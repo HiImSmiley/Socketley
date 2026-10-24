@@ -142,7 +142,12 @@ case "$("$BIN" mail trace nobody@ 2>&1)" in *"someone@else.test -> nobody@exampl
 grep -q "from <someone@else.test> to <nobody@example.test>: refused" "$SOCKETLEY_DLOG" && ok "each a line of the log as well" \
     || bad "the log line" "$(grep -c 'to <' "$SOCKETLEY_DLOG")"
 
-metrics=$(curl -s "http://127.0.0.1:$MP/metrics")
+# The worker's figures reach the daemon a moment after they change, later under load.
+for _ in $(seq 1 100); do
+    metrics=$(curl -s "http://127.0.0.1:$MP/metrics")
+    echo "$metrics" | grep -qE '^socketley_mail_delivered_total\{name="m"\} [1-9]' && echo "$metrics" | grep -q '^socketley_mail_stat{name="m",stat="mail_bayes_spam"} 25' && break
+    sleep 0.1
+done
 echo "$metrics" | grep -qE '^socketley_mail_delivered_total\{name="m"\} [1-9]' && echo "$metrics" | grep -q '^socketley_mail_stat{name="m",stat="mail_bayes_spam"} 25' \
     && ok "the daemon's metrics carry the mail runtime's figures" || bad "mail metrics" "$(echo "$metrics" | grep -c socketley_mail)"
 

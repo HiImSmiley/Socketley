@@ -96,6 +96,16 @@ checked=$("$BIN" mail m dns --check 2>&1)
 case "$checked" in *"ok         example.test MX"*"ok         example.test TXT"*"missing    _dmarc.example.test TXT: want v=DMARC1"*" records as they should be") \
     ok "mail dns --check says which records the resolvers have, and which they lack" ;;
     *) bad "mail dns --check" "$checked" ;; esac
+"$BIN" create mail mp -p $((SL_PORT_BASE+1997)) --mail-domain policy.test --dmarc-policy reject \
+    --bimi https://policy.test/logo.svg,https://policy.test/vmc.pem -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 $((SL_PORT_BASE+1997)) >/dev/null 2>&1
+recs=$("$BIN" mail mp dns 2>&1)
+case "$recs" in *'_dmarc.policy.test. 300 IN TXT "v=DMARC1; p=reject; adkim=r; aspf=r"'*) ok "--dmarc-policy reject is the policy published" ;;
+    *) bad "--dmarc-policy" "$recs" ;; esac
+case "$recs" in *'default._bimi.policy.test. 300 IN TXT "v=BIMI1; l=https://policy.test/logo.svg; a=https://policy.test/vmc.pem"'*) ok "and --bimi its logo and certificate" ;;
+    *) bad "--bimi" "$recs" ;; esac
+out=$("$BIN" create mail mbad -p $((SL_PORT_BASE+1998)) --mail-domain bad.test --bimi http://bad.test/logo.png 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"--bimi requires"*) true ;; *) false ;; esac && ok "a BIMI logo that is no https SVG is refused" || bad "--bimi refused" "rc $rc: $out"
 check "socketley mail dns prints the eight for a zone kept elsewhere" "$("$BIN" mail m dns 2>/dev/null | wc -l)" "8"
 
 # ─── no-reply ───────────────────────────────────────────────────────────────
@@ -133,12 +143,12 @@ check "and the list is empty after" "$("$BIN" mail m suppressed 2>/dev/null)" ""
 "$BIN" mail m forgive dead@remote.test >/dev/null 2>&1; check "forgiving one not there says so" "$?" "1"
 
 # A bounce from elsewhere counts only under the tag mail went out with, and only for that tag's domain.
-bounce() { # bounce <to> <failed address>
-    python3 - "$P" "$1" "$2" <<'PY'
+bounce() { # bounce <to> <failed address> [status]
+    python3 - "$P" "$1" "$2" "${3:-5.1.1}" <<'PY'
 import smtplib, sys
 s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0)); s.ehlo("x")
 s.sendmail("", [sys.argv[2]], "From: MAILER-DAEMON@remote.test\r\nSubject: failed\r\n\r\n"
-           "Final-Recipient: rfc822; %s\r\nAction: failed\r\nStatus: 5.1.1\r\n" % sys.argv[3])
+           "Final-Recipient: rfc822; %s\r\nAction: failed\r\nStatus: %s\r\n" % (sys.argv[3], sys.argv[4]))
 PY
 }
 bounce no-reply@example.test victim@remote.test
@@ -147,6 +157,13 @@ bounce "$tagged" amy@remote.test
 for _ in $(seq 1 50); do "$BIN" mail m suppressed 2>/dev/null | grep -q amy@ && break; sleep 0.1; done
 check "a bounce under the tag for remote.test suppresses an address there" "$("$BIN" mail m suppressed 2>/dev/null | grep -c '^amy@remote.test$')" "1"
 check "but not one under no tag, nor one of another domain" "$("$BIN" mail m suppressed 2>/dev/null | grep -c 'victim')" "0"
+# A status that says try again, or a mailbox that is full, is no address that is dead.
+bounce "$tagged" soft@remote.test 4.4.7
+bounce "$tagged" full@remote.test 5.2.2
+bounce "$tagged" gone@remote.test 5.1.1
+for _ in $(seq 1 50); do "$BIN" mail m suppressed 2>/dev/null | grep -q gone@ && break; sleep 0.1; done
+check "a bounce whose status is 4.x.x or 5.2.2 suppresses nobody, one of 5.1.1 its address" \
+    "$("$BIN" mail m suppressed 2>/dev/null | grep -cE '^(soft|full|gone)@remote.test$')" "1"
 
 # What was learned is kept across a restart, and every shard knows it.
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1

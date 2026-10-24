@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <optional>
 #include <memory>
 #include <string>
@@ -32,6 +33,7 @@
 #include "../../shared/util/inflate.h"
 #include "mail_sieve_store.h"
 #include "mail_spool.h"
+#include "mail_transfer.h"
 #include "smtp_session.h"
 #include "../../shared/crypto/password_file.h"
 #include "../../shared/http/notifier.h"
@@ -91,6 +93,10 @@ public:
     // A lane for work that only computes, spread over every thread but the first, which waits on files and the network.
     uint32_t cpu_lane() { return 1 + m_pool.next_lane() % (m_pool.threads() > 1 ? m_pool.threads() - 1 : 1); }
     spool& queue() { return m_spool; }
+    // The webmail's filter rules, the Sieve script "webmail" (jmap_session::hooks::filters), off the loop.
+    void web_filters(const std::string& user, std::optional<std::string> script, std::function<void(int, std::string)> done);
+    // What a mail client is told of how to reach the mailbox of `email` (jmap_session::hooks::client_setup).
+    std::string client_setup(std::string_view kind, const std::string& email) const;
     // A message of `user`'s, at `key`, learned by the spam filter as spam or not, on whichever shard it was moved.
     void learn(const std::string& user, const std::string& key, uint64_t size, bool spam);
     const std::string& hostname() const { return m_hostname; }
@@ -119,7 +125,8 @@ public:
     route_to route(const address& a, bool from_null) const;
     // A message of this runtime's own making queued, as a bounce or `socketley send` is: false when it cannot be.
     void queue_message(const std::string& from, const std::vector<std::string>& rcpts, std::string body, bool bounce,
-                       std::string user, std::function<void(bool ok, std::string id)> done, bool requiretls = false);
+                       std::string user, std::function<void(bool ok, std::string id)> done, bool requiretls = false,
+                       int64_t hold_until_ms = 0);
     uint32_t shard() const;
     std::string state_dir() const { return m_state_dir; }
     uint64_t next_cookie() { return m_next_cookie++; }
@@ -256,13 +263,22 @@ private:
         std::string idp_logout(const std::string& back) override;
         void forward(std::string client) override { forwarded = std::move(client); }
         bool unsubscribe(const std::string& token) override { return run->unsubscribe(token); }
+        std::string client_setup(std::string_view kind, const std::string& email) override
+        {
+            return run->client_setup(kind, email);
+        }
+        void filters(const std::string& user, std::optional<std::string> script, std::function<void(int, std::string)> done) override
+        {
+            run->web_filters(user, std::move(script), std::move(done));
+        }
         void push(const std::string& url, const std::string& p256dh, const std::string& auth, std::string body) override
         {
             run->push_send(url, p256dh, auth, std::move(body));
         }
         std::string address_of(const std::string& user) override;
+        std::vector<std::string> addresses_of(const std::string& user) override;
         void submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts, std::string message,
-                    std::function<void(bool, std::string)> done) override;
+                    std::function<void(bool, std::string)> done, int64_t hold_until_ms = 0) override;
     };
     struct listener
     {
@@ -359,10 +375,18 @@ private:
     std::vector<std::string> m_arc_trusted;
     std::string m_state_dir;
 
+    // Messages refused for an attachment of a kind that runs or for what clamd found in them.
+    uint64_t m_content_refused{0};
+    // Recipients a provider's feedback report said called its mail spam, unsubscribed for it.
+    uint64_t m_complaints{0};
+    void complained(const std::vector<std::string>& who, const std::string& reporter);
     // The blocklists of --dnsbl that name the address it sends from, asked hourly on the first shard; empty for none.
     std::string m_self_listed;
     int64_t m_self_checked_ms{0};
     void check_own_listing();
+    // Whether the PTR of each address its HELO name has gives that name back (forward-confirmed reverse DNS).
+    std::string m_name_mismatch;
+    void check_own_name();
     // What became of recent mail, for `socketley mail trace`: delivered, deferred, bounced or refused.
     struct traced
     {
@@ -392,6 +416,11 @@ private:
     void bayes_read();
     void bayes_fold();
     std::string learn_command(const std::string& arg, std::function<void(std::string_view)> answer);
+    // The exports and imports started here, by number, until the CLI is told how one ended.
+    std::map<uint64_t, std::shared_ptr<transfer_status>> m_transfers;
+    uint64_t m_transfer_seq{0};
+    std::string transfer_command(bool out, const std::string& arg);
+    std::string transfer_job(const std::string& arg);
     // A certificate the entrance has still to write, the listeners that need it waiting for it.
     bool m_cert_wait = false;
     bool certificate_to_come() const;
@@ -428,6 +457,23 @@ private:
         int64_t tokens_ms{0};
     };
     std::unordered_map<std::string, client> m_clients;
+    // Failed sign-ins by account, from how many addresses, and the addresses it signed in from, for a spray of
+    // guesses no one address's count sees; kept across a restart with the addresses refused.
+    struct account_guard
+    {
+        uint32_t failures{0};
+        int64_t first_failure_ms{0};
+        int64_t locked_until_ms{0};
+        std::unordered_set<std::string> from;
+        std::unordered_map<std::string, int64_t> known;
+    };
+    std::unordered_map<std::string, account_guard> m_accounts;
+    bool m_auth_dirty{false};
+    bool account_refused(const std::string& acct, const std::string& ip, int64_t now) const;
+    void account_signed_in(const std::string& acct, const std::string& name, const std::string& ip);
+    void account_failed(const std::string& acct, const std::string& ip, int64_t now);
+    void save_auth();
+    void load_auth();
     // Whether `ip` may send another message now, by --rate-limit's bucket of it and --global-rate-limit's.
     bool may_send(const std::string& ip);
     // An accept refused with EMFILE waits a moment before the next, rather than spinning on the same failure.

@@ -1,5 +1,5 @@
 # A nameserver for a test: lib_fake_dns.py <port> <delay_ms> <mode> name=ip ..., on FAKEDNS_ADDR (127.0.0.1 unless
-# given), answering A and AAAA for the names given and NXDOMAIN for the rest; name=MX:<pref>:<host>, name=TXT:<text>
+# given), answering A and AAAA for the names given and NXDOMAIN for the rest; name=MX:<pref>:<host>, name=PTR:<host>, name=TXT:<text>
 # and name=TLSA:<usage>:<selector>:<type>:<hex> give a name those records, and name=AD sets the AD bit on its answers,
 # as a validating resolver does for a name DNSSEC signed.  name=SERVFAIL answers SERVFAIL for it, and name=NXFOR:<s>
 # NXDOMAIN for <s> seconds from the first question about it.  <mode> is normal, truncate (every
@@ -35,7 +35,7 @@ def answer(m, peer):
         if v.startswith("NXFOR:") and time.time() - first_asked.setdefault(name, time.time()) < float(v[6:]):
             s.sendto(struct.pack(">HHHHHH", qid, 0x8183, 1, 0, 0, 0) + q, peer); return
     ad = 0x0020 if "AD" in vals else 0
-    if qtype in (15, 16, 52):
+    if qtype in (12, 15, 16, 52):
         rrs = b""; n = 0
         for v in vals:
             if qtype == 15 and v.startswith("MX:"):
@@ -44,6 +44,8 @@ def answer(m, peer):
             elif qtype == 16 and v.startswith("TXT:"):
                 t = v[4:].encode()
                 rd = b"".join(bytes([len(t[i:i + 255])]) + t[i:i + 255] for i in range(0, max(len(t), 1), 255))
+            elif qtype == 12 and v.startswith("PTR:"):
+                rd = wire(v[4:])
             elif qtype == 52 and v.startswith("TLSA:"):
                 _, u, sel, mt, hx = v.split(":", 4)
                 rd = bytes([int(u), int(sel), int(mt)]) + bytes.fromhex(hx)
@@ -53,7 +55,7 @@ def answer(m, peer):
         if name not in table:
             s.sendto(struct.pack(">HHHHHH", qid, 0x8183, 1, 0, 0, 0) + q, peer); return
         s.sendto(struct.pack(">HHHHHH", qid, 0x8180 | ad, 1, n, 0, 0) + q + rrs, peer); return
-    ips = [ip for ip in vals if not ip.startswith(("MX:", "TXT:", "TLSA:", "NXFOR:")) and ip not in ("AD", "SERVFAIL")
+    ips = [ip for ip in vals if not ip.startswith(("MX:", "TXT:", "TLSA:", "PTR:", "NXFOR:")) and ip not in ("AD", "SERVFAIL")
            and (":" in ip) == (qtype == 28)]
     if mode == "servfail":
         s.sendto(struct.pack(">HHHHHH", qid, 0x8182, 1, 0, 0, 0) + q, peer); return

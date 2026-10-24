@@ -1,4 +1,5 @@
 #include "smtp_session.h"
+#include "mail_sasl.h"
 
 #include <charconv>
 #include <algorithm>
@@ -373,6 +374,13 @@ void smtp_session::run()
                 else
                     auth_plain(line);
                 break;
+            case phase::auth_bearer:
+                m_phase = phase::command;
+                if (line == "*")
+                    error(501, "5.0.0", "Authentication cancelled");
+                else
+                    auth_bearer(line);
+                break;
             case phase::auth_login_user:
             {
                 m_phase = phase::command;
@@ -538,7 +546,7 @@ void smtp_session::ehlo(std::string_view arg, bool extended)
     if (m_cfg.tls_active && !m_cfg.lmtp)
         out += "250-REQUIRETLS\r\n";
     if (m_cfg.auth_offered && m_user.empty() && (m_cfg.tls_active || m_cfg.auth_in_clear))
-        out += "250-AUTH PLAIN LOGIN\r\n";
+        out += m_cfg.bearer_offered ? "250-AUTH PLAIN LOGIN XOAUTH2 OAUTHBEARER\r\n" : "250-AUTH PLAIN LOGIN\r\n";
     out += "250 ENHANCEDSTATUSCODES\r\n";
     m_hooks.reply(out);
 }
@@ -772,7 +780,28 @@ void smtp_session::auth(std::string_view arg)
         say("334 UGFzc3dvcmQ6");
         return;
     }
+    if (m_cfg.bearer_offered && (socketley::ascii::iequals(mech, "XOAUTH2") || socketley::ascii::iequals(mech, "OAUTHBEARER")))
+    {
+        m_bearer_mech = socketley::ascii::iequals(mech, "XOAUTH2") ? "XOAUTH2" : "OAUTHBEARER";
+        if (initial.empty())
+        {
+            m_phase = phase::auth_bearer;
+            say("334 ");
+            return;
+        }
+        return auth_bearer(initial);
+    }
     error(504, "5.5.4", "Unrecognized authentication type");
+}
+
+void smtp_session::auth_bearer(std::string_view b64)
+{
+    std::string raw, user, token;
+    if (!socketley::base64::decode(b64, raw))
+        return error(501, "5.5.2", "Cannot decode the response");
+    if (!sasl_bearer(m_bearer_mech, raw, user, token) || user.empty())
+        return error(535, "5.7.8", "Authentication credentials invalid");
+    sign_in(m_bearer_mech, std::move(user), std::move(token));
 }
 
 void smtp_session::auth_plain(std::string_view b64)

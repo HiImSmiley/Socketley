@@ -435,6 +435,18 @@ bool parse(const uint8_t* msg, int len, uint16_t type, std::vector<std::string>&
                 char buf[INET6_ADDRSTRLEN];
                 out.emplace_back(::inet_ntop(AF_INET6, rd, buf, sizeof buf));
             }
+            else if (t == dns::type::PTR && rdlen > 0)
+            {
+                uint8_t pn[dns::max_name];
+                size_t after = 0;
+                if (const size_t pl = dns::read_name(msg, n, next + 10, pn, after))
+                {
+                    std::string h = dns::to_text(std::string_view(reinterpret_cast<char*>(pn), pl));
+                    if (!h.empty() && h.back() == '.')
+                        h.pop_back();
+                    out.push_back(std::move(h));
+                }
+            }
             else if (t == dns::type::MX && rdlen > 2)
             {
                 uint8_t ex[dns::max_name];
@@ -520,6 +532,16 @@ public:
     bool mx(const std::string& name, std::vector<std::string>& out, bool& nx) override
     {
         return ask(name, dns::type::MX, out, nx);
+    }
+    bool ptr(const std::string& ip, std::vector<std::string>& out, bool& nx) override
+    {
+        in_addr a{};
+        if (::inet_pton(AF_INET, ip.c_str(), &a) != 1)
+            return false;
+        const auto* b = reinterpret_cast<const unsigned char*>(&a.s_addr);
+        return ask(std::to_string(b[3]) + "." + std::to_string(b[2]) + "." + std::to_string(b[1]) + "." +
+                       std::to_string(b[0]) + ".in-addr.arpa",
+                   dns::type::PTR, out, nx);
     }
 
 private:
@@ -800,8 +822,16 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
         if (d == org)
             break;
     }
+    const auto aligned = [&](const std::string& d, const std::string& mode) {
+        const std::string a = socketley::idna::to_ascii(lower(d));
+        return mode == "s" ? a == out.from_domain : organizational_domain(a) == org;
+    };
     if (record.empty())
     {
+        // With no policy the alignment is still told, relaxed, for what trusts a sender that is who it says.
+        out.spf_aligned = out.spf == "pass" && aligned(out.spf_domain, "r");
+        for (const auto& [res, d] : out.dkim)
+            out.dkim_aligned = out.dkim_aligned || (res == "pass" && aligned(d, "r"));
         out.dmarc = "none";
         return out;
     }
@@ -842,10 +872,6 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
     out.p = p;
     out.sp = sp;
     out.pct = pct;
-    const auto aligned = [&](const std::string& d, const std::string& mode) {
-        const std::string a = socketley::idna::to_ascii(lower(d));
-        return mode == "s" ? a == out.from_domain : organizational_domain(a) == org;
-    };
     out.spf_aligned = out.spf == "pass" && aligned(out.spf_domain, aspf);
     for (const auto& [res, d] : out.dkim)
         out.dkim_aligned = out.dkim_aligned || (res == "pass" && aligned(d, adkim));

@@ -2,7 +2,7 @@
 # suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
 # Integration test: the IMAP extensions a mail client leans on beyond IMAP4rev1: CONDSTORE and QRESYNC (RFC 7162),
 # ESEARCH (RFC 4731), LIST-EXTENDED and LIST-STATUS (RFC 5258, 5819), STATUS=SIZE (RFC 8438), QUOTA (RFC 9208),
-# SORT and THREAD (RFC 5256).
+# SORT and THREAD (RFC 5256), WITHIN (RFC 5032), SAVEDATE (RFC 8514), PREVIEW (RFC 8970) and AUTHENTICATE LOGIN.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
@@ -13,6 +13,8 @@
 #   * LIST RETURN (STATUS) without each folder's STATUS, a STATUS SIZE that is not the bytes
 #   * a quota not told, or a message delivered or appended past it
 #   * SORT out of the criteria's order, a base subject that keeps its Re:, THREAD not tying a reply to its parent
+#   * OLDER or YOUNGER not counting from now, SAVEDBEFORE reading the internal date, a PREVIEW not of the text
+#   * AUTHENTICATE LOGIN not asking for the password after the user, or taking a wrong one
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -78,7 +80,7 @@ PY
 for _ in $(seq 1 100); do [ "$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/INBOX/" | grep -c '<Key>')" -ge 5 ] && break; sleep 0.1; done
 
 python3 - "$IM" "$P" > "$T/ext.out" 2>&1 <<'PY'
-import re, smtplib, socket, sys, time
+import base64, re, smtplib, socket, sys, time
 def crashed(kind, value, tb):
     print("bad the client ran to its end: " + repr(value))
 sys.excepthook = crashed
@@ -172,6 +174,42 @@ time.sleep(2.5)
 a.cmd("NOOP")
 r = a.cmd("SEARCH SUBJECT \"too big\"")
 say("and a delivery past it is not kept", r[0] == "* SEARCH", r)
+# WITHIN, SAVEDATE and PREVIEW (RFC 5032, 8514, 8970).
+r = a.cmd("CAPABILITY")
+say("CAPABILITY offers WITHIN, SAVEDATE, PREVIEW and AUTH=LOGIN", all(x in r[0] for x in
+    ["WITHIN", "SAVEDATE", "PREVIEW", "AUTH=LOGIN"]), r[0])
+r = a.cmd("UID FETCH 1 (PREVIEW SAVEDATE)")
+say("FETCH PREVIEW is the start of the message's text", 'PREVIEW "body of a@else"' in r[0], r)
+say("FETCH SAVEDATE is a date", re.search(r'SAVEDATE "[ \d]\d-[A-Z][a-z]{2}-\d{4} \d\d:\d\d:\d\d [+-]\d{4}"', r[0]), r)
+r = a.cmd("UID FETCH 1 (UID PREVIEW (LAZY))")
+say("PREVIEW (LAZY) is taken", " OK " in r[-1] and "PREVIEW" in r[0], r)
+every = a.cmd("UID SEARCH ALL")[0]
+r = a.cmd("UID SEARCH YOUNGER 3600")
+say("SEARCH YOUNGER 3600 finds what came this hour", r[0] == every and every != "* SEARCH", (r, every))
+r = a.cmd("SEARCH OLDER 3600")
+say("and OLDER 3600 none of it", r[0] == "* SEARCH", r)
+lit = "Subject: old one\r\n\r\nfrom long ago\r\n"
+a.cmd('APPEND INBOX "01-Jan-2020 00:00:00 +0000" {%d+}\r\n%s' % (len(lit), lit))
+a.cmd("NOOP")
+r = a.cmd("UID SEARCH BEFORE 1-Jan-2021")
+r2 = a.cmd("UID SEARCH SAVEDBEFORE 1-Jan-2021 SAVEDATESUPPORTED")
+say("SAVEDBEFORE reads when a message was saved, not its internal date", r[0] != "* SEARCH" and r2[0] == "* SEARCH", (r, r2))
+r = a.cmd("UID SEARCH SAVEDSINCE 1-Jan-2021 SUBJECT \"old one\"")
+say("and SAVEDSINCE finds it", r[0] != "* SEARCH", r)
+r = a.cmd("SEARCH OLDER 86400 SUBJECT \"old one\"")
+say("OLDER counts back from the internal date", r[0] != "* SEARCH", r)
+# AUTHENTICATE LOGIN: the user and then the password, each a continuation of its own.
+d = C()
+d.s.sendall(b"L AUTHENTICATE LOGIN\r\n"); l1 = d.f.readline()
+d.s.sendall(base64.b64encode(b"alice") + b"\r\n"); l2 = d.f.readline()
+d.s.sendall(base64.b64encode(b"alicepassword1") + b"\r\n"); l3 = d.f.readline()
+say("AUTHENTICATE LOGIN asks for the user, then the password, and signs in", l1.startswith(b"+ VXNlcm5hbWU6") and
+    l2.startswith(b"+ UGFzc3dvcmQ6") and l3.startswith(b"L OK"), (l1, l2, l3))
+e = C()
+e.s.sendall(b"L AUTHENTICATE LOGIN YWxpY2U=\r\n"); l1 = e.f.readline()
+e.s.sendall(base64.b64encode(b"wrongpassword") + b"\r\n"); l2 = e.f.readline()
+say("and with the user given at once, a wrong password is refused", l1.startswith(b"+ UGFzc3dvcmQ6") and
+    l2.startswith(b"L NO"), (l1, l2))
 PY
 # COMPRESS=DEFLATE: what one session reads compressed is what another reads in the clear.
 python3 - "$IM" >> "$T/ext.out" 2>&1 <<'PY'

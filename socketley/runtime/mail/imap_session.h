@@ -27,6 +27,8 @@ struct imap_config
     bool tls_active{false};
     // A password may be said in the clear: this machine's own client.
     bool login_in_clear{false};
+    // XOAUTH2 and OAUTHBEARER offered beside PLAIN, where an idp gives the tokens they carry.
+    bool bearer_offered{false};
     uint64_t max_append{25ull << 20};
     // The ManageSieve URL imapsieve's scripts are put at, where there is one (RFC 6785 2).
     std::string imapsieve;
@@ -202,6 +204,11 @@ private:
     std::string m_idle_tag;
     std::string m_auth_tag;
     bool m_auth_continue{false};
+    // PLAIN, LOGIN, XOAUTH2 or OAUTHBEARER, the mechanism the continuation answers.
+    std::string m_auth_mech;
+    // LOGIN's user, given before its password is asked for.
+    std::string m_login_user;
+    bool m_login_named{false};
     std::shared_ptr<bool> m_alive;
 };
 

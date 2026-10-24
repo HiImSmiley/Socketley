@@ -828,7 +828,8 @@ marks an advertisement. Each goes to one recipient, never to one who
 unsubscribed, with a link to unsubscribe of their own where the template says
 .BR {{unsubscribe}} ,
 or below what it says, and List-Unsubscribe naming it and a mailto: (RFC 2369),
-with List-Unsubscribe-Post for a provider's one click (RFC 8058). The link is
+with List-Unsubscribe-Post for a provider's one click (RFC 8058), and List-Id
+naming its list by its sender, such as <news.example.com> (RFC 2919). The link is
 .BI https:// webmail /unsubscribe
 where the runtime has
 .B \-\-web
@@ -1001,6 +1002,10 @@ socketley daemon stats
 .B idp\-user \fIidp\fR disable\fR|\fBenable\fR|\fBlogout\fR|\fBremove\fR|\fBshow \fIuser\fR
 .TQ
 .B idp\-user \fIidp\fR list\fR|\fBimport \fIstorage\fR
+.TQ
+.B idp\-user \fIidp\fR totp \fIuser\fR on\fR|\fBoff
+.TQ
+.B idp\-user \fIidp\fR app\-password \fIuser\fR add \fIlabel\fR|\fBremove \fIlabel\fR|\fBlist
 The accounts an
 .B idp
 runtime keeps, changed in the process that keeps them.
@@ -1021,6 +1026,21 @@ ends every session and refresh token the account holds;
 does too.
 .B show
 prints the fields, the password as set and never its hash.
+.B totp on
+turns on a second step of signing in: it prints the key, and the otpauth://
+link that gives it to an authenticator app, and from then on a web sign-in asks
+the six digits the app shows after the password, a code taken once (RFC 6238);
+.B off
+turns it off.
+.B app\-password add
+makes a password of four groups of four letters for one mail app, printed
+once, which signs in over SMTP, IMAP, POP3 and JMAP and is taken back on its own
+by
+.BR remove ;
+with the second step on, mail apps sign in with these alone, since they have no
+code to give. A user does all of it on their account page,
+.BR /account ,
+the second step turned on only once a code proves the app has the key.
 .B import
 takes a storage runtime's users over, with the password each has there, an
 account of the same name already here kept as it is. A refusal is exit 1.
@@ -1135,8 +1155,14 @@ socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
 .fi
 .RE
 .TP
-.BI "mail " "\fR[\fImail\fR] " "\fR[\fBqueue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns \fR[\fB\-\-check\fR] | \fBtrace \fIaddress\fR | \fBusage \fR[\fIuser\fR] | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBunsubscribed\fR | \fBresubscribe \fIaddress\fR | \fBlearn \fIuser\fB/\fIfolder \fB\-\-as spam\fR|\fBham\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname\fR]"
+.BI "mail " "\fR[\fImail\fR] " "\fR[\fBqueue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns \fR[\fB\-\-check\fR] | \fBtrace \fIaddress\fR | \fBusage \fR[\fIuser\fR] | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBunsubscribed\fR | \fBresubscribe \fIaddress\fR | \fBlearn \fIuser\fB/\fIfolder \fB\-\-as spam\fR|\fBham\fR | \fBexport \fIuser \fR[\fIdir\fR] | \fBimport \fIuser file\fR|\fIdir\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname\fR]"
 The runtime's name may go unsaid where the daemon has one mail runtime alone.
+Hourly, and as it starts, it asks whether the PTR of each address of its host
+names that host again (forward-confirmed reverse DNS, without which Gmail and
+Outlook refuse or file its mail as spam, and which is set where the address is
+rented), and whether a blocklist of its
+.B \-\-dnsbl
+names one; either is said in its summary and the log.
 Alone, a few lines of what the runtime is and how it does: its domains, users
 and mailboxes, its ports, the webmail's name, what waits, what was delivered,
 deferred, bounced, received and stored, and its lists. A mail runtime's spool,
@@ -1178,6 +1204,27 @@ takes one back.
 .B learn
 teaches the spam filter a folder of a user's, spam or not, such as their Junk
 and their INBOX on a new machine, where the filter has learned nothing yet.
+.B export
+writes a user's mailbox out as mbox files, a folder each, as
+.IB dir / folder .mbox
+under a directory the daemon makes for itself alone and refuses where it holds
+files already, under
+.I /var/tmp/socketley\-mail
+where none is named; the flags go as Status and X\-Status, the keywords as
+X\-Keywords and the internal date in each "From " line.
+.B import
+reads an mbox, or every
+.I .mbox
+under a directory, into a user's folders, a file's into the folder its name
+says, an empty file an empty folder: what
+.B export
+wrote, Thunderbird's, or a Google Takeout's, whose X\-Gmail\-Labels say the
+folder (Inbox, Sent, Drafts, Spam as Junk, Trash, a label of the user's,
+Archive for the rest) and whose read and starred say the flags. Both wait for
+the end and say how many messages went. A mailbox on another IMAP server moves
+over IMAP itself, with
+.BR imapsync (1)
+or a mail client.
 .B sieve
 lists a user's Sieve scripts, the active one marked, prints one, puts one from
 a file
@@ -1193,6 +1240,8 @@ socketley mail m show 65e5113d0e2120000000
 socketley mail m dns >> /etc/bind/example.com.zone
 socketley mail m sieve alice put main filter.sieve
 socketley mail m sieve alice activate main
+socketley mail m export alice /var/backups/alice
+socketley mail m import alice ~/Takeout/Mail/All\ mail\ Including\ Spam\ and\ Trash.mbox
 .fi
 .RE
 .TP
@@ -12882,6 +12931,20 @@ of the certificate being there. A certificate given with
 .B \-\-cert
 is there when the runtime starts, or it does not start.
 .PP
+.B Signing in.
+A user signs in with their password over TLS, or from this machine in the
+clear, or with a token their idp gave, by XOAUTH2 or OAUTHBEARER on SMTP, IMAP
+and POP3, as mail apps that sign in through an identity provider do; where the
+account has its second step on, a mail app signs in with one of its app
+passwords (see
+.BR idp\-user ).
+Ten wrong answers from one address in ten minutes refuse that address for ten
+minutes; twenty at one account from three addresses or more refuse the
+account, for ten minutes, to every address but those it signed in from within
+thirty days, so guesses spread over many addresses lock none of its own devices
+out. Both outlast a restart. Each sign-in is a line of the log: the user, the
+protocol and the address.
+.PP
 .B Whose mail it takes.
 Its domains are
 .BR \-\-mail\-domain ,
@@ -13174,7 +13237,16 @@ address: it is not mailed again by any shard until
 lets it go, or ninety days pass. A bounce under no tag, or another domain's, is
 read and acts on nothing, so no stranger can stop mail to an address. The
 runtime's own bounce of such a message is its own word, so an address is learned
-dead from its first try.
+dead from its first try. A recipient whose Status is 4.x.x, or 5.2.2 (its mailbox
+full), is no address that is dead and is not suppressed.
+.IP
+A provider's feedback report (ARF, RFC 5965) that one of its users called a
+message spam \(em as Microsoft's JMRP and the other feedback loops send them, to
+whichever address of its domains was given to them \(em unsubscribes that user
+from its advertisements, as their own click would, where the report's sender is
+who it says by SPF or DKIM; the report is still delivered.
+.B socketley mail trace
+names it.
 .PP
 .B Mailboxes.
 With
@@ -13201,7 +13273,8 @@ IMAP4rev1, and IMAP4rev2 (RFC 9051) for a client that enables it, with LITERAL+,
 SEARCHRES, SASL\-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT,
 CHILDREN, SPECIAL\-USE, ID, ENABLE, CONDSTORE and QRESYNC, ESEARCH,
 LIST\-EXTENDED and LIST\-STATUS, STATUS=SIZE, QUOTA, SORT (with DISPLAYFROM and
-DISPLAYTO), THREAD (ORDEREDSUBJECT, REFERENCES) and COMPRESS=DEFLATE, what a
+DISPLAYTO), THREAD (ORDEREDSUBJECT, REFERENCES), WITHIN (OLDER and YOUNGER),
+SAVEDATE, PREVIEW and COMPRESS=DEFLATE, what a
 loop turn says compressed as one flushed block, on the mailboxes of
 .BR \-\-storage ;
 a password goes over STARTTLS or
@@ -13268,7 +13341,8 @@ is the session; the API at
 .B /jmap/api
 takes Core/echo, Mailbox/get, query, set and changes, Email/get, query, set,
 import and changes, Thread/get with every Email of a conversation in any
-mailbox, Identity/get and EmailSubmission/set with its
+mailbox, Quota/get, query and changes (RFC 9425) with the octets of the
+user's quota, Identity/get and set, and EmailSubmission/set with its
 onSuccessUpdateEmail and onSuccessDestroyEmail, back\-references among them;
 .B /jmap/upload
 and
@@ -13301,9 +13375,15 @@ the entrance serves a mail client in the browser under the name, in the look
 of the storage interface: the mailboxes with their unread counts and a starred
 view, the conversations a page at a time, each read as its messages from every
 mailbox with what they quote folded away, a search over all of them, reading,
-writing, replying and forwarding with attachments, drafts, moving, flags and
-deletion, a name, a signature and an out-of-office answer, and new mail as it
-comes. It signs in through the idp runtime, whose session cookie under its
+writing, replying and forwarding with attachments, drafts saved as they are
+written, moving, archiving, flags and deletion, a whole folder selected or
+emptied, a message's headers and its print, a send undone within seconds or
+put off until a time, plain text or formatted, a sender of the user's
+addresses, the one a message was sent to for its reply, a name, a signature,
+an out-of-office answer between two dates, filters for arriving mail as a
+Sieve script, and new mail as it comes, told in the background where the
+browser lets it. It speaks German where the browser asks for it, English
+otherwise. It signs in through the idp runtime, whose session cookie under its
 .B \-\-cookie\-domain
 signs the user in to every runtime of it at once, and sends a page not signed
 in to the idp's
@@ -13540,6 +13620,23 @@ or
 .BR mail ;
 needs
 .BR \-\-web .
+Under each of its zones the webmail also answers
+.B autoconfig
+and
+.BR autodiscover ,
+where mail clients ask how a mailbox is reached: Thunderbird's
+.B /mail/config\-v1.1.xml
+(and
+.BR /.well\-known/autoconfig/ ),
+Outlook's
+.B /autodiscover/autodiscover.xml
+and the JSON lookup that points at it, with
+.B _autodiscover._tcp
+in the zone; each names its host, the ports it opens with TLS, and the address
+as the login, and an address of no domain it keeps is answered 404. A user
+signed in to the webmail finds the same under Settings, and a profile that sets
+up an iPhone, an iPad or a Mac at once
+.RB ( /~mail/mobileconfig ).
 .TP
 .BI "\-\-lmtp " port
 LMTP for this machine's own programs, into the mailboxes only; a connection
@@ -13561,11 +13658,32 @@ Publish where TLS reports (RFC 8460) about its domains go.
 .BI "\-\-dmarc\-rua " address
 Publish where DMARC aggregate reports about its domains go.
 .TP
+.BI "\-\-dmarc\-policy " none\fR|\fBquarantine\fR|\fBreject
+What its DMARC record asks of mail that claims its domains and fails SPF and
+DKIM; quarantine unless given, reject once the reports show only its own mail
+passes.
+.TP
+.BI "\-\-bimi " https://logo.svg\fR[,\fIhttps://certificate.pem\fR]
+Publish a BIMI record, its SVG logo, and the mark certificate the providers
+that show a logo beside a message (Gmail among them) ask for; a domain DMARC
+quarantines or rejects is shown.
+.TP
 .B \-\-reports
 Send the DMARC and TLS reports other domains ask for.
 .TP
 .BI "\-\-greylist " duration
 Greylist strangers (RFC 6647) for this long, such as 5m; 0 for none.
+.TP
+.BI "\-\-refuse\-attachments " ext\fR[,\fIext\fR...]|\fBdefault\fR|\fBnone
+Mail from elsewhere with an attachment of one of these extensions is refused,
+554, its name in the answer: unless given, programs, scripts, shortcuts, disk
+images and Office documents with macros (exe, scr, js, vbs, ps1, lnk, iso,
+docm, xlsm and the rest of Gmail's list).
+.TP
+.BI "\-\-clamav " host:port\fR|\fIsocket
+The clamd every message from elsewhere is streamed to (INSTREAM) before it is
+taken; one it names a virus in is refused with that name, and one it does not
+answer for is taken and logged, as Rspamd's silence is.
 .TP
 .BI "\-\-rspamd " url
 The Rspamd that scans mail from elsewhere, such as http://127.0.0.1:11333.

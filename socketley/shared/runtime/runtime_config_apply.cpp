@@ -226,6 +226,14 @@ void apply_mail_config(mail_instance& ml, const runtime_config& cfg, bool by_pre
         ml.set_reports(cfg.mail_reports);
     if (asked("dmarc_rua", cfg.mail_dmarc_rua != defaults.mail_dmarc_rua))
         ml.set_dmarc_rua(cfg.mail_dmarc_rua);
+    if (asked("dmarc_policy", cfg.mail_dmarc_policy != defaults.mail_dmarc_policy))
+        ml.set_dmarc_policy(cfg.mail_dmarc_policy);
+    if (asked("bimi", cfg.mail_bimi != defaults.mail_bimi))
+        ml.set_bimi(cfg.mail_bimi);
+    if (asked("refuse_attachments", cfg.mail_refused_attachments != defaults.mail_refused_attachments))
+        ml.set_refused_attachments(cfg.mail_refused_attachments);
+    if (asked("clamav", cfg.mail_clamav != defaults.mail_clamav))
+        ml.set_clamav(cfg.mail_clamav);
     if (asked("tls_rpt", cfg.mail_tls_rpt != defaults.mail_tls_rpt))
         ml.set_tls_rpt(cfg.mail_tls_rpt);
     if (asked("mta_sts", cfg.mail_mta_sts != defaults.mail_mta_sts))

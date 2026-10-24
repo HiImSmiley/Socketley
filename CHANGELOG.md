@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A mailbox moves.** `socketley mail export <user> [dir]` writes a user's
+  folders out as mbox files, a folder each, the flags as Status and
+  X-Status and the keywords as X-Keywords; `socketley mail import <user>
+  <file.mbox|dir>` reads them back, or Thunderbird's, or a Google Takeout's
+  into the folders its labels say, read and starred as its flags. Both wait
+  for the end and say how many messages went.
+- **The webmail does what a mail client does.** Drafts save as they are
+  written; a send can be undone for a few seconds or put off until a time;
+  a message can be archived, printed or shown with its headers; a whole
+  folder is selected or emptied; the editor writes formatted text; a user
+  with more than one address sends from any of them, and a reply goes out
+  from the one the message was sent to; the out-of-office answer takes two
+  dates; filters for arriving mail are written as a Sieve script; and new
+  mail is told while the tab is in the background. It speaks German where
+  the browser asks for it.
+- **IMAP and JMAP extensions.** IMAP has WITHIN (OLDER, YOUNGER), SAVEDATE,
+  PREVIEW and AUTHENTICATE LOGIN; JMAP has Quota (RFC 9425) and
+  Identity/set.
+- **Signing in, defended.** An idp account can have a second step
+  (`idp-user <idp> totp <user> on`, or on the account page): a web sign-in
+  then asks the code an authenticator app shows, once, and mail apps sign in
+  with app passwords (`idp-user <idp> app-password <user> add <label>`), each
+  taken back on its own. SMTP, IMAP and POP3 take the idp's tokens by
+  XOAUTH2 and OAUTHBEARER. Guesses spread over many addresses refuse the
+  account to all but the addresses it signs in from, the refusals outlast a
+  restart, and each sign-in is logged. Mail from elsewhere with an
+  attachment that runs (`--refuse-attachments`, Gmail's list unless said)
+  is refused, and `--clamav <host:port>` refuses what clamd names.
+- **Mail clients set themselves up, and mail arrives better.** A mail
+  runtime with `--web` and `--domain` answers `autoconfig.<zone>` and
+  `autodiscover.<zone>` through the entrance: Thunderbird's
+  config-v1.1.xml, Outlook's autodiscover (and its JSON lookup, with the
+  SRV record), and for a signed-in user an Apple profile and the settings in
+  the webmail. `--dmarc-policy none|quarantine|reject` and `--bimi
+  <logo.svg>[,<cert>]` are published; advertisements carry `List-Id`; a
+  provider's feedback report (ARF) from a sender SPF or DKIM vouches for
+  unsubscribes the user who complained; a bounce whose status is 4.x.x or
+  5.2.2 suppresses nobody; and the runtime says when its address's PTR does
+  not name its host.
 - **Running a mail server.** `socketley mail` takes no runtime name where
   there is one mail runtime; `mail trace <address>` says what became of the
   latest mail from or to it (delivered, deferred, bounced, refused, with the
@@ -834,6 +873,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hands a descriptor over — the origin keeps the socket and relays.
 ### Fixed
 
+- **JMAP's preview ended in a space** where the message's text ended in
+  white space.
 - **JMAP had no conversations.** Every Email was a Thread of its own and
   collapseThreads was ignored. A message's conversation is now the hash of the
   Message-ID its References begin with (else In-Reply-To, else its own), taken

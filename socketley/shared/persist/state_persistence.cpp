@@ -765,6 +765,10 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mail_delimiter = std::string(ml->get_recipient_delimiter());
             cfg.mail_reports = ml->get_reports();
             cfg.mail_dmarc_rua = std::string(ml->get_dmarc_rua());
+            cfg.mail_dmarc_policy = std::string(ml->get_dmarc_policy());
+            cfg.mail_bimi = std::string(ml->get_bimi());
+            cfg.mail_refused_attachments = std::string(ml->get_refused_attachments());
+            cfg.mail_clamav = std::string(ml->get_clamav());
             cfg.mail_tls_rpt = std::string(ml->get_tls_rpt());
             cfg.mail_mta_sts = std::string(ml->get_mta_sts());
             cfg.mail_default_quota = ml->get_default_quota();
@@ -1241,6 +1245,14 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_bool_field("reports", true);
             if (!cfg.mail_dmarc_rua.empty())
                 append_str_field("dmarc_rua", cfg.mail_dmarc_rua);
+            if (cfg.mail_dmarc_policy != "quarantine")
+                append_str_field("dmarc_policy", cfg.mail_dmarc_policy);
+            if (!cfg.mail_bimi.empty())
+                append_str_field("bimi", cfg.mail_bimi);
+            if (cfg.mail_refused_attachments != "default")
+                append_str_field("refuse_attachments", cfg.mail_refused_attachments);
+            if (!cfg.mail_clamav.empty())
+                append_str_field("clamav", cfg.mail_clamav);
             if (!cfg.mail_tls_rpt.empty())
                 append_str_field("tls_rpt", cfg.mail_tls_rpt);
             if (!cfg.mail_mta_sts.empty())
@@ -1542,6 +1554,12 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
                 cfg.mail_delimiter = json_get_string(json, "recipient_delimiter");
             cfg.mail_reports = json_get_bool(json, "reports");
             cfg.mail_dmarc_rua = json_get_string(json, "dmarc_rua");
+            if (json_has_key(json, "dmarc_policy"))
+                cfg.mail_dmarc_policy = json_get_string(json, "dmarc_policy");
+            cfg.mail_bimi = json_get_string(json, "bimi");
+            if (json_has_key(json, "refuse_attachments"))
+                cfg.mail_refused_attachments = json_get_string(json, "refuse_attachments");
+            cfg.mail_clamav = json_get_string(json, "clamav");
             cfg.mail_tls_rpt = json_get_string(json, "tls_rpt");
             cfg.mail_mta_sts = json_get_string(json, "mta_sts");
             cfg.mail_default_quota = json_get_size(json, "default_quota", 0);

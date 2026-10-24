@@ -53,7 +53,9 @@ trap cleanup EXIT
 echo "=== Integration: a mail runtime takes, keeps, signs, sends, retries and bounces mail ==="
 
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
-    2.0.0.127.bl.test=127.0.0.2 4.0.0.127.bl.test=127.255.255.254 listed-host.test=127.0.0.2 >/dev/null 2>&1 &
+    2.0.0.127.bl.test=127.0.0.2 4.0.0.127.bl.test=127.255.255.254 listed-host.test=127.0.0.2 \
+    2.0.0.127.in-addr.arpa=PTR:other-host.test named-host.test=127.0.0.3 3.0.0.127.in-addr.arpa=PTR:named-host.test \
+    >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
@@ -303,6 +305,14 @@ case "$("$BIN" mail mlisted 2>&1)" in *"BLOCKLISTED its address is on bl.test (1
     *) bad "a runtime whose own address a blocklist names says so" "$("$BIN" mail mlisted 2>&1 | head -4)" ;; esac
 case "$("$BIN" mail mb 2>&1)" in *BLOCKLISTED*) bad "one whose address no list names says nothing" "$("$BIN" mail mb 2>&1)" ;;
     *) ok "one whose address no list names says nothing" ;; esac
+# And whose address does not name it back: the PTR of 127.0.0.2 is other-host.test, that of 127.0.0.3 named-host.test.
+case "$("$BIN" mail mlisted 2>&1)" in *"REVERSE DNS 127.0.0.2's PTR names other-host.test, not listed-host.test"*) ok "a runtime whose address's PTR names another says so" ;;
+    *) bad "a runtime whose address's PTR names another says so" "$("$BIN" mail mlisted 2>&1 | head -5)" ;; esac
+"$BIN" create mail mnamed -p $((SL_PORT_BASE+1978)) --mail-domain third.test --hostname named-host.test -s >/dev/null 2>&1
+for _ in $(seq 1 30); do "$BIN" stats mnamed 2>/dev/null | grep -q mail_complaints && break; sleep 0.1; done
+sleep 1
+case "$("$BIN" mail mnamed 2>&1)" in *"REVERSE DNS"*) bad "one whose PTR names it back says nothing" "$("$BIN" mail mnamed 2>&1 | head -5)" ;;
+    *) ok "one whose PTR names it back says nothing" ;; esac
 
 # ─── the CLI and the daemon ─────────────────────────────────────────────────
 "$BIN" send luasend -1 >/dev/null 2>&1; check "send of a message that begins with - to a server reaches it" "$?" "0"

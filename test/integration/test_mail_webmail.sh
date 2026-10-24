@@ -138,8 +138,13 @@ def api(*calls, headers=None):
 st, h, _ = web("POST", "/jmap/api", json.dumps({"using": USING, "methodCalls": []}),
                {"Cookie": cookie, "Content-Type": "application/json"})
 check("a change signed by the cookie alone, without the page's header, is refused", st == 403, st)
-st, h, r = api(["Mailbox/get", {"accountId": acct}, "b"])
-boxes = {b.get("role") or b["name"]: b for b in (r.get("b", [[None, {}]])[0][1].get("list") or [])} if st == 200 else {}
+# The first message is delivered after its 250, so a busy machine may not have it in the mailbox yet.
+for _ in range(50):
+    st, h, r = api(["Mailbox/get", {"accountId": acct}, "b"])
+    boxes = {b.get("role") or b["name"]: b for b in (r.get("b", [[None, {}]])[0][1].get("list") or [])} if st == 200 else {}
+    if st != 200 or boxes.get("inbox", {}).get("totalEmails") == 1:
+        break
+    time.sleep(0.1)
 check("with it the API answers for the cookie's user", st == 200 and "inbox" in boxes and boxes["inbox"]["totalEmails"] == 1, (st, r))
 check("and the answer is not readable by another origin", "access-control-allow-origin" not in h, h)
 st, h, _ = web("GET", "/~mail/session", headers={"Cookie": "skl_idp=eyJhbGciOiJFUzI1NiJ9.e30.AAAA", "X-Socketley-UI": "1"})
@@ -347,6 +352,24 @@ for _ in $(seq 1 100); do
 done
 [ "$code" = 200 ] && grep -q '<title>Mail</title>' "$T/via" && ok "the entrance serves the page under the name" \
     || bad "the entrance serves the page under the name" "$code $(head -c 200 "$T/via" 2>/dev/null)"
+# The page in German where the browser asks for it: every word it says through say() has its German, with as many
+# places for what goes in.
+words=$(python3 - "$T/via" <<'PY'
+import json, re, sys
+page = open(sys.argv[1], encoding="utf-8").read()
+table = re.search(r"Object\.assign\(SAY, \{\n(.*?)\n\}\);", page, re.S)
+if not table:
+    print("no table"); sys.exit()
+de = json.loads("{" + table.group(1) + "}")
+used = set(re.findall(r"say\('((?:[^'\\]|\\.)*)'", page)) | set(re.findall(r"field\('([^']*)'", page))
+missing = sorted(u for u in used if u not in de)
+uneven = sorted(k for k, v in de.items() if k.count("%") != v.count("%"))
+unused = sorted(k for k in de if k not in used and ">" + k + "<" not in page and 'placeholder="%s"' % k not in page)
+print("ok" if not missing and not uneven and not unused and len(used) > 150 else
+      "missing %s uneven %s unused %s of %d" % (missing, uneven, unused, len(used)))
+PY
+)
+[ "$words" = ok ] && ok "every word of the page has its German, with its places for what goes in" || bad "the German words" "$words"
 session=$(via -H "Authorization: Basic $(printf 'bob:bobpassword12' | base64)" "https://webmail.example.test:$GATE/jmap/session")
 case "$session" in *'"apiUrl":"https://webmail.example.test'*) ok "behind it the session's URLs are the HTTPS it was reached over" ;;
     *) bad "behind it the session's URLs are the HTTPS it was reached over" "$(printf '%s' "$session" | head -c 300)" ;; esac

@@ -1323,6 +1323,7 @@ project "fuzz_mail"
         "socketley/runtime/mail/managesieve_session.cpp",
         "socketley/runtime/mail/imap_order.cpp",
         "socketley/runtime/mail/pop3_session.cpp",
+        "socketley/runtime/mail/mail_mbox.cpp",
         "socketley/shared/util/base64.cpp"
     }
     links(tls_libs())

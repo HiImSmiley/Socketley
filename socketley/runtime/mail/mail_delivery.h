@@ -112,6 +112,10 @@ private:
 
     void dispatch(const entry_ptr& e);
     void schedule(const entry_ptr& e, int64_t at);
+public:
+    // A message taken now and first tried at `at`, as one sent for later is.
+    void queued_at(const entry_ptr& e, int64_t at) { schedule(e, at); }
+private:
     void pump(route& r);
     void lookup(route& r);
     // The domain's MTA-STS policy brought up to date: its TXT record asked, and the policy fetched where its id

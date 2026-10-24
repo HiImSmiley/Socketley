@@ -46,7 +46,8 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "idp-user")
         return "idp-user <idp> add <user> [--password <pw>|-] [--name ..] [--email ..] [--groups a,b] [--set k=v] "
                "[--reset] | passwd <user> --password <pw>|- [--reset] | set <user> k=v... | disable|enable|logout|"
-               "remove|show <user> | list | import <storage>";
+               "remove|show <user> | list | import <storage> | totp <user> on|off | "
+               "app-password <user> add <label>|remove <label>|list";
     if (verb == "db-backup")  return "db-backup <db> <file>";
     if (verb == "db-restore") return "db-restore <db> <file>";
     if (verb == "db-query")   return "db-query <db> <collection> ['{\"where\":..,\"sort\":..,\"limit\":..,\"skip\":..}']";
@@ -59,6 +60,7 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "mail")
         return "mail [<mail>] [queue [filter] | show <id> | flush [id] | drop <id> | dns [--check] | suppressed | forgive <address> | "
                "unsubscribed | resubscribe <address> | learn <user>/<folder> --as spam|ham | trace <address> | usage [user] | "
+               "export <user> [dir] | import <user> <file.mbox|dir> | "
                "sieve <user> list|get <name>|put <name> <file|->|check <file|->|activate <name>|deactivate|delete <name>]";
     if (verb == "cluster")
         return "cluster [ls|ps|group <name>|stats|watch|show <daemon>|raft-status|placement|"

@@ -51,6 +51,12 @@ std::vector<std::string> of(const runtime_instance& rt, bool with_buckets)
         add_list(stg.get_website_domain(), out, with_buckets);
     }
     add_list(rt.get_domains(), out, false);
+    // A mail runtime's webmail answers mail clients too, under the names they ask for its zones' setup.
+    if (rt.get_type() == runtime_mail && static_cast<const mail_instance&>(rt).get_web_port() && !rt.get_domains().empty())
+    {
+        out.emplace_back("autoconfig");
+        out.emplace_back("autodiscover");
+    }
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;

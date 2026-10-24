@@ -1136,4 +1136,65 @@ bool parse_date(std::string_view v, int64_t& t, int& zone)
 }
 
 
+std::string preview(std::string_view message, const part& text, size_t bytes)
+{
+    const bool tags = text.subtype == "html";
+    const std::string s = to_utf8(decoded_body(message.substr(text.body_off, text.body_len), text.encoding),
+                                  param(text.params, "charset"));
+    std::string flat;
+    bool tag = false;
+    // Read only until it is longer than the preview, which what follows cannot change.
+    for (size_t i = 0; i < s.size() && flat.size() <= bytes; ++i)
+    {
+        const char c = s[i];
+        if (tags && (c == '<' || c == '>'))
+            tag = c == '<';
+        else if (tag)
+            continue;
+        else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        {
+            if (!flat.empty() && flat.back() != ' ')
+                flat += ' ';
+        }
+        else
+            flat += c;
+    }
+    if (flat.size() > bytes)
+    {
+        size_t n = bytes;
+        while (n > 0 && (static_cast<unsigned char>(flat[n]) & 0xC0) == 0x80)
+            --n;
+        flat.resize(n);
+    }
+    while (!flat.empty() && flat.back() == ' ')
+        flat.pop_back();
+    return flat;
+}
+
+namespace
+{
+
+const part* first_of(const part& p, std::string_view subtype, int depth)
+{
+    if (depth > 32)
+        return nullptr;
+    if (p.multipart())
+    {
+        for (const auto& c : p.children)
+            if (const part* got = first_of(c, subtype, depth + 1))
+                return got;
+        return nullptr;
+    }
+    return p.type == "text" && p.subtype == subtype && p.disposition != "attachment" ? &p : nullptr;
+}
+
+}   // namespace
+
+const part* preview_part(const part& root)
+{
+    if (const part* p = first_of(root, "plain", 0))
+        return p;
+    return first_of(root, "html", 0);
+}
+
 }   // namespace socketley::mail::mime

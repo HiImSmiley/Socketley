@@ -22,6 +22,8 @@
 //   8  bytes a POP3 client sends, in pieces cut where a 0xFF byte stands, user u password p signing in to a maildrop
 //      of two: nothing is removed but at QUIT, each once, and a line of a multi-line answer that begins with a dot
 //      is stuffed.
+//   9  an mbox file, read message by message: each read moves on, every line of a message ends in CRLF, and a
+//      message written back as an mbox entry reads back as itself, its flags and keywords with it.
 
 #include <algorithm>
 #include <cctype>
@@ -31,6 +33,7 @@
 #include "../../socketley/runtime/mail/mail_aliases.h"
 #include "../../socketley/runtime/mail/mail_compose.h"
 #include "../../socketley/runtime/mail/mail_dkim.h"
+#include "../../socketley/runtime/mail/mail_mbox.h"
 #include "../../socketley/runtime/mail/mail_mime.h"
 #include "../../socketley/runtime/mail/mail_sieve.h"
 #include "../../socketley/runtime/mail/mail_sieve_store.h"
@@ -198,6 +201,39 @@ void mime_case(std::string_view msg)
     const std::string bs = mime::structure(root, msg, true);
     check_literals(bs);
     check_literals(mime::envelope(msg.substr(0, root.header_len)));
+    if (const mime::part* text = mime::preview_part(root))
+    {
+        const std::string p = mime::preview(msg, *text);
+        FUZZ_CHECK(p.size() <= 256 && p.find_first_of("\r\n\t") == std::string::npos && !p.ends_with(' '),
+                   "a preview longer than 256 bytes, or with a line's end in it");
+    }
+}
+
+void mbox_case(std::string_view text)
+{
+    size_t at = 0;
+    mbox::message m;
+    for (int n = 0; n < 1000; ++n)
+    {
+        const size_t before = at;
+        if (!mbox::next(text, at, true, m))
+            break;
+        FUZZ_CHECK(at > before && at <= text.size(), "a read that does not move on");
+        for (size_t i = 0; i < m.bytes.size(); ++i)
+            if (m.bytes[i] == '\n')
+                FUZZ_CHECK(i > 0 && m.bytes[i - 1] == '\r', "a line of a message that ends in a bare LF");
+        // A message whose first line is folded would take the flags' header for the one it folds, and a line that
+        // ends in a CR of its own is one an mbox's LF cannot tell from its end.
+        if (m.bytes.empty() || m.bytes.front() == ' ' || m.bytes.front() == '\t' ||
+            m.bytes.find("\r\r\n") != std::string::npos)
+            continue;
+        const std::string e = mbox::entry(m.bytes, m.flags, m.keywords, m.date_ms);
+        size_t at2 = 0;
+        mbox::message back;
+        FUZZ_CHECK(mbox::next(e, at2, true, back) && at2 == e.size(), "an entry that does not read back whole");
+        FUZZ_CHECK(back.bytes == m.bytes, "an entry that reads back as another message");
+        FUZZ_CHECK(back.flags == m.flags && back.keywords == m.keywords, "an entry whose flags or keywords change");
+    }
 }
 
 void dkim_case(std::string_view msg)
@@ -510,7 +546,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size < 1 || size > (64u << 10))
         return 0;
     const std::string_view in(reinterpret_cast<const char*>(data) + 1, size - 1);
-    switch (data[0] % 9)
+    switch (data[0] % 10)
     {
         case 0: smtp(in); break;
         case 1: mime_case(in); break;
@@ -521,6 +557,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         case 6: managesieve_case(in); break;
         case 7: order_case(in); break;
         case 8: pop3_case(in); break;
+        case 9: mbox_case(in); break;
     }
     return 0;
 }

@@ -95,6 +95,18 @@ public:
     void set_reports(bool v) { m_reports = v; }
     bool get_reports() const { return m_reports; }
     // The address its published DMARC record names for reports.
+    // The attachments' extensions mail from elsewhere is refused for, comma-separated; "none" for none refused.
+    void set_refused_attachments(std::string_view v) { m_refused_attachments = std::string(v); }
+    std::string_view get_refused_attachments() const { return m_refused_attachments; }
+    // The clamd mail from elsewhere is scanned by, host:port or a unix socket's path; empty for none.
+    void set_clamav(std::string_view v) { m_clamav = std::string(v); }
+    std::string_view get_clamav() const { return m_clamav; }
+    // What its DMARC record asks of mail that fails: none, quarantine or reject.
+    void set_dmarc_policy(std::string_view v) { m_dmarc_policy = std::string(v); }
+    std::string_view get_dmarc_policy() const { return m_dmarc_policy; }
+    // Its BIMI logo's https URL, and a comma and its mark certificate's where it has one (RFC draft-brand-indicators).
+    void set_bimi(std::string_view v) { m_bimi = std::string(v); }
+    std::string_view get_bimi() const { return m_bimi; }
     void set_dmarc_rua(std::string_view v) { m_dmarc_rua = std::string(v); }
     std::string_view get_dmarc_rua() const { return m_dmarc_rua; }
     // The address its _smtp._tls record names for TLS reports.
@@ -193,6 +205,10 @@ private:
     std::string m_delimiter{"+"};
     bool m_reports{false};
     std::string m_dmarc_rua;
+    std::string m_dmarc_policy{"quarantine"};
+    std::string m_refused_attachments{"default"};
+    std::string m_clamav;
+    std::string m_bimi;
     std::string m_tls_rpt;
     std::string m_mta_sts;
     uint64_t m_default_quota{0};

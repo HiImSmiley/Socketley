@@ -61,4 +61,10 @@ std::string param(const std::vector<std::pair<std::string, std::string>>& params
 // An RFC 5322 date, the obsolete forms among it, as unix time and the zone it was written in, minutes east of UTC.
 bool parse_date(std::string_view v, int64_t& t, int& zone);
 
+// The first `bytes` of a text part's words, its runs of white space one space and an HTML part's tags taken out, cut
+// where a UTF-8 character begins: what JMAP's preview and IMAP's PREVIEW (RFC 8970) show of a message.
+std::string preview(std::string_view message, const part& text, size_t bytes = 256);
+// The part a preview is of: the first text/plain that is no attachment, else the first such text/html; null for none.
+const part* preview_part(const part& root);
+
 }   // namespace socketley::mail::mime

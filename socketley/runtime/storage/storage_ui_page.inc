@@ -546,6 +546,9 @@ body.audio #ups,body.audio #selbar{bottom:96px}
 'use strict';
 // ─── helpers ────────────────────────────────────────────────────────────────
 const $ = (s, r = document) => r.querySelector(s);
+// The page's words in the reader's language where the page filled SAY with them, each `%` taking an argument in turn.
+const SAY = {};
+function say(s, ...a) { const w = SAY[s] || s; let i = 0; return a.length ? w.replace(/%/g, () => a[i++]) : w; }
 function el(t, a, ...kids) {
   const e = document.createElement(t);
   for (const [k, v] of Object.entries(a || {})) {
@@ -766,7 +769,7 @@ function modal(title, body, foot, wide) {
   const s = el('div', { class: 'scrim' }, box);
   const close = () => { s.remove(); const i = layers.indexOf(L); if (i >= 0) layers.splice(i, 1); if (L.onclose) L.onclose(); };
   const L = { close, esc: close, box };
-  box.append(el('div', { class: 'dh' }, el('h3', { text: title }), ibtn('close', 'Close', close)), el('div', { class: 'db' }, body));
+  box.append(el('div', { class: 'dh' }, el('h3', { text: title }), ibtn('close', say('Close'), close)), el('div', { class: 'db' }, body));
   if (foot) box.append(el('div', { class: 'df' }, foot));
   s.addEventListener('mousedown', e => { if (e.target === s) close(); });
   host().append(s); layers.push(L);
@@ -778,7 +781,7 @@ function ask({ title, text, input, value, ok = 'OK', danger }) {
     const inp = input ? el('input', { class: 'inp', value: value || '', placeholder: input, spellcheck: 'false', style: 'width:100%' }) : null;
     const finish = v => { if (done) return; done = true; L.close(); res(v); };
     const go = () => finish(inp ? inp.value.trim() || null : true);
-    const L = modal(title, [text ? el('p', { text }) : null, inp], [btn(null, 'Cancel', () => finish(null)), btn(null, ok, go, danger ? 'badf' : 'pri')]);
+    const L = modal(title, [text ? el('p', { text }) : null, inp], [btn(null, say('Cancel'), () => finish(null)), btn(null, ok, go, danger ? 'badf' : 'pri')]);
     L.onclose = () => { if (!done) { done = true; res(null); } };
     L.box.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
     if (inp) { inp.focus(); const dot = (value || '').lastIndexOf('.'); inp.setSelectionRange(0, dot > 0 ? dot : (value || '').length); }

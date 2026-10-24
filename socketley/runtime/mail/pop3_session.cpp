@@ -1,4 +1,5 @@
 #include "pop3_session.h"
+#include "mail_sasl.h"
 
 #include <algorithm>
 #include <charconv>
@@ -52,7 +53,7 @@ void pop3_session::capabilities()
     const bool sasl = m_cfg.tls_active || m_cfg.login_in_clear;
     std::string out = "+OK Capability list follows\r\nTOP\r\nUIDL\r\nRESP-CODES\r\nAUTH-RESP-CODE\r\nPIPELINING\r\n";
     if (sasl)
-        out += "USER\r\nSASL PLAIN\r\n";
+        out += m_cfg.bearer_offered ? "USER\r\nSASL PLAIN XOAUTH2 OAUTHBEARER\r\n" : "USER\r\nSASL PLAIN\r\n";
     if (m_cfg.tls_offered && !m_cfg.tls_active && !m_transaction)
         out += "STLS\r\n";
     out += "IMPLEMENTATION socketley\r\n.\r\n";
@@ -203,6 +204,15 @@ void pop3_session::command(std::string_view line)
             return;
         }
         std::string raw;
+        if (m_sasl_mech != "plain")
+        {
+            std::string user, token;
+            if (!socketley::base64::decode(line, raw) || !sasl_bearer(m_sasl_mech, raw, user, token) || user.empty())
+                err("[AUTH] authentication failed");
+            else
+                sign_in(std::move(user), std::move(token));
+            return;
+        }
         const size_t a = socketley::base64::decode(line, raw) ? raw.find('\0') : std::string::npos;
         const size_t b = a == std::string::npos ? a : raw.find('\0', a + 1);
         if (b == std::string::npos || raw.substr(a + 1, b - a - 1).empty() ||
@@ -302,9 +312,9 @@ void pop3_session::command(std::string_view line)
             socketley::ascii::lower_in_place(mech);
             if (!may)
                 err("[AUTH] a password goes over TLS only: STLS first");
-            else if (mech != "plain")
-                err("only PLAIN is offered");
-            else if (!arg2.empty())
+            else if (mech != "plain" && !(m_cfg.bearer_offered && (mech == "xoauth2" || mech == "oauthbearer")))
+                err(m_cfg.bearer_offered ? "PLAIN, XOAUTH2 and OAUTHBEARER are offered" : "only PLAIN is offered");
+            else if (m_sasl_mech = mech == "plain" ? "plain" : mech == "xoauth2" ? "XOAUTH2" : "OAUTHBEARER"; !arg2.empty())
             {
                 m_sasl = true;
                 command(arg2 == "=" ? std::string_view{} : arg2);

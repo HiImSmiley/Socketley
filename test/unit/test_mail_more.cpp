@@ -11,7 +11,13 @@
 
 #include "runtime/mail/imap_utf7.h"
 #include "runtime/mail/mail_bayes.h"
+#include "runtime/mail/mail_content.h"
+#include "runtime/mail/mail_sasl.h"
+#include "runtime/mail/mail_setup.h"
 #include "runtime/mail/mail_greylist.h"
+#include "runtime/mail/mail_mbox.h"
+#include "runtime/mail/mail_mime.h"
+#include "runtime/mail/imap_store.h"
 #include "runtime/mail/mail_reports.h"
 #include "runtime/mail/mail_rspamd.h"
 #include "runtime/mail/mail_srs.h"
@@ -527,4 +533,140 @@ TEST_CASE("bayes: the table survives its file and its journal's lines, a line cu
     bayes none;
     CHECK(none.load(path, why));
     CHECK(none.words() == 0);
+}
+
+TEST_CASE("sasl: XOAUTH2 and OAUTHBEARER give their user and token, and anything else none")
+{
+    std::string user, token;
+    CHECK(sasl_bearer("XOAUTH2", std::string("user=alice@x.test\x01" "auth=Bearer tok.en-1\x01\x01"), user, token));
+    CHECK(user == "alice@x.test");
+    CHECK(token == "tok.en-1");
+    CHECK(sasl_bearer("OAUTHBEARER", std::string("n,a=bob,\x01host=mail\x01port=993\x01" "auth=Bearer abc\x01\x01"), user, token));
+    CHECK(user == "bob");
+    CHECK(token == "abc");
+    CHECK(sasl_bearer("OAUTHBEARER", std::string("n,,\x01" "auth=Bearer abc\x01\x01"), user, token));
+    CHECK(user.empty());
+    CHECK_FALSE(sasl_bearer("XOAUTH2", std::string("user=a\x01" "auth=Basic abc\x01\x01"), user, token));
+    CHECK_FALSE(sasl_bearer("XOAUTH2", std::string("user=a\x01" "auth=Bearer \x01\x01"), user, token));
+    CHECK_FALSE(sasl_bearer("PLAIN", std::string("\0a\0b", 4), user, token));
+}
+
+TEST_CASE("content: an attachment of a kind that runs is named, an ordinary one and a list of none are not")
+{
+    const auto with = [](const std::string& name) {
+        return "From: a@b\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n"
+               "Content-Type: text/plain\r\n\r\nhi\r\n--b\r\nContent-Type: application/octet-stream; name=\"" + name +
+               "\"\r\nContent-Disposition: attachment; filename=\"" + name + "\"\r\n\r\nxx\r\n--b--\r\n";
+    };
+    CHECK(refused_attachment(with("Setup.EXE"), "default") == "Setup.EXE");
+    CHECK(refused_attachment(with("budget.xlsm"), "default") == "budget.xlsm");
+    CHECK(refused_attachment(with("report.pdf"), "default").empty());
+    CHECK(refused_attachment(with("setup.exe"), "none").empty());
+    CHECK(refused_attachment(with("report.pdf"), "pdf, .zip") == "report.pdf");
+    CHECK(refused_attachment("From: a@b\r\nSubject: plain\r\n\r\nno parts\r\n", "default").empty());
+}
+
+TEST_CASE("setup: what Thunderbird, Outlook and an Apple device are told names the host, the TLS ports and the address")
+{
+    client_settings s;
+    s.hostname = "mail.x.test";
+    s.email = "a&b@x.test";
+    s.domain = "x.test";
+    s.imaps = 993;
+    s.submission = 587;
+    const std::string tb = thunderbird_autoconfig(s);
+    CHECK(tb.find("<hostname>mail.x.test</hostname>") != std::string::npos);
+    CHECK(tb.find("<port>993</port>\n      <socketType>SSL</socketType>") != std::string::npos);
+    CHECK(tb.find("<port>587</port>\n      <socketType>STARTTLS</socketType>") != std::string::npos);
+    CHECK(tb.find("pop3") == std::string::npos);
+    const std::string ol = outlook_autodiscover(s);
+    CHECK(ol.find("<LoginName>a&amp;b@x.test</LoginName>") != std::string::npos);
+    CHECK(ol.find("<Encryption>TLS</Encryption>") != std::string::npos);
+    const std::string ap = apple_mobileconfig(s);
+    CHECK(ap.find("<key>EmailAddress</key><string>a&amp;b@x.test</string>") != std::string::npos);
+    CHECK(ap == apple_mobileconfig(s));
+    CHECK(autodiscover_address("<Request><EMailAddress> u@x.test </EMailAddress></Request>") == "u@x.test");
+    CHECK(autodiscover_address("<EMailAddress>bad\"x</EMailAddress>").empty());
+    CHECK(outlook_autodiscover_json("autodiscover.x.test") ==
+          "{\"Protocol\":\"AutodiscoverV1\",\"Url\":\"https://autodiscover.x.test/autodiscover/autodiscover.xml\"}");
+}
+
+TEST_CASE("mbox: a message written out reads back as itself, its flags, keywords and date with it")
+{
+    const std::string msg = "Subject: hi\r\n\r\nFrom the start\r\n>From before\r\nlast\r\n\r\n";
+    const std::string e = mbox::entry(msg, flag_seen | flag_flagged | flag_answered, {"$Forwarded", "work"},
+                                      1792900800000);
+    CHECK(e.starts_with("From MAILER-DAEMON Sun Oct 25 04:00:00 2026\nStatus: RO\nX-Status: AF\n"
+                        "X-Keywords: $Forwarded work\nSubject: hi\n\n>From the start\n>>From before\n"));
+    CHECK(e.find('\r') == std::string::npos);
+    // Two entries one after the other, the first ending in an empty line of its own.
+    const std::string two = e + mbox::entry("Subject: two\r\n\r\nbody\r\n", 0, {}, 0);
+    size_t at = 0;
+    mbox::message m;
+    REQUIRE(mbox::next(two, at, true, m));
+    CHECK(m.bytes == msg);
+    CHECK(m.flags == (flag_seen | flag_flagged | flag_answered));
+    CHECK(m.keywords == std::vector<std::string>{"$Forwarded", "work"});
+    CHECK(m.date_ms == 1792900800000);
+    REQUIRE(mbox::next(two, at, true, m));
+    CHECK(m.bytes == "Subject: two\r\n\r\nbody\r\n");
+    CHECK(m.flags == 0);
+    CHECK(at == two.size());
+    CHECK_FALSE(mbox::next(two, at, true, m));
+    // A message still being read is not taken until what follows it is.
+    at = 0;
+    CHECK(mbox::next(two, at, false, m));
+    CHECK_FALSE(mbox::next(two, at, false, m));
+    // An empty message between two is one, and no part of the next.
+    const std::string empty = "From a Thu Jan  1 00:00:00 2026\nFrom b Thu Jan  1 00:00:00 2026\nX: y\n";
+    at = 0;
+    REQUIRE(mbox::next(empty, at, true, m));
+    CHECK(m.bytes.empty());
+    REQUIRE(mbox::next(empty, at, true, m));
+    CHECK(m.bytes == "X: y\r\n");
+}
+
+TEST_CASE("mbox: a Takeout's labels say the folder and the flags")
+{
+    uint8_t f = 0;
+    CHECK(mbox::folder_of_labels("Inbox,Opened,Category Updates", f) == "INBOX");
+    CHECK(f == flag_seen);
+    f = 0;
+    CHECK(mbox::folder_of_labels("Spam,Unread", f) == "Junk");
+    CHECK(f == 0);
+    f = 0;
+    CHECK(mbox::folder_of_labels("Important,Work/Projects,Starred", f) == "Work/Projects");
+    CHECK(f == (flag_seen | flag_flagged));
+    f = 0;
+    CHECK(mbox::folder_of_labels("Archived,Opened", f) == "Archive");
+    CHECK(mbox::folder_of_labels("\"Clients, old\",Opened", f) == "Clients, old");
+    CHECK(mbox::folder_of_labels("Inbox,Sent", f) == "Sent");
+    CHECK(mbox::folder_of_labels("Trash,Inbox", f) == "Trash");
+    const std::string takeout = "From 1234@xxx Mon Oct 19 10:00:00 +0000 2026\r\nX-GM-THRID: 1\r\n"
+                                "X-Gmail-Labels: Inbox,\r\n Unread\r\nSubject: s\r\n\r\nb\r\n";
+    size_t at = 0;
+    mbox::message m;
+    REQUIRE(mbox::next(takeout, at, true, m));
+    CHECK(m.folder == "INBOX");
+    CHECK(m.flags == 0);
+    CHECK(m.date_ms == 1792404000000);
+    CHECK(m.bytes == "X-GM-THRID: 1\r\nSubject: s\r\n\r\nb\r\n");
+}
+
+TEST_CASE("preview: a message's text from its start, its white space one space and its tags out, of 256 bytes")
+{
+    const std::string msg = "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n"
+                            "Content-Type: text/plain; name=x.txt\r\nContent-Disposition: attachment\r\n\r\nnot this\r\n"
+                            "--b\r\nContent-Type: text/html\r\n\r\n<p>Hello\r\n  <b>there</b></p>  \r\n--b--\r\n";
+    const mime::part root = mime::parse(msg);
+    const mime::part* text = mime::preview_part(root);
+    REQUIRE(text);
+    CHECK(text->subtype == "html");
+    CHECK(mime::preview(msg, *text) == "Hello there");
+    const std::string longer = "Subject: x\r\n\r\n" + std::string(300, 'a');
+    const mime::part r2 = mime::parse(longer);
+    CHECK(mime::preview(longer, *mime::preview_part(r2)).size() == 256);
+    const std::string umlauts = "Content-Type: text/plain; charset=utf-8\r\n\r\n" + std::string(255, 'a') + "\xc3\xa4";
+    const mime::part r3 = mime::parse(umlauts);
+    CHECK(mime::preview(umlauts, *mime::preview_part(r3)) == std::string(255, 'a'));
 }

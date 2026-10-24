@@ -1,6 +1,7 @@
 #include "cli.h"
 
 #include <chrono>
+#include <ctime>
 #include <algorithm>
 #include <filesystem>
 #include <map>
@@ -812,6 +813,7 @@ int cli_mail_overview(const char* runtime)
               << "  lists      " << stat("mail_suppressed") << " suppressed after a bounce, " << stat("mail_unsubscribed")
               << " unsubscribed\n"
               << (stat("mail_self_listed_by") == "0" ? std::string() : "  BLOCKLISTED its address is on " + stat("mail_self_listed_by") + "\n")
+              << (stat("mail_name_mismatch") == "0" ? std::string() : "  REVERSE DNS " + stat("mail_name_mismatch") + "\n")
               << "  spam       " << (cfg_s("rspamd").empty() ? "" : "scored by " + cfg_s("rspamd") + ", else ")
               << "learned from the users: " << stat("mail_bayes_spam") << " spam, " << stat("mail_bayes_ham")
               << " not, " << stat("mail_bayes_junked") << " put in Junk\n"
@@ -826,7 +828,8 @@ namespace
 {
 
 constexpr std::string_view mail_verbs[] = {"queue", "show", "flush", "drop", "dns", "suppressed", "forgive",
-                                           "sieve", "unsubscribed", "resubscribe", "learn", "trace", "usage"};
+                                           "sieve", "unsubscribed", "resubscribe", "learn", "trace", "usage",
+                                           "export", "import"};
 
 // The one mail runtime the daemon has, for a command that names none; empty, said why, where there is none or more.
 std::string only_mail_runtime()
@@ -912,6 +915,61 @@ int cli_mail(int argc, char** argv)
         ipc_frame::append_arg(cmd, socketley::base64::encode(std::string(where.substr(0, slash)) + "\n" + std::string(as) +
                                                              "\n" + std::string(where.substr(slash + 1))));
         return ask(cmd);
+    }
+    // `export <user> [<dir>]` and `import <user> <file.mbox|dir>`: a job of the runtime's, asked after until it ends.
+    if (verb == "export" || verb == "import")
+    {
+        if (argc < 5 || argc > 6 || (verb == "import" && argc != 6))
+        {
+            std::cerr << "usage: socketley mail [<mail>] export <user> [<dir>]\n"
+                         "       socketley mail [<mail>] import <user> <file.mbox|dir>\n";
+            return 1;
+        }
+        std::string path;
+        if (argc == 6)
+        {
+            std::error_code ec;
+            path = std::filesystem::absolute(argv[5], ec).lexically_normal().string();
+            if (path.size() > 1 && path.ends_with('/'))
+                path.pop_back();
+        }
+        else
+        {
+            char stamp[32];
+            const time_t now = ::time(nullptr);
+            std::tm tm{};
+            ::localtime_r(&now, &tm);
+            std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
+            path = "/var/tmp/socketley-mail/" + std::string(argv[4]) + "-" + stamp;
+        }
+        std::string cmd = "mail ";
+        ipc_frame::append_arg(cmd, argv[2]);
+        cmd += " " + std::string(verb) + " ";
+        ipc_frame::append_arg(cmd, socketley::base64::encode(std::string(argv[4]) + "\n" + path));
+        std::string out;
+        if (const int rc = ipc_send(cmd, out); rc < 0)
+            return ipc_report_failure(rc);
+        else if (rc != 0 || !out.starts_with("job "))
+        {
+            std::cout << out << (out.ends_with('\n') ? "" : "\n");
+            return 1;
+        }
+        std::string poll = "mail ";
+        ipc_frame::append_arg(poll, argv[2]);
+        poll += " job ";
+        poll += trimmed_text(std::string_view(out).substr(4));
+        for (;;)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::string st;
+            const int rc = ipc_send(poll, st);
+            if (rc < 0)
+                return ipc_report_failure(rc);
+            if (rc == 0 && st.starts_with("running"))
+                continue;
+            std::cout << st << (st.ends_with('\n') ? "" : "\n");
+            return rc != 0 || st.starts_with("error") ? 1 : 0;
+        }
     }
     // `usage` alone is every user of the runtime's idp, asked of the idp here.
     if (verb == "usage" && argc == 4)

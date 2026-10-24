@@ -31,6 +31,12 @@ struct check_resolver
         return true;
     }
     virtual bool mx(const std::string& name, std::vector<std::string>& out, bool& nx) = 0;
+    // The names an address's PTR records give it, for a check of this host's own; none where it is not asked.
+    virtual bool ptr(const std::string& /*ip*/, std::vector<std::string>& /*out*/, bool& nx)
+    {
+        nx = false;
+        return false;
+    }
 };
 
 // The system's resolver, through res_nquery, pointed at the servers of SOCKETLEY_RESOLV_CONF where it is set; its

@@ -7,6 +7,7 @@
 // the index, the same on every shard, so */changes says cannotCalculateChanges whenever it is not the client's.
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -54,13 +55,27 @@ public:
         virtual std::string idp_logout(const std::string& /*back*/) { return {}; }
         // The client the entrance forwards, whose failed sign-ins count against it.
         virtual void forward(std::string /*client*/) {}
+        // What a mail client is told of how to reach the mailbox of `email`: "autoconfig", "autodiscover",
+        // "mobileconfig" or the webmail's "json"; empty for an address none of its domains holds.
+        virtual std::string client_setup(std::string_view /*kind*/, const std::string& /*email*/) { return {}; }
+        // The webmail's filter rules, the Sieve script "webmail": read where `script` is none, or put and made the
+        // active one, answered with a status and JSON.
+        virtual void filters(const std::string& /*user*/, std::optional<std::string> /*script*/,
+                             std::function<void(int, std::string)> done)
+        {
+            done(404, "{\"error\":\"no filters here\"}");
+        }
         // An advertisement's recipient unsubscribed by the token its link carries, false where the token is none.
         virtual bool unsubscribe(const std::string& /*token*/) { return false; }
         // The address a signed-in user sends as.
         virtual std::string address_of(const std::string& user) = 0;
+        // Every address they may send as, theirs first: the same name under each domain, and the aliases that are theirs.
+        virtual std::vector<std::string> addresses_of(const std::string& user) { return {address_of(user)}; }
         // A message queued to go from `from` to `rcpts`, answered with its spool id.
+        // Held until `hold_until_ms` where that is later than now (FUTURERELEASE, RFC 4865).
         virtual void submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts,
-                            std::string message, std::function<void(bool, std::string)> done) = 0;
+                            std::string message, std::function<void(bool, std::string)> done,
+                            int64_t hold_until_ms = 0) = 0;
         // What was put into a folder, for imapsieve.
         virtual void acted(const std::string& /*user*/, const std::string& /*folder*/, std::string /*cause*/,
                            std::vector<uint32_t> /*uids*/) {}
@@ -158,6 +173,8 @@ private:
     void email_import(const json::jvalue& args, const std::shared_ptr<call_state>& cs, std::function<void(answer)> done);
     void email_parse(const json::jvalue& args, std::function<void(answer)> done);
     void vacation_get(const json::jvalue& args, std::function<void(answer)> done);
+    // The account's one quota on the octets its mail takes (RFC 9425), none where no --quota is set.
+    void quota(const std::string& name, const json::jvalue& args, std::function<void(answer)> done);
     void vacation_set(const json::jvalue& args, std::function<void(answer)> done);
     void push_get(const json::jvalue& args, std::function<void(answer)> done);
     void identity_set(const json::jvalue& args, std::function<void(answer)> done);

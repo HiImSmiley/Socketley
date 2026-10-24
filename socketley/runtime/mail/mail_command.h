@@ -39,6 +39,11 @@ enum class verb : uint8_t
     trace        = 14,
     // How much the mailboxes of the users, the argument's comma-separated names, hold against their quota.
     usage        = 15,
+    // A user's mailbox written out as mbox files, or mbox files read into it: the argument is the user and the path, a
+    // line each, in base64, and the answer the job's number, which `job` asks after.
+    export_box   = 16,
+    import_box   = 17,
+    job          = 18,
 };
 
 struct attachment

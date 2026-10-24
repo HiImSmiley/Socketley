@@ -1,4 +1,5 @@
 #include "idp_run.h"
+#include "idp_totp.h"
 
 #include "../../shared/util/ascii.h"
 
@@ -440,6 +441,8 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         account_post(c, rq);
     else if (p == "/account/password" && post)
         password_post(c, rq);
+    else if ((p == "/account/totp" || p == "/account/app-password") && post)
+        security_post(c, rq);
     else if (p == "/.well-known/openid-configuration" || p == "/jwks" || p == "/authorize" || p == "/login" ||
              p == "/token" || p == "/userinfo" || p == "/logout" || p == "/" || p.starts_with("/account"))
         respond(c, 405, "text/plain", "method not allowed\n");
@@ -709,6 +712,85 @@ void idp_run::login_page(const std::shared_ptr<conn>& c, const params& p, std::s
     respond(c, status, "text/html; charset=utf-8", page("Sign in", body));
 }
 
+// `n` bytes from the kernel's generator, for a key or an app password; empty where it gave none.
+static std::string random_string(size_t n)
+{
+    std::string b(n, '\0');
+    return socketley::random_bytes(b.data(), n) ? b : std::string();
+}
+
+void idp_run::code_page(const std::shared_ptr<conn>& c, const std::string& pending, std::string_view error, int status)
+{
+    const std::string body =
+        "<h1>Sign in</h1><p class=\"small\">The code your authenticator app shows now.</p><form method=\"post\">"
+        "<input type=\"hidden\" name=\"pending\" value=\"" + html_escape(pending) + "\"><label for=\"c\">Code</label>"
+        "<input id=\"c\" type=\"text\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" "
+        "pattern=\"[0-9 ]{6,7}\" autofocus required>" +
+        (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
+        "<button type=\"submit\">Sign in</button></form>";
+    respond(c, status, "text/html; charset=utf-8", page("Sign in", body));
+}
+
+bool idp_run::code_right(const account& a, std::string_view code)
+{
+    std::string secret;
+    if (!base32_decode(a.field("totp"), secret))
+        return false;
+    uint64_t& last = m_totp_used[a.id];
+    const uint64_t step = totp_step(secret, code, wall::now_sec(), last);
+    if (!step)
+        return false;
+    last = step;
+    return true;
+}
+
+void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, params p)
+{
+    const std::string token(param(p, "pending"));
+    const std::string ip = client_ip(*c, rq);
+    const auto it = m_pending.find(token);
+    if (it == m_pending.end() || it->second.until_s < wall::now_sec())
+    {
+        if (it != m_pending.end())
+            m_pending.erase(it);
+        login_page(c, {}, "The sign-in took too long; sign in again.", 401);
+        return;
+    }
+    if (barred(ip, wall::now_sec()))
+    {
+        ++m_c.barred;
+        login_page(c, it->second.p, "Too many failed sign-ins from here; try again in a quarter of an hour.", 429);
+        return;
+    }
+    const account* a = m_accounts.by_id(it->second.id);
+    if (!a || a->disabled())
+    {
+        m_pending.erase(it);
+        login_page(c, {}, "The user or password is not right.", 401);
+        return;
+    }
+    if (!code_right(*a, param(p, "code")))
+    {
+        ++m_c.refused;
+        std::weak_ptr<conn> weak = c;
+        c->waiting = true;
+        missed(ip, wall::now_sec(), [this, weak, token] {
+            auto c2 = weak.lock();
+            if (!c2 || c2->dead)
+                return;
+            c2->waiting = false;
+            code_page(c2, token, "That code is not the one the app shows.", 401);
+            m_http.resume(c2);
+        });
+        return;
+    }
+    const params carried = it->second.p;
+    const bool remember = it->second.remember;
+    m_pending.erase(it);
+    ++m_c.sign_ins;
+    grant(c, carried, *a, session_cookie(*a, remember));
+}
+
 void idp_run::authorize(const std::shared_ptr<conn>& c, const request& rq)
 {
     const params p = parse_form(rq.query);
@@ -750,6 +832,12 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
     else if (const std::string_view rd = param(p, "rd"); !rd.empty() && !return_allowed(rd, m_issuer, m_cookie_domain))
     {
         respond(c, 400, "text/plain", "the return address is outside this provider's domain\n");
+        return;
+    }
+    // The code of the second step, for a sign-in whose password was right.
+    if (!param(p, "pending").empty())
+    {
+        second_step(c, rq, std::move(p));
         return;
     }
     const std::string user(param(p, "username"));
@@ -795,6 +883,20 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
         cc->waiting = false;
         if (a->field("reset") == "1")
             reset_page(cc, p, {}, 200);
+        else if (!a->field("totp").empty())
+        {
+            // Its password right, the code is asked for, what the sign-in carries kept here five minutes.
+            const int64_t now = wall::now_sec();
+            std::erase_if(m_pending, [now](const auto& kv) { return kv.second.until_s < now; });
+            if (m_pending.size() < 10000)
+            {
+                const std::string token = socketley::random_hex(24);
+                m_pending[token] = {a->id, remember, p, now + 300};
+                code_page(cc, token, {}, 200);
+            }
+            else
+                login_page(cc, p, "Too many sign-ins are waiting for their code; try again in a minute.", 429);
+        }
         else
         {
             ++m_c.sign_ins;
@@ -810,6 +912,63 @@ void idp_run::check_password(const account* who, std::string_view password, std:
     static const std::string dummy = socketley::storage::password_hash("socketley-no-such-user");
     const std::string hash(who && !who->field("password").empty() ? who->field("password") : std::string_view(dummy));
     const bool real = who && !who->field("password").empty();
+    check_hash(hash, real, password, std::move(then));
+}
+
+void idp_run::check_mail_password(const account* who, std::string password, std::function<void(bool)> then)
+{
+    // An app password a line: label, hash and when it was made, apart by tabs.
+    std::vector<std::string> hashes;
+    if (who)
+        for (std::string_view rest = who->field("app_passwords"); !rest.empty();)
+        {
+            const size_t nl = rest.find('\n');
+            const std::string_view line = rest.substr(0, nl);
+            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            const size_t t1 = line.find('\t'), t2 = t1 == std::string_view::npos ? t1 : line.find('\t', t1 + 1);
+            if (t2 != std::string_view::npos)
+                hashes.emplace_back(line.substr(t1 + 1, t2 - t1 - 1));
+        }
+    const bool second = who && !who->field("totp").empty();
+    auto list = std::make_shared<const std::vector<std::string>>(std::move(hashes));
+    // With a second step on, a mail app signs in with an app password alone, as it has no code to give.
+    if (second || !list->empty())
+    {
+        if (second)
+        {
+            if (list->empty())
+                check_password(nullptr, password, [then](bool) { then(false); });
+            else
+                check_app_passwords(list, 0, std::move(password), std::move(then));
+            return;
+        }
+        check_password(who, password, [this, list, password, then](bool ok) {
+            if (ok)
+                then(true);
+            else
+                check_app_passwords(list, 0, password, then);
+        });
+        return;
+    }
+    check_password(who, password, std::move(then));
+}
+
+void idp_run::check_app_passwords(std::shared_ptr<const std::vector<std::string>> hashes, size_t i, std::string password,
+                                  std::function<void(bool)> then)
+{
+    if (i >= hashes->size())
+        return then(false);
+    const std::string hash = (*hashes)[i];
+    check_hash(hash, true, password, [this, hashes, i, password, then](bool ok) {
+        if (ok)
+            then(true);
+        else
+            check_app_passwords(hashes, i + 1, password, then);
+    });
+}
+
+void idp_run::check_hash(std::string hash, bool real, std::string_view password, std::function<void(bool)> then)
+{
     if (!m_hash.enabled())
     {
         const bool ok = socketley::storage::password_matches(hash, password);
@@ -1179,8 +1338,181 @@ void idp_run::account_page(const std::shared_ptr<conn>& c, const request& rq, st
         "current-password\" required><label for=\"n\">New password</label><input id=\"n\" type=\"password\" "
         "name=\"new\" autocomplete=\"new-password\" required><button type=\"submit\">Change password</button></form>"
         "<form method=\"post\" action=\"/account/everywhere\"><button type=\"submit\">Sign out everywhere</button>"
-        "</form>";
+        "</form>" + security_html(*who);
     respond(c, status, "text/html; charset=utf-8", page("Your account", body));
+}
+
+std::string idp_run::security_html(const account& who)
+{
+    std::string out = "<h2>Two-step sign-in</h2>";
+    if (who.field("totp").empty())
+        out += "<p class=\"small\">Off: your password alone signs you in.</p><form method=\"post\" "
+               "action=\"/account/totp\"><input type=\"hidden\" name=\"do\" value=\"start\"><button type=\"submit\">"
+               "Turn on</button></form>";
+    else
+        out += "<p class=\"small\">On: a code from your authenticator app follows your password, and mail apps sign in "
+               "with an app password.</p><form method=\"post\" action=\"/account/totp\"><input type=\"hidden\" "
+               "name=\"do\" value=\"off\"><label for=\"tc\">Code</label><input id=\"tc\" type=\"text\" name=\"code\" "
+               "inputmode=\"numeric\" autocomplete=\"one-time-code\" required><button type=\"submit\">Turn off</button>"
+               "</form>";
+    out += "<h2>App passwords</h2><p class=\"small\">For a mail app on a phone or a computer: each its own, taken back "
+           "on its own.</p>";
+    for (std::string_view rest = who.field("app_passwords"); !rest.empty();)
+    {
+        const size_t nl = rest.find('\n');
+        const std::string_view line = rest.substr(0, nl);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        if (line.empty())
+            continue;
+        const std::string label(line.substr(0, line.find('\t')));
+        out += "<form method=\"post\" action=\"/account/app-password\" class=\"row\"><input type=\"hidden\" "
+               "name=\"do\" value=\"remove\"><input type=\"hidden\" name=\"label\" value=\"" + html_escape(label) +
+               "\"><span style=\"flex:1\">" + html_escape(label) + "</span><button type=\"submit\">Remove</button></form>";
+    }
+    out += "<form method=\"post\" action=\"/account/app-password\"><input type=\"hidden\" name=\"do\" value=\"add\">"
+           "<label for=\"al\">For</label><input id=\"al\" type=\"text\" name=\"label\" placeholder=\"Phone\" "
+           "maxlength=\"64\" required><button type=\"submit\">Make one</button></form>";
+    return out;
+}
+
+void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const account* who = session_of(rq);
+    if (!who)
+    {
+        redirect(c, "/login?rd=" + url_encode("/account"));
+        return;
+    }
+    const params p = parse_form(rq.body);
+    const std::string what(param(p, "do")), id = who->id;
+    std::weak_ptr<conn> weak = c;
+    const auto saved = [this, weak, rq](std::string_view note) {
+        return [this, weak, rq, note = std::string(note)](bool ok, const std::string& why) {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            cc->waiting = false;
+            if (ok)
+                account_page(cc, rq, note, {}, 200);
+            else
+                account_page(cc, rq, {}, why, 400);
+            m_http.resume(cc);
+        };
+    };
+    if (rq.path == "/account/totp")
+    {
+        const int64_t now = wall::now_sec();
+        std::erase_if(m_enrolling, [now](const auto& kv) { return kv.second.second < now; });
+        if (what == "start")
+        {
+            // The key shown once, taken into the account only when a code of it proves the app has it.
+            const std::string key = base32_encode(random_string(20));
+            m_enrolling[id] = {key, now + 600};
+            const std::string uri = totp_uri(url_host(m_issuer), who->username(), key);
+            std::string grouped;
+            for (size_t i = 0; i < key.size(); i += 4)
+                grouped += (i ? " " : "") + key.substr(i, 4);
+            respond(c, 200, "text/html; charset=utf-8",
+                    page("Two-step sign-in",
+                         "<h1>Two-step sign-in</h1><p class=\"small\">Add this key to your authenticator app, then give "
+                         "the code it shows.</p><p><code>" + html_escape(grouped) + "</code></p><p class=\"small\">"
+                         "<a href=\"" + html_escape(uri) + "\">Open in an authenticator app</a></p><form method=\"post\" "
+                         "action=\"/account/totp\"><input type=\"hidden\" name=\"do\" value=\"confirm\"><label for=\"tc\">"
+                         "Code</label><input id=\"tc\" type=\"text\" name=\"code\" inputmode=\"numeric\" "
+                         "autocomplete=\"one-time-code\" autofocus required><button type=\"submit\">Turn on</button></form>"));
+            return;
+        }
+        if (what == "confirm")
+        {
+            const auto it = m_enrolling.find(id);
+            std::string secret;
+            uint64_t last = 0;
+            if (it == m_enrolling.end() || !base32_decode(it->second.first, secret) ||
+                !totp_step(secret, param(p, "code"), now, last))
+            {
+                account_page(c, rq, {}, "That code is not the one the app shows; turn it on again.", 400);
+                m_enrolling.erase(id);
+                return;
+            }
+            const std::string key = it->second.first;
+            m_enrolling.erase(it);
+            c->waiting = true;
+            update_account(id, {{"totp", key}}, saved("Two-step sign-in is on."));
+            return;
+        }
+        if (what == "off")
+        {
+            if (!code_right(*who, param(p, "code")))
+            {
+                account_page(c, rq, {}, "That code is not the one the app shows.", 400);
+                return;
+            }
+            c->waiting = true;
+            update_account(id, {{"totp", ""}}, saved("Two-step sign-in is off."));
+            return;
+        }
+    }
+    if (rq.path == "/account/app-password")
+    {
+        const std::string label(param(p, "label"));
+        std::vector<std::string> lines;
+        for (std::string_view rest = who->field("app_passwords"); !rest.empty();)
+        {
+            const size_t nl = rest.find('\n');
+            if (const std::string_view l = rest.substr(0, nl); !l.empty())
+                lines.emplace_back(l);
+            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        }
+        const auto label_of = [](const std::string& l) { return l.substr(0, l.find('\t')); };
+        if (label.empty() || label.size() > 64 || label.find_first_of("\t\n") != std::string::npos)
+        {
+            account_page(c, rq, {}, "Name what the app password is for.", 400);
+            return;
+        }
+        if (what == "remove")
+        {
+            std::erase_if(lines, [&](const std::string& l) { return label_of(l) == label; });
+            std::string joined;
+            for (const auto& l : lines)
+                joined += l + "\n";
+            c->waiting = true;
+            update_account(id, {{"app_passwords", joined}}, saved("Removed."));
+            return;
+        }
+        if (what == "add")
+        {
+            if (lines.size() >= 10 || std::any_of(lines.begin(), lines.end(), [&](const std::string& l) { return label_of(l) == label; }))
+            {
+                account_page(c, rq, {}, lines.size() >= 10 ? "Ten app passwords are the most; remove one first."
+                                                           : "An app password of that name is there already.", 400);
+                return;
+            }
+            const std::string raw = random_string(16);
+            std::string pw;
+            for (size_t i = 0; i < 16; ++i)
+                pw += std::string(i && i % 4 == 0 ? "-" : "") + static_cast<char>('a' + static_cast<unsigned char>(raw[i]) % 26);
+            c->waiting = true;
+            hash_password(pw, [this, weak, rq, id, lines, label, pw](std::string hash) {
+                std::string joined;
+                for (const auto& l : lines)
+                    joined += l + "\n";
+                joined += label + "\t" + hash + "\t" + std::to_string(wall::now_sec()) + "\n";
+                update_account(id, {{"app_passwords", joined}}, [this, weak, rq, label, pw](bool ok, const std::string& why) {
+                    auto cc = weak.lock();
+                    if (!cc || cc->dead)
+                        return;
+                    cc->waiting = false;
+                    if (!ok)
+                        account_page(cc, rq, {}, why, 400);
+                    else
+                        account_page(cc, rq, "The app password for " + label + ", shown this once: " + pw, {}, 200);
+                    m_http.resume(cc);
+                });
+            });
+            return;
+        }
+    }
+    respond(c, 400, "text/plain", "no such change\n");
 }
 
 void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
@@ -1415,7 +1747,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         const std::string name = who ? std::string(who->username()) : std::string();
         const std::string email = who ? std::string(who->field("email")) : std::string();
         const std::string quota = who ? std::string(who->field("mail_quota")) : std::string();
-        check_password(who, args.size() > 2 ? args[2] : std::string(), [this, ticket, name, email, quota](bool ok) {
+        check_mail_password(who, args.size() > 2 ? args[2] : std::string(), [this, ticket, name, email, quota](bool ok) {
             answer_command(ticket, ok ? "ok " + name + "\t" + email + "\t" + quota : std::string("error: no"));
         });
         return;
@@ -1506,6 +1838,88 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         else
             answer_command(ticket, done);
     };
+    // totp <user> on|off: a second step of signing in, its key given once to put into an authenticator app.
+    if (action == "totp")
+    {
+        const std::string how = args.size() > 2 ? args[2] : std::string();
+        if (how == "off")
+        {
+            apply({{"totp", ""}}, "ok");
+            return;
+        }
+        if (how != "on")
+        {
+            answer_command(ticket, "error: idp-user totp <user> on|off");
+            return;
+        }
+        const std::string key = base32_encode(random_string(20));
+        apply({{"totp", key}}, totp_uri(url_host(m_issuer), user, key) + "\nkey: " + key);
+        return;
+    }
+    // app-password <user> add <label> | remove <label> | list: passwords a mail app signs in with, each its own.
+    if (action == "app-password")
+    {
+        const std::string how = args.size() > 2 ? args[2] : std::string(), label = args.size() > 3 ? args[3] : std::string();
+        const account* who = m_accounts.by_id(id);
+        std::string kept(who ? who->field("app_passwords") : std::string_view{});
+        std::vector<std::string> lines;
+        for (std::string_view rest = kept; !rest.empty();)
+        {
+            const size_t nl = rest.find('\n');
+            if (const std::string_view l = rest.substr(0, nl); !l.empty())
+                lines.emplace_back(l);
+            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        }
+        const auto label_of = [](const std::string& l) { return l.substr(0, l.find('\t')); };
+        if (how == "list")
+        {
+            std::string out;
+            for (const auto& l : lines)
+                out += label_of(l) + "\n";
+            answer_command(ticket, out);
+            return;
+        }
+        if (label.empty() || label.find_first_of("\t\n") != std::string::npos || label.size() > 64 ||
+            (how != "add" && how != "remove"))
+        {
+            answer_command(ticket, "error: idp-user app-password <user> add <label> | remove <label> | list");
+            return;
+        }
+        const bool had = std::any_of(lines.begin(), lines.end(), [&](const std::string& l) { return label_of(l) == label; });
+        if (how == "remove")
+        {
+            if (!had)
+            {
+                answer_command(ticket, "error: " + user + " has no app password named " + label);
+                return;
+            }
+            std::erase_if(lines, [&](const std::string& l) { return label_of(l) == label; });
+            std::string joined;
+            for (const auto& l : lines)
+                joined += l + "\n";
+            apply({{"app_passwords", joined}}, "ok");
+            return;
+        }
+        if (had || lines.size() >= 10)
+        {
+            answer_command(ticket, had ? "error: " + user + " has an app password named " + label + " already"
+                                       : "error: " + user + " has ten app passwords; remove one first");
+            return;
+        }
+        // Four groups of four letters, typed on a phone without a mistake, about 75 bits.
+        const std::string raw = random_string(16);
+        std::string pw;
+        for (size_t i = 0; i < 16; ++i)
+            pw += std::string(i && i % 4 == 0 ? "-" : "") + static_cast<char>('a' + static_cast<unsigned char>(raw[i]) % 26);
+        hash_password(pw, [apply, lines, label, pw](std::string hash) {
+            std::string joined;
+            for (const auto& l : lines)
+                joined += l + "\n";
+            joined += label + "\t" + hash + "\t" + std::to_string(wall::now_sec()) + "\n";
+            apply({{"app_passwords", joined}}, pw);
+        });
+        return;
+    }
     if (action == "passwd")
     {
         std::string password;

@@ -56,7 +56,8 @@ trap cleanup EXIT
 
 echo "=== Integration: templates, recipients and advertisements on a mail runtime ==="
 
-python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 >/dev/null 2>&1 &
+python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
+    "fbl.test=TXT:v=spf1 ip4:127.0.0.2 -all" >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
@@ -280,6 +281,7 @@ lu = dan.get("List-Unsubscribe", "")
 https = re.search(r"<(https://mail\.example\.test/unsubscribe\?t=[^>]+)>", lu)
 check("an advertisement carries List-Unsubscribe, https and mailto, and its one-click POST",
       bool(https) and "<mailto:unsubscribe@example.test?subject=" in lu and dan.get("List-Unsubscribe-Post") == "List-Unsubscribe=One-Click", (lu, dan.get("List-Unsubscribe-Post")))
+check("and List-Id names its list by its sender (RFC 2919)", dan.get("List-Id") == "<news.example.test>", dan.get("List-Id"))
 h = dan.get_body(("html",)).get_content()
 check("its link is where the template says {{unsubscribe}}", bool(https) and https.group(1).replace("&", "&amp;") in h and "{{unsubscribe}}" not in h, h[-300:])
 t = eve.get_body(("plain",)).get_content()
@@ -318,6 +320,31 @@ PY
 for _ in $(seq 1 50); do "$BIN" mail m unsubscribed | grep -q fay@remote.test && break; sleep 0.1; done
 "$BIN" mail m unsubscribed | grep -qx fay@remote.test && ok "a mail to the mailto: unsubscribes its recipient" \
     || bad "a mail to the mailto: unsubscribes its recipient" "$mailto_token / $("$BIN" mail m unsubscribed)"
+
+# A provider's feedback report that its user called an advertisement spam: from a reporter SPF says is who it is,
+# the user is sent no more; from one it does not, nothing changes.
+arf() { # arf <from address> <complainant>
+    python3 - "$P" "$1" "$2" <<'PY'
+import smtplib, sys
+port, sender, who = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+msg = ("From: %s\r\nTo: unsubscribe@example.test\r\nSubject: complaint\r\nMIME-Version: 1.0\r\n"
+       "Content-Type: multipart/report; report-type=feedback-report; boundary=b\r\n\r\n"
+       "--b\r\nContent-Type: text/plain\r\n\r\nA complaint.\r\n"
+       "--b\r\nContent-Type: message/feedback-report\r\n\r\nFeedback-Type: abuse\r\nUser-Agent: fbl/1\r\nVersion: 1\r\n\r\n"
+       "--b\r\nContent-Type: message/rfc822\r\n\r\nFrom: news@example.test\r\nTo: %s\r\nSubject: Sale\r\n\r\nan offer\r\n"
+       "--b--\r\n") % (sender, who)
+s = smtplib.SMTP("127.0.0.1", port, source_address=("127.0.0.2", 0)); s.ehlo("fbl.test")
+s.sendmail(sender, ["unsubscribe@example.test"], msg); s.quit()
+PY
+}
+arf reports@fbl.test gil@remote.test
+arf reports@forged.test hal@remote.test
+for _ in $(seq 1 50); do "$BIN" mail m unsubscribed | grep -q gil@ && break; sleep 0.1; done
+"$BIN" mail m unsubscribed | grep -qx gil@remote.test && ok "a provider's complaint from a reporter SPF passes unsubscribes the complainant" \
+    || bad "a complaint unsubscribes" "$("$BIN" mail m unsubscribed)"
+"$BIN" mail m unsubscribed | grep -q hal@ && bad "one SPF does not pass changes nothing" "$("$BIN" mail m unsubscribed)" \
+    || ok "one SPF does not pass changes nothing"
+case "$("$BIN" mail trace gil@remote.test 2>&1)" in *"complained"*) ok "and the complaint is traced" ;; *) bad "the complaint traced" "$("$BIN" mail trace gil@remote.test 2>&1)" ;; esac
 
 # Recipients from an idp's accounts and a db's documents, with their fields.
 rm -f "$T"/sink/*

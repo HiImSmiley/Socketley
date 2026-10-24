@@ -22,6 +22,8 @@ struct pop3_config
     bool tls_active{false};
     // A password may go in the clear, from this machine.
     bool login_in_clear{false};
+    // XOAUTH2 and OAUTHBEARER offered beside PLAIN, where an idp gives the tokens they carry.
+    bool bearer_offered{false};
 };
 
 class pop3_session
@@ -90,6 +92,8 @@ private:
     bool m_discarding{false};
     // AUTH PLAIN waiting for its response on a line of its own.
     bool m_sasl{false};
+    // plain, XOAUTH2 or OAUTHBEARER, the mechanism the continuation answers.
+    std::string m_sasl_mech;
     std::string m_pending_user;
     std::string m_user;
     bool m_transaction{false};

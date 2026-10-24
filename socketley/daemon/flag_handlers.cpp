@@ -1934,6 +1934,45 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--reports"):
             ml->set_reports(true);
             return 0;
+        case fnv1a("--refuse-attachments"):
+            if (next.empty() || next.find_first_of(" ;\"/") != std::string_view::npos)
+            {
+                std::cout << "--refuse-attachments requires the extensions refused, such as exe,js,vbs, default, or none\n";
+                return 1;
+            }
+            ml->set_refused_attachments(pa.args[++i]);
+            return 0;
+        case fnv1a("--clamav"):
+            if (next.empty() || (next.front() != '/' && next.rfind(':') == std::string_view::npos))
+            {
+                std::cout << "--clamav requires clamd's host:port, such as 127.0.0.1:3310, or its socket's path\n";
+                return 1;
+            }
+            ml->set_clamav(pa.args[++i]);
+            return 0;
+        case fnv1a("--dmarc-policy"):
+            if (next != "none" && next != "quarantine" && next != "reject")
+            {
+                std::cout << "--dmarc-policy requires none, quarantine or reject\n";
+                return 1;
+            }
+            ml->set_dmarc_policy(pa.args[++i]);
+            return 0;
+        case fnv1a("--bimi"):
+        {
+            // https://<logo>.svg, and after a comma the https URL of its mark certificate where it has one.
+            const std::string_view logo = next.substr(0, next.find(','));
+            const std::string_view vmc = next.find(',') == std::string_view::npos ? std::string_view{} : next.substr(next.find(',') + 1);
+            if (!logo.starts_with("https://") || !logo.ends_with(".svg") || (!vmc.empty() && !vmc.starts_with("https://")) ||
+                next.find_first_of(" ;\"") != std::string_view::npos)
+            {
+                std::cout << "--bimi requires the https URL of an SVG logo, and a comma and its certificate's where it has "
+                             "one, such as https://example.com/logo.svg\n";
+                return 1;
+            }
+            ml->set_bimi(pa.args[++i]);
+            return 0;
+        }
         case fnv1a("--dmarc-rua"):
             if (next.empty() || next.find('@') == std::string_view::npos || next.find_first_of(" ,;\"") != std::string_view::npos)
             {

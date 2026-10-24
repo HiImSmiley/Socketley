@@ -66,6 +66,8 @@ struct smtp_config
     // AUTH is offered once the connection is encrypted, or from the start where it is said safe (a loopback peer).
     bool        auth_offered{false};
     bool        auth_in_clear{false};
+    // XOAUTH2 and OAUTHBEARER offered beside PLAIN and LOGIN, where an idp gives the tokens they carry.
+    bool        bearer_offered{false};
     // A submission port: nothing is taken from one not signed in.
     bool        auth_required{false};
     // A message is accepted only where STARTTLS was spoken first.
@@ -148,7 +150,11 @@ public:
     static constexpr uint32_t max_errors = 20;
 
 private:
-    enum class phase : uint8_t { command, auth_plain, auth_login_user, auth_login_pass, data, chunk, waiting, closed };
+    enum class phase : uint8_t { command, auth_plain, auth_login_user, auth_login_pass, auth_bearer, data, chunk, waiting,
+                                 closed };
+    // XOAUTH2 or OAUTHBEARER, whose response waits in auth_bearer.
+    std::string m_bearer_mech;
+    void auth_bearer(std::string_view b64);
 
     // The commands in `m_in` from `m_at` on, until one waits for an answer or the input runs out.
     void run();

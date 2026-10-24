@@ -1,4 +1,5 @@
 #include "imap_session.h"
+#include "mail_sasl.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -7,6 +8,7 @@
 #include <ctime>
 #include <map>
 #include <set>
+#include <utility>
 
 #include "imap_order.h"
 #include "imap_utf7.h"
@@ -14,6 +16,7 @@
 #include "mail_text.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::mail
 {
@@ -273,9 +276,9 @@ struct item
     uint8_t binary{0};
     bool body() const
     {
-        return name == "ENVELOPE" || name == "BODYSTRUCTURE" || name == "BODY" || name.starts_with("BODY[") ||
-               name.starts_with("BODY.PEEK[") || name == "RFC822" || name == "RFC822.HEADER" || name == "RFC822.TEXT" ||
-               binary;
+        return name == "ENVELOPE" || name == "BODYSTRUCTURE" || name == "BODY" || name == "PREVIEW" ||
+               name.starts_with("BODY[") || name.starts_with("BODY.PEEK[") || name == "RFC822" ||
+               name == "RFC822.HEADER" || name == "RFC822.TEXT" || binary;
     }
     // Whether the message's header alone answers it: ENVELOPE, and the top-level header or its fields.
     bool header_only() const
@@ -301,7 +304,7 @@ bool parse_item(std::string_view t, item& it)
         it.answer = u;
         static constexpr std::string_view known[] = {"UID", "FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE",
                                                      "BODYSTRUCTURE", "BODY", "RFC822", "RFC822.HEADER", "RFC822.TEXT",
-                                                     "MODSEQ", "EMAILID", "THREADID"};
+                                                     "MODSEQ", "EMAILID", "THREADID", "PREVIEW", "SAVEDATE"};
         return std::find(std::begin(known), std::end(known), u) != std::end(known);
     }
     const size_t close = u.find(']', br);
@@ -406,13 +409,14 @@ static std::string capabilities(const imap_config& cfg)
                     "SPECIAL-USE ID ENABLE SEARCHRES "
                     "CONDSTORE QRESYNC ESEARCH LIST-EXTENDED LIST-STATUS STATUS=SIZE QUOTA QUOTA=RES-STORAGE SORT "
                     "SORT=DISPLAY THREAD=ORDEREDSUBJECT THREAD=REFERENCES COMPRESS=DEFLATE MULTIAPPEND UTF8=ACCEPT "
-                    "CREATE-SPECIAL-USE BINARY OBJECTID METADATA NOTIFY ACL RIGHTS=texk APPENDLIMIT=" +
+                    "CREATE-SPECIAL-USE BINARY OBJECTID METADATA NOTIFY ACL RIGHTS=texk WITHIN SAVEDATE PREVIEW APPENDLIMIT=" +
                     std::to_string(cfg.max_append);
     if (!cfg.imapsieve.empty())
         c += " IMAPSIEVE=" + cfg.imapsieve;
     if (cfg.tls_offered && !cfg.tls_active)
         c += " STARTTLS";
-    c += cfg.tls_active || cfg.login_in_clear ? " AUTH=PLAIN" : " LOGINDISABLED";
+    c += cfg.tls_active || cfg.login_in_clear ? (cfg.bearer_offered ? " AUTH=PLAIN AUTH=LOGIN AUTH=XOAUTH2 AUTH=OAUTHBEARER" : " AUTH=PLAIN AUTH=LOGIN")
+                                              : " LOGINDISABLED";
     return c;
 }
 
@@ -630,6 +634,32 @@ void imap_session::run()
             if (!socketley::base64::decode(line, raw))
             {
                 finish(m_auth_tag, "BAD", "Invalid base64");
+                continue;
+            }
+            // LOGIN asks for the user and then the password, each a continuation of its own.
+            if (m_auth_mech == "LOGIN")
+            {
+                if (!m_login_named)
+                {
+                    m_login_user = std::move(raw);
+                    m_login_named = true;
+                    m_auth_continue = true;
+                    m_hooks.reply("+ UGFzc3dvcmQ6\r\n");
+                }
+                else
+                {
+                    m_login_named = false;
+                    sign_in(m_auth_tag, std::exchange(m_login_user, {}), raw);
+                }
+                continue;
+            }
+            if (m_auth_mech != "PLAIN")
+            {
+                std::string user, token;
+                if (!sasl_bearer(m_auth_mech, raw, user, token) || user.empty())
+                    finish(m_auth_tag, "NO", "[AUTHENTICATIONFAILED] Malformed response");
+                else
+                    sign_in(m_auth_tag, user, token);
                 continue;
             }
             const size_t a = raw.find('\0');
@@ -1052,6 +1082,8 @@ void imap_session::command(std::string tag, std::vector<token> a)
             for (const auto& [sp, use] : imap_store::special())
                 if (iequal(sp, n))
                     fixed = use;
+            if (iequal(n, "Archive"))
+                fixed = "\\Archive";
             for (size_t k = 5; k < a.size() && a[k].k != token::close; ++k)
                 if (!iequal(a[k].text, fixed))
                     return finish(tag, "NO", "[USEATTR] Only " + (fixed.empty() ? std::string("no use") : fixed) +
@@ -1235,15 +1267,18 @@ void imap_session::cmd_login(const std::string& tag, const std::vector<token>& a
 
 void imap_session::cmd_authenticate(const std::string& tag, const std::vector<token>& a)
 {
-    if (a.size() < 2 || !iequal(a[1].text, "PLAIN"))
+    const std::string mech = a.size() < 2 ? std::string() : upper(a[1].text);
+    if (mech != "PLAIN" && mech != "LOGIN" && !(m_cfg.bearer_offered && (mech == "XOAUTH2" || mech == "OAUTHBEARER")))
         return finish(tag, "NO", "Unsupported authentication mechanism");
+    m_auth_mech = mech;
+    m_login_named = false;
     if (a.size() > 2)
     {
         // SASL-IR: the response came with the command.
         m_in.insert(0, a[2].text + "\r\n");
     }
     else
-        m_hooks.reply("+ \r\n");
+        m_hooks.reply(mech == "LOGIN" ? "+ VXNlcm5hbWU6\r\n" : "+ \r\n");
     m_auth_tag = tag;
     m_auth_continue = true;
 }
@@ -1500,6 +1535,9 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
             for (const auto& [sp, use] : imap_store::special())
                 if (sp == n && !use.empty())
                     attrs += " " + use;
+            // Archive is a mailbox's once it is made, by a client or the webmail, and not before (RFC 6154).
+            if (n == "Archive")
+                attrs += " \\Archive";
             listed.push_back(std::string(lsub ? "LSUB" : "LIST") + " (" + attrs + ") \"/\" " +
                              mime::imap_string(shown(n), false));
             listed.push_back(n);
@@ -1863,8 +1901,14 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
     {
         size_t i = from + 2;
         for (; i < a.size() && a[i].k != token::close; ++i)
+        {
             if (!add(a[i].text))
                 return finish(tag, "BAD", "Unknown FETCH item " + a[i].text);
+            // PREVIEW's (LAZY) lets the server leave out what is slow to make, and none of it is here (RFC 8970 3).
+            if (items.back().name == "PREVIEW" && i + 1 < a.size() && a[i + 1].k == token::open)
+                while (i + 1 < a.size() && a[i].k != token::close)
+                    ++i;
+        }
         after = i + 1;
     }
     else if (!add(a[from + 1].text))
@@ -2038,6 +2082,14 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                     out += "NIL";
                 else if (it.name == "INTERNALDATE")
                     out += internal_date(m->date_ms);
+                // A message the store kept no save date of was saved when it came (RFC 8514 4).
+                else if (it.name == "SAVEDATE")
+                    out += internal_date(m->saved_ms ? m->saved_ms : m->date_ms);
+                else if (it.name == "PREVIEW")
+                {
+                    const mime::part* text = part ? mime::preview_part(*part) : nullptr;
+                    out += text ? mime::imap_string(mime::preview(*j->bytes, *text), false) : std::string("NIL");
+                }
                 else if (it.name == "RFC822.SIZE")
                     out += std::to_string(j->bytes && !j->bytes->empty() ? j->bytes->size() : m->size);
                 else if (!part)
@@ -2284,12 +2336,14 @@ bool parse_one(const std::vector<std::string>& t, size_t& i, crit& out, int dept
     out = {};
     out.key = k;
     static constexpr std::string_view bare[] = {"ALL", "ANSWERED", "DELETED", "FLAGGED", "SEEN", "DRAFT", "NEW", "OLD",
-                                                "RECENT", "UNANSWERED", "UNDELETED", "UNFLAGGED", "UNSEEN", "UNDRAFT"};
+                                                "RECENT", "UNANSWERED", "UNDELETED", "UNFLAGGED", "UNSEEN", "UNDRAFT",
+                                                "SAVEDATESUPPORTED"};
     if (std::find(std::begin(bare), std::end(bare), k) != std::end(bare))
         return true;
     static constexpr std::string_view one[] = {"KEYWORD", "UNKEYWORD", "LARGER", "SMALLER", "BEFORE", "ON",
                                                "SINCE", "SENTBEFORE", "SENTON", "SENTSINCE", "FROM", "TO",
-                                               "CC", "BCC", "SUBJECT", "BODY", "TEXT", "UID", "EMAILID", "THREADID"};
+                                               "CC", "BCC", "SUBJECT", "BODY", "TEXT", "UID", "EMAILID", "THREADID",
+                                               "OLDER", "YOUNGER", "SAVEDBEFORE", "SAVEDON", "SAVEDSINCE"};
     if (std::find(std::begin(one), std::end(one), k) != std::end(one))
     {
         if (i >= t.size())
@@ -2377,7 +2431,7 @@ bool matches(const crit& c, const imap_message& m, size_t idx, std::string_view 
         return matches(c.kids[0], m, idx, msg, head, root) || matches(c.kids[1], m, idx, msg, head, root);
     if (k == "SET" || k == "UID")
         return std::binary_search(c.set.begin(), c.set.end(), idx);
-    if (k == "ALL")
+    if (k == "ALL" || k == "SAVEDATESUPPORTED")
         return true;
     if (k == "ANSWERED")
         return m.flags & flag_answered;
@@ -2414,6 +2468,17 @@ bool matches(const crit& c, const imap_message& m, size_t idx, std::string_view 
     // No message has a THREADID here, as FETCH says NIL.
     if (k == "EMAILID" || k == "THREADID")
         return k == "EMAILID" && c.arg == imap_store::email_id(m.key);
+    // OLDER and YOUNGER count seconds back from now (RFC 5032).
+    if (k == "OLDER" || k == "YOUNGER")
+    {
+        const bool older = m.date_ms <= socketley::wall::now_ms() - static_cast<int64_t>(c.num) * 1000;
+        return k == "OLDER" ? older : !older;
+    }
+    if (k == "SAVEDBEFORE" || k == "SAVEDON" || k == "SAVEDSINCE")
+    {
+        const int64_t saved = (m.saved_ms ? m.saved_ms : m.date_ms) / 86400000;
+        return k == "SAVEDBEFORE" ? saved < c.day : k == "SAVEDON" ? saved == c.day : saved >= c.day;
+    }
     if (k == "LARGER")
         return m.size > c.num;
     if (k == "SMALLER")

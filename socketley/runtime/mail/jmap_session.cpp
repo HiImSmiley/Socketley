@@ -1,4 +1,5 @@
 #include "jmap_session.h"
+#include "mail_setup.h"
 
 #include <algorithm>
 #include <charconv>
@@ -21,6 +22,7 @@ constexpr std::string_view core = "urn:ietf:params:jmap:core";
 constexpr std::string_view mail_cap = "urn:ietf:params:jmap:mail";
 constexpr std::string_view submission_cap = "urn:ietf:params:jmap:submission";
 constexpr std::string_view vacation_cap = "urn:ietf:params:jmap:vacationresponse";
+constexpr std::string_view quota_cap = "urn:ietf:params:jmap:quota";
 
 std::string reason_of(int code)
 {
@@ -374,6 +376,29 @@ void jmap_session::handle(request rq)
             unsubscribe_page(rq);
             return after();
         }
+        // A mail client asking how it reaches a mailbox: Thunderbird at autoconfig.<domain>, Outlook at autodiscover.
+        std::string lower = rq.path;
+        socketley::ascii::lower_in_place(lower);
+        const auto told = [&](std::string_view kind, const std::string& email, std::string_view type) {
+            const std::string doc = m_hooks.client_setup(kind, email);
+            if (doc.empty())
+                fail(404, "text/plain", "no mailbox of that domain is kept here");
+            else
+                respond(200, type, doc);
+            return after();
+        };
+        if (lower == "/mail/config-v1.1.xml" || lower == "/.well-known/autoconfig/mail/config-v1.1.xml")
+            return told("autoconfig", percent_decoded(query_param(rq.query, "emailaddress")), "application/xml");
+        if (lower == "/autodiscover/autodiscover.xml")
+            return told("autodiscover", autodiscover_address(rq.body), "application/xml");
+        if (lower.starts_with("/autodiscover/autodiscover.json"))
+        {
+            std::string host = rq.header("x-forwarded-host");
+            if (host.empty())
+                host = rq.header("host");
+            respond(200, "application/json", outlook_autodiscover_json(host.substr(0, host.find(':'))));
+            return after();
+        }
     }
     if (rq.method == "OPTIONS")
     {
@@ -388,6 +413,31 @@ void jmap_session::handle(request rq)
         if (p == "/~mail/session" && r.method == "GET" && m_cfg.web)
         {
             web_session(r);
+            return after();
+        }
+        // The webmail's filter rules, read, or put by the page alone.
+        if (p == "/~mail/filters" && m_cfg.web && (r.method == "GET" || (r.method == "PUT" && m_from_page)))
+        {
+            std::optional<std::string> script;
+            if (r.method == "PUT")
+                script = r.body;
+            m_hooks.filters(m_user, std::move(script), [this, alive = m_alive, after](int status, std::string body) {
+                if (!*alive)
+                    return;
+                respond(status, "application/json", body);
+                after();
+            });
+            return;
+        }
+        // The signed-in user's profile for an iPhone, an iPad or a Mac.
+        if (p == "/~mail/mobileconfig" && r.method == "GET" && m_cfg.web)
+        {
+            const std::string doc = m_hooks.client_setup("mobileconfig", m_hooks.address_of(m_user));
+            if (doc.empty())
+                fail(404, "text/plain", "no address of this runtime's domains is yours");
+            else
+                respond(200, "application/x-apple-aspen-config", doc,
+                        "Content-Disposition: attachment; filename=\"mail.mobileconfig\"\r\n");
             return after();
         }
         if ((p == "/.well-known/jmap" || p == "/jmap/session") && r.method == "GET")
@@ -517,6 +567,8 @@ std::string jmap_session::session_json(const request& rq) const
     json::quote_into(out, submission_cap);
     out += ":{},";
     json::quote_into(out, vacation_cap);
+    out += ":{},";
+    json::quote_into(out, quota_cap);
     out += ":{}},\"accounts\":{" + a + ":{\"name\":";
     json::quote_into(out, m_user);
     out += ",\"isPersonal\":true,\"isReadOnly\":false,\"accountCapabilities\":{";
@@ -527,14 +579,18 @@ std::string jmap_session::session_json(const request& rq) const
            ",\"emailQuerySortOptions\":[\"receivedAt\",\"size\",\"subject\",\"from\",\"to\",\"sentAt\"],"
            "\"mayCreateTopLevelMailbox\":true},";
     json::quote_into(out, submission_cap);
-    out += ":{\"maxDelayedSend\":0,\"submissionExtensions\":{}},";
+    out += ":{\"maxDelayedSend\":2592000,\"submissionExtensions\":{\"FUTURERELEASE\":[]}},";
     json::quote_into(out, vacation_cap);
+    out += ":{},";
+    json::quote_into(out, quota_cap);
     out += ":{}}}},\"primaryAccounts\":{";
     json::quote_into(out, mail_cap);
     out += ":" + a + ",";
     json::quote_into(out, submission_cap);
     out += ":" + a + ",";
     json::quote_into(out, vacation_cap);
+    out += ":" + a + ",";
+    json::quote_into(out, quota_cap);
     out += ":" + a + "},\"username\":";
     json::quote_into(out, m_user);
     out += ",\"apiUrl\":";
@@ -571,7 +627,7 @@ void jmap_session::api(const request& rq)
     }
     for (const auto& u : using_->items)
         if (u.k != json::jvalue::kind::string ||
-            (u.s != core && u.s != mail_cap && u.s != submission_cap && u.s != vacation_cap))
+            (u.s != core && u.s != mail_cap && u.s != submission_cap && u.s != vacation_cap && u.s != quota_cap))
         {
             fail(400, "urn:ietf:params:jmap:error:unknownCapability", "a capability this server does not have: " + u.s);
             return finished();
@@ -721,6 +777,8 @@ void jmap_session::method(const std::string& name, const json::jvalue& args, con
         return vacation_get(args, std::move(done));
     if (name == "VacationResponse/set")
         return vacation_set(args, std::move(done));
+    if (name == "Quota/get" || name == "Quota/changes" || name == "Quota/query" || name == "Quota/queryChanges")
+        return quota(name, args, std::move(done));
     if (name == "PushSubscription/get")
         return push_get(args, std::move(done));
     if (name == "PushSubscription/set")
@@ -923,6 +981,9 @@ void jmap_session::web_session(const request& rq)
     json::quote_into(out, m_hooks.address_of(m_user));
     out += ",\"logout\":";
     json::quote_into(out, m_hooks.idp_logout(base_url(rq) + "/"));
+    // The servers and ports a mail app is set up with.
+    if (const std::string setup = m_hooks.client_setup("json", m_hooks.address_of(m_user)); !setup.empty())
+        out += ",\"setup\":" + setup;
     out += "}";
     respond(200, "application/json", out);
 }

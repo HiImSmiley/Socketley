@@ -119,6 +119,30 @@ private:
 
     // Whether `password` is the account's, on the hash pool, with `then` called on the loop.
     void check_password(const account* who, std::string_view password, std::function<void(bool)> then);
+    // `password` against one hash, `real` false for a hash that stands for no account, so the time says nothing.
+    void check_hash(std::string hash, bool real, std::string_view password, std::function<void(bool)> then);
+    // A mail app's sign-in: the account's password unless its second step is on, and each of its app passwords.
+    void check_mail_password(const account* who, std::string password, std::function<void(bool)> then);
+    // The app passwords' hashes from the `i`th on, each tried in turn until one is the password.
+    void check_app_passwords(std::shared_ptr<const std::vector<std::string>> hashes, size_t i, std::string password,
+                             std::function<void(bool)> then);
+    // The second step of a web sign-in, its password already right: what it carries until the code comes.
+    struct pending_sign_in
+    {
+        std::string id;
+        bool remember{false};
+        params p;
+        int64_t until_s{0};
+    };
+    std::unordered_map<std::string, pending_sign_in> m_pending;
+    // The last step of each account's codes taken, so one code is taken once; and a secret an account is enrolling.
+    std::unordered_map<std::string, uint64_t> m_totp_used;
+    std::unordered_map<std::string, std::pair<std::string, int64_t>> m_enrolling;
+    void code_page(const std::shared_ptr<conn>& c, const std::string& pending, std::string_view error, int status);
+    void second_step(const std::shared_ptr<conn>& c, const request& rq, params p);
+    void security_post(const std::shared_ptr<conn>& c, const request& rq);
+    std::string security_html(const account& who);
+    bool code_right(const account& a, std::string_view code);
     // A scrypt hash of `password` made on the hash pool, empty when it could not be.
     void hash_password(std::string_view password, std::function<void(std::string)> then);
 

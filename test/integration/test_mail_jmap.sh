@@ -97,7 +97,7 @@ printf 'spa - http://localhost:5173/cb\n' > "$T/clients"
 for p in "$PI/jwks" "$PS/"; do
     for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p")" != 000 ] && break; sleep 0.1; done
 done
-"$BIN" idp-user auth add alice --password alicepassword1 --email alice@example.test >/dev/null 2>&1
+"$BIN" idp-user auth add alice --password alicepassword1 --email alice@example.test --set mail_quota=1M >/dev/null 2>&1
 "$BIN" create mail m -p "$P" --mail-domain example.test --idp auth --storage st/mail --imap "$IM" --jmap "$JM" -s \
     >/dev/null 2>&1
 for p in "$P" "$IM" "$JM"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"; done
@@ -281,7 +281,7 @@ long_text = preview_of(b"From: zoe@else.test\r\nContent-Type: text/plain; charse
 say("a preview is cut where a character begins", long_text == "lead " + "x" * 250, long_text)
 html = preview_of(b"From: zoe@else.test\r\nContent-Type: text/html; charset=utf-8",
                   b"<html><body><p>Hello</p>\r\n\r\n<b>big</b>   world " + b"<i>word</i> " * 80 + b"</body></html>")
-want = ("Hello big world " + "word " * 80)[:256]
+want = ("Hello big world " + "word " * 80)[:256].rstrip()
 say("and an HTML one has its tags taken out", html == want, (html, want))
 # VacationResponse
 r = api(["VacationResponse/get", {"accountId": acct}, "g0"],
@@ -318,6 +318,20 @@ say("a VacationResponse answers a sender once, from the user, auto-replied", len
     and b"Auto-Submitted: auto-replied" in body and b"Back on Monday." in body, (away, body[:300]))
 say("and answers no list", not sink_with(b"rcpt list@remote.test", 1, 0), "a list was answered")
 api(["VacationResponse/set", {"accountId": acct, "update": {"singleton": {"isEnabled": False}}}, "off"])
+# Quota (RFC 9425): the octets the account's mail takes of its bound.
+say("the session offers quota", "urn:ietf:params:jmap:quota" in s.get("capabilities", {}) and
+    s.get("primaryAccounts", {}).get("urn:ietf:params:jmap:quota") == acct, s.get("capabilities"))
+r = api(["Quota/get", {"accountId": acct, "ids": None}, "q"], ["Quota/get", {"accountId": acct, "ids": ["mail", "nope"]}, "n"])
+q = r["q"][0][1]["list"]
+say("Quota/get tells the octets used of the account's bound", len(q) == 1 and q[0]["resourceType"] == "octets" and
+    q[0]["hardLimit"] in (1000000, 1048576) and 0 < q[0]["used"] < q[0]["hardLimit"] and q[0]["scope"] == "account" and
+    q[0]["types"] == ["Mail"], r)
+say("and an id it does not have as notFound", r["n"][0][1]["notFound"] == ["nope"] and len(r["n"][0][1]["list"]) == 1, r)
+r = api(["Quota/changes", {"accountId": acct, "sinceState": r["q"][0][1]["state"]}, "c"], ["Quota/query", {"accountId": acct}, "y"],
+        ["Quota/changes", {"accountId": acct, "sinceState": "0-1"}, "old"])
+say("Quota/changes since now is none, Quota/query finds the one", r["c"][0][1]["created"] == [] and r["y"][0][1]["ids"] == ["mail"], r)
+say("and changes since another state are to be fetched again", r["old"][0][0] == "error" and
+    r["old"][0][1]["type"] == "cannotCalculateChanges", r)
 # PushSubscription, its pushes read with the keys it gave
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes, hmac, serialization

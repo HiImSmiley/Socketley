@@ -106,6 +106,8 @@ const char* role_of(std::string_view folder)
         return "junk";
     if (folder == "Trash")
         return "trash";
+    if (folder == "Archive")
+        return "archive";
     return nullptr;
 }
 
@@ -658,36 +660,8 @@ std::string email_object(const email_view& view, const std::string& id, const im
             add(p, bytes && offers_attachment(att) ? "true" : "false");
         else if (p == "preview")
         {
-            // The text with its runs of white space made one space, HTML's tags taken out, read only until it is
-            // longer than the preview, which what follows cannot change.
-            constexpr size_t preview_bytes = 256;
-            std::string flat;
-            const auto take = [&](const mime::part& part) {
-                // A textBody holds the HTML of an Email that has no plain text.
-                const bool tags = socketley::ascii::iequals(part.subtype, "html");
-                const std::string s = text_of(msg, part);
-                bool tag = false;
-                for (size_t i = 0; i < s.size() && flat.size() <= preview_bytes; ++i)
-                {
-                    const char c = s[i];
-                    if (tags && (c == '<' || c == '>'))
-                        tag = c == '<';
-                    else if (tag)
-                        continue;
-                    else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
-                    {
-                        if (!flat.empty() && flat.back() != ' ')
-                            flat += ' ';
-                    }
-                    else
-                        flat += c;
-                }
-            };
-            if (!text.empty())
-                take(*text.front()->p);
-            else if (!html.empty())
-                take(*html.front()->p);
-            add(p, q(utf8_prefix(flat, preview_bytes)));
+            const body_part* first = !text.empty() ? text.front() : !html.empty() ? html.front() : nullptr;
+            add(p, q(first ? mime::preview(msg, *first->p) : std::string()));
         }
         else if (p == "bodyStructure")
             add(p, bytes ? part_json(msg, tree, id, view.body_props) : "null");
@@ -1409,8 +1383,8 @@ void jmap_session::thread_get(const jvalue& args, std::function<void(answer)> do
 
 void jmap_session::identity_get(const jvalue&, std::function<void(answer)> done)
 {
-    // The one address the user sends as, with what they set of it.
-    const std::string email = m_hooks.address_of(m_user);
+    // Each address the user sends as, with what they set, which is the same for all of them.
+    const std::vector<std::string> emails = m_hooks.addresses_of(m_user);
     const std::string* kept = m_store.meta(m_user, {}, std::string(identity_entry));
     jvalue v;
     const bool have = kept && json::json_reader(*kept).document(v);
@@ -1418,11 +1392,14 @@ void jmap_session::identity_get(const jvalue&, std::function<void(answer)> done)
         const jvalue* x = have ? json::member(v, k) : nullptr;
         return x ? json::written(*x) : std::string(otherwise);
     };
-    done({{"Identity/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":" +
-                               q(entry_state(kept)) + ",\"list\":[{\"id\":\"i0\",\"name\":" +
-                               field("name", "\"\"") + ",\"email\":" + q(email) + ",\"replyTo\":" + field("replyTo", "null") +
-                               ",\"bcc\":" + field("bcc", "null") + ",\"textSignature\":" + field("textSignature", "\"\"") +
-                               ",\"htmlSignature\":" + field("htmlSignature", "\"\"") + ",\"mayDelete\":false}],\"notFound\":[]}"}});
+    std::string list;
+    for (size_t i = 0; i < emails.size(); ++i)
+        list += std::string(i ? "," : "") + "{\"id\":\"i" + std::to_string(i) + "\",\"name\":" + field("name", "\"\"") +
+                ",\"email\":" + q(emails[i]) + ",\"replyTo\":" + field("replyTo", "null") + ",\"bcc\":" +
+                field("bcc", "null") + ",\"textSignature\":" + field("textSignature", "\"\"") + ",\"htmlSignature\":" +
+                field("htmlSignature", "\"\"") + ",\"mayDelete\":false}";
+    done({{"Identity/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":" + q(entry_state(kept)) +
+                               ",\"list\":[" + list + "],\"notFound\":[]}"}});
 }
 
 void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> done)
@@ -1446,7 +1423,8 @@ void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> 
     if (const jvalue* u = json::member(args, "update"); u && u->k == jvalue::kind::object)
         for (const auto& [id, patch] : u->members)
         {
-            bool fine = id == "i0" && patch.k == jvalue::kind::object;
+            bool fine = id.size() > 1 && id.size() <= 4 && id[0] == 'i' && std::all_of(id.begin() + 1, id.end(), ::isdigit) &&
+                        std::stoul(id.substr(1)) < m_hooks.addresses_of(m_user).size() && patch.k == jvalue::kind::object;
             for (const auto& [k, x] : patch.members)
             {
                 const bool text = k == "name" || k == "textSignature" || k == "htmlSignature";
@@ -1457,7 +1435,7 @@ void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> 
             if (!fine)
             {
                 not_updated += (not_updated.size() > 1 ? "," : "") + q(id) + ":" +
-                               set_error(id == "i0" ? "invalidProperties" : "notFound");
+                               set_error(id.starts_with("i") ? "invalidProperties" : "notFound");
                 continue;
             }
             for (const auto& [k, x] : patch.members)
@@ -1975,6 +1953,50 @@ void jmap_session::email_parse(const jvalue& args, std::function<void(answer)> d
     (*step)();
 }
 
+// ─── Quota ──────────────────────────────────────────────────────────────────
+
+void jmap_session::quota(const std::string& name, const jvalue& args, std::function<void(answer)> done)
+{
+    const uint64_t limit = m_store.quota(m_user), used = m_store.usage(m_user);
+    // The state is what is used of what may be, so a client asking for changes since another is told to fetch again.
+    const std::string state = limit ? std::to_string(used) + "-" + std::to_string(limit) : "0";
+    const std::string acct = q(account_of(m_user));
+    if (name == "Quota/changes" || name == "Quota/queryChanges")
+    {
+        if (json::string_of(args, name == "Quota/changes" ? "sinceState" : "sinceQueryState") != state)
+            return done({{"error", "{\"type\":\"cannotCalculateChanges\"}"}});
+        if (name == "Quota/queryChanges")
+            return done({{name, "{\"accountId\":" + acct + ",\"oldQueryState\":" + q(state) + ",\"newQueryState\":" +
+                                    q(state) + ",\"removed\":[],\"added\":[]}"}});
+        return done({{name, "{\"accountId\":" + acct + ",\"oldState\":" + q(state) + ",\"newState\":" + q(state) +
+                                ",\"hasMoreChanges\":false,\"created\":[],\"updated\":[],\"destroyed\":[]}"}});
+    }
+    if (name == "Quota/query")
+        return done({{name, "{\"accountId\":" + acct + ",\"queryState\":" + q(state) +
+                                ",\"canCalculateChanges\":true,\"position\":0,\"ids\":[" +
+                                std::string(limit ? "\"mail\"" : "") + "]" + (limit ? ",\"total\":1" : ",\"total\":0") +
+                                "}"}});
+    const jvalue* ids = json::member(args, "ids");
+    const bool all = !ids || ids->k != jvalue::kind::array;
+    bool asked = all;
+    std::string missing;
+    if (!all)
+        for (const auto& v : ids->items)
+        {
+            if (v.k == jvalue::kind::string && v.s == "mail" && limit)
+                asked = true;
+            else
+                missing += (missing.empty() ? "" : ",") + (v.k == jvalue::kind::string ? q(v.s) : std::string("null"));
+        }
+    std::string list;
+    if (asked && limit)
+        list = "{\"id\":\"mail\",\"resourceType\":\"octets\",\"used\":" + std::to_string(used) +
+               ",\"hardLimit\":" + std::to_string(limit) + ",\"warnLimit\":" + std::to_string(limit / 10 * 9) +
+               ",\"scope\":\"account\",\"name\":" + q(m_user) + ",\"types\":[\"Mail\"],\"description\":null}";
+    done({{name, "{\"accountId\":" + acct + ",\"state\":" + q(state) + ",\"list\":[" + list + "],\"notFound\":[" +
+                     missing + "]}"}});
+}
+
 // ─── VacationResponse ───────────────────────────────────────────────────────
 
 void jmap_session::vacation_get(const jvalue&, std::function<void(answer)> done)
@@ -2321,8 +2343,25 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                 const std::string own = m_hooks.address_of(m_user);
                 std::string from;
                 std::vector<std::string> rcpts;
+                // holduntil, a date, or holdfor, seconds: when it is sent, a month ahead at the most (RFC 4865).
+                int64_t hold = 0;
                 if (const jvalue* mf = json::member(envelope, "mailFrom"))
+                {
                     from = std::string(json::string_of(*mf, "email"));
+                    if (const jvalue* params = json::member(*mf, "parameters"))
+                    {
+                        if (const std::string_view until = json::string_of(*params, "holduntil"); !until.empty())
+                            hold = utc_ms(until);
+                        else if (const std::string_view secs = json::string_of(*params, "holdfor"); !secs.empty())
+                            hold = wall::now_ms() + std::strtoll(std::string(secs).c_str(), nullptr, 10) * 1000;
+                    }
+                }
+                if (hold > wall::now_ms() + 30ll * 86400000)
+                {
+                    comma(j->not_created);
+                    j->not_created += q(cid) + ":" + set_error("invalidProperties", "a message is held a month at the most");
+                    return (*self)();
+                }
                 if (const jvalue* rt = json::member(envelope, "rcptTo"); rt && rt->k == jvalue::kind::array)
                     for (const auto& r : rt->items)
                         rcpts.emplace_back(json::string_of(r, "email"));
@@ -2341,7 +2380,8 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                                 rcpts.push_back(a.text());
                     }
                 // A user sends as their own address, as submission holds them to.
-                if (!socketley::ascii::iequals(from, own))
+                const std::vector<std::string> mine = m_hooks.addresses_of(m_user);
+                if (std::none_of(mine.begin(), mine.end(), [&](const std::string& a) { return socketley::ascii::iequals(from, a); }))
                 {
                     comma(j->not_created);
                     j->not_created += q(cid) + ":" + set_error("forbiddenFrom", "the user sends as " + own);
@@ -2361,7 +2401,7 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                 message += "\r\n";
                 message.append(std::string_view(*b).substr(head.size()));
                 m_hooks.submit(m_user, from, rcpts, std::move(message),
-                               [j, self, comma, cid, email_id, alive](bool ok, std::string spool_id) {
+                               [j, self, comma, cid, email_id, alive, hold](bool ok, std::string spool_id) {
                                    if (!*alive)
                                        return;
                                    if (!ok)
@@ -2373,9 +2413,9 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                                    j->sent_email[cid] = email_id;
                                    comma(j->created);
                                    j->created += q(cid) + ":{\"id\":" + q("S" + spool_id) + ",\"sendAt\":" +
-                                                 q(utc(wall::now_ms())) + ",\"undoStatus\":\"final\"}";
+                                                 q(utc(std::max(hold, wall::now_ms()))) + ",\"undoStatus\":\"final\"}";
                                    (*self)();
-                               });
+                               }, hold);
             });
             return;
         }

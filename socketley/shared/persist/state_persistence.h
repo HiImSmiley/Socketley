@@ -250,6 +250,10 @@ struct runtime_config
     std::string mail_delimiter{"+"};
     bool mail_reports{false};
     std::string mail_dmarc_rua;
+    std::string mail_dmarc_policy{"quarantine"};
+    std::string mail_refused_attachments{"default"};
+    std::string mail_clamav;
+    std::string mail_bimi;
     std::string mail_tls_rpt;
     std::string mail_mta_sts;
     uint64_t mail_default_quota{0};
