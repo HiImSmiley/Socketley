@@ -33,7 +33,9 @@ std::string thread_id(const imap_message& m)
 {
     static constexpr char digits[] = "0123456789abcdef";
     uint64_t v = m.thread ? m.thread : imap_store::email_hash(m.key) | 1;
-    std::string out = "T" + std::string(16, '0');
+    // Written in place, as GCC 12 warns of "T" joined to a string by + as a copy past the literal.
+    std::string out(17, '0');
+    out[0] = 'T';
     for (size_t i = 16; i > 0; --i, v >>= 4)
         out[i] = digits[v & 15];
     return out;
@@ -1382,7 +1384,11 @@ void jmap_session::thread_get(const jvalue& args, std::function<void(answer)> do
         std::unordered_set<std::string> seen;
         for (const auto& [at, email] : emails)
             if (seen.insert(email).second)
-                ids += (ids.empty() ? "" : ",") + q(email);
+            {
+                if (!ids.empty())
+                    ids += ',';
+                ids += q(email);
+            }
         list += (list.size() > 1 ? "," : "") + std::string("{\"id\":") + q(id) + ",\"emailIds\":[" + ids + "]}";
     }
     done({{"Thread/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":" + q(email_state(m_store, m_user)) +
