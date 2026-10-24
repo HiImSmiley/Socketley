@@ -1700,6 +1700,9 @@ std::string mqtt_run::stats() const
     st::put(out, "websocket_refused", m_ws_refused);
     st::put(out, "snapshots", m_persists);
     st::put(out, "snapshot_failing", m_persist_failed);
+    // A change that waits for its snapshot, or whose snapshot is still being written, is what a crash would lose.
+    st::put(out, "snapshot_unsaved",
+            !m_owner.snapshot_path().empty() && m_broker && (m_broker->dirty() || m_routes_dirty || m_persist_busy));
     if (m_routes)
         for (size_t i = 0; i < m_routes->routes().size(); ++i)
         {

@@ -307,8 +307,14 @@ std::string broker::snapshot() const
     bytes::writer w;
     w.u32(snapshot_magic);
     w.u8(snapshot_version);
-    w.u32(static_cast<uint32_t>(m_retained.size()));
-    m_retained.each([&](const std::shared_ptr<const message>& m) { put_message(w, *m); });
+    // The broker's own '$' figures are made again after a start, not read back stale.
+    uint32_t n = 0;
+    m_retained.each([&](const std::shared_ptr<const message>& m) { n += !m->topic.starts_with('$'); });
+    w.u32(n);
+    m_retained.each([&](const std::shared_ptr<const message>& m) {
+        if (!m->topic.starts_with('$'))
+            put_message(w, *m);
+    });
     w.u32(static_cast<uint32_t>(m_sessions.size()));
     for (const auto& [id, s] : m_sessions)
         w.bytes(encode_session(*s));
@@ -339,7 +345,9 @@ bool broker::restore(std::string_view in, std::string& why)
             why = "a retained message is cut off";
             return false;
         }
-        retained.push_back(std::move(m));
+        // A snapshot written before the '$' figures were left out still holds the last process's.
+        if (!m->topic.starts_with('$'))
+            retained.push_back(std::move(m));
     }
     if (!r.u32(n) || n > cap_count)
     {

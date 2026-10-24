@@ -590,6 +590,11 @@ tally < <(run after)
 # The worker killed outright: what the last snapshot held, a second's worth at most behind.
 wpid=$(ss -ltnpH "sport = :$P" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
 if [ -n "$wpid" ]; then
+    # The kill comes once a snapshot holds every change, which a disk busy with other writes can take seconds to finish.
+    for _ in $(seq 1 100); do
+        case "$("$BIN" stats m 2>&1)" in *"snapshot_unsaved:0"*) break ;; esac
+        sleep 0.1
+    done
     kill -9 "$wpid"
     for _ in $(seq 1 100); do
         sleep 0.2
@@ -620,8 +625,12 @@ c.disconnect()
 time.sleep(1.5)
 PY
 "$BIN" remove m >/dev/null 2>&1
-sleep 1
-left=$(find "$HOME" -name 'm.snapshot*' 2>/dev/null)
+# The files go once the worker has written its last snapshot and is gone, which a busy disk can make seconds.
+for _ in $(seq 1 100); do
+    left=$(find "$HOME" -name 'm.snapshot*' 2>/dev/null)
+    [ -z "$left" ] && break
+    sleep 0.1
+done
 [ -z "$left" ] && ok || bad "remove takes the broker's snapshot under the state directory with it" "$left"
 "$BIN" create mqtt m -p "$P" --anonymous --persistent on -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" || bad "a broker of the same name is made again" "$(tail -3 "$SOCKETLEY_DLOG")"

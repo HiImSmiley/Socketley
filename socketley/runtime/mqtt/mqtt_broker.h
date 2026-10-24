@@ -473,6 +473,8 @@ public:
     bool restore(std::string_view bytes, std::string& why);
     // Whether anything a snapshot holds changed since the last call.
     bool take_dirty();
+    // The same, left as it is.
+    bool dirty() const { return m_dirty; }
 
     // ── Moving sessions between shards ──────────────────────────────────────
 

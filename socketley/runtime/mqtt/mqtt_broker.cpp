@@ -761,13 +761,16 @@ bool broker::store_retained(const message_ptr& m, bool notify)
 {
     const auto old = m_retained.get(m->topic);
     const size_t old_size = old ? old->topic.size() + old->payload.size() : 0;
+    // A '$' topic holds the broker's own figures, made again each interval and so no change a snapshot keeps.
+    const bool kept = !m->topic.starts_with('$');
     if (m->payload.empty())
     {
         if (old)
         {
             m_retained.set(m->topic, nullptr);
             m_retained_bytes -= old_size;
-            mark();
+            if (kept)
+                mark();
             if (notify)
                 m_hooks.retained_changed(m->topic, nullptr);
         }
@@ -781,7 +784,8 @@ bool broker::store_retained(const message_ptr& m, bool notify)
     }
     m_retained.set(m->topic, m);
     m_retained_bytes = m_retained_bytes - old_size + size;
-    mark();
+    if (kept)
+        mark();
     if (notify)
         m_hooks.retained_changed(m->topic, m);
     return true;

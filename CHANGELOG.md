@@ -757,6 +757,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   path when the process exited, tens of milliseconds after the stop, which could
   be after the next worker had bound it.
 
+- **An idle `mqtt` runtime with `--persistent` wrote its snapshot every ten
+  seconds.** Each `$SYS/broker/` figure it publishes counted as a change, so the
+  snapshot was rewritten and synced for an uptime, and a start read the last
+  process's figures back. They are now neither a change nor in the snapshot,
+  and `stats` says with `snapshot_unsaved` whether a change is not in one yet.
+
 ### Changed
 
 - **Cache: `allkeys-random` at its limit takes a victim by sampling the table**,

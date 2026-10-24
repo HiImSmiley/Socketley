@@ -910,6 +910,29 @@ TEST_CASE("a snapshot brings sessions, queues, unanswered messages and retained 
     CHECK_FALSE(r.b->restore("garbage", why));
 }
 
+TEST_CASE("the broker's own $SYS figures are no change a snapshot is written for, and are not in one")
+{
+    fake_io io;
+    fake_hooks hooks;
+    broker_config c;
+    c.sys_interval_s = 10;
+    broker b(c, io, hooks);
+    b.take_dirty();
+    b.tick();
+    REQUIRE(b.retained_count() > 0);
+    CHECK_FALSE(b.take_dirty());
+    io.now += 10'000;
+    b.tick();
+    CHECK_FALSE(b.take_dirty());
+    rig r;
+    std::string why;
+    REQUIRE(r.b->restore(b.snapshot(), why));
+    CHECK(r.b->retained_count() == 0);
+    const uint64_t p = r.connect("p", level_5);
+    r.send(p, pub("kept", "k", 0, 0, true, level_5));
+    CHECK(r.b->take_dirty());
+}
+
 TEST_CASE("a session given up by one broker is taken in by another")
 {
     rig one, two;
