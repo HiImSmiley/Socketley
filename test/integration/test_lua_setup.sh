@@ -115,6 +115,12 @@ out=$("$BIN" --lua "$W/typo.lua" 2>&1); rc=$?
 case "$out" in *"unknown key: prot"*) [ "$rc" -eq 1 ] && ok "an unknown key is refused by name" || bad "an unknown key" "rc $rc: $out" ;;
     *) bad "an unknown key is refused by name" "rc $rc: $out" ;; esac
 
+mkdir -p "$W/locked"; chmod 000 "$W/locked"
+out=$("$BIN" create dns locked -p $((P+10)) --bind 127.0.0.1 --zone "$W/locked/l.test.zone" --publish 127.0.0.1 --proxy none 2>&1); rc=$?
+chmod 755 "$W/locked"
+case "$out" in *"cannot be read"*) [ "$rc" -eq 1 ] && [ ! -e "$W/locked/l.test.zone" ] && ok "a zone file the daemon may not look at is refused, not written over" \
+    || bad "an unreadable zone file" "rc $rc: $out" ;; *) bad "a zone file the daemon may not look at is refused, not written over" "rc $rc: $out" ;; esac
+
 # ─── written back ───────────────────────────────────────────────────────────
 "$BIN" export "$W/exp" > "$W/out" 2>&1; rc=$?
 [ "$rc" -eq 0 ] && [ -f "$W/exp/config.lua" ] && [ -f "$W/exp/runtimes/post.lua" ] && [ -f "$W/exp/zones/try.test.zone" ] \

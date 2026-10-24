@@ -1401,6 +1401,12 @@ bool dns_instance::ensure_zone_files(std::string& why) const
         struct stat st{};
         if (::stat(path.c_str(), &st) == 0)
             continue;
+        // A file this process may not look at is not missing, and is not written over.
+        if (errno != ENOENT)
+        {
+            why = "--zone: " + path + " cannot be read: " + std::strerror(errno);
+            return false;
+        }
         // The zone a missing file is for: the name given, or the file's own name less ".zone".
         std::string origin = named ? entry : std::filesystem::path(path).filename().string();
         if (!named && origin.ends_with(".zone"))
