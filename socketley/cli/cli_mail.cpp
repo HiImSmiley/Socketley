@@ -193,6 +193,9 @@ std::string text_of_html(std::string_view h)
             t.starts_with("</h") || t.starts_with("<li") || t.starts_with("</table") || t.starts_with("</ul") ||
             t.starts_with("</ol"))
             out += "\n";
+        // A table's cells stand apart on their row.
+        else if (t.starts_with("</td") || t.starts_with("</th"))
+            out += " ";
         if (t.starts_with("<a "))
             if (const size_t at = t.find("href=\""); at != std::string::npos)
             {

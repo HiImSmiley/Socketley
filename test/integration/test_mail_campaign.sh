@@ -249,7 +249,7 @@ cat > "$T/customers.json" <<'EOF'
 EOF
 out=$("$BIN" send m --template "$EX/autumn.html" --script "$EX/campaign.lua" --to "json:$T/customers.json" \
       --from news@example.test --subject 'Hello {{name|there}}, your code: {{code}}' --ad --dry-run 2>&1); rc=$?
-case "$out" in *'To: "Ann Lee" <lee@remote.test>'*"Picked for you, Ann:"*"Scarf (https://shop.example.com/p/scarf%201?utm_source=mail&utm_campaign=autumn)"*"28.00 €"*"(2 recipients in all; nothing sent)"*) [ "$rc" -eq 0 ] \
+case "$out" in *'To: "Ann Lee" <lee@remote.test>'*"Picked for you, Ann:"*"Scarf (https://shop.example.com/p/scarf%201?utm_source=mail&utm_campaign=autumn) 28.00 €"*"(2 recipients in all; nothing sent)"*) [ "$rc" -eq 0 ] \
     && ok "the example's template and script write the message campaign.sh says" || bad "the example" "rc $rc: $out" ;;
     *) bad "the example's template and script write the message campaign.sh says" "rc $rc: $out" ;; esac
 
