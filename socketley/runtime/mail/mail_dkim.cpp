@@ -324,7 +324,10 @@ std::string sign(std::string_view message, std::string_view domain, std::string_
         for (auto it = headers.rbegin(); it != headers.rend(); ++it)
             if (socketley::ascii::iequals(trim(it->first), name))
             {
-                h += (h.empty() ? "" : ":") + std::string(name);
+                // Each piece on its own, as GCC 12 warns of a ":" joined by + as a copy past any object.
+                if (!h.empty())
+                    h += ':';
+                h += name;
                 data += relaxed_header(it->first, it->second) + "\r\n";
                 break;
             }

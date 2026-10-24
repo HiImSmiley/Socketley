@@ -556,7 +556,12 @@ std::string email_object(const email_view& view, const std::string& id, const im
 {
     std::string o = "{";
     const auto add = [&](std::string_view k, const std::string& val) {
-        o += (o.size() > 1 ? "," : "") + q(k) + ":" + val;
+        // Each piece on its own, as GCC 12 warns of a "," joined by + as a copy past any object.
+        if (o.size() > 1)
+            o += ',';
+        o += q(k);
+        o += ':';
+        o += val;
     };
     std::string_view msg = bytes ? std::string_view(*bytes) : std::string_view{};
     const std::string_view head = header_block(msg);
@@ -823,7 +828,11 @@ void jmap_session::mailbox_query(const jvalue& args, std::function<void(answer)>
     const int64_t limit = json::int_of(args, "limit", 100000);
     std::string ids = "[";
     for (size_t i = static_cast<size_t>(position); i < folders.size() && static_cast<int64_t>(i) < position + limit; ++i)
-        ids += (ids.size() > 1 ? "," : "") + q(folders[i]->id());
+    {
+        if (ids.size() > 1)
+            ids += ',';
+        ids += q(folders[i]->id());
+    }
     done({{"Mailbox/query", "{\"accountId\":" + q(account_of(m_user)) + ",\"queryState\":" +
                                 q(mailbox_state(m_store, m_user)) + ",\"canCalculateChanges\":false,\"position\":" +
                                 std::to_string(position) + ",\"ids\":" + ids + "],\"total\":" +
@@ -1081,7 +1090,9 @@ void jmap_session::email_get(const jvalue& args, std::function<void(answer)> don
             const email_view view{j->props, j->body_props, j->whole, j->text_values, j->html_values, j->all_values,
                                   j->max_value};
             const auto write = [j, view, id, m, mailbox](const std::string* bytes) {
-                j->list += (j->list.size() > 1 ? "," : "") + email_object(view, id, &m, mailbox, bytes);
+                if (j->list.size() > 1)
+                    j->list += ',';
+                j->list += email_object(view, id, &m, mailbox, bytes);
             };
             if (!j->head && !j->whole)
             {

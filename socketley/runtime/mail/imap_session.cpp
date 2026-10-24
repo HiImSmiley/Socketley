@@ -169,7 +169,12 @@ std::string set_text(std::vector<uint32_t> v)
         size_t j = i;
         while (j + 1 < v.size() && v[j + 1] == v[j] + 1)
             ++j;
-        out += (out.empty() ? "" : ",") + std::to_string(v[i]) + (j > i ? ":" + std::to_string(v[j]) : std::string());
+        // Each piece on its own, as GCC 12 warns of a "," joined by + as a copy past any object.
+        if (!out.empty())
+            out += ',';
+        out += std::to_string(v[i]);
+        if (j > i)
+            out += ':' + std::to_string(v[j]);
         i = j + 1;
     }
     return out;
@@ -233,7 +238,11 @@ std::string missing_text(const imap_folder& f, const std::vector<std::pair<uint3
     const auto add = [&out](uint64_t lo, uint64_t hi) {
         if (lo > hi)
             return;
-        out += (out.empty() ? "" : ",") + std::to_string(lo) + (lo == hi ? std::string() : ":" + std::to_string(hi));
+        if (!out.empty())
+            out += ',';
+        out += std::to_string(lo);
+        if (lo != hi)
+            out += ':' + std::to_string(hi);
     };
     for (const auto& [lo, hi_asked] : r)
     {
@@ -3007,8 +3016,13 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
                          const auto span = [&](const std::vector<uint32_t>& v) {
                              return std::to_string(v[i]) + (e > i ? ":" + std::to_string(v[e]) : std::string());
                          };
-                         src += (src.empty() ? "" : ",") + span(uids);
-                         dst += (dst.empty() ? "" : ",") + span(made);
+                         if (!src.empty())
+                         {
+                             src += ',';
+                             dst += ',';
+                         }
+                         src += span(uids);
+                         dst += span(made);
                          i = e + 1;
                      }
                      const std::string code = "[COPYUID " + std::to_string(validity) + " " + src + " " + dst + "] ";

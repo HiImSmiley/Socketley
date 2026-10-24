@@ -62,10 +62,11 @@ constexpr int64_t claim_patience_ms = 3000;
 
 std::string frame_of(sverb v, uint32_t from)
 {
-    socketley::bytes::writer w(shard_prefix);
-    w.u8(static_cast<uint8_t>(v));
-    w.u32(from);
-    return w.take();
+    // Written in place rather than moved out of a writer, which GCC 12 reads as a copy past the string's own buffer.
+    std::string out(shard_prefix);
+    out += static_cast<char>(v);
+    socketley::bytes::append32(out, from);
+    return out;
 }
 
 void put_list(socketley::bytes::writer& w, const std::vector<std::string>& list)
