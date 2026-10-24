@@ -202,6 +202,8 @@ inline constexpr setting table[] = {
      "the host:port every JMAP push is sent to, the URL's name still the one checked"},
     {"SOCKETLEY_MAIL_IDLE_MS", kind::number, audience::test, 100, no_max, "0",
      "milliseconds a mail runtime's connection may be quiet, or its TLS handshake take, before it is closed"},
+    {"SOCKETLEY_MAIL_BAYES_FOLD_MS", kind::number, audience::test, 100, no_max, "600000",
+     "milliseconds a mail runtime's spam filter leaves what the shards learned in its journal before it is folded in"},
     {"SOCKETLEY_MAIL_QUEUE_SCALE", kind::number, audience::test, 1, 100000, "1",
      "how many times faster a mail runtime's retries and queue lifetime run"},
     {"SOCKETLEY_MAIL_BUSY_HOLD_MS", kind::number, audience::test, 0, no_max, "30000",

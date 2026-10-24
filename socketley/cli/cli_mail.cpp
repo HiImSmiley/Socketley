@@ -811,6 +811,9 @@ int cli_mail_overview(const char* runtime)
               << "  received   " << stat("mail_received") << ", stored in mailboxes " << stat("mail_stored") << "\n"
               << "  lists      " << stat("mail_suppressed") << " suppressed after a bounce, " << stat("mail_unsubscribed")
               << " unsubscribed\n"
+              << "  spam       " << (cfg_s("rspamd").empty() ? "" : "scored by " + cfg_s("rspamd") + ", else ")
+              << "learned from the users: " << stat("mail_bayes_spam") << " spam, " << stat("mail_bayes_ham")
+              << " not, " << stat("mail_bayes_junked") << " put in Junk\n"
               << "more: socketley mail " << runtime << " queue | dns | suppressed | unsubscribed, socketley stats "
               << runtime << "\n";
     return 0;
@@ -832,13 +835,27 @@ int cli_mail(int argc, char** argv)
     const std::string_view verb = argv[3];
     if (verb != "queue" && verb != "show" && verb != "flush" && verb != "drop" && verb != "dns" &&
         verb != "suppressed" && verb != "forgive" && verb != "sieve" && verb != "unsubscribed" &&
-        verb != "resubscribe")
+        verb != "resubscribe" && verb != "learn")
     {
         std::cerr << command_usage::line("mail");
         return 1;
     }
     if (verb == "sieve")
         return cli_mail_sieve(argc, argv);
+    // `learn <user> spam|ham <folder>`: the three in one argument, as the runtime reads them.
+    if (verb == "learn")
+    {
+        if (argc != 7 || (std::string_view(argv[5]) != "spam" && std::string_view(argv[5]) != "ham"))
+        {
+            std::cerr << "usage: socketley mail <mail> learn <user> spam|ham <folder>\n";
+            return 1;
+        }
+        std::string cmd = "mail ";
+        ipc_frame::append_arg(cmd, argv[2]);
+        cmd += " learn ";
+        ipc_frame::append_arg(cmd, socketley::base64::encode(std::string(argv[4]) + "\n" + argv[5] + "\n" + argv[6]));
+        return ask(cmd);
+    }
     if ((verb == "show" || verb == "drop" || verb == "forgive" || verb == "resubscribe") && argc < 5)
     {
         std::cerr << command_usage::line("mail");

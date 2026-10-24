@@ -58,7 +58,7 @@ void decoded_texts(std::string_view msg, const mime::part& p, F&& take, int dept
     for (const auto& [k, v] : p.params)
         if (socketley::ascii::iequals(k, "charset"))
             charset = v;
-    take(mime::to_utf8(mime::decoded_body(msg.substr(p.body_off, p.body_len), p.encoding), charset));
+    take(mime::to_utf8(mime::decoded_body(msg.substr(p.body_off, p.body_len), p.encoding), charset), p);
 }
 
 bool decoded_has(std::string_view msg, const mime::part* root, std::string_view needle)
@@ -66,7 +66,7 @@ bool decoded_has(std::string_view msg, const mime::part* root, std::string_view 
     if (!root)
         return false;
     bool found = false;
-    decoded_texts(msg, *root, [&](const std::string& t) { found = found || contains_ci(t, needle); });
+    decoded_texts(msg, *root, [&](const std::string& t, const mime::part&) { found = found || contains_ci(t, needle); });
     return found;
 }
 
@@ -295,6 +295,12 @@ bool may_hold(std::string_view filter, const std::vector<uint64_t>& grams)
             return false;
     }
     return true;
+}
+
+void each_text(std::string_view msg, const mime::part& root,
+               const std::function<void(const std::string& text, const mime::part& part)>& take)
+{
+    decoded_texts(msg, root, take);
 }
 
 }   // namespace socketley::mail

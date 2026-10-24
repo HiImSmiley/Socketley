@@ -4,6 +4,7 @@
 // as it arrives and answered once it is on the disk, then handed to the delivery.
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <optional>
 #include <memory>
@@ -18,6 +19,7 @@
 #include <sys/uio.h>
 
 #include "mail_aliases.h"
+#include "mail_bayes.h"
 #include "mail_command.h"
 #include "imap_session.h"
 #include "managesieve_session.h"
@@ -89,6 +91,8 @@ public:
     // A lane for work that only computes, spread over every thread but the first, which waits on files and the network.
     uint32_t cpu_lane() { return 1 + m_pool.next_lane() % (m_pool.threads() > 1 ? m_pool.threads() - 1 : 1); }
     spool& queue() { return m_spool; }
+    // A message of `user`'s, at `key`, learned by the spam filter as spam or not, on whichever shard it was moved.
+    void learn(const std::string& user, const std::string& key, uint64_t size, bool spam);
     const std::string& hostname() const { return m_hostname; }
     const std::vector<std::string>& domains() const { return m_domains; }
     bool is_local_domain(std::string_view d) const;
@@ -355,6 +359,23 @@ private:
     std::vector<std::string> m_arc_trusted;
     std::string m_state_dir;
 
+    // The spam filter, scored with on the first shard, which reads what every shard learned from their journal.
+    std::unique_ptr<bayes> m_bayes;
+    uint64_t m_bayes_off{0}, m_bayes_junked{0}, m_bayes_learned{0};
+    int64_t m_bayes_folded_ms{0};
+    struct learning
+    {
+        std::string user, key;
+        uint64_t size{0};
+        bool spam{false};
+    };
+    // What is to be learned, read eight at a time.
+    std::deque<learning> m_learn_queue;
+    uint32_t m_learning{0};
+    void pump_learning();
+    void bayes_read();
+    void bayes_fold();
+    std::string learn_command(const std::string& arg, std::function<void(std::string_view)> answer);
     // A certificate the entrance has still to write, the listeners that need it waiting for it.
     bool m_cert_wait = false;
     bool certificate_to_come() const;

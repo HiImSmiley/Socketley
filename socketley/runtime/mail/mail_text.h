@@ -4,6 +4,7 @@
 // that is not text, an attachment.  A filter of each message's trigrams says which messages cannot hold a string, so a
 // search reads only those that may.
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,6 +30,9 @@ std::string text_filter(std::string_view msg, std::string_view head, const mime:
 bool may_hold(std::string_view filter, std::string_view needle);
 // A needle's trigrams hashed once, for the filters of the many messages a search tries it on.
 std::vector<uint64_t> trigrams_of(std::string_view needle);
+// Each text part of `msg`, whose structure is `root`, with its transfer encoding and charset undone.
+void each_text(std::string_view msg, const mime::part& root,
+               const std::function<void(const std::string& text, const mime::part& part)>& take);
 // Whether a message whose filter is `filter` may hold the needle whose trigrams are `grams`.
 bool may_hold(std::string_view filter, const std::vector<uint64_t>& grams);
 

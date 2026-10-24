@@ -32,6 +32,9 @@ enum class verb : uint8_t
     // The addresses that unsubscribed from advertisements, and one of them taken back.
     unsubscribed = 11,
     resubscribe  = 12,
+    // A folder of a user's learned by the spam filter: the argument is the user, spam or ham, and the folder, a line
+    // each, in base64.
+    learn        = 13,
 };
 
 struct attachment

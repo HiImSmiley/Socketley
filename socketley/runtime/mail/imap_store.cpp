@@ -2275,6 +2275,22 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
         uint64_t reserved{0};
     };
     auto j = std::make_shared<job>();
+    // What a user moves says what it is: into Junk spam, out of it or filed into a folder of their own not spam.
+    const auto named = [](const std::string& f, std::string_view n) { return socketley::ascii::iequals(f, n); };
+    const bool to_junk = named(dest->name, "Junk") && !named(from->name, "Junk");
+    const bool from_junk = named(from->name, "Junk") && !named(dest->name, "Junk") && !named(dest->name, "Trash");
+    const bool filed = !named(from->name, "Junk") && !named(dest->name, "Junk");
+    const bool kept = filed && !named(dest->name, "Trash") && !named(dest->name, "Drafts") && !named(dest->name, "Sent") &&
+                      !named(from->name, "Sent") && !named(from->name, "Drafts") && !named(from->name, "Trash") &&
+                      !named(dest->name, from->name);
+    if (to_junk || from_junk || kept)
+        done = [this, name, j, to_junk, inner = std::move(done)](bool ok, uint32_t validity, std::vector<uint32_t> made) {
+            if (ok)
+                for (size_t i = 0; i < j->todo.size() && i < j->keys.size(); ++i)
+                    if (i < j->state.size() && j->state[i] == 1)
+                        m_run.learn(name, j->keys[i], j->todo[i].size, to_junk);
+            inner(ok, validity, std::move(made));
+        };
     for (const uint32_t uid : uids)
         if (const imap_message* m = from->by_uid(uid))
         {

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A spam filter that learns from the users.** Without `--rspamd`, a mail
+  runtime scores mail with a filter of its own (SpamBayes' chi-square of
+  the words of the subject, the text and the HTML, the From's domain and the
+  links' hosts), taught by what users move into Junk and out of it, or file
+  into a folder of their own, over IMAP, JMAP and the webmail's Report junk
+  and Not junk alike. Trained on 20 of each it scores every message as
+  `x-spam-bayes` and puts one of 0.9 or more in Junk; `socketley mail <m>
+  learn <user> spam|ham <folder>` teaches it a folder at once, and `stats`
+  says what it learned. Every shard learns into a journal the first, which
+  takes mail, folds into its file.
 - **A mail runtime takes its entrance's certificate.** `--tls` with `--dns`
   and no `--cert` is the certificate the dns runtime's entrance keeps for its
   names, renewed there; one still to be written is waited for, mail taken on

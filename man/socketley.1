@@ -1135,7 +1135,7 @@ socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
 .fi
 .RE
 .TP
-.BI "mail " "mail " "\fR[\fBqueue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns\fR | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBunsubscribed\fR | \fBresubscribe \fIaddress\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname\fR]"
+.BI "mail " "mail " "\fR[\fBqueue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns\fR | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBunsubscribed\fR | \fBresubscribe \fIaddress\fR | \fBlearn \fIuser \fBspam\fR|\fBham \fIfolder\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname\fR]"
 Alone, a few lines of what the runtime is and how it does: its domains, users
 and mailboxes, its ports, the webmail's name, what waits, what was delivered,
 deferred, bounced, received and stored, and its lists. A mail runtime's spool,
@@ -1162,6 +1162,9 @@ lets one go;
 the addresses that unsubscribed from its advertisements, until
 .B resubscribe
 takes one back.
+.B learn
+teaches the spam filter a folder of a user's, spam or not, such as their Junk
+and their INBOX on a new machine, where the filter has learned nothing yet.
 .B sieve
 lists a user's Sieve scripts, the active one marked, prints one, puts one from
 a file
@@ -13533,6 +13536,24 @@ Greylist strangers (RFC 6647) for this long, such as 5m; 0 for none.
 .TP
 .BI "\-\-rspamd " url
 The Rspamd that scans mail from elsewhere, such as http://127.0.0.1:11333.
+Without it, or where it did not answer, mail is scored by the runtime's own
+filter, which learns from the users: a message moved into Junk is spam, and one
+moved out of it, or filed from the INBOX into a folder of their own, is not,
+over IMAP, JMAP and the webmail's Report junk and Not junk alike. Its words are
+those of the subject, the text and the HTML's text, the From's domain and the
+links' hosts, weighed as SpamBayes does (Robinson's chi\-square of Fisher); a
+message is learned once, and one said otherwise is learned again. Once it has
+learned 20 of each, every message is given its score as x\-spam\-bayes, and one
+of 0.9 or more is put in Junk; nothing is refused for it.
+.B "socketley mail"
+.I m
+.B learn
+teaches it a folder at once, and
+.B "socketley stats"
+says how much it learned
+.RB ( mail_bayes_spam ", " mail_bayes_ham )
+and how much it put in Junk
+.RB ( mail_bayes_junked ).
 .TP
 .BI "\-\-recipient\-delimiter " chars\fR|\fBnone
 What divides a user from a tag in an address, + unless it says.
@@ -18186,6 +18207,13 @@ A test aid: the milliseconds any connection to a mail runtime may be quiet, or
 its TLS handshake take, before it is told so and closed; unset, five minutes
 for SMTP, POP3 and ManageSieve, thirty for IMAP, and thirty seconds for a
 handshake.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_BAYES_FOLD_MS
+A test aid: the milliseconds what a mail runtime's spam filter learned stays in
+its journal before the first shard folds it into the filter's file; unset, ten
+minutes.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

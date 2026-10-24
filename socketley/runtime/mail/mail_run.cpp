@@ -804,6 +804,24 @@ bool mail_run::start(std::string& why)
                 m_notify->add(n, j, "mail/" + s.user);
         };
     }
+    // The spam filter scores on the shard that takes mail: what it kept, what it was folding, and the journal after.
+    if (m_owner.get_shard_index() == 0)
+    {
+        m_bayes = std::make_unique<bayes>();
+        const std::string path = mail_bayes_path(m_owner.get_name());
+        std::string bwhy, text;
+        if (!m_bayes->load(path, bwhy))
+        {
+            LOG_ERROR(("mail " + std::string(m_owner.get_name()) + ": " + bwhy + "; its spam filter starts empty").c_str());
+            m_bayes = std::make_unique<bayes>();
+        }
+        if (socketley::read_file(path + ".folding", text, {.missing_ok = true}, nullptr))
+            m_bayes->apply(text);
+        text.clear();
+        if (socketley::read_file(path + ".journal", text, {.missing_ok = true}, nullptr))
+            m_bayes_off = m_bayes->apply(text);
+        m_bayes_folded_ms = wall::now_ms_coarse();
+    }
     m_ring = m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
     m_multishot = m_ring && m_loop.recv_multishot_enabled();
     // Mail is taken on shard 0 alone, since each shard's spool syncs apart: on one disk four shards took half of what
@@ -2097,12 +2115,14 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
         ++r.m_checks_out;
         auto result = std::make_shared<inbound_result>();
         auto spam = std::make_shared<spam_verdict>();
+        auto tokens = std::make_shared<std::vector<uint32_t>>();
         auto unread = std::make_shared<bool>(false);
         const std::string path = r.m_spool.file_of(*e);
         const uint64_t off = e->body_off, len = e->body_len;
         r.m_checks.submit(r.m_checks.next_lane(),
-                          [e, result, spam, unread, ip, helo, path, off, len, trusted = r.m_arc_trusted,
-                           rspamd = std::string(r.m_owner.get_rspamd())] {
+                          [e, result, spam, tokens, unread, ip, helo, path, off, len, trusted = r.m_arc_trusted,
+                           rspamd = std::string(r.m_owner.get_rspamd()),
+                           scored = r.m_bayes && r.m_bayes->trained()] {
                               std::string whole;
                               std::string_view msg;
                               if (e->body)
@@ -2141,8 +2161,11 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
                                       rcpts.push_back(rc.addr);
                                   *spam = rspamd_check(rspamd, msg, ip, helo, e->from, rcpts, {});
                               }
+                              // Its words, for the filter that learns, where Rspamd did not score it.
+                              if (scored && !spam->scored && !result->reject())
+                                  *tokens = spam_tokens(msg);
                           },
-                          [&r, alive, e, done, result, unread, spam, ip] {
+                          [&r, alive, e, done, result, unread, spam, tokens, ip] {
                               if (!*alive)
                                   return;
                               --r.m_checks_out;
@@ -2209,6 +2232,19 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
                                   char buf[96];
                                   std::snprintf(buf, sizeof buf, " (score=%.2f required=%.2f)", spam->score, spam->required);
                                   header += "; x-spam=" + std::string(flagged ? "yes" : "no") + buf;
+                              }
+                              // What the users taught the filter, where Rspamd said nothing.
+                              if (!spam->scored && !tokens->empty() && r.m_bayes && r.m_bayes->trained())
+                              {
+                                  const double p = r.m_bayes->score(*tokens);
+                                  char buf[48];
+                                  std::snprintf(buf, sizeof buf, "; x-spam-bayes=%.2f", p);
+                                  header += buf;
+                                  if (p >= bayes::spam_at && !junk)
+                                  {
+                                      junk = true;
+                                      ++r.m_bayes_junked;
+                                  }
                               }
                               if (junk)
                                   ++r.m_quarantined;
@@ -2547,6 +2583,15 @@ void mail_run::arm_tick()
 void mail_run::tick()
 {
     const int64_t now = wall::now_ms_coarse();
+    // What the shards learned, into the table; folded into its file every ten minutes or past 8 MiB of journal.
+    if (m_bayes)
+    {
+        bayes_read();
+        // A test aid shortens the ten minutes.
+        static const int64_t fold_ms = settings::number<int64_t>("SOCKETLEY_MAIL_BAYES_FOLD_MS").value_or(600000);
+        if (m_bayes_off > (8u << 20) || (m_bayes_off && now - m_bayes_folded_ms > fold_ms))
+            bayes_fold();
+    }
     // The certificate written at last: TLS offered, and what waited for it opened.
     if (m_cert_wait && !certificate_to_come())
     {
@@ -2959,6 +3004,13 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
             answer(out);
             return;
         }
+        case verb::learn:
+        {
+            const std::string refused = learn_command(arg, answer);
+            if (!refused.empty())
+                answer(refused);
+            return;
+        }
         case verb::sieve:
         {
             // A change of the scripts waits on the disk, so the loop does not.
@@ -3037,6 +3089,128 @@ void mail_run::send_command(uint64_t ticket, socketley::bytes::reader& r)
     queue_message(from, rcpts, std::move(body), false, "local", [answer](bool ok, std::string id) {
         answer(ok ? "queued " + id : "error: the message could not be written to the spool");
     });
+}
+
+void mail_run::learn(const std::string& user, const std::string& key, uint64_t size, bool spam)
+{
+    if (m_learn_queue.size() >= 100000)
+        return;
+    m_learn_queue.push_back({user, key, size, spam});
+    pump_learning();
+}
+
+void mail_run::pump_learning()
+{
+    while (m_imap && m_learning < 8 && !m_learn_queue.empty())
+    {
+        learning l = std::move(m_learn_queue.front());
+        m_learn_queue.pop_front();
+        ++m_learning;
+        m_imap->body(l.key, l.size, [this, alive = m_alive, spam = l.spam](std::shared_ptr<const std::string> bytes) {
+            if (!*alive)
+                return;
+            if (!bytes)
+            {
+                --m_learning;
+                pump_learning();
+                return;
+            }
+            auto line = std::make_shared<std::string>();
+            m_pool.submit(cpu_lane(),
+                          [bytes, line, spam] { *line = bayes::line(message_identity(*bytes), spam, spam_tokens(*bytes)); },
+                          [this, alive, line] {
+                              if (!*alive)
+                                  return;
+                              --m_learning;
+                              // One write a line, so the lines of shards writing at once are each whole.
+                              const std::string path = mail_bayes_path(m_owner.get_name()) + ".journal";
+                              const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+                              if (fd >= 0 && socketley::write_all(fd, line->data(), line->size()))
+                                  ++m_bayes_learned;
+                              if (fd >= 0)
+                                  ::close(fd);
+                              pump_learning();
+                          });
+        }, false);
+    }
+}
+
+void mail_run::bayes_read()
+{
+    const std::string path = mail_bayes_path(m_owner.get_name()) + ".journal";
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0)
+    {
+        m_bayes_off = 0;
+        return;
+    }
+    const auto size = static_cast<uint64_t>(st.st_size);
+    if (size < m_bayes_off)
+        m_bayes_off = 0;
+    if (size == m_bayes_off)
+        return;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    std::string text(std::min<uint64_t>(size - m_bayes_off, 16u << 20), '\0');
+    const ssize_t n = ::pread(fd, text.data(), text.size(), static_cast<off_t>(m_bayes_off));
+    ::close(fd);
+    if (n > 0)
+    {
+        text.resize(static_cast<size_t>(n));
+        m_bayes_off += m_bayes->apply(text);
+    }
+}
+
+void mail_run::bayes_fold()
+{
+    // The journal moved aside, so a shard's next line starts a new one; what it held past what was read, taken.
+    const std::string path = mail_bayes_path(m_owner.get_name());
+    if (::rename((path + ".journal").c_str(), (path + ".folding").c_str()) != 0)
+        return;
+    std::string rest;
+    if (socketley::read_file(path + ".folding", rest, {.missing_ok = true}, nullptr) && rest.size() > m_bayes_off)
+        m_bayes->apply(std::string_view(rest).substr(m_bayes_off));
+    m_bayes_off = 0;
+    m_bayes_folded_ms = wall::now_ms_coarse();
+    // Written off the loop from a copy, the folding file kept until the table it went into is on the disk.
+    auto copy = std::make_shared<bayes>(*m_bayes);
+    m_pool.submit(0, [copy, path, name = std::string(m_owner.get_name())] {
+        std::string why;
+        if (copy->save(path, why))
+            ::unlink((path + ".folding").c_str());
+        else
+            LOG_ERROR(("mail " + name + ": " + why).c_str());
+    }, [] {});
+}
+
+std::string mail_run::learn_command(const std::string& arg, std::function<void(std::string_view)> answer)
+{
+    if (!m_imap)
+        return "error: the spam filter learns from mailboxes, which need --idp and --storage";
+    std::string all;
+    if (!socketley::base64::decode(arg, all))
+        return "error: the command did not arrive whole";
+    const size_t a = all.find('\n'), b = a == std::string::npos ? a : all.find('\n', a + 1);
+    if (b == std::string::npos)
+        return "usage: socketley mail <mail> learn <user> spam|ham <folder>";
+    const std::string user = all.substr(0, a), cls = all.substr(a + 1, b - a - 1), folder = all.substr(b + 1);
+    if (cls != "spam" && cls != "ham")
+        return "error: learn takes spam or ham, not " + cls;
+    m_imap->open(user, folder, [this, alive = m_alive, answer, user, folder, spam = cls == "spam"](std::shared_ptr<imap_folder> f) {
+        if (!*alive)
+            return;
+        if (!f)
+        {
+            answer("error: " + user + " has no folder " + folder);
+            return;
+        }
+        for (const auto& m : f->msgs)
+            learn(user, m.key, m.size, spam);
+        answer("learning " + std::to_string(f->msgs.size()) + " message" + (f->msgs.size() == 1 ? "" : "s") + " of " +
+               user + "'s " + folder + " as " + (spam ? "spam" : "not spam"));
+    });
+    return {};
 }
 
 std::string mail_run::sieve_command(const std::string& arg)
@@ -3140,6 +3314,14 @@ std::string mail_run::stats() const
     put(out, "mail_rate_limited", m_rate_limited);
     put(out, "starttls", m_starttls);
     put(out, "tls_failures", m_tls_failures);
+    if (m_bayes)
+    {
+        put(out, "mail_bayes_spam", m_bayes->spam_learned());
+        put(out, "mail_bayes_ham", m_bayes->ham_learned());
+        put(out, "mail_bayes_words", m_bayes->words());
+        put(out, "mail_bayes_junked", m_bayes_junked);
+    }
+    put(out, "mail_bayes_learned", m_bayes_learned);
     if (m_delivery)
         m_delivery->stats(out);
     return out;

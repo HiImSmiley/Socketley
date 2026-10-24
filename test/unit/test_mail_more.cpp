@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "runtime/mail/imap_utf7.h"
+#include "runtime/mail/mail_bayes.h"
 #include "runtime/mail/mail_greylist.h"
 #include "runtime/mail/mail_reports.h"
 #include "runtime/mail/mail_rspamd.h"
@@ -444,4 +445,86 @@ TEST_CASE("search: past a mebibyte a message's filter holds anything, and an emp
     const std::string empty = "\r\n";
     const mime::part none = mime::parse(empty);
     CHECK(may_hold(text_filter(empty, header_block(empty), &none), "anything") == false);
+}
+
+namespace
+{
+
+std::string sample_mail(const std::string& subject, const std::string& body, const std::string& from = "a@b.test")
+{
+    return "From: " + from + "\r\nTo: u@x.test\r\nSubject: " + subject + "\r\nContent-Type: text/plain\r\n\r\n" + body + "\r\n";
+}
+
+const char* const spammy[] = {"cheap pills online pharmacy discount", "win money lottery prize claim now",
+                              "viagra cialis cheap pharmacy order", "casino bonus free spins jackpot win",
+                              "crypto investment guaranteed profit double money"};
+const char* const hammy[] = {"meeting notes from tuesday about the release plan", "lunch on friday with the team at noon",
+                             "please review the pull request for the parser", "the invoice for september is attached",
+                             "family dinner sunday with grandma and the kids"};
+
+}   // namespace
+
+TEST_CASE("bayes: a message's words are its subject's, its text's and its From's domain, each once")
+{
+    const auto t = spam_tokens(sample_mail("Hello Hello", "hello world, the world is round", "Ann <ann@Example.TEST>"));
+    const auto again = spam_tokens(sample_mail("Hello Hello", "hello world, the world is round", "Ann <ann@Example.TEST>"));
+    CHECK(t == again);
+    CHECK(t.size() == 6);   // s:hello, f:example.test, hello, world, the, round
+    const auto html = spam_tokens("Subject: x\r\nContent-Type: text/html\r\n\r\n<style>.a{color:red}</style><p>Visit <a "
+                                  "href=\"https://shop.example.test/x\">here</a></p>\r\n");
+    const auto plain = spam_tokens("Subject: x\r\nContent-Type: text/plain\r\n\r\nVisit here\r\n");
+    CHECK(html.size() == plain.size() + 1);   // the link's host, and no word of the style
+}
+
+TEST_CASE("bayes: trained on what users said, it tells spam it has not seen from the rest, and learns a message once")
+{
+    bayes b;
+    std::mt19937 rng(7);
+    const auto mixed = [&](const char* const* set) {
+        std::string s;
+        for (int i = 0; i < 3; ++i)
+            s += std::string(set[rng() % 5]) + " ";
+        return s;
+    };
+    CHECK(b.score(spam_tokens(sample_mail("x", "cheap pills"))) == 0.5);
+    for (uint64_t i = 0; i < 30; ++i)
+    {
+        CHECK(b.learn(i, true, spam_tokens(sample_mail("offer", mixed(spammy), "x@spam.test"))));
+        CHECK(b.learn(1000 + i, false, spam_tokens(sample_mail("work", mixed(hammy), "y@work.test"))));
+    }
+    REQUIRE(b.trained());
+    CHECK(b.score(spam_tokens(sample_mail("claim your prize", "free money jackpot pharmacy discount"))) >= bayes::spam_at);
+    CHECK(b.score(spam_tokens(sample_mail("release", "review the release notes with the team on tuesday"))) <= 0.2);
+    // Learned again as the same, nothing changes; said otherwise, it is unlearned first.
+    const auto t = spam_tokens(sample_mail("offer", "casino bonus"));
+    CHECK_FALSE(b.learn(5, true, spam_tokens(sample_mail("offer", mixed(spammy)))));
+    CHECK(b.learn(5000, true, t));
+    CHECK(b.spam_learned() == 31);
+    CHECK(b.learn(5000, false, t));
+    CHECK(b.spam_learned() == 30);
+    CHECK(b.ham_learned() == 31);
+}
+
+TEST_CASE("bayes: the table survives its file and its journal's lines, a line cut off left for the next read")
+{
+    bayes b;
+    const auto t = spam_tokens(sample_mail("offer", "cheap pills"));
+    std::string journal = bayes::line(1, true, t) + bayes::line(2, false, spam_tokens(sample_mail("hi", "meeting notes")));
+    const std::string cut = bayes::line(3, true, t);
+    journal += cut.substr(0, cut.size() / 2);
+    CHECK(b.apply(journal) == journal.size() - cut.size() / 2);
+    CHECK(b.spam_learned() == 1);
+    CHECK(b.ham_learned() == 1);
+    const std::string path = std::filesystem::temp_directory_path() / ("bayes-" + std::to_string(::getpid()));
+    std::string why;
+    REQUIRE(b.save(path, why));
+    bayes back;
+    REQUIRE(back.load(path, why));
+    CHECK(back.spam_learned() == 1);
+    CHECK(back.words() == b.words());
+    CHECK_FALSE(back.learn(1, true, t));
+    std::filesystem::remove(path);
+    bayes none;
+    CHECK(none.load(path, why));
+    CHECK(none.words() == 0);
 }

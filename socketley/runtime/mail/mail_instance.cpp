@@ -60,6 +60,11 @@ std::string mail_suppressed_path(std::string_view runtime_name)
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".suppressed")).string();
 }
 
+std::string mail_bayes_path(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".bayes")).string();
+}
+
 std::string mail_unsubscribed_path(std::string_view runtime_name)
 {
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".unsubscribed")).string();
