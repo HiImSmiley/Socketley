@@ -553,13 +553,16 @@ bool meets(const jvalue& f, const query_cand& c, std::string_view whole, const m
     if (const jvalue* a = json::member(f, "hasAttachment"); a && a->k == jvalue::kind::boolean)
     {
         // An Email that could not be read has no attachment.
-        std::vector<const body_part*> text, html, att;
+        bool offered = false;
         if (root)
         {
+            // The parts point into the tree, so they are asked while it lives.
+            std::vector<const body_part*> text, html, att;
             body_part tree = number_parts(*root, root->multipart() ? std::string() : std::string("1"));
             pick({&tree}, "mixed", false, &html, &text, att);
+            offered = offers_attachment(att);
         }
-        if (a->b != offers_attachment(att))
+        if (a->b != offered)
             return false;
     }
     return true;
