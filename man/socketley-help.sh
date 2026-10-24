@@ -310,12 +310,12 @@ cli_commands() {
     echo "  A message for each recipient from a template: {{name}} is their value, {{name|other}}"
     echo "  stands where they have none, {{{name}}} goes into the HTML unescaped; {{ expr }} is any"
     echo "  Lua expression, {% if vip then %}..{% end %} and {% for _, p in ipairs(items) do %} run"
-    echo "  Lua, include('f.html') puts in another. --script f.lua defines functions for them, with"
+    echo "  Lua, include('f.html') puts in another. --lua f.lua defines functions for them, with"
     echo "  on_recipient(r) to change or leave out a recipient and on_link(url, r) to rewrite links."
     echo "  --ad marks an advertisement: a link to unsubscribe of their own, List-Unsubscribe, and no"
     echo "  mail to one who unsubscribed. Sending stops before the first when its message has a name"
-    echo "  without a value, and skips a later one, unless --no-check; --rate 5/s paces them (2/s);"
-    echo "  --dry-run shows the first, --test-to <a> sends it to you alone."
+    echo "  without a value, and skips a later one, unless --no-check; --rate-limit 5 paces them"
+    echo "  (2 a second, 300/m a minute); --test shows the first, --test-to <a> sends it to you alone."
     echo -e "  ${CYAN}socketley send m --template autumn.html --to db:shop/customers --subject 'Hi {{name}}' --ad${NC}"
     echo ""
 
@@ -3544,7 +3544,7 @@ RUNTIMES
   rename <old> <new>             rename a runtime
   send <name> <data>             send through a runtime
   send <mail> --to <address>     write and queue a message (--subject, --text, --html, --attach, --inline)
-  send <mail> --template <file>  one for each recipient of --to idp:|db:|json:, filled; --script, --ad, --no-check, --rate
+  send <mail> --template <file>  one for each recipient of --to idp:|db:|json:, filled; --lua, --ad, --no-check, --rate-limit
   reload | reload-lua <name>     stop and start on the stored configuration, or reload the Lua script
 
 OTHER

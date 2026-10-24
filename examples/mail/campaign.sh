@@ -9,7 +9,7 @@
 # to unsubscribe of their own. campaign.lua leaves out who never ordered and
 # marks each link to the shop with the campaign. Nothing is sent if the
 # template asks for a value the first customer has not, and a later one who has
-# not is skipped; --rate keeps a new sender out of the spam folder. Whoever
+# not is skipped; --rate-limit keeps a new sender out of the spam folder. Whoever
 # unsubscribed is skipped, and `socketley mail m unsubscribed` lists them.
 # logo.png is the shop's logo, beside this script.
 # =============================================================================
@@ -18,11 +18,11 @@ set -e
 cd "$(dirname "$0")"
 
 # What the first customer's message says, nothing sent; then that one, to you.
-socketley send m --template autumn.html --script campaign.lua --inline logo.png --to db:shop/customers \
-    --from news@example.com --subject 'Hello {{name|there}}, your code: {{code}}' --ad --dry-run
-socketley send m --template autumn.html --script campaign.lua --inline logo.png --to db:shop/customers \
+socketley send m --template autumn.html --lua campaign.lua --inline logo.png --to db:shop/customers \
+    --from news@example.com --subject 'Hello {{name|there}}, your code: {{code}}' --ad --test
+socketley send m --template autumn.html --lua campaign.lua --inline logo.png --to db:shop/customers \
     --from news@example.com --subject 'Hello {{name|there}}, your code: {{code}}' --ad --test-to you@example.com
 
 # All of them, five a second.
-socketley send m --template autumn.html --script campaign.lua --inline logo.png --to db:shop/customers \
-    --from news@example.com --subject 'Hello {{name|there}}, your code: {{code}}' --ad --rate 5/s
+socketley send m --template autumn.html --lua campaign.lua --inline logo.png --to db:shop/customers \
+    --from news@example.com --subject 'Hello {{name|there}}, your code: {{code}}' --ad --rate-limit 5

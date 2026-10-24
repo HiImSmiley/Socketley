@@ -7,7 +7,7 @@
 #
 #   * a placeholder not filled from the recipient's values, --set, or its default, a value put into the HTML unescaped,
 #     or {{{raw}}} escaped; no plain text part beside the HTML
-#   * --dry-run sending anything, or not showing the first recipient's message
+#   * --test sending anything, or not showing the first recipient's message
 #   * a template sent when the first recipient's message cannot be written, or stopping at a later one rather than
 #     skipping it; with --no-check a missing value refused, or {{unsubscribe}} filled without --ad
 #   * --inline not sending the image inside the message, by the Content-ID the HTML names
@@ -98,12 +98,12 @@ sent_to() { grep -l "^rcpt $1\$" "$T"/sink/* 2>/dev/null; }
 wait_for() { for _ in $(seq 1 100); do [ -n "$(sent_to "$1")" ] && return 0; sleep 0.1; done; return 1; }
 count() { ls "$T"/sink 2>/dev/null | grep -vc '^\.' ; }
 
-# --dry-run: the first message shown, nothing sent.
+# --test: the first message shown, nothing sent.
 out=$("$BIN" send m --template "$T/promo.html" --to "json:$T/people.json" --subject 'Hi {{name|there}}' \
-      --from news@example.test --set banner='<i>autumn</i>' --ad --dry-run 2>&1); rc=$?
+      --from news@example.test --set banner='<i>autumn</i>' --ad --test 2>&1); rc=$?
 case "$out" in *"To: \"Amy <b>\" <amy@remote.test>"*|*"amy@remote.test"*) ;; *) rc=99 ;; esac
-case "$out" in *"Subject: Hi Amy <b>"*"Your code: A-1"*"(3 recipients in all; nothing sent)"*) [ "$rc" -eq 0 ] && ok "--dry-run shows the first message filled, and sends nothing" \
-    || bad "--dry-run" "rc $rc: $out" ;; *) bad "--dry-run shows the first message filled, and sends nothing" "rc $rc: $out" ;; esac
+case "$out" in *"Subject: Hi Amy <b>"*"Your code: A-1"*"(3 recipients in all; nothing sent)"*) [ "$rc" -eq 0 ] && ok "--test shows the first message filled, and sends nothing" \
+    || bad "--test" "rc $rc: $out" ;; *) bad "--test shows the first message filled, and sends nothing" "rc $rc: $out" ;; esac
 sleep 0.5; [ "$(count)" -eq 0 ] && ok "and the sink got nothing" || bad "and the sink got nothing" "$(count)"
 
 # Strict unless said: a first recipient whose message cannot be written stops them all.
@@ -118,7 +118,7 @@ case "$out" in *"{{unsubscribe}} is filled for an advertisement, --ad, alone"*) 
 
 # Past the first: a later recipient without a value is skipped, the rest sent.
 out=$("$BIN" send m --template "$T/promo.html" --to "json:$T/people.json" --subject 'Hi {{name|there}}' \
-      --from news@example.test --set banner='<i>autumn</i>' --inline "$T/logo.png" --ad --rate 50/s 2>&1); rc=$?
+      --from news@example.test --set banner='<i>autumn</i>' --inline "$T/logo.png" --ad --rate-limit 50 2>&1); rc=$?
 case "$out" in *"skipped cat@remote.test: nothing fills {{code}}"*"sent 2 of 3, skipped 1"*) [ "$rc" -eq 0 ] && ok "a later recipient without a value is skipped and the rest sent" \
     || bad "a later one is skipped" "rc $rc: $out" ;; *) bad "a later recipient without a value is skipped and the rest sent" "rc $rc: $out" ;; esac
 wait_for amy@remote.test; wait_for bob@remote.test
@@ -182,8 +182,8 @@ cat > "$T/shop.json" <<'EOF'
  {"email":"reg@remote.test","name":"Reg","picks":[]}]
 EOF
 rm -f "$T"/sink/*
-out=$("$BIN" send m --template "$T/shop.html" --script "$T/shop.lua" --to "json:$T/shop.json" --subject 'For {{first}}' \
-      --from news@example.test --ad --rate 50/s 2>&1); rc=$?
+out=$("$BIN" send m --template "$T/shop.html" --lua "$T/shop.lua" --to "json:$T/shop.json" --subject 'For {{first}}' \
+      --from news@example.test --ad --rate-limit 50 2>&1); rc=$?
 case "$out" in *"skipped opt@remote.test: opted out in the shop"*"sent 2 of 3, skipped 1"*) [ "$rc" -eq 0 ] \
     && ok "on_recipient leaves a recipient out with why, and a name in the branch not taken asks for no value" || bad "on_recipient" "rc $rc: $out" ;;
     *) bad "on_recipient leaves a recipient out with why, and a name in the branch not taken asks for no value" "rc $rc: $out" ;; esac
@@ -221,14 +221,14 @@ out=$("$BIN" send m --template "$T/broken.html" --to "json:$T/people.json" --fro
 case "$out" in *"broken.html:2:"*) [ "$rc" -eq 1 ] && ok "a template that is no Lua is refused with its file and line" || bad "a broken template" "rc $rc: $out" ;;
     *) bad "a template that is no Lua is refused with its file and line" "rc $rc: $out" ;; esac
 printf '<p>{%% local n = 2 -- a comment %%}n{{ n }}</p>\n<p>{{ email:nosuch() }}</p>\n' > "$T/comment.html"
-out=$("$BIN" send m --template "$T/comment.html" --to amy@remote.test --from news@example.test --dry-run 2>&1); rc=$?
+out=$("$BIN" send m --template "$T/comment.html" --to amy@remote.test --from news@example.test --test 2>&1); rc=$?
 case "$out" in *"comment.html:2: attempt to call method 'nosuch'"*) [ "$rc" -eq 1 ] && ok "a comment in a tag ends with it, and the lines after keep their numbers" || bad "a comment in a tag" "rc $rc: $out" ;;
     *) bad "a comment in a tag ends with it, and the lines after keep their numbers" "rc $rc: $out" ;; esac
 printf '<p>{%% local n = 2 -- a comment %%}n{{ n }}</p>\n' > "$T/comment.html"
-out=$("$BIN" send m --template "$T/comment.html" --to amy@remote.test --from news@example.test --dry-run 2>&1)
+out=$("$BIN" send m --template "$T/comment.html" --to amy@remote.test --from news@example.test --test 2>&1)
 case "$out" in *"n2"*) ok "and what follows the tag on its line is written" ;; *) bad "and what follows the tag on its line is written" "$out" ;; esac
 printf '<p>{{ string.rep("x", #email) }}</p>\n{%% if email:find("amy") then error("amy is not to be written") end %%}\n' > "$T/fails.html"
-out=$("$BIN" send m --template "$T/fails.html" --to "json:$T/people.json" --from news@example.test --rate 50/s 2>&1); rc=$?
+out=$("$BIN" send m --template "$T/fails.html" --to "json:$T/people.json" --from news@example.test --rate-limit 50 2>&1); rc=$?
 case "$out" in *"stopped before sending"*"fails.html:2: amy is not to be written"*) [ "$rc" -eq 1 ] && ok "a first message that fails in Lua stops them all, said with its file and line" \
     || bad "a first failing in Lua" "rc $rc: $out" ;; *) bad "a first message that fails in Lua stops them all, said with its file and line" "rc $rc: $out" ;; esac
 sleep 0.5; [ "$(count)" -eq 2 ] && ok "and nothing more went" || bad "and nothing more went" "$(count)"
@@ -236,9 +236,17 @@ sleep 0.5; [ "$(count)" -eq 2 ] && ok "and nothing more went" || bad "and nothin
 mkdir -p "$T/sub"; printf 'secret' > "$T/secret"
 printf '<p>{{ include("../secret") }}</p>' > "$T/sub/up.html"; printf '<p>{{ include("%s") }}</p>' "$T/secret" > "$T/sub/root.html"
 for f in up root; do
-    out=$("$BIN" send m --template "$T/sub/$f.html" --to amy@remote.test --from news@example.test --dry-run 2>&1); rc=$?
+    out=$("$BIN" send m --template "$T/sub/$f.html" --to amy@remote.test --from news@example.test --test 2>&1); rc=$?
     case "$out" in *"include() takes a template beside this one"*) [ "$rc" -eq 1 ] && ok "include() reads a template beside this one alone ($f)" || bad "include() outside ($f)" "rc $rc: $out" ;;
         *) bad "include() reads a template beside this one alone ($f)" "rc $rc: $out" ;; esac
+done
+
+# The flags are spelt as the rest of socketley spells them: --lua, --test, --rate-limit.
+out=$("$BIN" send m --template "$T/promo.html" --to "json:$T/people.json" --set banner=x --ad --rate-limit 300/m --test 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--rate-limit takes a number a minute after a slash" || bad "--rate-limit 300/m" "rc $rc: $out"
+for old in "--dry-run" "--rate 5/s" "--script $T/shop.lua" "-s x"; do
+    out=$("$BIN" send m --template "$T/promo.html" --to amy@remote.test $old 2>&1); rc=$?
+    [ "$rc" -eq 1 ] && ok "send refuses $old, which socketley spells otherwise" || bad "send refuses $old" "rc $rc: $out"
 done
 
 # The example's template and script, as campaign.sh sends them.
@@ -247,8 +255,8 @@ cat > "$T/customers.json" <<'EOF'
 [{"email":"zed@remote.test","name":"Zed","orders":0,"code":"Z"},
  {"email":"lee@remote.test","name":"Ann Lee","orders":2,"code":"AUTUMN30","picks":[{"id":"scarf 1","title":"Scarf","price":40}]}]
 EOF
-out=$("$BIN" send m --template "$EX/autumn.html" --script "$EX/campaign.lua" --to "json:$T/customers.json" \
-      --from news@example.test --subject 'Hello {{name|there}}, your code: {{code}}' --ad --dry-run 2>&1); rc=$?
+out=$("$BIN" send m --template "$EX/autumn.html" --lua "$EX/campaign.lua" --to "json:$T/customers.json" \
+      --from news@example.test --subject 'Hello {{name|there}}, your code: {{code}}' --ad --test 2>&1); rc=$?
 case "$out" in *'To: "Ann Lee" <lee@remote.test>'*"Picked for you, Ann:"*"Scarf (https://shop.example.com/p/scarf%201?utm_source=mail&utm_campaign=autumn) 28.00 €"*"(2 recipients in all; nothing sent)"*) [ "$rc" -eq 0 ] \
     && ok "the example's template and script write the message campaign.sh says" || bad "the example" "rc $rc: $out" ;;
     *) bad "the example's template and script write the message campaign.sh says" "rc $rc: $out" ;; esac
@@ -290,7 +298,7 @@ forged=$(printf '%s' "$path" | sed 's/[0-9a-f]\{4\}$/0000/')
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$W$forged")
 [ "$code" = 404 ] && ok "a forged token is no link of this runtime's" || bad "a forged token is refused" "$code"
 rm -f "$T"/sink/*
-out=$("$BIN" send m --to dan@remote.test --to fay@remote.test --set x=1 --subject 'Sale' --from news@example.test --ad --text 'again' --rate 50/s 2>&1); rc=$?
+out=$("$BIN" send m --to dan@remote.test --to fay@remote.test --set x=1 --subject 'Sale' --from news@example.test --ad --text 'again' --rate-limit 50 2>&1); rc=$?
 case "$out" in *"skipped dan@remote.test: dan@remote.test unsubscribed"*"sent 1 of 2, skipped 1"*) wait_for fay@remote.test \
     && ok "an advertisement is not sent to one who unsubscribed, and is to the rest" || bad "the rest is sent" "$out" ;;
     *) bad "an advertisement is not sent to one who unsubscribed, and is to the rest" "rc $rc: $out" ;; esac
@@ -314,7 +322,7 @@ for _ in $(seq 1 50); do "$BIN" mail m unsubscribed | grep -q fay@remote.test &&
 # Recipients from an idp's accounts and a db's documents, with their fields.
 rm -f "$T"/sink/*
 printf 'Hi {{name|you}}, code {{code|none}}' > "$T/short.txt"
-out=$("$BIN" send m --to idp:auth --to db:shop/customers --subject 'Codes' --from news@example.test --text "$(cat "$T/short.txt")" --rate 50/s 2>&1); rc=$?
+out=$("$BIN" send m --to idp:auth --to db:shop/customers --subject 'Codes' --from news@example.test --text "$(cat "$T/short.txt")" --rate-limit 50 2>&1); rc=$?
 case "$out" in *"sent 4 of 4"*) ok "idp:<runtime> and db:<runtime>/<collection> give their accounts and documents as recipients" ;;
     *) bad "idp:<runtime> and db:<runtime>/<collection> give their accounts and documents as recipients" "rc $rc: $out" ;; esac
 for a in ann ben dora eli; do wait_for $a@remote.test; done

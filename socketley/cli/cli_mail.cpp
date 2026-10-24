@@ -251,7 +251,7 @@ void put(socketley::json::jvalue& row, const std::string& name, const std::strin
         row.members.emplace_back(name, std::move(v));
 }
 
-// "5/s", "300/min", "1000/h" or a bare number a second, as messages a second.
+// A number a second, or a number for each s, m or h after a slash -- 5, 300/m, 1000/h -- as messages a second.
 bool parse_rate(std::string_view v, double& per_s)
 {
     const size_t slash = v.find('/');
@@ -261,7 +261,7 @@ bool parse_rate(std::string_view v, double& per_s)
     if (n.empty() || !end || *end || count <= 0)
         return false;
     const std::string_view unit = slash == std::string_view::npos ? std::string_view("s") : v.substr(slash + 1);
-    const double over = unit == "s" ? 1 : unit == "min" || unit == "m" ? 60 : unit == "h" ? 3600 : 0;
+    const double over = unit == "s" ? 1 : unit == "m" ? 60 : unit == "h" ? 3600 : 0;
     if (!over)
         return false;
     per_s = count / over;
@@ -271,9 +271,9 @@ bool parse_rate(std::string_view v, double& per_s)
 }   // namespace
 
 // `socketley send <mail> --to ...`: the message is written by the runtime, its body from stdin or --text. With a
-// template -- placeholders, --set, a source of recipients, --ad, --no-check, --dry-run, --test-to or --rate -- each
-// recipient is sent a message of their own, the placeholders filled from their values, at --rate, strictly unless
-// --no-check says a placeholder without a value may be empty.
+// template -- placeholders, --set, a source of recipients, --lua, --ad, --no-check, --test, --test-to or
+// --rate-limit -- each recipient is sent a message of their own, the placeholders filled from their values, at
+// --rate-limit, strictly unless --no-check says a placeholder without a value may be empty.
 int cli_mail_send(int argc, char** argv)
 {
     socketley::mail::compose c;
@@ -307,7 +307,7 @@ int cli_mail_send(int argc, char** argv)
             c.from = value();
         else if (a == "--reply-to" && has)
             c.reply_to = value();
-        else if ((a == "--subject" || a == "-s") && has)
+        else if (a == "--subject" && has)
             c.subject = value();
         else if (a == "--text" && has)
         {
@@ -366,11 +366,11 @@ int cli_mail_send(int argc, char** argv)
             sets[kv.substr(0, eq)] = kv.substr(eq + 1);
             templated = true;
         }
-        else if (a == "--rate" && has)
+        else if (a == "--rate-limit" && has)
         {
             if (!parse_rate(value(), rate))
             {
-                std::cout << "--rate is messages a second, a minute or an hour: 5/s, 300/min, 1000/h\n";
+                std::cout << "--rate-limit is messages a second, or a minute or an hour after a slash: 5, 300/m, 1000/h\n";
                 return 1;
             }
             templated = true;
@@ -380,7 +380,7 @@ int cli_mail_send(int argc, char** argv)
             test_to = value();
             templated = true;
         }
-        else if (a == "--script" && has)
+        else if (a == "--lua" && has)
         {
             script_path = value();
             templated = true;
@@ -392,7 +392,7 @@ int cli_mail_send(int argc, char** argv)
             check = false;
             templated = true;
         }
-        else if (a == "--dry-run")
+        else if (a == "--test")
             dry = templated = true;
         else if (a == "--raw")
             raw = true;
@@ -655,7 +655,7 @@ int cli_mail_send(int argc, char** argv)
         return rc != 0 || !reply.starts_with("queued") ? 1 : 0;
     }
 
-    // At --rate, the first a check: a first that cannot be written or is refused stops them all, unless --no-check.
+    // At --rate-limit, the first a check: a first that cannot be written or is refused stops them all, unless --no-check.
     const auto gap = std::chrono::microseconds(static_cast<int64_t>(1e6 / rate));
     auto next = std::chrono::steady_clock::now();
     size_t sent = 0, skipped = 0, failed = 0;

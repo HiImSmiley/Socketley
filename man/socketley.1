@@ -735,7 +735,7 @@ df \-h | socketley send m \-\-to "Ops <ops@example.com>" \-\-subject "Disks" \e
 .fi
 .RE
 .TP
-.BI "send " "mail " "\fB\-\-template \fIfile\fR \fB\-\-to \fIaddress\fR|\fBidp:\fIidp\fR[\fB/\fIgroup\fR]|\fBdb:\fIdb\fB/\fIcollection\fR|\fBjson:\fIfile\fR [\fB\-\-set \fIname\fB=\fIvalue\fR] [\fB\-\-ad\fR] [\fB\-\-no\-check\fR] [\fB\-\-rate \fIn\fB/s\fR|\fB/min\fR|\fB/h\fR] [\fB\-\-dry\-run\fR] [\fB\-\-test\-to \fIaddress\fR]"
+.BI "send " "mail " "\fB\-\-template \fIfile\fR \fB\-\-to \fIaddress\fR|\fBidp:\fIidp\fR[\fB/\fIgroup\fR]|\fBdb:\fIdb\fB/\fIcollection\fR|\fBjson:\fIfile\fR [\fB\-\-set \fIname\fB=\fIvalue\fR] [\fB\-\-lua \fIfile\fR] [\fB\-\-ad\fR] [\fB\-\-no\-check\fR] [\fB\-\-rate\-limit \fIn\fR[\fB/m\fR|\fB/h\fR]] [\fB\-\-test\fR] [\fB\-\-test\-to \fIaddress\fR]"
 A message for each recipient, of their own, from a template: an HTML file, or
 .B \-\-text
 for plain text alone, and the subject, with placeholders.
@@ -764,8 +764,10 @@ and a
 .B name
 is written into its To. With an HTML template the plain part beside it is the
 HTML's text, its links written out. The messages go at
-.B \-\-rate
-(two a second unless it says), so a new sender's first thousand do not land in
+.B \-\-rate\-limit
+a second, or a minute or an hour after a slash
+.RB ( 300/m ;
+two a second unless it says), so a new sender's first thousand do not land in
 the spam folder for coming at once; what was skipped or failed is said by
 recipient, and a line says how many were sent.
 .IP
@@ -795,7 +797,7 @@ escape, percent-encode, and keep a value unescaped;
 puts in another template, from beside this one, filled for the same recipient.
 A template reaches its recipient's values, what the script defines, string,
 table, math, os.date and os.time, and no file and no process.
-.B \-\-script
+.B \-\-lua
 .I file.lua
 runs once before the first recipient and reaches all of Lua;
 .BI on_recipient( r )
@@ -812,7 +814,7 @@ them all before any is sent, as does a first the runtime refuses, since a
 template that fails its first recipient is wrong for all of them.
 .B \-\-no\-check
 lets a name with no value be empty, and sends on past a first refused.
-.B \-\-dry\-run
+.B \-\-test
 shows the first recipient's message and how many there are, and sends nothing;
 .B \-\-test\-to
 sends that message, its subject marked [test], to the address it names alone.
@@ -839,9 +841,9 @@ advertisement still goes to an address that unsubscribed.
 .nf
 socketley send m \-\-template autumn.html \-\-inline logo.png \-\-to db:shop/customers \e
     \-\-from news@example.com \-\-subject "Hello {{name|there}}, your code {{code}}" \e
-    \-\-ad \-\-rate 5/s
-socketley send m \-\-template autumn.html \-\-to idp:auth/vip \-\-set code=VIP30 \-\-dry\-run
-socketley send m \-\-template order.html \-\-script shop.lua \-\-to db:shop/orders \-\-test\-to me@example.com
+    \-\-ad \-\-rate\-limit 5
+socketley send m \-\-template autumn.html \-\-to idp:auth/vip \-\-set code=VIP30 \-\-test
+socketley send m \-\-template order.html \-\-lua shop.lua \-\-to db:shop/orders \-\-test\-to me@example.com
 .fi
 .RE
 .PP

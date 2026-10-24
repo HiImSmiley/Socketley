@@ -43,15 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the HTML), the plain part written from the HTML. A template is Lua:
   `{{ expr }}` is any expression, `{% if %}` and `{% for %}` blocks run where
   they stand (a list from a db document walked into rows), `include("f.html")`
-  puts in another, and `--script f.lua` defines functions for them plus
+  puts in another, and `--lua f.lua` defines functions for them plus
   `on_recipient(r)`, to change or leave out a recipient, and `on_link(url, r)`,
   to rewrite each link; a template reaches no file and no process, its
   script does. The recipients are
   addresses, `idp:<idp>[/<group>]` (its accounts and their fields),
   `db:<db>/<collection>` (its documents) or `json:<file>`, `--set` gives
-  values for all, and `--rate` paces them (2/s unless said). Sending stops
+  values for all, and `--rate-limit` paces them (2 a second unless said, `300/m` a minute). Sending stops
   before the first when its message has a placeholder without a value or is
-  refused, and skips a later one, unless `--no-check` lets them be empty; `--dry-run` shows the first and
+  refused, and skips a later one, unless `--no-check` lets them be empty; `--test` shows the first and
   `--test-to` sends it to one address. `--ad` marks an advertisement: one
   recipient each, never one who unsubscribed, with their own link where
   `{{unsubscribe}}` is or below, List-Unsubscribe with a mailto: and the

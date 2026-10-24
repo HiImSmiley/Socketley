@@ -956,9 +956,9 @@ int cli_send(int argc, char** argv)
     // A flag only a mail message takes makes it one for a mail runtime, written there; any other words, a "-1" or a
     // "--" among them, are a message for a server or a client as they are.
     static constexpr std::string_view mail_flags[] = {"--to",   "-t",     "--cc",   "--bcc",  "--from",   "--reply-to",
-                                                      "--subject", "-s", "--text", "--header", "--html", "--attach",
+                                                      "--subject", "--text", "--header", "--html", "--attach",
                                                       "--raw", "--template", "--set", "--inline", "--ad", "--no-check",
-                                                      "--dry-run", "--test-to", "--rate", "--script"};
+                                                      "--test", "--test-to", "--rate-limit", "--lua"};
     if (argc >= 4 && std::any_of(std::begin(mail_flags), std::end(mail_flags),
                                  [&](std::string_view f) { return f == argv[3]; }))
         return cli_mail_send(argc, argv);
