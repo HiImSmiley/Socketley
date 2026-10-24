@@ -469,7 +469,11 @@ def appender():
     try:
         A = conn()
         for _ in range(8):
-            appended.append(A.append("Bulk", None, None, big)[0])
+            r = A.append("Bulk", None, None, big)
+            appended.append(r[0])
+            # A refusal is named, as the count alone does not say which.
+            if r[0] != "OK":
+                errs.append(repr(r))
     except Exception as e:
         errs.append(repr(e))
 def flooder():
