@@ -1,7 +1,7 @@
 #pragma once
 // DEFLATE written (RFC 1951) as a stream that is read as it goes: each call's bytes compressed against the 32 KiB
-// before them, in a block of Huffman codes made for what it holds or the fixed ones where those come out shorter, and
-// flushed with an empty stored block, so the other side opens all of it at once, as IMAP's COMPRESS (RFC 4978) and a
+// before them, in a block of Huffman codes made for what it holds, the fixed ones where those come out shorter, or
+// stored as they are where neither makes them smaller, and ended on a byte with an empty stored block after codes, so the other side opens all of it at once, as IMAP's COMPRESS (RFC 4978) and a
 // sync flush of zlib have it.  Matches are found by a hash of three bytes and a chain of at most 64 earlier places, so
 // a call costs a bounded amount per byte.
 #include <cstdint>
@@ -23,6 +23,9 @@ public:
     void compress(std::string_view in, std::string& out);
     // The final block, an empty one, which a gzip or zlib reader needs to know the stream ended.
     void finish(std::string& out);
+    // Begins again as if `dict` had just been compressed, so pieces of one stream can be compressed apart and their
+    // outputs joined in order, as pigz does; what comes out is what one deflater given every piece would write.
+    void prime(std::string_view dict);
 
 private:
     void bits(uint32_t value, int count, std::string& out);

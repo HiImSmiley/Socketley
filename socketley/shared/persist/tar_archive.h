@@ -25,8 +25,8 @@ public:
     tar_writer(const tar_writer&) = delete;
     tar_writer& operator=(const tar_writer&) = delete;
 
-    // `path` made anew, 0600; false with why.
-    bool open(const std::string& path, compression c, std::string& why);
+    // `path` made anew, 0600; false with why; more than one of `threads` compress beside the caller, which reads.
+    bool open(const std::string& path, compression c, std::string& why, unsigned threads = 1);
     // An entry of the archive: `name` relative, without a leading slash; owner and times from `st`.
     bool add_dir(std::string_view name, const struct stat& st, std::string& why);
     // The file at `source`, read as it is written; a file that grew or shrank meanwhile is taken as far as it was read
@@ -49,9 +49,14 @@ private:
     bool put(std::string_view bytes, std::string& why);
     bool flush(bool last, std::string& why);
 
+    struct workers;
+
     int m_fd{-1};
     compression m_c{compression::none};
     std::unique_ptr<deflater> m_z;
+    std::unique_ptr<workers> m_pool;
+    // The last 32 KiB handed to the pool, which the next piece is compressed against.
+    std::string m_dict;
     std::string m_buf, m_out;
     uint32_t m_crc{0};
     uint64_t m_raw{0}, m_written{0}, m_files{0};

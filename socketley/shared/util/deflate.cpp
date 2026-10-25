@@ -206,6 +206,22 @@ void deflater::finish(std::string& out)
     out.append("\x00\x00\xff\xff", 4);
 }
 
+void deflater::prime(std::string_view dict)
+{
+    const std::string_view tail = dict.substr(dict.size() > window ? dict.size() - window : 0);
+    m_hist.assign(tail);
+    m_hist_at = 0;
+    std::fill(m_head.begin(), m_head.end(), -1);
+    std::fill(m_prev.begin(), m_prev.end(), -1);
+    const auto* p = reinterpret_cast<const unsigned char*>(m_hist.data());
+    for (size_t i = 0; i + min_match <= m_hist.size(); ++i)
+    {
+        const uint32_t h = hash3(p + i);
+        m_prev[i & (window - 1)] = m_head[h];
+        m_head[h] = static_cast<int64_t>(i);
+    }
+}
+
 void deflater::bits(uint32_t value, int count, std::string& out)
 {
     // Least significant bit first, as DEFLATE packs everything but its Huffman codes.
@@ -408,6 +424,25 @@ void deflater::compress(std::string_view in, std::string& out)
         dyn_bits += static_cast<uint64_t>(lit_freq[s]) * lit_len[s];
     for (size_t d = 0; d < 30; ++d)
         dyn_bits += static_cast<uint64_t>(dist_freq[d]) * dist_len[d];
+
+    // What codes would not make smaller, already compressed media most of all, goes out as it is, in stored blocks
+    // of at most 65535 bytes, each a header that ends on a byte and the two lengths.
+    const uint64_t stored_bits = 8ull * (in.size() + 5 * ((in.size() + 65534) / 65535));
+    if (stored_bits < std::min(dyn_bits, fixed_bits))
+    {
+        for (size_t at = 0; at < in.size(); at += 65535)
+        {
+            const size_t n = std::min<size_t>(65535, in.size() - at);
+            bits(0, 1, out);
+            bits(0, 2, out);
+            if (m_bitcount > 0)
+                bits(0, 8 - m_bitcount, out);
+            bits(static_cast<uint32_t>(n), 16, out);
+            bits(static_cast<uint32_t>(~n & 0xffff), 16, out);
+            out.append(in.substr(at, n));
+        }
+        return;
+    }
 
     // A short piece is not worth making codes for: the fixed ones go out at once.
     const bool dynamic = in.size() >= 1024 && dyn_bits < fixed_bits;

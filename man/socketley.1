@@ -1644,12 +1644,16 @@ already is refused. See
 under
 .BR "LUA CONFIGURATION" .
 .TP
-.BI "export \-\-full " file " \fR[\fB\-\-compress fast\fR|\fBbest\fR|\fBnone\fR]"
+.BI "export \-\-full " file " \fR[\fB\-\-compress fast\fR|\fBbest\fR|\fBnone\fR] [\fB\-\-threads\fR \fIn\fR]"
 The setup and its data in one tar archive, gzip around it unless
 .B \-\-compress none
 says otherwise (\fBbest\fR looks longer for what repeats, as
 .B gzip \-9
-does): the state directory \(em every runtime's file, the mailboxes' index,
+does; what does not get smaller, as photos and attachments, goes in as it is),
+compressed a MiB at a time on as many threads as the CPUs it may run on, or
+.B \-\-threads
+.IR n ,
+into one stream any gzip reads: the state directory \(em every runtime's file, the mailboxes' index,
 the idp's accounts and keys, the Sieve scripts, the calendars' journals, the
 DKIM and DNSSEC keys, the certificates \(em the daemon's configuration
 directory, and what each runtime keeps elsewhere: a storage runtime's buckets,

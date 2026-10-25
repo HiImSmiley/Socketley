@@ -7,9 +7,16 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "../util/crc.h"
 #include "../util/deflate.h"
@@ -24,6 +31,8 @@ namespace
 constexpr size_t block = 512;
 // What is handed to the compressor, and read from the file, at a time.
 constexpr size_t piece = 1u << 20;
+// DEFLATE's window, all a piece compressed apart needs of what came before it.
+constexpr size_t dict_size = 32768;
 // The largest size an ustar header's eleven octal digits hold.
 constexpr uint64_t ustar_max = 077777777777ull;
 
@@ -120,15 +129,116 @@ void le32(std::string& out, uint32_t v)
 
 // ─── writing ────────────────────────────────────────────────────────────────
 
+// Threads that each compress a piece against the 32 KiB before it, the pieces written in the order they were given.
+struct tar_writer::workers
+{
+    struct job
+    {
+        std::string dict, data, out;
+        bool done{false};
+    };
+
+    workers(unsigned n, deflater::effort e) : m_effort(e)
+    {
+        // A thread the system will not give leaves fewer, and none leaves the compressing to the caller.
+        try
+        {
+            for (unsigned i = 0; i < n; ++i)
+                m_threads.emplace_back([this] { run(); });
+        }
+        catch (const std::system_error&)
+        {
+        }
+    }
+
+    size_t size() const { return m_threads.size(); }
+
+    ~workers()
+    {
+        {
+            const std::lock_guard l(m_mu);
+            m_stop = true;
+        }
+        m_work.notify_all();
+        for (auto& t : m_threads)
+            t.join();
+    }
+
+    void give(std::string dict, std::string data)
+    {
+        auto j = std::make_shared<job>();
+        j->dict = std::move(dict);
+        j->data = std::move(data);
+        m_order.push_back(j);
+        {
+            const std::lock_guard l(m_mu);
+            m_todo.push_back(std::move(j));
+        }
+        m_work.notify_one();
+    }
+
+    // What is done at the front of the order onto `out`, waiting for all of it with `all`, else only while more are
+    // given than two for each thread, so the reading never runs far ahead of the compressing.
+    void take(std::string& out, bool all)
+    {
+        std::unique_lock l(m_mu);
+        while (!m_order.empty())
+        {
+            if (!m_order.front()->done)
+            {
+                if (!all && m_order.size() < 2 * m_threads.size())
+                    return;
+                m_done.wait(l, [&] { return m_order.front()->done; });
+            }
+            out.append(m_order.front()->out);
+            m_order.pop_front();
+        }
+    }
+
+private:
+    void run()
+    {
+        deflater z(m_effort);
+        for (;;)
+        {
+            std::shared_ptr<job> j;
+            {
+                std::unique_lock l(m_mu);
+                m_work.wait(l, [&] { return m_stop || !m_todo.empty(); });
+                if (m_todo.empty())
+                    return;
+                j = std::move(m_todo.front());
+                m_todo.pop_front();
+            }
+            z.prime(j->dict);
+            z.compress(j->data, j->out);
+            {
+                const std::lock_guard l(m_mu);
+                j->done = true;
+                std::string().swap(j->data);
+            }
+            m_done.notify_all();
+        }
+    }
+
+    deflater::effort m_effort;
+    std::mutex m_mu;
+    std::condition_variable m_work, m_done;
+    std::deque<std::shared_ptr<job>> m_todo, m_order;
+    std::vector<std::thread> m_threads;
+    bool m_stop{false};
+};
+
 tar_writer::tar_writer() = default;
 
 tar_writer::~tar_writer()
 {
+    m_pool.reset();
     if (m_fd >= 0)
         ::close(m_fd);
 }
 
-bool tar_writer::open(const std::string& path, compression c, std::string& why)
+bool tar_writer::open(const std::string& path, compression c, std::string& why, unsigned threads)
 {
     m_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (m_fd < 0)
@@ -139,7 +249,12 @@ bool tar_writer::open(const std::string& path, compression c, std::string& why)
     m_c = c;
     if (c != compression::none)
     {
-        m_z = std::make_unique<deflater>(c == compression::best ? deflater::effort::best : deflater::effort::fast);
+        const deflater::effort e = c == compression::best ? deflater::effort::best : deflater::effort::fast;
+        m_z = std::make_unique<deflater>(e);
+        if (threads > 1)
+            m_pool = std::make_unique<workers>(threads, e);
+        if (m_pool && m_pool->size() == 0)
+            m_pool.reset();
         // gzip's header (RFC 1952): no name, no time, the slowest or the fastest level, made on Unix.
         m_out.assign("\x1f\x8b\x08\x00\x00\x00\x00\x00", 8);
         m_out += static_cast<char>(c == compression::best ? 2 : 4);
@@ -159,7 +274,23 @@ bool tar_writer::put(std::string_view bytes, std::string& why)
 
 bool tar_writer::flush(bool last, std::string& why)
 {
-    if (m_z)
+    if (m_pool)
+    {
+        // What the next piece is compressed against: this one's end, and the one before's where this is shorter.
+        std::string next = m_buf.size() >= dict_size ? m_buf.substr(m_buf.size() - dict_size) : m_dict + m_buf;
+        if (next.size() > dict_size)
+            next.erase(0, next.size() - dict_size);
+        if (!m_buf.empty())
+            m_pool->give(std::exchange(m_dict, std::move(next)), std::exchange(m_buf, {}));
+        m_pool->take(m_out, last);
+        if (last)
+        {
+            m_z->finish(m_out);
+            le32(m_out, m_crc);
+            le32(m_out, static_cast<uint32_t>(m_raw & 0xffffffffu));
+        }
+    }
+    else if (m_z)
     {
         m_z->compress(m_buf, m_out);
         if (last)

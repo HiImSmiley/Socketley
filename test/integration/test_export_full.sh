@@ -7,6 +7,7 @@
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   * an archive tar or gzip does not take, or one that is not smaller with --compress best
+#   * compressing on several threads that loses or reorders a piece, which one thread would not
 #   * a runtime's data left out: its buckets, its accounts, its mailboxes, its documents, its keys
 #   * a restore over a running daemon, over runtimes already there, or of a file that is no such archive
 #   * a restore that brings the runtimes back stopped, or without what they held
@@ -94,6 +95,11 @@ done
     && ok "best is no larger than fast, and fast smaller than none" \
     || bad "the sizes" "$(stat -c '%n %s' "$T/best.tar.gz" "$T/fast.tar.gz" "$T/plain.tar")"
 tar tf "$T/plain.tar" >/dev/null 2>&1 && ok "--compress none is a plain tar" || bad "a plain tar" "$(file "$T/plain.tar")"
+"$BIN" export --full "$T/one.tar.gz" --threads 1 >/dev/null 2>&1
+[ "$(tar tzf "$T/one.tar.gz" 2>/dev/null | wc -l)" -eq "$(printf '%s\n' "$list" | wc -l)" ] && ok "compressed on one thread, the archive holds the same" \
+    || bad "--threads 1" "$(tar tzf "$T/one.tar.gz" 2>&1 | wc -l) entries"
+out=$("$BIN" export --full "$T/zero.tar.gz" --threads 0 2>&1); rc=$?
+[ "$rc" -eq 1 ] && [ ! -e "$T/zero.tar.gz" ] && ok "--threads 0 is refused" || bad "--threads 0" "rc $rc: $out"
 [ "$(stat -c %a "$T/fast.tar.gz")" = 600 ] && ok "the archive is its writer's alone" || bad "the archive's mode" "$(stat -c %a "$T/fast.tar.gz")"
 
 out=$("$BIN" restore "$T/fast.tar.gz" 2>&1); rc=$?

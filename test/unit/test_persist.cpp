@@ -176,6 +176,42 @@ TEST_CASE("DEFLATE: best effort is no larger than fast, both open to what went i
     CHECK(fast.size() < text.size() / 3);
 }
 
+TEST_CASE("DEFLATE: pieces compressed apart against the 32 KiB before each are the stream one deflater writes")
+{
+    std::string text;
+    std::mt19937 rng(9);
+    static const char* words[] = {"inbox ", "zone ", "bucket ", "socketley ", "of ", "an ", "segment ", "\n"};
+    for (int i = 0; i < 150000; ++i)
+        text += words[rng() % 8];
+    // Bytes no code makes smaller, between the text, go out stored.
+    std::string noise(200000, '\0');
+    for (auto& c : noise)
+        c = static_cast<char>(rng());
+    text.insert(300000, noise);
+    for (const auto e : {socketley::deflater::effort::fast, socketley::deflater::effort::best})
+    {
+        std::string whole, apart;
+        socketley::deflater one(e), each(e);
+        for (size_t at = 0; at < text.size(); at += 70000)
+        {
+            const std::string_view in = std::string_view(text).substr(at, 70000);
+            one.compress(in, whole);
+            each.prime(std::string_view(text).substr(0, at));
+            each.compress(in, apart);
+        }
+        one.finish(whole);
+        each.finish(apart);
+        CHECK(apart == whole);
+        CHECK(opened(apart) == text);
+    }
+    std::string stored;
+    socketley::deflater z;
+    z.compress(noise, stored);
+    CHECK(stored.size() <= noise.size() + 5 * 4);
+    z.finish(stored);
+    CHECK(opened(stored) == noise);
+}
+
 TEST_CASE("tar: what is written reads back, a long name, a link, a file of several pieces, each compression")
 {
     const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("skl-tar-" + std::to_string(::getpid()));
@@ -207,6 +243,26 @@ TEST_CASE("tar: what is written reads back, a long name, a link, a file of sever
             CHECK(w.add_link("var/lib/link", "/" + std::string(120, 'y'), st, why));
             REQUIRE_MESSAGE(w.close(why), why);
             CHECK(w.files() == 3);
+        }
+        // Compressed on two threads, the archive is the same to the byte.
+        if (c != socketley::tar_writer::compression::none)
+        {
+            std::string by[2];
+            for (const unsigned threads : {1u, 2u})
+            {
+                const std::string p = (dir / ("t" + std::to_string(threads) + ".tar")).string();
+                socketley::tar_writer w;
+                REQUIRE_MESSAGE(w.open(p, c, why, threads), why);
+                struct stat st{};
+                REQUIRE(::stat(dir.c_str(), &st) == 0);
+                CHECK(w.add_dir("var/lib", st, why));
+                CHECK(w.add_file("var/lib/big", (dir / "big").string(), why));
+                CHECK(w.add_link("var/lib/link", "/" + std::string(120, 'y'), st, why));
+                REQUIRE_MESSAGE(w.close(why), why);
+                CHECK(socketley::read_file(p, by[threads - 1]));
+            }
+            CHECK(by[0].size() > 1000);
+            CHECK(by[1] == by[0]);
         }
         socketley::tar_reader r;
         REQUIRE_MESSAGE(r.open(path, why), why);

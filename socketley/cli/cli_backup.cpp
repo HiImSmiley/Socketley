@@ -5,12 +5,14 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -225,15 +227,32 @@ std::set<std::string> running_runtimes()
 
 }   // namespace
 
-// `socketley export --full <file> [--compress fast|best|none]`.
+// `socketley export --full <file> [--compress fast|best|none] [--threads N]`.
 int cli_export_full(int argc, char** argv)
 {
     std::string file;
     socketley::tar_writer::compression c = socketley::tar_writer::compression::fast;
+    // As many compress as the CPUs this process may run on, up to 64, which hold 128 pieces of a MiB at once.
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    unsigned threads =
+        ::sched_getaffinity(0, sizeof(cpus), &cpus) == 0 ? std::clamp(static_cast<unsigned>(CPU_COUNT(&cpus)), 1u, 64u) : 1;
     for (int i = 3; i < argc; ++i)
     {
         const std::string_view a = argv[i];
-        if (a == "--compress" && i + 1 < argc)
+        if (a == "--threads" && i + 1 < argc)
+        {
+            const std::string_view v = argv[++i];
+            unsigned n = 0;
+            const auto [end, err] = std::from_chars(v.data(), v.data() + v.size(), n);
+            if (err != std::errc() || end != v.data() + v.size() || n < 1 || n > 64)
+            {
+                std::cout << "--threads takes a number from 1 to 64\n";
+                return 1;
+            }
+            threads = n;
+        }
+        else if (a == "--compress" && i + 1 < argc)
         {
             const std::string_view v = argv[++i];
             if (v == "fast")
@@ -252,13 +271,13 @@ int cli_export_full(int argc, char** argv)
             file = std::string(a);
         else
         {
-            std::cerr << "usage: socketley export --full <file> [--compress fast|best|none]\n";
+            std::cerr << "usage: socketley export --full <file> [--compress fast|best|none] [--threads N]\n";
             return 1;
         }
     }
     if (file.empty())
     {
-        std::cerr << "usage: socketley export --full <file> [--compress fast|best|none]\n";
+        std::cerr << "usage: socketley export --full <file> [--compress fast|best|none] [--threads N]\n";
         return 1;
     }
     std::error_code ec;
@@ -381,7 +400,7 @@ int cli_export_full(int argc, char** argv)
 
     const fs::path partial = out.string() + ".partial";
     writer_job j;
-    bool ok = j.tar.open(partial.string(), c, j.why) &&
+    bool ok = j.tar.open(partial.string(), c, j.why, threads) &&
               j.tar.add_bytes(std::string(meta_dir) + "manifest.json", socketley::json::written(manifest) + "\n", 0600, j.why);
     if (ok && setup)
     {
