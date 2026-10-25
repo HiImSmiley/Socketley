@@ -485,6 +485,15 @@ TEST_CASE("errors past the limit close the connection, and a long line is refuse
     CHECK(g.codes().back() == 250);
 }
 
+TEST_CASE("VRFY confirms no user, EXPN expands no list, HELP points at the RFC, and none of them ends the session")
+{
+    fake f;
+    smtp_session s(plain_config(), f);
+    s.input("VRFY alice\r\nEXPN staff\r\nHELP\r\nNOOP\r\n");
+    CHECK(f.codes() == std::vector<int>{252, 502, 214, 250});
+    CHECK_FALSE(f.closed);
+}
+
 TEST_CASE("commands out of order, and a DATA the store cannot take")
 {
     fake f;
@@ -561,6 +570,15 @@ TEST_CASE("DKIM: what this signs, it verifies, and the canonicalizations are RFC
     std::string two = signed_msg;
     two.insert(two.find("To: "), "From: evil@else.test\r\n");
     CHECK(dkim::verify(two, sigs[0], dkim::public_record(key.get()), 1000) == dkim::result::fail);
+    // A message with two From before it is signed is signed whole, and a third added after still breaks it.
+    const std::string twice = "From: a@example.test\r\nFrom: c@example.test\r\nTo: b@remote.test\r\n\r\nbody\r\n";
+    const std::string signed_twice = dkim::sign(twice, "example.test", "skl", key.get(), 1000) + twice;
+    const auto ts = dkim::signatures(signed_twice);
+    REQUIRE(ts.size() == 1);
+    CHECK(dkim::verify(signed_twice, ts[0], dkim::public_record(key.get()), 1000) == dkim::result::pass);
+    std::string thrice = signed_twice;
+    thrice.insert(thrice.find("To: "), "From: evil@else.test\r\n");
+    CHECK(dkim::verify(thrice, ts[0], dkim::public_record(key.get()), 1000) == dkim::result::fail);
     // x= is when the signature stops vouching: it passes before and fails after (RFC 6376 3.5).
     const std::string expiring = dkim::sign(msg, "example.test", "skl", key.get(), 1000, "DKIM-Signature", "x=1500; ") + msg;
     const auto xs = dkim::signatures(expiring);

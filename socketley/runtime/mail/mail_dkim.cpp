@@ -320,7 +320,7 @@ std::string sign(std::string_view message, std::string_view domain, std::string_
     std::string data;
     for (const auto name : wanted)
     {
-        // The last of a name, the one a reader is shown.
+        // The last of a name, the one a reader is shown; every From there is, as a checker takes them one by one.
         for (auto it = headers.rbegin(); it != headers.rend(); ++it)
             if (socketley::ascii::iequals(trim(it->first), name))
             {
@@ -329,7 +329,8 @@ std::string sign(std::string_view message, std::string_view domain, std::string_
                     h += ':';
                 h += name;
                 data += relaxed_header(it->first, it->second) + "\r\n";
-                break;
+                if (name != "from")
+                    break;
             }
     }
     // From named once more than it is there, so a second From added on the way breaks the signature.
