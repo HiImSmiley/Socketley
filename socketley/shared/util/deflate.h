@@ -1,7 +1,8 @@
 #pragma once
 // DEFLATE written (RFC 1951) as a stream that is read as it goes: each call's bytes compressed against the 32 KiB
 // before them, in a block of Huffman codes made for what it holds, the fixed ones where those come out shorter, or
-// stored as they are where neither makes them smaller, and ended on a byte with an empty stored block after codes, so the other side opens all of it at once, as IMAP's COMPRESS (RFC 4978) and a
+// stored as they are where neither makes them smaller or 64 KiB of them look like noise, which is then not searched
+// for matches at all, and ended on a byte with an empty stored block after codes, so the other side opens all of it at once, as IMAP's COMPRESS (RFC 4978) and a
 // sync flush of zlib have it.  Matches are found by a hash of three bytes and a chain of at most 64 earlier places, so
 // a call costs a bounded amount per byte.
 #include <cstdint>
@@ -28,6 +29,13 @@ public:
     void prime(std::string_view dict);
 
 private:
+    // The bytes of the history from `from` to `to` as one block of codes, or stored, which still remembers where
+    // each three of them begin.
+    void block(size_t from, size_t to, std::string& out);
+    void store(size_t from, size_t to, std::string& out);
+    void stored(std::string_view in, std::string& out);
+    // The place `i` of the history entered in the hash chains, once the three bytes it begins are there.
+    void insert(size_t i);
     void bits(uint32_t value, int count, std::string& out);
     void code(uint32_t code, int length, std::string& out);
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 namespace socketley
 {
@@ -27,6 +28,25 @@ constexpr uint8_t cl_order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3
 uint32_t hash3(const unsigned char* p)
 {
     return ((static_cast<uint32_t>(p[0]) << 16 | static_cast<uint32_t>(p[1]) << 8 | p[2]) * 2654435761u) >> 17;
+}
+
+// What is judged noise or not at a time.
+constexpr size_t segment = 65536;
+
+bool looks_random(std::string_view s)
+{
+    // Bytes as evenly spread as compressed data's: order-0 entropy above 7.9 bits, where DEFLATE saves about 1%.
+    if (s.size() < 4096)
+        return false;
+    std::array<uint32_t, 256> count{};
+    for (const char c : s)
+        ++count[static_cast<unsigned char>(c)];
+    double sum = 0;
+    for (const uint32_t c : count)
+        if (c)
+            sum += c * std::log2(static_cast<double>(c));
+    const double n = static_cast<double>(s.size());
+    return std::log2(n) - sum / n > 7.9;
 }
 
 // A literal or the end (sym < 257, dist 0), or a match of its length symbol, length and distance.
@@ -208,18 +228,12 @@ void deflater::finish(std::string& out)
 
 void deflater::prime(std::string_view dict)
 {
-    const std::string_view tail = dict.substr(dict.size() > window ? dict.size() - window : 0);
-    m_hist.assign(tail);
+    m_hist.assign(dict.substr(dict.size() > window ? dict.size() - window : 0));
     m_hist_at = 0;
     std::fill(m_head.begin(), m_head.end(), -1);
     std::fill(m_prev.begin(), m_prev.end(), -1);
-    const auto* p = reinterpret_cast<const unsigned char*>(m_hist.data());
-    for (size_t i = 0; i + min_match <= m_hist.size(); ++i)
-    {
-        const uint32_t h = hash3(p + i);
-        m_prev[i & (window - 1)] = m_head[h];
-        m_head[h] = static_cast<int64_t>(i);
-    }
+    for (size_t i = 0; i < m_hist.size(); ++i)
+        insert(i);
 }
 
 void deflater::bits(uint32_t value, int count, std::string& out)
@@ -258,18 +272,65 @@ void deflater::compress(std::string_view in, std::string& out)
     }
     const size_t start = m_hist.size();
     m_hist.append(in);
-    const std::string& buf = m_hist;
-    const auto* p = reinterpret_cast<const unsigned char*>(buf.data());
+    // A run of segments that look alike, noise or not, is one block, so already compressed media costs no matching.
+    std::vector<bool> noise;
+    // A tail too short to judge goes with the segment before it.
+    for (size_t at = start; at < m_hist.size(); at += segment)
+        noise.push_back(m_hist.size() - at < 4096 && !noise.empty() ? noise.back()
+                                                                     : looks_random(std::string_view(m_hist).substr(at, segment)));
+    for (size_t k = 0; k < noise.size();)
+    {
+        size_t e = k + 1;
+        while (e < noise.size() && noise[e] == noise[k])
+            ++e;
+        const size_t from = start + k * segment, to = std::min(m_hist.size(), start + e * segment);
+        if (noise[k])
+            store(from, to, out);
+        else
+            block(from, to, out);
+        k = e;
+    }
+}
+
+void deflater::insert(size_t i)
+{
+    if (i + min_match > m_hist.size())
+        return;
+    const uint32_t h = hash3(reinterpret_cast<const unsigned char*>(m_hist.data()) + i);
+    const int64_t at = static_cast<int64_t>(m_hist_at + i);
+    m_prev[static_cast<size_t>(at) & (window - 1)] = m_head[h];
+    m_head[h] = at;
+}
+
+void deflater::store(size_t from, size_t to, std::string& out)
+{
+    for (size_t i = from; i < to; ++i)
+        insert(i);
+    stored(std::string_view(m_hist).substr(from, to - from), out);
+}
+
+void deflater::stored(std::string_view in, std::string& out)
+{
+    // Blocks of at most 65535 bytes, each a header that ends on a byte and the two lengths.
+    for (size_t at = 0; at < in.size(); at += 65535)
+    {
+        const size_t n = std::min<size_t>(65535, in.size() - at);
+        bits(0, 1, out);
+        bits(0, 2, out);
+        if (m_bitcount > 0)
+            bits(0, 8 - m_bitcount, out);
+        bits(static_cast<uint32_t>(n), 16, out);
+        bits(static_cast<uint32_t>(~n & 0xffff), 16, out);
+        out.append(in.substr(at, n));
+    }
+}
+
+void deflater::block(size_t from, size_t end, std::string& out)
+{
+    const std::string_view in = std::string_view(m_hist).substr(from, end - from);
+    const size_t start = from;
+    const auto* p = reinterpret_cast<const unsigned char*>(m_hist.data());
     const uint64_t base = m_hist_at;
-    const size_t end = buf.size();
-    const auto insert = [&](size_t i) {
-        if (i + min_match > end)
-            return;
-        const uint32_t h = hash3(p + i);
-        const int64_t at = static_cast<int64_t>(base + i);
-        m_prev[static_cast<size_t>(at) & (window - 1)] = m_head[h];
-        m_head[h] = at;
-    };
     // The matches found first, so the block's codes can be made for what it holds.
     std::vector<token> toks;
     toks.reserve(in.size() / 2 + 1);
@@ -425,22 +486,11 @@ void deflater::compress(std::string_view in, std::string& out)
     for (size_t d = 0; d < 30; ++d)
         dyn_bits += static_cast<uint64_t>(dist_freq[d]) * dist_len[d];
 
-    // What codes would not make smaller, already compressed media most of all, goes out as it is, in stored blocks
-    // of at most 65535 bytes, each a header that ends on a byte and the two lengths.
+    // What codes would not make smaller goes out as it is.
     const uint64_t stored_bits = 8ull * (in.size() + 5 * ((in.size() + 65534) / 65535));
     if (stored_bits < std::min(dyn_bits, fixed_bits))
     {
-        for (size_t at = 0; at < in.size(); at += 65535)
-        {
-            const size_t n = std::min<size_t>(65535, in.size() - at);
-            bits(0, 1, out);
-            bits(0, 2, out);
-            if (m_bitcount > 0)
-                bits(0, 8 - m_bitcount, out);
-            bits(static_cast<uint32_t>(n), 16, out);
-            bits(static_cast<uint32_t>(~n & 0xffff), 16, out);
-            out.append(in.substr(at, n));
-        }
+        stored(in, out);
         return;
     }
 
