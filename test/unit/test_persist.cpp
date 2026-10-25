@@ -248,13 +248,14 @@ TEST_CASE("tar: what is written reads back, a long name, a link, a file of sever
         if (c != socketley::tar_writer::compression::none)
         {
             std::string by[2];
+            // Taken once, since writing the first archive changes the directory's time.
+            struct stat st{};
+            REQUIRE(::stat(dir.c_str(), &st) == 0);
             for (const unsigned threads : {1u, 2u})
             {
                 const std::string p = (dir / ("t" + std::to_string(threads) + ".tar")).string();
                 socketley::tar_writer w;
                 REQUIRE_MESSAGE(w.open(p, c, why, threads), why);
-                struct stat st{};
-                REQUIRE(::stat(dir.c_str(), &st) == 0);
                 CHECK(w.add_dir("var/lib", st, why));
                 CHECK(w.add_file("var/lib/big", (dir / "big").string(), why));
                 CHECK(w.add_link("var/lib/link", "/" + std::string(120, 'y'), st, why));

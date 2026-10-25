@@ -88,7 +88,7 @@ list=$(tar tzf "$T/fast.tar.gz" 2>&1)
 st_dir=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['state_dir'])" "$(tar xzOf "$T/fast.tar.gz" socketley-backup/manifest.json)")
 case "$list" in *"socketley-backup/manifest.json"*"socketley-backup/setup/config.lua"*) ok "tar lists the manifest and the Lua setup" ;; *) bad "tar's listing" "$(printf '%s' "$list" | head -5)" ;; esac
 for want in "${T#/}/data/files/" "${T#/}/kv.rdb" "${st_dir#/}/db/docs/seg-00000001.log" "${st_dir#/}/idp/auth.accounts/" "${st_dir#/}/mail/m.dkim.skl.key"; do
-    printf '%s\n' "$list" | grep -q "^$want" || { bad "the archive holds $want" "$(printf '%s\n' "$list" | grep -c .) entries"; continue; }
+    grep -q "^$want" <<< "$list" || { bad "the archive holds $want" "$(printf '%s\n' "$list" | grep -c .) entries"; continue; }
     ok "the archive holds ${want%/}"
 done
 [ "$(stat -c %s "$T/best.tar.gz")" -le "$(stat -c %s "$T/fast.tar.gz")" ] && [ "$(stat -c %s "$T/fast.tar.gz")" -lt "$(stat -c %s "$T/plain.tar")" ] \

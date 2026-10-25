@@ -159,14 +159,24 @@ for _ in $(seq 1 50); do [ "$(stat_of notify_failed)" -gt "$f0" ] && break; slee
 [ "$(stat_of notify_failed)" -gt "$f0" ] && [ "$(stat_of notify_queued)" -ge 1 ] \
     && ok "an event for a server that is stopped fails and waits" \
     || bad "an event for a server that is stopped fails and waits" "failed $(stat_of notify_failed) queued $(stat_of notify_queued)"
-"$BIN" start nrv >/dev/null 2>&1
-wait_port "$PV"
-back=$(python3 - "$PV" <<'PY'
+# A broadcast reaches whoever is connected when it is sent, so the client is there before the next attempt: five
+# failures put that attempt 4 s off, and the client connects the moment the port opens.
+for _ in $(seq 1 100); do [ "$(stat_of notify_failed)" -gt $((f0 + 4)) ] && break; sleep 0.1; done
+python3 - "$PV" > "$T/back" <<'PY' &
 import socket, sys, time
-c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5)
+end = time.time() + 30
+while True:
+    try:
+        c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5)
+        break
+    except OSError:
+        if time.time() > end:
+            print("no connection")
+            sys.exit(0)
+        time.sleep(0.01)
 c.sendall(b"hello\n")
 c.settimeout(0.2)
-got, end = b"", time.time() + 20
+got = b""
 while time.time() < end and b"k2.panel" not in got:
     try:
         got += c.recv(65536)
@@ -174,7 +184,10 @@ while time.time() < end and b"k2.panel" not in got:
         pass
 print(b"k2.panel" in got)
 PY
-)
+client=$!
+"$BIN" start nrv >/dev/null 2>&1
+wait "$client"
+back=$(cat "$T/back")
 [ "$back" = True ] && ok "and reaches the server's clients once it is back" \
     || bad "and reaches the server's clients once it is back" "$back"
 
