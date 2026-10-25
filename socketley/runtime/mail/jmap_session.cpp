@@ -1,4 +1,5 @@
 #include "jmap_session.h"
+#include "dav.h"
 #include "mail_setup.h"
 
 #include <algorithm>
@@ -31,13 +32,17 @@ std::string reason_of(int code)
         case 200: return "OK";
         case 201: return "Created";
         case 204: return "No Content";
+        case 207: return "Multi-Status";
+        case 301: return "Moved Permanently";
         case 304: return "Not Modified";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
         case 411: return "Length Required";
+        case 412: return "Precondition Failed";
         case 413: return "Content Too Large";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
@@ -400,6 +405,17 @@ void jmap_session::handle(request rq)
             return after();
         }
     }
+    // A calendar or contacts client looking for where they are kept (RFC 6764).
+    if (rq.path == "/.well-known/caldav" || rq.path == "/.well-known/carddav")
+    {
+        respond(301, {}, {}, "Location: /dav/\r\n");
+        return after();
+    }
+    if (rq.method == "OPTIONS" && dav_path(rq.path, "PROPFIND"))
+    {
+        respond(200, {}, {}, "DAV: " + std::string(dav_classes) + "\r\nAllow: " + std::string(dav_allow) + "\r\n");
+        return after();
+    }
     if (rq.method == "OPTIONS")
     {
         respond(204, {}, {}, "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
@@ -477,6 +493,29 @@ void jmap_session::handle(request rq)
         }
         if (p == "/jmap/eventsource" && r.method == "GET")
             return eventsource(r);
+        if (dav_path(p, r.method))
+        {
+            dav_store* store = m_hooks.dav();
+            if (!store)
+            {
+                fail(404, "about:blank", "calendars and contacts need --idp and --storage");
+                return after();
+            }
+            dav_request d{r.method, p, [hs = r.headers](std::string_view n) {
+                              for (const auto& [k, v] : hs)
+                                  if (socketley::ascii::iequals(k, n))
+                                      return v;
+                              return std::string();
+                          },
+                          std::move(r.body)};
+            return dav_serve(*store, m_alive, m_user, m_hooks.address_of(m_user), std::move(d),
+                             [this, after, alive = m_alive](dav_reply out) {
+                                 if (!*alive)
+                                     return;
+                                 respond(out.code, out.type, out.body, out.headers);
+                                 after();
+                             });
+        }
         fail(404, "about:blank", "nothing is here");
         return after();
     };

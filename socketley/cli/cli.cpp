@@ -691,6 +691,7 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("mqtt-sessions"):
         case fnv1a("mqtt-kick"):
         case fnv1a("mqtt-retained"):
+        case fnv1a("dnssec"):
             return cli_forward(argc, argv);
         case fnv1a("db-query"):
             return cli_forward(argc, argv);

@@ -28,6 +28,9 @@ inline constexpr uint16_t dns_default_port = 53;
 // Responses a second to one client block before the rest are dropped or sent truncated (--rrl), 0 for no limit.
 inline constexpr uint32_t dns_default_rrl = 100;
 
+// Where a runtime's DNSSEC keys are kept, one file a zone, the same for every shard.
+std::string dns_dnssec_dir(std::string_view runtime_name);
+
 class dns_instance : public runtime_instance
 {
 public:
@@ -44,6 +47,8 @@ public:
     }
     std::string_view get_zones() const { return m_zones; }
     std::vector<std::string> zone_paths() const;
+    // The DS record each zone's parent is given, and its DNSKEY, a line each; the keys made where they are not yet.
+    std::string ds_records(std::string& why) const;
     // Where the file of a zone given by name (--zone example.com) is kept: the state directory's zones/.
     static std::string managed_zone_path(std::string_view zone);
     // Each zone file that does not exist yet written, for a zone given by name or a missing <zone>.zone: its SOA,
@@ -75,6 +80,10 @@ public:
     void set_rrl(uint32_t per_sec) { m_rrl = per_sec; }
     uint32_t get_rrl() const { return m_rrl; }
 
+    // DNSSEC (--dnssec): every zone signed as it is loaded, with a key of its own under the runtime's state.
+    void set_dnssec(bool on) { m_dnssec = on; }
+    bool get_dnssec() const { return m_dnssec; }
+
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
@@ -94,6 +103,7 @@ private:
     std::string m_proxy;
     uint16_t m_proxy_port{443};
     uint32_t    m_rrl{dns_default_rrl};
+    bool        m_dnssec{false};
 
     std::unique_ptr<socketley::dns::dns_run> m_run;
     // Runs the ring still owes completions to, freed once it owes them none.

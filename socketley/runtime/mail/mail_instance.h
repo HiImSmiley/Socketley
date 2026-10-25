@@ -32,6 +32,8 @@ std::string mail_verp_key_path(std::string_view runtime_name);
 std::string mail_key_path(std::string_view runtime_name, std::string_view selector);
 // Where the users' Sieve scripts are kept, the same for every shard.
 std::string mail_sieve_dir(std::string_view runtime_name);
+// Where the journals of its users' calendars and address books are kept, one a collection.
+std::string mail_dav_dir(std::string_view runtime_name);
 // A runtime's state moved under a new name, as an import that renames it asks; false with `why` where a file of the
 // new name's is there already or one could not be moved.
 bool mail_rename_state(std::string_view from, std::string_view to, std::string& why);

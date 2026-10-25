@@ -1155,6 +1155,22 @@ socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
 .fi
 .RE
 .TP
+.BI "dnssec " dns
+The DS record each zone of a dns runtime with
+.B \-\-dnssec
+is to be given at its parent, the registrar, and the DNSKEY it stands for, a
+line each; the keys are made where the runtime has not made them yet, so the DS
+can go to the registrar before the zone is served signed. A zone whose parent
+does not have its DS is answered as if unsigned by every validating resolver;
+one whose parent has a DS for another key is not answered at all, so a key is
+never removed while a DS names it.
+.RS
+.PP
+.nf
+socketley dnssec ns
+.fi
+.RE
+.TP
 .BI "mail " "\fR[\fImail\fR] " "\fR[\fBqueue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns \fR[\fB\-\-check\fR] | \fBtrace \fIaddress\fR | \fBusage \fR[\fIuser\fR] | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBunsubscribed\fR | \fBresubscribe \fIaddress\fR | \fBlearn \fIuser\fB/\fIfolder \fB\-\-as spam\fR|\fBham\fR | \fBexport \fIuser \fR[\fIdir\fR] | \fBimport \fIuser file\fR|\fIdir\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname\fR]"
 The runtime's name may go unsaid where the daemon has one mail runtime alone.
 Hourly, and as it starts, it asks whether the PTR of each address of its host
@@ -11747,6 +11763,18 @@ the query) and the others are dropped. A resolver behind that network retries
 over TCP, which is not limited, and is served; a victim whose address a
 flood forges receives nothing larger than what was sent. 100 by default, 0 for
 no limit.
+.TP
+.B \-\-dnssec
+Sign every zone as it is loaded (RFC 4033 to 4035): a key of ECDSA P\-256 with
+SHA\-256 (algorithm 13) a zone, made at the first start and kept in
+.IR state\-dir /dns/ name .dnssec/
+for every shard, its DNSKEY at the apex, an NSEC chain through the names and
+an RRSIG over every set the zone holds, for three weeks and made again a week
+before they end. A query with the DO bit is answered with the signatures, and
+a name or type that is not there with the NSEC records that prove it; a zone
+transfer carries them. The parent zone is given the DS record
+.B socketley dnssec
+prints.
 .SS Names runtimes are reached by
 The daemon writes the names its runtimes are reached by into
 .IR state\-dir /.dns/names
@@ -13365,6 +13393,38 @@ or not a Sieve script runs. A PushSubscription (at most 50 a user, a week each
 until renewed) is verified by the code pushed to its URL, then sent a
 StateChange whenever the types it asked for change, over HTTPS to a public
 address, encrypted where it gave keys (RFC 8291).
+.PP
+.B Calendars and contacts.
+On the same ports, CalDAV (RFC 4791) and CardDAV (RFC 6352) for every user:
+.B /.well\-known/caldav
+and
+.B /.well\-known/carddav
+lead to
+.BR /dav/ ,
+whose principal names the user's calendars under
+.IB /dav/ user /calendars/
+and address books under
+.IB /dav/ user /contacts/\fR,
+.B personal
+and
+.B default
+there for every user and more made with MKCALENDAR or MKCOL. A client puts,
+reads and deletes each event, task or card whole, under If-Match and
+If-None-Match; PROPPATCH keeps a collection's name, colour and description;
+the multiget and query REPORTs, a query's component filter among them, and
+sync-collection (RFC 6578) answer. The entries are objects of the
+.B \-\-storage
+bucket under
+.IB .dav/ user /\fR,
+apart from the mail folders, and what changed in a collection is a line of a
+journal under
+.IB state /mail/ name .dav/\fR,
+whose length is its sync token. Through the entrance a user signs in as for
+JMAP; Thunderbird's autoconfig, the Apple profile and
+.B _caldavs._tcp
+and
+.B _carddavs._tcp
+in the zone point a client there.
 .PP
 .B Webmail.
 With

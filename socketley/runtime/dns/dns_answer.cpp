@@ -1,4 +1,5 @@
 #include "dns_answer.h"
+#include "dns_sign.h"
 
 #include <cstring>
 
@@ -61,14 +62,15 @@ namespace
 {
 
 // The OPT record of a reply (RFC 6891): the size this server takes over UDP, and the upper bits of an extended rcode.
-void write_opt(writer& w, uint8_t ext_rcode)
+void write_opt(writer& w, uint8_t ext_rcode, bool dnssec_ok)
 {
     w.put8(0);
     w.put16(type::OPT);
     w.put16(udp_payload);
     w.put8(ext_rcode);
     w.put8(0);   // version 0
-    w.put16(0);  // no flags: no DNSSEC here
+    // The DO bit goes back as it came (RFC 3225 3).
+    w.put16(dnssec_ok ? 0x8000 : 0);
     w.put16(0);
 }
 
@@ -76,6 +78,8 @@ struct lookup
 {
     enum kind { found, nodata, nxdomain, referral, chain_out } k{nxdomain};
     const node* nd{nullptr};
+    // The name `nd` is kept under, the wildcard's where it stood in for the name asked.
+    std::string_view owner;
     // The zone cut a referral hands the name to.
     std::string_view cut;
     const node* cut_node{nullptr};
@@ -106,10 +110,11 @@ lookup find_name(const zone& z, std::string_view name, uint16_t qtype)
         r.cut_node = best_cut;
         return r;
     }
-    if (const node* n = z.find(name))
+    if (const auto it = z.names.find(name); it != z.names.end())
     {
-        r.nd = n;
-        r.k = n->sets.empty() ? lookup::nodata : lookup::found;
+        r.nd = &it->second;
+        r.owner = it->first;
+        r.k = r.nd->sets.empty() ? lookup::nodata : lookup::found;
         return r;
     }
     // The closest encloser is the first ancestor that exists, and the wildcard is directly beneath it; a zone with
@@ -124,11 +129,12 @@ lookup find_name(const zone& z, std::string_view name, uint16_t qtype)
         buf[0] = '\1';
         buf[1] = '*';
         std::memcpy(buf + 2, p.data(), p.size());
-        if (const node* w = z.find(std::string_view(buf, 2 + p.size())))
+        if (const auto it = z.names.find(std::string_view(buf, 2 + p.size())); it != z.names.end())
         {
-            r.nd = w;
+            r.nd = &it->second;
+            r.owner = it->first;
             r.wildcard = true;
-            r.k = w->sets.empty() ? lookup::nodata : lookup::found;
+            r.k = r.nd->sets.empty() ? lookup::nodata : lookup::found;
             return r;
         }
         break;
@@ -151,13 +157,57 @@ void add_set(writer& w, std::string_view owner, const rrset& s, uint16_t& count)
     }
 }
 
-void add_soa(writer& w, const zone& z, counts& c)
+// The RRSIGs of the set of type `t` at `nd`, written for `owner`.
+void add_sig(writer& w, std::string_view owner, const node& nd, uint16_t t, uint16_t& count)
+{
+    if (const rrset* s = nd.sig(t))
+        for (const auto& rd : s->rdata)
+        {
+            write_rr(w, owner, type_sec::RRSIG, s->ttl, rd);
+            ++count;
+        }
+}
+
+void add_soa(writer& w, const zone& z, counts& c, bool sec = false)
 {
     if (const rrset* soa = z.soa(); soa && !soa->rdata.empty())
     {
         write_rr(w, z.origin, type::SOA, z.negative_ttl, soa->rdata[0]);
         ++c.ns;
+        if (const node* apex = sec ? z.find(z.origin) : nullptr)
+            add_sig(w, z.origin, *apex, type::SOA, c.ns);
     }
+}
+
+// The NSEC at `owner`, a name of the chain, and its RRSIG, in the authority section.
+void add_nsec(writer& w, const zone& z, std::string_view owner, counts& c)
+{
+    const node* n = owner.empty() ? nullptr : z.find(owner);
+    if (const rrset* s = n ? n->find(type_sec::NSEC) : nullptr)
+    {
+        add_set(w, owner, *s, c.ns);
+        add_sig(w, owner, *n, type_sec::NSEC, c.ns);
+    }
+}
+
+// The NSEC proving `name` is not in the zone, and the one proving no wildcard stands in for it beneath its closest
+// encloser, once where they are one (RFC 4035 3.1.3.2).
+void deny_name(writer& w, const zone& z, std::string_view name, counts& c)
+{
+    const std::string_view first = covering(z, name);
+    add_nsec(w, z, first, c);
+    std::string_view ce = parent(name);
+    while (ce.size() > z.origin.size() && !z.find(ce))
+        ce = parent(ce);
+    if (ce.size() > max_name - 2)
+        return;
+    char buf[max_name + 1];
+    buf[0] = '\1';
+    buf[1] = '*';
+    std::memcpy(buf + 2, ce.data(), ce.size());
+    const std::string_view second = covering(z, std::string_view(buf, 2 + ce.size()));
+    if (second != first)
+        add_nsec(w, z, second, c);
 }
 
 // The addresses of a server or mail host named in an answer, when this zone holds them: optional, so whatever does not
@@ -301,6 +351,7 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
             meta.edns = true;
             client_udp = std::max<uint16_t>(512, rd16(q + next + 2));
             version = q[next + 5];
+            meta.dnssec = (rd16(q + next + 6) & 0x8000) != 0;
         }
         pos = next + 10 + rdlen;
     }
@@ -319,7 +370,7 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
         if (meta.edns)
         {
             const auto m = w.save();
-            write_opt(w, static_cast<uint8_t>(rc >> 4));
+            write_opt(w, static_cast<uint8_t>(rc >> 4), meta.dnssec);
             if (w.overflowed())
                 w.restore(m);
             else
@@ -371,6 +422,8 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
     std::string_view name = qname;
     uint8_t rc = rcode::NOERROR;
     bool aa = true;
+    // The signatures and denials go in where the zone is signed and the query asked for them.
+    const bool sec = meta.dnssec && z->dnssec;
     for (int hops = 0; hops < 8; ++hops)
     {
         const lookup l = find_name(*z, name, qtype);
@@ -383,6 +436,17 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
                 meta.referral = true;
             }
             add_set(w, l.cut, *l.cut_node->find(type::NS), c.ns);
+            // A signed delegation's DS, or the NSEC proving it has none (RFC 4035 3.1.4).
+            if (sec)
+            {
+                if (const rrset* ds = l.cut_node->find(type::DS))
+                {
+                    add_set(w, l.cut, *ds, c.ns);
+                    add_sig(w, l.cut, *l.cut_node, type::DS, c.ns);
+                }
+                else
+                    add_nsec(w, *z, l.cut, c);
+            }
             if (w.overflowed())
                 break;
             targets_of(*l.cut_node->find(type::NS), [&](std::string_view t) { add_addresses(w, *z, t, c); });
@@ -391,16 +455,30 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
         if (l.k == lookup::nxdomain)
         {
             rc = rcode::NXDOMAIN;
-            add_soa(w, *z, c);
+            add_soa(w, *z, c, sec);
+            if (sec)
+                deny_name(w, *z, name, c);
             break;
         }
         if (l.k == lookup::nodata)
         {
-            add_soa(w, *z, c);
+            add_soa(w, *z, c, sec);
+            // A name with no records of its own between others is proven by the NSEC whose span covers it.
+            if (sec)
+                add_nsec(w, *z, l.nd->find(type_sec::NSEC) ? l.owner : covering(*z, name), c);
+            if (sec && l.wildcard)
+                add_nsec(w, *z, covering(*z, name), c);
             break;
         }
         const node& nd = *l.nd;
         // RFC 8482: ANY is given one small record, not everything, so it amplifies nothing.
+        // A signed zone answers it with one set it has and its signature, which a synthesized record cannot have.
+        if (qtype == type::ANY && sec && !nd.sets.empty())
+        {
+            add_set(w, name, nd.sets.front(), c.an);
+            add_sig(w, name, nd, nd.sets.front().type, c.an);
+            break;
+        }
         if (qtype == type::ANY)
         {
             static const std::string rfc8482("\x07RFC8482\x00", 9);
@@ -411,6 +489,13 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
         if (const rrset* s = nd.find(qtype))
         {
             add_set(w, name, *s, c.an);
+            if (sec)
+            {
+                add_sig(w, name, nd, qtype, c.an);
+                // An answer a wildcard stood in for proves the name asked is not there itself.
+                if (l.wildcard)
+                    add_nsec(w, *z, covering(*z, name), c);
+            }
             if (!w.overflowed())
                 targets_of(*s, [&](std::string_view t) { add_addresses(w, *z, t, c); });
             break;
@@ -418,10 +503,16 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
         const rrset* cname = nd.find(type::CNAME);
         if (!cname || qtype == type::CNAME)
         {
-            add_soa(w, *z, c);
+            add_soa(w, *z, c, sec);
+            if (sec)
+                add_nsec(w, *z, l.owner, c);
+            if (sec && l.wildcard)
+                add_nsec(w, *z, covering(*z, name), c);
             break;
         }
         add_set(w, name, *cname, c.an);
+        if (sec)
+            add_sig(w, name, nd, type::CNAME, c.an);
         if (w.overflowed())
             break;
         // The alias is followed while its target is in this zone; outside it, the asker's resolver takes over.

@@ -58,6 +58,8 @@ case "$xml" in *"<hostname>mail.example.test</hostname>"*"<port>$IMAPS</port>"*"
     ok "Thunderbird's autoconfig names the host, its IMAP and SMTP ports over TLS, and the address to sign in with" ;;
     *) bad "Thunderbird's autoconfig" "$xml" ;; esac
 case "$xml" in *"STARTTLS"*|*"pop3"*) bad "and no port it does not open" "$xml" ;; *) ok "and no port it does not open" ;; esac
+case "$xml" in *'<addressBook type="carddav">'*'<serverURL>https://mail.example.test/dav/</serverURL>'*'<calendar type="caldav">'*) \
+    ok "and the calendars and contacts beside the mail" ;; *) bad "the calendars in autoconfig" "$xml" ;; esac
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$W/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress=alice%40example.test")" = 200 ] \
     && ok "at the well-known path as well" || bad "the well-known path" "-"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$W/mail/config-v1.1.xml?emailaddress=bob%40else.test")" = 404 ] \
@@ -77,6 +79,9 @@ prof=$(curl -s -D "$T/ph" -u alice:alicepassword1 -H 'X-Forwarded-Proto: https' 
 case "$prof" in *"<key>EmailAddress</key><string>alice@example.test</string>"*"<key>IncomingMailServerPortNumber</key><integer>$IMAPS</integer>"*"<key>OutgoingMailServerPortNumber</key><integer>$SUBS</integer>"*) \
     grep -qi 'content-type: application/x-apple-aspen-config' "$T/ph" && ok "and names their address, the ports, as a configuration profile" \
     || bad "the profile's type" "$(cat "$T/ph")" ;; *) bad "the Apple profile" "$prof" ;; esac
+case "$prof" in *"<string>com.apple.caldav.account</string>"*"<string>com.apple.carddav.account</string>"*) \
+    case "$prof" in *"<key>CalDAVHostName</key><string>mail.example.test</string>"*) ok "the profile sets up the calendar and the contacts" ;;
+        *) bad "the profile's calendar host" "$prof" ;; esac ;; *) bad "the profile's calendar and contacts" "$prof" ;; esac
 
 q() { dig +short +time=2 +tries=1 -p "$NS" @127.0.0.1 "$@" 2>/dev/null; }
 for _ in $(seq 1 50); do [ -n "$(q autoconfig.example.test A)" ] && break; sleep 0.2; done
@@ -86,8 +91,12 @@ for _ in $(seq 1 50); do [ -n "$(q _autodiscover._tcp.example.test SRV)" ] && br
 [ "$(q _autodiscover._tcp.example.test SRV)" = "0 1 443 autodiscover.example.test." ] && ok "and Outlook's SRV record leads there" \
     || bad "the SRV record" "$(q _autodiscover._tcp.example.test SRV)"
 
+for _ in $(seq 1 50); do [ -n "$(q _caldavs._tcp.example.test SRV)" ] && break; sleep 0.2; done
+[ "$(q _caldavs._tcp.example.test SRV)" = "0 1 443 mail.example.test." ] && [ "$(q _carddavs._tcp.example.test TXT)" = '"path=/dav/"' ] \
+    && ok "and the calendar and contacts records lead to the webmail's name (RFC 6764)" \
+    || bad "the DAV records" "$(q _caldavs._tcp.example.test SRV) / $(q _carddavs._tcp.example.test TXT)"
 sess=$(curl -s -u alice:alicepassword1 -H 'X-Forwarded-Proto: https' -H 'X-Socketley-UI: 1' "$W/~mail/session")
-case "$sess" in *'"setup":{"host":"mail.example.test","imaps":'"$IMAPS"',"imap":0,"pop3s":0,"pop3":0,"submissions":'"$SUBS"',"submission":0}'*) \
+case "$sess" in *'"setup":{"host":"mail.example.test","imaps":'"$IMAPS"',"imap":0,"pop3s":0,"pop3":0,"submissions":'"$SUBS"',"submission":0,"dav":"https://mail.example.test/dav/"}'*) \
     ok "the webmail tells its user the same" ;; *) bad "the webmail's setup" "$sess" ;; esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

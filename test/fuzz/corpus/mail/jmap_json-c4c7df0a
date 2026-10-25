@@ -1,0 +1,1 @@
+{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{"accountId":"a","filter":{"text":"\u00e4"},"limit":10},"q"],["Email/get",{"#ids":{"resultOf":"q","name":"Email/query","path":"/ids"}},"g"]]}

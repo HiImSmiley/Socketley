@@ -3,11 +3,19 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include <algorithm>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
+#include "shared/crypto/jws.h"
+#include "shared/util/base64.h"
+
 #include "runtime/dns/dns_answer.h"
+#include "runtime/dns/dns_sign.h"
 #include "runtime/dns/dns_wire.h"
 #include "runtime/dns/dns_zone.h"
 
@@ -589,4 +597,152 @@ TEST_CASE("published names and DNS-01 answers join a zone; what the file says wi
     a = ask(zs, query("example.com.", type::SOA));
     REQUIRE(a.r.an == 1);
     CHECK(rd32(reinterpret_cast<const uint8_t*>(a.r.rrs[0].rdata.data()) + a.r.rrs[0].rdata.size() - 20) == before + 1000);
+}
+
+namespace
+{
+
+// The query with the DO bit set in its OPT, as a validating resolver sends it.
+std::string query_do(const char* name, uint16_t qtype)
+{
+    std::string q = query(name, qtype);
+    q[q.size() - 4] = static_cast<char>(0x80);
+    return q;
+}
+
+zone signed_example(zone_key& key)
+{
+    zone z = load(example_zone);
+    const std::string dir = (std::filesystem::temp_directory_path() / ("skl-dnssec-" + std::to_string(::getpid()))).string();
+    std::string why;
+    REQUIRE_MESSAGE(load_or_make_key(dir, z.origin, key, why), why);
+    REQUIRE(sign_zone(z, key, 1800000000));
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return z;
+}
+
+bool has_type(const std::vector<rr_out>& rrs, uint16_t t)
+{
+    return std::any_of(rrs.begin(), rrs.end(), [&](const rr_out& r) { return r.type == t; });
+}
+
+}   // namespace
+
+TEST_CASE("DNSSEC: the key tag and DS of RFC 6605's example, and RFC 4034's canonical order")
+{
+    std::string pub;
+    REQUIRE(socketley::base64::decode("GojIhhXUN/u4v54ZQqGSnyhWJwaubCvTmeexv7bR6edbkrSqQpF64cYbcB7wNcP+e+MAnLr+Wi9xMWyQLc8NAA==", pub));
+    zone_key k;
+    k.dnskey = std::string("\x01\x01\x03\x0d", 4) + pub;
+    k.tag = key_tag(k.dnskey);
+    CHECK(k.tag == 55648);
+    CHECK(ds_text(wire("example.net."), k) ==
+          "example.net. IN DS 55648 13 2 B4C8C1FE2E7477127B27115656AD6256F424625BF5C1E2770CE6D6E37DF61D17");
+    const std::vector<std::string> order = {wire("example."), wire("a.example."), wire("yljkjljk.a.example."),
+                                            wire("z.a.example."), wire("zabc.a.example."), wire("z.example."),
+                                            std::string("\x01\x01\x01z\x07" "example\x00", 12), wire("*.z.example."),
+                                            std::string("\x01\x80\x01z\x07" "example\x00", 12)};
+    for (size_t i = 0; i + 1 < order.size(); ++i)
+    {
+        CHECK(canonical_less(order[i], order[i + 1]));
+        CHECK_FALSE(canonical_less(order[i + 1], order[i]));
+    }
+}
+
+TEST_CASE("DNSSEC: a signed zone holds its key, a chain through its own names and a signature over each set")
+{
+    zone_key key;
+    const zone z = signed_example(key);
+    const node* apex = z.find(z.origin);
+    REQUIRE(apex);
+    REQUIRE(apex->find(type_sec::DNSKEY));
+    CHECK(apex->find(type_sec::DNSKEY)->rdata[0] == key.dnskey);
+    // Glue and the empty names between are no owners; the cut is.
+    CHECK(std::find(z.chain.begin(), z.chain.end(), wire("ns.sub.example.com.")) == z.chain.end());
+    CHECK(std::find(z.chain.begin(), z.chain.end(), wire("a.b.example.com.")) == z.chain.end());
+    CHECK(std::find(z.chain.begin(), z.chain.end(), wire("sub.example.com.")) != z.chain.end());
+    CHECK(z.chain.front() == z.origin);
+    for (size_t i = 0; i < z.chain.size(); ++i)
+    {
+        const node* n = z.find(z.chain[i]);
+        REQUIRE(n);
+        const rrset* nsec = n->find(type_sec::NSEC);
+        REQUIRE(nsec);
+        const std::string& next = z.chain[(i + 1) % z.chain.size()];
+        CHECK(nsec->rdata[0].compare(0, next.size(), next) == 0);
+        for (const auto& s : n->sets)
+        {
+            const rrset* sig = n->sig(s.type);
+            if (n->cut && s.type == type::NS)
+            {
+                CHECK_FALSE(sig);
+                continue;
+            }
+            REQUIRE(sig);
+            // The signed data rebuilt as a validator does, and the signature checked against the key.
+            const std::string& rd = sig->rdata[0];
+            const size_t fixed = 18 + z.origin.size();
+            std::string data = rd.substr(0, fixed);
+            std::vector<std::string> sorted = s.rdata;
+            std::sort(sorted.begin(), sorted.end());
+            for (const auto& r : sorted)
+            {
+                data += z.chain[i];
+                const auto p16 = [&](uint16_t v) { data += static_cast<char>(v >> 8); data += static_cast<char>(v & 0xFF); };
+                p16(s.type);
+                p16(1);
+                p16(static_cast<uint16_t>(s.ttl >> 16));
+                p16(static_cast<uint16_t>(s.ttl & 0xFFFF));
+                p16(static_cast<uint16_t>(r.size()));
+                data += r;
+            }
+            CHECK(socketley::jws::es256_verify(key.pkey.get(), data, rd.substr(fixed)));
+        }
+    }
+    // Signed by the week, whichever moment of it: the serial raised by the week's number, in the SOA as well.
+    const int64_t week = 1800000000 / (7 * 86400);
+    CHECK(z.sig_expires_s == week * 7 * 86400 + 21 * 86400);
+    CHECK(z.serial == 2026100701u + static_cast<uint32_t>(week));
+    const std::string& soa = z.find(z.origin)->find(type::SOA)->rdata[0];
+    CHECK(rd32(reinterpret_cast<const uint8_t*>(soa.data()) + soa.size() - 20) == z.serial);
+}
+
+TEST_CASE("DNSSEC: an answer to DO carries the signatures and the proofs of what is not there")
+{
+    zone_key key;
+    const auto zs = one(signed_example(key));
+    auto a = ask(zs, query_do("mail.example.com.", type::A));
+    REQUIRE(a.r.an == 2);
+    CHECK(a.r.section(0)[1].type == type_sec::RRSIG);
+    CHECK((a.r.rrs.back().ttl & 0x8000) != 0);   // DO echoed in the OPT
+    a = ask(zs, query("mail.example.com.", type::A));
+    CHECK(a.r.an == 1);
+    CHECK_FALSE(has_type(a.r.rrs, type_sec::RRSIG));
+
+    a = ask(zs, query_do("nothing.example.com.", type::A));
+    CHECK(a.r.rcode() == rcode::NXDOMAIN);
+    CHECK(has_type(a.r.section(1), type_sec::NSEC));
+    CHECK(has_type(a.r.section(1), type_sec::RRSIG));
+
+    a = ask(zs, query_do("mail.example.com.", type::AAAA));
+    CHECK(a.r.an == 0);
+    const auto auth = a.r.section(1);
+    CHECK(std::any_of(auth.begin(), auth.end(), [](const rr_out& r) { return r.type == type_sec::NSEC && r.owner == wire("mail.example.com."); }));
+
+    // A wildcard's answer, signed with its labels, and the proof that the name asked is not there itself.
+    a = ask(zs, query_do("x.apps.example.com.", type::A));
+    REQUIRE(a.r.an == 2);
+    CHECK(static_cast<uint8_t>(a.r.section(0)[1].rdata[3]) == 3);
+    CHECK(has_type(a.r.section(1), type_sec::NSEC));
+
+    // A delegation without a DS says so with the cut's NSEC.
+    a = ask(zs, query_do("www.sub.example.com.", type::A));
+    CHECK_FALSE(a.r.aa());
+    const auto ref = a.r.section(1);
+    CHECK(std::any_of(ref.begin(), ref.end(), [](const rr_out& r) { return r.type == type_sec::NSEC && r.owner == wire("sub.example.com."); }));
+
+    a = ask(zs, query_do("example.com.", type_sec::DNSKEY));
+    REQUIRE(a.r.an == 2);
+    CHECK(a.r.section(0)[0].rdata == key.dnskey);
 }

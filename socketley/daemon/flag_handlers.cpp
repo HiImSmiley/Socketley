@@ -1564,6 +1564,9 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             dns->set_rrl(n);
             return 0;
         }
+        case fnv1a("--dnssec"):
+            dns->set_dnssec(true);
+            return 0;
         default:
             return -1;
     }

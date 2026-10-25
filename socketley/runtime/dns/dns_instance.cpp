@@ -1,5 +1,6 @@
 #include "dns_instance.h"
 #include "dns_answer.h"
+#include "dns_sign.h"
 #include "dns_wire.h"
 #include "dns_zone.h"
 
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <sstream>
 #include <memory>
 #include <unordered_map>
@@ -29,7 +31,9 @@
 #include "../../shared/persist/paths.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/net/ip_block.h"
+#include "../../shared/util/base64.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/wall_clock.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/persist/replaced_file.h"
 
@@ -120,9 +124,12 @@ std::vector<std::string> split_csv(std::string_view s)
     return out;
 }
 
-// Every zone of `paths`, read and checked, one apex each; false with the reason.
+// What signs a zone as it is loaded where the runtime signs its zones; false with why.
+using zone_signer = std::function<bool(zone&, std::string&)>;
+
+// Every zone of `paths`, read and checked, one apex each, and signed by `sign` where it is given; false with the reason.
 bool load_all(const std::vector<std::string>& paths, zone_set& out, std::string& why,
-              const extra_records* extra = nullptr)
+              const extra_records* extra = nullptr, const zone_signer* sign = nullptr)
 {
     out.zones.clear();
     for (const auto& p : paths)
@@ -132,6 +139,11 @@ bool load_all(const std::vector<std::string>& paths, zone_set& out, std::string&
             return false;
         if (extra)
             add_extra(*z, *extra);
+        if (sign && *sign && !(*sign)(*z, why))
+        {
+            why = p + ": " + why;
+            return false;
+        }
         for (const auto& other : out.zones)
             if (other->origin == z->origin)
             {
@@ -386,11 +398,29 @@ private:
     __kernel_timespec m_tick_ts{1, 0};
     bool m_tick_armed{false};
     int64_t m_last_sweep{0};
+    // With --dnssec, what signs each zone as it is loaded, and the key of each by its apex.
+    zone_signer m_signer;
+    std::unordered_map<std::string, zone_key> m_keys;
 };
 
 bool dns_run::start(std::string& why)
 {
     m_paths = m_owner.zone_paths();
+    if (m_owner.get_dnssec())
+        m_signer = [this](zone& z, std::string& err) {
+            auto it = m_keys.find(z.origin);
+            if (it == m_keys.end())
+            {
+                zone_key k;
+                if (!load_or_make_key(dns_dnssec_dir(m_owner.get_name()), z.origin, k, err))
+                    return false;
+                it = m_keys.emplace(z.origin, std::move(k)).first;
+            }
+            if (sign_zone(z, it->second, socketley::wall::now_sec()))
+                return true;
+            err = "its signatures could not be made";
+            return false;
+        };
     if (std::string bad; !parse_publish(m_owner.get_publish(), m_v4, m_v6, bad))
     {
         why = "--publish: '" + bad + "' is not an address";
@@ -412,7 +442,7 @@ bool dns_run::start(std::string& why)
         return false;
     auto zs = std::make_shared<zone_set>();
     const extra_records extra = feed_extra();
-    if (!load_all(m_paths, *zs, why, &extra))
+    if (!load_all(m_paths, *zs, why, &extra, &m_signer))
         return false;
     m_zones = zs;
 
@@ -1178,6 +1208,11 @@ void dns_run::check_zones()
             changed = true;
         }
     }
+    // A signed zone is signed again as a new week begins, its serial raised for the secondaries.
+    const int64_t epoch = sign_epoch(socketley::wall::now_sec());
+    for (const auto& z : m_zones->zones)
+        if (z->dnssec && z->sign_epoch != epoch)
+            changed = true;
     for (const auto& z : m_zones->zones)
     {
         // A file gone for a moment is no change; it is read again once it is back.
@@ -1191,7 +1226,7 @@ void dns_run::check_zones()
     std::string why;
     const extra_records extra = feed_extra();
     std::vector<const zone*> kept;
-    if (!load_all(m_paths, *next, why, &extra))
+    if (!load_all(m_paths, *next, why, &extra, &m_signer))
     {
         ++m_c.reload_failures;
         LOG_ERROR(("dns: zone not reloaded, still serving the one before: " + why).c_str());
@@ -1206,6 +1241,8 @@ void dns_run::check_zones()
             if (sound)
             {
                 add_extra(*z, extra);
+                if (m_signer && !m_signer(*z, ignored))
+                    sound = false;
                 for (const auto& other : next->zones)
                     if (other->origin == z->origin)
                         sound = false;
@@ -1372,6 +1409,29 @@ using socketley::dns::dns_run;
 dns_instance::dns_instance(std::string_view name) : runtime_instance(runtime_dns, name) {}
 
 dns_instance::~dns_instance() = default;
+
+std::string dns_dnssec_dir(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "dns" / (std::string(runtime_name) + ".dnssec")).string();
+}
+
+std::string dns_instance::ds_records(std::string& why) const
+{
+    socketley::dns::zone_set zs;
+    if (!socketley::dns::load_all(zone_paths(), zs, why))
+        return {};
+    std::string out;
+    for (const auto& z : zs.zones)
+    {
+        socketley::dns::zone_key k;
+        if (!socketley::dns::load_or_make_key(dns_dnssec_dir(get_name()), z->origin, k, why))
+            return {};
+        out += socketley::dns::ds_text(z->origin, k) + "\n";
+        out += socketley::dns::to_text(z->origin) + " IN DNSKEY 257 3 13 " +
+               socketley::base64::encode(std::string_view(k.dnskey).substr(4)) + "\n";
+    }
+    return out;
+}
 
 std::vector<std::string> dns_instance::zone_paths() const
 {

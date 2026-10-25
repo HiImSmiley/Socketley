@@ -25,6 +25,7 @@
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/pop3_session.h"
 #include "shared/util/ascii.h"
+#include "shared/util/xml_doc.h"
 #include "shared/util/inflate.h"
 
 using namespace socketley::mail;
@@ -669,4 +670,36 @@ TEST_CASE("preview: a message's text from its start, its white space one space a
     const std::string umlauts = "Content-Type: text/plain; charset=utf-8\r\n\r\n" + std::string(255, 'a') + "\xc3\xa4";
     const mime::part r3 = mime::parse(umlauts);
     CHECK(mime::preview(umlauts, *mime::preview_part(r3)) == std::string(255, 'a'));
+}
+
+TEST_CASE("xml: elements know their namespace through prefixes and defaults, attributes and entities are read")
+{
+    socketley::xml::node doc;
+    REQUIRE(socketley::xml::reader("\xEF\xBB\xBF<?xml version=\"1.0\"?>\n<!-- c --><d:propfind xmlns:d=\"DAV:\">"
+                                   "<d:prop xmlns=\"urn:x\"><a/><d:b q='1 &gt; 0'/><c xmlns=\"\">&lt;&#x41;&#66;&amp;</c></d:prop>"
+                                   "</d:propfind>").document(doc));
+    CHECK(doc.name == "propfind");
+    CHECK(doc.ns == "DAV:");
+    const socketley::xml::node* prop = doc.child("prop", "DAV:");
+    REQUIRE(prop);
+    REQUIRE(prop->kids.size() == 3);
+    CHECK(prop->kids[0].ns == "urn:x");
+    CHECK(prop->kids[1].ns == "DAV:");
+    CHECK(prop->kids[1].attr("q") == "1 > 0");
+    CHECK(prop->kids[2].ns.empty());
+    CHECK(prop->kids[2].text == "<AB&");
+    for (const char* bad : {"<a>", "<a></b>", "<a><![CDATA[x]]></a>", "<!DOCTYPE a><a/>", "<a>x<b/></a>", "<a b=c/>",
+                            "<a>&bogus;</a>", "<a/><b/>", "<a/>junk"})
+    {
+        socketley::xml::node n;
+        CHECK_FALSE(socketley::xml::reader(bad).document(n));
+    }
+    std::string deep;
+    for (int i = 0; i < 40; ++i)
+        deep += "<a>";
+    socketley::xml::node n;
+    CHECK_FALSE(socketley::xml::reader(deep).document(n));
+    std::string back;
+    CHECK(socketley::xml::unescape(socketley::xml::escape("a<b>&\"c'\x01"), back));
+    CHECK(back == "a<b>&\"c'");
 }

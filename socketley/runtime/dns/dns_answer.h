@@ -21,6 +21,8 @@ struct answer_meta
     bool     truncated{false};
     bool     referral{false};
     bool     edns{false};
+    // The query's DO bit (RFC 3225): it takes the signatures of a signed zone.
+    bool     dnssec{false};
     // A query for a whole zone, which only TCP carries and only allowed peers get; the caller streams it.
     const zone* xfr{nullptr};
     // A response to a NOTIFY this server sent, by its ID, so the caller stops sending it again.
@@ -38,7 +40,7 @@ struct answer_meta
     {
         rcode = 0;
         qtype = 0;
-        dropped = truncated = referral = edns = notify_ack = false;
+        dropped = truncated = referral = edns = dnssec = notify_ack = false;
         xfr = nullptr;
         id = 0;
         question_end = 0;
@@ -117,6 +119,7 @@ void transfer(const zone& z, const uint8_t* q, size_t question_end, Emit&& emit)
     begin();
     add(z.origin, soa->type, soa->ttl, soa->rdata[0]);
     for (const auto& [name, nd] : z.names)
+    {
         for (const auto& s : nd.sets)
         {
             if (s.type == 6 && name == z.origin)
@@ -124,6 +127,11 @@ void transfer(const zone& z, const uint8_t* q, size_t question_end, Emit&& emit)
             for (const auto& rd : s.rdata)
                 add(name, s.type, s.ttl, rd);
         }
+        // A signed zone's RRSIGs go with it, each a record of type 46.
+        for (const auto& s : nd.sigs)
+            for (const auto& rd : s.rdata)
+                add(name, 46, s.ttl, rd);
+    }
     add(z.origin, soa->type, soa->ttl, soa->rdata[0]);
     flush();
 }

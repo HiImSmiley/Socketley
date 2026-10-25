@@ -188,6 +188,7 @@ struct runtime_config
     std::string dns_proxy;
     // Written always, since 0 is a setting (no rate limit) and not "not given".
     uint32_t dns_rrl = 100;
+    bool dns_dnssec = false;
 
     // Sync
     std::string sync_dir;

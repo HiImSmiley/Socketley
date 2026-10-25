@@ -332,6 +332,15 @@ r = api(["Quota/changes", {"accountId": acct, "sinceState": r["q"][0][1]["state"
 say("Quota/changes since now is none, Quota/query finds the one", r["c"][0][1]["created"] == [] and r["y"][0][1]["ids"] == ["mail"], r)
 say("and changes since another state are to be fetched again", r["old"][0][0] == "error" and
     r["old"][0][1]["type"] == "cannotCalculateChanges", r)
+# Mailbox/changes: a state is a digest of the folders, the same one nothing changed.
+st = api(["Mailbox/get", {"accountId": acct, "ids": []}, "g"])["g"][0][1]["state"]
+r = api(["Mailbox/changes", {"accountId": acct, "sinceState": st}, "c"],
+        ["Mailbox/set", {"accountId": acct, "create": {"n": {"name": "Changes", "parentId": None}}}, "s"],
+        ["Mailbox/changes", {"accountId": acct, "sinceState": st}, "after"])
+say("Mailbox/changes since now is none, its updatedProperties null", r["c"][0][1].get("created") == [] and
+    r["c"][0][1].get("updatedProperties", 1) is None and r["c"][0][1]["newState"] == st, r)
+say("and after a folder is made, it is to be fetched again", r["after"][0][0] == "error" and
+    r["after"][0][1]["type"] == "cannotCalculateChanges", r)
 # PushSubscription, its pushes read with the keys it gave
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes, hmac, serialization

@@ -1324,6 +1324,9 @@ project "fuzz_mail"
         "socketley/runtime/mail/imap_order.cpp",
         "socketley/runtime/mail/pop3_session.cpp",
         "socketley/runtime/mail/mail_mbox.cpp",
+        "socketley/runtime/mail/mail_arc.cpp",
+        "socketley/runtime/mail/mail_srs.cpp",
+        "socketley/runtime/mail/mail_tls_policy.cpp",
         "socketley/shared/util/base64.cpp"
     }
     links(tls_libs())
@@ -1456,8 +1459,11 @@ project "fuzz_dns"
         "test/fuzz/fuzz_common.h",
         "socketley/runtime/dns/dns_wire.cpp",
         "socketley/runtime/dns/dns_zone.cpp",
-        "socketley/runtime/dns/dns_answer.cpp"
+        "socketley/runtime/dns/dns_answer.cpp",
+        "socketley/runtime/dns/dns_sign.cpp",
+        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp"
     }
+    links { "crypto" }
 
     fuzz_target_settings()
 
@@ -2367,8 +2373,11 @@ project "test_dns"
         "test/unit/test_dns.cpp",
         "socketley/runtime/dns/dns_wire.cpp",
         "socketley/runtime/dns/dns_zone.cpp",
-        "socketley/runtime/dns/dns_answer.cpp"
+        "socketley/runtime/dns/dns_answer.cpp",
+        "socketley/runtime/dns/dns_sign.cpp",
+        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp"
     }
+    links(tls_libs())
 
     filter "configurations:Debug"
         defines { "DEBUG" }

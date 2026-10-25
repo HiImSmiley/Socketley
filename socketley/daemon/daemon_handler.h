@@ -214,6 +214,8 @@ private:
     // mqtt-pub, mqtt-sessions, mqtt-kick, mqtt-retained and mqtt-tap, which ask a broker's shards.
     int cmd_mqtt(ipc_connection* conn, const parsed_args& pa);
     int cmd_mail(ipc_connection* conn, const parsed_args& pa);
+    // dnssec <dns>: the DS records the parents of a signing dns runtime's zones are given, and their DNSKEYs.
+    int cmd_dnssec(ipc_connection* conn, const parsed_args& pa);
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);

@@ -41,6 +41,33 @@ std::string uuid_of(std::string_view name)
     return out;
 }
 
+// The CalDAV and CardDAV accounts of a profile, the device asking for the password as it does for mail's.
+std::string dav_payloads(const client_settings& s, const std::string& id)
+{
+    if (s.dav_host.empty())
+        return {};
+    std::string out;
+    for (const auto& [kind, type] : {std::pair{"CalDAV", "caldav"}, {"CardDAV", "carddav"}})
+    {
+        const std::string k = kind;
+        out += "    <dict>\n"
+               "      <key>" + k + "AccountDescription</key><string>" + (k == "CalDAV" ? "Calendar " : "Contacts ") +
+               xml(s.email) + "</string>\n"
+               "      <key>" + k + "HostName</key><string>" + xml(s.dav_host) + "</string>\n"
+               "      <key>" + k + "Port</key><integer>443</integer>\n"
+               "      <key>" + k + "PrincipalURL</key><string>/dav/</string>\n"
+               "      <key>" + k + "UseSSL</key><true/>\n"
+               "      <key>" + k + "Username</key><string>" + xml(s.email) + "</string>\n"
+               "      <key>PayloadDisplayName</key><string>" + k + " " + xml(s.email) + "</string>\n"
+               "      <key>PayloadIdentifier</key><string>" + xml(id) + "." + type + "</string>\n"
+               "      <key>PayloadType</key><string>com.apple." + type + ".account</string>\n"
+               "      <key>PayloadUUID</key><string>" + uuid_of(id + "." + type) + "</string>\n"
+               "      <key>PayloadVersion</key><integer>1</integer>\n"
+               "    </dict>\n";
+    }
+    return out;
+}
+
 }   // namespace
 
 std::string thunderbird_autoconfig(const client_settings& s)
@@ -63,7 +90,13 @@ std::string thunderbird_autoconfig(const client_settings& s)
     server("incomingServer", "pop3", s.pop3, "STARTTLS");
     server("outgoingServer", "smtp", s.submissions, "SSL");
     server("outgoingServer", "smtp", s.submission, "STARTTLS");
-    return out + "  </emailProvider>\n</clientConfig>\n";
+    out += "  </emailProvider>\n";
+    if (!s.dav_host.empty())
+        for (const auto& [element, type] : {std::pair{"addressBook", "carddav"}, {"calendar", "caldav"}})
+            out += std::string("  <") + element + " type=\"" + type + "\">\n    <username>%EMAILADDRESS%</username>\n"
+                   "    <authentication>http-basic</authentication>\n    <serverURL>https://" + xml(s.dav_host) +
+                   "/dav/</serverURL>\n  </" + element + ">\n";
+    return out + "</clientConfig>\n";
 }
 
 std::string outlook_autodiscover(const client_settings& s)
@@ -139,7 +172,7 @@ std::string apple_mobileconfig(const client_settings& s)
            "      <key>PayloadType</key><string>com.apple.mail.managed</string>\n"
            "      <key>PayloadUUID</key><string>" + uuid_of(id + ".account") + "</string>\n"
            "      <key>PayloadVersion</key><integer>1</integer>\n"
-           "    </dict>\n  </array>\n"
+           "    </dict>\n" + dav_payloads(s, id) + "  </array>\n"
            "  <key>PayloadDisplayName</key><string>Mail at " + xml(s.domain) + "</string>\n"
            "  <key>PayloadIdentifier</key><string>" + xml(id) + "</string>\n"
            "  <key>PayloadType</key><string>Configuration</string>\n"

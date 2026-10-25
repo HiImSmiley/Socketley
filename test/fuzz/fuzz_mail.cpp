@@ -24,6 +24,16 @@
 //      is stuffed.
 //   9  an mbox file, read message by message: each read moves on, every line of a message ends in CRLF, and a
 //      message written back as an mbox entry reads back as itself, its flags and keywords with it.
+//  10  a message whose ARC chain is checked against one key, then sealed with that key: a seal the message takes
+//      is one the chain then passes.
+//  11  an address rewritten by SRS and read back as itself, and bytes read as an SRS address, which a wrong key or
+//      an old day does not read.
+//  12  an MTA-STS policy and record and TLSA data: a policy taken survives its cache line, and matches its own
+//      exchangers.
+//  13  a WebDAV body, read as XML: every element of a document taken is within the depth it is read to, and a
+//      text escaped reads back as itself.
+//  14  a JMAP request body, read as JSON as the API reads it: a document taken writes out as one that reads back
+//      the same.
 
 #include <algorithm>
 #include <cctype>
@@ -33,7 +43,17 @@
 #include "../../socketley/runtime/mail/mail_aliases.h"
 #include "../../socketley/runtime/mail/mail_compose.h"
 #include "../../socketley/runtime/mail/mail_dkim.h"
+#include "../../socketley/runtime/mail/mail_arc.h"
 #include "../../socketley/runtime/mail/mail_mbox.h"
+#include "../../socketley/runtime/mail/mail_srs.h"
+#include "../../socketley/runtime/mail/mail_tls_policy.h"
+#include "../../socketley/shared/util/ascii.h"
+#include "../../socketley/shared/util/base64.h"
+#include "../../socketley/shared/util/xml_doc.h"
+#include "../../socketley/shared/json/json_doc.h"
+
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
 #include "../../socketley/runtime/mail/mail_mime.h"
 #include "../../socketley/runtime/mail/mail_sieve.h"
 #include "../../socketley/runtime/mail/mail_sieve_store.h"
@@ -207,6 +227,120 @@ void mime_case(std::string_view msg)
         FUZZ_CHECK(p.size() <= 256 && p.find_first_of("\r\n\t") == std::string::npos && !p.ends_with(' '),
                    "a preview longer than 256 bytes, or with a line's end in it");
     }
+}
+
+void arc_case(std::string_view msg)
+{
+    // One key for every input, made once: its DNS record is what the lookup answers for any name.
+    static EVP_PKEY* key = EVP_RSA_gen(1024);
+    static const std::string record = [] {
+        unsigned char* der = nullptr;
+        const int n = i2d_PUBKEY(key, &der);
+        std::string r = "v=DKIM1; k=rsa; p=" + socketley::base64::encode(std::string_view(reinterpret_cast<char*>(der), n > 0 ? n : 0));
+        OPENSSL_free(der);
+        return r;
+    }();
+    const arc::key_lookup lookup = [](const std::string&, std::string& r) {
+        r = record;
+        return true;
+    };
+    const arc::chain before = arc::verify(msg, lookup, 1800000000);
+    FUZZ_CHECK(before.count >= 0 && before.count <= 50, "a chain counted past what a message may hold");
+    FUZZ_CHECK(before.result == "none" || before.result == "pass" || before.result == "fail", "a chain's result is none of them");
+    // A message with a set already, or one with no header or no From, which DKIM signs always, is not the property's:
+    // a seal of a fresh one must pass.
+    if (before.count != 0 || msg.find("\r\n\r\n") == std::string_view::npos || msg.find('\0') != std::string_view::npos ||
+        (!msg.starts_with("From:") && msg.find("\r\nFrom:") == std::string_view::npos))
+        return;
+    const std::string set = arc::seal(msg, "mx.fuzz.test", "spf=pass", "fuzz.test", "s", key, 1800000000, "none");
+    if (set.empty())
+        return;
+    const std::string sealed = set + std::string(msg);
+    const arc::chain after = arc::verify(sealed, lookup, 1800000000);
+    FUZZ_CHECK(after.result == "pass" && after.count == 1, "a message this runtime sealed fails its own chain");
+}
+
+void srs_case(std::string_view in)
+{
+    const size_t nul = in.find('\0');
+    const std::string_view sender = in.substr(0, nul), rest = nul == std::string_view::npos ? std::string_view{} : in.substr(nul + 1);
+    // The property is of an address: printable, one '@' with something either side, a host's name after it.
+    const size_t at = sender.find('@');
+    const bool address = at != std::string_view::npos && at > 0 && at + 1 < sender.size() &&
+                         sender.find('@', at + 1) == std::string_view::npos && sender.size() <= 254 &&
+                         std::all_of(sender.begin(), sender.end(), [](char c) { return c > 0x20 && c < 0x7f; }) &&
+                         std::all_of(sender.begin() + static_cast<std::ptrdiff_t>(at) + 1, sender.end(), [](char c) {
+                             return std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-';
+                         });
+    const std::string fwd = srs::forward(sender, "fwd.test", "k1", 20000);
+    if (address && !fwd.empty() && fwd != sender && fwd.size() <= 320)
+    {
+        const std::string back = srs::reverse(fwd, "fwd.test", "k1", 20003);
+        FUZZ_CHECK(socketley::ascii::iequals(back, sender), "an SRS address that does not read back as its sender");
+        FUZZ_CHECK(srs::reverse(fwd, "fwd.test", "k2", 20003).empty(), "an SRS address read with another key");
+        FUZZ_CHECK(srs::reverse(fwd, "fwd.test", "k1", 20030).empty(), "an SRS address read past its 21 days");
+    }
+    (void)srs::reverse(rest, "fwd.test", "k1", 20000);
+}
+
+void tls_policy_case(std::string_view in)
+{
+    tls_policy::sts p;
+    int64_t age = 0;
+    std::string why, id;
+    (void)tls_policy::sts_record_id(in.substr(0, 200), id);
+    if (tls_policy::parse_sts(in, p, age, why))
+    {
+        FUZZ_CHECK(age >= 0, "a policy with a negative max_age");
+        for (const auto& mx : p.mx)
+            if (!mx.starts_with("*."))
+                FUZZ_CHECK(tls_policy::mx_matches(p, mx), "a policy that does not match an exchanger it lists");
+        const std::string line = tls_policy::cache_line("d.test", p);
+        std::string domain;
+        tls_policy::sts back;
+        if (line.find('\n') == std::string::npos && tls_policy::from_cache_line(line, domain, back))
+            FUZZ_CHECK(domain == "d.test" && back.mode == p.mode && back.mx == p.mx && back.id == p.id,
+                       "a cache line that does not read back as its policy");
+    }
+    tls_policy::tlsa t;
+    if (tls_policy::parse_tlsa(in, t))
+        (void)tls_policy::usable(t);
+}
+
+int depth_of(const socketley::xml::node& n)
+{
+    int d = 0;
+    for (const auto& k : n.kids)
+        d = std::max(d, depth_of(k));
+    return d + 1;
+}
+
+void xml_case(std::string_view in)
+{
+    socketley::xml::node doc;
+    if (socketley::xml::reader(in, 32).document(doc))
+        FUZZ_CHECK(depth_of(doc) <= 33, "a document deeper than it was read to");
+    std::string back;
+    const std::string text(in.substr(0, 256));
+    FUZZ_CHECK(socketley::xml::unescape(socketley::xml::escape(text), back), "an escaped text that does not read back");
+    std::string kept;
+    for (const char c : text)
+        if (static_cast<unsigned char>(c) >= 0x20 || c == '\t' || c == '\n' || c == '\r')
+            kept += c;
+    FUZZ_CHECK(back == kept, "an escaped text that reads back as another");
+}
+
+void jmap_json_case(std::string_view in)
+{
+    socketley::json::json_policy policy;
+    policy.max_depth = 32;
+    socketley::json::jvalue v;
+    if (!socketley::json::json_reader(in, policy).document(v))
+        return;
+    const std::string once = socketley::json::written(v);
+    socketley::json::jvalue back;
+    FUZZ_CHECK(socketley::json::json_reader(once, policy).document(back), "a document written out that does not read back");
+    FUZZ_CHECK(socketley::json::written(back) == once, "a document that writes out otherwise the second time");
 }
 
 void mbox_case(std::string_view text)
@@ -546,7 +680,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size < 1 || size > (64u << 10))
         return 0;
     const std::string_view in(reinterpret_cast<const char*>(data) + 1, size - 1);
-    switch (data[0] % 10)
+    switch (data[0] % 15)
     {
         case 0: smtp(in); break;
         case 1: mime_case(in); break;
@@ -558,6 +692,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         case 7: order_case(in); break;
         case 8: pop3_case(in); break;
         case 9: mbox_case(in); break;
+        case 10: arc_case(in); break;
+        case 11: srs_case(in); break;
+        case 12: tls_policy_case(in); break;
+        case 13: xml_case(in); break;
+        case 14: jmap_json_case(in); break;
     }
     return 0;
 }

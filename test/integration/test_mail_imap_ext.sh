@@ -15,6 +15,7 @@
 #   * SORT out of the criteria's order, a base subject that keeps its Re:, THREAD not tying a reply to its parent
 #   * OLDER or YOUNGER not counting from now, SAVEDBEFORE reading the internal date, a PREVIEW not of the text
 #   * AUTHENTICATE LOGIN not asking for the password after the user, or taking a wrong one
+#   * SETQUOTA taken over the account's quota, an UNSELECT that expunges
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -210,6 +211,20 @@ e.s.sendall(b"L AUTHENTICATE LOGIN YWxpY2U=\r\n"); l1 = e.f.readline()
 e.s.sendall(base64.b64encode(b"wrongpassword") + b"\r\n"); l2 = e.f.readline()
 say("and with the user given at once, a wrong password is refused", l1.startswith(b"+ UGFzc3dvcmQ6") and
     l2.startswith(b"L NO"), (l1, l2))
+# SETQUOTA, the quota being the idp account's; UNSELECT, which unlike CLOSE expunges nothing.
+r = a.cmd('SETQUOTA "" (STORAGE 100)')
+say("SETQUOTA is refused, the quota being the account's", "[NOPERM]" in r[-1], r)
+a.cmd("SELECT INBOX")
+before = a.cmd("UID SEARCH ALL")[0]
+first = before.split()[2]
+a.cmd("UID STORE %s +FLAGS (\\Deleted)" % first)
+r = a.cmd("UNSELECT")
+a.cmd("SELECT INBOX")
+after = a.cmd("UID SEARCH ALL")[0]
+say("UNSELECT leaves a \\Deleted message where it is", " OK " in r[-1] and after == before, (r, before, after))
+r = a.cmd("UNSELECT"); r2 = a.cmd("UNSELECT")
+say("and a second one, with nothing selected, is refused", " OK " in r[-1] and " BAD " in r2[-1], (r, r2))
+a.cmd("SELECT INBOX"); a.cmd("UID STORE %s -FLAGS (\\Deleted)" % first)
 PY
 # COMPRESS=DEFLATE: what one session reads compressed is what another reads in the clear.
 python3 - "$IM" >> "$T/ext.out" 2>&1 <<'PY'

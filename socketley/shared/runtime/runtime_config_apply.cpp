@@ -119,6 +119,8 @@ void apply_dns_config(dns_instance& dns, const runtime_config& cfg, bool by_pres
         dns.set_proxy(cfg.dns_proxy);
     if (asked("rrl", true))
         dns.set_rrl(cfg.dns_rrl);
+    if (asked("dnssec", cfg.dns_dnssec))
+        dns.set_dnssec(cfg.dns_dnssec);
 }
 
 void apply_sync_config(sync_instance& sy, const runtime_config& cfg, bool by_presence)

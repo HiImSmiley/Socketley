@@ -1,0 +1,5 @@
+version: STSv1
+mode: enforce
+mx: mx.example.test
+mx: *.example.net
+max_age: 86400

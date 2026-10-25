@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **DNSSEC.** A dns runtime with `--dnssec` signs its zones as it loads
+  them (ECDSA P-256, an NSEC chain, an RRSIG over every set), answers a
+  query with the DO bit with the signatures and the proofs of what is not
+  there, and signs again before the signatures end; `socketley dnssec <dns>`
+  prints the DS record for the registrar.
+- **Calendars and contacts.** A mail runtime with `--idp` and `--storage`
+  serves CalDAV and CardDAV on its JMAP and webmail ports: every user has a
+  calendar and an address book at `/dav/<user>/`, makes more, and syncs them
+  with Thunderbird, DAVx5, iOS and macOS, found through `/.well-known/caldav`,
+  the Apple profile, Thunderbird's autoconfig and the `_caldavs` and
+  `_carddavs` records. The entries live in the storage bucket beside the
+  mail.
 - **A mailbox moves.** `socketley mail export <user> [dir]` writes a user's
   folders out as mbox files, a folder each, the flags as Status and
   X-Status and the keywords as X-Keywords; `socketley mail import <user>

@@ -928,6 +928,9 @@ bool mail_run::start(std::string& why)
     // Sieve filters the mail a mailbox takes, so its scripts are every shard's, and ManageSieve listens on each.
     if (m_mailboxes && m_mailboxes->enabled())
         m_sieve = std::make_unique<sieve_store>(mail_sieve_dir(m_owner.get_name()));
+    // Calendars and contacts beside the mail, on the ports JMAP and the webmail answer on.
+    if (m_mailboxes && m_mailboxes->enabled())
+        m_dav = std::make_unique<dav_store>(*m_mailboxes, mail_dav_dir(m_owner.get_name()), m_alive);
     else if (m_owner.get_sieve_port())
     {
         why = "--sieve keeps the filters of mailboxes, which need --idp and --storage";
@@ -2984,6 +2987,11 @@ std::string mail_run::records_text() const
         // Where Outlook asks how a mailbox is reached, the entrance's name the webmail answers under.
         if (m_owner.get_web_port() && !m_owner.get_domains().empty())
             out += "_autodiscover._tcp." + d + ". 300 IN SRV 0 1 443 autodiscover." + d + ".\n";
+        // And where a calendar or contacts client finds them, at the webmail's name (RFC 6764).
+        if (const std::string url = web_url(); m_mailboxes && m_mailboxes->enabled() && !url.empty())
+            for (const char* service : {"_caldavs", "_carddavs"})
+                out += std::string(service) + "._tcp." + d + ". 300 IN SRV 0 1 443 " + url.substr(8) + ".\n" +
+                       service + "._tcp." + d + ". 300 IN TXT \"path=/dav/\"\n";
         // Where a mail client finds the ports it sends and reads on (RFC 6186, RFC 8314), and its filters' (RFC 5804).
         for (const auto& [service, port] : {std::pair{"_submissions", m_owner.get_submissions_port()},
                                             {"_submission", m_owner.get_submission_port()},
@@ -3441,6 +3449,9 @@ std::string mail_run::client_setup(std::string_view kind, const std::string& ema
     s.pop3 = tls ? m_owner.get_pop3_port() : 0;
     s.submissions = m_owner.get_submissions_port();
     s.submission = tls ? m_owner.get_submission_port() : 0;
+    if (m_dav)
+        if (const std::string url = web_url(); !url.empty())
+            s.dav_host = url.substr(8);
     if (kind == "autoconfig")
         return thunderbird_autoconfig(s);
     if (kind == "autodiscover")
@@ -3452,6 +3463,8 @@ std::string mail_run::client_setup(std::string_view kind, const std::string& ema
     for (const auto& [name, port] : {std::pair<const char*, uint16_t>{"imaps", s.imaps}, {"imap", s.imap}, {"pop3s", s.pop3s},
                                      {"pop3", s.pop3}, {"submissions", s.submissions}, {"submission", s.submission}})
         out += ",\"" + std::string(name) + "\":" + std::to_string(port);
+    if (!s.dav_host.empty())
+        out += ",\"dav\":\"https://" + s.dav_host + "/dav/\"";
     return out + "}";
 }
 

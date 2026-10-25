@@ -137,6 +137,7 @@ constexpr row rows[] = {
     {"--transfer", "D", "list", "Transfer to", "Addresses that may copy the zones (AXFR): secondaries.", "DNS", {}, "203.0.113.53"},
     {"--notify", "D", "list", "Notify", "Secondaries told of each change.", "DNS", {}, "203.0.113.53"},
     {"--rrl", "D", "int", "Rate limit", "Answers a second to one network; 0 for none.", "DNS", {}, "100"},
+    {"--dnssec", "D", "bool", "DNSSEC", "Signs its zones; the parent takes the DS socketley dns ds prints.", "DNS", {}, ""},
 
     // ── sync ────────────────────────────────────────────────────────────────
     {"--dir", "Y", "path", "Directory", "The directory whose files are carried. Required.", "Sync", {}, "/srv/photos"},
@@ -319,6 +320,7 @@ constexpr state_key_row state_keys[] = {
     {"--transfer", "transfer"},
     {"--notify", "notify"},
     {"--rrl", "rrl"},
+    {"--dnssec", "dnssec"},
     {"--clients", "clients"},
     {"--issuer", "issuer"},
     {"--cookie-domain", "cookie_domain"},

@@ -1,6 +1,7 @@
 #pragma once
 // What a mail client is told when it asks how to reach a mailbox: Thunderbird's autoconfig (config-v1.1.xml),
-// Outlook's autodiscover (the POX schema, and the JSON that points at it), and an Apple configuration profile.
+// Outlook's autodiscover (the POX schema, and the JSON that points at it), and an Apple configuration profile; the
+// calendars and contacts beside the mail where the entrance serves them.
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -13,6 +14,8 @@ struct client_settings
 {
     std::string hostname, email, domain;
     uint16_t imap{0}, imaps{0}, pop3{0}, pop3s{0}, submission{0}, submissions{0};
+    // Where the entrance serves calendars and contacts over HTTPS, at /dav/; empty where it serves none.
+    std::string dav_host;
 };
 
 std::string thunderbird_autoconfig(const client_settings& s);

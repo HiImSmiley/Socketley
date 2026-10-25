@@ -687,6 +687,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.dns_publish = std::string(d->get_publish());
             cfg.dns_proxy = std::string(d->get_proxy());
             cfg.dns_rrl = d->get_rrl();
+            cfg.dns_dnssec = d->get_dnssec();
             break;
         }
         case runtime_sync:
@@ -1143,6 +1144,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             if (!cfg.dns_proxy.empty())
                 append_str_field("proxy", cfg.dns_proxy);
             append_int_field("rrl", cfg.dns_rrl);
+            if (cfg.dns_dnssec)
+                append_bool_field("dnssec", true);
             break;
         case runtime_sync:
             append_str_field("mode", sync_mode_name(static_cast<sync_mode>(cfg.mode)));
@@ -1486,6 +1489,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.dns_publish = json_get_string(json, "publish");
             cfg.dns_proxy = json_get_string(json, "proxy");
             cfg.dns_rrl = json_get_uint32(json, "rrl", 100);
+            cfg.dns_dnssec = json_get_bool(json, "dnssec");
             break;
         case runtime_sync:
         {

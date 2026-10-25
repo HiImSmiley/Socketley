@@ -1530,6 +1530,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("mail"):          return cmd_mail(conn, pa);
         case fnv1a("db-restore"):    return cmd_db_restore(conn, pa);
         case fnv1a("db-query"):      return cmd_db_query(conn, pa);
+        case fnv1a("dnssec"):        return cmd_dnssec(conn, pa);
         case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
@@ -3075,6 +3076,36 @@ bool daemon_handler::ask_worker(ipc_connection* conn, std::string_view runtime, 
         return false;
     }
     return true;
+}
+
+int daemon_handler::cmd_dnssec(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count != 2)
+    {
+        conn->write_buf = command_usage::line("dnssec");
+        return 1;
+    }
+    auto* instance = m_manager.get(pa.args[1]);
+    if (!instance || instance->get_type() != runtime_dns)
+    {
+        conn->write_buf = "no dns runtime named " + std::string(pa.args[1]) + "\n";
+        return 1;
+    }
+    const auto* dns = static_cast<const dns_instance*>(instance);
+    if (!dns->get_dnssec())
+    {
+        conn->write_buf = std::string(pa.args[1]) + " signs no zones; edit it with --dnssec first\n";
+        return 1;
+    }
+    std::string why;
+    const std::string records = dns->ds_records(why);
+    if (records.empty())
+    {
+        conn->write_buf = "dnssec: " + why + "\n";
+        return 1;
+    }
+    conn->write_buf = records;
+    return 0;
 }
 
 // A mail runtime's commands: a message to send goes to one shard, which queues it; the queue, a flush and a drop ask

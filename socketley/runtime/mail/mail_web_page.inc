@@ -376,6 +376,8 @@ if (/^de\b/i.test(navigator.language || '')) { document.documentElement.lang = '
   "It goes %": "Wird gesendet: %",
   "Saving replaces the filter “%” a mail app put in place.": "Speichern ersetzt den Filter „%“, den eine Mail-App angelegt hat.",
   "Sign in with % and your password.": "Melde dich mit % und deinem Passwort an.",
+  "%: %, port %, %": "%: %, Port %, %",
+  "Calendars and contacts: %": "Kalender und Kontakte: %",
   "% is empty": "% ist leer",
   "% selected": "% ausgewählt",
   "% messages": "% Nachrichten",
@@ -1282,11 +1284,12 @@ async function filtersEditor() {
 function mailApps() {
   const st = me && me.setup;
   if (!st) return [];
-  const row = (what, port, tls) => port ? el('div', { class: 'approw', text: what + ': ' + st.host + ', port ' + port + (tls ? ', SSL/TLS' : ', STARTTLS') }) : null;
+  const row = (what, port, tls) => port ? el('div', { class: 'approw', text: say('%: %, port %, %', what, st.host, port, tls ? 'SSL/TLS' : 'STARTTLS') }) : null;
   return [el('h4', { text: say('Mail apps') }),
     el('div', { class: 'approw', text: say('Sign in with % and your password.', me.address) }),
     row('IMAP', st.imaps || st.imap, !!st.imaps), row('POP3', st.pop3s || st.pop3, !!st.pop3s),
     row(say('Sending (SMTP)'), st.submissions || st.submission, !!st.submissions),
+    st.dav ? el('div', { class: 'approw', text: say('Calendars and contacts: %', st.dav) }) : null,
     el('div', { class: 'approw', text: say('Thunderbird and Outlook find these by themselves from your address.') }),
     el('a', { class: 'btn', href: '/~mail/mobileconfig', download: 'mail.mobileconfig', text: say('Profile for iPhone, iPad and Mac') })].filter(Boolean);
 }

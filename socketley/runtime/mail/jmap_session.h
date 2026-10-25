@@ -21,6 +21,8 @@
 namespace socketley::mail
 {
 
+class dav_store;
+
 struct jmap_config
 {
     std::string hostname;
@@ -58,6 +60,8 @@ public:
         // What a mail client is told of how to reach the mailbox of `email`: "autoconfig", "autodiscover",
         // "mobileconfig" or the webmail's "json"; empty for an address none of its domains holds.
         virtual std::string client_setup(std::string_view /*kind*/, const std::string& /*email*/) { return {}; }
+        // The users' calendars and address books, null where the runtime keeps no mailboxes.
+        virtual dav_store* dav() { return nullptr; }
         // The webmail's filter rules, the Sieve script "webmail": read where `script` is none, or put and made the
         // active one, answered with a status and JSON.
         virtual void filters(const std::string& /*user*/, std::optional<std::string> /*script*/,

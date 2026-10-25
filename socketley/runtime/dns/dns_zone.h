@@ -32,11 +32,20 @@ struct node
     std::vector<rrset> sets;
     // A zone cut: NS records on a name below the apex, which hands that name and all below it to other servers.
     bool cut{false};
+    // In a signed zone, the RRSIGs of each set, a set of them per type covered, `type` being the one it covers.
+    std::vector<rrset> sigs;
 
     const rrset* find(uint16_t t) const
     {
         for (const auto& s : sets)
             if (s.type == t)
+                return &s;
+        return nullptr;
+    }
+    const rrset* sig(uint16_t covered) const
+    {
+        for (const auto& s : sigs)
+            if (s.type == covered)
                 return &s;
         return nullptr;
     }
@@ -56,6 +65,11 @@ struct zone
     // The file it came from and how it stood when read, so a change is noticed.
     std::string path;
     socketley::file_stamp stamp;
+    // Signed (dns_sign.h): its NSEC chain's owners in canonical order, and when its first signature ends.
+    bool dnssec{false};
+    std::vector<std::string> chain;
+    int64_t sig_expires_s{0};
+    int64_t sign_epoch{0};
 
     const node* find(std::string_view wire) const
     {
@@ -89,6 +103,8 @@ struct zone
         return m_cache.wild == 1;
     }
     static constexpr uint16_t type_soa = 6;
+    // What soa() and has_wildcards() kept forgotten, after the sets they point into were changed.
+    void forget_lookups() { m_cache = lookup_cache(); }
 
 private:
     // Pointers into this zone's own names, so a copy starts without them rather than pointing into another's.

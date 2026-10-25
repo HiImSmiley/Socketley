@@ -22,6 +22,7 @@
 #include "mail_aliases.h"
 #include "mail_bayes.h"
 #include "mail_command.h"
+#include "dav_store.h"
 #include "imap_session.h"
 #include "managesieve_session.h"
 #include "mail_dnsbl.h"
@@ -263,6 +264,7 @@ private:
         std::string idp_logout(const std::string& back) override;
         void forward(std::string client) override { forwarded = std::move(client); }
         bool unsubscribe(const std::string& token) override { return run->unsubscribe(token); }
+        dav_store* dav() override { return run->m_dav.get(); }
         std::string client_setup(std::string_view kind, const std::string& email) override
         {
             return run->client_setup(kind, email);
@@ -445,6 +447,7 @@ private:
     // What a user is told once their mailbox passes --quota-warn, kept for the run.
     std::unordered_set<std::string> m_quota_warned;
     std::unique_ptr<imap_store> m_imap;
+    std::unique_ptr<dav_store> m_dav;
     std::unordered_map<uint64_t, std::unique_ptr<conn>> m_conns;
     // Connections and failed sign-ins by client address, and each address's message rate, for the limits on them.
     struct client
