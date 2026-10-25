@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A machine whole, data and all.** `socketley export --full <file>`
+  writes the setup and every runtime's data into one tar archive (gzip,
+  `--compress best` for gzip -9's effort, or `none`): the state directory,
+  the configuration, the storage buckets, mailboxes, accounts and keys, a
+  db by its own backup; `socketley restore <file>` puts it back on a machine
+  whose daemon is stopped, and the runtimes come back as they were.
 - **DNSSEC.** A dns runtime with `--dnssec` signs its zones as it loads
   them (ECDSA P-256, an NSEC chain, an RRSIG over every set), answers a
   query with the DO bit with the signatures and the proofs of what is not

@@ -2542,7 +2542,8 @@ project "test_persist"
 
     links { "dl" }
 
-    files { "test/unit/test_persist.cpp" }
+    files { "test/unit/test_persist.cpp", "socketley/shared/persist/tar_archive.cpp", "socketley/shared/util/deflate.cpp",
+            "socketley/shared/util/inflate.cpp", "socketley/shared/util/crc.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

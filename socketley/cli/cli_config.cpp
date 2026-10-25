@@ -437,7 +437,8 @@ int cli_export(int argc, char** argv)
 {
     if (argc < 3)
     {
-        std::cerr << "usage: socketley export <dir>\n";
+        std::cerr << "usage: socketley export <dir>\n"
+                     "       socketley export --full <file> [--compress fast|best|none]\n";
         return 1;
     }
     type_manifest::load_dir(socketley_paths::resolve().types_dir);

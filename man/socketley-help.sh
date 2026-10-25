@@ -572,6 +572,14 @@ cli_commands() {
     echo -e "  ${CYAN}socketley export /root/setup${NC}"
     echo ""
 
+    echo -e "${BOLD}export --full <file> [--compress fast|best|none] | restore <file> [--force]${NC}"
+    echo "  The setup and its data in one tar.gz: the state directory, the configuration, every"
+    echo "  runtime's data (buckets, mailboxes, accounts, keys, db by its own backup). restore"
+    echo "  puts it back on a machine whose daemon is stopped; started, the runtimes come back."
+    echo -e "  ${CYAN}socketley export --full /var/backups/socketley.tar.gz --compress best${NC}"
+    echo -e "  ${CYAN}socketley restore /var/backups/socketley.tar.gz${NC}"
+    echo ""
+
     echo -e "${BOLD}cluster [subcommand]${NC}"
     echo "  Multi-daemon cluster inspection (requires daemon in cluster mode;"
     echo "  says 'cluster mode is off' with the reason when it is not)"

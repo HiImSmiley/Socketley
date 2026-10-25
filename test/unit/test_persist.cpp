@@ -8,12 +8,16 @@
 
 #include <atomic>
 #include <filesystem>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "shared/persist/file_stamp.h"
 #include "shared/persist/replaced_file.h"
+#include "shared/persist/tar_archive.h"
+#include "shared/util/deflate.h"
+#include "shared/util/inflate.h"
 
 namespace
 {
@@ -127,4 +131,124 @@ TEST_CASE("a file is read whole, a missing or a too large one refused unless all
     CHECK(socketley::read_file(d + "/link", out));
     CHECK_FALSE(socketley::read_file(d + "/link", out, {.no_follow = true}));
     std::filesystem::remove_all(d);
+}
+
+namespace
+{
+
+std::string opened(const std::string& deflated)
+{
+    socketley::inflater in;
+    in.feed(reinterpret_cast<const uint8_t*>(deflated.data()), deflated.size());
+    in.end();
+    std::string out;
+    for (;;)
+    {
+        const auto r = in.run(out, 1u << 20);
+        if (r == socketley::inflater::result::done)
+            return out;
+        if (r != socketley::inflater::result::output_full)
+            return "(not opened)";
+    }
+}
+
+}   // namespace
+
+TEST_CASE("DEFLATE: best effort is no larger than fast, both open to what went in, and finish ends the stream")
+{
+    std::string text;
+    std::mt19937 rng(7);
+    static const char* words[] = {"mail ", "runtime ", "storage ", "socketley ", "the ", "a ", "journal ", "\n"};
+    for (int i = 0; i < 200000; ++i)
+        text += words[rng() % 8];
+    std::string fast, best;
+    socketley::deflater f(socketley::deflater::effort::fast), b(socketley::deflater::effort::best);
+    for (size_t at = 0; at < text.size(); at += 100000)
+    {
+        f.compress(std::string_view(text).substr(at, 100000), fast);
+        b.compress(std::string_view(text).substr(at, 100000), best);
+    }
+    f.finish(fast);
+    b.finish(best);
+    CHECK(opened(fast) == text);
+    CHECK(opened(best) == text);
+    CHECK(best.size() <= fast.size());
+    CHECK(fast.size() < text.size() / 3);
+}
+
+TEST_CASE("tar: what is written reads back, a long name, a link, a file of several pieces, each compression")
+{
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("skl-tar-" + std::to_string(::getpid()));
+    std::filesystem::create_directories(dir);
+    std::string big(3u << 20, '\0');
+    std::mt19937 rng(11);
+    for (auto& c : big)
+        c = static_cast<char>('a' + rng() % 4);
+    {
+        FILE* fp = std::fopen((dir / "big").c_str(), "wb");
+        REQUIRE(fp);
+        std::fwrite(big.data(), 1, big.size(), fp);
+        std::fclose(fp);
+    }
+    const std::string long_name = "var/lib/" + std::string(150, 'x') + "/file";
+    for (auto c : {socketley::tar_writer::compression::none, socketley::tar_writer::compression::fast,
+                   socketley::tar_writer::compression::best})
+    {
+        const std::string path = (dir / "a.tar").string();
+        std::string why;
+        {
+            socketley::tar_writer w;
+            REQUIRE_MESSAGE(w.open(path, c, why), why);
+            struct stat st{};
+            REQUIRE(::stat(dir.c_str(), &st) == 0);
+            CHECK(w.add_dir("var/lib", st, why));
+            CHECK(w.add_bytes(long_name, "short", 0640, why));
+            CHECK(w.add_file("var/lib/big", (dir / "big").string(), why));
+            CHECK(w.add_link("var/lib/link", "/" + std::string(120, 'y'), st, why));
+            REQUIRE_MESSAGE(w.close(why), why);
+            CHECK(w.files() == 3);
+        }
+        socketley::tar_reader r;
+        REQUIRE_MESSAGE(r.open(path, why), why);
+        socketley::tar_reader::entry e;
+        REQUIRE(r.next(e, why) == socketley::tar_reader::status::entry);
+        CHECK(e.name == "var/lib/");
+        CHECK(e.type == '5');
+        REQUIRE(r.next(e, why) == socketley::tar_reader::status::entry);
+        CHECK(e.name == long_name);
+        CHECK(e.mode == 0640);
+        std::string got;
+        CHECK(r.read(got, 100, why));
+        CHECK(got == "short");
+        REQUIRE(r.next(e, why) == socketley::tar_reader::status::entry);
+        CHECK(e.name == "var/lib/big");
+        CHECK(e.size == big.size());
+        got.clear();
+        while (r.left() > 0)
+            REQUIRE(r.read(got, 1u << 19, why));
+        CHECK(got == big);
+        REQUIRE(r.next(e, why) == socketley::tar_reader::status::entry);
+        CHECK(e.type == '2');
+        CHECK(e.link == "/" + std::string(120, 'y'));
+        CHECK(r.next(e, why) == socketley::tar_reader::status::end);
+        // An entry passed over unread is skipped whole.
+        socketley::tar_reader skip;
+        REQUIRE(skip.open(path, why));
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(skip.next(e, why) == socketley::tar_reader::status::entry);
+        CHECK(e.type == '2');
+    }
+    // What is no tar is told so.
+    {
+        FILE* fp = std::fopen((dir / "junk").c_str(), "wb");
+        std::string junk(2048, 'j');
+        std::fwrite(junk.data(), 1, junk.size(), fp);
+        std::fclose(fp);
+        socketley::tar_reader r;
+        std::string why;
+        REQUIRE(r.open((dir / "junk").string(), why));
+        socketley::tar_reader::entry e;
+        CHECK(r.next(e, why) == socketley::tar_reader::status::bad);
+    }
+    std::filesystem::remove_all(dir);
 }

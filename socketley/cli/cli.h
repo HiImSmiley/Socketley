@@ -29,6 +29,9 @@ int cli_daemon(int argc, char** argv);
 int cli_config(int argc, char** argv);
 // `socketley export <dir>`, the daemon's setup written as the Lua `socketley --lua` reads, in cli_config.cpp.
 int cli_export(int argc, char** argv);
+// `socketley export --full <file>` and `socketley restore <file>`, the setup and its data in one archive, in cli_backup.cpp.
+int cli_export_full(int argc, char** argv);
+int cli_restore(int argc, char** argv);
 int cli_cluster(int argc, char** argv);
 // `socketley acme issue`, in cli_acme.cpp.
 int acme_main(int argc, char** argv);

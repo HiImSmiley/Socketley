@@ -1644,6 +1644,53 @@ already is refused. See
 under
 .BR "LUA CONFIGURATION" .
 .TP
+.BI "export \-\-full " file " \fR[\fB\-\-compress fast\fR|\fBbest\fR|\fBnone\fR]"
+The setup and its data in one tar archive, gzip around it unless
+.B \-\-compress none
+says otherwise (\fBbest\fR looks longer for what repeats, as
+.B gzip \-9
+does): the state directory \(em every runtime's file, the mailboxes' index,
+the idp's accounts and keys, the Sieve scripts, the calendars' journals, the
+DKIM and DNSSEC keys, the certificates \(em the daemon's configuration
+directory, and what each runtime keeps elsewhere: a storage runtime's buckets,
+a cache's file and its journal, a zone, a script, a file of tokens. A db
+runtime that runs is written by its own backup, which holds what it holds at
+one moment, rather than copied while it writes; a cache gives what its file
+and its journal hold, what a crash would leave it, every write but the last
+.B \-\-persistent\-interval
+where it journals; the Lua setup
+.B export
+writes goes in beside them. Not in it: a log, what a runtime writes as its
+output, a backups directory, and the files a sync runtime carries, which are
+the user's own; each is named when the command ends. Run as root or as the
+daemon's user, while it runs or not, the archive written 0600 and only once it
+is whole.
+.RS
+.PP
+.nf
+socketley export \-\-full /var/backups/socketley\-$(date +%F).tar.gz
+.fi
+.RE
+.TP
+.BI "restore " file " \fR[\fB\-\-force\fR]"
+What
+.B export \-\-full
+wrote put back where it was, owned by the users it was owned by where they are
+on this machine, each file written beside its place and moved there whole. The
+daemon is stopped first, and started again brings every runtime back from its
+state as it was, running where it ran. A state directory that holds runtimes
+already is refused unless
+.BR \-\-force ;
+a path outside those the archive's manifest names refuses the archive.
+.RS
+.PP
+.nf
+systemctl stop socketley
+socketley restore /var/backups/socketley\-2026\-10\-25.tar.gz
+systemctl start socketley
+.fi
+.RE
+.TP
 .BI "import " "name " "[\-\-restart] " "json"
 Update a runtime's configuration from a JSON string. With no
 .I json

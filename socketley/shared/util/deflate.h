@@ -15,9 +15,14 @@ namespace socketley
 class deflater
 {
 public:
-    deflater();
+    // How hard matches are looked for: fast walks 64 earlier places, best up to 4096, a quarter of that once it holds
+    // a match of 32 and none once one of 258, and takes a match only where the next byte's is no longer, as gzip -9.
+    enum class effort : uint8_t { fast, best };
+    explicit deflater(effort e = effort::fast);
     // `in` compressed onto the end of `out`, ended so that every byte of it can be read from what is there.
     void compress(std::string_view in, std::string& out);
+    // The final block, an empty one, which a gzip or zlib reader needs to know the stream ended.
+    void finish(std::string& out);
 
 private:
     void bits(uint32_t value, int count, std::string& out);
@@ -31,6 +36,10 @@ private:
     std::vector<int64_t> m_prev;
     uint32_t m_bitbuf{0};
     int m_bitcount{0};
+    int m_chain{64};
+    uint32_t m_good{max_good};
+    bool m_lazy{false};
+    static constexpr uint32_t max_good = 1u << 16;
 };
 
 }   // namespace socketley

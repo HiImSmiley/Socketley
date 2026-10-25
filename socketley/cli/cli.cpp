@@ -515,7 +515,10 @@ int cli_dispatch(int argc, char** argv)
             return cli_config(argc, argv);
 
         case fnv1a("export"):
-            return cli_export(argc, argv);
+            return argc >= 3 && std::string_view(argv[2]) == "--full" ? cli_export_full(argc, argv) : cli_export(argc, argv);
+
+        case fnv1a("restore"):
+            return cli_restore(argc, argv);
 
         case fnv1a("help"):
         case fnv1a("--help"):

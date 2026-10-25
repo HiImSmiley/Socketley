@@ -11,7 +11,6 @@ namespace
 
 constexpr size_t window = 32768;
 constexpr size_t hash_size = 1u << 15;
-constexpr int chain = 64;
 constexpr uint32_t min_match = 3, max_match = 258;
 
 constexpr uint16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
@@ -191,7 +190,21 @@ std::vector<std::pair<uint8_t, uint8_t>> rle(const std::vector<uint8_t>& lens)
 
 }   // namespace
 
-deflater::deflater() : m_head(hash_size, -1), m_prev(window, -1) {}
+deflater::deflater(effort e)
+    : m_head(hash_size, -1), m_prev(window, -1), m_chain(e == effort::best ? 4096 : 64),
+      m_good(e == effort::best ? 32 : max_good), m_lazy(e == effort::best)
+{
+}
+
+void deflater::finish(std::string& out)
+{
+    // Every compress() ends on a byte, so the final block is an empty stored one with BFINAL set.
+    bits(1, 1, out);
+    bits(0, 2, out);
+    if (m_bitcount > 0)
+        bits(0, 8 - m_bitcount, out);
+    out.append("\x00\x00\xff\xff", 4);
+}
 
 void deflater::bits(uint32_t value, int count, std::string& out)
 {
@@ -245,32 +258,85 @@ void deflater::compress(std::string_view in, std::string& out)
     std::vector<token> toks;
     toks.reserve(in.size() / 2 + 1);
     std::vector<uint32_t> lit_freq(286, 0), dist_freq(30, 0);
+    // The longest match at `i` among the places the chain holds, and its distance.
+    const auto find = [&](size_t i, uint32_t& best_dist) {
+        uint32_t best = 0;
+        if (i + min_match > end)
+            return best;
+        int64_t cand = m_head[hash3(p + i)];
+        const int64_t here = static_cast<int64_t>(base + i);
+        const uint32_t limit = static_cast<uint32_t>(std::min<size_t>(max_match, end - i));
+        int budget = m_chain;
+        bool shortened = false;
+        for (; cand >= 0 && budget > 0; --budget)
+        {
+            const int64_t dist = here - cand;
+            if (dist <= 0 || dist > static_cast<int64_t>(window) || cand < static_cast<int64_t>(base))
+                break;
+            const size_t j = static_cast<size_t>(cand - static_cast<int64_t>(base));
+            // One that differs where the best so far ends cannot be longer, and is passed over unread.
+            if (best > 0 && (p[j + best] != p[i + best] || p[j] != p[i]))
+            {
+                cand = m_prev[static_cast<size_t>(cand) & (window - 1)];
+                continue;
+            }
+            uint32_t n = 0;
+            while (n < limit && p[j + n] == p[i + n])
+                ++n;
+            if (n > best)
+            {
+                best = n;
+                best_dist = static_cast<uint32_t>(dist);
+                if (n == limit)
+                    break;
+                // A good match found, the rest of the chain is walked a quarter as far.
+                if (n >= m_good && !shortened)
+                {
+                    budget /= 4;
+                    shortened = true;
+                }
+            }
+            cand = m_prev[static_cast<size_t>(cand) & (window - 1)];
+        }
+        return best;
+    };
+    // The match lazy matching found at the next place, which is where the loop goes next.
+    bool known = false;
+    uint32_t known_len = 0, known_dist = 0;
     for (size_t i = start; i < end;)
     {
-        uint32_t best = 0, best_dist = 0;
-        if (i + min_match <= end)
+        uint32_t best_dist = known_dist;
+        uint32_t best = known ? known_len : find(i, best_dist);
+        known = false;
+        // A match the next byte begins a longer one of is put off by a literal (lazy matching).
+        if (m_lazy && best >= min_match && best < max_match && i + 1 < end)
         {
-            int64_t cand = m_head[hash3(p + i)];
-            const int64_t here = static_cast<int64_t>(base + i);
-            const uint32_t limit = static_cast<uint32_t>(std::min<size_t>(max_match, end - i));
-            for (int steps = 0; cand >= 0 && steps < chain; ++steps)
+            insert(i);
+            uint32_t next_dist = 0;
+            const uint32_t next = find(i + 1, next_dist);
+            if (next > best)
             {
-                const int64_t dist = here - cand;
-                if (dist <= 0 || dist > static_cast<int64_t>(window) || cand < static_cast<int64_t>(base))
-                    break;
-                const size_t j = static_cast<size_t>(cand - static_cast<int64_t>(base));
-                uint32_t n = 0;
-                while (n < limit && p[j + n] == p[i + n])
-                    ++n;
-                if (n > best)
-                {
-                    best = n;
-                    best_dist = static_cast<uint32_t>(dist);
-                    if (n == limit)
-                        break;
-                }
-                cand = m_prev[static_cast<size_t>(cand) & (window - 1)];
+                known = true;
+                known_len = next;
+                known_dist = next_dist;
+                best = 0;
             }
+            else
+            {
+                // Taken after all: the place inserted above is the match's first, which the loop below skips.
+                const int li = length_index(best);
+                toks.push_back({static_cast<uint16_t>(257 + li), static_cast<uint16_t>(best), static_cast<uint16_t>(best_dist)});
+                ++lit_freq[257 + static_cast<size_t>(li)];
+                ++dist_freq[static_cast<size_t>(dist_index(best_dist))];
+                for (uint32_t k = 1; k < best; ++k)
+                    insert(i + k);
+                i += best;
+                continue;
+            }
+            toks.push_back({p[i], 0, 0});
+            ++lit_freq[p[i]];
+            ++i;
+            continue;
         }
         if (best >= min_match)
         {
