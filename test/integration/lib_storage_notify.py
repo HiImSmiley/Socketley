@@ -663,6 +663,9 @@ def mode_crash(port, hook_port, data):
     outbox = os.path.join(data, ".notify", "outbox.0")
     check("in the outbox on disk", os.path.getsize(outbox) > 0 and b"r/crash" in open(outbox, "rb").read(),
           os.path.exists(outbox))
+    # Killed once with the webhook still down: the worker that comes back writes the outbox again, with the event.
+    check("the worker comes back after SIGKILL", kill_and_wait(worker_pid()), worker_pid())
+    check("and its outbox still holds what it owes", b"r/crash" in open(outbox, "rb").read(), os.path.getsize(outbox))
     pid = worker_pid()
     os.kill(int(pid), signal.SIGKILL)
     hook.up()
@@ -674,7 +677,7 @@ def mode_crash(port, hook_port, data):
         except OSError:
             return False
 
-    check("the worker comes back after SIGKILL", wait_for(back, 40), worker_pid())
+    check("and after a second SIGKILL", wait_for(back, 40), worker_pid())
     check("and the event of the answered PUT arrives from its outbox", wait_event(hook, "r/crash", "ObjectCreated:Put", 20),
           hook.records())
     check("sent by the new worker", wait_for(lambda: stat("notify_sent") >= 1, 5), nstats())

@@ -75,6 +75,8 @@ public:
 private:
     // An 'E' or 'T' record carries its bytes, a 'T' and an 'S' the change's number first.
     void append_record(char type, uint64_t id, std::string_view payload = {}, uint64_t change = 0);
+    // The record onto m_buf, whether a file is open or not.
+    void encode_record(char type, uint64_t id, std::string_view payload = {}, uint64_t change = 0);
     // Runs `then`, which may be empty, once the first `at` bytes appended since the file was opened are synced.
     void wait_for(uint64_t at, std::function<void()> then);
     void kick();

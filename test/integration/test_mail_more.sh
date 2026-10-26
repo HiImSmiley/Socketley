@@ -278,6 +278,18 @@ check "its MTA-STS policy is served for its domain" "$(printf '%s' "$r" | tr -d 
 [[ "$r" == *"mx: "* ]] && ok "and names its exchanger" || bad "and names its exchanger" "$r"
 check "and not for another" "$(curl -sk -o /dev/null -w '%{http_code}' --resolve "mta-sts.else.test:$STS:127.0.0.1" \
     "https://mta-sts.else.test:$STS/.well-known/mta-sts.txt")" "404"
+# A request of its first line alone, which has no header to split, is answered and kills nothing.
+bare=$(python3 - "$STS" <<'PY'
+import socket, ssl, sys
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5), server_hostname="mta-sts.example.test")
+s.sendall(b"GET /.well-known/mta-sts.txt HTTP/1.0\r\n\r\n")
+print(s.recv(100).split(b"\r\n")[0].decode())
+PY
+)
+check "a request without headers is answered" "$bare" "HTTP/1.1 404 Not Found"
+check "and the policy is still served after it" "$(curl -sk -o /dev/null -w '%{http_code}' --resolve "mta-sts.example.test:$STS:127.0.0.1" \
+    "https://mta-sts.example.test:$STS/.well-known/mta-sts.txt")" "200"
 recs=$("$BIN" mail m dns 2>/dev/null)
 [[ "$recs" == *'_mta-sts.example.test. 300 IN TXT "v=STSv1; id='* ]] && ok "and its record is published" \
     || bad "and its record is published" "$recs"

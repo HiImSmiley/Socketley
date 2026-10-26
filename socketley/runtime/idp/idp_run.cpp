@@ -1015,7 +1015,15 @@ void idp_run::hash_password(std::string_view password, std::function<void(std::s
 
 void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie)
 {
-    const client* cl = find_client(param(p, "client_id"));
+    // A code goes only to one of the client's own addresses, whichever path the sign-in came by.
+    const client* cl = nullptr;
+    if (!param(p, "client_id").empty())
+    {
+        bool answered = false;
+        cl = checked_client(c, p, answered);
+        if (!cl)
+            return;
+    }
     // A sign-in for a page behind a proxy, or for this provider itself, rather than for a client.
     if (!cl)
     {

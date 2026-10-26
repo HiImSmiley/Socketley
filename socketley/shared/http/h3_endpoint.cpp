@@ -1347,6 +1347,9 @@ void endpoint::deliver_head(stream& st, bool fin)
         if (st.owner && st.owner->q && !st.owner->dead)
             ngtcp2_conn_shutdown_stream(st.owner->q, 0, st.sid, NGHTTP3_H3_MESSAGE_ERROR);
         h->stream_gone(st);
+        // nghttp3 may still call back for this stream in the same read, and is to find nothing there.
+        if (st.owner && st.owner->h)
+            nghttp3_conn_set_stream_user_data(st.owner->h, st.sid, nullptr);
         if (st.owner)
             st.owner->streams.erase(st.sid);
         return;

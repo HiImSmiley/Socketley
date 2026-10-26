@@ -349,7 +349,9 @@ void mail_run::sts_input(conn& c, std::string_view bytes)
     const std::string_view head(c.sts_in.data(), end);
     const std::string_view first = head.substr(0, head.find("\r\n"));
     std::string host;
-    for (const auto& [name, value] : split_headers(head.substr(first.size() + 2)))
+    // A request of its first line alone has no headers after it.
+    const std::string_view rest = first.size() + 2 <= head.size() ? head.substr(first.size() + 2) : std::string_view();
+    for (const auto& [name, value] : split_headers(rest))
         if (socketley::ascii::iequals(name, "Host"))
         {
             std::string_view v = value;

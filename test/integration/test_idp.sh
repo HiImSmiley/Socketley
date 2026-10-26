@@ -207,6 +207,10 @@ if phase == "main":
 
     st, body, h = req("GET", "/authorize" + q(**dict(auth, state="again")), cookie=cookie)
     check("a signed-in browser is sent straight back with a code", (st, bool(code_of(h)[0].get("code"))), (302, True))
+    st, body, h = req("GET", "/login" + q(**dict(auth, redirect_uri="https://attacker.example/cb")), cookie=cookie)
+    check("/login sends no code to an address the client did not register", (st, "code=" in (h.get("Location") or "")), (400, False))
+    st, body, h = req("POST", "/login", dict(auth, redirect_uri="https://attacker.example/cb", username="alice", password="alicepassword1"))
+    check("nor does a sign-in posted to /login", (st, "code=" in (h.get("Location") or "")), (400, False))
 
     # A public client: PKCE or nothing.
     pub = dict(client_id="spa", redirect_uri="http://localhost:5173/cb", response_type="code", scope="openid offline_access")

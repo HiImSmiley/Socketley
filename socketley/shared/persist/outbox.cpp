@@ -156,7 +156,8 @@ bool outbox::open(const std::string& dir, std::string_view sub, uint32_t shard, 
     for (const held& e : entries)
         if (keep(e.id, e.payload))
         {
-            append_record('E', e.id, e.payload);
+            // Encoded straight into the buffer, since the file it goes to is not the one appends go to yet.
+            encode_record('E', e.id, e.payload);
             ++m_owed;
         }
     const bool ok = write_all(fd, m_buf.data(), m_buf.size()) && ::fsync(fd) == 0;
@@ -183,6 +184,11 @@ void outbox::append_record(char type, uint64_t id, std::string_view payload, uin
 {
     if (m_fd < 0 || m_stopped)
         return;
+    encode_record(type, id, payload, change);
+}
+
+void outbox::encode_record(char type, uint64_t id, std::string_view payload, uint64_t change)
+{
     std::string rec;
     {
         bytes::writer w;
