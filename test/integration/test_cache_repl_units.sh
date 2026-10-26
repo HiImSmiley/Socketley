@@ -74,8 +74,8 @@ rl() { redis-cli -p "$1" "${@:2}" 2>/dev/null | tr '\n' ' '; }
 
 # Bounded, so a link that is merely slow does not read as a divergence -- and
 # one that is diverged still ends red, because the comparison is made after.
-settle() {   # settle PORT WANT -- CMD...
-    local port=$1 want=$2; shift 3
+settle() {   # settle PORT WANT CMD...
+    local port=$1 want=$2; shift 2
     for _ in $(seq 1 30); do
         [ "$(rl "$port" "$@")" = "$want" ] && return 0
         sleep 0.2

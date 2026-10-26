@@ -223,8 +223,19 @@ void dav_store::remove_collection(const std::string& user, const std::string& ki
         auto names = std::make_shared<std::vector<std::string>>();
         for (auto& e : all)
             names->push_back(std::move(e.name));
-        names->push_back(".props");
-        remove_each(user, kind, coll, names, 0, true, done);
+        // A listing that stopped at its cap leaves more behind, so the collection is listed again before .props goes.
+        if (all.size() < max_entries)
+        {
+            names->push_back(".props");
+            return remove_each(user, kind, coll, names, 0, true, done);
+        }
+        remove_each(user, kind, coll, names, 0, true, [this, user, kind, coll, done, alive](bool removed) {
+            if (!*alive)
+                return;
+            if (!removed)
+                return done(false);
+            remove_collection(user, kind, coll, done);
+        });
     });
 }
 
@@ -287,13 +298,13 @@ void dav_store::note(const std::string& user, const std::string& kind, const std
     ::close(fd);
 }
 
-bool dav_store::read_journal(const std::string& path, uint64_t& base, std::vector<std::pair<std::string, bool>>& lines) const
+void dav_store::read_journal(const std::string& path, uint64_t& base, std::vector<std::pair<std::string, bool>>& lines) const
 {
     base = 0;
     lines.clear();
     std::string text;
     if (!socketley::read_file(path, text))
-        return true;
+        return;
     for (std::string_view rest = text; !rest.empty();)
     {
         const size_t nl = rest.find('\n');
@@ -305,7 +316,6 @@ bool dav_store::read_journal(const std::string& path, uint64_t& base, std::vecto
         if (line.size() > 2 && (line[0] == '+' || line[0] == '-') && line[1] == '\t')
             lines.emplace_back(std::string(line.substr(2)), line[0] == '-');
     }
-    return true;
 }
 
 uint64_t dav_store::token(const std::string& user, const std::string& kind, const std::string& coll) const

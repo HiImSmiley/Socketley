@@ -283,7 +283,7 @@ if phase == "first":
         "textBody": [{"partId": "t", "type": "text/plain"}], "bodyValues": {"t": {"value": "maybe"}}}}}, "c"])
     mine = r.get("c", {}).get("created", {}).get("r", {})
     ids = {m["threadId"] for m in t1 + t3 if "plans" in m["subject"]} | {mine.get("threadId")}
-    check("a message, a reply filed in Sent and the answer to it are one conversation", len(ids) == 1 and None not in ids, (t1, t3, mine))
+    check("a message, a reply filed in Sent and the answer to it are one conversation", len(t1) >= 1 and len(t3) >= 1 and len(ids) == 1 and None not in ids, (t1, t3, mine))
     tid = ids.pop() if len(ids) == 1 else ""
     open(saved, "w").write(tid)
     r = api(["Thread/get", {"accountId": A, "ids": [tid]}, "t"])
@@ -303,8 +303,12 @@ PY
 tally < <(thread_check first)
 "$BIN" stop m >/dev/null 2>&1
 idx=$(find "$HOME" -path '*.imap/alice*' -type f ! -name '*.fts' ! -name '*.lock' 2>/dev/null)
-had=$(cat $idx 2>/dev/null | grep -c '^H ')
-sed -i '/^H /d' $idx 2>/dev/null
+if [ -n "$idx" ]; then
+    had=$(cat $idx 2>/dev/null | grep -c '^H ')
+    sed -i '/^H /d' $idx 2>/dev/null
+else
+    had=0
+fi
 [ "$had" -gt 0 ] && ok "the index keeps each message's conversation ($had lines)" || bad "the index keeps each message's conversation" "$idx"
 "$BIN" start m >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$W" || bad "the webmail port listens again" "$(tail -3 "$SOCKETLEY_DLOG")"

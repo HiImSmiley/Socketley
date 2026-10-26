@@ -56,7 +56,7 @@ ask() {
     local port=$1 line=$2 limit=$3
     local outf="$SOCKETLEY_TMPD/ask.$$"
     : > "$outf"
-    { echo "$line"; sleep "$limit"; } | timeout $((limit+5)) nc 127.0.0.1 "$port" > "$outf" 2>/dev/null &
+    setsid sh -c '{ echo "$1"; sleep "$2"; } | timeout "$3" nc 127.0.0.1 "$4"' _ "$line" "$limit" $((limit+5)) "$port" > "$outf" 2>/dev/null &
     local pid=$! start now
     start=$(date +%s)
     WAITED=999
@@ -64,7 +64,7 @@ ask() {
         if [ -s "$outf" ]; then WAITED=$(( $(date +%s) - start )); break; fi
         sleep 0.2
     done
-    kill "$pid" 2>/dev/null || true
+    kill -- "-$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     ANSWER=$(tr -d '\r' < "$outf")
     rm -f "$outf"
@@ -102,14 +102,14 @@ assert_contains "$ANSWER" "bar" "a linked cache answers at all"
 # seconds later.  The runtime is stopped while STILL wedged: letting it run
 # first lets it answer normally, which is what the first draft of this block
 # measured and reported as a pass.
-FROZEN=$(worker_pid qcache)
+FROZEN=$(worker_pid qcache || true)
 if [ -z "$FROZEN" ]; then
     fail "setup" "the second cache reports no pid"
 else
     kill -STOP "$FROZEN" 2>/dev/null || true
     outf="$SOCKETLEY_TMPD/dropped.out"
     : > "$outf"
-    { echo "cache get foo"; sleep 40; } | timeout 45 nc 127.0.0.1 "$QSRV_PORT" > "$outf" 2>/dev/null &
+    setsid sh -c '{ echo "cache get foo"; sleep 40; } | timeout 45 nc 127.0.0.1 "$1"' _ "$QSRV_PORT" > "$outf" 2>/dev/null &
     ncpid=$!
     sleep 2
     start=$(date +%s)
@@ -119,7 +119,7 @@ else
         if [ -s "$outf" ]; then waited=$(( $(date +%s) - start )); break; fi
         sleep 0.2
     done
-    kill "$ncpid" 2>/dev/null || true
+    kill -- "-$ncpid" 2>/dev/null || true
     wait "$ncpid" 2>/dev/null || true
     kill -CONT "$FROZEN" 2>/dev/null || true; FROZEN=""
     got=$(tr -d '\r' < "$outf")
@@ -137,7 +137,7 @@ fi
 # SIGSTOP and not SIGKILL: a killed worker is noticed and its sink dropped,
 # which is the OTHER case below.  A stopped one stays registered, so the request
 # is written into its socket, parked, and nothing is coming.
-FROZEN=$(worker_pid pcache)
+FROZEN=$(worker_pid pcache || true)
 if [ -z "$FROZEN" ]; then
     fail "setup" "the cache reports no pid to freeze"
 else

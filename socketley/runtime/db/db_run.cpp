@@ -1,22 +1,15 @@
 #include "db_run.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <charconv>
 #include <ctime>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/eventfd.h>
-#include <sys/stat.h>
 #include <unistd.h>
-
-#include <openssl/crypto.h>
 
 #include "db_instance.h"
 #include "../../shared/http/http_framing.h"
@@ -63,12 +56,6 @@ db_run::answer refused(int status, std::string_view code, std::string_view messa
 db_run::answer refused(const error& e)
 {
     return refused(e.status, e.code, e.message);
-}
-
-// A path's segment with its %XX spelled out; false for a % that spells nothing or a byte no id holds.
-bool unescape(std::string_view in, std::string& out)
-{
-    return socketley::http::percent_decode(in, out, false);
 }
 
 // The version an If-Match names, "3" or 3; 0 for none or one that is not a version.
@@ -326,7 +313,7 @@ void db_run::synced(bool ok, uint64_t covered)
             if (w.c->dead)
                 continue;
             w.c->keep_alive = false;
-            w.c->out += head(*w.c, 503, "application/json", body.size(), {});
+            put_head(w.c->out, *w.c, 503, "application/json", body.size(), {});
             w.c->out += body;
             w.c->waiting = false;
             m_http.flush(w.c);
@@ -467,7 +454,6 @@ void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::s
     c->replica = replica;
     c->coll = std::move(coll);
     c->keep_alive = false;
-    ++m_c.feeds;
     c->out += "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n"
               "X-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\n" +
               cors(rq) + "Connection: close\r\n\r\n";
@@ -493,7 +479,8 @@ void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::s
     c->dump = m_store.everything();
     c->dump_at = 0;
     c->dump_seq = m_store.seq();
-    m_store.pin();
+    if (!c->dump.empty())
+        m_store.pin();
     pump_dump(c);
     arm_tick();
 }
@@ -515,7 +502,8 @@ void db_run::pump_dump(const std::shared_ptr<conn>& c)
                 c->dump = m_store.everything();
                 c->dump_at = 0;
                 c->dump_seq = m_store.seq();
-                m_store.pin();
+                if (!c->dump.empty())
+                    m_store.pin();
                 continue;
             }
             for (const auto& e : m_history)
@@ -573,7 +561,8 @@ void db_run::jobs_done()
             ++it;
             continue;
         }
-        j.th.join();
+        if (j.th.joinable())
+            j.th.join();
         copy_job& job = *j.job;
         m_store.finish(job);
         if (!job.merge)
@@ -601,7 +590,17 @@ void db_run::jobs_done()
                 for (const auto& e : std::filesystem::directory_iterator(std::string(m_owner.get_backup_dir()), ec))
                 {
                     const std::string n = e.path().filename().string();
-                    if (n.starts_with(prefix) && n.ends_with(".dbbackup"))
+                    // Only the exact stamp follows the name, so "shop-eu-..." is not one of shop's.
+                    constexpr size_t stamp_len = 16;
+                    if (!n.starts_with(prefix) || !n.ends_with(".dbbackup") ||
+                        n.size() != prefix.size() + stamp_len + 9)
+                        continue;
+                    const std::string_view st = std::string_view(n).substr(prefix.size(), stamp_len);
+                    bool stamped = st[8] == 'T' && st[15] == 'Z';
+                    for (size_t i = 0; i < stamp_len && stamped; ++i)
+                        if (i != 8 && i != 15 && (st[i] < '0' || st[i] > '9'))
+                            stamped = false;
+                    if (stamped)
                         ours.push_back(e.path());
                 }
                 std::sort(ours.begin(), ours.end());
@@ -718,6 +717,7 @@ void db_run::replica_main()
                     {
                         reset = true;
                         got.clear();
+                        mark = 0;
                         continue;
                     }
                     if (name == "synced")
@@ -756,6 +756,7 @@ void db_run::replica_main()
                     if (reset)
                     {
                         m_replica_in.clear();
+                        m_replica_mark = 0;
                         m_replica_reset = true;
                     }
                     for (auto& e : got)
@@ -802,6 +803,11 @@ void db_run::take_replicated()
         // Answers waiting on what is about to go are given first, as they were.
         if (!m_waiting.empty() || !m_unpublished.empty())
             synced(m_store.sync(), m_store.seq());
+        // A job running read the log about to go, so it ends and is taken in first.
+        for (auto& j : m_jobs)
+            if (j->th.joinable())
+                j->th.join();
+        jobs_done();
         if (!m_store.reset(why))
         {
             LOG_ERROR(("db " + std::string(m_owner.get_name()) + ": the copy could not be emptied: " + why).c_str());
@@ -809,6 +815,7 @@ void db_run::take_replicated()
             return;
         }
         m_durable = 0;
+        m_replica_seq = 0;
         m_history.clear();
         m_history_bytes = 0;
         m_history_from = 1;
@@ -1146,35 +1153,28 @@ void db_run::put_head(std::string& o, const conn& c, int status, std::string_vie
     o += "\r\n";
 }
 
-std::string db_run::head(const conn& c, int status, std::string_view type, size_t length, std::string_view extra) const
-{
-    std::string o;
-    put_head(o, c, status, type, length, extra);
-    return o;
-}
-
 void db_run::respond(const std::shared_ptr<conn>& c, int status, std::string_view body, std::string_view extra,
-                     uint64_t version)
+                     uint64_t version, bool head_only)
 {
     if (status >= 400)
         ++m_c.refused;
     put_head(c->out, *c, status, "application/json", body.size(), extra, version);
-    c->out += body;
+    if (!head_only)
+        c->out += body;
 }
 
 std::string db_run::cors(const request& rq) const
 {
     if (rq.origin.empty())
         return {};
+    // A named origin is answered with the browser's credentials; `*` lets any page in, but not with them.
     for (const auto& o : m_origins)
-    {
-        // A named origin is answered with the browser's credentials; `*` lets any page in, but not with them.
         if (o == rq.origin)
             return "Access-Control-Allow-Origin: " + rq.origin +
                    "\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Expose-Headers: ETag\r\nVary: Origin\r\n";
+    for (const auto& o : m_origins)
         if (o == "*")
             return "Access-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: ETag\r\n";
-    }
     return "Vary: Origin\r\n";
 }
 
@@ -1293,7 +1293,7 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
     }
     // A path with no % is its own spelling, read where it lies.
     std::string unescaped;
-    if (rq.path.find('%') != std::string::npos && !unescape(rq.path, unescaped))
+    if (rq.path.find('%') != std::string::npos && !socketley::http::percent_decode(rq.path, unescaped, false))
     {
         respond(c, 400, error_body("bad_path", "the path holds a % that spells no byte"), allow);
         return;
@@ -1353,10 +1353,9 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
         }
         return;
     }
-    if (rq.method == "HEAD")
-        a.body.clear();
+    const bool head_only = rq.method == "HEAD";
     if (a.needs <= m_durable)
-        respond(c, a.status, a.body, allow, a.version);
+        respond(c, a.status, a.body, allow, a.version, head_only);
     else
     {
         // Rests on a change not yet on the disk: answered once it is, and nothing behind it read meanwhile.
@@ -1364,7 +1363,8 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
             ++m_c.refused;
         std::string reply;
         put_head(reply, *c, a.status, "application/json", a.body.size(), allow, a.version);
-        reply += a.body;
+        if (!head_only)
+            reply += a.body;
         hold(waiter{a.needs, c, std::move(reply), 0, false});
     }
     m_spare.swap(a.body);
@@ -1445,10 +1445,19 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
                 op.kind = write_op::del;
             else
                 return refused(400, "bad_write", "an op is put, insert, patch or delete");
-            if (const jvalue* v = member(o, "if"))
-                op.if_v = version_of(v->s);
-            if (const jvalue* v = member(o, "if_absent"); v && v->k == jvalue::kind::boolean)
+            if (const jvalue* v = member(o, "if"); v && v->k != jvalue::kind::null)
+            {
+                const bool text = v->k == jvalue::kind::string || v->k == jvalue::kind::number;
+                op.if_v = text ? version_of(v->s) : 0;
+                if (!op.if_v && !(text && v->s == "*"))
+                    return refused(400, "bad_precondition", "an op's if names a version, 3");
+            }
+            if (const jvalue* v = member(o, "if_absent"); v && v->k != jvalue::kind::null)
+            {
+                if (v->k != jvalue::kind::boolean)
+                    return refused(400, "bad_precondition", "an op's if_absent is true or false");
                 op.if_absent = v->b;
+            }
             ops.push_back(std::move(op));
         }
     }
@@ -1577,15 +1586,20 @@ void db_run::call(uint64_t ticket, std::string_view json)
     // and asked after by its number.
     if (const jvalue* file = parsed ? string_member(req, "backup") : nullptr)
     {
-        auto job = file->s.starts_with('/') ? m_store.plan_backup(file->s) : nullptr;
+        if (!file->s.starts_with('/'))
+        {
+            mgr->requests().complete_deferred(
+                ticket, request_status::ok,
+                "{\"status\":400,\"body\":" + error_body("bad_path", "the backup's file is an absolute path") + "}");
+            return;
+        }
+        auto job = m_store.plan_backup(file->s);
         if (!job)
         {
             mgr->requests().complete_deferred(
                 ticket, request_status::ok,
                 "{\"status\":409,\"body\":" +
-                    error_body("busy", file->s.starts_with('/') ? "a merge or another backup is running; try again"
-                                                                : "the backup's file is an absolute path") +
-                    "}");
+                    error_body("busy", "a merge or another backup is running; try again") + "}");
             return;
         }
         const uint64_t id = m_next_backup_id++;
@@ -1765,6 +1779,7 @@ void db_run::on_request_reply(uint64_t cookie, request_status st, std::string_vi
     if (st != request_status::ok || !decode_crossing_reply(reply, status, version, body))
     {
         status = 503;
+        version = 0;
         refusal = error_body("shard_unreachable", "shard 0, which writes, did not answer");
         body = refusal;
     }
@@ -1787,7 +1802,7 @@ void db_run::deliver(const crossed& to, int status, std::string_view body, uint6
         return;
     // Shard 0 answered once the write was on its disk and had said so first, so a read behind it here sees it.
     catch_up();
-    respond(c, status, to.head ? std::string_view{} : body, to.allow, version);
+    respond(c, status, body, to.allow, version, to.head);
     m_http.resume(c);
 }
 

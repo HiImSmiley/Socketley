@@ -198,6 +198,16 @@ if [ -n "$MS" ] && [ "${MS%.*}" -le 6 ]; then ok
 else bad "and it is answered at the backend bound rather than the header one" \
          "took ${MS:-?}s, with --backend-timeout 2 and a 10s header deadline"; fi
 
+case "$OUT" in
+    *"slow_status=HTTP/1.1 200"*) ok ;;
+    *) bad "the slow backend's response reaches the client before the close" \
+           "got: $(echo "$OUT" | grep slow_status || echo '<no line>')" ;;
+esac
+SP=$(echo "$OUT" | sed -n 's/slow_pieces=//p')
+if [ "${SP:-0}" -gt 0 ]; then ok
+else bad "and some of its body arrives before the close" \
+         "slow_pieces=${SP:-?}, so the checks below judge an empty answer"; fi
+
 SS=$(echo "$OUT" | sed -n 's/slow_seconds=//p')
 if [ -n "$SS" ] && [ "${SS%.*}" -lt 20 ]; then ok
 else bad "and the connection it cannot answer is closed rather than left open" \

@@ -83,6 +83,9 @@ function on_message(msg)
     if self.name == "dev-ws" then
         socketley.log("[WS] " .. msg)
         -- Echo for WebSocket testing
-        self.broadcast('{"type":"echo","data":"' .. msg .. '"}')
+        local esc = msg:gsub('[\\"]', '\\%0'):gsub('%c', function(c)
+            return string.format('\\u%04x', c:byte())
+        end)
+        self.broadcast('{"type":"echo","data":"' .. esc .. '"}')
     end
 end

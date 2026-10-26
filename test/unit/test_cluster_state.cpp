@@ -725,7 +725,9 @@ TEST_CASE("the report lines survive the stats text they travel in, and a text th
     CHECK(rep->offset == 5);
     CHECK(rep->primary);
     // Fenced by lapse, it says so.
-    CHECK_FALSE(cl::parse_report("x:1\n" + cl::report_lines(r, 9000), "db")->primary);
+    const auto fenced = cl::parse_report("x:1\n" + cl::report_lines(r, 9000), "db");
+    REQUIRE(fenced.has_value());
+    CHECK_FALSE(fenced->primary);
 
     CHECK_FALSE(cl::parse_report("keys:3\n", "db").has_value());
     CHECK_FALSE(cl::parse_report("cluster_incarnation:7\ncluster_epoch:1\ncluster_offset:2\n", "db").has_value());
@@ -831,7 +833,7 @@ TEST_CASE("the most up-to-date copy is the highest epoch, then the highest offse
     CHECK(cl::best_candidate({c{5, 10, 2, 40}, c{3, 20, 2, 40}, c{4, 30, 2, 40}})->node == 3);
     // The order they are listed in decides nothing.
     CHECK(cl::best_candidate({c{4, 30, 2, 40}, c{3, 20, 2, 40}, c{5, 10, 2, 40}})->node == 3);
-    CHECK(cl::best_candidate({c{2, 20, 2, 41}, c{3, 20, 2, 40}})->incarnation == 20);
+    CHECK(cl::best_candidate({c{2, 20, 2, 41}, c{3, 20, 2, 40}})->node == 2);
 }
 
 TEST_CASE("followers dial the primary on its own -p, at the host its node is reached at")

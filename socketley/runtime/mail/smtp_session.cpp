@@ -278,9 +278,7 @@ void smtp_session::reset()
     m_ret = 0;
     m_envid.clear();
     m_requiretls = false;
-    m_8bit = false;
     m_utf8 = false;
-    m_declared = 0;
 }
 
 void smtp_session::wait()
@@ -569,7 +567,7 @@ void smtp_session::mail(std::string_view arg)
         return error(501, "5.1.7", "Bad sender address syntax");
     const std::string_view path = rest.substr(0, close + 1);
     std::string_view params = trim(rest.substr(close + 1));
-    bool utf8 = false, eight = false;
+    bool utf8 = false;
     uint64_t declared = 0;
     uint8_t ret = 0;
     std::string envid;
@@ -591,9 +589,7 @@ void smtp_session::mail(std::string_view arg)
         else if (istarts(p, "BODY="))
         {
             const std::string_view v = p.substr(5);
-            if (socketley::ascii::iequals(v, "8BITMIME"))
-                eight = true;
-            else if (!socketley::ascii::iequals(v, "7BIT"))
+            if (!socketley::ascii::iequals(v, "8BITMIME") && !socketley::ascii::iequals(v, "7BIT"))
                 return error(501, "5.5.4", "Bad BODY");
         }
         else if (socketley::ascii::iequals(p, "SMTPUTF8"))
@@ -631,7 +627,7 @@ void smtp_session::mail(std::string_view arg)
     if (!from.empty() && from.domain.empty())
         return error(501, "5.1.7", "Bad sender address syntax");
     wait();
-    m_hooks.mail_from(from, [this, alive = m_alive, from, utf8, eight, declared, ret, envid, requiretls](rcpt_verdict v) {
+    m_hooks.mail_from(from, [this, alive = m_alive, from, utf8, ret, envid, requiretls](rcpt_verdict v) {
         if (!*alive)
             return;
         if (v.code / 100 == 2)
@@ -642,8 +638,6 @@ void smtp_session::mail(std::string_view arg)
             m_envid = envid;
             m_requiretls = requiretls;
             m_utf8 = utf8;
-            m_8bit = eight;
-            m_declared = declared;
             say(250, "2.1.0", v.text.empty() ? "OK" : v.text);
         }
         else
@@ -1168,6 +1162,13 @@ bool smtp_session::chunk(std::string_view& in)
     if (m_chunk_cr)
     {
         m_chunk_cr = false;
+        if (++m_size > m_cfg.max_size)
+        {
+            m_hooks.data_abort(true);
+            reset();
+            say(552, "5.3.4", "Message size exceeds the limit");
+            return true;
+        }
         m_hooks.data_bytes("\n");
     }
     message_end();

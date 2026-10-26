@@ -529,9 +529,11 @@ TEST_CASE("a reader never sees half of one shard's list")
             ++dup;
     }
     int st = 0; ::waitpid(writer, &st, 0);
+    CHECK((WIFEXITED(st) && WEXITSTATUS(st) == 0));
 
     MESSAGE("seqlock: " << reads << " clean reads, " << empty << " empty, "
                         << dup << " with a duplicated entry");
     CHECK(dup == 0);
     CHECK(reads > 0);
+    CHECK(reads - empty > 0);
 }

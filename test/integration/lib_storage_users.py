@@ -338,6 +338,9 @@ def mode_reload(T, creds, policy_file):
 
     allowed("bob reads alice-s by his identity policy", T, "GET", "/alice-s/x", BOB)
     doc = json.load(open(policy_file))
+    open(policy_file, "w").write("{ not json")
+    time.sleep(1.5)
+    allowed("a policy file that does not compile leaves the set as it was", T, "GET", "/alice-s/x", BOB)
     doc["Statement"] = [s for s in doc["Statement"] if s.get("Sid") != "ReadShared"]
     open(policy_file, "w").write(json.dumps(doc))
     check("an edit of his policy file alone takes that away without a restart",
@@ -345,7 +348,7 @@ def mode_reload(T, creds, policy_file):
           repr(status(T, "GET", "/alice-s/x", BOB)))
     open(policy_file, "w").write("{ not json")
     time.sleep(1.5)
-    allowed("a policy file that does not compile leaves the set as it was", T, "GET", "/alice-a/doc.txt", ALICE)
+    allowed("a policy file that does not compile leaves the owner's own bucket served", T, "GET", "/alice-a/doc.txt", ALICE)
     denied("including what it took away", T, "GET", "/alice-s/x", BOB)
 
 

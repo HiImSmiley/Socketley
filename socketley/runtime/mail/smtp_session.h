@@ -126,7 +126,6 @@ public:
     // What the session knows, for the message's Received header and for the hooks.
     const std::string& helo() const { return m_helo; }
     bool               esmtp() const { return m_esmtp; }
-    bool               tls() const { return m_cfg.tls_active; }
     const std::string& user() const { return m_user; }
     const address&     sender() const { return m_from; }
     const std::vector<address>& recipients() const { return m_rcpts; }
@@ -136,11 +135,6 @@ public:
     const std::string& envid() const { return m_envid; }
     // MAIL said REQUIRETLS: the message goes on only over TLS to a server whose certificate was checked (RFC 8689).
     bool requiretls() const { return m_requiretls; }
-    bool               body_8bit() const { return m_8bit; }
-    bool               smtputf8() const { return m_utf8; }
-    // The bytes of the message counted so far, before the size limit is told.
-    uint64_t           received() const { return m_size; }
-    uint32_t           errors() const { return m_errors; }
     uint64_t           messages() const { return m_messages; }
 
     // Lines are commands until DATA, and the client may not send one longer than this (RFC 5321 4.5.3.1.4 says 512).
@@ -193,9 +187,7 @@ private:
     address     m_from;
     bool        m_have_from{false};
     std::vector<address> m_rcpts;
-    bool        m_8bit{false};
     bool        m_utf8{false};
-    uint64_t    m_declared{0};
     std::string m_login_user;
     // DATA: the state of the line being read, what was counted, and whether the message is refused already.
     uint8_t     m_dstate{0};

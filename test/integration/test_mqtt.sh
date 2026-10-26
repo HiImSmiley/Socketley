@@ -296,8 +296,12 @@ if phase == "main":
         c = Client(port, version=4)
         c.connect("bad-filter-3")
         c.send(SUBSCRIBE, 2, struct.pack(">H", 1) + s("a/#/b") + b"\x00")
-        p = c.read(2)
-        truth("and a 3.1.1 client sending it is answered 0x80 or closed", p is None or (p.kind == SUBACK and p.body[-1] == 0x80), p)
+        try:
+            p = c.read(2)
+            answered = p is not None and p.kind == SUBACK and p.body[-1] == 0x80
+        except Closed:
+            p, answered = None, True
+        truth("and a 3.1.1 client sending it is answered 0x80 or closed", answered, p)
         c.close()
 
         # A client's receive maximum holds the broker's QoS 1 messages back.
@@ -511,7 +515,7 @@ if phase == "main":
     # ── what is kept ────────────────────────────────────────────────────────
     def before_restart():
         c = connected(port, "durable", props={SESSION_EXPIRY: 3600})
-        c.subscribe(("dur/#", 1), ("$share/dg/dur/s", 1))
+        c.subscribe(("dur/#", 1), ("$share/dg/shr/s", 1))
         c.disconnect()
         p = connected(port, "dur-pub")
         p.publish("dur/kept", "retained-across", qos=1, retain=True)
@@ -530,7 +534,7 @@ if phase == "after":
         check("with its queued messages", [x for x in got if x[0] == "dur/q"],
               [("dur/q", b"q%d" % i) for i in range(5)])
         p = connected(port, "dur-pub2")
-        p.publish("dur/s", "shared", qos=1)
+        p.publish("shr/s", "shared", qos=1)
         m = c.message(2)
         check("and its subscriptions, shared ones too", m.payload if m else None, b"shared")
         s2 = connected(port, "dur-reader")

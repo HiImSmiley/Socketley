@@ -284,6 +284,10 @@ else bad "phase2-delivery" "every response must be this request's own; crossed=$
 if [ "$A_SHARE" -gt 0 ] && [ "$RB" -gt 0 ]; then ok
 else bad "phase2-vacuity" "both backends must serve; 127.0.0.1=$A_SHARE localhost=$RB"; fi
 
+# And neither more than round robin could send, with a little slack.
+if [ "$A_SHARE" -le "$((REQS / 2 + 2))" ] && [ "$RB" -le "$((REQS / 2 + 2))" ]; then ok
+else bad "phase2-balance" "round robin over two backends sends about half each; 127.0.0.1=$A_SHARE localhost=$RB of $REQS"; fi
+
 # The identity assertion: the endpoint's name is pinned to the session before
 # the ClientHello, so a socket that ever crossed between these two would put
 # the wrong name on the wire -- or, for the literal, a name at all.

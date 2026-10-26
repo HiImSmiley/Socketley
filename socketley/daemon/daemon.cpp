@@ -233,6 +233,11 @@ static daemon_config load_daemon_config(const std::string& config_path)
             }
             else if (v.get_type() == sol::type::string)
                 value = v.as<std::string>();
+            else
+            {
+                out.settings_refusal += "[config] settings." + key + " is not a boolean, a number or a string\n";
+                continue;
+            }
             if (const std::string why = socketley::settings::refusal(*s, value); !why.empty())
             {
                 out.settings_refusal += "[config] settings." + why + "\n";

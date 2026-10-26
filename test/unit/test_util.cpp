@@ -114,7 +114,7 @@ TEST_CASE("an address that keeps failing is barred until its window ends, and th
         for (int k = 0; k < 3; ++k)
             bar.missed("flood" + std::to_string(i), t0 + std::chrono::seconds(i));
     CHECK(bar.barred_for("flood999", t0 + 999s) > 0);
-    CHECK(bar.barred_for("flood0", t0 + 999s) == 0);
+    CHECK(bar.barred_for("flood0", t0 + 1s) == 0);
 }
 
 TEST_CASE("a setting is read through its table entry: its range, its flag rule and its name in the file")

@@ -137,7 +137,7 @@ constexpr row rows[] = {
     {"--transfer", "D", "list", "Transfer to", "Addresses that may copy the zones (AXFR): secondaries.", "DNS", {}, "203.0.113.53"},
     {"--notify", "D", "list", "Notify", "Secondaries told of each change.", "DNS", {}, "203.0.113.53"},
     {"--rrl", "D", "int", "Rate limit", "Answers a second to one network; 0 for none.", "DNS", {}, "100"},
-    {"--dnssec", "D", "bool", "DNSSEC", "Signs its zones; the parent takes the DS socketley dns ds prints.", "DNS", {}, ""},
+    {"--dnssec", "D", "switch", "DNSSEC", "Signs its zones; the parent takes the DS socketley dns ds prints.", "DNS", {}, ""},
 
     // ── sync ────────────────────────────────────────────────────────────────
     {"--dir", "Y", "path", "Directory", "The directory whose files are carried. Required.", "Sync", {}, "/srv/photos"},
@@ -205,7 +205,7 @@ constexpr row rows[] = {
     {"--greylist", "E", "duration", "Greylist delay", "Tell a first sender, recipient and network to come back after this long.", "Mail limits", {}, "5m"},
     {"--rspamd", "E", "text", "Rspamd", "The Rspamd a stranger's mail is scored by, http://host:port.", "Mail limits", {}, "http://127.0.0.1:11333"},
     {"--recipient-delimiter", "E", "text", "Subaddress delimiter", "What divides a user from a tag, user+tag; none for no tags.", "Mail", {}, "+"},
-    {"--reports", "E", "bool", "Send reports", "Send the DMARC and TLS reports other domains ask for.", "Mail", {}, ""},
+    {"--reports", "E", "switch", "Send reports", "Send the DMARC and TLS reports other domains ask for.", "Mail", {}, ""},
     {"--refuse-attachments", "E", "list", "Refused attachments", "Extensions mail from elsewhere is refused for: default for programs, scripts and macro documents, or none.", "Mail", {}, "default"},
     {"--clamav", "E", "text", "ClamAV", "The clamd every message from elsewhere is scanned by, host:port or its socket.", "Mail", {}, "127.0.0.1:3310"},
     {"--dmarc-policy", "E", "choice", "DMARC policy", "What its DMARC record asks of mail that fails its checks; quarantine unless given.", "Mail", "none,quarantine,reject"},
@@ -404,6 +404,9 @@ std::string_view state_key(const row& r)
 
 bool is_path_flag(std::string_view flag)
 {
+    // An empty argument is no flag, though it equals every row's empty alias.
+    if (flag.empty())
+        return false;
     for (const row& r : rows)
         if (r.kind == "path" && (r.flag == flag || r.aliases == flag))
             return true;
@@ -449,7 +452,7 @@ std::vector<flag_entry> flags_for(runtime_type type)
 bool offered(std::string_view flag, runtime_type type)
 {
     const char letter = letter_of(type);
-    if (!letter)
+    if (!letter || flag.empty())
         return false;
     for (const row& r : rows)
         if ((r.flag == flag || r.aliases == flag) && r.types.find(letter) != std::string_view::npos)

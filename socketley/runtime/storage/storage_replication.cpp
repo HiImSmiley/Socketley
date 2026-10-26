@@ -200,7 +200,7 @@ bool storage_run::node_change(const change_note& n, cluster_change& out) const
     }
     if (n.event != ev_delete)
         return false;
-    out.kind  = n.version_id.empty() ? 'd' : 'x';
+    out.kind  = out.version_id.empty() ? 'd' : 'x';
     out.stamp = n.stamp;
     return true;
 }

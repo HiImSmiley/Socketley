@@ -142,7 +142,11 @@ else
     # Not wrapped in a subshell: $! would then name the subshell, and killing
     # that leaves nc running -- measured, a counter-proof run read a `v=hello`
     # the abandoned reader collected after the cache was let go again.
-    { echo "k1"; sleep 30; } | timeout 35 nc 127.0.0.1 "$SRV_PORT" > "$outf" 2>/dev/null &
+    wfifo="$SOCKETLEY_TMPD/deadline.in"
+    rm -f "$wfifo"; mkfifo "$wfifo"
+    { echo "k1"; sleep 30; } > "$wfifo" &
+    wpid=$!
+    timeout 35 nc 127.0.0.1 "$SRV_PORT" < "$wfifo" > "$outf" 2>/dev/null &
     ncpid=$!
     start=$(date +%s)
     waited=99
@@ -151,7 +155,9 @@ else
         sleep 0.2
     done
     kill "$ncpid" 2>/dev/null || true
-    wait "$ncpid" 2>/dev/null || true
+    pkill -P "$wpid" 2>/dev/null || true
+    kill "$wpid" 2>/dev/null || true
+    wait "$ncpid" "$wpid" 2>/dev/null || true
     kill -CONT "$FROZEN" 2>/dev/null || true
     FROZEN=""
     got=$(tr -d '\r' < "$outf")

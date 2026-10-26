@@ -253,7 +253,8 @@ if [ "$(code cache_set)" = "0" ] && [ "$(reply cache_get)" = "v" ]; then ok; els
         "set=$(code cache_set) get=[$(reply cache_get)]"
 fi
 
-if [ "$(reply cache_mget)" != "" ] && [ "$(code cache_mset)" = "0" ]; then ok; else
+case "$(reply cache_mget)" in ERR*|"") MGET_OK=0;; *1*2*) MGET_OK=1;; *) MGET_OK=0;; esac
+if [ "$MGET_OK" = 1 ] && [ "$(code cache_mset)" = "0" ]; then ok; else
     bad "mset/mget answer" "mset=$(code cache_mset) mget=[$(reply cache_mget)]"
 fi
 
@@ -263,8 +264,7 @@ fi
 REFUSED=0
 for f in cluster_ps cluster_group cluster_stats cluster_watch; do
     case "$(reply $f)" in
-        ""|unknown*) ;;
-        *) REFUSED=$((REFUSED+1));;
+        "cluster ${f#cluster_} is a "*) [ "$(code $f)" = "1" ] && REFUSED=$((REFUSED+1));;
     esac
 done
 if [ "$REFUSED" -eq 4 ]; then ok; else

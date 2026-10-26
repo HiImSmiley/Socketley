@@ -61,7 +61,7 @@ pid=$(st pid)
 hwm=$(awk '/^VmHWM:/{print int($2/1024)}' "/proc/$pid/status" 2>/dev/null)
 if [ -z "$hwm" ]; then
     bad "the worker's memory can be read" "no /proc/$pid/status"
-elif [ "${SOCKETLEY_CONFIG:-}" = Sanitize ]; then
+elif [ "${SOCKETLEY_CONFIG:-}" = Sanitize ] || nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then
     echo "  SKIP: memory under a sanitizer build keeps every freed piece (high-water ${hwm} MiB)"
 else
     if [ "$hwm" -lt 100 ]; then ok "the worker never held the file (high-water ${hwm} MiB of a 200 MiB file)"

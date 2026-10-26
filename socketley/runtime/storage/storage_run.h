@@ -664,7 +664,6 @@ public:
     uint64_t hash_handoffs() const { return m_hash.submitted(); }
     shard_node& node() { return m_node; }
     file_io& io() { return m_io; }
-    void set_authenticator(authenticator* a) { m_auth = a; }
     // An authenticator the run keeps for as long as it lives, because a
     // request in flight when a stop came is still asking it.
     void adopt_authenticator(std::unique_ptr<authenticator> a)
@@ -720,7 +719,6 @@ public:
     void scrub_found(scrubber::finding f);
     // Reads the id of this node's data, or makes it; blocking, so it runs at open().
     bool load_cluster_id(std::string& err);
-    const std::string& cluster_self() const { return m_cluster_self; }
     // Uploads left open this many seconds are aborted; zero keeps them until they are.
     void set_mpu_expire_secs(uint32_t s)
     {
@@ -853,7 +851,6 @@ public:
     void hook_async_done(uint64_t id, const std::shared_ptr<hook_job>& job);
     std::shared_ptr<char[]> take_hook_buffer();
     void give_hook_buffer(std::shared_ptr<char[]> b);
-    void enter_discard(const std::shared_ptr<conn>& c);
     // Answers a request that is refused before its body was read, after reading
     // and dropping the body when it is small enough, so the client hears the
     // answer and not a reset.
@@ -1603,7 +1600,6 @@ private:
     // low-power encoder; and the render node it is on.
     enum class media_hw : uint8_t { unknown, testing, none, vaapi, vaapi_lp };
     media_hw    m_hw{media_hw::unknown};
-    bool        m_hw_tried_lp{false};
     std::string m_hw_device;
     void media_hw_detect();
     // The streams this shard makes at once, more where renditions are made on a GPU.

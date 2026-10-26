@@ -290,7 +290,8 @@ bool dns_client::send(job& j)
     // A candidate the search list made too long to be a name is passed over.
     while (j.at < j.names.size() && !to_wire(j.names[j.at], wire))
         ++j.at;
-    if (j.at >= j.names.size())
+    // No resolv.conf, as in a bare container, leaves no server to ask, and the modulo below would divide by zero.
+    if (j.at >= j.names.size() || m_cfg.servers.empty())
         return false;
     const endpoint& server = m_cfg.servers[j.server % m_cfg.servers.size()];
     for (question& q : j.qs)

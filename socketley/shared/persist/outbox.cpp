@@ -21,7 +21,6 @@ namespace
 
 // The file is written again empty once nothing in it is owed and it has grown past this.
 constexpr uint64_t rotate_bytes = 1u << 20;
-constexpr size_t record_cap = 8u << 20;
 
 }   // namespace
 
@@ -99,7 +98,8 @@ bool outbox::open(const std::string& dir, std::string_view sub, uint32_t shard, 
     {
         bytes::reader h(std::string_view(text).substr(pos, 8));
         uint32_t len = 0, crc = 0;
-        if (!h.u32(len) || !h.u32(crc) || len > record_cap || text.size() - pos - 8 < len)
+        // Any length append_record wrote is read back; one past the end of the file is a torn tail.
+        if (!h.u32(len) || !h.u32(crc) || text.size() - pos - 8 < len)
             break;
         const std::string_view payload = std::string_view(text).substr(pos + 8, len);
         if (crc::crc32(payload) != crc)

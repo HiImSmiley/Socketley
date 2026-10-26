@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
+#include <unordered_set>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -14,11 +14,9 @@
 
 #include "idp_logic.h"
 #include "../../shared/util/byte_codec.h"
-#include "../../shared/crypto/jws.h"
 #include "../../shared/json/json_doc.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
-#include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/text_list.h"
 
@@ -520,7 +518,7 @@ bool account_store::create(const field_list& fields, std::string& id, std::strin
 size_t account_store::create_many(const std::vector<field_list>& accounts, std::string& why)
 {
     std::vector<std::string> records;
-    std::unordered_map<std::string, bool> names;
+    std::unordered_set<std::string> names;
     for (const auto& fields : accounts)
     {
         std::string one;
@@ -541,7 +539,7 @@ size_t account_store::create_many(const std::vector<field_list>& accounts, std::
                 why += std::string(username) + ": no randomness for an id\n";
                 continue;
             }
-            names[lname] = true;
+            names.insert(lname);
             records.push_back(put_record(id, fields));
         }
     }

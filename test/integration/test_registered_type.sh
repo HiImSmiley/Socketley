@@ -104,7 +104,7 @@ EOF
 # Failed -- which is all the column needs to be measured.
 cat > "$HOME/.config/socketley/types/wide.toml" <<EOF
 name = "a_registered_type_with_a_long_name"
-exec = $WORKER
+exec = "$WORKER"
 manifest_version = 1
 EOF
 

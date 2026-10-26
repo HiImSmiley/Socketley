@@ -10,8 +10,8 @@
 #
 #   negotiation  a client offering h2 by ALPN is given it, one that does not
 #                keeps HTTP/1.1, and a non-entrance proxy offers neither
-#   routing      a stream is routed by its own `:authority`, and two names on
-#                ONE connection reach their two different runtimes
+#   routing      a stream is routed by its own `:authority`, and two names reach
+#                their two different runtimes, each over its own connection
 #   bodies       a POST over a stream reaches the backend whole, with and
 #                without a stated length
 #   framing      an answer ends, so a client reads a complete body and a
@@ -71,6 +71,16 @@ E=$((P+1))
 "$BIN" create server one -p $((P+2)) --http "$T/one" --domain one.example.com -s >/dev/null 2>&1
 "$BIN" create server two -p $((P+3)) --http "$T/two" --domain two.example.com -s >/dev/null 2>&1
 "$BIN" create server three -p $((P+5)) --http "$T/two" --domain three.example.com -s >/dev/null 2>&1
+cat >"$T/echo.lua" <<'LUA'
+local got = {}
+function on_http_body(id, chunk) got[id] = (got[id] or 0) + #chunk end
+function on_http_request(req)
+    local n = got[req.client_id] or #(req.body or ""); got[req.client_id] = nil
+    return { status = 200, body = "len=" .. n }
+end
+function on_disconnect(id) got[id] = nil end
+LUA
+"$BIN" create server echo -p $((P+6)) --lua "$T/echo.lua" --domain echo.example.com -s >/dev/null 2>&1
 "$BIN" create proxy ent -p "$E" --tls --cert "$T/e.pem" --key "$T/e.key" -s >/dev/null 2>&1
 
 # Over the entrance, with the name resolved to it; -k because the certificate is its own.
@@ -101,8 +111,6 @@ expect "and still gets its answer" "$(hc one.example.com /who.txt --http1.1)" "f
 
 # ── routing, which is why the frames are read at all ────────────────────────
 expect "a stream is routed by its own authority" "$(hc two.example.com /who.txt)" "from-two"
-# Both names on ONE connection, which is what a browser does when one certificate covers them: curl reuses the
-# connection for the second URL because the resolve map and the certificate are the same.
 two_on_one=$(curl -sk --noproxy '*' -m 10 \
     --resolve "one.example.com:$E:127.0.0.1" --resolve "two.example.com:$E:127.0.0.1" \
     -w '|%{http_version}' \
@@ -139,6 +147,31 @@ got=$(cat "$T/big.txt" | hc one.example.com /who.txt -X POST --data-binary @- -H
        -o /dev/null -w '%{http_code}/%{http_version}')
 case "$got" in 2*/2|4*/2|5*/2) ok "a body of no stated length too, framed as chunks for the parser ($got)" ;;
                 *) bad "a body of no stated length" "got '$got'" ;; esac
+
+# An empty DATA frame in the middle of a body of no stated length is nothing, and not the chunk that ends it.
+for _ in $(seq 1 40); do [ "$(hc echo.example.com /x)" = "len=0" ] && break; sleep 0.2; done
+got=$(python3 - "$E" <<'PY'
+import socket, ssl, sys, h2.connection, h2.config, h2.events
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+ctx.set_alpn_protocols(["h2"])
+s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5), server_hostname="echo.example.com")
+c = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True)); c.initiate_connection()
+c.send_headers(1, [(":method", "POST"), (":path", "/x"), (":scheme", "https"), (":authority", "echo.example.com")])
+c.send_data(1, b"abc"); c.send_data(1, b""); c.send_data(1, b"def", end_stream=True)
+s.sendall(c.data_to_send())
+body, done = b"", False
+s.settimeout(5)
+while not done:
+    d = s.recv(65536)
+    if not d: break
+    for e in c.receive_data(d):
+        if isinstance(e, h2.events.DataReceived): body += e.data; c.acknowledge_received_data(len(e.data), e.stream_id)
+        if isinstance(e, (h2.events.StreamEnded, h2.events.StreamReset)): done = True
+    s.sendall(c.data_to_send())
+print(body.decode(errors="replace"))
+PY
+)
+expect "an empty DATA frame between two others leaves the body whole" "$got" "len=6"
 
 # ── a complete body, byte for byte ─────────────────────────────────────────
 cp "$T/big.txt" "$T/one/big.txt"
@@ -205,6 +238,7 @@ expect "a proxy with a backend of its own offers no h2, having no authority to r
 # Waited on the stream count, which is the proof the request was counted at all, and only then are the resets
 # read: waiting on the resets themselves would be waiting for the defect.
 r0=$(tally_of h2_resets_out); s0=$(tally_of h2_streams)
+case "$r0" in ''|*[!0-9]*) bad "the entrance reports h2_resets_out" "got '$r0'" ;; *) ok "the entrance reports h2_resets_out" ;; esac
 hc one.example.com /who.txt >/dev/null
 for _ in $(seq 1 60); do [ "$(tally_of h2_streams)" != "$s0" ] && break; sleep 0.2; done
 expect "a completed answer leaves no reset behind" "$(tally_of h2_resets_out)" "$r0"

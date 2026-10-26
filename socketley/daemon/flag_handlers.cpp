@@ -1639,9 +1639,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
         {
             const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
             uint64_t secs = 0;
-            if (v == "never")
-                secs = 0;
-            else if (v.empty() || parse_duration_seconds(v, 365ull * 24 * 3600, secs) != duration_parse::ok)
+            if (v != "never" && (v.empty() || parse_duration_seconds(v, 365ull * 24 * 3600, secs) != duration_parse::ok))
             {
                 std::cout << "--every requires how often the whole directory is walked, as 30s, 10m, 1h or 1d, "
                              "or never\n";
@@ -1697,7 +1695,8 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--issuer"):
         {
             const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
-            if (v.empty() || socketley::idp::url_host(v).empty() || v.find_first_of("?#") != std::string_view::npos)
+            if (v.empty() || socketley::idp::url_host(v).empty() || v.find_first_of("?#") != std::string_view::npos ||
+                (!v.starts_with("https://") && !v.starts_with("http://localhost") && !v.starts_with("http://127.0.0.1")))
             {
                 std::cout << "--issuer requires the https address the provider is reached at, "
                              "such as https://auth.example.com\n";
@@ -2716,10 +2715,5 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
         }
         return parse_proxy_gate_flag(proxy, pa, i);
     }
-    switch (pa.hashes[i])
-    {
-
-        default:
-            return parse_proxy_shared_flags(proxy, pa, i);
-    }
+    return parse_proxy_shared_flags(proxy, pa, i);
 }

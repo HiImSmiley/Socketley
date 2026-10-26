@@ -20,7 +20,6 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/runtime/stats_text.h"
 #include "../../shared/util/byte_codec.h"
-#include "../../shared/util/logging.h"
 
 namespace socketley::mqtt
 {
@@ -56,7 +55,7 @@ constexpr int64_t unreachable_ms = 3000;
 // A shard that answers none of its batches for this long holds publishers at QoS 0 no longer.
 constexpr int64_t stall_ms = 1000;
 // How long a retained topic's last change is remembered, to tell an older one crossing a newer from behind.
-constexpr int64_t stamp_keep_ns = 10'000'000'000;
+constexpr int64_t stamp_keep_us = 10'000'000;
 
 constexpr int64_t claim_patience_ms = 3000;
 
@@ -79,7 +78,7 @@ void put_list(socketley::bytes::writer& w, const std::vector<std::string>& list)
 bool get_list(socketley::bytes::reader& r, std::vector<std::string>& list)
 {
     uint32_t n = 0;
-    if (!r.u32(n) || n > (1u << 24))
+    if (!r.u32(n) || n > (1u << 24) || n > r.left() / 4)
         return false;
     list.resize(n);
     for (auto& s : list)
@@ -90,10 +89,10 @@ bool get_list(socketley::bytes::reader& r, std::vector<std::string>& list)
 
 uint64_t claim_stamp(uint32_t shard)
 {
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::system_clock::now().time_since_epoch())
                         .count();
-    return (static_cast<uint64_t>(ns) << 6) | (shard & 63);
+    return (static_cast<uint64_t>(us) << 6) | (shard & 63);
 }
 
 }   // namespace
@@ -341,7 +340,9 @@ bool mqtt_run::dump_reply(uint64_t cookie, request_status st, std::string_view r
             auto m = std::make_shared<message>();
             if (!r.view(body, 1u << 28) || !message_from(body, *m))
                 return true;
-            m_broker->apply_retained(m->topic, m);
+            // A retained value that came live from another shard meanwhile is newer than this snapshot.
+            if (!m_retained_stamps.contains(m->topic))
+                m_broker->apply_retained(m->topic, m);
         }
         return true;
     }
@@ -611,8 +612,8 @@ void mqtt_run::sweep_claims(int64_t now)
 {
     if (!m_retained_stamps.empty())
     {
-        const uint64_t ns = claim_stamp(0) >> 6;
-        std::erase_if(m_retained_stamps, [&](const auto& kv) { return ns - (kv.second >> 6) > stamp_keep_ns; });
+        const uint64_t us = claim_stamp(0) >> 6;
+        std::erase_if(m_retained_stamps, [&](const auto& kv) { return us - (kv.second >> 6) > stamp_keep_us; });
     }
     std::vector<uint64_t> late;
     for (const auto& [id, pc] : m_claims)

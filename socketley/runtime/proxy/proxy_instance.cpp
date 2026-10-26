@@ -6,7 +6,6 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/runtime/stats_text.h"
-#include "../../shared/cluster/cluster_discovery.h"
 #include "../../shared/lua/lua_context.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/invariants.h"
@@ -22,7 +21,6 @@
 #include <fcntl.h>
 #include <cstring>
 #include <cerrno>
-#include <cstdlib>
 #include <cstddef>
 #include <charconv>
 #include <arpa/inet.h>
@@ -608,7 +606,6 @@ void proxy_instance::add_backend(std::string_view addr)
 void proxy_instance::clear_backends() { m_backends.clear(); }
 void proxy_instance::set_protocol(proxy_protocol p) { m_protocol = p; }
 void proxy_instance::set_strategy(proxy_strategy s) { m_strategy = s; }
-void proxy_instance::set_runtime_manager(runtime_manager* mgr) { runtime_instance::set_runtime_manager(mgr); }
 
 void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
 {
@@ -745,6 +742,7 @@ void proxy_instance::announce_group_nodes()
     if (!m_endpoints)
         return;
 
+    std::unordered_set<std::string> present;
     for (const auto& b : m_backends)
     {
         if (!b.is_group)
@@ -762,13 +760,18 @@ void proxy_instance::announce_group_nodes()
             member_dial(ep, dials);
             for (const auto& dial : dials)
             {
-                if (dial.port != 0 || !m_group_nodes_said.insert(dial.host).second)
+                if (dial.port != 0)
+                    continue;
+                present.insert(dial.host);
+                if (!m_group_nodes_said.insert(dial.host).second)
                     continue;
                 LOG_INFO(("proxy backend " + b.address + " member " + ep.host + ":" +
                           std::to_string(ep.port) + " is reached over " + dial.host).c_str());
             }
         }
     }
+    // A node that left is forgotten, so the set follows the membership and a node that returns is said again.
+    std::erase_if(m_group_nodes_said, [&](const std::string& n) { return !present.contains(n); });
 }
 
 // The declarations of this proxy's backends folded into one table, where one
@@ -820,11 +823,13 @@ void proxy_instance::resolve_group_hosts(bool retry_failed)
     if (!m_endpoints || m_backends.empty())
     {
         m_group_addr.clear();
+        m_group_failed.clear();
         m_group_unresolved = false;
         return;
     }
 
     std::unordered_map<std::string, in_addr> kept;
+    std::unordered_set<std::string> named;
     bool unresolved = false;
 
     for (const auto& b : m_backends)
@@ -845,6 +850,7 @@ void proxy_instance::resolve_group_hosts(bool retry_failed)
             if (inet_pton(AF_INET, ep.host.c_str(), &literal) == 1)
                 continue;
 
+            named.insert(ep.host);
             if (kept.find(ep.host) != kept.end())
                 continue;
 
@@ -886,6 +892,7 @@ void proxy_instance::resolve_group_hosts(bool retry_failed)
     }
 
     m_group_addr.swap(kept);
+    std::erase_if(m_group_failed, [&](const std::string& h) { return !named.contains(h); });
     m_group_unresolved = unresolved;
 
     // A name that did not resolve is work for the sweep, the same way an
@@ -1295,7 +1302,7 @@ void proxy_instance::finish_client_recv_withdraw(proxy_client_connection* conn,
     // backend half gives: the resume fires on a write completion and there may
     // be none left to fire on.  And on the same terms, client_eof included --
     // arming there spins on res=0.
-    if (!client_read_armable(conn) || backend_backpressured(conn))
+    if (!client_read_armable(conn) || backend_backpressured(conn) || conn->connect_pending)
         return;
     if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
         close_pair(fd, conn->ex.backend_fd);
@@ -1520,8 +1527,7 @@ bool proxy_instance::resolve_backend(backend_info& b)
         {
             // Hostname — resolve via getaddrinfo at setup time to avoid blocking on hot path
             char port_str[8];
-            auto [pe, pec] = std::to_chars(port_str, port_str + sizeof(port_str), b.resolved_port);
-            *pe = '\0';
+            *std::to_chars(port_str, port_str + sizeof(port_str), b.resolved_port).ptr = '\0';
 
             struct addrinfo hints{};
             hints.ai_family = AF_INET;
@@ -1890,7 +1896,7 @@ bool proxy_instance::setup(event_loop& loop)
         // And HTTP/3 beside it, on the same port over UDP; its own certificate context is the endpoint's, because
         // QUIC's TLS is not this one's record layer.
         if (h3_offered())
-            h3_open(static_cast<uint16_t>(get_port()));
+            h3_open(effective_port());
     }
 
     // The backend-TLS options apply to every backend at once, and none of them
@@ -2221,7 +2227,8 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         for (int i = 0; i < MAX_FDS; i++)
         {
             auto* conn = m_client_slots[i];
-            if (!conn) continue;
+            // A TLS queue holds plaintext, which the raw socket must never carry.
+            if (!conn || conn->ssl) continue;
             while (!conn->write_queue.empty())
             {
                 const auto& msg = conn->write_queue.front();
@@ -2266,6 +2273,9 @@ void proxy_instance::teardown(event_loop& /*loop*/)
     m_client_count = 0;
     m_backend_count = 0;
     m_parked_count = 0;
+
+    // After the streams are released, so no stream's connection is told of its end twice.
+    h3_stop();
 
     // Close pooled backend connections and free their sessions, before start()
     // can build a new context -- and acquire_pooled_backend checks tls_owner
@@ -3230,9 +3240,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     bool is_multishot_recv = is_multishot_recv_op(req->type);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
-    if (!is_multishot_recv)
-        conn->read_pending = false;
-    else if (!multishot_more)
+    if (!multishot_more)
         conn->read_pending = false;
 
     // Something else ended the read first, so the cancel this flag stands for
@@ -3458,10 +3466,15 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         // If async connect is pending, buffer incoming data (with limit)
         if (SOCKETLEY_UNLIKELY(conn->connect_pending))
         {
-            if (conn->ex.saved_request.size() < read_buffer_bytes())
-                conn->ex.saved_request.append(read_data, data_len);
+            conn->ex.saved_request.append(read_data, data_len);
             if (is_provided)
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            // A multishot recv would go on delivering past the bound, so it is taken back and handle_connect re-arms.
+            if (conn->read_pending && !conn->recv_withdrawing &&
+                conn->ex.saved_request.size() >= read_buffer_bytes() &&
+                is_multishot_recv_op(conn->read_req.type) &&
+                m_loop->submit_cancel_request(&conn->read_req))
+                conn->recv_withdrawing = true;
             // Pause reads if too much data buffered, resume in handle_connect
             if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending &&
                 conn->ex.saved_request.size() < read_buffer_bytes())
@@ -3589,6 +3602,10 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     // sent in this process meanwhile.
     if (SOCKETLEY_UNLIKELY(conn->connect_pending))
     {
+        // A multishot recv would go on delivering past the bound, so it is taken back and handle_connect re-arms.
+        if (conn->read_pending && !conn->recv_withdrawing && conn->partial.size() >= read_buffer_bytes() &&
+            is_multishot_recv_op(conn->read_req.type) && m_loop->submit_cancel_request(&conn->read_req))
+            conn->recv_withdrawing = true;
         if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending && conn->partial.size() < read_buffer_bytes())
             if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
             {
@@ -4038,9 +4055,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     bool is_multishot_recv = is_multishot_recv_op(req->type);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
-    if (!is_multishot_recv)
-        conn->read_pending = false;
-    else if (!multishot_more)
+    if (!multishot_more)
         conn->read_pending = false;
 
     // Something else ended the read first, so the cancel this flag stands for
@@ -4616,7 +4631,7 @@ bool proxy_instance::append_backend_host_header(std::string& out,
     out += host;
     out += ':';
     char port_buf[8];
-    auto [pend, pec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
+    const char* const pend = std::to_chars(port_buf, port_buf + sizeof(port_buf), port).ptr;
     out.append(port_buf, static_cast<size_t>(pend - port_buf));
     out += "\r\n";
     return true;
@@ -5248,12 +5263,12 @@ bool proxy_instance::enforce_declared_route(proxy_client_connection* conn,
 // request before anything has been decided about where it is going.
 #ifndef SOCKETLEY_NO_LUA
 
-// A field name a filter supplied must be a tchar and nothing else, because
-// filter input is frequently derived from the request and "the script wrote
-// it" is not evidence that the peer did not.
-static bool filter_token_ok(std::string_view s)
+// ASCII-only, because `c | 0x20` also turns '_' into DEL and '^' into '~'.
+static void filter_lower_ascii(std::string& s)
 {
-    return http_field_name_ok(s);
+    for (auto& c : s)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c | 0x20);
 }
 
 // A field value a filter supplied, where the bytes that end a line and a
@@ -5303,8 +5318,7 @@ static void filter_collect_header(sol::table& out, std::string_view line)
     if (colon == std::string_view::npos || colon == 0)
         return;   // parse_http_request_line has already refused these
     std::string name(line.substr(0, colon));
-    for (auto& c : name)
-        c = static_cast<char>(c | 0x20);
+    filter_lower_ascii(name);
     const std::string_view value = http_trim_ows(line.substr(colon + 1));
 
     // Repeats are combined in the order sent, as RFC 9110 Section 5.2 defines,
@@ -5461,9 +5475,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                         continue;
                     }
                     std::string name = entry.as<std::string>();
-                    for (auto& c : name)
-                        c = static_cast<char>(c | 0x20);
-                    if (!filter_token_ok(name))
+                    filter_lower_ascii(name);
+                    if (!http_field_name_ok(name))
                     {
                         fprintf(stderr, "%s filter remove_headers: `%s` is not a field "
                                         "name\n",
@@ -5504,9 +5517,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                 }
                 std::string name = key.as<std::string>();
                 std::string value = val.as<std::string>();
-                for (auto& c : name)
-                    c = static_cast<char>(c | 0x20);
-                if (!filter_token_ok(name) || !filter_value_ok(value))
+                filter_lower_ascii(name);
+                if (!http_field_name_ok(name) || !filter_value_ok(value))
                 {
                     fprintf(stderr, "%s filter set_headers: refused a header this "
                                     "proxy will not put on the wire\n",
@@ -5584,9 +5596,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                 const std::string name = key.as<std::string>();
                 const std::string value = val.as<std::string>();
                 std::string lower = name;
-                for (auto& c : lower)
-                    c = static_cast<char>(c | 0x20);
-                if (!filter_token_ok(name) || !filter_value_ok(value))
+                filter_lower_ascii(lower);
+                if (!http_field_name_ok(name) || !filter_value_ok(value))
                 {
                     fprintf(stderr, "%s filter answer headers: refused a header this "
                                     "proxy will not put on the wire\n",
@@ -5664,13 +5675,19 @@ void proxy_instance::entrance_load(std::chrono::milliseconds min_gap)
 
     std::string text;
     if (stamp.exists())
-        if (FILE* f = std::fopen(path.c_str(), "re"))
+    {
+        FILE* f = std::fopen(path.c_str(), "re");
+        if (!f)
         {
-            char buf[8192];
-            for (size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;)
-                text.append(buf, n);
-            std::fclose(f);
+            // An unreadable file keeps the tables in use and is tried again at the next call.
+            m_entrance_stamp.reset();
+            return;
         }
+        char buf[8192];
+        for (size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;)
+            text.append(buf, n);
+        std::fclose(f);
+    }
 
     std::unordered_map<std::string, entrance_route, string_hash, string_equal> exact;
     std::vector<std::pair<std::string, entrance_route>> wild;
@@ -6595,10 +6612,9 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx,
     auto& pool = m_backend_pool[backend_idx];
     if (pool.size() >= MAX_POOL_PER_BACKEND)
     {
-        // Pool full — close the oldest (swap with last, then pop)
+        // Pool full — close the oldest and keep the rest in push order
         discard_pooled(pool.front(), true);
-        pool.front() = std::move(pool.back());
-        pool.pop_back();
+        pool.erase(pool.begin());
     }
 
     // The session moves here, backend_pool_eligible() having already
@@ -6827,7 +6843,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         // on the event-loop thread froze the whole daemon for the resolver's
         // timeout -- so recovery is bounded by the sweep interval instead,
         // which is the right way round for a proxy.
-        const_cast<proxy_instance*>(this)->arm_idle_sweep();
+        arm_idle_sweep();
         return false;
     }
 
@@ -8600,10 +8616,13 @@ void proxy_instance::note_backend_selected(size_t idx)
         return;
 
     auto& cb = m_circuit_breakers[idx];
-    if (SOCKETLEY_UNLIKELY(cb.current == circuit_breaker::half_open) && !cb.probe_in_flight)
+    const auto now = std::chrono::steady_clock::now();
+    // A probe whose window has run out is replaced, or every selection after it would pass as the probe.
+    if (SOCKETLEY_UNLIKELY(cb.current == circuit_breaker::half_open) &&
+        (!cb.probe_in_flight || now - cb.probe_started >= std::chrono::seconds(m_mesh.circuit_timeout)))
     {
         cb.probe_in_flight = true;
-        cb.probe_started = std::chrono::steady_clock::now();
+        cb.probe_started = now;
     }
 }
 
@@ -9698,10 +9717,13 @@ void proxy_instance::note_group_selected(std::string_view host, uint16_t port)
         return;
 
     auto& cb = it->second;
-    if (SOCKETLEY_UNLIKELY(cb.current == circuit_breaker::half_open) && !cb.probe_in_flight)
+    const auto now = std::chrono::steady_clock::now();
+    // A probe whose window has run out is replaced, or every selection after it would pass as the probe.
+    if (SOCKETLEY_UNLIKELY(cb.current == circuit_breaker::half_open) &&
+        (!cb.probe_in_flight || now - cb.probe_started >= std::chrono::seconds(m_mesh.circuit_timeout)))
     {
         cb.probe_in_flight = true;
-        cb.probe_started = std::chrono::steady_clock::now();
+        cb.probe_started = now;
     }
 }
 
@@ -10393,7 +10415,7 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
     hdr_len += status.size();
     std::memcpy(hdr_buf + hdr_len, "\r\nContent-Length: ", 18);
     hdr_len += 18;
-    auto [clen_end, clen_ec] = std::to_chars(hdr_buf + hdr_len, hdr_buf + sizeof(hdr_buf), body.size());
+    const char* const clen_end = std::to_chars(hdr_buf + hdr_len, hdr_buf + sizeof(hdr_buf), body.size()).ptr;
     hdr_len = static_cast<size_t>(clen_end - hdr_buf);
     std::memcpy(hdr_buf + hdr_len, "\r\nConnection: close\r\n\r\n", 23);
     hdr_len += 23;
@@ -11017,6 +11039,8 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     }
     conn->send_retries = 0;
 
+    SKL_TRACE_ADD(conn, bytes_written, static_cast<unsigned long long>(cqe->res));
+
     // Short write handling: resubmit remaining bytes
     if (conn->write_batch_count > 0)
     {
@@ -11038,7 +11062,6 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         }
     }
 
-    SKL_TRACE_ADD(conn, bytes_written, (unsigned long long)(cqe->res > 0 ? cqe->res : 0));
     SKL_TRACE_ADD(conn, writes, 1);
 
     // Full write completed — release batch

@@ -90,7 +90,6 @@ public:
 
     // The records encoded since the last call.
     std::string take_output();
-    size_t      pending_output() const;
 
     // Nothing more is needed from the object: LIMIT is reached, the ScanRange is passed, or the query failed.
     bool done() const;

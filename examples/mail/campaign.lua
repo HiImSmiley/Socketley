@@ -19,6 +19,7 @@ end
 -- Each link to the shop says it came from this campaign; any other is left as it is.
 function on_link(url, r)
     if url:find("^https://shop%.example%.com/") then
-        return url .. (url:find("?", 1, true) and "&" or "?") .. "utm_source=mail&utm_campaign=autumn"
+        local base, frag = url:match("^([^#]*)(#?.*)$")
+        return base .. (base:find("?", 1, true) and "&" or "?") .. "utm_source=mail&utm_campaign=autumn" .. frag
     end
 end

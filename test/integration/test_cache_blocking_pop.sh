@@ -222,7 +222,7 @@ case "$OUT" in *"connection to wait on"*) ok "and says what is missing" ;;
 echo "--- 7. sharded is refused by name ---"
 "$BIN" create cache bp_s -p "$PS" --shards 4 --cluster -s >/dev/null 2>&1
 for _ in $(seq 1 80); do
-    [ "$(ss -ltn 2>/dev/null | awk -v a=$((PS+1)) -v d=$((PS+4)) -F: '{n=$NF+0; if(n>=a&&n<=d) c++} END{print c+0}')" -ge 4 ] && break
+    [ "$(ss -ltn 2>/dev/null | awk -v a=$((PS+1)) -v d=$((PS+4)) '{k=split($4,p,":"); n=p[k]+0; if(n>=a&&n<=d) c++} END{print c+0}')" -ge 4 ] && break
     sleep 0.2
 done
 got=$(python3 - "$PS" <<'X'

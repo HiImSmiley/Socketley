@@ -79,8 +79,8 @@ expect "a missing key is 404 with its XML" "$(h2 "$U/htwo/none" | grep -o '<Code
 expect "a listing names both" "$(h2 "$U/htwo?list-type=2" | grep -o '<Key>[^<]*' | tr '\n' ' ')" "<Key>big <Key>s.txt "
 expect "the web interface's page is served" "$(h2 "$U/~ui/" | grep -c '<html')" 1
 expect "a folder's ZIP streams with its length" \
-    "$(h2 -o "$T/f.zip" -w '%{size_download}' "$U/~dav/htwo/?zip"; echo; python3 -c 'import zipfile,sys; print(sorted(zipfile.ZipFile(sys.argv[1]).namelist()))' "$T/f.zip")" \
-    "$(stat -c %s "$T/f.zip" 2>/dev/null)
+    "$(h2 -D "$T/f.hdr" -o "$T/f.zip" -w '%{size_download}' "$U/~dav/htwo/?zip"; echo; python3 -c 'import zipfile,sys; print(sorted(zipfile.ZipFile(sys.argv[1]).namelist()))' "$T/f.zip")" \
+    "$(tr -d '\r' < "$T/f.hdr" | awk 'tolower($1)=="content-length:" {print $2}')
 ['big', 's.txt']"
 expect "twenty requests in parallel go over one connection" \
     "$(h2 -Z --parallel-max 20 $(for _ in $(seq 20); do echo "$U/htwo/s.txt -o /dev/null"; done) -w '%{num_connects}\n' | sort | uniq -c | tr -s ' ' | tr '\n' ' ')" \

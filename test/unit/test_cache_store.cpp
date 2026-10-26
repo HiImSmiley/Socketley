@@ -955,8 +955,6 @@ TEST_CASE("cache_store new methods")
     // the one no bool could carry.
     SUBCASE("expire_in answers about the key, not about the call")
     {
-        int64_t unused = 0;
-        (void)unused;
         CHECK(store.expire_in("nosuch", 600, false) == cache_store::expire_result::no_such_key);
 
         store.set("a", "v");
@@ -1394,7 +1392,7 @@ TEST_CASE("cache_store scan restricted to one type")
 static std::string store_value_of(const cache_store& st, std::string_view key)
 {
     std::string out;
-    const_cast<cache_store&>(st).get(key, out);
+    st.get(key, out);
     return out;
 }
 
@@ -3260,7 +3258,6 @@ TEST_CASE("a key copied, renamed or stored is charged while it is there and give
     cache_store store;
     REQUIRE(store.set("base", std::string(5000, 'b')));
     const size_t base = store.get_memory_used();
-    std::string out;
 
     auto fill = [&](std::string_view key, int type) {
         for (int i = 0; i < 40; ++i)
@@ -3626,8 +3623,9 @@ TEST_CASE("every change to a collection is given back exactly when the key goes"
                     REQUIRE(store.lset("l", i % 60, std::string((i * 37) % 250, 'x')) == 0);
                 CHECK(store.lrem("l", 2, std::string((37 * 7) % 250, 'x')) >= 0);
                 CHECK(store.lrem("l", -3, std::string(len, 'a')) >= 0);
+                REQUIRE(store.rpush("l", std::string(len, 'b')));
                 for (int i = 0; i < 20; ++i)
-                    CHECK(store.linsert("l", i % 2 == 0, std::string(len, 'b'), std::string(i * 9, 'i')) != 0);
+                    CHECK(store.linsert("l", i % 2 == 0, std::string(len, 'b'), std::string(i * 9, 'i')) > 0);
                 REQUIRE(store.del("l"));
                 CHECK(store.get_memory_used() == base);
 
@@ -3829,7 +3827,7 @@ TEST_CASE("stream_log agrees with a model through appends, deletions and trims")
                 // Whatever went is the oldest `gone`, never more than was asked.
                 CHECK(gone <= (model.size() > t.maxlen ? model.size() - t.maxlen : 0));
                 for (uint64_t i = 0; i < gone; ++i) model.erase(model.begin());
-                if (!t.approx && !t.limit) CHECK(model.size() <= std::max<uint64_t>(t.maxlen, 0));
+                if (!t.approx && !t.limit) CHECK(model.size() <= t.maxlen);
             }
             else if (op < 92 && !model.empty())
             {
@@ -3951,7 +3949,7 @@ TEST_CASE("a group's pending entries agree with a model through deliveries, clai
     stream_log::group* g = s.find_group("g");
     REQUIRE(g);
 
-    struct pend { std::string owner; int64_t when; uint64_t count; };
+    struct pend { std::string owner; uint64_t count; };
     std::map<stream_id, pend> model;
     std::set<std::string> consumers;
     const auto consumer = [&](const std::string& n) {
@@ -3968,7 +3966,7 @@ TEST_CASE("a group's pending entries agree with a model through deliveries, clai
         {
             stream_log::nack& n = s.deliver(*g, id, *consumer(who), step);
             CHECK(n.count == 1);
-            model[id] = { who, step, 1 };
+            model[id] = { who, 1 };
         }
         else if (op < 6)
         {
@@ -4000,7 +3998,7 @@ TEST_CASE("a group's pending entries agree with a model through deliveries, clai
             stream_log::nack& n = s.force_nack(*g, id, 5);
             if (!model.count(id)) { CHECK(n.count == 1); CHECK(n.delivery_ms == 5); }
             s.move_nack(id, n, *consumer(who));
-            model[id] = { who, n.delivery_ms, n.count };
+            model[id] = { who, n.count };
         }
 
         if (step % 1000 == 0)
@@ -4129,8 +4127,9 @@ TEST_CASE("a stream survives save and load, and a dump names it as records")
     close(fd);
     REQUIRE(store.save(path));
     cache_store back;
-    REQUIRE(back.load(path));
+    const bool loaded = back.load(path);
     unlink(path);
+    REQUIRE(loaded);
     REQUIRE(back.stream_get("s"));
     CHECK(serialized(*back.stream_get("s")) == serialized(*store.stream_get("s")));
     CHECK(back.type("empty") == "stream");
@@ -4207,7 +4206,14 @@ TEST_CASE("a stream write refused for room leaves the stream as it was")
     store.set_max_memory(store.get_memory_used() + 64);
     size_t refused = 0;
     for (uint64_t i = 51; i <= 400; ++i)
-        if (!store_xadd(store, "s", { i, 0 }, { "f", std::string(100, 'z') })) ++refused;
+    {
+        const std::string snap = serialized(*store.stream_get("s"));
+        if (!store_xadd(store, "s", { i, 0 }, { "f", std::string(100, 'z') }))
+        {
+            ++refused;
+            CHECK(serialized(*store.stream_get("s")) == snap);
+        }
+    }
     CHECK(refused > 0);
     CHECK(store.get_memory_used() <= store.get_max_memory());
     CHECK(serialized(*store.stream_get("s")).size() >= before.size());
@@ -4245,6 +4251,7 @@ TEST_CASE("cache_store keys and scan leave out a key past its deadline before th
 TEST_CASE("cache_store load refuses a dump cut inside a key's header")
 {
     const std::string path = "/tmp/socketley-unit-cut-" + std::to_string(::getpid()) + ".bin";
+    struct remover { const std::string& p; ~remover() { ::unlink(p.c_str()); } } remove_at_exit{path};
     {
         cache_store src;
         src.set("first", "1");
@@ -4265,7 +4272,6 @@ TEST_CASE("cache_store load refuses a dump cut inside a key's header")
     }
     cache_store dst;
     CHECK_FALSE(dst.load(path));
-    ::unlink(path.c_str());
 }
 
 TEST_CASE("LREM removes what a list of the same elements would lose, packed or not, from either end")

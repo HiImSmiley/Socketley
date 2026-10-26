@@ -241,9 +241,11 @@ check("paho: a will is sent when its socket is cut", [m[1] for m in sb.msgs], [b
 s.loop_stop(); s.disconnect()
 p.loop_stop(); p.disconnect()
 PY
+    paho_out=$(python3 "$T/paho_check.py" "$P" "$PW" "$PT" "$T" 2>&1); paho_rc=$?
     while IFS= read -r l; do
         case "$l" in ok\ *) pass ;; bad\ *) fail "${l#bad }" ;; *) echo "  $l" ;; esac
-    done < <(python3 "$T/paho_check.py" "$P" "$PW" "$PT" "$T" 2>&1)
+    done <<<"$paho_out"
+    [ "$paho_rc" -eq 0 ] || fail "paho_check.py exited $paho_rc"
 else
     skip "paho-mqtt is not importable"
 fi

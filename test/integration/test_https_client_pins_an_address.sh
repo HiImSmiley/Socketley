@@ -99,9 +99,12 @@ post() { curl -s -m 20 -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -X POST -o "$T/
 with_hook "https://127.0.0.1:$GOOD/hook"
 expect "an address in the URL is matched against the certificate's IP SAN" "$(post) $(cat "$T/good.count" 2>/dev/null)" "204 1"
 
+# The refusal means something only if the wrong hook is up and presents its certificate.
+expect "the hook with the certificate for another address is up" \
+    "$(openssl s_client -connect "127.0.0.1:$WRONG" </dev/null 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | grep -c '127\.0\.0\.1')" "1"
 with_hook "https://127.0.0.1:$WRONG/hook"
 expect "a certificate for another address is refused, its common name notwithstanding" \
-    "$(post) $(cat "$T/wrong.count" 2>/dev/null || echo 0)" "502 0"
+    "$(post) $(cat "$T/wrong.count" 2>/dev/null)" "502 "
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

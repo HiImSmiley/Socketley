@@ -165,7 +165,6 @@ public:
     explicit oidc_verifier(federation_oidc cfg) : m_cfg(std::move(cfg)), m_jwks(m_cfg.jwks_path) {}
 
     bool verify(std::string_view token, int64_t now, oidc_identity& out, std::string& why);
-    const federation_oidc& config() const { return m_cfg; }
 
 private:
     federation_oidc m_cfg;

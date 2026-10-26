@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <utility>
 
 using socketley::json::jvalue;
@@ -24,12 +23,6 @@ namespace
 {
 
 // ─── Matching ───────────────────────────────────────────────────────────────
-
-// IAM's StringLike: * any run of characters, ? one.
-bool glob(std::string_view pat, std::string_view text)
-{
-    return socketley::iam_wild_match(pat, text);
-}
 
 std::string lowered(std::string_view in)
 {
@@ -470,7 +463,7 @@ struct compiler
             const std::string_view bpart = rv.substr(0, rv.find('/'));
             if (bpart.find_first_of("*?") != std::string_view::npos)
             {
-                if (!glob(bpart, bucket))
+                if (!wild_match(bpart, bucket, false))
                     return fail("Policy has invalid resource: " + r + " does not cover this bucket");
                 if (bpart.size() == rv.size())
                 {
@@ -505,7 +498,6 @@ struct compiler
         return true;
     }
 
-    bool parse_cidr(std::string_view text, bucket_policy::cidr& c) { return parse_cidr_text(text, c); }
 
     // The one key an operator takes here, compared without case as IAM compares condition keys.
     bool only_key(const jvalue& block, std::string_view op, std::string_view key, const jvalue*& val)
@@ -656,7 +648,7 @@ struct compiler
                 else if (c.o == cond::op::ip || c.o == cond::op::not_ip)
                 {
                     bucket_policy::cidr cc;
-                    if (c.key != "aws:sourceip" || !parse_cidr(t, cc))
+                    if (c.key != "aws:sourceip" || !parse_cidr_text(t, cc))
                         return fail("Invalid IP address or CIDR in " + key_text + ": " + t);
                     c.cidrs.push_back(cc);
                 }
@@ -699,7 +691,7 @@ struct compiler
                 for (const std::string& t : list)
                 {
                     bucket_policy::cidr c;
-                    if (!parse_cidr(t, c))
+                    if (!parse_cidr_text(t, c))
                         return fail("Invalid IP address or CIDR in aws:SourceIp: " + t);
                     into.push_back(c);
                 }
@@ -1245,16 +1237,6 @@ bool bucket_policy::allows_iam() const
 namespace
 {
 
-bool equal_ci(std::string_view a, std::string_view b)
-{
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); ++i)
-        if (ascii::lower(a[i]) != ascii::lower(b[i]))
-            return false;
-    return true;
-}
-
 // Whether one value of the request matches one of the condition's, before the operator's negation.
 bool matches_one(const bucket_policy::condition& c, std::string_view v)
 {
@@ -1268,17 +1250,17 @@ bool matches_one(const bucket_policy::condition& c, std::string_view v)
             return false;
         case op::str_eq_ci: case op::str_ne_ci:
             for (const std::string& w : c.values)
-                if (equal_ci(w, v))
+                if (ascii::iequals(w, v))
                     return true;
             return false;
         case op::str_like: case op::str_not_like:
             for (const std::string& w : c.values)
-                if (glob(w, v))
+                if (wild_match(w, v, false))
                     return true;
             return false;
         case op::boolean:
             for (const std::string& w : c.values)
-                if (equal_ci(w, v))
+                if (ascii::iequals(w, v))
                     return true;
             return false;
         default:
@@ -1319,7 +1301,8 @@ bool matches_one(const bucket_policy::condition& c, std::string_view v)
 bool negated(bucket_policy::condition::op o)
 {
     using op = bucket_policy::condition::op;
-    return o == op::str_ne || o == op::str_ne_ci || o == op::str_not_like || o == op::num_ne || o == op::date_ne;
+    return o == op::str_ne || o == op::str_ne_ci || o == op::str_not_like || o == op::num_ne || o == op::date_ne ||
+           o == op::not_ip;
 }
 
 }   // namespace
@@ -1338,7 +1321,10 @@ bool bucket_policy::conditions_hold(const statement& s, const policy_request& r)
         if (c.o == condition::op::null)
         {
             // Null: true asks that the key be absent, false that it be there.
-            if ((c.values.front() == "true") == present)
+            bool holds = false;
+            for (const std::string& w : c.values)
+                holds = holds || (w == "true") != present;
+            if (!holds)
                 return false;
             continue;
         }

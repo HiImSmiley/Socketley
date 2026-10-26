@@ -130,7 +130,9 @@ EOF
     CLEAN=$(grep -c '(clean stop)' "$SOCKETLEY_DLOG" 2>/dev/null); CLEAN=${CLEAN:-0}
     [ "$CLEAN" -ge "$r" ] || bad "round $r: log" "$CLEAN starts logged a clean stop after $r stops"
 
-    MISSING=$(python3 - "$PORT" "$ACKED" <<'EOF'
+    # Each round's list ends without a newline, so one is put after each, or two keys would read as one.
+    for f in "$SOCKETLEY_TMPD"/acked.[0-9]*; do cat "$f"; echo; done > "$SOCKETLEY_TMPD/acked.all" 2>/dev/null
+    MISSING=$(python3 - "$PORT" "$SOCKETLEY_TMPD/acked.all" <<'EOF'
 import http.client, sys
 c = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=10)
 gone = 0

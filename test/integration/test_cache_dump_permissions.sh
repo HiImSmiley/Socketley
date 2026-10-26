@@ -87,7 +87,7 @@ fi
 
 # ── 2. a second uid, if this machine has one to lend ────────────────────────
 if sudo -n true 2>/dev/null && id -u nobody >/dev/null 2>&1; then
-    OUT=$(sudo -n -u nobody sh -c "cat '$DUMP'" 2>&1 | strings 2>/dev/null || true)
+    OUT=$(sudo -n -u nobody sh -c "cat '$DUMP'" 2>&1 | grep -aF -- "$VAL" || true)
     case "$OUT" in
         *"$VAL"*)
             fail "another uid cannot read what was cached" \

@@ -116,10 +116,12 @@ void outside_paths(const runtime_file& r, std::set<std::string>& take, std::set<
             const size_t comma = rest.find(',');
             std::string_view one = rest.substr(0, comma);
             rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            if (one.find("://") != std::string_view::npos)
+                continue;
             // A user and a file of passwords, "name:/path".
             if (const size_t at = one.find(":/"); at != std::string_view::npos && !one.starts_with("/"))
                 one = one.substr(at + 1);
-            if (!one.starts_with("/") || one.find("://") != std::string_view::npos)
+            if (!one.starts_with("/"))
                 continue;
             std::error_code ec;
             const fs::path p = fs::path(one).lexically_normal();
@@ -177,7 +179,7 @@ bool add_tree(writer_job& j, const fs::path& p, const std::function<bool(const f
     };
     if (!one(p))
         return false;
-    if (!fs::is_directory(fs::symlink_status(p, ec)))
+    if (!fs::is_directory(p, ec))
         return true;
     for (auto it = fs::recursive_directory_iterator(p, fs::directory_options::none, ec); !ec && it != fs::end(it);
          it.increment(ec))
@@ -414,7 +416,7 @@ int cli_export_full(int argc, char** argv)
     // backup stands in for them.
     const auto skip_state = [&](const fs::path& p) {
         const std::string name = p.filename().string();
-        if (under(p, scratch) || name == ".history" || name.ends_with(".before-restore") || name.starts_with(".export-") ||
+        if (p == partial || under(p, scratch) || name == ".history" || name.ends_with(".before-restore") || name.starts_with(".export-") ||
             name.ends_with(".restore-tmp"))
             return true;
         for (const auto& d : db_backed)
@@ -517,6 +519,12 @@ int cli_restore(int argc, char** argv)
     }
     const bool root_user = ::geteuid() == 0;
     uint64_t files = 0, bytes = 0;
+    // A directory takes its recorded mode once everything under it is written, deepest first.
+    std::vector<std::pair<fs::path, mode_t>> dir_modes;
+    const auto finish_dirs = [&]() {
+        for (auto d = dir_modes.rbegin(); d != dir_modes.rend(); ++d)
+            if (::chmod(d->first.c_str(), d->second) != 0) {}
+    };
     for (;;)
     {
         const auto st = tar.next(e, why);
@@ -536,6 +544,29 @@ int cli_restore(int argc, char** argv)
             std::cout << "restore: the archive names " << target.string() << ", outside what its manifest says it holds\n";
             return 2;
         }
+        // A link made by this archive must not carry a later entry out of the root it is under.
+        const fs::path& root_of = *std::find_if(roots.begin(), roots.end(), [&](const fs::path& r) { return under(target, r); });
+        fs::path walked = root_of;
+        bool through_link = false;
+        const fs::path base = (e.type == '5' ? target : target.parent_path()).lexically_normal();
+        const fs::path below = under(base, root_of) ? base.lexically_relative(root_of.lexically_normal()) : fs::path();
+        for (const auto& part : below)
+        {
+            if (part == "." || part.empty())
+                continue;
+            walked /= part;
+            struct stat ls{};
+            if (::lstat(walked.c_str(), &ls) == 0 && S_ISLNK(ls.st_mode))
+            {
+                through_link = true;
+                break;
+            }
+        }
+        if (through_link)
+        {
+            std::cout << "restore: " << target.string() << " lies behind a symlink, which an archive may not write through\n";
+            return 2;
+        }
         uid_t uid = e.uid;
         gid_t gid = e.gid;
         if (const passwd* pw = e.uname.empty() ? nullptr : ::getpwnam(e.uname.c_str()))
@@ -545,8 +576,9 @@ int cli_restore(int argc, char** argv)
         if (e.type == '5')
         {
             fs::create_directories(target, ec);
-            if (::chmod(target.c_str(), e.mode) != 0) {}
+            if (::chmod(target.c_str(), e.mode | 0700) != 0) {}
             if (root_user && ::lchown(target.c_str(), uid, gid) != 0) {}
+            dir_modes.emplace_back(target, static_cast<mode_t>(e.mode));
             continue;
         }
         fs::create_directories(target.parent_path(), ec);
@@ -607,6 +639,7 @@ int cli_restore(int argc, char** argv)
         ++files;
         bytes += e.size;
     }
+    finish_dirs();
     std::cout << "restored " << files << " files, " << mib(bytes) << ", from " << socketley::json::string_of(manifest, "host")
               << " of " << socketley::json::string_of(manifest, "created")
               << "; start the daemon (systemctl start socketley) and its runtimes come back as they were\n";

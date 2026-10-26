@@ -1240,9 +1240,13 @@ TEST_CASE("under loss, delay, asymmetric cuts, kills and reboots no runtime ever
                 static_cast<unsigned long long>(moves), static_cast<unsigned long long>(kills),
                 static_cast<unsigned long long>(cuts), static_cast<unsigned long long>(restores));
     // A sweep that never cut, killed or installed a snapshot would be green about nothing.
-    CHECK(kills > 100);
-    CHECK(cuts > 100);
-    CHECK(restores > 0);
+    // One seed is a look at a failure and is not held to the totals of the sweep.
+    if (!only)
+    {
+        CHECK(kills > 100);
+        CHECK(cuts > 100);
+        CHECK(restores > 0);
+    }
 }
 
 // ─── a cache: one primary, followers that copy it, and a promotion when its node is lost ───
@@ -1658,6 +1662,7 @@ TEST_CASE("a lease that had lapsed is used only once the node has applied what t
     cl::brain b(2, "n2", t);
     cl::output out;
     b.tick(10000, following(1, 5), out);
+    REQUIRE(out.frames.size() == 1);
     b.on_lease_grant(1, out.frames[0].nonce, 40, 10100, following(1, 5));
     // The lease is back but the log behind it is not: the replicas may have moved while this node was away.
     CHECK_FALSE(b.serving(10100));
@@ -1879,6 +1884,7 @@ TEST_CASE("a copy of a newer epoch outranks a longer copy of an older one when a
     c.says  = {{2, db(20, 5, 500, true)}, {3, db(30, 5, 40)}};
     c.until = {{2, 20000}};
     c.run_to(20000 + t.down_after_ms + 500);
+    REQUIRE(!c.proposals.empty());
     const cl::command& p = c.proposals.back().second;
     REQUIRE(p.op == cl::op::promote);
     CHECK(p.node == 3);

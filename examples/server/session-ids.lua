@@ -25,7 +25,10 @@ local function new_session_id()
     return string.format("%x-%04x-%x", os.time(), math.random(0, 0xffff), seq)
 end
 
-math.randomseed(os.time())
+local urandom = io.open("/dev/urandom", "rb")
+local entropy = urandom and urandom:read(4)
+if urandom then urandom:close() end
+math.randomseed(os.time() + (entropy and (entropy:byte(1) * 16777216 + entropy:byte(2) * 65536 + entropy:byte(3) * 256 + entropy:byte(4)) or 0))
 
 function on_connect(client_id)
     session_ids[client_id] = new_session_id()

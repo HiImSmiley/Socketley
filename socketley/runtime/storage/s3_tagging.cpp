@@ -32,7 +32,8 @@ bool allowed(uint32_t cp)
     }
     return cp > 0x9F && cp != 0xAD && !(cp >= 0x200B && cp <= 0x200F) && !(cp >= 0x202A && cp <= 0x202E) &&
            !(cp >= 0x2060 && cp <= 0x206F) && !(cp >= 0xE000 && cp <= 0xF8FF) && cp != 0xFEFF &&
-           !(cp >= 0xFFF9 && cp <= 0xFFFB) && (cp & 0xFFFE) != 0xFFFE && cp < 0xF0000;
+           !(cp >= 0xFFF9 && cp <= 0xFFFB) && !(cp >= 0xFDD0 && cp <= 0xFDEF) && !(cp >= 0x600 && cp <= 0x605) &&
+           cp != 0x61C && cp != 0x6DD && cp != 0x70F && cp != 0x180E && (cp & 0xFFFE) != 0xFFFE && cp < 0xF0000;
 }
 
 // The characters of `s`, false when it is not UTF-8 or holds one a tag may not.

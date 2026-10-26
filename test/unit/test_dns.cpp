@@ -615,11 +615,18 @@ zone signed_example(zone_key& key)
 {
     zone z = load(example_zone);
     const std::string dir = (std::filesystem::temp_directory_path() / ("skl-dnssec-" + std::to_string(::getpid()))).string();
+    struct dir_guard
+    {
+        const std::string& path;
+        ~dir_guard()
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } guard{dir};
     std::string why;
     REQUIRE_MESSAGE(load_or_make_key(dir, z.origin, key, why), why);
     REQUIRE(sign_zone(z, key, 1800000000));
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
     return z;
 }
 
@@ -642,8 +649,8 @@ TEST_CASE("DNSSEC: the key tag and DS of RFC 6605's example, and RFC 4034's cano
           "example.net. IN DS 55648 13 2 B4C8C1FE2E7477127B27115656AD6256F424625BF5C1E2770CE6D6E37DF61D17");
     const std::vector<std::string> order = {wire("example."), wire("a.example."), wire("yljkjljk.a.example."),
                                             wire("z.a.example."), wire("zabc.a.example."), wire("z.example."),
-                                            std::string("\x01\x01\x01z\x07" "example\x00", 12), wire("*.z.example."),
-                                            std::string("\x01\x80\x01z\x07" "example\x00", 12)};
+                                            std::string("\x01\x01\x01z\x07" "example\x00", 13), wire("*.z.example."),
+                                            std::string("\x01\x80\x01z\x07" "example\x00", 13)};
     for (size_t i = 0; i + 1 < order.size(); ++i)
     {
         CHECK(canonical_less(order[i], order[i + 1]));
@@ -752,6 +759,15 @@ TEST_CASE("dns feed: changes in one second each move the directory's time a seco
 {
     const std::filesystem::path home = std::filesystem::temp_directory_path() / ("skl-feed-" + std::to_string(::getpid()));
     std::filesystem::create_directories(home);
+    struct home_guard
+    {
+        const std::filesystem::path& path;
+        ~home_guard()
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } guard{home};
     ::setenv("HOME", home.c_str(), 1);
     REQUIRE(dns_feed::write_records("mail", "a.example.test. 300 IN TXT \"one\"\n"));
     const int64_t first = dns_feed::stamp_ns() / 1000000000;
@@ -765,5 +781,4 @@ TEST_CASE("dns feed: changes in one second each move the directory's time a seco
     // What is written again unchanged is no change.
     REQUIRE(dns_feed::write_records("mail", "a.example.test. 300 IN TXT \"two\"\n"));
     CHECK(dns_feed::stamp_ns() / 1000000000 == third);
-    std::filesystem::remove_all(home);
 }

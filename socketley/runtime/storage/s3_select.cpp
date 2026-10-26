@@ -3249,11 +3249,6 @@ std::string select_engine::take_output()
     return r;
 }
 
-size_t select_engine::pending_output() const
-{
-    return m_impl->out.size();
-}
-
 bool select_engine::done() const
 {
     return m_impl->done;

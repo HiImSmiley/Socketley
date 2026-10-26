@@ -19,7 +19,7 @@ function on_websocket(client_id, headers)
     -- Extract durable session cookie (browser sends automatically)
     local sid = sessions[client_id] and sessions[client_id].sid or tostring(client_id)
     if headers.cookie then
-        sid = headers.cookie:match("session_id=([^;%s]+)") or sid
+        sid = headers.cookie:match("%f[%w_]session_id=([^;%s]+)") or sid
     end
     sessions[client_id] = {
         sid    = sid,

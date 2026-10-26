@@ -326,6 +326,7 @@ for _ in range(40):
     # (a) a real ClientHello, then gone
     try:
         raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, LINGER0)
         raw.setblocking(False)
         tls = ctx.wrap_socket(raw, server_hostname="localhost",
                               do_handshake_on_connect=False)
@@ -333,8 +334,7 @@ for _ in range(40):
             tls.do_handshake()          # writes the ClientHello, wants a read
         except (ssl.SSLWantReadError, ssl.SSLWantWriteError, OSError):
             pass
-        raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, LINGER0)
-        raw.close()
+        tls.close()
     except Exception:
         pass
 

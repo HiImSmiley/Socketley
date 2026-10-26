@@ -79,7 +79,9 @@ static bool socket_answers()
 // daemon, refusing rather than forking over an unidentified peer -- a false
 // negative costs one spare process and a false positive writes the whole
 // session to a stranger.
-static bool ensure_daemon(char* /*argv0*/)
+static bool refused_tab(int argc, char** argv);
+
+static bool ensure_daemon()
 {
     switch (socketley::daemon_probe(daemon_handler::socket_path.c_str()))
     {
@@ -209,8 +211,6 @@ int cli_dispatch(int argc, char** argv)
         // it is alive, because a daemon killed outright leaves that file.
         case fnv1a("daemons"):
         {
-            const auto paths = socketley_paths::resolve();
-
             struct entry { std::string sock; long pid; std::filesystem::path file; };
             std::vector<entry> found;
 
@@ -384,7 +384,7 @@ int cli_dispatch(int argc, char** argv)
                 // serving" is more use here than "failed to connect" -- but not
                 // for the busy one, which is serving and was being told it was
                 // not there.
-                if (rc == ipc_no_answer)
+                if (rc == ipc_no_answer || rc == ipc_cut_short)
                     return ipc_report_failure(rc);
                 if (rc < 0)
                 {
@@ -402,7 +402,7 @@ int cli_dispatch(int argc, char** argv)
             {
                 std::string data;
                 const int rc = ipc_send("daemon-stats", data);
-                if (rc == ipc_no_answer)
+                if (rc == ipc_no_answer || rc == ipc_cut_short)
                     return ipc_report_failure(rc);
                 if (rc < 0)
                 {
@@ -484,7 +484,7 @@ int cli_dispatch(int argc, char** argv)
             // The message belongs to ensure_daemon, which has three reasons to
             // say no, so reprinting one here would put the wrong sentence
             // under the right one.
-            if (!ensure_daemon(argv[0]))
+            if (!ensure_daemon())
                 return 2;
 
             for (int i = 2; i < argc; ++i)
@@ -595,7 +595,7 @@ int cli_dispatch(int argc, char** argv)
         return cli_mqtt_passwd(argc, argv);
 
     // All other commands need the daemon — auto-start if not running
-    if (!ensure_daemon(argv[0]))
+    if (!ensure_daemon())
         return 2;
 
     switch (fnv1a(cmd.data()))
@@ -628,6 +628,8 @@ int cli_dispatch(int argc, char** argv)
                 return 1;
             }
 
+            if (refused_tab(argc, argv))
+                return 1;
             bool want_interactive = false;
             std::string edits;
             for (int i = 3; i < argc; ++i)
@@ -635,7 +637,7 @@ int cli_dispatch(int argc, char** argv)
                 if (std::string_view(argv[i]) == "-i")
                     want_interactive = true;
                 edits += ' ';
-                edits += argv[i];
+                ipc_frame::append_arg(edits, cli_caller_path(argv[i - 1], argv[i]));
             }
 
             // One verb either way, so a stopped runtime is started whether or not there was something to change:
@@ -695,7 +697,6 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("mqtt-kick"):
         case fnv1a("mqtt-retained"):
         case fnv1a("dnssec"):
-            return cli_forward(argc, argv);
         case fnv1a("db-query"):
             return cli_forward(argc, argv);
         case fnv1a("db-restore"):
@@ -723,7 +724,7 @@ int cli_dispatch(int argc, char** argv)
 
             // Check for stdin shortcut: socketley <name> with piped input
             if (!isatty(STDIN_FILENO))
-                return cli_stdin_send(argc, argv);
+                return cli_stdin_send(argv);
 
             std::cerr << "unknown command\n";
             return 1;
@@ -743,7 +744,7 @@ std::string cli_caller_path(std::string_view flag, std::string_view value)
         for (;;)
         {
             const size_t comma = value.find(',', pos);
-            if (!out.empty() || pos > 0)
+            if (pos > 0)
                 out += ',';
             out += cli_caller_path(flag, value.substr(pos, comma == std::string_view::npos ? std::string_view::npos
                                                                                           : comma - pos));
@@ -865,7 +866,14 @@ int cli_forward(int argc, char** argv)
     for (int i = 1; i < argc; ++i)
     {
         if (i > 1) command += ' ';
-        if (opens_files && i > 2)
+        // add's executable is its first word, a path the daemon would read against its own directory.
+        if (verb == "add" && i == 2 && argv[i][0] != '/' && argv[i][0] != '\0')
+        {
+            std::error_code ec;
+            const auto abs = std::filesystem::absolute(argv[i], ec);
+            ipc_frame::append_arg(command, ec ? std::string(argv[i]) : abs.string());
+        }
+        else if (opens_files && i > 2)
             ipc_frame::append_arg(command, cli_caller_path(argv[i - 1], argv[i]));
         else if (i > 1)
             ipc_frame::append_arg(command, argv[i]);
@@ -1026,7 +1034,7 @@ int cli_send(int argc, char** argv)
     return exit_code;
 }
 
-int cli_stdin_send(int /*argc*/, char** argv)
+int cli_stdin_send(char** argv)
 {
     std::string name = argv[1];
 
@@ -1180,9 +1188,12 @@ static int open_editor(const std::string& path)
     if (!editor || !editor[0])
         editor = "vim";
 
+    // The shell splits an editor given with arguments, such as "code --wait".
+    const std::string script = std::string(editor) + " \"$1\"";
+
     pid_t pid = fork();
     if (pid < 0) return -1;
-    if (pid == 0) { execlp(editor, editor, path.c_str(), nullptr); _exit(127); }
+    if (pid == 0) { execl("/bin/sh", "sh", "-c", script.c_str(), "sh", path.c_str(), nullptr); _exit(127); }
 
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) return -1;
@@ -1486,7 +1497,7 @@ int cli_interactive_command(const std::string& command)
             break;
 
         // Input from user
-        if (fds[0].revents & POLLIN)
+        if (fds[0].revents & (POLLIN | POLLHUP))
         {
             n = read(STDIN_FILENO, buf, sizeof(buf));
             if (n <= 0)

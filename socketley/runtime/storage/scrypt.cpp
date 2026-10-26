@@ -405,7 +405,9 @@ bool derive_many(std::span<const job> jobs, uint64_t N, uint32_t r, uint64_t max
     if (jobs.size() > max_batch || !params_ok(N, r, 1, max_mem))
         return false;
 #if defined(__x86_64__)
-    if (jobs.size() > 1 && has_avx2())
+    // The batch holds a table for each of its 2 or 4 lanes at once, so it is taken only while all of them fit the cap.
+    const uint64_t lanes = jobs.size() == 2 ? 2 : 4;
+    if (jobs.size() > 1 && has_avx2() && uint64_t(128) * r * N * lanes <= max_mem)
         return derive_avx2_any(jobs, N, r);
 #endif
     for (const job& j : jobs)

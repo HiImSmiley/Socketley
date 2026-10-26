@@ -10,7 +10,6 @@
 #include <cerrno>
 #include <charconv>
 #include <cstdlib>
-#include <cstring>
 #include <shared_mutex>
 #include <thread>
 
@@ -418,12 +417,8 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
     // the submission carried, which is alive for as long as it is owed one.
     auto* raw = reinterpret_cast<conn*>(req->buffer);
     std::shared_ptr<conn> c;
-    for (auto* pool : {&m_conns})
-    {
-        auto it = pool->find(raw->id);
-        if (it != pool->end() && it->second.get() == raw)
-            c = it->second;
-    }
+    if (auto it = m_conns.find(raw->id); it != m_conns.end() && it->second.get() == raw)
+        c = it->second;
     if (!c)
         for (const auto& cl : m_closing)
             if (cl.get() == raw)
@@ -2768,7 +2763,7 @@ void storage_run::tend_sync_runners()
 {
     if (m_store.shard() != 0 || !m_auth || !m_git.available() || m_stopped)
         return;
-    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t now = wall::now_sec();
     if (now < m_runners_at)
         return;
     m_runners_at = now + 10;

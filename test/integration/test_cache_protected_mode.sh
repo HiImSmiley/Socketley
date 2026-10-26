@@ -70,8 +70,23 @@ print(out.split(b"\r\n")[0].decode("latin1")[:8])
 PYEOF
 }
 
+remote_set() {
+    python3 - "$EXT" "$1" <<'PYEOF'
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3)
+s.sendall(b"*3\r\n$3\r\nSET\r\n$7\r\nrefused\r\n$1\r\nv\r\n")
+s.settimeout(1)
+try:
+    s.recv(4096)
+except socket.timeout:
+    pass
+PYEOF
+}
+
 ok "$(redis-cli -h 127.0.0.1 -p "$P" ping 2>/dev/null)" "PONG" "a default cache serves loopback"
 ok "$(remote "$P")" "-DENIED " "and refuses a peer on another address"
+remote_set "$P" >/dev/null
+ok "$(redis-cli -h 127.0.0.1 -p "$P" exists refused 2>/dev/null)" "0" "a write from the refused peer was not run"
 ok "$(redis-cli -h 127.0.0.1 -p "$P" dbsize 2>/dev/null)" "0" "the refused peer changed nothing"
 ok "$(remote $((P + 1)))" "+PONG" "a --public cache serves that peer"
 

@@ -1056,13 +1056,16 @@ void storage_run::share_burn(std::string id, std::string bucket, std::string key
     m_burning.insert(id);
     struct burn
     {
-        std::string id, bucket;
+        std::string id, bucket, prefix;
         size_t left{0};
         size_t removed{0};
+        // A folder's listing went on past this page.
+        bool more{false};
     };
     auto b = std::make_shared<burn>();
     b->id = id;
     b->bucket = bucket;
+    b->prefix = key;
     auto one_done = [this, b](st s, bool existed)
     {
         if (s == st::ok && existed)
@@ -1071,6 +1074,13 @@ void storage_run::share_burn(std::string id, std::string bucket, std::string key
             LOG_WARN(("storage: a burning link could not remove from " + b->bucket + ": " + status_name(s)).c_str());
         if (--b->left)
             return;
+        // The next page of a folder, listed from its start since this one's objects are gone; a page that removed
+        // nothing is left to the sweep, so an object that refuses removal is not listed again for ever.
+        if (b->more && b->removed > 0)
+        {
+            share_burn(b->id, b->bucket, b->prefix, true);
+            return;
+        }
         ::unlink((m_store.options().dir + "/.shares/" + b->id + ".burning").c_str());
         m_burning.erase(b->id);
         LOG_INFO(("storage: link " + b->id + " ended and removed " + std::to_string(b->removed) + " object(s) of " +
@@ -1093,6 +1103,7 @@ void storage_run::share_burn(std::string id, std::string bucket, std::string key
             return;
         }
         b->left = p.objects.size();
+        b->more = p.truncated;
         for (const list_entry& e : p.objects)
             m_store.remove(bucket, e.key, one_done);
     });

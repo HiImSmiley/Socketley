@@ -18,8 +18,10 @@
 #include "control.h"
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 namespace socketley {
 namespace detail {
@@ -28,6 +30,12 @@ inline std::string& attached_name()
 {
     static std::string name;
     return name;
+}
+
+inline std::vector<std::string>& attached_all()
+{
+    static std::vector<std::string> names;
+    return names;
 }
 
 inline std::string& attach_error_storage()
@@ -73,10 +81,14 @@ inline bool daemon_attach(const std::string& name, const std::string& type,
         if (!is_managed)
         {
             detail::attached_name() = actual_name;
-            std::atexit([] {
-                if (!detail::attached_name().empty())
-                    ctl::command("remove " + detail::attached_name());
-            });
+            auto& all = detail::attached_all();
+            static const bool registered = (std::atexit([] {
+                for (const auto& n : detail::attached_all())
+                    ctl::command("remove " + n);
+            }), true);
+            (void)registered;
+            if (std::find(all.begin(), all.end(), actual_name) == all.end())
+                all.push_back(actual_name);
         }
         return true;
     }
@@ -86,6 +98,8 @@ inline bool daemon_attach(const std::string& name, const std::string& type,
 inline void daemon_detach(const std::string& name)
 {
     ctl::command("remove " + name);
+    auto& all = detail::attached_all();
+    all.erase(std::remove(all.begin(), all.end(), name), all.end());
     if (detail::attached_name() == name)
         detail::attached_name().clear();
 }
@@ -95,6 +109,8 @@ inline void daemon_detach()
     if (!detail::attached_name().empty())
     {
         ctl::command("remove " + detail::attached_name());
+        auto& all = detail::attached_all();
+        all.erase(std::remove(all.begin(), all.end(), detail::attached_name()), all.end());
         detail::attached_name().clear();
     }
 }

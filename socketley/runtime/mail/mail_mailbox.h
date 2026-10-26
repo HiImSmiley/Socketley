@@ -28,6 +28,7 @@ class mailboxes
 {
 public:
     explicit mailboxes(mail_run& run);
+    ~mailboxes() { *m_alive = false; }
 
     // --storage and --idp read; false with `why` when --storage names no runtime.
     bool configure(std::string& why);

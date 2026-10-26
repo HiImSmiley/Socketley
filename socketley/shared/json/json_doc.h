@@ -401,7 +401,7 @@ inline std::string_view string_of(const jvalue& obj, std::string_view name)
     return v && v->k == jvalue::kind::string ? std::string_view(v->s) : std::string_view{};
 }
 
-// A number member as a whole number, `otherwise` when it is missing, no number or not whole.
+// A number member written as an integer, `otherwise` when it is missing, no number, or written with a point or exponent.
 inline int64_t int_of(const jvalue& obj, std::string_view name, int64_t otherwise = 0)
 {
     const jvalue* v = member(obj, name);

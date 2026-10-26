@@ -62,16 +62,22 @@ void request_channel::arm_park_sweep()
 template <class Pick>
 size_t request_channel::drop_parked(Pick pick)
 {
-    m_sweep_due.clear();
+    // Taken out of the member for the walk, since an answer's callback can come back here and refill it.
+    std::vector<uint64_t> due;
+    due.swap(m_sweep_due);
+    due.clear();
     for (const auto& [ticket, p] : m_parked)
         if (pick(p))
-            m_sweep_due.push_back(ticket);
+            due.push_back(ticket);
 
-    for (const uint64_t ticket : m_sweep_due)
+    for (const uint64_t ticket : due)
         complete_deferred(ticket, request_status::dropped, {});
 
-    m_stat_parked_dropped += m_sweep_due.size();
-    return m_sweep_due.size();
+    const size_t n = due.size();
+    m_stat_parked_dropped += n;
+    if (m_sweep_due.empty())
+        m_sweep_due.swap(due);
+    return n;
 }
 
 void request_channel::detach()

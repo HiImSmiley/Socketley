@@ -41,7 +41,7 @@ function on_route(method, raw_path, path)
     socketley.log("Routing: " .. method .. " " .. raw_path .. " (as " .. path .. ")")
 
     -- Admin routes go to admin-backend
-    if path:match("^/admin") then
+    if path == "/admin" or path:match("^/admin/") then
         socketley.log(" -> admin-backend (index 2)")
         return 2
     end

@@ -2,7 +2,6 @@
 // The identity provider's running half: its listener, its connections and the HTTP it speaks on them, the accounts
 // it keeps, the keys it signs with, and the commands `socketley idp-user` sends it.
 #include <optional>
-#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -66,9 +65,7 @@ private:
         std::string body;
         std::string cookie;
         std::string authorization;
-        std::string content_type;
         std::string forwarded_for;
-        std::string host;
     };
 
 
@@ -108,7 +105,7 @@ private:
 
     // What an authorize request asks, checked: the client and its redirect, or an error page when there is no
     // address to send the error to.
-    const client* checked_client(const std::shared_ptr<conn>& c, const params& p, bool& answered);
+    const client* checked_client(const std::shared_ptr<conn>& c, const params& p);
     // The code for a signed-in account, sent to the client's redirect, or the browser sent on.
     void grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie);
     void login_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status);

@@ -7,7 +7,6 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "dns_zone.h"
 

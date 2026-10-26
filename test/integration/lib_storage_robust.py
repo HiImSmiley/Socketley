@@ -139,8 +139,10 @@ def stall_waiter(sock):
     t0 = stall_t0
     try:
         data = sock.recv(65536)
-        stall_result["closed"] = True
         stall_result["data"] = data
+        while data:
+            data = sock.recv(65536)
+        stall_result["closed"] = True
     except socket.timeout:
         stall_result["closed"] = False
     except OSError as e:
@@ -178,6 +180,9 @@ def head_waiter():
     s.settimeout(60)
     try:
         head_result["data"] = s.recv(4096)
+        data = head_result["data"]
+        while data:
+            data = s.recv(4096)
         head_result["closed"] = True
     except OSError:
         head_result["closed"] = False
@@ -576,6 +581,8 @@ if boto3:
         want = b"".join(BLOCK for _ in range(3))
         off = first % len(BLOCK)
         check("a range near the end of it is the right slice", body == want[off:off + 1000000])
+        check("the giant is a data file under the bucket before it is deleted",
+              any(fs for _, _, fs in os.walk(os.path.join(DATA, "gig", "data"))))
         s3.delete_object(Bucket="gig", Key="huge")
         check("the giant is deletable and its space is given back (no data file left under the bucket)",
               wait_for(lambda: not any(fs for _, _, fs in os.walk(os.path.join(DATA, "gig", "data"))), 10))

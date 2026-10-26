@@ -80,7 +80,8 @@ tail -f -n +1 "$LOG" &
 # to be SIGKILLed at the end of the grace period, and turn every graceful
 # shutdown into an ungraceful one — which would quietly delete the difference
 # between the two rows of the stale-detection table in the man page.
-trap 'kill -TERM "$DPID" 2>/dev/null || true' TERM INT
+TERMED=0
+trap 'TERMED=1; kill -TERM "$DPID" 2>/dev/null || true' TERM INT
 
 # Not guarded, on purpose.  The daemon name and the cluster directory are not
 # persisted, so this runs on every boot including a restart.
@@ -161,7 +162,13 @@ echo "node $NODE_NAME ready"
 # the stale-detection table in the man page then look like the second one.
 #
 # So wait, and then keep waiting until the daemon is actually gone.
-wait "$DPID" 2>/dev/null || true
-while kill -0 "$DPID" 2>/dev/null; do
+RC=0
+while :; do
+    wait "$DPID" 2>/dev/null
+    RC=$?
+    kill -0 "$DPID" 2>/dev/null || break
     sleep 0.1
 done
+# A daemon that died without our TERM is a crash, and the container must say so.
+[ "$TERMED" -eq 1 ] && exit 0
+exit "$RC"

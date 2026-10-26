@@ -190,8 +190,9 @@ bool acl_rules::check(std::string_view user, std::string_view client, std::strin
         if (!applies(r, user) || !(r.rights & right))
             return false;
         const std::string f = expand(r, user, client);
+        // A deny whose name cannot be put in holds for everything, so it fails closed.
         if (f.empty())
-            return false;
+            return r.deny;
         if (!as_filter)
             return topic_matches(f, topic);
         // A subscription is refused only where a rule covers all of it; what a deny covers in part is held back

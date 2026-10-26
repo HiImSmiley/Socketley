@@ -57,7 +57,7 @@ std::string body_hash(std::string_view message);
 
 struct signature
 {
-    std::string v, a, d, s, c, h, bh, b, i, l, t, x;
+    std::string v, a, d, s, c, h, bh, b, l, x;
     // The header's value as it stood, and its place among the message's headers.
     std::string raw;
     size_t index{0};

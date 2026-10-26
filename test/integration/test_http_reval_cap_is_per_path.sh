@@ -194,7 +194,7 @@ else fail "${BIG_KB} KiB over TLS is kept" \
 L3=$(full_lines)
 
 # ── 5. and the operator is told, once per runtime that fills ───────────────
-if [ "$L1" = "$L0" ] && [ "$L2" -gt "$L1" ] && [ "$L3" -gt "$L2" ]; then pass
+if [ "$L1" = "$L0" ] && [ "$L2" -eq $((L1 + 1)) ] && [ "$L3" -eq $((L2 + 1)) ]; then pass
 else fail "a map that stops taking files says so once" \
           "the line count went $L0 -> $L1 -> $L2 -> $L3 across the three arms," \
           "and it has to stay put for the arm that keeps nothing and rise by one" \

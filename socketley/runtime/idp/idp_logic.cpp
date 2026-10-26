@@ -197,6 +197,9 @@ std::string url_host(std::string_view url)
         const size_t close = host.find(']');
         if (close == std::string_view::npos)
             return {};
+        // Only a port may follow the literal, or "[::1]evil.example" would read as [::1].
+        if (close + 1 < host.size() && host[close + 1] != ':')
+            return {};
         host = host.substr(0, close + 1);
     }
     else if (const size_t colon = host.rfind(':'); colon != std::string_view::npos)
@@ -209,6 +212,10 @@ std::string url_host(std::string_view url)
 
 bool return_allowed(std::string_view url, std::string_view issuer, std::string_view cookie_domain)
 {
+    // A browser drops tabs and line breaks from an address, so "/\t/evil.example" would leave as "//evil.example".
+    for (const char c : url)
+        if (static_cast<unsigned char>(c) <= 0x20 || c == 0x7f)
+            return false;
     // A path on this provider itself.
     if (url.starts_with("/") && !url.starts_with("//") && url.find('\\') == std::string_view::npos)
         return true;

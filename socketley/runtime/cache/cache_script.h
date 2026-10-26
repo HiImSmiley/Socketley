@@ -65,11 +65,9 @@ public:
     // time would otherwise grow the cache for ever. The least recently run goes first, and EVALSHA of it answers
     // NOSCRIPT, after which a client sends EVAL again; SCRIPT LOAD's are kept until SCRIPT FLUSH.
     static constexpr size_t eval_kept = 500;
-    size_t eval_held() const { return m_eval_lru.size(); }
     bool               known(std::string_view sha) const;
     const std::string* body_of(std::string_view sha) const;
     void               flush();
-    size_t             size() const { return m_scripts.size(); }
 
     // The hex SHA1 of a string, which is also `redis.sha1hex`.
     static std::string sha1_hex(std::string_view in);

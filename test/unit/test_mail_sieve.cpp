@@ -743,7 +743,7 @@ if exists "subject" { fileinto "no"; })");
     REQUIRE(o.header);
     CHECK(o.header->find("Subject") == std::string::npos);
     // A value's line ends are no way to write a header of one's own.
-    o = run(R"(require ["editheader", "variables"]; set "v" "a${unicode:0d}${unicode:0a}Bcc: x@y"; addheader "X-A" "${v}";)");
+    o = run(R"(require ["editheader", "variables", "encoded-character"]; set "v" "a${unicode:0d}${unicode:0a}Bcc: x@y"; addheader "X-A" "${v}";)");
     REQUIRE(o.header);
     CHECK(o.header->find("\r\nBcc:") == std::string::npos);
     CHECK(compile_error(R"(require "editheader"; addheader "Bad Name" "x";)").find("no header name") !=

@@ -80,7 +80,10 @@ else fail "the page still reads as a command reference" \
 daemon_start "$BIN"
 PORT=$((SL_PORT_BASE + 880))
 "$BIN" create cache cmdref -p "$PORT" -s >/dev/null 2>&1 || true
-sleep 0.5
+for _ in $(seq 1 100); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then break; fi
+    sleep 0.1
+done
 
 # One connection per command, and the first line of the answer.  /dev/tcp
 # rather than nc, because nc -q1 lingers a second per command and there are
@@ -98,7 +101,7 @@ ask() {
 # The control first: a command that is certainly there, and one that certainly
 # is not, so a run where every answer looks the same cannot pass.
 [ "$(ask 'get')" != "failed: unknown command" ] && pass \
-    || fail "the probe can tell a known command" "`get` alone read as unknown"
+    || fail "the probe can tell a known command" "'get' alone read as unknown"
 [ "$(ask 'definitelynotacommand')" = "failed: unknown command" ] && pass \
     || fail "the probe can tell an unknown command" \
             "a command nobody implements did not read as unknown"

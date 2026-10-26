@@ -41,7 +41,9 @@ local function code_for(n)
 end
 
 local function json_escape(s)
-    return (s:gsub('[\\"]', '\\%0'):gsub('\n', '\\n'))
+    return (s:gsub('[\\"]', '\\%0'):gsub('\n', '\\n'):gsub('%c', function(c)
+        return string.format('\\u%04x', c:byte())
+    end))
 end
 
 local function bad(status, why)
@@ -63,6 +65,10 @@ function on_http_request(req)
         end
         if not url:match("^https?://") then
             return bad(400, "only http:// and https:// are shortened")
+        end
+
+        if url:find("%c") then
+            return bad(400, "the URL must not contain control characters")
         end
 
         created = created + 1

@@ -78,7 +78,7 @@ void pop3_session::run()
         if (!nl)
         {
             // Past a line's limit what came is dropped, and so is the rest of that line when it comes, said once.
-            if (m_in.size() - m_at > max_line)
+            if (m_in.size() - m_at > max_line + 1)
             {
                 m_in.clear();
                 m_at = 0;
@@ -90,6 +90,8 @@ void pop3_session::run()
         }
         std::string_view line(start, static_cast<size_t>(static_cast<const char*>(nl) - start));
         m_at += line.size() + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
         if (m_discarding || line.size() > max_line)
         {
             if (!m_discarding)
@@ -97,8 +99,6 @@ void pop3_session::run()
             m_discarding = false;
             continue;
         }
-        if (!line.empty() && line.back() == '\r')
-            line.remove_suffix(1);
         command(line);
     }
     if (m_at >= m_in.size())
@@ -257,6 +257,8 @@ void pop3_session::command(std::string_view line)
                 ok(m_cfg.hostname + " closing");
             else
                 err("[SYS/TEMP] some deleted messages were not removed");
+            if (m_closed)
+                return;
             m_closed = true;
             m_hooks.close();
         };

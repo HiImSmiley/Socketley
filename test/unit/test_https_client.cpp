@@ -51,6 +51,7 @@ struct one_answer
     }
     ~one_answer()
     {
+        if (::shutdown(fd, SHUT_RDWR) < 0) {}
         th.join();
         ::close(fd);
     }

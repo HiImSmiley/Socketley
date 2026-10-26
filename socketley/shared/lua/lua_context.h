@@ -45,10 +45,7 @@ namespace lua_tick
 #ifndef SOCKETLEY_NO_LUA
 
 #include <sol/sol.hpp>
-#include <cstdint>
 #include <memory>
-#include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>

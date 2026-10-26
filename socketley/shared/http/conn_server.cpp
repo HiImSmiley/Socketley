@@ -119,6 +119,12 @@ void conn_server::accept_done(struct io_uring_cqe* cqe)
             m_hooks.accepted(c);
         }
     }
+    // Out of descriptors, an accept again at once fails again at once, so it waits for a close or the next sweep.
+    if (fd == -EMFILE || fd == -ENFILE || fd == -ENOBUFS || fd == -ENOMEM)
+    {
+        m_accept_starved = !m_accept_pending;
+        return;
+    }
     if (!m_accept_pending && !m_stopped && fd != -ECANCELED)
         arm_accept();
 }
@@ -266,6 +272,8 @@ void conn_server::close_conn(const std::shared_ptr<server_conn>& c)
     m_rt.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
     if (c->rd_pending || c->wr_pending)
         m_closing.push_back(c);
+    // The descriptor just given back is room for the accept that ran out.
+    resume_accept();
 }
 
 void conn_server::sweep(int64_t now, int64_t idle_secs)
@@ -276,6 +284,15 @@ void conn_server::sweep(int64_t now, int64_t idle_secs)
             idle.push_back(c);
     for (auto& c : idle)
         close_conn(c);
+    resume_accept();
+}
+
+void conn_server::resume_accept()
+{
+    if (!m_accept_starved || m_accept_pending || m_stopped)
+        return;
+    m_accept_starved = false;
+    arm_accept();
 }
 
 }   // namespace socketley::http

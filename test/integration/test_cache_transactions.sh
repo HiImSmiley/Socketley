@@ -78,6 +78,16 @@ printf 'multi\nset ghost yes\n' | timeout 2 nc -q1 127.0.0.1 "$PORT" >/dev/null 
 sleep 0.3
 eq "a dropped connection runs nothing" "$(pt 'get ghost')" "nil|"
 
+# A second connection writes between MULTI and EXEC, and its write lands before the queue.
+INTER=$(mktemp)
+{ printf 'multi\nincrby ik 1\n'; sleep 1; printf 'exec\n'; } | timeout 5 nc -q1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' | tr '\n' '|' >"$INTER" &
+INTER_PID=$!
+sleep 0.4
+pt 'set ik 10' >/dev/null
+wait "$INTER_PID" 2>/dev/null
+eq "a write between MULTI and EXEC lands before the queue" "$(cat "$INTER")" "ok|queued|11|end|"
+rm -f "$INTER"
+
 # ── RESP ────────────────────────────────────────────────────────────────────
 if command -v redis-cli >/dev/null 2>&1; then
     OUT=$(printf 'MULTI\nSET r1 x\nINCRBY n 3\nEXEC\n' | redis-cli -p "$PORT" 2>&1 | tr '\n' '|')

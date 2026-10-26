@@ -92,7 +92,7 @@ LUA
 # this file is about a timer surviving a reload, not about the shape of the
 # prefix, and pinning the name here would put a second claim in a function
 # whose whole job is to count.
-ticks() { grep -cE "\[lua[^]]*\] tick" "$SOCKETLEY_DLOG" 2>/dev/null || true; }
+ticks() { grep -cE "\[lua[^]]*\] tick${1:-}" "$SOCKETLEY_DLOG" 2>/dev/null || true; }
 
 # grew_by BASELINE TIMEOUT_S — wait until at least one more tick than BASELINE
 # has been logged.  Waiting on the count rather than sleeping a fixed span: the
@@ -102,7 +102,7 @@ grew_by() {
     local base=$1 timeout=${2:-6} deadline
     deadline=$(( $(date +%s) + timeout ))
     while [ "$(date +%s)" -le "$deadline" ]; do
-        [ "$(ticks)" -gt "$base" ] && return 0
+        [ "$(ticks "${3:-}")" -gt "$base" ] && return 0
         sleep 0.1
     done
     return 1
@@ -179,6 +179,27 @@ if grew_by "$BASE" 8; then ok
 else bad "the reloaded interval is running" \
     "no new '[lua] tick' within 8s of the last reload (count stuck at $BASE)" \
     "$(tail -3 "$SOCKETLEY_DLOG" 2>/dev/null | tr '\n' '|')"; fi
+
+# ─── ONLY THE NEWEST GENERATION'S TIMER ADVANCES ────────────────────────────
+#
+# Every generation logs the same word, so a timer left behind by a replaced
+# context would keep the count above growing; this one tells the generations apart.
+cat >"$SCRIPT" <<'LUA'
+socketley.set_interval(25, function()
+    socketley.log("tick gen2")
+end)
+LUA
+if "$BIN" reload-lua timer_rt >/dev/null 2>&1; then ok
+else bad "reload-lua accepted the second generation" "reload-lua timer_rt failed"; fi
+sleep 0.3
+GEN2_BASE=$(ticks " gen2")
+if grew_by "$GEN2_BASE" 8 " gen2"; then ok
+else bad "the newest generation's interval is running" "no 'tick gen2' within 8s of the reload"; fi
+OLD_BASE=$(grep -cE "\[lua[^]]*\] tick$" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+sleep 0.5
+OLD_NOW=$(grep -cE "\[lua[^]]*\] tick$" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+if [ "$OLD_NOW" = "$OLD_BASE" ]; then ok
+else bad "the replaced generation's interval stopped" "plain 'tick' went from $OLD_BASE to $OLD_NOW after the reload"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

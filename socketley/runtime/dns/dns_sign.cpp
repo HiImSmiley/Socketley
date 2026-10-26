@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <map>
 
 #include "dns_wire.h"
 #include "../../shared/crypto/jws.h"

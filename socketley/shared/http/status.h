@@ -26,6 +26,7 @@ inline const char* status_text(int status)
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 406: return "Not Acceptable";
         case 407: return "Proxy Authentication Required";
         case 408: return "Request Timeout";
         case 409: return "Conflict";

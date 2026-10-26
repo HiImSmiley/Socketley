@@ -268,6 +268,9 @@ bool proxy_instance::h2_child_pull(proxy_client_connection* child)
     uint64_t given = 0;
     auto give = [&](std::string_view d)
     {
+        // An empty DATA frame carries nothing, and as a chunk it would read as the last one.
+        if (d.empty())
+            return;
         given += d.size();
         if (!st.synth_chunked)
         {
@@ -314,10 +317,13 @@ bool proxy_instance::h2_child_pull(proxy_client_connection* child)
     // have not arrived yet, and driving it again on nothing is a loop: drive -> arm_read -> pull -> drive, which is
     // what this did until the log showed the same line twenty-five times in one millisecond.  The next DATA frame
     // is what wakes it, through host.body.
+    const proxy_h2_stream* const held = child->h2s.get();
     if (fed && !child->closing && child->fd >= 0)
         drive_client_request(child, child->fd, false);
-    // Held across the drive as well, so a read armed from inside the parse finds the pull already running.
-    st.pulling = false;
+    // Held across the drive as well, so a read armed from inside the parse finds the pull already running; a drive
+    // that ended the stream freed st, and nothing is left to clear.
+    if (child->h2s.get() == held)
+        st.pulling = false;
     if (!parent->closing)
         h2_schedule(parent);
     return true;

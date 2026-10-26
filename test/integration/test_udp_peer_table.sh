@@ -121,7 +121,14 @@ KEPT_BEFORE=$(peers upk)
 EKEPT_BEFORE=$(peers upe)
 
 # One tick of the sweep, with room for the tick that lands after it.
-sleep 36
+KEPT_MIN=$KEPT_BEFORE; EKEPT_MIN=$EKEPT_BEFORE
+SWEEP_END=$((SECONDS+36))
+while [ "$SECONDS" -lt "$SWEEP_END" ]; do
+    k=$(peers upk); e=$(peers upe)
+    if [ -n "$k" ] && [ "$k" -lt "${KEPT_MIN:-0}" ]; then KEPT_MIN=$k; fi
+    if [ -n "$e" ] && [ "$e" -lt "${EKEPT_MIN:-0}" ]; then EKEPT_MIN=$e; fi
+    sleep 0.1
+done
 
 LEFT=$(peers upt)
 KEPT=$(peers upk)
@@ -137,8 +144,8 @@ else
         "because setup() returns on the UDP path before it reaches the arm"
 fi
 
-if [ "${KEPT:-0}" -ge 1 ]; then
-    ok "and a peer that keeps sending is kept ($KEPT_BEFORE -> $KEPT)"
+if [ "${KEPT:-0}" -ge 1 ] && [ "${KEPT_MIN:-0}" -ge 1 ]; then
+    ok "and a peer that keeps sending is kept ($KEPT_BEFORE -> $KEPT, never below $KEPT_MIN)"
 else
     bad "the sweep forgets the silent and keeps the talking" \
         "the still-sending peer's table went ${KEPT_BEFORE:-<none>} -> ${KEPT:-<none>};" \
@@ -146,8 +153,8 @@ else
         "peer of a busy server every thirty seconds"
 fi
 
-if [ "${EKEPT:-0}" -ge 1 ]; then
-    ok "and a peer whose datagrams are empty is kept too ($EKEPT_BEFORE -> $EKEPT)"
+if [ "${EKEPT:-0}" -ge 1 ] && [ "${EKEPT_MIN:-0}" -ge 1 ]; then
+    ok "and a peer whose datagrams are empty is kept too ($EKEPT_BEFORE -> $EKEPT, never below $EKEPT_MIN)"
 else
     bad "an empty datagram refreshes last_seen like any other" \
         "the peer sending nothing but zero-length datagrams went ${EKEPT_BEFORE:-<none>} ->" \

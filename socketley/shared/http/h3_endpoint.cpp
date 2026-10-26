@@ -1558,12 +1558,24 @@ void answer(stream& st, std::string data, bool finish)
         rest = {};
         std::string_view view = st.dechunk_in;
         std::string out;
+        bool unreadable = false;
         for (;;)
         {
             std::string_view piece;
-            if (http_chunked_next(st.dechunk, view, piece) != chunk_step::payload)
+            const chunk_step step = http_chunked_next(st.dechunk, view, piece);
+            unreadable = step == chunk_step::bad;
+            if (step != chunk_step::payload)
                 break;
             out.append(piece);
+        }
+        // An answer whose chunks cannot be found again is cut off, rather than held while it grows without end.
+        if (unreadable)
+        {
+            st.dechunk_in.clear();
+            if (hc.q && !hc.dead)
+                ngtcp2_conn_shutdown_stream(hc.q, 0, st.sid, NGHTTP3_H3_INTERNAL_ERROR);
+            hc.ep->dirty_raw(hc);
+            return;
         }
         st.dechunk_in.erase(0, st.dechunk_in.size() - view.size());
         if (!out.empty())

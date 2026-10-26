@@ -179,7 +179,19 @@ std::string seal(std::string_view message, std::string_view authserv, std::strin
     std::map<int, set> sets;
     // A chain that does not read is one of n sets as far as its numbers go, sealed as failed.
     const bool readable = sets_of(headers, sets);
-    const int i = readable ? static_cast<int>(sets.size()) + 1 : 1;
+    int highest = 0;
+    if (!readable)
+        for (const auto& h : headers)
+        {
+            const std::string_view name = trim(h.first);
+            if (!socketley::ascii::iequals(name, "ARC-Authentication-Results") &&
+                !socketley::ascii::iequals(name, "ARC-Message-Signature") && !socketley::ascii::iequals(name, "ARC-Seal"))
+                continue;
+            const std::string n = tag(h.second, "i");
+            if (!n.empty() && n.size() <= 2 && std::all_of(n.begin(), n.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                highest = std::max(highest, std::stoi(n));
+        }
+    const int i = (readable ? static_cast<int>(sets.size()) : highest) + 1;
     if (i > max_sets)
         return {};
     const std::string n = std::to_string(i);
@@ -191,7 +203,7 @@ std::string seal(std::string_view message, std::string_view authserv, std::strin
     if (ams.empty())
         return {};
     const std::string sealed = readable ? std::string(cv) : std::string("fail");
-    std::string value = " i=" + n + "; a=" + dkim::algorithm_of(key) + "; cv=" + (i == 1 ? std::string("none") : sealed) +
+    std::string value = " i=" + n + "; a=" + dkim::algorithm_of(key) + "; cv=" + (readable && i == 1 ? std::string("none") : sealed) +
                         "; d=" + std::string(domain) + "; s=" + std::string(selector) + ";\r\n\tt=" +
                         std::to_string(now_s) + "; b=";
     // The new set read among the old ones, as a checker will read it.

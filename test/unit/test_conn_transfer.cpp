@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -71,6 +72,9 @@ std::string read_some(int fd, size_t want)
 {
     std::string out;
     char buf[512];
+    // A read that never gets its bytes fails the check rather than hanging the test.
+    const struct timeval limit{5, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
     while (out.size() < want)
     {
         const ssize_t n = ::read(fd, buf, sizeof(buf));

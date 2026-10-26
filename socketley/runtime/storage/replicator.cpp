@@ -18,7 +18,6 @@
 #include "../../shared/storage/s3_sigv4.h"
 #include "../../shared/util/hex.h"
 #include "../../shared/util/base64.h"
-#include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
 
 namespace socketley::storage
@@ -103,9 +102,6 @@ bool replace_note(const std::string& path, const std::string& text)
     ::close(fd);
     return whole && ::rename(tmp.c_str(), path.c_str()) == 0;
 }
-
-// The path of `key` in `bucket` below a target's own path.
-std::string object_path(const http_target& t, std::string_view bucket, std::string_view key);
 
 // What a change sent to another node is, for the log.
 std::string node_change_name(char kind, bool has_version)
@@ -559,7 +555,7 @@ void replicator::ask_next()
     if (!l.seed->asker)
         l.seed->asker = new_peer(l.target);
     http_request rq;
-    rq.head = signed_head(l, "HEAD", object_path(l.target.http, q.bucket, q.key),
+    rq.head = signed_head(l, "HEAD", target_object_path(l.target.http, q.bucket, q.key),
                           q.version_id.empty() ? std::string() : "versionId=" + url_encode(q.version_id, false), {}, 0);
     rq.head_only   = true;
     rq.answer_secs = 10;
@@ -679,10 +675,10 @@ void replicator::settle(uint64_t ticket, bool made, std::function<void()> then)
         {
             for (auto c = m_sync_copies.begin(); c != m_sync_copies.end();)
                 c = c->second == ticket ? m_sync_copies.erase(c) : std::next(c);
-            if (w->second.then)
-                sync_answer(ticket, false);
-            else
-                m_sync_waits.erase(w);
+            std::function<void()> waiter = std::move(w->second.then);
+            m_sync_waits.erase(w);
+            if (waiter)
+                waiter();
         }
     const auto it = m_staged.find(ticket);
     if (it == m_staged.end())
@@ -741,7 +737,6 @@ void replicator::on_timer()
     if (m_stopped)
         return;
     const auto now = std::chrono::steady_clock::now();
-    bool waiting = false;
     // A write whose nodes did not all take it in time is answered anyway, and its copies go on.
     std::vector<uint64_t> late;
     for (const auto& [ticket, w] : m_sync_waits)
@@ -749,7 +744,7 @@ void replicator::on_timer()
             late.push_back(ticket);
     for (const uint64_t ticket : late)
         sync_answer(ticket, true);
-    waiting = std::any_of(m_sync_waits.begin(), m_sync_waits.end(), [](const auto& w) { return bool(w.second.then); });
+    bool waiting = std::any_of(m_sync_waits.begin(), m_sync_waits.end(), [](const auto& w) { return bool(w.second.then); });
     for (auto& lp : m_lanes)
     {
         lane& l = *lp;
@@ -954,7 +949,12 @@ void replicator::ended(lane& l, const std::shared_ptr<job>& j, outcome o, uint64
         else
             it->second = left;
     }
+    // A version one destination refused stays FAILED however the others end.
+    const bool refused_before = left == 0 && m_refused.erase(vk) > 0;
+    if (o == outcome::refused && left > 0)
+        m_refused.insert(vk);
     const std::string_view status = o == outcome::refused ? replication_failed
+                                  : refused_before        ? std::string_view{}
                                   : left == 0             ? replication_completed
                                                           : std::string_view{};
     if (status.empty())
@@ -1082,20 +1082,10 @@ std::string target_object_path(const http_target& t, std::string_view bucket, st
     return p;
 }
 
-namespace
-{
-
-std::string object_path(const http_target& t, std::string_view bucket, std::string_view key)
-{
-    return target_object_path(t, bucket, key);
-}
-
-}   // namespace
-
 void replicator::run_marker(lane& l, const std::shared_ptr<job>& j)
 {
     http_request rq;
-    rq.head = signed_head(l, "DELETE", object_path(l.target.http, j->t.dest_bucket, j->t.key), {},
+    rq.head = signed_head(l, "DELETE", target_object_path(l.target.http, j->t.dest_bucket, j->t.key), {},
                           {{"x-amz-replication-status", "REPLICA"},
                            {std::string(replica_version_header), j->t.version_id}}, 0);
     exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
@@ -1107,7 +1097,7 @@ void replicator::run_marker(lane& l, const std::shared_ptr<job>& j)
 void replicator::run_tags(lane& l, const std::shared_ptr<job>& j)
 {
     const std::string query = "tagging=&versionId=" + url_encode(j->t.version_id, false);
-    const std::string path  = object_path(l.target.http, j->t.dest_bucket, j->t.key);
+    const std::string path  = target_object_path(l.target.http, j->t.dest_bucket, j->t.key);
     std::vector<std::pair<std::string, std::string>> h{{"x-amz-replication-status", "REPLICA"}};
     http_request rq;
     if (j->t.tags.empty())
@@ -1134,7 +1124,7 @@ http_request replicator::node_record(const lane& l, const task& t) const
         path.pop_back();
     path += "/" + t.bucket;
     if (t.node_kind == 'l' || t.node_kind == 'q')
-        path = object_path(l.target.http, t.bucket, t.key);
+        path = target_object_path(l.target.http, t.bucket, t.key);
     rq.body = t.tags;
     rq.head = signed_head(l, "POST", path, std::string(cluster_query) + "=",
                           {{"content-type", "application/octet-stream"}}, rq.body.size());
@@ -1149,7 +1139,7 @@ void replicator::run_node(lane& l, const std::shared_ptr<job>& j)
         ended(lp, jj, a.status / 100 == 2 ? outcome::done : judge_node(jj->t, a), 0);
     };
     http_request rq;
-    const std::string path = object_path(l.target.http, t.bucket, t.key);
+    const std::string path = target_object_path(l.target.http, t.bucket, t.key);
     switch (t.node_kind)
     {
         case 'p':
@@ -1416,7 +1406,7 @@ void replicator::send_single(lane& l, const std::shared_ptr<job>& j)
     if (const std::string v = checksum_value(m, algo); !v.empty() && v.find('-') == std::string::npos)
         h.emplace_back(std::string(checksum_header(algo)), v);
     http_request rq;
-    rq.head = signed_head(l, "PUT", object_path(l.target.http, j->t.dest_bucket, j->t.key), {}, std::move(h), m.size);
+    rq.head = signed_head(l, "PUT", target_object_path(l.target.http, j->t.dest_bucket, j->t.key), {}, std::move(h), m.size);
     if (spliceable(l.target.http, m, m.size))
     {
         rq.file_fd  = j->fd;
@@ -1445,7 +1435,7 @@ void replicator::mpu_create(lane& l, const std::shared_ptr<job>& j)
         h.emplace_back("x-amz-checksum-type", v.find('-') != std::string::npos ? "COMPOSITE" : "FULL_OBJECT");
     }
     http_request rq;
-    rq.head = signed_head(l, "POST", object_path(l.target.http, j->t.dest_bucket, j->t.key), "uploads=", std::move(h), 0);
+    rq.head = signed_head(l, "POST", target_object_path(l.target.http, j->t.dest_bucket, j->t.key), "uploads=", std::move(h), 0);
     exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
     {
         if (a.status / 100 != 2)
@@ -1488,7 +1478,7 @@ void replicator::mpu_part(lane& l, const std::shared_ptr<job>& j)
         h.emplace_back(std::string(checksum_header(algo)), base64::encode(j->parts.checksums[i]));
     const std::string query = "partNumber=" + std::to_string(number) + "&uploadId=" + url_encode(j->upload_id, false);
     http_request rq;
-    rq.head = signed_head(l, "PUT", object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h), len);
+    rq.head = signed_head(l, "PUT", target_object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h), len);
     if (spliceable(l.target.http, j->meta, len))
     {
         rq.file_fd  = j->fd;
@@ -1538,7 +1528,7 @@ void replicator::mpu_complete(lane& l, const std::shared_ptr<job>& j)
         h.emplace_back("x-amz-replication-status", "REPLICA");
     const std::string query = "uploadId=" + url_encode(j->upload_id, false);
     http_request rq;
-    rq.head = signed_head(l, "POST", object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h),
+    rq.head = signed_head(l, "POST", target_object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h),
                           x.size());
     rq.body = std::move(x);
     exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
@@ -1563,7 +1553,7 @@ void replicator::mpu_abort(lane& l, const std::shared_ptr<job>& j, outcome o)
     std::vector<std::pair<std::string, std::string>> h;
     if (!j->t.node_kind)
         h.emplace_back("x-amz-replication-status", "REPLICA");
-    rq.head = signed_head(l, "DELETE", object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h), 0);
+    rq.head = signed_head(l, "DELETE", target_object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h), 0);
     exchange(l, j, std::move(rq), [this, o, why](lane& lp, const std::shared_ptr<job>& jj, http_answer)
     {
         jj->why = why;
@@ -1714,6 +1704,7 @@ void replicator::seed_more(lane& l)
             return;
         sd.buckets = true;
     }
+    const auto overflowed = m_c.node_overflows;
     auto all = m_store.buckets();
     std::sort(all.begin(), all.end(), [](const bucket_info& a, const bucket_info& b) { return a.name < b.name; });
     // A batch stays well inside the queue's bound, so a seeding never lets go of itself.
@@ -1729,6 +1720,8 @@ void replicator::seed_more(lane& l)
         queued += m_store.keys_after(b.name, after, batch - queued,
                                      [&](const std::string& key, const std::vector<const object_meta*>& versions)
         {
+            if (m_c.node_overflows != overflowed)
+                return;
             for (const object_meta* m : versions)
             {
                 cluster_change c;
@@ -1747,10 +1740,14 @@ void replicator::seed_more(lane& l)
                 }
                 push(l, node_task(c), false);
                 ++m_c.node_seeded;
+                if (m_c.node_overflows != overflowed)
+                    return;
             }
             sd.bucket = b.name;
             sd.key    = key;
         });
+        if (m_c.node_overflows != overflowed)
+            return;
         if (queued >= batch)
             break;
     }
@@ -1781,8 +1778,11 @@ void replicator::seed_more(lane& l)
     }
     while (sd.keys_done && queued < batch && !sd.removals.empty())
     {
-        push(l, node_task(sd.removals.back()), false);
+        cluster_change c = std::move(sd.removals.back());
         sd.removals.pop_back();
+        push(l, node_task(c), false);
+        if (m_c.node_overflows != overflowed)
+            return;
         ++queued;
     }
     sd.done   = sd.keys_done && sd.removals.empty();

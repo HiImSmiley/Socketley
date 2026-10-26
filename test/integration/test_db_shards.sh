@@ -166,11 +166,12 @@ if phase == "main":
         s.events(0, 1.0)
     for i in range(5):
         db(pd, "PUT", "/c/items/f%d" % i, {"n": i})
-    got = [[(e[1], e[2]["id"]) for e in s.events(5)] for s in streams]
+    evs = [s.events(5) for s in streams]
+    got = [[(e[1], e[2]["id"]) for e in v] for v in evs]
     check("every stream, on any shard, hears each change once and in order",
           [g == [("put", "f%d" % i) for i in range(5)] for g in got], [True] * len(streams))
-    ids = [[e[0] for e in s.events(0, 0.3)] for s in streams]
-    check("numbered as shard 0 numbers them", len({tuple(x) for x in ids}), 1)
+    ids = [[e[0] for e in v] for v in evs]
+    check("numbered as shard 0 numbers them", (len({tuple(x) for x in ids}), len(ids[0]), ids[0] == sorted(set(ids[0]))), (1, 5, True))
 
     # A document whose time came is gone on every shard.
     # Whole seconds, so +1 could end a fraction of a second after the PUT; four leaves three at the least.

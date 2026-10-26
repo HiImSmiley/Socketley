@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
@@ -210,7 +211,7 @@ void cache_store::zrange(std::string_view key, int64_t start, int64_t stop,
         {
             if (e == ord.end()) break;
             out.emplace_back(std::string_view(e->second), e->first);
-            if (e == ord.begin()) { ++i; break; }
+            if (e == ord.begin()) break;
             --e;
         }
     }
@@ -563,7 +564,6 @@ void cache_store::after_pop(list_map::iterator it, std::string_view key, size_t 
     if (it->second.empty())
     {
         track_sub(entry_cost(it->first, it->second));
-        m_list_elems -= it->second.size();
         m_lists.erase(it);
         m_expiry.erase(std::string(key));
         drop_lru(key);
@@ -611,6 +611,9 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     auto it = m_sets.find(key);
     if (it != m_sets.end())
     {
+        // A member already held costs nothing, so it is answered before the admission check.
+        if (it->second.count(member) != 0)
+            return 0;
         // Named for the same reason as in lpush(): `it` must survive the call.
         if (!check_memory(stored_string(member.size()) + set_elem_overhead
                           + set_growth(&it->second), key))
@@ -661,7 +664,6 @@ bool cache_store::srem(std::string_view key, std::string_view member)
     if (it->second.empty())
     {
         track_sub(entry_cost(it->first, it->second));
-        m_set_elems -= it->second.size();
         m_sets.erase(it);
         m_expiry.erase(std::string(key));
         drop_lru(key);
@@ -872,6 +874,8 @@ size_t cache_store::key_cost(std::string_view key) const
 
 int cache_store::rename_key(std::string_view src, std::string_view dst, bool nx)
 {
+    check_expiry(src);
+    check_expiry(dst);
     if (!exists(src))
         return -2;
     if (src == dst)
@@ -912,6 +916,8 @@ int cache_store::rename_key(std::string_view src, std::string_view dst, bool nx)
 
 int cache_store::copy_key(std::string_view src, std::string_view dst, bool replace)
 {
+    check_expiry(src);
+    check_expiry(dst);
     if (!exists(src))
         return -2;
     if (src == dst)
@@ -1107,7 +1113,6 @@ bool cache_store::hdel(std::string_view key, std::string_view field)
     if (it->second.empty())
     {
         track_sub(entry_cost(it->first, it->second));
-        m_hash_fields -= it->second.size();
         m_hashes.erase(it);
         m_expiry.erase(std::string(key));
         drop_lru(key);
@@ -1198,6 +1203,7 @@ int64_t cache_store::get_ttl(std::string_view key) const
 
 bool cache_store::persist(std::string_view key)
 {
+    check_expiry(key);
     auto it = m_expiry.find(key);
     if (it == m_expiry.end())
         return false;
@@ -1854,7 +1860,8 @@ bool cache_store::incrbyfloat(std::string_view key, double delta, double& result
         char* end = nullptr;
         errno = 0;
         val = std::strtod(cur.c_str(), &end);
-        if (end != cur.c_str() + cur.size() || cur.empty() || errno == ERANGE)
+        if (end != cur.c_str() + cur.size() || cur.empty() || errno == ERANGE
+            || std::isspace(static_cast<unsigned char>(cur[0])))
             return false;
     }
     else if (has_type_conflict_for_string(key))
@@ -1869,7 +1876,16 @@ bool cache_store::incrbyfloat(std::string_view key, double delta, double& result
     const std::string txt = cache_float_text(val);
     if (txt.empty())
         return false;
-    return set(key, txt);
+
+    // set() drops the deadline, which INCRBYFLOAT keeps.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    if (auto eit = m_expiry.find(key); eit != m_expiry.end())
+        deadline = eit->second;
+    if (!set(key, txt))
+        return false;
+    if (deadline)
+        m_expiry.insert_or_assign(std::string(key), *deadline);
+    return true;
 }
 
 bool cache_store::getdel(std::string_view key, std::string& out)
@@ -2647,8 +2663,8 @@ void cache_store::dump_commands(std::string& buf) const
             cmd.push_back(' ');
             // Whole scores print as integers, which is what the text
             // interpreter reads back without a rounding step.
-            if (score == static_cast<double>(static_cast<int64_t>(score))
-                && score < 9.2e18 && score > -9.2e18)
+            if (score < 9.2e18 && score > -9.2e18
+                && score == static_cast<double>(static_cast<int64_t>(score)))
                 cmd.append(std::to_string(static_cast<int64_t>(score)));
             else
             {
@@ -2728,6 +2744,13 @@ void cache_store::dump_commands(std::string& buf) const
             cmd.append(key);
             cmd.push_back(' ');
             cmd.append(std::to_string(ms));
+            emit();
+        }
+        else
+        {
+            // A key past its deadline that was not swept yet is dumped as gone.
+            cmd.append("del ");
+            cmd.append(key);
             emit();
         }
     }
@@ -2900,6 +2923,7 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
     if (map == MAP_FAILED)
     {
         close(fd_raw);
+        unlink(tmp_path.c_str());
         return false;
     }
 
@@ -3010,7 +3034,10 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
         return false;
     }
 
-    return rename(tmp_path.c_str(), std::string(path).c_str()) == 0;
+    if (rename(tmp_path.c_str(), std::string(path).c_str()) == 0)
+        return true;
+    unlink(tmp_path.c_str());
+    return false;
 }
 
 bool cache_store::load(std::string_view path, size_t offset)
@@ -3035,7 +3062,7 @@ bool cache_store::load(std::string_view path, size_t offset)
     // different file, narrowing only.
     if ((st.st_mode & 0077) != 0)
     {
-        if (fchmod(fd_raw, 0600) == 0)
+        if (fchmod(fd_raw, st.st_mode & 0700) == 0)
             LOG_INFO(("cache: tightened " + std::string(path) +
                       " to 0600 — a persistence dump holds whatever was cached "
                       "and was readable by other users on this machine").c_str());
@@ -3273,10 +3300,28 @@ bool cache_store::load_v2(const char* data, size_t size)
     return true;
 }
 
+// Where the file ends, so a length read from it can be checked before a string is sized to it.
+static std::streamoff stream_end(std::ifstream& file)
+{
+    const std::streampos cur = file.tellg();
+    file.seekg(0, std::ios::end);
+    const std::streampos end = file.tellg();
+    file.seekg(cur);
+    return end;
+}
+
+static bool stream_fits(std::ifstream& file, std::streamoff file_end, uint64_t n)
+{
+    const std::streamoff cur = file.tellg();
+    return cur >= 0 && file_end >= cur && n <= static_cast<uint64_t>(file_end - cur);
+}
+
 bool cache_store::load_v2_stream(std::ifstream& file)
 {
     // Legacy ifstream-based parser (fallback when mmap fails)
     flush_all();
+
+    const std::streamoff file_end = stream_end(file);
 
     auto now = std::chrono::steady_clock::now();
     const int64_t wall_now_ms = socketley::wall::now_ms();
@@ -3285,6 +3330,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
         uint32_t len = 0;
         file.read(reinterpret_cast<char*>(&len), sizeof(len));
         if (!file) return false;
+        if (!stream_fits(file, file_end, len)) return false;
         // Sized on construction rather than resize()d into, for the reason
         // given in load_v2(): growing a fresh string to 16..29 bytes buys 30.
         std::string buf(len, '\0');
@@ -3407,7 +3453,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
             {
                 int64_t len = 0;
                 file.read(reinterpret_cast<char*>(&len), sizeof(len));
-                if (!file || len < 0 || len > (int64_t{1} << 40)) return false;
+                if (!file || len < 0 || !stream_fits(file, file_end, static_cast<uint64_t>(len))) return false;
                 std::string blob(static_cast<size_t>(len), '\0');
                 file.read(blob.data(), len);
                 if (!file) return false;
@@ -3430,12 +3476,15 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
 {
     flush_all();
 
+    const std::streamoff file_end = stream_end(file);
+
     // Process the first entry (key_len already read)
     uint32_t key_len = first_key_len;
 
     while (true)
     {
         // Short anywhere inside an entry is a cut dump; only the end of the file between entries is its end.
+        if (!stream_fits(file, file_end, key_len)) return false;
         std::string key(key_len, '\0');
         file.read(key.data(), key_len);
         if (!file) return false;
@@ -3444,6 +3493,7 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
         file.read(reinterpret_cast<char*>(&val_len), sizeof(val_len));
         if (!file) return false;
 
+        if (!stream_fits(file, file_end, val_len)) return false;
         std::string value(val_len, '\0');
         file.read(value.data(), val_len);
         if (!file) return false;
@@ -3455,8 +3505,6 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
         if (!file)
             return file.gcount() == 0;
     }
-
-    return true;
 }
 
 // ─── Eviction / Memory ───

@@ -135,7 +135,7 @@ private:
     std::string session_json(const request& rq) const;
     void api(const request& rq);
     void upload(const request& rq, const std::string& account);
-    void download(const request& rq, const std::string& account, const std::string& blob, const std::string& type,
+    void download(const std::string& account, const std::string& blob, const std::string& type,
                   const std::string& name);
     void eventsource(const request& rq);
     // The webmail page, and who it is signed in as.

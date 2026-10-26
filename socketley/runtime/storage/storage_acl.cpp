@@ -116,9 +116,10 @@ bool storage_run::acl_headers_ok(const std::shared_ptr<conn>& c, bool bucket, s3
     {
         acl_list a;
         s3_error ignored;
-        const bool taken = rq.canned == "bucket-owner-full-control" ||
-                           (acl_from_request(rq, false, owner, owner, acl_users(), a, ignored) &&
-                            a == default_acl(owner) && (rq.canned != "private" || requester.empty() || requester == owner));
+        const bool parsed = acl_from_request(rq, false, owner, owner, acl_users(), a, ignored);
+        const bool taken  = parsed && (rq.canned == "bucket-owner-full-control" ||
+                                       (a == default_acl(owner) &&
+                                        (rq.canned != "private" || requester.empty() || requester == owner)));
         if (!taken)
             err = make_error("AccessControlListNotSupported");
         return taken;

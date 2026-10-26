@@ -82,10 +82,10 @@ const std::vector<std::string>* alias_table::find(std::string_view local, std::s
 {
     std::string key = lower(local);
     key += '@';
-    key += domain;
+    key += lower(domain);
     if (const auto it = map.find(key); it != map.end())
         return &it->second;
-    if (const auto it = map.find("*@" + std::string(domain)); it != map.end())
+    if (const auto it = map.find("*@" + lower(domain)); it != map.end())
         return &it->second;
     return nullptr;
 }

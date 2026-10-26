@@ -144,9 +144,15 @@ bool destination_of(const xml_node& d, replication_rule& r, s3_error& err)
         {
             bool on = false;
             for (const xml_node& m : k.kids)
-                if (m.name == "Status" && status_of(m, on) && on)
-                    return refuse(err, "NotImplemented", "S3 Replication Time Control and replication metrics are "
-                                                          "not offered by this endpoint");
+                if (m.name == "Status")
+                {
+                    // A status that is neither Enabled nor Disabled is malformed, not off.
+                    if (!status_of(m, on))
+                        return false;
+                    if (on)
+                        return refuse(err, "NotImplemented", "S3 Replication Time Control and replication metrics "
+                                                              "are not offered by this endpoint");
+                }
         }
         else
             return false;
@@ -336,7 +342,8 @@ bool parse_replication_config(std::string_view xml, replication_config& out, s3_
             if (!v1 && o.has_priority && r.has_priority && o.priority == r.priority)
                 return refuse(err, "InvalidArgument", "Found duplicate priority " + std::to_string(r.priority) +
                                                           " for rules. Priority must be unique.");
-            if (v1 && (o.prefix.starts_with(r.prefix) || r.prefix.starts_with(o.prefix)))
+            // Overlap is refused for one destination, as the message says and S3 does, and not across two.
+            if (v1 && o.dest_bucket == r.dest_bucket && (o.prefix.starts_with(r.prefix) || r.prefix.starts_with(o.prefix)))
                 return refuse(err, "InvalidRequest", "Found overlapping prefixes '" + o.prefix + "' and '" +
                                                          r.prefix + "' for same destination bucket");
         }

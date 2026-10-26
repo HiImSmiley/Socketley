@@ -42,7 +42,7 @@ bool parse_remote_key(std::string_view rk, std::string& bucket, std::string& key
         return false;
     const std::string_view stamp = rk.substr(0, s2);
     key = std::string(rk.substr(s2 + 1));
-    const size_t d1 = stamp.find('-');
+    const size_t d1 = stamp.find('-', stamp.starts_with('-') ? 1 : 0);
     if (d1 == std::string_view::npos || stamp.size() < d1 + 1 + 32 + 2 || stamp[d1 + 33] != '-' || key.empty())
         return false;
     mtime = std::atoll(std::string(stamp.substr(0, d1)).c_str());
@@ -435,6 +435,12 @@ std::shared_ptr<body_reader> tierer::reader(const object_meta& m, uint64_t first
         if (!t)
         {
             give(false, {});
+            return;
+        }
+        // Nothing asked is nothing to fetch, and a range of off + 0 - 1 would wrap.
+        if (n == 0)
+        {
+            give(true, {});
             return;
         }
         http_request rq;

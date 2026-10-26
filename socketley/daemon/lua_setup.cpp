@@ -353,7 +353,7 @@ namespace
 {
 
 // Flags that are keys of another shape, beside the table: the script, a client's reconnect, its printing, and start.
-constexpr std::string_view special_flags[] = {"-s", "--test", "--lua", "--reconnect", "-b", "-bp", "-bt", "-bpt"};
+constexpr std::string_view special_flags[] = {"--lua", "--reconnect"};
 
 bool special_flag(std::string_view flag)
 {
@@ -389,7 +389,9 @@ std::vector<config_key> schema_keys(runtime_type type, std::vector<std::string>&
 std::string number_to_text(double v)
 {
     char buf[32];
-    std::snprintf(buf, sizeof buf, "%.10g", v);
+    // A whole number below 2^53 is exact in a double, and %.10g would round it above ten digits.
+    const bool whole = v == std::floor(v) && std::fabs(v) < 9007199254740992.0;
+    std::snprintf(buf, sizeof buf, whole ? "%.0f" : "%.10g", v);
     return buf;
 }
 
@@ -461,11 +463,12 @@ std::string emit_key(const config_key& key, const sol::table& entry, const std::
 
             if (value.empty())
                 return name + ": the value is empty\n";
-            if (std::string why = refuse_whitespace(key.name, value); !why.empty())
+            std::string resolved = beside(base, key.flag, value);
+            if (std::string why = refuse_whitespace(key.name, resolved); !why.empty())
                 return why;
 
             words.emplace_back(key.flag);
-            words.push_back(beside(base, key.flag, value));
+            words.push_back(std::move(resolved));
             return {};
         }
 
@@ -496,15 +499,16 @@ std::string emit_key(const config_key& key, const sol::table& entry, const std::
             {
                 if (value.empty())
                     return name + ": an entry is empty\n";
-                if (std::string why = refuse_whitespace(key.name, value); !why.empty())
+                const std::string resolved = beside(base, key.flag, value);
+                if (std::string why = refuse_whitespace(key.name, resolved); !why.empty())
                     return why;
                 // An entry holding the separator would arrive as two.
-                if (value.find(sep) != std::string::npos)
+                if (resolved.find(sep) != std::string::npos)
                     return name + ": an entry cannot hold '" + std::string(1, sep) + "', which separates the list (\"" +
-                           value + "\")\n";
+                           resolved + "\")\n";
                 if (!joined.empty())
                     joined += sep;
-                joined += beside(base, key.flag, value);
+                joined += resolved;
             }
 
             // An empty list is the operator asking for nothing rather than for
@@ -592,26 +596,18 @@ std::string emit_special_keys(const sol::table& entry, const std::string& base, 
             if (obj.get_type() != sol::type::string)
                 return "bash: expected a string\n";
 
-            switch (fnv1a(obj.as<std::string>()))
+            bool prefix = false;
+            bool stamp = false;
+            for (const char c : obj.as<std::string>())
             {
-                case fnv1a("pt"):
-                case fnv1a("tp"):
-                case fnv1a("bpt"):
-                case fnv1a("btp"):
-                    words.emplace_back("-bpt");
-                    break;
-                case fnv1a("p"):
-                case fnv1a("bp"):
-                    words.emplace_back("-bp");
-                    break;
-                case fnv1a("t"):
-                case fnv1a("bt"):
-                    words.emplace_back("-bt");
-                    break;
-                default:
-                    words.emplace_back("-b");
-                    break;
+                if (c == 'p')
+                    prefix = true;
+                else if (c == 't')
+                    stamp = true;
+                else if (c != 'b')
+                    return "bash: expected b, p, t or a combination\n";
             }
+            words.emplace_back(prefix && stamp ? "-bpt" : prefix ? "-bp" : stamp ? "-bt" : "-b");
         }
     }
 
@@ -801,7 +797,10 @@ void open(sol::state& lua, const std::string& top)
         if (!std::filesystem::is_directory(p, ec))
             return run(p);
         std::vector<std::filesystem::path> files;
-        for (const auto& f : std::filesystem::directory_iterator(p, ec))
+        std::filesystem::directory_iterator dir(p, ec);
+        if (ec)
+            throw sol::error("include: cannot read " + p.string() + ": " + ec.message());
+        for (const auto& f : dir)
             if (f.path().extension() == ".lua")
                 files.push_back(f.path());
         std::sort(files.begin(), files.end());

@@ -46,6 +46,15 @@ std::string q(std::string_view s)
     return json::quote(s);
 }
 
+// An id as given, with a "#" creation reference swapped for the id it made, empty where none made it.
+std::string resolved(const std::unordered_map<std::string, std::string>& created, std::string id)
+{
+    if (id.empty() || id.front() != '#')
+        return id;
+    const auto it = created.find(id.substr(1));
+    return it == created.end() ? std::string() : it->second;
+}
+
 // The state of an entry kept as one, a digest of what it holds.
 std::string entry_state(const std::string* kept)
 {
@@ -149,8 +158,10 @@ std::vector<std::string> keywords_of(const imap_message& m)
 uint8_t flags_of(const std::vector<std::string>& keywords, std::vector<std::string>& words)
 {
     uint8_t bits = 0;
-    for (const auto& k : keywords)
+    for (const auto& given : keywords)
     {
+        std::string k = given;
+        socketley::ascii::lower_in_place(k);
         if (k == "$seen")
             bits |= flag_seen;
         else if (k == "$answered")
@@ -160,7 +171,7 @@ uint8_t flags_of(const std::vector<std::string>& keywords, std::vector<std::stri
         else if (k == "$draft")
             bits |= flag_draft;
         else if (!k.empty() && k.size() <= 255 && k.find_first_of(" ()[]{}%*\"\\") == std::string::npos)
-            words.push_back(k);
+            words.push_back(std::move(k));
     }
     return bits;
 }
@@ -379,7 +390,7 @@ std::string part_json(std::string_view msg, const body_part& bp, const std::stri
     add("name", name.empty() ? "null" : q(name));
     add("type", q(type_of(p)));
     const std::string cs = mime::param(p.params, "charset");
-    add("charset", p.type == "text" || p.type == "TEXT" ? q(cs.empty() ? "us-ascii" : cs) : cs.empty() ? "null" : q(cs));
+    add("charset", p.type == "text" ? q(cs.empty() ? "us-ascii" : cs) : cs.empty() ? "null" : q(cs));
     std::string disp = p.disposition;
     socketley::ascii::lower_in_place(disp);
     add("disposition", disp.empty() ? "null" : q(disp));
@@ -825,7 +836,9 @@ void jmap_session::mailbox_query(const jvalue& args, std::function<void(answer)>
         const auto kb = std::make_pair(by_name ? 0 : sort_order(b->name), leaf_of(b->name));
         return ascending ? ka < kb : kb < ka;
     });
-    const int64_t position = std::max<int64_t>(0, json::int_of(args, "position", 0));
+    int64_t position = json::int_of(args, "position", 0);
+    if (position < 0)
+        position = std::max<int64_t>(0, static_cast<int64_t>(folders.size()) + position);
     const int64_t limit = json::int_of(args, "limit", 100000);
     std::string ids = "[";
     for (size_t i = static_cast<size_t>(position); i < folders.size() && static_cast<int64_t>(i) < position + limit; ++i)
@@ -859,8 +872,7 @@ void jmap_session::mailbox_set(const jvalue& args, const std::shared_ptr<call_st
             s += ",";
     };
     const auto name_of_id = [this, cs](std::string id) -> std::string {
-        if (!id.empty() && id.front() == '#')
-            id = cs->created.count(id.substr(1)) ? cs->created[id.substr(1)] : std::string();
+        id = resolved(cs->created, id);
         const auto f = mailbox_by_id(id);
         return f ? f->name : std::string();
     };
@@ -927,12 +939,15 @@ void jmap_session::mailbox_set(const jvalue& args, const std::shared_ptr<call_st
                 j->not_updated += q(id) + ":" + set_error("notFound");
                 return (*self)();
             }
-            if (const jvalue* sub = json::member(patch, "isSubscribed"); sub && sub->k == jvalue::kind::boolean)
-                m_store.set_subscribed(m_user, f->name, sub->b);
+            const jvalue* sub = json::member(patch, "isSubscribed");
+            const bool resubscribe = sub && sub->k == jvalue::kind::boolean;
+            const bool subscribed = resubscribe && sub->b;
             const jvalue* name = json::member(patch, "name");
             const jvalue* parent = json::member(patch, "parentId");
             if (!name && !parent)
             {
+                if (resubscribe)
+                    m_store.set_subscribed(m_user, f->name, subscribed);
                 comma(j->updated);
                 j->updated += q(id) + ":null";
                 return (*self)();
@@ -952,13 +967,17 @@ void jmap_session::mailbox_set(const jvalue& args, const std::shared_ptr<call_st
             const std::string to = under.empty() ? leaf : under + "/" + leaf;
             if (to == f->name)
             {
+                if (resubscribe)
+                    m_store.set_subscribed(m_user, f->name, subscribed);
                 comma(j->updated);
                 j->updated += q(id) + ":null";
                 return (*self)();
             }
-            m_store.rename(m_user, f->name, to, [this, j, id, self, comma, alive](bool ok) {
+            m_store.rename(m_user, f->name, to, [this, j, id, self, comma, alive, to, resubscribe, subscribed](bool ok) {
                 if (!*alive)
                     return;
+                if (ok && resubscribe)
+                    m_store.set_subscribed(m_user, to, subscribed);
                 comma(ok ? j->updated : j->not_updated);
                 (ok ? j->updated : j->not_updated) += q(id) + ":" + (ok ? std::string("null") : set_error("forbidden"));
                 (*self)();
@@ -1048,9 +1067,9 @@ void jmap_session::email_get(const jvalue& args, std::function<void(answer)> don
     if (ids && ids->k == jvalue::kind::array)
         j->ids = strings_of(ids);
     else
-        for (const auto& [id, at] : m_ids)
+        for (const auto& entry : m_ids)
             if (j->ids.size() < 1000)
-                j->ids.push_back(id);
+                j->ids.push_back(entry.first);
     if (j->ids.size() > 1000)
         return done({{"error", set_error("requestTooLarge")}});
     const jvalue* props = json::member(j->args, "properties");
@@ -1158,11 +1177,15 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
     auto j = std::make_shared<job>();
     j->args = args;
     const jvalue* filter = json::member(j->args, "filter");
+    bool bad_date = false;
     // What a filter needs of each Email beyond the index: its header, or all of it.
     std::function<void(const jvalue&)> needs = [&](const jvalue& f) {
         if (const jvalue* conds = json::member(f, "conditions"); conds && conds->k == jvalue::kind::array)
             for (const auto& c : conds->items)
                 needs(c);
+        for (const char* k : {"before", "after"})
+            if (const std::string_view d = json::string_of(f, k); !d.empty() && utc_ms(d) < 0)
+                bad_date = true;
         for (const char* k : {"from", "to", "cc", "bcc", "subject", "header"})
             if (json::member(f, k))
                 j->head = true;
@@ -1172,6 +1195,8 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
     };
     if (filter)
         needs(*filter);
+    if (bad_date)
+        return done({{"error", set_error("unsupportedFilter", "before and after are UTC dates")}});
     if (const jvalue* sort = json::member(j->args, "sort"); sort && sort->k == jvalue::kind::array && !sort->items.empty())
     {
         j->sort_by = std::string(json::string_of(sort->items.front(), "property"));
@@ -1415,8 +1440,8 @@ void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> 
         v.k = jvalue::kind::object;
     }
     if (const jvalue* c = json::member(args, "create"); c && c->k == jvalue::kind::object)
-        for (const auto& [cid, obj] : c->members)
-            not_created += (not_created.size() > 1 ? "," : "") + q(cid) + ":" +
+        for (const auto& member : c->members)
+            not_created += (not_created.size() > 1 ? "," : "") + q(member.first) + ":" +
                            set_error("forbiddenFrom", "the address a user sends as is the account's");
     for (const auto& id : strings_of(json::member(args, "destroy")))
         not_destroyed += (not_destroyed.size() > 1 ? "," : "") + q(id) + ":" + set_error("forbidden");
@@ -1429,8 +1454,15 @@ void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> 
             {
                 const bool text = k == "name" || k == "textSignature" || k == "htmlSignature";
                 const bool list = k == "replyTo" || k == "bcc";
+                const auto address = [](const jvalue& a) {
+                    const jvalue* name = json::member(a, "name");
+                    const jvalue* email = json::member(a, "email");
+                    return a.k == jvalue::kind::object && email && email->k == jvalue::kind::string &&
+                           (!name || name->k == jvalue::kind::null || name->k == jvalue::kind::string);
+                };
                 fine = fine && ((text && x.k == jvalue::kind::string && x.s.size() <= 16384) ||
-                                (list && (x.k == jvalue::kind::null || x.k == jvalue::kind::array)));
+                                (list && (x.k == jvalue::kind::null ||
+                                          (x.k == jvalue::kind::array && std::all_of(x.items.begin(), x.items.end(), address)))));
             }
             if (!fine)
             {
@@ -1438,17 +1470,19 @@ void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> 
                                set_error(id.starts_with("i") ? "invalidProperties" : "notFound");
                 continue;
             }
+            jvalue next = v;
             for (const auto& [k, x] : patch.members)
-                if (jvalue* have = json::member(v, k))
+                if (jvalue* have = json::member(next, k))
                     *have = x;
                 else
-                    v.members.emplace_back(k, x);
-            const std::string text = json::written(v);
+                    next.members.emplace_back(k, x);
+            const std::string text = json::written(next);
             if (m_store.set_meta(m_user, {}, std::string(identity_entry), &text) != imap_store::meta_refusal::none)
             {
                 not_updated += (not_updated.size() > 1 ? "," : "") + q(id) + ":" + set_error("tooLarge");
                 continue;
             }
+            v = std::move(next);
             updated += (updated.size() > 1 ? "," : "") + q(id) + ":null";
         }
     const std::string* now = m_store.meta(m_user, {}, std::string(identity_entry));
@@ -1485,9 +1519,7 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
             s += ",";
     };
     const auto resolve = [cs](std::string id) {
-        if (!id.empty() && id.front() == '#')
-            return cs->created.count(id.substr(1)) ? cs->created[id.substr(1)] : std::string();
-        return id;
+        return resolved(cs->created, id);
     };
     auto step = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = step;
@@ -1707,6 +1739,12 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
                         j->not_updated += q(given) + ":" + set_error("tooManyMailboxes", "an Email is in one mailbox");
                         return (*self)();
                     }
+                    if (v.members.front().second.k != jvalue::kind::boolean || !v.members.front().second.b)
+                    {
+                        comma(j->not_updated);
+                        j->not_updated += q(given) + ":" + set_error("invalidProperties", "a mailboxIds value is true");
+                        return (*self)();
+                    }
                     move_to = resolve(v.members.front().first);
                 }
                 else if (k.starts_with("mailboxIds/"))
@@ -1755,7 +1793,7 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
             }
             // A move is a copy, keeping the object's name and so the id, and the original taken away.
             m_store.copy(m_user, w.f, {w.uid}, to->name, false,
-                         [this, j, self, comma, given, w, to, id, alive](bool ok, uint32_t, std::vector<uint32_t> made) {
+                         [this, j, self, comma, given, w, to, alive](bool ok, uint32_t, std::vector<uint32_t> made) {
                              if (!*alive)
                                  return;
                              if (!ok || made.empty())
@@ -1787,7 +1825,7 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
                 j->not_destroyed += q(given) + ":" + set_error("notFound");
                 return (*self)();
             }
-            m_store.expunge(m_user, w.f, {w.uid}, true, [j, self, comma, given, alive](std::vector<uint32_t> gone) {
+            m_store.expunge(m_user, w.f, {w.uid}, true, [j, self, comma, given, real = resolve(given), alive](std::vector<uint32_t> gone) {
                 if (!*alive)
                     return;
                 if (gone.empty())
@@ -1798,7 +1836,7 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
                 else
                 {
                     comma(j->destroyed);
-                    j->destroyed += q(given);
+                    j->destroyed += q(real);
                 }
                 (*self)();
             });
@@ -1841,8 +1879,7 @@ void jmap_session::email_import(const jvalue& args, const std::shared_ptr<call_s
                                               j->created + "},\"notCreated\":" + j->not_created + "}}"}});
         const auto [cid, obj] = j->emails[j->at++];
         std::string mbox = first_true(json::member(obj, "mailboxIds"));
-        if (!mbox.empty() && mbox.front() == '#')
-            mbox = cs->created.count(mbox.substr(1)) ? cs->created[mbox.substr(1)] : std::string();
+        mbox = resolved(cs->created, mbox);
         const auto f = mailbox_by_id(mbox);
         if (!f)
         {
@@ -1924,8 +1961,6 @@ void jmap_session::email_parse(const jvalue& args, std::function<void(answer)> d
     j->view.html_values = flag("fetchHTMLBodyValues");
     j->view.all_values = flag("fetchAllBodyValues");
     j->view.max_value = static_cast<size_t>(std::max<int64_t>(0, json::int_of(args, "maxBodyValueBytes", 0)));
-    // A body property list given is kept by the request, which outlives this job.
-    j->view.body_props = nullptr;
     auto step = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = step;
     *step = [this, j, weak, done, alive = m_alive] {
@@ -2034,6 +2069,8 @@ void jmap_session::vacation_set(const jvalue& args, std::function<void(answer)> 
     }
     if (const jvalue* c = json::member(args, "create"); c && c->k == jvalue::kind::object && !c->members.empty())
         return done({{"error", set_error("invalidArguments", "a VacationResponse is a singleton: update it")}});
+    if (const jvalue* d = json::member(args, "destroy"); d && d->k == jvalue::kind::array && !d->items.empty())
+        return done({{"error", set_error("invalidArguments", "a VacationResponse is not destroyed: turn it off")}});
     if (const jvalue* u = json::member(args, "update"); u && u->k == jvalue::kind::object)
         for (const auto& [id, patch] : u->members)
         {
@@ -2073,8 +2110,6 @@ void jmap_session::vacation_set(const jvalue& args, std::function<void(answer)> 
             }
             updated += (updated.size() > 1 ? "," : "") + q(id) + ":null";
         }
-    if (const jvalue* d = json::member(args, "destroy"); d && d->k == jvalue::kind::array && !d->items.empty())
-        return done({{"error", set_error("invalidArguments", "a VacationResponse is not destroyed: turn it off")}});
     const std::string* now = m_store.meta(m_user, {}, std::string(vacation_entry));
     done({{"VacationResponse/set", "{\"accountId\":" + q(account_of(m_user)) + ",\"oldState\":" +
                                        q(old_state) + ",\"newState\":" + q(entry_state(now)) + ",\"updated\":" + updated +
@@ -2177,8 +2212,10 @@ void jmap_session::push_set(const jvalue& args, const std::shared_ptr<call_state
                 comma(not_created);
                 not_created += q(cid) + ":" +
                                set_error(subs.items.size() >= 50 ? "overQuota" : "invalidProperties",
-                                         !url_ok ? "url is an https:// URL" : !keys_ok ? "keys are a P-256 point and 16 bytes"
-                                                                                       : "deviceClientId is needed");
+                                         !url_ok ? "url is an https:// URL"
+                                         : !keys_ok ? "keys are a P-256 point and 16 bytes"
+                                         : device.empty() || device.size() > 255 ? "deviceClientId is needed"
+                                                                                 : "there are 50 subscriptions already");
                 continue;
             }
             const std::string id = "P" + socketley::random_hex(8);
@@ -2205,8 +2242,7 @@ void jmap_session::push_set(const jvalue& args, const std::shared_ptr<call_state
                                        ",\"verificationCode\":" + q(code) + "}");
         }
     const auto find = [&subs, &cs](std::string id) -> jvalue* {
-        if (!id.empty() && id.front() == '#')
-            id = cs->created.count(id.substr(1)) ? cs->created[id.substr(1)] : std::string();
+        id = resolved(cs->created, id);
         for (auto& sub : subs.items)
             if (json::string_of(sub, "id") == id)
                 return &sub;
@@ -2224,36 +2260,44 @@ void jmap_session::push_set(const jvalue& args, const std::shared_ptr<call_state
             }
             bool fine = true;
             std::string answer_expires;
+            const char* why = "a property is not one to set";
+            jvalue next = *sub;
             for (const auto& [k, v] : patch.members)
             {
                 if (k == "verificationCode" && v.k == jvalue::kind::string)
                 {
                     // The code the push service carried to the client, which proves the client reads that URL.
-                    if (!socketley::crypto::secure_equal(v.s, json::string_of(*sub, "verificationCode")))
+                    if (!socketley::crypto::secure_equal(v.s, json::string_of(next, "verificationCode")))
+                    {
                         fine = false;
+                        why = "the verificationCode is not the one pushed";
+                    }
                     else
                     {
                         jvalue yes;
                         yes.k = jvalue::kind::boolean;
                         yes.b = true;
-                        put(*sub, "verified", yes);
+                        put(next, "verified", yes);
                     }
                 }
                 else if (k == "expires")
                 {
                     answer_expires = capped(&v);
-                    put(*sub, "expires", string_value(answer_expires));
+                    put(next, "expires", string_value(answer_expires));
                 }
                 else if (k == "types" && (v.k == jvalue::kind::array || v.k == jvalue::kind::null))
-                    put(*sub, "types", v);
+                    put(next, "types", v);
                 else
                     fine = false;
             }
             comma(fine ? updated : not_updated);
             if (fine)
+            {
+                *sub = std::move(next);
                 updated += q(id) + ":" + (answer_expires.empty() ? std::string("null") : "{\"expires\":" + q(answer_expires) + "}");
+            }
             else
-                not_updated += q(id) + ":" + set_error("invalidProperties", "the verificationCode is not the one pushed");
+                not_updated += q(id) + ":" + set_error("invalidProperties", why);
         }
     for (const auto& id : strings_of(json::member(args, "destroy")))
     {
@@ -2267,7 +2311,7 @@ void jmap_session::push_set(const jvalue& args, const std::shared_ptr<call_state
         const std::string real(json::string_of(*sub, "id"));
         std::erase_if(subs.items, [&](const jvalue& x) { return json::string_of(x, "id") == real; });
         comma(destroyed);
-        destroyed += q(id);
+        destroyed += q(real);
     }
     // Kept with the states as they are now, from which the pushes begin, whenever the first look at them comes.
     jvalue entry;
@@ -2318,8 +2362,7 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
         {
             const auto [cid, obj] = j->creates[j->at++];
             std::string email_id(json::string_of(obj, "emailId"));
-            if (!email_id.empty() && email_id.front() == '#')
-                email_id = cs->created.count(email_id.substr(1)) ? cs->created[email_id.substr(1)] : std::string();
+            email_id = resolved(cs->created, email_id);
             where w;
             if (!locate(email_id, w))
             {
@@ -2345,16 +2388,27 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                 std::vector<std::string> rcpts;
                 // holduntil, a date, or holdfor, seconds: when it is sent, a month ahead at the most (RFC 4865).
                 int64_t hold = 0;
+                bool bad_until = false;
                 if (const jvalue* mf = json::member(envelope, "mailFrom"))
                 {
                     from = std::string(json::string_of(*mf, "email"));
                     if (const jvalue* params = json::member(*mf, "parameters"))
                     {
                         if (const std::string_view until = json::string_of(*params, "holduntil"); !until.empty())
+                        {
                             hold = utc_ms(until);
+                            bad_until = hold < 0;
+                        }
                         else if (const std::string_view secs = json::string_of(*params, "holdfor"); !secs.empty())
-                            hold = wall::now_ms() + std::strtoll(std::string(secs).c_str(), nullptr, 10) * 1000;
+                            hold = wall::now_ms() +
+                                   std::clamp<long long>(std::strtoll(std::string(secs).c_str(), nullptr, 10), 0, 31 * 86400ll) * 1000;
                     }
+                }
+                if (bad_until)
+                {
+                    comma(j->not_created);
+                    j->not_created += q(cid) + ":" + set_error("invalidProperties", "holduntil is a UTC date");
+                    return (*self)();
                 }
                 if (hold > wall::now_ms() + 30ll * 86400000)
                 {
@@ -2368,8 +2422,7 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                 if (from.empty())
                 {
                     address a;
-                    std::string display;
-                    from = parse_mailbox(header_value(head, "From"), a, &display) ? a.text() : own;
+                    from = parse_mailbox(header_value(head, "From"), a) ? a.text() : own;
                 }
                 if (rcpts.empty())
                     for (const char* h : {"To", "Cc", "Bcc"})

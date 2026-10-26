@@ -398,6 +398,8 @@ std::vector<std::unique_ptr<server_instance>>* g_graveyard = nullptr;
 std::string* g_http_dir = nullptr;
 
 int g_cb_mode = 0;   // what the C++ callbacks do; see cb_mode_name()
+unsigned g_auth_n = 0;   // which auth call this is within the input
+unsigned g_stop_n = 0;   // which reentrant serve this is within the input
 
 struct world;
 world* g_world = nullptr;
@@ -523,8 +525,7 @@ bool cb_on_auth(int)
 {
     // Refuse one in four, which is the path that closes a connection between
     // the accept and the first read — before it ever had a read armed.
-    static unsigned n = 0;
-    return (++n & 3) != 0;
+    return (++g_auth_n & 3) != 0;
 }
 
 void cb_on_tick(double) {}
@@ -569,8 +570,7 @@ void stub_cache::serve_request(std::string_view payload, std::string& out)
                 std::vector<int> fds = rt->clients();
                 if (!fds.empty() && (payload.size() & 1))
                     rt->disconnect(fds[payload.size() % fds.size()]);
-                static unsigned n = 0;
-                if ((++n & 7) == 0)
+                if ((++g_stop_n & 7) == 0)
                     rt->stop(*g_loop);
             }
             out.append("reentrant\n");
@@ -1034,6 +1034,7 @@ void run_step(world& w, const step& s)
                         {
                             w.udp = (s.b & 1) != 0;
                             w.rt->set_udp(w.udp);
+                            w.rt->set_master_pw(w.udp ? "" : "fuzzpw");
                         }
                         break;
                 }
@@ -1091,6 +1092,18 @@ void run_step(world& w, const step& s)
 
 // ──────────────────────────── one-time setup ────────────────────────────────
 
+void remove_http_dir()
+{
+    if (!g_http_dir)
+        return;
+    for (const char* name : { "index.html", "blob.bin" })
+    {
+        const std::string path = *g_http_dir + "/" + name;
+        ::unlink(path.c_str());
+    }
+    ::rmdir(g_http_dir->c_str());
+}
+
 void build_http_dir()
 {
     char dir[128];
@@ -1114,6 +1127,7 @@ void build_http_dir()
     write_file("blob.bin", std::string(256 * 1024, 'B'));
 
     g_http_dir = new std::string(dir);
+    std::atexit(remove_http_dir);
 }
 
 void init_once()
@@ -1192,6 +1206,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     w.udp    = (data[0] & 0x80) != 0;
     w.tick   = (data[1] & 0x80) != 0;
     g_cb_mode = data[2] % 6;
+    g_auth_n  = 0;
+    g_stop_n  = 0;
 
     // The cache stub starts registered and in its plainest mode for every
     // input, so that replaying one input on its own reproduces what it did

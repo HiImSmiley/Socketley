@@ -9,7 +9,6 @@
 #include <unordered_set>
 #include <memory>
 #include <vector>
-#include <queue>
 #include <random>
 #include <optional>
 #include <functional>
@@ -609,7 +608,6 @@ public:
     void clear_backends();
     void set_protocol(proxy_protocol p);
     void set_strategy(proxy_strategy s);
-    void set_runtime_manager(runtime_manager* mgr);
 
     // The manager's name/group to endpoint snapshot, which is all the proxy
     // needs to know about other runtimes and arrives as data rather than as a

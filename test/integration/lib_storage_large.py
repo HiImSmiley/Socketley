@@ -148,8 +148,14 @@ check("a range deep in the object is 206 with the right bytes",
       r.getheader("Content-Range") == "bytes %d-%d/%d" % (first, last, SIZE), (r.status, len(piece)))
 
 # ── the connection and the runtime after a large transfer ───────────────────
-s, body = request("HEAD", "/large-bucket/huge.bin")
-check("the runtime answers a HEAD afterwards with the object's length", s == 200)
+conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=120)
+conn.request("HEAD", "/large-bucket/huge.bin")
+r = conn.getresponse()
+r.read()
+head_len = r.getheader("Content-Length")
+conn.close()
+check("the runtime answers a HEAD afterwards with the object's length", r.status == 200 and head_len == str(SIZE),
+      (r.status, head_len, SIZE))
 
 # An overwrite of the giant with a small object, and the space is given back.
 request("DELETE", "/large-bucket/huge.bin")
@@ -159,7 +165,7 @@ check("the large object is deletable", request("HEAD", "/large-bucket/huge.bin")
 request("PUT", "/large-bucket/copy-src", headers={"Content-Length": "0"})
 conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=300)
 conn.putrequest("PUT", "/large-bucket/copy-src")
-conn.putheader("Content-Length", str(SIZE // 4))
+conn.putheader("Content-Length", str((SIZE_MIB // 4) << 20))
 conn.endheaders()
 for _ in range(SIZE_MIB // 4):
     conn.send(BLOCK)

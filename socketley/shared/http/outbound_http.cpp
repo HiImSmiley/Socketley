@@ -470,7 +470,10 @@ void http_peer::advance()
         {
             const uint64_t gen = m_gen;
             auto alive = m_alive;
-            m_req.source([this, alive, gen](bool ok, std::string_view piece)
+            // A copy is called, since a source that answers at once can reach finish(), which clears m_req and with it
+            // the function still running.
+            const auto source = m_req.source;
+            source([this, alive, gen](bool ok, std::string_view piece)
             {
                 if (!*alive || m_gen != gen)
                     return;
@@ -707,15 +710,16 @@ void http_peer::got(const char* p, size_t n)
             m_in.append(buf, static_cast<size_t>(r));
         }
     }
-    if (answer_complete())
-    {
-        finish(true);
-        return;
-    }
-    // Past the cap is no answer this client reads, and not a truncated one handed on as whole.
+    // Past the cap is no answer this client reads, and not a truncated one handed on as whole; asked first, since the
+    // read that crosses it can be the one that completes it.
     if (m_in.size() > answer_cap)
     {
         finish(false, "the answer is larger than 1 MiB");
+        return;
+    }
+    if (answer_complete())
+    {
+        finish(true);
         return;
     }
     if (m_ssl && !m_sent && !m_write_failed)

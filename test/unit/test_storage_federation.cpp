@@ -42,6 +42,13 @@ constexpr int64_t now_s = 1'760'000'000;
 const std::string the_issuer = "https://idp.example";
 const std::string the_client = "socketley";
 
+struct dir_guard
+{
+    std::string d;
+    explicit dir_guard(std::string p) : d(std::move(p)) {}
+    ~dir_guard() { std::error_code ec; std::filesystem::remove_all(d, ec); }
+};
+
 const unsigned char* bytes(std::string_view s)
 {
     return reinterpret_cast<const unsigned char*>(s.data());
@@ -623,6 +630,7 @@ TEST_CASE("the policy claim names users as a comma-separated string or an array"
 TEST_CASE("a JWKS file is read again when it changes and kept when it breaks")
 {
     const std::string dir  = temp_dir();
+    dir_guard guard(dir);
     const std::string path = dir + "/keys.json";
     federation_oidc cfg = oidc_cfg();
     cfg.jwks_path = path;
@@ -649,7 +657,6 @@ TEST_CASE("a JWKS file is read again when it changes and kept when it breaks")
     CHECK(v.verify(jwt(rsa_a(), "RS256", "r"), now_s, id, why));
     CHECK_FALSE(v.verify(jwt(rsa_b(), "RS256", "r"), now_s, id, why));
 
-    std::filesystem::remove_all(dir);
 }
 
 // ---- mapping ----
@@ -833,6 +840,7 @@ TEST_CASE("a provider file with a bad line is refused, naming the line")
 TEST_CASE("a provider file is loaded with its relative paths under its own directory")
 {
     const std::string dir = temp_dir();
+    dir_guard guard(dir);
     write_file(dir + "/federation.conf", "oidc issuer i\noidc client c\noidc jwks keys.json\n");
     federation_config cfg;
     std::string why;
@@ -843,7 +851,6 @@ TEST_CASE("a provider file is loaded with its relative paths under its own direc
     CHECK(why.starts_with(dir + "/bad.conf: "));
     CHECK_FALSE(load_federation(dir + "/missing.conf", cfg, why));
     CHECK(why.find("cannot read") != std::string::npos);
-    std::filesystem::remove_all(dir);
 }
 
 // ---- LDAP ----

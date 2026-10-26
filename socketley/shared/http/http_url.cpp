@@ -70,7 +70,8 @@ bool parse_http_url(std::string_view url, http_target& t, std::string& why)
         why = "a URL has no spaces";
         return false;
     }
-    if (!port.empty() || (slash != std::string_view::npos && authority.ends_with(":")))
+    // A colon with no port after it is refused with a path or without one alike.
+    if (!port.empty() || authority.ends_with(":"))
     {
         uint32_t p = 0;
         const auto r = std::from_chars(port.data(), port.data() + port.size(), p);

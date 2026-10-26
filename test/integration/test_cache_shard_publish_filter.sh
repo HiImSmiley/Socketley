@@ -104,7 +104,8 @@ def drain(socks, want, deadline=2.0):
     for s in socks:
         buf = b''
         s.settimeout(0.05)
-        while time.time() < end:
+        lim = max(end, time.time() + 0.25)
+        while time.time() < lim:
             try:
                 d = s.recv(65536)
             except socket.timeout:

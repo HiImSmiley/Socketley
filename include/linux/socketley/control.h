@@ -141,7 +141,12 @@ inline result ipc_send(const std::string& socket_path, std::string_view command)
     for (;;)
     {
         n = read(fd, buf, sizeof(buf));
-        if (n <= 0)
+        if (n < 0)
+        {
+            close(fd);
+            return {-1, "read() failed before the reply's terminator"};
+        }
+        if (n == 0)
             break;
 
         nul = static_cast<char*>(std::memchr(buf, '\0', static_cast<size_t>(n)));
@@ -657,6 +662,16 @@ inline result cache_keys(const std::string& cache_name, const std::string& patte
     return command("action " + cache_name + " keys " + pattern);
 }
 
+inline bool token_ok(const std::string& t)
+{
+    if (t.empty())
+        return false;
+    for (unsigned char c : t)
+        if (c == ' ' || (c >= '\t' && c <= '\r'))
+            return false;
+    return true;
+}
+
 inline result cache_mget(const std::string& cache_name,
                          const std::vector<std::string>& keys)
 {
@@ -665,6 +680,8 @@ inline result cache_mget(const std::string& cache_name,
     std::string cmd = "action " + cache_name + " mget";
     for (const auto& k : keys)
     {
+        if (!token_ok(k))
+            return {1, "mget keys must be non-empty and hold no whitespace"};
         cmd += ' ';
         cmd += k;
     }
@@ -679,6 +696,8 @@ inline result cache_mset(const std::string& cache_name,
     std::string cmd = "action " + cache_name + " mset";
     for (const auto& [k, v] : kvs)
     {
+        if (!token_ok(k) || !token_ok(v))
+            return {1, "mset keys and values must be non-empty and hold no whitespace"};
         cmd += ' ';
         cmd += k;
         cmd += ' ';

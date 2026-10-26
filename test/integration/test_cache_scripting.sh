@@ -55,6 +55,27 @@ RESP_PY="$SOCKETLEY_TMPD/s.py"
 cat > "$RESP_PY" <<'PY'
 import socket, sys, json
 port = int(sys.argv[1]); cmds = json.loads(sys.argv[2])
+def skip(b, i):
+    e = b.find(b'\r\n', i)
+    if e < 0: return None
+    t = b[i:i+1]; line = b[i+1:e]; e += 2
+    if t in (b'+', b'-', b':', b'_'): return e
+    n = int(line)
+    if t == b'$':
+        if n < 0: return e
+        return e + n + 2 if e + n + 2 <= len(b) else None
+    if n < 0: return e
+    for _ in range(n):
+        e = skip(b, e)
+        if e is None: return None
+    return e
+def replies(b):
+    n = 0; i = 0
+    while i < len(b):
+        i = skip(b, i)
+        if i is None: break
+        n += 1
+    return n
 out = b''
 try:
     s = socket.create_connection(('127.0.0.1', port), timeout=20)
@@ -68,7 +89,7 @@ try:
         except socket.timeout: break
         if not b: break
         out += b
-        if out.endswith(b'\r\n'): break
+        if replies(out) >= len(cmds): break
     s.close()
 except Exception as e: print('ERROR:' + type(e).__name__)
 sys.stdout.write(out.decode('latin1').replace('\r\n', ' | '))
@@ -92,7 +113,7 @@ echo "--- 1. the sandbox, door by door ---"
 # Each of these is a way out of the interpreter, and `nil` is the only
 # acceptable answer.  ffi is last because it is the one that matters most.
 for lib in io os package debug require load loadstring dofile loadfile getfenv setfenv; do
-    want "$lib is not there" "nil" "[[\"EVAL\",\"return type($lib)\",\"0\"]]"
+    want "$lib is not there" '$3 | nil | ' "[[\"EVAL\",\"return type($lib)\",\"0\"]]"
 done
 # require is gone, so this is belt and braces: if some path to it survives,
 # the script says so rather than the test assuming it cannot.
@@ -195,7 +216,7 @@ echo "--- 7. the globals are sealed, so one script cannot leave state for the ne
 # cleared it -- a channel between two clients that neither opened.
 want "writing a global is refused, and names the variable" "leaked" \
   '[["EVAL","leaked = 42","0"]]'
-want "and nothing was left behind" "nil" \
+want "and nothing was left behind" '$3 | nil | ' \
   '[["EVAL","return tostring(leaked)","0"]]'
 # The seal must not reach the things a script legitimately uses.
 want "locals still work" ":8" \

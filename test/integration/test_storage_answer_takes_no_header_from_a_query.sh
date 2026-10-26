@@ -34,7 +34,10 @@ echo "=== Integration: a storage answer takes no header from a query ==="
 daemon_start "$BIN"
 KEY=AKIAHEADERINJECT0000
 SEC=headerinjectsecretheaderinject00
-"$BIN" create storage hdr -p "$P" --dir "$T/stg" --access-key "$KEY" --secret-key "$SEC" -s >/dev/null 2>&1
+if ! "$BIN" create storage hdr -p "$P" --dir "$T/stg" --access-key "$KEY" --secret-key "$SEC" -s >/dev/null 2>&1; then
+    echo "  FAIL [create]: the runtime was not created"
+    exit 1
+fi
 for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$P/" && break; sleep 0.1; done
 S() { curl -s -m 10 --user "$KEY:$SEC" --aws-sigv4 'aws:amz:us-east-1:s3' "$@"; }
 S -o /dev/null -X PUT "http://127.0.0.1:$P/bkt"
@@ -43,6 +46,7 @@ printf 'hello\n' | S -o /dev/null -X PUT --data-binary @- "http://127.0.0.1:$P/b
 Q='response-content-disposition=attachment%0D%0ASet-Cookie:%20sid%3Devil'
 for round in first again; do
     head=$(S -s -D - -o /dev/null "http://127.0.0.1:$P/bkt/k?$Q" | tr -d '\r')
+    expect "the object is answered before its headers are read ($round GET)" "$(head -1 <<<"$head" | awk '{print $2}')" 200
     expect "a CR LF in an override starts no header of its own ($round GET)" "$(grep -ci '^set-cookie' <<<"$head")" 0
     expect "and the object is still answered ($round GET)" "$(head -1 <<<"$head" | awk '{print $2}')" 200
 done

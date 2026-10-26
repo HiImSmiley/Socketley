@@ -69,7 +69,7 @@ LEFT="$BEFORE"
 for _ in $(seq 1 50); do LEFT=$(carriers "$SOCK"); [ -z "$LEFT" ] && break; sleep 0.1; done
 [ -z "$LEFT" ] && pass || fail "nothing of a killed test is left running" "still running: $LEFT"
 for _ in $(seq 1 30); do [ -d "$TMPD" ] || break; sleep 0.1; done
-[ ! -d "$TMPD" ] && pass || fail "a killed test's state directory is removed" "$TMPD is still there"
+[ -n "$TMPD" ] && [ ! -d "$TMPD" ] && pass || fail "a killed test's state directory is removed" "$TMPD is still there"
 
 # ── 4. a test that ends normally keeps what it cleans up itself ────────────
 daemon_isolate dieswith-self

@@ -19,7 +19,6 @@
 #include "../shared/runtime/runtime_definitions.h"
 #include "../shared/ipc/worker_protocol.h"
 
-class proxy_instance;
 class runtime_instance;
 struct runtime_config;
 
@@ -170,13 +169,6 @@ public:
     static void answer_map_request(int reply_fd, uint64_t ticket, bool ok,
                                    std::string_view err);
 
-    // What to do when the child dies without being asked to.
-    enum class death_policy
-    {
-        restart,   // fork a new one and re-send config; the state stays running
-        fail,      // leave the runtime in `failed` for the operator to see
-    };
-
     proxy_supervisor(runtime_instance* placeholder, std::string exec_path);
     ~proxy_supervisor();
 
@@ -191,8 +183,6 @@ public:
     { m_shard_index = index; m_shard_region_fd = region_fd;
       m_shard_clients_fd = clients_fd; }
 
-    uint32_t shard_index() const { return m_shard_index; }
-
     // The shard mesh ends this child inherits, consumed by the fork because
     // the daemon closes its own copies once the whole set is forked, so a
     // restarted shard relays instead.
@@ -205,7 +195,6 @@ public:
 
     // Ask the child to stop serving but stay alive, or to exit outright.
     void send_start();
-    void send_stop();
     void shutdown();
 
     // Ask the child to re-run its script, which is the only way `reload-lua`
@@ -350,9 +339,6 @@ public:
     // ever waited on the child again.
     pid_t release_pid() { const pid_t p = m_pid; m_pid = 0; return p; }
 
-    void set_death_policy(death_policy p) { m_policy = p; }
-    death_policy get_death_policy() const { return m_policy; }
-
 private:
     void   close_control();
     bool   write_frame(const std::string& framed);
@@ -386,7 +372,7 @@ private:
     void   close_link_chan();
 
     void   apply_stats(const std::string& payload);
-    void   ingest(const std::string& buf);
+    void   ingest();
 
     // "runtime 'name' shard N: ", the start of every line this class logs
     // about its worker, because the daemon supervises many and a crash that
@@ -495,7 +481,6 @@ private:
     // once rather than once per request.
     int          m_link_chan_fd{-1};
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_granted;
-    death_policy m_policy{death_policy::restart};
     unsigned     m_restarts{0};
     std::chrono::steady_clock::time_point m_last_restart{};
 };

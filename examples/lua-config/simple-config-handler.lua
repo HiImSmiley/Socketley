@@ -15,7 +15,7 @@
 function on_start()
     socketley.log("Runtime started: " .. self.name)
     socketley.log("  Type: " .. self.type)
-    socketley.log("  Port: " .. self.port)
+    socketley.log("  Port: " .. tostring(self.port))
 end
 
 function on_stop()

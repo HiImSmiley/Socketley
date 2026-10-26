@@ -29,6 +29,14 @@ std::string temp_path()
     return "/tmp/skl-sync-index-" + std::to_string(::getpid()) + "-" + std::to_string(++n) + ".idx";
 }
 
+// Removes its file on every exit path, a failed REQUIRE included.
+struct tmp_file
+{
+    std::string path;
+    explicit tmp_file(std::string p) : path(std::move(p)) {}
+    ~tmp_file() { ::unlink(path.c_str()); }
+};
+
 index_entry made(uint64_t size, int64_t mtime, std::string etag)
 {
     index_entry e;
@@ -60,7 +68,8 @@ void truncate_by(const std::string& p, size_t bytes)
 
 TEST_CASE("a file carried is remembered, and one gone is forgotten")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     {
         sync_index ix;
@@ -89,12 +98,12 @@ TEST_CASE("a file carried is remembered, and one gone is forgotten")
     CHECK(ix.find("ui/photos", "a.jpg") == nullptr);
     REQUIRE(ix.find("ui/photos", "b/c.txt") != nullptr);
     CHECK(ix.find("ui/photos", "b/c.txt")->etag == "etag-b");
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("one path carried to two targets is two records")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     sync_index ix;
     REQUIRE(ix.open(p, "/srv\nlaptop", why));
@@ -106,12 +115,12 @@ TEST_CASE("one path carried to two targets is two records")
     CHECK(ix.find("ui/photos", "a.jpg") == nullptr);
     REQUIRE(ix.find("ui2/photos", "a.jpg") != nullptr);
     CHECK(ix.find("ui2/photos", "a.jpg")->etag == "two");
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("a record cut short by a crash costs that record and no other")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     {
         sync_index ix;
@@ -134,12 +143,12 @@ TEST_CASE("a record cut short by a crash costs that record and no other")
     REQUIRE(again.open(p, "/srv\nlaptop", why));
     CHECK(again.size() == 2);
     CHECK(again.find("t", "third") != nullptr);
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("a file that is not an index is refused rather than read as one")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     REQUIRE(fd >= 0);
     const std::string junk = "this is somebody else's file\n";
@@ -149,12 +158,12 @@ TEST_CASE("a file that is not an index is refused rather than read as one")
     std::string why;
     CHECK_FALSE(ix.open(p, "/srv\nlaptop", why));
     CHECK(why.find("not a sync index") != std::string::npos);
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("rewriting the index keeps every live record and drops the dead ones")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     sync_index ix;
     REQUIRE(ix.open(p, "/srv\nlaptop", why));
@@ -181,13 +190,13 @@ TEST_CASE("rewriting the index keeps every live record and drops the dead ones")
         CHECK(e->size == static_cast<uint64_t>(i));
         CHECK(again.find("t", "drop-" + std::to_string(i)) == nullptr);
     }
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("a path with a tab, a newline or a quote in it comes back as it went in")
 {
     // The record is length-prefixed exactly so these need no escaping; a line-based file would have lost them.
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     const std::string odd = "a\tb\nc\"d'e\\f g.txt";
     {
@@ -200,7 +209,6 @@ TEST_CASE("a path with a tab, a newline or a quote in it comes back as it went i
     CHECK(ix.size() == 1);
     REQUIRE(ix.find("t", odd) != nullptr);
     CHECK(ix.find("t", odd)->size == 7);
-    ::unlink(p.c_str());
 }
 
 // Flips one byte at `off`, as a disk that wrote one page and not the one before it leaves the file.
@@ -217,7 +225,8 @@ static void flip_at(const std::string& p, size_t off)
 
 TEST_CASE("a damaged record ends the file there, and nothing after it is believed")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     size_t after_first = 0;
     {
@@ -238,12 +247,12 @@ TEST_CASE("a damaged record ends the file there, and nothing after it is believe
     // The third was whole, and is still not believed: it came after a record nobody can vouch for.
     CHECK(ix.find("t", "third") == nullptr);
     CHECK(file_size(p) == after_first);
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("an index kept for another directory or prefix is begun again, and the same one is read")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     {
         sync_index ix;
@@ -270,12 +279,12 @@ TEST_CASE("an index kept for another directory or prefix is begun again, and the
     sync_index other;
     REQUIRE(other.open(p, "/elsewhere\ndesktop", why));
     CHECK(other.size() == 0);
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("an etag longer than a record holds is kept short, and the records after it still read")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     {
         sync_index ix;
@@ -291,12 +300,12 @@ TEST_CASE("an etag longer than a record holds is kept short, and the records aft
     CHECK(ix.find("t", "long")->etag == std::string(255, 'x'));
     REQUIRE(ix.find("t", "after") != nullptr);
     CHECK(ix.find("t", "after")->size == 2);
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("a file holding part of the magic is the index a crash left before its first record")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     REQUIRE(fd >= 0);
     REQUIRE(::write(fd, "SKLS", 4) == 4);
@@ -309,12 +318,12 @@ TEST_CASE("a file holding part of the magic is the index a crash left before its
     sync_index again;
     REQUIRE(again.open(p, "s", why));
     CHECK(again.size() == 1);
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("a target no longer named is forgotten, and stays forgotten")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     std::string why;
     {
         sync_index ix;
@@ -331,5 +340,4 @@ TEST_CASE("a target no longer named is forgotten, and stays forgotten")
     CHECK(ix.size() == 1);
     CHECK(ix.find("ui/photos", "a") != nullptr);
     CHECK(ix.find("old/photos", "a") == nullptr);
-    ::unlink(p.c_str());
 }

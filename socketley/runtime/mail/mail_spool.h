@@ -133,7 +133,6 @@ public:
     void read(const entry_ptr& e, uint64_t off, uint32_t len, std::function<void(bool ok, std::string_view bytes)> cb);
 
     uint64_t bytes() const { return m_bytes; }
-    uint64_t written() const { return m_written; }
     uint64_t write_failures() const { return m_write_failures; }
     // Syncs of the segments and the messages they committed, and the segments on the disk.
     uint64_t commits() const { return m_commits; }
@@ -240,7 +239,6 @@ private:
     uint64_t m_next_writer{1};
     uint64_t m_bytes{0};
     uint64_t m_kept{0};
-    uint64_t m_written{0};
     uint64_t m_write_failures{0};
     // The segments by generation, the current one taking records, and those ready or free to be made ready.
     std::map<uint32_t, segment> m_segs;

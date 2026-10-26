@@ -32,6 +32,7 @@ set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ports.sh"
+. "$(dirname "$0")/lib_ready.sh"
 daemon_isolate cachescan
 PASS=0; FAIL=0; TOTAL=0
 
@@ -51,7 +52,7 @@ echo "=== Integration: SCAN completeness and resume cost ==="
 daemon_start "$BIN"
 PORT=$((SL_PORT_BASE + 940))
 "$BIN" create cache scan_c -p "$PORT" -s >/dev/null 2>&1 || true
-sleep 0.4
+ready_tcp 127.0.0.1 "$PORT" 15 || { echo "  FAIL: the cache never listened"; exit 1; }
 
 # A keyspace across all four maps: the cursor has to carry which map it is in.
 python3 -c "

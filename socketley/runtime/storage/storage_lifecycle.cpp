@@ -365,7 +365,7 @@ void storage_run::lifecycle_issue(lifecycle_pass& p)
                 ++m_lc->expired;
             notify_delete(bucket, key);
         }
-        else if (s != st::ok && s != st::no_such_bucket)
+        else if (s != st::ok && s != st::no_such_bucket && s != st::locked)
             LOG_WARN(("storage: lifecycle could not remove " + bucket + "/" + key + ": " + status_name(s)).c_str());
         lifecycle_done(id);
     }, std::move(still_due), change_cause::lifecycle, lifecycle_origin());

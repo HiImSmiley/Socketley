@@ -121,7 +121,7 @@ if printf '%s' "$OUT" | grep -qa "on_start error" &&
          "actionable; 'could not start runtime' would not be"
 fi
 # And the operator is told which of the two situations they are in.
-if printf '%s' "$OUT" | grep -qa "running"; then pass; else
+if printf '%s' "$OUT" | grep -qa "created and running"; then pass; else
     fail "create -s says the runtime is nonetheless up" \
          "output: ${OUT:-<nothing>}" \
          "exit 1 with a live listener is unusual enough to have to be stated:" \

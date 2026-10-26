@@ -253,7 +253,7 @@ def mode_main(port):
     check("and read back as 1000", len(rules_of(get_lc()[1])) == 1000)
 
     no_id = doc(rule(days(9), prefix="n/"))
-    put_lc(no_id)
+    check("the configuration of a rule without an ID is taken", put_lc(no_id) == (200, None))
     rid = rules_of(get_lc()[1])[0]["id"]
     check("a rule without an ID is given one", bool(rid) and len(rid) <= 255, rid)
 

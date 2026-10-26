@@ -34,9 +34,9 @@ printf 'frames' | curl -s -o /dev/null -T - "$U/films/night.mp4"
 expect "the film is there" "$(curl -s "$U/films/night.mp4")" "frames"
 
 ui() { curl -s -m 5 -H 'X-Socketley-UI: 1' "$@"; }
-ui -o /dev/null -X POST -d '{"bucket":"films","key":"night.mp4","t":1200,"d":5400}' "$U/~ui/progress"
+expect "a position is answered as taken" "$(ui -o /dev/null -w '%{http_code}' -X POST -d '{"bucket":"films","key":"night.mp4","t":1200,"d":5400}' "$U/~ui/progress")" 204
 expect "the next visitor is shown nothing the last one watched" "$(ui "$U/~ui/progress")" "[]"
-expect "and nothing about it is kept on disk" "$(ls "$SOCKETLEY_TMPD/an/.ui/progress" 2>/dev/null | wc -l)" 0
+expect "and nothing about it is kept on disk" "$(find "$SOCKETLEY_TMPD/an" \( -ipath '*anonymous*' -o -path '*/.ui/progress/*' \) -type f 2>/dev/null | wc -l)" 0
 
 # The page's one script is let run by its hash and no other inline script is, so text that reached the page unescaped
 # could not run.

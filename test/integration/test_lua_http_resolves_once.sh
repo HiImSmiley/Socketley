@@ -149,6 +149,7 @@ cat > "$WORK/inner.sh" <<'INNEREOF'
 set -uo pipefail
 WORK=$1
 BIN=$2
+HERE=$3
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -173,6 +174,7 @@ CALLS=40
 echo 0 > "$WORK/queries"; echo 0 > "$WORK/requests"
 python3 "$WORK/fixture.py" "$WORK" "$PORT" >"$WORK/fx.out" 2>"$WORK/fx.log" &
 FXPID=$!
+trap 'kill "$FXPID" 2>/dev/null' EXIT
 for i in $(seq 1 60); do
     grep -q "dns up" "$WORK/fx.log" 2>/dev/null && grep -q "http up" "$WORK/fx.log" 2>/dev/null && break
     sleep 0.1
@@ -185,7 +187,7 @@ fi
 export HOME="$WORK/home"; mkdir -p "$HOME"
 export SOCKETLEY_SOCKET="$WORK/d.sock"
 
-. "$(dirname "$0")/lib_daemon.sh"
+. "$HERE/lib_daemon.sh"
 daemon_watch "$WORK"   # its processes go with it if it is killed
 queries()  { cat "$WORK/queries"  2>/dev/null || echo 0; }
 requests() { cat "$WORK/requests" 2>/dev/null || echo 0; }
@@ -319,4 +321,4 @@ echo "  $PASS/$TOTAL passed"
 INNEREOF
 chmod +x "$WORK/inner.sh"
 
-timeout 420 unshare -r -n -m "$WORK/inner.sh" "$WORK" "$BIN"
+timeout 420 unshare -r -n -m "$WORK/inner.sh" "$WORK" "$BIN" "$HERE"

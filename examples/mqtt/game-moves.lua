@@ -31,12 +31,16 @@ function on_client_message(client_id, msg)
     end
     local g = games[game] or { n = 0 }
     games[game] = g
-    g.n = g.n + 1
-    local record = socketley.json_encode({ n = g.n, move = move })
+    local n = g.n + 1
+    local record = socketley.json_encode({ n = n, move = move })
     local ok, err = socketley.mqtt.publish("games", "game/" .. game .. "/moves", record, { qos = 1 })
     if not ok then
         return reply(client_id, "not sent: " .. tostring(err))
     end
-    socketley.mqtt.publish("games", "game/" .. game .. "/last", record, { qos = 1, retain = true })
+    g.n = n
+    local ok2, err2 = socketley.mqtt.publish("games", "game/" .. game .. "/last", record, { qos = 1, retain = true })
+    if not ok2 then
+        return reply(client_id, "not sent as last: " .. tostring(err2))
+    end
     reply(client_id, "move " .. g.n .. " sent")
 end

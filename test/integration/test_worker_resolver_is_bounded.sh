@@ -78,7 +78,7 @@ echo "=== Integration: a worker's resolver is bounded, and an operator's is not 
 worker_on_port() {
     local port=$1 p holders
     holders=$(ss -ltnpH "sport = :$port" 2>/dev/null || true)
-    for p in $(pgrep -x socketley 2>/dev/null || true); do
+    for p in $(pgrep -P "$SOCKETLEY_DPID" 2>/dev/null || true); do
         grep -qz "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" "/proc/$p/environ" 2>/dev/null || continue
         [ "$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)" = "$SOCKETLEY_DPID" ] || continue
         case "$holders" in

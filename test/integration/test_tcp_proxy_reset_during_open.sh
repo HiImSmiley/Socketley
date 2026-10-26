@@ -160,10 +160,13 @@ except OSError:
     print("DEAD")
 PY
 
+# Captured first, because grep -q on a pipe can end ss with SIGPIPE under pipefail.
+listening() { local out; out=$(ss -ltn 2>/dev/null) || true; grep -q "$1" <<<"$out"; }
+
 python3 "$WORK/be.py" "$BPORT" >"$WORK/be.log" 2>&1 &
 BEPID=$!
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$BPORT " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$BPORT "; then
+for _ in $(seq 1 100); do listening ":$BPORT " && break; sleep 0.1; done
+if ! listening ":$BPORT "; then
     echo "  FATAL: the echo backend never bound $BPORT"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 
@@ -172,8 +175,8 @@ fi
 export SOCKETLEY_RECV_MULTISHOT=0
 daemon_start "$BIN"
 "$BIN" create proxy tcpr -p "$PPORT" --backend "127.0.0.1:$BPORT" --protocol tcp -s >/dev/null 2>&1 || true
-for _ in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$PPORT " && break; sleep 0.1; done
-if ! ss -ltn 2>/dev/null | grep -q ":$PPORT "; then
+for _ in $(seq 1 150); do listening ":$PPORT " && break; sleep 0.1; done
+if ! listening ":$PPORT "; then
     echo "  FATAL: the proxy never bound $PPORT"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 WORKER=$(ss -ltnp 2>/dev/null | awk -v p=":$PPORT" '$4 ~ p"$" {
@@ -239,7 +242,7 @@ else fail "the descriptors behind them come back" \
 # still counted and this row would fail for the defect it exists to exclude.
 "$BIN" stop tcpr >/dev/null 2>&1 || true
 "$BIN" start tcpr >/dev/null 2>&1 || true
-for _ in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$PPORT " && break; sleep 0.1; done
+for _ in $(seq 1 150); do listening ":$PPORT " && break; sleep 0.1; done
 timeout 120 python3 "$WORK/storm.py" "$PPORT" "$STORM" fin >/dev/null 2>&1 || true
 LEFT2=$(drain "$DRAIN_SECS")
 if [ "$LEFT2" = 0 ]; then pass

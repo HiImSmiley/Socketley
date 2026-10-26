@@ -51,7 +51,10 @@ int ipc_send(std::string_view command, std::string& data)
         size_t total = 0;
         while (total < msg.size())
         {
-            ssize_t w = write(fd, msg.data() + total, msg.size() - total);
+            // send, not write, so a daemon that closed first is an error here and not a SIGPIPE that ends the CLI.
+            ssize_t w = ::send(fd, msg.data() + total, msg.size() - total, MSG_NOSIGNAL);
+            if (w < 0 && errno == EINTR)
+                continue;
             if (w < 0) { close(fd); return ipc_unreachable; }
             total += static_cast<size_t>(w);
         }
@@ -117,8 +120,14 @@ int ipc_send(std::string_view command, std::string& data)
             close(fd);
             return ipc_no_answer;
         }
+        if (n < 0 && errno == EINTR)
+            continue;
+        // The end of the stream before the NUL is an answer cut short, which is not the daemon's to give a code to.
         if (n <= 0)
-            break;
+        {
+            close(fd);
+            return ipc_cut_short;
+        }
 
         nul = static_cast<char*>(std::memchr(buf, '\0', n));
         if (nul)
@@ -149,6 +158,12 @@ int ipc_report_failure(int rc)
         return 2;
     }
 
+    if (rc == ipc_cut_short)
+    {
+        std::cerr << "the daemon at " << daemon_handler::socket_path
+                  << " closed the connection before its answer was whole\n";
+        return 2;
+    }
     std::cerr << "failed to connect to daemon\n";
     return 2;
 }

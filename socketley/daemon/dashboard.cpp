@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -118,12 +119,13 @@ bool read_request(int fd, request& r, size_t max_body)
     std::string in;
     size_t end;
     char buf[8192];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     while ((end = in.find("\r\n\r\n")) == std::string::npos)
     {
         if (in.size() > 16384)
             return false;
         const ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n <= 0)
+        if (n <= 0 || std::chrono::steady_clock::now() > deadline)
             return false;
         in.append(buf, static_cast<size_t>(n));
     }
@@ -167,7 +169,7 @@ bool read_request(int fd, request& r, size_t max_body)
     while (r.body.size() < want)
     {
         const ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n <= 0)
+        if (n <= 0 || std::chrono::steady_clock::now() > deadline)
             return false;
         r.body.append(buf, static_cast<size_t>(n));
     }
@@ -664,9 +666,17 @@ void server::zone(int fd, const request& r)
     }
     const std::string tmp = path + ".dashboard." + std::to_string(::getpid());
     {
+        struct stat old{};
+        const bool had = ::stat(path.c_str(), &old) == 0;
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         f << text;
         f.close();
+        // The zone keeps the mode and owner it had, which the dns runtime's group reads it by.
+        if (had)
+        {
+            if (::chmod(tmp.c_str(), old.st_mode & 07777) != 0) {}
+            if (::chown(tmp.c_str(), old.st_uid, old.st_gid) != 0) {}
+        }
         std::error_code ec;
         if (!f || (std::filesystem::rename(tmp, path, ec), ec))
         {
@@ -759,17 +769,23 @@ void server::run(int fd, const request& r)
             said += i ? " " : "";
             if (args->items[0].s == "import" && i == 2)
                 said += "<document>";
+            else if (const size_t eq = w.find('=');
+                     eq != std::string::npos && (w.compare(0, eq, "--master-pw") == 0 ||
+                                                 w.compare(0, eq, "--secret-key") == 0 ||
+                                                 w.compare(0, eq, "--password") == 0))
+                said += w.substr(0, eq + 1) + "***";
             else
                 said += hide_next ? std::string("***") : w;
             hide_next = w == "--master-pw" || w == "--secret-key" || w == "--password";
         }
         LOG_INFO(("dashboard: " + who + " ran " + said.substr(0, 200) + " (" + std::to_string(rc) + ")").c_str());
     }
-    if (rc == ipc_unreachable || rc == ipc_no_answer)
+    if (rc < 0)
     {
         send(fd, 502, "text/plain; charset=utf-8",
              rc == ipc_no_answer ? "The daemon is still at it; look again in a moment.\n"
-                                 : "The daemon's control socket did not answer.\n");
+             : rc == ipc_cut_short ? "The daemon closed the connection before its answer was whole.\n"
+                                   : "The daemon's control socket did not answer.\n");
         return;
     }
     send(fd, 200, "application/json", "{\"code\":" + std::to_string(rc) + ",\"out\":" + socketley::json::quote(out) + "}");

@@ -124,8 +124,6 @@ private:
         }
     };
     mutable lookup_cache m_cache;
-
-public:
 };
 
 // Bounds on a file, so a mistake -- or a file somebody else can write -- cannot take the worker's memory.

@@ -1,5 +1,7 @@
 #include "git_names.h"
 
+#include <algorithm>
+
 namespace git_names
 {
 
@@ -50,6 +52,14 @@ bool valid_branch(std::string_view b, std::string& why)
     for (unsigned char c : b)
         ok = ok && c > ' ' && c < 0x7f && c != '~' && c != '^' && c != ':' && c != '?' && c != '*' && c != '[' &&
              c != '\\';
+    // And each part between slashes as git check-ref-format has it: not led by '.', not ending in ".lock".
+    for (size_t at = 0; ok && at <= b.size();)
+    {
+        const size_t slash = std::min(b.find('/', at), b.size());
+        const std::string_view part = b.substr(at, slash - at);
+        ok = !part.starts_with('.') && !part.ends_with(".lock");
+        at = slash + 1;
+    }
     if (!ok)
         why = "\"" + std::string(b) + "\" is no branch name";
     return ok;
@@ -105,6 +115,9 @@ std::string name_of(std::string_view url)
                    : '-';
     while (!out.empty() && (out.front() == '.' || out.front() == '-'))
         out.erase(0, 1);
+    // Kept to the length valid_name allows, or a long URL would be refused a name the user never gave.
+    if (out.size() > 100)
+        out.resize(100);
     return out.empty() || out == "_backups" ? std::string("repository") : out;
 }
 

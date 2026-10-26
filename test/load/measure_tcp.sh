@@ -42,6 +42,14 @@ total_unstable=0
 total_rounds=0
 dirty_passes=0
 
+PASS_RUNDIR=""
+cleanup() {
+    [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
+    [ -n "$PASS_RUNDIR" ] && rm -rf "$PASS_RUNDIR"
+    return 0
+}
+trap cleanup EXIT
+
 one_pass() {
     local tag="$1" port="$2"
     local dirty=0
@@ -49,6 +57,7 @@ one_pass() {
     local tw0 rundir
     tw0="$(time_wait_count)"
     rundir="$(make_run_dir)"
+    PASS_RUNDIR="$rundir"
 
     if ! start_daemon "$rundir"; then
         rm -rf "$rundir"

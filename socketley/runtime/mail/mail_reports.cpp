@@ -1,9 +1,10 @@
 #include "mail_reports.h"
 
 #include <algorithm>
-#include <array>
 #include <ctime>
 
+#include "../../shared/json/json_escape.h"
+#include "../../shared/util/crc.h"
 #include "../../shared/util/random_id.h"
 
 namespace socketley::mail
@@ -31,20 +32,6 @@ std::string xml(std::string_view s)
     return out;
 }
 
-std::string json(std::string_view s)
-{
-    std::string out = "\"";
-    for (const char c : s)
-    {
-        if (c == '"' || c == '\\')
-            out += '\\';
-        if (static_cast<unsigned char>(c) < 0x20)
-            continue;
-        out += c;
-    }
-    return out + "\"";
-}
-
 std::string iso(int64_t t)
 {
     std::tm tm{};
@@ -55,31 +42,16 @@ std::string iso(int64_t t)
     return buf;
 }
 
-uint32_t crc32(std::string_view data)
-{
-    static const auto table = [] {
-        std::array<uint32_t, 256> t{};
-        for (uint32_t i = 0; i < 256; ++i)
-        {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k)
-                c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            t[i] = c;
-        }
-        return t;
-    }();
-    uint32_t c = 0xFFFFFFFFu;
-    for (const unsigned char b : data)
-        c = table[(c ^ b) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
-
 // Fields of a row joined by a byte no field holds, so a map counts the rows alike.
 std::string row_key(const std::vector<std::string>& fields)
 {
     std::string out;
     for (const auto& f : fields)
-        out.append(f).push_back('\x1f');
+    {
+        for (const char c : f)
+            out.push_back(c == '\x1f' ? ' ' : c);
+        out.push_back('\x1f');
+    }
     return out;
 }
 
@@ -114,7 +86,7 @@ std::string reports::gzip(const std::string& data)
         out.append(data, at, n);
         at += n;
     } while (at < data.size());
-    const uint32_t c = crc32(data);
+    const uint32_t c = socketley::crc::crc32(data);
     const auto size = static_cast<uint32_t>(data.size());
     for (int i = 0; i < 4; ++i)
         out += static_cast<char>((c >> (8 * i)) & 0xFF);
@@ -133,6 +105,8 @@ void reports::dmarc(const dmarc_seen& s)
 {
     roll(static_cast<int64_t>(::time(nullptr)));
     if (s.rua.empty() || s.policy_domain.empty())
+        return;
+    if (m_dmarc.size() >= 10000 && !m_dmarc.count(s.policy_domain))
         return;
     published& p = m_dmarc[s.policy_domain];
     p.rua = s.rua;
@@ -170,8 +144,9 @@ void reports::tls(const std::string& domain, const std::string& type, const std:
     else
     {
         ++t.failed;
-        if (t.failures.size() < 1000)
-            ++t.failures[{failure, sending_ip, mx, mx_ip}];
+        const auto key = std::make_tuple(failure, sending_ip, mx, mx_ip);
+        if (t.failures.size() < 1000 || t.failures.count(key))
+            ++t.failures[key];
     }
 }
 
@@ -216,8 +191,13 @@ std::vector<report_mail> reports::due(int64_t now_s, const std::string& organiza
             while (!uri.empty() && uri.front() == ' ')
                 uri.remove_prefix(1);
             if (uri.size() > 7 && (uri.substr(0, 7) == "mailto:" || uri.substr(0, 7) == "MAILTO:"))
-                r.to.emplace_back(uri.substr(7, uri.find('!') == std::string_view::npos ? std::string_view::npos
-                                                                                        : uri.find('!') - 7));
+            {
+                const std::string_view address = uri.substr(7, uri.find('!') == std::string_view::npos
+                                                                   ? std::string_view::npos
+                                                                   : uri.find('!') - 7);
+                if (!address.empty())
+                    r.to.emplace_back(address);
+            }
         }
         if (r.to.empty())
             continue;
@@ -230,23 +210,23 @@ std::vector<report_mail> reports::due(int64_t now_s, const std::string& organiza
     for (const auto& [domain, t] : m_tls)
     {
         const std::string id = socketley::random_hex(8) + "." + std::to_string(++m_serial);
-        std::string j = "{\"organization-name\":" + json(organization) + ",\"date-range\":{\"start-datetime\":" +
-                        json(iso(begin)) + ",\"end-datetime\":" + json(iso(end)) + "},\"contact-info\":" +
-                        json(contact) + ",\"report-id\":" + json(id) + ",\"policies\":[{\"policy\":{\"policy-type\":" +
-                        json(t.type) + ",\"policy-string\":[";
+        std::string j = "{\"organization-name\":" + socketley::json::quote(organization) + ",\"date-range\":{\"start-datetime\":" +
+                        socketley::json::quote(iso(begin)) + ",\"end-datetime\":" + socketley::json::quote(iso(end)) + "},\"contact-info\":" +
+                        socketley::json::quote(contact) + ",\"report-id\":" + socketley::json::quote(id) + ",\"policies\":[{\"policy\":{\"policy-type\":" +
+                        socketley::json::quote(t.type) + ",\"policy-string\":[";
         for (size_t i = 0; i < t.lines.size(); ++i)
-            j += (i ? "," : "") + json(t.lines[i]);
-        j += "],\"policy-domain\":" + json(domain) + ",\"mx-host\":[";
+            j += (i ? "," : "") + socketley::json::quote(t.lines[i]);
+        j += "],\"policy-domain\":" + socketley::json::quote(domain) + ",\"mx-host\":[";
         for (size_t i = 0; i < t.mx.size(); ++i)
-            j += (i ? "," : "") + json(t.mx[i]);
+            j += (i ? "," : "") + socketley::json::quote(t.mx[i]);
         j += "]},\"summary\":{\"total-successful-session-count\":" + std::to_string(t.ok) +
              ",\"total-failure-session-count\":" + std::to_string(t.failed) + "},\"failure-details\":[";
         bool first = true;
         for (const auto& [k, n] : t.failures)
         {
-            j += std::string(first ? "" : ",") + "{\"result-type\":" + json(std::get<0>(k)) + ",\"sending-mta-ip\":" +
-                 json(std::get<1>(k)) + ",\"receiving-mx-hostname\":" + json(std::get<2>(k)) +
-                 ",\"receiving-ip\":" + json(std::get<3>(k)) + ",\"failed-session-count\":" + std::to_string(n) + "}";
+            j += std::string(first ? "" : ",") + "{\"result-type\":" + socketley::json::quote(std::get<0>(k)) + ",\"sending-mta-ip\":" +
+                 socketley::json::quote(std::get<1>(k)) + ",\"receiving-mx-hostname\":" + socketley::json::quote(std::get<2>(k)) +
+                 ",\"receiving-ip\":" + socketley::json::quote(std::get<3>(k)) + ",\"failed-session-count\":" + std::to_string(n) + "}";
             first = false;
         }
         j += "]}]}\n";

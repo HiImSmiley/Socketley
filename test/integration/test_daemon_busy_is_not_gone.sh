@@ -51,7 +51,7 @@ bad() {
 }
 
 daemon_isolate daemonbusy
-trap 'kill ${LPID:-0} 2>/dev/null; daemon_stop 2>/dev/null || true' EXIT
+trap '[ -n "${LPID:-}" ] && kill "$LPID" 2>/dev/null; daemon_stop 2>/dev/null || true' EXIT
 daemon_start "$BIN"
 
 secs() { python3 -c "print(f'{$2 - $1:.2f}')"; }
@@ -115,6 +115,29 @@ else
         "an absent daemon answered rc $GRC with: ${GOUT:-<nothing>};" \
         "reporting 'busy' for a path with nothing on it trades one wrong sentence" \
         "for another"
+fi
+
+# A third: the daemon began its answer and closed before its NUL, which is neither its exit code nor an absence.
+CUT="$SOCKETLEY_TMPD/cut.sock"
+python3 -c "
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind('$CUT'); s.listen(4); s.settimeout(20)
+for _ in range(4):
+    c = s.accept()[0]
+    asked = c.recv(4096)
+    # The CLI's identity probe is answered as a daemon answers it; the command after it is given half an answer.
+    c.sendall(b'\x00socketley-daemon 1 x /bin/x\n\x00' if asked == b'ping\n' else b'\x00half of an ans')
+    c.close()
+" >/dev/null 2>&1 &
+LPID=$!
+for _ in $(seq 1 60); do [ -S "$CUT" ] && break; sleep 0.1; done
+COUT=$(SOCKETLEY_SOCKET="$CUT" "$BIN" daemon stop 2>&1); CRC=$?
+kill "$LPID" 2>/dev/null; LPID=""
+if [ "$CRC" -eq 2 ] && printf '%s' "$COUT" | grep -q "before its answer was whole"; then
+    ok "an answer cut short is said to be, and is not exit 0 (rc $CRC)"
+else
+    bad "an answer cut short" "rc $CRC with: ${COUT:-<nothing>}" "half an answer under the daemon's exit byte 0 read as the whole of it"
 fi
 
 # And an ordinary command against the real daemon is untouched by any of it.

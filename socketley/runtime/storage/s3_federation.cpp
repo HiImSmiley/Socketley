@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstring>
 
-#include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -25,7 +24,6 @@
 #include <openssl/param_build.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
-#include <openssl/x509v3.h>
 
 #include "../../shared/json/json_doc.h"
 #include "../../shared/http/outbound_http.h"
@@ -409,7 +407,7 @@ bool ber_read_uint(std::string_view c, int32_t& out)
 
 // ---- the LDAP connection ----
 
-// One blocking exchange with an LDAP server, plain or TLS, every wait bounded by one deadline.
+// One blocking exchange with an LDAP server, plain or TLS, every wait on the socket bounded by one deadline.
 class ldap_link
 {
 public:
@@ -456,14 +454,18 @@ public:
             if (::connect(fd, ai->ai_addr, ai->ai_addrlen) != 0)
             {
                 err = errno;
-                if (err == EINPROGRESS && wait(POLLOUT, why))
+                if (err == EINPROGRESS)
                 {
+                    if (!wait(POLLOUT, why))
+                    {
+                        ::close(fd);
+                        m_fd = -1;
+                        continue;
+                    }
                     socklen_t len = sizeof err;
                     if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0)
                         err = errno;
                 }
-                else if (err == EINPROGRESS)
-                    err = ETIMEDOUT;
             }
             if (err != 0)
             {
@@ -1388,8 +1390,8 @@ bool ldap_simple_bind(const federation_ldap& cfg, std::string_view username, std
              ldap_parse_bind_response(msg, 1, out, why);
         // The unbind is a courtesy whose failure changes nothing.
         std::string ignored;
-        if (ok && out.bound() && !link.send_all(ldap_unbind_request(2), ignored))
-            ignored.clear();
+        if (ok && out.bound())
+            link.send_all(ldap_unbind_request(2), ignored);
     }
     ERR_clear_error();
     return ok;

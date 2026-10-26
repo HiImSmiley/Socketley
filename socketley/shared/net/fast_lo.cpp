@@ -1001,9 +1001,13 @@ static void sweep_loop(const recon_args& a, ledger& book)
                 uint64_t rm = v.count;
                 if (v.count == SKL_TAINT || v.count >= SWEEP_FLOOR)
                 {
+                    // A failed read leaves rm at the count, which for a tainted pair is the sentinel and no size.
                     if (!diag_exact(nl, buf, key, rm))
+                    {
                         failed = true;
-                    else if (v.count != SKL_TAINT && v.mark == SKL_PENDING)
+                        continue;
+                    }
+                    if (v.count != SKL_TAINT && v.mark == SKL_PENDING)
                     {
                         const snap_val ans{rm, v.ask};
                         map_put(a.snap, key, &ans, BPF_ANY);
@@ -1223,13 +1227,12 @@ static unsigned possible_cpus()
     static const unsigned n = [] {
         std::ifstream f("/sys/devices/system/cpu/possible");
         std::string s;
-        unsigned hi = 0;
-        if (std::getline(f, s))
-        {
-            const size_t at = s.find_last_of("-,");
-            hi = static_cast<unsigned>(std::strtoul(s.c_str() + (at == std::string::npos ? 0 : at + 1),
-                                                    nullptr, 10));
-        }
+        // Unknown when the file cannot be read, since a guess too small lets the kernel write past the buffer.
+        if (!std::getline(f, s) || s.empty())
+            return 0u;
+        const size_t at = s.find_last_of("-,");
+        const unsigned hi = static_cast<unsigned>(std::strtoul(s.c_str() + (at == std::string::npos ? 0 : at + 1),
+                                                               nullptr, 10));
         return hi + 1;
     }();
     return n;
@@ -1258,7 +1261,7 @@ fast_lo_figures fast_lo_now()
     uint64_t* const slots[C_COUNT] = { &f.entered, &f.tainted_bound, &f.tainted_unanswered,
                                        &f.tainted_budget, &f.tainted_peer_off };
     std::vector<uint64_t> per_cpu(possible_cpus());
-    for (uint32_t k = 0; k < C_COUNT; ++k)
+    for (uint32_t k = 0; k < C_COUNT && !per_cpu.empty(); ++k)
     {
         union bpf_attr a{};
         a.map_fd = static_cast<uint32_t>(lo->m_counters);

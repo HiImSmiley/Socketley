@@ -52,6 +52,7 @@ set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_ports.sh"
 . "$(dirname "$0")/lib_daemon.sh"
 
 daemon_isolate ipcperm
@@ -148,7 +149,7 @@ fi
 # The port is 24610 rather than the 230xx this directory otherwise uses: it was
 # picked out of a block reserved for the work that added this file, so that it
 # cannot collide with a test landing from another branch at the same time.
-if "$BIN" create server ipcperm_probe -p "${PB:-24610}" >/dev/null 2>&1 &&
+if "$BIN" create server ipcperm_probe -p "$((SL_PORT_BASE+610))" >/dev/null 2>&1 &&
    "$BIN" ls 2>/dev/null | grep -qa ipcperm_probe
 then pass; else
     fail "control: the owning user still drives the daemon" \

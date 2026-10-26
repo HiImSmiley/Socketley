@@ -126,8 +126,7 @@ if phase == "main":
     # Changed on the account page, at whichever shard; every shard answers with the change at once.
     for n in range(8):
         st, body, _ = req("POST", "/account", dict(name="Alice %d" % n, email="a@example.com"), cookie=cookie)
-        if st != 200 or "Saved." not in body:
-            check("the account page saves at every shard", st, 200)
+        check("the account page saves at every shard", (st, "Saved." in body), (200, True))
         check("a change on the account page is what every shard says next",
               [userinfo(tokens[i]["access_token"]) for i in range(8)], ["Alice %d" % n] * 8)
     json.dump({"cookie": cookie, "access": tokens[0]["access_token"], "refresh": tokens[1]["refresh_token"],

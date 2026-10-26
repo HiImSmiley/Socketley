@@ -302,7 +302,11 @@ struct importer : std::enable_shared_from_this<importer>
                         const fs::path p(self->path);
                         if (fs::is_regular_file(p, ec))
                         {
-                            found->emplace_back(p.string(), folder_of_file(p.filename().string()));
+                            std::string folder = folder_of_file(p.filename().string());
+                            if (fs::file_size(p, ec) == 0 && !ec)
+                                empties->push_back(std::move(folder));
+                            else
+                                found->emplace_back(p.string(), std::move(folder));
                             return;
                         }
                         if (!fs::is_directory(p, ec))
@@ -311,15 +315,20 @@ struct importer : std::enable_shared_from_this<importer>
                             return;
                         }
                         for (fs::recursive_directory_iterator it(p, ec), end; !ec && it != end; it.increment(ec))
-                            if (it->is_regular_file(ec) && it->path().extension() == ".mbox")
+                            if (std::error_code entry_ec; it->is_regular_file(entry_ec) && it->path().extension() == ".mbox")
                             {
-                                std::string folder = folder_of_file(fs::relative(it->path(), p, ec).string());
+                                std::string folder = folder_of_file(fs::relative(it->path(), p, entry_ec).string());
                                 // An empty file is a folder that held nothing, made all the same.
-                                if (it->file_size(ec) == 0)
+                                if (it->file_size(entry_ec) == 0)
                                     empties->push_back(std::move(folder));
                                 else
                                     found->emplace_back(it->path().string(), std::move(folder));
                             }
+                        if (ec)
+                        {
+                            *why = "the daemon cannot read all of " + self->path + ": " + ec.message();
+                            return;
+                        }
                         std::sort(found->begin(), found->end());
                         if (found->empty() && empties->empty())
                             *why = self->path + " holds no .mbox file";

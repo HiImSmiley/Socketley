@@ -381,8 +381,8 @@ inline bool decode_routes(std::string_view payload, route_table& out)
     {
         const std::string path(r.str());
         if (!r.ok) return false;
+        // The table keeps a prefix route's path without its '*', which add() is given back.
         const bool prefix = r.u8() != 0;
-        (void)prefix;   // carried by the path's trailing '*', see route_table::add
 
         const uint32_t nm = r.u32();
         if (!r.ok) return false;

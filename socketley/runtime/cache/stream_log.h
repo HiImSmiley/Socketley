@@ -218,7 +218,6 @@ public:
         // Written out because a nested class's member initialisers are not usable before its enclosing class ends.
         pel_index() noexcept : m_cap(0), m_size(0), m_tombs(0) {}
 
-        size_t size() const { return m_size; }
         size_t heap_bytes() const { return m_cap ? malloc_chunk_bytes(m_cap * sizeof(pel_map::iterator)) + malloc_chunk_bytes(m_cap) : 0; }
         pel_map::iterator at(size_t i) const { return m_slots[i]; }
 
@@ -713,7 +712,6 @@ public:
         auto it = g.consumers.find(name);
         if (it == g.consumers.end()) return -1;
         const size_t n = it->second.pel.size();
-        const size_t ix_before = g.ix.heap_bytes();
         for (const stream_id& id : it->second.pel)
         {
             const size_t k = g.ix.locate(id);
@@ -722,7 +720,6 @@ public:
             g.pel.erase(at);
         }
         m_heap -= n * (nack_node_bytes + cpel_node_bytes);
-        m_heap -= ix_before - g.ix.heap_bytes();
         m_heap -= consumer_node_bytes + name_bytes(it->first.size());
         g.consumers.erase(it);
         return static_cast<int64_t>(n);
@@ -785,10 +782,9 @@ public:
             o->pel.erase(it->second.in_owner);
             m_heap -= cpel_node_bytes;
         }
-        const size_t ix_before = g.ix.heap_bytes();
         g.ix.erase_at(k);
         g.pel.erase(it);
-        m_heap -= nack_node_bytes + (ix_before - g.ix.heap_bytes());
+        m_heap -= nack_node_bytes;
         return true;
     }
 
@@ -984,7 +980,6 @@ private:
     {
         bool   new_block;
         bool   same;
-        size_t entry_bytes;
         size_t new_cap;
         size_t old_cap;
     };
@@ -1007,7 +1002,6 @@ private:
             if (!p.same) e += var_len(fv[2 * i].size()) + fv[2 * i].size();
             e += var_len(fv[2 * i + 1].size()) + fv[2 * i + 1].size();
         }
-        p.entry_bytes = e;
         if (p.new_block)
         {
             size_t master = var_len(pairs);

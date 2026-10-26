@@ -103,7 +103,7 @@ daemon_start "$BIN"
 create_ok "a proxy" "$BIN" create proxy if_prx -p "$P_PRX" \
     --backend "127.0.0.1:$P_BCK"
 
-OUT=$(reimport if_prx '{"health_check":1,"health_interval":11,"health_path":"/hz","health_threshold":7,"circuit_threshold":9,"circuit_timeout":15,"backend_timeout":9,"retry_count":3,"retry_all":True}')
+OUT=$(reimport if_prx '{"health_check":1,"health_interval":11,"health_path":"/hz","health_threshold":7,"circuit_threshold":9,"circuit_timeout":15,"backend_timeout":9,"retry_count":3,"retry_all":True}') || true
 if [ -z "$OUT" ]; then ok; else bad "the import is accepted" "got '$OUT'"; fi
 
 check "health_check"      "1"    "$(field if_prx health_check)"
@@ -119,7 +119,7 @@ check "retry_all"         "true" "$(field if_prx retry_all)"
 # ─── 2. A field put back to its default is honoured ─────────────────────────
 # The whole reason the shared list needed a second question. "!= 30" would
 # leave 15 here and report success.
-OUT=$(reimport if_prx '{"circuit_timeout":30}')
+OUT=$(reimport if_prx '{"circuit_timeout":30}') || true
 if [ -z "$OUT" ]; then ok; else bad "putting a default back is accepted" "got '$OUT'"; fi
 # `show` omits a field that equals its default, so the absence IS the assertion.
 check "circuit_timeout went back to 30" "" "$(field if_prx circuit_timeout)"
@@ -152,7 +152,7 @@ check "an omitted mesh path is left alone" "/a.pem" "$(field if_prx mesh_client_
 
 # And the spelling that does clear it, which is the documented recovery for a
 # runtime whose certificate files have gone.
-OUT=$(reimport if_prx "{'mesh_client_cert':'','mesh_client_key':'','mesh_client_ca':''}")
+OUT=$(reimport if_prx "{'mesh_client_cert':'','mesh_client_key':'','mesh_client_ca':''}") || true
 if [ -z "$OUT" ]; then ok; else bad "an empty mesh path is accepted" "got '$OUT'"; fi
 check "and \"\" clears it" "" "$(field if_prx mesh_client_cert)"
 
@@ -164,7 +164,7 @@ ready_tcp 127.0.0.1 "$P_PRX" >/dev/null 2>&1 || true
 
 # `grep -c` prints 0 and exits 1 on no match, so `|| true` and not `|| echo 0`.
 BEFORE=$(grep -c "applied an edit to the running runtime" "$SOCKETLEY_DLOG" 2>/dev/null || true)
-OUT=$(reimport if_prx '{"retry_count":5}')
+OUT=$(reimport if_prx '{"retry_count":5}') || true
 if [ -z "$OUT" ]; then ok; else bad "import on a running proxy is accepted" "got '$OUT'"; fi
 sleep 0.8
 AFTER=$(grep -c "applied an edit to the running runtime" "$SOCKETLEY_DLOG" 2>/dev/null || true)
@@ -177,7 +177,7 @@ check "and the value moved"  "5" "$(field if_prx retry_count)"
 create_ok "a server" "$BIN" create server if_srv -p "$P_SRV"
 mkdir -p "$SOCKETLEY_TMPD/www"
 printf 'hello\n' > "$SOCKETLEY_TMPD/www/index.html"
-OUT=$(reimport if_srv "{'http_dir':'$SOCKETLEY_TMPD/www','http_cache':True}")
+OUT=$(reimport if_srv "{'http_dir':'$SOCKETLEY_TMPD/www','http_cache':True}") || true
 if [ -z "$OUT" ]; then ok; else bad "the server import is accepted" "got '$OUT'"; fi
 check "http_dir"   "$SOCKETLEY_TMPD/www" "$(field if_srv http_dir)"
 check "http_cache" "true"                "$(field if_srv http_cache)"

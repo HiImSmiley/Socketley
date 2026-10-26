@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <charconv>
-#include <cstring>
 
 #include "mail_mime.h"
 #include "mail_web.h"
@@ -213,9 +212,9 @@ void jmap_session::run()
     while (!m_busy && !m_closed && !m_stream)
     {
         const size_t end = m_in.find("\r\n\r\n");
-        if (end == std::string::npos)
+        if (end == std::string::npos || end > max_head)
         {
-            if (m_in.size() > max_head)
+            if (end != std::string::npos || m_in.size() > max_head)
             {
                 fail(431, "urn:ietf:params:jmap:error:limit", "the request's head is too long");
                 m_closed = true;
@@ -387,13 +386,13 @@ void jmap_session::handle(request rq)
         const auto told = [&](std::string_view kind, const std::string& email, std::string_view type) {
             const std::string doc = m_hooks.client_setup(kind, email);
             if (doc.empty())
-                fail(404, "text/plain", "no mailbox of that domain is kept here");
+                fail(404, "about:blank", "no mailbox of that domain is kept here");
             else
                 respond(200, type, doc);
             return after();
         };
         if (lower == "/mail/config-v1.1.xml" || lower == "/.well-known/autoconfig/mail/config-v1.1.xml")
-            return told("autoconfig", percent_decoded(query_param(rq.query, "emailaddress")), "application/xml");
+            return told("autoconfig", query_param(rq.query, "emailaddress"), "application/xml");
         if (lower == "/autodiscover/autodiscover.xml")
             return told("autodiscover", autodiscover_address(rq.body), "application/xml");
         if (lower.starts_with("/autodiscover/autodiscover.json"))
@@ -450,7 +449,7 @@ void jmap_session::handle(request rq)
         {
             const std::string doc = m_hooks.client_setup("mobileconfig", m_hooks.address_of(m_user));
             if (doc.empty())
-                fail(404, "text/plain", "no address of this runtime's domains is yours");
+                fail(404, "about:blank", "no address of this runtime's domains is yours");
             else
                 respond(200, "application/x-apple-aspen-config", doc,
                         "Content-Disposition: attachment; filename=\"mail.mobileconfig\"\r\n");
@@ -489,7 +488,7 @@ void jmap_session::handle(request rq)
                 fail(404, "about:blank", "no such blob");
                 return after();
             }
-            return download(r, parts[0], parts[1], query_param(r.query, "type"), parts.size() > 2 ? parts[2] : "blob");
+            return download(parts[0], parts[1], query_param(r.query, "type"), parts.size() > 2 ? parts[2] : "blob");
         }
         if (p == "/jmap/eventsource" && r.method == "GET")
             return eventsource(r);
@@ -919,7 +918,7 @@ void jmap_session::upload(const request& rq, const std::string& account)
     });
 }
 
-void jmap_session::download(const request&, const std::string& account, const std::string& id, const std::string& type,
+void jmap_session::download(const std::string& account, const std::string& id, const std::string& type,
                             const std::string& name)
 {
     if (account != account_of(m_user))
@@ -968,7 +967,7 @@ void jmap_session::page(const request& rq)
 void jmap_session::unsubscribe_page(const request& rq)
 {
     // The token is the link's own, base64url and hex: one with any other character is no link this runtime made.
-    const std::string token = percent_decoded(query_param(rq.query, "t"));
+    const std::string token = query_param(rq.query, "t");
     const bool shaped = !token.empty() && token.size() < 600 &&
                         token.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") ==
                             std::string::npos;
@@ -1033,7 +1032,7 @@ void jmap_session::eventsource(const request& rq)
     const std::string ping = query_param(rq.query, "ping");
     int64_t p = 0;
     std::from_chars(ping.data(), ping.data() + ping.size(), p);
-    m_ping_s = p <= 0 ? 0 : std::max<int64_t>(p, 30);
+    m_ping_s = p <= 0 ? 0 : std::clamp<int64_t>(p, 30, 86400);
     m_close_after_state = query_param(rq.query, "closeafter") == "state";
     m_stream = true;
     m_stream_state = email_state(m_store, m_user) + mailbox_state(m_store, m_user);

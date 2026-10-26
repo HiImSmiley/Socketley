@@ -13,6 +13,7 @@
 #include <string_view>
 #include <system_error>
 
+#include "../util/ascii.h"
 #include "../util/text_list.h"
 
 // Same spelling and guards as event_loop_definitions.h, repeated rather than
@@ -189,7 +190,7 @@ inline bool http_status_code(std::string_view line, uint16_t& out)
         return false;
     for (size_t i = 0; i < 5; i++)
     {
-        if ((line[i] | 0x20) != proto[i])
+        if (socketley::ascii::lower(line[i]) != proto[i])
             return false;
     }
     const size_t sp = line.find(' ');
@@ -1001,7 +1002,8 @@ inline std::string http_head_saying_close(std::string_view head)
         if (line.size() <= name.size() || line[name.size()] != ':')
             return false;
         for (size_t i = 0; i < name.size(); ++i)
-            if ((line[i] | 0x20) != name[i])
+            // Letters alone are folded, since '\r' | 0x20 is '-'.
+            if (socketley::ascii::lower(line[i]) != name[i])
                 return false;
         return true;
     };
@@ -1039,7 +1041,7 @@ inline std::string http_head_adding(std::string_view head, std::string_view lowe
         const std::string_view line = head.substr(pos + 2, lower_name.size() + 1);
         if (line.size() == lower_name.size() + 1 && line.back() == ':' &&
             std::equal(lower_name.begin(), lower_name.end(), line.begin(),
-                       [](char a, char b) { return a == (b | 0x20); }))
+                       [](char a, char b) { return a == socketley::ascii::lower(b); }))
             return std::string(head);
     }
     std::string out(head.substr(0, head.size() - 2));

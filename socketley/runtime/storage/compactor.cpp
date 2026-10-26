@@ -210,12 +210,13 @@ void compactor::start(candidate c)
     j->was        = std::move(c.meta);
     m_busy        = true;
     auto alive    = m_alive;
-    auto then     = [this, alive, j](open_result o)
+    // The loop is held apart from this, which a dead compactor no longer is.
+    auto then     = [this, alive, j, loop = &m_loop](open_result o)
     {
         if (!*alive)
         {
             if (o.fd >= 0)
-                m_loop.close_fd(o.fd);
+                loop->close_fd(o.fd);
             return;
         }
         if (o.fd >= 0)

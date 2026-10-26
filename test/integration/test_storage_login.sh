@@ -214,7 +214,8 @@ elif phase == "after":
     check("and an invited user's", sign_in("erin", "erinpassword1")[0], 200)
     check("and a deleted user's does not", sign_in("dave", "davepassword1")[0], 401)
 PY
-    tally < "$SOCKETLEY_TMPD/step"
+    local rc=$?; tally < "$SOCKETLEY_TMPD/step"
+    [ "$rc" -eq 0 ] && ok || bad "the $1 step ran to its end" "python exited $rc"
 }
 
 step main

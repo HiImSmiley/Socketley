@@ -2,7 +2,9 @@
 #include "../../shared/json/json_escape.h"
 
 #include <charconv>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace socketley::db
 {
@@ -96,7 +98,11 @@ bool number_of(const jvalue& v, double& out)
     if (v.k != jvalue::kind::number)
         return false;
     const auto r = std::from_chars(v.s.data(), v.s.data() + v.s.size(), out);
-    return r.ec == std::errc() && std::isfinite(out);
+    if (r.ec == std::errc::result_out_of_range)
+        out = std::strtod(v.s.c_str(), nullptr);
+    else if (r.ec != std::errc())
+        return false;
+    return std::isfinite(out);
 }
 
 bool same(const jvalue& a, const jvalue& b)
@@ -137,6 +143,27 @@ bool same(const jvalue& a, const jvalue& b)
     return false;
 }
 
+// `v` with members in name order and numbers written by value, so two values same() calls equal write the same text.
+static void canonical(jvalue& v)
+{
+    if (v.k == jvalue::kind::number)
+    {
+        double x = 0;
+        if (number_of(v, x))
+        {
+            char buf[40];
+            const auto r = std::to_chars(buf, buf + sizeof buf, x == 0 ? 0.0 : x);
+            v.s.assign(buf, r.ptr);
+        }
+    }
+    for (auto& i : v.items)
+        canonical(i);
+    for (auto& m : v.members)
+        canonical(m.second);
+    std::stable_sort(v.members.begin(), v.members.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+}
+
 ikey key_of(const jvalue* v)
 {
     ikey k;
@@ -164,9 +191,13 @@ ikey key_of(const jvalue* v)
             break;
         case jvalue::kind::array:
         case jvalue::kind::object:
+        {
             k.rank = ikey::other;
-            json::write_into(k.str, *v);
+            jvalue c = *v;
+            canonical(c);
+            json::write_into(k.str, c);
             break;
+        }
     }
     return k;
 }

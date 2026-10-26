@@ -110,11 +110,13 @@ inline bool create_file_once(const std::string& path, std::string_view data, std
     const bool whole = ::fchmod(fd, mode) == 0 && write_all(fd, data.data(), data.size()) && ::fsync(fd) == 0;
     const int werr = errno;
     const bool closed = ::close(fd) == 0;
+    // Taken before the unlink, which may change errno even when it succeeds.
+    const int cerr = errno;
     if (!whole || !closed)
     {
         ::unlink(tmp.c_str());
         if (why)
-            *why = "cannot write " + tmp + ": " + std::strerror(whole ? errno : werr);
+            *why = "cannot write " + tmp + ": " + std::strerror(whole ? cerr : werr);
         return false;
     }
     const bool linked = ::link(tmp.c_str(), path.c_str()) == 0;

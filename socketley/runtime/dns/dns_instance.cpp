@@ -17,7 +17,6 @@
 #include <unordered_map>
 
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -263,7 +262,6 @@ private:
     struct udp_ep
     {
         int fd{-1};
-        int family{AF_INET};
         bool pktinfo{false};
         io_request rd{};
         bool rd_pending{false};
@@ -548,7 +546,6 @@ bool dns_run::open_udp(int family, uint16_t port, uint32_t bind4)
     }
     auto ep = std::make_unique<udp_ep>();
     ep->fd = fd;
-    ep->family = family;
     ep->pktinfo = pktinfo;
     m_udp.push_back(std::move(ep));
     return true;
@@ -896,7 +893,9 @@ void dns_run::accept_done(tcp_listener& l, struct io_uring_cqe* cqe)
             arm_read(c);
         }
     }
-    if (!l.pending && !m_stopped && fd != -ECANCELED)
+    // Out of descriptors or memory is left to tick(), which asks again a second later.
+    const bool starved = fd == -EMFILE || fd == -ENFILE || fd == -ENOBUFS || fd == -ENOMEM;
+    if (!l.pending && !m_stopped && fd != -ECANCELED && !starved)
         arm_accept(l);
 }
 
@@ -1246,6 +1245,9 @@ void dns_run::check_zones()
                 for (const auto& other : next->zones)
                     if (other->origin == z->origin)
                         sound = false;
+                for (const auto& o : m_zones->zones)
+                    if (o->path != p && o->origin == z->origin)
+                        sound = false;
             }
             if (!sound)
             {
@@ -1265,11 +1267,13 @@ void dns_run::check_zones()
     }
     if (kept.size() < next->zones.size())
         ++m_c.reloads;
+    const std::shared_ptr<const zone_set> prior = std::move(m_zones);
+    m_zones = next;
     for (const auto& z : next->zones)
     {
         if (std::find(kept.begin(), kept.end(), z.get()) != kept.end())
             continue;
-        const zone* before = m_zones->find(z->origin);
+        const zone* before = prior->find(z->origin);
         const bool newer = !before || before->origin != z->origin || before->serial != z->serial;
         LOG_INFO(("dns: reloaded " + to_text(z->origin) + " serial " + std::to_string(z->serial) + ", " +
                   std::to_string(z->records) + " records").c_str());
@@ -1279,7 +1283,6 @@ void dns_run::check_zones()
         if (newer)
             queue_notify(*z);
     }
-    m_zones = next;
 }
 
 void dns_run::queue_notify(const zone& z)
@@ -1561,15 +1564,10 @@ std::string dns_instance::config_refusal() const
     const auto paths = zone_paths();
     if (paths.empty())
         return "dns: --zone is required: the zone's name, such as example.com, or a zone file\n";
-    if (std::string why; !ensure_zone_files(why))
-        return "dns: " + why + "\n";
     if (!get_listen_path().empty())
         return "dns: --listen unix: is not served; DNS is asked over UDP and TCP\n";
     if (get_tls())
         return "dns: --tls is not served; DNS over TLS is not part of this runtime\n";
-    socketley::dns::zone_set zs;
-    if (std::string why; !socketley::dns::load_all(paths, zs, why))
-        return "dns: " + why + "\n";
     std::vector<socketley::ip_block> blocks;
     if (std::string bad; !m_transfer.empty() && !socketley::ip_block::parse_list(m_transfer, blocks, bad))
         return "dns: --transfer takes addresses or blocks such as 192.0.2.7 or 2001:db8::/32, not '" + bad + "'\n";
@@ -1583,6 +1581,11 @@ std::string dns_instance::config_refusal() const
     std::vector<std::string> v4, v6;
     if (std::string bad; !socketley::dns::parse_publish(m_publish, v4, v6, bad))
         return "dns: --publish takes IPv4 and IPv6 addresses, not '" + bad + "'\n";
+    if (std::string why; !ensure_zone_files(why))
+        return "dns: " + why + "\n";
+    socketley::dns::zone_set zs;
+    if (std::string why; !socketley::dns::load_all(paths, zs, why))
+        return "dns: " + why + "\n";
     return {};
 }
 

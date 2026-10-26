@@ -12,15 +12,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <filesystem>
 #include <iomanip>
-#include <charconv>
 #include <ctime>
 #include <unistd.h>
 #include <dirent.h>
-#include <sys/stat.h>
-
-namespace fs = std::filesystem;
 
 namespace {
 
@@ -276,9 +271,11 @@ static int cluster_stats(const std::string& dir, const std::string& local_name,
     for (const auto& d : daemons)
     {
         if (d.stale)
+        {
             ++stale;
-        else
-            ++healthy;
+            continue;
+        }
+        ++healthy;
 
         for (const auto& rt : d.runtimes)
         {
@@ -331,7 +328,6 @@ static int cluster_watch(const std::string& dir, const std::string& local_name,
         std::cout << "\n(refreshing every 2s, Ctrl+C to stop)\n";
         usleep(2000000);
     }
-    return 0;
 }
 
 namespace {

@@ -784,7 +784,7 @@ def mode_recovery(port, data):
           before["in a slot"][1] == "ON" and before["in a header written again"][0][0] == "COMPLIANCE", before)
 
     subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
-    time.sleep(0.5)
+    sig.wait_released(data)
     subprocess.run([BIN, "start", RUNTIME], capture_output=True)
     check("it starts again", wait_for(probe, 30))
     after = lock_state(cases)

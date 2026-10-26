@@ -59,6 +59,8 @@ class Client(QuicConnectionProtocol):
                 self.h3.send_data(sid, body[i:i + (1 << 16)], end_stream=i + (1 << 16) >= len(body))
                 self.transmit()
                 await asyncio.sleep(0.002)
+            if not body:
+                self.h3.send_data(sid, b"", end_stream=True)
         self.transmit()
         await asyncio.wait_for(st["done"].wait(), 60)
         return st["status"], b"".join(st["body"])

@@ -149,6 +149,8 @@ std::string decode(std::string_view in)
             {
                 have -= 16;
                 const auto u = static_cast<uint16_t>((bits >> have) & 0xFFFF);
+                if (high && (u < 0xDC00 || u >= 0xE000))
+                    return {};
                 if (u >= 0xD800 && u < 0xDC00)
                     high = u;
                 else if (u >= 0xDC00 && u < 0xE000)
@@ -167,7 +169,7 @@ std::string decode(std::string_view in)
                 }
             }
         }
-        if (high || (bits & ((1u << have) - 1)) != 0)
+        if (high || have >= 6 || (bits & ((1u << have) - 1)) != 0)
             return {};
         i = end + 1;
     }

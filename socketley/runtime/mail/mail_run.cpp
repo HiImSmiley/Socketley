@@ -48,6 +48,7 @@
 #include "../../shared/runtime/stats_text.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/hex.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/util/settings.h"
@@ -325,14 +326,7 @@ std::string mail_run::sts_policy() const
 std::string mail_run::sts_id() const
 {
     const std::string h = socketley::crypto::hmac_sha256("socketley mta-sts", sts_policy());
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    for (size_t i = 0; i < 10 && i < h.size(); ++i)
-    {
-        out += hex[static_cast<uint8_t>(h[i]) >> 4];
-        out += hex[static_cast<uint8_t>(h[i]) & 15];
-    }
-    return out;
+    return socketley::hex_encode(h.data(), std::min<size_t>(h.size(), 10));
 }
 
 void mail_run::sts_input(conn& c, std::string_view bytes)
@@ -435,14 +429,7 @@ std::string mail_run::unsubscribe_token(std::string_view addr) const
     std::string a(addr);
     socketley::ascii::lower_in_place(a);
     const std::string mac = socketley::crypto::hmac_sha256(m_verp_key, "unsubscribe\n" + a);
-    static const char* hex = "0123456789abcdef";
-    std::string out = socketley::base64url::encode(a) + ".";
-    for (size_t i = 0; i < 12 && i < mac.size(); ++i)
-    {
-        out += hex[static_cast<uint8_t>(mac[i]) >> 4];
-        out += hex[static_cast<uint8_t>(mac[i]) & 15];
-    }
-    return out;
+    return socketley::base64url::encode(a) + "." + socketley::hex_encode(mac.data(), std::min<size_t>(mac.size(), 12));
 }
 
 std::string mail_run::unsubscribe_address(std::string_view token) const
@@ -594,14 +581,7 @@ std::string mail_run::verp_token(std::string_view domain) const
     std::string d(domain);
     socketley::ascii::lower_in_place(d);
     const std::string mac = socketley::crypto::hmac_sha256(m_verp_key, d);
-    static const char* hex = "0123456789abcdef";
-    std::string out;
-    for (size_t i = 0; i < 8 && i < mac.size(); ++i)
-    {
-        out += hex[static_cast<uint8_t>(mac[i]) >> 4];
-        out += hex[static_cast<uint8_t>(mac[i]) & 15];
-    }
-    return out;
+    return socketley::hex_encode(mac.data(), std::min<size_t>(mac.size(), 8));
 }
 
 namespace
@@ -653,9 +633,10 @@ void mail_run::edit_list(address_list& l, std::vector<std::string> add, std::vec
     // Read, merged and written under a lock of the file, so two shards' changes are both kept; never on the loop.
     auto result = std::make_shared<std::unordered_set<std::string>>();
     auto why = std::make_shared<std::string>();
+    auto stamp = std::make_shared<socketley::file_stamp>();
     const std::string path = l.path;
     m_pool.submit(0,
-                  [path, keep_s = l.keep_s, add = std::move(add), remove = std::move(remove), result, why] {
+                  [path, keep_s = l.keep_s, add = std::move(add), remove = std::move(remove), result, why, stamp] {
                       const int lock = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
                       if (lock >= 0 && ::flock(lock, LOCK_EX) != 0) {}
                       std::string text;
@@ -677,10 +658,12 @@ void mail_run::edit_list(address_list& l, std::vector<std::string> add, std::vec
                       }
                       if (!socketley::replace_file(path, out, socketley::durability::data, why.get()) && why->empty())
                           *why = "it could not be written";
+                      // Taken under the lock, so a write of another shard after it is not taken as seen.
+                      *stamp = socketley::file_stamp::of(path);
                       if (lock >= 0)
                           ::close(lock);
                   },
-                  [this, &l, result, why, path, alive = m_alive] {
+                  [this, &l, result, why, stamp, path, alive = m_alive] {
                       if (!*alive)
                           return;
                       if (!why->empty())
@@ -690,7 +673,7 @@ void mail_run::edit_list(address_list& l, std::vector<std::string> add, std::vec
                           return;
                       }
                       l.set = std::move(*result);
-                      l.stamp = socketley::file_stamp::of(path);
+                      l.stamp = *stamp;
                   });
 }
 
@@ -705,7 +688,6 @@ void mail_run::bounce_taken(std::string_view message, std::string_view to, bool 
     std::vector<std::string> dead;
     // The one of `dead` its block's Status, read after its Action, may still take back.
     size_t dead_at_status = SIZE_MAX;
-    bool unverified = false;
     std::string_view rest = message;
     std::string recipient;
     while (!rest.empty())
@@ -753,16 +735,12 @@ void mail_run::bounce_taken(std::string_view message, std::string_view to, bool 
                         dead_at_status = dead.size() - 1;
                     }
                 }
-                else
-                    unverified = true;
             }
             recipient.clear();
         }
     }
-    m_bounces_unverified += unverified;
     if (dead.empty())
         return;
-    m_suppressions += dead.size();
     edit_list(m_suppressed, std::move(dead), {});
 }
 
@@ -815,7 +793,9 @@ bool mail_run::start(std::string& why)
         if (fd >= 0)
         {
             const std::string key = socketley::random_hex(32);
-            if (key.empty() || !socketley::write_all(fd, key.data(), key.size()) || ::fsync(fd) != 0) {}
+            // A key not whole is taken away, so the next start makes one and not trips on an empty file.
+            if (key.empty() || !socketley::write_all(fd, key.data(), key.size()) || ::fsync(fd) != 0)
+                ::unlink(path.c_str());
             ::close(fd);
         }
         for (int tries = 0; tries < 50 && m_verp_key.size() < 64; ++tries)
@@ -1864,9 +1844,8 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
         }
         ++r.m_auth_failed;
         if (guarded)
-            r.account_failed(acct, ip, wall::now_ms_coarse());
-        if (guarded)
         {
+            r.account_failed(acct, ip, wall::now_ms_coarse());
             const int64_t t = wall::now_ms_coarse();
             mail_run::client& cl = r.m_clients[ip];
             if (t - cl.first_failure_ms > auth_window_ms)
@@ -1998,6 +1977,13 @@ bool mail_run::may_send(const std::string& who)
         if (cl.tokens < 1.0)
             return false;
         cl.tokens -= 1.0;
+        if (m_owner.get_global_rate_limit() > 0 && !m_owner.take_global_token())
+        {
+            // Refused by the shared bucket, the sender keeps its own token.
+            cl.tokens += 1.0;
+            return false;
+        }
+        return true;
     }
     return m_owner.get_global_rate_limit() <= 0 || m_owner.take_global_token();
 }
@@ -2593,18 +2579,20 @@ void mail_run::conn::when_drained(std::function<void()> f)
 void mail_run::conn::later(std::function<void()> f)
 {
     const uint64_t me = id;
-    if (!run->m_fio.after(std::chrono::milliseconds(0), [r = run, me, f = std::move(f), alive = run->m_alive](int64_t) {
+    // Shared, so the fallback below still holds the callable the timer was given.
+    const auto fn = std::make_shared<std::function<void()>>(std::move(f));
+    if (!run->m_fio.after(std::chrono::milliseconds(0), [r = run, me, fn, alive = run->m_alive](int64_t) {
             if (!*alive)
                 return;
             if (conn* c = r->find(me); c && !c->dead)
             {
                 c->in_input = true;
-                f();
+                (*fn)();
                 c->in_input = false;
                 r->flush(*c);
             }
         }))
-        f();
+        (*fn)();
 }
 
 bool mail_run::conn::start_compress()
@@ -2637,13 +2625,17 @@ std::string mail_run::received_line(const conn& c, const std::string& id, const 
     return out;
 }
 
-void mail_run::accepted(const entry_ptr& e)
+void mail_run::accepted(const entry_ptr& e, int64_t hold_until_ms)
 {
     ++m_received;
     runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
     if (m_lua)
         m_lua->message(*e);
-    if (m_delivery)
+    if (!m_delivery)
+        return;
+    if (hold_until_ms)
+        m_delivery->queued_at(e, hold_until_ms);
+    else
         m_delivery->queued(e);
 }
 
@@ -2671,12 +2663,7 @@ void mail_run::queue_message(const std::string& from, const std::vector<std::str
         if (ok && hold_until_ms > wall::now_ms_coarse())
         {
             m_spool.retry(*e, 0, hold_until_ms);
-            ++m_received;
-            runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
-            if (m_lua)
-                m_lua->message(*e);
-            if (m_delivery)
-                m_delivery->queued_at(e, hold_until_ms);
+            accepted(e, hold_until_ms);
         }
         else if (ok)
             accepted(e);
@@ -2816,6 +2803,8 @@ void mail_run::tick()
         }
     }
     std::vector<conn*> late;
+    // Polling can close a connection, so it waits until the walk is over.
+    std::vector<uint64_t> imap_poll, jmap_poll;
     for (auto& [id, c] : m_conns)
     {
         const bool shaking = c->ssl && !c->handshaken;
@@ -2829,20 +2818,12 @@ void mail_run::tick()
         else if (c->closing && now - c->closing_ms >= close_grace_ms)
             m_close_soon.push_back(c->id);
         else if (c->imap && (c->imap->idling() || c->imap->notifying()))
-        {
-            c->in_input = true;
-            c->imap->poll();
-            c->in_input = false;
-            flush(*c);
-        }
+            imap_poll.push_back(c->id);
         else if (c->jmap && c->jmap->streaming())
         {
             // An EventSource's client says nothing: it is kept while it reads what it is told.
             c->heard_ms = now;
-            c->in_input = true;
-            c->jmap->poll();
-            c->in_input = false;
-            flush(*c);
+            jmap_poll.push_back(c->id);
         }
     }
     for (conn* c : late)
@@ -2870,6 +2851,22 @@ void mail_run::tick()
         else
             close_conn(*c);
     }
+    for (const uint64_t id : imap_poll)
+        if (conn* c = find(id); c && !c->dead && c->imap)
+        {
+            c->in_input = true;
+            c->imap->poll();
+            c->in_input = false;
+            flush(*c);
+        }
+    for (const uint64_t id : jmap_poll)
+        if (conn* c = find(id); c && !c->dead && c->jmap)
+        {
+            c->in_input = true;
+            c->jmap->poll();
+            c->in_input = false;
+            flush(*c);
+        }
     if (now >= m_next_files_ms)
     {
         m_next_files_ms = now + 1000;
@@ -3264,11 +3261,11 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
                 if (user.empty())
                     continue;
                 const uint64_t used = m_imap->usage(user), quota = m_imap->quota(user);
-                char line[160];
-                std::snprintf(line, sizeof line, "%-24s %12s  of %s%s\n", user.c_str(), size(used).c_str(),
+                std::string line(user.size() + 160, '\0');
+                std::snprintf(line.data(), line.size(), "%-24s %12s  of %s%s\n", user.c_str(), size(used).c_str(),
                               quota ? size(quota).c_str() : "no quota",
                               quota ? (" (" + std::to_string(used * 100 / quota) + "%)").c_str() : "");
-                out += line;
+                out += line.c_str();
             }
             answer(out);
             return;
@@ -3357,6 +3354,11 @@ void mail_run::send_command(uint64_t ticket, socketley::bytes::reader& r)
         }
     }
     std::vector<std::string> rcpts;
+    if (!m_delivery)
+    {
+        answer("error: the mail runtime is not running");
+        return;
+    }
     if (!m_delivery->compose_message(c, from, rcpts, body, why))
     {
         answer("error: " + why);
@@ -3552,6 +3554,10 @@ void mail_run::save_auth()
             text += "ip " + ip + " " + std::to_string(c.locked_until_ms) + "\n";
     for (const auto& [name, a] : m_accounts)
     {
+        // A name with a space or a control byte would not read back as one field.
+        if (std::any_of(name.begin(), name.end(),
+                        [](char ch) { return static_cast<unsigned char>(ch) <= ' ' || ch == 0x7f; }))
+            continue;
         if (a.locked_until_ms > now)
             text += "locked " + name + " " + std::to_string(a.locked_until_ms) + "\n";
         for (const auto& [ip, ms] : a.known)
@@ -3601,8 +3607,9 @@ void mail_run::load_auth()
 void mail_run::check_own_name()
 {
     auto said = std::make_shared<std::string>();
+    auto unsure = std::make_shared<bool>(false);
     m_pool.submit(0,
-                  [host = m_hostname, said] {
+                  [host = m_hostname, said, unsure] {
                       bool nx = false;
                       auto r = system_check_resolver(5000);
                       std::vector<std::string> addrs;
@@ -3610,6 +3617,8 @@ void mail_run::check_own_name()
                       {
                           if (nx)
                               *said = host + " has no address";
+                          else
+                              *unsure = true;
                           return;
                       }
                       for (const auto& ip : addrs)
@@ -3619,6 +3628,8 @@ void mail_run::check_own_name()
                           {
                               if (nx)
                                   *said += (said->empty() ? "" : "; ") + ip + " has no PTR record";
+                              else
+                                  *unsure = true;
                               continue;
                           }
                           if (std::none_of(names.begin(), names.end(),
@@ -3627,8 +3638,9 @@ void mail_run::check_own_name()
                                        (names.empty() ? std::string("nothing") : names.front()) + ", not " + host;
                       }
                   },
-                  [this, alive = m_alive, said] {
-                      if (!*alive)
+                  [this, alive = m_alive, said, unsure] {
+                      // A lookup that timed out says nothing about a mismatch already found.
+                      if (!*alive || (*unsure && said->empty()))
                           return;
                       if (*said != m_name_mismatch && !said->empty())
                           LOG_WARN(("mail " + std::string(m_owner.get_name()) + ": " + *said +
@@ -3762,12 +3774,13 @@ std::string mail_run::trace_text(const std::string& address) const
     return out;
 }
 
-void mail_run::learn(const std::string& user, const std::string& key, uint64_t size, bool spam)
+bool mail_run::learn(const std::string& user, const std::string& key, uint64_t size, bool spam)
 {
     if (m_learn_queue.size() >= 100000)
-        return;
+        return false;
     m_learn_queue.push_back({user, key, size, spam});
     pump_learning();
+    return true;
 }
 
 void mail_run::pump_learning()
@@ -3876,9 +3889,10 @@ std::string mail_run::learn_command(const std::string& arg, std::function<void(s
             answer("error: " + user + " has no folder " + folder);
             return;
         }
+        size_t queued = 0;
         for (const auto& m : f->msgs)
-            learn(user, m.key, m.size, spam);
-        answer("learning " + std::to_string(f->msgs.size()) + " message" + (f->msgs.size() == 1 ? "" : "s") + " of " +
+            queued += learn(user, m.key, m.size, spam);
+        answer("learning " + std::to_string(queued) + " message" + (queued == 1 ? "" : "s") + " of " +
                user + "'s " + folder + " as " + (spam ? "spam" : "not spam"));
     });
     return {};

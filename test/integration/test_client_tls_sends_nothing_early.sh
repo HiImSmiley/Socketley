@@ -71,10 +71,13 @@ cat > "$SOCKETLEY_TMPD/listen.py" <<'PYEOF'
 import socket, sys, threading, time
 tls_port, plain_port, outdir = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 
-def one(port, tag):
+def bind(port):
     ls = socket.socket()
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ls.bind(("127.0.0.1", port)); ls.listen(8); ls.settimeout(0.3)
+    return ls
+
+def one(ls, tag):
     deadline = time.time() + 90
     while time.time() < deadline:
         try:
@@ -109,9 +112,10 @@ def one(port, tag):
         return
     ls.close()
 
-threading.Thread(target=one, args=(plain_port, "plain"), daemon=True).start()
+plain_ls, tls_ls = bind(plain_port), bind(tls_port)
+threading.Thread(target=one, args=(plain_ls, "plain"), daemon=True).start()
 sys.stderr.write("listening\n"); sys.stderr.flush()
-one(tls_port, "tls")
+one(tls_ls, "tls")
 PYEOF
 
 python3 "$SOCKETLEY_TMPD/listen.py" "$P_TLS" "$P_PLAIN" "$SOCKETLEY_TMPD" \

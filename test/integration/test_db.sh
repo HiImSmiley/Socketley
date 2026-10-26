@@ -51,7 +51,7 @@ chmod 600 "$T/keys"
 out=$("$BIN" create db x1 -p "$PD" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok || bad "a database no key nor account can write is refused" "rc $rc: $out"
 out=$("$BIN" create db x3 -p "$PD" --keys relative.keys 2>&1); rc=$?
-case "$out" in *"$PWD/relative.keys"*|"") ok ;; *) [ "$rc" -eq 0 ] && ok || bad "a relative --keys is made absolute by the CLI" "rc $rc: $out" ;; esac
+case "$("$BIN" show x3 2>&1)" in *"$PWD/relative.keys"*) [ "$rc" -eq 0 ] && ok || bad "a relative --keys is made absolute by the CLI" "rc $rc: $out" ;; *) bad "a relative --keys is made absolute by the CLI" "rc $rc: $out" ;; esac
 "$BIN" remove x3 >/dev/null 2>&1
 printf 'chars everyone\n' > "$T/badschema"
 out=$("$BIN" create db x4 -p "$PD" --keys "$T/keys" --schema "$T/badschema" -s 2>&1); rc=$?
@@ -325,6 +325,8 @@ elif phase == "schema":
     check("a key added to the file while running is taken",
           db("GET", "/c/notes/n1", headers={"Authorization": "Bearer seconddbsecret0123456789"})[0], 200)
 PY
+    local rc=$?
+    [ "$rc" -eq 0 ] || echo "bad the checker ran to its end: exit $rc"
 }
 
 tally < <(run main)

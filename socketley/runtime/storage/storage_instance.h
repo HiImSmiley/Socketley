@@ -128,7 +128,6 @@ public:
     // What decides whether a request may go on.  Given, it is used instead of
     // the anonymous default; the SigV4 authenticator arrives here.
     void set_authenticator(std::unique_ptr<socketley::storage::authenticator> a);
-    bool has_authenticator() const { return m_auth != nullptr; }
 
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
@@ -153,9 +152,6 @@ public:
     // Itself in the worker, and the daemon's override where the runtime is a
     // placeholder for a worker, whose run is empty.
     request_sink* as_request_sink() override { return sink_or(this); }
-
-    // What was counted, for the tests that read it through `stats`.
-    socketley::storage::storage_run* run() const { return m_run.get(); }
 
 private:
     bool open_listener(uint16_t port, bool reuseport, int& out_fd);
@@ -194,5 +190,4 @@ private:
     // The node beside the port, made once and kept: it owns an io_request the
     // ring may still be holding after a stop.
     std::unique_ptr<socketley::unix_companion> m_companion;
-    uint32_t    m_max_conns_cached{0};
 };

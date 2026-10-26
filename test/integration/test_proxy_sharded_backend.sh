@@ -228,9 +228,10 @@ sleep 1.5
 DOWN=$(via "$PX_NAME" sb_dead)
 ALIVE=$("$BIN" ls 2>/dev/null | grep -c "sb_dead")
 case "$DOWN" in
-    SHARDED|PLAIN) DOWN_OK=no ;;
-    ERROR:*)       DOWN_OK=no ;;
-    *)             DOWN_OK=yes ;;
+    NOTHING|SHARDED|PLAIN) DOWN_OK=no ;;
+    ERROR:*)               DOWN_OK=no ;;
+    HTTP/1*)               DOWN_OK=yes ;;
+    *)                     DOWN_OK=no ;;
 esac
 if [ "$DOWN_OK" = "yes" ] && [ "$ALIVE" -ge 1 ]; then
     ok "with every node gone the proxy answers '$DOWN' and stays up"

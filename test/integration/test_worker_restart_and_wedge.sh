@@ -61,7 +61,12 @@ DPID=$(daemon_starting_pids "$SOCKETLEY_SOCKET")
 # Bound waits on the thing itself, never a fixed sleep.
 wait_port() {
     local p=$1 i
-    for i in $(seq 1 200); do ss -ltn | grep -q ":$p " && return 0; sleep 0.1; done
+    local listing
+    for i in $(seq 1 200); do
+        listing=$(ss -ltn 2>/dev/null)
+        case "$listing" in *":$p "*) return 0 ;; esac
+        sleep 0.1
+    done
     return 1
 }
 worker_of() { pgrep -P "$1" 2>/dev/null | head -1; }
@@ -78,6 +83,12 @@ printf 'set survivor 1\n' | timeout 3 nc -q0 127.0.0.1 "$PORT_CACHE" >/dev/null
 # below are not passing on a string that is always there.
 if ! status_of kv | grep -q "restart"; then ok; else
     bad "no restart note before a kill" "$(status_of kv)"
+fi
+
+# And the key is there before the kill, or the nil after it says nothing.
+before=$(printf 'get survivor\n' | timeout 3 nc -q0 127.0.0.1 "$PORT_CACHE")
+if [ "$before" = "1" ]; then ok; else
+    bad "the key was stored before the kill" "expected 1, got '$before'"
 fi
 
 sleep 4   # so the original uptime is visibly larger than the replacement's

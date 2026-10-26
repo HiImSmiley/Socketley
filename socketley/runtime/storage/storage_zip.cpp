@@ -218,9 +218,10 @@ std::string entry_name(std::string_view rel)
 
 // `name` made one no entry before it has, by " (2)", " (3)" and on before its last segment's extension, since an
 // unzipper writes a second entry of one name over the first.
-std::string unique_name(std::string name, std::unordered_set<std::string>& taken)
+std::string unique_name(std::string name, std::unordered_set<std::string>& taken,
+                        const std::unordered_set<std::string>& dirs)
 {
-    if (taken.insert(name).second)
+    if (!dirs.contains(name) && taken.insert(name).second)
         return name;
     const size_t slash = name.rfind('/');
     const size_t dot = name.rfind('.');
@@ -228,7 +229,7 @@ std::string unique_name(std::string name, std::unordered_set<std::string>& taken
     for (int n = 2;; ++n)
     {
         std::string next = name.substr(0, cut) + " (" + std::to_string(n) + ")" + name.substr(cut);
-        if (taken.insert(next).second)
+        if (!dirs.contains(next) && taken.insert(next).second)
             return next;
     }
 }
@@ -260,7 +261,8 @@ void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, 
         job->bucket = bucket;
         uint64_t at = 0;
         size_t skipped = 0;
-        std::unordered_set<std::string> taken;
+        std::unordered_set<std::string> taken, dirs;
+        std::vector<std::pair<list_entry*, std::string>> picked;
         for (list_entry& e : p.objects)
         {
             std::string name = e.key.substr(prefix.size());
@@ -281,9 +283,17 @@ void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, 
             std::string safe = entry_name(name);
             if (safe.empty())
                 continue;
+            // A file named as a folder of another entry would keep that folder from unpacking.
+            for (size_t sl = safe.find('/'); sl != std::string::npos; sl = safe.find('/', sl + 1))
+                dirs.insert(safe.substr(0, sl));
+            picked.emplace_back(&e, std::move(safe));
+        }
+        for (auto& [ep, safe] : picked)
+        {
+            list_entry& e = *ep;
             zip_job::entry z;
             z.key      = std::move(e.key);
-            z.name     = unique_name(std::move(safe), taken);
+            z.name     = unique_name(std::move(safe), taken, dirs);
             z.size     = e.meta.size;
             z.mtime_ms = e.meta.mtime_ms;
             z.offset   = at;

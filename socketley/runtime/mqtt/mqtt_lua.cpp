@@ -131,6 +131,14 @@ void mqtt_lua::publish(const client_info& c, const message_ptr& m, std::function
             if (lua_type(th, -1) == LUA_TSTRING)
                 out->topic = lua_tostring(th, -1);
             lua_pop(th, 1);
+            if (out->topic != m->topic && (!valid_topic(out->topic) || out->topic.front() == '$'))
+            {
+                std::cerr << "[" << owner << "] on_publish returned `" << out->topic
+                          << "`, which is not a topic a message can be published to\n";
+                v.allow = false;
+                done(std::move(v));
+                return;
+            }
             lua_getfield(th, 1, "payload");
             if (lua_type(th, -1) == LUA_TSTRING || lua_type(th, -1) == LUA_TNUMBER)
             {

@@ -168,7 +168,7 @@ else bad "a clean numeric value no longer imports (max_connections is not 42)"; 
 # answered in cleartext afterwards and the command reported success.
 "$BIN" remove rt_partial >/dev/null 2>&1 || true
 "$BIN" create server rt_partial -p "$PARTIAL_PORT" \
-    --max-conn 77 --idle-timeout 45 --log /tmp/rt_partial.log \
+    --max-conn 77 --idle-timeout 45 --log "$WORK/rt_partial.log" \
     --tls --cert /tmp/rt.pem --key /tmp/rt.key >/dev/null 2>&1
 "$BIN" show rt_partial > "$WORK/partial-before.json"
 # Without TLS on before the import, both checks below would hold for a runtime that never had it.

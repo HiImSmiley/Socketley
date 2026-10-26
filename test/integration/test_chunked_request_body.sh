@@ -135,7 +135,7 @@ create_ok "and one that does not"        "$BIN" create server cb_plain  -p "$P_N
 ready_tcp 127.0.0.1 "$P_S" >/dev/null 2>&1 || true
 ready_tcp 127.0.0.1 "$P_N" >/dev/null 2>&1 || true
 
-WPID=$("$BIN" stats cb_stream 2>/dev/null | awk -F: '/^pid:/ {gsub(/[^0-9]/,"",$2); print $2}' | head -1)
+WPID=$("$BIN" stats cb_stream 2>/dev/null | awk -F: '/^pid:/ {gsub(/[^0-9]/,"",$2); print $2}' | head -1) || true
 rss() { awk '/VmRSS/{print $2}' "/proc/$WPID/status" 2>/dev/null || echo 0; }
 
 # One driver, so every case below differs only in what it puts on the wire.

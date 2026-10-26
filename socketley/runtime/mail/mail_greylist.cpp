@@ -125,7 +125,7 @@ bool greylist::read_tail()
         if (std::sscanf(line.c_str(), "%lld %lld %32s", &first, &passed, h) != 3)
             continue;
         entry& e = m_entries[h];
-        e.first_ms = e.first_ms ? std::min<int64_t>(e.first_ms, first) : first;
+        e.first_ms = std::max<int64_t>(e.first_ms, first);
         e.passed_ms = std::max<int64_t>(e.passed_ms, passed);
     }
     return true;

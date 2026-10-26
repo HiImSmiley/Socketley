@@ -182,8 +182,8 @@ bool expand(std::string_view spec, const std::string& domain, spf_state& s, std:
             if (keep && keep < labels.size())
                 labels.erase(labels.begin(), labels.end() - static_cast<long>(keep));
             std::string joined;
-            for (const auto& l : labels)
-                joined += (joined.empty() ? "" : ".") + l;
+            for (size_t i = 0; i < labels.size(); ++i)
+                joined += (i ? "." : "") + std::string(labels[i]);
             // An upper-case letter asks for the value URL-escaped (RFC 7208 7.3).
             if (given != letter)
             {
@@ -366,8 +366,6 @@ std::string check_host(const std::string& domain, spf_state& s, int depth)
     std::string redirect;
     for (const std::string_view term : words(std::string_view(*record).substr(6)))
     {
-        if (term.empty())
-            continue;
         if (const size_t eq = term.find('='); eq != std::string_view::npos && term.find(':') > eq)
         {
             if (lower(term.substr(0, eq)) == "redirect")
@@ -734,11 +732,9 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
         if (out.dkim.size() >= 10)
             break;
         std::string record;
-        dkim::result res = dkim::result::permerror;
-        if (!key_of(sig.s + "._domainkey." + sig.d, record))
-            res = dkim::result::temperror;
-        else
-            res = dkim::verify(message, sig, record, now_s, nullptr, &bodies);
+        const dkim::result res = !key_of(sig.s + "._domainkey." + sig.d, record)
+                                     ? dkim::result::temperror
+                                     : dkim::verify(message, sig, record, now_s, nullptr, &bodies);
         out.dkim.emplace_back(dkim::result_name(res), sig.d);
     }
     const arc::chain chain = arc::verify(message, key_of, now_s);
@@ -850,8 +846,14 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
         const size_t eq = tag.find('=');
         if (eq == std::string_view::npos)
             continue;
-        const std::string k = lower(tag.substr(0, eq));
-        const std::string v = lower(tag.substr(eq + 1));
+        std::string_view kk = tag.substr(0, eq);
+        std::string_view vv = tag.substr(eq + 1);
+        while (!kk.empty() && (kk.back() == ' ' || kk.back() == '\t'))
+            kk.remove_suffix(1);
+        while (!vv.empty() && (vv.front() == ' ' || vv.front() == '\t'))
+            vv.remove_prefix(1);
+        const std::string k = lower(kk);
+        const std::string v = lower(vv);
         if (k == "p")
             p = v;
         else if (k == "sp")

@@ -133,17 +133,18 @@ import socket, sys, time
 # The runtime reads on until some 58 MB of replies wait, which a loaded machine takes longer than 20 s to answer.
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=90); s.recv(200)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-for _ in range(20):
-    s.sendall(b"EHLO x\r\n" * 20000)
-time.sleep(1)
-got, start = 0, time.time()
+got = 0
 try:
+    for _ in range(20):
+        s.sendall(b"EHLO x\r\n" * 20000)
+    time.sleep(1)
+    start = time.time()
     while time.time() - start < 15:
         b = s.recv(1 << 20)
         if not b: print("closed"); break
         got += len(b)
     else: print("open")
-except ConnectionResetError: print("closed")
+except (ConnectionResetError, BrokenPipeError): print("closed")
 except Exception as e: print("error", e)
 PY
 )

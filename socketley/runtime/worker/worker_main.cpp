@@ -1775,15 +1775,17 @@ private:
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
             {
                 const auto now = std::chrono::steady_clock::now();
-                if (now >= deadline)
-                    return false;
-
                 struct pollfd pfd{m_map_fd, POLLOUT, 0};
-                const int slice = static_cast<int>(
+                const int slice = now >= deadline ? 0 : static_cast<int>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         deadline - now).count());
-                if (::poll(&pfd, 1, slice) < 0 && errno != EINTR)
+                if (now >= deadline || (::poll(&pfd, 1, slice) < 0 && errno != EINTR))
+                {
+                    // Half a frame in the stream would make the daemon read the next one wrong, so the channel goes.
+                    if (off > 0)
+                        close_map();
                     return false;
+                }
                 continue;
             }
 

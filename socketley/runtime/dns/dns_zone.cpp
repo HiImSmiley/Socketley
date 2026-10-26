@@ -150,6 +150,11 @@ bool tokenize(std::string_view text, std::vector<entry>& out, std::string& why)
                     break;
                 if (q == '\\' && i + 1 < text.size() && text[i + 1] != '\n')
                 {
+                    if (i + 3 < text.size() && std::isdigit(static_cast<unsigned char>(text[i + 1])) &&
+                        std::isdigit(static_cast<unsigned char>(text[i + 2])) &&
+                        std::isdigit(static_cast<unsigned char>(text[i + 3])) &&
+                        (text[i + 1] - '0') * 100 + (text[i + 2] - '0') * 10 + (text[i + 3] - '0') > 255)
+                        return fail(why, line, "an escape above \\255");
                     t.text += q;
                     t.text += text[i + 1];
                     i += 2;
@@ -915,12 +920,23 @@ bool load_zone(const std::string& path, std::string_view origin_hint, zone& out,
         const ssize_t n = ::read(fd, text.data() + got, text.size() - got);
         if (n < 0 && errno == EINTR)
             continue;
-        if (n <= 0)
+        if (n < 0)
+        {
+            const int err = errno;
+            ::close(fd);
+            why = path + ": " + std::strerror(err);
+            return false;
+        }
+        if (n == 0)
             break;
         got += static_cast<size_t>(n);
     }
     ::close(fd);
-    text.resize(got);
+    if (got != text.size())
+    {
+        why = path + ": changed while it was read";
+        return false;
+    }
     if (!parse_zone(text, origin_hint, out, why))
     {
         why = path + ": " + why;
@@ -1021,8 +1037,12 @@ size_t add_extra(zone& z, const extra_records& x)
         auto it = std::find_if(sets.begin(), sets.end(), [&](const set_of& s) { return s.name == w && s.t == t; });
         if (it == sets.end())
             sets.push_back({w, t, ttl, {rd}});
-        else if (std::find(it->rdata.begin(), it->rdata.end(), rd) == it->rdata.end())
-            it->rdata.push_back(rd);
+        else
+        {
+            it->ttl = std::min(it->ttl, ttl);
+            if (std::find(it->rdata.begin(), it->rdata.end(), rd) == it->rdata.end())
+                it->rdata.push_back(rd);
+        }
     }
     for (const auto& s : sets)
         put(s.name, s.t, s.ttl, s.rdata);

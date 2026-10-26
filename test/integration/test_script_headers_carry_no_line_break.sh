@@ -31,6 +31,7 @@ T="$SOCKETLEY_TMPD"
 SP=$((SL_PORT_BASE+1966))
 SINK=$((SL_PORT_BASE+1967))
 SINK_PID=""
+: > "$T/sink.log"
 trap '[ -n "$SINK_PID" ] && kill "$SINK_PID" 2>/dev/null; daemon_stop' EXIT
 
 echo "=== Integration: a script's headers carry no line break ==="

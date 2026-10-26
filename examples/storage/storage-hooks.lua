@@ -35,9 +35,9 @@ function on_request(req)
     end
 
     if req.operation == "PutObject" then
-        -- One question to the policy runtime; nil and NoSuchKey mean "not named".
-        local meta = socketley.storage.head("policy", "rules", req.key)
-        if meta then
+        -- One question to the policy runtime; only NoSuchKey means "not named", any other failure refuses.
+        local meta, code = socketley.storage.head("policy", "rules", req.key)
+        if meta or code ~= "NoSuchKey" then
             return "AccessDenied"
         end
     end

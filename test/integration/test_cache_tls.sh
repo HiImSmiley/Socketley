@@ -760,8 +760,8 @@ for _ in range(40):
             tls.do_handshake()
         except (ssl.SSLWantReadError, ssl.SSLWantWriteError, OSError):
             pass
-        raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, LINGER0)
-        raw.close()
+        tls.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, LINGER0)
+        tls.close()
     except Exception:
         pass
 

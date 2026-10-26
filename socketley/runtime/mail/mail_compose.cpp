@@ -183,7 +183,7 @@ bool parse_mailbox_list(std::string_view in, std::vector<address>& out)
             out.push_back(std::move(a));
         }
     }
-    return true;
+    return !quoted && angle == 0;
 }
 
 std::string encode_header_value(std::string_view, std::string_view value)
@@ -386,6 +386,11 @@ bool compose_message(const compose& c, const address& from, std::string_view fro
                 why = "the header " + std::string(name) + " is the message's own and cannot be given";
                 return false;
             }
+        if (!c.reply_to.empty() && socketley::ascii::iequals(name, "reply-to"))
+        {
+            why = "the header Reply-To is given twice";
+            return false;
+        }
         h += std::string(name) + ": " + encode_header_value(name, trim(std::string_view(x).substr(colon + 1))) + "\r\n";
     }
     std::string body;

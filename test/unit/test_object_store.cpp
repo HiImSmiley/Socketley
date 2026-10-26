@@ -2148,7 +2148,7 @@ std::string reference_escape(std::string_view in)
             case '"':  out += "&quot;"; break;
             case '\'': out += "&apos;"; break;
             default:
-                if (c < 0x20 && c != '\t' && c != '\n' && c != '\r')
+                if (c < 0x20 && c != '\t' && c != '\n')
                 {
                     char buf[12];
                     std::snprintf(buf, sizeof buf, "&#x%X;", c);
@@ -2415,10 +2415,14 @@ TEST_CASE("a put with a condition or a committer never takes a pooled file")
     r.settle();
     // A caller that marks a pooled put conditional afterwards is refused rather than rolled forward.
     st why = st::ok;
+    const size_t pool_before = count_pool_files(d.path, "bkt");
     auto op = r.store->begin_put("bkt", "k", {}, 1, true, why, true);
     REQUIRE(op);
     op->set_create_only(true);
     CHECK(op->failed());
+    CHECK(count_pool_files(d.path, "bkt") == pool_before);
+    op->abort();
+    r.settle();
     // And one that says so at the start writes to a file of its own.
     r.settle();
     const size_t pooled = count_pool_files(d.path, "bkt");
@@ -3047,12 +3051,13 @@ TEST_CASE("a sealed body whose header was cut short at a chunk boundary, or whos
     // And the parts in the other order, with the header naming them so, are not these parts.
     CHECK_FALSE(sse_open_body(mp, seal.key, s2 + s1, back));
 
-    // Version 1 had neither, which is the gap version 2 closes: its cut and its swap both open.
+    // Version 1 had neither, which is the gap version 2 closes: its cut opens.
     object_meta v1 = sealed_meta(key, seal);
     v1.extra.back().second = "1" + v1.extra.back().second.substr(1);
     const std::string old = sealed_stream(seal.key, body, 0, sse_format_v1);
     v1.size = 2 * sse_chunk;
     CHECK(sse_open_body(v1, seal.key, old, back));
+    CHECK(back == body.substr(0, 2 * sse_chunk));
 }
 TEST_CASE("a sealed put at every edge of its buffers reads back through its chunks and stores no plaintext")
 {

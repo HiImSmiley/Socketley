@@ -92,9 +92,17 @@ bool valid_utf8(std::string_view s)
         const size_t n = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 0;
         if (n == 0 || i + n > s.size())
             return false;
+        uint32_t cp = n == 1 ? b : n == 2 ? (b & 0x1f) : n == 3 ? (b & 0x0f) : (b & 0x07);
         for (size_t k = 1; k < n; ++k)
+        {
             if ((static_cast<uint8_t>(s[i + k]) & 0xc0) != 0x80)
                 return false;
+            cp = (cp << 6) | (static_cast<uint8_t>(s[i + k]) & 0x3f);
+        }
+        // The shortest form only, and no surrogate or code point past U+10FFFF, as RFC 3629 allows.
+        static constexpr uint32_t least[] = {0, 0, 0x80, 0x800, 0x10000};
+        if (cp < least[n] || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff)
+            return false;
         i += n;
     }
     return true;
@@ -541,7 +549,7 @@ void storage_run::unzip_job::start_entry(size_t i)
             return;
         }
         const uint64_t first = e.local + 30 + rd16(h, 26) + rd16(h, 28);
-        if (first + e.csize > self->meta.size)
+        if (first > self->meta.size || e.csize > self->meta.size - first)
         {
             self->entry_done(i, false);
             return;
@@ -678,6 +686,13 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
                 *pick = nullptr;
                 return;
             }
+            // A listing that failed says nothing of the folder, which may be full, so nothing is written into it.
+            if (s != st::ok && s != st::no_such_key)
+            {
+                *pick = nullptr;
+                j->refuse(503, "Whether a folder of the archive's name is there could not be told.\n");
+                return;
+            }
             if (s == st::ok && (!p.objects.empty() || !p.prefixes.empty()))
             {
                 if (n < 100)
@@ -742,7 +757,7 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
                 auto j = wj.lock();
                 if (!j)
                     return;
-                if (count > entries_max || cd_size > directory_max || cd_off + cd_size > size)
+                if (count > entries_max || cd_size > directory_max || cd_off > size || cd_size > size - cd_off)
                 {
                     j->refuse(400, "The archive's directory is too large or not where it says.\n");
                     return;
@@ -828,7 +843,7 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
                         e.key = j->prefix + path + (e.dir ? "/" : "");
                         // Encrypted, or packed some way other than stored or deflated, it cannot be opened here.
                         if (e.key.size() > key_max || !valid_utf8(e.key) || (flags & 1) || (e.method != 0 && e.method != 8) ||
-                            (!e.dir && e.local + 30 > size) || (e.method == 0 && e.csize != e.usize) ||
+                            (!e.dir && (e.local > size || size - e.local < 30)) || (e.method == 0 && e.csize != e.usize) ||
                             !app_allowed(cc, "PUT", j->bucket, e.key))
                         {
                             ++j->skipped;
@@ -849,7 +864,7 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
                 rd32(t, eocd - 20) == 0x07064b50)
             {
                 const uint64_t z64 = rd64(t, eocd - 20 + 8);
-                if (z64 + 56 > size)
+                if (z64 > size || size - z64 < 56)
                 {
                     j->refuse(400, "The archive's directory is not where it says.\n");
                     return;

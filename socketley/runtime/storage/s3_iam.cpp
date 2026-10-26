@@ -231,12 +231,15 @@ bool trust_ok(std::string_view doc, std::string& why)
         why = "The trust policy is not a policy document.";
         return false;
     }
+    std::vector<jvalue> st;
+    if (statements_of(doc, st))
+        for (const jvalue& s : st)
+            if (member(s, "NotPrincipal") || member(s, "NotAction"))
+            {
+                why = "The trust policy cannot use NotPrincipal or NotAction.";
+                return false;
+            }
     return true;
-}
-
-bool glob(std::string_view pat, std::string_view text)
-{
-    return socketley::iam_wild_match(pat, text);
 }
 
 std::vector<std::string> strings_of(const jvalue* v)
@@ -585,7 +588,7 @@ bool iam_trusts(std::string_view trust, std::string_view user_id)
             continue;
         bool action = false;
         for (const std::string& a : strings_of(member(s, "Action")))
-            action = action || glob(a, "sts:AssumeRole") || a == "*";
+            action = action || socketley::iam_wild_match(a, "sts:AssumeRole") || a == "*";
         if (!action)
             continue;
         bool who = false;
@@ -926,20 +929,23 @@ struct api
                 return fail(409, "EntityAlreadyExists", "Login Profile for user " + n + " already exists.");
             if (a == "UpdateLoginProfile" && u->password.empty())
                 return fail(404, "NoSuchEntity", "Login Profile for User " + n + " cannot be found.");
-            if (const std::string* pw = field("Password"); pw || a == "CreateLoginProfile")
+            const std::string* pw = field("Password");
+            if (!pw && a == "CreateLoginProfile")
+                return missing("Password");
+            if (pw)
             {
-                const std::string why = password_problem(pw ? std::string_view(*pw) : std::string_view{}, n);
+                const std::string why = password_problem(*pw, n);
                 if (!why.empty())
                     return fail(400, "PasswordPolicyViolation", why);
                 const std::string h = password_hash(*pw);
                 if (h.empty())
                     return fail(500, "ServiceFailure", "No random bytes for a salt.");
+                std::string secret = u->login_secret.empty() ? random_text("", 40, alnum) : u->login_secret;
+                if (secret.empty())
+                    return fail(500, "ServiceFailure", "No random bytes for a secret.");
                 u->password = h;
                 u->password_ms = now;
-                if (u->login_secret.empty())
-                    u->login_secret = random_text("", 40, alnum);
-                if (u->login_secret.empty())
-                    return fail(500, "ServiceFailure", "No random bytes for a secret.");
+                u->login_secret = std::move(secret);
             }
             if (const std::string* reset = field("PasswordResetRequired"))
                 u->password_reset = *reset == "true";
@@ -1034,6 +1040,8 @@ struct api
                     return fail(400, "InvalidInput", why);
                 next[*k] = v;
             }
+            if (field(a == "TagUser" ? "Tags.member.51.Key" : "TagKeys.member.51"))
+                return fail(409, "LimitExceeded", "Cannot exceed quota for TagsPerUser: 50");
             if (next.size() > 50)
                 return fail(409, "LimitExceeded", "Cannot exceed quota for TagsPerUser: 50");
             tags = std::move(next);
@@ -1049,7 +1057,7 @@ struct api
             if (const std::string* d = field("ExpiresInDays"))
             {
                 const auto res = std::from_chars(d->data(), d->data() + d->size(), days);
-                if (res.ec != std::errc{} || days < 1 || days > 30)
+                if (res.ec != std::errc{} || res.ptr != d->data() + d->size() || days < 1 || days > 30)
                     return missing("ExpiresInDays");
             }
             iam_invite i;
@@ -1117,6 +1125,15 @@ struct api
                 return fail(500, "ServiceFailure", "No random bytes for a salt.");
             if (const std::string* em = field("Email"); em && !em->empty() && !tag_problem(iam_tag_email, *em).empty())
                 return missing("Email");
+            if (const std::string* dn = field("DisplayName"); dn && dn->size() > 128)
+                return missing("DisplayName");
+            std::string admins_id;
+            if (i.admin && !s.groups.count(std::string(iam_admins_group)))
+            {
+                admins_id = new_id("AGPA");
+                if (admins_id.empty())
+                    return fail(500, "ServiceFailure", "No random bytes for an id.");
+            }
             iam_user* u = nullptr;
             if (iam_result* bad = make_user(n, "/", u))
                 return *bad;
@@ -1127,7 +1144,7 @@ struct api
                 u->tags[std::string(iam_tag_max_bytes)] = std::to_string(i.max_bytes);
             if (i.libraries)
                 u->policies.inline_docs[std::string(iam_libraries_policy)] = std::string(iam_libraries_doc);
-            if (const std::string* dn = field("DisplayName"); dn && !dn->empty() && dn->size() <= 128)
+            if (const std::string* dn = field("DisplayName"); dn && !dn->empty())
                 u->tags[std::string(iam_tag_display_name)] = *dn;
             if (const std::string* em = field("Email"); em && !em->empty())
                 u->tags[std::string(iam_tag_email)] = *em;
@@ -1138,7 +1155,7 @@ struct api
                 {
                     iam_group grp;
                     grp.name = g;
-                    grp.id = new_id("AGPA");
+                    grp.id = std::move(admins_id);
                     grp.created_ms = now;
                     s.groups[g] = std::move(grp);
                 }
@@ -1154,7 +1171,8 @@ struct api
         {
             const std::string n = text("UserName");
             auto it = s.users.find(n);
-            if (it == s.users.end())
+            // A user of the credentials file is described there.
+            if (it == s.users.end() || it->second.external)
                 return no_entity("user", n);
             if (a == "GetUser")
             {
@@ -1279,11 +1297,8 @@ struct api
         for (std::string_view kind : {std::string_view("User"), std::string_view("Group"), std::string_view("Role")})
             for (std::string_view op : {"Put", "Get", "Delete", "List", "Attach", "Detach", "ListAttached"})
             {
-                const bool attached = op == "Attach" || op == "Detach" || op == "ListAttached";
                 const bool listing  = op == "List" || op == "ListAttached";
                 std::string want = std::string(op) + std::string(kind) + (listing ? "Policies" : "Policy");
-                if (attached && op == "ListAttached")
-                    want = "ListAttached" + std::string(kind) + "Policies";
                 if (a == want)
                     return policy_op(kind == "User" ? "user" : kind == "Group" ? "group" : "role", op);
             }
@@ -1300,6 +1315,8 @@ struct api
             iam_group g;
             g.name = n;
             g.id = new_id("AGPA");
+            if (g.id.empty())
+                return fail(500, "ServiceFailure", "No random bytes for an id.");
             g.path = path;
             g.created_ms = now;
             std::string x = begin();
@@ -1387,6 +1404,8 @@ struct api
             iam_role ro;
             ro.name = n;
             ro.id = new_id("AROA");
+            if (ro.id.empty())
+                return fail(500, "ServiceFailure", "No random bytes for an id.");
             ro.path = path;
             ro.created_ms = now;
             ro.trust = trust;
@@ -1419,16 +1438,18 @@ struct api
             }
             if (a == "UpdateRole")
             {
-                if (const std::string* d = field("Description"))
-                    it->second.description = *d;
-                if (const std::string* m = field("MaxSessionDuration"))
+                int64_t v = 0;
+                const std::string* m = field("MaxSessionDuration");
+                if (m)
                 {
-                    int64_t v = 0;
                     const auto res = std::from_chars(m->data(), m->data() + m->size(), v);
                     if (res.ec != std::errc{} || v < 3600 || v > 43200)
                         return missing("MaxSessionDuration");
-                    it->second.max_session = v;
                 }
+                if (const std::string* d = field("Description"))
+                    it->second.description = *d;
+                if (m)
+                    it->second.max_session = v;
                 return done();
             }
             if (!it->second.policies.inline_docs.empty() || !it->second.policies.attached.empty())

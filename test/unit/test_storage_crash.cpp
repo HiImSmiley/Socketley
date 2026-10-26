@@ -384,7 +384,7 @@ TEST_CASE("a writer killed at random moments leaves only whole objects and never
         REQUIRE(before.problem.empty());
         total_files += before.files;
         std::error_code ec;
-        if (!fs::is_empty(dir + "/" + bucket + "/tmp", ec))
+        if (fs::exists(dir + "/" + bucket + "/tmp", ec) && !fs::is_empty(dir + "/" + bucket + "/tmp", ec))
             ++kills_with_tmp;
 
         // What the writer said it began and finished.
@@ -416,8 +416,18 @@ TEST_CASE("a writer killed at random moments leaves only whole objects and never
         INFO(after.problem);
         REQUIRE(after.problem.empty());
         for (const auto& [name, kv] : before.found)
-            if (!after.found.contains(name))
+        {
+            if (after.found.contains(name))
+                continue;
+            // A delete begun at or after the last acknowledgement may be finished by the start.
+            bool delete_begun = false;
+            for (uint32_t k = 0; k < key_count; ++k)
+                if (key_name(k) == name)
+                    for (uint32_t n = std::max<uint32_t>(acked[k], 1); n <= started[k]; ++n)
+                        delete_begun = delete_begun || is_delete(n);
+            if (!delete_begun)
                 FAIL_CHECK("the start removed the object file of " << name);
+        }
         rolled += e.report.rolled_forward;
 
         // The store and the files agree.

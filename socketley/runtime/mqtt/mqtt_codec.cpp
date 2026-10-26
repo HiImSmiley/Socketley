@@ -26,49 +26,6 @@ const char* packet_name(packet_type t)
     return "?";
 }
 
-const char* reason_text(uint8_t code)
-{
-    switch (code)
-    {
-        case reason::success:                 return "success";
-        case reason::granted_qos1:            return "granted QoS 1";
-        case reason::granted_qos2:            return "granted QoS 2";
-        case reason::disconnect_with_will:    return "disconnect with will";
-        case reason::no_matching_subscribers: return "no matching subscribers";
-        case reason::no_subscription_existed: return "no subscription existed";
-        case reason::continue_authentication: return "continue authentication";
-        case reason::unspecified:             return "unspecified error";
-        case reason::malformed:               return "malformed packet";
-        case reason::protocol_error:          return "protocol error";
-        case reason::implementation_specific: return "implementation specific error";
-        case reason::unsupported_version:     return "unsupported protocol version";
-        case reason::client_id_invalid:       return "client identifier not valid";
-        case reason::bad_user_or_password:    return "bad user name or password";
-        case reason::not_authorized:          return "not authorized";
-        case reason::server_unavailable:      return "server unavailable";
-        case reason::server_busy:             return "server busy";
-        case reason::bad_auth_method:         return "bad authentication method";
-        case reason::keepalive_timeout:       return "keep alive timeout";
-        case reason::session_taken_over:      return "session taken over";
-        case reason::topic_filter_invalid:    return "topic filter invalid";
-        case reason::topic_name_invalid:      return "topic name invalid";
-        case reason::packet_id_in_use:        return "packet identifier in use";
-        case reason::packet_id_not_found:     return "packet identifier not found";
-        case reason::receive_max_exceeded:    return "receive maximum exceeded";
-        case reason::topic_alias_invalid:     return "topic alias invalid";
-        case reason::packet_too_large:        return "packet too large";
-        case reason::message_rate_too_high:   return "message rate too high";
-        case reason::quota_exceeded:          return "quota exceeded";
-        case reason::administrative_action:   return "administrative action";
-        case reason::payload_format_invalid:  return "payload format invalid";
-        case reason::qos_not_supported:       return "QoS not supported";
-        case reason::shared_not_supported:    return "shared subscriptions not supported";
-        case reason::sub_ids_not_supported:   return "subscription identifiers not supported";
-        case reason::wildcards_not_supported: return "wildcard subscriptions not supported";
-    }
-    return "reason";
-}
-
 bool properties::empty() const
 {
     return !payload_format && !message_expiry && !content_type && !response_topic && !correlation_data &&
@@ -469,7 +426,6 @@ frame_status take_frame(std::string_view in, uint32_t max_size, frame& out)
         return frame_status::too_large;
     if (in.size() < total)
         return frame_status::incomplete;
-    out.first = first;
     out.type  = static_cast<packet_type>(type);
     out.flags = first & 0x0F;
     out.body  = in.substr(i, remaining);
@@ -510,7 +466,9 @@ bool read_connect(const frame& f, connect_packet& out, refusal& err)
         return fail(err, reason::malformed, "a password without a user name");
     if (level == level_5 && !read_properties(r, ctx::connect, out.props, err))
         return false;
-    if (!r.utf8(out.client_id))
+    if (!r.binary(out.client_id))
+        return fail(err, reason::malformed, "the client identifier is cut off");
+    if (!valid_utf8(out.client_id))
         return fail(err, reason::client_id_invalid, "the client identifier is no UTF-8 string");
     if (will)
     {
@@ -1138,23 +1096,6 @@ void write_suback(std::string& out, uint8_t level, const suback_packet& p)
     });
 }
 
-void write_unsubscribe(std::string& out, uint8_t level, const unsubscribe_packet& p)
-{
-    packet(out, 0xA2, [&](std::string& b) {
-        put_u16(b, p.packet_id);
-        if (level == level_5)
-            put_properties(b, p.props);
-        for (const auto& f : p.filters)
-            put_str(b, f);
-    });
-}
-
-void write_pingreq(std::string& out)
-{
-    out.push_back(static_cast<char>(0xC0));
-    out.push_back(0);
-}
-
 void write_pingresp(std::string& out)
 {
     out.push_back(static_cast<char>(0xD0));
@@ -1169,16 +1110,6 @@ void write_disconnect(std::string& out, uint8_t level, const disconnect_packet& 
         b.push_back(static_cast<char>(p.reason));
         if (!p.props.empty())
             put_properties(b, p.props);
-    });
-}
-
-void write_auth(std::string& out, const auth_packet& p)
-{
-    packet(out, 0xF0, [&](std::string& b) {
-        if (p.reason == reason::success && p.props.empty())
-            return;
-        b.push_back(static_cast<char>(p.reason));
-        put_properties(b, p.props);
     });
 }
 

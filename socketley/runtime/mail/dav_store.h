@@ -77,7 +77,7 @@ private:
     void note(const std::string& user, const std::string& kind, const std::string& coll, const std::string& name,
               bool gone);
     // The journal read: its base, what came before its first line, and its lines.
-    bool read_journal(const std::string& path, uint64_t& base, std::vector<std::pair<std::string, bool>>& lines) const;
+    void read_journal(const std::string& path, uint64_t& base, std::vector<std::pair<std::string, bool>>& lines) const;
     void remove_each(const std::string& user, const std::string& kind, const std::string& coll,
                      std::shared_ptr<std::vector<std::string>> names, size_t i, bool all_ok, std::function<void(bool)> done);
     void list_page(std::string prefix, std::string after, std::shared_ptr<std::vector<entry>> got,

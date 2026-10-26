@@ -385,7 +385,11 @@ echo 99 > "$ROUTE_FILE"
 R0_BEFORE=$(stat pr0 total_connections); R1_BEFORE=$(stat pr1 total_connections)
 R2_BEFORE=$(stat pr2 total_connections)
 for _ in $(seq 1 6); do ask "$ROUTE_PORT" "ROUTE-PROBE" 0.5 >/dev/null; done
-sleep 1.0
+for _ in $(seq 1 60); do
+    [ $(( $(stat pr0 total_connections) + $(stat pr1 total_connections) + $(stat pr2 total_connections)
+          - R0_BEFORE - R1_BEFORE - R2_BEFORE )) -ge 6 ] && break
+    sleep 0.1
+done
 
 R0_D=$(( $(stat pr0 total_connections) - R0_BEFORE ))
 R1_D=$(( $(stat pr1 total_connections) - R1_BEFORE ))

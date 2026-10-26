@@ -514,7 +514,7 @@ struct ring_watch
         // Bounded at eight: a report is for reading, and if eight descriptors
         // are stuck the ninth adds nothing.
         int listed = 0;
-        for (int fd = 0; fd < 4096 && listed < 8 && off > 0 &&
+        for (int fd = 0; fd < static_cast<int>(fd_scan_limit()) && listed < 8 && off > 0 &&
                          off < static_cast<int>(sizeof(buf)); fd++)
         {
             // fd_inflight() answers 0 for anything outside the tracked range,

@@ -398,7 +398,8 @@ void put_op::pump()
         {
             // Held across the call because the callback may end this operation.
             auto self = shared_from_this();
-            m_ready_cb();
+            auto cb = m_ready_cb;
+            cb();
         }
     }
 }

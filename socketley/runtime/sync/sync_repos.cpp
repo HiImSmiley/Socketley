@@ -82,10 +82,8 @@ bool repo_runner::reload(std::string& why)
         if (auto it = m_pulls.find(user); it != m_pulls.end())
             p.git = std::move(it->second.git);
         else
-        {
             p.git = std::make_unique<socketley::storage::git_mirrors>();
-            p.git->open_runner(dir, user, endpoint, tls, ca);
-        }
+        p.git->open_runner(dir, user, endpoint, tls, ca);
         p.id.access_key    = text_of(*u, "access_key");
         p.id.secret        = text_of(*u, "secret");
         p.id.session_token = text_of(*u, "session_token");

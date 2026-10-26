@@ -28,12 +28,15 @@ NAME=backlogcache
 MSGS="${MSGS:-6000}"
 PASS=0; FAIL=0; TOTAL=0
 
+TMPD=""
 cleanup() {
     "$BIN" stop "$NAME" 2>/dev/null || true
     sleep 0.2
     "$BIN" remove "$NAME" 2>/dev/null || true
-    rm -f "$TMPD"/* 2>/dev/null || true
-    rmdir "$TMPD" 2>/dev/null || true
+    if [ -n "$TMPD" ]; then
+        rm -f "$TMPD"/* 2>/dev/null || true
+        rmdir "$TMPD" 2>/dev/null || true
+    fi
     daemon_stop
 }
 trap cleanup EXIT
@@ -85,7 +88,7 @@ sub.settimeout(5.0)
 buf = b""
 closed_early = False
 try:
-    while buf.count(b"\n") < count:
+    while sum(1 for l in buf.split(b"\n")[:-1] if l.startswith(b"message backlog")) < count:
         chunk = sub.recv(65536)
         if not chunk:
             closed_early = True

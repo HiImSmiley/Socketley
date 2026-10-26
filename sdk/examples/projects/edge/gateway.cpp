@@ -37,7 +37,10 @@ int main()
     // The return contract is not the obvious one -- see proxy.h:
     //   nullopt = DROP the bytes, "" = pass unchanged, "..." = replace.
     gw.on_proxy_request([](int, std::string_view head) -> std::optional<std::string> {
-        printf("gw: %.*s\n", (int)head.substr(0, head.find('\r')).size(), head.data());
+        const std::string_view line = head.substr(0, head.find_first_of("\r\n"));
+        // A body chunk is not a request line, so it is not logged.
+        if (line.size() > 9 && line.substr(line.size() - 9, 8) == " HTTP/1.")
+            printf("gw: %.*s\n", (int)line.size(), line.data());
         return std::string{};                // empty = forward unmodified
     });
 

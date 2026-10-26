@@ -153,8 +153,9 @@ PY
 )
 case "$got" in *cache-ok*) ok "the cache's key is back" ;; *) bad "the cache's key" "$got" ;; esac
 case "$got" in *imap-ok*) ok "the account signs in and its message is in its mailbox" ;; *) bad "the account and mailbox" "$got" ;; esac
-[ "$(dig +short +time=2 +tries=1 -p "$NS" @127.0.0.1 example.test SOA 2>/dev/null | wc -l)" -ge 1 ] 2>/dev/null && ok "the dns zone is served again" \
-    || { command -v dig >/dev/null 2>&1 || { echo "  SKIP: dig is not installed"; true; } && bad "the dns zone" "no SOA"; }
+if ! command -v dig >/dev/null 2>&1; then echo "  SKIP: dig is not installed"
+elif [ "$(dig +short +time=2 +tries=1 -p "$NS" @127.0.0.1 example.test SOA 2>/dev/null | wc -l)" -ge 1 ]; then ok "the dns zone is served again"
+else bad "the dns zone" "no SOA"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

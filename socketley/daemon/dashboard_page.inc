@@ -172,8 +172,6 @@ const TYPES = {
   mqtt: ['mqtt', 'MQTT', 'A broker for devices, apps and browsers, whose sessions wait for clients that went away.'],
   mail: ['mail', 'Mail', 'A mail server for its domains and users: SMTP, a spool, DKIM, mailboxes in a storage, IMAP.']
 };
-// The configuration key `show` and `import` name a flag by, which the schema gives for each type's row.
-const confKey = f => f.key;
 const ARRAYS = new Set(['backends', 'upstreams']);
 const HEALTH = ['', 'tcp', 'http'];
 // Durations as the flags take them and seconds as the configuration keeps them; sizes alike in bytes.
@@ -510,7 +508,7 @@ async function detail(full) {
   const C = $('#content');
   if (!r) { if (full) { C.textContent = ''; C.append(el('p', { class: 'mut', text: 'No runtime ' + view.name + '.' })); } return; }
   if (full || !shown || shown.name !== r.name) {
-    shown = { name: r.name, conf: null, stats: '' };
+    shown = { name: r.name, conf: null };
     C.textContent = '';
     C.append(el('div', { id: 'dHead' }), el('div', { class: 'tiles t3', id: 'dTiles' }),
       el('div', { class: 'panel' }, el('h3', {}, ico('edit'), el('span', { text: 'Configuration' })), el('div', { id: 'dConf', class: 'kv' })),
@@ -518,7 +516,8 @@ async function detail(full) {
       el('div', { class: 'panel' }, el('h3', {}, ico('info'), el('span', { text: 'Stats' })), el('div', { id: 'dStats' })));
     shown.logNext = 0;
     if (me && me.user) {
-      run('show', r.name).then(x => { if (!x.code) { try { shown.conf = JSON.parse(x.out); } catch (e) {} paintConf(); } });
+      const mine = shown;
+      run('show', r.name).then(x => { if (shown === mine && !x.code) { try { shown.conf = JSON.parse(x.out); } catch (e) {} paintConf(); } });
       statsText(r.name);
     }
   }
@@ -536,7 +535,7 @@ async function detail(full) {
     tile('gauge', 'Memory', human(r.memory_bytes), 'held, every shard', line(n, 'rss', human, true)));
   if (!full && shown.stamp && Date.now() - shown.stamp > 5000) statsText(r.name);
   tailInto($('#dLog'), shown, r.name, 300);
-  if (r.state === 'failed' && why[r.name] && !$('#dWhy')) H.append(el('div', { id: 'dWhy', class: 'panel', style: 'border-color:rgba(251,88,118,.4)' }, el('h3', {}, ico('info'), el('span', { text: 'Why it failed' })), el('div', { class: 'kv' }, el('div', { class: 'k', text: new Date(why[r.name].at).toLocaleString() }), el('div', { class: 'v', text: clean(why[r.name].text) }))));
+  if (r.state === 'failed' && why[r.name]) H.append(el('div', { id: 'dWhy', class: 'panel', style: 'border-color:rgba(251,88,118,.4)' }, el('h3', {}, ico('info'), el('span', { text: 'Why it failed' })), el('div', { class: 'kv' }, el('div', { class: 'k', text: new Date(why[r.name].at).toLocaleString() }), el('div', { class: 'v', text: clean(why[r.name].text) }))));
 }
 // A line without its clock and tag, which the view says by itself.
 const clean = t => t.replace(/^\[\d\d:\d\d:\d\d\] \[[A-Z]+\] /, '');
@@ -553,8 +552,11 @@ const NOISE = /inbound handshakes? failed in the last|did not finish a TLS hands
 async function tailInto(box, st, runtime, keep, level, text, quiet) {
   if (!box || st.logBusy) return;
   st.logBusy = true;
+  const gen = st.gen || 0;
   try {
     const d = await (await must(await api('GET', '/api/logs?since=' + (st.logNext || 0) + '&max=' + (st.logNext ? 500 : keep) + (runtime ? '&runtime=' + encodeURIComponent(runtime) : '') + (level ? '&level=' + level : '')))).json();
+    // A filter changed meanwhile, so these lines are of the old one.
+    if ((st.gen || 0) !== gen) { st.logBusy = false; return; }
     st.logNext = d.next;
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
     const q = (text || '').toLowerCase();
@@ -684,7 +686,7 @@ function logsView() {
   const quietRow = el('div', { class: 'swrow', title: 'Failed TLS handshakes, connections that never finished one and request heads that stopped arriving: what scanners cause on any open port' },
     el('label', { class: 'sw' }, quiet, el('i')), el('span', { class: 'h', text: 'Hide scanner noise' }));
   const box = el('div', { class: 'log' });
-  const restart = () => { box.textContent = ''; st.logNext = 0; tick(); };
+  const restart = () => { box.textContent = ''; st.logNext = 0; st.gen = (st.gen || 0) + 1; tick(); };
   rt.onchange = () => { view.runtime = rt.value; history.replaceState(null, '', '#/logs' + (rt.value ? '/' + encodeURIComponent(rt.value) : '')); restart(); };
   lv.onchange = restart; q.oninput = () => { clearTimeout(st.qt); st.qt = setTimeout(restart, 250); };
   quiet.onchange = () => { try { localStorage.setItem('skl-dash-quiet', quiet.checked ? '1' : '0'); } catch (e) {} restart(); };
@@ -857,7 +859,7 @@ function form(type, conf, editing, running) {
   const sections = new Map();
   for (const f of schema.flags) {
     if (f.hidden || !f.types.includes(type)) continue;
-    if (editing && (!confKey(f, type) || f.flag === '-s')) continue;
+    if (editing && (!f.key || f.flag === '-s')) continue;
     if (!sections.has(f.section)) sections.set(f.section, []);
     sections.get(f.section).push(f);
   }
@@ -868,11 +870,11 @@ function form(type, conf, editing, running) {
   for (const sec of order) {
     const fs = sections.get(sec);
     const grid = el('div', { class: 'form' });
-    let open = OPEN.has(sec) || (editing && fs.some(f => conf && conf[confKey(f, type)] != null));
+    let open = OPEN.has(sec) || (editing && fs.some(f => conf && conf[f.key] != null));
     const head = el('div', { class: 'fsec', onclick: () => { open = !open; grid.hidden = !open; head.firstChild.textContent = (open ? '▾ ' : '▸ ') + sec; } }, el('span', { text: (open ? '▾ ' : '▸ ') + sec }));
     grid.hidden = !open;
     for (const f of fs) {
-      const key = confKey(f, type);
+      const key = f.key;
       let cur = conf && key ? conf[key] : undefined;
       if (f.flag === '--health-check' && typeof cur === 'number') cur = HEALTH[cur] || '';
       let input, get;
@@ -947,7 +949,7 @@ function create() {
   const preview = el('div', { class: 'cmd' });
   const out = el('pre', { class: 'out', hidden: true });
   const paint = () => { preview.textContent = 'socketley create ' + type + ' ' + (name.value.trim() || '<name>') + ' ' + f.words().join(' '); };
-  C.addEventListener('input', paint); C.addEventListener('change', paint);
+  for (const n of [name, f.box]) { n.addEventListener('input', paint); n.addEventListener('change', paint); }
   const make = async () => {
     const n = name.value.trim();
     if (!/^[A-Za-z0-9_.-]{1,128}$/.test(n) || n.startsWith('.')) { toast('A name is letters, digits, - _ and ., up to 128.', 'bad'); name.focus(); return; }

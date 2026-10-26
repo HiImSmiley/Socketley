@@ -93,6 +93,8 @@ std::string slurp(const std::string& path, size_t max = 4096)
             break;
     }
     ::close(fd);
+    if (out.size() > max)
+        out.resize(max);
     return out;
 }
 
@@ -387,6 +389,8 @@ void read_files_ring(walker& w, io_uring* ring, int dfd, const std::vector<dir_e
         if (rc < 0 && rc != -EINTR)
         {
             why = -rc;
+            // Entries the kernel never took will not complete, so they are not waited for.
+            inflight -= std::min(inflight, io_uring_sq_ready(ring));
             while (inflight)
             {
                 io_uring_cqe* c = nullptr;
@@ -917,6 +921,7 @@ bool object_store::finish_bucket(recovering& r, recovery_report& rep, std::strin
     bool changed = r.changed;
     if (r.other_layout)
     {
+        changed = true;
         LOG_INFO(("storage: the journal of bucket " + b.name + " was written for another shard count; "
                   "this shard's keys are rebuilt from the object files").c_str());
     }

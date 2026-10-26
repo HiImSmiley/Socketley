@@ -328,10 +328,10 @@ fi
 # fired; what is checked is the id they fired with — a handle out of the
 # reserved range, not a number that this runtime's own descriptor table could
 # also produce.
-if grep -q "sub_connect 1[6-9][0-9]\{6\}" "$WORK/daemon.log"; then ok; else
+if awk '{for(i=1;i<NF;i++) if($i=="sub_connect" && $(i+1)+0 >= 16777216) f=1} END{exit !f}' "$WORK/daemon.log"; then ok; else
     bad "on_connect fired with $(grep -o 'sub_connect [0-9]*' "$WORK/daemon.log" | tail -1 | cut -d' ' -f2), which is inside this runtime's own descriptor range"
 fi
-if grep -q "sub_disconnect 1[6-9][0-9]\{6\}" "$WORK/daemon.log"; then ok; else
+if awk '{for(i=1;i<NF;i++) if($i=="sub_disconnect" && $(i+1)+0 >= 16777216) f=1} END{exit !f}' "$WORK/daemon.log"; then ok; else
     bad "on_disconnect fired with $(grep -o 'sub_disconnect [0-9]*' "$WORK/daemon.log" | tail -1 | cut -d' ' -f2), which is inside this runtime's own descriptor range"
 fi
 

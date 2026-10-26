@@ -54,7 +54,6 @@ class mqtt_instance;
 class mail_instance;
 
 enum server_mode : uint8_t;
-enum server_send_to : uint8_t;
 enum client_mode : uint8_t;
 enum cache_mode : uint8_t;
 

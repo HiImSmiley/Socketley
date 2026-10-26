@@ -130,7 +130,9 @@ esac
 STRANDED=$(python3 -c "import json;print(json.dumps(['*2\r\n\$3\r\nGET\r\nNOTBULK\r\n', ['PING'], ['PING']]))")
 OUT3=$(resp "$STRANDED" hold)
 case "$OUT3" in
-    *"protocol error"*CLOSED*|*CLOSED*) ok "a protocol error is answered and the connection closes" ;;
+    *CLOSED*"-ERR"*) ok "a protocol error is answered and the connection closes" ;;
+    *CLOSED*) bad "a protocol error is answered before the connection closes" \
+                   "the connection closed with no error reply: $OUT3" ;;
     *TIMEOUT*) bad "a protocol error closes the connection" \
                    "the connection stayed open: $OUT3;" \
                    "Redis closes here because the stream is no longer framed, and a client" \

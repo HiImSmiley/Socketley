@@ -7,7 +7,6 @@
 
 #include <openssl/evp.h>
 #include <cstdio>
-#include <cstring>
 
 namespace socketley {
 
@@ -494,9 +493,24 @@ void cache_script_engine::ensure_state()
         "local g = _G\n"
         "local rawset, pairs, ipairs, setmetatable, getmetatable, type =\n"
         "      rawset, pairs, ipairs, setmetatable, getmetatable, type\n"
+        "local ros = {}\n"
         "local function ro(t)\n"
-        "  return setmetatable({}, { __index = t, __metatable = false,\n"
+        "  local p = setmetatable({}, { __index = t, __metatable = false,\n"
         "    __newindex = function() error('Attempt to modify a readonly table', 2) end })\n"
+        "  ros[p] = true\n"
+        "  return p\n"
+        "end\n"
+        "local tbl = g.table\n"
+        "if type(tbl) == 'table' then\n"
+        "  for _, n in ipairs({ 'insert', 'remove', 'sort' }) do\n"
+        "    local f = tbl[n]\n"
+        "    if type(f) == 'function' then\n"
+        "      tbl[n] = function(t, ...)\n"
+        "        if ros[t] then error('Attempt to modify a readonly table', 2) end\n"
+        "        return f(t, ...)\n"
+        "      end\n"
+        "    end\n"
+        "  end\n"
         "end\n"
         "getmetatable('').__metatable = false\n"
         "local backing = {}\n"
@@ -532,24 +546,30 @@ bool cache_script_engine::eval(std::string_view body,
     // Refilled, not rebuilt.  The tables and their two global bindings are made
     // once; a call only writes the elements it needs and clears whatever the
     // previous script left past its own end.
-    // The tail is measured on the table and not remembered from last time: a
-    // script may write KEYS[5] itself, and trusting our own count would leave
-    // that entry visible to the next script.
+    // Every other entry is walked out of the table, since a script may write KEYS[5] itself and no length finds it.
     // Written raw, so a metatable one script set on KEYS runs nothing for the next.
     lua_State* L = m_lua.lua_state();
     const auto refill = [L](const sol::table& t, std::span<const std::string_view> v)
     {
         t.push();
-        const size_t prev = lua_objlen(L, -1);
         for (size_t i = 0; i < v.size(); ++i)
         {
             lua_pushlstring(L, v[i].data(), v[i].size());
             lua_rawseti(L, -2, static_cast<int>(i + 1));
         }
-        for (size_t i = v.size(); i < prev; ++i)
+        lua_pushnil(L);
+        while (lua_next(L, -2) != 0)
         {
+            lua_pop(L, 1);
+            if (lua_type(L, -1) == LUA_TNUMBER)
+            {
+                const lua_Number d = lua_tonumber(L, -1);
+                if (d >= 1 && d <= static_cast<lua_Number>(v.size()) && d == static_cast<lua_Number>(static_cast<int64_t>(d)))
+                    continue;
+            }
+            lua_pushvalue(L, -1);
             lua_pushnil(L);
-            lua_rawseti(L, -2, static_cast<int>(i + 1));
+            lua_rawset(L, -4);
         }
         lua_pop(L, 1);
     };

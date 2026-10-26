@@ -444,9 +444,9 @@ for F in $FAULTS; do
              "${S_N:-0} requests in ${PHASE_CAP}s, wanted >= $MIN_LATE"
     fi
 
-    R=$(ctl up be2); RESTORE_T=$(echo "$R" | awk '{print $2}')
+    R=$(ctl up be2); RESTORE_T=$(echo "$R" | awk '$1 == "ok" {print $2}')
     if [ -z "${RESTORE_T:-}" ]; then
-        bad "$F: restore timestamp readable" "the backend did not report when it came back"
+        bad "$F: restore timestamp readable" "the backend's control answered '${R%% *}' rather than ok"
         : >"$STOPF"; wait $LPID 2>/dev/null; LPID=""; continue
     fi
 

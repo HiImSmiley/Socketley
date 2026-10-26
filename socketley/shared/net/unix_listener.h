@@ -310,6 +310,13 @@ inline bind_result bind_listener(const std::string& path,
                     r.error = tag + " is a file that is no socket -- refusing to remove it to put one there";
                     return r;
                 }
+                // Only a socket nothing listens on is a leftover; one that refused this user (EACCES) may be live.
+                if (err != ECONNREFUSED)
+                {
+                    r.error = tag + " could not be probed (" + std::strerror(err) +
+                              ") -- refusing to remove a socket that may be in use";
+                    return r;
+                }
                 if (unlink(path.c_str()) < 0) {}
             }
         }

@@ -395,7 +395,7 @@ TEST_CASE("aws-chunked example from the S3 API reference, with its three publish
         CHECK(s.decoded_bytes() == 66560);
     }
 
-    // Each of the three signatures, when wrong, is the one that fails, and the bytes before it were still handed out.
+    // Each of the three signatures, when wrong, is the one that fails, and its own bytes were already handed out, since a chunk is verified only at its end.
     struct wrong { sv a, b, c; int at; };
     std::string bad = "0000000000000000000000000000000000000000000000000000000000000000";
     const wrong ws[] = {{bad, s2, s3_, 1}, {s1, bad, s3_, 2}, {s1, s2, bad, 3}};
@@ -1254,7 +1254,8 @@ TEST_CASE("the date the request uses, x-amz-date or Date, must be present, well 
         r.headers.erase(std::remove_if(r.headers.begin(), r.headers.end(), [](auto& h) { return h.first == "x-amz-date"; }), r.headers.end());
         // Date alone is the timestamp, and x-amz-date was signed, so its absence is a mismatch of the list, not a missing date.
         s3::verify_result res = r.run();
-        CHECK(res.status != s3::sigv4_status::ok);
+        CHECK(res.status == s3::sigv4_status::signature_mismatch);
+        CHECK(std::string(res.code) == "SignatureDoesNotMatch");
     }
     {
         req r(*c);
@@ -1436,8 +1437,9 @@ TEST_CASE("paths: encoded once, never normalised, and either the encoded or the 
     }
     // The tidy path is the one the docs example signed even though it arrived with a raw '$'.
     {
-        const kase* c = find_case("docs/put-object");
-        CHECK(c->path.find('$') != sv::npos);
+        req r(*find_case("docs/put-object"));
+        CHECK(r.path.find('$') != std::string::npos);
+        CHECK(r.run().status == s3::sigv4_status::ok);
     }
 }
 
@@ -1495,6 +1497,15 @@ TEST_CASE("headers: names in any case, values trimmed and folded, repeats joined
             if (h.first == "My-Header1")
                 seen++;
         CHECK(seen == 3);
+        CHECK(r.run().status == s3::sigv4_status::ok);
+        std::string* first = r.find("My-Header1");
+        const std::string kept = *first;
+        *first = "";
+        CHECK(r.run().status == s3::sigv4_status::signature_mismatch);
+        *first = kept + ",value1";
+        CHECK(r.run().status == s3::sigv4_status::signature_mismatch);
+        *first = kept;
+        CHECK(r.run().status == s3::sigv4_status::ok);
     }
 }
 
@@ -1535,6 +1546,15 @@ TEST_CASE("a secret longer than a hash block still signs")
     req r(*c);
     r.secret = std::string(100, 'k');
     CHECK(r.run().status == s3::sigv4_status::signature_mismatch);
+
+    // The same request signed with that 100-byte secret by an independent HMAC-SHA256 implementation verifies.
+    req long_key(*find_case("suite/get-header-key-duplicate"));
+    long_key.secret = std::string(100, 'k');
+    *long_key.find("Authorization") = " AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, "
+                                      "SignedHeaders=host;my-header1;x-amz-date, Signature=bfedead84de8f41eb610212855e47b9adaca13119f98352dd389e3422b2ea40f";
+    CHECK(long_key.run().status == s3::sigv4_status::ok);
+    long_key.secret = std::string(99, 'k');
+    CHECK(long_key.run().status == s3::sigv4_status::signature_mismatch);
 }
 
 TEST_CASE("a signing key kept for reuse is never served to another secret, day, region or service")

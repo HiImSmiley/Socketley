@@ -7,7 +7,6 @@
 #include <string_view>
 #include <unordered_map>
 #include <memory>
-#include <queue>
 #include <vector>
 #include <chrono>
 #include <netinet/in.h>
@@ -79,7 +78,6 @@ struct alignas(64) server_connection
     // for the same reason: past this the entry is large enough that another
     // one costs nothing worth saving.
     static constexpr size_t WRITE_COALESCE_LIMIT = 64 * 1024;
-    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
     static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
     // === HOT fields (CQE dispatch path) — first 2 cache lines ===
@@ -320,6 +318,7 @@ struct alignas(64) server_connection
         free(file_buf);
         if (file_fd >= 0)        close(file_fd);
         if (splice_file_fd >= 0) close(splice_file_fd);
+        if (stream_fd >= 0)      close(stream_fd);
         // The session, for a struct that never reached pool_release(), safe
         // here because no submission ever named it.
         tls_context::free_ssl(ssl);
@@ -403,7 +402,6 @@ struct alignas(64) server_connection
         chunked_response = false;
         chunk_dec = http_chunked_decoder{};
         http_head_saved.clear();
-        http_req_saved.headers.clear();
         http_req_saved = http_request{};
 
         // With the rest of the per-response state: a struct that carried a
@@ -540,7 +538,6 @@ struct upstream_connection
     // for the same reason: past this the entry is large enough that another
     // one costs nothing worth saving.
     static constexpr size_t WRITE_COALESCE_LIMIT = 64 * 1024;
-    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
     static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
     int conn_id;                  // 1-based Lua-facing ID (stable across reconnects)
@@ -767,7 +764,6 @@ public:
     // Master mode
     void set_master_pw(std::string_view pw);
     std::string_view get_master_pw() const;
-    int get_master_fd() const;
 
     // HTTP static file serving
     void set_http_dir(std::string_view path);
@@ -1405,7 +1401,6 @@ private:
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
     bool m_recv_bundle{false};
-    bool m_direct_accept{false};
 
     // UDP mode
     static constexpr size_t MAX_UDP_PEERS = 10000;

@@ -103,7 +103,9 @@ shows "master_pw reaches the runtime"      lp_api '"master_pw": "hunter2"'
 shows "send_to reaches the runtime"        lp_api '"send_to": "master"'
 shows "http_cache reaches the runtime"     lp_api '"http_cache": true'
 shows "cache reaches the runtime"          lp_api '"cache_name": "lp_store"'
-shows "bash=pt reaches all three bits"     lp_api '"bash_timestamp": true'
+shows "bash=pt reaches the output bit"     lp_api '"bash_output": true'
+shows "bash=pt reaches the prefix bit"     lp_api '"bash_prefix": true'
+shows "bash=pt reaches the timestamp bit"  lp_api '"bash_timestamp": true'
 
 # ─── The cache family ───────────────────────────────────────────────────────
 cat > "$WORK/cache.lua" <<EOF

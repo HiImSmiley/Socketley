@@ -37,6 +37,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <filesystem>
+#include <system_error>
 
 #include "fuzz_common.h"
 
@@ -192,8 +195,9 @@ void check_literals(std::string_view s)
         const std::string num(s.substr(at + 1, close - at - 1));
         if (num.empty() || num.find_first_not_of("0123456789") != std::string::npos)
             continue;
-        const size_t n = std::strtoull(num.c_str(), nullptr, 10);
-        FUZZ_CHECK(close + 3 + n <= s.size(), "a literal longer than what follows it");
+        size_t n = 0;
+        const auto parsed = std::from_chars(num.data(), num.data() + num.size(), n);
+        FUZZ_CHECK(parsed.ec == std::errc{} && n <= s.size() - (close + 3), "a literal longer than what follows it");
         at = close + 2 + n;
     }
 }
@@ -513,9 +517,20 @@ struct sieve_hooks : managesieve_session::hooks
     }
 };
 
+struct sieve_dir_guard
+{
+    std::string path;
+    ~sieve_dir_guard()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+};
+
 void managesieve_case(std::string_view in)
 {
-    static sieve_store store("/tmp/fuzz-mail-sieve-" + std::to_string(::getpid()));
+    static const sieve_dir_guard guard{"/tmp/fuzz-mail-sieve-" + std::to_string(::getpid())};
+    static sieve_store store(guard.path);
     sieve_hooks h;
     managesieve_config cfg;
     cfg.hostname = "mx.example.com";
@@ -602,8 +617,16 @@ void order_case(std::string_view in)
         if (io::parse_keys({k, "subject"}, one))
             keys.insert(keys.end(), one.begin(), one.end());
     }
+    std::vector<uint32_t> before;
+    for (const auto& e : v)
+        before.push_back(e.number);
+    std::sort(before.begin(), before.end());
     io::sort(v, keys);
-    FUZZ_CHECK(v.size() <= 64, "sort lost or made messages");
+    std::vector<uint32_t> after;
+    for (const auto& e : v)
+        after.push_back(e.number);
+    std::sort(after.begin(), after.end());
+    FUZZ_CHECK(before == after, "sort lost or made messages");
 }
 
 struct pop3_hooks : pop3_session::hooks
@@ -655,7 +678,24 @@ void pop3_case(std::string_view in)
         in = cut == std::string_view::npos ? std::string_view{} : in.substr(cut + 1);
     }
     // Nothing is deleted but at a QUIT, and only what the maildrop had, each once.
-    FUZZ_CHECK(h.removed.empty() || upper_in.find("QUIT") != std::string::npos, "a message removed before QUIT");
+    // The stream the session saw has the chunk separators out of it, and a QUIT is a line whose verb it is.
+    bool quit_line = false;
+    {
+        std::string stream;
+        for (char c : upper_in)
+            if (c != '\xff')
+                stream += c;
+        for (size_t at = 0; at < stream.size() && !quit_line;)
+        {
+            const size_t nl = stream.find('\n', at);
+            std::string_view line = std::string_view(stream).substr(at, nl == std::string::npos ? nl : nl - at);
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+            quit_line = line.substr(0, line.find(' ')) == "QUIT";
+            at = nl == std::string::npos ? stream.size() : nl + 1;
+        }
+    }
+    FUZZ_CHECK(h.removed.empty() || quit_line, "a message removed before QUIT");
     std::vector<uint32_t> r = h.removed;
     std::sort(r.begin(), r.end());
     FUZZ_CHECK(std::adjacent_find(r.begin(), r.end()) == r.end(), "a message removed twice");

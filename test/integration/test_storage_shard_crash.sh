@@ -130,9 +130,14 @@ total=$(curl -s --unix-socket "$(node 1)" "http://x/crash?list-type=2" | grep -o
 expect "the listing has the earlier objects and the one" "$total" 9
 sh=$("$BIN" stats stg 2>&1 | awk -F: '/^shard_peer_failures:/ {s+=$2} END {print s+0}')
 [ "$sh" -ge 1 ] && ok "the shard that sent the commit counted the failure" || bad "no failure counted" "$sh"
+akey=""
+for i in $(seq 1 50); do
+    if [ "$(python3 "$LIB" owner crash "after/k$i" $N)" = 2 ]; then akey="after/k$i"; break; fi
+done
+[ -n "$akey" ] && ok "a key owned by shard 2 for the put after: $akey" || bad "no key" "owner"
 expect "shard 2 takes a put through another shard again" \
-    "$(code --unix-socket "$(node 0)" -X PUT --data-binary after "http://x/crash/after")" 200
-expect "and serves it" "$(curl -s --unix-socket "$(node 2)" http://x/crash/after)" after
+    "$(code --unix-socket "$(node 0)" -X PUT --data-binary after "http://x/crash/$akey")" 200
+expect "and serves it" "$(curl -s --unix-socket "$(node 2)" "http://x/crash/$akey")" after
 
 echo "== a shard is killed with an upload half received, and a sibling has one too =="
 rm -f "$D/ready1" "$D/ready3" "$D/release"

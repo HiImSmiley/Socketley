@@ -283,7 +283,6 @@ private:
 
     void lane_enter(std::string_view bucket, std::string_view id, uint32_t number, std::function<void()> run);
     void lane_leave(std::string_view bucket, std::string_view id, uint32_t number);
-    void part_finished(std::string_view bucket, std::string_view id);
 
     void remove_upload(std::string bucket, std::string id, std::function<void()> cb);
     void remove_files(std::string bucket, std::string id, std::vector<uint32_t> parts, std::function<void()> cb);

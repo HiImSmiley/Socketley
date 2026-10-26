@@ -247,10 +247,11 @@ fi
 # not arrange, so the reachability assertion below is expected to be vacuous.
 if [ "$G" -eq 0 ]; then
     echo "  NOTE: publish() gave up on nobody, so the reachability assertion below"
-    echo "        did not exercise the mechanism.  See the header: the mark this"
+    echo "        was not counted, as it would pass for nothing.  See the header: the mark this"
     echo "        file was built to provoke no longer exists in this build."
 fi
 
+if [ "$G" -ne 0 ]; then
 TOTAL=$((TOTAL+1))
 if [ "$U" -eq 0 ]; then
     PASS=$((PASS+1))
@@ -261,6 +262,7 @@ else
     echo "         them.  Their armed read is the only way back to them and"
     echo "         something has taken it away.  See the header: this is what"
     echo "         routing publish()'s subscribers through classify() does."
+fi
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

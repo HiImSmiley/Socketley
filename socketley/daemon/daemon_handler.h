@@ -87,7 +87,6 @@ public:
     void on_cqe(struct io_uring_cqe* cqe) override;
 
     void set_state_persistence(state_persistence* sp);
-    void set_cluster_discovery(cluster_discovery* cd);
     // Both, because a configured port and a bound one are different answers
     // and `dashboard` was giving the first when it meant the second.
     void set_metrics_port(uint16_t port, bool bound);

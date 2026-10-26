@@ -4,7 +4,6 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
-#include <ctime>
 #include <filesystem>
 
 #include <fcntl.h>
@@ -290,12 +289,18 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             s.fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
             struct stat st{};
             std::string h;
-            if (s.fd < 0 || ::fstat(s.fd, &st) != 0 || static_cast<uint64_t>(st.st_size) != seg_size ||
-                !read_at(s.fd, h, seg_head, 0) || !seg_gen_of(h, s.gen))
+            if (s.fd < 0)
+                continue;
+            if (::fstat(s.fd, &st) != 0)
+            {
+                ::close(s.fd);
+                continue;
+            }
+            if (static_cast<uint64_t>(st.st_size) != seg_size || !read_at(s.fd, h, seg_head, 0) ||
+                !seg_gen_of(h, s.gen))
             {
                 // A segment whose making a crash cut holds no record yet.
-                if (s.fd >= 0)
-                    ::close(s.fd);
+                ::close(s.fd);
                 std::filesystem::remove(path, ec);
                 continue;
             }
@@ -509,6 +514,7 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             m_free.push_back(std::move(s));
         else
         {
+            forget_gone(s.gen);
             ::close(s.fd);
             std::filesystem::remove(s.path, ec);
         }
@@ -582,6 +588,12 @@ void spool::close()
         m_loop.close_fd(m_dir_fd);
         m_dir_fd = -1;
     }
+    for (auto& [id, x] : m_writers)
+        if (x->fd >= 0)
+        {
+            m_loop.close_fd(x->fd);
+            x->fd = -1;
+        }
     for (auto& [id, r] : m_readers)
         if (r.fd >= 0)
             m_loop.close_fd(r.fd);
@@ -783,10 +795,28 @@ void spool::pump(uint64_t w)
                 }
                 // The file's name is the directory's, which is synced too before the sender is told it is taken.
                 if (m_dir_fd < 0 || !m_io.sync(m_dir_fd, false, [this, w, alive = m_alive](int64_t r) {
-                        if (*alive)
-                            end(w, r >= 0);
+                        if (!*alive)
+                            return;
+                        if (r >= 0)
+                        {
+                            end(w, true);
+                            return;
+                        }
+                        const auto j = m_writers.find(w);
+                        if (j == m_writers.end())
+                            return;
+                        j->second->failed = true;
+                        pump(w);
                     }))
-                    end(w, m_dir_fd < 0 || ::fsync(m_dir_fd) == 0);
+                {
+                    if (m_dir_fd < 0 || ::fsync(m_dir_fd) == 0)
+                        end(w, true);
+                    else
+                    {
+                        i->second->failed = true;
+                        pump(w);
+                    }
+                }
             }))
         {
             x.writing = false;
@@ -827,7 +857,6 @@ void spool::end(uint64_t w, bool ok)
             s.live_bytes += e.rec_len;
         }
         m_bytes += e.body_len;
-        ++m_written;
         m_entries[e.id] = x->e;
     }
     else
@@ -1028,7 +1057,8 @@ void spool::prepare()
                       LOG_WARN(("mail: the spool segment " + job->path + " cannot be written").c_str());
                       if (job->fd >= 0)
                           m_loop.close_fd(job->fd);
-                      if (!m_io.unlinkat(AT_FDCWD, job->path, 0, [](int64_t) {})) {}
+                      if (!m_io.unlinkat(AT_FDCWD, job->path, 0, [](int64_t) {}))
+                          ::unlink(job->path.c_str());
                       // With no segment to write to, what waits is refused rather than left without an answer.
                       if (m_segs.find(m_cur) != m_segs.end())
                           return;
@@ -1182,6 +1212,8 @@ void spool::compact_log()
     // What memory holds is the log's truth: it is written whole on a thread, and moved into the old one's place.
     m_log_compacting = true;
     auto text = std::make_shared<std::string>(log_text());
+    // What the buffer holds is already in that snapshot.
+    const size_t in_snapshot = m_log_buf.size();
     auto fd = std::make_shared<int>(-1);
     m_pool.submit(0,
                   [text, fd, dir = m_dir] {
@@ -1208,7 +1240,7 @@ void spool::compact_log()
                       }
                       *fd = a;
                   },
-                  [this, text, fd, alive = m_alive] {
+                  [this, text, fd, in_snapshot, alive = m_alive] {
                       if (!*alive)
                       {
                           if (*fd >= 0)
@@ -1221,6 +1253,7 @@ void spool::compact_log()
                           if (m_log_fd >= 0)
                               m_loop.close_fd(m_log_fd);
                           m_log_fd = *fd;
+                          m_log_buf.erase(0, std::min(in_snapshot, m_log_buf.size()));
                           m_log_base = text->size();
                           m_log_grown = m_log_buf.size();
                       }

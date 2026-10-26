@@ -107,7 +107,7 @@ body() {
 # code NAME PORT PATH -> the HTTP status, or 000.
 code() {
     curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
-         "http://127.0.0.1:$2/$1$3" 2>/dev/null || printf '000'
+         "http://127.0.0.1:$2/$1$3" 2>/dev/null || true
 }
 # `ls` and not `ps`, because ps lists only what is running and would make a
 # failed runtime indistinguishable from one that never existed.

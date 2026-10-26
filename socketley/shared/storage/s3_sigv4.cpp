@@ -806,7 +806,10 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
         creq.clear();
         append(creq, {req.method, "\n", paths[attempt], "\n", query, "\n"});
         if (!append_canonical_headers(creq, req.headers, sh))
+        {
+            OPENSSL_cleanse(key, sizeof(key));
             return fail(sigv4_status::signature_mismatch, 403, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. A signed header is missing from the request.", a.form);
+        }
         append(creq, {"\n", sh, "\n", payload_text});
 
         uint8_t creq_hash[32];

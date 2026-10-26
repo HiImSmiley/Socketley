@@ -81,7 +81,6 @@ public:
     bool notifying() const { return !m_notify.empty() || m_notify_selected; }
     // What came and is not taken yet, the command being gathered included.
     size_t buffered() const { return m_in.size() + m_cmd.size(); }
-    const std::string& user() const { return m_user; }
 
     static constexpr size_t max_line = 65536;
     // A FETCH waits for its client past this much unwritten, so a mailbox is not read into memory faster than it goes.
@@ -190,8 +189,14 @@ private:
     std::vector<notify_filter> m_notify;
     // The selected folder is told of between commands, not only in IDLE.
     bool m_notify_selected{false};
-    // What each watched folder was when last looked at: its version, whether it was subscribed.
-    std::unordered_map<std::string, std::pair<uint64_t, bool>> m_notify_seen;
+    // What each watched folder was when last looked at: its version, whether it was subscribed, the events asked of it.
+    struct notify_seen
+    {
+        uint64_t version{0};
+        bool subscribed{false};
+        uint8_t events{0};
+    };
+    std::unordered_map<std::string, notify_seen> m_notify_seen;
     uint64_t m_told_modseq{0};
     // Input: what is not yet a whole command, the command being gathered with its literals, and how much of a literal
     // is still to come.

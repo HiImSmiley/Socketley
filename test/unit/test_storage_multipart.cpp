@@ -1109,13 +1109,17 @@ TEST_CASE("a part list too long for the header follows the body, so any list S3 
         const std::string key = sealed ? "s" : "p";
         object_meta meta;
         sse_seal_spec seal;
+        sse_key kek{};
+        std::string wrapped;
         if (sealed)
         {
             sse_record rec;
             rec.mode     = sse_mode::s3;
             rec.per_part = true;
             seal.key     = sse_random_key();
-            REQUIRE(sse_wrap(sse_random_key(), seal.key, rec.wrapped));
+            kek          = sse_random_key();
+            REQUIRE(sse_wrap(kek, seal.key, rec.wrapped));
+            wrapped = rec.wrapped;
             meta.extra.emplace_back(std::string(sse_extra), encode_sse(rec));
         }
         const std::string id = r->create("bkt", key, checksum_algo::none, meta);
@@ -1166,8 +1170,10 @@ TEST_CASE("a part list too long for the header follows the body, so any list S3 
 
         if (sealed)
         {
+            sse_key opened{};
+            REQUIRE(sse_unwrap(kek, wrapped, opened));
             std::string back;
-            REQUIRE(sse_open_body(h.meta, seal.key, std::string_view(file).substr(h.header_len), back));
+            REQUIRE(sse_open_body(h.meta, opened, std::string_view(file).substr(h.header_len), back));
             CHECK(back == whole);
         }
         else
@@ -1189,7 +1195,22 @@ TEST_CASE("a part list too long for the header follows the body, so any list S3 
         const object_meta* m = again.store->find("bkt", key);
         REQUIRE(m != nullptr);
         part_trailer t;
-        CHECK(part_trailer_of(*m, t));
+        REQUIRE(part_trailer_of(*m, t));
+        const bool was_sealed = std::string_view(key) == "s";
+        const uint64_t body_len = was_sealed ? sse_stored_len(a.size(), sse_format) + sse_stored_len(b.size(), sse_format) +
+                                                   sse_stored_len(c.size(), sse_format)
+                                             : whole.size();
+        CHECK(t.at == body_len);
+        CHECK(t.len == 20 + 3 * 12);
+        CHECK(stored_size(*m) == body_len + t.len);
+        const std::string file = slurp_file(d.path + "/bkt/data/" + object_rel_path(key));
+        const decoded_header h = decode_object_header(file);
+        REQUIRE(h.status == header_status::ok);
+        CHECK(file.size() == h.header_len + stored_size(*m));
+        part_list l;
+        REQUIRE(decode_part_trailer(std::string_view(file).substr(h.header_len + t.at), *m, t, l));
+        CHECK(l.numbers == std::vector<uint32_t>{2, 5, 9});
+        CHECK(l.sizes == std::vector<uint64_t>{a.size(), b.size(), c.size()});
     }
 }
 

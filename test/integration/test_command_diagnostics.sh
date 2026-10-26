@@ -87,6 +87,8 @@ else fail "an ordinary create still works" "exit $RC"; fi
 "$BIN" create server cd_r1     -p $((P + 6)) -s >/dev/null 2>&1 || true
 
 BEFORE=$(state_of cd_victim)
+if [ -n "$BEFORE" ]; then pass
+else fail "the runtime the flag value names exists before the restart" "cd_victim is not listed"; fi
 RC=0
 OUT=$("$BIN" restart cd_r1 --some-flag cd_victim 2>&1) || RC=$?
 

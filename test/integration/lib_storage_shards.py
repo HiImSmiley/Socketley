@@ -406,8 +406,8 @@ def mode_copy(nodes):
 
 def mode_equiv(args):
     # -- NODES4... -- NODES1...
-    i = args.index("--", 1)
-    many, one = args[1:i], args[i + 1:]
+    i = args.index("--", 2)
+    many, one = args[2:i], args[i + 1:]
     bucket = "pop"
     queries = [
         ("", "", 1000, ""), ("", "", 7, ""), ("", "/", 1000, ""), ("", "/", 2, ""), ("", "/", 1, ""),

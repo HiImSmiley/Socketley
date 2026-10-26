@@ -188,6 +188,12 @@ inline bool parse_notify_config(std::string_view xml, notify_config& out, s3_err
     xml_node root;
     if (xml.size() > notification_max_bytes || !xml_reader(xml).document(root) || root.name != "NotificationConfiguration")
         return false;
+    // The Ids the document names, which an Id made for a configuration without one must not take.
+    std::vector<std::string> named;
+    for (const xml_node& c : root.kids)
+        for (const xml_node& k : c.kids)
+            if (k.name == "Id" && k.kids.empty())
+                named.push_back(k.text);
     for (const xml_node& c : root.kids)
     {
         if (c.name == "EventBridgeConfiguration")
@@ -240,7 +246,19 @@ inline bool parse_notify_config(std::string_view xml, notify_config& out, s3_err
             return detail::notify_refuse(err, "Unable to validate the following destination configurations");
         r.target = r.arn.substr(webhook_arn_prefix.size());
         if (r.id.empty())
-            r.id = "notification-" + std::to_string(out.rules.size() + 1);
+        {
+            const auto taken = [&](const std::string& id) {
+                for (const std::string& n : named)
+                    if (n == id)
+                        return true;
+                for (const notify_rule& o : out.rules)
+                    if (o.id == id)
+                        return true;
+                return false;
+            };
+            for (size_t at = out.rules.size() + 1; r.id.empty() || taken(r.id); ++at)
+                r.id = "notification-" + std::to_string(at);
+        }
         for (const notify_rule& o : out.rules)
         {
             if (o.id == r.id)

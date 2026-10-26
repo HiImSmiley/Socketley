@@ -385,7 +385,7 @@ public:
     ws_client(ws_client&& o) noexcept
         : m_fd(o.m_fd), m_host(std::move(o.m_host)), m_port(o.m_port),
           m_mode(o.m_mode), m_path(std::move(o.m_path)),
-          m_buf(std::move(o.m_buf))
+          m_buf(std::move(o.m_buf)), m_frag(std::move(o.m_frag))
     {
         o.m_fd = detail::platform::invalid_socket;
     }
@@ -401,6 +401,7 @@ public:
             m_mode = o.m_mode;
             m_path = std::move(o.m_path);
             m_buf = std::move(o.m_buf);
+            m_frag = std::move(o.m_frag);
             o.m_fd = detail::platform::invalid_socket;
         }
         return *this;
@@ -424,12 +425,15 @@ public:
 
         if (mode == ws_mode::websocket)
         {
+            // A peer that accepts and never answers must not hold connect() forever.
+            set_recv_timeout(10000);
             if (!do_handshake())
             {
                 detail::platform::close_socket(m_fd);
                 m_fd = detail::platform::invalid_socket;
                 return false;
             }
+            set_recv_timeout(0);
         }
 
         return true;
@@ -449,6 +453,7 @@ public:
             m_fd = detail::platform::invalid_socket;
         }
         m_buf.clear();
+        m_frag.clear();
     }
 
     bool reconnect()
@@ -528,6 +533,7 @@ private:
     ws_mode m_mode{ws_mode::websocket};
     std::string m_path;
     std::string m_buf;
+    std::string m_frag;
 
     // ── WebSocket handshake ─────────────────────────────────────
 
@@ -545,7 +551,7 @@ private:
 
         // Build HTTP upgrade request
         std::string req = "GET " + m_path + " HTTP/1.1\r\n"
-                          "Host: " + m_host + ":" + std::to_string(m_port) + "\r\n"
+                          "Host: " + (m_host.find(':') != std::string::npos && m_host.front() != '[' ? "[" + m_host + "]" : m_host) + ":" + std::to_string(m_port) + "\r\n"
                           "Upgrade: websocket\r\n"
                           "Connection: Upgrade\r\n"
                           "Sec-WebSocket-Key: " + client_key + "\r\n"
@@ -661,6 +667,8 @@ private:
     struct parsed_frame
     {
         uint8_t opcode;
+        bool fin;
+        bool invalid = false;
         std::string payload;
         size_t consumed;
     };
@@ -677,6 +685,7 @@ private:
         uint8_t b1 = static_cast<uint8_t>(data[1]);
 
         out.opcode = b0 & 0x0F;
+        out.fin = (b0 & 0x80) != 0;
         bool masked = (b1 & 0x80) != 0;
         uint64_t payload_len = b1 & 0x7F;
         size_t header_size = 2;
@@ -699,7 +708,10 @@ private:
         }
 
         if (payload_len > detail::WS_MAX_PAYLOAD)
-            return false;
+        {
+            out.invalid = true;
+            return true;
+        }
 
         size_t mask_size = masked ? 4 : 0;
         size_t total = header_size + mask_size + static_cast<size_t>(payload_len);
@@ -738,6 +750,15 @@ private:
         return true;
     }
 
+    ws_message fail_recv()
+    {
+        detail::platform::close_socket(m_fd);
+        m_fd = detail::platform::invalid_socket;
+        m_buf.clear();
+        m_frag.clear();
+        return {"", false, false, true};
+    }
+
     ws_message recv_websocket()
     {
         for (;;)
@@ -745,6 +766,8 @@ private:
             parsed_frame frame;
             if (parse_frame(frame))
             {
+                if (frame.invalid)
+                    return fail_recv();
                 m_buf.erase(0, frame.consumed);
 
                 if (frame.opcode == detail::WS_OP_PING)
@@ -773,7 +796,17 @@ private:
                     return {"", true, false, false};
                 }
 
-                // Text frame
+                // Data frames of one message are joined until the one with FIN.
+                if (!frame.fin || !m_frag.empty())
+                {
+                    if (m_frag.size() + frame.payload.size() > detail::WS_MAX_PAYLOAD)
+                        return fail_recv();
+                    m_frag += frame.payload;
+                    if (!frame.fin)
+                        continue;
+                    frame.payload = std::move(m_frag);
+                    m_frag.clear();
+                }
                 return {std::move(frame.payload), false, false, false};
             }
 
@@ -797,6 +830,8 @@ private:
                 return {std::move(line), false, false, false};
             }
 
+            if (m_buf.size() > detail::WS_MAX_PAYLOAD)
+                return fail_recv();
             if (!read_more())
                 return {"", false, false, true};
         }

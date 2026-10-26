@@ -2,9 +2,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <csignal>
 
 #include <fcntl.h>
@@ -1293,7 +1290,7 @@ void object_store::ensure_dirs(const std::string& bucket_name, const std::string
 
 st check_delete_condition(const delete_condition& c, const object_meta& current)
 {
-    if (!c.if_match.empty() && c.if_match != "*" && !etag_list_matches(c.if_match, current.etag()))
+    if (!c.if_match.empty() && !etag_list_matches(c.if_match, current.etag()))
         return st::precondition_failed;
     if (c.mtime_s >= 0 && current.mtime_ms / 1000 != c.mtime_s)
         return st::precondition_failed;
@@ -1439,7 +1436,7 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
         if (m_opts.nshards > 1 && m_opts.max_bytes)
         {
             const auto old = bp->objects.find(rq.key);
-            const uint64_t held = old == bp->objects.end() ? 0 : old->second.size;
+            const uint64_t held = old == bp->objects.end() || versioned(*bp, rq.key) ? 0 : old->second.size;
             if (m_totals.bytes - held + rq.meta.size > quota())
             {
                 commit_refuse(c, st::storage_full);
@@ -1628,7 +1625,7 @@ void object_store::commit_staged(const commit_ptr& c, bool restamp)
         if (!q)
         {
             m_loop->close_fd(leaf);
-            commit_done(c, st::io_error);
+            commit_refuse(c, st::io_error);
         }
     });
 }
@@ -2593,8 +2590,6 @@ void object_store::open_file(int dir_fd, std::string rel, std::string key, size_
                 }
             };
             (*step)(buf->size());
-            // The step keeps itself alive through the copy each read holds.
-            (void)step;
         });
     if (!q)
         cb({st::io_error, -1, {}, 0, {}});
@@ -2882,7 +2877,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
                                     return;
                                 if (rn <= 0)
                                 {
-                                    (*finish)({rn < 0 ? st::io_error : st::io_error, cs->meta});
+                                    (*finish)({st::io_error, cs->meta});
                                     return;
                                 }
                                 const bool qw = m_io->pwrite(cs->dst_fd, cs->buf.data(),
@@ -2895,6 +2890,11 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
                                         if (rw < 0)
                                         {
                                             (*finish)({errno_status(rw), cs->meta});
+                                            return;
+                                        }
+                                        if (rw != rn)
+                                        {
+                                            (*finish)({st::io_error, cs->meta});
                                             return;
                                         }
                                         if (cs->new_md5)
@@ -3166,8 +3166,6 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
             fail(st::io_error);
     };
     (*step)(0);
-    // The sequence outlives this frame through the completion each step queues.
-    (void)step;
 }
 
 void object_store::delete_bucket(std::string name, std::function<void(st)> cb)

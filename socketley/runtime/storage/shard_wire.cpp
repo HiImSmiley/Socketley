@@ -399,7 +399,8 @@ bool page_writer::fits(const std::string& name, size_t cost)
     if (m_cut)
         return false;
     m_total += cost;
-    if (m_total <= m_max)
+    // The first entry goes in whatever it costs, since a page that ends before it would be asked for again for ever.
+    if (m_total <= m_max || m_object_count + m_prefix_count == 0)
         return true;
     // The first entry that does not fit is where the page now ends.
     m_cut       = true;

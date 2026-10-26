@@ -53,21 +53,23 @@ i=0
 for bad in "127.0.0.1:abc" "127.0.0.1:" "127.0.0.1:99999" "127.0.0.1:0"; do
     i=$((i + 1))
     "$BIN" remove badpx >/dev/null 2>&1 || true
+    : > "$SOCKETLEY_DLOG"
     RC=0
     OUT=$("$BIN" create proxy badpx -p $((P + i)) --backend "$bad" -s 2>&1) || RC=$?
     if [ "$RC" -ne 0 ]; then pass
     else fail "--backend $bad is refused" \
               "create exited 0 for an address that cannot connect" \
               "said: ${OUT:-<nothing>}"; fi
+    # The reason has to be findable, and the log holds only this case's refusal.
+    for _ in $(seq 1 20); do
+        grep -q "the port is not a number" "$SOCKETLEY_DLOG" 2>/dev/null && break
+        sleep 0.1
+    done
+    if grep -q "the port is not a number" "$SOCKETLEY_DLOG" 2>/dev/null; then pass
+    else fail "the log names the port as the problem for --backend $bad" \
+              "no line in the daemon log says which part of the address is wrong" \
+              "the CLI's own message points at the log, so it has to be there."; fi
 done
-
-# The reason has to be findable.  The proxy runs out of process by default, so
-# the CLI gets the worker's generic refusal and the specific line goes to the
-# log — which is exactly where the operator is told to look.
-if grep -q "the port is not a number" "$SOCKETLEY_DLOG" 2>/dev/null; then pass
-else fail "the log names the port as the problem" \
-          "no line in the daemon log says which part of the address is wrong" \
-          "the CLI's own message points at the log, so it has to be there."; fi
 
 # ─── Control: an ordinary backend still works end to end ────────────────────
 #

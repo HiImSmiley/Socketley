@@ -95,9 +95,12 @@ def take(s, buf):
     while True:
         if len(buf) >= 2:
             ln = buf[1] & 0x7F; off = 2
-            if ln == 126 and len(buf) >= 4:
-                ln = struct.unpack("!H", buf[2:4])[0]; off = 4
-            if ln != 126 and len(buf) >= off + ln:
+            if ln == 126:
+                if len(buf) >= 4:
+                    ln = struct.unpack("!H", buf[2:4])[0]; off = 4
+                else:
+                    ln = None
+            if ln is not None and len(buf) >= off + ln:
                 return (buf[0] & 0x0F, buf[off:off+ln], buf[off+ln:])
         try:
             d = s.recv(65536)

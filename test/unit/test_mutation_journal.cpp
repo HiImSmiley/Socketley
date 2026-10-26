@@ -21,11 +21,20 @@ std::string temp_path()
     return "/tmp/skl-mutation-journal-" + std::to_string(::getpid()) + "-" + std::to_string(++n);
 }
 
+// Removes its file on every exit path, a failed REQUIRE included.
+struct tmp_file
+{
+    std::string path;
+    explicit tmp_file(std::string p) : path(std::move(p)) {}
+    ~tmp_file() { ::unlink(path.c_str()); }
+};
+
 }   // namespace
 
 TEST_CASE("a record longer than 64 MiB is replayed, and so is every record after it")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     const std::string big(70u << 20, 'v');
     {
         mutation_journal j;
@@ -44,12 +53,12 @@ TEST_CASE("a record longer than 64 MiB is replayed, and so is every record after
     CHECK(sizes[1] == big.size());
     CHECK(last == "set b 2");
     CHECK_FALSE(st.torn);
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("a record whose bytes do not match its checksum still ends the replay")
 {
-    const std::string p = temp_path();
+    const tmp_file tf(temp_path());
+    const std::string& p = tf.path;
     {
         mutation_journal j;
         REQUIRE(j.open_append(p, "owner"));
@@ -68,7 +77,6 @@ TEST_CASE("a record whose bytes do not match its checksum still ends the replay"
     REQUIRE(mutation_journal::replay(p, [&](std::string_view r) { got.emplace_back(r); }, st));
     REQUIRE(got.size() == 1);
     CHECK(got[0] == "set a 1");
-    ::unlink(p.c_str());
 }
 
 TEST_CASE("the record checksum is CRC-32 at every length and alignment")

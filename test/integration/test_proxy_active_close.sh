@@ -50,10 +50,11 @@ head -c 4194304 /dev/zero | tr '\0' L > "$WORK/www/large.txt"
 "$BIN" create server pcbe -p "$BP" --http "$WORK/www" --http-cache -s >/dev/null 2>&1 || true
 "$BIN" create proxy pc -p "$P" --backend "127.0.0.1:$BP" --protocol http -s >/dev/null 2>&1 || true
 for _ in $(seq 1 100); do
-    ss -ltn 2>/dev/null | grep -q ":$P " && ss -ltn 2>/dev/null | grep -q ":$BP " && break
+    SSO=$(ss -ltn 2>/dev/null); case "$SSO" in *":$P "*":$BP "*|*":$BP "*":$P "*) break ;; esac
     sleep 0.1
 done
-if ! ss -ltn 2>/dev/null | grep -q ":$P "; then
+SSO=$(ss -ltn 2>/dev/null)
+if [[ "$SSO" != *":$P "* ]]; then
     echo "  FATAL: the proxy never bound $P"; echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 

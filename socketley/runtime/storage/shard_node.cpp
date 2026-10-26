@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
-#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -394,11 +393,15 @@ void shard_node::run_drop_settled(std::string name, std::function<void(st)> cb)
     auto alive = m_alive;
 
     // Every shard that agreed is told the drop is off, and this one is reopened.
-    auto abort_all = [this, alive, name, ds]()
+    auto tell_prepared = [this, name, ds]()
     {
-        m_store.drop_abort(name);
         for (const uint32_t j : ds->prepared)
             m_transport.call(j, wire::encode_bucket(wire::op::drop_abort, name), [](bool, std::string_view) {});
+    };
+    auto abort_all = [this, name, tell_prepared]()
+    {
+        m_store.drop_abort(name);
+        tell_prepared();
     };
 
     each_peer([name](uint32_t) { return wire::encode_bucket(wire::op::drop_prepare, name); },
@@ -412,7 +415,7 @@ void shard_node::run_drop_settled(std::string name, std::function<void(st)> cb)
                   else if (ds->refusal == st::ok)
                       ds->refusal = ps;
               },
-              [this, alive, name, cb, ds, abort_all]()
+              [this, alive, name, cb, ds, abort_all, tell_prepared]()
               {
                   if (!*alive)
                       return;
@@ -422,16 +425,14 @@ void shard_node::run_drop_settled(std::string name, std::function<void(st)> cb)
                       cb(ds->refusal);
                       return;
                   }
-                  m_store.drop_rename(name, [this, alive, name, cb, ds, abort_all](st r)
+                  m_store.drop_rename(name, [this, alive, name, cb, tell_prepared](st r)
                   {
                       if (!*alive)
                           return;
                       if (r != st::ok)
                       {
                           // The store reopened this shard's own bucket.
-                          for (const uint32_t j : ds->prepared)
-                              m_transport.call(j, wire::encode_bucket(wire::op::drop_abort, name),
-                                               [](bool, std::string_view) {});
+                          tell_prepared();
                           cb(r);
                           return;
                       }
@@ -1379,17 +1380,20 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             return;
         case wire::op::drop_prepare:
         {
-            auto judge = [this, name, reply]()
+            auto alive = m_alive;
+            auto judge = [this, alive, name, reply]()
             {
-                m_store.after_settled(name, [this, name, reply]()
-                                      { reply(true, wire::encode_status(m_store.drop_check(name))); });
+                m_store.after_settled(name, [this, alive, name, reply]()
+                {
+                    if (*alive)
+                        reply(true, wire::encode_status(m_store.drop_check(name)));
+                });
             };
             if (!m_mpu)
             {
                 judge();
                 return;
             }
-            auto alive = m_alive;
             m_mpu->after_removals(name, [alive, judge]()
             {
                 if (*alive)

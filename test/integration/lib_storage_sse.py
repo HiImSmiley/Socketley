@@ -1660,6 +1660,9 @@ def main():
         mode_pool(int(sys.argv[2]), sys.argv[3])
     elif MODE == "policy":
         mode_policy(int(sys.argv[2]))
+    else:
+        print("unknown mode " + MODE)
+        sys.exit(2)
     print("  %d passed, %d failed" % (passed, failed))
     sys.exit(min(failed, 100))
 

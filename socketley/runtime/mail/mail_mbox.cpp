@@ -183,6 +183,30 @@ bool next(std::string_view text, size_t& at, bool whole, message& out)
     bool in_head = true, dropping = false, in_labels = false, labelled = false;
     std::string labels;
     const auto add = [&](uint8_t f) { out.flags = static_cast<uint8_t>(out.flags | f); };
+    // The flag headers' values are read once their folded lines are in.
+    int kind = 0;
+    std::string flagged;
+    const auto settle = [&] {
+        if (kind == 1)
+            add(flagged.find('R') != std::string::npos ? flag_seen : 0);
+        else if (kind == 2)
+            for (const char c : flagged)
+                add(c == 'A'   ? flag_answered
+                    : c == 'F' ? flag_flagged
+                    : c == 'T' ? flag_draft
+                    : c == 'D' ? flag_deleted
+                               : 0);
+        else if (kind == 3)
+            for (size_t k = 0; k < flagged.size();)
+            {
+                const size_t stop = flagged.find(' ', k);
+                std::string w = flagged.substr(k, stop == std::string::npos ? std::string::npos : stop - k);
+                if (!w.empty())
+                    out.keywords.push_back(std::move(w));
+                k = stop == std::string::npos ? flagged.size() : stop + 1;
+            }
+        kind = 0;
+    };
     for (size_t p = 0; p < body.size();)
     {
         const size_t nl = body.find('\n', p);
@@ -195,12 +219,17 @@ bool next(std::string_view text, size_t& at, bool whole, message& out)
         if (!line.empty() && line.front() == '>' && from_line(line))
             line.remove_prefix(1);
         if (in_head && line.empty())
+        {
+            settle();
             in_head = false;
+        }
         else if (in_head && (line.front() == ' ' || line.front() == '\t'))
         {
             // A folded line goes with the header before it, kept or taken out with it.
             if (in_labels)
                 labels += " " + trimmed(line);
+            if (kind)
+                flagged += " " + trimmed(line);
             if (dropping)
                 continue;
         }
@@ -209,26 +238,15 @@ bool next(std::string_view text, size_t& at, bool whole, message& out)
             const size_t colon = line.find(':');
             const std::string_view name = line.substr(0, colon);
             const std::string value = colon == std::string_view::npos ? std::string() : trimmed(line.substr(colon + 1));
+            settle();
             dropping = true;
             in_labels = false;
-            if (socketley::ascii::iequals(name, "Status"))
-                add(value.find('R') != std::string::npos ? flag_seen : 0);
-            else if (socketley::ascii::iequals(name, "X-Status"))
-                for (const char c : value)
-                    add(c == 'A'   ? flag_answered
-                        : c == 'F' ? flag_flagged
-                        : c == 'T' ? flag_draft
-                        : c == 'D' ? flag_deleted
-                                   : 0);
-            else if (socketley::ascii::iequals(name, "X-Keywords"))
-                for (size_t k = 0; k < value.size();)
-                {
-                    const size_t stop = value.find(' ', k);
-                    std::string w = value.substr(k, stop == std::string::npos ? std::string::npos : stop - k);
-                    if (!w.empty())
-                        out.keywords.push_back(std::move(w));
-                    k = stop == std::string::npos ? value.size() : stop + 1;
-                }
+            if (socketley::ascii::iequals(name, "Status") || socketley::ascii::iequals(name, "X-Status") ||
+                socketley::ascii::iequals(name, "X-Keywords"))
+            {
+                kind = socketley::ascii::iequals(name, "Status") ? 1 : socketley::ascii::iequals(name, "X-Status") ? 2 : 3;
+                flagged = value;
+            }
             else if (socketley::ascii::iequals(name, "X-Gmail-Labels"))
             {
                 labels = value;
@@ -242,6 +260,7 @@ bool next(std::string_view text, size_t& at, bool whole, message& out)
         out.bytes.append(line);
         out.bytes += "\r\n";
     }
+    settle();
     if (last && out.bytes.ends_with("\r\n\r\n"))
         out.bytes.resize(out.bytes.size() - 2);
     if (labelled)

@@ -97,8 +97,8 @@ M.login("alice", "alicepassword1")
 M.select("INBOX")
 typ, data = M.uid("SEARCH", None, "SUBJECT", "Offer")
 uids = data[0].split()
-M.uid("MOVE", b",".join(uids), "Junk")
-print(len(uids))
+typ, _ = M.uid("MOVE", b",".join(uids), "Junk")
+print(len(uids) if typ == "OK" else "MOVE " + typ)
 PY
 )
 [ "$moved" = 25 ] && ok "alice moves the 25 into Junk over IMAP" || bad "the MOVE" "$moved"

@@ -65,6 +65,8 @@ except Exception as e: print('ERROR:' + type(e).__name__)
 sys.stdout.write(out.decode('latin1').replace('\r\n', ' | '))
 PY
 resp() { python3 "$RESP_PY" "$P" "$1" 2>/dev/null; }
+wantx() { local l=$1 e=$2 c=$3 got; got=$(resp "$c")
+          [ "$got" = "$e" ] && ok "$l" || bad "$l" "wanted '$e'" "got: $got"; }
 want() { local l=$1 e=$2 c=$3 got; got=$(resp "$c")
          case "$got" in *"$e"*) ok "$l" ;; *) bad "$l" "wanted '$e'" "got: $got" ;; esac; }
 
@@ -101,7 +103,7 @@ done
 
 echo "--- 2. and nothing else changed ---"
 # The half that matters as much: a hit is still a hit and a miss is still nil.
-want "GET on its own string"   "v"    '[["GET","s"]]'
+wantx "GET on its own string"  '$1 | v | ' '[["GET","s"]]'
 want "STRLEN on its own"       ":1"   '[["STRLEN","s"]]'
 want "LLEN on its own list"    ":1"   '[["LLEN","l"]]'
 want "LRANGE on its own"       "e"    '[["LRANGE","l","0","-1"]]'
@@ -110,7 +112,7 @@ want "SMEMBERS on its own"     "m"    '[["SMEMBERS","t"]]'
 want "HLEN on its own hash"    ":1"   '[["HLEN","h"]]'
 want "HGET on its own"         "v"    '[["HGET","h","f"]]'
 want "ZCARD on its own zset"   ":1"   '[["ZCARD","z"]]'
-want "ZSCORE on its own"       "1"    '[["ZSCORE","z","m"]]'
+wantx "ZSCORE on its own"      '$1 | 1 | ' '[["ZSCORE","z","m"]]'
 want "GET on nothing is nil"   '$-1'  '[["GET","weder"]]'
 want "LLEN on nothing is 0"    ":0"   '[["LLEN","weder"]]'
 want "HLEN on nothing is 0"    ":0"   '[["HLEN","weder"]]'

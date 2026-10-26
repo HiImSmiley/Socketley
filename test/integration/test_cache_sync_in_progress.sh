@@ -151,7 +151,7 @@ else fail "the real pair is created" "a create exited $create_rc"; fi
 
 GOT=""
 for _ in $(seq 1 10); do
-    GOT=$(send_to $((P + 11)) 'get synckey')
+    GOT=$(send_to $((P + 11)) 'get synckey' || true)
     [ "$GOT" = "syncval" ] && break
     sleep 0.5
 done

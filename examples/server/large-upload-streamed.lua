@@ -46,22 +46,40 @@ function on_http_body(client_id, chunk, remaining)
         uploads[client_id] = up
     end
 
-    up.fh:write(chunk)
+    if up.failed then return end
+    if not up.fh:write(chunk) then
+        socketley.log("upload: write failed for " .. up.path)
+        up.fh:close()
+        up.fh = nil
+        os.remove(up.path)
+        up.failed = true
+        return
+    end
     up.bytes = up.bytes + #chunk
 
     -- `remaining` is what is still owed after this chunk, or nil for a chunked
     -- body where that is unknown.  Either way it is 0 exactly once, on the call
     -- that ends the body -- which is why this test is the same for both.
     if remaining == 0 then
-        up.fh:close()
+        local closed = up.fh:close()
         up.fh = nil
-        up.done = true
+        if closed then
+            up.done = true
+        else
+            socketley.log("upload: close failed for " .. up.path)
+            os.remove(up.path)
+            up.failed = true
+        end
     end
 end
 
 function on_http_request(req)
     local up = uploads[req.client_id]
     uploads[req.client_id] = nil
+
+    if up and up.failed then
+        return { status = 507, body = "upload failed\n" }
+    end
 
     if not up or not up.done then
         return { status = 400, body = "no body\n" }
@@ -86,7 +104,7 @@ function on_disconnect(client_id)
     local up = uploads[client_id]
     if not up then return end
     if up.fh then up.fh:close() end
-    if not up.done then
+    if not up.done and not up.failed then
         os.remove(up.path)
         socketley.log("upload: removed partial " .. up.path
             .. " (" .. up.bytes .. " bytes)")

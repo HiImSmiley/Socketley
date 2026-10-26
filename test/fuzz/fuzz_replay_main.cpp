@@ -171,15 +171,17 @@ bool collect(const std::string& path, std::vector<std::string>& files, int depth
     DIR* d = ::opendir(path.c_str());
     if (!d)
         return false;
+    bool ok = true;
     struct dirent* e;
     while ((e = ::readdir(d)) != nullptr)
     {
         if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0)
             continue;
-        collect(path + "/" + e->d_name, files, depth + 1);
+        if (!collect(path + "/" + e->d_name, files, depth + 1))
+            ok = false;
     }
     ::closedir(d);
-    return true;
+    return ok;
 }
 
 // ─── mutation ───────────────────────────────────────────────────────────────

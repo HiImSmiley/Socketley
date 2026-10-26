@@ -62,7 +62,14 @@ bool parse_cluster(std::string_view text, cluster_config& out, std::string& why)
         t.region = "us-east-1";
         t.node   = true;
         if (f.size() == 4)
+        {
             t.http.ca_file = std::string(f[3].substr(3));
+            if (t.http.ca_file.empty())
+            {
+                why = where + "ca= names the file of the CA the node's certificate is checked against";
+                return false;
+            }
+        }
         if (!valid_target_name(t.name))
         {
             why = where + "a node's name is letters, digits, '-', '_' and '.'";

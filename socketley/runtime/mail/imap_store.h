@@ -134,7 +134,7 @@ public:
 
     // METADATA (RFC 5464): the entries of a folder, "" the server's, kept in the index for every shard.  An entry is
     // its name in lower case, /private/... or /shared/..., at most 1000 a user, of 64 KiB each and 1 MiB in all.
-    enum class meta_refusal : uint8_t { none, no_folder, too_many, too_large, bad_name };
+    enum class meta_refusal : uint8_t { none, no_folder, too_many, too_large, bad_name, io };
     meta_refusal set_meta(const std::string& user, const std::string& folder, const std::string& entry,
                           const std::string* value);
     // The value of `entry`, null where it has none; and, with `depth` 1 or past, the entries under it that deep.

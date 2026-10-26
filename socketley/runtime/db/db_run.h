@@ -133,9 +133,8 @@ private:
     // A response's head appended to `o`, with an ETag for `version` when it is one.
     void put_head(std::string& o, const conn& c, int status, std::string_view type, size_t length,
                   std::string_view extra, uint64_t version = 0) const;
-    std::string head(const conn& c, int status, std::string_view type, size_t length, std::string_view extra) const;
     void respond(const std::shared_ptr<conn>& c, int status, std::string_view body, std::string_view extra = {},
-                 uint64_t version = 0);
+                 uint64_t version = 0, bool head_only = false);
     std::string cors(const request& rq) const;
     bool who_of(const request& rq, principal& who, bool& by_cookie, std::string& refusal);
     void reload_files(std::string& why);
@@ -268,7 +267,7 @@ private:
     struct counters
     {
         uint64_t reads{0}, writes{0}, queries{0}, syncs{0}, refused{0}, conflicts{0}, calls{0}, expired{0}, events{0},
-            feeds{0}, backups{0}, backup_failures{0}, replicated{0}, resets{0}, crossed{0}, crossings_served{0},
+            backups{0}, backup_failures{0}, replicated{0}, resets{0}, crossed{0}, crossings_served{0},
             caught_up{0}, reopened{0};
     } m_c;
 };

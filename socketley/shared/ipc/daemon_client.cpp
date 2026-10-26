@@ -106,7 +106,7 @@ daemon_identity daemon_probe(const char*   socket_path,
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     static constexpr char probe[] = "ping\n";
-    if (write(fd, probe, sizeof(probe) - 1) != static_cast<ssize_t>(sizeof(probe) - 1))
+    if (::send(fd, probe, sizeof(probe) - 1, MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(probe) - 1))
     {
         close(fd);
         return daemon_identity::mute;
@@ -218,7 +218,7 @@ static int daemon_ipc(const char* cmd)
     }
 
     std::string msg = std::string(cmd) + "\n";
-    if (write(fd, msg.data(), msg.size()) < 0)
+    if (::send(fd, msg.data(), msg.size(), MSG_NOSIGNAL) < 0)
     {
         close(fd);
         return -1;

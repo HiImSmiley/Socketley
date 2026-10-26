@@ -202,6 +202,8 @@ esac
 
 # ─── 7. show/import round trip ──────────────────────────────────────────────
 "$BIN" show rb_big > "$SOCKETLEY_TMPD/rb.json" 2>/dev/null
+"$BIN" edit rb_big --read-buffer 3M >/dev/null 2>&1 || true
+check "the record is moved off it before the import" "3145728" "$(f rb_big)"
 "$BIN" import rb_big < "$SOCKETLEY_TMPD/rb.json" >/dev/null 2>&1 || true
 check "a round trip through show/import keeps it" "2097152" "$(f rb_big)"
 
@@ -231,8 +233,8 @@ case "$POST" in
     *413*) bad "a 2 MB body is inside a 4 MiB bound" \
                "answered 413, so the server is still comparing against the old" \
                "1 MiB constant rather than its configured bound" ;;
-    "") bad "the server answered the post at all" "no reply" ;;
-    *) ok ;;
+    "HTTP/1."*) ok ;;
+    *) bad "the server answered the post at all" "got '$POST'" ;;
 esac
 
 echo "  measured: default refusal=[$R] large=[$RB] post=[$POST]"

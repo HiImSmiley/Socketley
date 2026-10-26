@@ -47,7 +47,7 @@ DPID=$!
 sleep 2
 
 # One reachable sink so a backend is usable; the rest are dead ends.
-timeout 25 nc -l 127.0.0.1 "$SINK_PORT" >/dev/null 2>&1 &
+timeout 25 nc -lk 127.0.0.1 "$SINK_PORT" >/dev/null 2>&1 &
 NC_PID=$!
 sleep 0.3
 

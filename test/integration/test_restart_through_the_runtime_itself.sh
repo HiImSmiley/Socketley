@@ -43,7 +43,7 @@ done
 
 state() { "$BIN" ls 2>/dev/null | awk -v n=" ent " '$0 ~ n {print $7}'; }
 # show leaves out a field at its default, and one shard is the default, so a missing line reads as the 1 it is.
-shards() { local v; v=$("$BIN" show ent 2>/dev/null | sed -n 's/.*"shards": \([0-9]*\).*/\1/p'); echo "${v:-1}"; }
+shards() { local o v; o=$("$BIN" show ent 2>/dev/null) && [ -n "$o" ] || { echo "show failed"; return; }; v=$(sed -n 's/.*"shards": \([0-9]*\).*/\1/p' <<<"$o"); echo "${v:-1}"; }
 # One line per listening worker, which is the shard count from outside the daemon.
 workers() { ss -ltn "sport = :$EN" 2>/dev/null | grep -c ":$EN "; }
 # What a caller reached through the entrance sees; empty when it is not listening.

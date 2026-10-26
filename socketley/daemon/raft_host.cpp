@@ -18,10 +18,8 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <filesystem>
 #include <netinet/tcp.h>
-#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -712,8 +710,11 @@ void raft_host::maintain()
     for (link* l : timed_out)
         l->fail("did not come up within 3 s");
 
-    if (m_ticks % 10 == 0)
+    if (m_ticks - m_join_tried >= 10)
+    {
+        m_join_tried = m_ticks;
         try_join();
+    }
     if (m_node->current_role() == raft::role::leader)
     {
         ensure_own_record();
@@ -857,7 +858,7 @@ void raft_host::fail_stop(const std::string& why)
 {
     if (!m_fatal.empty())
         return;
-    m_fatal = why;
+    m_fatal = why.empty() ? "refused by the cluster" : why;
     LOG_ERROR(("raft: " + why + "; this node stops taking part in the cluster until the daemon restarts").c_str());
     m_stopped = true;
     std::vector<link*> all;
@@ -1064,7 +1065,12 @@ void raft_host::handle_command(const std::string& data)
 bool raft_host::submit(const std::string& data, std::string& err)
 {
     socketley::cluster::command c;
-    if (m_stopped || !socketley::cluster::decode(data, c))
+    if (m_stopped)
+    {
+        err = "this node has stopped taking part in the cluster\n";
+        return false;
+    }
+    if (!socketley::cluster::decode(data, c))
     {
         err = "the cluster command is malformed\n";
         return false;
@@ -1407,11 +1413,12 @@ socketley::cluster::want raft_host::desired() const
 std::map<std::string, std::pair<std::string, uint16_t>> raft_host::primary_endpoints() const
 {
     std::map<std::string, std::pair<std::string, uint16_t>> out;
-    for (const auto& [name, lead] : m_brain->current().primaries)
+    for (const auto& entry : m_brain->current().primaries)
     {
+        const std::string& name = entry.first;
         const std::string addr = primary_address(name);
         const size_t colon = addr.rfind(':');
-        if (lead.node == 0 || colon == std::string::npos)
+        if (colon == std::string::npos)
             continue;
         uint16_t port = 0;
         const std::string_view digits = std::string_view(addr).substr(colon + 1);
@@ -1438,7 +1445,7 @@ std::string raft_host::placement() const
     {
         struct line { std::string name, type, want, placed, nodes, note; };
         std::vector<line> rows;
-        size_t w[5] = {7, 4, 8, 6, 5};
+        size_t w[2] = {7, 4};
         for (const auto& [name, sp] : st.specs)
         {
             line l;
@@ -1460,9 +1467,6 @@ std::string raft_host::placement() const
                          + (m == 1 ? "it" : "them");
             w[0] = std::max(w[0], l.name.size());
             w[1] = std::max(w[1], l.type.size());
-            w[2] = std::max(w[2], l.want.size() + 0);
-            w[3] = std::max(w[3], l.placed.size());
-            w[4] = std::max(w[4], l.nodes.size());
             rows.push_back(std::move(l));
         }
         auto pad = [](const std::string& s, size_t n) { return s + std::string(n > s.size() ? n - s.size() : 0, ' ') + "  "; };

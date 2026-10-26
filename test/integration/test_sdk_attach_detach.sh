@@ -150,7 +150,8 @@ case "$OUT" in
            "signal=15 is the daemon terminating the caller inside its own detach";;
 esac
 
-if ! "$BIN" ls </dev/null 2>/dev/null | awk '$2=="att_self"{f=1} END{exit !f}'; then ok; else
+if kill -0 "$SOCKETLEY_DPID" 2>/dev/null &&
+   ! "$BIN" ls </dev/null 2>/dev/null | awk '$2=="att_self"{f=1} END{exit !f}'; then ok; else
     bad "and the entry is gone afterwards" \
         "$("$BIN" ls </dev/null 2>&1)" \
         "a detach that does not unregister is not a detach"

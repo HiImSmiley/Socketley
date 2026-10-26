@@ -89,6 +89,7 @@ cat > "$SOCKETLEY_TMPD/probe.py" <<'PYEOF'
 import socket, sys, time
 path, dur = sys.argv[1], float(sys.argv[2])
 worst = 0.0
+replies = 0
 end = time.time() + dur
 while time.time() < end:
     t0 = time.perf_counter()
@@ -101,11 +102,14 @@ while time.time() < end:
             if not c: break
             buf += c
         s.close()
+        if b"\0" in buf:
+            replies += 1
+            worst = max(worst, (time.perf_counter() - t0) * 1000.0)
     except Exception:
         pass
-    worst = max(worst, (time.perf_counter() - t0) * 1000.0)
     time.sleep(0.005)
-print(f"{worst:.1f}")
+if replies:
+    print(f"{worst:.1f}")
 PYEOF
 
 python3 "$SOCKETLEY_TMPD/probe.py" "$SOCKETLEY_SOCKET" 6 > "$SOCKETLEY_TMPD/worst.txt" 2>/dev/null &

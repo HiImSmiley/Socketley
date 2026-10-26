@@ -566,11 +566,14 @@ struct storage_run::copy_feed : std::enable_shared_from_this<copy_feed>
     void retire()
     {
         ended = true;
+        keep.reset();
+        // A read still out on the descriptor keeps it, and its answer closes it, so the number is not reused under it.
+        if (reading)
+            return;
         src.reset();
         if (fd >= 0)
             run->m_loop.close_fd(fd);
         fd = -1;
-        keep.reset();
     }
 
     void fail(const s3_error& e)
@@ -632,7 +635,12 @@ struct storage_run::copy_feed : std::enable_shared_from_this<copy_feed>
             {
                 self->reading = false;
                 if (self->ended)
+                {
+                    if (self->fd >= 0)
+                        self->run->m_loop.close_fd(self->fd);
+                    self->fd = -1;
                     return;
+                }
                 if (!ok)
                 {
                     self->fail(st::io_error);

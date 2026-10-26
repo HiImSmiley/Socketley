@@ -208,7 +208,7 @@ if [ -n "$SDK_BIN" ]; then
     # parent here is a shell blocked in sleep, which is what keeps the entry
     # in Z rather than letting bash reap it the moment it dies.
     C_SOCK="$SOCKETLEY_TMPD/c.sock"
-    bash -c "SOCKETLEY_SOCKET=$C_SOCK '$BIN' daemon >/dev/null 2>&1 & echo \$! > $SOCKETLEY_TMPD/cpid; sleep 25" &
+    bash -c "SOCKETLEY_SOCKET=$C_SOCK '$BIN' daemon >/dev/null 2>&1 & echo \$! > $SOCKETLEY_TMPD/cpid; exec sleep 25" &
     C_PARENT=$!
     for _ in $(seq 1 60); do [ -S "$C_SOCK" ] && break; sleep 0.1; done
     C_PID=$(cat "$SOCKETLEY_TMPD/cpid" 2>/dev/null || echo "")

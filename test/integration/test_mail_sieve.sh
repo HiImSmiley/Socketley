@@ -161,6 +161,7 @@ PY
 while read -r verdict name; do
     case "$verdict" in ok) ok "$name" ;; bad) bad "${name%%:*}" "${name#*:}" ;; esac
 done < <(grep -E '^(ok|bad) ' "$T/ms.out" || echo "bad the ManageSieve client ran: $(tail -3 "$T/ms.out")")
+grep -q '^Traceback' "$T/ms.out" && bad "the ManageSieve client ran to its end" "$(tail -3 "$T/ms.out" | tr '\n' '|')"
 
 # ─── what the script does with mail ─────────────────────────────────────────
 send() { # send <from> <subject>: a message for alice, from a stranger's server
@@ -318,12 +319,14 @@ check "a script deactivated is no longer run" \
 out=$("$BIN" mail m sieve alice put long "$T/long.sieve" 2>&1)
 check "a script of 20 KB is put by the CLI" "$out" ""
 dir=$(find "$HOME/.local/share" -type d -path '*m.sieve/alice' 2>/dev/null | head -1)
-printf 'if true { nope; }\n' > "$dir/edited.sieve"
+[ -n "$dir" ] && printf 'if true { nope; }\n' > "$dir/edited.sieve" 2>/dev/null
+if [ ! -f "$dir/edited.sieve" ]; then bad "a script that no longer compiles is not made active" "the script could not be written (dir '$dir')"; else
 out=$("$BIN" mail m sieve alice activate edited 2>&1); rc=$?
 case "$out" in error*) [ $rc = 1 ] && ok "a script that no longer compiles is not made active" \
     || bad "a script that no longer compiles is not made active" "rc $rc" ;;
     *) bad "a script that no longer compiles is not made active" "$out" ;; esac
-rm -f "$dir/edited.sieve"
+fi
+[ -n "$dir" ] && rm -f "$dir/edited.sieve"
 
 # ─── the extensions ─────────────────────────────────────────────────────────
 printf 'require "editheader";\naddheader "X-Global" "seen";\n' > "$T/global.sieve"

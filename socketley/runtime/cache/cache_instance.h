@@ -52,8 +52,8 @@ struct client_connection
     // which is a floor on the rate, expressed as time.  A client sustaining
     // the floor always has PARTIAL_BASE_SECS of slack; one below it falls
     // behind its own allowance and is dropped; one sending nothing gets the
-    // base and no more.  10 KB/s is under 2.7 kbit/s -- slower than a modem,
-    // and far under anything a real client runs on.
+    // base and no more.  10 KiB/s is about 82 kbit/s, which is far under
+    // anything a real client runs on.
     //
     // Measured before this existed: two peers holding a half-command against
     // --max-connections 2 refused every real client and were never reclaimed.

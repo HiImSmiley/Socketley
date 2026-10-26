@@ -126,7 +126,7 @@ local lib = {
     os = { date = os.date, time = os.time, clock = os.clock, difftime = os.difftime },
 }
 function lib.raw(s) return setmetatable({ tostring(s) }, safe_mt) end
-function lib.html(s) return esc(tostring(s)) end
+function lib.html(s) return lib.raw(esc(tostring(s))) end
 function lib.url(s)
     return (tostring(s):gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end))
 end
@@ -294,9 +294,10 @@ sol::object to_lua(sol::state& lua, const json::jvalue& v)
         case kind::array:
         {
             sol::table t = lua.create_table(static_cast<int>(v.items.size()), 0);
-            for (size_t i = 0; i < v.items.size(); ++i)
-                if (v.items[i].k != kind::null)
-                    t[i + 1] = to_lua(lua, v.items[i]);
+            size_t at = 0;
+            for (const auto& item : v.items)
+                if (item.k != kind::null)
+                    t[++at] = to_lua(lua, item);
             return t;
         }
         case kind::object:

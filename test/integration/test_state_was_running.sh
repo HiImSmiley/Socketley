@@ -80,7 +80,7 @@ if [ -f "$REC" ]; then pass
 else fail "the state record exists" "no file at $REC; every check below is vacuous"; fi
 
 # ─── 1. The three writes, on the exact text ─────────────────────────────────
-line_of() { grep -o '"was_running": [^ ]*' "$1" 2>/dev/null | head -1; }
+line_of() { grep -o '"was_running": [^ ]*' "$1" 2>/dev/null | head -1 || true; }
 
 AFTER_CREATE=$(line_of "$REC")
 if [ "$AFTER_CREATE" = '"was_running": true,' ]; then pass

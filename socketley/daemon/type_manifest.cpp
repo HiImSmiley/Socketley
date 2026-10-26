@@ -127,7 +127,7 @@ std::string value_refusal(const type_manifest::schema_key& k, std::string_view v
             const char* first = v.data();
             const char* last  = v.data() + v.size();
             auto [p, ec] = std::from_chars(first, last, n);
-            if (ec != std::errc{} || p != last || v.empty())
+            if (ec != std::errc{} || p != last)
                 return "--" + k.name + " takes an integer, not \"" +
                        std::string(v) + "\"\n";
             return {};
@@ -441,7 +441,7 @@ size_t load_dir(const fs::path& dir)
                 id))
         {
             LOG_WARN(("type manifest " + path.string() + " refused: \"" + tn +
-                      "\" is a built-in type name").c_str());
+                      "\" is a built-in type name, is not a valid type name, or finds no free type id").c_str());
             continue;
         }
 

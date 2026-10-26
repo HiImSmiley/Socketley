@@ -175,7 +175,7 @@ wait_until("bytes_in", base_in + len(HEAD) + len(BODY_HEAD), "partial POST read"
 base_msgs = stat("total_messages") or 0
 b = conn()
 b.sendall(b"relay-into-http\n")
-wait_until("total_messages", base_msgs + 1, "relayed line processed")
+print("relay_processed=%s" % ("yes" if wait_until("total_messages", base_msgs + 1, "relayed line processed") else "no"))
 
 a.sendall(BODY_TAIL)                 # completes the request
 buf = read_for(a)
@@ -196,7 +196,7 @@ print("ka_first_ok=%s" % ("yes" if first.startswith(b"HTTP/1.1") else "no"))
 base_msgs = stat("total_messages") or 0
 d = conn()
 d.sendall(b"relay-between-requests\n")
-wait_until("total_messages", base_msgs + 1, "gap line processed")
+print("gap_processed=%s" % ("yes" if wait_until("total_messages", base_msgs + 1, "gap line processed") else "no"))
 
 # The next request, split so the read that classifies it does not also complete
 # it.  A hold released on classification has nothing queued to land behind.
@@ -220,7 +220,7 @@ read_for(e, 1.0)                     # its own response, consumed
 base_msgs = stat("total_messages") or 0
 f = conn()
 f.sendall(b"relay-to-idle-http\n")
-wait_until("total_messages", base_msgs + 1, "idle-http line processed")
+print("idle_processed=%s" % ("yes" if wait_until("total_messages", base_msgs + 1, "idle-http line processed") else "no"))
 # Longer than the relay-hold deadline, so a fix that merely delayed the bytes
 # would still be caught here.
 idle = read_for(e, 1.5)
@@ -257,16 +257,19 @@ OUT=$(python3 "$TMPD_T/drive.py" "$BIN" "$PORT" 2>&1) || {
 val() { printf '%s\n' "$OUT" | grep "^$1=" | head -1 | cut -d= -f2-; }
 
 # ── Scenario 1 ──────────────────────────────────────────────────────────────
+assert_eq "$(val relay_processed)" "yes" "the relayed line was processed by the server"
 assert_eq "$(val http_starts_with_status)" "yes" "response is the first thing on the wire"
 assert_eq "$(val http_bytes_before_status)" "0" "nothing precedes the status line"
 assert_eq "$(val http_relay_present)" "no"  "no relay bytes on an HTTP connection"
 
 # ── Scenario 2 ──────────────────────────────────────────────────────────────
+assert_eq "$(val gap_processed)" "yes" "the gap line was processed by the server"
 assert_eq "$(val ka_first_ok)" "yes" "keep-alive: first request answered"
 assert_eq "$(val ka_second_starts_with_status)" "yes" "keep-alive: second response leads"
 assert_eq "$(val ka_second_relay_present)" "no" "keep-alive: nothing relayed into the gap"
 
 # ── Scenario 3 ──────────────────────────────────────────────────────────────
+assert_eq "$(val idle_processed)" "yes" "the idle-http line was processed by the server"
 assert_eq "$(val idle_http_relay_present)" "no" "an idle HTTP connection is not a relay target"
 assert_eq "$(val idle_http_bytes)" "0" "and receives no unsolicited bytes at all"
 

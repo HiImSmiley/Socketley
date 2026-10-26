@@ -116,7 +116,7 @@ ok "${1:-}" "200" "a PUT that fits one read is retried and answered by the secon
 set -- $(put $((PX + 1)) 1000000 0 rb1)
 B_LINE=$(grep '^B ' "$SOCKETLEY_TMPD/log" | head -1)
 case "$B_LINE" in
-    ""|"B 1000000 of 1000000") ok ok ok "the second backend never saw a truncated body" ;;
+    ""|"B 1000000 of 1000000") ok a a "the second backend never saw a truncated body" ;;
     *) ok "$B_LINE" "B 1000000 of 1000000, or nothing" "the second backend never saw a truncated body" ;;
 esac
 ok "${1:-}" "502" "a PUT that streamed past the first read is not retried: 502 at once"

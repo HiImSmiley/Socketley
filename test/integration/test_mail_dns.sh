@@ -144,6 +144,7 @@ check "the bounce to no-reply@ suppresses the address it says failed" "$("$BIN" 
 for _ in $(seq 1 30); do s=$("$BIN" stats m 2>/dev/null | sed -n 's/^mail_bounces_taken://p'); [ "${s:-0}" -ge 1 ] && break; sleep 0.2; done
 [ "${s:-0}" -ge 1 ] && ok "and is counted taken" || bad "and is counted taken" "${s:-absent}"
 id=$("$BIN" send m --to dead@remote.test --subject "again" --text "again body" 2>&1 | sed -n 's/^queued //p')
+[ -n "$id" ] || bad "a suppressed address's message is queued" "send printed no id"
 # Its attempt is over once it is out of the queue, after which what it sent would be at the sink.
 for _ in $(seq 1 100); do "$BIN" mail m show "$id" >/dev/null 2>&1 || break; sleep 0.1; done
 "$BIN" mail m show "$id" >/dev/null 2>&1 && bad "a suppressed address's message is over at once" "still queued" \

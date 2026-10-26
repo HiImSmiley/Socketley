@@ -56,7 +56,7 @@ fi
 P=$((SL_PORT_BASE+1396))
 
 daemon_isolate forkdenied
-trap 'prlimit --pid "${DPID:-0}" --nproc=unlimited:unlimited 2>/dev/null; daemon_stop 2>/dev/null || true' EXIT
+trap 'daemon_stop 2>/dev/null || true' EXIT
 daemon_start "$BIN"
 DPID="$SOCKETLEY_DPID"
 
@@ -84,7 +84,6 @@ else
 fi
 
 # ── 2. It said no, and it said why ─────────────────────────────────────────
-prlimit --pid "$DPID" --nproc=unlimited:unlimited 2>/dev/null
 SAID=$(printf '%s' "$OUT" | head -1)
 LOGGED=$(grep -c "fork failed\|could not start out-of-process" "$SOCKETLEY_DLOG" 2>/dev/null || true)
 if [ "$RC" -ne 0 ] && [ -n "$SAID" ] && [ "${LOGGED:-0}" -ge 1 ]; then
@@ -110,14 +109,21 @@ fi
 # was_running:true on a runtime that never ran is how a restart resurrects it,
 # and this is the same clearing the `refused` verdict has always done.
 WR="<no file>"
-if [ -n "$STATE_FILE_DIR" ] && [ -f "$STATE_FILE_DIR/fk.json" ]; then
-    WR=$(grep -o '"was_running"[[:space:]]*:[[:space:]]*[a-z]*' "$STATE_FILE_DIR/fk.json" | tail -1)
-fi
+for _ in $(seq 1 50); do
+    if [ -n "$STATE_FILE_DIR" ] && [ -f "$STATE_FILE_DIR/fk.json" ]; then
+        WR=$(grep -o '"was_running"[[:space:]]*:[[:space:]]*[a-z]*' "$STATE_FILE_DIR/fk.json" | tail -1 || true)
+        [ -n "$WR" ] && break
+        WR="<no was_running>"
+    fi
+    sleep 0.1
+done
 case "$WR" in
     *true*) bad "a runtime that never started is not restored as running" \
                 "the state file says '$WR';" \
                 "the next daemon start would bring back a runtime that never ran" ;;
-    *)      ok "was_running is not left true for a runtime that never started ($WR)" ;;
+    *false) ok "was_running is not left true for a runtime that never started ($WR)" ;;
+    *)      bad "a runtime that never started has a state file saying was_running is false" \
+                "read '$WR' from '${STATE_FILE_DIR:-<no state directory>}/fk.json'" ;;
 esac
 
 "$BIN" remove fk >/dev/null 2>&1

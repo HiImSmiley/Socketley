@@ -246,21 +246,23 @@ fi
 # descriptors is also what the BROKEN build did — by closing the pair at the FIN
 # and discarding the answer — so this check alone would have passed on it.  It
 # discriminates only next to "and every answer came back".
-FD0=$(ls -1 "/proc/$SOCKETLEY_DPID/fd" 2>/dev/null | wc -l || true)
+# The sockets of hc_copy live in its worker, not in the daemon.
+CPID=$(ss -ltnpH "sport = :$PX_COPY" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+FD0=$(ls -1 "/proc/${CPID:-0}/fd" 2>/dev/null | wc -l || true)
 for i in $(seq 1 8); do
     out=$(python3 "$TMPD/halfclose.py" "$PX_COPY" "hcfd$i" 2>/dev/null || true)
     assert_eq "$out" "+OK" "descriptor round $i answered"
 done
 FD1=$FD0
 for _ in $(seq 1 40); do
-    FD1=$(ls -1 "/proc/$SOCKETLEY_DPID/fd" 2>/dev/null | wc -l || true)
+    FD1=$(ls -1 "/proc/${CPID:-0}/fd" 2>/dev/null | wc -l || true)
     [ -n "$FD1" ] && [ "$FD1" -le $((FD0 + 4)) ] && break
     sleep 0.25
 done
 TOTAL=$((TOTAL+1))
 if [ -z "$FD1" ] || [ -z "$FD0" ] || [ "$FD0" -eq 0 ]; then
     FAIL=$((FAIL+1))
-    echo "  FAIL [descriptors released]: could not read /proc/$SOCKETLEY_DPID/fd"
+    echo "  FAIL [descriptors released]: could not read /proc/${CPID:-0}/fd"
 elif [ "$FD1" -le $((FD0 + 4)) ]; then
     PASS=$((PASS+1))
 else

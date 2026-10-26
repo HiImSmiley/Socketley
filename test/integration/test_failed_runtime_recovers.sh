@@ -47,7 +47,7 @@ P=$((SL_PORT_BASE+1390))
 PS=$((SL_PORT_BASE+1392))
 
 daemon_isolate failedrecovers
-trap 'kill ${HOLDER:-0} 2>/dev/null; daemon_stop 2>/dev/null || true' EXIT
+trap 'if [ "${HOLDER:-0}" -gt 0 ]; then kill "$HOLDER" 2>/dev/null; fi; daemon_stop 2>/dev/null || true' EXIT
 daemon_start "$BIN"
 
 state_of() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n { print $7; exit }'; }
@@ -66,7 +66,7 @@ s.bind(('127.0.0.1',$1)); s.listen(8); time.sleep(60)" &
     HOLDER=$!
     sleep 1
 }
-release() { kill "${HOLDER:-0}" 2>/dev/null; wait "${HOLDER:-0}" 2>/dev/null; HOLDER=0; sleep 0.5; }
+release() { if [ "${HOLDER:-0}" -gt 0 ]; then kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; fi; HOLDER=0; sleep 0.5; }
 
 # ── 1. It really is failed, and for the reason we think ────────────────────
 occupy "$P"

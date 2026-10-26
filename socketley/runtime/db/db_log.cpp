@@ -231,12 +231,18 @@ bool seglog::begin(uint32_t seg, std::string& why)
     end_seal();
     end_next();
     const std::string path = path_of(seg);
-    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    // Made under a name no start reads, so a crash before the header is down leaves no segment too short to open.
+    const std::string tmp = path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     const std::string head = head_of();
-    if (fd < 0 || !write_all(fd, head.data(), head.size()) || ::fdatasync(fd) != 0 || !sync_dir(m_dir))
+    if (fd < 0 || !write_all(fd, head.data(), head.size()) || ::fdatasync(fd) != 0 ||
+        ::rename(tmp.c_str(), path.c_str()) != 0 || !sync_dir(m_dir))
     {
         if (fd >= 0)
+        {
             ::close(fd);
+            ::unlink(tmp.c_str());
+        }
         why = path + " cannot be written";
         return false;
     }
@@ -393,7 +399,8 @@ void seglog::end_next()
 {
     if (!m_next)
         return;
-    m_next->th.join();
+    if (m_next->th.joinable())
+        m_next->th.join();
     if (m_next->fd >= 0)
         ::close(m_next->fd);
     ::unlink((m_dir + "/" + next_name).c_str());

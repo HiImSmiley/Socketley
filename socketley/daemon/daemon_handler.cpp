@@ -87,7 +87,6 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include <algorithm>
 #include <cctype>
 #include <grp.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include "../shared/net/name_resolver.h"
@@ -95,7 +94,6 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include <sstream>
 #include <iostream>
 #include <filesystem>
-#include <fstream>
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <poll.h>
@@ -103,7 +101,6 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include "../shared/util/logging.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/util/number_parse.h"
-#include "../shared/util/settings.h"
 
 // Two seconds is the backstop for a worker that has wedged, not a budget the
 // normal path spends -- a child reports in 17-22 ms -- and it is one budget
@@ -342,17 +339,6 @@ static std::string attach_pid_refusal(int conn_fd, pid_t pid)
     return {};
 }
 
-// Why this runtime's --cpus request cannot be honoured, with the
-// text on runtime_instance because the restore path meets the request again on
-// a ring created before the state file was read.
-static std::string instance_ring_refusal(const runtime_instance* inst,
-                                         const event_loop& loop)
-{
-    if (!inst)
-        return {};
-    return inst->ring_policy_refusal(loop);
-}
-
 // cout is borrowed for the length of a command and given back, because every
 // parser reports its refusals there and there is the daemon's stdout -- safe
 // on this thread, which is the only one that writes cout.
@@ -490,13 +476,12 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
         [this](const cluster_ev_wire& w)
         {
             const std::string payload = worker_proto::encode_cluster_event(w);
-            for (auto& [name, shards] : m_proxy_workers)
+            for (auto& entry : m_proxy_workers)
             {
-                (void)name;
                 // Every shard, because a cluster event is about the cluster
                 // and telling only shard 0 would run on_group_change in one of
                 // four identical interpreters.
-                for (auto& sup : shards)
+                for (auto& sup : entry.second)
                     if (sup)
                         sup->send_cluster_event(payload);
             }
@@ -560,11 +545,6 @@ daemon_handler::~daemon_handler()
 void daemon_handler::set_state_persistence(state_persistence* sp)
 {
     m_persistence = sp;
-}
-
-void daemon_handler::set_cluster_discovery(cluster_discovery* cd)
-{
-    m_cluster = cd;
 }
 
 daemon_handler::socket_state daemon_handler::probe_socket()
@@ -1595,9 +1575,6 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     instance->set_runtime_manager(&m_manager);
     instance->set_event_loop(&m_loop);
 
-    if (type == runtime_proxy)
-        static_cast<proxy_instance*>(instance)->set_runtime_manager(&m_manager);
-
     bool autostart = false;
 
     // What --lua asked for, loaded once every flag has been seen; see the --lua
@@ -1701,7 +1678,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 
     // Checked as a set for the same reason TLS is, and at the same point: the
     // flag that completes the request may be further along the command line.
-    if (const std::string msg = instance_ring_refusal(instance, m_loop); !msg.empty())
+    if (const std::string msg = instance->ring_policy_refusal(m_loop); !msg.empty())
     {
         std::cout << msg;
         m_manager.remove(name);
@@ -1803,6 +1780,18 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
             else
             {
                 std::cout << "could not start runtime\n";
+                // The entrances it just made go with it, or nothing names them any more.
+                const auto entrances = dns_entrance_children(name);
+                for (const auto& e : entrances)
+                    m_manager.stop(e, m_loop);
+                if (!entrances.empty())
+                    reconcile_proxy_workers();
+                for (const auto& e : entrances)
+                {
+                    m_manager.remove(e);
+                    if (m_persistence)
+                        m_persistence->remove_runtime(e);
+                }
                 m_manager.remove(name);
                 return 2;
             }
@@ -2050,8 +2039,7 @@ int daemon_handler::make_dns_entrance(dns_instance* dns, bool start)
     if (made_entrance && dns->get_proxy_port() == 443 && !m_manager.get(http) &&
         !make(http, {"create", "proxy", http, "-p", "80", "--redirect-https"}, "the redirect to HTTPS"))
     {
-        if (made_entrance)
-            drop(proxy);
+        drop(proxy);
         return 1;
     }
     dns->set_proxy(proxy);
@@ -2201,7 +2189,8 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             // worker's frame has arrived.
         }
 
-        if (want_interactive && inst)
+        // A dns runtime's entrance joined names after the refusal above and is no stream for typed input either.
+        if (want_interactive && inst && inst->get_type() != runtime_proxy)
         {
             // The proxy case was refused above, before anything was started.
             conn->interactive = true;
@@ -2982,7 +2971,11 @@ bool daemon_handler::deliver_to_runtime(std::string_view name,
         {
             // With `exclude` set this is a sibling fan-out with no siblings
             // left, so nothing was owed a delivery and it is not an error.
-            why = "could not reach the worker holding " + std::string(name);
+            if (exclude)
+                if (const auto it = m_proxy_workers.find(std::string(name));
+                    it != m_proxy_workers.end() && it->second.size() <= 1)
+                    return true;
+            why ="could not reach the worker holding " + std::string(name);
             return false;
         }
         return true;
@@ -3569,13 +3562,11 @@ int daemon_handler::cmd_db_restore(ipc_connection* conn, const parsed_args& pa)
     }
     // Read whole before anything is touched: a file that is not a backup of a database changes nothing.
     std::string why;
-    uint64_t records = 0;
     if (file.empty() || file.front() != '/' ||
         !socketley::db::seglog::scan_file(
             file,
             [&](uint32_t, uint64_t, std::string_view p) {
                 std::vector<socketley::db::event> evs;
-                ++records;
                 return socketley::db::decode_record(p, evs);
             },
             false, why))
@@ -3631,9 +3622,6 @@ int daemon_handler::cmd_idp_user(ipc_connection* conn, const parsed_args& pa)
         conn->write_buf = "runtime is not running: " + std::string(name) + "\n";
         return 1;
     }
-    const auto ask = [&](std::string_view runtime, std::string_view payload, std::string& reply) {
-        return ask_worker(conn, runtime, payload, reply);
-    };
     std::string reply;
     if (pa.args[2] == "import")
     {
@@ -3659,7 +3647,7 @@ int daemon_handler::cmd_idp_user(ipc_connection* conn, const parsed_args& pa)
             q.kind = socketley::storage_rpc::op::users;
             q.start_after = after;
             std::string page;
-            if (!ask(storage, socketley::storage_rpc::encode(q), page))
+            if (!ask_worker(conn, storage, socketley::storage_rpc::encode(q), page))
                 return 2;
             socketley::storage_rpc::reply r;
             if (!socketley::storage_rpc::decode(page, socketley::storage_rpc::op::users, r) || !r.ok)
@@ -3667,7 +3655,7 @@ int daemon_handler::cmd_idp_user(ipc_connection* conn, const parsed_args& pa)
                 conn->write_buf = "the storage " + std::string(storage) + " gave no list of users: " + r.message + "\n";
                 return 1;
             }
-            if (!ask(name, std::string(socketley::idp::command_marker) + "import-data\n" + page, reply))
+            if (!ask_worker(conn, name, std::string(socketley::idp::command_marker) + "import-data\n" + page, reply))
                 return 2;
             if (reply.starts_with("error: "))
             {
@@ -3694,7 +3682,7 @@ int daemon_handler::cmd_idp_user(ipc_connection* conn, const parsed_args& pa)
         if (i + 1 < pa.count)
             payload += '\n';
     }
-    if (!ask(name, payload, reply))
+    if (!ask_worker(conn, name, payload, reply))
         return 2;
     conn->write_buf = reply;
     if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
@@ -3744,8 +3732,10 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
     //
     // `send` is not a cache command and keeps its own path; `memory` is half
     // configuration the daemon owns, so it is finished below rather than here.
+    const uint32_t action_hash = fnv1a_lower(action);
+
     if (type == runtime_cache && instance->is_out_of_process()
-        && action != "send" && action != "memory")
+        && action_hash != fnv1a("send") && action_hash != fnv1a("memory"))
     {
         // The cache splits a text command at its spaces, and only a value, its last word, is taken as the rest.
         for (size_t i = 3; i < pa.count; ++i)
@@ -3759,7 +3749,7 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
     }
 
     if (type == runtime_cache && instance->is_out_of_process()
-        && action == "memory")
+        && action_hash == fnv1a("memory"))
     {
         // The cap is what this runtime was configured with and the daemon has
         // it; the bytes in use are the worker's and only the worker knows.
@@ -3770,8 +3760,6 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf = cap + " " + conn->write_buf;
         return rc;
     }
-
-    uint32_t action_hash = fnv1a_lower(action);
 
     switch (action_hash)
     {
@@ -4464,7 +4452,7 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
                 conn->write_buf = "mset is only valid for cache runtimes\n";
                 return 1;
             }
-            if (pa.count < 6)
+            if (pa.count < 5)
             {
                 conn->write_buf = "usage: <cache> mset <key1> <val1> [key2] [val2] ...\n";
                 return 1;
@@ -4493,7 +4481,7 @@ static bool asks_restart(const parsed_args& pa)
     return false;
 }
 
-int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
+int daemon_handler::cmd_edit(ipc_connection* conn,
                              const parsed_args& pa, bool may_restart)
 {
     if (may_restart && pa.count >= 3 && asks_restart(pa))
@@ -5177,8 +5165,6 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
     // half-changed.
     const uint32_t    eff_shards = merged("shards", cfg.shards,
                                           instance->get_shards());
-    const std::string eff_listen = merged("listen", cfg.listen_path,
-                                          std::string(instance->get_listen_path()));
 
     if (const std::string msg = shards_config_refusal(type, eff_shards);
         !msg.empty())
@@ -5478,10 +5464,6 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         }
     }
 
-    if (has("port"))              instance->set_port(cfg.port);
-    if (has("listen"))            instance->set_listen_path(cfg.listen_path);
-    if (has("bind"))              instance->set_bind_address(cfg.bind_address);
-    if (has("domain") && type != runtime_storage) instance->set_domains(cfg.domains);
     // The same absolute-path rule the flag doors apply, because a document is
     // the other way in and a state file written before that rule existed is a
     // third.
@@ -5500,11 +5482,6 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
             return 1;
         }
     }
-    if (has("log_file"))          instance->set_log_file(cfg.log_file);
-    if (has("write_file"))        instance->set_write_file(cfg.write_file);
-    if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);
-    if (has("bash_prefix"))       instance->set_bash_prefix(cfg.bash_prefix);
-    if (has("bash_timestamp"))    instance->set_bash_timestamp(cfg.bash_timestamp);
     // The flags a client does not have are refused here too, because import
     // does not go through the flag parser and a validation that guards one
     // entrance is not there.
@@ -5544,6 +5521,15 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         return 1;
     }
 
+    if (has("port"))              instance->set_port(cfg.port);
+    if (has("listen"))            instance->set_listen_path(cfg.listen_path);
+    if (has("bind"))              instance->set_bind_address(cfg.bind_address);
+    if (has("domain") && type != runtime_storage) instance->set_domains(cfg.domains);
+    if (has("log_file"))          instance->set_log_file(cfg.log_file);
+    if (has("write_file"))        instance->set_write_file(cfg.write_file);
+    if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);
+    if (has("bash_prefix"))       instance->set_bash_prefix(cfg.bash_prefix);
+    if (has("bash_timestamp"))    instance->set_bash_timestamp(cfg.bash_timestamp);
     if (has("max_connections"))   instance->set_max_connections(cfg.max_connections);
     if (has("rate_limit"))        instance->set_rate_limit(cfg.rate_limit);
     if (has("global_rate_limit")) instance->set_global_rate_limit(cfg.global_rate_limit);
@@ -6142,6 +6128,8 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
             existing->set_port(port);
             if (pid > 0)
                 existing->set_pid(pid);
+            if (!owner_name.empty())
+                existing->set_owner(owner_name);
             if (m_persistence)
                 m_persistence->save_runtime(existing);
             return 0;
@@ -6428,7 +6416,7 @@ void daemon_handler::link_peers(proxy_supervisor* from, const std::string& targe
 
     const auto mine = m_proxy_workers.find(origin);
     const auto theirs = m_proxy_workers.find(target);
-    if (mine == m_proxy_workers.end() || theirs == m_proxy_workers.end())
+    if (mine == m_proxy_workers.end() || theirs == m_proxy_workers.end() || theirs->second.empty())
         return;
 
     // A sharded origin gets one link PER SHARD, and the far side registers each
@@ -6710,12 +6698,9 @@ void daemon_handler::forget(std::string_view gone)
     std::vector<std::string> local;
     {
         std::shared_lock lock(m_manager.mutex);
-        for (const auto& [name, inst] : m_manager.list())
-        {
-            (void)inst;
-            if (name != gone)
-                local.push_back(name);
-        }
+        for (const auto& entry : m_manager.list())
+            if (entry.first != gone)
+                local.push_back(entry.first);
     }
     for (const auto& name : local)
         if (auto* srv = route_relay::local_server(&m_manager, name))
@@ -8230,8 +8215,7 @@ void daemon_handler::check_managed_health()
         pid_t pid = inst->get_pid();
         if (pid <= 0)
             continue;
-        int status = 0;
-        pid_t ret = waitpid(pid, &status, WNOHANG);
+        pid_t ret = waitpid(pid, nullptr, WNOHANG);
         if (ret <= 0)
             continue;  // still alive or error
 
@@ -8558,8 +8542,7 @@ int daemon_handler::cmd_cluster_create(ipc_connection* conn, const parsed_args& 
         conn->write_buf = out.empty() ? "the flags were refused\n" : out;
         return rc;
     }
-    const int rc = submit_cluster_command(*m_raft, c, conn->write_buf);
-    return rc;
+    return submit_cluster_command(*m_raft, c, conn->write_buf);
 }
 
 int daemon_handler::cmd_cluster_remove(ipc_connection* conn, const parsed_args& pa)
@@ -9098,11 +9081,19 @@ void daemon_handler::publish_runtime_events()
                                   ",\"port\":" + std::to_string(inst->get_port()) + "}");
     }
     // Retained, so a subscriber that comes later reads how each runtime stands, and cleared for one that is gone.
+    // A refused update leaves the old state recorded, so the next call sends it again.
+    auto next = now;
     for (const auto& [name, json] : now)
         if (const auto it = m_event_states.find(name); it == m_event_states.end() || it->second != json)
-            m_alert_out.add("events", json, "runtimes/" + name + "/state", true);
+            if (!m_alert_out.add("events", json, "runtimes/" + name + "/state", true))
+            {
+                if (it != m_event_states.end())
+                    next[name] = it->second;
+                else
+                    next.erase(name);
+            }
     for (const auto& [name, json] : m_event_states)
-        if (!now.contains(name))
-            m_alert_out.add("events", std::string(), "runtimes/" + name + "/state", true);
-    m_event_states = std::move(now);
+        if (!now.contains(name) && !m_alert_out.add("events", std::string(), "runtimes/" + name + "/state", true))
+            next.emplace(name, json);
+    m_event_states = std::move(next);
 }

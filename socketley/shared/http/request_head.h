@@ -37,6 +37,12 @@ int take_request(std::string_view in, size_t max_head, size_t max_body, request_
         }
         return 0;
     }
+    // The bound holds for a head that arrived whole as well, not only for one still coming.
+    if (end + 4 > max_head)
+    {
+        status = 431;
+        return -1;
+    }
     const std::string_view head = in.substr(0, end + 2);
     if (!http_eol_framing_ok(head, true))
         return -1;

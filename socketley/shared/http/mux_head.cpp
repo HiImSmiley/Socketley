@@ -129,7 +129,11 @@ void response_head(std::string_view head, response& out)
             value.remove_prefix(1);
         if (name == "transfer-encoding")
         {
-            out.chunked = value.find("chunked") != std::string_view::npos;
+            // A coding's name is case-insensitive (RFC 9112 7), so "Chunked" is chunked too.
+            std::string coding(value);
+            for (char& ch : coding)
+                ch = static_cast<char>(ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+            out.chunked = coding.find("chunked") != std::string::npos;
             continue;
         }
         if (name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "upgrade")

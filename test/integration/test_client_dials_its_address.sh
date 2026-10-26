@@ -60,9 +60,9 @@ for bad in "127.0.0.1:abc" "127.0.0.1:" "127.0.0.1:99999" "127.0.0.1:0" ":8080";
     "$BIN" remove badcli >/dev/null 2>&1 || true
     RC=0
     OUT=$(timeout 20 "$BIN" create client badcli -t "$bad" -s 2>&1) || RC=$?
-    if [ "$RC" -ne 0 ]; then pass
+    if [ "$RC" -eq 1 ]; then pass
     else fail "-t $bad is refused" \
-              "create exited 0 for an address that cannot be dialled" \
+              "create exited $RC, not 1, for an address that cannot be dialled" \
               "said: ${OUT:-<nothing>}"; fi
 done
 

@@ -364,8 +364,8 @@ void copy_job::run()
     ok = true;
     for (auto& it : items)
     {
-        int& fd = fds[it.from.seg];
-        if (fd == 0)
+        int& fd = fds.try_emplace(it.from.seg, -2).first->second;
+        if (fd == -2)
         {
             char name[32];
             std::snprintf(name, sizeof name, "/seg-%08u.log", it.from.seg);
@@ -401,7 +401,7 @@ void copy_job::run()
         it.to.off = offs[0];
     }
     for (auto& [seg, fd] : fds)
-        if (fd > 0)
+        if (fd >= 0)
             ::close(fd);
     if (!ok)
         return;
@@ -1189,6 +1189,11 @@ bool read_v1(const std::string& dir, std::map<std::pair<std::string, std::string
                 out.erase({e.coll, e.id});
                 continue;
             }
+            if (t != ent_put)
+            {
+                bad = true;
+                break;
+            }
             if (!r.u64(e.v) || !r.bytes(e.owner, 256) || !r.bytes(e.json, store::max_doc))
             {
                 bad = true;
@@ -1220,6 +1225,12 @@ bool store::open(const std::string& dir, const schema& s, std::string& why)
     {
         for (auto& [key, e] : old)
         {
+            jvalue body;
+            if (!json_reader(e.json).document(body))
+            {
+                why = "a document of the first format is no JSON object";
+                return false;
+            }
             e.seq = ++m_seq;
             std::vector<uint64_t> offs;
             const location at = m_log.append(encode_record(e.seq, {e}, &offs));
@@ -1232,12 +1243,6 @@ bool store::open(const std::string& dir, const schema& s, std::string& why)
             d.v = e.v;
             d.seq = e.seq;
             d.at = location{at.seg, at.off + offs[0], static_cast<uint32_t>(e.json.size())};
-            jvalue body;
-            if (!json_reader(e.json).document(body))
-            {
-                why = "a document of the first format is no JSON object";
-                return false;
-            }
             derive(*c, body, d);
             set_doc(*c, e.coll, e.id, &d);
             std::string ignored;
@@ -1249,7 +1254,16 @@ bool store::open(const std::string& dir, const schema& s, std::string& why)
             return false;
         }
         for (const char* f : {"/data.snapshot", "/data.journal"})
+        {
+            if (!std::filesystem::exists(dir + f, ec))
+                continue;
             std::filesystem::rename(dir + f, dir + f + ".v1", ec);
+            if (ec)
+            {
+                why = std::string("the file of the first format could not be set aside: ") + f;
+                return false;
+            }
+        }
     }
     // The deletions scan() remembered were for itself.
     m_tombs.clear();
@@ -1282,6 +1296,7 @@ void store::close()
     m_follow_seg = 0;
     m_follow_off = 0;
     m_seen_segs.clear();
+    m_tombs.clear();
     m_job_running = false;
 }
 
@@ -1709,7 +1724,8 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     else if (!in_order && q.desc)
         std::reverse(hits.begin(), hits.end());
     out += "{\"docs\":[";
-    const size_t end = std::min(hits.size(), q.skip + q.limit);
+    const size_t stop = q.skip > SIZE_MAX - q.limit ? SIZE_MAX : q.skip + q.limit;
+    const size_t end = std::min(hits.size(), stop);
     for (size_t i = q.skip; i < end; ++i)
     {
         if (i > q.skip)
@@ -1724,8 +1740,8 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
         write_doc(*hits[i].id, *hits[i].d, hit ? j : std::string_view(hits[i].json), out);
     }
     out += ']';
-    if (hits.size() > q.skip + q.limit)
-        out += ",\"next\":" + std::to_string(q.skip + q.limit);
+    if (hits.size() > stop)
+        out += ",\"next\":" + std::to_string(stop);
     out += '}';
     return true;
 }
@@ -2052,16 +2068,25 @@ bool store::apply(const std::vector<event>& evs, std::string& why)
             from = to;
             continue;
         }
-        std::vector<uint64_t> offs;
-        const location at = m_log.append(encode_record(seq, group, &offs));
-        for (size_t i = 0; i < group.size(); ++i)
+        for (const event& e : group)
         {
-            const event& e = group[i];
             if (!valid_collection(e.coll) || !valid_id(e.id))
             {
                 why = "a change names no collection or id this database takes";
                 return false;
             }
+            jvalue probe;
+            if (!e.del && !json_reader(e.json).document(probe))
+            {
+                why = "a change carries a document that is no JSON object";
+                return false;
+            }
+        }
+        std::vector<uint64_t> offs;
+        const location at = m_log.append(encode_record(seq, group, &offs));
+        for (size_t i = 0; i < group.size(); ++i)
+        {
+            const event& e = group[i];
             coll_state* c = coll_of(e.coll);
             if (!c)
                 c = &make_coll(e.coll);

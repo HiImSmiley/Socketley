@@ -40,7 +40,7 @@ trap cleanup EXIT
 
 echo "=== Integration: a CLI cache command runs where the cache is ==="
 
-command -v nc >/dev/null 2>&1 || { echo "  SKIP: nc is required"; exit 0; }
+command -v nc >/dev/null 2>&1 || { echo "  FAIL: nc is required"; exit 1; }
 
 daemon_start "$BIN"
 "$BIN" create cache cw -p "$PORT" --persistent "$DUMP" --mode admin -s >/dev/null 2>&1

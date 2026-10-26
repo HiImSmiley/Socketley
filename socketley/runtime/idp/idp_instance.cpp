@@ -45,8 +45,9 @@ std::string idp_instance::config_refusal() const
     const std::string i = issuer();
     if (i.empty())
         return "idp: --issuer is required, or a --domain to make it https://<domain> from\n";
-    if (!socketley::idp::url_host(i).size() || i.find_first_of("?#") != std::string::npos ||
-        (!i.starts_with("https://") && !i.starts_with("http://localhost") && !i.starts_with("http://127.0.0.1")))
+    const std::string host = socketley::idp::url_host(i);
+    if (host.empty() || i.find_first_of("?#") != std::string::npos ||
+        (!i.starts_with("https://") && host != "localhost" && host != "127.0.0.1"))
         return "idp: --issuer must be an https address without a query (http only for localhost): " + i + "\n";
     if (!get_listen_path().empty())
         return "idp: --listen unix: is not served; the provider listens on its port\n";

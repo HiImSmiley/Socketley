@@ -1,7 +1,6 @@
 #include "mail_delivery.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <charconv>
 #include <cstring>
 #include <ctime>
@@ -108,19 +107,6 @@ bool parse_answer(const uint8_t* msg, size_t len, uint16_t type, std::vector<dns
             if (el)
                 out.push_back({dns::rd16(rd), dns::to_text(std::string_view(reinterpret_cast<char*>(ex), el))});
         }
-        else if (t == type && type == dns::type::TXT)
-        {
-            std::string text;
-            for (size_t i = 0; i < rdlen;)
-            {
-                const size_t n = rd[i];
-                if (i + 1 + n > rdlen)
-                    break;
-                text.append(reinterpret_cast<const char*>(rd + i + 1), n);
-                i += 1 + n;
-            }
-            out.push_back({0, std::move(text)});
-        }
         at = next + 10 + rdlen;
     }
     return true;
@@ -197,6 +183,8 @@ struct delivery::out_conn
     uint64_t body_off{0};
     bool bol{true};
     bool reading{false};
+    // Counts the items this connection has ended, so a read for one that ended is told from one for the next.
+    uint64_t item_no{0};
     bool signature_sent{false};
     // The exchanger's TLSA records, asked for the host at `tlsa_for`: DANE applies where there are any, and they
     // authenticate where one is usable; and what the domain's MTA-STS policy asks.
@@ -307,7 +295,15 @@ bool delivery::start(std::string& why)
         }
         if (const size_t slash = rest.find('/'); slash != std::string_view::npos)
             rest = rest.substr(0, slash);
-        if (const size_t colon = rest.rfind(':'); colon != std::string_view::npos && rest.front() != '[')
+        // A bracketed IPv6 host loses its brackets, and its port is the text after "]:".
+        size_t colon = rest.rfind(':');
+        if (!rest.empty() && rest.front() == '[')
+        {
+            const size_t close = rest.find(']');
+            colon = close != std::string_view::npos && close + 1 < rest.size() && rest[close + 1] == ':'
+                        ? close + 1 : std::string_view::npos;
+        }
+        if (colon != std::string_view::npos)
         {
             const std::string_view port = rest.substr(colon + 1);
             unsigned value = 0;
@@ -316,6 +312,8 @@ bool delivery::start(std::string& why)
                                ? static_cast<uint16_t>(value) : 0;
             rest = rest.substr(0, colon);
         }
+        if (rest.size() >= 2 && rest.front() == '[' && rest.back() == ']')
+            rest = rest.substr(1, rest.size() - 2);
         m_relay_host = std::string(rest);
         if (m_relay_host.empty() || m_relay_port == 0)
         {
@@ -754,7 +752,7 @@ bool folder_ok(std::string_view f)
     {
         const size_t slash = std::min(f.find('/', at), f.size());
         const std::string_view part = f.substr(at, slash - at);
-        if (part == "." || part == ".." || part.starts_with("."))
+        if (part.starts_with("."))
             return false;
         at = slash + 1;
     }
@@ -1923,7 +1921,7 @@ void delivery::report(const entry_ptr& e, report_kind kind)
                 status += "Diagnostic-Code: smtp; " + clean(r.why) + "\r\n";
             if (delay)
                 status += "Will-Retry-Until: " +
-                          rfc5322_date(e->at_ms + static_cast<int64_t>(m_run.owner().get_queue_lifetime()) * 1000) +
+                          rfc5322_date(e->at_ms + static_cast<int64_t>(m_run.owner().get_queue_lifetime()) * 1000 / queue_scale()) +
                           "\r\n";
         }
         const std::string subject = delay ? "Delayed Mail (still being retried)" : failed ?
@@ -1949,16 +1947,16 @@ void delivery::report(const entry_ptr& e, report_kind kind)
                           "Arrival-Date: " + rfc5322_date(e->at_ms) + "\r\n" + status + "\r\n--" + b +
                           (full ? "\r\nContent-Type: message/rfc822\r\n\r\n" : "\r\nContent-Type: text/rfc822-headers\r\n\r\n") +
                           enclosed + "\r\n--" + b + "--\r\n";
-        if (failed)
-            ++m_bounced;
-        else
-            ++m_reports;
         if (included.empty())
         {
             if (kind == report_kind::final)
                 m_run.queue().remove(e->id);
             return;
         }
+        if (failed)
+            ++m_bounced;
+        else
+            ++m_reports;
         m_run.queue_message("", {e->from}, std::move(msg), true, {},
                             [this, e, kind, included, alive](bool ok, std::string) {
             if (!*alive || kind == report_kind::delay)
@@ -2138,8 +2136,8 @@ void delivery::conn_connect(out_conn& c)
             if (st == dns_client::state::unsure)
             {
                 // The system's resolver, on a thread, for what the loop's cannot say.
-                c.state = out_conn::st::resolving;
-                c.deadline_ms = 0;
+                c.state = out_conn::st::connecting;
+                c.deadline_ms = wall::now_ms_coarse() + 60000;
                 auto got = std::make_shared<std::vector<endpoint>>();
                 const uint64_t id = c.id, gen = c.gen;
                 m_run.pool().submit(0, [host = c.host, got] { *got = socketley::resolve_all(host, nullptr, AF_UNSPEC); },
@@ -2161,8 +2159,6 @@ void delivery::conn_connect(out_conn& c)
                                         }
                                         conn_connect(c);
                                     });
-                c.state = out_conn::st::connecting;
-                c.deadline_ms = wall::now_ms_coarse() + 60000;
                 return;
             }
             c.addrs = std::move(found);
@@ -2314,7 +2310,12 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             c.handshaken = true;
             c.verified = SSL_get_verify_result(c.ssl) == X509_V_OK;
             ++m_tls_sessions;
-            tls_told(c, c.verified, c.verified ? "" : "certificate-host-mismatch");
+            const long verdict = SSL_get_verify_result(c.ssl);
+            tls_told(c, c.verified,
+                     c.verified                                    ? ""
+                     : verdict == X509_V_ERR_HOSTNAME_MISMATCH     ? "certificate-host-mismatch"
+                     : verdict == X509_V_ERR_CERT_HAS_EXPIRED      ? "certificate-expired"
+                                                                   : "certificate-not-trusted");
             if (c.verified && c.dane && !c.tlsa.empty())
                 ++m_dane_verified;
             else if (c.verified && c.sts == tls_policy::sts_mode::enforce)
@@ -2331,7 +2332,8 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             {
                 // The conversation starts over inside TLS (RFC 3207 4.2).
                 c.state = out_conn::st::ehlo;
-                c.pipelining = c.starttls = c.eightbit = c.utf8 = c.auth_plain = c.chunking = c.dsn = false;
+                c.pipelining = c.starttls = c.eightbit = c.utf8 = c.auth_plain = c.auth_login = c.chunking = c.dsn = false;
+                c.size_max = 0;
                 c.requiretls = false;
                 c.rcpt_max = 0;
                 c.expect.push_back('E');
@@ -2391,6 +2393,12 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
         std::string text = std::move(c.reply_text);
         c.reply_text.clear();
         conn_reply(c, code, std::move(text));
+        // Bytes the server sent in the clear after its STARTTLS answer are no part of the TLS session (RFC 3207 4.2).
+        if (live() && c.state == out_conn::st::handshake && c.after_starttls && at < c.in.size())
+        {
+            conn_fail(c, "451 4.7.0 " + c.host + " sent data after its STARTTLS answer", early_move(c));
+            return;
+        }
     }
     if (live())
         c.in.erase(0, at);
@@ -2509,6 +2517,12 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                 c.expect.pop_front();
             if (!ok)
             {
+                if (code == 421)
+                {
+                    // A server that answers 421 is closing, so no HELO is sent to it.
+                    conn_fail(c, "451 4.4.2 " + c.host + " answered " + said, early_move(c));
+                    return;
+                }
                 if (c.state == st::ehlo)
                 {
                     c.state = st::helo;
@@ -3026,15 +3040,17 @@ void delivery::conn_chunk(out_conn& c)
         return;
     }
     c.reading = true;
-    const uint64_t id = c.id, gen = c.gen;
+    const uint64_t id = c.id, gen = c.gen, item_no = c.item_no;
     m_run.queue().read(e, c.body_off, body_chunk,
-                       [this, id, gen, send, sig = std::move(sig), alive = m_alive](bool ok, std::string_view b) mutable {
+                       [this, id, gen, item_no, send, sig = std::move(sig), alive = m_alive](bool ok, std::string_view b) mutable {
                            if (!*alive)
                                return;
                            const auto it = m_conns.find(id);
                            if (it == m_conns.end() || it->second->gen != gen)
                                return;
                            out_conn& c = *it->second;
+                           if (c.item_no != item_no)
+                               return;
                            c.reading = false;
                            // A chunk refused while this one was read ended the message.
                            if (!c.cur || c.state != out_conn::st::body || c.bdat_code)
@@ -3054,6 +3070,8 @@ void delivery::conn_end_item(out_conn& c, int code, const std::string& text)
     if (!c.cur)
         return;
     std::unique_ptr<item> it = std::move(c.cur);
+    ++c.item_no;
+    c.reading = false;
     const bool data_answered = c.state == out_conn::st::dot;
     for (size_t t = 0; t < it->to.size(); ++t)
     {
@@ -3146,7 +3164,22 @@ void delivery::conn_fail(out_conn& c, const std::string& why, move_on next)
         std::unique_ptr<item> it = std::move(c.cur);
         const bool permanent = why.size() > 0 && why[0] == '5';
         for (size_t t = 0; t < it->to.size(); ++t)
-            result(*it, t, permanent ? 550 : 451, why, !permanent);
+        {
+            int rc = permanent ? 550 : 451;
+            std::string rt = why;
+            // A recipient the server already refused keeps that answer, as conn_end_item has it.
+            if (c.mail_code / 100 != 2 && c.mail_code)
+            {
+                rc = c.mail_code;
+                rt = c.mail_text;
+            }
+            else if (t < c.rcpt_code.size() && c.rcpt_code[t] && c.rcpt_code[t] / 100 != 2)
+            {
+                rc = c.rcpt_code[t];
+                rt = c.rcpt_text[t];
+            }
+            result(*it, t, rc, rt.empty() ? std::to_string(rc) : rt, rc / 100 == 4 || rc == 0);
+        }
         if (--m_out[it->e->id] == 0)
             attempt_over(it->e);
     }

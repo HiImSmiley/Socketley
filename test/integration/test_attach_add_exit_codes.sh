@@ -82,7 +82,8 @@ refuses "add answers a bad name with 1, not 2" 1 "invalid runtime name" \
         "$BIN" add /bin/true --name 'ax..bad'
 
 # ─── The controls ───────────────────────────────────────────────────────────
-RC=0; "$BIN" create server ax_par -p $((P+7)) >/dev/null 2>&1 || RC=$?
+RC=0; OUT=$("$BIN" create server ax_par -p $((P+7)) 2>&1) || RC=$?
+if [ "$RC" -ne 0 ]; then fail "the owner runtime for the controls is created" "exit $RC: ${OUT:-<nothing>}"; fi
 RC=0; OUT=$("$BIN" attach server ax_ok $((P+4)) --owner ax_par 2>&1) || RC=$?
 if [ "$RC" -eq 0 ]; then pass
 else fail "an ordinary attach still works" "exit $RC: ${OUT:-<nothing>}"; fi
@@ -94,6 +95,14 @@ else fail "and --owner still takes" "owner reads '${OWN:-<nothing>}'"; fi
 RC=0; OUT=$("$BIN" add /bin/true --name ax_add 2>&1) || RC=$?
 if [ "$RC" -eq 0 ] && "$BIN" ls --name 2>/dev/null | grep -qx ax_add; then pass
 else fail "an ordinary add still works" "exit $RC: ${OUT:-<nothing>}"; fi
+
+# A path relative to where the command is typed, which the daemon would read against its own directory.
+mkdir -p "$SOCKETLEY_TMPD/here"
+printf '#!/bin/sh\nexec sleep 30\n' > "$SOCKETLEY_TMPD/here/tool.sh"
+chmod +x "$SOCKETLEY_TMPD/here/tool.sh"
+RC=0; OUT=$(cd "$SOCKETLEY_TMPD/here" && "$BIN" add ./tool.sh --name ax_rel 2>&1) || RC=$?
+if [ "$RC" -eq 0 ] && "$BIN" ls --name 2>/dev/null | grep -qx ax_rel; then pass
+else fail "add takes a path relative to the caller's directory" "exit $RC: ${OUT:-<nothing>}"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

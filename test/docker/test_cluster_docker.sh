@@ -204,8 +204,8 @@ assert_contains "$FILES" "api2.json" "the killed node left its file behind"
 STARTED=$SECONDS
 STALE_OUT=""
 while [ $((SECONDS - STARTED)) -lt "$STALE_DEADLINE" ]; do
-    STALE_OUT=$(dc exec -T gateway socketley cluster ls 2>&1)
-    if ! printf '%s\n' "$STALE_OUT" | grep '^api2' | grep -qv "stale"; then
+    if STALE_OUT=$(dc exec -T gateway socketley cluster ls 2>&1) &&
+       ! printf '%s\n' "$STALE_OUT" | grep '^api2' | grep -qv "stale"; then
         break
     fi
     sleep 1
@@ -313,7 +313,8 @@ dc stop -t 10 api2 >/dev/null 2>&1
 STARTED=$SECONDS
 GONE=0
 while [ $((SECONDS - STARTED)) -lt 6 ]; do
-    if ! dc exec -T gateway ls /cluster 2>/dev/null | grep -q "api2.json"; then
+    if LS_OUT=$(dc exec -T gateway ls /cluster 2>/dev/null) &&
+       ! printf '%s\n' "$LS_OUT" | grep -q "api2.json"; then
         GONE=1
         break
     fi

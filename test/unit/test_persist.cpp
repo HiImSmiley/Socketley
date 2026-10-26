@@ -29,6 +29,13 @@ std::string fresh_dir()
     return d;
 }
 
+struct dir_guard
+{
+    std::filesystem::path d;
+    explicit dir_guard(const std::string& p) : d(p) {}
+    ~dir_guard() { std::error_code ec; std::filesystem::remove_all(d, ec); }
+};
+
 std::string read(const std::string& p)
 {
     std::string out;
@@ -41,6 +48,7 @@ std::string read(const std::string& p)
 TEST_CASE("a file replaced whole holds the new bytes at the mode given, and nothing is left beside it")
 {
     const std::string d = fresh_dir(), p = d + "/f";
+    dir_guard guard(d);
     for (const auto sync : {socketley::durability::none, socketley::durability::data, socketley::durability::data_and_dir})
     {
         REQUIRE(socketley::replace_file(p, "one", sync));
@@ -54,23 +62,23 @@ TEST_CASE("a file replaced whole holds the new bytes at the mode given, and noth
     for (const auto& e : std::filesystem::directory_iterator(d))
         files += e.is_regular_file();
     CHECK(files == 1);
-    std::filesystem::remove_all(d);
 }
 
 TEST_CASE("a replace that cannot be made says which step failed, and leaves the old file as it was")
 {
     const std::string d = fresh_dir(), p = d + "/f";
+    dir_guard guard(d);
     REQUIRE(socketley::replace_file(p, "kept", socketley::durability::data));
     std::string why;
     CHECK_FALSE(socketley::replace_file(d + "/no/such/dir/f", "x", socketley::durability::data, &why));
     CHECK(why.starts_with("open failed for "));
     CHECK(read(p) == "kept");
-    std::filesystem::remove_all(d);
 }
 
 TEST_CASE("of writers racing to make one file, one wins whole and the others take it as made")
 {
     const std::string d = fresh_dir(), p = d + "/once";
+    dir_guard guard(d);
     std::atomic<int> made{0}, ok{0};
     std::vector<std::thread> ts;
     for (int i = 0; i < 8; ++i)
@@ -88,12 +96,12 @@ TEST_CASE("of writers racing to make one file, one wins whole and the others tak
     const std::string got = read(p);
     REQUIRE(got.size() == 4096);
     CHECK(got == std::string(4096, got[0]));
-    std::filesystem::remove_all(d);
 }
 
 TEST_CASE("a stamp tells a missing file, a rewrite and a replacement of the same size apart")
 {
     const std::string d = fresh_dir(), p = d + "/f";
+    dir_guard guard(d);
     const socketley::file_stamp none = socketley::file_stamp::of(p);
     CHECK_FALSE(none.exists());
     CHECK(none == socketley::file_stamp{});
@@ -109,12 +117,12 @@ TEST_CASE("a stamp tells a missing file, a rewrite and a replacement of the same
     CHECK(b.ino != a.ino);
     CHECK(b != a);
     CHECK(socketley::file_stamp::of(p) == b);
-    std::filesystem::remove_all(d);
 }
 
 TEST_CASE("a file is read whole, a missing or a too large one refused unless allowed, and a link when asked")
 {
     const std::string d = fresh_dir(), p = d + "/f";
+    dir_guard guard(d);
     std::string out, why;
     CHECK_FALSE(socketley::read_file(d + "/none", out, {}, &why));
     CHECK(why.find("No such file") != std::string::npos);
@@ -130,7 +138,6 @@ TEST_CASE("a file is read whole, a missing or a too large one refused unless all
     REQUIRE(::symlink(p.c_str(), (d + "/link").c_str()) == 0);
     CHECK(socketley::read_file(d + "/link", out));
     CHECK_FALSE(socketley::read_file(d + "/link", out, {.no_follow = true}));
-    std::filesystem::remove_all(d);
 }
 
 namespace
@@ -215,6 +222,7 @@ TEST_CASE("DEFLATE: pieces compressed apart against the 32 KiB before each are t
 TEST_CASE("tar: what is written reads back, a long name, a link, a file of several pieces, each compression")
 {
     const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("skl-tar-" + std::to_string(::getpid()));
+    dir_guard guard(dir.string());
     std::filesystem::create_directories(dir);
     std::string big(3u << 20, '\0');
     std::mt19937 rng(11);
@@ -307,5 +315,4 @@ TEST_CASE("tar: what is written reads back, a long name, a link, a file of sever
         socketley::tar_reader::entry e;
         CHECK(r.next(e, why) == socketley::tar_reader::status::bad);
     }
-    std::filesystem::remove_all(dir);
 }

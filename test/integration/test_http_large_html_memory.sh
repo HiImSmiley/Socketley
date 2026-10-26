@@ -126,26 +126,29 @@ else
         "added .bin '${BIN_PEAK:-<none>}' .html '${HTML_PEAK:-<none>}' KiB -- an unread VmRSS is not zero growth"
 fi
 
-BIN_X=$(awk -v p="${BIN_PEAK:-0}" -v f="$FILE_BYTES" 'BEGIN{printf "%.2f", p*1024/f}')
-HTML_X=$(awk -v p="${HTML_PEAK:-0}" -v f="$FILE_BYTES" 'BEGIN{printf "%.2f", p*1024/f}')
+# With either peak unread there is no ratio to judge, and the failure above stands.
+if [ -n "$BIN_PEAK" ] && [ -n "$HTML_PEAK" ]; then
+    BIN_X=$(awk -v p="${BIN_PEAK:-0}" -v f="$FILE_BYTES" 'BEGIN{printf "%.2f", p*1024/f}')
+    HTML_X=$(awk -v p="${HTML_PEAK:-0}" -v f="$FILE_BYTES" 'BEGIN{printf "%.2f", p*1024/f}')
 
-if awk -v x="$BIN_X" 'BEGIN{exit !(x < 0.25)}'; then
-    ok "the splice path holds none of the file (added ${BIN_X}x)"
-else
-    bad "a .bin is spliced and never held" \
-        "the request added ${BIN_X}x the file; splice was expected to add nothing," \
-        "so this run measured the read path for both and the .html number below" \
-        "no longer distinguishes anything"
-fi
+    if awk -v x="$BIN_X" 'BEGIN{exit !(x < 0.25)}'; then
+        ok "the splice path holds none of the file (added ${BIN_X}x)"
+    else
+        bad "a .bin is spliced and never held" \
+            "the request added ${BIN_X}x the file; splice was expected to add nothing," \
+            "so this run measured the read path for both and the .html number below" \
+            "no longer distinguishes anything"
+    fi
 
-if awk -v x="$HTML_X" 'BEGIN{exit !(x < 2.5)}'; then
-    ok "the read path holds the file once, not three times (added ${HTML_X}x)"
-else
-    bad "one large .html is one copy of itself, plus the response" \
-        "the request added ${HTML_X}x the file, over the 2.5x threshold;" \
-        "3.05x was file_buf, an injected copy and the response --- if a second" \
-        "copy is back, the script belongs in the response as a third piece" \
-        "rather than in a copy of the body"
+    if awk -v x="$HTML_X" 'BEGIN{exit !(x < 2.5)}'; then
+        ok "the read path holds the file once, not three times (added ${HTML_X}x)"
+    else
+        bad "one large .html is one copy of itself, plus the response" \
+            "the request added ${HTML_X}x the file, over the 2.5x threshold;" \
+            "3.05x was file_buf, an injected copy and the response --- if a second" \
+            "copy is back, the script belongs in the response as a third piece" \
+            "rather than in a copy of the body"
+    fi
 fi
 
 "$BIN" stop hm >/dev/null 2>&1; "$BIN" remove hm >/dev/null 2>&1

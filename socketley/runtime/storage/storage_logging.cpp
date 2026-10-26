@@ -7,14 +7,12 @@
 #include <openssl/ssl.h>
 
 #include <algorithm>
-#include <cstdlib>
 
 #include "s3_logging.h"
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
-#include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
 
 namespace socketley::storage
@@ -242,10 +240,14 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     l += c->by_acl ? "- Yes\n" : "- -\n";
 
     // Lines for one destination are held together, the date partition's source bucket being part of where they go.
+    // The prefix is length-prefixed so none can collide with another, and grants keep a source bucket's lines apart.
     std::string dest = cfg->target_bucket;
     dest += '\n';
+    dest += cfg->partitioned ? 'p' : 'n';
+    dest += std::to_string(cfg->target_prefix.size());
+    dest += '\n';
     dest += cfg->target_prefix;
-    if (cfg->partitioned)
+    if (cfg->partitioned || !cfg->grants.empty())
     {
         dest += '\n';
         dest += r.bucket;
@@ -257,8 +259,8 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
         b.target      = cfg->target_bucket;
         b.prefix      = cfg->target_prefix;
         b.partitioned = cfg->partitioned;
-        if (s3_error ignored; !logging_acl(*cfg, b.acl, ignored))
-            b.acl.clear();
+        s3_error ignored;
+        logging_acl(*cfg, b.acl, ignored);
         if (b.partitioned)
             b.prefix += std::string(owner_of(r.bucket)) + "/us-east-1/" + r.bucket + "/";
         b.since = std::chrono::steady_clock::now();

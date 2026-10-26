@@ -148,7 +148,7 @@ check("AssumeRole longer than twelve hours is refused",
 b = sts(BOB).get_session_token()["Credentials"]
 bs, bt = (b["AccessKeyId"], b["SecretAccessKey"]), b["SessionToken"]
 s3(bs, bt).create_bucket(Bucket="bobb")
-check("bob's session owns what it makes", code_of(lambda: s3(BOB).put_object(Bucket="bobb", Key="y", Body=b"y")) == "ok")
+check("bob's session owns what it makes", code_of(lambda: s3(bs, bt).put_object(Bucket="bobb", Key="y", Body=b"y")) == "ok")
 check("and may not read an admin's bucket", code_of(lambda: s3(bs, bt).get_object(Bucket="adminb", Key="k")) == "AccessDenied")
 
 # A presigned URL with a session token

@@ -126,9 +126,12 @@ uint64_t storage_run::h3_make_stream(h3::stream& st)
     sc->h3s       = &st;
     sc->quic_ssl  = h3::tls_of(st);
     sc->accepted  = sc->last_progress = sc->request_began = std::chrono::steady_clock::now();
+    // Known only when the stream says whose it is, or the default address would be taken as the client's.
     if (const sockaddr_storage* a = h3::peer_of(st))
+    {
         sc->ip = client_ip_from(reinterpret_cast<const sockaddr*>(a));
-    sc->ip_known  = true;
+        sc->ip_known = true;
+    }
     sc->peer      = h3::peer_text_of(st);
     sc->any_request = true;
     m_streams[sc->id] = sc;

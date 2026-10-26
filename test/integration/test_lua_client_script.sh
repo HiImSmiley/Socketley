@@ -175,18 +175,18 @@ create_ok "TCP client created with a script" "$BIN" create client lc_cli \
 create_ok "UDP client created with a script" "$BIN" create client lc_udpcli \
     --udp -t "127.0.0.1:$UDP_PORT" --lua "$UDPCLI_LUA" -s
 
-said 'CLI order=on_connect,on_start' 10 || true
+said '\bCLI order=on_connect,on_start' 10 || true
 said 'SRV got=' 10 || true
-said 'CLI msg=' 10 || true
+said '\bCLI msg=' 10 || true
 
 # ── 1. The callback order ──────────────────────────────────────────────────
 assert_eq "on_connect fires first, and reports one connection" \
           "CLI order=on_connect id=OK conns=1" \
-          "$(line 'CLI order=on_connect id=[0-9]+ conns=[0-9]+' | sed -E 's/id=[0-9]+/id=OK/')" \
+          "$(line '\bCLI order=on_connect id=[0-9]+ conns=[0-9]+' | sed -E 's/id=[0-9]+/id=OK/')" \
     "the id is normalised because it is a descriptor number and not a" \
     "contract; the sequence and the count are"
 assert_eq "on_start fires second" \
-          "CLI order=on_connect,on_start" "$(line 'CLI order=on_connect,on_start')" \
+          "CLI order=on_connect,on_start" "$(line '\bCLI order=on_connect,on_start')" \
     "current behaviour, pinned so that a change to it is a decision rather" \
     "than a side effect: a script that sets state up in on_start and uses it" \
     "in on_connect is broken today and would be silently fixed by a swap"
@@ -198,7 +198,7 @@ assert_eq "on_start fires second" \
 # keep state.
 assert_eq "self.name, self.type, self.protocol, and the 'client' alias" \
           "CLI ident name=lc_cli type=client proto=tcp alias=true" \
-          "$(line 'CLI ident name=[a-z_]+ type=[a-z]+ proto=[a-z]+ alias=[a-z]+')"
+          "$(line '\bCLI ident name=[a-z_]+ type=[a-z]+ proto=[a-z]+ alias=[a-z]+')"
 said 'UDPCLI ident' 10 || true
 assert_eq "self.protocol says udp on a --udp client" \
           "UDPCLI ident name=lc_udpcli type=client proto=udp alias=true" \
@@ -216,7 +216,7 @@ assert_eq "the server's message counter agrees" "1" "$(stat lc_srv total_message
     "a script, so a build whose logging works and whose plumbing does not" \
     "cannot satisfy both"
 assert_eq "on_message on the client carries the server's reply" \
-          "1" "$(hits 'CLI msg=\[REPLY-PAYLOAD-FROM-CLIENT\]' "$SOCKETLEY_DLOG")"
+          "1" "$(hits '\bCLI msg=\[REPLY-PAYLOAD-FROM-CLIENT\]' "$SOCKETLEY_DLOG")"
 
 said 'UDPSRV got=' 10 || true
 assert_eq "self.send() on a UDP client reaches the UDP server" \
@@ -230,11 +230,11 @@ assert_eq "self.connections() agrees with stats while connected" \
     "of the runtime, so the two cannot be satisfied by one wrong constant"
 
 # ── 5. on_disconnect names the connection that connected ───────────────────
-CONN_ID=$({ grep -aoE 'CLI order=on_connect id=[0-9]+' "$SOCKETLEY_DLOG" 2>/dev/null || true; } \
+CONN_ID=$({ grep -aoE '\bCLI order=on_connect id=[0-9]+' "$SOCKETLEY_DLOG" 2>/dev/null || true; } \
           | head -1 | sed 's/.*id=//')
 "$BIN" stop lc_srv >/dev/null 2>&1 || true
-said 'CLI disc id=' 10 || true
-DISC_ID=$({ grep -aoE 'CLI disc id=[0-9]+' "$SOCKETLEY_DLOG" 2>/dev/null || true; } \
+said '\bCLI disc id=' 10 || true
+DISC_ID=$({ grep -aoE '\bCLI disc id=[0-9]+' "$SOCKETLEY_DLOG" 2>/dev/null || true; } \
           | head -1 | sed 's/.*id=//')
 
 # Both operands have to exist before the comparison means anything — an

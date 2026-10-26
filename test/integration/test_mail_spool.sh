@@ -283,6 +283,8 @@ for i in 1 2 3 4 5 6; do
 done
 sleep 3
 w=$(ss -ltnpH "sport = :$P" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+check "the listener's pid is a worker of its own, not none and not the daemon" \
+    "$([ -n "$w" ] && [ -d /proc/"$w"/fd ] && [ "$w" != "${SOCKETLEY_DPID:-}" ] && echo yes || echo no)" "yes"
 check "six large messages waiting for their next try hold no descriptor of their files" \
     "$(ls -l /proc/"$w"/fd 2>/dev/null | grep -c '\.msg$')" "0"
 # A remove keeps aside mail the runtime took and still holds, and takes its users' state with it.

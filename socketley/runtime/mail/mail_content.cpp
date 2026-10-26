@@ -2,7 +2,6 @@
 
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -29,23 +28,27 @@ bool listed(std::string_view list, std::string_view ext)
         rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
         while (!one.empty() && (one.front() == ' ' || one.front() == '.'))
             one.remove_prefix(1);
+        while (!one.empty() && one.back() == ' ')
+            one.remove_suffix(1);
         if (!one.empty() && socketley::ascii::iequals(one, ext))
             return true;
     }
     return false;
 }
 
-std::string first_refused(std::string_view msg, const mime::part& p, std::string_view list, int depth)
+std::string first_refused(const mime::part& p, std::string_view list, int depth)
 {
     if (depth > 32)
         return {};
     for (const auto& c : p.children)
-        if (std::string n = first_refused(msg, c, list, depth + 1); !n.empty())
+        if (std::string n = first_refused(c, list, depth + 1); !n.empty())
             return n;
     std::string name = mime::param(p.disposition_params, "filename");
     if (name.empty())
         name = mime::param(p.params, "name");
     name = mime::decode_words(name);
+    while (!name.empty() && (name.back() == '.' || name.back() == ' '))
+        name.pop_back();
     const size_t dot = name.rfind('.');
     if (dot == std::string::npos || dot + 1 == name.size())
         return {};
@@ -55,6 +58,12 @@ std::string first_refused(std::string_view msg, const mime::part& p, std::string
 // A connection to clamd, its timeout on every read and write; -1 with why where it cannot be made.
 int clamd_connect(const std::string& where, int timeout_s, std::string& why)
 {
+    const timeval tv{timeout_s, 0};
+    const auto timed = [&](int fd)
+    {
+        if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0 ||
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0) {}
+    };
     int fd = -1;
     if (where.starts_with("/"))
     {
@@ -67,7 +76,13 @@ int clamd_connect(const std::string& where, int timeout_s, std::string& why)
         }
         std::memcpy(un.sun_path, where.c_str(), where.size() + 1);
         fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd >= 0 && ::connect(fd, reinterpret_cast<sockaddr*>(&un), sizeof un) != 0)
+        if (fd < 0)
+        {
+            why = std::string("its socket cannot be created: ") + std::strerror(errno);
+            return -1;
+        }
+        timed(fd);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&un), sizeof un) != 0)
         {
             why = std::string("it cannot be reached: ") + std::strerror(errno);
             ::close(fd);
@@ -77,16 +92,32 @@ int clamd_connect(const std::string& where, int timeout_s, std::string& why)
     else
     {
         const size_t colon = where.rfind(':');
+        if (colon == std::string::npos)
+        {
+            why = "its address has no port";
+            return -1;
+        }
+        std::string host = where.substr(0, colon);
+        if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+            host = host.substr(1, host.size() - 2);
         addrinfo hints{}, *res = nullptr;
         hints.ai_socktype = SOCK_STREAM;
-        if (::getaddrinfo(where.substr(0, colon).c_str(), where.substr(colon + 1).c_str(), &hints, &res) != 0 || !res)
+        if (::getaddrinfo(host.c_str(), where.substr(colon + 1).c_str(), &hints, &res) != 0 || !res)
         {
             why = "its address does not resolve";
             return -1;
         }
-        fd = ::socket(res->ai_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd >= 0 && ::connect(fd, res->ai_addr, res->ai_addrlen) != 0)
+        for (const addrinfo* ai = res; ai; ai = ai->ai_next)
         {
+            fd = ::socket(ai->ai_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0)
+            {
+                why = std::string("its socket cannot be created: ") + std::strerror(errno);
+                continue;
+            }
+            timed(fd);
+            if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+                break;
             why = std::string("it cannot be reached: ") + std::strerror(errno);
             ::close(fd);
             fd = -1;
@@ -95,9 +126,6 @@ int clamd_connect(const std::string& where, int timeout_s, std::string& why)
         if (fd < 0)
             return -1;
     }
-    timeval tv{timeout_s, 0};
-    if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0 ||
-        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0) {}
     return fd;
 }
 
@@ -121,7 +149,7 @@ std::string refused_attachment(std::string_view msg, std::string_view list)
 {
     if (list.empty() || list == "none")
         return {};
-    return first_refused(msg, mime::parse(msg), list, 0);
+    return first_refused(mime::parse(msg), list, 0);
 }
 
 virus_verdict clamav_scan(const std::string& where, std::string_view msg, int timeout_s)

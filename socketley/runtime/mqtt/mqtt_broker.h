@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -398,9 +397,6 @@ public:
     broker(const broker&)            = delete;
     broker& operator=(const broker&) = delete;
 
-    const broker_config& config() const { return m_cfg; }
-    void set_limits(const broker_config& cfg);
-
     // ── From the transport ──────────────────────────────────────────────────
 
     void connected(uint64_t conn, conn_info info);
@@ -452,7 +448,6 @@ public:
     void retained_each(std::string_view filter, const std::function<void(const message_ptr&)>& f) const;
 
     const broker_stats& stats() const { return m_stats; }
-    size_t connection_count() const { return m_conns.size(); }
     size_t session_count() const { return m_sessions.size(); }
     size_t connected_count() const;
     size_t subscription_count() const { return m_subs.size(); }
@@ -570,6 +565,7 @@ private:
     size_t consume(connection& c, std::string_view in);
     bool handle(connection& c, const frame& f);
     void protocol_failure(connection& c, uint8_t code, const std::string& why);
+    void refuse_connect(connection& c, uint8_t level, uint8_t code);
     void disconnect_with(connection& c, uint8_t code, const std::string& why = {});
 
     bool on_connect(connection& c, const frame& f);

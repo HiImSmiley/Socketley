@@ -9,7 +9,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 daemon_isolate httpworker
 HTTP_PORT=$((SL_PORT_BASE+391))
 PASS=0; FAIL=0; TOTAL=0
-LUA_SCRIPT="/tmp/test_http_worker.lua"
+LUA_SCRIPT="$SOCKETLEY_TMPD/test_http_worker.lua"
 
 cleanup() {
     "$BIN" stop http_svr 2>/dev/null || true

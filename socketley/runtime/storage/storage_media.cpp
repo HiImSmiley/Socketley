@@ -19,9 +19,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #include <algorithm>
@@ -140,17 +137,11 @@ int64_t mtime_ms(const struct stat& sb)
     return static_cast<int64_t>(sb.st_mtim.tv_sec) * 1000 + sb.st_mtim.tv_nsec / 1000000;
 }
 
-bool parse_uint(std::string_view s, uint64_t& v)
-{
-    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    return !s.empty() && ec == std::errc{} && end == s.data() + s.size();
-}
-
 // The sizes a variant may ask for, so that a cache holds a few of each medium and not any number.
 bool thumb_width(std::string_view v, uint64_t& w)
 {
     constexpr uint64_t allowed[] = {64, 128, 256, 320, 480, 640, 960, 1280, 1920};
-    return v.starts_with("thumb-") && parse_uint(v.substr(6), w) && std::ranges::find(allowed, w) != std::end(allowed);
+    return v.starts_with("thumb-") && parse_whole(v.substr(6), w) && std::ranges::find(allowed, w) != std::end(allowed);
 }
 
 // A stream's variant without the -a<n> that picks its sound track, and that track.
@@ -159,7 +150,7 @@ std::string_view without_track(std::string_view v, int64_t& track)
     track = 0;
     const size_t at = v.rfind("-a");
     uint64_t n = 0;
-    if (at == std::string_view::npos || !v.starts_with("hls") || !parse_uint(v.substr(at + 2), n) || n == 0 || n > 64)
+    if (at == std::string_view::npos || !v.starts_with("hls") || !parse_whole(v.substr(at + 2), n) || n == 0 || n > 64)
         return v;
     track = static_cast<int64_t>(n);
     return v.substr(0, at);
@@ -170,7 +161,7 @@ const rung* rendition_of(std::string_view v)
     int64_t track = 0;
     v = without_track(v, track);
     uint64_t h = 0;
-    if (!v.starts_with("hls-") || !parse_uint(v.substr(4), h))
+    if (!v.starts_with("hls-") || !parse_whole(v.substr(4), h))
         return nullptr;
     for (const rung& r : ladder)
         if (static_cast<uint64_t>(r.height) == h)
@@ -181,7 +172,7 @@ const rung* rendition_of(std::string_view v)
 bool sub_index(std::string_view v, int64_t& index)
 {
     uint64_t n = 0;
-    if (!v.starts_with("sub-") || !parse_uint(v.substr(4), n) || n > 1000)
+    if (!v.starts_with("sub-") || !parse_whole(v.substr(4), n) || n > 1000)
         return false;
     index = static_cast<int64_t>(n);
     return true;
@@ -198,7 +189,7 @@ bool stream_file(std::string_view f, int64_t& seg)
     if (!f.starts_with("seg") || !f.ends_with(".m4s") || f.size() != 3 + 5 + 4)
         return false;
     uint64_t n = 0;
-    if (!parse_uint(f.substr(3, 5), n))
+    if (!parse_whole(f.substr(3, 5), n))
         return false;
     seg = static_cast<int64_t>(n);
     return true;
@@ -612,8 +603,10 @@ std::string master_text(const media_probe& p, std::string_view source, std::stri
     }
     const std::string subs = p.subtitles.empty() ? "" : ",SUBTITLES=\"subs\"";
     const std::string audio = p.audio ? ",mp4a.40.2" : "";
-    std::vector<std::string> lines;
-    for (const rung* r : rungs_of(p))
+    // The first listed is where a player begins: 720p, or the largest below it, before the rest.
+    auto rungs = rungs_of(p);
+    std::stable_partition(rungs.begin(), rungs.end(), [](const rung* r) { return r->height == 720; });
+    for (const rung* r : rungs)
     {
         int64_t w = 0, h = 0;
         fitted(p, r->height, w, h);
@@ -623,15 +616,11 @@ std::string master_text(const media_probe& p, std::string_view source, std::stri
                         audio + "\"" + fps_attr(p) + subs + "\n";
         url_path(l, "hls-" + std::to_string(r->height) + a, source);
         l += "/index.m3u8" + v + "\n";
-        lines.push_back(std::move(l));
-    }
-    // The first listed is where a player begins: 720p, or the largest below it, before the rest.
-    std::stable_partition(lines.begin(), lines.end(), [&](const std::string& l) { return l.find("hls-720/") != std::string::npos; });
-    for (const std::string& l : lines)
         m += l;
+    }
     if (const std::string codecs = source_codecs(p); !codecs.empty())
     {
-        m += "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(std::max<int64_t>(p.bitrate, 1000000) * 3 / 2 + audio_kbps * 1000) +
+        m += "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(std::clamp<int64_t>(p.bitrate, 1000000, 1000000000) * 3 / 2 + audio_kbps * 1000) +
              ",RESOLUTION=" + std::to_string(p.width) + "x" + std::to_string(p.height) + ",CODECS=\"" + codecs + audio + "\"" +
              fps_attr(p) + (p.hdr() ? (p.transfer == "smpte2084" ? ",VIDEO-RANGE=PQ" : ",VIDEO-RANGE=HLG") : "") + subs + "\n";
         url_path(m, "hls-copy" + a, source);
@@ -839,7 +828,7 @@ std::vector<region> live_regions(const std::string& dir)
     {
         const std::string_view n = e->d_name;
         uint64_t from = 0;
-        if (n.ends_with(".lock") && parse_uint(n.substr(0, n.size() - 5), from))
+        if (n.ends_with(".lock") && parse_whole(n.substr(0, n.size() - 5), from))
             froms.push_back(static_cast<int64_t>(from));
     }
     ::closedir(d);
@@ -895,7 +884,7 @@ web_plan web_plan_of(const media_probe& p)
     web_plan w;
     w.rate = 12000000;
     if (p.duration > 0)
-        w.rate = std::clamp<int64_t>(static_cast<int64_t>(fits / p.duration) - 192000, 600000, w.rate);
+        w.rate = std::clamp<int64_t>(static_cast<int64_t>(std::min(fits / p.duration, 1e9)) - 192000, 600000, w.rate);
     w.lines = w.rate >= 8000000 ? 1440 : w.rate >= 2500000 ? 1080 : 720;
     // A picture every browser and chat plays is copied when it fits as it is; anything else is made H.264.
     w.copies = p.vcodec == "h264" && !p.hdr() && p.height <= w.lines && (p.bitrate == 0 || p.bitrate <= 12000000) &&
@@ -1191,8 +1180,8 @@ void storage_run::media_source(const std::shared_ptr<conn>& c, std::string_view 
     s3_request& r = c->req;
     const size_t slash = rest.find('/');
     uint64_t expires = 0;
-    if (slash == std::string_view::npos || !parse_uint(r.get_query("t"), expires) ||
-        static_cast<int64_t>(expires) * 1000 < wall::now_ms())
+    if (slash == std::string_view::npos || !parse_whole(r.get_query("t"), expires) ||
+        expires > static_cast<uint64_t>(INT64_MAX / 1000) || static_cast<int64_t>(expires) * 1000 < wall::now_ms())
     {
         app_reply(c, 403, "Access denied.\n");
         return;
@@ -1713,7 +1702,6 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
         if (oldest == m_media_jobs.size())
             return false;
         media_end_rendition(oldest, true);
-        --streams;
     }
     if ((::mkdir(w.dir.c_str(), 0700) < 0 && errno != EEXIST) || (::mkdir((w.dir + "/jobs").c_str(), 0700) < 0 && errno != EEXIST))
     {
@@ -2382,7 +2370,7 @@ void storage_run::media_evict(const std::string& keep)
         all.push_back(std::move(en));
     }
     ::closedir(d);
-    const uint64_t cap = cap_mb << 20;
+    const uint64_t cap = std::min<uint64_t>(cap_mb, UINT64_MAX >> 20) << 20;
     if (total <= cap)
         return;
     std::ranges::sort(all, {}, &entry::used_ms);
@@ -2459,8 +2447,8 @@ void storage_run::media_stop()
     m_media_jobs.clear();
     m_media_waits.clear();
     m_media_unasked.clear();
-    for (auto& [object, src] : m_media_srcs)
-        m_loop.close_fd(src.fd);
+    for (auto& entry : m_media_srcs)
+        m_loop.close_fd(entry.second.fd);
     m_media_srcs.clear();
     if (m_media_timer.armed)
         m_loop.submit_timeout_remove(&m_media_timer.req);

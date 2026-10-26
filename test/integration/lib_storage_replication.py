@@ -342,7 +342,8 @@ def mode_main(sp, dp):
 
     # The marker of img/x was not copied, which a later copy through the same queue shows.
     src.put_object(Bucket=SB, Key="docs/sentinel", Body=b"s")
-    wait_for(lambda: status(src, SB, "docs/sentinel") == "COMPLETED", 20)
+    check("the sentinel behind it is copied",
+          wait_for(lambda: status(src, SB, "docs/sentinel") == "COMPLETED", 20), status(src, SB, "docs/sentinel"))
     check("a delete marker a rule does not copy stays on the source",
           body(dst, DB, "img/x") == b"hot image" and versions(dst, DB, "img/x")[1] == [], versions(dst, DB, "img/x"))
     check("and nothing a rule does not name reached the destination",
@@ -544,7 +545,9 @@ def mode_crash(sp, dp, slow_port, data):
     check("with the same bytes", hashlib.sha256(body(dst, DB, "slow/huge")).hexdigest() ==
           hashlib.sha256(huge).hexdigest())
     src.put_object(Bucket="rsrc-slow", Key="slow/sentinel", Body=b"s")
-    wait_for(lambda: status(src, "rsrc-slow", "slow/sentinel") == "COMPLETED", 30)
+    check("the sentinel behind it is copied",
+          wait_for(lambda: status(src, "rsrc-slow", "slow/sentinel") == "COMPLETED", 30),
+          status(src, "rsrc-slow", "slow/sentinel"))
     check("a PUT never answered is on neither side",
           call(src.head_object, Bucket="rsrc-slow", Key="slow/phantom") == "404" and
           call(dst.head_object, Bucket=DB, Key="slow/phantom") == "404")
@@ -647,8 +650,9 @@ def mode_loop(sp, dp):
     # A second round trip would have to queue behind these, so a sentinel through each queue settles it.
     src.put_object(Bucket="loop-a", Key="sentinel-a", Body=b"a")
     dst.put_object(Bucket="loop-b", Key="sentinel-b", Body=b"b")
-    wait_for(lambda: status(src, "loop-a", "sentinel-a") == "COMPLETED" and
-             status(dst, "loop-b", "sentinel-b") == "COMPLETED", 20)
+    check("the sentinels through both queues are copied",
+          wait_for(lambda: status(src, "loop-a", "sentinel-a") == "COMPLETED" and
+                   status(dst, "loop-b", "sentinel-b") == "COMPLETED", 20))
     time.sleep(1)
     check("and nothing comes back: each key has its one version and one marker on both sides",
           all(versions(c, bk, k) == ([(k, False)], [(k, True)]) for c, bk in ((src, "loop-a"), (dst, "loop-b"))

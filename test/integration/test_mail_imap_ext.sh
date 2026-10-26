@@ -98,6 +98,7 @@ class C:
         out = []
         while True:
             l = self.f.readline().decode(errors="replace").rstrip("\r\n")
+            if not l: out.append("<closed>"); return out
             out.append(l)
             if l.startswith(tag + " "): return out
 a = C(); a.cmd("LOGIN alice alicepassword1")

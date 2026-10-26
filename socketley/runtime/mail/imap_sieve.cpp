@@ -108,7 +108,7 @@ void mail_run::imap_sieve(const std::string& user, const std::string& folder, st
         ctx.seen = [scripts, user = j->user, now_s = ctx.now_s](std::string_view key) {
             return scripts->seen(user, key, now_s);
         };
-        store->body(m->key, m->size, [this, j, self, store, scripts, uid, ctx = std::move(ctx), own, alive = m_alive](
+        store->body(m->key, m->size, [this, j, self, scripts, uid, ctx = std::move(ctx), own, alive = m_alive](
                                          std::shared_ptr<const std::string> bytes) mutable {
             if (!*alive)
                 return;
@@ -126,7 +126,7 @@ void mail_run::imap_sieve(const std::string& user, const std::string& folder, st
                     }
                     *out = script->run(sieve::message{*bytes, {}, {}}, ctx);
                 },
-                [this, j, self, store, uid, bytes, out, own, alive] {
+                [this, j, self, uid, bytes, out, own, alive] {
                     if (!*alive)
                         return;
                     imap_sieve_apply(j->user, j->f, uid, *bytes, *out, own);
@@ -172,9 +172,12 @@ void mail_run::imap_sieve_apply(const std::string& user, const std::shared_ptr<i
                 break;
             }
             case sieve::action::kind::fileinto:
-                if (a.arg != f->name && (a.create || !store->mailbox_id(user, a.arg).empty() ||
-                                         socketley::ascii::iequals(a.arg, "INBOX")))
+                if (a.arg != f->name && !(socketley::ascii::iequals(a.arg, "INBOX") &&
+                                          socketley::ascii::iequals(f->name, "INBOX")) &&
+                    (a.create || !store->mailbox_id(user, a.arg).empty() || socketley::ascii::iequals(a.arg, "INBOX")))
                     filed.emplace_back(a.arg, a.flags);
+                else
+                    kept = true;   // A fileinto that files nowhere leaves the message where it is.
                 break;
             case sieve::action::kind::redirect:
                 queue_message(own, {a.arg}, "Delivered-To: " + own + "\r\n" + std::string(bytes), false, {},

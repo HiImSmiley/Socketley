@@ -50,6 +50,12 @@ assert_contains "$OUT" "total_messages"
 assert_contains "$OUT" "bytes_in"
 assert_contains "$OUT" "bytes_out"
 assert_contains "$OUT" "type:server"
+for key in total_connections total_messages bytes_in; do
+    val=$(sed -n "s/^[[:space:]]*$key:[[:space:]]*//p" <<<"$OUT" | head -1)
+    TOTAL=$((TOTAL+1))
+    if [ "${val:-0}" -ge 1 ] 2>/dev/null; then PASS=$((PASS+1))
+    else FAIL=$((FAIL+1)); echo "  FAIL [$key]: expected at least 1 after a connection and a message, got '${val:-<none>}'"; fi
+done
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

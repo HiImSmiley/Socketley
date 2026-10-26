@@ -116,7 +116,6 @@ public:
     auth_verdict authorize_ui_session(std::string_view access_key, int64_t issued_ms, int64_t expires_ms,
                                       std::string_view mac_hex) override;
 
-    size_t credential_count() const { return m_creds.size(); }
     std::string display_name(std::string_view id) const override;
     uint64_t max_bytes_of(std::string_view id) const override;
     void keep_current() override { maybe_reload(); }

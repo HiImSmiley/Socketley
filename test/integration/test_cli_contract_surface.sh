@@ -91,6 +91,10 @@ else fail "help still prints help" "exit $RC, ${#OUT} bytes"; fi
        --backend ",127.0.0.1:$((P + 20))" --protocol http >/dev/null 2>&1 || true
 SHOW=$("$BIN" show cc_comma 2>/dev/null | tr -d '\n')
 case "$SHOW" in
+    *'"backends"'*) pass ;;
+    *) fail "the runtime with a leading comma shows a backends list" "show said: ${SHOW:-<nothing>}" ;;
+esac
+case "$SHOW" in
     *'"backends": ['*'""'*) fail "a leading comma is not a backend" \
                                  "show carries an empty one: $(echo "$SHOW" | grep -o '"backends":[^]]*.')" ;;
     *) pass ;;

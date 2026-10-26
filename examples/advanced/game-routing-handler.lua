@@ -74,7 +74,9 @@ function on_client_message(client_id, msg)
         for _, name in ipairs(names) do
             if name:match("^chess%-") then
                 local info = socketley.get(name)
-                table.insert(modes, name .. " (" .. info.connections .. " players)")
+                if info then
+                    table.insert(modes, name .. " (" .. info.connections .. " players)")
+                end
             end
         end
         self.send(client_id, "available: " .. table.concat(modes, ", "))

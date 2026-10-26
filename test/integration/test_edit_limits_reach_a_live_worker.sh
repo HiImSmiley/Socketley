@@ -233,7 +233,7 @@ fi
 # man/socketley.1 has an assertion behind it.
 "$BIN" edit ep --health-check tcp >/dev/null 2>&1
 EDIT_HC_RC=$?
-SHOWN_HC=$("$BIN" show ep 2>/dev/null | grep -o "\"health_check\": *[0-9]*" | head -1)
+SHOWN_HC=$("$BIN" show ep 2>/dev/null | grep -oE "\"health_check\": *1\b" | head -1)
 if [ "$EDIT_HC_RC" -eq 0 ] && [ -n "$SHOWN_HC" ]; then
     ok "--health-check is stored and waits for the next start ($SHOWN_HC)"
 else

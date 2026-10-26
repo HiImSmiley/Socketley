@@ -585,16 +585,16 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         sol::object cto = m_lua["callback_timeout_ms"];
         if (cto.valid() && cto != sol::nil)
         {
-            sol::optional<int> ms =
-                m_lua["callback_timeout_ms"].get<sol::optional<int>>();
-            if (!ms || *ms < 0)
+            const bool is_num = cto.get_type() == sol::type::number;
+            const double ms = is_num ? cto.as<double>() : -1.0;
+            if (!is_num || ms != std::floor(ms) || ms < 0.0 || ms > 4294967295.0)
             {
                 load_diag("`callback_timeout_ms` must be a millisecond count of "
                           "0 or more (0 disables the callback deadline for this "
                           "script)");
                 return false;
             }
-            m_deadline_ms = static_cast<uint32_t>(*ms);
+            m_deadline_ms = static_cast<uint32_t>(ms);
             install_deadline_hook();
         }
     }
@@ -1362,8 +1362,8 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
                      path.find_first_of(std::string_view(" \r\n\0", 4)) == std::string_view::npos;
     if (hdrs)
         (*hdrs).for_each([&](sol::object k, sol::object v) {
-            if (k.is<std::string>() && v.is<std::string>() &&
-                (!http_field_name_ok(k.as<std::string>()) || !http_field_value_ok(v.as<std::string>())))
+            if (!k.is<std::string>() || !v.is<std::string>() ||
+                !http_field_name_ok(k.as<std::string>()) || !http_field_value_ok(v.as<std::string>()))
                 fields_ok = false;
         });
     if (!fields_ok)
@@ -3290,6 +3290,18 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
             if (any)
                 return api_why("the multicast list has no entry at index 1 — "
                                "it is an array of client ids, not a keyed table");
+        }
+        else
+        {
+            size_t stray = 0;
+            ids.for_each([&](sol::object k, sol::object)
+            {
+                if (!stray && k.get_type() == sol::type::number && k.as<double>() > static_cast<double>(fds.size()))
+                    stray = fds.size() + 1;
+            });
+            if (stray)
+                return api_why("the multicast list has no entry at index " + std::to_string(stray)
+                               + " but has entries after it");
         }
         // The count, not a bool: every id was well formed, and how many still
         // name an open connection is the thing worth knowing.

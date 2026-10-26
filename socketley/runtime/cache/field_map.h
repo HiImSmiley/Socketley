@@ -52,8 +52,23 @@ public:
         }
         return *this;
     }
-    field_map(field_map&&) noexcept = default;
-    field_map& operator=(field_map&&) noexcept = default;
+    field_map(field_map&& o) noexcept
+        : m_pack(std::move(o.m_pack)), m_count(o.m_count), m_epoch(o.m_epoch), m_table(std::move(o.m_table))
+    {
+        o.m_count = 0;
+    }
+    field_map& operator=(field_map&& o) noexcept
+    {
+        if (this != &o)
+        {
+            m_pack = std::move(o.m_pack);
+            m_count = o.m_count;
+            m_epoch = o.m_epoch;
+            m_table = std::move(o.m_table);
+            o.m_count = 0;
+        }
+        return *this;
+    }
 
     size_t size()  const { return m_table ? m_table->size() : m_count; }
     bool   empty() const { return size() == 0; }
@@ -116,6 +131,13 @@ public:
     // Stores `v` under `f`; answers whether the field is new.
     bool set(std::string_view f, std::string_view v)
     {
+        // A value viewing this map's own buffer must survive the buffer moving.
+        char staged[PACK_MAX_LEN];
+        if (!m_table && !v.empty() && v.size() <= PACK_MAX_LEN)
+        {
+            std::memcpy(staged, v.data(), v.size());
+            v = std::string_view(staged, v.size());
+        }
         if (!m_table && !packs(f.size(), v.size()))
             unpack();
         if (m_table)

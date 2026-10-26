@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -40,6 +41,7 @@ int main(int argc, char** argv)
     printf("connected over websocket -- /nick /join /who /quit\n");
 
     std::atomic<bool> gone{false};
+    std::atomic<bool> quitting{false};
 
     std::thread reader([&] {
         for (;;)
@@ -48,8 +50,12 @@ int main(int argc, char** argv)
             if (msg.error || msg.is_close)
             {
                 gone = true;
+                if (quitting)
+                    return;
                 printf("server closed the connection\n");
-                return;
+                // The main thread is blocked in getline, so leave from here.
+                fflush(stdout);
+                std::_Exit(0);
             }
             if (!msg.data.empty())
             {
@@ -72,6 +78,7 @@ int main(int argc, char** argv)
             break;
     }
 
+    quitting = true;
     c.close();      // unblocks the reader's recv()
     reader.join();
     return 0;

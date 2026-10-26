@@ -449,7 +449,7 @@ const nameOf = a => a ? (a.name || a.email || '') : '';
 const who = list => (list || []).map(a => a.name ? a.name + ' <' + a.email + '>' : a.email).join(', ');
 const whoShort = list => (list || []).map(a => a.name || a.email).join(', ');
 const letter = s => (s || '?').replace(/^["'\s]+/, '').charAt(0) || '?';
-function avatar(a, cls) { const s = nameOf(a) || '?'; return el('div', { class: 'av' + (cls ? ' ' + cls : ''), style: 'background:hsl(' + hue((a && a.email) || s) + ' 52% 44%)', text: letter(s) }); }
+function avatar(a) { const s = nameOf(a) || '?'; return el('div', { class: 'av', style: 'background:hsl(' + hue((a && a.email) || s) + ' 52% 44%)', text: letter(s) }); }
 const LOC = navigator.language || 'en';
 function short(d) {
   const t = new Date(d), n = new Date();
@@ -514,7 +514,7 @@ function cleanHtml(html, images, cids) {
       if (urlish.test(n) && /^(javascript|vbscript|data:(?!image\/(png|gif|jpe?g|webp);))/i.test(v)) e.removeAttribute(a.name);
     }
     if (e.localName === 'a' && e.hasAttribute('href')) { e.setAttribute('target', '_blank'); e.setAttribute('rel', 'noopener noreferrer'); }
-    for (const at of ['src', 'background', 'poster']) {
+    for (const at of /^(image|use|feimage)$/.test(e.localName.toLowerCase()) ? ['src', 'background', 'poster', 'href', 'xlink:href'] : ['src', 'background', 'poster']) {
       const v = (e.getAttribute(at) || '').trim(); if (!v) continue;
       if (/^cid:/i.test(v)) { const u = cids[v.slice(4).replace(/^<|>$/g, '').toLowerCase()]; if (u) e.setAttribute(at, u); else e.removeAttribute(at); }
       else if (/^(https?:)?\/\//i.test(v)) { if (images) e.setAttribute(at, v.replace(/^(http:)?\/\//i, 'https://')); else { e.removeAttribute(at); blocked++; } }
@@ -1032,7 +1032,7 @@ function reply(m, all) {
   compose({
     to: who(target), cc: who(cc), subject: /^re:/i.test(m.subject || '') ? m.subject : 'Re: ' + (m.subject || ''),
     body: '\n\n' + say('On %, % wrote:', full(m.sentAt || m.receivedAt), nameOf(from) || say('someone')) + '\n' + quoted + '\n',
-    inReplyTo: m.messageId || null, references: [...(m.references || []), ...(m.messageId || [])], replyTo: m.id, identity: as && as.id
+    inReplyTo: m.messageId || null, references: [...(m.references || []), ...(m.messageId || [])], identity: as && as.id
   });
 }
 function forward(m) {
@@ -1083,7 +1083,7 @@ function compose(o = {}) {
   subj.addEventListener('input', () => { head.textContent = subj.value || say('New message'); });
   cmp = { box, to, cc, bcc, subj, body, ed, tools, fromSel, rich: false, atts: (o.attachments || []).slice(), uploading: 0, inReplyTo: o.inReplyTo || null, references: o.references || null, draft: o.draft || null, start: JSON.stringify([to.value, cc.value, bcc.value, subj.value, body.value]), atts0: (o.attachments || []).length };
   const paintAtts = () => { catts.textContent = ''; for (const a of cmp.atts) catts.append(el('span', { class: 'chip' }, ico('clip'), el('span', { text: a.name + (a.size ? ' · ' + human(a.size) : '') }), ibtn('close', say('Remove'), () => { cmp.atts = cmp.atts.filter(x => x !== a); paintAtts(); }))); };
-  cmp.paintAtts = paintAtts; paintAtts();
+  paintAtts();
   // Kept as a draft every half minute it has changed, so a closed tab or a crash loses little.
   const mine = cmp;
   mine.autosave = setInterval(() => {
@@ -1126,7 +1126,7 @@ function editorHtml(ed) {
   const walk = n => {
     for (const c of [...n.childNodes]) {
       if (c.nodeType === 3) continue;
-      if (c.nodeType !== 1 || !keep.has(c.tagName)) { c.replaceWith(...(c.nodeType === 1 && !['SCRIPT', 'STYLE'].includes(c.tagName) ? [...c.childNodes] : [])); continue; }
+      if (c.nodeType !== 1 || !keep.has(c.tagName)) { c.replaceWith(...(c.nodeType === 1 && !['SCRIPT', 'STYLE'].includes(c.tagName) ? [...c.childNodes] : [])); walk(n); return; }
       for (const a of [...c.attributes]) if (!(c.tagName === 'A' && a.name === 'href' && /^(https?:|mailto:)/i.test(a.value))) c.removeAttribute(a.name);
       walk(c);
     }
@@ -1159,7 +1159,7 @@ async function send() {
   c.sending = true; c.box.querySelector('.cfoot .btn').disabled = true;
   // Held ten seconds, the window hidden, so a message sent too soon can be taken back.
   c.box.hidden = true;
-  if (!await held(c)) { c.box.hidden = false; c.sending = false; c.box.querySelector('.cfoot .btn').disabled = false; return; }
+  if (!await held(c)) { c.box.hidden = false; c.holdUntil = null; c.sending = false; c.box.querySelector('.cfoot .btn').disabled = false; return; }
   const sent = byRole.sent;
   try {
     const res = await jmap(
@@ -1170,10 +1170,10 @@ async function send() {
     setErrors(one(res, 'd')); setErrors(one(res, 's'));
     remember(built.rcpts);
     if (c.draft) jmap(['Email/set', { accountId: acct, destroy: [c.draft] }, 'x']).catch(() => {});
-    closeCompose(true);
+    if (cmp === c) closeCompose(true);
     toast(c.holdUntil ? say('It goes %', c.holdUntil.toLocaleString(LOC, { weekday: 'short', hour: '2-digit', minute: '2-digit' })) : say('Sent'));
     await loadBoxes(); loadList(true);
-  } catch (e) { fail(e); c.sending = false; c.box.querySelector('.cfoot .btn').disabled = false; }
+  } catch (e) { fail(e); c.box.hidden = false; c.holdUntil = null; c.sending = false; c.box.querySelector('.cfoot .btn').disabled = false; }
 }
 // When a message goes: tomorrow at eight, next Monday at eight, or a time asked for.
 function sendLater(at) {
@@ -1196,14 +1196,16 @@ function held(c) {
     const bar = el('div', { class: 'toast ok holdbar' }, el('span', { text: say('Sending…') }),
       el('button', { class: 'lnk', text: say('Undo'), onclick: () => { clearTimeout(holding.t); bar.remove(); holding = null; done(false); } }));
     host().append($('#toasts')); $('#toasts').append(bar);
-    holding = { c, done, t: setTimeout(() => { bar.remove(); holding = null; done(true); }, 10000) };
+    holding = { done, t: setTimeout(() => { bar.remove(); holding = null; done(true); }, 10000) };
   });
 }
 async function saveDraft(c, quiet) {
   try {
     const built = emailOf(c);
-    const res = await jmap(['Email/set', { accountId: acct, create: { d: built.e }, destroy: c.draft ? [c.draft] : [] }, 'd']);
+    const old = c.draft;
+    const res = await jmap(['Email/set', { accountId: acct, create: { d: built.e } }, 'd']);
     setErrors(one(res, 'd'));
+    if (old) jmap(['Email/set', { accountId: acct, destroy: [old] }, 'x']).catch(() => {});
     // The window still open, the draft it now has is the one a later save replaces.
     const made = (one(res, 'd').created || {}).d;
     if (made && cmp === c) { c.draft = made.id; c.saved = JSON.stringify([c.to.value, c.cc.value, c.bcc.value, c.subj.value, bodyText(c), c.atts.length]); }
@@ -1261,7 +1263,7 @@ async function filtersEditor() {
         : r.action === 'forward' ? el('input', { class: 'inp', value: r.target || '', placeholder: 'address' }) : null;
       f.onchange = () => { r.field = f.value; }; v.oninput = () => { r.value = v.value; };
       a.onchange = () => { r.action = a.value; r.target = a.value === 'move' && folders[0] ? boxPath(folders[0]) : ''; paint(); };
-      if (t) { t.onchange = t.oninput = () => { r.target = t.value; }; if (r.action === 'move' && !r.target && folders[0]) r.target = boxPath(folders[0]); }
+      if (t) { t.onchange = t.oninput = () => { r.target = t.value; }; if (r.action === 'move' && folders[0] && !folders.some(b => boxPath(b) === r.target)) r.target = boxPath(folders[0]); }
       list.append(el('div', { class: 'rule' }, f, v, a, t, ibtn('trash', say('Remove the rule'), () => { rules.splice(i, 1); paint(); })));
     });
   };

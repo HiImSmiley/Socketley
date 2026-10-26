@@ -41,7 +41,7 @@ lua_mqtt_client::mode lua_mqtt_client::begin(lua_State* L, int)
     const bool has_cb = nargs >= 1 && lua_type(L, nargs) == LUA_TFUNCTION;
     const int logical = has_cb ? nargs - 1 : nargs;
     std::string target, topic, payload;
-    if (logical < 3 || logical > 4 || !string_at(L, 1, target) || !string_at(L, 2, topic))
+    if (logical < 3 || logical > 4 || !string_at(L, 1, target) || !string_at(L, 2, topic) || target.empty())
         return refuse(publish_usage);
     // A payload is bytes; a number is taken as the text it prints as.
     if (lua_type(L, 3) == LUA_TNUMBER || lua_type(L, 3) == LUA_TSTRING)
@@ -61,8 +61,9 @@ lua_mqtt_client::mode lua_mqtt_client::begin(lua_State* L, int)
         lua_getfield(L, 4, "qos");
         if (lua_type(L, -1) == LUA_TNUMBER)
         {
-            const lua_Integer q = lua_tointeger(L, -1);
-            if (q < 0 || q > 2)
+            // 1.5 is no level, and truncated it would publish at one nobody asked for.
+            const lua_Number q = lua_tonumber(L, -1);
+            if (q != 0 && q != 1 && q != 2)
             {
                 lua_pop(L, 1);
                 return refuse("socketley.mqtt.publish: qos is 0, 1 or 2");

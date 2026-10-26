@@ -66,7 +66,8 @@ namespace
 {
 
 // The placeholders of a rule's template filled in; a level that a name cannot hold is replaced by '_'.
-std::string expand(std::string_view tpl, const message& m, const std::vector<std::string_view>& plus, bool for_id)
+std::string expand(std::string_view tpl, const message& m, const std::vector<std::string_view>& plus, bool for_id,
+                   bool for_key = false)
 {
     std::string out;
     for (size_t i = 0; i < tpl.size(); ++i)
@@ -96,7 +97,10 @@ std::string expand(std::string_view tpl, const message& m, const std::vector<std
             continue;
         }
         for (const char c : v)
-            out += (for_id && (c == '/' || c == '?' || c == '#')) ? '_' : c;
+            out += ((for_id && (c == '/' || c == '?' || c == '#')) ||
+                    (for_key && (c == ' ' || c == '\t' || c == '\r' || c == '\n')))
+                       ? '_'
+                       : c;
         ++i;
     }
     return out;
@@ -273,6 +277,8 @@ bool route_table::parse(std::string_view text, std::string& why)
             r.kind   = target_kind::db;
             r.name   = std::string(coll);
             r.detail = std::string(path);
+            if (r.name.find("%c") != std::string::npos)
+                return refuse("%c is not put into a collection name");
             if (!placeholders_ok(r.name, 0, false, false, problem) ||
                 !placeholders_ok(r.detail, plus_count, false, false, problem))
                 return refuse(problem);
@@ -287,7 +293,9 @@ bool route_table::parse(std::string_view text, std::string& why)
             r.detail = std::string(path);
             if (!r.detail.empty() && r.detail.back() != '/')
                 r.detail += '/';
-            if (!placeholders_ok(r.detail, 0, true, false, problem))
+            if (r.name.find("%c") != std::string::npos || r.detail.find("%c") != std::string::npos)
+                return refuse("%c is not put into a storage object, which holds the messages of many clients");
+            if (!placeholders_ok(r.name, 0, false, false, problem) || !placeholders_ok(r.detail, 0, true, false, problem))
                 return refuse(problem);
         }
         else if (scheme == "server")
@@ -319,7 +327,7 @@ std::string route_table::request_for(const route& r, const message& m, const std
     {
         case target_kind::cache_stream:
         {
-            const std::string key = expand(r.name, m, plus, false);
+            const std::string key = expand(r.name, m, plus, false, true);
             const std::string qos = std::to_string(m.qos);
             const std::string_view args[] = {"xadd", key, "*", "topic", m.topic, "payload", m.payload,
                                              "qos", qos, "client", m.from_client};
@@ -331,7 +339,7 @@ std::string route_table::request_for(const route& r, const message& m, const std
         case target_kind::cache_channel:
         {
             std::string cmd(socketley::one_command_marker);
-            cmd += "publish " + expand(r.name, m, plus, false) + " ";
+            cmd += "publish " + expand(r.name, m, plus, false, true) + " ";
             cmd += m.payload;
             return cmd;
         }
@@ -505,6 +513,7 @@ void route_table::load(std::string_view bytes)
     uint32_t n = 0;
     if (!rd.u32(n))
         return;
+    std::vector<char> restored(m_routes.size(), 0);
     for (uint32_t i = 0; i < n; ++i)
     {
         std::string text, batch;
@@ -523,9 +532,11 @@ void route_table::load(std::string_view bytes)
         }
         if (!rd.bytes(batch, 64u << 20) || !rd.u64(seq))
             return;
-        for (auto& r : m_routes)
-            if (r.text == text)
+        for (size_t ri = 0; ri < m_routes.size(); ++ri)
+            if (!restored[ri] && m_routes[ri].text == text)
             {
+                restored[ri] = 1;
+                route& r = m_routes[ri];
                 r.queue = std::move(held);
                 r.next_seq = r.queue.size();
                 r.batch = std::move(batch);

@@ -235,7 +235,9 @@ bool mqtt_run::start(std::string& why)
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path(snap).parent_path(), ec);
         std::string bytes;
-        if (socketley::read_file(snap, bytes, {.missing_ok = true}, &why) && !bytes.empty())
+        if (!socketley::read_file(snap, bytes, {.missing_ok = true}, &why))
+            return false;
+        if (!bytes.empty())
         {
             socketley::bytes::reader r(bytes);
             uint32_t magic = 0;
@@ -418,6 +420,12 @@ void mqtt_run::accept_done(listener& l, struct io_uring_cqe* cqe)
                 arm_read(*raw);
             }
         }
+    }
+    // Out of descriptors, the next accept fails the same way at once: it waits a tenth of a second instead.
+    if (fd == -EMFILE || fd == -ENFILE)
+    {
+        m_accept_paused_until_ms = now_ms() + 100;
+        return;
     }
     if (!l.pending && !m_stopped && fd != -ECANCELED)
         arm_accept(l);
@@ -795,9 +803,12 @@ void mqtt_run::send_parts(uint64_t id, std::string_view head, const std::shared_
         queue_owned(*c, std::string_view(frame, static_cast<size_t>(n)));
     }
     queue_owned(*c, head);
-    const auto off = static_cast<uint32_t>(body.data() - owner->data());
-    c->queue.emplace_back(owner, off, static_cast<uint32_t>(body.size()));
-    c->owed += body.size();
+    if (!body.empty())
+    {
+        const auto off = static_cast<uint32_t>(body.data() - owner->data());
+        c->queue.emplace_back(owner, off, static_cast<uint32_t>(body.size()));
+        c->owed += body.size();
+    }
     flush(*c);
 }
 
@@ -1024,10 +1035,13 @@ void mqtt_run::on_loop_turn()
 {
     if (m_stopped)
         return;
-    if (!m_tcp.pending)
-        arm_accept(m_tcp);
-    if (m_ws.fd >= 0 && !m_ws.pending)
-        arm_accept(m_ws);
+    if (now_ms() >= m_accept_paused_until_ms)
+    {
+        if (!m_tcp.pending)
+            arm_accept(m_tcp);
+        if (m_ws.fd >= 0 && !m_ws.pending)
+            arm_accept(m_ws);
+    }
     for (auto& [id, c] : m_conns)
     {
         if (c->rearm && !c->dead)
@@ -1066,7 +1080,7 @@ void mqtt_run::tick()
     {
         // Each tick, so a file changed is taken within two seconds as documented, not three.
         m_next_files_ms = now + 1000;
-        refresh_files(false);
+        refresh_files();
     }
     if (m_routes)
         m_routes->cut_batches(now, m_owner.get_shard_index(), false);
@@ -1087,7 +1101,7 @@ void mqtt_run::tick()
     arm_tick();
 }
 
-void mqtt_run::refresh_files(bool)
+void mqtt_run::refresh_files()
 {
     std::string why;
     if (!m_users.refresh([](user_table& t, std::string_view text, std::string& w) { return t.parse(text, w); }, why))
@@ -1110,7 +1124,6 @@ void mqtt_run::persist(bool now_and_wait)
     if (m_persist_busy && !now_and_wait)
     {
         // Still writing the last one: this change waits for the next turn of the interval.
-        m_broker->take_dirty();
         m_routes_dirty = true;
         return;
     }
@@ -1624,7 +1637,9 @@ void mqtt_run::command(uint64_t ticket, std::string_view payload)
         case verb::tap_poll:
         {
             uint64_t id = 0;
-            std::from_chars(arg.data(), arg.data() + arg.size(), id);
+            if (const auto [end, ec] = std::from_chars(arg.data(), arg.data() + arg.size(), id);
+                ec != std::errc{} || end != arg.data() + arg.size())
+                id = 0;
             const auto it = m_taps.find(id);
             if (it == m_taps.end())
             {
@@ -1650,7 +1665,9 @@ void mqtt_run::command(uint64_t ticket, std::string_view payload)
         case verb::tap_close:
         {
             uint64_t id = 0;
-            std::from_chars(arg.data(), arg.data() + arg.size(), id);
+            if (const auto [end, ec] = std::from_chars(arg.data(), arg.data() + arg.size(), id);
+                ec != std::errc{} || end != arg.data() + arg.size())
+                id = 0;
             m_taps.erase(id);
             answer("closed");
             return;

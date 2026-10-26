@@ -69,6 +69,8 @@ int run(const std::vector<int>& at, const std::vector<int>& want)
         }
         _exit(0);
     }
+    if (pid < 0)
+        return -1;
     int st = 0;
     ::waitpid(pid, &st, 0);
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;

@@ -389,7 +389,7 @@ bool broker::restore(std::string_view in, std::string& why)
     for (const auto& id : ended)
         if (const auto it = m_sessions.find(id); it != m_sessions.end())
             end_session(*it->second, true);
-    m_dirty = false;
+    m_dirty = !ended.empty();
     return true;
 }
 

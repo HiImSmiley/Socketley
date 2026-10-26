@@ -26,7 +26,6 @@
 #include "mail_tls_policy.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
-#include "../../shared/net/endpoint.h"
 
 class tls_context;
 
@@ -64,7 +63,6 @@ public:
     // Each key's selector and the TXT record it is published as: the RSA and the Ed25519 key that sign, and the pair
     // --dkim-next has ready.
     std::vector<std::pair<std::string, std::string>> dkim_records() const;
-    std::string dkim_selector() const { return m_selector; }
 
     // The delays between tries, in seconds, the last repeated until the lifetime is over.
     static constexpr uint32_t retry_delays[] = {60, 300, 900, 1800, 3600, 7200, 14400, 28800};

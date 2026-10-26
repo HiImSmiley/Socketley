@@ -251,7 +251,6 @@ else
     bad "memory does not follow the body's size" \
         "RSS was ${AFTER50}kB after 50 MB and ${AFTER200}kB after 200 MB, a growth" \
         "of ${GROWTH}kB -- four times the body for barely more memory is the claim"
-    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
 fi
 
 # ─── 4. A script without the callback is unchanged, including its refusal ────

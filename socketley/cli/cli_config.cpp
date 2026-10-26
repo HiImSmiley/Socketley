@@ -52,15 +52,15 @@ std::string daemon_config_path()
 
 bool same_file(const std::string& a, const std::string& b)
 {
-    std::error_code ec1, ec2;
-    return std::filesystem::equivalent(a, b, ec1) && !ec1 && !ec2;
+    std::error_code ec;
+    return std::filesystem::equivalent(a, b, ec) && !ec;
 }
 
 // A command's words as the daemon's line, each quoted where it has to be.
-std::string line_of(const std::vector<std::string>& words, size_t from = 0)
+std::string line_of(const std::vector<std::string>& words)
 {
     std::string line;
-    for (size_t i = from; i < words.size(); ++i)
+    for (size_t i = 0; i < words.size(); ++i)
     {
         if (!line.empty())
             line += ' ';
@@ -198,7 +198,11 @@ int cli_config(int argc, char** argv)
             ipc_frame::append_arg(line, *v);
             int rc = ipc_send(line, response);
             if (rc < 0) { return ipc_report_failure(rc); }
-            if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
+            if (rc != 0)
+            {
+                std::cerr << (response.empty() ? std::string("the daemon refused it and said nothing\n") : response);
+                return rc;
+            }
         }
     }
 
@@ -304,16 +308,21 @@ int cli_config(int argc, char** argv)
             // Asked again, since a document the runtime takes in part is a setup half made.
             std::string again;
             jvalue now;
-            if (ipc_send(show_line, again) == 0 && parse(again, now))
-                if (const jvalue left = differences(want, now); !left.members.empty())
-                {
-                    std::cerr << "could not change " << e.name << ":\n  it does not take what the file says of";
-                    for (const auto& [k, v] : left.members)
-                        std::cerr << " " << k;
-                    std::cerr << "\n";
-                    ++failed;
-                    continue;
-                }
+            if (ipc_send(show_line, again) != 0 || !parse(again, now))
+            {
+                std::cerr << "could not change " << e.name << ":\n  it cannot be read back to check\n";
+                ++failed;
+                continue;
+            }
+            if (const jvalue left = differences(want, now); !left.members.empty())
+            {
+                std::cerr << "could not change " << e.name << ":\n  it does not take what the file says of";
+                for (const auto& [k, v] : left.members)
+                    std::cerr << " " << k;
+                std::cerr << "\n";
+                ++failed;
+                continue;
+            }
         }
 
         if (e.start != -1 && (e.start == 1) != running)
@@ -414,11 +423,15 @@ std::string daemon_table()
                 if (depth > 8)
                     return "{}";
                 std::map<std::string, std::string> fields;
-                for (const auto& [k, v] : o.as<sol::table>())
+                const sol::table t = o.as<sol::table>();
+                std::string items;
+                const std::string pad(4 * static_cast<size_t>(depth + 1), ' ');
+                for (size_t i = 1; i <= t.size(); ++i)
+                    items += pad + lit(t.get<sol::object>(i), depth + 1) + ",\n";
+                for (const auto& [k, v] : t)
                     if (k.get_type() == sol::type::string)
                         fields[k.as<std::string>()] = lit(v, depth + 1);
-                std::string out = "{\n";
-                const std::string pad(4 * static_cast<size_t>(depth + 1), ' ');
+                std::string out = "{\n" + items;
                 for (const auto& [k, v] : fields)
                     out += pad + k + " = " + v + ",\n";
                 return out + std::string(4 * static_cast<size_t>(depth), ' ') + "}";
@@ -562,6 +575,7 @@ int cli_export(int argc, char** argv)
     {
         std::ofstream f(dir / "runtimes" / (w.name + ".lua"));
         f << w.text;
+        f.close();
         if (!f)
         {
             std::cout << (dir / "runtimes" / (w.name + ".lua")).string() << " could not be written\n";
@@ -588,6 +602,7 @@ int cli_export(int argc, char** argv)
     {
         std::ofstream f(dir / "config.lua");
         f << top;
+        f.close();
         if (!f)
         {
             std::cout << (dir / "config.lua").string() << " could not be written\n";
@@ -607,7 +622,13 @@ int cli_export(int argc, char** argv)
     }
     std::string why;
     int differing = 0;
-    for (const lua_setup::runtime_entry& e : lua_setup::runtimes(lua, written_top, why))
+    const std::vector<lua_setup::runtime_entry> back = lua_setup::runtimes(lua, written_top, why);
+    if (!why.empty())
+    {
+        std::cout << why;
+        return 2;
+    }
+    for (const lua_setup::runtime_entry& e : back)
     {
         std::string planned, shown, line = "show ";
         ipc_frame::append_arg(line, e.name);

@@ -115,6 +115,7 @@ check "cache accepts --shards" "$rc" "0"
 
 out=$("$BIN" create client shk -t 127.0.0.1:$P_BACK --shards 4 2>&1); rc=$?
 check "client refuses --shards" "$rc" "1"
+[[ "$out" == *"not available on a client"* ]] && ok "and says why" || bad "client refusal reason: $out"
 
 # A server used to be the third, and may now shard without --lua and still may
 # not with one -- this line only keeps this file honest about which types are
@@ -125,10 +126,13 @@ check "a server with no script is no longer refused" "$rc" "0"
 
 out=$("$BIN" create proxy shbad -p $P_SPARE3 --backend 127.0.0.1:$P_BACK --shards 0 2>&1); rc=$?
 check "--shards 0 refused" "$rc" "1"
+[[ "$out" == *"invalid shard count"* ]] && ok "and says the count is invalid" || bad "--shards 0 refusal reason: $out"
 out=$("$BIN" create proxy shbad -p $P_SPARE3 --backend 127.0.0.1:$P_BACK --shards 999 2>&1); rc=$?
 check "--shards 999 refused" "$rc" "1"
+[[ "$out" == *"must be between 1 and"* ]] && ok "and says the range" || bad "--shards 999 refusal reason: $out"
 out=$("$BIN" create proxy shbad -p $P_SPARE3 --backend 127.0.0.1:$P_BACK --shards x 2>&1); rc=$?
 check "--shards with a non-number refused" "$rc" "1"
+[[ "$out" == *"invalid shard count"* ]] && ok "and says the count is invalid" || bad "--shards x refusal reason: $out"
 
 echo "== four shards, one runtime =="
 python3 "$BACKEND_PY" $P_BACK 4 >/dev/null 2>&1 &
@@ -261,6 +265,8 @@ SW=($(for p in $(pgrep -x socketley 2>/dev/null); do
 
 if [[ ${#SW[@]} -ne 2 || -z "$SD" ]]; then
     bad "stale-shard setup: daemon='$SD' shards=${#SW[@]} (expected 2)"
+    [[ -n "$SD" ]] && kill -9 "$SD" 2>/dev/null
+    for p in "${SW[@]}"; do kill -CONT $p 2>/dev/null; kill -9 $p 2>/dev/null; done
 else
     kill -STOP "${SW[0]}"
     kill -9 "$SD"

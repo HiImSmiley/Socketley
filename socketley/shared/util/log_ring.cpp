@@ -96,6 +96,8 @@ bool take(source& s)
                 keep(s.runtime, s.partial);
                 s.partial += '\n';
                 if (::write(STDERR_FILENO, s.partial.data(), s.partial.size()) < 0) {}
+                // Kept and written once, since a drain after the end asks again.
+                s.partial.clear();
             }
             return false;
         }
@@ -256,7 +258,9 @@ std::vector<entry> since(uint64_t seq, size_t max, std::string_view runtime, std
             continue;
         if (out.size() == max)
         {
-            next = out.back().seq;
+            // None asked for leaves the cursor where it was, since there is no last line to go on from.
+            if (!out.empty())
+                next = out.back().seq;
             break;
         }
         out.push_back(*it);

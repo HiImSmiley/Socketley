@@ -17,9 +17,6 @@ inline constexpr uint8_t level_31  = 3;
 inline constexpr uint8_t level_311 = 4;
 inline constexpr uint8_t level_5   = 5;
 
-// The largest Remaining Length four bytes of variable length integer carry.
-inline constexpr uint32_t max_remaining = 268'435'455;
-
 enum class packet_type : uint8_t
 {
     connect = 1, connack, publish, puback, pubrec, pubrel, pubcomp,
@@ -67,8 +64,6 @@ inline constexpr uint8_t shared_not_supported      = 0x9E;
 inline constexpr uint8_t sub_ids_not_supported     = 0xA1;
 inline constexpr uint8_t wildcards_not_supported   = 0xA2;
 }   // namespace reason
-
-const char* reason_text(uint8_t code);
 
 // The properties of a 5.0 packet; which of them a packet may carry is checked when it is read.
 struct properties
@@ -208,7 +203,6 @@ enum class frame_status : uint8_t { ok, incomplete, malformed, too_large };
 
 struct frame
 {
-    uint8_t          first{0};
     packet_type      type{packet_type::connect};
     uint8_t          flags{0};
     std::string_view body;
@@ -242,11 +236,8 @@ void write_publish(std::string& out, uint8_t level, const publish_packet& p);
 void write_ack(std::string& out, uint8_t level, const ack_packet& p);
 void write_subscribe(std::string& out, uint8_t level, const subscribe_packet& p);
 void write_suback(std::string& out, uint8_t level, const suback_packet& p);
-void write_unsubscribe(std::string& out, uint8_t level, const unsubscribe_packet& p);
-void write_pingreq(std::string& out);
 void write_pingresp(std::string& out);
 void write_disconnect(std::string& out, uint8_t level, const disconnect_packet& p);
-void write_auth(std::string& out, const auth_packet& p);
 
 // The bytes write_publish() would produce, so a sender can hold a packet to a peer's Maximum Packet Size first.
 size_t publish_size(uint8_t level, const publish_packet& p);

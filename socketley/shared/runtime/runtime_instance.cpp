@@ -83,6 +83,7 @@ void runtime_instance::start_tick_timer()
 void runtime_instance::fire_tick(int res)
 {
     if (res == -ECANCELED || !m_tick) return;
+    tick_handler* const self = m_tick;
     auto now = std::chrono::steady_clock::now();
     double dt = std::chrono::duration<double, std::milli>(now - m_tick->last).count();
     m_tick->last = now;
@@ -93,6 +94,14 @@ void runtime_instance::fire_tick(int res)
         sol::protected_function_result r = m_lua->on_tick()(dt);
         lua_diag::raised(r, get_name(), "on_tick");
 #endif
+    }
+    // A tick that stopped its own runtime let go of this handler while no completion of it is left to free it.
+    if (m_tick != self && !self->rt)
+    {
+        if (self->loop)
+            self->loop->deregister_owner(self);
+        delete self;
+        return;
     }
     if (!m_tick || !m_event_loop) return;
     uint32_t ms = m_cb_tick_ms > 0 ? m_cb_tick_ms

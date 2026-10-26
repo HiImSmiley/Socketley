@@ -92,6 +92,11 @@ sync_index::~sync_index()
 
 bool sync_index::open(std::string path, std::string_view scope, std::string& why)
 {
+    if (scope.size() > 65535)
+    {
+        why = "the sync scope is too long to index";
+        return false;
+    }
     if (m_fd >= 0)
         ::close(m_fd);
     m_fd = -1;

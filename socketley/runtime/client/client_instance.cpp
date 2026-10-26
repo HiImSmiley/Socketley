@@ -10,10 +10,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
-#include <charconv>
 #include <chrono>
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <algorithm>
@@ -696,6 +694,9 @@ bool client_instance::setup(event_loop& loop)
         m_tls = std::move(ctx);
     }
 
+    // A start is a new --reconnect budget.
+    m_reconnect_attempt = 0;
+
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     // Needs the ring, because a multishot recv selects its buffer from one.
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_enabled();
@@ -717,6 +718,8 @@ void client_instance::teardown(event_loop& loop)
     // Drain write queue
     m_write_queue.clear();
     m_write_queue_full = false;
+    m_drain_wanted = false;
+    m_drain_due = false;
 
     if (m_conn->fd >= 0)
     {
@@ -841,7 +844,6 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
             // the stream between two arms and neither sees a whole message.
             if (more)
                 return;
-            m_conn->read_pending = true;
             // Reset the request type, because leaving it as a provided-buffer
             // type makes the handler append ring buffer 0's contents and
             // return a buffer it never took.

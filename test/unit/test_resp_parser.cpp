@@ -227,7 +227,7 @@ TEST_CASE("RESP parsing — parse_message_views, the parser the runtimes call")
         std::string buf = "*9\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n"
                           "$1\r\ne\r\n$1\r\nf\r\n$1\r\ng\r\n$1\r\nh\r\n$1\r\ni\r\n";
         auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
-        CHECK(result != resp::parse_result::ok);
+        CHECK(result == resp::parse_result::too_many_args);
     }
 
     // The one shape the two parsers are known to read differently, recorded

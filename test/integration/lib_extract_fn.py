@@ -40,9 +40,20 @@ def extract(path: str, signature: str) -> str:
 
     depth, i = 0, open_brace
     while i < len(src):
-        if src[i] == '{':
+        c = src[i]
+        if src.startswith('//', i):
+            nl = src.find('\n', i)
+            i = len(src) if nl < 0 else nl
+        elif src.startswith('/*', i):
+            end = src.find('*/', i + 2)
+            i = len(src) if end < 0 else end + 1
+        elif c == '"' or (c == "'" and not src[i - 1].isalnum()):
+            i += 1
+            while i < len(src) and src[i] != c:
+                i += 2 if src[i] == '\\' else 1
+        elif c == '{':
             depth += 1
-        elif src[i] == '}':
+        elif c == '}':
             depth -= 1
             if depth == 0:
                 break

@@ -11,11 +11,6 @@
 #include <unistd.h>
 #include <optional>
 
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-
-#include <openssl/hmac.h>
-
 #include "checksum.h"
 #include "digest.h"
 #include "s3_iam.h"
@@ -86,7 +81,8 @@ uint64_t decoded_length_of(const request_view& req)
 {
     const std::string_view v = trim(req.header("x-amz-decoded-content-length"));
     uint64_t n = 0;
-    if (v.empty() || std::from_chars(v.data(), v.data() + v.size(), n).ec != std::errc{})
+    const auto r = std::from_chars(v.data(), v.data() + v.size(), n);
+    if (r.ec != std::errc{} || r.ptr != v.data() + v.size())
         return UINT64_MAX;
     return n;
 }
@@ -609,7 +605,6 @@ bool sigv4_authenticator::rebuild(std::string& err)
     auto file_users = std::move(m_file_users);
     auto roles = m_roles;
     auto logins = m_logins;
-    const auto iam_stamp = m_iam_stamp;
     m_file_users.clear();
     for (std::string& id : set.user_ids())
         m_file_users.insert(std::move(id));
@@ -619,7 +614,6 @@ bool sigv4_authenticator::rebuild(std::string& err)
         m_file_users = std::move(file_users);
         m_roles = std::move(roles);
         m_logins = std::move(logins);
-        m_iam_stamp = iam_stamp;
         err = "no credentials to serve with";
         return false;
     }
@@ -708,8 +702,7 @@ void sigv4_authenticator::add_iam(credential_set& set)
         if (!doc.empty())
             compiled(*u, doc);
         std::shared_ptr<const user_identity> done = u;
-        if (!set.add_user(done, err))
-            continue;
+        set.add_user(done, err);
         // A user who may not sign in is still one, whose buckets keep their owner and whom a share can name.
         if (tag(iam_tag_disabled) == "true")
             continue;
@@ -949,7 +942,7 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
         {
             const std::string_view part = take_item(q, '&');
             if (part.starts_with("X-Amz-Security-Token=") && !percent_decode(part.substr(21), token, false))
-                token.clear();
+                token = std::string(part.substr(21));
         }
     std::shared_ptr<const user_identity> session_user;
     bool expired = false;

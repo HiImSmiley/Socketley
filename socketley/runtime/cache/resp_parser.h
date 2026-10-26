@@ -306,8 +306,13 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
     int count = 0;
     // Digits and then the CRLF, nothing between: `*3x\r\n` read as three.
     auto [ptr, ec] = std::from_chars(data + 1, crlf, count);
-    if (ec != std::errc{} || ptr != crlf || count < 0 || count > RESP_MAX_ARRAY_SIZE)
+    // An all-digit count too big for int is a refusal like one above the cap.
+    if (ec == std::errc::result_out_of_range && ptr == crlf && data[1] >= '0' && data[1] <= '9')
+        return parse_result::too_many_args;
+    if (ec != std::errc{} || ptr != crlf || count < 0)
         return parse_result::error;
+    if (count > RESP_MAX_ARRAY_SIZE)
+        return parse_result::too_many_args;
 
     size_t offset = static_cast<size_t>(crlf - data) + 2;
 
@@ -326,6 +331,8 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
         int len = 0;
         auto [p2, e2] = std::from_chars(data + offset + 1, end_crlf, len);
         // Split, because only the first of these means the stream is lost.
+        if (e2 == std::errc::result_out_of_range && p2 == end_crlf && data[offset + 1] >= '0' && data[offset + 1] <= '9')
+            return parse_result::value_too_large;
         if (e2 != std::errc{} || p2 != end_crlf || len < 0)
             return parse_result::error;
         if (len > max_bulk)
@@ -439,6 +446,8 @@ inline parse_result parse_message_views(std::string_view buf,
             return parse_result::incomplete;
 
         auto [ptr, ec] = std::from_chars(data + 1, crlf, count);
+        if (__builtin_expect(ec == std::errc::result_out_of_range && ptr == crlf && data[1] >= '0' && data[1] <= '9', 0))
+            return parse_result::too_many_args;
         if (__builtin_expect(ec != std::errc{} || ptr != crlf || count < 0, 0))
             return parse_result::error;
         // A well-formed header asking for more elements than we hold room for
@@ -487,6 +496,8 @@ inline parse_result parse_message_views(std::string_view buf,
 
             int len = 0;
             auto [p2, e2] = std::from_chars(data + offset + 1, end_crlf, len);
+            if (__builtin_expect(e2 == std::errc::result_out_of_range && p2 == end_crlf && data[offset + 1] >= '0' && data[offset + 1] <= '9', 0))
+                return parse_result::value_too_large;
             if (__builtin_expect(e2 != std::errc{} || p2 != end_crlf || len < 0, 0))
                 return parse_result::error;
             // The same split as the other decoder above; the two paths have to

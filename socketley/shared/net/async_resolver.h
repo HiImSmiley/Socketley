@@ -51,6 +51,10 @@ public:
     {
         const std::string key = host + '\n' + std::to_string(family);
         const auto now = std::chrono::steady_clock::now();
+        // Bounded, since names come from configuration and a map of them is that small; pruned before the reference
+        // below is taken, which a prune after it could erase.
+        if (m_entries.size() >= max_entries && m_entries.find(key) == m_entries.end())
+            prune(now, fresh);
         auto& e = m_entries[key];
         if (e && e->done.load(std::memory_order_acquire))
         {
@@ -66,9 +70,6 @@ public:
         }
         if (!e)
         {
-            // Bounded, since names come from configuration and a map of them is that small.
-            if (m_entries.size() > max_entries)
-                prune(now, fresh);
             e = std::make_shared<entry>();
             e->at = now;
             e->on_loop = true;

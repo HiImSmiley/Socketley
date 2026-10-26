@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <iterator>
 
@@ -46,7 +47,7 @@ public:
                 continue;
             type  = u16(e + 2);
             count = u32(e + 4);
-            static constexpr uint64_t sizes[] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8};
+            static constexpr uint64_t sizes[] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4};
             const uint64_t size = type < std::size(sizes) ? sizes[type] * count : 0;
             at = size <= 4 ? e + 8 : u32(e + 8);
             return size > 0 && has(at, size);
@@ -224,7 +225,11 @@ bool heif_place(std::string_view file, exif_place& out)
             // Stored in the file, in one piece.
             if (method != 0 || extents != 1)
                 return false;
-            out.off = base + be_n(iloc, at + index_size, off_size);
+            const uint64_t off = be_n(iloc, at + index_size, off_size);
+            // A sum past 2^64 would wrap to a place in the file that is not the item's.
+            if (off > UINT64_MAX - base)
+                return false;
+            out.off = base + off;
             out.len = be_n(iloc, at + index_size + off_size, len_size);
             return out.len > 4;
         }

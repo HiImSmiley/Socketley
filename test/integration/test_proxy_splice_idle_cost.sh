@@ -154,7 +154,12 @@ sleep 0.6
 # The proxy's event loop, its splices and their io-wq threads are in its own worker; the daemon idles whatever
 # the proxy does, so it is the worker that is measured.
 PXPID=$("$BIN" stats spidle 2>/dev/null | sed -n 's/^pid://p')
-OUT=$(python3 - "$PX" "$IDLE" "${PXPID:-$DPID}" <<'PYEOF'
+if [ -z "$PXPID" ]; then
+    herr "the idle cost could be measured" "stats spidle printed no pid of the proxy's worker"
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"
+    exit 1
+fi
+OUT=$(python3 - "$PX" "$IDLE" "$PXPID" <<'PYEOF'
 import os, socket, sys, time
 
 px, idle_n, dpid = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])

@@ -215,7 +215,7 @@ assert_contains "$OUT" "$((SL_PORT_BASE+304))"
 assert_contains "$OUT" "$((SL_PORT_BASE+305))"
 node2 remove clst_odd >/dev/null 2>&1; node2 remove clst_zz >/dev/null 2>&1
 for _ in $(seq 1 30); do
-    node1 cluster ps 2>/dev/null | grep -q clst_ || break
+    node1 cluster ps 2>/dev/null | grep -qE 'clst_odd|clst_zz' || break
     sleep 0.5
 done
 

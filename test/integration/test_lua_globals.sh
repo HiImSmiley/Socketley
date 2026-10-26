@@ -70,6 +70,7 @@ cleanup() {
     [ -n "${HTTPD_PID:-}" ] && wait "$HTTPD_PID" 2>/dev/null
     "$BIN" stop  glob made 2>/dev/null || true
     sleep 0.3
+    [ -z "${RAW_PID:-}" ] || kill -9 "$RAW_PID" 2>/dev/null || true
     "$BIN" remove glob made 2>/dev/null || true
     daemon_stop
 }

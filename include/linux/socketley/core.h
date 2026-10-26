@@ -45,6 +45,26 @@ inline void install_signal_handlers(event_loop* loop) {
     sigaction(SIGTERM, &sa, nullptr);
 }
 
+// The handlers for as long as a start() runs its loop, and the ones before them back after, so a signal that comes
+// once the loop is gone finds no pointer to it.
+struct signal_scope {
+    event_loop* loop;
+    struct sigaction old_int{}, old_term{};
+    explicit signal_scope(event_loop* l) : loop(l) {
+        sigaction(SIGINT, nullptr, &old_int);
+        sigaction(SIGTERM, nullptr, &old_term);
+        install_signal_handlers(l);
+    }
+    ~signal_scope() {
+        sigaction(SIGINT, &old_int, nullptr);
+        sigaction(SIGTERM, &old_term, nullptr);
+        if (signal_loop_ptr() == loop)
+            signal_loop_ptr() = nullptr;
+    }
+    signal_scope(const signal_scope&) = delete;
+    signal_scope& operator=(const signal_scope&) = delete;
+};
+
 // The wrappers' cpus(<spec>) — `max`, `0-3`, `0,2,5` — applied to the loop the
 // wrapper owns, which is where an embedded runtime's affinity lives: the
 // runtime-side set_cpus() is a *request* checked against the ring, and a ring

@@ -58,7 +58,7 @@ ln -s "$WORK/outside"            "$WORK/root/dir-out"          # symlink'd direc
 "$BIN" create server esc -p $((P+1)) --http "$WORK/root" -s >/dev/null 2>&1 || true
 sleep 1.2
 
-get(){ curl -s -m 5 -o "$WORK/body" -w '%{http_code}' "http://127.0.0.1:$((P+1))$1" 2>/dev/null || echo 000; }
+get(){ curl -s --path-as-is -m 5 -o "$WORK/body" -w '%{http_code}' "http://127.0.0.1:$((P+1))$1" 2>/dev/null || echo 000; }
 
 # 1. the control: a real file inside the root IS served, or nothing below means anything
 code=$(get /ok.html)

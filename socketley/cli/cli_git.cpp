@@ -12,7 +12,6 @@
 // <work>/state.json says how the last run ended; <work>/repo.git is the clone; <work>/lock is held while one runs.
 #include <fcntl.h>
 #include <netdb.h>
-#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/file.h>
@@ -22,9 +21,7 @@
 #include <unistd.h>
 
 #include <openssl/err.h>
-#include <openssl/evp.h>
 #include <openssl/ssl.h>
-#include <openssl/x509v3.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -35,7 +32,6 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -92,8 +88,17 @@ child git_start(const std::vector<std::string>& args, bool want_stdin)
 {
     child c;
     int ip[2] = {-1, -1}, op[2] = {-1, -1};
-    if ((want_stdin && ::pipe2(ip, O_CLOEXEC) != 0) || ::pipe2(op, O_CLOEXEC) != 0)
+    if (want_stdin && ::pipe2(ip, O_CLOEXEC) != 0)
         return c;
+    if (::pipe2(op, O_CLOEXEC) != 0)
+    {
+        if (want_stdin)
+        {
+            ::close(ip[0]);
+            ::close(ip[1]);
+        }
+        return c;
+    }
     std::vector<std::string> a = {"git"};
     a.insert(a.end(), args.begin(), args.end());
     std::vector<char*> argv;
@@ -179,11 +184,6 @@ bool read_full(int fd, char* p, size_t n)
 
 // ─── the runtime's S3 API ───────────────────────────────────────────────────
 
-std::string uri_encode(std::string_view s, bool keep_slash)
-{
-    return socketley::http::url_encode(s, keep_slash);
-}
-
 struct reply
 {
     int status{0};
@@ -203,7 +203,12 @@ public:
         m_secret = s ? s : "";
         m_token = t ? t : "";
     }
-    ~s3_client() { drop(); }
+    ~s3_client()
+    {
+        drop();
+        if (m_ctx)
+            SSL_CTX_free(m_ctx);
+    }
 
     // One request; the body, when there is one, comes from `body` in pieces, `length` bytes in all.
     // `copy` names an object the new one is copied from, as x-amz-copy-source does.
@@ -211,6 +216,7 @@ public:
                  uint64_t length = 0, const std::function<bool(const std::function<bool(const char*, size_t)>&)>& body = {},
                  const std::string& copy = {})
     {
+        m_error.clear();
         for (int attempt = 0; attempt < 2; ++attempt)
         {
             if (!connected() && !connect())
@@ -219,6 +225,7 @@ public:
                 read_reply(r, method == "HEAD"))
                 return true;
             drop();
+            m_error = "the runtime at " + m_host + ":" + m_port + " dropped the request";
             // A body comes from a pipe and cannot be sent twice.
             if (body)
                 return false;
@@ -534,7 +541,7 @@ private:
             return 0;
         // Gone already, or not this user's to clear: nothing is left to take, and the run is not failed for it.
         reply head;
-        if (!m_s3.request("HEAD", "/" + uri_encode(m_o.move_from, false), "", head))
+        if (!m_s3.request("HEAD", "/" + socketley::http::url_encode(m_o.move_from, false), "", head))
             return fail(m_s3.m_error);
         if (head.status != 200)
         {
@@ -562,7 +569,7 @@ private:
         // A library that holds what other repositories wrote is refused, and kept.
         reply r;
         if (list(m_o.move_from, "", keys) && keys.empty() &&
-            m_s3.request("DELETE", "/" + uri_encode(m_o.move_from, false), "", r) && r.status == 204)
+            m_s3.request("DELETE", "/" + socketley::http::url_encode(m_o.move_from, false), "", r) && r.status == 204)
             std::cerr << "git-sync: the library " << m_o.move_from << " was empty and is gone\n";
         return 0;
     }
@@ -570,11 +577,11 @@ private:
     bool ensure_bucket()
     {
         reply r;
-        if (!m_s3.request("HEAD", "/" + uri_encode(m_o.bucket, false), "", r))
+        if (!m_s3.request("HEAD", "/" + socketley::http::url_encode(m_o.bucket, false), "", r))
             return fail(m_s3.m_error), false;
         if (r.status == 200)
             return true;
-        if (r.status == 404 && m_s3.request("PUT", "/" + uri_encode(m_o.bucket, false), "", r) && r.status == 200)
+        if (r.status == 404 && m_s3.request("PUT", "/" + socketley::http::url_encode(m_o.bucket, false), "", r) && r.status == 200)
             return true;
         fail("the library " + m_o.bucket + " cannot be written by this user (" + std::to_string(r.status) + ")");
         return false;
@@ -583,7 +590,7 @@ private:
     std::string object_path(std::string_view key) const { return object_path(m_o.bucket, key); }
     static std::string object_path(std::string_view bucket, std::string_view key)
     {
-        return "/" + uri_encode(bucket, false) + "/" + uri_encode(key, true);
+        return "/" + socketley::http::url_encode(bucket, false) + "/" + socketley::http::url_encode(key, true);
     }
 
     bool del(const std::string& key) { return del(m_o.bucket, key); }
@@ -605,10 +612,10 @@ private:
         {
             std::string q = "list-type=2";
             if (!token.empty())
-                q += "&continuation-token=" + uri_encode(token, false);
-            q += "&prefix=" + uri_encode(prefix, false);
+                q += "&continuation-token=" + socketley::http::url_encode(token, false);
+            q += "&prefix=" + socketley::http::url_encode(prefix, false);
             reply r;
-            if (!m_s3.request("GET", "/" + uri_encode(bucket, false), q, r) || r.status != 200)
+            if (!m_s3.request("GET", "/" + socketley::http::url_encode(bucket, false), q, r) || r.status != 200)
                 return false;
             for (auto& k : xml_values(r.body, "Key"))
                 keys.push_back(std::move(k));
@@ -874,7 +881,11 @@ private:
             std::ofstream w(m_o.work + "/written.tmp");
             w << m_last_commit << "\n" << m_refs;
             w.close();
-            std::filesystem::rename(m_o.work + "/written.tmp", m_o.work + "/written");
+            std::error_code rec;
+            if (!w)
+                std::filesystem::remove(m_o.work + "/written.tmp", rec);
+            else
+                std::filesystem::rename(m_o.work + "/written.tmp", m_o.work + "/written", rec);
         }
         std::ofstream s(m_o.work + "/state.json.tmp");
         s << "{\"ok\":" << (ok ? "true" : "false") << ",\"at\":" << std::time(nullptr)
@@ -883,7 +894,10 @@ private:
           << "}\n";
         s.close();
         std::error_code ec;
-        std::filesystem::rename(m_o.work + "/state.json.tmp", m_o.work + "/state.json", ec);
+        if (!s)
+            std::filesystem::remove(m_o.work + "/state.json.tmp", ec);
+        else
+            std::filesystem::rename(m_o.work + "/state.json.tmp", m_o.work + "/state.json", ec);
     }
 
     options m_o;

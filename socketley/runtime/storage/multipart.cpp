@@ -5,7 +5,6 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 
@@ -18,7 +17,6 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/base64.h"
-#include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
 
 namespace fs = std::filesystem;
@@ -551,6 +549,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
         checksum_algo algo{checksum_algo::none};
         int64_t     initiated{0};
         bool        mpu_made{false};
+        bool        dir_made{false};
         std::shared_ptr<int> dir_fd;
         std::shared_ptr<int> file_fd;
         std::shared_ptr<int> data_fd;
@@ -611,7 +610,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
     });
     ch->then([io, s](file_io::done d)
     {
-        return io->mkdirat(AT_FDCWD, s->dir, 0755, std::move(d));
+        return io->mkdirat(AT_FDCWD, s->dir, 0755, [s, d](int64_t r) { s->dir_made = r == 0; d(r); });
     });
     ch->then([io, s](file_io::done d)
     {
@@ -657,14 +656,17 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
         if (!*alive)
             return;
         --m_inflight;
-        if (r < 0)
+        const bool gone = r >= 0 && !m_store->has_bucket(s->bucket);
+        // The directory descriptor is the upload's from here.
+        const int up_dir = r >= 0 && !gone ? ::dup(*s->dir_fd) : -1;
+        if (up_dir < 0)
         {
             // Nothing was promised, so what was made is taken back where it can be: the files first, and the
             // directory once both have gone, or its removal finds them still there.
             auto left = std::make_shared<int>(1);
             auto io = m_io;
             const std::string dir = s->dir;
-            const bool had_dir = *s->dir_fd >= 0;
+            const bool had_dir = s->dir_made;
             auto one_gone = [left, io, dir, had_dir](int64_t)
             {
                 if (--*left == 0 && had_dir)
@@ -675,12 +677,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
             if (*s->data_fd >= 0 && m_io->unlinkat(AT_FDCWD, dir + "/data", 0, one_gone))
                 ++*left;
             one_gone(0);
-            s->cb(errno_st(r), {});
-            return;
-        }
-        if (!m_store->has_bucket(s->bucket))
-        {
-            s->cb(st::no_such_bucket, {});
+            s->cb(r < 0 ? errno_st(r) : gone ? st::no_such_bucket : st::io_error, {});
             return;
         }
         auto up = std::make_unique<mpu_upload>();
@@ -691,8 +688,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
         up->initiated_ms = s->initiated;
         up->algo         = s->algo;
         up->place_base   = place_base_of(s->key, s->meta, s->algo);
-        // The directory descriptor is the upload's from here.
-        up->dir_fd = ::dup(*s->dir_fd);
+        up->dir_fd       = up_dir;
         m_uploads.emplace(key_of(s->bucket, s->id), std::move(up));
         s->cb(st::ok, s->id);
     });
@@ -1445,8 +1441,10 @@ void multipart_store::assemble_pump(const std::shared_ptr<assemble_state>& a)
         };
         char* buf = a->buf[slot].get();
         const bool qr = m_io->pread(*src, buf, n, src_off,
-            [this, a, src, buf, n, dst_off, chunk_done](int64_t rn)
+            [this, alive = m_alive, a, src, buf, n, dst_off, chunk_done](int64_t rn)
             {
+                if (!*alive)
+                    return;
                 if (rn != static_cast<int64_t>(n))
                 {
                     chunk_done(rn < 0 ? rn : -EIO);
@@ -1703,7 +1701,6 @@ void multipart_store::forget(const std::string& bucket, const std::string& id)
     m_store->release_bytes(up->held);
     if (up->dir_fd >= 0)
         m_loop->close_fd(up->dir_fd);
-    up->dir_fd = -1;
     // Commits waiting behind another find the upload gone and drop their file.
     for (auto& [n, waiting] : up->lanes)
         for (auto& fn : waiting)

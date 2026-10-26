@@ -441,8 +441,12 @@ void set_detail(const char* fmt, ...)
     va_end(ap);
 }
 
+// Fixed-size so that cache_fail() can unlink it without allocating.
+char g_tmp_path[128];
+
 [[noreturn]] void cache_fail(const char* expr, const char* file, int line, const char* what)
 {
+    if (g_tmp_path[0] && ::unlink(g_tmp_path) < 0) {}
     if (g_detail[0])
         std::fprintf(stderr, "\n--- measurements ---\n  %s\n", g_detail);
     print_program();
@@ -935,7 +939,7 @@ void verify_model(world& w, bool evict_possible)
         const bool ttl_ok = (e.ttl == TTL_NONE)  ? (ttl == -1 && pttl == -1)
                           : (e.ttl == TTL_LONG)  ? (ttl > 0 && ttl <= TTL_LONG_S
                                                     && pttl > 0 && pttl <= TTL_LONG_MS)
-                                                 : (ttl <= 0);
+                                                 : (ttl != -1 && ttl <= 0);
         if (!ttl_ok)
         {
             set_detail("key %d (%zu bytes of '%c'), type %.*s: the model set %s, the store reports "
@@ -1701,6 +1705,7 @@ bool run_step(world& w, const step& s)
         }
         case OP_PERSIST:
         {
+            model_expire(w, ki);   // persist() calls check_expiry() first, so an elapsed key is gone, not revived
             const bool had = (e.type != T_NONE && e.ttl != TTL_NONE);
             const bool ok  = w.store.persist(k);
             CACHE_CHECK(ok == had, "persist() disagrees with the model about whether a TTL was set");
@@ -1719,6 +1724,7 @@ bool run_step(world& w, const step& s)
         case OP_LPUSH:
         case OP_RPUSH:
         {
+            w.store.check_expiry(k);
             model_expire(w, ki);   // push() calls check_expiry() first
             if ((e.type == T_LIST && e.list.size() >= MAX_ELEMS) || avoid_collection_uaf(w))
                 return true;
@@ -1778,6 +1784,7 @@ bool run_step(world& w, const step& s)
 
         case OP_SADD:
         {
+            w.store.check_expiry(k);
             model_expire(w, ki);   // sadd() calls check_expiry() first
             if ((e.type == T_SET && e.members.size() >= MAX_ELEMS && e.members.count(mem) == 0)
                 || avoid_collection_uaf(w))
@@ -1833,6 +1840,7 @@ bool run_step(world& w, const step& s)
 
         case OP_HSET:
         {
+            w.store.check_expiry(k);
             model_expire(w, ki);   // hset() calls check_expiry() first
             if ((e.type == T_HASH && e.fields.size() >= MAX_ELEMS && e.fields.count(mem) == 0)
                 || avoid_collection_uaf(w))
@@ -1884,6 +1892,7 @@ bool run_step(world& w, const step& s)
         case OP_ZADD:
         case OP_ZINCRBY:
         {
+            w.store.check_expiry(k);
             model_expire(w, ki);   // both call check_expiry() first
             const bool   had   = (e.type == T_ZSET && e.zmembers.count(mem) != 0);
             if ((e.type == T_ZSET && !had && e.zmembers.size() >= MAX_ELEMS) || avoid_collection_uaf(w))
@@ -2049,6 +2058,8 @@ bool run_step(world& w, const step& s)
         {
             const int          kj = s.b % NKEYS;
             const std::string& k2 = key_str(kj);
+            w.store.check_expiry(k);
+            w.store.check_expiry(k2);
             model_expire(w, ki);   // lmove() expires both itself
             model_expire(w, kj);
             shadow_entry& e2 = w.sh[kj];
@@ -2170,6 +2181,7 @@ bool run_step(world& w, const step& s)
 
         case OP_LINSERT:
         {
+            w.store.check_expiry(k);
             model_expire(w, ki);
             if ((e.type == T_LIST && e.list.size() >= MAX_ELEMS) || avoid_collection_uaf(w))
                 return true;
@@ -2494,6 +2506,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         std::snprintf(buf, sizeof(buf), "/dev/shm/socketley-fuzz-cache-%d.bin",
                       static_cast<int>(::getpid()));
         w.tmp_path = buf;
+        std::snprintf(g_tmp_path, sizeof(g_tmp_path), "%s", buf);
     }
 
     size_t off = 0;
@@ -2512,6 +2525,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     }
 
     if (::unlink(w.tmp_path.c_str()) < 0) {}
+    g_tmp_path[0] = '\0';
     ::fuzz::set_current(nullptr, 0);
     return 0;
 }

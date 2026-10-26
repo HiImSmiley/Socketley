@@ -274,6 +274,12 @@ bool acl_from_request(const acl_request& rq, bool bucket, const std::string& own
             grant(out, w, std::move(id), perms[i]);
         }
     }
+    // Headers of separators alone name nobody, and taken as they are they would leave a resource no one may reach.
+    if (out.grants.empty())
+    {
+        err = fail("InvalidArgument");
+        return false;
+    }
     return true;
 }
 

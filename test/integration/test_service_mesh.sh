@@ -300,7 +300,8 @@ RC=0; OUT=$("$BIN" edit sidecar_proxy --circuit-threshold 10 --retry 3 2>&1) || 
 assert_ok "$RC" "edit mesh flags" "$OUT"
 
 OUT=$("$BIN" show sidecar_proxy 2>&1)    || daemon_required "show sidecar_proxy"
-assert_contains "$OUT" "circuit_threshold"
+assert_contains "$OUT" '"circuit_threshold": 10'
+assert_contains "$OUT" '"retry_count": 3'
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

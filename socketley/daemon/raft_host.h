@@ -200,6 +200,7 @@ private:
     bool        m_tick_armed = false;
     clock::time_point m_last_tick{};
     uint64_t    m_ticks = 0;
+    uint64_t    m_join_tried = 0;
 
     io_request  m_pump_req{};
     bool        m_pump_armed = false;

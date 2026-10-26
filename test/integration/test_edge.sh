@@ -94,7 +94,12 @@ qd() { dig @127.0.0.1 -p "$DNS" +time=2 +tries=1 +short "$@" 2>&1; }
 got=""
 for _ in $(seq 1 40); do got=$(qd ui.example.com A); [ -n "$got" ] && break; sleep 0.2; done
 mine=$(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-if [ -n "$got" ]; then
+# The same blocks the runtime leaves out: private, shared, loopback, link-local and multicast IPv4.
+pub4=$(ip -o -4 addr show up scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | awk -F. \
+    '$1==10||$1==127||$1==0||($1==172&&$2>=16&&$2<=31)||($1==192&&$2==168)||($1==169&&$2==254)||($1==100&&$2>=64&&$2<=127)||$1>=224{next} {print}')
+if [ -z "$got" ] && [ -n "$pub4" ]; then
+    bad "this machine's address" "the dns runtime gave no answer for ui.example.com A within 8 s, and this machine has: $(echo $mine)"
+elif [ -n "$got" ]; then
     case " $(echo $mine) " in *" $got "*) ok "with --proxy and no --publish, a name is answered with this machine's address ($got)" ;;
         *) bad "this machine's address" "answered $got; this machine has: $(echo $mine)" ;; esac
 else

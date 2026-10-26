@@ -54,7 +54,6 @@ public:
     // The records the writer has added up to `end` of the journal `journal` names; false when it has since begun
     // another, which follow_open() then reads whole.
     bool follow(uint64_t journal, uint64_t end);
-    bool following() const { return m_following; }
     void close();
 
     // The journal written, by its inode, which a compaction changes; and its length, which every change grows.

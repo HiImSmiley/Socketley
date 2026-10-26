@@ -107,6 +107,20 @@ TEST_CASE("zlib's streams at every level open byte for byte")
         }
 }
 
+TEST_CASE("hand-made stored and fixed blocks open without zlib")
+{
+    // A fixed-Huffman block holding "hello", as zlib writes it.
+    const std::string fixed("\xcb\x48\xcd\xc9\xc9\x07\x00", 7);
+    // Two stored blocks, the first not final.
+    const std::string stored("\x00\x02\x00\xfd\xffhe\x01\x03\x00\xfc\xffllo", 15);
+    for (const size_t step : {size_t{1}, size_t{2}, size_t{100}})
+        for (const size_t cap : {size_t{1}, size_t{3}, size_t{1024}})
+        {
+            CHECK(open(fixed, step, cap) == "hello");
+            CHECK(open(stored, step, cap) == "hello");
+        }
+}
+
 TEST_CASE("a stream ends at its final block, and what follows it is not read as more")
 {
     zlib z;

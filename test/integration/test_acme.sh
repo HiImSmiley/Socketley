@@ -90,6 +90,7 @@ check "the challenge's answer was left behind by nobody" "$(ls "$HOME/.local/sha
 CERT=$(find "$HOME/.local/share/socketley" -path '*www.socketley.test/fullchain.pem' | head -1)
 KEY="${CERT%fullchain.pem}key.pem"
 check "it is kept where --acme puts it" "$([ -s "$CERT" ] && [ -s "$KEY" ] && echo yes)" yes
+[ -n "$CERT" ] || { echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; echo "  FAILED"; exit 1; }
 serial() { echo | openssl s_client -connect "127.0.0.1:$P_TLS" -servername www.socketley.test 2>/dev/null | openssl x509 -noout -serial 2>/dev/null; }
 before=$(serial)
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$T/k2.pem" -out "$T/c2.pem" -days 2 \
@@ -117,7 +118,7 @@ check "and says nothing" "$(cat "$T/hand.out")" ""
 check "TLS-ALPN-01 is answered by a running TLS listener" \
       "$(openssl x509 -noout -ext subjectAltName -in "$T/alpn.pem" 2>/dev/null | grep -o 'DNS:[a-z.]*')" DNS:alpn.socketley.test
 CHALLENGES="$(dirname "$(dirname "$CERT")")/challenges"
-check "and its challenge certificate is gone after" "$([ -d "$CHALLENGES" ] && ls "$CHALLENGES" | grep -c tls-alpn)" 0
+check "and its challenge certificate is gone after" "$(ls "$CHALLENGES" 2>/dev/null | grep -c tls-alpn)" 0
 check "and acme-tls/1 is spoken no more once it is gone" \
       "$(echo | openssl s_client -connect 127.0.0.1:$P_TLS -servername alpn.socketley.test -alpn acme-tls/1 2>/dev/null | grep -c 'ALPN protocol: acme-tls/1')" 0
 

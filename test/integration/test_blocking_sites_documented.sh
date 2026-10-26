@@ -76,6 +76,8 @@ still_there "the resolver on a client's first dial" \
             'lookup_now\(' runtime/client/client_instance.cpp
 still_there "the journal writes from the loop" \
             'journal_flush_now|m_journal\.flush' runtime/cache/cache_instance.cpp
+still_there "the cache syncs its snapshot at teardown" \
+            'fsync\(' runtime/cache/cache_store.cpp
 # The state file is named as written off the loop, which holds while its writer is a thread.
 if grep -qE 'std::thread\(&state_persistence::writer_loop' "$SRC/shared/persist/state_persistence.cpp"; then pass
 else fail "the state file is written off the loop" "the section says a thread writes it and the source no longer does"; fi

@@ -433,7 +433,7 @@ def mode_main(port, data):
     # The first sixteen hex digits of an id are its version's order, so newest first is descending.
     seqs = [v[:16] for v in listed]
     check("and newest first, the latest being the one GET reads",
-          seqs == sorted(seqs, reverse=True) and len(set(seqs)) == len(seqs) and h.get("x-amz-version-id") == listed[0],
+          seqs == sorted(seqs, reverse=True) and len(set(seqs)) == len(seqs) and bool(listed) and h.get("x-amz-version-id") == listed[0],
           (listed[:4], h.get("x-amz-version-id")))
     expect["race"] = [(e[2], e[4]) for e in p["entries"]] if p else None
 

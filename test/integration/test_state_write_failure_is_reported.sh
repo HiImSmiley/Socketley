@@ -89,7 +89,7 @@ if [ "$((AFTER - BEFORE))" -ge 1 ]; then ok; else
     bad "the failure is reported at all" \
         "no new 'state file' line in the daemon log after a refused write"; fi
 
-LINE=$(grep "state file" "$SOCKETLEY_DLOG" | tail -1)
+LINE=$(grep "state file" "$SOCKETLEY_DLOG" | tail -1 || true)
 case "$LINE" in
     *"sw_ro.json"*) ok ;;
     *) bad "the line names the file" "got '${LINE:-<nothing>}'" ;;

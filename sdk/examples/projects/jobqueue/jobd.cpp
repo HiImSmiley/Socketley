@@ -28,7 +28,6 @@
 #include <socketley/runtime/cache.h>
 
 #include <atomic>
-#include <csignal>
 #include <cstdio>
 #include <string>
 

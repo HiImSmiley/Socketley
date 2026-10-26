@@ -7,6 +7,8 @@
 #include "lua_json.h"
 #include "../json/json_escape.h"
 
+#include <cmath>
+
 namespace
 {
 
@@ -83,9 +85,18 @@ lua_db_client::mode lua_db_client::begin(lua_State* L, int tag)
             return true;
         if (lua_type(L, idx) != LUA_TTABLE)
             return false;
+        // A version that is no whole count is refused, or the write would go through without its condition.
         lua_getfield(L, idx, "if");
-        if (lua_type(L, -1) == LUA_TNUMBER)
-            if_match = std::to_string(static_cast<uint64_t>(lua_tonumber(L, -1)));
+        if (lua_type(L, -1) != LUA_TNIL)
+        {
+            const double d = lua_type(L, -1) == LUA_TNUMBER ? lua_tonumber(L, -1) : -1.0;
+            if (!(d >= 0.0) || d != std::floor(d) || d >= 9007199254740992.0)
+            {
+                lua_pop(L, 1);
+                return false;
+            }
+            if_match = std::to_string(static_cast<uint64_t>(d));
+        }
         lua_pop(L, 1);
         lua_getfield(L, idx, "if_absent");
         if (lua_toboolean(L, -1))

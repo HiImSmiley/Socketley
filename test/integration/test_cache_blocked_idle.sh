@@ -36,6 +36,17 @@ redis-cli -p "$PORT" blpop jobs 0 >"$OUT" 2>&1 &
 WAITER=$!
 sleep 1
 
+if [ -z "$W" ] || [ ! -r "/proc/$W/status" ]; then
+    bad "no worker process found under the daemon to count wakeups of"
+    echo " Summary: $PASS passed, $FAIL failed"
+    exit 1
+fi
+if ! kill -0 "$WAITER" 2>/dev/null; then
+    bad "the BLPOP waiter is not parked: $(cat "$OUT")"
+    echo " Summary: $PASS passed, $FAIL failed"
+    exit 1
+fi
+
 WINDOW=10
 C0=$(vctx "$W")
 sleep "$WINDOW"

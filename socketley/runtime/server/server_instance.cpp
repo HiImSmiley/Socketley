@@ -34,6 +34,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <charconv>
+#include <limits>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -272,6 +273,10 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
                            conn->splice_remaining || conn->splice_pipe[0] >= 0))
         splice_cleanup(conn.get());
 
+    // A stream parked when the client went away still holds its file.
+    if (SOCKETLEY_UNLIKELY(conn->stream_fd >= 0))
+        stream_file_cleanup(conn.get());
+
     // Normally already done by release_conn(), which is where the slot is given
     // up; this covers reap_retired(), which reaches the pool directly.
     release_fixed_slot(conn.get());
@@ -299,7 +304,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     // Unpipe: clear peer's back-pointer
     if (conn->pipe_peer_fd >= 0)
     {
-        auto* peer = (conn->pipe_peer_fd >= 0 && conn->pipe_peer_fd < MAX_FDS)
+        auto* peer = (conn->pipe_peer_fd < MAX_FDS)
             ? m_conn_idx[conn->pipe_peer_fd] : nullptr;
         if (peer && peer->pipe_peer_fd == conn->fd)
             peer->pipe_peer_fd = -1;
@@ -548,12 +553,6 @@ std::string_view server_instance::get_master_pw() const
     return m_master_pw;
 }
 
-
-int server_instance::get_master_fd() const
-{
-    return m_master_fd;
-}
-
 void server_instance::set_http_dir(std::string_view path)
 {
     m_http_dir = std::filesystem::path(path);
@@ -582,6 +581,9 @@ bool server_instance::add_upstream_target(std::string_view addr)
     upstream_target t;
     t.address = std::string(addr);
     auto colon = addr.rfind(':');
+    // Upstreams dial IPv4 only, so an address with a second colon can never connect.
+    if (colon != std::string_view::npos && addr.find(':') != colon)
+        return false;
     if (colon != std::string_view::npos)
     {
         t.resolved_host = std::string(addr.substr(0, colon));
@@ -662,33 +664,11 @@ static size_t ws_inject_offset(std::string_view content)
 static std::string inject_ws_script(std::string_view content)
 {
     std::string result(content);
-
-    // Try </head> first
-    auto pos = result.find("</head>");
-    if (pos == std::string::npos)
-        pos = result.find("</HEAD>");
-    if (pos != std::string::npos)
-    {
-        result.insert(pos, WS_INJECT_SCRIPT);
-        return result;
-    }
-
-    // Try </body>
-    pos = result.find("</body>");
-    if (pos == std::string::npos)
-        pos = result.find("</BODY>");
-    if (pos != std::string::npos)
-    {
-        result.insert(pos, WS_INJECT_SCRIPT);
-        return result;
-    }
-
-    // Append at end
-    result.append(WS_INJECT_SCRIPT);
+    result.insert(ws_inject_offset(content), WS_INJECT_SCRIPT);
     return result;
 }
 
-static std::string build_http_response(std::string_view content_type, std::string_view body, bool keep_alive = false)
+static std::string build_http_response(std::string_view content_type, std::string_view body, bool keep_alive)
 {
     std::string resp;
     resp.reserve(128 + body.size());
@@ -827,7 +807,7 @@ static bool http_request_keep_alive(const http_request& req)
     return req.version.find("1.1") != std::string_view::npos;
 }
 
-static const std::shared_ptr<const std::string>& http_404_response(bool keep_alive = false)
+static const std::shared_ptr<const std::string>& http_404_response(bool keep_alive)
 {
     static const auto resp_close = std::make_shared<const std::string>(
         "HTTP/1.1 404 Not Found\r\n"
@@ -1023,6 +1003,7 @@ void server_instance::rebuild_http_cache()
         // same openat2(RESOLVE_BENEATH) -- where a symlink to /etc/shadow was
         // read into memory here and served -- with the canonical prefix test
         // kept for a kernel without it.
+        int cfd = -1;
         {
             bool beneath = false;
             bool asked = false;
@@ -1035,7 +1016,7 @@ void server_instance::rebuild_http_cache()
                                          &how, sizeof(how));
                 if (r >= 0)
                 {
-                    ::close(static_cast<int>(r));
+                    cfd = static_cast<int>(r);
                     beneath = asked = true;
                 }
                 else if (errno != ENOSYS)
@@ -1053,12 +1034,27 @@ void server_instance::rebuild_http_cache()
                 continue;
         }
 
-        // Read file content
-        std::ifstream f(entry.path(), std::ios::binary);
-        if (!f.is_open())
-            continue;
-        std::string content((std::istreambuf_iterator<char>(f)),
-                             std::istreambuf_iterator<char>());
+        // Read through the descriptor that was checked, because opening the path again reads whatever it names by then.
+        std::string content;
+        if (cfd >= 0)
+        {
+            char rbuf[65536];
+            ssize_t n;
+            while ((n = ::read(cfd, rbuf, sizeof(rbuf))) > 0 || (n < 0 && errno == EINTR))
+                if (n > 0)
+                    content.append(rbuf, static_cast<size_t>(n));
+            ::close(cfd);
+            if (n < 0)
+                continue;
+        }
+        else
+        {
+            std::ifstream f(entry.path(), std::ios::binary);
+            if (!f.is_open())
+                continue;
+            content.assign((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+        }
 
         // Detect content type
         std::string ext = entry.path().extension().string();
@@ -1210,7 +1206,11 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         url_path = owned;
     }
 
-    if (http_hidden_path(url_path))
+    // A decoded %3F can leave the root only after the query strip.
+    if (url_path == "/")
+        url_path = "/index.html";
+
+    if (url_path.empty() || http_hidden_path(url_path))
     {
         queue_http_response(conn, http_404_response(conn->http_keep_alive));
         if (!conn->http_keep_alive)
@@ -1900,6 +1900,9 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
                 }
 
                 int status = resp_tbl.get_or("status", 200);
+                // Clamped before the reason is looked up, so "500" is not sent with the text of a code that does not exist.
+                if (status < 100 || status > 999)
+                    status = 500;
                 // Read out of the string body_obj anchors in the registry, so
                 // the response below is the only copy of it.
                 const std::string_view body = lua_field_present(body_obj)
@@ -2265,7 +2268,11 @@ bool server_instance::setup(event_loop& loop)
     // Internal-only server, where a listen path is a listener, so a runtime
     // that has one is not this case however its owner is set.
     if (listen_path.empty() && get_port() == 0 && !get_owner().empty())
+    {
+        // Dialled all the same, because an upstream is no business of the listener.
+        start_upstreams();
         return true;
+    }
 
     uint16_t port = get_port();
     if (port == 0)
@@ -2381,7 +2388,6 @@ bool server_instance::setup(event_loop& loop)
     // Multishot accept where supported, but not direct descriptors, because
     // cqe->res would be a fixed index and setsockopt and getpeername need a
     // real fd.
-    m_direct_accept = false;
     m_multishot_active = event_loop::supports_multishot_accept();
 
     // The old accept chain keeps its request and this run takes a fresh one,
@@ -3218,7 +3224,8 @@ uint64_t server_instance::auth_peer_key(int fd)
         // One holder of an IPv6 network has its whole /64.
         uint64_t net = 0;
         std::memcpy(&net, a.s6_addr, 8);
-        return net | (uint64_t{1} << 63);
+        // An odd multiplier is a bijection, so no two /64s share a key and a /64 lands in the IPv4 or uid range only by 2^-31 chance.
+        return net * 0x9E3779B97F4A7C15ull;
     }
     if (peer.ss_family == AF_UNIX)
     {
@@ -3774,6 +3781,9 @@ void server_instance::handle_file_stream(struct io_uring_cqe* cqe, server_connec
         conn->proto = proto_unknown;
         if (!conn->read_pending && !arm_conn_read(conn))
             return;
+        // A send refused for backlog above has closed it, and a pipelined request must not run on it.
+        if (conn->closing)
+            return;
         // Last statement, for the reason the splice arm gives: parse_partial()
         // can start the next response on this connection.
         parse_partial(conn);
@@ -4009,6 +4019,14 @@ bool server_instance::end_chunked_response(server_connection* conn)
     return taken;
 }
 
+// RESP2 wire protocol: starts with '*N', '$N', or '+A-Za-z'.
+static bool resp2_starts(char c0, char c1)
+{
+    return (c0 == '*' && c1 >= '0' && c1 <= '9') ||
+           (c0 == '$' && c1 >= '0' && c1 <= '9') ||
+           (c0 == '+' && ((c1 >= 'A' && c1 <= 'Z') || (c1 >= 'a' && c1 <= 'z')));
+}
+
 void server_instance::parse_partial(server_connection* conn)
 {
 reparse:
@@ -4057,21 +4075,14 @@ reparse:
 
             const char s0 = conn->partial[0];
             const char s1 = conn->partial.size() > 1 ? conn->partial[1] : '\0';
-            const bool resp =
-                (s0 == '*' && s1 >= '0' && s1 <= '9') ||
-                (s0 == '$' && s1 >= '0' && s1 <= '9') ||
-                (s0 == '+' && ((s1 >= 'A' && s1 <= 'Z') || (s1 >= 'a' && s1 <= 'z')));
-            conn->proto = resp ? proto_resp : proto_tcp;
+            conn->proto = resp2_starts(s0, s1) ? proto_resp : proto_tcp;
         }
         else
         {
         char c0 = conn->partial[0], c1 = conn->partial[1];
         char c2 = conn->partial[2], c3 = conn->partial[3];
 
-        // RESP2 wire protocol: starts with '*N', '$N', or '+A-Za-z'
-        if ((c0 == '*' && c1 >= '0' && c1 <= '9') ||
-            (c0 == '$' && c1 >= '0' && c1 <= '9') ||
-            (c0 == '+' && ((c1 >= 'A' && c1 <= 'Z') || (c1 >= 'a' && c1 <= 'z'))))
+        if (resp2_starts(c0, c1))
         {
             conn->proto = proto_resp;
         }
@@ -4326,6 +4337,10 @@ reparse:
 
     if (conn->proto == proto_ws)
     {
+        // on_websocket may have disconnected this client, and frames buffered behind its upgrade belong to a conversation that is over.
+        if (conn->closing)
+            return;
+
         // Parse WebSocket frames with fragment reassembly (RFC 6455 §5.4)
         // Fragments are compacted in-place at partial[0..ws_frag_len) — zero heap allocs.
         ws_frame_view frame;
@@ -4561,7 +4576,7 @@ reparse:
 
         if (sp1 == std::string_view::npos || sp2 == std::string_view::npos)
         {
-            conn->closing = true;
+            refuse_http_request(conn, http_400_response());
             return;
         }
 
@@ -6509,6 +6524,9 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
                     conn->write_batch[i].clear();
                 conn->write_batch_count = 0;
                 conn->closing = true;
+                // This completion was the last thing that would have ended it.
+                if (!conn_ops_pending(conn))
+                    close_conn(conn);
             }
             return;
         }
@@ -6619,7 +6637,11 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         conn->file_size = 0;
         queue_http_response(conn, http_404_response(conn->http_keep_alive));
         if (!conn->http_keep_alive)
+        {
             conn->closing = true;
+            if (!conn_ops_pending(conn))
+                close_conn(conn);
+        }
         else
         {
             conn->proto = proto_unknown;
@@ -6652,6 +6674,9 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         conn->file_url_path.clear();
         queue_http_response(conn, http_500_response());
         conn->closing = true;
+        // An answer sent directly leaves no write completion to end this.
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
         return;
     }
 
@@ -6774,8 +6799,10 @@ void server_instance::handle_splice_in(struct io_uring_cqe* cqe, server_connecti
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || conn->closing))
     {
+        // A failed splice leaves a promised length unsent, so the connection goes.
+        conn->closing = true;
         splice_cleanup(conn);
-        if (conn->closing && !conn_ops_pending(conn))
+        if (!conn_ops_pending(conn))
             close_conn(conn);
         return;
     }
@@ -6806,8 +6833,10 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || conn->closing))
     {
+        // A failed splice leaves a promised length unsent, so the connection goes.
+        conn->closing = true;
         splice_cleanup(conn);
-        if (conn->closing && !conn_ops_pending(conn))
+        if (!conn_ops_pending(conn))
             close_conn(conn);
         return;
     }
@@ -6860,6 +6889,9 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
         // splice_cleanup() has just cleared the last splice flag, so this is the
         // write completion for the file path: same moment, same reasoning.
         maybe_shutdown_write(conn);
+        // Nothing else armed means the shutdown could not arm a read to wait on the peer.
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
     }
     else
     {
@@ -7548,7 +7580,8 @@ int server_instance::alloc_handle()
     {
         if (m_next_handle < conn_handle_base)
             m_next_handle = conn_handle_base;
-        const int h = m_next_handle++;
+        const int h = m_next_handle;
+        m_next_handle = h == std::numeric_limits<int>::max() ? conn_handle_base : h + 1;
         if (m_forwarded.find(h) == m_forwarded.end())
             return h;
     }
@@ -8032,6 +8065,7 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
     uc->fd = fd;
     uc->connected = true;
     uc->closing = false;
+    uc->closed_for_backlog = false;
     uc->reconnect_attempt = 0;
     uc->partial.clear();
     uc->partial.reserve(4096);
@@ -8159,6 +8193,7 @@ void server_instance::upstream_disconnect(upstream_connection* uc)
 
     // Release write queue refs
     uc->write_queue.clear();
+    uc->drain_wanted = false;
     for (size_t i = 0; i < uc->write_batch_count; i++)
         uc->write_batch[i].clear();
     uc->write_batch_count = 0;
@@ -8228,6 +8263,8 @@ submit_next:
         {
             uc->read_pending = false;
             uc->closing = true;
+            if (!uc->write_pending)
+                upstream_disconnect(uc);
         }
     }
     else if (uc->closing && !uc->write_pending)

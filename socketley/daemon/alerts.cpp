@@ -1,12 +1,10 @@
 #include "alerts.h"
 
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -302,7 +300,7 @@ void monitor::consider(int64_t now, std::map<std::string, alert>& seen)
             ++it;
             continue;
         }
-        if (s.raised)
+        if (s.raised || m_told.count(it->first))
             post(s.a, false, now);
         it = m_states.erase(it);
     }

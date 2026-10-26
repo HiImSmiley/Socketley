@@ -199,6 +199,8 @@ inline bool parse_cors_xml(std::string_view x, cors_config& out, s3_error& err)
             const std::string_view n = t.name;
             if (n == "AllowedOrigin")
             {
+                if (value.empty())
+                    return false;
                 if (std::count(value.begin(), value.end(), '*') > 1)
                     return invalid("AllowedOrigin \"" + value + "\" can not have more than one wildcard.");
                 r.origins.push_back(std::move(value));

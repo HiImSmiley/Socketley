@@ -242,8 +242,8 @@ private:
                 self_closing = true;
                 break;
             }
-            const size_t eq = m_x.find('=', m_pos);
-            if (eq == std::string_view::npos)
+            const size_t eq = m_x.find_first_of("=/<>\"'", m_pos);
+            if (eq == std::string_view::npos || m_x[eq] != '=')
                 return false;
             std::string_view an = m_x.substr(m_pos, eq - m_pos);
             while (!an.empty() && space(an.back()))

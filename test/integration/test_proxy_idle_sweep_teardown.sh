@@ -104,7 +104,13 @@ ELAPSED=${OUT##* }
 
 case "$VERDICT" in
     ENDED|ConnectionResetError)
-        ok "the swept client's socket ended after ${ELAPSED}s, at the sweep" ;;
+        # Only at the sweep: an end before the idle timeout is the request dropped on the client's half close.
+        if awk -v e="$ELAPSED" 'BEGIN { exit !(e >= 0.9) }'; then
+            ok "the swept client's socket ended after ${ELAPSED}s, at the sweep"
+        else
+            bad "the sweep is what ended the exchange" \
+                "the client's socket ended after ${ELAPSED}s, before the 1 s idle timeout"
+        fi ;;
     ANSWERED)
         # Only at the sweep: an answer before the idle timeout is the proxy failing to reach its backend.
         if awk -v e="$ELAPSED" 'BEGIN { exit !(e >= 0.9) }'; then

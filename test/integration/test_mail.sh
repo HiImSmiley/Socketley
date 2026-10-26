@@ -337,6 +337,7 @@ r=$("$BIN" create mail hn -p $((SL_PORT_BASE+1988)) --mail-domain example.test -
 case "$r" in *"--hostname requires"*) ok "a --hostname that is no DNS name is refused" ;; *) bad "a --hostname that is no DNS name is refused" "$r" ;; esac
 "$BIN" create mail rl -p $((SL_PORT_BASE+1988)) --mail-domain example.test --relay smtps://user:pw123secret@relay.test:465 >/dev/null 2>&1
 check "show writes a smarthost's password as ***" "$("$BIN" show rl 2>/dev/null | grep -c 'pw123secret')" "0"
+check "and the record it shows carries the mask" "$("$BIN" show rl 2>/dev/null | grep -q 'user:\*\*\*@relay.test' && echo yes)" "yes"
 "$BIN" show rl > "$T/rl.json" 2>/dev/null
 "$BIN" import rl < "$T/rl.json" >/dev/null 2>&1
 state=$(find "$HOME/.local/share" -name 'rl.json' -path '*runtimes*' 2>/dev/null | head -1)

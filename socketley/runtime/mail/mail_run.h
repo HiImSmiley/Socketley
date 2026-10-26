@@ -89,7 +89,6 @@ public:
 
     mail_instance& owner() { return m_owner; }
     event_loop& loop() { return m_loop; }
-    file_io& fio() { return m_fio; }
     hash_pool& pool() { return m_pool; }
     // A lane for work that only computes, spread over every thread but the first, which waits on files and the network.
     uint32_t cpu_lane() { return 1 + m_pool.next_lane() % (m_pool.threads() > 1 ? m_pool.threads() - 1 : 1); }
@@ -99,7 +98,7 @@ public:
     // What a mail client is told of how to reach the mailbox of `email` (jmap_session::hooks::client_setup).
     std::string client_setup(std::string_view kind, const std::string& email) const;
     // A message of `user`'s, at `key`, learned by the spam filter as spam or not, on whichever shard it was moved.
-    void learn(const std::string& user, const std::string& key, uint64_t size, bool spam);
+    bool learn(const std::string& user, const std::string& key, uint64_t size, bool spam);
     const std::string& hostname() const { return m_hostname; }
     const std::vector<std::string>& domains() const { return m_domains; }
     bool is_local_domain(std::string_view d) const;
@@ -345,7 +344,7 @@ private:
     void begin_session(conn& c);
     smtp_config session_config(const conn& c) const;
     std::string received_line(const conn& c, const std::string& id, const std::string& rcpt) const;
-    void accepted(const entry_ptr& e);
+    void accepted(const entry_ptr& e, int64_t hold_until_ms = 0);
     std::string queue_text(std::string_view filter) const;
     // `socketley mail ... sieve`: a user's scripts listed, read, put, checked, activated or deleted.
     std::string sieve_command(const std::string& arg);
@@ -517,9 +516,7 @@ private:
     uint64_t m_too_big{0};
     uint64_t m_spool_failed{0};
     uint64_t m_bounces_taken{0};
-    uint64_t m_suppressions{0};
     uint64_t m_unsubscribes{0};
-    uint64_t m_bounces_unverified{0};
     uint32_t m_checks_out{0};
     uint64_t m_checked{0};
     uint64_t m_dmarc_rejected{0};

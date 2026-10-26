@@ -106,9 +106,14 @@ daemon_start "$BIN" --cpus max
 if [ -S "$SOCKETLEY_SOCKET" ]; then pass
 else fail "a daemon whose file and flag disagree still comes up" "no socket"; fi
 
-OUT=$("$BIN" create server dcfg_s1 -p $((P + 4)) 2>&1 </dev/null || true)
-if [ -z "$OUT" ]; then pass
-else fail "and it serves" "create said: $OUT"; fi
+OUT=$("$BIN" create server dcfg_s1 -p $((P + 4)) -s 2>&1 </dev/null || true)
+LISTENING=""
+for _ in $(seq 1 50); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$((P + 4))") 2>/dev/null; then LISTENING=yes; break; fi
+    sleep 0.1
+done
+if [ -z "$OUT" ] && [ "$LISTENING" = yes ]; then pass
+else fail "and it serves" "create said: ${OUT:-<nothing>}, listening: ${LISTENING:-no}"; fi
 
 daemon_stop
 unset SOCKETLEY_CONFIG

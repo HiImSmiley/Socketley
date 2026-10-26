@@ -413,7 +413,7 @@ assert_has "a multicast list with a non-id entry is refused" \
     "it used to drop that entry and send to the rest, reporting nothing —" \
     "and the entry it drops is the one whose id came back from json_decode" \
     "as a string, which is how this happens in practice" "got: $R"
-assert_eq "...and nothing was sent" "0" "$(hits 'MC-HOLE')" \
+assert_eq "...and nothing was sent" "0" "$(( $(hits 'MC-HOLE') + $(grep -c MC-HOLE <<<"$R" || true) ))" \
     "the refusal is a refusal: a build that reported the error and delivered" \
     "to the other two satisfies the line above and fails this one"
 

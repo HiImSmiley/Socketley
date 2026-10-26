@@ -105,6 +105,16 @@ TEST_CASE("a UDP server whose first read the ring refused still hears")
     rt.set_udp(true);
     rt.set_event_loop(&loop);
     REQUIRE(rt.start(loop));
+    struct teardown
+    {
+        server_instance& rt;
+        event_loop& loop;
+        ~teardown()
+        {
+            rt.stop(loop);
+            loop.shutdown_ring();
+        }
+    } down{rt, loop};
 
     // The precondition, stated so a run that never reached it cannot be read
     // as a pass: the socket is bound and the read on it was refused.
@@ -125,9 +135,6 @@ TEST_CASE("a UDP server whose first read the ring refused still hears")
                   "a UDP server whose read the ring refused never armed another one: "
                   "the port is bound, the runtime is running, and every datagram sent "
                   "to it is dropped by the kernel for the life of the process");
-
-    rt.stop(loop);
-    loop.shutdown_ring();
 }
 
 // The control.  Without it, "no datagram arrived" is also what a harness that

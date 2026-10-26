@@ -118,6 +118,13 @@ bool parse_put_options(lua_State* L, int idx, storage_rpc::request& r, std::stri
                 name.assign(np, nn);
                 r.metadata.emplace_back(lower(std::move(name)), std::move(value));
                 lua_pop(L, 1);
+                // The storage runtime reads no more than this many, so more are refused here, where they are named.
+                if (r.metadata.size() > 256)
+                {
+                    err = "metadata takes at most 256 names";
+                    lua_pop(L, 3);
+                    return false;
+                }
             }
         }
         else
@@ -166,7 +173,8 @@ bool parse_list_options(lua_State* L, int idx, storage_rpc::request& r, std::str
         else if (key == "max_keys")
         {
             const lua_Number n = lua_tonumber(L, -1);
-            if (lua_type(L, -1) != LUA_TNUMBER || n < 1 || n > storage_rpc::max_list ||
+            // Written so a NaN fails the range before it reaches the cast, which it may not.
+            if (lua_type(L, -1) != LUA_TNUMBER || !(n >= 1 && n <= storage_rpc::max_list) ||
                 n != static_cast<lua_Number>(static_cast<uint32_t>(n)))
             {
                 err = "max_keys must be a whole number from 1 to " + std::to_string(storage_rpc::max_list);

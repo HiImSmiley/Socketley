@@ -80,11 +80,16 @@ want() {  # want LABEL EXPECTED JSON [PORT]
     case "$got" in *"$expect"*) ok "$label" ;;
                    *) bad "$label" "reply did not contain '$expect'" "got: $got" ;; esac
 }
+want_is() {  # want_is LABEL EXPECTED-WHOLE-REPLY JSON [PORT]
+    local label=$1 expect=$2 cmds=$3 port=${4:-$P} got
+    got=$(resp "$cmds" "$port")
+    [ "$got" = "$expect" ] && ok "$label" || bad "$label" "reply was not '$expect'" "got: $got"
+}
 
 echo "--- 1. the reliable-queue move ---"
 want "rpoplpush takes from the tail" "c" \
   '[["DEL","q","proc"],["RPUSH","q","a","b","c"],["RPOPLPUSH","q","proc"]]'
-want "and the source lost exactly it" '| a |' '[["LRANGE","q","0","-1"]]'
+want_is "and the source lost exactly it" '*2 | $1 | a | $1 | b | ' '[["LRANGE","q","0","-1"]]'
 want "lmove LEFT RIGHT takes from the head" "a" '[["LMOVE","q","proc","LEFT","RIGHT"]]'
 want "src == dst rotates rather than emptying" "b" '[["LMOVE","q","q","RIGHT","LEFT"]]'
 want "an empty source is nil, not an error" '$-1' \
@@ -152,8 +157,8 @@ read -r distinct total calls <<<"$(python3 "$SCAN_PY" "$P" 2>/dev/null)"
 
 want "MATCH filters"        "f7 | " '[["HSCAN","big","0","MATCH","f7","COUNT","500"]]'
 want "sscan on a small set" "m1"    '[["DEL","s1"],["SADD","s1","m1"],["SSCAN","s1","0"]]'
-want "zscan carries scores" "2"     '[["DEL","z1"],["ZADD","z1","2","m"],["ZSCAN","z1","0"]]'
-want "a missing key is cursor 0"  "0" '[["HSCAN","nosuchkey","0"]]'
+want "zscan carries scores" '$1 | m | $1 | 2 | ' '[["DEL","z1"],["ZADD","z1","2","m"],["ZSCAN","z1","0"]]'
+want_is "a missing key is cursor 0" '*2 | $1 | 0 | *0 | ' '[["HSCAN","nosuchkey","0"]]'
 
 echo "--- 4. SET KEEPTTL and SET GET ---"
 want "GET answers the replaced value" "alt" \

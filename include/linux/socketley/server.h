@@ -183,7 +183,7 @@ public:
     // that produce none (a TCP bind failure returns false silently).
     bool start() {
         if (!m_loop.init()) return false;
-        detail::install_signal_handlers(&m_loop);
+        const detail::signal_scope signals(&m_loop);
         if (!m_mgr.start(m_name, m_loop) || raw()->get_state() != runtime_running) {
             LOG_ERROR((std::string(raw()->get_name()) +
                        ": did not reach running; not entering the event loop. "

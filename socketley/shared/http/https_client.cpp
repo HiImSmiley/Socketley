@@ -77,7 +77,11 @@ bool parse(const std::string& raw, bool whole, bool head, reply& out, std::strin
     }
     else if (!length.empty())
     {
-        const size_t want = std::strtoull(length.c_str(), nullptr, 10);
+        // Digits and nothing else, or "12abc" would cut the body to 12 and "abc" would give an empty one as whole.
+        size_t want = 0;
+        const auto [end, ec] = std::from_chars(length.data(), length.data() + length.size(), want);
+        if (ec != std::errc() || end != length.data() + length.size())
+            return fail(err, "the answer's Content-Length is no number: " + length);
         if (body.size() < want)
             return fail(err, "the answer ended " + std::to_string(want - body.size()) + " bytes short of its length");
         body.resize(want);

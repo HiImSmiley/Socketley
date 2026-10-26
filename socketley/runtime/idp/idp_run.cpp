@@ -4,20 +4,15 @@
 #include "../../shared/util/ascii.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <charconv>
 #include <cstring>
-#include <fstream>
-#include <sstream>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <openssl/crypto.h>
 #include <openssl/evp.h>
 
 #include "idp_instance.h"
@@ -27,7 +22,6 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/ipc/shard_target.h"
 #include "../../shared/storage/storage_rpc.h"
-#include "../storage/checksum.h"
 #include "../storage/password_hash.h"
 #include "../storage/scrypt.h"
 #include "../../shared/json/json_escape.h"
@@ -198,7 +192,6 @@ bool idp_run::start(std::string& why)
 
     if (!m_http.listen_tcp(m_owner.bind_in_addr(), m_owner.effective_port(), m_shards > 1, why))
         return false;
-    m_loop.register_owner(this);
     m_http.start_accepting();
     LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": issuer " + m_issuer + ", " +
               std::to_string(m_accounts.size()) + " account(s), " + std::to_string(m_clients.size()) + " client(s)").c_str());
@@ -342,12 +335,8 @@ int idp_run::take_request(conn& c, request& rq, int& refusal)
         }
         else if (header_name_equals(f, "authorization", 13))
             rq.authorization.assign(value);
-        else if (header_name_equals(f, "content-type", 12))
-            rq.content_type.assign(value);
         else if (header_name_equals(f, "x-forwarded-for", 15))
             rq.forwarded_for.assign(value);
-        else if (header_name_equals(f, "host", 4))
-            rq.host.assign(value);
     });
     if (r <= 0)
         return r;
@@ -647,15 +636,13 @@ void idp_run::missed(const std::string& ip, int64_t now, std::function<void()> t
 
 // ─── Authorize and sign in ──────────────────────────────────────────────────
 
-const client* idp_run::checked_client(const std::shared_ptr<conn>& c, const params& p, bool& answered)
+const client* idp_run::checked_client(const std::shared_ptr<conn>& c, const params& p)
 {
-    answered = false;
     const client* cl = find_client(param(p, "client_id"));
     const std::string_view back = param(p, "redirect_uri");
     // Without a known client and one of its own addresses there is nowhere safe to send an error, so it is shown.
     if (!cl || !cl->allows(back))
     {
-        answered = true;
         respond(c, 400, "text/html; charset=utf-8",
                 page("Sign-in refused", "<h1>This sign-in cannot go on</h1><p class=\"small\">The application asked "
                                         "with a client or a return address this provider does not know.</p>"));
@@ -665,7 +652,6 @@ const client* idp_run::checked_client(const std::shared_ptr<conn>& c, const para
     const std::string state = std::string(param(p, "state"));
     auto fail = [&](std::string_view error, std::string_view desc)
     {
-        answered = true;
         redirect(c, std::string(back) + sep + "error=" + url_encode(error) + "&error_description=" +
                         url_encode(desc) + (state.empty() ? "" : "&state=" + url_encode(state)));
     };
@@ -797,8 +783,7 @@ void idp_run::authorize(const std::shared_ptr<conn>& c, const request& rq)
     const bool oauth = rq.path == "/authorize";
     if (oauth)
     {
-        bool answered = false;
-        if (!checked_client(c, p, answered))
+        if (!checked_client(c, p))
             return;
     }
     else if (const std::string_view rd = param(p, "rd"); !rd.empty() && !return_allowed(rd, m_issuer, m_cookie_domain))
@@ -825,8 +810,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             p.push_back(std::move(kv));
     if (rq.path == "/authorize")
     {
-        bool answered = false;
-        if (!checked_client(c, p, answered))
+        if (!checked_client(c, p))
             return;
     }
     else if (const std::string_view rd = param(p, "rd"); !rd.empty() && !return_allowed(rd, m_issuer, m_cookie_domain))
@@ -1019,8 +1003,7 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
     const client* cl = nullptr;
     if (!param(p, "client_id").empty())
     {
-        bool answered = false;
-        cl = checked_client(c, p, answered);
+        cl = checked_client(c, p);
         if (!cl)
             return;
     }
@@ -1414,7 +1397,13 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
         if (what == "start")
         {
             // The key shown once, taken into the account only when a code of it proves the app has it.
-            const std::string key = base32_encode(random_string(20));
+            const std::string seed = random_string(20);
+            if (seed.empty())
+            {
+                account_page(c, rq, {}, "No randomness for a key; try again.", 503);
+                return;
+            }
+            const std::string key = base32_encode(seed);
             m_enrolling[id] = {key, now + 600};
             const std::string uri = totp_uri(url_host(m_issuer), who->username(), key);
             std::string grouped;
@@ -1496,6 +1485,11 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
                 return;
             }
             const std::string raw = random_string(16);
+            if (raw.size() != 16)
+            {
+                account_page(c, rq, {}, "No randomness for a password; try again.", 503);
+                return;
+            }
             std::string pw;
             for (size_t i = 0; i < 16; ++i)
                 pw += std::string(i && i % 4 == 0 ? "-" : "") + static_cast<char>('a' + static_cast<unsigned char>(raw[i]) % 26);
@@ -1787,6 +1781,11 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
                     answer_command(ticket, "error: --set takes name=value");
                     return;
                 }
+                if (kv.compare(0, eq, "username") == 0 || kv.compare(0, eq, "created") == 0)
+                {
+                    answer_command(ticket, "error: the field " + kv.substr(0, eq) + " is set by the provider, not by --set");
+                    return;
+                }
                 fields.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
             }
             else
@@ -1824,7 +1823,12 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         if (password.empty())
             create(std::move(fields));
         else
-            hash_password(password, [create, fields = std::move(fields)](std::string hash) mutable {
+            hash_password(password, [this, ticket, create, fields = std::move(fields)](std::string hash) mutable {
+            if (hash.empty())
+            {
+                answer_command(ticket, "error: the password could not be hashed");
+                return;
+            }
                 fields.emplace_back("password", std::move(hash));
                 fields.emplace_back("password_set", std::to_string(wall::now_sec()));
                 create(std::move(fields));
@@ -1860,7 +1864,13 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             answer_command(ticket, "error: idp-user totp <user> on|off");
             return;
         }
-        const std::string key = base32_encode(random_string(20));
+        const std::string seed = random_string(20);
+        if (seed.empty())
+        {
+            answer_command(ticket, "error: no randomness for a key");
+            return;
+        }
+        const std::string key = base32_encode(seed);
         apply({{"totp", key}}, totp_uri(url_host(m_issuer), user, key) + "\nkey: " + key);
         return;
     }
@@ -1868,16 +1878,18 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
     if (action == "app-password")
     {
         const std::string how = args.size() > 2 ? args[2] : std::string(), label = args.size() > 3 ? args[3] : std::string();
-        const account* who = m_accounts.by_id(id);
-        std::string kept(who ? who->field("app_passwords") : std::string_view{});
-        std::vector<std::string> lines;
-        for (std::string_view rest = kept; !rest.empty();)
-        {
-            const size_t nl = rest.find('\n');
-            if (const std::string_view l = rest.substr(0, nl); !l.empty())
-                lines.emplace_back(l);
-            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
-        }
+        const auto parse_lines = [](const account* a) {
+            std::vector<std::string> out;
+            for (std::string_view rest = a ? a->field("app_passwords") : std::string_view{}; !rest.empty();)
+            {
+                const size_t nl = rest.find('\n');
+                if (const std::string_view l = rest.substr(0, nl); !l.empty())
+                    out.emplace_back(l);
+                rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            }
+            return out;
+        };
+        std::vector<std::string> lines = parse_lines(who);
         const auto label_of = [](const std::string& l) { return l.substr(0, l.find('\t')); };
         if (how == "list")
         {
@@ -1916,10 +1928,28 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         }
         // Four groups of four letters, typed on a phone without a mistake, about 75 bits.
         const std::string raw = random_string(16);
+        if (raw.size() != 16)
+        {
+            answer_command(ticket, "error: no randomness for a password");
+            return;
+        }
         std::string pw;
         for (size_t i = 0; i < 16; ++i)
             pw += std::string(i && i % 4 == 0 ? "-" : "") + static_cast<char>('a' + static_cast<unsigned char>(raw[i]) % 26);
-        hash_password(pw, [apply, lines, label, pw](std::string hash) {
+        hash_password(pw, [this, apply, parse_lines, ticket, id, user, label, pw](std::string hash) {
+            if (hash.empty())
+            {
+                answer_command(ticket, "error: the password could not be hashed");
+                return;
+            }
+            // Read again here, since another change to the list may have landed while the hash ran.
+            const std::vector<std::string> lines = parse_lines(m_accounts.by_id(id));
+            const auto label_of = [](const std::string& l) { return l.substr(0, l.find('\t')); };
+            if (lines.size() >= 10 || std::any_of(lines.begin(), lines.end(), [&](const std::string& l) { return label_of(l) == label; }))
+            {
+                answer_command(ticket, "error: " + user + " has ten app passwords or one named " + label + " already");
+                return;
+            }
             std::string joined;
             for (const auto& l : lines)
                 joined += l + "\n";
@@ -1947,7 +1977,12 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             answer_command(ticket, "error: " + problem);
             return;
         }
-        hash_password(password, [apply, reset](std::string hash) {
+        hash_password(password, [this, ticket, apply, reset](std::string hash) {
+            if (hash.empty())
+            {
+                answer_command(ticket, "error: the password could not be hashed");
+                return;
+            }
             const std::string now = std::to_string(wall::now_sec());
             apply({{"password", std::move(hash)}, {"password_set", now}, {"revoked_before", std::to_string(wall::now_ms())},
                    {"reset", reset ? "1" : ""}},

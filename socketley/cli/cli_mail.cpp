@@ -1,5 +1,6 @@
 #include "cli.h"
 
+#include <cmath>
 #include <chrono>
 #include <ctime>
 #include <algorithm>
@@ -174,17 +175,25 @@ std::string text_of_html(std::string_view h)
         if (close == std::string_view::npos)
             break;
         // A style or a script says nothing a reader reads.
+        const auto named = [&](size_t at, std::string_view w) {
+            const size_t next = at + w.size();
+            return lower_at(at, w) && (next >= h.size() || h[next] == '>' || h[next] == '/' ||
+                                       std::isspace(static_cast<unsigned char>(h[next])));
+        };
+        bool skipped = false;
         for (const std::string_view skip : {std::string_view("<style"), std::string_view("<script"), std::string_view("<head")})
-            if (lower_at(i, skip))
+            if (named(i, skip))
             {
                 const std::string end = "</" + std::string(skip.substr(1));
                 size_t at = close;
-                while (at < h.size() && !lower_at(at, end))
+                while (at < h.size() && !named(at, end))
                     ++at;
-                i = at;
+                const size_t gt = h.find('>', at);
+                i = gt == std::string_view::npos ? h.size() : gt + 1;
+                skipped = true;
                 break;
             }
-        if (h[i] != '<')
+        if (skipped)
             continue;
         const std::string_view tag = h.substr(i, close - i + 1);
         std::string t(tag);
@@ -259,7 +268,7 @@ bool parse_rate(std::string_view v, double& per_s)
     const std::string n(v.substr(0, slash));
     char* end = nullptr;
     const double count = std::strtod(n.c_str(), &end);
-    if (n.empty() || !end || *end || count <= 0)
+    if (n.empty() || *end || !(count > 0) || !std::isfinite(count))
         return false;
     const std::string_view unit = slash == std::string_view::npos ? std::string_view("s") : v.substr(slash + 1);
     const double over = unit == "s" ? 1 : unit == "m" ? 60 : unit == "h" ? 3600 : 0;

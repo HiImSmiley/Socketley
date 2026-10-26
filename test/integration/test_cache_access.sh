@@ -326,7 +326,7 @@ burst_ok = (first == "burst0" and last == "burst%d" % (BURST - 1)
 print("STORE", "ok" if (same_write and split_write and burst_ok)
       else "BAD same=%s split=%s burst=%s" % (same_write, split_write, burst_ok))
 PY
-) || PROBE="probe failed"
+) || PROBE="$PROBE"$'\n'"probe failed"
 
 assert_eq "$(echo "$PROBE" | grep '^ORDER '      | cut -d' ' -f2-)" "ok" "replies in request order"
 assert_eq "$(echo "$PROBE" | grep '^HALFCLOSE '  | cut -d' ' -f2-)" "ok" "reply survives a half-closed client"

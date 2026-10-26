@@ -175,7 +175,7 @@ private:
     void settle();
     void arm_tick();
     void tick();
-    void refresh_files(bool first);
+    void refresh_files();
     void persist(bool now_and_wait);
     void reap_taps(int64_t now);
     void tap_message(const message& m);
@@ -257,6 +257,8 @@ private:
     __kernel_timespec m_tick_ts{};
     bool m_tick_armed{false};
     int64_t m_next_files_ms{0};
+    // An accept refused with EMFILE waits a moment before the next, rather than spinning on the same failure.
+    int64_t m_accept_paused_until_ms{0};
     int64_t m_next_persist_ms{0};
     bool m_persist_busy{false};
     bool m_persist_failed{false};

@@ -127,6 +127,11 @@ void git_mirrors::open(std::string dir, uint32_t shard, std::string endpoint, bo
     if (m_shard == 0 && m_any)
     {
         list_lock lock(m_dir);
+        if (!lock.held())
+        {
+            LOG_WARN("storage: git: the list of repositories could not be locked, so none moved");
+            return;
+        }
         std::vector<repo> rs = repos();
         bool changed = false;
         for (repo& r : rs)

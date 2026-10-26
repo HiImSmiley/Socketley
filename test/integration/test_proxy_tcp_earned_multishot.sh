@@ -189,7 +189,7 @@ for i in range(200):
     ok += d == m
 print(ok)
 PY
-)
+) || GOT=0
 if [ "$GOT" = "200" ]; then pass
 else fail "200 small round trips are answered byte for byte" "$GOT of 200"; fi
 

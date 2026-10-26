@@ -436,7 +436,6 @@ void proxy_supervisor::poll_map()
     if (fatal)
     {
         LOG_ERROR("proxy supervisor: malformed map frame from a worker");
-        m_map_in.clear();
         close_map();
     }
 }
@@ -663,6 +662,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // replacement that is not a worker binary said nothing about why.
     m_saw_worker_frame  = false;
 
+    // A new child starts with publish interest on, whatever the last one was told.
+    m_publish_interest_sent = -1;
+
     const int fl = ::fcntl(m_control_fd, F_GETFL, 0);
     if (fl >= 0)
         if (::fcntl(m_control_fd, F_SETFL, fl | O_NONBLOCK) < 0) {}
@@ -788,11 +790,6 @@ bool proxy_supervisor::send_deliver(std::string_view message)
 void proxy_supervisor::send_start()
 {
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::start, {}))) {}
-}
-
-void proxy_supervisor::send_stop()
-{
-    if (!write_frame(worker_proto::frame(worker_proto::frame_type::stop, {}))) {}
 }
 
 void proxy_supervisor::send_reload(std::string_view lua_path)
@@ -979,6 +976,7 @@ void proxy_supervisor::poll()
     // from a completion that a refused submission never produces, and this
     // drain is the only thing the health tick calls.
     arm_map_poll();
+    arm_control_poll();
 
     if (m_control_fd < 0)
         return;
@@ -1007,7 +1005,7 @@ void proxy_supervisor::poll()
         break;
     }
 
-    ingest(m_in);
+    ingest();
 }
 
 // Three things end this wait -- serving, refused, timeout -- all read with
@@ -1199,7 +1197,7 @@ bool proxy_supervisor::await_routes(const void* previous,
     }
 }
 
-void proxy_supervisor::ingest(const std::string&)
+void proxy_supervisor::ingest()
 {
     worker_proto::frame_type type{};
     uint16_t                 ver = 0;
@@ -1559,7 +1557,7 @@ bool proxy_supervisor::check_liveness()
     // it is about to be blamed for, and the one way to build that binary is to
     // leave `proxy-worker` undispatched.
     if (!m_saw_worker_frame && m_config_error.empty())
-        m_config_error = std::string(m_exec_path) +
+        m_config_error = m_exec_path +
                          " exited before it answered anything; a custom daemon "
                          "or worker binary must run worker_main() for argv[1] "
                          "== \"proxy-worker\"";
@@ -1570,13 +1568,6 @@ bool proxy_supervisor::check_liveness()
     if (WIFEXITED(status) && WEXITSTATUS(status) == worker_proto::exit_config_refused)
     {
         LOG_ERROR((who() + "the worker refused its configuration; not restarting it").c_str());
-        if (m_placeholder)
-            m_placeholder->mark_failed();
-        return true;
-    }
-
-    if (m_policy == death_policy::fail)
-    {
         if (m_placeholder)
             m_placeholder->mark_failed();
         return true;

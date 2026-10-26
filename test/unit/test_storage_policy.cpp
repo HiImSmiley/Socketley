@@ -69,7 +69,7 @@ TEST_CASE("unicode escapes are read as the characters they name, and a broken on
     CHECK_FALSE(compiles(doc_with("", R"("effect")")));
 
     // A resource with an escaped character matches the key with the character.
-    const std::string esc = R"({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/café/😀"}})";
+    const std::string esc = R"({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/caf\u00e9/\ud83d\ude00"}})";
     CHECK(anonymous_get(esc, "café/😀") == policy_effect::allow);
     CHECK(anonymous_get(esc, "cafe/😀") == policy_effect::none);
     const std::string raw = R"({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/café/😀"}})";

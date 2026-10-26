@@ -45,7 +45,7 @@ function on_writable(client_id)
 end
 
 function on_client_message(client_id, msg)
-    if msg == "send" then
+    if msg == "send" and not remaining[client_id] then
         remaining[client_id] = CHUNKS
         pump(client_id)
     end

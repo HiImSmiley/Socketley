@@ -263,7 +263,7 @@ imap_store::meta_refusal imap_store::set_meta(const std::string& name, const std
     user(name);
     const std::string fname = folder.empty() ? std::string() : canonical(folder);
     meta_refusal why = meta_refusal::none;
-    mutate(name, [&](user_state& u, std::string& lines) {
+    const bool written = mutate(name, [&](user_state& u, std::string& lines) {
         if (!fname.empty() && !u.folders.count(fname))
         {
             why = meta_refusal::no_folder;
@@ -291,7 +291,7 @@ imap_store::meta_refusal imap_store::set_meta(const std::string& name, const std
         apply(u, line, false);
         lines += line;
     });
-    return why;
+    return written ? why : meta_refusal::io;
 }
 
 const std::string* imap_store::meta(const std::string& name, const std::string& folder, const std::string& entry)
@@ -342,7 +342,7 @@ bool imap_store::set_acl(const std::string& owner, const std::string& folder, co
     user(owner);
     const std::string fname = canonical(folder);
     bool there = false;
-    mutate(owner, [&](user_state& u, std::string& lines) {
+    const bool written = mutate(owner, [&](user_state& u, std::string& lines) {
         if (!u.folders.count(fname))
             return;
         there = true;
@@ -350,9 +350,9 @@ bool imap_store::set_acl(const std::string& owner, const std::string& folder, co
         apply(u, line, false);
         lines += line;
     });
-    if (there)
+    if (written && there)
         note_share(owner, fname, who, !r.empty());
-    return there;
+    return written && there;
 }
 
 std::map<std::string, std::string> imap_store::acl(const std::string& owner, const std::string& folder)
@@ -982,6 +982,8 @@ void imap_store::reload(user_state& u)
             old.highestmodseq = f->highestmodseq;
             old.vanished = std::move(f->vanished);
             old.vanished_from = f->vanished_from;
+            old.acl = std::move(f->acl);
+            old.objectid = std::move(f->objectid);
             for (auto& m : f->msgs)
                 if (const imap_message* was = old.by_uid(m.uid))
                     m.recent = was->recent;
@@ -1289,7 +1291,7 @@ void imap_store::get_upload(const std::string& user, const std::string& id,
                             std::function<void(std::shared_ptr<const std::string>)> done)
 {
     const size_t a = id.find('x'), b = a == std::string::npos ? a : id.find('x', a + 1);
-    if (!id.starts_with("U") || b == std::string::npos || id.find_first_not_of("0123456789abcdefxU") != std::string::npos)
+    if (!id.starts_with("U") || b == std::string::npos || b - a < 2 || id.find_first_not_of("0123456789abcdefxU") != std::string::npos)
     {
         done(nullptr);
         return;
@@ -1601,7 +1603,8 @@ void imap_store::hold_filter(user_state& u, uint64_t id, std::string filter)
 
 void imap_store::write_text_filters(const std::string& name, user_state& u)
 {
-    if (u.filters_out.empty())
+    // Records wait while a compaction is under way, so its rename does not drop them.
+    if (u.filters_out.empty() || u.filters_compacting)
         return;
     // Every record in one write to the end, which another shard's appends do not cut into.
     const std::string path = u.base + ".fts";
@@ -1626,7 +1629,7 @@ void imap_store::write_text_filters(const std::string& name, user_state& u)
     // A file grown past three times what the messages still there need is written again with theirs alone, weighed
     // once it is twice what it was when last weighed.
     struct stat st{};
-    if (u.filters_compacting || ::stat((u.base + ".fts").c_str(), &st) != 0 || st.st_size < (1 << 20) ||
+    if (u.filters_compacting || ::stat(path.c_str(), &st) != 0 || st.st_size < (1 << 20) ||
         static_cast<uint64_t>(st.st_size) < 2 * u.filters_weighed)
         return;
     u.filters_weighed = static_cast<uint64_t>(st.st_size);
@@ -1647,7 +1650,7 @@ void imap_store::write_text_filters(const std::string& name, user_state& u)
     u.filters_compacting = true;
     const uint64_t kept = keep.size();
     // Off the lane the spool's syncs take, which a large file's write would hold up.
-    m_run.pool().submit(m_run.cpu_lane(), [path = u.base + ".fts", keep = std::move(keep)] {
+    m_run.pool().submit(m_run.cpu_lane(), [path, keep = std::move(keep)] {
         if (!socketley::replace_file(path, keep, socketley::durability::none)) {}
     }, [this, name, kept, alive = m_alive] {
         if (!*alive)
@@ -1800,8 +1803,8 @@ void imap_store::sync(const std::string& name, const std::shared_ptr<imap_folder
                            return;
                        }
                        std::set<std::string> there;
-                       for (const auto& [k, v] : *acc)
-                           there.insert(k);
+                       for (const auto& o : *acc)
+                           there.insert(o.first);
                        std::sort(acc->begin(), acc->end());
                        // Under the user's lock, the index read to its end: what another shard gave a UID is known,
                        // and a message logged after the listing began is not expunged for being missing from it.
@@ -1820,7 +1823,7 @@ void imap_store::sync(const std::string& name, const std::shared_ptr<imap_folder
                                {
                                    // A message a listing lacks goes once it has been missing a minute, so one the
                                    // store took and lists late is not expunged for it.
-                                   const auto [miss, fresh] = f->missing_since.try_emplace(m.key, now);
+                                   const auto miss = f->missing_since.try_emplace(m.key, now).first;
                                    if (now - miss->second < 60000)
                                        continue;
                                    f->missing_since.erase(miss);
@@ -1919,7 +1922,7 @@ void imap_store::body(const std::string& key, uint64_t size, std::function<void(
     };
     mailboxes* boxes = m_run.boxes();
     // Whole for a small one; a mebibyte at a time otherwise.
-    const auto read_from = [this, boxes, key, size, data, finish, alive = m_alive](auto&& self) -> void {
+    const auto read_from = [boxes, key, size, data, finish, alive = m_alive](auto&& self) -> void {
         rpc::request rq;
         rq.bucket = boxes->bucket();
         rq.key = key;
@@ -2284,6 +2287,7 @@ void imap_store::expunge(const std::string& name, const std::shared_ptr<imap_fol
                         const uint64_t ms = ++f->highestmodseq;
                         u.used -= std::min(u.used, m->size);
                         f->gone_keys.emplace_back(ms, m->key);
+                        f->missing_since.erase(m->key);
                         m->size = UINT64_MAX;
                         f->vanished.emplace_back(ms, g);
                         lines += "X " + std::to_string(g) + " " + std::to_string(ms) + " " + f->name + "\n";
@@ -2346,7 +2350,7 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
     // The room the copies take is held while they are made, so two COPYs cannot pass the quota together.
     if (!counts)
         j->reserved = 0;
-    if (!reserve(name, j->reserved))
+    if (counts && !reserve(name, j->reserved))
     {
         done(false, dest->uidvalidity, {});
         return;
@@ -2356,8 +2360,8 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
     std::set<std::string> taken;
     for (const auto& m : dest->msgs)
         taken.insert(m.key.substr(m.key.rfind('/') + 1));
-    for (const auto& [ms, k] : dest->gone_keys)
-        taken.insert(k.substr(k.rfind('/') + 1));
+    for (const auto& g : dest->gone_keys)
+        taken.insert(g.second.substr(g.second.rfind('/') + 1));
     j->keys.resize(j->todo.size());
     for (size_t i = 0; i < j->todo.size(); ++i)
     {
@@ -2434,7 +2438,7 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
             ++j->running;
             j->running_bytes += m.size;
             // A copy's source is read past the cache, so a large COPY does not push out what clients read.
-            body(m.key, m.size, [this, name, dest, j, i, self](std::shared_ptr<const std::string> b) {
+            body(m.key, m.size, [this, j, i, self](std::shared_ptr<const std::string> b) {
                 if (!b)
                 {
                     --j->running;
@@ -2638,8 +2642,12 @@ void imap_store::empty_out(const std::string& name, const std::shared_ptr<imap_f
             // A message that came in while the last pass ran keeps the folder.
             if (!f->msgs.empty())
                 return;
-            if (u.folders.erase(fname))
+            // A folder made again under the name since is another's, and stays.
+            if (const auto it = u.folders.find(fname); it != u.folders.end() && it->second == f)
+            {
+                u.folders.erase(it);
                 lines += "D " + fname + "\n";
+            }
             gone = true;
         });
         done(gone);

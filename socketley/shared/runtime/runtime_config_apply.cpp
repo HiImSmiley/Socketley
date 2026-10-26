@@ -489,6 +489,10 @@ bool apply_server_config(server_instance& srv, const runtime_config& cfg, bool b
     // A document that never names the list leaves it, since clearing it would end the server's upstream leg.
     if (!asked("upstreams", true))
         return true;
+    // The list it had, put back when the new one is refused, so a refusal leaves the server as it was.
+    std::vector<std::string> before;
+    for (const auto& t : srv.get_upstream_targets())
+        before.push_back(t.address);
     srv.clear_upstream_targets();
     for (const auto& u : cfg.upstreams)
     {
@@ -496,6 +500,9 @@ bool apply_server_config(server_instance& srv, const runtime_config& cfg, bool b
             continue;
         if (refusal)
         {
+            srv.clear_upstream_targets();
+            for (const auto& b : before)
+                if (!srv.add_upstream_target(b)) {}
             *refusal = server_instance::upstream_refusal(u);
             return false;
         }

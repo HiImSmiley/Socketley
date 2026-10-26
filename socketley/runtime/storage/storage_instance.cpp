@@ -3,13 +3,10 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <charconv>
-#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -189,7 +186,6 @@ socketley::storage::sync_runners sync_runners_of(std::string_view name)
 
 void storage_instance::refresh_cached_limits()
 {
-    m_max_conns_cached = get_max_connections();
     if (m_run)
     {
         m_run->store().set_max_bytes(m_max_bytes);

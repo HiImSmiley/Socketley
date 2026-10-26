@@ -57,6 +57,10 @@ using socketley::jws::es256;
 using socketley::jws::jwk_of;
 using socketley::jws::sha256;
 
+constexpr std::string_view acme_usage =
+    "usage: socketley acme issue --domains name[,name...] [--cert file] [--key file] [--email addr] "
+    "[--directory url] [--challenge http-01|tls-alpn-01|dns-01] [--dns-zones zone[,zone...]]\n";
+
 constexpr std::string_view lets_encrypt = "https://acme-v02.api.letsencrypt.org/directory";
 constexpr int poll_seconds = 90;
 
@@ -295,7 +299,9 @@ bool zone_delegated(const std::string& zone, std::string& why)
     {
         host = env;
         // "127.0.0.1:5353" and "[::1]:5353"; a bare IPv6 address has more than one colon.
-        if (host.front() == '[' && host.find("]:") != std::string::npos)
+        if (host.front() == '[' && host.back() == ']')
+            host = host.substr(1, host.size() - 2);
+        else if (host.front() == '[' && host.find("]:") != std::string::npos)
         {
             port = host.substr(host.find("]:") + 2);
             host = host.substr(1, host.find(']') - 1);
@@ -325,7 +331,10 @@ bool zone_delegated(const std::string& zone, std::string& why)
 
     const std::string id = socketley::random_hex(8), value = socketley::random_hex(16);
     if (id.empty() || value.empty())
+    {
+        why = "the probe could not be given an id";
         return false;
+    }
     const std::string label = "probe-" + id;
     std::string path;
     if (!dns_feed::write_challenge(label + "." + zone, value, label, path))
@@ -395,7 +404,8 @@ std::string stage(const std::string& path, const std::string& data, mode_t mode)
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
     if (fd < 0)
         return {};
-    bool ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
+    bool ok = ::fchmod(fd, mode) == 0;
+    ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size()) && ok;
     ok = ::fsync(fd) == 0 && ok;
     ok = ::close(fd) == 0 && ok;
     if (!ok)
@@ -565,14 +575,15 @@ int issue(int argc, char** argv)
             out = argv[++i];
             return true;
         };
+        auto split_into = [](const std::string& list, std::vector<std::string>& out) {
+            for (std::string_view rest = list; !rest.empty();)
+                if (const std::string_view one = socketley::take_item(rest); !one.empty())
+                    out.emplace_back(one);
+        };
         std::string v;
         bool ok = true;
         if (a == "--domains" && (ok = value(v)))
-        {
-            for (std::string_view rest = v; !rest.empty();)
-                if (const std::string_view one = socketley::take_item(rest); !one.empty())
-                    names.emplace_back(one);
-        }
+            split_into(v, names);
         else if (a == "--cert")
             ok = value(cert);
         else if (a == "--key")
@@ -586,11 +597,7 @@ int issue(int argc, char** argv)
         // The zones a dns runtime of this daemon serves: a name in one is proven over DNS-01 whatever --challenge
         // says, which needs no port open, and --challenge is left for the others.
         else if (a == "--dns-zones" && (ok = value(v)))
-        {
-            for (std::string_view rest = v; !rest.empty();)
-                if (const std::string_view one = socketley::take_item(rest); !one.empty())
-                    dns_zones.emplace_back(one);
-        }
+            split_into(v, dns_zones);
         else
             ok = false;
         if (!ok)
@@ -601,8 +608,7 @@ int issue(int argc, char** argv)
     }
     if (names.empty())
     {
-        std::cout << "usage: socketley acme issue --domains name[,name...] [--cert file] [--key file] [--email addr] "
-                     "[--directory url] [--challenge http-01|tls-alpn-01|dns-01] [--dns-zones zone[,zone...]]\n";
+        std::cout << acme_usage;
         return 1;
     }
     // A wildcard is proven by DNS alone (RFC 8555 8.4); SOCKETLEY_ACME_CHALLENGE picks one for every name, for a
@@ -726,8 +732,13 @@ int issue(int argc, char** argv)
         ids += (ids.empty() ? "" : ",") + std::string("{\"type\":\"dns\",\"value\":") + socketley::json::quote(n) + "}";
     reply r;
     jvalue order;
-    if (!c.post(c.new_order(), "{\"identifiers\":[" + ids + "]}", r, err) || !json_reader(r.body).document(order))
+    if (!c.post(c.new_order(), "{\"identifiers\":[" + ids + "]}", r, err))
         return done(2);
+    if (!json_reader(r.body).document(order))
+    {
+        err = "the CA answered newOrder with something that is not JSON";
+        return done(2);
+    }
     const std::string order_url = r.header("location");
     const std::string thumb = c.thumbprint();
 
@@ -851,7 +862,6 @@ int acme_main(int argc, char** argv)
 {
     if (argc >= 3 && std::string_view(argv[2]) == "issue")
         return issue(argc, argv);
-    std::cout << "usage: socketley acme issue --domains name[,name...] [--cert file] [--key file] [--email addr] "
-                 "[--directory url] [--challenge http-01|tls-alpn-01|dns-01] [--dns-zones zone[,zone...]]\n";
+    std::cout << acme_usage;
     return 1;
 }

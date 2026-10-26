@@ -130,6 +130,11 @@ else
 fi
 echo "  $(printf '%s\n' "$CACHE_ONLY_SRC" | grep -c .) flags create takes for a cache"
 
+# Every row's kind is one the dashboard draws, or the field is a text box that sends what it should not.
+ODD_KINDS=$(grep -oE '^\s*\{"-[^"]*", "[A-Z]*", "[a-z]*"' "$SCHEMA" | sed -E 's/.*"([a-z]*)"$/\1/' | sort -u |
+    grep -vxE 'switch|choice|int|duration|size|list|path|text')
+[ -z "$ODD_KINDS" ] && ok || bad "every schema kind is one the dashboard knows" "$ODD_KINDS" "a row with kind bool is drawn as text"
+
 # ── layer 1: the docs, which need no daemon ─────────────────────────────────
 #
 # A flag the operator cannot look up is a flag they will not use.  Both
@@ -143,13 +148,16 @@ echo "  $(printf '%s\n' "$CACHE_ONLY_SRC" | grep -c .) flags create takes for a 
 # first version of this file did.  That inversion has now been found four times
 # in this repository; the fix is always to not put grep -q at the end of a pipe.
 MAN_FLAT=$(mktemp)
-sed 's/\\-/-/g' "$MAN" > "$MAN_FLAT" 2>/dev/null
+sed -e 's/\\-/-/g' -e 's/\\f[BIRP]/ /g' "$MAN" > "$MAN_FLAT" 2>/dev/null
 trap 'rm -f "$MAN_FLAT"; cleanup' EXIT
+
+# A flag counts as documented only as a whole token, so -p is not found inside --publish.
+has_flag() { grep -qE -- "(^|[^-A-Za-z0-9])$1([^A-Za-z0-9-]|\$)" "$2" 2>/dev/null; }
 
 UNDOC=""
 while read -r flag _; do
-    grep -qF -- "$flag" "$HELP"     2>/dev/null || UNDOC="$UNDOC $flag(help)"
-    grep -qF -- "$flag" "$MAN_FLAT" 2>/dev/null || UNDOC="$UNDOC $flag(man)"
+    has_flag "$flag" "$HELP"     || UNDOC="$UNDOC $flag(help)"
+    has_flag "$flag" "$MAN_FLAT" || UNDOC="$UNDOC $flag(man)"
 done <<< "$SURFACE"
 
 if [ -z "$UNDOC" ]; then ok; else
@@ -220,6 +228,8 @@ while read -r flag; do
         case "$out" in
             "unknown flag:"*)           got=unknown   ;;
             *"cannot be changed with"*) got=refused   ;;
+            "runtime not found"*|"the daemon"*|"the socket"*|*"failed to connect"*|"not permitted"*)
+                                        got=other     ;;
             *)                          got=reachable ;;
         esac
         CHECKED=$((CHECKED+1))

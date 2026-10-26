@@ -55,11 +55,6 @@ broker::broker(broker_config cfg, broker_io& io, broker_hooks& hooks)
 
 broker::~broker() = default;
 
-void broker::set_limits(const broker_config& cfg)
-{
-    m_cfg = cfg;
-}
-
 broker::connection* broker::conn_of(uint64_t id)
 {
     // A delivery asks after the same connection from deliver, pump and the writer in turn.
@@ -331,6 +326,18 @@ bool broker::handle(connection& c, const frame& f)
     }
 }
 
+void broker::refuse_connect(connection& c, uint8_t level, uint8_t code)
+{
+    ++m_stats.connects_refused;
+    connack_packet a;
+    a.reason = code;
+    std::string out;
+    write_connack(out, level, a);
+    send_packet(c, out);
+    c.ph = connection::phase::closing;
+    m_io.close(c.id);
+}
+
 void broker::protocol_failure(connection& c, uint8_t code, const std::string& why)
 {
     ++m_stats.protocol_errors;
@@ -374,14 +381,7 @@ bool broker::on_connect(connection& c, const frame& f)
     connect_packet p;
     refusal err;
     const auto refuse = [&](uint8_t level, uint8_t code) {
-        ++m_stats.connects_refused;
-        connack_packet a;
-        a.reason = code;
-        std::string out;
-        write_connack(out, level, a);
-        send_packet(c, out);
-        c.ph = connection::phase::closing;
-        m_io.close(c.id);
+        refuse_connect(c, level, code);
         return false;
     };
     if (!read_connect(f, p, err))
@@ -457,15 +457,8 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
     const std::unique_ptr<connect_packet> held = std::move(c->pending);
     connect_packet& p = *held;
     const auto refuse = [&](uint8_t code) {
-        ++m_stats.connects_refused;
-        connack_packet ack;
-        ack.reason = code;
-        std::string out;
-        write_connack(out, c->level, ack);
-        send_packet(*c, out);
-        c->ph   = connection::phase::closing;
         c->busy = false;
-        m_io.close(c->id);
+        refuse_connect(*c, c->level, code);
     };
     if (a.code != reason::success)
     {
@@ -636,7 +629,7 @@ bool broker::on_publish(connection& c, const frame& f)
         if (p.qos == 0)
             return;
         send_ack(c, p.qos == 1 ? packet_type::puback : packet_type::pubrec, p.packet_id, code);
-        if (p.qos == 2)
+        if (p.qos == 2 && (c.level < level_5 || code < 0x80))
         {
             s.incoming_qos2.insert(p.packet_id);
             mark();
@@ -745,7 +738,7 @@ void broker::finish_publish(uint64_t conn, uint64_t generation, uint8_t qos, uin
     if (qos > 0)
     {
         send_ack(*c, qos == 1 ? packet_type::puback : packet_type::pubrec, id, level == level_5 ? code : reason::success);
-        if (qos == 2 && c->s)
+        if (qos == 2 && c->s && (level < level_5 || code < 0x80))
         {
             c->s->incoming_qos2.insert(id);
             mark();
@@ -1590,8 +1583,7 @@ std::vector<broker::session_view> broker::sessions() const
 
 void broker::retained_each(std::string_view filter, const std::function<void(const message_ptr&)>& f) const
 {
-    m_retained.match(filter.empty() ? std::string_view("#") : filter,
-                     [&](const std::shared_ptr<const message>& m) { f(m); });
+    m_retained.match(filter.empty() ? std::string_view("#") : filter, f);
 }
 
 }   // namespace socketley::mqtt

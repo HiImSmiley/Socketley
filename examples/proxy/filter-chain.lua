@@ -41,7 +41,8 @@ filters = {
     -- Returning a table with `status` is the answer.  The chain stops and the
     -- request is never forwarded.
     function(req)
-        if string.find(req.path, "/public/", 1, true) then
+        local public = "/" .. self.name .. "/public/"
+        if req.path:sub(1, #public) == public or req.path:sub(1, 8) == "/public/" then
             return   -- nothing: carry on
         end
 

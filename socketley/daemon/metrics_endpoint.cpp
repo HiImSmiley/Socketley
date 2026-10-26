@@ -4,7 +4,6 @@
 #include "dashboard.h"
 #include "../shared/runtime/runtime_manager.h"
 #include "../shared/runtime/runtime_instance.h"
-#include "../shared/loop/blocking_write.h"
 #include "../shared/util/logging.h"
 #include "../shared/util/version.h"
 #include "../shared/runtime/runtime_definitions.h"
@@ -34,7 +33,6 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/eventfd.h>
-#include <netinet/tcp.h>
 #include <poll.h>
 #include <fcntl.h>
 
@@ -232,7 +230,16 @@ void metrics_endpoint::serve_loop()
         int client_fd = accept4(m_listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr),
                                 &client_len, SOCK_CLOEXEC);
         if (client_fd < 0)
+        {
+            // The pending connection stays in the backlog, so without a pause the listener polls ready again at once.
+            if (errno == EMFILE || errno == ENFILE)
+            {
+                struct pollfd pause{m_wake_fd, POLLIN, 0};
+                if (poll(&pause, 1, 100) > 0)
+                    break;
+            }
             continue;
+        }
 
         // Bounded both ways, because this thread serves one connection at a
         // time and a peer that connects and says nothing held every scrape,
@@ -1047,11 +1054,6 @@ std::string metrics_endpoint::build_metrics() const
     return out;
 }
 
-static const char* runtime_type_str(runtime_type t)
-{
-    return type_to_string(t);
-}
-
 std::string metrics_endpoint::build_json_overview() const
 {
     const std::vector<runtime_row> rows = runtime_rows(m_manager);
@@ -1121,7 +1123,8 @@ void metrics_endpoint::sample()
             a.cert = dashboard::served_cert(*rt);
             // What it holds against its limit, from the same text the figures come from; a cache that evicts is
             // full by design, so only one that refuses is watched.
-            const storage_row row = parse_storage_row(name, rt->stat_detail_snapshot());
+            const std::string detail = rt->stat_detail_snapshot();
+            const storage_row row = parse_storage_row(name, detail);
             if (rt->get_type() == runtime_storage)
             {
                 a.dir.assign(static_cast<const storage_instance*>(rt.get())->get_dir());
@@ -1132,7 +1135,7 @@ void metrics_endpoint::sample()
             else if (rt->get_type() == runtime_sync && rt->get_state() == runtime_running)
             {
                 row.get("failing", a.failing);
-                a.error = socketley::stats_text::field(rt->stat_detail_snapshot(), "last_error");
+                a.error = socketley::stats_text::field(detail, "last_error");
             }
             else if (rt->get_type() == runtime_mail && rt->get_state() == runtime_running)
             {
@@ -1183,7 +1186,7 @@ static void append_runtime_row(std::string& j, std::string_view name, runtime_ty
     j += "{\"name\":\"";
     socketley::json::escape_into(j, name);
     j += "\",\"type\":\"";
-    j += runtime_type_str(type);
+    j += type_to_string(type);
     j += "\",\"state\":\"";
     j += state_to_string(state);
     j += "\",\"port\":";

@@ -56,7 +56,7 @@ umask "$OLD_UMASK"
 
 # Which directory this daemon chose, from the daemon itself rather than from a
 # copy of paths.cpp's keying rule living in a test.
-STATE_DIR=$(grep -a "state directory: " "$SOCKETLEY_DLOG" | tail -1 | sed 's/.*state directory: //')
+STATE_DIR=$(grep -a "state directory: " "$SOCKETLEY_DLOG" | tail -1 | sed 's/.*state directory: //' || true)
 if [ -z "$STATE_DIR" ] || [ ! -d "$STATE_DIR" ]; then
     echo "  FATAL: the daemon did not say which state directory it is using;"
     echo "         nothing below would be measuring this build."

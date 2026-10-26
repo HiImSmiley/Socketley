@@ -5,6 +5,7 @@
 #include "shared/persist/state_persistence.h"
 #include "shared/loop/event_loop.h"
 
+#include <cerrno>
 #include <filesystem>
 #include <string>
 #include <system_error>
@@ -303,8 +304,9 @@ TEST_CASE("managed runtime fork+exec")
         CHECK(inst->start(loop));
         pid_t first_child = inst->get_pid();
 
-        // Wait for /bin/true to exit (becomes zombie until reaped)
-        waitpid(first_child, nullptr, 0);
+        // Wait for /bin/true to exit without reaping it, so it stays a zombie
+        siginfo_t info{};
+        REQUIRE(waitid(P_PID, static_cast<id_t>(first_child), &info, WEXITED | WNOWAIT) == 0);
 
         CHECK(inst->stop(loop));
         CHECK(inst->get_state() == runtime_stopped);
@@ -313,6 +315,10 @@ TEST_CASE("managed runtime fork+exec")
         CHECK(inst->start(loop));
         CHECK(inst->get_state() == runtime_running);
         CHECK(inst->get_pid() > 0);
+
+        errno = 0;
+        CHECK(waitpid(first_child, nullptr, WNOHANG) == -1);
+        CHECK(errno == ECHILD);
 
         pid_t second_child = inst->get_pid();
         waitpid(second_child, nullptr, 0);

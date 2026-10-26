@@ -505,7 +505,7 @@ size_t reference_chunked_end(std::string_view sv, size_t from, ref_view& r)
                     return p;
             }
         }
-        if (sv.size() - p < size + 2)
+        if (sv.size() - p < 2 || size > sv.size() - p - 2)
             return std::string_view::npos;
         if (sv[p + size] != '\r' || sv[p + size + 1] != '\n')
             return std::string_view::npos;

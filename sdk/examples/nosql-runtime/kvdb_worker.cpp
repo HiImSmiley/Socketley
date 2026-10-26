@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -34,7 +33,9 @@ std::vector<std::string> split_ws(std::string_view line, size_t limit)
         if (i > start) out.emplace_back(line.substr(start, i - start));
     }
     while (i < line.size() && line[i] == ' ') ++i;
-    if (i < line.size()) out.emplace_back(line.substr(i));
+    size_t end = line.size();
+    while (end > i && line[end - 1] == ' ') --end;
+    if (i < end) out.emplace_back(line.substr(i, end - i));
     return out;
 }
 
@@ -207,9 +208,11 @@ private:
     {
         if (m_pending.empty() || m_path.empty()) return;
         std::ofstream f(m_path, std::ios::app | std::ios::binary);
-        if (f) f.write(m_pending.data(),
-                       static_cast<std::streamsize>(m_pending.size()));
-        m_pending.clear();
+        if (!f) return;
+        f.write(m_pending.data(), static_cast<std::streamsize>(m_pending.size()));
+        f.flush();
+        // A record that did not reach the file stays pending for the next tick.
+        if (f) m_pending.clear();
     }
 
     // Replay, last record wins, then rewrite the file with the live set --

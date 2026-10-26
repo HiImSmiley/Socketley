@@ -744,7 +744,7 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
     const bool lock = http_token_equals(c->req.header("x-amz-bucket-object-lock-enabled"), "true", 4);
     // The default owner is recorded as no owner at all, as every bucket made before there were users is.
     const std::string me = c->user ? c->user->id : std::string(default_owner);
-    m_node.create_bucket(name, me == default_owner ? std::string() : me, [this, weak, name, lock, me](st s)
+    m_node.create_bucket(name, me == default_owner ? std::string() : me, [this, weak, hold = c, name, lock, me](st s)
     {
         auto answer = [this, weak, name, me](st a)
         {
@@ -774,22 +774,19 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
         }
         if (!lock)
         {
-            auto cc = weak.lock();
-            if (!cc || cc->dead)
-                return;
-            create_bucket_docs(cc, name, answer);
+            // The docs are written for a client that has gone, so the bucket keeps the ACL it was asked for.
+            create_bucket_docs(hold, name, answer);
             return;
         }
         // Versioning first, since object lock is refused on a bucket without it, and a bucket left without the
         // lock it was asked for is not left at all.
-        m_node.set_doc(bucket_doc::versioning, name, versioning_xml(versioning::enabled), [this, weak, name, answer](st v)
+        m_node.set_doc(bucket_doc::versioning, name, versioning_xml(versioning::enabled), [this, hold, name, answer](st v)
         {
-            auto locked = [this, weak, name, answer](st l)
+            auto locked = [this, hold, name, answer](st l)
             {
                 if (l == st::ok)
                 {
-                    if (auto cc = weak.lock(); cc && !cc->dead)
-                        create_bucket_docs(cc, name, answer);
+                    create_bucket_docs(hold, name, answer);
                     return;
                 }
                 m_node.delete_bucket(name, [answer, l](st) { answer(l); });

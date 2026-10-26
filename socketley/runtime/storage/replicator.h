@@ -175,7 +175,7 @@ public:
     void stop();
 
     const replication_counters& counters() const { return m_c; }
-    // Versions and delete markers waiting to be copied, across every target, and changes waiting for another node.
+    // Versions and delete markers waiting to be copied, across every target; node_pending() counts the changes waiting for another node.
     uint64_t pending() const { return m_pending - m_node_pending; }
     uint64_t node_pending() const { return m_node_pending; }
     // The nodes this shard has not yet queued all it holds for, or not yet asked whether they need it.
@@ -362,6 +362,8 @@ private:
     uint64_t      m_node_pending{0};
     // Destinations still to take each version, by bucket, key and version id, so its status is written once.
     std::unordered_map<std::string, uint32_t> m_open;
+    // The versions a destination refused while others were still to copy them.
+    std::unordered_set<std::string> m_refused;
     // The copies of each change staged and not yet settled, by ticket.
     struct staged_copies
     {

@@ -153,7 +153,7 @@ check '[ -n "$L2" ] && status "$L2" | grep -q "^quorum: *reachable (2 of 3"' "th
 # ─── restart it: same id, log recovered, a follower of the new leader ──────
 case $L in a) port=$PB;; b) port=$((PB+1));; c) port=$((PB+2));; esac
 node_start "$L" --raft-listen 127.0.0.1:$port --raft-insecure --raft-name "$L"
-recovered=$(grep -oE 'snapshot [0-9]+ and [0-9]+ entries recovered' "$T/$L.log" | tail -1)
+recovered=$(grep -oE 'snapshot [0-9]+ and [0-9]+ entries recovered' "$T/$L.log" | tail -1 || true)
 snap_at=$(awk '{print $2}' <<<"$recovered"); entries=$(awk '{print $4}' <<<"$recovered")
 check '[ -n "$recovered" ] && [ $((snap_at + entries)) -gt 0 ]' "the restarted node recovered nothing from its WAL ($recovered)"
 check '[ "$(myid "$L")" = "$old_id" ]' "the restarted node has a different id"

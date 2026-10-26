@@ -168,7 +168,7 @@ def heal():
           body(a, "hkept", "k") == b"HEALNEW" * 1000 and body(a, "hkept", "k", v2) == b"HEALNEW" * 1000)
     seen = stats(a_name).get("scrub_corrupt", 0)
     passes = stats(a_name).get("scrub_passes", 0)
-    wait_for(lambda: stats(a_name).get("scrub_passes", 0) >= passes + 2, 30)
+    check("two passes ran after the heal", wait_for(lambda: stats(a_name).get("scrub_passes", 0) >= passes + 2, 30), stats(a_name))
     check("and the passes after find nothing more", stats(a_name).get("scrub_corrupt", 0) == seen, stats(a_name))
     check("the other node removed nothing", body(b, "hkept", "k", v1) == b"HEALOLD" * 1000 and
           body(b, "hplain", "obj") == b"HEALPLAIN" * 1000)

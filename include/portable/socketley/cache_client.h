@@ -188,7 +188,7 @@ public:
 
     cache_client(cache_client&& o) noexcept
         : m_fd(o.m_fd), m_host(std::move(o.m_host)), m_port(o.m_port),
-          m_buf(std::move(o.m_buf))
+          m_buf(std::move(o.m_buf)), m_recv_timeout_ms(o.m_recv_timeout_ms)
     {
         o.m_fd = detail::platform::invalid_socket;
     }
@@ -202,6 +202,7 @@ public:
             m_host = std::move(o.m_host);
             m_port = o.m_port;
             m_buf = std::move(o.m_buf);
+            m_recv_timeout_ms = o.m_recv_timeout_ms;
             o.m_fd = detail::platform::invalid_socket;
         }
         return *this;
@@ -215,7 +216,11 @@ public:
         m_host = host;
         m_port = port;
         m_fd = detail::platform::tcp_connect(host, port);
-        return m_fd != detail::platform::invalid_socket;
+        if (m_fd == detail::platform::invalid_socket)
+            return false;
+        if (m_recv_timeout_ms)
+            apply_recv_timeout(m_recv_timeout_ms);
+        return true;
     }
 
     void close()
@@ -242,19 +247,8 @@ public:
 
     void set_recv_timeout(uint32_t ms)
     {
-        if (m_fd == detail::platform::invalid_socket)
-            return;
-#ifdef _WIN32
-        DWORD tv = ms;
-        setsockopt(m_fd, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-        struct timeval tv{};
-        tv.tv_sec = static_cast<long>(ms / 1000);
-        tv.tv_usec = static_cast<long>((ms % 1000) * 1000);
-        setsockopt(m_fd, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&tv), sizeof(tv));
-#endif
+        m_recv_timeout_ms = ms;
+        apply_recv_timeout(ms);
     }
 
     const std::string& host() const { return m_host; }
@@ -605,13 +599,39 @@ private:
     std::string m_host;
     uint16_t m_port{0};
     std::string m_buf;
+    uint32_t m_recv_timeout_ms{0};
+
+    void apply_recv_timeout(uint32_t ms)
+    {
+        if (m_fd == detail::platform::invalid_socket)
+            return;
+#ifdef _WIN32
+        DWORD tv = ms;
+        setsockopt(m_fd, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
+        struct timeval tv{};
+        tv.tv_sec = static_cast<long>(ms / 1000);
+        tv.tv_usec = static_cast<long>((ms % 1000) * 1000);
+        setsockopt(m_fd, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&tv), sizeof(tv));
+#endif
+    }
 
     bool send_cmd(const std::string& cmd)
     {
         if (m_fd == detail::platform::invalid_socket)
             return false;
+        // A newline would split the command in two and shift every later reply by one.
+        if (cmd.find('\n') != std::string::npos)
+            return false;
         std::string msg = cmd + "\n";
-        return detail::platform::send_all(m_fd, msg.data(), msg.size());
+        if (!detail::platform::send_all(m_fd, msg.data(), msg.size()))
+        {
+            close();
+            return false;
+        }
+        return true;
     }
 
     std::string read_line()
@@ -674,6 +694,7 @@ private:
         cache_result r;
         r.ok = true;
 
+        bool first = true;
         for (;;)
         {
             std::string line = read_line();
@@ -684,12 +705,13 @@ private:
             }
             if (line == "end")
                 break;
-            if (is_error_response(line))
+            if (first && is_error_response(line))
             {
                 r.ok = false;
                 r.value = std::move(line);
                 break;
             }
+            first = false;
             r.values.push_back(std::move(line));
         }
 

@@ -2127,7 +2127,8 @@ void bsock_recv(world& w, int idx)
                 if (p >= buf.size())
                     break;
                 pos = p;
-                if (digits)
+                // A mark that ended inside the carry was noted by the read before.
+                if (digits && p >= carry_len)
                     bsock_note_request(b, id, buf_off + at);
             }
 
@@ -3077,7 +3078,6 @@ void run_step(world& w, const step& s)
                 for (int k = 0; k < NCLIENTS; k++)
                     if (w.cli[k].proxy_fd == target)
                         w.cli[k].self_closed = true;
-                c.self_closed = true;
             }
             break;
         }
@@ -3232,12 +3232,28 @@ void write_lua_script()
     ::close(fd);
     if (ok)
         g_lua_path = new std::string(path);
+    else
+        ::unlink(path);
+}
+
+// The proxy reads these paths when it starts, so they can only go at exit.
+void unlink_shm_files()
+{
+    for (const char* ext : { "crt", "key", "lua" })
+    {
+        char path[128];
+        std::snprintf(path, sizeof(path), "/dev/shm/socketley-fuzz-proxy-%d.%s",
+                      static_cast<int>(::getpid()), ext);
+        ::unlink(path);
+    }
 }
 
 void init_once()
 {
     if (g_loop)
         return;
+
+    std::atexit(unlink_shm_files);
 
     // The runtime logs a line whenever a timer withdrawal does not reach the
     // ring and on a few other conditions this target deliberately provokes.

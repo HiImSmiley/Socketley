@@ -224,7 +224,7 @@ private:
     void fetch_range(target& t, lane& l);
     // The fetch on `l` is over: placed when it is whole, its temporary file removed when it is not.
     void fetch_end(target& t, lane& l, bool whole);
-    void finish_pull(target& t);
+    void finish_pull();
     // The path below --dir a key names, false for one outside --prefix or one no file may be named.
     bool rel_of_key(std::string_view key, std::string& rel) const;
     // Where a copy of `rel` is kept when both sides changed it: beside it, named for the moment.

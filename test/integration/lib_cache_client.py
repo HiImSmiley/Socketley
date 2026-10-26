@@ -85,15 +85,17 @@ def burst(acked_path, batch, targets):
                 f = conn.makefile("rwb", buffering=0)
             f.write("".join("set %s%d %d\n" % (PREFIX, i + k, i + k) for k in range(batch)).encode())
             good = 0
-            for k in range(batch):
-                reply = f.readline()
-                if not reply:
-                    raise EOFError("closed")
-                if reply.rstrip(b"\r\n") == b"ok":
-                    good += 1
-            now = time.time_ns()
-            out.write("".join("%d %d %s\n" % (i + k, now, targets[at % len(targets)]) for k in range(good)))
-            i += good
+            try:
+                for k in range(batch):
+                    reply = f.readline()
+                    if not reply:
+                        raise EOFError("closed")
+                    if reply.rstrip(b"\r\n") == b"ok":
+                        good += 1
+            finally:
+                now = time.time_ns()
+                out.write("".join("%d %d %s\n" % (i + k, now, targets[at % len(targets)]) for k in range(good)))
+                i += good
             if good == batch:
                 continue
         except (OSError, EOFError):

@@ -41,7 +41,8 @@ BIN="${BIN:-$HERE/../../bin/Release/socketley}"
 
 if ! command -v openssl >/dev/null 2>&1; then
     echo "=== Integration: a client gives up on a target that never handshakes ==="
-    echo "  SKIP: openssl CLI not available (needed to generate a certificate)"
+    echo "  NOT ASSERTED: openssl CLI not available (needed to generate a certificate)"
+    echo "  Results: 0/0 passed (0 failed, 1 not asserted)"
     exit 0
 fi
 
@@ -76,7 +77,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=127.0.0.1" \
     -keyout "$TMPD/key.pem" -out "$TMPD/cert.pem" >/dev/null 2>&1 || true
 if [ -s "$TMPD/cert.pem" ] && [ -s "$TMPD/key.pem" ]; then pass
 else
-    echo "  SKIP: openssl could not generate a certificate"
+    echo "  NOT ASSERTED: openssl could not generate a certificate"
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, 1 not asserted)"
     exit 0
 fi
 
@@ -107,7 +109,8 @@ disown "$HOLDER" 2>/dev/null || true
 
 READY=""
 for _ in $(seq 1 40); do
-    ss -ltn 2>/dev/null | grep -q ":$STALL " && { READY=yes; break; }
+    listeners=$(ss -ltn 2>/dev/null || true)
+    [[ $listeners == *":$STALL "* ]] && { READY=yes; break; }
     sleep 0.25
 done
 if [ "$READY" = yes ]; then pass

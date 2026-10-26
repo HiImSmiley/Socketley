@@ -615,7 +615,8 @@ tar_reader::status tar_reader::next(entry& e, std::string& why)
                     if (sp == std::string::npos)
                         break;
                     const size_t len = std::strtoull(body.c_str() + at, nullptr, 10);
-                    if (len == 0 || at + len > body.size())
+                    // A record shorter than its own length, space and newline is no record, and would underflow below.
+                    if (len == 0 || at + len > body.size() || at + len < sp + 2 || body[at + len - 1] != '\n')
                         break;
                     const std::string rec = body.substr(sp + 1, at + len - sp - 2);
                     const size_t eq = rec.find('=');

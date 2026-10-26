@@ -114,6 +114,9 @@ if mode == 'watch':
     # the connection now rather than walking the whole map
     d = conn(port); d.sendall(b''.join(enc(['WATCH','m:%d' % i]) for i in range(5000)))
     time.sleep(0.4); d.close(); time.sleep(0.3)
+    for i in (0, 2500, 4999): send(b,['SET','m:%d' % i,'1'])
+    send(a,['WATCH','m:0']); send(a,['MULTI'],['SET','m:0','Y'])
+    out['after_bulk_write'] = send(a,['EXEC'])
     send(a,['SET','k','1']); send(a,['WATCH','k']); send(a,['MULTI'],['SET','k','Z'])
     out['after_bulk_close'] = send(a,['EXEC'])
     a.close(); b.close()
@@ -238,6 +241,9 @@ for T in mset multidel eval; do
 done
 case "$(printf '%s' "$W" | val after_bulk_close)" in *'+OK'*) ok "5000 watches left with their client" ;;
     *) bad "close" "a departed bulk watcher still aborts other transactions" ;; esac
+
+case "$(printf '%s' "$W" | val after_bulk_write)" in *'+OK'*) ok "a write to a departed watcher's key leaves a fresh watch intact" ;;
+    *) bad "close" "a fresh watch on a key the departed client watched aborted" ;; esac
 
 echo "--- 2. the confirmation a client counts down from ---"
 P1=$(py patterns)

@@ -329,6 +329,7 @@ fi
 # #1, the proxy has to stop dialling #2 and #3 -- paths nobody serves -- and
 # the log has to say it took the new set.
 "$BIN" stop cn_srvs >/dev/null 2>&1
+wait_for '[ "$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)" -eq 0 ]'
 "$BIN" edit cn_srvs --shards 2 >/dev/null 2>&1
 "$BIN" start cn_srvs >/dev/null 2>&1
 # The proxy saying it took #0 and #1 again is it having followed the restart.

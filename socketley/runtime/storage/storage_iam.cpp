@@ -65,14 +65,17 @@ st storage_run::iam_take(int64_t rev, const std::string& json)
         return st::io_error;
     }
     // The document changed last on any node is every node's.
-    bool ok = true;
+    bool ok = true, written = false;
     const bool newer = rev > read_rev(file);
     if (newer)
-        ok = replace_file(file, json, durability::data_and_dir) &&
-             replace_file(file + ".rev", std::to_string(rev), durability::data_and_dir);
+    {
+        written = replace_file(file, json, durability::data_and_dir);
+        ok = written && replace_file(file + ".rev", std::to_string(rev), durability::data_and_dir);
+    }
     ::flock(lfd, LOCK_UN);
     ::close(lfd);
-    if (newer && ok)
+    // The document on disk is what is enforced, so a revision that failed to follow it still refreshes.
+    if (written)
         m_auth->refresh();
     return ok ? st::ok : st::io_error;
 }

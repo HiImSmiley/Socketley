@@ -561,10 +561,12 @@ std::optional<candidate> best_candidate(const std::vector<candidate>& from)
 
 std::string replica_address(const std::vector<std::string>& args, std::string_view host)
 {
+    // The last -p, as the flag parser and cache_flags_refusal both take it.
+    std::string port;
     for (size_t i = 0; i + 1 < args.size(); ++i)
         if (args[i] == "-p")
-            return std::string(host) + ":" + args[i + 1];
-    return {};
+            port = args[i + 1];
+    return port.empty() ? std::string() : std::string(host) + ":" + port;
 }
 
 }   // namespace socketley::cluster

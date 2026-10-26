@@ -187,7 +187,9 @@ while True:
         pass
 PY
 IMP=$!
-for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/$TP) 2>/dev/null && break; sleep 0.1; done
+imp_up=0
+for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/$TP) 2>/dev/null && { imp_up=1; break; }; sleep 0.1; done
+[ "$imp_up" = 1 ] && ok "the impostor listens" || bad "the impostor listens" "no connect to $TP"
 : > "$T/imp.log"
 out=$(SOCKETLEY_GIT_ACCESS_KEY=$ALICE_K SOCKETLEY_GIT_SECRET=$ALICE_S "$BIN" git-sync --url "git://127.0.0.1:$GP/demo.git" \
     --branch main --work "$T/impostor" --endpoint "127.0.0.1:$TP" --tls --bucket code --name demo 2>&1); rc=$?

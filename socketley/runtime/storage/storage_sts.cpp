@@ -356,7 +356,9 @@ void storage_run::sts_federated_session(const std::shared_ptr<conn>& c, std::str
         }
         if (rc == 1)
         {
-            duration = std::min(duration, longest_role);
+            // 0 is a role with no cap of its own, as the other path reads it, and not credentials that end at once.
+            if (longest_role > 0)
+                duration = std::min(duration, longest_role);
             role     = std::string(rname);
         }
     }

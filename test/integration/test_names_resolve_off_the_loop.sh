@@ -53,7 +53,7 @@ else fail "a server's upstream named by host dials within a second" \
           "upstreams: '$(upstreams nl_up)', target connections: '$(conns nl_tgt)'"; fi
 
 "$BIN" create client nl_cli -t "localhost:$TGT" --reconnect 10 -s >/dev/null
-sleep 0.4
+wait_for "conns nl_tgt" 2 30 || true
 BEFORE=$(conns nl_tgt)
 
 # The client reconnects through its resolver once the target is back; the

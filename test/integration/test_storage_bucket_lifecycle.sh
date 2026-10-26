@@ -75,7 +75,8 @@ run_lib() {   # label runtime mode args...
     p=$(echo "$out" | grep -c '^  PASS')
     f=$(echo "$out" | grep -c '^  FAIL')
     PASS=$((PASS+p)); FAIL=$((FAIL+f)); TOTAL=$((TOTAL+p+f))
-    if [ "$rc" -ne 0 ] && [ "$f" -eq 0 ]; then bad "$label" "exit $rc: $out"; fi
+    if [ "$rc" -ne 0 ] && [ "$f" -eq 0 ]; then bad "$label" "exit $rc: $out"
+    elif [ "$p" -eq 0 ] && [ "$f" -eq 0 ]; then bad "$label" "no PASS or FAIL line: $out"; fi
 }
 
 echo "=== Integration: bucket lifecycle ==="

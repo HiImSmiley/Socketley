@@ -6,7 +6,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/eventfd.h>
-#include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <cerrno>
@@ -676,7 +675,6 @@ inline void event_loop::arm(io_request* req, uint32_t target, uint32_t target2)
                       "completion will be dropped and whatever waits for it will "
                       "wait for ever.  Set io_request::owner before submitting.");
         }
-        ++m_stat_ownerless;
     }
     req->owner_token = tok;
 
@@ -1807,16 +1805,6 @@ void event_loop::return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, u
     io_uring_buf_ring_advance(pool.ring, count);
 }
 
-bool event_loop::has_buf_ring(uint16_t group_id) const
-{
-    return group_id < MAX_BUF_GROUPS && m_buf_rings[group_id].ring != nullptr;
-}
-
-bool event_loop::recv_multishot_supported() const
-{
-    return m_recv_multishot_supported;
-}
-
 bool event_loop::recv_multishot_enabled() const
 {
     // The environment read once, the same way recv_bundle_enabled() reads its
@@ -2171,20 +2159,6 @@ bool event_loop::submit_connect(int fd, const struct sockaddr* addr, socklen_t l
     return true;
 }
 
-bool event_loop::register_files(const int* fds, uint32_t count)
-{
-    if (m_files_registered)
-        return false;
-
-    int ret = io_uring_register_files(&m_ring, fds, count);
-    if (ret < 0)
-        return false;
-
-    m_files_registered = true;
-    m_registered_file_count = count;
-    return true;
-}
-
 bool event_loop::update_registered_file(uint32_t idx, int fd)
 {
     if (!m_files_registered || idx >= m_registered_file_count)
@@ -2192,16 +2166,6 @@ bool event_loop::update_registered_file(uint32_t idx, int fd)
 
     int ret = io_uring_register_files_update(&m_ring, idx, &fd, 1);
     return ret >= 0;
-}
-
-void event_loop::unregister_files()
-{
-    if (m_files_registered)
-    {
-        io_uring_unregister_files(&m_ring);
-        m_files_registered = false;
-        m_registered_file_count = 0;
-    }
 }
 
 // Bitmap-based fixed file slot allocator, returning the index of a free slot

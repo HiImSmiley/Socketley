@@ -286,7 +286,7 @@ size_t bayes::apply(std::string_view text)
             break;
         const std::string_view l = text.substr(used, nl - used);
         used = nl + 1;
-        if (l.size() < 19 || (l[0] != 's' && l[0] != 'h') || l[1] != ' ')
+        if (l.size() < 18 || (l[0] != 's' && l[0] != 'h') || l[1] != ' ')
             continue;
         const uint64_t message = std::strtoull(std::string(l.substr(2, 16)).c_str(), nullptr, 16);
         std::vector<uint32_t> tokens;

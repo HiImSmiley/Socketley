@@ -171,6 +171,17 @@ content_type_ref& content_type_ref::operator=(std::string_view v)
     // Leaked on purpose, so an assignment made while statics are torn down never meets a destroyed pool.
     static std::mutex& mu   = *new std::mutex;
     static pool_t&     pool = *new pool_t;
+    // A view into the string this holds is copied first, since release() frees it.
+    std::string held;
+    if (owned())
+    {
+        const std::string* own = ptr();
+        if (v.data() >= own->data() && v.data() <= own->data() + own->size())
+        {
+            held.assign(v);
+            v = held;
+        }
+    }
     release();
     if (v.empty())
         return *this;
@@ -873,7 +884,8 @@ void reserve_checksum(object_meta& m, checksum_algo algo, uint16_t composite)
 bool part_trailer_of(const object_meta& m, part_trailer& out)
 {
     const std::string* v = extra_of(m, part_layout_extra);
-    if (!v || m.parts == 0)
+    // No upload has more parts than S3's 10000, so a count past it is a meta not to size a read by.
+    if (!v || m.parts == 0 || m.parts > 10000)
         return false;
     const std::string_view s(*v);
     const size_t semi  = s.find(';');

@@ -4,7 +4,6 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <queue>
 #include <vector>
 #include <netinet/in.h>
 #include <linux/time_types.h>
@@ -29,8 +28,6 @@ struct client_tcp_connection
     // to half of this one.
     size_t write_off{0};
     std::string partial;
-
-    static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     bool read_pending{false};
     bool write_pending{false};

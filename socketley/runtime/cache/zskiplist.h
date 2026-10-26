@@ -327,6 +327,7 @@ public:
     }
     const_iterator last() const
     {
+        if (empty()) return end();
         return big() ? const_iterator(tail(), this)
                      : const_iterator(m_count - 1, prev_off(m_pack.size()), this);
     }
@@ -397,6 +398,12 @@ public:
 private:
     void insert_big(double score, std::string_view member)
     {
+        // The index grows before anything is linked, so a failed allocation leaves the list as it was.
+        {
+            member_index* x = ix();
+            if (!ix_room(x->cap, x->size, x->tombs))
+                ix_rebuild(ix_cap_after_insert(x->cap, x->size, x->tombs));
+        }
         node*  update[max_level];
         size_t rank[max_level];
         node*  x = m_big.head;
@@ -731,9 +738,12 @@ private:
         for (size_t off = 0; off < m_pack.size(); off = next_off(off))
             items.emplace_back(score_at(off), std::string(member_at(off)));
         node* head = make_node(max_level, 0.0, {});
+        member_index* index = nullptr;
+        try { index = new member_index(); }
+        catch (...) { destroy(head); throw; }
         m_pack.~pack_buf();
         m_big.head = head;
-        m_big.aux  = new member_index();
+        m_big.aux  = index;
         m_count = 0;
         m_level = 1;
         for (auto& [sc, member] : items)

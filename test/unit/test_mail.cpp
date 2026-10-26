@@ -41,7 +41,6 @@ struct fake : smtp_session::hooks
     std::string out;
     std::vector<std::string> messages;
     std::string body;
-    bool in_data{false};
     bool closed{false};
     bool tls{false};
     bool hold{false};
@@ -91,20 +90,17 @@ struct fake : smtp_session::hooks
     {
         if (refuse_data)
             return false;
-        in_data = true;
         body.clear();
         return true;
     }
     void data_bytes(std::string_view p) override { body.append(p); }
     void data_end(std::function<void(rcpt_verdict)> done) override
     {
-        in_data = false;
         messages.push_back(body);
         answer([done] { done({250, "queued"}); });
     }
     void data_abort(bool) override
     {
-        in_data = false;
         ++aborted;
     }
     void close() override { closed = true; }
@@ -533,6 +529,7 @@ TEST_CASE("DKIM: dkimpy's signatures verify here, in both canonicalizations, and
         CHECK(dkim::verify(head, sigs[0], dkim_record, 1792552976) == dkim::result::fail);
     }
     const auto sigs = dkim::signatures(dkim_signed_relaxed);
+    REQUIRE(sigs.size() == 1);
     CHECK(dkim::verify(dkim_signed_relaxed, sigs[0], "", 0) == dkim::result::permerror);
     CHECK(dkim::verify(dkim_signed_relaxed, sigs[0], "v=DKIM1; p=", 0) == dkim::result::fail);
     // Whitespace the relaxed canonicalization is allowed to take changes nothing.
@@ -566,7 +563,6 @@ TEST_CASE("DKIM: what this signs, it verifies, and the canonicalizations are RFC
     REQUIRE(sigs.size() == 1);
     CHECK(dkim::verify(signed_msg, sigs[0], dkim::public_record(key.get()), 1000) == dkim::result::pass);
     // A second From added on the way is caught, since From is signed once more than it is there.
-    const std::string forged = signed_msg + "";
     std::string two = signed_msg;
     two.insert(two.find("To: "), "From: evil@else.test\r\n");
     CHECK(dkim::verify(two, sigs[0], dkim::public_record(key.get()), 1000) == dkim::result::fail);
@@ -672,7 +668,6 @@ namespace
 struct table_resolver : check_resolver
 {
     std::map<std::string, std::vector<std::string>> txts, addresses, mxs;
-    int asked{0};
     bool txt(const std::string& name, std::vector<std::string>& out, bool& nx) override { return get(txts, name, out, nx); }
     bool addrs(const std::string& name, std::vector<std::string>& out, bool& nx) override
     {
@@ -682,7 +677,6 @@ struct table_resolver : check_resolver
     bool get(const std::map<std::string, std::vector<std::string>>& m, const std::string& name,
              std::vector<std::string>& out, bool& nx)
     {
-        ++asked;
         const auto it = m.find(name);
         nx = it == m.end();
         if (!nx)
@@ -1287,7 +1281,9 @@ TEST_CASE("DKIM: Ed25519 signs and verifies, l= short of the body is no pass, an
     CHECK(s[0].l == "10");
     CHECK(dkim::verify(s2, s[0], dkim::public_record(rsa.get()), 1000) == dkim::result::pass);
     const std::string appended = s2 + "a line of someone else's\r\n";
-    CHECK(dkim::verify(appended, dkim::signatures(appended)[0], dkim::public_record(rsa.get()), 1000) ==
+    const auto appended_sigs = dkim::signatures(appended);
+    REQUIRE(appended_sigs.size() == 1);
+    CHECK(dkim::verify(appended, appended_sigs[0], dkim::public_record(rsa.get()), 1000) ==
           dkim::result::neutral);
     // A d= with a space in it would write a result of its own into this host's Authentication-Results.
     std::string spaced = s2;
@@ -1340,7 +1336,6 @@ TEST_CASE("SPF: IPv6 %{i}, %{h} from HELO, other delimiters, upper-case escapes,
 TEST_CASE("DMARC: pct= samples the policy, two records are none, a name past ASCII is its A-labels")
 {
     table_resolver r;
-    const std::string msg = "From: a@sample.test\r\nMessage-ID: <%s@x>\r\n\r\nbody\r\n";
     r.txts["_dmarc.sample.test"] = {"v=DMARC1; p=reject; pct=0"};
     auto res = check_inbound("From: a@sample.test\r\nMessage-ID: <1@x>\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0);
     CHECK(res.dmarc == "fail");

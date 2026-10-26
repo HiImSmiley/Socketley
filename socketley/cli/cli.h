@@ -16,7 +16,7 @@ int cli_mail_send(int argc, char** argv);
 int cli_mail(int argc, char** argv);
 int cli_mqtt_sub(int argc, char** argv);
 int cli_mqtt_passwd(int argc, char** argv);
-int cli_stdin_send(int argc, char** argv);
+int cli_stdin_send(char** argv);
 int cli_edit(int argc, char** argv);
 int cli_import(int argc, char** argv);
 int cli_runtime_action(int argc, char** argv);

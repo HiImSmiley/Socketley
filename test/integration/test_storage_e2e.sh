@@ -136,7 +136,8 @@ run_py() {   # port mode [args]   -> counted into the totals
     echo "$out" | grep -E '^  (PASS|FAIL)'
     p=$(echo "$out" | grep -c '^  PASS'); f=$(echo "$out" | grep -c '^  FAIL')
     PASS=$((PASS+p)); FAIL=$((FAIL+f)); TOTAL=$((TOTAL+p+f))
-    if [ "$rc" -ne 0 ] && [ "$f" -eq 0 ]; then bad "the library ran" "exit $rc: $(echo "$out" | tail -5)"; fi
+    if [ "$rc" -ne 0 ] && [ "$f" -eq 0 ]; then bad "the library ran" "exit $rc: $(echo "$out" | tail -5)"
+    elif [ "$p" -eq 0 ] && [ "$f" -eq 0 ]; then bad "the library ran" "no PASS or FAIL line: $out"; fi
 }
 
 arm() {   # shards port
@@ -169,13 +170,14 @@ arm() {   # shards port
 
     # ── what an upload leaves on the disk ──
     local left=1
+    [ -d "$T/data$n/e2ebkt/mpu" ] && [ -d "$T/data$n/e2ebkt/tmp" ] || bad "the bucket's mpu and tmp directories exist" "$(ls "$T/data$n" 2>&1 | tr '\n' ' ')"
     for _ in $(seq 1 40); do
         left=$(find "$T/data$n/e2ebkt/mpu" -mindepth 1 2>/dev/null | wc -l)
         [ "$left" = 0 ] && break
         sleep 0.25
     done
     expect "no upload directory or part file is left on the disk" "$left" 0
-    expect "and nothing is left in tmp/" "$(ls "$T/data$n/e2ebkt/tmp" | wc -l)" 0
+    expect "and nothing is left in tmp/" "$(ls "$T/data$n/e2ebkt/tmp" 2>&1 | wc -l)" 0
 
     # ── stats and metrics ──
     local uniq

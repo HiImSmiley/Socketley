@@ -192,7 +192,21 @@ bool recv_handover(int channel_fd, handover& h, int& out_fd)
                 break;
             }
         }
-    if (n <= 0 || static_cast<size_t>(n) != frame_buf.size() || (msg.msg_flags & MSG_CTRUNC))
+    // The rest of a frame the sender had to finish with send() after its sendmsg, waited for as long as it waits.
+    size_t got = n > 0 ? static_cast<size_t>(n) : 0;
+    while (n > 0 && got < frame_buf.size() && !(msg.msg_flags & MSG_CTRUNC))
+    {
+        struct pollfd pfd{channel_fd, POLLIN, 0};
+        if (::poll(&pfd, 1, 1000) <= 0)
+            break;
+        const ssize_t m = ::recv(channel_fd, frame_buf.data() + got, frame_buf.size() - got, 0);
+        if (m < 0 && errno == EINTR)
+            continue;
+        if (m <= 0)
+            break;
+        got += static_cast<size_t>(m);
+    }
+    if (n <= 0 || got != frame_buf.size() || (msg.msg_flags & MSG_CTRUNC))
     {
         if (fd >= 0)
             ::close(fd);

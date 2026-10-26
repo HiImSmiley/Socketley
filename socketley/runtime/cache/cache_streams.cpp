@@ -1041,7 +1041,7 @@ struct stream_commands
                 return;
             }
         }
-        if (delivery == -1 || delivery < 0 || delivery > now) delivery = now;
+        if (delivery < 0 || delivery > now) delivery = now;
 
         std::string& body = ci.m_stream_scratch;
         body.clear();

@@ -93,6 +93,11 @@ TEST_CASE("a browser is sent back only to the provider's host or the cookie doma
     CHECK_FALSE(return_allowed("http://app.example.com/", iss, "example.com"));
     CHECK_FALSE(return_allowed("javascript:alert(1)", iss, "example.com"));
     CHECK(url_host("https://Auth.Example.com:8443/p") == "auth.example.com");
+    // A browser drops the tab and goes to //evil.example.
+    CHECK_FALSE(return_allowed("/\t/evil.example", iss, ""));
+    CHECK_FALSE(return_allowed("/\n/evil.example", iss, ""));
+    CHECK(url_host("https://[::1]:8443/cb") == "[::1]");
+    CHECK(url_host("https://[::1]evil.example/cb").empty());
 }
 
 TEST_CASE("a token verifies with its own key and fails every way it was not made")
@@ -481,7 +486,8 @@ TEST_CASE("signing with one key, then another, then the first, signs each with i
     }
     // A signature whose r or s is short, which DER writes without its leading zeros, is padded on the left.
     int short_ones = 0;
-    for (int i = 0; i < 600 && short_ones < 2; ++i)
+    // About one signature in 128 has one, so 600 missed both one run in a hundred; 4000 misses one in 10^13.
+    for (int i = 0; i < 4000 && short_ones < 2; ++i)
     {
         const std::string in = "n" + std::to_string(i);
         const std::string s = socketley::jws::es256(a, in);

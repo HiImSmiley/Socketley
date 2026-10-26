@@ -28,22 +28,31 @@ bool field_string(lua_State* L, int t, const char* name, std::string& out)
     return ok;
 }
 
+// The string on top of the stack whole, false for one with a NUL, which would cut an address short unseen.
+bool whole_string(lua_State* L, std::vector<std::string>& out)
+{
+    size_t n = 0;
+    const char* p = lua_tolstring(L, -1, &n);
+    if (std::string_view(p, n).find('\0') != std::string_view::npos)
+        return false;
+    out.emplace_back(p, n);
+    return true;
+}
+
 // A string, or a list of strings.
 bool field_list(lua_State* L, int t, const char* name, std::vector<std::string>& out)
 {
     lua_getfield(L, t, name);
     bool ok = true;
     if (lua_type(L, -1) == LUA_TSTRING)
-        out.emplace_back(lua_tostring(L, -1));
+        ok = whole_string(L, out);
     else if (lua_type(L, -1) == LUA_TTABLE)
     {
         const int n = static_cast<int>(lua_objlen(L, -1));
         for (int i = 1; i <= n && ok; ++i)
         {
             lua_rawgeti(L, -1, i);
-            ok = lua_type(L, -1) == LUA_TSTRING;
-            if (ok)
-                out.emplace_back(lua_tostring(L, -1));
+            ok = lua_type(L, -1) == LUA_TSTRING && whole_string(L, out);
             lua_pop(L, 1);
         }
     }
@@ -74,6 +83,8 @@ lua_mail_client::mode lua_mail_client::begin(lua_State* L, int)
     if (logical != 2 || lua_type(L, 1) != LUA_TSTRING || lua_type(L, 2) != LUA_TTABLE)
         return refuse(send_usage);
     const std::string target = lua_tostring(L, 1);
+    if (target.empty())
+        return refuse(send_usage);
     socketley::mail::compose c;
     if (!field_list(L, 2, "to", c.to) || !field_list(L, 2, "cc", c.cc) || !field_list(L, 2, "bcc", c.bcc) ||
         !field_string(L, 2, "from", c.from) || !field_string(L, 2, "reply_to", c.reply_to) ||

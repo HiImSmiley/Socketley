@@ -92,6 +92,7 @@ int main()
             {
                 fds[nfds].fd = client;
                 fds[nfds].events = POLLIN;
+                fds[nfds].revents = 0;
                 ++nfds;
             }
             else if (client >= 0)
@@ -117,7 +118,12 @@ int main()
             }
 
             // Echo back
-            if (write(fds[i].fd, buf, n) < 0) {}
+            if (send(fds[i].fd, buf, static_cast<size_t>(n), MSG_NOSIGNAL | MSG_DONTWAIT) != n)
+            {
+                close(fds[i].fd);
+                fds[i] = fds[--nfds];
+                --i;
+            }
         }
     }
 

@@ -14,10 +14,10 @@
 #include <functional>
 #include <set>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
-#include <openssl/evp.h>
 #include <openssl/sha.h>
 
 #include "compression.h"
@@ -288,7 +288,7 @@ bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
             const std::string s(text);
             char* end = nullptr;
             out = std::strtoll(s.c_str(), &end, 10);
-            return !s.empty() && end && !*end;
+            return !s.empty() && !*end;
         };
         long long iat = 0, exp = 0;
         if (!number(val.substr(a + 1, b - a - 1), iat) || !number(val.substr(b + 1, d - b - 1), exp) ||
@@ -907,7 +907,7 @@ void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
     p.key    = str_of(req, "key");
     p.t      = num_of(req, "t");
     p.d      = num_of(req, "d");
-    if (p.bucket.empty() || p.key.empty() || !(p.d >= 0) || p.t > p.d + 1)
+    if (p.bucket.empty() || p.key.empty() || !(p.d >= 0) || !std::isfinite(p.d) || p.t > p.d + 1)
     {
         app_reply(c, 400, "A position names a bucket and a key, and lies within the film's length.\n");
         return;
@@ -926,13 +926,15 @@ void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
-        if (s != st::ok)
+        // A position is forgotten even when its film is gone.
+        if (s != st::ok && p.t >= 0)
         {
             app_reply(cc, 404, "No such object.\n");
             return;
         }
-        p.etag = m.etag();
-        p.at   = wall::now_ms();
+        if (s == st::ok)
+            p.etag = m.etag();
+        p.at = wall::now_ms();
         const std::string dir = m_store.options().dir + "/.ui";
         if ((::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST) ||
             (::mkdir((dir + "/progress").c_str(), 0700) < 0 && errno != EEXIST))
@@ -1028,7 +1030,10 @@ void storage_run::ui_library_body(const std::shared_ptr<conn>& c)
     tag_set tags;
     s3_error err;
     if (const auto xml = m_store.bucket_tagging(bucket); xml && !parse_tagging_xml(*xml, tags, err, max_bucket_tags))
-        tags.clear();
+    {
+        app_reply(c, 500, "The library's tags could not be read, so they are left as they are.\n");
+        return;
+    }
     std::erase_if(tags, [](const auto& t) { return t.first == "socketley:web-copies"; });
     if (on->b)
         tags.emplace_back("socketley:web-copies", "on");
@@ -1142,7 +1147,13 @@ void storage_run::ui_access_body(const std::shared_ptr<conn>& c)
     jvalue root;
     std::vector<std::string> statements;
     std::string head;
-    if (const bucket_policy* p = m_store.policy(bucket); p && json_reader(p->text()).document(root))
+    const bucket_policy* current = m_store.policy(bucket);
+    if (current && !json_reader(current->text()).document(root))
+    {
+        app_reply(c, 500, "The library's policy could not be read, so it is left as it is.\n");
+        return;
+    }
+    if (current)
         for (const auto& [k, v] : root.members)
         {
             if (k != "Statement")
@@ -1563,11 +1574,13 @@ void storage_run::ui_taken(const std::shared_ptr<conn>& c)
             {
                 auto f = std::make_shared<photo_facts>();
                 const int fd = o.fd;
-                auto done = [this, g, bucket, key, etag, add, hold, f, fd]()
+                auto done = [this, g, bucket, key, etag, add, hold, f, fd, status = o.status]()
                 {
                     if (fd >= 0)
                         m_loop.close_fd(fd);
-                    m_taken[bucket + '\n' + key + '\n' + etag] = *f;
+                    // A read that failed for lack of a descriptor says nothing about the photo, so it is asked again.
+                    if (status != st::io_error)
+                        m_taken[bucket + '\n' + key + '\n' + etag] = *f;
                     add(key, *f);
                     --g->left;
                     (*hold)();

@@ -270,7 +270,7 @@ void parse_into(part& p, std::string_view msg, size_t off, size_t len, int depth
     if (p.encoding.empty())
         p.encoding = "7BIT";
     const std::string_view body = msg.substr(p.body_off, p.body_len);
-    if (p.type == "text" || p.message())
+    if (p.type == "text" || p.message() || p.multipart())
         p.lines = count_lines(body);
     if (depth >= max_depth)
     {
@@ -786,7 +786,12 @@ bool iconv_utf8(std::string_view charset, std::string_view in, std::string& out)
     if (it == h.open.end())
     {
         if (h.open.size() >= 64)
-            return false;
+        {
+            for (auto& [n, old] : h.open)
+                if (old != reinterpret_cast<iconv_t>(-1))
+                    ::iconv_close(old);
+            h.open.clear();
+        }
         it = h.open.emplace(name, ::iconv_open("UTF-8", name.c_str())).first;
     }
     iconv_t cd = it->second;
@@ -954,13 +959,9 @@ std::string param(const std::vector<std::pair<std::string, std::string>>& params
             std::string raw;
             for (size_t i = b + 1; i < v.size(); ++i)
             {
-                const auto hex = [](char c) {
-                    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
-                         : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-                };
-                if (v[i] == '%' && i + 2 < v.size() && hex(v[i + 1]) >= 0 && hex(v[i + 2]) >= 0)
+                if (v[i] == '%' && i + 2 < v.size() && hex_value(v[i + 1]) >= 0 && hex_value(v[i + 2]) >= 0)
                 {
-                    raw += static_cast<char>(hex(v[i + 1]) * 16 + hex(v[i + 2]));
+                    raw += static_cast<char>(hex_value(v[i + 1]) * 16 + hex_value(v[i + 2]));
                     i += 2;
                 }
                 else
@@ -1176,7 +1177,7 @@ namespace
 
 const part* first_of(const part& p, std::string_view subtype, int depth)
 {
-    if (depth > 32)
+    if (depth > max_depth)
         return nullptr;
     if (p.multipart())
     {

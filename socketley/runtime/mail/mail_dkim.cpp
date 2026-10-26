@@ -3,10 +3,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
-#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <fcntl.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <openssl/pem.h>
@@ -122,8 +121,13 @@ key_ptr load_or_make(const std::string& path, std::string& why, bool ed25519)
     if (!make_key(path, why, ed25519))
         return nullptr;
     // What is at the path now, this one's key or the one another shard linked there first.
-    if (!socketley::read_file(path, pem, {}, &why) || pem.empty())
+    if (!socketley::read_file(path, pem, {}, &why))
         return nullptr;
+    if (pem.empty())
+    {
+        why = path + " holds no private key";
+        return nullptr;
+    }
     return load_pem(path, pem, why);
 }
 
@@ -391,9 +395,7 @@ std::vector<signature> signatures(std::string_view message, std::string_view hea
             else if (k == "h") s.h = no_space(v);
             else if (k == "bh") s.bh = no_space(v);
             else if (k == "b") s.b = no_space(v);
-            else if (k == "i") s.i = v;
             else if (k == "l") s.l = v;
-            else if (k == "t") s.t = v;
             else if (k == "x") s.x = v;
         }
         // A domain or selector that is no name would be a DNS name and a header of a sender's making.
@@ -505,7 +507,7 @@ result verify(std::string_view message, const signature& sig, std::string_view r
         return fail(result::permerror, "a tag the signature needs is missing");
     if (sig.a != "rsa-sha256" && sig.a != "ed25519-sha256")
         return fail(result::permerror, "an algorithm other than rsa-sha256 and ed25519-sha256");
-    if (!sig.x.empty() && std::atoll(sig.x.c_str()) < now_s)
+    if (!sig.x.empty() && std::strtoll(sig.x.c_str(), nullptr, 10) < now_s)
         return fail(result::fail, "the signature has expired");
     std::string hc = "simple", bc = "simple";
     if (!sig.c.empty())
@@ -538,7 +540,7 @@ result verify(std::string_view message, const signature& sig, std::string_view r
     bool partial = false;
     if (!sig.l.empty())
     {
-        const auto l = static_cast<size_t>(std::atoll(sig.l.c_str()));
+        const auto l = static_cast<size_t>(std::strtoll(sig.l.c_str(), nullptr, 10));
         if (l > canon.size())
             return fail(result::permerror, "l= is longer than the body");
         partial = l < canon.size();

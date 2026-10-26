@@ -46,7 +46,7 @@ std::optional<std::string> header_param(std::string_view header, std::string_vie
         if (eq == std::string_view::npos)
             return std::nullopt;
         const std::string pname = lowered(trimmed(rest.substr(0, eq)));
-        std::string_view v = rest.substr(eq + 1);
+        std::string_view v = trimmed(rest.substr(eq + 1));
         std::string value;
         size_t used = 0;
         if (!v.empty() && v.front() == '"')

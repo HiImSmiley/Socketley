@@ -609,8 +609,7 @@ const P = {
   wrap: '<path d="M4 6h16M4 12h13a3 3 0 0 1 0 6h-4m2-2-2 2 2 2M4 18h5"/>',
   menu: '<path d="M4 6h16M4 12h16M4 18h16"/>', clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
   spark: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/>',
-  info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/>', speed: '<path d="M12 13l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>',
-  replace: '<path d="M4 7h11l-3-3M20 17H9l3 3"/>',
+  info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/>',
   send: '<path d="M21 3 10.5 13.5M21 3l-6.5 18-4-7.5L3 9.5z"/>',
   git: '<circle cx="6" cy="5.5" r="2.2"/><circle cx="6" cy="18.5" r="2.2"/><circle cx="18" cy="8.5" r="2.2"/><path d="M6 7.7v8.6M18 10.7c0 4-6 3.3-11 6.2"/>',
   user: '<circle cx="12" cy="8" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/>',
@@ -975,7 +974,7 @@ async function load(keepScroll) {
   try {
     // The libraries are read again inside one as well, at most every half minute, so one another device made shows up.
     const stale = !buckets.length || Date.now() - bucketsAt > 30000;
-    const [list, roots] = await Promise.all([propfind(path), path.length && !stale ? null : propfind([])]);
+    const [list, roots] = await Promise.all([propfind(path), path.length && stale ? propfind([]) : null]);
     if (path.length && stale) bucketsAt = Date.now();
     if (seq !== loadSeq) return;
     if (roots) buckets = roots.filter(b => b.dir);
@@ -1079,8 +1078,10 @@ async function migratePositions() {
   for (const k of old) {
     try {
       const v = JSON.parse(localStorage.getItem(k)), segs = k.slice(8).split('/');
-      await api('POST', '/~ui/progress', { body: JSON.stringify({ bucket: segs[0], key: segs.slice(1).join('/'), t: v.t, d: v.d }) });
-    } catch (e) {}
+      const r = await api('POST', '/~ui/progress', { body: JSON.stringify({ bucket: segs[0], key: segs.slice(1).join('/'), t: v.t, d: v.d }) });
+      // A server error or a lost line keeps the position for the next load.
+      if (r.status >= 500) continue;
+    } catch (e) { if (!(e instanceof SyntaxError)) continue; }
     store.del(k);
   }
 }
@@ -1110,6 +1111,7 @@ function watching() {
 function render() {
   const C = $('#content'); C.textContent = '';
   MORE.clear();
+  if (moreIo) moreIo.disconnect();
   closePop();
   const all = sorted(items.filter(it => !query || it.name.toLowerCase().includes(query)));
   // At home other people's libraries are left out unless the user turned them on.
@@ -1339,7 +1341,7 @@ function musicSections(auds) {
     wrap.textContent = '';
     const cmp = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
     for (const a of [...albums.values()].sort((a, b) => cmp(a.artist, b.artist) || cmp(a.year, b.year) || cmp(a.album, b.album))) wrap.append(albumBlock(a));
-    if (loose.length) wrap.append(section(albums.size ? 'Other music' : 'Music', 'aud', loose, it => fileCard(it)));
+    if (loose.length) wrap.append(section('Other music', 'aud', loose, it => fileCard(it)));
     paintPlaying();
   });
   return wrap;
@@ -1693,7 +1695,7 @@ async function remove(list) {
   if (done) toast(done === 1 ? 'Deleted ' + (list.length === 1 ? list[0].name : '1 item') : 'Deleted ' + done + ' items');
   if (errs.length) toast(errs[0] + (errs.length > 1 ? ' (and ' + (errs.length - 1) + ' more)' : ''), 'bad', 7000);
   if (!path.length) buckets = [];
-  load(true);
+  await load(true);
 }
 // A copy beside the original, named as a file manager names one: “photo (1).jpg”, then “photo (2).jpg”.
 function copyName(name, dir, n) {
@@ -2003,11 +2005,12 @@ function computersPane(box) {
       code(origin + '/~dav/' + target));
     if (!key) out.prepend(el('p', { class: 'mut', style: 'font-size:13px', text: 'Make a key for this computer first: it goes in where <access key> and <secret> stand, and the secret is shown only now.' }));
   };
+  let made = [];
   const make = async () => {
-    try { const n = await iam('CreateAccessKey'); paint(n.one('AccessKeyId'), n.one('SecretAccessKey')); toast('Key made: copy what you need now, the secret is not shown again'); }
+    try { const n = await iam('CreateAccessKey'); made = [n.one('AccessKeyId'), n.one('SecretAccessKey')]; paint(...made); toast('Key made: copy what you need now, the secret is not shown again'); }
     catch (e) { fail(e); }
   };
-  [lib, folder, name].forEach(i => i.addEventListener('input', () => paint()));
+  [lib, folder, name].forEach(i => i.addEventListener('input', () => paint(...made)));
   box.append(el('p', { class: 'mut', style: 'font-size:13px;margin:0 0 12px', text: 'Keep a folder on your computer and a library here the same, both ways, through ' + host + '.' }),
     el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px' }, field('Library', lib), field('Folder in it', folder), field('Name of this computer', name), btn('lock', 'Make a key for this computer', make, 'pri')), out);
   paint();
@@ -2274,12 +2277,15 @@ function newUserDlg(fill) {
   const pw = el('input', { class: 'inp', value: newPassword(), spellcheck: 'false' }), reset = el('input', { type: 'checkbox', checked: true }), adm = el('input', { type: 'checkbox' }), libs = el('input', { type: 'checkbox', checked: true });
   const quota = el('input', { class: 'inp', type: 'number', min: '0', step: '0.1', placeholder: 'No quota' });
   const err = el('div', { class: 'err' });
+  let begun = '', profiled = false;
   const make = async () => {
     err.textContent = '';
     const u = id.value.trim();
     try {
-      await iam('CreateUser', { UserName: u });
-      await iam('CreateLoginProfile', { UserName: u, Password: pw.value, PasswordResetRequired: reset.checked ? 'true' : 'false' });
+      // A user this dialog made on an earlier try is taken up, so a refused later step can be corrected and retried.
+      if (u !== begun) { await iam('CreateUser', { UserName: u }); begun = u; profiled = false; }
+      await iam(begun === u && profiled ? 'UpdateLoginProfile' : 'CreateLoginProfile', { UserName: u, Password: pw.value, PasswordResetRequired: reset.checked ? 'true' : 'false' });
+      profiled = true;
       const t = {};
       if (name.value.trim()) t['socketley:display-name'] = name.value.trim();
       if (mail.value.trim()) t['socketley:email'] = mail.value.trim();
@@ -2328,12 +2334,14 @@ async function inviteShow(token) {
   card.addEventListener('submit', async ev => {
     ev.preventDefault(); err.textContent = '';
     if (pw.value !== pw2.value) { err.textContent = 'The two passwords differ.'; return; }
-    const r = await fetch('/~ui/invite', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, user: id.value.trim(), password: pw.value, name: name.value.trim(), email: mail.value.trim() }) });
+    let r;
+    try { r = await fetch('/~ui/invite', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, user: id.value.trim(), password: pw.value, name: name.value.trim(), email: mail.value.trim() }) }); }
+    catch (e) { err.textContent = 'Joining failed: ' + e.message; return; }
     if (!r.ok) { const t = await r.text(); const m = /<Message>([^<]*)/.exec(t); err.textContent = r.status === 429 ? 'Too many tries from here; wait a while.' : m ? m[1] : 'Joining failed: ' + r.status; return; }
-    const s = await fetch('/~ui/session', { method: 'POST', headers: { 'Authorization': 'Basic ' + btoa(unescape(encodeURIComponent(id.value.trim() + ':' + pw.value))), 'X-Socketley-UI': '1' } });
+    const s = await fetch('/~ui/session', { method: 'POST', headers: { 'Authorization': 'Basic ' + btoa(unescape(encodeURIComponent(id.value.trim() + ':' + pw.value))), 'X-Socketley-UI': '1' } }).catch(() => null);
     history.replaceState(null, '', location.pathname);
     card.remove(); F.hidden = false;
-    if (s.ok) { me = await s.json(); start(); toast('Welcome, ' + (me.name || me.user)); } else signedOut();
+    if (s && s.ok) { me = await s.json(); start(); toast('Welcome, ' + (me.name || me.user)); } else signedOut();
   });
   id.focus();
 }
@@ -2376,7 +2384,7 @@ function viewImage(it, list) {
     const cur = list[i];
     if (bar) bar.remove();
     bar = topbar(L, cur); L.o.prepend(bar);
-    stage.querySelectorAll('img,.spin').forEach(n => n.remove());
+    stage.querySelectorAll('img,.spin,.nopic').forEach(n => n.remove());
     const sp = el('div', { class: 'spin' }); stage.append(sp);
     const x = cur._exif;
     info.textContent = '';
@@ -2388,7 +2396,7 @@ function viewImage(it, list) {
     const heif = /\.(heic|heif|hif)$/i.test(cur.name);
     const img = el('img', { src: heif ? '/~media/thumb-1920/' + enc(cur.segs) : '/~dav/' + enc(cur.segs), alt: cur.name, draggable: 'false' });
     img.onload = () => sp.remove();
-    img.onerror = () => { sp.remove(); img.remove(); stage.append(el('div', { class: 'mut', text: 'This picture cannot be shown.' })); };
+    img.onerror = () => { sp.remove(); img.remove(); stage.append(el('div', { class: 'mut nopic', text: 'This picture cannot be shown.' })); };
     img.ondblclick = () => { zoom = zoom > 1 ? 1 : 2.2; img.style.transform = 'scale(' + zoom + ')'; };
     stage.append(img);
     // The neighbours, so the next step shows at once.
@@ -2715,6 +2723,7 @@ async function addSidecars(v, film) {
       if (!r.ok) continue;
       const vtt = toVtt(subText(await r.arrayBuffer()), ext(sc.it.name));
       const url = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }));
+      if (!v.isConnected) { URL.revokeObjectURL(url); break; }
       v.append(el('track', { kind: 'subtitles', src: url, srclang: sc.lang || 'und', label: sc.label }));
       n++;
     } catch (e) {}
@@ -2876,6 +2885,7 @@ async function playVideo(it, list) {
     clearInterval(saveT); clearInterval(upT); clearTimeout(idleT);
     document.removeEventListener('keydown', keys); document.removeEventListener('fullscreenchange', onfs);
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    for (const t of v.querySelectorAll('track')) URL.revokeObjectURL(t.src);
     if (player) player.stop(); else { v.pause(); v.removeAttribute('src'); v.load(); }
     loadProgress().then(() => { if (auth && !layers.length) render(); });
   };
@@ -2974,7 +2984,7 @@ async function playAudio(it, list) {
     a.addEventListener('timeupdate', paint); a.addEventListener('durationchange', paint); a.addEventListener('progress', paint);
     a.addEventListener('play', () => pp.firstChild.innerHTML = P.pause); a.addEventListener('pause', () => pp.firstChild.innerHTML = P.play);
     a.addEventListener('ended', () => { if (AU.i < AU.list.length - 1) skip(1); });
-    a.volume = +store.get('skl-vol', '1') || 1;
+    const vol = +store.get('skl-vol', '1'); a.volume = isFinite(vol) ? vol : 1;
     document.body.append(bar); document.body.classList.add('audio');
     watchingStart();
     if ('mediaSession' in navigator) { navigator.mediaSession.setActionHandler('previoustrack', () => skip(-1)); navigator.mediaSession.setActionHandler('nexttrack', () => skip(1)); }
@@ -3021,9 +3031,9 @@ lang('JavaScript', CL, ['bc', 'lc', 'dq', 'sq', 'bt', 'num', 'word'], KW.js);
 lang('JSON', CL, ['bc', 'lc', 'jkey', 'dq', 'num', 'word'], 'true false null');
 lang('Python', CL, ['tq', 'hash', 'dq', 'sq', 'num', 'word'], KW.py);
 lang('Shell', CL, ['hash', 'dq', 'sq', 'var', 'num', 'word'], KW.sh);
-lang('Lua', Object.assign({}, CL, { lb: 'com' }), ['bc', 'dd', 'dq', 'sq', 'num', 'word'], KW.lua);
+lang('Lua', CL, ['bc', 'dd', 'dq', 'sq', 'num', 'word'], KW.lua);
 lang('SQL', CL, ['bc', 'dd', 'dq', 'sq', 'num', 'word'], KW.sql, 'i');
-lang('CSS', Object.assign({}, CL, { key: 'prop' }), ['bc', 'dq', 'sq', 'num', 'word'], KW.css);
+lang('CSS', CL, ['bc', 'dq', 'sq', 'num', 'word'], KW.css);
 lang('YAML', CL, ['hash', 'key', 'dq', 'sq', 'num', 'word'], KW.yaml, 'm');
 lang('INI', CL, ['hash', 'semi', 'sect', 'key', 'dq', 'sq', 'num', 'word'], 'true false yes no on off', 'm');
 (() => {
@@ -3298,7 +3308,7 @@ function sendDlg(preset) {
 // hand out for a picked or dropped file, which needs one click too; else its file is chosen again, all of them in one
 // dialog or by dropping them, and each is matched to its upload by name, size and time. A large one goes on from the
 // parts the server says arrived.
-const UP = { jobs: [], busy: 0, slots: 4, ui: null, rate: 0, lastBytes: 0, lastT: 0, ticking: 0, watching: 0, sending: 0 };
+const UP = { jobs: [], busy: 0, slots: 4, ui: null, ticking: 0, watching: 0, sending: 0 };
 // A browser keeps six connections to a server that speaks HTTP/1.1, as this one does, for all its tabs together; while
 // a film or a song plays in any tab of it, uploads take one of them, so the player's segments never wait behind them,
 // and four again once it is closed. Tabs tell each other on a channel, a player every 5 s while it is open.
@@ -3411,7 +3421,8 @@ async function arrived(j) {
   let marker = '';
   for (;;) {
     const r = await api('GET', url(j) + '?uploadId=' + encodeURIComponent(j.id) + (marker ? '&part-number-marker=' + marker : ''));
-    if (!r.ok) return false;
+    // Only a missing upload is gone; any other refusal keeps it, to be sent again from what is known.
+    if (!r.ok) return r.status !== 404;
     const doc = new DOMParser().parseFromString(await r.text(), 'application/xml');
     const t = (e, n) => { const x = e.getElementsByTagName(n)[0]; return x ? x.textContent : ''; };
     for (const e of doc.getElementsByTagName('Part')) {
@@ -3586,7 +3597,6 @@ function schedule() {
     const n = nextTask(); if (!n) break;
     const [j, t] = n;
     UP.busy++; j.active = (j.active || 0) + 1;
-    if (!UP.jobs.some(j => j.started)) UP.started = Date.now();
     t().finally(() => { UP.busy--; j.active--; schedule(); paintUploads(); });
   }
   if (!UP.busy && !UP.jobs.some(j => ['queued', 'running', 'starting', 'finishing'].includes(j.state))) { clearInterval(UP.ticking); UP.ticking = 0; paintUploads(); }
@@ -3719,6 +3729,7 @@ function failed(j, r) {
   const m = /<Message>([^<]*)/.exec(r.text);
   j.err = r.status ? r.status + ' ' + (m ? m[1] : (r.text || '').trim().slice(0, 120)) : 'the connection was lost';
   if (j.k) UDB.del(j.k);
+  if (j.stash) { UP.stashed = Math.max(0, UP.stashed - j.size); j.stash = false; }
   if (j.onend) j.onend(j);
   for (const x of j.xhrs) x.abort();
   toast('Upload of ' + j.name + ' failed: ' + j.err, 'bad', 7000);

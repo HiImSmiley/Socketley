@@ -79,7 +79,7 @@ namespace
 {
 
 // What follows a runtime's name in a file of its state, where the file is its: its spool or a shard's, its keys,
-// suppressed and unsubscribed lists, VERP key, IMAP index, Sieve scripts, calendar journals and outbox; empty where
+// suppressed and unsubscribed lists, VERP key, IMAP index, Sieve scripts, calendar journals, outbox and spam model; empty where
 // the file is none of them.
 std::string_view state_suffix(std::string_view file, std::string_view stem)
 {
@@ -89,6 +89,7 @@ std::string_view state_suffix(std::string_view file, std::string_view stem)
     if (rest.empty() || rest.starts_with(".dkim.") || rest == ".suppressed" || rest == ".suppressed.lock" ||
         rest == ".unsubscribed" || rest == ".unsubscribed.lock" ||
         rest == ".verp" || rest == ".imap" || rest == ".sieve" || rest == ".dav" || rest == ".outbox" ||
+        rest == ".bayes" || rest == ".bayes.journal" || rest == ".bayes.folding" || rest == ".bayes.tmp" ||
         (rest.front() == '.' && rest.size() > 1 && rest.find_first_not_of("0123456789", 1) == std::string_view::npos))
         return rest.empty() ? std::string_view(".") : rest;
     return "-";
@@ -115,10 +116,13 @@ bool mail_rename_state(std::string_view from, std::string_view to, std::string& 
         }
         moves.emplace_back(e.path(), base / target);
     }
-    for (const auto& [a, b] : moves)
-        if (std::filesystem::rename(a, b, ec); ec)
+    for (size_t i = 0; i < moves.size(); ++i)
+        if (std::filesystem::rename(moves[i].first, moves[i].second, ec); ec)
         {
-            why = a.string() + " could not be renamed: " + ec.message();
+            why = moves[i].first.string() + " could not be renamed: " + ec.message();
+            std::error_code undo;
+            while (i-- > 0)
+                std::filesystem::rename(moves[i].second, moves[i].first, undo);
             return false;
         }
     return true;
@@ -141,8 +145,11 @@ void mail_forget_state(std::string_view runtime_name)
         if (socketley::read_file((p / "spool" / "queued").string(), queued) &&
             std::from_chars(queued.data(), queued.data() + queued.size(), n).ec == std::errc() && n > 0)
         {
-            const std::filesystem::path aside =
+            std::filesystem::path aside =
                 base / (p.filename().string() + ".held-" + std::to_string(socketley::wall::now_ms() / 1000));
+            for (int n2 = 1; std::filesystem::exists(aside); ++n2)
+                aside = base / (p.filename().string() + ".held-" + std::to_string(socketley::wall::now_ms() / 1000) +
+                                "-" + std::to_string(n2));
             std::filesystem::rename(p, aside, ec);
             if (!ec)
             {
@@ -151,6 +158,10 @@ void mail_forget_state(std::string_view runtime_name)
                              .c_str());
                 continue;
             }
+            LOG_WARN(("mail " + stem + ": " + p.string() + " holds queued mail and could not be moved aside: " +
+                      ec.message())
+                         .c_str());
+            continue;
         }
         std::filesystem::remove_all(p, ec);
     }

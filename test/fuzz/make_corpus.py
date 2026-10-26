@@ -126,9 +126,9 @@ def ws_frame(opcode=0x1, payload=b"", fin=True, mask=None, force_len=None):
     n = len(payload) if force_len is None else force_len
     out = bytearray([b0])
     mb = 0x80 if mask is not None else 0x00
-    if n < 126 and force_len is None:
+    if n < 126:
         out.append(mb | n)
-    elif n < 65536 and force_len is None:
+    elif n < 65536:
         out.append(mb | 126)
         out += struct.pack("!H", n)
     else:
@@ -2434,21 +2434,21 @@ def _s3_hm(k, m):
     return hmac.new(k, m if isinstance(m, bytes) else m.encode(), hashlib.sha256).digest()
 
 
-def _s3_key(secret, region="us-east-1"):
-    k = _s3_hm(("AWS4" + secret).encode(), _S3_DATE[:8])
+def _s3_key(secret, region="us-east-1", date=_S3_DATE):
+    k = _s3_hm(("AWS4" + secret).encode(), date[:8])
     return _s3_hm(_s3_hm(_s3_hm(k, region), "s3"), "aws4_request")
 
 
-def _s3_sign(method, path, query, headers, signed, payload, region="us-east-1", secret=_S3_SK, drop=None):
+def _s3_sign(method, path, query, headers, signed, payload, region="us-east-1", secret=_S3_SK, drop=None, date=_S3_DATE):
     items = sorted(p.partition("=")[0::2] for p in query.split("&") if p and p.partition("=")[0] != drop)
     cq = "&".join("%s=%s" % (n, v) for n, v in items)
     ch = ""
     for n in signed:
         ch += "%s:%s\n" % (n, ",".join(" ".join(v.split()) for k, v in headers if k.lower() == n))
     creq = "\n".join([method, path, cq, ch, ";".join(signed), payload])
-    sts = "\n".join(["AWS4-HMAC-SHA256", _S3_DATE, "%s/%s/s3/aws4_request" % (_S3_DATE[:8], region),
+    sts = "\n".join(["AWS4-HMAC-SHA256", date, "%s/%s/s3/aws4_request" % (date[:8], region),
                      hashlib.sha256(creq.encode()).hexdigest()])
-    return _s3_hm(_s3_key(secret, region), sts).hex()
+    return _s3_hm(_s3_key(secret, region, date), sts).hex()
 
 
 def _s3_request(flags, method, path, query, payload_fallback, headers):
@@ -2460,7 +2460,7 @@ def _s3_header_request(method, path, query, extra=(), payload=_S3_EMPTY, region=
                        secret=_S3_SK, date=_S3_DATE, flags=0, sig=None):
     hdrs = [("Host", "storage.local:9000"), ("x-amz-date", date), ("x-amz-content-sha256", payload)] + list(extra)
     signed = sorted(set(h[0].lower() for h in hdrs))
-    sig = sig or _s3_sign(method, path, query, hdrs, signed, payload, region, secret)
+    sig = sig or _s3_sign(method, path, query, hdrs, signed, payload, region, secret, date=date)
     auth = "AWS4-HMAC-SHA256 Credential=%s/%s/%s/s3/aws4_request, SignedHeaders=%s, Signature=%s" % (
         ak, date[:8], region, ";".join(signed), sig)
     return _s3_request(flags, method, path, query, "", hdrs + [("Authorization", auth)])
@@ -2471,7 +2471,7 @@ def _s3_presigned(method, path, extra_query="", expires=3600, region="us-east-1"
             "&X-Amz-Expires=%d&X-Amz-SignedHeaders=host" % (_S3_AK, date[:8], region, date, expires))
     q = base + ("&" + extra_query if extra_query else "")
     hdrs = [("Host", "storage.local:9000")]
-    sig = _s3_sign(method, path, q, hdrs, ["host"], "UNSIGNED-PAYLOAD", region, drop="X-Amz-Signature")
+    sig = _s3_sign(method, path, q, hdrs, ["host"], "UNSIGNED-PAYLOAD", region, drop="X-Amz-Signature", date=date)
     return _s3_request(0, method, path, q + "&X-Amz-Signature=" + sig, "", hdrs)
 
 

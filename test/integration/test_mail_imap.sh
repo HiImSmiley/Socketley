@@ -214,8 +214,15 @@ tally() { while read -r verdict rest; do case "$verdict" in ok) ok "$rest" ;; ba
 tally < <(timeout 120 python3 "$T/client.py" "$IM" "$P" first 2>&1 | grep -E '^(ok|bad) ' || echo "bad the client ran: $(timeout 60 python3 "$T/client.py" "$IM" "$P" first 2>&1 | tail -2)")
 for _ in $(seq 1 30); do [ -z "$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/INBOX/" | grep -o '<Key>[^<]*one[^<]*</Key>')" ] && break; sleep 0.1; done
 n=$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/" | grep -o '<Key>' | wc -l)
-[ "$n" -ge 4 ] && ok "the folders are objects in the storage, the expunged one gone" || bad "the folders are objects in the storage, the expunged one gone" "$n objects"
-tally < <(timeout 60 python3 "$T/client.py" "$IM" "$P" idle 2>&1 | grep -E '^(ok|bad) ')
+[ "$n" -ge 4 ] && ok "the folders are objects in the storage" || bad "the folders are objects in the storage" "$n objects"
+for _ in $(seq 1 30); do
+    ni=$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/INBOX/" | grep -o '<Key>' | wc -l)
+    [ "$ni" -le 2 ] && break; sleep 0.1
+done
+[ "$ni" -eq 2 ] && ok "the expunged one is gone from the storage" || bad "the expunged one is gone from the storage" "$ni objects in the inbox, want 2"
+out=$(timeout 60 python3 "$T/client.py" "$IM" "$P" idle 2>&1); rc=$?
+tally < <(printf '%s\n' "$out" | grep -E '^(ok|bad) ')
+[ "$rc" -eq 0 ] || bad "the idle client ran" "exit $rc: $(printf '%s\n' "$out" | tail -2)"
 before=$(timeout 60 python3 - "$IM" <<'PY'
 import imaplib, ssl, sys
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
@@ -225,7 +232,9 @@ PY
 )
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$IM" >/dev/null
-tally < <(timeout 60 python3 "$T/client.py" "$IM" "$P" after "$T/status.after" 2>&1 | grep -E '^(ok|bad) ')
+out=$(timeout 60 python3 "$T/client.py" "$IM" "$P" after "$T/status.after" 2>&1); rc=$?
+tally < <(printf '%s\n' "$out" | grep -E '^(ok|bad) ')
+[ "$rc" -eq 0 ] || bad "the after client ran" "exit $rc: $(printf '%s\n' "$out" | tail -2)"
 v1=$(printf '%s' "$before" | grep -o 'UIDVALIDITY [0-9]*'); v2=$(grep -o 'UIDVALIDITY [0-9]*' "$T/status.after" 2>/dev/null)
 [ -n "$v1" ] && [ "$v1" = "$v2" ] && ok "UIDVALIDITY is the same after a restart" || bad "UIDVALIDITY is the same after a restart" "$v1 / $v2"
 

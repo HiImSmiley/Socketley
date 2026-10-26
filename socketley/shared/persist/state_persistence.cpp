@@ -27,6 +27,7 @@
 #include <fstream>
 #include <sstream>
 #include <charconv>
+#include <stdexcept>
 #include <cerrno>
 #include <cstdio>
 #include <unistd.h>
@@ -109,11 +110,6 @@ std::string json_unescape(std::string_view s)
         }
     }
     return out;
-}
-
-const char* type_str(runtime_type t)
-{
-    return type_to_string(t);
 }
 
 runtime_type str_to_type(std::string_view s)
@@ -396,7 +392,11 @@ int json_get_int(const std::string& json, std::string_view key, int default_val 
 uint32_t json_get_uint32(const std::string& json, std::string_view key, uint32_t default_val = 0)
 {
     return json_get_number<uint32_t>(json, key, default_val,
-        [](const std::string& s, size_t& n) { return static_cast<uint32_t>(std::stoul(s, &n)); });
+        [](const std::string& s, size_t& n) {
+            const unsigned long v = std::stoul(s, &n);
+            if (v > std::numeric_limits<uint32_t>::max()) throw std::out_of_range("uint32");
+            return static_cast<uint32_t>(v);
+        });
 }
 
 double json_get_double(const std::string& json, std::string_view key, double default_val = 0.0)
@@ -504,6 +504,9 @@ void json_get_extra(const std::string& json,
         if (colon == std::string::npos || json[colon] != ':')
             return;
         pos = colon + 1;
+        const size_t vstart = json.find_first_not_of(" \t\n\r", pos);
+        if (vstart == std::string::npos || json[vstart] != '"')
+            return;
         if (!take_string(val))
             return;
         out.emplace_back(json_unescape(key), json_unescape(val));
@@ -823,7 +826,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
         }
     }
 
-    cfg.type_name = type_str(cfg.type);
+    cfg.type_name = type_to_string(cfg.type);
 
     // A registered type's fields come from the instance, because this file
     // knows neither their names nor their kinds.
@@ -879,9 +882,9 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         // infinity on purpose, so the value is kept as the largest number this
         // format can say rather than written as one nothing can read.
         // The shortest text that reads back as the same double, where %g's six digits turned 1234567 into 1234570.
-        const auto [end, ec] = std::to_chars(buf, buf + sizeof(buf),
-                                             std::isfinite(val) ? val : std::numeric_limits<double>::max());
-        const int n = ec == std::errc{} ? static_cast<int>(end - buf) : snprintf(buf, sizeof(buf), "0");
+        const auto end = std::to_chars(buf, buf + sizeof(buf),
+                                             std::isfinite(val) ? val : std::numeric_limits<double>::max()).ptr;
+        const int n = static_cast<int>(end - buf);
         j += "    \"";
         j += key;
         j += "\": ";
@@ -892,7 +895,7 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     j += "{\n";
     append_str_field("name", cfg.name);
     append_str_field("id", cfg.id);
-    append_str_field("type", type_str(cfg.type));
+    append_str_field("type", type_to_string(cfg.type));
     append_int_field("port", cfg.port);
     // Written only when there is one, with the `unix:` prefix kept because
     // this is the field an operator edits and re-imports.

@@ -64,6 +64,8 @@ EOF
 
 out=$("$BIN" create idp x2 -p "$PI" --issuer "ftp://x" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok || bad "an issuer that is no http address is refused" "rc $rc: $out"
+out=$("$BIN" create idp x3 -p "$PI" --issuer "http://localhost.example.org" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok || bad "plain http for a public name that begins with localhost is refused" "rc $rc: $out"
 out=$("$BIN" create idp x4 -p "$PI" --issuer "http://127.0.0.1:$PI" --tls 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok || bad "--tls is refused, since the entrance terminates it" "rc $rc: $out"
 
@@ -112,7 +114,7 @@ IMP=$("$BIN" idp-user auth import ui 2>&1); rc=$?
 case "$IMP" in "2 imported, 1 already here"*) ok ;; *) bad "a storage's users are imported, an account of the same name kept" "rc $rc: $IMP" ;; esac
 
 run() {
-    python3 - "$PI" "$1" "$T" "$PS" "$PP" "$PM" "$ALICE" 2>&1 <<'PY'
+    python3 - "$PI" "$1" "$T" "$PS" "$PP" "$PM" "$ALICE" 2>&1 <<'PY' || echo "bad the $1 checks ran to their end"
 import sys, json, time, base64, hashlib, re, urllib.request, urllib.error, urllib.parse
 import jwt
 pi, phase, tmpd, ps, pp, pm, alice_id = sys.argv[1:8]

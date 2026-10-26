@@ -46,7 +46,8 @@ PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"
         local l; for l in "${@:3}"; do echo "        $l"; done; }
-check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "expected '$2', got '$3'"; fi; }
+check() { if [ -z "$2" ] || [ -z "$3" ]; then bad "$1" "the probe printed nothing: expected '$2', got '$3'"
+          elif [ "$2" = "$3" ]; then ok; else bad "$1" "expected '$2', got '$3'"; fi; }
 
 cleanup() { "$BIN" stop hs >/dev/null 2>&1 || true; daemon_stop; }
 trap cleanup EXIT

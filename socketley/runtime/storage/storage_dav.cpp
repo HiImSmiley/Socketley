@@ -7,7 +7,6 @@
 #include <algorithm>
 
 
-#include "checksum.h"
 #include "digest.h"
 #include "s3_names.h"
 #include "s3_xml.h"
@@ -337,7 +336,6 @@ void storage_run::app_forward(const std::shared_ptr<conn>& c, std::string_view m
         c->app_header = std::move(extra_value);
         r.headers.push_back({extra_name, c->app_header});
     }
-    static const std::vector<header_ref> none;
     request_view rv;
     rv.method  = r.method;
     rv.headers = &r.headers;
@@ -670,7 +668,8 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
                 std::string prefix = k.empty() || k.back() == '/' ? k : k + "/";
                 // Onto itself every copy lands on its own source and the move then removes it; into itself the copies
                 // land where the listing is still walking (RFC 4918 9.8.5, 9.9.4).
-                if (method != "DELETE" && dst_b == b && dst_k.starts_with(prefix))
+                if (method != "DELETE" && dst_b == b &&
+                    (dst_k.starts_with(prefix) || (!dst_k.empty() && prefix.starts_with(dst_k))))
                 {
                     app_reply(cc, 403, "A folder is not copied or moved onto itself or into itself.\n");
                     return;
@@ -1024,10 +1023,8 @@ void storage_run::dav_collection(const std::shared_ptr<conn>& c, const std::stri
     if (bucket.empty())
     {
         std::vector<std::pair<std::string, std::string>> links;
-        const user_identity* u = c->user.get();
-        const std::string_view me = u ? std::string_view(u->id) : default_owner;
         for (const bucket_info& b : m_store.buckets())
-            if (!u || u->admin || (b.owner.empty() ? default_owner : std::string_view(b.owner)) == me)
+            if (lists_bucket(c, b))
                 links.emplace_back(dav_href(b.name, {}), b.name + "/");
         app_reply(c, 200, page("/", links), "text/html; charset=utf-8");
         return;
@@ -1121,6 +1118,20 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
     };
     w->one = [this, raw, done, remove_then_done](const list_entry& e)
     {
+        // Each key is judged as the single file's operation is, since a policy may deny on a key under the folder.
+        const auto allowed = [this, raw](std::string_view method, const std::string& bucket, const std::string& key)
+        {
+            const auto cc = raw->who.lock();
+            return cc && !cc->dead && app_allowed(cc, method, bucket, key);
+        };
+        const std::string dst_key = raw->removing ? std::string{} : raw->dst_prefix + e.key.substr(raw->prefix.size());
+        if ((!raw->keep_source && !allowed("DELETE", raw->bucket, e.key)) ||
+            (!raw->removing && (!allowed("GET", raw->bucket, e.key) || !allowed("PUT", raw->dst_bucket, dst_key))))
+        {
+            ++raw->failed;
+            done();
+            return;
+        }
         if (raw->removing)
         {
             remove_then_done(e.key);
@@ -1133,7 +1144,6 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
             done();
             return;
         }
-        const std::string dst_key = raw->dst_prefix + e.key.substr(raw->prefix.size());
         const std::string src_key = e.key;
         m_store.open_object(raw->bucket, e.key, static_cast<size_t>(stored_size(e.meta)),
                             [this, raw, done, remove_then_done, dst_key, src_key, hold = raw->self.lock()](open_result o)
@@ -1429,6 +1439,9 @@ void storage_run::dav_trash(const std::shared_ptr<conn>& c, std::string bucket, 
                     continue;
                 if (it.latest)
                 {
+                    // A marker with nothing behind it still closes its entry before the next key.
+                    if (raw->deleted)
+                        raw->out += ",\"size\":0}";
                     raw->key = it.key;
                     raw->deleted = is_delete_marker(it.meta);
                     if (raw->deleted)

@@ -74,6 +74,13 @@ if "master: ok" not in drain(master):
     print("SETUP: authentication was refused", file=sys.stderr)
     sys.exit(2)
 
+# Positive control: the master's broadcast reaches the observer, so silence later means something.
+master.sendall(b"MASTER-CONTROL\n")
+time.sleep(0.5)
+if "MASTER-CONTROL" not in drain(observer):
+    print("SETUP: the master's broadcast never reached the observer", file=sys.stderr)
+    sys.exit(2)
+
 # Trip the unparsed-input cap: more than 1 MiB with no newline, so none of it is
 # ever consumed as a command. This reaches a teardown path distinct from a plain
 # disconnect.

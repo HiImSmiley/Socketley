@@ -130,6 +130,8 @@ struct item
     int64_t mtime_ms{0};
     std::optional<std::string> data;
     bool missing{false};
+    // The storage could not answer, so `missing` says nothing about the collection.
+    bool failed{false};
 };
 
 struct prop_name
@@ -316,6 +318,7 @@ struct op : std::enable_shared_from_this<op>
             it.t = t;
             it.props = std::move(props);
             it.token = self->store.token(self->user, t.kind, t.coll);
+            it.failed = !ok;
             it.missing = !ok || (!found && t.coll != dav_store::default_of(t.kind));
             then(std::move(it));
         });
@@ -764,6 +767,8 @@ struct op : std::enable_shared_from_this<op>
             return reply(error_reply(403, "a calendar is made among the calendars"));
         auto self = shared_from_this();
         collection(here, [self, doc, has_body](item it) {
+            if (it.failed)
+                return self->reply(error_reply(503, "the storage cannot be reached now"));
             if (!it.missing)
                 return self->reply(precondition(405, ns_dav, "resource-must-be-null"));
             std::vector<std::pair<std::string, std::string>> props;
@@ -995,8 +1000,14 @@ struct op : std::enable_shared_from_this<op>
     {
         auto self = shared_from_this();
         if (here.lv == level::collection)
-            return store.remove_collection(user, here.kind, here.coll, [self](bool ok) {
-                self->reply(ok ? dav_reply{204, {}, {}, {}} : error_reply(503, "the storage cannot be reached now"));
+            return collection(here, [self](item it) {
+                if (it.failed)
+                    return self->reply(error_reply(503, "the storage cannot be reached now"));
+                if (it.missing)
+                    return self->reply(error_reply(404, "nothing is here"));
+                self->store.remove_collection(self->user, self->here.kind, self->here.coll, [self](bool ok) {
+                    self->reply(ok ? dav_reply{204, {}, {}, {}} : error_reply(503, "the storage cannot be reached now"));
+                });
             });
         store.head(user, here.kind, here.coll, here.name, [self](bool ok, std::string cur) {
             if (!ok)

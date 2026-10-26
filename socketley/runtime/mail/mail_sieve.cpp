@@ -11,6 +11,7 @@
 #include "mail_compose.h"
 #include "mail_mime.h"
 #include "smtp_session.h"
+#include "../../shared/http/url.h"
 #include "../../shared/util/ascii.h"
 
 namespace socketley::mail::sieve
@@ -144,14 +145,6 @@ std::string_view trim(std::string_view s)
     while (!s.empty() && is_wsp(s.back()))
         s.remove_suffix(1);
     return s;
-}
-
-int hex_digit(char c)
-{
-    if (is_digit(c))
-        return c - '0';
-    const char l = socketley::ascii::lower(c);
-    return l >= 'a' && l <= 'f' ? l - 'a' + 10 : -1;
 }
 
 void append_utf8(std::string& out, uint32_t cp)
@@ -402,7 +395,7 @@ bool lex(std::string_view s, std::vector<token>& out, std::string& err)
             uint64_t v = 0;
             while (i < s.size() && is_digit(s[i]))
             {
-                if (v > (UINT64_MAX - 9) / 10)
+                if (v > (UINT64_MAX - static_cast<uint64_t>(s[i] - '0')) / 10)
                     return fail("a number too large");
                 v = v * 10 + static_cast<uint64_t>(s[i] - '0');
                 ++i;
@@ -708,18 +701,7 @@ bool field_name_ok(std::string_view n)
 std::string percent_decoded(std::string_view s)
 {
     std::string out;
-    for (size_t i = 0; i < s.size(); ++i)
-    {
-        const int h = s[i] == '%' && i + 2 < s.size() ? hex_digit(s[i + 1]) : -1;
-        const int l = h >= 0 ? hex_digit(s[i + 2]) : -1;
-        if (l >= 0)
-        {
-            out += static_cast<char>(h * 16 + l);
-            i += 2;
-        }
-        else
-            out += s[i];
-    }
+    socketley::http::percent_decode(s, out, false, socketley::http::bad_escape::keep);
     return out;
 }
 

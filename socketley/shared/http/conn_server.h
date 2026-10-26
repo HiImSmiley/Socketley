@@ -89,6 +89,8 @@ public:
     void close_conn(const std::shared_ptr<server_conn>& c);
     // Those with nothing to do for longer than `idle_secs` closed.
     void sweep(int64_t now, int64_t idle_secs);
+    // The accept again, once one that ran out of descriptors may succeed.
+    void resume_accept();
 
     size_t size() const { return m_conns.size(); }
     bool empty() const { return m_conns.empty(); }
@@ -116,6 +118,8 @@ private:
     int m_listen_fd{-1};
     io_request m_accept_req{};
     bool m_accept_pending{false};
+    // The last accept failed for want of descriptors and none is armed.
+    bool m_accept_starved{false};
     bool m_stopped{false};
     std::unordered_map<uint64_t, std::shared_ptr<server_conn>> m_conns;
     // Let go, and still owed a read or a write by the ring.

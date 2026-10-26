@@ -229,7 +229,7 @@ elif step == "copy":
     b.cmd("SELECT Copied")
     subj = b.cmd("FETCH 1:* (BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
     got = re.findall(r"Subject: (n\d+)", "\n".join(subj))
-    say("a COPY of 300 keeps their order and says each UID", m is not None and m.group(1) == "1:300" and
+    say("a COPY of 300 keeps their order and says each UID", m is not None and m.group(1) == "1:300" and m.group(2) == "1:300" and
         got == ["n%03d" % i for i in range(300)], (r[-1], got[:5]))
     # Another session appends while this one expunges.
     b.cmd("SELECT Many")
@@ -274,7 +274,10 @@ elif step == "ext":
     b.s.sendall(b"bin1 UID FETCH %d (BINARY.SIZE[2] BINARY.PEEK[2])\r\n" % u4)
     got = b""
     while True:
-        got += b.s.recv(65536)
+        chunk = b.s.recv(65536)
+        if not chunk:
+            break
+        got += chunk
         i = got.find(b"\r\nbin1 ")
         if i >= 0 and got.find(b"\r\n", i + 2) >= 0:
             break
@@ -339,8 +342,11 @@ elif step == "meta":
     b.cmd("SELECT INBOX")
     uidc = int(b.cmd("UID SEARCH SUBJECT copied-one")[0].split()[-1])
     b.cmd("UID COPY %d Filtered" % uidc)
-    time.sleep(1.5)
-    st = b.cmd("STATUS Archive2 (MESSAGES)")
+    for _ in range(40):
+        time.sleep(0.25)
+        st = b.cmd("STATUS Archive2 (MESSAGES)")
+        if "MESSAGES 1" in st[0]:
+            break
     say("imapsieve files what a client put into its folder where the script says", "MESSAGES 1" in st[0], st)
     b.cmd("SELECT Filtered")
     lines = b.cmd("FETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT)])")

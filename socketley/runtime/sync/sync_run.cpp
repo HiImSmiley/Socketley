@@ -29,7 +29,6 @@ namespace fs = std::filesystem;
 using socketley::http_answer;
 using socketley::http_peer;
 using socketley::http_request;
-using socketley::http_target;
 
 namespace
 {
@@ -570,12 +569,9 @@ void sync_run::end_walk()
     // since all leave things unseen that are still here, and are left where they were carried.
     std::sort(m_seen.begin(), m_seen.end());
     std::vector<std::string> gone;
-    for (const auto& [k, e] : m_index.all())
-    {
-        (void)e;
-        if (!std::binary_search(m_seen.begin(), m_seen.end(), k.path))
-            gone.push_back(k.path);
-    }
+    for (const auto& entry : m_index.all())
+        if (!std::binary_search(m_seen.begin(), m_seen.end(), entry.first.path))
+            gone.push_back(entry.first.path);
     std::sort(gone.begin(), gone.end());
     gone.erase(std::unique(gone.begin(), gone.end()), gone.end());
     // A directory that is suddenly empty is far likelier a disk that is not mounted than a user who deleted every
@@ -639,7 +635,7 @@ void sync_run::check_path(const std::string& rel)
             say(rel + " is a link to a file outside " + std::string(m_rt.get_dir()) + ", which is not carried");
             return;
         }
-        const int64_t mtime = int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+        const int64_t mtime = mtime_of(st);
         for (auto& t : m_targets)
         {
             const index_entry* had = m_index.find(t.name, rel);
@@ -872,7 +868,7 @@ void sync_run::carry(target& t, lane& l, const job& j)
     // the index already holds at this size and time is not sent twice.
     job now = j;
     now.size = uint64_t(st.st_size);
-    now.mtime_ns = int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+    now.mtime_ns = mtime_of(st);
     if (const index_entry* had = m_index.find(t.name, j.path);
         had && had->size == now.size && had->mtime_ns == now.mtime_ns)
     {
@@ -931,7 +927,7 @@ void sync_run::send_part(target& t, lane& l)
     // A file that changed under the upload would be assembled from two versions of itself.
     struct stat st{};
     if (::fstat(*up.fd, &st) != 0 || uint64_t(st.st_size) != up.j.size ||
-        int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec != up.j.mtime_ns)
+        mtime_of(st) != up.j.mtime_ns)
     {
         abort_upload(t, l, up.j.path + ": changed while it was carried; it is carried again once it is written");
         return;
@@ -1460,7 +1456,7 @@ void sync_run::decide_pull(target& t)
     // here since; a listing with nothing in it is taken for a storage that lost its bucket, not for one emptied.
     std::vector<std::string> gone;
     for (const auto& [k, e] : m_index.all())
-        if (k.target == t.name && !m_remote.contains(k.path))
+        if (k.target == t.name && !m_remote.contains(k.path) && !excluded(k.path))
             gone.push_back(k.path);
     if (m_remote.empty() && !gone.empty())
     {
@@ -1492,7 +1488,7 @@ void sync_run::decide_pull(target& t)
     m_stats.indexed = m_index.size();
     m_remote.clear();
     if (m_fetches.empty())
-        finish_pull(t);
+        finish_pull();
 }
 
 void sync_run::pump_fetch(target& t)
@@ -1534,7 +1530,7 @@ void sync_run::pump_fetch(target& t)
     }
     // Every fetch is over once no lane holds one and none waits.
     if (m_fetches.empty() && std::none_of(t.lanes.begin(), t.lanes.end(), [](const auto& l) { return l->get != nullptr; }))
-        finish_pull(t);
+        finish_pull();
 }
 
 void sync_run::fetch_range(target& t, lane& l)
@@ -1600,7 +1596,14 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
         return;
     const std::string dir(m_rt.get_dir());
     bool placed = false;
-    if (whole && f->fd >= 0 && ::fsync(f->fd) == 0)
+    bool synced = whole && f->fd >= 0;
+    if (synced && ::fsync(f->fd) != 0)
+    {
+        note(f->rel + ": syncing it here failed: " + std::strerror(errno));
+        owe_retry();
+        synced = false;
+    }
+    if (synced)
     {
         const std::string full = dir + "/" + f->rel;
         struct stat st{};
@@ -1615,10 +1618,14 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
         // storage's goes at the name and this side's beside it, so the next listing does not find the conflict again.
         std::string name = f->rel;
         bool ok = true;
+        std::string reason;
         if (f->conflict && pushes())
             name = conflict_name(f->rel);
         else if (f->conflict && here && ::rename(full.c_str(), (dir + "/" + conflict_name(f->rel)).c_str()) != 0)
+        {
+            reason = std::strerror(errno);
             ok = false;
+        }
         const std::string target_path = dir + "/" + name;
         const std::string parent = target_path.substr(0, target_path.rfind('/'));
         // The folders on the way are made here, below the deepest one there is, and only when that is no link out
@@ -1631,7 +1638,11 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
         if (ok && inside(have, nullptr))
             fs::create_directories(parent, ec);
         else
+        {
+            if (ok)
+                reason = "a link leads out of the folder";
             ok = false;
+        }
         if (ok && !ec && inside(parent, nullptr) && ::rename(f->temp.c_str(), target_path.c_str()) == 0)
         {
             placed = true;
@@ -1648,7 +1659,7 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
             m_stats.failing = 0;
         }
         else
-            note(name + ": it could not be put in place: " + (ec ? ec.message() : std::string(std::strerror(errno))));
+            note(name + ": it could not be put in place: " + (!reason.empty() ? reason : ec ? ec.message() : std::string(std::strerror(errno))));
     }
     if (f->fd >= 0)
         ::close(f->fd);
@@ -1656,7 +1667,7 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
         ::unlink(f->temp.c_str());
 }
 
-void sync_run::finish_pull(target&)
+void sync_run::finish_pull()
 {
     if (!m_pulling)
         return;

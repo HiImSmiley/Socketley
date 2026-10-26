@@ -54,10 +54,10 @@ std::string miss_key(std::string_view client)
         if (::inet_ntop(AF_INET, &a.s6_addr[12], v4, sizeof v4))
             return v4;
     }
+    // Led by a byte no address text has, so the raw bytes of a /64 can never equal an IPv4 peer's text.
     static constexpr unsigned char zero[8]{};
-    if (std::memcmp(a.s6_addr, zero, 8) == 0)
-        return std::string(reinterpret_cast<const char*>(a.s6_addr), 16);
-    return std::string(reinterpret_cast<const char*>(a.s6_addr), 8);
+    const size_t n = std::memcmp(a.s6_addr, zero, 8) == 0 ? 16 : 8;
+    return '\x06' + std::string(reinterpret_cast<const char*>(a.s6_addr), n);
 }
 
 }   // namespace

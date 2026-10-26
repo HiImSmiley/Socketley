@@ -64,10 +64,6 @@ public:
     // forgetting to register would silently swallow all of a handler's I/O.
     uint32_t register_owner(io_handler* owner);
 
-    // Submissions queued with no owner, whose completions were dropped,
-    // counted as well as logged so a test can assert zero.
-    uint64_t stat_ownerless() const { return m_stat_ownerless; }
-
     // Call when the handler can no longer service a completion, and a handler
     // that frees itself from its own on_cqe must deregister there and not
     // earlier.
@@ -173,7 +169,6 @@ public:
     void unregister_buffers();
     bool submit_read_fixed_buf(int fd, char* buf, uint32_t len, uint16_t buf_idx, io_request* req);
     bool submit_write_fixed_buf(int fd, const char* buf, uint32_t len, uint16_t buf_idx, io_request* req);
-    bool buffers_registered() const { return m_bufs_registered; }
 
     // A buffer group belongs to a runtime type and not an instance, so the
     // first instance to reach here decides the geometry and a later one asking
@@ -193,12 +188,10 @@ public:
     char* get_buf_ptr(uint16_t group_id, uint16_t buf_id);
     void return_buf(uint16_t group_id, uint16_t buf_id);
     void return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, uint32_t count);
-    bool has_buf_ring(uint16_t group_id) const;
 
     // Multishot recv, one SQE producing completions from the buffer ring until
     // error or cancel, resubmitted only when IORING_CQE_F_MORE is clear.
     bool submit_recv_multishot(int fd, uint16_t group_id, io_request* req);
-    bool recv_multishot_supported() const;
 
     // Whether arming one is worth attempting -- kernel support and not disabled
     // by SOCKETLEY_RECV_MULTISHOT=0 -- which is the switch every runtime's A/B
@@ -264,11 +257,7 @@ public:
     }
 
     // Registered files: pre-register fds to avoid fget/fput per op
-    bool register_files(const int* fds, uint32_t count);
     bool update_registered_file(uint32_t idx, int fd);
-    void unregister_files();
-    bool files_registered() const { return m_files_registered; }
-    uint32_t registered_file_count() const { return m_registered_file_count; }
 
     // Allocate a slot in the registered file table, returns index or -1
     int alloc_fixed_file_slot();
@@ -343,8 +332,6 @@ public:
     // NAPI busy polling: reduce latency by busy-polling the NIC driver.
     bool enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer = false);
 
-    bool direct_accept_supported() const { return m_direct_accept_supported; }
-
     // Whether a ring exists right now, which a caller deferring init() until
     // its config arrives has to ask, because poll_completions() returns
     // immediately until then.
@@ -357,9 +344,6 @@ public:
     // distinguishes not asked from asked and refused.
     bool affinity_applied() const { return m_affinity_applied; }
 
-    // How often a full submission queue refused an operation, which is a
-    // delivery defect that has already happened.
-    uint64_t sq_exhausted_count() const { return m_sq_exhausted_count; }
 
 private:
     struct io_uring_sqe* get_sqe();
@@ -423,7 +407,6 @@ private:
     // settlement will say before it makes the entry the answer depends on.
     static constexpr uint32_t credit_after_turn(uint32_t last_batch, uint32_t credit)
     { return last_batch > 1 ? BUSY_CREDIT : credit > 0 ? credit - 1 : 0; }
-    uint64_t m_stat_ownerless{0};
     bool     m_warned_ownerless{false};
     int m_eventfd{-1};
     io_request m_signal_req{};

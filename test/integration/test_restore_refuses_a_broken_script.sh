@@ -125,7 +125,7 @@ case "$BODY" in
 esac
 
 # ─── 3. The log says which, why and what to do ──────────────────────────────
-LINE=$(grep -i "did not load" "$SOCKETLEY_DLOG" | tail -1)
+LINE=$(grep -i "did not load" "$SOCKETLEY_DLOG" | tail -1 || true)
 case "$LINE" in *rb_broken*) ok ;;
     *) bad "the log names the runtime" "got '${LINE:-<nothing>}'" ;; esac
 case "$LINE" in *broken.lua*) ok ;;

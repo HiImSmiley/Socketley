@@ -30,8 +30,9 @@ inline bool xml_plain(unsigned char c)
     {
         std::array<bool, 256> t{};
         for (int i = 0; i < 256; ++i)
+            // A raw CR is read back as LF (XML 1.0 2.11), so a key holding one goes out as a reference.
             t[static_cast<size_t>(i)] = !(i == '&' || i == '<' || i == '>' || i == '"' || i == '\'' ||
-                                          (i < 0x20 && i != '\t' && i != '\n' && i != '\r'));
+                                          (i < 0x20 && i != '\t' && i != '\n'));
         return t;
     }();
     return table[c];

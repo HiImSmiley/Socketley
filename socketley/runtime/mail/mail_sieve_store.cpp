@@ -206,8 +206,9 @@ bool sieve_store::fits(const std::string& user, const std::string& name, uint64_
     size_t n = 0;
     bool there = false;
     // Each script's size from its inode, not from reading it.
-    for (const auto& [s, active] : list(user))
+    for (const auto& entry : list(user))
     {
+        const std::string& s = entry.first;
         if (s == name)
         {
             there = true;
@@ -392,17 +393,23 @@ std::shared_ptr<const sieve::script> sieve_store::fresh(compiled& c, const std::
     std::string text, why;
     if (!socketley::read_file(path, text))
         return nullptr;
-    c.script = sieve::script::compile(text, why, loader_for(user));
+    // Each file the compile asks for is stamped before it is read, so a rewrite after the read is seen as a change.
+    const sieve::loader load = loader_for(user);
+    const sieve::loader stamping = [&](bool global, std::string_view name, std::string& body) {
+        const std::string n(name);
+        if (name_ok(n))
+        {
+            const std::string p = path_of(global ? global_user : user, n);
+            c.files.emplace_back(p, stamp_of(p));
+        }
+        return load(global, name, body);
+    };
+    c.script = sieve::script::compile(text, why, stamping);
     if (!c.script)
     {
         LOG_WARN(("mail: " + std::string(what) + " " + c.name + " no longer compiles, and filters nothing: " + why)
                      .c_str());
         return nullptr;
-    }
-    for (const auto& [global, name] : c.script->included())
-    {
-        const std::string p = path_of(global ? global_user : user, name);
-        c.files.emplace_back(p, stamp_of(p));
     }
     return c.script;
 }
@@ -539,7 +546,13 @@ void sieve_store::keep_seen(const std::string& user, std::string_view key, uint3
 {
     const user_lock lock(user_dir(user));
     std::lock_guard<std::mutex> g(m_mu);
-    if (!remember(user, "duplicate", hash_of(key), now_s + seconds, now_s)) {}
+    const std::string hash = hash_of(key);
+    bool ok = true;
+    // What other shards appended is read first, so remember() extends the cursor from the end of the file.
+    recall(user, "duplicate", hash, now_s, ok);
+    if (!ok || !lock.held())
+        return;
+    if (!remember(user, "duplicate", hash, now_s + seconds, now_s)) {}
 }
 
 }   // namespace socketley::mail

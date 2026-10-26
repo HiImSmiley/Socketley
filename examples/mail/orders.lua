@@ -16,11 +16,12 @@ function on_message(m)
     if m.to[1] ~= "orders@example.com" then
         return
     end
-    socketley.mqtt.publish("bus", "orders/new", m.message or "", { qos = 1 })
+    local ok = socketley.mqtt.publish("bus", "orders/new", m.message or "", { qos = 1 })
     socketley.mail.send("m", {
         from = "orders@example.com",
         to = m.from,
         subject = "Re: " .. (m.subject or "your order"),
-        text = "Thank you, your order " .. m.id .. " is in.",
+        text = ok and ("Thank you, your order " .. m.id .. " is in.")
+            or ("Sorry, your order " .. m.id .. " was not taken, please send it again."),
     })
 end

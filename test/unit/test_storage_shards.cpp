@@ -562,6 +562,11 @@ std::string copy_dir(const std::string& from)
     std::string to = ::mkdtemp(tmpl);
     std::error_code ec;
     fs::copy(from, to, fs::copy_options::recursive, ec);
+    if (ec)
+    {
+        std::error_code rm;
+        fs::remove_all(to, rm);
+    }
     REQUIRE_FALSE(ec);
     return to;
 }
@@ -1196,7 +1201,15 @@ TEST_CASE("a copy whose source and destination belong to different shards commit
 TEST_CASE("a listing through any shard is the listing one shard would give, page for page")
 {
     tmpdir d;
-    std::string reference_dir;
+    struct reference_guard
+    {
+        std::string path;
+        ~reference_guard()
+        {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        }
+    } reference;
     {
         cluster c(d.path, 4);
         REQUIRE(c.make_bucket(3, "bkt") == st::ok);
@@ -1213,13 +1226,13 @@ TEST_CASE("a listing through any shard is the listing one shard would give, page
         for (const char* k : {"dir0", "dir0.txt", "dir1/", "dir1/sub0", "dir2/sub1/file", "a", "zzz", "dir5/sub2/file9x"})
             REQUIRE(c.put(0, "bkt", k, "z").status == st::ok);
         c.stop(true);
-        reference_dir = copy_dir(d.path);
+        reference.path = copy_dir(d.path);
     }
 
     // The reference: one shard on a copy of the same files, which rebuilds its
     // journal from them because the copy's journals were written for four.
     cluster four(d.path, 4);
-    cluster one(reference_dir, 1);
+    cluster one(reference.path, 1);
     REQUIRE(one.m[0]->report.objects == four.objects_held());
     CHECK(one.objects_held() == 6 * 3 * 9 + 40 + 8);
 
@@ -1245,14 +1258,13 @@ TEST_CASE("a listing through any shard is the listing one shard would give, page
             INFO("prefix=" << qs.prefix << " delimiter=" << qs.delimiter << " max=" << qs.max_keys
                            << " after=" << qs.start_after << " shard=" << s);
             CHECK(got == expect);
-            ++compared;
+            if (got == expect)
+                ++compared;
         }
     }
     CHECK(compared == static_cast<int>(queries.size()) * 4);
     CHECK(four.m[0]->node->counters().list_fanouts > 0);
     CHECK(one.m[0]->node->counters().list_fanouts == 0);
-    std::error_code ec;
-    fs::remove_all(reference_dir, ec);
 }
 
 TEST_CASE("merging pages keeps a prefix once and stops at the nearest shard that was cut short")
@@ -1999,6 +2011,7 @@ TEST_CASE("parts written in place through any shard become the object without a 
     REQUIRE(c.make_bucket(0, "bkt") == st::ok);
     const std::string key = key_owned_by("bkt", 2, 4, "inplace");
     const std::string id = c.mpu_create(3, "bkt", key);
+    REQUIRE(c.m[2]->mpu->find("bkt", id) != nullptr);
     const uint64_t base = c.m[2]->mpu->find("bkt", id)->place_base;
 
     // Each part through another shard, and the owner says where each goes.
@@ -2019,6 +2032,7 @@ TEST_CASE("parts written in place through any shard become the object without a 
     REQUIRE(c.mpu_put_part(0, "bkt", key, id, 2, p2, &again) == st::ok);
     CHECK(again.off == 0);
     // So part 2 is in its own file now, and the completion copies.
+    REQUIRE(c.m[2]->mpu->find("bkt", id) != nullptr);
     CHECK(!c.m[2]->mpu->find("bkt", id)->parts.at(2).in_place);
 
     const std::string id2 = c.mpu_create(0, "bkt", key);

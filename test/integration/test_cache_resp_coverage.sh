@@ -210,7 +210,7 @@ twant "text ltrim"       'ok'    'rpush tl a
 rpush tl b
 ltrim tl 0 0
 '
-twant "text spop"        'm'     'sadd tst m
+twant "text spop"        ' | m | ' 'sadd tst m
 spop tst
 '
 
@@ -233,7 +233,7 @@ want "a negative score survived too" '-3' '[["ZSCORE","rz","c"]]' "$PF"
 echo "--- 11. a mutation only the new path knows reaches the follower ---"
 resp '[["SETRANGE","rs","0","XX"],["HINCRBY","rh","n","7"],["LSET","rl","0","Q"]]' "$PL" >/dev/null
 for _ in $(seq 1 40); do
-    [ "$(resp '[["HGET","rh","n"]]' "$PF")" != "" ] && break
+    [ "$(resp '[["HGET","rh","n"]]' "$PF")" = "$(resp '[["HGET","rh","n"]]' "$PL")" ] && break
     sleep 0.2
 done
 # Against the leader rather than against a literal: the assertion is that the

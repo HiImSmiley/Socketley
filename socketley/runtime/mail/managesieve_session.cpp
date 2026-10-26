@@ -110,7 +110,7 @@ void managesieve_session::run()
         if (!nl)
         {
             // Past a line's limit what came is dropped, and so is the rest of that line when it comes, said once.
-            if (m_in.size() - m_at > max_line)
+            if (m_in.size() - m_at > max_line + 1)
             {
                 m_in.clear();
                 m_at = 0;
@@ -130,6 +130,26 @@ void managesieve_session::run()
             m_discarding = false;
             m_args.clear();
             m_dropping = false;
+            // A literal ending the dropped line still has its bytes to come, and they are not commands.
+            std::string_view tail = line;
+            if (!tail.empty() && tail.back() == '\r')
+                tail.remove_suffix(1);
+            const size_t open = tail.rfind('{');
+            if (!tail.empty() && tail.back() == '}' && open != std::string_view::npos &&
+                (open == 0 || tail[open - 1] == ' '))
+            {
+                std::string_view n = tail.substr(open + 1, tail.size() - open - 2);
+                if (!n.empty() && n.back() == '+')
+                    n.remove_suffix(1);
+                uint64_t len = 0;
+                const auto r = std::from_chars(n.data(), n.data() + n.size(), len);
+                if (!n.empty() && r.ec == std::errc() && r.ptr == n.data() + n.size())
+                {
+                    m_args.push_back({{}, true});
+                    m_literal = len;
+                    m_dropping = true;
+                }
+            }
             continue;
         }
         if (!line.empty() && line.back() == '\r')
@@ -389,9 +409,13 @@ void managesieve_session::command()
     {
         const std::string* name = str(1);
         uint64_t size = 0;
-        const bool num = m_args.size() > 2 && !m_args[2].string &&
-                         std::from_chars(m_args[2].text.data(), m_args[2].text.data() + m_args[2].text.size(), size)
-                                 .ec == std::errc();
+        bool num = m_args.size() > 2 && !m_args[2].string;
+        if (num)
+        {
+            const std::string& t = m_args[2].text;
+            const auto r = std::from_chars(t.data(), t.data() + t.size(), size);
+            num = r.ec == std::errc() && r.ptr == t.data() + t.size();
+        }
         if (!name || !num)
             no({}, "HAVESPACE takes a name and a size");
         else if (!sieve_store::name_ok(*name))

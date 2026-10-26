@@ -120,7 +120,7 @@ def serve(raw):
         c = ctx.wrap_socket(raw, server_side=True)
     except Exception as e:
         # Expected for every rejected case: the proxy walks away mid-handshake.
-        print(f"handshake-rejected {type(e).__name__}", flush=True)
+        print(f"handshake-rejected {type(e).__name__} {e}", flush=True)
         try:
             raw.close()
         except OSError:
@@ -247,7 +247,7 @@ fi
 # Every refusal above ends the connection during the handshake.  If any of them
 # had fallen back to cleartext, the backend would have logged a request line
 # where a ClientHello belonged.
-if grep -q "^served c-[234]" "$TMPD/be.log" "$TMPD/be2.log" 2>/dev/null; then
+if grep -qiE "^served c-[234]|HTTP_REQUEST|http request" "$TMPD/be.log" "$TMPD/be2.log" 2>/dev/null; then
     bad "a refused backend is never retried in the clear" \
         "the backend served a request from a configuration that failed verification"
 else

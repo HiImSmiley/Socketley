@@ -59,6 +59,7 @@ struct shard_dump_header
     uint32_t      index{0};
     unsigned char fingerprint[cache_fingerprint_len]{};
     bool          has_fingerprint{false};
+    bool          truncated{false};
 };
 
 static std::string encode_shard_dump_header(uint32_t count, uint32_t index)
@@ -90,6 +91,17 @@ static bool read_shard_dump_header(const std::string& path,
     char buf[shard_dump_header_size]{};
     f.read(buf, static_cast<std::streamsize>(shard_dump_header_size));
     const std::streamsize got = f.gcount();
+
+    // The magic with less than a whole header behind it is a torn write and not an old file.
+    if (got >= static_cast<std::streamsize>(sizeof(shard_dump_magic))
+        && got < static_cast<std::streamsize>(shard_dump_header_size)
+        && std::memcmp(buf, shard_dump_magic, sizeof(shard_dump_magic)) == 0)
+    {
+        legacy = false;
+        out = shard_dump_header{};
+        out.truncated = true;
+        return true;
+    }
 
     if (got < static_cast<std::streamsize>(shard_dump_header_size)
         || std::memcmp(buf, shard_dump_magic, sizeof(shard_dump_magic)) != 0)
@@ -965,19 +977,23 @@ void cache_instance::teardown(event_loop& /*loop*/)
             // Giving up on this client must not give up on the rest, because
             // the break used to leave the enclosing loop and cost every
             // remaining client its pending replies.
-            if (!conn->response_buf.empty())
-            {
-                if (!socketley::write_all_until(fd, conn->response_buf.data(),
-                                                conn->response_buf.size(), drain_end))
-                    continue;
-            }
+            // The queue holds the older replies, so it goes first and a failure there ends this client.
+            bool queue_broken = false;
             while (!conn->write_queue.empty())
             {
                 const std::string_view msg = conn->write_queue.front().view();
                 if (!socketley::write_all_until(fd, msg.data(), msg.size(), drain_end))
+                {
+                    queue_broken = true;
                     break;
+                }
                 conn->write_queue.pop();
             }
+            if (queue_broken)
+                continue;
+            if (!conn->response_buf.empty())
+                socketley::write_all_until(fd, conn->response_buf.data(),
+                                           conn->response_buf.size(), drain_end);
         }
     }
 
@@ -1002,6 +1018,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
         // Drop the subscriptions with the socket, or a connection that later
         // lands on the same fd number inherits the dead client's channels.
         m_store.unsubscribe_all(fd);
+        m_store.punsubscribe_all(fd);
         // A follower promoted from this connection must lose the descriptor
         // before the loop below sees it, or it would close the number a second
         // time.
@@ -2325,7 +2342,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
         // The read pause_read() withdrew, reporting; the crossing it waited
         // for may have been answered in between, in which case it resumes here.
-        if (cqe->res == -ECANCELED && conn->read_paused)
+        if (cqe->res == -ECANCELED && conn->read_paused && !conn->closing)
         {
             if (!conn->closing && SOCKETLEY_UNLIKELY(!resume_read(conn, fd)))
                 close_client(conn, fd, "read-submit-failed");
@@ -2335,6 +2352,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         // Connection closed or error, deferred if a write is still owed, with
         // the subscriptions dropped at once.
         m_store.unsubscribe_all(fd);
+        m_store.punsubscribe_all(fd);
 
         // Asked first, because a crossing owed to this socket outranks a write
         // in flight: flush_responses() drops a closing connection's buffer, so
@@ -2485,10 +2503,15 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (m_loop && !conn->closing)
     {
-        if (!conn->read_pending && !conn->read_paused
-            && SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd)))
+        // A pause whose cancel lost to this data is lifted here, because no crossing is left to resume it.
+        const bool resumed = !conn->read_paused || resume_read(conn, fd);
+        if (SOCKETLEY_UNLIKELY(!resumed)
+            || (!conn->read_pending && !conn->read_paused
+                && SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd))))
         {
-            close_client(conn, fd, "read-submit-failed");
+            conn->closing = true;
+            if (!conn->write_pending)
+                close_client(conn, fd, "read-submit-failed");
             return;
         }
         return;
@@ -2704,8 +2727,8 @@ static bool parse_double_sv(std::string_view sv, double& out)
 // one, and only a fractional score pays for a decimal point.
 static void append_score_bare(std::string& rb, double sc)
 {
-    if (sc == static_cast<double>(static_cast<int64_t>(sc))
-        && sc < 9.2e18 && sc > -9.2e18)
+    if (sc < 9.2e18 && sc > -9.2e18
+        && sc == static_cast<double>(static_cast<int64_t>(sc)))
     {
         rb.append(std::to_string(static_cast<int64_t>(sc)));
         return;
@@ -3433,11 +3456,10 @@ bool cache_instance::slot_render(const reply_slot& sl, bool resp,
             // there is one terminator for the runtime rather than one per
             // shard.
             for (const auto& p : sl.parts)
-            {
                 if (!p.ends_with("end\n"))
                     return false;
+            for (const auto& p : sl.parts)
                 out.append(std::string_view(p).substr(0, p.size() - 4));
-            }
             out.append("end\n", 4);
             return true;
         }
@@ -3517,6 +3539,12 @@ bool cache_instance::load_shard_set()
         if (!read_shard_dump_header(p, h, legacy))
             continue;                      // not there, which is not an error
 
+        if (h.truncated)
+        {
+            LOG_ERROR(("cache: " + p + " ends inside its shard header; refusing to "
+                       "load a torn dump").c_str());
+            return false;
+        }
         if (legacy)
         {
             // A file at a sharded name with no header is not something this
@@ -3541,6 +3569,12 @@ bool cache_instance::load_shard_set()
         if (!read_shard_dump_header(m_persistent_path, h, legacy))
             return true;                   // first start, nothing to load
 
+        if (h.truncated)
+        {
+            LOG_ERROR(("cache: " + m_persistent_path + " ends inside its shard header; "
+                       "refusing to load a torn dump").c_str());
+            return false;
+        }
         if (legacy)
         {
             LOG_INFO(("cache: loading the pre-shard dump at " + m_persistent_path
@@ -5007,7 +5041,8 @@ bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
         while (!rest.empty())
         {
             const size_t sp1 = rest.find(' ');
-            if (sp1 == std::string_view::npos) break;
+            if (sp1 == std::string_view::npos)
+                return false;       // a key without its value, which the interpreter refuses whole
             const std::string_view k = rest.substr(0, sp1);
             rest = rest.substr(sp1 + 1);
             const size_t sp2 = rest.find(' ');
@@ -5042,6 +5077,18 @@ bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
     // crossing per key that never leaves this process.
     if (keys_all_local(keys.data(), keys.size()))
         return false;
+
+    // A crossing needs somebody to keep waiting, which the scratch connection
+    // cannot: same gate as the single-key case and the same reason.
+    if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
+    {
+        run_in_reply_order(conn, [&] {
+            emit_unrouted(conn, h == fnv1a("mget") ? "mget" : "mset", false,
+                          "names keys several shards own, and this path "
+                          "cannot wait for them");
+        });
+        return true;
+    }
 
     // The same table, before the same irreversible step, because an `else`
     // standing for mset would quietly turn the next multi-key spelling added
@@ -5115,6 +5162,16 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
                                 m_shard_n) == m_shard_i);
     if (local)
         return false;
+
+    if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
+    {
+        run_in_reply_order(conn, [&] {
+            emit_unrouted(conn, args[0], true,
+                          "names keys several shards own, and this path "
+                          "cannot wait for them");
+        });
+        return true;
+    }
 
     // What each multi-key spelling becomes per key: one table, decided once,
     // and BEFORE the slot is opened -- a refusal after that leaves a slot
@@ -5469,18 +5526,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 
         case cache_cmd_class::multi_key:
         {
-            // A crossing needs somebody to keep waiting, which the scratch
-            // connection cannot: same gate as the single-key case and the same
-            // reason.
-            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
-            {
-                run_in_reply_order(conn, [&] {
-                    emit_unrouted(conn, parts.cmd, false,
-                                  "names keys several shards own, and this path "
-                                  "cannot wait for them");
-                });
-                return;
-            }
+            // The crossing gate lives in explode_text_multi, after the keys are known to be foreign.
             if (explode_text_multi(conn, h, parts.args))
                 return;
             // Could not be split: a usage error or past the ceiling, and the
@@ -5991,7 +6037,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             bool had_key = m_store.exists(key);
             std::string oldval;
             if (!m_store.getset(key, newval, oldval))
-                rb.append("error: type conflict\n", 21);
+            {
+                const auto t = m_store.type(key);
+                if (t == "none" || t == "string")
+                    rb.append("error: out of memory\n", 21);
+                else
+                    rb.append("error: type conflict\n", 21);
+            }
             else
             {
                 if (had_key) { rb.append(oldval); rb.push_back('\n'); }
@@ -6809,7 +6861,15 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (!m_store.set(key, val))
             {
                 m_store.check_expiry(key);
-                if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
+                if (!m_store.set(key, val))
+                {
+                    const auto t = m_store.type(key);
+                    if (t == "none" || t == "string")
+                        rb.append("error: out of memory\n", 21);
+                    else
+                        rb.append("error: type conflict\n", 21);
+                    return;
+                }
             }
             m_store.set_expiry(key, sec);
             mark_ttl_keys();
@@ -6839,7 +6899,15 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (!m_store.set(key, val))
             {
                 m_store.check_expiry(key);
-                if (!m_store.set(key, val)) { rb.append("error: type conflict\n", 21); return; }
+                if (!m_store.set(key, val))
+                {
+                    const auto t = m_store.type(key);
+                    if (t == "none" || t == "string")
+                        rb.append("error: out of memory\n", 21);
+                    else
+                        rb.append("error: type conflict\n", 21);
+                    return;
+                }
             }
             m_store.set_expiry_ms(key, ms);
             mark_ttl_keys();
@@ -6986,7 +7054,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                     std::string_view cnt_str = (sp2 == std::string_view::npos) ? rest2 : rest2.substr(0, sp2);
                     rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
                     size_t cnt = 10;
-                    if (parse_int_sv(cnt_str, cnt)) { scan_count = cnt; scan_count_given = true; }
+                    if (!parse_int_sv(cnt_str, cnt))
+                    { rb.append("error: invalid count\n", 21); return; }
+                    scan_count = cnt; scan_count_given = true;
                 }
             }
             if (sp.too_many)
@@ -7067,9 +7137,16 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             // The journal's tail describes state the load just replaced, so a
             // fresh snapshot of what is now in memory supersedes it before it
             // is cut off.
-            if (loaded && m_journal.is_open() && save_shard_dump())
-                journal_after_snapshot(true);
-            rb.append(loaded ? "ok\n" : "failed: load failed\n");
+            bool snapped = true;
+            if (loaded && m_journal.is_open())
+            {
+                snapped = save_shard_dump();
+                if (snapped)
+                    journal_after_snapshot(true);
+            }
+            if (!loaded)        rb.append("failed: load failed\n");
+            else if (!snapped)  rb.append("failed: snapshot after load failed\n");
+            else                rb.append("ok\n", 3);
             break;
         }
         case fnv1a("size"):
@@ -7294,6 +7371,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             int64_t s = 0, e = 0;
             if (!parse_int_sv(s_s, s) || !parse_int_sv(e_s, e))
             { rb.append("error: invalid index\n", 21); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
+            if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(key, 'l')))
+            { rb.append("error: type conflict\n", 21); break; }
             m_store.ltrim(key, s, e);
             rb.append("ok\n", 3);
             replicate_command(line);
@@ -7446,6 +7526,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         {
             auto [key, _r] = extract_key(args);
             if (key.empty()) { rb.append("usage: srandmember key\n", 23); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             std::string member;
             if (!m_store.srandmember(key, member)) { rb.append("nil\n", 4); return; }
             rb.append(member); rb.push_back('\n');
@@ -7457,6 +7538,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         {
             auto [key, f] = extract_key(args);
             if (key.empty() || f.empty()) { rb.append("usage: hexists key field\n", 25); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             rb.append(m_store.hexists(key, f) ? "1\n" : "0\n", 2);
             break;
         }
@@ -7481,7 +7563,15 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || f.empty()) { rb.append("usage: hsetnx key field value\n", 30); return; }
             if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
             const int rc = m_store.hsetnx(key, f, v);
-            if (rc < 0) { rb.append("error: type conflict\n", 21); return; }
+            if (rc < 0)
+            {
+                const auto t = m_store.type(key);
+                if (t == "none" || t == "hash")
+                    rb.append("error: out of memory\n", 21);
+                else
+                    rb.append("error: type conflict\n", 21);
+                return;
+            }
             rb.append(rc ? "1\n" : "0\n", 2);
             if (rc == 1) replicate_command(line);
             break;
@@ -7490,6 +7580,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         {
             auto [key, f] = extract_key(args);
             if (key.empty() || f.empty()) { rb.append("usage: hstrlen key field\n", 25); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             const auto v = m_store.hget(key, f);
             rb.append(std::to_string(v ? v->size() : 0)); rb.push_back('\n');
             break;
@@ -7531,6 +7622,14 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || rest.empty())
             { rb.append("usage: hmset key field value [field value ...]\n"); return; }
             if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            // A field without its value is refused whole, as mset does, rather than stored with an empty one.
+            {
+                size_t words = 1;
+                for (const char c : rest)
+                    words += c == ' ';
+                if (words % 2 != 0)
+                { rb.append("usage: hmset key field value [field value ...]\n"); return; }
+            }
             if (m_has_ttl_keys) m_store.check_expiry(key);
             // Fields go in order up to the first the store refuses, and only those reach a follower.
             std::string_view walk = rest;
@@ -7589,6 +7688,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 auto [o, r3] = extract_key(walk);
                 auto [v, r4] = extract_key(r3);
                 if (o.empty()) break;
+                if (v.empty()) { rb.append("error: syntax\n", 14); return; }
                 const uint32_t oh = fnv1a_lower(o);
                 if (oh == fnv1a("match")) pat = v;
                 else if (oh == fnv1a("valuematch")) { vpat = v; has_v = true; }
@@ -7679,6 +7779,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
             if (!parse_score_bound(a_s, lo, lo_in) || !parse_score_bound(b_s, hi, hi_in))
             { rb.append("error: min or max is not a float\n", 33); return; }
+            m_store.check_expiry(key);
             rb.append(std::to_string(m_store.zcount(key, lo, hi, lo_in, hi_in)));
             rb.push_back('\n');
             break;
@@ -7686,22 +7787,31 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         case fnv1a("zpopmin"):
         case fnv1a("zpopmax"):
         {
-            auto [key, _r] = extract_key(args);
-            if (key.empty()) { rb.append("usage: zpopmin key\n", 19); return; }
+            auto [key, zrest] = extract_key(args);
+            if (key.empty()) { rb.append("usage: zpopmin key [count]\n", 27); return; }
             if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
-            std::string member; double score = 0;
-            if (!m_store.zpop(key, fnv1a_lower(cmd) == fnv1a("zpopmax"), member, score))
-            { rb.append("end\n", 4); return; }
-            rb.append(member); rb.push_back(' ');
-            append_score_bare(rb, score); rb.push_back('\n');
-            rb.append("end\n", 4);
-            // The ZREM it turned out to be, for SPOP's reason.
-            if (mutation_log_wanted())
+            int64_t zcount_want = 1;
+            if (!zrest.empty())
             {
-                std::string c = "zrem "; c.append(key.data(), key.size());
-                c += ' '; c += member;
-                replicate_command(c);
+                auto [cnt_s, zextra] = extract_key(zrest);
+                if (!zextra.empty() || !parse_int_sv(cnt_s, zcount_want) || zcount_want < 0)
+                { rb.append("error: invalid count\n", 21); return; }
             }
+            const bool zpop_max = fnv1a_lower(cmd) == fnv1a("zpopmax");
+            std::string member; double score = 0;
+            for (int64_t n = 0; n < zcount_want && m_store.zpop(key, zpop_max, member, score); ++n)
+            {
+                rb.append(member); rb.push_back(' ');
+                append_score_bare(rb, score); rb.push_back('\n');
+                // The ZREM it turned out to be, for SPOP's reason.
+                if (mutation_log_wanted())
+                {
+                    std::string c = "zrem "; c.append(key.data(), key.size());
+                    c += ' '; c += member;
+                    replicate_command(c);
+                }
+            }
+            rb.append("end\n", 4);
             break;
         }
         case fnv1a("zremrangebyrank"):
@@ -7982,6 +8092,13 @@ void cache_instance::log_lua_mutation(std::initializer_list<std::string_view> pa
 {
     if (!mutation_log_wanted())
         return;
+    // Only the last part survives a space, because the reader splits the rest on it.
+    for (auto it = parts.begin() + 1; it + 1 < parts.end(); ++it)
+        if (it->find(' ') != std::string_view::npos)
+        {
+            repl_unfaithful(*it);
+            return;
+        }
     size_t n = 0;
     for (const auto p : parts)
         n += p.size() + 1;
@@ -8847,15 +8964,7 @@ void cache_instance::process_resp_command(client_connection* conn,
 
         case cache_cmd_class::multi_key:
         {
-            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
-            {
-                run_in_reply_order(conn, [&] {
-                    emit_unrouted(conn, args[0], true,
-                                  "names keys several shards own, and this path "
-                                  "cannot wait for them");
-                });
-                return;
-            }
+            // The crossing gate lives in explode_resp_multi, after the keys are known to be foreign.
             if (explode_resp_multi(conn, h, args, argc))
                 return;
             break;
@@ -9505,7 +9614,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 
             if (!m_store.set(args[1], args[2]))
             {
-                resp::encode_error_code_into(rb, wrongtype_msg);
+                encode_refusal(rb, m_store.type(args[1]), "string");
                 break;
             }
             if (ex_sec > 0) { m_store.set_expiry(args[1], ex_sec); mark_ttl_keys(); }
@@ -9516,11 +9625,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             {
                 if (had_old) resp::encode_bulk_into(rb, old_val);
                 else         resp::encode_null_into(rb);
-                repl_set_effect(args[1], args[2], ex_sec, px_ms);
-                break;
             }
-            resp::encode_ok_into(rb);
-            repl_set_effect(args[1], args[2], ex_sec, px_ms);
+            else
+                resp::encode_ok_into(rb);
+            // KEEPTTL replicates the deadline it kept, because the follower's set drops one.
+            repl_set_effect(args[1], args[2], ex_sec,
+                            (keepttl && kept > 0) ? kept : px_ms);
 #ifndef SOCKETLEY_NO_LUA
             if (lua() && lua()->has_on_write())
             {
@@ -9719,7 +9829,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             bool had_key = m_store.exists(args[1]);
             std::string oldval;
             if (!m_store.getset(args[1], args[2], oldval))
-                resp::encode_error_code_into(rb, wrongtype_msg);
+                encode_refusal(rb, m_store.type(args[1]), "string");
             else
             {
                 if (!had_key) resp::encode_null_into(rb);
@@ -9902,6 +10012,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             if (m_store.pop_with(args[1], true, [&](std::string_view v) { resp::encode_bulk_into(rb, v); }))
                 repl(args, 2);
+            else if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'l')))
+                resp::encode_error_code_into(rb, wrongtype_msg);
             else resp::encode_null_into(rb);
             break;
         }
@@ -9917,6 +10029,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             if (m_store.pop_with(args[1], false, [&](std::string_view v) { resp::encode_bulk_into(rb, v); }))
                 repl(args, 2);
+            else if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'l')))
+                resp::encode_error_code_into(rb, wrongtype_msg);
             else resp::encode_null_into(rb);
             break;
         }
@@ -10074,6 +10188,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     zgone++;
                     repl_unit("zrem", args[1], {}, args[i]);
                 }
+            if (SOCKETLEY_UNLIKELY(zgone == 0 && m_store.holds_other_type(args[1], 'z')))
+            { resp::encode_error_code_into(rb, wrongtype_msg); break; }
             resp::encode_integer_into(rb, zgone);
             break;
         }
@@ -10112,7 +10228,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             m_store.check_expiry(args[1]);
             size_t zr = 0;
             if (!m_store.zrank(args[1], args[2], zr, fnv1a_lower(args[0]) == fnv1a("zrevrank")))
-            { resp::encode_null_into(rb); break; }
+            {
+                if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'z')))
+                    resp::encode_error_code_into(rb, wrongtype_msg);
+                else
+                    resp::encode_null_into(rb);
+                break;
+            }
             resp::encode_integer_into(rb, static_cast<int64_t>(zr));
             break;
         }
@@ -10238,6 +10360,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     removed++;
                     repl_unit("srem", args[1], {}, args[i]);
                 }
+            if (SOCKETLEY_UNLIKELY(removed == 0 && m_store.holds_other_type(args[1], 't')))
+            { resp::encode_error_code_into(rb, wrongtype_msg); break; }
             resp::encode_integer_into(rb, removed);
             break;
         }
@@ -10474,6 +10598,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     removed++;
                     repl_unit("hdel", args[1], {}, args[i]);
                 }
+            if (SOCKETLEY_UNLIKELY(removed == 0 && m_store.holds_other_type(args[1], 'h')))
+            { resp::encode_error_code_into(rb, wrongtype_msg); break; }
             resp::encode_integer_into(rb, removed);
             break;
         }
@@ -10565,7 +10691,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (!m_store.set(args[1], args[3]))
             {
                 m_store.check_expiry(args[1]);
-                if (!m_store.set(args[1], args[3])) { resp::encode_error_code_into(rb, wrongtype_msg); return; }
+                if (!m_store.set(args[1], args[3]))
+                { encode_refusal(rb, m_store.type(args[1]), "string"); return; }
             }
             m_store.set_expiry(args[1], sec);
             mark_ttl_keys();
@@ -10591,7 +10718,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (!m_store.set(args[1], args[3]))
             {
                 m_store.check_expiry(args[1]);
-                if (!m_store.set(args[1], args[3])) { resp::encode_error_code_into(rb, wrongtype_msg); return; }
+                if (!m_store.set(args[1], args[3]))
+                { encode_refusal(rb, m_store.type(args[1]), "string"); return; }
             }
             m_store.set_expiry_ms(args[1], ms);
             mark_ttl_keys();
@@ -10699,7 +10827,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 else if (fnv1a_lower(args[i]) == fnv1a("count") && i + 1 < argc)
                 {
                     size_t cnt = 10;
-                    if (parse_int_sv(args[i+1], cnt)) { scan_count = cnt; scan_count_given = true; }
+                    if (!parse_int_sv(args[i+1], cnt))
+                    { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
+                    scan_count = cnt; scan_count_given = true;
                     i++;
                 }
             }
@@ -11083,6 +11213,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             int64_t s = 0, e = 0;
             if (!parse_int_sv(args[2], s) || !parse_int_sv(args[3], e))
             { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+            if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'l')))
+            { resp::encode_error_code_into(rb, wrongtype_msg); break; }
             m_store.ltrim(args[1], s, e);
             resp::encode_ok_into(rb);
             repl(args, argc);
@@ -11269,6 +11402,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp_srandmember_count(args, argc, rb);
                 break;
             }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             std::string member;
             if (m_store.srandmember(args[1], member)) resp::encode_bulk_into(rb, member);
             else resp::encode_null_into(rb);
@@ -11287,6 +11421,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("hexists"):
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb, m_store.hexists(args[1], args[2]) ? 1 : 0);
             break;
         }
@@ -11315,7 +11450,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             const int rc = m_store.hsetnx(args[1], args[2], args[3]);
-            if (rc < 0) { resp::encode_error_code_into(rb, "WRONGTYPE"); break; }
+            if (rc < 0) { encode_refusal(rb, m_store.type(args[1]), "hash"); break; }
             resp::encode_integer_into(rb, rc);
             if (rc == 1) repl(args, argc);
             break;
@@ -11348,6 +11483,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("hstrlen"):
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             const auto v = m_store.hget(args[1], args[2]);
             resp::encode_integer_into(rb, v ? static_cast<int64_t>(v->size()) : 0);
             break;
@@ -11450,8 +11586,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             std::string_view pat = "*";   // absent MATCH is everything; see above
             size_t want = 10;                       // Redis's own default COUNT
             std::string_view vpat; bool has_v = false, count_given = false;
-            for (int i = 3; i + 1 < argc; i += 2)
+            for (int i = 3; i < argc; i += 2)
             {
+                if (i + 1 >= argc) { resp::encode_error_into(rb, "syntax error"); return; }
                 const uint32_t o = fnv1a_lower(args[i]);
                 if (o == fnv1a("match")) pat = args[i + 1];
                 else if (o == fnv1a("valuematch")) { vpat = args[i + 1]; has_v = true; }
@@ -11530,6 +11667,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 else { resp::encode_error_into(rb, "syntax error"); return; }
             }
             std::vector<std::pair<std::string_view, double>> out;
+            m_store.check_expiry(args[1]);
             m_store.zrangebyscore(args[1], lo, hi, lo_in, hi_in, rev, out);
             apply_zlimit(out, off, cnt);
             resp::encode_array_header_into(rb,
@@ -11547,6 +11685,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
             if (!parse_score_bound(args[2], lo, lo_in) || !parse_score_bound(args[3], hi, hi_in))
             { resp::encode_error_code_into(rb, "ERR min or max is not a float"); break; }
+            m_store.check_expiry(args[1]);
             resp::encode_integer_into(rb,
                 static_cast<int64_t>(m_store.zcount(args[1], lo, hi, lo_in, hi_in)));
             break;
@@ -11555,14 +11694,20 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("zpopmin"):
         case fnv1a("zpopmax"):
         {
-            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (argc < 2 || argc > 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            int64_t zcount_want = 1;
+            if (argc == 3 && (!parse_int_sv(args[2], zcount_want) || zcount_want < 0))
+            { resp::encode_error_into(rb, "value is out of range, must be positive"); return; }
             std::string member; double score = 0;
-            if (m_store.zpop(args[1], cmd_hash == fnv1a("zpopmax"), member, score))
+            std::string zbody;
+            int64_t zpopped = 0;
+            while (zpopped < zcount_want
+                   && m_store.zpop(args[1], cmd_hash == fnv1a("zpopmax"), member, score))
             {
-                resp::encode_array_header_into(rb, 2);
-                resp::encode_bulk_into(rb, member);
-                resp::encode_bulk_into(rb, score_text(score));
+                ++zpopped;
+                resp::encode_bulk_into(zbody, member);
+                resp::encode_bulk_into(zbody, score_text(score));
                 if (mutation_log_wanted())
                 {
                     std::string cmd = "zrem ";
@@ -11571,7 +11716,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     replicate_command(cmd);
                 }
             }
-            else resp::encode_array_header_into(rb, 0);
+            resp::encode_array_header_into(rb, static_cast<int>(zpopped * 2));
+            rb.append(zbody);
             break;
         }
         case fnv1a("zremrangebyrank"):
@@ -12766,6 +12912,7 @@ void cache_instance::handle_replicate_request(client_connection* conn)
     // because publish() writes straight into the write queue and the
     // subscriber can no longer unsubscribe itself.
     m_store.unsubscribe_all(conn->fd);
+    m_store.punsubscribe_all(conn->fd);
 
     // Register first, then queue the dump: both the dump and every command that
     // follows travel through the same buffer, which is what keeps them ordered.

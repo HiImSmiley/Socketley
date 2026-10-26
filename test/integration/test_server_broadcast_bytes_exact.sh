@@ -83,15 +83,18 @@ def ws_sub(out, idx):
     buf = buf.split(b"\r\n\r\n", 1)[1]
     ready.wait()
     msgs = []
+    seen = 0
     try:
-        while len([m for m in msgs if not m.startswith(b"hello-")]) < n:
+        while seen < n:
             while True:
                 if len(buf) >= 2:
                     ln = buf[1] & 0x7f; h = 2
                     if ln == 126: ln = int.from_bytes(buf[2:4], "big"); h = 4
                     elif ln == 127: ln = int.from_bytes(buf[2:10], "big"); h = 10
                     if len(buf) >= h + ln:
-                        msgs.append(buf[h:h + ln]); buf = buf[h + ln:]; break
+                        msgs.append(buf[h:h + ln]); buf = buf[h + ln:]
+                        if not msgs[-1].startswith(b"hello-"): seen += 1
+                        break
                 b = s.recv(1 << 16)
                 if not b: raise EOFError
                 buf += b

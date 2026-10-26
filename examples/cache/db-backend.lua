@@ -26,6 +26,7 @@ local WRITE_BEHIND = true  -- true  = buffer writes and flush every tick_ms (rec
 tick_ms = 2000             -- flush pending writes to DB every 2 seconds
 
 local db
+local db_upsert
 local pending_writes = {}  -- key → value (write-behind buffer)
 
 function on_start()
@@ -59,6 +60,7 @@ function on_miss(key)
     else
         local cur = db:execute("SELECT value FROM cache_kv WHERE key = '" ..
                                db:escape(key) .. "'")
+        if not cur then return nil end
         local row = cur:fetch({}, "a")
         if row then value = row.value end
         cur:close()
@@ -96,15 +98,17 @@ function on_tick(dt)
     pending_writes = {}
 end
 
-local function db_upsert(key, value)
+function db_upsert(key, value)
     if not db then return end
     if BACKEND == "sqlite" then
         db:exec("INSERT OR REPLACE INTO cache_kv(key, value) VALUES(" ..
                 db:quote(key) .. ", " .. db:quote(value) .. ")")
     else
-        db:execute("INSERT INTO cache_kv(key, value) VALUES('" ..
-                   db:escape(key) .. "','" .. db:escape(value) ..
-                   "') ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value")
+        local conflict = BACKEND == "mysql" and "') ON DUPLICATE KEY UPDATE value = VALUES(value)"
+                         or "') ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value"
+        local ok, err = db:execute("INSERT INTO cache_kv(key, value) VALUES('" ..
+                                   db:escape(key) .. "','" .. db:escape(value) .. conflict)
+        if not ok then socketley.log("DB write failed: " .. tostring(err)) end
     end
 end
 

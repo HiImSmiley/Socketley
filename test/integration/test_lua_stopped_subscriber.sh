@@ -154,6 +154,7 @@ said "SUBSCRIBED" 10 || true
 # ── Control: the subscription is live while the runtime is running ──────────
 publish m1
 said "HIT msg=m1" 6 || true
+said "NOSTART msg=m1" 6 || true
 if grep -qa "HIT msg=m1 state=running" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
     fail "control: a publish reaches the subscriber while it is running" \
          "no 'HIT msg=m1 state=running' line" \

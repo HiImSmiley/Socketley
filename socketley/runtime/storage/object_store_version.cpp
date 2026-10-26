@@ -597,6 +597,18 @@ void object_store::vop_behind(std::shared_ptr<vop> v)
         vop_end(std::move(v), st::no_such_bucket);
         return;
     }
+    // A null version it would take the place of under a lock stays, as vop_install refuses the same replacement.
+    if (version_id_of(v->meta) == "null")
+        if (const auto vs = b->versions.find(v->key); vs != b->versions.end())
+        {
+            const int64_t now = static_cast<int64_t>(now_ms());
+            for (const object_meta& m : vs->second)
+                if (version_id_of(m) == "null" && lock_holds(m, now, false))
+                {
+                    vop_end(std::move(v), st::locked);
+                    return;
+                }
+        }
     v->behind = true;
     // Its file goes where a noncurrent version of its id is, over the older null version it takes the place of.
     const std::string vrel = version_rel_path(v->key, version_of(v->meta).id);
@@ -845,18 +857,21 @@ bool object_store::write_removed()
     }
     const std::string text = w.take();
     const std::string tmp = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    // Kept open and appended to after the rename, which it follows, so no second open can fail and end the journal.
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0600);
     if (fd < 0)
         return false;
     const bool whole = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
-    ::close(fd);
     if (!whole || ::rename(tmp.c_str(), path.c_str()) < 0)
+    {
+        ::close(fd);
         return false;
+    }
     if (m_removed_fd >= 0)
         ::close(m_removed_fd);
-    m_removed_fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+    m_removed_fd = fd;
     m_removed_appends = 0;
-    return m_removed_fd >= 0;
+    return true;
 }
 
 bool object_store::open_removed(std::string& err)

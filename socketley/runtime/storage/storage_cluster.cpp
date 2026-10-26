@@ -41,9 +41,9 @@ bool storage_run::load_cluster_id(std::string& err)
         std::snprintf(hex_id, sizeof hex_id, "%016llx%016llx\n", static_cast<unsigned long long>(random_u64()),
                       static_cast<unsigned long long>(random_u64()));
         const std::string id = hex_id;
-        // The first shard's id stays, and a later one reads it.
+        // The first shard's id stays, and a later one reads it; one that lost the race to make it reads the winner's.
         if (!create_file_once(path, id, nullptr, 0644))
-            break;
+            continue;
     }
     err = "the cluster id of this node's data in " + path + " can be neither read nor made";
     return false;

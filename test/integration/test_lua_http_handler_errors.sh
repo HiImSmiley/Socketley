@@ -138,7 +138,7 @@ ready_tcp 127.0.0.1 "$PORT" 10 || echo "  NOTE: the runtime never accepted"
 # status PATH -> the HTTP status code, or 000 when nothing answered
 status() {
     curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
-        "http://127.0.0.1:$PORT$1" 2>/dev/null || printf '000'
+        "http://127.0.0.1:$PORT$1" 2>/dev/null || true
 }
 body() {
     curl -s --max-time 3 "http://127.0.0.1:$PORT$1" 2>/dev/null || true

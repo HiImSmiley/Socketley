@@ -88,11 +88,12 @@ esac
 
 # The valid arm: the same three flags, spelled right, still land their values.
 if "$BIN" create proxy pxy -p "$PORT_PROXY" --backend "127.0.0.1:$PORT_BACK" \
-        --retry 2 --health-threshold 3 --circuit-threshold 4 >/dev/null 2>&1
+        --retry 2 --health-threshold 5 --circuit-threshold 4 >/dev/null 2>&1
 then ok; else bad "valid counts are accepted" "create refused a correct command line"; fi
 
 SHOW=$("$BIN" show pxy 2>/dev/null)
-if grep -q '"retry_count": 2' <<<"$SHOW" && grep -q '"circuit_threshold": 4' <<<"$SHOW"
+if grep -q '"retry_count": 2' <<<"$SHOW" && grep -q '"circuit_threshold": 4' <<<"$SHOW" \
+        && grep -q '"health_threshold": 5' <<<"$SHOW"
 then ok; else bad "valid counts are stored" "show reports something else"; fi
 
 # The edit arm is a second copy of all three cases in flag_handlers.cpp, so a
