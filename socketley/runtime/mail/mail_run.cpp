@@ -3040,8 +3040,9 @@ std::string mail_run::records_text() const
 
 void mail_run::publish_records()
 {
-    // One shard writes them, since every shard's are the same.
-    if (m_owner.get_dns().empty() || m_owner.get_shard_index() != 0)
+    // One shard writes them, since every shard's are the same, and only once start has the keys and the certificate
+    // they are of, so a dns runtime never serves the zone without its DKIM keys.
+    if (m_owner.get_dns().empty() || m_owner.get_shard_index() != 0 || !m_delivery)
         return;
     const std::string text = records_text();
     if (text == m_published)

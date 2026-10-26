@@ -6,6 +6,7 @@
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   * a record of the four missing from the zone, or the host the MX names left without an address
+#   * a restart that writes its records before it has its DKIM keys, so the zone is served for a moment without them
 #   * a DKIM record that is not the key the runtime signs with
 #   * a message without a sender not sent from no-reply@, or mail to no-reply@ taken from anyone
 #   * a bounce to no-reply@ dropped unread, so a dead address is mailed again and again, after a restart or by
@@ -201,6 +202,18 @@ for id in "${ids[@]}"; do
     for _ in $(seq 1 100); do "$BIN" mail msh show "$id" >/dev/null 2>&1 || break; sleep 0.1; done
 done
 check "an address one shard learned is suppressed by every shard" "$(grep -l 'zed body' "$T"/sink/*.eml 2>/dev/null | wc -l)" "0"
+
+# A restart publishes nothing until it has its keys: the records it gave are kept, never written without DKIM.
+feed=$(find "$T" -path '*/.dns/records-m' | head -1)
+was=$(stat -c %y "$feed" 2>/dev/null)
+kill "$SOCKETLEY_DPID" 2>/dev/null
+for _ in $(seq 1 50); do kill -0 "$SOCKETLEY_DPID" 2>/dev/null || break; sleep 0.1; done
+daemon_start "$BIN"
+ready_tcp 127.0.0.1 "$P" >/dev/null 2>&1 || true
+for _ in $(seq 1 30); do [ -n "$(q skl._domainkey.example.test TXT)" ] && break; sleep 0.1; done
+[ -n "$was" ] && [ "$(stat -c %y "$feed" 2>/dev/null)" = "$was" ] && [ -n "$(q skl._domainkey.example.test TXT)" ] \
+    && ok "a restart leaves its records as they were, the DKIM keys among them" \
+    || bad "the records across a restart" "written $was -> $(stat -c %y "$feed" 2>/dev/null): $(awk '{print $1}' "$feed" 2>/dev/null | tr '\n' ' ')"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
