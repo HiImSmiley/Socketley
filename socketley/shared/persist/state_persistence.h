@@ -210,6 +210,7 @@ struct runtime_config
     std::string db_schema;
     std::string db_keys;
     std::string db_idp;
+    std::string db_idp_audience;
     std::string db_origins;
     uint64_t db_max_bytes = 0;
     uint64_t db_cache = 64ull << 20;
@@ -222,6 +223,7 @@ struct runtime_config
     // Mqtt; its snapshot is persistent_path and persistent_interval, as a cache's file is.
     std::string mqtt_users;
     std::string mqtt_idp;
+    std::string mqtt_idp_audience;
     std::string mqtt_acl;
     std::string mqtt_routes;
     bool mqtt_anonymous = false;
@@ -266,6 +268,7 @@ struct runtime_config
     std::string mail_hostname;
     bool mail_no_reply = false;
     std::string mail_idp;
+    std::string mail_idp_audience;
     std::string mail_storage;
     std::string mail_users;
     std::string mail_relay;

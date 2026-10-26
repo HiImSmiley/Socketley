@@ -1,5 +1,6 @@
 #include "idp_session.h"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <fstream>
@@ -23,8 +24,22 @@ namespace socketley::idp
 session_verifier::session_verifier() = default;
 session_verifier::~session_verifier() = default;
 
-void session_verifier::configure(std::string_view idp_runtime)
+void session_verifier::configure(std::string_view idp_runtime, std::string_view audiences)
 {
+    m_audiences.clear();
+    m_refused.clear();
+    for (std::string_view rest = audiences; !rest.empty();)
+    {
+        const size_t comma = rest.find(',');
+        std::string_view one = rest.substr(0, comma);
+        rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+        while (!one.empty() && one.front() == ' ')
+            one.remove_prefix(1);
+        while (!one.empty() && one.back() == ' ')
+            one.remove_suffix(1);
+        if (!one.empty())
+            m_audiences.emplace_back(one);
+    }
     m_path = idp_runtime.empty() ? std::string() : idp_jwks_path(idp_runtime);
     m_issuer.clear();
     m_keys.reset();
@@ -76,6 +91,14 @@ bool session_verifier::verified(std::string_view token, bool bearer, int64_t now
         if (!m_seen.verify(k.key.get(), k.kid, bearer ? "at+jwt" : "session+jwt", m_issuer, token, now, c, why) ||
             (!bearer && c["aud"] != "session") || c["sub"].empty())
             continue;
+        // An access token is for the client it was given to, and taken here only for one this runtime names.
+        if (bearer && std::find(m_audiences.begin(), m_audiences.end(), c["aud"]) == m_audiences.end())
+        {
+            if (m_refused.size() < 64 && m_refused.insert(c["aud"]).second)
+                LOG_WARN(("idp: an access token given to client \"" + c["aud"] +
+                          "\" was refused; --idp-audience names the clients whose tokens this runtime takes").c_str());
+            return false;
+        }
         out = who{c["sub"], c["preferred_username"], c["email"], c["admin"] == "true"};
         return true;
     }

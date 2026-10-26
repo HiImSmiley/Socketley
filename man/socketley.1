@@ -12491,6 +12491,12 @@ document's
 .BI "\-\-idp " runtime
 The idp runtime whose accounts own documents.
 .TP
+.BI "\-\-idp\-audience " clients
+The ids of the idp's clients whose access tokens it takes, comma-separated. A
+token the provider gave any other application is refused, since it is that
+application's and no key to this runtime; without the flag no access token is
+taken, while cookies and passwords sign in as before.
+.TP
 .BI "\-\-origins " list
 The web origins a browser may call it from, comma-separated, answered with
 CORS and the browser's sign-in;
@@ -12874,6 +12880,12 @@ writes them; read again within two seconds of a change.
 .TP
 .BI "\-\-idp " runtime
 The idp runtime whose access tokens, given as the password, sign clients in.
+.TP
+.BI "\-\-idp\-audience " clients
+The ids of the idp's clients whose access tokens it takes, comma-separated. A
+token the provider gave any other application is refused, since it is that
+application's and no key to this runtime; without the flag no access token is
+taken, while cookies and passwords sign in as before.
 .TP
 .BI "\-\-acl " file
 Who may publish and subscribe to what (see
@@ -13618,6 +13630,12 @@ and learn from those.
 .TP
 .BI "\-\-idp " runtime
 The idp runtime whose users have mailboxes here and sign in to send and read.
+.TP
+.BI "\-\-idp\-audience " clients
+The ids of the idp's clients whose access tokens it takes, comma-separated. A
+token the provider gave any other application is refused, since it is that
+application's and no key to this runtime; without the flag no access token is
+taken, while cookies and passwords sign in as before.
 .TP
 .BI "\-\-storage " runtime\fR[/\fIbucket\fR]
 The storage runtime, and bucket, the mailboxes are kept in.

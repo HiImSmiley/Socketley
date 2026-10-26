@@ -84,6 +84,7 @@ bool filter_covers(std::string_view acl, std::string_view sub)
 bool acl_rules::parse(std::string_view text, std::string& why)
 {
     m_rules.clear();
+    m_loaded = true;
     std::string current;
     size_t n = 0;
     while (!text.empty())
@@ -185,7 +186,7 @@ bool acl_rules::check(std::string_view user, std::string_view client, std::strin
                       bool as_filter) const
 {
     if (m_rules.empty())
-        return true;
+        return !m_loaded;
     const auto hits = [&](const rule& r) {
         if (!applies(r, user) || !(r.rights & right))
             return false;

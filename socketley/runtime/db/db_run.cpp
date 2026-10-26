@@ -131,7 +131,7 @@ bool db_run::start(std::string& why)
     reload_files(why);
     if (!why.empty())
         return false;
-    m_idp.configure(m_owner.get_idp());
+    m_idp.configure(m_owner.get_idp(), m_owner.get_idp_audience());
     for (std::string_view list = m_owner.get_origins(); !list.empty();)
     {
         const std::string_view one = http_trim_ows(take_item(list));

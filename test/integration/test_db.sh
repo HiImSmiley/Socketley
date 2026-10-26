@@ -35,6 +35,7 @@ daemon_start "$BIN"
 
 cat > "$T/clients" <<EOF
 spa - http://localhost:5173/cb
+other - http://localhost:5174/cb
 EOF
 cat > "$T/schema" <<EOF
 # collection access   indexes
@@ -61,7 +62,7 @@ case "$(tail -20 "$SOCKETLEY_DLOG")" in *"access is private, owner, shared, publ
 
 "$BIN" create idp auth -p "$PI" --clients "$T/clients" --issuer "http://127.0.0.1:$PI" -s >/dev/null 2>&1 \
     && ok || bad "the idp runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
-"$BIN" create db data -p "$PD" --schema "$T/schema" --keys "$T/keys" --idp auth --origins "http://app.test" -s >/dev/null 2>&1 \
+"$BIN" create db data -p "$PD" --schema "$T/schema" --keys "$T/keys" --idp auth --idp-audience spa --origins "http://app.test" -s >/dev/null 2>&1 \
     && ok || bad "the db runtime is made and started" "$(tail -3 "$SOCKETLEY_DLOG")"
 for p in "$PI/jwks" "$PD/"; do
     for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p")" != 000 ] && break; sleep 0.1; done
@@ -145,15 +146,14 @@ def db(method, path, body=None, headers=None):
 def sign_in(user, password):
     st, _, h = at(I, "POST", "/login", form={"username": user, "password": password, "rd": I + "/account"})
     return (h.get("Set-Cookie") or "").split(";")[0]
-def access_token(user, password):
+def access_token(user, password, client="spa", cb="http://localhost:5173/cb"):
     verifier = base64.urlsafe_b64encode(os.urandom(40)).rstrip(b"=").decode()
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    cb = "http://localhost:5173/cb"
-    st, _, h = at(I, "POST", "/authorize", form=dict(client_id="spa", redirect_uri=cb, response_type="code", scope="openid",
+    st, _, h = at(I, "POST", "/authorize", form=dict(client_id=client, redirect_uri=cb, response_type="code", scope="openid",
                   state="s", code_challenge=challenge, code_challenge_method="S256", username=user, password=password))
     code = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(h.get("Location", "")).query)).get("code")
     st, body, _ = at(I, "POST", "/token", form=dict(grant_type="authorization_code", code=code, redirect_uri=cb,
-                     client_id="spa", code_verifier=verifier))
+                     client_id=client, code_verifier=verifier))
     return json.loads(body).get("access_token") if st == 200 else None
 def lines(port, msgs):
     s = socket.create_connection(("127.0.0.1", int(port)), 5)
@@ -260,6 +260,10 @@ if phase == "main":
     check("the database takes it as the account it names", (st, [x["_id"] for x in d.get("docs", [])]), (200, ["c3"]))
     check("and writes as that account", db("PATCH", "/c/chars/c3", {"inc": {"level": 1}}, T)[1].get("level"), 8)
     check("a token changed by a byte is refused", db("GET", "/me", headers={"Authorization": "Bearer %sx" % tok})[0], 401)
+    # A token the provider gave another of its applications is that application's, and no key to this database.
+    other = access_token("bob", "bobpassword12", "other", "http://localhost:5174/cb")
+    check("the provider gives the other application a token too", bool(other), True)
+    check("which a database that names only spa refuses", db("GET", "/me", headers={"Authorization": "Bearer %s" % other})[0], 401)
 
     # ── A transaction ─────────────────────────────────────────────────────────
     st, d, _ = db("POST", "/tx", {"ops": [{"op": "put", "c": "notes", "id": "t1", "doc": {"a": 1}},

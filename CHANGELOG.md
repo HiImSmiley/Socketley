@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Access tokens are for the application they were given to.** A db, mail
+  or mqtt runtime with `--idp` takes an access token only from a client
+  `--idp-audience` names; a token the provider gave any other application
+  is refused and said once in the log. Without the flag no access token is
+  taken, and cookies and passwords sign in as before.
+
 ### Added
 
 - **A machine whole, data and all.** `socketley export --full <file>`

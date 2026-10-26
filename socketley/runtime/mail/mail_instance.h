@@ -139,6 +139,9 @@ public:
     bool get_no_reply() const { return m_no_reply; }
     void set_idp(std::string_view rt) { m_idp = std::string(rt); }
     std::string_view get_idp() const { return m_idp; }
+    // The clients of the idp whose access tokens are taken (--idp-audience), comma-separated.
+    void set_idp_audience(std::string_view list) { m_idp_audience = std::string(list); }
+    std::string_view get_idp_audience() const { return m_idp_audience; }
     // The storage runtime and bucket the mailboxes are kept in, `name[/bucket]`.
     void set_storage(std::string_view s) { m_storage = std::string(s); }
     std::string_view get_storage() const { return m_storage; }
@@ -221,6 +224,7 @@ private:
     std::string m_hostname;
     bool        m_no_reply{false};
     std::string m_idp;
+    std::string m_idp_audience;
     std::string m_storage;
     std::string m_users;
     std::string m_relay;

@@ -75,7 +75,7 @@ for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://12
 DAVE=$("$BIN" idp-user auth add dave --password davepassword1 2>&1)
 [ ${#DAVE} -eq 22 ] && ok || bad "an account is made" "$DAVE"
 
-"$BIN" create mqtt a -p "$PA" --users "$T/users" --acl "$T/acl" --idp auth --ws "$PW" -s >/dev/null 2>&1 \
+"$BIN" create mqtt a -p "$PA" --users "$T/users" --acl "$T/acl" --idp auth --idp-audience spa --ws "$PW" -s >/dev/null 2>&1 \
     && ok || bad "a broker with users, rules, an idp and WebSocket is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for p in "$PA" "$PW"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -5 "$SOCKETLEY_DLOG")"; done
 
@@ -260,6 +260,22 @@ if phase == "reread":
               [0x87, 1])
         al.disconnect()
     guarded("reread", reread)
+
+
+if phase == "emptyacl":
+    def emptyacl():
+        # An --acl of no rules grants nothing, as mosquitto reads one, and is taken within the reload's tick.
+        end = time.time() + 5
+        al = None
+        while time.time() < end:
+            al = connected(pa, "alice-e", username="alice", password="alicenew9")
+            got = al.subscribe(("granted/now", 1))
+            al.disconnect()
+            if got == [0x87]:
+                break
+            time.sleep(0.2)
+        check("an acl file of no rules grants nothing", got, [0x87])
+    guarded("emptyacl", emptyacl)
 PY
 }
 
@@ -268,6 +284,8 @@ tally < <(run main)
 printf 'alicenew9\n' | "$BIN" mqtt-passwd "$T/users" alice >/dev/null 2>&1
 sed -i 's|^topic read public/#|topic read granted/now|' "$T/acl"
 tally < <(run reread)
+printf '# every rule taken out\n' > "$T/acl"
+tally < <(run emptyacl)
 
 st=$("$BIN" stats a 2>&1)
 case "$st" in *"auth_refused:"*) ok ;; *) bad "stats count the refused sign-ins" "$st" ;; esac

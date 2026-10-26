@@ -170,6 +170,8 @@ void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presenc
         db.set_keys_path(cfg.db_keys);
     if (asked("idp", !cfg.db_idp.empty()))
         db.set_idp(cfg.db_idp);
+    if (asked("idp_audience", !cfg.db_idp_audience.empty()))
+        db.set_idp_audience(cfg.db_idp_audience);
     if (asked("origins", !cfg.db_origins.empty()))
         db.set_origins(cfg.db_origins);
     if (asked("max_bytes", cfg.db_max_bytes > 0))
@@ -258,6 +260,8 @@ void apply_mail_config(mail_instance& ml, const runtime_config& cfg, bool by_pre
         ml.set_no_reply(cfg.mail_no_reply);
     if (asked("idp", !cfg.mail_idp.empty()))
         ml.set_idp(cfg.mail_idp);
+    if (asked("idp_audience", !cfg.mail_idp_audience.empty()))
+        ml.set_idp_audience(cfg.mail_idp_audience);
     if (asked("storage", !cfg.mail_storage.empty()))
         ml.set_storage(cfg.mail_storage);
     if (asked("users", !cfg.mail_users.empty()))
@@ -290,6 +294,8 @@ void apply_mqtt_config(mqtt_instance& mq, const runtime_config& cfg, bool by_pre
         mq.set_users(cfg.mqtt_users);
     if (asked("idp", !cfg.mqtt_idp.empty()))
         mq.set_idp(cfg.mqtt_idp);
+    if (asked("idp_audience", !cfg.mqtt_idp_audience.empty()))
+        mq.set_idp_audience(cfg.mqtt_idp_audience);
     if (asked("acl", !cfg.mqtt_acl.empty()))
         mq.set_acl(cfg.mqtt_acl);
     if (asked("routes", !cfg.mqtt_routes.empty()))

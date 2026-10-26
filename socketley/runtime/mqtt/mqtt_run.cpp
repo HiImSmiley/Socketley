@@ -188,7 +188,7 @@ bool mqtt_run::start(std::string& why)
     if (!m_owner.get_idp().empty())
     {
         m_idp = std::make_unique<socketley::idp::session_verifier>();
-        m_idp->configure(m_owner.get_idp());
+        m_idp->configure(m_owner.get_idp(), m_owner.get_idp_audience());
     }
     m_users.set_path(std::string(m_owner.get_users()));
     m_acl.set_path(std::string(m_owner.get_acl()));

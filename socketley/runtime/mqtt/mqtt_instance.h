@@ -31,6 +31,9 @@ public:
     std::string_view get_users() const { return m_users; }
     void set_idp(std::string_view runtime) { m_idp = std::string(runtime); }
     std::string_view get_idp() const { return m_idp; }
+    // The clients of the idp whose access tokens are taken (--idp-audience), comma-separated.
+    void set_idp_audience(std::string_view list) { m_idp_audience = std::string(list); }
+    std::string_view get_idp_audience() const { return m_idp_audience; }
     void set_acl(std::string_view path) { m_acl = std::string(path); }
     std::string_view get_acl() const { return m_acl; }
     void set_routes(std::string_view path) { m_routes = std::string(path); }
@@ -80,6 +83,7 @@ public:
 private:
     std::string m_users;
     std::string m_idp;
+    std::string m_idp_audience;
     std::string m_acl;
     std::string m_routes;
     bool        m_anonymous{false};

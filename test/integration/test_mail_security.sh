@@ -77,7 +77,7 @@ for p in "$PI/jwks" "$PS/"; do
     for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p")" != 000 ] && break; sleep 0.1; done
 done
 "$BIN" idp-user auth add alice --password alicepassword1 --email alice@example.test >/dev/null 2>&1
-"$BIN" create mail m -p "$P" --mail-domain example.test --idp auth --storage st/mail --submission "$SUB" --imap "$IM" \
+"$BIN" create mail m -p "$P" --mail-domain example.test --idp auth --idp-audience spa --storage st/mail --submission "$SUB" --imap "$IM" \
     --tls --cert "$T/cert.pem" --key "$T/key.pem" --clamav "127.0.0.1:$CLAM" -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$IM" || bad "the IMAP port listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 

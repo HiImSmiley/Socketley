@@ -1755,6 +1755,15 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             }
             db->set_idp(pa.args[++i]);
             return 0;
+        // The clients of the idp whose access tokens it takes, as a token is the application's it was given to.
+        case fnv1a("--idp-audience"):
+            if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
+            {
+                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                return 1;
+            }
+            db->set_idp_audience(pa.args[++i]);
+            return 0;
         // The web origins a browser may call it from.
         case fnv1a("--origins"):
             if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
@@ -2079,6 +2088,15 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             return 0;
         case fnv1a("--idp"):
             return runtime("--idp requires the name of an idp runtime of this daemon\n", &mail_instance::set_idp, false);
+        // The clients of the idp whose access tokens it takes, as a token is the application's it was given to.
+        case fnv1a("--idp-audience"):
+            if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
+            {
+                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                return 1;
+            }
+            ml->set_idp_audience(pa.args[++i]);
+            return 0;
         // The storage runtime and bucket the mailboxes are kept in.
         case fnv1a("--storage"):
             return runtime("--storage requires a storage runtime of this daemon, as name or name/bucket\n",
@@ -2202,6 +2220,15 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
                 return 1;
             }
             mq->set_idp(pa.args[++i]);
+            return 0;
+        // The clients of the idp whose access tokens it takes, as a token is the application's it was given to.
+        case fnv1a("--idp-audience"):
+            if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
+            {
+                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                return 1;
+            }
+            mq->set_idp_audience(pa.args[++i]);
             return 0;
         case fnv1a("--anonymous"):
             mq->set_anonymous(true);

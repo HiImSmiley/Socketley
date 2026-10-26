@@ -720,6 +720,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.db_schema = std::string(db->get_schema_path());
             cfg.db_keys = std::string(db->get_keys_path());
             cfg.db_idp = std::string(db->get_idp());
+            cfg.db_idp_audience = std::string(db->get_idp_audience());
             cfg.db_origins = std::string(db->get_origins());
             cfg.db_max_bytes = db->get_max_bytes();
             cfg.db_cache = db->get_cache_bytes();
@@ -735,6 +736,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             auto* mq = static_cast<const mqtt_instance*>(instance);
             cfg.mqtt_users = std::string(mq->get_users());
             cfg.mqtt_idp = std::string(mq->get_idp());
+            cfg.mqtt_idp_audience = std::string(mq->get_idp_audience());
             cfg.mqtt_acl = std::string(mq->get_acl());
             cfg.mqtt_routes = std::string(mq->get_routes());
             cfg.mqtt_anonymous = mq->get_anonymous();
@@ -784,6 +786,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mail_hostname = std::string(ml->get_hostname());
             cfg.mail_no_reply = ml->get_no_reply();
             cfg.mail_idp = std::string(ml->get_idp());
+            cfg.mail_idp_audience = std::string(ml->get_idp_audience());
             cfg.mail_storage = std::string(ml->get_storage());
             cfg.mail_users = std::string(ml->get_users());
             cfg.mail_relay = std::string(ml->get_relay());
@@ -1179,6 +1182,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("keys", cfg.db_keys);
             if (!cfg.db_idp.empty())
                 append_str_field("idp", cfg.db_idp);
+            if (!cfg.db_idp_audience.empty())
+                append_str_field("idp_audience", cfg.db_idp_audience);
             if (!cfg.db_origins.empty())
                 append_str_field("origins", cfg.db_origins);
             if (cfg.db_max_bytes > 0)
@@ -1198,6 +1203,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("users", cfg.mqtt_users);
             if (!cfg.mqtt_idp.empty())
                 append_str_field("idp", cfg.mqtt_idp);
+            if (!cfg.mqtt_idp_audience.empty())
+                append_str_field("idp_audience", cfg.mqtt_idp_audience);
             if (!cfg.mqtt_acl.empty())
                 append_str_field("acl", cfg.mqtt_acl);
             if (!cfg.mqtt_routes.empty())
@@ -1281,6 +1288,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_bool_field("no_reply", true);
             if (!cfg.mail_idp.empty())
                 append_str_field("idp", cfg.mail_idp);
+            if (!cfg.mail_idp_audience.empty())
+                append_str_field("idp_audience", cfg.mail_idp_audience);
             if (!cfg.mail_storage.empty())
                 append_str_field("storage", cfg.mail_storage);
             if (!cfg.mail_users.empty())
@@ -1517,6 +1526,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.db_schema = json_get_string(json, "schema");
             cfg.db_keys = json_get_string(json, "keys");
             cfg.db_idp = json_get_string(json, "idp");
+            cfg.db_idp_audience = json_get_string(json, "idp_audience");
             cfg.db_origins = json_get_string(json, "origins");
             cfg.db_max_bytes = json_get_size(json, "max_bytes");
             cfg.db_cache = json_get_size(json, "cache", 64ull << 20);
@@ -1529,6 +1539,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
         case runtime_mqtt:
             cfg.mqtt_users = json_get_string(json, "users");
             cfg.mqtt_idp = json_get_string(json, "idp");
+            cfg.mqtt_idp_audience = json_get_string(json, "idp_audience");
             cfg.mqtt_acl = json_get_string(json, "acl");
             cfg.mqtt_routes = json_get_string(json, "routes");
             cfg.mqtt_anonymous = json_get_bool(json, "anonymous");
@@ -1578,6 +1589,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.mail_hostname = json_get_string(json, "hostname");
             cfg.mail_no_reply = json_get_bool(json, "no_reply");
             cfg.mail_idp = json_get_string(json, "idp");
+            cfg.mail_idp_audience = json_get_string(json, "idp_audience");
             cfg.mail_storage = json_get_string(json, "storage");
             cfg.mail_users = json_get_string(json, "users");
             cfg.mail_relay = json_get_string(json, "relay");

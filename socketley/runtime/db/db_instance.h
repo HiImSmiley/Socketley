@@ -38,6 +38,9 @@ public:
     // The idp runtime whose sign-ins and access tokens name the accounts that own documents (--idp).
     void set_idp(std::string_view name) { m_idp = std::string(name); }
     std::string_view get_idp() const { return m_idp; }
+    // The clients of the idp whose access tokens are taken (--idp-audience), comma-separated.
+    void set_idp_audience(std::string_view list) { m_idp_audience = std::string(list); }
+    std::string_view get_idp_audience() const { return m_idp_audience; }
 
     // The web origins a browser may call it from (--origins), comma-separated; * for any, without its cookie.
     void set_origins(std::string_view list) { m_origins = std::string(list); }
@@ -85,6 +88,7 @@ private:
     std::string m_schema;
     std::string m_keys;
     std::string m_idp;
+    std::string m_idp_audience;
     std::string m_origins;
     uint64_t m_max_bytes{0};
     uint64_t m_cache_bytes{64ull << 20};

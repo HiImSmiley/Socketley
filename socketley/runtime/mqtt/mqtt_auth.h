@@ -46,6 +46,8 @@ public:
     bool may_subscribe(std::string_view user, std::string_view client, std::string_view filter) const;
 
     bool empty() const { return m_rules.empty(); }
+    // Whether a file was read: an --acl of no rules is one that grants nothing, as mosquitto reads it, and not none.
+    bool loaded() const { return m_loaded; }
 
 private:
     struct rule
@@ -64,6 +66,7 @@ private:
                bool as_filter) const;
 
     std::vector<rule> m_rules;
+    bool m_loaded{false};
 };
 
 using socketley::user_table;

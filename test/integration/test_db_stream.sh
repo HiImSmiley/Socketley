@@ -58,7 +58,7 @@ chmod 600 "$T/keys" "$T/replica.key"
 
 "$BIN" create idp auth -p "$PI" --clients "$T/clients" --issuer "http://127.0.0.1:$PI" -s >/dev/null 2>&1 \
     && ok || bad "the idp runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
-"$BIN" create db data -p "$PD" --schema "$T/schema" --keys "$T/keys" --idp auth -s >/dev/null 2>&1 \
+"$BIN" create db data -p "$PD" --schema "$T/schema" --keys "$T/keys" --idp auth --idp-audience spa -s >/dev/null 2>&1 \
     && ok || bad "the db runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 up "$PD" && up "$PI"
 ALICE=$("$BIN" idp-user auth add alice --password alicepassword1 2>&1)
