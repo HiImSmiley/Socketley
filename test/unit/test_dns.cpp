@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "shared/crypto/jws.h"
+#include "shared/net/dns_feed.h"
 #include "shared/util/base64.h"
 
 #include "runtime/dns/dns_answer.h"
@@ -745,4 +746,24 @@ TEST_CASE("DNSSEC: an answer to DO carries the signatures and the proofs of what
     a = ask(zs, query_do("example.com.", type_sec::DNSKEY));
     REQUIRE(a.r.an == 2);
     CHECK(a.r.section(0)[0].rdata == key.dnskey);
+}
+
+TEST_CASE("dns feed: changes in one second each move the directory's time a second on, so each raises the serial")
+{
+    const std::filesystem::path home = std::filesystem::temp_directory_path() / ("skl-feed-" + std::to_string(::getpid()));
+    std::filesystem::create_directories(home);
+    ::setenv("HOME", home.c_str(), 1);
+    REQUIRE(dns_feed::write_records("mail", "a.example.test. 300 IN TXT \"one\"\n"));
+    const int64_t first = dns_feed::stamp_ns() / 1000000000;
+    REQUIRE(first > 0);
+    REQUIRE(dns_feed::write_records("mail", {}));
+    const int64_t second = dns_feed::stamp_ns() / 1000000000;
+    REQUIRE(dns_feed::write_records("mail", "a.example.test. 300 IN TXT \"two\"\n"));
+    const int64_t third = dns_feed::stamp_ns() / 1000000000;
+    CHECK(second > first);
+    CHECK(third > second);
+    // What is written again unchanged is no change.
+    REQUIRE(dns_feed::write_records("mail", "a.example.test. 300 IN TXT \"two\"\n"));
+    CHECK(dns_feed::stamp_ns() / 1000000000 == third);
+    std::filesystem::remove_all(home);
 }

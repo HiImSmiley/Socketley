@@ -18,7 +18,8 @@
 //
 // Files rather than messages because each side already has what it takes: the daemon writes its state there, and a
 // dns runtime, in a worker process of its own, reads a file when it changes. The directory's own time is when the
-// set last changed, and a dns runtime adds it to the serial it serves, so a secondary sees a change it made.
+// set last changed, a second later than the change before at least, and a dns runtime adds its seconds to the serial
+// it serves, so a secondary sees every change.
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -36,6 +37,7 @@ bool write_names(const std::vector<std::string>& names);
 
 // An ACME DNS-01 answer for `name` (without "_acme-challenge."); its file, for removing it after.
 bool write_challenge(std::string_view name, std::string_view value, std::string_view token, std::string& path);
+void remove_challenge(const std::string& path);
 
 // The table entrance `name` routes by (runtime_names::entrance_table), rewritten only when it changes; and those of
 // entrances that are gone, removed.

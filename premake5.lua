@@ -1461,7 +1461,8 @@ project "fuzz_dns"
         "socketley/runtime/dns/dns_zone.cpp",
         "socketley/runtime/dns/dns_answer.cpp",
         "socketley/runtime/dns/dns_sign.cpp",
-        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp"
+        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp",
+        "socketley/shared/net/dns_feed.cpp", "socketley/shared/persist/paths.cpp"
     }
     links { "crypto" }
 
@@ -2375,7 +2376,8 @@ project "test_dns"
         "socketley/runtime/dns/dns_zone.cpp",
         "socketley/runtime/dns/dns_answer.cpp",
         "socketley/runtime/dns/dns_sign.cpp",
-        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp"
+        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp",
+        "socketley/shared/net/dns_feed.cpp", "socketley/shared/persist/paths.cpp"
     }
     links(tls_libs())
 

@@ -12,6 +12,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -36,6 +37,28 @@ bool write_atomic(const std::string& path, std::string_view data)
     return socketley::replace_file(path, data, socketley::durability::none, nullptr, 0644);
 }
 
+// A change to the directory, made under a lock beside it, after which the directory's time is moved past the
+// second it held before, so two changes in one second still raise the serial a dns runtime adds that second to.
+template <class F>
+bool change(F&& f)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(dir(), ec);
+    const int lock = ::open((dir() + "-lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (lock >= 0 && ::flock(lock, LOCK_EX) < 0) {}
+    const int64_t before = stamp_ns() / 1000000000;
+    const bool ok = f();
+    struct stat st{};
+    if (before > 0 && ::stat(dir().c_str(), &st) == 0 && st.st_mtim.tv_sec <= before)
+    {
+        const timespec times[2] = {{0, UTIME_OMIT}, {static_cast<time_t>(before + 1), 0}};
+        if (::utimensat(AT_FDCWD, dir().c_str(), times, 0) < 0) {}
+    }
+    if (lock >= 0)
+        ::close(lock);
+    return ok;
+}
+
 }   // namespace
 
 std::string dir()
@@ -57,7 +80,7 @@ bool write_names(const std::vector<std::string>& names)
     // Nothing written when nothing changed, and no file made for nothing.
     if (::stat(path.c_str(), &st) < 0 ? text.empty() : read_file(path) == text)
         return true;
-    return write_atomic(path, text);
+    return change([&] { return write_atomic(path, text); });
 }
 
 bool write_challenge(std::string_view name, std::string_view value, std::string_view token, std::string& path)
@@ -70,7 +93,12 @@ bool write_challenge(std::string_view name, std::string_view value, std::string_
         value.find_first_of(" \n") != std::string_view::npos)
         return false;
     path = dir() + "/acme-" + safe.substr(0, 64);
-    return write_atomic(path, std::string(name) + " " + std::string(value) + "\n");
+    return change([&] { return write_atomic(path, std::string(name) + " " + std::string(value) + "\n"); });
+}
+
+void remove_challenge(const std::string& path)
+{
+    change([&] { return ::unlink(path.c_str()) == 0; });
 }
 
 std::string routes_path(std::string_view entrance)
@@ -84,7 +112,7 @@ bool write_routes(std::string_view entrance, std::string_view table)
     struct stat st{};
     if (::stat(path.c_str(), &st) == 0 && read_file(path) == table)
         return true;
-    return write_atomic(path, table);
+    return change([&] { return write_atomic(path, table); });
 }
 
 void remove_routes_except(const std::vector<std::string>& entrances)
@@ -101,8 +129,13 @@ void remove_routes_except(const std::vector<std::string>& entrances)
             gone.emplace_back(fn);
     }
     ::closedir(d);
-    for (const auto& g : gone)
-        ::unlink((dir() + "/" + g).c_str());
+    if (gone.empty())
+        return;
+    change([&] {
+        for (const auto& g : gone)
+            ::unlink((dir() + "/" + g).c_str());
+        return true;
+    });
 }
 
 bool write_records(std::string_view runtime, std::string_view text)
@@ -117,10 +150,10 @@ bool write_records(std::string_view runtime, std::string_view text)
     struct stat st{};
     const bool there = ::stat(path.c_str(), &st) == 0;
     if (text.empty())
-        return !there || ::unlink(path.c_str()) == 0;
+        return !there || change([&] { return ::unlink(path.c_str()) == 0; });
     if (there && read_file(path) == text)
         return true;
-    return write_atomic(path, text);
+    return change([&] { return write_atomic(path, text); });
 }
 
 // Beside the directory and not in it, since the directory's time dates the records and the zones are none of them.

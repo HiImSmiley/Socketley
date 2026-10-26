@@ -362,7 +362,7 @@ bool zone_delegated(const std::string& zone, std::string& why)
         }
         ::freeaddrinfo(ai);
     }
-    ::unlink(path.c_str());
+    dns_feed::remove_challenge(path);
     return ok;
 }
 
@@ -705,10 +705,12 @@ int issue(int argc, char** argv)
         return 2;
     }
     client c(h, account);
-    std::vector<std::string> written;
+    std::vector<std::string> written, answers;
     auto done = [&](int rc) {
         for (const std::string& f : written)
             ::unlink(f.c_str());
+        for (const std::string& f : answers)
+            dns_feed::remove_challenge(f);
         EVP_PKEY_free(account);
         if (lock >= 0)
             ::close(lock);
@@ -765,7 +767,7 @@ int issue(int argc, char** argv)
                     err = "the DNS-01 answer for " + ident + " could not be written to " + dns_feed::dir();
                     return done(2);
                 }
-                written.push_back(path);
+                answers.push_back(path);
                 dns_checks.push_back({au.s, url});
                 continue;
             }
