@@ -155,7 +155,11 @@ std::string render_agents(const std::vector<agent>& agents)
     {
         out += "agent " + a.name + (a.joined ? " joined " : " invited ") + a.secret_hash + " ";
         for (size_t i = 0; i < a.services.size(); ++i)
-            out += (i ? "," : "") + render_service(a.services[i]);
+        {
+            if (i)
+                out += ',';
+            out += render_service(a.services[i]);
+        }
         out += "\n";
     }
     return out;

@@ -1,5 +1,7 @@
 #include "tunnel_instance.h"
 
+#include <charconv>
+
 #include "tunnel_registry.h"
 #include "tunnel_run.h"
 #include "../../shared/net/endpoint.h"
