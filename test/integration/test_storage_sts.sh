@@ -36,7 +36,7 @@ ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "got '$2', want '$3'"; fi; }
 # Counts what a Python step printed: "ok NAME" or "bad NAME: DETAIL" per line, and shows anything else.
-tally() { while IFS= read -r line; do case "$line" in ok\ *) ok ;; bad\ *) bad "${line#bad }" "" ;; *) echo "  $line" ;; esac; done; }
+. "$HERE/lib_verdicts.sh"
 
 daemon_isolate stgsts
 trap 'daemon_stop' EXIT

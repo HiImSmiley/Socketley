@@ -33,7 +33,7 @@ python3 -c "import boto3" 2>/dev/null || { echo "  SKIP: boto3 is required"; exi
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
-tally() { while IFS= read -r line; do case "$line" in ok\ *) ok ;; bad\ *) bad "${line#bad }" "" ;; *) echo "  $line" ;; esac; done; }
+. "$HERE/lib_verdicts.sh"
 
 daemon_isolate stglogin
 trap 'daemon_stop' EXIT

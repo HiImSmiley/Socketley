@@ -23,7 +23,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
-tally() { while IFS= read -r line; do case "$line" in ok\ *) ok ;; bad\ *) bad "${line#bad }" "" ;; *) echo "  $line" ;; esac; done; }
+. "$HERE/lib_verdicts.sh"
 
 echo "=== Integration: an mqtt runtime's topic rules hand messages to a cache, a db and a broker ==="
 daemon_isolate mqttroutes

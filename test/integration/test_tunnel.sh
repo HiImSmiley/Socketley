@@ -19,7 +19,7 @@ BIN=$(readlink -f "$BIN")
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
-tally() { while IFS= read -r line; do case "$line" in ok\ *) ok ;; bad\ *) bad "${line#bad }" "" ;; *) echo "  $line" ;; esac; done; }
+. "$(dirname "$0")/lib_verdicts.sh"
 
 echo "=== Integration: a tunnel edge serves the services of an agent that dialled out to it ==="
 daemon_isolate tunnel
