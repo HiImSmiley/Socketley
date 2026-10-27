@@ -672,6 +672,26 @@ TEST_CASE("preview: a message's text from its start, its white space one space a
     CHECK(mime::preview(umlauts, *mime::preview_part(r3)) == std::string(255, 'a'));
 }
 
+TEST_CASE("preview: what a reply says, without what it quotes, as Outlook, Gmail and plain quoting mark it")
+{
+    const auto of = [](const std::string& body, const char* type = "text/plain") {
+        const std::string msg = std::string("Content-Type: ") + type + "; charset=utf-8\r\n\r\n" + body;
+        const mime::part root = mime::parse(msg);
+        return mime::preview(msg, *mime::preview_part(root));
+    };
+    CHECK(of("yea\r\n________________________________\r\nVon: smiley@smileygames.online <smiley@smileygames.online>\r\n"
+             "Gesendet: Dienstag\r\n\r\nTrue\r\n") == "yea");
+    CHECK(of("test\r\nOn Tue, Oct 27, 2026, 03:43 PM, Jonas Schenk wrote:\r\n> yea\r\n") == "test");
+    CHECK(of("ok\r\n\r\nAm 27.10.2026 um 15:42 schrieb smiley <smiley@x.de>:\r\n> True\r\n") == "ok");
+    CHECK(of("<div>moin</div><div id=\"appendonsend\"></div><hr><div id=\"divRplyFwdMsg\">Von: a@b</div>", "text/html") ==
+          "moin");
+    CHECK(of("<p>fine</p><blockquote type=\"cite\">earlier</blockquote>", "text/html") == "fine");
+    // A message that is nothing but a quote, a forward, still says what it holds.
+    CHECK(of("> only quoted\r\n> lines\r\n") == "> only quoted > lines");
+    // A From: line without an address is the message's own words.
+    CHECK(of("From: the start, as agreed\r\nmore") == "From: the start, as agreed more");
+}
+
 TEST_CASE("xml: elements know their namespace through prefixes and defaults, attributes and entities are read")
 {
     socketley::xml::node doc;

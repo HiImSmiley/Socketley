@@ -7,7 +7,7 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#07080c">
 <title>Mail</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='1' y2='1'%3E%3Cstop stop-color='%23c084fc'/%3E%3Cstop offset='1' stop-color='%23fb923c'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='24' height='24' rx='6' fill='url(%23g)'/%3E%3Cpath d='M5 8l7 5 7-5M5 7.5h14v9H5z' fill='none' stroke='%23fff' stroke-width='1.8' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='1' y2='1'%3E%3Cstop stop-color='%23c084fc'/%3E%3Cstop offset='.55' stop-color='%23f472b6'/%3E%3Cstop offset='1' stop-color='%23fb923c'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='24' height='24' rx='6' fill='url(%23g)'/%3E%3Cpath d='M5 8l7 5 7-5M5 7.5h14v9H5z' fill='none' stroke='%23fff' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 /*STYLE*/
 /* ── the webmail's own ── */
@@ -42,7 +42,7 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .row .avw .av{margin:0}
 .row .tick{position:absolute;inset:0;border-radius:50%;display:none;align-items:center;justify-content:center;background:var(--card2);border:1.5px solid var(--line2);color:var(--fg)}
 .row .tick .i{width:18px;height:18px}
-.row:hover .tick,.row.ck .tick,#rows.picking .tick{display:flex}
+.row .avw:hover .tick,.row.ck .tick,#rows.picking .tick{display:flex}
 .row.ck .tick{background:var(--grad);border-color:transparent;color:var(--on)}
 .row:not(.ck) .tick .i{opacity:0}
 .rm{flex:1;min-width:0}
@@ -87,7 +87,9 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .imgbar{display:flex;align-items:center;gap:10px;padding:9px 12px;margin-bottom:12px;border-radius:11px;background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.22);font-size:13px;color:#e9dcb5}
 .imgbar .btn{height:30px;font-size:12.5px;margin-left:auto}
 .mbody{border-radius:14px;overflow:hidden;background:#fff}
-.mbody iframe{display:block;width:100%;border:0;height:120px;background:#fff}
+.mbody.dark{background:none;border-radius:0}
+.mbody iframe{display:block;width:100%;border:0;height:40px;background:#fff}
+.mbody.dark iframe{background:none}
 .mtext{white-space:pre-wrap;word-break:break-word;font:14px/1.6 inherit;padding:2px 2px}
 .mtext .q{color:var(--dim);border-left:2px solid var(--line2);padding-left:10px;display:block}
 .mtext a,.hdr a{color:var(--a1)}
@@ -101,11 +103,11 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .att>div{min-width:0}
 .r1 .who .tn{display:inline-block;margin-left:6px;font-size:11.5px;font-weight:600;color:var(--dim);vertical-align:1px}
 .row.unread .who .tn{color:var(--mut)}
-.msg{border:1px solid var(--line);border-radius:16px;padding:14px 16px 16px;margin-bottom:10px;background:rgba(255,255,255,.02)}
+.msg{border:1px solid var(--line);border-radius:16px;padding:14px 16px 16px;margin-bottom:10px;background:rgba(14,16,24,.72);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
 .msg .hdr{cursor:default;margin-bottom:12px}
 .msg .hdr .ib{width:32px;height:32px;flex:none;margin-top:-4px}
-.msg.shut{display:flex;align-items:center;gap:12px;padding:10px 16px;cursor:pointer;background:rgba(255,255,255,.015)}
-.msg.shut:hover{background:rgba(255,255,255,.045)}
+.msg.shut{display:flex;align-items:center;gap:12px;padding:10px 16px;cursor:pointer}
+.msg.shut:hover{background:rgba(26,29,42,.78)}
 .msg.shut .av{width:30px;height:30px;font-size:13px}
 .msg.shut b{font-weight:600;flex:none;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .msg.shut .pv{flex:1;min-width:0;color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -121,6 +123,8 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .kbd{font:11.5px var(--mono);padding:1px 6px;border-radius:6px;background:rgba(255,255,255,.08);border:1px solid var(--line);color:var(--mut)}
 #cmp{position:fixed;right:24px;bottom:0;width:600px;max-width:calc(100vw - 32px);height:min(640px,calc(100vh - 60px));z-index:50;display:flex;flex-direction:column;background:#11141d;border:1px solid var(--line2);border-bottom:0;border-radius:16px 16px 0 0;box-shadow:0 30px 80px -20px rgba(0,0,0,.9);animation:rise .22s cubic-bezier(.2,.8,.2,1)}
 #cmp.min{height:auto}
+#cmp.moved{border-bottom:1px solid var(--line2);border-radius:16px;animation:none}
+#cmp .chead{touch-action:none;cursor:grab}
 #cmp.min .cbody,#cmp.min .cfoot{display:none}
 #cmp .chead{display:flex;align-items:center;gap:4px;padding:8px 8px 8px 16px;border-bottom:1px solid var(--line);cursor:pointer;border-radius:16px 16px 0 0;background:rgba(255,255,255,.03)}
 #cmp .chead b{flex:1;font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -140,7 +144,7 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .drop{outline:2px dashed rgba(var(--glow),.7);outline-offset:-6px}
 #settings .chk{display:flex;align-items:center;gap:10px;margin:4px 0 12px}
 #settings .approw{font-size:13px;color:var(--dim);margin:2px 0 6px}
-.holdbar .lnk{margin-left:12px;font-weight:600}
+.holdbar .lnk{margin:0 0 0 12px;font-weight:600}
 #cmp .ed{flex:1;min-height:160px;overflow:auto;padding:10px 12px;outline:none;font:14px/1.55 inherit}
 #cmp .ed blockquote{margin:6px 0;padding-left:10px;border-left:3px solid var(--line);color:var(--dim)}
 #cmp .tools{display:flex;gap:2px;padding:4px 8px;border-bottom:1px solid var(--line)}
@@ -177,7 +181,7 @@ pre.hdrs{max-height:60vh;overflow:auto;font:12px/1.5 ui-monospace,monospace;whit
 <div id="login" hidden>
   <div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div>
   <div class="lcard">
-    <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>socketley</div>
+    <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M5 8l7 5 7-5M5 7.5h14v9H5z" stroke-linejoin="round"/></svg></div>socketley</div>
     <h1>Mail</h1>
     <p class="mut" id="lsub">Sign in with your account to read and send your mail.</p>
     <div class="err" id="le"></div>
@@ -186,7 +190,7 @@ pre.hdrs{max-height:60vh;overflow:auto;font:12px/1.5 ui-monospace,monospace;whit
 </div>
 <div id="app" hidden>
   <aside id="side">
-    <div class="logo" id="home"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>Mail</div>
+    <div class="logo" id="home"><div class="mk"><svg viewBox="0 0 24 24"><path d="M5 8l7 5 7-5M5 7.5h14v9H5z" stroke-linejoin="round"/></svg></div>Mail</div>
     <button class="btn pri" id="compose"></button>
     <div id="boxes"></div>
     <button class="nav" id="nSet"></button>
@@ -311,7 +315,10 @@ if (/^de\b/i.test(navigator.language || '')) { document.documentElement.lang = '
   "Reply all": "Allen antworten",
   "Reply": "Antworten",
   "Report junk": "Als Spam melden",
-  "Rules for arriving mail…": "Regeln für eingehende Mails …",
+  "Edit filters": "Filter bearbeiten",
+  "No rules yet: arriving mail stays in the inbox.": "Noch keine Regeln: neue Mails bleiben im Posteingang.",
+  "One rule sorts arriving mail.": "Eine Regel sortiert neue Mails.",
+  "% rules sort arriving mail.": "% Regeln sortieren neue Mails.",
   "Save": "Speichern",
   "Schedule": "Planen",
   "Search": "Suche",
@@ -338,7 +345,7 @@ if (/^de\b/i.test(navigator.language || '')) { document.documentElement.lang = '
   "Star": "Markieren",
   "Starred": "Markiert",
   "Subject": "Betreff",
-  "Tell me of new mail while this tab is in the background": "Neue Mails melden, während dieser Tab im Hintergrund ist",
+  "Notify me of new mail": "Bei neuen Mails benachrichtigen",
   "That conversation is no longer there": "Diese Unterhaltung gibt es nicht mehr",
   "The filters were not saved": "Die Filter wurden nicht gespeichert",
   "The folder and every message in it are deleted for good.": "Der Ordner und jede Nachricht darin werden endgültig gelöscht.",
@@ -502,6 +509,19 @@ function textOfHtml(html) { const d = new DOMParser().parseFromString(html, 'tex
 // Mail's HTML, cleaned of anything that runs, submits or reaches out, and of remote images until the reader asks for
 // them; it is shown in a frame sandboxed without scripts, as the page's CSP has it too.
 const FRAME_CSS = 'html,body{margin:0;background:#fff;color:#1f2330;font:14px/1.55 -apple-system,"Segoe UI",Roboto,Inter,Arial,sans-serif;word-wrap:break-word;overflow-wrap:anywhere}body{padding:18px 20px}img{max-width:100%;height:auto}table{max-width:100%}pre{white-space:pre-wrap}blockquote{margin:0 0 0 .8ex;border-left:2px solid #cfd3dc;padding-left:1ex;color:#596070}a{color:#6d28d9}';
+// A colour as [r, g, b]; null where it paints nothing, undefined where it is not one this can read.
+function rgbOf(v) {
+  v = (v || '').trim().toLowerCase();
+  if (!v || /^(transparent|inherit|initial|unset|none|currentcolor)$/.test(v)) return null;
+  if (v === 'black' || v === 'windowtext') return [0, 0, 0];
+  if (v === 'white' || v === 'window') return [255, 255, 255];
+  let m = /^#([0-9a-f]{3})$/.exec(v); if (m) return [...m[1]].map(h => parseInt(h + h, 16));
+  m = /^#([0-9a-f]{6})$/.exec(v); if (m) return [0, 2, 4].map(i => parseInt(m[1].substr(i, 2), 16));
+  m = /^rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)\s*(?:[,/]\s*([\d.]+)(%?))?\s*\)$/.exec(v);
+  if (m) return m[4] !== undefined && +m[4] === 0 ? null : [+m[1], +m[2], +m[3]];
+  return undefined;
+}
+const lumOf = c => (c[0] * 299 + c[1] * 587 + c[2] * 114) / 255000;
 function cleanHtml(html, images, cids) {
   const d = new DOMParser().parseFromString(html, 'text/html');
   d.querySelectorAll('script,iframe,frame,frameset,object,embed,applet,form,input,button,select,textarea,meta,link,base,noscript,template,portal,dialog').forEach(e => e.remove());
@@ -529,14 +549,35 @@ function cleanHtml(html, images, cids) {
     if (!images && /url\s*\(/i.test(t)) { t = t.replace(/url\s*\([^)]*\)/gi, 'none'); blocked++; }
     css += t + '\n'; s.remove();
   }
-  return { doc: '<!doctype html><html><head><meta charset="utf-8"><style>' + FRAME_CSS + '</style><style>' + css.replace(/<\/style/gi, '') + '</style></head><body>' + (d.body ? d.body.innerHTML : '') + '</body></html>', blocked };
+  // A message that paints no page of its own, only dark text on white as most replies are, is shown in the page's
+  // colours; one with its own backgrounds or a stylesheet that colours keeps the white it was made for.
+  const white = c => c === null || (c && lumOf(c) > .92);
+  let painted = /(^|[^-])(color|background)[\w-]*\s*:/i.test(css.replace(/background\s*:\s*(transparent|none|#fff(fff)?|white)\s*[;}]/gi, ''));
+  const fix = [];
+  for (const e of painted ? [] : d.querySelectorAll('*')) {
+    if (e.hasAttribute('background') || (e.style && e.style.backgroundImage && e.style.backgroundImage !== 'none')) { painted = true; break; }
+    const bg = [e.getAttribute('bgcolor'), e.style && e.style.backgroundColor].filter(Boolean).map(rgbOf);
+    if (bg.some(c => !white(c))) { painted = true; break; }
+    const fg = [e.getAttribute('color'), e.style && e.style.color].filter(Boolean).map(rgbOf);
+    if (bg.length || fg.some(c => c && lumOf(c) < .45)) fix.push(e);
+  }
+  if (!painted)
+    for (const e of fix) {
+      e.removeAttribute('bgcolor'); e.style.backgroundColor = '';
+      if (rgbOf(e.getAttribute('color')) && lumOf(rgbOf(e.getAttribute('color'))) < .45) e.removeAttribute('color');
+      if (rgbOf(e.style.color) && lumOf(rgbOf(e.style.color)) < .45) e.style.color = '';
+    }
+  const t = getComputedStyle(document.documentElement), v = (n, d) => t.getPropertyValue(n).trim() || d;
+  const dark = painted ? '' : 'html,body{background:transparent;color:' + v('--fg', '#eef0f7') + ';color-scheme:dark}body{padding:2px 0}blockquote{border-left-color:rgba(255,255,255,.18);color:' + v('--mut', '#9aa2b8') + '}a{color:' + v('--a1', '#c084fc') + '}';
+  return { doc: '<!doctype html><html><head><meta charset="utf-8"><style>' + FRAME_CSS + dark + '</style><style>' + css.replace(/<\/style/gi, '') + '</style></head><body>' + (d.body ? d.body.innerHTML : '') + '</body></html>', blocked, dark: !painted };
 }
 // The quotes of what a reply answers, as Gmail, Outlook, Apple Mail and Thunderbird mark them.
 const QUOTES = 'blockquote[type=cite],.gmail_quote,.gmail_extra,#divRplyFwdMsg,#divRplyFwdMsg~*,#appendonsend~*,.moz-cite-prefix,.yahoo_quoted,#mail-editor-reference-message-container';
 function frame(docHtml, quotes) {
   const f = el('iframe', { sandbox: 'allow-same-origin allow-popups allow-popups-to-escape-sandbox', referrerpolicy: 'no-referrer', title: say('Message') });
   f.srcdoc = docHtml;
-  const fit = () => { try { const b = f.contentDocument; if (b && b.documentElement) f.style.height = Math.max(80, b.documentElement.scrollHeight + 2) + 'px'; } catch (e) {} };
+  // The body's own height, as the document's is never less than the frame it is in, which would never shrink.
+  const fit = () => { try { const b = f.contentDocument.body; if (b) f.style.height = Math.max(24, b.scrollHeight) + 'px'; } catch (e) {} };
   // What a reply quotes is folded away behind a button, as a conversation shows each message above it already.
   f.quoteToggle = quotes ? el('button', { class: 'qt', title: say('Show the quoted text'), hidden: true, onclick: e => {
     const on = !e.currentTarget.classList.contains('on'); e.currentTarget.classList.toggle('on', on);
@@ -552,7 +593,7 @@ function frame(docHtml, quotes) {
       }
     } catch (e) {}
     fit();
-    try { new ResizeObserver(fit).observe(f.contentDocument.documentElement); for (const i of f.contentDocument.images) i.addEventListener('load', fit); } catch (e) {}
+    try { new ResizeObserver(fit).observe(f.contentDocument.body); for (const i of f.contentDocument.images) i.addEventListener('load', fit); } catch (e) {}
   });
   return f;
 }
@@ -983,7 +1024,7 @@ function openCard(m) {
         btn(null, say('Show images'), () => { showImages.add(m.id); paintReader(); }),
         from ? btn(null, say('Always from this sender'), () => { showImages.add('*' + from.email); store.set('skl-mail-img', JSON.stringify([...showImages].filter(x => x.startsWith('*')))); paintReader(); }) : null));
     const f = frame(c.doc, true);
-    card.append(el('div', { class: 'mbody' }, f), f.quoteToggle);
+    card.append(el('div', { class: 'mbody' + (c.dark ? ' dark' : '') }, f), f.quoteToggle);
   } else {
     const [mine, quoted] = splitQuote(text || m.preview || '');
     const box = el('div', { class: 'mtext' }, linkify(mine));
@@ -999,7 +1040,7 @@ function openCard(m) {
 // the run of "> " lines it ends with.
 function splitQuote(t) {
   const lines = t.split('\n');
-  let at = lines.findIndex(l => /^\s*(On\s.{0,300}\swrote:|Am\s.{0,300}\sschrieb.{0,60}:|-{2,}\s*(Original|Forwarded) Message\s*-{2,}|From:\s.+\s<?\S+@\S+>?)\s*$/i.test(l));
+  let at = lines.findIndex(l => /^\s*(On\s.{0,300}\swrote:|Am\s.{0,300}\sschrieb.{0,60}:|-{2,}\s*(Original|Forwarded) Message\s*-{2,}|-{2,}\s*Ursprüngliche Nachricht\s*-{2,}|_{8,}|(From|Von):\s.*\S@\S.*)\s*$/i.test(l));
   if (at < 0) {
     let i = lines.length;
     while (i > 0 && (/^\s*>/.test(lines[i - 1]) || !lines[i - 1].trim())) i--;
@@ -1010,7 +1051,7 @@ function splitQuote(t) {
 }
 
 // ─── writing ────────────────────────────────────────────────────────────────
-let cmp = null;
+let cmp = null, cmpAt = null;
 const quoteOf = m => {
   const vals = m.bodyValues || {};
   let t = (m.textBody || []).filter(p => p.type !== 'text/html').map(p => (vals[p.partId] || {}).value || '').join('\n');
@@ -1028,7 +1069,9 @@ function reply(m, all) {
   const addressed = [...(m.to || []), ...(m.cc || [])].map(a => (a.email || '').toLowerCase());
   const as = identities.find(i => addressed.includes(i.email.toLowerCase()));
   const from = (m.from || [])[0];
-  const quoted = quoteOf(m).replace(/\s+$/, '').split('\n').map(l => '> ' + l).join('\n');
+  // Only what the message itself says: what it quoted in turn is in the conversation already, and would nest deeper with
+  // every answer.
+  const quoted = splitQuote(quoteOf(m))[0].replace(/\s+$/, '').split('\n').map(l => '> ' + l).join('\n');
   compose({
     to: who(target), cc: who(cc), subject: /^re:/i.test(m.subject || '') ? m.subject : 'Re: ' + (m.subject || ''),
     body: '\n\n' + say('On %, % wrote:', full(m.sentAt || m.receivedAt), nameOf(from) || say('someone')) + '\n' + quoted + '\n',
@@ -1081,6 +1124,20 @@ function compose(o = {}) {
     el('div', { class: 'cfoot' }, btn('send', say('Send'), () => send(), 'pri'), ibtn('clock', say('Send later'), e => sendLater(e.currentTarget)), ibtn('clip', say('Attach files'), () => file.click()),
       ibtn('format', say('Formatting'), () => richMode(cmp, !cmp.rich)), file, el('span', { class: 'note', text: '' }), el('div', { class: 'grow' }), ibtn('trash', say('Discard'), () => discard())));
   subj.addEventListener('input', () => { head.textContent = subj.value || say('New message'); });
+  // It goes where its title bar is dragged, and the next one opens there too; a click without a drag still folds it.
+  const bar = box.firstChild, place = (x, y) => {
+    x = Math.min(Math.max(0, x), Math.max(0, innerWidth - box.offsetWidth)); y = Math.min(Math.max(0, y), Math.max(0, innerHeight - box.offsetHeight));
+    Object.assign(box.style, { left: x + 'px', top: y + 'px', right: 'auto', bottom: 'auto' }); box.classList.add('moved'); cmpAt = { x, y };
+  };
+  let drag = null;
+  bar.addEventListener('pointerdown', e => { if (!e.button && !e.target.closest('.ib') && matchMedia('(min-width:901px)').matches) drag = { x: e.clientX, y: e.clientY, r: box.getBoundingClientRect(), on: false }; });
+  bar.addEventListener('pointermove', e => {
+    if (!drag || (!drag.on && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 5)) return;
+    if (!drag.on) { drag.on = true; bar.setPointerCapture(e.pointerId); }
+    place(drag.r.left + e.clientX - drag.x, drag.r.top + e.clientY - drag.y);
+  });
+  bar.addEventListener('pointerup', () => { if (drag && drag.on) bar.dragged = true; drag = null; });
+  bar.addEventListener('click', e => { if (bar.dragged) { bar.dragged = false; e.stopImmediatePropagation(); } }, true);
   cmp = { box, to, cc, bcc, subj, body, ed, tools, fromSel, rich: false, atts: (o.attachments || []).slice(), uploading: 0, inReplyTo: o.inReplyTo || null, references: o.references || null, draft: o.draft || null, start: JSON.stringify([to.value, cc.value, bcc.value, subj.value, body.value]), atts0: (o.attachments || []).length };
   const paintAtts = () => { catts.textContent = ''; for (const a of cmp.atts) catts.append(el('span', { class: 'chip' }, ico('clip'), el('span', { text: a.name + (a.size ? ' · ' + human(a.size) : '') }), ibtn('close', say('Remove'), () => { cmp.atts = cmp.atts.filter(x => x !== a); paintAtts(); }))); };
   paintAtts();
@@ -1107,6 +1164,7 @@ function compose(o = {}) {
   box.addEventListener('drop', e => { e.preventDefault(); box.classList.remove('drop'); for (const f of e.dataTransfer.files) attach(f); });
   box.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); } if (e.key === 'Escape') { e.stopPropagation(); closeCompose(); } });
   document.body.append(box);
+  if (cmpAt && matchMedia('(min-width:901px)').matches) place(cmpAt.x, cmpAt.y);
   (o.to ? body : to).focus();
   if (o.to) { body.setSelectionRange(0, 0); body.scrollTop = 0; }
 }
@@ -1246,11 +1304,16 @@ function sieveOf(rules) {
   });
   return '# webmail rules: ' + JSON.stringify(rules) + '\nrequire ["fileinto", "imap4flags", "copy"];\n' + body.join('\n') + '\n';
 }
-async function filtersEditor() {
-  let got = { script: '', active: '' };
+// The filter in place, and the rules this page wrote it from.
+async function filtersNow() {
+  let got = { script: '', active: '' }, rules = [];
   try { const r = await fetch('/~mail/filters', { credentials: 'same-origin', headers: { 'X-Socketley-UI': '1' } }); if (r.ok) got = await r.json(); } catch (e) {}
-  let rules = [];
   try { const first = (got.script || '').split('\n')[0]; if (first.startsWith('# webmail rules: ')) rules = JSON.parse(first.slice(17)); } catch (e) {}
+  return { got, rules };
+}
+async function filtersEditor() {
+  const { got, rules } = await filtersNow();
+  if (!rules.length) rules.push({ field: 'from', value: '', action: 'move', target: '' });
   const list = el('div', { class: 'rules' });
   const folders = Object.values(byId).filter(b => b.role !== 'drafts' && b.role !== 'sent');
   const paint = () => {
@@ -1308,6 +1371,8 @@ async function settings() {
   const vf = el('input', { class: 'inp', type: 'datetime-local', value: local(vac.fromDate) });
   const vt = el('input', { class: 'inp', type: 'datetime-local', value: local(vac.toDate) });
   const nt = el('input', { type: 'checkbox' }); nt.checked = store.get('skl-mail-notify') === '1';
+  const fsum = el('div', { class: 'approw' });
+  filtersNow().then(({ rules }) => { const n = rules.filter(r => r.value).length; fsum.textContent = !n ? say('No rules yet: arriving mail stays in the inbox.') : n === 1 ? say('One rule sorts arriving mail.') : say('% rules sort arriving mail.', n); });
   const body = el('div', { id: 'settings' },
     el('label', { class: 'l', text: say('Your name, as people see it') }), name,
     el('label', { class: 'l', text: say('Signature') }), sig,
@@ -1317,9 +1382,9 @@ async function settings() {
     el('label', { class: 'l', text: say('Subject') }), vs,
     el('label', { class: 'l', text: say('Message') }), vb,
     el('h4', { text: say('Filters') }),
-    el('button', { class: 'lnk', text: say('Rules for arriving mail…'), onclick: () => { L.close(); filtersEditor(); } }),
+    fsum, btn('filter', say('Edit filters'), () => { L.close(); filtersEditor(); }),
     el('h4', { text: say('Notifications') }),
-    el('label', { class: 'chk' }, nt, el('span', { text: say('Tell me of new mail while this tab is in the background') })),
+    el('label', { class: 'chk' }, nt, el('span', { text: say('Notify me of new mail') })),
     ...mailApps());
   const save = async () => {
     try {

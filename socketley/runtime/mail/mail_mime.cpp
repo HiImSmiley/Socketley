@@ -1137,39 +1137,89 @@ bool parse_date(std::string_view v, int64_t& t, int& zone)
 }
 
 
+namespace
+{
+
+bool starts_with_i(std::string_view s, std::string_view prefix)
+{
+    return s.size() >= prefix.size() && socketley::ascii::iequals(s.substr(0, prefix.size()), prefix);
+}
+
+// A line that begins what a reply quotes, as Outlook, Gmail, Apple Mail and Thunderbird mark it in plain text.
+bool quote_line(std::string_view l)
+{
+    while (!l.empty() && (l.front() == ' ' || l.front() == '\t'))
+        l.remove_prefix(1);
+    while (!l.empty() && (l.back() == '\r' || l.back() == ' '))
+        l.remove_suffix(1);
+    if (l.starts_with('>') || (l.size() >= 8 && l.find_first_not_of('_') == std::string_view::npos))
+        return true;
+    if (l.starts_with("--") && (l.find("Original Message") != std::string_view::npos ||
+                                l.find("Ursprüngliche Nachricht") != std::string_view::npos))
+        return true;
+    if ((starts_with_i(l, "On ") && l.ends_with("wrote:")) || (starts_with_i(l, "Am ") && l.ends_with(":") &&
+                                                               l.find("schrieb") != std::string_view::npos))
+        return true;
+    return (starts_with_i(l, "From: ") || starts_with_i(l, "Von: ")) && l.find('@') != std::string_view::npos;
+}
+
+// A tag, without its "<", that holds what a reply quotes in HTML.
+bool quote_tag(std::string_view t)
+{
+    if (starts_with_i(t, "blockquote"))
+        return true;
+    for (const std::string_view mark : {"divRplyFwdMsg", "appendonsend", "gmail_quote", "moz-cite-prefix"})
+        if (t.find(mark) != std::string_view::npos)
+            return true;
+    return false;
+}
+
+}   // namespace
+
 std::string preview(std::string_view message, const part& text, size_t bytes)
 {
     const bool tags = text.subtype == "html";
     const std::string s = to_utf8(decoded_body(message.substr(text.body_off, text.body_len), text.encoding),
                                   param(text.params, "charset"));
-    std::string flat;
-    bool tag = false;
-    // Read only until it is longer than the preview, which what follows cannot change.
-    for (size_t i = 0; i < s.size() && flat.size() <= bytes; ++i)
+    const std::string_view sv = s;
+    // What the message itself says, before what it quotes; all of it where it is nothing but a quote.
+    const auto flatten = [&](bool cut)
     {
-        const char c = s[i];
-        if (tags && (c == '<' || c == '>'))
-            tag = c == '<';
-        else if (tag)
-            continue;
-        else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        std::string flat;
+        bool tag = false;
+        // Read only until it is longer than the preview, which what follows cannot change.
+        for (size_t i = 0; i < s.size() && flat.size() <= bytes; ++i)
         {
-            if (!flat.empty() && flat.back() != ' ')
-                flat += ' ';
+            const char c = s[i];
+            if (cut && tags && c == '<' && quote_tag(sv.substr(i + 1, sv.find('>', i) - i - 1)))
+                break;
+            if (cut && !tags && (i == 0 || s[i - 1] == '\n') && quote_line(sv.substr(i, sv.find('\n', i) - i)))
+                break;
+            if (tags && (c == '<' || c == '>'))
+                tag = c == '<';
+            else if (tag)
+                continue;
+            else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+            {
+                if (!flat.empty() && flat.back() != ' ')
+                    flat += ' ';
+            }
+            else
+                flat += c;
         }
-        else
-            flat += c;
-    }
-    if (flat.size() > bytes)
-    {
-        size_t n = bytes;
-        while (n > 0 && (static_cast<unsigned char>(flat[n]) & 0xC0) == 0x80)
-            --n;
-        flat.resize(n);
-    }
-    while (!flat.empty() && flat.back() == ' ')
-        flat.pop_back();
-    return flat;
+        if (flat.size() > bytes)
+        {
+            size_t n = bytes;
+            while (n > 0 && (static_cast<unsigned char>(flat[n]) & 0xC0) == 0x80)
+                --n;
+            flat.resize(n);
+        }
+        while (!flat.empty() && flat.back() == ' ')
+            flat.pop_back();
+        return flat;
+    };
+    std::string own = flatten(true);
+    return own.empty() ? flatten(false) : own;
 }
 
 namespace

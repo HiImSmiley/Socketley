@@ -111,7 +111,7 @@ std::string page(std::string_view title, std::string_view body)
         "<div class=\"logo\"><div class=\"mk\"><svg viewBox=\"0 0 24 24\"><path d=\"M7 5.5v13l11-6.5z\"/></svg>"
         "</div>socketley</div>";
     return "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" "
-           "content=\"width=device-width,initial-scale=1\"><title>" +
+           "content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='1' y2='1'%3E%3Cstop stop-color='%23c084fc'/%3E%3Cstop offset='.55' stop-color='%23f472b6'/%3E%3Cstop offset='1' stop-color='%23fb923c'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='24' height='24' rx='6' fill='url(%23g)'/%3E%3Cpath d='M14.5 9.5a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM13.6 11.8 18 16.2v2.3h-2.3v-1.6h-1.6v-1.6l-2-2' fill='none' stroke='%23fff' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\"><title>" +
            html_escape(title) + "</title>" + head + std::string(body) + "</main></div></body></html>";
 }
 
