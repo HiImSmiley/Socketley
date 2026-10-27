@@ -1,11 +1,9 @@
 #include "jws.h"
+#include "key_file.h"
 #include "../util/base64.h"
 
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include <openssl/bio.h>
 #include <openssl/bn.h>
@@ -30,52 +28,7 @@ std::string sha256(std::string_view in)
 
 EVP_PKEY* load_or_make_key(const std::string& path, std::string_view what, std::string& err)
 {
-    if (BIO* b = BIO_new_file(path.c_str(), "r"))
-    {
-        EVP_PKEY* k = PEM_read_bio_PrivateKey(b, nullptr, nullptr, nullptr);
-        BIO_free(b);
-        if (k)
-            return k;
-        err = std::string(what) + " " + path + " does not load";
-        return nullptr;
-    }
-    ERR_clear_error();
-    EVP_PKEY* k = EVP_EC_gen("P-256");
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    // Written beside and linked into place whole, so a failure leaves no empty or cut key that would never load.
-    const std::string tmp = path + ".new." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    FILE* f = fd >= 0 ? fdopen(fd, "w") : nullptr;
-    bool ok = k && f && PEM_write_PrivateKey(f, k, nullptr, nullptr, 0, nullptr, nullptr) == 1 && fflush(f) == 0 &&
-              ::fsync(fd) == 0;
-    if (f)
-        ok = fclose(f) == 0 && ok;
-    else if (fd >= 0)
-        ::close(fd);
-    ok = ok && ::link(tmp.c_str(), path.c_str()) == 0;
-    if (fd >= 0)
-        ::unlink(tmp.c_str());
-    if (!ok)
-    {
-        // Another process linked its key first, which is the one both must use.
-        if (BIO* b = BIO_new_file(path.c_str(), "r"))
-        {
-            EVP_PKEY* theirs = PEM_read_bio_PrivateKey(b, nullptr, nullptr, nullptr);
-            BIO_free(b);
-            if (theirs)
-            {
-                if (k)
-                    EVP_PKEY_free(k);
-                return theirs;
-            }
-        }
-        err = std::string(what) + " " + path + " could not be written";
-        if (k)
-            EVP_PKEY_free(k);
-        return nullptr;
-    }
-    return k;
+    return key_file::load_or_make(path, what, [] { return EVP_EC_gen("P-256"); }, err);
 }
 
 std::string jwk_of(EVP_PKEY* k)

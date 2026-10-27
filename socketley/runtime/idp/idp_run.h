@@ -103,6 +103,23 @@ private:
     void account_post(const std::shared_ptr<conn>& c, const request& rq);
     void password_post(const std::shared_ptr<conn>& c, const request& rq);
 
+    // The device grant (RFC 8628): a client asks for a pair of codes, a person allows the user code on /device, and
+    // the client polls the token endpoint with the device code until that person has.
+    void device_authorization(const std::shared_ptr<conn>& c, const request& rq);
+    void device_page(const std::shared_ptr<conn>& c, const request& rq, std::string_view note, std::string_view error,
+                     int status);
+    void device_post(const std::shared_ptr<conn>& c, const request& rq);
+    void device_token(const std::shared_ptr<conn>& c, const client& cl, std::string device_code);
+    void device_answered(const std::shared_ptr<conn>& c, const client& cl, device_poll what, const device_entry& e);
+    // This shard's own grants: a user code decided, and a device code polled.
+    bool decide_device(const std::string& user_code, bool allow, const std::string& sub, int64_t at);
+    device_poll poll_device(const std::string& device_code, std::string_view client_id, int64_t now,
+                            device_entry& out);
+    // The client a token or device request names, authenticated; null with the error already sent.
+    const client* requesting_client(const std::shared_ptr<conn>& c, const request& rq, const params& p);
+    // A sign-in that went through, counted and said in the log with who and from where.
+    void signed_in(const account& who, std::string_view ip, std::string_view how);
+
     // What an authorize request asks, checked: the client and its redirect, or an error page when there is no
     // address to send the error to.
     const client* checked_client(const std::shared_ptr<conn>& c, const params& p);
@@ -217,6 +234,9 @@ private:
     int64_t m_clients_checked{0};
 
     std::unordered_map<std::string, code_entry> m_codes;
+    // Device grants by device code, and each one's device code by its user code in normal form.
+    std::unordered_map<std::string, device_entry> m_devices;
+    std::unordered_map<std::string, std::string> m_user_codes;
     std::unordered_map<std::string, misses> m_misses;
 
     bool m_stopped{false};
@@ -232,7 +252,7 @@ private:
 
     struct counters
     {
-        uint64_t sign_ins{0}, refused{0}, barred{0}, codes{0}, tokens{0}, refreshes{0}, userinfo{0};
+        uint64_t sign_ins{0}, refused{0}, barred{0}, codes{0}, tokens{0}, refreshes{0}, userinfo{0}, devices{0};
         uint64_t crossed{0}, crossings_served{0}, reopened{0};
     } m_c;
 };

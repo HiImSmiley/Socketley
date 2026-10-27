@@ -1461,7 +1461,7 @@ project "fuzz_dns"
         "socketley/runtime/dns/dns_zone.cpp",
         "socketley/runtime/dns/dns_answer.cpp",
         "socketley/runtime/dns/dns_sign.cpp",
-        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp",
+        "socketley/shared/crypto/jws.cpp", "socketley/shared/crypto/key_file.cpp", "socketley/shared/util/base64.cpp",
         "socketley/shared/net/dns_feed.cpp", "socketley/shared/persist/paths.cpp"
     }
     links { "crypto" }
@@ -1486,7 +1486,7 @@ project "fuzz_db"
         "socketley/runtime/db/db_schema.cpp",
         "socketley/runtime/db/db_store.cpp",
         "socketley/runtime/db/db_log.cpp",
-        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp"
+        "socketley/shared/crypto/jws.cpp", "socketley/shared/crypto/key_file.cpp", "socketley/shared/util/base64.cpp"
     }
 
     fuzz_target_settings()
@@ -2376,7 +2376,7 @@ project "test_dns"
         "socketley/runtime/dns/dns_zone.cpp",
         "socketley/runtime/dns/dns_answer.cpp",
         "socketley/runtime/dns/dns_sign.cpp",
-        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp",
+        "socketley/shared/crypto/jws.cpp", "socketley/shared/crypto/key_file.cpp", "socketley/shared/util/base64.cpp",
         "socketley/shared/net/dns_feed.cpp", "socketley/shared/persist/paths.cpp"
     }
     links(tls_libs())
@@ -2867,7 +2867,41 @@ project "test_idp"
     links { "crypto", "dl" }
 
     files { "test/unit/test_idp.cpp", "socketley/runtime/idp/idp_logic.cpp", "socketley/runtime/idp/idp_accounts.cpp",
-            "socketley/runtime/idp/idp_shard.cpp", "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp" }
+            "socketley/runtime/idp/idp_shard.cpp", "socketley/shared/crypto/jws.cpp", "socketley/shared/crypto/key_file.cpp", "socketley/shared/util/base64.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+project "test_ssh_ca"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    links { "crypto", "dl" }
+
+    files { "test/unit/test_ssh_ca.cpp", "socketley/shared/crypto/ssh_cert.cpp", "socketley/shared/crypto/ed25519.cpp",
+            "socketley/shared/crypto/key_file.cpp", "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
@@ -3015,7 +3049,7 @@ project "test_db"
 
     files { "test/unit/test_db.cpp", "socketley/runtime/db/db_doc.cpp", "socketley/runtime/db/db_schema.cpp",
             "socketley/runtime/db/db_store.cpp", "socketley/runtime/db/db_log.cpp", "socketley/runtime/db/db_shard.cpp",
-            "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp" }
+            "socketley/shared/crypto/jws.cpp", "socketley/shared/crypto/key_file.cpp", "socketley/shared/util/base64.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

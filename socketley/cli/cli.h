@@ -35,6 +35,12 @@ int cli_restore(int argc, char** argv);
 int cli_cluster(int argc, char** argv);
 // `socketley acme issue`, in cli_acme.cpp.
 int acme_main(int argc, char** argv);
+// `socketley login` and `logout`, in cli_login.cpp.
+int cli_login(int argc, char** argv);
+int cli_logout(int argc, char** argv);
+// The access token of the person signed in at the idp `issuer`, refreshed when it has run out; false with `err`
+// telling them to sign in.
+bool cli_access_token(const std::string& issuer, std::string& token, std::string& err);
 int git_sync_main(int argc, char** argv);
 
 // A path a flag names, made absolute against the caller's directory, because the daemon resolves it against its own.

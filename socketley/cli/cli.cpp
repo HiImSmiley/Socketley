@@ -366,6 +366,12 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("acme"):
             return acme_main(argc, argv);
 
+        // A person signed in at an idp runtime, which may be another machine's; neither needs a daemon.
+        case fnv1a("login"):
+            return cli_login(argc, argv);
+        case fnv1a("logout"):
+            return cli_logout(argc, argv);
+
         // One repository a storage runtime keeps, run by the runtime (git_mirrors.h) and runnable by hand.
         case fnv1a("git-sync"):
             return git_sync_main(argc, argv);

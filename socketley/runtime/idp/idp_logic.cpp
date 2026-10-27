@@ -14,6 +14,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/http/url.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/random_id.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/crypto/mac.h"
 
@@ -78,7 +79,7 @@ bool parse_clients(std::string_view text, std::vector<client>& out, std::string&
         const std::string where = "line " + std::to_string(line_no) + ": ";
         if (w.size() < 3)
         {
-            why = where + "a client is its id, its secret or -, and at least one redirect address";
+            why = where + "a client is its id, its secret or -, and at least one redirect address or device";
             return false;
         }
         client c;
@@ -94,6 +95,11 @@ bool parse_clients(std::string_view text, std::vector<client>& out, std::string&
         for (size_t i = 2; i < w.size(); ++i)
         {
             const std::string_view r = w[i];
+            if (r == "device")
+            {
+                c.device = true;
+                continue;
+            }
             // An http address only on this machine, where nobody can stand between the browser and the client.
             const std::string host = url_host(r);
             const bool local = r.starts_with("http://") && (host == "localhost" || host == "127.0.0.1" || host == "[::1]");
@@ -114,6 +120,53 @@ bool parse_clients(std::string_view text, std::vector<client>& out, std::string&
         out.push_back(std::move(c));
     }
     return true;
+}
+
+namespace
+{
+
+// Consonants alone, so no code spells a word, and none of the letters a person mixes up with a digit.
+constexpr std::string_view user_code_letters = "BCDFGHJKLMNPQRSTVWXZ";
+
+}   // namespace
+
+std::string make_user_code()
+{
+    unsigned char raw[8];
+    if (!socketley::random_bytes(raw, sizeof raw))
+        return {};
+    std::string out;
+    for (size_t i = 0; i < sizeof raw; ++i)
+    {
+        if (i == 4)
+            out += '-';
+        // 256 is not a multiple of 20, and the bias of 16 in 256 is nothing a guess at a ten-minute code can use.
+        out += user_code_letters[raw[i] % user_code_letters.size()];
+    }
+    return out;
+}
+
+std::string normal_user_code(std::string_view typed)
+{
+    std::string out;
+    for (const char ch : typed)
+    {
+        if (ch == '-' || ch == ' ')
+            continue;
+        const char up = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        if (user_code_letters.find(up) == std::string_view::npos || out.size() == 8)
+            return {};
+        out += up;
+    }
+    return out.size() == 8 ? out : std::string();
+}
+
+uint32_t user_code_shard(std::string_view normal, uint32_t shards)
+{
+    uint32_t h = 2166136261u;
+    for (const char ch : normal)
+        h = (h ^ static_cast<unsigned char>(ch)) * 16777619u;
+    return shards ? h % shards : 0;
 }
 
 params parse_form(std::string_view in)

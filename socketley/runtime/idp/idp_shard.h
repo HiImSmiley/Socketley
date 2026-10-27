@@ -27,13 +27,45 @@ struct code_entry
     int64_t expires{0};
 };
 
+// A device grant (RFC 8628) waiting for its person, kept by the shard its user code names.
+struct device_entry
+{
+    enum state_t : uint8_t
+    {
+        pending  = 0,
+        approved = 1,
+        denied   = 2,
+    };
+    std::string client_id;
+    std::string scope;
+    std::string user_code;
+    std::string sub;
+    state_t state{pending};
+    int64_t auth_time{0};
+    int64_t expires{0};
+    // When the device may ask again without being told to slow down.
+    int64_t next_poll{0};
+};
+
+// What a poll of a device code comes to.
+enum class device_poll : uint8_t
+{
+    pending   = 0,
+    slow_down = 1,
+    approved  = 2,
+    denied    = 3,
+    gone      = 4,
+};
+
 struct shard_call
 {
     enum op_t : uint8_t
     {
-        redeem = 1,   // the code `key`, taken from the shard that gave it
-        update = 2,   // the account `key`'s `fields`, set by shard 0
-        miss   = 3,   // a sign-in from `key` failed at `at`, told to every other shard
+        redeem        = 1,   // the code `key`, taken from the shard that gave it
+        update        = 2,   // the account `key`'s `fields`, set by shard 0
+        miss          = 3,   // a sign-in from `key` failed at `at`, told to every other shard
+        device_decide = 4,   // the user code `key` allowed or refused (`fields` allow, sub) at `at`
+        device_ask    = 5,   // the device code `key` polled by the client `fields` client_id at `at`
     };
     op_t op{redeem};
     std::string key;
@@ -48,6 +80,10 @@ bool decode_call(std::string_view in, shard_call& out);
 // A redeem's answer: the code's entry, or none when it is not known, was used or has gone.
 std::string encode_code(const code_entry* e);
 bool decode_code(std::string_view in, bool& found, code_entry& out);
+
+// A device poll's answer: what it came to, and for an approved grant the account, its scope and when it signed in.
+std::string encode_device(device_poll what, const device_entry* e);
+bool decode_device(std::string_view in, device_poll& what, device_entry& out);
 
 // An update's answer: done, or why not.
 std::string encode_result(bool ok, std::string_view why);

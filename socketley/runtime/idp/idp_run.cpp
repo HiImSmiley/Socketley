@@ -44,6 +44,10 @@ namespace
 {
 
 constexpr int64_t code_secs     = 60;
+constexpr int64_t device_secs   = 600;
+constexpr int64_t device_poll_s = 5;
+constexpr size_t  max_devices   = 10000;
+constexpr std::string_view device_grant = "urn:ietf:params:oauth:grant-type:device_code";
 constexpr int64_t token_secs    = 3600;
 constexpr int64_t refresh_secs  = 30 * 86400;
 constexpr int64_t session_secs  = 12 * 3600;
@@ -310,13 +314,23 @@ void idp_run::tick()
     const int64_t now = wall::now_sec();
     m_http.sweep(now, idle_secs);
     std::erase_if(m_codes, [now](const auto& kv) { return kv.second.expires <= now; });
+    for (auto it = m_devices.begin(); it != m_devices.end();)
+    {
+        if (it->second.expires > now)
+        {
+            ++it;
+            continue;
+        }
+        m_user_codes.erase(it->second.user_code);
+        it = m_devices.erase(it);
+    }
     // A loop rather than erase_if, whose predicate GCC 12's library hands each entry as const.
     for (auto it = m_misses.begin(); it != m_misses.end();)
     {
         std::erase_if(it->second.at, [now](int64_t t) { return now - t > miss_window; });
         it = it->second.at.empty() ? m_misses.erase(it) : std::next(it);
     }
-    if (!m_http.empty() || !m_codes.empty() || !m_misses.empty())
+    if (!m_http.empty() || !m_codes.empty() || !m_misses.empty() || !m_devices.empty())
         arm_tick();
 }
 
@@ -418,6 +432,12 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         sign_in(c, rq);
     else if (p == "/token" && post)
         token(c, rq);
+    else if (p == "/device_authorization" && post)
+        device_authorization(c, rq);
+    else if (p == "/device" && get)
+        device_page(c, rq, {}, {}, 200);
+    else if (p == "/device" && post)
+        device_post(c, rq);
     else if (p == "/userinfo" && (get || post))
         userinfo(c, rq);
     else if (p == "/logout" && (get || post))
@@ -433,7 +453,8 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
     else if ((p == "/account/totp" || p == "/account/app-password") && post)
         security_post(c, rq);
     else if (p == "/.well-known/openid-configuration" || p == "/jwks" || p == "/authorize" || p == "/login" ||
-             p == "/token" || p == "/userinfo" || p == "/logout" || p == "/" || p.starts_with("/account"))
+             p == "/token" || p == "/userinfo" || p == "/logout" || p == "/" || p.starts_with("/account") ||
+             p == "/device" || p == "/device_authorization")
         respond(c, 405, "text/plain", "method not allowed\n");
     else
         respond(c, 404, "text/plain", "not found\n");
@@ -449,8 +470,9 @@ void idp_run::discovery(const std::shared_ptr<conn>& c)
                 ",\"token_endpoint\":" + socketley::json::quote(i + "/token") + ",\"userinfo_endpoint\":" +
                 socketley::json::quote(i + "/userinfo") + ",\"jwks_uri\":" + socketley::json::quote(i + "/jwks") +
                 ",\"end_session_endpoint\":" + socketley::json::quote(i + "/logout") +
+                ",\"device_authorization_endpoint\":" + socketley::json::quote(i + "/device_authorization") +
                 ",\"response_types_supported\":[\"code\"],\"grant_types_supported\":[\"authorization_code\","
-                "\"refresh_token\"],\"subject_types_supported\":[\"public\"],\"id_token_signing_alg_values_supported\":"
+                "\"refresh_token\",\"urn:ietf:params:oauth:grant-type:device_code\"],\"subject_types_supported\":[\"public\"],\"id_token_signing_alg_values_supported\":"
                 "[\"ES256\"],\"scopes_supported\":[\"openid\",\"profile\",\"email\",\"offline_access\"],"
                 "\"token_endpoint_auth_methods_supported\":[\"client_secret_basic\",\"client_secret_post\",\"none\"],"
                 "\"code_challenge_methods_supported\":[\"S256\"],\"claims_supported\":[\"sub\",\"name\","
@@ -773,7 +795,7 @@ void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, par
     const params carried = it->second.p;
     const bool remember = it->second.remember;
     m_pending.erase(it);
-    ++m_c.sign_ins;
+    signed_in(*a, ip, "with password and code");
     grant(c, carried, *a, session_cookie(*a, remember));
 }
 
@@ -883,7 +905,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
         }
         else
         {
-            ++m_c.sign_ins;
+            signed_in(*a, ip, "with password");
             grant(cc, p, *a, session_cookie(*a, remember));
         }
         m_http.resume(cc);
@@ -1093,9 +1115,17 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
     respond(c, 200, "application/json", body, any_origin);
 }
 
-void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
+const client* idp_run::requesting_client(const std::shared_ptr<conn>& c, const request& rq, const params& p)
 {
-    const params p = parse_form(rq.body);
+    const std::string ip = client_ip(*c, rq);
+    const int64_t now = wall::now_sec();
+    if (barred(ip, now))
+    {
+        ++m_c.barred;
+        json_error(c, 429, "temporarily_unavailable", "too many failed requests from here; try again in a quarter of "
+                                                      "an hour");
+        return nullptr;
+    }
     // The client, by HTTP Basic or by the form, and a public one by its id alone.
     std::string id(param(p, "client_id")), secret(param(p, "client_secret"));
     bool basic = false;
@@ -1117,10 +1147,21 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
         cl && (cl->is_public() ? secret.empty() : crypto::secure_equal(secret, cl->secret));
     if (!authenticated)
     {
+        // A secret guessed at counts against the address as a password guessed at does.
+        missed(ip, now, [] {});
         json_error(c, 401, "invalid_client", "the client is not known or its secret is not right",
                    basic ? "WWW-Authenticate: Basic realm=\"" + m_issuer + "\"\r\n" : std::string());
-        return;
+        return nullptr;
     }
+    return cl;
+}
+
+void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const params p = parse_form(rq.body);
+    const client* cl = requesting_client(c, rq, p);
+    if (!cl)
+        return;
     const std::string_view grant = param(p, "grant_type");
     if (grant == "authorization_code")
     {
@@ -1191,7 +1232,289 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
         issue_tokens(c, *cl, e, *who);
         return;
     }
-    json_error(c, 400, "unsupported_grant_type", "only authorization_code and refresh_token are served");
+    if (grant == device_grant)
+    {
+        device_token(c, *cl, std::string(param(p, "device_code")));
+        return;
+    }
+    json_error(c, 400, "unsupported_grant_type", "only authorization_code, refresh_token and device_code are served");
+}
+
+// ─── The device grant ───────────────────────────────────────────────────────
+
+void idp_run::signed_in(const account& who, std::string_view ip, std::string_view how)
+{
+    ++m_c.sign_ins;
+    LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": \"" + std::string(who.username()) + "\" signed in " +
+              std::string(how) + (ip.empty() ? std::string() : " from " + std::string(ip))).c_str());
+}
+
+void idp_run::device_authorization(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const params p = parse_form(rq.body);
+    const client* cl = requesting_client(c, rq, p);
+    if (!cl)
+        return;
+    if (!cl->device)
+    {
+        json_error(c, 400, "unauthorized_client", "the client may not use the device grant; give it `device` in "
+                                                  "--clients");
+        return;
+    }
+    if (m_devices.size() >= max_devices)
+    {
+        json_error(c, 503, "temporarily_unavailable", "too many device sign-ins are waiting; try again in a minute");
+        return;
+    }
+    // A user code this shard keeps, so whichever shard the person's browser reaches can ask the right one.
+    std::string user_code, normal;
+    for (int i = 0; i < 256; ++i)
+    {
+        std::string candidate = make_user_code();
+        std::string n = normal_user_code(candidate);
+        if (n.empty() || user_code_shard(n, m_shards) != m_shard || m_user_codes.contains(n))
+            continue;
+        user_code = std::move(candidate);
+        normal = std::move(n);
+        break;
+    }
+    const std::string token = random_b64url(32);
+    const std::string device_code = m_shards > 1 && !token.empty() ? std::to_string(m_shard) + "." + token : token;
+    if (user_code.empty() || token.empty())
+    {
+        json_error(c, 503, "temporarily_unavailable", "no randomness for a code");
+        return;
+    }
+    const int64_t now = wall::now_sec();
+    device_entry e;
+    e.client_id = cl->id;
+    e.scope.assign(param(p, "scope"));
+    e.user_code = normal;
+    e.expires = now + device_secs;
+    e.next_poll = now;
+    m_devices.emplace(device_code, std::move(e));
+    m_user_codes.emplace(normal, device_code);
+    ++m_c.devices;
+    arm_tick();
+    const std::string page_url = m_issuer + "/device";
+    respond(c, 200, "application/json",
+            "{\"device_code\":" + socketley::json::quote(device_code) + ",\"user_code\":" +
+                socketley::json::quote(user_code) + ",\"verification_uri\":" + socketley::json::quote(page_url) +
+                ",\"verification_uri_complete\":" + socketley::json::quote(page_url + "?user_code=" + user_code) +
+                ",\"expires_in\":" + std::to_string(device_secs) + ",\"interval\":" + std::to_string(device_poll_s) +
+                "}",
+            any_origin);
+}
+
+void idp_run::device_page(const std::shared_ptr<conn>& c, const request& rq, std::string_view note,
+                          std::string_view error, int status)
+{
+    const account* who = session_of(rq);
+    if (!who)
+    {
+        // Signed in first, and brought back here with the code the address carried.
+        const std::string back = "/device" + (rq.query.empty() ? std::string() : "?" + rq.query);
+        redirect(c, "/login?rd=" + url_encode(back));
+        return;
+    }
+    const params q = parse_form(rq.method == "POST" ? rq.body : rq.query);
+    const std::string_view name = who->field("name").empty() ? who->username() : who->field("name");
+    std::string body = "<h1>Sign in a device</h1>";
+    if (!note.empty())
+        body += "<p>" + html_escape(note) + "</p><p class=\"small\">You can close this page.</p>";
+    else
+        body += "<p class=\"small\">Signed in as <b>" + html_escape(name) +
+                "</b>. Allow only a code that a device of yours shows you right now; whoever holds the device signs "
+                "in as you.</p><form method=\"post\" action=\"/device\"><label for=\"u\">Code</label><input id=\"u\" "
+                "type=\"text\" name=\"user_code\" autocomplete=\"off\" autocapitalize=\"characters\" autofocus "
+                "required value=\"" + html_escape(param(q, "user_code")) + "\">" +
+                (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
+                "<button type=\"submit\" name=\"action\" value=\"allow\">Allow</button> <button type=\"submit\" "
+                "name=\"action\" value=\"deny\">Refuse</button></form>";
+    respond(c, status, "text/html; charset=utf-8", page("Sign in a device", body));
+}
+
+void idp_run::device_post(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const account* who = session_of(rq);
+    if (!who)
+    {
+        device_page(c, rq, {}, {}, 401);
+        return;
+    }
+    const std::string ip = client_ip(*c, rq);
+    const int64_t now = wall::now_sec();
+    if (barred(ip, now))
+    {
+        ++m_c.barred;
+        device_page(c, rq, {}, "Too many wrong codes from here; try again in a quarter of an hour.", 429);
+        return;
+    }
+    const params p = parse_form(rq.body);
+    const std::string normal = normal_user_code(param(p, "user_code"));
+    const bool allow = param(p, "action") == "allow";
+    const std::string sub = who->id, user(who->username());
+    // A code that is no code at all is answered at once and counts like a wrong one.
+    const auto decided = [this, ip, now, allow, user, normal](const std::shared_ptr<conn>& cc, const request& r,
+                                                              bool ok)
+    {
+        if (!ok)
+        {
+            missed(ip, now, [] {});
+            device_page(cc, r, {}, "That code is not known or has expired.", 400);
+            return;
+        }
+        LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": \"" + user + "\" " +
+                  (allow ? "allowed" : "refused") + " a device sign-in from " + ip).c_str());
+        device_page(cc, r, allow ? "The device is signed in." : "The device was refused.", {}, 200);
+    };
+    if (normal.empty())
+    {
+        decided(c, rq, false);
+        return;
+    }
+    const uint32_t keeper = user_code_shard(normal, m_shards);
+    if (keeper == m_shard)
+    {
+        decided(c, rq, decide_device(normal, allow, sub, now));
+        return;
+    }
+    std::weak_ptr<conn> weak = c;
+    const bool asked = cross(keeper, shard_call{shard_call::device_decide, normal,
+                                                {{"allow", allow ? "1" : "0"}, {"sub", sub}}, now},
+                             [this, weak, rq, decided](bool answered, std::string_view reply)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        cc->waiting = false;
+        bool ok = false;
+        std::string why;
+        if (!answered || !decode_result(reply, ok, why))
+            ok = false;
+        decided(cc, rq, ok);
+        m_http.resume(cc);
+    });
+    if (asked)
+        c->waiting = true;
+    else
+        decided(c, rq, false);
+}
+
+bool idp_run::decide_device(const std::string& user_code, bool allow, const std::string& sub, int64_t at)
+{
+    const auto u = m_user_codes.find(user_code);
+    if (u == m_user_codes.end())
+        return false;
+    const auto d = m_devices.find(u->second);
+    if (d == m_devices.end() || d->second.expires <= at || d->second.state != device_entry::pending)
+        return false;
+    d->second.state = allow ? device_entry::approved : device_entry::denied;
+    d->second.sub = sub;
+    d->second.auth_time = at;
+    // A decided code is decided once, and no second person can take it over.
+    m_user_codes.erase(u);
+    return true;
+}
+
+device_poll idp_run::poll_device(const std::string& device_code, std::string_view client_id, int64_t now,
+                                 device_entry& out)
+{
+    const auto it = m_devices.find(device_code);
+    if (it == m_devices.end() || it->second.client_id != client_id)
+        return device_poll::gone;
+    device_entry& e = it->second;
+    if (e.expires <= now)
+    {
+        m_user_codes.erase(e.user_code);
+        m_devices.erase(it);
+        return device_poll::gone;
+    }
+    if (e.state == device_entry::pending)
+    {
+        // RFC 8628 3.5: a client that asks too often is told to slow down, and waits five seconds longer each time.
+        if (now < e.next_poll)
+        {
+            e.next_poll += device_poll_s;
+            return device_poll::slow_down;
+        }
+        e.next_poll = now + device_poll_s;
+        return device_poll::pending;
+    }
+    out = e;
+    const device_poll what = e.state == device_entry::approved ? device_poll::approved : device_poll::denied;
+    m_user_codes.erase(e.user_code);
+    m_devices.erase(it);
+    return what;
+}
+
+void idp_run::device_token(const std::shared_ptr<conn>& c, const client& cl, std::string device_code)
+{
+    const int64_t now = wall::now_sec();
+    uint32_t keeper = m_shard;
+    if (!code_shard(device_code, m_shards, keeper) || keeper == m_shard)
+    {
+        device_entry e;
+        const device_poll what = poll_device(device_code, cl.id, now, e);
+        device_answered(c, cl, what, e);
+        return;
+    }
+    std::weak_ptr<conn> weak = c;
+    const bool asked = cross(keeper, shard_call{shard_call::device_ask, device_code, {{"client_id", cl.id}}, now},
+                             [this, weak, client_id = cl.id](bool answered, std::string_view reply)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        cc->waiting = false;
+        device_poll what = device_poll::gone;
+        device_entry e;
+        if (!answered || !decode_device(reply, what, e))
+            what = device_poll::gone;
+        if (const client* again = find_client(client_id))
+            device_answered(cc, *again, what, e);
+        else
+            json_error(cc, 401, "invalid_client", "the client is not known or its secret is not right");
+        m_http.resume(cc);
+    });
+    if (asked)
+        c->waiting = true;
+    else
+        json_error(c, 400, "expired_token", "the device code is not known or has expired");
+}
+
+void idp_run::device_answered(const std::shared_ptr<conn>& c, const client& cl, device_poll what,
+                              const device_entry& e)
+{
+    switch (what)
+    {
+        case device_poll::pending:
+            json_error(c, 400, "authorization_pending", "the person has not allowed the code yet");
+            return;
+        case device_poll::slow_down:
+            json_error(c, 400, "slow_down", "asked again too soon; wait five seconds longer between polls");
+            return;
+        case device_poll::denied:
+            json_error(c, 400, "access_denied", "the person refused the code");
+            return;
+        case device_poll::gone:
+            json_error(c, 400, "expired_token", "the device code is not known or has expired");
+            return;
+        case device_poll::approved:
+            break;
+    }
+    const account* who = m_accounts.by_id(e.sub);
+    if (!who || who->disabled() || !still_signed_in(*who, e.auth_time * 1000))
+    {
+        json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
+        return;
+    }
+    code_entry granted;
+    granted.client_id = cl.id;
+    granted.sub = who->id;
+    granted.scope = e.scope;
+    granted.auth_time = e.auth_time;
+    issue_tokens(c, cl, granted, *who);
 }
 
 void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, bool found,
@@ -1651,7 +1974,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
                     respond(c3, 500, "text/plain", "the password could not be kept\n");
                 else
                 {
-                    ++m_c.sign_ins;
+                    signed_in(*a2, {}, "with a new password");
                     if (from_reset)
                         grant(c3, p, *a2, session_cookie(*a2, false));
                     else
@@ -2232,6 +2555,32 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
             arm_tick();
             mgr->requests().complete_deferred(ticket, request_status::ok, {});
             return;
+        case shard_call::device_decide:
+        {
+            std::string allow, sub;
+            for (const auto& [k, v] : call.fields)
+            {
+                if (k == "allow")
+                    allow = v;
+                else if (k == "sub")
+                    sub = v;
+            }
+            const bool ok = !sub.empty() && decide_device(call.key, allow == "1", sub, call.at);
+            mgr->requests().complete_deferred(ticket, request_status::ok, encode_result(ok, {}));
+            return;
+        }
+        case shard_call::device_ask:
+        {
+            std::string client_id;
+            for (const auto& [k, v] : call.fields)
+                if (k == "client_id")
+                    client_id = v;
+            device_entry e;
+            const device_poll what = poll_device(call.key, client_id, call.at, e);
+            mgr->requests().complete_deferred(ticket, request_status::ok,
+                                              encode_device(what, what == device_poll::approved ? &e : nullptr));
+            return;
+        }
     }
     mgr->requests().complete_deferred(ticket, request_status::ok, {});
 }

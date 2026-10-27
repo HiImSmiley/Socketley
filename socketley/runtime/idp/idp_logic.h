@@ -26,13 +26,16 @@ struct client
     std::string id;
     std::string secret;
     std::vector<std::string> redirects;
+    // Whether it may sign a person in by the device grant (RFC 8628), which `device` in place of a redirect allows.
+    bool device{false};
 
     bool is_public() const { return secret.empty(); }
     bool allows(std::string_view redirect) const;
 };
 
-// `id secret redirect [redirect...]` a line, `-` as the secret for a public client, `#` starting a comment; false
-// with `why` naming the line for anything else, so a client is never half read.
+// `id secret redirect [redirect...]` a line, `-` as the secret for a public client, `device` among the redirects
+// for the device grant, `#` starting a comment; false with `why` naming the line for anything else, so a client is
+// never half read.
 bool parse_clients(std::string_view text, std::vector<client>& out, std::string& why);
 
 using params = std::vector<std::pair<std::string, std::string>>;
@@ -48,6 +51,14 @@ std::string url_encode(std::string_view in);
 
 // Text safe inside HTML, attribute values included.
 std::string html_escape(std::string_view in);
+
+// A device grant's user code: eight letters a person reads and types without mistaking one for another,
+// XXXX-XXXX; empty when there was no randomness.
+std::string make_user_code();
+// What a person typed as a user code, upper case without the dash and spaces; empty when it is not one.
+std::string normal_user_code(std::string_view typed);
+// The shard among `shards` that keeps the user code `normal`.
+uint32_t user_code_shard(std::string_view normal, uint32_t shards);
 
 
 // RFC 7636: a verifier of 43 to 128 unreserved characters whose SHA-256, base64url, is the S256 challenge.
