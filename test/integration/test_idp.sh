@@ -242,6 +242,9 @@ if phase == "main":
     check("the sign-in page wears the storage interface's look, its aurora let in and still no script",
           (st, 'class="lcard"' in body and "--grad:" in body, "img-src data:" in (h.get("Content-Security-Policy") or ""),
            "<script" in body), (200, True, True, False))
+    st, body, _ = req("POST", "/account/totp", dict(do="start"), cookie=cookie)
+    check("turning two-step sign-in on shows the key as a code to scan, beside the link it encodes",
+          (st, "<svg" in body and "h1v1h-1z" in body, "otpauth://totp/" in body), (200, True, True))
     st, body, _ = req("POST", "/account", dict(name="Alice B", email="alice@example.com"), cookie=cookie)
     st, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + rt.get("access_token", "")})
     check("a name changed on the account page is what userinfo says", json.loads(body).get("name") if st == 200 else st, "Alice B")

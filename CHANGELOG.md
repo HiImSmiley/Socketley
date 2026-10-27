@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A code to scan for two-step sign-in.** An idp's page that turns two-step
+  sign-in on shows the authenticator key as a QR code beside the key itself.
 - **A tunnel runtime.** A machine with no address of its own — at home behind a
   router or carrier-grade NAT — runs a tunnel `--mode agent` that dials out to a
   tunnel `--mode edge` on a machine the internet reaches, over TLS on port 443

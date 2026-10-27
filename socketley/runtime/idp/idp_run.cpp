@@ -1,5 +1,6 @@
 #include "idp_run.h"
 #include "idp_totp.h"
+#include "../../shared/util/qr_code.h"
 
 #include "../../shared/util/ascii.h"
 
@@ -1882,8 +1883,10 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
                 grouped += (i ? " " : "") + key.substr(i, 4);
             respond(c, 200, "text/html; charset=utf-8",
                     page("Two-step sign-in",
-                         "<h1>Two-step sign-in</h1><p class=\"mut\">Add this key to your authenticator app, then give "
-                         "the code it shows.</p><p><code>" + html_escape(grouped) + "</code></p><p class=\"mut\">"
+                         "<h1>Two-step sign-in</h1><p class=\"mut\">Scan this with your authenticator app, or add the "
+                         "key below by hand, then give the code it shows.</p><div style=\"width:200px;margin:16px 0;"
+                         "border-radius:12px;overflow:hidden\">" + socketley::qr::svg(uri) + "</div><p><code>" +
+                         html_escape(grouped) + "</code></p><p class=\"mut\">"
                          "<a href=\"" + html_escape(uri) + "\">Open in an authenticator app</a></p><form method=\"post\" "
                          "action=\"/account/totp\"><input type=\"hidden\" name=\"do\" value=\"confirm\"><label for=\"tc\">"
                          "Code</label><input class=\"inp\" id=\"tc\" type=\"text\" name=\"code\" inputmode=\"numeric\" "
