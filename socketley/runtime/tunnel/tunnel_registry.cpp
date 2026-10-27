@@ -39,10 +39,16 @@ bool parse_service(std::string_view s, service& out)
 {
     if (s.starts_with("http:"))
     {
+        s.remove_prefix(5);
+        const size_t eq = s.find('=');
         out.http = true;
-        out.name = std::string(s.substr(5));
+        out.name = std::string(s.substr(0, eq));
+        out.auth = eq == std::string_view::npos ? std::string() : std::string(s.substr(eq + 1));
         out.port = 0;
-        return valid_name(out.name);
+        // A visitor's --auth spec, kept whole on the line: nothing in it may end the item or the field.
+        const bool auth_ok = eq == std::string_view::npos ||
+                             (!out.auth.empty() && out.auth.find_first_of(", \t") == std::string::npos);
+        return valid_name(out.name) && auth_ok;
     }
     if (!s.starts_with("tcp:"))
         return false;
@@ -63,7 +69,9 @@ bool parse_service(std::string_view s, service& out)
 
 std::string render_service(const service& s)
 {
-    return s.http ? "http:" + s.name : "tcp:" + s.name + ":" + std::to_string(s.port);
+    if (s.http)
+        return "http:" + s.name + (s.auth.empty() ? "" : "=" + s.auth);
+    return "tcp:" + s.name + ":" + std::to_string(s.port);
 }
 
 }   // namespace
@@ -174,7 +182,8 @@ bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::ve
         const std::string_view n = trim_blanks(take_item(http_csv));
         if (!parse_service("http:" + std::string(n), s))
         {
-            why = "--http takes service names: lower-case letters, digits and -";
+            why = "--http takes service names, lower-case letters, digits and -, each with =<auth> to ask its visitors "
+                  "for one";
             return false;
         }
         out.push_back(std::move(s));

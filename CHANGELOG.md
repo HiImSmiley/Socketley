@@ -20,20 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **A tunnel runtime.** A machine with no address of its own — at home behind
-  a router or carrier-grade NAT — runs a tunnel `--mode agent` that dials out
-  to a tunnel `--mode edge` on a machine the internet reaches, over TLS on
-  port 443 through the entrance, and holds that one connection. The edge
-  serves the agent's HTTP services at `<service>.<its domain>`, routed by the
-  entrance with its certificate and answered by the dns runtime, and its TCP
-  services on ports of their own; nothing is opened on the router.
-  `socketley tunnel <edge> invite` prints an invitation the agent joins with
-  once, in exchange for a key of its own; `set` changes what it offers,
-  `revoke` cuts it off. An edge with `--forward` carries a person signed in at
-  its `--idp` to the targets it names: `socketley tunnel ssh <edge> --idp
-  <idp>` as ssh's `ProxyCommand` reaches a server through port 443. It takes
-  the access tokens of the client `socketley login` signs in as, `socketley`,
-  unless `--idp-audience` names others.
+- **A tunnel runtime.** A machine with no address of its own — at home behind a
+  router or carrier-grade NAT — runs a tunnel `--mode agent` that dials out to a
+  tunnel `--mode edge` on a machine the internet reaches, over TLS on port 443
+  through the entrance, and holds that one connection. The edge serves the
+  agent's HTTP services at `<service>.<its domain>`, routed by the entrance with
+  its certificate and answered by the dns runtime, and its TCP services on ports
+  of their own; nothing is opened on the router. `socketley tunnel <edge>
+  invite` prints an invitation the agent joins with once, in exchange for a key
+  of its own; `set` changes what it offers, `revoke` cuts it off. An HTTP
+  service invited as `<name>=<auth>` asks every request of its visitors for what
+  a proxy's `--auth` takes — a sign-in at an idp, a token or a key — before any
+  of it reaches home; the figures are in the metrics as `socketley_tunnel_*`. An
+  edge with `--forward` carries a person signed in at its `--idp` to the targets
+  it names: `socketley tunnel ssh <edge> --idp <idp>` as ssh's `ProxyCommand`
+  reaches a server through port 443. It takes the access tokens of the client
+  `socketley login` signs in as, `socketley`, unless `--idp-audience` names
+  others.
 - **SSH by the sign-in.** An idp runtime with `--ssh-ca <hours>` is an SSH
   certificate authority: `socketley login <idp>` signs a person in from the
   command line by a code they allow in a browser (the device grant, RFC 8628,

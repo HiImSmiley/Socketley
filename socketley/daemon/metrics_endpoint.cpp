@@ -783,6 +783,40 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
 }
 
 // A mail runtime's `stats` figures: what it took, delivered, deferred and bounced, what waits, and every other by name.
+// A tunnel's links and what went through them, each figure of its stats a family of its own.
+static void append_tunnel_series(std::string& out, const std::vector<storage_row>& rows)
+{
+    if (rows.empty())
+        return;
+    const auto family = [&](std::string_view metric, std::string_view type, std::string_view help, std::string_view key) {
+        out += '\n';
+        metric_head(out, metric, type, help);
+        for (const auto& r : rows)
+        {
+            uint64_t v = 0;
+            if (!r.get(key, v))
+                continue;
+            out += metric;
+            out += "{name=\"";
+            label_escape_into(out, r.name);
+            out += "\"} ";
+            json_append_uint(out, v);
+            out += '\n';
+        }
+    };
+    family("socketley_tunnel_links", "gauge", "Links a tunnel holds now: agents and people at an edge, the edge at an agent.",
+           "links");
+    family("socketley_tunnel_agents", "gauge", "Agents an edge knows, joined or invited.", "agents");
+    family("socketley_tunnel_streams_total", "counter", "Streams a tunnel opened for visitors and people.", "streams");
+    family("socketley_tunnel_refused_total", "counter", "Upgrades and streams a tunnel refused.", "refused");
+    family("socketley_tunnel_visitors_refused_total", "counter", "Requests a protected service's auth refused.",
+           "visitors_refused");
+    family("socketley_tunnel_bytes_in_total", "counter", "Bytes a tunnel read from its local connections and sent on.",
+           "bytes_in");
+    family("socketley_tunnel_bytes_out_total", "counter", "Bytes a tunnel received and wrote to its local connections.",
+           "bytes_out");
+}
+
 static void append_mail_series(std::string& out, const std::vector<storage_row>& rows)
 {
     if (rows.empty())
@@ -854,8 +888,10 @@ static std::vector<runtime_row> runtime_rows(const runtime_manager& manager)
     for (const auto& [name, rt] : runtimes)
         // The bound port, the one `ps` prints: an unset -p is the type's default.
         rows.push_back({name, rt->get_type(), rt->get_state(), rt->effective_port(), rt->worker_figures(),
-                        rt->get_type() == runtime_storage || rt->get_type() == runtime_mail ? rt->stat_detail_snapshot()
-                                                                                             : std::string{},
+                        rt->get_type() == runtime_storage || rt->get_type() == runtime_mail ||
+                                rt->get_type() == runtime_tunnel
+                            ? rt->stat_detail_snapshot()
+                            : std::string{},
                         rt->shard_pids()});
     return rows;
 }
@@ -1050,6 +1086,12 @@ std::string metrics_endpoint::build_metrics() const
         if (s.type == runtime_mail && s.state == runtime_running && !s.detail.empty())
             mail_rows.push_back(parse_storage_row(s.name, s.detail));
     append_mail_series(out, mail_rows);
+
+    std::vector<storage_row> tunnel_rows;
+    for (const auto& s : snapshots)
+        if (s.type == runtime_tunnel && s.state == runtime_running && !s.detail.empty())
+            tunnel_rows.push_back(parse_storage_row(s.name, s.detail));
+    append_tunnel_series(out, tunnel_rows);
 
     return out;
 }

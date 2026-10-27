@@ -280,8 +280,8 @@ TEST_CASE("the agents file is read as written, and refuses what it cannot be")
     const std::string hash(64, 'a');
     std::vector<agent> agents;
     std::string why;
-    REQUIRE(parse_agents("# a comment\nagent pi joined " + hash + " http:web,tcp:mc:25565\n\nagent nas invited " + hash +
-                             " http:files  # trailing\n",
+    REQUIRE(parse_agents("# a comment\nagent pi joined " + hash + " http:web=idp:auth,tcp:mc:25565\n\nagent nas invited " +
+                             hash + " http:files  # trailing\n",
                          agents, why));
     REQUIRE(agents.size() == 2);
     CHECK(agents[0].name == "pi");
@@ -289,6 +289,8 @@ TEST_CASE("the agents file is read as written, and refuses what it cannot be")
     CHECK(agents[0].services.size() == 2);
     CHECK(agents[0].services[1].name == "mc");
     CHECK(agents[0].services[1].port == 25565);
+    CHECK(agents[0].services[0].auth == "idp:auth");
+    CHECK(agents[1].services[0].auth.empty());
     CHECK_FALSE(agents[1].joined);
     std::vector<agent> again;
     REQUIRE(parse_agents(render_agents(agents), again, why));
@@ -306,6 +308,8 @@ TEST_CASE("the agents file is read as written, and refuses what it cannot be")
     CHECK(refused("agent pi joined " + hash + " tcp:mc:0\n"));
     CHECK(refused("agent pi joined " + hash + " tcp:mc:70000\n"));
     CHECK(refused("agent pi joined " + hash + " http:web,http:web\n"));
+    CHECK(refused("agent pi joined " + hash + " http:web=\n"));
+    CHECK(refused("agent pi joined " + hash + " http:Web=idp:auth\n"));
     // A name or a port another agent has.
     CHECK(refused("agent pi joined " + hash + " http:web\nagent nas joined " + hash + " http:web\n"));
     CHECK(refused("agent pi joined " + hash + " tcp:a:2000\nagent nas joined " + hash + " tcp:b:2000\n"));
@@ -315,8 +319,10 @@ TEST_CASE("services, credentials and names")
 {
     std::vector<service> s;
     std::string why;
-    REQUIRE(parse_services("web, files", "mc:25565", s, why));
+    REQUIRE(parse_services("web, files=bearer:/etc/tokens", "mc:25565", s, why));
     CHECK(s.size() == 3);
+    CHECK((s[0].auth.empty() && s[1].name == "files" && s[1].auth == "bearer:/etc/tokens"));
+    CHECK_FALSE(parse_services("files=", "", s, why));
     CHECK_FALSE(parse_services("", "", s, why));
     CHECK_FALSE(parse_services("Web", "", s, why));
     CHECK_FALSE(parse_services("", "mc", s, why));

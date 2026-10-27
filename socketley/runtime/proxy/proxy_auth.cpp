@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstring>
 #include <fstream>
@@ -18,6 +19,7 @@
 #include "../../shared/util/base64.h"
 #include "../../shared/crypto/mac.h"
 #include "../../shared/http/http_framing.h"
+#include "../../shared/net/peer_address.h"
 
 namespace
 {
@@ -231,4 +233,94 @@ proxy_auth::verdict proxy_auth::check(std::string_view authorization, std::strin
     m_misses.missed(key, now);
     LOG_WARN(("proxy " + m_runtime + ": authorization refused from " + std::string(client)).c_str());
     return verdict::refuse;
+}
+
+proxy_auth::request_verdict proxy_auth::decide(std::string_view head, std::string_view peer, bool tls,
+                                               std::string_view method, std::string_view path, std::string_view host)
+{
+    request_verdict v;
+    int fields = 0;
+    const std::string_view authorization = http_request_field(head, "authorization", fields);
+    // Behind the entrance, a hop on this machine, the client is who it says it heard from last.
+    std::string client(peer);
+    if (socketley::is_loopback(client))
+    {
+        int xff_fields = 0;
+        const std::string_view xff = http_last_forwarded_hop(http_request_field(head, "x-forwarded-for", xff_fields));
+        if (xff_fields == 1 && !xff.empty())
+            client.assign(xff);
+    }
+    if (client.empty())
+        client = "local";
+    if (!idp())
+    {
+        int64_t retry_after = 0;
+        const verdict r = check(fields > 1 ? std::string_view("-") : authorization, client, retry_after);
+        v.pass = r == verdict::pass;
+        if (r == verdict::barred)
+        {
+            v.status = "429 Too Many Requests";
+            v.body = "Too many failed authorizations from this address; try again later.\n";
+            v.headers = "Retry-After: " + std::to_string(retry_after) + "\r\n";
+        }
+        else if (!v.pass)
+        {
+            v.status = "401 Unauthorized";
+            v.body = "Unauthorized\n";
+            v.headers = m_challenge;
+        }
+        return v;
+    }
+
+    // A sign-in an idp keeps: the cookie verified here, a browser without one sent to sign in and back, and anything
+    // else told 401.
+    std::string cookies;
+    for (size_t pos = head.find("\r\n"); pos != std::string_view::npos && pos + 2 < head.size();)
+    {
+        const size_t nl = head.find("\r\n", pos + 2);
+        const std::string_view line = head.substr(pos + 2, (nl == std::string_view::npos ? head.size() : nl) - pos - 2);
+        pos = nl;
+        if (header_name_equals(line, "cookie", 6))
+        {
+            if (!cookies.empty())
+                cookies += "; ";
+            cookies.append(http_trim_ows(line.substr(7)));
+        }
+    }
+    if (check_session(cookies, v.sub, v.username, v.email) == verdict::pass)
+    {
+        v.pass = true;
+        return v;
+    }
+    int accept_fields = 0, proto_fields = 0, host_fields = 0;
+    const std::string_view accept = http_request_field(head, "accept", accept_fields);
+    // The Host field whole, its port too, which the name a caller keeps for routing has lost.
+    const std::string_view whole_host = http_trim_ows(http_request_field(head, "host", host_fields));
+    const bool browser = (method == "GET" || method == "HEAD") && accept.find("text/html") != std::string_view::npos &&
+                         host_fields == 1 && !host.empty();
+    if (browser)
+    {
+        // The scheme the browser used: this hop's own, or what the entrance in front of it says it was.
+        std::string_view scheme = tls ? "https" : "http";
+        if (socketley::is_loopback(client) || socketley::is_loopback(peer))
+            if (const std::string_view p = http_trim_ows(http_request_field(head, "x-forwarded-proto", proto_fields));
+                proto_fields == 1 && (p == "https" || p == "http"))
+                scheme = p;
+        const bool host_ok = !whole_host.empty() && std::all_of(whole_host.begin(), whole_host.end(), [](char ch) {
+            return std::isalnum(static_cast<unsigned char>(ch)) || ch == '.' || ch == '-' || ch == ':' || ch == '[' ||
+                   ch == ']';
+        });
+        const std::string back = std::string(scheme) + "://" + std::string(host_ok ? whole_host : host) +
+                                 std::string(path);
+        if (const std::string to = login_url(back); !to.empty())
+        {
+            v.status = "302 Found";
+            v.headers = "Location: " + to + "\r\nCache-Control: no-store\r\n";
+            return v;
+        }
+    }
+    v.status = "401 Unauthorized";
+    v.body = "Sign in first.\n";
+    v.headers = "WWW-Authenticate: Bearer realm=\"" + m_runtime + "\"\r\n";
+    return v;
 }

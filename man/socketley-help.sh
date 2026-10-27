@@ -483,10 +483,12 @@ cli_commands() {
     echo -e "  ${CYAN}socketley ssh-cert auth.example.com${NC}"
     echo ""
 
-    echo -e "${BOLD}tunnel <edge> invite|set <agent> --http <names> --tcp <name:port> | list | revoke <agent>${NC}"
+    echo -e "${BOLD}tunnel <edge> invite|set <agent> --http <name[=auth],...> --tcp <name:port> | list | revoke <agent>${NC}"
     echo "  The agents a tunnel edge takes: invite prints an invitation used"
-    echo "  once, set changes what an agent offers, revoke cuts it off."
-    echo -e "  ${CYAN}socketley tunnel t invite pi --http home --tcp mc:25565${NC}"
+    echo "  once, set changes what an agent offers, revoke cuts it off. An HTTP"
+    echo "  service named <name>=<auth> asks every visitor's request for it, as"
+    echo "  a proxy's --auth does (idp:<idp>, bearer:<file>, basic:<file>)."
+    echo -e "  ${CYAN}socketley tunnel t invite pi --http home=idp:auth --tcp mc:25565${NC}"
     echo ""
 
     echo -e "${BOLD}tunnel connect <edge> <host:port> --idp <idp> | tunnel ssh <edge> --idp <idp>${NC}"

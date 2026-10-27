@@ -22,6 +22,7 @@
 #include "../runtime/idp/idp_instance.h"
 #include "../runtime/tunnel/tunnel_instance.h"
 #include "../runtime/tunnel/tunnel_registry.h"
+#include "../runtime/proxy/proxy_auth.h"
 #include "../runtime/db/db_instance.h"
 #include "../runtime/mqtt/mqtt_command.h"
 #include "../shared/util/base64.h"
@@ -3642,8 +3643,12 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
         {
             out += a.name + (a.joined ? "\tjoined\t" : "\tinvited\t");
             for (size_t i = 0; i < a.services.size(); ++i)
-                out += (i ? "," : "") + (a.services[i].http ? a.services[i].name
-                                                            : a.services[i].name + ":" + std::to_string(a.services[i].port));
+            {
+                const tn::service& s = a.services[i];
+                if (i)
+                    out += ',';
+                out += s.http ? s.name + (s.auth.empty() ? "" : "=" + s.auth) : s.name + ":" + std::to_string(s.port);
+            }
             out += "\n";
         }
         conn->write_buf = out;
@@ -3693,6 +3698,12 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf = why + "\n";
             return 1;
         }
+        for (const tn::service& s : a.services)
+            if (const std::string bad = s.auth.empty() ? std::string() : proxy_auth::spec_error(s.auth); !bad.empty())
+            {
+                conn->write_buf = "--http " + s.name + ": " + bad + "\n";
+                return 1;
+            }
         // An invitation's secret goes to the agent once, in this answer; the file keeps its hash.
         const std::string secret = invite ? socketley::random_b64url(32) : std::string();
         a.secret_hash = invite ? tn::hash_secret(secret) : std::string();

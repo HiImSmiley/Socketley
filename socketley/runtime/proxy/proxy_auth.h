@@ -55,6 +55,20 @@ public:
     // The WWW-Authenticate field a refusal carries, with its line end.
     const std::string& challenge() const { return m_challenge; }
 
+    // What one request is told: let through, with who signed in for an idp:<runtime> --auth, or the answer that
+    // refuses it -- its status line's text, body, and header lines each with its line end.
+    struct request_verdict
+    {
+        bool pass{false};
+        std::string status, body, headers;
+        std::string sub, username, email;
+    };
+    // The request whose head runs from its request line to the blank line, from the socket's `peer` address, over
+    // TLS here or not; `method`, `path` and `host` are what the caller read off it, and a hop on this machine is
+    // believed about the client and the scheme it used.
+    request_verdict decide(std::string_view head, std::string_view peer, bool tls, std::string_view method,
+                           std::string_view path, std::string_view host);
+
     // Failures from one address that bar it, and for how long from the first of them.
     static constexpr uint32_t tries = 5;
     static constexpr std::chrono::minutes window{15};

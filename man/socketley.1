@@ -1133,7 +1133,7 @@ socketley idp\-ssh auth host\-sign /etc/ssh/ssh_host_ed25519_key.pub \-\-names s
 .fi
 .RE
 .TP
-.BI "tunnel " "edge" " invite\fR|\fBset " agent " \fR[\fB\-\-http \fIname,...\fR] [\fB\-\-tcp \fIname\fB:\fIport,...\fR]"
+.BI "tunnel " "edge" " invite\fR|\fBset " agent " \fR[\fB\-\-http \fIname\fR[\fB=\fIauth\fR]\fI,...\fR] [\fB\-\-tcp \fIname\fB:\fIport,...\fR]"
 .TQ
 .BI "tunnel " edge " list\fR|\fBrevoke \fIagent"
 The agents a tunnel edge takes:
@@ -1141,7 +1141,12 @@ The agents a tunnel edge takes:
 prints an invitation, used once, for an agent to offer the services named
 (an HTTP one at
 .IB name . domain ,
-a TCP one on its port), and invited again an agent takes a new one;
+a TCP one on its port), and invited again an agent takes a new one; an HTTP
+service with
+.BI = auth
+asks each of its visitors for it, as a proxy's
+.B \-\-auth
+does;
 .B set
 changes what it offers and keeps its key;
 .B revoke
@@ -1150,7 +1155,7 @@ cuts it off. See
 .RS
 .PP
 .nf
-socketley tunnel t invite pi \-\-http home,nas \-\-tcp mc:25565
+socketley tunnel t invite pi \-\-http home=idp:auth,nas \-\-tcp mc:25565
 .fi
 .RE
 .TP
@@ -11605,7 +11610,18 @@ and
 .BR _queued_bytes ,
 the rest
 .B socketley_mail_stat
-by name.
+by name. A tunnel's are
+.B socketley_tunnel_links
+and
+.B _agents
+as gauges, and
+.BR socketley_tunnel_streams_total ,
+.BR _refused_total ,
+.B _visitors_refused_total
+(requests a protected service's auth refused),
+.B _bytes_in_total
+and
+.BR _bytes_out_total .
 .SS Lua
 A script attached with
 .B \-\-lua
@@ -14039,6 +14055,25 @@ entrance's certificate, and the dns runtime answers the name by the edge's
 wildcard. A TCP service is a port on the edge, here 25565. The edge says
 nothing about a stream it carries: what reaches the agent is what the visitor
 sent, and the service answers as if they were on the same machine.
+.PP
+.B Who may visit.
+An HTTP service invited as
+.IB name = auth
+lets through only the requests
+.I auth
+admits, with what a proxy's
+.B \-\-auth
+takes:
+.BI idp: runtime
+sends a browser to sign in and back,
+.BI bearer: file
+and
+.BI basic: file
+ask for a token or a key. Every request is asked, not only a connection's
+first, since the entrance hands one connection to the edge from visitor to
+visitor; nothing of a refused request reaches the agent, a body is carried as
+a body and never read as the next request, and a connection whose upgrade the
+service refused ends with that answer. A TCP service is the agent's to guard.
 .PP
 Each connection is a multiplexed link (one TLS connection, many streams, each
 with its own credit so one slow reader holds back only its own stream), opened

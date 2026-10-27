@@ -1011,7 +1011,6 @@ private:
     // --auth asked of a parsed request, answered here (401, or 429 for an address that keeps failing) when it
     // refuses, and false then.
     bool auth_admits(proxy_client_connection* conn);
-    bool session_admits(proxy_client_connection* conn, std::string_view head, std::string_view client);
     // --redirect-https's answer to a parsed request.
     void answer_https_redirect(proxy_client_connection* conn);
     // The one answer for a request that will never reach a backend, where 502

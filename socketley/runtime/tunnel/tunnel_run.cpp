@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "../idp/idp_session.h"
+#include "../proxy/proxy_auth.h"
 #include "../../shared/http/request_head.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/net/endpoint.h"
@@ -144,8 +145,11 @@ void link::on_data(uint32_t stream, std::string_view bytes)
     const auto g = leg_of(stream);
     if (!g || g->dead)
         return;
+    if (g->await_101)
+        run.upgrade_answered(g, bytes);
     g->out.append(bytes);
     g->unacked += bytes.size();
+    run.m_c.bytes_out += bytes.size();
     g->srv->flush(g);
 }
 
@@ -154,7 +158,7 @@ void link::on_close(uint32_t stream)
     if (const auto g = leg_of(stream))
     {
         g->far_closed = true;
-        run.leg_done_writing(*g);
+        run.leg_done_writing(g);
     }
 }
 
@@ -179,33 +183,48 @@ void link::on_goaway(std::string_view) {}
 leg_hooks::leg_hooks(tunnel_run& r, std::string a, service sv)
     : run(r), agent(std::move(a)), svc(std::move(sv)), srv(r.m_loop, &r, r.m_owner, *this, max_legs)
 {
+    if (svc.http && !svc.auth.empty())
+    {
+        auth = std::make_unique<proxy_auth>();
+        auth->configure(svc.auth, r.m_owner.get_name());
+    }
 }
+
+leg_hooks::~leg_hooks() = default;
 
 std::shared_ptr<http::server_conn> leg_hooks::make_conn()
 {
     auto g = std::make_shared<leg>();
     g->srv = &srv;
+    g->gated = auth != nullptr;
     return g;
 }
 
 void leg_hooks::serve(const std::shared_ptr<http::server_conn>& c)
 {
-    run.pump(static_cast<leg&>(*c));
+    const auto g = std::static_pointer_cast<leg>(c);
+    if (g->gated)
+        run.gate(*this, g);
+    else
+        run.pump(*g);
 }
 
 void leg_hooks::accepted(const std::shared_ptr<http::server_conn>& c)
 {
-    run.visitor(*this, std::static_pointer_cast<leg>(c));
+    // A protected service's stream is opened by the first request its auth lets through.
+    const auto g = std::static_pointer_cast<leg>(c);
+    if (!g->gated && !run.visitor(*this, g))
+        srv.close_conn(g);
 }
 
 bool leg_hooks::written(const std::shared_ptr<http::server_conn>& c)
 {
-    auto& g = static_cast<leg&>(*c);
-    if (g.l && g.unacked)
+    const auto g = std::static_pointer_cast<leg>(c);
+    if (g->l && g->unacked)
     {
-        g.l->s.consumed(g.stream, g.unacked, g.l->out);
-        g.unacked = 0;
-        run.flush_link(*g.l);
+        g->l->s.consumed(g->stream, g->unacked, g->l->out);
+        g->unacked = 0;
+        run.flush_link(*g->l);
     }
     run.leg_done_writing(g);
     return false;
@@ -225,10 +244,18 @@ void leg_hooks::closing(const std::shared_ptr<http::server_conn>& c)
 
 bool leg_hooks::read_ended(const std::shared_ptr<http::server_conn>& c)
 {
-    auto& g = static_cast<leg&>(*c);
+    const auto g = std::static_pointer_cast<leg>(c);
     // What was read before the end goes first, and the close after it once it has.
-    g.near_closed = true;
-    run.pump(g);
+    g->near_closed = true;
+    if (g->gated)
+    {
+        // A visitor no request of which went on has nothing to wait for, unless its refusal is still being written.
+        if (!g->l)
+            return g->refused || !g->refusal.empty();
+        run.gate(*this, g);
+    }
+    else
+        run.pump(*g);
     run.leg_done_writing(g);
     return true;
 }
@@ -244,32 +271,50 @@ void tunnel_run::pump(leg& g)
     if (!g.l || !g.l->s.is_open(g.stream))
     {
         g.in.clear();
+        g.cleared = 0;
         return;
     }
-    const size_t n = g.l->s.send(g.stream, g.in, g.l->out);
+    const size_t limit = g.gated ? g.cleared : g.in.size();
+    const size_t n = g.l->s.send(g.stream, std::string_view(g.in).substr(0, limit), g.l->out);
     g.in.erase(0, n);
+    if (g.gated)
+        g.cleared -= n;
+    m_c.bytes_in += n;
     // A stream out of credit stops its socket being read until the far side gives more.
-    g.waiting = !g.in.empty();
+    g.waiting = g.gated ? g.cleared != 0 || !g.refusal.empty() : !g.in.empty();
     flush_link(*g.l);
-    if (g.near_closed && g.in.empty())
+    if (g.near_closed && (g.gated ? g.cleared == 0 : g.in.empty()))
     {
         g.l->s.close(g.stream, g.l->out);
         flush_link(*g.l);
     }
 }
 
-void tunnel_run::leg_done_writing(leg& g)
+void tunnel_run::leg_done_writing(const std::shared_ptr<leg>& g)
 {
-    if (g.dead || g.cn_pending || g.unsent() != 0)
+    if (g->dead || g->cn_pending || g->unsent() != 0)
         return;
-    if (g.far_closed && !g.shut && g.fd >= 0)
+    // The refusal goes once the far side has answered everything before it, or at once when nothing went there.
+    if (!g->refusal.empty() && (g->far_closed || !g->l))
     {
-        ::shutdown(g.fd, SHUT_WR);
-        g.shut = true;
+        g->out += g->refusal;
+        g->refusal.clear();
+        g->refused = true;
+        g->srv->flush(g);
+        return;
     }
-    if (g.far_closed && g.near_closed && g.l)
-        if (const auto it = g.l->legs.find(g.stream); it != g.l->legs.end())
-            g.srv->close_conn(it->second);
+    if (g->refused)
+    {
+        g->srv->close_conn(g);
+        return;
+    }
+    if (g->far_closed && !g->shut && g->fd >= 0)
+    {
+        ::shutdown(g->fd, SHUT_WR);
+        g->shut = true;
+    }
+    if (g->far_closed && g->near_closed && g->l)
+        g->srv->close_conn(g);
 }
 
 void tunnel_run::dial_leg(link& l, uint32_t stream, std::string_view target)
@@ -504,7 +549,8 @@ std::string tunnel_run::stats() const
     return std::string("mode:") + (m_edge ? "edge" : "agent") + "\nlinks:" + std::to_string(links) +
            "\nagents:" + std::to_string(m_agents.size()) + "\nlinks_made:" + std::to_string(m_c.links) +
            "\nstreams:" + std::to_string(m_c.streams) + "\nrefused:" + std::to_string(m_c.refused) +
-           "\njoined:" + std::to_string(m_c.joined) + "\n";
+           "\njoined:" + std::to_string(m_c.joined) + "\nvisitors_refused:" + std::to_string(m_c.visitors_refused) +
+           "\nbytes_in:" + std::to_string(m_c.bytes_in) + "\nbytes_out:" + std::to_string(m_c.bytes_out) + "\n";
 }
 
 // ─── The edge ───────────────────────────────────────────────────────────────
@@ -597,14 +643,14 @@ void tunnel_run::reload_agents()
         return;
     }
     m_agents_mtime = mtime;
-    // A service gone, or moved to another agent or port, takes its listener with it.
+    // A service gone, moved, or asking its visitors for another auth takes its listener with it.
     for (auto it = m_listeners.begin(); it != m_listeners.end();)
     {
         bool kept = false;
         for (const agent& a : agents)
             for (const service& s : a.services)
                 kept = kept || (a.name == it->second->agent && s.name == it->first && s.http == it->second->svc.http &&
-                                s.port == it->second->svc.port);
+                                s.port == it->second->svc.port && s.auth == it->second->svc.auth);
         if (kept)
         {
             ++it;
@@ -776,10 +822,10 @@ void tunnel_run::upgraded(const std::shared_ptr<http::server_conn>& c, link::kin
     flush_link(*l);
 }
 
-void tunnel_run::visitor(leg_hooks& h, const std::shared_ptr<leg>& g)
+bool tunnel_run::visitor(leg_hooks& h, const std::shared_ptr<leg>& g)
 {
     if (h.agent.empty())
-        return;
+        return true;
     const auto it = m_agent_links.find(h.agent);
     const auto l = it == m_agent_links.end() ? nullptr : it->second.lock();
     const uint32_t stream = l ? l->s.open(h.svc.name, peer_text(g->peer), l->out) : 0;
@@ -787,14 +833,126 @@ void tunnel_run::visitor(leg_hooks& h, const std::shared_ptr<leg>& g)
     {
         // Nobody to carry it to: the agent is not connected.
         ++m_c.refused;
-        h.srv.close_conn(g);
-        return;
+        return false;
     }
     g->l = l.get();
     g->stream = stream;
     l->legs[stream] = g;
     ++m_c.streams;
     flush_link(*l);
+    return true;
+}
+
+void tunnel_run::refuse_visitor(const std::shared_ptr<leg>& g, std::string_view status, std::string_view body,
+                                std::string_view headers)
+{
+    ++m_c.visitors_refused;
+    g->refusal = "HTTP/1.1 " + std::string(status) + "\r\nContent-Type: text/plain\r\nContent-Length: " +
+                 std::to_string(body.size()) + "\r\nConnection: close\r\n" + std::string(headers) + "\r\n" +
+                 std::string(body);
+    // Nothing after what already passed goes on, and the stream ends behind it so the far side answers and closes.
+    g->in.resize(g->cleared);
+    g->near_closed = true;
+    g->waiting = true;
+    pump(*g);
+    leg_done_writing(g);
+}
+
+void tunnel_run::upgrade_answered(const std::shared_ptr<leg>& g, std::string_view bytes)
+{
+    constexpr std::string_view switched = "HTTP/1.1 101";
+    g->answer.append(bytes.substr(0, switched.size() - g->answer.size()));
+    if (g->answer.size() < switched.size() && switched.starts_with(g->answer))
+        return;
+    g->await_101 = false;
+    if (g->answer == switched)
+        return;
+    // Refused the upgrade: the visitor's connection ends with this answer, so no request after it goes on unasked.
+    g->raw = false;
+    g->in.clear();
+    g->cleared = 0;
+    g->near_closed = true;
+    pump(*g);
+}
+
+void tunnel_run::gate(leg_hooks& h, const std::shared_ptr<leg>& g)
+{
+    while (!g->refused && g->refusal.empty() && g->cleared < g->in.size())
+    {
+        std::string_view rest = std::string_view(g->in).substr(g->cleared);
+        if (g->raw)
+        {
+            g->cleared = g->in.size();
+            break;
+        }
+        if (g->body_left)
+        {
+            const size_t k = std::min(g->body_left, rest.size());
+            g->cleared += k;
+            g->body_left -= k;
+            continue;
+        }
+        if (g->chunked)
+        {
+            std::string_view piece;
+            const size_t before = rest.size();
+            const chunk_step step = http_chunked_next(g->chunks, rest, piece);
+            g->cleared += before - rest.size();
+            if (step == chunk_step::done)
+                g->chunked = false;
+            else if (step == chunk_step::bad)
+                refuse_visitor(g, "400 Bad Request", "Bad Request\n", {});
+            else if (step == chunk_step::need_more)
+                break;
+            continue;
+        }
+        // A request's head, asked of the auth whole before any byte of it goes on.
+        const size_t end = rest.find("\r\n\r\n");
+        if (end == std::string_view::npos)
+        {
+            if (rest.size() > max_head)
+                refuse_visitor(g, "431 Request Header Fields Too Large", "Request Header Fields Too Large\n", {});
+            break;
+        }
+        const std::string_view head = rest.substr(0, end + 2);
+        const size_t line_end = head.find("\r\n");
+        const std::string_view line = head.substr(0, line_end);
+        const size_t sp1 = line.find(' ');
+        const size_t sp2 = sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
+        const http_request_framing_scan scan = http_scan_request_headers(head.substr(line_end + 2));
+        if (end + 4 > max_head || !http_eol_framing_ok(head, true) || sp2 == std::string_view::npos ||
+            !scan.ok)
+        {
+            refuse_visitor(g, "400 Bad Request", "Bad Request\n", {});
+            break;
+        }
+        const std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
+        int host_fields = 0;
+        const std::string_view host = http_request_field(head, "host", host_fields);
+        // The entrance on this machine is the only one that reaches a service's socket, and it is believed.
+        proxy_auth::request_verdict v = h.auth->decide(head, "127.0.0.1", false, line.substr(0, sp1),
+                                                       target.substr(0, target.find('?')),
+                                                       host_fields == 1 ? host : std::string_view());
+        if (!v.pass)
+        {
+            refuse_visitor(g, v.status, v.body, v.headers);
+            break;
+        }
+        if (!g->l && !visitor(h, g))
+        {
+            refuse_visitor(g, "502 Bad Gateway", "The machine serving this is not connected.\n", {});
+            break;
+        }
+        g->cleared += end + 4;
+        int upgrade_fields = 0;
+        g->raw = !http_request_field(head, "upgrade", upgrade_fields).empty();
+        g->await_101 = g->raw;
+        g->answer.clear();
+        g->chunked = scan.chunked;
+        g->chunks = http_chunked_decoder{};
+        g->body_left = scan.chunked ? 0 : scan.content_length;
+    }
+    pump(*g);
 }
 
 // ─── The agent ──────────────────────────────────────────────────────────────

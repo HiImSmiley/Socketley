@@ -15,12 +15,14 @@
 #include "tunnel_registry.h"
 #include "../../shared/crypto/tls_context.h"
 #include "../../shared/http/conn_server.h"
+#include "../../shared/http/http_framing.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/net/async_resolver.h"
 #include "../../shared/net/tunnel_mux.h"
 
 class tunnel_instance;
+class proxy_auth;
 
 namespace socketley::idp
 {
@@ -46,6 +48,21 @@ struct leg : http::server_conn
     bool near_closed{false};
     bool shut{false};
     reset_code why{reset_code::gone};
+
+    // A protected service's visitor: each request is asked of the listener's auth before any of it goes on, and only
+    // the bytes at the front of `in` that a request let through frames (`cleared`) are sent.
+    bool gated{false};
+    size_t cleared{0};
+    size_t body_left{0};
+    bool chunked{false};
+    http_chunked_decoder chunks{};
+    // Upgraded past HTTP, after which everything goes on unasked, once the far side's answer begins with a 101.
+    bool raw{false};
+    bool await_101{false};
+    std::string answer;
+    // A refusal, written once the far side has answered all that went before it, and the visitor closed after.
+    std::string refusal;
+    bool refused{false};
 };
 
 // One multiplexed connection: an agent or a person at the edge, or the edge at an agent.
@@ -91,10 +108,13 @@ class leg_hooks : public http::conn_hooks
 {
 public:
     leg_hooks(tunnel_run& run, std::string agent, service svc);
+    ~leg_hooks() override;
     tunnel_run& run;
     // The agent and service a listener's visitors are carried to; empty for a dialler.
     const std::string agent;
     const service svc;
+    // What a protected HTTP service asks of each request; null lets every visitor through.
+    std::unique_ptr<proxy_auth> auth;
     http::conn_server srv;
 
     std::shared_ptr<http::server_conn> make_conn() override;
@@ -165,7 +185,7 @@ private:
     void drop_link(link& l);
     // The leg's buffered bytes handed to its stream as far as the credit goes.
     void pump(leg& g);
-    void leg_done_writing(leg& g);
+    void leg_done_writing(const std::shared_ptr<leg>& g);
     // A leg to `target` (`host:port`) for a stream the far side opened, refused when it cannot be begun.
     void dial_leg(link& l, uint32_t stream, std::string_view target);
 
@@ -177,8 +197,15 @@ private:
     void refuse_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view why);
     void upgraded(const std::shared_ptr<http::server_conn>& c, link::kind k, std::string who,
                   std::string_view extra_headers);
-    // A visitor on a service's listener, carried to the agent offering it.
-    void visitor(leg_hooks& h, const std::shared_ptr<leg>& g);
+    // A visitor on a service's listener, carried to the agent offering it; false when the agent is not connected.
+    bool visitor(leg_hooks& h, const std::shared_ptr<leg>& g);
+    // A protected service's visitor's requests asked of its auth, as far as they have come, and what passed sent.
+    void gate(leg_hooks& h, const std::shared_ptr<leg>& g);
+    // The far side's first bytes after an upgrade a visitor asked for, which must be its 101.
+    void upgrade_answered(const std::shared_ptr<leg>& g, std::string_view bytes);
+    // The visitor told `status` once everything before it is answered, then closed.
+    void refuse_visitor(const std::shared_ptr<leg>& g, std::string_view status, std::string_view body,
+                        std::string_view headers);
 
     // ── the agent ──
     bool start_agent(std::string& why);
@@ -222,7 +249,7 @@ private:
 
     struct counters
     {
-        uint64_t links{0}, refused{0}, streams{0}, joined{0};
+        uint64_t links{0}, refused{0}, streams{0}, joined{0}, visitors_refused{0}, bytes_in{0}, bytes_out{0};
     } m_c;
 };
 

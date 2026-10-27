@@ -6,7 +6,8 @@
 // ─── THE FILE ───────────────────────────────────────────────────────────────
 //   <state>/tunnel/<edge>/agents, a line each:
 //     agent <name> invited|joined <sha256 hex of the secret> <service>[,<service>...]
-//   a service `http:<name>`, reached at <name>.<the edge's domain>, or `tcp:<name>:<port>`, a port on the edge.
+//   a service `http:<name>`, reached at <name>.<the edge's domain> and with `=<auth>` only by visitors that auth
+//   admits, or `tcp:<name>:<port>`, a port on the edge.
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -21,6 +22,8 @@ struct service
     bool http{true};
     std::string name;
     uint16_t port{0};
+    // What an HTTP service asks of each request, as a proxy's --auth does; empty lets every visitor through.
+    std::string auth;
 };
 
 struct agent
@@ -47,7 +50,7 @@ bool valid_name(std::string_view name);
 bool parse_agents(std::string_view text, std::vector<agent>& out, std::string& why);
 std::string render_agents(const std::vector<agent>& agents);
 
-// `--http a,b --tcp c:25565` as services; false with `why` for a bad name or port.
+// `--http a,b=idp:auth --tcp c:25565` as services; false with `why` for a bad name or port.
 bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::vector<service>& out, std::string& why);
 
 // Why `a`'s services clash with another agent's, naming them twice or a port twice; empty when they do not.

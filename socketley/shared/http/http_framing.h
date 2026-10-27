@@ -6,6 +6,7 @@
 // un-pooled socket and the cost of guessing wrong is a client reading someone
 // else's data.
 
+#include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -125,6 +126,31 @@ inline std::string_view http_last_forwarded_hop(std::string_view xff)
     if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
         xff.remove_prefix(comma + 1);
     return http_trim_ows(xff);
+}
+
+// The value of field `lower` in a request's head, the last of them, with how many times it came.
+inline std::string_view http_request_field(std::string_view head, std::string_view lower, int& count)
+{
+    count = 0;
+    std::string_view value;
+    for (size_t p = head.find("\r\n"); p != std::string_view::npos && p + 2 < head.size();)
+    {
+        const size_t start = p + 2;
+        size_t nl = head.find("\r\n", start);
+        if (nl == std::string_view::npos)
+            nl = head.size();
+        const std::string_view line = head.substr(start, nl - start);
+        if (line.empty())
+            break;
+        if (line.size() > lower.size() && line[lower.size()] == ':' &&
+            std::equal(lower.begin(), lower.end(), line.begin(), [](char a, char b) { return http_lower_equals(b, a); }))
+        {
+            ++count;
+            value = http_trim_ows(line.substr(lower.size() + 1));
+        }
+        p = nl;
+    }
+    return value;
 }
 
 // The credentials an Authorization value carries after `scheme_lower`, a scheme RFC 9110 11.1 matches in any case,

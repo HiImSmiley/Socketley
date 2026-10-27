@@ -4637,120 +4637,26 @@ bool proxy_instance::append_backend_host_header(std::string& out,
     return true;
 }
 
-// The value of header `lower` in a request's head, with how many times it came.
-static std::string_view request_field(std::string_view head, std::string_view lower, int& count)
-{
-    count = 0;
-    std::string_view value;
-    for (size_t p = head.find("\r\n"); p != std::string_view::npos && p + 2 < head.size();)
-    {
-        const size_t start = p + 2;
-        size_t nl = head.find("\r\n", start);
-        if (nl == std::string_view::npos)
-            nl = head.size();
-        const std::string_view line = head.substr(start, nl - start);
-        if (line.empty())
-            break;
-        if (line.size() > lower.size() && line[lower.size()] == ':' &&
-            std::equal(lower.begin(), lower.end(), line.begin(), [](char a, char b) { return http_lower_equals(b, a); }))
-        {
-            ++count;
-            value = http_trim_ows(line.substr(lower.size() + 1));
-        }
-        p = nl;
-    }
-    return value;
-}
-
 bool proxy_instance::auth_admits(proxy_client_connection* conn)
 {
     const size_t end = conn->partial.find("\r\n\r\n");
     const std::string_view head(conn->partial.data(), end == std::string::npos ? conn->partial.size() : end + 2);
-    int fields = 0;
-    const std::string_view authorization = request_field(head, "authorization", fields);
-    // Behind the entrance, a hop on this machine, the client is who it says it heard from last.
     if (conn->peer_addr.empty() && !conn->peer_probed && conn->fd >= 0)
     {
         conn->peer_addr   = peer_ip(conn->fd);
         conn->peer_probed = true;
     }
-    std::string client = conn->peer_addr;
-    if (socketley::is_loopback(client))
-    {
-        int xff_fields = 0;
-        const std::string_view xff = http_last_forwarded_hop(request_field(head, "x-forwarded-for", xff_fields));
-        if (xff_fields == 1 && !xff.empty())
-            client.assign(xff);
-    }
-    if (client.empty())
-        client = "local";
+    proxy_auth::request_verdict v = m_auth.decide(head, conn->peer_addr, conn->tls(), conn->ex.method,
+                                                  conn->ex.path, conn->ex.host_fields == 1 ? conn->ex.host : "");
     if (m_auth.idp())
-        return session_admits(conn, head, client);
-    int64_t retry_after = 0;
-    const auto v = m_auth.check(fields > 1 ? std::string_view("-") : authorization, client, retry_after);
-    if (v == proxy_auth::verdict::pass)
-        return true;
-    if (v == proxy_auth::verdict::barred)
-        send_error(conn, "429 Too Many Requests", "Too many failed authorizations from this address; try again later.\n",
-                   true, "Retry-After: " + std::to_string(retry_after) + "\r\n");
-    else
-        send_error(conn, "401 Unauthorized", "Unauthorized\n", true, m_auth.challenge());
-    return false;
-}
-
-// A sign-in an idp keeps: the cookie verified here, a browser without one sent to sign in and back, and anything
-// else told 401.
-bool proxy_instance::session_admits(proxy_client_connection* conn, std::string_view head, std::string_view client)
-{
-    std::string cookies;
-    for (size_t pos = head.find("\r\n"); pos != std::string_view::npos && pos + 2 < head.size();)
     {
-        const size_t nl = head.find("\r\n", pos + 2);
-        const std::string_view line = head.substr(pos + 2, (nl == std::string_view::npos ? head.size() : nl) - pos - 2);
-        pos = nl;
-        if (header_name_equals(line, "cookie", 6))
-        {
-            if (!cookies.empty())
-                cookies += "; ";
-            cookies.append(http_trim_ows(line.substr(7)));
-        }
+        conn->auth_user = std::move(v.sub);
+        conn->auth_name = std::move(v.username);
+        conn->auth_email = std::move(v.email);
     }
-    conn->auth_user.clear();
-    conn->auth_name.clear();
-    conn->auth_email.clear();
-    if (m_auth.check_session(cookies, conn->auth_user, conn->auth_name, conn->auth_email) == proxy_auth::verdict::pass)
+    if (v.pass)
         return true;
-    int accept_fields = 0, proto_fields = 0;
-    const std::string_view accept = request_field(head, "accept", accept_fields);
-    const bool browser = (conn->ex.method == "GET" || conn->ex.method == "HEAD") &&
-                         accept.find("text/html") != std::string_view::npos && conn->ex.host_fields == 1 &&
-                         !conn->ex.host.empty();
-    if (browser)
-    {
-        // The scheme the browser used: this proxy's own, or what the entrance in front of it says it was.
-        std::string_view scheme = conn->tls() ? "https" : "http";
-        if (socketley::is_loopback(std::string(client)) || socketley::is_loopback(conn->peer_addr))
-            if (const std::string_view p = http_trim_ows(request_field(head, "x-forwarded-proto", proto_fields));
-                proto_fields == 1 && (p == "https" || p == "http"))
-                scheme = p;
-        // The Host field whole, its port too, which the name ex.host keeps for routing has lost.
-        int host_fields = 0;
-        const std::string_view host = http_trim_ows(request_field(head, "host", host_fields));
-        const bool host_ok = host_fields == 1 && !host.empty() &&
-                             std::all_of(host.begin(), host.end(), [](char ch) {
-                                 return std::isalnum(static_cast<unsigned char>(ch)) || ch == '.' || ch == '-' ||
-                                        ch == ':' || ch == '[' || ch == ']';
-                             });
-        const std::string back = std::string(scheme) + "://" + std::string(host_ok ? host : conn->ex.host) +
-                                 conn->ex.path;
-        if (const std::string to = m_auth.login_url(back); !to.empty())
-        {
-            send_error(conn, "302 Found", "", true, "Location: " + to + "\r\nCache-Control: no-store\r\n");
-            return false;
-        }
-    }
-    send_error(conn, "401 Unauthorized", "Sign in first.\n", true,
-               "WWW-Authenticate: Bearer realm=\"" + std::string(get_name()) + "\"\r\n");
+    send_error(conn, v.status, v.body, true, v.headers);
     return false;
 }
 
