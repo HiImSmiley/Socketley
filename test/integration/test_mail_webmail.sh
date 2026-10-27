@@ -377,6 +377,44 @@ PY
 session=$(via -H "Authorization: Basic $(printf 'bob:bobpassword12' | base64)" "https://webmail.example.test:$GATE/jmap/session")
 case "$session" in *'"apiUrl":"https://webmail.example.test'*) ok "behind it the session's URLs are the HTTPS it was reached over" ;;
     *) bad "behind it the session's URLs are the HTTPS it was reached over" "$(printf '%s' "$session" | head -c 300)" ;; esac
+# A tab come back to, over HTTP/2 through the entrance: its EventSource held, then its API calls at once, each one a
+# connect to the webmail the entrance has not pooled; their bodies wait on that connect and must still reach it.
+burst=$(python3 - "$GATE" <<'PY'
+import base64, json, socket, ssl, sys, time, h2.config, h2.connection, h2.events
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE; ctx.set_alpn_protocols(["h2"])
+s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5), server_hostname="webmail.example.test")
+c = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True)); c.initiate_connection(); s.sendall(c.data_to_send())
+auth = "Basic " + base64.b64encode(b"bob:bobpassword12").decode()
+st, ended = {}, set()
+def send(sid, method, path, body=b""):
+    hs = [(":method", method), (":scheme", "https"), (":authority", "webmail.example.test"), (":path", path),
+          ("authorization", auth), ("x-socketley-ui", "1")]
+    if body: hs += [("content-type", "application/json"), ("content-length", str(len(body)))]
+    c.send_headers(sid, hs, end_stream=not body)
+    if body: c.send_data(sid, body, end_stream=True)
+    s.sendall(c.data_to_send())
+def pump(until, limit):
+    s.settimeout(0.2); t = time.time()
+    while not until() and time.time() - t < limit:
+        try: d = s.recv(65536)
+        except socket.timeout: continue
+        if not d: break
+        for e in c.receive_data(d):
+            if isinstance(e, h2.events.ResponseReceived): st[e.stream_id] = dict(e.headers)[b":status"].decode()
+            if isinstance(e, h2.events.DataReceived): c.acknowledge_received_data(e.flow_controlled_length, e.stream_id)
+            if isinstance(e, (h2.events.StreamEnded, h2.events.StreamReset)): ended.add(e.stream_id)
+        s.sendall(c.data_to_send())
+send(1, "GET", "/jmap/session"); pump(lambda: 1 in ended, 5)
+send(3, "GET", "/jmap/eventsource?types=*&closeafter=no&ping=60"); pump(lambda: 3 in st, 5)
+body = json.dumps({"using": ["urn:ietf:params:jmap:core"], "methodCalls": [["Core/echo", {}, "a"]]}).encode()
+for sid in (5, 7, 9, 11):
+    send(sid, "POST", "/jmap/api", body)
+pump(lambda: all(x in ended for x in (5, 7, 9, 11)), 8)
+print(" ".join(st.get(x, "-") for x in (1, 3, 5, 7, 9, 11)))
+PY
+)
+[ "$burst" = "200 200 200 200 200 200" ] && ok "a tab's API calls at once beside its EventSource all reach the webmail through the entrance" \
+    || bad "a tab's API calls at once beside its EventSource all reach the webmail through the entrance" "$burst"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

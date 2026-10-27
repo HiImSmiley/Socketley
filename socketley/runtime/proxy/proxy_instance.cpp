@@ -9190,6 +9190,14 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
             conn->ex.saved_request.clear();
     }
 
+    // Body bytes that came while the connect was in flight wait in partial for a backend, and nothing else wakes them.
+    if (m_protocol == protocol_http && conn->ex.header_parsed && !conn->partial.empty() && !conn->closing &&
+        !conn->client_eof)
+    {
+        drive_client_request(conn, conn->fd);
+        return;
+    }
+
     // The client read was left unarmed until a backend existed, and is not
     // armed onto a socket that reported end of stream while the connect was in
     // flight.
