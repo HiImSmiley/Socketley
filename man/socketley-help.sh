@@ -1596,6 +1596,7 @@ flags_options() {
     echo "│ --offer <name=h:p,..>  │ What an agent carries streams to    │"
     echo "│ --forward <h:p,...>    │ Where an edge carries people        │"
     echo "│ --idp <idp>            │ Whose people may use --forward      │"
+    echo "│ --idp-audience <ids>   │ Their clients' tokens (socketley)   │"
     echo "└────────────────────────┴─────────────────────────────────────┘"
     echo ""
 

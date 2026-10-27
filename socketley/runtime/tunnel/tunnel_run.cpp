@@ -561,7 +561,8 @@ bool tunnel_run::start_edge(std::string& why)
     if (!m_owner.get_idp().empty())
     {
         m_idp = std::make_unique<socketley::idp::session_verifier>();
-        m_idp->configure(m_owner.get_idp(), m_owner.get_idp_audience());
+        const std::string_view audience = m_owner.get_idp_audience();
+        m_idp->configure(m_owner.get_idp(), audience.empty() ? socketley::idp::cli_client : audience);
     }
     m_front = std::make_unique<front_hooks>(*this);
     m_dial = std::make_unique<leg_hooks>(*this, std::string(), service{});

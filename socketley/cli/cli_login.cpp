@@ -17,6 +17,7 @@
 #include "../shared/json/json_escape.h"
 #include "../shared/loop/blocking_write.h"
 #include "../shared/persist/read_file.h"
+#include "../runtime/idp/idp_logic.h"
 
 namespace fs = std::filesystem;
 using socketley::json::json_reader;
@@ -26,8 +27,6 @@ using socketley::json::int_of;
 
 namespace
 {
-
-constexpr std::string_view default_client = "socketley-cli";
 
 int64_t now_s()
 {
@@ -205,7 +204,7 @@ bool cli_access_token(const std::string& given, std::string& token, std::string&
 
 int cli_login(int argc, char** argv)
 {
-    std::string given, client(default_client);
+    std::string given, client(socketley::idp::cli_client);
     for (int i = 2; i < argc; ++i)
     {
         const std::string_view a = argv[i];

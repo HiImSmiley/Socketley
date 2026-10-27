@@ -31,11 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once, in exchange for a key of its own; `set` changes what it offers,
   `revoke` cuts it off. An edge with `--forward` carries a person signed in at
   its `--idp` to the targets it names: `socketley tunnel ssh <edge> --idp
-  <idp>` as ssh's `ProxyCommand` reaches a server through port 443.
+  <idp>` as ssh's `ProxyCommand` reaches a server through port 443. It takes
+  the access tokens of the client `socketley login` signs in as, `socketley`,
+  unless `--idp-audience` names others.
 - **SSH by the sign-in.** An idp runtime with `--ssh-ca <hours>` is an SSH
   certificate authority: `socketley login <idp>` signs a person in from the
   command line by a code they allow in a browser (the device grant, RFC 8628,
-  for a client marked `device` in `--clients`), `socketley ssh-cert <idp>`
+  as the client `socketley`, marked `device` in `--clients`), `socketley ssh-cert <idp>`
   then gets a certificate for their key that holds that many hours and names
   their username, `root` for the admins group and each `ssh:<name>` group,
   and sshd takes it with `TrustedUserCAKeys`. `socketley idp-ssh <idp> ca`

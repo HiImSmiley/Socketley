@@ -157,7 +157,7 @@ constexpr row rows[] = {
     {"--offer", "U", "list", "Offers", "What an agent carries the edge's streams to: service=host:port each.", "Tunnel", {}, "pi=127.0.0.1:8123"},
     {"--forward", "U", "list", "Forward", "Where an edge carries a signed-in person's stream, as ssh's ProxyCommand asks.", "Tunnel", {}, "127.0.0.1:22"},
     {"--idp", "U", "text", "Identity provider", "The idp runtime whose signed-in people may use --forward.", "Tunnel", {}, "auth"},
-    {"--idp-audience", "U", "list", "Audiences", "The clients whose access tokens --forward takes.", "Tunnel", {}, "socketley-cli"},
+    {"--idp-audience", "U", "list", "Audiences", "The clients whose access tokens --forward takes.", "Tunnel", {}, "socketley"},
     {"--ssh-ca", "I", "int", "SSH certificates", "Signs SSH certificates for signed-in users, holding this many hours; off when not given.", "Identity", {}, "8"},
     {"--schema", "B", "path", "Schema", "The collections, a line each: name, access (private, owner, shared, public, catalog) and indexed fields.", "Database", {}, "/etc/socketley/db.schema"},
     {"--keys", "B", "path", "Keys", "Service keys a backend sends as Authorization: Bearer, name and secret a line.", "Database", {}, "/etc/socketley/db.keys"},

@@ -1069,7 +1069,7 @@ and
 .B tunnel
 act as that person, refreshing the access token when it runs out. The client
 is
-.B socketley\-cli
+.B socketley
 unless named; the provider allows the grant only to a client marked
 .B device
 in its
@@ -14113,10 +14113,11 @@ The idp runtime whose people may use
 .BR \-\-forward .
 .TP
 .BI "\-\-idp\-audience " client ,...
-The clients whose access tokens are taken, as
-.B socketley\-cli
-for
-.BR "socketley login" .
+The clients whose access tokens are taken;
+.B socketley
+(the client
+.B "socketley login"
+signs in as) when none is named.
 .PP
 A tunnel takes no
 .BR \-\-shards :

@@ -19,6 +19,7 @@
 
 #include "../shared/loop/blocking_write.h"
 #include "../shared/net/tunnel_mux.h"
+#include "../runtime/idp/idp_logic.h"
 
 namespace
 {
@@ -218,7 +219,7 @@ int connect_main(const std::string& edge, const std::string& target, const std::
     std::string out;
     ev.s = &s;
     ev.out = &out;
-    s.hello({{"person", "socketley-cli"}}, out);
+    s.hello({{"person", std::string(socketley::idp::cli_client)}}, out);
     ev.stream = s.open(target, {}, out);
     if (!leftover.empty() && !s.feed(leftover, out))
     {

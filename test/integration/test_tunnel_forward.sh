@@ -5,6 +5,7 @@
 #
 # What each part would catch:
 #   * a stream carried for someone with no access token, or one given to a client the edge does not take
+#   * an edge with no --idp-audience not taking what `socketley login` signs in as by default
 #   * a target the edge does not name reached, or a refusal not said
 #   * bytes lost between stdin, the edge, the target and stdout, or the end of stdin not reaching the target
 #   * ssh through the tunnel not getting in with its certificate
@@ -48,7 +49,7 @@ trap 'kill $ECHO 2>/dev/null; [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null
 daemon_start "$BIN"
 
 cat > "$T/clients" <<EOF
-cli - device ssh
+socketley - device ssh
 other - device
 EOF
 "$BIN" create idp auth -p "$PI" --clients "$T/clients" --issuer "$I" --ssh-ca 8 -s >/dev/null 2>&1 \
@@ -57,12 +58,12 @@ for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$I/jwks")
 "$BIN" idp-user auth add alice --password alicepassword1 >/dev/null 2>&1
 out=$("$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && case "$out" in *"--forward needs --idp"*) true ;; *) false ;; esac && ok || bad "--forward without --idp is refused" "rc $rc: $out"
-"$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX,127.0.0.1:$PS" --idp auth --idp-audience cli -s >/dev/null 2>&1 \
+"$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX,127.0.0.1:$PS" --idp auth -s >/dev/null 2>&1 \
     && ok || bad "an edge that forwards for the idp's people is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for _ in $(seq 1 50); do ss -ltn "sport = :$PE" | grep -q LISTEN && break; sleep 0.1; done
 
-login_as() {   # login_as <user> <password> <client> <config dir>
-    XDG_CONFIG_HOME="$4" "$BIN" login "$I" --client "$3" > "$T/login.out" 2>&1 &
+login_as() {   # login_as <user> <password> <client, or empty for the default> <config dir>
+    XDG_CONFIG_HOME="$4" "$BIN" login "$I" ${3:+--client "$3"} > "$T/login.out" 2>&1 &
     local pid=$!
     for _ in $(seq 1 50); do grep -q "allow the code" "$T/login.out" && break; sleep 0.1; done
     python3 - "$PI" "$(sed -n 's/^and allow the code //p' "$T/login.out")" "$1" "$2" <<'PY' >/dev/null 2>&1
@@ -87,7 +88,7 @@ PY
 
 out=$(printf 'hello' | "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"socketley login"*) true ;; *) false ;; esac && ok || bad "nobody signed in is told to sign in" "rc $rc: $out"
-login_as alice alicepassword1 cli "$T/alice" && ok || bad "alice signs in" "$(cat "$T/login.out")"
+login_as alice alicepassword1 "" "$T/alice" && ok || bad "alice signs in" "$(cat "$T/login.out")"
 export XDG_CONFIG_HOME="$T/alice"
 
 out=$(printf 'hello through the tunnel' | "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" 2>"$T/err"); rc=$?
