@@ -478,10 +478,17 @@ void tunnel_run::flush_link(link& l)
         l.out.clear();
         return;
     }
+    // The frames handed over whole when nothing waits before them, rather than copied behind nothing.
+    const auto hand_over = [&](std::string& to) {
+        if (to.empty())
+            to.swap(l.out);
+        else
+            to.append(l.out);
+        l.out.clear();
+    };
     if (m_edge)
     {
-        t->out.append(l.out);
-        l.out.clear();
+        hand_over(t->out);
         m_front->srv.flush(t);
         return;
     }
@@ -501,10 +508,7 @@ void tunnel_run::flush_link(link& l)
         tls_context::take_out(u.ssl, u.out);
     }
     else
-    {
-        u.out.append(l.out);
-        l.out.clear();
-    }
+        hand_over(u.out);
     m_up->srv.flush(t);
 }
 
