@@ -238,6 +238,10 @@ if phase == "main":
     st, body, _ = req("GET", "/account", cookie=cookie)
     check("the account page shows the signed-in account", (st, "alice" in body), (200, True))
     check("and sends one signed out to sign in", req("GET", "/account")[2].get("Location", "").startswith("/login"), True)
+    st, body, h = req("GET", "/login")
+    check("the sign-in page wears the storage interface's look, its aurora let in and still no script",
+          (st, 'class="lcard"' in body and "--grad:" in body, "img-src data:" in (h.get("Content-Security-Policy") or ""),
+           "<script" in body), (200, True, True, False))
     st, body, _ = req("POST", "/account", dict(name="Alice B", email="alice@example.com"), cookie=cookie)
     st, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + rt.get("access_token", "")})
     check("a name changed on the account page is what userinfo says", json.loads(body).get("name") if st == 200 else st, "Alice B")

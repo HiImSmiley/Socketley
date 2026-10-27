@@ -103,11 +103,12 @@ textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);f
     <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>socketley</div>
     <h1>Daemon</h1>
     <p class="mut" id="lsub">Sign in with an admin's access key.</p>
+    <a class="btn pri" id="lidp" hidden>Sign in with your account</a>
+    <div class="or" id="lor" hidden>or with an access key</div>
     <label for="lk">Access key</label><input class="inp" id="lk" autocomplete="username" required spellcheck="false">
     <label for="ls">Secret</label><input class="inp" id="ls" type="password" autocomplete="current-password" required>
     <div class="err" id="le"></div>
-    <button class="btn pri">Sign in</button>
-    <a class="btn" id="lidp" hidden>Sign in with your account</a>
+    <button class="btn pri" id="lsb">Sign in</button>
   </form>
 </div>
 <div id="app" hidden>
@@ -983,7 +984,7 @@ async function start() {
   // Without credentials configured the page only shows, and says how to change that.
   if (!s.configured) { me = { user: null }; start(); toast('Read only: set daemon.dashboard_credentials to sign in and change runtimes.', 'spark', 9000); return; }
   if (s.user) { me = { user: s.user, idp_logout: s.idp_logout }; start(); return; }
-  if (s.idp_login) { $('#lidp').href = s.idp_login; $('#lidp').hidden = false; }
+  if (s.idp_login) { $('#lidp').href = s.idp_login; $('#lidp').hidden = $('#lor').hidden = false; $('#lsb').classList.remove('pri'); }
   $('#login').hidden = false; $('#lk').focus();
 })();
 </script>

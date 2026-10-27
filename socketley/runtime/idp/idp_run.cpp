@@ -26,6 +26,7 @@
 #include "../../shared/storage/storage_rpc.h"
 #include "../storage/password_hash.h"
 #include "../storage/scrypt.h"
+#include "../storage/storage_ui_kit.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/http/status.h"
@@ -94,21 +95,23 @@ int64_t issued_ms(const claims& c)
     return ms ? ms : claim_int(c, "iat") * 1000;
 }
 
+// The storage interface's look, its sign-in card with the page's own forms in it, so a sign-in reads as one product.
 std::string page(std::string_view title, std::string_view body)
 {
+    static const std::string head =
+        "<style>" + std::string(socketley::storage::storage_ui_style()) +
+        "body{overflow:auto}.page{position:relative;min-height:100%;display:flex;padding:16px}.page>.lcard{margin:auto}"
+        ".lcard h2{margin:30px 0 4px;font-size:16px}.lcard form .btn{width:100%;justify-content:center;height:44px;"
+        "margin-top:18px}.lcard .row{display:flex;align-items:center;gap:10px;margin-top:10px}.lcard .row .btn{width:"
+        "auto;margin:0}.lcard .row span{flex:1}.lcard .acts{display:flex;gap:10px}.lcard a{color:var(--a1)}"
+        ".lcard code{font-family:var(--mono);font-size:15px;letter-spacing:.06em}</style></head><body>"
+        "<div id=\"aurora\"><i></i><i></i><i></i></div><div id=\"login\"><div class=\"orb o1\"></div><div "
+        "class=\"orb o2\"></div><div class=\"orb o3\"></div></div><div class=\"page\"><main class=\"lcard\">"
+        "<div class=\"logo\"><div class=\"mk\"><svg viewBox=\"0 0 24 24\"><path d=\"M7 5.5v13l11-6.5z\"/></svg>"
+        "</div>socketley</div>";
     return "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" "
            "content=\"width=device-width,initial-scale=1\"><title>" +
-           html_escape(title) +
-           "</title><style>body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;display:flex;"
-           "min-height:100vh;align-items:center;justify-content:center}main{background:#fff;padding:2rem 2.2rem;"
-           "border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);width:min(22rem,90vw)}h1{font-size:1.25rem;"
-           "margin:0 0 1.2rem}label{display:block;font-size:.85rem;margin:.8rem 0 .3rem;color:#444}"
-           "input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:.6rem;border:1px solid "
-           "#ccd;border-radius:6px;font-size:1rem}button{margin-top:1.2rem;width:100%;padding:.65rem;border:0;"
-           "border-radius:6px;background:#2d6cdf;color:#fff;font-size:1rem;cursor:pointer}.err{color:#b3261e;"
-           "font-size:.9rem;margin:.4rem 0 0}.small{font-size:.85rem;color:#555}.row{display:flex;gap:.4rem;"
-           "align-items:center;margin-top:.8rem;font-size:.85rem}a{color:#2d6cdf}</style></head><body><main>" +
-           std::string(body) + "</main></body></html>";
+           html_escape(title) + "</title>" + head + std::string(body) + "</main></div></body></html>";
 }
 
 // The parameters an authorize request carries through the sign-in form, and nothing else.
@@ -394,7 +397,7 @@ void idp_run::respond(const std::shared_ptr<conn>& c, int status, std::string_vi
     o += "\r\nCache-Control: no-store\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\n"
          "Referrer-Policy: no-referrer\r\n";
     if (type.starts_with("text/html"))
-        o += "X-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
+        o += "X-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
              "frame-ancestors 'none'\r\n";
     o += extra_headers;
     if (!c->keep_alive)
@@ -686,7 +689,7 @@ const client* idp_run::checked_client(const std::shared_ptr<conn>& c, const para
     if (!cl || !cl->allows(back))
     {
         respond(c, 400, "text/html; charset=utf-8",
-                page("Sign-in refused", "<h1>This sign-in cannot go on</h1><p class=\"small\">The application asked "
+                page("Sign-in refused", "<h1>This sign-in cannot go on</h1><p class=\"mut\">The application asked "
                                         "with a client or a return address this provider does not know.</p>"));
         return nullptr;
     }
@@ -727,16 +730,17 @@ void idp_run::login_page(const std::shared_ptr<conn>& c, const params& p, std::s
     for (const auto name : carried)
         if (const std::string_view v = param(p, name); !v.empty())
             hidden += "<input type=\"hidden\" name=\"" + std::string(name) + "\" value=\"" + html_escape(v) + "\">";
-    const std::string host = url_host(m_issuer);
+    // The domain the session cookie covers is what one sign-in opens, else the provider's own host.
+    const std::string host = m_cookie_domain.empty() ? url_host(m_issuer) : m_cookie_domain;
     const std::string body =
-        "<h1>Sign in</h1><form method=\"post\">" + hidden +
-        "<label for=\"u\">User</label><input id=\"u\" type=\"text\" name=\"username\" autocomplete=\"username\" "
-        "autofocus required value=\"" + html_escape(param(p, "username")) +
-        "\"><label for=\"p\">Password</label><input id=\"p\" type=\"password\" name=\"password\" "
-        "autocomplete=\"current-password\" required><div class=\"row\"><input id=\"r\" type=\"checkbox\" "
-        "name=\"remember\" value=\"1\"><label for=\"r\" style=\"margin:0\">Stay signed in</label></div>" +
+        "<h1>Welcome back</h1><p class=\"mut\">Sign in to " + html_escape(host) + ".</p><form method=\"post\">" +
+        hidden + "<label for=\"u\">User</label><input class=\"inp\" id=\"u\" type=\"text\" name=\"username\" "
+        "autocomplete=\"username\" autofocus required value=\"" + html_escape(param(p, "username")) +
+        "\"><label for=\"p\">Password</label><input class=\"inp\" id=\"p\" type=\"password\" name=\"password\" "
+        "autocomplete=\"current-password\" required><label class=\"chk\"><input type=\"checkbox\" name=\"remember\" "
+        "value=\"1\"> Stay signed in on this device</label>" +
         (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
-        "<button type=\"submit\">Sign in</button></form><p class=\"small\">" + html_escape(host) + "</p>";
+        "<button class=\"btn pri\" type=\"submit\">Sign in</button></form>";
     respond(c, status, "text/html; charset=utf-8", page("Sign in", body));
 }
 
@@ -750,12 +754,12 @@ static std::string random_string(size_t n)
 void idp_run::code_page(const std::shared_ptr<conn>& c, const std::string& pending, std::string_view error, int status)
 {
     const std::string body =
-        "<h1>Sign in</h1><p class=\"small\">The code your authenticator app shows now.</p><form method=\"post\">"
+        "<h1>Sign in</h1><p class=\"mut\">The code your authenticator app shows now.</p><form method=\"post\">"
         "<input type=\"hidden\" name=\"pending\" value=\"" + html_escape(pending) + "\"><label for=\"c\">Code</label>"
-        "<input id=\"c\" type=\"text\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" "
+        "<input class=\"inp\" id=\"c\" type=\"text\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" "
         "pattern=\"[0-9 ]{6,7}\" autofocus required>" +
         (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
-        "<button type=\"submit\">Sign in</button></form>";
+        "<button class=\"btn pri\" type=\"submit\">Sign in</button></form>";
     respond(c, status, "text/html; charset=utf-8", page("Sign in", body));
 }
 
@@ -831,7 +835,7 @@ void idp_run::authorize(const std::shared_ptr<conn>& c, const request& rq)
     else if (const std::string_view rd = param(p, "rd"); !rd.empty() && !return_allowed(rd, m_issuer, m_cookie_domain))
     {
         respond(c, 400, "text/html; charset=utf-8",
-                page("Sign-in refused", "<h1>This sign-in cannot go on</h1><p class=\"small\">The page asked to "
+                page("Sign-in refused", "<h1>This sign-in cannot go on</h1><p class=\"mut\">The page asked to "
                                         "return to an address outside this provider's domain.</p>"));
         return;
     }
@@ -1463,16 +1467,17 @@ void idp_run::device_page(const std::shared_ptr<conn>& c, const request& rq, std
     const std::string_view name = who->field("name").empty() ? who->username() : who->field("name");
     std::string body = "<h1>Sign in a device</h1>";
     if (!note.empty())
-        body += "<p>" + html_escape(note) + "</p><p class=\"small\">You can close this page.</p>";
+        body += "<p>" + html_escape(note) + "</p><p class=\"mut\">You can close this page.</p>";
     else
-        body += "<p class=\"small\">Signed in as <b>" + html_escape(name) +
+        body += "<p class=\"mut\">Signed in as <b>" + html_escape(name) +
                 "</b>. Allow only a code that a device of yours shows you right now; whoever holds the device signs "
-                "in as you.</p><form method=\"post\" action=\"/device\"><label for=\"u\">Code</label><input id=\"u\" "
-                "type=\"text\" name=\"user_code\" autocomplete=\"off\" autocapitalize=\"characters\" autofocus "
+                "in as you.</p><form method=\"post\" action=\"/device\"><label for=\"u\">Code</label><input "
+                "class=\"inp\" id=\"u\" type=\"text\" name=\"user_code\" autocomplete=\"off\" autocapitalize=\"characters\" autofocus "
                 "required value=\"" + html_escape(param(q, "user_code")) + "\">" +
                 (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
-                "<button type=\"submit\" name=\"action\" value=\"allow\">Allow</button> <button type=\"submit\" "
-                "name=\"action\" value=\"deny\">Refuse</button></form>";
+                "<div class=\"acts\"><button class=\"btn pri\" type=\"submit\" name=\"action\" value=\"allow\">Allow"
+                "</button><button class=\"btn\" type=\"submit\" name=\"action\" value=\"deny\">Refuse</button></div>"
+                "</form>";
     respond(c, status, "text/html; charset=utf-8", page("Sign in a device", body));
 }
 
@@ -1737,7 +1742,7 @@ void idp_run::logout(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     respond(c, 200, "text/html; charset=utf-8",
-            page("Signed out", "<h1>Signed out</h1><p class=\"small\">You can close this page.</p>"), clear_cookie());
+            page("Signed out", "<h1>Signed out</h1><p class=\"mut\">You can close this page.</p>"), clear_cookie());
 }
 
 void idp_run::home(const std::shared_ptr<conn>& c, const request& rq)
@@ -1750,8 +1755,9 @@ void idp_run::home(const std::shared_ptr<conn>& c, const request& rq)
     }
     const std::string_view name = who->field("name").empty() ? who->username() : who->field("name");
     respond(c, 200, "text/html; charset=utf-8",
-            page("Signed in", "<h1>Signed in</h1><p>as <b>" + html_escape(name) + "</b></p><p><a href=\"/account\">"
-                              "Your account</a></p><form method=\"post\" action=\"/logout\"><button "
+            page("Signed in", "<h1>Signed in</h1><p class=\"mut\">as <b>" + html_escape(name) + "</b></p><form "
+                              "method=\"get\" action=\"/account\"><button class=\"btn pri\" type=\"submit\">Your "
+                              "account</button></form><form method=\"post\" action=\"/logout\"><button class=\"btn\" "
                               "type=\"submit\">Sign out</button></form>"));
 }
 
@@ -1762,14 +1768,14 @@ void idp_run::reset_page(const std::shared_ptr<conn>& c, const params& p, std::s
         if (const std::string_view v = param(p, name); !v.empty())
             hidden += "<input type=\"hidden\" name=\"" + std::string(name) + "\" value=\"" + html_escape(v) + "\">";
     const std::string body =
-        "<h1>Set a new password</h1><p class=\"small\">Your password must be set again before you go on.</p>"
+        "<h1>Set a new password</h1><p class=\"mut\">Your password must be set again before you go on.</p>"
         "<form method=\"post\" action=\"/account/password\">" + hidden +
         "<input type=\"hidden\" name=\"username\" value=\"" + html_escape(param(p, "username")) +
-        "\"><label for=\"o\">Current password</label><input id=\"o\" type=\"password\" name=\"current\" "
-        "autocomplete=\"current-password\" required><label for=\"n\">New password</label><input id=\"n\" "
+        "\"><label for=\"o\">Current password</label><input class=\"inp\" id=\"o\" type=\"password\" name=\"current\" "
+        "autocomplete=\"current-password\" required><label for=\"n\">New password</label><input class=\"inp\" id=\"n\" "
         "type=\"password\" name=\"new\" autocomplete=\"new-password\" required>" +
         (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
-        "<button type=\"submit\">Set password</button></form>";
+        "<button class=\"btn pri\" type=\"submit\">Set password</button></form>";
     respond(c, status, "text/html; charset=utf-8", page("Set a new password", body));
 }
 
@@ -1783,17 +1789,17 @@ void idp_run::account_page(const std::shared_ptr<conn>& c, const request& rq, st
         return;
     }
     const std::string body =
-        "<h1>Your account</h1><p class=\"small\">Signed in as <b>" + html_escape(who->username()) + "</b></p>" +
-        (note.empty() ? std::string() : "<p class=\"small\">" + html_escape(note) + "</p>") +
+        "<h1>Your account</h1><p class=\"mut\">Signed in as <b>" + html_escape(who->username()) + "</b></p>" +
+        (note.empty() ? std::string() : "<p class=\"mut\">" + html_escape(note) + "</p>") +
         (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
-        "<form method=\"post\" action=\"/account\"><label for=\"dn\">Name</label><input id=\"dn\" type=\"text\" "
-        "name=\"name\" value=\"" + html_escape(who->field("name")) + "\"><label for=\"em\">E-mail</label><input "
+        "<form method=\"post\" action=\"/account\"><label for=\"dn\">Name</label><input class=\"inp\" id=\"dn\" type=\"text\" "
+        "name=\"name\" value=\"" + html_escape(who->field("name")) + "\"><label for=\"em\">E-mail</label><input class=\"inp\" "
         "id=\"em\" type=\"text\" name=\"email\" value=\"" + html_escape(who->field("email")) +
-        "\"><button type=\"submit\">Save</button></form><form method=\"post\" action=\"/account/password\"><label "
-        "for=\"o\">Current password</label><input id=\"o\" type=\"password\" name=\"current\" autocomplete=\""
-        "current-password\" required><label for=\"n\">New password</label><input id=\"n\" type=\"password\" "
-        "name=\"new\" autocomplete=\"new-password\" required><button type=\"submit\">Change password</button></form>"
-        "<form method=\"post\" action=\"/account/everywhere\"><button type=\"submit\">Sign out everywhere</button>"
+        "\"><button class=\"btn pri\" type=\"submit\">Save</button></form><h2>Password</h2><form method=\"post\" action=\"/account/password\"><label "
+        "for=\"o\">Current password</label><input class=\"inp\" id=\"o\" type=\"password\" name=\"current\" autocomplete=\""
+        "current-password\" required><label for=\"n\">New password</label><input class=\"inp\" id=\"n\" type=\"password\" "
+        "name=\"new\" autocomplete=\"new-password\" required><button class=\"btn pri\" type=\"submit\">Change password</button></form>"
+        "<form method=\"post\" action=\"/account/everywhere\"><button class=\"btn bad\" type=\"submit\">Sign out everywhere</button>"
         "</form>" + security_html(*who);
     respond(c, status, "text/html; charset=utf-8", page("Your account", body));
 }
@@ -1802,16 +1808,16 @@ std::string idp_run::security_html(const account& who)
 {
     std::string out = "<h2>Two-step sign-in</h2>";
     if (who.field("totp").empty())
-        out += "<p class=\"small\">Off: your password alone signs you in.</p><form method=\"post\" "
-               "action=\"/account/totp\"><input type=\"hidden\" name=\"do\" value=\"start\"><button type=\"submit\">"
+        out += "<p class=\"mut\">Off: your password alone signs you in.</p><form method=\"post\" "
+               "action=\"/account/totp\"><input type=\"hidden\" name=\"do\" value=\"start\"><button class=\"btn pri\" type=\"submit\">"
                "Turn on</button></form>";
     else
-        out += "<p class=\"small\">On: a code from your authenticator app follows your password, and mail apps sign in "
+        out += "<p class=\"mut\">On: a code from your authenticator app follows your password, and mail apps sign in "
                "with an app password.</p><form method=\"post\" action=\"/account/totp\"><input type=\"hidden\" "
-               "name=\"do\" value=\"off\"><label for=\"tc\">Code</label><input id=\"tc\" type=\"text\" name=\"code\" "
-               "inputmode=\"numeric\" autocomplete=\"one-time-code\" required><button type=\"submit\">Turn off</button>"
+               "name=\"do\" value=\"off\"><label for=\"tc\">Code</label><input class=\"inp\" id=\"tc\" type=\"text\" name=\"code\" "
+               "inputmode=\"numeric\" autocomplete=\"one-time-code\" required><button class=\"btn bad\" type=\"submit\">Turn off</button>"
                "</form>";
-    out += "<h2>App passwords</h2><p class=\"small\">For a mail app on a phone or a computer: each its own, taken back "
+    out += "<h2>App passwords</h2><p class=\"mut\">For a mail app on a phone or a computer: each its own, taken back "
            "on its own.</p>";
     for (std::string_view rest = who.field("app_passwords"); !rest.empty();)
     {
@@ -1823,11 +1829,11 @@ std::string idp_run::security_html(const account& who)
         const std::string label(line.substr(0, line.find('\t')));
         out += "<form method=\"post\" action=\"/account/app-password\" class=\"row\"><input type=\"hidden\" "
                "name=\"do\" value=\"remove\"><input type=\"hidden\" name=\"label\" value=\"" + html_escape(label) +
-               "\"><span style=\"flex:1\">" + html_escape(label) + "</span><button type=\"submit\">Remove</button></form>";
+               "\"><span>" + html_escape(label) + "</span><button class=\"btn sm bad\" type=\"submit\">Remove</button></form>";
     }
     out += "<form method=\"post\" action=\"/account/app-password\"><input type=\"hidden\" name=\"do\" value=\"add\">"
-           "<label for=\"al\">For</label><input id=\"al\" type=\"text\" name=\"label\" placeholder=\"Phone\" "
-           "maxlength=\"64\" required><button type=\"submit\">Make one</button></form>";
+           "<label for=\"al\">For</label><input class=\"inp\" id=\"al\" type=\"text\" name=\"label\" placeholder=\"Phone\" "
+           "maxlength=\"64\" required><button class=\"btn pri\" type=\"submit\">Make one</button></form>";
     return out;
 }
 
@@ -1876,12 +1882,12 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
                 grouped += (i ? " " : "") + key.substr(i, 4);
             respond(c, 200, "text/html; charset=utf-8",
                     page("Two-step sign-in",
-                         "<h1>Two-step sign-in</h1><p class=\"small\">Add this key to your authenticator app, then give "
-                         "the code it shows.</p><p><code>" + html_escape(grouped) + "</code></p><p class=\"small\">"
+                         "<h1>Two-step sign-in</h1><p class=\"mut\">Add this key to your authenticator app, then give "
+                         "the code it shows.</p><p><code>" + html_escape(grouped) + "</code></p><p class=\"mut\">"
                          "<a href=\"" + html_escape(uri) + "\">Open in an authenticator app</a></p><form method=\"post\" "
                          "action=\"/account/totp\"><input type=\"hidden\" name=\"do\" value=\"confirm\"><label for=\"tc\">"
-                         "Code</label><input id=\"tc\" type=\"text\" name=\"code\" inputmode=\"numeric\" "
-                         "autocomplete=\"one-time-code\" autofocus required><button type=\"submit\">Turn on</button></form>"));
+                         "Code</label><input class=\"inp\" id=\"tc\" type=\"text\" name=\"code\" inputmode=\"numeric\" "
+                         "autocomplete=\"one-time-code\" autofocus required><button class=\"btn pri\" type=\"submit\">Turn on</button></form>"));
             return;
         }
         if (what == "confirm")
@@ -2006,7 +2012,7 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
                 account_page(cc, rq, {}, why, 500);
             else
                 respond(cc, 200, "text/html; charset=utf-8",
-                        page("Signed out", "<h1>Signed out everywhere</h1><p class=\"small\">Every session of this "
+                        page("Signed out", "<h1>Signed out everywhere</h1><p class=\"mut\">Every session of this "
                                            "account has ended.</p>"),
                         clear_cookie());
             m_http.resume(cc);
@@ -2121,7 +2127,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
                         grant(c3, p, *a2, session_cookie(*a2, false));
                     else
                         respond(c3, 200, "text/html; charset=utf-8",
-                                page("Password changed", "<h1>Password changed</h1><p class=\"small\">Every other "
+                                page("Password changed", "<h1>Password changed</h1><p class=\"mut\">Every other "
                                                          "session has ended.</p><p><a href=\"/account\">Your "
                                                          "account</a></p>"),
                                 session_cookie(*a2, false));

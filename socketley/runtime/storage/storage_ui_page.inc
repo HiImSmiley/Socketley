@@ -72,7 +72,10 @@ a{color:inherit}
 .lcard p{margin:0 0 22px}
 .lcard label{display:block;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);margin:14px 0 6px}
 .lcard .inp{width:100%;height:44px}
-.lcard .btn.pri{width:100%;justify-content:center;height:46px;margin-top:22px;font-size:15px}
+.lcard .btn.pri,.lcard>.btn{width:100%;justify-content:center;height:46px;margin-top:22px;font-size:15px}
+#lf>#lidp{margin-top:0}
+.lcard .or{display:flex;align-items:center;gap:10px;margin:22px 0 4px;color:var(--dim);font-size:12px}
+.lcard .or::before,.lcard .or::after{content:"";flex:1;height:1px;background:var(--line2)}
 .chk{display:flex!important;align-items:center;gap:.5rem;text-transform:none!important;letter-spacing:0!important;font-weight:400!important;cursor:pointer}
 .err{color:var(--bad);min-height:1.3em;margin-top:10px;font-size:13px}
 .fv{display:flex;flex-direction:column;gap:5px;margin:0 0 12px}.fv>span{font-size:12.5px;color:var(--mut)}.fv small{font-size:11.5px}
@@ -501,12 +504,13 @@ body.audio #ups,body.audio #selbar{bottom:96px}
     <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>socketley</div>
     <h1>Welcome back</h1>
     <p class="mut">Sign in to your library.</p>
+    <a class="btn pri" id="lidp" hidden>Sign in with your account</a>
+    <div class="or" id="lor" hidden>or with a password or access key</div>
     <label for="lk">User name or access key</label><input class="inp" id="lk" autocomplete="username" required spellcheck="false" autocapitalize="off">
     <label for="ls">Password or secret</label><input class="inp" id="ls" type="password" autocomplete="current-password" required>
     <label class="chk"><input type="checkbox" id="lr"> Stay signed in on this device</label>
     <div class="err" id="le"></div>
-    <button class="btn pri">Sign in</button>
-    <a class="btn" id="lidp" hidden>Sign in with your account</a>
+    <button class="btn pri" id="lsb">Sign in</button>
   </form>
 </div>
 <div id="app" hidden>
@@ -3897,9 +3901,9 @@ async function start() {
   try {
     const r = await fetch('/~ui/session', { headers: { 'X-Socketley-UI': '1' } });
     if (r.ok) { me = await r.json(); start(); return; }
-    // A storage that takes an identity provider's sign-in offers it beside its own form.
+    // A storage that takes an identity provider's sign-in offers it first, as only it signs in the other pages too.
     const idp = r.headers.get('X-Socketley-Idp-Login');
-    if (idp) { $('#lidp').href = idp; $('#lidp').hidden = false; }
+    if (idp) { $('#lidp').href = idp; $('#lidp').hidden = $('#lor').hidden = false; $('#lsb').classList.remove('pri'); }
   } catch (e) {}
   signedOut();
 })();
