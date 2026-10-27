@@ -4,6 +4,7 @@
 #include "flag_handlers.h"
 #include "type_manifest.h"
 #include "../shared/runtime/command_usage.h"
+#include "../shared/util/random_id.h"
 #include "../shared/runtime/type_registry.h"
 #include "../shared/runtime/stats_text.h"
 #include "../shared/loop/event_loop.h"
@@ -19,6 +20,8 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
+#include "../runtime/tunnel/tunnel_instance.h"
+#include "../runtime/tunnel/tunnel_registry.h"
 #include "../runtime/db/db_instance.h"
 #include "../runtime/mqtt/mqtt_command.h"
 #include "../shared/util/base64.h"
@@ -1511,6 +1514,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("db-restore"):    return cmd_db_restore(conn, pa);
         case fnv1a("db-query"):      return cmd_db_query(conn, pa);
         case fnv1a("dnssec"):        return cmd_dnssec(conn, pa);
+        case fnv1a("tunnel"):        return cmd_tunnel(conn, pa);
         case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
@@ -1634,6 +1638,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_mail:
                     result = parse_mail_flags(static_cast<mail_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_tunnel:
+                    result = parse_tunnel_flags(static_cast<tunnel_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -3602,6 +3609,129 @@ int daemon_handler::cmd_db_restore(ipc_connection* conn, const parsed_args& pa)
         false);
 }
 
+// A tunnel edge's agents: an invitation made, the agents listed, or one revoked, the edge's worker reading the file
+// again within a second and cutting off an agent no longer in it.
+int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
+{
+    namespace tn = socketley::tunnel;
+    if (pa.count < 3)
+    {
+        conn->write_buf = "usage: " + command_usage::line("tunnel") + "\n";
+        return 1;
+    }
+    const std::string edge(pa.args[1]);
+    auto* inst = m_manager.get(edge);
+    if (!inst || inst->get_type() != runtime_tunnel ||
+        static_cast<tunnel_instance*>(inst)->get_mode() != tunnel_instance::mode::edge)
+    {
+        conn->write_buf = "no tunnel edge named " + edge + "\n";
+        return 1;
+    }
+    const std::string_view action = pa.args[2];
+    std::string why;
+    if (action == "list" && pa.count == 3)
+    {
+        std::vector<tn::agent> agents;
+        if (!tn::load_agents(edge, agents, why))
+        {
+            conn->write_buf = why + "\n";
+            return 2;
+        }
+        std::string out;
+        for (const auto& a : agents)
+        {
+            out += a.name + (a.joined ? "\tjoined\t" : "\tinvited\t");
+            for (size_t i = 0; i < a.services.size(); ++i)
+                out += (i ? "," : "") + (a.services[i].http ? a.services[i].name
+                                                            : a.services[i].name + ":" + std::to_string(a.services[i].port));
+            out += "\n";
+        }
+        conn->write_buf = out;
+        return 0;
+    }
+    if (action == "revoke" && pa.count == 4)
+    {
+        const std::string name(pa.args[3]);
+        const bool ok = tn::update_agents(edge, [&](std::vector<tn::agent>& agents, std::string& w) {
+            const size_t before = agents.size();
+            std::erase_if(agents, [&](const tn::agent& a) { return a.name == name; });
+            if (agents.size() == before)
+            {
+                w = "no agent named " + name;
+                return false;
+            }
+            return true;
+        }, why);
+        conn->write_buf = ok ? std::string() : why + "\n";
+        return ok ? 0 : 1;
+    }
+    if ((action == "invite" || action == "set") && pa.count >= 4)
+    {
+        const bool invite = action == "invite";
+        tn::agent a;
+        a.name = std::string(pa.args[3]);
+        std::string http, tcp;
+        for (size_t i = 4; i < pa.count; ++i)
+        {
+            if (pa.args[i] == "--http" && i + 1 < pa.count)
+                http = std::string(pa.args[++i]);
+            else if (pa.args[i] == "--tcp" && i + 1 < pa.count)
+                tcp = std::string(pa.args[++i]);
+            else
+            {
+                conn->write_buf = "usage: " + command_usage::line("tunnel") + "\n";
+                return 1;
+            }
+        }
+        if (!tn::valid_name(a.name))
+        {
+            conn->write_buf = "an agent's name is lower-case letters, digits and -\n";
+            return 1;
+        }
+        if (!tn::parse_services(http, tcp, a.services, why))
+        {
+            conn->write_buf = why + "\n";
+            return 1;
+        }
+        // An invitation's secret goes to the agent once, in this answer; the file keeps its hash.
+        const std::string secret = invite ? socketley::random_b64url(32) : std::string();
+        a.secret_hash = invite ? tn::hash_secret(secret) : std::string();
+        const bool ok = (!invite || !secret.empty()) &&
+                        tn::update_agents(edge, [&](std::vector<tn::agent>& agents, std::string& w) {
+            if (const std::string c = tn::clash(agents, a); !c.empty())
+            {
+                w = c;
+                return false;
+            }
+            const auto it = std::find_if(agents.begin(), agents.end(), [&](const tn::agent& o) { return o.name == a.name; });
+            // `set` changes what an agent offers and keeps its key; invited again, it takes a new secret instead.
+            if (!invite)
+            {
+                if (it == agents.end())
+                {
+                    w = "no agent named " + a.name + "; invite it first";
+                    return false;
+                }
+                it->services = a.services;
+                return true;
+            }
+            if (it != agents.end())
+                agents.erase(it);
+            agents.push_back(a);
+            return true;
+        }, why);
+        if (!ok)
+        {
+            conn->write_buf = (why.empty() ? std::string("no randomness for a secret") : why) + "\n";
+            return 1;
+        }
+        conn->write_buf = invite ? a.name + "." + secret + "\n" : std::string();
+        return 0;
+    }
+    conn->write_buf = "usage: " + command_usage::line("tunnel") + "\n";
+    return 1;
+}
+
 // An account of an idp runtime, changed or read in the worker that keeps them, which answers in text.
 int daemon_handler::cmd_idp_user(ipc_connection* conn, const parsed_args& pa)
 {
@@ -4685,8 +4815,9 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
                 case runtime_db:
                 case runtime_mqtt:
                 case runtime_mail:
-                    // A storage, DNS, sync, idp, db, mqtt or mail runtime's own
-                    // settings are applied by `import`, as a cache's are.
+                case runtime_tunnel:
+                    // A storage, DNS, sync, idp, db, mqtt, mail or tunnel runtime's
+                    // own settings are applied by `import`, as a cache's are.
                     result = -1;
                     break;
                 default:
@@ -6918,7 +7049,7 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // are the exceptions: their work is done on a worker's own loop, which
         // only a worker turns.
         if (cfg.type == runtime_sync || cfg.type == runtime_idp || cfg.type == runtime_db ||
-            cfg.type == runtime_mqtt || cfg.type == runtime_mail)
+            cfg.type == runtime_mqtt || cfg.type == runtime_mail || cfg.type == runtime_tunnel)
             inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(

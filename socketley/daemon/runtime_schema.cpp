@@ -151,6 +151,13 @@ constexpr row rows[] = {
     {"--issuer", "I", "text", "Issuer", "The https address it is reached at; https://<first name> when not given.", "Identity", {}, "https://auth.example.com"},
     {"--idp", "T", "text", "Identity provider", "The idp runtime whose sign-in the web interface takes, its users being the users of the same name here.", "Storage", {}, "auth"},
     {"--cookie-domain", "I", "text", "Cookie domain", "The domain whose names share one sign-in, for a proxy's --auth idp:.", "Identity", {}, "example.com"},
+    {"--mode", "U", "choice", "Mode", "An edge agents dial out to, or an agent dialling one.", "Tunnel", "edge,agent"},
+    {"--to", "U", "text", "Edge", "The edge an agent dials, its https address.", "Tunnel", {}, "https://t.example.com"},
+    {"--join", "U", "text", "Invitation", "What `socketley tunnel <edge> invite` printed, used once to join.", "Tunnel", {}, "pi.Xw3..."},
+    {"--offer", "U", "list", "Offers", "What an agent carries the edge's streams to: service=host:port each.", "Tunnel", {}, "pi=127.0.0.1:8123"},
+    {"--forward", "U", "list", "Forward", "Where an edge carries a signed-in person's stream, as ssh's ProxyCommand asks.", "Tunnel", {}, "127.0.0.1:22"},
+    {"--idp", "U", "text", "Identity provider", "The idp runtime whose signed-in people may use --forward.", "Tunnel", {}, "auth"},
+    {"--idp-audience", "U", "list", "Audiences", "The clients whose access tokens --forward takes.", "Tunnel", {}, "socketley-cli"},
     {"--ssh-ca", "I", "int", "SSH certificates", "Signs SSH certificates for signed-in users, holding this many hours; off when not given.", "Identity", {}, "8"},
     {"--schema", "B", "path", "Schema", "The collections, a line each: name, access (private, owner, shared, public, catalog) and indexed fields.", "Database", {}, "/etc/socketley/db.schema"},
     {"--keys", "B", "path", "Keys", "Service keys a backend sends as Authorization: Bearer, name and secret a line.", "Database", {}, "/etc/socketley/db.keys"},
@@ -329,6 +336,10 @@ constexpr state_key_row state_keys[] = {
     {"--issuer", "issuer"},
     {"--cookie-domain", "cookie_domain"},
     {"--ssh-ca", "ssh_ca"},
+    {"--to", "to"},
+    {"--join", "join"},
+    {"--offer", "offer"},
+    {"--forward", "forward"},
     {"--idp", "idp"},
     {"--idp-audience", "idp_audience"},
     {"--schema", "schema"},
@@ -437,6 +448,7 @@ char letter_of(runtime_type type)
         case runtime_db:      return 'B';
         case runtime_mqtt:    return 'M';
         case runtime_mail:    return 'E';
+        case runtime_tunnel:  return 'U';
         default:              return 0;
     }
 }

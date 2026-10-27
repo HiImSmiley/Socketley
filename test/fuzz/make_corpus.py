@@ -2878,6 +2878,44 @@ def mqtt_seeds():
     return seeds
 
 
+def tunnelmux_frame(t, stream, payload=b""):
+    return struct.pack(">IBI", len(payload), t, stream) + payload
+
+def tunnelmux_seeds():
+    hello = tunnelmux_frame(1, 0, b"\x01" + struct.pack(">H", 4) + b"edge" + struct.pack(">H", 1) + b"t")
+    def op(stream, target, peer=b""):
+        return tunnelmux_frame(2, stream, struct.pack(">H", len(target)) + target + peer)
+    conv = (hello + op(1, b"web", b"203.0.113.7:4000") + tunnelmux_frame(3, 1, b"GET / HTTP/1.1\r\n\r\n") +
+            tunnelmux_frame(4, 1, struct.pack(">I", 65536)) + tunnelmux_frame(7, 0, b"12345678") +
+            tunnelmux_frame(5, 1) + tunnelmux_frame(9, 0, b"bye"))
+    return {
+        "accepted_whole": b"\0\0" + conv,
+        "accepted_cut_7": b"\0\x07" + conv,
+        "dialled_open_even": b"\x01\0" + hello + op(2, b"pi") + tunnelmux_frame(3, 2, b"close me"),
+        "reset_and_late_data": b"\0\0" + hello + op(1, b"abc") + tunnelmux_frame(6, 1, b"\x01") + tunnelmux_frame(3, 1, b"late"),
+        "limit": b"\0\0" + hello + b"".join(op(i, b"web") for i in range(1, 22, 2)),
+        "over_credit": b"\0\0" + hello + op(1, b"web") + tunnelmux_frame(3, 1, b"x" * 65536) * 5,
+        "before_hello": b"\0\0" + tunnelmux_frame(3, 1, b"x"),
+        "huge_length": b"\0\0" + hello + struct.pack(">IBI", 1 << 24, 3, 1),
+    }
+
+def sshcert_seeds():
+    import base64
+    cert = ("AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIOV8L4lftgLEepfDlBBE1MLAPJypmBscWGRTR7aD7xCXAAAAICTZa3UpuRNOjkxwDTZiEB+wDXHaHJw7Cx+sKMt0cTXJ"
+            "AAAAAAAAACoAAAABAAAACmFsaWNlQHRlc3QAAAARAAAABWFsaWNlAAAABHJvb3QAAAAAauAE7AAAAABsv+dLAAAAAAAAAIIAAAAVcGVybWl0LVgxMS1mb3J3YXJkaW5nAAAAAAAAABdwZXJt"
+            "aXQtYWdlbnQtZm9yd2FyZGluZwAAAAAAAAAWcGVybWl0LXBvcnQtZm9yd2FyZGluZwAAAAAAAAAKcGVybWl0LXB0eQAAAAAAAAAOcGVybWl0LXVzZXItcmMAAAAAAAAAAAAAADMAAAALc3No"
+            "LWVkMjU1MTkAAAAgDg7B+qzVttKUVtBB0wmzBJik+HTpsj3UaZ9KErPM3w0AAABTAAAAC3NzaC1lZDI1NTE5AAAAQFNUIYyok07eO8oQ6q3zRGK3b9FyKCykd+AsXeyvq0W8R/YjRe/wCAaa"
+            "FccFEjltpecM36XuyaWepoMKkAaU4QU=")
+    blob = base64.b64decode(cert)
+    return {
+        "cert_ed25519": b"\0" + blob,
+        "cert_cut": b"\0" + blob[:len(blob) // 2],
+        "key_ed25519": b"\x01ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICTZa3UpuRNOjkxwDTZiEB+wDXHaHJw7Cx+sKMt0cTXJ alice@laptop",
+        "key_ecdsa": b"\x01ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOgotK8AyjzEGK5tBo6UhI//UHAP/pvJWobredED24l2pRgPLov5wFV8ji4GC2B8lDqkXnok7pecSzEvwMEWVTM=",
+        "key_cert_line": b"\x01ssh-ed25519-cert-v01@openssh.com " + cert.encode() + b" x",
+        "key_bad": b"\x01ssh-ed25519 not-base64",
+    }
+
 def main(argv):
     root = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
     total = 0
@@ -2893,7 +2931,9 @@ def main(argv):
                         ("bucketpolicy", bucketpolicy_seeds()),
                         ("dns", dns_seeds()),
                         ("mqtt", mqtt_seeds()),
-                        ("mail", mail_seeds())):
+                        ("mail", mail_seeds()),
+                        ("tunnelmux", tunnelmux_seeds()),
+                        ("sshcert", sshcert_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

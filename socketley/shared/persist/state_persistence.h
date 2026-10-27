@@ -207,6 +207,15 @@ struct runtime_config
     std::string idp_cookie_domain;
     uint32_t idp_ssh_ca_hours = 0;
 
+    // Tunnel
+    uint8_t tunnel_mode = 0;
+    std::string tunnel_to;
+    std::string tunnel_join;
+    std::string tunnel_offers;
+    std::string tunnel_forward;
+    std::string tunnel_idp;
+    std::string tunnel_idp_audience;
+
     // Db
     std::string db_schema;
     std::string db_keys;

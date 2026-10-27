@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
+# A tunnel edge carrying a signed-in person's stream to a --forward target: `socketley tunnel connect` between stdin
+# and stdout, and ssh through it as its ProxyCommand with a certificate from the same idp -- what replaces wstunnel.
+#
+# What each part would catch:
+#   * a stream carried for someone with no access token, or one given to a client the edge does not take
+#   * a target the edge does not name reached, or a refusal not said
+#   * bytes lost between stdin, the edge, the target and stdout, or the end of stdin not reaching the target
+#   * ssh through the tunnel not getting in with its certificate
+set -uo pipefail
+
+BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+BIN=$(readlink -f "$BIN")
+. "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
+
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); }
+bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
+
+echo "=== Integration: a tunnel edge carries a signed-in person's stream, ssh among them ==="
+daemon_isolate tunnelfwd
+T=$SOCKETLEY_TMPD
+PI=$((SL_PORT_BASE + 1976))
+PE=$((SL_PORT_BASE + 1977))
+PX=$((SL_PORT_BASE + 1978))
+PS=$((SL_PORT_BASE + 1979))
+I="http://127.0.0.1:$PI"
+python3 - "$PX" <<'PY' &
+import socketserver, sys
+class Echo(socketserver.BaseRequestHandler):
+    def handle(self):
+        while True:
+            d = self.request.recv(65536)
+            if not d:
+                break
+            self.request.sendall(d)
+        self.request.shutdown(1)
+class E(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+E(("127.0.0.1", int(sys.argv[1])), Echo).serve_forever()
+PY
+ECHO=$!
+SSHD_PID=""
+trap 'kill $ECHO 2>/dev/null; [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null; daemon_stop' EXIT
+daemon_start "$BIN"
+
+cat > "$T/clients" <<EOF
+cli - device ssh
+other - device
+EOF
+"$BIN" create idp auth -p "$PI" --clients "$T/clients" --issuer "$I" --ssh-ca 8 -s >/dev/null 2>&1 \
+    || bad "the idp is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$I/jwks")" = 200 ] && break; sleep 0.1; done
+"$BIN" idp-user auth add alice --password alicepassword1 >/dev/null 2>&1
+out=$("$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && case "$out" in *"--forward needs --idp"*) true ;; *) false ;; esac && ok || bad "--forward without --idp is refused" "rc $rc: $out"
+"$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX,127.0.0.1:$PS" --idp auth --idp-audience cli -s >/dev/null 2>&1 \
+    && ok || bad "an edge that forwards for the idp's people is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 50); do ss -ltn "sport = :$PE" | grep -q LISTEN && break; sleep 0.1; done
+
+login_as() {   # login_as <user> <password> <client> <config dir>
+    XDG_CONFIG_HOME="$4" "$BIN" login "$I" --client "$3" > "$T/login.out" 2>&1 &
+    local pid=$!
+    for _ in $(seq 1 50); do grep -q "allow the code" "$T/login.out" && break; sleep 0.1; done
+    python3 - "$PI" "$(sed -n 's/^and allow the code //p' "$T/login.out")" "$1" "$2" <<'PY' >/dev/null 2>&1
+import sys, urllib.request, urllib.parse, urllib.error
+I = "http://127.0.0.1:%s" % sys.argv[1]
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+op = urllib.request.build_opener(NoRedirect)
+def post(path, form, cookie=None):
+    h = {"Content-Type": "application/x-www-form-urlencoded"}
+    if cookie: h["Cookie"] = cookie
+    r = urllib.request.Request(I + path, data=urllib.parse.urlencode(form).encode(), method="POST", headers=h)
+    try:
+        with op.open(r) as resp: return resp.headers
+    except urllib.error.HTTPError as e: return e.headers
+cookie = (post("/login", {"username": sys.argv[3], "password": sys.argv[4]}).get("Set-Cookie") or "").split(";")[0]
+post("/device", {"user_code": sys.argv[2], "action": "allow"}, cookie)
+PY
+    for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    wait "$pid"
+}
+
+out=$(printf 'hello' | "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"socketley login"*) true ;; *) false ;; esac && ok || bad "nobody signed in is told to sign in" "rc $rc: $out"
+login_as alice alicepassword1 cli "$T/alice" && ok || bad "alice signs in" "$(cat "$T/login.out")"
+export XDG_CONFIG_HOME="$T/alice"
+
+out=$(printf 'hello through the tunnel' | "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" 2>"$T/err"); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "hello through the tunnel" ] && ok || bad "stdin reaches the target and its answer stdout" "rc $rc: '$out' $(cat "$T/err")"
+head -c 3000000 /dev/urandom > "$T/blob"
+"$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" < "$T/blob" > "$T/blob.back" 2>"$T/err"; rc=$?
+[ "$rc" -eq 0 ] && cmp -s "$T/blob" "$T/blob.back" && ok || bad "three megabytes there and back, whole" "rc $rc: $(stat -c %s "$T/blob.back") $(cat "$T/err")"
+out=$(printf 'x' | "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:9" --idp "$I" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"does not forward to that target"*) true ;; *) false ;; esac && ok || bad "a target the edge does not name is refused" "rc $rc: $out"
+grep -q 'tunnel e: "alice" connected from 127.0.0.1' "$SOCKETLEY_DLOG" && ok || bad "who connected is said in the log" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
+
+login_as alice alicepassword1 other "$T/other" || true
+out=$(printf 'x' | XDG_CONFIG_HOME="$T/other" "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"401"*|*"not one this edge takes"*) true ;; *) false ;; esac && ok \
+    || bad "a token given to a client the edge does not take is refused" "rc $rc: $out"
+
+# ── ssh through the tunnel, by the certificate the same sign-in gets ──────────
+SSHD=$(command -v sshd || echo /usr/sbin/sshd)
+if [ -x "$SSHD" ] && command -v ssh >/dev/null && command -v ssh-keygen >/dev/null; then
+    curl -s "$I/ssh/ca.pub" > "$T/ca.pub"
+    ssh-keygen -q -t ed25519 -N '' -f "$T/host"
+    ssh-keygen -q -t ed25519 -N '' -f "$T/key"
+    "$BIN" ssh-cert "$I" --key "$T/key.pub" || bad "alice gets a certificate" "rc $?"
+    mkdir -p "$T/principals"; echo alice > "$T/principals/$USER"
+    cat > "$T/sshd_config" <<EOF
+Port $PS
+ListenAddress 127.0.0.1
+HostKey $T/host
+PidFile $T/sshd.pid
+AuthorizedKeysFile none
+TrustedUserCAKeys $T/ca.pub
+AuthorizedPrincipalsFile $T/principals/%u
+UsePAM no
+StrictModes no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+    "$SSHD" -D -f "$T/sshd_config" -E "$T/sshd.log" &
+    SSHD_PID=$!
+    for _ in $(seq 1 50); do ss -ltn "sport = :$PS" | grep -q LISTEN && break; sleep 0.1; done
+    out=$(ssh -i "$T/key" -o CertificateFile="$T/key-cert.pub" -o IdentitiesOnly=yes -o BatchMode=yes \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+              -o ProxyCommand="$BIN tunnel connect http://127.0.0.1:$PE 127.0.0.1:$PS --idp $I" \
+              "$USER@through-the-tunnel" echo in 2>&1 | grep -v '^Warning: Permanently added')
+    [ "$out" = in ] && ok || bad "ssh gets in through the tunnel by its certificate" "$out"
+else
+    echo "  SKIP: sshd, ssh and ssh-keygen are needed for the ssh part"
+fi
+
+echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
+[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
+exit "$FAIL"

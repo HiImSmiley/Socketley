@@ -4,6 +4,7 @@
 #include "../../runtime/proxy/proxy_instance.h"
 #include "../../runtime/storage/storage_instance.h"
 #include "../../runtime/dns/dns_instance.h"
+#include "../../runtime/tunnel/tunnel_instance.h"
 #include "../util/text_list.h"
 
 #include <algorithm>
@@ -50,7 +51,10 @@ std::vector<std::string> of(const runtime_instance& rt, bool with_buckets)
         add_list(stg.get_domain(), out, with_buckets);
         add_list(stg.get_website_domain(), out, with_buckets);
     }
-    add_list(rt.get_domains(), out, false);
+    // A tunnel edge's agents' services are names below its own, which its wildcard answers in DNS.
+    const bool edge = rt.get_type() == runtime_tunnel &&
+                      static_cast<const tunnel_instance&>(rt).get_mode() == tunnel_instance::mode::edge;
+    add_list(rt.get_domains(), out, edge);
     // A mail runtime's webmail answers mail clients too, under the names they ask for its zones' setup.
     if (rt.get_type() == runtime_mail && static_cast<const mail_instance&>(rt).get_web_port() && !rt.get_domains().empty())
     {
@@ -83,6 +87,8 @@ bool speaks_http(const runtime_instance& rt)
             return static_cast<const proxy_instance&>(rt).get_protocol() == protocol_http && !is_entrance(rt);
         case runtime_mail:
             return static_cast<const mail_instance&>(rt).get_web_port() != 0;
+        case runtime_tunnel:
+            return static_cast<const tunnel_instance&>(rt).get_mode() == tunnel_instance::mode::edge;
         default:
             return false;
     }
@@ -170,6 +176,24 @@ std::string entrance_table(const runtime_instance& entrance, const std::vector<c
             else
                 for (const auto& z : zones)
                     add(n + "." + z, addr);
+        }
+    }
+    // Each HTTP service of a tunnel edge goes to the socket the edge serves it on, before the edge's own wildcard.
+    for (const runtime_instance* r : all)
+    {
+        if (!r || r->get_type() != runtime_tunnel || !speaks_http(*r))
+            continue;
+        const std::string_view domains = r->get_domains();
+        const std::string base = normal(domains.substr(0, domains.find(',')));
+        if (base.empty())
+            continue;
+        for (const auto& [svc, sock] : static_cast<const tunnel_instance&>(*r).http_services())
+        {
+            if (base.find('.') != std::string::npos)
+                add(svc + "." + base, "unix:" + sock);
+            else
+                for (const auto& z : zones)
+                    add(svc + "." + base + "." + z, "unix:" + sock);
         }
     }
     std::sort(routes.begin(), routes.end());

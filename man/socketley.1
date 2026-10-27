@@ -518,7 +518,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-can be: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, or any registered type \(em see
+can be: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, or any registered type \(em see
 .BR "REGISTERED TYPES" .
 .I name
 is a unique identifier for the runtime.
@@ -1130,6 +1130,48 @@ certificate written beside the key for sshd's
 .nf
 socketley idp\-ssh auth ca > /etc/ssh/socketley_user_ca.pub
 socketley idp\-ssh auth host\-sign /etc/ssh/ssh_host_ed25519_key.pub \-\-names server.example.com
+.fi
+.RE
+.TP
+.BI "tunnel " "edge" " invite\fR|\fBset " agent " \fR[\fB\-\-http \fIname,...\fR] [\fB\-\-tcp \fIname\fB:\fIport,...\fR]"
+.TQ
+.BI "tunnel " edge " list\fR|\fBrevoke \fIagent"
+The agents a tunnel edge takes:
+.B invite
+prints an invitation, used once, for an agent to offer the services named
+(an HTTP one at
+.IB name . domain ,
+a TCP one on its port), and invited again an agent takes a new one;
+.B set
+changes what it offers and keeps its key;
+.B revoke
+cuts it off. See
+.BR "TUNNEL FLAGS" .
+.RS
+.PP
+.nf
+socketley tunnel t invite pi \-\-http home,nas \-\-tcp mc:25565
+.fi
+.RE
+.TP
+.BI "tunnel connect " "edge host" : port " \fB\-\-idp \fIidp"
+.TQ
+.BI "tunnel ssh " edge " \fB\-\-idp \fIidp"
+A stream to a
+.B \-\-forward
+target of a tunnel edge, between stdin and stdout, for the person signed in at
+.I idp
+by
+.BR login ;
+.B ssh
+is to 127.0.0.1:22 there, for ssh's
+.BR ProxyCommand .
+Errors are said on stderr, since stdout is the stream. A target the edge does
+not name is exit 1.
+.RS
+.PP
+.nf
+ssh \-o ProxyCommand='socketley tunnel ssh t.example.com \-\-idp auth.example.com' root@server
 .fi
 .RE
 .TP
@@ -1875,7 +1917,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -13965,6 +14007,120 @@ connections refused for want of TLS, the policies fetched and what testing ones
 would have failed, what Sieve rejected, sent on and answered on vacation, the
 MX lookups, what the spam filter refused and filed in Junk, what was
 greylisted, the reports sent, and the IMAP connections and reads.
+.SH TUNNEL FLAGS
+A
+.B tunnel
+runtime makes a machine that has no address of its own reachable \(em one at
+home behind a router, behind carrier-grade NAT, on a network that lets only
+port 443 out. The machine runs an
+.B agent
+that dials out to an
+.BR edge ,
+a tunnel runtime on a machine the internet reaches, and holds that one
+connection open; the edge serves the agent's services under its own names and
+carries each visitor through the connection the agent made. Nothing is opened
+on the router.
+.PP
+.nf
+# on the machine with the address
+socketley create tunnel t \-\-mode edge \-p 9450 \-\-domain t \-s
+socketley tunnel t invite pi \-\-http home \-\-tcp mc:25565
+# on the machine at home, with what invite printed
+socketley create tunnel pi \-\-mode agent \-\-to https://t.example.com \e
+    \-\-join pi.Xw3... \-\-offer home=127.0.0.1:8123,mc=127.0.0.1:25565 \-s
+.fi
+.PP
+An HTTP service is reached at
+.IB service . domain
+of the edge, here
+.BR https://home.t.example.com :
+the edge serves it on a socket the entrance routes that name to, with the
+entrance's certificate, and the dns runtime answers the name by the edge's
+wildcard. A TCP service is a port on the edge, here 25565. The edge says
+nothing about a stream it carries: what reaches the agent is what the visitor
+sent, and the service answers as if they were on the same machine.
+.PP
+Each connection is a multiplexed link (one TLS connection, many streams, each
+with its own credit so one slow reader holds back only its own stream), opened
+by an HTTP upgrade at
+.B /.tunnel
+that passes the entrance like any other. An agent pings every 15 seconds; a
+link silent for 45 is given up and the agent dials again, after a pause that
+doubles to half a minute.
+.PP
+.B Who may connect.
+.B socketley tunnel
+.I edge
+.B invite
+prints an invitation once; the agent joins with it at its first connection and
+is given a key of its own in its place, kept in its state directory (0600),
+and the invitation is spent. The edge keeps only hashes.
+.B revoke
+cuts an agent off within a second;
+.B set
+changes what it offers and keeps its key.
+.PP
+.B People.
+An edge with
+.B \-\-forward
+carries a person signed in at its
+.B \-\-idp
+to the targets it names, and to nothing else, as
+.B socketley tunnel connect
+or
+.B tunnel ssh
+asks; this is how ssh reaches a server through port 443:
+.RS
+.PP
+.nf
+Host server
+    ProxyCommand socketley tunnel ssh t.example.com \-\-idp auth.example.com
+.fi
+.RE
+.TP
+.BR "\-\-mode edge" | agent
+Which end this is; an edge unless told.
+.TP
+.BI "\-p " port
+An edge's port for agents and people, on 127.0.0.1 unless
+.B \-\-bind
+says otherwise, since the entrance in front of it terminates TLS.
+.TP
+.BI "\-\-domain " name
+An edge's name, under which its agents' HTTP services are named.
+.TP
+.BI "\-\-to " url
+The edge an agent dials,
+.BI https:// host
+.RI [: port ];
+.B http://
+only for one on the same machine.
+.TP
+.BI "\-\-join " invitation
+What
+.B invite
+printed, used once.
+.TP
+.BI "\-\-offer " service = host : port ,...
+What an agent carries the edge's streams to, by the service names the edge
+invited it with; a name it does not offer is refused at the agent.
+.TP
+.BI "\-\-forward " host : port ,...
+Where an edge carries a signed-in person's stream.
+.TP
+.BI "\-\-idp " idp
+The idp runtime whose people may use
+.BR \-\-forward .
+.TP
+.BI "\-\-idp\-audience " client ,...
+The clients whose access tokens are taken, as
+.B socketley\-cli
+for
+.BR "socketley login" .
+.PP
+A tunnel takes no
+.BR \-\-shards :
+each agent's link is held by one process.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never

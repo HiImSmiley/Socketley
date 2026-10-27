@@ -11,6 +11,7 @@
 #include "../../runtime/dns/dns_instance.h"
 #include "../../runtime/sync/sync_instance.h"
 #include "../../runtime/idp/idp_instance.h"
+#include "../../runtime/tunnel/tunnel_instance.h"
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
@@ -159,6 +160,27 @@ void apply_idp_config(idp_instance& ip, const runtime_config& cfg, bool by_prese
         ip.set_cookie_domain(cfg.idp_cookie_domain);
     if (asked("ssh_ca", cfg.idp_ssh_ca_hours != 0))
         ip.set_ssh_ca_hours(cfg.idp_ssh_ca_hours);
+}
+
+void apply_tunnel_config(tunnel_instance& tn, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("mode", cfg.tunnel_mode != 0))
+        tn.set_mode(cfg.tunnel_mode ? tunnel_instance::mode::agent : tunnel_instance::mode::edge);
+    if (asked("to", !cfg.tunnel_to.empty()))
+        tn.set_to(cfg.tunnel_to);
+    if (asked("join", !cfg.tunnel_join.empty()))
+        tn.set_join(cfg.tunnel_join);
+    if (asked("offer", !cfg.tunnel_offers.empty()))
+        tn.set_offers(cfg.tunnel_offers);
+    if (asked("forward", !cfg.tunnel_forward.empty()))
+        tn.set_forward(cfg.tunnel_forward);
+    if (asked("idp", !cfg.tunnel_idp.empty()))
+        tn.set_idp(cfg.tunnel_idp);
+    if (asked("idp_audience", !cfg.tunnel_idp_audience.empty()))
+        tn.set_idp_audience(cfg.tunnel_idp_audience);
 }
 
 void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence)
@@ -572,6 +594,9 @@ bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by
             break;
         case runtime_mail:
             apply_mail_config(static_cast<mail_instance&>(rt), cfg, by_presence);
+            break;
+        case runtime_tunnel:
+            apply_tunnel_config(static_cast<tunnel_instance&>(rt), cfg, by_presence);
             break;
     }
 

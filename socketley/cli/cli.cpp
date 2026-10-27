@@ -695,6 +695,8 @@ int cli_dispatch(int argc, char** argv)
             return cli_idp_user(argc, argv);
         case fnv1a("idp-ssh"):
             return cli_idp_ssh(argc, argv);
+        case fnv1a("tunnel"):
+            return cli_tunnel(argc, argv);
         case fnv1a("db-backup"):
             return cli_db_backup(argc, argv);
         case fnv1a("mqtt-pub"):

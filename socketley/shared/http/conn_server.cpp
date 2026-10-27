@@ -7,6 +7,8 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "../runtime/runtime_instance.h"
@@ -49,6 +51,102 @@ bool conn_server::listen_tcp(uint32_t addr, uint16_t port, bool shared, std::str
     return true;
 }
 
+bool conn_server::listen_unix(const std::string& path, std::string& why)
+{
+    sockaddr_un a{};
+    if (path.size() >= sizeof a.sun_path)
+    {
+        why = "the socket path " + path + " is too long";
+        return false;
+    }
+    m_listen_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (m_listen_fd < 0)
+    {
+        why = std::string("no socket: ") + std::strerror(errno);
+        return false;
+    }
+    a.sun_family = AF_UNIX;
+    std::memcpy(a.sun_path, path.data(), path.size());
+    ::unlink(path.c_str());
+    if (::bind(m_listen_fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0 || ::chmod(path.c_str(), 0660) < 0 ||
+        ::listen(m_listen_fd, 1024) < 0)
+    {
+        why = path + " could not be bound: " + std::strerror(errno);
+        ::close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+    m_unix_path = path;
+    return true;
+}
+
+std::shared_ptr<server_conn> conn_server::dial(const sockaddr_storage& addr, socklen_t len, std::string& why)
+{
+    if (m_stopped)
+    {
+        why = "stopped";
+        return nullptr;
+    }
+    const int fd = ::socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+    {
+        why = std::string("no socket: ") + std::strerror(errno);
+        return nullptr;
+    }
+    auto c = m_hooks.make_conn();
+    c->id = m_next_id++;
+    c->fd = fd;
+    c->peer = addr;
+    c->last = wall::now_sec_coarse();
+    if (addr.ss_family != AF_UNIX)
+    {
+        int one = 1;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    }
+    c->cn = io_request{};
+    c->cn.owner = m_owner;
+    c->cn.buffer = reinterpret_cast<char*>(c.get());
+    c->cn.fd = fd;
+    c->cn.type = op_connect;
+    c->cn_pending = m_loop.submit_connect(fd, reinterpret_cast<const sockaddr*>(&c->peer), len, &c->cn);
+    if (!c->cn_pending)
+    {
+        ::close(fd);
+        why = "the ring is full";
+        return nullptr;
+    }
+    m_conns.emplace(c->id, c);
+    m_rt.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
+    return c;
+}
+
+void conn_server::connect_done(const std::shared_ptr<server_conn>& c, int res)
+{
+    c->cn_pending = false;
+    if (c->dead)
+    {
+        forget_if_idle(c);
+        return;
+    }
+    m_hooks.connected(c, res);
+    if (res < 0)
+    {
+        close_conn(c);
+        return;
+    }
+    if (!c->dead)
+    {
+        arm_read(c);
+        flush(c);
+    }
+}
+
+void conn_server::forget_if_idle(const std::shared_ptr<server_conn>& c)
+{
+    if (!c->rd_pending && !c->wr_pending && !c->cn_pending)
+        std::erase(m_closing, c);
+}
+
 void conn_server::start_accepting()
 {
     arm_accept();
@@ -65,6 +163,8 @@ void conn_server::stop()
         m_loop.close_fd(m_listen_fd);
         m_listen_fd = -1;
     }
+    if (!m_unix_path.empty())
+        ::unlink(m_unix_path.c_str());
     std::vector<std::shared_ptr<server_conn>> all;
     all.reserve(m_conns.size());
     for (auto& [id, c] : m_conns)
@@ -147,7 +247,7 @@ bool conn_server::on_cqe(io_request* req, struct io_uring_cqe* cqe)
         accept_done(cqe);
         return true;
     }
-    if (req->type != op_read && req->type != op_write)
+    if (req->type != op_read && req->type != op_write && req->type != op_connect)
         return false;
     auto c = conn_of(req);
     if (!c)
@@ -156,12 +256,14 @@ bool conn_server::on_cqe(io_request* req, struct io_uring_cqe* cqe)
         read_done(c, cqe->res);
     else if (req == &c->wr)
         write_done(c, cqe->res);
+    else if (req == &c->cn)
+        connect_done(c, cqe->res);
     return true;
 }
 
 void conn_server::arm_read(const std::shared_ptr<server_conn>& c)
 {
-    if (c->dead || c->rd_pending || c->fd < 0)
+    if (c->dead || c->rd_pending || c->cn_pending || c->read_eof || c->fd < 0)
         return;
     c->rd = io_request{};
     c->rd.owner = m_owner;
@@ -178,8 +280,12 @@ void conn_server::read_done(const std::shared_ptr<server_conn>& c, int res)
     c->rd_pending = false;
     if (c->dead)
     {
-        if (!c->wr_pending)
-            std::erase(m_closing, c);
+        forget_if_idle(c);
+        return;
+    }
+    if (res == 0 && m_hooks.read_ended(c))
+    {
+        c->read_eof = true;
         return;
     }
     if (res <= 0)
@@ -208,7 +314,7 @@ void conn_server::resume(const std::shared_ptr<server_conn>& c)
 
 void conn_server::flush(const std::shared_ptr<server_conn>& c)
 {
-    if (c->dead || c->wr_pending)
+    if (c->dead || c->wr_pending || c->cn_pending)
         return;
     if (c->sent >= c->sending.size())
     {
@@ -239,8 +345,7 @@ void conn_server::write_done(const std::shared_ptr<server_conn>& c, int res)
     c->wr_pending = false;
     if (c->dead)
     {
-        if (!c->rd_pending)
-            std::erase(m_closing, c);
+        forget_if_idle(c);
         return;
     }
     if (res <= 0)
@@ -270,7 +375,7 @@ void conn_server::close_conn(const std::shared_ptr<server_conn>& c)
     }
     m_conns.erase(c->id);
     m_rt.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
-    if (c->rd_pending || c->wr_pending)
+    if (c->rd_pending || c->wr_pending || c->cn_pending)
         m_closing.push_back(c);
     // The descriptor just given back is room for the accept that ran out.
     resume_accept();

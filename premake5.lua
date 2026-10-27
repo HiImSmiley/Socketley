@@ -1400,6 +1400,45 @@ project "fuzz_raft_msg"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the tunnel's multiplexing, and the SSH certificate reader ───
+
+project "fuzz_tunnel_mux"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_tunnel_mux.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/shared/net/tunnel_mux.cpp"
+    }
+
+    fuzz_target_settings()
+
+project "fuzz_ssh_cert"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_ssh_cert.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/shared/crypto/ssh_cert.cpp",
+        "socketley/shared/crypto/ed25519.cpp",
+        "socketley/shared/crypto/key_file.cpp",
+        "socketley/shared/crypto/jws.cpp",
+        "socketley/shared/util/base64.cpp"
+    }
+    links { "crypto" }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: SigV4 request verification and the aws-chunked decoder ───
 --
 -- Reachable by anything that can send an HTTP request to a storage runtime, before the request is otherwise looked at.
@@ -2902,6 +2941,40 @@ project "test_ssh_ca"
 
     files { "test/unit/test_ssh_ca.cpp", "socketley/shared/crypto/ssh_cert.cpp", "socketley/shared/crypto/ed25519.cpp",
             "socketley/shared/crypto/key_file.cpp", "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+project "test_tunnel_mux"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_tunnel_mux.cpp", "socketley/shared/net/tunnel_mux.cpp", "socketley/runtime/tunnel/tunnel_registry.cpp",
+            "socketley/shared/crypto/jws.cpp", "socketley/shared/crypto/key_file.cpp", "socketley/shared/util/base64.cpp",
+            "socketley/shared/persist/paths.cpp" }
+    links { "crypto", "dl" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

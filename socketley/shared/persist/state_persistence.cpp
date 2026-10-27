@@ -12,6 +12,7 @@
 #include "../../runtime/dns/dns_instance.h"
 #include "../../runtime/sync/sync_instance.h"
 #include "../../runtime/idp/idp_instance.h"
+#include "../../runtime/tunnel/tunnel_instance.h"
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
@@ -715,6 +716,18 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.idp_ssh_ca_hours = ip->get_ssh_ca_hours();
             break;
         }
+        case runtime_tunnel:
+        {
+            auto* tn = static_cast<const tunnel_instance*>(instance);
+            cfg.tunnel_mode = static_cast<uint8_t>(tn->get_mode());
+            cfg.tunnel_to = std::string(tn->get_to());
+            cfg.tunnel_join = std::string(tn->get_join());
+            cfg.tunnel_offers = std::string(tn->get_offers());
+            cfg.tunnel_forward = std::string(tn->get_forward());
+            cfg.tunnel_idp = std::string(tn->get_idp());
+            cfg.tunnel_idp_audience = std::string(tn->get_idp_audience());
+            break;
+        }
         case runtime_db:
         {
             auto* db = static_cast<const db_instance*>(instance);
@@ -1178,6 +1191,21 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             if (cfg.idp_ssh_ca_hours)
                 append_int_field("ssh_ca", cfg.idp_ssh_ca_hours);
             break;
+        case runtime_tunnel:
+            append_str_field("mode", cfg.tunnel_mode ? "agent" : "edge");
+            if (!cfg.tunnel_to.empty())
+                append_str_field("to", cfg.tunnel_to);
+            if (!cfg.tunnel_join.empty())
+                append_str_field("join", cfg.tunnel_join);
+            if (!cfg.tunnel_offers.empty())
+                append_str_field("offer", cfg.tunnel_offers);
+            if (!cfg.tunnel_forward.empty())
+                append_str_field("forward", cfg.tunnel_forward);
+            if (!cfg.tunnel_idp.empty())
+                append_str_field("idp", cfg.tunnel_idp);
+            if (!cfg.tunnel_idp_audience.empty())
+                append_str_field("idp_audience", cfg.tunnel_idp_audience);
+            break;
         case runtime_db:
             if (!cfg.db_schema.empty())
                 append_str_field("schema", cfg.db_schema);
@@ -1525,6 +1553,15 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.idp_issuer = json_get_string(json, "issuer");
             cfg.idp_cookie_domain = json_get_string(json, "cookie_domain");
             cfg.idp_ssh_ca_hours = json_get_uint32(json, "ssh_ca");
+            break;
+        case runtime_tunnel:
+            cfg.tunnel_mode = json_get_string(json, "mode") == "agent" ? 1 : 0;
+            cfg.tunnel_to = json_get_string(json, "to");
+            cfg.tunnel_join = json_get_string(json, "join");
+            cfg.tunnel_offers = json_get_string(json, "offer");
+            cfg.tunnel_forward = json_get_string(json, "forward");
+            cfg.tunnel_idp = json_get_string(json, "idp");
+            cfg.tunnel_idp_audience = json_get_string(json, "idp_audience");
             break;
         case runtime_db:
             cfg.db_schema = json_get_string(json, "schema");

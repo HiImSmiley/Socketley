@@ -25,8 +25,10 @@ struct server_conn
     uint64_t id{0};
     int fd{-1};
     sockaddr_storage peer{};
-    io_request rd{}, wr{};
-    bool rd_pending{false}, wr_pending{false}, dead{false};
+    io_request rd{}, wr{}, cn{};
+    bool rd_pending{false}, wr_pending{false}, cn_pending{false}, dead{false};
+    // The far side wrote its last and this one may still write, for a runtime whose read_ended() keeps it open.
+    bool read_eof{false};
     // An answer is made on a later turn, so nothing more is read off this connection meanwhile.
     bool waiting{false};
     bool keep_alive{true};
@@ -63,6 +65,11 @@ public:
     virtual bool keeps_open(const server_conn&) const { return false; }
     // Called as a connection is let go, before its descriptor closes.
     virtual void closing(const std::shared_ptr<server_conn>&) {}
+    // The far side wrote its last; true keeps the connection open for what is still to be written, which the runtime
+    // then closes itself.
+    virtual bool read_ended(const std::shared_ptr<server_conn>&) { return false; }
+    // A dial() came to `res`: 0 connected and reading, or a negative errno, after which the connection is let go.
+    virtual void connected(const std::shared_ptr<server_conn>&, int /*res*/) {}
 };
 
 class conn_server
@@ -72,6 +79,10 @@ public:
 
     // The port on `addr` (network order), every shard's at once when `shared`; -1 with `why` when it cannot be.
     bool listen_tcp(uint32_t addr, uint16_t port, bool shared, std::string& why);
+    // A Unix socket at `path`, made 0660 in place of whatever was there; false with `why` when it cannot be.
+    bool listen_unix(const std::string& path, std::string& why);
+    // A connection to `addr`, its outcome told by the hooks' connected(); null with `why` when none could be begun.
+    std::shared_ptr<server_conn> dial(const sockaddr_storage& addr, socklen_t len, std::string& why);
     void start_accepting();
     // Stops accepting and closes every connection; what the ring still owes them is waited for by drained().
     void stop();
@@ -108,6 +119,9 @@ private:
     void arm_read(const std::shared_ptr<server_conn>& c);
     void read_done(const std::shared_ptr<server_conn>& c, int res);
     void write_done(const std::shared_ptr<server_conn>& c, int res);
+    void connect_done(const std::shared_ptr<server_conn>& c, int res);
+    // The connection let go of by the ring at last: nothing of it is in flight any more.
+    void forget_if_idle(const std::shared_ptr<server_conn>& c);
 
     event_loop& m_loop;
     io_handler* m_owner;
@@ -116,6 +130,7 @@ private:
     size_t m_max_conns;
 
     int m_listen_fd{-1};
+    std::string m_unix_path;
     io_request m_accept_req{};
     bool m_accept_pending{false};
     // The last accept failed for want of descriptors and none is armed.

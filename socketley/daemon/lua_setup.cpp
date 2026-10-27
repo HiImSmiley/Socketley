@@ -153,6 +153,11 @@ constexpr config_key config_keys[] = {
     { "issuer",             "--issuer",             key_kind::text    },
     { "cookie_domain",      "--cookie-domain",      key_kind::text    },
     { "ssh_ca",             "--ssh-ca",             key_kind::integer },
+    // ── tunnel ──────────────────────────────────────────────────────────────
+    { "to",                 "--to",                 key_kind::text    },
+    { "join",               "--join",               key_kind::text    },
+    { "offer",              "--offer",              key_kind::text    },
+    { "forward",            "--forward",            key_kind::text    },
     { "idp",                "--idp",                key_kind::text    },
     { "idp_audience",       "--idp-audience",       key_kind::text    },
     // ── db ──────────────────────────────────────────────────────────────────
@@ -757,8 +762,8 @@ void flatten(const sol::table& list, const std::string& base, std::vector<runtim
         e.name = *name_opt;
         runtime_type type;
         if (!type_opt || type_opt->empty())
-            e.refused = "it has no type (server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, or a "
-                        "registered type)\n";
+            e.refused = "it has no type (server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, "
+                        "tunnel, or a registered type)\n";
         else if (e.type = *type_opt; !parse_runtime_type(e.type.c_str(), type))
             e.refused = "unknown runtime type: " + e.type + "\n";
         else

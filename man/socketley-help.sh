@@ -238,7 +238,7 @@ cli_commands() {
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
     echo "  Create a new runtime: server, client, proxy, cache, storage, dns, sync, idp, db,"
-    echo "  mqtt, mail, or a type"
+    echo "  mqtt, mail, tunnel, or a type"
     echo "  registered by a manifest in the daemon's types directory"
     echo "  (/etc/socketley/types/ or ~/.config/socketley/types/), whose"
     echo "  schema keys become --<key> flags. See REGISTERED TYPES in man."
@@ -481,6 +481,18 @@ cli_commands() {
     echo "  An SSH certificate for the signed-in person's key, beside it as"
     echo "  -cert.pub, from an idp with --ssh-ca."
     echo -e "  ${CYAN}socketley ssh-cert auth.example.com${NC}"
+    echo ""
+
+    echo -e "${BOLD}tunnel <edge> invite|set <agent> --http <names> --tcp <name:port> | list | revoke <agent>${NC}"
+    echo "  The agents a tunnel edge takes: invite prints an invitation used"
+    echo "  once, set changes what an agent offers, revoke cuts it off."
+    echo -e "  ${CYAN}socketley tunnel t invite pi --http home --tcp mc:25565${NC}"
+    echo ""
+
+    echo -e "${BOLD}tunnel connect <edge> <host:port> --idp <idp> | tunnel ssh <edge> --idp <idp>${NC}"
+    echo "  A stream to an edge's --forward target over stdin and stdout, for"
+    echo "  the person signed in by login; ssh is for ProxyCommand."
+    echo -e "  ${CYAN}socketley tunnel ssh t.example.com --idp auth.example.com${NC}"
     echo ""
 
     echo -e "${BOLD}idp-ssh <idp> ca | host-sign <file.pub> --names <host,...> [--days N]${NC}"
@@ -928,6 +940,19 @@ runtime_types() {
     echo -e "${CYAN}│${NC} Accounts: socketley idp-user auth add|passwd|set|list|import   ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Example: socketley create idp auth -p 9400 \\                   ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   --domain auth.example.com --cookie-domain example.com -s     ${CYAN}│${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}TUNNEL${NC}                                                         ${CYAN}│${NC}"
+    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}│${NC} Reach a machine with no address of its own: its agent dials    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   out to an edge, which serves its services under its names.   ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Edge: --mode edge -p port --domain t [--forward h:p --idp idp] ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Agent: --mode agent --to https://t.x --join <invitation>       ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --offer name=host:port,...                              ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Agents: socketley tunnel <edge> invite|set|list|revoke         ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} ssh through 443: tunnel ssh <edge> --idp <idp> as ProxyCommand ${CYAN}│${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
@@ -1560,6 +1585,17 @@ flags_options() {
     echo "│ --every <duration>     │ How often the whole tree is walked  │"
     echo "│ --exclude <pat,...>    │ Shell patterns left out             │"
     echo "│ --repositories <file>  │ Pull a user's git repositories      │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${BOLD}Tunnel Flags (a machine reached through an edge; man: TUNNEL FLAGS):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --mode edge|agent      │ Which end this is                   │"
+    echo "│ --to <url>             │ The edge an agent dials             │"
+    echo "│ --join <invitation>    │ What invite printed, used once      │"
+    echo "│ --offer <name=h:p,..>  │ What an agent carries streams to    │"
+    echo "│ --forward <h:p,...>    │ Where an edge carries people        │"
+    echo "│ --idp <idp>            │ Whose people may use --forward      │"
     echo "└────────────────────────┴─────────────────────────────────────┘"
     echo ""
 
@@ -3637,6 +3673,8 @@ OTHER
   login <idp> | logout <idp>     sign in at an idp from the command line
   ssh-cert <idp>                 an SSH certificate for your key
   idp-ssh <idp> ca|host-sign     an idp's SSH authority
+  tunnel <edge> invite|list|...  a tunnel edge's agents
+  tunnel connect|ssh <edge> ...  a stream through a tunnel edge
   db-backup | db-restore         a db runtime to a file, or back from one
   db-query <db> <collection>     the documents a query of a db runtime finds
   mail [<mail>]                  what a mail runtime is and how it does (the name where there are more)

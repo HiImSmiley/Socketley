@@ -9,6 +9,7 @@
 #include "../../runtime/dns/dns_instance.h"
 #include "../../runtime/sync/sync_instance.h"
 #include "../../runtime/idp/idp_instance.h"
+#include "../../runtime/tunnel/tunnel_instance.h"
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
@@ -39,6 +40,8 @@ std::unique_ptr<runtime_instance> create_runtime(runtime_type type, std::string_
             return std::make_unique<mqtt_instance>(name);
         case runtime_mail:
             return std::make_unique<mail_instance>(name);
+        case runtime_tunnel:
+            return std::make_unique<tunnel_instance>(name);
         default:
             return type_registry::make(type, name);
     }

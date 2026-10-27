@@ -23,7 +23,8 @@ enum runtime_type : uint8_t
     runtime_idp     = 7,
     runtime_db      = 8,
     runtime_mqtt    = 9,
-    runtime_mail    = 10
+    runtime_mail    = 10,
+    runtime_tunnel  = 11
 };
 
 // The names, once.  Five places had this switch -- lua_context,
@@ -74,6 +75,11 @@ inline std::string shards_config_refusal(runtime_type type,
 
     // The same shape of refusal as the client's, with a worse ending: N shards share no socket here either, and the
     // index of what was last carried is one file, so N of them would overwrite each other's record of the last run.
+    // A link is held by one process, so a visitor reaching another shard's listener would find no agent there.
+    if (type == runtime_tunnel)
+        return "--shards is not available on a tunnel: each agent's link is held by one process, and a visitor "
+               "reaching another shard would find no agent there\n";
+
     if (type == runtime_sync)
         return "--shards is not available on a sync: it listens on nothing to share, and N of them would carry the "
                "same files over each other and write one index from N processes\n";

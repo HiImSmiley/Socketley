@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_mqtt fuzz_mail"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -89,6 +89,10 @@ build() {
 }
 
 want fuzz_resp     && build fuzz_resp "$ROOT/test/fuzz/fuzz_resp.cpp"
+want fuzz_tunnel_mux && build fuzz_tunnel_mux "$ROOT/test/fuzz/fuzz_tunnel_mux.cpp" "$ROOT/socketley/shared/net/tunnel_mux.cpp"
+want fuzz_ssh_cert && build fuzz_ssh_cert "$ROOT/test/fuzz/fuzz_ssh_cert.cpp" "$ROOT/socketley/shared/crypto/ssh_cert.cpp" \
+    "$ROOT/socketley/shared/crypto/ed25519.cpp" "$ROOT/socketley/shared/crypto/key_file.cpp" \
+    "$ROOT/socketley/shared/crypto/jws.cpp" "$ROOT/socketley/shared/util/base64.cpp" -lcrypto
 want fuzz_ws_frame && build fuzz_ws_frame "$ROOT/test/fuzz/fuzz_ws_frame.cpp" -lssl -lcrypto
 want fuzz_raft_msg && build fuzz_raft_msg "$ROOT/test/fuzz/fuzz_raft_msg.cpp" \
     "$ROOT/socketley/shared/cluster/raft_codec.cpp" "$ROOT/socketley/shared/cluster/raft.cpp" \
@@ -121,6 +125,7 @@ want fuzz_cache_ops && build fuzz_cache_ops \
 # fuzz_http_response is as cheap as the parser targets because the response
 # framing was lifted into a header that includes nothing else of ours.
 want fuzz_http_response && build fuzz_http_response "$ROOT/test/fuzz/fuzz_http_response.cpp"
+want fuzz_proxy_tunnel && build fuzz_proxy_tunnel "$ROOT/test/fuzz/fuzz_proxy_tunnel.cpp"
 
 # fuzz_event_loop is two translation units and one system library, and it never
 # opens a ring, so -luring is a link-time dependency only and the binary runs

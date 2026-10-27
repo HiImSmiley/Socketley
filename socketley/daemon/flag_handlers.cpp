@@ -21,6 +21,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
+#include "../runtime/tunnel/tunnel_instance.h"
 #include "../runtime/db/db_instance.h"
 #include "../runtime/mqtt/mqtt_instance.h"
 #include "../runtime/mail/mail_instance.h"
@@ -1858,6 +1859,60 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             db->set_backup_keep(n);
             return 0;
         }
+        default:
+            return -1;
+    }
+}
+
+int parse_tunnel_flags(tunnel_instance* tn, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+    const auto text = [&](const char* flag, const char* what, auto set) {
+        if (next.empty() || next.starts_with("--"))
+        {
+            std::cout << flag << " requires " << what << "\n";
+            return 1;
+        }
+        set(next);
+        ++i;
+        return 0;
+    };
+    switch (pa.hashes[i])
+    {
+        // An edge that agents dial out to, or an agent that dials one.
+        case fnv1a("--mode"):
+            if (next != "edge" && next != "agent")
+            {
+                std::cout << "--mode requires edge or agent\n";
+                return 1;
+            }
+            tn->set_mode(next == "edge" ? tunnel_instance::mode::edge : tunnel_instance::mode::agent);
+            ++i;
+            return 0;
+        case fnv1a("--to"):
+            if (!next.starts_with("https://") && !next.starts_with("http://"))
+            {
+                std::cout << "--to requires the edge's address, such as https://t.example.com\n";
+                return 1;
+            }
+            tn->set_to(next);
+            ++i;
+            return 0;
+        case fnv1a("--join"):
+            return text("--join", "the invitation `socketley tunnel <edge> invite` printed",
+                        [&](std::string_view v) { tn->set_join(v); });
+        case fnv1a("--offer"):
+            return text("--offer", "<service>=<host>:<port>, a comma between each",
+                        [&](std::string_view v) { tn->set_offers(v); });
+        case fnv1a("--forward"):
+            return text("--forward", "<host>:<port>, a comma between each, where signed-in people may be carried",
+                        [&](std::string_view v) { tn->set_forward(v); });
+        case fnv1a("--idp"):
+            return text("--idp", "the idp runtime whose signed-in people may use --forward",
+                        [&](std::string_view v) { tn->set_idp(v); });
+        case fnv1a("--idp-audience"):
+            return text("--idp-audience", "the clients, a comma between each, whose access tokens are taken",
+                        [&](std::string_view v) { tn->set_idp_audience(v); });
         default:
             return -1;
     }

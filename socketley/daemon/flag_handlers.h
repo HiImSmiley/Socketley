@@ -49,6 +49,7 @@ class storage_instance;
 class dns_instance;
 class sync_instance;
 class idp_instance;
+class tunnel_instance;
 class db_instance;
 class mqtt_instance;
 class mail_instance;
@@ -80,6 +81,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
 int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::string_view name);
 int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::string_view name);
 int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::string_view name);
+int parse_tunnel_flags(tunnel_instance* tn, const parsed_args& pa, size_t& i, std::string_view name);
 int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::string_view name);
 int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::string_view name);
 int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::string_view name);

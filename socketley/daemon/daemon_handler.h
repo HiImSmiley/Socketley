@@ -215,6 +215,8 @@ private:
     int cmd_mail(ipc_connection* conn, const parsed_args& pa);
     // dnssec <dns>: the DS records the parents of a signing dns runtime's zones are given, and their DNSKEYs.
     int cmd_dnssec(ipc_connection* conn, const parsed_args& pa);
+    // `tunnel <edge> invite|list|revoke`: the agents a tunnel edge takes, kept in its agents file.
+    int cmd_tunnel(ipc_connection* conn, const parsed_args& pa);
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);

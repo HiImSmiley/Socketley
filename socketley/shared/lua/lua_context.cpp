@@ -3035,6 +3035,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         case runtime_idp:
         case runtime_db:
         case runtime_mail:
+        case runtime_tunnel:
             // No verbs of their own yet.
             break;
     }
