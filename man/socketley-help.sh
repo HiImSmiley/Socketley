@@ -470,6 +470,25 @@ cli_commands() {
     echo -e "  ${CYAN}socketley idp-user auth add smiley --password - --groups admins${NC}"
     echo ""
 
+    echo -e "${BOLD}login <idp> [--client id] | logout <idp>${NC}"
+    echo "  Signs a person in at an idp by a code allowed in a browser; the"
+    echo "  tokens are kept for ssh-cert and tunnel, refreshed when they run out."
+    echo -e "  ${CYAN}socketley login auth.example.com${NC}"
+    echo -e "  ${CYAN}socketley logout auth.example.com${NC}"
+    echo ""
+
+    echo -e "${BOLD}ssh-cert <idp> [--key file.pub]${NC}"
+    echo "  An SSH certificate for the signed-in person's key, beside it as"
+    echo "  -cert.pub, from an idp with --ssh-ca."
+    echo -e "  ${CYAN}socketley ssh-cert auth.example.com${NC}"
+    echo ""
+
+    echo -e "${BOLD}idp-ssh <idp> ca | host-sign <file.pub> --names <host,...> [--days N]${NC}"
+    echo "  The idp's SSH authority: its public key for TrustedUserCAKeys and"
+    echo "  @cert-authority, and host certificates for HostCertificate."
+    echo -e "  ${CYAN}socketley idp-ssh auth ca > /etc/ssh/socketley_user_ca.pub${NC}"
+    echo ""
+
     echo -e "${BOLD}db-backup <db> <file>${NC}"
     echo "  A db runtime's documents written into one file while it serves."
     echo -e "  ${CYAN}socketley db-backup data /var/backups/data.dbbackup${NC}"
@@ -904,6 +923,8 @@ runtime_types() {
     echo -e "${CYAN}│${NC} Cores: --shards N, shard 0 writes accounts, every shard signs. ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Flags: --clients file (id secret|- redirect... a line),        ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}        --issuer url, --cookie-domain example.com               ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --ssh-ca hours (SSH certificates; client marked ssh)    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Devices: a client marked device; socketley login               ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Accounts: socketley idp-user auth add|passwd|set|list|import   ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Example: socketley create idp auth -p 9400 \\                   ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   --domain auth.example.com --cookie-domain example.com -s     ${CYAN}│${NC}"
@@ -1549,6 +1570,8 @@ flags_options() {
     echo "│ --issuer <url>         │ The https address every token names │"
     echo "│ --cookie-domain        │ Names that share the sign-in cookie │"
     echo "│ <domain>               │                                     │"
+    echo "│ --ssh-ca <hours>       │ Signs SSH certificates that hold    │"
+    echo "│                        │ this long                           │"
     echo "│ --shards <N>           │ Workers; shard 0 writes the         │"
     echo "│                        │ accounts                            │"
     echo "│ --tls --cert --key     │ Terminate TLS on its port           │"
@@ -3611,6 +3634,9 @@ OTHER
   acme issue --domains <names>   a certificate from Let's Encrypt
   git-sync --url <url> ...       mirror a git repository into a storage library
   idp-user <idp> add|passwd|...  an idp runtime's accounts
+  login <idp> | logout <idp>     sign in at an idp from the command line
+  ssh-cert <idp>                 an SSH certificate for your key
+  idp-ssh <idp> ca|host-sign     an idp's SSH authority
   db-backup | db-restore         a db runtime to a file, or back from one
   db-query <db> <collection>     the documents a query of a db runtime finds
   mail [<mail>]                  what a mail runtime is and how it does (the name where there are more)

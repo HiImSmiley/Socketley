@@ -120,6 +120,15 @@ private:
     // A sign-in that went through, counted and said in the log with who and from where.
     void signed_in(const account& who, std::string_view ip, std::string_view how);
 
+    // The SSH certificate authority (--ssh-ca): its public key, and a user certificate for the account an access
+    // token names, for a key the token's holder sends.
+    void ssh_ca_pub(const std::shared_ptr<conn>& c);
+    void ssh_user_cert(const std::shared_ptr<conn>& c, const request& rq);
+    // The principals a user certificate names: the username, root for the admins group, and <p> for each ssh:<p>.
+    static std::vector<std::string> ssh_principals(const account& who);
+    // A host certificate for `key_line` naming `names`, holding `days`; the certificate line, or `error: ...`.
+    std::string ssh_host_cert(std::string_view key_line, std::string_view names, uint32_t days);
+
     // What an authorize request asks, checked: the client and its redirect, or an error page when there is no
     // address to send the error to.
     const client* checked_client(const std::shared_ptr<conn>& c, const params& p);
@@ -224,6 +233,10 @@ private:
     std::string m_jwk;
     // What signs the refresh tokens, which only this provider reads back.
     std::string m_secret;
+    // What signs SSH certificates under --ssh-ca, null without it, and its public key as authorized_keys writes it.
+    EVP_PKEY* m_ssh_ca{nullptr};
+    std::string m_ssh_ca_line;
+    uint32_t m_ssh_hours{0};
     // Session cookies and access tokens already verified, so one sent again is not verified again.
     mutable verified_tokens m_verified;
 
@@ -252,7 +265,7 @@ private:
 
     struct counters
     {
-        uint64_t sign_ins{0}, refused{0}, barred{0}, codes{0}, tokens{0}, refreshes{0}, userinfo{0}, devices{0};
+        uint64_t sign_ins{0}, refused{0}, barred{0}, codes{0}, tokens{0}, refreshes{0}, userinfo{0}, devices{0}, ssh_certs{0};
         uint64_t crossed{0}, crossings_served{0}, reopened{0};
     } m_c;
 };

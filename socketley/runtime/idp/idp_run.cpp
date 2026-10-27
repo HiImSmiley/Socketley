@@ -17,7 +17,9 @@
 
 #include "idp_instance.h"
 #include "../../shared/http/http_framing.h"
+#include "../../shared/crypto/ed25519.h"
 #include "../../shared/crypto/jws.h"
+#include "../../shared/crypto/ssh_cert.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/ipc/shard_target.h"
@@ -139,6 +141,8 @@ idp_run::~idp_run()
     m_loop.deregister_owner(this);
     if (m_key)
         EVP_PKEY_free(m_key);
+    if (m_ssh_ca)
+        EVP_PKEY_free(m_ssh_ca);
 }
 
 bool idp_run::start(std::string& why)
@@ -157,6 +161,18 @@ bool idp_run::start(std::string& why)
     {
         why = err;
         return false;
+    }
+    m_ssh_hours = m_owner.get_ssh_ca_hours();
+    if (m_ssh_hours)
+    {
+        m_ssh_ca = socketley::ed25519::load_or_make(idp_ssh_ca_path(m_owner.get_name()), "the SSH CA key", err);
+        if (!m_ssh_ca)
+        {
+            why = err;
+            return false;
+        }
+        m_ssh_ca_line = socketley::ssh::line_of(socketley::ssh::ed25519_blob(socketley::ed25519::public_raw(m_ssh_ca)),
+                                                std::string(m_owner.get_name()) + "-ssh-ca");
     }
     m_kid = socketley::jws::thumbprint(m_key);
     m_secret = token_secret(m_key);
@@ -438,6 +454,10 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         device_page(c, rq, {}, {}, 200);
     else if (p == "/device" && post)
         device_post(c, rq);
+    else if (p == "/ssh/ca.pub" && get)
+        ssh_ca_pub(c);
+    else if (p == "/ssh/user-cert" && post)
+        ssh_user_cert(c, rq);
     else if (p == "/userinfo" && (get || post))
         userinfo(c, rq);
     else if (p == "/logout" && (get || post))
@@ -454,7 +474,7 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         security_post(c, rq);
     else if (p == "/.well-known/openid-configuration" || p == "/jwks" || p == "/authorize" || p == "/login" ||
              p == "/token" || p == "/userinfo" || p == "/logout" || p == "/" || p.starts_with("/account") ||
-             p == "/device" || p == "/device_authorization")
+             p == "/device" || p == "/device_authorization" || p == "/ssh/ca.pub" || p == "/ssh/user-cert")
         respond(c, 405, "text/plain", "method not allowed\n");
     else
         respond(c, 404, "text/plain", "not found\n");
@@ -1238,6 +1258,128 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     json_error(c, 400, "unsupported_grant_type", "only authorization_code, refresh_token and device_code are served");
+}
+
+// ─── The SSH certificate authority ──────────────────────────────────────────
+
+void idp_run::ssh_ca_pub(const std::shared_ptr<conn>& c)
+{
+    if (!m_ssh_ca)
+    {
+        respond(c, 404, "text/plain", "this provider signs no SSH certificates\n");
+        return;
+    }
+    respond(c, 200, "text/plain", m_ssh_ca_line + "\n", any_origin);
+}
+
+std::vector<std::string> idp_run::ssh_principals(const account& who)
+{
+    std::vector<std::string> out{std::string(who.username())};
+    std::string_view groups = who.field("groups");
+    while (!groups.empty())
+    {
+        const std::string_view g = socketley::trim_blanks(take_item(groups));
+        if (g == "admins")
+            out.emplace_back("root");
+        else if (g.starts_with("ssh:") && g.size() > 4)
+            out.emplace_back(g.substr(4));
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+void idp_run::ssh_user_cert(const std::shared_ptr<conn>& c, const request& rq)
+{
+    if (!m_ssh_ca)
+    {
+        respond(c, 404, "text/plain", "this provider signs no SSH certificates\n");
+        return;
+    }
+    std::string_view token;
+    claims a;
+    std::string why;
+    const int64_t now = wall::now_sec();
+    if (!http_auth_credentials(rq.authorization, "bearer", token) ||
+        !m_verified.verify(m_key, m_kid, "at+jwt", m_issuer, token, now, a, why))
+    {
+        respond(c, 401, "text/plain", "a valid bearer access token is required\n",
+                "WWW-Authenticate: Bearer error=\"invalid_token\"\r\n");
+        return;
+    }
+    // A token a web application was given cannot be turned into a way onto the user's servers.
+    const client* cl = find_client(claim(a, "client_id"));
+    if (!cl || !cl->ssh)
+    {
+        respond(c, 403, "text/plain", "the token was given to a client that may not ask for SSH certificates\n");
+        return;
+    }
+    const account* who = m_accounts.by_id(claim(a, "sub"));
+    if (!who || who->disabled() || who->field("reset") == "1" || !still_signed_in(*who, issued_ms(a)))
+    {
+        respond(c, 403, "text/plain", "the account is no longer one that may sign in\n");
+        return;
+    }
+    socketley::ssh::public_key key;
+    if (!socketley::ssh::parse_public_key(param(parse_form(rq.body), "public_key"), key, why))
+    {
+        respond(c, 400, "text/plain", "public_key: " + why + "\n");
+        return;
+    }
+    socketley::ssh::cert_request req;
+    req.subject_blob = key.blob;
+    req.kind = socketley::ssh::cert_kind::user;
+    req.serial = socketley::random_u64();
+    req.key_id = std::string(who->username()) + "@" + url_host(m_issuer);
+    req.principals = ssh_principals(*who);
+    // Five minutes back, for a server whose clock is a little behind this one.
+    req.valid_after = static_cast<uint64_t>(now - 300);
+    req.valid_before = static_cast<uint64_t>(now + int64_t{m_ssh_hours} * 3600);
+    req.extensions = socketley::ssh::default_user_extensions();
+    const std::string cert = socketley::ssh::sign_cert(req, m_ssh_ca, why);
+    if (cert.empty())
+    {
+        respond(c, 500, "text/plain", "the certificate could not be signed: " + why + "\n");
+        return;
+    }
+    ++m_c.ssh_certs;
+    std::string names;
+    for (const auto& pr : req.principals)
+        names += (names.empty() ? "" : ",") + pr;
+    LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": SSH certificate " + std::to_string(req.serial) + " for \"" +
+              std::string(who->username()) + "\" as " + names + ", " + std::to_string(m_ssh_hours) + " h, key " +
+              socketley::ssh::fingerprint(key.blob) + " from " + client_ip(*c, rq)).c_str());
+    respond(c, 200, "text/plain", socketley::ssh::line_of(cert, key.comment.empty() ? req.key_id : key.comment) + "\n");
+}
+
+std::string idp_run::ssh_host_cert(std::string_view key_line, std::string_view names, uint32_t days)
+{
+    if (!m_ssh_ca)
+        return "error: this provider signs no SSH certificates; give it --ssh-ca";
+    socketley::ssh::public_key key;
+    std::string why;
+    if (!socketley::ssh::parse_public_key(key_line, key, why))
+        return "error: " + why;
+    socketley::ssh::cert_request req;
+    req.subject_blob = key.blob;
+    req.kind = socketley::ssh::cert_kind::host;
+    req.serial = socketley::random_u64();
+    while (!names.empty())
+        if (const std::string_view n = socketley::trim_blanks(take_item(names)); !n.empty())
+            req.principals.emplace_back(n);
+    if (req.principals.empty())
+        return "error: a host certificate names at least one host";
+    req.key_id = req.principals.front();
+    const int64_t now = wall::now_sec();
+    req.valid_after = static_cast<uint64_t>(now - 300);
+    req.valid_before = static_cast<uint64_t>(now + int64_t{days} * 86400);
+    const std::string cert = socketley::ssh::sign_cert(req, m_ssh_ca, why);
+    if (cert.empty())
+        return "error: " + why;
+    LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": SSH host certificate " + std::to_string(req.serial) +
+              " for " + std::string(req.key_id) + ", " + std::to_string(days) + " days, key " +
+              socketley::ssh::fingerprint(key.blob)).c_str());
+    return socketley::ssh::line_of(cert, req.key_id);
 }
 
 // ─── The device grant ───────────────────────────────────────────────────────
@@ -2025,6 +2167,26 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         return;
     }
     const std::string action = args[0];
+    // The SSH authority's public key, and a host certificate: `ssh-host <key line> <names> <days>`.
+    if (action == "ssh-ca")
+    {
+        answer_command(ticket, m_ssh_ca ? m_ssh_ca_line + "\n"
+                                        : std::string("error: this provider signs no SSH certificates; give it --ssh-ca"));
+        return;
+    }
+    if (action == "ssh-host")
+    {
+        uint32_t days = 0;
+        if (args.size() != 4 || std::from_chars(args[3].data(), args[3].data() + args[3].size(), days).ec != std::errc{} ||
+            days < 1 || days > 3650)
+        {
+            answer_command(ticket, "error: idp-user ssh-host takes a public key line, names and 1 to 3650 days");
+            return;
+        }
+        const std::string out = ssh_host_cert(args[1], args[2], days);
+        answer_command(ticket, out.starts_with("error: ") ? out : out + "\n");
+        return;
+    }
     if (action == "list")
     {
         std::string out;

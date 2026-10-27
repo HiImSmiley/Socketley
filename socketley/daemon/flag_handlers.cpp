@@ -1717,6 +1717,21 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
             ip->set_cookie_domain(pa.args[++i]);
             return 0;
         }
+        // A certificate authority for SSH, its user certificates holding this many hours.
+        case fnv1a("--ssh-ca"):
+        {
+            uint32_t h = 0;
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), h);
+            if (v.empty() || ec != std::errc{} || end != v.data() + v.size() || h < 1 || h > 168)
+            {
+                std::cout << "--ssh-ca requires the hours a user certificate holds, 1 to 168, such as 8\n";
+                return 1;
+            }
+            ip->set_ssh_ca_hours(h);
+            ++i;
+            return 0;
+        }
         default:
             return -1;
     }

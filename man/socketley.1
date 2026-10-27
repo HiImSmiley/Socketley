@@ -1053,6 +1053,86 @@ socketley idp\-user auth import ui
 .fi
 .RE
 .TP
+.BI "login " "idp" " \fR[\fB\-\-client \fIid\fR]"
+.TQ
+.BI "logout " idp
+A person signed in at an
+.B idp
+runtime, this machine's or another's, by the device grant (RFC 8628):
+.B login
+prints the address and the code to allow there, waits until a browser signed
+in as that person allows it, and keeps the tokens in
+.I ~/.config/socketley/tokens/
+(0600), from where
+.B ssh\-cert
+and
+.B tunnel
+act as that person, refreshing the access token when it runs out. The client
+is
+.B socketley\-cli
+unless named; the provider allows the grant only to a client marked
+.B device
+in its
+.BR \-\-clients .
+.B logout
+forgets the tokens. A refused or expired code is exit 1.
+.RS
+.PP
+.nf
+socketley login auth.example.com
+.fi
+.RE
+.TP
+.BI "ssh\-cert " idp " \fR[\fB\-\-key \fIfile.pub\fR]"
+An SSH certificate for the person signed in at
+.I idp
+by
+.BR login ,
+for
+.I ~/.ssh/id_ed25519.pub
+or, without one,
+.I ~/.ssh/socketley_ed25519
+made for it, written beside the key as
+.IR \-cert.pub ,
+where ssh finds it. It holds the hours the provider's
+.B \-\-ssh\-ca
+says and names the username, root for the admins group, and
+.I name
+for each group
+.BI ssh: name .
+A provider refusing it, as for a token given to a client not marked
+.BR ssh ,
+is exit 1.
+.RS
+.PP
+.nf
+socketley ssh\-cert auth.example.com
+ssh root@server.example.com
+.fi
+.RE
+.TP
+.BI "idp\-ssh " idp " ca"
+.TQ
+.BI "idp\-ssh " idp " host\-sign " "file.pub " "\fB\-\-names \fIhost,...\fR [\fB\-\-days \fIN\fR]"
+The SSH authority of an idp runtime of this daemon:
+.B ca
+prints its public key, for sshd's
+.B TrustedUserCAKeys
+and a client's
+.B @cert\-authority
+line;
+.B host\-sign
+certifies a host key for the names given, 365 days unless told, the
+certificate written beside the key for sshd's
+.BR HostCertificate .
+.RS
+.PP
+.nf
+socketley idp\-ssh auth ca > /etc/ssh/socketley_user_ca.pub
+socketley idp\-ssh auth host\-sign /etc/ssh/ssh_host_ed25519_key.pub \-\-names server.example.com
+.fi
+.RE
+.TP
 .BI "db\-backup " "db file"
 Every document of a db runtime written into
 .IR file ,
@@ -12247,9 +12327,32 @@ The applications that sign in through it, one a line:
 with
 .B \-
 as the secret of a public client, which must then send a PKCE challenge. A
-redirect is an https address compared whole, http only on localhost. The file
-is read again when it changes; one broken while running keeps the clients read
-before it.
+redirect is an https address compared whole, http only on localhost. In place
+of a redirect,
+.B device
+lets the client sign a person in by the device grant, as
+.B socketley login
+does, and
+.B ssh
+lets its access tokens ask for SSH certificates. The file is read again when
+it changes; one broken while running keeps the clients read before it.
+.TP
+.BI "\-\-ssh\-ca " hours
+An SSH certificate authority: an Ed25519 key made at the first start and kept
+in the state directory, its public key at
+.BR /ssh/ca.pub ,
+and at
+.B /ssh/user\-cert
+a user certificate holding
+.I hours
+(1 to 168) for the account whose access token is sent, given only to a client
+marked
+.B ssh
+and never to a disabled account. Every certificate is said in the log with the
+account, its principals and the key's fingerprint. See
+.B ssh\-cert
+and
+.BR idp\-ssh .
 .TP
 .BI "\-\-issuer " url
 The https address the provider is reached at, which every token names; when

@@ -79,7 +79,7 @@ bool parse_clients(std::string_view text, std::vector<client>& out, std::string&
         const std::string where = "line " + std::to_string(line_no) + ": ";
         if (w.size() < 3)
         {
-            why = where + "a client is its id, its secret or -, and at least one redirect address or device";
+            why = where + "a client is its id, its secret or -, and at least one redirect address, device or ssh";
             return false;
         }
         client c;
@@ -95,9 +95,9 @@ bool parse_clients(std::string_view text, std::vector<client>& out, std::string&
         for (size_t i = 2; i < w.size(); ++i)
         {
             const std::string_view r = w[i];
-            if (r == "device")
+            if (r == "device" || r == "ssh")
             {
-                c.device = true;
+                (r == "device" ? c.device : c.ssh) = true;
                 continue;
             }
             // An http address only on this machine, where nobody can stand between the browser and the client.

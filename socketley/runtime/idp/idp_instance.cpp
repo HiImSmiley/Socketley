@@ -19,6 +19,11 @@ std::string idp_accounts_dir(std::string_view runtime_name)
     return (socketley_paths::resolve().state_dir / "idp" / (std::string(runtime_name) + ".accounts")).string();
 }
 
+std::string idp_ssh_ca_path(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "idp" / (std::string(runtime_name) + ".ssh-ca")).string();
+}
+
 idp_instance::idp_instance(std::string_view name) : runtime_instance(runtime_idp, name) {}
 
 idp_instance::~idp_instance() = default;

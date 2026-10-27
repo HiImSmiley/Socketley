@@ -157,6 +157,8 @@ void apply_idp_config(idp_instance& ip, const runtime_config& cfg, bool by_prese
         ip.set_issuer(cfg.idp_issuer);
     if (asked("cookie_domain", !cfg.idp_cookie_domain.empty()))
         ip.set_cookie_domain(cfg.idp_cookie_domain);
+    if (asked("ssh_ca", cfg.idp_ssh_ca_hours != 0))
+        ip.set_ssh_ca_hours(cfg.idp_ssh_ca_hours);
 }
 
 void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence)

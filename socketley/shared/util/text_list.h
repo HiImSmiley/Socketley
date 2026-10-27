@@ -14,4 +14,14 @@ inline std::string_view take_item(std::string_view& list, char sep = ',')
     return item;
 }
 
+// `s` without the spaces and tabs around it.
+inline std::string_view trim_blanks(std::string_view s)
+{
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
+        s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))
+        s.remove_suffix(1);
+    return s;
+}
+
 }   // namespace socketley

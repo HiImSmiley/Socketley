@@ -28,13 +28,15 @@ struct client
     std::vector<std::string> redirects;
     // Whether it may sign a person in by the device grant (RFC 8628), which `device` in place of a redirect allows.
     bool device{false};
+    // Whether its access tokens may ask for SSH certificates, which `ssh` in place of a redirect allows.
+    bool ssh{false};
 
     bool is_public() const { return secret.empty(); }
     bool allows(std::string_view redirect) const;
 };
 
 // `id secret redirect [redirect...]` a line, `-` as the secret for a public client, `device` among the redirects
-// for the device grant, `#` starting a comment; false with `why` naming the line for anything else, so a client is
+// for the device grant, `ssh` for SSH certificates, `#` starting a comment; false with `why` naming the line for anything else, so a client is
 // never half read.
 bool parse_clients(std::string_view text, std::vector<client>& out, std::string& why);
 

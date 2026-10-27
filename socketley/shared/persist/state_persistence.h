@@ -205,6 +205,7 @@ struct runtime_config
     std::string idp_clients;
     std::string idp_issuer;
     std::string idp_cookie_domain;
+    uint32_t idp_ssh_ca_hours = 0;
 
     // Db
     std::string db_schema;

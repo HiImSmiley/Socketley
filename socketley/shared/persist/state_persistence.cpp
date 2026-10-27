@@ -712,6 +712,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.idp_clients = std::string(ip->get_clients());
             cfg.idp_issuer = std::string(ip->get_issuer_flag());
             cfg.idp_cookie_domain = std::string(ip->get_cookie_domain());
+            cfg.idp_ssh_ca_hours = ip->get_ssh_ca_hours();
             break;
         }
         case runtime_db:
@@ -1174,6 +1175,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("issuer", cfg.idp_issuer);
             if (!cfg.idp_cookie_domain.empty())
                 append_str_field("cookie_domain", cfg.idp_cookie_domain);
+            if (cfg.idp_ssh_ca_hours)
+                append_int_field("ssh_ca", cfg.idp_ssh_ca_hours);
             break;
         case runtime_db:
             if (!cfg.db_schema.empty())
@@ -1521,6 +1524,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.idp_clients = json_get_string(json, "clients");
             cfg.idp_issuer = json_get_string(json, "issuer");
             cfg.idp_cookie_domain = json_get_string(json, "cookie_domain");
+            cfg.idp_ssh_ca_hours = json_get_uint32(json, "ssh_ca");
             break;
         case runtime_db:
             cfg.db_schema = json_get_string(json, "schema");

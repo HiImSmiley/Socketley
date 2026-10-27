@@ -27,6 +27,9 @@ std::string idp_jwks_path(std::string_view runtime_name);
 // <state>/idp/<name>.accounts/, the accounts' snapshot and journal.
 std::string idp_accounts_dir(std::string_view runtime_name);
 
+// <state>/idp/<name>.ssh-ca, the Ed25519 key it signs SSH certificates with under --ssh-ca.
+std::string idp_ssh_ca_path(std::string_view runtime_name);
+
 class idp_instance : public runtime_instance, public deferred_request_sink
 {
 public:
@@ -46,6 +49,10 @@ public:
     void set_cookie_domain(std::string_view d) { m_cookie_domain = std::string(d); }
     std::string_view get_cookie_domain() const { return m_cookie_domain; }
 
+    // How many hours an SSH user certificate it signs holds (--ssh-ca), 0 when it signs none.
+    void set_ssh_ca_hours(uint32_t h) { m_ssh_ca_hours = h; }
+    uint32_t get_ssh_ca_hours() const { return m_ssh_ca_hours; }
+
     std::string config_refusal() const override;
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
@@ -64,6 +71,7 @@ private:
     std::string m_clients;
     std::string m_issuer;
     std::string m_cookie_domain;
+    uint32_t m_ssh_ca_hours{0};
 
     std::unique_ptr<socketley::idp::idp_run> m_run;
     // Runs stopped but still owed completions by the ring.

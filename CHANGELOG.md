@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Guessed client secrets bar the address.** Five wrong client secrets at an
+  idp's token endpoint from one address in a quarter of an hour bar it there,
+  as five wrong passwords already did at the sign-in page.
 - **Access tokens are for the application they were given to.** A db, mail
   or mqtt runtime with `--idp` takes an access token only from a client
   `--idp-audience` names; a token the provider gave any other application
@@ -17,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **SSH by the sign-in.** An idp runtime with `--ssh-ca <hours>` is an SSH
+  certificate authority: `socketley login <idp>` signs a person in from the
+  command line by a code they allow in a browser (the device grant, RFC 8628,
+  for a client marked `device` in `--clients`), `socketley ssh-cert <idp>`
+  then gets a certificate for their key that holds that many hours and names
+  their username, `root` for the admins group and each `ssh:<name>` group,
+  and sshd takes it with `TrustedUserCAKeys`. `socketley idp-ssh <idp> ca`
+  prints the authority's key, `host-sign` certifies a server's host key for
+  `@cert-authority`. Only a client marked `ssh` may ask, a disabled account
+  gets nothing, and every certificate is said in the log.
+- **Every sign-in in the log.** An idp runtime says who signed in, how and
+  from where, and who allowed or refused a device.
 - **A machine whole, data and all.** `socketley export --full <file>`
   writes the setup and every runtime's data into one tar archive (gzip,
   `--compress best` for gzip -9's effort, or `none`, compressed on every
