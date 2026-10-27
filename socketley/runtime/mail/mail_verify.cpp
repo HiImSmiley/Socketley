@@ -183,7 +183,11 @@ bool expand(std::string_view spec, const std::string& domain, spf_state& s, std:
                 labels.erase(labels.begin(), labels.end() - static_cast<long>(keep));
             std::string joined;
             for (size_t i = 0; i < labels.size(); ++i)
-                joined += (i ? "." : "") + std::string(labels[i]);
+            {
+                if (i)
+                    joined += '.';
+                joined += labels[i];
+            }
             // An upper-case letter asks for the value URL-escaped (RFC 7208 7.3).
             if (given != letter)
             {
