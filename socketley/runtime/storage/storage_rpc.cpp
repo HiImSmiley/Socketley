@@ -207,6 +207,25 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
         case op::del:
         {
             ++m_c.deletes;
+            // A conditional delete is asked of the latest under its lane, so a write between the ask and the removal
+            // cannot be what goes.
+            if (!rq.if_match.empty())
+            {
+                delete_condition cond;
+                cond.if_match = rq.if_match;
+                m_store.remove_version(rq.bucket, rq.key, {}, [this, answer, bucket = rq.bucket, key = rq.key](remove_result r)
+                {
+                    if (r.status != st::ok)
+                    {
+                        answer(op::del, refusal_for(r.status));
+                        return;
+                    }
+                    answer(op::del, storage_rpc::reply{});
+                    if (r.existed)
+                        notify_delete(bucket, key);
+                }, false, {}, std::move(cond));
+                return true;
+            }
             m_store.remove(rq.bucket, rq.key, [this, answer, bucket = rq.bucket, key = rq.key](st s, bool existed)
             {
                 if (s != st::ok)
@@ -408,7 +427,7 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                 storage_rpc::reply r;
                 r.info = rpc_info_of(pr->meta);
                 answer(op::put, r);
-            }, err);
+            }, err, put_condition{rq.if_match, rq.if_none_match});
             if (!state->whole && !state->done)
             {
                 state->done = true;
@@ -677,7 +696,7 @@ void storage_run::sweep_streams()
 }
 
 std::shared_ptr<put_op> storage_run::begin_own_put(const std::string& bucket, const std::string& key, object_meta meta,
-                                                   uint64_t size, s3_error& err)
+                                                   uint64_t size, s3_error& err, bool poolable)
 {
     // A bucket that encrypts its new objects encrypts this one too.
     sse_seal_spec seal;
@@ -704,7 +723,7 @@ std::shared_ptr<put_op> storage_run::begin_own_put(const std::string& bucket, co
     // Given S3's default checksum like a client's object.
     reserve_checksum(meta, default_checksum_algo);
     st why = st::ok;
-    auto op_ptr = m_store.begin_put(bucket, key, std::move(meta), size, true, why, true, sealed ? &seal : nullptr);
+    auto op_ptr = m_store.begin_put(bucket, key, std::move(meta), size, true, why, poolable, sealed ? &seal : nullptr);
     if (!op_ptr)
     {
         err = error_for(why);
@@ -717,11 +736,14 @@ std::shared_ptr<put_op> storage_run::begin_own_put(const std::string& bucket, co
 std::shared_ptr<storage_run::whole_put> storage_run::put_whole(const std::string& bucket, const std::string& key,
                                                               object_meta meta, std::string data,
                                                               std::function<void(st, const put_result*)> done,
-                                                              s3_error& err)
+                                                              s3_error& err, put_condition cond)
 {
-    auto op_ptr = begin_own_put(bucket, key, std::move(meta), data.size(), err);
+    // A pooled file is rolled forward after a crash without its condition, so a conditional put is not pooled.
+    auto op_ptr = begin_own_put(bucket, key, std::move(meta), data.size(), err, !cond.any());
     if (!op_ptr)
         return nullptr;
+    if (cond.any())
+        op_ptr->set_condition(std::move(cond));
     auto w  = std::make_shared<whole_put>();
     w->put  = std::move(op_ptr);
     w->data = std::move(data);

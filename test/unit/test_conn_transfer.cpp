@@ -427,6 +427,15 @@ TEST_CASE("the shard tag cannot be reached by a counter that wraps")
     s.set_shard(1);
     for (int i = 0; i < 1000; ++i)
         CHECK(conn_ref_shard(conn_ref{1, s.next()}) == 1u);
+    // And across the wrap itself, from just short of 2^58: still shard 1, and never serial 0.
+    conn_serial_source end(conn_serial_counter_mask - 2);
+    end.set_shard(1);
+    for (int i = 0; i < 6; ++i)
+    {
+        const conn_ref r{1, end.next()};
+        CHECK(conn_ref_shard(r) == 1u);
+        CHECK((r.serial & conn_serial_counter_mask) != 0);
+    }
 }
 
 TEST_CASE("an unsharded runtime reads as shard 0, which is what it is")

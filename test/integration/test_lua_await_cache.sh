@@ -63,6 +63,13 @@ echo "=== Integration: a Lua handler that waits for the linked cache ==="
 SCRIPT="$SOCKETLEY_TMPD/await.lua"
 cat > "$SCRIPT" <<'LUA'
 function on_client_message(id, msg)
+    -- Two awaits in one invocation, the first given up on, for the reply that comes late.
+    if msg == "twice" then
+        local a = self.cache("get k1")
+        local b = self.cache("get k2")
+        self.send(id, "a=" .. tostring(a) .. " b=" .. tostring(b))
+        return
+    end
     local v, err = self.cache("get " .. msg)
     if v then
         self.send(id, "v=" .. v)
@@ -173,6 +180,37 @@ else
         FAIL=$((FAIL+1))
         echo "  FAIL [deadline]: the answer had not arrived after ${waited}s"
     fi
+fi
+
+# ─── A reply that comes after its await was given up on ────────────────────
+# The cache is frozen while the first await waits, so it times out and the handler waits again; let go after that,
+# the cache answers the first request late and then the second, and the late one is not the second await's answer.
+CACHE_PID=$("$BIN" stats awcache 2>/dev/null | grep -oP '^pid:\K[0-9]+' | head -1)
+if [ -z "$CACHE_PID" ]; then
+    echo "  FAIL [setup]: the cache reports no pid to freeze"
+    FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1))
+else
+    FROZEN=$CACHE_PID
+    kill -STOP "$FROZEN" 2>/dev/null || true
+    outf="$SOCKETLEY_TMPD/late.out"
+    : > "$outf"
+    wfifo="$SOCKETLEY_TMPD/late.in"
+    rm -f "$wfifo"; mkfifo "$wfifo"
+    { echo "twice"; sleep 40; } > "$wfifo" &
+    wpid=$!
+    timeout 45 nc 127.0.0.1 "$SRV_PORT" < "$wfifo" > "$outf" 2>/dev/null &
+    ncpid=$!
+    # Past the first await's ten seconds and the sweep's tick, so the second is the one waiting.
+    sleep 13
+    kill -CONT "$FROZEN" 2>/dev/null || true
+    FROZEN=""
+    for _ in $(seq 1 100); do [ -s "$outf" ] && break; sleep 0.2; done
+    kill "$ncpid" 2>/dev/null || true
+    pkill -P "$wpid" 2>/dev/null || true
+    kill "$wpid" 2>/dev/null || true
+    wait "$ncpid" "$wpid" 2>/dev/null || true
+    got=$(tr -d '\r' < "$outf")
+    assert_eq "$got" "a=nil b=second" "a reply that came after its await was given up on is not the next await's answer"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

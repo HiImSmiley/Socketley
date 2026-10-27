@@ -1472,3 +1472,37 @@ TEST_CASE("membership encoding keeps voters and learners apart")
     // A node named on both sides is a voter.
     CHECK(raft::decode_config(raft::encode_config({1, 2}, {2, 5})).learners == std::vector<raft::node_id>{5});
 }
+
+TEST_CASE("a follower takes the read index its leader answers from a term it has not heard of yet")
+{
+    raft::options o;
+    o.id = 2;
+    raft::persisted p;
+    p.hard.term   = 3;
+    p.snap.voters = {1, 2, 3};
+    raft::node n(o, std::move(p));
+    raft::message hb;
+    hb.type = raft::msg_type::heartbeat;
+    hb.from = 1;
+    hb.to   = 2;
+    hb.term = 3;
+    n.step(hb);
+    REQUIRE(n.leader() == 1);
+    REQUIRE(n.read_index(77));
+    CHECK_FALSE(n.take_ready().messages.empty());
+    // Node 1 was elected again at term 4 while this one heard nothing, and answers the read from there.
+    raft::message rr;
+    rr.type    = raft::msg_type::read_index_resp;
+    rr.from    = 1;
+    rr.to      = 2;
+    rr.term    = 4;
+    rr.context = 77;
+    n.step(rr);
+    bool answered = false;
+    while (n.has_ready())
+        for (const raft::read_state& r : n.take_ready().reads)
+            answered = answered || r.request == 77;
+    CHECK(answered);
+    CHECK(n.term() == 4);
+    CHECK(n.leader() == 1);
+}

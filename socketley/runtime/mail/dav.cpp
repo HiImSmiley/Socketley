@@ -986,9 +986,15 @@ struct op : std::enable_shared_from_this<op>
                 if (!self->allowed(cur))
                     return self->reply(error_reply(412, "the entry is not as the request supposes"));
                 const bool fresh = cur.empty();
+                // A conditional request writes only over what it was checked against, which the storage asks again
+                // under the key's lane, so two clients both passing the check above cannot both write.
+                const bool conditional = !self->rq.header("if-match").empty() || !self->rq.header("if-none-match").empty();
+                std::string expect = conditional ? (fresh ? std::string("-") : cur) : std::string();
                 self->store.put(self->user, self->here.kind, self->here.coll, self->here.name, std::move(self->rq.body),
-                                entry_type(self->here.kind), [self, fresh](std::string etag) {
-                                    if (etag.empty())
+                                entry_type(self->here.kind), std::move(expect), [self, fresh](int status, std::string etag) {
+                                    if (status == 412)
+                                        return self->reply(error_reply(412, "the entry is not as the request supposes"));
+                                    if (status != 0)
                                         return self->reply(error_reply(503, "the storage cannot be reached now"));
                                     self->reply({fresh ? 201 : 204, {}, {}, "ETag: \"" + etag + "\"\r\n"});
                                 });
@@ -1016,8 +1022,13 @@ struct op : std::enable_shared_from_this<op>
                 return self->reply(error_reply(404, "nothing is here"));
             if (!self->allowed(cur))
                 return self->reply(error_reply(412, "the entry is not as the request supposes"));
-            self->store.remove(self->user, self->here.kind, self->here.coll, self->here.name, [self](bool done) {
-                self->reply(done ? dav_reply{204, {}, {}, {}} : error_reply(503, "the storage cannot be reached now"));
+            // Asked again under the key's lane when the request is conditional, as a put is.
+            const bool conditional = !self->rq.header("if-match").empty() || !self->rq.header("if-none-match").empty();
+            self->store.remove(self->user, self->here.kind, self->here.coll, self->here.name,
+                               conditional ? cur : std::string(), [self](int status) {
+                self->reply(status == 0     ? dav_reply{204, {}, {}, {}}
+                            : status == 412 ? error_reply(412, "the entry is not as the request supposes")
+                                            : error_reply(503, "the storage cannot be reached now"));
             });
         });
     }

@@ -5226,13 +5226,20 @@ const char* server_instance::begin_cache_await(lua_State* th, std::string_view c
     // Posted before the yield, so a channel that will not take it is a refusal
     // the script reads rather than a handler stopped for an answer nobody is
     // going to send.
-    if (!mgr->requests().post(this, await_cookie(id), cname, cmd, request_class::client))
+    // A key of its own per request, not the invocation's id, since a reply that comes after its handler gave up and
+    // waits again must not be taken for the new await.
+    uint32_t key = ++m_await_key;
+    if (key == 0)
+        key = ++m_await_key;
+    if (!mgr->requests().post(this, await_cookie(key), cname, cmd, request_class::client))
         return "the request channel is full";
 
     if (held)
         ++held->cache_pending;
 
     sus.note_await(id, cache_await_ms, held ? cache_cookie(held, false) : 0);
+    // One reply comes for every request, which takes the entry with it.
+    m_awaits[key] = {id, sus.await_seq(id)};
     arm_await_sweep();
     return nullptr;
 }
@@ -5299,10 +5306,15 @@ void server_instance::on_request_reply(uint64_t cookie, request_status st,
         // the handler has run on -- so an answer the script writes on the way
         // out still finds the connection open.
         auto& sus = lua()->suspender();
+        const auto it = m_awaits.find(await_cookie_id(cookie));
+        if (it == m_awaits.end())
+            return;
+        const auto [id, seq] = it->second;
+        m_awaits.erase(it);
         if (st == request_status::ok)
-            sus.settle_value(await_cookie_id(cookie), reply);
+            sus.settle_value(id, reply, seq);
         else
-            sus.settle_nil(await_cookie_id(cookie), request_status_text(st));
+            sus.settle_nil(id, request_status_text(st), seq);
         return;
     }
 #endif

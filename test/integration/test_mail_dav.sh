@@ -112,6 +112,19 @@ st, _, _ = req("PUT", cal + "ev1.ics", ev.replace("Treffen", "Treffen 2"), dict(
 check("PUT under an etag that is no longer it is refused", st == 412, st)
 st, hs, _ = req("PUT", cal + "ev1.ics", ev.replace("Treffen", "Treffen 2"), dict(ct, **{"If-Match": etag}))
 check("and under the one it has is taken, with a new etag", st == 204 and hs.get("etag") not in ("", etag), (st, hs))
+# Two clients editing the same entry under the same etag: the check and the write are one step, so only one is taken.
+import threading
+st, hs, now = req("GET", cal + "ev1.ics")
+seen = hs.get("etag", "")
+answers = []
+def edit(n):
+    answers.append(req("PUT", cal + "ev1.ics", ev.replace("Treffen", "Race %d" % n), dict(ct, **{"If-Match": seen}))[0])
+ts = [threading.Thread(target=edit, args=(n,)) for n in range(16)]
+for t in ts: t.start()
+for t in ts: t.join()
+check("of sixteen edits under one etag at once exactly one is taken, the rest refused",
+      sorted(set(answers)) == [204, 412] and answers.count(204) == 1, sorted(answers))
+req("PUT", cal + "ev1.ics", now, ct)
 st, _, d = req("PUT", cal + "bad.ics", "hello", ct)
 check("a calendar entry that is no calendar is refused", st == 403 and "valid-calendar-data" in d, (st, d))
 req("PUT", cal + "t1.ics", todo, ct)

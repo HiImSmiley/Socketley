@@ -352,77 +352,37 @@ void outbox::maybe_rotate()
     if (m_owed != 0 || m_writing || m_rotating || !m_buf.empty() || !m_waiters.empty() || !m_staged.empty() ||
         m_off < rotate_bytes || m_fd < 0 || m_stopped)
         return;
+    // Opened and renamed here rather than on the ring, so a stop never finds a rename that may still run after it.
+    const std::string tmp = m_name + ".new";
+    const int fd = ::openat(m_dir_fd, tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0 || ::renameat(m_dir_fd, tmp.c_str(), m_dir_fd, m_name.c_str()) < 0)
+    {
+        LOG_WARN((m_what + " could not be started again empty: " + std::strerror(errno)).c_str());
+        if (fd >= 0)
+            ::close(fd);
+        return;
+    }
+    // The old file's name is gone, so its descriptor is let go of and everything after goes to the new one.
+    m_loop.close_fd(m_fd);
+    m_fd  = fd;
+    m_off = 0;
+    m_unsynced = false;
+    m_synced = m_appended;
+    // Writes wait for the rename to be durable, since a crash before it would leave them in a file with no name.
     m_rotating = true;
     auto alive = m_alive;
-    const std::string tmp = m_name + ".new";
-    auto fail = [this](std::string_view why)
-    {
-        LOG_WARN((m_what + " could not be started again empty: " + std::string(why)).c_str());
-        m_rotating = false;
-        kick();
-    };
-    const bool q = m_io.openat(m_dir_fd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644,
-        [this, alive, tmp, fail](int64_t fd)
+    if (!m_io.fsync(m_dir_fd, false, [this, alive](int64_t)
         {
             if (!*alive)
                 return;
-            // A stop that came in the middle closed the files this would go on with, so nothing more is done.
-            if (m_stopped)
-            {
-                if (fd >= 0)
-                    m_loop.close_fd(static_cast<int>(fd));
-                m_rotating = false;
-                return;
-            }
-            if (fd < 0)
-            {
-                fail(std::strerror(static_cast<int>(-fd)));
-                return;
-            }
-            const bool q2 = m_io.renameat(m_dir_fd, tmp, m_dir_fd, m_name, [this, alive, fd, fail](int64_t r)
-            {
-                if (!*alive)
-                    return;
-                if (m_stopped)
-                {
-                    m_loop.close_fd(static_cast<int>(fd));
-                    m_rotating = false;
-                    return;
-                }
-                if (r < 0)
-                {
-                    m_loop.close_fd(static_cast<int>(fd));
-                    fail(std::strerror(static_cast<int>(-r)));
-                    return;
-                }
-                // The old file's name is gone, so its descriptor is let go of and everything after goes to the new one.
-                m_loop.close_fd(m_fd);
-                m_fd  = static_cast<int>(fd);
-                m_off = 0;
-                m_unsynced = false;
-                // What the old file held is let go of, so only what waits to be written is not yet synced.
-                m_synced = m_appended - m_buf.size();
-                if (!m_io.fsync(m_dir_fd, false, [this, alive](int64_t)
-                    {
-                        if (!*alive)
-                            return;
-                        m_rotating = false;
-                        if (!m_stopped)
-                            kick();
-                    }))
-                {
-                    m_rotating = false;
-                    kick();
-                }
-            });
-            if (!q2)
-            {
-                m_loop.close_fd(static_cast<int>(fd));
-                fail("the ring is full");
-            }
-        });
-    if (!q)
-        fail("the ring is full");
+            m_rotating = false;
+            if (!m_stopped)
+                kick();
+        }))
+    {
+        m_rotating = false;
+        kick();
+    }
 }
 
 void outbox::stop()
@@ -430,8 +390,10 @@ void outbox::stop()
     if (m_stopped)
         return;
     m_stopped = true;
+    // The rename is made already and only its directory sync may be in flight, which is done here before writing.
+    if (m_rotating && m_dir_fd >= 0 && ::fsync(m_dir_fd) == 0) {}
     // The delivery records not yet written are written here, blocking as a stop may, so a restart does not send them again.
-    if (m_fd >= 0 && (!m_buf.empty() || m_unsynced) && !m_rotating)
+    if (m_fd >= 0 && (!m_buf.empty() || m_unsynced))
     {
         if ((m_buf.empty() ||
              ::pwrite(m_fd, m_buf.data(), m_buf.size(), static_cast<off_t>(m_off)) == static_cast<ssize_t>(m_buf.size())) &&

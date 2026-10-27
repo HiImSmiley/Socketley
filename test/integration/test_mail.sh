@@ -340,8 +340,15 @@ check "show writes a smarthost's password as ***" "$("$BIN" show rl 2>/dev/null 
 check "and the record it shows carries the mask" "$("$BIN" show rl 2>/dev/null | grep -q 'user:\*\*\*@relay.test' && echo yes)" "yes"
 "$BIN" show rl > "$T/rl.json" 2>/dev/null
 "$BIN" import rl < "$T/rl.json" >/dev/null 2>&1
-state=$(find "$HOME/.local/share" -name 'rl.json' -path '*runtimes*' 2>/dev/null | head -1)
-check "and an import of what it showed keeps the password" "$(grep -c 'pw123secret' "$state" 2>/dev/null)" "1"
+# The state is written by the daemon's writer thread, so it is waited for rather than read at once.
+kept=""
+for _ in $(seq 1 50); do
+    state=$(find "$HOME/.local/share" -name 'rl.json' -path '*runtimes*' 2>/dev/null | head -1)
+    kept=$(grep -c 'pw123secret' "$state" 2>/dev/null)
+    [ "$kept" = "1" ] && break
+    sleep 0.1
+done
+check "and an import of what it showed keeps the password" "$kept" "1"
 "$BIN" create mail ren -p $((SL_PORT_BASE+1988)) --mail-domain example.test -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 $((SL_PORT_BASE+1988)) >/dev/null
 "$BIN" show ren 2>/dev/null | sed 's/"name": "ren"/"name": "ren2"/' > "$T/ren.json"

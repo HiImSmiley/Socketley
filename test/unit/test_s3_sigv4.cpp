@@ -421,6 +421,24 @@ TEST_CASE("aws-chunked example from the S3 API reference, with its three publish
 
 // ─── the streaming cases ───
 
+// Every trailer the request announces in x-amz-trailer, so a case with several lines checks all of them.
+static std::vector<sv> declared_trailers(const kase& c)
+{
+    std::vector<sv> out;
+    for (const hdr& h : c.headers)
+    {
+        if (h.n != "x-amz-trailer")
+            continue;
+        for (sv rest = h.v; !rest.empty();)
+        {
+            size_t comma = rest.find(',');
+            out.push_back(rest.substr(0, comma));
+            rest = comma == sv::npos ? sv() : rest.substr(comma + 1);
+        }
+    }
+    return out;
+}
+
 TEST_CASE("streaming cases decode to the payload, in every split of the wire and one byte at a time")
 {
     int streams = 0;
@@ -448,6 +466,8 @@ TEST_CASE("streaming cases decode to the payload, in every split of the wire and
             REQUIRE(st == s3::stream_status::done);
             REQUIRE(decoded == c.decoded);
             CHECK(s.trailer_value(c.trailer_name.empty() ? sv("x-amz-checksum-crc32") : c.trailer_name) == c.trailer_value);
+            for (sv name : declared_trailers(c))
+                CHECK(!s.trailer_value(name).empty());
         }
         s3::chunk_stream s(res.stream);
         std::string decoded;

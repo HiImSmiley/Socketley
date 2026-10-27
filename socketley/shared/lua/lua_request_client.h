@@ -67,6 +67,8 @@ private:
     {
         int      tag{0};
         uint32_t await{0};
+        // Which await of the invocation this request answers.
+        uint32_t seq{0};
         // A registry reference on the state and not on the coroutine the call came from, which is pooled and reused
         // once the caller has finished.
         int      ref{LUA_NOREF};

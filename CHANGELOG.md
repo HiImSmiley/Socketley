@@ -1135,6 +1135,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Two CalDAV or CardDAV clients editing one entry under the same `If-Match`
+  could both be taken, the second overwriting the first; the condition is now
+  asked of the storage under the entry's own lane, so one is taken and the
+  other answered 412. A DELETE under `If-Match` is the same.
+- A Lua handler that waited twice on `self.cache` could take the late answer
+  to its first, given-up wait as the answer to its second.
+- A follower that missed an election took the new leader's answer to its
+  read index as coming from nobody, and the read never completed.
+- A stop in the moment a delivery outbox was being started again empty could
+  lose the records queued in that moment.
 - SINTERSTORE, SUNIONSTORE and SDIFFSTORE are refused with `-OOM` when their
   result has no room under `--maxmemory`, and leave the destination as it
   was; they stored it past the limit.

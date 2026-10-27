@@ -79,6 +79,9 @@ public:
             m_counter = 1;          // serial 0 is not a valid ref
     }
 
+    // From `start`, which a test sets just short of the counter's end to see the wrap.
+    explicit conn_serial_source(uint64_t start) : m_counter(start) {}
+
     // Not a constructor argument because the shard index arrives in a config
     // frame; call it before the first next().
     void set_shard(uint32_t shard_index)

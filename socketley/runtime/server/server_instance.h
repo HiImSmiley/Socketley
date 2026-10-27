@@ -654,6 +654,9 @@ public:
     void teardown(event_loop& loop) override;
 
 private:
+    // The invocation and which of its awaits each self.cache request answers, by the request's own key.
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> m_awaits;
+    uint32_t m_await_key{0};
     // The two listeners setup() chooses between, each of which opens and binds
     // m_listen_fd or returns false, with everything after that point the same
     // for both.

@@ -1365,7 +1365,6 @@ private:
         auto& ch = m_manager.requests();
         if (ch.parked_count() != 0 || ch.pending() != 0)
             return;
-
         // The names waiting, taken before anything is erased.
         //
         // This was a range-for over m_peer_links with an inner loop erasing
@@ -1400,6 +1399,12 @@ private:
                     break;
                 }
             if (keep == m_peer_links.size())
+                continue;
+            // A routed connection pinned direct would have its stream over two sockets, which the far side reads in
+            // either order, so a live link is not replaced under one.
+            if (m_pinned_direct != 0
+                && std::any_of(m_peer_links.begin(), m_peer_links.end(),
+                               [&](const peer_entry& o) { return o.live && o.name == peer; }))
                 continue;
 
             // Any earlier link to the same runtime leaves the table first, or
@@ -1552,6 +1557,7 @@ private:
 
         shard_link* link = live_peer_link_for(to, ref);
         m_route_pin.emplace(ref, link ? pin_direct : pin_relay);
+        m_pinned_direct += link ? 1 : 0;
         return link;
     }
 
@@ -1975,7 +1981,11 @@ private:
         // the daemon's leg is slower, so a frame that changes route here
         // arrives after the ones that went direct rather than before them.
         if (pinnable)
-            m_route_pin[ref] = pin_relay;
+        {
+            uint8_t& pin = m_route_pin[ref];
+            m_pinned_direct -= pin == pin_direct ? 1 : 0;
+            pin = pin_relay;
+        }
 
         if (!m_writer.write(worker_proto::frame(
                 worker_proto::frame_type::route_up, frame))) {}
@@ -1991,15 +2001,28 @@ private:
             return;
         const uint64_t owner = conn_owner_key(runtime_id);
         for (auto it = m_route_pin.begin(); it != m_route_pin.end(); )
-            it = (it->first.owner == owner) ? m_route_pin.erase(it) : std::next(it);
+        {
+            if (it->first.owner != owner)
+            {
+                ++it;
+                continue;
+            }
+            m_pinned_direct -= it->second == pin_direct ? 1 : 0;
+            it = m_route_pin.erase(it);
+        }
     }
 
     // A route that has ended takes its pin with it, on whichever side sent the
     // frame that ended it.
     void forget_route_pin(worker_proto::route_op op, const conn_ref& ref)
     {
-        if (op == worker_proto::route_op::close || op == worker_proto::route_op::drop)
-            m_route_pin.erase(ref);
+        if (op != worker_proto::route_op::close && op != worker_proto::route_op::drop)
+            return;
+        if (const auto it = m_route_pin.find(ref); it != m_route_pin.end())
+        {
+            m_pinned_direct -= it->second == pin_direct ? 1 : 0;
+            m_route_pin.erase(it);
+        }
     }
 
     // The map's verdict first, up the only descriptor this process may block
@@ -2193,6 +2216,8 @@ private:
     // when the route closes; bounded by the routes that are open, which is
     // what the server's own table is bounded by.
     std::unordered_map<conn_ref, uint8_t, conn_ref_hash> m_route_pin;
+    // The entries of m_route_pin that are pin_direct, which a link being replaced would split across two sockets.
+    size_t m_pinned_direct{0};
     remote_sink                            m_remote;
 
     // Where a deferred answer goes back out, by the cookie the channel hands

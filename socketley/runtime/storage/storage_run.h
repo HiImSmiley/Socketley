@@ -1633,14 +1633,15 @@ private:
         void abort();
     };
     // A put of `size` bytes the runtime makes itself, begun as a client's is: encrypted when the bucket encrypts,
-    // marked for replication and with S3's default checksum; null with `err` when it cannot start.
+    // marked for replication, with S3's default checksum and pooled when small unless not `poolable`; null with
+    // `err` when it cannot start.
     std::shared_ptr<put_op> begin_own_put(const std::string& bucket, const std::string& key, object_meta meta,
-                                          uint64_t size, s3_error& err);
+                                          uint64_t size, s3_error& err, bool poolable = true);
     // Writes `data` as the object, encrypted when the bucket encrypts, marked for replication and with S3's default
     // checksum as a client's put is, telling `done` once; null with `err` when it cannot start.
     std::shared_ptr<whole_put> put_whole(const std::string& bucket, const std::string& key, object_meta meta,
                                          std::string data, std::function<void(st, const put_result*)> done,
-                                         s3_error& err);
+                                         s3_error& err, put_condition cond = {});
 
     // Server access logging, in storage_logging.cpp: lines held per destination until they are delivered as one
     // object, and the deliveries in flight, so a stop can drop them.

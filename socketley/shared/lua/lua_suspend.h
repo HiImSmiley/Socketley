@@ -30,6 +30,7 @@
 
 #include <sol/sol.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -173,6 +174,13 @@ public:
         return 0;
     }
 
+    // Which await of its invocation the last note_await() made, for the settle of its answer to name.
+    uint32_t await_seq(id_t id)
+    {
+        const record* r = find(id);
+        return r ? r->awaits : 0;
+    }
+
     // Note that this invocation has posted something and is about to yield, so
     // the deadline dates from the await rather than from the callback's start.
     //
@@ -200,10 +208,13 @@ public:
     // An unknown id is a reply that arrived after its handler was let go, and
     // is ignored rather than reported: the settle that already happened is the
     // one that counted.
-    void settle_value(id_t id, std::string_view value)
+    //
+    // `seq`, when given, is what await_seq() said when the await was made: a reply for an earlier await of the same
+    // invocation, one that was given up on and came anyway, is then not taken as the answer to the one waiting now.
+    void settle_value(id_t id, std::string_view value, uint32_t seq = 0)
     {
         record* r = find(id);
-        if (!r)
+        if (!r || (seq && r->awaits != seq))
             return;
         sol::stack::push(r->th, value);
         resume(id, 1);
@@ -213,10 +224,10 @@ public:
     // handler stopped on and counted by what it returns -- for an answer that is
     // a table, or several results, rather than the one string settle_value takes.
     template <class Push>
-    void settle_with(id_t id, Push&& push)
+    void settle_with(id_t id, Push&& push, uint32_t seq = 0)
     {
         record* r = find(id);
-        if (!r)
+        if (!r || (seq && r->awaits != seq))
             return;
         const int n = push(r->th);
         resume(id, n);
@@ -236,10 +247,10 @@ public:
     // Every await ends in exactly one settle, including the ones whose answer
     // never came.  A script therefore never has to bound its own wait, which is
     // the whole point: `local v, err = self.cache(...)` always returns.
-    void settle_nil(id_t id, std::string_view reason)
+    void settle_nil(id_t id, std::string_view reason, uint32_t seq = 0)
     {
         record* r = find(id);
-        if (!r)
+        if (!r || (seq && r->awaits != seq))
             return;
         lua_pushnil(r->th);
         sol::stack::push(r->th, reason);
@@ -303,7 +314,10 @@ public:
             // not being resumed, but the hold is still a hold.
             if (r.awaiting && m_await_ended)
                 m_await_ended(r.ctx);
-            if (r.ref != LUA_NOREF)
+            // A resumed invocation's frame holds the same reference and lets it go below, after its resume.
+            const bool running = std::any_of(m_frames.begin(), m_frames.end(),
+                                             [&](const frame& f) { return f.ref == r.ref; });
+            if (r.ref != LUA_NOREF && !running)
                 luaL_unref(L, LUA_REGISTRYINDEX, r.ref);
         }
         m_live.clear();

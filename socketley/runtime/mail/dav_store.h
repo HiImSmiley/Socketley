@@ -48,11 +48,13 @@ public:
     // Its etag alone, empty where it is not there.
     void head(const std::string& user, const std::string& kind, const std::string& coll, const std::string& name,
               std::function<void(bool ok, std::string etag)> done);
-    // Written, and noted in the journal; the etag the storage gave it, empty where it could not be written.
+    // Written and journalled when the entry still has the etag `expect` ("-" for none, empty for any): 0 and the new
+    // etag, 412 when it has another, or 503.
     void put(const std::string& user, const std::string& kind, const std::string& coll, const std::string& name,
-             std::string data, std::string type, std::function<void(std::string etag)> done);
+             std::string data, std::string type, std::string expect, std::function<void(int status, std::string etag)> done);
+    // Removed when it still has the etag `expect`, empty for whatever it has: 0, 412 or 503.
     void remove(const std::string& user, const std::string& kind, const std::string& coll, const std::string& name,
-                std::function<void(bool)> done);
+                std::string expect, std::function<void(int status)> done);
     // A collection and every entry of it gone.
     void remove_collection(const std::string& user, const std::string& kind, const std::string& coll,
                            std::function<void(bool)> done);

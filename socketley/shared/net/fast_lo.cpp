@@ -175,6 +175,16 @@ static void map_put(int fd, const void* key, const void* value, uint64_t flags)
     if (sys_bpf(BPF_MAP_UPDATE_ELEM, &a) != 0) {}
 }
 
+// Whether `key` is in the map, which for the state map is whether its socket has not closed.
+static bool map_has(int fd, const void* key, void* value)
+{
+    union bpf_attr a{};
+    a.map_fd = static_cast<uint32_t>(fd);
+    a.key = reinterpret_cast<uint64_t>(key);
+    a.value = reinterpret_cast<uint64_t>(value);
+    return sys_bpf(BPF_MAP_LOOKUP_ELEM, &a) == 0;
+}
+
 // A few instructions and forward labels, enough to write the two programs
 // below as they read rather than as hand-counted jump offsets.
 class bpf_asm
@@ -954,6 +964,10 @@ static void answer_loop(const recon_args& a, ledger& book)
             uint64_t rm = 0;
             if (!diag_exact(nl, buf, r.key, rm))
                 continue;   // the sweep re-asks for anything left pending
+            // A socket that closed since it asked had its entries erased, and an answer put now would outlive it.
+            state_val alive{};
+            if (!map_has(a.state, r.key, &alive))
+                continue;
             const snap_val ans{rm, r.ask};
             map_put(a.snap, r.key, &ans, BPF_ANY);
             book.note(r.key, rm);

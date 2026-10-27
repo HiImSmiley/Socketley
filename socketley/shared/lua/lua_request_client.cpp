@@ -119,6 +119,7 @@ lua_request_client::mode lua_request_client::send(lua_State* L, int tag, std::st
         uint64_t held = 0;
         m_owner.hold_answering_connection(held);
         m_ctx.suspender().note_await(p.await, 0, held);
+        p.seq = m_ctx.suspender().await_seq(p.await);
     }
     m_pending.emplace(cookie, p);
     return has_cb ? mode::callback : mode::wait;
@@ -133,7 +134,7 @@ void lua_request_client::on_request_reply(uint64_t cookie, request_status st, st
     m_pending.erase(it);
     if (p.await != 0)
     {
-        m_ctx.suspender().settle_with(p.await, [&](lua_State* th) { return push_values(th, p.tag, st, reply); });
+        m_ctx.suspender().settle_with(p.await, [&](lua_State* th) { return push_values(th, p.tag, st, reply); }, p.seq);
         return;
     }
     lua_State* L = m_ctx.state().lua_state();

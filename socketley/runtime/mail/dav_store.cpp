@@ -165,50 +165,62 @@ void dav_store::head(const std::string& user, const std::string& kind, const std
 }
 
 void dav_store::put(const std::string& user, const std::string& kind, const std::string& coll, const std::string& name,
-                    std::string data, std::string type, std::function<void(std::string)> done)
+                    std::string data, std::string type, std::string expect,
+                    std::function<void(int, std::string)> done)
 {
-    m_boxes.make_bucket([this, user, kind, coll, name, data = std::move(data), type = std::move(type), done,
-                         alive = m_alive](bool made) mutable {
+    m_boxes.make_bucket([this, user, kind, coll, name, data = std::move(data), type = std::move(type),
+                         expect = std::move(expect), done, alive = m_alive](bool made) mutable {
         if (!*alive)
             return;
         if (!made)
-            return done({});
+            return done(503, {});
         rpc::request rq;
         rq.kind = rpc::op::put;
         rq.bucket = m_boxes.bucket();
         rq.key = key_of(user, kind, coll, name);
         rq.data = std::move(data);
         rq.content_type = std::move(type);
+        if (expect == "-")
+            rq.if_none_match = "*";
+        else if (!expect.empty())
+            rq.if_match = "\"" + expect + "\"";
         m_boxes.ask(m_boxes.storage(), rpc::encode(rq),
                     [this, user, kind, coll, name, done, alive](request_status st, std::string_view bytes) {
                         if (!*alive)
                             return;
                         rpc::reply r;
-                        if (st != request_status::ok || !rpc::decode(bytes, rpc::op::put, r) || !r.ok)
-                            return done({});
+                        if (st != request_status::ok || !rpc::decode(bytes, rpc::op::put, r))
+                            return done(503, {});
+                        if (!r.ok)
+                            return done(r.code == "PreconditionFailed" || r.code == "NoSuchKey" ? 412 : 503, {});
                         if (!name.starts_with("."))
                             note(user, kind, coll, name, false);
-                        done(r.info.etag.empty() ? std::string("0") : bare(r.info.etag));
+                        done(0, r.info.etag.empty() ? std::string("0") : bare(r.info.etag));
                     });
     });
 }
 
 void dav_store::remove(const std::string& user, const std::string& kind, const std::string& coll,
-                       const std::string& name, std::function<void(bool)> done)
+                       const std::string& name, std::string expect, std::function<void(int)> done)
 {
     rpc::request rq;
     rq.kind = rpc::op::del;
     rq.bucket = m_boxes.bucket();
     rq.key = key_of(user, kind, coll, name);
+    if (!expect.empty())
+        rq.if_match = "\"" + expect + "\"";
     m_boxes.ask(m_boxes.storage(), rpc::encode(rq),
                 [this, user, kind, coll, name, done, alive = m_alive](request_status st, std::string_view bytes) {
                     if (!*alive)
                         return;
                     rpc::reply r;
-                    const bool ok = st == request_status::ok && rpc::decode(bytes, rpc::op::del, r) && r.ok;
-                    if (ok && !name.starts_with("."))
+                    if (st != request_status::ok || !rpc::decode(bytes, rpc::op::del, r))
+                        return done(503);
+                    if (!r.ok)
+                        return done(r.code == "PreconditionFailed" ? 412 : 503);
+                    if (!name.starts_with("."))
                         note(user, kind, coll, name, true);
-                    done(ok);
+                    done(0);
                 });
 }
 
@@ -246,8 +258,8 @@ void dav_store::remove_each(const std::string& user, const std::string& kind, co
     if (i == names->size())
         return done(all_ok);
     const std::string name = (*names)[i];
-    remove(user, kind, coll, name, [this, user, kind, coll, names, i, all_ok, done](bool one) {
-        remove_each(user, kind, coll, names, i + 1, all_ok && one, done);
+    remove(user, kind, coll, name, {}, [this, user, kind, coll, names, i, all_ok, done](int status) {
+        remove_each(user, kind, coll, names, i + 1, all_ok && status == 0, done);
     });
 }
 
@@ -280,7 +292,8 @@ void dav_store::set_props(const std::string& user, const std::string& kind, cons
         std::replace(value.begin(), value.end(), '\r', ' ');
         text += k + "\t" + value + "\n";
     }
-    put(user, kind, coll, ".props", std::move(text), "text/plain", [done](std::string etag) { done(!etag.empty()); });
+    put(user, kind, coll, ".props", std::move(text), "text/plain", {},
+        [done](int status, std::string) { done(status == 0); });
 }
 
 void dav_store::note(const std::string& user, const std::string& kind, const std::string& coll, const std::string& name,

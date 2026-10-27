@@ -22,7 +22,7 @@ namespace socketley::storage_rpc
 inline constexpr size_t max_value = 1u << 20;
 inline constexpr size_t max_field = 1u << 16;
 inline constexpr uint32_t max_list = 1000;
-inline constexpr uint8_t version = 3;
+inline constexpr uint8_t version = 4;
 
 // users answers for the storage's users rather than its objects, a page of them after start_after, each an
 // object_info whose key is the user and whose metadata holds name, email, admin, reset and the password's hash.
@@ -73,6 +73,9 @@ struct request
     bool        last{false};
     // get_range's length.
     uint32_t    length{0};
+    // put's and del's preconditions, an ETag in quotes or *, asked under the key's lane so they cannot be raced.
+    std::string if_match;
+    std::string if_none_match;
 };
 
 inline std::string encode(const request& r)
@@ -98,6 +101,8 @@ inline std::string encode(const request& r)
     w.bytes(r.stream);
     w.flag(r.last);
     w.u32(r.length);
+    w.bytes(r.if_match);
+    w.bytes(r.if_none_match);
     return w.take();
 }
 
@@ -122,7 +127,8 @@ inline bool decode(std::string_view in, request& r)
     }
     return rd.bytes(r.prefix, max_field) && rd.bytes(r.delimiter, max_field) &&
            rd.bytes(r.start_after, max_field) && rd.u32(r.max_keys) && rd.u64(r.size) &&
-           rd.bytes(r.stream, max_field) && rd.flag(r.last) && rd.u32(r.length);
+           rd.bytes(r.stream, max_field) && rd.flag(r.last) && rd.u32(r.length) &&
+           rd.bytes(r.if_match, max_field) && rd.bytes(r.if_none_match, max_field);
 }
 
 struct object_info

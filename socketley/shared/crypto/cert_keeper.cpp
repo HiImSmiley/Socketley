@@ -321,14 +321,15 @@ bool prepare_acme(const std::vector<std::string>& domains, std::string_view emai
             a.pid = o.pid;
             a.issuing = o.issuing;
         }
-    std::erase_if(g_acme, [&](const acme_state& o) { return o.cert == a.cert; });
     int64_t left = 0;
     bool self_signed = false;
+    // Refused before the old entry goes, so a child it still waits for is not left with nothing to reap it.
     if (!cert_left(a.cert, left, self_signed) && !write_self_signed(domains, 7, a.cert, a.key))
     {
         err = "acme: a placeholder certificate could not be written to " + a.cert;
         return false;
     }
+    std::erase_if(g_acme, [&](const acme_state& o) { return o.cert == a.cert; });
     g_acme.push_back(std::move(a));
     g_next_renew = clock::now();
     return true;

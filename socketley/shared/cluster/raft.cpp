@@ -343,8 +343,10 @@ void node::step(const message& m)
 
         const bool keeps_term = m.type == msg_type::pre_vote
                              || (m.type == msg_type::pre_vote_resp && !m.reject);
+        // Only a leader answers a read index, so its sender is the leader of the term it carries.
+        const bool leads = from_leader || m.type == msg_type::read_index_resp;
         if (!keeps_term)
-            become_follower(m.term, from_leader ? m.from : no_node);
+            become_follower(m.term, leads ? m.from : no_node);
     }
     else if (m.term < m_term)
     {
