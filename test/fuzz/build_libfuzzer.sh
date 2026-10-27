@@ -102,7 +102,10 @@ want fuzz_s3_sigv4 && build fuzz_s3_sigv4 "$ROOT/test/fuzz/fuzz_s3_sigv4.cpp" \
 want fuzz_bucket_policy && build fuzz_bucket_policy "$ROOT/test/fuzz/fuzz_bucket_policy.cpp" \
     "$ROOT/socketley/runtime/storage/bucket_policy.cpp"
 want fuzz_dns && build fuzz_dns "$ROOT/test/fuzz/fuzz_dns.cpp" "$ROOT/socketley/runtime/dns/dns_wire.cpp" \
-    "$ROOT/socketley/runtime/dns/dns_zone.cpp" "$ROOT/socketley/runtime/dns/dns_answer.cpp"
+    "$ROOT/socketley/runtime/dns/dns_zone.cpp" "$ROOT/socketley/runtime/dns/dns_answer.cpp" \
+    "$ROOT/socketley/runtime/dns/dns_sign.cpp" "$ROOT/socketley/shared/crypto/jws.cpp" \
+    "$ROOT/socketley/shared/crypto/key_file.cpp" "$ROOT/socketley/shared/util/base64.cpp" \
+    "$ROOT/socketley/shared/net/dns_feed.cpp" "$ROOT/socketley/shared/persist/paths.cpp" -lcrypto
 want fuzz_mqtt && build fuzz_mqtt "$ROOT/test/fuzz/fuzz_mqtt.cpp" "$ROOT/socketley/runtime/mqtt/mqtt_codec.cpp" \
     "$ROOT/socketley/runtime/mqtt/mqtt_topics.cpp" "$ROOT/socketley/runtime/mqtt/mqtt_broker.cpp" \
     "$ROOT/socketley/runtime/mqtt/mqtt_broker_store.cpp"
@@ -111,11 +114,13 @@ want fuzz_mail && build fuzz_mail "$ROOT/test/fuzz/fuzz_mail.cpp" "$ROOT/socketl
     "$ROOT/socketley/runtime/mail/mail_mime.cpp" "$ROOT/socketley/runtime/mail/mail_aliases.cpp" \
     "$ROOT/socketley/runtime/mail/mail_sieve.cpp" "$ROOT/socketley/runtime/mail/mail_sieve_store.cpp" \
     "$ROOT/socketley/runtime/mail/managesieve_session.cpp" "$ROOT/socketley/runtime/mail/imap_order.cpp" \
-    "$ROOT/socketley/shared/util/base64.cpp" -lssl -lcrypto
+    "$ROOT/socketley/runtime/mail/pop3_session.cpp" "$ROOT/socketley/runtime/mail/mail_mbox.cpp" \
+    "$ROOT/socketley/runtime/mail/mail_arc.cpp" "$ROOT/socketley/runtime/mail/mail_srs.cpp" \
+    "$ROOT/socketley/runtime/mail/mail_tls_policy.cpp" "$ROOT/socketley/shared/util/base64.cpp" -lssl -lcrypto
 want fuzz_db && build fuzz_db "$ROOT/test/fuzz/fuzz_db.cpp" "$ROOT/socketley/runtime/db/db_doc.cpp" \
     "$ROOT/socketley/runtime/db/db_schema.cpp" "$ROOT/socketley/runtime/db/db_store.cpp" \
     "$ROOT/socketley/runtime/db/db_log.cpp" "$ROOT/socketley/shared/crypto/jws.cpp" \
-    "$ROOT/socketley/shared/util/base64.cpp" -lcrypto
+    "$ROOT/socketley/shared/crypto/key_file.cpp" "$ROOT/socketley/shared/util/base64.cpp" -lcrypto
 
 # fuzz_cache_ops needs one .cpp out of the runtime rather than the whole SDK,
 # because cache_store.cpp includes nothing but libc headers.
