@@ -1781,7 +1781,21 @@ and
 and
 .B \-\-client\-key
 \(em are accepted here. Certificates are read when a runtime starts, so a
-running one keeps the identity it handshook with until it is restarted. An edit
+running one keeps the identity it handshook with until it is restarted. What it
+trusts is refused instead of stored while it runs, since a stored one would be
+shown while the old one went on deciding who gets in:
+.B \-\-tls
+on a runtime without it,
+.B \-\-ca
+naming another file, and on a proxy
+.BR \-\-client\-ca ,
+.B \-\-client\-cert
+and
+.BR \-\-client\-key ,
+and the same fields in
+.BR import ;
+.B \-\-restart
+takes them. An edit
 that would leave the set incomplete \(em a certificate with no
 .BR \-\-tls ,
 .B \-\-tls

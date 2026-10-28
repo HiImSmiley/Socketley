@@ -2644,6 +2644,14 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
     }
 }
 
+// A TLS flag a running runtime would store and not handshake with, refused with the way to have it taken.
+static int refuse_running_trust(std::string_view flag)
+{
+    std::cout << "cannot change " << flag << " while running: its handshakes use what it started with; edit it with "
+                 "--restart\n";
+    return 1;
+}
+
 int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                             size_t& i, bool is_running)
 {
@@ -2689,6 +2697,16 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "cannot change the bind address while running\n";
                 return 1;
             }
+            return parse_shared_flags(instance, pa, i);
+        // The TLS context and what it trusts are built before the first handshake, so a running runtime would show
+        // the change and go on handshaking without it.
+        case fnv1a("--tls"):
+            if (is_running && !instance->get_tls())
+                return refuse_running_trust(pa.args[i]);
+            return parse_shared_flags(instance, pa, i);
+        case fnv1a("--ca"):
+            if (is_running && i + 1 < pa.count && pa.args[i + 1] != instance->get_ca_path())
+                return refuse_running_trust(pa.args[i]);
             return parse_shared_flags(instance, pa, i);
         // Not a setting of the runtime: it says the caller wants the change carried across a stop and a start, and
         // the command has already acted on it by the time the flags are read.
@@ -2811,6 +2829,18 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
             return 1;
         }
         return parse_proxy_gate_flag(proxy, pa, i);
+    }
+    // The listener's client CA and the backend leg's certificate are contexts built at start, as --ca is.
+    if (pa.hashes[i] == fnv1a("--client-ca") || pa.hashes[i] == fnv1a("--client-cert") ||
+        pa.hashes[i] == fnv1a("--client-key"))
+    {
+        std::string_view ca, cert, key;
+        proxy->get_mesh_tls_paths(ca, cert, key);
+        const std::string_view now = pa.hashes[i] == fnv1a("--client-ca")   ? ca
+                                   : pa.hashes[i] == fnv1a("--client-cert") ? cert
+                                                                            : key;
+        if (is_running && i + 1 < pa.count && pa.args[i + 1] != now)
+            return refuse_running_trust(pa.args[i]);
     }
     return parse_proxy_shared_flags(proxy, pa, i);
 }

@@ -437,6 +437,29 @@ assert_eq "$(echo "$MTLS_RESULT" | grep '^WITHCERT' | cut -d' ' -f2)" "yes" \
 assert_eq "$(echo "$MTLS_RESULT" | grep '^NOCERT' | cut -d' ' -f2)" "no" \
     "mTLS: a client with no certificate is rejected"
 
+# What a running listener trusts is the context it started with, so a new CA on
+# it is refused rather than shown while the old one goes on deciding; --restart
+# takes it, and an edit that names the CA it has already changes nothing.
+show_field() { "$BIN" show "$1" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$2"; }
+assert_eq "$(rc_of "$BIN" edit tls_mtls --ca "$CERTS/server.pem")" "1" "edit --ca on a running server is refused"
+assert_eq "$(show_field tls_mtls ca_path)" "$CERTS/ca.pem" "a refused --ca leaves the server's CA as it was"
+assert_eq "$(rc_of "$BIN" edit tls_mtls --ca "$CERTS/ca.pem")" "0" "edit --ca naming the CA a running server has is no change"
+assert_eq "$(rc_of "$BIN" create proxy tls_pxmtls -p "$((SL_PORT_BASE+736))" --backend 127.0.0.1:1 \
+    --tls --cert "$CERTS/server.pem" --key "$CERTS/server-key.pem" --client-ca "$CERTS/ca.pem" -s)" "0" \
+    "create proxy with --client-ca (mutual TLS) succeeds"
+for flag in --client-ca --client-cert --client-key; do
+    assert_eq "$(rc_of "$BIN" edit tls_pxmtls "$flag" "$CERTS/other-key.pem")" "1" "edit $flag on a running proxy is refused"
+done
+assert_eq "$(show_field tls_pxmtls mesh_client_ca)" "$CERTS/ca.pem" "a refused --client-ca leaves the proxy's as it was"
+assert_eq "$(show_field tls_pxmtls mesh_client_cert)" "" "a refused --client-cert stores nothing"
+assert_eq "$(rc_of "$BIN" import tls_pxmtls "{\"mesh_client_ca\":\"$CERTS/server.pem\"}")" "1" \
+    "import of another mesh_client_ca on a running proxy is refused"
+assert_eq "$(rc_of "$BIN" edit tls_pxmtls --client-ca "$CERTS/server.pem" --restart)" "0" \
+    "edit --client-ca --restart takes the new CA"
+assert_eq "$(show_field tls_pxmtls mesh_client_ca)" "$CERTS/server.pem" "and the proxy has it"
+rc_of "$BIN" stop tls_pxmtls >/dev/null
+rc_of "$BIN" remove tls_pxmtls >/dev/null
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Fail closed
 # ─────────────────────────────────────────────────────────────────────────────

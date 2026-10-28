@@ -5474,6 +5474,16 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
             conn->write_buf = "cannot change TLS while running\n";
             return 1;
         }
+        // What the handshakes trust, and the proxy's backend certificate, are contexts built at start as TLS is.
+        if ((cfg.has("ca_path") && cfg.ca_path != instance->get_ca_path()) ||
+            (cfg.has("mesh_client_ca") && cfg.mesh_client_ca != inst_mca) ||
+            (cfg.has("mesh_client_cert") && cfg.mesh_client_cert != inst_mcert) ||
+            (cfg.has("mesh_client_key") && cfg.mesh_client_key != inst_mkey))
+        {
+            conn->write_buf = "cannot change the CA or a client certificate while running: its handshakes use what it "
+                              "started with; import it with --restart\n";
+            return 1;
+        }
         if (type == runtime_server || type == runtime_client)
         {
             bool cur_udp = instance->is_udp();

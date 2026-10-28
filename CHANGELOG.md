@@ -194,6 +194,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the shared `/tmp/socketley.sock` read every flag `--lua` makes runtimes
   with, `--master-pw` and `--secret-key` among them. `socketley daemon`
   reports such a socket instead of exiting 0.
+- **A running runtime's trust is not edited behind its back.** `edit
+  --client-ca`, `--client-cert` and `--client-key` on a running proxy, and
+  `--ca` or `--tls` on any running runtime, were stored, shown by `show` and
+  answered with success while the listener and the backend leg went on with
+  the context they started with, so a client CA rotated after a compromise
+  kept letting the old certificates in until a restart nobody was told to
+  make; they are now refused while it runs, in `edit` and in `import`, and
+  `--restart` takes them. Naming the value it already has is no change.
 - **`export --full` keeps the setup's secrets to itself while it works.**
   The Lua setup it writes beside the data, every runtime's master password
   and keys in plain text, went into a `.export-<pid>` directory of the state
