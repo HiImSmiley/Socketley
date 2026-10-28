@@ -456,9 +456,12 @@ int cli_export_full(int argc, char** argv)
     s.b = setup;
     put("setup", s);
 
-    const fs::path partial = out.string() + ".partial";
+    // This export's own name beside the archive, so neither a link someone left at a guessable one nor a crash's leftover
+    // is what it writes.
+    const fs::path partial = out.string() + ".partial-" + std::to_string(::getpid());
     writer_job j;
-    bool ok = j.tar.open(partial.string(), c, j.why, threads) &&
+    const bool opened = j.tar.open(partial.string(), c, j.why, threads);
+    bool ok = opened &&
               j.tar.add_bytes(std::string(meta_dir) + "manifest.json", socketley::json::written(manifest) + "\n", 0600, j.why);
     if (ok && setup)
     {
@@ -491,7 +494,8 @@ int cli_export_full(int argc, char** argv)
     cleanup();
     if (!ok)
     {
-        fs::remove(partial, ec);
+        if (opened)
+            fs::remove(partial, ec);
         std::cout << "export: " << j.why << "\n";
         return 2;
     }

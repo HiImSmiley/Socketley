@@ -239,6 +239,7 @@ TEST_CASE("tar: what is written reads back, a long name, a link, a file of sever
                    socketley::tar_writer::compression::best})
     {
         const std::string path = (dir / "a.tar").string();
+        std::filesystem::remove(path);
         std::string why;
         {
             socketley::tar_writer w;
@@ -262,6 +263,7 @@ TEST_CASE("tar: what is written reads back, a long name, a link, a file of sever
             for (const unsigned threads : {1u, 2u})
             {
                 const std::string p = (dir / ("t" + std::to_string(threads) + ".tar")).string();
+                std::filesystem::remove(p);
                 socketley::tar_writer w;
                 REQUIRE_MESSAGE(w.open(p, c, why, threads), why);
                 CHECK(w.add_dir("var/lib", st, why));
@@ -315,4 +317,30 @@ TEST_CASE("tar: what is written reads back, a long name, a link, a file of sever
         socketley::tar_reader::entry e;
         CHECK(r.next(e, why) == socketley::tar_reader::status::bad);
     }
+}
+
+TEST_CASE("tar: an archive is made new, never into a file or through a link someone left at its name")
+{
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("skl-tar-new-" + std::to_string(::getpid()));
+    dir_guard guard(dir.string());
+    std::filesystem::create_directories(dir);
+    const std::string loot = (dir / "loot").string();
+    {
+        FILE* fp = std::fopen(loot.c_str(), "wb");
+        REQUIRE(fp);
+        std::fputs("theirs", fp);
+        std::fclose(fp);
+    }
+    std::filesystem::create_symlink(loot, dir / "linked.tar");
+    std::filesystem::copy_file(loot, dir / "left.tar");
+    for (const char* name : {"linked.tar", "left.tar"})
+    {
+        socketley::tar_writer w;
+        std::string why;
+        CHECK_FALSE(w.open((dir / name).string(), socketley::tar_writer::compression::none, why));
+        CHECK(why.find("could not be written") != std::string::npos);
+    }
+    CHECK(read(loot) == "theirs");
+    CHECK(read((dir / "left.tar").string()) == "theirs");
+    CHECK(std::filesystem::is_symlink(dir / "linked.tar"));
 }

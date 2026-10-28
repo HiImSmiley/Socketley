@@ -8,6 +8,7 @@
 #
 #   * an archive tar or gzip does not take, or one that is not smaller with --compress best
 #   * compressing on several threads that loses or reorders a piece, which one thread would not
+#   * an archive written through a link someone left at the name beside it
 #   * a runtime's data left out: its buckets, its accounts, its mailboxes, its documents, its keys
 #   * a restore over a running daemon, over runtimes already there, or of a file that is no such archive
 #   * a crafted manifest that writes a system file, a home's hidden one, or a setuid bit
@@ -103,6 +104,14 @@ tar tf "$T/plain.tar" >/dev/null 2>&1 && ok "--compress none is a plain tar" || 
 out=$("$BIN" export --full "$T/zero.tar.gz" --threads 0 2>&1); rc=$?
 [ "$rc" -eq 1 ] && [ ! -e "$T/zero.tar.gz" ] && ok "--threads 0 is refused" || bad "--threads 0" "rc $rc: $out"
 [ "$(stat -c %a "$T/fast.tar.gz")" = 600 ] && ok "the archive is its writer's alone" || bad "the archive's mode" "$(stat -c %a "$T/fast.tar.gz")"
+# A link someone left at the guessable name beside the archive is no way into what export writes.
+: > "$T/loot"; chmod 644 "$T/loot"; ln -s "$T/loot" "$T/trap.tar.gz.partial"
+out=$("$BIN" export --full "$T/trap.tar.gz" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ ! -s "$T/loot" ] && [ -f "$T/trap.tar.gz" ] && [ ! -L "$T/trap.tar.gz" ] && gzip -t "$T/trap.tar.gz" 2>/dev/null \
+    && [ -z "$(ls "$T"/trap.tar.gz.partial-* 2>/dev/null)" ] \
+    && ok "a link at the archive's partial name is passed by, and nothing is written through it" \
+    || bad "a link at the partial name" "rc $rc: $out; loot $(stat -c %s "$T/loot") bytes; $(ls -la "$T"/trap.tar.gz* 2>&1)"
+rm -f "$T/trap.tar.gz" "$T/trap.tar.gz.partial" "$T/loot"
 
 out=$("$BIN" restore "$T/fast.tar.gz" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"daemon is running"*) true ;; *) false ;; esac && ok "restore refuses a running daemon" || bad "restore over a running daemon" "rc $rc: $out"

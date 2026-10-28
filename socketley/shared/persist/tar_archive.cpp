@@ -240,7 +240,8 @@ tar_writer::~tar_writer()
 
 bool tar_writer::open(const std::string& path, compression c, std::string& why, unsigned threads)
 {
-    m_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    // Made new, never through a link or into a file someone left at the name, which would keep its owner and mode.
+    m_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (m_fd < 0)
     {
         why = path + " could not be written: " + std::strerror(errno);

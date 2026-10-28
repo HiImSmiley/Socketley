@@ -194,6 +194,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the shared `/tmp/socketley.sock` read every flag `--lua` makes runtimes
   with, `--master-pw` and `--secret-key` among them. `socketley daemon`
   reports such a socket instead of exiting 0.
+- **`export --full` writes no archive through a link beside it.** The
+  archive was written to `<file>.partial`, opened through a symlink or into a
+  file someone else left at that name, so a root export into `/tmp` could
+  hand the whole state, passwords and keys to another user or overwrite any
+  file; it now goes to a name of its own export's process, made new and never
+  followed.
 - **Restore writes no file through a link at its scratch name.** Each file
   went to `<file>.restore-tmp` opened through whatever stood there, so an
   archive whose earlier entry was a symlink of that name had root write the
