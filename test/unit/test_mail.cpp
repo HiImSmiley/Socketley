@@ -749,18 +749,23 @@ TEST_CASE("DMARC: aligned SPF or DKIM passes, a policy is taken from the organiz
     const std::string msg = "From: Alice <alice@news.example.test>\r\nTo: b@here.test\r\nSubject: x\r\n\r\nbody\r\n";
     r.txts["example.test"] = {"v=spf1 ip4:192.0.2.1 -all"};
     r.txts["_dmarc.example.test"] = {"v=DMARC1; p=reject; sp=quarantine"};
+    // A subdomain is the parent's organization by the system's suffix list; without one alignment is strict.
+    const bool psl = !socketley::public_suffix::system_list().empty();
+    if (!psl)
+        MESSAGE("no system public suffix list: news.example.test is its own organization, with no policy");
     // SPF passes for the parent domain, aligned under relaxed alignment.
     auto res = check_inbound(msg, "192.0.2.1", "mx.example.test", "bounce@example.test", r, 0);
     CHECK(res.spf == "pass");
-    CHECK(res.dmarc == "pass");
+    CHECK(res.dmarc == (psl ? "pass" : "none"));
     CHECK_FALSE(res.reject());
     // From another address: SPF fails, nothing aligned, and the subdomain's policy is sp=quarantine.
     res = check_inbound(msg, "203.0.113.5", "evil.test", "x@example.test", r, 0);
     CHECK(res.spf == "fail");
-    CHECK(res.dmarc == "fail");
-    CHECK(res.dmarc_policy == "quarantine");
-    CHECK(res.quarantine());
-    CHECK(res.header().find("dmarc=fail header.from=news.example.test (p=quarantine)") != std::string::npos);
+    CHECK(res.dmarc == (psl ? "fail" : "none"));
+    CHECK(res.dmarc_policy == (psl ? "quarantine" : ""));
+    CHECK(res.quarantine() == psl);
+    if (psl)
+        CHECK(res.header().find("dmarc=fail header.from=news.example.test (p=quarantine)") != std::string::npos);
     // The domain's own address is the policy's own p=.
     const std::string own = "From: alice@example.test\r\n\r\nx\r\n";
     res = check_inbound(own, "203.0.113.5", "evil.test", "x@else.test", r, 0);
@@ -777,7 +782,7 @@ TEST_CASE("DMARC: aligned SPF or DKIM passes, a policy is taken from the organiz
     res = check_inbound(own, "192.0.2.1", "example.test", "", r, 0);
     CHECK(res.spf_domain == "example.test");
     CHECK(res.spf == "pass");
-    CHECK(organizational_domain("a.b.example.test") == "example.test");
+    CHECK(organizational_domain("a.b.example.test") == (psl ? "example.test" : "a.b.example.test"));
     CHECK(organizational_domain("example") == "example");
 }
 
