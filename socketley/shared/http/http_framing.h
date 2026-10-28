@@ -347,11 +347,11 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
 
         const std::string_view name = line.substr(0, colon);
 
-        // Whitespace between a field name and its colon (RFC 9112 Section
-        // 5.1), unrecoverable because "Content-Length : 5" frames the response
-        // for a lenient backend and not for this parser.
-        if (SOCKETLEY_UNLIKELY(name.find(' ')  != std::string_view::npos ||
-                               name.find('\t') != std::string_view::npos))
+        // A name that is not a token, whitespace before the colon (RFC 9112
+        // Section 5.1) or a "Content-Length\x0b" alike, is unrecoverable
+        // because it frames the response for a lenient client and not for
+        // this parser.
+        if (SOCKETLEY_UNLIKELY(!http_is_token(name)))
         {
             out.ok = false;
             return out;

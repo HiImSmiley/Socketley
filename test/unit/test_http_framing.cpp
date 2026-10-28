@@ -53,6 +53,24 @@ TEST_CASE("a request field name that is not a token is refused, so no backend's 
     CHECK(s.content_length == 5);
 }
 
+TEST_CASE("a response field name that is not a token leaves its length unknown, so the socket is never pooled")
+{
+    for (const std::string_view head : {std::string_view("HTTP/1.1 200 OK\r\nContent-Length\x0b: 5\r\n\r\nhello"),
+                                        std::string_view("HTTP/1.1 200 OK\r\nTransfer-Encoding\x0c: chunked\r\n"
+                                                         "Content-Length: 5\r\n\r\nhello"),
+                                        std::string_view("HTTP/1.1 200 OK\r\nX-A\0: 1\r\nContent-Length: 5\r\n\r\nhello",
+                                                         52)})
+    {
+        http_response_framing st;
+        http_response_scan_chunk(st, head);
+        CHECK(st.unknown);
+    }
+    http_response_framing ok;
+    http_response_scan_chunk(ok, "HTTP/1.1 200 OK\r\nX_Odd.Name~2!: 1\r\nContent-Length: 5\r\n\r\nhello");
+    CHECK_FALSE(ok.unknown);
+    CHECK(http_response_frame_complete(ok));
+}
+
 TEST_CASE("a head checked a byte at a time from where the last check stopped is judged as it is whole")
 {
     const char* const heads[] = {

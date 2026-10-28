@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   framing field to the proxy, server, storage or tunnel and went on to the
   backend verbatim, where a parser that trims it framed the body by it and
   read a second request the proxy never routed or authenticated.
+- **A backend answer whose field name is not a token is never pooled.** A
+  `Content-Length<VT>` or a NUL in a response field name framed the answer one
+  way for the proxy and another for a lenient client; such a backend socket
+  is now relayed to its close and not reused.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's
