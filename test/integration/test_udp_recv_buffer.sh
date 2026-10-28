@@ -92,6 +92,36 @@ else
         "measured anywhere from 10,960 to 20,000 of 20,000 on the same binary"
 fi
 
+# ── what an untuned socket holds here, and what the listener's ask buys ─────
+# The listener asks for 1 MiB, which the kernel caps at net.core.rmem_max and doubles, so on a machine whose
+# rmem_max is the 208 KiB default the tuned buffer is twice an untuned one and not the tenfold measured above.
+RMAX=$(cat /proc/sys/net/core/rmem_max)
+RDEF=$(cat /proc/sys/net/core/rmem_default)
+ASK=$((1024 * 1024)); [ "$RMAX" -lt "$ASK" ] && ASK=$RMAX
+TUNED=$((ASK * 2))
+BASE=$(python3 -c "
+import socket
+r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); r.bind(('127.0.0.1', 0))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4*1024*1024)
+pay = b'x' * 99 + b'\n'
+for _ in range($BURST):
+    try: s.sendto(pay, r.getsockname())
+    except OSError: pass
+n = 0
+while True:
+    try: r.recv(256, socket.MSG_DONTWAIT); n += 1
+    except BlockingIOError: break
+print(n)" 2>/dev/null)
+if [ $((TUNED * 2)) -lt $((RDEF * 3)) ]; then
+    echo "  SKIP: net.core.rmem_max is $RMAX, which caps the listener's 1 MiB at $TUNED beside a default of $RDEF -- too close to tell apart"
+    for n in urb_c; do "$BIN" stop "$n" >/dev/null 2>&1; "$BIN" remove "$n" >/dev/null 2>&1; done
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+    [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+fi
+# Halfway between an untuned socket's depth and the depth the capped ask should give, so neither is near it.
+FLOOR=$(( ${BASE:-221} * (RDEF + TUNED) / (2 * RDEF) ))
+
 # ── the measurement: the same burst at a server that is not ────────────────
 "$BIN" create server urb -p "$PR" --udp -s >/dev/null 2>&1
 sleep 1.2
@@ -110,12 +140,12 @@ else
     sleep 2.5
 
     DEEP=$(msgs_of urb)
-    if [ "${DEEP:-0}" -ge 1000 ]; then
-        ok "a burst may get $DEEP datagrams ahead of a runtime that is not reading"
+    if [ "${DEEP:-0}" -ge "$FLOOR" ]; then
+        ok "a burst may get $DEEP datagrams ahead of a runtime that is not reading (an untuned socket holds ${BASE:-?})"
     else
         bad "the UDP listener's receive buffer is tuned" \
-            "only ${DEEP:-<none>} of $BURST survived a burst at a socket nobody was draining;" \
-            "221 is the kernel default with no SO_RCVBUF set, which is what this listener" \
+            "only ${DEEP:-<none>} of $BURST survived a burst at a socket nobody was draining, under $FLOOR;" \
+            "${BASE:-<none>} is what an untuned socket holds here, which is what this listener" \
             "had while every other socket in the tree was tuned -- and a datagram dropped" \
             "there is gone, with no window to close and no retransmit behind it"
     fi
