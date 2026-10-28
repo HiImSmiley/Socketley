@@ -196,7 +196,10 @@ expect "a request without a Host is 400" "$(code '' /who.txt -H 'Host:')" 400
 expect "a request that came round again is 508" "$(code chat.example.com /who.txt -H "Via: 1.1 web.$(hostname)")" 508
 expect "and one that only passed another proxy is not" "$(code chat.example.com /who.txt -H "Via: 1.1 xweb.$(hostname), 1.1 other")" 200
 expect "the absolute form names the host itself" \
-    "$(curl -s --noproxy '*' -m 3 --request-target http://chat.example.com/who.txt "http://127.0.0.1:$E/x" | sed 's/two/one/')" "one"
+    "$(hc chat.example.com /x --request-target http://chat.example.com/who.txt | sed 's/two/one/')" "one"
+# A Host naming another host than the target would reach the runtime as a name its handshake was not checked against.
+expect "and with a Host naming another it is refused" \
+    "$(code ui.example.com /x --request-target http://chat.example.com/who.txt)" 400
 
 # A storage runtime is told the name asked for, which is how it finds the bucket.
 for _ in $(seq 1 40); do [ "$(code ui.example.com /)" = 200 ] && break; sleep 0.2; done
