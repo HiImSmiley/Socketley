@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   framing field to the proxy, server, storage or tunnel and went on to the
   backend verbatim, where a parser that trims it framed the body by it and
   read a second request the proxy never routed or authenticated.
+- **An h2c upgrade is not relayed by the proxy.** A request offering
+  `Upgrade: h2c` reached the backend with its offer and `HTTP2-Settings`, and
+  after a 101 the client spoke HTTP/2 to the backend past `--auth`, filters,
+  routes and the `X-Forwarded-User` strip; the offer is now stripped and the
+  request answered as the plain one it carries, while WebSocket and other
+  upgrades are relayed as before.
 - **A backend answer whose field name is not a token is never pooled.** A
   `Content-Length<VT>` or a NUL in a response field name framed the answer one
   way for the proxy and another for a lenient client; such a backend socket

@@ -4772,7 +4772,7 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // the ones that frame the message, which a client must not be able to take away from the backend's reading.
     std::vector<std::string> connection_named;
     {
-        bool conn_has_upgrade = false, has_upgrade_field = false;
+        bool conn_has_upgrade = false, has_upgrade_field = false, offers_h2 = false;
         size_t u_pos = 0;
         while (u_pos < headers_section.size())
         {
@@ -4802,11 +4802,16 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
             }
             else if (header_name_equals(line, "upgrade", 7))
             {
-                if (!http_trim_ows(line.substr(colon + 1)).empty())
+                const std::string_view offer = http_trim_ows(line.substr(colon + 1));
+                if (!offer.empty())
                     has_upgrade_field = true;
+                // HTTP/2 behind a 101 would carry every later request past the auth, filters and routes this
+                // proxy applies per request head, so an h2c offer is no offer (RFC 9113 3.1 retires it anyway).
+                if (http_list_has_token(offer, "h2c", 3) || http_list_has_token(offer, "h2", 2))
+                    offers_h2 = true;
             }
         }
-        upgrade_offered = conn_has_upgrade && has_upgrade_field;
+        upgrade_offered = conn_has_upgrade && has_upgrade_field && !offers_h2;
     }
 
     bool host_written = false;
@@ -4849,7 +4854,8 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
                  header_name_equals(hdr_line, "proxy-authenticate", 18) ||
                  header_name_equals(hdr_line, "proxy-authorization", 19) ||
                  header_name_equals(hdr_line, "te", 2) ||
-                 header_name_equals(hdr_line, "trailer", 7))
+                 header_name_equals(hdr_line, "trailer", 7) ||
+                 header_name_equals(hdr_line, "http2-settings", 14))
             skip = true;
         // The credentials --auth took were this proxy's to see, not the backend's.
         else if (m_auth.enabled() && header_name_equals(hdr_line, "authorization", 13))

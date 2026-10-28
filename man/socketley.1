@@ -20262,7 +20262,14 @@ verbatim, and computes no part of it \(em there is no
 .B Sec\-WebSocket\-Accept
 calculation here, no check that the key matches, and no opinion about the
 protocol named. It keys off the 101 and not off the token, so any upgrade two
-endpoints agree on is relayed the same way.
+endpoints agree on is relayed the same way \(em except
+.B h2c
+(and
+.BR h2 ),
+whose offer is stripped with its
+.B HTTP2\-Settings
+field and answered as a plain request, because HTTP/2 behind a 101 would carry
+every later request past the checks the proxy makes on each request head.
 .PP
 .B "Frames are never parsed."
 After the 101 the connection carries opaque bytes. The proxy does not know
