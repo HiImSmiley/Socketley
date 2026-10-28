@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **No user takes the buckets' default owner.** An invitation or CreateUser
   could make a user named `socketley`, the owner every bucket with none
   recorded belongs to, and so own all of them; the name is refused.
+- **A sign-in or an account's change posted from another site is refused.**
+  POST /login, /authorize, /device and the /account forms answer 403 when
+  Origin, or else Referer, names a page that is neither the provider's nor
+  under its cookie domain, so another site cannot sign its visitor into an
+  account of its choosing; a client sending neither header is taken as
+  before. The provider's pages now say `Referrer-Policy: same-origin`, under
+  which a browser posts their forms with their Origin.
 - **A return address with a backslash in its host is refused.** With
   `--cookie-domain` set, `rd=https://evil.example%5C.example.com/` passed as a
   name under the domain, and a browser, reading the backslash as a slash, went

@@ -295,6 +295,13 @@ bool return_allowed(std::string_view url, std::string_view issuer, std::string_v
                               host[host.size() - domain.size() - 1] == '.');
 }
 
+bool form_origin_allowed(std::string_view origin, std::string_view issuer, std::string_view cookie_domain)
+{
+    // "null", what a browser sends for a page that hides its origin, is no page of these.
+    return origin.empty() ||
+           ((origin.starts_with("https://") || origin.starts_with("http://")) && return_allowed(origin, issuer, cookie_domain));
+}
+
 std::string sign_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view body)
 {
     std::string header;

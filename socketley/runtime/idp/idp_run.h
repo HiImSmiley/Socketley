@@ -66,6 +66,9 @@ private:
         std::string cookie;
         std::string authorization;
         std::string forwarded_for;
+        // The page a browser says sent the request, Origin and else Referer, for a form posted from another site.
+        std::string origin;
+        std::string referer;
     };
 
 

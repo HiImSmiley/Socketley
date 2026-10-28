@@ -371,6 +371,10 @@ int idp_run::take_request(conn& c, request& rq, int& refusal)
             rq.authorization.assign(value);
         else if (header_name_equals(f, "x-forwarded-for", 15))
             rq.forwarded_for.assign(value);
+        else if (header_name_equals(f, "origin", 6))
+            rq.origin.assign(value);
+        else if (header_name_equals(f, "referer", 7))
+            rq.referer.assign(value);
     });
     if (r <= 0)
         return r;
@@ -395,8 +399,9 @@ void idp_run::respond(const std::shared_ptr<conn>& c, int status, std::string_vi
     o += type;
     o += "\r\nContent-Length: ";
     o += std::to_string(body.size());
+    // Same-origin rather than no-referrer, under which a browser would post this provider's own forms as Origin: null.
     o += "\r\nCache-Control: no-store\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\n"
-         "Referrer-Policy: no-referrer\r\n";
+         "Referrer-Policy: same-origin\r\n";
     if (type.starts_with("text/html"))
         o += "X-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
              "frame-ancestors 'none'\r\n";
@@ -446,6 +451,14 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         respond(c, 200, "text/plain", "",
                 std::string(any_origin) + "Access-Control-Allow-Methods: GET, POST\r\n"
                 "Access-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Max-Age: 600\r\n");
+        return;
+    }
+    // A form that signs in or changes an account is taken only from this provider's pages, or a browser on another
+    // site could post one and sign its visitor into an account of the site's choosing.
+    if (post && (p == "/login" || p == "/authorize" || p == "/device" || p.starts_with("/account")) &&
+        !form_origin_allowed(rq.origin.empty() ? rq.referer : rq.origin, m_issuer, m_cookie_domain))
+    {
+        respond(c, 403, "text/plain", "a form posted from another site is not taken here\n");
         return;
     }
     if (p == "/.well-known/openid-configuration" && get)

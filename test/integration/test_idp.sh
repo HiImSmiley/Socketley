@@ -14,6 +14,7 @@
 #   * a storage's users not coming over with the passwords they have there
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a return address a browser reads as another host's, by a backslash in its host
+#   * a sign-in or an account's change posted from another site's page
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -254,6 +255,27 @@ if phase == "main":
     st, body, h = req("POST", "/login", dict(rd="/", username="dora", password="dorapassword1"))
     dora = cookie_of(h)
     check("an imported user signs in with the password it had in the storage", (st, h.get("Location"), dora.startswith("skl_idp=")), (302, "/", True))
+
+    # A form posted from another site signs nobody in and changes nothing; one from the provider's page, or a client
+    # that names no page, is taken.
+    df = dict(rd="/", username="dora", password="dorapassword1")
+    for name, hd in (("a sign-in posted from another site is refused and signs nobody in", {"Origin": "https://evil.example"}),
+                     ("so is one whose page hid its origin", {"Origin": "null"}),
+                     ("and one a Referer says came from another site", {"Referer": "https://evil.example/page"})):
+        st, _, h = req("POST", "/login", df, headers=hd)
+        check(name, (st, h.get("Set-Cookie")), (403, None))
+    st, _, h = req("POST", "/login", df, headers={"Origin": I, "Referer": "https://evil.example/"})
+    check("one from the provider's own page is taken", (st, cookie_of(h).startswith("skl_idp=")), (302, True))
+    st, _, h = req("POST", "/login", df, headers={"Referer": I + "/login"})
+    check("as is one whose Referer is the provider's page", (st, cookie_of(h).startswith("skl_idp=")), (302, True))
+    check("the provider's pages tell a browser to post their forms with their origin",
+          req("GET", "/login")[2].get("Referrer-Policy"), "same-origin")
+    st, _, _ = req("POST", "/account", dict(name="Mallory", email="alice@example.com"), cookie=cookie, headers={"Origin": "https://evil.example"})
+    st2, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + rt.get("access_token", "")})
+    check("an account changed from another site is refused", (st, json.loads(body).get("name") if st2 == 200 else st2), (403, "Alice B"))
+    for path, form in (("/account/password", dict(current="alicepassword1", new="Evil-pass-2026q")), ("/account/totp", dict(do="start")),
+                       ("/account/everywhere", {}), ("/device", dict(user_code="ABCD-EFGH", do="allow"))):
+        check("so is a post to " + path, req("POST", path, form, cookie=cookie, headers={"Origin": "https://evil.example"})[0], 403)
 
     # The storage, signed in by the idp: dora is the storage's dora.
     S = "http://127.0.0.1:%s" % ps

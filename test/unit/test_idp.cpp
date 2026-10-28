@@ -108,6 +108,20 @@ TEST_CASE("a browser is sent back only to the provider's host or the cookie doma
     CHECK(return_allowed("https://app.example.com:8443/x?y=\\", iss, "example.com"));
 }
 
+TEST_CASE("a form is taken from the provider's pages, a name under the cookie domain, or a client naming none")
+{
+    const std::string_view iss = "https://auth.example.com";
+    CHECK(form_origin_allowed("", iss, ""));
+    CHECK(form_origin_allowed("https://auth.example.com", iss, ""));
+    CHECK(form_origin_allowed("https://auth.example.com/login?rd=/", iss, ""));
+    CHECK(form_origin_allowed("https://app.example.com", iss, "example.com"));
+    CHECK_FALSE(form_origin_allowed("https://app.example.com", iss, ""));
+    CHECK_FALSE(form_origin_allowed("https://evil.example", iss, "example.com"));
+    CHECK_FALSE(form_origin_allowed("null", iss, "example.com"));
+    CHECK_FALSE(form_origin_allowed("/login", iss, ""));
+    CHECK_FALSE(form_origin_allowed("http://auth.example.com", iss, ""));
+}
+
 TEST_CASE("a token verifies with its own key and fails every way it was not made")
 {
     EVP_PKEY* k = fresh_key();

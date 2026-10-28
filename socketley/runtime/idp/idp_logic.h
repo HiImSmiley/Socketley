@@ -79,6 +79,10 @@ std::string url_host(std::string_view url);
 // `cookie_domain` or a name below it.
 bool return_allowed(std::string_view url, std::string_view issuer, std::string_view cookie_domain);
 
+// Whether a form a browser posted came from a page return_allowed() would send it to, `origin` being its Origin or
+// else its Referer; true when it names none, as a client that is no browser sends neither.
+bool form_origin_allowed(std::string_view origin, std::string_view issuer, std::string_view cookie_domain);
+
 // A signed token's claims, read back: strings, numbers as their text, and booleans as "true" or "false".
 using claims = std::map<std::string, std::string, std::less<>>;
 
