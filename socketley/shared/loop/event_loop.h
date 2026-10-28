@@ -44,6 +44,35 @@ public:
     void set_busy_spin(bool on) { m_spin = on; }
 
     bool init();
+
+    // ── Ring setup tiers ────────────────────────────────────────────────────
+    // What init() asks io_uring_queue_init_params for, best first: DEFER_TASKRUN and SINGLE_ISSUER need 6.1,
+    // NO_SQARRAY 6.6, and SUBMIT_ALL, COOP_TASKRUN and CQSIZE 5.19, which the middle tiers keep on 5.19 and 6.0.
+    static constexpr unsigned RING_SETUP_BASE = IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN
+                                              | IORING_SETUP_CQSIZE;
+    static constexpr unsigned RING_SETUP_DEFER = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    static constexpr unsigned RING_SETUP_TIERS[] = {
+        RING_SETUP_DEFER | RING_SETUP_BASE | IORING_SETUP_NO_SQARRAY,
+        RING_SETUP_DEFER | RING_SETUP_BASE,
+        RING_SETUP_BASE | IORING_SETUP_NO_SQARRAY,
+        RING_SETUP_BASE,
+        0u,
+    };
+
+    // The index of the first tier try_setup accepts, or -1 when it accepts none, apart from init() so a test can
+    // play any kernel.
+    template <typename F>
+    static int pick_ring_setup(F&& try_setup)
+    {
+        constexpr int n = static_cast<int>(sizeof(RING_SETUP_TIERS) / sizeof(RING_SETUP_TIERS[0]));
+        for (int i = 0; i < n; i++)
+            if (try_setup(RING_SETUP_TIERS[i]))
+                return i;
+        return -1;
+    }
+
+    // The flags of the tier init() built the ring with.
+    unsigned ring_setup_flags() const { return m_ring_setup_flags; }
     void run();
 
     // End the ring, which run() returning deliberately does not do, at the one
@@ -424,6 +453,7 @@ private:
     bool m_cpus_explicit{false};
     bool m_affinity_applied{false};
     cpu_set_spec m_cpus{};
+    unsigned m_ring_setup_flags{0};
     bool m_recv_multishot_supported{false};
     // Set once the kernel refuses a multishot receive the probe passed, after which none is armed on this loop.
     bool m_recv_multishot_refused{false};

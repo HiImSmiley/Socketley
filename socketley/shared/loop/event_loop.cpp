@@ -940,8 +940,6 @@ void event_loop::apply_cpu_affinity()
 
 bool event_loop::init()
 {
-    bool initialized = false;
-
     // Before the ring, so no submission is counted against a table that does
     // not exist, and fatal on failure because a daemon quietly crossing
     // connections is worse than one that does not start.
@@ -978,39 +976,17 @@ bool event_loop::init()
     // the ring allocates is allocated on a CPU the loop will actually run on.
     apply_cpu_affinity();
 
-    // IORING_SETUP_NO_SQARRAY saves one indirection and needs 6.6, so each
-    // setup below is retried without it rather than dropping straight to plain
-    // mode and losing SINGLE_ISSUER and DEFER_TASKRUN at once.
-    const unsigned no_sqarray_opts[2] = { static_cast<unsigned>(IORING_SETUP_NO_SQARRAY), 0u };
-    for (unsigned no_sqarray : no_sqarray_opts)
-    {
-        if (initialized) break;
-
-    // Priority 1: SINGLE_ISSUER + DEFER_TASKRUN (defers task_work to
-    // io_uring_enter, avoiding async interrupts; needs kernel 6.1+)
-    if (!initialized)
-    {
-        struct io_uring_params p2{};
-        p2.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN
-                 | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN
-                 | no_sqarray;
-        p2.flags |= IORING_SETUP_CQSIZE;
-        p2.cq_entries = m_queue_depth * 4;
-        if (io_uring_queue_init_params(m_queue_depth, &m_ring, &p2) == 0)
-        {
-            initialized = true;
-        }
-    }
-
-    }   // end NO_SQARRAY retry loop
-
-    // Priority 2: plain mode, once SINGLE_ISSUER with and without NO_SQARRAY
-    // has been refused.
-    if (!initialized)
-    {
-        if (io_uring_queue_init(m_queue_depth, &m_ring, 0) < 0)
-            return false;
-    }
+    // The first setup this kernel accepts, best first, so a kernel missing one flag loses that flag and not the rest.
+    const int tier = pick_ring_setup([this](unsigned flags) {
+        struct io_uring_params p{};
+        p.flags = flags;
+        if (flags & IORING_SETUP_CQSIZE)
+            p.cq_entries = m_queue_depth * 4;
+        return io_uring_queue_init_params(m_queue_depth, &m_ring, &p) == 0;
+    });
+    if (tier < 0)
+        return false;
+    m_ring_setup_flags = RING_SETUP_TIERS[tier];
 
     // The ring exists from here on, and only from here: everything below and
     // every submission afterwards may reach into it.

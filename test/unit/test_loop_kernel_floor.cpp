@@ -316,3 +316,67 @@ TEST_CASE("a descriptor already being closed gets the refusal itself rather than
     CHECK(f.loop.owner_inflight(&r) == 0);
     CHECK(pump_until(f.loop, [&] { return f.loop.fd_inflight(fd) == 0 && f.loop.m_fd_close_pending == 0; }));
 }
+
+// ─── RING SETUP TIERS ───────────────────────────────────────────────────────
+//
+// A kernel below 6.1 refuses DEFER_TASKRUN, and init() went from the full set
+// straight to a ring with no flags at all, losing SUBMIT_ALL with it, so one
+// failing SQE stopped the rest of its batch.  Which tier a kernel gets is
+// decided by pick_ring_setup(), played here against the flag sets of the
+// kernels that matter; every tier is then built for real on this one.
+
+namespace {
+
+// The setup flags each kernel knows, cumulatively, as io_uring_setup checks them.
+constexpr unsigned K_5_19 = IORING_SETUP_CQSIZE | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN;
+constexpr unsigned K_6_0  = K_5_19 | IORING_SETUP_SINGLE_ISSUER;
+constexpr unsigned K_6_1  = K_6_0 | IORING_SETUP_DEFER_TASKRUN;
+constexpr unsigned K_6_6  = K_6_1 | IORING_SETUP_NO_SQARRAY;
+
+unsigned picked_on(unsigned known)
+{
+    const int tier = event_loop::pick_ring_setup([&](unsigned flags) { return (flags & ~known) == 0; });
+    REQUIRE(tier >= 0);
+    return event_loop::RING_SETUP_TIERS[tier];
+}
+
+} // namespace
+
+TEST_CASE("each kernel gets every setup flag it has")
+{
+    CHECK(picked_on(K_6_6) == (event_loop::RING_SETUP_DEFER | event_loop::RING_SETUP_BASE
+                               | IORING_SETUP_NO_SQARRAY));
+    CHECK(picked_on(K_6_1) == (event_loop::RING_SETUP_DEFER | event_loop::RING_SETUP_BASE));
+    // The two kernels the old fallback left with nothing.
+    CHECK(picked_on(K_6_0) == event_loop::RING_SETUP_BASE);
+    CHECK(picked_on(K_5_19) == event_loop::RING_SETUP_BASE);
+    CHECK((picked_on(K_5_19) & IORING_SETUP_SUBMIT_ALL) != 0);
+    // Below the floor the bare ring is still there to fall back to.
+    CHECK(picked_on(IORING_SETUP_CQSIZE) == 0u);
+    CHECK(event_loop::pick_ring_setup([](unsigned) { return false; }) == -1);
+}
+
+TEST_CASE("every setup tier builds a ring on this kernel, and init() takes the best")
+{
+    for (unsigned flags : event_loop::RING_SETUP_TIERS)
+    {
+        CAPTURE(flags);
+        struct io_uring r;
+        struct io_uring_params p{};
+        p.flags = flags;
+        if (flags & IORING_SETUP_CQSIZE)
+            p.cq_entries = 256;
+        const bool needs_6_6 = (flags & IORING_SETUP_NO_SQARRAY) != 0;
+        const bool needs_6_1 = (flags & IORING_SETUP_DEFER_TASKRUN) != 0;
+        if ((needs_6_6 && !kernel_at_least(6, 6)) || (needs_6_1 && !kernel_at_least(6, 1)))
+            continue;
+        REQUIRE(io_uring_queue_init_params(64, &r, &p) == 0);
+        io_uring_queue_exit(&r);
+    }
+
+    if (kernel_at_least(6, 6))
+    {
+        fixture f;
+        CHECK(f.loop.ring_setup_flags() == event_loop::RING_SETUP_TIERS[0]);
+    }
+}
