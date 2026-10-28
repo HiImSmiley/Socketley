@@ -890,19 +890,20 @@ bool smtp_session::data(std::string_view& in)
                     p = end;
                     break;
                 }
-                // A bare LF ends the line as a CRLF would, and so does a lone CR.
+                // A bare LF is written as CRLF, as a lone CR is, but only a CRLF begins a line the end's dot may open.
                 if (nl > p && nl[-1] == '\r')
                 {
                     append_lines(out, p, static_cast<size_t>(nl - p), false);
                     out += '\n';
+                    m_dstate = s_bol;
                 }
                 else
                 {
                     append_lines(out, p, static_cast<size_t>(nl - p), true);
                     out.append("\r\n");
+                    m_dstate = s_mid;
                 }
                 p = nl + 1;
-                m_dstate = s_bol;
                 break;
             }
             case s_bol:
@@ -935,10 +936,10 @@ bool smtp_session::data(std::string_view& in)
                 }
                 else if (*p == '\n')
                 {
-                    // A lone dot ended by a bare LF is no end: the line is an empty one.
+                    // A lone dot ended by a bare LF is no end, and opens no line where a dot would end the message.
                     out.append("\r\n");
                     ++p;
-                    m_dstate = s_bol;
+                    m_dstate = s_mid;
                 }
                 else
                     m_dstate = s_mid;

@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **Only CRLF.CRLF ends a message's DATA.** A bare LF began a line the
+  ending dot could open, so `\n.\r\n` ended the message and what followed ran
+  as commands (SMTP smuggling); a bare LF is still written as CRLF, but a dot
+  after it is data.
 - **A stranger's mail sent on by an alias or a redirect is not DKIM-signed.**
   Any outgoing message whose From named a local domain was signed with its
   key, so mail forged as `ceo@<domain>` and forwarded left signed; only mail of

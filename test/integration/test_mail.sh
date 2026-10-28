@@ -285,6 +285,23 @@ f=$(mail_with "smuggled")
 [ -n "$f" ] && grep -q 'MAIL FROM:<evil@else.test>' "$f" && ok "a dot between bare LFs ends no message: what follows is the body" \
     || bad "a dot between bare LFs ends no message: what follows is the body" "$(cat "$T/smuggle.out")"
 check "and only one message was taken" "$(grep -l 'smuggled' "$T"/sink/*.eml 2>/dev/null | wc -l)" "1"
+python3 - "$P" > "$T/smuggle2.out" 2>&1 <<'PY'
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+f = s.makefile("rb")
+def say(x): s.sendall(x)
+f.readline()
+say(b"EHLO x\r\n")
+while not f.readline().startswith(b"250 "): pass
+say(b"MAIL FROM:<carol@else.test>\r\nRCPT TO:<info@example.test>\r\nDATA\r\n")
+for _ in range(3): f.readline()
+say(b"Subject: smuggle two\r\n\r\nfirst\n.\r\nMAIL FROM:<evil2@else.test>\r\nRCPT TO:<info@example.test>\r\nDATA\r\nsmuggled again\r\n.\r\nQUIT\r\n")
+print(f.readline().decode().strip())
+PY
+f=$(mail_with "smuggled again")
+[ -n "$f" ] && grep -q 'MAIL FROM:<evil2@else.test>' "$f" && ok "nor does a dot after a bare LF and before a CRLF" \
+    || bad "nor does a dot after a bare LF and before a CRLF" "$(cat "$T/smuggle2.out")"
+check "and again only one message was taken" "$(grep -l 'smuggled again' "$T"/sink/*.eml 2>/dev/null | wc -l)" "1"
 r=$(python3 - "$P" <<'PY'
 import smtplib, sys
 s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0))

@@ -344,7 +344,7 @@ TEST_CASE("a message past fifty Received lines is a loop, refused by DATA and BD
     CHECK(f.messages.size() == 1);
 }
 
-TEST_CASE("a bare LF is a line's end written as CRLF, and a dot between bare LFs ends nothing")
+TEST_CASE("a bare LF is a line's end written as CRLF, and a dot after one ends nothing")
 {
     fake f;
     smtp_session s(plain_config(), f);
@@ -354,11 +354,21 @@ TEST_CASE("a bare LF is a line's end written as CRLF, and a dot between bare LFs
     s.input("one\n.\nMAIL FROM:<evil@b.org>\r\nRCPT TO:<victim@d.org>\r\nDATA\r\nforged\r\n.\r\n");
     CHECK(f.codes() == std::vector<int>{250});
     REQUIRE(f.messages.size() == 1);
-    CHECK(f.messages[0] == "one\r\n\r\nMAIL FROM:<evil@b.org>\r\nRCPT TO:<victim@d.org>\r\nDATA\r\nforged\r\n");
+    CHECK(f.messages[0] == "one\r\n.\r\nMAIL FROM:<evil@b.org>\r\nRCPT TO:<victim@d.org>\r\nDATA\r\nforged\r\n");
+    // Nor does a dot after a bare LF and before a CRLF, as a server that ends lines only at CRLF would read it.
+    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\none\n.\r\nMAIL FROM:<evil@b.org>\r\n.\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 354, 250});
+    REQUIRE(f.messages.size() == 2);
+    CHECK(f.messages[1] == "one\r\n.\r\nMAIL FROM:<evil@b.org>\r\n");
+    // Nor one after a dot ended by a bare LF.
+    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\none\r\n.\n.\r\nRSET\r\n.\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 354, 250});
+    REQUIRE(f.messages.size() == 3);
+    CHECK(f.messages[2] == "one\r\n\r\n.\r\nRSET\r\n");
     // A lone CR is a line's end too, so a server that ends lines at one reads the lines this one read.
     s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\nx\ry\r.\r\nz\r\n.\r\n");
-    REQUIRE(f.messages.size() == 2);
-    CHECK(f.messages[1] == "x\r\ny\r\n.\r\nz\r\n");
+    REQUIRE(f.messages.size() == 4);
+    CHECK(f.messages[3] == "x\r\ny\r\n.\r\nz\r\n");
 }
 
 TEST_CASE("a message past the size is read to its end and refused, and the next one is taken")
