@@ -126,6 +126,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   standing for all, so a Deny on deleting a prefix's objects was passed over
   and they went with the bucket; each version is now judged as its own
   DeleteObjectVersion, and one refused keeps the library, answered 409.
+- **IMAP LIST takes at most 64 patterns of 1024 bytes.** Every folder was
+  matched against every pattern with the reference copied in front of it
+  each time, so one LIST of a 25 MiB reference or of millions of patterns
+  held the shard's loop for minutes; such a LIST is now BAD, a pattern stops
+  at the first character it cannot match, and a command of more than a
+  million words is refused.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

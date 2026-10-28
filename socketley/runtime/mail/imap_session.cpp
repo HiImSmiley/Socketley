@@ -24,6 +24,11 @@ namespace
 {
 
 constexpr std::string_view all_flags = "\\Answered \\Flagged \\Deleted \\Seen \\Draft";
+// LIST's budget: a reference and pattern together no longer than this, and no more patterns than the next.
+constexpr size_t max_list_pattern = 1024;
+constexpr size_t max_list_patterns = 64;
+// The most words one command is read into.
+constexpr size_t max_tokens = 1u << 20;
 
 std::string upper(std::string_view s)
 {
@@ -129,7 +134,7 @@ uint8_t flag_bit(std::string_view f)
 // pattern of many stars costs its length times the name's, never more.
 bool wildmatch(std::string_view pat, std::string_view name)
 {
-    if (pat.size() > 1024)
+    if (pat.size() > max_list_pattern)
         return false;
     const bool inbox = iequal(name.substr(0, 5), "INBOX") && (name.size() == 5 || name[5] == '/');
     // can[j]: the pattern so far matches name[0, j).
@@ -156,6 +161,9 @@ bool wildmatch(std::string_view pat, std::string_view name)
                                (inbox && j < 5 && socketley::ascii::lower(p) == socketley::ascii::lower(name[j]))))
                     next[j + 1] = 1;
         can.swap(next);
+        // A pattern that reaches no place in the name matches nothing whatever follows.
+        if (std::find(can.begin(), can.end(), 1) == can.end())
+            return false;
     }
     return can[name.size()];
 }
@@ -527,6 +535,9 @@ bool imap_session::tokenize(std::string_view s, std::vector<token>& out) const
     size_t i = 0;
     while (i < s.size())
     {
+        // A command of a million words is none a client sends, and each would cost a string of its own.
+        if (out.size() > max_tokens)
+            return false;
         const char c = s[i];
         // A line's end inside a command is only ever after a literal's marker, and separates like a space.
         if (c == ' ' || c == '\r' || c == '\n')
@@ -1511,11 +1522,19 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
     if (a[i].k == token::open)
     {
         for (++i; i < a.size() && a[i].k != token::close; ++i)
+        {
+            // Each folder is matched against every pattern, so their number and length are bounded before any is.
+            if (pats.size() == max_list_patterns)
+                return finish(tag, "BAD", "LIST takes at most 64 patterns");
             pats.push_back(box(a[i].text));
+        }
         ++i;
     }
     else
         pats.push_back(box(a[i++].text));
+    for (const auto& p : pats)
+        if (ref.size() + p.size() > max_list_pattern)
+            return finish(tag, "BAD", "LIST pattern too long");
     bool told_subscribed = only_subscribed && !lsub;
     std::vector<std::string> status;
     if (i + 1 < a.size() && upper(a[i].text) == "RETURN" && a[i + 1].k == token::open)
@@ -1533,8 +1552,11 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
         untagged("LIST (\\Noselect) \"/\" \"\"");
         return finish(tag, "OK", "LIST completed");
     }
+    // The reference joined to each pattern here, once, not for every folder.
+    for (auto& p : pats)
+        p.insert(0, ref);
     m_waiting = true;
-    m_store.folders(m_user, [this, alive = m_alive, tag, ref, pats, lsub, only_subscribed, told_subscribed,
+    m_store.folders(m_user, [this, alive = m_alive, tag, pats = std::move(pats), lsub, only_subscribed, told_subscribed,
                              status](std::vector<std::string> names) {
         if (!*alive)
             return;
@@ -1546,7 +1568,7 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
         {
             bool hit = false;
             for (const auto& p : pats)
-                hit = hit || wildmatch(ref + p, n);
+                hit = hit || wildmatch(p, n);
             const bool sub = m_store.subscribed(m_user, n);
             if (!hit || (only_subscribed && !sub))
                 continue;
@@ -1578,7 +1600,7 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
                 for (size_t at = n.find('/'); at != std::string::npos; at = n.find('/', at + 1))
                     levels.insert(n.substr(0, at));
             const auto hit = [&](const std::string& n) {
-                return std::any_of(pats.begin(), pats.end(), [&](const std::string& p) { return wildmatch(ref + p, n); });
+                return std::any_of(pats.begin(), pats.end(), [&](const std::string& p) { return wildmatch(p, n); });
             };
             for (const auto& n : levels)
                 if (!std::binary_search(shared.begin(), shared.end(), n) && hit(n))

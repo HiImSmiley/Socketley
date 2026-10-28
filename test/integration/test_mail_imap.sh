@@ -602,6 +602,36 @@ except Exception as e:
 PY
 )
 check "a literal's marker glued to an atom is no literal, a huge one is refused, and the next command answered" "$r" "a BAD c NO  b OK "
+
+# LIST matches every folder against every pattern on the loop, so a long reference or many patterns are refused at
+# once, as is a command of more than a million words; an ordinary LIST of two patterns still answers both.
+r=$(timeout 180 python3 - "$IM" <<'PY'
+import imaplib, sys
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1]))
+M.login("bob", "bobpassword12")
+def ask(cmd):
+    tag = M._new_tag()
+    M.send(tag + b" " + cmd + b"\r\n")
+    while True:
+        line = M.readline()
+        if line.startswith(tag + b" ") or not line:
+            return line[len(tag) + 1:].split(b" ")[0].decode(errors="replace")
+long_ref = ask(b'LIST "' + b"a" * 2048 + b'" "*"')
+many = ask(b'LIST "" (' + b" ".join(b"x%d" % i for i in range(100)) + b")")
+typ, data = M.list('""', "(INBOX Sent)")
+two = typ == "OK" and len(data) == 2 and b'"INBOX"' in b" ".join(data) and b'"Sent"' in b" ".join(data)
+# Thirty-seven lines of thirty thousand words, each carried on to the next by an empty LITERAL+.
+words = b" ".join([b"x"] * 30000)
+tag = M._new_tag()
+M.send(tag + b" NOOP " + b"".join(words + b" {0+}\r\n" for _ in range(37)) + b"x\r\n")
+line = M.readline()
+while line and not line.startswith(tag + b" "):
+    line = M.readline()
+huge = line[len(tag) + 1:].split(b" ")[0].decode(errors="replace")
+print(long_ref, many, two, huge, M.noop()[0])
+PY
+)
+check "LIST refuses a 2 KiB reference and 100 patterns, lists two, and a command of a million words is refused" "$r" "BAD BAD True BAD OK"
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
