@@ -241,6 +241,16 @@ want "nor setmetatable" "table expected" \
   '[["EVAL","setmetatable(_G, {}) return 1","0"]]'
 want "and no value survived any of them" "nil" \
   '[["EVAL","return tostring(sneak)","0"]]'
+# KEYS and ARGV are the two tables every script shares by name, so a metatable
+# one script set on them answered the next script's reads from its upvalue.
+want "a metatable on KEYS is refused" "protected metatable" \
+  '[["EVAL","setmetatable(KEYS, {}) return 1","0"]]'
+resp '[["EVAL","local s = {} pcall(setmetatable, KEYS, {__index = function(_, k) return s[k] end, __newindex = function(_, k, v) s[k] = v end}) KEYS.secret = ARGV[1] return 1","0","planted"]]' >/dev/null
+want "and nothing one script put in KEYS reaches the next" '$3 | nil | ' \
+  '[["EVAL","return tostring(KEYS.secret)","0"]]'
+resp '[["EVAL","pcall(setmetatable, ARGV, {__index = function() return \"planted\" end}) return 1","0"]]' >/dev/null
+want "nor does an __index planted on ARGV" '$6 | absent | ' \
+  '[["EVAL","return ARGV[9] or \"absent\"","0"]]'
 
 echo "--- 8. sharded: a script is routed by the keys it declares ---"
 "$BIN" create cache sc_s -p "$PS" --shards 4 --cluster -s >/dev/null 2>&1

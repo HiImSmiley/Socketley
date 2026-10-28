@@ -489,6 +489,7 @@ void cache_script_engine::ensure_state()
     // for every later script from every client, so the globals move into a
     // backing table behind __index, the libraries behind read-only proxies,
     // the string metatable behind __metatable, and rawset out of reach.
+    // KEYS and ARGV get a protected metatable, since one planted there by a script would answer every later script's reads.
     m_lua.script(
         "local g = _G\n"
         "local rawset, pairs, ipairs, setmetatable, getmetatable, type =\n"
@@ -513,6 +514,8 @@ void cache_script_engine::ensure_state()
         "  end\n"
         "end\n"
         "getmetatable('').__metatable = false\n"
+        "setmetatable(g.KEYS, { __metatable = false })\n"
+        "setmetatable(g.ARGV, { __metatable = false })\n"
         "local backing = {}\n"
         "for k, v in pairs(g) do backing[k] = v end\n"
         "for _, n in ipairs({ 'string', 'table', 'math', 'redis' }) do\n"
@@ -547,7 +550,7 @@ bool cache_script_engine::eval(std::string_view body,
     // once; a call only writes the elements it needs and clears whatever the
     // previous script left past its own end.
     // Every other entry is walked out of the table, since a script may write KEYS[5] itself and no length finds it.
-    // Written raw, so a metatable one script set on KEYS runs nothing for the next.
+    // Written raw, and no script can give either table a metatable: ensure_state() protects both.
     lua_State* L = m_lua.lua_state();
     const auto refill = [L](const sol::table& t, std::span<const std::string_view> v)
     {
