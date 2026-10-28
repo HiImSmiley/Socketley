@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Content-Length<VT>` or a NUL in a response field name framed the answer one
   way for the proxy and another for a lenient client; such a backend socket
   is now relayed to its close and not reused.
+- **No rename makes a user named `socketley`.** UpdateUser's NewUserName was
+  checked against the IAM and credentials-file users only, so a delegate allowed
+  UpdateUser on `user/*` could rename itself to the default owner's name and own
+  every bucket made with the default key; it is now EntityAlreadyExists, as
+  CreateUser and invitations already were.
 - **A Signature Version 2 presigned URL signs every subresource it carries.**
   A subresource added under an escaped name, `%76ersionId` or `%61cl`, was
   left out of the string to sign but read by the handler, so a presigned GET

@@ -155,6 +155,10 @@ check("and a move out of them is refused, as a right over the user it makes",
       code(lambda: ai.update_user(UserName="t1", NewPath="/")), "AccessDenied")
 check("as is UpdateUser of a user outside them", code(lambda: ai.update_user(UserName="bob", NewUserName="t3")), "AccessDenied")
 check("and the user is where the allowed move put it", iam.get_user(UserName="t1")["User"]["Path"], "/team/x/")
+check("no rename takes the default owner's name, which owns every bucket recorded with none",
+      code(lambda: ai.update_user(UserName="t1", NewUserName="socketley")), "EntityAlreadyExists")
+check("not even an admin's", code(lambda: iam.update_user(UserName="bob", NewUserName="socketley")), "EntityAlreadyExists")
+check("and the user keeps its name", iam.get_user(UserName="t1")["User"]["UserName"], "t1")
 
 # No delegate gives IAM rights.
 check("a delegate puts an S3 policy on a user it may", code(lambda: ai.put_user_policy(

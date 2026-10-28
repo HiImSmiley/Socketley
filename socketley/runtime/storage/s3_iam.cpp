@@ -882,6 +882,13 @@ struct api
         x += "</LoginProfile>";
     }
 
+    // Whether no user may be given the name `n`, made or renamed: the default owner's is a name too, and every bucket
+    // recorded with no owner belongs to it.
+    bool name_taken(const std::string& n) const
+    {
+        return s.users.count(n) || (taken && taken(ctx, n)) || n == default_owner;
+    }
+
     // A user made by an invitation or by CreateUser, its name checked and taken by none.
     iam_result* make_user(const std::string& n, const std::string& path, iam_user*& out)
     {
@@ -889,8 +896,7 @@ struct api
             return &missing("UserName");
         if (!valid_path(path))
             return &missing("Path");
-        // The owner a bucket with none recorded belongs to is a name too, and a user given it would own them all.
-        if (s.users.count(n) || (taken && taken(ctx, n)) || n == default_owner)
+        if (name_taken(n))
             return &fail(409, "EntityAlreadyExists", "User with name " + n + " already exists.");
         iam_user u;
         u.name = n;
@@ -1195,7 +1201,7 @@ struct api
                 {
                     if (!valid_name(*nn, 64))
                         return missing("NewUserName");
-                    if (s.users.count(*nn) || (taken && taken(ctx, *nn)))
+                    if (name_taken(*nn))
                         return fail(409, "EntityAlreadyExists", "User with name " + *nn + " already exists.");
                     u.name = *nn;
                     for (auto& [k, key] : s.keys)
