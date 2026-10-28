@@ -21,6 +21,9 @@ FF="${SOCKETLEY_FFMPEG:-$(command -v ffmpeg || true)}"
 FFPROBE="$(dirname "$FF")/ffprobe"
 [ -x "$FFPROBE" ] || FFPROBE="$(command -v ffprobe || true)"
 [ -n "$FFPROBE" ] || { echo "  SKIP: ffprobe is required beside ffmpeg"; exit 0; }
+. "$HERE/lib_ffmpeg.sh"
+LACKS=$(ffmpeg_lacks "$FF" fmt:lavfi fmt:hls fmt:mp4 filter:testsrc2 filter:sine filter:scale enc:libx264 enc:aac enc:mjpeg fmt:matroska filter:testsrc filter:noise enc:mpeg4)
+[ -z "$LACKS" ] || { echo "  SKIP: $FF has no $LACKS, which the films here or the storage's renditions are made with"; exit 0; }
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
