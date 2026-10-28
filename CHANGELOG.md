@@ -126,6 +126,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   standing for all, so a Deny on deleting a prefix's objects was passed over
   and they went with the bucket; each version is now judged as its own
   DeleteObjectVersion, and one refused keeps the library, answered 409.
+- **A References header of millions of ids makes a hundred strings.** An
+  APPEND or a delivered message of 25 MiB of `<a>` built a string for every
+  id on the loop, about 0.8 GB, to keep the first, and SORT and THREAD kept
+  each message's room for all of them until they answered; the thread's root
+  is now the first id read, and SORT and THREAD keep the last hundred.
 - **Asking for another user's folder makes no index for them.** Any
   `Other Users/<name>/...` a signed-in IMAP user named wrote a lock and a
   journal for `<name>` and kept it in memory and in every tick for good, so

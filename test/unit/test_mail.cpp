@@ -1305,6 +1305,27 @@ TEST_CASE("SORT and THREAD: a display name with a comma, and a reply chain fifty
     CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
 }
 
+TEST_CASE("SORT and THREAD: a References header of a million ids keeps its last hundred and no room for the rest")
+{
+    namespace io = socketley::mail::imap_order;
+    std::string refs = "References:";
+    for (int i = 0; i < 1000000; ++i)
+        refs += " <" + std::to_string(i) + "@r>";
+    const std::string header = "Subject: s\r\nMessage-ID: <me@r> <other@r>\r\n" + refs + "\r\n\r\n";
+    io::entry e;
+    io::read(e, header);
+    REQUIRE(e.references.size() == 100);
+    CHECK(e.references.front() == "999900@r");
+    CHECK(e.references.back() == "999999@r");
+    // A vector filled to a million and cut to a hundred keeps the room of the million.
+    CHECK(e.references.capacity() <= 100);
+    CHECK(e.message_id == "me@r");
+    CHECK(io::thread_root(header) == "0@r");
+    io::entry irt;
+    io::read(irt, "In-Reply-To: <p@r> <q@r>\r\n\r\n");
+    CHECK(irt.references == std::vector<std::string>{"p@r"});
+}
+
 TEST_CASE("DKIM: Ed25519 signs and verifies, l= short of the body is no pass, and a weak or wrong key is refused")
 {
     char tmpl[] = "/tmp/test_mail_ed_XXXXXX";

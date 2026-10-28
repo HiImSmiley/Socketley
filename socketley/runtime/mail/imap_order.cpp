@@ -44,19 +44,46 @@ bool skip_blob(std::string_view t, size_t& p)
     return true;
 }
 
-// The <ids> a header holds, in order.
-std::vector<std::string> ids_in(std::string_view v)
+// The first <id> a header holds; empty where it holds none.
+std::string first_id(std::string_view v)
 {
-    std::vector<std::string> out;
     for (size_t at = 0; (at = v.find('<', at)) != std::string_view::npos;)
     {
         const size_t end = v.find('>', at);
         if (end == std::string_view::npos)
             break;
         if (end > at + 1)
-            out.emplace_back(v.substr(at + 1, end - at - 1));
+            return std::string(v.substr(at + 1, end - at - 1));
         at = end + 1;
     }
+    return {};
+}
+
+// The last `most` <ids> a header holds, in order, kept as views in a ring so millions of them make `most` strings.
+std::vector<std::string> last_ids(std::string_view v, size_t most)
+{
+    std::vector<std::string_view> ring;
+    size_t seen = 0;
+    for (size_t at = 0; (at = v.find('<', at)) != std::string_view::npos;)
+    {
+        const size_t end = v.find('>', at);
+        if (end == std::string_view::npos)
+            break;
+        if (end > at + 1)
+        {
+            const std::string_view id = v.substr(at + 1, end - at - 1);
+            if (ring.size() < most)
+                ring.push_back(id);
+            else
+                ring[seen % most] = id;
+            ++seen;
+        }
+        at = end + 1;
+    }
+    std::vector<std::string> out;
+    out.reserve(ring.size());
+    for (size_t i = 0; i < ring.size(); ++i)
+        out.emplace_back(ring[(seen - ring.size() + i) % most]);
     return out;
 }
 
@@ -204,25 +231,19 @@ void read(entry& e, std::string_view header)
     int64_t t = 0;
     int zone = 0;
     e.sent_s = mime::parse_date(header_value(header, "Date"), t, zone) ? t : e.arrival_ms / 1000;
-    const auto mid = ids_in(header_value(header, "Message-ID"));
-    e.message_id = mid.empty() ? std::string() : mid.front();
-    e.references = ids_in(header_value(header, "References"));
-    if (e.references.empty())
-    {
-        const auto irt = ids_in(header_value(header, "In-Reply-To"));
-        if (!irt.empty())
-            e.references.push_back(irt.front());
-    }
+    e.message_id = first_id(header_value(header, "Message-ID"));
     // A chain longer than any reply quotes is read from its end.
-    if (e.references.size() > 100)
-        e.references.erase(e.references.begin(), e.references.end() - 100);
+    e.references = last_ids(header_value(header, "References"), 100);
+    if (e.references.empty())
+        if (std::string irt = first_id(header_value(header, "In-Reply-To")); !irt.empty())
+            e.references.push_back(std::move(irt));
 }
 
 std::string thread_root(std::string_view header)
 {
     for (const char* name : {"References", "In-Reply-To", "Message-ID"})
-        if (const auto ids = ids_in(header_value(header, name)); !ids.empty())
-            return ids.front();
+        if (std::string id = first_id(header_value(header, name)); !id.empty())
+            return id;
     return {};
 }
 
