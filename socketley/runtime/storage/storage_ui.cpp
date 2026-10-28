@@ -511,7 +511,9 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     }
     // A sign-in is made from the credentials themselves and never from a session, so a cookie cannot extend itself.
     const std::string_view h = r.header("authorization");
-    if (std::string_view cred; r.method == "POST" && !http_auth_credentials(h, "basic", cred))
+    std::string_view cred;
+    const bool by_credentials = http_auth_credentials(h, "basic", cred);
+    if (r.method == "POST" && !by_credentials)
     {
         static const std::vector<header_ref> none;
         request_view rv;
@@ -530,7 +532,8 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     response out;
     out.status = 200;
     int64_t expires = 0;
-    if (r.method == "POST" && !c->anonymous)
+    // A runtime that takes no credentials lets a sign-in without them past the check above, a cookie's too.
+    if (r.method == "POST" && by_credentials && !c->anonymous)
     {
         // Sealed under the secret of the key the sign-in was made with: the access key given, or the "~<name>" a
         // password signs as.

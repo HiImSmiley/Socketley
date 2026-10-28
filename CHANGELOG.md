@@ -106,6 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   left out of the string to sign but read by the handler, so a presigned GET
   could be turned into a read of an old version or a `response-*` override,
   and a PUT into an ACL, tagging or part upload; it now breaks the signature.
+- **A storage interface cookie does not renew itself under `--anonymous`.**
+  `POST /~ui/session` with only a cookie and the interface's header, which
+  `--anonymous` let past the check for credentials, set a fresh cookie of 12
+  hours or 30 days that signing out of the old one did not end; a cookie is
+  now set only for a sign-in made with credentials.
 - **A refused interface cookie no longer blocks the identity provider's
   sign-in.** A storage with `--idp` answered a request carrying a `skl_ui`
   cookie it refused, one left from before signing out everywhere, of a key
