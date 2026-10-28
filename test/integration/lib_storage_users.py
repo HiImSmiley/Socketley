@@ -230,6 +230,17 @@ def mode_deny(T):
     allowed("and not another", T, "PUT", "/bob-c", BOB)
     allowed("the same bucket is alice's to make", T, "PUT", "/forbidden-1", ALICE)
 
+    # It denies him the policy operations on bob-b though he owns it, and a lockout it does not name is his to undo.
+    share = policy(stmt("Allow", "arn:aws:iam::1:user/alice", "s3:GetObject", "arn:aws:s3:::bob-b/*"))
+    denied("his own policy denies him setting a policy on his bucket", T, "PUT", "/bob-b", BOB, "policy", share)
+    denied("so alice is not let in", T, "GET", "/bob-b/keep/x", ALICE)
+    denied("and removing one", T, "DELETE", "/bob-b", BOB, "policy")
+    shut = policy(stmt("Deny", "*", "s3:*", "arn:aws:s3:::bob-c/*"), stmt("Deny", "*", "s3:*", "arn:aws:s3:::bob-c"))
+    allowed("bob shuts everyone out of bob-c, which his policy does not name", T, "PUT", "/bob-c", BOB, "policy", shut)
+    denied("which shuts him out", T, "GET", "/bob-c", BOB)
+    allowed("and he still removes it", T, "DELETE", "/bob-c", BOB, "policy")
+    allowed("after which he lists it again", T, "GET", "/bob-c", BOB)
+
     # And it wins over an Allow in a bucket policy.
     doc = policy(stmt("Allow", "arn:aws:iam::1:user/bob", ["s3:DeleteObject", "s3:PutObject"],
                       "arn:aws:s3:::alice-s/*"))

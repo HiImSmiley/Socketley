@@ -123,7 +123,9 @@ cat > "$D/conf/bob.json" <<'EOF'
    "Resource": ["arn:aws:s3:::alice-s", "arn:aws:s3:::alice-s/*"]},
   {"Sid": "KeepKeep", "Effect": "Deny", "Action": "s3:DeleteObject",
    "Resource": ["arn:aws:s3:::bob-*/keep/*", "arn:aws:s3:::alice-s/*"]},
-  {"Sid": "NoForbidden", "Effect": "Deny", "Action": "s3:CreateBucket", "Resource": "arn:aws:s3:::forbidden-*"}
+  {"Sid": "NoForbidden", "Effect": "Deny", "Action": "s3:CreateBucket", "Resource": "arn:aws:s3:::forbidden-*"},
+  {"Sid": "OwnPolicy", "Effect": "Deny", "Action": ["s3:PutBucketPolicy", "s3:DeleteBucketPolicy"],
+   "Resource": "arn:aws:s3:::bob-b"}
 ]}
 EOF
 # The shards runtime reads a copy, since the reload below edits these.

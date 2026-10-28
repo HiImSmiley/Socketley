@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Content-Length<VT>` or a NUL in a response field name framed the answer one
   way for the proxy and another for a lenient client; such a backend socket
   is now relayed to its close and not reused.
+- **A user's own Deny of the bucket policy operations holds on its own bucket.**
+  A bucket's owner and an admin were let set, read and delete its policy past
+  every policy, so an explicit Deny of PutBucketPolicy or DeleteBucketPolicy in
+  their credentials-file or IAM policy did nothing; only the bucket's policy is
+  now set aside, so a lockout can still be undone.
 - **A user's name is no new user's while a bucket names it its owner.** A
   bucket records its owner by user name, so once that user was deleted, renamed
   or removed from the credentials file, an invitation or a CreateUser of the same

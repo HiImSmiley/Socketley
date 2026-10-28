@@ -316,9 +316,18 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
                            action == s3_action::delete_bucket_policy || action == s3_action::get_bucket_policy_status;
     if (action == s3_action::none || policy_op)
     {
-        if (!restricted || !m_store.has_bucket(r.bucket) ||
-            ((u->admin || owner_of(r.bucket) == u->id) && !u->session_policy))
+        if (!restricted || !m_store.has_bucket(r.bucket))
             return;
+        if ((u->admin || owner_of(r.bucket) == u->id) && !u->session_policy)
+        {
+            // Only the bucket's policy is set aside, so a Deny in the user's own policies still refuses.
+            if (policy_op && ((u->has_policy && u->policy.needs_ip()) || (u->iam_policy && u->iam_policy->needs_ip())))
+                client_address(*c);
+            if (policy_op && ((u->has_policy && u->policy.evaluate(pr) == policy_effect::deny) ||
+                              (u->iam_policy && u->iam_policy->evaluate(pr) == policy_effect::deny)))
+                refuse(make_error("AccessDenied"));
+            return;
+        }
         if (action == s3_action::none || access_of(c, r.bucket, pr, u) != policy_effect::allow)
             refuse(make_error("AccessDenied"));
         return;
