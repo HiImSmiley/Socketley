@@ -470,7 +470,8 @@ void mqtt_run::arm_read(conn& c)
     c.rd.buffer = reinterpret_cast<char*>(&c);
     c.rd.fd     = c.fd;
     c.rearm     = false;
-    if (m_multishot)
+    // Asked of the loop each time, because a kernel that refuses the flag turns it off after start.
+    if (m_multishot && m_loop.recv_multishot_enabled())
     {
         c.rd.type      = op_recv_multishot;
         c.rd.buf_group = static_cast<uint8_t>(ring_group);
@@ -491,7 +492,8 @@ void mqtt_run::arm_read(conn& c)
 void mqtt_run::read_done(conn& c, struct io_uring_cqe* cqe)
 {
     const int res = cqe->res;
-    if (c.rd.type == op_recv_multishot)
+    // A provided-buffer read is what the loop re-arms a refused multishot as, and it ends like one without F_MORE.
+    if (c.rd.type == op_recv_multishot || c.rd.type == op_read_provided)
     {
         const bool more = cqe->flags & IORING_CQE_F_MORE;
         const bool was_withdrawing = c.withdrawing;

@@ -99,6 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   every reader shows, got dmarc=none and no policy, and a second From written
   so slipped past the two-From refusal and a user's submission check; every
   From header is now found by the name rule readers use.
+- **Connections are read on a 5.19 kernel.** Multishot receive needs 6.0
+  but was turned on wherever the receive opcode existed, so on 5.19 every
+  runtime closed each connection at its first read; it is now probed for real,
+  and a refusal the probe missed turns it off and re-arms a plain read.
 - **No user takes the buckets' default owner.** An invitation or CreateUser
   could make a user named `socketley`, the owner every bucket with none
   recorded belongs to, and so own all of them; the name is refused.

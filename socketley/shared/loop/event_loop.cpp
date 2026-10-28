@@ -1030,15 +1030,8 @@ bool event_loop::init()
     m_accept_poll_first = m_multishot_supported && probe_accept_variant(true, true);
     m_recv_poll_first = probe_recv_poll_first();
 
-    // Probe for advanced io_uring features
-    {
-        struct io_uring_probe* probe = io_uring_get_probe_ring(&m_ring);
-        if (probe)
-        {
-            m_recv_multishot_supported = io_uring_opcode_supported(probe, IORING_OP_RECV);
-            io_uring_free_probe(probe);
-        }
-    }
+    // IORING_OP_RECV exists from 5.6 and its multishot flag only from 6.0, so the opcode table cannot answer this.
+    m_recv_multishot_supported = probe_recv_multishot();
 
     // Pre-register a sparse fixed file table with every slot empty,
     // heap-allocated to avoid a 32 KB stack frame, and only on a kernel that
@@ -1150,9 +1143,14 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
         if (__builtin_expect(m_owners[tok & OWNER_SLOT_MASK].token == tok
                              && req->owner != nullptr, 1))
         {
-            SKL_TIMING_HANDLER_BEGIN(req);
-            req->owner->on_cqe(cqe);
-            SKL_TIMING_HANDLER_END(m_op_timing);
+            // A multishot receive the kernel refused is re-armed as a single one here, once for every runtime,
+            // rather than handed to a read chain that closes the connection over it.
+            if (__builtin_expect(cqe->res != -EINVAL, 1) || !rearm_refused_multishot(cqe, req, rtype, rt1))
+            {
+                SKL_TIMING_HANDLER_BEGIN(req);
+                req->owner->on_cqe(cqe);
+                SKL_TIMING_HANDLER_END(m_op_timing);
+            }
         }
         else
             drop_completion(cqe, req);
@@ -1170,6 +1168,37 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
     }
 
     return cqe_outcome::next;
+}
+
+bool event_loop::rearm_refused_multishot(const struct io_uring_cqe* cqe, io_request* req,
+                                         uint8_t rtype, uint32_t target)
+{
+    // Only the final, bufferless answer to a kind the probe passed, which is what a kernel refusing the flag sends.
+    if (!is_multishot_recv_op(static_cast<op_type>(rtype)) || !m_recv_multishot_supported
+        || (cqe->flags & (IORING_CQE_F_MORE | IORING_CQE_F_BUFFER)) != 0 || target == IO_TARGET_NONE)
+        return false;
+
+    if (!m_recv_multishot_refused)
+    {
+        m_recv_multishot_refused = true;
+        LOG_WARN("event loop: the kernel refused a multishot receive the probe had accepted, so this loop "
+                 "reads with single receives from now on");
+    }
+
+    // A number waiting to be closed takes the refusal itself, since a receive armed now would hold it open with
+    // nothing left to cancel it.
+    const bool     fixed = (target & IO_TARGET_FIXED) != 0;
+    const uint32_t idx   = target & ~IO_TARGET_FIXED;
+    if (fixed)
+    {
+        if (idx >= MAX_FIXED_FILES || ((m_fixed_unreg_deferred[idx >> 6] >> (idx & 63)) & 1u))
+            return false;
+        return submit_read_provided_fixed_file(static_cast<int>(idx), req->buf_group, req);
+    }
+    if (!fd_tracked(static_cast<int>(idx)) || !m_fd_close_deferred
+        || ((m_fd_close_deferred[idx >> 6] >> (idx & 63)) & 1u))
+        return false;
+    return submit_read_provided(static_cast<int>(idx), req->buf_group, req);
 }
 
 // Batch-drain all available CQEs in one pass -- single io_uring_cq_advance.
@@ -1631,7 +1660,7 @@ bool event_loop::submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io
 
 bool event_loop::submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
 {
-    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
+    if (m_recv_multishot_refused || group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
         return false;
 
     struct io_uring_sqe* sqe = get_sqe();
@@ -1874,12 +1903,13 @@ bool event_loop::recv_multishot_enabled() const
         const char* e = socketley::settings::text("SOCKETLEY_RECV_MULTISHOT");
         return e && std::string_view(e) == "0";
     }();
-    return m_recv_multishot_supported && !opted_out;
+    return m_recv_multishot_supported && !m_recv_multishot_refused && !opted_out;
 }
 
 bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* req)
 {
-    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
+    // Refused here as well as in recv_multishot_enabled(), because every runtime caches that answer at start.
+    if (m_recv_multishot_refused || group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
         return false;
 
     struct io_uring_sqe* sqe = get_sqe();
@@ -1893,6 +1923,55 @@ bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* re
     req->buf_group = static_cast<uint8_t>(group_id);
     arm(req, raw_target(fd));
     return true;
+}
+
+// Kernel support for IORING_RECV_MULTISHOT established the way probe_recv_bundle() establishes its flag, because a
+// 5.19 kernel accepts the opcode and refuses the flag with -EINVAL at the first read of every connection.
+bool event_loop::probe_recv_multishot()
+{
+    struct io_uring r;
+    if (io_uring_queue_init(8, &r, 0) < 0)
+        return false;
+
+    bool ok = false;
+    int  e  = 0;
+    struct io_uring_buf_ring* br = io_uring_setup_buf_ring(&r, 4, 0, 0, &e);
+    char bufs[4][64];
+    int  sv[2] = { -1, -1 };
+    if (br && ::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0)
+    {
+        for (int i = 0; i < 4; i++)
+            io_uring_buf_ring_add(br, bufs[i], 64, static_cast<uint16_t>(i),
+                                  io_uring_buf_ring_mask(4), i);
+        io_uring_buf_ring_advance(br, 4);
+
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&r);
+        if (sqe)
+        {
+            io_uring_prep_recv_multishot(sqe, sv[0], nullptr, 0, 0);
+            sqe->flags  |= IOSQE_BUFFER_SELECT;
+            sqe->buf_group = 0;
+            io_uring_submit(&r);
+
+            char payload[32] = {};
+            if (::write(sv[1], payload, sizeof(payload)) < 0) {}
+
+            struct io_uring_cqe* cqe = nullptr;
+            struct __kernel_timespec ts = { 0, 200 * 1000 * 1000 };
+            if (io_uring_wait_cqe_timeout(&r, &cqe, &ts) == 0 && cqe)
+            {
+                // The bytes alone are not enough: a receive that delivered them and ended is a single-shot one.
+                ok = cqe->res == static_cast<int>(sizeof(payload))
+                  && (cqe->flags & IORING_CQE_F_MORE) != 0;
+                io_uring_cqe_seen(&r, cqe);
+            }
+        }
+    }
+    if (sv[0] >= 0) ::close(sv[0]);
+    if (sv[1] >= 0) ::close(sv[1]);
+    if (br) io_uring_free_buf_ring(&r, br, 4, 0);
+    io_uring_queue_exit(&r);
+    return ok;
 }
 
 // Kernel support for IORING_RECVSEND_BUNDLE established by a real bundled
@@ -1962,7 +2041,7 @@ bool event_loop::recv_bundle_enabled() const
 
 bool event_loop::submit_recv_multishot_bundle(int fd, uint16_t group_id, io_request* req)
 {
-    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
+    if (m_recv_multishot_refused || group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
         return false;
     auto& pool = m_buf_rings[group_id];
     // A tripped cursor cannot name a bundle's buffers, and false here is not
@@ -1987,7 +2066,7 @@ bool event_loop::submit_recv_multishot_bundle(int fd, uint16_t group_id, io_requ
 
 bool event_loop::submit_recv_multishot_bundle_fixed_file(int fixed_idx, uint16_t group_id, io_request* req)
 {
-    if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
+    if (m_recv_multishot_refused || group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
         return false;
     auto& pool = m_buf_rings[group_id];
     if (!pool.cursor_ok || pool.buf_count > MAX_CQE_BUFS)

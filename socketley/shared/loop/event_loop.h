@@ -190,7 +190,8 @@ public:
     void return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, uint32_t count);
 
     // Multishot recv, one SQE producing completions from the buffer ring until
-    // error or cancel, resubmitted only when IORING_CQE_F_MORE is clear.
+    // error or cancel, resubmitted only when IORING_CQE_F_MORE is clear, and refused once the kernel has refused one
+    // on this loop, so a caller's chain falls to its provided-buffer read.
     bool submit_recv_multishot(int fd, uint16_t group_id, io_request* req);
 
     // Whether arming one is worth attempting -- kernel support and not disabled
@@ -424,6 +425,8 @@ private:
     bool m_affinity_applied{false};
     cpu_set_spec m_cpus{};
     bool m_recv_multishot_supported{false};
+    // Set once the kernel refuses a multishot receive the probe passed, after which none is armed on this loop.
+    bool m_recv_multishot_refused{false};
     bool m_files_registered{false};
     bool m_bufs_registered{false};
     bool m_direct_accept_supported{false};
@@ -491,6 +494,11 @@ private:
     // Kernel support for IORING_RECVSEND_BUNDLE, established by one real
     // submission on a throwaway ring the first time anyone asks.
     static bool probe_recv_bundle();
+    // The -EINVAL a kernel without IORING_RECV_MULTISHOT answers, turned into a single provided-buffer receive on
+    // the same request, and true when that receive was armed and the completion must not be delivered.
+    bool rearm_refused_multishot(const struct io_uring_cqe* cqe, io_request* req, uint8_t rtype, uint32_t target);
+    // Kernel support for IORING_RECV_MULTISHOT, established the same way at init().
+    static bool probe_recv_multishot();
 
     static constexpr uint16_t MAX_BUF_GROUPS = 8;
     buf_ring_pool m_buf_rings[MAX_BUF_GROUPS]{};

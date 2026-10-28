@@ -1947,6 +1947,44 @@ project "test_udp_recv_ladder"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: what the event loop does on the oldest kernel it claims, played on this one ───
+
+project "test_loop_kernel_floor"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        ".",
+        "thirdparty/doctest",
+        "socketley",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
+
+    files { "test/unit/test_loop_kernel_floor.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: Raft, as whole simulated clusters ───
 --
 -- Its own copy of raft.cpp, built with the planted defects the harness has to
