@@ -227,7 +227,8 @@ TEST_CASE("the certificates this writes are read back whole and ssh-keygen reads
         CHECK(c.valid_after == rq.valid_after);
         CHECK(c.valid_before == rq.valid_before);
         CHECK(c.critical_options == std::vector<std::pair<std::string, std::string>>{{"source-address", "10.0.0.0/8"}});
-        CHECK(c.extensions.size() == 5);
+        CHECK(c.extensions == std::vector<std::pair<std::string, std::string>>{
+                                  {"permit-agent-forwarding", ""}, {"permit-port-forwarding", ""}, {"permit-pty", ""}});
         CHECK(ssh::verify_cert(c));
         CHECK(c.signature_key == ssh::ed25519_blob(ed25519::public_raw(ca)));
 
@@ -245,6 +246,8 @@ TEST_CASE("the certificates this writes are read back whole and ssh-keygen reads
         CHECK(listed.find("Serial: 1000") != std::string::npos);
         CHECK(listed.find("source-address 10.0.0.0/8") != std::string::npos);
         CHECK(listed.find("permit-pty") != std::string::npos);
+        CHECK(listed.find("permit-X11-forwarding") == std::string::npos);
+        CHECK(listed.find("permit-user-rc") == std::string::npos);
         CHECK(listed.find("Signing CA: ED25519 " + ssh::fingerprint(c.signature_key)) != std::string::npos);
     }
 

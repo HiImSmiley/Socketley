@@ -54,7 +54,8 @@ struct cert_request
     std::vector<std::string> extensions;
 };
 
-// The extensions ssh-keygen gives a user certificate when told nothing else.
+// The extensions a user certificate of this provider carries: a terminal, port forwarding and agent forwarding, and
+// neither X11 forwarding nor ~/.ssh/rc, which ssh-keygen's default adds.
 std::vector<std::string> default_user_extensions();
 
 // The certificate blob for `req`, signed by the Ed25519 key `ca`; empty with `err` when the subject key is of a

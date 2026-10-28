@@ -12450,7 +12450,10 @@ a user certificate holding
 (1 to 168) for the account whose access token is sent, given only to a client
 marked
 .B ssh
-and never to a disabled account. Every certificate is said in the log with the
+and never to a disabled account. A user certificate permits a terminal, port
+forwarding and agent forwarding, and neither X11 forwarding nor the user's
+.IR ~/.ssh/rc .
+Every certificate is said in the log with the
 account, its principals and the key's fingerprint. See
 .B ssh\-cert
 and

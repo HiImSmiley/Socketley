@@ -241,8 +241,7 @@ std::string line_of(std::string_view blob, std::string_view comment)
 
 std::vector<std::string> default_user_extensions()
 {
-    return {"permit-X11-forwarding", "permit-agent-forwarding", "permit-port-forwarding", "permit-pty",
-            "permit-user-rc"};
+    return {"permit-agent-forwarding", "permit-port-forwarding", "permit-pty"};
 }
 
 std::string sign_cert(const cert_request& req, EVP_PKEY* ca, std::string& err)

@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   name under the domain, and a browser, reading the backslash as a slash, went
   to evil.example after signing in or out; a return address's host may now hold
   only letters, digits, `.-_` and a port.
+- **SSH user certificates permit less.** A certificate the idp signed
+  permitted X11 forwarding and the user's `~/.ssh/rc` beside a terminal, port
+  and agent forwarding, root ones too; it now permits only the last three.
 - **A forced password reset asks for the second step first.** Setting a new
   password without a session took a username and the old password alone and
   signed the account in, skipping its authenticator code, and for any account,
