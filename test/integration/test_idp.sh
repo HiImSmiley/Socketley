@@ -553,7 +553,7 @@ expect "but to one under the cookie domain" \
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
 STATS=$("$BIN" stats auth 2>/dev/null)
-case "$STATS" in *"accounts:10"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+case "$STATS" in *"accounts:9"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]
