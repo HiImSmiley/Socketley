@@ -522,6 +522,23 @@ function rgbOf(v) {
   return undefined;
 }
 const lumOf = c => (c[0] * 299 + c[1] * 587 + c[2] * 114) / 255000;
+// CSS with its escapes undone and no backslash left, so what is checked here is what the browser reads.
+function cssPlain(t) {
+  return t.replace(/\\([0-9a-f]{1,6})[ \t\r\n\f]?|\\([\s\S])/gi, (m, h, c) => {
+    if (c !== undefined) return c === '\n' ? '' : c;
+    const n = parseInt(h, 16);
+    return n > 0 && n <= 0x10ffff && (n < 0xd800 || n > 0xdfff) ? String.fromCodePoint(n) : '\ufffd';
+  }).replace(/\\/g, '');
+}
+// Every CSS function that loads an image or a file, a vendor's prefix and all.
+const CSS_FETCH = /(-[a-z]+-)?\b(url|src|image|image-set|cross-fade|element)\s*\(/gi;
+// CSS that reaches nowhere while images are blocked, with no @import or expression, and no < to end its <style>.
+function cssClean(t, images) {
+  let blocked = 0;
+  t = cssPlain(t).replace(/@import[^;]*;?/gi, '').replace(/expression\s*\(/gi, 'none(');
+  if (!images) t = t.replace(CSS_FETCH, () => { blocked++; return 'none('; });
+  return { css: t.replace(/</g, '\\3c '), blocked };
+}
 function cleanHtml(html, images, cids) {
   const d = new DOMParser().parseFromString(html, 'text/html');
   d.querySelectorAll('script,iframe,frame,frameset,object,embed,applet,form,input,button,select,textarea,meta,link,base,noscript,template,portal,dialog').forEach(e => e.remove());
@@ -541,13 +558,13 @@ function cleanHtml(html, images, cids) {
     }
     if (e.hasAttribute('srcset') && !images) { e.removeAttribute('srcset'); blocked++; }
     const st = e.getAttribute('style');
-    if (st && /url\s*\(|expression\s*\(/i.test(st)) { if (!images || /expression/i.test(st)) blocked++; e.setAttribute('style', images ? st.replace(/expression\s*\([^)]*\)/gi, '') : st.replace(/url\s*\([^)]*\)|expression\s*\([^)]*\)/gi, 'none')); }
+    if (st) { const c = cssClean(st, images); blocked += c.blocked; if (c.css !== st) e.setAttribute('style', c.css); }
   }
   let css = '';
   for (const s of d.querySelectorAll('style')) {
-    let t = s.textContent.replace(/@import[^;]*;?/gi, '').replace(/expression\s*\([^)]*\)/gi, '');
-    if (!images && /url\s*\(/i.test(t)) { t = t.replace(/url\s*\([^)]*\)/gi, 'none'); blocked++; }
-    css += t + '\n'; s.remove();
+    const c = cssClean(s.textContent, images);
+    blocked += c.blocked;
+    css += c.css + '\n'; s.remove();
   }
   // A message that paints no page of its own, only dark text on white as most replies are, is shown in the page's
   // colours; one with its own backgrounds or a stylesheet that colours keeps the white it was made for.
@@ -569,7 +586,7 @@ function cleanHtml(html, images, cids) {
     }
   const t = getComputedStyle(document.documentElement), v = (n, d) => t.getPropertyValue(n).trim() || d;
   const dark = painted ? '' : 'html,body{background:transparent;color:' + v('--fg', '#eef0f7') + ';color-scheme:dark}body{padding:2px 0}blockquote{border-left-color:rgba(255,255,255,.18);color:' + v('--mut', '#9aa2b8') + '}a{color:' + v('--a1', '#c084fc') + '}';
-  return { doc: '<!doctype html><html><head><meta charset="utf-8"><style>' + FRAME_CSS + dark + '</style><style>' + css.replace(/<\/style/gi, '') + '</style></head><body>' + (d.body ? d.body.innerHTML : '') + '</body></html>', blocked, dark: !painted };
+  return { doc: '<!doctype html><html><head><meta charset="utf-8"><style>' + FRAME_CSS + dark + '</style><style>' + css + '</style></head><body>' + (d.body ? d.body.innerHTML : '') + '</body></html>', blocked, dark: !painted };
 }
 // The quotes of what a reply answers, as Gmail, Outlook, Apple Mail and Thunderbird mark them.
 const QUOTES = 'blockquote[type=cite],.gmail_quote,.gmail_extra,#divRplyFwdMsg,#divRplyFwdMsg~*,#appendonsend~*,.moz-cite-prefix,.yahoo_quoted,#mail-editor-reference-message-container';

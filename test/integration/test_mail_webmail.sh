@@ -80,7 +80,7 @@ s.quit()
 PY
 
 tally < <(python3 - "$W" "$PI" "$P" <<'PY'
-import base64, hashlib, http.client, json, re, smtplib, socket, sys, time, urllib.parse
+import base64, hashlib, http.client, json, re, smtplib, socket, subprocess, sys, time, urllib.parse
 W, PI, P = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 def check(name, ok, info=""):
     print(("ok " if ok else "bad ") + name + ("" if ok else ": " + str(info)[:400].replace("\n", " ")))
@@ -104,6 +104,29 @@ check("the page is served as HTML with nosniff and an ETag", st == 200 and h.get
       and h.get("x-content-type-options") == "nosniff" and h.get("etag"), (st, h))
 check("its CSP lets its one script run by that script's hash, and no frame embed it", want in csp
       and "frame-ancestors 'none'" in csp and "unsafe-inline" not in csp.split("script-src", 1)[1].split(";", 1)[0], csp)
+# The page's CSS cleaning, run by node where there is one: no < to end its <style>, and nothing fetched while blocked.
+css_js = script.decode("utf-8", "replace")
+css_js = css_js[css_js.find("function cssPlain"):css_js.find("function cleanHtml(")]
+harness = css_js + r"""
+const cases = [['</</stylestyle><img src=x onerror=alert(1)>', false], ['a{background:image-set("https://evil.test/a.png" 1x)}', false],
+  ['a{background:-webkit-image-set(url(https://evil.test/b.png) 1x)}', false], ['a{background:\\75rl(https://evil.test/c.png)}', false],
+  ['a{background:im\\61ge-set("//evil.test/d.png" 1x)}', false], ['a{background:\\5c 75rl(https://evil.test/e.png)}', false],
+  ['@\\69mport "https://evil.test/f.css"; b{color:red}', true], ['a{background:url(https://ok.test/g.png)}', true]];
+console.log(JSON.stringify(cases.map(([t, images]) => cssClean(t, images))));
+"""
+try:
+    out = json.loads(subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20).stdout) if css_js else None
+except FileNotFoundError:
+    out = "no node"
+except (ValueError, subprocess.SubprocessError):
+    out = None
+if out != "no node":
+    fetch = re.compile(r"(url|image-set|image|src|cross-fade|element)\s*\(|\\|@import", re.I)
+    check("webmail CSS keeps no < that could end its <style>", out and "<" not in out[0]["css"], out)
+    check("and with images blocked fetches nothing by image-set, a prefix or an escape", out and
+          all(not fetch.search(o["css"]) for o in out[1:6]) and all(o["blocked"] for o in out[1:5]), out)
+    check("while @import goes and a shown image's url( stays", out and "evil" not in out[6]["css"] and "color:red" in out[6]["css"]
+          and "url(https://ok.test/g.png)" in out[7]["css"], out)
 st2, _, body2 = web("GET", "/", headers={"If-None-Match": h.get("etag", "x")})
 check("a browser's copy is answered 304", st2 == 304 and not body2, st2)
 

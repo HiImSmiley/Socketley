@@ -64,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **The webmail's message CSS can no longer end its `<style>` or load a
+  blocked image.** `</style` was removed in one pass, so `</</stylestyle>`
+  left one, and only `url(` was blocked, so `image-set("https://...")` loaded
+  a remote image; CSS is now unescaped, keeps no `<`, and every function that
+  loads an image is dropped while images are blocked.
 - **Only CRLF.CRLF ends a message's DATA.** A bare LF began a line the
   ending dot could open, so `\n.\r\n` ended the message and what followed ran
   as commands (SMTP smuggling); a bare LF is still written as CRLF, but a dot
