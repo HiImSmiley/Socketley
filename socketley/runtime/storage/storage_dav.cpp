@@ -221,7 +221,9 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
         if (!v.allowed)
             login_missed(*c);
     }
-    else if (ui_cookie(c, v) || idp_cookie(c, v))
+    // A refused interface cookie, one tossed from a sibling host or left from before a sign-out, gives way to the
+    // identity provider's session, and is answered by its refusal only where there is none.
+    else if (const bool carried = ui_cookie(c, v); (carried && v.allowed) || idp_cookie(c, v) || carried)
     {
         // A browser's session sends its cookie with whatever it asks, another site's form too: a change made under
         // the cookie alone must carry the interface's own header, which no page elsewhere can add without CORS.

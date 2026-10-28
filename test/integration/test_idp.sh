@@ -22,6 +22,7 @@
 #   * a storage's users not coming over with the passwords they have there, or its admins coming over as admins
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted
+#   * a storage refusing the sign-in for a stale or tossed interface cookie sent beside it
 #   * a return address a browser reads as another host's, by a backslash in its host
 #   * a sign-in or an account's change posted from another site's page
 #   * an e-mail a user gave themselves taken as vouched for, another account's, or able to split a line
@@ -368,6 +369,9 @@ if phase == "main":
     s = json.loads(body) if st == 200 else {}
     check("and takes it: the account's user there, with the way to sign out at the idp",
           (st, s.get("user"), (s.get("idp_logout") or "").startswith(I + "/logout")), (200, "dora", True))
+    st, body, h = at(S, "GET", "/~ui/session", headers={"X-Socketley-UI": "1"}, cookie="skl_ui=bm9ib2R5.1.2.00; " + dora)
+    check("even beside an interface cookie it refuses, as one tossed from a sibling host or left from a sign-out",
+          (st, json.loads(body).get("user") if st == 200 else None), (200, "dora"))
     st, body, h = at(S, "GET", "/~ui/session", headers={"X-Socketley-UI": "1"}, cookie=cookie_of(req("POST", "/login", dict(rd="/", username="carol", password="carolpassword1"))[2]))
     check("an account that is no user of the storage is let in to nothing there", st, 403)
 

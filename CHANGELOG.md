@@ -106,6 +106,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   left out of the string to sign but read by the handler, so a presigned GET
   could be turned into a read of an old version or a `response-*` override,
   and a PUT into an ACL, tagging or part upload; it now breaks the signature.
+- **A refused interface cookie no longer blocks the identity provider's
+  sign-in.** A storage with `--idp` answered a request carrying a `skl_ui`
+  cookie it refused, one left from before signing out everywhere, of a key
+  since changed, past its expiry or tossed from a sibling host, by that
+  refusal alone, and the browser went round the idp's sign-in for good; the
+  idp's session is now asked next, and the refusal stands only without one.
 - **A folder is not copied or moved onto its own bucket's root.** WebDAV's
   COPY or MOVE of `b/a/` to `/~dav/b/` was let through where any other folder
   above it was refused, and wrote `b/a/x` over `b/x` before the walk had read
