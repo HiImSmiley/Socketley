@@ -156,6 +156,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   held the shard's loop for minutes; such a LIST is now BAD, a pattern stops
   at the first character it cannot match, and a command of more than a
   million words is refused.
+- **A readonly cache refuses PUBLISH over RESP too.** It answered
+  `denied: readonly mode` over the text protocol and delivered the message over
+  RESP, from a client or a script's `redis.call`; it is now `-ERR readonly mode`
+  on both.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

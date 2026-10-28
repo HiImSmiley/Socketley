@@ -10939,6 +10939,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("publish"):
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            // Refused as the text protocol refuses it, so readonly means the same on both wires.
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int count = publish(args[1], args[2]);
             resp::encode_integer_into(rb, count);
             break;

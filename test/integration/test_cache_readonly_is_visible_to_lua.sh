@@ -197,6 +197,13 @@ else
     echo "  FAIL [the wire still names readonly]: SET answered '$WIRE'"
 fi
 
+# ── PUBLISH over RESP is refused as the text protocol refuses it ──────────
+# The control first: on the writable cache PUBLISH counts its zero receivers.
+check "readwrite: RESP PUBLISH is delivered" \
+      "0" "$(python3 "$SOCKETLEY_TMPD/resp.py" "$P_RW" "PUBLISH ro:ch m" | head -1)"
+check "readonly: RESP PUBLISH is refused" \
+      "ERR readonly mode" "$(python3 "$SOCKETLEY_TMPD/resp.py" "$P_RO" "PUBLISH ro:ch m" | head -1)"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 [ "$FAIL" -eq 0 ]
