@@ -284,11 +284,8 @@ struct alignas(64) proxy_client_connection
             return socketley::h3::tls_of(*h3s);
         return ssl;
     }
-    // The client's address as X-Forwarded-For names it, looked up on the
-    // connection's first request and kept for the rest.
+    // The client's address as X-Forwarded-For names it, read at accept, and empty only for a unix-socket peer.
     std::string peer_addr;
-    // Asked once, since a unix peer's address is empty and the empty string cannot say it was asked.
-    bool peer_probed{false};
     // Who --auth idp: found signed in for this request, named to the backend: the account's id, username, email.
     std::string auth_user;
     std::string auth_name;

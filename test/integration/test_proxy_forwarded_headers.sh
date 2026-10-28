@@ -17,6 +17,13 @@
 # the start of the chain and loses its claims about scheme and host, and each
 # header reaches the backend exactly once -- so a build that appended blindly
 # or trusted the client fails as surely as one that added nothing.
+#
+# A client that resets its connection right behind its request has no peer
+# address left to look up by the time the request is read, and the empty
+# address that left stands for a unix-socket peer on this machine: the chain
+# went to the backend as the client wrote it, with no hop of this proxy's.
+# The address is read at accept, so every request that reaches the backend
+# carries its hop.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -40,7 +47,7 @@ echo "=== Integration: the proxy says who asked, over what, for which host ==="
 # Answers each request with the forwarding headers it received, one per line.
 cat > "$SOCKETLEY_TMPD/be.py" <<'PYEOF'
 import socket, sys, threading
-port = int(sys.argv[1])
+port, log = int(sys.argv[1]), sys.argv[2]
 def serve(c):
     buf = b""
     try:
@@ -52,6 +59,8 @@ def serve(c):
             head, buf = buf.split(b"\r\n\r\n", 1)
             lines = [l for l in head.split(b"\r\n")[1:] if l.lower().startswith(b"x-forwarded-")]
             body = b"\n".join(lines) + b"\n"
+            with open(log, "ab") as f:
+                f.write(body)
             c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
     finally:
         c.close()
@@ -62,7 +71,7 @@ while True:
     c, _ = ls.accept()
     threading.Thread(target=serve, args=(c,), daemon=True).start()
 PYEOF
-python3 "$SOCKETLEY_TMPD/be.py" "$BE" 2>"$SOCKETLEY_TMPD/be.log" & BEPID=$!
+python3 "$SOCKETLEY_TMPD/be.py" "$BE" "$SOCKETLEY_TMPD/seen.log" 2>"$SOCKETLEY_TMPD/be.log" & BEPID=$!
 for _ in $(seq 1 50); do grep -q "be up" "$SOCKETLEY_TMPD/be.log" 2>/dev/null && break; sleep 0.1; done
 
 daemon_start "$BIN"
@@ -94,6 +103,22 @@ ok "$(ask)" \
 ok "$(ask 'X-Forwarded-For: 10.0.0.1' 'X-Forwarded-Proto: https' 'X-Forwarded-Host: evil.example')" \
    "X-Forwarded-For: 10.0.0.1, 127.0.0.1 | X-Forwarded-Proto: http | X-Forwarded-Host: shop.example" \
    "a client's chain is extended and its scheme and host claims are replaced, once each"
+
+# The last bytes of the head and a reset together, forty times over.
+python3 - "$PX" <<'PYEOF'
+import socket, struct, sys, time
+port = int(sys.argv[1])
+for _ in range(40):
+    s = socket.create_connection(("127.0.0.1", port), timeout=4)
+    s.sendall(b"GET /fw/rst HTTP/1.1\r\nHost: shop.example\r\nX-Forwarded-For: 10.9.9.9\r\n")
+    time.sleep(0.05)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    s.sendall(b"\r\n")
+    s.close()
+PYEOF
+sleep 1
+ok "$(grep -c '^X-Forwarded-For: 10\.9\.9\.9$' "$SOCKETLEY_TMPD/seen.log")" "0" \
+   "a client that resets behind its request is never forwarded without this proxy's hop"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `nosniff` and a sandboxing Content-Security-Policy, a type a browser would
   run is sent as an attachment, and an anonymous GET takes no `response-*`
   override.
+- **A proxy's X-Forwarded-For always names the client.** A client that reset
+  its connection right behind its request left no address to look up when the
+  request was read, and the empty address stood for a local unix peer: the
+  client's own X-Forwarded-For reached the backend with no hop added, and
+  `--auth` took it as the client's address. The address is now read at accept,
+  and a TCP client without one is refused.
 - **No user takes the buckets' default owner.** An invitation or CreateUser
   could make a user named `socketley`, the owner every bucket with none
   recorded belongs to, and so own all of them; the name is refused.

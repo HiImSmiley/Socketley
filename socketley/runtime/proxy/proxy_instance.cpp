@@ -318,7 +318,6 @@ void proxy_client_connection::reset(int new_fd)
     h2s.reset();
     h2_parent = nullptr;
     peer_addr.clear();
-    peer_probed = false;
     auth_user.clear();
     auth_name.clear();
     auth_email.clear();
@@ -2957,6 +2956,20 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         if (!m_bound_listen_path.empty())
             socketley::unix_sock::tune_stream(client_fd);
 
+        // The address X-Forwarded-For names and --auth keys on, read while the
+        // socket still has a peer, and a TCP client without one refused,
+        // because an empty address is a unix peer's and means this machine.
+        std::string peer;
+        if (m_bound_listen_path.empty())
+        {
+            peer = peer_ip(client_fd);
+            if (SOCKETLEY_UNLIKELY(peer.empty()))
+            {
+                close_tracked(client_fd);
+                goto proxy_resubmit_accept;
+            }
+        }
+
         // Auth check: reject before allocating connection state
         if (!invoke_on_auth(client_fd))
         {
@@ -2967,6 +2980,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         stat_add(m_stat_total_connections, 1);
 
         auto conn = client_pool_acquire(client_fd);
+        conn->peer_addr = std::move(peer);
         // Grown on demand: sixty-four kilobytes charged at accept, before the
         // client has sent a byte, and clear() keeps whatever a busy connection
         // grows into anyway -- so the reserve only ever bought the first
@@ -4641,11 +4655,6 @@ bool proxy_instance::auth_admits(proxy_client_connection* conn)
 {
     const size_t end = conn->partial.find("\r\n\r\n");
     const std::string_view head(conn->partial.data(), end == std::string::npos ? conn->partial.size() : end + 2);
-    if (conn->peer_addr.empty() && !conn->peer_probed && conn->fd >= 0)
-    {
-        conn->peer_addr   = peer_ip(conn->fd);
-        conn->peer_probed = true;
-    }
     proxy_auth::request_verdict v = m_auth.decide(head, conn->peer_addr, conn->tls(), conn->ex.method,
                                                   conn->ex.path, conn->ex.host_fields == 1 ? conn->ex.host : "");
     if (m_auth.idp())
@@ -4784,11 +4793,6 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
 
     bool host_written = false;
     bool client_keep_alive = false;
-    if (conn->peer_addr.empty() && !conn->peer_probed && conn->fd >= 0)
-    {
-        conn->peer_addr   = peer_ip(conn->fd);
-        conn->peer_probed = true;
-    }
     const bool forwarded_trusted = m_prefix.empty() && !m_entrance && socketley::is_loopback(conn->peer_addr);
     bool kept_proto = false, kept_host = false;
     std::string prior_forwarded_for;
