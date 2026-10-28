@@ -54,9 +54,13 @@ constexpr int      udp_sock_buf = 8 << 20;
 constexpr int      udp_rounds = 32;
 // RFC 7766 6.2.3: a connection left quiet is closed after a few seconds; a transfer under way is not quiet.
 constexpr int      tcp_idle_secs = 10;
+// A connection whose answers have not moved for this long has a peer that does not read them, and is closed.
+constexpr int      tcp_stall_secs = 30;
 constexpr uint32_t tcp_max_conns = 256;
 // What a connection may have waiting to be written: a whole transfer of a large zone, and no more.
 constexpr size_t   tcp_out_max = 256u << 20;
+// Past this much unsent, a connection's queries are neither read nor answered until its peer has read some.
+constexpr size_t   tcp_out_high = 64u << 10;
 constexpr size_t   tcp_rbuf = 16384;
 // A NOTIFY is sent again at these seconds after the first, until the secondary answers it (RFC 1996 3.6).
 constexpr int      notify_backoff[] = {1, 3, 7, 15, 31};
@@ -294,6 +298,7 @@ private:
         // Where the next answer goes: `out` unless the ring is reading it.
         std::string& tail() { return wr_pending ? later : out; }
         size_t waiting() const { return out.size() - out_off + later.size(); }
+        bool held() const { return waiting() > tcp_out_high; }
         char rbuf[tcp_rbuf];
     };
     // A NOTIFY goes from a socket of its own, connected to the secondary, so its answer comes back to this shard:
@@ -329,7 +334,9 @@ private:
     void accept_done(tcp_listener& l, struct io_uring_cqe* cqe);
     void arm_read(const std::shared_ptr<tcp_conn>& c);
     void read_done(const std::shared_ptr<tcp_conn>& c, int res);
+    // Answers what `in` holds and flushes, over again while the socket takes the answers whole.
     void tcp_serve(const std::shared_ptr<tcp_conn>& c);
+    size_t tcp_answer(const std::shared_ptr<tcp_conn>& c);
     void tcp_flush(const std::shared_ptr<tcp_conn>& c);
     void write_done(const std::shared_ptr<tcp_conn>& c, int res);
     void close_conn(const std::shared_ptr<tcp_conn>& c);
@@ -942,17 +949,38 @@ void dns_run::read_done(const std::shared_ptr<tcp_conn>& c, int res)
     c->in.append(c->rbuf, static_cast<size_t>(res));
     runtime_instance::stat_add(m_owner.m_stat_bytes_in, static_cast<uint64_t>(res));
     tcp_serve(c);
-    if (!c->dead)
+    if (!c->dead && !c->held())
         arm_read(c);
 }
 
-// Every whole message the connection has brought, answered in order (RFC 7766 allows pipelining).
 void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
+{
+    for (;;)
+    {
+        const size_t took = tcp_answer(c);
+        if (c->dead)
+            return;
+        // A message can be no longer than 65535 bytes and its length; more than that waiting is no DNS client.
+        if (!c->held() && c->in.size() > max_message + 2)
+        {
+            close_conn(c);
+            return;
+        }
+        tcp_flush(c);
+        // A flush the socket took whole makes room for the queries held back behind it.
+        if (c->dead || c->held() || took == 0)
+            return;
+    }
+}
+
+// Every whole message the connection has brought, answered in order (RFC 7766 allows pipelining), until what waits
+// to be written is past tcp_out_high; the bytes taken from `in`.
+size_t dns_run::tcp_answer(const std::shared_ptr<tcp_conn>& c)
 {
     size_t off = 0;
     static thread_local uint8_t out[max_message + 2];
     const bool xfr_ok = !m_transfer.empty() && ip_block::any_contains(m_transfer, reinterpret_cast<const sockaddr*>(&c->peer));
-    while (c->in.size() - off >= 2)
+    while (!c->held() && c->in.size() - off >= 2)
     {
         const size_t len = rd16(reinterpret_cast<const uint8_t*>(c->in.data()) + off);
         if (c->in.size() - off - 2 < len)
@@ -980,7 +1008,7 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
             if (c->waiting() > tcp_out_max)
             {
                 close_conn(c);
-                return;
+                return 0;
             }
             continue;
         }
@@ -1007,17 +1035,11 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
         if (c->waiting() > tcp_out_max)
         {
             close_conn(c);
-            return;
+            return 0;
         }
     }
     c->in.erase(0, off);
-    // A message can be no longer than 65535 bytes and its length; more than that waiting is no DNS client.
-    if (c->in.size() > max_message + 2)
-    {
-        close_conn(c);
-        return;
-    }
-    tcp_flush(c);
+    return off;
 }
 
 void dns_run::tcp_flush(const std::shared_ptr<tcp_conn>& c)
@@ -1082,7 +1104,10 @@ void dns_run::write_done(const std::shared_ptr<tcp_conn>& c, int res)
         c->out.append(c->later);
         c->later.clear();
     }
-    tcp_flush(c);
+    // The queries held back while the peer was not reading are answered, and reading starts again, once it has.
+    tcp_serve(c);
+    if (!c->dead && !c->held())
+        arm_read(c);
 }
 
 void dns_run::close_conn(const std::shared_ptr<tcp_conn>& c)
@@ -1125,10 +1150,10 @@ void dns_run::tick()
         arm_udp(*ep);
     for (auto& l : m_tcp)
         arm_accept(*l);
-    // Connections quiet for too long, with nothing left to write.
+    // Connections quiet for too long with nothing left to write, and those whose peer has stopped reading.
     std::vector<std::shared_ptr<tcp_conn>> idle;
     for (auto& [id, c] : m_conns)
-        if (now - c->last > tcp_idle_secs && c->waiting() == 0)
+        if ((now - c->last > tcp_idle_secs && c->waiting() == 0) || now - c->last > tcp_stall_secs)
             idle.push_back(c);
     for (auto& c : idle)
         close_conn(c);

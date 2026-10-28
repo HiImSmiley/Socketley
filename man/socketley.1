@@ -12128,7 +12128,9 @@ a malformed query is FORMERR, and opcodes other than QUERY are NOTIMP.
 .SS TCP
 A connection may carry several queries one after another and is answered in
 order (RFC 7766). One left quiet for 10 seconds, with nothing left to write, is
-closed.
+closed. Past 64 KiB of answers its peer has not read, a connection's further
+queries wait unread until it has; one whose answers have not moved for 30
+seconds is closed.
 .SS Stats
 .B stats
 adds, for each shard:

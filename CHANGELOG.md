@@ -230,6 +230,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   files, saying what it leaves. No restored file keeps a setuid or setgid
   bit, and outside the state and config a file the archive says root owns is
   written as the daemon's user's.
+- **A DNS TCP peer that does not read its answers stops being read.** A
+  connection's queries were read and answered however many answers waited
+  unsent, up to 256 MiB a connection, and one with answers waiting was never
+  closed. Past 64 KiB unsent its queries now wait unread, and a connection
+  whose answers have not moved for 30 seconds is closed.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's
