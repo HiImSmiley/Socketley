@@ -187,6 +187,18 @@ for _ in range(10):
 st, _, _ = web("POST", "/jmap/api", mb, dict(B, **{"X-Forwarded-Proto": "https", "X-Forwarded-For": "203.0.113.7"}))
 st2, _, _ = web("POST", "/jmap/api", mb, dict(B, **{"X-Forwarded-Proto": "https", "X-Forwarded-For": "203.0.113.8"}))
 check("ten failures from the client the entrance forwards lock it out, and only it", st == 503 and st2 == 200, (st, st2))
+# A peer that is not the entrance's 127.0.0.1 names no client: its failures are its own, whatever it says it forwards.
+def web_from(source, method, path, body=None, headers=None):
+    c = http.client.HTTPConnection("127.0.0.1", W, timeout=10, source_address=(source, 0))
+    c.request(method, path, body=body, headers=headers or {})
+    r = c.getresponse(); r.read(); c.close()
+    return r.status
+for i in range(10):
+    web_from("127.0.0.2", "POST", "/jmap/api", mb, {"Authorization": basic("ghost%d" % i, "wrong"), "X-Forwarded-Proto": "https",
+                                                    "X-Forwarded-For": "198.51.100.%d" % (10 + i), "Content-Type": "application/json"})
+st = web_from("127.0.0.2", "POST", "/jmap/api", mb, {"Authorization": basic("alice", "alicepassword1"), "X-Forwarded-Proto": "https",
+                                                     "X-Forwarded-For": "198.51.100.99", "Content-Type": "application/json"})
+check("a peer other than the entrance is locked out by its own address, not by the client it names", st == 503, st)
 
 # Uploads, drafts, a move, and sending.
 st, h, d = web("POST", "/jmap/upload/%s/" % acct, b"attached text", {"Cookie": cookie, "X-Socketley-UI": "1", "Content-Type": "text/plain"})

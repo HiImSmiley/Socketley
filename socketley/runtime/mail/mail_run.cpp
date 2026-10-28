@@ -1241,6 +1241,7 @@ void mail_run::begin_session(conn& c)
         cfg.web = c.kind == port_kind::web;
         // Behind the entrance every peer is 127.0.0.1, so a password goes only where it forwards HTTPS.
         cfg.login_in_clear = loopback(c.peer) && !cfg.web;
+        cfg.trust_forwarded = cfg.web && loopback(c.peer);
         cfg.max_size = m_owner.get_max_size();
         c.jmap = std::make_unique<jmap_session>(cfg, c, *m_imap);
     }

@@ -361,7 +361,8 @@ void jmap_session::handle(request rq)
     {
         // Behind the entrance: the scheme it was reached over and the client it forwards are the ones that count.
         m_https = socketley::ascii::iequals(rq.header("x-forwarded-proto"), "https");
-        const std::string forwarded_for = rq.header("x-forwarded-for");
+        // Only the entrance names the client, or a peer would pick the address its failures count against.
+        const std::string forwarded_for = m_cfg.trust_forwarded ? rq.header("x-forwarded-for") : std::string();
         std::string_view xff = forwarded_for;
         if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
             xff.remove_prefix(comma + 1);

@@ -34,6 +34,8 @@ struct jmap_config
     // The port the entrance reaches on 127.0.0.1: the webmail page at /, the idp's session cookie, and the client and
     // scheme the entrance forwards.
     bool web{false};
+    // The peer is the entrance on 127.0.0.1 or ::1, whose X-Forwarded-For names the client.
+    bool trust_forwarded{false};
 };
 
 class jmap_session

@@ -64,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **The webmail port takes X-Forwarded-For only from 127.0.0.1 or ::1.**
+  Another peer could name a new client with each failed sign-in and never be
+  locked out; its failures now count against its own address.
 - **The webmail's message CSS can no longer end its `<style>` or load a
   blocked image.** `</style` was removed in one pass, so `</</stylestyle>`
   left one, and only `url(` was blocked, so `image-set("https://...")` loaded
