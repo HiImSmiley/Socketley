@@ -75,6 +75,9 @@ verdict request_head(const std::vector<std::pair<std::string, std::string>>& fie
     }
     if (method.empty() || method == "CONNECT" || scheme.empty() || path.empty())
         return verdict::malformed;
+    // Origin form, or "*" for OPTIONS (RFC 9113 8.3.1), since a host in :path is one :authority does not name.
+    if (path.front() != '/' && !(path == "*" && method == "OPTIONS"))
+        return verdict::malformed;
     if (end_stream && out.has_cl && out.cl != 0)
         return verdict::malformed;
     out.synth_chunked = !end_stream && !out.has_cl;

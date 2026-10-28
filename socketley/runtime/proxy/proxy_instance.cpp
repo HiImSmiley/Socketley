@@ -4577,8 +4577,25 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
                 }
             }
         }
+        // The port and a trailing dot are not part of the name; an IPv6
+        // literal keeps its brackets and loses only what follows them.
+        auto name_of = [](std::string_view a) {
+            std::string n(a);
+            if (!n.empty() && n.front() == '[')
+                n.erase(std::min(n.size(), n.find(']') + 1));
+            else if (const size_t c = n.find(':'); c != std::string::npos)
+                n.erase(c);
+            while (!n.empty() && n.back() == '.')
+                n.pop_back();
+            for (char& c : n)
+                if (c >= 'A' && c <= 'Z')
+                    c = static_cast<char>(c | 0x20);
+            return n;
+        };
+        conn->ex.host = name_of(authority);
         // The absolute form names the host itself and wins over the field
-        // (RFC 9112 3.2.2); the backend is given the origin form.
+        // (RFC 9112 3.2.2); the backend is given the origin form, and a Host
+        // field naming another host is refused, since the backend reads it.
         std::string_view target = conn->ex.path;
         for (std::string_view scheme : {std::string_view("http://"), std::string_view("https://")})
             if (target.size() > scheme.size() &&
@@ -4586,28 +4603,17 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
             {
                 std::string_view rest = target.substr(scheme.size());
                 const size_t slash = rest.find_first_of("/?");
+                std::string named = name_of(rest.substr(0, slash));
+                if (SOCKETLEY_UNLIKELY(conn->ex.host_fields > 0 && named != conn->ex.host))
+                    return http_request_parse::invalid;
                 std::string origin = slash == std::string_view::npos ? "/" : std::string(rest.substr(slash));
                 if (!origin.starts_with('/'))
                     origin.insert(0, 1, '/');
                 conn->ex.host_fields = std::max<uint8_t>(conn->ex.host_fields, 1);
-                conn->ex.host.assign(rest.substr(0, slash));
+                conn->ex.host = std::move(named);
                 conn->ex.path = std::move(origin);
-                authority = {};
                 break;
             }
-        if (!authority.empty())
-            conn->ex.host.assign(authority);
-        // The port and a trailing dot are not part of the name; an IPv6
-        // literal keeps its brackets and loses only what follows them.
-        if (!conn->ex.host.empty() && conn->ex.host.front() == '[')
-            conn->ex.host.erase(std::min(conn->ex.host.size(), conn->ex.host.find(']') + 1));
-        else if (const size_t c = conn->ex.host.find(':'); c != std::string::npos)
-            conn->ex.host.erase(c);
-        while (!conn->ex.host.empty() && conn->ex.host.back() == '.')
-            conn->ex.host.pop_back();
-        for (char& c : conn->ex.host)
-            if (c >= 'A' && c <= 'Z')
-                c = static_cast<char>(c | 0x20);
     }
 
     return http_request_parse::complete;

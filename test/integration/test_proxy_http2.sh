@@ -130,6 +130,52 @@ expect "both over HTTP/2" "$(printf '%s' "$two_on_one" | grep -o '|2' | wc -l)" 
 expect "a stream naming a name the handshake did not is refused" \
     "$(hc one.example.com /who.txt -H 'Host: two.example.com' -o /dev/null -w '%{http_code}/%{http_version}')" "421/2"
 
+# An absolute-form target names the host the entrance routes and checks the handshake by, and the Host field is what
+# the backend reads: one request naming two hosts reached one's runtime telling it the other, so it is refused.
+absolute() {
+    python3 - "$E" "$@" <<'PY'
+import socket, ssl, sys, h2.connection, h2.config, h2.events
+port, how, target, host = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+ctx.set_alpn_protocols(["h2"] if how == "h2" else ["http/1.1"])
+s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port), 5), server_hostname="one.example.com")
+s.settimeout(5)
+if how == "h1":
+    s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (target, host)).encode())
+    got = b""
+    while True:
+        d = s.recv(65536)
+        if not d: break
+        got += d
+    head, _, body = got.partition(b"\r\n\r\n")
+    print(head.split(b" ")[1].decode() + " " + body.decode(errors="replace").strip())
+    sys.exit(0)
+cfg = h2.config.H2Configuration(client_side=True, validate_outbound_headers=False, normalize_outbound_headers=False)
+c = h2.connection.H2Connection(cfg); c.initiate_connection()
+c.send_headers(1, [(":method", "GET"), (":path", target), (":scheme", "https"), (":authority", host)], end_stream=True)
+s.sendall(c.data_to_send())
+status, body, done = "", b"", False
+while not done:
+    d = s.recv(65536)
+    if not d: break
+    for e in c.receive_data(d):
+        if isinstance(e, h2.events.ResponseReceived): status = dict(e.headers).get(b":status", b"").decode()
+        if isinstance(e, h2.events.DataReceived): body += e.data; c.acknowledge_received_data(len(e.data), e.stream_id)
+        if isinstance(e, h2.events.StreamReset): status, done = "reset", True
+        if isinstance(e, h2.events.StreamEnded): done = True
+    s.sendall(c.data_to_send())
+print(status + " " + body.decode(errors="replace").strip())
+PY
+}
+expect "an absolute-form target and the Host it agrees with are routed" \
+    "$(absolute h1 "https://one.example.com/who.txt" "ONE.example.com.")" "200 from-one"
+expect "an absolute-form target naming another host than Host is refused" \
+    "$(absolute h1 "https://one.example.com/who.txt" "two.example.com")" "400 Bad Request"
+expect "a stream whose :path is not origin-form is reset as malformed" \
+    "$(absolute h2 "https://one.example.com/who.txt" "two.example.com" | cut -d' ' -f1)" "reset"
+expect "and an origin-form one on the same terms is answered" \
+    "$(absolute h2 "/who.txt" "one.example.com")" "200 from-one"
+
 # ── a second request on the same connection ────────────────────────────────
 twice=$(curl -sk --noproxy '*' -m 10 --resolve "one.example.com:$E:127.0.0.1" \
     "https://one.example.com:$E/who.txt" "https://one.example.com:$E/who.txt" | tr -d '\n')

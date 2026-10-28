@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `nosniff` and a sandboxing Content-Security-Policy, a type a browser would
   run is sent as an attachment, and an anonymous GET takes no `response-*`
   override.
+- **An absolute-form request names one host.** `GET https://A/x` with
+  `Host: B` was routed and checked against the TLS name by A and reached A's
+  runtime telling it B; HTTP/2 the same with a `:path` of `https://A/x`. Such a
+  request is now refused 400, and an HTTP/2 `:path` must be origin-form, or `*`
+  for OPTIONS.
 - **A proxy's X-Forwarded-For always names the client.** A client that reset
   its connection right behind its request left no address to look up when the
   request was read, and the empty address stood for a local unix peer: the
