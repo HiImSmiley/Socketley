@@ -139,10 +139,14 @@ st, h, _ = web("GET", "/jmap/session")
 check("a JMAP client with no credentials is still asked for Basic", st == 401 and h.get("www-authenticate", "").startswith("Basic"), (st, h))
 
 # Signed in at the idp.
+# The session cookie by its name, since the idp sets a known-device cookie beside it and http_ keeps one header of each.
 def sign_in(user, pw):
     form = urllib.parse.urlencode({"username": user, "password": pw, "rd": "http://127.0.0.1:%d/" % W})
-    st, h, _ = http_(PI, "POST", "/login", form, {"Content-Type": "application/x-www-form-urlencoded"})
-    return (h.get("set-cookie") or "").split(";")[0]
+    c = http.client.HTTPConnection("127.0.0.1", PI, timeout=10)
+    c.request("POST", "/login", body=form, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    r = c.getresponse(); r.read()
+    got = [v.split(";")[0] for k, v in r.getheaders() if k.lower() == "set-cookie"]; c.close()
+    return next((v for v in got if v.startswith("skl_idp=")), "")
 cookie = sign_in("alice", "alicepassword1")
 C = {"Cookie": cookie, "X-Socketley-UI": "1"}
 st, h, d = web("GET", "/~mail/session", headers=C)
