@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection to a cache or a server, a replica's included, left every client
   closed after it in CLOSE-WAIT with no FIN sent; such a kernel is now found
   at start and those runtimes use plain descriptors there.
+- **A script's `socketley.stop` frees the port before it answers.** A script
+  running in the daemon left the stopped runtime's workers serving for up to
+  two seconds, and an `edit --shards` and `start` in that time kept the old
+  shards beside a new one, whose `self.clients()` and theirs each missed the
+  other's clients.
 - **Tunnel names and joins, made safe.** A kept sign-in goes only to an idp
   beside the edge that names it, so an edge cannot ask for another's token; an
   agent that has joined is replaced only with `tunnel join --replace`; an

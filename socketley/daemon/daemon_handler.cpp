@@ -7450,7 +7450,14 @@ void daemon_handler::reconcile_proxy_workers()
             std::none_of(it->second.begin(), it->second.end(),
                          [](const auto& sup) { return sup->is_alive(); });
 
-        if (w == wanted.end() || all_reaped)
+        // A set asked for more shards than it has outlived a stop no reconcile
+        // followed, since the count cannot be edited while running, and its
+        // survivors map a client list sized for the old count, so it is forked
+        // again whole.
+        const bool must_grow = w != wanted.end() && !it->second.empty() &&
+                               it->second.size() < w->second;
+
+        if (w == wanted.end() || all_reaped || must_grow)
         {
             // Recorded before the retire, because retire() nulls the
             // supervisor's placeholder pointer and this is a name the map is
@@ -7648,8 +7655,8 @@ void daemon_handler::reconcile_proxy_workers()
             }
             else if (creg.count() != want_count)
             {
-                // Width is fixed at creation, so a changed shard count needs a
-                // new region, which reconcile does not currently produce.
+                // Width is fixed at creation, and a set that grows was retired
+                // whole above, so no running shard still maps the old region.
                 if (!creg.create(static_cast<uint32_t>(want_count)))
                     LOG_WARN(("could not resize the shared client list for "
                               + name).c_str());

@@ -2332,7 +2332,13 @@ void lua_context::register_bindings(runtime_instance* owner)
                            + state_to_string(inst->get_state()) + ", not running");
 
         if (mgr->stop(name, *loop))
+        {
+            // The workers taken down before the answer, as the daemon does for
+            // a worker's script, or they serve the port until the next health
+            // tick and a start in between keeps them with their old config.
+            mgr->release_workers();
             return api_yes();
+        }
         return api_why(q(name) + " could not be stopped; the reason is in "
                                  "the daemon's log");
     };
