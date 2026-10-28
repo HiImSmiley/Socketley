@@ -811,6 +811,18 @@ TEST_CASE("DMARC: a From written with a space before its colon is an author, cou
     CHECK(res.reject());
 }
 
+TEST_CASE("Submission: a From is the user's own, one From at most, or none")
+{
+    const auto alice = [](const address& a) { return a.local == "alice" && a.domain == "example.test"; };
+    CHECK(authors_owned("Subject: x\r\n\r\n", alice));
+    CHECK(authors_owned("From: Alice <alice@example.test>\r\n\r\n", alice));
+    CHECK_FALSE(authors_owned("From: ceo@example.test\r\n\r\n", alice));
+    CHECK_FALSE(authors_owned("From: alice@example.test, ceo@example.test\r\n\r\n", alice));
+    CHECK_FALSE(authors_owned("From: alice@example.test\r\nFrom : alice@example.test\r\n\r\n", alice));
+    CHECK_FALSE(authors_owned("From: <\r\n\r\n", alice));
+    CHECK_FALSE(authors_owned("Subject: x\nFrom: ceo@example.test\r\n\r\n", alice));
+}
+
 TEST_CASE("DMARC: a DKIM signature of the From domain passes where SPF does not")
 {
     table_resolver r;

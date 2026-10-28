@@ -217,6 +217,8 @@ private:
         // user's is held back from the spool until it is whole, so the Date and Message-ID it lacks go ahead of it.
         std::string head_seen;
         bool holding{false};
+        // The header held ran past 64 KiB without its end, so its From could not all be read.
+        bool head_cut{false};
         void release_head(bool at_end);
         // Its address in --dnsbl's lists: not asked, being asked, listed nowhere, listed by `listed_by`; and the
         // MAIL that waits for the answer.

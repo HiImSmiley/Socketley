@@ -3,6 +3,7 @@
 // RFC 2047 where they are not ASCII, text as quoted-printable, an HTML part beside it, attachments in base64.  And the
 // reading of a message's headers back, which a bounce, DKIM and IMAP's ENVELOPE need.
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -50,5 +51,8 @@ std::vector<std::pair<std::string_view, std::string_view>> split_headers(std::st
 // How many From headers a block has, each name trimmed as header_value reads it and a bare LF ending a line as some
 // readers take it, with header_value's value in `first`; the one place DMARC, submission and signing count them.
 size_t from_headers(std::string_view headers, std::string* first = nullptr);
+// Whether a submitted header block's From names only addresses `own` takes: true where there is no From, false for two
+// or for one that does not read; SMTP submission and JMAP's EmailSubmission both ask it.
+bool authors_owned(std::string_view headers, const std::function<bool(const address&)>& own);
 
 }   // namespace socketley::mail

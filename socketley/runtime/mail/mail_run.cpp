@@ -2121,6 +2121,7 @@ bool mail_run::conn::data_begin()
     entry = e;
     writer = r.m_spool.begin(std::move(e), head);
     head_seen.clear();
+    head_cut = false;
     holding = !smtp->user().empty();
     return writer != 0;
 }
@@ -2147,6 +2148,7 @@ void mail_run::conn::release_head(bool at_end)
     // where the header did not end within what was held it is left as it came.
     std::string add;
     const bool whole = at_end || head_seen.find("\r\n\r\n") != std::string::npos || head_seen.starts_with("\r\n");
+    head_cut = !whole;
     if (whole)
     {
         bool date = false, id = false;
@@ -2196,12 +2198,14 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
     head_seen.clear();
     if (!smtp->user().empty())
     {
-        std::vector<address> authors;
-        std::string from;
-        const size_t n = from_headers(header_block(head), &from);
-        // Two From headers are two authors a reader and a checker may each take one of, so they are refused.
-        if (n > 1 || (n == 1 && (!parse_mailbox_list(from, authors) || authors.empty() ||
-                                 std::any_of(authors.begin(), authors.end(), [this](const address& a) { return !owns(a); }))))
+        // A header whose end was not held may have its From past what was kept, and the signer would read that one.
+        if (head_cut)
+        {
+            r.m_spool.abort(w);
+            done({552, "The header runs past 64 KiB, too long for its From to be checked"});
+            return;
+        }
+        if (!authors_owned(header_block(head), [this](const address& a) { return owns(a); }))
         {
             r.m_spool.abort(w);
             done({553, "The From header names an address not owned by " + smtp->user()});

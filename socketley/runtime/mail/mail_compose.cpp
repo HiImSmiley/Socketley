@@ -1,5 +1,6 @@
 #include "mail_compose.h"
 
+#include <algorithm>
 #include <cctype>
 #include <ctime>
 
@@ -529,6 +530,17 @@ size_t from_headers(std::string_view headers, std::string* first)
     if (first)
         *first = header_value(headers, "From");
     return n;
+}
+
+bool authors_owned(std::string_view headers, const std::function<bool(const address&)>& own)
+{
+    std::string from;
+    const size_t n = from_headers(headers, &from);
+    if (n == 0)
+        return true;
+    std::vector<address> authors;
+    return n == 1 && parse_mailbox_list(from, authors) && !authors.empty() &&
+           std::all_of(authors.begin(), authors.end(), own);
 }
 
 }   // namespace socketley::mail

@@ -178,6 +178,15 @@ check "nor under one From of another written so" "$(smtp "$SUB" alice@example.te
 Subject: forged
 
 the ceo says once more' starttls login alice alicepass1)" "refused 553"
+long_head=$(python3 -c 'print("\n".join("X-Pad-%d: %s" % (i, "a" * 76) for i in range(900)))')
+check "nor under a From of another past 64 KiB of header" "$(smtp "$SUB" alice@example.test carol@remote.test "$long_head
+From: ceo@example.test
+Subject: forged
+
+the ceo says late" starttls login alice alicepass1)" "refused 552"
+check "while a long body under a short header is still taken" "$(smtp "$SUB" alice@example.test carol@remote.test "Subject: long
+
+$long_head" starttls login alice alicepass1)" "sent"
 
 # ─── socketley send ─────────────────────────────────────────────────────────
 id=$("$BIN" send m --from alice@example.test --to dave@remote.test --subject "Hello from the CLI" --text "cli body" 2>&1)
