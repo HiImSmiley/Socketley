@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   percent-encoded was verified with the signer's key but then judged as
   anonymous, so Deny statements naming the signer did not apply to it and a
   bucket policy could be put by a user who owns nothing.
+- **A second step that is on is replaced only by turning it off.** The
+  account page's `do=start` and `do=confirm` replaced the authenticator key of
+  an account that had one with no code of it, so a stolen session could swap
+  in a key of its own and lock the owner out; both are now refused while one
+  is on, and a key begun while it was off no longer replaces one turned on
+  meanwhile.
 - **A proxy with `--auth idp:` keeps the provider's cookies from its backend.**
   The backend was handed the `skl_idp` session cookie with the rest of the
   Cookie field, and could replay it at every runtime that trusts the provider,

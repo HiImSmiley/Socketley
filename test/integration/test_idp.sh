@@ -15,6 +15,7 @@
 #   * a password that must be reset letting the account in before it is
 #   * the signing key changing across a restart, which would sign every user out
 #   * a code of the second step taken again after a restart
+#   * a session replacing a second step that is on, or one turned on meanwhile, without a code of it
 #   * a storage's users not coming over with the passwords they have there
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted
@@ -132,10 +133,10 @@ IMP=$("$BIN" idp-user auth import ui 2>&1); rc=$?
 case "$IMP" in "2 imported, 1 already here"*) ok ;; *) bad "a storage's users are imported, an account of the same name kept" "rc $rc: $IMP" ;; esac
 
 run() {
-    python3 - "$PI" "$1" "$T" "$PS" "$PP" "$PM" "$ALICE" 2>&1 <<'PY' || echo "bad the $1 checks ran to their end"
-import sys, json, time, base64, hashlib, re, urllib.request, urllib.error, urllib.parse
+    python3 - "$PI" "$1" "$T" "$PS" "$PP" "$PM" "$ALICE" "$BIN" 2>&1 <<'PY' || echo "bad the $1 checks ran to their end"
+import sys, json, time, base64, hashlib, re, subprocess, urllib.request, urllib.error, urllib.parse
 import jwt
-pi, phase, tmpd, ps, pp, pm, alice_id = sys.argv[1:8]
+pi, phase, tmpd, ps, pp, pm, alice_id, bin_ = sys.argv[1:9]
 I = "http://127.0.0.1:%s" % pi
 CB = "http://127.0.0.1:9/cb"
 def check(name, got, want):
@@ -460,6 +461,18 @@ elif phase == "after_cli":
           req("POST", "/authorize", dict(auth, username="dora", password="dorapassword1"), headers={"X-Forwarded-For": "198.51.100.7"})[0], 429)
     check("and another is not",
           req("POST", "/authorize", dict(auth, username="dora", password="dorapassword1"), headers={"X-Forwarded-For": "198.51.100.8"})[0], 302)
+    # A second step is replaced only by turning it off, which takes a code of it, and never by a session alone.
+    O = {"X-Forwarded-For": "198.51.100.80"}
+    oc = cookie_of(req("POST", "/login", dict(rd="/", username="omar", password="omarpassword12"), headers=O)[2])
+    st, body, _ = req("POST", "/account/totp", dict(do="start"), cookie=oc, headers=O)
+    k1 = "".join((re.search(r"<p><code>([A-Z2-7 ]+)</code>", body) or [None, ""])[1].split())
+    check("a second step begun shows its key", (st, bool(k1)), (200, True))
+    on = subprocess.run([bin_, "idp-user", "auth", "totp", "omar", "on"], capture_output=True, text=True).stdout
+    check("and an admin turns one on meanwhile", bool(re.search(r"key: \S+", on)), True)
+    st, body, _ = req("POST", "/account/totp", dict(do="confirm", code=totp_now(k1)), cookie=oc, headers=O)
+    check("the key begun before replaces nothing", (st, "Two-step sign-in is on." in body), (400, False))
+    st, body, _ = req("POST", "/account/totp", dict(do="start"), cookie=oc, headers=O)
+    check("and with one on, a session is shown no key to replace it with", (st, "otpauth://" in body), (400, False))
 
 elif phase == "limits":
     import threading, hmac, struct
@@ -571,6 +584,7 @@ tally < <(run main)
 "$BIN" idp-user auth add erin --password erinpassword1 >/dev/null 2>&1
 "$BIN" idp-user auth totp erin on 2>&1 | sed -n 's/^key: //p' > "$T/erin.key"
 "$BIN" idp-user auth passwd erin --password erinTemp12345 --reset >/dev/null 2>&1
+"$BIN" idp-user auth add omar --password omarpassword12 >/dev/null 2>&1 || bad "omar is made" "rc $?"
 [ -s "$T/erin.key" ] && ok || bad "a second step is turned on for the reset checks" "no key"
 tally < <(run after_cli)
 
@@ -609,7 +623,7 @@ expect "but to one under the cookie domain" \
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
 STATS=$("$BIN" stats auth 2>/dev/null)
-case "$STATS" in *"accounts:12"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+case "$STATS" in *"accounts:13"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]

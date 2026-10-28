@@ -2380,6 +2380,13 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
     {
         const int64_t now = wall::now_sec();
         std::erase_if(m_enrolling, [now](const auto& kv) { return kv.second.second < now; });
+        // A key on is replaced only by turning it off first, which takes a code of it, so a session alone never can.
+        if ((what == "start" || what == "confirm") && !who->field("totp").empty())
+        {
+            m_enrolling.erase(id);
+            account_page(c, rq, {}, "Two-step sign-in is on already; turn it off first, with a code your app shows.", 400);
+            return;
+        }
         if (what == "start")
         {
             // The key shown once, taken into the account only when a code of it proves the app has it.
@@ -2422,8 +2429,9 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
             const std::string key = it->second.first;
             m_enrolling.erase(it);
             c->waiting = true;
-            // The code that turned it on is taken, so it signs nobody in after.
-            update_account(id, {{"totp", key}, {"totp_step", std::to_string(step)}}, saved("Two-step sign-in is on."));
+            // The code that turned it on is taken, so it signs nobody in after, and only while no key was set since.
+            update_account(id, {{"?totp", ""}, {"totp", key}, {"totp_step", std::to_string(step)}},
+                           saved("Two-step sign-in is on."));
             return;
         }
         if (what == "off")
