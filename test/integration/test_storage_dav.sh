@@ -10,7 +10,8 @@
 #   * a folder's copy or move losing an object, or its removal leaving one
 #   * a copy or move with Overwrite: F replacing what is at its Destination
 #   * a folder moved onto itself or into itself, which copied each object onto
-#     its own key and then removed it: every object in it gone
+#     its own key and then removed it: every object in it gone; or onto its
+#     bucket's root, which wrote over objects the walk had still to read
 #   * a user seeing or writing another user's bucket through the drive
 #   * a library deleted with its contents taking a file, and then itself,
 #     that a policy denies deleting
@@ -187,6 +188,9 @@ check "a folder moved onto itself is refused, and keeps every object" \
       "$(code -u "$A" -X MOVE -H "$(dst docs/d/)" "$U/~dav/docs/d/") $(names "$A" docs/d/)" "403 d sub one.txt"
 check "as is one moved into a folder of its own" \
       "$(code -u "$A" -X MOVE -H "$(dst docs/d/sub/inner/)" "$U/~dav/docs/d/") $(names "$A" docs/d/)" "403 d sub one.txt"
+check "or one moved or copied onto its bucket's root, which holds it" \
+      "$(code -u "$A" -X MOVE -H "$(dst docs/)" "$U/~dav/docs/d/") $(code -u "$A" -X COPY -H "$(dst docs/)" "$U/~dav/docs/d/") $(names "$A" docs/d/)" \
+      "403 403 d sub one.txt"
 check "and a file moved onto itself" \
       "$(code -u "$A" -X MOVE -H "$(dst docs/d/one.txt)" "$U/~dav/docs/d/one.txt") $(names "$A" docs/d/)" "403 d sub one.txt"
 check "DELETE of a folder is 204" "$(code -u "$A" -X DELETE "$U/~dav/docs/d/")" 204

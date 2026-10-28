@@ -666,10 +666,10 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
                         dst_k += '/';
                 }
                 std::string prefix = k.empty() || k.back() == '/' ? k : k + "/";
-                // Onto itself every copy lands on its own source and the move then removes it; into itself the copies
-                // land where the listing is still walking (RFC 4918 9.8.5, 9.9.4).
-                if (method != "DELETE" && dst_b == b &&
-                    (dst_k.starts_with(prefix) || (!dst_k.empty() && prefix.starts_with(dst_k))))
+                // Onto itself every copy lands on its own source and the move then removes it; into itself, or onto
+                // a folder above it up to the bucket's root, the copies land where the listing is still walking
+                // (RFC 4918 9.8.5, 9.9.4).
+                if (method != "DELETE" && dst_b == b && (dst_k.starts_with(prefix) || prefix.starts_with(dst_k)))
                 {
                     app_reply(cc, 403, "A folder is not copied or moved onto itself or into itself.\n");
                     return;

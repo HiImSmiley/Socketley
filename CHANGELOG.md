@@ -106,6 +106,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   left out of the string to sign but read by the handler, so a presigned GET
   could be turned into a read of an old version or a `response-*` override,
   and a PUT into an ACL, tagging or part upload; it now breaks the signature.
+- **A folder is not copied or moved onto its own bucket's root.** WebDAV's
+  COPY or MOVE of `b/a/` to `/~dav/b/` was let through where any other folder
+  above it was refused, and wrote `b/a/x` over `b/x` before the walk had read
+  it, losing what was there; it is now 403 like the rest.
 - **A library deleted with its contents is judged file by file.** `DELETE
   /~dav/<bucket>/?contents` asked a policy only about the bucket and one key
   standing for all, so a Deny on deleting a prefix's objects was passed over
