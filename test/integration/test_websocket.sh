@@ -10,10 +10,13 @@ daemon_isolate ws
 PORT=$((SL_PORT_BASE+200))
 PASS=0; FAIL=0; TOTAL=0
 
+P_LISTED=$((SL_PORT_BASE+201))
+P_ANY=$((SL_PORT_BASE+202))
+
 cleanup() {
-    "$BIN" stop ws_test 2>/dev/null || true
+    for n in ws_test ws_listed ws_any; do "$BIN" stop "$n" 2>/dev/null || true; done
     sleep 0.5
-    "$BIN" remove ws_test 2>/dev/null || true
+    for n in ws_test ws_listed ws_any; do "$BIN" remove "$n" 2>/dev/null || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -98,6 +101,43 @@ else
     TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
     echo "  FAIL [two raw TCP connections were accepted]: stats reported no"
     echo "        connection count to compare against"
+fi
+
+# The status code an upgrade to port $1 is answered with, the rest of the
+# arguments being extra header lines.
+upgrade_status() {
+    local port=$1; shift
+    local extra="" h
+    for h in "$@"; do extra="$extra$h\r\n"; done
+    printf "GET / HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $WS_KEY\r\nSec-WebSocket-Version: 13\r\n$extra\r\n" \
+        | nc -q 1 127.0.0.1 "$port" 2>/dev/null | head -1 | tr -d '\r' | awk '{print $2}' || true
+}
+
+# A page on another site drives the server through its visitor's browser, so
+# only the server's own origin and the ones --origins lists are upgraded.
+create_ok "server with listed origins" "$BIN" create server ws_listed -p "$P_LISTED" \
+    --origins https://app.example,http://other.example:8080 -s
+create_ok "server with any origin" "$BIN" create server ws_any -p "$P_ANY" --origins '*' -s
+sleep 0.3
+
+assert_eq "$(upgrade_status "$PORT")" "101" "no Origin is not a browser, and is upgraded"
+assert_eq "$(upgrade_status "$PORT" "Origin: http://127.0.0.1:$PORT")" "101" "the page's own origin is upgraded"
+assert_eq "$(upgrade_status "$PORT" "Origin: http://evil.example")" "403" "another site's page is refused"
+assert_eq "$(upgrade_status "$PORT" "Origin: null")" "403" "an opaque origin is refused"
+assert_eq "$(upgrade_status "$PORT" "Origin: http://app.local:8080" "X-Forwarded-Host: app.local:8080")" "101" \
+    "the origin a proxy in front was asked for is upgraded"
+assert_eq "$(upgrade_status "$P_LISTED" "Origin: http://other.example:8080")" "101" "a listed origin is upgraded"
+assert_eq "$(upgrade_status "$P_LISTED" "Origin: HTTPS://APP.EXAMPLE")" "101" "a listed origin matches in any case"
+assert_eq "$(upgrade_status "$P_LISTED" "Origin: http://evil.example")" "403" "an origin the list lacks is refused"
+assert_eq "$(upgrade_status "$P_ANY" "Origin: http://evil.example")" "101" "* admits any origin"
+
+# Kept in the state file, so the list survives the restart the daemon makes itself.
+SF=$(find "${HOME}/.local/share/socketley" -name 'ws_listed.json' 2>/dev/null | head -1)
+TOTAL=$((TOTAL+1))
+if [ -n "$SF" ] && grep -q '"origins": "https://app.example,http://other.example:8080"' "$SF"; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1)); echo "  FAIL [the origins persist]: not in ${SF:-<no state file>}"
 fi
 
 # Test: Server is still running after mixed connections

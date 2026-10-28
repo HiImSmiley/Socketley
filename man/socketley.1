@@ -2083,6 +2083,7 @@ master_pw	string	Static password for master mode
 send_to	string	"sender", "others", "master", comma separated
 http_dir	string	Static file root, as \fB\-\-http\fR
 http_cache	bool	Hold those files in memory, as \fB\-\-http\-cache\fR
+origins	string	Other web origins that may open a WebSocket, as \fB\-\-origins\fR
 upstreams	array	Upstream addresses, as \fB\-\-upstream\fR
 .TE
 .PP
@@ -3798,6 +3799,25 @@ cannot express it: the daemon receives one line and splits it on whitespace, so
 an empty argument does not survive the wire and arrives as the flag with
 nothing after it.
 .TP
+.BI "\-\-origins " list
+The web origins, besides the server's own, whose pages may open a WebSocket
+here, comma\-separated, such as
+.BR https://app.example.com ;
+.B *
+admits any. A handshake whose
+.B Origin
+is neither listed nor the
+.B Host
+it was sent to (or the
+.B X\-Forwarded\-Host
+of a proxy in front) is answered
+.B 403 Forbidden
+and closed, so a page on another site cannot drive the server, or the cache
+linked to it, through the browser of someone who can reach it. A client that
+sends no
+.BR Origin ,
+which is any client but a browser, is not affected.
+.TP
 .BI "\-\-http " "directory"
 Serve static files from the given directory over HTTP. When a browser makes a
 plain HTTP GET request (without a WebSocket upgrade header), the server responds
@@ -4309,7 +4329,10 @@ Detected when an HTTP request contains
 The server completes the RFC 6455 handshake and transparently frames/deframes
 messages. The
 .B on_websocket
-callback fires after the upgrade. A text message that is not valid UTF\-8
+callback fires after the upgrade. A browser page from another origin is
+refused with 403 unless
+.B \-\-origins
+lists it. A text message that is not valid UTF\-8
 fails its connection with close code 1007 and never reaches a script; a
 fragmented message is checked once it is whole.
 A message the server relays without a script \(em to other clients, back to
@@ -4346,7 +4369,9 @@ This is about the
 line only. Once a connection's protocol is known, lines of any length are
 delivered as they arrive.
 .PP
-Browser example:
+Browser example, from a page the server serves itself or one
+.B \-\-origins
+lists:
 .nf
 const ws = new WebSocket("ws://localhost:9000");
 ws.onmessage = e => console.log(e.data);
@@ -14571,6 +14596,7 @@ mode                       \-\-mode
 udp (bool)                 \-\-udp
 http                       \-\-http
 http_cache (bool)          \-\-http\-cache
+origins                    \-\-origins
 master_pw                  \-\-master\-pw
 send_to (string)           \-\-send\-to
 cache                      \-\-cache

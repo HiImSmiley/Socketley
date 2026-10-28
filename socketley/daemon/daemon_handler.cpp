@@ -4697,7 +4697,7 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
         server_mode mode{mode_inout};
         uint8_t     send_to{send_to_unset};
         bool        udp{false};
-        std::string master_pw, cache_name, http_dir;
+        std::string master_pw, cache_name, http_dir, origins;
         bool        http_cache{false};
         client_mode cmode{client_mode_inout};
         std::string target;
@@ -4742,6 +4742,7 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
         before.cache_name = std::string(srv_b->get_cache_name());
         before.http_dir   = srv_b->get_http_dir().string();
         before.http_cache = srv_b->get_http_cache();
+        before.origins    = std::string(srv_b->get_origins());
     }
     else if (type == runtime_client)
     {
@@ -4801,6 +4802,7 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
             srv_r->set_cache_name(before.cache_name);
             srv_r->set_http_dir(before.http_dir);
             srv_r->set_http_cache(before.http_cache);
+            srv_r->set_origins(before.origins);
         }
         else if (type == runtime_client)
         {

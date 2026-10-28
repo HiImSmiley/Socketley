@@ -256,6 +256,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unsent, up to 256 MiB a connection, and one with answers waiting was never
   closed. Past 64 KiB unsent its queries now wait unread, and a connection
   whose answers have not moved for 30 seconds is closed.
+- **A server's WebSocket takes a browser only from its own pages and the
+  `--origins` it lists.** Any web page could open `ws://` to a server its
+  visitor could reach, one bound to 127.0.0.1 or behind a firewall included,
+  and read and write its linked cache through that visitor's browser. An
+  upgrade whose `Origin` is neither the `Host` it was sent to, the
+  `X-Forwarded-Host` of a proxy in front, nor in the new `--origins` list
+  (`*` for any) is now 403; a client that sends no `Origin` is not affected.
 - **Every line forwarded to a master carries its sender.** With `--send-to
   master`, a WebSocket client's one message could hold line breaks, so a raw
   TCP master read `[7] hi` and then a `[4] ...` line that client had written as

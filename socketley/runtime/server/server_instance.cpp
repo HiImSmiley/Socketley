@@ -907,6 +907,20 @@ static const std::shared_ptr<const std::string>& http_400_ws_key_response()
     return resp;
 }
 
+// An Origin that is neither the page's own host nor listed in --origins, named so the operator knows what to add.
+static const std::shared_ptr<const std::string>& http_403_ws_origin_response()
+{
+    static const auto resp = [] {
+        constexpr std::string_view body = "this page's origin may not open a WebSocket here; see --origins\n";
+        std::string r = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: ";
+        r += std::to_string(body.size());
+        r += "\r\nConnection: close\r\n\r\n";
+        r += body;
+        return std::make_shared<const std::string>(std::move(r));
+    }();
+    return resp;
+}
+
 static const std::shared_ptr<const std::string>& http_413_response()
 {
     static const auto resp = std::make_shared<const std::string>(
@@ -4157,6 +4171,7 @@ reparse:
             // Views into `partial`, copied onto the connection only once this
             // GET turns out to be an upgrade.
             std::string_view ws_cookie_v, ws_origin_v, ws_protocol_v, ws_auth_v;
+            std::string_view ws_host_v, ws_fwd_host_v;
 
             // Walk headers line by line
             size_t line_start = hdrs.find("\r\n"); // skip request line
@@ -4243,6 +4258,12 @@ reparse:
                             }
                             break;
                         }
+                        case fnv1a("host"):
+                            ws_host_v = http_trim_ows(line.substr(colon + 1));
+                            break;
+                        case fnv1a("x-forwarded-host"):
+                            ws_fwd_host_v = http_trim_ows(line.substr(colon + 1));
+                            break;
                     }
                 }
 
@@ -4307,6 +4328,15 @@ reparse:
                 if (SOCKETLEY_UNLIKELY(!ws_key_present))
                 {
                     refuse_http_request(conn, http_400_ws_key_response());
+                    return;
+                }
+
+                // A browser names the page that opened the socket, and only that page's own host or a listed origin
+                // may drive this server through the browser of someone who can reach it.
+                if (SOCKETLEY_UNLIKELY(!ws_origin_admitted(http_trim_ows(ws_origin_v), ws_host_v, ws_fwd_host_v,
+                                                            m_origins)))
+                {
+                    refuse_http_request(conn, http_403_ws_origin_response());
                     return;
                 }
 

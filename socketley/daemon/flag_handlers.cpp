@@ -918,6 +918,18 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         case fnv1a("--http-cache"):
             srv->set_http_cache(true);
             return 0;
+        // The web origins besides its own whose pages may open a WebSocket here.
+        case fnv1a("--origins"):
+        {
+            const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
+            {
+                std::cout << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                return 1;
+            }
+            srv->set_origins(pa.args[++i]);
+            return 0;
+        }
         default:
             return -1;
     }

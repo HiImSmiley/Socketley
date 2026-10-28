@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <openssl/evp.h>
+#include "../util/text_list.h"
 
 // SSE2 is baseline for x86-64; AVX2 is optional
 #if defined(__x86_64__) || defined(_M_X64)
@@ -782,4 +783,37 @@ inline const std::shared_ptr<const std::string>* ws_frame_close_pre(uint16_t cod
         case 1009: return &ws_frame_close_too_big_shared();
         default:   return nullptr;
     }
+}
+
+// Whether a handshake's Origin may open a socket: none (not a browser), the host the page asked, the host a proxy in
+// front was asked, or one of `allowed`, comma-separated with `*` for any.
+inline bool ws_origin_admitted(std::string_view origin, std::string_view host, std::string_view forwarded_host,
+                               std::string_view allowed)
+{
+    if (origin.empty())
+        return true;
+    const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c; };
+    const auto same = [&lower](std::string_view a, std::string_view b) {
+        if (a.size() != b.size())
+            return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (lower(a[i]) != lower(b[i]))
+                return false;
+        return true;
+    };
+    for (std::string_view list = allowed; !list.empty();)
+    {
+        const std::string_view one = socketley::trim_blanks(socketley::take_item(list));
+        if (one == "*" || (!one.empty() && same(one, origin)))
+            return true;
+    }
+    const size_t scheme_end = origin.find("://");
+    if (scheme_end == std::string_view::npos)
+        return false;
+    const std::string_view authority = origin.substr(scheme_end + 3);
+    if (authority.empty())
+        return false;
+    forwarded_host = socketley::trim_blanks(socketley::take_item(forwarded_host));
+    return same(authority, socketley::trim_blanks(host)) ||
+           (!forwarded_host.empty() && same(authority, forwarded_host));
 }

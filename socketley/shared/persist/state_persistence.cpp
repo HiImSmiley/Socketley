@@ -632,6 +632,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.master_pw = std::string(srv->get_master_pw());
             cfg.http_dir = srv->get_http_dir().string();
             cfg.http_cache = srv->get_http_cache();
+            cfg.origins = std::string(srv->get_origins());
             for (const auto& ut : srv->get_upstream_targets())
                 cfg.upstreams.push_back(ut.address);
             break;
@@ -1024,6 +1025,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("http_dir", cfg.http_dir);
             if (cfg.http_cache)
                 append_bool_field("http_cache", true);
+            if (!cfg.origins.empty())
+                append_str_field("origins", cfg.origins);
             if (!cfg.upstreams.empty())
             {
                 j += "    \"upstreams\": [";
@@ -1456,6 +1459,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
                 cfg.send_to |= 4;
             cfg.http_dir = json_get_string(json, "http_dir");
             cfg.http_cache = json_get_bool(json, "http_cache");
+            cfg.origins = json_get_string(json, "origins");
             cfg.upstreams = json_get_array(json, "upstreams");
             break;
         case runtime_client:

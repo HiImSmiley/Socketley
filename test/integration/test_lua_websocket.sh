@@ -172,7 +172,7 @@ line() {
 }
 
 create_ok "server created with a websocket script" "$BIN" create server ws_srv \
-    -p "$PORT" --mode in --lua "$LUA" -s
+    -p "$PORT" --mode in --lua "$LUA" --origins https://ORIGIN-VALUE -s
 ready_tcp 127.0.0.1 "$PORT" 10 || echo "  NOTE: the server never accepted"
 
 UP=$(python3 "$SOCKETLEY_TMPD/ws.py" "$PORT" 2>&1 || true)

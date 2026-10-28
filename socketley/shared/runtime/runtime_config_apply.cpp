@@ -514,6 +514,8 @@ bool apply_server_config(server_instance& srv, const runtime_config& cfg, bool b
         srv.set_http_dir(cfg.http_dir);
     if (asked("http_cache", cfg.http_cache))
         srv.set_http_cache(cfg.http_cache);
+    if (asked("origins", !cfg.origins.empty()))
+        srv.set_origins(cfg.origins);
     if (!cfg.master_pw.empty())
         srv.set_master_pw(cfg.master_pw);
     // A document that never names the list leaves it, since clearing it would end the server's upstream leg.

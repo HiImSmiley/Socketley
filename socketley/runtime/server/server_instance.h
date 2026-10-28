@@ -768,6 +768,10 @@ public:
     void set_master_pw(std::string_view pw);
     std::string_view get_master_pw() const;
 
+    // The web origins besides its own whose pages may open a WebSocket here, comma-separated, `*` for any.
+    void set_origins(std::string_view list) { m_origins = std::string(list); }
+    std::string_view get_origins() const { return m_origins; }
+
     // HTTP static file serving
     void set_http_dir(std::string_view path);
     const std::filesystem::path& get_http_dir() const;
@@ -1234,6 +1238,7 @@ private:
     // Master mode
     int m_master_fd{-1};
     std::string m_master_pw;
+    std::string m_origins;
     int m_listen_fd;
     // The socket node this run's listener actually bound, deliberately not
     // get_listen_path(), because a runtime edited between start and stop would

@@ -111,6 +111,9 @@ struct runtime_config
     std::string http_dir;
     bool http_cache = false;
 
+    // Server WebSocket origins besides its own
+    std::string origins;
+
     // Server upstreams
     std::vector<std::string> upstreams;
 

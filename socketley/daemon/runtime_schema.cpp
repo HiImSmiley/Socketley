@@ -68,6 +68,7 @@ constexpr row rows[] = {
     {"--master-pw", "S", "text", "Master password", "The password that claims master mode.", "Server"},
     {"--no-master-pw", "S", "switch", "No master password", "Take the master password away, which ends master mode.", "Server"},
     {"--cache", "S", "text", "Cache", "A cache runtime its scripts and clients use.", "Server", {}, "store"},
+    {"--origins", "S", "list", "Web origins", "The pages besides its own a browser may open a WebSocket from; * for any.", "Server", {}, "https://app.example.com"},
     {"-u", "S", "list", "Upstreams", "Servers it relays to, host:port each.", "Server", {}, "10.0.0.5:9000", "--upstream"},
 
     // ── client ──────────────────────────────────────────────────────────────
