@@ -174,6 +174,10 @@ elif phase == "after":
     cr = st["role"]
     r3 = mk("s3", (cr["AccessKeyId"], cr["SecretAccessKey"]), cr["SessionToken"])
     check("and a role's session", code(lambda: r3.delete_object(Bucket="data", Key="g2")), "ok")
+    iam.put_user_policy(UserName="alice", PolicyName="mk", PolicyDocument=doc("Allow", "s3:CreateBucket", "*"))
+    settle()
+    check("alice makes a bucket of her own", code(lambda: a3.create_bucket(Bucket="alice-kept")), "ok")
+    iam.delete_user_policy(UserName="alice", PolicyName="mk")
     check("a user with a key is DeleteConflict", code(lambda: iam.delete_user(UserName="alice")), "DeleteConflict")
     iam.delete_access_key(UserName="alice", AccessKeyId=alice[0])
     settle()
@@ -182,6 +186,20 @@ elif phase == "after":
     iam.delete_user_policy(UserName="alice", PolicyName="read")
     iam.remove_user_from_group(UserName="alice", GroupName="writers")
     check("a user with nothing left is deleted", code(lambda: iam.delete_user(UserName="alice")), "ok")
+    settle()
+    check("but no new user takes the name while a bucket names it its owner",
+          code(lambda: iam.create_user(UserName="alice")), "EntityAlreadyExists")
+    iam.create_user(UserName="erin")
+    check("nor does a rename", code(lambda: iam.update_user(UserName="erin", NewUserName="alice")), "EntityAlreadyExists")
+    s3.delete_bucket(Bucket="alice-kept")
+    # Each shard lets go of the bucket in its own time, and the IAM call may reach either.
+    got = "none"
+    for _ in range(20):
+        settle()
+        got = code(lambda: iam.create_user(UserName="alice"))
+        if got != "EntityAlreadyExists":
+            break
+    check("which is free once the bucket is gone", got, "ok")
     iam.delete_role_policy(RoleName="cleaner", PolicyName="d")
     iam.delete_role(RoleName="cleaner")
     settle()

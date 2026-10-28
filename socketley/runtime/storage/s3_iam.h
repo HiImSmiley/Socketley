@@ -154,9 +154,10 @@ struct iam_result
 using iam_fields = std::vector<std::pair<std::string, std::string>>;
 
 // Runs `action` with `fields` on `s` at `now_ms`; `taken(id)` says whether a user id is already the credentials
-// file's, so the API makes none of the same name.
+// file's and `owns(id)` whether a bucket's recorded owner is that id, so the API gives no user either name.
 iam_result iam_apply(iam_state& s, std::string_view action, const iam_fields& fields, int64_t now_ms,
-                     std::string_view request_id, bool (*taken)(void*, std::string_view), void* taken_ctx);
+                     std::string_view request_id, bool (*taken)(void*, std::string_view),
+                     bool (*owns)(void*, std::string_view), void* taken_ctx);
 
 // The resources an IAM request acts on, each after "arn:aws:iam::<account>:" as user/<path><name>, group/... or
 // role/..., and one empty string for an action on none, such as ListUsers.

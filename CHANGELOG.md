@@ -69,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Content-Length<VT>` or a NUL in a response field name framed the answer one
   way for the proxy and another for a lenient client; such a backend socket
   is now relayed to its close and not reused.
+- **A user's name is no new user's while a bucket names it its owner.** A
+  bucket records its owner by user name, so once that user was deleted, renamed
+  or removed from the credentials file, an invitation or a CreateUser of the same
+  name made a user with full control of the bucket; CreateUser, invitations and
+  UpdateUser now refuse such a name with EntityAlreadyExists until the bucket is
+  gone.
 - **No rename makes a user named `socketley`.** UpdateUser's NewUserName was
   checked against the IAM and credentials-file users only, so a delegate allowed
   UpdateUser on `user/*` could rename itself to the default owner's name and own

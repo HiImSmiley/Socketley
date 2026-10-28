@@ -189,9 +189,17 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
                     refuse(" on " + t + ", an admin, whom only an admin may change");
         }
         if (res.ok)
-            res = iam_apply(st, action, *f, now_ms, c->req.request_id,
-                            [](void* a, std::string_view id) { return static_cast<authenticator*>(a)->file_user(id); },
-                            m_auth);
+            res = iam_apply(
+                st, action, *f, now_ms, c->req.request_id,
+                [](void* a, std::string_view id) { return static_cast<storage_run*>(a)->m_auth->file_user(id); },
+                [](void* a, std::string_view id)
+                {
+                    for (const bucket_info& b : static_cast<storage_run*>(a)->m_store.buckets())
+                        if (b.owner == id)
+                            return true;
+                    return false;
+                },
+                this);
         // A node of a cluster notes when the document changed, so the one changed last is every node's.
         if (res.ok && res.changed)
         {

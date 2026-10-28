@@ -664,6 +664,7 @@ struct api
     int64_t now;
     std::string_view rid;
     bool (*taken)(void*, std::string_view);
+    bool (*owns)(void*, std::string_view);
     void* ctx;
     iam_result r;
 
@@ -882,11 +883,11 @@ struct api
         x += "</LoginProfile>";
     }
 
-    // Whether no user may be given the name `n`, made or renamed: the default owner's is a name too, and every bucket
-    // recorded with no owner belongs to it.
+    // Whether no user may be given the name `n`, made or renamed: a bucket's owner is recorded by name, so one a bucket
+    // still names is taken, as is the default owner's, which every bucket recorded with none belongs to.
     bool name_taken(const std::string& n) const
     {
-        return s.users.count(n) || (taken && taken(ctx, n)) || n == default_owner;
+        return s.users.count(n) || (taken && taken(ctx, n)) || n == default_owner || (owns && owns(ctx, n));
     }
 
     // A user made by an invitation or by CreateUser, its name checked and taken by none.
@@ -1612,9 +1613,10 @@ bool iam_defaults_to_caller(std::string_view action)
 }
 
 iam_result iam_apply(iam_state& s, std::string_view action, const iam_fields& fields, int64_t now_ms,
-                     std::string_view request_id, bool (*taken)(void*, std::string_view), void* taken_ctx)
+                     std::string_view request_id, bool (*taken)(void*, std::string_view),
+                     bool (*owns)(void*, std::string_view), void* taken_ctx)
 {
-    api x{s, action, fields, now_ms, request_id, taken, taken_ctx, {}};
+    api x{s, action, fields, now_ms, request_id, taken, owns, taken_ctx, {}};
     x.run();
     return x.r;
 }
