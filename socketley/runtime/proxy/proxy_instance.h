@@ -117,6 +117,8 @@ struct proxy_exchange
     // wider, and these five went to byte 2032, where the request's own fields already lay.
     int backend_fd{-1};
     bool header_parsed{false};
+    // How much of an unfinished head was already scanned, so the next read resumes there and not from the start.
+    size_t head_scanned{0};
     bool response_started{false};
     bool client_conn_close{false};  // client sent Connection: close
     // Answered on our own account with the request possibly still arriving,

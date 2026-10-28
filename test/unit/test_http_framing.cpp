@@ -39,6 +39,25 @@ TEST_CASE("a request whose Content-Length is spelled with a CR for its hyphen is
     CHECK(t.content_length == 5);
 }
 
+TEST_CASE("a head checked a byte at a time from where the last check stopped is judged as it is whole")
+{
+    const char* const heads[] = {
+        "GET / HTTP/1.1\r\nHost: h\r\n\r\n", "GET / HTTP/1.1\r\nHost: h\n\r\n", "GET / HTTP/1.1\rHost: h\r\n",
+        "GET / HTTP/1.1\r\n\nHost: h\r\n", "\nGET /", "GET /\r", "GET /\r\r\n", "\r\n\r\n"};
+    for (const std::string_view whole : heads)
+        for (const bool complete : {false, true})
+        {
+            size_t passed = 0;
+            bool ok = true;
+            for (size_t n = 1; n <= whole.size() && ok; ++n)
+            {
+                ok = http_eol_framing_ok(whole.substr(0, n), complete && n == whole.size(), passed);
+                passed = n;
+            }
+            CHECK(ok == http_eol_framing_ok(whole, complete));
+        }
+}
+
 TEST_CASE("an Authorization scheme is matched in any case and its credentials trimmed")
 {
     std::string_view cred;

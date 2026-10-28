@@ -237,10 +237,11 @@ inline bool http_status_code(std::string_view line, uint16_t& out)
 
 // A header block that is not strictly CRLF-framed is refused, because leniency
 // this proxy and its backend choose differently is request smuggling, and
-// until `complete` a trailing CR is a split CRLF rather than a verdict.
-inline bool http_eol_framing_ok(std::string_view bytes, bool complete)
+// until `complete` a trailing CR is a split CRLF rather than a verdict, with
+// `from` the length an earlier call passed, whose last byte alone is read again.
+inline bool http_eol_framing_ok(std::string_view bytes, bool complete, size_t from = 0)
 {
-    for (size_t i = 0; i < bytes.size(); i++)
+    for (size_t i = from > 0 ? std::min(from, bytes.size()) - 1 : 0; i < bytes.size(); i++)
     {
         if (bytes[i] == '\n')
         {

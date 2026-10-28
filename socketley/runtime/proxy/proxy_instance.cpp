@@ -4483,7 +4483,10 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     // The header block ends at the first blank line, which under the rule
     // above is "\r\n\r\n" and no other, so until it turns up every byte
     // received is still header.
-    const auto hdr_end = conn->partial.find("\r\n\r\n");
+    // Resumed where the last read left off, less the three bytes a split terminator could have begun with, because
+    // a head sent a byte at a time and rescanned whole on each one costs the square of its length.
+    const size_t resume = std::min(conn->ex.head_scanned, conn->partial.size());
+    const auto hdr_end = conn->partial.find("\r\n\r\n", resume > 3 ? resume - 3 : 0);
     const bool block_complete = (hdr_end != std::string::npos);
     const size_t scan_len = block_complete ? hdr_end : conn->partial.size();
 
@@ -4491,7 +4494,7 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     // included, because a bare LF put a whole header line inside conn->ex.version
     // and sent it on the request line.
     if (SOCKETLEY_UNLIKELY(!http_eol_framing_ok(
-            std::string_view(conn->partial.data(), scan_len), block_complete)))
+            std::string_view(conn->partial.data(), scan_len), block_complete, std::min(resume, scan_len))))
         return http_request_parse::invalid;
 
     // Ready means the whole header block and not just the request line,
@@ -4499,7 +4502,11 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     // client's real headers were forwarded as a body the backend read as a
     // second request.
     if (!block_complete)
+    {
+        conn->ex.head_scanned = scan_len;
         return http_request_parse::need_more;
+    }
+    conn->ex.head_scanned = 0;
 
     const auto pos = conn->partial.find("\r\n");   // exists: "\r\n\r\n" contains it
     std::string_view line(conn->partial.data(), pos);
@@ -8304,6 +8311,7 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     }
 
     cconn->ex.header_parsed = false;
+    cconn->ex.head_scanned = 0;
     cconn->ex.response_started = false;
     cconn->kept_alive = true;
     cconn->ex.reissue_ok = false;

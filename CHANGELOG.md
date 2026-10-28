@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `nosniff` and a sandboxing Content-Security-Policy, a type a browser would
   run is sent as an attachment, and an anonymous GET takes no `response-*`
   override.
+- **A head arriving in small pieces is scanned once.** Each read of an
+  unfinished request head searched it again from its first byte, so a head sent
+  a byte at a time cost the square of its length; the scan now resumes where
+  the last one stopped.
 - **HTTP/1.0 with Transfer-Encoding is refused.** The proxy forwarded such a
   request as it came, though a 1.0 backend may read no chunks and take the body
   for the next request (RFC 9112 6.1); it is now answered 400.
