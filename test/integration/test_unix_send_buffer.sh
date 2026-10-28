@@ -57,6 +57,11 @@ if [ "$WANT" -eq "$WDEF" ]; then
 fi
 
 daemon_start "$BIN"
+# The daemon's own socket is listed with no skmem where the kernel has no unix_diag, and then nothing here can be read.
+if ! ss -xmaH 2>/dev/null | grep -q '\btb[0-9]'; then
+    echo "  SKIP: ss -xm reads no unix socket's buffer here (the kernel has no CONFIG_UNIX_DIAG)"
+    exit 0
+fi
 D="$SOCKETLEY_TMPD"
 P=$((SL_PORT_BASE + 1790))
 RTDIR="$SOCKETLEY_SOCKET.rt"
