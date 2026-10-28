@@ -70,6 +70,8 @@ constexpr int     code_free     = 5;
 constexpr int     code_tries    = 3;
 constexpr int64_t known_secs    = 90 * 86400;
 constexpr std::string_view known_cookie_name = "skl_idp_known";
+// Why a change that waited on a field still holding a value was not made.
+constexpr std::string_view changed_meanwhile = "the account changed meanwhile";
 
 std::string peer_text(const sockaddr_storage& a)
 {
@@ -864,17 +866,21 @@ void idp_run::code_page(const std::shared_ptr<conn>& c, const std::string& pendi
     respond(c, status, "text/html; charset=utf-8", page("Sign in", body));
 }
 
-bool idp_run::code_right(const account& a, std::string_view code)
+void idp_run::check_code(const account& a, std::string_view code, std::function<void(bool)> then)
 {
     std::string secret;
-    if (!base32_decode(a.field("totp"), secret))
-        return false;
-    uint64_t& last = m_totp_used[a.id];
-    const uint64_t step = totp_step(secret, code, wall::now_sec(), last);
+    const std::string was(a.field("totp_step"));
+    uint64_t last = 0;
+    std::from_chars(was.data(), was.data() + was.size(), last);
+    const uint64_t step = base32_decode(a.field("totp"), secret) ? totp_step(secret, code, wall::now_sec(), last) : 0;
     if (!step)
-        return false;
-    last = step;
-    return true;
+    {
+        then(false);
+        return;
+    }
+    // Taken only while the step kept is the one read here, so the same code sent to two shards at once is taken once.
+    update_account(a.id, {{"?totp_step", was}, {"totp_step", std::to_string(step)}},
+                   [then = std::move(then)](bool ok, const std::string&) { then(ok); });
 }
 
 void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, params p)
@@ -912,39 +918,57 @@ void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, par
                   429);
         return;
     }
-    if (!code_right(*a, param(p, "code")))
+    std::weak_ptr<conn> weak = c;
+    c->waiting = true;
+    check_code(*a, param(p, "code"), [this, weak, token, ip, acct, now](bool right)
     {
-        ++m_c.refused;
-        // A few wrong codes end the sign-in, whose password must then be given again.
-        const bool ended = ++it->second.misses >= code_tries;
-        const params back = it->second.p;
-        if (ended)
-            m_pending.erase(it);
-        std::weak_ptr<conn> weak = c;
-        c->waiting = true;
-        missed(ip, acct, now, [this, weak, token, ended, back] {
-            auto c2 = weak.lock();
-            if (!c2 || c2->dead)
-                return;
-            c2->waiting = false;
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        // Looked up again, as another request may have ended it while the code was taken.
+        const auto pit = m_pending.find(token);
+        const account* who = pit == m_pending.end() ? nullptr : m_accounts.by_id(pit->second.id);
+        if (!who)
+        {
+            cc->waiting = false;
+            login_page(cc, {}, "The sign-in took too long; sign in again.", 401);
+            m_http.resume(cc);
+            return;
+        }
+        if (!right)
+        {
+            ++m_c.refused;
+            // A few wrong codes end the sign-in, whose password must then be given again.
+            const bool ended = ++pit->second.misses >= code_tries;
+            const params back = pit->second.p;
             if (ended)
-                login_page(c2, back, "That code was wrong too many times; sign in again.", 401);
-            else
-                code_page(c2, token, "That code is not the one the app shows.", 401);
-            m_http.resume(c2);
-        });
-        return;
-    }
-    const params carried = it->second.p;
-    const bool remember = it->second.remember;
-    m_pending.erase(it);
-    if (a->field("reset") == "1")
-    {
-        reset_after_sign_in(c, *a, carried, remember);
-        return;
-    }
-    signed_in(*a, ip, "with password and code");
-    grant(c, carried, *a, session_cookie(*a, remember));
+                m_pending.erase(pit);
+            missed(ip, acct, now, [this, weak, token, ended, back] {
+                auto c2 = weak.lock();
+                if (!c2 || c2->dead)
+                    return;
+                c2->waiting = false;
+                if (ended)
+                    login_page(c2, back, "That code was wrong too many times; sign in again.", 401);
+                else
+                    code_page(c2, token, "That code is not the one the app shows.", 401);
+                m_http.resume(c2);
+            });
+            return;
+        }
+        const params carried = pit->second.p;
+        const bool remember = pit->second.remember;
+        m_pending.erase(pit);
+        cc->waiting = false;
+        if (who->field("reset") == "1")
+            reset_after_sign_in(cc, *who, carried, remember);
+        else
+        {
+            signed_in(*who, ip, "with password and code");
+            grant(cc, carried, *who, session_cookie(*who, remember));
+        }
+        m_http.resume(cc);
+    });
 }
 
 void idp_run::reset_after_sign_in(const std::shared_ptr<conn>& c, const account& a, const params& p, bool remember)
@@ -2060,9 +2084,9 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
         {
             const auto it = m_enrolling.find(id);
             std::string secret;
-            uint64_t last = 0;
-            if (it == m_enrolling.end() || !base32_decode(it->second.first, secret) ||
-                !totp_step(secret, param(p, "code"), now, last))
+            const uint64_t step = it == m_enrolling.end() || !base32_decode(it->second.first, secret)
+                                      ? 0 : totp_step(secret, param(p, "code"), now, 0);
+            if (!step)
             {
                 account_page(c, rq, {}, "That code is not the one the app shows; turn it on again.", 400);
                 m_enrolling.erase(id);
@@ -2071,18 +2095,26 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
             const std::string key = it->second.first;
             m_enrolling.erase(it);
             c->waiting = true;
-            update_account(id, {{"totp", key}}, saved("Two-step sign-in is on."));
+            // The code that turned it on is taken, so it signs nobody in after.
+            update_account(id, {{"totp", key}, {"totp_step", std::to_string(step)}}, saved("Two-step sign-in is on."));
             return;
         }
         if (what == "off")
         {
-            if (!code_right(*who, param(p, "code")))
-            {
-                account_page(c, rq, {}, "That code is not the one the app shows.", 400);
-                return;
-            }
             c->waiting = true;
-            update_account(id, {{"totp", ""}}, saved("Two-step sign-in is off."));
+            check_code(*who, param(p, "code"), [this, weak, rq, id, saved](bool right) {
+                auto cc = weak.lock();
+                if (!cc || cc->dead)
+                    return;
+                if (!right)
+                {
+                    cc->waiting = false;
+                    account_page(cc, rq, {}, "That code is not the one the app shows.", 400);
+                    m_http.resume(cc);
+                    return;
+                }
+                update_account(id, {{"totp", ""}}, saved("Two-step sign-in is off."));
+            });
             return;
         }
     }
@@ -2904,13 +2936,28 @@ void idp_run::on_request_reply(uint64_t cookie, request_status st, std::string_v
     then(st == request_status::ok, reply);
 }
 
+bool idp_run::write_account(const std::string& id, const field_list& fields, std::string& why)
+{
+    const account* a = m_accounts.by_id(id);
+    field_list set;
+    for (const auto& [k, v] : fields)
+        if (!k.starts_with('?'))
+            set.emplace_back(k, v);
+        else if (!a || a->field(std::string_view(k).substr(1)) != v)
+        {
+            why = std::string(changed_meanwhile);
+            return false;
+        }
+    return m_accounts.update(id, set, why);
+}
+
 void idp_run::update_account(const std::string& id, field_list fields,
                              std::function<void(bool, const std::string&)> then)
 {
     if (!m_reader)
     {
         std::string why;
-        const bool ok = m_accounts.update(id, fields, why);
+        const bool ok = write_account(id, fields, why);
         publish_accounts();
         then(ok, why);
         return;
@@ -2963,7 +3010,7 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
         case shard_call::update:
         {
             std::string why;
-            const bool ok = !m_reader && m_accounts.update(call.key, call.fields, why);
+            const bool ok = !m_reader && write_account(call.key, call.fields, why);
             if (m_reader)
                 why = "the accounts are written by shard 0";
             publish_accounts();

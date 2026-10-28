@@ -161,14 +161,15 @@ private:
         int misses{0};
     };
     std::unordered_map<std::string, pending_sign_in> m_pending;
-    // The last step of each account's codes taken, so one code is taken once; and a secret an account is enrolling.
-    std::unordered_map<std::string, uint64_t> m_totp_used;
+    // A secret an account is enrolling, until a code of it proves the app has it.
     std::unordered_map<std::string, std::pair<std::string, int64_t>> m_enrolling;
     void code_page(const std::shared_ptr<conn>& c, const std::string& pending, std::string_view error, int status);
     void second_step(const std::shared_ptr<conn>& c, const request& rq, params p);
     void security_post(const std::shared_ptr<conn>& c, const request& rq);
     std::string security_html(const account& who);
-    bool code_right(const account& a, std::string_view code);
+    // Whether `code` is the account's now and of a later step than the last it took, that step kept with the account
+    // by shard 0, so a code is taken once at every shard and across a restart.
+    void check_code(const account& a, std::string_view code, std::function<void(bool)> then);
     // A scrypt hash of `password` made on the hash pool, empty when it could not be.
     void hash_password(std::string_view password, std::function<void(std::string)> then);
 
@@ -204,8 +205,11 @@ private:
     // Whether a token given at `issued`, in milliseconds, still holds: the account was not signed out everywhere since.
     static bool still_signed_in(const account& who, int64_t issued);
 
-    // Fields of an account set by shard 0, here or asked of it, with `then` called once this shard reads the change.
+    // Fields of an account set by shard 0, here or asked of it, with `then` called once this shard reads the change; a
+    // field named ?<name> sets nothing and makes the change wait on <name> still holding that value.
     void update_account(const std::string& id, field_list fields, std::function<void(bool, const std::string&)> then);
+    // The change update_account() asks, made here at shard 0.
+    bool write_account(const std::string& id, const field_list& fields, std::string& why);
     // Asks shard `shard`, with `then` called on its answer, or with false when it gave none.
     bool cross(uint32_t shard, const shard_call& call, std::function<void(bool, std::string_view)> then);
     // Shard 0's journal as far as it has written it: said to the other shards, which read it before every answer.

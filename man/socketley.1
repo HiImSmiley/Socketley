@@ -1029,7 +1029,8 @@ prints the fields, the password as set and never its hash.
 .B totp on
 turns on a second step of signing in: it prints the key, and the otpauth://
 link that gives it to an authenticator app, and from then on a web sign-in asks
-the six digits the app shows after the password, a code taken once (RFC 6238);
+the six digits the app shows after the password, a code taken once at every
+shard and across a restart, the last step taken kept with the account (RFC 6238);
 .B off
 turns it off.
 .B app\-password add

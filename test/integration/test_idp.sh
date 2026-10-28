@@ -13,6 +13,7 @@
 #   * a refresh for an account disabled, signed out everywhere or made to reset its password since
 #   * a password that must be reset letting the account in before it is
 #   * the signing key changing across a restart, which would sign every user out
+#   * a code of the second step taken again after a restart
 #   * a storage's users not coming over with the passwords they have there
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a return address a browser reads as another host's, by a backslash in its host
@@ -449,7 +450,32 @@ elif phase == "limits":
     check("five wrong codes at an account hold up its next code, a right one too",
           (st, "wrong codes" in body, h.get("Set-Cookie")), (429, True, None))
 
+elif phase == "replay":
+    import hmac, struct, hashlib, time, re
+    def totp_now(key):
+        k = base64.b32decode(key.replace(" ", "").upper() + "=" * (-len(key.replace(" ", "")) % 8))
+        h = hmac.new(k, struct.pack(">Q", int(time.time()) // 30), hashlib.sha1).digest()
+        o = h[-1] & 15
+        return "%06d" % ((struct.unpack(">I", h[o:o + 4])[0] & 0x7fffffff) % 1000000)
+    # Early in a step, so the code still holds once the runtime is back.
+    if time.time() % 30 > 10:
+        time.sleep(30 - time.time() % 30 + 0.5)
+    key = open(tmpd + "/lea.key").read().strip()
+    E = {"X-Forwarded-For": "198.51.100.70"}
+    body = req("POST", "/login", dict(rd="/", username="lea", password="leapassword123"), headers=E)[1]
+    pending = (re.search(r'name="pending" value="([0-9a-f]+)"', body) or [None, ""])[1]
+    code = totp_now(key)
+    st, _, h = req("POST", "/login", dict(rd="/", pending=pending, code=code), headers=E)
+    check("a code signs in", (st, (h.get("Set-Cookie") or "").startswith("skl_idp=")), (302, True))
+    json.dump({"code": code}, open(tmpd + "/lea.json", "w"))
+
 elif phase == "restarted":
+    # First, while the code taken before the restart still holds.
+    E = {"X-Forwarded-For": "198.51.100.71"}
+    body = req("POST", "/login", dict(rd="/", username="lea", password="leapassword123"), headers=E)[1]
+    pending = (re.search(r'name="pending" value="([0-9a-f]+)"', body) or [None, ""])[1]
+    st, _, h = req("POST", "/login", dict(rd="/", pending=pending, code=json.load(open(tmpd + "/lea.json"))["code"]), headers=E)
+    check("a code taken before a restart is not taken again after it", (st, h.get("Set-Cookie")), (401, None))
     s = json.load(open(state_file))
     k = json.loads(req("GET", "/jwks")[1])["keys"][0]
     check("the signing key survives a restart, so tokens given before still verify", k["kid"], s["kid"])
@@ -480,6 +506,10 @@ for u in gus ivy jon kim; do "$BIN" idp-user auth add "$u" --password "${u}passw
 [ -s "$T/kim.key" ] && ok || bad "a second step is turned on for the limits' checks" "no key"
 tally < <(run limits)
 
+"$BIN" idp-user auth add lea --password leapassword123 >/dev/null 2>&1
+"$BIN" idp-user auth totp lea on 2>&1 | sed -n 's/^key: //p' > "$T/lea.key"
+tally < <(run replay)
+
 "$BIN" stop auth >/dev/null 2>&1
 "$BIN" start auth >/dev/null 2>&1
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PI/jwks")" = 200 ] && break; sleep 0.1; done
@@ -506,7 +536,7 @@ expect "but to one under the cookie domain" \
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
 STATS=$("$BIN" stats auth 2>/dev/null)
-case "$STATS" in *"accounts:9"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+case "$STATS" in *"accounts:10"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]

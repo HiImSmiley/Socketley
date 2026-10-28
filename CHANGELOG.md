@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   name under the domain, and a browser, reading the backslash as a slash, went
   to evil.example after signing in or out; a return address's host may now hold
   only letters, digits, `.-_` and a port.
+- **An authenticator code signs in once, anywhere.** The idp remembered the
+  last code taken in each shard's memory, so the same code signed in again at
+  another shard or after a restart; the step is now kept with the account and
+  taken at shard 0 only while it is still the last one there.
 - **Sign-in guesses are bounded at every turn.** The idp counted a failure
   only once its hash was done, so guesses sent together from one address
   were all checked; it now counts those in flight, an IPv6 address by its

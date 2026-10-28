@@ -8,6 +8,7 @@
 #   * a change made with idp-user, or on the account page at a reading shard, not seen at once by every shard
 #   * a reading shard losing the accounts when shard 0 folds its journal into a snapshot
 #   * an address barred at one shard trying its five again at each of the others
+#   * one code of the second step signing in once at each shard
 #   * the accounts or the key lost when the runtime restarts with another number of shards
 set -uo pipefail
 
@@ -152,6 +153,33 @@ elif phase == "compact":
     check("a thousand changes are taken", failed, 0)
     check("and every shard reads the last of them past the snapshot", [userinfo(s["access"]) for _ in range(8)], ["N1099"] * 8)
 
+elif phase == "replay":
+    import hmac, struct, hashlib, time, re
+    def totp_now(key):
+        k = base64.b32decode(key.replace(" ", "").upper() + "=" * (-len(key.replace(" ", "")) % 8))
+        h = hmac.new(k, struct.pack(">Q", int(time.time()) // 30), hashlib.sha1).digest()
+        o = h[-1] & 15
+        return "%06d" % ((struct.unpack(">I", h[o:o + 4])[0] & 0x7fffffff) % 1000000)
+    # Away from a step's edge, so every try below gives the one code.
+    if time.time() % 30 > 20:
+        time.sleep(30 - time.time() % 30 + 0.5)
+    key = open(tmpd + "/tia.key").read().strip()
+    code = totp_now(key)
+    taken = 0
+    for i in range(8):
+        # The password and the code on one connection, as the waiting sign-in is its shard's; each a shard of its own.
+        c = http.client.HTTPConnection("127.0.0.1", int(pi), timeout=10)
+        h = {"X-Forwarded-For": "198.51.100.%d" % (100 + i), "Content-Type": "application/x-www-form-urlencoded"}
+        c.request("POST", "/login", urllib.parse.urlencode(dict(rd="/", username="tia", password="tiapassword123")), h)
+        r = c.getresponse()
+        pending = (re.search(r'name="pending" value="([0-9a-f]+)"', r.read().decode()) or [None, ""])[1]
+        c.request("POST", "/login", urllib.parse.urlencode(dict(rd="/", pending=pending, code=code)), h)
+        r = c.getresponse()
+        r.read()
+        taken += r.status == 302
+        c.close()
+    check("one code signs in once, whichever shard it is given to", taken, 1)
+
 elif phase == "barred":
     for _ in range(5):
         req("POST", "/authorize", dict(auth, username="bob", password="wrongpassword"), headers={"X-Forwarded-For": "198.51.100.7"})
@@ -192,6 +220,10 @@ r=$(echo "$s" | sum_of reopened)
 [ "$r" -gt 0 ] && ok || bad "the reading shards read the accounts again after the snapshot" "reopened $r"
 out=$("$BIN" idp-user auth show alice 2>&1)
 case "$out" in *"name: N1099"*) ok ;; *) bad "shard 0 keeps the last change" "$out" ;; esac
+
+"$BIN" idp-user auth add tia --password tiapassword123 >/dev/null 2>&1
+"$BIN" idp-user auth totp tia on 2>&1 | sed -n 's/^key: //p' > "$T/tia.key"
+tally < <(run replay)
 
 tally < <(run barred)
 
