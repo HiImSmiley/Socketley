@@ -127,6 +127,34 @@ if out != "no node":
           all(not fetch.search(o["css"]) for o in out[1:6]) and all(o["blocked"] for o in out[1:5]), out)
     check("while @import goes and a shown image's url( stays", out and "evil" not in out[6]["css"] and "color:red" in out[6]["css"]
           and "url(https://ok.test/g.png)" in out[7]["css"], out)
+# Its image URLs, read as the browser reads them: a control character, a backslash or a newline hides no remote image.
+img_js = script.decode("utf-8", "replace")
+img_js = img_js[img_js.find("function imageUrl"):img_js.find("function cleanHtml(")] if "function imageUrl" in img_js else ""
+harness = img_js + r"""
+const base = 'https://mail.example.test/', cids = { part1: '/jmap/download/a/b/x.png' };
+const cases = [['\x01https://tracker.test/1.gif', false], ['\\\\tracker.test/2.gif', false], ['/\\tracker.test/3.gif', false],
+  ['/\n/tracker.test/4.gif', false], [' \x1f//tracker.test/5.gif\x02', false], ['https://ok.test/6.png', true],
+  ['http://ok.test/7.png', true], ['cid:<Part1>', false], ['/jmap/download/a/b/y.png', false], ['data:image/png;base64,AA', false]];
+console.log(JSON.stringify(cases.map(([v, images]) => imageUrl(v, images, cids, base))));
+"""
+try:
+    out = json.loads(subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20).stdout) if img_js else None
+except FileNotFoundError:
+    out = "no node"
+except (ValueError, subprocess.SubprocessError):
+    out = None
+if out != "no node":
+    check("with images blocked a remote image hidden by a control character, a backslash or a newline is dropped and counted",
+          out and all(o["url"] is None and o["remote"] for o in out[:5]), out)
+    check("a shown one goes by https, and a cid, one of here and data: are kept", out and
+          out[5]["url"] == "https://ok.test/6.png" and out[6]["url"] == "https://ok.test/7.png" and
+          out[7]["url"] == "/jmap/download/a/b/x.png" and out[8]["url"] == "https://mail.example.test/jmap/download/a/b/y.png" and
+          out[9]["url"] == "data:image/png;base64,AA" and not any(o["remote"] for o in out[7:]), out)
+clean_js = script.decode("utf-8", "replace")
+clean_js = clean_js[clean_js.find("function cleanHtml("):clean_js.find("// The quotes of what a reply answers")]
+check("an SVG animation, which could set an href, is taken out, and the frame refuses remote images while they are blocked",
+      ",animate,set,animateMotion,animateTransform," in clean_js and
+      "Content-Security-Policy\" content=\"img-src \\'self\\' data: blob:\"" in clean_js, clean_js[:200])
 st2, _, body2 = web("GET", "/", headers={"If-None-Match": h.get("etag", "x")})
 check("a browser's copy is answered 304", st2 == 304 and not body2, st2)
 

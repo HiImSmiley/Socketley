@@ -126,6 +126,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   standing for all, so a Deny on deleting a prefix's objects was passed over
   and they went with the bucket; each version is now judged as its own
   DeleteObjectVersion, and one refused keeps the library, answered 409.
+- **The webmail's hidden images stay hidden.** An image URL was judged
+  remote only by a leading `https://` or `//`, so `&#1;https://...`,
+  `\\host/...` and a `//` split by a newline, which the browser reads as
+  remote, and an SVG `<animate>` of an `href` loaded a tracking pixel with
+  images off; URLs are now read as the browser reads them, SVG animation is
+  removed, and the message's frame refuses images not of the webmail while
+  they are blocked.
 - **A References header of millions of ids makes a hundred strings.** An
   APPEND or a delivered message of 25 MiB of `<a>` built a string for every
   id on the loop, about 0.8 GB, to keep the first, and SORT and THREAD kept

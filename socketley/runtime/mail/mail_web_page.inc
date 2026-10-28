@@ -539,9 +539,20 @@ function cssClean(t, images) {
   if (!images) t = t.replace(CSS_FETCH, () => { blocked++; return 'none('; });
   return { css: t.replace(/</g, '\\3c '), blocked };
 }
+// What an image's URL in a message is shown as: a cid its part, one of here, data: or blob: as it is, another only while
+// images are shown; read as the browser reads it, so no control character or backslash hides where it goes.
+function imageUrl(v, images, cids, base) {
+  v = v.replace(/^[\u0000- ]+|[\u0000- ]+$/g, '');
+  if (/^cid:/i.test(v)) return { url: cids[v.slice(4).replace(/^<|>$/g, '').toLowerCase()] || null, remote: false };
+  let u = null;
+  try { u = new URL(v, base); } catch (e) { return { url: null, remote: false }; }
+  if (u.protocol === 'data:' || u.protocol === 'blob:' || u.origin === new URL(base).origin) return { url: u.href, remote: false };
+  const web = /^https?:$/.test(u.protocol);
+  return { url: images && web ? u.href.replace(/^http:/, 'https:') : null, remote: web };
+}
 function cleanHtml(html, images, cids) {
   const d = new DOMParser().parseFromString(html, 'text/html');
-  d.querySelectorAll('script,iframe,frame,frameset,object,embed,applet,form,input,button,select,textarea,meta,link,base,noscript,template,portal,dialog').forEach(e => e.remove());
+  d.querySelectorAll('script,iframe,frame,frameset,object,embed,applet,form,input,button,select,textarea,meta,link,base,noscript,template,portal,dialog,animate,set,animateMotion,animateTransform,discard').forEach(e => e.remove());
   let blocked = 0;
   const urlish = /^(href|src|action|formaction|background|poster|srcset|xlink:href|data|lowsrc|dynsrc|cite|longdesc|ping)$/;
   for (const e of d.querySelectorAll('*')) {
@@ -552,9 +563,9 @@ function cleanHtml(html, images, cids) {
     }
     if (e.localName === 'a' && e.hasAttribute('href')) { e.setAttribute('target', '_blank'); e.setAttribute('rel', 'noopener noreferrer'); }
     for (const at of /^(image|use|feimage)$/.test(e.localName.toLowerCase()) ? ['src', 'background', 'poster', 'href', 'xlink:href'] : ['src', 'background', 'poster']) {
-      const v = (e.getAttribute(at) || '').trim(); if (!v) continue;
-      if (/^cid:/i.test(v)) { const u = cids[v.slice(4).replace(/^<|>$/g, '').toLowerCase()]; if (u) e.setAttribute(at, u); else e.removeAttribute(at); }
-      else if (/^(https?:)?\/\//i.test(v)) { if (images) e.setAttribute(at, v.replace(/^(http:)?\/\//i, 'https://')); else { e.removeAttribute(at); blocked++; } }
+      if (!e.hasAttribute(at)) continue;
+      const c = imageUrl(e.getAttribute(at), images, cids, location.href);
+      if (c.url) e.setAttribute(at, c.url); else { e.removeAttribute(at); if (c.remote) blocked++; }
     }
     if (e.hasAttribute('srcset') && !images) { e.removeAttribute('srcset'); blocked++; }
     const st = e.getAttribute('style');
@@ -586,7 +597,9 @@ function cleanHtml(html, images, cids) {
     }
   const t = getComputedStyle(document.documentElement), v = (n, d) => t.getPropertyValue(n).trim() || d;
   const dark = painted ? '' : 'html,body{background:transparent;color:' + v('--fg', '#eef0f7') + ';color-scheme:dark}body{padding:2px 0}blockquote{border-left-color:rgba(255,255,255,.18);color:' + v('--mut', '#9aa2b8') + '}a{color:' + v('--a1', '#c084fc') + '}';
-  return { doc: '<!doctype html><html><head><meta charset="utf-8"><style>' + FRAME_CSS + dark + '</style><style>' + css + '</style></head><body>' + (d.body ? d.body.innerHTML : '') + '</body></html>', blocked, dark: !painted };
+  // The frame refuses any image not of here while they are blocked, whatever the cleaning above missed.
+  const shut = images ? '' : '<meta http-equiv="Content-Security-Policy" content="img-src \'self\' data: blob:">';
+  return { doc: '<!doctype html><html><head><meta charset="utf-8">' + shut + '<style>' + FRAME_CSS + dark + '</style><style>' + css + '</style></head><body>' + (d.body ? d.body.innerHTML : '') + '</body></html>', blocked, dark: !painted };
 }
 // The quotes of what a reply answers, as Gmail, Outlook, Apple Mail and Thunderbird mark them.
 const QUOTES = 'blockquote[type=cite],.gmail_quote,.gmail_extra,#divRplyFwdMsg,#divRplyFwdMsg~*,#appendonsend~*,.moz-cite-prefix,.yahoo_quoted,#mail-editor-reference-message-container';
