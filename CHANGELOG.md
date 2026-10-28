@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **No user takes the buckets' default owner.** An invitation or CreateUser
   could make a user named `socketley`, the owner every bucket with none
   recorded belongs to, and so own all of them; the name is refused.
+- **A return address with a backslash in its host is refused.** With
+  `--cookie-domain` set, `rd=https://evil.example%5C.example.com/` passed as a
+  name under the domain, and a browser, reading the backslash as a slash, went
+  to evil.example after signing in or out; a return address's host may now hold
+  only letters, digits, `.-_` and a port.
 - **A forced password reset asks for the second step first.** Setting a new
   password without a session took a username and the old password alone and
   signed the account in, skipping its authenticator code, and for any account,

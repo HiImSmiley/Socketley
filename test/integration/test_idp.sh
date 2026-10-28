@@ -13,6 +13,7 @@
 #   * the signing key changing across a restart, which would sign every user out
 #   * a storage's users not coming over with the passwords they have there
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
+#   * a return address a browser reads as another host's, by a backslash in its host
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -374,6 +375,22 @@ for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://12
 tally < <(run restarted)
 AFTER=$("$BIN" idp-user auth show alice 2>&1)
 case "$AFTER" in "id: $ALICE"*"game.class: mage"*) ok ;; *) bad "an account keeps its id and its fields across a restart" "$AFTER" ;; esac
+
+# ── A provider sharing its sign-in under a cookie domain sends a browser nowhere outside it ──
+P2=$((SL_PORT_BASE + 1965))
+"$BIN" create idp auth2 -p "$P2" --issuer "https://auth.example.com" --cookie-domain example.com -s >/dev/null 2>&1 \
+    && ok || bad "an idp with --cookie-domain is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$P2/jwks")" = 200 ] && break; sleep 0.1; done
+EVIL='https%3A%2F%2Fevil.example%5C.example.com%2F'
+expect "a return address whose host a backslash ends, which a browser reads as a slash, is refused" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$P2/login?rd=$EVIL")" 400
+expect "one on a name under the cookie domain is not" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$P2/login?rd=https%3A%2F%2Fapp.example.com%2Fx")" 200
+expect "a sign-out sends a browser to no such address" \
+    "$(curl -s -o /dev/null -w '%{redirect_url}' "http://127.0.0.1:$P2/logout?post_logout_redirect_uri=$EVIL")" ""
+expect "but to one under the cookie domain" \
+    "$(curl -s -o /dev/null -w '%{redirect_url}' "http://127.0.0.1:$P2/logout?post_logout_redirect_uri=https%3A%2F%2Fapp.example.com%2Fx")" \
+    "https://app.example.com/x"
 
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac

@@ -244,6 +244,11 @@ std::string url_host(std::string_view url)
     // Credentials in an address are a way to make it read as another host.
     if (authority.find('@') != std::string_view::npos || authority.empty())
         return {};
+    // A browser reads a backslash as a slash and drops tabs, so a host is held to the letters a name or address has.
+    for (const char c : authority)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != '_' && c != ':' && c != '[' &&
+            c != ']')
+            return {};
     std::string_view host = authority;
     if (host.front() == '[')
     {

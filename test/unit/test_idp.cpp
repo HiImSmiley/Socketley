@@ -98,6 +98,14 @@ TEST_CASE("a browser is sent back only to the provider's host or the cookie doma
     CHECK_FALSE(return_allowed("/\n/evil.example", iss, ""));
     CHECK(url_host("https://[::1]:8443/cb") == "[::1]");
     CHECK(url_host("https://[::1]evil.example/cb").empty());
+    // A browser reads the backslash as a slash and goes to evil.example.
+    CHECK_FALSE(return_allowed("https://evil.example\\.example.com/", iss, "example.com"));
+    CHECK_FALSE(return_allowed("https://evil.example\\@app.example.com/", iss, "example.com"));
+    CHECK_FALSE(return_allowed("https://evil.example%2f.example.com/", iss, "example.com"));
+    CHECK(url_host("https://evil.example\\.example.com/").empty());
+    CHECK(url_host("https://a b.example.com/").empty());
+    CHECK(url_host("https://\xe2\x84\x80.example.com/").empty());
+    CHECK(return_allowed("https://app.example.com:8443/x?y=\\", iss, "example.com"));
 }
 
 TEST_CASE("a token verifies with its own key and fails every way it was not made")
