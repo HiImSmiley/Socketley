@@ -77,11 +77,9 @@ out=$("$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX" 2>&1
     && ok || bad "an edge that forwards for the idp's people is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for _ in $(seq 1 50); do ss -ltn "sport = :$PE" | grep -q LISTEN && break; sleep 0.1; done
 
-login_as() {   # login_as <user> <password> <client, or empty for the default> <config dir>
-    XDG_CONFIG_HOME="$4" "$BIN" login "$I" ${3:+--client "$3"} > "$T/login.out" 2>&1 &
-    local pid=$!
-    for _ in $(seq 1 50); do grep -q "allow the code" "$T/login.out" && break; sleep 0.1; done
-    python3 - "$PI" "$(sed -n 's/^and allow the code //p' "$T/login.out")" "$1" "$2" <<'PY' >/dev/null 2>&1
+allow_code() {   # allow_code <file the code is printed to> <user> <password>: as a browser signed in would
+    for _ in $(seq 1 50); do grep -q "allow the code" "$1" && break; sleep 0.1; done
+    python3 - "$PI" "$(sed -n 's/^and allow the code //p' "$1")" "$2" "$3" <<'PY' >/dev/null 2>&1
 import sys, urllib.request, urllib.parse, urllib.error
 I = "http://127.0.0.1:%s" % sys.argv[1]
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -97,6 +95,11 @@ def post(path, form, cookie=None):
 cookie = (post("/login", {"username": sys.argv[3], "password": sys.argv[4]}).get("Set-Cookie") or "").split(";")[0]
 post("/device", {"user_code": sys.argv[2], "action": "allow"}, cookie)
 PY
+}
+login_as() {   # login_as <user> <password> <client, or empty for the default> <config dir>
+    XDG_CONFIG_HOME="$4" "$BIN" login "$I" ${3:+--client "$3"} > "$T/login.out" 2>&1 &
+    local pid=$!
+    allow_code "$T/login.out" "$1" "$2"
     for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     wait "$pid"
 }
@@ -126,9 +129,17 @@ out=$(printf 'asked the edge' | "$BIN" tunnel connect "http://127.0.0.1:$PE" "12
 out=$("$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"only an admin"*) true ;; *) false ;; esac && ok || bad "someone who is no admin adds no agent" "rc $rc: $out"
 [ -z "$("$BIN" tunnel e list)" ] && ok || bad "and the edge holds none" "$("$BIN" tunnel e list)"
+# Signed in nowhere here, the join signs in for itself and keeps nothing of an admin's sign-in once it is done.
+mkdir -p "$T/fresh"
+XDG_CONFIG_HOME="$T/fresh" "$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" > "$T/join.out" 2>&1 &
+jp=$!
+allow_code "$T/join.out" boss bosspassword1
+for _ in $(seq 1 150); do kill -0 "$jp" 2>/dev/null || break; sleep 0.1; done
+wait "$jp"; rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 "$T/join.out")" = "https://web" ] && ok \
+    || bad "an admin's join makes the agent and says where its service is" "rc $rc: $(cat "$T/join.out")"
+[ -z "$(find "$T/fresh" -type f)" ] && ok || bad "and no sign-in is left behind" "$(find "$T/fresh" -type f)"
 login_as boss bosspassword1 "" "$T/boss" && ok || bad "an admin signs in" "$(cat "$T/login.out")"
-out=$(XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" 2>&1); rc=$?
-[ "$rc" -eq 0 ] && [ "$out" = "https://web" ] && ok || bad "an admin's join makes the agent and says where its service is" "rc $rc: $out"
 for _ in $(seq 1 50); do "$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth$" && break; sleep 0.1; done
 "$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth$" && ok \
     || bad "the agent joins, its service asking visitors to sign in at the edge's idp" "$("$BIN" tunnel e list)"

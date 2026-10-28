@@ -39,8 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   answered by the dns runtime, a name a runtime has staying that runtime's, and
   its TCP services on ports of their own; nothing is opened on the router.
   `socketley tunnel join <edge> --http ollama=127.0.0.1:11434` on the machine
-  at home is all it takes: an admin of the edge's idp, signed in there by a
-  code allowed in a browser, adds the agent, and the agent runtime is made and
+  at home is all it takes: an admin of the edge's idp, signed in for that join
+  alone by a code allowed in a browser and kept nowhere, adds the agent, and the agent runtime is made and
   joins, its services asking visitors to sign in. Without an idp,
   `socketley tunnel <edge> invite` prints an invitation the agent joins with
   once, in exchange for a key of its own; `set` changes what it offers,

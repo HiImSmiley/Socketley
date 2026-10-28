@@ -419,19 +419,10 @@ int join_main(int argc, char** argv)
         std::cout << err << "\n";
         return 2;
     }
-    // Signed in here first, the way `socketley login` does, when this machine holds no sign-in yet.
+    // A sign-in kept here is used; else one for this join alone, kept nowhere, since an admin's would outlive it.
     if (!cli_access_token(idp, token, err))
-    {
-        std::string a0 = "socketley", a1 = "login";
-        char* login_argv[] = {a0.data(), a1.data(), idp.data(), nullptr};
-        if (const int rc = cli_login(3, login_argv); rc != 0)
+        if (const int rc = cli_sign_in_once(idp, token); rc != 0)
             return rc;
-        if (!cli_access_token(idp, token, err))
-        {
-            std::cout << err << "\n";
-            return 1;
-        }
-    }
     int status = 0;
     std::string invitation;
     if (!ask_edge(ea, "POST /.tunnel/join HTTP/1.1\r\nHost: " + ea.authority + "\r\nAuthorization: Bearer " + token +

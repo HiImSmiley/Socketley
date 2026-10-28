@@ -147,8 +147,9 @@ bool discover(https_client::client& h, const std::string& issuer, std::string& t
     return !token_url.empty();
 }
 
-// The tokens of a token endpoint's answer kept as `k`'s, the refresh token kept when none came with them.
-bool take_tokens(const jvalue& d, kept& k, std::string& err)
+// The tokens of a token endpoint's answer kept as `k`'s, the refresh token kept when none came with them, and
+// written to disk unless `keep` is false.
+bool take_tokens(const jvalue& d, kept& k, std::string& err, bool keep = true)
 {
     const std::string_view access = string_of(d, "access_token");
     if (access.empty())
@@ -160,10 +161,95 @@ bool take_tokens(const jvalue& d, kept& k, std::string& err)
     if (const std::string_view r = string_of(d, "refresh_token"); !r.empty())
         k.refresh_token.assign(r);
     k.expires = now_s() + int_of(d, "expires_in", 3600);
-    return write_kept(k, err);
+    return !keep || write_kept(k, err);
+}
+
+// The device grant: a code shown here and allowed in a browser, its tokens in `k`, kept on disk only when `keep`.
+int device_sign_in(const std::string& given, const std::string& client, bool keep, kept& k)
+{
+    const std::string issuer = issuer_of(given);
+    https_client::client h;
+    std::string err, token_url, device_url;
+    if (!h.init(err) || !discover(h, issuer, token_url, device_url, err))
+    {
+        std::cout << err << "\n";
+        return 2;
+    }
+    if (device_url.empty())
+    {
+        std::cout << issuer << " offers no device sign-in\n";
+        return 2;
+    }
+    int status = 0;
+    jvalue d;
+    // A sign-in not kept asks for no refresh token, so nothing outlives the access token's hour.
+    const std::string scope = keep ? "openid offline_access" : "openid";
+    if (!ask(h, device_url, "client_id=" + form_value(client) + "&scope=" + form_value(scope), status, d, err))
+    {
+        std::cout << err << "\n";
+        return 2;
+    }
+    if (status != 200)
+    {
+        std::cout << issuer << " refused the sign-in: " << string_of(d, "error_description") << "\n";
+        return 1;
+    }
+    const std::string device_code(string_of(d, "device_code"));
+    const std::string user_code(string_of(d, "user_code"));
+    const std::string page(string_of(d, "verification_uri_complete").empty() ? string_of(d, "verification_uri")
+                                                                              : string_of(d, "verification_uri_complete"));
+    int64_t interval = std::max<int64_t>(int_of(d, "interval", 5), 1);
+    const int64_t until = now_s() + int_of(d, "expires_in", 600);
+    std::cout << "Open " << page << "\nand allow the code " << user_code << "\n" << std::flush;
+
+    k.issuer = issuer;
+    k.client_id = client;
+    while (now_s() < until)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(interval));
+        if (!ask(h, token_url, "grant_type=" + form_value("urn:ietf:params:oauth:grant-type:device_code") +
+                                   "&client_id=" + form_value(client) + "&device_code=" + form_value(device_code),
+                 status, d, err))
+        {
+            std::cout << err << "\n";
+            return 2;
+        }
+        if (status == 200)
+        {
+            if (!take_tokens(d, k, err, keep))
+            {
+                std::cout << err << "\n";
+                return 2;
+            }
+            return 0;
+        }
+        const std::string_view e = string_of(d, "error");
+        if (e == "authorization_pending")
+            continue;
+        if (e == "slow_down")
+        {
+            interval += 5;
+            continue;
+        }
+        std::cout << (e == "access_denied" ? std::string("the code was refused")
+                                           : e == "expired_token" ? std::string("the code expired")
+                                                                  : std::string(string_of(d, "error_description")))
+                  << "\n";
+        return 1;
+    }
+    std::cout << "the code expired before it was allowed\n";
+    return 1;
 }
 
 }   // namespace
+
+int cli_sign_in_once(const std::string& given, std::string& token)
+{
+    kept k;
+    const int rc = device_sign_in(given, std::string(socketley::idp::cli_client), false, k);
+    token = rc == 0 ? k.access_token : std::string();
+    return rc;
+}
 
 bool cli_access_token(const std::string& given, std::string& token, std::string& err)
 {
@@ -223,78 +309,8 @@ int cli_login(int argc, char** argv)
         std::cout << "usage: socketley login <idp address> [--client <id>]\n";
         return 1;
     }
-    const std::string issuer = issuer_of(given);
-    https_client::client h;
-    std::string err, token_url, device_url;
-    if (!h.init(err) || !discover(h, issuer, token_url, device_url, err))
-    {
-        std::cout << err << "\n";
-        return 2;
-    }
-    if (device_url.empty())
-    {
-        std::cout << issuer << " offers no device sign-in\n";
-        return 2;
-    }
-    int status = 0;
-    jvalue d;
-    if (!ask(h, device_url, "client_id=" + form_value(client) + "&scope=" + form_value("openid offline_access"),
-             status, d, err))
-    {
-        std::cout << err << "\n";
-        return 2;
-    }
-    if (status != 200)
-    {
-        std::cout << issuer << " refused the sign-in: " << string_of(d, "error_description") << "\n";
-        return 1;
-    }
-    const std::string device_code(string_of(d, "device_code"));
-    const std::string user_code(string_of(d, "user_code"));
-    const std::string page(string_of(d, "verification_uri_complete").empty() ? string_of(d, "verification_uri")
-                                                                              : string_of(d, "verification_uri_complete"));
-    int64_t interval = std::max<int64_t>(int_of(d, "interval", 5), 1);
-    const int64_t until = now_s() + int_of(d, "expires_in", 600);
-    std::cout << "Open " << page << "\nand allow the code " << user_code << "\n" << std::flush;
-
     kept k;
-    k.issuer = issuer;
-    k.client_id = client;
-    while (now_s() < until)
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(interval));
-        if (!ask(h, token_url, "grant_type=" + form_value("urn:ietf:params:oauth:grant-type:device_code") +
-                                   "&client_id=" + form_value(client) + "&device_code=" + form_value(device_code),
-                 status, d, err))
-        {
-            std::cout << err << "\n";
-            return 2;
-        }
-        if (status == 200)
-        {
-            if (!take_tokens(d, k, err))
-            {
-                std::cout << err << "\n";
-                return 2;
-            }
-            return 0;
-        }
-        const std::string_view e = string_of(d, "error");
-        if (e == "authorization_pending")
-            continue;
-        if (e == "slow_down")
-        {
-            interval += 5;
-            continue;
-        }
-        std::cout << (e == "access_denied" ? std::string("the code was refused")
-                                           : e == "expired_token" ? std::string("the code expired")
-                                                                  : std::string(string_of(d, "error_description")))
-                  << "\n";
-        return 1;
-    }
-    std::cout << "the code expired before it was allowed\n";
-    return 1;
+    return device_sign_in(given, client, true, k);
 }
 
 int cli_logout(int argc, char** argv)

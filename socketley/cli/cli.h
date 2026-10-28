@@ -41,6 +41,8 @@ int cli_logout(int argc, char** argv);
 // The access token of the person signed in at the idp `issuer`, refreshed when it has run out; false with `err`
 // telling them to sign in.
 bool cli_access_token(const std::string& issuer, std::string& token, std::string& err);
+// A device sign-in for one command: its access token, kept nowhere and with no refresh token; the exit code.
+int cli_sign_in_once(const std::string& issuer, std::string& token);
 // `socketley ssh-cert` and `idp-ssh`, in cli_ssh.cpp.
 int cli_ssh_cert(int argc, char** argv);
 int cli_idp_ssh(int argc, char** argv);

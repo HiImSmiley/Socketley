@@ -492,8 +492,8 @@ cli_commands() {
     echo ""
 
     echo -e "${BOLD}tunnel join <edge> [--name <agent>] --http <service>=<host:port> --tcp <service:port>=<host:port>${NC}"
-    echo "  This machine made an agent of an edge, by an admin of its idp: signed"
-    echo "  in here first if need be, the agent runtime is made and joins at once."
+    echo "  This machine made an agent of an edge, by an admin of its idp, signed"
+    echo "  in for this join alone and kept nowhere; the agent joins at once."
     echo "  Its HTTP services ask visitors to sign in until the edge's owner says"
     echo "  otherwise with set. Prints where each service is."
     echo -e "  ${CYAN}socketley tunnel join https://edge.example.com --http ollama=127.0.0.1:11434${NC}"
