@@ -143,9 +143,14 @@ enum class st : uint8_t
     invalid_bucket_state,
     // The write would take the bucket, or the user who owns it, past its quota.
     quota_exceeded,
+    // A new object's key is not well-formed UTF-8, which every listing would write out as it is.
+    invalid_key_name,
 };
 
 const char* status_name(st s);
+
+// Whether `key` may name a new object: st::ok, st::key_too_long for none or past max_key_bytes, or st::invalid_key_name.
+st key_name_status(std::string_view key);
 
 // The smallest string greater than every string that begins with `s`, empty
 // when there is none because `s` is all 0xFF bytes.

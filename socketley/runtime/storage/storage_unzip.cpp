@@ -10,6 +10,7 @@
 #include "sse.h"
 #include "tierer.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/utf8.h"
 #include "../../shared/json/json_escape.h"
 
 namespace socketley::storage
@@ -82,30 +83,6 @@ std::string from_cp437(std::string_view s)
         }
     }
     return o;
-}
-
-bool valid_utf8(std::string_view s)
-{
-    for (size_t i = 0; i < s.size();)
-    {
-        const auto b = static_cast<uint8_t>(s[i]);
-        const size_t n = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 0;
-        if (n == 0 || i + n > s.size())
-            return false;
-        uint32_t cp = n == 1 ? b : n == 2 ? (b & 0x1f) : n == 3 ? (b & 0x0f) : (b & 0x07);
-        for (size_t k = 1; k < n; ++k)
-        {
-            if ((static_cast<uint8_t>(s[i + k]) & 0xc0) != 0x80)
-                return false;
-            cp = (cp << 6) | (static_cast<uint8_t>(s[i + k]) & 0x3f);
-        }
-        // The shortest form only, and no surrogate or code point past U+10FFFF, as RFC 3629 allows.
-        static constexpr uint32_t least[] = {0, 0, 0x80, 0x800, 0x10000};
-        if (cp < least[n] || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff)
-            return false;
-        i += n;
-    }
-    return true;
 }
 
 // An entry's name as a path under the folder: its parts without empty ones or ".", backslashes taken for the slashes
@@ -825,7 +802,7 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
                         }
                         at += 46 + nlen + xlen + clen;
                         if (name.empty())
-                            name = (flags & 0x0800) || valid_utf8(raw) ? std::string(raw) : from_cp437(raw);
+                            name = (flags & 0x0800) || utf8::valid(raw) ? std::string(raw) : from_cp437(raw);
                         e.name = name;
                         const std::string path = clean_path(name, e.dir);
                         const std::string_view last = std::string_view(path).substr(path.rfind('/') + 1);
@@ -842,7 +819,7 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
                         }
                         e.key = j->prefix + path + (e.dir ? "/" : "");
                         // Encrypted, or packed some way other than stored or deflated, it cannot be opened here.
-                        if (e.key.size() > key_max || !valid_utf8(e.key) || (flags & 1) || (e.method != 0 && e.method != 8) ||
+                        if (e.key.size() > key_max || !utf8::valid(e.key) || (flags & 1) || (e.method != 0 && e.method != 8) ||
                             (!e.dir && (e.local > size || size - e.local < 30)) || (e.method == 0 && e.csize != e.usize) ||
                             !app_allowed(cc, "PUT", j->bucket, e.key))
                         {

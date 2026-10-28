@@ -531,9 +531,9 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
         cb(st::no_such_bucket, {});
         return;
     }
-    if (key.empty() || key.size() > max_key_bytes)
+    if (const st bad = key_name_status(key); bad != st::ok)
     {
-        cb(st::key_too_long, {});
+        cb(bad, {});
         return;
     }
 

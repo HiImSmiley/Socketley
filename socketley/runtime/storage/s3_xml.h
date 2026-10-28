@@ -174,6 +174,12 @@ inline s3_error error_for(st s)
         case st::bad_digest:          return make_error("BadDigest");
         case st::storage_full:        return make_error("StorageFull");
         case st::quota_exceeded:      return make_error("QuotaExceeded");
+        case st::invalid_key_name:
+        {
+            s3_error e = make_error("InvalidArgument");
+            e.message  = "Object key is not valid UTF-8.";
+            return e;
+        }
         case st::busy:                return make_error("OperationAborted");
         // A part whose upload was aborted while its body was arriving, which is
         // the only way a cancelled body still has someone to answer.

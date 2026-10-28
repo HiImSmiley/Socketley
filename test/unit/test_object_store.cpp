@@ -1398,6 +1398,18 @@ TEST_CASE("an object too large for a single put is refused before a byte is take
     CHECK_FALSE(op);
     CHECK(why == st::key_too_long);
 
+    // A key every listing writes out as it is must be UTF-8 a parser takes: no stray byte, overlong form or surrogate.
+    for (const std::string_view bad : {std::string_view("a\xff" "b"), std::string_view("\xc0\xaf"),
+                                       std::string_view("\xed\xa0\x80"), std::string_view("caf\xc3")})
+    {
+        CHECK(key_name_status(bad) == st::invalid_key_name);
+        op = r.store->begin_put("bkt", bad, {}, 1, true, why);
+        CHECK_FALSE(op);
+        CHECK(why == st::invalid_key_name);
+    }
+    CHECK(key_name_status("caf\xc3\xa9/\xf0\x9f\x93\x81 \x01") == st::ok);
+    CHECK(key_name_status("") == st::key_too_long);
+
     object_meta big;
     big.extra = {{"x-amz-meta-x", std::string(9000, 'v')}};
     op = r.store->begin_put("bkt", "k", big, 1, true, why);

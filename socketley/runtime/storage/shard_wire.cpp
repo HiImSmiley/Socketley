@@ -61,7 +61,7 @@ bool get_origin(bytes::reader& r, change_origin& who)
 bool status_byte(bytes::reader& r, st& s)
 {
     uint8_t b = 0;
-    if (!r.u8(b) || b > static_cast<uint8_t>(st::quota_exceeded))
+    if (!r.u8(b) || b > static_cast<uint8_t>(st::invalid_key_name))
         return false;
     s = static_cast<st>(b);
     return true;

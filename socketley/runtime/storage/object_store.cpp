@@ -28,6 +28,7 @@
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/utf8.h"
 
 namespace socketley::storage
 {
@@ -88,8 +89,16 @@ const char* status_name(st s)
         case st::locked:              return "locked";
         case st::invalid_bucket_state: return "invalid bucket state";
         case st::quota_exceeded:      return "quota exceeded";
+        case st::invalid_key_name:    return "invalid key name";
     }
     return "unknown";
+}
+
+st key_name_status(std::string_view key)
+{
+    if (key.empty() || key.size() > max_key_bytes)
+        return st::key_too_long;
+    return utf8::valid(key) ? st::ok : st::invalid_key_name;
 }
 
 object_store::object_store(event_loop& loop, file_io& io, store_options opts)
@@ -2607,9 +2616,9 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         why = st::no_such_bucket;
         return nullptr;
     }
-    if (key.empty() || key.size() > max_key_bytes)
+    if (const st bad = key_name_status(key); bad != st::ok)
     {
-        why = st::key_too_long;
+        why = bad;
         return nullptr;
     }
     // Tags have limits of their own, checked where they are parsed.
@@ -2693,9 +2702,9 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
         cb({st::no_such_bucket, meta});
         return;
     }
-    if (dst_key.empty() || dst_key.size() > max_key_bytes)
+    if (const st bad = key_name_status(dst_key); bad != st::ok)
     {
-        cb({st::key_too_long, meta});
+        cb({bad, meta});
         return;
     }
 

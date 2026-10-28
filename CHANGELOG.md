@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Content-Length<VT>` or a NUL in a response field name framed the answer one
   way for the proxy and another for a lenient client; such a backend socket
   is now relayed to its close and not reused.
+- **An object key is UTF-8.** A PUT, POST, copy or multipart upload took any
+  bytes as its key, `%FF` included, and ListObjects wrote them out raw in a
+  document it declares UTF-8, so one writer made the bucket's listing
+  unparseable for every client not asking for `encoding-type=url`; such a key
+  is now 400 InvalidArgument. Keys already stored can still be deleted.
 - **A grant by e-mail names nobody when two users give the address.** An
   invitee chose its own e-mail, unchecked, and a grant by that address went to
   the first user holding it by id, so one invited as `aaron` with the address
