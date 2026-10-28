@@ -1809,19 +1809,107 @@ void idp_run::device_page(const std::shared_ptr<conn>& c, const request& rq, std
     const params q = parse_form(rq.method == "POST" ? rq.body : rq.query);
     const std::string_view name = who->field("name").empty() ? who->username() : who->field("name");
     std::string body = "<h1>Sign in a device</h1>";
+    // A code the address carried is only filled in: what it allows is shown, and allowed, on the next page.
     if (!note.empty())
         body += "<p>" + html_escape(note) + "</p><p class=\"mut\">You can close this page.</p>";
     else
         body += "<p class=\"mut\">Signed in as <b>" + html_escape(name) +
-                "</b>. Allow only a code that a device of yours shows you right now; whoever holds the device signs "
-                "in as you.</p><form method=\"post\" action=\"/device\"><label for=\"u\">Code</label><input "
-                "class=\"inp\" id=\"u\" type=\"text\" name=\"user_code\" autocomplete=\"off\" autocapitalize=\"characters\" autofocus "
-                "required value=\"" + html_escape(param(q, "user_code")) + "\">" +
+                "</b>. Give the code a device of yours shows you right now; the next page says which application "
+                "asks and what it may do before anything is allowed.</p><form method=\"post\" action=\"/device\">"
+                "<label for=\"u\">Code</label><input class=\"inp\" id=\"u\" type=\"text\" name=\"user_code\" "
+                "autocomplete=\"off\" autocapitalize=\"characters\" autofocus required value=\"" +
+                html_escape(param(q, "user_code")) + "\">" +
                 (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
-                "<div class=\"acts\"><button class=\"btn pri\" type=\"submit\" name=\"action\" value=\"allow\">Allow"
-                "</button><button class=\"btn\" type=\"submit\" name=\"action\" value=\"deny\">Refuse</button></div>"
-                "</form>";
+                "<button class=\"btn pri\" type=\"submit\" name=\"action\" value=\"look\">Continue</button></form>";
     respond(c, status, "text/html; charset=utf-8", page("Sign in a device", body));
+}
+
+bool idp_run::device_needs_proof(const device_entry& e) const
+{
+    const auto it = std::find_if(m_clients.begin(), m_clients.end(), [&](const client& cl) { return cl.id == e.client_id; });
+    return m_ssh_ca && it != m_clients.end() && it->ssh;
+}
+
+void idp_run::device_confirm(const std::shared_ptr<conn>& c, const account& who, const std::string& user_code,
+                             const device_entry& e, std::string_view error, int status)
+{
+    const std::string_view name = who.field("name").empty() ? who.username() : who.field("name");
+    const std::string shown = user_code.size() == 8 ? user_code.substr(0, 4) + "-" + user_code.substr(4) : user_code;
+    std::string body = "<h1>Allow this device?</h1><p class=\"mut\">Signed in as <b>" + html_escape(name) +
+                       "</b>.</p><p>The application <b>" + html_escape(e.client_id) +
+                       "</b> asks, for the device showing <code>" + html_escape(shown) + "</code>, to act as you" +
+                       (has_scope(e.scope, "offline_access") ? " until you sign out everywhere" : " for an hour") +
+                       ".</p>";
+    const bool proof = device_needs_proof(e);
+    if (proof)
+    {
+        const std::vector<std::string> as = ssh_principals(who);
+        std::string names;
+        for (size_t i = 0; i < as.size(); ++i)
+            names += (i == 0 ? "" : i + 1 == as.size() ? " and " : ", ") + std::string("<b>") + html_escape(as[i]) + "</b>";
+        body += "<p class=\"err\">It can also get SSH certificates for your servers, logging in to them as " + names +
+                (who.in_group("admins") ? ", root being one: whoever holds the device has every server" : "") +
+                ".</p>";
+    }
+    body += "<p class=\"mut\">Allow it only if you started this sign-in yourself, just now, on a device in front of "
+            "you. If someone sent you this link or this code, refuse it.</p><form method=\"post\" action=\"/device\">"
+            "<input type=\"hidden\" name=\"user_code\" value=\"" + html_escape(user_code) + "\">";
+    if (proof && !who.field("totp").empty())
+        body += "<label for=\"tc\">The code your authenticator app shows, to allow it</label><input class=\"inp\" "
+                "id=\"tc\" type=\"text\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" required>";
+    else if (proof)
+        body += "<label for=\"pw\">Your password, to allow it</label><input class=\"inp\" id=\"pw\" type=\"password\" "
+                "name=\"password\" autocomplete=\"current-password\" required>";
+    body += (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
+            "<div class=\"acts\"><button class=\"btn pri\" type=\"submit\" name=\"action\" value=\"allow\">Allow"
+            "</button><button class=\"btn\" type=\"submit\" name=\"action\" value=\"deny\" formnovalidate>Refuse"
+            "</button></div></form>";
+    respond(c, status, "text/html; charset=utf-8", page("Allow this device?", body));
+}
+
+void idp_run::find_device(const std::string& normal, int64_t now, std::function<void(bool, const device_entry&)> then)
+{
+    const uint32_t keeper = user_code_shard(normal, m_shards);
+    if (keeper == m_shard)
+    {
+        const auto u = m_user_codes.find(normal);
+        const auto d = u == m_user_codes.end() ? m_devices.end() : m_devices.find(u->second);
+        const bool found = d != m_devices.end() && d->second.expires > now && d->second.state == device_entry::pending;
+        then(found, found ? d->second : device_entry{});
+        return;
+    }
+    const bool asked = cross(keeper, shard_call{shard_call::device_peek, normal, {}, now},
+                             [then](bool answered, std::string_view reply) {
+        device_poll what = device_poll::gone;
+        device_entry e;
+        if (!answered || !decode_device(reply, what, e))
+            what = device_poll::gone;
+        then(what == device_poll::pending, e);
+    });
+    if (!asked)
+        then(false, {});
+}
+
+void idp_run::decide_at(const std::string& normal, bool allow, const std::string& sub, int64_t now,
+                        std::function<void(bool)> then)
+{
+    const uint32_t keeper = user_code_shard(normal, m_shards);
+    if (keeper == m_shard)
+    {
+        then(decide_device(normal, allow, sub, now));
+        return;
+    }
+    const bool asked = cross(keeper, shard_call{shard_call::device_decide, normal,
+                                                {{"allow", allow ? "1" : "0"}, {"sub", sub}}, now},
+                             [then](bool answered, std::string_view reply) {
+        bool ok = false;
+        std::string why;
+        if (!answered || !decode_result(reply, ok, why))
+            ok = false;
+        then(ok);
+    });
+    if (!asked)
+        then(false);
 }
 
 void idp_run::device_post(const std::shared_ptr<conn>& c, const request& rq)
@@ -1842,53 +1930,137 @@ void idp_run::device_post(const std::shared_ptr<conn>& c, const request& rq)
     }
     const params p = parse_form(rq.body);
     const std::string normal = normal_user_code(param(p, "user_code"));
-    const bool allow = param(p, "action") == "allow";
-    const std::string sub = who->id, user(who->username());
-    // A code that is no code at all is answered at once and counts like a wrong one.
-    const auto decided = [this, ip, now, allow, user, normal](const std::shared_ptr<conn>& cc, const request& r,
-                                                              bool ok)
-    {
-        if (!ok)
-        {
-            missed(ip, {}, now, [] {});
-            device_page(cc, r, {}, "That code is not known or has expired.", 400);
-            return;
-        }
-        LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": \"" + user + "\" " +
-                  (allow ? "allowed" : "refused") + " a device sign-in from " + ip).c_str());
-        device_page(cc, r, allow ? "The device is signed in." : "The device was refused.", {}, 200);
+    const std::string action(param(p, "action"));
+    const std::string id = who->id, user(who->username());
+    std::weak_ptr<conn> weak = c;
+    // The connection answered and let go on, once whatever it waited on is done.
+    const auto done = [this](const std::shared_ptr<conn>& cc) {
+        cc->waiting = false;
+        m_http.resume(cc);
+    };
+    // A code that is no grant's counts like a wrong one.
+    const auto unknown = [this, ip, now](const std::shared_ptr<conn>& cc, const request& r) {
+        missed(ip, {}, now, [] {});
+        device_page(cc, r, {}, "That code is not known or has expired.", 400);
     };
     if (normal.empty())
     {
-        decided(c, rq, false);
+        unknown(c, rq);
         return;
     }
-    const uint32_t keeper = user_code_shard(normal, m_shards);
-    if (keeper == m_shard)
+    c->waiting = true;
+    if (action == "deny")
     {
-        decided(c, rq, decide_device(normal, allow, sub, now));
+        decide_at(normal, false, id, now, [this, weak, rq, ip, user, unknown, done](bool ok) {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (!ok)
+                unknown(cc, rq);
+            else
+            {
+                LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": \"" + user + "\" refused a device sign-in from " + ip).c_str());
+                device_page(cc, rq, "The device was refused.", {}, 200);
+            }
+            done(cc);
+        });
         return;
     }
-    std::weak_ptr<conn> weak = c;
-    const bool asked = cross(keeper, shard_call{shard_call::device_decide, normal,
-                                                {{"allow", allow ? "1" : "0"}, {"sub", sub}}, now},
-                             [this, weak, rq, decided](bool answered, std::string_view reply)
-    {
+    find_device(normal, now, [this, weak, rq, p, normal, action, id, user, ip, now, unknown, done](
+                                 bool found, const device_entry& e) {
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
-        cc->waiting = false;
-        bool ok = false;
-        std::string why;
-        if (!answered || !decode_result(reply, ok, why))
-            ok = false;
-        decided(cc, rq, ok);
-        m_http.resume(cc);
+        const account* me = m_accounts.by_id(id);
+        if (!found || !me)
+        {
+            unknown(cc, rq);
+            done(cc);
+            return;
+        }
+        // Only a post from the page that said what it allows allows anything.
+        if (action != "allow")
+        {
+            device_confirm(cc, *me, normal, e, {}, 200);
+            done(cc);
+            return;
+        }
+        const auto allow = [this, weak, rq, normal, id, user, ip, now, unknown, done] {
+            decide_at(normal, true, id, now, [this, weak, rq, user, ip, unknown, done](bool ok) {
+                auto c2 = weak.lock();
+                if (!c2 || c2->dead)
+                    return;
+                if (!ok)
+                    unknown(c2, rq);
+                else
+                {
+                    LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": \"" + user + "\" allowed a device sign-in from " + ip).c_str());
+                    device_page(c2, rq, "The device is signed in.", {}, 200);
+                }
+                done(c2);
+            });
+        };
+        if (!device_needs_proof(e))
+        {
+            allow();
+            return;
+        }
+        // Proved again here, as approving it gives SSH certificates: the code where the account has a second step,
+        // the password otherwise, each counted against the account and the address like a sign-in.
+        const bool by_code = !me->field("totp").empty();
+        const std::string acct = account_key(rq, by_code ? "code:" : "", me, {});
+        const auto refused = [this, weak, ip, acct, now, id, normal, e, done](std::string_view why, int status, bool count) {
+            auto c2 = weak.lock();
+            if (!c2 || c2->dead)
+                return;
+            const auto answer = [this, weak, id, normal, e, text = std::string(why), status, done] {
+                auto c3 = weak.lock();
+                if (!c3 || c3->dead)
+                    return;
+                if (const account* a = m_accounts.by_id(id))
+                    device_confirm(c3, *a, normal, e, text, status);
+                else
+                    respond(c3, 401, "text/plain", "the account is no longer one that may sign in\n");
+                done(c3);
+            };
+            if (count)
+                missed(ip, acct, now, answer);
+            else
+                answer();
+        };
+        if (const int64_t wait = m_limits.wait(acct, now, by_code ? code_free : account_free); wait > 0)
+        {
+            ++m_c.barred;
+            refused("Too many failed tries as this user; try again in " + std::to_string(wait) + " seconds.", 429, false);
+            return;
+        }
+        if (by_code)
+        {
+            check_code(*me, param(p, "code"), [allow, refused](bool right) {
+                if (right)
+                    allow();
+                else
+                    refused("That code is not the one the app shows.", 401, true);
+            });
+            return;
+        }
+        if (hashing_full())
+        {
+            refused("Too many sign-ins are being checked; try again in a moment.", 503, false);
+            return;
+        }
+        const std::string addr = address_key(ip);
+        m_limits.begin(addr);
+        m_limits.begin(acct);
+        check_password(me, param(p, "password"), [this, addr, acct, allow, refused](bool right) {
+            m_limits.end(addr);
+            m_limits.end(acct);
+            if (right)
+                allow();
+            else
+                refused("The password is not right.", 401, true);
+        });
     });
-    if (asked)
-        c->waiting = true;
-    else
-        decided(c, rq, false);
 }
 
 bool idp_run::decide_device(const std::string& user_code, bool allow, const std::string& sub, int64_t at)
@@ -3186,6 +3358,16 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
             }
             const bool ok = !sub.empty() && decide_device(call.key, allow == "1", sub, call.at);
             mgr->requests().complete_deferred(ticket, request_status::ok, encode_result(ok, {}));
+            return;
+        }
+        case shard_call::device_peek:
+        {
+            const auto u = m_user_codes.find(call.key);
+            const auto d = u == m_user_codes.end() ? m_devices.end() : m_devices.find(u->second);
+            const bool waiting = d != m_devices.end() && d->second.expires > call.at && d->second.state == device_entry::pending;
+            mgr->requests().complete_deferred(ticket, request_status::ok,
+                                              encode_device(waiting ? device_poll::pending : device_poll::gone,
+                                                            waiting ? &d->second : nullptr));
             return;
         }
         case shard_call::device_ask:

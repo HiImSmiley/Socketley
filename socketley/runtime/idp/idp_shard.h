@@ -66,6 +66,7 @@ struct shard_call
         miss          = 3,   // a sign-in from `key` failed at `at`, told to every other shard
         device_decide = 4,   // the user code `key` allowed or refused (`fields` allow, sub) at `at`
         device_ask    = 5,   // the device code `key` polled by the client `fields` client_id at `at`
+        device_peek   = 6,   // the grant the user code `key` names, if it still waits at `at`
     };
     op_t op{redeem};
     std::string key;
@@ -81,7 +82,8 @@ bool decode_call(std::string_view in, shard_call& out);
 std::string encode_code(const code_entry* e);
 bool decode_code(std::string_view in, bool& found, code_entry& out);
 
-// A device poll's answer: what it came to, and for an approved grant the account, its scope and when it signed in.
+// A device poll's answer: what it came to, and for an approved grant the account, its scope and when it signed in;
+// a peek's, pending with the client and scope of a grant still waiting.
 std::string encode_device(device_poll what, const device_entry* e);
 bool decode_device(std::string_view in, device_poll& what, device_entry& out);
 

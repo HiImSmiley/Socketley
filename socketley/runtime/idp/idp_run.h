@@ -106,6 +106,18 @@ private:
     void device_page(const std::shared_ptr<conn>& c, const request& rq, std::string_view note, std::string_view error,
                      int status);
     void device_post(const std::shared_ptr<conn>& c, const request& rq);
+    // What allowing the grant `e` gives, said before it is allowed, with the password or code asked for where it
+    // reaches the account's servers.
+    void device_confirm(const std::shared_ptr<conn>& c, const account& who, const std::string& user_code,
+                        const device_entry& e, std::string_view error, int status);
+    // Whether allowing the grant `e` asks the person to prove again who they are: a client marked ssh, which can
+    // get SSH certificates naming root for an admin.
+    bool device_needs_proof(const device_entry& e) const;
+    // The waiting grant the user code `normal` names, from the shard that keeps it, `then` told whether there is one.
+    void find_device(const std::string& normal, int64_t now, std::function<void(bool, const device_entry&)> then);
+    // The grant decided at the shard that keeps it, `then` told whether it was waiting.
+    void decide_at(const std::string& normal, bool allow, const std::string& sub, int64_t now,
+                   std::function<void(bool)> then);
     void device_token(const std::shared_ptr<conn>& c, const client& cl, std::string device_code);
     void device_answered(const std::shared_ptr<conn>& c, const client& cl, device_poll what, const device_entry& e);
     // This shard's own grants: a user code decided, and a device code polled.

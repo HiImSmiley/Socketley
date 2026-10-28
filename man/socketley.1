@@ -1062,7 +1062,13 @@ A person signed in at an
 runtime, this machine's or another's, by the device grant (RFC 8628):
 .B login
 prints the address and the code to allow there, waits until a browser signed
-in as that person allows it, and keeps the tokens in
+in as that person allows it \(em the page names the application asking and
+what allowing it gives, and for a client marked
+.B ssh
+under
+.B \-\-ssh\-ca
+says it gets SSH certificates, as root for an admin, and takes the password
+again, or the code where the second step is on \(em and keeps the tokens in
 .I ~/.config/socketley/tokens/
 (0600), from where
 .B ssh\-cert

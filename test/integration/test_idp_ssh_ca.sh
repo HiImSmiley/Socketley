@@ -7,6 +7,7 @@
 #   * a certificate ssh-keygen or sshd does not read, or one naming the wrong principals or lifetime
 #   * a login by the key alone, without the certificate, or by a certificate for a principal sshd does not allow
 #   * a token given to a client not marked `ssh` buying a certificate, or one for a disabled account
+#   * a device allowed for a client marked `ssh` without the page saying so, or without the password given again
 #   * an access token that ran out not being refreshed before the certificate is asked for
 #   * a certificate given on a sign-in older than twelve hours, as a refresh token kept going would give one
 #   * a host certificate a client checking @cert-authority would not take
@@ -73,12 +74,41 @@ def post(path, form, cookie=None):
         with op.open(r) as resp: return resp.headers
     except urllib.error.HTTPError as e: return e.headers
 cookie = (post("/login", {"username": sys.argv[3], "password": sys.argv[4]}).get("Set-Cookie") or "").split(";")[0]
-post("/device", {"user_code": sys.argv[2], "action": "allow"}, cookie)
+post("/device", {"user_code": sys.argv[2], "action": "allow", "password": sys.argv[4]}, cookie)
 PY
     for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     wait "$pid"
 }
 
+# Allowing a client marked ssh says what it gives, root for an admin, and takes the password again.
+python3 - "$PI" > "$T/proof.out" 2>&1 <<'PY'
+import sys, json, urllib.request, urllib.parse, urllib.error
+I = "http://127.0.0.1:%s" % sys.argv[1]
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+op = urllib.request.build_opener(NoRedirect)
+def post(path, form, cookie=None):
+    h = {"Content-Type": "application/x-www-form-urlencoded"}
+    if cookie: h["Cookie"] = cookie
+    r = urllib.request.Request(I + path, data=urllib.parse.urlencode(form).encode(), method="POST", headers=h)
+    try:
+        with op.open(r) as resp: return resp.status, resp.read().decode(), resp.headers
+    except urllib.error.HTTPError as e: return e.code, e.read().decode(), e.headers
+def check(name, got, want):
+    print(("ok " if got == want else "bad ") + name + ("" if got == want else ": got %r, want %r" % (got, want)))
+code = json.loads(post("/device_authorization", {"client_id": "cli", "scope": "openid"})[1])["user_code"]
+cookie = (post("/login", {"username": "alice", "password": "alicepassword1"})[2].get("Set-Cookie") or "").split(";")[0]
+st, body, _ = post("/device", {"user_code": code, "action": "look"}, cookie)
+check("the page says the device gets SSH certificates, as root for an admin, and asks for the password",
+      (st, "SSH certificates" in body, "<b>root</b>" in body, 'name="password"' in body), (200, True, True, True))
+st, body, _ = post("/device", {"user_code": code, "action": "allow"}, cookie)
+check("allowed without the password, nothing is allowed", (st, "signed in" in body, 'name="password"' in body), (401, False, True))
+st, body, _ = post("/device", {"user_code": code, "action": "allow", "password": "wrongpassword"}, cookie)
+check("nor with a wrong one", (st, "signed in" in body), (401, False))
+st, body, _ = post("/device", {"user_code": code, "action": "allow", "password": "alicepassword1"}, cookie)
+check("and with the right one it is", (st, "The device is signed in." in body), (200, True))
+PY
+while read -r v rest; do [ "$v" = ok ] && ok || bad "$rest" ""; done < "$T/proof.out"
 login_as alice alicepassword1 cli "$T/alice" && ok || bad "alice signs in from the command line" "$(cat "$T/login.out")"
 ssh-keygen -q -t ed25519 -N '' -C alice@laptop -f "$T/alice_key"
 XDG_CONFIG_HOME="$T/alice" "$BIN" ssh-cert "$I" --key "$T/alice_key.pub" && [ -f "$T/alice_key-cert.pub" ] && ok \

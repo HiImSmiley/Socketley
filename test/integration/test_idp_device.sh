@@ -7,6 +7,7 @@
 #   * a token handed out before the person allowed the code, or after they refused it, or twice
 #   * a device polling too fast not being told to slow down
 #   * the confirmation page reachable without a session, or a code decided twice
+#   * a code the address carried allowed without a page saying which application asks and what it may do
 #   * a device code redeemed by a client it was not given to
 #   * a grant kept by one shard and allowed or polled at another going astray
 #   * a sign-in or a device decision missing from the log
@@ -119,7 +120,15 @@ st, body, h = req("POST", "/login", {"username": "alice", "password": "alicepass
 cookie = (h.get("Set-Cookie") or "").split(";")[0]
 check("signing in brings the person back to the page", (st, h.get("Location"), cookie.startswith("skl_idp=")), (302, "/device", True))
 st, body, _ = req("GET", "/device?user_code=" + a["user_code"], cookie=cookie)
-check("signed in, the page asks to allow the code", (st, 'value="%s"' % a["user_code"] in body, 'value="allow"' in body), (200, True, True))
+check("signed in, the page fills the code in and allows nothing yet",
+      (st, 'value="%s"' % a["user_code"] in body, 'value="allow"' in body, 'value="look"' in body), (200, True, False, True))
+st, body, _ = req("POST", "/device", {"user_code": a["user_code"], "action": "look"}, cookie=cookie)
+check("given, the code shows which application asks and what allowing it gives, and only then the button",
+      (st, "<b>cli</b>" in body, "until you sign out everywhere" in body, 'value="allow"' in body, "SSH" in body,
+       'name="password"' in body), (200, True, True, True, False, False))
+# From an address of its own, as the misses below bring this one to the bar.
+st, body, _ = req("POST", "/device", {"user_code": "BBBB-BBBB", "action": "look"}, cookie=cookie, headers={"X-Forwarded-For": "198.51.100.90"})
+check("a code nobody was given shows nothing to allow", (st, "not known" in body, 'value="allow"' in body), (400, True, False))
 
 # Typed the way a person might: lower case, a space for the dash.
 typed = a["user_code"].lower().replace("-", " ")

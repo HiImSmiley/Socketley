@@ -99,7 +99,7 @@ def post(path, form, cookie=None):
         with op.open(r) as resp: return resp.headers
     except urllib.error.HTTPError as e: return e.headers
 cookie = (post("/login", {"username": sys.argv[3], "password": sys.argv[4]}).get("Set-Cookie") or "").split(";")[0]
-post("/device", {"user_code": sys.argv[2], "action": "allow"}, cookie)
+post("/device", {"user_code": sys.argv[2], "action": "allow", "password": sys.argv[4]}, cookie)
 PY
 }
 login_as() {   # login_as <user> <password> <client, or empty for the default> <config dir>

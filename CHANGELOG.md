@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   name under the domain, and a browser, reading the backslash as a slash, went
   to evil.example after signing in or out; a return address's host may now hold
   only letters, digits, `.-_` and a port.
+- **Allowing a device says what it allows.** The idp's `/device` page asked
+  to allow a code with no word of which application asked or that it could
+  get SSH certificates, as root for an admin, and the address `socketley
+  login` prints filled the code in, one click from allowing it. The code now
+  leads to a page naming the application and what it may do, and a client
+  marked `ssh` is allowed only with the password, or the code, given again.
 - **Refresh tokens are good once, and SSH certificates want a recent sign-in.**
   A refresh left the old refresh token valid, so a stolen one went on working
   beside the owner's; each refresh now gives the next and a token used again
