@@ -12063,7 +12063,12 @@ every second answer is replaced by a truncated one (TC, no records, as large as
 the query) and the others are dropped. A resolver behind that network retries
 over TCP, which is not limited, and is served; a victim whose address a
 flood forges receives nothing larger than what was sent. 100 by default, 0 for
-no limit.
+no limit. The limit is the runtime's: with
+.BR \-\-shards ,
+each shard allows its share of
+.IR n ,
+since the kernel spreads one network's queries over the shards by their source
+port.
 .TP
 .B \-\-dnssec
 Sign every zone as it is loaded (RFC 4033 to 4035): a key of ECDSA P\-256 with

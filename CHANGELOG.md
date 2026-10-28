@@ -230,6 +230,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   files, saying what it leaves. No restored file keeps a setuid or setgid
   bit, and outside the state and config a file the archive says root owns is
   written as the daemon's user's.
+- **`--rrl` holds for a sharded dns runtime as a whole.** Each shard kept the
+  full limit for itself, and the kernel spreads a forged flood over the shards
+  by source port, so `--shards 8` let eight times `--rrl` through to one
+  network. Each shard now allows its share.
 - **A DNS TCP connection is kept by whole queries, not by bytes.** Any byte
   read counted as activity, so a peer sending one byte of a query it never
   finished every few seconds kept its connection for good, and 256 of them

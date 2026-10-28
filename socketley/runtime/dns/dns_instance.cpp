@@ -471,7 +471,9 @@ bool dns_run::start(std::string& why)
         }
         m_notify_to.emplace_back(ss, len);
     }
-    m_rrl_limit = m_owner.get_rrl();
+    // The kernel spreads one network's queries over the shards by port, so each keeps its share of the limit.
+    const uint32_t shards = std::max<uint32_t>(m_owner.get_shards(), 1);
+    m_rrl_limit = m_owner.get_rrl() == 0 ? 0 : std::max<uint32_t>(1, (m_owner.get_rrl() + shards - 1) / shards);
 
     const uint16_t port = m_owner.effective_port();
     const uint32_t bind4 = m_owner.bind_in_addr();

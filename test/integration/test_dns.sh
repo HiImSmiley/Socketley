@@ -17,7 +17,8 @@
 #                the zone before it, and the secondaries told of the new serial
 #                once each, answered once each
 #   rrl          a burst from one network past --rrl is half truncated, half
-#                dropped, and the rest answered
+#                dropped, and the rest answered; with --shards, the limit is the
+#                runtime's and not each shard's
 #   restart      a daemon started again brings the runtime back, answering
 #
 # Skipped when dig is not installed.
@@ -45,9 +46,9 @@ skip() { echo "  SKIP: $1"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 
 cleanup() {
     [ -n "${SINK_PID:-}" ] && kill "$SINK_PID" 2>/dev/null
-    for r in ns ns2 bad pub chat files; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
+    for r in ns ns2 bad pub chat files wide; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.2
-    for r in ns ns2 bad pub chat files; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
+    for r in ns ns2 bad pub chat files wide; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -208,6 +209,40 @@ EOF
 read -r full tc dropped <<<"$burst"
 if [ "$full" -le 110 ] && [ "$tc" -ge 100 ] && [ "$dropped" -ge 100 ]; then ok "400 queries in a burst: $full answered, $tc truncated, $dropped dropped"
 else bad "rate limit of 100 a second" "answered $full, truncated $tc, dropped $dropped"; fi
+
+# Four shards each take the queries the kernel hashes to them by source port: a limit kept by each in full let four
+# times --rrl through to one network.
+PW=$((SL_PORT_BASE+1727))
+"$BIN" create dns wide -p "$PW" --zone "$T/one.zone" --shards 4 --rrl 20 --proxy none -s >/dev/null 2>&1
+for _ in $(seq 1 50); do dig @127.0.0.1 -p "$PW" +short +time=1 +tries=1 www.one.test A >/dev/null 2>&1 && break; sleep 0.1; done
+sleep 2
+full=$(python3 - "$PW" <<'EOF'
+import socket, struct, sys, time
+p = int(sys.argv[1])
+q = struct.pack("!HHHHHH", 7, 0, 1, 0, 0, 0) + b"\x03www\x03one\x04test\x00" + struct.pack("!HH", 1, 1)
+socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(40)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+    s.setblocking(False)
+for _ in range(10):
+    for s in socks:
+        s.sendto(q, ("127.0.0.1", p))
+time.sleep(0.5)
+full = 0
+for s in socks:
+    try:
+        while True:
+            d = s.recv(4096)
+            if not struct.unpack("!H", d[2:4])[0] & 0x200: full += 1
+    except BlockingIOError:
+        pass
+print(full)
+EOF
+)
+# 20 a second, or 40 for a burst that straddles a second; each shard keeping 20 of its own answers 80 or more.
+if [ "${full:-999}" -ge 1 ] && [ "${full:-999}" -le 45 ]; then ok "400 queries from 40 ports to four shards at --rrl 20: $full answered"
+else bad "--rrl across four shards" "answered ${full:-none}, want at most 45"; fi
+"$BIN" remove wide >/dev/null 2>&1
 
 # ── names runtimes are reached by, published ────────────────────────────────
 P2=$((SL_PORT_BASE+1712))
