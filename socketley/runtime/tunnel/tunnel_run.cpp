@@ -706,12 +706,86 @@ void tunnel_run::reload_agents()
 void tunnel_run::refuse_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view why)
 {
     ++m_c.refused;
-    const std::string body = std::string(why) + "\n";
-    c->out += "HTTP/1.1 " + std::to_string(status) + (status == 401 ? " Unauthorized" : status == 404 ? " Not Found" : " Bad Request") +
-              "\r\nContent-Type: text/plain\r\nContent-Length: " + std::to_string(body.size()) +
-              "\r\nConnection: close\r\n\r\n" + body;
+    answer_front(c, status, why);
+}
+
+void tunnel_run::answer_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view text)
+{
+    const std::string body = std::string(text) + "\n";
+    const char* reason = status == 200   ? " OK"
+                         : status == 401 ? " Unauthorized"
+                         : status == 403 ? " Forbidden"
+                         : status == 404 ? " Not Found"
+                         : status == 409 ? " Conflict"
+                                         : " Bad Request";
+    c->out += "HTTP/1.1 " + std::to_string(status) + reason + "\r\nContent-Type: text/plain\r\nContent-Length: " +
+              std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
     c->keep_alive = false;
     c->in.clear();
+}
+
+// A signed-in admin of the edge's idp adds an agent, answered with the invitation its CLI joins with at once.
+void tunnel_run::join_by_person(const std::shared_ptr<http::server_conn>& c, std::string_view head)
+{
+    const std::string_view auth = header_of(head, "authorization");
+    socketley::idp::session_verifier::who who;
+    if (!m_idp || !auth.starts_with("Bearer ") || !m_idp->check_bearer(trim_blanks(auth.substr(7)), who))
+    {
+        refuse_front(c, 401, "the access token is not one this edge takes");
+        return;
+    }
+    if (!who.admin)
+    {
+        refuse_front(c, 403, "only an admin of this edge's idp adds agents");
+        return;
+    }
+    agent a;
+    a.name = std::string(trim_blanks(header_of(head, "tunnel-agent")));
+    std::string why;
+    if (!valid_name(a.name))
+    {
+        refuse_front(c, 400, "an agent's name is lower-case letters, digits and -");
+        return;
+    }
+    if (!parse_services(header_of(head, "tunnel-http"), header_of(head, "tunnel-tcp"), a.services, why))
+    {
+        refuse_front(c, 400, why);
+        return;
+    }
+    // A service a person adds asks its visitors to sign in at the edge's idp, until the edge's owner says otherwise.
+    for (service& s : a.services)
+    {
+        if (s.http && s.auth.empty())
+            s.auth = "idp:" + std::string(m_owner.get_idp());
+        if (const std::string bad = s.http ? proxy_auth::spec_error(s.auth) : std::string(); !bad.empty())
+        {
+            refuse_front(c, 400, s.name + ": " + bad);
+            return;
+        }
+    }
+    const std::string secret = random_b64url(32);
+    a.secret_hash = hash_secret(secret);
+    // An agent of that name already is replaced, as an agent set up again on a machine flashed anew is.
+    const bool ok = !secret.empty() && update_agents(m_owner.get_name(), [&](std::vector<agent>& agents, std::string& w) {
+        if (const std::string clashed = clash(agents, a); !clashed.empty())
+        {
+            w = clashed;
+            return false;
+        }
+        std::erase_if(agents, [&](const agent& o) { return o.name == a.name; });
+        agents.push_back(a);
+        return true;
+    }, why);
+    if (!ok)
+    {
+        refuse_front(c, 409, why.empty() ? std::string("no randomness for a secret") : why);
+        return;
+    }
+    LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" added agent \"" + a.name +
+              "\" from " + peer_text(c->peer)).c_str());
+    m_agents_mtime = -1;
+    reload_agents();
+    answer_front(c, 200, a.name + "." + secret);
 }
 
 void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
@@ -726,6 +800,21 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
     const std::string head = c->in.substr(0, end + 2);
     c->in.erase(0, end + 4);
     const std::string_view line = std::string_view(head).substr(0, head.find("\r\n"));
+    // Where a person signs in, for a CLI given only the edge's address.
+    if (line.starts_with("GET /.tunnel/idp "))
+    {
+        const std::string issuer = m_idp ? m_idp->issuer() : std::string();
+        if (issuer.empty())
+            refuse_front(c, 404, "this edge takes no sign-in");
+        else
+            answer_front(c, 200, issuer);
+        return;
+    }
+    if (line.starts_with("POST /.tunnel/join "))
+    {
+        join_by_person(c, head);
+        return;
+    }
     if (!line.starts_with("GET /.tunnel ") || header_of(head, "upgrade") != upgrade_token)
     {
         refuse_front(c, 404, "this is a socketley tunnel edge: agents and people upgrade at /.tunnel");

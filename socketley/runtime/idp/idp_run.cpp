@@ -1119,6 +1119,8 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
     claims.assign(common).append(",\"aud\":").append(aud).append(",\"client_id\":").append(aud);
     claims.append(",\"scope\":").append(scope).append(",\"jti\":\"").append(jti).append("\",\"exp\":").append(exp);
     claims.append(profile);
+    // The admin bit a session cookie carries, so a runtime taking the token can tell an admin as it does from a cookie.
+    claims.append(",\"admin\":").append(who.in_group("admins") ? "true" : "false");
     const std::string access = sign_token(m_key, m_kid, "at+jwt", claims);
     std::string refresh;
     if (has_scope(e.scope, "offline_access") || !cl.is_public())

@@ -195,6 +195,8 @@ private:
     // A request on the front, answered and, for an agent or a person with a credential, upgraded.
     void front_request(const std::shared_ptr<http::server_conn>& c);
     void refuse_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view why);
+    void answer_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view body);
+    void join_by_person(const std::shared_ptr<http::server_conn>& c, std::string_view head);
     void upgraded(const std::shared_ptr<http::server_conn>& c, link::kind k, std::string who,
                   std::string_view extra_headers);
     // A visitor on a service's listener, carried to the agent offering it; false when the agent is not connected.

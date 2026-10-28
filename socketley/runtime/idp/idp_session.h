@@ -49,6 +49,8 @@ public:
     // the audiences configure() named.
     bool check_bearer(std::string_view token, who& out);
 
+    // The provider's issuer, where a CLI signs in, empty while its key is not known.
+    std::string issuer();
     // Where a browser signs in and is sent back to `return_to` from, empty while the provider's key is not known.
     std::string login_url(std::string_view return_to);
     // Where it signs out, and back to `return_to`.

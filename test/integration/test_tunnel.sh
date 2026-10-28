@@ -9,6 +9,7 @@
 #   * a half-closed connection whose answer is dropped
 #   * an agent that does not come back after it or the edge restarts, or comes back by joining again
 #   * a revoked agent still carried, or a service it never offered reached
+#   * a service's name not beside the edge's, or another runtime given a name a service has
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -164,14 +165,20 @@ ZONE
     "$BIN" create proxy web -p "$PW" -s >/dev/null 2>&1
     "$BIN" create dns ns -p "$DNS" --zone "$T/z.zone" --proxy web --publish 198.51.100.7 --rrl 0 -s >/dev/null 2>&1
     "$BIN" edit t --domain t >/dev/null 2>&1
-    for _ in $(seq 1 60); do [ "$(curl -s -m 2 -H 'Host: web.t.example.com' "http://127.0.0.1:$PW/e")" = "hello from home /e" ] && break; sleep 0.1; done
-    [ "$(curl -s -m 2 -H 'Host: web.t.example.com' "http://127.0.0.1:$PW/e")" = "hello from home /e" ] && ok \
-        || bad "the entrance routes a service's name to the agent at home" "$(cat "$HOME"/.local/share/socketley/runtimes*/.dns/routes-web 2>&1 | head -5)"
+    for _ in $(seq 1 60); do [ "$(curl -s -m 2 -H 'Host: web.example.com' "http://127.0.0.1:$PW/e")" = "hello from home /e" ] && break; sleep 0.1; done
+    [ "$(curl -s -m 2 -H 'Host: web.example.com' "http://127.0.0.1:$PW/e")" = "hello from home /e" ] && ok \
+        || bad "the entrance routes a service's name, beside the edge's, to the agent at home" "$(cat "$HOME"/.local/share/socketley/runtimes*/.dns/routes-web 2>&1 | head -5)"
     # The zone is rebuilt at most once a second after the names change.
-    for _ in $(seq 1 40); do got=$(dig +short @127.0.0.1 -p "$DNS" web.t.example.com A 2>/dev/null); [ -n "$got" ] && break; sleep 0.1; done
+    for _ in $(seq 1 40); do got=$(dig +short @127.0.0.1 -p "$DNS" web.example.com A 2>/dev/null); [ -n "$got" ] && break; sleep 0.1; done
     [ "$got" = 198.51.100.7 ] && ok || bad "and the zone answers the name" "$got"
-    out=$(curl -s -m 2 -H 'Host: nothing.t.example.com' "http://127.0.0.1:$PW/" 2>&1)
-    case "$out" in *"socketley tunnel edge"*) ok ;; *) bad "a name of no service reaches the edge, which says what it is" "$out" ;; esac
+    out=$(curl -s -m 2 -H 'Host: t.example.com' "http://127.0.0.1:$PW/" 2>&1)
+    case "$out" in *"socketley tunnel edge"*) ok ;; *) bad "the edge's own name reaches the edge, which says what it is" "$out" ;; esac
+    out=$(curl -s -m 2 -o /dev/null -w '%{http_code}' -H 'Host: web.t.example.com' "http://127.0.0.1:$PW/e" 2>&1)
+    [ "$out" != 200 ] && ok || bad "and no name below it is the edge's any more" "$out"
+    out=$("$BIN" create server site -p $((SL_PORT_BASE + 1976)) --domain web 2>&1); rc=$?
+    [ "$rc" -ne 0 ] && case "$out" in *"web is already the name of runtime 't'"*) true ;; *) false ;; esac && ok \
+        || bad "a name a service has is not given to another runtime" "rc $rc: $out"
+    "$BIN" remove site >/dev/null 2>&1
     # An agent's upgrade passes the entrance to the edge: the key it holds is taken there.
     up=$(python3 - "$PW" "$(cat "$KEY")" <<'PY'
 import socket, sys

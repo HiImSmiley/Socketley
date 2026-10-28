@@ -125,6 +125,14 @@ bool session_verifier::check_bearer(std::string_view token, who& out)
     return m_keys && !token.empty() && verified(token, true, wall::now_sec(), out);
 }
 
+std::string session_verifier::issuer()
+{
+    if (!enabled())
+        return {};
+    reload();
+    return m_issuer;
+}
+
 std::string session_verifier::login_url(std::string_view return_to)
 {
     if (!enabled())

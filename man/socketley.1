@@ -1155,19 +1155,41 @@ cuts it off. See
 .RS
 .PP
 .nf
-socketley tunnel t invite pi \-\-http home=idp:auth,nas \-\-tcp mc:25565
+socketley tunnel edge invite pi \-\-http home=idp:auth,nas \-\-tcp mc:25565
 .fi
 .RE
 .TP
-.BI "tunnel connect " "edge host" : port " \fB\-\-idp \fIidp"
+.BI "tunnel join " edge " \fR[\fB\-\-name \fIagent\fR] [\fB\-\-http \fIservice\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-tcp \fIservice\fB:\fIedge-port\fB=\fIhost\fB:\fIport,...\fR]"
+This machine made an agent of an edge, by an admin of the edge's idp: signed
+in here as
+.B login
+does when it is not yet, the edge adds the agent, named after this machine's
+host name unless
+.B \-\-name
+says otherwise, and the agent runtime of that name is made and joins at once.
+Each HTTP service asks its visitors to sign in at the edge's idp until the
+edge's owner says otherwise with
+.BR "tunnel " "edge" " set" .
+Joined again under the same name, the agent the edge had is replaced; a
+runtime of that name on this machine already is exit 1, and the edge is not
+asked. Prints where each service is.
+.RS
+.PP
+.nf
+socketley tunnel join https://edge.example.com \-\-http ollama=127.0.0.1:11434
+.fi
+.RE
+.TP
+.BI "tunnel connect " "edge host" : port " \fR[\fB\-\-idp \fIidp\fR]"
 .TQ
-.BI "tunnel ssh " edge " \fB\-\-idp \fIidp"
+.BI "tunnel ssh " edge " \fR[\fB\-\-idp \fIidp\fR]"
 A stream to a
 .B \-\-forward
 target of a tunnel edge, between stdin and stdout, for the person signed in at
 .I idp
 by
-.BR login ;
+.BR login ,
+the edge's own idp, asked of the edge, unless given;
 .B ssh
 is to 127.0.0.1:22 there, for ssh's
 .BR ProxyCommand .
@@ -1176,7 +1198,7 @@ not name is exit 1.
 .RS
 .PP
 .nf
-ssh \-o ProxyCommand='socketley tunnel ssh t.example.com \-\-idp auth.example.com' root@server
+ssh \-o ProxyCommand='socketley tunnel ssh edge.example.com' root@server
 .fi
 .RE
 .TP
@@ -14039,20 +14061,17 @@ on the router.
 .PP
 .nf
 # on the machine with the address
-socketley create tunnel t \-\-mode edge \-p 9450 \-\-domain t \-s
-socketley tunnel t invite pi \-\-http home \-\-tcp mc:25565
-# on the machine at home, with what invite printed
-socketley create tunnel pi \-\-mode agent \-\-to https://t.example.com \e
-    \-\-join pi.Xw3... \-\-offer home=127.0.0.1:8123,mc=127.0.0.1:25565 \-s
+socketley create tunnel edge \-\-mode edge \-p 9450 \-\-domain edge \-\-idp auth \-s
+# on the machine at home, signed in as an admin of auth
+socketley tunnel join https://edge.example.com \-\-http home=127.0.0.1:8123 \-\-tcp mc:25565=127.0.0.1:25565
 .fi
 .PP
-An HTTP service is reached at
-.IB service . domain
-of the edge, here
-.BR https://home.t.example.com :
+An HTTP service is named beside the edge, here
+.BR https://home.example.com :
 the edge serves it on a socket the entrance routes that name to, with the
-entrance's certificate, and the dns runtime answers the name by the edge's
-wildcard. A TCP service is a port on the edge, here 25565. The edge says
+entrance's certificate, and the dns runtime answers the name. A name a
+runtime has stays that runtime's, and another runtime is not given a name a
+service has. A TCP service is a port on the edge, here 25565. The edge says
 nothing about a stream it carries: what reaches the agent is what the visitor
 sent, and the service answers as if they were on the same machine.
 .PP
@@ -14084,10 +14103,15 @@ link silent for 45 is given up and the agent dials again, after a pause that
 doubles to half a minute.
 .PP
 .B Who may connect.
+.B socketley tunnel join
+is an admin of the edge's
+.B \-\-idp
+adding an agent; or, without an idp,
 .B socketley tunnel
 .I edge
 .B invite
-prints an invitation once; the agent joins with it at its first connection and
+on the edge's machine prints an invitation once, for the agent's
+.BR \-\-join ; the agent joins with it at its first connection and
 is given a key of its own in its place, kept in its state directory (0600),
 and the invitation is spent. The edge keeps only hashes.
 .B revoke
@@ -14109,7 +14133,7 @@ asks; this is how ssh reaches a server through port 443:
 .PP
 .nf
 Host server
-    ProxyCommand socketley tunnel ssh t.example.com \-\-idp auth.example.com
+    ProxyCommand socketley tunnel ssh edge.example.com
 .fi
 .RE
 .TP
@@ -14122,7 +14146,10 @@ An edge's port for agents and people, on 127.0.0.1 unless
 says otherwise, since the entrance in front of it terminates TLS.
 .TP
 .BI "\-\-domain " name
-An edge's name, under which its agents' HTTP services are named.
+An edge's name, beside which its agents' HTTP services are named:
+.B home.example.com
+for an edge
+.BR edge.example.com .
 .TP
 .BI "\-\-to " url
 The edge an agent dials,
@@ -14145,7 +14172,9 @@ Where an edge carries a signed-in person's stream.
 .TP
 .BI "\-\-idp " idp
 The idp runtime whose people may use
-.BR \-\-forward .
+.BR \-\-forward ,
+and whose admins add agents with
+.BR "tunnel join" .
 .TP
 .BI "\-\-idp\-audience " client ,...
 The clients whose access tokens are taken;

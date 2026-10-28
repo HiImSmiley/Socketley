@@ -1,13 +1,18 @@
 // `socketley tunnel connect` and `tunnel ssh`: a signed-in person's stream to a --forward target of a tunnel edge,
-// carried between stdin and stdout, as ssh's ProxyCommand wants it; `tunnel <edge> ...` goes to the daemon.  Errors
-// go to stderr here, unlike every other command, because stdout carries the stream.
+// carried between stdin and stdout, as ssh's ProxyCommand wants it; `tunnel join` makes this machine an agent of an
+// edge its admin signs in at; `tunnel <edge> ...` goes to the daemon.  Errors of connect and ssh go to stderr, unlike
+// every other command, because stdout carries the stream.
 #include "cli.h"
 
+#include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <vector>
 
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -18,6 +23,8 @@
 #include <openssl/x509v3.h>
 
 #include "../shared/loop/blocking_write.h"
+#include "../shared/persist/paths.h"
+#include "../shared/util/text_list.h"
 #include "../shared/net/tunnel_mux.h"
 #include "../runtime/idp/idp_logic.h"
 
@@ -161,29 +168,89 @@ struct pipe_events : tn::events
     void on_goaway(std::string_view) override {}
 };
 
-int connect_main(const std::string& edge, const std::string& target, const std::string& idp)
+// An edge's address taken apart: https unless it says http, its host and port, and `host[:port]` for a Host field.
+struct edge_address
 {
-    std::string err, token;
-    if (!cli_access_token(idp, token, err))
-    {
-        std::cerr << err << "\n";
-        return 1;
-    }
-    std::string rest = edge;
-    const bool tls = !rest.starts_with("http://");
+    bool tls{true};
+    std::string authority, host, port;
+};
+
+edge_address parse_edge(std::string rest)
+{
+    edge_address a;
+    a.tls = !rest.starts_with("http://");
     if (rest.starts_with("https://"))
         rest = rest.substr(8);
     else if (rest.starts_with("http://"))
         rest = rest.substr(7);
-    rest = rest.substr(0, rest.find('/'));
-    std::string host = rest, port = tls ? "443" : "80";
-    if (const size_t colon = rest.rfind(':'); colon != std::string::npos && rest.find(']') == std::string::npos)
+    a.authority = rest.substr(0, rest.find('/'));
+    a.host = a.authority;
+    a.port = a.tls ? "443" : "80";
+    if (const size_t colon = a.authority.rfind(':'); colon != std::string::npos && a.authority.find(']') == std::string::npos)
     {
-        host = rest.substr(0, colon);
-        port = rest.substr(colon + 1);
+        a.host = a.authority.substr(0, colon);
+        a.port = a.authority.substr(colon + 1);
     }
+    return a;
+}
+
+// One request to the edge outside a tunnel, its status and its body read to the end of the connection.
+bool ask_edge(const edge_address& a, const std::string& request, int& status, std::string& body, std::string& err)
+{
     conn c;
-    if (!dial(c, host, port, tls, err))
+    if (!dial(c, a.host, a.port, a.tls, err))
+        return false;
+    if (!c.write(request))
+    {
+        err = "the edge closed the connection";
+        return false;
+    }
+    std::string got;
+    char buf[16384];
+    for (ssize_t n; (n = c.read(buf, sizeof buf)) > 0 && got.size() < 65536;)
+        got.append(buf, static_cast<size_t>(n));
+    const size_t end = got.find("\r\n\r\n");
+    if (!got.starts_with("HTTP/1.") || got.size() < 12 || end == std::string::npos)
+    {
+        err = "the edge gave no answer";
+        return false;
+    }
+    status = std::atoi(got.c_str() + 9);
+    body = got.substr(end + 4);
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r'))
+        body.pop_back();
+    return true;
+}
+
+// The idp the edge takes sign-ins of, asked of the edge itself when none was given.
+bool idp_of(const edge_address& a, std::string& idp, std::string& err)
+{
+    if (!idp.empty())
+        return true;
+    int status = 0;
+    if (!ask_edge(a, "GET /.tunnel/idp HTTP/1.1\r\nHost: " + a.authority + "\r\nConnection: close\r\n\r\n", status, idp,
+                  err))
+        return false;
+    if (status != 200 || idp.empty())
+    {
+        err = "the edge names no idp to sign in at: " + idp;
+        return false;
+    }
+    return true;
+}
+
+int connect_main(const std::string& edge, const std::string& target, std::string idp)
+{
+    std::string err, token;
+    const edge_address ea = parse_edge(edge);
+    if (!idp_of(ea, idp, err) || !cli_access_token(idp, token, err))
+    {
+        std::cerr << err << "\n";
+        return 1;
+    }
+    const std::string& rest = ea.authority;
+    conn c;
+    if (!dial(c, ea.host, ea.port, ea.tls, err))
     {
         std::cerr << err << "\n";
         return 2;
@@ -281,11 +348,137 @@ int connect_main(const std::string& edge, const std::string& target, const std::
     return 0;
 }
 
+// This machine's name as an agent's: its host name, lower case, anything but letters and digits made a -.
+std::string host_agent_name()
+{
+    char h[256] = {};
+    std::string n;
+    if (::gethostname(h, sizeof h - 1) == 0)
+        for (const char* p = h; *p && *p != '.'; ++p)
+            n += std::isalnum(static_cast<unsigned char>(*p)) ? static_cast<char>(std::tolower(static_cast<unsigned char>(*p))) : '-';
+    while (!n.empty() && n.front() == '-')
+        n.erase(0, 1);
+    n = n.substr(0, 63);
+    while (!n.empty() && n.back() == '-')
+        n.pop_back();
+    return n.empty() ? std::string("agent") : n;
+}
+
+// `tunnel join <edge> --http <name>=<host>:<port> --tcp <name>:<port>=<host>:<port>`: an admin of the edge's idp,
+// signed in here, adds this machine as an agent, and the agent runtime is made with the invitation the edge answers.
+int join_main(int argc, char** argv)
+{
+    std::string edge, name, http, tcp, offers;
+    const auto usage = [] {
+        std::cout << "usage: socketley tunnel join <edge address> [--name <agent>] [--http <service>=<host>:<port>,...] "
+                     "[--tcp <service>:<edge port>=<host>:<port>,...]\n";
+        return 1;
+    };
+    for (int i = 3; i < argc; ++i)
+    {
+        const std::string_view a = argv[i];
+        if ((a == "--http" || a == "--tcp") && i + 1 < argc)
+        {
+            // Each offer names the service the edge serves and where it is reached on this machine.
+            std::string_view list = argv[++i];
+            while (!list.empty())
+            {
+                const std::string_view item = socketley::trim_blanks(socketley::take_item(list));
+                const size_t eq = item.find('=');
+                if (eq == std::string_view::npos || eq == 0 || eq + 1 == item.size())
+                    return usage();
+                const std::string_view svc = item.substr(0, eq), there = item.substr(eq + 1);
+                std::string& names = a == "--http" ? http : tcp;
+                names += (names.empty() ? "" : ",") + std::string(svc);
+                offers += (offers.empty() ? "" : ",") + std::string(svc.substr(0, svc.find(':'))) + "=" + std::string(there);
+            }
+        }
+        else if (a == "--name" && i + 1 < argc)
+            name = argv[++i];
+        else if (edge.empty() && !a.starts_with("--"))
+            edge = a;
+        else
+            return usage();
+    }
+    if (edge.empty() || offers.empty())
+        return usage();
+    if (name.empty())
+        name = host_agent_name();
+    // Asked before the edge is, since the edge replaces an agent of that name and the one here would lose its key.
+    if (std::error_code ec; std::filesystem::exists(socketley_paths::resolve().state_dir / (name + ".json"), ec))
+    {
+        std::cout << "a runtime named " << name << " is here already; socketley remove " << name
+                  << " first, or join with --name\n";
+        return 1;
+    }
+
+    const edge_address ea = parse_edge(edge);
+    std::string idp, err, token;
+    if (!idp_of(ea, idp, err))
+    {
+        std::cout << err << "\n";
+        return 2;
+    }
+    // Signed in here first, the way `socketley login` does, when this machine holds no sign-in yet.
+    if (!cli_access_token(idp, token, err))
+    {
+        std::string a0 = "socketley", a1 = "login";
+        char* login_argv[] = {a0.data(), a1.data(), idp.data(), nullptr};
+        if (const int rc = cli_login(3, login_argv); rc != 0)
+            return rc;
+        if (!cli_access_token(idp, token, err))
+        {
+            std::cout << err << "\n";
+            return 1;
+        }
+    }
+    int status = 0;
+    std::string invitation;
+    if (!ask_edge(ea, "POST /.tunnel/join HTTP/1.1\r\nHost: " + ea.authority + "\r\nAuthorization: Bearer " + token +
+                          "\r\nTunnel-Agent: " + name + "\r\nTunnel-Http: " + http + "\r\nTunnel-Tcp: " + tcp +
+                          "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                  status, invitation, err))
+    {
+        std::cout << err << "\n";
+        return 2;
+    }
+    if (status != 200)
+    {
+        std::cout << "the edge refused: " << invitation << "\n";
+        return 1;
+    }
+    std::vector<std::string> words = {"socketley", "create", "tunnel", name, "--mode", "agent", "--to", edge,
+                                      "--join", invitation, "--offer", offers, "-s"};
+    std::vector<char*> create_argv;
+    for (auto& w : words)
+        create_argv.push_back(w.data());
+    create_argv.push_back(nullptr);
+    if (const int rc = cli_dispatch(static_cast<int>(words.size()), create_argv.data()); rc != 0)
+        return rc;
+    // Where each service is now, named beside the edge as the edge names it; an address has no name to be beside.
+    in6_addr literal{};
+    const bool named = ::inet_pton(AF_INET, ea.host.c_str(), &literal) != 1 && ea.host.find(':') == std::string::npos;
+    const size_t dot = named ? ea.host.find('.') : std::string::npos;
+    const std::string beside = dot == std::string::npos ? std::string() : ea.host.substr(dot);
+    const std::string machine = dot == std::string::npos ? ea.host : ea.host.substr(dot + 1);
+    std::string_view h = http, c = tcp;
+    while (!h.empty())
+        std::cout << "https://" << socketley::take_item(h) << beside << "\n";
+    while (!c.empty())
+    {
+        const std::string_view s = socketley::take_item(c);
+        std::cout << machine << s.substr(s.find(':')) << "\n";
+    }
+    return 0;
+}
+
 }   // namespace
 
 int cli_tunnel(int argc, char** argv)
 {
     const std::string_view what = argc > 2 ? argv[2] : "";
+    if (what == "join")
+        return join_main(argc, argv);
     if (what != "connect" && what != "ssh")
         return cli_forward(argc, argv);
     std::string edge, target, idp;
@@ -305,10 +498,10 @@ int cli_tunnel(int argc, char** argv)
     if (what == "ssh")
         target = "127.0.0.1:22";
     // Said on stderr, since stdout is the stream itself.
-    if (extra || edge.empty() || target.empty() || idp.empty())
+    if (extra || edge.empty() || target.empty())
     {
-        std::cerr << "usage: socketley tunnel connect <edge address> <host>:<port> --idp <idp address>\n"
-                     "       socketley tunnel ssh <edge address> --idp <idp address>\n";
+        std::cerr << "usage: socketley tunnel connect <edge address> <host>:<port> [--idp <idp address>]\n"
+                     "       socketley tunnel ssh <edge address> [--idp <idp address>]\n";
         return 1;
     }
     return connect_main(edge, target, idp);

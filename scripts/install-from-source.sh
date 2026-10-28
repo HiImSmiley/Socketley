@@ -312,6 +312,8 @@ if [ "$(uname -s)" != "Linux" ]; then
 fi
 
 ARCH="$(uname -m)"
+# Who runs the install, through sudo or not, and is given the daemon's socket.
+ADMIN_USER="${SUDO_USER:-$(id -un)}"
 # bin/premake5 is an x86-64 binary, so on aarch64 premake is built from source, and its bootstrap links libuuid.
 ARCH_DEPS=""
 case "$ARCH" in
@@ -471,6 +473,10 @@ if [ "$WANT_SERVICE" = 1 ]; then
     printf '\n  groupadd --system socketley, useradd --system socketley\n'
     printf '      the daemon runs unprivileged, and membership of the socketley group is\n'
     printf '      exactly the set of people who may reach its 0660 IPC socket.\n\n'
+    if [ "$ADMIN_USER" != root ]; then
+        printf '  usermod -aG socketley %s\n' "$ADMIN_USER"
+        printf '      you, who installs it, may then run socketley commands without sudo.\n\n'
+    fi
     printf '  install -dm750 /var/lib/socketley/runtimes\n'
     printf '  install -dm755 /run/socketley, install -dm755 /etc/socketley\n'
     printf '      0750 because each runtime record carries that runtime master password\n'
@@ -637,6 +643,13 @@ if [ "$WANT_SERVICE" = 1 ]; then
         uid=$(free_system_uid)
         run_root useradd --system ${uid:+--uid "$uid"} --no-create-home --shell "$NOLOGIN" --gid socketley socketley
     fi
+    if [ "$ADMIN_USER" = root ]; then
+        :
+    elif id -nG "$ADMIN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx socketley; then
+        note "$ADMIN_USER is in the socketley group already"
+    else
+        run_root usermod -aG socketley "$ADMIN_USER"
+    fi
 
     step "creating the state, runtime and configuration directories" \
          "check that /var, /run and /etc are writable by root"
@@ -748,9 +761,11 @@ if [ "$WANT_SERVICE" = 1 ]; then
     printf '\n'
     printf 'The daemon IPC socket is 0660 socketley:socketley.  Every socketley command\n'
     printf 'goes through it, and a runtime Lua script runs with the daemon privileges, so\n'
-    printf 'reaching it is an administrative right.  To grant it:\n'
-    printf '\n'
-    printf '  sudo usermod -aG socketley %s     # then log in again\n' "$(id -un)"
+    printf 'reaching it is an administrative right.\n'
+    if [ "$ADMIN_USER" != root ]; then
+        printf '%s has it now; log in again, or run  newgrp socketley,  for it to take effect.\n' "$ADMIN_USER"
+    fi
+    printf 'To grant it to someone else:  sudo usermod -aG socketley <user>\n'
     printf '\n'
 fi
 printf '  first runtime:  socketley create server hello -p 9000 -s\n'

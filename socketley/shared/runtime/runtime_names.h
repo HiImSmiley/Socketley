@@ -16,7 +16,8 @@ namespace runtime_names
 std::string normal(std::string_view name);
 
 // The names `rt` declares it is reached by: --domain, and a storage runtime's --domain and --website-domain, each
-// normalised; a storage runtime's also with the wildcard its buckets are addressed under when `with_buckets`.
+// normalised; a storage runtime's also with the wildcard its buckets are addressed under when `with_buckets`, and
+// a tunnel edge's those of its agents' HTTP services, named beside its own.
 std::vector<std::string> of(const runtime_instance& rt, bool with_buckets = false);
 
 // Why `rt` may not have its names beside `others`, empty when it may: a name another runtime has, outside a shared
@@ -33,7 +34,8 @@ bool speaks_http(const runtime_instance& rt);
 
 // The table an entrance routes by, as text (dns_feed.h's routes-<entrance>): a `zone <origin>` line for each zone of
 // the dns runtimes that name it with --proxy, then a `route <name> <address>...` line for each name of a runtime that
-// speaks HTTP -- a name without a dot once under each zone, the addresses of a group's runtimes together.
+// speaks HTTP -- a name without a dot once under each zone, the addresses of a group's runtimes together, and an
+// edge's service under its name unless a runtime has that name.
 // `origins_of` gives a dns runtime's zone origins. A runtime with --tls of its own is left out: the entrance is where
 // TLS ends, and it does not speak TLS to what it routes to.
 std::string entrance_table(const runtime_instance& entrance, const std::vector<const runtime_instance*>& all,

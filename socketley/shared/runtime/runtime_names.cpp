@@ -42,7 +42,33 @@ std::string normal(std::string_view name)
     return n;
 }
 
-std::vector<std::string> of(const runtime_instance& rt, bool with_buckets)
+namespace
+{
+
+// A tunnel edge's service is named beside the edge, `ollama` for an edge called `edge`, so it reads as any other.
+std::string service_name(std::string_view edge_name, std::string_view service)
+{
+    const size_t dot = edge_name.find('.');
+    return dot == std::string_view::npos ? std::string(service) : std::string(service) + std::string(edge_name.substr(dot));
+}
+
+// The names of an edge's HTTP services with the socket each is served on.
+std::vector<std::pair<std::string, std::string>> edge_services(const runtime_instance& rt)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    if (rt.get_type() != runtime_tunnel)
+        return out;
+    const std::string_view domains = rt.get_domains();
+    const std::string base = normal(domains.substr(0, domains.find(',')));
+    if (base.empty())
+        return out;
+    for (auto& [svc, sock] : static_cast<const tunnel_instance&>(rt).http_services())
+        out.emplace_back(service_name(base, svc), std::move(sock));
+    return out;
+}
+
+// The names `rt` itself is reached by, without the services of an edge.
+std::vector<std::string> own(const runtime_instance& rt, bool with_buckets)
 {
     std::vector<std::string> out;
     if (rt.get_type() == runtime_storage)
@@ -51,16 +77,25 @@ std::vector<std::string> of(const runtime_instance& rt, bool with_buckets)
         add_list(stg.get_domain(), out, with_buckets);
         add_list(stg.get_website_domain(), out, with_buckets);
     }
-    // A tunnel edge's agents' services are names below its own, which its wildcard answers in DNS.
-    const bool edge = rt.get_type() == runtime_tunnel &&
-                      static_cast<const tunnel_instance&>(rt).get_mode() == tunnel_instance::mode::edge;
-    add_list(rt.get_domains(), out, edge);
+    add_list(rt.get_domains(), out, false);
     // A mail runtime's webmail answers mail clients too, under the names they ask for its zones' setup.
     if (rt.get_type() == runtime_mail && static_cast<const mail_instance&>(rt).get_web_port() && !rt.get_domains().empty())
     {
         out.emplace_back("autoconfig");
         out.emplace_back("autodiscover");
     }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+}   // namespace
+
+std::vector<std::string> of(const runtime_instance& rt, bool with_buckets)
+{
+    std::vector<std::string> out = own(rt, with_buckets);
+    for (auto& [name, sock] : edge_services(rt))
+        out.push_back(std::move(name));
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
@@ -116,7 +151,8 @@ std::string http_address(const runtime_instance& r)
 
 std::string refusal(const runtime_instance& rt, const std::vector<const runtime_instance*>& others)
 {
-    const auto mine = of(rt);
+    // Its own names against all of every other's, an edge's services among them.
+    const auto mine = own(rt, false);
     if (mine.empty())
         return {};
     if (is_entrance(rt))
@@ -167,7 +203,7 @@ std::string entrance_table(const runtime_instance& entrance, const std::vector<c
         const std::string addr = http_address(*r);
         if (addr.empty())
             continue;
-        for (const auto& n : of(*r, /*with_buckets=*/true))
+        for (const auto& n : own(*r, /*with_buckets=*/true))
         {
             const bool relative = n.find('.') == std::string::npos ||
                                   (n.starts_with("*.") && n.find('.', 2) == std::string::npos);
@@ -178,22 +214,28 @@ std::string entrance_table(const runtime_instance& entrance, const std::vector<c
                     add(n + "." + z, addr);
         }
     }
-    // Each HTTP service of a tunnel edge goes to the socket the edge serves it on, before the edge's own wildcard.
+    // Each HTTP service of a tunnel edge goes to the socket the edge serves it on, unless a runtime has its name.
+    const size_t runtimes_routed = routes.size();
+    const auto routed = [&](const std::string& name)
+    {
+        return std::any_of(routes.begin(), routes.begin() + static_cast<std::ptrdiff_t>(runtimes_routed),
+                           [&](const auto& r) { return r.first == name; });
+    };
     for (const runtime_instance* r : all)
     {
-        if (!r || r->get_type() != runtime_tunnel || !speaks_http(*r))
+        if (!r || !speaks_http(*r))
             continue;
-        const std::string_view domains = r->get_domains();
-        const std::string base = normal(domains.substr(0, domains.find(',')));
-        if (base.empty())
-            continue;
-        for (const auto& [svc, sock] : static_cast<const tunnel_instance&>(*r).http_services())
+        for (const auto& [name, sock] : edge_services(*r))
         {
-            if (base.find('.') != std::string::npos)
-                add(svc + "." + base, "unix:" + sock);
+            if (name.find('.') != std::string::npos)
+            {
+                if (!routed(name))
+                    add(name, "unix:" + sock);
+            }
             else
                 for (const auto& z : zones)
-                    add(svc + "." + base + "." + z, "unix:" + sock);
+                    if (!routed(name + "." + z))
+                        add(name + "." + z, "unix:" + sock);
         }
     }
     std::sort(routes.begin(), routes.end());

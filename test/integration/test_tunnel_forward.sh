@@ -9,6 +9,9 @@
 #   * a target the edge does not name reached, or a refusal not said
 #   * bytes lost between stdin, the edge, the target and stdout, or the end of stdin not reaching the target
 #   * ssh through the tunnel not getting in with its certificate
+#   * `tunnel connect` with no --idp not finding the edge's idp by asking the edge
+#   * `tunnel join` adding an agent for someone who is no admin, or its service open to visitors who did not sign in
+#   * an agent joined by a person not reaching the service it offers, or a second join of its name breaking it
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -27,6 +30,7 @@ PI=$((SL_PORT_BASE + 1976))
 PE=$((SL_PORT_BASE + 1977))
 PX=$((SL_PORT_BASE + 1978))
 PS=$((SL_PORT_BASE + 1979))
+PH=$((SL_PORT_BASE + 1980))
 I="http://127.0.0.1:$PI"
 python3 - "$PX" <<'PY' &
 import socketserver, sys
@@ -44,8 +48,18 @@ class E(socketserver.ThreadingTCPServer):
 E(("127.0.0.1", int(sys.argv[1])), Echo).serve_forever()
 PY
 ECHO=$!
+python3 - "$PH" <<'PY' &
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = ("hello from the agent " + self.path).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+HOME_WEB=$!
 SSHD_PID=""
-trap 'kill $ECHO 2>/dev/null; [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null; daemon_stop' EXIT
+trap 'kill $ECHO $HOME_WEB 2>/dev/null; [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null; daemon_stop' EXIT
 daemon_start "$BIN"
 
 cat > "$T/clients" <<EOF
@@ -56,6 +70,7 @@ EOF
     || bad "the idp is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$I/jwks")" = 200 ] && break; sleep 0.1; done
 "$BIN" idp-user auth add alice --password alicepassword1 >/dev/null 2>&1
+"$BIN" idp-user auth add boss --password bosspassword1 --groups admins >/dev/null 2>&1
 out=$("$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && case "$out" in *"--forward needs --idp"*) true ;; *) false ;; esac && ok || bad "--forward without --idp is refused" "rc $rc: $out"
 "$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX,127.0.0.1:$PS" --idp auth -s >/dev/null 2>&1 \
@@ -104,6 +119,34 @@ login_as alice alicepassword1 other "$T/other" || true
 out=$(printf 'x' | XDG_CONFIG_HOME="$T/other" "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"401"*|*"not one this edge takes"*) true ;; *) false ;; esac && ok \
     || bad "a token given to a client the edge does not take is refused" "rc $rc: $out"
+
+# ── the edge says where to sign in, and an admin signed in there adds an agent ──
+out=$(printf 'asked the edge' | "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" 2>"$T/err"); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "asked the edge" ] && ok || bad "with no --idp the edge's own is asked for" "rc $rc: '$out' $(cat "$T/err")"
+out=$("$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"only an admin"*) true ;; *) false ;; esac && ok || bad "someone who is no admin adds no agent" "rc $rc: $out"
+[ -z "$("$BIN" tunnel e list)" ] && ok || bad "and the edge holds none" "$("$BIN" tunnel e list)"
+login_as boss bosspassword1 "" "$T/boss" && ok || bad "an admin signs in" "$(cat "$T/login.out")"
+out=$(XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "https://web" ] && ok || bad "an admin's join makes the agent and says where its service is" "rc $rc: $out"
+for _ in $(seq 1 50); do "$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth$" && break; sleep 0.1; done
+"$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth$" && ok \
+    || bad "the agent joins, its service asking visitors to sign in at the edge's idp" "$("$BIN" tunnel e list)"
+grep -q 'tunnel e: "boss" added agent "pi"' "$SOCKETLEY_DLOG" && ok || bad "who added it is said in the log" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
+WEB=$(dirname "$(find "$HOME/.local/share" -path '*tunnel/e/agents' 2>/dev/null | head -1)")/web.sock
+[ ${#WEB} -ge 100 ] && WEB="/tmp/skl-$(printf '%s' "$WEB" | sha256sum | cut -c1-16).sock"
+for _ in $(seq 1 30); do [ -S "$WEB" ] && break; sleep 0.1; done
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 --unix-socket "$WEB" http://web/x)
+[ "$code" = 401 ] && ok || bad "a visitor who did not sign in is refused" "$code"
+"$BIN" tunnel e set pi --http web >/dev/null 2>&1
+for _ in $(seq 1 50); do [ "$(curl -s -m 3 --unix-socket "$WEB" http://web/x)" = "hello from the agent /x" ] && break; sleep 0.1; done
+[ "$(curl -s -m 3 --unix-socket "$WEB" http://web/x)" = "hello from the agent /x" ] && ok \
+    || bad "opened by the edge's owner, the service at the agent answers" "$(tail -3 "$SOCKETLEY_DLOG")"
+out=$(XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"a runtime named pi is here already"*) true ;; *) false ;; esac && ok \
+    || bad "a join whose runtime is here already asks nothing of the edge" "rc $rc: $out"
+[ "$(curl -s -m 3 --unix-socket "$WEB" http://web/y)" = "hello from the agent /y" ] && ok || bad "and the agent keeps its key" "$("$BIN" tunnel e list)"
+"$BIN" remove pi >/dev/null 2>&1
 
 # ── ssh through the tunnel, by the certificate the same sign-in gets ──────────
 SSHD=$(command -v sshd || echo /usr/sbin/sshd)
