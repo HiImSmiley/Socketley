@@ -4530,6 +4530,9 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     const http_request_framing_scan scan = http_scan_request_headers(headers);
     if (SOCKETLEY_UNLIKELY(!scan.ok))
         return http_request_parse::invalid;
+    // Transfer-Encoding outside HTTP/1.1 is faulty framing (RFC 9112 6.1), since a 1.0 backend reads no chunks.
+    if (SOCKETLEY_UNLIKELY(scan.transfer_encoding && conn->ex.version != "HTTP/1.1"))
+        return http_request_parse::invalid;
 
     // How long this request's body is, from a header block just proved to give
     // exactly one answer, with everything past it held back by

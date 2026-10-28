@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `nosniff` and a sandboxing Content-Security-Policy, a type a browser would
   run is sent as an attachment, and an anonymous GET takes no `response-*`
   override.
+- **HTTP/1.0 with Transfer-Encoding is refused.** The proxy forwarded such a
+  request as it came, though a 1.0 backend may read no chunks and take the body
+  for the next request (RFC 9112 6.1); it is now answered 400.
 - **An absolute-form request names one host.** `GET https://A/x` with
   `Host: B` was routed and checked against the TLS name by A and reached A's
   runtime telling it B; HTTP/2 the same with a `:path` of `https://A/x`. Such a

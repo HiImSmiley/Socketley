@@ -22,7 +22,9 @@
 # request was read as that body; an HTTP/1.0 client that asked for nothing was
 # kept open, because the proxy always asks its backend for keep-alive; and a
 # POST whose head and a large body arrived in one read was refused 431, the
-# body counted as header bytes.
+# body counted as header bytes.  An HTTP/1.0 request with Transfer-Encoding
+# went to the backend as it came, which RFC 9112 6.1 calls faulty framing: a
+# 1.0 backend may read no chunks and take the body for the next request.
 #
 # ─── WHAT KEEPS IT HONEST ───────────────────────────────────────────────────
 #
@@ -247,6 +249,12 @@ try:
             r.fill(); print("%s open" % st)
         except EOFError:
             print("%s closed %.2f" % (st, time.time() - t))
+    elif case == "te10":
+        s, r = conn()
+        s.sendall(b"POST /cx/te10 HTTP/1.0\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+                  b"3\r\nabc\r\n0\r\n\r\n")
+        st, _ = r.response()
+        print(st)
     elif case == "big":
         s, r = conn()
         body = b"x" * 20000
@@ -314,6 +322,14 @@ if [ "${1:-}" = 401 ] && [ "${2:-}" = 200 ] && secs_under "${3:-99}" 1.5; then
 else bad "pooled with a body owed" "client saw: $R" \
          "want: 401 then 200 in under 1.5 s -- a pooled socket reads the next" \
          "client's request as the first client's body and answers nothing"; fi
+
+# ── 7. HTTP/1.0 with Transfer-Encoding is faulty framing ────────────────────
+R=$(run te10)
+if [ "$R" = 400 ] && ! grep -q '/cx/te10' "$SOCKETLEY_TMPD/be.req"; then
+    ok "an HTTP/1.0 request with Transfer-Encoding is refused 400 and never forwarded"
+else bad "HTTP/1.0 with Transfer-Encoding" "client saw: $R" \
+         "backend parsed: $(grep '/cx/te10' "$SOCKETLEY_TMPD/be.req" | head -1)" \
+         "want: 400, and nothing reaching a backend that may read no chunks"; fi
 
 # Control: every row above talked to the backend it was meant to.
 N=$(grep -cE '^(GET|POST) ' "$SOCKETLEY_TMPD/be.req" 2>/dev/null || true); N=${N:-0}
