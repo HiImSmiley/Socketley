@@ -1029,8 +1029,10 @@ std::string v2_string_to_sign(const request_view& req, const verify_options& opt
     std::vector<std::pair<std::string, std::string>> sub;
     // A parameter written without '=' has no value at all, and is signed so.
     for_each_param(req.raw_query, [&](std::string_view n, std::string_view v) {
-        if (std::ranges::find(v2_subresources, n) != std::end(v2_subresources))
-            sub.emplace_back(std::string(n), v.data() ? "=" + decode_component(v, false) : std::string());
+        // The name is matched and signed decoded, as the handler reads it, so an escaped subresource is never left out.
+        std::string name = decode_component(n, true);
+        if (std::ranges::find(v2_subresources, std::string_view(name)) != std::end(v2_subresources))
+            sub.emplace_back(std::move(name), v.data() ? "=" + decode_component(v, false) : std::string());
     });
     std::ranges::stable_sort(sub, {}, [](const auto& e) { return e.first; });
     for (size_t i = 0; i < sub.size(); ++i)

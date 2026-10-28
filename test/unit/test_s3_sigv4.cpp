@@ -1162,6 +1162,17 @@ TEST_CASE("Signature Version 2: the S3 documentation's examples, a presigned URL
         const s3::request_view unknown{"GET", "/photos/puppy.jpg",
                                        "AWSAccessKeyId=AKIANOBODY&Expires=1141889120&Signature=fScKGHCDI0NY5E7CYp9Vc8VKMbY%3D", h, {}};
         CHECK(std::string(s3::verify(unknown, opts, lookup, 1141889000).code) == "InvalidAccessKeyId");
+        // A subresource added to the signed URL under an escaped name is signed as the handler reads it, so it breaks the signature.
+        for (const sv extra : {"&%76ersionId=1", "&%61cl", "&%72esponse-content-type=text/html", "&versionId=1"})
+        {
+            const std::string q = std::string(rv.raw_query) + std::string(extra);
+            const s3::request_view widened{"GET", "/photos/puppy.jpg", q, h, {}};
+            CHECK(s3::verify(widened, opts, lookup, 1141889000).status == s3::sigv4_status::signature_mismatch);
+        }
+        // A parameter that is no subresource stays outside the signature, as S3 has it.
+        const std::string other_q = std::string(rv.raw_query) + "&foo=bar";
+        const s3::request_view unsigned_param{"GET", "/photos/puppy.jpg", other_q, h, {}};
+        CHECK(s3::verify(unsigned_param, opts, lookup, 1141889000).status == s3::sigv4_status::ok);
     }
 }
 

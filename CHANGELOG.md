@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Content-Length<VT>` or a NUL in a response field name framed the answer one
   way for the proxy and another for a lenient client; such a backend socket
   is now relayed to its close and not reused.
+- **A Signature Version 2 presigned URL signs every subresource it carries.**
+  A subresource added under an escaped name, `%76ersionId` or `%61cl`, was
+  left out of the string to sign but read by the handler, so a presigned GET
+  could be turned into a read of an old version or a `response-*` override,
+  and a PUT into an ACL, tagging or part upload; it now breaks the signature.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's
