@@ -1141,7 +1141,9 @@ The agents a tunnel edge takes:
 prints an invitation, used once, for an agent to offer the services named
 (an HTTP one at
 .IB name . domain ,
-a TCP one on its port), and invited again an agent takes a new one; an HTTP
+a TCP one on its port, on every address of the machine or, as
+.IB name : address : port ,
+on that one alone), and invited again an agent takes a new one; an HTTP
 service with
 .BI = auth
 asks each of its visitors for it, as a proxy's

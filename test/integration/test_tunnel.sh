@@ -12,6 +12,7 @@
 #   * a service's name not beside the edge's, or another runtime given a name a service has
 #   * an agent's offers that edit cannot change, or changes on a running agent that has not restarted
 #   * the entrance's own address logged for who an agent or a person was
+#   * a TCP service given an address opened on every one, or not carried
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -90,7 +91,8 @@ out=$(curl -s -m 3 --unix-socket "$WEB" http://web/x -o /dev/null -w '%{http_cod
     --offer "web=127.0.0.1:$PB,echo=127.0.0.1:$PX" -s >/dev/null 2>&1 && ok || bad "an agent is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for _ in $(seq 1 50); do "$BIN" tunnel t list | grep -q joined && break; sleep 0.1; done
 case "$("$BIN" tunnel t list)" in *joined*) ok ;; *) bad "the agent joins" "$("$BIN" tunnel t list) $(tail -5 "$SOCKETLEY_DLOG")" ;; esac
-KEY=$(find "$HOME/.local/share" -path '*tunnel/home/key' 2>/dev/null | head -1)
+# The edge marks the agent joined before the agent has read the answer and kept the key it carries.
+for _ in $(seq 1 50); do KEY=$(find "$HOME/.local/share" -path '*tunnel/home/key' 2>/dev/null | head -1); [ -s "$KEY" ] && break; sleep 0.1; done
 [ "$(stat -c %a "$KEY" 2>/dev/null)" = 600 ] && ok || bad "and keeps its key, readable by its owner alone" "$KEY"
 
 tally < <(python3 - "$WEB" "$PT" 2>&1 <<'PY' || echo "bad the transfer checks ran to their end"
@@ -215,8 +217,24 @@ PY
 fi
 
 # A service the edge was told of and the agent does not offer is refused at the agent, its link kept.
-"$BIN" tunnel t set pi --http web,ghost --tcp "echo:$PT" && ok || bad "set changes an agent's services" "rc $?"
+"$BIN" tunnel t set pi --http web,ghost --tcp "echo:127.0.0.1:$PT" && ok || bad "set changes an agent's services" "rc $?"
 sleep 1.5
+# A TCP service given an address is opened on that one alone, and carried as before.
+[ "$(ss -Hltn "sport = :$PT" | awk '{print $4}')" = "127.0.0.1:$PT" ] && ok \
+    || bad "a TCP service given an address listens there alone" "$(ss -Hltn "sport = :$PT")"
+"$BIN" tunnel t list | grep -q "echo:127.0.0.1:$PT" && ok || bad "and list says where" "$("$BIN" tunnel t list)"
+# The entrance's upgrade above took the agent's link over, so it is waited for while it dials again.
+bound() { python3 -c "
+import socket, sys
+s = socket.create_connection(('127.0.0.1', $PT), timeout=5); s.sendall(b'bound'); s.shutdown(1)
+d = b''
+while True:
+    c = s.recv(100)
+    if not c: break
+    d += c
+print(d.decode())" 2>&1; }
+for _ in $(seq 1 80); do out=$(bound); [ "$out" = bound ] && break; sleep 0.1; done
+[ "$out" = bound ] && ok || bad "and carried to the agent" "$out"
 GHOST=$(sock_of ghost)
 for _ in $(seq 1 30); do [ -S "$GHOST" ] && break; sleep 0.1; done
 out=$(curl -s -m 3 --unix-socket "$GHOST" http://ghost/ -o /dev/null -w '%{http_code}' 2>&1)

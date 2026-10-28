@@ -458,7 +458,7 @@ int join_main(int argc, char** argv)
     while (!c.empty())
     {
         const std::string_view s = socketley::take_item(c);
-        std::cout << machine << s.substr(s.find(':')) << "\n";
+        std::cout << machine << s.substr(s.rfind(':')) << "\n";
     }
     return 0;
 }

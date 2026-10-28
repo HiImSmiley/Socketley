@@ -341,7 +341,8 @@ void tunnel_run::dial_leg(link& l, uint32_t stream, std::string_view target)
                 if (a.joined && a.name == target.substr(0, slash))
                     for (const service& s : a.services)
                         if (!s.http && s.name == target.substr(slash + 1))
-                            addr = "127.0.0.1:" + std::to_string(s.port);
+                            addr = (s.bind.empty() || s.bind == "0.0.0.0" ? std::string("127.0.0.1") : s.bind) + ":" +
+                                   std::to_string(s.port);
     }
     else if (const auto it = m_offers.find(std::string(target)); it != m_offers.end())
         addr = it->second;
@@ -671,7 +672,8 @@ void tunnel_run::reload_agents()
         for (const agent& a : agents)
             for (const service& s : a.services)
                 kept = kept || (a.name == it->second->agent && s.name == it->first && s.http == it->second->svc.http &&
-                                s.port == it->second->svc.port && s.auth == it->second->svc.auth);
+                                s.port == it->second->svc.port && s.bind == it->second->svc.bind &&
+                                s.auth == it->second->svc.auth);
         if (kept)
         {
             ++it;
@@ -688,8 +690,11 @@ void tunnel_run::reload_agents()
                 continue;
             auto h = std::make_unique<leg_hooks>(*this, a.name, s);
             std::string err;
+            in_addr on{htonl(INADDR_ANY)};
+            if (!s.bind.empty() && ::inet_pton(AF_INET, s.bind.c_str(), &on) != 1)
+                on.s_addr = htonl(INADDR_LOOPBACK);
             const bool ok = s.http ? h->srv.listen_unix(service_socket(m_owner.get_name(), s.name), err)
-                                   : h->srv.listen_tcp(htonl(INADDR_ANY), s.port, false, err);
+                                   : h->srv.listen_tcp(on.s_addr, s.port, false, err);
             if (!ok)
             {
                 LOG_WARN(("tunnel " + std::string(m_owner.get_name()) + ": the service " + s.name + " of " + a.name +

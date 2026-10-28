@@ -3647,7 +3647,8 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
                 const tn::service& s = a.services[i];
                 if (i)
                     out += ',';
-                out += s.http ? s.name + (s.auth.empty() ? "" : "=" + s.auth) : s.name + ":" + std::to_string(s.port);
+                out += s.http ? s.name + (s.auth.empty() ? "" : "=" + s.auth)
+                              : s.name + (s.bind.empty() ? "" : ":" + s.bind) + ":" + std::to_string(s.port);
             }
             out += "\n";
         }

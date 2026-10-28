@@ -22,6 +22,8 @@ struct service
     bool http{true};
     std::string name;
     uint16_t port{0};
+    // The IPv4 address a TCP service's port is opened on, empty for every one the edge's machine has.
+    std::string bind;
     // What an HTTP service asks of each request, as a proxy's --auth does; empty lets every visitor through.
     std::string auth;
 };

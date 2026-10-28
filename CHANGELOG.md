@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A tunnel's TCP service on one address.** `--tcp ssh:127.0.0.1:2201` opens
+  the port on that address alone, for a service only `tunnel ssh --agent`
+  reaches, where every TCP service was opened on all of them.
 - **ssh to a machine at home.** `socketley tunnel ssh <edge> --agent pi` as ssh's
   `ProxyCommand` reaches the agent pi's `ssh` service through port 443, for an
   admin of the edge's idp; `tunnel connect <edge> pi/<service>` any TCP service

@@ -291,10 +291,18 @@ TEST_CASE("the agents file is read as written, and refuses what it cannot be")
     CHECK(agents[0].services[1].port == 25565);
     CHECK(agents[0].services[0].auth == "idp:auth");
     CHECK(agents[1].services[0].auth.empty());
+    CHECK(agents[0].services[1].bind.empty());
     CHECK_FALSE(agents[1].joined);
     std::vector<agent> again;
     REQUIRE(parse_agents(render_agents(agents), again, why));
     CHECK(render_agents(again) == render_agents(agents));
+
+    // A TCP service on one address alone keeps it, the port after it.
+    REQUIRE(parse_agents("agent pi joined " + hash + " tcp:ssh:127.0.0.1:2201\n", agents, why));
+    CHECK(agents[0].services[0].name == "ssh");
+    CHECK(agents[0].services[0].bind == "127.0.0.1");
+    CHECK(agents[0].services[0].port == 2201);
+    CHECK(render_agents(agents).find(" tcp:ssh:127.0.0.1:2201\n") != std::string::npos);
 
     const auto refused = [&](const std::string& text) {
         std::vector<agent> out;
@@ -307,6 +315,8 @@ TEST_CASE("the agents file is read as written, and refuses what it cannot be")
     CHECK(refused("agent pi joined " + hash + " ftp:web\n"));
     CHECK(refused("agent pi joined " + hash + " tcp:mc:0\n"));
     CHECK(refused("agent pi joined " + hash + " tcp:mc:70000\n"));
+    CHECK(refused("agent pi joined " + hash + " tcp:mc:localhost:25565\n"));
+    CHECK(refused("agent pi joined " + hash + " tcp:mc:1.2.3:25565\n"));
     CHECK(refused("agent pi joined " + hash + " http:web,http:web\n"));
     CHECK(refused("agent pi joined " + hash + " http:web=\n"));
     CHECK(refused("agent pi joined " + hash + " http:Web=idp:auth\n"));

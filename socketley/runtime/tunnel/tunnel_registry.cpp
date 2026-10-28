@@ -3,6 +3,7 @@
 #include <charconv>
 #include <filesystem>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
@@ -53,11 +54,15 @@ bool parse_service(std::string_view s, service& out)
     if (!s.starts_with("tcp:"))
         return false;
     s.remove_prefix(4);
-    const size_t colon = s.rfind(':');
+    // `<name>:<port>`, or `<name>:<address>:<port>` for a port opened on that address alone.
+    const size_t first = s.find(':'), colon = s.rfind(':');
     if (colon == std::string_view::npos)
         return false;
     out.http = false;
-    out.name = std::string(s.substr(0, colon));
+    out.name = std::string(s.substr(0, first));
+    out.bind = first == colon ? std::string() : std::string(s.substr(first + 1, colon - first - 1));
+    if (in_addr a{}; !out.bind.empty() && ::inet_pton(AF_INET, out.bind.c_str(), &a) != 1)
+        return false;
     const std::string_view p = s.substr(colon + 1);
     uint32_t port = 0;
     const auto [end, ec] = std::from_chars(p.data(), p.data() + p.size(), port);
@@ -71,7 +76,7 @@ std::string render_service(const service& s)
 {
     if (s.http)
         return "http:" + s.name + (s.auth.empty() ? "" : "=" + s.auth);
-    return "tcp:" + s.name + ":" + std::to_string(s.port);
+    return "tcp:" + s.name + (s.bind.empty() ? "" : ":" + s.bind) + ":" + std::to_string(s.port);
 }
 
 }   // namespace
@@ -202,7 +207,8 @@ bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::ve
         const std::string_view n = trim_blanks(take_item(tcp_csv));
         if (!parse_service("tcp:" + std::string(n), s))
         {
-            why = "--tcp takes <name>:<port>, the port the edge serves it on";
+            why = "--tcp takes <name>:<port>, the port the edge serves it on, or <name>:<address>:<port> for that "
+                  "address alone";
             return false;
         }
         out.push_back(std::move(s));
