@@ -29,8 +29,8 @@
 #   * IMAP4rev2 still saying RECENT or UNSEEN, or answering SEARCH without ESEARCH; $ not what SAVE kept; a SELECT
 #     not saying CLOSED; STATUS without DELETED
 #   * a folder shared by ACL not listed, read or written as its rights say, a right not given taken anyway, or one
-#     taken away kept; a MOVE into another's folder; the imapsieve script, which runs as the owner, named by a share
-#     with w
+#     taken away kept, by a session that has the folder selected too; a MOVE into another's folder; the imapsieve
+#     script, which runs as the owner, named by a share with w
 #   * AUTHENTICATE PLAIN not signing in, with its response at once or after the continuation; DELETE INBOX taken; an
 #     APPEND past the largest message waited for; the command parser answering differently as its input is cut
 #   * BINARY giving a part still encoded, a NUL in a plain literal, or an encoding it cannot undo answered OK
@@ -458,7 +458,17 @@ elif step == "acl":
     g = b.cmd("GETMETADATA Team /shared/imapsieve/script")
     say("with w a share sets a /shared entry but not the imapsieve script, which runs as the owner",
         "[NOPERM]" in r[-1] and r2[-1].split()[1] == "OK" and any("/shared/imapsieve/script NIL" in x for x in g), (r, r2, g))
+    a.cmd('SELECT "Other Users/bob/Team"')
+    b.cmd("SETACL Team alice lr")
+    r = a.cmd("STORE 1 +FLAGS (\\Flagged)")
+    f = b.cmd("FETCH 1 (FLAGS)")
+    say("rights taken from a share hold for a session that has it selected: lr left is read-only",
+        "[READ-ONLY]" in r[-1] and not any("\\Flagged" in x for x in f), (r, f))
     b.cmd("DELETEACL Team alice")
+    f = a.cmd("FETCH 1 (BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    s = a.cmd("UID SEARCH ALL")
+    say("and DELETEACL closes it there: nothing more is read", "[NOPERM]" in f[-1] and not any("team note" in x for x in f)
+        and s[-1].split()[1] == "BAD", (f, s))
     r = a.cmd('SELECT "Other Users/bob/Team"')
     l = a.cmd('LIST "" "Other Users/*"')
     say("DELETEACL takes it all away: not selected, not listed", "[NONEXISTENT]" in r[-1] and not any("Team" in x for x in l), (r, l))

@@ -469,6 +469,27 @@ void imap_session::refuse(const std::string& tag, const place& p)
     finish(tag, "NO", "[NOPERM] The mailbox's owner has not given that right");
 }
 
+bool imap_session::share_held()
+{
+    if (!m_folder || m_owner == m_user)
+        return true;
+    m_store.refresh(m_owner);
+    m_rights = m_store.rights(m_owner, m_folder->name, m_user);
+    const auto may = [this](char r) { return m_rights.find(r) != std::string::npos; };
+    if (!may('r'))
+    {
+        m_folder.reset();
+        m_view.clear();
+        m_saved.clear();
+        m_state = state::auth;
+        return false;
+    }
+    // A share that keeps r but loses every right to change anything is read-only from now on (RFC 4314 4).
+    if (!(may('s') || may('w') || may('t') || may('e')))
+        m_readonly = true;
+    return true;
+}
+
 void imap_session::greet()
 {
     untagged("OK [CAPABILITY " + capabilities(m_cfg) + "] " + m_cfg.hostname + " IMAP4rev1 socketley ready");
@@ -939,12 +960,11 @@ void imap_session::command(std::string tag, std::vector<token> a)
     }
     const std::string cmd = upper(a[0].text);
     const bool authed = m_state == state::auth || m_state == state::selected;
-    const bool selected = m_state == state::selected;
-    // What another shard changed of this user's mailboxes is read in before each command.
+    // What another shard changed of this user's mailboxes is read in before each command, and a share's rights with it.
     if (authed)
         m_store.refresh(m_user);
-    if (selected && m_owner != m_user)
-        m_store.refresh(m_owner);
+    const bool taken_back = m_state == state::selected && !share_held();
+    const bool selected = m_state == state::selected;
     const auto str = [&](size_t i) -> const std::string* {
         return i < a.size() && (a[i].k == token::atom || a[i].k == token::string) ? &a[i].text : nullptr;
     };
@@ -1186,6 +1206,8 @@ void imap_session::command(std::string tag, std::vector<token> a)
         update_view();
         return;
     }
+    if (taken_back)
+        return finish(tag, "NO", "[NOPERM] The mailbox's owner has taken the share back");
     if (!selected)
         return finish(tag, "BAD", "Select a mailbox first");
     if (cmd == "CLOSE" || cmd == "UNSELECT")
@@ -3186,6 +3208,9 @@ void imap_session::poll()
     if (between && !m_notify.empty())
         notify_changes(false);
     if (!m_folder || !(m_idle || (between && m_notify_selected)))
+        return;
+    // A share taken back while the client waits tells it nothing more of the folder.
+    if (!m_running && !m_waiting && !share_held())
         return;
     m_store.open(m_owner, m_folder->name, [this, alive = m_alive](std::shared_ptr<imap_folder>) {
         if (*alive && (m_idle || m_notify_selected) && !m_running && !m_waiting)

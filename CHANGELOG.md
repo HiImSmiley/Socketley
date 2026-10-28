@@ -181,6 +181,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **A share taken back ends in the sessions that have it selected.** Rights
+  were read once, at SELECT, so after DELETEACL a grantee who kept the folder
+  open went on reading, searching, flagging and expunging the owner's mail
+  for as long as the connection lasted, and IDLE kept telling its changes; each
+  command now reads the rights again, a folder without `r` is closed with
+  `[NOPERM]`, and one left without a right to change anything is read-only.
 - **Only a mailbox's owner names its imapsieve script.** A user given `w`
   on another's folder could set `/shared/imapsieve/script` to one of the
   owner's Sieve scripts, which then ran as the owner on every message the user

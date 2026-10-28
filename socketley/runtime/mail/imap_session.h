@@ -152,6 +152,9 @@ private:
     std::string seen_as(const std::string& owner, const std::string& folder) const;
     // NO [NONEXISTENT] where the user may not even see the folder, NO [NOPERM] where they may but not do this.
     void refuse(const std::string& tag, const place& p);
+    // Whether another user's selected folder may still be read, its rights taken again from the owner's ACL as it is
+    // now and the folder closed where they no longer give r.
+    bool share_held();
     // SETACL, DELETEACL, GETACL, LISTRIGHTS and MYRIGHTS (RFC 4314).
     void cmd_acl(const std::string& tag, const std::string& cmd, const std::vector<token>& a);
     static constexpr std::string_view others = "Other Users/";
