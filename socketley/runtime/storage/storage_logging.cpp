@@ -34,9 +34,29 @@ std::chrono::milliseconds access_log_interval()
     return std::chrono::milliseconds(ms);
 }
 
+// Appends `v` with every byte that could end or split a field, or the line, percent-encoded.
+void escaped(std::string& out, std::string_view v)
+{
+    static constexpr char digits[] = "0123456789ABCDEF";
+    for (const char ch : v)
+    {
+        const auto b = static_cast<unsigned char>(ch);
+        if (b <= 0x20 || b >= 0x7f || ch == '"' || ch == '\\')
+        {
+            out += '%';
+            out += digits[b >> 4];
+            out += digits[b & 15];
+        }
+        else
+            out += ch;
+    }
+}
+
 void plain(std::string& out, std::string_view v)
 {
-    out += v.empty() ? std::string_view("-") : v;
+    if (v.empty())
+        out += '-';
+    escaped(out, v);
     out += ' ';
 }
 
@@ -203,17 +223,18 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
         url_encode_to(l, k, true);
         l += ' ';
     }
+    // The request line as the client wrote it, so none of it may close the quotes.
     l += '"';
-    l += r.method;
+    escaped(l, r.method);
     l += ' ';
-    l += r.raw_path;
+    escaped(l, r.raw_path);
     if (!r.raw_query.empty())
     {
         l += '?';
-        l += r.raw_query;
+        escaped(l, r.raw_query);
     }
     l += ' ';
-    l += r.version.empty() ? std::string_view("HTTP/1.1") : r.version;
+    escaped(l, r.version.empty() ? std::string_view("HTTP/1.1") : std::string_view(r.version));
     l += "\" ";
     number(l, static_cast<uint64_t>(status), false);
     plain(l, op.empty() ? std::string_view(c->error_code) : error);
@@ -224,7 +245,8 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     l += "- ";
     quoted(l, r.header("referer"));
     quoted(l, r.header("user-agent"));
-    plain(l, r.header("x-amz-version-id"));
+    // The version the request names, as S3 logs it, and not a header any client may send.
+    plain(l, r.get_query("versionId"));
     l += "- ";
     const bool v2_query = r.has_query("AWSAccessKeyId") && r.has_query("Signature");
     const bool by_query = r.raw_query.find("X-Amz-Algorithm=") != std::string_view::npos || v2_query;

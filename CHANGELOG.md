@@ -69,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Content-Length<VT>` or a NUL in a response field name framed the answer one
   way for the proxy and another for a lenient client; such a backend socket
   is now relayed to its close and not reused.
+- **A client cannot forge fields of a bucket's access log.** The request line
+  was written into its quoted field as sent, so a `"` in the path closed it,
+  and the version and host fields took a header's spaces as they came, each
+  adding fields a parser reads by position, from a request with no credentials
+  at all. Every field a client writes is now percent-encoded where a byte would
+  end or split it, and the Version Id is the request's `versionId`, as in S3.
 - **An object key is UTF-8.** A PUT, POST, copy or multipart upload took any
   bytes as its key, `%FF` included, and ListObjects wrote them out raw in a
   document it declares UTF-8, so one writer made the bucket's listing

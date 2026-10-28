@@ -92,6 +92,16 @@ curl -s -A 'batch/1.0' -X POST "$U/src?delete" -H "Content-MD5: $(printf '%s' "$
 text=$(logs_text site/ 3 batch/1.0)
 check "a DeleteObjects is a MULTI_OBJECT_DELETE line" "$(printf '%s\n' "$text" | grep -c 'REST\.POST\.MULTI_OBJECT_DELETE - "POST /src?delete HTTP/1\.1" 200 ')" 1
 check "and a BATCH.DELETE.OBJECT line for each key" "$(printf '%s\n' "$text" | grep -cE 'BATCH\.DELETE\.OBJECT d[12] .* 204 - ')" 2
+# A client's bytes neither close the request's quotes nor add fields, from the path, the query or a header.
+exec 3<>"/dev/tcp/127.0.0.1/$P1"
+printf 'GET /src/x"%%20200%%20-%%20forged?versionId=v%%201 HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nUser-Agent: forge/1.0\r\nX-Amz-Version-Id: abc 1.2.3.4 200\r\nConnection: close\r\n\r\n' "$P1" >&3
+timeout 5 cat <&3 >/dev/null
+exec 3<&-
+text=$(logs_text site/ 1 forge/1.0)
+check "a quote in the path is percent-encoded in the request's field" \
+    "$(printf '%s\n' "$text" | grep -c '"GET /src/x%22%20200%20-%20forged?versionId=v%201 HTTP/1\.1" ')" 1
+check "the version is the request's versionId, its space encoded" "$(printf '%s\n' "$text" | grep -c '"forge/1.0" v%201 - ')" 1
+check "and a header's spaces add no field" "$(printf '%s\n' "$text" | grep -c '1\.2\.3\.4')" 0
 keys=$(curl -s "$U/logs?list-type=2&prefix=site/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g')
 check "a log object is named prefix, delivery time and a unique suffix" \
     "$(printf '%s\n' "$keys" | grep -vcE '^site/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9A-F]{16}$')" 0
