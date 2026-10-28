@@ -18,6 +18,7 @@
 #   * a session replacing a second step that is on, or one turned on meanwhile, without a code of it
 #   * a session alone turning a second step on or making an app password, or an app password outliving a sign-out
 #     everywhere
+#   * an app password removed while another is being made coming back with it
 #   * a storage's users not coming over with the passwords they have there
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted
@@ -297,6 +298,22 @@ if phase == "main":
     for bad in ("dora@example.com\t9G", "dora@example.com\nx", "dora", "do ra@example.com"):
         check("nor one that is no plain address: %r" % bad, req("POST", "/account", dict(name="Dora", email=bad), cookie=dc)[0], 400)
     check("but one of their own", req("POST", "/account", dict(name="Dora", email="dora@else.example"), cookie=dc)[0], 200)
+    # An app password removed while another is being checked and hashed stays removed.
+    import threading
+    D = {"X-Forwarded-For": "198.51.100.82"}
+    st, body, _ = req("POST", "/account/app-password", dict(do="add", label="Old", password="dorapassword1"), cookie=dc, headers=D)
+    check("an app password is made on the password", (st, "shown this once" in body), (200, True))
+    raced = {}
+    def add_new():
+        raced["add"] = req("POST", "/account/app-password", dict(do="add", label="New", password="dorapassword1"), cookie=dc, headers=D)[0]
+    adding = threading.Thread(target=add_new)
+    adding.start()
+    time.sleep(0.03)
+    raced["remove"] = req("POST", "/account/app-password", dict(do="remove", label="Old"), cookie=dc, headers=D)[0]
+    adding.join()
+    labels = re.findall(r'name="label" value="([^"]+)"><span>', req("GET", "/account", cookie=dc)[1])
+    check("an app password removed while another is made stays removed", (raced.get("remove"), raced.get("add"), labels),
+          (200, 200, ["New"]))
     dcode = code_of(req("GET", "/authorize" + q(**dict(auth, scope="openid email")), cookie=dc)[2])[0].get("code")
     st, body, _ = exchange(dcode)
     try:

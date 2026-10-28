@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   percent-encoded was verified with the signer's key but then judged as
   anonymous, so Deny statements naming the signer did not apply to it and a
   bucket policy could be put by a user who owns nothing.
+- **An app password removed while another is made stays removed.** Making
+  one on the account page wrote back the list as it was read before its
+  password was checked and hashed, so one removed meanwhile, there or with
+  `idp-user`, signed mail apps in again; the list is now read again after the
+  hash, and both making and removing write only while it is still what they
+  read.
 - **A session alone makes no app password and turns no second step on or off.**
   The account page made an app password, a way into the mail that outlives
   the session, and began a second step on the session cookie alone; both now

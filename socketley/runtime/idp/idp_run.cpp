@@ -135,6 +135,27 @@ field_list stale_families(const account& who, int64_t now)
     return out;
 }
 
+// An account's app passwords, a line each: label, hash and when it was made, apart by tabs.
+std::vector<std::string> app_password_lines(std::string_view field)
+{
+    std::vector<std::string> out;
+    for (std::string_view rest = field; !rest.empty();)
+    {
+        const size_t nl = rest.find('\n');
+        if (const std::string_view l = rest.substr(0, nl); !l.empty())
+            out.emplace_back(l);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+    }
+    return out;
+}
+
+// Whether `lines` hold an app password labelled `label`.
+bool has_app_password(const std::vector<std::string>& lines, std::string_view label)
+{
+    return std::any_of(lines.begin(), lines.end(),
+                       [&](const std::string& l) { return std::string_view(l).substr(0, l.find('\t')) == label; });
+}
+
 // The storage interface's look, its sign-in card with the page's own forms in it, so a sign-in reads as one product.
 std::string page(std::string_view title, std::string_view body)
 {
@@ -2490,15 +2511,9 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
     if (rq.path == "/account/app-password")
     {
         const std::string label(param(p, "label"));
-        std::vector<std::string> lines;
-        for (std::string_view rest = who->field("app_passwords"); !rest.empty();)
-        {
-            const size_t nl = rest.find('\n');
-            if (const std::string_view l = rest.substr(0, nl); !l.empty())
-                lines.emplace_back(l);
-            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
-        }
-        const auto label_of = [](const std::string& l) { return l.substr(0, l.find('\t')); };
+        // The list as read here, which a change waits on still holding at shard 0, so none made meanwhile is undone.
+        const std::string was(who->field("app_passwords"));
+        std::vector<std::string> lines = app_password_lines(was);
         if (label.empty() || label.size() > 64 || label.find_first_of("\t\n") != std::string::npos)
         {
             account_page(c, rq, {}, "Name what the app password is for.", 400);
@@ -2506,17 +2521,17 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
         }
         if (what == "remove")
         {
-            std::erase_if(lines, [&](const std::string& l) { return label_of(l) == label; });
+            std::erase_if(lines, [&](const std::string& l) { return std::string_view(l).substr(0, l.find('\t')) == label; });
             std::string joined;
             for (const auto& l : lines)
                 joined += l + "\n";
             c->waiting = true;
-            update_account(id, {{"app_passwords", joined}}, saved("Removed."));
+            update_account(id, {{"?app_passwords", was}, {"app_passwords", joined}}, saved("Removed."));
             return;
         }
         if (what == "add")
         {
-            if (lines.size() >= 10 || std::any_of(lines.begin(), lines.end(), [&](const std::string& l) { return label_of(l) == label; }))
+            if (lines.size() >= 10 || has_app_password(lines, label))
             {
                 account_page(c, rq, {}, lines.size() >= 10 ? "Ten app passwords are the most; remove one first."
                                                            : "An app password of that name is there already.", 400);
@@ -2532,7 +2547,7 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
             for (size_t i = 0; i < 16; ++i)
                 pw += std::string(i && i % 4 == 0 ? "-" : "") + static_cast<char>('a' + static_cast<unsigned char>(raw[i]) % 26);
             c->waiting = true;
-            prove_again(c, rq, *who, p, [this, weak, rq, id, lines, label, pw](int status, std::string_view why) {
+            prove_again(c, rq, *who, p, [this, weak, rq, id, label, pw](int status, std::string_view why) {
                 if (status != 0)
                 {
                     auto cc = weak.lock();
@@ -2543,12 +2558,29 @@ void idp_run::security_post(const std::shared_ptr<conn>& c, const request& rq)
                     m_http.resume(cc);
                     return;
                 }
-                hash_password(pw, [this, weak, rq, id, lines, label, pw](std::string hash) {
+                hash_password(pw, [this, weak, rq, id, label, pw](std::string hash) {
+                    auto cc = weak.lock();
+                    if (!cc || cc->dead)
+                        return;
+                    // Read again, as an app password removed or made while this one was checked and hashed stays so.
+                    const account* me = m_accounts.by_id(id);
+                    const std::string now_was(me ? me->field("app_passwords") : std::string_view{});
+                    const std::vector<std::string> now_lines = app_password_lines(now_was);
+                    if (hash.empty() || !me || now_lines.size() >= 10 || has_app_password(now_lines, label))
+                    {
+                        cc->waiting = false;
+                        account_page(cc, rq, {}, hash.empty() ? "The password could not be made; try again."
+                                                              : "Ten app passwords are the most, or one of that name is there already.",
+                                     hash.empty() ? 503 : 400);
+                        m_http.resume(cc);
+                        return;
+                    }
                     std::string joined;
-                    for (const auto& l : lines)
+                    for (const auto& l : now_lines)
                         joined += l + "\n";
                     joined += label + "\t" + hash + "\t" + std::to_string(wall::now_sec()) + "\n";
-                    update_account(id, {{"app_passwords", joined}}, [this, weak, rq, label, pw](bool ok, const std::string& why) {
+                    update_account(id, {{"?app_passwords", now_was}, {"app_passwords", joined}},
+                                   [this, weak, rq, label, pw](bool ok, const std::string& why) {
                         auto cc = weak.lock();
                         if (!cc || cc->dead)
                             return;
