@@ -256,6 +256,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unsent, up to 256 MiB a connection, and one with answers waiting was never
   closed. Past 64 KiB unsent its queries now wait unread, and a connection
   whose answers have not moved for 30 seconds is closed.
+- **A client id that begins with `$` takes nothing from an ACL pattern.** Under
+  `pattern read %c/#`, a client that connected as `$SYS` was granted `$SYS/#`
+  and read the broker's figures; a `%c` or `%u` that would open the filter with
+  `$` now grants nothing, and a deny with it holds for everything.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

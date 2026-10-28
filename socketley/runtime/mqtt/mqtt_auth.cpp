@@ -166,7 +166,8 @@ std::string acl_rules::expand(const rule& r, std::string_view user, std::string_
         if (r.filter[i] == '%' && i + 1 < r.filter.size() && (r.filter[i + 1] == 'u' || r.filter[i + 1] == 'c'))
         {
             const std::string_view v = r.filter[i + 1] == 'u' ? user : client;
-            if (bad(v))
+            // A name that would open the filter with `$` would reach the tree that wildcards are kept out of.
+            if (bad(v) || (out.empty() && v.front() == '$'))
                 return {};
             out += v;
             ++i;

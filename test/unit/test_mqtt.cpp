@@ -443,6 +443,13 @@ TEST_CASE("the ACL grants by user and pattern, and a deny wins")
     CHECK_FALSE(a.may_subscribe("alice", "c1", "#"));
     // A name holding a separator cannot widen a pattern.
     CHECK_FALSE(a.may_write("bob", "a/b", "devices/a/b/x"));
+    // A name that would open the filter with `$` cannot reach the $ tree.
+    acl_rules lead;
+    REQUIRE(lead.parse("pattern read %c/#\n", why));
+    CHECK(lead.may_subscribe("", "dev1", "dev1/#"));
+    CHECK_FALSE(lead.may_subscribe("", "$SYS", "$SYS/#"));
+    CHECK_FALSE(lead.may_read("", "$SYS", "$SYS/broker/version"));
+    CHECK(a.may_write("bob", "$dev", "devices/$dev/x"));
     CHECK_FALSE(a.parse("topic sometimes a/b\n", why));
     CHECK_FALSE(a.parse("topic read a/#/b\n", why));
     CHECK(filter_covers("a/#", "a/b/c"));
