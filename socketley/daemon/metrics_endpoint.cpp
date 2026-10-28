@@ -1169,7 +1169,10 @@ void metrics_endpoint::sample()
             const storage_row row = parse_storage_row(name, detail);
             if (rt->get_type() == runtime_storage)
             {
-                a.dir.assign(static_cast<const storage_instance*>(rt.get())->get_dir());
+                {
+                    const auto held = rt->config_lock();
+                    a.dir.assign(static_cast<const storage_instance*>(rt.get())->get_dir());
+                }
                 row.get("bytes", a.used);
                 row.get("max_bytes", a.limit);
             }

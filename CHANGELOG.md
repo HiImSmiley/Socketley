@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is routed once an agent has joined, and two edges' services of one name do
   not share it; a service's auth with an empty method or a `#` is refused, and
   an edge serves no service whose auth it cannot read.
+- **The dashboard while a runtime is edited.** A dashboard page or an alert
+  check that read a runtime's certificate, address or socket path while
+  `edit` or `import` changed it could read freed memory and crash the daemon;
+  the two now take turns.
 - **A tunnel's TCP service on one address.** `--tcp ssh:127.0.0.1:2201` opens
   the port on that address alone, for a service only `tunnel ssh --agent`
   reaches, where every TCP service was opened on all of them.

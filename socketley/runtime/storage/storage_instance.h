@@ -33,7 +33,11 @@ public:
     ~storage_instance() override;
 
     // Where the buckets live.
-    void set_dir(std::string_view dir) { m_dir = std::string(dir); }
+    void set_dir(std::string_view dir)
+    {
+        const auto held = config_lock();
+        m_dir = std::string(dir);
+    }
     std::string_view get_dir() const { return m_dir; }
 
     // Requests are accepted without credentials.  Off unless asked for, and

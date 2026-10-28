@@ -466,6 +466,7 @@ std::string cert_json(const std::string& path)
 
 std::string served_cert(const runtime_instance& rt)
 {
+    const auto held = rt.config_lock();
     std::string cert(rt.get_cert_path());
     if (cert.empty() && !rt.get_acme_domains().empty())
         cert = cert_keeper::acme_cert_path(rt.get_acme_domains().front());
@@ -495,6 +496,7 @@ void server::edge(int fd, const request& r)
             i.type = type_to_string(rt->get_type());
             i.tls = rt->get_tls();
             i.cert = served_cert(*rt);
+            const auto held = rt->config_lock();
             i.acme = !rt->get_acme_domains().empty();
             const std::string bind(rt->get_bind_address());
             i.address = !rt->get_listen_path().empty() ? "unix:" + std::string(rt->get_listen_path())
@@ -637,8 +639,11 @@ void server::zone(int fd, const request& r)
     {
         std::shared_lock lock(m_manager.mutex);
         if (const auto* rt = m_manager.get(runtime); rt && rt->get_type() == runtime_dns)
+        {
+            const auto held = rt->config_lock();
             for (const std::string& p : static_cast<const dns_instance*>(rt)->zone_paths())
                 served = served || p == path;
+        }
     }
     if (!served)
     {

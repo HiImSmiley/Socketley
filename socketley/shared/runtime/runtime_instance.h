@@ -450,6 +450,10 @@ public:
         return m_worker_backed.load(std::memory_order_acquire);
     }
 
+    // Held by a thread off the event loop while it copies the cert, ACME, bind, listen or a type's own path strings,
+    // whose setters take it too because edit and import reassign them while the metrics thread reads.
+    std::unique_lock<std::mutex> config_lock() const { return std::unique_lock(m_config_mutex); }
+
     // Straight to `failed`, for a supervisor that has decided a child is not
     // coming back, and not a transition any runtime makes to itself.
     void mark_failed() { store_state(runtime_failed); }
@@ -888,6 +892,8 @@ private:
     mutable std::mutex m_stat_detail_mutex;
     std::string m_stat_detail;
     std::atomic<bool> m_worker_backed{false};
+    // Guards the assignment of the strings config_lock() names, and nothing on the event loop reads under it.
+    mutable std::mutex m_config_mutex;
 
     std::string m_name;
     std::string m_id;
@@ -896,7 +902,8 @@ private:
     bool m_armed_io = false;
     // See last_on_start_error().  Empty unless the most recent on_start raised.
     std::string m_on_start_error;
-    uint16_t m_port = 0;
+    // Atomic, as m_tls is, because the metrics thread reads both while edit sets them.
+    std::atomic<uint16_t> m_port{0};
     std::string m_listen_path;
     std::string m_bind_address;
     std::string m_companion_path;
@@ -973,7 +980,7 @@ private:
     int m_reconnect = -1; // -1 = disabled, 0 = infinite, >0 = max attempts
 
     // TLS
-    bool m_tls = false;
+    std::atomic<bool> m_tls{false};
     std::string m_cert_path;
     std::string m_key_path;
     std::string m_ca_path;

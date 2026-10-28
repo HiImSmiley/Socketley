@@ -428,16 +428,17 @@ void runtime_instance::note_restart()
 
 void runtime_instance::set_port(uint16_t port)
 {
-    m_port = port;
+    m_port.store(port, std::memory_order_relaxed);
 }
 
 uint16_t runtime_instance::get_port() const
 {
-    return m_port;
+    return m_port.load(std::memory_order_relaxed);
 }
 
 void runtime_instance::set_listen_path(std::string_view path)
 {
+    const auto held = config_lock();
     m_listen_path = path;
 }
 
@@ -448,6 +449,7 @@ std::string_view runtime_instance::get_listen_path() const
 
 void runtime_instance::set_bind_address(std::string_view address)
 {
+    const auto held = config_lock();
     m_bind_address = address;
 }
 
@@ -1178,11 +1180,16 @@ int runtime_instance::get_reconnect() const { return m_reconnect; }
 
 // ─── TLS ───
 
-void runtime_instance::set_tls(bool enabled) { m_tls = enabled; }
-bool runtime_instance::get_tls() const { return m_tls; }
-void runtime_instance::set_cert_path(std::string_view path) { m_cert_path = path; }
+void runtime_instance::set_tls(bool enabled) { m_tls.store(enabled, std::memory_order_relaxed); }
+bool runtime_instance::get_tls() const { return m_tls.load(std::memory_order_relaxed); }
+void runtime_instance::set_cert_path(std::string_view path)
+{
+    const auto held = config_lock();
+    m_cert_path = path;
+}
 void runtime_instance::set_acme_domains(std::string_view comma_list)
 {
+    const auto held = config_lock();
     m_acme_domains.clear();
     while (!comma_list.empty())
     {

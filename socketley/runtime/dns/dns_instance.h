@@ -38,9 +38,14 @@ public:
     ~dns_instance() override;
 
     // The zone files served, comma-separated (--zone, which may be given more than once).
-    void set_zones(std::string_view csv) { m_zones = std::string(csv); }
+    void set_zones(std::string_view csv)
+    {
+        const auto held = config_lock();
+        m_zones = std::string(csv);
+    }
     void add_zone(std::string_view path)
     {
+        const auto held = config_lock();
         if (!m_zones.empty())
             m_zones += ',';
         m_zones += path;
@@ -70,7 +75,11 @@ public:
 
     // The entrance runtimes' names are reached through (--proxy): a proxy without --backend. With it, every runtime's
     // name in a zone is answered, with --publish's addresses or, without them, this machine's public ones.
-    void set_proxy(std::string_view name) { m_proxy = std::string(name); }
+    void set_proxy(std::string_view name)
+    {
+        const auto held = config_lock();
+        m_proxy = std::string(name);
+    }
     std::string_view get_proxy() const { return m_proxy; }
     // The port the entrance `create` makes for it listens on (--proxy-port), 443 when not given; read at create only.
     void set_proxy_port(uint16_t port) { m_proxy_port = port; }
