@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <initializer_list>
+#include <string>
 #include <string_view>
 
 #include "../util/text_list.h"
@@ -33,6 +36,22 @@ inline std::string_view cookie_value(std::string_view header, std::string_view n
         out = v;
         return true;
     });
+    return out;
+}
+
+// A Cookie header's value without the cookies named in `names`, the others as they came; empty when none is left.
+inline std::string without_cookies(std::string_view header, std::initializer_list<std::string_view> names)
+{
+    std::string out;
+    while (!header.empty())
+    {
+        const std::string_view part = trim_blanks(take_item(header, ';'));
+        if (part.empty() || std::find(names.begin(), names.end(), trim_blanks(part.substr(0, part.find('=')))) != names.end())
+            continue;
+        if (!out.empty())
+            out += "; ";
+        out.append(part);
+    }
     return out;
 }
 

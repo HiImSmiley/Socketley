@@ -73,6 +73,15 @@ TEST_CASE("every cookie of a name is visited in order until one is taken")
     CHECK(socketley::http::cookie_value("skl=", "skl").empty());
 }
 
+TEST_CASE("the cookies a proxy took are left out of what it forwards, every other one kept")
+{
+    CHECK(socketley::http::without_cookies(" a=1; skl=x;skl_known=y; \tb=2;skl =z; skl2=3", {"skl", "skl_known"}) ==
+          "a=1; b=2; skl2=3");
+    CHECK(socketley::http::without_cookies("skl=x; skl=y", {"skl"}).empty());
+    CHECK(socketley::http::without_cookies("theme=dark", {"skl"}) == "theme=dark");
+    CHECK(socketley::http::without_cookies("", {"skl"}).empty());
+}
+
 TEST_CASE("a number in the environment is read whole or not at all")
 {
     const auto read = [](const char* v) {

@@ -16,6 +16,8 @@
 #include "../../shared/net/peer_address.h"
 #include "../../shared/util/settings.h"
 #include "../../shared/util/text_list.h"
+#include "../../shared/http/cookie.h"
+#include "../idp/idp_logic.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -4955,6 +4957,21 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
                 result += "\r\n";
             }
             host_written = true;
+            h_pos = nl + 2;
+            continue;
+        }
+
+        // The provider's own cookies --auth took were this proxy's to see, as the backend is told who in X-Forwarded-User.
+        if (!skip && m_auth.idp() && header_name_equals(hdr_line, "cookie", 6))
+        {
+            const std::string kept = socketley::http::without_cookies(
+                hdr_line.substr(7), {socketley::idp::session_cookie_name, socketley::idp::known_cookie_name});
+            if (!kept.empty())
+            {
+                result += "Cookie: ";
+                result += kept;
+                result += "\r\n";
+            }
             h_pos = nl + 2;
             continue;
         }

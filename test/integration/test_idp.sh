@@ -17,6 +17,7 @@
 #   * a code of the second step taken again after a restart
 #   * a storage's users not coming over with the passwords they have there
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
+#   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted
 #   * a return address a browser reads as another host's, by a backslash in its host
 #   * a sign-in or an account's change posted from another site's page
 #   * an e-mail a user gave themselves taken as vouched for, another account's, or able to split a line
@@ -53,7 +54,8 @@ python3 -c '
 import http.server, sys
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        b = ("%s|%s" % (self.headers.get("X-Forwarded-User") or "-", self.headers.get("X-Forwarded-Preferred-Username") or "-")).encode()
+        b = ("%s|%s|%s" % (self.headers.get("X-Forwarded-User") or "-", self.headers.get("X-Forwarded-Preferred-Username") or "-",
+                           self.headers.get("Cookie") or "-")).encode()
         self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def log_message(self, *a): pass
 http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
@@ -349,6 +351,10 @@ if phase == "main":
     check("anything else is told 401", at(P, "GET", "/gate/page", headers={"Accept": "application/json"})[0], 401)
     st, body, h = at(P, "GET", "/gate/who", headers={"X-Forwarded-User": "root", "X-Forwarded-Preferred-Username": "root"}, cookie=dora)
     check("a signed-in request reaches the backend, told who and not what the client claims", (st, body.split("|")[1]), (200, "dora"))
+    st, body, h = at(P, "GET", "/gate/who", cookie=dora + "; theme=dark; skl_idp_known=k")
+    sent = body.split("|")[2] if body.count("|") >= 2 else body
+    check("the backend is handed its own cookies and not the provider's, which would sign it in elsewhere as the user",
+          (st, "skl_idp" in sent, "theme=dark" in sent), (200, False, True))
     forged = dora[:-4] + ("AAAA" if not dora.endswith("AAAA") else "BBBB")
     check("a forged cookie is refused", at(P, "GET", "/gate/who", headers={"Accept": "application/json"}, cookie=forged)[0], 401)
 

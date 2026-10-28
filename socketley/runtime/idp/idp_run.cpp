@@ -74,7 +74,6 @@ constexpr size_t  max_families  = 32;
 constexpr std::string_view family_prefix = "rt.";
 // How long a sign-in buys SSH certificates for, refreshed tokens and all.
 constexpr int64_t ssh_auth_secs = 12 * 3600;
-constexpr std::string_view known_cookie_name = "skl_idp_known";
 // Why a change that waited on a field still holding a value was not made.
 constexpr std::string_view changed_meanwhile = "the account changed meanwhile";
 

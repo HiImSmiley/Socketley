@@ -4802,7 +4802,10 @@ its username in
 .B X\-Forwarded\-Preferred\-Username
 and its address in
 .BR X\-Forwarded\-Email ,
-which a client's own of those names never reaches. The cookie reaches a proxy
+which a client's own of those names never reaches; the provider's own cookies
+are taken out of the
+.B Cookie
+field it is sent, every other cookie kept. The cookie reaches a proxy
 on another name only when the provider's
 .B \-\-cookie\-domain
 covers both.

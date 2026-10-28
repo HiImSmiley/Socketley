@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   percent-encoded was verified with the signer's key but then judged as
   anonymous, so Deny statements naming the signer did not apply to it and a
   bucket policy could be put by a user who owns nothing.
+- **A proxy with `--auth idp:` keeps the provider's cookies from its backend.**
+  The backend was handed the `skl_idp` session cookie with the rest of the
+  Cookie field, and could replay it at every runtime that trusts the provider,
+  the provider itself included; it now gets every other cookie, and learns who
+  is signed in from `X-Forwarded-User` alone.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

@@ -18,6 +18,8 @@ namespace socketley::idp
 
 // The cookie an idp runtime signs a browser in with, which every runtime that trusts it reads.
 inline constexpr std::string_view session_cookie_name = "skl_idp";
+// The cookie a browser keeps once an account has signed in on it, which only the provider reads.
+inline constexpr std::string_view known_cookie_name = "skl_idp_known";
 
 // The client `socketley login` signs in as, and so the one a tunnel edge takes when no --idp-audience is named.
 inline constexpr std::string_view cli_client = "socketley";
