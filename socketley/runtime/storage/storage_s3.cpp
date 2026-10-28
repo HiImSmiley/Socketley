@@ -313,6 +313,16 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     c->user      = std::move(v.user);
     c->anonymous = v.anonymous;
     c->cluster   = c->user && c->user->cluster;
+    // S3 takes the response-* overrides from a signed request only, so a request with no credentials cannot choose
+    // how a browser reads what it names.
+    if (c->anonymous && m_auth->holds_users() && (r.method == "GET" || r.method == "HEAD") && !r.key.empty() &&
+        std::any_of(r.query.begin(), r.query.end(), [](const auto& kv) { return kv.first.starts_with("response-"); }))
+    {
+        s3_error e = make_error("InvalidRequest");
+        e.message  = "Request specific response headers cannot be used for anonymous GET requests.";
+        deny_request(c, e);
+        return;
+    }
 
     // A bucket owned by someone other than the one the client names is refused before anything is done to it, so a
     // name taken over by another owner receives nothing meant for the first.
@@ -1725,6 +1735,29 @@ std::string_view website_target(const object_meta& m)
     return {};
 }
 
+// Whether a browser shows a body of `type` inline without running anything in it on the origin it came from.
+bool passive_type(std::string_view type)
+{
+    type = http_trim_ows(type.substr(0, type.find(';')));
+    std::string t(type);
+    for (char& ch : t)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (t.find("xml") != std::string::npos || t.find("html") != std::string::npos || t.find("script") != std::string::npos ||
+        t.find("svg") != std::string::npos)
+        return false;
+    return t.starts_with("image/") || t.starts_with("audio/") || t.starts_with("video/") || t.starts_with("font/") ||
+           t == "text/plain" || t == "text/csv" || t == "application/pdf" || t == "application/json" ||
+           t == "application/octet-stream" || t == "binary/octet-stream" || t == "application/zip";
+}
+
+// Whether a Content-Disposition saves the body rather than showing it.
+bool attachment_disposition(std::string_view v)
+{
+    v = http_trim_ows(v);
+    return v.size() >= 10 && http_token_equals(v.substr(0, 10), "attachment", 10) &&
+           (v.size() == 10 || v[10] == ';' || v[10] == ' ' || v[10] == '\t');
+}
+
 // The headers an object's stored metadata puts on a response, with the
 // response-* query overrides a presigned URL may add; in a `versioned` bucket an
 // object written before it was versioned is named as the null version, and `part`
@@ -1762,10 +1795,28 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
         return nullptr;
     };
 
-    if (const auto* o = overridden("Content-Type"))
-        r.headers.emplace_back("Content-Type", o->second);
-    else
-        r.headers.emplace_back("Content-Type", m.content_type);
+    const auto* type_override = overridden("Content-Type");
+    const std::string_view type = type_override ? std::string_view(type_override->second)
+                                                : std::string_view(m.content_type.str());
+    r.headers.emplace_back("Content-Type", std::string(type));
+    // An object shares its origin with the web interface everywhere but a website endpoint, so it is never sniffed into
+    // something else, runs in no document of that origin, and is saved rather than shown when a browser would run it.
+    const bool active = !q.website && !passive_type(type);
+    bool attached = false;
+    const auto disposition = [&](std::string_view header, std::string_view v)
+    {
+        if (!http_token_equals(header, "content-disposition", 19))
+            return true;
+        attached = attached || attachment_disposition(v);
+        return !active || attachment_disposition(v);
+    };
+    if (!q.website)
+    {
+        r.headers.emplace_back("X-Content-Type-Options", "nosniff");
+        // A PDF viewer shows nothing in a sandbox and runs nothing on the page's origin.
+        if (!http_token_equals(http_trim_ows(type.substr(0, type.find(';'))), "application/pdf", 15))
+            r.headers.emplace_back("Content-Security-Policy", "default-src 'none'; sandbox");
+    }
 
     // The checksum a client asked to see, of the part it asked for by number or else of the whole object,
     // which an answer holding only a range of it does not get.
@@ -1818,7 +1869,7 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
             display.push_back(next_upper ? static_cast<char>(std::toupper(static_cast<unsigned char>(ch))) : ch);
             next_upper = ch == '-';
         }
-        if (overridden(display))
+        if (overridden(display) || !disposition(display, v))
             continue;
         r.headers.emplace_back(display, v);
     }
@@ -1830,8 +1881,10 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
     for (const auto& o : overrides)
         if (o.header != "Content-Type" && q.has_query(o.query))
             for (const auto& kv : q.query)
-                if (kv.first == o.query)
+                if (kv.first == o.query && disposition(o.header, kv.second))
                     r.headers.emplace_back(std::string(o.header), kv.second);
+    if (active && !attached)
+        r.headers.emplace_back("Content-Disposition", "attachment");
     if (m.parts)
         r.headers.emplace_back("x-amz-mp-parts-count", std::to_string(m.parts));
 }
@@ -2500,7 +2553,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
         // A GET that asks for nothing but the object gets the headers kept with the copy, which do not follow the
         // bucket's lifecycle rules, once the object's own grants, if they decide, admit it; a refusal is answer()'s.
         if (q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
-            !m_store.lifecycle(q.bucket) && (!q.website || (!c->website_status && website_target(*hot.meta).empty())) &&
+            !m_store.lifecycle(q.bucket) && !q.website &&
             !q.has_header("x-amz-server-side-encryption-customer-algorithm") &&
             (!c->acl_need || acl_admits(c, *hot.meta)) && evaluate(q, *hot.meta) == cond::proceed)
         {

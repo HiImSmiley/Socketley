@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sign-ins (proxies, storage, the dashboard, tunnel edges) within a second,
   where they held until they ran out, up to 30 days; the admin bit is the
   account's now, not the one the cookie was signed with.
+- **An object runs nothing on the web interface's origin.** An HTML, SVG or
+  XML object, read by S3, anonymously or through a share link, was shown inline
+  on the origin the web interface is served from, so its script acted with the
+  reader's session. Every object answer outside a website endpoint now carries
+  `nosniff` and a sandboxing Content-Security-Policy, a type a browser would
+  run is sent as an attachment, and an anonymous GET takes no `response-*`
+  override.
 - **No user takes the buckets' default owner.** An invitation or CreateUser
   could make a user named `socketley`, the owner every bucket with none
   recorded belongs to, and so own all of them; the name is refused.

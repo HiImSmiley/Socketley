@@ -124,6 +124,7 @@ public:
     bool issue_session_as(std::string_view user_id, int64_t expires, std::string_view policy, std::string_view role,
                           session_credentials& out) override;
     bool has_user(std::string_view id) const override { return m_creds.find_user(id) != nullptr; }
+    bool holds_users() const override { return true; }
     auth_verdict authorize_password(std::string_view user, std::string_view password) override;
     auth_verdict authorize_identity(std::string_view id) override;
     int login_state(std::string_view id) const override;

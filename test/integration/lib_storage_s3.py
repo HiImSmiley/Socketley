@@ -312,9 +312,14 @@ r = request("HEAD", B + "range.bin", headers={"If-None-Match": etag})
 check("HEAD with If-None-Match is 304", r.status == 304)
 
 # Response header overrides.
-r = request("GET", B + "plain.bin?response-content-type=text%2Fhtml&response-content-disposition=inline")
+r = request("GET", B + "plain.bin?response-content-type=text%2Fplain&response-content-disposition=inline")
 check("response-content-type and response-content-disposition override the stored headers",
-      r.h("content-type") == "text/html" and r.h("content-disposition") == "inline", r.headers)
+      r.h("content-type") == "text/plain" and r.h("content-disposition") == "inline", r.headers)
+r = request("GET", B + "plain.bin?response-content-type=text%2Fhtml&response-content-disposition=inline")
+check("but a type a browser would run is saved, not shown, and runs in a sandbox",
+      r.h("content-type") == "text/html" and r.h("content-disposition") == "attachment" and
+      r.h("x-content-type-options") == "nosniff" and r.h("content-security-policy") == "default-src 'none'; sandbox",
+      r.headers)
 
 # If-None-Match: * on a PUT.
 r = request("PUT", B + "plain.bin", body=b"x", headers={"If-None-Match": "*"})
@@ -720,7 +725,8 @@ if boto3:
 
     data = os.urandom(2_500_000)
     r = s3.put_object(Bucket="boto-bucket", Key="dir/obj 1+2.bin", Body=data, ContentType="application/x-boto",
-                      Metadata={"alpha": "1", "beta": "two"}, CacheControl="no-store", ContentDisposition="inline",
+                      Metadata={"alpha": "1", "beta": "two"}, CacheControl="no-store",
+                      ContentDisposition='attachment; filename="obj.bin"',
                       ContentEncoding="identity", ContentLanguage="fr")
     check("boto3 put_object returns the MD5 ETag", r["ETag"] == '"%s"' % md5hex(data), r["ETag"])
     g = s3.get_object(Bucket="boto-bucket", Key="dir/obj 1+2.bin")
@@ -728,8 +734,8 @@ if boto3:
     check("boto3 get_object returns the bytes", body_read == data)
     check("boto3 get_object returns the bytes and every stored header",
           g["ContentType"] == "application/x-boto" and g["Metadata"] == {"alpha": "1", "beta": "two"}
-          and g["CacheControl"] == "no-store" and g["ContentDisposition"] == "inline" and g["ContentLanguage"] == "fr"
-          and g["ContentLength"] == len(data) and g["ETag"] == '"%s"' % md5hex(data), dict(g))
+          and g["CacheControl"] == "no-store" and g["ContentDisposition"] == 'attachment; filename="obj.bin"'
+          and g["ContentLanguage"] == "fr" and g["ContentLength"] == len(data) and g["ETag"] == '"%s"' % md5hex(data), dict(g))
     h = s3.head_object(Bucket="boto-bucket", Key="dir/obj 1+2.bin")
     check("boto3 head_object", h["ContentLength"] == len(data) and h["Metadata"]["beta"] == "two")
     g = s3.get_object(Bucket="boto-bucket", Key="dir/obj 1+2.bin", Range="bytes=100-199")

@@ -238,6 +238,8 @@ public:
     }
     // Whether user `id` is one the credentials or the IAM API declared.
     virtual bool has_user(std::string_view /*id*/) const { return false; }
+    // Whether this authenticator holds any users, which one that lets everyone in as with no credentials does not.
+    virtual bool holds_users() const { return false; }
     // The id of the user whose email is `email`, empty for none.
     // 32 bytes only this user's secret derives, for `purpose`, to seal what is kept for the user; empty for none.
     virtual std::string seal_key(std::string_view /*user_id*/, std::string_view /*purpose*/) const { return {}; }

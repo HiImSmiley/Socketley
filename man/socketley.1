@@ -7789,7 +7789,7 @@ Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposit
 T}
 GetObject	GET /bucket/key	T{
 .ad l
-Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides; x\-amz\-tagging\-count when the object has tags (on HEAD too); ?versionId= reads that version, and x\-amz\-version\-id names it; an object stored under a client's key needs the SSE\-C headers, on HEAD too.
+Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides on a signed request (InvalidRequest, 400, on an anonymous one); every answer outside a website endpoint carries X\-Content\-Type\-Options: nosniff and, but for a PDF, Content\-Security\-Policy: default\-src 'none'; sandbox, and is sent as Content\-Disposition: attachment unless its type is an image, audio, video, font, text/plain, text/csv, PDF, JSON, ZIP or octet\-stream, so nothing it holds runs on the web interface's origin; x\-amz\-tagging\-count when the object has tags (on HEAD too); ?versionId= reads that version, and x\-amz\-version\-id names it; an object stored under a client's key needs the SSE\-C headers, on HEAD too.
 T}
 HeadObject	HEAD /bucket/key	T{
 .ad l
