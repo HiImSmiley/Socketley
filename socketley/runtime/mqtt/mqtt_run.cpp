@@ -168,6 +168,7 @@ bool mqtt_run::start(std::string& why)
     cfg.max_sessions       = m_owner.get_max_sessions();
     cfg.keepalive_max      = m_owner.get_keepalive_max();
     cfg.write_limit        = m_owner.get_write_buffer() ? m_owner.get_write_buffer() : (4u << 20);
+    m_read_hold            = cfg.write_limit * 2 + cfg.max_packet;
     cfg.version            = SOCKETLEY_VERSION;
     cfg.sys_interval_s     = 10;
     // A shard of several publishes its own figures under its number, and every shard keeps them all.
@@ -463,7 +464,7 @@ const mqtt_run::conn* mqtt_run::find(uint64_t id) const
 
 void mqtt_run::arm_read(conn& c)
 {
-    if (c.dead || c.rd_pending || c.fd < 0 || c.paused)
+    if (c.dead || c.rd_pending || c.fd < 0 || c.paused || c.write_held)
         return;
     c.rd        = io_request{};
     c.rd.owner  = this;
@@ -536,7 +537,7 @@ void mqtt_run::read_done(conn& c, struct io_uring_cqe* cqe)
         }
         if (!more)
             arm_read(c);
-        else if (c.paused)
+        else if (c.paused || c.write_held)
             withdraw_read(c);
         return;
     }
@@ -564,6 +565,9 @@ void mqtt_run::bytes_in(conn& c, const char* p, size_t n)
         tls_in(c, p, n);
     else
         plain_in(c, p, n);
+    // The replies, pongs and acks to what was just read are queued by now, so a peer leaving them unread is held here.
+    if (!c.dead && c.unsent() > m_read_hold)
+        c.write_held = true;
 }
 
 void mqtt_run::tls_in(conn& c, const char* p, size_t n)
@@ -935,6 +939,12 @@ void mqtt_run::write_done(conn& c, int res)
     runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
     if (c.unsent() == 0 && c.told_broker && !c.closing)
         m_broker->drained(c.id);
+    // Read again once the peer has taken half of what held it, so a slow reader is not withdrawn and armed every write.
+    if (c.write_held && c.unsent() <= m_read_hold / 2)
+    {
+        c.write_held = false;
+        arm_read(c);
+    }
     flush(c);
 }
 

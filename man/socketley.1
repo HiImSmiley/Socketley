@@ -13249,6 +13249,11 @@ is refused with 0x97.
 The longest keep alive granted, 1200 unless given; a 5.0 client asking more or
 none is told this one.
 .PP
+A client that leaves more than twice
+.B \-\-write\-buffer
+(4M unless given) of what it was sent unread is not read until it has read half
+of it, so its pings and acks cannot grow what it is owed.
+.PP
 .B stats
 says the sessions and those connected, the subscriptions, the retained
 messages and their bytes, what is queued and in flight, the messages received

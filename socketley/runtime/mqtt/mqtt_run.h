@@ -109,6 +109,8 @@ private:
         // The broker holds its next packet, so it is not read until it may go on; a multishot read is being taken back.
         bool paused{false};
         bool withdrawing{false};
+        // Owed more than m_read_hold: a peer that does not read what it is sent is not read either until it has.
+        bool write_held{false};
         // A read buffer of its own, only where the buffer ring cannot be used.
         std::unique_ptr<char[]> rbuf;
         // Bytes not yet gone, oldest first: the ones queued since the last write, and the ones the ring is sending
@@ -273,6 +275,8 @@ private:
     uint64_t m_auth_refused{0};
     uint64_t m_tls_failures{0};
     uint64_t m_ws_refused{0};
+    // Twice what deliveries stop at and a packet over, so only replies to a peer's own input can pass it.
+    size_t m_read_hold{0};
     std::shared_ptr<bool> m_alive;
 
     // Requests the topic rules have in flight, by cookie.

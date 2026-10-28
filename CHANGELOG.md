@@ -230,6 +230,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   files, saying what it leaves. No restored file keeps a setuid or setgid
   bit, and outside the state and config a file the archive says root owns is
   written as the daemon's user's.
+- **An MQTT client that does not read stops being read.** WebSocket pongs,
+  PINGRESPs and acks were queued for a client whatever it had left unread, so
+  one sending pings and reading nothing grew the broker's memory at line rate,
+  before CONNECT for 10 seconds and after one with keep alive 0 for good. Past
+  twice `--write-buffer` unread, a connection is not read until it has taken
+  half of it.
 - **An MQTT WebSocket frame is held only up to four times `--max-packet`.**
   An unfinished frame was kept whole up to WebSocket's 16 MiB however small
   `--max-packet` was, before any CONNECT and, after one with keep alive 0,
