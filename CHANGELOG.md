@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sign-ins (proxies, storage, the dashboard, tunnel edges) within a second,
   where they held until they ran out, up to 30 days; the admin bit is the
   account's now, not the one the cookie was signed with.
+- **A share link gives only what its maker may still do.** A folder link was
+  judged once, as a ListBucket, and then read every file under it, and any link
+  went on working after its maker lost access, was disabled or removed, or its
+  bucket was removed and made again by someone else. Each read is now its
+  maker's GetObject of that key, an upload its PutObject, a folder's page and
+  ZIP its ListBucket, judged at the request; a link is bound to its bucket's
+  owner and creation time.
 - **An object runs nothing on the web interface's origin.** An HTML, SVG or
   XML object, read by S3, anonymously or through a share link, was shown inline
   on the origin the web interface is served from, so its script acted with the

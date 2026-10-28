@@ -70,7 +70,9 @@ void storage_run::set_cluster(cluster_config cfg)
         cluster_change cc;
         cc.kind    = 'b';
         cc.bucket  = bucket;
-        cc.payload = encode_cluster_record({kind, owner, doc, xml, {}});
+        // A bucket made is sent with the time it was made at, which the other nodes keep, so it is the same bucket there.
+        const std::string value = kind == 'c' ? std::to_string(m_store.bucket_created_ms(bucket)) : xml;
+        cc.payload = encode_cluster_record({kind, owner, doc, value, {}});
         if (!m_repl.enqueue_nodes(cc))
         {
             then();
@@ -214,7 +216,7 @@ void storage_run::op_cluster(const std::shared_ptr<conn>& c)
     {
         case 'c':
             m_node.create_bucket(q.bucket, rec.owner, [answer](st s) { answer(s == st::bucket_exists ? st::ok : s); },
-                                 true);
+                                 true, std::max<int64_t>(0, std::atoll(rec.value.c_str())));
             return;
         case 'r':
             m_node.delete_bucket(q.bucket, [answer](st s) { answer(s == st::no_such_bucket ? st::ok : s); }, true);

@@ -2965,9 +2965,9 @@ struct create_state
 
 }   // namespace
 
-void object_store::create_bucket(std::string name, std::string owner, std::function<void(st)> cb)
+void object_store::create_bucket(std::string name, std::string owner, std::function<void(st)> cb, int64_t created_ms)
 {
-    create_bucket_impl(std::move(name), false, 0, std::move(owner), std::move(cb));
+    create_bucket_impl(std::move(name), false, created_ms, std::move(owner), std::move(cb));
 }
 
 void object_store::adopt_bucket(std::string name, int64_t created_ms, std::string owner, std::function<void(st)> cb)
@@ -3013,7 +3013,7 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
     cs->name = std::move(name);
     cs->cb   = std::move(cb);
     cs->adopt = adopt;
-    cs->created_ms = adopt ? created_ms : static_cast<int64_t>(now_ms());
+    cs->created_ms = adopt || created_ms > 0 ? created_ms : static_cast<int64_t>(now_ms());
     cs->owner = std::move(owner);
     cs->text = std::to_string(cs->created_ms);
     if (!cs->owner.empty())

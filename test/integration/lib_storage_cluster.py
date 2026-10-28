@@ -354,6 +354,11 @@ def main():
           call(C.delete_object, Bucket=L, Key="held", VersionId=lv) == "AccessDenied")
 
     # ── share links ────────────────────────────────────────────────────────────
+    def made(c):
+        r = call(c.list_buckets)
+        return [x["CreationDate"] for x in (r.get("Buckets", []) if isinstance(r, dict) else []) if x["Name"] == P]
+    check("a bucket was made at the same time on every node, which a link of it is bound to",
+          len(made(A)) == 1 and made(A) == made(B) == made(C), [made(c) for c in (A, B, C)])
     A.put_object(Bucket=P, Key="shared.txt", Body=b"shared from a")
     wait_for(lambda: body(B, P, "shared.txt") == b"shared from a" and body(C, P, "shared.txt") == b"shared from a")
     link = share(NODES[0][1], "POST", body={"bucket": P, "key": "shared.txt", "max_downloads": 5})

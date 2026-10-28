@@ -1693,7 +1693,7 @@ void replicator::seed_more(lane& l)
             std::sort(all.begin(), all.end(), [](const bucket_info& a, const bucket_info& b) { return a.name < b.name; });
             for (const bucket_info& b : all)
             {
-                push(l, node_task({'b', b.name, {}, {}, {}, encode_cluster_record({'c', b.owner, 0, {}, {}})}), false);
+                push(l, node_task({'b', b.name, {}, {}, {}, encode_cluster_record({'c', b.owner, 0, std::to_string(b.created_ms), {}})}), false);
                 for (auto& [kind, xml] : m_store.bucket_docs_text(b.name))
                     push(l, node_task({'b', b.name, {}, {}, {},
                                        encode_cluster_record({'d', {}, static_cast<uint8_t>(kind), std::move(xml), {}})}),

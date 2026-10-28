@@ -6,6 +6,7 @@
 #include "storage_run.h"
 
 #include <ctime>
+#include <optional>
 #include <unordered_set>
 
 #include "body_reader.h"
@@ -237,12 +238,15 @@ std::string unique_name(std::string name, std::unordered_set<std::string>& taken
 }   // namespace
 
 void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix,
-                            std::vector<std::string> only, std::string archive, bool by_link)
+                            std::vector<std::string> only, std::string archive, const link_maker* maker)
 {
     list_query q;
     q.prefix = prefix;
     std::weak_ptr<conn> weak = c;
-    app_list(bucket, std::move(q), [this, weak, bucket, prefix, by_link, only = std::move(only), archive = std::move(archive)](st s, list_page p) mutable
+    std::optional<link_maker> as;
+    if (maker)
+        as = *maker;
+    app_list(bucket, std::move(q), [this, weak, bucket, prefix, as = std::move(as), only = std::move(only), archive = std::move(archive)](st s, list_page p) mutable
     {
         auto c = weak.lock();
         if (!c || c->dead)
@@ -273,7 +277,8 @@ void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, 
                                               { return name == o || (name.starts_with(o) && name[o.size()] == '/'); }))
                 continue;
             // What only its client's key opens cannot be read here, and what the user may not read is not given.
-            if (sse_mode_of(e.meta) == sse_mode::c || (!by_link && !app_allowed(c, "GET", bucket, e.key)))
+            if (sse_mode_of(e.meta) == sse_mode::c ||
+                !(as ? link_allows(c, *as, "GET", bucket, e.key) : app_allowed(c, "GET", bucket, e.key)))
             {
                 ++skipped;
                 continue;

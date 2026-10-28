@@ -315,6 +315,15 @@ uint8_t bucket_acl_need(s3_action a);
 uint8_t object_acl_need(s3_action a);
 struct share_link;
 
+// Whom a share link acts for: its maker, as a request of the maker's own would be judged.
+struct link_maker
+{
+    std::shared_ptr<const user_identity> user;
+    std::string principal;
+    // A runtime that holds no users judges a link as a request with no credentials.
+    bool        anonymous{false};
+};
+
 // What ffprobe said of an object: a stream's ladder, playlists and filters are made from it.
 struct media_probe
 {
@@ -1045,9 +1054,9 @@ public:
     static std::string attachment_of(std::string_view key);
     // A ZIP of what is under `prefix` in `bucket` (only the names in `only` and what is under them, when it names
     // any), saved as `archive`.zip, with an exact Content-Length; storage_zip.cpp.
-    // `by_link` for a share link's folder, which its link and not the policies lets the visitor read.
+    // `maker` for a share link's folder, whose maker each file is judged for rather than the visitor.
     void zip_start(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix, std::vector<std::string> only,
-                   std::string archive, bool by_link);
+                   std::string archive, const link_maker* maker);
     void zip_pump(const std::shared_ptr<conn>& c);
     // Lets go of an archive's open object, at a close or the next request.
     void zip_end(conn& c);
@@ -1120,6 +1129,9 @@ public:
     void share_body(const std::shared_ptr<conn>& c);
     // The link `id` names, once it is current and its password given; false after answering.
     bool share_open(const std::shared_ptr<conn>& c, std::string_view id, share_link& s);
+    // Whether `maker` may do `method` to `key` in `bucket`, as app_allowed judges the request standing in its place.
+    bool link_allows(const std::shared_ptr<conn>& c, const link_maker& maker, std::string_view method,
+                     std::string_view bucket, std::string_view key);
     // The bucket and key a link and the path under it name, as share_open admits them; false after answering.
     bool share_target(const std::shared_ptr<conn>& c, std::string_view id, std::string_view rel, std::string& bucket,
                       std::string& key);

@@ -92,7 +92,9 @@ public:
     // ── Buckets are made and dropped by shard 0 and told to the rest ────────
     // `owner` is the id of the user that makes it, empty for the default owner.  Each change but a `quiet` one, which
     // another node of the cluster made, is told to the bucket listener before `cb` hears it was made.
-    void create_bucket(std::string name, std::string owner, std::function<void(st)> cb, bool quiet = false);
+    // `created_ms`, when not 0, is the time another node made the bucket at, which it keeps here too.
+    void create_bucket(std::string name, std::string owner, std::function<void(st)> cb, bool quiet = false,
+                       int64_t created_ms = 0);
     void delete_bucket(std::string name, std::function<void(st)> cb, bool quiet = false);
     // Sets a bucket's configuration document of `kind`, or removes it when `xml` is empty; every shard has it before `cb`.
     void set_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb, bool quiet = false);
@@ -139,7 +141,7 @@ public:
     void stop();
 
 private:
-    void run_create(std::string name, std::string owner, std::function<void(st, int64_t)> cb);
+    void run_create(std::string name, std::string owner, int64_t created_ms, std::function<void(st, int64_t)> cb);
     // Waits out the uploads of the bucket still removing their files, whose clients were already answered.
     void run_drop(std::string name, std::function<void(st)> cb);
     void run_drop_settled(std::string name, std::function<void(st)> cb);

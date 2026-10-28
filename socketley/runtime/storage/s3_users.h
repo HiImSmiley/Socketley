@@ -29,6 +29,8 @@ struct user_identity
     bool        configured{false};
     // The key the nodes of a cluster sign for each other with, whose requests write what another node made.
     bool        cluster{false};
+    // May not sign in, which the IAM API's socketley:disabled tag says; the user stays the owner of what it made.
+    bool        disabled{false};
     bool        has_policy{false};
     bucket_policy policy;
     // The most bytes the buckets this user owns may hold together, 0 for no bound.

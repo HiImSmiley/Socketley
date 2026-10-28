@@ -10846,7 +10846,15 @@ or none is a folder, read as a page, as JSON with
 and file by file under it;
 .B upload
 lets a visitor PUT files into it. The maker must be able to read what the link
-names, and to write there for an upload link. A password is asked for with Basic,
+names, and to write there for an upload link. A link acts as its maker, judged at
+each request as the maker's own would be: a file it reads is the maker's
+GetObject of that key, a folder's page, list and ZIP its ListBucket (and the ZIP
+leaves out each file the maker may not read), an upload its PutObject. One the
+maker may no longer use is
+.BR 403 ;
+one whose maker is no user of the runtime any more or is disabled, or whose
+bucket was removed and made again under its name, is
+.BR 410 . A password is asked for with Basic,
 any user name, and kept salted and hashed;
 .B max_downloads
 counts each read from the start of a file and not a player's later ranges, and

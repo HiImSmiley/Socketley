@@ -244,12 +244,13 @@ std::function<void(st)> shard_node::told(bool quiet, char kind, const std::strin
     };
 }
 
-void shard_node::create_bucket(std::string name, std::string owner, std::function<void(st)> cb, bool quiet)
+void shard_node::create_bucket(std::string name, std::string owner, std::function<void(st)> cb, bool quiet,
+                               int64_t created_ms)
 {
     cb = told(quiet, 'c', name, owner, 0, {}, std::move(cb));
     if (m_store.shard() == 0)
     {
-        run_create(std::move(name), std::move(owner), [cb](st s, int64_t) { cb(s); });
+        run_create(std::move(name), std::move(owner), created_ms, [cb](st s, int64_t) { cb(s); });
         return;
     }
     if (!valid_bucket_name(name))
@@ -264,7 +265,7 @@ void shard_node::create_bucket(std::string name, std::string owner, std::functio
     }
     ++m_c.bucket_ops;
     auto alive = m_alive;
-    m_transport.call(0, wire::encode_bucket(wire::op::bucket_create, name, 0, owner),
+    m_transport.call(0, wire::encode_bucket(wire::op::bucket_create, name, created_ms, owner),
         [this, alive, name, cb](bool ok, std::string_view reply)
         {
             if (!*alive)
@@ -289,7 +290,7 @@ void shard_node::create_bucket(std::string name, std::string owner, std::functio
         });
 }
 
-void shard_node::run_create(std::string name, std::string owner, std::function<void(st, int64_t)> cb)
+void shard_node::run_create(std::string name, std::string owner, int64_t created_ms, std::function<void(st, int64_t)> cb)
 {
     ++m_c.bucket_ops;
     auto alive = m_alive;
@@ -316,7 +317,7 @@ void shard_node::run_create(std::string name, std::string owner, std::function<v
                                     name + "; it does when it next starts").c_str());
                   },
                   [cb, s, ms]() { cb(s, ms); });
-    });
+    }, created_ms);
 }
 
 void shard_node::delete_bucket(std::string name, std::function<void(st)> cb, bool quiet)
@@ -1364,7 +1365,7 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             // The reply's copy is taken before the call, whose arguments C++ may build in either order.
             auto answer = [this, name, reply](st s, int64_t created)
             { reply(true, wire::encode_created(s, created, m_store.bucket_owner(name))); };
-            run_create(std::move(name), std::move(owner), std::move(answer));
+            run_create(std::move(name), std::move(owner), ms, std::move(answer));
             return;
         }
         case wire::op::bucket_delete:

@@ -5,6 +5,9 @@
 #
 #   * a link made by someone who may not read what it names, or one that gives
 #     more than its maker may
+#   * a link that reads a file of its folder its maker may not, writes where
+#     its maker may no longer, outlives its maker or its maker's key, or reads a
+#     bucket made again under its bucket's name, by another or its own maker
 #   * a link not reading its object or its folder for a visitor, or reading
 #     anything outside it
 #   * a password not asked for, or a wrong one taken, or guessed at without end
@@ -48,6 +51,7 @@ P1=$((SL_PORT_BASE + 1909))
 U="http://127.0.0.1:$P1"
 T="$SOCKETLEY_TMPD"
 cat > "$T/creds" <<EOF
+AKIASHAREOPS00000000:shareopssecretshareopssecretshareops0000
 [ann]
 AKIASHAREANN00000000:shareannsecretshareannsecretshareann0000
 [ben]
@@ -256,6 +260,53 @@ check "a link that does not burn leaves its file after its last download" "$(cod
 r=$(mk "$A" '{"bucket":"ann","key":"send/kept.txt","burn":true,"expires_in":4}')
 "$BIN" stop share >/dev/null 2>&1; sleep 5; "$BIN" start share >/dev/null 2>&1; up
 check "one that ended while the runtime was stopped burns at its start" "$(gone send/kept.txt)" gone
+
+# A link gives only what its maker may still do, judged each time it is read, in the bucket it was made in.
+s3c() { curl -s -m 30 --aws-sigv4 "aws:amz:us-east-1:s3" -u "$1" -o /dev/null -w '%{http_code}' "${@:2}"; }
+printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"ben"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::ann"},{"Effect":"Allow","Principal":{"AWS":"ben"},"Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::ann/album/sub/*"}]}' > "$T/benpol"
+check "ann lets ben list her bucket and read and write album/sub/" "$(s3c "$A" -T "$T/benpol" "$U/ann?policy" | cut -c1)" 2
+sleep 0.3
+bl=$(mk "$B" '{"bucket":"ann","key":"album/"}')
+check "a user who may list a folder shares it" "${#bl}" 22
+check "and its link lists it" "$(curl -s "$U/~share/$bl/?format=json" | python3 -c 'import json,sys; print([x["name"] for x in json.load(sys.stdin)["files"]])')" "['one.jpg']"
+check "but reads no file in it its maker may not read" "$(code "$U/~share/$bl/one.jpg")" 403
+check "and one its maker may" "$(curl -s "$U/~share/$bl/sub/two.jpg")" two
+check "nor puts one its maker may not read in its ZIP" "$(curl -s -o "$T/b.zip" "$U/~share/$bl/?zip"; python3 -c 'import zipfile,sys; print([i.filename for i in zipfile.ZipFile(sys.argv[1]).infolist()])' "$T/b.zip")" "['sub/two.jpg']"
+bu=$(mk "$B" '{"bucket":"ann","key":"album/sub/","upload":true}')
+check "an upload link takes a file while its maker may write there" "$(printf 'up' | code -T - "$U/~share/$bu/up.txt")" 201
+bf=$(mk "$B" '{"bucket":"ann","key":"album/sub/two.jpg"}')
+check "a file's link reads while its maker may" "$(curl -s "$U/~share/$bf")" two
+s3c "$A" -X DELETE "$U/ann?policy" >/dev/null
+sleep 0.3
+check "and not once its maker may no longer" "$(code "$U/~share/$bf")" 403
+check "nor does the folder's" "$(code "$U/~share/$bl/?format=json")" 403
+check "nor does the upload link take a file" "$(printf 'up' | code -T - "$U/~share/$bu/up2.txt")" 403
+s3c "$A" -X PUT "$U/again" >/dev/null
+printf 'first' | s3c "$A" -T - "$U/again/f.txt" >/dev/null
+ag=$(mk "$A" '{"bucket":"again","key":"f.txt"}')
+check "a link reads its bucket's file" "$(curl -s "$U/~share/$ag")" first
+s3c "$A" -X DELETE "$U/again/f.txt" >/dev/null
+check "whose bucket is removed" "$(s3c "$A" -X DELETE "$U/again")" 204
+s3c "$B" -X PUT "$U/again" >/dev/null
+printf 'second' | s3c "$B" -T - "$U/again/f.txt" >/dev/null
+check "and a bucket made again under its name is not the link's" "$(code "$U/~share/$ag")" 410
+bo=$(mk "$B" '{"bucket":"again","key":"f.txt"}')
+check "a link of the new bucket's owner reads" "$(curl -s "$U/~share/$bo")" second
+s3c "$A" -X PUT "$U/anew" >/dev/null
+printf 'first' | s3c "$A" -T - "$U/anew/f.txt" >/dev/null
+an=$(mk "$A" '{"bucket":"anew","key":"f.txt"}')
+s3c "$A" -X DELETE "$U/anew/f.txt" >/dev/null
+s3c "$A" -X DELETE "$U/anew" >/dev/null
+s3c "$A" -X PUT "$U/anew" >/dev/null
+printf 'again' | s3c "$A" -T - "$U/anew/f.txt" >/dev/null
+check "nor is one its own maker made again under the name" "$(code "$U/~share/$an")" 410
+O="AKIASHAREOPS00000000:shareopssecretshareopssecretshareops0000"
+ol=$(mk "$O" '{"bucket":"again","key":"f.txt"}')
+check "a key that is no user's makes a link that reads" "$(curl -s "$U/~share/$ol")" second
+printf '[ann]\nAKIASHAREANN00000000:shareannsecretshareannsecretshareann0000\n' > "$T/creds"
+sleep 1.1
+check "until its maker is no user here" "$(code "$U/~share/$bo")" 410
+check "or its key is gone" "$(code "$U/~share/$ol")" 410
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

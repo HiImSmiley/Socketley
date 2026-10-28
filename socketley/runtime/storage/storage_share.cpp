@@ -19,6 +19,7 @@
 #include <map>
 #include <cctype>
 #include <charconv>
+#include <utility>
 
 #include "digest.h"
 #include "../../shared/json/json_doc.h"
@@ -67,6 +68,12 @@ struct share_link
     int64_t     drained_ms{0};
     // A webhook told of each download, and of the files' removal when the link burns.
     std::string notify;
+    // The owner of the bucket the link was made in, which a bucket made again under its name by another does not have.
+    std::string bucket_owner;
+    // The access key of a maker that is no user, by which the link acts.
+    std::string maker_key;
+    // Whom the link acts for, as share_open finds the maker now.
+    link_maker  maker;
 };
 
 namespace
@@ -112,6 +119,13 @@ std::string share_json(const share_link& s)
     {
         o += ",\"notify\":";
         socketley::json::quote_into(o, s.notify);
+    }
+    o += ",\"bucket_owner\":";
+    socketley::json::quote_into(o, s.bucket_owner);
+    if (!s.maker_key.empty())
+    {
+        o += ",\"maker_key\":";
+        socketley::json::quote_into(o, s.maker_key);
     }
     o += "}";
     return o;
@@ -162,6 +176,8 @@ bool parse_share(std::string_view text, share_link& s)
     s.burn = flag_of(root, "burn");
     s.drained_ms = static_cast<int64_t>(num_of(root, "drained"));
     s.notify = str_of(root, "notify");
+    s.bucket_owner = str_of(root, "bucket_owner");
+    s.maker_key = str_of(root, "maker_key");
     return !s.id.empty() && !s.bucket.empty();
 }
 
@@ -392,6 +408,29 @@ bool storage_run::share_open(const std::shared_ptr<conn>& c, std::string_view id
         app_reply(c, 410, "This link has expired.\n");
         return false;
     }
+    // A bucket removed and made again is newer than every link of the one before, and one made by another has its owner.
+    const bool same_bucket = m_store.has_bucket(s.bucket) && m_store.bucket_created_ms(s.bucket) <= s.created_ms &&
+                             (s.bucket_owner.empty() || owner_of(s.bucket) == s.bucket_owner);
+    const auto take = [&s](auth_verdict v)
+    {
+        s.maker.user      = std::move(v.user);
+        s.maker.principal = std::move(v.principal);
+        return v.allowed;
+    };
+    s.maker = {};
+    bool maker_known = true;
+    if (!m_auth->holds_users())
+        s.maker.anonymous = true;
+    else if (s.owner != default_owner)
+        maker_known = take(m_auth->authorize_identity(s.owner));
+    // A key that is no user's made it, and one made before links named the key is any such key's.
+    else if (!s.maker_key.empty())
+        maker_known = take(m_auth->authorize_key(s.maker_key));
+    if (!same_bucket || !maker_known)
+    {
+        app_reply(c, 410, "This link no longer holds.\n");
+        return false;
+    }
     if (s.pw_hash.empty())
         return true;
     // Any user name, and the link's password, as a browser asks for them.
@@ -433,7 +472,32 @@ bool storage_run::share_target(const std::shared_ptr<conn>& c, std::string_view 
     }
     bucket = s.bucket;
     key    = s.folder ? s.key + std::string(rel) : s.key;
+    if (!link_allows(c, s.maker, "GET", bucket, key))
+    {
+        app_reply(c, 403, "The link's maker may no longer read this.\n");
+        return false;
+    }
     return true;
+}
+
+bool storage_run::link_allows(const std::shared_ptr<conn>& c, const link_maker& maker, std::string_view method,
+                              std::string_view bucket, std::string_view key)
+{
+    // The visitor's own identity, and what judging leaves on the request, are put back however the maker's is judged.
+    auto user      = std::exchange(c->user, maker.user);
+    auto principal = std::exchange(c->principal, maker.principal);
+    const bool anonymous = std::exchange(c->anonymous, maker.anonymous);
+    const uint8_t acl_need = std::exchange(c->acl_need, uint8_t{0});
+    const bool hide = c->hide_missing, admitted = c->policy_admitted;
+    // A maker let in only by an object's own grants is not, since the visitor is served without them.
+    const bool allowed = app_allowed(c, method, bucket, key) && c->acl_need == 0;
+    c->user            = std::move(user);
+    c->principal       = std::move(principal);
+    c->anonymous       = anonymous;
+    c->acl_need        = acl_need;
+    c->hide_missing    = hide;
+    c->policy_admitted = admitted;
+    return allowed;
 }
 
 void storage_run::op_share(const std::shared_ptr<conn>& c)
@@ -513,8 +577,17 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         app_reply(c, 404, "No such file in this link.\n");
         return;
     }
+    // A link gives what its maker may still do: a folder's list or archive as a ListBucket, a file as a GetObject, an
+    // upload as a PutObject, each judged now.
+    const bool listing = reading && s.folder && (rel.empty() || rel.back() == '/');
+    const bool whole   = listing || (reading && s.folder && r.has_query("zip"));
+    if (!link_allows(c, s.maker, r.method == "PUT" ? "PUT" : "GET", s.bucket, whole ? std::string_view{} : key))
+    {
+        app_reply(c, 403, "The link's maker may no longer do this.\n");
+        return;
+    }
     // A folder link without a file is a page of what is in it, and with ?format=json a list.
-    if (reading && s.folder && (rel.empty() || rel.back() == '/') && !r.has_query("zip"))
+    if (listing && !r.has_query("zip"))
     {
         list_query q;
         q.prefix    = key;
@@ -715,7 +788,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         archive = archive.substr(archive.rfind('/') + 1);
         c->anonymous = true;
         c->user.reset();
-        zip_start(c, s.bucket, std::move(key), {}, std::move(archive), true);
+        zip_start(c, s.bucket, std::move(key), {}, std::move(archive), &s.maker);
         return;
     }
     // The object itself, as the S3 path serves it, judged by the link and not by any policy.
@@ -878,6 +951,9 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
     }
     s.owner = u ? u->id : std::string(default_owner);
     s.created_ms = wall::now_ms();
+    s.bucket_owner = std::string(owner_of(s.bucket));
+    if (s.owner == default_owner && !c->anonymous)
+        s.maker_key = c->principal;
     // A lifetime past a hundred years is one that does not end, and is not multiplied past int64 into the past.
     constexpr uint64_t century_s = 100ull * 365 * 86400;
     s.expires_ms = !expires_in || expires_in > century_s ? 0 : s.created_ms + static_cast<int64_t>(expires_in) * 1000;

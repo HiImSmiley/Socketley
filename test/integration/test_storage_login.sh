@@ -12,7 +12,7 @@
 #     password and keys without a policy
 #   * a delegate of IAM rights setting an admin's password
 #   * the tags the runtime reads not read: the name shown, the quota held to,
-#     disabled meaning neither password nor key signs in
+#     disabled meaning neither password nor key signs in, nor a share link reads
 #   * the IAM group of admins not making an admin
 #   * an invitation used twice, made by a non-admin, or not making the user
 #     it says
@@ -171,14 +171,20 @@ if phase == "main":
     settle()
     check("a member of admins is an admin", json.loads(ui("GET", "/~ui/session", cookie=alice)[1])["admin"], True)
     iam.remove_user_from_group(UserName="alice", GroupName="admins")
+    a3.put_object(Bucket="alices", Key="shared.txt", Body=b"hi")
+    st, body, _ = ui("POST", "/~share", {"bucket": "alices", "key": "shared.txt"}, basic=("alice", "alicepassword2"))
+    link = "/~share/" + (json.loads(body)["id"] if st == 201 else "none")
+    check("a user's share link reads", ui("GET", link, ui_header=False)[:2], (200, "hi"))
     iam.tag_user(UserName="alice", Tags=[{"Key": "socketley:disabled", "Value": "true"}])
     settle()
     check("a disabled user's password signs in no more", sign_in("alice", "alicepassword2")[0], 401)
+    check("nor does its share link read", ui("GET", link, ui_header=False)[0], 410)
     check("nor its key", code(lambda: a3.list_buckets()), "InvalidAccessKeyId")
     check("but its name is still a user's", "alice" in [u["id"] for u in json.loads(ui("GET", "/~ui/users", cookie=dave)[1])["users"]], True)
     iam.untag_user(UserName="alice", TagKeys=["socketley:disabled"])
     settle()
     check("let in again, it signs in", sign_in("alice", "alicepassword2")[0], 200)
+    check("and its link reads again", ui("GET", link, ui_header=False)[:2], (200, "hi"))
 
     # Invitations.
     _, root, _ = sign_in("AKIALOGINROOT0000000", "loginrootsecretloginrootsecretloginroot0")

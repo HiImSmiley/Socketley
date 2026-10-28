@@ -457,7 +457,7 @@ void storage_run::op_dav(const std::shared_ptr<conn>& c)
                 only.push_back(v);
         std::string archive = key.empty() ? bucket : key.substr(0, key.size() - 1);
         archive = archive.substr(archive.rfind('/') + 1);
-        zip_start(c, std::move(bucket), std::move(key), std::move(only), std::move(archive), false);
+        zip_start(c, std::move(bucket), std::move(key), std::move(only), std::move(archive), nullptr);
         return;
     }
     // A file read with ?download is saved by a browser, under its own name.

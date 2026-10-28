@@ -675,7 +675,12 @@ void sigv4_authenticator::add_iam(credential_set& set)
             }
             // Disabled is no sign-in for a user of the file too; the keys the file holds stay the file's to revoke.
             if (const auto d = iu.tags.find(std::string(iam_tag_disabled)); d != iu.tags.end() && d->second == "true")
+            {
+                auto off = std::make_shared<user_identity>(*set.find_user(name));
+                off->disabled = true;
+                set.replace_user(std::move(off));
                 continue;
+            }
             add_login(name, iu, set.shared_user(name));
             for (const auto& [id, k] : st.keys)
                 if (k.user == name && k.active && !set.add(id, k.secret, err, set.shared_user(name)))
@@ -698,6 +703,7 @@ void sigv4_authenticator::add_iam(credential_set& set)
         u->configured   = true;
         u->iam_id       = iu.id;
         u->iam_path     = iu.path;
+        u->disabled     = tag(iam_tag_disabled) == "true";
         const std::string doc = iam_user_policy(st, iu);
         if (!doc.empty())
             compiled(*u, doc);
@@ -1083,8 +1089,30 @@ auth_verdict sigv4_authenticator::authorize_identity(std::string_view id)
         v.error   = {"AccessDenied", "The account signed in is no user of this runtime.", 403};
         return v;
     }
+    // A disabled user acts through no sign-in elsewhere and through none of its share links.
+    if (user->disabled)
+    {
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The account signed in is disabled.", 403};
+        return v;
+    }
     v.user      = std::move(user);
     v.principal = "~" + std::string(id);
+    return v;
+}
+
+auth_verdict sigv4_authenticator::authorize_key(std::string_view access_key)
+{
+    maybe_reload();
+    auth_verdict v;
+    if (m_creds.secret(access_key).empty())
+    {
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The access key is not one of this runtime's.", 403};
+        return v;
+    }
+    v.principal = std::string(access_key);
+    v.user      = m_creds.user_of(access_key);
     return v;
 }
 

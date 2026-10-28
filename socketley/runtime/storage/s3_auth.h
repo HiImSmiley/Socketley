@@ -201,6 +201,15 @@ public:
         v.error   = {"AccessDenied", "The account signed in is no user of this runtime.", 403};
         return v;
     }
+    // What a request signed with `access_key` would be let do, as a share link that key made acts; refused for a key
+    // that is gone.
+    virtual auth_verdict authorize_key(std::string_view /*access_key*/)
+    {
+        auth_verdict v;
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The access key is not one of this runtime's.", 403};
+        return v;
+    }
     // The HMAC-SHA256, hex, of ui_session_text(access_key, issued_ms, expires_ms) under that key's secret, which a
     // session cookie carries; empty for a key that is none.
     virtual std::string ui_session_mac(std::string_view /*access_key*/, int64_t /*issued_ms*/, int64_t /*expires_ms*/) const

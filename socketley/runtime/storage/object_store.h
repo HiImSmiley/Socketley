@@ -693,8 +693,9 @@ public:
     // ── Buckets ─────────────────────────────────────────────────────────────
     bool has_bucket(std::string_view name) const;
     std::vector<bucket_info> buckets() const;
-    // `owner` is the id of the user that made it, empty for the default owner.
-    void create_bucket(std::string name, std::string owner, std::function<void(st)> cb);
+    // `owner` is the id of the user that made it, empty for the default owner; `created_ms`, when not 0, is the time
+    // another node made it at.
+    void create_bucket(std::string name, std::string owner, std::function<void(st)> cb, int64_t created_ms = 0);
     void delete_bucket(std::string name, std::function<void(st)> cb);
     // The id of the user that owns a bucket, empty for the default owner or a bucket that is not here.
     std::string_view bucket_owner(std::string_view name) const;
