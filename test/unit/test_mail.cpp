@@ -244,6 +244,18 @@ TEST_CASE("BDAT: chunks cut anywhere are the message as sent, a bare LF made CRL
     CHECK(f.codes() == std::vector<int>{250, 250, 250, 503, 250});
     CHECK(f.aborted == 1);
     CHECK(f.messages.size() == 2);
+    // A recipient named after the first chunk is refused, not answered 250 and left out of the message.
+    std::vector<std::string> asked;
+    f.rcpt_rule = [&asked](const address& to) {
+        asked.push_back(to.text());
+        return rcpt_verdict{250, ""};
+    };
+    s.input("MAIL FROM:<a@example.org>\r\nRCPT TO:<b@example.com>\r\nBDAT 2\r\nhiRCPT TO:<c@example.com>\r\n"
+            "BDAT 0 LAST\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 250, 503, 250});
+    CHECK(asked == std::vector<std::string>{"b@example.com"});
+    REQUIRE(f.messages.size() == 3);
+    CHECK(f.messages[2] == "hi");
 }
 
 TEST_CASE("DSN: NOTIFY, ORCPT, RET and ENVID are read, kept with each recipient, and refused when malformed")

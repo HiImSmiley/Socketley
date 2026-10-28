@@ -181,6 +181,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **RCPT after a BDAT chunk is refused.** A recipient named between chunks
+  was answered 250, under LMTP with a 250 of its own at the end, but the
+  message had taken its recipients with the first chunk and never reached it;
+  it is now 503, as DATA after a chunk already was.
 - **An SRS address's hash binds where its host ends.** It covered the stamp,
   host and local part run together, so the address made for
   `ictim.orgbob@v` also passed as one for `bob@victim.org`, and a bounce

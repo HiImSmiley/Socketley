@@ -650,6 +650,9 @@ void smtp_session::rcpt(std::string_view arg)
 {
     if (!m_have_from)
         return error(503, "5.5.1", "MAIL first");
+    // The message's recipients were taken when its first chunk began, so one named after it would be told 250 for nothing.
+    if (m_chunking)
+        return error(503, "5.5.1", "BDAT already began the message");
     if (!istarts(arg, "TO:"))
         return error(501, "5.5.4", "Syntax: RCPT TO:<address>");
     std::string_view rest = trim(arg.substr(3));
