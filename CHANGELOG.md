@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Content-Length<VT>` or a NUL in a response field name framed the answer one
   way for the proxy and another for a lenient client; such a backend socket
   is now relayed to its close and not reused.
+- **A grant by e-mail names nobody when two users give the address.** An
+  invitee chose its own e-mail, unchecked, and a grant by that address went to
+  the first user holding it by id, so one invited as `aaron` with the address
+  of `ceo` took every grant meant for `ceo`; such a grant is now
+  UnresolvableGrantByEmailAddress, and addresses are compared without case.
 - **A user's own Deny of the bucket policy operations holds on its own bucket.**
   A bucket's owner and an admin were let set, read and delete its policy past
   every policy, so an explicit Deny of PutBucketPolicy or DeleteBucketPolicy in

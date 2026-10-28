@@ -42,7 +42,7 @@ public:
     std::shared_ptr<const user_identity> shared_user(std::string_view id) const;
     // The first access key that signs for user `id`, empty for none.
     std::string_view key_of(std::string_view id) const;
-    // The user whose email is `email`, empty for none.
+    // The one user whose email is `email`, compared without case; empty for none or for more than one.
     std::string user_of_email(std::string_view email) const;
 
     size_t size() const { return m_map.size(); }

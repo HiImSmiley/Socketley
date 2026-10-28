@@ -50,6 +50,9 @@ AKIAACLMAIN000000001:acl/main/secret
 name = Alt
 email = alt@example.org
 AKIAACLALT0000000001:acl/alt/secret
+[aaron]
+email = alt@example.org
+AKIAACLAARON00000001:acl/aaron/secret
 CREDS
 "$BIN" create storage acl1 -p "$P1" --dir "$T/one" --credentials "$T/creds" --shards 2 -s >/dev/null 2>&1 \
     || { echo "  FAIL [create]: the runtime was not created"; exit 1; }
@@ -125,6 +128,9 @@ alt.put_object(Bucket="aclsow", Key="granted", Body=b"g", GrantRead="emailAddres
 check("a grant by email names the user", grants(main, "aclsow", "granted"), sorted([("alt", "FULL_CONTROL"), ("main", "READ")]))
 check("an email that is nobody's is UnresolvableGrantByEmailAddress",
       code(lambda: alt.put_object(Bucket="aclsow", Key="x", Body=b"x", GrantRead="emailAddress=nobody@example.org")),
+      "UnresolvableGrantByEmailAddress")
+check("an email two users have names neither, though one is first by id",
+      code(lambda: main.put_object(Bucket="aclsow", Key="x", Body=b"x", GrantRead="emailAddress=alt@example.org")),
       "UnresolvableGrantByEmailAddress")
 check("an id that is nobody's is InvalidArgument",
       code(lambda: alt.put_object(Bucket="aclsow", Key="x", Body=b"x", GrantRead='id="nobody"')), "InvalidArgument")

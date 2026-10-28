@@ -16,6 +16,7 @@
 #include "s3_iam.h"
 #include "s3_names.h"
 #include "s3_sts.h"
+#include "../../shared/util/ascii.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/storage/s3_sigv4.h"
 #include "../../shared/util/size_suffix.h"
@@ -355,10 +356,16 @@ std::shared_ptr<const user_identity> credential_set::shared_user(std::string_vie
 
 std::string credential_set::user_of_email(std::string_view email) const
 {
+    // An address two users give, in any case, names neither, so a grant by it never reaches whoever claimed it too.
+    std::string found;
     for (const auto& [id, u] : m_users)
-        if (!u->email.empty() && u->email == email)
-            return id;
-    return {};
+        if (!u->email.empty() && ascii::iequals(u->email, email))
+        {
+            if (!found.empty())
+                return {};
+            found = id;
+        }
+    return found;
 }
 
 std::string_view credential_set::key_of(std::string_view id) const
