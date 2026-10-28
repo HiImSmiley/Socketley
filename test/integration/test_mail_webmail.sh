@@ -418,6 +418,9 @@ case "$session" in *'"apiUrl":"https://webmail.example.test'*) ok "behind it the
     *) bad "behind it the session's URLs are the HTTPS it was reached over" "$(printf '%s' "$session" | head -c 300)" ;; esac
 # A tab come back to, over HTTP/2 through the entrance: its EventSource held, then its API calls at once, each one a
 # connect to the webmail the entrance has not pooled; their bodies wait on that connect and must still reach it.
+if ! python3 -c 'import h2' 2>/dev/null; then
+    echo "  SKIP: a tab's burst over HTTP/2 (the python h2 library is not installed)"
+else
 burst=$(python3 - "$GATE" <<'PY'
 import base64, json, socket, ssl, sys, time, h2.config, h2.connection, h2.events
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE; ctx.set_alpn_protocols(["h2"])
@@ -454,6 +457,7 @@ PY
 )
 [ "$burst" = "200 200 200 200 200 200" ] && ok "a tab's API calls at once beside its EventSource all reach the webmail through the entrance" \
     || bad "a tab's API calls at once beside its EventSource all reach the webmail through the entrance" "$burst"
+fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

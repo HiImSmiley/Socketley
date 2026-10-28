@@ -36,6 +36,8 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 expect() { [ "$2" = "$3" ] && ok || bad "$1" "got '$2', want '$3'"; }
 
 echo "=== Integration: the idp runtime keeps accounts and signs them in everywhere ==="
+# The account every sign-in below uses is a storage's IAM user, made with boto3 and imported.
+python3 -c 'import boto3, jwt' 2>/dev/null || { echo "  SKIP: boto3 and PyJWT are required"; exit 0; }
 daemon_isolate idp
 T=$SOCKETLEY_TMPD
 PS=$((SL_PORT_BASE + 1960))

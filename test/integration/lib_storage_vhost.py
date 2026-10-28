@@ -307,6 +307,11 @@ def raw_mode():
 
 
 def after_mode():
+    try:
+        import boto3  # noqa: F401
+    except ImportError:
+        print("  SKIP: boto3 is not installed, and the object read after the restart is the one it copied")
+        finish()
     st, _, data = raw("GET", "vh-bucket.localhost:%d" % PORT, "/copy")
     check("after a restart the bucket's host still addresses it", st == 200 and data == b"copied across", (st, data[:200]))
     st, _, data = raw("GET", "localhost:%d" % PORT, "/vh-bucket/copy")

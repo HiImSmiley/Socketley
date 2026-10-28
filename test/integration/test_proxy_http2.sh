@@ -195,6 +195,9 @@ case "$got" in 2*/2|4*/2|5*/2) ok "a body of no stated length too, framed as chu
                 *) bad "a body of no stated length" "got '$got'" ;; esac
 
 # An empty DATA frame in the middle of a body of no stated length is nothing, and not the chunk that ends it.
+if ! python3 -c 'import h2' 2>/dev/null; then
+    echo "  SKIP: an empty DATA frame between two others (the python h2 library is not installed)"
+else
 for _ in $(seq 1 40); do [ "$(hc echo.example.com /x)" = "len=0" ] && break; sleep 0.2; done
 got=$(python3 - "$E" <<'PY'
 import socket, ssl, sys, h2.connection, h2.config, h2.events
@@ -218,6 +221,7 @@ print(body.decode(errors="replace"))
 PY
 )
 expect "an empty DATA frame between two others leaves the body whole" "$got" "len=6"
+fi
 
 # ── a complete body, byte for byte ─────────────────────────────────────────
 cp "$T/big.txt" "$T/one/big.txt"
