@@ -272,6 +272,8 @@ private:
         uint64_t filters_weighed{0};
     };
     user_state& user(const std::string& name);
+    // The state of a user some shard keeps an index for, or null, nothing made for a name no mail or sign-in made.
+    user_state* indexed(const std::string& name);
     // A filter held in memory and counted against what every user's may take together.
     void hold_filter(user_state& u, uint64_t id, std::string filter);
     // The filters made here appended to the user's file, which is written again once it is mostly for messages gone.

@@ -323,9 +323,12 @@ std::string imap_store::rights(const std::string& owner, const std::string& fold
 {
     if (owner == who)
         return std::string(all_rights);
-    const auto& folders = user(owner).folders;
-    const auto it = folders.find(canonical(folder));
-    if (it == folders.end())
+    // An owner with no index has given nobody a right, and asking makes none for them.
+    const user_state* u = indexed(owner);
+    if (!u)
+        return {};
+    const auto it = u->folders.find(canonical(folder));
+    if (it == u->folders.end())
         return {};
     std::string out;
     for (const char* id : {who.c_str(), "anyone"})
@@ -357,9 +360,11 @@ bool imap_store::set_acl(const std::string& owner, const std::string& folder, co
 
 std::map<std::string, std::string> imap_store::acl(const std::string& owner, const std::string& folder)
 {
-    const auto& folders = user(owner).folders;
-    const auto it = folders.find(canonical(folder));
-    return it == folders.end() ? std::map<std::string, std::string>{} : it->second->acl;
+    const user_state* u = indexed(owner);
+    if (!u)
+        return {};
+    const auto it = u->folders.find(canonical(folder));
+    return it == u->folders.end() ? std::map<std::string, std::string>{} : it->second->acl;
 }
 
 std::string imap_store::list_path(std::string_view name) const
@@ -591,6 +596,17 @@ std::shared_ptr<imap_folder> imap_store::make_folder(user_state& u, const std::s
     u.last_validity = f->uidvalidity;
     u.folders[name] = f;
     return f;
+}
+
+imap_store::user_state* imap_store::indexed(const std::string& name)
+{
+    if (const auto it = m_users.find(name); it != m_users.end() && it->second.loaded)
+        return &it->second;
+    const std::string base = path_of(name);
+    struct stat st{};
+    if (::stat(base.c_str(), &st) != 0 && ::stat((base + ".log").c_str(), &st) != 0)
+        return nullptr;
+    return &user(name);
 }
 
 imap_store::user_state& imap_store::user(const std::string& name)

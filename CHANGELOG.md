@@ -126,6 +126,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   standing for all, so a Deny on deleting a prefix's objects was passed over
   and they went with the bucket; each version is now judged as its own
   DeleteObjectVersion, and one refused keeps the library, answered 409.
+- **Asking for another user's folder makes no index for them.** Any
+  `Other Users/<name>/...` a signed-in IMAP user named wrote a lock and a
+  journal for `<name>` and kept it in memory and in every tick for good, so
+  a client naming millions filled the state volume and the shard; an owner
+  without an index now has given no rights and gets none made.
 - **IMAP LIST takes at most 64 patterns of 1024 bytes.** Every folder was
   matched against every pattern with the reference copied in front of it
   each time, so one LIST of a 25 MiB reference or of millions of patterns

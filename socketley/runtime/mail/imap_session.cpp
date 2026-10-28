@@ -3260,7 +3260,8 @@ void imap_session::cmd_acl(const std::string& tag, const std::string& cmd, const
     if (a.size() < 2 || (cmd == "SETACL" && a.size() < 4) || ((cmd == "DELETEACL" || cmd == "LISTRIGHTS") && a.size() < 3))
         return finish(tag, "BAD", cmd + " needs a mailbox" + (cmd == "GETACL" || cmd == "MYRIGHTS" ? "" : " and an identifier"));
     const place p = resolve(box(a[1].text));
-    if (p.owner.empty() || m_store.mailbox_id(p.owner, p.folder).empty())
+    // A folder of another that gave no right is looked up no further, so a name of no one gets no index.
+    if (p.owner.empty() || p.rights.empty() || m_store.mailbox_id(p.owner, p.folder).empty())
         return finish(tag, "NO", "[NONEXISTENT] No such mailbox");
     const std::string shown_name = mime::imap_string(a[1].text, false);
     if (cmd == "MYRIGHTS")

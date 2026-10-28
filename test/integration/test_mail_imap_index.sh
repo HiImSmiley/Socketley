@@ -472,6 +472,10 @@ elif step == "acl":
     r = a.cmd('SELECT "Other Users/bob/Team"')
     l = a.cmd('LIST "" "Other Users/*"')
     say("DELETEACL takes it all away: not selected, not listed", "[NONEXISTENT]" in r[-1] and not any("Team" in x for x in l), (r, l))
+    # A name no one has is no owner: each of these is NONEXISTENT, and leaves no index for it (checked below).
+    r = [a.cmd(c)[-1] for c in ('STATUS "Other Users/nosuchowner/INBOX" (MESSAGES)', 'SELECT "Other Users/nosuchowner/INBOX"',
+                                'MYRIGHTS "Other Users/nosuchowner/INBOX"', 'GETACL "Other Users/nosuchowner/INBOX"')]
+    say("another's folder of a name no one has is NONEXISTENT", all("[NONEXISTENT]" in x for x in r), r)
 elif step == "cuts":
     # The same commands sent whole, a byte at a time and cut at odd places are answered the same.
     script = (b"c1 LOGIN {3+}\r\nbob {13+}\r\nbobpassword12\r\nc2 EXAMINE INBOX\r\n"
@@ -529,6 +533,9 @@ tally < <(run meta | grep -E '^(ok|bad) ')
 tally < <(run notify | grep -E '^(ok|bad) ')
 tally < <(run rev2 | grep -E '^(ok|bad) ')
 tally < <(run acl | grep -E '^(ok|bad) ')
+made=$(find "$HOME/.local/share" -path '*/mail/m.imap/nosuchowner*' 2>/dev/null | head -3)
+[ -n "$(find "$HOME/.local/share" -path '*/mail/m.imap/bob' 2>/dev/null)" ] && [ -z "$made" ] \
+    && ok "asking for a folder of no one makes no index for them" || bad "asking for a folder of no one makes no index for them" "$made"
 tally < <(run cuts | grep -E '^(ok|bad) ')
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1; ready_tcp 127.0.0.1 "$IM" >/dev/null
 tally < <(run after | grep -E '^(ok|bad) ')
