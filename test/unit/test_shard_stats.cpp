@@ -445,6 +445,39 @@ TEST_CASE("a retired shard's clients stop being listed")
     CHECK(out[0] == mk(7, 1));
 }
 
+TEST_CASE("a shard killed inside a write leaves a block the daemon can still clear")
+{
+    shard_clients::client_table region;
+    REQUIRE(region.create(2));
+    CHECK(in_child([&] {
+        shard_clients::client_table w;
+        if (!w.adopt(::dup(region.fd()), 1, 2)) return 1;
+        w.push(mk(7, 1)); w.push(mk(7, 2));
+        return 0;
+    }) == 0);
+
+    // What a SIGKILL between begin_write and end_write leaves: an odd version
+    // no process will ever make even again.
+    const size_t len = shard_clients::region_size(2);
+    void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, region.fd(), 0);
+    REQUIRE(p != MAP_FAILED);
+    auto* b = reinterpret_cast<shard_clients::block_header*>(
+        static_cast<uint8_t*>(p) + sizeof(shard_clients::region_header) + shard_clients::block_size);
+    b->version.fetch_add(1, std::memory_order_relaxed);
+
+    std::vector<conn_ref> out;
+    CHECK_FALSE(region.read_block(1, out));
+
+    // The daemon clears it once the pid is reaped, and a clear that only added
+    // one would leave it odd -- unreadable for as long as the runtime runs.
+    region.clear_block(1);
+    out.clear();
+    CHECK(region.read_block(1, out));
+    CHECK(out.empty());
+    CHECK((b->version.load(std::memory_order_relaxed) & 1u) == 0);
+    ::munmap(p, len);
+}
+
 TEST_CASE("a replacement shard does not inherit its predecessor's clients")
 {
     shard_clients::client_table region;

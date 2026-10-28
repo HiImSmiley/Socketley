@@ -430,8 +430,12 @@ private:
         std::chrono::seconds                  grace{5};
         // The runtime it served, whose next worker is not forked until this one has exited.
         std::string                           runtime;
+        // Its block of the runtime's client list, which it writes until it exits and the daemon clears after.
+        uint32_t                              clients_block{shard_clients::client_table::invalid_index};
     };
     std::vector<orphan_worker> m_orphan_workers;
+    // An exited worker's block, cleared when the runtime still has the list it wrote.
+    void clear_clients_block(const std::string& runtime, uint32_t block);
 
     // waitpid(WNOHANG) over the list, and SIGKILL for anything still there a
     // few seconds after its SIGTERM.

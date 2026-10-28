@@ -182,6 +182,7 @@ public:
     void set_shard(uint32_t index, int region_fd, int clients_fd)
     { m_shard_index = index; m_shard_region_fd = region_fd;
       m_shard_clients_fd = clients_fd; }
+    uint32_t shard_index() const { return m_shard_index; }
 
     // The shard mesh ends this child inherits, consumed by the fork because
     // the daemon closes its own copies once the whole set is forked, so a

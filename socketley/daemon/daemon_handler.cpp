@@ -7396,9 +7396,12 @@ void daemon_handler::reconcile_proxy_workers()
         if (const pid_t p = sup->release_pid(); p > 0)
         {
             m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false,
-                std::chrono::seconds(dumps ? socketley::dump_exit_bound_sec : 5), runtime});
+                std::chrono::seconds(dumps ? socketley::dump_exit_bound_sec : 5), runtime,
+                sup->shard_index()});
             watch_exit(p);
         }
+        else
+            clear_clients_block(runtime, sup->shard_index());
 
         const uint32_t tok = sup->retire();
         m_retired_handlers.push_back({std::move(sup), tok});
@@ -7472,11 +7475,9 @@ void daemon_handler::reconcile_proxy_workers()
             r->second.set_shard_count(static_cast<uint32_t>(w->second));
 
         // The client list is sized from the shard count, so a retired shard's
-        // block is cleared instead of the region being resized.
-        if (const auto c = m_shard_client_regions.find(it->first);
-            c != m_shard_client_regions.end())
-            for (size_t i = w->second; i < c->second.count(); ++i)
-                c->second.clear_block(static_cast<uint32_t>(i));
+        // block is cleared instead of the region being resized -- by
+        // clear_clients_block() once its worker has exited, because until then
+        // that worker still accepts and closes and is the block's writer.
 
         ++it;
     }
@@ -8169,6 +8170,7 @@ bool daemon_handler::predecessor_running(const std::string& name)
         const pid_t r = ::waitpid(it->pid, nullptr, WNOHANG);
         if (r > 0 || (r < 0 && errno == ECHILD))
         {
+            clear_clients_block(it->runtime, it->clients_block);
             it = m_orphan_workers.erase(it);
             continue;
         }
@@ -8176,6 +8178,14 @@ bool daemon_handler::predecessor_running(const std::string& name)
         ++it;
     }
     return running;
+}
+
+void daemon_handler::clear_clients_block(const std::string& runtime, uint32_t block)
+{
+    // Safe because nothing forks the runtime's next worker, which would adopt this block, while this one runs.
+    if (const auto c = m_shard_client_regions.find(runtime);
+        c != m_shard_client_regions.end() && block < c->second.count())
+        c->second.clear_block(block);
 }
 
 bool daemon_handler::any_spawn_waiting(const std::vector<std::string>& names) const
@@ -8241,6 +8251,7 @@ void daemon_handler::reap_orphan_workers()
         const pid_t r = ::waitpid(it->pid, nullptr, WNOHANG);
         if (r > 0 || (r < 0 && errno == ECHILD))
         {
+            clear_clients_block(it->runtime, it->clients_block);
             it = m_orphan_workers.erase(it);
             continue;
         }
