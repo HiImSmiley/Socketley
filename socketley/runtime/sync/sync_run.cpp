@@ -445,14 +445,24 @@ size_t sync_run::open_connections() const
 
 bool sync_run::excluded(const std::string& rel) const
 {
-    const size_t slash = rel.rfind('/');
-    const char* base = rel.c_str() + (slash == std::string::npos ? 0 : slash + 1);
+    // Every folder on the way down is asked too, so a key the storage lists under an excluded folder is out as the
+    // walk keeps it out.
+    std::string part;
     for (const auto& pat : m_exclude)
     {
         // A pattern with no slash names an entry at any depth, as a .gitignore line does.
-        const char* against = pat.find('/') == std::string::npos ? base : rel.c_str();
-        if (::fnmatch(pat.c_str(), against, 0) == 0)
-            return true;
+        const bool whole = pat.find('/') != std::string::npos;
+        for (size_t from = 0;;)
+        {
+            const size_t slash = rel.find('/', from);
+            const size_t end = slash == std::string::npos ? rel.size() : slash;
+            part.assign(rel, whole ? 0 : from, whole ? end : end - from);
+            if (::fnmatch(pat.c_str(), part.c_str(), 0) == 0)
+                return true;
+            if (slash == std::string::npos)
+                break;
+            from = slash + 1;
+        }
     }
     return false;
 }

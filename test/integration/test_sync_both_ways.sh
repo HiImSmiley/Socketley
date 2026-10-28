@@ -17,6 +17,7 @@
 #   * a key that climbs out of the directory written outside it
 #   * one way in, a file changed here not put back, or its change lost
 #     rather than kept beside it
+#   * a key below an --exclude'd folder brought in, such as a .git/config
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -134,6 +135,22 @@ until_ok 15 test "$(cat "$T/in/a.txt")" = a
 expect "a file changed here is put back as the storage has it" "$(cat "$T/in/a.txt") $(cat "$T/in/sub/b.txt")" "a b2"
 expect "and the change made here is kept beside it" "$(cat "$T/in"/a\ \(conflict*.txt 2>/dev/null)" "edited here"
 expect "with nothing written over on the storage" "$(S "http://127.0.0.1:$P/media/a.txt")" a
+
+# ─── an excluded folder keeps its whole tree out ────────────────────────────
+# The walk never enters `.git`, and a key the storage lists below one is as far out: a `.git/config` brought in is
+# a command the next `git status` runs.
+S -o /dev/null -X PUT "http://127.0.0.1:$P/repo"
+put repo/ok.txt "ok"
+put repo/a/.git/config "[core] fsmonitor = touch pwned"
+put repo/a/.git/HEAD "ref: refs/heads/x"
+put repo/.socketley-sync/x "planted"
+mkdir -p "$T/ex"
+"$BIN" create sync ex --dir "$T/ex" --storage "box/repo" --credentials "$T/creds" --mode in --exclude .git \
+    --every 2s -s >/dev/null 2>&1
+until_ok 20 test -e "$T/ex/ok.txt"
+sleep 3
+expect "a key below an excluded folder, or below the job's own, is not brought" \
+    "$(cd "$T/ex" && find . -type f | sort | tr '\n' ' ' | sed 's/ $//')" "./ok.txt"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
