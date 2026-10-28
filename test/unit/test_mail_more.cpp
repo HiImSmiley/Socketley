@@ -65,18 +65,14 @@ TEST_CASE("SRS: a forwarded sender is rewritten under this domain and read back,
     // An SRS1 address is as old as the first forwarder's stamp inside it.
     CHECK(srs::reverse(again, "second.test", "second key", day + 21) == fwd);
     CHECK(srs::reverse(again, "second.test", "second key", day + 22).empty());
-    // The four base64 characters of earlier releases are read until 2026-12-31 (day 20818), and not after.
+    // The four base64 characters of a pre-release build, about 21 bits, are not read back even with the right MAC.
     const int64_t late = 20810;
     const std::string stamp = srs::forward("carol@origin.test", "fwd.test", key, late).substr(14, 2);
     std::string signed_text = stamp + "origin.testcarol";
     socketley::ascii::lower_in_place(signed_text);
     const std::string old_hash = socketley::base64::encode(socketley::crypto::hmac_sha1(key, signed_text)).substr(0, 4);
     const std::string old_form = "SRS0=" + old_hash + "=" + stamp + "=origin.test=carol@fwd.test";
-    CHECK(srs::reverse(old_form, "fwd.test", key, late) == "carol@origin.test");
-    CHECK(srs::reverse(old_form, "fwd.test", key, 20819).empty());
-    std::string wrong_old = old_form;
-    wrong_old[5] = wrong_old[5] == 'A' || wrong_old[5] == 'a' ? 'B' : 'A';
-    CHECK(srs::reverse(wrong_old, "fwd.test", key, late).empty());
+    CHECK(srs::reverse(old_form, "fwd.test", key, late).empty());
     // The hash binds where the host ends, so one address does not vouch for another split of the same characters.
     const std::string split = srs::forward("ictim.orgbob@v", "fwd.test", key, day);
     CHECK(srs::reverse(split, "fwd.test", key, day) == "ictim.orgbob@v");

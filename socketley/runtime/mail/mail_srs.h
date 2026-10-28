@@ -5,7 +5,7 @@
 // for one another forwarder rewrote, as Shevek's scheme and Postfix's postsrsd write them; the hash is eight base32
 // characters (40 bits, whatever a relay does to case) of an HMAC under a key of the runtime's own, the time its day,
 // and an address older than 21 days by its own stamp or, for SRS1, by the first forwarder's, or not of this key, is no
-// address.  The four-character hash of earlier releases is read back until 2026-12-31 and no longer.
+// address.
 #include <cstdint>
 #include <string>
 #include <string_view>
