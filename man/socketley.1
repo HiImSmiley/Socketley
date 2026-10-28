@@ -12128,7 +12128,11 @@ a malformed query is FORMERR, and opcodes other than QUERY are NOTIMP.
 .SS TCP
 A connection may carry several queries one after another and is answered in
 order (RFC 7766). One left quiet for 10 seconds, with nothing left to write, is
-closed. Past 64 KiB of answers its peer has not read, a connection's further
+closed; only a whole query or a write counts, so a query begun and not finished
+is quiet. A shard holds at most
+.B \-\-max\-connections
+of them, 256 when it is not given; one more closes the quietest with nothing
+left to write to make room for itself. Past 64 KiB of answers its peer has not read, a connection's further
 queries wait unread until it has; one whose answers have not moved for 30
 seconds is closed.
 .SS Stats
@@ -12156,6 +12160,8 @@ and
 (answers the socket would not take),
 .BR tcp_conns ,
 .BR tcp_refused ,
+.B tcp_evicted
+(connections closed to make room for a new one),
 .BR transfers ,
 .BR transfers_refused ,
 .BR notify_sent ,

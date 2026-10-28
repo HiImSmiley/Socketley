@@ -230,6 +230,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   files, saying what it leaves. No restored file keeps a setuid or setgid
   bit, and outside the state and config a file the archive says root owns is
   written as the daemon's user's.
+- **A DNS TCP connection is kept by whole queries, not by bytes.** Any byte
+  read counted as activity, so a peer sending one byte of a query it never
+  finished every few seconds kept its connection for good, and 256 of them
+  closed every new TCP client of a shard at once. Only a whole query or a
+  write counts now, and a full table closes its quietest connection with
+  nothing left to write to make room for the new one (`tcp_evicted`).
 - **A DNS TCP peer that does not read its answers stops being read.** A
   connection's queries were read and answered however many answers waited
   unsent, up to 256 MiB a connection, and one with answers waiting was never

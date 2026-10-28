@@ -236,7 +236,7 @@ public:
         uint64_t noerror{0}, nxdomain{0}, refused{0}, formerr{0}, notimp{0}, other_rcode{0};
         uint64_t truncated{0}, referrals{0}, dropped{0};
         uint64_t rrl_dropped{0}, rrl_slipped{0}, send_failed{0};
-        uint64_t tcp_conns{0}, tcp_refused{0};
+        uint64_t tcp_conns{0}, tcp_refused{0}, tcp_evicted{0};
         uint64_t transfers{0}, transfers_refused{0};
         uint64_t notify_sent{0}, notify_acked{0}, notify_given_up{0};
         uint64_t reloads{0}, reload_failures{0};
@@ -332,6 +332,9 @@ private:
 
     void arm_accept(tcp_listener& l);
     void accept_done(tcp_listener& l, struct io_uring_cqe* cqe);
+    // RFC 7766 6.2.3: a full table makes room by closing the connection longest without a whole query or a write,
+    // among those with nothing left to write.
+    void evict_quietest();
     void arm_read(const std::shared_ptr<tcp_conn>& c);
     void read_done(const std::shared_ptr<tcp_conn>& c, int res);
     // Answers what `in` holds and flushes, over again while the socket takes the answers whole.
@@ -877,6 +880,8 @@ void dns_run::accept_done(tcp_listener& l, struct io_uring_cqe* cqe)
     if (fd >= 0)
     {
         const uint32_t limit = m_owner.get_max_connections() ? m_owner.get_max_connections() : tcp_max_conns;
+        if (!m_stopped && m_conns.size() >= limit)
+            evict_quietest();
         if (m_stopped || m_conns.size() >= limit)
         {
             ++m_c.tcp_refused;
@@ -904,6 +909,18 @@ void dns_run::accept_done(tcp_listener& l, struct io_uring_cqe* cqe)
     const bool starved = fd == -EMFILE || fd == -ENFILE || fd == -ENOBUFS || fd == -ENOMEM;
     if (!l.pending && !m_stopped && fd != -ECANCELED && !starved)
         arm_accept(l);
+}
+
+void dns_run::evict_quietest()
+{
+    std::shared_ptr<tcp_conn> pick;
+    for (const auto& [id, c] : m_conns)
+        if (c->waiting() == 0 && (!pick || c->last < pick->last))
+            pick = c;
+    if (!pick)
+        return;
+    ++m_c.tcp_evicted;
+    close_conn(pick);
 }
 
 std::shared_ptr<dns_run::tcp_conn> dns_run::conn_of(io_request* req)
@@ -945,7 +962,6 @@ void dns_run::read_done(const std::shared_ptr<tcp_conn>& c, int res)
         close_conn(c);
         return;
     }
-    c->last = steady_sec();
     c->in.append(c->rbuf, static_cast<size_t>(res));
     runtime_instance::stat_add(m_owner.m_stat_bytes_in, static_cast<uint64_t>(res));
     tcp_serve(c);
@@ -1039,6 +1055,9 @@ size_t dns_run::tcp_answer(const std::shared_ptr<tcp_conn>& c)
         }
     }
     c->in.erase(0, off);
+    // Only a whole query counts as activity, so a peer trickling bytes of one it never finishes is still quiet.
+    if (off > 0)
+        c->last = steady_sec();
     return off;
 }
 
@@ -1675,6 +1694,7 @@ std::string dns_instance::stats_lines() const
         << "send_failed:" << c.send_failed << "\n"
         << "tcp_conns:" << c.tcp_conns << "\n"
         << "tcp_refused:" << c.tcp_refused << "\n"
+        << "tcp_evicted:" << c.tcp_evicted << "\n"
         << "transfers:" << c.transfers << "\n"
         << "transfers_refused:" << c.transfers_refused << "\n"
         << "notify_sent:" << c.notify_sent << "\n"

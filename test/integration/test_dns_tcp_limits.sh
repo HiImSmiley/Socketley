@@ -8,6 +8,9 @@
 #     answers waiting to be written grew to 256 MiB a connection
 #   * a connection with answers still waiting never closed, however long its
 #     peer had not read them
+#   * a byte of a query that is never finished, sent every few seconds, kept
+#     a connection from being quiet, so a few such filled the table
+#   * a full table closing the newcomer rather than the quietest connection
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -28,8 +31,8 @@ daemon_isolate dnslimits
 T="$SOCKETLEY_TMPD"
 P=$((SL_PORT_BASE+1725))
 cleanup() {
-    "$BIN" stop ns >/dev/null 2>&1 || true
-    "$BIN" remove ns >/dev/null 2>&1 || true
+    for r in ns small; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
+    for r in ns small; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -93,6 +96,63 @@ expect "a peer that reads no answers is not read from either (${mib} MiB taken)"
 expect "and its connection is closed once its answers stop moving (${secs}s)" "$closed" "closed"
 expect "the runtime answers a fresh connection after it" \
     "$(dig @127.0.0.1 -p "$P" +tcp +short +time=2 +tries=1 example.com A 2>&1)" "192.0.2.1"
+
+# ── a table held by trickled bytes ──────────────────────────────────────────
+P2=$((SL_PORT_BASE+1726))
+"$BIN" create dns small -p "$P2" --zone "$T/z.zone" --max-connections 4 --proxy none -s >/dev/null 2>&1
+for _ in $(seq 1 50); do dig @127.0.0.1 -p "$P2" +tcp +short +time=1 +tries=1 example.com A >/dev/null 2>&1 && break; sleep 0.1; done
+sleep 1
+# Every slot taken by a connection that sends a byte of a query it never finishes every two seconds: a client
+# after them is still answered, and the trickling ones are closed as quiet however often a byte comes.
+res=$(python3 - "$P2" <<'PY'
+import select, socket, struct, sys, time
+p = int(sys.argv[1])
+def ask():
+    q = struct.pack(">HHHHHH", 9, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 1, 1)
+    try:
+        s = socket.create_connection(("127.0.0.1", p), 3)
+        s.settimeout(3)
+        s.sendall(struct.pack(">H", len(q)) + q)
+        d = b""
+        while len(d) < 2 or len(d) < 2 + struct.unpack(">H", d[:2])[0]:
+            b = s.recv(4096)
+            if not b:
+                return "refused"
+            d += b
+        return "answered" if struct.unpack(">H", d[8:10])[0] == 1 else "wrong"
+    except OSError:
+        return "refused"
+tricklers = []
+for _ in range(4):
+    s = socket.create_connection(("127.0.0.1", p), 3)
+    s.sendall(b"\xff")
+    tricklers.append(s)
+time.sleep(1)
+fresh = ask()
+start = time.time()
+po = select.poll()
+for s in tricklers:
+    po.register(s, select.POLLHUP | select.POLLERR | select.POLLRDHUP)
+closed = set()
+while time.time() - start < 20 and len(closed) < len(tricklers):
+    for fd, _ in po.poll(500):
+        closed.add(fd)
+        po.unregister(fd)
+    for s in tricklers:
+        if s.fileno() not in closed:
+            try:
+                s.send(b"\x00")
+            except OSError:
+                pass
+    time.sleep(1.5)
+print(fresh, len(closed), int(time.time() - start))
+PY
+)
+read -r fresh closed secs <<<"$res"
+expect "a client is answered while every slot is held by a trickling connection" "$fresh" "answered"
+expect "and the trickling connections are closed as quiet, though a byte came every two seconds (${secs}s)" "$closed" "4"
+stat_of() { "$BIN" stats small 2>/dev/null | awk -F: -v k="$1" '$1==k {s+=$2} END {print s+0}'; }
+expect "the one closed to make room is counted" "$(stat_of tcp_evicted)" "1"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
