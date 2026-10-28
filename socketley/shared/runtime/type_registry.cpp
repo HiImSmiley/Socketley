@@ -3,6 +3,7 @@
 
 #include <cctype>
 #include <deque>
+#include <iterator>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -54,6 +55,16 @@ constexpr builtin_name builtins[] = {
     {runtime_sync, "sync"},       {runtime_idp, "idp"},       {runtime_db, "db"},
     {runtime_mqtt, "mqtt"},       {runtime_mail, "mail"},     {runtime_tunnel, "tunnel"},
 };
+
+// Every built-in is below first_registered, so no registered type is handed a built-in's id.
+static_assert(std::size(builtins) == type_registry::first_registered &&
+              []
+              {
+                  for (const auto& b : builtins)
+                      if (b.type >= type_registry::first_registered)
+                          return false;
+                  return true;
+              }());
 
 bool builtin_lookup(std::string_view name, runtime_type& out)
 {
