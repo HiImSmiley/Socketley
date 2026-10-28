@@ -5,6 +5,7 @@
 #include "../util/settings.h"
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -228,6 +229,63 @@ static bool probe_recv_poll_first()
     io_uring_queue_exit(&ring);
     close(sv[0]);
     close(sv[1]);
+    return ok;
+}
+
+// Whether a file taken out of the fixed table is put at once while a recv on
+// another slot is still armed, because a kernel that frees its resource nodes
+// in order holds every socket closed after an idle connection's recv, and the
+// peer of each sits in FIN-WAIT-2 with this side in CLOSE-WAIT until that one
+// connection goes.
+static bool probe_fixed_file_release()
+{
+    int idle[2] = { -1, -1 }, gone[2] = { -1, -1 };
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, idle) < 0)
+        return false;
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gone) < 0)
+    {
+        close(idle[0]);
+        close(idle[1]);
+        return false;
+    }
+
+    struct io_uring ring;
+    bool ring_open = (io_uring_queue_init(4, &ring, 0) == 0);
+    bool ok = false;
+    int files[2] = { idle[0], gone[0] };
+    if (ring_open && io_uring_register_files(&ring, files, 2) == 0)
+    {
+        char buf[16];
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (sqe)
+        {
+            // The idle connection: a recv on slot 0 that nothing will answer.
+            io_uring_prep_recv(sqe, 0, buf, sizeof(buf), 0);
+            sqe->flags |= IOSQE_FIXED_FILE;
+            io_uring_sqe_set_data(sqe, nullptr);
+            if (io_uring_submit(&ring) == 1)
+            {
+                // The closed connection: its own descriptor and then its slot,
+                // which is the order every teardown here takes.
+                close(gone[0]);
+                gone[0] = -1;
+                int neg = -1;
+                if (io_uring_register_files_update(&ring, 1, &neg, 1) == 1)
+                {
+                    // The put runs as task work before the update returns to
+                    // this thread, so a kernel that has done it shows the
+                    // hangup without waiting.
+                    struct pollfd p = { gone[1], POLLIN | POLLRDHUP, 0 };
+                    ok = (::poll(&p, 1, 0) == 1 && (p.revents & (POLLHUP | POLLRDHUP)));
+                }
+            }
+        }
+    }
+    if (ring_open)
+        io_uring_queue_exit(&ring);
+    const int fds[] = { idle[0], idle[1], gone[0], gone[1] };
+    for (int fd : fds)
+        if (fd >= 0) close(fd);
     return ok;
 }
 
@@ -983,7 +1041,10 @@ bool event_loop::init()
     }
 
     // Pre-register a sparse fixed file table with every slot empty,
-    // heap-allocated to avoid a 32 KB stack frame.
+    // heap-allocated to avoid a 32 KB stack frame, and only on a kernel that
+    // closes a removed socket while another one is idle, because every caller
+    // keeps its plain descriptor and falls back to it when no slot is handed out.
+    if (probe_fixed_file_release())
     {
         int* sparse_fds = static_cast<int*>(malloc(MAX_FIXED_FILES * sizeof(int)));
         if (sparse_fds)

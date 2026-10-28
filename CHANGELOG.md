@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Clients are closed beside an idle connection on older kernels.** On a
+  kernel that frees io_uring's file nodes in order (6.8 here), one idle
+  connection to a cache or a server, a replica's included, left every client
+  closed after it in CLOSE-WAIT with no FIN sent; such a kernel is now found
+  at start and those runtimes use plain descriptors there.
 - **Tunnel names and joins, made safe.** A kept sign-in goes only to an idp
   beside the edge that names it, so an edge cannot ask for another's token; an
   agent that has joined is replaced only with `tunnel join --replace`; an
