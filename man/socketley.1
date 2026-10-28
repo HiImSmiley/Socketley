@@ -1044,7 +1044,11 @@ code to give. A user does all of it on their account page,
 the second step turned on only once a code proves the app has the key.
 .B import
 takes a storage runtime's users over, with the password each has there, an
-account of the same name already here kept as it is. A refusal is exit 1.
+account of the same name already here kept as it is. An admin of the storage
+comes over as none here, since an admin here is root by SSH certificate, and
+is named in the output so that
+.B set \fIuser\fB groups=admins
+makes it one. A refusal is exit 1.
 .RS
 .PP
 .nf

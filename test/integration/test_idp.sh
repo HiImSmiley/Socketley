@@ -19,7 +19,7 @@
 #   * a session alone turning a second step on or making an app password, or an app password outliving a sign-out
 #     everywhere
 #   * an app password removed while another is being made coming back with it
-#   * a storage's users not coming over with the passwords they have there
+#   * a storage's users not coming over with the passwords they have there, or its admins coming over as admins
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted
 #   * a return address a browser reads as another host's, by a backslash in its host
@@ -134,6 +134,12 @@ PY
 sleep 0.3
 IMP=$("$BIN" idp-user auth import ui 2>&1); rc=$?
 case "$IMP" in "2 imported, 1 already here"*) ok ;; *) bad "a storage's users are imported, an account of the same name kept" "rc $rc: $IMP" ;; esac
+# The storage's admin comes over as no admin, which would be root by SSH certificate, and is named for the operator.
+case "$IMP" in *"root was an admin of the storage and is none here; idp-user auth set root groups=admins makes it one"*) ok ;;
+    *) bad "an admin of the storage imported is named as one" "$IMP" ;; esac
+ROOTSHOW=$("$BIN" idp-user auth show root 2>&1)
+case "$ROOTSHOW" in "id: "*) ok ;; *) bad "the storage's admin is imported" "$ROOTSHOW" ;; esac
+case "$ROOTSHOW" in *"groups:"*) bad "and is in no group here" "$ROOTSHOW" ;; *) ok ;; esac
 
 run() {
     python3 - "$PI" "$1" "$T" "$PS" "$PP" "$PM" "$ALICE" "$BIN" 2>&1 <<'PY' || echo "bad the $1 checks ran to their end"

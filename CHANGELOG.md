@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Cookie field, and could replay it at every runtime that trusts the provider,
   the provider itself included; it now gets every other cookie, and learns who
   is signed in from `X-Forwarded-User` alone.
+- **`idp-user import` makes no storage admin an idp admin.** A storage user
+  with the admin bit became a member of `admins`, which is root on every host
+  that trusts the idp's SSH CA, so a storage admin could hand out root by
+  making an admin user before an import; it now comes over as no admin, and
+  the import names it with the `set` that makes it one.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

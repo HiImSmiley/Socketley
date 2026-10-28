@@ -3254,6 +3254,7 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
     // name is an account here already is left as the account is.
     size_t kept = 0;
     std::vector<field_list> fresh;
+    std::string admins;
     for (const auto& u : r.objects)
     {
         if (m_accounts.by_name(u.key))
@@ -3266,10 +3267,12 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
         {
             if (v.empty())
                 continue;
+            // An admin here is root by SSH certificate, more than a storage's admin may hand out, so it is only said.
             if (k == "admin")
             {
                 if (v == "1")
-                    f.emplace_back("groups", "admins");
+                    admins += u.key + " was an admin of the storage and is none here; idp-user " +
+                              std::string(m_owner.get_name()) + " set " + u.key + " groups=admins makes it one\n";
             }
             // A storage user's e-mail is taken as one nobody here vouched for.
             else if (k == "name" || (k == "email" && email_problem(v).empty()) || k == "password" || k == "reset")
@@ -3279,7 +3282,7 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
     }
     std::string errors;
     const size_t added = m_accounts.create_many(fresh, errors);
-    answer_command(ticket, std::to_string(added) + " " + std::to_string(kept) + "\n" + errors);
+    answer_command(ticket, std::to_string(added) + " " + std::to_string(kept) + "\n" + errors + admins);
 }
 
 // ─── Shards ─────────────────────────────────────────────────────────────────
