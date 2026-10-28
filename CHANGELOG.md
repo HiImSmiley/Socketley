@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   name under the domain, and a browser, reading the backslash as a slash, went
   to evil.example after signing in or out; a return address's host may now hold
   only letters, digits, `.-_` and a port.
+- **Sign-in guesses are bounded at every turn.** The idp counted a failure
+  only once its hash was done, so guesses sent together from one address
+  were all checked; it now counts those in flight, an IPv6 address by its
+  /64, holds an account up after ten failures from anywhere (half a minute,
+  doubling to five, never for a browser it signed in on), ends a second step
+  after three wrong codes, and lets at most 64 checks wait.
 - **SSH user certificates permit less.** A certificate the idp signed
   permitted X11 forwarding and the user's `~/.ssh/rc` beside a terminal, port
   and agent forwarding, root ones too; it now permits only the last three.

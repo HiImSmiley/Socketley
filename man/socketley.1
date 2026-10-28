@@ -12392,6 +12392,18 @@ entrance, which terminates TLS for its names as for every other runtime's;
 .B \-\-tls
 is refused.
 .PP
+.B Guessing.
+Five failed sign-ins from one address within fifteen minutes refuse it until
+they age out, an IPv6 address counted by its /64, and sign-ins still being
+checked count beside them, so many sent at once are refused alike. Ten at one
+account, from wherever, make its next try wait half a minute, doubling with each
+one more to five minutes; a browser the account signed in on before keeps a
+count of its own, by a cookie of the provider's that lasts ninety days, so
+guesses from elsewhere never hold its user up. Three wrong codes end a
+sign-in's second step, its password then asked again, and five at an account
+hold its codes up as its passwords are. At most 64 password checks wait at a
+shard, and a sign-in past them is told to try again in a moment (503).
+.PP
 .B On several cores.
 With
 .BI "\-\-shards " N

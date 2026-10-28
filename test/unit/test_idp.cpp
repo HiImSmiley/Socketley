@@ -596,3 +596,53 @@ TEST_CASE("random tokens have the length asked for, in their alphabet, and do no
     CHECK(socketley::random_bytes(big.data(), big.size()));
     CHECK(big.find(std::string(64, '\0')) == std::string::npos);
 }
+
+TEST_CASE("an IPv6 address counts under its /64, an IPv4 one written as IPv6 under itself")
+{
+    CHECK(address_key("203.0.113.9") == "203.0.113.9");
+    CHECK(address_key("2001:db8:1:2:aaaa:bbbb:cccc:dddd") == "2001:db8:1:2::/64");
+    CHECK(address_key("2001:db8:1:2::1") == address_key("2001:db8:1:2:ffff::9"));
+    CHECK(address_key("2001:db8:1:3::1") != address_key("2001:db8:1:2::1"));
+    CHECK(address_key("::ffff:198.51.100.7") == "198.51.100.7");
+    CHECK(address_key("not an address") == "not an address");
+}
+
+TEST_CASE("attempts in flight count against the bar, and an account waits longer with each failure past its free ones")
+{
+    attempt_limits l;
+    const int64_t t = 1'000'000;
+    for (int i = 0; i < 4; ++i)
+        l.begin("a");
+    CHECK_FALSE(l.barred("a", t, 5));
+    l.begin("a");
+    CHECK(l.barred("a", t, 5));
+    for (int i = 0; i < 5; ++i)
+        l.end("a");
+    CHECK_FALSE(l.barred("a", t, 5));
+    for (int i = 0; i < 5; ++i)
+        l.failed("a", t);
+    CHECK(l.barred("a", t, 5));
+    CHECK_FALSE(l.barred("a", t + attempt_limits::window_s + 1, 5));
+
+    for (int i = 0; i < 9; ++i)
+        l.failed("u", t);
+    CHECK(l.wait("u", t, 10) == 0);
+    l.begin("u");
+    CHECK(l.wait("u", t, 10) == 30);
+    l.end("u");
+    l.failed("u", t);
+    CHECK(l.wait("u", t + 10, 10) == 20);
+    CHECK(l.wait("u", t + 30, 10) == 0);
+    l.failed("u", t + 30);
+    CHECK(l.wait("u", t + 30, 10) == 60);
+    for (int i = 0; i < 10; ++i)
+        l.failed("u", t + 40);
+    CHECK(l.wait("u", t + 40, 10) == 300);
+    CHECK(l.wait("u", t + 40 + attempt_limits::window_s + 1, 10) == 0);
+
+    l.age(t + 40 + attempt_limits::window_s + 1);
+    CHECK(l.empty());
+    l.begin("x");
+    l.age(t + 10 * attempt_limits::window_s);
+    CHECK_FALSE(l.empty());
+}

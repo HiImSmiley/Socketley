@@ -63,7 +63,13 @@ constexpr size_t  max_conns     = 4096;
 // What the endpoints a page's script calls say to every origin alike.
 constexpr std::string_view any_origin = "Access-Control-Allow-Origin: *\r\n";
 constexpr int     miss_limit    = 5;
-constexpr int64_t miss_window   = 15 * 60;
+// Failures at one account before each try waits, from 30 seconds to 5 minutes, and wrong codes likewise.
+constexpr int     account_free  = 10;
+constexpr int     code_free     = 5;
+// Wrong codes one password step may be followed by before it must be given again.
+constexpr int     code_tries    = 3;
+constexpr int64_t known_secs    = 90 * 86400;
+constexpr std::string_view known_cookie_name = "skl_idp_known";
 
 std::string peer_text(const sockaddr_storage& a)
 {
@@ -344,13 +350,8 @@ void idp_run::tick()
         m_user_codes.erase(it->second.user_code);
         it = m_devices.erase(it);
     }
-    // A loop rather than erase_if, whose predicate GCC 12's library hands each entry as const.
-    for (auto it = m_misses.begin(); it != m_misses.end();)
-    {
-        std::erase_if(it->second.at, [now](int64_t t) { return now - t > miss_window; });
-        it = it->second.at.empty() ? m_misses.erase(it) : std::next(it);
-    }
-    if (!m_http.empty() || !m_codes.empty() || !m_misses.empty() || !m_devices.empty())
+    m_limits.age(now);
+    if (!m_http.empty() || !m_codes.empty() || !m_limits.empty() || !m_devices.empty())
         arm_tick();
 }
 
@@ -614,7 +615,8 @@ std::string idp_run::session_cookie(const account& who, bool remember) const
         h += "; Secure";
     if (!m_cookie_domain.empty())
         h += "; Domain=" + m_cookie_domain;
-    return h + "\r\n";
+    // A browser given a session is one the account signed in on, which guesses at it from elsewhere do not hold up.
+    return h + "\r\n" + known_cookie(who);
 }
 
 bool idp_run::still_signed_in(const account& who, int64_t issued)
@@ -716,16 +718,48 @@ std::string idp_run::client_ip(const conn& c, const request& rq) const
 
 bool idp_run::barred(const std::string& ip, int64_t now)
 {
-    const auto it = m_misses.find(ip);
-    if (it == m_misses.end())
-        return false;
-    std::erase_if(it->second.at, [now](int64_t t) { return now - t > miss_window; });
-    return static_cast<int>(it->second.at.size()) >= miss_limit;
+    return m_limits.barred(address_key(ip), now, miss_limit);
 }
 
-void idp_run::missed(const std::string& ip, int64_t now, std::function<void()> then)
+std::string idp_run::known_cookie(const account& who) const
 {
-    m_misses[ip].at.push_back(now);
+    const int64_t now = wall::now_sec();
+    const std::string body = "\"iss\":" + m_issuer_json + ",\"aud\":\"known\",\"sub\":" + socketley::json::quote(who.id) +
+                             ",\"iat\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + known_secs);
+    // The provider's own host alone reads it, so it names no domain.
+    std::string h = "Set-Cookie: " + std::string(known_cookie_name) + "=" + sign_secret_token(m_secret, "known+jwt", body) +
+                    "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + std::to_string(known_secs);
+    if (m_secure_cookie)
+        h += "; Secure";
+    return h + "\r\n";
+}
+
+std::string idp_run::account_key(const request& rq, std::string_view prefix, const account* who,
+                                 std::string_view user) const
+{
+    bool known = false;
+    if (who)
+        http::for_each_cookie(rq.cookie, known_cookie_name, [&](std::string_view v) {
+            claims c;
+            std::string why;
+            known = verify_secret_token(m_secret, "known+jwt", m_issuer, v, wall::now_sec(), c, why) &&
+                    claim(c, "aud") == "known" && claim(c, "sub") == who->id;
+            return known;
+        });
+    if (known)
+        return std::string(prefix) + "known:" + who->id;
+    std::string name(who ? who->username() : user);
+    socketley::ascii::lower_in_place(name);
+    return std::string(prefix) + "user:" + name;
+}
+
+void idp_run::missed(const std::string& ip, const std::string& acct, int64_t now, std::function<void()> then)
+{
+    std::vector<std::string> keys{address_key(ip)};
+    if (!acct.empty())
+        keys.push_back(acct);
+    for (const auto& k : keys)
+        m_limits.failed(k, now);
     arm_tick();
     // Every shard bars the address, which would otherwise have five tries at each, and the failure is answered once
     // they all have, so the next try is barred wherever it lands.
@@ -737,11 +771,12 @@ void idp_run::missed(const std::string& ip, int64_t now, std::function<void()> t
     };
     for (uint32_t j = 0; j < m_shards && m_shards > 1; ++j)
         if (j != m_shard)
-        {
-            ++*left;
-            if (!cross(j, shard_call{shard_call::miss, ip, {}, now}, one))
-                --*left;
-        }
+            for (const auto& k : keys)
+            {
+                ++*left;
+                if (!cross(j, shard_call{shard_call::miss, k, {}, now}, one))
+                    --*left;
+            }
     one(true, {});
 }
 
@@ -855,7 +890,8 @@ void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, par
         login_page(c, {}, "The sign-in took too long; sign in again.", 401);
         return;
     }
-    if (barred(ip, wall::now_sec()))
+    const int64_t now = wall::now_sec();
+    if (barred(ip, now))
     {
         ++m_c.barred;
         login_page(c, it->second.p, "Too many failed sign-ins from here; try again in a quarter of an hour.", 429);
@@ -868,17 +904,33 @@ void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, par
         login_page(c, {}, "The user or password is not right.", 401);
         return;
     }
+    const std::string acct = account_key(rq, "code:", a, {});
+    if (const int64_t wait = m_limits.wait(acct, now, code_free); wait > 0)
+    {
+        ++m_c.barred;
+        code_page(c, token, "Too many wrong codes for this user; try again in " + std::to_string(wait) + " seconds.",
+                  429);
+        return;
+    }
     if (!code_right(*a, param(p, "code")))
     {
         ++m_c.refused;
+        // A few wrong codes end the sign-in, whose password must then be given again.
+        const bool ended = ++it->second.misses >= code_tries;
+        const params back = it->second.p;
+        if (ended)
+            m_pending.erase(it);
         std::weak_ptr<conn> weak = c;
         c->waiting = true;
-        missed(ip, wall::now_sec(), [this, weak, token] {
+        missed(ip, acct, now, [this, weak, token, ended, back] {
             auto c2 = weak.lock();
             if (!c2 || c2->dead)
                 return;
             c2->waiting = false;
-            code_page(c2, token, "That code is not the one the app shows.", 401);
+            if (ended)
+                login_page(c2, back, "That code was wrong too many times; sign in again.", 401);
+            else
+                code_page(c2, token, "That code is not the one the app shows.", 401);
             m_http.resume(c2);
         });
         return;
@@ -964,18 +1016,38 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     const std::string ip = client_ip(*c, rq);
-    if (barred(ip, wall::now_sec()))
+    const int64_t now = wall::now_sec();
+    if (barred(ip, now))
     {
         ++m_c.barred;
         login_page(c, p, "Too many failed sign-ins from here; try again in a quarter of an hour.", 429);
         return;
     }
     const account* who = m_accounts.by_name(user);
+    const std::string acct = account_key(rq, {}, who, user);
+    if (const int64_t wait = m_limits.wait(acct, now, account_free); wait > 0)
+    {
+        ++m_c.barred;
+        login_page(c, p, "Too many failed sign-ins as this user; try again in " + std::to_string(wait) + " seconds.",
+                   429);
+        return;
+    }
+    if (hashing_full())
+    {
+        login_page(c, p, "Too many sign-ins are being checked; try again in a moment.", 503);
+        return;
+    }
+    // Counted while its hash is made, so many sent at once are each counted against those sent beside them.
+    const std::string addr = address_key(ip);
+    m_limits.begin(addr);
+    m_limits.begin(acct);
     std::weak_ptr<conn> weak = c;
     const bool remember = param(p, "remember") == "1";
     c->waiting = true;
-    check_password(who, password, [this, weak, p = std::move(p), ip, user, remember](bool ok)
+    check_password(who, password, [this, weak, p = std::move(p), ip, addr, acct, user, remember](bool ok)
     {
+        m_limits.end(addr);
+        m_limits.end(acct);
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
@@ -985,7 +1057,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             ++m_c.refused;
             LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": a sign-in as \"" + user + "\" from " + ip +
                       " was refused").c_str());
-            missed(ip, wall::now_sec(), [this, weak, p]
+            missed(ip, acct, wall::now_sec(), [this, weak, p]
             {
                 auto c2 = weak.lock();
                 if (!c2 || c2->dead)
@@ -1092,9 +1164,15 @@ void idp_run::check_hash(std::string hash, bool real, std::string_view password,
         then(real && ok);
         return;
     }
+    ++m_hashing;
+    auto counted = [this, then = std::move(then)](bool ok)
+    {
+        --m_hashing;
+        then(ok);
+    };
     {
         std::lock_guard<std::mutex> g(m_checks->mu);
-        m_checks->waiting.push_back({hash, std::string(password), real, std::move(then)});
+        m_checks->waiting.push_back({hash, std::string(password), real, std::move(counted)});
     }
     // A piece of work for each check, which takes whatever checks wait, so the thread that is free makes them together.
     m_hash.submit(m_hash.next_lane(), [checks = m_checks, pool = &m_hash, alive = m_alive]
@@ -1262,7 +1340,7 @@ const client* idp_run::requesting_client(const std::shared_ptr<conn>& c, const r
     if (!authenticated)
     {
         // A secret guessed at counts against the address as a password guessed at does.
-        missed(ip, now, [] {});
+        missed(ip, {}, now, [] {});
         json_error(c, 401, "invalid_client", "the client is not known or its secret is not right",
                    basic ? "WWW-Authenticate: Basic realm=\"" + m_issuer + "\"\r\n" : std::string());
         return nullptr;
@@ -1597,7 +1675,7 @@ void idp_run::device_post(const std::shared_ptr<conn>& c, const request& rq)
     {
         if (!ok)
         {
-            missed(ip, now, [] {});
+            missed(ip, {}, now, [] {});
             device_page(cc, r, {}, "That code is not known or has expired.", 400);
             return;
         }
@@ -2166,20 +2244,39 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
         carried_on = it->second.p;
     }
     const std::string ip = client_ip(*c, rq);
-    if (barred(ip, wall::now_sec()))
+    const int64_t now = wall::now_sec();
+    if (barred(ip, now))
     {
         ++m_c.barred;
         respond(c, 429, "text/plain", "Too many failed sign-ins from here; try again in a quarter of an hour.\n");
         return;
     }
+    const std::string acct = account_key(rq, {}, who, {});
+    if (const int64_t wait = m_limits.wait(acct, now, account_free); wait > 0)
+    {
+        ++m_c.barred;
+        respond(c, 429, "text/plain", "Too many failed sign-ins as this user; try again in " + std::to_string(wait) +
+                                          " seconds.\n");
+        return;
+    }
+    if (hashing_full())
+    {
+        respond(c, 503, "text/plain", "Too many sign-ins are being checked; try again in a moment.\n");
+        return;
+    }
+    const std::string addr = address_key(ip);
+    m_limits.begin(addr);
+    m_limits.begin(acct);
     const std::string current(param(p, "current"));
     const std::string fresh(param(p, "new"));
     const std::string id = who ? who->id : std::string();
     const std::string problem = socketley::storage::password_problem(fresh, who ? who->username() : "");
     std::weak_ptr<conn> weak = c;
     c->waiting = true;
-    check_password(who, current, [this, weak, rq, token, carried_on, ip, id, fresh, problem, from_reset](bool ok)
+    check_password(who, current, [this, weak, rq, token, carried_on, ip, addr, acct, id, fresh, problem, from_reset](bool ok)
     {
+        m_limits.end(addr);
+        m_limits.end(acct);
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
@@ -2195,7 +2292,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
         };
         if (!ok || !a || a->disabled())
         {
-            missed(ip, wall::now_sec(), [this, weak, rq, token, from_reset]
+            missed(ip, acct, wall::now_sec(), [this, weak, rq, token, from_reset]
             {
                 auto c2 = weak.lock();
                 if (!c2 || c2->dead)
@@ -2874,7 +2971,7 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
             return;
         }
         case shard_call::miss:
-            m_misses[call.key].at.push_back(call.at);
+            m_limits.failed(call.key, call.at);
             arm_tick();
             mgr->requests().complete_deferred(ticket, request_status::ok, {});
             return;

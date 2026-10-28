@@ -87,6 +87,39 @@ bool form_origin_allowed(std::string_view origin, std::string_view issuer, std::
 // it is one, or empty.
 std::string email_problem(std::string_view email);
 
+// What failures from the address `ip` count under: the address, and for IPv6 its /64, which one host is given whole.
+std::string address_key(std::string_view ip);
+
+// Failed attempts by what they were made at -- an address, an account -- within a window, and the attempts at each
+// still being checked, so many sent at once are counted before any of them is answered.
+class attempt_limits
+{
+public:
+    static constexpr int64_t window_s = 15 * 60;
+
+    // Whether `key` is refused outright: its failures in the window and its attempts in flight reach `limit`.
+    bool barred(const std::string& key, int64_t now, int limit);
+    // Seconds before `key` may try again: none while its failures and attempts in flight are below `free`, then 30
+    // after the last failure, doubling with each one more, to 300 at most.
+    int64_t wait(const std::string& key, int64_t now, int free);
+    void begin(const std::string& key) { ++m_keys[key].in_flight; }
+    void end(const std::string& key);
+    void failed(const std::string& key, int64_t at);
+    // Failures out of the window forgotten, and keys with nothing left.
+    void age(int64_t now);
+    bool empty() const { return m_keys.empty(); }
+
+private:
+    struct entry
+    {
+        std::vector<int64_t> at;
+        uint32_t in_flight{0};
+    };
+    // The failures of `key` still in the window, its entry made when it has none.
+    entry& fresh(const std::string& key, int64_t now);
+    std::unordered_map<std::string, entry> m_keys;
+};
+
 // A signed token's claims, read back: strings, numbers as their text, and booleans as "true" or "false".
 using claims = std::map<std::string, std::string, std::less<>>;
 

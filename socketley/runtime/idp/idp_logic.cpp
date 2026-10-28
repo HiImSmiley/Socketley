@@ -4,6 +4,8 @@
 #include <cctype>
 #include <charconv>
 
+#include <arpa/inet.h>
+
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -554,6 +556,74 @@ bool verify_secret_token(std::string_view secret, std::string_view typ, std::str
                           return !want.empty() && crypto::secure_equal(sig, want);
                       },
                       out, why);
+}
+
+std::string address_key(std::string_view ip)
+{
+    const std::string text(ip);
+    unsigned char a[16];
+    if (text.find(':') == std::string::npos || ::inet_pton(AF_INET6, text.c_str(), a) != 1)
+        return text;
+    // An IPv4 address written as IPv6 is the IPv4 address.
+    static constexpr unsigned char mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (std::equal(mapped, mapped + 12, a))
+        return ::inet_ntop(AF_INET, a + 12, buf, sizeof buf) ? std::string(buf) : text;
+    std::fill(a + 8, a + 16, 0);
+    return ::inet_ntop(AF_INET6, a, buf, sizeof buf) ? std::string(buf) + "/64" : text;
+}
+
+attempt_limits::entry& attempt_limits::fresh(const std::string& key, int64_t now)
+{
+    entry& e = m_keys[key];
+    std::erase_if(e.at, [now](int64_t t) { return now - t > window_s; });
+    return e;
+}
+
+bool attempt_limits::barred(const std::string& key, int64_t now, int limit)
+{
+    if (!m_keys.contains(key))
+        return false;
+    const entry& e = fresh(key, now);
+    return static_cast<int64_t>(e.at.size()) + e.in_flight >= limit;
+}
+
+int64_t attempt_limits::wait(const std::string& key, int64_t now, int free)
+{
+    if (!m_keys.contains(key))
+        return 0;
+    const entry& e = fresh(key, now);
+    const int64_t n = static_cast<int64_t>(e.at.size()) + e.in_flight;
+    if (n < free)
+        return 0;
+    const int64_t delay = std::min<int64_t>(300, int64_t{30} << std::min<int64_t>(n - free, 4));
+    // One still being checked is waited for as a failure would be, so a burst sent together gets one try.
+    if (e.in_flight > 0 || e.at.empty())
+        return delay;
+    const int64_t last = *std::max_element(e.at.begin(), e.at.end());
+    return std::max<int64_t>(0, last + delay - now);
+}
+
+void attempt_limits::end(const std::string& key)
+{
+    const auto it = m_keys.find(key);
+    if (it != m_keys.end() && it->second.in_flight > 0)
+        --it->second.in_flight;
+}
+
+void attempt_limits::failed(const std::string& key, int64_t at)
+{
+    m_keys[key].at.push_back(at);
+}
+
+void attempt_limits::age(int64_t now)
+{
+    // A loop rather than erase_if, whose predicate GCC 12's library hands each entry as const.
+    for (auto it = m_keys.begin(); it != m_keys.end();)
+    {
+        std::erase_if(it->second.at, [now](int64_t t) { return now - t > window_s; });
+        it = it->second.at.empty() && it->second.in_flight == 0 ? m_keys.erase(it) : std::next(it);
+    }
 }
 
 }   // namespace socketley::idp

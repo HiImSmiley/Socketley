@@ -6,6 +6,8 @@
 #   * an account losing a field it was given, or its id changing, across a restart
 #   * a client or redirect it does not know being sent a code, or an error sent to an address nobody registered
 #   * a wrong password, an unknown or disabled account, or a sixth failure in a row signing in
+#   * guesses sent together, spread over an IPv6 /64 or over many addresses at one account, or wrong codes, passing
+#     the bars on them
 #   * a code redeemed twice, by another client, for another redirect, or without its PKCE verifier
 #   * a token that does not verify against the published key, or names the account by anything but its id
 #   * a refresh for an account disabled, signed out everywhere or made to reset its password since
@@ -389,6 +391,64 @@ elif phase == "after_cli":
     check("and another is not",
           req("POST", "/authorize", dict(auth, username="dora", password="dorapassword1"), headers={"X-Forwarded-For": "198.51.100.8"})[0], 302)
 
+elif phase == "limits":
+    import threading, hmac, struct
+    def totp_now(key):
+        k = base64.b32decode(key.replace(" ", "").upper() + "=" * (-len(key.replace(" ", "")) % 8))
+        h = hmac.new(k, struct.pack(">Q", int(time.time()) // 30), hashlib.sha1).digest()
+        o = h[-1] & 15
+        return "%06d" % ((struct.unpack(">I", h[o:o + 4])[0] & 0x7fffffff) % 1000000)
+    def login(user, password, addr, cookie=None):
+        return req("POST", "/login", dict(rd="/", username=user, password=password), headers={"X-Forwarded-For": addr}, cookie=cookie)
+    # Many guesses sent at once from one address: five are checked, and the rest refused before any is answered.
+    got = []
+    def one():
+        got.append(login("gus", "wrongpassword", "198.51.100.30")[0])
+    ts = [threading.Thread(target=one) for _ in range(20)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("twenty guesses sent at once from one address are five checked and the rest refused",
+          (got.count(401), got.count(429)), (5, 15))
+    # An IPv6 host has its /64, so failures there count for the whole of it.
+    for i in range(5):
+        login("ivy", "wrongpassword", "2001:db8:1:2::%x" % (i + 1))
+    check("five failures from one IPv6 /64 bar every address in it", login("ivy", "ivypassword123", "2001:db8:1:2:ffff::9")[0], 429)
+    check("and not the next /64", login("ivy", "ivypassword123", "2001:db8:1:3::1")[0], 302)
+    # Guesses at one account from many addresses hold it up a while, but not in a browser it signed in on.
+    st, _, h = login("jon", "jonpassword123", "198.51.100.40")
+    known = [c.split(";")[0] for c in (h.get_all("Set-Cookie") or []) if c.startswith("skl_idp_known=")]
+    check("a sign-in marks the browser as one the account signed in on", (st, len(known)), (302, 1))
+    for i in range(10):
+        login("jon", "wrongpassword", "203.0.113.%d" % (i + 1))
+    st, body, _ = login("JON", "jonpassword123", "203.0.113.50")
+    wait = int((re.search(r"try again in (\d+) seconds", body) or [None, "0"])[1])
+    check("ten failures at one account from ten addresses hold up the next from any other, for half a minute",
+          (st, 0 < wait <= 30), (429, True))
+    check("but not from a browser the account signed in on", login("jon", "jonpassword123", "203.0.113.51", known[0] if known else None)[0], 302)
+    # Wrong codes: three end the password step, and five at the account hold its code step up.
+    kim_key = open(tmpd + "/kim.key").read().strip()
+    def pending_of(addr):
+        body = login("kim", "kimpassword123", addr)[1]
+        return (re.search(r'name="pending" value="([0-9a-f]+)"', body) or [None, ""])[1]
+    def code(pending, c, addr):
+        return req("POST", "/login", dict(rd="/", pending=pending, code=c), headers={"X-Forwarded-For": addr})
+    wrong = "%06d" % ((int(totp_now(kim_key)) + 500000) % 1000000)
+    p1 = pending_of("198.51.100.60")
+    answers = [code(p1, wrong, "198.51.100.60") for _ in range(3)]
+    check("two wrong codes ask again, and the third ends the sign-in",
+          [(st, "sign in again" in body) for st, body, _ in answers], [(401, False), (401, False), (401, True)])
+    st, body, h = code(p1, totp_now(kim_key), "198.51.100.60")
+    check("whose right code then signs nobody in", (st, h.get("Set-Cookie")), (401, None))
+    p2 = pending_of("198.51.100.61")
+    code(p2, wrong, "198.51.100.61")
+    code(p2, wrong, "198.51.100.61")
+    p3 = pending_of("198.51.100.62")
+    st, body, h = code(p3, totp_now(kim_key), "198.51.100.62")
+    check("five wrong codes at an account hold up its next code, a right one too",
+          (st, "wrong codes" in body, h.get("Set-Cookie")), (429, True, None))
+
 elif phase == "restarted":
     s = json.load(open(state_file))
     k = json.loads(req("GET", "/jwks")[1])["keys"][0]
@@ -414,6 +474,11 @@ tally < <(run main)
 "$BIN" idp-user auth passwd erin --password erinTemp12345 --reset >/dev/null 2>&1
 [ -s "$T/erin.key" ] && ok || bad "a second step is turned on for the reset checks" "no key"
 tally < <(run after_cli)
+
+for u in gus ivy jon kim; do "$BIN" idp-user auth add "$u" --password "${u}password123" >/dev/null 2>&1; done
+"$BIN" idp-user auth totp kim on 2>&1 | sed -n 's/^key: //p' > "$T/kim.key"
+[ -s "$T/kim.key" ] && ok || bad "a second step is turned on for the limits' checks" "no key"
+tally < <(run limits)
 
 "$BIN" stop auth >/dev/null 2>&1
 "$BIN" start auth >/dev/null 2>&1
@@ -441,7 +506,7 @@ expect "but to one under the cookie domain" \
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
 STATS=$("$BIN" stats auth 2>/dev/null)
-case "$STATS" in *"accounts:5"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+case "$STATS" in *"accounts:9"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]

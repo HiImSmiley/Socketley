@@ -72,12 +72,6 @@ private:
     };
 
 
-    // Who has failed to sign in from where, for the bar after five failures in fifteen minutes.
-    struct misses
-    {
-        std::vector<int64_t> at;
-    };
-
     std::shared_ptr<socketley::http::server_conn> make_conn() override;
     void accepted(const std::shared_ptr<conn>& c) override;
     void serve(const std::shared_ptr<conn>& c) override;
@@ -163,6 +157,8 @@ private:
         int64_t until_s{0};
         // The proof a forced reset carries: the sign-in passed every step, and only its password is still to be set.
         bool reset{false};
+        // Wrong codes given for it, three of which end it.
+        int misses{0};
     };
     std::unordered_map<std::string, pending_sign_in> m_pending;
     // The last step of each account's codes taken, so one code is taken once; and a secret an account is enrolling.
@@ -183,8 +179,16 @@ private:
     std::string clear_cookie() const;
     std::string client_ip(const conn& c, const request& rq) const;
     bool barred(const std::string& ip, int64_t now);
-    // A failed sign-in from `ip`, with `then` called once every shard bars by it.
-    void missed(const std::string& ip, int64_t now, std::function<void()> then);
+    // A failed sign-in from `ip`, and at the account keyed `acct` unless it is empty, with `then` called once every
+    // shard counts it.
+    void missed(const std::string& ip, const std::string& acct, int64_t now, std::function<void()> then);
+    // What failures at the account `who` (or the username `user` where there is none) count under: its own key for
+    // a browser it signed in on before, so guesses from elsewhere never hold that one up, and the account's otherwise.
+    std::string account_key(const request& rq, std::string_view prefix, const account* who, std::string_view user) const;
+    // The cookie a browser keeps once an account has signed in on it, which account_key() reads.
+    std::string known_cookie(const account& who) const;
+    // Whether every hashing thread has as much waiting as the bound, so a sign-in is turned away rather than queued.
+    bool hashing_full() const { return m_hashing >= 64; }
     const client* find_client(std::string_view id);
     void load_clients();
     // The profile claims every token of the account carries.
@@ -265,7 +269,10 @@ private:
     // Device grants by device code, and each one's device code by its user code in normal form.
     std::unordered_map<std::string, device_entry> m_devices;
     std::unordered_map<std::string, std::string> m_user_codes;
-    std::unordered_map<std::string, misses> m_misses;
+    // Failures by address and by account, and the attempts at each being checked.
+    attempt_limits m_limits;
+    // Password checks given to the hashing threads and not answered yet.
+    uint32_t m_hashing{0};
 
     bool m_stopped{false};
 
