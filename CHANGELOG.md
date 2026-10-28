@@ -194,6 +194,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the shared `/tmp/socketley.sock` read every flag `--lua` makes runtimes
   with, `--master-pw` and `--secret-key` among them. `socketley daemon`
   reports such a socket instead of exiting 0.
+- **`export --full` keeps the setup's secrets to itself while it works.**
+  The Lua setup it writes beside the data, every runtime's master password
+  and keys in plain text, went into a `.export-<pid>` directory of the state
+  directory at 0755, readable for the whole archive write where the state
+  directory can be traversed and left there for good by an export cut short;
+  the directory is now 0700 and the next export removes any whose process is
+  gone.
 - **`export --full` writes no archive through a link beside it.** The
   archive was written to `<file>.partial`, opened through a symlink or into a
   file someone else left at that name, so a root export into `/tmp` could

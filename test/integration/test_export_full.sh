@@ -9,6 +9,7 @@
 #   * an archive tar or gzip does not take, or one that is not smaller with --compress best
 #   * compressing on several threads that loses or reorders a piece, which one thread would not
 #   * an archive written through a link someone left at the name beside it
+#   * the setup's secrets readable in the export's scratch, or left there by one cut short
 #   * a runtime's data left out: its buckets, its accounts, its mailboxes, its documents, its keys
 #   * a restore over a running daemon, over runtimes already there, or of a file that is no such archive
 #   * a crafted manifest that writes a system file, a home's hidden one, or a setuid bit
@@ -112,6 +113,28 @@ out=$("$BIN" export --full "$T/trap.tar.gz" 2>&1); rc=$?
     && ok "a link at the archive's partial name is passed by, and nothing is written through it" \
     || bad "a link at the partial name" "rc $rc: $out; loot $(stat -c %s "$T/loot") bytes; $(ls -la "$T"/trap.tar.gz* 2>&1)"
 rm -f "$T/trap.tar.gz" "$T/trap.tar.gz.partial" "$T/loot"
+# The scratch the setup's secrets are written into is its owner's alone, and what an export cut short left goes with
+# the next, but never a live export's.
+mkdir -p "$st_dir/.export-4194305/setup" "$st_dir/.export-$$"
+printf 'master_pw = "left behind"\n' > "$st_dir/.export-4194305/setup/config.lua"
+"$BIN" export --full "$T/watched.tar.gz" >/dev/null 2>&1 & epid=$!
+mode=""
+for _ in $(seq 1 1000); do
+    if [ -d "$st_dir/.export-$epid" ]; then
+        kill -STOP "$epid" 2>/dev/null; mode=$(stat -c %a "$st_dir/.export-$epid" 2>/dev/null); kill -CONT "$epid" 2>/dev/null
+        break
+    fi
+    kill -0 "$epid" 2>/dev/null || break
+    sleep 0.005
+done
+wait "$epid"; rc=$?
+if [ -z "$mode" ]; then echo "  SKIP: the export's scratch came and went between two looks"
+elif [ "$mode" = 700 ]; then ok "the export's scratch is its owner's alone"
+else bad "the export's scratch" "mode $mode"; fi
+[ "$rc" -eq 0 ] && [ ! -e "$st_dir/.export-4194305" ] && [ -d "$st_dir/.export-$$" ] && [ ! -e "$st_dir/.export-$epid" ] \
+    && ok "a scratch an export cut short left is gone after the next, a live one's kept" \
+    || bad "the scratches left" "rc $rc; $(ls -a "$st_dir" | grep export)"
+rm -rf "$st_dir/.export-$$" "$T/watched.tar.gz"
 
 out=$("$BIN" restore "$T/fast.tar.gz" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"daemon is running"*) true ;; *) false ;; esac && ok "restore refuses a running daemon" || bad "restore over a running daemon" "rc $rc: $out"

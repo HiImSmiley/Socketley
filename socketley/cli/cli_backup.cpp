@@ -6,6 +6,7 @@
 #include <grp.h>
 #include <pwd.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -360,11 +361,28 @@ int cli_export_full(int argc, char** argv)
     const bool running = daemon_running();
     const std::vector<runtime_file> runtimes = runtimes_of(state);
 
-    // A scratch directory the daemon may write into, which the archive passes over and which goes after.
+    // What an export cut short left, the setup's secrets among it, goes once the process that made it is gone.
+    std::vector<fs::path> stale;
+    for (const auto& f : fs::directory_iterator(state, ec))
+    {
+        const std::string n = f.path().filename().string();
+        int pid = 0;
+        if (!n.starts_with(".export-"))
+            continue;
+        const auto [end, err] = std::from_chars(n.data() + 8, n.data() + n.size(), pid);
+        if (err == std::errc() && end == n.data() + n.size() && pid > 0 && ::kill(pid, 0) != 0 && errno == ESRCH)
+            stale.push_back(f.path());
+    }
+    for (const auto& gone : stale)
+        fs::remove_all(gone, ec);
+    // A scratch directory the daemon may write into, which the archive passes over and which goes after; its owner's
+    // alone, since the setup written into it holds every runtime's passwords and keys in plain text.
     const fs::path scratch = state / (".export-" + std::to_string(::getpid()));
-    fs::create_directories(scratch, ec);
+    fs::remove_all(scratch, ec);
+    const bool scratched = ::mkdir(scratch.c_str(), 0700) == 0 && ::chmod(scratch.c_str(), 0700) == 0;
     struct stat sst{};
-    if (::stat(state.c_str(), &sst) == 0 && ::geteuid() == 0 && ::chown(scratch.c_str(), sst.st_uid, sst.st_gid) != 0) {}
+    if (scratched && ::stat(state.c_str(), &sst) == 0 && ::geteuid() == 0 &&
+        ::chown(scratch.c_str(), sst.st_uid, sst.st_gid) != 0) {}
     const auto cleanup = [&] {
         std::error_code e;
         fs::remove_all(scratch, e);
@@ -379,14 +397,14 @@ int cli_export_full(int argc, char** argv)
         std::vector<char> d(dir.begin(), dir.end());
         d.push_back('\0');
         char* av[] = {prog, verb, d.data(), nullptr};
-        setup = cli_export(3, av) == 0;
+        setup = scratched && cli_export(3, av) == 0;
         if (!setup)
             std::cout << "the Lua setup could not be written beside the data; the archive holds the state, which restore "
                          "puts back\n";
     }
     // A db runtime's documents as its backup writes them while it serves, which a copy of files being written is not.
     std::set<std::string> db_backed;
-    const std::set<std::string> live = running ? running_runtimes() : std::set<std::string>{};
+    const std::set<std::string> live = running && scratched ? running_runtimes() : std::set<std::string>{};
     for (const auto& r : runtimes)
     {
         if (r.type != "db" || !live.count(r.name))
