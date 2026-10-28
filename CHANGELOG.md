@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sign-ins (proxies, storage, the dashboard, tunnel edges) within a second,
   where they held until they ran out, up to 30 days; the admin bit is the
   account's now, not the one the cookie was signed with.
+- **AssumeRole of a role nobody made is NoSuchEntity.** Any RoleArn that
+  named no role the IAM API made gave the caller a session of its own, as if
+  the role had been assumed; it is now refused.
 - **A Signature Version 2 presigned URL lasts at most a week.** Its `Expires`
   could lie any distance ahead, so such a URL never ended; one more than seven
   days ahead is now refused, as a Version 4 one is.

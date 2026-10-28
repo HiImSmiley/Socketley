@@ -7961,7 +7961,7 @@ STS's: temporary credentials for the signing user, DurationSeconds 900 to 129600
 T}
 AssumeRole	POST / Action=AssumeRole	T{
 .ad l
-STS's: the same, DurationSeconds 900 to 43200 (3600), any RoleArn, and a Policy that bounds the session.
+STS's: the same, DurationSeconds 900 to 43200 (3600), the RoleArn of a role the IAM API made, and a Policy that bounds the session.
 T}
 AssumeRoleWithWebIdentity	POST / Action=AssumeRoleWithWebIdentity	T{
 .ad l
@@ -8381,7 +8381,9 @@ AssumeRole of a role the IAM API made (see
 .BR IAM )
 is refused unless the role's trust policy names the caller, for longer than the
 role's MaxSessionDuration, and its session holds the role's policies and not the
-caller's. Any other RoleArn makes the caller's own session, bounded by its
+caller's. Any other RoleArn is
+.B "404 NoSuchEntity"
+and gives the caller nothing. The session is bounded by its
 .B Policy
 (an identity policy's grammar, at most 2048 bytes), which only narrows it:
 what the policy does not allow is refused even to an admin or a bucket's owner,

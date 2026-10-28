@@ -127,6 +127,16 @@ check("one sealed with another secret is refused", code_of(lambda: s3(("ASIAAAAA
 # AssumeRole with a policy
 pol = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
                   "Resource": "arn:aws:s3:::adminb/*"}]})
+check("a role no one made is NoSuchEntity, not the caller's own session",
+      code_of(lambda: sts(ADMIN).assume_role(RoleArn="arn:aws:iam::000000000000:role/reader", RoleSessionName="reader-1",
+                                             Policy=pol)) == "NoSuchEntity")
+iam = boto3.client("iam", endpoint_url=url, region_name="us-east-1", aws_access_key_id=ADMIN[0],
+                   aws_secret_access_key=ADMIN[1], config=cfg)
+iam.create_role(RoleName="reader", AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"}]}))
+iam.put_role_policy(RoleName="reader", PolicyName="all", PolicyDocument=json.dumps({"Version": "2012-10-17",
+                    "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}))
+time.sleep(0.3)
 r = sts(ADMIN).assume_role(RoleArn="arn:aws:iam::000000000000:role/reader", RoleSessionName="reader-1", Policy=pol)
 rc = r["Credentials"]
 rs, rt = (rc["AccessKeyId"], rc["SecretAccessKey"]), rc["SessionToken"]
@@ -140,7 +150,7 @@ check("nor a new bucket", code_of(lambda: s3(rs, rt).create_bucket(Bucket="roleb
 check("nor a bucket's policy, though its user is an admin",
       code_of(lambda: s3(rs, rt).get_bucket_policy(Bucket="adminb")) == "AccessDenied")
 check("a policy that does not compile is refused",
-      code_of(lambda: sts(ADMIN, checked=False).assume_role(RoleArn="arn:x", RoleSessionName="ab", Policy="{not json")) == "MalformedPolicyDocument")
+      code_of(lambda: sts(ADMIN, checked=False).assume_role(RoleArn="arn:aws:iam::000000000000:role/reader", RoleSessionName="ab", Policy="{not json")) == "MalformedPolicyDocument")
 check("AssumeRole longer than twelve hours is refused",
       code_of(lambda: sts(ADMIN, checked=False).assume_role(RoleArn="arn:x", RoleSessionName="ab", DurationSeconds=50000)) == "ValidationError")
 

@@ -147,28 +147,6 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
         }
         role_arn     = *arn;
         session_name = *name;
-        // A role the IAM API made is assumed only as its trust policy lets, for no longer than it allows; any
-        // other ARN is the caller's own session, bounded by its Policy.
-        int64_t longest_role = 0;
-        const std::string_view rname = iam_role_name_of(*arn);
-        const int rc = v.user ? m_auth->role_check(rname, v.user->id, longest_role) : -1;
-        if (rc == 0)
-        {
-            fail(403, "AccessDenied", "User " + v.user->id + " is not authorized to perform sts:AssumeRole on " + *arn);
-            return;
-        }
-        if (rc == 1)
-        {
-            if (field("DurationSeconds") && duration > longest_role)
-            {
-                fail(400, "ValidationError", "DurationSeconds exceeds the MaxSessionDuration of the role.");
-                return;
-            }
-            // The default hour is cut to a role that allows less, as STS does, rather than issued past its maximum.
-            if (!field("DurationSeconds") && longest_role > 0)
-                duration = std::min(duration, longest_role);
-            role = std::string(rname);
-        }
         if (const std::string* p = field("Policy"))
         {
             bucket_policy checked;
@@ -185,6 +163,29 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
             }
             policy = *p;
         }
+        // A role is one the IAM API made, assumed only as its trust policy lets and for no longer than it allows.
+        int64_t longest_role = 0;
+        const std::string_view rname = iam_role_name_of(*arn);
+        const int rc = m_auth->role_check(rname, v.user ? std::string_view(v.user->id) : std::string_view{}, longest_role);
+        if (rc < 0)
+        {
+            fail(404, "NoSuchEntity", "The role with name " + std::string(rname) + " cannot be found.");
+            return;
+        }
+        if (rc == 0 || !v.user)
+        {
+            fail(403, "AccessDenied", "User " + (v.user ? v.user->id : v.principal) + " is not authorized to perform sts:AssumeRole on " + *arn);
+            return;
+        }
+        if (field("DurationSeconds") && duration > longest_role)
+        {
+            fail(400, "ValidationError", "DurationSeconds exceeds the MaxSessionDuration of the role.");
+            return;
+        }
+        // The default hour is cut to a role that allows less, as STS does, rather than issued past its maximum.
+        if (!field("DurationSeconds") && longest_role > 0)
+            duration = std::min(duration, longest_role);
+        role = std::string(rname);
     }
     else if (field("Policy"))
     {
