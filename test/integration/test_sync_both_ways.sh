@@ -18,6 +18,8 @@
 #   * one way in, a file changed here not put back, or its change lost
 #     rather than kept beside it
 #   * a key below an --exclude'd folder brought in, such as a .git/config
+#   * one way in, a conflict through a folder linked out of the directory
+#     renaming a file outside it
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -151,6 +153,21 @@ until_ok 20 test -e "$T/ex/ok.txt"
 sleep 3
 expect "a key below an excluded folder, or below the job's own, is not brought" \
     "$(cd "$T/ex" && find . -type f | sort | tr '\n' ' ' | sed 's/ $//')" "./ok.txt"
+
+# ─── a folder that is a link out of --dir ───────────────────────────────────
+# One way in, a conflict renames this side's file aside: through `sub -> outside` that renamed a file outside --dir.
+S -o /dev/null -X PUT "http://127.0.0.1:$P/lnk"
+put lnk/marker.txt "m"
+put lnk/sub/victim.txt "the storage's, longer"
+mkdir -p "$T/lin" "$T/outside"
+printf 'mine' > "$T/outside/victim.txt"
+ln -s "$T/outside" "$T/lin/sub"
+"$BIN" create sync lin --dir "$T/lin" --storage "box/lnk" --credentials "$T/creds" --mode in --every 2s -s \
+    >/dev/null 2>&1
+until_ok 20 test -e "$T/lin/marker.txt"
+sleep 3
+expect "a conflict through a folder linked out of --dir touches nothing outside it" \
+    "$(ls "$T/outside" | tr '\n' ' ')/$(cat "$T/outside/victim.txt")" "victim.txt /mine"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

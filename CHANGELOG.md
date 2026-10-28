@@ -256,6 +256,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unsent, up to 256 MiB a connection, and one with answers waiting was never
   closed. Past 64 KiB unsent its queries now wait unread, and a connection
   whose answers have not moved for 30 seconds is closed.
+- **A sync brings, renames and removes files only below `--dir`, whatever
+  its folders are links to.** One way in, a conflict on a file reached through
+  a folder linked out of `--dir` renamed the file at the far end of the link
+  aside, outside it, before the copy was refused; the folders a file is
+  placed in, renamed in or removed from are now opened by the kernel below
+  `--dir`, and a file reached through a link out of it is left alone.
 - **An `--exclude`d folder keeps its whole tree out of a sync both ways.** The
   walk never entered it, but a key the storage listed below it was judged by
   its own name only, so under `--exclude .git` an `a/.git/config` put in the

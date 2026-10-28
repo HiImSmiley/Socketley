@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <sys/stat.h>
 
 #include "sync_index.h"
 
@@ -173,6 +174,9 @@ private:
     bool provably_gone(const std::string& rel) const;
     // Whether `full` resolves to a place below --dir, with the place it resolves to in `real`.
     bool inside(const std::string& full, std::string* real) const;
+    // lstat of `rel` below --dir with every folder on the way resolved by the kernel, -1 with EXDEV where a link leads
+    // out of it.
+    int lstat_beneath(const std::string& rel, struct stat& st) const;
 
     // inotify: one watch per directory the walk passes, a read standing on the descriptor, and what it said.
     void watch_dir(const std::string& rel);
@@ -287,6 +291,8 @@ private:
 
     // --dir as the filesystem names it, links resolved, which every link's target is held against.
     std::string m_root_real;
+    // --dir held open, so what is placed, renamed or removed in it is reached below it whatever its folders become.
+    int m_root_fd{-1};
 
     sync_stats m_stats;
     bool       m_stopped{false};

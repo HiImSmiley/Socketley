@@ -2,13 +2,16 @@
 #include "sync_instance.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <climits>
 #include <cstdlib>
+#include <linux/openat2.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -147,6 +150,56 @@ int64_t mtime_of(const struct stat& st)
     return int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
 }
 
+// `rel` below the folder `root` names, resolved by the kernel so no link leads out of it: -1 with EXDEV where one would.
+int open_beneath(int root, const std::string& rel, int flags)
+{
+    struct open_how how{};
+    how.flags = static_cast<uint64_t>(flags | O_CLOEXEC);
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+    const long r = ::syscall(__NR_openat2, root, rel.empty() ? "." : rel.c_str(), &how, sizeof how);
+    return r < 0 ? -1 : static_cast<int>(r);
+}
+
+// The folder `rel` below `root`, each one missing on the way made inside the one before it when `make` says so.
+int dir_beneath(int root, const std::string& rel, bool make)
+{
+    if (rel.empty())
+        return open_beneath(root, rel, O_PATH | O_DIRECTORY);
+    int dir = -1;
+    for (size_t end = rel.find('/');; end = rel.find('/', end + 1))
+    {
+        const std::string upto = rel.substr(0, end);
+        int fd = open_beneath(root, upto, O_PATH | O_DIRECTORY);
+        if (fd < 0 && errno == ENOENT && make)
+        {
+            const size_t slash = upto.rfind('/');
+            const std::string name = upto.substr(slash == std::string::npos ? 0 : slash + 1);
+            if (::mkdirat(dir >= 0 ? dir : root, name.c_str(), 0777) == 0 || errno == EEXIST)
+                fd = open_beneath(root, upto, O_PATH | O_DIRECTORY);
+        }
+        const int err = errno;
+        if (dir >= 0)
+            ::close(dir);
+        if (fd < 0)
+        {
+            errno = err;
+            return -1;
+        }
+        dir = fd;
+        if (end == std::string::npos)
+            return dir;
+    }
+}
+
+// The folder part of `rel` and its last name.
+std::pair<std::string, std::string> split_rel(const std::string& rel)
+{
+    const size_t slash = rel.rfind('/');
+    if (slash == std::string::npos)
+        return {std::string(), rel};
+    return {rel.substr(0, slash), rel.substr(slash + 1)};
+}
+
 // Every segment of a key encoded as S3 signs it, the separators kept.
 std::string encode_key(std::string_view key)
 {
@@ -226,7 +279,11 @@ sync_run::sync_run(sync_instance& rt, event_loop& loop)
 {
 }
 
-sync_run::~sync_run() = default;
+sync_run::~sync_run()
+{
+    if (m_root_fd >= 0)
+        ::close(m_root_fd);
+}
 
 bool sync_run::resolve_targets(std::string& why)
 {
@@ -324,6 +381,14 @@ bool sync_run::start(std::string& why)
     }
     char root[PATH_MAX];
     m_root_real = ::realpath(std::string(m_rt.get_dir()).c_str(), root) ? root : std::string(m_rt.get_dir());
+    if (m_root_fd >= 0)
+        ::close(m_root_fd);
+    m_root_fd = ::open(std::string(m_rt.get_dir()).c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (m_root_fd < 0)
+    {
+        why = std::string(m_rt.get_dir()) + ": " + std::strerror(errno);
+        return false;
+    }
     // The directory and the prefix decide which object a path is, so an index kept for others is begun again.
     const std::string scope = std::string(m_rt.get_dir()) + "\n" + std::string(m_rt.get_prefix());
     if (!m_index.open(index.string(), scope, why))
@@ -627,6 +692,16 @@ bool sync_run::inside(const std::string& full, std::string* real) const
     if (real)
         real->assign(r);
     return in;
+}
+
+int sync_run::lstat_beneath(const std::string& rel, struct stat& st) const
+{
+    const int fd = open_beneath(m_root_fd, rel, O_PATH | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    const int r = ::fstat(fd, &st);
+    ::close(fd);
+    return r;
 }
 
 void sync_run::check_path(const std::string& rel)
@@ -1403,14 +1478,21 @@ void sync_run::list_page(target& t, lane& l)
 
 void sync_run::decide_pull(target& t)
 {
-    const std::string dir(m_rt.get_dir());
     const bool both = pushes();
     std::string why;
     for (const auto& [rel, r] : m_remote)
     {
         const index_entry* had = m_index.find(t.name, rel);
         struct stat st{};
-        const bool here = ::lstat((dir + "/" + rel).c_str(), &st) == 0;
+        const bool here = lstat_beneath(rel, st) == 0;
+        // A folder on the way that leads out of --dir would have the storage's file judged against one elsewhere.
+        if (!here && errno != ENOENT && errno != ENOTDIR)
+        {
+            say(rel + (errno == EXDEV || errno == ELOOP ? " is reached through a link out of the folder"
+                                                        : ": " + std::string(std::strerror(errno))) +
+                ", so the storage's is not brought");
+            continue;
+        }
         if (here && !S_ISREG(st.st_mode))
         {
             say(rel + " is no file here, so the storage's is not brought over it");
@@ -1481,16 +1563,21 @@ void sync_run::decide_pull(target& t)
         // Carried out since the listing was asked for would be in it; a removal still queued for it is not news.
         if (!had)
             continue;
-        const std::string full = dir + "/" + rel;
+        // Removed in the folder the kernel opened below --dir, so a folder swapped for a link since cannot point
+        // the removal anywhere else.
+        const auto [folder, leaf] = split_rel(rel);
+        const int at = dir_beneath(m_root_fd, folder, false);
         struct stat st{};
-        if (::lstat(full.c_str(), &st) == 0 && S_ISREG(st.st_mode) && uint64_t(st.st_size) == had->size &&
-            mtime_of(st) == had->mtime_ns && inside(full, nullptr))
+        if (at >= 0 && ::fstatat(at, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
+            uint64_t(st.st_size) == had->size && mtime_of(st) == had->mtime_ns)
         {
-            if (::unlink(full.c_str()) == 0)
+            if (::unlinkat(at, leaf.c_str(), 0) == 0)
                 ++m_stats.removed_here;
             else
                 note(rel + ": " + std::strerror(errno));
         }
+        if (at >= 0)
+            ::close(at);
         // One changed here since is this side's now, and the walk carries it out again as a new file.
         if (!m_index.gone(t.name, rel, why))
             note(why);
@@ -1604,7 +1691,6 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
     l.busy = false;
     if (!f)
         return;
-    const std::string dir(m_rt.get_dir());
     bool placed = false;
     bool synced = whole && f->fd >= 0;
     if (synced && ::fsync(f->fd) != 0)
@@ -1615,11 +1701,18 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
     }
     if (synced)
     {
-        const std::string full = dir + "/" + f->rel;
+        // The folder it goes in, opened and made by the kernel below --dir, so no link there before or swapped in
+        // since has this side's file renamed, or the storage's put, anywhere else.
+        const auto [folder, leaf] = split_rel(f->rel);
+        const int at = dir_beneath(m_root_fd, folder, true);
+        bool ok = at >= 0;
+        std::string reason;
+        if (!ok)
+            reason = errno == EXDEV || errno == ELOOP ? "a link leads out of the folder" : std::strerror(errno);
         struct stat st{};
-        const bool here = ::lstat(full.c_str(), &st) == 0;
+        const bool here = ok && ::fstatat(at, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0;
         // This side's file as the decision saw it, or the storage's copy is kept beside whatever it became.
-        if (!f->conflict && (here != f->here || (here && (uint64_t(st.st_size) != f->here_size || mtime_of(st) != f->here_mtime))))
+        if (ok && !f->conflict && (here != f->here || (here && (uint64_t(st.st_size) != f->here_size || mtime_of(st) != f->here_mtime))))
         {
             f->conflict = true;
             ++m_stats.conflicts;
@@ -1627,33 +1720,17 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
         // Both ways, the storage's copy goes beside this side's, which the walk then carries out; one way in, the
         // storage's goes at the name and this side's beside it, so the next listing does not find the conflict again.
         std::string name = f->rel;
-        bool ok = true;
-        std::string reason;
-        if (f->conflict && pushes())
+        if (ok && f->conflict && pushes())
             name = conflict_name(f->rel);
-        else if (f->conflict && here && ::rename(full.c_str(), (dir + "/" + conflict_name(f->rel)).c_str()) != 0)
+        else if (ok && f->conflict && here &&
+                 ::renameat2(at, leaf.c_str(), at, split_rel(conflict_name(f->rel)).second.c_str(),
+                             RENAME_NOREPLACE) != 0)
         {
             reason = std::strerror(errno);
             ok = false;
         }
-        const std::string target_path = dir + "/" + name;
-        const std::string parent = target_path.substr(0, target_path.rfind('/'));
-        // The folders on the way are made here, below the deepest one there is, and only when that is no link out
-        // of --dir.
-        std::string have = parent;
-        struct stat pst{};
-        while (have.size() > dir.size() && ::lstat(have.c_str(), &pst) != 0)
-            have.resize(have.rfind('/'));
-        std::error_code ec;
-        if (ok && inside(have, nullptr))
-            fs::create_directories(parent, ec);
-        else
-        {
-            if (ok)
-                reason = "a link leads out of the folder";
-            ok = false;
-        }
-        if (ok && !ec && inside(parent, nullptr) && ::rename(f->temp.c_str(), target_path.c_str()) == 0)
+        const std::string name_leaf = split_rel(name).second;
+        if (ok && ::renameat(AT_FDCWD, f->temp.c_str(), at, name_leaf.c_str()) == 0)
         {
             placed = true;
             ++m_stats.brought;
@@ -1661,7 +1738,7 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
             std::string why;
             // The name as the storage has it is now the same on both sides; a conflict copy is new to both, and the
             // walk carries it out, as it does this side's file over the storage's, which it now knows the etag of.
-            if (name == f->rel && ::lstat(target_path.c_str(), &st) == 0 &&
+            if (name == f->rel && ::fstatat(at, name_leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
                 !m_index.carried(t.name, f->rel, index_entry{uint64_t(st.st_size), mtime_of(st), f->etag}, why))
                 note(why);
             if (name != f->rel && !m_index.carried(t.name, f->rel, index_entry{0, -1, f->etag}, why))
@@ -1669,7 +1746,9 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
             m_stats.failing = 0;
         }
         else
-            note(name + ": it could not be put in place: " + (!reason.empty() ? reason : ec ? ec.message() : std::string(std::strerror(errno))));
+            note(name + ": it could not be put in place: " + (!reason.empty() ? reason : std::string(std::strerror(errno))));
+        if (at >= 0)
+            ::close(at);
     }
     if (f->fd >= 0)
         ::close(f->fd);
