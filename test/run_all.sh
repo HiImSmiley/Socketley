@@ -102,6 +102,7 @@ trap cleanup EXIT
 # A file that skipped some or all of itself exits 0 like one that ran, so what it said it skipped is collected and
 # named at the end instead of being counted as a pass in silence.
 SKIPPED=""
+FAILED=""
 note_skips() {   # name, log
     local line
     line=$(grep -m1 -E '^[[:space:]]*SKIP' "$2" 2>/dev/null | sed 's/^[[:space:]]*//' | cut -c1-120)
@@ -116,7 +117,7 @@ run_test() {
     if "$@" 2>&1 | tee "$log"; [ "${PIPESTATUS[0]}" = 0 ]; then
         PASS=$((PASS+1))
     else
-        FAIL=$((FAIL+1))
+        FAIL=$((FAIL+1)); FAILED="$FAILED$name"$'\n'
     fi
     note_skips "$name" "$log"
     rm -f "$log"
@@ -368,7 +369,7 @@ if [ "$PAR" -gt 1 ]; then
         if [ "$(cat "$RESDIR/$name.rc" 2>/dev/null)" = 0 ]; then PASS=$((PASS+1)); echo ""; continue; fi
         echo "  -- red beside $PAR others; run again alone:"
         if bash "$script" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
-        else FAIL=$((FAIL+1)); fi
+        else FAIL=$((FAIL+1)); FAILED="$FAILED$name"$'\n'; fi
         echo ""
     done < "$PAR_LIST"
     # What a parallel file left running, found by this run's mark.
@@ -429,6 +430,12 @@ if [ -n "$SKIPPED" ]; then
     printf '%s' "$SKIPPED" | sed 's/^/    /'
     echo "    Counted as passed, since each ran what it could; what it could not is"
     echo "    a missing tool or permission on this machine, and the line says which."
+    echo ""
+fi
+
+if [ -n "$FAILED" ]; then
+    echo "─── failed ────────────────────────────────────────────────────────"
+    printf '%s' "$FAILED" | sed 's/^/    /'
     echo ""
 fi
 
