@@ -170,6 +170,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `denied: readonly mode` over the text protocol and delivered the message over
   RESP, from a client or a script's `redis.call`; it is now `-ERR readonly mode`
   on both.
+- **A tunnel service's hashed socket is no longer in `/tmp`.** Where the state
+  directory is too deep for a socket's path, an edge served the service on
+  `/tmp/skl-<hash>.sock`, which another local user could bind while the edge
+  was stopped and then receive every visitor's request, cookies and bearer
+  tokens with it; it is now `<daemon socket>.rt/tunnel-<hash>.sock`, in the
+  0700 directory of this user's that companion nodes use, and a service with
+  no such path is not served.
 - **`export` writes no file after a runtime name that is a path.** It named a
   runtime's file, its comment and its `include` line after the name the socket
   answered with, so a listener there that named a runtime `../../x` had the

@@ -26,7 +26,8 @@ std::vector<std::pair<std::string, std::string>> tunnel_instance::http_services(
     for (const auto& a : agents)
         for (const auto& s : a.services)
             if (s.http && a.joined)
-                out.emplace_back(s.name, socketley::tunnel::service_socket(get_name(), s.name));
+                if (std::string sock = socketley::tunnel::service_socket(get_name(), s.name); !sock.empty())
+                    out.emplace_back(s.name, std::move(sock));
     return out;
 }
 

@@ -103,10 +103,15 @@ case "$INV" in pi.*) ok ;; *) bad "an invitation with protected services is prin
 for _ in $(seq 1 50); do "$BIN" tunnel t list | grep -q joined && break; sleep 0.1; done
 sock_of() {
     local p; p=$(dirname "$(find "$HOME/.local/share" -path '*tunnel/t/agents' 2>/dev/null | head -1)")/$1.sock
-    [ ${#p} -ge 100 ] && p="/tmp/skl-$(printf '%s' "$p" | sha256sum | cut -c1-16).sock"
+    [ ${#p} -ge 100 ] && p="$SOCKETLEY_SOCKET.rt/tunnel-$(printf '%s' "$p" | sha256sum | cut -c1-16).sock"
     echo "$p"
 }
 for _ in $(seq 1 50); do [ -S "$(sock_of web)" ] && [ -S "$(sock_of both)" ] && [ "$(curl -s -m 2 --unix-socket "$(sock_of open)" http://open/ready)" = "home /ready" ] && break; sleep 0.1; done
+# A socket in /tmp itself is one any user may bind first once the edge lets the name go, and so read every visitor.
+d=$(dirname "$(sock_of web)")
+case "$d" in "$SOCKETLEY_SOCKET.rt") [ -S "$(sock_of web)" ] && [ "$(stat -c '%u %a' "$d")" = "$(id -u) 700" ] && ok \
+    || bad "a hashed service socket lies in a directory of this user's alone" "$(sock_of web): $(stat -c '%U %a' "$d" 2>&1)" ;;
+    *) ok ;; esac
 
 COOKIE=$(python3 - "$PI" <<'PY'
 import sys, urllib.request, urllib.parse, urllib.error

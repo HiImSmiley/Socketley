@@ -37,11 +37,13 @@ struct agent
     std::vector<service> services;
 };
 
-// <state>/tunnel/<edge>/, its agents file, and the socket an HTTP service of it is served on, in /tmp under a hash
-// when the state directory is too deep for a socket's path.
+// <state>/tunnel/<edge>/, its agents file, and the socket an HTTP service of it is served on, beside the daemon's
+// socket under a hash when the state directory is too deep for a socket's path, and empty when that is too.
 std::string edge_dir(std::string_view edge);
 std::string agents_path(std::string_view edge);
 std::string service_socket(std::string_view edge, std::string_view service);
+// Why a service's socket may not be bound -- there is none, or a hashed one's directory is not this user's alone.
+std::string service_socket_refusal(std::string_view edge, const std::string& sock);
 // <state>/tunnel/<agent>/key, the key an agent runtime was given when it joined.
 std::string agent_key_path(std::string_view agent_runtime);
 

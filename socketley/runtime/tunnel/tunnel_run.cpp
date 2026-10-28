@@ -706,8 +706,11 @@ void tunnel_run::reload_agents()
             in_addr on{htonl(INADDR_ANY)};
             if (!s.bind.empty() && ::inet_pton(AF_INET, s.bind.c_str(), &on) != 1)
                 on.s_addr = htonl(INADDR_LOOPBACK);
-            const bool ok = s.http ? h->srv.listen_unix(service_socket(m_owner.get_name(), s.name), err)
-                                   : h->srv.listen_tcp(on.s_addr, s.port, false, err);
+            const std::string sock = s.http ? service_socket(m_owner.get_name(), s.name) : std::string();
+            if (s.http)
+                err = service_socket_refusal(m_owner.get_name(), sock);
+            const bool ok = err.empty() && (s.http ? h->srv.listen_unix(sock, err)
+                                                   : h->srv.listen_tcp(on.s_addr, s.port, false, err));
             if (!ok)
             {
                 LOG_WARN(("tunnel " + std::string(m_owner.get_name()) + ": the service " + s.name + " of " + a.name +

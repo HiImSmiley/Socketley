@@ -76,10 +76,10 @@ case "$INV" in pi.*) ok ;; *) bad "an invitation is printed" "rc $rc: $INV" ;; e
 out=$("$BIN" tunnel t invite other --http web 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"already pi's"*) true ;; *) false ;; esac && ok || bad "a service of another agent cannot be taken" "rc $rc: $out"
 [ "$("$BIN" tunnel t list)" = "$(printf 'pi\tinvited\tweb,echo:%s' "$PT")" ] && ok || bad "list shows the invitation" "$("$BIN" tunnel t list 2>&1)"
-# Where the edge serves a service: beside its agents file, or under /tmp by a hash of that path when it is too deep.
+# Where the edge serves a service: beside its agents file, or beside the daemon's socket by a hash of that path when it is too deep.
 sock_of() {
     local p; p=$(dirname "$(find "$HOME/.local/share" -path '*tunnel/t/agents' 2>/dev/null | head -1)")/$1.sock
-    [ ${#p} -ge 100 ] && p="/tmp/skl-$(printf '%s' "$p" | sha256sum | cut -c1-16).sock"
+    [ ${#p} -ge 100 ] && p="$SOCKETLEY_SOCKET.rt/tunnel-$(printf '%s' "$p" | sha256sum | cut -c1-16).sock"
     echo "$p"
 }
 for _ in $(seq 1 30); do WEB=$(sock_of web); [ -S "$WEB" ] && break; sleep 0.1; done

@@ -152,7 +152,7 @@ for _ in $(seq 1 50); do "$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth
     || bad "the agent joins, its service asking visitors to sign in at the edge's idp" "$("$BIN" tunnel e list)"
 grep -q 'tunnel e: "boss" added agent "pi"' "$SOCKETLEY_DLOG" && ok || bad "who added it is said in the log" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
 WEB=$(dirname "$(find "$HOME/.local/share" -path '*tunnel/e/agents' 2>/dev/null | head -1)")/web.sock
-[ ${#WEB} -ge 100 ] && WEB="/tmp/skl-$(printf '%s' "$WEB" | sha256sum | cut -c1-16).sock"
+[ ${#WEB} -ge 100 ] && WEB="$SOCKETLEY_SOCKET.rt/tunnel-$(printf '%s' "$WEB" | sha256sum | cut -c1-16).sock"
 for _ in $(seq 1 30); do [ -S "$WEB" ] && break; sleep 0.1; done
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 --unix-socket "$WEB" http://web/x)
 [ "$code" = 401 ] && ok || bad "a visitor who did not sign in is refused" "$code"

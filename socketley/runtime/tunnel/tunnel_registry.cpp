@@ -10,6 +10,7 @@
 
 #include "../../shared/crypto/jws.h"
 #include "../../shared/loop/blocking_write.h"
+#include "../../shared/net/unix_listener.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/hex.h"
@@ -102,7 +103,20 @@ std::string service_socket(std::string_view edge, std::string_view service)
     if (path.size() < 100)
         return path;
     const std::string d = jws::sha256(path);
-    return "/tmp/skl-" + hex_encode(d.data(), 8) + ".sock";
+    // Beside the daemon's socket in the directory its companion nodes use, since in /tmp anyone could bind the name first.
+    std::string hashed =
+        socketley_paths::resolve().socket_path.string() + ".rt/tunnel-" + hex_encode(d.data(), 8) + ".sock";
+    return unix_sock::path_refusal(hashed).empty() ? hashed : std::string();
+}
+
+std::string service_socket_refusal(std::string_view edge, const std::string& sock)
+{
+    if (sock.empty())
+        return "the state directory is too deep for its socket, and the daemon's socket for a short one";
+    if (sock.starts_with(edge_dir(edge) + "/"))
+        return {};
+    const std::string dir = unix_sock::node_dir_of(sock);
+    return unix_sock::secure_node_dir(dir) ? std::string() : dir + " is not a directory of this user's alone";
 }
 
 std::string agent_key_path(std::string_view agent_runtime)
