@@ -637,8 +637,11 @@ void server::zone(int fd, const request& r)
     // Only a file a dns runtime serves, so the page writes nothing else on this machine.
     bool served = false;
     {
+        // Found in the list under the lock already held, since get() would take the shared lock a second time.
         std::shared_lock lock(m_manager.mutex);
-        if (const auto* rt = m_manager.get(runtime); rt && rt->get_type() == runtime_dns)
+        const auto& listed = m_manager.list();
+        const auto it = listed.find(runtime);
+        if (const runtime_instance* rt = it == listed.end() ? nullptr : it->second.get(); rt && rt->get_type() == runtime_dns)
         {
             const auto held = rt->config_lock();
             for (const std::string& p : static_cast<const dns_instance*>(rt)->zone_paths())
