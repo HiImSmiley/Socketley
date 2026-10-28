@@ -290,7 +290,7 @@ fi
 attached(){
     if grep -q 'fast-lo: unavailable' "$SOCKETLEY_DLOG"; then
         # Only a refusal the environment explains is a skip; any other is the attach path failing.
-        if ! grep 'fast-lo: unavailable' "$SOCKETLEY_DLOG" | grep -qE 'no CAP_|needs cgroup v2|no SO_NETNS_COOKIE|Function not implemented|Operation not supported'; then
+        if ! grep 'fast-lo: unavailable' "$SOCKETLEY_DLOG" | grep -qE 'no CAP_|needs cgroup v2|this kernel has no|Function not implemented|Operation not supported'; then
             fail "attach" "with the capabilities set the shortcut attaches, or names an environment reason" "$(grep 'fast-lo' "$SOCKETLEY_DLOG")"
         fi
         echo "  SKIP: the shortcut did not attach here: $(grep 'fast-lo' "$SOCKETLEY_DLOG")"

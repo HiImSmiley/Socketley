@@ -307,6 +307,16 @@ static int prog_load(const bpf_asm& a, uint32_t type, const char* name)
     }
 }
 
+// What a refused load says, read off the verifier's log so a kernel too old for the programs is named as such.
+static const char* load_refusal()
+{
+    if (std::strstr(g_verifier_log, "unknown func bpf_get_current_pid_tgid"))
+        return "this kernel has no bpf_get_current_pid_tgid for sockops programs (Linux 6.10 added it)";
+    if (std::strstr(g_verifier_log, "unknown func "))
+        return "this kernel has no BPF helper the programs call (its verifier says unknown func)";
+    return "programs could not be loaded";
+}
+
 // The peer's key is this socket's with the addresses swapped and the ports
 // swapped.
 static constexpr int16_t K_PORT = -4;    // u32 port, the ports map's key
@@ -1180,7 +1190,7 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
                          mode == fast_lo_mode::trust);
     if (m_ops < 0 || m_msg < 0)
         return fail(denied(errno) ? "no CAP_BPF/CAP_NET_ADMIN to load the programs"
-                                  : "programs could not be loaded", errno);
+                                  : load_refusal(), errno);
 
     union bpf_attr a{};
     a.target_fd = static_cast<uint32_t>(m_socks);
