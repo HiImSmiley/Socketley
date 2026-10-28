@@ -1036,8 +1036,16 @@ bool event_loop::init()
 
     setup_eventfd();
 
-    if (const auto usec = socketley::settings::number<uint32_t>("SOCKETLEY_NAPI_BUSY_POLL_US"))
-        enable_napi_busy_poll(*usec);
+    if (const auto usec = socketley::settings::number<uint32_t>("SOCKETLEY_NAPI_BUSY_POLL_US");
+        usec && !enable_napi_busy_poll(*usec))
+    {
+        // Set by name, so a ring that would not take it says so rather than leaving the setting silently inert.
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "event loop: SOCKETLEY_NAPI_BUSY_POLL_US=%u was not applied, because the kernel refused "
+                 "NAPI busy poll registration", *usec);
+        LOG_WARN(msg);
+    }
 
     return true;
 }
