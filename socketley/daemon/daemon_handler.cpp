@@ -5285,6 +5285,16 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         }
     }
 
+    // The --auth judged as the flag judges it, so a typo is told here and not by every request refused.
+    if (cfg.has("auth") && !cfg.proxy_auth.empty())
+    {
+        if (const std::string bad = proxy_auth::spec_error(cfg.proxy_auth); !bad.empty())
+        {
+            conn->write_buf = bad + "\n";
+            return 1;
+        }
+    }
+
     // The address judged as --bind judges it, since a document is the other way in.
     if (cfg.has("bind") && !cfg.bind_address.empty())
     {

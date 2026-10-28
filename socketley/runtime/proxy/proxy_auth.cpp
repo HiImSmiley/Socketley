@@ -89,12 +89,20 @@ std::string proxy_auth::spec_error(std::string_view spec)
 
 void proxy_auth::configure(std::string_view spec, std::string_view runtime)
 {
+    // A spec that is none of the three, from saved state or an archive the flag never judged, is a bearer
+    // --auth with no file, which refuses everybody where none would let everybody through.
+    const bool unknown = !spec.empty() && !spec.starts_with("bearer:") && !spec.starts_with("basic:") &&
+                         !spec.starts_with("idp:");
     m_kind = spec.starts_with("bearer:")  ? kind::bearer
            : spec.starts_with("basic:") ? kind::basic
            : spec.starts_with("idp:")   ? kind::idp
+           : unknown                    ? kind::bearer
                                         : kind::none;
-    m_file.assign(m_kind == kind::none || m_kind == kind::idp ? std::string_view{}
-                                                              : spec.substr(m_kind == kind::bearer ? 7 : 6));
+    m_file.assign(m_kind == kind::none || m_kind == kind::idp || unknown
+                      ? std::string_view{}
+                      : spec.substr(m_kind == kind::bearer ? 7 : 6));
+    if (m_kind != kind::none && m_kind != kind::idp && m_file.empty())
+        LOG_ERROR(("proxy " + std::string(runtime) + ": " + spec_error(spec) + "; every request is refused").c_str());
     m_sessions.reset();
     if (m_kind == kind::idp)
     {
@@ -113,6 +121,9 @@ void proxy_auth::configure(std::string_view spec, std::string_view runtime)
 
 void proxy_auth::reload(std::chrono::steady_clock::time_point now)
 {
+    // No file refuses everybody, which configure has already said.
+    if (m_file.empty())
+        return;
     if (m_stamp && now - m_checked < std::chrono::seconds(1))
         return;
     m_checked = now;

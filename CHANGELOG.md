@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   framing field to the proxy, server, storage or tunnel and went on to the
   backend verbatim, where a parser that trims it framed the body by it and
   read a second request the proxy never routed or authenticated.
+- **A proxy `--auth` that is none of `bearer:`, `basic:` or `idp:` refuses
+  every request.** Only the flag judged it: from saved state, a restored
+  archive or `import` (and so `edit`), a misspelt spec such as
+  `Bearer:/etc/tokens` meant no authentication at all and said nothing. The
+  proxy now logs why and refuses everybody, and `import` refuses the
+  document with the flag's sentence.
 - **An h2c upgrade is not relayed by the proxy.** A request offering
   `Upgrade: h2c` reached the backend with its offer and `HTTP2-Settings`, and
   after a 101 the client spoke HTTP/2 to the backend past `--auth`, filters,
