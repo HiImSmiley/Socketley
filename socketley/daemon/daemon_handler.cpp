@@ -3699,11 +3699,12 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
             return 1;
         }
         for (const tn::service& s : a.services)
-            if (const std::string bad = s.auth.empty() ? std::string() : proxy_auth::spec_error(s.auth); !bad.empty())
-            {
-                conn->write_buf = "--http " + s.name + ": " + bad + "\n";
-                return 1;
-            }
+            for (const std::string_view method : tn::auth_methods(s.auth))
+                if (const std::string bad = proxy_auth::spec_error(method); !bad.empty())
+                {
+                    conn->write_buf = "--http " + s.name + ": " + bad + "\n";
+                    return 1;
+                }
         // An invitation's secret goes to the agent once, in this answer; the file keeps its hash.
         const std::string secret = invite ? socketley::random_b64url(32) : std::string();
         a.secret_hash = invite ? tn::hash_secret(secret) : std::string();

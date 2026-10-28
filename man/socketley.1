@@ -14092,7 +14092,11 @@ sends a browser to sign in and back,
 .BI bearer: file
 and
 .BI basic: file
-ask for a token or a key. Every request is asked, not only a connection's
+ask for a token or a key, and several joined by
+.B +
+let in a visitor any one of them admits:
+.B idp:auth+bearer:/etc/socketley/hub.token
+takes a person signed in and a program with the token alike. Every request is asked, not only a connection's
 first, since the entrance hands one connection to the edge from visitor to
 visitor; nothing of a refused request reaches the agent, a body is carried as
 a body and never read as the next request, and a connection whose upgrade the

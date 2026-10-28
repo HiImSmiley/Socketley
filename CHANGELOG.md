@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A tunnel service with more than one way in.** An HTTP service's auth may
+  join several with `+`, `ollama=idp:auth+bearer:/etc/socketley/hub.token`:
+  a person signed in and a program with the token both get through, and a
+  browser with neither is sent to sign in. The edge's log names who the
+  entrance heard an agent or a person from, where it said the entrance.
 - **A tunnel's settings by `edit`.** `socketley edit <agent> --offer ... --restart`
   changes what an agent offers, and so for every tunnel flag; without
   `--restart` a running tunnel says it needs one, where it said unknown flag.

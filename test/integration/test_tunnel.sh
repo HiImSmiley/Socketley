@@ -11,6 +11,7 @@
 #   * a revoked agent still carried, or a service it never offered reached
 #   * a service's name not beside the edge's, or another runtime given a name a service has
 #   * an agent's offers that edit cannot change, or changes on a running agent that has not restarted
+#   * the entrance's own address logged for who an agent or a person was
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -161,6 +162,17 @@ for _ in $(seq 1 80); do [ "$(curl -s -m 2 --unix-socket "$WEB" http://web/edite
 for _ in $(seq 1 30); do grep -q "tunnel thief: the edge refused" "$SOCKETLEY_DLOG" && break; sleep 0.1; done
 grep -q "tunnel thief: the edge refused: HTTP/1.1 401" "$SOCKETLEY_DLOG" && ok || bad "an invitation joins once" "$(grep thief "$SOCKETLEY_DLOG" | tail -2)"
 "$BIN" remove thief >/dev/null 2>&1
+# Behind the entrance the edge says who the entrance heard a refused agent from, not the entrance itself.
+python3 - "$PE" <<'PY' >/dev/null 2>&1
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"GET /.tunnel HTTP/1.1\r\nHost: t\r\nUpgrade: socketley-tunnel/1\r\nConnection: Upgrade\r\n"
+          b"X-Forwarded-For: 203.0.113.9\r\nAuthorization: Tunnel nobody.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n\r\n")
+s.recv(4096)
+PY
+for _ in $(seq 1 20); do grep -q 'agent "nobody" refused from' "$SOCKETLEY_DLOG" && break; sleep 0.1; done
+grep -q 'agent "nobody" refused from 203.0.113.9$' "$SOCKETLEY_DLOG" && ok \
+    || bad "a refused agent is said with the address the entrance heard it from" "$(grep 'refused from' "$SOCKETLEY_DLOG" | tail -1)"
 
 # ── Through the entrance, as on a machine with a zone ───────────────────────
 if command -v dig >/dev/null 2>&1; then

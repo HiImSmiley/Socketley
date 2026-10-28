@@ -20,6 +20,7 @@
 #include "../../shared/http/request_head.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/net/endpoint.h"
+#include "../../shared/net/peer_address.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
@@ -55,6 +56,14 @@ std::string peer_text(const sockaddr_storage& a)
         return "[" + std::string(buf) + "]:" + std::to_string(ntohs(v->sin6_port));
     }
     return "local";
+}
+
+// Who a request came from: behind the entrance, a hop on this machine, the client the entrance heard it from.
+std::string client_of(const sockaddr_storage& peer, std::string_view head)
+{
+    int fields = 0;
+    const std::string_view xff = http_last_forwarded_hop(http_request_field(head, "x-forwarded-for", fields));
+    return is_loopback(peer) && fields == 1 && !xff.empty() ? std::string(xff) : peer_text(peer);
 }
 
 // `host:port` with a literal address or localhost, as --forward and --offer name their targets.
@@ -183,11 +192,12 @@ void link::on_goaway(std::string_view) {}
 leg_hooks::leg_hooks(tunnel_run& r, std::string a, service sv)
     : run(r), agent(std::move(a)), svc(std::move(sv)), srv(r.m_loop, &r, r.m_owner, *this, max_legs)
 {
-    if (svc.http && !svc.auth.empty())
-    {
-        auth = std::make_unique<proxy_auth>();
-        auth->configure(svc.auth, r.m_owner.get_name());
-    }
+    if (svc.http)
+        for (const std::string_view method : auth_methods(svc.auth))
+        {
+            auth.push_back(std::make_unique<proxy_auth>());
+            auth.back()->configure(method, r.m_owner.get_name());
+        }
 }
 
 leg_hooks::~leg_hooks() = default;
@@ -196,7 +206,7 @@ std::shared_ptr<http::server_conn> leg_hooks::make_conn()
 {
     auto g = std::make_shared<leg>();
     g->srv = &srv;
-    g->gated = auth != nullptr;
+    g->gated = !auth.empty();
     return g;
 }
 
@@ -757,11 +767,12 @@ void tunnel_run::join_by_person(const std::shared_ptr<http::server_conn>& c, std
     {
         if (s.http && s.auth.empty())
             s.auth = "idp:" + std::string(m_owner.get_idp());
-        if (const std::string bad = s.http ? proxy_auth::spec_error(s.auth) : std::string(); !bad.empty())
-        {
-            refuse_front(c, 400, s.name + ": " + bad);
-            return;
-        }
+        for (const std::string_view method : s.http ? auth_methods(s.auth) : std::vector<std::string_view>{})
+            if (const std::string bad = proxy_auth::spec_error(method); !bad.empty())
+            {
+                refuse_front(c, 400, s.name + ": " + bad);
+                return;
+            }
     }
     const std::string secret = random_b64url(32);
     a.secret_hash = hash_secret(secret);
@@ -782,7 +793,7 @@ void tunnel_run::join_by_person(const std::shared_ptr<http::server_conn>& c, std
         return;
     }
     LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" added agent \"" + a.name +
-              "\" from " + peer_text(c->peer)).c_str());
+              "\" from " + client_of(c->peer, head)).c_str());
     m_agents_mtime = -1;
     reload_agents();
     answer_front(c, 200, a.name + "." + secret);
@@ -831,7 +842,7 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
         if (it == m_agents.end() || !it->joined || it->secret_hash != hash_secret(secret))
         {
             LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": agent \"" + name + "\" refused from " +
-                      peer_text(c->peer)).c_str());
+                      client_of(c->peer, head)).c_str());
             refuse_front(c, 401, "this agent's key is not one the edge holds");
             return;
         }
@@ -861,7 +872,7 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
         }
         ++m_c.joined;
         LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": agent \"" + name + "\" joined from " +
-                  peer_text(c->peer)).c_str());
+                  client_of(c->peer, head)).c_str());
         m_agents_mtime = -1;
         reload_agents();
         upgraded(c, link::kind::agent, name, "Tunnel-Key: " + name + "." + key + "\r\n");
@@ -876,7 +887,7 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
             return;
         }
         LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" connected from " +
-                  peer_text(c->peer)).c_str());
+                  client_of(c->peer, head)).c_str());
         upgraded(c, link::kind::person, who.username, {});
         return;
     }
@@ -1022,10 +1033,19 @@ void tunnel_run::gate(leg_hooks& h, const std::shared_ptr<leg>& g)
         const std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
         int host_fields = 0;
         const std::string_view host = http_request_field(head, "host", host_fields);
-        // The entrance on this machine is the only one that reaches a service's socket, and it is believed.
-        proxy_auth::request_verdict v = h.auth->decide(head, "127.0.0.1", false, line.substr(0, sp1),
-                                                       target.substr(0, target.find('?')),
-                                                       host_fields == 1 ? host : std::string_view());
+        // The entrance on this machine is the only one that reaches a service's socket, and it is believed; refused
+        // by every method, a browser is sent to sign in where one of them would send it.
+        proxy_auth::request_verdict v;
+        for (const auto& a : h.auth)
+        {
+            proxy_auth::request_verdict one = a->decide(head, "127.0.0.1", false, line.substr(0, sp1),
+                                                        target.substr(0, target.find('?')),
+                                                        host_fields == 1 ? host : std::string_view());
+            if (one.pass || v.status.empty() || one.status.starts_with("302"))
+                v = std::move(one);
+            if (v.pass)
+                break;
+        }
         if (!v.pass)
         {
             refuse_visitor(g, v.status, v.body, v.headers);

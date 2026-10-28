@@ -50,6 +50,9 @@ bool valid_name(std::string_view name);
 bool parse_agents(std::string_view text, std::vector<agent>& out, std::string& why);
 std::string render_agents(const std::vector<agent>& agents);
 
+// The ways a service's visitors may be let in, `idp:auth+bearer:/etc/x` as its two; a request any one admits passes.
+std::vector<std::string_view> auth_methods(std::string_view auth);
+
 // `--http a,b=idp:auth --tcp c:25565` as services; false with `why` for a bad name or port.
 bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::vector<service>& out, std::string& why);
 

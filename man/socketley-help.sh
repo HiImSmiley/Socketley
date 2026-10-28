@@ -487,7 +487,8 @@ cli_commands() {
     echo "  The agents a tunnel edge takes: invite prints an invitation used"
     echo "  once, set changes what an agent offers, revoke cuts it off. An HTTP"
     echo "  service named <name>=<auth> asks every visitor's request for it, as"
-    echo "  a proxy's --auth does (idp:<idp>, bearer:<file>, basic:<file>)."
+    echo "  a proxy's --auth does (idp:<idp>, bearer:<file>, basic:<file>), or"
+    echo "  any of several joined by +: idp:auth+bearer:/etc/x lets in either."
     echo -e "  ${CYAN}socketley tunnel edge invite pi --http home=idp:auth --tcp mc:25565${NC}"
     echo ""
 

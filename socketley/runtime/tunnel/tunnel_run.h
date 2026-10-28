@@ -113,8 +113,8 @@ public:
     // The agent and service a listener's visitors are carried to; empty for a dialler.
     const std::string agent;
     const service svc;
-    // What a protected HTTP service asks of each request; null lets every visitor through.
-    std::unique_ptr<proxy_auth> auth;
+    // What a protected HTTP service asks of each request, any one of them enough; none lets every visitor through.
+    std::vector<std::unique_ptr<proxy_auth>> auth;
     http::conn_server srv;
 
     std::shared_ptr<http::server_conn> make_conn() override;

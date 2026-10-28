@@ -9,6 +9,7 @@
 #   * a body, chunked or not, read as the next request's head, or the request behind it carried unasked
 #   * an upgrade the service refused leaving the connection unasked from then on
 #   * a browser not sent to sign in at the idp, or a signed-in one refused
+#   * a service of two ways in refusing a visitor either would let through, or letting a wrong one in
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -91,19 +92,21 @@ for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$I/jwks")
 
 out=$("$BIN" tunnel t invite pi --http "open,x=bogus" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"--http x: --auth takes"*) true ;; *) false ;; esac && ok || bad "an auth no proxy would take is refused" "rc $rc: $out"
-INV=$("$BIN" tunnel t invite pi --http "open,tok=bearer:$T/tokens,web=idp:auth" 2>&1)
+out=$("$BIN" tunnel t invite pi --http "open,x=idp:auth+bogus" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"--http x: --auth takes"*) true ;; *) false ;; esac && ok || bad "and so is one of several" "rc $rc: $out"
+INV=$("$BIN" tunnel t invite pi --http "open,tok=bearer:$T/tokens,web=idp:auth,both=idp:auth+bearer:$T/tokens" 2>&1)
 case "$INV" in pi.*) ok ;; *) bad "an invitation with protected services is printed" "$INV" ;; esac
-[ "$("$BIN" tunnel t list)" = "$(printf 'pi\tinvited\topen,tok=bearer:%s,web=idp:auth' "$T/tokens")" ] && ok \
+[ "$("$BIN" tunnel t list)" = "$(printf 'pi\tinvited\topen,tok=bearer:%s,web=idp:auth,both=idp:auth+bearer:%s' "$T/tokens" "$T/tokens")" ] && ok \
     || bad "list shows what each service asks" "$("$BIN" tunnel t list 2>&1)"
 "$BIN" create tunnel home --mode agent --to "http://127.0.0.1:$PE" --join "$INV" \
-    --offer "open=127.0.0.1:$PB,tok=127.0.0.1:$PB,web=127.0.0.1:$PB" -s >/dev/null 2>&1 || bad "an agent is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+    --offer "open=127.0.0.1:$PB,tok=127.0.0.1:$PB,web=127.0.0.1:$PB,both=127.0.0.1:$PB" -s >/dev/null 2>&1 || bad "an agent is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for _ in $(seq 1 50); do "$BIN" tunnel t list | grep -q joined && break; sleep 0.1; done
 sock_of() {
     local p; p=$(dirname "$(find "$HOME/.local/share" -path '*tunnel/t/agents' 2>/dev/null | head -1)")/$1.sock
     [ ${#p} -ge 100 ] && p="/tmp/skl-$(printf '%s' "$p" | sha256sum | cut -c1-16).sock"
     echo "$p"
 }
-for _ in $(seq 1 50); do [ -S "$(sock_of web)" ] && [ "$(curl -s -m 2 --unix-socket "$(sock_of open)" http://open/ready)" = "home /ready" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -S "$(sock_of web)" ] && [ -S "$(sock_of both)" ] && [ "$(curl -s -m 2 --unix-socket "$(sock_of open)" http://open/ready)" = "home /ready" ] && break; sleep 0.1; done
 
 COOKIE=$(python3 - "$PI" <<'PY'
 import sys, urllib.request, urllib.parse, urllib.error
@@ -121,9 +124,9 @@ PY
 )
 case "$COOKIE" in skl_idp=?*) ok ;; *) bad "alice signs in at the idp" "$COOKIE" ;; esac
 
-tally < <(python3 - "$(sock_of open)" "$(sock_of tok)" "$(sock_of web)" "$T/hits" "$COOKIE" 2>&1 <<'PY' || echo "bad the visitor checks ran to their end"
+tally < <(python3 - "$(sock_of open)" "$(sock_of tok)" "$(sock_of web)" "$T/hits" "$COOKIE" "$(sock_of both)" 2>&1 <<'PY' || echo "bad the visitor checks ran to their end"
 import sys, socket, time
-open_s, tok_s, web_s, hits, cookie = sys.argv[1:6]
+open_s, tok_s, web_s, hits, cookie, both_s = sys.argv[1:7]
 def check(name, cond, detail=""):
     print(("ok " if cond else "bad ") + name + ("" if cond else ": " + detail))
 def conn(path):
@@ -228,6 +231,17 @@ check("anything else with no sign-in is told 401", status(a) == "HTTP/1.1 401 Un
 s = conn(web_s); s.sendall(req("/w-in", "Cookie: %s\r\n" % cookie)); a = read_answer(s)
 check("a signed-in visitor is let through", a.endswith(b"home /w-in"), repr(a[:300]))
 check("and no refused request reached home", not any(hit(p) for p in ("/w-browser", "/w-api")))
+
+# A service with two ways in lets a visitor through by either, and refuses as the one a visitor would use.
+s = conn(both_s); s.sendall(req("/b-tok", TOK)); a = read_answer(s)
+check("of two ways in, the token lets a program through", a.endswith(b"home /b-tok"), repr(a[:200]))
+s = conn(both_s); s.sendall(req("/b-in", "Cookie: %s\r\n" % cookie)); a = read_answer(s)
+check("and the sign-in a person in a browser", a.endswith(b"home /b-in"), repr(a[:300]))
+s = conn(both_s); s.sendall(req("/b-browser", "Accept: text/html\r\n")); a = read_answer(s)
+check("a browser with neither is sent to sign in", status(a) == "HTTP/1.1 302 Found", repr(a[:300]))
+s = conn(both_s); s.sendall(req("/b-wrong", "Authorization: Bearer wrong\r\n")); a = read_answer(s)
+check("a wrong token is refused", status(a) == "HTTP/1.1 401 Unauthorized", repr(a[:200]))
+check("and neither refused request reached home", not hit("/b-browser") and not hit("/b-wrong"))
 PY
 )
 

@@ -173,6 +173,14 @@ std::string render_agents(const std::vector<agent>& agents)
     return out;
 }
 
+std::vector<std::string_view> auth_methods(std::string_view auth)
+{
+    std::vector<std::string_view> out;
+    while (!auth.empty())
+        out.push_back(take_item(auth, '+'));
+    return out;
+}
+
 bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::vector<service>& out, std::string& why)
 {
     out.clear();
