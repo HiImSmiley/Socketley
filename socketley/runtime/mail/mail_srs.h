@@ -2,8 +2,10 @@
 // The Sender Rewriting Scheme: a message an alias forwards to another domain goes from an address of this runtime's
 // domain that names the original sender, so SPF at the far end judges this host and a bounce still finds its way
 // back.  SRS0=<hash>=<time>=<domain>=<local>@<ours> for a sender of elsewhere, SRS1=<hash>=<first forwarder>==<rest>
-// for one another forwarder rewrote, as Shevek's scheme and Postfix's postsrsd write them; the hash is an HMAC under a
-// key of the runtime's own, the time its day, and an address older than 21 days or not of this key is no address.
+// for one another forwarder rewrote, as Shevek's scheme and Postfix's postsrsd write them; the hash is eight base32
+// characters (40 bits, whatever a relay does to case) of an HMAC under a key of the runtime's own, the time its day,
+// and an address older than 21 days by its own stamp or, for SRS1, by the first forwarder's, or not of this key, is no
+// address.  The four-character hash of earlier releases is read back until 2026-12-31 and no longer.
 #include <cstdint>
 #include <string>
 #include <string_view>

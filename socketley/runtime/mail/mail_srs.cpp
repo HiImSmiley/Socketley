@@ -12,6 +12,8 @@ namespace
 
 constexpr std::string_view base32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 constexpr int64_t max_age_days = 21;
+// The last day, 2026-12-31, an address of the four-character hash written before it is read back.
+constexpr int64_t legacy_until_day = 20818;
 
 std::string lower(std::string_view s)
 {
@@ -20,8 +22,22 @@ std::string lower(std::string_view s)
     return out;
 }
 
-// The four characters of the HMAC over what an address carries, lower-cased so a relay that folds case keeps it.
+// Eight base32 characters, 40 bits, of the HMAC over what an address carries lower-cased, kept whole by a relay that
+// folds case.
 std::string hash_of(std::string_view key, std::string_view what)
+{
+    const std::string mac = socketley::crypto::hmac_sha1(key, lower(what));
+    uint64_t bits = 0;
+    for (size_t i = 0; i < 5 && i < mac.size(); ++i)
+        bits = bits << 8 | static_cast<uint8_t>(mac[i]);
+    std::string out;
+    for (int i = 7; i >= 0; --i)
+        out += base32[(bits >> (5 * i)) & 31];
+    return out;
+}
+
+// The four base64 characters earlier releases wrote, about 21 bits once case is folded.
+std::string legacy_hash_of(std::string_view key, std::string_view what)
 {
     const std::string mac = socketley::crypto::hmac_sha1(key, lower(what));
     return socketley::base64::encode(mac).substr(0, 4);
@@ -46,9 +62,17 @@ bool fresh(std::string_view s, int64_t day)
     return age <= max_age_days;
 }
 
-bool same_hash(std::string_view a, std::string_view b)
+// Whether `h` is the hash of `what` under `key`, in a time that tells nothing of where it differs; the old short form
+// only until legacy_until_day, once no address written with it is still fresh.
+bool hash_ok(std::string_view h, std::string_view key, std::string_view what, int64_t day)
 {
-    return a.size() == 4 && socketley::ascii::iequals(a, b);
+    std::string given = lower(h);
+    std::string want;
+    if (h.size() == 8)
+        want = lower(hash_of(key, what));
+    else if (h.size() == 4 && day <= legacy_until_day)
+        want = lower(legacy_hash_of(key, what));
+    return !want.empty() && socketley::crypto::secure_equal(given, want);
 }
 
 }   // namespace
@@ -106,7 +130,7 @@ std::string reverse(std::string_view address, std::string_view domain, std::stri
         const std::string_view h = tail.substr(0, a), t = tail.substr(a + 1, b - a - 1),
                                host = tail.substr(b + 1, c - b - 1), who = tail.substr(c + 1);
         if (host.empty() || who.empty() || !fresh(t, day) ||
-            !same_hash(h, hash_of(key, std::string(t) + std::string(host) + std::string(who))))
+            !hash_ok(h, key, std::string(t) + std::string(host) + std::string(who), day))
             return {};
         return std::string(who) + "@" + std::string(host);
     }
@@ -118,7 +142,10 @@ std::string reverse(std::string_view address, std::string_view domain, std::stri
         if (dd == std::string_view::npos)
             return {};
         const std::string_view h = tail.substr(0, a), orighost = tail.substr(a + 1, dd - a - 1), rest = tail.substr(dd + 1);
-        if (orighost.empty() || !same_hash(h, hash_of(key, std::string(orighost) + std::string(rest))))
+        // The first forwarder's day stamp in =HHHH=TT=... is read too, so an SRS1 address lives no longer than its SRS0.
+        const size_t ta = rest.find('=', 1), tb = ta == std::string_view::npos ? ta : rest.find('=', ta + 1);
+        if (orighost.empty() || tb == std::string_view::npos || !fresh(rest.substr(ta + 1, tb - ta - 1), day) ||
+            !hash_ok(h, key, std::string(orighost) + std::string(rest), day))
             return {};
         return "SRS0" + std::string(rest) + "@" + std::string(orighost);
     }

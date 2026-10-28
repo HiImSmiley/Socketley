@@ -24,7 +24,9 @@
 #include "runtime/mail/mail_text.h"
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/pop3_session.h"
+#include "shared/crypto/mac.h"
 #include "shared/util/ascii.h"
+#include "shared/util/base64.h"
 #include "shared/util/xml_doc.h"
 #include "shared/util/inflate.h"
 
@@ -37,6 +39,9 @@ TEST_CASE("SRS: a forwarded sender is rewritten under this domain and read back,
     const std::string fwd = srs::forward("alice@origin.test", "fwd.test", key, day);
     CHECK(fwd.starts_with("SRS0="));
     CHECK(fwd.ends_with("=origin.test=alice@fwd.test"));
+    // The hash is eight base32 characters, 40 bits that folding case does not shrink.
+    CHECK(fwd.find('=', 5) == 13);
+    CHECK(fwd.substr(5, 8).find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567") == std::string::npos);
     CHECK(srs::reverse(fwd, "fwd.test", key, day) == "alice@origin.test");
     CHECK(srs::reverse(fwd, "fwd.test", key, day + 21) == "alice@origin.test");
     CHECK(srs::reverse(fwd, "fwd.test", key, day + 22).empty());
@@ -57,6 +62,21 @@ TEST_CASE("SRS: a forwarded sender is rewritten under this domain and read back,
     CHECK(again.starts_with("SRS1="));
     CHECK(again.find("=fwd.test==") != std::string::npos);
     CHECK(srs::reverse(again, "second.test", "second key", day) == fwd);
+    // An SRS1 address is as old as the first forwarder's stamp inside it.
+    CHECK(srs::reverse(again, "second.test", "second key", day + 21) == fwd);
+    CHECK(srs::reverse(again, "second.test", "second key", day + 22).empty());
+    // The four base64 characters of earlier releases are read until 2026-12-31 (day 20818), and not after.
+    const int64_t late = 20810;
+    const std::string stamp = srs::forward("carol@origin.test", "fwd.test", key, late).substr(14, 2);
+    std::string signed_text = stamp + "origin.testcarol";
+    socketley::ascii::lower_in_place(signed_text);
+    const std::string old_hash = socketley::base64::encode(socketley::crypto::hmac_sha1(key, signed_text)).substr(0, 4);
+    const std::string old_form = "SRS0=" + old_hash + "=" + stamp + "=origin.test=carol@fwd.test";
+    CHECK(srs::reverse(old_form, "fwd.test", key, late) == "carol@origin.test");
+    CHECK(srs::reverse(old_form, "fwd.test", key, 20819).empty());
+    std::string wrong_old = old_form;
+    wrong_old[5] = wrong_old[5] == 'A' || wrong_old[5] == 'a' ? 'B' : 'A';
+    CHECK(srs::reverse(wrong_old, "fwd.test", key, late).empty());
     // A bounce, a sender of this domain and a non-SRS address are left alone.
     CHECK(srs::forward("", "fwd.test", key, day).empty());
     CHECK(srs::forward("me@fwd.test", "fwd.test", key, day) == "me@fwd.test");

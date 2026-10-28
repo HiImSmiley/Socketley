@@ -64,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **SRS addresses carry a 40-bit hash, and SRS1 ones expire.** The hash was
+  four base64 characters compared without case, about 21 bits; it is now eight
+  base32 characters, an SRS1 address is refused once the first forwarder's day
+  stamp inside it is 21 days old, and the old short hash is read back only
+  until 2026-12-31.
 - **The webmail port takes X-Forwarded-For only from 127.0.0.1 or ::1.**
   Another peer could name a new client with each failed sign-in and never be
   locked out; its failures now count against its own address.
