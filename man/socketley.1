@@ -9328,13 +9328,15 @@ and such a tag change as
 .B s3:ReplicateTags
 (see
 .BR "Bucket policy" ),
-marks the version REPLICA, and never copies a replica or a replica's delete
+for a user the policies allow that and do not deny the write it stands for, and
+takes the header from nobody else, whose request is the plain write it is;
+it marks the version REPLICA, and never copies a replica or a replica's delete
 marker on, so two buckets that replicate to each other copy each change once.
 The request also names the source's version id in
 .BR x\-socketley\-replica\-version\-id ,
 which a storage runtime that is the destination gives the replica or its delete
 marker, as S3 does, as long as that id is still newer than every version the key
-has there; otherwise the replica gets an id of its own. Another S3 stores the
+has there and dated no more than fifteen minutes past the destination's clock; otherwise the replica gets an id of its own. Another S3 stores the
 replication header as it does and ignores the other, so there a replica's version
 id is its own. A replica's time and owner are the destination's own.
 .PP
@@ -10031,7 +10033,9 @@ and PutReplicationConfiguration the three replication ones. A write that sends
 (PutObject and the steps of a multipart upload) is ReplicateObject instead of
 PutObject, such a DeleteObject is ReplicateDelete, and such a PutObjectTagging or
 DeleteObjectTagging is ReplicateTags: a user allowed those three and nothing else can
-be the destination's replication user.
+be the destination's replication user. The header counts only for a user allowed the
+replication action, and a Deny of the write it stands for still refuses it; anyone
+else's request is the plain write, its header ignored.
 .TP
 .B Resource
 one or a list of

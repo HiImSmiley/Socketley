@@ -79,7 +79,7 @@ void storage_run::op_get_notification(const std::shared_ptr<conn>& c)
 change_origin storage_run::origin_of(const conn& c) const
 {
     change_origin o;
-    o.replica = replica_request(c.req);
+    o.replica = c.replica;
     if (o.replica)
         o.source_version = std::string(c.req.header(replica_version_header));
     // Another node's change is one no node sends on, made with that node's stamp.

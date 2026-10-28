@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sign-ins (proxies, storage, the dashboard, tunnel edges) within a second,
   where they held until they ran out, up to 30 days; the admin bit is the
   account's now, not the one the cookie was signed with.
+- **A replica's status is taken only from a replication.** Any client could
+  send `x-amz-replication-status: REPLICA`, be judged for ReplicateObject
+  instead of the write and so escape a Deny of it, and name a replica version
+  id that made the key's next version id wrap. The header now counts only for a
+  user allowed the replication action and not denied the write, and a source's
+  version id is kept only while it is no more than fifteen minutes ahead.
 - **A share link gives only what its maker may still do.** A folder link was
   judged once, as a ListBucket, and then read every file under it, and any link
   went on working after its maker lost access, was disabled or removed, or its

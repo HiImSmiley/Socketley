@@ -292,6 +292,8 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     }
 
     auth_verdict v = m_auth->authorize(rv);
+    // A replica's status is taken as sent only where no policy judges anything, and otherwise as apply_policy finds.
+    c->replica = replica_request(r);
     // A policy may let in a request with no credentials, and ownership or a policy may refuse one with them.
     if ((v.allowed || v.anonymous) && needs_judging(v.anonymous ? nullptr : v.user.get()))
         apply_policy(c, rv, v);
@@ -1282,8 +1284,8 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
     }
     if (!c->cluster)
     {
-        replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
-        replica_source(r, meta);
+        replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, c->replica);
+        replica_source(*c, meta);
     }
     start_put(c, r.key, std::move(meta), {}, checksum_algo::none, cond, {},
               ask.mode != sse_mode::none ? &seal : nullptr);

@@ -488,7 +488,7 @@ bool storage_run::link_allows(const std::shared_ptr<conn>& c, const link_maker& 
     auto principal = std::exchange(c->principal, maker.principal);
     const bool anonymous = std::exchange(c->anonymous, maker.anonymous);
     const uint8_t acl_need = std::exchange(c->acl_need, uint8_t{0});
-    const bool hide = c->hide_missing, admitted = c->policy_admitted;
+    const bool hide = c->hide_missing, admitted = c->policy_admitted, replica = c->replica;
     // A maker let in only by an object's own grants is not, since the visitor is served without them.
     const bool allowed = app_allowed(c, method, bucket, key) && c->acl_need == 0;
     c->user            = std::move(user);
@@ -497,6 +497,7 @@ bool storage_run::link_allows(const std::shared_ptr<conn>& c, const link_maker& 
     c->acl_need        = acl_need;
     c->hide_missing    = hide;
     c->policy_admitted = admitted;
+    c->replica         = replica;
     return allowed;
 }
 

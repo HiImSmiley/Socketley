@@ -129,8 +129,8 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
     // The object the upload completes is replicated as its bucket's rules said when it began.
     if (!c->cluster)
     {
-        replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
-        replica_source(r, meta);
+        replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, c->replica);
+        replica_source(*c, meta);
     }
 
     ++m_c.mpu_created;

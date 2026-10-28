@@ -542,6 +542,8 @@ struct conn
     bool        anonymous{false};
     // Another node of the cluster sent it, to write what that node made, which no policy judges.
     bool        cluster{false};
+    // A replication's write, carrying the REPLICA status, by a user the policies let replicate the key.
+    bool        replica{false};
     bool        policy_admitted{false};
     // A missing key is answered AccessDenied, for a requester a policy lets read and not list, as S3 does.
     bool        hide_missing{false};
@@ -1232,7 +1234,7 @@ public:
     // PENDING when a rule of `bucket` copies it, and none for an SSE-C version, which is never copied.
     void replication_mark(std::string_view bucket, std::string_view key, object_meta& m, bool sse_c, bool replica);
     // Puts into `m` the version id a replica's source gave it, which the store gives the replica when it can.
-    void replica_source(const s3_request& r, object_meta& m);
+    void replica_source(const conn& c, object_meta& m);
     // Queues the copies a change already made makes, true when any was.
     bool replicate_change(const change_note& n);
     // Stages the copies of a change about to be made, its ticket in the replication outbox or 0, and says in

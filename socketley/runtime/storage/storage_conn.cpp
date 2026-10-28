@@ -1790,6 +1790,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->user.reset();
     c->anonymous       = false;
     c->cluster         = false;
+    c->replica         = false;
     c->policy_admitted = false;
     c->cors_head.clear();
     c->hide_missing = false;

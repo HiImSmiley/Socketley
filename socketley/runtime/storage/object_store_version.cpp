@@ -36,6 +36,9 @@ st errno_status(int64_t res)
     return (res == -ENOSPC || res == -EDQUOT) ? st::storage_full : st::io_error;
 }
 
+// How far ahead of this clock a replica's source may have dated its version.
+constexpr uint64_t replica_ahead_us = 15ull * 60 * 1000 * 1000;
+
 uint64_t now_us()
 {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -173,10 +176,15 @@ version_tag object_store::next_version(const bucket& b, const std::string& key, 
         t.marker = marker;
         return t;
     }
-    if (b.vstate == versioning::enabled && version_of_id(source_id, marker, t) && t.seq > newest_seq(b, key))
+    // A replica keeps its source's id only while that is dated no more than a quarter hour ahead of this clock, so no
+    // id a client chose can push the key's order to where the next version's would wrap.
+    const uint64_t now = now_us();
+    if (b.vstate == versioning::enabled && version_of_id(source_id, marker, t) && t.seq > newest_seq(b, key) &&
+        t.seq <= now + replica_ahead_us)
         return t;
     // Newer than every version the key has even when the clock stepped back.
-    t.seq    = std::max(now_us(), newest_seq(b, key) + 1);
+    const uint64_t newest = newest_seq(b, key);
+    t.seq    = std::max(now, newest < UINT64_MAX ? newest + 1 : newest);
     t.marker = marker;
     t.id     = b.vstate == versioning::enabled ? hex16(t.seq) + hex16(random_u64()) : "null";
     return t;

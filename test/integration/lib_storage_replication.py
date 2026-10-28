@@ -26,6 +26,7 @@ READ_AK/READ_SK (may only read).  Prints one PASS or FAIL line per assertion and
 """
 import hashlib
 import http.client
+import json
 import os
 import signal
 import socket
@@ -415,6 +416,29 @@ def mode_policy(dp):
     st, _, _ = raw(dp, "PUT", "/rdst-p/plain2", b"z", {"x-amz-replication-status": "PENDING"}, key=ADMIN)
     check("a status other than REPLICA is not taken from a client",
           st == 200 and status(dst, "rdst-p", "plain2") == "", status(dst, "rdst-p", "plain2"))
+    # A replica's status is honoured only for a user let replicate, and never past a Deny of the write it stands for.
+    dst.put_bucket_policy(Bucket="rdst-p", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::rdst-p/open/*"},
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::rdst-p/locked/*"}]}))
+    st, _, _ = raw(dp, "PUT", "/rdst-p/locked/a", b"z", {"x-amz-replication-status": "REPLICA"}, key=ADMIN)
+    check("a REPLICA status does not escape a Deny of PutObject", st == 403, st)
+    st, _, _ = raw(dp, "PUT", "/rdst-p/locked/b", b"z", {"x-amz-replication-status": "REPLICA"}, key=REPL)
+    check("not even for the replication user", st == 403, st)
+    pinned = "f" * 32
+    st, _, _ = raw(dp, "PUT", "/rdst-p/open/r", b"old", {"x-amz-replication-status": "REPLICA",
+                                                        "x-socketley-replica-version-id": pinned}, key=READ)
+    check("a user that may write and not replicate writes a plain object",
+          st == 200 and status(dst, "rdst-p", "open/r") == "", (st, status(dst, "rdst-p", "open/r")))
+    check("whose replica version id is not taken", pinned not in version_ids(dst, "rdst-p", "open/r")[0],
+          version_ids(dst, "rdst-p", "open/r"))
+    st, _, _ = raw(dp, "PUT", "/rdst-p/pin", b"old", {"x-amz-replication-status": "REPLICA",
+                                                     "x-socketley-replica-version-id": pinned}, key=REPL)
+    check("a replica dated past this clock is written", st == 200 and status(dst, "rdst-p", "pin") == "REPLICA", st)
+    check("under a version id of this endpoint's", pinned not in version_ids(dst, "rdst-p", "pin")[0],
+          version_ids(dst, "rdst-p", "pin"))
+    dst.put_object(Bucket="rdst-p", Key="pin", Body=b"new")
+    check("so a later write is still the latest", body(dst, "rdst-p", "pin") == b"new", body(dst, "rdst-p", "pin"))
+    dst.delete_bucket_policy(Bucket="rdst-p")
 
 
 # ── down ────────────────────────────────────────────────────────────────────

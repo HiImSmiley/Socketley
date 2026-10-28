@@ -122,10 +122,10 @@ void storage_run::replication_mark(std::string_view bucket, std::string_view key
         set_replication_status(m, replication_pending);
 }
 
-void storage_run::replica_source(const s3_request& r, object_meta& m)
+void storage_run::replica_source(const conn& c, object_meta& m)
 {
-    const std::string_view id = http_trim_ows(r.header(replica_version_header));
-    if (replica_request(r) && valid_version_id(id) && id != "null")
+    const std::string_view id = http_trim_ows(c.req.header(replica_version_header));
+    if (c.replica && valid_version_id(id) && id != "null")
         m.extra.emplace_back(std::string(replica_version_extra), std::string(id));
 }
 

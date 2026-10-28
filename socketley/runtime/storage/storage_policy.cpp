@@ -260,16 +260,18 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
             return;
     }
 
-    // A request that names a version is the version's own action, as S3 judges it, and a replica's write is a
-    // replication's.
-    s3_action plain = action_of_operation(operation_name(r));
-    if (replica_request(r) && (plain == s3_action::put_object || plain == s3_action::abort_multipart_upload))
-        plain = s3_action::replicate_object;
-    else if (replica_request(r) && plain == s3_action::delete_object && !r.key.empty())
-        plain = s3_action::replicate_delete;
-    else if (replica_request(r) && (plain == s3_action::put_object_tagging || plain == s3_action::delete_object_tagging))
-        plain = s3_action::replicate_tags;
+    // A request that names a version is the version's own action, as S3 judges it.
+    const s3_action plain = action_of_operation(operation_name(r));
     const s3_action action = r.has_query("versionId") ? version_action(plain) : plain;
+    s3_action as_replica = s3_action::none;
+    if (plain == s3_action::put_object || plain == s3_action::abort_multipart_upload)
+        as_replica = s3_action::replicate_object;
+    else if (plain == s3_action::delete_object && !r.key.empty())
+        as_replica = s3_action::replicate_delete;
+    else if (plain == s3_action::put_object_tagging || plain == s3_action::delete_object_tagging)
+        as_replica = s3_action::replicate_tags;
+    if (as_replica == s3_action::none)
+        c->replica = false;
 
     const request_context ctx(*c, u, v.anonymous, static_cast<int64_t>(m_store.now_ms()));
     policy_request pr;
@@ -325,6 +327,16 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     auto judge = [this, &c, u](std::string_view bucket, const policy_request& q) { return access_of(c, bucket, q, u); };
 
     policy_effect dest = judge(r.bucket, pr);
+    // A replica's write is a replication's only for a user let replicate the key, and is still refused by a Deny of
+    // the write it stands for; for anybody else it is that write, its status ignored.
+    if (c->replica)
+    {
+        policy_request rq = pr;
+        rq.action  = as_replica;
+        c->replica = dest != policy_effect::deny && judge(r.bucket, rq) == policy_effect::allow;
+        if (c->replica)
+            dest = policy_effect::allow;
+    }
     // An object's own grants are read where the object is, so a request its bucket does not admit waits for them.
     if (dest == policy_effect::none && !copy_from)
         if (const uint8_t need = object_acl_need(action);
