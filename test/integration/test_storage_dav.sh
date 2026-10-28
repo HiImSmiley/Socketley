@@ -12,6 +12,8 @@
 #   * a folder moved onto itself or into itself, which copied each object onto
 #     its own key and then removed it: every object in it gone
 #   * a user seeing or writing another user's bucket through the drive
+#   * a library deleted with its contents taking a file, and then itself,
+#     that a policy denies deleting
 #   * a versioned bucket's deleted file missing from its trash, or not brought
 #     back by a restore
 #   * the interface not served, or served without its content policy
@@ -453,6 +455,17 @@ check "nor is the owner shared its own" "$(acc "$A" ann read)" 400
 check "none takes it away" "$(acc "$A" ben none) $(code -u "$B" "$U/~dav/docs/a/one.txt") $(names "$B" "")" "204 403 "
 check "and leaves the rest of the policy as it was" "$(s3 "$U/docs?policy" | python3 -c 'import json,sys; print([x["Sid"] for x in json.load(sys.stdin)["Statement"]])')" "['mine']"
 s3 -o /dev/null -X DELETE "$U/docs?policy"; s3 -o /dev/null -X DELETE "$U/docs/secret/x.txt"
+
+# A library deleted with its contents loses each file only as a policy lets that file be deleted.
+check "MKCOL makes a library to delete" "$(code -u "$A" -X MKCOL "$U/~dav/purged/")" 201
+printf 'kept' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/purged/secret/x.txt"
+printf 'gone' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/purged/open.txt"
+s3 -o /dev/null -X PUT "$U/purged?policy" -d '{"Version":"2012-10-17","Statement":[{"Sid":"keep","Effect":"Deny","Principal":"*","Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":"arn:aws:s3:::purged/secret/*"}]}'
+check "deleted with its contents, it keeps a file the policy denies deleting, and itself" \
+      "$(code -u "$A" -X DELETE "$U/~dav/purged/?contents") $(curl -s -u "$A" "$U/~dav/purged/secret/x.txt")" "409 kept"
+s3 -o /dev/null -X DELETE "$U/purged?policy"
+check "and goes once the policy is taken away" \
+      "$(code -u "$A" -X DELETE "$U/~dav/purged/?contents") $(s3 -o /dev/null -w '%{http_code}' -I "$U/purged")" "204 404"
 
 # When and where photos were taken, from their EXIF: a JPEG's APP1, and a HEIF's Exif item past the first 64 KiB.
 python3 - "$T" <<'XEOF'

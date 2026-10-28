@@ -106,6 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   left out of the string to sign but read by the handler, so a presigned GET
   could be turned into a read of an old version or a `response-*` override,
   and a PUT into an ACL, tagging or part upload; it now breaks the signature.
+- **A library deleted with its contents is judged file by file.** `DELETE
+  /~dav/<bucket>/?contents` asked a policy only about the bucket and one key
+  standing for all, so a Deny on deleting a prefix's objects was passed over
+  and they went with the bucket; each version is now judged as its own
+  DeleteObjectVersion, and one refused keeps the library, answered 409.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

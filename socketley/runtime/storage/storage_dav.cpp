@@ -1327,8 +1327,15 @@ void storage_run::dav_purge(const std::shared_ptr<conn>& c, std::string bucket)
             raw->again = false;
             while (raw->inflight < 32 && raw->at < raw->items.size())
             {
-                ++raw->inflight;
                 const auto& [key, version] = raw->items[raw->at++];
+                // Each version is judged as its own DeleteObjectVersion is, since a policy may deny on a key in it.
+                if (const auto cc = raw->who.lock();
+                    !cc || cc->dead || !app_allowed(cc, "DELETE", raw->bucket, key, "versionId"))
+                {
+                    ++raw->failed;
+                    continue;
+                }
+                ++raw->inflight;
                 m_store.remove_version(raw->bucket, key, version,
                                        [this, raw, key = key, hold = raw->self.lock()](remove_result rr)
                 {
@@ -1359,7 +1366,7 @@ void storage_run::dav_purge(const std::shared_ptr<conn>& c, std::string bucket)
         if (raw->failed)
         {
             app_reply(cc, 409, std::to_string(raw->failed) + " of the library's files could not be removed; a file " +
-                                   "under retention or legal hold stays until it is released.\n");
+                                   "under retention or legal hold stays until it is released, and one a policy keeps stays.\n");
             return;
         }
         cc->on_answer = [this](const std::shared_ptr<conn>& c2, response& resp)
