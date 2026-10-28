@@ -534,7 +534,10 @@ if [ -n "$RCLONE" ] && [ -x "$RCLONE" ]; then
     mkdir -p "$T/tree/x/y" "$T/back"
     for i in 1 2 3; do head -c $((i * 70000)) /dev/urandom > "$T/tree/x/f$i"; done
     printf 'deep' > "$T/tree/x/y/deep.txt"
-    rc() { "$RCLONE" --config /dev/null --webdav-url "$U/~dav/" --webdav-vendor other --webdav-pacer-min-sleep 0.01ms --webdav-user "${A%%:*}" \
+    # The pacer is shortened for speed alone, by an rclone that has the flag; 1.60 has not.
+    PACER=()
+    "$RCLONE" help flags webdav 2>/dev/null | grep -q -- --webdav-pacer-min-sleep && PACER=(--webdav-pacer-min-sleep 0.01ms)
+    rc() { "$RCLONE" --config /dev/null --webdav-url "$U/~dav/" --webdav-vendor other "${PACER[@]}" --webdav-user "${A%%:*}" \
                      --webdav-pass "$("$RCLONE" obscure "${A#*:}")" "$@" 2>&1; }
     out=$(rc copy "$T/tree" :webdav:docs/tree); check "rclone copies a tree in" "$out" ""
     out=$(rc copy :webdav:docs/tree "$T/back"); check "and out" "$out" ""
