@@ -246,7 +246,7 @@ check "and only read" "$(code -X POST "$U/~ui/")" 405
 check "a path of no application is refused" "$(code "$U/~nope/")" 400
 # A browser typing the host alone would otherwise read an XML refusal, and find no way to the interface at all.
 # The code and the Location of a GET, as one line.
-sent() { curl -s -m 30 -o /dev/null -D - "$@" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^HTTP/{c=$2} /^location:/{l=$2} END{print l ? c " " l : c}'; }
+sent() { curl -s -m 30 -o /dev/null -D - "$@" | tr -d '\r' | awk '/^HTTP/{c=$2} tolower($1) == "location:"{l=$2} END{print l ? c " " l : c}'; }
 check "a browser at the root is sent to the interface" "$(sent -H 'Accept: text/html,application/xhtml+xml,*/*;q=0.8' "$U/")" "302 /~ui/"
 check "and so is its HEAD" "$(sent -I -H 'Accept: text/html' "$U/")" "302 /~ui/"
 check "a client asking for no HTML still gets S3" "$(sent "$U/")" 403
