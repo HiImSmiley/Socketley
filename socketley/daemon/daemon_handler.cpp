@@ -4699,6 +4699,8 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
         bool        http_cache{false};
         client_mode cmode{client_mode_inout};
         std::string target;
+        tunnel_instance::mode tmode{tunnel_instance::mode::edge};
+        std::string to, join, offers, forward, idp, idp_audience;
     } before;
 
     before.tls        = instance->get_tls();
@@ -4745,6 +4747,17 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
         before.cmode  = cli_b->get_mode();
         before.udp    = cli_b->is_udp();
         before.target = std::string(cli_b->get_target());
+    }
+    else if (type == runtime_tunnel)
+    {
+        const auto* tn_b = static_cast<const tunnel_instance*>(instance);
+        before.tmode        = tn_b->get_mode();
+        before.to           = std::string(tn_b->get_to());
+        before.join         = std::string(tn_b->get_join());
+        before.offers       = std::string(tn_b->get_offers());
+        before.forward      = std::string(tn_b->get_forward());
+        before.idp          = std::string(tn_b->get_idp());
+        before.idp_audience = std::string(tn_b->get_idp_audience());
     }
 
     const auto restore_edit = [&]
@@ -4793,6 +4806,17 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
             cli_r->set_mode(before.cmode);
             cli_r->set_udp(before.udp);
             cli_r->set_target(before.target);
+        }
+        else if (type == runtime_tunnel)
+        {
+            auto* tn_r = static_cast<tunnel_instance*>(instance);
+            tn_r->set_mode(before.tmode);
+            tn_r->set_to(before.to);
+            tn_r->set_join(before.join);
+            tn_r->set_offers(before.offers);
+            tn_r->set_forward(before.forward);
+            tn_r->set_idp(before.idp);
+            tn_r->set_idp_audience(before.idp_audience);
         }
     };
 

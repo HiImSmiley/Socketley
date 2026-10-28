@@ -11,6 +11,7 @@
 #   * a revoked agent still carried, or a service it never offered reached
 #   * a service's name not beside the edge's, or another runtime given a name a service has
 #   * an agent's offers that edit cannot change, or changes on a running agent that has not restarted
+#   * a tunnel edit refused on a later flag that leaves an earlier one in effect after --restart
 #   * the entrance's own address logged for who an agent or a person was
 #   * a TCP service given an address opened on every one, or not carried
 set -uo pipefail
@@ -158,6 +159,20 @@ out=$("$BIN" edit home --offer "web=127.0.0.1:$PB" 2>&1); rc=$?
 "$BIN" show home | grep -q "\"offer\": \"web=127.0.0.1:$PB,echo=127.0.0.1:$PX\"" && ok || bad "and the change is kept" "$("$BIN" show home | grep offer)"
 for _ in $(seq 1 80); do [ "$(curl -s -m 2 --unix-socket "$WEB" http://web/edited)" = "hello from home /edited" ] && break; sleep 0.1; done
 [ "$(curl -s -m 2 --unix-socket "$WEB" http://web/edited)" = "hello from home /edited" ] && ok || bad "with the agent back, its key kept" "$(tail -3 "$SOCKETLEY_DLOG")"
+
+# A tunnel edit refused on a later flag leaves the earlier ones unapplied, through --restart as without it.
+before=$("$BIN" show t)
+out=$("$BIN" edit t --forward 10.0.0.9:22 --mode bogus --restart 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"--mode requires edge or agent"*) true ;; *) false ;; esac && ok \
+    || bad "edit of an edge with a bad --mode is refused" "rc $rc: $out"
+[ "$("$BIN" show t)" = "$before" ] && ok || bad "and the edge's --forward is as it was" "$("$BIN" show t | grep -E 'forward|mode')"
+before=$("$BIN" show home)
+out=$("$BIN" edit home --offer "web=127.0.0.1:1" --to ftp://nowhere --restart 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"--to requires"*) true ;; *) false ;; esac && ok \
+    || bad "edit of an agent with a bad --to is refused" "rc $rc: $out"
+[ "$("$BIN" show home)" = "$before" ] && ok || bad "and what the agent offers is as it was" "$("$BIN" show home | grep -E 'offer|\"to\"')"
+for _ in $(seq 1 80); do [ "$(curl -s -m 2 --unix-socket "$WEB" http://web/refused)" = "hello from home /refused" ] && break; sleep 0.1; done
+[ "$(curl -s -m 2 --unix-socket "$WEB" http://web/refused)" = "hello from home /refused" ] && ok || bad "and the agent, restarted unchanged, still carries web" "$(tail -3 "$SOCKETLEY_DLOG")"
 
 # A second agent with the same invitation is refused, the first keeps its link.
 "$BIN" create tunnel thief --mode agent --to "http://127.0.0.1:$PE" --join "$INV" --offer "web=127.0.0.1:$PB" -s >/dev/null 2>&1

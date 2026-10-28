@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **A tunnel's settings by `edit`.** `socketley edit <agent> --offer ... --restart`
   changes what an agent offers, and so for every tunnel flag; without
   `--restart` a running tunnel says it needs one, where it said unknown flag.
+  An edit refused on any of its flags leaves every tunnel setting as it was,
+  and with `--restart` the tunnel starts again unchanged.
 - **Installed, and usable without sudo.** `scripts/install-from-source.sh`
   adds who runs it to the `socketley` group, so after logging in again
   `socketley` commands reach the daemon without `sudo`.
