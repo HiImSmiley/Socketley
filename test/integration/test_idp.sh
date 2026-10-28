@@ -15,6 +15,7 @@
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a return address a browser reads as another host's, by a backslash in its host
 #   * a sign-in or an account's change posted from another site's page
+#   * an e-mail a user gave themselves taken as vouched for, another account's, or able to split a line
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -250,6 +251,29 @@ if phase == "main":
     st, body, _ = req("POST", "/account", dict(name="Alice B", email="alice@example.com"), cookie=cookie)
     st, body, _ = req("GET", "/userinfo", headers={"Authorization": "Bearer " + rt.get("access_token", "")})
     check("a name changed on the account page is what userinfo says", json.loads(body).get("name") if st == 200 else st, "Alice B")
+    # An e-mail an admin gave is vouched for; one the holder gives themselves is not, nor may it be another's or no address.
+    check("an e-mail an admin gave is vouched for", json.loads(body).get("email_verified") if st == 200 else st, True)
+    dc = cookie_of(req("POST", "/login", dict(rd="/", username="dora", password="dorapassword1"))[2])
+    check("one may not give themselves another account's e-mail",
+          req("POST", "/account", dict(name="Dora", email="ALICE@example.com"), cookie=dc)[0], 400)
+    check("nor one whose name is another username on this provider's host",
+          req("POST", "/account", dict(name="Dora", email="carol@127.0.0.1"), cookie=dc)[0], 400)
+    for bad in ("dora@example.com\t9G", "dora@example.com\nx", "dora", "do ra@example.com"):
+        check("nor one that is no plain address: %r" % bad, req("POST", "/account", dict(name="Dora", email=bad), cookie=dc)[0], 400)
+    check("but one of their own", req("POST", "/account", dict(name="Dora", email="dora@else.example"), cookie=dc)[0], 200)
+    dcode = code_of(req("GET", "/authorize" + q(**dict(auth, scope="openid email")), cookie=dc)[2])[0].get("code")
+    st, body, _ = exchange(dcode)
+    try:
+        dt = verify(json.loads(body)["id_token"], "wiki")
+        check("which a token carries as not vouched for", (dt.get("email"), dt.get("email_verified")), ("dora@else.example", False))
+    except Exception as e:
+        check("which a token carries as not vouched for", repr(e), "")
+    try:
+        dsess = jwt.decode(cookie_of(req("POST", "/login", dict(rd="/", username="dora", password="dorapassword1"))[2]).split("=", 1)[1],
+                           options={"verify_signature": False})
+        check("and the session cookie, which a mail runtime trusts, does not name", (dsess.get("email"), dsess.get("email_verified")), ("", False))
+    except Exception as e:
+        check("and the session cookie does not name it", repr(e), "")
 
     # The imported storage user signs in with the password it had there.
     st, body, h = req("POST", "/login", dict(rd="/", username="dora", password="dorapassword1"))

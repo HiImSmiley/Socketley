@@ -597,10 +597,12 @@ std::string idp_run::session_cookie(const account& who, bool remember) const
 {
     const int64_t now = wall::now_sec();
     const int64_t life = remember ? remember_secs : session_secs;
-    // What a proxy or a storage verifying the cookie on its own needs: the id, the username and the admin bit.
+    // What a proxy or a storage verifying the cookie on its own needs: the id, the username, an e-mail this provider
+    // vouches for and the admin bit.
     const std::string body = "\"iss\":" + m_issuer_json + ",\"aud\":\"session\",\"sub\":" +
                              socketley::json::quote(who.id) + ",\"preferred_username\":" + socketley::json::quote(who.username()) +
-                             ",\"email\":" + socketley::json::quote(who.field("email")) + ",\"admin\":" +
+                             ",\"email\":" + socketley::json::quote(trusted_email(who)) + ",\"email_verified\":" +
+                             (email_trusted(who) ? "true" : "false") + ",\"admin\":" +
                              (who.in_group("admins") ? "true" : "false") + ",\"iat\":" + std::to_string(now) +
                              ",\"iat_ms\":" + std::to_string(wall::now_ms()) +
                              ",\"auth_time\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + life);
@@ -630,7 +632,7 @@ std::string idp_run::profile_claims(const account& who) const
     const std::string_view name = who.field("name").empty() ? who.username() : who.field("name");
     std::string out = ",\"name\":" + socketley::json::quote(name) + ",\"preferred_username\":" + socketley::json::quote(who.username());
     if (const std::string_view e = who.field("email"); !e.empty())
-        out += ",\"email\":" + socketley::json::quote(e);
+        out += ",\"email\":" + socketley::json::quote(e) + ",\"email_verified\":" + (email_trusted(who) ? "true" : "false");
     if (const std::string_view p = who.field("picture"); !p.empty())
         out += ",\"picture\":" + socketley::json::quote(p);
     std::string groups;
@@ -647,6 +649,50 @@ std::string idp_run::profile_claims(const account& who) const
     if (!groups.empty())
         out += ",\"groups\":[" + groups + "]";
     return out;
+}
+
+bool idp_run::own_domain(std::string_view domain) const
+{
+    std::string_view cookie = m_cookie_domain;
+    if (cookie.starts_with("."))
+        cookie.remove_prefix(1);
+    return socketley::ascii::iequals(domain, url_host(m_issuer)) || (!cookie.empty() && socketley::ascii::iequals(domain, cookie));
+}
+
+bool idp_run::email_trusted(const account& who) const
+{
+    const std::string_view e = who.field("email");
+    if (e.empty() || !email_problem(e).empty())
+        return false;
+    if (who.field("email_verified") == "1")
+        return true;
+    const size_t at = e.find('@');
+    return socketley::ascii::iequals(e.substr(0, at), who.username()) && own_domain(e.substr(at + 1));
+}
+
+std::string idp_run::self_email_problem(const account& who, std::string_view email) const
+{
+    if (std::string why = email_problem(email); !why.empty() || email.empty())
+        return why;
+    const size_t at = email.find('@');
+    const std::string_view domain = email.substr(at + 1);
+    // The name a mail runtime files the address under, its +tag aside.
+    const std::string_view base = email.substr(0, std::min(at, email.find('+')));
+    bool served = own_domain(domain);
+    for (const account* a : m_accounts.all())
+    {
+        if (a->id == who.id || !email_trusted(*a))
+            continue;
+        const std::string_view theirs = a->field("email");
+        if (socketley::ascii::iequals(theirs, email))
+            return "that address is another account's";
+        // A domain an admin gave an address in is one a mail runtime here may serve.
+        if (socketley::ascii::iequals(theirs.substr(theirs.find('@') + 1), domain))
+            served = true;
+    }
+    if (const account* a = served ? m_accounts.by_name(base) : nullptr; a && a->id != who.id)
+        return "that address is another account's";
+    return {};
 }
 
 std::string idp_run::clear_cookie() const
@@ -2038,6 +2084,24 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
         redirect(c, "/login?rd=" + url_encode("/account"));
         return;
     }
+    field_list fields;
+    if (rq.path != "/account/everywhere")
+    {
+        const params p = parse_form(rq.body);
+        const std::string email(http_trim_ows(param(p, "email")));
+        fields.emplace_back("name", std::string(param(p, "name")));
+        // An address its holder gives themselves is one nobody vouched for, and one left as it was stays as it was.
+        if (email != who->field("email"))
+        {
+            if (const std::string why = self_email_problem(*who, email); !why.empty())
+            {
+                account_page(c, rq, {}, why, 400);
+                return;
+            }
+            fields.emplace_back("email", email);
+            fields.emplace_back("email_verified", "");
+        }
+    }
     std::weak_ptr<conn> weak = c;
     c->waiting = true;
     if (rq.path == "/account/everywhere")
@@ -2061,9 +2125,7 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
         });
         return;
     }
-    const params p = parse_form(rq.body);
-    update_account(who->id, {{"name", std::string(param(p, "name"))}, {"email", std::string(param(p, "email"))}},
-                   [this, weak, rq](bool ok, const std::string& why)
+    update_account(who->id, std::move(fields), [this, weak, rq](bool ok, const std::string& why)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -2209,6 +2271,24 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
 namespace socketley::idp
 {
 
+namespace
+{
+
+// Why the e-mail an admin gives an account in `f` is no plain address; one that is is vouched for, unless `f` says.
+std::string admin_email(field_list& f)
+{
+    const auto e = std::find_if(f.begin(), f.end(), [](const auto& kv) { return kv.first == "email"; });
+    if (e == f.end())
+        return {};
+    if (std::string why = email_problem(e->second); !why.empty())
+        return why;
+    if (std::none_of(f.begin(), f.end(), [](const auto& kv) { return kv.first == "email_verified"; }))
+        f.emplace_back("email_verified", e->second.empty() ? "" : "1");
+    return {};
+}
+
+}   // namespace
+
 void idp_run::answer_command(uint64_t ticket, std::string_view text)
 {
     // A change a command made is said to the other shards before it is answered, so none answers from before it.
@@ -2274,7 +2354,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
     }
     const std::string user = args[1];
     // A mail runtime asking whether an address is a user's, and whether a password it was given is theirs: by the
-    // username, or the address being the account's email.
+    // username, the address being an e-mail this provider vouches for, or its name being a username.
     const auto named = [this](std::string_view name) -> const account* {
         if (const account* a = m_accounts.by_name(name))
             return a;
@@ -2282,7 +2362,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         if (at == std::string_view::npos)
             return nullptr;
         for (const account* a : m_accounts.all())
-            if (socketley::ascii::iequals(a->field("email"), name))
+            if (email_trusted(*a) && socketley::ascii::iequals(a->field("email"), name))
                 return a;
         return m_accounts.by_name(name.substr(0, at));
     };
@@ -2291,7 +2371,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         const account* who = named(user);
         // The user, the email and the mail quota a mail runtime keeps their mailbox within.
         answer_command(ticket, who && !who->disabled() ? "ok " + std::string(who->username()) + "\t" +
-                                                             std::string(who->field("email")) + "\t" +
+                                                             std::string(trusted_email(*who)) + "\t" +
                                                              std::string(who->field("mail_quota"))
                                                        : std::string("none"));
         return;
@@ -2302,7 +2382,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         if (who && who->disabled())
             who = nullptr;
         const std::string name = who ? std::string(who->username()) : std::string();
-        const std::string email = who ? std::string(who->field("email")) : std::string();
+        const std::string email = who ? std::string(trusted_email(*who)) : std::string();
         const std::string quota = who ? std::string(who->field("mail_quota")) : std::string();
         check_mail_password(who, args.size() > 2 ? args[2] : std::string(), [this, ticket, name, email, quota](bool ok) {
             answer_command(ticket, ok ? "ok " + name + "\t" + email + "\t" + quota : std::string("error: no"));
@@ -2356,6 +2436,11 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
                 answer_command(ticket, "error: the field " + k + " is set by the provider, not by --set");
                 return;
             }
+        if (const std::string why = admin_email(fields); !why.empty())
+        {
+            answer_command(ticket, "error: " + why);
+            return;
+        }
         if (m_accounts.by_name(user))
         {
             answer_command(ticket, "error: the username \"" + user + "\" is taken");
@@ -2569,6 +2654,11 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             answer_command(ticket, "error: set needs name=value");
             return;
         }
+        if (const std::string why = admin_email(f); !why.empty())
+        {
+            answer_command(ticket, "error: " + why);
+            return;
+        }
         apply(f, "");
         return;
     }
@@ -2638,7 +2728,8 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
                 if (v == "1")
                     f.emplace_back("groups", "admins");
             }
-            else if (k == "name" || k == "email" || k == "password" || k == "reset")
+            // A storage user's e-mail is taken as one nobody here vouched for.
+            else if (k == "name" || (k == "email" && email_problem(v).empty()) || k == "password" || k == "reset")
                 f.emplace_back(k, v);
         }
         fresh.push_back(std::move(f));

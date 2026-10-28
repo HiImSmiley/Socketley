@@ -183,7 +183,8 @@ void mailboxes::take_answer(std::string_view rest, known& k)
     const size_t a = rest.find('\t');
     k.user = std::string(rest.substr(0, a));
     const std::string_view after = a == std::string_view::npos ? std::string_view{} : rest.substr(a + 1);
-    const size_t b = after.find('\t');
+    // The quota is the last field, so an e-mail holding a tab cannot say what it is.
+    const size_t b = after.rfind('\t');
     k.email = std::string(after.substr(0, b));
     size_t q = 0;
     k.quota = b != std::string_view::npos && parse_size_suffix(after.substr(b + 1), q) ? q : 0;

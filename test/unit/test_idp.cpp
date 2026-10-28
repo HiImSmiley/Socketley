@@ -122,6 +122,29 @@ TEST_CASE("a form is taken from the provider's pages, a name under the cookie do
     CHECK_FALSE(form_origin_allowed("http://auth.example.com", iss, ""));
 }
 
+TEST_CASE("an e-mail address is a plain one, with nothing that would split a line or a field")
+{
+    CHECK(email_problem("").empty());
+    CHECK(email_problem("alice@example.com").empty());
+    CHECK(email_problem("a.b+tag_1@mail.example-x.co").empty());
+    CHECK(email_problem("root@localhost").empty());
+    CHECK_FALSE(email_problem("alice").empty());
+    CHECK_FALSE(email_problem("@example.com").empty());
+    CHECK_FALSE(email_problem("alice@").empty());
+    CHECK_FALSE(email_problem("a@b@example.com").empty());
+    CHECK_FALSE(email_problem("alice@example.com\t9G").empty());
+    CHECK_FALSE(email_problem("alice\n@example.com").empty());
+    CHECK_FALSE(email_problem("al ice@example.com").empty());
+    CHECK_FALSE(email_problem("\"a\"@example.com").empty());
+    CHECK_FALSE(email_problem(".alice@example.com").empty());
+    CHECK_FALSE(email_problem("a..b@example.com").empty());
+    CHECK_FALSE(email_problem("alice@example..com").empty());
+    CHECK_FALSE(email_problem("alice@-example.com").empty());
+    CHECK_FALSE(email_problem("alice@exa_mple.com").empty());
+    CHECK_FALSE(email_problem("al\xc3\xaf" "ce@example.com").empty());
+    CHECK_FALSE(email_problem(std::string(65, 'a') + "@example.com").empty());
+}
+
 TEST_CASE("a token verifies with its own key and fails every way it was not made")
 {
     EVP_PKEY* k = fresh_key();

@@ -189,6 +189,14 @@ private:
     void load_clients();
     // The profile claims every token of the account carries.
     std::string profile_claims(const account& who) const;
+    // Whether `who`'s e-mail is one an admin gave them, or their own username on a domain of this provider's: what a
+    // mail runtime, a proxy and a token's email_verified may take as theirs.
+    bool email_trusted(const account& who) const;
+    std::string_view trusted_email(const account& who) const { return email_trusted(who) ? who.field("email") : std::string_view{}; }
+    // Why `who` may not give themselves `email`: no plain address, or one another account has or could have.
+    std::string self_email_problem(const account& who, std::string_view email) const;
+    // Whether `domain` is this provider's host or its cookie domain.
+    bool own_domain(std::string_view domain) const;
     // Whether a token given at `issued`, in milliseconds, still holds: the account was not signed out everywhere since.
     static bool still_signed_in(const account& who, int64_t issued);
 

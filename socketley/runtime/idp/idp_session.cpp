@@ -99,7 +99,9 @@ bool session_verifier::verified(std::string_view token, bool bearer, int64_t now
                           "\" was refused; --idp-audience names the clients whose tokens this runtime takes").c_str());
             return false;
         }
-        out = who{c["sub"], c["preferred_username"], c["email"], c["admin"] == "true"};
+        // An e-mail the provider does not vouch for is anyone's to claim, so it is not taken as the user's.
+        out = who{c["sub"], c["preferred_username"], c["email_verified"] == "true" ? c["email"] : std::string(),
+                  c["admin"] == "true"};
         return true;
     }
     return false;

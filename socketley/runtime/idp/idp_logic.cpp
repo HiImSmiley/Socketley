@@ -1,5 +1,6 @@
 #include "idp_logic.h"
 
+#include <algorithm>
 #include <cctype>
 #include <charconv>
 
@@ -293,6 +294,32 @@ bool return_allowed(std::string_view url, std::string_view issuer, std::string_v
         domain.erase(0, 1);
     return host == domain || (host.size() > domain.size() && host.ends_with(domain) &&
                               host[host.size() - domain.size() - 1] == '.');
+}
+
+std::string email_problem(std::string_view email)
+{
+    if (email.empty())
+        return {};
+    const size_t at = email.find('@');
+    if (email.size() > 254 || at == std::string_view::npos || at == 0 || at > 64 || at + 1 == email.size())
+        return "an e-mail address is a name, an @ and a domain, at most 254 characters";
+    const std::string_view local = email.substr(0, at);
+    for (const char c : local)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && std::string_view("!#$%&'*+-/=?^_`{|}~.").find(c) == std::string_view::npos)
+            return "an e-mail address's name holds letters, digits and !#$%&'*+-/=?^_`{|}~. only";
+    if (local.front() == '.' || local.back() == '.' || local.find("..") != std::string_view::npos)
+        return "an e-mail address's name neither begins nor ends with a dot, nor has two together";
+    for (std::string_view rest = email.substr(at + 1);;)
+    {
+        const size_t dot = rest.find('.');
+        const std::string_view label = rest.substr(0, dot);
+        if (label.empty() || label.size() > 63 || label.front() == '-' || label.back() == '-' ||
+            std::any_of(label.begin(), label.end(), [](char c) { return !std::isalnum(static_cast<unsigned char>(c)) && c != '-'; }))
+            return "an e-mail address's domain is names of letters, digits and dashes between dots";
+        if (dot == std::string_view::npos)
+            return {};
+        rest.remove_prefix(dot + 1);
+    }
 }
 
 bool form_origin_allowed(std::string_view origin, std::string_view issuer, std::string_view cookie_domain)

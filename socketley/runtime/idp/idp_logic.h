@@ -83,6 +83,10 @@ bool return_allowed(std::string_view url, std::string_view issuer, std::string_v
 // else its Referer; true when it names none, as a client that is no browser sends neither.
 bool form_origin_allowed(std::string_view origin, std::string_view issuer, std::string_view cookie_domain);
 
+// Why `email` is no plain address, local@domain in ASCII without quotes, comments or control characters; empty when
+// it is one, or empty.
+std::string email_problem(std::string_view email);
+
 // A signed token's claims, read back: strings, numbers as their text, and booleans as "true" or "false".
 using claims = std::map<std::string, std::string, std::less<>>;
 

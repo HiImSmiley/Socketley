@@ -11,6 +11,7 @@
 #   * a DMARC reject taken, a quarantine put in the inbox
 #   * a message over a mebibyte stored cut, or not at all
 #   * an idp password not taken, a wrong one taken, or a user sending as another's address
+#   * an e-mail a user gave themselves at the idp taken as theirs to send from or sign in by, or taking another's
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -165,6 +166,43 @@ grep -l "alice sends" "$T"/sink/*.eml >/dev/null 2>&1 && ok "which is delivered"
 check "a wrong idp password is refused" "$(smtp "$SUB" alice@example.test dan@remote.test "$T/m5" alice wrong)" "auth 535"
 check "a user may not send as another's address" "$(smtp "$SUB" mallory@example.test dan@remote.test "$T/m5" alice alicepassword1)" "sender 553"
 check "nor as an address elsewhere" "$(smtp "$SUB" alice@other.test dan@remote.test "$T/m5" alice alicepassword1)" "sender 553"
+
+# ─── an address a user gave themselves at the idp ───────────────────────────
+for u in bob carl ceo; do "$BIN" idp-user auth add "$u" --password "${u}password123" >/dev/null 2>&1; done
+# A user signs in at the idp and sets their own e-mail there; the status of the save.
+self_email() {
+    python3 - "$PI" "$1" "$2" <<'PY' 2>&1 | tail -1
+import sys, urllib.request, urllib.parse, urllib.error
+I = "http://127.0.0.1:%s" % sys.argv[1]
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+op = urllib.request.build_opener(NoRedirect)
+def post(path, form, cookie=None):
+    r = urllib.request.Request(I + path, data=urllib.parse.urlencode(form).encode(), method="POST",
+                               headers={"Cookie": cookie} if cookie else {})
+    try:
+        with op.open(r) as resp:
+            return resp.status, resp.headers
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers
+_, h = post("/login", dict(rd="/", username=sys.argv[2], password=sys.argv[2] + "password123"))
+print(post("/account", dict(name=sys.argv[2], email=sys.argv[3]), (h.get("Set-Cookie") or "").split(";")[0])[0])
+PY
+}
+# A message from `$1`, so its header says the sender the envelope does.
+msg_from() { printf 'From: %s\r\nTo: dan@remote.test\r\nSubject: from %s\r\n\r\nhello\r\n' "$1" "$1" > "$T/from-$1"; echo "$T/from-$1"; }
+check "a user may not give themselves another account's address" "$(self_email bob alice@example.test)" "400"
+check "nor one a username here would have in a domain an admin gave an address in" "$(self_email carl ceo@example.test)" "400"
+check "but may give themselves one no account has" "$(self_email bob boss@example.test)" "200"
+check "which they may not send from" "$(smtp "$SUB" boss@example.test dan@remote.test "$(msg_from boss@example.test)" bob bobpassword123)" "sender 553"
+check "nor sign in by" "$(smtp "$SUB" bob@example.test dan@remote.test "$(msg_from bob@example.test)" boss@example.test bobpassword123)" "auth 535"
+check "the account an address names signs in by it" \
+    "$(smtp "$SUB" ceo@example.test dan@remote.test "$(msg_from ceo@example.test)" ceo@example.test ceopassword123)" "sent"
+check "and a user still sends from their own" "$(smtp "$SUB" bob@example.test dan@remote.test "$(msg_from bob@example.test)" bob bobpassword123)" "sent"
+"$BIN" idp-user auth set bob email=robert@example.test >/dev/null 2>&1
+check "and from one an admin gave them" \
+    "$(smtp "$SUB" robert@example.test dan@remote.test "$(msg_from robert@example.test)" bob bobpassword123)" "sent"
 
 for k in mail_stored mail_checked mail_dmarc_rejected mail_quarantined; do
     v=""

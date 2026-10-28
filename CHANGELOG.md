@@ -12,6 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **No user takes the buckets' default owner.** An invitation or CreateUser
   could make a user named `socketley`, the owner every bucket with none
   recorded belongs to, and so own all of them; the name is refused.
+- **An e-mail a user gives themselves is no longer taken as theirs.** The
+  account page saved any `email`, and a mail runtime let the user send from it
+  and sign in by it, so a user setting `ceo@<domain>` sent as the CEO. An
+  e-mail is now a plain address; one its holder sets may not be another
+  account's, nor `<another username>@` a domain of the provider's or one an
+  admin gave an address in; and only one an admin set with `idp-user`, or the
+  account's own `<username>@<issuer host or cookie domain>`, is vouched for:
+  only that one is in the session cookie, the mail runtime's answers and an
+  address's lookup, and tokens carry `email_verified`. An e-mail set before
+  this release is vouched for only once an admin sets it again with
+  `idp-user <idp> set <user> email=...`.
 - **A sign-in or an account's change posted from another site is refused.**
   POST /login, /authorize, /device and the /account forms answer 403 when
   Origin, or else Referer, names a page that is neither the provider's nor
