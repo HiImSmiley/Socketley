@@ -1,6 +1,7 @@
 #pragma once
 // A sign-in an idp runtime of this daemon gave, verified where it is used -- a proxy, a storage, the dashboard --
-// against the key the provider publishes beside its state, with no request to the provider.
+// against the key the provider publishes beside its state, with no request to the provider, and against its account's
+// standing published beside the key, so a sign-in the provider no longer holds is refused here as well.
 #include <optional>
 #include <cstdint>
 #include <memory>
@@ -40,6 +41,7 @@ public:
         std::string sub;
         std::string username;
         std::string email;
+        // From the account's groups as they are now, not as the token was signed.
         bool admin{false};
     };
 
@@ -58,6 +60,10 @@ public:
 
 private:
     void reload();
+    // The provider's standing file read again when it changed.
+    void reload_standing();
+    // The account's standing, the file looked at again for an id it does not hold, since one just made is new to it.
+    const standing* standing_of(const std::string& sub);
 
     std::string m_path;
     std::string m_issuer;
@@ -67,8 +73,14 @@ private:
     std::unique_ptr<socketley::storage::jwks_keys> m_keys;
     std::optional<socketley::file_stamp> m_stamp;
     int64_t m_checked{0};
+    // Every account's standing; empty, so every session is refused, until the file has been read once.
+    std::string m_standing_path;
+    standing_table m_standing;
+    std::optional<socketley::file_stamp> m_standing_stamp;
+    bool m_standing_read{false};
     bool verified(std::string_view token, bool bearer, int64_t now, who& out);
-    // Sessions already verified, so a signature is checked once a session and not once a request.
+    // Sessions already verified, so a signature is checked once a session and not once a request; the standing is
+    // looked up on every request, so a remembered session never outlives its account's sign-out.
     verified_tokens m_seen;
 };
 

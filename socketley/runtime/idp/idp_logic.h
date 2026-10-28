@@ -162,4 +162,29 @@ std::string sign_secret_token(std::string_view secret, std::string_view typ, std
 bool verify_secret_token(std::string_view secret, std::string_view typ, std::string_view issuer, std::string_view token,
                          int64_t now, claims& out, std::string& why);
 
+// When a token of this provider was given, to the millisecond its own claim says, or its iat's second.
+int64_t issued_ms(const claims& c);
+
+// An account's standing as the provider publishes it beside its key, for a runtime that verifies its sessions alone:
+// whether it is an admin, disabled or told to set its password again, and since when its sign-ins hold.
+struct standing
+{
+    int64_t revoked_before{0};
+    bool admin{false};
+    bool disabled{false};
+    bool reset{false};
+
+    // Whether a sign-in given at `issued` milliseconds still holds.
+    bool admits(int64_t issued) const { return !disabled && !reset && issued >= revoked_before; }
+};
+using standing_table = std::unordered_map<std::string, standing, string_hash, string_equal>;
+
+// The file's first line, which names its format.
+inline constexpr std::string_view standing_format = "socketley-idp-standing 1\n";
+
+// One account's line, `<id> <revoked_before> <flags>`, the flags `a` admin, `d` disabled and `r` reset, or `-`.
+void append_standing(std::string& out, std::string_view id, const standing& s);
+// The file whole, or false and `out` untouched when it is not one, so a reader keeps what it had.
+bool parse_standing(std::string_view text, standing_table& out);
+
 }   // namespace socketley::idp

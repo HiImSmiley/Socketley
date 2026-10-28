@@ -14,6 +14,11 @@ std::string idp_jwks_path(std::string_view runtime_name)
     return (socketley_paths::resolve().state_dir / "idp" / (std::string(runtime_name) + ".jwks")).string();
 }
 
+std::string idp_standing_path(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "idp" / (std::string(runtime_name) + ".standing")).string();
+}
+
 std::string idp_accounts_dir(std::string_view runtime_name)
 {
     return (socketley_paths::resolve().state_dir / "idp" / (std::string(runtime_name) + ".accounts")).string();

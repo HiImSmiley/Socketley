@@ -41,10 +41,14 @@ void session_verifier::configure(std::string_view idp_runtime, std::string_view 
             m_audiences.emplace_back(one);
     }
     m_path = idp_runtime.empty() ? std::string() : idp_jwks_path(idp_runtime);
+    m_standing_path = idp_runtime.empty() ? std::string() : idp_standing_path(idp_runtime);
     m_issuer.clear();
     m_keys.reset();
     m_stamp.reset();
     m_checked = 0;
+    m_standing.clear();
+    m_standing_stamp.reset();
+    m_standing_read = false;
     m_seen.clear();
 }
 
@@ -55,6 +59,7 @@ void session_verifier::reload()
     if (m_stamp && now == m_checked)
         return;
     m_checked = now;
+    reload_standing();
     const socketley::file_stamp stamp = socketley::file_stamp::of(m_path);
     if (stamp == m_stamp)
         return;
@@ -81,6 +86,35 @@ void session_verifier::reload()
     m_keys = std::move(keys);
 }
 
+void session_verifier::reload_standing()
+{
+    const socketley::file_stamp stamp = socketley::file_stamp::of(m_standing_path);
+    if (stamp == m_standing_stamp)
+        return;
+    m_standing_stamp = stamp;
+    std::string text;
+    // Kept as it was when unreadable, as the key is, since the provider only ever renames a whole file over it.
+    if (!socketley::read_whole_file(m_standing_path, text) || !parse_standing(text, m_standing))
+    {
+        if (!m_standing_read)
+            LOG_WARN(("idp: " + m_standing_path + " holds no accounts' standing yet; no session is taken until it does")
+                         .c_str());
+        return;
+    }
+    m_standing_read = true;
+}
+
+const standing* session_verifier::standing_of(const std::string& sub)
+{
+    auto it = m_standing.find(sub);
+    if (it == m_standing.end())
+    {
+        reload_standing();
+        it = m_standing.find(sub);
+    }
+    return it == m_standing.end() ? nullptr : &it->second;
+}
+
 bool session_verifier::verified(std::string_view token, bool bearer, int64_t now, who& out)
 {
     for (const auto& k : m_keys->keys)
@@ -99,9 +133,12 @@ bool session_verifier::verified(std::string_view token, bool bearer, int64_t now
                           "\" was refused; --idp-audience names the clients whose tokens this runtime takes").c_str());
             return false;
         }
+        // The token's signature says who; whether that sign-in still holds, and the admin bit, the account says now.
+        const standing* s = standing_of(c["sub"]);
+        if (!s || !s->admits(issued_ms(c)))
+            return false;
         // An e-mail the provider does not vouch for is anyone's to claim, so it is not taken as the user's.
-        out = who{c["sub"], c["preferred_username"], c["email_verified"] == "true" ? c["email"] : std::string(),
-                  c["admin"] == "true"};
+        out = who{c["sub"], c["preferred_username"], c["email_verified"] == "true" ? c["email"] : std::string(), s->admin};
         return true;
     }
     return false;

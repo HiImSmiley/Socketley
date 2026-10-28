@@ -59,6 +59,8 @@ public:
     // The journal written, by its inode, which a compaction changes; and its length, which every change grows.
     uint64_t journal_id() const { return m_journal_id; }
     uint64_t journal_end() const { return m_journal_end; }
+    // A count every change made or read adds to, so what is derived from the accounts is made again only after one.
+    uint64_t changes() const { return m_changes; }
 
     const account* by_id(std::string_view id) const;
     // By username, case aside.
@@ -102,6 +104,7 @@ private:
     uint64_t m_journal_records{0};
     uint64_t m_journal_id{0};
     uint64_t m_journal_end{0};
+    uint64_t m_changes{0};
     bool m_following{false};
     int m_follow_fd{-1};
     uint64_t m_follow_off{0};

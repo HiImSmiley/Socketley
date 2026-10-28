@@ -20,6 +20,8 @@
 #   * a return address a browser reads as another host's, by a backslash in its host
 #   * a sign-in or an account's change posted from another site's page
 #   * an e-mail a user gave themselves taken as vouched for, another account's, or able to split a line
+#   * one of them still taking a cookie of an account disabled, removed, signed out everywhere or made to reset since,
+#     or the admin bit of one taken out of admins since; or a code given before a sign-out redeemed after it
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -101,6 +103,11 @@ out=$("$BIN" idp-user auth add eve --password short 2>&1); rc=$?
 SHOW=$("$BIN" idp-user auth show alice 2>&1)
 case "$SHOW" in *"game.class: mage"*"password: (set)"*) ok ;; *) bad "show lists the fields, the password as set and not its hash" "$SHOW" ;; esac
 case "$SHOW" in *'$scrypt$'*) bad "show never prints the hash" "$SHOW" ;; *) ok ;; esac
+# Accounts the command line changes after the first checks, each signed in before it does.
+for u in frank gina hank; do
+    g=; [ "$u" = frank ] && g="--groups admins"
+    "$BIN" idp-user auth add "$u" --password "${u}password1" $g >/dev/null 2>&1 || bad "$u is made" "rc $?"
+done
 LIST=$("$BIN" idp-user auth list 2>&1)
 case "$LIST" in alice*carol*) ok ;; *) bad "list names every account" "$LIST" ;; esac
 out=$("$BIN" idp-user nosuch list 2>&1); rc=$?
@@ -352,11 +359,48 @@ if phase == "main":
     s = json.loads(at(M, "GET", "/api/session", cookie=dora)[1])
     check("but not an account that is no admin", s.get("user"), None)
 
+    # Sign-ins the command line takes back, or takes the admin bit of, before the next phase.
+    signed = lambda u: cookie_of(req("POST", "/login", dict(rd="/", username=u, password=u + "password1"))[2])
+    later = {u: signed(u) for u in ("carol", "frank", "gina", "hank")}
+    check("another admin takes the dashboard", json.loads(at(M, "GET", "/api/session", cookie=later["frank"])[1]).get("user"), "frank")
+    check("and every one of them the proxy, before the command line changes them",
+          [at(P, "GET", "/gate/who", cookie=c)[0] for c in later.values()], [200] * 4)
+    check("alice's sign-in reaches the proxy too", at(P, "GET", "/gate/who", cookie=cookie)[0], 200)
+    later_code = code_of(req("GET", "/authorize" + q(**dict(auth, state="later")), cookie=cookie)[2])[0].get("code", "")
+
     json.dump({"kid": k["kid"], "id_token": t.get("id_token", ""), "cookie": cookie, "refresh": rt.get("refresh_token", ""),
-               "dora": dora}, open(state_file, "w"))
+               "dora": dora, "later": later, "later_code": later_code}, open(state_file, "w"))
 
 elif phase == "after_cli":
     s = json.load(open(state_file))
+    # What the command line took back is refused where the sign-in is verified without asking the idp, which reads
+    # the accounts' standing again once a second.
+    def eventually(fn, want):
+        end = time.time() + 3
+        got = fn()
+        while got != want and time.time() < end:
+            time.sleep(0.1)
+            got = fn()
+        return got
+    P, S, M = ("http://127.0.0.1:%s" % x for x in (pp, ps, pm))
+    gate = lambda c: at(P, "GET", "/gate/who", headers={"Accept": "application/json"}, cookie=c)[0]
+    store = lambda c: at(S, "GET", "/~ui/session", headers={"X-Socketley-UI": "1"}, cookie=c)[0]
+    board = lambda c: json.loads(at(M, "GET", "/api/session", cookie=c)[1]).get("user")
+    later = s["later"]
+    check("the proxy refuses a cookie from before its account was signed out everywhere", eventually(lambda: gate(s["cookie"]), 401), 401)
+    check("and the dashboard takes it for no admin", eventually(lambda: board(s["cookie"]), None), None)
+    check("the storage refuses one from before its account was signed out everywhere", eventually(lambda: store(s["dora"]), 401), 401)
+    check("the proxy refuses a disabled account's cookie", eventually(lambda: gate(later["carol"]), 401), 401)
+    check("and a removed account's", eventually(lambda: gate(later["hank"]), 401), 401)
+    check("and that of an account made to set its password again", eventually(lambda: gate(later["gina"]), 401), 401)
+    st, _, h = req("GET", "/account", cookie=later["gina"])
+    check("as the idp's own pages do", (st, (h.get("Location") or "").startswith("/login")), (302, True))
+    check("an admin taken out of admins is no admin at the dashboard", eventually(lambda: board(later["frank"]), None), None)
+    check("but still signed in at the proxy", gate(later["frank"]), 200)
+    st, body, _ = exchange(s["later_code"])
+    check("a code given before its account was signed out everywhere is redeemed for nothing", (st, json.loads(body).get("error")), (400, "invalid_grant"))
+    dora = cookie_of(req("POST", "/login", dict(rd="/", username="dora", password="dorapassword1"))[2])
+    check("a sign-in after the sign-out is taken at the proxy and the storage", (gate(dora), store(dora)), (200, 200))
     check("a disabled account cannot sign in", req("POST", "/login", dict(rd="/", username="carol", password="carolpassword1"))[0], 401)
     st, body, _ = req("POST", "/token", dict(grant_type="refresh_token", refresh_token=s["refresh"], client_id="spa"))
     check("an account signed out everywhere refreshes into nothing", (st, json.loads(body).get("error")), (400, "invalid_grant"))
@@ -511,6 +555,10 @@ tally < <(run main)
 "$BIN" idp-user auth disable carol >/dev/null 2>&1 && ok || bad "disable takes" "rc $?"
 "$BIN" idp-user auth logout alice >/dev/null 2>&1 && ok || bad "logout takes" "rc $?"
 "$BIN" idp-user auth passwd alice --password tempPassword99 --reset >/dev/null 2>&1 && ok || bad "passwd --reset takes" "rc $?"
+"$BIN" idp-user auth logout dora >/dev/null 2>&1 && ok || bad "logout takes dora" "rc $?"
+"$BIN" idp-user auth set frank groups=staff >/dev/null 2>&1 && ok || bad "set takes frank out of admins" "rc $?"
+"$BIN" idp-user auth set gina reset=1 >/dev/null 2>&1 && ok || bad "set makes gina's password one to set again" "rc $?"
+"$BIN" idp-user auth remove hank >/dev/null 2>&1 && ok || bad "remove takes hank" "rc $?"
 # An account with a second step whose password must be set again, its key kept for the checks to make codes.
 "$BIN" idp-user auth add erin --password erinpassword1 >/dev/null 2>&1
 "$BIN" idp-user auth totp erin on 2>&1 | sed -n 's/^key: //p' > "$T/erin.key"
@@ -553,7 +601,7 @@ expect "but to one under the cookie domain" \
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
 STATS=$("$BIN" stats auth 2>/dev/null)
-case "$STATS" in *"accounts:9"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+case "$STATS" in *"accounts:12"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]

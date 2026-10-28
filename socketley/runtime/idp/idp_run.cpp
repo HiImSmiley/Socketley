@@ -102,13 +102,6 @@ int64_t claim_int(const claims& c, std::string_view k)
     return out;
 }
 
-// When a token of this provider was given, to the millisecond its own claim says, or its iat's second.
-int64_t issued_ms(const claims& c)
-{
-    const int64_t ms = claim_int(c, "iat_ms");
-    return ms ? ms : claim_int(c, "iat") * 1000;
-}
-
 // A refresh token family's field read: the generation its newest token is, and when the family ends.
 bool read_family(std::string_view v, uint64_t& generation, int64_t& expires)
 {
@@ -255,6 +248,12 @@ bool idp_run::start(std::string& why)
     if (!(m_reader ? m_accounts.follow_open(idp_accounts_dir(m_owner.get_name()), why)
                    : m_accounts.open(idp_accounts_dir(m_owner.get_name()), why)))
         return false;
+    // The accounts' standing beside the key, before any session is signed, so a proxy never verifies one without it.
+    if (!publish_standing())
+    {
+        why = "the accounts' standing could not be written to " + idp_standing_path(m_owner.get_name());
+        return false;
+    }
     publish_accounts();
     // Password hashes are made and checked off the loop, which an scrypt would hold for tens of milliseconds.
     m_loop.register_owner(this);
@@ -628,7 +627,7 @@ const account* idp_run::session_of(const request& rq, int64_t* auth_time) const
         if (!m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, v, now, c, why) || claim(c, "aud") != "session")
             return false;
         const account* a = m_accounts.by_id(claim(c, "sub"));
-        if (a && !a->disabled() && still_signed_in(*a, issued_ms(c)))
+        if (a && !a->disabled() && a->field("reset") != "1" && still_signed_in(*a, issued_ms(c)))
         {
             found = a;
             if (auth_time)
@@ -1305,6 +1304,7 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
     e.challenge.assign(param(p, "code_challenge"));
     const int64_t now = wall::now_sec();
     e.auth_time = auth_time ? auth_time : now;
+    e.issued_ms = wall::now_ms();
     e.expires = now + code_secs;
     // Named by the shard that keeps it, which the exchange is taken to.
     const std::string token = random_b64url(32);
@@ -2074,6 +2074,7 @@ bool idp_run::decide_device(const std::string& user_code, bool allow, const std:
     d->second.state = allow ? device_entry::approved : device_entry::denied;
     d->second.sub = sub;
     d->second.auth_time = at;
+    d->second.issued_ms = wall::now_ms();
     // A decided code is decided once, and no second person can take it over.
     m_user_codes.erase(u);
     return true;
@@ -2166,8 +2167,10 @@ void idp_run::device_answered(const std::shared_ptr<conn>& c, const client& cl, 
         case device_poll::approved:
             break;
     }
+    // The account is looked at again, so one disabled, made to reset its password or signed out everywhere since
+    // the person allowed the code gets nothing.
     const account* who = m_accounts.by_id(e.sub);
-    if (!who || who->disabled() || !still_signed_in(*who, e.auth_time * 1000))
+    if (!who || who->disabled() || who->field("reset") == "1" || !still_signed_in(*who, e.issued_ms))
     {
         json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
         return;
@@ -2198,8 +2201,9 @@ void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const p
         json_error(c, 400, "invalid_grant", "the code verifier does not match the challenge");
         return;
     }
+    // As for a device, a code given before the account was disabled, made to reset or signed out everywhere is void.
     const account* who = m_accounts.by_id(e.sub);
-    if (!who || who->disabled())
+    if (!who || who->disabled() || who->field("reset") == "1" || !still_signed_in(*who, e.issued_ms))
     {
         json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
         return;
@@ -3194,8 +3198,43 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
 
 // ─── Shards ─────────────────────────────────────────────────────────────────
 
+bool idp_run::publish_standing()
+{
+    if (m_reader || m_accounts.changes() == m_standing_at)
+        return true;
+    std::string doc(standing_format);
+    for (const account* a : m_accounts.all())
+    {
+        // An id a line cannot hold is left out, so its sessions are refused rather than misread.
+        if (a->id.find_first_of(" \t\r\n") != std::string::npos)
+            continue;
+        standing s;
+        const std::string_view before = a->field("revoked_before");
+        std::from_chars(before.data(), before.data() + before.size(), s.revoked_before);
+        s.admin = a->in_group("admins");
+        s.disabled = a->disabled();
+        s.reset = a->field("reset") == "1";
+        append_standing(doc, a->id, s);
+    }
+    if (doc != m_standing)
+    {
+        // Synced, since a crash that brought back the file before a sign-out would let its sessions in again.
+        std::string why;
+        const std::string path = idp_standing_path(m_owner.get_name());
+        if (!replace_file(path, doc, durability::data_and_dir, &why))
+        {
+            LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + path + " could not be written: " + why).c_str());
+            return false;
+        }
+        m_standing = std::move(doc);
+    }
+    m_standing_at = m_accounts.changes();
+    return true;
+}
+
 void idp_run::publish_accounts()
 {
+    publish_standing();
     if (m_shards <= 1 || m_reader)
         return;
     const uint64_t id = m_accounts.journal_id(), end = m_accounts.journal_end();

@@ -46,12 +46,15 @@ for p in "$P1" "$P4"; do
 done
 ALICE1=$("$BIN" idp-user one add alice --password alicepassword1 2>&1) || bad "an account is made at one" "$ALICE1"
 ALICE4=$("$BIN" idp-user four add alice --password alicepassword1 2>&1) || bad "an account is made at four" "$ALICE4"
+for r in one four; do
+    "$BIN" idp-user "$r" add bob --password bobpassword12 >/dev/null 2>&1 || bad "bob is made at $r" "rc $?"
+done
 
 run() {
-    python3 - "$1" "$2" "$3" 2>&1 <<'PY' || echo "bad the checks against $1 ran to their end"
-import sys, json, re, time, urllib.request, urllib.error, urllib.parse
+    python3 - "$1" "$2" "$3" "$BIN" "$4" 2>&1 <<'PY' || echo "bad the checks against $1 ran to their end"
+import sys, json, re, time, subprocess, urllib.request, urllib.error, urllib.parse
 import jwt
-port, alice_id, grants = sys.argv[1], sys.argv[2], int(sys.argv[3])
+port, alice_id, grants, bin_, runtime = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 I = "http://127.0.0.1:%s" % port
 def check(name, got, want):
     print(("ok " if got == want else "bad ") + name + ("" if got == want else ": got %r, want %r" % (got, want)))
@@ -146,6 +149,15 @@ check("a code nobody was given is not known", (st, "not known" in body), (400, T
 st, body, _ = req("POST", "/device", {"user_code": "AEIO-0000", "action": "allow"}, cookie=cookie)
 check("nor is one of letters a code never has", (st, "not known" in body), (400, True))
 
+# A device bob allowed, after which bob must set a new password: it gets nothing until bob has.
+bobs = start()[1]
+st, body, h = req("POST", "/login", {"username": "bob", "password": "bobpassword12", "rd": "/device"})
+bob = (h.get("Set-Cookie") or "").split(";")[0]
+st, body, _ = req("POST", "/device", {"user_code": bobs["user_code"], "action": "allow"}, cookie=bob)
+check("bob allows a device", (st, "signed in" in body), (200, True))
+check("and bob is then made to set a new password",
+      subprocess.run([bin_, "idp-user", runtime, "set", "bob", "reset=1"], capture_output=True).returncode, 0)
+
 # Past the slow-down the first device was given: five seconds and five more.
 time.sleep(10.5)
 st, r = poll(a["device_code"])
@@ -162,6 +174,8 @@ for o in others:
     check("every other allowed device gets its tokens", (st, "access_token" in r), (200, True))
 st, r = poll(refused["device_code"])
 check("the refused device is told so", (st, r.get("error")), (400, "access_denied"))
+st, r = poll(bobs["device_code"])
+check("a device allowed by an account made to reset since gets no token", (st, r.get("error")), (400, "invalid_grant"))
 
 # Secrets guessed from one address bar it, and the bar does not reach another address.
 far = {"X-Forwarded-For": "203.0.113.9"}
@@ -177,8 +191,8 @@ check("while another address is not barred", st, 400)
 PY
 }
 
-tally < <(run "$P1" "$ALICE1" 2)
-tally < <(run "$P4" "$ALICE4" 8)
+tally < <(run "$P1" "$ALICE1" 2 one)
+tally < <(run "$P4" "$ALICE4" 8 four)
 
 # ── socketley login, the device grant from the command line ─────────────────
 export XDG_CONFIG_HOME="$T/config"

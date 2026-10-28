@@ -11,6 +11,7 @@
 #   * one code of the second step signing in once at each shard
 #   * one refresh token refreshing once at each shard
 #   * the accounts or the key lost when the runtime restarts with another number of shards
+#   * a sign-out everywhere at a reading shard, or an account disabled, not reaching a proxy that verifies sessions alone
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -32,6 +33,7 @@ echo "=== Integration: an idp runtime of several shards, one writing the account
 daemon_isolate idpshards
 T=$SOCKETLEY_TMPD
 PI=$((SL_PORT_BASE + 1995))
+PG=$((SL_PORT_BASE + 1996))
 trap 'daemon_stop' EXIT
 daemon_start "$BIN"
 
@@ -49,12 +51,15 @@ expect "and three read them" "$(echo "$s" | grep -c '^role:reader$')" 3
 ALICE=$("$BIN" idp-user auth add alice --password alicepassword1 --name "Alice A" 2>&1) \
     && ok || bad "an account is made at shard 0" "$ALICE"
 "$BIN" idp-user auth add bob --password bobpassword12 >/dev/null 2>&1 && ok || bad "and another" "rc $?"
+# A proxy whose backend is nobody: a sign-in it takes is told 502 there, one it refuses 401.
+"$BIN" create proxy gate -p "$PG" --backend "127.0.0.1:9" --auth idp:auth -s >/dev/null 2>&1 \
+    && ok || bad "a proxy taking the idp's sign-in is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 
 run() {
-    python3 - "$PI" "$1" "$T" "$ALICE" 2>&1 <<'PY' || echo "bad the $1 checks ran to their end"
-import sys, json, base64, http.client, urllib.request, urllib.error, urllib.parse
+    python3 - "$PI" "$1" "$T" "$ALICE" "$PG" 2>&1 <<'PY' || echo "bad the $1 checks ran to their end"
+import sys, json, time, base64, http.client, urllib.request, urllib.error, urllib.parse
 import jwt
-pi, phase, tmpd, alice_id = sys.argv[1:5]
+pi, phase, tmpd, alice_id, pg = sys.argv[1:6]
 I = "http://127.0.0.1:%s" % pi
 CB = "http://127.0.0.1:9/cb"
 def check(name, got, want):
@@ -94,6 +99,21 @@ def userinfo(tok):
 def keys():
     jw = json.loads(req("GET", "/jwks")[1])
     return {k["kid"]: jwt.algorithms.ECAlgorithm.from_jwk(json.dumps(k)) for k in jw["keys"]}
+def gate(cookie):
+    r = urllib.request.Request("http://127.0.0.1:%s/gate/x" % pg, headers={"Accept": "application/json", "Cookie": cookie})
+    try:
+        with op.open(r, timeout=10) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+def eventually(fn, want):
+    # The proxy reads the accounts' standing again once a second.
+    end = time.time() + 3
+    got = fn()
+    while got != want and time.time() < end:
+        time.sleep(0.1)
+        got = fn()
+    return got
 state_file = tmpd + "/py.json"
 
 if phase == "main":
@@ -124,6 +144,14 @@ if phase == "main":
     check("a forged code is known nowhere", exchange("2.forged")[0], 400)
     check("nor one naming a shard there is none of", exchange("9.forged")[0], 400)
     check("every shard answers userinfo", [userinfo(tokens[i]["access_token"]) for i in range(12)], ["Alice A"] * 12)
+    check("the proxy takes the sign-in", gate(cookie), 502)
+
+    # Bob signs out everywhere at whichever shard; a session bob had from before is refused at the proxy.
+    bobs = [cookie_of(req("POST", "/login", dict(rd="/", username="bob", password="bobpassword12"))[2]) for _ in range(2)]
+    check("the proxy takes both of bob's sign-ins", [gate(b) for b in bobs], [502, 502])
+    st, body, _ = req("POST", "/account/everywhere", {}, cookie=bobs[1])
+    check("bob signs out everywhere", st, 200)
+    check("and the other one is refused at the proxy", eventually(lambda: gate(bobs[0]), 401), 401)
 
     # Changed on the account page, at whichever shard; every shard answers with the change at once.
     for n in range(8):
@@ -203,6 +231,7 @@ elif phase == "after_logout":
     check("an account disabled with idp-user is refused at every shard at once", [userinfo(s["access"]) for _ in range(8)], [401] * 8)
     st, body, _ = req("POST", "/token", dict(grant_type="refresh_token", refresh_token=s["refresh"]), BASIC)
     check("and refreshes into nothing", st, 400)
+    check("and its session at the proxy", eventually(lambda: gate(s["cookie"]), 401), 401)
 
 elif phase == "restarted":
     s = json.load(open(state_file))

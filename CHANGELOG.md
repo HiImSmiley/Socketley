@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **An account's sign-ins end everywhere when it does.** Disabling an account,
+  signing it out everywhere, a new password, a reset or removal from `admins`
+  now ends its cookies and tokens at every runtime that takes the idp's
+  sign-ins (proxies, storage, the dashboard, tunnel edges) within a second,
+  where they held until they ran out, up to 30 days; the admin bit is the
+  account's now, not the one the cookie was signed with.
 - **No user takes the buckets' default owner.** An invitation or CreateUser
   could make a user named `socketley`, the owner every bucket with none
   recorded belongs to, and so own all of them; the name is refused.

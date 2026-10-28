@@ -24,6 +24,8 @@ struct code_entry
     std::string scope;
     std::string challenge;
     int64_t auth_time{0};
+    // When the code was given, in milliseconds, for a sign-out everywhere since.
+    int64_t issued_ms{0};
     int64_t expires{0};
 };
 
@@ -42,6 +44,8 @@ struct device_entry
     std::string sub;
     state_t state{pending};
     int64_t auth_time{0};
+    // When the person decided, in milliseconds, for a sign-out everywhere since.
+    int64_t issued_ms{0};
     int64_t expires{0};
     // When the device may ask again without being told to slow down.
     int64_t next_poll{0};

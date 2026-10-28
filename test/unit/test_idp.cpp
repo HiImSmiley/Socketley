@@ -485,14 +485,26 @@ TEST_CASE("the shards' questions and answers come back as they were sent")
     CHECK_FALSE(decode_call("not a call", d));
     CHECK_FALSE(decode_call(encode_call(c).substr(0, cross_marker.size() + 3), d));
 
-    code_entry e{"wiki", "http://x/cb", "sub", "n", "openid", "chal", 10, 20};
+    code_entry e{"wiki", "http://x/cb", "sub", "n", "openid", "chal", 10, 10500, 20};
     bool found = false;
     code_entry f;
     REQUIRE(decode_code(encode_code(&e), found, f));
     CHECK(found);
     CHECK(f.redirect == "http://x/cb");
     CHECK(f.challenge == "chal");
+    CHECK(f.issued_ms == 10500);
     CHECK(f.expires == 20);
+
+    device_entry de;
+    de.sub = "sub";
+    de.auth_time = 7;
+    de.issued_ms = 7250;
+    device_entry df;
+    device_poll what = device_poll::gone;
+    REQUIRE(decode_device(encode_device(device_poll::approved, &de), what, df));
+    CHECK(what == device_poll::approved);
+    CHECK(df.auth_time == 7);
+    CHECK(df.issued_ms == 7250);
     REQUIRE(decode_code(encode_code(nullptr), found, f));
     CHECK_FALSE(found);
 
@@ -509,6 +521,40 @@ TEST_CASE("the shards' questions and answers come back as they were sent")
     CHECK_FALSE(code_shard("abcdef", 4, shard));
     CHECK_FALSE(code_shard("1.abcdef", 1, shard));
     CHECK_FALSE(code_shard("x.abcdef", 4, shard));
+}
+
+TEST_CASE("an account's standing is read back as it was written, and a file cut short is not read at all")
+{
+    std::string doc(standing_format);
+    append_standing(doc, "id-a", standing{0, true, false, false});
+    append_standing(doc, "id-b", standing{1700000000123, false, true, true});
+    append_standing(doc, "id-c", standing{});
+    standing_table t;
+    REQUIRE(parse_standing(doc, t));
+    REQUIRE(t.size() == 3);
+    CHECK(t.at("id-a").admin);
+    CHECK(t.at("id-a").admits(1));
+    CHECK(t.at("id-b").revoked_before == 1700000000123);
+    CHECK(t.at("id-b").disabled);
+    CHECK(t.at("id-b").reset);
+    CHECK_FALSE(t.at("id-b").admits(1800000000000));
+    CHECK_FALSE(t.at("id-c").admin);
+
+    standing_table kept{{"old", standing{}}};
+    CHECK_FALSE(parse_standing(doc.substr(0, doc.size() - 1), kept));
+    CHECK_FALSE(parse_standing("not the format\n", kept));
+    CHECK_FALSE(parse_standing(std::string(standing_format) + "id 12x -\n", kept));
+    CHECK_FALSE(parse_standing(std::string(standing_format) + "id 12 q\n", kept));
+    CHECK(kept.size() == 1);
+    REQUIRE(parse_standing(standing_format, kept));
+    CHECK(kept.empty());
+
+    standing s;
+    s.revoked_before = 5000;
+    CHECK_FALSE(s.admits(4999));
+    CHECK(s.admits(5000));
+    CHECK(issued_ms(claims{{"iat", "4"}, {"iat_ms", "4999"}}) == 4999);
+    CHECK(issued_ms(claims{{"iat", "4"}}) == 4000);
 }
 
 TEST_CASE("signing with one key, then another, then the first, signs each with its own")

@@ -114,6 +114,7 @@ void account_store::unindex(const account& a)
 
 bool account_store::apply(std::string_view record)
 {
+    ++m_changes;
     socketley::bytes::reader r(record);
     uint8_t op = 0;
     std::string id;

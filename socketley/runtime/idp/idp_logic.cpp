@@ -626,4 +626,70 @@ void attempt_limits::age(int64_t now)
     }
 }
 
+int64_t issued_ms(const claims& c)
+{
+    const auto read = [&](std::string_view k) {
+        int64_t v = 0;
+        if (const auto it = c.find(k); it != c.end())
+            std::from_chars(it->second.data(), it->second.data() + it->second.size(), v);
+        return v;
+    };
+    const int64_t ms = read("iat_ms");
+    return ms ? ms : read("iat") * 1000;
+}
+
+void append_standing(std::string& out, std::string_view id, const standing& s)
+{
+    out.append(id).append(" ").append(std::to_string(s.revoked_before)).append(" ");
+    const size_t flags = out.size();
+    if (s.admin)
+        out += 'a';
+    if (s.disabled)
+        out += 'd';
+    if (s.reset)
+        out += 'r';
+    if (out.size() == flags)
+        out += '-';
+    out += '\n';
+}
+
+bool parse_standing(std::string_view text, standing_table& out)
+{
+    if (!text.starts_with(standing_format))
+        return false;
+    text.remove_prefix(standing_format.size());
+    standing_table read;
+    while (!text.empty())
+    {
+        const size_t nl = text.find('\n');
+        // A line cut short is a file being written, which a rename never shows, so the whole is refused.
+        if (nl == std::string_view::npos)
+            return false;
+        const std::string_view line = text.substr(0, nl);
+        text.remove_prefix(nl + 1);
+        const size_t a = line.find(' ');
+        const size_t b = a == std::string_view::npos ? a : line.find(' ', a + 1);
+        if (b == std::string_view::npos || a == 0)
+            return false;
+        standing s;
+        const auto [end, ec] = std::from_chars(line.data() + a + 1, line.data() + b, s.revoked_before);
+        if (ec != std::errc{} || end != line.data() + b)
+            return false;
+        for (const char f : line.substr(b + 1))
+        {
+            if (f == 'a')
+                s.admin = true;
+            else if (f == 'd')
+                s.disabled = true;
+            else if (f == 'r')
+                s.reset = true;
+            else if (f != '-')
+                return false;
+        }
+        read.insert_or_assign(std::string(line.substr(0, a)), s);
+    }
+    out = std::move(read);
+    return true;
+}
+
 }   // namespace socketley::idp

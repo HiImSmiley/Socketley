@@ -24,6 +24,10 @@ std::string idp_key_path(std::string_view runtime_name);
 // <state>/idp/<name>.jwks, the public half beside it, which a proxy of this daemon verifies sessions with.
 std::string idp_jwks_path(std::string_view runtime_name);
 
+// <state>/idp/<name>.standing, beside it: each account's id and whether it may still be signed in, which that proxy
+// checks every session against.
+std::string idp_standing_path(std::string_view runtime_name);
+
 // <state>/idp/<name>.accounts/, the accounts' snapshot and journal.
 std::string idp_accounts_dir(std::string_view runtime_name);
 

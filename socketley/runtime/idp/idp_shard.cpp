@@ -57,6 +57,7 @@ std::string encode_code(const code_entry* e)
         w.bytes(e->scope);
         w.bytes(e->challenge);
         w.u64(static_cast<uint64_t>(e->auth_time));
+        w.u64(static_cast<uint64_t>(e->issued_ms));
         w.u64(static_cast<uint64_t>(e->expires));
     }
     return w.take();
@@ -69,12 +70,13 @@ bool decode_code(std::string_view in, bool& found, code_entry& out)
         return false;
     if (found)
     {
-        uint64_t auth = 0, exp = 0;
+        uint64_t auth = 0, issued = 0, exp = 0;
         if (!r.bytes(out.client_id, 4096) || !r.bytes(out.redirect, 4096) || !r.bytes(out.sub, 4096) ||
             !r.bytes(out.nonce, 4096) || !r.bytes(out.scope, 4096) || !r.bytes(out.challenge, 4096) || !r.u64(auth) ||
-            !r.u64(exp))
+            !r.u64(issued) || !r.u64(exp))
             return false;
         out.auth_time = static_cast<int64_t>(auth);
+        out.issued_ms = static_cast<int64_t>(issued);
         out.expires = static_cast<int64_t>(exp);
     }
     return r.left() == 0;
@@ -88,6 +90,7 @@ std::string encode_device(device_poll what, const device_entry* e)
     w.bytes(e ? std::string_view(e->sub) : std::string_view());
     w.bytes(e ? std::string_view(e->scope) : std::string_view());
     w.u64(e ? static_cast<uint64_t>(e->auth_time) : 0);
+    w.u64(e ? static_cast<uint64_t>(e->issued_ms) : 0);
     return w.take();
 }
 
@@ -95,12 +98,13 @@ bool decode_device(std::string_view in, device_poll& what, device_entry& out)
 {
     socketley::bytes::reader r(in);
     uint8_t w = 0;
-    uint64_t auth = 0;
+    uint64_t auth = 0, issued = 0;
     if (!r.u8(w) || w > static_cast<uint8_t>(device_poll::gone) || !r.bytes(out.client_id, 4096) || !r.bytes(out.sub, 4096) ||
-        !r.bytes(out.scope, 4096) || !r.u64(auth))
+        !r.bytes(out.scope, 4096) || !r.u64(auth) || !r.u64(issued))
         return false;
     what = static_cast<device_poll>(w);
     out.auth_time = static_cast<int64_t>(auth);
+    out.issued_ms = static_cast<int64_t>(issued);
     return r.left() == 0;
 }
 

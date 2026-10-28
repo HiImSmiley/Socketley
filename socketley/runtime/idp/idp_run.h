@@ -231,8 +231,12 @@ private:
     bool write_account(const std::string& id, const field_list& fields, std::string& why);
     // Asks shard `shard`, with `then` called on its answer, or with false when it gave none.
     bool cross(uint32_t shard, const shard_call& call, std::function<void(bool, std::string_view)> then);
-    // Shard 0's journal as far as it has written it: said to the other shards, which read it before every answer.
+    // Shard 0's journal as far as it has written it: said to the other shards, which read it before every answer, and
+    // the accounts' standing written beside the key once a change has altered it.
     void publish_accounts();
+    // Each account's standing where the runtimes that verify its sessions alone read it, by shard 0 alone, as it
+    // writes the accounts; false when it could not be written, which the next change tries again.
+    bool publish_standing();
     void catch_up();
 
     void answer_command(uint64_t ticket, std::string_view text);
@@ -305,6 +309,9 @@ private:
     bool m_reader{false};
     uint64_t m_told_id{0}, m_told_end{0};
     std::string m_follow_error;
+    // The accounts' change count the standing was last written at, and what it said.
+    uint64_t m_standing_at{UINT64_MAX};
+    std::string m_standing;
     std::unordered_map<uint64_t, std::function<void(bool, std::string_view)>> m_crossed;
     uint64_t m_next_cookie{1};
 
