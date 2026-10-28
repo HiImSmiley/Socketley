@@ -194,6 +194,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the shared `/tmp/socketley.sock` read every flag `--lua` makes runtimes
   with, `--master-pw` and `--secret-key` among them. `socketley daemon`
   reports such a socket instead of exiting 0.
+- **Restore writes no file through a link at its scratch name.** Each file
+  went to `<file>.restore-tmp` opened through whatever stood there, so an
+  archive whose earlier entry was a symlink of that name had root write the
+  next file's bytes wherever the link pointed; the name is now removed and
+  made new, never followed, and an archive that holds such a name, which
+  export never writes, is refused.
 - **Restore writes no system file an archive names.** `socketley restore`
   took every root its archive's manifest listed as a place to write, so a
   crafted archive restored as root could put a file in `/etc/cron.d`,

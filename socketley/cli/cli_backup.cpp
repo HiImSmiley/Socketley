@@ -629,6 +629,12 @@ int cli_restore(int argc, char** argv)
             std::cout << "restore: the archive names " << target.string() << ", outside what its manifest says it holds\n";
             return 2;
         }
+        // Export passes this name over, and a link at it is what a later file of the same name would be written through.
+        if (e.name.ends_with(".restore-tmp"))
+        {
+            std::cout << "restore: the archive names " << target.string() << ", which no archive export writes holds\n";
+            return 2;
+        }
         if (std::any_of(refused.begin(), refused.end(), [&](const fs::path& r) { return under(target, r); }))
             continue;
         if (const std::string no = left_to_system(target, false); !no.empty())
@@ -698,7 +704,9 @@ int cli_restore(int argc, char** argv)
             continue;
         // Written beside it and moved over it whole, so a restore cut short leaves no file half written.
         const std::string tmp = target.string() + ".restore-tmp";
-        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        // Made new, never through what a restore cut short or anyone else left at the name.
+        if (::unlink(tmp.c_str()) != 0) {}
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd < 0)
         {
             std::cout << "restore: " << target.string() << " could not be written: " << std::strerror(errno) << "\n";

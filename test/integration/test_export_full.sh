@@ -11,6 +11,7 @@
 #   * a runtime's data left out: its buckets, its accounts, its mailboxes, its documents, its keys
 #   * a restore over a running daemon, over runtimes already there, or of a file that is no such archive
 #   * a crafted manifest that writes a system file, a home's hidden one, or a setuid bit
+#   * a file restored through a link at its scratch name, one the archive planted or one already there
 #   * a restore that brings the runtimes back stopped, or without what they held
 set -uo pipefail
 
@@ -151,6 +152,36 @@ rm -rf "$ETC_T" 2>/dev/null
 [ "$(cat "$T/plain/kept" 2>/dev/null)" = "a runtime's file" ] && [ "$(stat -c %a "$T/plain/kept")" = 755 ] \
     && ok "the rest is put back, without its setuid bit" || bad "the file beside them" "$(stat -c '%a %s' "$T/plain/kept" 2>&1)"
 rm -rf "$T/plain" "$T/home/.ssh"
+# A file is written beside its place under a name no link can stand at, one the archive planted or one left before it.
+printf 'the victim\n' > "$T/victim"; printf 'the other victim\n' > "$T/victim2"
+mkdir -p "$T/left"; ln -s "$T/victim2" "$T/left/b.restore-tmp"
+python3 - "$T" <<'PY'
+import io, json, sys, tarfile
+T = sys.argv[1]
+def archive(path, root, entries):
+    t = tarfile.open(path, "w:gz")
+    i = tarfile.TarInfo("socketley-backup/manifest.json"); m = json.dumps({"format": 1, "roots": [root]}).encode()
+    i.size = len(m); t.addfile(i, io.BytesIO(m))
+    for name, link, data in entries:
+        i = tarfile.TarInfo(name.lstrip("/"))
+        if link:
+            i.type = tarfile.SYMTYPE; i.linkname = link; t.addfile(i)
+        else:
+            i.size = len(data); t.addfile(i, io.BytesIO(data))
+    t.close()
+archive(T + "/planted.tar.gz", T + "/planted", [(T + "/planted/a.restore-tmp", T + "/victim", None),
+                                                (T + "/planted/a", None, b"written through the link\n")])
+archive(T + "/left.tar.gz", T + "/left", [(T + "/left/b", None, b"restored\n")])
+PY
+out=$("$BIN" restore "$T/planted.tar.gz" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && [ "$(cat "$T/victim")" = "the victim" ] && case "$out" in *"a.restore-tmp, which no archive export writes holds"*) true ;; *) false ;; esac \
+    && ok "an archive that plants a link at a file's scratch name is refused, and writes nothing through it" \
+    || bad "a planted .restore-tmp link" "rc $rc: $out; victim: $(cat "$T/victim")"
+out=$("$BIN" restore "$T/left.tar.gz" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$T/victim2")" = "the other victim" ] && [ "$(cat "$T/left/b")" = "restored" ] && [ ! -e "$T/left/b.restore-tmp" ] \
+    && ok "a link left at a file's scratch name is replaced, not written through" \
+    || bad "a .restore-tmp link left before" "rc $rc: $out; victim2: $(cat "$T/victim2"); b: $(cat "$T/left/b" 2>&1)"
+rm -rf "$T/planted" "$T/left" "$T/victim" "$T/victim2"
 printf 'no archive at all' > "$T/junk.tar.gz"
 out=$("$BIN" restore "$T/junk.tar.gz" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "a file that is no such archive is refused" || bad "a junk archive" "rc $rc: $out"
