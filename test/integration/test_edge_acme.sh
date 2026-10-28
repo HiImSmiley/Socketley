@@ -21,8 +21,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_daemon.sh"
 
-PEBBLE_DIR="${PEBBLE_DIR:-$HOME/socketley-perf/acme}"
-PEBBLE="$PEBBLE_DIR/pebble-linux-amd64/linux/amd64/pebble"
+. "$HERE/lib_pebble.sh"
 for f in "$PEBBLE" "$PEBBLE_DIR/pebble.minica.pem" "$PEBBLE_DIR/localhost-cert.pem" "$PEBBLE_DIR/localhost-key.pem"; do
     [ -r "$f" ] || { echo "  SKIP: Pebble is required ($f; set PEBBLE_DIR)"; exit 0; }
 done

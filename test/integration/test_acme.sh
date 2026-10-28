@@ -25,9 +25,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 exec 2>&1
 
 echo "=== Integration: ACME certificates ==="
-PEBBLE_DIR="${PEBBLE_DIR:-$HOME/socketley-perf/acme}"
-PEBBLE="$PEBBLE_DIR/pebble-linux-amd64/linux/amd64/pebble"
-CHALL="$PEBBLE_DIR/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv"
+. "$HERE/lib_pebble.sh"
 for f in "$PEBBLE" "$CHALL" "$PEBBLE_DIR/pebble.minica.pem" "$PEBBLE_DIR/localhost-cert.pem" "$PEBBLE_DIR/localhost-key.pem"; do
     [ -r "$f" ] || { echo "  SKIP: Pebble is required ($f; set PEBBLE_DIR)"; exit 0; }
 done

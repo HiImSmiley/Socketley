@@ -142,6 +142,9 @@ set -uo pipefail
 SECS="${1:-10}"
 CONFIG="${2:-Sanitize}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The makefiles carry this machine's architecture in their configuration names.
+PLATFORM="$(sed -n 's/^  config=debug_//p' "$ROOT/make/Makefile" 2>/dev/null)"
+[ -n "$PLATFORM" ] || { [ "$(uname -m)" = aarch64 ] && PLATFORM=arm64 || PLATFORM=x64; }
 
 BIN_DIR="$ROOT/bin/$CONFIG"
 CORPUS_ROOT="${FUZZ_CORPUS_ROOT:-$ROOT/test/fuzz/corpus}"
@@ -354,7 +357,7 @@ for target in "${TARGETS[@]}"; do
     # ── GCC replay driver: always, even when libFuzzer ran ──
     if [ ! -x "$BIN_DIR/$target" ]; then
         echo "FAIL $target: $BIN_DIR/$target does not exist"
-        echo "     build it: ./bin/premake5 gmake2 && cd make && make config=$(echo "$CONFIG" | tr 'A-Z' 'a-z')_x64 $target"
+        echo "     build it: ./bin/premake5 gmake2 && cd make && make config=$(echo "$CONFIG" | tr 'A-Z' 'a-z')_$PLATFORM $target"
         fail=$((fail + 1))
         continue
     fi

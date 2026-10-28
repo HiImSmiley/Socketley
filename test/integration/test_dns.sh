@@ -28,9 +28,9 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_daemon.sh"
+# Sourced before daemon_isolate moves HOME, or the default never finds Pebble.
+. "$HERE/lib_pebble.sh"
 
-# Taken before daemon_isolate moves HOME, or the default never finds Pebble.
-PEBBLE_DIR="${PEBBLE_DIR:-$HOME/socketley-perf/acme}"
 daemon_isolate dns
 P=$((SL_PORT_BASE+1710))
 SINK=$((SL_PORT_BASE+1711))
@@ -236,7 +236,6 @@ if [ "${s2:-0}" -gt "${s1:-0}" ] 2>/dev/null; then ok "and the serial grows, so 
 else bad "the serial after a published name went" "$s1 -> $s2"; fi
 
 # ── a wildcard certificate over DNS-01, from this runtime's own answers ─────
-PEBBLE="$PEBBLE_DIR/pebble-linux-amd64/linux/amd64/pebble"
 if [ -x "$PEBBLE" ] && [ -r "$PEBBLE_DIR/pebble.minica.pem" ] && command -v openssl >/dev/null 2>&1; then
     P_DIR=$((SL_PORT_BASE+1715)) P_MGMT=$((SL_PORT_BASE+1716))
     printf '{"pebble": {"listenAddress": "127.0.0.1:%s", "managementListenAddress": "127.0.0.1:%s", "certificate": "%s", "privateKey": "%s", "httpPort": %s, "tlsPort": %s, "ocspResponderURL": "", "externalAccountBindingRequired": false}}\n' \
@@ -257,7 +256,7 @@ if [ -x "$PEBBLE" ] && [ -r "$PEBBLE_DIR/pebble.minica.pem" ] && command -v open
     sleep 1.5
     expect "and its answers are gone after" "$(qp _acme-challenge.example.com TXT)" ""
 else
-    echo "  SKIP: DNS-01 needs Pebble (set PEBBLE_DIR)"
+    echo "  SKIP: DNS-01 needs Pebble ($PEBBLE; set PEBBLE_DIR)"
 fi
 
 # ── restart ─────────────────────────────────────────────────────────────────

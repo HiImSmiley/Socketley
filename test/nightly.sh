@@ -48,6 +48,14 @@ echo
 STARTED=$(date +%s)
 declare -A RESULT
 
+# The makefiles carry this machine's architecture in their configuration names, so it is read from the ones premake wrote.
+platform() {
+    local p
+    p=$(sed -n 's/^  config=debug_//p' make/Makefile 2>/dev/null)
+    [ -n "$p" ] || { [ "$(uname -m)" = aarch64 ] && p=arm64 || p=x64; }
+    printf '%s' "$p"
+}
+
 # ─── builds, one at a time ──────────────────────────────────────────────────
 # Serially and deliberately, because a parallel link of two sanitized
 # configurations is where this machine has run out of memory and a build that
@@ -60,7 +68,7 @@ build() {
     local extra_cppflags=${2:-}
     local log="$RUNDIR/build-$cfg.log"
     printf '  build %-9s ' "$cfg"
-    if make -C make "config=${cfg}_x64" -j"$(nproc)" \
+    if make -C make "config=${cfg}_$(platform)" -j"$(nproc)" \
             ${extra_cppflags:+CPPFLAGS="$extra_cppflags"} >"$log" 2>&1; then
         local w
         w=$(grep -cE 'warning:|error:' "$log")
