@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A presigned request is its signer's however it spells the signing
+  parameters.** A URL whose `X-Amz-Algorithm` (or V2 `AWSAccessKeyId`) name was
+  percent-encoded was verified with the signer's key but then judged as
+  anonymous, so Deny statements naming the signer did not apply to it and a
+  bucket policy could be put by a user who owns nothing.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

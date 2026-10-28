@@ -31,11 +31,13 @@ the number of failures.
 """
 import base64
 import hashlib
+import hmac
 import http.client
 import json
 import os
 import socket
 import ssl
+import urllib.parse
 import sys
 import xml.etree.ElementTree as ET
 
@@ -139,6 +141,28 @@ def req(target, method, path, query="", body=b"", key=None, headers=None):
 
 K1 = (AK1, SK1)
 K2 = (AK2, SK2)
+
+
+def presigned(target, method, path_query, key, body=b"", name_spelling="X-Amz-Algorithm", expires=300):
+    """A SigV4 presigned request, its algorithm parameter named as `name_spelling` writes it in the URL."""
+    path, _, extra = path_query.partition("?")
+    c, host = connect(target)
+    amzdate = sig.amz_now()
+    scope = "%s/us-east-1/s3/aws4_request" % amzdate[:8]
+    q = "%s=AWS4-HMAC-SHA256&X-Amz-Credential=%s&X-Amz-Date=%s&X-Amz-Expires=%d&X-Amz-SignedHeaders=host" % (
+        name_spelling, urllib.parse.quote("%s/%s" % (key[0], scope), safe=""), amzdate, expires)
+    if extra:
+        q = extra + "&" + q
+    creq = "\n".join([method, path, sig.canonical_query(q), "host:%s\n" % host, "host", "UNSIGNED-PAYLOAD"])
+    sts = "\n".join(["AWS4-HMAC-SHA256", amzdate, scope, sig.sha256hex(creq.encode())])
+    signature = hmac.new(sig.signing_key(key[1], amzdate[:8]), sts.encode(), hashlib.sha256).hexdigest()
+    try:
+        c.request(method, path + "?" + q + "&X-Amz-Signature=" + signature, body=body or None, headers={"Host": host})
+        r = c.getresponse()
+        data = r.read()
+        return Resp(r.status, {k.lower(): v for k, v in r.getheaders()}, data)
+    finally:
+        c.close()
 
 
 def put_policy(target, bucket, doc, key=K1, md5=True):
@@ -478,6 +502,12 @@ def mode_deny(port):
 
     r = put_object(T, "dny", "other/new", b"x", key=K2)
     check("a PUT by the key a user ARN denies is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    # Presigned with X-Amz-Algorithm's name percent-encoded, which the verifier decodes and the signer's check must too.
+    r = presigned(T, "GET", "/dny/open/a", K2, name_spelling="%58-Amz-Algorithm")
+    check("a presigned GET with the algorithm's name percent-encoded verifies", r.status == 200, repr(r))
+    r = presigned(T, "PUT", "/dny/other/enc", K2, b"x", name_spelling="%58-Amz-Algorithm")
+    check("a presigned PUT whose X-Amz-Algorithm is percent-encoded is still its signer's, and denied",
+          r.status == 403 and r.code() == "AccessDenied", repr(r))
     check("and stored nothing", req(T, "GET", "/dny/other/new", key=K1).status == 404)
     check("the other key may PUT", put_object(T, "dny", "other/new", b"x", key=K1).status == 200)
     r = req(T, "DELETE", "/dny/other/a", key=K2)

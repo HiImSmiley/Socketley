@@ -63,13 +63,15 @@ bool valid_access_key(std::string_view k)
     return true;
 }
 
+// Names compared decoded, as the verifier reads them, so an encoded name cannot be a signature here and none there.
 bool query_names(std::string_view query, std::string_view name)
 {
+    std::string decoded;
     while (!query.empty())
     {
         const std::string_view part = take_item(query, '&');
-        const size_t eq = part.find('=');
-        if (part.substr(0, eq) == name)
+        const std::string_view raw = part.substr(0, part.find('='));
+        if (raw == name || (raw.find('%') != std::string_view::npos && percent_decode(raw, decoded, false) && decoded == name))
             return true;
     }
     return false;
@@ -985,6 +987,8 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
             v.error = {"InvalidToken", "The provided token is malformed or otherwise invalid.", 400};
         return v;
     }
+    // A request whose signature verified names its signer, however it spelled the parameters that made it signed.
+    v.anonymous = false;
     v.principal = std::string(vr.access_key());
     v.user      = token.empty() ? m_creds.user_of(v.principal) : std::move(session_user);
     v.session   = !token.empty();
