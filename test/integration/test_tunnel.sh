@@ -10,6 +10,7 @@
 #   * an agent that does not come back after it or the edge restarts, or comes back by joining again
 #   * a revoked agent still carried, or a service it never offered reached
 #   * a service's name not beside the edge's, or another runtime given a name a service has
+#   * an agent's offers that edit cannot change, or changes on a running agent that has not restarted
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -145,6 +146,15 @@ for _ in $(seq 1 60); do [ "$(curl -s -m 2 --unix-socket "$WEB" http://web/again
 "$BIN" stop t >/dev/null 2>&1; "$BIN" start t >/dev/null 2>&1
 for _ in $(seq 1 80); do [ "$(curl -s -m 2 --unix-socket "$WEB" http://web/back)" = "hello from home /back" ] && break; sleep 0.1; done
 [ "$(curl -s -m 2 --unix-socket "$WEB" http://web/back)" = "hello from home /back" ] && ok || bad "after the edge restarts the agent dials again" "$(tail -5 "$SOCKETLEY_DLOG")"
+
+# What a running agent offers is changed by edit through a restart, and edit says so when asked without one.
+out=$("$BIN" edit home --offer "web=127.0.0.1:$PB" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"--offer changes a tunnel when it starts"*"--restart"*) true ;; *) false ;; esac && ok \
+    || bad "edit of a running agent's offers asks for --restart" "rc $rc: $out"
+"$BIN" edit home --offer "web=127.0.0.1:$PB,echo=127.0.0.1:$PX" --restart >/dev/null 2>&1 && ok || bad "edit --restart changes what an agent offers" "rc $?"
+"$BIN" show home | grep -q "\"offer\": \"web=127.0.0.1:$PB,echo=127.0.0.1:$PX\"" && ok || bad "and the change is kept" "$("$BIN" show home | grep offer)"
+for _ in $(seq 1 80); do [ "$(curl -s -m 2 --unix-socket "$WEB" http://web/edited)" = "hello from home /edited" ] && break; sleep 0.1; done
+[ "$(curl -s -m 2 --unix-socket "$WEB" http://web/edited)" = "hello from home /edited" ] && ok || bad "with the agent back, its key kept" "$(tail -3 "$SOCKETLEY_DLOG")"
 
 # A second agent with the same invitation is refused, the first keeps its link.
 "$BIN" create tunnel thief --mode agent --to "http://127.0.0.1:$PE" --join "$INV" --offer "web=127.0.0.1:$PB" -s >/dev/null 2>&1

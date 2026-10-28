@@ -4826,10 +4826,20 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
                 case runtime_db:
                 case runtime_mqtt:
                 case runtime_mail:
-                case runtime_tunnel:
-                    // A storage, DNS, sync, idp, db, mqtt, mail or tunnel runtime's
+                    // A storage, DNS, sync, idp, db, mqtt or mail runtime's
                     // own settings are applied by `import`, as a cache's are.
                     result = -1;
+                    break;
+                case runtime_tunnel:
+                    // A tunnel reads its own settings when it starts, so a running one takes them through a restart.
+                    if (is_running && runtime_schema::offered(pa.args[i], type))
+                    {
+                        restore_edit();
+                        std::cout << pa.args[i] << " changes a tunnel when it starts: socketley edit " << name << " "
+                                  << pa.args[i] << " ... --restart\n";
+                        return 1;
+                    }
+                    result = parse_tunnel_flags(static_cast<tunnel_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's fields reach its worker at the next
