@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   percent-encoded was verified with the signer's key but then judged as
   anonymous, so Deny statements naming the signer did not apply to it and a
   bucket policy could be put by a user who owns nothing.
+- **A session alone makes no app password and turns no second step on or off.**
+  The account page made an app password, a way into the mail that outlives
+  the session, and began a second step on the session cookie alone; both now
+  ask for the password again, or a code where a second step is on, counted as
+  a sign-in's are, and turning one off counts its wrong codes. Signing out
+  everywhere, a new password, `idp-user passwd` and `idp-user logout` now end
+  the account's app passwords too, where they went on signing mail apps in.
 - **A second step that is on is replaced only by turning it off.** The
   account page's `do=start` and `do=confirm` replaced the authenticator key of
   an account that had one with no code of it, so a stolen session could swap

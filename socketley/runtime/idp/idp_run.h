@@ -186,6 +186,11 @@ private:
     void second_step(const std::shared_ptr<conn>& c, const request& rq, params p);
     void security_post(const std::shared_ptr<conn>& c, const request& rq);
     std::string security_html(const account& who);
+    // Whether the person at `c` is `who` again, before a change a stolen session must not make alone: the code where
+    // the account has a second step, its password otherwise, counted against the account and the address like a
+    // sign-in; `then` given 0 when they are, else the status to answer and why.
+    void prove_again(const std::shared_ptr<conn>& c, const request& rq, const account& who, const params& p,
+                     std::function<void(int, std::string_view)> then);
     // Whether `code` is the account's now and of a later step than the last it took, that step kept with the account
     // by shard 0, so a code is taken once at every shard and across a restart.
     void check_code(const account& a, std::string_view code, std::function<void(bool)> then);

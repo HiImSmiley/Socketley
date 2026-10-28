@@ -12413,6 +12413,11 @@ which answers from the account as it is now, and
 at
 .B /account
 a user changes their name, address and password and signs out everywhere.
+Turning a second step on or off and making an app password ask for the
+password again, or a code where a second step is on, counted as a sign-in's
+are, so a session alone changes neither; a second step on is replaced only by
+turning it off. Signing out everywhere and a new password end the account's
+app passwords with its sessions.
 Tokens are signed ES256 with a P\-256 key made at the first start and kept in
 the state directory, so a restart signs nobody out; a refresh token, which only
 the provider reads back, is signed HS256 under a secret made from that key. A

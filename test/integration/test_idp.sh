@@ -16,6 +16,8 @@
 #   * the signing key changing across a restart, which would sign every user out
 #   * a code of the second step taken again after a restart
 #   * a session replacing a second step that is on, or one turned on meanwhile, without a code of it
+#   * a session alone turning a second step on or making an app password, or an app password outliving a sign-out
+#     everywhere
 #   * a storage's users not coming over with the passwords they have there
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted
@@ -277,7 +279,9 @@ if phase == "main":
     check("the sign-in page wears the storage interface's look, its aurora let in and still no script",
           (st, 'class="lcard"' in body and "--grad:" in body, "img-src data:" in (h.get("Content-Security-Policy") or ""),
            "<script" in body), (200, True, True, False))
-    st, body, _ = req("POST", "/account/totp", dict(do="start"), cookie=cookie)
+    st, body, _ = req("POST", "/account/totp", dict(do="start"), cookie=cookie, headers={"X-Forwarded-For": "198.51.100.81"})
+    check("a session alone does not turn two-step sign-in on, its password not given", (st, "otpauth://" in body), (401, False))
+    st, body, _ = req("POST", "/account/totp", dict(do="start", password="alicepassword1"), cookie=cookie)
     check("turning two-step sign-in on shows the key as a code to scan, beside the link it encodes",
           (st, "<svg" in body and "h1v1h-1z" in body, "otpauth://totp/" in body), (200, True, True))
     st, body, _ = req("POST", "/account", dict(name="Alice B", email="alice@example.com"), cookie=cookie)
@@ -464,15 +468,25 @@ elif phase == "after_cli":
     # A second step is replaced only by turning it off, which takes a code of it, and never by a session alone.
     O = {"X-Forwarded-For": "198.51.100.80"}
     oc = cookie_of(req("POST", "/login", dict(rd="/", username="omar", password="omarpassword12"), headers=O)[2])
-    st, body, _ = req("POST", "/account/totp", dict(do="start"), cookie=oc, headers=O)
-    k1 = "".join((re.search(r"<p><code>([A-Z2-7 ]+)</code>", body) or [None, ""])[1].split())
+    st, body, _ = req("POST", "/account/totp", dict(do="start", password="omarpassword12"), cookie=oc, headers=O)
+    k1 ="".join((re.search(r"<p><code>([A-Z2-7 ]+)</code>", body) or [None, ""])[1].split())
     check("a second step begun shows its key", (st, bool(k1)), (200, True))
     on = subprocess.run([bin_, "idp-user", "auth", "totp", "omar", "on"], capture_output=True, text=True).stdout
     check("and an admin turns one on meanwhile", bool(re.search(r"key: \S+", on)), True)
     st, body, _ = req("POST", "/account/totp", dict(do="confirm", code=totp_now(k1)), cookie=oc, headers=O)
     check("the key begun before replaces nothing", (st, "Two-step sign-in is on." in body), (400, False))
-    st, body, _ = req("POST", "/account/totp", dict(do="start"), cookie=oc, headers=O)
+    st, body, _ = req("POST", "/account/totp", dict(do="start", password="omarpassword12"), cookie=oc, headers=O)
     check("and with one on, a session is shown no key to replace it with", (st, "otpauth://" in body), (400, False))
+    # An app password, a way into the mail that outlives the session, is made only on a code, and ends with the sessions.
+    mail_ok = lambda pw: subprocess.run([bin_, "idp-user", "auth", "verify", "omar", pw], capture_output=True, text=True).stdout.startswith("ok ")
+    k2 = (re.search(r"key: (\S+)", on) or [None, ""])[1]
+    st, body, _ = req("POST", "/account/app-password", dict(do="add", label="Phone"), cookie=oc, headers=O)
+    check("a session alone makes no app password", (st, "shown this once" in body), (401, False))
+    st, body, _ = req("POST", "/account/app-password", dict(do="add", label="Phone", code=totp_now(k2)), cookie=oc, headers=O)
+    app = (re.search(r"shown this once: ([a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4})", body) or [None, ""])[1]
+    check("a code of the second step makes one, which a mail app signs in with", (st, bool(app) and mail_ok(app)), (200, True))
+    st, body, _ = req("POST", "/account/everywhere", {}, cookie=oc, headers=O)
+    check("and signing out everywhere ends it with the sessions", (st, mail_ok(app)), (200, False))
 
 elif phase == "limits":
     import threading, hmac, struct
