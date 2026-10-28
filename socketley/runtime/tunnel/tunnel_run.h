@@ -87,6 +87,8 @@ public:
     std::string out;
     std::unordered_map<uint32_t, std::shared_ptr<leg>> legs;
     std::weak_ptr<http::server_conn> transport;
+    // A person who is an admin of the edge's idp, who may reach an agent's TCP service by its name.
+    bool admin{false};
     int64_t last_heard{0};
     int64_t last_ping{0};
 
@@ -198,7 +200,7 @@ private:
     void answer_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view body);
     void join_by_person(const std::shared_ptr<http::server_conn>& c, std::string_view head);
     void upgraded(const std::shared_ptr<http::server_conn>& c, link::kind k, std::string who,
-                  std::string_view extra_headers);
+                  std::string_view extra_headers, bool admin = false);
     // A visitor on a service's listener, carried to the agent offering it; false when the agent is not connected.
     bool visitor(leg_hooks& h, const std::shared_ptr<leg>& g);
     // A protected service's visitor's requests asked of its auth, as far as they have come, and what passed sent.

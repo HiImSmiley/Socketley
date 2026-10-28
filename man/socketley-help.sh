@@ -500,10 +500,11 @@ cli_commands() {
     echo -e "  ${CYAN}socketley tunnel join https://edge.example.com --http ollama=127.0.0.1:11434${NC}"
     echo ""
 
-    echo -e "${BOLD}tunnel connect <edge> <host:port> [--idp <idp>] | tunnel ssh <edge> [--idp <idp>]${NC}"
+    echo -e "${BOLD}tunnel connect <edge> <host:port>|<agent>/<service> [--idp <idp>] | tunnel ssh <edge> [--agent <agent>]${NC}"
     echo "  A stream to an edge's --forward target over stdin and stdout, for"
     echo "  the person signed in by login, at the edge's idp unless --idp names"
-    echo "  one; ssh is for ProxyCommand."
+    echo "  one; ssh is for ProxyCommand. An admin of that idp may name an agent's"
+    echo "  TCP service, and --agent its ssh: a machine at home over 443, no port."
     echo -e "  ${CYAN}socketley tunnel ssh edge.example.com${NC}"
     echo ""
 

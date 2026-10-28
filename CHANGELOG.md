@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **ssh to a machine at home.** `socketley tunnel ssh <edge> --agent pi` as ssh's
+  `ProxyCommand` reaches the agent pi's `ssh` service through port 443, for an
+  admin of the edge's idp; `tunnel connect <edge> pi/<service>` any TCP service
+  of an agent. Nobody else may name one.
 - **A tunnel service with more than one way in.** An HTTP service's auth may
   join several with `+`, `ollama=idp:auth+bearer:/etc/socketley/hub.token`:
   a person signed in and a program with the token both get through, and a

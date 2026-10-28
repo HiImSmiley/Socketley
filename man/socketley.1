@@ -1180,9 +1180,9 @@ socketley tunnel join https://edge.example.com \-\-http ollama=127.0.0.1:11434
 .fi
 .RE
 .TP
-.BI "tunnel connect " "edge host" : port " \fR[\fB\-\-idp \fIidp\fR]"
+.BI "tunnel connect " "edge host" : port \fR|\fIagent\fB/\fIservice " \fR[\fB\-\-idp \fIidp\fR]"
 .TQ
-.BI "tunnel ssh " edge " \fR[\fB\-\-idp \fIidp\fR]"
+.BI "tunnel ssh " edge " \fR[\fB\-\-agent \fIagent\fR] [\fB\-\-idp \fIidp\fR]"
 A stream to a
 .B \-\-forward
 target of a tunnel edge, between stdin and stdout, for the person signed in at
@@ -1193,12 +1193,21 @@ the edge's own idp, asked of the edge, unless given;
 .B ssh
 is to 127.0.0.1:22 there, for ssh's
 .BR ProxyCommand .
+An admin of the edge's idp may name an agent's TCP service instead,
+.IB agent / service ,
+and
+.B \-\-agent
+names that agent's
+.BR ssh ,
+so a machine at home is reached by ssh through 443 with no port opened for it
+anywhere.
 Errors are said on stderr, since stdout is the stream. A target the edge does
 not name is exit 1.
 .RS
 .PP
 .nf
 ssh \-o ProxyCommand='socketley tunnel ssh edge.example.com' root@server
+ssh \-o ProxyCommand='socketley tunnel ssh edge.example.com \-\-agent pi' me@pi
 .fi
 .RE
 .TP

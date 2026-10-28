@@ -335,6 +335,13 @@ void tunnel_run::dial_leg(link& l, uint32_t stream, std::string_view target)
         // Only a target the edge names, so a signed-in person reaches what it allows and nothing else.
         if (std::find(m_forward.begin(), m_forward.end(), target) != m_forward.end())
             addr = std::string(target);
+        // An admin may name an agent's TCP service, `pi/ssh`, carried as a visitor of its port on this machine.
+        else if (const size_t slash = target.find('/'); l.admin && slash != std::string_view::npos)
+            for (const agent& a : m_agents)
+                if (a.joined && a.name == target.substr(0, slash))
+                    for (const service& s : a.services)
+                        if (!s.http && s.name == target.substr(slash + 1))
+                            addr = "127.0.0.1:" + std::to_string(s.port);
     }
     else if (const auto it = m_offers.find(std::string(target)); it != m_offers.end())
         addr = it->second;
@@ -878,7 +885,7 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
         upgraded(c, link::kind::agent, name, "Tunnel-Key: " + name + "." + key + "\r\n");
         return;
     }
-    if (scheme == "Bearer" && m_idp && !m_forward.empty())
+    if (scheme == "Bearer" && m_idp)
     {
         socketley::idp::session_verifier::who who;
         if (!m_idp->check_bearer(cred, who))
@@ -888,19 +895,20 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
         }
         LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" connected from " +
                   client_of(c->peer, head)).c_str());
-        upgraded(c, link::kind::person, who.username, {});
+        upgraded(c, link::kind::person, who.username, {}, who.admin);
         return;
     }
     refuse_front(c, 401, "an agent's key, an invitation, or an access token is required");
 }
 
 void tunnel_run::upgraded(const std::shared_ptr<http::server_conn>& c, link::kind k, std::string who,
-                          std::string_view extra_headers)
+                          std::string_view extra_headers, bool admin)
 {
     auto& f = static_cast<front_conn&>(*c);
     c->out += "HTTP/1.1 101 Switching Protocols\r\nUpgrade: " + std::string(upgrade_token) +
               "\r\nConnection: Upgrade\r\n" + std::string(extra_headers) + "\r\n";
     f.l = std::make_shared<link>(*this, k, std::move(who), c);
+    f.l->admin = admin;
     ++m_c.links;
     f.l->s.hello({{"edge", std::string(m_owner.get_name())}}, f.l->out);
     if (k == link::kind::agent)

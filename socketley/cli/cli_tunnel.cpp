@@ -472,13 +472,15 @@ int cli_tunnel(int argc, char** argv)
         return join_main(argc, argv);
     if (what != "connect" && what != "ssh")
         return cli_forward(argc, argv);
-    std::string edge, target, idp;
+    std::string edge, target, idp, agent;
     bool extra = false;
     for (int i = 3; i < argc; ++i)
     {
         const std::string_view a = argv[i];
         if (a == "--idp" && i + 1 < argc)
             idp = argv[++i];
+        else if (a == "--agent" && i + 1 < argc && what == "ssh")
+            agent = argv[++i];
         else if (edge.empty())
             edge = a;
         else if (target.empty() && what == "connect")
@@ -486,13 +488,14 @@ int cli_tunnel(int argc, char** argv)
         else
             extra = true;
     }
+    // An agent's TCP service `ssh` for --agent, else the edge's own machine.
     if (what == "ssh")
-        target = "127.0.0.1:22";
+        target = agent.empty() ? std::string("127.0.0.1:22") : agent + "/ssh";
     // Said on stderr, since stdout is the stream itself.
     if (extra || edge.empty() || target.empty())
     {
-        std::cerr << "usage: socketley tunnel connect <edge address> <host>:<port> [--idp <idp address>]\n"
-                     "       socketley tunnel ssh <edge address> [--idp <idp address>]\n";
+        std::cerr << "usage: socketley tunnel connect <edge address> <host>:<port>|<agent>/<service> [--idp <idp address>]\n"
+                     "       socketley tunnel ssh <edge address> [--agent <agent>] [--idp <idp address>]\n";
         return 1;
     }
     return connect_main(edge, target, idp);

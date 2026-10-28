@@ -61,8 +61,8 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "tunnel")
         return "tunnel <edge> invite|set <agent> [--http <name>[=<auth>],...] [--tcp <name>:<port>,...] | list | "
                "revoke <agent> | tunnel join <edge address> [--name <agent>] [--http <service>=<host>:<port>,...] "
-               "[--tcp <service>:<port>=<host>:<port>,...] | tunnel connect <edge address> <host>:<port> [--idp <idp address>] | "
-               "tunnel ssh <edge address> [--idp <idp address>]";
+               "[--tcp <service>:<port>=<host>:<port>,...] | tunnel connect <edge address> <host>:<port>|<agent>/<service> "
+               "[--idp <idp address>] | tunnel ssh <edge address> [--agent <agent>] [--idp <idp address>]";
     if (verb == "mail")
         return "mail [<mail>] [queue [filter] | show <id> | flush [id] | drop <id> | dns [--check] | suppressed | forgive <address> | "
                "unsubscribed | resubscribe <address> | learn <user>/<folder> --as spam|ham | trace <address> | usage [user] | "

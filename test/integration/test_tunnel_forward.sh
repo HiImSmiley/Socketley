@@ -12,6 +12,7 @@
 #   * `tunnel connect` with no --idp not finding the edge's idp by asking the edge
 #   * `tunnel join` adding an agent for someone who is no admin, or its service open to visitors who did not sign in
 #   * an agent joined by a person not reaching the service it offers, or a second join of its name breaking it
+#   * an agent's ssh not reached by an admin's `tunnel ssh --agent`, or reached by anyone else
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -31,6 +32,7 @@ PE=$((SL_PORT_BASE + 1977))
 PX=$((SL_PORT_BASE + 1978))
 PS=$((SL_PORT_BASE + 1979))
 PH=$((SL_PORT_BASE + 1980))
+PT=$((SL_PORT_BASE + 1981))
 I="http://127.0.0.1:$PI"
 python3 - "$PX" <<'PY' &
 import socketserver, sys
@@ -131,17 +133,18 @@ out=$("$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:
 [ -z "$("$BIN" tunnel e list)" ] && ok || bad "and the edge holds none" "$("$BIN" tunnel e list)"
 # Signed in nowhere here, the join signs in for itself and keeps nothing of an admin's sign-in once it is done.
 mkdir -p "$T/fresh"
-XDG_CONFIG_HOME="$T/fresh" "$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" > "$T/join.out" 2>&1 &
+XDG_CONFIG_HOME="$T/fresh" "$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" \
+    --tcp "ssh:$PT=127.0.0.1:$PX" > "$T/join.out" 2>&1 &
 jp=$!
 allow_code "$T/join.out" boss bosspassword1
 for _ in $(seq 1 150); do kill -0 "$jp" 2>/dev/null || break; sleep 0.1; done
 wait "$jp"; rc=$?
-[ "$rc" -eq 0 ] && [ "$(tail -1 "$T/join.out")" = "https://web" ] && ok \
+[ "$rc" -eq 0 ] && grep -qx "https://web" "$T/join.out" && grep -qx "127.0.0.1:$PT" "$T/join.out" && ok \
     || bad "an admin's join makes the agent and says where its service is" "rc $rc: $(cat "$T/join.out")"
 [ -z "$(find "$T/fresh" -type f)" ] && ok || bad "and no sign-in is left behind" "$(find "$T/fresh" -type f)"
 login_as boss bosspassword1 "" "$T/boss" && ok || bad "an admin signs in" "$(cat "$T/login.out")"
-for _ in $(seq 1 50); do "$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth$" && break; sleep 0.1; done
-"$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth$" && ok \
+for _ in $(seq 1 50); do "$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth,ssh:$PT$" && break; sleep 0.1; done
+"$BIN" tunnel e list | grep -q "^pi	joined	web=idp:auth,ssh:$PT$" && ok \
     || bad "the agent joins, its service asking visitors to sign in at the edge's idp" "$("$BIN" tunnel e list)"
 grep -q 'tunnel e: "boss" added agent "pi"' "$SOCKETLEY_DLOG" && ok || bad "who added it is said in the log" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
 WEB=$(dirname "$(find "$HOME/.local/share" -path '*tunnel/e/agents' 2>/dev/null | head -1)")/web.sock
@@ -149,7 +152,7 @@ WEB=$(dirname "$(find "$HOME/.local/share" -path '*tunnel/e/agents' 2>/dev/null 
 for _ in $(seq 1 30); do [ -S "$WEB" ] && break; sleep 0.1; done
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 --unix-socket "$WEB" http://web/x)
 [ "$code" = 401 ] && ok || bad "a visitor who did not sign in is refused" "$code"
-"$BIN" tunnel e set pi --http web >/dev/null 2>&1
+"$BIN" tunnel e set pi --http web --tcp "ssh:$PT" >/dev/null 2>&1
 for _ in $(seq 1 50); do [ "$(curl -s -m 3 --unix-socket "$WEB" http://web/x)" = "hello from the agent /x" ] && break; sleep 0.1; done
 [ "$(curl -s -m 3 --unix-socket "$WEB" http://web/x)" = "hello from the agent /x" ] && ok \
     || bad "opened by the edge's owner, the service at the agent answers" "$(tail -3 "$SOCKETLEY_DLOG")"
@@ -157,6 +160,14 @@ out=$(XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel join "http://127.0.0.1:$PE" --name
 [ "$rc" -eq 1 ] && case "$out" in *"a runtime named pi is here already"*) true ;; *) false ;; esac && ok \
     || bad "a join whose runtime is here already asks nothing of the edge" "rc $rc: $out"
 [ "$(curl -s -m 3 --unix-socket "$WEB" http://web/y)" = "hello from the agent /y" ] && ok || bad "and the agent keeps its key" "$("$BIN" tunnel e list)"
+# An admin reaches an agent's TCP service by its name, `tunnel ssh --agent` its ssh; nobody else does.
+out=$(printf 'to the agent' | XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel ssh "http://127.0.0.1:$PE" --agent pi 2>"$T/err"); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "to the agent" ] && ok || bad "an admin's tunnel ssh --agent reaches the agent's ssh" "rc $rc: '$out' $(cat "$T/err")"
+out=$(printf 'x' | "$BIN" tunnel connect "http://127.0.0.1:$PE" pi/ssh 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"does not forward to that target"*) true ;; *) false ;; esac && ok \
+    || bad "someone who is no admin does not" "rc $rc: $out"
+out=$(printf 'x' | XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel connect "http://127.0.0.1:$PE" pi/web 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok || bad "nor an admin an HTTP service by this way" "rc $rc: $out"
 "$BIN" remove pi >/dev/null 2>&1
 
 # ── ssh through the tunnel, by the certificate the same sign-in gets ──────────
