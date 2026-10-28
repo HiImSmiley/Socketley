@@ -107,9 +107,9 @@ public:
     {
         if (!m_base || i >= m_count) return;
         auto* b = block(i);
-        b->version.fetch_add(1, std::memory_order_acq_rel);
+        begin_write(b);
         b->count.store(0, std::memory_order_release);
-        b->version.fetch_add(1, std::memory_order_release);
+        end_write(b);
     }
 
     int fd() const { return m_fd; }
@@ -145,10 +145,10 @@ public:
 
         // Whatever the previous occupant left is not about this process.
         auto* b = block(index);
-        b->version.fetch_add(1, std::memory_order_acq_rel);
+        begin_write(b);
         b->count.store(0, std::memory_order_release);
         b->generation.fetch_add(1, std::memory_order_relaxed);
-        b->version.fetch_add(1, std::memory_order_release);
+        end_write(b);
         return true;
     }
 
@@ -169,14 +169,14 @@ public:
                              ? max_clients_per_shard
                              : static_cast<uint32_t>(refs.size());
 
-        b->version.fetch_add(1, std::memory_order_acq_rel);      // -> odd
+        begin_write(b);
         for (uint32_t i = 0; i < n; ++i)
         {
             e[i].owner.store(refs[i].owner,  std::memory_order_relaxed);
             e[i].serial.store(refs[i].serial, std::memory_order_relaxed);
         }
         b->count.store(n, std::memory_order_relaxed);
-        b->version.fetch_add(1, std::memory_order_release);      // -> even
+        end_write(b);
     }
 
     // One entry's worth of stores each, mirroring what server_instance does to
@@ -189,11 +189,11 @@ public:
         if (n >= max_clients_per_shard) return;      // cannot happen; see the header
 
         auto* e = entries(m_index);
-        b->version.fetch_add(1, std::memory_order_acq_rel);
+        begin_write(b);
         e[n].owner.store(r.owner,  std::memory_order_relaxed);
         e[n].serial.store(r.serial, std::memory_order_relaxed);
         b->count.store(n + 1, std::memory_order_relaxed);
-        b->version.fetch_add(1, std::memory_order_release);
+        end_write(b);
     }
 
     void swap_remove(uint32_t idx)
@@ -204,7 +204,7 @@ public:
         if (n == 0 || idx >= n) return;
 
         auto* e = entries(m_index);
-        b->version.fetch_add(1, std::memory_order_acq_rel);
+        begin_write(b);
         if (idx != n - 1)
         {
             e[idx].owner.store(e[n-1].owner.load(std::memory_order_relaxed),
@@ -213,16 +213,16 @@ public:
                                 std::memory_order_relaxed);
         }
         b->count.store(n - 1, std::memory_order_relaxed);
-        b->version.fetch_add(1, std::memory_order_release);
+        end_write(b);
     }
 
     void clear_own()
     {
         if (!writable()) return;
         auto* b = block(m_index);
-        b->version.fetch_add(1, std::memory_order_acq_rel);
+        begin_write(b);
         b->count.store(0, std::memory_order_relaxed);
-        b->version.fetch_add(1, std::memory_order_release);
+        end_write(b);
     }
 
     uint32_t own_count() const
@@ -286,6 +286,16 @@ public:
     static constexpr uint32_t invalid_index = 0xFFFFFFFFu;
 
 private:
+    // Odd while a writer is inside; the fence keeps the entries' stores after it on a CPU that reorders stores, as ARM does.
+    static void begin_write(block_header* b)
+    {
+        b->version.fetch_add(1, std::memory_order_acq_rel);
+        std::atomic_thread_fence(std::memory_order_release);
+    }
+
+    // Even again, once every entry and the count are stored.
+    static void end_write(block_header* b) { b->version.fetch_add(1, std::memory_order_release); }
+
     region_header* header() const
     { return reinterpret_cast<region_header*>(m_base); }
 
