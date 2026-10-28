@@ -79,11 +79,10 @@ inline bool http_token_equals(std::string_view s, const char* lower, size_t len)
     return true;
 }
 
-// Whether a name may go out as a header's name: a token (RFC 9110 5.6.2), so it can neither end the line nor be
-// read as a value -- names a script supplied are often derived from a request.
-inline bool http_field_name_ok(std::string_view s)
+// Whether a name is a non-empty token (RFC 9110 5.6.2), every byte a tchar, with no cap on its length.
+inline bool http_is_token(std::string_view s)
 {
-    if (s.empty() || s.size() > 256)
+    if (s.empty())
         return false;
     for (char c : s)
     {
@@ -100,6 +99,13 @@ inline bool http_field_name_ok(std::string_view s)
         }
     }
     return true;
+}
+
+// Whether a name may go out as a header's name: a token (RFC 9110 5.6.2), so it can neither end the line nor be
+// read as a value -- names a script supplied are often derived from a request.
+inline bool http_field_name_ok(std::string_view s)
+{
+    return s.size() <= 256 && http_is_token(s);
 }
 
 // Whether a value may go out as one header line: a CR or LF in it would end the line and start another the
@@ -473,11 +479,12 @@ inline http_request_framing_scan http_scan_request_headers(std::string_view head
             return out;
         }
 
-        // Whitespace between the field name and its colon (RFC 9112 Section
-        // 5.1), which walks past every conflict check below while the other
-        // end still frames the body by it.
+        // A name that is not a token, whitespace before the colon (RFC 9112
+        // Section 5.1) or a "Transfer-Encoding\x0b" alike, walks past every
+        // conflict check below while a backend that trims it still frames the
+        // body by it.
         const std::string_view name = line.substr(0, colon);
-        if (SOCKETLEY_UNLIKELY(name.back() == ' ' || name.back() == '\t'))
+        if (SOCKETLEY_UNLIKELY(!http_is_token(name)))
         {
             out.ok = false;
             return out;

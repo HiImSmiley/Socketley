@@ -39,6 +39,20 @@ TEST_CASE("a request whose Content-Length is spelled with a CR for its hyphen is
     CHECK(t.content_length == 5);
 }
 
+TEST_CASE("a request field name that is not a token is refused, so no backend's trimmed reading of it frames the body")
+{
+    CHECK_FALSE(http_scan_request_headers("Host: x\r\nTransfer-Encoding\x0b: chunked\r\nContent-Length: 5").ok);
+    CHECK_FALSE(http_scan_request_headers("Host: x\r\nContent-Length\x0c: 5").ok);
+    CHECK_FALSE(http_scan_request_headers("Host: x\r\n\x0b" "Transfer-Encoding: chunked").ok);
+    CHECK_FALSE(http_scan_request_headers(std::string_view("Host: x\r\nX-A\0: 1", 16)).ok);
+    CHECK_FALSE(http_scan_request_headers("Host: x\r\nX-A\x7f: 1").ok);
+    CHECK_FALSE(http_scan_request_headers("Host: x\r\nX-Forwarded-User\x0b: admin").ok);
+    CHECK_FALSE(http_scan_request_headers("Host: x\r\nContent-Length : 5").ok);
+    const http_request_framing_scan s = http_scan_request_headers("Host: x\r\nX_Odd.Name~2!: 1\r\nContent-Length: 5");
+    CHECK(s.ok);
+    CHECK(s.content_length == 5);
+}
+
 TEST_CASE("a head checked a byte at a time from where the last check stopped is judged as it is whole")
 {
     const char* const heads[] = {

@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that trusts the idp's SSH CA, so a storage admin could hand out root by
   making an admin user before an import; it now comes over as no admin, and
   the import names it with the `set` that makes it one.
+- **A request field name that is not a token is a 400.** A name with a
+  control byte, DEL or NUL in it, such as `Transfer-Encoding<VT>`, was no
+  framing field to the proxy, server, storage or tunnel and went on to the
+  backend verbatim, where a parser that trims it framed the body by it and
+  read a second request the proxy never routed or authenticated.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

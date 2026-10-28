@@ -39,6 +39,11 @@
 #                                                 must not choose separately
 #   F  Transfer-Encoding              REFUSE 501  RFC 9112 6.1 -- this server
 #                                                 implements no transfer coding
+#   G  Transfer-Encoding<VT> beside   REFUSE 400  RFC 9110 5.6.2, a name is a
+#      a Content-Length                           token; a backend that trims
+#                                                 VT frames by chunks
+#   H  Content-Length<VT> alone       REFUSE 400  the same, the other way round
+#   I  a NUL inside a field name      REFUSE 400  the same
 #
 # F is the one that had a third option, and the third option is why it is here:
 # reading a chunked body as a body of length zero meant the chunk data was
@@ -197,6 +202,13 @@ def build(case, path, spath):
     if case == "F":     # chunked, whose chunk data is a whole request
         return (head + "Transfer-Encoding: chunked\r\n\r\n").encode() + \
                ("%x\r\n" % n).encode() + s2 + b"\r\n0\r\n\r\n"
+    if case == "G":     # a coding a VT-trimming backend honours, hidden beside a length
+        return (head + "Content-Length: %d\r\nTransfer-Encoding\x0b: chunked\r\n\r\n"
+                % (n + 5)).encode() + b"0\r\n\r\n" + s2
+    if case == "H":     # a length a VT-trimming backend honours and this one would not
+        return (head + "Content-Length\x0b: %d\r\n\r\n" % n).encode() + s2
+    if case == "I":     # a NUL inside a field name
+        return (head + "X-A\x00: 1\r\n\r\n").encode() + s2
     raise SystemExit("unknown case")
 
 port, case, path, spath = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
@@ -264,6 +276,11 @@ both A       "200=0 400=1 501=0 secret=no"
 both C       "200=0 400=1 501=0 secret=no"
 both D       "200=0 400=1 501=0 secret=no"
 both E       "200=0 400=1 501=0 secret=no"
+# A field name that is not a token: before the change G was one 200 for the whole message and H and I two, the
+# second one /secret.html.
+both G       "200=0 400=1 501=0 secret=no"
+both H       "200=0 400=1 501=0 secret=no"
+both I       "200=0 400=1 501=0 secret=no"
 
 echo "--- a transfer coding neither end will guess at ---"
 # The proxy forwards chunked verbatim and always has -- it never de-chunks -- so
