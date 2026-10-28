@@ -24,7 +24,11 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 if [ -z "${SL_IN_NS:-}" ]; then
-    unshare -rm true 2>/dev/null || { echo "  FAIL: unshare -rm is not permitted here"; exit 1; }
+    if ! unshare -rm true 2>/dev/null; then
+        echo "=== Integration: a dump that does not fit fails, it does not crash ==="
+        echo "  SKIP: unshare -rm is not permitted here, so there is no private mount for the full disk (unprivileged user namespaces are off)"
+        exit 0
+    fi
     exec env SL_IN_NS=1 BIN="$BIN" unshare -rm bash "$0" "$@"
 fi
 
