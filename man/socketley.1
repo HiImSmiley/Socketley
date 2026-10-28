@@ -8167,7 +8167,8 @@ within fifteen minutes, and a URL's
 and
 .BR Signature ,
 good until
-.BR Expires ;
+.BR Expires ,
+which may lie at most a week (604800 seconds) ahead;
 its resource is the bucket and key as sent with the subresources S3 signs, and
 nothing of the body is signed. Whatever region the credential scope names, none
 included, is accepted. Every

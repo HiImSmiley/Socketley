@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sign-ins (proxies, storage, the dashboard, tunnel edges) within a second,
   where they held until they ran out, up to 30 days; the admin bit is the
   account's now, not the one the cookie was signed with.
+- **A Signature Version 2 presigned URL lasts at most a week.** Its `Expires`
+  could lie any distance ahead, so such a URL never ended; one more than seven
+  days ahead is now refused, as a Version 4 one is.
 - **Every `x-amz-*` header must be signed.** Signature Version 4 required
   only host, the date and the payload hash among the signed headers, so anyone
   holding a signed request or a presigned URL could add `x-amz-copy-source`,

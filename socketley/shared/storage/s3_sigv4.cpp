@@ -1077,6 +1077,9 @@ verify_result verify_v2(const request_view& req, const verify_options& opts, con
             return malformed(form, "Expires is not a number of seconds since the epoch.");
         if (static_cast<int64_t>(until) < now_unix)
             return fail(sigv4_status::expired, 403, "AccessDenied", "Request has expired", form);
+        // A URL that names no signing time is held to the week a Signature Version 4 one may last, counted from now.
+        if (until > static_cast<uint64_t>(now_unix) + static_cast<uint64_t>(opts.max_expires_seconds))
+            return malformed(form, "Expires must be less than a week (604800 seconds) from now.");
         dates.push_back(expires);
     }
     if (access_key.size() > 127)

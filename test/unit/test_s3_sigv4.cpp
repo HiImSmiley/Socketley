@@ -1152,6 +1152,10 @@ TEST_CASE("Signature Version 2: the S3 documentation's examples, a presigned URL
         const s3::verify_result r = s3::verify(rv, opts, lookup, 1141889000);
         CHECK(r.status == s3::sigv4_status::ok);
         CHECK(r.form == s3::auth_form::query);
+        CHECK(s3::verify(rv, opts, lookup, 1141889120 - 604800).status == s3::sigv4_status::ok);
+        const s3::verify_result far = s3::verify(rv, opts, lookup, 1141889120 - 604801);
+        CHECK(far.status == s3::sigv4_status::malformed);
+        CHECK(far.http_status == 400);
         const s3::verify_result late = s3::verify(rv, opts, lookup, 1141889121);
         CHECK(late.status == s3::sigv4_status::expired);
         CHECK(std::string(late.code) == "AccessDenied");
