@@ -222,9 +222,13 @@ std::string entrance_table(const runtime_instance& entrance, const std::vector<c
     }
     // Each HTTP service of a tunnel edge goes to the socket the edge serves it on, unless a runtime or an edge before
     // it has that name, since one name spread over two machines would hand visitors to either.
+    // A runtime's wildcard counts as having the name too, since an exact route would take it from under the wildcard.
     const auto routed = [&](const std::string& name)
     {
-        return std::any_of(routes.begin(), routes.end(), [&](const auto& r) { return r.first == name; });
+        return std::any_of(routes.begin(), routes.end(), [&](const auto& r) {
+            return r.first == name || (r.first.starts_with("*.") && name.size() > r.first.size() - 1 &&
+                                       name.ends_with(std::string_view(r.first).substr(1)));
+        });
     };
     // Edges in the order of their names, so which keeps a name both have does not hang on the order runtimes are listed.
     std::vector<const runtime_instance*> edges;

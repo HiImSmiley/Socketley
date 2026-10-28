@@ -226,6 +226,11 @@ ZONE
     line=$(grep '^route web.example.com ' "$R")
     [ "$line" = "route web.example.com unix:$WEB" ] && ok || bad "two edges' services of one name are not one route" "$line"
     "$BIN" remove t2 >/dev/null 2>&1
+    # A runtime's wildcard keeps the names under it: a service of the same name is no exact route past it.
+    "$BIN" create server wild -p $((SL_PORT_BASE + 1978)) --domain '*.example.com' -s >/dev/null 2>&1
+    sleep 2.5
+    grep -q '^route web.example.com ' "$R" && bad "a runtime's wildcard keeps a service's name" "$(grep 'example.com' "$R")" || ok
+    "$BIN" remove wild >/dev/null 2>&1
     # An agent's upgrade passes the entrance to the edge: the key it holds is taken there.
     up=$(python3 - "$PW" "$(cat "$KEY")" <<'PY'
 import socket, sys
