@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sign-ins (proxies, storage, the dashboard, tunnel edges) within a second,
   where they held until they ran out, up to 30 days; the admin bit is the
   account's now, not the one the cookie was signed with.
+- **Every `x-amz-*` header must be signed.** Signature Version 4 required
+  only host, the date and the payload hash among the signed headers, so anyone
+  holding a signed request or a presigned URL could add `x-amz-copy-source`,
+  object-lock or SSE headers to it. A header the signature does not cover is
+  now 403 AccessDenied, as in S3.
 - **A replica's status is taken only from a replication.** Any client could
   send `x-amz-replication-status: REPLICA`, be judged for ReplicateObject
   instead of the write and so escape a Deny of it, and name a replica version

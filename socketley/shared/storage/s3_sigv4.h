@@ -41,7 +41,8 @@
 //   Query parameters are decoded, re-encoded, and sorted by encoded name then value, with a missing value taken as empty.
 //   A header value has its outer whitespace trimmed and its inner runs folded to one space, and repeated headers are
 //   joined with a comma.
-//   The signed headers must include host, the date header the request uses, and x-amz-content-sha256 when present.
+//   The signed headers must include host, the date header the request uses, and every x-amz-* header the request carries,
+//   but for an x-amz-content-sha256 beside a presigned URL.
 //   The payload hash is the x-amz-content-sha256 header, else request_view::body_sha256_hex, else an error (header form);
 //   a presigned request uses UNSIGNED-PAYLOAD unless the query gives X-Amz-Content-Sha256.
 //

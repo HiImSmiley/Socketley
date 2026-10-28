@@ -8171,6 +8171,12 @@ good until
 its resource is the bucket and key as sent with the subresources S3 signs, and
 nothing of the body is signed. Whatever region the credential scope names, none
 included, is accepted. Every
+.B x\-amz\-*
+header a request carries must be among the signed ones, as S3 requires, but for an
+.B x\-amz\-content\-sha256
+header beside a presigned URL; one that is not is
+.B "403 AccessDenied"
+and the request is refused. Every
 .B x\-amz\-content\-sha256
 mode a client sends is honoured: a hex hash is checked against the body as it
 streams (a body that is not the one signed is

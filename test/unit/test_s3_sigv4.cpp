@@ -1302,6 +1302,30 @@ TEST_CASE("host, the date header and x-amz-content-sha256 must be signed")
     }
 }
 
+TEST_CASE("an x-amz-* header the signature does not cover is refused, in either form and any case")
+{
+    for (const char* name : {"boto3/get-special-key", "docs/presigned-get"})
+    {
+        const kase* c = find_case(name);
+        REQUIRE(c);
+        INFO(name);
+        for (const char* extra : {"x-amz-copy-source", "X-Amz-Object-Lock-Mode", "x-amz-bypass-governance-retention",
+                                  "x-amz-replication-status", "x-amz-server-side-encryption-customer-key"})
+        {
+            req r(*c);
+            r.headers.emplace_back(extra, "anything");
+            INFO(extra);
+            const s3::verify_result res = r.run();
+            CHECK(res.status == s3::sigv4_status::malformed);
+            CHECK(res.http_status == 403);
+            CHECK(std::string(res.code) == "AccessDenied");
+        }
+        req r(*c);
+        r.headers.emplace_back(std::string("x-amz-") + std::string(200, 'a'), "anything");
+        CHECK(r.run().status == s3::sigv4_status::malformed);
+    }
+}
+
 TEST_CASE("the payload hash comes from x-amz-content-sha256, else from the caller, else it is an error")
 {
     const kase* c = find_case("suite/post-x-www-form-urlencoded");

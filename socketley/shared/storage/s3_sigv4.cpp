@@ -723,6 +723,22 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
         if (find_header(req.headers, "x-amz-content-sha256") && !list_contains(sh, "x-amz-content-sha256"))
             return malformed(a.form, "x-amz-content-sha256 must be signed.");
     }
+    // Every x-amz-* header must be signed, as S3 requires, but for the payload hash a presigned URL's sender may state,
+    // which is checked against the body below.
+    for (const header_field& h : req.headers)
+    {
+        if (h.name.size() < 6 || !ascii::iequals(h.name.substr(0, 6), "x-amz-"))
+            continue;
+        char lower[128];
+        const bool fits = h.name.size() <= sizeof lower;
+        for (size_t i = 0; fits && i < h.name.size(); ++i)
+            lower[i] = ascii::lower(h.name[i]);
+        const std::string_view name(lower, fits ? h.name.size() : 0);
+        if (fits && a.form == auth_form::query && name == "x-amz-content-sha256")
+            continue;
+        if (!fits || !list_contains(sh, name))
+            return fail(sigv4_status::malformed, 403, "AccessDenied", "There were headers present in the request which were not signed", a.form);
+    }
 
     std::string_view secret = secrets(a.access_key);
     if (secret.empty())
