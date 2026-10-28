@@ -19,6 +19,7 @@
 #include "../shared/ipc/ipc_framing.h"
 #include "../shared/json/json_doc.h"
 #include "../shared/persist/paths.h"
+#include "../shared/runtime/runtime_name.h"
 #include "../shared/util/settings.h"
 
 namespace {
@@ -503,6 +504,13 @@ int cli_export(int argc, char** argv)
         if (!socketley::json::string_of(r, "owner").empty() || (placed && placed->k == jvalue::kind::boolean && placed->b))
             continue;
         const std::string name(socketley::json::string_of(r, "name"));
+        // The name becomes a file's, a comment and an include string, so one no runtime may have is refused.
+        if (!socketley::valid_runtime_name(name))
+        {
+            std::cout << "the daemon lists a runtime named " << socketley::json::quote(name)
+                      << ", which no runtime may be called\n";
+            return 2;
+        }
         std::string shown, line = "show ";
         ipc_frame::append_arg(line, name);
         jvalue state;

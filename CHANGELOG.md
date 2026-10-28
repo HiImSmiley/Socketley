@@ -170,6 +170,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `denied: readonly mode` over the text protocol and delivered the message over
   RESP, from a client or a script's `redis.call`; it is now `-ERR readonly mode`
   on both.
+- **`export` writes no file after a runtime name that is a path.** It named a
+  runtime's file, its comment and its `include` line after the name the socket
+  answered with, so a listener there that named a runtime `../../x` had the
+  export write outside its directory; a name no runtime may have is refused.
 - **No command goes to a daemon socket held by another user.** Every command
   the CLI sends now asks the socket's peer who it is first and refuses one
   that is neither this user, root nor the packaged daemon's account; `--lua`

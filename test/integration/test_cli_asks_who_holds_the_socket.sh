@@ -7,6 +7,7 @@
 #   * --lua writing `plan` and `create` lines, every flag a runtime is made with and its --master-pw with them, to
 #     whatever listens at the socket path -- /tmp/socketley.sock is shared by every user of the machine
 #   * export asking such a listener for its runtimes and writing what it said into the export
+#   * export naming a file after a listed runtime whose name is a path, so `../../x` wrote outside the export
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -99,6 +100,17 @@ if [ "$rc" -eq 2 ] && [ -z "$(heard_more)" ] && [ ! -e "$W/exp/config.lua" ]; th
     ok "export asks a listener that is no daemon nothing and writes nothing"
 else
     bad "export asks a listener that is no daemon nothing" "rc $rc: $out / heard: $(head -c 300 "$W/heard")"
+fi
+
+# ─── a name that is a path ──────────────────────────────────────────────────
+# A listener that passes for a daemon, as one of this user's own can, lists a runtime whose name climbs out of the
+# export.
+squat mimic "../../escaped"
+out=$("$BIN" export "$W/exp2" 2>&1); rc=$?
+if [ "$rc" -eq 2 ] && [ ! -e "$W/escaped.lua" ] && [ ! -e "$W/exp2/config.lua" ]; then
+    ok "export refuses a runtime name no runtime may have, and writes no file by it"
+else
+    bad "export refuses a name that is a path" "rc $rc: $out / $(ls -R "$W" 2>&1 | head -20)"
 fi
 
 # ─── nothing there ──────────────────────────────────────────────────────────
