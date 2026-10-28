@@ -187,6 +187,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unanswered spent the check's 20-second budget, the policy lookup failed as
   `temperror`, and mail forged under a `p=reject` domain was delivered; the
   record is now read first.
+- **DMARC's `pct=` sample is not the sender's to pick.** It was an unkeyed
+  hash of the Message-ID, so a sender forging a domain that published
+  `p=quarantine; pct=10` chose an ID outside the sample and reached the inbox
+  every time; the hash is now keyed by a secret of the runtime's process.
 - **A share taken back ends in the sessions that have it selected.** Rights
   were read once, at SELECT, so after DELETEACL a grantee who kept the folder
   open went on reading, searching, flagging and expunging the owner's mail

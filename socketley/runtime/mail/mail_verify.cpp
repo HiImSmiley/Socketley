@@ -17,9 +17,11 @@
 #include "mail_compose.h"
 #include "mail_dkim.h"
 #include "../dns/dns_wire.h"
+#include "../../shared/crypto/mac.h"
 #include "../../shared/net/idna.h"
 #include "../../shared/net/public_suffix.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/random_id.h"
 #include "../../shared/util/settings.h"
 #include "../../shared/util/wall_clock.h"
 
@@ -28,6 +30,22 @@ namespace socketley::mail
 
 namespace
 {
+
+// A key of this process's own for DMARC's pct= sample, which no sender can compute offline.
+const std::string& sample_key()
+{
+    static const std::string key = [] {
+        std::string k(32, '\0');
+        if (!socketley::random_bytes(k.data(), k.size()))
+            for (size_t i = 0; i + 8 <= k.size(); i += 8)
+            {
+                const uint64_t v = socketley::random_u64();
+                std::memcpy(k.data() + i, &v, sizeof v);
+            }
+        return k;
+    }();
+    return key;
+}
 
 std::string lower(std::string_view s)
 {
@@ -891,13 +909,15 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
     if (pass)
         return out;
     // pct= samples the failing mail the policy is for; the rest is taken by the policy below it (RFC 7489 6.6.4),
-    // the sample the same for every copy of one message.
+    // the sample the same for every copy of one message and, keyed by this process, not the sender's to pick.
     if (pct < 100)
     {
-        uint64_t h = 1469598103934665603ull;
-        for (const unsigned char c : header_value(head, "Message-ID"))
-            h = (h ^ c) * 1099511628211ull;
-        if (static_cast<int>(h % 100) >= pct)
+        const std::string mac =
+            socketley::crypto::hmac_sha256(sample_key(), out.from_domain + "\n" + header_value(head, "Message-ID"));
+        uint64_t h = 0;
+        for (size_t i = 0; i < 8 && i < mac.size(); ++i)
+            h = h << 8 | static_cast<uint8_t>(mac[i]);
+        if (mac.size() == socketley::crypto::sha256_bytes && static_cast<int>(h % 100) >= pct)
             out.dmarc_policy = out.dmarc_policy == "reject" ? "quarantine" : "none";
     }
     // A forwarder trusted here vouches with a passing chain for what it broke (RFC 8617 7.2).

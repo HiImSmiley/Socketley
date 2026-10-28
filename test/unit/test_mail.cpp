@@ -1414,6 +1414,22 @@ TEST_CASE("DMARC: pct= samples the policy, two records are none, a name past ASC
                                   "1.2.3.4", "h", "", r, 0).reject();
     CHECK(rejected > 60);
     CHECK(rejected < 140);
+    // Forty Message-IDs an unkeyed FNV-1a puts past the sample are sampled as any others are, so no sender picks.
+    int picked = 0, sampled = 0;
+    for (int i = 0; picked < 40; ++i)
+    {
+        const std::string id = "<" + std::to_string(i) + "@x>";
+        uint64_t h = 1469598103934665603ull;
+        for (const unsigned char c : id)
+            h = (h ^ c) * 1099511628211ull;
+        if (h % 100 < 50)
+            continue;
+        ++picked;
+        sampled += check_inbound("From: a@sample.test\r\nMessage-ID: " + id + "\r\n\r\nx\r\n", "1.2.3.4", "h", "", r,
+                                 0).reject();
+    }
+    CHECK(sampled > 0);
+    CHECK(sampled < 40);
     r.txts["_dmarc.two.test"] = {"v=DMARC1; p=reject", "v=DMARC1; p=none"};
     CHECK(check_inbound("From: a@two.test\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0).dmarc == "none");
     r.txts["_dmarc.ver.test"] = {"v=DMARC1x; p=reject"};
