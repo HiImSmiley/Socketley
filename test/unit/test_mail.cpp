@@ -1425,6 +1425,34 @@ TEST_CASE("DMARC: pct= samples the policy, two records are none, a name past ASC
     CHECK(socketley::idna::to_ascii("M\xc3\xbcnchen.DE") == "xn--mnchen-3ya.de");
 }
 
+TEST_CASE("DMARC: the From domain's policy is read first, so names a sender makes slow cannot spend its budget")
+{
+    // A resolver whose budget is one lookup, as the twenty seconds are once a sender's slow names have taken them.
+    struct one_lookup : table_resolver
+    {
+        int left{1};
+        bool txt(const std::string& name, std::vector<std::string>& out, bool& nx) override
+        {
+            return left-- > 0 && table_resolver::txt(name, out, nx);
+        }
+        bool addrs(const std::string& name, std::vector<std::string>& out, bool& nx) override
+        {
+            return left-- > 0 && table_resolver::addrs(name, out, nx);
+        }
+        bool mx(const std::string& name, std::vector<std::string>& out, bool& nx) override
+        {
+            return left-- > 0 && table_resolver::mx(name, out, nx);
+        }
+    };
+    one_lookup r;
+    r.txts["_dmarc.victim.test"] = {"v=DMARC1; p=reject"};
+    r.txts["attacker.test"] = {"v=spf1 a -all"};
+    const auto res = check_inbound("From: ceo@victim.test\r\nMessage-ID: <1@x>\r\n\r\nx\r\n", "1.2.3.4", "h",
+                                   "x@attacker.test", r, 0);
+    CHECK(res.dmarc == "fail");
+    CHECK(res.reject());
+}
+
 TEST_CASE("PSL: a rule past ASCII matches its A-labels, so two tenants under it are two organizations")
 {
     socketley::public_suffix::list l;

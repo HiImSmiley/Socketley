@@ -181,6 +181,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **A DMARC policy is read before the names a sender chose.** The From
+  domain's record was looked up last, after SPF, up to ten DKIM keys and the
+  ARC keys of the sender's naming, so a sender whose nameserver left those
+  unanswered spent the check's 20-second budget, the policy lookup failed as
+  `temperror`, and mail forged under a `p=reject` domain was delivered; the
+  record is now read first.
 - **A share taken back ends in the sessions that have it selected.** Rights
   were read once, at SELECT, so after DELETEACL a grantee who kept the folder
   open went on reading, searching, flagging and expunging the owner's mail

@@ -698,6 +698,61 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
                              const std::vector<std::string>& arc_trusted)
 {
     inbound_result out;
+    const std::string_view head = header_block(message);
+    const std::string from_header = header_value(head, "From");
+    std::vector<address> from;
+    const size_t authors = from_headers(head);
+    const bool authors_ok = parse_mailbox_list(from_header, from) && !from.empty() && authors == 1 &&
+                            std::all_of(from.begin(), from.end(), [&](const address& a) {
+                                return !a.domain.empty() && a.domain == from[0].domain;
+                            });
+    // A name past ASCII is looked up and compared as its A-labels, as DNS and a signature's d= write it.
+    const std::string author_domain = authors_ok ? socketley::idna::to_ascii(lower(from[0].domain)) : std::string();
+    const std::string org = author_domain.empty() ? std::string() : organizational_domain(author_domain);
+    // The From domain's DMARC record is read before any name the sender chose, so names it makes slow cannot spend
+    // the lookup budget the policy needs.
+    std::string policy;
+    bool at_org = false, policy_unread = false;
+    for (const std::string& d : {author_domain, org})
+    {
+        if (d.empty())
+            break;
+        std::vector<std::string> txts;
+        bool nx = false;
+        if (!r.txt("_dmarc." + d, txts, nx))
+        {
+            policy_unread = true;
+            break;
+        }
+        // A record begins v=DMARC1 and a ; or its end; two of them at one name are none (RFC 7489 6.6.3).
+        size_t found = 0;
+        for (const auto& t : txts)
+        {
+            const std::string l = lower(t);
+            size_t q = 0;
+            while (q < l.size() && l[q] == ' ')
+                ++q;
+            if (l.compare(q, 8, "v=dmarc1") != 0)
+                continue;
+            q += 8;
+            while (q < l.size() && l[q] == ' ')
+                ++q;
+            if (q < l.size() && l[q] != ';')
+                continue;
+            ++found;
+            policy = t;
+        }
+        if (found > 1)
+            policy.clear();
+        if (found > 0)
+        {
+            at_org = d != author_domain;
+            break;
+        }
+        if (d == org)
+            break;
+    }
+
     // SPF of the envelope sender's domain, or of HELO's for a bounce (RFC 7208 2.4).
     const size_t at = mail_from.rfind('@');
     out.spf_domain = socketley::idna::to_ascii(lower(at == std::string::npos ? helo : mail_from.substr(at + 1)));
@@ -718,8 +773,6 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
             }
         return true;
     };
-    const std::string_view head = header_block(message);
-    const std::string from_header = header_value(head, "From");
     std::string from_org;
     {
         std::vector<address> a;
@@ -747,8 +800,6 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
     out.arc_sealer = chain.sealer;
 
     // DMARC of the domain From names, the one a reader sees.
-    std::vector<address> from;
-    const size_t authors = from_headers(head);
     // A message with no From names no author to pass for, and DMARC has nothing to say of it.
     if (authors == 0)
     {
@@ -757,10 +808,6 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
     }
     // One whose author cannot be told -- two From headers, one that does not read, or authors of several domains --
     // would pass DMARC by no domain's policy, so it is refused as a failing one would be (RFC 7489 6.6.1).
-    const bool authors_ok = parse_mailbox_list(from_header, from) && !from.empty() && authors == 1 &&
-                            std::all_of(from.begin(), from.end(), [&](const address& a) {
-                                return !a.domain.empty() && a.domain == from[0].domain;
-                            });
     if (!authors_ok)
     {
         out.dmarc = "fail";
@@ -768,58 +815,22 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
         out.why = "its From names no single author's domain";
         return out;
     }
-    // A name past ASCII is looked up and compared as its A-labels, as DNS and a signature's d= write it.
-    out.from_domain = socketley::idna::to_ascii(lower(from[0].domain));
+    out.from_domain = author_domain;
     if (out.from_domain.empty())
     {
         out.dmarc = "permerror";
         return out;
     }
-    const std::string org = organizational_domain(out.from_domain);
-    std::string record;
-    bool at_org = false;
-    for (const std::string& d : {out.from_domain, org})
+    if (policy_unread)
     {
-        std::vector<std::string> txts;
-        bool nx = false;
-        if (!r.txt("_dmarc." + d, txts, nx))
-        {
-            out.dmarc = "temperror";
-            return out;
-        }
-        // A record begins v=DMARC1 and a ; or its end; two of them at one name are none (RFC 7489 6.6.3).
-        size_t found = 0;
-        for (const auto& t : txts)
-        {
-            const std::string l = lower(t);
-            size_t q = 0;
-            while (q < l.size() && l[q] == ' ')
-                ++q;
-            if (l.compare(q, 8, "v=dmarc1") != 0)
-                continue;
-            q += 8;
-            while (q < l.size() && l[q] == ' ')
-                ++q;
-            if (q < l.size() && l[q] != ';')
-                continue;
-            ++found;
-            record = t;
-        }
-        if (found > 1)
-            record.clear();
-        if (found > 0)
-        {
-            at_org = d != out.from_domain;
-            break;
-        }
-        if (d == org)
-            break;
+        out.dmarc = "temperror";
+        return out;
     }
     const auto aligned = [&](const std::string& d, const std::string& mode) {
         const std::string a = socketley::idna::to_ascii(lower(d));
         return mode == "s" ? a == out.from_domain : organizational_domain(a) == org;
     };
-    if (record.empty())
+    if (policy.empty())
     {
         // With no policy the alignment is still told, relaxed, for what trusts a sender that is who it says.
         out.spf_aligned = out.spf == "pass" && aligned(out.spf_domain, "r");
@@ -830,7 +841,7 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
     }
     std::string p = "none", sp, adkim = "r", aspf = "r";
     int pct = 100;
-    std::string_view rest = record;
+    std::string_view rest = policy;
     while (!rest.empty())
     {
         const size_t semi = rest.find(';');
