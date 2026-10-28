@@ -213,6 +213,24 @@ check("a password the entrance did not forward over HTTPS is refused", st == 403
 st, h, _ = web("POST", "/jmap/api", mb, dict(B, **{"X-Forwarded-Proto": "https"}))
 check("one it forwarded over HTTPS is taken, readable by a client of another origin", st == 200
       and h.get("access-control-allow-origin") == "*", (st, h))
+# Another site's form, signed by the Basic credentials a browser keeps for here, changes nothing; a web client of
+# another origin, which calls by CORS with application/json, still does.
+BH = dict(B, **{"X-Forwarded-Proto": "https"})
+bob_acct = "a" + base64.urlsafe_b64encode(b"bob").decode().rstrip("=")
+def forged(name):
+    return json.dumps({"using": USING, "methodCalls": [["Mailbox/set", {"accountId": bob_acct, "create": {"m": {"name": name}}}, "s"]]})
+st_plain, _, _ = web("POST", "/jmap/api", forged("forged-plain"), dict(BH, **{"Content-Type": "text/plain"}))
+st_form, _, _ = web("POST", "/jmap/api", forged("forged-form"), dict(BH, **{"Content-Type": "application/x-www-form-urlencoded"}))
+st_nav, _, _ = web("POST", "/jmap/api", forged("forged-nav"), dict(BH, **{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}))
+st_bare, _, _ = web("POST", "/jmap/api", forged("forged-bare"), {k: v for k, v in dict(BH, **{"Sec-Fetch-Site": "cross-site",
+                    "Sec-Fetch-Mode": "cors"}).items() if k != "Content-Type"})
+st_cors, _, _ = web("POST", "/jmap/api", mb, dict(BH, **{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "cors"}))
+st, _, d = web("POST", "/jmap/api", json.dumps({"using": USING, "methodCalls": [["Mailbox/get", {"accountId": bob_acct}, "g"]]}), BH)
+names = [m.get("name") for m in json.loads(d)["methodResponses"][0][1].get("list", [])] if st == 200 else None
+check("a form's text/plain or urlencoded body, a cross-site navigation and a cross-site body not JSON are refused",
+      (st_plain, st_form, st_nav, st_bare) == (403, 403, 403, 403), (st_plain, st_form, st_nav, st_bare))
+check("and made no mailbox, while a cross-origin client's CORS call is answered", st_cors == 200 and names is not None
+      and not any(n and n.startswith("forged-") for n in names), (st_cors, names))
 bad_pw = {"Authorization": basic("bob", "wrong"), "X-Forwarded-Proto": "https", "X-Forwarded-For": "198.51.100.1, 203.0.113.7"}
 for _ in range(10):
     web("POST", "/jmap/api", mb, bad_pw)

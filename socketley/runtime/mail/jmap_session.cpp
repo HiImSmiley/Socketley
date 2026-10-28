@@ -149,6 +149,26 @@ bool pointer(const json::jvalue& v, std::string_view path, json::jvalue& out)
     return m && pointer(*m, rest, out);
 }
 
+// Whether a browser may have sent `rq` from another site with no preflight, signed with credentials it keeps for here.
+bool unasked_from_elsewhere(const jmap_session::request& rq)
+{
+    const std::string site = rq.header("sec-fetch-site");
+    const bool elsewhere = !site.empty() && site != "same-origin" && site != "none";
+    if (elsewhere && !socketley::ascii::iequals(rq.header("sec-fetch-mode"), "cors"))
+        return true;
+    if (rq.path != "/jmap/api")
+        return false;
+    std::string type = rq.header("content-type");
+    type.erase(std::min(type.find(';'), type.size()));
+    while (!type.empty() && (type.back() == ' ' || type.back() == '\t'))
+        type.pop_back();
+    socketley::ascii::lower_in_place(type);
+    if (elsewhere)
+        return type != "application/json";
+    // The bodies a form sends, which no JMAP client does.
+    return type == "text/plain" || type == "application/x-www-form-urlencoded" || type == "multipart/form-data";
+}
+
 }   // namespace
 
 std::string jmap_session::request::header(std::string_view name) const
@@ -421,6 +441,12 @@ void jmap_session::handle(request rq)
         respond(204, {}, {}, "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                              "Access-Control-Allow-Headers: Authorization, Content-Type, Accept\r\n"
                              "Access-Control-Max-Age: 86400\r\n");
+        return after();
+    }
+    // Basic, a bearer token and the cookie alike: what another site had the browser send unasked changes nothing.
+    if (rq.method != "GET" && rq.method != "HEAD" && unasked_from_elsewhere(rq))
+    {
+        fail(403, "about:blank", "a change from another site goes by CORS, as application/json");
         return after();
     }
     const std::string auth = rq.header("authorization");

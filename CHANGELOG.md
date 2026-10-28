@@ -126,6 +126,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   standing for all, so a Deny on deleting a prefix's objects was passed over
   and they went with the bucket; each version is now judged as its own
   DeleteObjectVersion, and one refused keeps the library, answered 409.
+- **Another site cannot act through the Basic credentials a browser keeps.**
+  Only a change signed by the webmail's cookie had to carry its header, so a
+  form on any site, posting `text/plain` JSON to `/jmap/api`, was signed by
+  the password the browser had cached for the JMAP or DAV prompt and set a
+  vacation reply, a signature or a mailbox; a form's body, a cross-site
+  navigation and a cross-site call whose body is not `application/json` are
+  now 403 whatever signs them.
 - **The webmail's hidden images stay hidden.** An image URL was judged
   remote only by a leading `https://` or `//`, so `&#1;https://...`,
   `\\host/...` and a `//` split by a newline, which the browser reads as
