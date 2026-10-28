@@ -18,6 +18,8 @@ public:
     bool empty() const { return m_rules.empty() && m_wild.empty(); }
     // `name`'s public suffix and one label more, in lower case; the name itself where it is a suffix or one label.
     std::string registrable(std::string_view name) const;
+    // Whether two host names are one registrable domain's, never for an address and never by an empty list.
+    bool same_owner(std::string_view a, std::string_view b) const;
 
 private:
     std::unordered_set<std::string> m_rules, m_wild, m_except;

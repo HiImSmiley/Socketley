@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <vector>
 
+#include <arpa/inet.h>
+
 #include "idna.h"
 #include "../persist/read_file.h"
 #include "../util/ascii.h"
@@ -78,6 +80,18 @@ std::string list::registrable(std::string_view name) const
     if (best >= labels)
         return n;
     return n.substr(starts[labels - best - 1]);
+}
+
+bool list::same_owner(std::string_view a, std::string_view b) const
+{
+    // An address names no registrable domain: by the unlisted-suffix rule 10.0.0.1 and 192.168.0.1 would be one.
+    in_addr v4{};
+    const auto address = [&v4](std::string_view n) {
+        return n.find(':') != std::string_view::npos || ::inet_pton(AF_INET, std::string(n).c_str(), &v4) == 1;
+    };
+    if (empty() || a.empty() || b.empty() || address(a) || address(b))
+        return false;
+    return registrable(a) == registrable(b);
 }
 
 const list& system_list()

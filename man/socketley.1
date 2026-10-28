@@ -1207,7 +1207,12 @@ the edge's own idp, asked of the edge, unless given; an idp the edge names
 is trusted with a sign-in kept here only when it is beside the edge
 .RB ( auth.example.com
 for
-.BR edge.example.com ),
+.BR edge.example.com :
+one registrable domain by the Public Suffix List in
+.IR /usr/share/publicsuffix ,
+so not two names under
+.BR duckdns.org ,
+and without the list only the edge's own name),
 and any other only when given with
 .BR \-\-idp ;
 .B ssh

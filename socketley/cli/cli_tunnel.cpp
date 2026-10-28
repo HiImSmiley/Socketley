@@ -25,6 +25,7 @@
 #include "../shared/loop/blocking_write.h"
 #include "../shared/persist/paths.h"
 #include "../shared/util/text_list.h"
+#include "../shared/net/public_suffix.h"
 #include "../shared/net/tunnel_mux.h"
 #include "../runtime/idp/idp_logic.h"
 
@@ -231,12 +232,8 @@ bool beside_edge(std::string_view edge_host, std::string_view issuer)
         h = h.substr(0, colon);
     if (h == edge_host)
         return true;
-    const size_t dot = h.find('.');
-    const std::string_view parent = dot == std::string_view::npos ? std::string_view() : h.substr(dot + 1);
-    in6_addr literal{};
-    return parent.find('.') != std::string_view::npos && ::inet_pton(AF_INET, std::string(h).c_str(), &literal) != 1 &&
-           edge_host.size() > parent.size() && edge_host.ends_with(parent) &&
-           edge_host[edge_host.size() - parent.size() - 1] == '.';
+    // One registrable domain and not one parent label, which made evil.duckdns.org beside home.duckdns.org.
+    return socketley::public_suffix::system_list().same_owner(h, edge_host);
 }
 
 // The idp the edge takes sign-ins of, asked of the edge itself when none was given; a sign-in kept here goes only to an

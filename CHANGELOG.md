@@ -170,6 +170,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `denied: readonly mode` over the text protocol and delivered the message over
   RESP, from a client or a script's `redis.call`; it is now `-ERR readonly mode`
   on both.
+- **A tunnel edge's idp is beside it only within one registrable domain.**
+  `tunnel connect`, `ssh` and `join` handed a kept sign-in to the idp an edge
+  named whenever the two shared a parent label, so `evil.duckdns.org` could
+  name `https://home.duckdns.org` and be sent its token to replay there; the
+  two names must now be one registrable domain by the Public Suffix List, and
+  without the list only the edge's own name is trusted without `--idp`.
 - **A tunnel service's hashed socket is no longer in `/tmp`.** Where the state
   directory is too deep for a socket's path, an edge served the service on
   `/tmp/skl-<hash>.sock`, which another local user could bind while the edge

@@ -1063,6 +1063,22 @@ TEST_CASE("the Public Suffix List: rules, wildcards and exceptions decide the re
     }
 }
 
+TEST_CASE("the Public Suffix List: two names are one owner's within one registrable domain, as a tunnel's idp and edge")
+{
+    socketley::public_suffix::list l;
+    l.load("com\norg\nduckdns.org\nuk\nco.uk\n");
+    CHECK(l.same_owner("auth.example.com", "edge.example.com"));
+    CHECK(l.same_owner("example.com", "edge.example.com"));
+    CHECK(l.same_owner("example.co.uk", "edge.example.co.uk"));
+    // Two names under a suffix anyone may register beneath are two owners', as a parent label alone took them for one.
+    CHECK_FALSE(l.same_owner("home.duckdns.org", "evil.duckdns.org"));
+    CHECK_FALSE(l.same_owner("example.co.uk", "evil.co.uk"));
+    CHECK_FALSE(l.same_owner("auth.example.com", "auth.example.org"));
+    CHECK_FALSE(l.same_owner("10.0.0.1", "192.168.0.1"));
+    CHECK_FALSE(l.same_owner("::1", "::1"));
+    CHECK_FALSE(socketley::public_suffix::list{}.same_owner("auth.example.com", "edge.example.com"));
+}
+
 TEST_CASE("ManageSieve: a sign-in answered at once, the commands pipelined behind it, a literal cut anywhere")
 {
     struct h : managesieve_session::hooks
