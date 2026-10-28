@@ -5728,12 +5728,28 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 // it this way before this flag absorbed it.
                 char fd_buf[16];
                 auto [fd_end, fd_ec] = std::to_chars(fd_buf, fd_buf + sizeof(fd_buf), sender->fd);
+                const std::string_view prefix_fd(fd_buf, static_cast<size_t>(fd_end - fd_buf));
                 std::string buf;
                 buf.reserve(msg.size() + 16);
                 buf.push_back('[');
-                buf.append(fd_buf, fd_end - fd_buf);
+                buf.append(prefix_fd);
                 buf.append("] ", 2);
-                buf.append(msg.data(), msg.size());
+                // A WebSocket message can hold line breaks, so every line it makes carries the sender's own prefix.
+                for (size_t i = 0; i < msg.size(); ++i)
+                {
+                    const char c = msg[i];
+                    if (c != '\n' && c != '\r')
+                    {
+                        buf.push_back(c);
+                        continue;
+                    }
+                    if (c == '\r' && i + 1 < msg.size() && msg[i + 1] == '\n')
+                        ++i;
+                    buf.push_back('\n');
+                    buf.push_back('[');
+                    buf.append(prefix_fd);
+                    buf.append("] ", 2);
+                }
                 buf.push_back('\n');
                 auto fwd_msg = std::make_shared<const std::string>(std::move(buf));
                 queue_send(m_conn_idx[m_master_fd], fwd_msg, false, nullptr, kind);

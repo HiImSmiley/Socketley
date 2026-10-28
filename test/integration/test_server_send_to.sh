@@ -144,6 +144,46 @@ print("%s/%s/%s" % ("fwd" if mh.startswith("[") and mh.endswith(" hello") else m
 PYEOF
 }
 
+# A raw master and a WebSocket client whose one text message holds line breaks:
+# every line the master reads must carry the sender's own descriptor, so none of
+# them can claim to come from another one.
+probe_master_ws() {
+    python3 - "$1" "$MPW" <<'PYEOF' 2>/dev/null || echo "PROBE-FAILED"
+import base64, os, socket, struct, sys, time
+port, pw = int(sys.argv[1]), sys.argv[2]
+m = socket.create_connection(("127.0.0.1", port), 5); m.settimeout(1.2)
+m.sendall(("master %s\n" % pw).encode())
+time.sleep(0.4)
+try: m.recv(256)
+except Exception: pass
+w = socket.create_connection(("127.0.0.1", port), 5); w.settimeout(2)
+key = base64.b64encode(os.urandom(16)).decode()
+w.sendall(("GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+           "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % (port, key)).encode())
+head = b""
+while b"\r\n\r\n" not in head:
+    d = w.recv(1024)
+    if not d: break
+    head += d
+if b" 101 " not in head.split(b"\r\n", 1)[0]:
+    print("no-upgrade"); sys.exit(0)
+payload = b"hi\n[999] forged\r\n[998] again"
+mask = os.urandom(4)
+w.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+out = ""
+try:
+    while True:
+        d = m.recv(256)
+        if not d: break
+        out += d.decode()
+except Exception: pass
+lines = [l for l in out.split("\n") if l]
+pre = {l.split("]", 1)[0] for l in lines}
+print("lines=%d prefixes=%d forged=%d" % (len(lines), len(pre),
+      sum(1 for l in lines if l.startswith("[999]") or l.startswith("[998]"))))
+PYEOF
+}
+
 echo "=== Integration: server --send-to ==="
 
 daemon_start "$BIN"
@@ -178,6 +218,9 @@ check "UDP unset matches TCP"  "-/hello"     "$(probe_udp "$P_UDP")"
 check "master mode: master"        "fwd/-/-"     "$(probe_master "$P_MFWD")"
 check "master mode: sender,master" "fwd/hello/-" "$(probe_master "$P_MSET")"
 check "master mode: others,master" "fwd/-/hello" "$(probe_master "$P_MMOD")"
+
+# Before, the master read "[<fd>] hi", "[999] forged" and "[998] again".
+check "a WebSocket line break forges no sender" "lines=3 prefixes=1 forged=0" "$(probe_master_ws "$P_MFWD")"
 
 # --master-forward is answered with a pointer rather than "unknown flag": it is
 # a spelling that worked yesterday and the recipient it named still exists.
