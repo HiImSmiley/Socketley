@@ -512,4 +512,23 @@ std::string header_value(std::string_view headers, std::string_view name)
     return {};
 }
 
+size_t from_headers(std::string_view headers, std::string* first)
+{
+    size_t n = 0;
+    for (std::string_view rest = headers; !rest.empty();)
+    {
+        const size_t nl = rest.find('\n');
+        const std::string_view line = rest.substr(0, nl);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        // A line that begins with a space or a tab goes on the header above it.
+        if (line.empty() || line.front() == ' ' || line.front() == '\t')
+            continue;
+        const size_t colon = line.find(':');
+        n += colon != std::string_view::npos && socketley::ascii::iequals(trim(line.substr(0, colon)), "From");
+    }
+    if (first)
+        *first = header_value(headers, "From");
+    return n;
+}
+
 }   // namespace socketley::mail

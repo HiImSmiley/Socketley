@@ -786,6 +786,31 @@ TEST_CASE("DMARC: aligned SPF or DKIM passes, a policy is taken from the organiz
     CHECK(organizational_domain("example") == "example");
 }
 
+TEST_CASE("DMARC: a From written with a space before its colon is an author, counted as every other")
+{
+    table_resolver r;
+    r.txts["_dmarc.example.test"] = {"v=DMARC1; p=reject"};
+    // The name is trimmed as header_value, IMAP's ENVELOPE and JMAP read it, so its domain's policy holds.
+    auto res = check_inbound("From : ceo@example.test\r\nSubject: x\r\n\r\nbody\r\n", "203.0.113.5", "evil.test",
+                             "x@else.test", r, 0);
+    CHECK(res.dmarc == "fail");
+    CHECK(res.reject());
+    // Beside another From it is a second author, and the message is refused as one whose author cannot be told.
+    res = check_inbound("From: a@nodmarc.test\r\nFrom\t: ceo@example.test\r\n\r\nbody\r\n", "203.0.113.5", "evil.test",
+                        "a@nodmarc.test", r, 0);
+    CHECK(res.dmarc == "fail");
+    CHECK(res.reject());
+    CHECK(from_headers("From : a@b.test\r\nfrom: c@d.test\r\n FROM: folded\r\n\r\n") == 2);
+    // A From behind a bare LF is one a reader may see; header_value does not, so its author reads as none.
+    std::string first;
+    CHECK(from_headers("Subject: x\nFrom: ceo@example.test\r\n\r\n", &first) == 1);
+    CHECK(first.empty());
+    CHECK(from_headers("FROM :  a@b.test \r\n\r\n", &first) == 1);
+    CHECK(first == "a@b.test");
+    res = check_inbound("Subject: x\nFrom: ceo@example.test\r\n\r\nbody\r\n", "203.0.113.5", "evil.test", "x@else.test", r, 0);
+    CHECK(res.reject());
+}
+
 TEST_CASE("DMARC: a DKIM signature of the From domain passes where SPF does not")
 {
     table_resolver r;

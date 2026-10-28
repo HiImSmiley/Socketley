@@ -47,5 +47,8 @@ std::string_view header_block(std::string_view message);
 std::string header_value(std::string_view headers, std::string_view name);
 // Each header as name and raw value (folding kept), in order.
 std::vector<std::pair<std::string_view, std::string_view>> split_headers(std::string_view headers);
+// How many From headers a block has, each name trimmed as header_value reads it and a bare LF ending a line as some
+// readers take it, with header_value's value in `first`; the one place DMARC, submission and signing count them.
+size_t from_headers(std::string_view headers, std::string* first = nullptr);
 
 }   // namespace socketley::mail

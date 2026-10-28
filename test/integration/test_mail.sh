@@ -168,6 +168,16 @@ check "nor under a From header of another" "$(smtp "$SUB" alice@example.test car
 Subject: forged
 
 the ceo says' starttls login alice alicepass1)" "refused 553"
+check "nor under a second From of another, written with a space before its colon" \
+    "$(smtp "$SUB" alice@example.test carol@remote.test 'From: alice@example.test
+From : ceo@example.test
+Subject: forged
+
+the ceo says too' starttls login alice alicepass1)" "refused 553"
+check "nor under one From of another written so" "$(smtp "$SUB" alice@example.test carol@remote.test 'From : ceo@example.test
+Subject: forged
+
+the ceo says once more' starttls login alice alicepass1)" "refused 553"
 
 # ─── socketley send ─────────────────────────────────────────────────────────
 id=$("$BIN" send m --from alice@example.test --to dave@remote.test --subject "Hello from the CLI" --text "cli body" 2>&1)

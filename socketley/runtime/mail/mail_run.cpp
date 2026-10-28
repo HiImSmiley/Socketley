@@ -2197,9 +2197,11 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
     if (!smtp->user().empty())
     {
         std::vector<address> authors;
-        const std::string from = header_value(header_block(head), "From");
-        if (!from.empty() && (!parse_mailbox_list(from, authors) ||
-                              std::any_of(authors.begin(), authors.end(), [this](const address& a) { return !owns(a); })))
+        std::string from;
+        const size_t n = from_headers(header_block(head), &from);
+        // Two From headers are two authors a reader and a checker may each take one of, so they are refused.
+        if (n > 1 || (n == 1 && (!parse_mailbox_list(from, authors) || authors.empty() ||
+                                 std::any_of(authors.begin(), authors.end(), [this](const address& a) { return !owns(a); }))))
         {
             r.m_spool.abort(w);
             done({553, "The From header names an address not owned by " + smtp->user()});

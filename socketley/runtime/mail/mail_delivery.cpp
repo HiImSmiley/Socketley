@@ -1643,7 +1643,9 @@ void delivery::sign_read(const std::shared_ptr<sign_job>& j)
         return;
     }
     const std::string_view whole = j->kept ? std::string_view(*j->kept) : std::string_view(j->data);
-    const std::string dom = signing_domain(header_value(header_block(whole), "From"));
+    // Only a message of one author is signed as its domain, the author DMARC takes it to be.
+    std::string author;
+    const std::string dom = from_headers(header_block(whole), &author) == 1 ? signing_domain(author) : std::string();
     // Mail from elsewhere that was checked here and is sent on, as an alias does, is sealed by ARC (RFC 8617), so the
     // next hop can know what it was as it came; other mail not from one of its domains goes unsigned.
     const bool forwarded = dom.empty() && !j->e->auth.empty() && !m_run.domains().empty();

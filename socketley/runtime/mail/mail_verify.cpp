@@ -748,23 +748,16 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
 
     // DMARC of the domain From names, the one a reader sees.
     std::vector<address> from;
-    size_t from_headers = 0;
-    for (std::string_view rest = head; !rest.empty();)
-    {
-        const size_t nl = rest.find('\n');
-        const std::string_view line = rest.substr(0, nl);
-        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
-        from_headers += line.size() > 5 && socketley::ascii::iequals(line.substr(0, 5), "From:");
-    }
+    const size_t authors = from_headers(head);
     // A message with no From names no author to pass for, and DMARC has nothing to say of it.
-    if (from_headers == 0)
+    if (authors == 0)
     {
         out.dmarc = "none";
         return out;
     }
     // One whose author cannot be told -- two From headers, one that does not read, or authors of several domains --
     // would pass DMARC by no domain's policy, so it is refused as a failing one would be (RFC 7489 6.6.1).
-    const bool authors_ok = parse_mailbox_list(from_header, from) && !from.empty() && from_headers == 1 &&
+    const bool authors_ok = parse_mailbox_list(from_header, from) && !from.empty() && authors == 1 &&
                             std::all_of(from.begin(), from.end(), [&](const address& a) {
                                 return !a.domain.empty() && a.domain == from[0].domain;
                             });

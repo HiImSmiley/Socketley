@@ -64,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **A `From :` header is an author to DMARC and to submission.** DMARC
+  counted only lines beginning `From:`, so `From : ceo@<domain>`, the author
+  every reader shows, got dmarc=none and no policy, and a second From written
+  so slipped past the two-From refusal and a user's submission check; every
+  From header is now found by the name rule readers use.
 - **No user takes the buckets' default owner.** An invitation or CreateUser
   could make a user named `socketley`, the owner every bucket with none
   recorded belongs to, and so own all of them; the name is refused.
