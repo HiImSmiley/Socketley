@@ -166,6 +166,8 @@ private:
         sockaddr_storage peer{};
         // Its address as text, IPv4 for a client a dual-stack listener took over IPv4.
         std::string ip;
+        // What its connections and messages count under: the address, or an IPv6 one's /64.
+        std::string net;
         // The client the entrance in front of the webmail port forwards, whose failed sign-ins count against it.
         std::string forwarded;
         port_kind kind{port_kind::smtp};

@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Cookie field, and could replay it at every runtime that trusts the provider,
   the provider itself included; it now gets every other cookie, and learns who
   is signed in from `X-Forwarded-User` alone.
+- **Mail counts an IPv6 client by its /64.** The ten failed sign-ins that
+  lock an address out, and the connections and messages an address may have,
+  were counted per address, so one /64 tried a password at every account from
+  a fresh address each time and was never locked out; they are counted per
+  /64 now, as the idp counts them.
 - **`idp-user import` makes no storage admin an idp admin.** A storage user
   with the admin bit became a member of `admins`, which is root on every host
   that trusts the idp's SSH CA, so a storage admin could hand out root by

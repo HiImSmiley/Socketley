@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "../../shared/net/address_key.h"
 #include "../../shared/util/transparent_string.h"
 
 typedef struct evp_pkey_st EVP_PKEY;
@@ -89,8 +90,8 @@ bool form_origin_allowed(std::string_view origin, std::string_view issuer, std::
 // it is one, or empty.
 std::string email_problem(std::string_view email);
 
-// What failures from the address `ip` count under: the address, and for IPv6 its /64, which one host is given whole.
-std::string address_key(std::string_view ip);
+// What failures from an address count under, as mail counts them too.
+using socketley::address_key;
 
 // Failed attempts by what they were made at -- an address, an account -- within a window, and the attempts at each
 // still being checked, so many sent at once are counted before any of them is answered.

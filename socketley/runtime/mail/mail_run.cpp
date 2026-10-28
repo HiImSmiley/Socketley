@@ -41,6 +41,7 @@
 #include "../../shared/crypto/tls_context.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/net/address_key.h"
 #include "../../shared/net/dns_feed.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/persist/replaced_file.h"
@@ -1113,12 +1114,13 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
         socklen_t len = sizeof peer;
         if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &len) < 0) {}
         const std::string ip = peer_ip(peer);
+        const std::string net = socketley::address_key(ip);
         const bool smtp_port = l.kind == port_kind::smtp || l.kind == port_kind::submission || l.kind == port_kind::lmtp;
         const bool imap_port = l.kind == port_kind::imap || l.kind == port_kind::imaps;
         const size_t limit = m_owner.get_max_connections() ? m_owner.get_max_connections() : default_max_conns;
         const uint32_t per_ip = l.kind == port_kind::smtp ? smtp_per_ip : other_per_ip;
         const bool full = limit && m_conns.size() >= limit;
-        const bool crowded = !loopback(peer) && m_clients[ip].conns >= per_ip;
+        const bool crowded = !loopback(peer) && m_clients[net].conns >= per_ip;
         // LMTP takes mail for the mailboxes with no check of it, so only a server on this machine may speak it.
         const bool stranger = l.kind == port_kind::lmtp && !loopback(peer);
         if (m_stopped || full || crowded || stranger)
@@ -1133,8 +1135,8 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
                                      : l.kind == port_kind::pop3  ? "-ERR [SYS/TEMP] " + why + "\r\n"
                                                                   : std::string();
             if (!m_stopped && !said.empty() && ::send(fd, said.data(), said.size(), MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {}
-            if (m_clients[ip].conns == 0 && m_clients[ip].failures == 0)
-                m_clients.erase(ip);
+            if (m_clients[net].conns == 0 && m_clients[net].failures == 0)
+                m_clients.erase(net);
             m_loop.close_fd(fd);
         }
         else
@@ -1146,7 +1148,8 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
             c->kind = l.kind;
             c->peer = peer;
             c->ip = ip;
-            ++m_clients[ip].conns;
+            c->net = net;
+            ++m_clients[net].conns;
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
             c->closing_ms = c->heard_ms = wall::now_ms_coarse();
@@ -1721,7 +1724,7 @@ void mail_run::close_conn(conn& c)
     if (c.dead)
         return;
     c.dead = true;
-    if (const auto it = m_clients.find(c.ip); it != m_clients.end())
+    if (const auto it = m_clients.find(c.net); it != m_clients.end())
     {
         it->second.conns -= std::min<uint32_t>(it->second.conns, 1);
         if (it->second.conns == 0 && it->second.failures == 0 && it->second.tokens_ms == 0)
@@ -1817,7 +1820,9 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
     // An address that failed too often lately is told to come back later, its password not looked at.
     const int64_t now = wall::now_ms_coarse();
     // Behind the entrance it is the client it forwards, which loopback never exempts.
-    const std::string& from = forwarded.empty() ? ip : forwarded;
+    const std::string& seen = forwarded.empty() ? ip : forwarded;
+    // Counted by its /64 for IPv6, so the addresses of one network are not each a fresh budget of guesses.
+    const std::string from = socketley::address_key(seen);
     const bool guarded = !forwarded.empty() || !loopback(peer);
     std::string acct = user;
     socketley::ascii::lower_in_place(acct);
@@ -1828,8 +1833,8 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
         return;
     }
     // A wrong answer waits a second before it is said, and counts against its address and its account.
-    auto finish = [&r, alive = r.m_alive, done, guarded, ip = from, acct, proto = std::string(protocol)](account a,
-                                                                                                       std::string name) {
+    auto finish = [&r, alive = r.m_alive, done, guarded, ip = from, seen, acct, proto = std::string(protocol)](
+                      account a, std::string name) {
         if (!*alive)
             return;
         if (a != account::no)
@@ -1839,7 +1844,7 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
             {
                 r.account_signed_in(acct, name, ip);
                 LOG_INFO(("mail " + std::string(r.m_owner.get_name()) + ": " + name + " signed in over " + proto +
-                          " from " + ip)
+                          " from " + seen)
                              .c_str());
             }
             done(a, std::move(name));
@@ -1944,7 +1949,7 @@ void mail_run::conn::mail_from(const address& from, std::function<void(rcpt_verd
     }
     // --rate-limit holds each sender to so many messages a second, its address or its account; the runtime is held to
     // --global-rate-limit's.
-    if (!run->may_send(smtp->user().empty() ? ip : "user:" + smtp->user()))
+    if (!run->may_send(smtp->user().empty() ? net : "user:" + smtp->user()))
     {
         ++run->m_rate_limited;
         done({450, "Too many messages; try again later"});
@@ -3604,12 +3609,13 @@ void mail_run::load_auth()
             l = sp == std::string_view::npos ? std::string_view{} : l.substr(sp + 1);
         }
         const auto ms = [&](size_t i) { return i < w.size() ? std::strtoll(w[i].c_str(), nullptr, 10) : 0; };
+        // An address an older runtime wrote whole is read as what it counts under now.
         if (w.size() == 3 && w[0] == "ip" && ms(2) > now)
-            m_clients[w[1]].locked_until_ms = ms(2);
+            m_clients[socketley::address_key(w[1])].locked_until_ms = ms(2);
         else if (w.size() == 3 && w[0] == "locked" && ms(2) > now)
             m_accounts[w[1]].locked_until_ms = ms(2);
         else if (w.size() == 4 && w[0] == "known" && now - ms(3) <= known_for_ms)
-            m_accounts[w[1]].known[w[2]] = ms(3);
+            m_accounts[w[1]].known[socketley::address_key(w[2])] = ms(3);
     }
 }
 

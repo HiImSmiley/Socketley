@@ -10,7 +10,7 @@
 #   * the idp's session cookie not taken, a change it signs not refused without the page's header, or a cookie's
 #     answer readable by another origin
 #   * a password taken in the clear behind an entrance that did not forward HTTPS, or a client the entrance forwards
-#     never locked out, or locked out with every other
+#     never locked out, or locked out with every other, or an IPv6 one let off by moving within its /64
 #   * an upload or a download refused to the cookie, or a download a browser would render
 #   * Email/set dropping a recipient's name or a Bcc, refusing a draft with no recipient or with its own Message-ID,
 #     or a move refused when its mailbox's null comes first
@@ -203,6 +203,18 @@ for i in range(10):
 st = web_from("127.0.0.2", "POST", "/jmap/api", mb, {"Authorization": basic("alice", "alicepassword1"), "X-Forwarded-Proto": "https",
                                                      "X-Forwarded-For": "198.51.100.99", "Content-Type": "application/json"})
 check("a peer other than the entrance is locked out by its own address, not by the client it names", st == 503, st)
+# An IPv6 client counts by its /64, so ten failures spread over its addresses lock out the whole of it and no more.
+import threading
+v6 = [threading.Thread(target=web, args=("POST", "/jmap/api", mb, {"Authorization": basic("spray%d" % i, "wrong"),
+      "X-Forwarded-Proto": "https", "X-Forwarded-For": "2001:db8:6:4::%x" % (i + 1)})) for i in range(10)]
+for t in v6:
+    t.start()
+for t in v6:
+    t.join()
+st, _, _ = web("POST", "/jmap/api", mb, dict(B, **{"X-Forwarded-Proto": "https", "X-Forwarded-For": "2001:db8:6:4:ffff::9"}))
+st2, _, _ = web("POST", "/jmap/api", mb, dict(B, **{"X-Forwarded-Proto": "https", "X-Forwarded-For": "2001:db8:6:5::1"}))
+check("ten failures from as many addresses of one IPv6 /64 lock out every address in it, and not the next /64",
+      st == 503 and st2 == 200, (st, st2))
 
 # Uploads, drafts, a move, and sending.
 st, h, d = web("POST", "/jmap/upload/%s/" % acct, b"attached text", {"Cookie": cookie, "X-Socketley-UI": "1", "Content-Type": "text/plain"})

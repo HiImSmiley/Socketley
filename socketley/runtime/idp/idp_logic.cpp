@@ -4,8 +4,6 @@
 #include <cctype>
 #include <charconv>
 
-#include <arpa/inet.h>
-
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -556,21 +554,6 @@ bool verify_secret_token(std::string_view secret, std::string_view typ, std::str
                           return !want.empty() && crypto::secure_equal(sig, want);
                       },
                       out, why);
-}
-
-std::string address_key(std::string_view ip)
-{
-    const std::string text(ip);
-    unsigned char a[16];
-    if (text.find(':') == std::string::npos || ::inet_pton(AF_INET6, text.c_str(), a) != 1)
-        return text;
-    // An IPv4 address written as IPv6 is the IPv4 address.
-    static constexpr unsigned char mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
-    char buf[INET6_ADDRSTRLEN] = {};
-    if (std::equal(mapped, mapped + 12, a))
-        return ::inet_ntop(AF_INET, a + 12, buf, sizeof buf) ? std::string(buf) : text;
-    std::fill(a + 8, a + 16, 0);
-    return ::inet_ntop(AF_INET6, a, buf, sizeof buf) ? std::string(buf) + "/64" : text;
 }
 
 attempt_limits::entry& attempt_limits::fresh(const std::string& key, int64_t now)
