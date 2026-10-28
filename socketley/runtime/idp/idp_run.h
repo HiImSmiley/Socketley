@@ -130,12 +130,19 @@ private:
     // address to send the error to.
     const client* checked_client(const std::shared_ptr<conn>& c, const params& p);
     // The code for a signed-in account, sent to the client's redirect, or the browser sent on.
-    void grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie);
+    void grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie,
+               int64_t auth_time = 0);
     void login_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status);
     void reset_page(const std::shared_ptr<conn>& c, const std::string& token, std::string_view error, int status);
     // A sign-in whose password, and code where the account has one, were right, sent to set its password again.
     void reset_after_sign_in(const std::shared_ptr<conn>& c, const account& a, const params& p, bool remember);
+    // The tokens of a sign-in, its refresh token, where it gets one, the first of a family kept with the account.
     void issue_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who);
+    // The tokens answered, the refresh token of the family `family` at its `generation`, none for an empty family.
+    void send_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who,
+                     std::string_view family, uint64_t generation);
+    // A refresh token exchanged: the next of its family given, and the family ended when one before the newest comes.
+    void refresh_grant(const std::shared_ptr<conn>& c, const client& cl, const claims& r, const account& who);
     // An authorization code exchanged, once the shard that gave it has handed over its entry.
     void redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, bool found, const code_entry& e);
 
@@ -175,7 +182,7 @@ private:
 
     // The signed-in account the request's cookie names, null when there is none, it does not verify, or the
     // account has since been disabled, removed or signed out everywhere.
-    const account* session_of(const request& rq) const;
+    const account* session_of(const request& rq, int64_t* auth_time = nullptr) const;
     std::string session_cookie(const account& who, bool remember) const;
     std::string clear_cookie() const;
     std::string client_ip(const conn& c, const request& rq) const;

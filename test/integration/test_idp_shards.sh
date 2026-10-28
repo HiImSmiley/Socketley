@@ -9,6 +9,7 @@
 #   * a reading shard losing the accounts when shard 0 folds its journal into a snapshot
 #   * an address barred at one shard trying its five again at each of the others
 #   * one code of the second step signing in once at each shard
+#   * one refresh token refreshing once at each shard
 #   * the accounts or the key lost when the runtime restarts with another number of shards
 set -uo pipefail
 
@@ -130,6 +131,14 @@ if phase == "main":
         check("the account page saves at every shard", (st, "Saved." in body), (200, True))
         check("a change on the account page is what every shard says next",
               [userinfo(tokens[i]["access_token"]) for i in range(8)], ["Alice %d" % n] * 8)
+    # A refresh token refreshes once, whichever shard it reaches, and one used again ends its sign-in at every shard.
+    st, body, _ = req("POST", "/token", dict(grant_type="refresh_token", refresh_token=tokens[2]["refresh_token"]), BASIC)
+    newest = json.loads(body).get("refresh_token", "") if st == 200 else ""
+    check("a refresh at whichever shard gives the next token", (st, bool(newest)), (200, True))
+    check("and the one before it refreshes at no shard",
+          [req("POST", "/token", dict(grant_type="refresh_token", refresh_token=tokens[2]["refresh_token"]), BASIC)[0] for _ in range(4)], [400] * 4)
+    check("nor, its sign-in ended, does the newest",
+          [req("POST", "/token", dict(grant_type="refresh_token", refresh_token=newest), BASIC)[0] for _ in range(4)], [400] * 4)
     json.dump({"cookie": cookie, "access": tokens[0]["access_token"], "refresh": tokens[1]["refresh_token"],
                "kid": jwt.get_unverified_header(tokens[0]["id_token"])["kid"], "id_token": tokens[0]["id_token"]},
               open(state_file, "w"))

@@ -12386,6 +12386,8 @@ a user changes their name, address and password and signs out everywhere.
 Tokens are signed ES256 with a P\-256 key made at the first start and kept in
 the state directory, so a restart signs nobody out; a refresh token, which only
 the provider reads back, is signed HS256 under a secret made from that key. A
+refresh token is good once: a refresh gives the next of its sign-in, kept with
+the account, and one used again ends that sign-in, its newest token too. A
 password is hashed and checked off the event loop, on a thread for each core
 the runtime may use, up to four shared out among its shards, each making up to
 four sign-ins' scrypt at once with AVX2. It serves plain HTTP and is reached through the
@@ -12463,7 +12465,8 @@ a user certificate holding
 (1 to 168) for the account whose access token is sent, given only to a client
 marked
 .B ssh
-and never to a disabled account. A user certificate permits a terminal, port
+and never to a disabled account, nor on a sign-in more than twelve hours old,
+refreshed tokens and all, which is told to sign in again. A user certificate permits a terminal, port
 forwarding and agent forwarding, and neither X11 forwarding nor the user's
 .IR ~/.ssh/rc .
 Every certificate is said in the log with the

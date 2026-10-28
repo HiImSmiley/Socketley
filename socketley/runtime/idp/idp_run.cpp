@@ -69,6 +69,11 @@ constexpr int     code_free     = 5;
 // Wrong codes one password step may be followed by before it must be given again.
 constexpr int     code_tries    = 3;
 constexpr int64_t known_secs    = 90 * 86400;
+// The refresh token families an account keeps, the oldest given up past them: a field each, rt.<id> "<generation> <expires>".
+constexpr size_t  max_families  = 32;
+constexpr std::string_view family_prefix = "rt.";
+// How long a sign-in buys SSH certificates for, refreshed tokens and all.
+constexpr int64_t ssh_auth_secs = 12 * 3600;
 constexpr std::string_view known_cookie_name = "skl_idp_known";
 // Why a change that waited on a field still holding a value was not made.
 constexpr std::string_view changed_meanwhile = "the account changed meanwhile";
@@ -102,6 +107,40 @@ int64_t issued_ms(const claims& c)
 {
     const int64_t ms = claim_int(c, "iat_ms");
     return ms ? ms : claim_int(c, "iat") * 1000;
+}
+
+// A refresh token family's field read: the generation its newest token is, and when the family ends.
+bool read_family(std::string_view v, uint64_t& generation, int64_t& expires)
+{
+    const size_t sp = v.find(' ');
+    if (sp == std::string_view::npos)
+        return false;
+    const auto g = std::from_chars(v.data(), v.data() + sp, generation);
+    const auto e = std::from_chars(v.data() + sp + 1, v.data() + v.size(), expires);
+    return g.ec == std::errc{} && g.ptr == v.data() + sp && e.ec == std::errc{} && e.ptr == v.data() + v.size() &&
+           generation > 0;
+}
+
+// The fields that remove `who`'s families that have ended, and its oldest past the most it keeps beside a new one.
+field_list stale_families(const account& who, int64_t now)
+{
+    field_list out;
+    std::vector<std::pair<int64_t, std::string>> live;
+    for (const auto& [k, v] : who.fields)
+    {
+        if (!k.starts_with(family_prefix))
+            continue;
+        uint64_t g = 0;
+        int64_t exp = 0;
+        if (!read_family(v, g, exp) || exp <= now)
+            out.emplace_back(k, "");
+        else
+            live.emplace_back(exp, k);
+    }
+    std::sort(live.begin(), live.end());
+    for (size_t i = 0; i + max_families <= live.size(); ++i)
+        out.emplace_back(live[i].second, "");
+    return out;
 }
 
 // The storage interface's look, its sign-in card with the page's own forms in it, so a sign-in reads as one product.
@@ -578,7 +617,7 @@ const client* idp_run::find_client(std::string_view id)
 
 // ─── Sessions ───────────────────────────────────────────────────────────────
 
-const account* idp_run::session_of(const request& rq) const
+const account* idp_run::session_of(const request& rq, int64_t* auth_time) const
 {
     // Every skl_idp cookie the request carries, since a browser sends one per domain it was set for.
     const int64_t now = wall::now_sec();
@@ -590,7 +629,11 @@ const account* idp_run::session_of(const request& rq) const
             return false;
         const account* a = m_accounts.by_id(claim(c, "sub"));
         if (a && !a->disabled() && still_signed_in(*a, issued_ms(c)))
+        {
             found = a;
+            if (auth_time)
+                *auth_time = claim_int(c, "auth_time");
+        }
         return found != nullptr;
     });
     return found;
@@ -1001,9 +1044,11 @@ void idp_run::authorize(const std::shared_ptr<conn>& c, const request& rq)
                                         "return to an address outside this provider's domain.</p>"));
         return;
     }
-    if (const account* who = param(p, "prompt") != "login" ? session_of(rq) : nullptr)
+    int64_t auth_time = 0;
+    if (const account* who = param(p, "prompt") != "login" ? session_of(rq, &auth_time) : nullptr)
     {
-        grant(c, p, *who, {});
+        // The code says when the person signed in, not when the browser came back with the session.
+        grant(c, p, *who, {}, auth_time);
         return;
     }
     login_page(c, p, {}, 200);
@@ -1232,7 +1277,8 @@ void idp_run::hash_password(std::string_view password, std::function<void(std::s
     });
 }
 
-void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie)
+void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie,
+                    int64_t auth_time)
 {
     // A code goes only to one of the client's own addresses, whichever path the sign-in came by.
     const client* cl = nullptr;
@@ -1258,7 +1304,7 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
     e.scope.assign(param(p, "scope"));
     e.challenge.assign(param(p, "code_challenge"));
     const int64_t now = wall::now_sec();
-    e.auth_time = now;
+    e.auth_time = auth_time ? auth_time : now;
     e.expires = now + code_secs;
     // Named by the shard that keeps it, which the exchange is taken to.
     const std::string token = random_b64url(32);
@@ -1286,6 +1332,43 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
 
 void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who)
 {
+    if (!has_scope(e.scope, "offline_access") && cl.is_public())
+    {
+        send_tokens(c, cl, e, who, {}, 0);
+        return;
+    }
+    const int64_t now = wall::now_sec();
+    const std::string family = socketley::random_hex(8);
+    if (family.empty())
+    {
+        json_error(c, 503, "temporarily_unavailable", "no randomness for a refresh token");
+        return;
+    }
+    // The family is kept with the account before its first token is given, so every shard knows it.
+    field_list fields = stale_families(who, now);
+    fields.emplace_back(std::string(family_prefix) + family, "1 " + std::to_string(now + refresh_secs));
+    std::weak_ptr<conn> weak = c;
+    c->waiting = true;
+    update_account(who.id, std::move(fields),
+                   [this, weak, client_id = cl.id, e, id = who.id, family](bool ok, const std::string&)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        cc->waiting = false;
+        const client* again = find_client(client_id);
+        const account* a = m_accounts.by_id(id);
+        if (!ok || !again || !a)
+            json_error(cc, 503, "temporarily_unavailable", "the sign-in could not be kept; try again");
+        else
+            send_tokens(cc, *again, e, *a, family, 1);
+        m_http.resume(cc);
+    });
+}
+
+void idp_run::send_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who,
+                          std::string_view family, uint64_t generation)
+{
     const int64_t now = wall::now_sec();
     const std::string jti = random_b64url(32);
     const std::string profile = profile_claims(who);
@@ -1312,10 +1395,11 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
     claims.append(",\"admin\":").append(who.in_group("admins") ? "true" : "false");
     const std::string access = sign_token(m_key, m_kid, "at+jwt", claims);
     std::string refresh;
-    if (has_scope(e.scope, "offline_access") || !cl.is_public())
+    if (!family.empty())
     {
         claims.assign(common).append(",\"aud\":\"refresh\",\"client_id\":").append(aud).append(",\"scope\":");
-        claims.append(scope).append(",\"exp\":").append(std::to_string(now + refresh_secs));
+        claims.append(scope).append(",\"fam\":\"").append(family).append("\",\"gen\":");
+        claims.append(std::to_string(generation)).append(",\"exp\":").append(std::to_string(now + refresh_secs));
         refresh = sign_secret_token(m_secret, "refresh+jwt", claims);
     }
     // A token is base64url and dots, which a JSON string holds as they are.
@@ -1402,7 +1486,9 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
                     redeemed(cc, *again, p, found, e);
                 else
                     json_error(cc, 401, "invalid_client", "the client is not known or its secret is not right");
-                m_http.resume(cc);
+                // Its tokens may wait on the refresh family being kept, which resumes the connection itself.
+                if (!cc->waiting)
+                    m_http.resume(cc);
             });
             if (asked)
                 c->waiting = true;
@@ -1440,12 +1526,7 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
             json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
             return;
         }
-        code_entry e;
-        e.sub = who->id;
-        e.scope = claim(r, "scope");
-        e.auth_time = claim_int(r, "auth_time");
-        ++m_c.refreshes;
-        issue_tokens(c, *cl, e, *who);
+        refresh_grant(c, *cl, r, *who);
         return;
     }
     if (grant == device_grant)
@@ -1454,6 +1535,66 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     json_error(c, 400, "unsupported_grant_type", "only authorization_code, refresh_token and device_code are served");
+}
+
+void idp_run::refresh_grant(const std::shared_ptr<conn>& c, const client& cl, const claims& r, const account& who)
+{
+    const std::string family = claim(r, "fam");
+    uint64_t generation = 0;
+    const std::string g = claim(r, "gen");
+    std::from_chars(g.data(), g.data() + g.size(), generation);
+    const std::string field = std::string(family_prefix) + family;
+    const std::string was(who.field(field));
+    uint64_t newest = 0;
+    int64_t expires = 0;
+    const int64_t now = wall::now_sec();
+    // A token of a family the account no longer keeps, or of none, as one given before families were, is spent.
+    if (family.size() != 16 || !generation || !read_family(was, newest, expires) || expires <= now)
+    {
+        json_error(c, 400, "invalid_grant", "the refresh token's sign-in has ended");
+        return;
+    }
+    const std::string id = who.id, user(who.username());
+    // One before the newest was used before, so whoever holds the newest may have stolen either: the family ends.
+    const auto reused = [this, id, user, field, client_id = cl.id](const std::shared_ptr<conn>& cc)
+    {
+        LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": a refresh token of \"" + user + "\" for " + client_id +
+                  " came again after it was used; that sign-in is ended").c_str());
+        update_account(id, {{field, ""}}, [](bool, const std::string&) {});
+        json_error(cc, 400, "invalid_grant", "the refresh token was used already; its sign-in has ended");
+    };
+    if (newest != generation)
+    {
+        reused(c);
+        return;
+    }
+    code_entry e;
+    e.sub = who.id;
+    e.scope = claim(r, "scope");
+    e.auth_time = claim_int(r, "auth_time");
+    std::weak_ptr<conn> weak = c;
+    c->waiting = true;
+    // The next generation taken only while this one is still the newest, so the same token sent twice gets one.
+    update_account(id, {{"?" + field, was}, {field, std::to_string(generation + 1) + " " + std::to_string(now + refresh_secs)}},
+                   [this, weak, client_id = cl.id, e, id, family, generation, reused](bool ok, const std::string& why)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        cc->waiting = false;
+        const client* again = find_client(client_id);
+        const account* a = m_accounts.by_id(id);
+        if (!ok && why == changed_meanwhile)
+            reused(cc);
+        else if (!ok || !again || !a)
+            json_error(cc, 503, "temporarily_unavailable", "the refresh could not be kept; try again");
+        else
+        {
+            ++m_c.refreshes;
+            send_tokens(cc, *again, e, *a, family, generation + 1);
+        }
+        m_http.resume(cc);
+    });
 }
 
 // ─── The SSH certificate authority ──────────────────────────────────────────
@@ -1514,6 +1655,16 @@ void idp_run::ssh_user_cert(const std::shared_ptr<conn>& c, const request& rq)
     if (!who || who->disabled() || who->field("reset") == "1" || !still_signed_in(*who, issued_ms(a)))
     {
         respond(c, 403, "text/plain", "the account is no longer one that may sign in\n");
+        return;
+    }
+    // A sign-in buys certificates for a while, so a refresh token alone does not go on buying them (RFC 9470).
+    if (now - claim_int(a, "auth_time") > ssh_auth_secs)
+    {
+        respond(c, 401, "text/plain",
+                "the sign-in is more than " + std::to_string(ssh_auth_secs / 3600) +
+                    " hours old; sign in again with `socketley login`\n",
+                "WWW-Authenticate: Bearer error=\"insufficient_user_authentication\", max_age=" +
+                    std::to_string(ssh_auth_secs) + "\r\n");
         return;
     }
     socketley::ssh::public_key key;
@@ -1814,7 +1965,8 @@ void idp_run::device_token(const std::shared_ptr<conn>& c, const client& cl, std
             device_answered(cc, *again, what, e);
         else
             json_error(cc, 401, "invalid_client", "the client is not known or its secret is not right");
-        m_http.resume(cc);
+        if (!cc->waiting)
+            m_http.resume(cc);
     });
     if (asked)
         c->waiting = true;

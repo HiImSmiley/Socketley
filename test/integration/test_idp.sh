@@ -11,6 +11,7 @@
 #   * a code redeemed twice, by another client, for another redirect, or without its PKCE verifier
 #   * a token that does not verify against the published key, or names the account by anything but its id
 #   * a refresh for an account disabled, signed out everywhere or made to reset its password since
+#   * a refresh token good more than once, or one used again leaving its sign-in standing
 #   * a password that must be reset letting the account in before it is
 #   * the signing key changing across a restart, which would sign every user out
 #   * a code of the second step taken again after a restart
@@ -239,6 +240,22 @@ if phase == "main":
     rt = json.loads(body) if st == 200 else {}
     check("a refresh token gives new tokens", (st, bool(rt.get("access_token"))), (200, True))
     check("but not to another client", req("POST", "/token", dict(grant_type="refresh_token", refresh_token=rt.get("refresh_token", "")), basic("wiki", "wikisecret"))[0], 400)
+    # A refresh token is good once: each refresh gives the next, and one used again ends the sign-in it is of.
+    pcode = code_of(req("GET", "/authorize" + q(**pk), cookie=cookie)[2])[0].get("code")
+    st, body, _ = req("POST", "/token", dict(grant_type="authorization_code", code=pcode, redirect_uri=pub["redirect_uri"], client_id="spa", code_verifier=verifier))
+    r0 = json.loads(body).get("refresh_token", "") if st == 200 else ""
+    st, body, _ = refresh(r0)
+    r1 = json.loads(body).get("refresh_token", "") if st == 200 else ""
+    check("a refresh gives a refresh token of its own", (st, bool(r1) and r1 != r0), (200, True))
+    st, body, _ = refresh(r1)
+    r2 = json.loads(body).get("refresh_token", "") if st == 200 else ""
+    check("which refreshes in turn", (st, bool(r2)), (200, True))
+    st, body, _ = refresh(r0)
+    check("one used before is refused", (st, json.loads(body).get("error")), (400, "invalid_grant"))
+    check("and ends its sign-in, its newest token too", refresh(r2)[0], 400)
+    st, body, _ = refresh(rt.get("refresh_token", ""))
+    check("while another sign-in's token still refreshes", st, 200)
+    rt = json.loads(body) if st == 200 else {}
 
     # The account page: a name changed there is what userinfo says next.
     st, body, _ = req("GET", "/account", cookie=cookie)

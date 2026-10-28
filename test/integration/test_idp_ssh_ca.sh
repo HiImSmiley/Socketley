@@ -8,6 +8,7 @@
 #   * a login by the key alone, without the certificate, or by a certificate for a principal sshd does not allow
 #   * a token given to a client not marked `ssh` buying a certificate, or one for a disabled account
 #   * an access token that ran out not being refreshed before the certificate is asked for
+#   * a certificate given on a sign-in older than twelve hours, as a refresh token kept going would give one
 #   * a host certificate a client checking @cert-authority would not take
 #   * a certificate given without a line in the log saying for whom and for which key
 set -uo pipefail
@@ -155,6 +156,32 @@ rm -f "$T/alice_key-cert.pub"
 XDG_CONFIG_HOME="$T/alice" "$BIN" ssh-cert "$I" --key "$T/alice_key.pub" && [ -f "$T/alice_key-cert.pub" ] && ok \
     || bad "a token that ran out is refreshed and the certificate given" "$(cat "$TOK")"
 [ "$(grep -o '"access_token":"[^"]*"' "$TOK")" != "$before" ] && ok || bad "and the new token kept" "unchanged"
+
+# Access tokens as the provider would sign them, of a sign-in old and of one fresh, with its own key.
+KEYFILE=$(find "$SOCKETLEY_TMPD" -name auth.key | head -1)
+mint() {   # mint <seconds since the sign-in>
+    python3 - "$KEYFILE" "$I" "$(curl -s "$I/jwks")" "$(XDG_CONFIG_HOME="$T/alice" "$BIN" idp-user auth show alice | sed -n 's/^id: //p')" "$1" <<'PY'
+import sys, json, time, jwt
+from cryptography.hazmat.primitives import serialization
+raw = open(sys.argv[1], "rb").read()
+try:
+    key = serialization.load_pem_private_key(raw, None)
+except ValueError:
+    key = serialization.load_der_private_key(raw, None)
+now = int(time.time())
+claims = {"iss": sys.argv[2], "sub": sys.argv[4], "aud": "cli", "client_id": "cli", "scope": "openid", "iat": now,
+          "iat_ms": now * 1000, "auth_time": now - int(sys.argv[5]), "exp": now + 600, "jti": str(now)}
+print(jwt.encode(claims, key, algorithm="ES256", headers={"kid": json.loads(sys.argv[3])["keys"][0]["kid"], "typ": "at+jwt"}))
+PY
+}
+cert_with() {   # cert_with <access token>: the status and the body
+    curl -s -w '\n%{http_code}' -H "Authorization: Bearer $1" --data-urlencode "public_key=$(cat "$T/alice_key.pub")" "$I/ssh/user-cert"
+}
+out=$(cert_with "$(mint 60)")
+[ "$(echo "$out" | tail -1)" = 200 ] && ok || bad "a sign-in of a minute ago gets a certificate" "$out"
+out=$(cert_with "$(mint $((13 * 3600)))")
+[ "$(echo "$out" | tail -1)" = 401 ] && case "$out" in *"sign in again"*) true ;; *) false ;; esac && ok \
+    || bad "one of thirteen hours ago is told to sign in again" "$out"
 
 "$BIN" idp-user auth disable alice >/dev/null 2>&1
 out=$(XDG_CONFIG_HOME="$T/alice" "$BIN" ssh-cert "$I" --key "$T/alice_key.pub" 2>&1); rc=$?

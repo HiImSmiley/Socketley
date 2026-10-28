@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   name under the domain, and a browser, reading the backslash as a slash, went
   to evil.example after signing in or out; a return address's host may now hold
   only letters, digits, `.-_` and a port.
+- **Refresh tokens are good once, and SSH certificates want a recent sign-in.**
+  A refresh left the old refresh token valid, so a stolen one went on working
+  beside the owner's; each refresh now gives the next and a token used again
+  ends its sign-in. `/ssh/user-cert` gave a certificate on any refreshed token;
+  it now wants a sign-in of the last twelve hours. Refresh tokens given before
+  this change are refused once, and `socketley login` signs in again.
 - **An authenticator code signs in once, anywhere.** The idp remembered the
   last code taken in each shard's memory, so the same code signed in again at
   another shard or after a restart; the step is now kept with the account and
