@@ -11,6 +11,8 @@
 #   * a message without a sender not sent from no-reply@, or mail to no-reply@ taken from anyone
 #   * a bounce to no-reply@ dropped unread, so a dead address is mailed again and again, after a restart or by
 #     another shard
+#   * a tag of the recipient's domain alone, which lets one recipient there bounce every other address at it into
+#     suppression, or a tag that is taken back however old it is
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -123,9 +125,9 @@ check "socketley mail dns prints the eight for a zone kept elsewhere" "$("$BIN" 
 # ─── no-reply ───────────────────────────────────────────────────────────────
 "$BIN" send m --to amy@remote.test --subject "notice" --text "noreply body" >/dev/null 2>&1
 f=$(mail_with "noreply body")
-[ -n "$f" ] && grep -q '^from no-reply+[0-9a-f]\{16\}@example.test$' "$f" && grep -q '^From: no-reply@example.test' "$f" \
-    && ok "a message without a sender goes from no-reply@ its domain, tagged for the domain it goes to" \
-    || bad "a message without a sender goes from no-reply@ its domain, tagged for the domain it goes to" "$(head -3 "$f" 2>/dev/null)"
+[ -n "$f" ] && grep -q '^from no-reply+[0-9]\{5,\}-[0-9a-f]\{20\}@example.test$' "$f" && grep -q '^From: no-reply@example.test' "$f" \
+    && ok "a message without a sender goes from no-reply@ its domain, tagged for the address it goes to and the day" \
+    || bad "a message without a sender goes from no-reply@ its domain, tagged for the address it goes to and the day" "$(head -3 "$f" 2>/dev/null)"
 tagged=$(sed -n 's/^from //p' "$f" 2>/dev/null | head -1)
 r=$(python3 - "$P" <<'PY'
 import smtplib, sys
@@ -155,7 +157,23 @@ grep -l "again body" "$T"/sink/*.eml >/dev/null 2>&1 && bad "a suppressed addres
 check "and the list is empty after" "$("$BIN" mail m suppressed 2>/dev/null)" ""
 "$BIN" mail m forgive dead@remote.test >/dev/null 2>&1; check "forgiving one not there says so" "$?" "1"
 
-# A bounce from elsewhere counts only under the tag mail went out with, and only for that tag's domain.
+# The tag no-reply mail to `addr` went out under, from a message sent to it now.
+tag_for() { # tag_for <addr>
+    "$BIN" send m --to "$1" --subject "tag" --text "tag body for $1" >/dev/null 2>&1
+    sed -n 's/^from //p' "$(mail_with "tag body for $1")" 2>/dev/null | head -1
+}
+# A message to two recipients at one domain goes in two transactions, each under its own recipient's tag.
+"$BIN" send m --to ann@remote.test --to bob@remote.test --subject "two" --text "two body" >/dev/null 2>&1
+for _ in $(seq 1 100); do [ "$(grep -l "two body" "$T"/sink/*.eml 2>/dev/null | wc -l)" -ge 2 ] && break; sleep 0.1; done
+two=$(grep -l "two body" "$T"/sink/*.eml 2>/dev/null)
+ann=$(grep -l '^rcpt ann@remote.test$' $two 2>/dev/null | head -1)
+bob=$(grep -l '^rcpt bob@remote.test$' $two 2>/dev/null | head -1)
+[ "$(echo "$two" | grep -c .)" = 2 ] && [ -n "$ann" ] && [ -n "$bob" ] && [ "$ann" != "$bob" ] \
+    && [ "$(sed -n 's/^from //p' "$ann")" != "$(sed -n 's/^from //p' "$bob")" ] \
+    && ok "no-reply mail to two recipients goes in a transaction each, under a tag each" \
+    || bad "no-reply mail to two recipients goes in a transaction each, under a tag each" "$(grep -h '^from \|^rcpt ' $two 2>/dev/null | tr '\n' ' ')"
+
+# A bounce from elsewhere counts only under the tag mail went out with, and only for that tag's recipient.
 bounce() { # bounce <to> <failed address> [status]
     python3 - "$P" "$1" "$2" "${3:-5.1.1}" <<'PY'
 import smtplib, sys
@@ -166,14 +184,32 @@ PY
 }
 bounce no-reply@example.test victim@remote.test
 bounce "$tagged" victim2@else.test
+bounce "$tagged" victim3@remote.test
+bounce "$(sed -n 's/^from //p' "$ann" 2>/dev/null)" victim4@remote.test
 bounce "$tagged" amy@remote.test
 for _ in $(seq 1 50); do "$BIN" mail m suppressed 2>/dev/null | grep -q amy@ && break; sleep 0.1; done
-check "a bounce under the tag for remote.test suppresses an address there" "$("$BIN" mail m suppressed 2>/dev/null | grep -c '^amy@remote.test$')" "1"
-check "but not one under no tag, nor one of another domain" "$("$BIN" mail m suppressed 2>/dev/null | grep -c 'victim')" "0"
+check "a bounce under amy@'s tag suppresses amy@" "$("$BIN" mail m suppressed 2>/dev/null | grep -c '^amy@remote.test$')" "1"
+check "but not one under no tag, nor another address under it, at amy@'s domain or another" \
+    "$("$BIN" mail m suppressed 2>/dev/null | grep -c 'victim')" "0"
+# A tag of the runtime's own key, made as it makes them, is taken back for seven days and not on the eighth.
+key=$(find "$T" -name m.verp 2>/dev/null | head -1)
+made() { # made <addr> <days ago>
+    python3 - "$key" "$1" "$2" <<'PY'
+import hashlib, hmac, sys, time
+day = int(time.time()) // 86400 - int(sys.argv[3])
+mac = hmac.new(open(sys.argv[1], "rb").read(), ("verp\n%s\n%d" % (sys.argv[2], day)).encode(), hashlib.sha256)
+print("no-reply+%d-%s@example.test" % (day, mac.hexdigest()[:20]))
+PY
+}
+bounce "$(made old@remote.test 8)" old@remote.test
+bounce "$(made week@remote.test 7)" week@remote.test
+for _ in $(seq 1 50); do "$BIN" mail m suppressed 2>/dev/null | grep -q week@ && break; sleep 0.1; done
+check "a bounce under a tag of seven days ago suppresses its address, one of eight days ago does not" \
+    "$("$BIN" mail m suppressed 2>/dev/null | grep -E '^(old|week)@remote.test$' | tr '\n' ' ')" "week@remote.test "
 # A status that says try again, or a mailbox that is full, is no address that is dead.
-bounce "$tagged" soft@remote.test 4.4.7
-bounce "$tagged" full@remote.test 5.2.2
-bounce "$tagged" gone@remote.test 5.1.1
+bounce "$(tag_for soft@remote.test)" soft@remote.test 4.4.7
+bounce "$(tag_for full@remote.test)" full@remote.test 5.2.2
+bounce "$(tag_for gone@remote.test)" gone@remote.test 5.1.1
 for _ in $(seq 1 50); do "$BIN" mail m suppressed 2>/dev/null | grep -q gone@ && break; sleep 0.1; done
 check "a bounce whose status is 4.x.x or 5.2.2 suppresses nobody, one of 5.1.1 its address" \
     "$("$BIN" mail m suppressed 2>/dev/null | grep -cE '^(soft|full|gone)@remote.test$')" "1"
@@ -185,7 +221,7 @@ check "a suppressed address is still suppressed after a restart" "$("$BIN" mail 
 PSH=$((SL_PORT_BASE+1994))
 "$BIN" create mail msh -p "$PSH" --mail-domain example.test --no-reply --shards 3 -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$PSH" || bad "the sharded runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
-"$BIN" send msh --to tagme@remote.test --subject "for the tag" --text "shard tag body" >/dev/null 2>&1
+"$BIN" send msh --to zed@remote.test --subject "for the tag" --text "shard tag body" >/dev/null 2>&1
 f=$(mail_with "shard tag body")
 tag2=$(sed -n 's/^from //p' "$f" 2>/dev/null | head -1)
 python3 - "$PSH" "$tag2" <<'PY'

@@ -2849,11 +2849,16 @@ void delivery::conn_begin(out_conn& c)
 {
     item& it = *c.cur;
     const spool_entry& e = *it.e;
-    if (c.rcpt_max && it.to.size() > c.rcpt_max)
+    address na;
+    const bool verp = m_run.owner().get_no_reply() && parse_address(e.from, na) &&
+                      socketley::ascii::iequals(na.local, "no-reply") && m_run.is_local_domain(na.domain);
+    // no-reply mail goes a recipient a transaction, so the tag of each MAIL FROM is its one recipient's.
+    const uint32_t per = verp ? 1u : c.rcpt_max;
+    if (per && it.to.size() > per)
     {
-        // The recipients past the server's limit go in a transaction of their own, next.
-        item rest{it.e, std::vector<target>(it.to.begin() + c.rcpt_max, it.to.end())};
-        it.to.resize(c.rcpt_max);
+        // The recipients past the limit go in a transaction of their own, next.
+        item rest{it.e, std::vector<target>(it.to.begin() + per, it.to.end())};
+        it.to.resize(per);
         ++m_out[e.id];
         m_routes[c.route].waiting.push_front(std::move(rest));
     }
@@ -2889,11 +2894,10 @@ void delivery::conn_begin(out_conn& c)
     for (const auto& t : it.to)
         for (const unsigned char ch : t.addr)
             utf8 = utf8 || ch >= 0x80;
-    // no-reply mail goes out under a tag of the domain it goes to, which a bounce of it must come back with.
+    // no-reply mail goes out under a tag of its recipient and the day, which a bounce of it must come back with.
     std::string sender = e.from;
-    if (address na; m_run.owner().get_no_reply() && parse_address(e.from, na) &&
-                    socketley::ascii::iequals(na.local, "no-reply") && m_run.is_local_domain(na.domain) && !it.to.empty())
-        sender = "no-reply+" + m_run.verp_token(domain_of(it.to.front().addr)) + "@" + na.domain;
+    if (verp && !it.to.empty())
+        sender = "no-reply+" + m_run.verp_token(it.to.front().addr, wall::now_ms() / 86400000) + "@" + na.domain;
     // Mail from elsewhere sent on goes from an SRS address of ours, so SPF at the far end judges this host.
     else if (!e.auth.empty() && !e.from.empty() && !m_run.domains().empty() && !m_run.is_local_domain(domain_of(e.from)))
         sender = srs::forward(e.from, m_run.domains().front(), m_run.secret(), wall::now_ms() / 86400000);

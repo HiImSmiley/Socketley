@@ -113,12 +113,16 @@ public:
     bool unsubscribe(std::string_view token);
     // Where the webmail is reached through the entrance, https://<its --domain>, empty without one.
     std::string web_url() const;
-    // A bounce taken for `to`, no-reply+<token>@: the recipients it says failed, suppressed where the token is the
-    // one this runtime sent mail for their domain under, so no one else's word suppresses an address.
+    // A bounce taken for `to`, no-reply+<token>@: the recipient it says failed, suppressed where the token is the
+    // one this runtime sent that very recipient mail under in the last verp_max_age_days, so no one else's word
+    // suppresses an address.
     // A report this runtime made itself is its own word, `trusted`.
     void bounce_taken(std::string_view message, std::string_view to, bool trusted);
-    // The tag of no-reply mail sent to `domain`, which its bounces come back with.
-    std::string verp_token(std::string_view domain) const;
+    // The tag of no-reply mail sent to `addr` on `day` (days since the epoch), <day>-<HMAC>, which its bounce comes
+    // back with.
+    std::string verp_token(std::string_view addr, int64_t day) const;
+    // The days a no-reply tag is taken back for, past the five the common servers retry a message for.
+    static constexpr int64_t verp_max_age_days = 7;
     // no-reply, or no-reply with a tag.
     static bool no_reply_local(std::string_view local);
     // Where mail for `a` goes, by the aliases, the no-reply address and the mailboxes.

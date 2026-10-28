@@ -248,6 +248,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   address could be had for a recipient of the sender's choosing; the parts are
   now hashed with the `=` between them, and a host holding `=` is not
   rewritten.
+- **A no-reply bounce suppresses only the address the mail went to.** The tag
+  in `no-reply+<tag>@` was a hash of the recipient's domain alone, the same for
+  every recipient there and for ever, so anyone sent one no-reply message could
+  read it from their Return-Path and bounce every other address at their
+  provider into suppression for ninety days. no-reply mail now goes one
+  recipient a transaction under a tag of that address and the day, taken back
+  for seven days; a bounce under a tag sent before this release suppresses
+  nobody.
 - **SRS addresses carry a 40-bit hash, and SRS1 ones expire.** The hash was
   four base64 characters compared without case, about 21 bits; it is now eight
   base32 characters, an SRS1 address is refused once the first forwarder's day

@@ -577,12 +577,13 @@ bool mail_run::no_reply_local(std::string_view local)
            (local.size() > 9 && socketley::ascii::iequals(local.substr(0, 9), "no-reply+"));
 }
 
-std::string mail_run::verp_token(std::string_view domain) const
+std::string mail_run::verp_token(std::string_view addr, int64_t day) const
 {
-    std::string d(domain);
-    socketley::ascii::lower_in_place(d);
-    const std::string mac = socketley::crypto::hmac_sha256(m_verp_key, d);
-    return socketley::hex_encode(mac.data(), std::min<size_t>(mac.size(), 8));
+    std::string a(addr);
+    socketley::ascii::lower_in_place(a);
+    const std::string d = std::to_string(day);
+    const std::string mac = socketley::crypto::hmac_sha256(m_verp_key, "verp\n" + a + "\n" + d);
+    return d + "-" + socketley::hex_encode(mac.data(), std::min<size_t>(mac.size(), 10));
 }
 
 namespace
@@ -685,6 +686,15 @@ void mail_run::bounce_taken(std::string_view message, std::string_view to, bool 
     const std::string_view token = plus != std::string_view::npos && at != std::string_view::npos && plus < at
                                        ? to.substr(plus + 1, at - plus - 1)
                                        : std::string_view{};
+    // The day the token was made on, -1 where it names none or one past verp_max_age_days.
+    int64_t day = -1;
+    if (const size_t dash = token.find('-'); dash != std::string_view::npos && dash > 0 && dash <= 9)
+    {
+        const int64_t today = wall::now_ms() / 86400000;
+        const auto r = std::from_chars(token.data(), token.data() + dash, day);
+        if (r.ec != std::errc() || r.ptr != token.data() + dash || day > today || today - day > verp_max_age_days)
+            day = -1;
+    }
     // A delivery status report names each recipient, then what was done with it (RFC 3464 2.3).
     std::vector<std::string> dead;
     // The one of `dead` its block's Status, read after its Action, may still take back.
@@ -727,7 +737,7 @@ void mail_run::bounce_taken(std::string_view message, std::string_view to, bool 
             const size_t ra = recipient.rfind('@');
             if (socketley::ascii::iequals(value.substr(0, 6), "failed") && ra != std::string::npos)
             {
-                if (trusted || (!token.empty() && token == verp_token(std::string_view(recipient).substr(ra + 1))))
+                if (trusted || (day >= 0 && socketley::ascii::iequals(token, verp_token(recipient, day))))
                 {
                     if (!m_suppressed.set.count(recipient) &&
                         std::find(dead.begin(), dead.end(), recipient) == dead.end())

@@ -13579,17 +13579,19 @@ a message
 or a script writes without a sender goes from
 .BI no\-reply@ domain\fR.
 Mail to that address is refused, but a bounce is taken and read. Such a message
-goes out under
+goes out to one recipient a transaction, under
 .BI no\-reply+ tag @ domain\fR,
-the tag a keyed hash of the recipient's domain that only this runtime can make,
-so a bounce that comes back under the tag of an address's domain suppresses that
-address: it is not mailed again by any shard until
+the tag the day and a keyed hash of the recipient's address and that day that
+only this runtime can make, so a bounce that comes back within seven days under
+an address's tag suppresses that address: it is not mailed again by any shard
+until
 .B socketley mail
 .I m
 .B forgive
 .I address
-lets it go, or ninety days pass. A bounce under no tag, or another domain's, is
-read and acts on nothing, so no stranger can stop mail to an address. The
+lets it go, or ninety days pass. A bounce under no tag, an older one, or another
+address's, is read and acts on nothing, so no stranger, nor another recipient,
+can stop mail to an address. The
 runtime's own bounce of such a message is its own word, so an address is learned
 dead from its first try. A recipient whose Status is 4.x.x, or 5.2.2 (its mailbox
 full), is no address that is dead and is not suppressed.
