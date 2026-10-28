@@ -28,6 +28,7 @@
 // client to send and must not be a thousand stack frames.
 
 #include <cstddef>
+#include <cstring>
 #include <string_view>
 
 namespace socketley
@@ -37,9 +38,12 @@ inline bool glob_match(std::string_view pat, std::string_view str) noexcept
 {
     constexpr size_t none = static_cast<size_t>(-1);
     size_t pi = 0, si = 0, star = none, star_si = 0;
+    // Linear in the input, so a pattern built to backtrack stops here and matches nothing, as Redis's nesting limit does.
+    size_t budget = 64 * (pat.size() + str.size()) + 4096;
 
     while (si < str.size())
     {
+        if (budget-- == 0) return false;
         if (pi < pat.size())
         {
             const char c = pat[pi];
@@ -48,6 +52,23 @@ inline bool glob_match(std::string_view pat, std::string_view str) noexcept
                 // Collapse a run, so "a***b" costs what "a*b" costs.
                 while (pi + 1 < pat.size() && pat[pi + 1] == '*') ++pi;
                 star = pi++; star_si = si;
+                // Plain bytes after a star are placed at their first occurrence, which is what the backtracking finds.
+                size_t end = pi;
+                while (end < pat.size() && pat[end] != '*' && pat[end] != '?'
+                       && pat[end] != '[' && pat[end] != '\\')
+                    ++end;
+                const size_t len = end - pi;
+                // The last run can only be the subject's tail.
+                if (end == pat.size())
+                    return len <= str.size() - si && str.substr(str.size() - len) == pat.substr(pi);
+                // A long subject is searched by memmem, as the restart below is quadratic in it.
+                if (pat[end] == '*' && len > 0 && str.size() - si > 256)
+                {
+                    const void* at = ::memmem(str.data() + si, str.size() - si, pat.data() + pi, len);
+                    if (!at) return false;
+                    si = static_cast<size_t>(static_cast<const char*>(at) - str.data()) + len;
+                    pi = end;
+                }
                 continue;
             }
             if (c == '?') { ++pi; ++si; continue; }
@@ -84,6 +105,9 @@ inline bool glob_match(std::string_view pat, std::string_view str) noexcept
                     }
                     ++e;
                 }
+                // The class is read byte by byte, so its length is charged, or one long class is quadratic again.
+                if (e - pi >= budget) return false;
+                budget -= e - pi;
                 if (neg) hit = !hit;
                 if (hit)
                 {

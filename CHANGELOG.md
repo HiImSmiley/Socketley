@@ -156,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   held the shard's loop for minutes; such a LIST is now BAD, a pattern stops
   at the first character it cannot match, and a command of more than a
   million words is refused.
+- **A cache's glob is linear in what it is given.** KEYS, SCAN MATCH,
+  VALUEMATCH and pattern subscriptions backtracked once per subject byte, so
+  `KEYS *<128 KiB of a>b` against a 256 KiB key held the shard for tens of
+  seconds. A plain run after a star is now placed at its first occurrence and
+  the last one is compared with the tail; a pattern that would still cost more
+  than about 64 steps per byte of pattern and subject matches nothing there.
 - **A script cannot give KEYS or ARGV a metatable.** The two tables are
   shared by every EVAL on a cache, so a metatable one client's script set on
   them ran in every later script until a restart, answering its reads and

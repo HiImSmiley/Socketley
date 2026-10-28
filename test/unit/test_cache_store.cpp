@@ -3,7 +3,10 @@
 #include <algorithm>
 #include "doctest.h"
 #include "../../socketley/runtime/cache/cache_store.h"
+#include "../../socketley/shared/util/glob_match.h"
+#include <chrono>
 #include <deque>
+#include <random>
 #include <map>
 #include <limits>
 #include <set>
@@ -4435,4 +4438,132 @@ TEST_CASE("RANDOMKEY and SRANDMEMBER draw every key about as often as any other"
     const auto [mmin, mmax] = std::minmax_element(members.begin(), members.end(),
         [](const auto& a, const auto& b) { return a.second < b.second; });
     CHECK(mmin->second * 2 > mmax->second);
+}
+
+namespace {
+
+// The matcher as it was before its work was bounded, kept as the reference the bounded one must agree with.
+bool glob_reference(std::string_view pat, std::string_view str)
+{
+    constexpr size_t none = static_cast<size_t>(-1);
+    size_t pi = 0, si = 0, star = none, star_si = 0;
+    while (si < str.size())
+    {
+        if (pi < pat.size())
+        {
+            const char c = pat[pi];
+            if (c == '*')
+            {
+                while (pi + 1 < pat.size() && pat[pi + 1] == '*') ++pi;
+                star = pi++; star_si = si;
+                continue;
+            }
+            if (c == '?') { ++pi; ++si; continue; }
+            if (c == '[')
+            {
+                size_t e   = pi + 1;
+                bool   neg = (e < pat.size() && pat[e] == '^');
+                if (neg) ++e;
+                bool hit = false;
+                while (e < pat.size() && pat[e] != ']')
+                {
+                    if (pat[e] == '\\' && e + 1 < pat.size())
+                    {
+                        ++e;
+                        if (pat[e] == str[si]) hit = true;
+                    }
+                    else if (e + 2 < pat.size() && pat[e + 1] == '-')
+                    {
+                        char lo = pat[e], hi = pat[e + 2];
+                        if (lo > hi) { const char t = lo; lo = hi; hi = t; }
+                        if (str[si] >= lo && str[si] <= hi) hit = true;
+                        e += 2;
+                    }
+                    else if (pat[e] == str[si])
+                        hit = true;
+                    ++e;
+                }
+                if (neg) hit = !hit;
+                if (hit) { pi = (e < pat.size()) ? e + 1 : e; ++si; continue; }
+            }
+            else if (c == '\\' && pi + 1 < pat.size())
+            {
+                if (pat[pi + 1] == str[si]) { pi += 2; ++si; continue; }
+            }
+            else if (c == str[si])
+            {
+                ++pi; ++si;
+                continue;
+            }
+        }
+        if (star != none) { pi = star + 1; si = ++star_si; continue; }
+        return false;
+    }
+    while (pi < pat.size() && pat[pi] == '*') ++pi;
+    return pi == pat.size();
+}
+
+double glob_seconds(const std::string& pat, const std::string& str, bool& matched)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    matched = socketley::glob_match(pat, str);
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+}  // namespace
+
+TEST_CASE("glob_match agrees with the unbounded matcher on short and long subjects")
+{
+    // A small alphabet, so stars, classes and escapes meet their own bytes often, and subjects past 256 reach memmem.
+    std::mt19937 rng(58);
+    const char pat_bytes[] = "ab*?[]^-\\";
+    const char str_bytes[] = "ab-]";
+    for (int round = 0; round < 40000; ++round)
+    {
+        std::string pat, str;
+        const size_t plen = rng() % 12;
+        const size_t slen = (round % 4 == 0) ? 257 + rng() % 400 : rng() % 24;
+        for (size_t i = 0; i < plen; ++i) pat += pat_bytes[rng() % (sizeof(pat_bytes) - 1)];
+        for (size_t i = 0; i < slen; ++i) str += str_bytes[rng() % (sizeof(str_bytes) - 1)];
+        INFO("pattern '" << pat << "' subject of " << str.size());
+        REQUIRE(socketley::glob_match(pat, str) == glob_reference(pat, str));
+    }
+}
+
+TEST_CASE("glob_match answers a pattern built to backtrack in linear time")
+{
+    // 256 KiB of 'a' and a 128 KiB run after a star took about (n-k)*k byte compares, tens of seconds of a shard.
+    const std::string key(262144, 'a');
+    const std::string run(131072, 'a');
+    bool m = true;
+
+    CHECK(glob_seconds("*" + run + "b", key, m) < 3.0);
+    CHECK_FALSE(m);
+    CHECK(glob_seconds("*" + run + "b*", key, m) < 3.0);
+    CHECK_FALSE(m);
+    CHECK(glob_seconds("*" + run, key, m) < 3.0);
+    CHECK(m);
+    CHECK(glob_seconds("*" + run + "*", key, m) < 3.0);
+    CHECK(m);
+
+    // A wildcard in the run keeps the restart, and the budget is what ends it.
+    std::string wild;
+    for (size_t i = 0; i < 65536; ++i) wild += "a?";
+    CHECK(glob_seconds("*" + wild + "b", key, m) < 3.0);
+    CHECK_FALSE(m);
+
+    // One class as long as the subject was read once per subject byte.
+    CHECK(glob_seconds("*[" + std::string(131072, 'b') + "]", key, m) < 3.0);
+    CHECK_FALSE(m);
+
+    // KEYS reaches the same matcher.
+    cache_store store;
+    store.set(key, "1");
+    std::vector<std::string_view> out;
+    const auto t0 = std::chrono::steady_clock::now();
+    store.keys("*" + run + "b", out);
+    CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 3.0);
+    CHECK(out.empty());
+    store.keys("*" + run, out);
+    CHECK(out.size() == 1);
 }
