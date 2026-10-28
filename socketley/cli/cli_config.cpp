@@ -177,6 +177,10 @@ int cli_config(int argc, char** argv)
         return 1;
     }
 
+    // Asked once, before the first command, since every flag a runtime is made with, its secrets too, goes to the socket.
+    bool probed = false;
+    const auto identified = [&probed] { return probed || (probed = ensure_daemon(false)); };
+
     // Apply daemon settings (name, cluster) before runtimes
     sol::optional<sol::table> daemon = lua["daemon"].get<sol::optional<sol::table>>();
     if (daemon)
@@ -196,6 +200,8 @@ int cli_config(int argc, char** argv)
             std::string response;
             std::string line = std::string("daemon-") + key + " ";
             ipc_frame::append_arg(line, *v);
+            if (!identified())
+                return 2;
             int rc = ipc_send(line, response);
             if (rc < 0) { return ipc_report_failure(rc); }
             if (rc != 0)
@@ -228,6 +234,8 @@ int cli_config(int argc, char** argv)
             ++failed;
             continue;
         }
+        if (!identified())
+            return 2;
 
         // What create would keep, the flags judged as create judges them.
         int failure = 0;
@@ -463,6 +471,9 @@ int cli_export(int argc, char** argv)
         return 1;
     }
 
+    // Asked before the first command, since the reply names the files this writes and the ones it copies.
+    if (!ensure_daemon(false))
+        return 2;
     std::string listing;
     const int lrc = ipc_send("ls --json", listing);
     if (lrc < 0)

@@ -6,6 +6,9 @@
 #include "../shared/util/version.h"
 
 int cli_dispatch(int argc, char** argv);
+// Whether a daemon of this user's serves the socket, started where none does unless `start` is false, and said on
+// stderr where it is refused: nothing is sent to whatever else holds the path.
+bool ensure_daemon(bool start = true);
 int cli_forward(int argc, char** argv);
 int cli_send(int argc, char** argv);
 int cli_idp_user(int argc, char** argv);

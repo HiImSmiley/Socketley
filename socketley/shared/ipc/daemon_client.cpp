@@ -57,6 +57,14 @@ static bool peer_trusted(uid_t uid)
     return pw && pw->pw_uid == uid;
 }
 
+bool socket_peer_trusted(int fd)
+{
+    struct ucred cr{};
+    socklen_t    cr_len = sizeof(cr);
+    // A peer whose user cannot be learned is not taken on trust.
+    return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cr_len) == 0 && peer_trusted(cr.uid);
+}
+
 daemon_identity daemon_probe(const char*   socket_path,
                              daemon_ident* out,
                              int           timeout_ms)
@@ -90,10 +98,7 @@ daemon_identity daemon_probe(const char*   socket_path,
     }
 
     // Asked before a byte is written, because the probe itself is a command.
-    struct ucred cr{};
-    socklen_t    cr_len = sizeof(cr);
-    // A peer whose user cannot be learned is not taken on trust.
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cr_len) != 0 || !peer_trusted(cr.uid))
+    if (!socket_peer_trusted(fd))
     {
         close(fd);
         return daemon_identity::stranger;

@@ -170,6 +170,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `denied: readonly mode` over the text protocol and delivered the message over
   RESP, from a client or a script's `redis.call`; it is now `-ERR readonly mode`
   on both.
+- **No command goes to a daemon socket held by another user.** Every command
+  the CLI sends now asks the socket's peer who it is first and refuses one
+  that is neither this user, root nor the packaged daemon's account; `--lua`
+  and `export` also skipped the probe the other verbs make, so a listener at
+  the shared `/tmp/socketley.sock` read every flag `--lua` makes runtimes
+  with, `--master-pw` and `--secret-key` among them. `socketley daemon`
+  reports such a socket instead of exiting 0.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

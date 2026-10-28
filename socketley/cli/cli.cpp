@@ -81,7 +81,7 @@ static bool socket_answers()
 // session to a stranger.
 static bool refused_tab(int argc, char** argv);
 
-static bool ensure_daemon()
+bool ensure_daemon(bool start)
 {
     switch (socketley::daemon_probe(daemon_handler::socket_path.c_str()))
     {
@@ -130,6 +130,11 @@ static bool ensure_daemon()
             return false;
 
         case socketley::daemon_identity::absent:
+            if (!start)
+            {
+                ipc_report_failure(ipc_unreachable);
+                return false;
+            }
             break;   // the path is free — including when a stale file is on it
     }
 
@@ -392,7 +397,7 @@ int cli_dispatch(int argc, char** argv)
                 // serving" is more use here than "failed to connect" -- but not
                 // for the busy one, which is serving and was being told it was
                 // not there.
-                if (rc == ipc_no_answer || rc == ipc_cut_short)
+                if (rc == ipc_no_answer || rc == ipc_cut_short || rc == ipc_stranger)
                     return ipc_report_failure(rc);
                 if (rc < 0)
                 {
@@ -410,7 +415,7 @@ int cli_dispatch(int argc, char** argv)
             {
                 std::string data;
                 const int rc = ipc_send("daemon-stats", data);
-                if (rc == ipc_no_answer || rc == ipc_cut_short)
+                if (rc == ipc_no_answer || rc == ipc_cut_short || rc == ipc_stranger)
                     return ipc_report_failure(rc);
                 if (rc < 0)
                 {

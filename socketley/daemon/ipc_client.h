@@ -7,6 +7,7 @@
 inline constexpr int ipc_unreachable = -1;   // nothing answered the socket
 inline constexpr int ipc_no_answer   = -2;   // something did, and then went quiet
 inline constexpr int ipc_cut_short   = -3;   // it began an answer and closed before the end of it
+inline constexpr int ipc_stranger    = -4;   // a process of another user holds the socket, so nothing was sent
 int ipc_send(std::string_view command, std::string& data);
 
 // The sentence an ipc_send failure deserves, in one function because eighteen

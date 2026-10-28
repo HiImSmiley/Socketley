@@ -62,6 +62,9 @@ daemon_identity daemon_probe(const char*   socket_path,
                              daemon_ident* out        = nullptr,
                              int           timeout_ms = 5000);
 
+// Whether the process at the other end of a connected unix socket is this user, root, or the packaged daemon's account.
+bool socket_peer_trusted(int fd);
+
 // This process's executable, stat'd through the magic link so it still
 // resolves after the inode has lost its name.
 bool self_exe_identity(std::string& raw_path, uint64_t& dev, uint64_t& ino);

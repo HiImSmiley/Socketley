@@ -563,6 +563,8 @@ daemon_handler::socket_state daemon_handler::probe_socket()
     const bool connected =
         connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
     const int err = errno;
+    // A listener of another user's on a shared /tmp path is no daemon of ours, and exiting 0 on it hid the squatter.
+    const bool trusted = connected && socketley::socket_peer_trusted(probe);
 
     // Raw close on purpose: this is a static probe with no event loop anywhere
     // in reach, so no SQE can ever have named this number and there is nothing
@@ -570,7 +572,7 @@ daemon_handler::socket_state daemon_handler::probe_socket()
     close(probe);
 
     if (connected)
-        return socket_state::ours;
+        return trusted ? socket_state::ours : socket_state::foreign;
 
     // EACCES/EPERM is still "do not touch this path" -- the caller's next move
     // on `free` is a setup() that unlinks it, which in a directory with no

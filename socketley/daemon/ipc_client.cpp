@@ -1,5 +1,6 @@
 #include "ipc_client.h"
 #include "daemon_handler.h"
+#include "../shared/ipc/daemon_client.h"
 #include "../shared/ipc/ipc_framing.h"
 
 #include <sys/socket.h>
@@ -24,6 +25,13 @@ int ipc_send(std::string_view command, std::string& data)
     {
         close(fd);
         return ipc_unreachable;
+    }
+
+    // Asked before a byte is written, because a shared /tmp path is bound by whoever comes first and a command carries its secrets.
+    if (!socketley::socket_peer_trusted(fd))
+    {
+        close(fd);
+        return ipc_stranger;
     }
 
     // Five seconds to answer, and a command that waits on a worker can spend
@@ -162,6 +170,13 @@ int ipc_report_failure(int rc)
     {
         std::cerr << "the daemon at " << daemon_handler::socket_path
                   << " closed the connection before its answer was whole\n";
+        return 2;
+    }
+    if (rc == ipc_stranger)
+    {
+        std::cerr << "the daemon socket at " << daemon_handler::socket_path
+                  << " is held by a process of another user\n"
+                     "  Nothing was sent to it. Point SOCKETLEY_SOCKET at a path you own.\n";
         return 2;
     }
     std::cerr << "failed to connect to daemon\n";
