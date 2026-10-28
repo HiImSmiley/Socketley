@@ -6,6 +6,8 @@
 #include <chrono>
 #include <functional>
 #include <fcntl.h>
+#include <new>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -529,6 +531,13 @@ TEST_CASE("a reader never sees half of one shard's list")
     shard_clients::client_table region;
     REQUIRE(region.create(1));
 
+    // The writer keeps writing until the reader has what it came for, or a loaded box lets the reader finish its
+    // reads before the writer is first scheduled and every one of them finds the list empty.
+    void* flag_mem = ::mmap(nullptr, sizeof(std::atomic<int>), PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(flag_mem != MAP_FAILED);
+    auto* done = new (flag_mem) std::atomic<int>(0);
+
     const pid_t writer = ::fork();
     REQUIRE(writer >= 0);
     if (writer == 0)
@@ -536,24 +545,31 @@ TEST_CASE("a reader never sees half of one shard's list")
         shard_clients::client_table w;
         if (!w.adopt(::dup(region.fd()), 0, 1)) _exit(1);
         uint64_t next = 1;
-        for (int round = 0; round < 200000; ++round)
+        const auto cap = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+        for (int round = 0; round < 200000 || done->load(std::memory_order_acquire) == 0; ++round)
         {
             if (w.own_count() < 8)
                 w.push(mk(7, next++));
             else
                 w.swap_remove(round % 8);      // middles as well as the end
+            if ((round & 1023) == 0 && std::chrono::steady_clock::now() > cap)
+                break;
         }
         _exit(0);
     }
 
-    int reads = 0, dup = 0, empty = 0;
-    for (int i = 0; i < 300000; ++i)
+    // The 300,000 reads are counted from the first that finds the writer's entries, so a writer the scheduler starts
+    // late shortens nothing the case races against it, and a writer that never starts fails it at the deadline.
+    int reads = 0, dup = 0, empty = 0, first = -1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (int i = 0; first >= 0 ? i < first + 300000 : std::chrono::steady_clock::now() < deadline; ++i)
     {
         std::vector<conn_ref> out;
         if (!region.read_block(0, out))
             continue;                          // gave up within the bound
         ++reads;
         if (out.empty()) { ++empty; continue; }
+        if (first < 0) first = i;
         std::vector<uint64_t> serials;
         serials.reserve(out.size());
         for (const auto& r : out) serials.push_back(r.serial);
@@ -561,7 +577,9 @@ TEST_CASE("a reader never sees half of one shard's list")
         if (std::adjacent_find(serials.begin(), serials.end()) != serials.end())
             ++dup;
     }
+    done->store(1, std::memory_order_release);
     int st = 0; ::waitpid(writer, &st, 0);
+    ::munmap(flag_mem, sizeof(std::atomic<int>));
     CHECK((WIFEXITED(st) && WEXITSTATUS(st) == 0));
 
     MESSAGE("seqlock: " << reads << " clean reads, " << empty << " empty, "
