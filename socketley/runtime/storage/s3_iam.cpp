@@ -11,6 +11,7 @@
 #include "../../shared/json/json_doc.h"
 #include "password_hash.h"
 #include "s3_names.h"
+#include "s3_users.h"
 #include "../../shared/json/json_escape.h"
 
 using socketley::json::jvalue;
@@ -888,7 +889,8 @@ struct api
             return &missing("UserName");
         if (!valid_path(path))
             return &missing("Path");
-        if (s.users.count(n) || (taken && taken(ctx, n)))
+        // The owner a bucket with none recorded belongs to is a name too, and a user given it would own them all.
+        if (s.users.count(n) || (taken && taken(ctx, n)) || n == default_owner)
             return &fail(409, "EntityAlreadyExists", "User with name " + n + " already exists.");
         iam_user u;
         u.name = n;

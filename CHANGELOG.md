@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **No user takes the buckets' default owner.** An invitation or CreateUser
+  could make a user named `socketley`, the owner every bucket with none
+  recorded belongs to, and so own all of them; the name is refused.
 - **A forced password reset asks for the second step first.** Setting a new
   password without a session took a username and the old password alone and
   signed the account in, skipping its authenticator code, and for any account,

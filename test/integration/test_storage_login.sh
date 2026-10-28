@@ -189,6 +189,9 @@ if phase == "main":
     check("a token that is none does not", json.loads(ui("GET", "/~ui/invite?token=" + "x" * 32)[1])["valid"], False)
     check("a weak password is refused when it is taken",
           ui("POST", "/~ui/invite", {"token": token, "user": "erin", "password": "short"}, ui_header=False)[0], 400)
+    # The name of the owner every bucket with none recorded belongs to is no one's to take.
+    check("an invitation does not make the buckets' default owner",
+          ui("POST", "/~ui/invite", {"token": token, "user": "socketley", "password": "socketleypass1"}, ui_header=False)[0], 409)
     check("the invitation makes the user", ui("POST", "/~ui/invite", {"token": token, "user": "erin", "password": "erinpassword1", "name": "Erin E"}, ui_header=False)[0], 200)
     settle()
     st, erin, me = sign_in("erin", "erinpassword1")
