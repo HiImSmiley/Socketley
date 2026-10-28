@@ -1707,6 +1707,9 @@ void imap_session::cmd_metadata(const std::string& tag, const std::vector<token>
             const bool nil = a[i + 1].k == token::atom && upper(a[i + 1].text) == "NIL";
             if (!p.own(m_user) && !entry.starts_with("/shared"))
                 return finish(tag, "NO", "[NOPERM] A private entry of another user's mailbox is theirs");
+            // The imapsieve entry names a script that runs as the owner, so only the owner names it.
+            if (!p.own(m_user) && (entry == "/shared/imapsieve" || entry.starts_with("/shared/imapsieve/")))
+                return finish(tag, "NO", "[NOPERM] Which script runs on a mailbox is its owner's to say");
             const auto why = m_store.set_meta(owner, folder, entry, nil ? nullptr : &a[i + 1].text);
             if (why == imap_store::meta_refusal::too_large)
                 return finish(tag, "NO", "[METADATA MAXSIZE " + std::to_string(imap_store::meta_max_value) +

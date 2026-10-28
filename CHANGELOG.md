@@ -181,6 +181,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **Only a mailbox's owner names its imapsieve script.** A user given `w`
+  on another's folder could set `/shared/imapsieve/script` to one of the
+  owner's Sieve scripts, which then ran as the owner on every message the user
+  flagged, filing, discarding or redirecting the owner's mail; the entry is now
+  `[NOPERM]` for anyone but the owner.
 - **RCPT after a BDAT chunk is refused.** A recipient named between chunks
   was answered 250, under LMTP with a 250 of its own at the end, but the
   message had taken its recipients with the first chunk and never reached it;

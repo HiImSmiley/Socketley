@@ -29,7 +29,8 @@
 #   * IMAP4rev2 still saying RECENT or UNSEEN, or answering SEARCH without ESEARCH; $ not what SAVE kept; a SELECT
 #     not saying CLOSED; STATUS without DELETED
 #   * a folder shared by ACL not listed, read or written as its rights say, a right not given taken anyway, or one
-#     taken away kept; a MOVE into another's folder
+#     taken away kept; a MOVE into another's folder; the imapsieve script, which runs as the owner, named by a share
+#     with w
 #   * AUTHENTICATE PLAIN not signing in, with its response at once or after the continuation; DELETE INBOX taken; an
 #     APPEND past the largest message waited for; the command parser answering differently as its input is cut
 #   * BINARY giving a part still encoded, a NUL in a plain literal, or an encoding it cannot undo answered OK
@@ -451,6 +452,12 @@ elif step == "acl":
     st = b.cmd("STATUS Team (MESSAGES)")
     left = a.cmd("UID SEARCH SUBJECT moving")[0]
     say("a MOVE goes into another's folder and from the user's own", r[-1].split()[1] == "OK" and "MESSAGES 3" in st[0] and left.strip() == "* SEARCH", (r, st, left))
+    b.cmd("SETACL Team alice +w")
+    r = a.cmd('SETMETADATA "Other Users/bob/Team" (/shared/imapsieve/script "onfile")')
+    r2 = a.cmd('SETMETADATA "Other Users/bob/Team" (/shared/comment "from alice")')
+    g = b.cmd("GETMETADATA Team /shared/imapsieve/script")
+    say("with w a share sets a /shared entry but not the imapsieve script, which runs as the owner",
+        "[NOPERM]" in r[-1] and r2[-1].split()[1] == "OK" and any("/shared/imapsieve/script NIL" in x for x in g), (r, r2, g))
     b.cmd("DELETEACL Team alice")
     r = a.cmd('SELECT "Other Users/bob/Team"')
     l = a.cmd('LIST "" "Other Users/*"')
