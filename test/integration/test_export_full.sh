@@ -10,6 +10,7 @@
 #   * compressing on several threads that loses or reorders a piece, which one thread would not
 #   * a runtime's data left out: its buckets, its accounts, its mailboxes, its documents, its keys
 #   * a restore over a running daemon, over runtimes already there, or of a file that is no such archive
+#   * a crafted manifest that writes a system file, a home's hidden one, or a setuid bit
 #   * a restore that brings the runtimes back stopped, or without what they held
 set -uo pipefail
 
@@ -125,6 +126,31 @@ PY
 out=$("$BIN" restore "$T/evil.tar.gz" 2>&1); rc=$?
 [ "$rc" -eq 2 ] && [ ! -e "$T/escaped" ] && case "$out" in *"outside what its manifest says"*) true ;; *) false ;; esac \
     && ok "an entry outside the manifest's roots refuses the archive, and is not written" || bad "an escaping entry" "rc $rc: $out"
+# A manifest is no authority over the system's files nor a home's own setup: what it names there is left, the rest put
+# back, and nothing it holds runs as its owner.
+ETC_T="/etc/socketley-restore-test-$$"
+python3 - "$T/system.tar.gz" "$T" "$ETC_T" <<'PY'
+import io, json, sys, tarfile
+T, etc = sys.argv[2], sys.argv[3]
+t = tarfile.open(sys.argv[1], "w:gz")
+def add(name, data, mode=0o644):
+    i = tarfile.TarInfo(name); i.size = len(data); i.mode = mode; t.addfile(i, io.BytesIO(data))
+add("socketley-backup/manifest.json", json.dumps({"format": 1, "state_dir": T + "/nowhere",
+                                                  "roots": [T + "/plain", etc, T + "/home/.ssh"]}).encode())
+add(T.lstrip("/") + "/plain/kept", b"a runtime's file\n", 0o4755)
+add(T.lstrip("/") + "/home/.ssh/authorized_keys", b"ssh-ed25519 AAAA planted\n")
+add(etc.lstrip("/") + "/x", b"* * * * * root /bin/true\n")
+t.close()
+PY
+out=$("$BIN" restore "$T/system.tar.gz" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ ! -e "$ETC_T" ] && [ ! -e "$T/home/.ssh/authorized_keys" ] \
+    && case "$out" in *"not restored: $ETC_T, under /etc"*"not restored: $T/home/.ssh, a hidden file of a home"*) true ;; *) false ;; esac \
+    && ok "a manifest's root under /etc or in a home's hidden files is left, and said" \
+    || bad "a manifest naming the system's files" "rc $rc: $out; $(ls -la "$ETC_T" "$T/home/.ssh" 2>&1 | head -3)"
+rm -rf "$ETC_T" 2>/dev/null
+[ "$(cat "$T/plain/kept" 2>/dev/null)" = "a runtime's file" ] && [ "$(stat -c %a "$T/plain/kept")" = 755 ] \
+    && ok "the rest is put back, without its setuid bit" || bad "the file beside them" "$(stat -c '%a %s' "$T/plain/kept" 2>&1)"
+rm -rf "$T/plain" "$T/home/.ssh"
 printf 'no archive at all' > "$T/junk.tar.gz"
 out=$("$BIN" restore "$T/junk.tar.gz" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "a file that is no such archive is refused" || bad "a junk archive" "rc $rc: $out"

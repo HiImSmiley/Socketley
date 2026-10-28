@@ -194,6 +194,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the shared `/tmp/socketley.sock` read every flag `--lua` makes runtimes
   with, `--master-pw` and `--secret-key` among them. `socketley daemon`
   reports such a socket instead of exiting 0.
+- **Restore writes no system file an archive names.** `socketley restore`
+  took every root its archive's manifest listed as a place to write, so a
+  crafted archive restored as root could put a file in `/etc/cron.d`,
+  `/etc/sudoers.d` or `/root/.ssh`; it now writes this machine's state and
+  config directories, and other roots only outside `/etc`, `/usr`, `/root`,
+  `/boot`, `/run`, `/var/spool` and the like and outside a home's hidden
+  files, saying what it leaves. No restored file keeps a setuid or setgid
+  bit, and outside the state and config a file the archive says root owns is
+  written as the daemon's user's.
 - **An account's sign-ins end everywhere when it does.** Disabling an account,
   signing it out everywhere, a new password, a reset or removal from `admins`
   now ends its cookies and tokens at every runtime that takes the idp's

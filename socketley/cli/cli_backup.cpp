@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -69,6 +70,61 @@ bool too_broad(const fs::path& p)
                                                  "/dev", "/proc", "/sys", "/run", "/mnt", "/media"};
     return system.count(p.lexically_normal().string()) > 0;
 }
+
+// `p` normal and without a trailing slash, so "/etc/" is compared as "/etc".
+fs::path clean(const fs::path& p)
+{
+    std::string s = p.lexically_normal().string();
+    while (s.size() > 1 && s.back() == '/')
+        s.pop_back();
+    return s;
+}
+
+// The places restore leaves to the system where an archive names them outside this machine's state and config: an
+// archive may say any path, and what it says is no authority over the system's files nor over a user's own setup.
+struct system_files
+{
+    std::vector<fs::path> homes;
+
+    system_files()
+    {
+        if (const char* h = std::getenv("HOME"); h && h[0] == '/')
+            homes.push_back(clean(h));
+        ::setpwent();
+        while (const passwd* pw = ::getpwent())
+            if (pw->pw_dir && pw->pw_dir[0] == '/')
+                homes.push_back(clean(pw->pw_dir));
+        ::endpwent();
+        std::erase_if(homes, [](const fs::path& h) { return too_broad(h); });
+    }
+
+    // Why `named` is one of them, or empty; asked of the path as named and, with `resolve`, as its links resolve.
+    std::string why(const fs::path& named, bool resolve) const
+    {
+        static constexpr std::string_view system[] = {
+            "/etc",    "/usr",       "/bin",          "/sbin",        "/lib",         "/lib32",           "/lib64",
+            "/libx32", "/boot",      "/root",         "/dev",         "/proc",        "/sys",             "/run",
+            "/var/run", "/var/spool", "/var/lib/dpkg", "/var/lib/rpm", "/var/lib/apt", "/var/lib/systemd", "/var/lib/polkit-1"};
+        std::error_code ec;
+        const fs::path real = resolve ? fs::weakly_canonical(named, ec) : named;
+        for (const fs::path& p : {clean(named), ec ? clean(named) : clean(real)})
+        {
+            if (too_broad(p))
+                return "a system directory";
+            for (const std::string_view s : system)
+                if (under(p, fs::path(s)))
+                    return "under " + std::string(s);
+            // A home's hidden files are its user's shell, ssh and desktop setup, not a runtime's data.
+            const std::vector<fs::path> parts(p.begin(), p.end());
+            if (parts.size() > 3 && parts[1] == "home" && parts[3].string().starts_with("."))
+                return "a hidden file of a home";
+            for (const fs::path& h : homes)
+                if (p != h && under(p, h) && p.lexically_relative(h).begin()->string().starts_with("."))
+                    return "a hidden file of a home";
+        }
+        return {};
+    }
+};
 
 struct runtime_file
 {
@@ -505,19 +561,48 @@ int cli_restore(int argc, char** argv)
         std::cout << "restore: the archive's manifest does not read\n";
         return 1;
     }
-    std::vector<fs::path> roots;
-    if (const jvalue* r = socketley::json::member(manifest, "roots"); r && r->k == jvalue::kind::array)
-        for (const auto& v : r->items)
-            if (v.k == jvalue::kind::string && v.s.starts_with("/") && !too_broad(v.s))
-                roots.emplace_back(v.s);
-    const fs::path state(socketley::json::string_of(manifest, "state_dir"));
+    // This machine's state and config directories are restore's to write; what else the manifest names, only where it
+    // is no system's.
+    const socketley_paths here = socketley_paths::resolve();
+    const fs::path state = clean(here.state_dir);
+    const fs::path config_dir = here.config_path.empty() ? fs::path() : clean(here.config_path.parent_path());
+    const auto local = [&](const fs::path& p) {
+        return (!state.empty() && under(p, state)) ||
+               (!config_dir.empty() && !too_broad(config_dir) && under(p, config_dir));
+    };
     std::error_code ec;
     if (!force && !runtimes_of(state).empty())
     {
         std::cout << state.string() << " holds runtimes already: --force puts the archive's over them\n";
         return 1;
     }
+    const system_files theirs;
+    // A root is asked as its links resolve; what lies below one is held to no link by the walk further down.
+    const auto left_to_system = [&](const fs::path& p, bool resolve) {
+        return local(p) ? std::string() : theirs.why(p, resolve);
+    };
+    const auto say_left = [](const fs::path& p, const std::string& no) {
+        std::cout << "not restored: " << p.string() << ", " << no << ", which restore leaves to the system; tar takes it "
+                  << "out of the archive by hand\n";
+    };
+    std::vector<fs::path> roots, refused;
+    if (const jvalue* r = socketley::json::member(manifest, "roots"); r && r->k == jvalue::kind::array)
+        for (const auto& v : r->items)
+        {
+            if (v.k != jvalue::kind::string || !v.s.starts_with("/") || too_broad(clean(v.s)))
+                continue;
+            const fs::path p = clean(v.s);
+            roots.push_back(p);
+            if (const std::string no = left_to_system(p, true); !no.empty())
+            {
+                refused.push_back(p);
+                say_left(p, no);
+            }
+        }
     const bool root_user = ::geteuid() == 0;
+    // Outside the state and config, what the archive says root owns is written as the daemon's user's instead.
+    struct stat state_owner{};
+    if (::stat(state.c_str(), &state_owner) != 0) {}
     uint64_t files = 0, bytes = 0;
     // A directory takes its recorded mode once everything under it is written, deepest first.
     std::vector<std::pair<fs::path, mode_t>> dir_modes;
@@ -543,6 +628,13 @@ int cli_restore(int argc, char** argv)
         {
             std::cout << "restore: the archive names " << target.string() << ", outside what its manifest says it holds\n";
             return 2;
+        }
+        if (std::any_of(refused.begin(), refused.end(), [&](const fs::path& r) { return under(target, r); }))
+            continue;
+        if (const std::string no = left_to_system(target, false); !no.empty())
+        {
+            say_left(target, no);
+            continue;
         }
         // A link made by this archive must not carry a later entry out of the root it is under.
         const fs::path& root_of = *std::find_if(roots.begin(), roots.end(), [&](const fs::path& r) { return under(target, r); });
@@ -573,12 +665,21 @@ int cli_restore(int argc, char** argv)
             uid = pw->pw_uid;
         if (const group* gr = e.gname.empty() ? nullptr : ::getgrnam(e.gname.c_str()))
             gid = gr->gr_gid;
+        if (root_user && !local(target))
+        {
+            if (uid == 0)
+                uid = state_owner.st_uid;
+            if (gid == 0)
+                gid = state_owner.st_gid;
+        }
+        // No archive makes a file that runs as its owner or its group.
+        const mode_t mode = static_cast<mode_t>(e.mode) & 01777;
         if (e.type == '5')
         {
             fs::create_directories(target, ec);
-            if (::chmod(target.c_str(), e.mode | 0700) != 0) {}
+            if (::chmod(target.c_str(), mode | 0700) != 0) {}
             if (root_user && ::lchown(target.c_str(), uid, gid) != 0) {}
-            dir_modes.emplace_back(target, static_cast<mode_t>(e.mode));
+            dir_modes.emplace_back(target, mode);
             continue;
         }
         fs::create_directories(target.parent_path(), ec);
@@ -624,7 +725,7 @@ int cli_restore(int argc, char** argv)
                     rest.remove_prefix(static_cast<size_t>(w));
             }
         }
-        if (::fchmod(fd, e.mode) != 0) {}
+        if (::fchmod(fd, mode) != 0) {}
         if (root_user && ::fchown(fd, uid, gid) != 0) {}
         const timespec times[2] = {{e.mtime, 0}, {e.mtime, 0}};
         if (::futimens(fd, times) != 0) {}

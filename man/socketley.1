@@ -1872,7 +1872,21 @@ daemon is stopped first, and started again brings every runtime back from its
 state as it was, running where it ran. A state directory that holds runtimes
 already is refused unless
 .BR \-\-force ;
-a path outside those the archive's manifest names refuses the archive.
+a path outside those the archive's manifest names refuses the archive. Besides
+this machine's state and configuration directories, a path the manifest names
+under
+.IR /etc ,
+.IR /usr ,
+.IR /root ,
+.IR /boot ,
+.IR /run ,
+.I /var/spool
+and the like, or among a home's hidden files, is left where it is and named,
+for
+.B tar
+to take out by hand; no file is restored setuid or setgid, and outside the
+state and configuration one the archive says root owns is owned by the
+daemon's user.
 .RS
 .PP
 .nf
