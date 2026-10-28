@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A forced password reset asks for the second step first.** Setting a new
+  password without a session took a username and the old password alone and
+  signed the account in, skipping its authenticator code, and for any account,
+  not only one told to reset. The reset page now comes only after the password
+  and the code, and carries a token of that sign-in, used once; the return
+  address a sign-in ends at is checked wherever it ends, and a Location with a
+  control character is refused.
 - **Clients are closed beside an idle connection on older kernels.** On a
   kernel that frees io_uring's file nodes in order (6.8 here), one idle
   connection to a cache or a server, a replica's included, left every client

@@ -409,6 +409,12 @@ void idp_run::respond(const std::shared_ptr<conn>& c, int status, std::string_vi
 
 void idp_run::redirect(const std::shared_ptr<conn>& c, std::string_view location, std::string_view extra_headers)
 {
+    // A control character in a Location would end the field and write headers of the caller's choosing.
+    if (std::any_of(location.begin(), location.end(), [](char ch) { return static_cast<unsigned char>(ch) < 0x20 || ch == 0x7f; }))
+    {
+        respond(c, 400, "text/plain", "the return address is not one this provider sends to\n");
+        return;
+    }
     std::string h = "Location: " + std::string(location) + "\r\n" + std::string(extra_headers);
     respond(c, 302, "text/plain", "", h);
 }
@@ -782,7 +788,8 @@ void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, par
     const std::string token(param(p, "pending"));
     const std::string ip = client_ip(*c, rq);
     const auto it = m_pending.find(token);
-    if (it == m_pending.end() || it->second.until_s < wall::now_sec())
+    // A reset's token is no second step's: its code was asked for already.
+    if (it == m_pending.end() || it->second.until_s < wall::now_sec() || it->second.reset)
     {
         if (it != m_pending.end())
             m_pending.erase(it);
@@ -820,8 +827,27 @@ void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, par
     const params carried = it->second.p;
     const bool remember = it->second.remember;
     m_pending.erase(it);
+    if (a->field("reset") == "1")
+    {
+        reset_after_sign_in(c, *a, carried, remember);
+        return;
+    }
     signed_in(*a, ip, "with password and code");
     grant(c, carried, *a, session_cookie(*a, remember));
+}
+
+void idp_run::reset_after_sign_in(const std::shared_ptr<conn>& c, const account& a, const params& p, bool remember)
+{
+    const int64_t now = wall::now_sec();
+    std::erase_if(m_pending, [now](const auto& kv) { return kv.second.until_s < now; });
+    if (m_pending.size() >= 10000)
+    {
+        login_page(c, p, "Too many sign-ins are waiting; try again in a minute.", 429);
+        return;
+    }
+    const std::string token = socketley::random_hex(24);
+    m_pending[token] = {a.id, remember, p, now + 600, true};
+    reset_page(c, token, {}, 200);
 }
 
 void idp_run::authorize(const std::shared_ptr<conn>& c, const request& rq)
@@ -912,9 +938,8 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             return;
         }
         cc->waiting = false;
-        if (a->field("reset") == "1")
-            reset_page(cc, p, {}, 200);
-        else if (!a->field("totp").empty())
+        // The code before a forced reset, so a password alone never sets a new one and signs in with it.
+        if (!a->field("totp").empty())
         {
             // Its password right, the code is asked for, what the sign-in carries kept here five minutes.
             const int64_t now = wall::now_sec();
@@ -928,6 +953,8 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             else
                 login_page(cc, p, "Too many sign-ins are waiting for their code; try again in a minute.", 429);
         }
+        else if (a->field("reset") == "1")
+            reset_after_sign_in(cc, *a, p, remember);
         else
         {
             signed_in(*a, ip, "with password");
@@ -1057,8 +1084,9 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
     // A sign-in for a page behind a proxy, or for this provider itself, rather than for a client.
     if (!cl)
     {
+        // Checked here as well as where the sign-in began, since every path that signs someone in ends here.
         const std::string_view rd = param(p, "rd");
-        redirect(c, rd.empty() ? std::string_view("/") : rd, set_cookie);
+        redirect(c, rd.empty() || !return_allowed(rd, m_issuer, m_cookie_domain) ? std::string_view("/") : rd, set_cookie);
         return;
     }
     code_entry e;
@@ -1764,17 +1792,13 @@ void idp_run::home(const std::shared_ptr<conn>& c, const request& rq)
                               "type=\"submit\">Sign out</button></form>"));
 }
 
-void idp_run::reset_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status)
+void idp_run::reset_page(const std::shared_ptr<conn>& c, const std::string& token, std::string_view error, int status)
 {
-    std::string hidden;
-    for (const auto name : carried)
-        if (const std::string_view v = param(p, name); !v.empty())
-            hidden += "<input type=\"hidden\" name=\"" + std::string(name) + "\" value=\"" + html_escape(v) + "\">";
+    // The sign-in it finishes is the token's, kept here with where it goes on to, and not what the form says.
     const std::string body =
         "<h1>Set a new password</h1><p class=\"mut\">Your password must be set again before you go on.</p>"
-        "<form method=\"post\" action=\"/account/password\">" + hidden +
-        "<input type=\"hidden\" name=\"username\" value=\"" + html_escape(param(p, "username")) +
-        "\"><label for=\"o\">Current password</label><input class=\"inp\" id=\"o\" type=\"password\" name=\"current\" "
+        "<form method=\"post\" action=\"/account/password\"><input type=\"hidden\" name=\"reset_token\" value=\"" +
+        html_escape(token) + "\"><label for=\"o\">Current password</label><input class=\"inp\" id=\"o\" type=\"password\" name=\"current\" "
         "autocomplete=\"current-password\" required><label for=\"n\">New password</label><input class=\"inp\" id=\"n\" "
         "type=\"password\" name=\"new\" autocomplete=\"new-password\" required>" +
         (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
@@ -2043,11 +2067,29 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
 void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
 {
     params p = parse_form(rq.body);
-    // Signed in, the account is the session's; at a forced reset it is the one named, proven by its old password.
+    // Signed in, the account is the session's; at a forced reset it is the one a sign-in that passed every step and
+    // found the reset left its token for, and nothing a form names.
     const account* who = session_of(rq);
     const bool from_reset = !who;
-    if (!who)
-        who = m_accounts.by_name(param(p, "username"));
+    const std::string token(param(p, "reset_token"));
+    params carried_on;
+    if (from_reset)
+    {
+        const auto it = m_pending.find(token);
+        if (token.empty() || it == m_pending.end() || !it->second.reset || it->second.until_s < wall::now_sec())
+        {
+            login_page(c, {}, "The sign-in took too long; sign in again.", 401);
+            return;
+        }
+        who = m_accounts.by_id(it->second.id);
+        if (!who || who->field("reset") != "1")
+        {
+            m_pending.erase(it);
+            login_page(c, {}, "Sign in again.", 401);
+            return;
+        }
+        carried_on = it->second.p;
+    }
     const std::string ip = client_ip(*c, rq);
     if (barred(ip, wall::now_sec()))
     {
@@ -2061,7 +2103,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
     const std::string problem = socketley::storage::password_problem(fresh, who ? who->username() : "");
     std::weak_ptr<conn> weak = c;
     c->waiting = true;
-    check_password(who, current, [this, weak, rq, p, ip, id, fresh, problem, from_reset](bool ok)
+    check_password(who, current, [this, weak, rq, token, carried_on, ip, id, fresh, problem, from_reset](bool ok)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -2071,21 +2113,21 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
         {
             cc->waiting = false;
             if (from_reset)
-                reset_page(cc, p, msg, status);
+                reset_page(cc, token, msg, status);
             else
                 account_page(cc, rq, {}, msg, status);
             m_http.resume(cc);
         };
         if (!ok || !a || a->disabled())
         {
-            missed(ip, wall::now_sec(), [this, weak, rq, p, from_reset]
+            missed(ip, wall::now_sec(), [this, weak, rq, token, from_reset]
             {
                 auto c2 = weak.lock();
                 if (!c2 || c2->dead)
                     return;
                 c2->waiting = false;
                 if (from_reset)
-                    reset_page(c2, p, "The current password is not right.", 401);
+                    reset_page(c2, token, "The current password is not right.", 401);
                 else
                     account_page(c2, rq, {}, "The current password is not right.", 401);
                 m_http.resume(c2);
@@ -2097,7 +2139,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
             fail(problem, 400);
             return;
         }
-        hash_password(fresh, [this, weak, p, id, from_reset](std::string hash)
+        hash_password(fresh, [this, weak, token, carried_on, id, from_reset](std::string hash)
         {
             auto c2 = weak.lock();
             if (!c2 || c2->dead)
@@ -2116,7 +2158,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
             // A new password ends the sessions given before it, as a stolen one would want.
             update_account(id, {{"password", hash}, {"reset", ""}, {"password_set", std::to_string(wall::now_sec())},
                                 {"revoked_before", std::to_string(wall::now_ms())}},
-                           [this, weak, p, id, from_reset](bool ok, const std::string&)
+                           [this, weak, token, carried_on, id, from_reset](bool ok, const std::string&)
             {
                 auto c3 = weak.lock();
                 if (!c3 || c3->dead)
@@ -2129,7 +2171,11 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
                 {
                     signed_in(*a2, {}, "with a new password");
                     if (from_reset)
-                        grant(c3, p, *a2, session_cookie(*a2, false));
+                    {
+                        const bool remember = m_pending.contains(token) && m_pending[token].remember;
+                        m_pending.erase(token);
+                        grant(c3, carried_on, *a2, session_cookie(*a2, remember));
+                    }
                     else
                         respond(c3, 200, "text/html; charset=utf-8",
                                 page("Password changed", "<h1>Password changed</h1><p class=\"mut\">Every other "

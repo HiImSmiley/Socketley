@@ -135,7 +135,9 @@ private:
     // The code for a signed-in account, sent to the client's redirect, or the browser sent on.
     void grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie);
     void login_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status);
-    void reset_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status);
+    void reset_page(const std::shared_ptr<conn>& c, const std::string& token, std::string_view error, int status);
+    // A sign-in whose password, and code where the account has one, were right, sent to set its password again.
+    void reset_after_sign_in(const std::shared_ptr<conn>& c, const account& a, const params& p, bool remember);
     void issue_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who);
     // An authorization code exchanged, once the shard that gave it has handed over its entry.
     void redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, bool found, const code_entry& e);
@@ -156,6 +158,8 @@ private:
         bool remember{false};
         params p;
         int64_t until_s{0};
+        // The proof a forced reset carries: the sign-in passed every step, and only its password is still to be set.
+        bool reset{false};
     };
     std::unordered_map<std::string, pending_sign_in> m_pending;
     // The last step of each account's codes taken, so one code is taken once; and a secret an account is enrolling.

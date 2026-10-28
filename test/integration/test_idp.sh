@@ -298,9 +298,42 @@ elif phase == "after_cli":
     # A password set with --reset lets the account in only after it is set again.
     st, body, h = req("POST", "/authorize", dict(auth, username="alice", password="tempPassword99"))
     check("a password that must be reset is asked for again before anything else", (st, "Set a new password" in body, h.get("Set-Cookie")), (200, True, None))
-    st, body, h = req("POST", "/account/password", dict(auth, username="alice", current="tempPassword99", new="Fresh-pass-2026x"))
+    reset_token = (re.search(r'name="reset_token" value="([0-9a-f]+)"', body) or [None, ""])[1]
+    # Without the token a sign-in that passed every step left, a password alone sets nothing and signs nobody in.
+    st, _, h = req("POST", "/account/password", dict(auth, username="alice", current="tempPassword99", new="Other-pass-2026y"))
+    check("a reset without the sign-in's token is refused", (st, h.get("Set-Cookie")), (401, None))
+    st, body, h = req("POST", "/account/password", dict(reset_token=reset_token, current="tempPassword99", new="Fresh-pass-2026x"))
     check("set again, the account goes on to its application", (st, bool(code_of(h)[0].get("code")), cookie_of(h).startswith("skl_idp=")), (302, True, True))
+    st, _, h = req("POST", "/account/password", dict(reset_token=reset_token, current="Fresh-pass-2026x", new="Third-pass-2026z"))
+    check("and its token is spent", (st, h.get("Set-Cookie")), (401, None))
     check("and the old password is no longer it", req("POST", "/authorize", dict(auth, username="alice", password="tempPassword99"))[0], 401)
+    # An account with a second step and a reset: the code is asked for first, and only then is the password set.
+    import hmac, struct
+    def totp_now(key):
+        k = base64.b32decode(key.replace(" ", "").upper() + "=" * (-len(key.replace(" ", "")) % 8))
+        h = hmac.new(k, struct.pack(">Q", int(time.time()) // 30), hashlib.sha1).digest()
+        o = h[-1] & 15
+        return "%06d" % ((struct.unpack(">I", h[o:o + 4])[0] & 0x7fffffff) % 1000000)
+    E = {"X-Forwarded-For": "198.51.100.20"}   # an address of its own, the failures before have barred this one
+    erin_key = open(tmpd + "/erin.key").read().strip()
+    st, body, h = req("POST", "/login", dict(rd="/", username="erin", password="erinTemp12345"), headers=E)
+    pending = (re.search(r'name="pending" value="([0-9a-f]+)"', body) or [None, ""])[1]
+    check("a reset is asked for only after the code", (st, bool(pending), "reset_token" in body, h.get("Set-Cookie")), (200, True, False, None))
+    st, body, h = req("POST", "/login", dict(rd="/", pending=pending, code=totp_now(erin_key)), headers=E)
+    erin_token = (re.search(r'name="reset_token" value="([0-9a-f]+)"', body) or [None, ""])[1]
+    check("and the code right, the password is asked for", (st, bool(erin_token), h.get("Set-Cookie")), (200, True, None))
+    st, body, h = req("POST", "/login", dict(rd="/", pending=erin_token, code=totp_now(erin_key)), headers=E)
+    check("a reset's token is taken for no second step", (st, h.get("Set-Cookie")), (401, None))
+    st, body, h = req("POST", "/login", dict(rd="/", username="erin", password="erinTemp12345"), headers=E)
+    pending = (re.search(r'name="pending" value="([0-9a-f]+)"', body) or [None, ""])[1]
+    time.sleep(max(0.0, 30 - time.time() % 30 + 0.5))
+    st, body, h = req("POST", "/login", dict(rd="/", pending=pending, code=totp_now(erin_key)), headers=E)
+    erin_token = (re.search(r'name="reset_token" value="([0-9a-f]+)"', body) or [None, ""])[1]
+    st, body, h = req("POST", "/account/password", dict(reset_token=erin_token, current="erinTemp12345", new="Erin-fresh-2026x"), headers=E)
+    check("and set, it signs in where it was going", (st, h.get("Location"), cookie_of(h).startswith("skl_idp=")), (302, "/", True))
+    # A return address with a line break writes no header of its own.
+    st, body, h = req("POST", "/login", dict(rd="/x\r\nSet-Cookie: injected=1", username="dora", password="dorapassword1"), headers=E)
+    check("a return address with a line break sets no header", ("injected" in (h.get("Set-Cookie") or ""), st in (302, 400)), (False, True))
     # Six failures from one address and the seventh try waits, right password or not.
     for _ in range(6):
         req("POST", "/authorize", dict(auth, username="dora", password="wrongpassword"), headers={"X-Forwarded-For": "198.51.100.7"})
@@ -328,6 +361,11 @@ tally < <(run main)
 "$BIN" idp-user auth disable carol >/dev/null 2>&1 && ok || bad "disable takes" "rc $?"
 "$BIN" idp-user auth logout alice >/dev/null 2>&1 && ok || bad "logout takes" "rc $?"
 "$BIN" idp-user auth passwd alice --password tempPassword99 --reset >/dev/null 2>&1 && ok || bad "passwd --reset takes" "rc $?"
+# An account with a second step whose password must be set again, its key kept for the checks to make codes.
+"$BIN" idp-user auth add erin --password erinpassword1 >/dev/null 2>&1
+"$BIN" idp-user auth totp erin on 2>&1 | sed -n 's/^key: //p' > "$T/erin.key"
+"$BIN" idp-user auth passwd erin --password erinTemp12345 --reset >/dev/null 2>&1
+[ -s "$T/erin.key" ] && ok || bad "a second step is turned on for the reset checks" "no key"
 tally < <(run after_cli)
 
 "$BIN" stop auth >/dev/null 2>&1
@@ -340,7 +378,7 @@ case "$AFTER" in "id: $ALICE"*"game.class: mage"*) ok ;; *) bad "an account keep
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
 STATS=$("$BIN" stats auth 2>/dev/null)
-case "$STATS" in *"accounts:4"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+case "$STATS" in *"accounts:5"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]
