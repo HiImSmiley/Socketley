@@ -78,6 +78,8 @@ cat > "$WORK/stopper.lua" <<'LUA'
 function on_message(msg)
     if msg:find("STOP") then
         self.broadcast("STOPPED:" .. tostring(socketley.stop("grow")) .. "\n")
+    elseif msg:find("START") then
+        self.broadcast("STARTED:" .. tostring(socketley.start("grow")) .. "\n")
     end
 end
 LUA
@@ -116,7 +118,7 @@ PY
 cat > "$WORK/stop.py" <<'PY'
 import socket, sys
 s = socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=5)
-s.sendall(b"STOP\n")
+s.sendall((sys.argv[2] if len(sys.argv) > 2 else "STOP").encode() + b"\n")
 s.settimeout(5)
 buf = b""
 while b"\n" not in buf:
@@ -158,6 +160,14 @@ check "three shards" "$(shard_count)" "3"
 COUNTS=$(python3 "$WORK/count.py" "$P_SRV" "$N")
 echo "  observed: the shards' clients() said [$COUNTS] for $N connections"
 check "every shard sees every client after the grow" "$COUNTS" "$N"
+
+echo "== stopped and started again by a script in the daemon =="
+check "the script's stop succeeds again" "$(python3 "$WORK/stop.py" "$P_STOP")" "STOPPED:true"
+check "and its start" "$(python3 "$WORK/stop.py" "$P_STOP" START)" "STARTED:true"
+# Once and at once, as for the stop: the workers are forked before the script hears yes.
+up=no
+nc -z 127.0.0.1 "$P_SRV" 2>/dev/null && up=yes
+check "the port answers once the script's start has" "$up" "yes"
 
 echo
 echo "shard clients grow: PASS=$PASS FAIL=$FAIL"

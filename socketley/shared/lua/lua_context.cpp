@@ -2246,6 +2246,9 @@ void lua_context::register_bindings(runtime_instance* owner)
                           + (have_port ? " on port " + std::to_string(cfg_port)
                                        : std::string{}));
         }
+        // Its workers forked before the answer, as for the CLI's start, so the port answers once the script hears yes.
+        if (cfg_start)
+            mgr->release_workers();
 
         return api_yes();
     };
@@ -2293,8 +2296,12 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (const std::string msg = inst->ring_policy_refusal(*loop); !msg.empty())
             return api_why(msg);
 
+        // Its workers forked before the answer, as for the CLI's start, rather than at the next health tick.
         if (mgr->start(name, *loop))
+        {
+            mgr->release_workers();
             return api_yes();
+        }
 
         return api_why(q(name) + " could not be started; it is "
                     + state_to_string(inst->get_state())
