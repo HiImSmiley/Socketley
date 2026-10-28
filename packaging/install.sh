@@ -12,7 +12,7 @@ fi
 
 if [ ! -f "$BINARY" ]; then
     echo "error: release binary not found at $BINARY"
-    echo "build first: cd make && make config=release_x64 -j\$(nproc)"
+    echo "build first: cd make && make config=release_$([ "$(uname -m)" = aarch64 ] && echo arm64 || echo x64) -j\$(nproc)"
     exit 1
 fi
 

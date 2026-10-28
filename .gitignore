@@ -140,3 +140,4 @@ test/benchmark/bench_client
 
 # scripts/update.sh: which pins of bin/build-thirdparty.sh the archives here were built from
 thirdparty/.built-versions
+thirdparty/premake/

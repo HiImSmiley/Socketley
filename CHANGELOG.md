@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **64-bit ARM.** socketley builds on aarch64 as on x86-64: the makefiles are
+  for the machine premake runs on (`release_arm64` there), Release compiles
+  for every 64-bit ARM CPU, `scripts/install-from-source.sh` builds premake
+  itself where the x86-64 `bin/premake5` cannot run, and a package built
+  there is an `arm64` .deb that `install.sh` picks on such a machine.
 - **A code to scan for two-step sign-in.** An idp's page that turns two-step
   sign-in on shows the authenticator key as a QR code beside the key itself.
 - **A tunnel runtime.** A machine with no address of its own — at home behind a

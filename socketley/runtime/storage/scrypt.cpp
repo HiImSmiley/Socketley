@@ -37,6 +37,9 @@ bool params_ok(uint64_t N, uint32_t r, uint32_t p, uint64_t max_mem)
     return blen <= UINT64_MAX - vlen && blen + vlen <= max_mem;
 }
 
+// The SSE and AVX2 paths' own, since elsewhere OpenSSL's EVP_PBE_scrypt does all of it.
+#if defined(__x86_64__)
+
 bool pbkdf2(std::string_view password, std::string_view salt, unsigned char* out, size_t len)
 {
     return password.size() <= INT_MAX && salt.size() <= INT_MAX && len <= INT_MAX &&
@@ -56,8 +59,6 @@ void set_word(void* base, size_t i, uint32_t w)
 {
     std::memcpy(static_cast<char*>(base) + 4 * i, &w, 4);
 }
-
-#if defined(__x86_64__)
 
 // Bytes derived from a password, cleared before they are freed, as OpenSSL clears its own.
 struct cleansed

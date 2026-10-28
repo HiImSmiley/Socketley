@@ -5,13 +5,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BINARY="$PROJECT_ROOT/bin/Release/socketley"
 VERSION="${1:-1.1.0}"
-ARCH="amd64"
+# The configuration premake5.lua made, and the Debian name of its architecture.
+CONFIG="$(sed -n 's/^  config=debug_/release_/p' "$PROJECT_ROOT/make/Makefile")"
+case "$CONFIG" in
+    release_x64) ARCH="amd64" ;;
+    release_arm64) ARCH="arm64" ;;
+    *) echo "error: run ./bin/premake5 gmake2 first, make/Makefile names no known configuration"; exit 1 ;;
+esac
 PKG_DIR="$PROJECT_ROOT/socketley_${VERSION}_${ARCH}"
 
 # Built here from clean, since make keeps objects across a change of flags and a package must carry the -march it
 # names, not whatever the last build of this tree used.
-make -C "$PROJECT_ROOT/make" config=release_x64 clean >/dev/null
-make -C "$PROJECT_ROOT/make" config=release_x64 -j"$(nproc)" socketley
+make -C "$PROJECT_ROOT/make" config="$CONFIG" clean >/dev/null
+make -C "$PROJECT_ROOT/make" config="$CONFIG" -j"$(nproc)" socketley
 if [ ! -f "$BINARY" ]; then
     echo "error: release binary not found at $BINARY"
     exit 1

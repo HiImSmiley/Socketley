@@ -1,3 +1,8 @@
+-- The machine's own architecture, or --arch=x64|arm64 when the makefiles are for another one.
+newoption { trigger = "arch", value = "x64|arm64", description = "The architecture to build for, this machine's by default",
+            allowed = { { "x64", "x86-64" }, { "arm64", "64-bit ARM" } } }
+target_arch = _OPTIONS["arch"] or ((os.outputof("uname -m") or ""):match("aarch64") and "arm64" or "x64")
+
 workspace "Socketley"
     system "linux"
     -- Sanitize = ASan + UBSan.  TSan = ThreadSanitizer, separate because the two
@@ -19,7 +24,11 @@ workspace "Socketley"
     -- most likely a signal handler or a std::atomic used across the daemon's
     -- fork boundary — and not a false positive to be suppressed.
     configurations { "Debug", "Dev", "Release", "Sanitize", "TSan", "Coverage" }
-    platforms { "x64" }
+    -- One platform, the one being built for, so a config is release_x64 on x86-64 and release_arm64 on ARM.
+    platforms { target_arch }
+    filter "platforms:arm64"
+        architecture "ARM64"
+    filter {}
     location "make"
 
     -- Every project, since the SDK and the tests use event_loop.h too and a system without liburing has none.
@@ -123,7 +132,6 @@ workspace "Socketley"
             "-fstack-protector-strong",
             "-D_FORTIFY_SOURCE=2",
             "-fvisibility=hidden",
-            "-march=x86-64-v2",
             "-mtune=native"
         }
         -- ─── HOW TO CHECK THIS, IF IT IS EVER CHANGED AGAIN ─────────────────
@@ -155,6 +163,12 @@ workspace "Socketley"
             "-Wl,-z,relro,-z,now",
             "-Wl,--as-needed"
         }
+    filter {}
+    -- The floor per architecture: x86-64-v2 as above, and armv8-a, which is every 64-bit ARM CPU.
+    filter { "configurations:Release", "platforms:x64" }
+        buildoptions { "-march=x86-64-v2" }
+    filter { "configurations:Release", "platforms:arm64" }
+        buildoptions { "-march=armv8-a" }
     filter {}
 
     -- Workspace-wide Sanitize settings (applies to ALL projects), matching the

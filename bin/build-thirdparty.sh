@@ -11,7 +11,9 @@
 # built here, headers and all, into thirdparty/{openssl,ngtcp2,nghttp3}, which
 # git ignores, and need perl and cmake.
 #
-#   ./bin/build-thirdparty.sh [liburing|luajit|http3|all]
+# `premake` builds premake itself into thirdparty/premake/, only where bin/premake5, an x86-64 binary, cannot run.
+#
+#   ./bin/build-thirdparty.sh [liburing|luajit|http3|premake|all]
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WHAT=${1:-all}
@@ -20,6 +22,7 @@ LIBURING_TAG=liburing-2.15   # pinned deliberately: see thirdparty/liburing/READ
 OPENSSL_TAG=openssl-3.5.9
 NGHTTP3_TAG=v1.18.0
 NGTCP2_TAG=v1.25.0
+PREMAKE_REF=v5.0.0-beta8   # bin/premake5's version; not a _TAG, so a change here rebuilds no library in scripts/update.sh
 
 build_liburing() {
   local tmp; tmp=$(mktemp -d)
@@ -77,6 +80,29 @@ build_luajit() {
     || { echo "   FAILED: LuaJIT build"; return 2; }
   cp "$tmp/src/libluajit.a" "$dest"
   echo "   built from source ($(stat -c%s "$dest") bytes)"
+}
+
+build_premake() {
+  echo "== premake"
+  if "$ROOT/bin/premake5" --version >/dev/null 2>&1; then
+    echo "   bin/premake5 runs here, nothing to build"
+    return 0
+  fi
+  local dest="$ROOT/thirdparty/premake/premake5"
+  if "$dest" --version 2>/dev/null | grep -qF "${PREMAKE_REF#v}"; then
+    echo "   already built, left alone"
+    return 0
+  fi
+  local tmp; tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+  git clone --depth 1 --branch "$PREMAKE_REF" https://github.com/premake/premake-core.git "$tmp" >/dev/null 2>&1 \
+    || { echo "   FAILED: could not clone premake"; return 2; }
+  # Its bootstrap links libuuid, which is uuid-dev on Debian.
+  ( cd "$tmp" && make -f Bootstrap.mak linux >/dev/null 2>&1 ) \
+    || { echo "   FAILED: premake build, which needs uuid-dev"; return 2; }
+  mkdir -p "$(dirname "$dest")"
+  cp "$tmp/bin/release/premake5" "$dest"
+  echo "   built $("$dest" --version)"
 }
 
 build_http3() {
@@ -143,6 +169,7 @@ case "$WHAT" in
   liburing) build_liburing ;;
   luajit)   build_luajit ;;
   http3)    build_http3 ;;
-  all)      build_liburing; build_luajit; build_http3 ;;
-  *) echo "usage: $0 [liburing|luajit|http3|all]"; exit 1 ;;
+  premake)  build_premake ;;
+  all)      build_liburing; build_luajit; build_http3; build_premake ;;
+  *) echo "usage: $0 [liburing|luajit|http3|premake|all]"; exit 1 ;;
 esac

@@ -17,9 +17,9 @@
 #                                 Dockerfile builder stage, ci.yml, release.yml
 #   liburing >= 2.7, from source  scripts/install-liburing.sh, which owns the pin
 #   thirdparty/luajit/libluajit.a bin/build-thirdparty.sh luajit, as CI runs it
-#   premake5 gmake2, release_x64  CLAUDE.md's build section, release.yml
+#   premake5 gmake2, release_<arch>  CLAUDE.md's build section, release.yml; make/Makefile names the arch
 #   Linux 5.19                    README.md's Requirements, sdk/CMakeLists.txt:5
-#   x86_64 only                   premake5.lua platforms { "x64" }, -march=x86-64-v2
+#   x86_64 or aarch64             premake5.lua's target_arch; on aarch64 premake is built, with uuid-dev
 #
 # netcat-openbsd, bc, groff-base, clang-18 and libclang-rt-18-dev appear in
 # ci.yml and are deliberately absent here: they belong to the test suite, the
@@ -312,12 +312,14 @@ if [ "$(uname -s)" != "Linux" ]; then
 fi
 
 ARCH="$(uname -m)"
-if [ "$ARCH" != "x86_64" ]; then
-    fail "socketley builds for x86_64 only: this is $ARCH" \
-         "premake5.lua declares platforms { \"x64\" }, Release compiles -march=x86-64-v2," \
-         "and bin/premake5 is itself an x86-64 binary." \
-         "there is no other configuration to select, so this is a port and not a flag."
-fi
+# bin/premake5 is an x86-64 binary, so on aarch64 premake is built from source, and its bootstrap links libuuid.
+ARCH_DEPS=""
+case "$ARCH" in
+    x86_64) ;;
+    aarch64) ARCH_DEPS=" uuid-dev" ;;
+    *) fail "socketley builds for x86_64 and aarch64: this is $ARCH" \
+            "premake5.lua knows the platforms x64 and arm64, and Release compiles a -march floor for each." ;;
+esac
 
 # ── The kernel ──────────────────────────────────────────────────────────────
 # 5.19 is the floor README.md's Requirements and sdk/CMakeLists.txt:5 both
@@ -457,7 +459,7 @@ printf '\n'
 printf 'This run needs root for the following, and for nothing else:\n\n'
 if [ "$SKIP_DEPS" = 0 ]; then
     printf '  apt-get update, then apt-get install -y --no-install-recommends\n'
-    printf '      build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl\n'
+    printf '      build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl%s\n' "$ARCH_DEPS"
     printf '      the build dependencies, taken from the Dockerfile and ci.yml.\n\n'
 fi
 printf '  make install, inside scripts/install-liburing.sh, then ldconfig\n'
@@ -505,7 +507,7 @@ else
          "apt-get failed; check the network and the package lists, then re-run -- nothing after this point has happened"
     run_root apt-get update
     run_root apt-get install -y --no-install-recommends \
-        build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl
+        build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl $ARCH_DEPS
 fi
 
 # ── The compiler, checked where the answer is still actionable ──────────────
@@ -554,13 +556,20 @@ step "building OpenSSL 3.5, ngtcp2 and nghttp3 for HTTP/3" \
 run bash bin/build-thirdparty.sh http3
 
 # ── Makefiles, then the Release build ───────────────────────────────────────
-step "generating makefiles" "./bin/premake5 gmake2 failed; check that bin/premake5 is executable"
-run ./bin/premake5 gmake2
+step "premake for this machine" "bin/build-thirdparty.sh premake failed; on aarch64 it needs uuid-dev, git and a network"
+run bash bin/build-thirdparty.sh premake
+PREMAKE=./bin/premake5
+"$PREMAKE" --version >/dev/null 2>&1 || PREMAKE=./thirdparty/premake/premake5
+step "generating makefiles" "$PREMAKE gmake2 failed; check that it is executable"
+run "$PREMAKE" gmake2
+# The configuration premake5.lua made for this machine, release_x64 or release_arm64.
+CONFIG="$(sed -n 's/^  config=debug_/release_/p' make/Makefile 2>/dev/null || true)"
+[ -n "$CONFIG" ] || CONFIG="release_$([ "$ARCH" = aarch64 ] && echo arm64 || echo x64)"
 
 step "building Release with -j$JOBS" \
      "if this was killed with no message it was the OOM reaper: re-run with --jobs 1"
 # The daemon alone: the SDK archives, tests, fuzzers and benchmarks are no part of an install.
-run make -C make config=release_x64 -j"$JOBS" socketley
+run make -C make config="$CONFIG" -j"$JOBS" socketley
 
 step "checking the build produced a binary" \
      "make can exit 0 having linked nothing, so this is checked rather than assumed"
@@ -569,7 +578,7 @@ if [ "$DRY_RUN" = 1 ]; then
 else
     if [ ! -x "$ROOT/bin/Release/socketley" ]; then
         fail "the build reported success but there is no binary at bin/Release/socketley" \
-             "re-run the build alone and read its last lines:  make -C make config=release_x64 -j1 socketley"
+             "re-run the build alone and read its last lines:  make -C make config=$CONFIG -j1 socketley"
     fi
     note "$(stat -c%s "$ROOT/bin/Release/socketley") bytes"
 fi

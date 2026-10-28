@@ -78,7 +78,7 @@ asks it for its runtime list before it reports success.
 - It names every step that needs root, and why, before it takes any.
 
 It refuses rather than guesses. A kernel below 5.19, GCC below 12, an
-architecture that is not x86\_64, a distribution whose package names are not
+architecture that is neither x86\_64 nor aarch64, a distribution whose package names are not
 written down anywhere in this repository, or a `socketley` `.deb` already
 owning `/usr/bin` — each one stops the run with the reason and the way forward,
 and changes nothing.
@@ -946,8 +946,11 @@ still want it to themselves.
   *run* time.
 - libssl-dev (TLS on every role that has a handshake, and WebSocket handshake hashing)
 - GCC 12+ (C++23)
-- x86\_64. `premake5.lua` declares one platform and Release compiles
-  `-march=x86-64-v2`, so another architecture is a port and not a flag.
+- x86\_64 or aarch64. `premake5.lua` builds for the machine it runs on, so a
+  configuration is `release_x64` or `release_arm64`, and Release compiles the
+  floor of each: `-march=x86-64-v2`, or `-march=armv8-a`, every 64-bit ARM CPU.
+  `bin/premake5` is an x86-64 binary; on aarch64 `bin/build-thirdparty.sh premake`
+  builds premake from source (it needs `uuid-dev`), as `scripts/install-from-source.sh` does.
 
 `scripts/install-from-source.sh` checks every line of this list before it
 builds anything, and refuses with the reason rather than failing later.

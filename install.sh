@@ -123,11 +123,13 @@ if [ -z "$DEB" ]; then
   curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" -o "$TMP/release.json" \
     || die "the newest release could not be read from GitHub; download a .deb and pass --deb FILE"
   . /etc/os-release
-  URLS=$(sed -n 's/.*"browser_download_url": *"\([^"]*\.deb\)".*/\1/p' "$TMP/release.json")
+  # Only the packages built for this machine's architecture, since dpkg refuses any other.
+  ARCH=$(dpkg --print-architecture)
+  URLS=$(sed -n 's/.*"browser_download_url": *"\([^"]*_'"$ARCH"'\.deb\)".*/\1/p' "$TMP/release.json")
   # A rolling distribution names no version, which set -u would otherwise stop at.
   URL=$(printf '%s\n' "$URLS" | grep -F "${ID:-}${VERSION_ID:-}" | head -1 || true)
   [ -n "$URL" ] || URL=$(printf '%s\n' "$URLS" | head -1)
-  [ -n "$URL" ] || die "the newest release has no .deb"
+  [ -n "$URL" ] || die "the newest release has no .deb for $ARCH; build from a clone with scripts/install-from-source.sh"
   echo "Downloading $(basename "$URL")..."
   curl -fsSL "$URL" -o "$TMP/socketley.deb"
   DEB="$TMP/socketley.deb"

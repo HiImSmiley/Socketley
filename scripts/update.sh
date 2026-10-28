@@ -244,12 +244,17 @@ if [ "$REBUILD_TP" = 1 ] || [ ! -f thirdparty/openssl/lib/libssl.a ] || [ ! -f t
 fi
 echo "$PINS" > "$TP_STAMP"
 
-step "generating makefiles" "./bin/premake5 gmake2 failed"
-./bin/premake5 gmake2 >/dev/null 2>&1 || ./bin/premake5 gmake2
+bash bin/build-thirdparty.sh premake >/dev/null || fail "premake could not be built for this machine" "bash bin/build-thirdparty.sh premake"
+PREMAKE=./bin/premake5
+"$PREMAKE" --version >/dev/null 2>&1 || PREMAKE=./thirdparty/premake/premake5
+step "generating makefiles" "$PREMAKE gmake2 failed"
+"$PREMAKE" gmake2 >/dev/null 2>&1 || "$PREMAKE" gmake2
+# The configuration premake5.lua made for this machine, release_x64 or release_arm64.
+CONFIG="$(sed -n 's/^  config=debug_/release_/p' make/Makefile)"
 
 step "building Release with -j$JOBS" "read the compiler's last lines above; with little memory try --jobs 1"
 LOG="$ROOT/make/update-build.log"
-if ! make -C make config=release_x64 -j"$JOBS" socketley > "$LOG" 2>&1; then
+if ! make -C make config="$CONFIG" -j"$JOBS" socketley > "$LOG" 2>&1; then
     grep -E 'error|Error' "$LOG" | head -20 >&2 || tail -20 "$LOG" >&2
     fail "the build failed; nothing was installed" "all of its output: $LOG"
 fi
