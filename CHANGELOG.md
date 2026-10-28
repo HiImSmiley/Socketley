@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **JMAP sends only a message whose From is the user's own.**
+  EmailSubmission/set compared only the envelope's sender with the user's
+  addresses, so a draft `From: ceo@<domain>` was sent and signed; its From
+  header is now held to the check SMTP submission makes.
 - **A submission whose header runs past 64 KiB is refused.** Only the first
   64 KiB of a signed-in user's header was kept for the From check, so a From
   of another placed after it was sent signed with the domain's key; such a

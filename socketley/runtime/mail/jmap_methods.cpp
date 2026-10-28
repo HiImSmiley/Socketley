@@ -2440,6 +2440,19 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                     j->not_created += q(cid) + ":" + set_error("forbiddenFrom", "the user sends as " + own);
                     return (*self)();
                 }
+                // The header's From is theirs too, by the check SMTP submission makes, as the signer signs that one.
+                const auto own_address = [&](const address& a) {
+                    const std::string t = a.text();
+                    return std::any_of(mine.begin(), mine.end(),
+                                       [&](const std::string& m) { return socketley::ascii::iequals(t, m); });
+                };
+                if (!authors_owned(head, own_address))
+                {
+                    comma(j->not_created);
+                    j->not_created +=
+                        q(cid) + ":" + set_error("forbiddenFrom", "the From header names an address not the user's");
+                    return (*self)();
+                }
                 if (rcpts.empty())
                 {
                     comma(j->not_created);

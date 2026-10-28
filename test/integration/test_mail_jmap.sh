@@ -222,6 +222,16 @@ say("and the message reaches its recipient, with its attachment", b"rcpt bob@rem
     and b"the body of it" in body, body[:300])
 r = api(["Email/query", {"accountId": acct, "filter": {"inMailbox": boxes["sent"]["id"]}}, "q"])
 say("and the draft is now in Sent", len(r["q"][0][1]["ids"]) == 1, r)
+# A draft whose From is another's is not sent, whatever envelope sender it is given.
+r = api(["Email/set", {"accountId": acct, "create": {"f": {
+            "mailboxIds": {boxes["drafts"]["id"]: True}, "keywords": {"$draft": True},
+            "from": [{"email": "ceo@example.test"}], "to": [{"email": "bob@remote.test"}],
+            "subject": "forged by jmap", "textBody": [{"partId": "t", "type": "text/plain"}],
+            "bodyValues": {"t": {"value": "the ceo says by jmap"}}}}}, "f"],
+        ["EmailSubmission/set", {"accountId": acct, "create": {"s": {"identityId": "i0", "emailId": "#f",
+            "envelope": {"mailFrom": {"email": "alice@example.test"}, "rcptTo": [{"email": "bob@remote.test"}]}}}}, "fs"])
+nc = r["fs"][0][1].get("notCreated", {}).get("s", {})
+say("EmailSubmission/set refuses a draft whose From header is another's", nc.get("type") == "forbiddenFrom", r)
 # Destroy, changes
 r = api(["Email/set", {"accountId": acct, "destroy": [up and got and got[0]["id"] or "x"]}, "x"])
 say("Email/set destroy takes an Email away", len(r["x"][0][1].get("destroyed", [])) == 1, r)
