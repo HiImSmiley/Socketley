@@ -13,6 +13,9 @@
 #   * `tunnel join` adding an agent for someone who is no admin, or its service open to visitors who did not sign in
 #   * an agent joined by a person not reaching the service it offers, or a second join of its name breaking it
 #   * an agent's ssh not reached by an admin's `tunnel ssh --agent`, or reached by anyone else
+#   * a kept sign-in handed to an edge that names an idp not beside it
+#   * a port of the edge's machine reached as an agent's service the edge does not serve
+#   * a join that replaces an agent already joined without being asked to
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -33,6 +36,7 @@ PX=$((SL_PORT_BASE + 1978))
 PS=$((SL_PORT_BASE + 1979))
 PH=$((SL_PORT_BASE + 1980))
 PT=$((SL_PORT_BASE + 1981))
+PF=$((SL_PORT_BASE + 1982))
 I="http://127.0.0.1:$PI"
 python3 - "$PX" <<'PY' &
 import socketserver, sys
@@ -168,7 +172,45 @@ out=$(printf 'x' | "$BIN" tunnel connect "http://127.0.0.1:$PE" pi/ssh 2>&1); rc
     || bad "someone who is no admin does not" "rc $rc: $out"
 out=$(printf 'x' | XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel connect "http://127.0.0.1:$PE" pi/web 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok || bad "nor an admin an HTTP service by this way" "rc $rc: $out"
+out=$(XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel connect "http://127.0.0.1:$PE" pi/nothing 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok || bad "nor a service the agent does not have" "rc $rc: $out"
 "$BIN" remove pi >/dev/null 2>&1
+
+# Gone from here, the agent the edge holds as joined is replaced only when asked; its service on the edge's own
+# port is not served, and an admin does not reach that port through it.
+out=$(XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --http "web=127.0.0.1:$PH" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"joined already; --replace takes its place"*) true ;; *) false ;; esac && ok \
+    || bad "a join does not replace an agent that has joined unasked" "rc $rc: $out"
+out=$(XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel join "http://127.0.0.1:$PE" --name pi --replace --http "web=127.0.0.1:$PH" \
+      --tcp "own:$PE=127.0.0.1:$PX" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok || bad "and does with --replace" "rc $rc: $out"
+for _ in $(seq 1 50); do "$BIN" tunnel e list | grep -q "^pi	joined	" && break; sleep 0.1; done
+for _ in $(seq 1 30); do grep -q "the service own of pi cannot be served" "$SOCKETLEY_DLOG" && break; sleep 0.1; done
+out=$(printf 'x' | XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel connect "http://127.0.0.1:$PE" pi/own 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"does not forward to that target"*) true ;; *) false ;; esac && ok \
+    || bad "a service the edge could not open is not dialled on the edge's machine" "rc $rc: $out"
+"$BIN" remove pi >/dev/null 2>&1
+
+# An edge that names an idp not beside it is handed no kept sign-in; whatever it was sent is written down.
+python3 - "$PF" "$T/fake.log" "$I" <<'PY' &
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        open(sys.argv[2], "a").write("%s %s\n" % (self.path, self.headers.get("Authorization", "-")))
+        b = (sys.argv[3] + "\n").encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+FAKE=$!
+for _ in $(seq 1 30); do ss -ltn "sport = :$PF" | grep -q LISTEN && break; sleep 0.1; done
+# It names the very idp an admin is signed in at here, from a name that is not beside it.
+printf 'x' | XDG_CONFIG_HOME="$T/boss" "$BIN" tunnel connect "http://localhost:$PF" "127.0.0.1:$PX" >/dev/null 2>"$T/err"; rc=$?
+out=$(cat "$T/err")
+[ "$rc" -eq 1 ] && case "$out" in *"is not beside localhost; give --idp"*) true ;; *) false ;; esac && ok \
+    || bad "an edge naming an idp not beside it is not trusted with a sign-in" "rc $rc: $out"
+! grep -qv " -$" "$T/fake.log" && ok || bad "and was sent no token" "$(cat "$T/fake.log")"
+kill $FAKE 2>/dev/null
 
 # ── ssh through the tunnel, by the certificate the same sign-in gets ──────────
 SSHD=$(command -v sshd || echo /usr/sbin/sshd)

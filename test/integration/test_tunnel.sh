@@ -203,6 +203,14 @@ ZONE
     [ "$rc" -ne 0 ] && case "$out" in *"web is already the name of runtime 't'"*) true ;; *) false ;; esac && ok \
         || bad "a name a service has is not given to another runtime" "rc $rc: $out"
     "$BIN" remove site >/dev/null 2>&1
+    # A second edge's service of the same name is no second route to it: the edge before it keeps the name.
+    "$BIN" create tunnel t2 --mode edge -p $((SL_PORT_BASE + 1977)) --domain t2 -s >/dev/null 2>&1
+    "$BIN" tunnel t2 invite other --http web >/dev/null 2>&1
+    R="$(dirname "$(find "$HOME/.local/share" -name 'routes-web' 2>/dev/null | head -1)")/routes-web"
+    sleep 2.5
+    line=$(grep '^route web.example.com ' "$R")
+    [ "$line" = "route web.example.com unix:$WEB" ] && ok || bad "two edges' services of one name are not one route" "$line"
+    "$BIN" remove t2 >/dev/null 2>&1
     # An agent's upgrade passes the entrance to the edge: the key it holds is taken there.
     up=$(python3 - "$PW" "$(cat "$KEY")" <<'PY'
 import socket, sys

@@ -492,11 +492,12 @@ cli_commands() {
     echo -e "  ${CYAN}socketley tunnel edge invite pi --http home=idp:auth --tcp mc:25565${NC}"
     echo ""
 
-    echo -e "${BOLD}tunnel join <edge> [--name <agent>] --http <service>=<host:port> --tcp <service:port>=<host:port>${NC}"
+    echo -e "${BOLD}tunnel join <edge> [--name <agent>] --http <service>=<host:port> --tcp <service:port>=<host:port> [--replace]${NC}"
     echo "  This machine made an agent of an edge, by an admin of its idp, signed"
     echo "  in for this join alone and kept nowhere; the agent joins at once."
     echo "  Its HTTP services ask visitors to sign in until the edge's owner says"
-    echo "  otherwise with set. Prints where each service is."
+    echo "  otherwise with set. An agent that joined already is replaced only with"
+    echo "  --replace. Prints where each service is."
     echo -e "  ${CYAN}socketley tunnel join https://edge.example.com --http ollama=127.0.0.1:11434${NC}"
     echo ""
 

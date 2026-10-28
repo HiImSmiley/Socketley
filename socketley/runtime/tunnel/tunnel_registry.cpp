@@ -46,9 +46,13 @@ bool parse_service(std::string_view s, service& out)
         out.name = std::string(s.substr(0, eq));
         out.auth = eq == std::string_view::npos ? std::string() : std::string(s.substr(eq + 1));
         out.port = 0;
-        // A visitor's --auth spec, kept whole on the line: nothing in it may end the item or the field.
-        const bool auth_ok = eq == std::string_view::npos ||
-                             (!out.auth.empty() && out.auth.find_first_of(", \t") == std::string::npos);
+        // A visitor's --auth spec, kept whole on the line: nothing in it may end the item, the field or the line, start
+        // a comment, or leave one of its +-joined methods empty, which would let every visitor through.
+        bool auth_ok = eq == std::string_view::npos ||
+                       (!out.auth.empty() && out.auth.front() != '+' && out.auth.back() != '+' &&
+                        out.auth.find("++") == std::string::npos);
+        for (const char c : out.auth)
+            auth_ok = auth_ok && c > ' ' && c != ',' && c != '#' && c != 0x7f;
         return valid_name(out.name) && auth_ok;
     }
     if (!s.starts_with("tcp:"))

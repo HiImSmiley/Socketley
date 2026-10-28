@@ -1161,7 +1161,7 @@ socketley tunnel edge invite pi \-\-http home=idp:auth,nas \-\-tcp mc:25565
 .fi
 .RE
 .TP
-.BI "tunnel join " edge " \fR[\fB\-\-name \fIagent\fR] [\fB\-\-http \fIservice\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-tcp \fIservice\fB:\fIedge-port\fB=\fIhost\fB:\fIport,...\fR]"
+.BI "tunnel join " edge " \fR[\fB\-\-name \fIagent\fR] [\fB\-\-http \fIservice\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-tcp \fIservice\fB:\fIedge-port\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-replace\fR] [\fB\-\-idp \fIidp\fR]"
 This machine made an agent of an edge, by an admin of the edge's idp: signed
 in by a code allowed in a browser when no
 .B login
@@ -1172,9 +1172,10 @@ says otherwise, and the agent runtime of that name is made and joins at once.
 Each HTTP service asks its visitors to sign in at the edge's idp until the
 edge's owner says otherwise with
 .BR "tunnel " "edge" " set" .
-Joined again under the same name, the agent the edge had is replaced; a
-runtime of that name on this machine already is exit 1, and the edge is not
-asked. Prints where each service is.
+An agent of that name the edge holds as joined is replaced only with
+.BR \-\-replace ,
+as for a machine set up anew; a runtime of that name on this machine already
+is exit 1, and the edge is not asked. Prints where each service is.
 .RS
 .PP
 .nf
@@ -1191,7 +1192,13 @@ target of a tunnel edge, between stdin and stdout, for the person signed in at
 .I idp
 by
 .BR login ,
-the edge's own idp, asked of the edge, unless given;
+the edge's own idp, asked of the edge, unless given; an idp the edge names
+is trusted with a sign-in kept here only when it is beside the edge
+.RB ( auth.example.com
+for
+.BR edge.example.com ),
+and any other only when given with
+.BR \-\-idp ;
 .B ssh
 is to 127.0.0.1:22 there, for ssh's
 .BR ProxyCommand .
@@ -14084,9 +14091,11 @@ socketley tunnel join https://edge.example.com \-\-http home=127.0.0.1:8123 \-\-
 An HTTP service is named beside the edge, here
 .BR https://home.example.com :
 the edge serves it on a socket the entrance routes that name to, with the
-entrance's certificate, and the dns runtime answers the name. A name a
-runtime has stays that runtime's, and another runtime is not given a name a
-service has. A TCP service is a port on the edge, here 25565. The edge says
+entrance's certificate, and the dns runtime answers the name, once the agent
+has joined. A name a runtime has stays that runtime's, another runtime is not
+given a name a service has, and of two edges with a service of one name the
+first by name keeps it. An edge named as a whole domain has no name beside
+it, and its services none. A TCP service is a port on the edge, here 25565. The edge says
 nothing about a stream it carries: what reaches the agent is what the visitor
 sent, and the service answers as if they were on the same machine.
 .PP

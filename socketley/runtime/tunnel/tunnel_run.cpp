@@ -335,12 +335,14 @@ void tunnel_run::dial_leg(link& l, uint32_t stream, std::string_view target)
         // Only a target the edge names, so a signed-in person reaches what it allows and nothing else.
         if (std::find(m_forward.begin(), m_forward.end(), target) != m_forward.end())
             addr = std::string(target);
-        // An admin may name an agent's TCP service, `pi/ssh`, carried as a visitor of its port on this machine.
+        // An admin may name an agent's TCP service, `pi/ssh`, carried as a visitor of the port this edge serves it on.
         else if (const size_t slash = target.find('/'); l.admin && slash != std::string_view::npos)
             for (const agent& a : m_agents)
                 if (a.joined && a.name == target.substr(0, slash))
                     for (const service& s : a.services)
-                        if (!s.http && s.name == target.substr(slash + 1))
+                        if (const auto served = m_listeners.find(s.name); !s.http && s.name == target.substr(slash + 1) &&
+                                                                          served != m_listeners.end() &&
+                                                                          served->second->agent == a.name)
                             addr = (s.bind.empty() || s.bind == "0.0.0.0" ? std::string("127.0.0.1") : s.bind) + ":" +
                                    std::to_string(s.port);
     }
@@ -688,6 +690,17 @@ void tunnel_run::reload_agents()
         {
             if (m_listeners.contains(s.name))
                 continue;
+            // A method the edge cannot take serves nothing rather than let every visitor through, as an unread one would.
+            std::string bad;
+            for (const std::string_view method : s.http ? auth_methods(s.auth) : std::vector<std::string_view>{})
+                if (bad.empty())
+                    bad = proxy_auth::spec_error(method);
+            if (!bad.empty())
+            {
+                LOG_WARN(("tunnel " + std::string(m_owner.get_name()) + ": the service " + s.name + " of " + a.name +
+                          " is not served: " + bad).c_str());
+                continue;
+            }
             auto h = std::make_unique<leg_hooks>(*this, a.name, s);
             std::string err;
             in_addr on{htonl(INADDR_ANY)};
@@ -788,11 +801,17 @@ void tunnel_run::join_by_person(const std::shared_ptr<http::server_conn>& c, std
     }
     const std::string secret = random_b64url(32);
     a.secret_hash = hash_secret(secret);
-    // An agent of that name already is replaced, as an agent set up again on a machine flashed anew is.
+    // An agent of that name that has joined is replaced only when asked, as for a machine flashed anew; one invited is.
+    const bool replace = trim_blanks(header_of(head, "tunnel-replace")) == "yes";
     const bool ok = !secret.empty() && update_agents(m_owner.get_name(), [&](std::vector<agent>& agents, std::string& w) {
         if (const std::string clashed = clash(agents, a); !clashed.empty())
         {
             w = clashed;
+            return false;
+        }
+        if (!replace && std::any_of(agents.begin(), agents.end(), [&](const agent& o) { return o.name == a.name && o.joined; }))
+        {
+            w = "an agent named " + a.name + " is joined already; --replace takes its place";
             return false;
         }
         std::erase_if(agents, [&](const agent& o) { return o.name == a.name; });

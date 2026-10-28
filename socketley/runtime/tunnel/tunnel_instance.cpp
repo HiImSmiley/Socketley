@@ -22,9 +22,10 @@ std::vector<std::pair<std::string, std::string>> tunnel_instance::http_services(
     std::string why;
     if (!socketley::tunnel::load_agents(get_name(), agents, why))
         return out;
+    // An agent only invited serves nobody yet, so its names stay free until it joins.
     for (const auto& a : agents)
         for (const auto& s : a.services)
-            if (s.http)
+            if (s.http && a.joined)
                 out.emplace_back(s.name, socketley::tunnel::service_socket(get_name(), s.name));
     return out;
 }

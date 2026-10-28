@@ -45,11 +45,16 @@ std::string normal(std::string_view name)
 namespace
 {
 
-// A tunnel edge's service is named beside the edge, `ollama` for an edge called `edge`, so it reads as any other.
+// A tunnel edge's service is named beside the edge, `ollama` for an edge called `edge`, so it reads as any other; an
+// edge named as a whole domain has no name beside it, and its services none.
 std::string service_name(std::string_view edge_name, std::string_view service)
 {
     const size_t dot = edge_name.find('.');
-    return dot == std::string_view::npos ? std::string(service) : std::string(service) + std::string(edge_name.substr(dot));
+    if (dot == std::string_view::npos)
+        return std::string(service);
+    if (edge_name.find('.', dot + 1) == std::string_view::npos)
+        return {};
+    return std::string(service) + std::string(edge_name.substr(dot));
 }
 
 // The names of an edge's HTTP services with the socket each is served on.
@@ -63,7 +68,8 @@ std::vector<std::pair<std::string, std::string>> edge_services(const runtime_ins
     if (base.empty())
         return out;
     for (auto& [svc, sock] : static_cast<const tunnel_instance&>(rt).http_services())
-        out.emplace_back(service_name(base, svc), std::move(sock));
+        if (std::string name = service_name(base, svc); !name.empty())
+            out.emplace_back(std::move(name), std::move(sock));
     return out;
 }
 
@@ -214,17 +220,20 @@ std::string entrance_table(const runtime_instance& entrance, const std::vector<c
                     add(n + "." + z, addr);
         }
     }
-    // Each HTTP service of a tunnel edge goes to the socket the edge serves it on, unless a runtime has its name.
-    const size_t runtimes_routed = routes.size();
+    // Each HTTP service of a tunnel edge goes to the socket the edge serves it on, unless a runtime or an edge before
+    // it has that name, since one name spread over two machines would hand visitors to either.
     const auto routed = [&](const std::string& name)
     {
-        return std::any_of(routes.begin(), routes.begin() + static_cast<std::ptrdiff_t>(runtimes_routed),
-                           [&](const auto& r) { return r.first == name; });
+        return std::any_of(routes.begin(), routes.end(), [&](const auto& r) { return r.first == name; });
     };
+    // Edges in the order of their names, so which keeps a name both have does not hang on the order runtimes are listed.
+    std::vector<const runtime_instance*> edges;
     for (const runtime_instance* r : all)
+        if (r && r->get_type() == runtime_tunnel && speaks_http(*r))
+            edges.push_back(r);
+    std::sort(edges.begin(), edges.end(), [](const auto* a, const auto* b) { return a->get_name() < b->get_name(); });
+    for (const runtime_instance* r : edges)
     {
-        if (!r || !speaks_http(*r))
-            continue;
         for (const auto& [name, sock] : edge_services(*r))
         {
             if (name.find('.') != std::string::npos)

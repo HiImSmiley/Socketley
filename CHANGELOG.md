@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Tunnel names and joins, made safe.** A kept sign-in goes only to an idp
+  beside the edge that names it, so an edge cannot ask for another's token; an
+  agent that has joined is replaced only with `tunnel join --replace`; an
+  admin reaches an agent's TCP service only where the edge opened it; a name
+  is routed once an agent has joined, and two edges' services of one name do
+  not share it; a service's auth with an empty method or a `#` is refused, and
+  an edge serves no service whose auth it cannot read.
 - **A tunnel's TCP service on one address.** `--tcp ssh:127.0.0.1:2201` opens
   the port on that address alone, for a service only `tunnel ssh --agent`
   reaches, where every TCP service was opened on all of them.

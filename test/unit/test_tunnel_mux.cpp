@@ -320,6 +320,15 @@ TEST_CASE("the agents file is read as written, and refuses what it cannot be")
     CHECK(refused("agent pi joined " + hash + " http:web,http:web\n"));
     CHECK(refused("agent pi joined " + hash + " http:web=\n"));
     CHECK(refused("agent pi joined " + hash + " http:Web=idp:auth\n"));
+    // An auth with an empty method, a comment, or a byte that is no printable character.
+    CHECK(refused("agent pi joined " + hash + " http:web=+idp:auth\n"));
+    CHECK(refused("agent pi joined " + hash + " http:web=idp:auth+\n"));
+    CHECK(refused("agent pi joined " + hash + " http:web=idp:a++bearer:/f\n"));
+    CHECK(refused("agent pi joined " + hash + " http:web=idp:a\x01b\n"));
+    // A # given as a service's auth, as a join's header may carry, would start a comment in the file.
+    std::vector<service> hashed;
+    std::string w;
+    CHECK_FALSE(parse_services("web=idp:a#x", "", hashed, w));
     // A name or a port another agent has.
     CHECK(refused("agent pi joined " + hash + " http:web\nagent nas joined " + hash + " http:web\n"));
     CHECK(refused("agent pi joined " + hash + " tcp:a:2000\nagent nas joined " + hash + " tcp:b:2000\n"));

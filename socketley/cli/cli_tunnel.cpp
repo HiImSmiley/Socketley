@@ -222,7 +222,25 @@ bool ask_edge(const edge_address& a, const std::string& request, int& status, st
     return true;
 }
 
-// The idp the edge takes sign-ins of, asked of the edge itself when none was given.
+// Whether an idp an edge names is beside it, auth.example.com for edge.example.com, or the same address.
+bool beside_edge(std::string_view edge_host, std::string_view issuer)
+{
+    std::string_view h = issuer.substr(issuer.find("://") == std::string_view::npos ? 0 : issuer.find("://") + 3);
+    h = h.substr(0, h.find('/'));
+    if (const size_t colon = h.rfind(':'); colon != std::string_view::npos && h.find(']') == std::string_view::npos)
+        h = h.substr(0, colon);
+    if (h == edge_host)
+        return true;
+    const size_t dot = h.find('.');
+    const std::string_view parent = dot == std::string_view::npos ? std::string_view() : h.substr(dot + 1);
+    in6_addr literal{};
+    return parent.find('.') != std::string_view::npos && ::inet_pton(AF_INET, std::string(h).c_str(), &literal) != 1 &&
+           edge_host.size() > parent.size() && edge_host.ends_with(parent) &&
+           edge_host[edge_host.size() - parent.size() - 1] == '.';
+}
+
+// The idp the edge takes sign-ins of, asked of the edge itself when none was given; a sign-in kept here goes only to an
+// idp beside the edge, since an edge could name any idp to be handed its token.
 bool idp_of(const edge_address& a, std::string& idp, std::string& err)
 {
     if (!idp.empty())
@@ -234,6 +252,13 @@ bool idp_of(const edge_address& a, std::string& idp, std::string& err)
     if (status != 200 || idp.empty())
     {
         err = "the edge names no idp to sign in at: " + idp;
+        return false;
+    }
+    if (!beside_edge(a.host, idp))
+    {
+        err = "the edge names " + idp + " as its idp, which is not beside " + a.host + "; give --idp " + idp +
+              " to sign in there anyway";
+        idp.clear();
         return false;
     }
     return true;
@@ -368,10 +393,11 @@ std::string host_agent_name()
 // signed in here, adds this machine as an agent, and the agent runtime is made with the invitation the edge answers.
 int join_main(int argc, char** argv)
 {
-    std::string edge, name, http, tcp, offers;
+    std::string edge, name, http, tcp, offers, idp;
+    bool replace = false;
     const auto usage = [] {
         std::cout << "usage: socketley tunnel join <edge address> [--name <agent>] [--http <service>=<host>:<port>,...] "
-                     "[--tcp <service>:<edge port>=<host>:<port>,...]\n";
+                     "[--tcp <service>:<edge port>=<host>:<port>,...] [--replace] [--idp <idp address>]\n";
         return 1;
     };
     for (int i = 3; i < argc; ++i)
@@ -395,6 +421,10 @@ int join_main(int argc, char** argv)
         }
         else if (a == "--name" && i + 1 < argc)
             name = argv[++i];
+        else if (a == "--idp" && i + 1 < argc)
+            idp = argv[++i];
+        else if (a == "--replace")
+            replace = true;
         else if (edge.empty() && !a.starts_with("--"))
             edge = a;
         else
@@ -402,10 +432,16 @@ int join_main(int argc, char** argv)
     }
     if (edge.empty() || offers.empty())
         return usage();
+    // An address without a scheme is the https one, as the agent runtime's --to wants it.
+    if (!edge.starts_with("https://") && !edge.starts_with("http://"))
+        edge = "https://" + edge;
     if (name.empty())
         name = host_agent_name();
-    // Asked before the edge is, since the edge replaces an agent of that name and the one here would lose its key.
-    if (std::error_code ec; std::filesystem::exists(socketley_paths::resolve().state_dir / (name + ".json"), ec))
+    // Asked before the edge is, in the system daemon's state as well where this CLI reaches that daemon.
+    const socketley_paths paths = socketley_paths::resolve();
+    std::error_code ec;
+    if (std::filesystem::exists(paths.state_dir / (name + ".json"), ec) ||
+        (paths.system_mode && std::filesystem::exists(std::filesystem::path("/var/lib/socketley/runtimes") / (name + ".json"), ec)))
     {
         std::cout << "a runtime named " << name << " is here already; socketley remove " << name
                   << " first, or join with --name\n";
@@ -413,7 +449,7 @@ int join_main(int argc, char** argv)
     }
 
     const edge_address ea = parse_edge(edge);
-    std::string idp, err, token;
+    std::string err, token;
     if (!idp_of(ea, idp, err))
     {
         std::cout << err << "\n";
@@ -427,7 +463,7 @@ int join_main(int argc, char** argv)
     std::string invitation;
     if (!ask_edge(ea, "POST /.tunnel/join HTTP/1.1\r\nHost: " + ea.authority + "\r\nAuthorization: Bearer " + token +
                           "\r\nTunnel-Agent: " + name + "\r\nTunnel-Http: " + http + "\r\nTunnel-Tcp: " + tcp +
-                          "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                          (replace ? "\r\nTunnel-Replace: yes" : "") + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                   status, invitation, err))
     {
         std::cout << err << "\n";
@@ -444,12 +480,19 @@ int join_main(int argc, char** argv)
     for (auto& w : words)
         create_argv.push_back(w.data());
     create_argv.push_back(nullptr);
+    // The edge holds the agent as invited until it joins, so the same join once the runtime can be made takes its place.
     if (const int rc = cli_dispatch(static_cast<int>(words.size()), create_argv.data()); rc != 0)
+    {
+        std::cout << "the edge holds " << name << " as invited; run this join again once its runtime can be made here\n";
         return rc;
+    }
     // Where each service is now, named beside the edge as the edge names it; an address has no name to be beside.
     in6_addr literal{};
     const bool named = ::inet_pton(AF_INET, ea.host.c_str(), &literal) != 1 && ea.host.find(':') == std::string::npos;
-    const size_t dot = named ? ea.host.find('.') : std::string::npos;
+    const size_t first_dot = named ? ea.host.find('.') : std::string::npos;
+    // An edge named as a whole domain has no name beside it, as the edge's own routes have none.
+    const size_t dot = first_dot != std::string::npos && ea.host.find('.', first_dot + 1) != std::string::npos ? first_dot
+                                                                                                               : std::string::npos;
     const std::string beside = dot == std::string::npos ? std::string() : ea.host.substr(dot);
     const std::string machine = dot == std::string::npos ? ea.host : ea.host.substr(dot + 1);
     std::string_view h = http, c = tcp;
