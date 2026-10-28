@@ -176,10 +176,18 @@ def fetch(path):
         if not d: break
         out += d
     return out.split(b"\r\n\r\n", 1)[1].decode()
+# Read off every process's parent, since a kernel without CONFIG_PROC_CHILDREN has no children file.
 def children(pid):
     out = []
-    for t in os.listdir("/proc/%d/task" % pid):
-        out += [int(c) for c in open("/proc/%d/task/%s/children" % (pid, t)).read().split()]
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            stat = open("/proc/%s/stat" % d).read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if int(stat[1]) == pid:
+            out.append(int(d))
     return out
 def cpu(pid):
     f = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()
