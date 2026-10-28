@@ -1643,12 +1643,17 @@ void delivery::sign_read(const std::shared_ptr<sign_job>& j)
         return;
     }
     const std::string_view whole = j->kept ? std::string_view(*j->kept) : std::string_view(j->data);
+    // Only mail of a signed-in user, of this machine or that this runtime wrote vouches for its domain; a stranger's
+    // that names one and is sent on by an alias or a redirect is not the domain's to sign.
+    const spool_entry& e = *j->e;
+    const bool ours = !e.user.empty() || e.bounce || e.peer == "127.0.0.1" || e.peer == "::1";
     // Only a message of one author is signed as its domain, the author DMARC takes it to be.
     std::string author;
-    const std::string dom = from_headers(header_block(whole), &author) == 1 ? signing_domain(author) : std::string();
+    const std::string dom =
+        ours && from_headers(header_block(whole), &author) == 1 ? signing_domain(author) : std::string();
     // Mail from elsewhere that was checked here and is sent on, as an alias does, is sealed by ARC (RFC 8617), so the
-    // next hop can know what it was as it came; other mail not from one of its domains goes unsigned.
-    const bool forwarded = dom.empty() && !j->e->auth.empty() && !m_run.domains().empty();
+    // next hop can know what it was as it came; other mail not signed goes as it is.
+    const bool forwarded = dom.empty() && !e.auth.empty() && !m_run.domains().empty();
     if (dom.empty() && !forwarded)
     {
         m_signed[id];

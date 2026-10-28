@@ -64,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **A stranger's mail sent on by an alias or a redirect is not DKIM-signed.**
+  Any outgoing message whose From named a local domain was signed with its
+  key, so mail forged as `ceo@<domain>` and forwarded left signed; only mail of
+  a signed-in user, of 127.0.0.1 or ::1, or that the runtime wrote is signed,
+  and forwarded mail from elsewhere is ARC-sealed instead.
 - **JMAP sends only a message whose From is the user's own.**
   EmailSubmission/set compared only the envelope's sender with the user's
   addresses, so a draft `From: ceo@<domain>` was sent and signed; its From

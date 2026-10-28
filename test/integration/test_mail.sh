@@ -130,6 +130,14 @@ check "a stranger's mail to an alias is taken" "$(smtp "$P" carol@else.test info
 
 alias body')" "sent"
 f=$(mail_with "alias body") && ok "and handed to the alias's domain's exchanger" || bad "and handed to the alias's domain's exchanger" "nothing at the sink"
+check "a stranger's mail From one of its domains is taken for an alias" "$(smtp "$P" carol@else.test info@example.test 'From: ceo@example.test
+Subject: forged
+
+forged alias body')" "sent"
+f=$(mail_with "forged alias body")
+[ -n "$f" ] && ! grep -q '^DKIM-Signature:' "$f" && grep -q '^ARC-Seal:' "$f" \
+    && ok "and sent on sealed by ARC, not signed as that domain" \
+    || bad "and sent on sealed by ARC, not signed as that domain" "$(grep -E '^(DKIM-Signature|ARC-Seal):' "$f" 2>/dev/null)"
 [ -n "$f" ] && grep -q '^rcpt bob@remote.test' "$f" && ok "for the alias's address" || bad "for the alias's address" "$(head -3 "$f" 2>/dev/null)"
 [ -n "$f" ] && grep -q 'by mail.example.test (socketley) with ESMTP id' "$f" && ok "under a Received line of its own" \
     || bad "under a Received line of its own" "$(grep -m2 Received "$f" 2>/dev/null)"
