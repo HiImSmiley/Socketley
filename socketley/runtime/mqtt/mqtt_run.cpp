@@ -721,8 +721,16 @@ void mqtt_run::ws_frames(conn& c)
                 break;
         }
     }
-    if (!c.dead)
-        c.ws_in.erase(0, at);
+    if (c.dead)
+        return;
+    c.ws_in.erase(0, at);
+    // What is left is one frame unfinished; one longer than a few of the largest packets the broker takes is no
+    // MQTT client's, and is refused before it is all held.
+    if (c.ws_in.size() > static_cast<size_t>(m_owner.get_max_packet()) * 4 + 14)
+    {
+        ++m_ws_refused;
+        close_conn(c);
+    }
 }
 
 // ── Writing ─────────────────────────────────────────────────────────────────

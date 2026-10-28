@@ -230,6 +230,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   files, saying what it leaves. No restored file keeps a setuid or setgid
   bit, and outside the state and config a file the archive says root owns is
   written as the daemon's user's.
+- **An MQTT WebSocket frame is held only up to four times `--max-packet`.**
+  An unfinished frame was kept whole up to WebSocket's 16 MiB however small
+  `--max-packet` was, before any CONNECT and, after one with keep alive 0,
+  for good. One longer now closes the connection, counted as a WebSocket
+  refusal.
 - **`--rrl` holds for a sharded dns runtime as a whole.** Each shard kept the
   full limit for itself, and the kernel spreads a forged flood over the shards
   by source port, so `--shards 8` let eight times `--rrl` through to one

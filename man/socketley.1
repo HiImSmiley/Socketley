@@ -13099,7 +13099,9 @@ by convention), the subprotocol
 or
 .B mqttv3.1
 chosen when offered, a packet carried in any number of frames and frames
-holding any number of packets. With
+holding any number of packets, a frame no longer than four times
+.BR \-\-max\-packet .
+With
 .B \-\-tls
 it is wss.
 .PP
