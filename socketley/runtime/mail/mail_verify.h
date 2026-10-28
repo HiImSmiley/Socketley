@@ -75,6 +75,8 @@ struct inbound_result
     std::string why;
     // The value of the Authentication-Results this host writes, after its own name.
     std::string header() const;
+    // Whether a value header() wrote says the ARC chain passed, read off its own token and not a sender's bytes.
+    static bool arc_passed(std::string_view results);
     bool reject() const { return dmarc == "fail" && dmarc_policy == "reject"; }
     bool quarantine() const { return dmarc == "fail" && dmarc_policy == "quarantine"; }
 };

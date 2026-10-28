@@ -711,6 +711,12 @@ std::string inbound_result::header() const
     return out;
 }
 
+bool inbound_result::arc_passed(std::string_view results)
+{
+    // A sender's bytes reach the value only as names, which hold no space, and policy words, which hold no ';'.
+    return results.find("; arc=pass (i=") != std::string_view::npos;
+}
+
 inbound_result check_inbound(std::string_view message, const std::string& ip, const std::string& helo,
                              const std::string& mail_from, check_resolver& r, int64_t now_s,
                              const std::vector<std::string>& arc_trusted)

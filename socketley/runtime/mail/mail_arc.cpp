@@ -126,6 +126,9 @@ chain verify(std::string_view message, const key_lookup& key_of, int64_t now_s)
     const auto& newest = sets.rbegin()->second;
     out.sealer = tag(headers[static_cast<size_t>(newest.as)].second, "d");
     socketley::ascii::lower_in_place(out.sealer);
+    // The sealer is told in this host's Authentication-Results, so only a domain name is kept, whatever fails after.
+    if (!dkim::ldh_name(out.sealer))
+        out.sealer.clear();
     // Each seal says what the chain was as it came: none under the first, pass under every later one.
     for (const auto& [n, s] : sets)
     {

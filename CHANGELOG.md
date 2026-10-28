@@ -191,6 +191,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hash of the Message-ID, so a sender forging a domain that published
   `p=quarantine; pct=10` chose an ID outside the sample and reached the inbox
   every time; the hash is now keyed by a secret of the runtime's process.
+- **An ARC seal this runtime adds says `cv=pass` only for a chain that
+  passed.** The newest seal's `d=` was copied into the Authentication-Results
+  unchecked, and the seal put on forwarded mail took `cv=pass` from any
+  `arc=pass` in that text, so a broken chain sealed `d=xarc=pass` was sealed
+  on as passing under this runtime's key; a sealer that is no domain name is
+  now left out, and only this host's own `; arc=pass (i=` token counts.
 - **A share taken back ends in the sessions that have it selected.** Rights
   were read once, at SELECT, so after DELETEACL a grantee who kept the folder
   open went on reading, searching, flagging and expunging the owner's mail

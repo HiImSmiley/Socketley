@@ -1529,7 +1529,19 @@ TEST_CASE("ARC: a set sealed here verifies, a chain broken on the way fails, and
     CHECK(res.arc_vouched);
     CHECK_FALSE(res.reject());
     CHECK(res.header().find("arc=pass (i=1 d=fwd.test, vouched)") != std::string::npos);
+    CHECK(inbound_result::arc_passed(res.header()));
     res = check_inbound(one, "203.0.113.9", "mx.fwd.test", "list@fwd.test", r, 1000, {"other.test"});
     CHECK(res.reject());
+    // A seal whose d= is no name fails and is told with no sealer, so its bytes cannot make a forward seal cv=pass.
+    std::string odd = one;
+    odd.replace(odd.find("d=fwd.test; s=arc;"), 18, "d=xarc=pass; s=arc;");
+    c = arc::verify(odd, key_of, 1000);
+    CHECK(c.result == "fail");
+    CHECK(c.sealer.empty());
+    res = check_inbound(odd, "203.0.113.9", "mx.fwd.test", "list@fwd.test", r, 1000);
+    CHECK(res.arc == "fail");
+    CHECK(res.header().find("arc=pass") == std::string::npos);
+    CHECK_FALSE(inbound_result::arc_passed(res.header()));
+    CHECK_FALSE(inbound_result::arc_passed("spf=none; dkim=none; dmarc=none; arc=fail (i=1 d=xarc=pass)"));
     std::filesystem::remove_all(tmpl);
 }

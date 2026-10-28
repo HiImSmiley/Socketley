@@ -1670,7 +1670,7 @@ void delivery::sign_read(const std::shared_ptr<sign_job>& j)
                             {
                                 // What the chain was as it came, as this host's checks wrote it.
                                 const std::string& auth = j->e->auth;
-                                const std::string cv = auth.find("arc=pass") != std::string::npos ? "pass" : "fail";
+                                const std::string cv = inbound_result::arc_passed(auth) ? "pass" : "fail";
                                 *sig = arc::seal(w, authserv, auth, seal_domain, sel, key.get(), now, cv);
                                 return;
                             }
