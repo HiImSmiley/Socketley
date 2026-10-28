@@ -1714,8 +1714,9 @@ void db_run::catch_up()
         try_follow();
         return;
     }
-    const uint64_t layout = log_word(1);
+    // The durable change before the layout, since shard 0 says the layout first and a merge it says is then not missed.
     const uint64_t durable = log_word(0);
+    const uint64_t layout = log_word(1);
     if (layout == m_seen_layout && durable <= m_store.seq())
         return;
     std::vector<event> evs;

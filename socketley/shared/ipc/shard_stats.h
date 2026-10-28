@@ -363,7 +363,8 @@ public:
 
     // Two numbers of this shard's own for its siblings, which the runtime gives their meaning: a sharded db's
     // writer puts the change its log is on the disk up to, and how often its segments were rearranged.  The second
-    // is stored first, so a reader that sees the first sees the second it was taken with.
+    // is stored first, so a reader that loads the first and then the second sees a second at least as new as the one
+    // published with the first.
     void publish_words(uint64_t first, uint64_t second)
     {
         if (!writable())
