@@ -442,7 +442,7 @@ private:
     io_request m_signal_req{};
     uint64_t m_signal_buf{};
     bool m_multishot_supported{false};
-    // IORING_ACCEPT_POLL_FIRST needs kernel 6.11; probed rather than assumed,
+    // IORING_ACCEPT_POLL_FIRST needs kernel 6.10; probed rather than assumed,
     // because an unknown ioprio bit makes the kernel refuse every accept.
     bool m_accept_poll_first{false};
     // IORING_RECVSEND_POLL_FIRST, probed for the same reason in the same field.

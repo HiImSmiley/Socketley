@@ -994,7 +994,16 @@ bool event_loop::init()
 
     // A loop waits with its accepts and receives armed, which the kernel counts as I/O wait unless told otherwise, so
     // a host idle but for socketley read one blocked task per process in its load average and its iowait.
-    if (io_uring_set_iowait(&m_ring, false) < 0) {}
+    // io_uring_set_iowait() arrived in liburing 2.10 and the floor is 2.7, so an older build keeps the kernel's default.
+#if IO_URING_VERSION_MAJOR > 2 || (IO_URING_VERSION_MAJOR == 2 && IO_URING_VERSION_MINOR >= 10)
+    if (io_uring_set_iowait(&m_ring, false) < 0)
+    {
+        // Said once per process, because every shard's loop would say the same thing about the same kernel.
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true, std::memory_order_relaxed))
+            LOG_DEBUG("event loop: this kernel counts a waiting loop as I/O wait, since opting out needs 6.15");
+    }
+#endif
 
     // Register the ring fd itself, which removes an fget/fput per io_uring
     // syscall for about 1-3% throughput.

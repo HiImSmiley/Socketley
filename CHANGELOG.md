@@ -99,6 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   every reader shows, got dmarc=none and no policy, and a second From written
   so slipped past the two-From refusal and a user's submission check; every
   From header is now found by the name rule readers use.
+- **socketley builds against liburing 2.7 to 2.9 again.** The loop's I/O
+  wait opt-out is a liburing 2.10 call and is now left out of an older build.
 - **An ignored `SOCKETLEY_NAPI_BUSY_POLL_US` is reported.** A kernel that
   refused NAPI busy poll left the setting doing nothing without a word; the
   loop now logs a warning.
