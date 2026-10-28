@@ -14,7 +14,7 @@ namespace socketley::mail::srs
 {
 
 // `sender` (local@domain) rewritten to be sent from `domain` on `day` (days since the epoch); `sender` as it is where
-// it is empty, a bounce's, or already of `domain`.
+// it is empty, a bounce's, already of `domain`, or of a host holding '='.
 std::string forward(std::string_view sender, std::string_view domain, std::string_view key, int64_t day);
 
 // The address an SRS address of `domain` stands for, checked against `key` and `day`; empty where it is none, its

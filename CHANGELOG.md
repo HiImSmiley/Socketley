@@ -181,6 +181,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client's own X-Forwarded-For reached the backend with no hop added, and
   `--auth` took it as the client's address. The address is now read at accept,
   and a TCP client without one is refused.
+- **An SRS address's hash binds where its host ends.** It covered the stamp,
+  host and local part run together, so the address made for
+  `ictim.orgbob@v` also passed as one for `bob@victim.org`, and a bounce
+  address could be had for a recipient of the sender's choosing; the parts are
+  now hashed with the `=` between them, and a host holding `=` is not
+  rewritten.
 - **SRS addresses carry a 40-bit hash, and SRS1 ones expire.** The hash was
   four base64 characters compared without case, about 21 bits; it is now eight
   base32 characters, an SRS1 address is refused once the first forwarder's day

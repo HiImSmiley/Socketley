@@ -77,6 +77,20 @@ TEST_CASE("SRS: a forwarded sender is rewritten under this domain and read back,
     std::string wrong_old = old_form;
     wrong_old[5] = wrong_old[5] == 'A' || wrong_old[5] == 'a' ? 'B' : 'A';
     CHECK(srs::reverse(wrong_old, "fwd.test", key, late).empty());
+    // The hash binds where the host ends, so one address does not vouch for another split of the same characters.
+    const std::string split = srs::forward("ictim.orgbob@v", "fwd.test", key, day);
+    CHECK(srs::reverse(split, "fwd.test", key, day) == "ictim.orgbob@v");
+    std::string moved = split;
+    moved.replace(moved.find("=v=ictim.orgbob@"), 16, "=victim.org=bob@");
+    CHECK(moved.find("=victim.org=bob@fwd.test") != std::string::npos);
+    CHECK(srs::reverse(moved, "fwd.test", key, day).empty());
+    // An SRS1 first forwarder holding '=' is not vouched for, so its '=' cannot become the end of a shorter host.
+    const std::string t = split.substr(14, 2);
+    const std::string first = "SRS0=ABCDEFGH=" + t + "=h=l@";
+    CHECK(srs::forward(first + "a=b", "second.test", "second key", day) == first + "a=b");
+    const std::string honest = srs::forward(first + "ab", "second.test", "second key", day);
+    CHECK(honest.starts_with("SRS1="));
+    CHECK(srs::reverse(honest, "second.test", "second key", day) == first + "ab");
     // A bounce, a sender of this domain and a non-SRS address are left alone.
     CHECK(srs::forward("", "fwd.test", key, day).empty());
     CHECK(srs::forward("me@fwd.test", "fwd.test", key, day) == "me@fwd.test");

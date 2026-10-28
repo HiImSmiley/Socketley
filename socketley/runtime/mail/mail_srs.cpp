@@ -62,16 +62,16 @@ bool fresh(std::string_view s, int64_t day)
     return age <= max_age_days;
 }
 
-// Whether `h` is the hash of `what` under `key`, in a time that tells nothing of where it differs; the old short form
-// only until legacy_until_day, once no address written with it is still fresh.
-bool hash_ok(std::string_view h, std::string_view key, std::string_view what, int64_t day)
+// Whether `h` is the hash of `what` under `key`, in a time that tells nothing of where it differs; the old short form,
+// over `legacy` as it was written, only until legacy_until_day, once no address written with it is still fresh.
+bool hash_ok(std::string_view h, std::string_view key, std::string_view what, std::string_view legacy, int64_t day)
 {
     std::string given = lower(h);
     std::string want;
     if (h.size() == 8)
         want = lower(hash_of(key, what));
     else if (h.size() == 4 && day <= legacy_until_day)
-        want = lower(legacy_hash_of(key, what));
+        want = lower(legacy_hash_of(key, legacy));
     return !want.empty() && socketley::crypto::secure_equal(given, want);
 }
 
@@ -105,11 +105,17 @@ std::string forward(std::string_view sender, std::string_view domain, std::strin
             orighost = std::string(tail.substr(h + 1, dd - h - 1));
             rest = std::string(tail.substr(dd + 1));
         }
+        // The hash's text ends the host at its first '=', so a host holding one is not vouched for.
+        if (orighost.find('=') != std::string::npos)
+            return std::string(sender);
         return "SRS1=" + hash_of(key, orighost + rest) + "=" + orighost + "=" + rest + "@" + std::string(domain);
     }
+    if (host.find('=') != std::string_view::npos)
+        return std::string(sender);
     const std::string t = stamp(day);
-    return "SRS0=" + hash_of(key, t + std::string(host) + std::string(local)) + "=" + t + "=" + std::string(host) + "=" +
-           std::string(local) + "@" + std::string(domain);
+    // The parts are hashed with the '=' between them, so the host cannot end elsewhere under the same hash.
+    return "SRS0=" + hash_of(key, t + "=" + std::string(host) + "=" + std::string(local)) + "=" + t + "=" +
+           std::string(host) + "=" + std::string(local) + "@" + std::string(domain);
 }
 
 std::string reverse(std::string_view address, std::string_view domain, std::string_view key, int64_t day)
@@ -130,7 +136,8 @@ std::string reverse(std::string_view address, std::string_view domain, std::stri
         const std::string_view h = tail.substr(0, a), t = tail.substr(a + 1, b - a - 1),
                                host = tail.substr(b + 1, c - b - 1), who = tail.substr(c + 1);
         if (host.empty() || who.empty() || !fresh(t, day) ||
-            !hash_ok(h, key, std::string(t) + std::string(host) + std::string(who), day))
+            !hash_ok(h, key, std::string(t) + "=" + std::string(host) + "=" + std::string(who),
+                     std::string(t) + std::string(host) + std::string(who), day))
             return {};
         return std::string(who) + "@" + std::string(host);
     }
@@ -144,8 +151,9 @@ std::string reverse(std::string_view address, std::string_view domain, std::stri
         const std::string_view h = tail.substr(0, a), orighost = tail.substr(a + 1, dd - a - 1), rest = tail.substr(dd + 1);
         // The first forwarder's day stamp in =HHHH=TT=... is read too, so an SRS1 address lives no longer than its SRS0.
         const size_t ta = rest.find('=', 1), tb = ta == std::string_view::npos ? ta : rest.find('=', ta + 1);
-        if (orighost.empty() || tb == std::string_view::npos || !fresh(rest.substr(ta + 1, tb - ta - 1), day) ||
-            !hash_ok(h, key, std::string(orighost) + std::string(rest), day))
+        if (orighost.empty() || orighost.find('=') != std::string_view::npos || tb == std::string_view::npos ||
+            !fresh(rest.substr(ta + 1, tb - ta - 1), day) ||
+            !hash_ok(h, key, std::string(orighost) + std::string(rest), std::string(orighost) + std::string(rest), day))
             return {};
         return "SRS0" + std::string(rest) + "@" + std::string(orighost);
     }
