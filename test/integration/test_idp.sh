@@ -29,6 +29,7 @@
 #   * an e-mail a user gave themselves taken as vouched for, another account's, or able to split a line
 #   * one of them still taking a cookie of an account disabled, removed, signed out everywhere or made to reset since,
 #     or the admin bit of one taken out of admins since; or a code given before a sign-out redeemed after it
+#   * a cookie of an account renamed since still taken, carrying the old name another account may be given
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -114,7 +115,7 @@ SHOW=$("$BIN" idp-user auth show alice 2>&1)
 case "$SHOW" in *"game.class: mage"*"password: (set)"*) ok ;; *) bad "show lists the fields, the password as set and not its hash" "$SHOW" ;; esac
 case "$SHOW" in *'$scrypt$'*) bad "show never prints the hash" "$SHOW" ;; *) ok ;; esac
 # Accounts the command line changes after the first checks, each signed in before it does.
-for u in frank gina hank; do
+for u in frank gina hank rita; do
     g=; [ "$u" = frank ] && g="--groups admins"
     "$BIN" idp-user auth add "$u" --password "${u}password1" $g >/dev/null 2>&1 || bad "$u is made" "rc $?"
 done
@@ -402,10 +403,10 @@ if phase == "main":
 
     # Sign-ins the command line takes back, or takes the admin bit of, before the next phase.
     signed = lambda u: cookie_of(req("POST", "/login", dict(rd="/", username=u, password=u + "password1"))[2])
-    later = {u: signed(u) for u in ("carol", "frank", "gina", "hank")}
+    later = {u: signed(u) for u in ("carol", "frank", "gina", "hank", "rita")}
     check("another admin takes the dashboard", json.loads(at(M, "GET", "/api/session", cookie=later["frank"])[1]).get("user"), "frank")
     check("and every one of them the proxy, before the command line changes them",
-          [at(P, "GET", "/gate/who", cookie=c)[0] for c in later.values()], [200] * 4)
+          [at(P, "GET", "/gate/who", cookie=c)[0] for c in later.values()], [200] * 5)
     check("alice's sign-in reaches the proxy too", at(P, "GET", "/gate/who", cookie=cookie)[0], 200)
     later_code = code_of(req("GET", "/authorize" + q(**dict(auth, state="later")), cookie=cookie)[2])[0].get("code", "")
 
@@ -438,6 +439,9 @@ elif phase == "after_cli":
     check("as the idp's own pages do", (st, (h.get("Location") or "").startswith("/login")), (302, True))
     check("an admin taken out of admins is no admin at the dashboard", eventually(lambda: board(later["frank"]), None), None)
     check("but still signed in at the proxy", gate(later["frank"]), 200)
+    check("a cookie from before its account was renamed is refused", eventually(lambda: gate(later["rita"]), 401), 401)
+    rosa = cookie_of(req("POST", "/login", dict(rd="/", username="rosa", password="ritapassword1"))[2])
+    check("and a sign-in under the new name is taken", gate(rosa), 200)
     st, body, _ = exchange(s["later_code"])
     check("a code given before its account was signed out everywhere is redeemed for nothing", (st, json.loads(body).get("error")), (400, "invalid_grant"))
     dora = cookie_of(req("POST", "/login", dict(rd="/", username="dora", password="dorapassword1"))[2])
@@ -654,6 +658,7 @@ tally < <(run main)
 "$BIN" idp-user auth set frank groups=staff >/dev/null 2>&1 && ok || bad "set takes frank out of admins" "rc $?"
 "$BIN" idp-user auth set gina reset=1 >/dev/null 2>&1 && ok || bad "set makes gina's password one to set again" "rc $?"
 "$BIN" idp-user auth remove hank >/dev/null 2>&1 && ok || bad "remove takes hank" "rc $?"
+"$BIN" idp-user auth set rita username=rosa >/dev/null 2>&1 && ok || bad "set renames rita" "rc $?"
 # An account with a second step whose password must be set again, its key kept for the checks to make codes.
 "$BIN" idp-user auth add erin --password erinpassword1 >/dev/null 2>&1
 "$BIN" idp-user auth totp erin on 2>&1 | sed -n 's/^key: //p' > "$T/erin.key"
@@ -697,7 +702,7 @@ expect "but to one under the cookie domain" \
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
 STATS=$("$BIN" stats auth 2>/dev/null)
-case "$STATS" in *"accounts:13"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+case "$STATS" in *"accounts:14"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]

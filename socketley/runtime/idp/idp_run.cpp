@@ -3226,6 +3226,10 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             answer_command(ticket, "error: " + why);
             return;
         }
+        // A runtime that takes a sign-in knows the account by the username it carries, so a new one ends the old.
+        if (std::any_of(f.begin(), f.end(),
+                        [&](const auto& kv) { return kv.first == "username" && kv.second != who->username(); }))
+            f.emplace_back("revoked_before", std::to_string(wall::now_ms()));
         apply(f, "");
         return;
     }

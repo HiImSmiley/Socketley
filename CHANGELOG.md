@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A renamed idp account signs in again.** `idp-user set user
+  username=new` left its sessions and tokens working with the old name in
+  them, which a storage and the mail take as the account they open, so the
+  next account given that name was reached with them; a new username now ends
+  them as `idp-user logout` does.
 - **One address's failures no longer lock everyone behind it out of the idp.**
   Five failed sign-ins, or five requests to `/token` naming a client that
   does not exist, which any web page can send from a visitor's browser,

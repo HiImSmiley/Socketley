@@ -1019,7 +1019,10 @@ can read, and
 makes it set again at the next sign-in.
 .B set
 gives any field a value, an empty one removing it: a field the provider does
-not know is kept and carried as it is, for the applications that use it.
+not know is kept and carried as it is, for the applications that use it. A new
+.B username
+ends the account's sessions and tokens, which carry the old one to every
+runtime that takes them.
 .B logout
 ends every session and refresh token the account holds;
 .B passwd
