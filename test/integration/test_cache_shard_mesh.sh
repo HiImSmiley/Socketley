@@ -141,6 +141,27 @@ else
 fi
 "$BIN" remove meshc >/dev/null 2>&1
 
+# ── A shard that really dies is still said ──────────────────────────────────
+#
+# A sibling's end is held for a moment before it is called a fault, since a stop reaches every shard in one turn
+# and one can be gone before another has read that it is going too; a shard killed while the rest run has no stop
+# behind it, so its siblings still say so, once the moment has passed.
+"$BIN" create cache meshc -p "$PORT" --shards 4 --resp -s >/dev/null 2>&1
+for i in $(seq 1 80); do redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.25; done
+BEFORE=$(grep -cE '\[WARN\].*the link to shard' "$SOCKETLEY_DLOG" 2>/dev/null || true)
+VICTIM=$(ss -Hltnp "sport = :$PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+[ -n "$VICTIM" ] && kill -9 "$VICTIM"
+for _ in $(seq 1 50); do
+    [ "$(grep -cE '\[WARN\].*the link to shard' "$SOCKETLEY_DLOG" 2>/dev/null || true)" -gt "${BEFORE:-0}" ] && break; sleep 0.1
+done
+AFTER=$(grep -cE '\[WARN\].*the link to shard' "$SOCKETLEY_DLOG" 2>/dev/null || true)
+if [ -n "$VICTIM" ] && [ "${AFTER:-0}" -gt "${BEFORE:-0}" ]; then
+    ok "a shard killed while its siblings run is reported by them ($((AFTER - BEFORE)) warning(s))"
+else
+    bad "a shard killed while its siblings run is reported by them" "victim '${VICTIM:-none}', warnings ${BEFORE:-0} -> ${AFTER:-0}"
+fi
+"$BIN" remove meshc >/dev/null 2>&1
+
 # ── eight shards: 56 links, and the assertion four shards cannot make ────
 #
 # The link for sibling j sits at a fixed descriptor slot, child_mesh_base + j.

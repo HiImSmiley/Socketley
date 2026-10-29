@@ -409,7 +409,10 @@ public:
             // send per frame produces a completion per crossing -- 5,920 ring
             // entries against 61,221 on the control socket -- and
             // unconditional, since a dying link still owes what it has queued.
-            for_each_link([](shard_link& link) { link.pump(); });
+            for_each_link([&](shard_link& link) {
+                link.pump();
+                link.settle(now);
+            });
             if (m_link_recv)
                 m_link_recv->pump();
 

@@ -6,6 +6,7 @@
 // route.
 #include <cstdint>
 #include <memory>
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -73,6 +74,9 @@ public:
         // goes now and the slot stays claimed until they have drained.
         if (m_loop)
             m_loop->deregister_owner(this);
+        // A link retired before its grace ran out still says it ended unexplained.
+        if (!m_held_warning.empty())
+            LOG_WARN(m_held_warning.c_str());
         // A link never die()d still has its descriptor, which the loop closes once nothing in the ring names it.
         if (m_fd >= 0)
         {
@@ -243,7 +247,25 @@ public:
     // ordinary stop and not a mesh that broke -- which is the difference
     // between a log where a real mesh failure is visible and one where every
     // stop says the same thing.
-    void expect_peer_exit() { m_peer_exit_expected = true; }
+    void expect_peer_exit()
+    {
+        m_peer_exit_expected = true;
+        // A sibling seen to go just before this process heard it was stopping was the same stop, told in another order.
+        if (!m_held_warning.empty())
+            LOG_DEBUG(m_held_warning.c_str());
+        m_held_warning.clear();
+    }
+
+    // A link's unexpected end said once it has stayed unexplained past the grace, since the daemon tells every
+    // shard to stop in one turn and a sibling can be gone before this one has read that it is going too.
+    void settle(std::chrono::steady_clock::time_point now)
+    {
+        if (!m_held_warning.empty() && now - m_held_at >= peer_exit_grace)
+        {
+            LOG_WARN(m_held_warning.c_str());
+            m_held_warning.clear();
+        }
+    }
 
     // ── Once per turn of the owner's loop ───────────────────────────────────
     // The two things a completion cannot do for itself -- put this turn's
@@ -269,7 +291,7 @@ public:
     // sleeps.
     bool needs_wake() const
     {
-        return !m_dead && (!m_armed || m_writer.needs_retry());
+        return (!m_dead && (!m_armed || m_writer.needs_retry())) || !m_held_warning.empty();
     }
 
     // The one function that ends a link, ordered flag then tickets then
@@ -314,7 +336,10 @@ public:
         else if (expected)
             LOG_DEBUG(note.c_str());
         else
-            LOG_WARN(note.c_str());
+        {
+            m_held_warning = note;
+            m_held_at = std::chrono::steady_clock::now();
+        }
     }
 
     size_t owed() const { return m_owed.size(); }
@@ -450,6 +475,10 @@ private:
 
     // Set by expect_peer_exit(); false means a sibling going is news.
     bool        m_peer_exit_expected{false};
+    // An unexpected end waiting out the grace before it is said, and when it came.
+    std::string m_held_warning;
+    std::chrono::steady_clock::time_point m_held_at{};
+    static constexpr std::chrono::milliseconds peer_exit_grace{1500};
 
     // What a standing recv writes into, one at a time and named by m_req.
     // 64 KiB was measured against this and is the same: a cache sharded two
