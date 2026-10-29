@@ -13298,8 +13298,13 @@ The most bytes retained messages take, 64M unless given; a new one past it is
 not kept, counted.
 .TP
 .BI "\-\-max\-sessions " n
-The most sessions, connected or not, 100000 unless given; a new client past it
-is refused with 0x97.
+The most sessions, connected or not, 100000 unless given. A new client past it
+ends the session away longest of whoever holds the most \(em a user, or for
+clients without one an address, IPv6 by its /64 \(em when that is two or more,
+counted as
+.BR sessions_evicted ,
+so one owner filling the table locks nobody else out; otherwise it is refused
+with 0x97.
 .TP
 .BI "\-\-keepalive\-max " seconds
 The longest keep alive granted, 1200 unless given; a 5.0 client asking more or

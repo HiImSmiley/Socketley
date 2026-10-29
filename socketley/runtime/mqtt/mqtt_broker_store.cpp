@@ -290,6 +290,7 @@ void broker::install_session(std::unique_ptr<session> s, const std::vector<std::
         m_subs.add(inner, is_shared ? group : std::string_view{}, s->key, o);
         filter_ref(filter, true);
     }
+    own(*s);
     session* raw = s.get();
     m_by_key[raw->key] = raw;
     m_sessions[raw->client_id] = std::move(s);

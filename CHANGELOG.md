@@ -163,6 +163,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate in it was an anchor and no name was checked, so any leaf the
   same public intermediate signed took the credentials; now the peer must
   show the file's first certificate.
+- **One MQTT client filling the session table locks nobody else out.**
+  Sessions kept by clean session 0 outlive their connection for a day, so one
+  account, or anyone under `--anonymous`, could connect 100000 times with fresh
+  client ids and leave every new client refused with 0x97 until they expired. A
+  new client past `--max-sessions` now ends the session away longest of
+  whoever holds the most (a user, or an address for clients without one) when
+  that is two or more, counted as `sessions_evicted`; only otherwise is it
+  refused.
 - **MQTT topic rules that lead to each other end.** Two `mqtt://` rules
   pointing at each other's broker with `%t`, or one pointing back at its own,
   passed one publish round for ever, delivered again on every pass. A message

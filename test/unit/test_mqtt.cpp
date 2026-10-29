@@ -1350,3 +1350,44 @@ TEST_CASE("an mqtt:// rule passes a message on with one hop more, and not once i
     // A rule of another kind starts no loop, so it still takes the message.
     CHECK(t.routes()[1].queue.size() == 2);
 }
+
+TEST_CASE("a full session table gives up the session away longest of whoever holds the most")
+{
+    broker_config cfg;
+    cfg.max_sessions = 4;
+    rig r(cfg);
+    const auto as = [&](const std::string& id, const std::string& user) {
+        const uint64_t c = r.open();
+        connect_packet p;
+        p.level       = level_311;
+        p.client_id   = id;
+        p.clean_start = false;
+        p.keepalive   = 60;
+        p.username    = user;
+        std::string out;
+        write_connect(out, p);
+        r.send(c, out);
+        r.packets(c);
+        return c;
+    };
+    const uint64_t alice = as("alice-dev", "alice");
+    r.b->disconnected(as("bob-dev", "bob"));
+    for (const char* id : {"junk-1", "junk-2"})
+    {
+        r.b->disconnected(as(id, "mallory"));
+        r.io.now += 1000;
+    }
+    REQUIRE(r.b->session_count() == 4);
+    const uint64_t carol = as("carol-dev", "carol");
+    CHECK_FALSE(r.io.closed.contains(carol));
+    CHECK(r.b->stats().sessions_evicted == 1);
+    CHECK(r.b->session_count() == 4);
+    CHECK_FALSE(r.b->kick("junk-1", false));
+    CHECK(r.b->kick("junk-2", false));
+    CHECK(r.b->kick("bob-dev", false));
+    // With one session to each owner nobody fills the table, and a newcomer is refused as before.
+    const uint64_t dave = as("dave-dev", "dave");
+    CHECK(r.io.closed.contains(dave));
+    CHECK(r.b->session_count() == 4);
+    CHECK_FALSE(r.io.closed.contains(alice));
+}

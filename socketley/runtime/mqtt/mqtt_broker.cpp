@@ -1,4 +1,5 @@
 #include "mqtt_broker.h"
+#include "../../shared/net/address_key.h"
 
 #include <algorithm>
 #include <random>
@@ -451,6 +452,46 @@ bool broker::lapsed(const session& s, int64_t now) const
     return !s.conn && s.expiry != never && now - s.gone_ms >= static_cast<int64_t>(s.expiry) * 1000;
 }
 
+void broker::own(session& s)
+{
+    if (!s.username.empty())
+        s.owner = s.username;
+    else
+    {
+        // A NUL, which no MQTT string holds, keeps an address apart from a user of the same name.
+        std::string_view host = s.peer;
+        if (const size_t bracket = host.find(']'); host.starts_with('[') && bracket != std::string_view::npos)
+            host = host.substr(1, bracket - 1);
+        else if (const size_t colon = host.find(':'); colon != std::string_view::npos && colon == host.rfind(':'))
+            host = host.substr(0, colon);
+        s.owner = std::string(1, '\0') + socketley::address_key(host);
+    }
+    ++m_owned[s.owner];
+}
+
+bool broker::make_room()
+{
+    const std::string* top = nullptr;
+    size_t most = 1;
+    for (const auto& [owner, n] : m_owned)
+        if (n > most)
+        {
+            most = n;
+            top = &owner;
+        }
+    if (!top)
+        return false;
+    session* oldest = nullptr;
+    for (const auto& [id, s] : m_sessions)
+        if (!s->conn && s->owner == *top && (!oldest || s->gone_ms < oldest->gone_ms))
+            oldest = s.get();
+    if (!oldest)
+        return false;
+    ++m_stats.sessions_evicted;
+    end_session(*oldest, true);
+    return true;
+}
+
 bool broker::held_by_another(std::string_view client_id, std::string_view username) const
 {
     const auto it = m_sessions.find(std::string(client_id));
@@ -491,7 +532,7 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
         refuse(reason::not_authorized);
         return;
     }
-    if (it == m_sessions.end() && m_sessions.size() >= m_cfg.max_sessions)
+    if (it == m_sessions.end() && m_sessions.size() >= m_cfg.max_sessions && !make_room())
     {
         refuse(c->level == level_5 ? reason::quota_exceeded : reason::server_unavailable);
         return;
@@ -521,6 +562,9 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
         auto fresh = std::make_unique<session>();
         fresh->key       = m_next_key++;
         fresh->client_id = p.client_id;
+        fresh->username  = a.username;
+        fresh->peer      = c->info.peer;
+        own(*fresh);
         s = fresh.get();
         m_by_key[s->key] = s;
         m_sessions[p.client_id] = std::move(fresh);
@@ -1389,6 +1433,8 @@ void broker::end_session(session& s, bool publish_will)
     if (s.conn)
         if (connection* c = conn_of(s.conn))
             c->s = nullptr;
+    if (const auto o = m_owned.find(s.owner); o != m_owned.end() && --o->second == 0)
+        m_owned.erase(o);
     m_by_key.erase(s.key);
     const std::string id = s.client_id;
     m_sessions.erase(id);

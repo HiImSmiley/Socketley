@@ -387,6 +387,7 @@ struct broker_stats
     uint64_t denied_subscribe{0};
     uint64_t wills_sent{0};
     uint64_t sessions_expired{0};
+    uint64_t sessions_evicted{0};
     uint64_t protocol_errors{0};
     uint64_t retained_refused{0};
     uint64_t takeovers{0};
@@ -505,6 +506,8 @@ private:
         uint64_t    key{0};
         std::string client_id;
         std::string username;
+        // Whom it is counted against in m_owned: its user, or for a client with none its address.
+        std::string owner;
         uint8_t     level{level_311};
         uint64_t    conn{0};
         std::map<std::string, sub_options> subs;
@@ -562,6 +565,10 @@ private:
     session* session_of_key(uint64_t key);
     // Whether a session left by its connection has outlived its expiry, whether or not the sweep has ended it yet.
     bool lapsed(const session& s, int64_t now) const;
+    // A full table's room for one more: the session away longest of whoever holds the most, two or more, ended.
+    bool make_room();
+    // A session counted against its owner as it is made.
+    void own(session& s);
 
     static constexpr size_t shared_payload_bytes = 8192;
     // Room the writing of each PUBLISH reuses, so a subscriber's copy costs no allocation once warm.
@@ -649,6 +656,8 @@ private:
     connection* m_last_conn{nullptr};
     std::vector<uint64_t> m_held;
     std::unordered_map<std::string, std::unique_ptr<session>> m_sessions;
+    // How many sessions each owner holds, so one filling the table is the one that gives way.
+    std::unordered_map<std::string, size_t> m_owned;
     std::unordered_map<uint64_t, session*> m_by_key;
     uint64_t m_next_key{1};
     uint64_t m_next_generation{1};
