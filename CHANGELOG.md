@@ -228,6 +228,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   came from a Mersenne Twister seeded with 32 bits, whose few outputs in one
   `auto-` identity let a client work out the identities given to others next
   and take over a session one of them kept.
+- **A db stream that does not read holds 256 KiB of changes, not the history.**
+  A stream of a public collection opened from an early change copied every
+  change the database keeps, about 32 MiB, into memory at once, for anybody
+  and for every such stream, and one that stopped reading held each change
+  made since up to 16 MiB; a stream now takes changes from the history only as
+  it drains, and one the history has gone past is told `reset`.
 - **A db query reads at most 8 MiB of documents for what no index answers,
   unless a key asks.** A condition or a sort on a field the schema does not
   index read every document of the collection on the loop, and anybody may

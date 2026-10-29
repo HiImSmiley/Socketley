@@ -91,6 +91,11 @@ private:
         std::vector<copy_job::item> dump;
         size_t dump_at{0};
         uint64_t dump_seq{0};
+        // Where the stream stands: the last change offered to it and how many of its documents, and whether the
+        // changes after them wait in the history for what it holds to drain.
+        uint64_t at_seq{0};
+        size_t at_skip{0};
+        bool behind{false};
     };
 
     struct request
@@ -149,6 +154,10 @@ private:
     void open_feed(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica);
     void send_event(conn& c, const event& e);
     void pump_dump(const std::shared_ptr<conn>& c);
+    // The stream's changes after its place, from the history, until it holds its window; a reset when they are gone.
+    void pump_history(const std::shared_ptr<conn>& c);
+    // A change's document, seen or not, counted as past for the stream's place.
+    static void offered(conn& c, uint64_t seq);
     bool sees(const conn& c, const event& e) const;
 
     // Work off the loop: a merge or a backup on a thread, told back through an eventfd.

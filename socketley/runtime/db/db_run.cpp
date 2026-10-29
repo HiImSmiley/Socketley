@@ -37,6 +37,10 @@ constexpr int64_t idle_secs = 120;
 constexpr size_t  max_head  = 16 * 1024;
 constexpr size_t  max_body  = 4u << 20;
 constexpr size_t  max_conns = 4096;
+// What a stream holds unsent before it takes further changes from the history as it drains, not into memory.
+constexpr size_t  feed_window = 256u << 10;
+// A stream's place when every document of its last change was offered to it.
+constexpr size_t  whole_change = SIZE_MAX;
 
 std::string error_body(std::string_view code, std::string_view message)
 {
@@ -404,14 +408,19 @@ void db_run::publish()
         for (size_t i = 0; i < m_feeds.size(); ++i)
         {
             const std::shared_ptr<conn> c = m_feeds[i];
-            if (c->dead || !c->dump.empty() || !sees(*c, e))
+            if (c->dead || !c->dump.empty() || c->behind)
+                continue;
+            // A stream that has its window unsent takes this change and those after it from the history as it drains.
+            if (c->unsent() >= feed_window)
+            {
+                c->behind = true;
+                continue;
+            }
+            offered(*c, e.seq);
+            if (!sees(*c, e))
                 continue;
             send_event(*c, e);
-            // A stream that reads slower than changes come is let go; it resumes from the last one it read.
-            if (c->unsent() > (16u << 20))
-                m_http.close_conn(c);
-            else
-                m_http.flush(c);
+            m_http.flush(c);
         }
         m_history_bytes += e.json.size() + e.coll.size() + e.id.size() + 64;
         m_history.push_back(std::move(e));
@@ -461,13 +470,14 @@ void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::s
     const bool kept = named && since <= m_durable && since + 1 >= m_history_from;
     if (!named || since == m_durable || kept)
     {
-        for (const auto& e : m_history)
-            if (e.seq > since && sees(*c, e))
-                send_event(*c, e);
-        m_http.flush(c);
+        c->at_seq = since;
+        c->at_skip = whole_change;
+        pump_history(c);
         arm_tick();
         return;
     }
+    c->at_seq = m_durable;
+    c->at_skip = whole_change;
     c->out += "id: " + std::to_string(m_durable) + "\nevent: reset\ndata: {}\n\n";
     if (!replica)
     {
@@ -506,9 +516,9 @@ void db_run::pump_dump(const std::shared_ptr<conn>& c)
                     m_store.pin();
                 continue;
             }
-            for (const auto& e : m_history)
-                if (e.seq > c->dump_seq)
-                    send_event(*c, e);
+            c->at_seq = c->dump_seq;
+            c->at_skip = whole_change;
+            c->behind = true;
             break;
         }
         const auto& it = c->dump[c->dump_at++];
@@ -518,6 +528,62 @@ void db_run::pump_dump(const std::shared_ptr<conn>& c)
             return;
         }
         send_event(*c, event{it.seq, it.coll, it.id, it.owner, it.v, false, json});
+    }
+    if (c->dump.empty() && c->behind)
+    {
+        pump_history(c);
+        return;
+    }
+    m_http.flush(c);
+}
+
+void db_run::offered(conn& c, uint64_t seq)
+{
+    if (seq == c.at_seq && c.at_skip != whole_change)
+        ++c.at_skip;
+    else
+    {
+        c.at_seq = seq;
+        c.at_skip = 1;
+    }
+}
+
+void db_run::pump_history(const std::shared_ptr<conn>& c)
+{
+    c->behind = false;
+    // The change after the stream's place, or the rest of the one it stopped inside, must still be in the history.
+    if (c->at_skip == whole_change ? c->at_seq + 1 < m_history_from : c->at_seq < m_history_from)
+    {
+        c->at_seq = m_durable;
+        c->at_skip = whole_change;
+        c->out += "id: " + std::to_string(m_durable) + "\nevent: reset\ndata: {}\n\n";
+        if (c->replica)
+        {
+            c->dump = m_store.everything();
+            c->dump_at = 0;
+            c->dump_seq = m_store.seq();
+            if (!c->dump.empty())
+                m_store.pin();
+            pump_dump(c);
+            return;
+        }
+        m_http.flush(c);
+        return;
+    }
+    auto it = std::partition_point(m_history.begin(), m_history.end(),
+                                   [&](const event& e) { return e.seq < c->at_seq; });
+    for (size_t n = 0; it != m_history.end() && it->seq == c->at_seq && n < c->at_skip; ++n)
+        ++it;
+    for (; it != m_history.end(); ++it)
+    {
+        if (c->unsent() >= feed_window)
+        {
+            c->behind = true;
+            break;
+        }
+        offered(*c, it->seq);
+        if (sees(*c, *it))
+            send_event(*c, *it);
     }
     m_http.flush(c);
 }
@@ -967,11 +1033,16 @@ void db_run::accepted(const std::shared_ptr<socketley::http::server_conn>&)
 
 bool db_run::written(const std::shared_ptr<socketley::http::server_conn>& sc)
 {
-    // A whole copy being sent goes on as what went before it drains.
+    // A whole copy being sent, or the history a stream is behind on, goes on as what went before it drains.
     const auto c = std::static_pointer_cast<conn>(sc);
-    if (!c->feed || c->dump.empty())
+    if (!c->feed)
         return false;
-    pump_dump(c);
+    if (!c->dump.empty())
+        pump_dump(c);
+    else if (c->behind)
+        pump_history(c);
+    else
+        return false;
     return true;
 }
 
