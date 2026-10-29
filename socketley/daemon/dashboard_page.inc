@@ -36,6 +36,7 @@ constexpr std::string_view dashboard_page = R"HTML(<!doctype html>
 .rng button{background:none;border:0;color:var(--mut);font:inherit;font-size:12.5px;font-weight:600;padding:6px 12px;cursor:pointer}
 .rng button.on{background:rgba(255,255,255,.1);color:var(--fg)}
 .dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
+.nav .dot{padding:0;margin:0 0 0 auto}
 .dot.running{background:var(--ok);box-shadow:0 0 10px var(--ok)}.dot.stopped,.dot.created{background:var(--dim)}.dot.failed{background:var(--bad);box-shadow:0 0 10px var(--bad)}
 .rt{width:100%;border-collapse:separate;border-spacing:0 8px}
 .rt td{background:var(--panel);padding:12px 12px;font-size:13.5px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
@@ -100,7 +101,7 @@ textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);f
 <div id="login" hidden>
   <div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div>
   <form class="lcard" id="lf">
-    <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>socketley</div>
+    <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M4 12h3.5l2-5 4 10 2-5H20" stroke-linecap="round" stroke-linejoin="round"/></svg></div>socketley</div>
     <h1>Daemon</h1>
     <p class="mut" id="lsub">Sign in with an admin's access key.</p>
     <a class="btn pri" id="lidp" hidden>Sign in with your account</a>
@@ -113,7 +114,7 @@ textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);f
 </div>
 <div id="app" hidden>
   <aside id="side">
-    <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>socketley</div>
+    <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M4 12h3.5l2-5 4 10 2-5H20" stroke-linecap="round" stroke-linejoin="round"/></svg></div>socketley</div>
     <button class="nav" id="nOver"></button>
     <button class="nav" id="nRts"></button>
     <button class="nav" id="nNew"></button>
@@ -156,6 +157,7 @@ Object.assign(P, {
   db: '<rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M4 9.5h16M4 15h16M9.5 9.5V20"/>',
   mqtt: '<circle cx="12" cy="12" r="2"/><path d="M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7M5.5 18.5a9.2 9.2 0 0 1 0-13M18.5 5.5a9.2 9.2 0 0 1 0 13"/>',
   mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
+  tunnel: '<path d="M3.5 20v-8a8.5 8.5 0 0 1 17 0v8"/><path d="M8.5 20v-7a3.5 3.5 0 0 1 7 0v7"/><path d="M2.5 20h19"/>',
   sync: '<path d="M4 11a8 8 0 0 1 13.7-5.6L20 7.5"/><path d="M20 13a8 8 0 0 1-13.7 5.6L4 16.5"/><path d="M20 3.5V7.5h-4M4 20.5v-4h4"/>',
   open: '<path d="M14 3.5h6.5V10"/><path d="M20.5 3.5 11 13"/><path d="M17.5 14v5.2a1.3 1.3 0 0 1-1.3 1.3H4.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H10"/>',
   gauge: '<path d="M12 14l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>', cpu: '<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/>'
@@ -283,7 +285,7 @@ function side() {
   const L = $('#rlist'); L.textContent = '';
   for (const r of rts.slice().sort((a, b) => a.name.localeCompare(b.name)))
     L.append(el('button', { class: 'nav' + (view.at === 'rt' && view.name === r.name ? ' on' : ''), onclick: () => go('#/runtime/' + encodeURIComponent(r.name)) },
-      el('span', { class: 'dot ' + r.state }), el('span', { text: r.name, title: r.name + ' · ' + r.type })));
+      ico(r.type), el('span', { text: r.name, title: r.name + ' · ' + r.type }), el('span', { class: 'dot ' + r.state, title: r.state })));
   if (!rts.length) L.append(el('div', { class: 'dim', style: 'padding:6px 12px;font-size:13px', text: 'No runtimes yet' }));
 }
 function crumbs(parts) {
