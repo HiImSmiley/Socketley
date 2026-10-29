@@ -368,11 +368,13 @@ void tunnel_run::dial_leg(link& l, uint32_t stream, std::string_view target)
     std::string addr;
     if (l.k == link::kind::person)
     {
+        // Asked again at every stream, so a sign-in the idp took back since opens nothing, and a demoted admin no agent.
+        const bool holds = person_holds(l);
         // Only a target the edge names, so a signed-in person reaches what it allows and nothing else.
-        if (std::find(m_forward.begin(), m_forward.end(), target) != m_forward.end())
+        if (holds && std::find(m_forward.begin(), m_forward.end(), target) != m_forward.end())
             addr = std::string(target);
         // An admin may name an agent's TCP service, `pi/ssh`, carried as a visitor of the port this edge serves it on.
-        else if (const size_t slash = target.find('/'); l.admin && slash != std::string_view::npos)
+        else if (const size_t slash = target.find('/'); holds && l.admin && slash != std::string_view::npos)
             for (const agent& a : m_agents)
                 if (a.joined && a.name == target.substr(0, slash))
                     for (const service& s : a.services)
@@ -501,6 +503,17 @@ void tunnel_run::tick()
     // Every link pinged while it is quiet, and one that answers nothing for long given up.
     for (const auto& l : links)
     {
+        // A person's link ends with the sign-in it was opened by: signed out everywhere, disabled, reset or removed.
+        if (m_edge && l->k == link::kind::person && !person_holds(*l))
+        {
+            LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": the sign-in of \"" + l->who +
+                      "\" no longer holds, and its link is closed").c_str());
+            l->s.goaway("the sign-in no longer holds", l->out);
+            flush_link(*l);
+            if (auto t = l->transport.lock())
+                transports.close_conn(t);
+            continue;
+        }
         if (now - l->last_heard > silent_limit)
         {
             if (auto t = l->transport.lock())
@@ -958,20 +971,22 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
         }
         LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" connected from " +
                   client_of(c->peer, head)).c_str());
-        upgraded(c, link::kind::person, who.username, {}, who.admin);
+        upgraded(c, link::kind::person, who.username, {}, who.sub, who.issued_ms, who.admin);
         return;
     }
     refuse_front(c, 401, "an agent's key, an invitation, or an access token is required");
 }
 
 void tunnel_run::upgraded(const std::shared_ptr<http::server_conn>& c, link::kind k, std::string who,
-                          std::string_view extra_headers, bool admin)
+                          std::string_view extra_headers, std::string sub, int64_t signed_in_ms, bool admin)
 {
     auto& f = static_cast<front_conn&>(*c);
     c->out += "HTTP/1.1 101 Switching Protocols\r\nUpgrade: " + std::string(upgrade_token) +
               "\r\nConnection: Upgrade\r\n" + std::string(extra_headers) + "\r\n";
     f.l = std::make_shared<link>(*this, k, std::move(who), c);
     f.l->admin = admin;
+    f.l->sub = std::move(sub);
+    f.l->signed_in_ms = signed_in_ms;
     ++m_c.links;
     f.l->s.hello({{"edge", std::string(m_owner.get_name())}}, f.l->out);
     if (k == link::kind::agent)
@@ -995,6 +1010,15 @@ void tunnel_run::upgraded(const std::shared_ptr<http::server_conn>& c, link::kin
     }
     c->in.clear();
     flush_link(*l);
+}
+
+bool tunnel_run::person_holds(link& l)
+{
+    bool admin = false;
+    if (!m_idp || !m_idp->holds(l.sub, l.signed_in_ms, admin))
+        return false;
+    l.admin = admin;
+    return true;
 }
 
 bool tunnel_run::visitor(leg_hooks& h, const std::shared_ptr<leg>& g)

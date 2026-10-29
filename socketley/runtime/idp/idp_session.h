@@ -43,6 +43,8 @@ public:
         std::string email;
         // From the account's groups as they are now, not as the token was signed.
         bool admin{false};
+        // When the sign-in was given, in milliseconds, for holds() to ask about again.
+        int64_t issued_ms{0};
     };
 
     // The signed-in account a request's Cookie fields name, false when none does.
@@ -50,6 +52,9 @@ public:
     // The account an access token names, for an `Authorization: Bearer`, when the client it was given to is one of
     // the audiences configure() named.
     bool check_bearer(std::string_view token, who& out);
+    // Whether a sign-in check() or check_bearer() took, the account `sub` given it at `given_ms`, still holds by its
+    // account's standing now, and with `admin` whether the account is an admin now; for what lives past one request.
+    bool holds(const std::string& sub, int64_t given_ms, bool& admin);
 
     // The provider's issuer, where a CLI signs in, empty while its key is not known.
     std::string issuer();

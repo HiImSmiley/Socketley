@@ -16,6 +16,7 @@
 #   * a kept sign-in handed to an edge that names an idp not beside it
 #   * a port of the edge's machine reached as an agent's service the edge does not serve
 #   * a join that replaces an agent already joined without being asked to
+#   * a person's link kept open, and its streams opened, after the idp took the sign-in back
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -77,6 +78,7 @@ EOF
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$I/jwks")" = 200 ] && break; sleep 0.1; done
 "$BIN" idp-user auth add alice --password alicepassword1 >/dev/null 2>&1
 "$BIN" idp-user auth add boss --password bosspassword1 --groups admins >/dev/null 2>&1
+"$BIN" idp-user auth add carol --password carolpassword1 >/dev/null 2>&1
 out=$("$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && case "$out" in *"--forward needs --idp"*) true ;; *) false ;; esac && ok || bad "--forward without --idp is refused" "rc $rc: $out"
 "$BIN" create tunnel e --mode edge -p "$PE" --forward "127.0.0.1:$PX,127.0.0.1:$PS" --idp auth -s >/dev/null 2>&1 \
@@ -123,6 +125,23 @@ head -c 3000000 /dev/urandom > "$T/blob"
 out=$(printf 'x' | "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:9" --idp "$I" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"does not forward to that target"*) true ;; *) false ;; esac && ok || bad "a target the edge does not name is refused" "rc $rc: $out"
 grep -q 'tunnel e: "alice" connected from 127.0.0.1' "$SOCKETLEY_DLOG" && ok || bad "who connected is said in the log" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
+
+# A link held open ends with its sign-in: signing carol out everywhere closes the one she has.
+login_as carol carolpassword1 "" "$T/carol" || bad "carol signs in" "$(cat "$T/login.out")"
+mkfifo "$T/held.in"
+XDG_CONFIG_HOME="$T/carol" "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" < "$T/held.in" \
+    > "$T/held.out" 2>"$T/held.err" &
+HELD=$!
+exec 7>"$T/held.in"
+printf 'held' >&7
+for _ in $(seq 1 50); do [ "$(cat "$T/held.out")" = held ] && break; sleep 0.1; done
+[ "$(cat "$T/held.out")" = held ] && ok || bad "carol's stream is carried" "$(cat "$T/held.err")"
+"$BIN" idp-user auth logout carol >/dev/null 2>&1
+for _ in $(seq 1 50); do kill -0 "$HELD" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$HELD" 2>/dev/null && bad "a link held open ends once its account is signed out everywhere" "still open after 5 s" || ok
+grep -q 'tunnel e: the sign-in of "carol" no longer holds' "$SOCKETLEY_DLOG" && ok || bad "and the log says why" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
+exec 7>&-
+kill "$HELD" 2>/dev/null; wait "$HELD" 2>/dev/null
 
 login_as alice alicepassword1 other "$T/other" || true
 out=$(printf 'x' | XDG_CONFIG_HOME="$T/other" "$BIN" tunnel connect "http://127.0.0.1:$PE" "127.0.0.1:$PX" --idp "$I" 2>&1); rc=$?

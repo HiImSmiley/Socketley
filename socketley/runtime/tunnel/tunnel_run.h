@@ -90,6 +90,9 @@ public:
     std::weak_ptr<http::server_conn> transport;
     // A person who is an admin of the edge's idp, who may reach an agent's TCP service by its name.
     bool admin{false};
+    // A person's account and when it signed in, asked of the idp again for as long as the link lives.
+    std::string sub;
+    int64_t signed_in_ms{0};
     int64_t last_heard{0};
     int64_t last_ping{0};
 
@@ -201,7 +204,9 @@ private:
     void answer_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view body);
     void join_by_person(const std::shared_ptr<http::server_conn>& c, std::string_view head);
     void upgraded(const std::shared_ptr<http::server_conn>& c, link::kind k, std::string who,
-                  std::string_view extra_headers, bool admin = false);
+                  std::string_view extra_headers, std::string sub = {}, int64_t signed_in_ms = 0, bool admin = false);
+    // Whether a person's sign-in still holds at the idp, its admin bit made what the account's is now.
+    bool person_holds(link& l);
     // A visitor on a service's listener, carried to the agent offering it; false when the agent is not connected.
     bool visitor(leg_hooks& h, const std::shared_ptr<leg>& g);
     // An HTTP service's visitor's requests, as far as they have come, asked of its auth where it has one, and what

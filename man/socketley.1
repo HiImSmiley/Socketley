@@ -14306,7 +14306,11 @@ to the targets it names, and to nothing else, as
 .B socketley tunnel connect
 or
 .B tunnel ssh
-asks; this is how ssh reaches a server through port 443:
+asks; this is how ssh reaches a server through port 443. Its sign-in is asked
+again at every stream and once a second, so signing the account out
+everywhere, disabling, resetting or removing it closes the person's link, and
+taking it out of admins takes away the agents' TCP services at its next
+stream:
 .RS
 .PP
 .nf

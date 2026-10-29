@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A person's tunnel link ends when the idp takes the sign-in back.** The
+  edge checked the access token once, when the link was opened, and kept
+  its admin bit as it was then, so an account signed out everywhere,
+  disabled or taken out of admins kept the link and an admin's reach to
+  every agent's ssh for as long as it answered pings; the link is now asked
+  about again at every stream and once a second, closed when the sign-in no
+  longer holds, and an admin taken out reaches no agent at the next stream.
 - **A tunnel agent is never handed a visitor's idp session.** The edge
   checked a protected service's visitors and then carried the request on as
   it came, the `skl_idp` cookie that signs in at every runtime trusting the
