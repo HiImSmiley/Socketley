@@ -30,6 +30,7 @@
 #   * one of them still taking a cookie of an account disabled, removed, signed out everywhere or made to reset since,
 #     or the admin bit of one taken out of admins since; or a code given before a sign-out redeemed after it
 #   * a cookie of an account renamed since still taken, carrying the old name another account may be given
+#   * a session signed out still taken from a copy of its cookie, or a sign-out ending the account's other sessions
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -391,6 +392,16 @@ if phase == "main":
           (st, "skl_idp" in sent, "theme=dark" in sent), (200, False, True))
     forged = dora[:-4] + ("AAAA" if not dora.endswith("AAAA") else "BBBB")
     check("a forged cookie is refused", at(P, "GET", "/gate/who", headers={"Accept": "application/json"}, cookie=forged)[0], 401)
+    # Signing out ends the session itself, at the provider and the proxy alike, and none of the account's others.
+    one = cookie_of(req("POST", "/login", dict(rd="/", username="dora", password="dorapassword1"))[2])
+    check("a session signed in reaches the proxy", at(P, "GET", "/gate/who", cookie=one)[0], 200)
+    check("a sign-out is answered", req("POST", "/logout", {}, cookie=one)[0], 200)
+    check("after which a copy of its cookie signs in at the provider no more", req("GET", "/account", cookie=one)[0], 302)
+    end = time.time() + 3
+    while at(P, "GET", "/gate/who", headers={"Accept": "application/json"}, cookie=one)[0] != 401 and time.time() < end:
+        time.sleep(0.1)
+    check("nor at the proxy", at(P, "GET", "/gate/who", headers={"Accept": "application/json"}, cookie=one)[0], 401)
+    check("while the account's other session holds", at(P, "GET", "/gate/who", cookie=dora)[0], 200)
 
     # The dashboard: an admin of the idp signs in, an account that is none does not.
     M = "http://127.0.0.1:%s" % pm

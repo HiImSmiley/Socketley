@@ -1,6 +1,7 @@
 #pragma once
 // What the identity provider decides without a socket: its clients, the forms and queries it reads, PKCE, the
 // tokens it signs and verifies, and where it may send a browser back to.
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -177,16 +178,24 @@ struct standing
     bool admin{false};
     bool disabled{false};
     bool reset{false};
+    // The sessions signed out one at a time, by the sid each names, while they would still verify.
+    std::vector<std::string> ended;
 
     // Whether a sign-in given at `issued` milliseconds still holds.
     bool admits(int64_t issued) const { return !disabled && !reset && issued >= revoked_before; }
+    // Whether the session naming `sid` was signed out on its own.
+    bool ended_session(std::string_view sid) const
+    {
+        return !sid.empty() && std::find(ended.begin(), ended.end(), sid) != ended.end();
+    }
 };
 using standing_table = std::unordered_map<std::string, standing, string_hash, string_equal>;
 
 // The file's first line, which names its format.
 inline constexpr std::string_view standing_format = "socketley-idp-standing 1\n";
 
-// One account's line, `<id> <revoked_before> <flags>`, the flags `a` admin, `d` disabled and `r` reset, or `-`.
+// One account's line, `<id> <revoked_before> <flags>` and then each ended sid, the flags `a` admin, `d` disabled and
+// `r` reset, or `-`.
 void append_standing(std::string& out, std::string_view id, const standing& s);
 // The file whole, or false and `out` untouched when it is not one, so a reader keeps what it had.
 bool parse_standing(std::string_view text, standing_table& out);

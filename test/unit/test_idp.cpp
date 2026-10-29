@@ -526,12 +526,19 @@ TEST_CASE("the shards' questions and answers come back as they were sent")
 TEST_CASE("an account's standing is read back as it was written, and a file cut short is not read at all")
 {
     std::string doc(standing_format);
-    append_standing(doc, "id-a", standing{0, true, false, false});
-    append_standing(doc, "id-b", standing{1700000000123, false, true, true});
+    append_standing(doc, "id-a", standing{0, true, false, false, {}});
+    append_standing(doc, "id-b", standing{1700000000123, false, true, true, {}});
     append_standing(doc, "id-c", standing{});
+    append_standing(doc, "id-d", standing{7, false, false, false, {"0a1b", "ffee"}});
     standing_table t;
     REQUIRE(parse_standing(doc, t));
-    REQUIRE(t.size() == 3);
+    REQUIRE(t.size() == 4);
+    CHECK(t.at("id-d").revoked_before == 7);
+    CHECK(t.at("id-d").ended_session("0a1b"));
+    CHECK(t.at("id-d").ended_session("ffee"));
+    CHECK_FALSE(t.at("id-d").ended_session("0a1c"));
+    CHECK_FALSE(t.at("id-d").ended_session(""));
+    CHECK_FALSE(t.at("id-a").ended_session("0a1b"));
     CHECK(t.at("id-a").admin);
     CHECK(t.at("id-a").admits(1));
     CHECK(t.at("id-b").revoked_before == 1700000000123);
@@ -545,6 +552,8 @@ TEST_CASE("an account's standing is read back as it was written, and a file cut 
     CHECK_FALSE(parse_standing("not the format\n", kept));
     CHECK_FALSE(parse_standing(std::string(standing_format) + "id 12x -\n", kept));
     CHECK_FALSE(parse_standing(std::string(standing_format) + "id 12 q\n", kept));
+    CHECK_FALSE(parse_standing(std::string(standing_format) + "id 12 a  ab\n", kept));
+    CHECK_FALSE(parse_standing(std::string(standing_format) + "id 12 a ab \n", kept));
     CHECK(kept.size() == 1);
     REQUIRE(parse_standing(standing_format, kept));
     CHECK(kept.empty());

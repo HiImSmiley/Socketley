@@ -135,7 +135,7 @@ bool session_verifier::verified(std::string_view token, bool bearer, int64_t now
         }
         // The token's signature says who; whether that sign-in still holds, and the admin bit, the account says now.
         const standing* s = standing_of(c["sub"]);
-        if (!s || !s->admits(issued_ms(c)))
+        if (!s || !s->admits(issued_ms(c)) || (!bearer && s->ended_session(c["sid"])))
             return false;
         // An e-mail the provider does not vouch for is anyone's to claim, so it is not taken as the user's.
         out = who{c["sub"], c["preferred_username"], c["email_verified"] == "true" ? c["email"] : std::string(), s->admin,

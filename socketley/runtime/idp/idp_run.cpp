@@ -80,6 +80,10 @@ constexpr std::string_view family_prefix = "rt.";
 constexpr int64_t ssh_auth_secs = 12 * 3600;
 // Why a change that waited on a field still holding a value was not made.
 constexpr std::string_view changed_meanwhile = "the account changed meanwhile";
+// A session signed out on its own, a field each, so.<sid> holding when it would have expired; past the most an
+// account keeps, a sign-out ends all of its sessions instead.
+constexpr std::string_view signed_out_prefix = "so.";
+constexpr size_t  max_signed_out = 32;
 
 std::string peer_text(const sockaddr_storage& a)
 {
@@ -136,6 +140,39 @@ field_list stale_families(const account& who, int64_t now)
     std::sort(live.begin(), live.end());
     for (size_t i = 0; i + max_families <= live.size(); ++i)
         out.emplace_back(live[i].second, "");
+    return out;
+}
+
+// The fields that sign the session naming `sid` out until `exp`, those signed out before that have expired let go; for
+// a session that names no sid it can be known by, or past the most an account keeps, every session ends instead.
+field_list sign_out_fields(const account& who, std::string_view sid, int64_t exp, int64_t now)
+{
+    field_list out;
+    size_t live = 0;
+    for (const auto& [k, v] : who.fields)
+    {
+        if (!k.starts_with(signed_out_prefix))
+            continue;
+        int64_t until = 0;
+        std::from_chars(v.data(), v.data() + v.size(), until);
+        if (until <= now)
+            out.emplace_back(k, "");
+        else
+            ++live;
+    }
+    const bool named = !sid.empty() && sid.size() <= 32 && std::all_of(sid.begin(), sid.end(), [](char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    });
+    if (named && live < max_signed_out)
+    {
+        out.emplace_back(std::string(signed_out_prefix) + std::string(sid), std::to_string(exp));
+        return out;
+    }
+    out.clear();
+    for (const auto& [k, v] : who.fields)
+        if (k.starts_with(signed_out_prefix))
+            out.emplace_back(k, "");
+    out.emplace_back("revoked_before", std::to_string(wall::now_ms()));
     return out;
 }
 
@@ -650,7 +687,9 @@ const account* idp_run::session_of(const request& rq, int64_t* auth_time) const
         if (!m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, v, now, c, why) || claim(c, "aud") != "session")
             return false;
         const account* a = m_accounts.by_id(claim(c, "sub"));
-        if (a && !a->disabled() && a->field("reset") != "1" && still_signed_in(*a, issued_ms(c)))
+        const std::string sid = claim(c, "sid");
+        if (a && !a->disabled() && a->field("reset") != "1" && still_signed_in(*a, issued_ms(c)) &&
+            (sid.empty() || a->field(std::string(signed_out_prefix) + sid).empty()))
         {
             found = a;
             if (auth_time)
@@ -673,7 +712,8 @@ std::string idp_run::session_cookie(const account& who, bool remember) const
                              (email_trusted(who) ? "true" : "false") + ",\"admin\":" +
                              (who.in_group("admins") ? "true" : "false") + ",\"iat\":" + std::to_string(now) +
                              ",\"iat_ms\":" + std::to_string(wall::now_ms()) +
-                             ",\"auth_time\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + life);
+                             ",\"auth_time\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + life) +
+                             ",\"sid\":" + socketley::json::quote(socketley::random_hex(12));
     std::string h = "Set-Cookie: " + std::string(session_cookie_name) + "=" + sign_token(m_key, m_kid, "session+jwt", body) +
                     "; Path=/; HttpOnly; SameSite=Lax";
     if (remember)
@@ -2335,17 +2375,54 @@ void idp_run::logout(const std::shared_ptr<conn>& c, const request& rq)
     for (const auto& cl : m_clients)
         if (cl.allows(to))
             known = true;
+    std::string loc;
     if (!to.empty() && (known || return_allowed(to, m_issuer, m_cookie_domain)))
     {
         const std::string_view state = param(p, "state");
-        std::string loc(to);
+        loc.assign(to);
         if (!state.empty())
             loc += std::string(to.find('?') == std::string_view::npos ? "?" : "&") + "state=" + url_encode(state);
-        redirect(c, loc, clear_cookie());
+    }
+    std::weak_ptr<conn> weak = c;
+    const auto answer = [this, weak, loc] {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        const bool waited = cc->waiting;
+        cc->waiting = false;
+        if (!loc.empty())
+            redirect(cc, loc, clear_cookie());
+        else
+            respond(cc, 200, "text/html; charset=utf-8",
+                    page("Signed out", "<h1>Signed out</h1><p class=\"mut\">You can close this page.</p>"), clear_cookie());
+        if (waited)
+            m_http.resume(cc);
+    };
+    // The sessions the browser sends end here and at every runtime, so a copy of the cookie kept elsewhere ends too.
+    std::vector<std::pair<std::string, field_list>> ending;
+    const int64_t now = wall::now_sec();
+    http::for_each_cookie(rq.cookie, session_cookie_name, [&](std::string_view v) {
+        claims cl;
+        std::string why;
+        if (m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, v, now, cl, why) && claim(cl, "aud") == "session")
+            if (const account* a = m_accounts.by_id(claim(cl, "sub")))
+                ending.emplace_back(a->id, sign_out_fields(*a, claim(cl, "sid"), claim_int(cl, "exp"), now));
+        return false;
+    });
+    if (ending.empty())
+    {
+        answer();
         return;
     }
-    respond(c, 200, "text/html; charset=utf-8",
-            page("Signed out", "<h1>Signed out</h1><p class=\"mut\">You can close this page.</p>"), clear_cookie());
+    c->waiting = true;
+    auto left = std::make_shared<size_t>(ending.size());
+    for (auto& [id, fields] : ending)
+        update_account(id, std::move(fields), [this, left, answer](bool ok, const std::string& why) {
+            if (!ok)
+                LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": a sign-out was not kept: " + why).c_str());
+            if (--*left == 0)
+                answer();
+        });
 }
 
 void idp_run::home(const std::shared_ptr<conn>& c, const request& rq)
@@ -3376,6 +3453,9 @@ bool idp_run::publish_standing()
         s.admin = a->in_group("admins");
         s.disabled = a->disabled();
         s.reset = a->field("reset") == "1";
+        for (const auto& [k, v] : a->fields)
+            if (k.starts_with(signed_out_prefix) && k.size() > signed_out_prefix.size())
+                s.ended.push_back(k.substr(signed_out_prefix.size()));
         append_standing(doc, a->id, s);
     }
     if (doc != m_standing)

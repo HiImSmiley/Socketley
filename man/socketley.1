@@ -12549,10 +12549,16 @@ a storage with
 and the dashboard with
 .B daemon.dashboard_idp
 verify themselves against the key it publishes beside its state, each session
-once until it expires. A session ended at the provider \(em signed out
-everywhere, the account disabled \(em therefore ends there at once and at
-those at the session's expiry, at most twelve hours, a month for one kept
-signed in.
+once until it expires, and against each account's standing it publishes there
+too. A session ended at the provider \(em signed out at
+.BR /logout ,
+signed out everywhere, the account disabled \(em therefore ends there at once
+and at those within a second.
+.B /logout
+ends the session the browser sends, a copy of its cookie with it, and keeps
+the account's others; past 32 sessions signed out this way within their
+lifetimes, or for a cookie from a build before this one, a sign-out ends all of
+them and the account's refresh tokens, as signing out everywhere does.
 .TP
 .BI "\-\-clients " file
 The applications that sign in through it, one a line:

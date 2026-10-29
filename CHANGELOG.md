@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Signing out at the idp ends the session, not only its cookie.** `/logout`
+  cleared the browser's cookie and nothing else, so a copy of it, kept by
+  whoever had taken it, went on signing in at the provider and every proxy,
+  storage and dashboard for up to a month; the session is now ended at the
+  provider and, by the standing it publishes, everywhere it is taken, the
+  account's other sessions kept.
 - **A person's tunnel link ends when the idp takes the sign-in back.** The
   edge checked the access token once, when the link was opened, and kept
   its admin bit as it was then, so an account signed out everywhere,

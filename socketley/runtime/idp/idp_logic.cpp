@@ -633,6 +633,8 @@ void append_standing(std::string& out, std::string_view id, const standing& s)
         out += 'r';
     if (out.size() == flags)
         out += '-';
+    for (const std::string& sid : s.ended)
+        out.append(" ").append(sid);
     out += '\n';
 }
 
@@ -658,7 +660,20 @@ bool parse_standing(std::string_view text, standing_table& out)
         const auto [end, ec] = std::from_chars(line.data() + a + 1, line.data() + b, s.revoked_before);
         if (ec != std::errc{} || end != line.data() + b)
             return false;
-        for (const char f : line.substr(b + 1))
+        const size_t c = line.find(' ', b + 1);
+        if (c != std::string_view::npos)
+            for (std::string_view rest = line.substr(c + 1);;)
+            {
+                const size_t sp = rest.find(' ');
+                const std::string_view sid = rest.substr(0, sp);
+                if (sid.empty())
+                    return false;
+                s.ended.emplace_back(sid);
+                if (sp == std::string_view::npos)
+                    break;
+                rest.remove_prefix(sp + 1);
+            }
+        for (const char f : line.substr(b + 1, c == std::string_view::npos ? c : c - b - 1))
         {
             if (f == 'a')
                 s.admin = true;
@@ -669,7 +684,7 @@ bool parse_standing(std::string_view text, standing_table& out)
             else if (f != '-')
                 return false;
         }
-        read.insert_or_assign(std::string(line.substr(0, a)), s);
+        read.insert_or_assign(std::string(line.substr(0, a)), std::move(s));
     }
     out = std::move(read);
     return true;
