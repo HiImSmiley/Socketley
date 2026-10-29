@@ -228,6 +228,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   came from a Mersenne Twister seeded with 32 bits, whose few outputs in one
   `auto-` identity let a client work out the identities given to others next
   and take over a session one of them kept.
+- **A condition on another account's document says nothing of it.** In an
+  owner collection a write with `If-Match` or `If-None-Match: *` to a document
+  another account holds was answered 412 with its version, or that it exists,
+  before the account was judged; it is now answered 404 as a plain write is.
 - **A presigned request is its signer's however it spells the signing
   parameters.** A URL whose `X-Amz-Algorithm` (or V2 `AWSAccessKeyId`) name was
   percent-encoded was verified with the signer's key but then judged as

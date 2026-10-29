@@ -1849,6 +1849,10 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         auto it = c->docs.find(op.id);
         // A document whose time came is gone, whatever the deletion that says so has not yet done.
         const doc* old = it == c->docs.end() || expired(it->second) ? nullptr : &it->second;
+        // Another's document is refused before any condition is judged, so a condition says nothing of its version.
+        if (who.kind == principal::user && old && old->owner != who.sub)
+            return refuse(a == access::owner ? fail(404, "not_found", "no such document")
+                                             : fail(403, "not_yours", "the document is another account's"));
         if (op.if_absent && old)
             return refuse(fail(412, "exists", "the document exists"));
         if (op.if_v && (!old || old->v != op.if_v))
@@ -1859,9 +1863,6 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
             return refuse(fail(404, "not_found", "no such document"));
         if (first && &op == &ops.front())
             *first = first_change{old != nullptr, old ? old->v + 1 : 1};
-        if (who.kind == principal::user && old && old->owner != who.sub)
-            return refuse(a == access::owner ? fail(404, "not_found", "no such document")
-                                             : fail(403, "not_yours", "the document is another account's"));
         const std::string key = staged_key(op.coll, op.id);
         if (std::none_of(undos.begin(), undos.end(), [&](const undo& u) { return u.c == c && u.id == op.id; }))
             undos.push_back({c, op.coll, op.id, it != c->docs.end(), it != c->docs.end() ? it->second : doc{}});
