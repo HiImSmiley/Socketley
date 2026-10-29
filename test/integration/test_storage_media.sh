@@ -20,6 +20,7 @@
 #     segments, holding its shard in the loop that writes the playlist
 #   * an info or a playlist answered 304 to the tag of a binary that wrote less in
 #     it, so a browser keeps showing what the binary before said
+#   * an object that is an HLS playlist making ffmpeg open a URL it names
 # suite: isolated
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -416,6 +417,32 @@ for _ in $(seq 1 30); do [ "$(ls "$T/media/.media" | grep -c '^[0-9a-f]\{64\}$')
 check "and is all the cache keeps" "$(ls "$T/media/.media" | grep -c '^[0-9a-f]\{64\}$')" 1
 check "a thumbnail it pushed out is made again" "$(get "$T/t1d.jpg" -u "$A" "$U/~media/thumb-256/films/clip.mp4")" 200
 check "as it was" "$(cmp -s "$T/t1.jpg" "$T/t1d.jpg" && echo same)" same
+
+# An object that is an HLS playlist is no medium, read over the listener as an encrypted one is: ffmpeg opens no URL
+# it names, on this host or another.
+PS2=$((SL_PORT_BASE + 1906)); PL=$((SL_PORT_BASE + 1907)); U2="http://127.0.0.1:$PS2"
+head -c 32 /dev/urandom > "$T/sse.key"; chmod 600 "$T/sse.key"
+"$BIN" create storage msse -p "$PS2" --dir "$T/msse" --anonymous --sse-key-file "$T/sse.key" -s >/dev/null 2>&1
+for _ in $(seq 1 100); do [ "$(code "$U2/")" != 000 ] && break; sleep 0.1; done
+python3 - "$PL" "$T/fetched" <<'PY' &
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
+while True:
+    c, _ = s.accept()
+    with open(sys.argv[2], "a") as f:
+        f.write("asked\n")
+    c.close()
+PY
+LISTENER=$!
+trap 'kill $LISTENER 2>/dev/null; daemon_stop' EXIT
+printf '#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nhttp://127.0.0.1:%s/x.ts\n#EXT-X-ENDLIST\n' "$PL" > "$T/x.m3u8"
+code -X PUT "$U2/films" >/dev/null
+check "a playlist is stored encrypted" \
+      "$(code -X PUT -H 'x-amz-server-side-encryption: AES256' -H 'Content-Type: application/vnd.apple.mpegurl' \
+              --data-binary @"$T/x.m3u8" "$U2/films/x.m3u8")" 200
+check "its thumbnail is 415" "$(code "$U2/~media/thumb-128/films/x.m3u8")" 415
+check "and ffmpeg opened no URL it names" "$(cat "$T/fetched" 2>/dev/null | wc -l)" 0
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

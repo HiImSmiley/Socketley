@@ -92,6 +92,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the one on DATA; past 400 such resets in ten seconds the connection now ends
   with GOAWAY ENHANCE_YOUR_CALM, and a session that leaves 4 MiB unread is
   closed.
+- **ffmpeg opens no URL an object names.** A thumbnail of an object that was
+  an HLS playlist, read over the listener as an encrypted, compressed or
+  tiered one is, made ffmpeg GET every segment URL it listed, on any host:
+  a blind request from the storage host to its own network. ffmpeg and
+  ffprobe now take only the protocol of their input and the demuxers of one
+  file.
 - **A storage interface cookie signed out stays signed out.** Its times
   were read with `strtoll`, so `+`, a leading zero or a blank spelled the
   same cookie another way: the seal still held, and the sign-out's mark,

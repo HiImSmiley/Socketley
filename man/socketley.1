@@ -11089,7 +11089,8 @@ through a link. ffmpeg, and ffprobe beside it, read an unencrypted object's file
 directly, kept open by the shard for a minute, and any other over the runtime's
 own listener with an address signed by a key in
 .IR dir /.media/key
-for that version of it, and what they made lies in
+for that version of it, by a demuxer of one file and never one that opens a URL
+the object names (HLS, DASH, concat), and what they made lies in
 .IR dir /.media/
 under the variant, the object's key and its ETag, so a new version is made anew
 and every shard serves what one made; one thumbnail is made once however many

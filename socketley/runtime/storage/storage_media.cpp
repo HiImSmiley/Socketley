@@ -295,6 +295,15 @@ std::string ffprobe_path(const std::string& ffmpeg)
     return search_path("ffprobe");
 }
 
+// The demuxers an object is read with, each of one file, so that none (hls, dash, concat, imf, vobsub) opens a URL the
+// object names.
+constexpr std::string_view media_formats =
+    "mov,matroska,avi,flv,mpegts,mpeg,mpegvideo,asf,ogg,mxf,dv,rm,nut,ivf,obu,h264,hevc,m4v,mjpeg,yuv4mpegpipe,wtv,"
+    "mp3,aac,ac3,eac3,dts,dtshd,truehd,mlp,flac,wav,w64,aiff,caf,au,amr,ape,wv,mpc,mpc8,tta,tak,shn,dsf,iff,gsm,loas,"
+    "voc,xwma,qoa,image2,apng,gif,jpeg_pipe,png_pipe,webp_pipe,bmp_pipe,tiff_pipe,jpegxl_pipe,jpegxl_anim,j2k_pipe,"
+    "psd_pipe,qoi_pipe,dpx_pipe,exr_pipe,pam_pipe,pbm_pipe,pgm_pipe,ppm_pipe,srt,ass,webvtt,microdvd,subviewer,"
+    "subviewer1,mpl2,sami,realtext,jacosub,pjs,vplayer,aqtitle,stl,lrc,scc";
+
 // The key of <dir>/.media/key, made by whichever shard comes first, and read by the others.
 std::string media_key(const std::string& media_dir)
 {
@@ -1797,10 +1806,13 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                hmac_sha256_hex(m_media_key, w.bucket + '\n' + w.key + '\n' + etag + '\n' + std::to_string(expires));
     }
 
+    // What ffmpeg may open is the one input it is given, read by a demuxer that opens nothing the object names.
+    const std::vector<std::string> fenced = {"-protocol_whitelist", src_fd >= 0 ? "file,subfile" : "http,https,tls,tcp",
+                                             "-format_whitelist", std::string(media_formats)};
+    std::vector<std::string> input = fenced;
     // Reads over the listener survive a pause long enough for it to let them go; a file's need nothing of the sort.
-    std::vector<std::string> input;
     if (src_fd < 0)
-        input = {"-reconnect", "1", "-reconnect_on_network_error", "1"};
+        input.insert(input.end(), {"-reconnect", "1", "-reconnect_on_network_error", "1"});
     input.insert(input.end(), {"-i", url});
     // As many encoder threads as cores, rather than x264's half again as many, when several jobs share them.
     const std::string threads = std::to_string(std::max(1u, std::thread::hardware_concurrency()));
@@ -1907,6 +1919,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                     "-show_chapters", "-show_frames", "-read_intervals", "%+#1"};
             if (args.front().empty())
                 return false;
+            args.insert(args.end(), fenced.begin(), fenced.end());
             if (src_fd < 0)
                 args.insert(args.end(), {"-reconnect", "1"});
             args.push_back(url);
