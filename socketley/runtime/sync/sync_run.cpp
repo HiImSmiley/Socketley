@@ -218,6 +218,20 @@ bool read_sync_credentials(const std::string& path, sync_credentials& out, std::
         why = path + ": " + std::strerror(errno);
         return false;
     }
+    // Asked of the descriptor read, so the file judged is the file whose secret is used.
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        ::close(fd);
+        why = path + " is not a regular file";
+        return false;
+    }
+    if ((st.st_mode & 0077) != 0)
+    {
+        ::close(fd);
+        why = path + " may be read by other users; chmod 600 it";
+        return false;
+    }
     std::string text;
     char buf[4096];
     for (;;)

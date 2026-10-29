@@ -172,6 +172,11 @@ std::string sync_instance::config_refusal() const
         return "sync: --credentials is required: a sync signs every request it makes\n";
     if (::access(m_credentials.c_str(), R_OK) != 0)
         return "sync: the credentials file " + m_credentials + " cannot be read\n";
+    // Refused as the SSE key file is, since the secret in it signs as the storage user to anyone who reads it.
+    if (struct stat cst{}; ::stat(m_credentials.c_str(), &cst) != 0 || !S_ISREG(cst.st_mode))
+        return "sync: the credentials file " + m_credentials + " is not a regular file\n";
+    else if ((cst.st_mode & 0077) != 0)
+        return "sync: the credentials file " + m_credentials + " may be read by other users; chmod 600 it\n";
     if (!get_listen_path().empty())
         return "sync: --listen unix: is not served; a sync listens on nothing\n";
     if (get_port() != 0)

@@ -70,6 +70,7 @@ st() { "$BIN" stats "$1" 2>/dev/null | sed -n "s/^$2://p"; }
 # Waits up to $1 seconds for the keys of bucket $2 to be $3.
 until_keys() { local i; for i in $(seq 1 "$1"); do [ "$(keys "$2")" = "$3" ] && return 0; sleep 0.5; done; return 1; }
 printf 'access_key = %s\nsecret_key = %s\n' "$KEY" "$SEC" > "$T/creds"
+chmod 600 "$T/creds"
 
 printf 'a\n' > "$T/src/a.txt"
 printf 'b\n' > "$T/src/sub/b.txt"
@@ -97,6 +98,10 @@ if command -v openssl >/dev/null 2>&1; then
         "$("$BIN" create sync bad --dir "$T/src" --storage tlsbox/photos --credentials "$T/creds" 2>&1 | grep -c 'serves TLS itself')" 1
     "$BIN" remove tlsbox >/dev/null 2>&1
 fi
+# The secret in it signs as the storage's user for whoever reads it.
+chmod 644 "$T/creds"
+expect "and a credentials file other users may read" "$(refused "box/photos" 'may be read by other users; chmod 600 it')" 1
+chmod 600 "$T/creds"
 expect "none of them was made" "$("$BIN" ls 2>/dev/null | grep -c ' bad ')" 0
 
 # ─── watched rather than walked ─────────────────────────────────────────────
@@ -232,6 +237,7 @@ expect "and once the bucket is there it carries, and the alert clears" "$(al) $(
 
 # Credentials put right in their file are used at the next walk, which the refusal itself asks for.
 printf 'access_key = %s\nsecret_key = wrongwrongwrongwrongwrongwrong00\n' "$KEY" > "$T/rot.creds"
+chmod 600 "$T/rot.creds"
 "$BIN" create sync rot --dir "$T/src" --storage box/rot --credentials "$T/rot.creds" -s >/dev/null 2>&1
 S -o /dev/null -X PUT "http://127.0.0.1:$P/rot"
 for _ in $(seq 1 30); do [ -n "$(st rot last_error)" ] && break; sleep 0.5; done

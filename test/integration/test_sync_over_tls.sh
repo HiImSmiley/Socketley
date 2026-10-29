@@ -44,6 +44,7 @@ S() { curl -s -m 30 --cacert "$T/c.pem" --user "$KEY:$SEC" --aws-sigv4 'aws:amz:
 for _ in $(seq 1 50); do S -o /dev/null "https://localhost:$P/" && break; sleep 0.1; done
 S -o /dev/null -X PUT "https://localhost:$P/far"
 printf 'access_key = %s\nsecret_key = %s\n' "$KEY" "$SEC" > "$T/creds"
+chmod 600 "$T/creds"
 
 mkdir -p "$T/src"
 head -c $((200*1024*1024)) /dev/urandom > "$T/src/big.bin"

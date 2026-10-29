@@ -58,6 +58,7 @@ cat > "$T/creds" <<EOF
 access_key = $KEY
 secret_key = $SEC
 EOF
+chmod 600 "$T/creds"
 
 # What the storage has before the job starts, and what this side has.
 put docs/from-storage.txt "storage"

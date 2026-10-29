@@ -71,6 +71,7 @@ cat > "$T/creds" <<EOF
 access_key = $KEY
 secret_key = $SEC
 EOF
+chmod 600 "$T/creds"
 
 # ─── what create refuses ────────────────────────────────────────────────────
 expect "a sync with no --dir is refused" \
@@ -138,6 +139,7 @@ expect "a host and a port carry as a runtime's name does" "$(S "http://127.0.0.1
 
 # ─── credentials the storage refuses ────────────────────────────────────────
 sed "s/$SEC/wrongsecretwrongsecretwrongsec00/" "$T/creds" > "$T/bad.creds"
+chmod 600 "$T/bad.creds"
 mkdir -p "$T/src3" && printf 'x\n' > "$T/src3/e.txt"
 "$BIN" create sync no --dir "$T/src3" --storage "box/photos" --credentials "$T/bad.creds" --every 2s -s >/dev/null 2>&1
 # An empty answer is a runtime that has not started yet, not a failure count of none.

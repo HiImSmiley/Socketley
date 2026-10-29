@@ -163,6 +163,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate in it was an anchor and no name was checked, so any leaf the
   same public intermediate signed took the credentials; now the peer must
   show the file's first certificate.
+- **A sync's credentials file must be its owner's alone.** A `--credentials`
+  file other users could read, as one written under umask 022 is, was taken
+  without a word, and its secret signs as the storage's user for anyone on the
+  machine. Such a file is now refused at create, at start and at every read,
+  with `chmod 600 it`, as the storage's SSE key file already is.
 - **A sync acts on no listing that says it is incomplete.** A storage that
   answered `IsTruncated` true with no continuation token, as one speaking
   ListObjects V1 does after 1000 keys, was taken as the whole bucket, and every

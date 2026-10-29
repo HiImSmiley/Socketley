@@ -12285,7 +12285,10 @@ and
 .B region
 when they are wanted, and
 .B #
-beginning a comment. Required, since a sync signs every request it makes.
+beginning a comment. Required, since a sync signs every request it makes. A
+file other users may read is refused, at create and at every read:
+.B chmod 600
+it.
 .TP
 .BI "\-\-prefix " key
 The key everything is written under, below the bucket; without the flag it is
