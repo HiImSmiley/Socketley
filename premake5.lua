@@ -2633,10 +2633,11 @@ project "test_persist"
         "socketley"
     }
 
-    links { "dl" }
+    links { "dl", "crypto" }
 
     files { "test/unit/test_persist.cpp", "socketley/shared/persist/tar_archive.cpp", "socketley/shared/util/deflate.cpp",
-            "socketley/shared/util/inflate.cpp", "socketley/shared/util/crc.cpp" }
+            "socketley/shared/util/inflate.cpp", "socketley/shared/util/crc.cpp",
+            "socketley/shared/crypto/key_file.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

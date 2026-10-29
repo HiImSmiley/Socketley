@@ -348,6 +348,11 @@ int cli_export_full(int argc, char** argv)
     }
     const socketley_paths paths = socketley_paths::resolve();
     const fs::path state = paths.state_dir;
+    if (!paths.state_dir_refusal.empty())
+    {
+        std::cout << paths.state_dir_refusal << "\n";
+        return 2;
+    }
     if (::access(state.c_str(), R_OK | X_OK) != 0)
     {
         std::cout << "the state directory " << state.string() << " cannot be read: run as root or as the daemon's user\n";
@@ -586,6 +591,11 @@ int cli_restore(int argc, char** argv)
     // This machine's state and config directories are restore's to write; what else the manifest names, only where it
     // is no system's.
     const socketley_paths here = socketley_paths::resolve();
+    if (!here.state_dir_refusal.empty())
+    {
+        std::cout << "restore: " << here.state_dir_refusal << "\n";
+        return 2;
+    }
     const fs::path state = clean(here.state_dir);
     const fs::path config_dir = here.config_path.empty() ? fs::path() : clean(here.config_path.parent_path());
     const auto local = [&](const fs::path& p) {

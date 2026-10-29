@@ -1,8 +1,10 @@
 #include "paths.h"
+#include "private_dir.h"
 #include "../util/settings.h"
 #include <unistd.h>
 #include <pwd.h>
 #include <cstdlib>
+#include <string>
 
 namespace fs = std::filesystem;
 
@@ -46,6 +48,7 @@ static std::string socket_key(const fs::path& sock)
 socketley_paths socketley_paths::resolve()
 {
     socketley_paths p;
+    bool in_tmp = false;
 
     // A development affordance for several daemons in one namespace, not how
     // clustering works.
@@ -82,6 +85,7 @@ socketley_paths socketley_paths::resolve()
         p.socket_path = "/tmp/socketley.sock";
 
         fs::path home = get_home();
+        in_tmp = home.empty();
         if (!home.empty())
         {
             p.state_dir   = home / ".local" / "share" / "socketley" / "runtimes";
@@ -91,12 +95,13 @@ socketley_paths socketley_paths::resolve()
         }
         else
         {
-            p.state_dir   = "/tmp/socketley-runtimes";
+            p.state_dir   = "/tmp/socketley-runtimes-" + std::to_string(uid);
             p.config_path.clear();
         }
 
         std::error_code ec;
-        fs::create_directories(p.state_dir, ec);
+        if (!in_tmp)
+            fs::create_directories(p.state_dir, ec);
 
         // If system daemon is running and socket is accessible, prefer it
         if (installed && access("/run/socketley/socketley.sock", R_OK | W_OK) == 0)
@@ -126,9 +131,16 @@ socketley_paths socketley_paths::resolve()
         {
             p.legacy_state_dir = p.state_dir;
             p.state_dir += "." + socket_key(want);
-            fs::create_directories(p.state_dir, ec);
+            if (!in_tmp)
+                fs::create_directories(p.state_dir, ec);
         }
     }
+
+    if (in_tmp && !socketley::private_dir(p.state_dir.string(), true))
+        p.state_dir_refusal = "the state directory " + p.state_dir.string() +
+                              " is not this user's alone; remove it or set HOME";
+    if (in_tmp && !p.legacy_state_dir.empty() && !socketley::private_dir(p.legacy_state_dir.string(), false))
+        p.legacy_state_dir.clear();
 
     return p;
 }

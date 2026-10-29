@@ -120,6 +120,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lockout, and skipped SPF, DMARC, DNSBL and greylisting. A TCP visitor now
   comes from 127.0.0.2; an HTTP service, behind the entrance, still from
   127.0.0.1.
+- **Without a home directory the state lies in a /tmp folder of the user's
+  own.** The fallback was one shared `/tmp/socketley-runtimes`, which another
+  user could make first and so read the runtimes' secrets and the ACME keys
+  in it, or plant a link where a key was about to be written; it is now
+  `/tmp/socketley-runtimes-<uid>`, made 0700 and refused by the daemon,
+  export and restore when it is anybody else's or open to them. A key's
+  scratch file is made new and never through a link.
 - **git-sync trusts only the storage runtime's own certificate.** With
   `--ca` naming a fullchain file, as an `--acme` storage hands it, every
   certificate in it was an anchor and no name was checked, so any leaf the

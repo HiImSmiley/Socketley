@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../persist/private_dir.h"
 #include "../runtime/runtime_definitions.h"
 #include "../util/settings.h"
 
@@ -171,18 +172,7 @@ inline std::vector<std::string> companion_paths(std::string_view daemon_socket,
 // before this one was in.
 inline bool secure_node_dir(const std::string& dir)
 {
-    if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
-        return false;
-
-    // lstat and not stat: a symlink here would point the check at one
-    // directory and the bind at another.
-    struct stat st{};
-    if (::lstat(dir.c_str(), &st) < 0)
-        return false;
-
-    return S_ISDIR(st.st_mode)
-        && st.st_uid == ::geteuid()
-        && (st.st_mode & (S_IRWXG | S_IRWXO)) == 0;
+    return socketley::private_dir(dir, true);
 }
 
 // The directory `path` belongs in, or empty.

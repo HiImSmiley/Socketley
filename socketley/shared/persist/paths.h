@@ -26,5 +26,8 @@ struct socketley_paths
     // legacy directory is decided by whoever serves it rather than by disk.
     std::filesystem::path default_socket_path;
 
+    // Why state_dir must not be used, empty when it may: a /tmp fallback another user made or can reach.
+    std::string state_dir_refusal;
+
     static socketley_paths resolve();
 };

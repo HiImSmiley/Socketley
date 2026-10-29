@@ -43,7 +43,8 @@ EVP_PKEY* load_or_make(const std::string& path, std::string_view what, EVP_PKEY*
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
     // Written beside and linked into place whole, so a failure leaves no empty or cut key that would never load.
     const std::string tmp = path + ".new." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    ::unlink(tmp.c_str());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     FILE* f = fd >= 0 ? fdopen(fd, "w") : nullptr;
     bool ok = k && f && PEM_write_PrivateKey(f, k, nullptr, nullptr, 0, nullptr, nullptr) == 1 && fflush(f) == 0 &&
               ::fsync(fd) == 0;

@@ -755,6 +755,11 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Resolve paths (system vs dev mode)
     auto paths = socketley_paths::resolve();
+    if (!paths.state_dir_refusal.empty())
+    {
+        std::cout << paths.state_dir_refusal << "\n";
+        return 2;
+    }
 
     // Set socket path for daemon_handler and ipc_client
     daemon_handler::socket_path = paths.socket_path.string();

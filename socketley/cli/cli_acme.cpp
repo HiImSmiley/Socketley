@@ -401,11 +401,13 @@ std::string stage(const std::string& path, const std::string& data, mode_t mode)
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
     const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    // Made new and never through a link, so a key goes into no file somebody else put at the name.
+    ::unlink(tmp.c_str());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
     if (fd < 0)
         return {};
     bool ok = ::fchmod(fd, mode) == 0;
-    ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size()) && ok;
+    ok = ok && ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
     ok = ::fsync(fd) == 0 && ok;
     ok = ::close(fd) == 0 && ok;
     if (!ok)

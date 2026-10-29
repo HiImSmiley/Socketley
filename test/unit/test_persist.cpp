@@ -13,7 +13,11 @@
 #include <thread>
 #include <vector>
 
+#include <openssl/evp.h>
+
+#include "shared/crypto/key_file.h"
 #include "shared/persist/file_stamp.h"
+#include "shared/persist/private_dir.h"
 #include "shared/persist/replaced_file.h"
 #include "shared/persist/tar_archive.h"
 #include "shared/util/deflate.h"
@@ -343,4 +347,51 @@ TEST_CASE("tar: an archive is made new, never into a file or through a link some
     CHECK(read(loot) == "theirs");
     CHECK(read((dir / "left.tar").string()) == "theirs");
     CHECK(std::filesystem::is_symlink(dir / "linked.tar"));
+}
+
+TEST_CASE("a directory is private only when it is this user's own, no link, and closed to group and others")
+{
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("skl-private-" + std::to_string(::getpid()));
+    dir_guard guard(dir.string());
+    std::filesystem::create_directories(dir);
+    const std::string made = (dir / "made").string();
+    CHECK_FALSE(socketley::private_dir(made, false));
+    CHECK(socketley::private_dir(made, true));
+    struct stat st{};
+    REQUIRE(::lstat(made.c_str(), &st) == 0);
+    CHECK((st.st_mode & 0777) == 0700);
+    const std::string open_dir = (dir / "open").string();
+    REQUIRE(::mkdir(open_dir.c_str(), 0700) == 0);
+    REQUIRE(::chmod(open_dir.c_str(), 0755) == 0);
+    CHECK_FALSE(socketley::private_dir(open_dir, true));
+    std::filesystem::create_symlink(made, dir / "link");
+    CHECK_FALSE(socketley::private_dir((dir / "link").string(), true));
+    CHECK_FALSE(socketley::private_dir("/", false));
+}
+
+TEST_CASE("a key is made beside its place in a file of its own, never through a link left at the scratch name")
+{
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("skl-keyfile-" + std::to_string(::getpid()));
+    dir_guard guard(dir.string());
+    std::filesystem::create_directories(dir);
+    const std::string loot = (dir / "loot").string();
+    {
+        FILE* fp = std::fopen(loot.c_str(), "wb");
+        REQUIRE(fp);
+        std::fclose(fp);
+    }
+    const std::string path = (dir / "key.pem").string();
+    std::filesystem::create_symlink(loot, path + ".new." + std::to_string(::getpid()));
+    std::string err;
+    EVP_PKEY* k = socketley::key_file::load_or_make(path, "test key", +[]() -> EVP_PKEY* {
+        return EVP_PKEY_Q_keygen(nullptr, nullptr, "ED25519");
+    }, err);
+    CHECK(k);
+    EVP_PKEY_free(k);
+    CHECK(std::filesystem::file_size(loot) == 0);
+    CHECK_FALSE(std::filesystem::is_symlink(path));
+    CHECK(read(path).find("PRIVATE KEY") != std::string::npos);
+    struct stat st{};
+    REQUIRE(::lstat(path.c_str(), &st) == 0);
+    CHECK((st.st_mode & 0777) == 0600);
 }
