@@ -49,6 +49,8 @@ struct device_entry
     int64_t expires{0};
     // When the device may ask again without being told to slow down.
     int64_t next_poll{0};
+    // The address, or the IPv6 site, that asked for it, whose grants waiting are counted.
+    std::string from;
 };
 
 // What a poll of a device code comes to.

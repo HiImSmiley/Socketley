@@ -12,6 +12,7 @@
 #   * a grant kept by one shard and allowed or polled at another going astray
 #   * a sign-in or a device decision missing from the log
 #   * guessed client secrets at /token never barring the address
+#   * one address taking every device grant a shard keeps, as anyone may ask for one with no secret
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -103,6 +104,13 @@ check("the page it is allowed on", (a.get("verification_uri"), a.get("verificati
 check("and how long and how often", (a.get("expires_in"), a.get("interval")), (600, 5))
 others = [start()[1] for _ in range(grants)]
 refused = start()[1]
+# Anyone may ask for a grant, so one address holds twenty waiting at a shard and another is not held up by it.
+if runtime == "one":
+    many = [req("POST", "/device_authorization", {"client_id": "cli"}, headers={"X-Forwarded-For": "198.51.100.70"})[0]
+            for _ in range(21)]
+    check("twenty grants wait for one address, and the next is refused", many, [200] * 20 + [429])
+    st, _, _ = req("POST", "/device_authorization", {"client_id": "cli"}, headers={"X-Forwarded-For": "198.51.100.71"})
+    check("while another address gets one", st, 200)
 
 st, r = poll(a["device_code"])
 check("a code nobody allowed yet is pending", (st, r.get("error")), (400, "authorization_pending"))

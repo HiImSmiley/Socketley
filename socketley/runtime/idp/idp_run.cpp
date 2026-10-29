@@ -51,6 +51,8 @@ constexpr int64_t code_secs     = 60;
 constexpr int64_t device_secs   = 600;
 constexpr int64_t device_poll_s = 5;
 constexpr size_t  max_devices   = 10000;
+// Device grants one address, or one IPv6 site, may have waiting at a shard.
+constexpr uint32_t max_devices_from = 20;
 constexpr std::string_view device_grant = "urn:ietf:params:oauth:grant-type:device_code";
 constexpr int64_t token_secs    = 3600;
 constexpr int64_t refresh_secs  = 30 * 86400;
@@ -409,8 +411,7 @@ void idp_run::tick()
             ++it;
             continue;
         }
-        m_user_codes.erase(it->second.user_code);
-        it = m_devices.erase(it);
+        it = forget_device(it);
     }
     m_limits.age(now);
     if (!m_http.empty() || !m_codes.empty() || !m_limits.empty() || !m_devices.empty())
@@ -1806,6 +1807,18 @@ void idp_run::device_authorization(const std::shared_ptr<conn>& c, const request
         json_error(c, 503, "temporarily_unavailable", "too many device sign-ins are waiting; try again in a minute");
         return;
     }
+    // Asked for by anyone with no secret, so each address, or IPv6 site, may hold only a few of them.
+    const std::string ip = client_ip(*c, rq);
+    std::string from = network_key(ip);
+    if (from.empty())
+        from = address_key(ip);
+    if (const auto f = m_devices_from.find(from); f != m_devices_from.end() && f->second >= max_devices_from)
+    {
+        ++m_c.barred;
+        json_error(c, 429, "temporarily_unavailable", "too many device sign-ins are waiting from here; try again in a few "
+                                                      "minutes");
+        return;
+    }
     // A user code this shard keeps, so whichever shard the person's browser reaches can ask the right one.
     std::string user_code, normal;
     for (int i = 0; i < 256; ++i)
@@ -1832,8 +1845,10 @@ void idp_run::device_authorization(const std::shared_ptr<conn>& c, const request
     e.user_code = normal;
     e.expires = now + device_secs;
     e.next_poll = now;
+    e.from = from;
     m_devices.emplace(device_code, std::move(e));
     m_user_codes.emplace(normal, device_code);
+    ++m_devices_from[from];
     ++m_c.devices;
     arm_tick();
     const std::string page_url = m_issuer + "/device";
@@ -2149,8 +2164,7 @@ device_poll idp_run::poll_device(const std::string& device_code, std::string_vie
     device_entry& e = it->second;
     if (e.expires <= now)
     {
-        m_user_codes.erase(e.user_code);
-        m_devices.erase(it);
+        forget_device(it);
         return device_poll::gone;
     }
     if (e.state == device_entry::pending)
@@ -2166,9 +2180,18 @@ device_poll idp_run::poll_device(const std::string& device_code, std::string_vie
     }
     out = e;
     const device_poll what = e.state == device_entry::approved ? device_poll::approved : device_poll::denied;
-    m_user_codes.erase(e.user_code);
-    m_devices.erase(it);
+    forget_device(it);
     return what;
+}
+
+idp_run::device_map::iterator idp_run::forget_device(device_map::iterator it)
+{
+    // Its user code only while it is still this grant's, as one decided gives it up for another to take.
+    if (const auto u = m_user_codes.find(it->second.user_code); u != m_user_codes.end() && u->second == it->first)
+        m_user_codes.erase(u);
+    if (const auto f = m_devices_from.find(it->second.from); f != m_devices_from.end() && --f->second == 0)
+        m_devices_from.erase(f);
+    return m_devices.erase(it);
 }
 
 void idp_run::device_token(const std::shared_ptr<conn>& c, const client& cl, std::string device_code)

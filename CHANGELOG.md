@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **One address holds at most twenty waiting device sign-ins at the idp.**
+  `/device_authorization` asks a public client for no secret, so anyone
+  could fill the ten thousand grants a shard keeps and refuse every
+  `socketley login` for as long as they went on; an address, or an IPv6
+  /48, past twenty grants waiting is now told to try again later.
 - **The idp counts a mail runtime's wrong passwords at the account.** Its
   check for mail kept no count, so IMAP, POP3 and SMTP from the mail runtime's
   own machine, which mail does not guard, guessed an account's password as

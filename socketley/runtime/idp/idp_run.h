@@ -120,6 +120,9 @@ private:
                    std::function<void(bool)> then);
     void device_token(const std::shared_ptr<conn>& c, const client& cl, std::string device_code);
     void device_answered(const std::shared_ptr<conn>& c, const client& cl, device_poll what, const device_entry& e);
+    // A grant of this shard's let go of, with its user code and its count at the address that asked; the next one after.
+    using device_map = std::unordered_map<std::string, device_entry>;
+    device_map::iterator forget_device(device_map::iterator it);
     // This shard's own grants: a user code decided, and a device code polled.
     bool decide_device(const std::string& user_code, bool allow, const std::string& sub, int64_t at);
     device_poll poll_device(const std::string& device_code, std::string_view client_id, int64_t now,
@@ -306,8 +309,10 @@ private:
 
     std::unordered_map<std::string, code_entry> m_codes;
     // Device grants by device code, and each one's device code by its user code in normal form.
-    std::unordered_map<std::string, device_entry> m_devices;
+    device_map m_devices;
     std::unordered_map<std::string, std::string> m_user_codes;
+    // The grants waiting by the address or IPv6 site that asked for them, so one cannot take every one there is.
+    std::unordered_map<std::string, uint32_t> m_devices_from;
     // Failures by address and by account, and the attempts at each being checked.
     attempt_limits m_limits;
     // Password checks given to the hashing threads and not answered yet.
