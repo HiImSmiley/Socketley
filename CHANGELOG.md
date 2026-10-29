@@ -120,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lockout, and skipped SPF, DMARC, DNSBL and greylisting. A TCP visitor now
   comes from 127.0.0.2; an HTTP service, behind the entrance, still from
   127.0.0.1.
+- **git-sync trusts only the storage runtime's own certificate.** With
+  `--ca` naming a fullchain file, as an `--acme` storage hands it, every
+  certificate in it was an anchor and no name was checked, so any leaf the
+  same public intermediate signed took the credentials; now the peer must
+  show the file's first certificate.
 - **A presigned request is its signer's however it spells the signing
   parameters.** A URL whose `X-Amz-Algorithm` (or V2 `AWSAccessKeyId`) name was
   percent-encoded was verified with the signer's key but then judged as

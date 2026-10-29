@@ -21,7 +21,9 @@
 #include <unistd.h>
 
 #include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -290,9 +292,28 @@ private:
                 drop();
                 return false;
             }
+            if (!m_ca.empty() && !peer_is_own_leaf())
+            {
+                m_error = "the listener at " + m_host + ":" + m_port + " is not the runtime of " + m_ca;
+                drop();
+                return false;
+            }
         }
         m_in.clear();
         return true;
+    }
+    // Only the first certificate of --ca is the runtime's, as a fullchain file also holds an intermediate that signs for anyone.
+    bool peer_is_own_leaf() const
+    {
+        BIO* b = BIO_new_file(m_ca.c_str(), "r");
+        X509* own = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
+        if (b)
+            BIO_free(b);
+        X509* peer = SSL_get1_peer_certificate(m_ssl);
+        const bool same = own && peer && X509_cmp(own, peer) == 0;
+        X509_free(own);
+        X509_free(peer);
+        return same;
     }
     void drop()
     {

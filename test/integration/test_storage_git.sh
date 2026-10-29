@@ -197,6 +197,59 @@ kill $IMP 2>/dev/null
 [ "$rc" -ne 0 ] && ok "git-sync --tls without --ca refuses a certificate the system does not trust" \
     || bad "git-sync --tls without --ca refuses a certificate the system does not trust" "rc $rc: $out"
 expect "and sends it nothing" "$(grep -c "$ALICE_K" "$T/imp.log")" 0
+# With --ca a fullchain, a listener whose leaf the same intermediate signed is not the runtime either.
+listen_tls() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY' &
+import socket, ssl, sys
+port, crt, key, log = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(crt, key)
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", port)); s.listen(4)
+s.settimeout(20)
+while True:
+    try:
+        c, _ = s.accept()
+    except Exception:
+        break
+    try:
+        t = ctx.wrap_socket(c, server_side=True); t.settimeout(3)
+        open(log, "ab").write(t.recv(65536) or b"")
+        t.close()
+    except Exception:
+        pass
+PY
+    LIS=$!
+    for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && return 0; sleep 0.1; done
+    return 1
+}
+sync_to() {
+    SOCKETLEY_GIT_ACCESS_KEY=$ALICE_K SOCKETLEY_GIT_SECRET=$ALICE_S "$BIN" git-sync --url "git://127.0.0.1:$GP/demo.git" \
+        --branch main --work "$T/$2" --endpoint "127.0.0.1:$1" --tls --ca "$T/own.full" --bucket code --name demo >/dev/null 2>&1
+}
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=sync-intermediate" -days 1 \
+    -keyout "$T/mid.key" -out "$T/mid.crt" >/dev/null 2>&1
+for leaf in own other; do
+    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$leaf.example.org" \
+        -keyout "$T/$leaf.key" -out "$T/$leaf.csr" >/dev/null 2>&1
+    openssl x509 -req -in "$T/$leaf.csr" -CA "$T/mid.crt" -CAkey "$T/mid.key" -CAcreateserial -days 1 \
+        -out "$T/$leaf.crt" >/dev/null 2>&1
+    cat "$T/$leaf.crt" "$T/mid.crt" > "$T/$leaf.full"
+done
+TP2=$((P+6))
+: > "$T/other.log"
+listen_tls "$TP2" "$T/other.full" "$T/other.key" "$T/other.log" && ok "a listener with a sibling leaf listens" \
+    || bad "a listener with a sibling leaf listens" "no connect to $TP2"
+sync_to "$TP2" sibling; rc=$?
+kill $LIS 2>/dev/null; wait $LIS 2>/dev/null
+[ "$rc" -ne 0 ] && ok "git-sync --ca <fullchain> refuses a leaf the same intermediate signed" \
+    || bad "git-sync --ca <fullchain> refuses a leaf the same intermediate signed" "rc $rc"
+expect "and sends it nothing" "$(grep -c "$ALICE_K" "$T/other.log")" 0
+TP3=$((P+7))
+: > "$T/own.log"
+listen_tls "$TP3" "$T/own.full" "$T/own.key" "$T/own.log" || bad "a listener with the runtime's leaf listens" "no connect to $TP3"
+sync_to "$TP3" ownleaf
+kill $LIS 2>/dev/null; wait $LIS 2>/dev/null
+[ "$(grep -c "$ALICE_K" "$T/own.log")" -ge 1 ] && ok "the runtime's own leaf is still trusted and handed the request" \
+    || bad "the runtime's own leaf is still trusted and handed the request" "nothing reached it"
 left=$(bundles)
 # The runs' own, by their commit rather than their date, which is yesterday's for a run just before midnight.
 expect "the last day's bundles all stay, its own among them" "$(echo "$left" | grep '\.bundle$' | grep -vc '_0000000000\.bundle$')" 3
