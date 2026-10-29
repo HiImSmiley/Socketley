@@ -12556,7 +12556,10 @@ signed out everywhere, the account disabled \(em therefore ends there at once
 and at those within a second.
 .B /logout
 ends the session the browser sends, a copy of its cookie with it, and keeps
-the account's others; past 32 sessions signed out this way within their
+the account's others; one another site sent the browser to is asked about
+first, unless the application names the account by an
+.B id_token_hint
+it was given; past 32 sessions signed out this way within their
 lifetimes, or for a cookie from a build before this one, a sign-out ends all of
 them and the account's refresh tokens, as signing out everywhere does.
 .TP

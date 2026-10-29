@@ -69,6 +69,8 @@ private:
         // The page a browser says sent the request, Origin and else Referer, for a form posted from another site.
         std::string origin;
         std::string referer;
+        // Where a browser says the request came from: same-origin, same-site, cross-site or none.
+        std::string fetch_site;
     };
 
 

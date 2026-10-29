@@ -31,6 +31,7 @@
 #     or the admin bit of one taken out of admins since; or a code given before a sign-out redeemed after it
 #   * a cookie of an account renamed since still taken, carrying the old name another account may be given
 #   * a session signed out still taken from a copy of its cookie, or a sign-out ending the account's other sessions
+#   * another site's page signing its visitors out of the provider unasked
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -402,6 +403,21 @@ if phase == "main":
         time.sleep(0.1)
     check("nor at the proxy", at(P, "GET", "/gate/who", headers={"Accept": "application/json"}, cookie=one)[0], 401)
     check("while the account's other session holds", at(P, "GET", "/gate/who", cookie=dora)[0], 200)
+    # Another site's page sending a browser to sign out is asked about first, unless it names the account by an id token.
+    two = cookie_of(req("POST", "/login", dict(rd="/", username="dora", password="dorapassword1"))[2])
+    st, body, h = req("GET", "/logout?post_logout_redirect_uri=" + urllib.parse.quote(I + "/x", safe=""), cookie=two,
+                      headers={"Sec-Fetch-Site": "cross-site"})
+    check("a sign-out another site sent a browser to is asked about, nothing ended yet",
+          (st, "Sign out?" in body, 'name="post_logout_redirect_uri"' in body, h.get("Set-Cookie")), (200, True, True, None))
+    st, body, _ = req("POST", "/logout", {}, cookie=two, headers={"Origin": "https://evil.example"})
+    check("so is one another site's form posts", (st, "Sign out?" in body), (200, True))
+    check("and the session holds", req("GET", "/account", cookie=two)[0], 200)
+    check("asked here, it signs out", req("POST", "/logout", {}, cookie=two, headers={"Origin": I})[0], 200)
+    check("and the session is over", req("GET", "/account", cookie=two)[0], 302)
+    three = cookie_of(req("POST", "/login", dict(rd="/", username="alice", password="alicepassword1"))[2])
+    st, body, _ = req("GET", "/logout?id_token_hint=" + t.get("id_token", ""), cookie=three, headers={"Sec-Fetch-Site": "cross-site"})
+    check("an application naming the account by its id token signs it out at once", (st, "Signed out" in body), (200, True))
+    check("its session over", req("GET", "/account", cookie=three)[0], 302)
 
     # The dashboard: an admin of the idp signs in, an account that is none does not.
     M = "http://127.0.0.1:%s" % pm

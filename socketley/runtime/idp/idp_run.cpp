@@ -476,6 +476,8 @@ int idp_run::take_request(conn& c, request& rq, int& refusal)
             rq.origin.assign(value);
         else if (header_name_equals(f, "referer", 7))
             rq.referer.assign(value);
+        else if (header_name_equals(f, "sec-fetch-site", 14))
+            rq.fetch_site.assign(value);
     });
     if (r <= 0)
         return r;
@@ -2409,6 +2411,27 @@ void idp_run::logout(const std::shared_ptr<conn>& c, const request& rq)
                 ending.emplace_back(a->id, sign_out_fields(*a, claim(cl, "sid"), claim_int(cl, "exp"), now));
         return false;
     });
+    // A browser another site sent is asked first, unless the application names the account by an id token it was given
+    // (OpenID Connect RP-Initiated Logout), so a page elsewhere cannot sign its visitors out unasked.
+    const bool elsewhere = rq.fetch_site == "cross-site" ||
+                           !form_origin_allowed(rq.origin.empty() ? rq.referer : rq.origin, m_issuer, m_cookie_domain);
+    claims hint;
+    std::string hint_why;
+    if (elsewhere && !ending.empty() &&
+        !(m_verified.verify(m_key, m_kid, "JWT", m_issuer, param(p, "id_token_hint"), now, hint, hint_why) &&
+          std::any_of(ending.begin(), ending.end(), [&](const auto& e) { return e.first == claim(hint, "sub"); })))
+    {
+        std::string hidden;
+        for (const std::string_view name : {std::string_view("post_logout_redirect_uri"), std::string_view("state")})
+            if (const std::string_view v = param(p, name); !v.empty())
+                hidden += "<input type=\"hidden\" name=\"" + std::string(name) + "\" value=\"" + html_escape(v) + "\">";
+        const std::string host = m_cookie_domain.empty() ? url_host(m_issuer) : m_cookie_domain;
+        respond(c, 200, "text/html; charset=utf-8",
+                page("Sign out", "<h1>Sign out?</h1><p class=\"mut\">Another site sent you here to sign out of " +
+                                     html_escape(host) + ".</p><form method=\"post\" action=\"/logout\">" + hidden +
+                                     "<button class=\"btn pri\" type=\"submit\">Sign out</button></form>"));
+        return;
+    }
     if (ending.empty())
     {
         answer();

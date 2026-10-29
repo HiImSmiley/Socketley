@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Another site cannot sign a browser out of the idp unasked.** `/logout`
+  ended the browser's session for any page that sent it there, a link or an
+  image's worth; a request another site sent, by `Sec-Fetch-Site` or its
+  Origin or Referer, is now asked "Sign out?" first, unless the application
+  names the account by an `id_token_hint` it was given.
 - **Signing out at the idp ends the session, not only its cookie.** `/logout`
   cleared the browser's cookie and nothing else, so a copy of it, kept by
   whoever had taken it, went on signing in at the provider and every proxy,
