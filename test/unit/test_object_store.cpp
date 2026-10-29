@@ -1469,8 +1469,8 @@ TEST_CASE("prefix successor jumps over a whole rolled-up prefix even with high b
     tmpdir d;
     rig r(d.path);
     REQUIRE(r.make_bucket("bkt") == st::ok);
-    const std::string hi = std::string("a\xFF") + "/x";
-    for (const std::string& k : {std::string("a\xFF") + "/1", hi, std::string("a\xFF") + "/z",
+    const std::string hi = std::string("a\xF4\x8F\xBF\xBF") + "/x";
+    for (const std::string& k : {std::string("a\xF4\x8F\xBF\xBF") + "/1", hi, std::string("a\xF4\x8F\xBF\xBF") + "/z",
                                  std::string("bkt")})
         REQUIRE(r.put("bkt", k, "1").status == st::ok);
     list_query q;
@@ -1478,7 +1478,7 @@ TEST_CASE("prefix successor jumps over a whole rolled-up prefix even with high b
     list_page p;
     REQUIRE(r.store->list("bkt", q, p) == st::ok);
     CHECK(keys_of(p) == std::vector<std::string>{"bkt"});
-    CHECK(p.prefixes == std::vector<std::string>{std::string("a\xFF") + "/"});
+    CHECK(p.prefixes == std::vector<std::string>{std::string("a\xF4\x8F\xBF\xBF") + "/"});
 }
 
 namespace {

@@ -1067,12 +1067,17 @@ TEST_CASE("a db rule puts a publisher's object as the document but never the own
     message m;
     m.topic = "dev/d7/s";
     m.from_client = "d7";
-    m.payload = R"({"_owner":"victim","hp":0,"_owner":"again"})";
+    m.payload = R"({"_owner":"victim","hp":0})";
     std::string call = route_table::request_for(r, m, {"d7"});
     CHECK(call.find("_owner") == std::string::npos);
     CHECK(call.find("u005f") == std::string::npos);
     CHECK(call.find("\"hp\":0") != std::string::npos);
     CHECK(call.find("/c/devices/d7") != std::string::npos);
+    // Two of a name is no document, so it is carried under "payload" and names no owner of the one it writes.
+    m.payload = R"({"_owner":"victim","hp":0,"_owner":"again"})";
+    call = route_table::request_for(r, m, {"d7"});
+    CHECK(call.find(R"("body":{"topic":)") != std::string::npos);
+    CHECK(call.find(R"("body":{"_owner")") == std::string::npos);
     m.payload = R"({"hp":1})";
     call = route_table::request_for(r, m, {"d7"});
     CHECK(call.find(R"("body":{"hp":1})") != std::string::npos);
