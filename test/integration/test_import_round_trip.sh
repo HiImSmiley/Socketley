@@ -294,6 +294,29 @@ if "$BIN" ls --name 2>/dev/null | grep -qx rn_a && ! "$BIN" ls --name 2>/dev/nul
 else bad "a refused import leaves the name it had (ls: $("$BIN" ls --name 2>/dev/null | tr '\n' ' '))"; fi
 "$BIN" remove rn_a >/dev/null 2>&1 || true; "$BIN" remove rn_b >/dev/null 2>&1 || true
 
+# ── A NAME OTHERS RELY ON ───────────────────────────────────────────────────
+#
+# A proxy naming a runtime as its backend, and a server naming a cache, are left naming nothing by its rename; it is
+# refused with each of them said, and taken once nothing names it.
+"$BIN" create cache rn_kv -p $((SL_PORT_BASE+828)) >/dev/null 2>&1 || true
+"$BIN" create server rn_web -p $((SL_PORT_BASE+829)) --cache rn_kv >/dev/null 2>&1 || true
+"$BIN" create proxy rn_px -p $((SL_PORT_BASE+830)) --backend rn_web >/dev/null 2>&1 || true
+RC=0; OUT=$("$BIN" import rn_kv '{"name":"rn_kv2"}' 2>&1) || RC=$?
+assert_rc "a runtime another names is not renamed" 1 "$RC"
+assert_contains "and what names it is said" "$OUT" "rn_web --cache rn_kv"
+RC=0; OUT=$("$BIN" import rn_web '{"name":"rn_web2"}' 2>&1) || RC=$?
+assert_contains "a proxy's backend is one that names it" "$OUT" "rn_px --backend rn_web"
+"$BIN" remove rn_px >/dev/null 2>&1 || true
+RC=0; "$BIN" import rn_web '{"name":"rn_web2"}' >/dev/null 2>&1 || RC=$?
+assert_rc "with nothing naming it, it is renamed" 0 "$RC"
+"$BIN" remove rn_web2 >/dev/null 2>&1 || true; "$BIN" remove rn_web >/dev/null 2>&1 || true; "$BIN" remove rn_kv >/dev/null 2>&1 || true
+"$BIN" create idp rn_auth -p $((SL_PORT_BASE+831)) --issuer https://auth.example.test >/dev/null 2>&1 || true
+"$BIN" create tunnel rn_edge --mode edge -p $((SL_PORT_BASE+832)) --idp rn_auth >/dev/null 2>&1 || true
+RC=0; OUT=$("$BIN" import rn_auth '{"name":"rn_auth2"}' 2>&1) || RC=$?
+assert_rc "an idp an edge signs people in at is not renamed" 1 "$RC"
+assert_contains "and the edge is said" "$OUT" "rn_edge --idp rn_auth"
+"$BIN" remove rn_edge >/dev/null 2>&1 || true; "$BIN" remove rn_auth >/dev/null 2>&1 || true
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A runtime others name is not renamed from under them.** A rename by
+  `import` or the dashboard left a proxy's backend, a server's cache, and the
+  mail runtimes, storages, edges, dbs and brokers signing people in at an idp
+  naming one that was no longer there; it is now refused with each of them
+  said, until they name another.
 - **A tunnel edge tells a link why it closes before closing it.** A person
   signed out, or a share whose time was up, read only that the edge closed the
   connection, as the edge closed it before its last word was written.

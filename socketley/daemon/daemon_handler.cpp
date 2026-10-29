@@ -946,6 +946,32 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
 // --acme, and a storage runtime's --domain and --website-domain with the wildcard its buckets are addressed under.
 // Rewritten only when they change, which is what moves the feed's time and with it the serial secondaries see.
 // The origins of a dns runtime's zones, read from its files once and again only when one changes.
+// The settings of `cfg` that name the runtime `name`, which a rename of it would leave naming nothing.
+static std::vector<std::string> naming_settings(const runtime_config& cfg, std::string_view name)
+{
+    std::vector<std::string> out;
+    // `<runtime>/<bucket>` names the runtime before its slash; a URL names none.
+    const auto names = [&](std::string_view v) { return !v.empty() && v.find("://") == std::string_view::npos &&
+                                                       v.substr(0, v.find('/')) == name; };
+    if (cfg.cache_name == name)
+        out.emplace_back("--cache");
+    if (std::find(cfg.backends.begin(), cfg.backends.end(), name) != cfg.backends.end())
+        out.emplace_back("--backend");
+    for (std::string_view auth = cfg.proxy_auth; !auth.empty();)
+        if (const std::string_view m = socketley::take_item(auth, '+'); m == "idp:" + std::string(name))
+            out.emplace_back("--auth");
+    for (const std::string* idp : {&cfg.storage_idp, &cfg.tunnel_idp, &cfg.db_idp, &cfg.mqtt_idp, &cfg.mail_idp})
+        if (*idp == name)
+            out.emplace_back("--idp");
+    if (cfg.dns_proxy == name)
+        out.emplace_back("--proxy");
+    if (names(cfg.sync_storage) || names(cfg.mail_storage))
+        out.emplace_back("--storage");
+    if (cfg.mail_dns == name)
+        out.emplace_back("--dns");
+    return out;
+}
+
 static std::vector<std::string> zone_origins(const runtime_instance& rt)
 {
     struct cached { std::optional<socketley::file_stamp> stamp; std::string origin; };
@@ -5446,6 +5472,35 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         if (m_manager.get(cfg.name))
         {
             conn->write_buf = "rename failed: name already taken\n";
+            return 1;
+        }
+        // What names it by its name would name nothing after, so a rename of a runtime others rely on is refused
+        // with them named, rather than leaving them without their idp, storage or backend.
+        std::string named_by;
+        {
+            std::shared_lock lock(m_manager.mutex);
+            for (const auto& [other, inst] : m_manager.list())
+            {
+                if (!inst || other == old_name)
+                    continue;
+                for (const std::string& flag : naming_settings(m_persistence->read_from_instance(inst.get()), old_name))
+                    named_by += "  " + std::string(other) + " " + flag + " " + old_name + "\n";
+                // An edge's agents' services that ask visitors to sign in at it.
+                std::vector<socketley::tunnel::agent> agents;
+                std::string why;
+                if (inst->get_type() == runtime_tunnel && socketley::tunnel::load_agents(other, agents, why))
+                    for (const auto& a : agents)
+                        for (const auto& sv : a.services)
+                            for (const std::string_view m : socketley::tunnel::auth_methods(sv.auth))
+                                if (m == "idp:" + old_name)
+                                    named_by += "  " + std::string(other) + " agent " + a.name + " --http " + sv.name +
+                                                "=" + sv.auth + "\n";
+            }
+        }
+        if (!named_by.empty())
+        {
+            conn->write_buf = "rename refused: these name " + old_name + ", and would name nothing after it:\n" +
+                              named_by + "  change them to another first\n";
             return 1;
         }
         // Renamed last, once nothing below can refuse the document, or a refusal left it renamed in memory alone.
