@@ -455,6 +455,21 @@ for _ in $(seq 1 100); do
 done
 [[ "$clean" == *"x-spam=no"* ]] && ok "and the mailbox is told its score in Authentication-Results" \
     || bad "and the mailbox is told its score in Authentication-Results" "$(grep -i 'authentication-results' <<<"$clean")"
+# A Sieve vacation answers no message filed as spam, which would tell its sender the address is read.
+printf 'require "vacation";\nvacation :days 1 "carl is away";\n' > "$T/away.sieve"
+{ "$BIN" mail sp sieve carl put away "$T/away.sieve" && "$BIN" mail sp sieve carl activate away; } >/dev/null 2>&1 \
+    || bad "carl's vacation is put" "$("$BIN" mail sp sieve carl list 2>&1)"
+python3 - "$PSP" >/dev/null 2>&1 <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0)); s.ehlo("x")
+for who, subject in (("ivy", "junky again"), ("jay", "clean again")):
+    s.sendmail(who + "@b.test", ["carl@example.test"], "From: %s@b.test\r\nTo: carl@example.test\r\nSubject: %s\r\n"
+               "Message-ID: <%s@b.test>\r\n\r\nbody\r\n" % (who, subject, who))
+PY
+vacations() { "$BIN" stats sp 2>/dev/null | sed -n 's/^mail_sieve_vacations://p'; }
+for _ in $(seq 1 100); do [ "$(vacations)" -ge 1 ] 2>/dev/null && break; sleep 0.1; done
+sleep 0.5
+check "a Sieve vacation answers the clean message and not the one filed as spam" "$(vacations)" "1"
 
 echo ""
 echo "Results: $PASS/$TOTAL passed, $FAIL failed"

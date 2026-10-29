@@ -743,6 +743,12 @@ uint8_t flag_bits(const std::vector<std::string>& flags)
     return out;
 }
 
+// Whether an automatic reply may answer `e`: spam is answered by nobody, which would tell its sender the address is read.
+bool answerable(const spool_entry& e)
+{
+    return !e.bounce && !e.from.empty() && e.folder != "Junk" && e.auth.find("x-spam=yes") == std::string::npos;
+}
+
 // A folder fileinto may name: printable, no step out of the user's mailboxes.
 bool folder_ok(std::string_view f)
 {
@@ -930,7 +936,7 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
     }
     const std::string_view headers = header_block(bytes);
     // Whether this sender was answered is asked of the memory off the loop, which may read and write a file.
-    if (sieve_store* store = m_run.filters(); vac && !e->bounce && store)
+    if (sieve_store* store = m_run.filters(); vac && answerable(*e) && store)
     {
         auto fresh = std::make_shared<bool>(false);
         m_run.pool().submit(0,
@@ -1034,9 +1040,7 @@ void delivery::jmap_vacation(const entry_ptr& e, const std::string& user, const 
 {
     imap_store* store = m_run.imap();
     sieve_store* memory = m_run.filters();
-    // Spam is answered by nobody, which would tell its sender the address is read.
-    if (!store || !memory || e->bounce || e->from.empty() || e->folder == "Junk" ||
-        e->auth.find("x-spam=yes") != std::string::npos)
+    if (!store || !memory || !answerable(*e))
         return;
     const std::string* kept = store->meta(user, {}, std::string(jmap_session::vacation_entry));
     socketley::json::jvalue v;

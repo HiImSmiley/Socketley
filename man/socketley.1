@@ -13935,7 +13935,8 @@ and fileinto file it, with the imap4flags' flags IMAP shows, fileinto into a
 folder not there only with :create (else into INBOX); discard keeps nothing;
 reject bounces it to its sender; redirect sends it on from the user's own
 address, never again if it comes back; vacation answers a sender once in its
-days or seconds, an hour at least, from the null sender; notify mails a mailto
+days or seconds, an hour at least, from the null sender, and never a bounce or
+spam; notify mails a mailto
 URI, auto\-notified, from the null sender, at most three times a message.
 What editheader adds or deletes is in what is kept and sent on, the Received
 and Auto\-Submitted headers excepted. duplicate keeps a message's ID twelve

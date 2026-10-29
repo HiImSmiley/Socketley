@@ -92,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the one on DATA; past 400 such resets in ten seconds the connection now ends
   with GOAWAY ENHANCE_YOUR_CALM, and a session that leaves 4 MiB unread is
   closed.
+- **A Sieve vacation answers no spam.** A message Rspamd, Bayes or DMARC
+  quarantine filed in Junk was answered by a user's `vacation`, which told
+  its sender the address is read; the JMAP VacationResponse already skipped
+  it, and both now ask one test.
 - **A tunnel's TCP visitor is no program of the agent's machine.** An agent
   dialled a service at 127.0.0.1 from 127.0.0.1, so a mail runtime offered as
   `--tcp smtp:25=127.0.0.1:25` took every sender on the internet for this
