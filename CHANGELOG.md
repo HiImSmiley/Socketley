@@ -120,6 +120,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lockout, and skipped SPF, DMARC, DNSBL and greylisting. A TCP visitor now
   comes from 127.0.0.2; an HTTP service, behind the entrance, still from
   127.0.0.1.
+- **A tunnel agent reaches an edge over plain http only on this machine.**
+  The man page said `http://` was for an edge on the same machine, but any
+  host was taken, so the one-time invitation, the agent's key and the CLI's
+  sign-in went over the network in clear; `--to`, `tunnel join` and
+  `tunnel connect`/`ssh` now refuse an `http://` address that is not
+  localhost, 127/8 or `[::1]`.
 - **Without a home directory the state lies in a /tmp folder of the user's
   own.** The fallback was one shared `/tmp/socketley-runtimes`, which another
   user could make first and so read the runtimes' secrets and the ACME keys

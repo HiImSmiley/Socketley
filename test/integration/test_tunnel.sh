@@ -71,6 +71,21 @@ out=$("$BIN" create tunnel a2 --mode agent --to https://x.example --offer web=12
 [ "$rc" -ne 0 ] && case "$out" in *"--join"*) true ;; *) false ;; esac && ok || bad "an agent with no invitation is refused" "rc $rc: $out"
 out=$("$BIN" create tunnel a3 --mode agent --to https://x.example --join pi.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --offer web=example.com:80 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok || bad "an offer of a name, not an address, is refused" "rc $rc: $out"
+# Plain http carries the invitation and the key in clear, so it reaches an edge on this machine only.
+out=$("$BIN" create tunnel a4 --mode agent --to http://192.0.2.1:9450 --join pi.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --offer web=127.0.0.1:1 2>&1); rc=$?
+[ "$rc" -ne 0 ] && case "$out" in *"only for an edge on this machine"*) true ;; *) false ;; esac && ok \
+    || bad "an agent's --to over http:// to another machine is refused" "rc $rc: $out"
+for to in http://localhost:9450 "http://[::1]:9450" http://127.0.0.2:9450; do
+    out=$("$BIN" create tunnel a5 --mode agent --to "$to" --join pi.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --offer web=127.0.0.1:1 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && ok || bad "an agent's --to $to on this machine is taken" "rc $rc: $out"
+    "$BIN" remove a5 >/dev/null 2>&1
+done
+out=$("$BIN" tunnel join http://192.0.2.1:9450 --name far --http web=127.0.0.1:1 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"only on this machine"*) true ;; *) false ;; esac && ok \
+    || bad "tunnel join over http:// to another machine is refused before anything is sent" "rc $rc: $out"
+out=$(printf x | "$BIN" tunnel connect http://192.0.2.1:9450 127.0.0.1:1 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"only on this machine"*) true ;; *) false ;; esac && ok \
+    || bad "tunnel connect over http:// to another machine is refused before anything is sent" "rc $rc: $out"
 
 INV=$("$BIN" tunnel t invite pi --http web --tcp "echo:$PT" 2>&1); rc=$?
 case "$INV" in pi.*) ok ;; *) bad "an invitation is printed" "rc $rc: $INV" ;; esac

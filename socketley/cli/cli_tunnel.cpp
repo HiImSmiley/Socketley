@@ -25,6 +25,7 @@
 #include "../shared/loop/blocking_write.h"
 #include "../shared/persist/paths.h"
 #include "../shared/util/text_list.h"
+#include "../shared/net/peer_address.h"
 #include "../shared/net/public_suffix.h"
 #include "../shared/net/tunnel_mux.h"
 #include "../runtime/idp/idp_logic.h"
@@ -176,6 +177,9 @@ struct edge_address
     std::string authority, host, port;
 };
 
+constexpr const char* plain_refusal =
+    "an edge is reached over http:// only on this machine, as the sign-in and the invitation go in clear; use https://";
+
 edge_address parse_edge(std::string rest)
 {
     edge_address a;
@@ -265,6 +269,11 @@ int connect_main(const std::string& edge, const std::string& target, std::string
 {
     std::string err, token;
     const edge_address ea = parse_edge(edge);
+    if (!ea.tls && !socketley::authority_is_this_machine(ea.authority))
+    {
+        std::cerr << plain_refusal << "\n";
+        return 1;
+    }
     if (!idp_of(ea, idp, err) || !cli_access_token(idp, token, err))
     {
         std::cerr << err << "\n";
@@ -446,6 +455,11 @@ int join_main(int argc, char** argv)
     }
 
     const edge_address ea = parse_edge(edge);
+    if (!ea.tls && !socketley::authority_is_this_machine(ea.authority))
+    {
+        std::cout << plain_refusal << "\n";
+        return 1;
+    }
     std::string err, token;
     if (!idp_of(ea, idp, err))
     {

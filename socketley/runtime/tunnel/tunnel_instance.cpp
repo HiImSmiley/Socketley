@@ -5,6 +5,7 @@
 #include "tunnel_registry.h"
 #include "tunnel_run.h"
 #include "../../shared/net/endpoint.h"
+#include "../../shared/net/peer_address.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
@@ -73,6 +74,10 @@ std::string tunnel_instance::config_refusal() const
     }
     if (!m_to.starts_with("https://") && !m_to.starts_with("http://"))
         return "tunnel: an agent needs --to, the edge's https address\n";
+    if (const std::string_view rest = std::string_view(m_to).substr(m_to.find("://") + 3);
+        m_to.starts_with("http://") && !socketley::authority_is_this_machine(rest.substr(0, rest.find('/'))))
+        return "tunnel: --to over http:// is only for an edge on this machine, as the invitation and key go in "
+               "clear; use https://\n";
     if (m_offers.empty())
         return "tunnel: an agent needs --offer <service>=<host>:<port>, what it carries the edge's streams to\n";
     std::string_view list = m_offers;
