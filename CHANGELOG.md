@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A tunnel agent is never handed a visitor's idp session.** The edge
+  checked a protected service's visitors and then carried the request on as
+  it came, the `skl_idp` cookie that signs in at every runtime trusting the
+  idp and the token or key the edge took among it, so the machine at home,
+  perhaps someone else's, could sign in as any admin who visited it; an open
+  service under the cookie domain was sent the cookie unasked. Every HTTP
+  request now reaches the agent without the idp's cookies, and without its
+  `Authorization` where the service asks for one.
 - **One address holds at most twenty waiting device sign-ins at the idp.**
   `/device_authorization` asks a public client for no secret, so anyone
   could fill the ten thousand grants a shard keeps and refuse every

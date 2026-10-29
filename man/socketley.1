@@ -14241,7 +14241,13 @@ given a name a service has, and of two edges with a service of one name the
 first by name keeps it. An edge named as a whole domain has no name beside
 it, and its services none. A TCP service is a port on the edge, here 25565. The edge says
 nothing about a stream it carries: what reaches the agent is what the visitor
-sent, and the service answers as if they were on the same machine.
+sent, and the service answers as if they were on the same machine, except that
+an HTTP request reaches it without the idp's session and known-device cookies,
+which sign in wherever the idp is trusted, and without the
+.B Authorization
+a service's
+.I auth
+took.
 .PP
 .B Who may visit.
 An HTTP service invited as

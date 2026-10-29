@@ -17,11 +17,13 @@
 
 #include "../idp/idp_session.h"
 #include "../proxy/proxy_auth.h"
+#include "../../shared/http/cookie.h"
 #include "../../shared/http/request_head.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/net/endpoint.h"
 #include "../../shared/net/peer_address.h"
 #include "../../shared/persist/read_file.h"
+#include "../../shared/util/ascii.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/text_list.h"
@@ -101,6 +103,39 @@ std::string_view header_of(std::string_view head, std::string_view name)
         pos = end;
     }
     return {};
+}
+
+// A visitor's request head as the agent, another machine, is given it: without the idp's cookies, which sign in
+// wherever the idp is trusted, and without the Authorization the edge's auth took when it has one.
+std::string forwarded_head(std::string_view head, bool drop_authorization)
+{
+    size_t pos = head.find("\r\n");
+    if (pos == std::string_view::npos)
+        return std::string(head);
+    pos += 2;
+    std::string out(head.substr(0, pos));
+    while (pos < head.size())
+    {
+        const size_t nl = head.find("\r\n", pos);
+        if (nl == std::string_view::npos)
+            break;
+        const std::string_view field = head.substr(pos, nl - pos);
+        pos = nl + 2;
+        const size_t colon = field.find(':');
+        const std::string_view name = field.substr(0, colon);
+        if (drop_authorization && ascii::iequals(name, "authorization"))
+            continue;
+        if (colon != std::string_view::npos && ascii::iequals(name, "cookie"))
+        {
+            const std::string kept = http::without_cookies(field.substr(colon + 1), {socketley::idp::session_cookie_name,
+                                                                                     socketley::idp::known_cookie_name});
+            if (!kept.empty())
+                out.append("Cookie: ").append(kept).append("\r\n");
+            continue;
+        }
+        out.append(field).append("\r\n");
+    }
+    return out;
 }
 
 struct front_conn : http::server_conn
@@ -206,7 +241,8 @@ std::shared_ptr<http::server_conn> leg_hooks::make_conn()
 {
     auto g = std::make_shared<leg>();
     g->srv = &srv;
-    g->gated = !auth.empty();
+    // A dialler's legs carry what a target answers, which is no request to read.
+    g->gated = !agent.empty() && svc.http;
     return g;
 }
 
@@ -221,7 +257,7 @@ void leg_hooks::serve(const std::shared_ptr<http::server_conn>& c)
 
 void leg_hooks::accepted(const std::shared_ptr<http::server_conn>& c)
 {
-    // A protected service's stream is opened by the first request its auth lets through.
+    // An HTTP service's stream is opened by the first request let through, a TCP service's at once.
     const auto g = std::static_pointer_cast<leg>(c);
     if (!g->gated && !run.visitor(*this, g))
         srv.close_conn(g);
@@ -1071,6 +1107,7 @@ void tunnel_run::gate(leg_hooks& h, const std::shared_ptr<leg>& g)
         // The entrance on this machine is the only one that reaches a service's socket, and it is believed; refused
         // by every method, a browser is sent to sign in where one of them would send it.
         proxy_auth::request_verdict v;
+        v.pass = h.auth.empty();
         for (const auto& a : h.auth)
         {
             proxy_auth::request_verdict one = a->decide(head, "127.0.0.1", false, line.substr(0, sp1),
@@ -1091,9 +1128,12 @@ void tunnel_run::gate(leg_hooks& h, const std::shared_ptr<leg>& g)
             refuse_visitor(g, "502 Bad Gateway", "The machine serving this is not connected.\n", {});
             break;
         }
-        g->cleared += end + 4;
         int upgrade_fields = 0;
         g->raw = !http_request_field(head, "upgrade", upgrade_fields).empty();
+        // The head rewritten last, as every view above is into the bytes it replaces.
+        const std::string fresh = forwarded_head(head, !h.auth.empty());
+        g->in.replace(g->cleared, end + 2, fresh);
+        g->cleared += fresh.size() + 2;
         g->await_101 = g->raw;
         g->answer.clear();
         g->chunked = scan.chunked;

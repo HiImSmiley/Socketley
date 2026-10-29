@@ -10,6 +10,7 @@
 #   * an upgrade the service refused leaving the connection unasked from then on
 #   * a browser not sent to sign in at the idp, or a signed-in one refused
 #   * a service of two ways in refusing a visitor either would let through, or letting a wrong one in
+#   * the idp's session cookie, open service or not, or a credential the edge's auth took, handed to the machine at home
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -42,6 +43,8 @@ class H(http.server.BaseHTTPRequestHandler):
     def hit(self):
         with open(hits, "a") as f:
             f.write(self.path + "\n")
+        with open(hits + ".head", "a") as f:
+            f.write("%s\t%s\t%s\n" % (self.path, self.headers.get("Cookie", "-"), self.headers.get("Authorization", "-")))
     def answer(self, status, body):
         self.send_response(status); self.send_header("Content-Length", str(len(body))); self.end_headers()
         self.wfile.write(body)
@@ -172,6 +175,13 @@ def hit(path):
         return path in open(hits).read().split("\n")
     except FileNotFoundError:
         return False
+def seen(path):
+    # The Cookie and Authorization a request reached home with.
+    for line in open(hits + ".head").read().split("\n"):
+        f = line.split("\t")
+        if f[0] == path and len(f) == 3:
+            return f[1], f[2]
+    return None
 def req(path, extra="", method="GET", body=b""):
     h = "%s %s HTTP/1.1\r\nHost: svc.t.example.com\r\n%s" % (method, path, extra)
     if body:
@@ -181,6 +191,10 @@ TOK = "Authorization: Bearer s3cret-token\r\n"
 
 s = conn(open_s); s.sendall(req("/o1")); a = read_answer(s)
 check("an open service lets a visitor through with nothing asked", a.endswith(b"home /o1"), repr(a[:200]))
+s = conn(open_s); s.sendall(req("/o-cookie", "Cookie: %s; theme=dark\r\nAuthorization: Basic eDp5\r\n" % cookie)); a = read_answer(s)
+check("an open service's visitor reaches home without the idp's cookie, its own and its Authorization kept",
+      (a.endswith(b"home /o-cookie"), seen("/o-cookie")) == (True, ("theme=dark", "Basic eDp5")),
+      repr(a[:200]) + " " + repr(seen("/o-cookie")))
 
 s = conn(tok_s); s.sendall(req("/t-none")); a = read_answer(s)
 check("a protected service refuses a visitor with no token", status(a) == "HTTP/1.1 401 Unauthorized" and b"WWW-Authenticate: Bearer" in a, repr(a[:300]))
@@ -233,15 +247,18 @@ loc = [l for l in a.split(b"\r\n") if l.lower().startswith(b"location:")]
 check("a browser with no sign-in is sent to sign in at the idp", status(a) == "HTTP/1.1 302 Found" and loc and b"/login" in loc[0] and b"svc.t.example.com" in loc[0], repr(a[:400]))
 s = conn(web_s); s.sendall(req("/w-api")); a = read_answer(s)
 check("anything else with no sign-in is told 401", status(a) == "HTTP/1.1 401 Unauthorized", repr(a[:200]))
-s = conn(web_s); s.sendall(req("/w-in", "Cookie: %s\r\n" % cookie)); a = read_answer(s)
+s = conn(web_s); s.sendall(req("/w-in", "Cookie: theme=dark; %s\r\n" % cookie)); a = read_answer(s)
 check("a signed-in visitor is let through", a.endswith(b"home /w-in"), repr(a[:300]))
+check("without the idp's cookie, which signs in wherever the idp is trusted", seen("/w-in") == ("theme=dark", "-"), repr(seen("/w-in")))
 check("and no refused request reached home", not any(hit(p) for p in ("/w-browser", "/w-api")))
 
 # A service with two ways in lets a visitor through by either, and refuses as the one a visitor would use.
 s = conn(both_s); s.sendall(req("/b-tok", TOK)); a = read_answer(s)
 check("of two ways in, the token lets a program through", a.endswith(b"home /b-tok"), repr(a[:200]))
+check("and the token the edge took is not handed on", seen("/b-tok") == ("-", "-"), repr(seen("/b-tok")))
 s = conn(both_s); s.sendall(req("/b-in", "Cookie: %s\r\n" % cookie)); a = read_answer(s)
 check("and the sign-in a person in a browser", a.endswith(b"home /b-in"), repr(a[:300]))
+check("its cookie not handed on either", seen("/b-in") == ("-", "-"), repr(seen("/b-in")))
 s = conn(both_s); s.sendall(req("/b-browser", "Accept: text/html\r\n")); a = read_answer(s)
 check("a browser with neither is sent to sign in", status(a) == "HTTP/1.1 302 Found", repr(a[:300]))
 s = conn(both_s); s.sendall(req("/b-wrong", "Authorization: Bearer wrong\r\n")); a = read_answer(s)

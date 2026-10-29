@@ -49,8 +49,9 @@ struct leg : http::server_conn
     bool shut{false};
     reset_code why{reset_code::gone};
 
-    // A protected service's visitor: each request is asked of the listener's auth before any of it goes on, and only
-    // the bytes at the front of `in` that a request let through frames (`cleared`) are sent.
+    // An HTTP service's visitor: each request is asked of the listener's auth, where it has one, and its head
+    // rewritten before any of it goes on, and only the bytes at the front of `in` that a request let through frames
+    // (`cleared`) are sent.
     bool gated{false};
     size_t cleared{0};
     size_t body_left{0};
@@ -203,7 +204,8 @@ private:
                   std::string_view extra_headers, bool admin = false);
     // A visitor on a service's listener, carried to the agent offering it; false when the agent is not connected.
     bool visitor(leg_hooks& h, const std::shared_ptr<leg>& g);
-    // A protected service's visitor's requests asked of its auth, as far as they have come, and what passed sent.
+    // An HTTP service's visitor's requests, as far as they have come, asked of its auth where it has one, and what
+    // passed sent on without what the agent must not be given.
     void gate(leg_hooks& h, const std::shared_ptr<leg>& g);
     // The far side's first bytes after an upgrade a visitor asked for, which must be its 101.
     void upgrade_answered(const std::shared_ptr<leg>& g, std::string_view bytes);
