@@ -49,7 +49,7 @@ for _ in $(seq 1 50); do python3 -c "import socket;socket.create_connection(('12
 # Three thousand queries, each with its own id, sent before a byte is read, so the runtime's answers pile up behind
 # a socket that is full and go out through the ring while more are appended.
 res=$(python3 - "$P" <<'PY'
-import socket, struct, sys, time
+import socket, struct, sys, threading, time
 N = 3000
 def query(i):
     q = struct.pack(">HHHHHH", i, 0x0100, 1, 0, 0, 0)
@@ -59,8 +59,11 @@ def query(i):
     return struct.pack(">H", len(q)) + q
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 10)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-s.sendall(b"".join(query(i) for i in range(1, N + 1)))
+# Sent beside the reads, as the runtime stops reading a peer whose answers are not read.
+threading.Thread(target=s.sendall, args=(b"".join(query(i) for i in range(1, N + 1)),), daemon=True).start()
 time.sleep(1.5)
+# Read with a window wide enough to take ten megabytes in seconds rather than minutes.
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
 s.settimeout(10)
 buf = b""
 good = bad = 0

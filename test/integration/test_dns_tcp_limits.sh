@@ -11,6 +11,10 @@
 #   * a byte of a query that is never finished, sent every few seconds, kept
 #     a connection from being quiet, so a few such filled the table
 #   * a full table closing the newcomer rather than the quietest connection
+#   * a peer reading its answers slowly closed as one that reads none, as the
+#     write waiting behind the kernel's queue is not woken while it drains
+#   * the flood itself cutting a query's length on a short send, so the
+#     runtime reads garbage it never answers and the hold is never tested
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -54,25 +58,35 @@ for _ in $(seq 1 50); do dig @127.0.0.1 -p "$P" +tcp +short +time=1 +tries=1 exa
 # ── a peer that never reads ─────────────────────────────────────────────────
 # Queries sent as fast as the runtime takes them, from a socket that reads nothing back: once the answers waiting
 # pass the runtime's mark it stops reading, and what the client gets sent is what the socket buffers on the way hold.
+# Beside it a peer sends as much and reads its answers a kilobyte at a time, slowly, and keeps its connection.
 res=$(python3 - "$P" <<'PY'
-import select, socket, struct, sys, time
+import select, socket, struct, sys, threading, time
 p = int(sys.argv[1])
 rmem = int(open("/proc/sys/net/ipv4/tcp_rmem").read().split()[2])
 wmem = int(open("/proc/sys/net/ipv4/tcp_wmem").read().split()[2])
 bound = rmem + wmem + (4 << 20)
 q = struct.pack(">HHHHHH", 1, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 1, 1)
 chunk = (struct.pack(">H", len(q)) + q) * 2000
+slow = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+slow.connect(("127.0.0.1", p))
+threading.Thread(target=slow.sendall, args=(chunk * 64,), daemon=True).start()
+opened = time.time()
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
 s.connect(("127.0.0.1", p))
 s.setblocking(False)
 sent = 0
+off = 0
 moved = time.time()
 end = moved + 15
 while time.time() < end and sent < 2 * bound:
     try:
-        sent += s.send(chunk)
+        # A short send resumes where it stopped, or a query's length is cut and the runtime reads garbage.
+        n = s.send(chunk[off:])
+        sent += n
+        off = (off + n) % len(chunk)
         moved = time.time()
     except BlockingIOError:
         if time.time() - moved > 2:
@@ -84,18 +98,37 @@ start = time.time()
 po = select.poll()
 po.register(s, select.POLLHUP | select.POLLERR | select.POLLRDHUP)
 closed = "open"
-while time.time() - start < 45:
-    if po.poll(1000):
+secs = 45
+kept = "kept"
+got = 0
+# Watched until well past the 30 seconds after which a peer whose answers do not move is closed.
+while time.time() - start < 45 and (closed == "open" or time.time() - opened < 40):
+    if closed == "open" and po.poll(500):
         closed = "closed"
-        break
-print(held, closed, sent >> 20, int(time.time() - start))
+        secs = int(time.time() - start)
+    elif closed == "closed":
+        time.sleep(0.5)
+    if kept == "kept":
+        try:
+            b = slow.recv(1024, socket.MSG_DONTWAIT)
+            got += len(b)
+            if not b:
+                kept = "closed"
+        except BlockingIOError:
+            pass
+        except OSError:
+            kept = "closed"
+print(held, closed, sent >> 20, secs, kept, got >> 10, int(time.time() - opened))
 PY
 )
-read -r held closed mib secs <<<"$res"
+read -r held closed mib secs kept kib slow_secs <<<"$res"
 expect "a peer that reads no answers is not read from either (${mib} MiB taken)" "$held" "held"
 expect "and its connection is closed once its answers stop moving (${secs}s)" "$closed" "closed"
+expect "a peer reading its answers slowly keeps its connection (${kib} KiB read in ${slow_secs}s)" "$kept" "kept"
 expect "the runtime answers a fresh connection after it" \
     "$(dig @127.0.0.1 -p "$P" +tcp +short +time=2 +tries=1 example.com A 2>&1)" "192.0.2.1"
+stat_of() { "$BIN" stats "$1" 2>/dev/null | awk -F: -v k="$2" '$1==k {s+=$2} END {print s+0}'; }
+expect "every query the runtime read of it was whole" "$(stat_of ns dropped)" "0"
 
 # ── a table held by trickled bytes ──────────────────────────────────────────
 P2=$((SL_PORT_BASE+1726))
@@ -151,8 +184,7 @@ PY
 read -r fresh closed secs <<<"$res"
 expect "a client is answered while every slot is held by a trickling connection" "$fresh" "answered"
 expect "and the trickling connections are closed as quiet, though a byte came every two seconds (${secs}s)" "$closed" "4"
-stat_of() { "$BIN" stats small 2>/dev/null | awk -F: -v k="$1" '$1==k {s+=$2} END {print s+0}'; }
-expect "the one closed to make room is counted" "$(stat_of tcp_evicted)" "1"
+expect "the one closed to make room is counted" "$(stat_of small tcp_evicted)" "1"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

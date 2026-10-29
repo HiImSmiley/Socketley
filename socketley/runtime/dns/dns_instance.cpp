@@ -18,9 +18,11 @@
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <linux/sockios.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -294,6 +296,8 @@ private:
         // Answers made while a write through the ring still reads `out`, which must not move under it.
         std::string later;
         int64_t last{0};
+        // What the kernel held unsent or unacknowledged at the last tick while a write waited on it.
+        int queued{0};
 
         // Where the next answer goes: `out` unless the ring is reading it.
         std::string& tail() { return wr_pending ? later : out; }
@@ -1174,8 +1178,17 @@ void dns_run::tick()
     // Connections quiet for too long with nothing left to write, and those whose peer has stopped reading.
     std::vector<std::shared_ptr<tcp_conn>> idle;
     for (auto& [id, c] : m_conns)
+    {
+        // A slow reader drains the kernel's queue long before the write waiting behind it wakes, and that is movement.
+        if (int q = 0; c->wr_pending && ::ioctl(c->fd, SIOCOUTQ, &q) == 0)
+        {
+            if (q < c->queued)
+                c->last = now;
+            c->queued = q;
+        }
         if ((now - c->last > tcp_idle_secs && c->waiting() == 0) || now - c->last > tcp_stall_secs)
             idle.push_back(c);
+    }
     for (auto& c : idle)
         close_conn(c);
     // The rate limit's blocks of seconds gone by.
