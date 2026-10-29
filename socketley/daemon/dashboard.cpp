@@ -31,6 +31,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/dns/dns_zone.h"
 #include "../runtime/dns/dns_wire.h"
+#include "../runtime/mail/mail_instance.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/http/url.h"
 #include "../shared/http/status.h"
@@ -770,21 +771,29 @@ void server::run(int fd, const request& r)
         // What was run, without what it was run with where that is a secret: the value after a flag that holds
         // one, and an import's whole document, which may hold any of them.
         std::string said;
-        bool hide_next = false;
+        const auto secret_flag = [](std::string_view f) {
+            return f == "--master-pw" || f == "--secret-key" || f == "--password";
+        };
+        bool hide_next = false, relay_next = false;
         for (size_t i = 0; i < args->items.size(); ++i)
         {
             const std::string& w = args->items[i].s;
             said += i ? " " : "";
+            const size_t eq = w.find('=');
+            const std::string_view flag = std::string_view(w).substr(0, eq);
             if (args->items[0].s == "import" && i == 2)
                 said += "<document>";
-            else if (const size_t eq = w.find('=');
-                     eq != std::string::npos && (w.compare(0, eq, "--master-pw") == 0 ||
-                                                 w.compare(0, eq, "--secret-key") == 0 ||
-                                                 w.compare(0, eq, "--password") == 0))
+            else if (eq != std::string::npos && secret_flag(flag))
                 said += w.substr(0, eq + 1) + "***";
+            // A mail relay's URL keeps its host and user readable, as show gives it, and loses its password.
+            else if (eq != std::string::npos && flag == "--relay")
+                said += w.substr(0, eq + 1) + mail_redacted_relay(std::string_view(w).substr(eq + 1));
+            else if (hide_next)
+                said += "***";
             else
-                said += hide_next ? std::string("***") : w;
-            hide_next = w == "--master-pw" || w == "--secret-key" || w == "--password";
+                said += relay_next ? mail_redacted_relay(w) : w;
+            hide_next = secret_flag(w);
+            relay_next = w == "--relay";
         }
         LOG_INFO(("dashboard: " + who + " ran " + said.substr(0, 200) + " (" + std::to_string(rc) + ")").c_str());
     }

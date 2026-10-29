@@ -198,6 +198,13 @@ sleep 0.5
 expect "the dashboard's log of a command keeps no password" \
     "$(grep -c 'dashtopsecretpw\|dashothersecret' "$SOCKETLEY_DLOG") $(grep -c 'ran create server pw .*--master-pw \*\*\*' "$SOCKETLEY_DLOG")" "0 1"
 run '{"args":["remove","pw"]}' >/dev/null
+# A mail relay's password, inline in its URL, is kept out of the log as show keeps it out.
+run '{"args":["create","mail","mrelay","--relay","smtps://relayuser:dashrelaysecret@smtp.example.net:465"]}' >/dev/null
+run '{"args":["edit","mrelay","--relay=smtps://relayuser:dashrelaysecret@smtp.example.net:465"]}' >/dev/null
+sleep 0.5
+expect "the dashboard's log of a relay keeps its host and user and no password" \
+    "$(grep 'dashboard: ' "$SOCKETLEY_DLOG" | grep -c dashrelaysecret) $(grep -c 'ran create mail mrelay --relay smtps://relayuser:\*\*\*@smtp.example.net:465' "$SOCKETLEY_DLOG") $(grep -c 'ran edit mrelay --relay=smtps://relayuser:\*\*\*@smtp.example.net:465' "$SOCKETLEY_DLOG")" "0 1 1"
+run '{"args":["remove","mrelay"]}' >/dev/null
 # ─── the log ────────────────────────────────────────────────────────────────
 run "{\"args\":[\"create\",\"storage\",\"loud\",\"-p\",\"$((P+2))\",\"--dir\",\"$T/loud\",\"--anonymous\",\"-s\"]}" >/dev/null
 logs() { curl -s -b "$T/jar" "$U/api/logs?$1"; }

@@ -120,6 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lockout, and skipped SPF, DMARC, DNSBL and greylisting. A TCP visitor now
   comes from 127.0.0.2; an HTTP service, behind the entrance, still from
   127.0.0.1.
+- **The dashboard logs a mail relay without its password.** A `create` or
+  `edit` with `--relay smtps://user:password@host` was written to the
+  daemon's log and its ring as typed, which every later session reads; the
+  password is now `***` there, as `show` gives it.
 - **A tunnel agent reaches an edge over plain http only on this machine.**
   The man page said `http://` was for an edge on the same machine, but any
   host was taken, so the one-time invitation, the agent's key and the CLI's
