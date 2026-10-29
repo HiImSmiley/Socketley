@@ -163,6 +163,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate in it was an anchor and no name was checked, so any leaf the
   same public intermediate signed took the credentials; now the peer must
   show the file's first certificate.
+- **A sync acts on no listing that says it is incomplete.** A storage that
+  answered `IsTruncated` true with no continuation token, as one speaking
+  ListObjects V1 does after 1000 keys, was taken as the whole bucket, and every
+  carried file past that page was removed here. Such a listing, or one handing
+  back the token just sent, is now a failed listing: it is said in
+  `last_error`, nothing is brought or removed, and the listing is retried.
 - **A script holds at most 128 MiB and returns at most 64 MiB.** EVAL's
   `string.rep` and `..` build strings in C, where the deadline never fires, and
   the reply was a second copy, so `EVAL "return string.rep('a',2e9)" 0` took

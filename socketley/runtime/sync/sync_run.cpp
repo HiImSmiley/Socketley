@@ -1464,8 +1464,23 @@ void sync_run::list_page(target& t, lane& l)
             o.size = std::strtoull(xml_text(c, "Size").c_str(), nullptr, 10);
             m_remote[rel] = std::move(o);
         }
-        m_list_token = xml_unescape(xml_text(a.body, "NextContinuationToken"));
-        if (xml_text(a.body, "IsTruncated") == "true" && !m_list_token.empty())
+        std::string next = xml_unescape(xml_text(a.body, "NextContinuationToken"));
+        const bool truncated = xml_text(a.body, "IsTruncated") == "true";
+        // A listing that says it goes on, with no new token to go on from, is part of the bucket and not acted on.
+        if (truncated && (next.empty() || next == m_list_token))
+        {
+            l.busy = false;
+            m_pulling = false;
+            m_listing = false;
+            m_last_pull = std::chrono::steady_clock::now();
+            m_remote.clear();
+            note(t.name + ": the storage's listing says it goes on but gives no new token to go on from, so nothing "
+                          "is brought or removed");
+            owe_retry();
+            return;
+        }
+        m_list_token = std::move(next);
+        if (truncated)
         {
             list_page(t, l);
             return;

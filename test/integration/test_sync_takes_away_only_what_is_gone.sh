@@ -240,6 +240,62 @@ cp "$T/creds" "$T/rot.creds"
 for _ in $(seq 1 90); do [ "$(keys rot | wc -w)" = 4 ] && break; sleep 1; done
 expect "and once put right in the file they are used, with no restart" "$(keys rot | wc -w)" 4
 
+# ─── a listing that says it goes on with nothing to go on from ──────────────
+# A storage answering as ListObjects V1 does says IsTruncated and gives no token: what it left out is not gone.
+X=$((SL_PORT_BASE+1979))
+cat > "$T/trunc.py" <<'PY'
+import http.client, http.server, os, re, sys
+listen, up, flag = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *a): pass
+    def relay(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(n) if n else b''
+        c = http.client.HTTPConnection('127.0.0.1', up, timeout=30)
+        c.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+        for k, v in self.headers.items():
+            c.putheader(k, v)
+        c.endheaders()
+        if body:
+            c.send(body)
+        r = c.getresponse()
+        data = r.read()
+        if os.path.exists(flag) and self.command == 'GET' and 'list-type=2' in self.path:
+            data = re.sub(rb'<Contents>(?:(?!</Contents>).)*?<Key>left-out\.txt</Key>.*?</Contents>', b'', data, flags=re.S)
+            data = re.sub(rb'<IsTruncated>[^<]*</IsTruncated>|<NextContinuationToken>[^<]*</NextContinuationToken>', b'', data)
+            data = data.replace(b'</ListBucketResult>', b'<IsTruncated>true</IsTruncated></ListBucketResult>')
+        self.send_response(r.status)
+        for k, v in r.getheaders():
+            if k.lower() in ('transfer-encoding', 'connection') or (k.lower() == 'content-length' and self.command != 'HEAD'):
+                continue
+            self.send_header(k, v)
+        if self.command != 'HEAD':
+            self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(data)
+        c.close()
+    do_GET = do_PUT = do_POST = do_DELETE = do_HEAD = relay
+http.server.ThreadingHTTPServer(('127.0.0.1', listen), H).serve_forever()
+PY
+python3 "$T/trunc.py" "$X" "$P" "$T/trunc.flag" & TRUNC_PID=$!
+for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$X " && break; sleep 0.1; done
+S -o /dev/null -X PUT "http://127.0.0.1:$P/trunc"
+printf 'k\n' | S -o /dev/null -X PUT --data-binary @- "http://127.0.0.1:$P/trunc/kept.txt"
+printf 'l\n' | S -o /dev/null -X PUT --data-binary @- "http://127.0.0.1:$P/trunc/left-out.txt"
+mkdir -p "$T/tr"
+"$BIN" create sync tr --dir "$T/tr" --storage "127.0.0.1:$X/trunc" --credentials "$T/creds" --mode in --every 2s -s \
+    >/dev/null 2>&1
+for _ in $(seq 1 30); do [ -f "$T/tr/kept.txt" ] && [ -f "$T/tr/left-out.txt" ] && break; sleep 0.5; done
+expect "both files are brought through the relay" "$(ls "$T/tr" | LC_ALL=C sort | tr '\n' ' ')" "kept.txt left-out.txt "
+touch "$T/trunc.flag"
+for _ in $(seq 1 30); do st tr last_error | grep -q 'no new token' && break; sleep 0.5; done
+expect "a listing truncated with no token is said" "$(st tr last_error | grep -c 'no new token')" 1
+expect "and what it left out is not taken away here" "$(ls "$T/tr" | LC_ALL=C sort | tr '\n' ' ')" "kept.txt left-out.txt "
+"$BIN" remove tr >/dev/null 2>&1
+kill "$TRUNC_PID" 2>/dev/null; wait "$TRUNC_PID" 2>/dev/null
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
