@@ -1184,12 +1184,21 @@ does;
 .B set
 changes what it offers and keeps its key;
 .B revoke
-cuts it off. See
+cuts it off. A TCP service on
+.B 127.0.0.1
+alone is how the edge's own machine reaches a service at home with nothing
+opened to anyone else: a proxy's
+.B \-\-backend
+or a sync's
+.B \-\-storage
+names that port as any other, and is refused while the agent is away. See
 .BR "TUNNEL FLAGS" .
 .RS
 .PP
 .nf
 socketley tunnel edge invite pi \-\-http home=idp:auth,nas \-\-tcp mc:25565
+socketley tunnel edge set pi \-\-tcp nas:127.0.0.1:9000
+socketley create sync backup \-\-dir /srv/data \-\-storage http://127.0.0.1:9000/backup
 .fi
 .RE
 .TP

@@ -294,6 +294,32 @@ while True:
 print(d.decode())" 2>&1; }
 for _ in $(seq 1 80); do out=$(bound); [ "$out" = bound ] && break; sleep 0.1; done
 [ "$out" = bound ] && ok || bad "and carried to the agent" "$out"
+# What the edge's machine runs reaches a service at home through that loopback port, open to nobody else: a proxy
+# here with it as its backend, cut while the agent is away and carried again once it is back.
+PY=$((SL_PORT_BASE + 1979))
+"$BIN" create proxy homeproxy --protocol tcp -p "$PY" --backend "127.0.0.1:$PT" -s >/dev/null 2>&1 || bad "a proxy to the loopback port is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+through() { python3 -c "
+import socket
+try:
+    s = socket.create_connection(('127.0.0.1', $PY), timeout=5); s.sendall(b'via the proxy'); s.shutdown(1)
+    d = b''
+    while True:
+        c = s.recv(100)
+        if not c: break
+        d += c
+    print(d.decode())
+except Exception as e:
+    print('failed', e)" 2>&1; }
+for _ in $(seq 1 50); do out=$(through); [ "$out" = "via the proxy" ] && break; sleep 0.1; done
+[ "$out" = "via the proxy" ] && ok || bad "a runtime of the edge's machine reaches the service at home through it" "$out"
+"$BIN" stop home >/dev/null 2>&1
+for _ in $(seq 1 30); do [ "$("$BIN" stats t 2>/dev/null | sed -n 's/^links://p')" = 0 ] && break; sleep 0.2; done
+out=$(through)
+[ "$out" != "via the proxy" ] && ok || bad "with the agent away it is reached no more" "$out"
+"$BIN" start home >/dev/null 2>&1
+for _ in $(seq 1 100); do out=$(through); [ "$out" = "via the proxy" ] && break; sleep 0.1; done
+[ "$out" = "via the proxy" ] && ok || bad "and once the agent is back it is again" "$out"
+"$BIN" remove homeproxy >/dev/null 2>&1
 GHOST=$(sock_of ghost)
 for _ in $(seq 1 30); do [ -S "$GHOST" ] && break; sleep 0.1; done
 out=$(curl -s -m 3 --unix-socket "$GHOST" http://ghost/ -o /dev/null -w '%{http_code}' 2>&1)
