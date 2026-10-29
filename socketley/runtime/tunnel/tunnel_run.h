@@ -2,6 +2,7 @@
 // The tunnel runtime's running half, both its modes: the links (one multiplexed connection each), the legs (a local
 // connection a stream is carried to), and what the edge and the agent each do with them.
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -9,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <time.h>
 
@@ -66,6 +68,22 @@ struct leg : http::server_conn
     bool refused{false};
 };
 
+// A UDP socket of the tunnel and its one receive in flight: a UDP service's port at the edge, or a flow's own socket
+// at an agent, which says what came to `got`.
+struct udp_port
+{
+    int fd{-1};
+    io_request req{};
+    msghdr msg{};
+    iovec iov{};
+    sockaddr_storage from{};
+    std::vector<char> buf;
+    bool pending{false};
+    // Closed once the ring has answered the receive that was cancelled under it.
+    bool dying{false};
+    std::function<void(udp_port&, std::string_view)> got;
+};
+
 // One multiplexed connection: an agent or a person at the edge, or the edge at an agent.
 class link : public events
 {
@@ -108,6 +126,7 @@ public:
     void on_window(uint32_t stream) override;
     void on_pong(std::string_view token) override;
     void on_goaway(std::string_view why) override;
+    void on_datagram(uint32_t flow, std::string_view service, std::string_view bytes) override;
 
 private:
     std::shared_ptr<leg> leg_of(uint32_t stream);
@@ -201,6 +220,25 @@ private:
     // A leg to `target` (`host:port`) for a stream the far side opened from `peer`, refused when it cannot be begun.
     void dial_leg(link& l, uint32_t stream, std::string_view target, std::string_view peer);
 
+    // ── UDP, at both ends ──
+    bool arm_udp(udp_port& p);
+    void on_udp(udp_port& p, int res);
+    // A socket given up, closed at once or once the ring owes it nothing.
+    void retire_udp(std::unique_ptr<udp_port> p);
+    // A datagram for the link, dropped when the link already holds more than a datagram should wait behind.
+    void send_datagram(link& l, uint32_t flow, std::string_view service, std::string_view bytes);
+    // At the edge, a visitor's datagram on a service's port carried to its agent, and an agent's back to its visitor.
+    void udp_visitor(const std::string& service, const udp_port& p, std::string_view bytes);
+    void udp_from_agent(link& l, uint32_t flow, std::string_view service, std::string_view bytes);
+    // At an agent, the edge's datagram sent to the offer it names, through its flow's own socket.
+    void udp_from_edge(link& l, uint32_t flow, std::string_view service, std::string_view bytes);
+    // The UDP services' ports as the agents file says, at the edge.
+    void reload_udp();
+    // Flows silent for long forgotten, and a socket the ring once refused armed again.
+    void tend_udp(int64_t now);
+    link* edge_link();
+    size_t flow_count() const;
+
     // ── the edge ──
     bool start_edge(std::string& why);
     void reload_agents();
@@ -265,6 +303,34 @@ private:
     std::vector<std::string> m_forward;
     std::unique_ptr<socketley::idp::session_verifier> m_idp;
 
+    // A UDP service's port at the edge and its visitors' flows, each visitor's address one flow.
+    struct udp_flow
+    {
+        sockaddr_storage peer{};
+        socklen_t len{0};
+        int64_t last{0};
+        std::string key;
+    };
+    struct udp_service
+    {
+        std::string agent;
+        service svc;
+        std::unique_ptr<udp_port> port;
+        std::unordered_map<std::string, uint32_t> by_peer;
+        std::unordered_map<uint32_t, udp_flow> flows;
+    };
+    std::map<std::string, udp_service> m_udp;
+    uint32_t m_next_flow{1};
+    // At an agent, each flow the edge sent with its own socket to the offer, so the answers find their visitor.
+    struct agent_flow
+    {
+        std::unique_ptr<udp_port> port;
+        std::string service;
+        int64_t last{0};
+    };
+    std::unordered_map<uint32_t, agent_flow> m_flows;
+    std::vector<std::unique_ptr<udp_port>> m_udp_dying;
+
     // The agent's connection to the edge and its dialler of offers.
     std::unique_ptr<upstream_hooks> m_up;
     std::unique_ptr<leg_hooks> m_local;
@@ -280,7 +346,8 @@ private:
 
     struct counters
     {
-        uint64_t links{0}, refused{0}, streams{0}, joined{0}, visitors_refused{0}, bytes_in{0}, bytes_out{0}, shared{0};
+        uint64_t links{0}, refused{0}, streams{0}, joined{0}, visitors_refused{0}, bytes_in{0}, bytes_out{0}, shared{0},
+            datagrams{0}, datagrams_dropped{0};
     } m_c;
 };
 

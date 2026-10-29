@@ -7,7 +7,7 @@
 //   <state>/tunnel/<edge>/agents, a line each:
 //     agent <name> invited|joined <sha256 hex of the secret> <service>[,<service>...]
 //   a service `http:<name>`, reached at <name>.<the edge's domain> and with `=<auth>` only by visitors that auth
-//   admits, or `tcp:<name>:<port>`, a port on the edge.
+//   admits, or `tcp:<name>:<port>` or `udp:<name>:<port>`, a port on the edge.
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -20,6 +20,8 @@ namespace socketley::tunnel
 struct service
 {
     bool http{true};
+    // A service that is not HTTP carries TCP, or with this UDP datagrams, on its port.
+    bool udp{false};
     std::string name;
     uint16_t port{0};
     // The IPv4 address a TCP service's port is opened on, empty for every one the edge's machine has.
@@ -62,8 +64,9 @@ std::string render_agents(const std::vector<agent>& agents);
 // The ways a service's visitors may be let in, `idp:auth+bearer:/etc/x` as its two; a request any one admits passes.
 std::vector<std::string_view> auth_methods(std::string_view auth);
 
-// `--http a,b=idp:auth --tcp c:25565` as services; false with `why` for a bad name or port.
-bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::vector<service>& out, std::string& why);
+// `--http a,b=idp:auth --tcp c:25565 --udp d:19132` as services; false with `why` for a bad name or port.
+bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::string_view udp_csv,
+                    std::vector<service>& out, std::string& why);
 
 // Why `a`'s services clash with another agent's, naming them twice or a port twice; empty when they do not.
 std::string clash(const std::vector<agent>& agents, const agent& a);

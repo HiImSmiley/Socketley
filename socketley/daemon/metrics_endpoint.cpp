@@ -858,6 +858,11 @@ static void append_tunnel_series(std::string& out, const std::vector<storage_row
            "bytes_in");
     family("socketley_tunnel_bytes_out_total", "counter", "Bytes a tunnel received and wrote to its local connections.",
            "bytes_out");
+    family("socketley_tunnel_shares", "gauge", "Ports people share at an edge now.", "shares");
+    family("socketley_tunnel_flows", "gauge", "UDP flows a tunnel carries now, a visitor each.", "flows");
+    family("socketley_tunnel_datagrams_total", "counter", "UDP datagrams a tunnel carried onto its link.", "datagrams");
+    family("socketley_tunnel_datagrams_dropped_total", "counter",
+           "UDP datagrams a tunnel dropped: no agent, a full link, too many flows, or cut.", "datagrams_dropped");
 }
 
 static void append_mail_series(std::string& out, const std::vector<storage_row>& rows)

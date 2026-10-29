@@ -3695,8 +3695,10 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
                 const tn::service& s = a.services[i];
                 if (i)
                     out += ',';
+                // A UDP service as --udp names it, beside the TCP ones as --tcp does.
                 out += s.http ? s.name + (s.auth.empty() ? "" : "=" + s.auth)
-                              : s.name + (s.bind.empty() ? "" : ":" + s.bind) + ":" + std::to_string(s.port);
+                              : s.name + (s.bind.empty() ? "" : ":" + s.bind) + ":" + std::to_string(s.port) +
+                                    (s.udp ? "/udp" : "");
             }
             out += "\n";
         }
@@ -3724,13 +3726,15 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
         const bool invite = action == "invite";
         tn::agent a;
         a.name = std::string(pa.args[3]);
-        std::string http, tcp;
+        std::string http, tcp, udp;
         for (size_t i = 4; i < pa.count; ++i)
         {
             if (pa.args[i] == "--http" && i + 1 < pa.count)
                 http = std::string(pa.args[++i]);
             else if (pa.args[i] == "--tcp" && i + 1 < pa.count)
                 tcp = std::string(pa.args[++i]);
+            else if (pa.args[i] == "--udp" && i + 1 < pa.count)
+                udp = std::string(pa.args[++i]);
             else
             {
                 conn->write_buf = command_usage::line("tunnel");
@@ -3742,7 +3746,7 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf = "an agent's name is lower-case letters, digits and -\n";
             return 1;
         }
-        if (!tn::parse_services(http, tcp, a.services, why))
+        if (!tn::parse_services(http, tcp, udp, a.services, why))
         {
             conn->write_buf = why + "\n";
             return 1;

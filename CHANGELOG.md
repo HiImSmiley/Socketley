@@ -830,6 +830,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **UDP through a tunnel.** `tunnel <edge> invite|set <agent> --udp
+  <name>:<port>` and `tunnel join ... --udp <service>:<port>=<host>:<port>`
+  open a UDP port on the edge whose visitors' datagrams the agent carries to a
+  service at home and back, each visitor a flow of its own, for a game server
+  or anything else that speaks UDP; a datagram is dropped rather than queued
+  while the agent is away or its link is full, and the metrics count both.
 - **An SSH certificate is revoked now, not at its expiry.** `socketley
   idp-ssh <idp> revoke <user>|<serial>` ends a person's certificates at once,
   through the revocation list `idp-ssh <idp> krl` names for sshd's

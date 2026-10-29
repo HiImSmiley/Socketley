@@ -56,8 +56,9 @@ bool parse_service(std::string_view s, service& out)
             auth_ok = auth_ok && c > ' ' && c != ',' && c != '#' && c != 0x7f;
         return valid_name(out.name) && auth_ok;
     }
-    if (!s.starts_with("tcp:"))
+    if (!s.starts_with("tcp:") && !s.starts_with("udp:"))
         return false;
+    out.udp = s.starts_with("udp:");
     s.remove_prefix(4);
     // `<name>:<port>`, or `<name>:<address>:<port>` for a port opened on that address alone.
     const size_t first = s.find(':'), colon = s.rfind(':');
@@ -81,7 +82,7 @@ std::string render_service(const service& s)
 {
     if (s.http)
         return "http:" + s.name + (s.auth.empty() ? "" : "=" + s.auth);
-    return "tcp:" + s.name + (s.bind.empty() ? "" : ":" + s.bind) + ":" + std::to_string(s.port);
+    return (s.udp ? "udp:" : "tcp:") + s.name + (s.bind.empty() ? "" : ":" + s.bind) + ":" + std::to_string(s.port);
 }
 
 }   // namespace
@@ -250,7 +251,8 @@ std::vector<std::string_view> auth_methods(std::string_view auth)
     return out;
 }
 
-bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::vector<service>& out, std::string& why)
+bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::string_view udp_csv,
+                    std::vector<service>& out, std::string& why)
 {
     out.clear();
     while (!http_csv.empty())
@@ -277,20 +279,42 @@ bool parse_services(std::string_view http_csv, std::string_view tcp_csv, std::ve
         }
         out.push_back(std::move(s));
     }
+    while (!udp_csv.empty())
+    {
+        service s;
+        const std::string_view n = trim_blanks(take_item(udp_csv));
+        if (!parse_service("udp:" + std::string(n), s))
+        {
+            why = "--udp takes <name>:<port>, the port the edge serves it on, or <name>:<address>:<port> for that "
+                  "address alone";
+            return false;
+        }
+        out.push_back(std::move(s));
+    }
     if (out.empty())
     {
-        why = "an agent offers at least one service: --http <name> or --tcp <name>:<port>";
+        why = "an agent offers at least one service: --http <name>, --tcp <name>:<port> or --udp <name>:<port>";
         return false;
     }
     return true;
 }
 
+namespace
+{
+
+// Two services on one port of the edge, TCP beside TCP or UDP beside UDP; a TCP and a UDP port of one number are two.
+bool same_port(const service& a, const service& b)
+{
+    return !a.http && !b.http && a.udp == b.udp && a.port == b.port;
+}
+
+}   // namespace
+
 std::string clash(const std::vector<agent>& agents, const agent& a)
 {
     for (size_t i = 0; i < a.services.size(); ++i)
         for (size_t j = 0; j < i; ++j)
-            if (a.services[i].name == a.services[j].name ||
-                (!a.services[i].http && !a.services[j].http && a.services[i].port == a.services[j].port))
+            if (a.services[i].name == a.services[j].name || same_port(a.services[i], a.services[j]))
                 return "the service " + a.services[i].name + " is named twice";
     for (const agent& o : agents)
     {
@@ -298,7 +322,7 @@ std::string clash(const std::vector<agent>& agents, const agent& a)
             continue;
         for (const service& s : o.services)
             for (const service& t : a.services)
-                if (s.name == t.name || (!s.http && !t.http && s.port == t.port))
+                if (s.name == t.name || same_port(s, t))
                     return "the service " + t.name + (s.name == t.name ? "" : " (port " + std::to_string(t.port) + ")") +
                            " is already " + o.name + "'s";
     }

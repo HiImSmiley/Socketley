@@ -50,6 +50,10 @@ struct recorder : events
     void on_window(uint32_t s) override { log.push_back("window " + std::to_string(s)); }
     void on_pong(std::string_view t) override { log.push_back("pong " + std::string(t)); }
     void on_goaway(std::string_view w) override { log.push_back("goaway " + std::string(w)); }
+    void on_datagram(uint32_t f, std::string_view svc, std::string_view b) override
+    {
+        log.push_back("datagram " + std::to_string(f) + " " + std::string(svc) + " " + std::string(b));
+    }
 };
 
 // Two ends of one connection, each one's output fed to the other.
@@ -196,6 +200,27 @@ TEST_CASE("resets, refusals, the stream limit, pings and goaway")
     CHECK(p.a.open("pi", "", p.a_out) == 0);
 }
 
+TEST_CASE("a datagram goes either way named by its flow and service, outside every stream's credit")
+{
+    pair_of p;
+    CHECK(p.a.datagram(7, "mc", "ping", p.a_out));
+    CHECK(p.b.datagram(7, "mc", std::string("pong\0x", 6), p.b_out));
+    REQUIRE(p.pump());
+    CHECK(p.rb.log.back() == "datagram 7 mc ping");
+    CHECK(p.ra.log.back() == std::string("datagram 7 mc pong\0x", 20));
+    // A stream that used its credit up holds back no datagram.
+    const uint32_t s = p.a.open("pi", "", p.a_out);
+    CHECK(p.a.send(s, std::string(initial_window, 'x'), p.a_out) == initial_window);
+    CHECK(p.a.credit(s) == 0);
+    CHECK(p.a.datagram(8, "mc", "still", p.a_out));
+    REQUIRE(p.pump());
+    CHECK(p.rb.log.back() == "datagram 8 mc still");
+    // What no frame can name is not sent.
+    CHECK_FALSE(p.a.datagram(0, "mc", "x", p.a_out));
+    CHECK_FALSE(p.a.datagram(1, "", "x", p.a_out));
+    CHECK_FALSE(p.a.datagram(1, "mc", std::string(max_payload, 'x'), p.a_out));
+}
+
 TEST_CASE("a far side that breaks the protocol ends the session")
 {
     const auto broken = [](const std::string& bytes, bool dialled = false) {
@@ -227,6 +252,9 @@ TEST_CASE("a far side that breaks the protocol ends the session")
     CHECK(broken(h + header).starts_with("a frame of 16777216 bytes"));
     CHECK(broken(h + frame(static_cast<frame_type>(42), 0, "")) == "a frame of unknown type 42");
     CHECK(broken(h + frame(frame_type::ping, 0, "short")) == "a ping of 5 bytes");
+    CHECK(broken(h + frame(frame_type::datagram, 0, std::string("\0\2mcx", 5))) == "a datagram with no flow or no service");
+    CHECK(broken(h + frame(frame_type::datagram, 3, std::string("\0\0x", 3))) == "a datagram with no flow or no service");
+    CHECK(broken(h + frame(frame_type::datagram, 3, std::string("\0\x09mc", 4))) == "a datagram with no flow or no service");
     // Credit that would pass 2^31.
     {
         recorder r;
@@ -328,23 +356,28 @@ TEST_CASE("the agents file is read as written, and refuses what it cannot be")
     // A # given as a service's auth, as a join's header may carry, would start a comment in the file.
     std::vector<service> hashed;
     std::string w;
-    CHECK_FALSE(parse_services("web=idp:a#x", "", hashed, w));
+    CHECK_FALSE(parse_services("web=idp:a#x", "", "", hashed, w));
     // A name or a port another agent has.
     CHECK(refused("agent pi joined " + hash + " http:web\nagent nas joined " + hash + " http:web\n"));
     CHECK(refused("agent pi joined " + hash + " tcp:a:2000\nagent nas joined " + hash + " tcp:b:2000\n"));
+    CHECK(refused("agent pi joined " + hash + " udp:a:2000\nagent nas joined " + hash + " udp:b:2000\n"));
+    // A TCP and a UDP port of one number are two ports.
+    CHECK_FALSE(refused("agent pi joined " + hash + " tcp:a:2000\nagent nas joined " + hash + " udp:b:2000\n"));
 }
 
 TEST_CASE("services, credentials and names")
 {
     std::vector<service> s;
     std::string why;
-    REQUIRE(parse_services("web, files=bearer:/etc/tokens", "mc:25565", s, why));
-    CHECK(s.size() == 3);
+    REQUIRE(parse_services("web, files=bearer:/etc/tokens", "mc:25565", "bedrock:127.0.0.1:19132", s, why));
+    CHECK(s.size() == 4);
     CHECK((s[0].auth.empty() && s[1].name == "files" && s[1].auth == "bearer:/etc/tokens"));
-    CHECK_FALSE(parse_services("files=", "", s, why));
-    CHECK_FALSE(parse_services("", "", s, why));
-    CHECK_FALSE(parse_services("Web", "", s, why));
-    CHECK_FALSE(parse_services("", "mc", s, why));
+    CHECK((!s[2].udp && s[3].udp && s[3].port == 19132 && s[3].bind == "127.0.0.1"));
+    CHECK_FALSE(parse_services("files=", "", "", s, why));
+    CHECK_FALSE(parse_services("", "", "", s, why));
+    CHECK_FALSE(parse_services("Web", "", "", s, why));
+    CHECK_FALSE(parse_services("", "mc", "", s, why));
+    CHECK_FALSE(parse_services("", "", "bedrock", s, why));
     CHECK(valid_name("a-1"));
     CHECK_FALSE(valid_name("-a"));
     CHECK_FALSE(valid_name(std::string(64, 'a')));

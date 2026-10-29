@@ -209,6 +209,14 @@ bool session::frame(frame_type t, uint32_t stream, std::string_view p, std::stri
             m_got_goaway = true;
             m_ev.on_goaway(p);
             return true;
+        case frame_type::datagram:
+        {
+            std::string_view service;
+            if (stream == 0 || !take_string(p, service) || service.empty() || service.size() > max_target)
+                return fail("a datagram with no flow or no service");
+            m_ev.on_datagram(stream, service, p);
+            return true;
+        }
     }
     return fail("a frame of unknown type " + std::to_string(static_cast<unsigned>(t)));
 }
@@ -294,6 +302,19 @@ void session::consumed(uint32_t stream, size_t n, std::string& out)
     put(frame_type::window, stream, p, out);
     s.recv_credit += s.unacked;
     s.unacked = 0;
+}
+
+bool session::datagram(uint32_t flow, std::string_view service, std::string_view bytes, std::string& out)
+{
+    if (flow == 0 || service.empty() || service.size() > max_target || 2 + service.size() + bytes.size() > max_payload)
+        return false;
+    std::string p;
+    p.reserve(2 + service.size() + bytes.size());
+    put_u16(p, static_cast<uint16_t>(service.size()));
+    p.append(service);
+    p.append(bytes);
+    put(frame_type::datagram, flow, p, out);
+    return true;
 }
 
 void session::ping(std::string_view token, std::string& out)

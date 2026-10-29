@@ -46,6 +46,32 @@ constexpr int64_t share_default_s = 2 * 3600;
 constexpr int64_t share_max_s = 24 * 3600;
 constexpr size_t shares_per_person = 3;
 constexpr size_t shares_per_edge = 32;
+// A UDP flow is forgotten after a minute of silence, a service or an agent holds so many at once, and a datagram is
+// dropped rather than queued behind more than this, which a game would rather lose than wait for.
+constexpr int64_t flow_idle_s = 60;
+constexpr size_t max_flows = 1024;
+constexpr size_t udp_queue_limit = 256 * 1024;
+// What one receive takes: any datagram at an edge's port, and at an agent's flow what a home service answers with.
+constexpr size_t edge_udp_buf = 65536;
+constexpr size_t flow_udp_buf = 9216;
+
+// A UDP socket bound to `on`, or connected to it, armed by the caller; null with `why`.
+std::unique_ptr<udp_port> open_udp(const endpoint& on, bool connect_to, size_t buf, std::string& why)
+{
+    const int fd = ::socket(on.addr.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    const sockaddr* a = reinterpret_cast<const sockaddr*>(&on.addr);
+    if (fd < 0 || (connect_to ? ::connect(fd, a, on.len) : ::bind(fd, a, on.len)) < 0)
+    {
+        why = std::strerror(errno);
+        if (fd >= 0)
+            ::close(fd);
+        return nullptr;
+    }
+    auto p = std::make_unique<udp_port>();
+    p->fd = fd;
+    p->buf.resize(buf);
+    return p;
+}
 
 std::string peer_text(const sockaddr_storage& a)
 {
@@ -224,6 +250,15 @@ void link::on_window(uint32_t stream)
 }
 
 void link::on_pong(std::string_view) {}
+
+void link::on_datagram(uint32_t flow, std::string_view service, std::string_view bytes)
+{
+    // An agent's datagram answers a visitor, the edge's is for an offer here, and a person carries no UDP.
+    if (k == kind::agent)
+        run.udp_from_agent(*this, flow, service, bytes);
+    else if (k == kind::edge)
+        run.udp_from_edge(*this, flow, service, bytes);
+}
 
 void link::on_goaway(std::string_view) {}
 
@@ -450,6 +485,12 @@ void tunnel_run::stop()
         m_up->srv.stop();
     if (m_local)
         m_local->srv.stop();
+    for (auto& [name, u] : m_udp)
+        retire_udp(std::move(u.port));
+    m_udp.clear();
+    for (auto& [id, f] : m_flows)
+        retire_udp(std::move(f.port));
+    m_flows.clear();
 }
 
 bool tunnel_run::drained() const
@@ -474,6 +515,12 @@ void tunnel_run::on_cqe(struct io_uring_cqe* cqe)
     {
         m_tick_armed = false;
         tick();
+        return;
+    }
+    // The tunnel's own receives on UDP sockets, which no connection server here arms.
+    if (req->type == op_recvmsg && req->owner == this)
+    {
+        on_udp(*reinterpret_cast<udp_port*>(req->buffer), cqe->res);
         return;
     }
     if ((m_front && m_front->srv.on_cqe(req, cqe)) || (m_dial && m_dial->srv.on_cqe(req, cqe)) ||
@@ -550,6 +597,7 @@ void tunnel_run::tick()
     }
     else if (m_up->srv.empty() && now >= m_next_dial)
         dial_edge();
+    tend_udp(now);
     arm_tick();
 }
 
@@ -653,7 +701,260 @@ std::string tunnel_run::stats() const
            "\nstreams:" + std::to_string(m_c.streams) + "\nrefused:" + std::to_string(m_c.refused) +
            "\njoined:" + std::to_string(m_c.joined) + "\nvisitors_refused:" + std::to_string(m_c.visitors_refused) +
            "\nshares:" + std::to_string(m_shares.size()) + "\nshared:" + std::to_string(m_c.shared) +
+           "\nflows:" + std::to_string(flow_count()) + "\ndatagrams:" + std::to_string(m_c.datagrams) +
+           "\ndatagrams_dropped:" + std::to_string(m_c.datagrams_dropped) +
            "\nbytes_in:" + std::to_string(m_c.bytes_in) + "\nbytes_out:" + std::to_string(m_c.bytes_out) + "\n";
+}
+
+// ─── UDP ────────────────────────────────────────────────────────────────────
+
+bool tunnel_run::arm_udp(udp_port& p)
+{
+    p.iov = iovec{p.buf.data(), p.buf.size()};
+    p.msg = msghdr{};
+    p.msg.msg_name = &p.from;
+    p.msg.msg_namelen = sizeof p.from;
+    p.msg.msg_iov = &p.iov;
+    p.msg.msg_iovlen = 1;
+    p.req = io_request{this, reinterpret_cast<char*>(&p), p.fd, 0, op_recvmsg};
+    p.pending = m_loop.submit_recvmsg(p.fd, &p.msg, &p.req);
+    return p.pending;
+}
+
+void tunnel_run::on_udp(udp_port& p, int res)
+{
+    p.pending = false;
+    if (p.dying)
+    {
+        const auto it = std::find_if(m_udp_dying.begin(), m_udp_dying.end(), [&](const auto& d) { return d.get() == &p; });
+        if (it != m_udp_dying.end())
+        {
+            ::close(p.fd);
+            m_udp_dying.erase(it);
+        }
+        return;
+    }
+    // A datagram cut to the buffer is not the one that was sent, and is dropped as a full socket drops one.
+    if (res > 0 && !(p.msg.msg_flags & MSG_TRUNC) && p.got)
+        p.got(p, std::string_view(p.buf.data(), static_cast<size_t>(res)));
+    else if (res > 0)
+        ++m_c.datagrams_dropped;
+    if (!p.dying && !m_stopped)
+        arm_udp(p);
+}
+
+void tunnel_run::retire_udp(std::unique_ptr<udp_port> p)
+{
+    if (!p)
+        return;
+    p->got = nullptr;
+    if (!p->pending)
+    {
+        ::close(p->fd);
+        return;
+    }
+    p->dying = true;
+    if (!m_loop.submit_cancel_request(&p->req)) {}
+    m_udp_dying.push_back(std::move(p));
+}
+
+void tunnel_run::send_datagram(link& l, uint32_t flow, std::string_view service, std::string_view bytes)
+{
+    const auto t = l.transport.lock();
+    const size_t queued = l.out.size() + (t ? t->out.size() + (t->sending.size() - t->sent) : 0);
+    if (!t || t->dead || queued > udp_queue_limit || !l.s.datagram(flow, service, bytes, l.out))
+    {
+        ++m_c.datagrams_dropped;
+        return;
+    }
+    ++m_c.datagrams;
+    m_c.bytes_in += bytes.size();
+    flush_link(l);
+}
+
+void tunnel_run::udp_visitor(const std::string& service, const udp_port& p, std::string_view bytes)
+{
+    const auto it = m_udp.find(service);
+    if (it == m_udp.end())
+        return;
+    udp_service& u = it->second;
+    const int64_t now = wall::now_sec();
+    std::string key(reinterpret_cast<const char*>(&p.from), p.msg.msg_namelen);
+    uint32_t flow = 0;
+    if (const auto f = u.by_peer.find(key); f != u.by_peer.end())
+    {
+        flow = f->second;
+        u.flows[flow].last = now;
+    }
+    else
+    {
+        if (u.flows.size() >= max_flows)
+        {
+            ++m_c.datagrams_dropped;
+            return;
+        }
+        flow = m_next_flow++;
+        if (m_next_flow == 0)
+            m_next_flow = 1;
+        u.flows[flow] = udp_flow{p.from, p.msg.msg_namelen, now, key};
+        u.by_peer.emplace(std::move(key), flow);
+    }
+    const auto a = m_agent_links.find(u.agent);
+    const auto l = a == m_agent_links.end() ? nullptr : a->second.lock();
+    if (!l)
+    {
+        // Nobody to carry it to: the agent is not connected.
+        ++m_c.datagrams_dropped;
+        return;
+    }
+    send_datagram(*l, flow, service, bytes);
+}
+
+void tunnel_run::udp_from_agent(link& l, uint32_t flow, std::string_view service, std::string_view bytes)
+{
+    // Only into a service of this agent's own, and only to a visitor that sent it something.
+    const auto it = m_udp.find(std::string(service));
+    if (it == m_udp.end() || it->second.agent != l.who || !it->second.port)
+        return;
+    const auto f = it->second.flows.find(flow);
+    if (f == it->second.flows.end())
+        return;
+    f->second.last = wall::now_sec();
+    m_c.bytes_out += bytes.size();
+    if (::sendto(it->second.port->fd, bytes.data(), bytes.size(), MSG_DONTWAIT,
+                 reinterpret_cast<const sockaddr*>(&f->second.peer), f->second.len) < 0)
+        ++m_c.datagrams_dropped;
+}
+
+void tunnel_run::udp_from_edge(link&, uint32_t flow, std::string_view service, std::string_view bytes)
+{
+    auto it = m_flows.find(flow);
+    if (it == m_flows.end())
+    {
+        // A new flow gets a socket of its own to the offer the service names, so its answers are told apart.
+        const auto o = m_offers.find(std::string(service));
+        endpoint ep;
+        std::string why;
+        auto p = o == m_offers.end() || m_flows.size() >= max_flows || !target_endpoint(o->second, ep)
+                     ? nullptr
+                     : open_udp(ep, true, flow_udp_buf, why);
+        if (!p)
+        {
+            ++m_c.datagrams_dropped;
+            return;
+        }
+        const std::string svc(service);
+        p->got = [this, flow, svc](udp_port&, std::string_view answer) {
+            if (const auto f = m_flows.find(flow); f != m_flows.end())
+                f->second.last = wall::now_sec();
+            if (link* e = edge_link())
+                send_datagram(*e, flow, svc, answer);
+        };
+        if (!arm_udp(*p))
+        {
+            retire_udp(std::move(p));
+            ++m_c.datagrams_dropped;
+            return;
+        }
+        it = m_flows.emplace(flow, agent_flow{std::move(p), svc, 0}).first;
+    }
+    if (it->second.service != service)
+        return;
+    it->second.last = wall::now_sec();
+    m_c.bytes_out += bytes.size();
+    if (::send(it->second.port->fd, bytes.data(), bytes.size(), MSG_DONTWAIT) < 0)
+        ++m_c.datagrams_dropped;
+}
+
+void tunnel_run::reload_udp()
+{
+    // A service gone, moved to another port or another agent takes its port and its flows with it.
+    for (auto it = m_udp.begin(); it != m_udp.end();)
+    {
+        bool kept = false;
+        for (const agent& a : m_agents)
+            for (const service& s : a.services)
+                kept = kept || (!s.http && s.udp && s.name == it->first && a.name == it->second.agent &&
+                                s.port == it->second.svc.port && s.bind == it->second.svc.bind);
+        if (kept)
+        {
+            ++it;
+            continue;
+        }
+        retire_udp(std::move(it->second.port));
+        it = m_udp.erase(it);
+    }
+    for (const agent& a : m_agents)
+        for (const service& s : a.services)
+        {
+            if (s.http || !s.udp || m_udp.contains(s.name))
+                continue;
+            endpoint on;
+            if (!literal_endpoint(s.bind.empty() ? "0.0.0.0" : s.bind, s.port, on))
+                continue;
+            std::string why;
+            auto p = open_udp(on, false, edge_udp_buf, why);
+            if (!p)
+            {
+                LOG_WARN(("tunnel " + std::string(m_owner.get_name()) + ": the UDP service " + s.name + " of " + a.name +
+                          " cannot be served: " + why).c_str());
+                continue;
+            }
+            const std::string name = s.name;
+            p->got = [this, name](udp_port& port, std::string_view bytes) { udp_visitor(name, port, bytes); };
+            arm_udp(*p);
+            m_udp.emplace(s.name, udp_service{a.name, s, std::move(p), {}, {}});
+        }
+}
+
+void tunnel_run::tend_udp(int64_t now)
+{
+    for (auto& [name, u] : m_udp)
+    {
+        for (auto f = u.flows.begin(); f != u.flows.end();)
+        {
+            if (now - f->second.last <= flow_idle_s)
+            {
+                ++f;
+                continue;
+            }
+            u.by_peer.erase(f->second.key);
+            f = u.flows.erase(f);
+        }
+        if (u.port && !u.port->pending)
+            arm_udp(*u.port);
+    }
+    for (auto f = m_flows.begin(); f != m_flows.end();)
+    {
+        if (now - f->second.last <= flow_idle_s)
+        {
+            if (f->second.port && !f->second.port->pending)
+                arm_udp(*f->second.port);
+            ++f;
+            continue;
+        }
+        retire_udp(std::move(f->second.port));
+        f = m_flows.erase(f);
+    }
+}
+
+link* tunnel_run::edge_link()
+{
+    link* out = nullptr;
+    if (m_up)
+        m_up->srv.for_each([&](const std::shared_ptr<http::server_conn>& c) {
+            if (auto& l = static_cast<upstream_conn&>(*c).l; l && !out)
+                out = l.get();
+        });
+    return out;
+}
+
+size_t tunnel_run::flow_count() const
+{
+    size_t n = m_flows.size();
+    for (const auto& [name, u] : m_udp)
+        n += u.flows.size();
+    return n;
 }
 
 // ─── The edge ───────────────────────────────────────────────────────────────
@@ -756,6 +1057,7 @@ void tunnel_run::reload_agents()
         for (const agent& a : agents)
             for (const service& s : a.services)
                 kept = kept || (a.name == it->second->agent && s.name == it->first && s.http == it->second->svc.http &&
+                                s.udp == it->second->svc.udp &&
                                 s.port == it->second->svc.port && s.bind == it->second->svc.bind &&
                                 s.auth == it->second->svc.auth);
         if (kept)
@@ -770,7 +1072,8 @@ void tunnel_run::reload_agents()
     for (const agent& a : agents)
         for (const service& s : a.services)
         {
-            if (m_listeners.contains(s.name))
+            // A UDP service has a port of its own kind, which reload_udp keeps.
+            if (m_listeners.contains(s.name) || (!s.http && s.udp))
                 continue;
             // A method the edge cannot take serves nothing rather than let every visitor through, as an unread one would.
             std::string bad;
@@ -821,6 +1124,7 @@ void tunnel_run::reload_agents()
     m_agents = std::move(agents);
     for (auto& t : cut)
         m_front->srv.close_conn(t);
+    reload_udp();
 }
 
 void tunnel_run::refuse_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view why)
@@ -867,7 +1171,8 @@ void tunnel_run::join_by_person(const std::shared_ptr<http::server_conn>& c, std
         refuse_front(c, 400, "an agent's name is lower-case letters, digits and -");
         return;
     }
-    if (!parse_services(header_of(head, "tunnel-http"), header_of(head, "tunnel-tcp"), a.services, why))
+    if (!parse_services(header_of(head, "tunnel-http"), header_of(head, "tunnel-tcp"), header_of(head, "tunnel-udp"),
+                        a.services, why))
     {
         refuse_front(c, 400, why);
         return;
@@ -1134,7 +1439,7 @@ std::string tunnel_run::begin_share(const std::string& sub, bool admin, bool ope
         if (taken)
             name.clear();
     }
-    service sv{true, name, 0, {}, open ? std::string() : "idp:" + std::string(m_owner.get_idp())};
+    service sv{true, false, name, 0, {}, open ? std::string() : "idp:" + std::string(m_owner.get_idp())};
     std::string err = name.empty() ? "no free name was found" : open ? std::string() : proxy_auth::spec_error(sv.auth);
     const std::string sock = name.empty() ? std::string() : service_socket(m_owner.get_name(), name);
     if (err.empty())
@@ -1175,7 +1480,7 @@ void tunnel_run::write_shares()
 {
     std::vector<service> list;
     for (const auto& [name, sh] : m_shares)
-        list.push_back(service{true, name, 0, {}, sh.open ? std::string() : "idp:" + std::string(m_owner.get_idp())});
+        list.push_back(service{true, false, name, 0, {}, sh.open ? std::string() : "idp:" + std::string(m_owner.get_idp())});
     if (std::string why; !save_shares(m_owner.get_name(), list, why))
         LOG_WARN(("tunnel " + std::string(m_owner.get_name()) + ": " + why).c_str());
 }
@@ -1592,6 +1897,10 @@ void tunnel_run::edge_gone()
 {
     if (m_stopped)
         return;
+    // The flows were the edge's to name, and a new link names them again from nothing.
+    for (auto& [id, f] : m_flows)
+        retire_udp(std::move(f.port));
+    m_flows.clear();
     // Tried again after a pause that doubles to half a minute, spread so a fleet does not come back at once.
     m_next_dial = wall::now_sec() + m_backoff + static_cast<int64_t>(random_u64() % 2);
     m_backoff = std::min(m_backoff * 2, max_backoff);

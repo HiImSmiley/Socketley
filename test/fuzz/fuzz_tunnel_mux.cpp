@@ -58,6 +58,10 @@ struct reactor : tn::events
     void on_window(uint32_t id) override { log += "window " + std::to_string(id) + "\n"; }
     void on_pong(std::string_view) override { log += "pong\n"; }
     void on_goaway(std::string_view w) override { log += "goaway " + std::to_string(w.size()) + "\n"; }
+    void on_datagram(uint32_t f, std::string_view svc, std::string_view b) override
+    {
+        log += "datagram " + std::to_string(f) + " " + std::string(svc) + " " + std::to_string(b.size()) + "\n";
+    }
 };
 
 struct run

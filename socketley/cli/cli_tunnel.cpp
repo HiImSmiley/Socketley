@@ -715,17 +715,18 @@ std::string host_agent_name()
 // signed in here, adds this machine as an agent, and the agent runtime is made with the invitation the edge answers.
 int join_main(int argc, char** argv)
 {
-    std::string edge, name, http, tcp, offers, idp;
+    std::string edge, name, http, tcp, udp, offers, idp;
     bool replace = false;
     const auto usage = [] {
         std::cout << "usage: socketley tunnel join <edge address> [--name <agent>] [--http <service>=<host>:<port>,...] "
-                     "[--tcp <service>:<edge port>=<host>:<port>,...] [--replace] [--idp <idp address>]\n";
+                     "[--tcp <service>:<edge port>=<host>:<port>,...] [--udp <service>:<edge port>=<host>:<port>,...] "
+                     "[--replace] [--idp <idp address>]\n";
         return 1;
     };
     for (int i = 3; i < argc; ++i)
     {
         const std::string_view a = argv[i];
-        if ((a == "--http" || a == "--tcp") && i + 1 < argc)
+        if ((a == "--http" || a == "--tcp" || a == "--udp") && i + 1 < argc)
         {
             // Each offer names the service the edge serves and where it is reached on this machine.
             std::string_view list = argv[++i];
@@ -736,7 +737,7 @@ int join_main(int argc, char** argv)
                 if (eq == std::string_view::npos || eq == 0 || eq + 1 == item.size())
                     return usage();
                 const std::string_view svc = item.substr(0, eq), there = item.substr(eq + 1);
-                std::string& names = a == "--http" ? http : tcp;
+                std::string& names = a == "--http" ? http : a == "--tcp" ? tcp : udp;
                 names += (names.empty() ? "" : ",") + std::string(svc);
                 offers += (offers.empty() ? "" : ",") + std::string(svc.substr(0, svc.find(':'))) + "=" + std::string(there);
             }
@@ -790,6 +791,7 @@ int join_main(int argc, char** argv)
     std::string invitation;
     if (!ask_edge(ea, "POST /.tunnel/join HTTP/1.1\r\nHost: " + ea.authority + "\r\nAuthorization: Bearer " + token +
                           "\r\nTunnel-Agent: " + name + "\r\nTunnel-Http: " + http + "\r\nTunnel-Tcp: " + tcp +
+                          "\r\nTunnel-Udp: " + udp +
                           (replace ? "\r\nTunnel-Replace: yes" : "") + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                   status, invitation, err))
     {
@@ -823,6 +825,11 @@ int join_main(int argc, char** argv)
     {
         const std::string_view s = socketley::take_item(c);
         std::cout << machine << s.substr(s.rfind(':')) << "\n";
+    }
+    for (std::string_view u = udp; !u.empty();)
+    {
+        const std::string_view s = socketley::take_item(u);
+        std::cout << machine << s.substr(s.rfind(':')) << "/udp\n";
     }
     return 0;
 }

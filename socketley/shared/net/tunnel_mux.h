@@ -43,6 +43,8 @@ enum class frame_type : uint8_t
     ping   = 7,
     pong   = 8,
     goaway = 9,
+    // A UDP datagram of a flow, named by its service; no stream, no credit, and dropped rather than queued when full.
+    datagram = 10,
 };
 
 enum class reset_code : uint8_t
@@ -70,6 +72,8 @@ public:
     virtual void on_window(uint32_t stream) = 0;
     virtual void on_pong(std::string_view token) = 0;
     virtual void on_goaway(std::string_view why) = 0;
+    // A datagram of `flow` for `service`; a side that carries no UDP has nothing to do with it.
+    virtual void on_datagram(uint32_t, std::string_view, std::string_view) {}
 };
 
 class session
@@ -95,6 +99,9 @@ public:
     // `n` bytes of the stream's data handed on, which gives the far side credit back once half of it is used.
     void consumed(uint32_t stream, size_t n, std::string& out);
     void ping(std::string_view token, std::string& out);
+    // A datagram of `flow` for `service` sent; false for a flow of 0, a service no open could name, or bytes past a
+    // frame, which the caller drops as a full socket would.
+    bool datagram(uint32_t flow, std::string_view service, std::string_view bytes, std::string& out);
     void goaway(std::string_view why, std::string& out);
 
     // What the stream may still be sent, 0 for one not open for writing.

@@ -1165,7 +1165,7 @@ socketley idp\-ssh auth revoke alice
 .fi
 .RE
 .TP
-.BI "tunnel " "edge" " invite\fR|\fBset " agent " \fR[\fB\-\-http \fIname\fR[\fB=\fIauth\fR]\fI,...\fR] [\fB\-\-tcp \fIname\fB:\fIport,...\fR]"
+.BI "tunnel " "edge" " invite\fR|\fBset " agent " \fR[\fB\-\-http \fIname\fR[\fB=\fIauth\fR]\fI,...\fR] [\fB\-\-tcp \fIname\fB:\fIport,...\fR] [\fB\-\-udp \fIname\fB:\fIport,...\fR]"
 .TQ
 .BI "tunnel " edge " list\fR|\fBrevoke \fIagent"
 The agents a tunnel edge takes:
@@ -1173,9 +1173,13 @@ The agents a tunnel edge takes:
 prints an invitation, used once, for an agent to offer the services named
 (an HTTP one at
 .IB name . domain ,
-a TCP one on its port, on every address of the machine or, as
+a TCP or a UDP one on its port, on every address of the machine or, as
 .IB name : address : port ,
-on that one alone), and invited again an agent takes a new one; an HTTP
+on that one alone, and a TCP and a UDP service may share a port number), and
+invited again an agent takes a new one; a UDP service carries each visitor's
+datagrams as a flow of its own to the agent and its answers back, forgets a
+flow silent for a minute, and drops a datagram rather than queue it while the
+agent is away or its link is full; an HTTP
 service with
 .BI = auth
 asks each of its visitors for it, as a proxy's
@@ -1196,13 +1200,13 @@ names that port as any other, and is refused while the agent is away. See
 .RS
 .PP
 .nf
-socketley tunnel edge invite pi \-\-http home=idp:auth,nas \-\-tcp mc:25565
+socketley tunnel edge invite pi \-\-http home=idp:auth,nas \-\-tcp mc:25565 \-\-udp bedrock:19132
 socketley tunnel edge set pi \-\-tcp nas:127.0.0.1:9000
 socketley create sync backup \-\-dir /srv/data \-\-storage http://127.0.0.1:9000/backup
 .fi
 .RE
 .TP
-.BI "tunnel join " edge " \fR[\fB\-\-name \fIagent\fR] [\fB\-\-http \fIservice\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-tcp \fIservice\fB:\fIedge-port\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-replace\fR] [\fB\-\-idp \fIidp\fR]"
+.BI "tunnel join " edge " \fR[\fB\-\-name \fIagent\fR] [\fB\-\-http \fIservice\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-tcp \fIservice\fB:\fIedge-port\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-udp \fIservice\fB:\fIedge-port\fB=\fIhost\fB:\fIport,...\fR] [\fB\-\-replace\fR] [\fB\-\-idp \fIidp\fR]"
 This machine made an agent of an edge, by an admin of the edge's idp: signed
 in by a code allowed in a browser when no
 .B login
@@ -11812,17 +11816,21 @@ and
 the rest
 .B socketley_mail_stat
 by name. A tunnel's are
-.B socketley_tunnel_links
+.BR socketley_tunnel_links ,
+.BR _agents ,
+.B _shares
 and
-.B _agents
-as gauges, and
+.B _flows
+(UDP visitors) as gauges, and
 .BR socketley_tunnel_streams_total ,
 .BR _refused_total ,
 .B _visitors_refused_total
 (requests a protected service's auth refused),
-.B _bytes_in_total
+.BR _bytes_in_total ,
+.BR _bytes_out_total ,
+.B _datagrams_total
 and
-.BR _bytes_out_total .
+.BR _datagrams_dropped_total .
 .SS Lua
 A script attached with
 .B \-\-lua
