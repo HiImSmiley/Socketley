@@ -63,6 +63,8 @@ constexpr size_t  max_conns     = 4096;
 // What the endpoints a page's script calls say to every origin alike.
 constexpr std::string_view any_origin = "Access-Control-Allow-Origin: *\r\n";
 constexpr int     miss_limit    = 5;
+// Failures at one IPv6 /48 before all of it is refused, sixteen /64s' worth, as a site is given 65536 of them.
+constexpr int     network_limit = 16 * miss_limit;
 // Failures at one account before each try waits, from 30 seconds to 5 minutes, and wrong codes likewise.
 constexpr int     account_free  = 10;
 constexpr int     code_free     = 5;
@@ -782,7 +784,25 @@ std::string idp_run::client_ip(const conn& c, const request& rq) const
 
 bool idp_run::barred(const std::string& ip, int64_t now)
 {
-    return m_limits.barred(address_key(ip), now, miss_limit);
+    const std::string net = network_key(ip);
+    return m_limits.barred(address_key(ip), now, miss_limit) ||
+           (!net.empty() && m_limits.barred(net, now, network_limit));
+}
+
+std::vector<std::string> idp_run::hold(const std::string& ip, const std::string& acct)
+{
+    std::vector<std::string> keys{address_key(ip), acct};
+    if (std::string net = network_key(ip); !net.empty())
+        keys.push_back(std::move(net));
+    for (const auto& k : keys)
+        m_limits.begin(k);
+    return keys;
+}
+
+void idp_run::release(const std::vector<std::string>& keys)
+{
+    for (const auto& k : keys)
+        m_limits.end(k);
 }
 
 std::string idp_run::known_cookie(const account& who) const
@@ -820,6 +840,8 @@ std::string idp_run::account_key(const request& rq, std::string_view prefix, con
 void idp_run::missed(const std::string& ip, const std::string& acct, int64_t now, std::function<void()> then)
 {
     std::vector<std::string> keys{address_key(ip)};
+    if (std::string net = network_key(ip); !net.empty())
+        keys.push_back(std::move(net));
     if (!acct.empty())
         keys.push_back(acct);
     for (const auto& k : keys)
@@ -1126,16 +1148,13 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     // Counted while its hash is made, so many sent at once are each counted against those sent beside them.
-    const std::string addr = address_key(ip);
-    m_limits.begin(addr);
-    m_limits.begin(acct);
+    const std::vector<std::string> held = hold(ip, acct);
     std::weak_ptr<conn> weak = c;
     const bool remember = param(p, "remember") == "1";
     c->waiting = true;
-    check_password(who, password, [this, weak, p = std::move(p), ip, addr, acct, user, remember](bool ok)
+    check_password(who, password, [this, weak, p = std::move(p), ip, held, acct, user, remember](bool ok)
     {
-        m_limits.end(addr);
-        m_limits.end(acct);
+        release(held);
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
@@ -2082,12 +2101,9 @@ void idp_run::prove_again(const std::shared_ptr<conn>& c, const request& rq, con
         then(503, "Too many sign-ins are being checked; try again in a moment.");
         return;
     }
-    const std::string addr = address_key(ip);
-    m_limits.begin(addr);
-    m_limits.begin(acct);
-    check_password(&who, param(p, "password"), [this, addr, acct, then, wrong](bool right) {
-        m_limits.end(addr);
-        m_limits.end(acct);
+    const std::vector<std::string> held = hold(ip, acct);
+    check_password(&who, param(p, "password"), [this, held, then, wrong](bool right) {
+        release(held);
         if (right)
             then(0, {});
         else
@@ -2709,19 +2725,16 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
         respond(c, 503, "text/plain", "Too many sign-ins are being checked; try again in a moment.\n");
         return;
     }
-    const std::string addr = address_key(ip);
-    m_limits.begin(addr);
-    m_limits.begin(acct);
+    const std::vector<std::string> held = hold(ip, acct);
     const std::string current(param(p, "current"));
     const std::string fresh(param(p, "new"));
     const std::string id = who ? who->id : std::string();
     const std::string problem = socketley::storage::password_problem(fresh, who ? who->username() : "");
     std::weak_ptr<conn> weak = c;
     c->waiting = true;
-    check_password(who, current, [this, weak, rq, token, carried_on, ip, addr, acct, id, fresh, problem, from_reset](bool ok)
+    check_password(who, current, [this, weak, rq, token, carried_on, ip, held, acct, id, fresh, problem, from_reset](bool ok)
     {
-        m_limits.end(addr);
-        m_limits.end(acct);
+        release(held);
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;

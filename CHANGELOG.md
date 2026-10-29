@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The idp bars an IPv6 /48 past eighty failed sign-ins.** Each /64 had
+  its own five, so a site's /48 gave one attacker 65536 budgets of five
+  guesses each a quarter of an hour; the /48 now shares one budget of
+  sixteen /64s' worth, beside each /64's own.
 - **A presigned request is its signer's however it spells the signing
   parameters.** A URL whose `X-Amz-Algorithm` (or V2 `AWSAccessKeyId`) name was
   percent-encoded was verified with the signer's key but then judged as

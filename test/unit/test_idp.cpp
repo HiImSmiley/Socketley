@@ -653,6 +653,16 @@ TEST_CASE("an IPv6 address counts under its /64, an IPv4 one written as IPv6 und
     CHECK(address_key("not an address") == "not an address");
 }
 
+TEST_CASE("an IPv6 address is of a /48 as well, which every /64 of one site shares, and an IPv4 one of none")
+{
+    CHECK(network_key("2001:db8:1:2:aaaa:bbbb:cccc:dddd") == "2001:db8:1::/48");
+    CHECK(network_key("2001:db8:1:2::1") == network_key("2001:db8:1:ffff::9"));
+    CHECK(network_key("2001:db8:2::1") != network_key("2001:db8:1::1"));
+    CHECK(network_key("203.0.113.9").empty());
+    CHECK(network_key("::ffff:198.51.100.7").empty());
+    CHECK(network_key("not an address").empty());
+}
+
 TEST_CASE("attempts in flight count against the bar, and an account waits longer with each failure past its free ones")
 {
     attempt_limits l;

@@ -26,4 +26,18 @@ inline std::string address_key(std::string_view ip)
     return ::inet_ntop(AF_INET6, a, buf, sizeof buf) ? std::string(buf) + "/64" : text;
 }
 
+// The IPv6 /48 a site is given, its 65536 /64s together; empty for IPv4, an IPv4 address written as IPv6, or none.
+inline std::string network_key(std::string_view ip)
+{
+    const std::string text(ip);
+    unsigned char a[16];
+    static constexpr unsigned char mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (text.find(':') == std::string::npos || ::inet_pton(AF_INET6, text.c_str(), a) != 1 ||
+        std::equal(mapped, mapped + 12, a))
+        return {};
+    std::fill(a + 6, a + 16, 0);
+    char buf[INET6_ADDRSTRLEN] = {};
+    return ::inet_ntop(AF_INET6, a, buf, sizeof buf) ? std::string(buf) + "/48" : std::string();
+}
+
 } // namespace socketley

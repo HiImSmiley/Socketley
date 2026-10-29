@@ -90,8 +90,9 @@ bool form_origin_allowed(std::string_view origin, std::string_view issuer, std::
 // it is one, or empty.
 std::string email_problem(std::string_view email);
 
-// What failures from an address count under, as mail counts them too.
+// What failures from an address count under, as mail counts them too, and the IPv6 site around it.
 using socketley::address_key;
+using socketley::network_key;
 
 // Failed attempts by what they were made at -- an address, an account -- within a window, and the attempts at each
 // still being checked, so many sent at once are counted before any of them is answered.

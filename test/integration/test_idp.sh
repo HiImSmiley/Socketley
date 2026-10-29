@@ -6,8 +6,8 @@
 #   * an account losing a field it was given, or its id changing, across a restart
 #   * a client or redirect it does not know being sent a code, or an error sent to an address nobody registered
 #   * a wrong password, an unknown or disabled account, or a sixth failure in a row signing in
-#   * guesses sent together, spread over an IPv6 /64 or over many addresses at one account, or wrong codes, passing
-#     the bars on them
+#   * guesses sent together, spread over an IPv6 /64, over the /64s of one /48 or over many addresses at one account,
+#     or wrong codes, passing the bars on them
 #   * a code redeemed twice, by another client, for another redirect, or without its PKCE verifier
 #   * a token that does not verify against the published key, or names the account by anything but its id
 #   * a refresh for an account disabled, signed out everywhere or made to reset its password since
@@ -540,6 +540,19 @@ elif phase == "limits":
         login("ivy", "wrongpassword", "2001:db8:1:2::%x" % (i + 1))
     check("five failures from one IPv6 /64 bar every address in it", login("ivy", "ivypassword123", "2001:db8:1:2:ffff::9")[0], 429)
     check("and not the next /64", login("ivy", "ivypassword123", "2001:db8:1:3::1")[0], 302)
+    # A site has its /48, so failures spread one each over its /64s bar the whole of it past sixteen /64s' worth.
+    spray = []
+    def sprayer(k):
+        for i in range(k, 80, 10):
+            spray.append(login("spray%d" % i, "wrongpassword", "2001:db8:48:%x::1" % i)[0])
+    ts = [threading.Thread(target=sprayer, args=(k,)) for k in range(10)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("eighty failures from as many /64s of one IPv6 /48 are each checked", spray.count(401), 80)
+    check("and bar a /64 of it not tried before", login("gus", "guspassword123", "2001:db8:48:ffff::1")[0], 429)
+    check("and not another /48", login("gus", "guspassword123", "2001:db8:49::1")[0], 302)
     # Guesses at one account from many addresses hold it up a while, but not in a browser it signed in on.
     st, _, h = login("jon", "jonpassword123", "198.51.100.40")
     known = [c.split(";")[0] for c in (h.get_all("Set-Cookie") or []) if c.startswith("skl_idp_known=")]
