@@ -509,6 +509,14 @@ cli_commands() {
     echo -e "  ${CYAN}socketley tunnel ssh edge.example.com${NC}"
     echo ""
 
+    echo -e "${BOLD}tunnel share <edge> <port>|<address>:<port> [--public] [--for <1m to 24h>]${NC}"
+    echo "  A port of this machine reached at a name the edge gives, beside its"
+    echo "  own, by those signed in at its idp, or by everyone with --public,"
+    echo "  until Ctrl+C, two hours unless --for says, or the sign-in ends. For"
+    echo "  admins of the edge's idp, three at a time. Prints the address."
+    echo -e "  ${CYAN}socketley tunnel share edge.example.com 3000${NC}"
+    echo ""
+
     echo -e "${BOLD}idp-ssh <idp> ca | host-sign <file.pub> --names <host,...> [--days N]${NC}"
     echo "  The idp's SSH authority: its public key for TrustedUserCAKeys and"
     echo "  @cert-authority, and host certificates for HostCertificate."
@@ -3693,6 +3701,7 @@ OTHER
   idp-ssh <idp> ca|host-sign     an idp's SSH authority
   tunnel <edge> invite|list|...  a tunnel edge's agents
   tunnel connect|ssh <edge> ...  a stream through a tunnel edge
+  tunnel share <edge> <port>     a port of this machine at a name, for a while
   db-backup | db-restore         a db runtime to a file, or back from one
   db-query <db> <collection>     the documents a query of a db runtime finds
   mail [<mail>]                  what a mail runtime is and how it does (the name where there are more)

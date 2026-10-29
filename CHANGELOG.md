@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A tunnel edge tells a link why it closes before closing it.** A person
+  signed out, or a share whose time was up, read only that the edge closed the
+  connection, as the edge closed it before its last word was written.
 - **A runtime in the dashboard's sidebar has its actions on a right click.**
   Start or stop, restart, reload Lua, edit and remove, and a link to where it
   is served, as its page offers them, beside each name with its type's icon.
@@ -822,6 +825,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`socketley tunnel share <edge> <port>` shows a port of this machine at a
+  name the edge gives.** Six letters and digits beside the edge's own name, for
+  those signed in at its idp or with `--public` for everyone, until Ctrl+C,
+  two hours unless `--for` says otherwise, or the sign-in ends; for admins of
+  the edge's idp, three at a time.
 - **64-bit ARM.** socketley builds on aarch64 as on x86-64: the makefiles are
   for the machine premake runs on (`release_arm64` there), Release compiles
   for every 64-bit ARM CPU, `scripts/install-from-source.sh` builds premake

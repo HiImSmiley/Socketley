@@ -1,10 +1,14 @@
 // `socketley tunnel connect` and `tunnel ssh`: a signed-in person's stream to a --forward target of a tunnel edge,
-// carried between stdin and stdout, as ssh's ProxyCommand wants it; `tunnel join` makes this machine an agent of an
-// edge its admin signs in at; `tunnel <edge> ...` goes to the daemon.  Errors of connect and ssh go to stderr, unlike
-// every other command, because stdout carries the stream.
+// carried between stdin and stdout, as ssh's ProxyCommand wants it; `tunnel share` a port of this machine at a name the
+// edge gives; `tunnel join` makes this machine an agent of an edge its admin signs in at; `tunnel <edge> ...` goes to
+// the daemon.  Errors of connect, ssh and share go to stderr, unlike every other command, because stdout carries the
+// stream, or the share's address alone.
 #include "cli.h"
 
 #include <cctype>
+#include <charconv>
+#include <ctime>
+#include <map>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +27,7 @@
 #include <openssl/x509v3.h>
 
 #include "../shared/loop/blocking_write.h"
+#include "../shared/util/duration_parse.h"
 #include "../shared/persist/paths.h"
 #include "../shared/util/ascii.h"
 #include "../shared/util/text_list.h"
@@ -267,29 +272,19 @@ bool idp_of(const edge_address& a, std::string& idp, std::string& err)
     return true;
 }
 
-int connect_main(const std::string& edge, const std::string& target, std::string idp)
+// The edge's answer to an upgrade with `token` and `headers`: 0 with the connection upgraded, the 101's head in `head`
+// and what came after it in `leftover`, else the exit status with the reason said on stderr.
+int open_link(const edge_address& ea, const std::string& token, const std::string& headers, conn& c, std::string& head,
+              std::string& leftover)
 {
-    std::string err, token;
-    const edge_address ea = parse_edge(edge);
-    if (!ea.tls && !socketley::authority_is_this_machine(ea.authority))
-    {
-        std::cerr << plain_refusal << "\n";
-        return 1;
-    }
-    if (!idp_of(ea, idp, err) || !cli_access_token(idp, token, err))
-    {
-        std::cerr << err << "\n";
-        return 1;
-    }
-    const std::string& rest = ea.authority;
-    conn c;
+    std::string err;
     if (!dial(c, ea.host, ea.port, ea.tls, err))
     {
         std::cerr << err << "\n";
         return 2;
     }
-    if (!c.write("GET /.tunnel HTTP/1.1\r\nHost: " + rest + "\r\nUpgrade: " + std::string(tn::upgrade_token) +
-                 "\r\nConnection: Upgrade\r\nAuthorization: Bearer " + token + "\r\n\r\n"))
+    if (!c.write("GET /.tunnel HTTP/1.1\r\nHost: " + ea.authority + "\r\nUpgrade: " + std::string(tn::upgrade_token) +
+                 "\r\nConnection: Upgrade\r\nAuthorization: Bearer " + token + "\r\n" + headers + "\r\n"))
     {
         std::cerr << "the edge closed the connection\n";
         return 2;
@@ -312,8 +307,41 @@ int connect_main(const std::string& edge, const std::string& target, std::string
         std::cerr << "the edge refused: " << socketley::ascii::printable(std::string_view(got).substr(end + 4, 300));
         return 1;
     }
-    std::string leftover = got.substr(end + 4);
+    head = got.substr(0, end + 2);
+    leftover = got.substr(end + 4);
+    return 0;
+}
 
+// The domain an edge's services are named in, `.example.com` for edge.example.com, as the edge's own routes name them;
+// empty for an address or an edge named as a whole domain, which have no name beside them.
+std::string beside_edge(const edge_address& ea)
+{
+    in6_addr literal{};
+    const bool named = ::inet_pton(AF_INET, ea.host.c_str(), &literal) != 1 && ea.host.find(':') == std::string::npos;
+    const size_t first_dot = named ? ea.host.find('.') : std::string::npos;
+    const bool beside = first_dot != std::string::npos && ea.host.find('.', first_dot + 1) != std::string::npos;
+    return beside ? ea.host.substr(first_dot) : std::string();
+}
+
+int connect_main(const std::string& edge, const std::string& target, std::string idp)
+{
+    std::string err, token;
+    const edge_address ea = parse_edge(edge);
+    if (!ea.tls && !socketley::authority_is_this_machine(ea.authority))
+    {
+        std::cerr << plain_refusal << "\n";
+        return 1;
+    }
+    if (!idp_of(ea, idp, err) || !cli_access_token(idp, token, err))
+    {
+        std::cerr << err << "\n";
+        return 1;
+    }
+    conn c;
+    std::string head, leftover;
+    if (const int rc = open_link(ea, token, {}, c, head, leftover); rc != 0)
+        return rc;
+    char buf[16384];
     pipe_events ev;
     tn::session s(true, ev);
     std::string out;
@@ -378,6 +406,292 @@ int connect_main(const std::string& edge, const std::string& target, std::string
         std::cerr << ev.why << "\n";
         return 1;
     }
+    return 0;
+}
+
+// A visitor's stream and its connection to the shared port.
+struct share_leg
+{
+    int fd{-1};
+    bool connecting{true};
+    // The visitor's bytes not yet written to the port, held no longer than the stream's window.
+    std::string to_port;
+    // The visitor sends no more, so the port's write half is shut once to_port is written.
+    bool far_closed{false};
+    bool wr_shut{false};
+    // The port sends no more.
+    bool rd_closed{false};
+};
+
+// What the edge asks of a share: a stream for each visitor, to the one port it shares.
+struct share_events : tn::events
+{
+    tn::session* s{nullptr};
+    std::string* out{nullptr};
+    std::string name;
+    sockaddr_storage port{};
+    socklen_t port_len{0};
+    std::map<uint32_t, share_leg> legs;
+    bool gone{false};
+    std::string why;
+
+    void on_hello(const tn::fields&) override {}
+    void on_open(uint32_t id, std::string_view svc, std::string_view) override
+    {
+        // Only the share's own name is carried, and only to the port it shares.
+        const int fd = svc == name ? ::socket(port.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) : -1;
+        if (fd < 0)
+        {
+            s->reset(id, tn::reset_code::refused, *out);
+            return;
+        }
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&port), port_len) < 0 && errno != EINPROGRESS)
+        {
+            ::close(fd);
+            s->reset(id, tn::reset_code::unreachable, *out);
+            return;
+        }
+        legs[id].fd = fd;
+    }
+    void on_data(uint32_t id, std::string_view bytes) override
+    {
+        if (const auto it = legs.find(id); it != legs.end())
+            it->second.to_port.append(bytes);
+    }
+    void on_close(uint32_t id) override
+    {
+        if (const auto it = legs.find(id); it != legs.end())
+            it->second.far_closed = true;
+    }
+    void on_reset(uint32_t id, tn::reset_code) override { drop(id); }
+    void on_window(uint32_t) override {}
+    void on_pong(std::string_view) override {}
+    void on_goaway(std::string_view w) override
+    {
+        gone = true;
+        why = std::string(w);
+    }
+    void drop(uint32_t id)
+    {
+        if (const auto it = legs.find(id); it != legs.end())
+        {
+            ::close(it->second.fd);
+            legs.erase(it);
+        }
+    }
+    // The stream cut and its connection closed, for a port that failed under it.
+    void cut(uint32_t id, tn::reset_code code)
+    {
+        s->reset(id, code, *out);
+        drop(id);
+    }
+};
+
+// `<port>`, `<address>:<port>` or `localhost:<port>` as the address a share connects visitors to; false for a name,
+// which would make the share depend on what this machine's resolver says.
+bool share_port(std::string_view t, sockaddr_storage& out, socklen_t& len)
+{
+    std::string host = "127.0.0.1";
+    std::string_view p = t;
+    if (const size_t colon = t.rfind(':'); colon != std::string_view::npos)
+    {
+        host = std::string(t.substr(0, colon));
+        p = t.substr(colon + 1);
+    }
+    if (host == "localhost")
+        host = "127.0.0.1";
+    if (host.size() > 2 && host.front() == '[' && host.back() == ']')
+        host = host.substr(1, host.size() - 2);
+    uint32_t port = 0;
+    const auto [end, ec] = std::from_chars(p.data(), p.data() + p.size(), port);
+    if (ec != std::errc{} || end != p.data() + p.size() || port == 0 || port > 65535)
+        return false;
+    out = {};
+    if (auto* v4 = reinterpret_cast<sockaddr_in*>(&out); ::inet_pton(AF_INET, host.c_str(), &v4->sin_addr) == 1)
+    {
+        v4->sin_family = AF_INET;
+        v4->sin_port = htons(static_cast<uint16_t>(port));
+        len = sizeof(sockaddr_in);
+        return true;
+    }
+    if (auto* v6 = reinterpret_cast<sockaddr_in6*>(&out); ::inet_pton(AF_INET6, host.c_str(), &v6->sin6_addr) == 1)
+    {
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port = htons(static_cast<uint16_t>(port));
+        len = sizeof(sockaddr_in6);
+        return true;
+    }
+    return false;
+}
+
+// `tunnel share <edge> <port> [--public] [--for <duration>]`: a port of this machine reached at a name the edge gives,
+// by its idp's signed-in people or with --public by everyone, until this ends or the time is up.
+int share_main(const std::string& edge, const std::string& target, bool open, uint64_t seconds, std::string idp)
+{
+    std::string err, token;
+    const edge_address ea = parse_edge(edge);
+    if (!ea.tls && !socketley::authority_is_this_machine(ea.authority))
+    {
+        std::cerr << plain_refusal << "\n";
+        return 1;
+    }
+    share_events ev;
+    if (!share_port(target, ev.port, ev.port_len))
+    {
+        std::cerr << "a share takes a port, or an address and a port: " << target << "\n";
+        return 1;
+    }
+    if (!idp_of(ea, idp, err) || !cli_access_token(idp, token, err))
+    {
+        std::cerr << err << "\n";
+        return 1;
+    }
+    conn c;
+    std::string head, leftover;
+    if (const int rc = open_link(ea, token,
+                                 "Tunnel-Share: " + std::string(open ? "public" : "signed-in") + "\r\nTunnel-Share-For: " +
+                                     std::to_string(seconds) + "\r\n",
+                                 c, head, leftover);
+        rc != 0)
+        return rc;
+    // The name the edge chose, read off its answer.
+    for (std::string_view rest = head; !rest.empty();)
+    {
+        std::string_view line = socketley::take_item(rest, '\n');
+        if (line.ends_with('\r'))
+            line.remove_suffix(1);
+        if (line.size() > 14 && socketley::ascii::iequals(line.substr(0, 14), "tunnel-share: "))
+            ev.name = std::string(socketley::trim_blanks(line.substr(14)));
+    }
+    if (ev.name.empty())
+    {
+        std::cerr << "the edge took the link but gave the share no name; it may be older than this command\n";
+        return 2;
+    }
+    const std::string beside = beside_edge(ea);
+    // An edge reached by its address has no domain to name the share in, so the name alone is said.
+    std::cout << (beside.empty() ? ev.name : "https://" + ev.name + beside + "/") << std::endl;
+    const time_t until = ::time(nullptr) + static_cast<time_t>(seconds);
+    char at[32];
+    std::strftime(at, sizeof at, "%H:%M", std::localtime(&until));
+    std::cerr << "shared with " << (open ? "everyone" : "those signed in at " + idp) << " until " << at
+              << " or Ctrl+C\n";
+
+    tn::session s(true, ev);
+    std::string out;
+    ev.s = &s;
+    ev.out = &out;
+    s.hello({{"person", std::string(socketley::idp::cli_client)}}, out);
+    if (!leftover.empty() && !s.feed(leftover, out))
+    {
+        std::cerr << "the edge broke the protocol: " << s.error() << "\n";
+        return 2;
+    }
+    char buf[16384];
+    std::vector<pollfd> p;
+    std::vector<uint32_t> ids;
+    while (!ev.gone)
+    {
+        if (!out.empty())
+        {
+            if (!c.write(out))
+            {
+                std::cerr << "the edge closed the connection\n";
+                return 2;
+            }
+            out.clear();
+        }
+        p.assign(1, pollfd{c.fd, POLLIN, 0});
+        ids.assign(1, 0);
+        for (const auto& [id, g] : ev.legs)
+        {
+            // A port is read only while the stream has credit for what it brings, and written while it owes bytes.
+            const short want = static_cast<short>((g.connecting || !g.to_port.empty() ? POLLOUT : 0) |
+                                                  (!g.connecting && !g.rd_closed && s.credit(id) > 0 ? POLLIN : 0));
+            p.push_back(pollfd{g.fd, want, 0});
+            ids.push_back(id);
+        }
+        if (!c.pending() && ::poll(p.data(), p.size(), -1) < 0 && errno != EINTR)
+            return 2;
+        if (c.pending() || (p[0].revents & (POLLIN | POLLHUP | POLLERR)))
+        {
+            const ssize_t n = c.read(buf, sizeof buf);
+            if (n <= 0)
+            {
+                std::cerr << "the edge closed the connection\n";
+                return 2;
+            }
+            if (!s.feed(std::string_view(buf, static_cast<size_t>(n)), out))
+            {
+                std::cerr << "the edge broke the protocol: " << s.error() << "\n";
+                return 2;
+            }
+        }
+        for (size_t i = 1; i < p.size(); ++i)
+        {
+            // Found again, as what the edge said above may have reset the stream.
+            const auto it = ev.legs.find(ids[i]);
+            if (it == ev.legs.end() || it->second.fd != p[i].fd)
+                continue;
+            const uint32_t id = ids[i];
+            share_leg& g = it->second;
+            const short r = p[i].revents;
+            if (g.connecting && (r & (POLLOUT | POLLERR | POLLHUP)))
+            {
+                int e = 0;
+                socklen_t el = sizeof e;
+                if (::getsockopt(g.fd, SOL_SOCKET, SO_ERROR, &e, &el) < 0 || e != 0)
+                {
+                    ev.cut(id, tn::reset_code::unreachable);
+                    continue;
+                }
+                g.connecting = false;
+            }
+            if (g.connecting)
+                continue;
+            if ((r & (POLLOUT | POLLERR | POLLHUP)) && !g.to_port.empty())
+            {
+                const ssize_t n = ::send(g.fd, g.to_port.data(), g.to_port.size(), MSG_NOSIGNAL);
+                if (n < 0 && errno != EAGAIN && errno != EINTR)
+                {
+                    ev.cut(id, tn::reset_code::gone);
+                    continue;
+                }
+                if (n > 0)
+                {
+                    g.to_port.erase(0, static_cast<size_t>(n));
+                    s.consumed(id, static_cast<size_t>(n), out);
+                }
+            }
+            if (g.far_closed && g.to_port.empty() && !g.wr_shut)
+            {
+                ::shutdown(g.fd, SHUT_WR);
+                g.wr_shut = true;
+            }
+            if ((r & (POLLIN | POLLHUP | POLLERR)) && !g.rd_closed && s.credit(id) > 0)
+            {
+                const ssize_t n = ::recv(g.fd, buf, std::min<size_t>(sizeof buf, s.credit(id)), 0);
+                if (n > 0)
+                    s.send(id, std::string_view(buf, static_cast<size_t>(n)), out);
+                else if (n == 0)
+                {
+                    s.close(id, out);
+                    g.rd_closed = true;
+                }
+                else if (errno != EAGAIN && errno != EINTR)
+                {
+                    ev.cut(id, tn::reset_code::gone);
+                    continue;
+                }
+            }
+            // Both ways ended: the stream is done on both sides and its connection goes.
+            if (g.rd_closed && g.wr_shut)
+                ev.drop(id);
+        }
+    }
+    if (!out.empty())
+        c.write(out);
+    std::cerr << "the share ended: " << ev.why << "\n";
     return 0;
 }
 
@@ -499,15 +813,9 @@ int join_main(int argc, char** argv)
         std::cout << "the edge holds " << name << " as invited; run this join again once its runtime can be made here\n";
         return rc;
     }
-    // Where each service is now, named beside the edge as the edge names it; an address has no name to be beside.
-    in6_addr literal{};
-    const bool named = ::inet_pton(AF_INET, ea.host.c_str(), &literal) != 1 && ea.host.find(':') == std::string::npos;
-    const size_t first_dot = named ? ea.host.find('.') : std::string::npos;
-    // An edge named as a whole domain has no name beside it, as the edge's own routes have none.
-    const size_t dot = first_dot != std::string::npos && ea.host.find('.', first_dot + 1) != std::string::npos ? first_dot
-                                                                                                               : std::string::npos;
-    const std::string beside = dot == std::string::npos ? std::string() : ea.host.substr(dot);
-    const std::string machine = dot == std::string::npos ? ea.host : ea.host.substr(dot + 1);
+    // Where each service is now, named beside the edge as the edge names it.
+    const std::string beside = beside_edge(ea);
+    const std::string machine = beside.empty() ? ea.host : beside.substr(1);
     std::string_view h = http, c = tcp;
     while (!h.empty())
         std::cout << "https://" << socketley::take_item(h) << beside << "\n";
@@ -526,6 +834,35 @@ int cli_tunnel(int argc, char** argv)
     const std::string_view what = argc > 2 ? argv[2] : "";
     if (what == "join")
         return join_main(argc, argv);
+    if (what == "share")
+    {
+        std::string edge, target, idp;
+        bool open = false, bad = false;
+        uint64_t seconds = 2 * 3600;
+        for (int i = 3; i < argc; ++i)
+        {
+            const std::string_view a = argv[i];
+            if (a == "--public")
+                open = true;
+            else if (a == "--idp" && i + 1 < argc)
+                idp = argv[++i];
+            else if (a == "--for" && i + 1 < argc)
+                bad = bad || parse_duration_seconds(argv[++i], 24 * 3600, seconds) != duration_parse::ok || seconds < 60;
+            else if (edge.empty())
+                edge = a;
+            else if (target.empty())
+                target = a;
+            else
+                bad = true;
+        }
+        if (bad || edge.empty() || target.empty())
+        {
+            std::cout << "usage: socketley tunnel share <edge address> <port>|<address>:<port> [--public] "
+                         "[--for <1m to 24h>] [--idp <idp address>]\n";
+            return 1;
+        }
+        return share_main(edge, target, open, seconds, idp);
+    }
     if (what != "connect" && what != "ssh")
         return cli_forward(argc, argv);
     std::string edge, target, idp, agent;

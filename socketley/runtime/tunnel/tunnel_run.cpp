@@ -41,6 +41,11 @@ constexpr size_t max_head = 16 * 1024;
 constexpr int64_t ping_every = 15;
 constexpr int64_t silent_limit = 45;
 constexpr int64_t max_backoff = 30;
+// A share holds two hours unless asked for less or more, a day at most, and each person and the edge hold only so many.
+constexpr int64_t share_default_s = 2 * 3600;
+constexpr int64_t share_max_s = 24 * 3600;
+constexpr size_t shares_per_person = 3;
+constexpr size_t shares_per_edge = 32;
 
 std::string peer_text(const sockaddr_storage& a)
 {
@@ -509,14 +514,11 @@ void tunnel_run::tick()
     for (const auto& l : links)
     {
         // A person's link ends with the sign-in it was opened by: signed out everywhere, disabled, reset or removed.
-        if (m_edge && l->k == link::kind::person && !person_holds(*l))
+        if (m_edge && l->k == link::kind::person && !l->ending && !person_holds(*l))
         {
             LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": the sign-in of \"" + l->who +
                       "\" no longer holds, and its link is closed").c_str());
-            l->s.goaway("the sign-in no longer holds", l->out);
-            flush_link(*l);
-            if (auto t = l->transport.lock())
-                transports.close_conn(t);
+            end_link(*l, "the sign-in no longer holds");
             continue;
         }
         if (now - l->last_heard > silent_limit)
@@ -534,6 +536,15 @@ void tunnel_run::tick()
     }
     if (m_edge)
     {
+        // A share past its time ends with its link, which tells the person why; gathered first, as a close ends the
+        // share and so changes the map.
+        std::vector<std::shared_ptr<link>> due;
+        for (auto& [name, sh] : m_shares)
+            if (auto l = sh.l.lock(); l && now >= sh.until)
+                due.push_back(std::move(l));
+        for (const auto& l : due)
+            if (!l->ending)
+                end_link(*l, "the share's time is up");
         reload_agents();
         m_front->srv.sweep(now, 30);
     }
@@ -586,6 +597,17 @@ void tunnel_run::flush_link(link& l)
     m_up->srv.flush(t);
 }
 
+void tunnel_run::end_link(link& l, std::string_view why)
+{
+    const auto t = l.transport.lock();
+    if (!t)
+        return;
+    l.ending = true;
+    t->keep_alive = false;
+    l.s.goaway(why, l.out);
+    flush_link(l);
+}
+
 void tunnel_run::drop_link(link& l)
 {
     std::vector<std::shared_ptr<leg>> legs;
@@ -601,6 +623,8 @@ void tunnel_run::drop_link(link& l)
     if (l.k == link::kind::agent)
         if (const auto it = m_agent_links.find(l.who); it != m_agent_links.end() && it->second.lock().get() == &l)
             m_agent_links.erase(it);
+    if (!l.share.empty())
+        end_share(l.share);
 }
 
 size_t tunnel_run::conn_count() const
@@ -628,6 +652,7 @@ std::string tunnel_run::stats() const
            "\nagents:" + std::to_string(m_agents.size()) + "\nlinks_made:" + std::to_string(m_c.links) +
            "\nstreams:" + std::to_string(m_c.streams) + "\nrefused:" + std::to_string(m_c.refused) +
            "\njoined:" + std::to_string(m_c.joined) + "\nvisitors_refused:" + std::to_string(m_c.visitors_refused) +
+           "\nshares:" + std::to_string(m_shares.size()) + "\nshared:" + std::to_string(m_c.shared) +
            "\nbytes_in:" + std::to_string(m_c.bytes_in) + "\nbytes_out:" + std::to_string(m_c.bytes_out) + "\n";
 }
 
@@ -664,7 +689,8 @@ void front_hooks::serve(const std::shared_ptr<http::server_conn>& c)
 
 bool front_hooks::keeps_open(const http::server_conn& c) const
 {
-    return static_cast<const front_conn&>(c).l != nullptr;
+    const auto& l = static_cast<const front_conn&>(c).l;
+    return l && !l->ending;
 }
 
 void front_hooks::closing(const std::shared_ptr<http::server_conn>& c)
@@ -701,6 +727,8 @@ bool tunnel_run::start_edge(std::string& why)
     if (!m_front->srv.listen_tcp(a.s_addr, m_owner.get_port(), false, why))
         return false;
     m_front->srv.start_accepting();
+    // Shares of a worker before this one ended with its links.
+    write_shares();
     reload_agents();
     return true;
 }
@@ -724,7 +752,7 @@ void tunnel_run::reload_agents()
     // A service gone, moved, or asking its visitors for another auth takes its listener with it.
     for (auto it = m_listeners.begin(); it != m_listeners.end();)
     {
-        bool kept = false;
+        bool kept = m_shares.contains(it->first);
         for (const agent& a : agents)
             for (const service& s : a.services)
                 kept = kept || (a.name == it->second->agent && s.name == it->first && s.http == it->second->svc.http &&
@@ -974,9 +1002,56 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
             refuse_front(c, 401, "the access token is not one this edge takes");
             return;
         }
-        LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" connected from " +
-                  client_of(c->peer, head)).c_str());
-        upgraded(c, link::kind::person, who.username, {}, who.sub, who.issued_ms, who.admin);
+        // A share asked for with the upgrade, so its name comes back in the answer and the protocol stays as it is.
+        const std::string_view share = header_of(head, "tunnel-share");
+        std::string name;
+        if (!share.empty())
+        {
+            int64_t seconds = share_default_s;
+            if (const std::string_view f = header_of(head, "tunnel-share-for"); !f.empty())
+            {
+                const auto [end, ec] = std::from_chars(f.data(), f.data() + f.size(), seconds);
+                if (ec != std::errc{} || end != f.data() + f.size() || seconds < 60 || seconds > share_max_s)
+                {
+                    refuse_front(c, 400, "a share holds from a minute to a day");
+                    return;
+                }
+            }
+            if (share != "public" && share != "signed-in")
+            {
+                refuse_front(c, 400, "a share is public or signed-in");
+                return;
+            }
+            int status = 0;
+            std::string why;
+            name = begin_share(who.sub, who.admin, share == "public", seconds, status, why);
+            if (name.empty())
+            {
+                refuse_front(c, status, why);
+                return;
+            }
+            LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" shares " + name +
+                      (share == "public" ? " with everyone" : " with those signed in") + " from " +
+                      client_of(c->peer, head)).c_str());
+        }
+        else
+            LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": \"" + who.username + "\" connected from " +
+                      client_of(c->peer, head)).c_str());
+        upgraded(c, link::kind::person, who.username, name.empty() ? std::string() : "Tunnel-Share: " + name + "\r\n",
+                 who.sub, who.issued_ms, who.admin);
+        if (!name.empty())
+        {
+            // The link gone already, in the upgrade, takes its share with it.
+            const auto& l = static_cast<front_conn&>(*c).l;
+            if (!l || c->dead)
+            {
+                end_share(name);
+                return;
+            }
+            l->share = name;
+            m_shares[name].l = l;
+            m_agent_links["share:" + name] = l;
+        }
         return;
     }
     refuse_front(c, 401, "an agent's key, an invitation, or an access token is required");
@@ -1024,6 +1099,85 @@ bool tunnel_run::person_holds(link& l)
         return false;
     l.admin = admin;
     return true;
+}
+
+std::string tunnel_run::begin_share(const std::string& sub, bool admin, bool open, int64_t seconds, int& status,
+                                    std::string& why)
+{
+    if (!admin)
+    {
+        status = 403;
+        why = "sharing is for admins of the edge's idp";
+        return {};
+    }
+    const size_t mine = static_cast<size_t>(
+        std::count_if(m_shares.begin(), m_shares.end(), [&](const auto& e) { return e.second.sub == sub; }));
+    if (mine >= shares_per_person || m_shares.size() >= shares_per_edge)
+    {
+        status = 429;
+        why = mine >= shares_per_person ? "you share " + std::to_string(mine) + " already; end one first"
+                                        : "the edge shares as many as it holds; try again later";
+        return {};
+    }
+    // Six letters and digits nobody chose, so a name is neither guessed nor one an agent's service has.
+    std::string name;
+    for (int tries = 0; tries < 16 && name.empty(); ++tries)
+    {
+        for (const char ch : random_b64url(32))
+            if (name.size() < 6 && ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')))
+                name += ch;
+        const bool taken = name.size() < 6 || m_listeners.contains(name) ||
+                           std::any_of(m_agents.begin(), m_agents.end(), [&](const agent& a) {
+                               return std::any_of(a.services.begin(), a.services.end(),
+                                                  [&](const service& sv) { return sv.name == name; });
+                           });
+        if (taken)
+            name.clear();
+    }
+    service sv{true, name, 0, {}, open ? std::string() : "idp:" + std::string(m_owner.get_idp())};
+    std::string err = name.empty() ? "no free name was found" : open ? std::string() : proxy_auth::spec_error(sv.auth);
+    const std::string sock = name.empty() ? std::string() : service_socket(m_owner.get_name(), name);
+    if (err.empty())
+        err = service_socket_refusal(m_owner.get_name(), sock);
+    auto h = err.empty() ? std::make_unique<leg_hooks>(*this, "share:" + name, sv) : nullptr;
+    if (h && !h->srv.listen_unix(sock, err))
+        h.reset();
+    if (!h)
+    {
+        LOG_WARN(("tunnel " + std::string(m_owner.get_name()) + ": a share cannot be served: " + err).c_str());
+        status = 503;
+        why = "the edge cannot serve a share now";
+        return {};
+    }
+    h->srv.start_accepting();
+    m_listeners.emplace(name, std::move(h));
+    m_shares[name] = share_entry{sub, wall::now_sec() + seconds, {}, open};
+    ++m_c.shared;
+    write_shares();
+    return name;
+}
+
+void tunnel_run::end_share(const std::string& name)
+{
+    if (!m_shares.erase(name))
+        return;
+    m_agent_links.erase("share:" + name);
+    if (const auto it = m_listeners.find(name); it != m_listeners.end())
+    {
+        it->second->srv.stop();
+        m_retired.push_back(std::move(it->second));
+        m_listeners.erase(it);
+    }
+    write_shares();
+}
+
+void tunnel_run::write_shares()
+{
+    std::vector<service> list;
+    for (const auto& [name, sh] : m_shares)
+        list.push_back(service{true, name, 0, {}, sh.open ? std::string() : "idp:" + std::string(m_owner.get_idp())});
+    if (std::string why; !save_shares(m_owner.get_name(), list, why))
+        LOG_WARN(("tunnel " + std::string(m_owner.get_name()) + ": " + why).c_str());
 }
 
 bool tunnel_run::visitor(leg_hooks& h, const std::shared_ptr<leg>& g)

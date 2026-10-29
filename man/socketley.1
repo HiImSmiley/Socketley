@@ -1239,6 +1239,32 @@ ssh \-o ProxyCommand='socketley tunnel ssh edge.example.com \-\-agent pi' me@pi
 .fi
 .RE
 .TP
+.BI "tunnel share " "edge port" "\fR|\fIaddress" : port " \fR[\fB\-\-public\fR] [\fB\-\-for \fIduration\fR] [\fB\-\-idp \fIidp\fR]"
+A port of this machine reached at six letters and digits the edge gives,
+named beside the edge as its agents' services are
+.RB ( k7f3q2.example.com
+for
+.BR edge.example.com ),
+for as long as the command runs: until Ctrl+C, the end of
+.B \-\-for
+(from a minute to a day, two hours when not given), or the end of the sign-in
+it was made with. Its visitors sign in at the edge's idp, unless
+.B \-\-public
+lets everyone in. Only admins of the edge's idp share, three at a time each and
+32 at an edge; the edge says who shares what in its log, and
+.B stats
+counts them as
+.BR shares .
+The address is printed on stdout, and errors on stderr; an edge reached by its
+address prints the name alone, having no domain to name it in.
+.RS
+.PP
+.nf
+socketley tunnel share edge.example.com 3000
+socketley tunnel share edge.example.com 127.0.0.1:8080 \-\-public \-\-for 30m
+.fi
+.RE
+.TP
 .BI "db\-backup " "db file"
 Every document of a db runtime written into
 .IR file ,

@@ -96,6 +96,52 @@ std::string agents_path(std::string_view edge)
     return edge_dir(edge) + "/agents";
 }
 
+std::string shares_path(std::string_view edge)
+{
+    return edge_dir(edge) + "/shares";
+}
+
+bool load_shares(std::string_view edge, std::vector<service>& out, std::string& why)
+{
+    std::string text;
+    if (!read_file(shares_path(edge), text, {.missing_ok = true}, &why))
+        return false;
+    std::string_view rest = text;
+    while (!rest.empty())
+    {
+        const std::string_view line = trim_blanks(take_item(rest, '\n'));
+        service sv;
+        if (line.empty())
+            continue;
+        if (!parse_service(line, sv) || !sv.http)
+        {
+            why = "the shares of " + std::string(edge) + " hold a line that is no share: " + std::string(line);
+            return false;
+        }
+        out.push_back(std::move(sv));
+    }
+    return true;
+}
+
+bool save_shares(std::string_view edge, const std::vector<service>& shares, std::string& why)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(edge_dir(edge), ec);
+    std::string text;
+    for (const service& sv : shares)
+        text += render_service(sv) + "\n";
+    // Replaced whole, so the daemon reading it between two shares never reads half of one.
+    const std::string path = shares_path(edge), tmp = path + ".new";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    bool ok = fd >= 0 && write_all(fd, text.data(), text.size());
+    if (fd >= 0)
+        ::close(fd);
+    ok = ok && ::rename(tmp.c_str(), path.c_str()) == 0;
+    if (!ok)
+        why = "the shares of " + std::string(edge) + " could not be written";
+    return ok;
+}
+
 std::string service_socket(std::string_view edge, std::string_view service)
 {
     std::string path = edge_dir(edge) + "/" + std::string(service) + ".sock";

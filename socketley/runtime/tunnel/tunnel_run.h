@@ -95,6 +95,10 @@ public:
     int64_t signed_in_ms{0};
     int64_t last_heard{0};
     int64_t last_ping{0};
+    // The name a person's link shares one of its own ports under, empty for none.
+    std::string share;
+    // Told why it ends, and closed once that is written.
+    bool ending{false};
 
     void on_hello(const fields& f) override;
     void on_open(uint32_t stream, std::string_view target, std::string_view peer) override;
@@ -189,6 +193,8 @@ private:
     void flush_link(link& l);
     // Every leg of a link that ended closed, and the link forgotten wherever it was named.
     void drop_link(link& l);
+    // A link at the edge told why it ends and closed once that is written, so the far side reads the reason, not a cut.
+    void end_link(link& l, std::string_view why);
     // The leg's buffered bytes handed to its stream as far as the credit goes.
     void pump(leg& g);
     void leg_done_writing(const std::shared_ptr<leg>& g);
@@ -207,6 +213,11 @@ private:
                   std::string_view extra_headers, std::string sub = {}, int64_t signed_in_ms = 0, bool admin = false);
     // Whether a person's sign-in still holds at the idp, its admin bit made what the account's is now.
     bool person_holds(link& l);
+    // A listener under a name of the edge's choosing for a person to share a port of theirs on, open to every visitor
+    // or to the idp's signed-in people, for `seconds`; the name, or empty with `status` and `why` set.
+    std::string begin_share(const std::string& sub, bool admin, bool open, int64_t seconds, int& status, std::string& why);
+    void end_share(const std::string& name);
+    void write_shares();
     // A visitor on a service's listener, carried to the agent offering it; false when the agent is not connected.
     bool visitor(leg_hooks& h, const std::shared_ptr<leg>& g);
     // An HTTP service's visitor's requests, as far as they have come, asked of its auth where it has one, and what
@@ -242,6 +253,15 @@ private:
     std::vector<agent> m_agents;
     int64_t m_agents_mtime{-1};
     std::unordered_map<std::string, std::weak_ptr<link>> m_agent_links;
+    // People's shares by name: whose they are, until when, and the link carrying them once it is up.
+    struct share_entry
+    {
+        std::string sub;
+        int64_t until{0};
+        std::weak_ptr<link> l;
+        bool open{false};
+    };
+    std::map<std::string, share_entry> m_shares;
     std::vector<std::string> m_forward;
     std::unique_ptr<socketley::idp::session_verifier> m_idp;
 
@@ -260,7 +280,7 @@ private:
 
     struct counters
     {
-        uint64_t links{0}, refused{0}, streams{0}, joined{0}, visitors_refused{0}, bytes_in{0}, bytes_out{0};
+        uint64_t links{0}, refused{0}, streams{0}, joined{0}, visitors_refused{0}, bytes_in{0}, bytes_out{0}, shared{0};
     } m_c;
 };
 
