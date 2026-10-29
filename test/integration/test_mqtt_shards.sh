@@ -395,6 +395,26 @@ if phase == "hang":
         pub.disconnect()
     guarded("hang", hang)
 
+if phase == "owned":
+    def owned():
+        own = connected(port, "sensor-42", version=4, clean=False, username="alice", password="alicepass1")
+        codes = []
+        for _ in range(12):
+            c = Client(port, version=4)
+            try:
+                codes.append(c.connect("sensor-42", clean=False, username="bob", password="bobpass22")[1])
+            except Closed:
+                codes.append(None)
+            finally:
+                c.close()
+        check("another user takes a client's session over from no shard", codes, [5] * 12)
+        truth("and the session's own connection stays", not own.closed_within(0.5))
+        back = Client(port, version=4)
+        check("its own user still takes it, from whichever shard", back.connect("sensor-42", clean=False,
+              username="alice", password="alicepass1")[:2], (True, 0))
+        back.disconnect()
+    guarded("owned", owned)
+
 if phase == "after":
     def after():
         got = []
@@ -433,6 +453,20 @@ dr=$("$BIN" stats fl 2>&1 | awk -F: '$1=="shard_dropped"{s+=$2} END{print s+0}')
 tally < <(run hang "$FP")
 "$BIN" remove fl >/dev/null 2>&1
 [ "$snaps" -eq 3 ] && ok || bad "each shard keeps a snapshot of its own" "$(find "$HOME" -name 'sh.snapshot*')"
+
+# A session is its user's on every shard, the claim of another shard carrying who asks.
+UP=$((P + 2))
+printf 'alicepass1\n' | "$BIN" mqtt-passwd "$SOCKETLEY_TMPD/users" alice >/dev/null 2>&1
+printf 'bobpass22\n' | "$BIN" mqtt-passwd "$SOCKETLEY_TMPD/users" bob >/dev/null 2>&1
+"$BIN" create mqtt us -p "$UP" --users "$SOCKETLEY_TMPD/users" --shards 3 -s >/dev/null 2>&1 \
+    && ok || bad "a broker of three shards with users is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+ready_tcp 127.0.0.1 "$UP" || bad "it listens" "$(tail -5 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 50); do
+    [ "$("$BIN" stats us 2>/dev/null | awk -F: '$1=="shard_peers_known"{s+=$2} END{print s+0}')" -ge 6 ] && break
+    sleep 0.2
+done
+tally < <(run owned "$UP")
+"$BIN" remove us >/dev/null 2>&1
 
 "$BIN" stop sh >/dev/null 2>&1 && "$BIN" start sh >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" || bad "the broker listens after a start" "$(tail -5 "$SOCKETLEY_DLOG")"

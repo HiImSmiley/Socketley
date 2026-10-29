@@ -330,6 +330,8 @@ private:
         uint64_t    stamp{0};
         size_t      waiting{0};
         bool        lost{false};
+        // Another shard holds the session under another user, so this connection may not have it.
+        bool        refused{false};
         std::string session;
         int64_t     started_ms{0};
     };
@@ -345,6 +347,7 @@ private:
     uint64_t m_shard_unreached{0};
     uint64_t m_claims_made{0};
     uint64_t m_claims_lost{0};
+    uint64_t m_claims_refused{0};
     uint64_t m_sessions_moved{0};
 };
 

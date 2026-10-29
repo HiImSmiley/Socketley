@@ -537,6 +537,7 @@ void mqtt_run::claim(const auth_ask& ask, auth_answer a, std::function<void(auth
         w.bytes(ask.client_id);
         w.flag(ask.clean_start);
         w.u64(pc.stamp);
+        w.bytes(pc.answer.username);
         f += w.take();
         const uint64_t cookie = m_next_cookie++;
         auto* mgr = m_owner.get_runtime_manager();
@@ -571,6 +572,8 @@ void mqtt_run::claim_reply(uint64_t cookie, request_status st, std::string_view 
         {
             if (status == 2)
                 pc.lost = true;
+            else if (status == 3)
+                pc.refused = true;
             else if (status == 1)
             {
                 std::string s;
@@ -593,6 +596,12 @@ void mqtt_run::finish_claim(uint64_t id)
     pending_claim pc = std::move(it->second);
     m_claims.erase(it);
     std::erase_if(m_claim_cookies, [&](const auto& kv) { return kv.second == id; });
+    if (pc.refused)
+    {
+        ++m_claims_refused;
+        pc.done({reason::not_authorized, {}});
+        return;
+    }
     if (pc.lost)
     {
         // A newer connection to the same client on another shard wins; this one is told to come back.
@@ -740,9 +749,17 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply)
             std::string client;
             bool clean = false;
             uint64_t stamp = 0;
-            if (!r.bytes(client, 1u << 16) || !r.flag(clean) || !r.u64(stamp))
+            std::string user;
+            if (!r.bytes(client, 1u << 16) || !r.flag(clean) || !r.u64(stamp) || !r.bytes(user, 1u << 16))
                 break;
             socketley::bytes::writer w;
+            // Refused before anything is given up, so the session's own connection stays.
+            if (m_broker->held_by_another(client, user))
+            {
+                w.u8(3);
+                reply = w.take();
+                break;
+            }
             bool newer_here = false;
             for (auto& [id, pc] : m_claims)
                 if (pc.ask.client_id == client)
@@ -799,6 +816,7 @@ void mqtt_run::shard_stats(std::string& out) const
     st::put(out, "shard_resent", m_shard_resent);
     st::put(out, "session_claims", m_claims_made);
     st::put(out, "session_claims_lost", m_claims_lost);
+    st::put(out, "session_claims_refused", m_claims_refused);
     st::put(out, "sessions_moved", m_sessions_moved);
 }
 

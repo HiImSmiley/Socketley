@@ -387,6 +387,7 @@ struct broker_stats
     uint64_t protocol_errors{0};
     uint64_t retained_refused{0};
     uint64_t takeovers{0};
+    uint64_t takeovers_refused{0};
 };
 
 class broker
@@ -476,6 +477,8 @@ public:
     // The session of `client_id` given up as bytes for another shard where a connection to it has just arrived, the
     // one here closed as taken over; empty when there is none, or when `clean` ends it here.
     std::string surrender(std::string_view client_id, bool clean);
+    // Whether `client_id` names a session not yet expired that was made under a user other than `username`.
+    bool held_by_another(std::string_view client_id, std::string_view username) const;
     // A session another shard gave up, taken in for the connection about to resume it.
     void adopt(std::string_view bytes);
 
@@ -554,6 +557,8 @@ private:
 
     connection* conn_of(uint64_t id);
     session* session_of_key(uint64_t key);
+    // Whether a session left by its connection has outlived its expiry, whether or not the sweep has ended it yet.
+    bool lapsed(const session& s, int64_t now) const;
 
     static constexpr size_t shared_payload_bytes = 8192;
     // Room the writing of each PUBLISH reuses, so a subscriber's copy costs no allocation once warm.

@@ -200,6 +200,23 @@ if phase == "main":
         no.close()
     guarded("rules", rules)
 
+    # A client id is no credential: under `pattern write devices/%c/state` it is the device's whole namespace.
+    def owned():
+        own = connected(pa, "sensor-42", version=4, clean=False, username="alice", password="alicepass1")
+        check("another user cannot take a client's session over",
+              code_of(pa, version=4, client_id="sensor-42", clean=False, username="bob", password="bobpass22"), 5)
+        check("nor end it with a clean start",
+              code_of(pa, client_id="sensor-42", clean=True, username="bob", password="bobpass22"), 0x87)
+        truth("and the session's own connection stays", not own.closed_within(0.5))
+        own.disconnect()
+        check("nor resume it while its client is away",
+              code_of(pa, version=4, client_id="sensor-42", clean=False, username="bob", password="bobpass22"), 5)
+        back = Client(pa, version=4)
+        check("its own user comes back to it", back.connect("sensor-42", clean=False, username="alice",
+                                                            password="alicepass1")[:2], (True, 0))
+        back.disconnect()
+    guarded("owned", owned)
+
     def websocket():
         w = Client(pw, ws="/mqtt")
         check("a WebSocket client offering mqtt is let in", w.connect("ws-1", username="alice", password="alicepass1")[1], 0)

@@ -446,6 +446,17 @@ void broker::take_over(session& s, bool clean)
     m_hooks.on_disconnect(info, "taken over");
 }
 
+bool broker::lapsed(const session& s, int64_t now) const
+{
+    return !s.conn && s.expiry != never && now - s.gone_ms >= static_cast<int64_t>(s.expiry) * 1000;
+}
+
+bool broker::held_by_another(std::string_view client_id, std::string_view username) const
+{
+    const auto it = m_sessions.find(std::string(client_id));
+    return it != m_sessions.end() && !lapsed(*it->second, m_io.now_ms()) && it->second->username != username;
+}
+
 void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
 {
     connection* c = conn_of(conn);
@@ -467,13 +478,18 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
     }
     const int64_t now = m_io.now_ms();
     auto it = m_sessions.find(p.client_id);
-    // One whose expiry passed since it was left is over, whether or not the sweep has come round to it yet.
-    if (it != m_sessions.end() && !it->second->conn && it->second->expiry != never &&
-        now - it->second->gone_ms >= static_cast<int64_t>(it->second->expiry) * 1000)
+    if (it != m_sessions.end() && lapsed(*it->second, now))
     {
         ++m_stats.sessions_expired;
         end_session(*it->second, true);
         it = m_sessions.find(p.client_id);
+    }
+    // A session is its user's: another account, or a client with none, may neither end it, take it nor resume it.
+    if (it != m_sessions.end() && it->second->username != a.username)
+    {
+        ++m_stats.takeovers_refused;
+        refuse(reason::not_authorized);
+        return;
     }
     if (it == m_sessions.end() && m_sessions.size() >= m_cfg.max_sessions)
     {
@@ -1406,9 +1422,7 @@ void broker::sweep_sessions(int64_t now)
             m_stats.dropped_expired += before - s->queue.size();
             mark();
         }
-        if (s->conn || s->expiry == never)
-            continue;
-        if (now - s->gone_ms >= static_cast<int64_t>(s->expiry) * 1000)
+        if (lapsed(*s, now))
             gone.push_back(id);
     }
     for (const auto& id : gone)

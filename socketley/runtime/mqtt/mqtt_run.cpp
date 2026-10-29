@@ -1729,6 +1729,7 @@ std::string mqtt_run::stats() const
     st::put(out, "connects_refused", s.connects_refused);
     st::put(out, "auth_refused", m_auth_refused);
     st::put(out, "takeovers", s.takeovers);
+    st::put(out, "takeovers_refused", s.takeovers_refused);
     st::put(out, "wills_sent", s.wills_sent);
     st::put(out, "sessions_expired", s.sessions_expired);
     st::put(out, "protocol_errors", s.protocol_errors);

@@ -12946,7 +12946,8 @@ messages, cleared by an empty one; wills, sent when a connection is lost or a
 a 5.0 will delay if one is given and not at all when the client comes back
 within it; sessions kept by 3.1.1's clean session 0 and 5.0's session expiry,
 one connection to a client id, a second taking the session over and the first
-told so; keep alive, a client silent for one and a half times it disconnected;
+told so, a session being its user's so that a CONNECT under another user (or
+none) is refused not authorized; keep alive, a client silent for one and a half times it disconnected;
 a CONNECT within ten seconds or the connection closed; and of 5.0 the session
 and message expiry, the receive maximum both ways, topic aliases, the maximum
 packet size, subscription identifiers, no local, retain as published, retain

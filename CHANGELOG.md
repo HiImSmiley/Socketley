@@ -163,6 +163,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate in it was an anchor and no name was checked, so any leaf the
   same public intermediate signed took the credentials; now the peer must
   show the file's first certificate.
+- **An MQTT session is its user's.** A CONNECT with another client's id took
+  that client's session over whatever account it came with: the device was
+  disconnected, its queue and subscriptions were handed to the newcomer, and a
+  `%c` rule gave the newcomer the device's topics; with a clean start the
+  session was ended. A session made under one user is now refused to every
+  other (`0x87`, `5` for 3.1.1), on any shard, and its own connection stays;
+  counted as `takeovers_refused` and `session_claims_refused`.
 - **A sync's credentials file must be its owner's alone.** A `--credentials`
   file other users could read, as one written under umask 022 is, was taken
   without a word, and its secret signs as the storage's user for anyone on the
