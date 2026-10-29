@@ -19,6 +19,7 @@
 
 #include <unistd.h>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <charconv>
 #include <cstdlib>
@@ -100,8 +101,8 @@ bool metrics_endpoint::start(uint16_t port, options o)
         return false;
     }
 
-    // Accepted sockets do not inherit O_NONBLOCK on Linux, so the read() and
-    // write_all() below block, each bounded by the timeouts serve_loop sets.
+    // Accepted sockets do not inherit O_NONBLOCK on Linux, so serve_loop reads
+    // them only when poll says so and dashboard::send writes with a deadline.
 
     m_wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (m_wake_fd < 0)
@@ -184,16 +185,27 @@ static bool host_is_loopback(const char* req)
 
 void metrics_endpoint::serve_loop()
 {
+    // Connections whose request is still arriving, read side by side so a peer that trickles holds only its own.
+    struct pending
+    {
+        int fd;
+        std::string in;
+        std::string peer;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::vector<pending> waiting;
+    // Raw close and the right one, because no SQE has ever named these
+    // descriptors and close_fd() would be a plain data race against the
+    // event-loop thread's own tables.
+    const auto drop = [&](size_t i) {
+        close(waiting[i].fd);
+        waiting.erase(waiting.begin() + static_cast<std::ptrdiff_t>(i));
+    };
+    std::vector<struct pollfd> fds;
     while (m_running.load(std::memory_order_acquire))
     {
-        // Both, always, because the listener alone left this thread parked in
-        // accept() with no way for stop() to reach it.
-        struct pollfd fds[2];
-        fds[0] = { m_listen_fd, POLLIN, 0 };
-        fds[1] = { m_wake_fd,   POLLIN, 0 };
-
-        // Woken for the next point of the history too, which this thread takes between connections.
-        const auto now = std::chrono::steady_clock::now();
+        // Woken for the next point of the history too, which this thread takes between requests.
+        auto now = std::chrono::steady_clock::now();
         if (now >= m_next_sample)
         {
             sample();
@@ -204,8 +216,25 @@ void metrics_endpoint::serve_loop()
                 m_next_save = now + std::chrono::minutes(5);
             }
         }
-        const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(m_next_sample - std::chrono::steady_clock::now());
-        int ready = poll(fds, 2, static_cast<int>(std::clamp<int64_t>(wait.count(), 0, history::step * 1000)));
+        now = std::chrono::steady_clock::now();
+        for (size_t i = waiting.size(); i-- > 0;)
+            if (now >= waiting[i].deadline)
+                drop(i);
+
+        // Both, always, because the listener alone left this thread parked in
+        // accept() with no way for stop() to reach it.
+        fds.clear();
+        fds.push_back({ m_listen_fd, POLLIN, 0 });
+        fds.push_back({ m_wake_fd,   POLLIN, 0 });
+        auto until = m_next_sample;
+        for (const pending& w : waiting)
+        {
+            fds.push_back({ w.fd, POLLIN, 0 });
+            until = std::min(until, w.deadline);
+        }
+        const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(until - now);
+        int ready = poll(fds.data(), static_cast<nfds_t>(fds.size()),
+                         static_cast<int>(std::clamp<int64_t>(wait.count(), 0, history::step * 1000)));
         if (ready < 0)
         {
             if (errno == EINTR)
@@ -217,8 +246,44 @@ void metrics_endpoint::serve_loop()
         // either descriptor.
         if (fds[1].revents != 0)
             break;
+        if (ready == 0)
+            continue;
 
-        if (ready == 0 || (fds[0].revents & POLLIN) == 0)
+        // Each request that came whole is served, last to first so the indexes of those before stay put.
+        for (size_t i = waiting.size(); i-- > 0;)
+        {
+            if (fds[i + 2].revents == 0)
+                continue;
+            char buf[16384];
+            const ssize_t n = ::recv(waiting[i].fd, buf, sizeof buf, MSG_DONTWAIT);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                continue;
+            if (n <= 0)
+            {
+                drop(i);
+                continue;
+            }
+            waiting[i].in.append(buf, static_cast<size_t>(n));
+            dashboard::request req;
+            req.peer = waiting[i].peer;
+            const dashboard::parse_state got = dashboard::parse_request(waiting[i].in, req);
+            if (got == dashboard::parse_state::more)
+                continue;
+            if (got == dashboard::parse_state::done)
+            {
+                const bool via = !req.header("via").empty();
+                const std::string host_line = "\r\nhost: " + std::string(req.header("host")) + "\r\n";
+                // A page whose name was rebound to 127.0.0.1 reaches this port as its own origin, so only a request that
+                // asked for this machine by name is served -- or a proxy's, which carries Via, which no page can set.
+                if (!via && !req.header("host").empty() && !host_is_loopback(host_line.c_str()))
+                    dashboard::send(waiting[i].fd, 403, {}, {});
+                else
+                    serve(waiting[i].fd, req, via);
+            }
+            drop(i);
+        }
+
+        if ((fds[0].revents & POLLIN) == 0)
             continue;
 
         struct sockaddr_in client_addr{};
@@ -241,38 +306,16 @@ void metrics_endpoint::serve_loop()
             continue;
         }
 
-        // Bounded both ways, because this thread serves one connection at a
-        // time and a peer that connects and says nothing held every scrape,
-        // and stop() with them.
-        const struct timeval io_bound{2, 0};
-        if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &io_bound, sizeof(io_bound)) < 0 ||
-            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &io_bound, sizeof(io_bound)) < 0)
-        {
-            close(client_fd);
-            continue;
-        }
-
-        dashboard::request req;
-        if (dashboard::read_request(client_fd, req))
-        {
-            char ip[INET_ADDRSTRLEN] = {};
-            ::inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof ip);
-            req.peer = ip;
-            const bool via = !req.header("via").empty();
-            const std::string host_line = "\r\nhost: " + std::string(req.header("host")) + "\r\n";
-            // A page whose name was rebound to 127.0.0.1 reaches this port as its own origin, so only a request that
-            // asked for this machine by name is served -- or a proxy's, which carries Via, which no page can set.
-            if (!via && !req.header("host").empty() && !host_is_loopback(host_line.c_str()))
-                dashboard::send(client_fd, 403, {}, {});
-            else
-                serve(client_fd, req, via);
-        }
-
-        // Raw close and the right one, because no SQE has ever named this
-        // descriptor and close_fd() would be a plain data race against the
-        // event-loop thread's own tables.
-        close(client_fd);
+        // An honest client sends its request in one go, so a few seconds bound one that does not, and the oldest of
+        // too many gives way to the newest.
+        if (waiting.size() >= max_waiting)
+            drop(0);
+        char ip[INET_ADDRSTRLEN] = {};
+        ::inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof ip);
+        waiting.push_back({ client_fd, {}, ip, std::chrono::steady_clock::now() + request_deadline });
     }
+    for (size_t i = waiting.size(); i-- > 0;)
+        drop(i);
 }
 
 void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)

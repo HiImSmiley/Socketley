@@ -120,6 +120,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lockout, and skipped SPF, DMARC, DNSBL and greylisting. A TCP visitor now
   comes from 127.0.0.2; an HTTP service, behind the entrance, still from
   127.0.0.1.
+- **A peer that trickles its request holds up no other on the metrics
+  port.** The endpoint read one connection at a time for up to fifteen
+  seconds each, so a few connections sending a byte a second stalled every
+  scrape, the dashboard and the history; requests are now read side by
+  side, each given five seconds to arrive whole, and an answer three to
+  leave.
 - **Signing out of the dashboard ends the session at the daemon.** A
   copy of the cookie stayed good for its twelve hours after sign-out, and
   after its key was removed from the credentials file or given another

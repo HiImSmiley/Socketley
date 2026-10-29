@@ -122,27 +122,20 @@ std::string request::client() const
     return address ? hop : peer;
 }
 
-bool read_request(int fd, request& r, size_t max_body)
+parse_state parse_request(std::string_view in, request& out, size_t max_body)
 {
-    std::string in;
-    size_t end;
-    char buf[8192];
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-    while ((end = in.find("\r\n\r\n")) == std::string::npos)
-    {
-        if (in.size() > 16384)
-            return false;
-        const ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n <= 0 || std::chrono::steady_clock::now() > deadline)
-            return false;
-        in.append(buf, static_cast<size_t>(n));
-    }
+    const size_t end = in.find("\r\n\r\n");
+    if (end == std::string_view::npos)
+        return in.size() > 16384 ? parse_state::bad : parse_state::more;
+    // Read afresh each time, since a field already taken would count as sent twice.
+    request r;
+    r.peer = out.peer;
     const std::string_view head(in.data(), end);
     const size_t line_end = head.find("\r\n");
     const std::string_view line = head.substr(0, line_end);
     const size_t sp1 = line.find(' '), sp2 = line.rfind(' ');
     if (sp1 == std::string_view::npos || sp2 == sp1)
-        return false;
+        return parse_state::bad;
     r.method.assign(line.substr(0, sp1));
     std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
     if (const size_t q = target.find('?'); q != std::string_view::npos)
@@ -160,32 +153,27 @@ bool read_request(int fd, request& r, size_t max_body)
         p = nl + 2;
         // A control byte other than a tab, a bare CR or LF among them, is no field's, and would end a log line early.
         if (std::any_of(h.begin(), h.end(), [](unsigned char c) { return (c < 0x20 && c != '\t') || c == 0x7f; }))
-            return false;
+            return parse_state::bad;
         const size_t colon = h.find(':');
         if (colon == std::string_view::npos)
             continue;
         std::string name = lower(h.substr(0, colon));
         // A field sent twice is refused rather than one of them taken.
         if (r.headers.count(name))
-            return false;
+            return parse_state::bad;
         r.headers.emplace(std::move(name), std::string(trim(h.substr(colon + 1))));
     }
     if (!r.header("transfer-encoding").empty())
-        return false;
+        return parse_state::bad;
     const std::string_view cl = r.header("content-length");
     const size_t want = cl.empty() ? 0 : std::strtoull(std::string(cl).c_str(), nullptr, 10);
     if (want > max_body)
-        return false;
-    r.body = in.substr(end + 4);
-    while (r.body.size() < want)
-    {
-        const ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n <= 0 || std::chrono::steady_clock::now() > deadline)
-            return false;
-        r.body.append(buf, static_cast<size_t>(n));
-    }
-    r.body.resize(want);
-    return true;
+        return parse_state::bad;
+    if (in.size() - (end + 4) < want)
+        return parse_state::more;
+    r.body.assign(in.substr(end + 4, want));
+    out = std::move(r);
+    return parse_state::done;
 }
 
 void send(int fd, int status, std::string_view type, std::string_view body, std::string_view extra_headers)
@@ -199,7 +187,8 @@ void send(int fd, int status, std::string_view type, std::string_view body, std:
     out += extra_headers;
     out += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
     out += body;
-    socketley::write_all(fd, out.data(), out.size());
+    // A peer that reads slowly holds the endpoint's one thread this long at most.
+    socketley::write_all_until(fd, out.data(), out.size(), std::chrono::steady_clock::now() + std::chrono::seconds(3));
 }
 
 server::server(std::string credentials, std::string idp, runtime_manager& manager)

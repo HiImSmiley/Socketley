@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <atomic>
 #include <string>
@@ -67,4 +68,7 @@ private:
     mutable std::string m_cached_json_runtimes;
     mutable std::chrono::steady_clock::time_point m_cache_time{};
     static constexpr auto METRICS_CACHE_TTL = std::chrono::seconds(1);
+    // How long a connection has to send its whole request, and how many may be sending one at once.
+    static constexpr auto request_deadline = std::chrono::seconds(5);
+    static constexpr size_t max_waiting = 32;
 };

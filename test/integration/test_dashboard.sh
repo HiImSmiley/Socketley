@@ -7,6 +7,7 @@
 #                the dashboard's schema (or an alias of one), for its type
 #   the page     served with the storage interface's style and helpers in it,
 #                and a script that parses
+#   slow peers   peers trickling their requests hold up no scrape or page
 #   signing in   an admin's key and secret make a session; another user's, a
 #                wrong secret and none do not; five failures bar the address
 #   reading      figures and the schema need a session, a local scraper's
@@ -19,7 +20,8 @@
 #   domains      the entrance's routes, a certificate's names and days, a zone
 #                read, edited (served at once), refused when it does not parse
 #                or is no dns runtime's, and only from the page
-#   no creds     without dashboard_credentials it reads and changes nothing
+#   no creds     without dashboard_credentials it reads the figures, not the
+#                log or a zone, and changes nothing
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -147,6 +149,30 @@ EOF
     expect "a runtime is opened by the names an entrance sends it, never by a wildcard or an address of no runtime" \
         "$(node "$T/hosts.js" 2>&1)" '{"ui":["storage.example","files.example"]}'
 fi
+
+# ─── a slow peer ────────────────────────────────────────────────────────────
+# Peers that trickle their requests a byte a second hold only their own connections, not the scraper's.
+python3 - "$M" <<'PY' &
+import socket, sys, time
+socks = []
+for _ in range(8):
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+    s.sendall(b"G")
+    socks.append(s)
+end = time.time() + 25
+while time.time() < end:
+    for s in socks:
+        try:
+            s.sendall(b"E")
+        except Exception:
+            pass
+    time.sleep(1)
+PY
+TRICKLE=$!
+sleep 0.5
+expect "a scrape is answered while eight peers trickle" "$(code -m 4 "$U/metrics")" 200
+expect "and so is the page" "$(code -m 4 "$U/")" 200
+kill $TRICKLE 2>/dev/null; wait $TRICKLE 2>/dev/null
 
 # ─── signing in ─────────────────────────────────────────────────────────────
 expect "figures need a session" "$(code "$U/api/runtimes")" 401
