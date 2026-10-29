@@ -34,4 +34,27 @@ inline void lower_in_place(std::string& s)
         c = lower(c);
 }
 
+// `s` with each control character a terminal acts on, C0 but tab and newline, DEL and C1 as UTF-8 writes it, made a
+// '?' and a CR before a newline dropped, so text another host sent can neither move the cursor nor show other text.
+inline std::string printable(std::string_view s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        const auto c = static_cast<unsigned char>(s[i]);
+        const int next = i + 1 < s.size() ? static_cast<unsigned char>(s[i + 1]) : -1;
+        if (c == '\r' && next == '\n')
+            continue;
+        if (c == 0xC2 && next >= 0x80 && next <= 0x9F)
+        {
+            out += '?';
+            ++i;
+        }
+        else
+            out += (c < 0x20 && c != '\t' && c != '\n') || c == 0x7F ? '?' : s[i];
+    }
+    return out;
+}
+
 } // namespace socketley::ascii

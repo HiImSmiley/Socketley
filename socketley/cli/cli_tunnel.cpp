@@ -24,6 +24,7 @@
 
 #include "../shared/loop/blocking_write.h"
 #include "../shared/persist/paths.h"
+#include "../shared/util/ascii.h"
 #include "../shared/util/text_list.h"
 #include "../shared/net/peer_address.h"
 #include "../shared/net/public_suffix.h"
@@ -252,12 +253,13 @@ bool idp_of(const edge_address& a, std::string& idp, std::string& err)
         return false;
     if (status != 200 || idp.empty())
     {
-        err = "the edge names no idp to sign in at: " + idp;
+        err = "the edge names no idp to sign in at: " + socketley::ascii::printable(idp);
         return false;
     }
     if (!beside_edge(a.host, idp))
     {
-        err = "the edge names " + idp + " as its idp, which is not beside " + a.host + "; give --idp " + idp +
+        const std::string named = socketley::ascii::printable(idp);
+        err = "the edge names " + named + " as its idp, which is not beside " + a.host + "; give --idp " + named +
               " to sign in there anyway";
         idp.clear();
         return false;
@@ -307,7 +309,7 @@ int connect_main(const std::string& edge, const std::string& target, std::string
     const size_t end = got.find("\r\n\r\n");
     if (!got.starts_with("HTTP/1.1 101"))
     {
-        std::cerr << "the edge refused: " << got.substr(end + 4, 300);
+        std::cerr << "the edge refused: " << socketley::ascii::printable(std::string_view(got).substr(end + 4, 300));
         return 1;
     }
     std::string leftover = got.substr(end + 4);
@@ -482,7 +484,7 @@ int join_main(int argc, char** argv)
     }
     if (status != 200)
     {
-        std::cout << "the edge refused: " << invitation << "\n";
+        std::cout << "the edge refused: " << socketley::ascii::printable(invitation) << "\n";
         return 1;
     }
     std::vector<std::string> words = {"socketley", "create", "tunnel", name, "--mode", "agent", "--to", edge,

@@ -213,6 +213,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   held the shard for hours. EVAL's string library now matches with Lua 5.1's
   rules in a matcher that looks at the deadline as it works, and refuses a
   pattern nested more than 200 deep, as Lua 5.2 does.
+- **What a provider or an edge sends reaches the terminal as text.** `login`
+  and `tunnel` printed a provider's sign-in page, code and refusals, and an
+  edge's refusals and named idp, as they came, so escape sequences in them
+  could show the person a link to another page than the one named, or
+  overwrite what was printed before; each control character is now a `?`.
 - **`mail export` writes only into a directory of its own.** It made the
   directory and reopened each mbox file by its path, following links, so
   another local user who could create `/var/tmp/socketley-mail` (the default

@@ -13,6 +13,7 @@
 #   * a sign-in or a device decision missing from the log
 #   * guessed client secrets at /token never barring the address
 #   * one address taking every device grant a shard keeps, as anyone may ask for one with no secret
+#   * a provider's page, code or refusal printed with the escapes that make a terminal show another page
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -243,6 +244,38 @@ grep -q 'idp one: "alice" allowed a device sign-in from 127.0.0.1' "$SOCKETLEY_D
     || bad "and so is a device allowed" "$(grep 'idp one' "$SOCKETLEY_DLOG" | tail -3)"
 grep -q 'idp four: "alice" refused a device sign-in' "$SOCKETLEY_DLOG" && ok \
     || bad "and one refused" "$(grep 'idp four' "$SOCKETLEY_DLOG" | tail -3)"
+
+# A provider of its own choosing: what it names reaches the terminal with no control character a terminal acts on.
+PF=$((SL_PORT_BASE + 1968))
+python3 - "$PF" > "$T/fake_idp.log" 2>&1 <<'PY' &
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port = int(sys.argv[1]); I = "http://127.0.0.1:%d" % port
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def answer(self, status, doc):
+        b = json.dumps(doc).encode()
+        self.send_response(status); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        self.answer(200, {"issuer": I, "token_endpoint": I + "/token", "device_authorization_endpoint": I + "/device_authorization"})
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.path == "/device_authorization":
+            self.answer(200, {"device_code": "d", "user_code": "AB\x1b[2K\rCD", "interval": 1, "expires_in": 30,
+                              "verification_uri_complete": "https://evil.test/\x1b]8;;https://evil.test\x07https://idp.corp.test/device\x1b]8;;\x07"})
+        else:
+            self.answer(400, {"error": "nope", "error_description": "refused\x1b[31m\u009b2J"})
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+PY
+FAKE=$!
+for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$PF/" && break; sleep 0.1; done
+timeout 20 "$BIN" login "http://127.0.0.1:$PF" --client cli > "$T/fake_login.out" 2>&1; rc=$?
+kill "$FAKE" 2>/dev/null; wait "$FAKE" 2>/dev/null
+grep -q '^Open https://evil.test/' "$T/fake_login.out" && grep -q '^refused' "$T/fake_login.out" \
+    && ! LC_ALL=C grep -q $'[\x01-\x08\x0b-\x1f\x7f]' "$T/fake_login.out" && ! LC_ALL=C grep -q $'\xc2[\x80-\x9f]' "$T/fake_login.out" \
+    && [ "$rc" -eq 1 ] && ok || bad "a provider's page, code and refusal reach the terminal without control characters" \
+    "rc $rc: $(od -c "$T/fake_login.out" | head -12)"
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

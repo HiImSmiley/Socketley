@@ -17,6 +17,7 @@
 #include "../shared/json/json_escape.h"
 #include "../shared/loop/blocking_write.h"
 #include "../shared/persist/read_file.h"
+#include "../shared/util/ascii.h"
 #include "../runtime/idp/idp_logic.h"
 
 namespace fs = std::filesystem;
@@ -172,7 +173,7 @@ int device_sign_in(const std::string& given, const std::string& client, bool kee
     std::string err, token_url, device_url;
     if (!h.init(err) || !discover(h, issuer, token_url, device_url, err))
     {
-        std::cout << err << "\n";
+        std::cout << socketley::ascii::printable(err) << "\n";
         return 2;
     }
     if (device_url.empty())
@@ -186,12 +187,13 @@ int device_sign_in(const std::string& given, const std::string& client, bool kee
     const std::string scope = keep ? "openid offline_access" : "openid";
     if (!ask(h, device_url, "client_id=" + form_value(client) + "&scope=" + form_value(scope), status, d, err))
     {
-        std::cout << err << "\n";
+        std::cout << socketley::ascii::printable(err) << "\n";
         return 2;
     }
     if (status != 200)
     {
-        std::cout << issuer << " refused the sign-in: " << string_of(d, "error_description") << "\n";
+        std::cout << issuer << " refused the sign-in: " << socketley::ascii::printable(string_of(d, "error_description"))
+                  << "\n";
         return 1;
     }
     const std::string device_code(string_of(d, "device_code"));
@@ -200,7 +202,9 @@ int device_sign_in(const std::string& given, const std::string& client, bool kee
                                                                               : string_of(d, "verification_uri_complete"));
     int64_t interval = std::max<int64_t>(int_of(d, "interval", 5), 1);
     const int64_t until = now_s() + int_of(d, "expires_in", 600);
-    std::cout << "Open " << page << "\nand allow the code " << user_code << "\n" << std::flush;
+    // The page and code go out with no control character, so neither can show the person another page than it names.
+    std::cout << "Open " << socketley::ascii::printable(page) << "\nand allow the code "
+              << socketley::ascii::printable(user_code) << "\n" << std::flush;
 
     k.issuer = issuer;
     k.client_id = client;
@@ -211,14 +215,14 @@ int device_sign_in(const std::string& given, const std::string& client, bool kee
                                    "&client_id=" + form_value(client) + "&device_code=" + form_value(device_code),
                  status, d, err))
         {
-            std::cout << err << "\n";
+            std::cout << socketley::ascii::printable(err) << "\n";
             return 2;
         }
         if (status == 200)
         {
             if (!take_tokens(d, k, err, keep))
             {
-                std::cout << err << "\n";
+                std::cout << socketley::ascii::printable(err) << "\n";
                 return 2;
             }
             return 0;
@@ -233,7 +237,7 @@ int device_sign_in(const std::string& given, const std::string& client, bool kee
         }
         std::cout << (e == "access_denied" ? std::string("the code was refused")
                                            : e == "expired_token" ? std::string("the code expired")
-                                                                  : std::string(string_of(d, "error_description")))
+                                                                  : socketley::ascii::printable(string_of(d, "error_description")))
                   << "\n";
         return 1;
     }
