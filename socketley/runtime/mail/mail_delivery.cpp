@@ -31,6 +31,7 @@
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/net/dns_client.h"
+#include "../../shared/net/idna.h"
 #include "../../shared/runtime/stats_text.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
@@ -749,6 +750,21 @@ bool answerable(const spool_entry& e)
     return !e.bounce && !e.from.empty() && e.folder != "Junk" && e.auth.find("x-spam=yes") == std::string::npos;
 }
 
+// Whether `e`'s sender may be told of a refusal: one signed in, this machine or this runtime, or a domain whose SPF
+// passed for the peer, so a bounce never goes to a third party that a stranger only named as the sender.
+bool sender_vouched(const spool_entry& e)
+{
+    if (!e.user.empty() || e.peer == "127.0.0.1" || e.peer == "::1" || e.peer == "local")
+        return true;
+    const size_t at = e.from.rfind('@');
+    // inbound_result::header() writes SPF's verdict and domain first, where no sender's byte stands before them.
+    constexpr std::string_view passed = "spf=pass smtp.mailfrom=";
+    if (at == std::string::npos || !std::string_view(e.auth).starts_with(passed))
+        return false;
+    const std::string_view rest = std::string_view(e.auth).substr(passed.size());
+    return rest.substr(0, rest.find(';')) == socketley::idna::to_ascii(lower(std::string_view(e.from).substr(at + 1)));
+}
+
 // A folder fileinto may name: printable, no step out of the user's mailboxes.
 bool folder_ok(std::string_view f)
 {
@@ -931,6 +947,15 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
     {
         // A message the user's filter refuses goes back to its sender as a failure (RFC 5429 2.1).
         ++m_sieve_rejected;
+        if (!sender_vouched(*e))
+        {
+            // To a sender that may be forged the failure would be backscatter, so the message is discarded instead.
+            LOG_INFO(("mail: " + own + "'s filter refused a message whose sender nothing vouches for, so it is "
+                      "discarded and not bounced")
+                         .c_str());
+            settle(250, "250 2.0.0 refused by the filter and discarded, its sender unverified");
+            return;
+        }
         settle(550, "550 5.7.1 refused by the filter of " + own + ": " + rejected.substr(0, 300));
         return;
     }

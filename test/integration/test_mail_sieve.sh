@@ -57,7 +57,7 @@ trap cleanup EXIT
 echo "=== Integration: Sieve filters and ManageSieve ==="
 
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
-    >/dev/null 2>&1 &
+    good.test=MX:10:mx.remote.test "good.test=TXT:v=spf1 ip4:127.0.0.3 -all" >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
@@ -210,6 +210,20 @@ case "$inbox" in *"Subject: hello"*) bad "reject keeps nothing" "$inbox" ;; *) o
 f=$(at_sink "Not from you")
 [ -n "$f" ] && grep -q '^rcpt pest@remote.test' "$f" && ok "and the sender is told why" \
     || bad "and the sender is told why" "$(ls "$T/sink")"
+# A stranger's sender is told only where its domain's SPF vouches for the stranger, so a forged one gets no backscatter.
+python3 - "$P" <<'PY'
+import smtplib, sys
+for src, sender in (("127.0.0.2", "victim@remote.test"), ("127.0.0.3", "pal@good.test")):
+    s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=(src, 0)); s.ehlo("x")
+    s.sendmail(sender, ["alice@example.test"], "From: pest@remote.test\r\nTo: alice@example.test\r\n"
+               "Subject: pest again\r\nMessage-ID: <%s.pest@remote.test>\r\n\r\nbody\r\n" % src)
+    s.quit()
+PY
+f=$(at_sink '^rcpt pal@good.test')
+[ -n "$f" ] && grep -q "Not from you" "$f" && ok "a refusal is told to a sender whose SPF passed" \
+    || bad "a refusal is told to a sender whose SPF passed" "$(ls "$T/sink")"
+sleep 0.5
+check "and not to one a stranger only named" "$(grep -l '^rcpt victim@remote.test' "$T"/sink/*.eml 2>/dev/null | wc -l)" "0"
 f=$(at_sink "body of please share")
 [ -n "$f" ] && grep -q '^rcpt friend@remote.test' "$f" && grep -q '^from alice@example.test' "$f" \
     && ok "redirect sends a copy on, from the user's own address" || bad "redirect sends a copy on, from the user's own address" "$(head -4 "$f" 2>/dev/null)"

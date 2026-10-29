@@ -92,6 +92,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the one on DATA; past 400 such resets in ten seconds the connection now ends
   with GOAWAY ENHANCE_YOUR_CALM, and a session that leaves 4 MiB unread is
   closed.
+- **A Sieve reject bounces only to a sender something vouches for.** A
+  stranger could name anyone as MAIL FROM, trip a user's `reject` rule, and
+  have this host mail the refusal, with the whole message under RET=FULL, to
+  that address. The refusal now goes to a signed-in user, this machine, or a
+  sender whose domain's SPF passed for the peer; any other such message is
+  discarded.
 - **A Sieve vacation answers no spam.** A message Rspamd, Bayes or DMARC
   quarantine filed in Junk was answered by a user's `vacation`, which told
   its sender the address is read; the JMAP VacationResponse already skipped

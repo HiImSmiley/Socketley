@@ -13933,7 +13933,8 @@ compiles with what it includes. The active one is run on a thread for each
 message that reaches the user's mailbox, the whole message what it reads: keep
 and fileinto file it, with the imap4flags' flags IMAP shows, fileinto into a
 folder not there only with :create (else into INBOX); discard keeps nothing;
-reject bounces it to its sender; redirect sends it on from the user's own
+reject bounces it to its sender where that sender signed in, is this machine
+or passed SPF, and otherwise discards it; redirect sends it on from the user's own
 address, never again if it comes back; vacation answers a sender once in its
 days or seconds, an hour at least, from the null sender, and never a bounce or
 spam; notify mails a mailto
