@@ -30,11 +30,11 @@ std::vector<std::pair<std::string, std::string>> tunnel_instance::http_services(
                 if (std::string sock = socketley::tunnel::service_socket(get_name(), s.name); !sock.empty())
                     out.emplace_back(s.name, std::move(sock));
     // What people share now, each for as long as the link that shares it.
-    std::vector<socketley::tunnel::service> shares;
+    std::vector<socketley::tunnel::share> shares;
     if (socketley::tunnel::load_shares(get_name(), shares, why))
         for (const auto& s : shares)
-            if (std::string sock = socketley::tunnel::service_socket(get_name(), s.name); !sock.empty())
-                out.emplace_back(s.name, std::move(sock));
+            if (std::string sock = socketley::tunnel::service_socket(get_name(), s.svc.name); !sock.empty())
+                out.emplace_back(s.svc.name, std::move(sock));
     return out;
 }
 

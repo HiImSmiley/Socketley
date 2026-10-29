@@ -102,7 +102,7 @@ std::string shares_path(std::string_view edge)
     return edge_dir(edge) + "/shares";
 }
 
-bool load_shares(std::string_view edge, std::vector<service>& out, std::string& why)
+bool load_shares(std::string_view edge, std::vector<share>& out, std::string& why)
 {
     std::string text;
     if (!read_file(shares_path(edge), text, {.missing_ok = true}, &why))
@@ -110,27 +110,32 @@ bool load_shares(std::string_view edge, std::vector<service>& out, std::string& 
     std::string_view rest = text;
     while (!rest.empty())
     {
-        const std::string_view line = trim_blanks(take_item(rest, '\n'));
-        service sv;
+        std::string_view line = trim_blanks(take_item(rest, '\n'));
         if (line.empty())
             continue;
-        if (!parse_service(line, sv) || !sv.http)
+        share sh;
+        const std::string_view svc = take_item(line, ' '), who = take_item(line, ' ');
+        const std::string_view until = trim_blanks(line);
+        const auto [end, ec] = std::from_chars(until.data(), until.data() + until.size(), sh.until);
+        if (!parse_service(svc, sh.svc) || !sh.svc.http || who.empty() || ec != std::errc{} ||
+            end != until.data() + until.size())
         {
-            why = "the shares of " + std::string(edge) + " hold a line that is no share: " + std::string(line);
+            why = "the shares of " + std::string(edge) + " hold a line that is no share: " + std::string(svc);
             return false;
         }
-        out.push_back(std::move(sv));
+        sh.who = std::string(who);
+        out.push_back(std::move(sh));
     }
     return true;
 }
 
-bool save_shares(std::string_view edge, const std::vector<service>& shares, std::string& why)
+bool save_shares(std::string_view edge, const std::vector<share>& shares, std::string& why)
 {
     std::error_code ec;
     std::filesystem::create_directories(edge_dir(edge), ec);
     std::string text;
-    for (const service& sv : shares)
-        text += render_service(sv) + "\n";
+    for (const share& sh : shares)
+        text += render_service(sh.svc) + " " + sh.who + " " + std::to_string(sh.until) + "\n";
     // Replaced whole, so the daemon reading it between two shares never reads half of one.
     const std::string path = shares_path(edge), tmp = path + ".new";
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);

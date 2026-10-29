@@ -46,11 +46,19 @@ std::string agents_path(std::string_view edge);
 std::string service_socket(std::string_view edge, std::string_view service);
 // Why a service's socket may not be bound -- there is none, or a hashed one's directory is not this user's alone.
 std::string service_socket_refusal(std::string_view edge, const std::string& sock);
-// <state>/tunnel/<edge>/shares: what people share for as long as their links last, `http:<name>[=<auth>]` a line,
-// written by the edge's worker alone and read by the daemon to route each name to the service's socket.
+// A person's share as the edge keeps it: its service, whose it is and until when (seconds since the epoch).
+struct share
+{
+    service svc;
+    std::string who;
+    int64_t until{0};
+};
+
+// <state>/tunnel/<edge>/shares: what people share for as long as their links last, `http:<name>[=<auth>] <who>
+// <until>` a line, written by the edge's worker alone and read by the daemon to route each name and to list them.
 std::string shares_path(std::string_view edge);
-bool load_shares(std::string_view edge, std::vector<service>& out, std::string& why);
-bool save_shares(std::string_view edge, const std::vector<service>& shares, std::string& why);
+bool load_shares(std::string_view edge, std::vector<share>& out, std::string& why);
+bool save_shares(std::string_view edge, const std::vector<share>& shares, std::string& why);
 // <state>/tunnel/<agent>/key, the key an agent runtime was given when it joined.
 std::string agent_key_path(std::string_view agent_runtime);
 

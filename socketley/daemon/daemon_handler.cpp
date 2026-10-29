@@ -3705,6 +3705,22 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
         conn->write_buf = out;
         return 0;
     }
+    // The ports people share at the edge now: name, who may visit, whose it is, and until when.
+    if (action == "shares" && pa.count == 3)
+    {
+        std::vector<tn::share> shares;
+        if (!tn::load_shares(edge, shares, why))
+        {
+            conn->write_buf = why + "\n";
+            return 2;
+        }
+        std::string out;
+        for (const auto& sh : shares)
+            out += sh.svc.name + (sh.svc.auth.empty() ? "\tpublic\t" : "\tsigned-in\t") + sh.who + "\t" +
+                   std::to_string(sh.until) + "\n";
+        conn->write_buf = out;
+        return 0;
+    }
     if (action == "revoke" && pa.count == 4)
     {
         const std::string name(pa.args[3]);

@@ -98,7 +98,7 @@ const std::string& page()
 
 // The commands the page may send; anything else is the CLI's alone.
 const std::set<std::string_view> verbs = {"create", "edit", "import", "start", "stop", "restart", "remove", "reload",
-                                          "reload-lua", "show", "stats", "ls", "ps"};
+                                          "reload-lua", "show", "stats", "ls", "ps", "tunnel"};
 
 }   // namespace
 

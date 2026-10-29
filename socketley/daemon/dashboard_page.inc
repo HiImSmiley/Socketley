@@ -477,6 +477,9 @@ function actions(r) {
     // reached through, and then the stop arrives and the start never does.
     on ? { icon: 'restart', label: 'Restart', fn: async () => { if (await act(['restart', n], n + ' restarted')) poll(); } } : null,
     { icon: 'restart', label: 'Reload Lua', full: true, fn: async () => { await act(['reload-lua', n], 'Lua of ' + n + ' reloaded'); } },
+    // An edge's agents and shares, known to be an edge once its configuration has been read.
+    r.type === 'tunnel' && shown && shown.name === n && shown.conf && shown.conf.mode !== 'agent'
+      ? { icon: 'users', label: 'Agents', full: true, fn: () => tunnelDlg(r) } : null,
     { icon: 'edit', label: 'Edit', full: true, fn: () => editDlg(r) },
     { icon: 'trash', label: 'Remove', full: true, bad: true, fn: async () => {
       if (!await ask({ title: 'Remove ' + n + '?', text: 'It stops and is gone, with its configuration. Its data (a storage directory, a cache file) stays where it is.', ok: 'Remove', danger: true })) return;
@@ -891,6 +894,91 @@ async function editDlg(r) {
   };
   const L = modal('Edit ' + r.name, [el('p', { class: 'mut', style: 'font-size:12.5px;margin-top:0', text: running ? 'Only what you change is sent. Limits take effect at once; a field marked restart waits for the next start, which Save & restart does now.' : 'Only what you change is sent; it takes effect at the next start.' }), nameBox, fields.box, rawBox],
     [toggle, el('span', { style: 'flex:1' }), btn(null, 'Cancel', () => L.close()), running ? btn('restart', 'Save & restart', () => save(true), '') : null, btn(null, 'Save', () => save(false), 'pri')], true);
+}
+
+// ─── a tunnel edge's agents and shares ──────────────────────────────────────
+// A service as list writes it: name[=auth] for HTTP, name:[address:]port for TCP, the same with /udp for UDP; an
+// auth may hold a colon of its own, and a port never has an =.
+const svcKind = s => s.includes('=') ? 'http' : s.endsWith('/udp') ? 'udp' : s.includes(':') ? 'tcp' : 'http';
+function copyText(text, what) {
+  const ok = () => toast(what + ' copied');
+  if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(ok, () => toast('Copy it from the box', 'bad'));
+  else toast('Copy it from the box', 'bad');
+}
+// The services of an agent, to invite one or to change them: HTTP, TCP and UDP, each a comma list.
+function servicesForm(have) {
+  const of = k => have.filter(x => svcKind(x) === k).map(x => k === 'udp' ? x.slice(0, -4) : x).join(', ');
+  const field = (label, ph, help, v) => { const i = el('input', { class: 'inp', placeholder: ph, spellcheck: 'false', autocomplete: 'off' }); i.value = v;
+    return [i, el('label', { class: 'fld2' }, el('span', {}, el('b', { text: label, style: 'font-weight:600;color:var(--fg)' })), i, el('div', { class: 'h', text: help }))]; };
+  const [h, hb] = field('HTTP', 'home=idp:auth, nas', 'Reached at <name> beside the edge; =<auth> asks visitors for it, as a proxy’s --auth.', of('http'));
+  const [t, tb] = field('TCP', 'mc:25565, nas:127.0.0.1:9000', 'A port on the edge each, on 127.0.0.1 alone for the edge’s own runtimes.', of('tcp'));
+  const [u, ub] = field('UDP', 'bedrock:19132', 'A UDP port on the edge each, every visitor a flow of its own.', of('udp'));
+  const words = () => { const w = []; for (const [f, i] of [['--http', h], ['--tcp', t], ['--udp', u]]) { const v = i.value.split(/[\s,]+/).filter(Boolean).join(','); if (v) w.push(f, v); } return w; };
+  return { box: el('div', { class: 'form' }, hb, tb, ub), words, names: () => [h, t, u].flatMap(i => i.value.split(/[\s,]+/).filter(Boolean)).map(x => x.split(/[=:]/)[0]) };
+}
+// What an edge holds: its agents, with their services changed or the agent revoked, an invitation for a new one, and
+// the ports people share at it now.
+async function tunnelDlg(r) {
+  // Where agents dial it: a name the entrance routes to it, else its own --domain, else for the person to fill in.
+  const own = shown && shown.name === r.name && shown.conf ? String(shown.conf.domain || '').split(',').map(x => x.trim()).find(x => x.includes('.') && !x.startsWith('*')) : '';
+  const edge = r.name, host = (hosts[edge] || [])[0] || own || '';
+  // Services are named beside the edge, as the edge's routes name them; an edge named as a whole domain has none.
+  const beside = host.split('.').length > 2 ? host.slice(host.indexOf('.')) : '';
+  const body = el('div');
+  const L = modal('Agents and shares of ' + edge, [body], [el('span', { style: 'flex:1' }), btn(null, 'Close', () => L.close())], true);
+  const act = async (args, said) => { const x = await run('tunnel', edge, ...args); if (x.code || (x.out || '').startsWith('error')) { toast((x.out || 'Failed').trim(), 'bad', 8000); return null; } if (said) toast(said); return x.out || ''; };
+  const editDlgFor = (name, have) => {
+    const f = servicesForm(have);
+    const D = modal('Services of ' + name, [el('p', { class: 'mut', style: 'font-size:12.5px;margin-top:0', text: 'What the edge serves for this agent; its key is kept, and what it offers at home is set where it runs.' }), f.box],
+      [el('span', { style: 'flex:1' }), btn(null, 'Cancel', () => D.close()), btn(null, 'Save', async () => { if (await act(['set', name, ...f.words()], name + '’s services saved') !== null) { D.close(); paint(); } }, 'pri')], true);
+  };
+  const inviteDlg = () => {
+    const name = el('input', { class: 'inp', placeholder: 'pi', spellcheck: 'false', autocomplete: 'off' });
+    const f = servicesForm([]);
+    const out = el('div');
+    const D = modal('Invite an agent to ' + edge, [el('div', { class: 'form' }, el('label', { class: 'fld2' }, el('span', {}, el('b', { text: 'Name', style: 'font-weight:600;color:var(--fg)' })), name, el('div', { class: 'h', text: 'Lower-case letters, digits and -, as the machine is known.' }))), f.box, out],
+      [el('span', { style: 'flex:1' }), btn(null, 'Close', () => D.close()), btn('plus', 'Invite', async () => {
+        const n = name.value.trim(); if (!n) { toast('An agent needs a name', 'bad'); return; }
+        const inv = (await act(['invite', n, ...f.words()]) || '').trim(); if (!inv) return;
+        // What to run on the machine at home, its offers to be pointed at the ports the services are there.
+        const cmd = 'socketley create tunnel ' + n + ' --mode agent --to https://' + (host || 'EDGE-ADDRESS') + ' --join ' + inv + ' --offer ' + f.names().map(x => x + '=127.0.0.1:PORT').join(',') + ' -s';
+        const box = el('textarea', { class: 'inp', readonly: true, spellcheck: 'false', rows: '3', style: 'height:auto;min-height:0;font-family:var(--mono);font-size:12px' }); box.value = cmd;
+        out.textContent = '';
+        out.append(el('p', { class: 'mut', style: 'font-size:12.5px', text: 'Run this on the machine at home, each PORT the one the service listens on there; the invitation is used once and holds 24 hours.' }), box,
+          el('div', { class: 'acts', style: 'margin-top:8px' }, btn('copy', 'Copy command', () => copyText(cmd, 'Command')), btn('copy', 'Copy invitation', () => copyText(inv, 'Invitation'))));
+        paint();
+      }, 'pri')], true);
+  };
+  const paint = async () => {
+    const [a, s] = await Promise.all([run('tunnel', edge, 'list'), run('tunnel', edge, 'shares')]);
+    body.textContent = '';
+    body.append(el('div', { class: 'fsec', style: 'cursor:default' }, el('span', { text: 'Agents' })));
+    const T = el('table', { class: 'mtbl' });
+    T.append(el('tr', {}, ...['Agent', 'Services', ''].map(t => el('th', { text: t }))));
+    const rows = a.code ? [] : (a.out || '').split('\n').filter(Boolean).map(l => l.split('\t'));
+    for (const [name, state, svcs] of rows) {
+      const have = (svcs || '').split(',').filter(Boolean);
+      const chip = x => { const k = svcKind(x), n = x.split(/[=:]/)[0];
+        return k === 'http' && beside ? el('a', { class: 'chip', href: 'https://' + n + beside + '/', target: '_blank', rel: 'noopener', title: x, text: 'http ' + n })
+          : el('span', { class: 'chip', title: x, text: k + ' ' + (k === 'http' ? x : x.replace(/\/udp$/, '')) }); };
+      T.append(el('tr', {}, el('td', {}, el('b', { text: name }), el('div', { class: state === 'joined' ? 'dim' : 'mut', style: 'font-size:12px', text: state })),
+        el('td', { class: 'w' }, el('div', { style: 'display:flex;flex-wrap:wrap;gap:6px' }, ...have.map(chip))),
+        el('td', { style: 'white-space:nowrap' }, btn('edit', 'Services', () => editDlgFor(name, have), 'sm'), ' ',
+          btn('trash', 'Revoke', async () => { if (!await ask({ title: 'Revoke ' + name + '?', text: 'Its link is cut at once and its services are served no more; it joins again only with a new invitation.', ok: 'Revoke', danger: true })) return; if (await act(['revoke', name], name + ' revoked') !== null) paint(); }, 'sm bad'))));
+    }
+    if (!rows.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '3', text: a.code ? (a.out || 'The agents could not be read').trim() : 'No agent yet: invite one, or run socketley tunnel join on the machine at home.' })));
+    body.append(T, el('div', { class: 'acts', style: 'margin:10px 0 4px' }, btn('plus', 'Invite an agent', inviteDlg, 'pri')));
+    body.append(el('div', { class: 'fsec', style: 'cursor:default' }, el('span', { text: 'Shares' })));
+    const S = el('table', { class: 'mtbl' });
+    S.append(el('tr', {}, ...['Address', 'Who may visit', 'Shared by', 'Until'].map(t => el('th', { text: t }))));
+    const shares = s.code ? [] : (s.out || '').split('\n').filter(Boolean).map(l => l.split('\t'));
+    for (const [name, who, by, until] of shares)
+      S.append(el('tr', {}, el('td', { class: 'w', style: 'font-family:var(--mono)' }, beside ? el('a', { href: 'https://' + name + beside + '/', target: '_blank', rel: 'noopener', text: name + beside, style: 'color:var(--fg)' }) : el('span', { text: name })),
+        el('td', { text: who === 'public' ? 'everyone' : 'those signed in' }), el('td', { text: by }), el('td', { text: new Date(+until * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })));
+    if (!shares.length) S.append(el('tr', {}, el('td', { class: 'mut', colspan: '4', text: 'Nothing shared now; socketley tunnel share <edge> <port> shares a port of a machine, until Ctrl+C.' })));
+    body.append(S);
+  };
+  paint();
 }
 
 // The fields of `type`, sectioned as the schema says; `conf` fills them for an edit.

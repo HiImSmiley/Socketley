@@ -1167,7 +1167,7 @@ socketley idp\-ssh auth revoke alice
 .TP
 .BI "tunnel " "edge" " invite\fR|\fBset " agent " \fR[\fB\-\-http \fIname\fR[\fB=\fIauth\fR]\fI,...\fR] [\fB\-\-tcp \fIname\fB:\fIport,...\fR] [\fB\-\-udp \fIname\fB:\fIport,...\fR]"
 .TQ
-.BI "tunnel " edge " list\fR|\fBrevoke \fIagent"
+.BI "tunnel " edge " list\fR|\fBshares\fR|\fBrevoke \fIagent"
 The agents a tunnel edge takes:
 .B invite
 prints an invitation, used once, for an agent to offer the services named
@@ -1187,6 +1187,9 @@ asks each of its visitors for it, as a proxy's
 does;
 .B set
 changes what it offers and keeps its key;
+.B shares
+lists the ports people share at it now, who may visit each, whose it is and
+until when;
 .B revoke
 cuts it off. A TCP service on
 .B 127.0.0.1

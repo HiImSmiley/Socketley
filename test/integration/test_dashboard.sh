@@ -240,6 +240,14 @@ j() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1
 expect "a command needs the page's header" "$(code -b "$T/jar" -d '{"args":["ls"]}' "$U/api/run")" 403
 expect "and a session" "$(code -H 'X-Socketley-Dashboard: 1' -d '{"args":["ls"]}' "$U/api/run")" 401
 expect "a verb that is not the dashboard's is refused" "$(code -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -d '{"args":["daemon-stop"]}' "$U/api/run")" 403
+# A tunnel edge's agents are managed from its page: invited, listed with their services, and revoked.
+run "{\"args\":[\"create\",\"tunnel\",\"dedge\",\"--mode\",\"edge\",\"-p\",\"$((P+6))\",\"-s\"]}" >/dev/null
+expect "the page invites an agent to an edge" "$(run '{"args":["tunnel","dedge","invite","pi","--http","home","--udp","bedrock:19132"]}' | j "d['out'].startswith('pi.')")" True
+expect "and lists it with its services" "$(run '{"args":["tunnel","dedge","list"]}' | j "d['out'].strip()")" "$(printf 'pi\tinvited\thome,bedrock:19132/udp')"
+expect "and the ports shared there, none yet" "$(run '{"args":["tunnel","dedge","shares"]}' | j "repr(d['out'])")" "''"
+expect "and revokes it" "$(run '{"args":["tunnel","dedge","revoke","pi"]}' | j "d['code']")" 0
+has "the page has the edge's Agents dialog" "$(curl -s "$U/")" "function tunnelDlg("
+run '{"args":["remove","dedge"]}' >/dev/null
 expect "a word with a tab is refused" "$(code -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -d '{"args":["create","server","a\tb"]}' "$U/api/run")" 400
 # A space travels inside its word, so the daemon judges the one name and makes neither half of it.
 expect "a word with a space arrives as one" \

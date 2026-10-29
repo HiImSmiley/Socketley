@@ -1329,7 +1329,7 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
             }
             int status = 0;
             std::string why;
-            name = begin_share(who.sub, who.admin, share == "public", seconds, status, why);
+            name = begin_share(who.sub, who.username, who.admin, share == "public", seconds, status, why);
             if (name.empty())
             {
                 refuse_front(c, status, why);
@@ -1406,8 +1406,8 @@ bool tunnel_run::person_holds(link& l)
     return true;
 }
 
-std::string tunnel_run::begin_share(const std::string& sub, bool admin, bool open, int64_t seconds, int& status,
-                                    std::string& why)
+std::string tunnel_run::begin_share(const std::string& sub, const std::string& who, bool admin, bool open,
+                                    int64_t seconds, int& status, std::string& why)
 {
     if (!admin)
     {
@@ -1456,7 +1456,7 @@ std::string tunnel_run::begin_share(const std::string& sub, bool admin, bool ope
     }
     h->srv.start_accepting();
     m_listeners.emplace(name, std::move(h));
-    m_shares[name] = share_entry{sub, wall::now_sec() + seconds, {}, open};
+    m_shares[name] = share_entry{sub, who, wall::now_sec() + seconds, {}, open};
     ++m_c.shared;
     write_shares();
     return name;
@@ -1478,9 +1478,10 @@ void tunnel_run::end_share(const std::string& name)
 
 void tunnel_run::write_shares()
 {
-    std::vector<service> list;
+    std::vector<share> list;
     for (const auto& [name, sh] : m_shares)
-        list.push_back(service{true, false, name, 0, {}, sh.open ? std::string() : "idp:" + std::string(m_owner.get_idp())});
+        list.push_back(share{service{true, false, name, 0, {}, sh.open ? std::string() : "idp:" + std::string(m_owner.get_idp())},
+                             sh.who, sh.until});
     if (std::string why; !save_shares(m_owner.get_name(), list, why))
         LOG_WARN(("tunnel " + std::string(m_owner.get_name()) + ": " + why).c_str());
 }

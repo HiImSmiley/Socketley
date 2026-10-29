@@ -98,12 +98,15 @@ share "$T/s1"
 N1=$(head -1 "$T/s1")
 case "$N1" in [a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9]) ok ;; *) bad "a share is given a name" "'$N1' $(cat "$T/s1.err")" ;; esac
 for _ in $(seq 1 50); do [ -S "$(sock_of "$N1")" ] && break; sleep 0.1; done
-[ "$(shares_file)" = "http:$N1=idp:auth" ] && ok || bad "the share is written for the daemon to route" "'$(shares_file)'"
+case "$(shares_file)" in "http:$N1=idp:auth boss "[0-9]*) ok ;; *) bad "the share is written for the daemon to route" "'$(shares_file)'" ;; esac
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 -H 'Accept: text/html' --unix-socket "$(sock_of "$N1")" "http://$N1.example.com/a")
 [ "$code" = 302 ] && ok || bad "a browser with no sign-in is sent to sign in" "$code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 --unix-socket "$(sock_of "$N1")" "http://$N1.example.com/a")
 [ "$code" = 401 ] && ok || bad "anything else with no sign-in is told 401" "$code"
 grep -q "\"boss\" shares $N1 with those signed in" "$SOCKETLEY_DLOG" && ok || bad "who shares what is said in the log" "$(grep 'tunnel e' "$SOCKETLEY_DLOG" | tail -2)"
+
+# The edge lists its shares for the dashboard: name, who may visit, whose it is, and until when.
+case "$("$BIN" tunnel e shares)" in "$N1	signed-in	boss	"[0-9]*) ok ;; *) bad "tunnel shares lists the share, whose it is and until when" "$("$BIN" tunnel e shares 2>&1)" ;; esac
 
 # --public: every visitor, many at once, and a large answer whole.
 share "$T/s2" --public

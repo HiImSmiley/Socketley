@@ -830,6 +830,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A tunnel edge's agents and shares in the dashboard.** An edge's page has
+  Agents beside Edit: its agents with their HTTP, TCP and UDP services, which
+  can be changed or revoked, an invitation for a new one with the command to
+  run at home, and the ports people share at it now; `tunnel <edge> shares`
+  lists those from the command line.
 - **UDP through a tunnel.** `tunnel <edge> invite|set <agent> --udp
   <name>:<port>` and `tunnel join ... --udp <service>:<port>=<host>:<port>`
   open a UDP port on the edge whose visitors' datagrams the agent carries to a

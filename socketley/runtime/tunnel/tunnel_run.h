@@ -253,7 +253,8 @@ private:
     bool person_holds(link& l);
     // A listener under a name of the edge's choosing for a person to share a port of theirs on, open to every visitor
     // or to the idp's signed-in people, for `seconds`; the name, or empty with `status` and `why` set.
-    std::string begin_share(const std::string& sub, bool admin, bool open, int64_t seconds, int& status, std::string& why);
+    std::string begin_share(const std::string& sub, const std::string& who, bool admin, bool open, int64_t seconds,
+                            int& status, std::string& why);
     void end_share(const std::string& name);
     void write_shares();
     // A visitor on a service's listener, carried to the agent offering it; false when the agent is not connected.
@@ -295,6 +296,7 @@ private:
     struct share_entry
     {
         std::string sub;
+        std::string who;
         int64_t until{0};
         std::weak_ptr<link> l;
         bool open{false};

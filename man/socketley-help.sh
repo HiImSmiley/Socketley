@@ -483,7 +483,7 @@ cli_commands() {
     echo -e "  ${CYAN}socketley ssh-cert auth.example.com${NC}"
     echo ""
 
-    echo -e "${BOLD}tunnel <edge> invite|set <agent> --http <name[=auth],...> --tcp <name:port> --udp <name:port> | list | revoke <agent>${NC}"
+    echo -e "${BOLD}tunnel <edge> invite|set <agent> --http <name[=auth],...> --tcp <name:port> --udp <name:port> | list | shares | revoke <agent>${NC}"
     echo "  The agents a tunnel edge takes: invite prints an invitation used"
     echo "  once, set changes what an agent offers, revoke cuts it off. An HTTP"
     echo "  service named <name>=<auth> asks every visitor's request for it, as"
