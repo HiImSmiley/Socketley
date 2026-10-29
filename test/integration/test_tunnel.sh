@@ -75,6 +75,9 @@ out=$("$BIN" create tunnel a3 --mode agent --to https://x.example --join pi.xxxx
 out=$("$BIN" create tunnel a4 --mode agent --to http://192.0.2.1:9450 --join pi.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --offer web=127.0.0.1:1 2>&1); rc=$?
 [ "$rc" -ne 0 ] && case "$out" in *"only for an edge on this machine"*) true ;; *) false ;; esac && ok \
     || bad "an agent's --to over http:// to another machine is refused" "rc $rc: $out"
+# The usage is said once, as every other command says it.
+out=$("$BIN" tunnel 2>&1)
+case "$out" in "usage: tunnel <edge>"*) ok ;; *) bad "tunnel with nothing after it says its usage once" "$(printf '%s' "$out" | head -c 80)" ;; esac
 # An edge's settings on an agent are refused as an agent's are on an edge, not kept and never read.
 for f in "-p 9451" "--domain x.example.test" "--forward 127.0.0.1:22" "--idp auth" "--idp-audience socketley"; do
     out=$("$BIN" create tunnel a6 --mode agent --to https://x.example --join pi.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --offer web=127.0.0.1:1 $f 2>&1); rc=$?

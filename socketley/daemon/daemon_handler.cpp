@@ -3639,7 +3639,7 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
     namespace tn = socketley::tunnel;
     if (pa.count < 3)
     {
-        conn->write_buf = "usage: " + command_usage::line("tunnel") + "\n";
+        conn->write_buf = command_usage::line("tunnel");
         return 1;
     }
     const std::string edge(pa.args[1]);
@@ -3707,7 +3707,7 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
                 tcp = std::string(pa.args[++i]);
             else
             {
-                conn->write_buf = "usage: " + command_usage::line("tunnel") + "\n";
+                conn->write_buf = command_usage::line("tunnel");
                 return 1;
             }
         }
@@ -3763,7 +3763,7 @@ int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
         conn->write_buf = invite ? a.name + "." + secret + "\n" : std::string();
         return 0;
     }
-    conn->write_buf = "usage: " + command_usage::line("tunnel") + "\n";
+    conn->write_buf = command_usage::line("tunnel");
     return 1;
 }
 
