@@ -347,8 +347,14 @@ std::string route_table::request_for(const route& r, const message& m, const std
         {
             std::string body;
             socketley::json::jvalue v;
-            if (socketley::json::json_reader(m.payload).document(v))
-                body = m.payload;
+            if (socketley::json::json_reader(m.payload).document(v) && v.k == socketley::json::jvalue::kind::object)
+            {
+                // The rule writes with the daemon's own rights, so who owns the document is never the publisher's to name.
+                if (std::erase_if(v.members, [](const auto& kv) { return kv.first == "_owner"; }))
+                    socketley::json::write_into(body, v);
+                else
+                    body = m.payload;
+            }
             else
             {
                 body = "{\"topic\":";

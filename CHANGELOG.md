@@ -228,6 +228,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   came from a Mersenne Twister seeded with 32 bits, whose few outputs in one
   `auto-` identity let a client work out the identities given to others next
   and take over a session one of them kept.
+- **An MQTT publisher does not name who owns the document a db rule writes.**
+  A `db://` rule puts a JSON object as the document with the daemon's own
+  rights, which take `_owner` from the body, so a publisher could hand a
+  document to any account or take one from its owner; the payload's `_owner`
+  is now dropped, and JSON that is no object is carried as other payloads are.
 - **A condition on another account's document says nothing of it.** In an
   owner collection a write with `If-Match` or `If-None-Match: *` to a document
   another account holds was answered 412 with its version, or that it exists,

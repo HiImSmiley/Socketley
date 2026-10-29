@@ -1058,6 +1058,30 @@ TEST_CASE("topic rules read their targets and refuse what is none, naming the li
     CHECK_FALSE(t.parse("a/b nowhere\n", why));
 }
 
+TEST_CASE("a db rule puts a publisher's object as the document but never the owner it names")
+{
+    route_table t;
+    std::string why;
+    REQUIRE(t.parse("dev/+/s db://fleet/devices/%1\n", why));
+    const route& r = t.routes()[0];
+    message m;
+    m.topic = "dev/d7/s";
+    m.from_client = "d7";
+    m.payload = R"({"_owner":"victim","hp":0,"_owner":"again"})";
+    std::string call = route_table::request_for(r, m, {"d7"});
+    CHECK(call.find("_owner") == std::string::npos);
+    CHECK(call.find("u005f") == std::string::npos);
+    CHECK(call.find("\"hp\":0") != std::string::npos);
+    CHECK(call.find("/c/devices/d7") != std::string::npos);
+    m.payload = R"({"hp":1})";
+    call = route_table::request_for(r, m, {"d7"});
+    CHECK(call.find(R"("body":{"hp":1})") != std::string::npos);
+    // JSON that is no object is no document, so it is carried as any other payload is.
+    m.payload = "42";
+    call = route_table::request_for(r, m, {"d7"});
+    CHECK(call.find(R"("payload":"42")") != std::string::npos);
+}
+
 TEST_CASE("a rule's request sent again goes back before every later one, and a snapshot keeps those in flight")
 {
     const std::string text = "a/# mqtt://core/b/%t\n";
