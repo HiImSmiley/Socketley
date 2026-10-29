@@ -2,6 +2,8 @@
 // A collection's documents by id. Each one is a node of its own, which keeps its place for as long as it lives, found
 // through a flat table of (hash, node) probed in order: a lookup reads the table's line and the node's, where an
 // unordered_map reads a bucket, the node before the bucket's first, and the node.
+// An id is hashed under this process's key, since ids are the clients' to choose and a fixed hash lets them crowd one
+// run of the table, which every probe through it then walks.
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -12,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "../../shared/util/transparent_string.h"
+#include "../../shared/util/keyed_hash.h"
 
 namespace socketley::db
 {
@@ -108,9 +110,12 @@ public:
     const_iterator begin() const { return const_iterator(data(), data() + m_tab.size()); }
     const_iterator end() const { return const_iterator(data() + m_tab.size(), data() + m_tab.size()); }
 
-    iterator find(std::string_view id) { return at(index_of(id)); }
+    iterator find(std::string_view id) { return at(index_of(id, hash_of(id))); }
     const_iterator find(std::string_view id) const { return const_cast<doc_map*>(this)->find(id); }
-    bool contains(std::string_view id) const { return index_of(id) != npos; }
+    bool contains(std::string_view id) const { return index_of(id, hash_of(id)) != npos; }
+
+    // An id's hash, whose low bits pick the slot its probe begins at.
+    static uint64_t hash_of(std::string_view id) { return socketley::keyed_hash(id); }
 
     void reserve(size_t n)
     {
@@ -124,11 +129,11 @@ public:
     // The document `id` made from `d` unless one is there; the one there and whether it was made.
     std::pair<iterator, bool> emplace(const std::string& id, Doc d)
     {
-        if (const size_t i = index_of(id); i != npos)
+        const uint64_t h = hash_of(id);
+        if (const size_t i = index_of(id, h); i != npos)
             return {at(i), false};
         if ((m_size + 1) * 4 > m_tab.size() * 3)
             grow(m_tab.empty() ? 16 : m_tab.size() * 2);
-        const uint64_t h = string_hash{}(id);
         auto node = std::make_unique<value_type>(id, std::move(d));
         const size_t i = place(h, node.get());
         node.release();
@@ -173,11 +178,10 @@ private:
         return i == npos ? end() : iterator(data() + i, data() + m_tab.size());
     }
 
-    size_t index_of(std::string_view id) const
+    size_t index_of(std::string_view id, uint64_t h) const
     {
         if (m_tab.empty())
             return npos;
-        const uint64_t h = string_hash{}(id);
         const size_t mask = m_tab.size() - 1;
         for (size_t i = h & mask;; i = (i + 1) & mask)
         {

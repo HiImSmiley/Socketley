@@ -228,6 +228,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   came from a Mersenne Twister seeded with 32 bits, whose few outputs in one
   `auto-` identity let a client work out the identities given to others next
   and take over a session one of them kept.
+- **A db collection's ids are hashed under a key of the process.** The map of
+  a collection's documents probed from std::hash's low bits, whose seed is
+  fixed, so ids chosen offline crowded one run of the table and made every
+  write, read and delete in that collection walk it; it now uses SipHash-2-4
+  under a key drawn at start.
 - **An MQTT publisher does not name who owns the document a db rule writes.**
   A `db://` rule puts a JSON object as the document with the daemon's own
   rights, which take `_owner` from the body, so a publisher could hand a

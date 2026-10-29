@@ -9,6 +9,7 @@
 #include <map>
 #include <fstream>
 #include <random>
+#include <set>
 #include <string>
 #include <unistd.h>
 
@@ -195,6 +196,31 @@ TEST_CASE("a collection's map finds, keeps and lets go of what a map would, and 
     m.clear();
     CHECK(m.empty());
     CHECK(m.begin() == m.end());
+}
+
+TEST_CASE("a collection's map hashes ids under a key, so ids made to share std::hash's slot do not share its own")
+{
+    // SipHash-2-4's reference vectors, key 00..0f: the empty message and the one byte 00.
+    socketley::sip_key k{0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL};
+    CHECK(socketley::siphash24(k, "") == 0x726fdb47dd0e0e31ULL);
+    CHECK(socketley::siphash24(k, std::string_view("\0", 1)) == 0x74f839c593dc67fdULL);
+    // Ids an attacker picks offline so std::hash puts every one at slot 0 of a table of 4096.
+    std::vector<std::string> ids;
+    for (uint64_t i = 0; ids.size() < 256; ++i)
+    {
+        std::string id = "c" + std::to_string(i);
+        if ((std::hash<std::string_view>{}(id) & 4095) == 0)
+            ids.push_back(std::move(id));
+    }
+    std::set<uint64_t> slots;
+    for (const auto& id : ids)
+        slots.insert(socketley::db::doc_map<int>::hash_of(id) & 4095);
+    CHECK(slots.size() > 200);
+    socketley::db::doc_map<int> m;
+    for (const auto& id : ids)
+        REQUIRE(m.emplace(id, 1).second);
+    for (const auto& id : ids)
+        CHECK(m.find(id) != m.end());
 }
 
 TEST_CASE("documents: written as read, paths, and the order an index keeps")
