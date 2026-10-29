@@ -75,6 +75,12 @@ out=$("$BIN" create tunnel a3 --mode agent --to https://x.example --join pi.xxxx
 out=$("$BIN" create tunnel a4 --mode agent --to http://192.0.2.1:9450 --join pi.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --offer web=127.0.0.1:1 2>&1); rc=$?
 [ "$rc" -ne 0 ] && case "$out" in *"only for an edge on this machine"*) true ;; *) false ;; esac && ok \
     || bad "an agent's --to over http:// to another machine is refused" "rc $rc: $out"
+# An edge's settings on an agent are refused as an agent's are on an edge, not kept and never read.
+for f in "-p 9451" "--domain x.example.test" "--forward 127.0.0.1:22" "--idp auth" "--idp-audience socketley"; do
+    out=$("$BIN" create tunnel a6 --mode agent --to https://x.example --join pi.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --offer web=127.0.0.1:1 $f 2>&1); rc=$?
+    [ "$rc" -ne 0 ] && case "$out" in *"are an edge's"*) true ;; *) false ;; esac && ok || bad "an agent with ${f%% *} is refused" "rc $rc: $out"
+    "$BIN" remove a6 >/dev/null 2>&1
+done
 for to in http://localhost:9450 "http://[::1]:9450" http://127.0.0.2:9450; do
     out=$("$BIN" create tunnel a5 --mode agent --to "$to" --join pi.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --offer web=127.0.0.1:1 2>&1); rc=$?
     [ "$rc" -eq 0 ] && ok || bad "an agent's --to $to on this machine is taken" "rc $rc: $out"

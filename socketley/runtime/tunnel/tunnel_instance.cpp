@@ -72,6 +72,9 @@ std::string tunnel_instance::config_refusal() const
             return "tunnel: --forward needs --idp, whose signed-in people may use it\n";
         return {};
     }
+    if (get_port() || !get_domains().empty() || !m_forward.empty() || !m_idp.empty() || !m_idp_audience.empty())
+        return "tunnel: -p, --domain, --forward, --idp and --idp-audience are an edge's; this is an agent, which dials "
+               "out (--mode edge for one)\n";
     if (!m_to.starts_with("https://") && !m_to.starts_with("http://"))
         return "tunnel: an agent needs --to, the edge's https address\n";
     if (const std::string_view rest = std::string_view(m_to).substr(m_to.find("://") + 3);
