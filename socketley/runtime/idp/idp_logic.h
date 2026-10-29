@@ -109,16 +109,22 @@ public:
     int64_t wait(const std::string& key, int64_t now, int free);
     void begin(const std::string& key) { ++m_keys[key].in_flight; }
     void end(const std::string& key);
+    // An attempt at `key` another shard began at `at` and is checking, and its end, counted beside this shard's own.
+    void begun_elsewhere(const std::string& key, int64_t at) { m_keys[key].elsewhere.push_back(at); }
+    void ended_elsewhere(const std::string& key);
     void failed(const std::string& key, int64_t at);
     // Failures out of the window forgotten, and keys with nothing left.
     void age(int64_t now);
     bool empty() const { return m_keys.empty(); }
 
 private:
+    // How long an attempt another shard began is counted, should the word of its end never come.
+    static constexpr int64_t elsewhere_s = 60;
     struct entry
     {
         std::vector<int64_t> at;
         uint32_t in_flight{0};
+        std::vector<int64_t> elsewhere;
     };
     // The failures of `key` still in the window, its entry made when it has none.
     entry& fresh(const std::string& key, int64_t now);

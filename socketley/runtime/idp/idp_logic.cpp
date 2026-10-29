@@ -560,6 +560,7 @@ attempt_limits::entry& attempt_limits::fresh(const std::string& key, int64_t now
 {
     entry& e = m_keys[key];
     std::erase_if(e.at, [now](int64_t t) { return now - t > window_s; });
+    std::erase_if(e.elsewhere, [now](int64_t t) { return now - t > elsewhere_s; });
     return e;
 }
 
@@ -568,7 +569,7 @@ bool attempt_limits::barred(const std::string& key, int64_t now, int limit)
     if (!m_keys.contains(key))
         return false;
     const entry& e = fresh(key, now);
-    return static_cast<int64_t>(e.at.size()) + e.in_flight >= limit;
+    return static_cast<int64_t>(e.at.size() + e.elsewhere.size()) + e.in_flight >= limit;
 }
 
 int64_t attempt_limits::wait(const std::string& key, int64_t now, int free)
@@ -576,12 +577,13 @@ int64_t attempt_limits::wait(const std::string& key, int64_t now, int free)
     if (!m_keys.contains(key))
         return 0;
     const entry& e = fresh(key, now);
-    const int64_t n = static_cast<int64_t>(e.at.size()) + e.in_flight;
+    const int64_t n = static_cast<int64_t>(e.at.size() + e.elsewhere.size()) + e.in_flight;
     if (n < free)
         return 0;
     const int64_t delay = std::min<int64_t>(300, int64_t{30} << std::min<int64_t>(n - free, 4));
-    // One still being checked is waited for as a failure would be, so a burst sent together gets one try.
-    if (e.in_flight > 0 || e.at.empty())
+    // One still being checked, here or at another shard, is waited for as a failure would be, so a burst sent together
+    // gets one try.
+    if (e.in_flight > 0 || !e.elsewhere.empty() || e.at.empty())
         return delay;
     const int64_t last = *std::max_element(e.at.begin(), e.at.end());
     return std::max<int64_t>(0, last + delay - now);
@@ -592,6 +594,12 @@ void attempt_limits::end(const std::string& key)
     const auto it = m_keys.find(key);
     if (it != m_keys.end() && it->second.in_flight > 0)
         --it->second.in_flight;
+}
+
+void attempt_limits::ended_elsewhere(const std::string& key)
+{
+    if (const auto it = m_keys.find(key); it != m_keys.end() && !it->second.elsewhere.empty())
+        it->second.elsewhere.erase(it->second.elsewhere.begin());
 }
 
 void attempt_limits::failed(const std::string& key, int64_t at)
@@ -605,7 +613,9 @@ void attempt_limits::age(int64_t now)
     for (auto it = m_keys.begin(); it != m_keys.end();)
     {
         std::erase_if(it->second.at, [now](int64_t t) { return now - t > window_s; });
-        it = it->second.at.empty() && it->second.in_flight == 0 ? m_keys.erase(it) : std::next(it);
+        std::erase_if(it->second.elsewhere, [now](int64_t t) { return now - t > elsewhere_s; });
+        it = it->second.at.empty() && it->second.in_flight == 0 && it->second.elsewhere.empty() ? m_keys.erase(it)
+                                                                                                 : std::next(it);
     }
 }
 

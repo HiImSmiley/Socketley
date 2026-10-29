@@ -73,6 +73,8 @@ struct shard_call
         device_decide = 4,   // the user code `key` allowed or refused (`fields` allow, sub) at `at`
         device_ask    = 5,   // the device code `key` polled by the client `fields` client_id at `at`
         device_peek   = 6,   // the grant the user code `key` names, if it still waits at `at`
+        hold          = 7,   // an attempt at `key` begun at `at` at another shard, counted here while it is checked
+        let_go        = 8,   // and checked, no longer counted
     };
     op_t op{redeem};
     std::string key;

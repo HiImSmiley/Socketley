@@ -837,15 +837,34 @@ std::vector<std::string> idp_run::hold(const std::string& ip, const std::string&
     std::vector<std::string> keys{address_key(ip), acct};
     if (std::string net = network_key(ip); !net.empty())
         keys.push_back(std::move(net));
+    hold_keys(keys);
+    return keys;
+}
+
+void idp_run::hold_keys(const std::vector<std::string>& keys)
+{
     for (const auto& k : keys)
         m_limits.begin(k);
-    return keys;
+    tell_shards(shard_call::hold, keys);
 }
 
 void idp_run::release(const std::vector<std::string>& keys)
 {
     for (const auto& k : keys)
         m_limits.end(k);
+    tell_shards(shard_call::let_go, keys);
+}
+
+void idp_run::tell_shards(shard_call::op_t op, const std::vector<std::string>& keys)
+{
+    // Not waited for, as the attempt is checked meanwhile and the word need only arrive before the next one does.
+    const int64_t now = wall::now_sec();
+    for (uint32_t j = 0; j < m_shards && m_shards > 1; ++j)
+        if (j != m_shard)
+            for (const auto& k : keys)
+                if (!cross(j, shard_call{op, k, {}, now}, [](bool, std::string_view) {})) {}
+    if (op == shard_call::hold)
+        arm_tick();
 }
 
 std::string idp_run::known_cookie(const account& who) const
@@ -3086,11 +3105,11 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             return;
         }
         if (counted)
-            m_limits.begin(acct);
+            hold_keys({acct});
         check_mail_password(who, args.size() > 2 ? args[2] : std::string(),
                             [this, ticket, name, email, quota, acct, counted](bool ok) {
             if (counted)
-                m_limits.end(acct);
+                release({acct});
             if (ok)
                 answer_command(ticket, "ok " + name + "\t" + email + "\t" + quota);
             else if (counted)
@@ -3648,6 +3667,15 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
         case shard_call::miss:
             m_limits.failed(call.key, call.at);
             arm_tick();
+            mgr->requests().complete_deferred(ticket, request_status::ok, {});
+            return;
+        case shard_call::hold:
+            m_limits.begun_elsewhere(call.key, call.at);
+            arm_tick();
+            mgr->requests().complete_deferred(ticket, request_status::ok, {});
+            return;
+        case shard_call::let_go:
+            m_limits.ended_elsewhere(call.key);
             mgr->requests().complete_deferred(ticket, request_status::ok, {});
             return;
         case shard_call::device_decide:

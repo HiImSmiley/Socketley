@@ -12539,7 +12539,9 @@ so a change made with
 or on the account page holds at every shard once it is answered; one made at
 another shard is sent to shard 0. A code is redeemed at the shard that gave it,
 which the code names, wherever the exchange arrives, and is good once there; a
-failed sign-in is answered once every shard counts it against its address. The
+sign-in being checked is counted at every shard while it is, and a failed one is
+answered once every shard counts it against its address and its account, so
+guesses sent at once over the shards share one budget. The
 number may change across a restart.
 .PP
 A sign-in is a cookie of the provider's, which a proxy with

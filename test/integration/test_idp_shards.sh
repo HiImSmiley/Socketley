@@ -8,6 +8,7 @@
 #   * a change made with idp-user, or on the account page at a reading shard, not seen at once by every shard
 #   * a reading shard losing the accounts when shard 0 folds its journal into a snapshot
 #   * an address barred at one shard trying its five again at each of the others
+#   * guesses sent at once over the shards each checked against those in flight at its own shard alone
 #   * one code of the second step signing in once at each shard
 #   * one refresh token refreshing once at each shard
 #   * the accounts or the key lost when the runtime restarts with another number of shards
@@ -225,6 +226,19 @@ elif phase == "barred":
           [429] * 8)
     check("and another is not", req("POST", "/authorize", dict(auth, username="bob", password="bobpassword12"),
                                     headers={"X-Forwarded-For": "198.51.100.8"})[0], 302)
+    # Guesses at one account sent at once land on every shard, and are counted together while they are checked.
+    import threading
+    got = []
+    def guess(i):
+        got.append(req("POST", "/login", dict(rd="/", username="ana", password="wrongpassword%d" % i),
+                       headers={"X-Forwarded-For": "198.51.100.%d" % (120 + i)})[0])
+    ts = [threading.Thread(target=guess, args=(i,)) for i in range(40)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("forty guesses at one account sent at once check about its ten free ones, not ten at each shard",
+          (len(got), got.count(401) <= 16), (40, True))
 
 elif phase == "after_logout":
     s = json.load(open(state_file))

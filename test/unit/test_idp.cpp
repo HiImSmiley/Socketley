@@ -689,6 +689,18 @@ TEST_CASE("attempts in flight count against the bar, and an account waits longer
     CHECK(l.barred("a", t, 5));
     CHECK_FALSE(l.barred("a", t + attempt_limits::window_s + 1, 5));
 
+    // Attempts another shard is checking count as this shard's own do, and are forgotten once they end or are old.
+    for (int i = 0; i < 4; ++i)
+        l.begun_elsewhere("e", t);
+    l.begin("e");
+    CHECK(l.barred("e", t, 5));
+    l.ended_elsewhere("e");
+    CHECK_FALSE(l.barred("e", t, 5));
+    l.begun_elsewhere("e", t);
+    CHECK(l.barred("e", t, 5));
+    CHECK_FALSE(l.barred("e", t + 61, 5));
+    l.end("e");
+
     for (int i = 0; i < 9; ++i)
         l.failed("u", t);
     CHECK(l.wait("u", t, 10) == 0);

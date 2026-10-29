@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Guesses sent at once over an idp's shards share one budget.** With
+  `--shards N`, each shard counted only the sign-ins it was checking itself,
+  so a burst spread over them was let through N times over before the first
+  failure was counted; an attempt being checked is now counted at every shard
+  while it is.
 - **Another site cannot sign a browser out of the idp unasked.** `/logout`
   ended the browser's session for any page that sent it there, a link or an
   image's worth; a request another site sent, by `Sec-Fetch-Site` or its
