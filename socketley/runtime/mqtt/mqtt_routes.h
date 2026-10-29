@@ -82,6 +82,8 @@ public:
     static constexpr size_t window       = 64;
     static constexpr size_t batch_bytes  = 1u << 20;
     static constexpr int64_t batch_ms    = 60000;
+    // How many mqtt:// rules one message passes through at most, so two that lead to each other end.
+    static constexpr uint8_t max_hops    = 8;
 
     // The rules in `text`; false with `why` naming the line that is not one.
     bool parse(std::string_view text, std::string& why);

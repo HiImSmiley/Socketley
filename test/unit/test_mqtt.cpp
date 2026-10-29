@@ -4,6 +4,7 @@
 #include "runtime/mqtt/mqtt_auth.h"
 #include "runtime/mqtt/mqtt_broker.h"
 #include "runtime/mqtt/mqtt_codec.h"
+#include "runtime/mqtt/mqtt_command.h"
 #include "runtime/mqtt/mqtt_routes.h"
 #include "runtime/mqtt/mqtt_topics.h"
 
@@ -1316,4 +1317,36 @@ TEST_CASE("a held publisher is read again only once what waited of it has gone o
     CHECK(r.packets(s).size() == 2);
     CHECK_FALSE(r.io.paused[p]);
     CHECK(r.io.resumed[p] == 1);
+}
+
+TEST_CASE("an mqtt:// rule passes a message on with one hop more, and not once it has passed max_hops")
+{
+    route_table t;
+    std::string why;
+    REQUIRE(t.parse("a/# mqtt://core/b/%t\na/# server://chat\n", why));
+    message m;
+    m.topic = "a/1";
+    m.hops  = 3;
+    t.offer(m, 0, 0);
+    route& r = t.routes()[0];
+    REQUIRE(r.queue.size() == 1);
+    socketley::bytes::reader rd(r.queue.front().bytes);
+    uint8_t v = 0, qos = 0, hops = 0;
+    bool retain = false;
+    std::string topic, payload;
+    REQUIRE(rd.marker(command_prefix));
+    REQUIRE(rd.u8(v));
+    REQUIRE(rd.bytes(topic, 65535));
+    REQUIRE(rd.bytes(payload, 65535));
+    REQUIRE(rd.u8(qos));
+    REQUIRE(rd.flag(retain));
+    REQUIRE(rd.u8(hops));
+    CHECK(topic == "b/a/1");
+    CHECK(hops == 4);
+    m.hops = route_table::max_hops;
+    t.offer(m, 0, 0);
+    CHECK(r.queue.size() == 1);
+    CHECK(r.dropped == 1);
+    // A rule of another kind starts no loop, so it still takes the message.
+    CHECK(t.routes()[1].queue.size() == 2);
 }

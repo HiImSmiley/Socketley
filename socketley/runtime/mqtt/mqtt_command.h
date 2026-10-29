@@ -27,7 +27,9 @@ enum class verb : uint8_t
     tap_close = 8,
 };
 
-inline std::string command_publish(std::string_view topic, std::string_view payload, uint8_t qos, bool retain)
+// `hops` is how many topic rules the message has passed already, and a publish without it has passed none.
+inline std::string command_publish(std::string_view topic, std::string_view payload, uint8_t qos, bool retain,
+                                   uint8_t hops = 0)
 {
     socketley::bytes::writer w(command_prefix);
     w.u8(static_cast<uint8_t>(verb::publish));
@@ -35,6 +37,7 @@ inline std::string command_publish(std::string_view topic, std::string_view payl
     w.bytes(payload);
     w.u8(qos);
     w.flag(retain);
+    w.u8(hops);
     return w.take();
 }
 

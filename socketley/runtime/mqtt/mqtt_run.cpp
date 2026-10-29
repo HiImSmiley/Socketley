@@ -1607,6 +1607,8 @@ void mqtt_run::command(uint64_t ticket, std::string_view payload)
                 return;
             }
             m.retain = retain;
+            if (uint8_t hops = 0; r.u8(hops))
+                m.hops = hops;
             if (!valid_topic(m.topic) || m.topic.front() == '$')
             {
                 answer("error: " + m.topic + " is not a topic a message can be published to");

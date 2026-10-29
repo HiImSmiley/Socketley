@@ -266,6 +266,34 @@ tally < <(run rules)
 ready_tcp 127.0.0.1 "$PE" || bad "the broker with rules starts again" "$(tail -5 "$SOCKETLEY_DLOG")"
 tally < <(run after)
 
+# A rule leading back to its own broker is the shortest of two that lead to each other: one publish went round for ever.
+PL=$((SL_PORT_BASE + 1948))
+printf 'loop/# mqtt://lp/%%t\n' > "$T/looproutes"
+"$BIN" create mqtt lp -p "$PL" --anonymous --routes "$T/looproutes" -s >/dev/null 2>&1 \
+    && ok || bad "a broker whose rule leads back to itself is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+ready_tcp 127.0.0.1 "$PL" || bad "it listens" "$(tail -5 "$SOCKETLEY_DLOG")"
+tally < <(PYTHONPATH="$HERE" python3 - "$PL" "$BIN" 2>&1 <<'PY'
+import sys, time
+from lib_mqtt import *
+port, binary = int(sys.argv[1]), sys.argv[2]
+def loop():
+    sub = connected(port, "loop-sub")
+    sub.subscribe(("loop/#", 0))
+    pub = connected(port, "loop-pub")
+    pub.publish("loop/x", "once", qos=1)
+    got = sub.messages(1000, 3.0)
+    check("a message a rule leads back to its broker is delivered once and once a pass, for eight passes", len(got), 9)
+    end = time.time() + 10
+    while time.time() < end and stat_sum(binary, "lp", "rule_0_dropped") < 1:
+        time.sleep(0.2)
+    check("and the pass it is not given is counted", stat_sum(binary, "lp", "rule_0_dropped"), 1)
+    pub.disconnect()
+    sub.disconnect()
+guarded("loop", loop)
+PY
+)
+"$BIN" remove lp >/dev/null 2>&1
+
 st=$("$BIN" stats edge 2>&1)
 case "$st" in *"rule_0_target:sensor/+/temp cache://kv/stream/temps-%1"*"rule_3_target:fwd/# mqtt://edge/from-edge/%t"*) ok ;;
     *) bad "stats name each rule and its target" "$st" ;; esac

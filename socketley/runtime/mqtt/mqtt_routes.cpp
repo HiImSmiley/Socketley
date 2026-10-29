@@ -378,7 +378,8 @@ std::string route_table::request_for(const route& r, const message& m, const std
             return line;
         }
         case target_kind::mqtt:
-            return command_publish(expand(r.name, m, plus, false), m.payload, m.qos, m.retain);
+            return command_publish(expand(r.name, m, plus, false), m.payload, m.qos, m.retain,
+                                   static_cast<uint8_t>(m.hops + 1));
         case target_kind::webhook:
         {
             std::string body = "{\"topic\":";
@@ -405,6 +406,13 @@ void route_table::offer(const message& m, int64_t now, uint32_t shard)
     {
         if (!plus_levels(r.filter, m.topic, plus))
             continue;
+        if (r.kind == target_kind::mqtt && m.hops >= max_hops)
+        {
+            ++r.dropped;
+            r.last_error = "a message reached this rule through " + std::to_string(max_hops) +
+                           " mqtt:// rules and is not passed on: rules that lead back to themselves";
+            continue;
+        }
         if (r.kind == target_kind::storage)
         {
             if (r.batch.empty())

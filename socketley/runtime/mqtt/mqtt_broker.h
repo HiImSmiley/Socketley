@@ -42,6 +42,8 @@ struct message
     int64_t     expires_ms{0};
     // The client identifier of whoever published it, empty when it came from inside, for No Local.
     std::string from_client;
+    // How many mqtt:// topic rules passed it on to get here, so rules that point at each other stop.
+    uint8_t     hops{0};
 };
 using message_ptr = std::shared_ptr<const message>;
 

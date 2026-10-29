@@ -13080,7 +13080,9 @@ sends every client of the server
 .B {"topic":..,"payload":..}
 as a line; and
 .BI mqtt:// runtime / topic
-publishes on that broker, at the message's QoS and retained as it was; and
+publishes on that broker, at the message's QoS and retained as it was, a
+message that has passed eight such rules on its way being passed on by no
+more of them, so rules that lead to each other end; and
 .BR http:// " or " https:// " URL"
 POSTs
 .B {"topic":..,"payload":..,"qos":..,"retain":..,"client":..}

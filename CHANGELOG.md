@@ -163,6 +163,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate in it was an anchor and no name was checked, so any leaf the
   same public intermediate signed took the credentials; now the peer must
   show the file's first certificate.
+- **MQTT topic rules that lead to each other end.** Two `mqtt://` rules
+  pointing at each other's broker with `%t`, or one pointing back at its own,
+  passed one publish round for ever, delivered again on every pass. A message
+  now carries how many such rules it has passed, and after eight no further
+  `mqtt://` rule takes it; each refusal is counted in the rule's `dropped`.
 - **An MQTT message waiting in a session is checked against the rules as it
   leaves.** A QoS 1 or 2 message was judged by `--acl` when it was routed and
   sent from the session's queue or resent from its window whenever the client
