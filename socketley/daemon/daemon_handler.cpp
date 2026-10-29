@@ -464,6 +464,17 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     m_manager.set_worker_release_sink([this] { reconcile_proxy_workers(); });
     // And the wait for a started runtime's workers, so a script's start answers as late as the CLI's does.
     m_manager.set_worker_await_sink([this](std::string_view name) {
+        // A worker still exiting holds the fork back, and a script's start cannot be parked as the CLI's is, so it
+        // is waited out here within the bound and the fork made at once.
+        const std::string held(name);
+        for (const auto until = std::chrono::steady_clock::now() + worker_startup_bound;
+             m_spawn_waiting.contains(held) && std::chrono::steady_clock::now() < until;)
+        {
+            if (::poll(nullptr, 0, 10) < 0) {}
+            reconcile_proxy_workers();
+        }
+        if (m_spawn_waiting.contains(held))
+            return "runtime " + held + " is not serving yet: its previous worker has not exited; it starts once it has";
         std::string out;
         if (await_worker_startup(name, out, std::chrono::steady_clock::now() + worker_startup_bound) == 0)
             return std::string();
