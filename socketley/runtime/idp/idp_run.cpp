@@ -277,8 +277,15 @@ bool idp_run::start(std::string& why)
             why = err;
             return false;
         }
-        m_ssh_ca_line = socketley::ssh::line_of(socketley::ssh::ed25519_blob(socketley::ed25519::public_raw(m_ssh_ca)),
-                                                std::string(m_owner.get_name()) + "-ssh-ca");
+        m_ssh_ca_blob = socketley::ssh::ed25519_blob(socketley::ed25519::public_raw(m_ssh_ca));
+        m_ssh_ca_line = socketley::ssh::line_of(m_ssh_ca_blob, std::string(m_owner.get_name()) + "-ssh-ca");
+        // Written at once, so a server whose RevokedKeys names it finds a list before the first revocation.
+        if (!socketley::idp::update_ssh_certs(m_owner.get_name(), m_ssh_ca_blob, static_cast<uint64_t>(wall::now_sec()),
+                                              [](auto&) {}, err))
+        {
+            why = err;
+            return false;
+        }
     }
     m_kid = socketley::jws::thumbprint(m_key);
     m_secret = token_secret(m_key);
@@ -585,6 +592,8 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         ssh_ca_pub(c);
     else if (p == "/ssh/user-cert" && post)
         ssh_user_cert(c, rq);
+    else if (p == "/ssh/krl" && get)
+        ssh_krl(c);
     else if (p == "/userinfo" && (get || post))
         userinfo(c, rq);
     else if (p == "/logout" && (get || post))
@@ -601,7 +610,8 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         security_post(c, rq);
     else if (p == "/.well-known/openid-configuration" || p == "/jwks" || p == "/authorize" || p == "/login" ||
              p == "/token" || p == "/userinfo" || p == "/logout" || p == "/" || p.starts_with("/account") ||
-             p == "/device" || p == "/device_authorization" || p == "/ssh/ca.pub" || p == "/ssh/user-cert")
+             p == "/device" || p == "/device_authorization" || p == "/ssh/ca.pub" || p == "/ssh/user-cert" ||
+             p == "/ssh/krl")
         respond(c, 405, "text/plain", "method not allowed\n");
     else
         respond(c, 404, "text/plain", "not found\n");
@@ -1723,6 +1733,36 @@ void idp_run::ssh_ca_pub(const std::shared_ptr<conn>& c)
     respond(c, 200, "text/plain", m_ssh_ca_line + "\n", any_origin);
 }
 
+void idp_run::ssh_krl(const std::shared_ptr<conn>& c)
+{
+    std::string krl, why;
+    if (!m_ssh_ca || !read_file(socketley::idp::ssh_krl_path(m_owner.get_name()), krl, {}, &why))
+    {
+        respond(c, 404, "text/plain", "this provider signs no SSH certificates\n");
+        return;
+    }
+    respond(c, 200, "application/octet-stream", krl, any_origin);
+}
+
+int idp_run::revoke_ssh(const std::function<bool(const socketley::idp::issued_cert&)>& which, std::string& why)
+{
+    if (!m_ssh_ca)
+        return 0;
+    int n = 0;
+    if (!socketley::idp::update_ssh_certs(m_owner.get_name(), m_ssh_ca_blob, static_cast<uint64_t>(wall::now_sec()),
+                                          [&](auto& certs) {
+                                              for (auto& c : certs)
+                                                  if (!c.revoked && which(c))
+                                                  {
+                                                      c.revoked = true;
+                                                      ++n;
+                                                  }
+                                          },
+                                          why))
+        return -1;
+    return n;
+}
+
 std::vector<std::string> idp_run::ssh_principals(const account& who)
 {
     std::vector<std::string> out{std::string(who.username())};
@@ -1801,6 +1841,15 @@ void idp_run::ssh_user_cert(const std::shared_ptr<conn>& c, const request& rq)
     if (cert.empty())
     {
         respond(c, 500, "text/plain", "the certificate could not be signed: " + why + "\n");
+        return;
+    }
+    // Written down before it is handed over, as a certificate nobody can revoke is not one to give.
+    if (!socketley::idp::update_ssh_certs(m_owner.get_name(), m_ssh_ca_blob, static_cast<uint64_t>(now),
+                                          [&](auto& certs) { certs.push_back({req.serial, who->id, req.valid_before, false}); },
+                                          why))
+    {
+        LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + why).c_str());
+        respond(c, 503, "text/plain", "the certificate cannot be recorded now, so it is not given\n");
         return;
     }
     ++m_c.ssh_certs;
@@ -3051,6 +3100,46 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
                                         : std::string("error: this provider signs no SSH certificates; give it --ssh-ca"));
         return;
     }
+    // Where the revocation list is, for sshd's RevokedKeys.
+    if (action == "ssh-krl")
+    {
+        answer_command(ticket, m_ssh_ca ? socketley::idp::ssh_krl_path(m_owner.get_name()) + "\n"
+                                        : std::string("error: this provider signs no SSH certificates; give it --ssh-ca"));
+        return;
+    }
+    // A person's current SSH certificates, by username, or one by its serial, revoked now.
+    if (action == "ssh-revoke")
+    {
+        if (!m_ssh_ca || args.size() != 2)
+        {
+            answer_command(ticket, m_ssh_ca ? "error: idp-ssh revoke takes a username or a certificate's serial"
+                                            : "error: this provider signs no SSH certificates; give it --ssh-ca");
+            return;
+        }
+        const account* who = m_accounts.by_name(args[1]);
+        uint64_t serial = 0;
+        const auto [end, ec] = std::from_chars(args[1].data(), args[1].data() + args[1].size(), serial);
+        const bool by_serial = !who && ec == std::errc{} && end == args[1].data() + args[1].size();
+        if (!who && !by_serial)
+        {
+            answer_command(ticket, "error: " + args[1] + " is neither a username nor a serial");
+            return;
+        }
+        std::string why;
+        const std::string sub = who ? who->id : std::string();
+        const int n = revoke_ssh([&](const auto& c) { return who ? c.sub == sub : c.serial == serial; }, why);
+        if (n < 0)
+            answer_command(ticket, "error: " + why);
+        else if (by_serial && n == 0)
+            answer_command(ticket, "error: no current certificate has the serial " + args[1]);
+        else
+        {
+            LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": " + std::to_string(n) + " SSH certificate(s) of " +
+                      args[1] + " revoked").c_str());
+            answer_command(ticket, "");
+        }
+        return;
+    }
     if (action == "ssh-host")
     {
         uint32_t days = 0;
@@ -3246,10 +3335,11 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         return;
     }
     const std::string id = who->id;
+    // Through write_account, the one door every change of an account takes, so what follows a change follows these.
     auto apply = [this, ticket, id](const field_list& f, std::string_view done)
     {
         std::string why;
-        if (!m_accounts.update(id, f, why))
+        if (!write_account(id, f, why))
             answer_command(ticket, "error: " + why);
         else
             answer_command(ticket, done);
@@ -3446,6 +3536,8 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         std::string why;
         if (!m_accounts.remove(id, why))
             answer_command(ticket, "error: " + why);
+        else if (revoke_ssh([&](const auto& c) { return c.sub == id; }, why) < 0)
+            answer_command(ticket, "error: the account is removed, but its SSH certificates are not revoked: " + why);
         else
             answer_command(ticket, "");
         return;
@@ -3629,7 +3721,17 @@ bool idp_run::write_account(const std::string& id, const field_list& fields, std
             why = std::string(changed_meanwhile);
             return false;
         }
-    return m_accounts.update(id, set, why);
+    if (!m_accounts.update(id, set, why))
+        return false;
+    // Signed out everywhere, disabled, reset, or its groups changed: its SSH certificates end now, not in hours, as one
+    // made before may carry a principal it no longer has.
+    const bool ends = std::any_of(set.begin(), set.end(), [](const auto& kv) {
+        return (kv.first == "revoked_before" && !kv.second.empty()) || kv.first == "groups" ||
+               ((kv.first == "disabled" || kv.first == "reset") && kv.second == "1");
+    });
+    if (std::string w; ends && revoke_ssh([&](const auto& c) { return c.sub == id; }, w) < 0)
+        LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + w).c_str());
+    return true;
 }
 
 void idp_run::update_account(const std::string& id, field_list fields,

@@ -383,4 +383,33 @@ bool verify_cert(const cert& c)
     return ed25519::verify(kraw, c.signed_part, sraw);
 }
 
+std::string krl_of(std::string_view ca_blob, std::vector<uint64_t> serials, uint64_t version)
+{
+    // "SSHKRL\n\0", format 1, then the list's version, when it was made, no flags, and an empty reserved and comment.
+    std::string out;
+    put_u64(out, 0x5353484b524c0a00ULL);
+    put_u32(out, 1);
+    put_u64(out, version);
+    put_u64(out, version);
+    put_u64(out, 0);
+    put_string(out, "");
+    put_string(out, "");
+    if (serials.empty())
+        return out;
+    std::sort(serials.begin(), serials.end());
+    serials.erase(std::unique(serials.begin(), serials.end()), serials.end());
+    // One section of the authority's certificates, holding a list of their serials.
+    std::string list;
+    for (const uint64_t s : serials)
+        put_u64(list, s);
+    std::string section;
+    put_string(section, ca_blob);
+    put_string(section, "");
+    section += static_cast<char>(0x20);
+    put_string(section, list);
+    out += static_cast<char>(1);
+    put_string(out, section);
+    return out;
+}
+
 }   // namespace socketley::ssh

@@ -10,6 +10,7 @@
 #include <openssl/evp.h>
 
 #include "runtime/idp/idp_logic.h"
+#include "runtime/idp/idp_ssh_certs.h"
 #include "shared/crypto/jws.h"
 #include "shared/json/json_escape.h"
 #include "shared/util/base64.h"
@@ -740,4 +741,23 @@ TEST_CASE("attempts in flight count against the bar, and an account waits longer
     l.begin("x");
     l.age(t + 10 * attempt_limits::window_s);
     CHECK_FALSE(l.empty());
+}
+
+TEST_CASE("an idp's SSH certificates are read back as written, and a line that is none refuses the whole file")
+{
+    using socketley::idp::issued_cert;
+    const std::vector<issued_cert> certs{{1000, "kx_n_ZmMreivWHwzMM7D3g", 1790028800, false}, {2000, "abc", 1790030000, true}};
+    std::vector<issued_cert> back;
+    REQUIRE(socketley::idp::parse_ssh_certs(socketley::idp::render_ssh_certs(certs), back));
+    REQUIRE(back.size() == 2);
+    CHECK(back[0].serial == 1000);
+    CHECK(back[0].sub == "kx_n_ZmMreivWHwzMM7D3g");
+    CHECK_FALSE(back[0].revoked);
+    CHECK(back[1].revoked);
+    CHECK(back[1].valid_before == 1790030000);
+    std::vector<issued_cert> none;
+    CHECK_FALSE(socketley::idp::parse_ssh_certs("1000 abc 1790028800 maybe\n", none));
+    CHECK_FALSE(socketley::idp::parse_ssh_certs("x abc 1 issued\n", none));
+    CHECK(socketley::idp::parse_ssh_certs("\n\n", none));
+    CHECK(none.empty());
 }

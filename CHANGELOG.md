@@ -830,6 +830,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **An SSH certificate is revoked now, not at its expiry.** `socketley
+  idp-ssh <idp> revoke <user>|<serial>` ends a person's certificates at once,
+  through the revocation list `idp-ssh <idp> krl` names for sshd's
+  `RevokedKeys` (and `/ssh/krl` serves); signing out everywhere, disabling,
+  resetting or removing an account, or changing its groups, revokes them too.
 - **`socketley tunnel share <edge> <port>` shows a port of this machine at a
   name the edge gives.** Six letters and digits beside the edge's own name, for
   those signed in at its idp or with `--public` for everyone, until Ctrl+C,

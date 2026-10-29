@@ -239,6 +239,8 @@ if [ -x "$SSHD" ] && command -v ssh >/dev/null && command -v ssh-keygen >/dev/nu
     ssh-keygen -q -t ed25519 -N '' -f "$T/key"
     "$BIN" ssh-cert "$I" --key "$T/key.pub" || bad "alice gets a certificate" "rc $?"
     mkdir -p "$T/principals"; echo alice > "$T/principals/$USER"
+    KRL=$("$BIN" idp-ssh auth krl)
+    [ -s "$KRL" ] && ok || bad "the idp keeps a revocation list from its start" "'$KRL'"
     cat > "$T/sshd_config" <<EOF
 Port $PS
 ListenAddress 127.0.0.1
@@ -246,6 +248,7 @@ HostKey $T/host
 PidFile $T/sshd.pid
 AuthorizedKeysFile none
 TrustedUserCAKeys $T/ca.pub
+RevokedKeys $KRL
 AuthorizedPrincipalsFile $T/principals/%u
 UsePAM no
 StrictModes no
@@ -260,6 +263,25 @@ EOF
               -o ProxyCommand="$BIN tunnel connect http://127.0.0.1:$PE 127.0.0.1:$PS --idp $I" \
               "$USER@through-the-tunnel" echo in 2>&1 | grep -v '^Warning: Permanently added')
     [ "$out" = in ] && ok || bad "ssh gets in through the tunnel by its certificate" "$out"
+    in_by_cert() {
+        ssh -i "$T/key" -o CertificateFile="$T/key-cert.pub" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$PS" \
+            "$USER@127.0.0.1" echo in 2>&1 | grep -v '^Warning: Permanently added'
+    }
+    # Revoked now, not in eight hours: sshd reads the list the idp writes, and a certificate made after still gets in.
+    ssh-keygen -Q -f "$KRL" "$T/key-cert.pub" >/dev/null 2>&1 && ok || bad "a certificate is not revoked until it is" "$(ssh-keygen -Q -f "$KRL" "$T/key-cert.pub" 2>&1)"
+    out=$("$BIN" idp-ssh auth revoke alice 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && [ -z "$out" ] && ok || bad "alice's certificates are revoked" "rc $rc: $out"
+    case "$(ssh-keygen -Q -f "$KRL" "$T/key-cert.pub" 2>&1)" in *REVOKED*) ok ;; *) bad "ssh-keygen reads it as revoked" "$(ssh-keygen -Q -f "$KRL" "$T/key-cert.pub" 2>&1)" ;; esac
+    [ "$(in_by_cert)" != in ] && ok || bad "and sshd lets it in no more" "$(in_by_cert)"
+    curl -s "$I/ssh/krl" | cmp -s - "$KRL" && ok || bad "the list is served as it is written" "$(curl -s -o /dev/null -w '%{http_code}' "$I/ssh/krl")"
+    "$BIN" ssh-cert "$I" --key "$T/key.pub" || bad "alice gets a new certificate" "rc $?"
+    [ "$(in_by_cert)" = in ] && ok || bad "which gets in, as a serial was revoked and not alice" "$(in_by_cert)"
+    out=$("$BIN" idp-ssh auth revoke 12345 2>&1); rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *"no current certificate"*) true ;; *) false ;; esac && ok || bad "a serial no certificate has is said" "rc $rc: $out"
+    # Signing out everywhere revokes what the sign-in bought, without anyone asking.
+    "$BIN" idp-user auth logout alice >/dev/null 2>&1
+    case "$(ssh-keygen -Q -f "$KRL" "$T/key-cert.pub" 2>&1)" in *REVOKED*) ok ;; *) bad "signing alice out everywhere revokes her certificate" "$(ssh-keygen -Q -f "$KRL" "$T/key-cert.pub" 2>&1)" ;; esac
 else
     echo "  SKIP: sshd, ssh and ssh-keygen are needed for the ssh part"
 fi

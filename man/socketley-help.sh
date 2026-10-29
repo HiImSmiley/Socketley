@@ -517,10 +517,13 @@ cli_commands() {
     echo -e "  ${CYAN}socketley tunnel share edge.example.com 3000${NC}"
     echo ""
 
-    echo -e "${BOLD}idp-ssh <idp> ca | host-sign <file.pub> --names <host,...> [--days N]${NC}"
+    echo -e "${BOLD}idp-ssh <idp> ca | host-sign <file.pub> --names <host,...> [--days N] | revoke <user>|<serial> | krl${NC}"
     echo "  The idp's SSH authority: its public key for TrustedUserCAKeys and"
-    echo "  @cert-authority, and host certificates for HostCertificate."
+    echo "  @cert-authority, host certificates for HostCertificate, a person's"
+    echo "  certificates ended now, and the revocation list for RevokedKeys, which"
+    echo "  signing out everywhere, disabling and removing write to as well."
     echo -e "  ${CYAN}socketley idp-ssh auth ca > /etc/ssh/socketley_user_ca.pub${NC}"
+    echo -e "  ${CYAN}socketley idp-ssh auth revoke alice${NC}"
     echo ""
 
     echo -e "${BOLD}db-backup <db> <file>${NC}"
@@ -3698,7 +3701,7 @@ OTHER
   idp-user <idp> add|passwd|...  an idp runtime's accounts
   login <idp> | logout <idp>     sign in at an idp from the command line
   ssh-cert <idp>                 an SSH certificate for your key
-  idp-ssh <idp> ca|host-sign     an idp's SSH authority
+  idp-ssh <idp> ca|revoke|...    an idp's SSH authority
   tunnel <edge> invite|list|...  a tunnel edge's agents
   tunnel connect|ssh <edge> ...  a stream through a tunnel edge
   tunnel share <edge> <port>     a port of this machine at a name, for a while

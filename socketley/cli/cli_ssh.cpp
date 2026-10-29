@@ -152,7 +152,9 @@ int cli_idp_ssh(int argc, char** argv)
 {
     const auto usage = [] {
         std::cout << "usage: socketley idp-ssh <idp> ca\n"
-                     "       socketley idp-ssh <idp> host-sign <public key file> --names <host,...> [--days N]\n";
+                     "       socketley idp-ssh <idp> host-sign <public key file> --names <host,...> [--days N]\n"
+                     "       socketley idp-ssh <idp> revoke <user>|<serial>\n"
+                     "       socketley idp-ssh <idp> krl\n";
         return 1;
     };
     if (argc < 4)
@@ -161,6 +163,10 @@ int cli_idp_ssh(int argc, char** argv)
     std::vector<std::string> fwd{argv[0], "idp-user", idp};
     if (action == "ca" && argc == 4)
         fwd.emplace_back("ssh-ca");
+    else if (action == "krl" && argc == 4)
+        fwd.emplace_back("ssh-krl");
+    else if (action == "revoke" && argc == 5)
+        fwd.insert(fwd.end(), {"ssh-revoke", argv[4]});
     else if (action == "host-sign" && argc >= 5)
     {
         const std::string pub = cli_caller_path("host-sign", argv[4]);

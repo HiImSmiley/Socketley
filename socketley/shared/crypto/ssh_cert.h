@@ -88,4 +88,8 @@ bool parse_cert(std::string_view blob, cert& out, std::string& err);
 // Whether the certificate's signature is its signature key's, for an Ed25519 signature key.
 bool verify_cert(const cert& c);
 
+// A key revocation list (PROTOCOL.krl) revoking the certificates of the authority `ca_blob` by their serials, for
+// sshd's RevokedKeys; `version` grows with each one written, and no serials makes a list revoking nothing.
+std::string krl_of(std::string_view ca_blob, std::vector<uint64_t> serials, uint64_t version);
+
 }   // namespace socketley::ssh

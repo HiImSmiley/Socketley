@@ -271,3 +271,53 @@ TEST_CASE("the certificates this writes are read back whole and ssh-keygen reads
     EVP_PKEY_free(ec);
     EVP_PKEY_free(ca);
 }
+
+TEST_CASE("a revocation list revokes the serials it names, as ssh-keygen -Q reads it, and no others")
+{
+    std::string err;
+    EVP_PKEY* ca = ed25519::generate();
+    REQUIRE(ca);
+    tmp_dir d;
+    ssh::public_key k;
+    REQUIRE(ssh::parse_public_key(user_ed, k, err));
+    const std::string ca_blob = ssh::ed25519_blob(ed25519::public_raw(ca));
+    const auto write = [&](const std::string& name, std::string_view bytes) {
+        std::ofstream(d.path + "/" + name, std::ios::binary) << bytes;
+        return d.path + "/" + name;
+    };
+    std::string certs[2];
+    for (int i = 0; i < 2; ++i)
+    {
+        ssh::cert_request rq;
+        rq.subject_blob = k.blob;
+        rq.kind = ssh::cert_kind::user;
+        rq.serial = i == 0 ? 1000 : 2000;
+        rq.key_id = "alice@auth.example.com";
+        rq.principals = {"alice"};
+        rq.valid_before = ~uint64_t{0};
+        certs[i] = write("c" + std::to_string(i) + "-cert.pub", ssh::line_of(ssh::sign_cert(rq, ca, err)) + "\n");
+    }
+    // The header alone when nothing is revoked, "SSHKRL\n\0" first.
+    const std::string empty = ssh::krl_of(ca_blob, {}, 7);
+    CHECK(empty.substr(0, 8) == std::string("SSHKRL\n\0", 8));
+    CHECK(empty.size() == 8 + 4 + 8 + 8 + 8 + 4 + 4);
+    if (!have_ssh_keygen())
+    {
+        EVP_PKEY_free(ca);
+        return;
+    }
+    const auto query = [](const std::string& krl, const std::string& cert) {
+        return std::system(("ssh-keygen -Q -f '" + krl + "' '" + cert + "' >/dev/null 2>&1").c_str());
+    };
+    const std::string none = write("none.krl", empty);
+    CHECK(query(none, certs[0]) == 0);
+    const std::string one = write("one.krl", ssh::krl_of(ca_blob, {1000, 1000}, 8));
+    CHECK(query(one, certs[0]) != 0);
+    CHECK(query(one, certs[1]) == 0);
+    // Another authority's list says nothing of these, though it names the same serial.
+    EVP_PKEY* other = ed25519::generate();
+    const std::string theirs = write("theirs.krl", ssh::krl_of(ssh::ed25519_blob(ed25519::public_raw(other)), {1000}, 9));
+    CHECK(query(theirs, certs[0]) == 0);
+    EVP_PKEY_free(other);
+    EVP_PKEY_free(ca);
+}

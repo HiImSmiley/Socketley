@@ -1128,6 +1128,10 @@ ssh root@server.example.com
 .BI "idp\-ssh " idp " ca"
 .TQ
 .BI "idp\-ssh " idp " host\-sign " "file.pub " "\fB\-\-names \fIhost,...\fR [\fB\-\-days \fIN\fR]"
+.TQ
+.BI "idp\-ssh " idp " revoke " user \fR|\fIserial
+.TQ
+.BI "idp\-ssh " idp " krl"
 The SSH authority of an idp runtime of this daemon:
 .B ca
 prints its public key, for sshd's
@@ -1138,12 +1142,26 @@ line;
 .B host\-sign
 certifies a host key for the names given, 365 days unless told, the
 certificate written beside the key for sshd's
-.BR HostCertificate .
+.BR HostCertificate ;
+.B revoke
+ends a person's current user certificates now rather than at their expiry, or
+one by the serial the log names for it;
+.B krl
+prints the path of the revocation list the idp keeps, for sshd's
+.BR RevokedKeys .
+The list is written when the idp starts and at every revocation, and a
+person signed out everywhere, disabled, reset, removed, or with their groups
+changed has their certificates revoked by it without being asked to, as one
+made before may carry a principal they no longer have. A server that cannot
+read the file fetches the same bytes from
+.BR /ssh/krl .
 .RS
 .PP
 .nf
 socketley idp\-ssh auth ca > /etc/ssh/socketley_user_ca.pub
 socketley idp\-ssh auth host\-sign /etc/ssh/ssh_host_ed25519_key.pub \-\-names server.example.com
+echo "RevokedKeys $(socketley idp\-ssh auth krl)" >> /etc/ssh/sshd_config.d/socketley.conf
+socketley idp\-ssh auth revoke alice
 .fi
 .RE
 .TP
@@ -12633,8 +12651,11 @@ and never to a disabled account, nor on a sign-in more than twelve hours old,
 refreshed tokens and all, which is told to sign in again. A user certificate permits a terminal, port
 forwarding and agent forwarding, and neither X11 forwarding nor the user's
 .IR ~/.ssh/rc .
-Every certificate is said in the log with the
-account, its principals and the key's fingerprint. See
+Every certificate is said in the log with its serial, the
+account, its principals and the key's fingerprint, and kept until it expires
+so that it can be revoked (see
+.BR "idp\-ssh revoke" ).
+See
 .B ssh\-cert
 and
 .BR idp\-ssh .

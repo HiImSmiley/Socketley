@@ -16,6 +16,7 @@
 
 #include "idp_accounts.h"
 #include "idp_logic.h"
+#include "idp_ssh_certs.h"
 #include "idp_shard.h"
 #include "../../shared/http/conn_server.h"
 #include "../../shared/loop/event_loop.h"
@@ -138,6 +139,10 @@ private:
     // token names, for a key the token's holder sends.
     void ssh_ca_pub(const std::shared_ptr<conn>& c);
     void ssh_user_cert(const std::shared_ptr<conn>& c, const request& rq);
+    // The revocation list sshd's RevokedKeys reads, for a server that fetches it rather than reading the file.
+    void ssh_krl(const std::shared_ptr<conn>& c);
+    // Every current SSH certificate `which` picks revoked, how many; -1 with `why` when the list cannot be written.
+    int revoke_ssh(const std::function<bool(const socketley::idp::issued_cert&)>& which, std::string& why);
     // The principals a user certificate names: the username, root for the admins group, and <p> for each ssh:<p>.
     static std::vector<std::string> ssh_principals(const account& who);
     // A host certificate for `key_line` naming `names`, holding `days`; the certificate line, or `error: ...`.
@@ -302,6 +307,7 @@ private:
     // What signs SSH certificates under --ssh-ca, null without it, and its public key as authorized_keys writes it.
     EVP_PKEY* m_ssh_ca{nullptr};
     std::string m_ssh_ca_line;
+    std::string m_ssh_ca_blob;
     uint32_t m_ssh_hours{0};
     // Session cookies and access tokens already verified, so one sent again is not verified again.
     mutable verified_tokens m_verified;
