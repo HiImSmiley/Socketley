@@ -534,7 +534,7 @@ tally < <(run notify | grep -E '^(ok|bad) ')
 tally < <(run rev2 | grep -E '^(ok|bad) ')
 tally < <(run acl | grep -E '^(ok|bad) ')
 made=$(find "$HOME/.local/share" -path '*/mail/m.imap/nosuchowner*' 2>/dev/null | head -3)
-[ -n "$(find "$HOME/.local/share" -path '*/mail/m.imap/bob' 2>/dev/null)" ] && [ -z "$made" ] \
+[ -n "$(find "$HOME/.local/share" -path '*/mail/m.imap/bob.log' 2>/dev/null)" ] && [ -z "$made" ] \
     && ok "asking for a folder of no one makes no index for them" || bad "asking for a folder of no one makes no index for them" "$made"
 tally < <(run cuts | grep -E '^(ok|bad) ')
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1; ready_tcp 127.0.0.1 "$IM" >/dev/null

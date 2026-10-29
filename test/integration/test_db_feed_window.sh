@@ -59,10 +59,12 @@ def stuck(path):
     s.connect(("127.0.0.1", int(pd)))
     s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\n\r\n" % path).encode())
     return s
+state = {}
 def events(s, want, wait=20.0):
-    """The stream's events as (id, name), read until `want` have come."""
+    """The stream's events as (id, name), read until `want` have come, what was read past them kept for the next call."""
     s.settimeout(0.5)
-    buf, out, end, head = b"", [], time.time() + wait, False
+    buf, head = state.get(s, (b"", False))
+    out, end = [], time.time() + wait
     while len(out) < want and time.time() < end:
         try:
             d = s.recv(1 << 20)
@@ -79,6 +81,7 @@ def events(s, want, wait=20.0):
             ev = dict(l.split(": ", 1) for l in block.decode().split("\n") if ": " in l and not l.startswith(":"))
             if "event" in ev:
                 out.append((int(ev.get("id", "0")), ev["event"]))
+    state[s] = (buf, head)
     return out
 
 n = 0
