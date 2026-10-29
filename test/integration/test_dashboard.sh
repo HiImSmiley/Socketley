@@ -262,6 +262,9 @@ export SOCKETLEY_CONFIG="$SOCKETLEY_TMPD/daemon.lua"
 daemon_start "$BIN"
 for _ in $(seq 1 50); do curl -s -o /dev/null "$U/" && break; sleep 0.1; done
 expect "without credentials the figures are read as before" "$(code "$U/api/runtimes")" 200
+# 403 and not 401, which would send the read-only page to a sign-in it cannot make.
+expect "but not the log, which is no figure" "$(code "$U/api/logs")" 403
+expect "nor a zone's text" "$(code -G --data-urlencode "runtime=ns" --data-urlencode "path=/etc/hostname" "$U/api/zone")" 403
 expect "and nobody signs in" "$(code -X POST -u "$ADMIN" "$U/api/session")" 403
 expect "or changes anything" "$(code -H 'X-Socketley-Dashboard: 1' -d '{"args":["ls"]}' "$U/api/run")" 403
 

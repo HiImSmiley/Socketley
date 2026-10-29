@@ -120,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lockout, and skipped SPF, DMARC, DNSBL and greylisting. A TCP visitor now
   comes from 127.0.0.2; an HTTP service, behind the entrance, still from
   127.0.0.1.
+- **A dashboard without credentials shows the figures and not the log or a
+  zone.** Its loopback port answered `/api/logs` and `/api/zone` to every
+  local user, handing out the daemon's log and zone files the state
+  directory keeps from them; both now need a session, 403 while none can
+  be made.
 - **The dashboard logs a mail relay without its password.** A `create` or
   `edit` with `--relay smtps://user:password@host` was written to the
   daemon's log and its ring as typed, which every later session reads; the

@@ -7,7 +7,8 @@
 // (daemon.dashboard_credentials, a storage runtime's format), checked as a proxy's --auth basic: checks them, five
 // failures from one address barring it for fifteen minutes. A session is a cookie sealed with a key this process
 // draws at start, HttpOnly and SameSite=Strict, good for twelve hours; a change also carries the page's own header,
-// which no other site's request can. Without the credentials the page shows and changes nothing.
+// which no other site's request can. Without the credentials the page shows the figures, not the log or a zone, and
+// changes nothing.
 #include "../runtime/idp/idp_session.h"
 #include <cstdint>
 #include <memory>

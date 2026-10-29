@@ -392,8 +392,13 @@ std::string query_field(std::string_view q, std::string_view name)
 
 void server::logs(int fd, const request& r)
 {
-    // The log says what runtimes do and with what, so only a session reads it when there are credentials.
-    if (!may_read(r))
+    // The log says what runtimes do and with what, which is no figure, so only a session reads it.
+    if (!configured())
+    {
+        send(fd, 403, "text/plain; charset=utf-8", "Reading the log needs daemon.dashboard_credentials and a sign-in.\n");
+        return;
+    }
+    if (session_of(r).empty())
     {
         send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
         return;
@@ -598,7 +603,13 @@ void server::edge(int fd, const request& r)
 
 void server::zone(int fd, const request& r)
 {
-    if (r.method == "GET" ? !may_read(r) : session_of(r).empty())
+    // A zone's text is no figure either, and the file is one only the daemon's user may read.
+    if (!configured())
+    {
+        send(fd, 403, "text/plain; charset=utf-8", "Reading a zone needs daemon.dashboard_credentials and a sign-in.\n");
+        return;
+    }
+    if (session_of(r).empty())
     {
         send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
         return;

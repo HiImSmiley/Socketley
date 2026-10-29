@@ -17121,7 +17121,8 @@ none with a word holding a space. With credentials named, every route but the
 page and the sign\-in needs the session, and
 .B /metrics
 needs it from anywhere but a scraper on this machine without a proxy between;
-without them the page shows the figures, as it always did, and changes
+without them the page shows the figures, as it always did, but not the log
+or a zone's text, which need a session whatever is configured, and changes
 nothing.
 .IP
 Its figures are drawn over the last fifteen minutes, hour, six hours or day, as
