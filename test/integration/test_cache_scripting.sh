@@ -355,5 +355,19 @@ want "a pattern nested past 200 is refused, not a C stack overflow" "too complex
   '[["EVAL","return string.match(string.rep(\"a\", 300), string.rep(\"a?\", 300))","0"]]'
 
 echo ""
+echo "--- 11. what a script may hold and return is bounded ---"
+# A string grown in C is built before any hook could fire, and its reply was a second copy of the same size.
+want "a string.rep past the script's heap is refused before it is built" "string.rep would make more than the 128 MiB" \
+  '[["EVAL","return #string.rep(\"a\", 200000000)","0"]]'
+want "a string doubled past the script's heap is out of memory" "OOM the script asked for more than the 128 MiB" \
+  '[["EVAL","local s = \"a\" for i = 1, 28 do s = s .. s end return #s","0"]]'
+want "a reply naming one string many times is refused at 64 MiB" "longer than the 64 MiB" \
+  '[["EVAL","local s = string.rep(\"a\", 1048576) local t = {} for i = 1, 80 do t[i] = s end return t","0"]]'
+want "and a script after them has its whole heap again" ":50000000 |" \
+  '[["EVAL","return #string.rep(\"a\", 50000000)","0"]]'
+want "a rep of nothing is nothing" '$0 |' '[["EVAL","return string.rep(\"\", 2000000000)","0"]]'
+want "the cache answers after them" "PONG" '[["PING"]]'
+
+echo ""
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && { echo "  OK"; exit 0; } || exit 1

@@ -46,6 +46,13 @@ public:
     using command_fn = std::function<void(std::span<std::string_view> args, std::string& reply)>;
 
     cache_script_engine() = default;
+    ~cache_script_engine();
+    cache_script_engine(const cache_script_engine&)            = delete;
+    cache_script_engine& operator=(const cache_script_engine&) = delete;
+
+    // What one script may allocate beyond what the state held when it began, and how long its reply may be.
+    static constexpr int64_t script_heap_max  = int64_t{128} << 20;
+    static constexpr size_t  script_reply_max = size_t{64} << 20;
 
     // Evaluates `body`, loaded as SCRIPT LOAD would load it, and appends the
     // RESP form of its return value.  False means `err` holds a message
@@ -85,7 +92,19 @@ private:
     // Pushes the reply and answers 1, or pushes the error text and answers 0.
     int run_call(lua_State* L, bool raising);
 
+    // Counts what the state allocates and refuses growth past `limit` while a script runs, -1 being unarmed.
+    struct alloc_budget
+    {
+        lua_Alloc inner{nullptr};
+        void*     inner_ud{nullptr};
+        int64_t   used{0};
+        int64_t   limit{-1};
+    };
+    static void* budgeted_alloc(void* ud, void* ptr, size_t osize, size_t nsize);
+
     bool                m_ready{false};
+    // Declared before the state, so it outlives every allocation the state frees.
+    alloc_budget        m_alloc;
     sol::state          m_lua;
     // Transparent too: known() and body_of() take a view and used to build a
     // std::string for every EVALSHA just to look it up.

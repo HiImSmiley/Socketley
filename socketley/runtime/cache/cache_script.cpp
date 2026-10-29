@@ -201,9 +201,11 @@ bool push_reply(lua_State* L, std::string_view& p)
 // and not a list.
 // Read raw, because this runs outside the script's pcall: a table whose
 // __index raised ended the worker, from one EVAL any client could send.
-void lua_to_resp(lua_State* L, int idx, std::string& out, int depth = 0)
+// False once `out` would pass `cap`, since a table naming one long string many times is a reply many times as long.
+bool lua_to_resp(lua_State* L, int idx, std::string& out, size_t cap, int depth = 0)
 {
-    if (depth > 16 || !lua_checkstack(L, 2)) { resp::encode_null_into(out); return; }
+    if (out.size() > cap) return false;
+    if (depth > 16 || !lua_checkstack(L, 2)) { resp::encode_null_into(out); return true; }
     if (idx < 0) idx = lua_gettop(L) + idx + 1;
 
     size_t len = 0;
@@ -214,7 +216,7 @@ void lua_to_resp(lua_State* L, int idx, std::string& out, int depth = 0)
             // "no value", and Redis chose these.
             if (lua_toboolean(L, idx)) resp::encode_integer_into(out, 1);
             else                       resp::encode_null_into(out);
-            return;
+            return true;
         case LUA_TNUMBER:
             // Truncated towards zero, not rounded: a script returning 3.7 is
             // returning 3 on Redis, and a caller that wanted 3.7 has to return
@@ -227,13 +229,14 @@ void lua_to_resp(lua_State* L, int idx, std::string& out, int depth = 0)
                             : d < -9223372036854775808.0  ? INT64_MIN
                                                           : static_cast<int64_t>(d);
             resp::encode_integer_into(out, v);
-            return;
+            return true;
         }
         case LUA_TSTRING:
         {
             const char* s = lua_tolstring(L, idx, &len);
+            if (len > cap - out.size()) return false;
             resp::encode_bulk_into(out, std::string_view(s, len));
-            return;
+            return true;
         }
         case LUA_TTABLE:
         {
@@ -242,9 +245,10 @@ void lua_to_resp(lua_State* L, int idx, std::string& out, int depth = 0)
             if (lua_type(L, -1) == LUA_TSTRING)
             {
                 const char* s = lua_tolstring(L, -1, &len);
+                if (len > cap - out.size()) { lua_pop(L, 1); return false; }
                 resp::encode_error_code_into(out, std::string_view(s, len));
                 lua_pop(L, 1);
-                return;
+                return true;
             }
             lua_pop(L, 1);
             lua_pushliteral(L, "ok");
@@ -252,9 +256,10 @@ void lua_to_resp(lua_State* L, int idx, std::string& out, int depth = 0)
             if (lua_type(L, -1) == LUA_TSTRING)
             {
                 const char* s = lua_tolstring(L, -1, &len);
+                if (len > cap - out.size()) { lua_pop(L, 1); return false; }
                 resp::encode_simple_into(out, std::string_view(s, len));
                 lua_pop(L, 1);
-                return;
+                return true;
             }
             lua_pop(L, 1);
 
@@ -273,15 +278,35 @@ void lua_to_resp(lua_State* L, int idx, std::string& out, int depth = 0)
             for (int i = 1; i <= n; ++i)
             {
                 lua_rawgeti(L, idx, i);
-                lua_to_resp(L, -1, out, depth + 1);
+                const bool fits = lua_to_resp(L, -1, out, cap, depth + 1);
                 lua_pop(L, 1);
+                if (!fits) return false;
             }
-            return;
+            return true;
         }
         default:
             resp::encode_null_into(out);
-            return;
+            return true;
     }
+}
+
+// string.rep with its result's length known before it is built, so a count of billions is refused without a byte.
+int bounded_rep(lua_State* L)
+{
+    size_t len = 0, seplen = 0;
+    luaL_checklstring(L, 1, &len);
+    const lua_Integer n = luaL_checkinteger(L, 2);
+    if (!lua_isnoneornil(L, 3)) luaL_checklstring(L, 3, &seplen);
+    const size_t unit = len + seplen;
+    if (n <= 0 || unit == 0) { lua_pushliteral(L, ""); return 1; }
+    const auto max = static_cast<size_t>(cache_script_engine::script_heap_max);
+    if (static_cast<uint64_t>(n) > max / unit + 1 || len * static_cast<size_t>(n) + seplen * static_cast<size_t>(n - 1) > max)
+        return luaL_error(L, "string.rep would make more than the %d MiB a script may hold",
+                          static_cast<int>(max >> 20));
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_insert(L, 1);
+    lua_call(L, lua_gettop(L) - 1, 1);
+    return 1;
 }
 
 }  // namespace
@@ -399,11 +424,30 @@ int cache_script_engine::run_call(lua_State* L, bool raising)
 
 // ─── The state ──────────────────────────────────────────────────────────────
 
+cache_script_engine::~cache_script_engine()
+{
+    // LuaJIT tears down its own allocator only when it is the one installed.
+    if (m_alloc.inner) lua_setallocf(m_lua.lua_state(), m_alloc.inner, m_alloc.inner_ud);
+}
+
+void* cache_script_engine::budgeted_alloc(void* ud, void* ptr, size_t osize, size_t nsize)
+{
+    auto* b = static_cast<alloc_budget*>(ud);
+    const int64_t grow = static_cast<int64_t>(nsize) - static_cast<int64_t>(osize);
+    // A NULL for growth is LuaJIT's "not enough memory", raised inside the script's pcall.
+    if (grow > 0 && b->limit >= 0 && b->used + grow > b->limit) return nullptr;
+    void* p = b->inner(b->inner_ud, ptr, osize, nsize);
+    if (p != nullptr || nsize == 0) b->used += grow;
+    return p;
+}
+
 void cache_script_engine::ensure_state()
 {
     if (m_ready) return;
     m_ready = true;
     lua_State* L = m_lua.lua_state();
+    m_alloc.inner = lua_getallocf(L, &m_alloc.inner_ud);
+    lua_setallocf(L, &cache_script_engine::budgeted_alloc, &m_alloc);
 
     // Opened by name, and the list is the whole of the sandbox.  `io`, `os`,
     // `package`, `debug` and `ffi` are absent because a script here came from
@@ -423,6 +467,9 @@ void cache_script_engine::ensure_state()
     // A client's pattern is matched by one that answers to the deadline, as LuaJIT's backtracks in C where no hook fires.
     lua_getglobal(L, "string");
     lua_pattern::install(L, -1);
+    lua_getfield(L, -1, "rep");
+    lua_pushcclosure(L, &bounded_rep, 1);
+    lua_setfield(L, -2, "rep");
     lua_pop(L, 1);
 
     // The deadline the rest of the tree already uses, on this state too: a
@@ -638,17 +685,46 @@ bool cache_script_engine::eval(std::string_view body,
     // by running past its own timeout while the cache stopped answering.
     lua_deadline::scope deadline("a script", lua_deadline::default_ms(), "cache eval");
 
-    sol::protected_function_result r = cached->second();
-    if (!r.valid())
+    const int64_t used_before = m_alloc.used;
+    bool ran = true;
     {
-        sol::error e = r;
-        err = shape_lua_error(e.what());
-        return false;
-    }
+        // Armed for the script alone, since a refusal outside its pcall would be a panic that ends the worker.
+        struct heap_scope
+        {
+            alloc_budget& b;
+            bool          armed;
+            void close() { if (armed) { b.limit = -1; armed = false; } }
+            ~heap_scope() { close(); }
+        } heap{ m_alloc, m_alloc.limit < 0 };
+        if (heap.armed) m_alloc.limit = used_before + script_heap_max;
+        sol::protected_function_result r = cached->second();
+        heap.close();
 
-    if (r.return_count() > 0) lua_to_resp(L, r.stack_index(), resp_out);
-    else                      resp::encode_null_into(resp_out);
-    return true;
+        if (!r.valid())
+        {
+            sol::error e = r;
+            err = shape_lua_error(e.what());
+            if (err.find("not enough memory") != std::string::npos)
+                err = "OOM the script asked for more than the " + std::to_string(script_heap_max >> 20)
+                    + " MiB a script may hold";
+            ran = false;
+        }
+        else if (r.return_count() > 0)
+        {
+            const size_t at = resp_out.size();
+            if (!lua_to_resp(L, r.stack_index(), resp_out, at + script_reply_max))
+            {
+                resp_out.resize(at);
+                err = "the script's reply is longer than the " + std::to_string(script_reply_max >> 20)
+                    + " MiB a script may return";
+                ran = false;
+            }
+        }
+        else resp::encode_null_into(resp_out);
+    }
+    // A script that grew the state by much leaves it collected, so its garbage is not the next one's head start.
+    if (m_alloc.used - used_before > int64_t{16} << 20) lua_gc(L, LUA_GCCOLLECT, 0);
+    return ran;
 }
 
 }  // namespace socketley

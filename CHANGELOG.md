@@ -163,6 +163,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate in it was an anchor and no name was checked, so any leaf the
   same public intermediate signed took the credentials; now the peer must
   show the file's first certificate.
+- **A script holds at most 128 MiB and returns at most 64 MiB.** EVAL's
+  `string.rep` and `..` build strings in C, where the deadline never fires, and
+  the reply was a second copy, so `EVAL "return string.rep('a',2e9)" 0` took
+  4 GB of the worker's memory. The script's state now refuses growth past
+  128 MiB while it runs (`-OOM`), `string.rep` refuses a result past it
+  before building it, and a reply past 64 MiB is an error.
 - **A script's pattern match is stopped by the deadline.** `string.find`,
   `match`, `gmatch` and `gsub` backtracked inside one C call where the count
   hook never fires, so `EVAL "return string.find(string.rep('a',1e5),'a*a*b')" 0`
