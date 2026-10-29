@@ -65,6 +65,8 @@ struct stream
     size_t   tx_given_front{0};    // what of tx.front() nghttp3 already has
     size_t   tx_given_chunks{0};   // chunks nghttp3 has whole, at the front
     uint64_t tx_total{0}, tx_given{0}, tx_acked_front{0};
+    // What the peer has acknowledged of tx_total, so what the answer still holds here is the difference.
+    uint64_t tx_acked{0};
     bool     submitted{false};
     bool     blocked{false};       // read_data said it would block; resumed when more comes
     bool     end_pending{false};
@@ -75,6 +77,11 @@ struct stream
     // used to decide a stream's write was done, which is not `ended` -- a stream still owing its last bytes
     // has them taken before its EOF is given.
     bool drained() const { return os != out_state::head && tx_given == tx_total; }
+    // The bytes of its answer this side still keeps, framed or not, which is what a host's backpressure counts.
+    uint64_t held() const
+    {
+        return (tx_total > tx_acked ? tx_total - tx_acked : 0) + head_acc.size() + dechunk_in.size();
+    }
 };
 
 // The runtime's own counters, which differ in name and place per runtime.

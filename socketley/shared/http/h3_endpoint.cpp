@@ -1003,6 +1003,7 @@ void acked(stream& st, uint64_t len)
 {
     // Acknowledged bytes are let go from the front; a chunk goes when the whole of it is.
     st.tx_acked_front += len;
+    st.tx_acked += len;
     while (!st.tx.empty() && st.tx_given_chunks > 0 && st.tx_acked_front >= st.tx.front().size())
     {
         st.tx_acked_front -= st.tx.front().size();

@@ -263,9 +263,17 @@ void proxy_instance::h3_host_stream_gone(socketley::h3::stream& st)
     }
 }
 
-// A stream whose bytes nghttp3 has all taken has nothing waiting on it here: this proxy is told its answer is over
-// by its own paths, not by the wire.
-void proxy_instance::h3_write_done(socketley::h3::stream&) {}
+// A stream whose bytes nghttp3 has all taken may have room again for its backend's answer; it is resumed after the
+// endpoint's walk, since a refused arm closes the stream the walk is on.
+void proxy_instance::h3_write_done(socketley::h3::stream& st)
+{
+    auto* child = h3_child(st);
+    if (!child || child->closing || child->ex.backend_fd < 0 || child->ex.backend_fd >= MAX_FDS)
+        return;
+    const auto& be = m_conn_idx[child->ex.backend_fd];
+    if (be.side == conn_backend && !be.backend->read_pending && !client_backpressured(be.backend))
+        m_h3_resume.push_back(child->fd);
+}
 
 #else
 

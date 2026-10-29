@@ -671,6 +671,11 @@ public:
     void finish_recv_withdraw(proxy_backend_connection* conn,
                               struct io_uring_cqe* cqe, io_request* req);
     bool client_backpressured(const proxy_backend_connection* conn) const;
+    // What a stream's connection holds of its answer past its write queue, framed for HTTP/2 or HTTP/3 and not yet
+    // taken by the wire, which its backend's pause has to count.
+    size_t stream_answer_held(const proxy_client_connection* conn) const;
+    // A stream's backend read again once its answer has drained, which no write completion reports for a stream.
+    void resume_stream_backend(proxy_client_connection* child);
 
     // Arming a read goes through here and nowhere else, so the question that
     // decides multishot is asked in one place rather than at twenty call sites.
@@ -841,6 +846,8 @@ private:
     void h2_in(proxy_client_connection* conn, const char* p, size_t n);
     // Frames into the connection's queue: its own first, then one of each stream with something to send, in turn.
     void h2_schedule(proxy_client_connection* conn);
+    // The wire took a write: a turn that stopped at the queue's bound goes on, since a paused backend cannot start it.
+    void h2_wrote(proxy_client_connection* conn);
     void h2_goaway(proxy_client_connection* conn, uint32_t code);
     // Every stream of a session that is going, before the session's own state is let go of.
     void h2_parent_gone(proxy_client_connection* conn);
@@ -1122,6 +1129,8 @@ private:
     h3_tally m_h3t{};
     std::unique_ptr<socketley::h3::endpoint, socketley::h3::endpoint_free> m_h3;
     std::unique_ptr<socketley::h3::host> m_h3_host;
+    // Streams whose answer QUIC has drained, resumed after the endpoint's turn rather than inside its walk.
+    std::vector<int> m_h3_resume;
     // The Alt-Svc value every answer over TCP carries, empty when no UDP socket is open.
     std::string m_alt_svc;
     std::string m_auth_spec;

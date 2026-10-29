@@ -1050,6 +1050,14 @@ void proxy_instance::on_loop_turn()
     // Every HTTP/3 connection whose state moved this turn writes its packets now, in one write each rather than
     // one per thing that moved it.
     h3_flush();
+    if (SOCKETLEY_UNLIKELY(!m_h3_resume.empty()))
+    {
+        std::vector<int> due;
+        due.swap(m_h3_resume);
+        for (const int fd : due)
+            if (fd >= 0 && fd < MAX_FDS && m_conn_idx[fd].side == conn_client && m_conn_idx[fd].client->h3s)
+                resume_stream_backend(m_conn_idx[fd].client);
+    }
 
     // The entrance's table, looked at once a second: a stat, and a read only
     // when the daemon wrote it again.
@@ -1097,8 +1105,27 @@ bool proxy_instance::client_backpressured(const proxy_backend_connection* conn) 
     if (conn->client_fd < 0 || conn->client_fd >= MAX_FDS)
         return false;
     const auto& ce = m_conn_idx[conn->client_fd];
-    return ce.side == conn_client &&
-           ce.client->write_queue.bytes() >= write_watermark_bytes();
+    if (ce.side != conn_client)
+        return false;
+    size_t held = ce.client->write_queue.bytes();
+    // A stream's write queue is emptied into its framing at once, so what it holds is counted there.
+    if (SOCKETLEY_UNLIKELY(ce.client->h2s != nullptr || ce.client->h3s != nullptr))
+        held += stream_answer_held(ce.client);
+    return held >= write_watermark_bytes();
+}
+
+void proxy_instance::resume_stream_backend(proxy_client_connection* child)
+{
+    if (child->closing || child->connect_pending || child->ex.backend_fd < 0 || child->ex.backend_fd >= MAX_FDS)
+        return;
+    const int bfd = child->ex.backend_fd;
+    auto& be = m_conn_idx[bfd];
+    if (be.side != conn_backend || be.backend->client_fd != child->fd || be.backend->read_pending ||
+        be.backend->parked || be.backend->pool_draining || !backend_read_armable(be.backend) ||
+        client_backpressured(be.backend))
+        return;
+    if (SOCKETLEY_UNLIKELY(!arm_read(bfd, be.backend)))
+        close_pair(child->fd, bfd);
 }
 
 // Whether the backend this client feeds is holding more than the pacing point,
@@ -10931,6 +10958,9 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
             return;
         }
     }
+
+    if (SOCKETLEY_UNLIKELY(conn->h2 != nullptr))
+        h2_wrote(conn);
 
     // Backpressure resume: if client write queue drained below threshold, restart backend reads
     if (conn->write_queue.bytes() < write_watermark_bytes() &&

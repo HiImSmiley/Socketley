@@ -353,6 +353,16 @@ bool proxy_instance::h2_child_flush(proxy_client_connection* child)
     return true;
 }
 
+size_t proxy_instance::stream_answer_held(const proxy_client_connection* conn) const
+{
+    if (conn->h3s)
+        return static_cast<size_t>(conn->h3s->held());
+    if (!conn->h2s)
+        return 0;
+    const proxy_h2_stream& st = *conn->h2s;
+    return st.tx_left() + st.hdr.size() + st.head_acc.size() + st.dechunk_in.size();
+}
+
 // The answer is over, which on a stream is END_STREAM and not a half-closed socket.
 void proxy_instance::h2_child_end(proxy_client_connection* child)
 {
@@ -409,6 +419,14 @@ void proxy_instance::h2_stream_gone(proxy_client_connection* child)
 
 // ─── The turn ───────────────────────────────────────────────────────────────
 
+void proxy_instance::h2_wrote(proxy_client_connection* conn)
+{
+    if (!conn->h2 || conn->closing || conn->fd < 0 || conn->h2->rr.empty() ||
+        conn->write_queue.bytes() >= h2_out_high)
+        return;
+    h2_schedule(conn);
+}
+
 void proxy_instance::h2_schedule(proxy_client_connection* conn)
 {
     if (!conn->h2 || conn->closing || conn->fd < 0)
@@ -426,8 +444,14 @@ void proxy_instance::h2_schedule(proxy_client_connection* conn)
         s.turn_again = false;
         std::string out;
         std::vector<proxy_client_connection*> ended;
+        // By descriptor, since a stream that ends in this turn is gone before its backend could be read again.
+        std::vector<int> wrote;
         h2::drain(s, out, conn->write_queue.bytes(), h2_out_high,
-                  [](proxy_client_connection* child) { child->last_activity = std::chrono::steady_clock::now(); },
+                  [&](proxy_client_connection* child)
+                  {
+                      child->last_activity = std::chrono::steady_clock::now();
+                      wrote.push_back(child->fd);
+                  },
                   [&](proxy_client_connection* child) { ended.push_back(child); },
                   [](proxy_client_connection*) {});
         if (!out.empty())
@@ -450,6 +474,11 @@ void proxy_instance::h2_schedule(proxy_client_connection* conn)
                 child->closing = true;
                 close_pair(child->fd, child->ex.backend_fd);
             }
+        // A stream whose answer the wire has taken below the pacing point has its backend read again.
+        for (const int fd : wrote)
+            if (fd >= 0 && fd < MAX_FDS && m_conn_idx[fd].side == conn_client &&
+                m_conn_idx[fd].client->h2_parent == conn)
+                resume_stream_backend(m_conn_idx[fd].client);
     } while (s.turn_again && !conn->closing && conn->fd >= 0);
     s.in_turn = false;
 

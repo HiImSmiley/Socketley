@@ -9,10 +9,17 @@
 #             sent them and never read grew the session's queue by 13 bytes per
 #             9 it sent; past the bound on resets the connection now ends with
 #             GOAWAY ENHANCE_YOUR_CALM, as it does for the peer's own resets
+#   answers   a stream's answer was framed into the stream's own buffer and the
+#             backend read on, since the pause asked only the stream's write
+#             queue, which is emptied into that buffer at once; eight GETs of a
+#             large file from a client that grants no window held all eight
+#             files in the entrance
 #
 # ─── WHAT KEEPS IT HONEST ───────────────────────────────────────────────────
 # A thousand such frames in one flight: before the bound every one was answered
 # and no GOAWAY came, so the count of resets and the GOAWAY's code are both asked.
+# The allowance for the eight answers is a third of what they ask, and a client
+# that does read must still get the whole file, or a pause nothing resumes passes.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -50,6 +57,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=example.com \
 
 mkdir -p "$T/one"
 echo "from-one" >"$T/one/who.txt"
+head -c $((48 * 1024 * 1024)) /dev/urandom >"$T/one/big.bin"
 E=$((P+1))
 "$BIN" create server one -p $((P+2)) --http "$T/one" --domain one.example.com -s >/dev/null 2>&1
 "$BIN" create proxy ent -p "$E" --tls --cert "$T/e.pem" --key "$T/e.key" -s >/dev/null 2>&1
@@ -113,6 +121,14 @@ if what == "resets":
     rst = sum(1 for t, _ in got if t == 3)
     away = [int.from_bytes(p[4:8], "big") for t, p in got if t == 7 and len(p) >= 8]
     print("%s %d" % ("goaway=%d" % away[-1] if away else "none", 1 if rst <= 400 else 0))
+elif what == "streams":
+    s = connect(port)
+    # GET, https, then :path and :authority as literals on the static table's names, with no Huffman.
+    path, auth = sys.argv[3].encode(), b"one.example.com"
+    block = b"\x82\x87\x04" + bytes([len(path)]) + path + b"\x01" + bytes([len(auth)]) + auth
+    s.sendall(b"".join(frame(1, 5, sid, block) for sid in range(1, 17, 2)))
+    time.sleep(float(sys.argv[4]))
+    print("held")
 PY
 
 got=$(python3 -I "$T/h2raw.py" "$E" resets 2>&1)
@@ -121,6 +137,31 @@ expect "a thousand frames that each draw a reset end the session with ENHANCE_YO
 expect "and the entrance still answers the next client" \
     "$(curl -sk --noproxy '*' -m 5 --resolve "one.example.com:$E:127.0.0.1" "https://one.example.com:$E/who.txt")" \
     "from-one"
+
+WORKER=$(ss -ltnp 2>/dev/null | awk -v p=":$E" '$4 ~ p"$" {
+    if (match($0, /pid=[0-9]+/)) print substr($0, RSTART+4, RLENGTH-4) }' | head -1)
+if [ -z "${WORKER:-}" ]; then
+    bad "the entrance's process is found" "nothing listens on $E"
+else
+    rss() { awk '/^VmRSS/{print $2}' "/proc/$WORKER/status" 2>/dev/null || echo 0; }
+    BASE=$(rss)
+    python3 -I "$T/h2raw.py" "$E" streams /big.bin 6 >"$T/streams.out" 2>&1 &
+    GP=$!
+    PEAK=$BASE
+    while kill -0 "$GP" 2>/dev/null; do r=$(rss); [ "${r:-0}" -gt "$PEAK" ] && PEAK=$r; sleep 0.1; done
+    wait "$GP" 2>/dev/null
+    ADDED=$(( (PEAK - BASE) / 1024 ))
+    echo "  eight GETs of a 48 MB file, no window granted: the entrance grew $ADDED MB ($(cat "$T/streams.out"))"
+    if [ "$(cat "$T/streams.out")" = held ] && [ "$ADDED" -lt 128 ]; then
+        ok "eight unread answers are held to the pacing point ($ADDED MB for 384 MB asked)"
+    else
+        bad "eight unread answers are held to the pacing point" "grew $ADDED MB, client said '$(cat "$T/streams.out")'"
+    fi
+fi
+bigver=$(curl -sk --noproxy '*' -m 60 --resolve "one.example.com:$E:127.0.0.1" -o "$T/got.bin" \
+    -w '%{http_version}' "https://one.example.com:$E/big.bin")
+expect "and a client that reads gets the whole 48 MB over a stream" \
+    "$(cmp -s "$T/one/big.bin" "$T/got.bin" && echo "same/$bigver")" "same/2"
 
 echo ""
 echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="

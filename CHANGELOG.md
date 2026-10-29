@@ -69,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its own five, so a site's /48 gave one attacker 65536 budgets of five
   guesses each a quarter of an hour; the /48 now shares one budget of
   sixteen /64s' worth, beside each /64's own.
+- **An HTTP/2 or HTTP/3 stream's answer pauses its backend like a socket's.**
+  A stream's answer was framed into the stream's own buffer at once, and the
+  backend's read paused only on the stream's write queue, which that leaves
+  empty, so a client that granted no window held whole answers in the
+  entrance; the pause now counts what the stream still holds, and the wire
+  taking it resumes the backend.
 - **An HTTP/2 client that does not read cannot grow the entrance's queue.**
   A frame that draws an RST_STREAM, such as a PRIORITY of the wrong length,
   drew one per frame with no count, and a session's queue had no bound beside
