@@ -11,6 +11,7 @@
 #   * APPEND, COPY and MOVE without the UIDs UIDPLUS gives, or EXPUNGE leaving the object in the storage
 #   * new mail not told by NOOP or IDLE, or told only when the bucket is next listed
 #   * flags and UIDs lost by a restart
+#   * a client on this machine guessing an idp account's password with no count kept of its failures
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -632,6 +633,37 @@ print(long_ref, many, two, huge, M.noop()[0])
 PY
 )
 check "LIST refuses a 2 KiB reference and 100 patterns, lists two, and a command of a million words is refused" "$r" "BAD BAD True BAD OK"
+
+# Mail does not guard a client on this machine, so the idp counts the guesses at its account: ten wrong passwords at
+# once hold the next up, the right one too, while the account still signs in on the web.
+"$BIN" idp-user auth add carl --password carlpassword12 --email carl@example.test >/dev/null 2>&1
+r=$(timeout 180 python3 - "$IM" "$PI" <<'PY'
+import imaplib, sys, threading, urllib.request, urllib.parse, urllib.error
+def login(pw):
+    M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1]))
+    try:
+        M.login("carl", pw)
+        return "OK"
+    except imaplib.IMAP4.error as e:
+        return "UNAVAILABLE" if "UNAVAILABLE" in str(e) else "NO"
+got = []
+ts = [threading.Thread(target=lambda: got.append(login("wrongpassword"))) for _ in range(10)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+try:
+    st = urllib.request.build_opener(NoRedirect).open(urllib.request.Request(
+        "http://127.0.0.1:%s/login" % sys.argv[2], method="POST",
+        data=urllib.parse.urlencode(dict(rd="/", username="carl", password="carlpassword12")).encode())).status
+except urllib.error.HTTPError as e:
+    st = e.code
+print(got.count("NO"), login("carlpassword12"), st)
+PY
+)
+check "ten wrong mail passwords from this machine hold up the next, the right one too, and not the web sign-in" "$r" "10 UNAVAILABLE 302"
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

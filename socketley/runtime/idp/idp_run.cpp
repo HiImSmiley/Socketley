@@ -2951,8 +2951,29 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         const std::string name = who ? std::string(who->username()) : std::string();
         const std::string email = who ? std::string(trusted_email(*who)) : std::string();
         const std::string quota = who ? std::string(who->field("mail_quota")) : std::string();
-        check_mail_password(who, args.size() > 2 ? args[2] : std::string(), [this, ticket, name, email, quota](bool ok) {
-            answer_command(ticket, ok ? "ok " + name + "\t" + email + "\t" + quota : std::string("error: no"));
+        // A client mail does not guard itself, one on its machine or behind a forwarder there, is counted at the account
+        // here, under a key of mail's own so a mail app with an old password never holds up its user's web sign-in.
+        const bool counted = args.size() > 3 && args[3] == "unguarded";
+        std::string acct = "mail:" + (who ? std::string(who->username()) : user);
+        socketley::ascii::lower_in_place(acct);
+        if (counted && m_limits.wait(acct, wall::now_sec(), account_free) > 0)
+        {
+            ++m_c.barred;
+            answer_command(ticket, "error: wait");
+            return;
+        }
+        if (counted)
+            m_limits.begin(acct);
+        check_mail_password(who, args.size() > 2 ? args[2] : std::string(),
+                            [this, ticket, name, email, quota, acct, counted](bool ok) {
+            if (counted)
+                m_limits.end(acct);
+            if (ok)
+                answer_command(ticket, "ok " + name + "\t" + email + "\t" + quota);
+            else if (counted)
+                count_failed({acct}, wall::now_sec(), [this, ticket] { answer_command(ticket, "error: no"); });
+            else
+                answer_command(ticket, "error: no");
         });
         return;
     }

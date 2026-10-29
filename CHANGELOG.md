@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The idp counts a mail runtime's wrong passwords at the account.** Its
+  check for mail kept no count, so IMAP, POP3 and SMTP from the mail runtime's
+  own machine, which mail does not guard, guessed an account's password as
+  fast as the hashing threads ran; ten failures from such a client now hold
+  the next up as ten sign-ins do, under a count of mail's own so a phone with
+  an old password never holds up the web sign-in, and mail says the account
+  cannot be checked now.
 - **A renamed idp account signs in again.** `idp-user set user
   username=new` left its sessions and tokens working with the old name in
   them, which a storage and the mail take as the account they open, so the

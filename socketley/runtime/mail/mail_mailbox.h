@@ -40,8 +40,9 @@ public:
     // runtime and kept a minute, `unreachable` where it does not answer; without one, any name an alias gave is a
     // mailbox of that name.
     void find(const std::string& name, std::function<void(account, std::string, std::string)> done);
-    // Whether `password` is `user`'s, asked of the idp runtime, which hashes it.
-    void verify(const std::string& user, const std::string& password,
+    // Whether `password` is `user`'s, asked of the idp runtime, which hashes it, and counts the failures at the account
+    // of a client mail does not guard itself (`unguarded`).
+    void verify(const std::string& user, const std::string& password, bool unguarded,
                 std::function<void(account, std::string, std::string)> done);
 
     // `e` into `user`'s `folder`, `head` put ahead of it and every Authentication-Results this host would have

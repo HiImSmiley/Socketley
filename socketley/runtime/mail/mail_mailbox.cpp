@@ -152,7 +152,7 @@ void mailboxes::find(const std::string& name, std::function<void(account, std::s
     });
 }
 
-void mailboxes::verify(const std::string& user, const std::string& password,
+void mailboxes::verify(const std::string& user, const std::string& password, bool unguarded,
                        std::function<void(account, std::string, std::string)> done)
 {
     if (m_idp.empty() || user.find('\n') != std::string::npos || password.find('\n') != std::string::npos)
@@ -161,13 +161,14 @@ void mailboxes::verify(const std::string& user, const std::string& password,
         return;
     }
     std::string payload(socketley::idp::command_marker);
-    payload += "verify\n" + user + "\n" + password;
+    payload += "verify\n" + user + "\n" + password + (unguarded ? "\nunguarded" : "");
     ask(m_idp, std::move(payload), [this, done, alive = m_alive](request_status st, std::string_view reply) {
         if (!*alive)
             return;
         if (st != request_status::ok || !reply.starts_with("ok "))
         {
-            done(st == request_status::ok ? account::no : account::unreachable, {}, {});
+            // An account the idp holds up for its failures is one that cannot be checked now, not a wrong password.
+            done(st == request_status::ok && reply != "error: wait" ? account::no : account::unreachable, {}, {});
             return;
         }
         known k;

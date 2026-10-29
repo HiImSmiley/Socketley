@@ -1908,7 +1908,7 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
         }
         // A password, which only the idp runtime can check, on its own threads.
         const uint64_t me = id;
-        r.m_mailboxes->verify(user, secret, [&r, me, finish](account a, std::string name, std::string email) {
+        r.m_mailboxes->verify(user, secret, !guarded, [&r, me, finish](account a, std::string name, std::string email) {
             if (conn* c = r.find(me); c && a == account::yes)
             {
                 c->idp_user = true;
