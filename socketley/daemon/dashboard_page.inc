@@ -825,15 +825,37 @@ async function editDlg(r) {
   try { const x = await run('show', r.name); if (x.code) throw new Error(x.out); conf = JSON.parse(x.out); } catch (e) { fail(e); return; }
   const running = r.state === 'running';
   const fields = form(r.type, conf, true, running);
+  // Its name, which import changes with the rest; a running one is stopped for it and started under the new one.
+  const nameIn = el('input', { class: 'inp', spellcheck: 'false', autocomplete: 'off' }); nameIn.value = r.name;
+  const nameBox = el('div', { class: 'form', style: 'margin-bottom:4px' }, el('label', { class: 'fld2' },
+    el('span', {}, el('b', { text: 'Name', style: 'font-weight:600;color:var(--fg)' }),
+      running ? el('span', { class: 'chip', style: 'font-size:10.5px;margin-left:6px;padding:1px 7px', title: 'A running runtime is stopped to be renamed', text: 'restart' }) : null),
+    nameIn, el('div', { class: 'h', text: 'Letters, digits, - _ and ., up to 128, not beginning with a dot.' })));
+  let renamed = '';
   const LIVE = new Set((schema && schema.live) || []);
   const raw = el('textarea', { class: 'inp', spellcheck: 'false' }); raw.value = JSON.stringify(conf, null, 2);
   const rawBox = el('div', { hidden: true }, el('p', { class: 'mut', style: 'font-size:12.5px', text: 'The whole configuration as import takes it. What a running runtime cannot change while it runs is refused: stop it first.' }), raw);
   let rawOn = false;
-  const toggle = btn(null, 'JSON', () => { rawOn = !rawOn; rawBox.hidden = !rawOn; fields.box.hidden = rawOn; toggle.querySelector('span').textContent = rawOn ? 'Form' : 'JSON'; }, '');
-  const done = msg => { toast(msg); L.close(); poll(); if (view.at === 'rt') detail(true); };
+  const toggle = btn(null, 'JSON', () => { rawOn = !rawOn; rawBox.hidden = !rawOn; fields.box.hidden = nameBox.hidden = rawOn; toggle.querySelector('span').textContent = rawOn ? 'Form' : 'JSON'; }, '');
+  // A renamed runtime is shown under its new name, its old one no longer there to show.
+  const done = msg => {
+    toast(renamed ? msg.replace(r.name, r.name + ' → ' + renamed) : msg); L.close();
+    if (renamed && renamed !== r.name) { delete meta[r.name]; go('#/runtime/' + encodeURIComponent(renamed)); }
+    poll(); if (view.at === 'rt' && !renamed) detail(true);
+  };
   const doc = () => {
-    if (rawOn) { try { return JSON.parse(raw.value); } catch (e) { toast('That is no JSON: ' + e.message, 'bad'); return null; } }
-    return fields.changes();
+    let d;
+    if (rawOn) { try { d = JSON.parse(raw.value); } catch (e) { toast('That is no JSON: ' + e.message, 'bad'); return null; } }
+    else {
+      d = fields.changes();
+      const n = nameIn.value.trim();
+      if (n !== r.name) {
+        if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(n)) { toast('A name is letters, digits, - _ and ., up to 128, not beginning with a dot', 'bad'); return null; }
+        d.name = n;
+      }
+    }
+    renamed = typeof d.name === 'string' && d.name !== r.name ? d.name : '';
+    return d;
   };
   // Stopped, saved and started again, for what a running runtime refuses or takes only at a start.
   const cycle = async d => {
@@ -867,7 +889,7 @@ async function editDlg(r) {
     }
     toast(why.split('\n').slice(0, 3).join(' '), 'bad', 7000);
   };
-  const L = modal('Edit ' + r.name, [el('p', { class: 'mut', style: 'font-size:12.5px;margin-top:0', text: running ? 'Only what you change is sent. Limits take effect at once; a field marked restart waits for the next start, which Save & restart does now.' : 'Only what you change is sent; it takes effect at the next start.' }), fields.box, rawBox],
+  const L = modal('Edit ' + r.name, [el('p', { class: 'mut', style: 'font-size:12.5px;margin-top:0', text: running ? 'Only what you change is sent. Limits take effect at once; a field marked restart waits for the next start, which Save & restart does now.' : 'Only what you change is sent; it takes effect at the next start.' }), nameBox, fields.box, rawBox],
     [toggle, el('span', { style: 'flex:1' }), btn(null, 'Cancel', () => L.close()), running ? btn('restart', 'Save & restart', () => save(true), '') : null, btn(null, 'Save', () => save(false), 'pri')], true);
 }
 

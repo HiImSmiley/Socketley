@@ -124,6 +124,8 @@ has "and a name no certificate is issued for is refused" "$("$BIN" import acmeed
 curl -s "$U/" > "$T/page.html"
 has "the page is served with the storage interface's style" "$(cat "$T/page.html")" "#aurora"
 has "and its dialogs" "$(cat "$T/page.html")" "function modal("
+# The edit dialog renames as import does, the name sent with what else changed.
+has "the edit dialog has the runtime's name to change" "$(cat "$T/page.html")" "d.name = n;"
 # The runtimes table says what each one costs the machine, beside its CPU.
 has "the runtimes table has a memory column" "$(cat "$T/page.html")" "'CPU', 'Memory'"
 has "filled from what the runtime costs, not its shards' resident memory added up" "$(cat "$T/page.html")" "human(r.memory_bytes"
