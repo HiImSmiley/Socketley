@@ -213,6 +213,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   held the shard for hours. EVAL's string library now matches with Lua 5.1's
   rules in a matcher that looks at the deadline as it works, and refuses a
   pattern nested more than 200 deep, as Lua 5.2 does.
+- **`mail export` writes only into a directory of its own.** It made the
+  directory and reopened each mbox file by its path, following links, so
+  another local user who could create `/var/tmp/socketley-mail` (the default
+  parent) could swap the directory or a file for a link of theirs and read
+  the mailbox; the directory is now refused when it is a link or its parent
+  is a folder another user may change, and every file is opened below it.
 - **An MQTT client identity the broker assigns is drawn from the kernel.** It
   came from a Mersenne Twister seeded with 32 bits, whose few outputs in one
   `auto-` identity let a client work out the identities given to others next

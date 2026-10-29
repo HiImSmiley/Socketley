@@ -1,5 +1,6 @@
 #include "mail_transfer.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -57,6 +58,102 @@ bool write_all(int fd, std::string_view s)
     return true;
 }
 
+// `rel` below the directory `dfd`, a folder of it made where missing when `make`, no step of it a link; -1 with errno
+// set where it cannot be.
+int open_below(int dfd, std::string_view rel, int flags, bool make)
+{
+    int at = dfd;
+    while (true)
+    {
+        const size_t slash = rel.find('/');
+        const std::string part(rel.substr(0, slash));
+        int fd = -1;
+        if (part.empty() || part == "." || part == "..")
+            errno = EINVAL;
+        else if (slash == std::string_view::npos)
+            fd = ::openat(at, part.c_str(), flags | O_NOFOLLOW | O_CLOEXEC, 0600);
+        else if (!make || ::mkdirat(at, part.c_str(), 0700) == 0 || errno == EEXIST)
+            fd = ::openat(at, part.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        const int e = errno;
+        if (at != dfd)
+            ::close(at);
+        errno = e;
+        if (fd < 0 || slash == std::string_view::npos)
+            return fd;
+        at = fd;
+        rel.remove_prefix(slash + 1);
+    }
+}
+
+// Whether the directory `dfd` holds nothing but itself and its parent.
+bool empty_dir(int dfd)
+{
+    const int fd = ::openat(dfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR* d = fd < 0 ? nullptr : ::fdopendir(fd);
+    if (!d)
+    {
+        if (fd >= 0)
+            ::close(fd);
+        return false;
+    }
+    bool empty = true;
+    while (const dirent* e = ::readdir(d))
+        if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0)
+        {
+            empty = false;
+            break;
+        }
+    ::closedir(d);
+    return empty;
+}
+
+// The directory `dir` names, made 0700 or taken where it is the daemon's and empty, open in `dfd`; why not otherwise.
+std::string make_export_dir(const std::string& dir, int& dfd)
+{
+    const fs::path path(dir);
+    const fs::path parent = path.parent_path();
+    const std::string leaf = path.filename().string();
+    if (leaf.empty() || leaf == "." || leaf == "..")
+        return dir + " is no directory to make";
+    std::error_code ec;
+    fs::create_directories(parent, ec);
+    const int pfd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    struct stat st{};
+    if (pfd < 0 || ::fstat(pfd, &st) < 0)
+    {
+        const int e = errno;
+        if (pfd >= 0)
+            ::close(pfd);
+        return "the daemon cannot open " + parent.string() + ": " + std::strerror(e);
+    }
+    // Another user who may rename what a folder holds could set a directory of theirs where the export goes.
+    if ((st.st_uid != ::geteuid() && st.st_uid != 0) || ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)))
+    {
+        ::close(pfd);
+        return parent.string() + " is a directory another user may change";
+    }
+    const bool made = ::mkdirat(pfd, leaf.c_str(), 0700) == 0;
+    if (!made && errno != EEXIST)
+    {
+        const int e = errno;
+        ::close(pfd);
+        return "the daemon cannot make " + dir + ": " + std::strerror(e);
+    }
+    dfd = ::openat(pfd, leaf.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    const int e = errno;
+    ::close(pfd);
+    if (dfd < 0)
+        return e == ELOOP || e == ENOTDIR ? dir + " is a link or no directory"
+                                          : "the daemon cannot open " + dir + ": " + std::strerror(e);
+    if (::fstat(dfd, &st) < 0 || st.st_uid != ::geteuid())
+        return dir + " is another user's";
+    if (!made && !empty_dir(dfd))
+        return dir + " holds files already";
+    if (::fchmod(dfd, 0700) < 0)
+        return "the daemon cannot make " + dir + " its own alone: " + std::strerror(errno);
+    return {};
+}
+
 // Calls `step` until it says it is waiting, so an answer that comes in line does not deepen the stack.
 struct trampoline
 {
@@ -100,12 +197,23 @@ struct exporter : std::enable_shared_from_this<exporter>
     std::string buffer, buffer_folder;
     uint32_t lane{0};
     trampoline t;
+    // The export's directory, every file of it opened below this and never by its path again.
+    int dfd{-1};
 
     exporter(imap_store& s, hash_pool& p, std::shared_ptr<bool> a, std::string u, std::string d,
              std::shared_ptr<transfer_status> st)
         : store(s), pool(p), alive(std::move(a)), user(std::move(u)), dir(std::move(d)), status(std::move(st))
     {
     }
+
+    ~exporter()
+    {
+        if (dfd >= 0)
+            ::close(dfd);
+    }
+
+    exporter(const exporter&) = delete;
+    exporter& operator=(const exporter&) = delete;
 
     void fail(std::string why)
     {
@@ -151,28 +259,17 @@ struct exporter : std::enable_shared_from_this<exporter>
         std::vector<std::string> names = folders;
         pool.submit(lane,
                     [self, why, names] {
-                        std::error_code ec;
-                        if (fs::exists(self->dir, ec) && !fs::is_empty(self->dir, ec))
-                        {
-                            *why = self->dir + " holds files already";
+                        *why = make_export_dir(self->dir, self->dfd);
+                        if (!why->empty())
                             return;
-                        }
-                        fs::create_directories(self->dir, ec);
-                        if (ec)
-                        {
-                            *why = "the daemon cannot make " + self->dir + ": " + ec.message();
-                            return;
-                        }
-                        fs::permissions(self->dir, fs::perms::owner_all, ec);
                         // Every folder gets its file, an empty one where it holds nothing.
                         for (const auto& n : names)
                         {
-                            const fs::path file = fs::path(self->dir) / (n + ".mbox");
-                            fs::create_directories(file.parent_path(), ec);
-                            const int fd = ::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                            const int fd = open_below(self->dfd, n + ".mbox", O_WRONLY | O_CREAT | O_EXCL, true);
                             if (fd < 0)
                             {
-                                *why = "the daemon cannot write " + file.string() + ": " + std::strerror(errno);
+                                *why = "the daemon cannot write " + (fs::path(self->dir) / (n + ".mbox")).string() + ": " +
+                                       std::strerror(errno);
                                 return;
                             }
                             ::close(fd);
@@ -229,12 +326,13 @@ struct exporter : std::enable_shared_from_this<exporter>
         }
         auto data = std::make_shared<std::string>(std::exchange(buffer, {}));
         auto why = std::make_shared<std::string>();
-        const fs::path file = fs::path(dir) / (buffer_folder + ".mbox");
+        const std::string rel = buffer_folder + ".mbox";
         pool.submit(lane,
-                    [data, why, file] {
-                        const int fd = ::open(file.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+                    [self, data, why, rel] {
+                        const int fd = open_below(self->dfd, rel, O_WRONLY | O_APPEND, false);
                         if (fd < 0 || !write_all(fd, *data))
-                            *why = "the daemon cannot write " + file.string() + ": " + std::strerror(errno);
+                            *why = "the daemon cannot write " + (fs::path(self->dir) / rel).string() + ": " +
+                                   std::strerror(errno);
                         if (fd >= 0)
                             ::close(fd);
                     },

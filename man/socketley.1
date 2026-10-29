@@ -1410,7 +1410,7 @@ and their INBOX on a new machine, where the filter has learned nothing yet.
 writes a user's mailbox out as mbox files, a folder each, as
 .IB dir / folder .mbox
 under a directory the daemon makes for itself alone and refuses where it holds
-files already, under
+files already, is a link, or lies in a folder another user may change, under
 .I /var/tmp/socketley\-mail
 where none is named; the flags go as Status and X\-Status, the keywords as
 X\-Keywords and the internal date in each "From " line.

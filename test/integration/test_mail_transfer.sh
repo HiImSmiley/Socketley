@@ -7,6 +7,7 @@
 #
 #   * an export missing a folder or a message, its flags or keywords, or a "From " line in a body left unescaped
 #   * an export over a directory that holds files already
+#   * an export below a folder another user may change, or through a link, where another user could read it
 #   * an import that loses a message's bytes, its folder, its flags or its keywords
 #   * a Takeout's labels not making the folders, or its read and starred not the flags
 #   * a file that is no mbox taken for one
@@ -102,6 +103,15 @@ case "$(head -4 "$T/out/Work/Projects.mbox")" in "From MAILER-DAEMON Mon Mar  2 
 out=$("$BIN" mail m export alice "$T/out" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"holds files already"*) true ;; *) false ;; esac && ok "an export over files is refused" \
     || bad "an export over files" "rc $rc: $out"
+# A folder every user may change is one where another could swap the export's directory for theirs.
+mkdir -p "$T/shared" && chmod 777 "$T/shared"
+out=$("$BIN" mail m export alice "$T/shared/alice" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && [ ! -e "$T/shared/alice/INBOX.mbox" ] && case "$out" in *"another user may change"*) true ;; *) false ;; esac \
+    && ok "an export below a folder any user may change is refused" || bad "an export below a shared folder" "rc $rc: $out"
+mkdir -p "$T/elsewhere" && ln -s "$T/elsewhere" "$T/link"
+out=$("$BIN" mail m export alice "$T/link" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && [ -z "$(ls -A "$T/elsewhere")" ] && case "$out" in *"is a link"*) true ;; *) false ;; esac \
+    && ok "an export through a link is refused, and nothing is written where it points" || bad "an export through a link" "rc $rc: $out"
 
 out=$("$BIN" mail m import bob "$T/out" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && [ "$out" = "imported 4 messages into bob's mailbox" ] && ok "import reads every file of the directory" \
