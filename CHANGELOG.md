@@ -228,6 +228,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   came from a Mersenne Twister seeded with 32 bits, whose few outputs in one
   `auto-` identity let a client work out the identities given to others next
   and take over a session one of them kept.
+- **A Raft port holds a connection to its hello.** An inbound link that had
+  not said who it is was kept for as long as it stayed open under
+  `--raft-insecure` (or after any handshake with an enrolled certificate),
+  could announce a 16 MiB first frame, and 256 of them, or of TLS handshakes
+  begun over and over, made the node close every member's connection; such a
+  link now goes after 3 s or at a first frame longer than a hello, and a full
+  table closes its oldest one to take the next connection.
 - **A db stream that does not read holds 256 KiB of changes, not the history.**
   A stream of a public collection opened from an early change copied every
   change the database keeps, about 32 MiB, into memory at once, for anybody

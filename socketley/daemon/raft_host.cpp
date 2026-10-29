@@ -85,6 +85,9 @@ bool wildcard(const std::string& addr)
 // Frames this far over a peer's unsent bytes are dropped, because Raft survives loss and a slow peer must not grow memory.
 constexpr size_t outbound_cap = 8u * 1024u * 1024u;
 
+// The longest a hello's frame is, its name and address each at most 255 bytes, with room to spare.
+constexpr uint32_t max_hello_frame = 1024;
+
 bool get_u64(std::string_view in, size_t& off, uint64_t& v)
 {
     if (in.size() - off < 8)
@@ -326,6 +329,15 @@ struct raft_host::link : io_handler
             size_t next = 0;
             if (off < in.size() && in[off] != ipc_frame::marker)
                 return fail("not a frame");
+            // A peer that has not said who it is is nobody, so its first frame is held to a hello's length, not 16 MiB.
+            if (!hello_seen && in.size() - off >= ipc_frame::header_size)
+            {
+                uint32_t len = 0;
+                for (size_t b = 0; b < 4; ++b)
+                    len |= static_cast<uint32_t>(static_cast<unsigned char>(in[off + 1 + b])) << (8 * b);
+                if (len > max_hello_frame)
+                    return fail("a first frame longer than a hello");
+            }
             const ipc_frame::take t = ipc_frame::peek_frame(in, off, payload, next);
             if (t == ipc_frame::take::need_more)
                 break;
@@ -588,7 +600,17 @@ void raft_host::on_accept(int res)
     }
     if (res >= 0 && m_in.size() >= max_inbound)
     {
-        // Peers are a handful of nodes, so this many open at once is somebody else holding the port.
+        // A full table makes room by closing its oldest link that has not said who it is, so strangers cannot hold it.
+        link* oldest = nullptr;
+        for (const auto& l : m_in)
+            if (!l->hello_seen && (!oldest || l->born < oldest->born))
+                oldest = l.get();
+        if (oldest)
+            oldest->fail("closed to make room, before its hello");
+    }
+    if (res >= 0 && m_in.size() >= max_inbound)
+    {
+        // Peers are a handful of nodes, so this many that have said who they are is somebody else holding the port.
         ::close(res);
     }
     else if (res >= 0)
@@ -694,9 +716,11 @@ void raft_host::maintain()
 {
     reap();
     const auto now = clock::now();
+    // A link not up within 3 s is stale, and so is an inbound one that has not said who it is by then.
     auto stale = [&](const std::unique_ptr<link>& l)
     {
-        return l && l->state != link::phase::ready && l->state != link::phase::dead && now - l->born > std::chrono::seconds(3);
+        return l && l->state != link::phase::dead && now - l->born > std::chrono::seconds(3)
+            && (l->state != link::phase::ready || (!l->outbound && !l->hello_seen));
     };
     std::vector<link*> timed_out;
     for (auto& [id, l] : m_out)
@@ -708,7 +732,7 @@ void raft_host::maintain()
     if (stale(m_join_link))
         timed_out.push_back(m_join_link.get());
     for (link* l : timed_out)
-        l->fail("did not come up within 3 s");
+        l->fail("did not come up, or say who it is, within 3 s");
 
     if (m_ticks - m_join_tried >= 10)
     {
