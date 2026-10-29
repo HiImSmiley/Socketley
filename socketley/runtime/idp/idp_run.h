@@ -207,12 +207,16 @@ private:
     // A failed sign-in from `ip`, and at the account keyed `acct` unless it is empty, with `then` called once every
     // shard counts it.
     void missed(const std::string& ip, const std::string& acct, int64_t now, std::function<void()> then);
+    // A failure at each of `keys`, told to every shard, `then` called once all of them count it.
+    void count_failed(std::vector<std::string> keys, int64_t now, std::function<void()> then);
     // The keys an attempt from `ip` at `acct` counts in flight under while it is checked, and their release after.
     std::vector<std::string> hold(const std::string& ip, const std::string& acct);
     void release(const std::vector<std::string>& keys);
     // What failures at the account `who` (or the username `user` where there is none) count under: its own key for
     // a browser it signed in on before, so guesses from elsewhere never hold that one up, and the account's otherwise.
     std::string account_key(const request& rq, std::string_view prefix, const account* who, std::string_view user) const;
+    // Whether the request comes from a browser `who` signed in on before, which the address's bar does not hold up.
+    bool known_device(const request& rq, const account* who) const;
     // The cookie a browser keeps once an account has signed in on it, which account_key() reads.
     std::string known_cookie(const account& who) const;
     // Whether every hashing thread has as much waiting as the bound, so a sign-in is turned away rather than queued.

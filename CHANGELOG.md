@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **One address's failures no longer lock everyone behind it out of the idp.**
+  Five failed sign-ins, or five requests to `/token` naming a client that
+  does not exist, which any web page can send from a visitor's browser,
+  refused every sign-in and token exchange from that address for a quarter
+  of an hour, right passwords and valid clients included. A browser an
+  account signed in on before is now held to the account's own limit alone,
+  a client that is unknown or public is refused without counting, and only a
+  confidential client's wrong secrets count, against that address's secrets.
 - **The idp bars an IPv6 /48 past eighty failed sign-ins.** Each /64 had
   its own five, so a site's /48 gave one attacker 65536 budgets of five
   guesses each a quarter of an hour; the /48 now shares one budget of

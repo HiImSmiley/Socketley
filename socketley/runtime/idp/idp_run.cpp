@@ -818,19 +818,20 @@ std::string idp_run::known_cookie(const account& who) const
     return h + "\r\n";
 }
 
+bool idp_run::known_device(const request& rq, const account* who) const
+{
+    return who && http::for_each_cookie(rq.cookie, known_cookie_name, [&](std::string_view v) {
+               claims c;
+               std::string why;
+               return verify_secret_token(m_secret, "known+jwt", m_issuer, v, wall::now_sec(), c, why) &&
+                      claim(c, "aud") == "known" && claim(c, "sub") == who->id;
+           });
+}
+
 std::string idp_run::account_key(const request& rq, std::string_view prefix, const account* who,
                                  std::string_view user) const
 {
-    bool known = false;
-    if (who)
-        http::for_each_cookie(rq.cookie, known_cookie_name, [&](std::string_view v) {
-            claims c;
-            std::string why;
-            known = verify_secret_token(m_secret, "known+jwt", m_issuer, v, wall::now_sec(), c, why) &&
-                    claim(c, "aud") == "known" && claim(c, "sub") == who->id;
-            return known;
-        });
-    if (known)
+    if (known_device(rq, who))
         return std::string(prefix) + "known:" + who->id;
     std::string name(who ? who->username() : user);
     socketley::ascii::lower_in_place(name);
@@ -844,6 +845,11 @@ void idp_run::missed(const std::string& ip, const std::string& acct, int64_t now
         keys.push_back(std::move(net));
     if (!acct.empty())
         keys.push_back(acct);
+    count_failed(std::move(keys), now, std::move(then));
+}
+
+void idp_run::count_failed(std::vector<std::string> keys, int64_t now, std::function<void()> then)
+{
     for (const auto& k : keys)
         m_limits.failed(k, now);
     arm_tick();
@@ -981,17 +987,17 @@ void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, par
         return;
     }
     const int64_t now = wall::now_sec();
-    if (barred(ip, now))
-    {
-        ++m_c.barred;
-        login_page(c, it->second.p, "Too many failed sign-ins from here; try again in a quarter of an hour.", 429);
-        return;
-    }
     const account* a = m_accounts.by_id(it->second.id);
     if (!a || a->disabled())
     {
         m_pending.erase(it);
         login_page(c, {}, "The user or password is not right.", 401);
+        return;
+    }
+    if (!known_device(rq, a) && barred(ip, now))
+    {
+        ++m_c.barred;
+        login_page(c, it->second.p, "Too many failed sign-ins from here; try again in a quarter of an hour.", 429);
         return;
     }
     const std::string acct = account_key(rq, "code:", a, {});
@@ -1127,13 +1133,15 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
     }
     const std::string ip = client_ip(*c, rq);
     const int64_t now = wall::now_sec();
-    if (barred(ip, now))
+    const account* who = m_accounts.by_name(user);
+    // A browser the account signed in on is held to the account's own key alone, so others behind its address
+    // failing do not lock it out.
+    if (!known_device(rq, who) && barred(ip, now))
     {
         ++m_c.barred;
         login_page(c, p, "Too many failed sign-ins from here; try again in a quarter of an hour.", 429);
         return;
     }
-    const account* who = m_accounts.by_name(user);
     const std::string acct = account_key(rq, {}, who, user);
     if (const int64_t wait = m_limits.wait(acct, now, account_free); wait > 0)
     {
@@ -1458,13 +1466,6 @@ const client* idp_run::requesting_client(const std::shared_ptr<conn>& c, const r
 {
     const std::string ip = client_ip(*c, rq);
     const int64_t now = wall::now_sec();
-    if (barred(ip, now))
-    {
-        ++m_c.barred;
-        json_error(c, 429, "temporarily_unavailable", "too many failed requests from here; try again in a quarter of "
-                                                      "an hour");
-        return nullptr;
-    }
     // The client, by HTTP Basic or by the form, and a public one by its id alone.
     std::string id(param(p, "client_id")), secret(param(p, "client_secret"));
     bool basic = false;
@@ -1482,12 +1483,23 @@ const client* idp_run::requesting_client(const std::shared_ptr<conn>& c, const r
             }
     }
     const client* cl = find_client(id);
+    // Only a confidential client's secret can be guessed at, and its guesses bar that alone, so a page posting
+    // here from a browser cannot lock its address out of signing in.
+    const bool secret_asked = cl && !cl->is_public();
+    const std::string secret_key = "secret:" + address_key(ip);
+    if (secret_asked && m_limits.barred(secret_key, now, miss_limit))
+    {
+        ++m_c.barred;
+        json_error(c, 429, "temporarily_unavailable", "too many wrong client secrets from here; try again in a "
+                                                      "quarter of an hour");
+        return nullptr;
+    }
     const bool authenticated =
         cl && (cl->is_public() ? secret.empty() : crypto::secure_equal(secret, cl->secret));
     if (!authenticated)
     {
-        // A secret guessed at counts against the address as a password guessed at does.
-        missed(ip, {}, now, [] {});
+        if (secret_asked)
+            count_failed({secret_key}, now, [] {});
         json_error(c, 401, "invalid_client", "the client is not known or its secret is not right",
                    basic ? "WWW-Authenticate: Basic realm=\"" + m_issuer + "\"\r\n" : std::string());
         return nullptr;
@@ -2070,7 +2082,7 @@ void idp_run::prove_again(const std::shared_ptr<conn>& c, const request& rq, con
     const int64_t now = wall::now_sec();
     const bool by_code = !who.field("totp").empty();
     const std::string acct = account_key(rq, by_code ? "code:" : "", &who, {});
-    if (barred(ip, now))
+    if (!known_device(rq, &who) && barred(ip, now))
     {
         ++m_c.barred;
         then(429, "Too many failed tries from here; try again in a quarter of an hour.");
@@ -2706,7 +2718,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
     }
     const std::string ip = client_ip(*c, rq);
     const int64_t now = wall::now_sec();
-    if (barred(ip, now))
+    if (!known_device(rq, who) && barred(ip, now))
     {
         ++m_c.barred;
         respond(c, 429, "text/plain", "Too many failed sign-ins from here; try again in a quarter of an hour.\n");

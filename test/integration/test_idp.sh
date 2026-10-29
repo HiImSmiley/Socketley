@@ -8,6 +8,7 @@
 #   * a wrong password, an unknown or disabled account, or a sixth failure in a row signing in
 #   * guesses sent together, spread over an IPv6 /64, over the /64s of one /48 or over many addresses at one account,
 #     or wrong codes, passing the bars on them
+#   * an address's bar holding up a browser an account signed in on, or set by /token requests that guess no secret
 #   * a code redeemed twice, by another client, for another redirect, or without its PKCE verifier
 #   * a token that does not verify against the published key, or names the account by anything but its id
 #   * a refresh for an account disabled, signed out everywhere or made to reset its password since
@@ -564,6 +565,25 @@ elif phase == "limits":
     check("ten failures at one account from ten addresses hold up the next from any other, for half a minute",
           (st, 0 < wait <= 30), (429, True))
     check("but not from a browser the account signed in on", login("jon", "jonpassword123", "203.0.113.51", known[0] if known else None)[0], 302)
+    # Others failing behind one address bar it, but not a browser an account signed in on, its right password and all.
+    for i in range(5):
+        login("nobody%d" % i, "wrongpassword", "203.0.113.60")
+    check("five failures from an address bar the next from it", login("ivy", "ivypassword123", "203.0.113.60")[0], 429)
+    check("but not a browser an account signed in on, from the same address",
+          login("jon", "jonpassword123", "203.0.113.60", known[0] if known else None)[0], 302)
+    # An unknown client guesses nothing, so a page in a browser sending them cannot bar its address's sign-ins.
+    for _ in range(6):
+        req("POST", "/token", dict(grant_type="refresh_token", refresh_token="x", client_id="nobody"),
+            headers={"X-Forwarded-For": "198.51.100.45"})
+    check("unknown clients at /token from an address do not bar its sign-ins", login("ivy", "ivypassword123", "198.51.100.45")[0], 302)
+    # A confidential client's wrong secrets bar that address's secrets, the right one too, and nothing else.
+    def secret_try(secret):
+        return req("POST", "/token", dict(grant_type="refresh_token", refresh_token="x"),
+                   headers={"X-Forwarded-For": "198.51.100.46",
+                            "Authorization": "Basic " + base64.b64encode(("wiki:" + secret).encode()).decode()})[0]
+    check("a wrong client secret is refused", [secret_try("wrongsecret") for _ in range(5)], [401] * 5)
+    check("and five of them bar the client's secret from that address", secret_try("wikisecret"), 429)
+    check("but not its sign-ins", login("ivy", "ivypassword123", "198.51.100.46")[0], 302)
     # Wrong codes: three end the password step, and five at the account hold its code step up.
     kim_key = open(tmpd + "/kim.key").read().strip()
     def pending_of(addr):
