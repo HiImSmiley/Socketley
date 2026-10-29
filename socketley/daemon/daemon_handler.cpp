@@ -462,6 +462,15 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     // And the moment before a runtime leaves the map, so a caller with only
     // the manager cannot free a placeholder out from under its supervisor.
     m_manager.set_worker_release_sink([this] { reconcile_proxy_workers(); });
+    // And the wait for a started runtime's workers, so a script's start answers as late as the CLI's does.
+    m_manager.set_worker_await_sink([this](std::string_view name) {
+        std::string out;
+        if (await_worker_startup(name, out, std::chrono::steady_clock::now() + worker_startup_bound) == 0)
+            return std::string();
+        while (!out.empty() && out.back() == '\n')
+            out.pop_back();
+        return out.empty() ? "runtime " + std::string(name) + " could not start (the reason is in the daemon log)" : out;
+    });
 
     // And who answers for one shard, because only this side knows a name is N
     // processes and can register the qualified entries.

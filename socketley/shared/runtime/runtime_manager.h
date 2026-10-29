@@ -178,6 +178,10 @@ public:
     // placeholder is still known to be alive.
     void set_worker_release_sink(std::function<void()> sink);
     void release_workers() const;
+    // Waits for a started runtime's workers to answer, as the CLI's start does, and gives their refusal or "".
+    void set_worker_await_sink(std::function<std::string(std::string_view)> sink) { m_worker_await_sink = std::move(sink); }
+    std::string await_workers(std::string_view name) const
+    { return m_worker_await_sink ? m_worker_await_sink(name) : std::string(); }
 
     // Where a runtime sends a request meant for another runtime, one per
     // daemon, whose sink table is the third thing publish_endpoints()
@@ -226,6 +230,7 @@ private:
     std::function<bool(std::string_view, std::string_view,
                        std::string_view, std::string&)> m_map_sink;
     std::function<void()> m_worker_release_sink;
+    std::function<std::string(std::string_view)> m_worker_await_sink;
     route_relay::sink*    m_route_sink{nullptr};
     std::function<void(const cluster_ev_wire&)> m_cluster_event_sink;
 

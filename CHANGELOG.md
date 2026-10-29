@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A script's `socketley.start` answers once the runtime serves.** It forked
+  the workers before answering but did not wait for them, so a script that
+  started a server and reached it at once could still find the port closed on a
+  busy machine; it now waits as the CLI's `start` does, and a worker's refusal
+  is the answer the script gets.
 - **Guesses sent at once over an idp's shards share one budget.** With
   `--shards N`, each shard counted only the sign-ins it was checking itself,
   so a burst spread over them was let through N times over before the first
