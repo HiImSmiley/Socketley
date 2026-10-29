@@ -9539,6 +9539,17 @@ void proxy_instance::response_deadline_sweep()
 
         conn->ex.awaiting_response = false;
 
+        // A body the client stopped sending is its own timeout, neither charged to the backend nor retried.
+        if (client_body_stalled(conn))
+        {
+            // A stream is reset rather than answered, since its backend stays attached and could answer behind it.
+            if (client_answerable(conn) && !conn->h2_parent && !conn->h3s)
+                send_error(conn, "408 Request Timeout", "Request Timeout\n", /*drain=*/false);
+            else
+                close_pair(cfd, conn->ex.backend_fd, close_reason::force);
+            continue;
+        }
+
         // Charged to the backend so the breaker opens, and to the member a
         // group-routed connection reached rather than to the index that names
         // the whole group.
@@ -10434,6 +10445,18 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
     response += body;
 
     queue_final_response(conn, std::move(response), drain);
+}
+
+bool proxy_instance::client_body_stalled(const proxy_client_connection* conn) const
+{
+    if (conn->connect_pending || conn->ex.response_started || !conn->partial.empty() ||
+        !(conn->ex.body_unbounded || conn->ex.body_remaining > 0))
+        return false;
+    if (conn->ex.backend_fd < 0 || conn->ex.backend_fd >= MAX_FDS)
+        return false;
+    const auto& be = m_conn_idx[conn->ex.backend_fd];
+    return be.side == conn_backend && be.backend->client_fd == conn->fd && !be.backend->write_pending &&
+           be.backend->write_queue.empty();
 }
 
 // See the declaration for why the status is chosen here, which is the whole of

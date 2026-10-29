@@ -5093,7 +5093,11 @@ then retried on another backend if
 allows it, and answered
 .B 504 Gateway Timeout
 otherwise; either way the backend is charged with an error, so the
-circuit breaker above opens and takes it out of rotation. Default: 2
+circuit breaker above opens and takes it out of rotation. While the request
+body still arrives the wait runs from its latest bytes, and a client that
+stops sending a body the backend has taken all of is answered
+.B 408 Request Timeout
+instead, with no retry and no error charged. Default: 2
 seconds. Set to 0 to wait indefinitely. A bare number is seconds; the
 suffixes
 .BR s ", " m ", " h ", " d " and " w

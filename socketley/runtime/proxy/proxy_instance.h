@@ -1030,6 +1030,9 @@ private:
     // status this proxy writes on its own account and there is now more than
     // one caller.
     bool client_answerable(const proxy_client_connection* conn) const;
+    // Whether a request whose wait ran out still owes body bytes the backend has taken all of, so the stall is
+    // the client's and not the backend's.
+    bool client_body_stalled(const proxy_client_connection* conn) const;
     // A connection whose buffered request has passed MAX_PARTIAL_SIZE, sibling
     // of the header block's 431, returning what client_answerable said.
     bool answer_request_too_large(proxy_client_connection* conn);
