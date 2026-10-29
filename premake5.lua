@@ -2961,7 +2961,7 @@ project "test_idp"
     files { "test/unit/test_idp.cpp", "socketley/runtime/idp/idp_logic.cpp", "socketley/runtime/idp/idp_accounts.cpp",
             "socketley/runtime/idp/idp_shard.cpp", "socketley/runtime/idp/idp_ssh_certs.cpp", "socketley/shared/crypto/jws.cpp",
             "socketley/shared/crypto/key_file.cpp", "socketley/shared/crypto/ssh_cert.cpp", "socketley/shared/crypto/ed25519.cpp",
-            "socketley/shared/persist/paths.cpp", "socketley/shared/persist/read_file.cpp", "socketley/shared/util/base64.cpp" }
+            "socketley/shared/persist/paths.cpp", "socketley/shared/util/base64.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
