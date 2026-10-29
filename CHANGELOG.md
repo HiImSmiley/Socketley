@@ -92,6 +92,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the one on DATA; past 400 such resets in ten seconds the connection now ends
   with GOAWAY ENHANCE_YOUR_CALM, and a session that leaves 4 MiB unread is
   closed.
+- **A storage interface cookie signed out stays signed out.** Its times
+  were read with `strtoll`, so `+`, a leading zero or a blank spelled the
+  same cookie another way: the seal still held, and the sign-out's mark,
+  kept under the hash of the text signed out, was not found. Only the
+  spelling a sign-in writes is taken now.
 - **A Sieve reject bounces only to a sender something vouches for.** A
   stranger could name anyone as MAIL FROM, trip a user's `reject` rule, and
   have this host mail the refusal, with the whole message under RET=FULL, to

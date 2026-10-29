@@ -291,6 +291,17 @@ check "a file read with ?download is saved under its name" \
       "$(curl -s -o /dev/null -D - -b "skl_ui=$ck" "$U/~dav/docs/a/one.txt?download" | grep -i '^content-disposition' | tr -d '\r')" \
       "Content-Disposition: attachment; filename=\"one.txt\"; filename*=UTF-8''one.txt"
 check "signing out clears the cookie" "$(curl -s -X DELETE -D - -o /dev/null "$U/~ui/session" | grep -i '^set-cookie: skl_ui=;' | grep -c 'Max-Age=0')" 1
+# A cookie is taken only as it was written, so no copy with its numbers spelled otherwise outlives its signing out.
+ck2=$(curl -s -u "$A" -X POST -D - -o /dev/null "$U/~ui/session" | grep -i '^set-cookie: skl_ui=' | sed 's/^[^=]*=//; s/;.*//')
+k2=${ck2%%.*}; m2=${ck2##*.}; i2=$(echo "$ck2" | cut -d. -f2); e2=$(echo "$ck2" | cut -d. -f3)
+check "another sign-in's cookie is let in" "$(code -b "skl_ui=$ck2" "$U/~ui/session")" 200
+check "but not with a + or a leading zero on its times" \
+      "$(code -b "skl_ui=$k2.+$i2.$e2.$m2" "$U/~ui/session")$(code -b "skl_ui=$k2.0$i2.$e2.$m2" "$U/~ui/session")$(code -b "skl_ui=$k2.$i2.0$e2.$m2" "$U/~ui/session")" \
+      401401401
+check "signing out with it" "$(code -b "skl_ui=$ck2" -X DELETE "$U/~ui/session")" 204
+check "ends it" "$(code -b "skl_ui=$ck2" "$U/~ui/session")" 401
+check "and every copy spelled otherwise" \
+      "$(code -b "skl_ui=$k2.+$i2.$e2.$m2" "$U/~ui/session")$(code -b "skl_ui=$k2.0$i2.$e2.$m2" "$U/~ui/session")" 401401
 
 # A folder as one ZIP.
 zipinfo() { python3 -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); print(z.testzip(), sorted((i.filename, i.file_size) for i in z.infolist()))' "$1"; }

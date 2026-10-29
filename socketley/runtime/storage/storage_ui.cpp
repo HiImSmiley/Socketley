@@ -294,6 +294,9 @@ bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
         if (!number(val.substr(a + 1, b - a - 1), iat) || !number(val.substr(b + 1, d - b - 1), exp) ||
             exp < wall::now_ms())
             return refused;
+        // Only the one spelling a sign-in writes is taken, so no copy spelled otherwise misses its sign-out's mark.
+        if (val.substr(0, d) != base64url::encode(key) + "." + std::to_string(iat) + "." + std::to_string(exp))
+            return refused;
         auth_verdict got = m_auth->authorize_ui_session(key, iat, exp, val.substr(d + 1));
         struct stat revoked{};
         if (got.allowed && !got.anonymous &&
