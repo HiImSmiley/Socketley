@@ -1723,6 +1723,7 @@ std::string mqtt_run::stats() const
     st::put(out, "dropped_queue", s.dropped_queue);
     st::put(out, "dropped_expired", s.dropped_expired);
     st::put(out, "dropped_too_large", s.dropped_too_large);
+    st::put(out, "dropped_denied", s.dropped_denied);
     st::put(out, "denied_publish", s.denied_publish);
     st::put(out, "denied_subscribe", s.denied_subscribe);
     st::put(out, "connects", s.connects);

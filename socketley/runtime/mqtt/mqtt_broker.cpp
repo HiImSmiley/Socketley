@@ -979,6 +979,7 @@ void broker::pump(session& s)
     connection* c = s.conn ? conn_of(s.conn) : nullptr;
     if (!c || c->ph != connection::phase::open)
         return;
+    const bool checked = m_hooks.reads_checked();
     while (!s.queue.empty() && s.out.size() < s.receive_max && m_io.backlog(c->id) <= m_cfg.write_limit)
     {
         queued q = std::move(s.queue.front());
@@ -987,6 +988,12 @@ void broker::pump(session& s)
         if (expired(*q.msg))
         {
             ++m_stats.dropped_expired;
+            continue;
+        }
+        // Asked again as it leaves, since the rules may have changed while it waited.
+        if (checked && !m_hooks.may_read(s.username, s.client_id, q.msg->topic))
+        {
+            ++m_stats.dropped_denied;
             continue;
         }
         if (s.out.full())
@@ -1054,6 +1061,23 @@ bool broker::write_publish_to(session& s, connection& c, uint16_t id, const queu
 
 void broker::resend(session& s, connection& c)
 {
+    // One the session's user may no longer read, as the rules now stand, leaves the window instead of going again.
+    if (m_hooks.reads_checked())
+    {
+        std::vector<uint16_t> denied;
+        s.out.each([&](uint16_t id, const inflight& f) {
+            if (f.st != inflight::state::await_pubcomp && f.item.msg &&
+                !m_hooks.may_read(s.username, s.client_id, f.item.msg->topic))
+                denied.push_back(id);
+        });
+        for (const uint16_t id : denied)
+            s.out.erase(id);
+        if (!denied.empty())
+        {
+            m_stats.dropped_denied += denied.size();
+            mark();
+        }
+    }
     // Oldest first, which is the order they were sent in.
     s.out.each([&](uint16_t id, const inflight& f) {
         if (f.st == inflight::state::await_pubcomp)

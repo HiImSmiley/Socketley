@@ -380,6 +380,7 @@ struct broker_stats
     uint64_t dropped_queue{0};
     uint64_t dropped_expired{0};
     uint64_t dropped_too_large{0};
+    uint64_t dropped_denied{0};
     uint64_t denied_publish{0};
     uint64_t denied_subscribe{0};
     uint64_t wills_sent{0};

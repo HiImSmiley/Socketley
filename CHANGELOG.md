@@ -163,6 +163,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate in it was an anchor and no name was checked, so any leaf the
   same public intermediate signed took the credentials; now the peer must
   show the file's first certificate.
+- **An MQTT message waiting in a session is checked against the rules as it
+  leaves.** A QoS 1 or 2 message was judged by `--acl` when it was routed and
+  sent from the session's queue or resent from its window whenever the client
+  came back, so a rule taken away while a client was offline still let it have
+  what had been queued for it. The read is now asked again as each queued
+  message leaves and as unanswered ones are resent; one refused is counted as
+  `dropped_denied`.
 - **An MQTT session is its user's.** A CONNECT with another client's id took
   that client's session over whatever account it came with: the device was
   disconnected, its queue and subscriptions were handed to the newcomer, and a

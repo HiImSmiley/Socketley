@@ -217,6 +217,16 @@ if phase == "main":
         back.disconnect()
     guarded("owned", owned)
 
+    # Queued while alice may read it; the rules that take public/# from her are put in before she comes back.
+    def queued():
+        q = connected(pa, "alice-q", version=4, clean=False, username="alice", password="alicepass1")
+        check("alice's session subscribes to what she may read", q.subscribe(("public/#", 1)), [1])
+        q.disconnect()
+        bo = connected(pa, "bob-q", username="bob", password="bobpass22")
+        check("and bob publishes to it while she is away", bo.publish("public/held", "queued", qos=1), 0)
+        bo.disconnect()
+    guarded("queued", queued)
+
     def websocket():
         w = Client(pw, ws="/mqtt")
         check("a WebSocket client offering mqtt is let in", w.connect("ws-1", username="alice", password="alicepass1")[1], 0)
@@ -276,6 +286,11 @@ if phase == "reread":
         check("rules changed in the file are taken while running", al.subscribe(("public/#", 1), ("granted/now", 1)),
               [0x87, 1])
         al.disconnect()
+        q = Client(pa, version=4)
+        check("alice comes back to her session", q.connect("alice-q", clean=False, username="alice",
+                                                          password="alicenew9")[:2], (True, 0))
+        truth("and is not sent what was queued for her that the rules no longer let her read", q.quiet(1.0))
+        q.disconnect()
     guarded("reread", reread)
 
 
