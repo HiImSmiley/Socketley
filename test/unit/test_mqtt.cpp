@@ -13,6 +13,9 @@
 #include <string>
 #include <vector>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 using namespace socketley::mqtt;
 
 namespace
@@ -810,6 +813,40 @@ TEST_CASE("CONNECT is refused for what it cannot be, in each version's own codes
     const uint64_t e = r.open();
     r.send(e, sub("x", 0));
     CHECK(r.io.closed.contains(e));
+}
+
+TEST_CASE("an identity the broker gives is not one a copy of the process gives next")
+{
+    // A generator whose state the parent holds hands the forked child the parent's next identity.
+    rig r;
+    const auto assigned = [&r] {
+        const uint64_t c = r.connect("", level_5, true);
+        const auto a = connack_of(r.packets(c)[0], level_5);
+        return a.props.assigned_client_id.value_or("");
+    };
+    REQUIRE(assigned().starts_with("auto-"));
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0)
+    {
+        const std::string id = assigned();
+        if (::write(fds[1], id.data(), id.size()) < 0) {}
+        ::_exit(0);
+    }
+    ::close(fds[1]);
+    const std::string mine = assigned();
+    std::string theirs;
+    char buf[64];
+    for (ssize_t n; (n = ::read(fds[0], buf, sizeof buf)) > 0;)
+        theirs.append(buf, static_cast<size_t>(n));
+    ::close(fds[0]);
+    int status = 0;
+    if (::waitpid(child, &status, 0) < 0) {}
+    CHECK(theirs.size() == mine.size());
+    CHECK(mine.size() == 21);
+    CHECK(theirs != mine);
 }
 
 TEST_CASE("an answer that comes later holds the connection's packets until it does")

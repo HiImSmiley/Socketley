@@ -2,7 +2,8 @@
 #include "../../shared/net/address_key.h"
 
 #include <algorithm>
-#include <random>
+
+#include "../../shared/util/random_id.h"
 
 namespace socketley::mqtt
 {
@@ -17,14 +18,12 @@ uint8_t level_code(uint8_t level, uint8_t v5_code, uint8_t v3_code)
     return level == level_5 ? v5_code : v3_code;
 }
 
+// An identity is the only key to a session kept for it, so it is drawn from the kernel and not from a generator its
+// output tells the state of; empty when the kernel gave nothing.
 std::string random_client_id()
 {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string id = "auto-";
-    for (int i = 0; i < 16; ++i)
-        id += digits[rng() & 15];
-    return id;
+    const std::string bits = socketley::random_hex(8);
+    return bits.empty() ? std::string{} : "auto-" + bits;
 }
 
 message message_of(const will_message& w, std::string_view client, int64_t now)
@@ -405,6 +404,8 @@ bool broker::on_connect(connection& c, const frame& f)
         if (p.level == level_31 || (p.level == level_311 && !p.clean_start))
             return refuse(p.level, reason::client_id_invalid);
         p.client_id = random_client_id();
+        if (p.client_id.empty())
+            return refuse(p.level, reason::server_unavailable);
         p.props.assigned_client_id = p.client_id;
     }
     c.pending = std::make_unique<connect_packet>(std::move(p));

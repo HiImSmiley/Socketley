@@ -213,6 +213,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   held the shard for hours. EVAL's string library now matches with Lua 5.1's
   rules in a matcher that looks at the deadline as it works, and refuses a
   pattern nested more than 200 deep, as Lua 5.2 does.
+- **An MQTT client identity the broker assigns is drawn from the kernel.** It
+  came from a Mersenne Twister seeded with 32 bits, whose few outputs in one
+  `auto-` identity let a client work out the identities given to others next
+  and take over a session one of them kept.
 - **A presigned request is its signer's however it spells the signing
   parameters.** A URL whose `X-Amz-Algorithm` (or V2 `AWSAccessKeyId`) name was
   percent-encoded was verified with the signer's key but then judged as
