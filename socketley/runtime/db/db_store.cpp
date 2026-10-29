@@ -1570,6 +1570,8 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     std::string json;
     bool in_order = false;
     bool unreadable = false;
+    bool too_costly = false;
+    size_t scanned = 0;
     // A candidate judged; false once the answer has what it needs.
     const auto consider = [&](const std::string* id, const doc* node) {
         const doc& d = *node;
@@ -1583,6 +1585,13 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
             json.clear();
             if (!cached(d, in) && json_of(d, json))
                 in = json;
+            // Bodies read for what no index answers cost the loop their bytes, so only a key's query reads past a bound.
+            scanned += in.size();
+            if (who.kind != principal::key && scanned > max_scan_bytes)
+            {
+                too_costly = true;
+                return false;
+            }
             if (in.empty() || !json_reader(in).document(body))
             {
                 unreadable = true;
@@ -1701,9 +1710,25 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
         std::sort(ids.begin(), ids.end(), [](const auto& x, const auto& y) { return *x.first < *y.first; });
         ids.erase(std::unique(ids.begin(), ids.end(), [](const auto& x, const auto& y) { return *x.first == *y.first; }),
                   ids.end());
-        for (const auto& [id, node] : ids)
-            if (!consider(id, node))
-                break;
+        // Without a sort the ids' order is the answer's, so the walk stops once it has the page.
+        in_order = q.sort.empty();
+        if (in_order && q.desc)
+        {
+            for (auto it = ids.rbegin(); it != ids.rend(); ++it)
+                if (!consider(it->first, it->second))
+                    break;
+        }
+        else
+            for (const auto& [id, node] : ids)
+                if (!consider(id, node))
+                    break;
+    }
+    if (too_costly)
+    {
+        err = fail(400, "needs_index", "a query reads at most " + std::to_string(max_scan_bytes >> 20) +
+                                           " MiB of documents for what no index answers, unless a key asks: index "
+                                           "the fields its where and sort name in the schema");
+        return false;
     }
     if (unreadable)
     {

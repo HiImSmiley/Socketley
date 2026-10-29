@@ -578,6 +578,29 @@ TEST_CASE("queries: conditions, sorting and pages, with and without an index")
     CHECK(find(st, user("u1"), "p", "{}") == "403");
 }
 
+TEST_CASE("a query not asked by a key reads a bounded amount of documents for what no index answers")
+{
+    tmpdir t;
+    store st;
+    std::string why;
+    REQUIRE(st.open(t.path, schema{}, why));
+    REQUIRE(st.set_schema(make_schema("pub public score\n"), why));
+    const std::string big(900000, 'x');
+    for (int i = 0; i < 12; ++i)
+        REQUIRE(put(st, key, "pub", ("d" + std::to_string(i)).c_str(),
+                    R"({"tag":"x","score":)" + std::to_string(i) + R"(,"big":")" + big + "\"}") == 0);
+    CHECK(find(st, nobody, "pub", R"({"where":{"tag":"none"}})") == "400");
+    CHECK(find(st, nobody, "pub", R"({"where":{"tag":"x"},"count":true})") == "400");
+    CHECK(find(st, user("u1"), "pub", R"({"sort":"tag","limit":1})") == "400");
+    CHECK(find(st, key, "pub", R"({"where":{"tag":"x"},"count":true})") == R"({"count":12})");
+    // What an index answers reads no document to judge it.
+    CHECK(ids_of(find(st, nobody, "pub", R"({"sort":"-score","limit":2})")) == "d11 d10 next=2");
+    CHECK(find(st, nobody, "pub", R"({"where":{"score":{"gte":0}},"count":true})") == R"({"count":12})");
+    // Without a sort the ids' order is the answer's, so a page stops reading once it has its documents.
+    CHECK(ids_of(find(st, nobody, "pub", R"({"where":{"tag":"x"},"limit":1})")) == "d0 next=1");
+    CHECK(ids_of(find(st, nobody, "pub", R"({"limit":2})")) == "d0 d1 next=2");
+}
+
 TEST_CASE("queries: an index answers what a scan answers, over random documents and conditions")
 {
     tmpdir t1, t2;

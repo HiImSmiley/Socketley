@@ -141,6 +141,8 @@ public:
     static constexpr size_t   max_write      = 32u << 20;
     static constexpr size_t   max_ops        = 256;
     static constexpr size_t   max_limit      = 1000;
+    // The document bytes a query not asked by a key reads for conditions and a sort no index answers.
+    static constexpr size_t   max_scan_bytes = 8u << 20;
     static constexpr size_t   max_collections = 1024;
 
     store() = default;

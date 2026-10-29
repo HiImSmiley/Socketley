@@ -12691,7 +12691,11 @@ for the number alone; it answers
 and
 .B next
 when there are more. A range compares a field's values of one kind only, as an
-index orders them: null, false, true, numbers, strings.
+index orders them: null, false, true, numbers, strings. A condition or a sort
+on a field the schema does not index is judged by reading the documents, at
+most 8 MiB of them unless a key asks, past which the query is refused with 400
+.BR needs_index :
+index the field.
 .B POST /tx
 takes
 .B {"ops":[{"op":"put","c":..,"id":..,"doc":{..}},{"op":"patch",..,"changes":{..},"if":3},{"op":"insert",..},{"op":"delete",..}]}

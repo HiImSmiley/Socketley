@@ -228,6 +228,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   came from a Mersenne Twister seeded with 32 bits, whose few outputs in one
   `auto-` identity let a client work out the identities given to others next
   and take over a session one of them kept.
+- **A db query reads at most 8 MiB of documents for what no index answers,
+  unless a key asks.** A condition or a sort on a field the schema does not
+  index read every document of the collection on the loop, and anybody may
+  query a public or catalog one; past the bound it is now refused with 400
+  `needs_index`. A query without a sort now also stops once it has its page.
 - **A db collection's ids are hashed under a key of the process.** The map of
   a collection's documents probed from std::hash's low bits, whose seed is
   fixed, so ids chosen offline crowded one run of the table and made every
