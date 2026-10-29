@@ -11,7 +11,7 @@ namespace
 {
 
 // The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc, Idp, dB, Mqtt,
-// mail (E).
+// mail (E), tunnel (U).
 struct row
 {
     std::string_view flag, types, kind, label, help, section, choices = {}, placeholder = {}, aliases = {};
@@ -20,17 +20,17 @@ struct row
 
 constexpr row rows[] = {
     // ── basics ──────────────────────────────────────────────────────────────
-    {"-p", "SCPKTDIBME", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
-    {"-s", "SCPKTDIBME", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
+    {"-p", "SCPKTDIBMEU", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
+    {"-s", "SCPKTDIBMEU", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
     {"-g", "SCPKTDME", "text", "Group", "A group its proxies reach all members of with --backend @group.", "Basics", {}, "web", "--group"},
     {"--lua", "SCPKTME", "path", "Lua script", "A script with the runtime's callbacks, run at start.", "Basics", {}, "/etc/socketley/app.lua"},
-    {"--test", "SCPKTDIBME", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
+    {"--test", "SCPKTDIBMEU", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
 
     // ── network ─────────────────────────────────────────────────────────────
-    {"--bind", "SPKTDIBME", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
+    {"--bind", "SPKTDIBMEU", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
     {"--listen", "SPKT", "text", "Unix socket", "Listen on a unix socket instead of a port.", "Network", {}, "unix:/run/socketley/app.sock"},
     {"--shards", "SPKTDIBME", "int", "Shards", "Worker processes sharing the port: the way one runtime uses more than one core.", "Network", {}, "4"},
-    {"--domain", "SPKTIBE", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
+    {"--domain", "SPKTIBEU", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
     {"--cpus", "SCPKTDIBME", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
 
     // ── TLS ─────────────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ constexpr row rows[] = {
     {"--reconnect", "C", "int", "Reconnect", "Connect again, backing off, when the connection is lost: the most attempts, 0 for no end.", "Limits", {}, "0"},
 
     // ── output ──────────────────────────────────────────────────────────────
-    {"--log", "SCPKTDME", "path", "State log", "A file it appends each state change to.", "Output", {}, "/var/log/socketley/app.log"},
+    {"--log", "SCPKTDMEU", "path", "State log", "A file it appends each state change to.", "Output", {}, "/var/log/socketley/app.log"},
     {"-w", "SC", "path", "Message file", "A file every received message is written to.", "Output", {}, "/var/log/socketley/msgs"},
     {"-b", "SC", "switch", "Print messages", "Print every received message.", "Output"},
     {"-bp", "SC", "switch", "…with name", "Print them with the runtime's name before each.", "Output"},
@@ -482,7 +482,7 @@ bool offered(std::string_view flag, runtime_type type)
 const std::string& json()
 {
     static const std::string out = [] {
-        std::string o = "{\"types\":[\"server\",\"client\",\"proxy\",\"cache\",\"storage\",\"dns\",\"sync\",\"idp\",\"db\",\"mqtt\",\"mail\"],\"flags\":[";
+        std::string o = "{\"types\":[\"server\",\"client\",\"proxy\",\"cache\",\"storage\",\"dns\",\"sync\",\"idp\",\"db\",\"mqtt\",\"mail\",\"tunnel\"],\"flags\":[";
         bool first = true;
         for (const row& r : rows)
         {
@@ -495,7 +495,8 @@ const std::string& json()
             for (char t : r.types)
             {
                 const char* name = t == 'S' ? "server" : t == 'C' ? "client" : t == 'P' ? "proxy" : t == 'K' ? "cache"
-                                 : t == 'T' ? "storage" : t == 'Y' ? "sync" : t == 'I' ? "idp" : t == 'B' ? "db" : t == 'M' ? "mqtt" : t == 'E' ? "mail" : "dns";
+                                 : t == 'T' ? "storage" : t == 'Y' ? "sync" : t == 'I' ? "idp" : t == 'B' ? "db" : t == 'M' ? "mqtt" : t == 'E' ? "mail"
+                                 : t == 'U' ? "tunnel" : "dns";
                 o += f2 ? "" : ",";
                 f2 = false;
                 socketley::json::quote_into(o, name);

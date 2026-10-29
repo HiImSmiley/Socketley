@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A runtime in the dashboard's sidebar has its actions on a right click.**
+  Start or stop, restart, reload Lua, edit and remove, and a link to where it
+  is served, as its page offers them, beside each name with its type's icon.
+- **A tunnel can be made and edited in the dashboard.** The schema the page
+  builds its forms from named a tunnel's settings as a DNS runtime's and
+  offered it no port, start, bind, names or state log, so an edit showed no
+  field; an edge's form now shows an edge's settings and an agent's an
+  agent's.
+- **An edit's ACME names and address are taken.** `import`, which the
+  dashboard saves an edit through, passed over `acme_domains` and
+  `acme_email` and answered as if it had saved them; they are now checked and
+  applied as `--acme` and `--acme-email` are, the certificate's files with
+  them.
+- **A tunnel agent refuses an edge's settings.** `-p`, `--domain`,
+  `--forward`, `--idp` and `--idp-audience` on an agent were kept and never
+  read, while an edge already refused an agent's; they are now refused by
+  name.
 - **The MQTT WebSocket ping flood test sends a stream the broker can read.** On
   a short send it began its 1000-frame chunk again instead of going on, cutting
   a frame in two, so the broker rightly refused it and the test failed on the

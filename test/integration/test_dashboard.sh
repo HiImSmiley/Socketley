@@ -78,7 +78,8 @@ parsers = {"parse_common_flags": None, "parse_shared_flags": None, "parse_server
            "parse_client_shared_flags": "client", "parse_proxy_shared_flags": "proxy", "parse_server_flags": "server", "parse_client_flags": "client",
            "parse_proxy_gate_flag": "proxy", "parse_proxy_flags": "proxy", "parse_cache_flags": "cache",
            "parse_dns_flags": "dns", "parse_storage_flags": "storage", "parse_sync_flags": "sync",
-           "parse_idp_flags": "idp", "parse_db_flags": "db", "parse_mqtt_flags": "mqtt", "parse_mail_flags": "mail"}
+           "parse_idp_flags": "idp", "parse_db_flags": "db", "parse_mqtt_flags": "mqtt", "parse_mail_flags": "mail",
+           "parse_tunnel_flags": "tunnel"}
 out = []
 for fn, ty in parsers.items():
     m = re.search(r"\n(?:static )?int " + fn + r"\(.*?\n\}\n", src, re.S)
@@ -104,11 +105,20 @@ flags = json.load(open(sys.argv[2]))["flags"]
 key = {(f["flag"], t): f.get("key") for f in flags for t in f["types"]}
 out = sorted({f["key"] for f in flags if f.get("key") and f["key"] not in written})
 print(" ".join(out) or "none", key[("--cache", "server")], key[("--cache", "db")], key[("--replicate", "cache")],
-      key[("--replicate", "db")], key[("--mode", "cache")], key[("--mode", "server")], key[("--every", "sync")])
+      key[("--replicate", "db")], key[("--mode", "cache")], key[("--mode", "server")], key[("--every", "sync")],
+      key[("--to", "tunnel")], key[("-p", "tunnel")])
 PY
 )
 expect "every key the schema names is one a runtime's state holds, and each type's own" \
-    "$keys" "none cache_name cache replicate_target replicate cache_mode mode every"
+    "$keys" "none cache_name cache replicate_target replicate cache_mode mode every to port"
+# An edit sends what changed through import, which takes ACME's names and address as the flags do, or refuses them.
+"$BIN" create server acmeedit -p $((P+9)) >/dev/null 2>&1
+got=$("$BIN" import acmeedit '{"acme_domains":"edit.example.test","acme_email":"ops@example.test"}' 2>&1; echo "rc=$?")
+expect "an edit's ACME names and address are taken" \
+    "$got $("$BIN" show acmeedit | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("acme_domains"), d.get("acme_email"), d.get("tls"))')" \
+    "rc=0 edit.example.test ops@example.test True"
+has "and a name no certificate is issued for is refused" "$("$BIN" import acmeedit '{"acme_domains":"192.0.2.7"}' 2>&1; echo "rc=$?")" "rc=1"
+"$BIN" remove acmeedit >/dev/null 2>&1
 
 # ─── the page ───────────────────────────────────────────────────────────────
 curl -s "$U/" > "$T/page.html"

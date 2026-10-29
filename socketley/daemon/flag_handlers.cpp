@@ -100,40 +100,24 @@ static int parse_port_flag(runtime_instance* instance, std::string_view value)
 
 // Every duration flag parses through here, so the next one cannot grow a
 // second grammar and no site can forget the range check.
-// --acme and --acme-email, one decision for create and edit: the names are checked as a CA would take them for
-// HTTP-01, and the certificate's files become the ones --acme keeps.
-static int parse_acme_flag(runtime_instance* instance, const parsed_args& pa, size_t& i)
+// --acme and --acme-email, one decision for create, edit and import: the names are checked as a CA would take them
+// for HTTP-01, and the certificate's files become the ones --acme keeps; "" when applied, else the refusal.
+std::string apply_acme(runtime_instance* instance, std::string_view v, bool email)
 {
-    const bool email = pa.hashes[i] == fnv1a("--acme-email");
     const char* flag = email ? "--acme-email" : "--acme";
     if (!tls_role_has_handshake(instance->get_type()) || instance->get_type() == runtime_client)
-    {
-        std::cout << flag << ": a certificate is issued for a runtime that listens: server, proxy, cache or storage\n";
-        return 1;
-    }
-    if (i + 1 >= pa.count)
-    {
-        std::cout << flag << (email ? " requires an address\n" : " requires a name, or several separated by commas\n");
-        return 1;
-    }
-    const std::string_view v = pa.args[++i];
+        return std::string(flag) + ": a certificate is issued for a runtime that listens: server, proxy, cache or storage";
     if (email)
     {
         if (v.find('@') == std::string_view::npos || v.find_first_of(" ,\t") != std::string_view::npos)
-        {
-            std::cout << "--acme-email: '" << v << "' is not an address\n";
-            return 1;
-        }
+            return "--acme-email: '" + std::string(v) + "' is not an address";
         instance->set_acme_email(v);
-        return 0;
+        return {};
     }
     instance->set_acme_domains(v);
     const auto& names = instance->get_acme_domains();
     if (names.empty())
-    {
-        std::cout << "--acme requires a name, or several separated by commas\n";
-        return 1;
-    }
+        return "--acme requires a name, or several separated by commas";
     for (const std::string& name : names)
     {
         // A wildcard of one label, which is proven over DNS-01 by a dns runtime serving its zone.
@@ -148,15 +132,28 @@ static int parse_acme_flag(runtime_instance* instance, const parsed_args& pa, si
                                    ch == '-' || ch == '.';
                         });
         if (!ok)
-        {
-            std::cout << "--acme: '" << name << "' is not a name a certificate is issued for "
-                         "(no addresses, at least one dot, a wildcard only as its first label)\n";
-            return 1;
-        }
+            return "--acme: '" + name + "' is not a name a certificate is issued for "
+                   "(no addresses, at least one dot, a wildcard only as its first label)";
     }
     instance->set_tls(true);
     instance->set_cert_path(cert_keeper::acme_cert_path(names.front()));
     instance->set_key_path(cert_keeper::acme_key_path(names.front()));
+    return {};
+}
+
+static int parse_acme_flag(runtime_instance* instance, const parsed_args& pa, size_t& i)
+{
+    const bool email = pa.hashes[i] == fnv1a("--acme-email");
+    if (i + 1 >= pa.count)
+    {
+        std::cout << (email ? "--acme-email requires an address\n" : "--acme requires a name, or several separated by commas\n");
+        return 1;
+    }
+    if (const std::string why = apply_acme(instance, pa.args[++i], email); !why.empty())
+    {
+        std::cout << why << "\n";
+        return 1;
+    }
     return 0;
 }
 

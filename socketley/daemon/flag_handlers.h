@@ -90,6 +90,8 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
 // "listen" field must judge it the same way, returning an empty string on
 // success with the bare path in `out` and the reason otherwise.
 std::string validate_listen_value(std::string_view value, std::string& out);
+// --acme or --acme-email's value checked and applied, for a flag and an imported document alike: "" or the refusal.
+std::string apply_acme(runtime_instance* instance, std::string_view value, bool email);
 
 // Mode parsing helpers
 bool parse_server_mode(uint32_t hash, server_mode& mode);

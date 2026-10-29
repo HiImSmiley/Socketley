@@ -5763,6 +5763,26 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
     if (has("tls"))               instance->set_tls(cfg.tls);
     if (has("cert_path"))         instance->set_cert_path(cfg.cert_path);
     if (has("key_path"))          instance->set_key_path(cfg.key_path);
+    // As the flags take them, which also points TLS at the files the names' certificate is kept in; empty clears them.
+    for (const auto& [key, value, email] : {std::tuple{"acme_domains", &cfg.acme_domains, false},
+                                            std::tuple{"acme_email", &cfg.acme_email, true}})
+    {
+        if (!has(key))
+            continue;
+        if (value->empty())
+        {
+            if (email)
+                instance->set_acme_email("");
+            else
+                instance->set_acme_domains("");
+            continue;
+        }
+        if (std::string why = apply_acme(instance, *value, email); !why.empty())
+        {
+            conn->write_buf = why + "\n";
+            return 1;
+        }
+    }
     if (has("ca_path"))           instance->set_ca_path(cfg.ca_path);
     if (has("target"))            instance->set_target(cfg.target);
     if (has("cache_name"))        instance->set_cache_name(cfg.cache_name);

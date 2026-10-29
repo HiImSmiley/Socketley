@@ -173,9 +173,12 @@ const TYPES = {
   idp: ['idp', 'Sign-in', 'One sign-in, with a storage\'s users, for apps and for routes behind a proxy.'],
   db: ['db', 'Database', 'JSON documents for apps, each owned by an account of the sign-in.'],
   mqtt: ['mqtt', 'MQTT', 'A broker for devices, apps and browsers, whose sessions wait for clients that went away.'],
-  mail: ['mail', 'Mail', 'A mail server for its domains and users: SMTP, a spool, DKIM, mailboxes in a storage, IMAP.']
+  mail: ['mail', 'Mail', 'A mail server for its domains and users: SMTP, a spool, DKIM, mailboxes in a storage, IMAP.'],
+  tunnel: ['tunnel', 'Tunnel', 'Reaches a machine with no public address: an edge here, or an agent that dials one.']
 };
 const ARRAYS = new Set(['backends', 'upstreams']);
+const TUNNEL_AGENT = new Set(['--to', '--join', '--offer']);
+const TUNNEL_EDGE = new Set(['-p', '--bind', '--domain', '--forward', '--idp', '--idp-audience']);
 const HEALTH = ['', 'tcp', 'http'];
 // Durations as the flags take them and seconds as the configuration keeps them; sizes alike in bytes.
 const toSec = v => { const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)?$/i.exec(String(v).trim()); if (!m) return null; const n = +m[1], u = (m[2] || 's').toLowerCase(); return Math.round(n * { ms: .001, s: 1, m: 60, h: 3600, d: 86400, w: 604800 }[u]); };
@@ -284,7 +287,7 @@ function side() {
   paintThemes();
   const L = $('#rlist'); L.textContent = '';
   for (const r of rts.slice().sort((a, b) => a.name.localeCompare(b.name)))
-    L.append(el('button', { class: 'nav' + (view.at === 'rt' && view.name === r.name ? ' on' : ''), onclick: () => go('#/runtime/' + encodeURIComponent(r.name)) },
+    L.append(el('button', { class: 'nav' + (view.at === 'rt' && view.name === r.name ? ' on' : ''), onclick: () => go('#/runtime/' + encodeURIComponent(r.name)), oncontextmenu: e => rtMenu(r, e) },
       ico(r.type), el('span', { text: r.name, title: r.name + ' · ' + r.type }), el('span', { class: 'dot ' + r.state, title: r.state })));
   if (!rts.length) L.append(el('div', { class: 'dim', style: 'padding:6px 12px;font-size:13px', text: 'No runtimes yet' }));
 }
@@ -462,23 +465,38 @@ function runtimes() {
   C.append(table(rts.filter(r => (!filterType || r.type === filterType) && (!q || r.name.toLowerCase().includes(q) || r.type.includes(q)))));
 }
 $('#q').addEventListener('input', () => runtimes());
-function controls(r, small) {
-  const n = r.name, cls = small ? 'sm' : '';
+// What may be done to `r`, for its buttons and its menu alike; `full` ones are not offered in a table's row.
+function actions(r) {
+  const n = r.name;
+  if (!me || !me.user) return [];
   const on = r.state === 'running';
-  const b = [];
-  if (!me || !me.user) return b;
-  if (on) b.push(btn('stop', 'Stop', async e => { e && e.stopPropagation(); if (await act(['stop', n], n + ' stopped')) poll(); }, cls),
+  return [
+    on ? { icon: 'stop', label: 'Stop', fn: async () => { if (await act(['stop', n], n + ' stopped')) poll(); } }
+       : { icon: 'play', label: 'Start', pri: true, fn: async () => { if (await act(['start', n], n + ' started')) poll(); } },
     // One command and not a stop and a start: the runtime being restarted may be the entrance this page is
     // reached through, and then the stop arrives and the start never does.
-    btn('restart', 'Restart', async e => { e && e.stopPropagation(); if (await act(['restart', n], n + ' restarted')) poll(); }, cls));
-  else b.push(btn('play', 'Start', async e => { e && e.stopPropagation(); if (await act(['start', n], n + ' started')) poll(); }, cls + ' pri'));
-  if (!small) b.push(btn('restart', 'Reload Lua', async () => { await act(['reload-lua', n], 'Lua of ' + n + ' reloaded'); }, cls),
-    btn('edit', 'Edit', () => editDlg(r), cls),
-    btn('trash', 'Remove', async () => {
+    on ? { icon: 'restart', label: 'Restart', fn: async () => { if (await act(['restart', n], n + ' restarted')) poll(); } } : null,
+    { icon: 'restart', label: 'Reload Lua', full: true, fn: async () => { await act(['reload-lua', n], 'Lua of ' + n + ' reloaded'); } },
+    { icon: 'edit', label: 'Edit', full: true, fn: () => editDlg(r) },
+    { icon: 'trash', label: 'Remove', full: true, bad: true, fn: async () => {
       if (!await ask({ title: 'Remove ' + n + '?', text: 'It stops and is gone, with its configuration. Its data (a storage directory, a cache file) stays where it is.', ok: 'Remove', danger: true })) return;
       if (await act(['remove', n], n + ' removed')) { delete meta[n]; go('#/runtimes'); poll(); }
-    }, cls + ' bad'));
-  return b;
+    } }
+  ].filter(Boolean);
+}
+function controls(r, small) {
+  const cls = small ? 'sm' : '';
+  return actions(r).filter(x => !small || !x.full).map(x => btn(x.icon, x.label, e => { e && e.stopPropagation(); x.fn(); },
+    cls + (x.pri ? ' pri' : '') + (x.bad ? ' bad' : '')));
+}
+// The runtime's actions at the pointer, as its page offers them, with where it is served first.
+function rtMenu(r, ev) {
+  ev.preventDefault();
+  const h = (hosts[r.name] || [])[0];
+  const acts = actions(r);
+  const list = [h ? { icon: 'open', label: 'Open ' + h, fn: () => window.open('https://' + h + '/', '_blank', 'noopener') } : null,
+    h && acts.length ? '-' : null, ...acts].filter(Boolean);
+  if (list.length) popup({ x: ev.clientX, y: ev.clientY }, list);
 }
 function table(list) {
   if (!list.length) return el('div', { class: 'empty' }, el('div', { class: 'big' }, ico('server')), el('h3', { text: 'No runtimes here' }), el('div', { text: 'Make one with New runtime.' }));
@@ -860,9 +878,12 @@ function form(type, conf, editing, running) {
   const LIVE = new Set((schema && schema.live) || []);
   const vals = new Map();
   const sections = new Map();
+  // A tunnel being edited is an edge or an agent already, and the other's fields are ones it refuses.
+  const other = type === 'tunnel' && editing && conf ? (conf.mode === 'agent' ? TUNNEL_EDGE : TUNNEL_AGENT) : null;
   for (const f of schema.flags) {
     if (f.hidden || !f.types.includes(type)) continue;
     if (editing && (!f.key || f.flag === '-s')) continue;
+    if (other && other.has(f.flag)) continue;
     if (!sections.has(f.section)) sections.set(f.section, []);
     sections.get(f.section).push(f);
   }
