@@ -109,10 +109,16 @@ std::string_view request::header(std::string_view name) const
 
 std::string request::client() const
 {
-    if (!socketley::is_loopback(peer))
+    if (peer.empty())
+        return "local";
+    // Only the entrance on 127.0.0.1 or ::1 names the client, and only by an address, or a guesser picks its own key.
+    if (peer != "127.0.0.1" && peer != "::1")
         return peer;
-    const std::string_view xff = http_last_forwarded_hop(header("x-forwarded-for"));
-    return xff.empty() ? (peer.empty() ? std::string("local") : peer) : std::string(xff);
+    const std::string hop(http_last_forwarded_hop(header("x-forwarded-for")));
+    in_addr v4{};
+    in6_addr v6{};
+    const bool address = ::inet_pton(AF_INET, hop.c_str(), &v4) == 1 || ::inet_pton(AF_INET6, hop.c_str(), &v6) == 1;
+    return address ? hop : peer;
 }
 
 bool read_request(int fd, request& r, size_t max_body)
@@ -151,6 +157,9 @@ bool read_request(int fd, request& r, size_t max_body)
             nl = head.size();
         const std::string_view h = head.substr(p, nl - p);
         p = nl + 2;
+        // A control byte other than a tab, a bare CR or LF among them, is no field's, and would end a log line early.
+        if (std::any_of(h.begin(), h.end(), [](unsigned char c) { return (c < 0x20 && c != '\t') || c == 0x7f; }))
+            return false;
         const size_t colon = h.find(':');
         if (colon == std::string_view::npos)
             continue;

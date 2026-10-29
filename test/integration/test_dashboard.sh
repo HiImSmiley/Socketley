@@ -164,6 +164,30 @@ for _ in 1 2 3 4 5; do code -X POST -H 'X-Forwarded-For: 10.9.9.9' -H 'Via: 1.1 
 expect "an address that keeps failing is barred, the right secret too" \
     "$(code -X POST -H 'X-Forwarded-For: 10.9.9.9' -H 'Via: 1.1 e' -u "$ADMIN" "$U/api/session")" 429
 expect "while another is not" "$(code -X POST -H 'X-Forwarded-For: 10.9.9.8' -H 'Via: 1.1 e' -u "$ADMIN" "$U/api/session")" 200
+# Only the entrance on 127.0.0.1 names the client, and only by an address: a peer elsewhere is barred by its own.
+raw_session() {
+    python3 - "$M" "$1" "$2" "$3" <<'PY'
+import base64, socket, sys
+port, source, xff, cred = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+s = socket.create_connection(("127.0.0.1", port), timeout=10, source_address=(source, 0))
+s.sendall(("POST /api/session HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic " + base64.b64encode(cred.encode()).decode() +
+           "\r\nX-Forwarded-For: " + xff.replace("|", "\n") + "\r\nContent-Length: 0\r\n\r\n").encode())
+got = b""
+while True:
+    b = s.recv(4096)
+    if not b:
+        break
+    got += b
+print(got.split(b" ")[1].decode() if got.startswith(b"HTTP/1.1 ") else "none")
+PY
+}
+for i in 1 2 3 4 5 6; do raw_session 127.0.0.2 "198.51.100.$i" "${ADMIN%%:*}:guess" >/dev/null; done
+expect "a peer other than the entrance is barred by its own address, whatever client it names" \
+    "$(raw_session 127.0.0.2 198.51.100.99 "$ADMIN")" 429
+expect "a hop that is no address is not taken as the client" \
+    "$(raw_session 127.0.0.1 'not-an-address' "${ADMIN%%:*}:guess") $(grep -c 'refused from not-an-address' "$SOCKETLEY_DLOG")" "401 0"
+expect "and a field with a bare LF is refused, so it writes no line of its choosing" \
+    "$(raw_session 127.0.0.1 '203.0.113.5|[12:00:00] [WARN] dashboard: forged line' "${ADMIN%%:*}:guess") $(grep -c '^\[12:00:00\] \[WARN\] dashboard: forged line' "$SOCKETLEY_DLOG")" "none 0"
 expect "a forged cookie is no session" "$(code -b 'skl_dash=AKIADASHTESTADMIN000.9999999999.00' "$U/api/runtimes")" 401
 # A browser sends one cookie of a name per domain it was set for, so a forged one beside the real one must not win.
 dash=$(awk '$6 == "skl_dash" {print $7}' "$T/jar")
