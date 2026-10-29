@@ -38,6 +38,7 @@
 #include "../shared/util/base64.h"
 #include "../shared/crypto/mac.h"
 #include "../shared/util/hex.h"
+#include "../shared/util/random_id.h"
 #include "../shared/http/http_framing.h"
 #include "../shared/http/cookie.h"
 #include "../shared/net/peer_address.h"
@@ -217,9 +218,9 @@ server::server(std::string credentials, std::string idp, runtime_manager& manage
 
 server::~server() = default;
 
-std::string server::seal(std::string_view user, int64_t expires) const
+std::string server::seal(std::string_view user, std::string_view sid, int64_t expires) const
 {
-    const std::string msg = std::string(user) + "." + std::to_string(expires);
+    const std::string msg = std::string(user) + "." + std::string(sid) + "." + std::to_string(expires);
     // No MAC is no seal, or a cookie without one would be checked against one without one.
     const std::string mac = socketley::crypto::hmac_sha256(m_key, msg);
     return mac.empty() ? std::string{} : msg + "." + socketley::hex_encode(mac);
@@ -238,20 +239,47 @@ std::string server::session_of(const request& r) const
     // Every skl_dash sent, the first whose seal holds taken, so one a sibling domain set does not shut the session out.
     std::string user;
     socketley::http::for_each_cookie(cookies, "skl_dash", [&](std::string_view v) {
-        const size_t d2 = v.rfind('.'), d1 = d2 == std::string_view::npos ? d2 : v.rfind('.', d2 - 1);
-        if (d1 == std::string_view::npos || d1 == 0)
-            return false;
-        const std::string who(v.substr(0, d1));
-        const int64_t expires = std::strtoll(std::string(v.substr(d1 + 1, d2 - d1 - 1)).c_str(), nullptr, 10);
-        if (expires < static_cast<int64_t>(std::time(nullptr)))
-            return false;
-        const std::string want = seal(who, expires);
-        if (want.empty() || !socketley::crypto::secure_equal(want, v))
+        std::string who, sid;
+        if (!unseal(v, who, sid) || !live(sid))
             return false;
         user = who;
         return true;
     });
     return user;
+}
+
+bool server::unseal(std::string_view v, std::string& user, std::string& sid) const
+{
+    const size_t d3 = v.rfind('.');
+    const size_t d2 = d3 == std::string_view::npos || d3 == 0 ? std::string_view::npos : v.rfind('.', d3 - 1);
+    const size_t d1 = d2 == std::string_view::npos || d2 == 0 ? std::string_view::npos : v.rfind('.', d2 - 1);
+    if (d1 == std::string_view::npos || d1 == 0)
+        return false;
+    const std::string who(v.substr(0, d1)), id(v.substr(d1 + 1, d2 - d1 - 1));
+    const int64_t expires = std::strtoll(std::string(v.substr(d2 + 1, d3 - d2 - 1)).c_str(), nullptr, 10);
+    if (expires < static_cast<int64_t>(std::time(nullptr)))
+        return false;
+    const std::string want = seal(who, id, expires);
+    if (want.empty() || !socketley::crypto::secure_equal(want, v))
+        return false;
+    user = who;
+    sid = id;
+    return true;
+}
+
+bool server::live(const std::string& sid) const
+{
+    std::lock_guard lock(m_sessions_mutex);
+    const auto it = m_sessions.find(sid);
+    if (it == m_sessions.end())
+        return false;
+    const std::string secret = m_auth ? m_auth->admin_secret(it->second.key) : std::string();
+    if (secret.empty() || !socketley::crypto::secure_equal(socketley::crypto::hmac_sha256(m_key, secret), it->second.mark))
+    {
+        m_sessions.erase(it);
+        return false;
+    }
+    return true;
 }
 
 bool server::handle(int fd, const request& r)
@@ -323,6 +351,15 @@ void server::session(int fd, const request& r)
     const bool https = r.header("x-forwarded-proto") == "https";
     if (r.method == "DELETE")
     {
+        // The session ends here, not only in this browser, so a copy of its cookie is no session either.
+        socketley::http::for_each_cookie(r.header("cookie"), "skl_dash", [&](std::string_view v) {
+            if (std::string who, sid; unseal(v, who, sid))
+            {
+                std::lock_guard lock(m_sessions_mutex);
+                m_sessions.erase(sid);
+            }
+            return false;
+        });
         send(fd, 204, {}, {}, std::string("Set-Cookie: skl_dash=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict") +
                                   (https ? "; Secure" : "") + "\r\n");
         return;
@@ -368,15 +405,29 @@ void server::session(int fd, const request& r)
     if (std::string_view cred; http_auth_credentials(authorization, "basic", cred))
         socketley::base64::decode(cred, pair);
     // Named as the credentials file names its section, and by the key for a key outside any.
-    const std::string key = pair.substr(0, pair.find(':'));
+    const size_t colon = pair.find(':');
+    const std::string key = pair.substr(0, colon);
     const std::string named = m_auth->user_of(key);
     const std::string user = named.empty() ? key : named;
-    const int64_t expires = static_cast<int64_t>(std::time(nullptr)) + session_seconds;
-    const std::string sealed = seal(user, expires);
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t expires = now + session_seconds;
+    const std::string sid = socketley::random_hex(16);
+    const std::string mark = colon == std::string::npos ? std::string() : socketley::crypto::hmac_sha256(m_key, pair.substr(colon + 1));
+    const std::string sealed = sid.empty() || mark.empty() ? std::string() : seal(user, sid, expires);
     if (sealed.empty())
     {
         send(fd, 503, "application/json", "{\"error\":\"the session could not be sealed\"}");
         return;
+    }
+    {
+        std::lock_guard lock(m_sessions_mutex);
+        std::erase_if(m_sessions, [&](const auto& e) { return e.second.expires < now; });
+        // Bounded by sign-ins, which take an admin's secret; past this many the one that ends first gives way.
+        if (m_sessions.size() >= 4096)
+            m_sessions.erase(std::min_element(m_sessions.begin(), m_sessions.end(), [](const auto& a, const auto& b) {
+                                 return a.second.expires < b.second.expires;
+                             }));
+        m_sessions[sid] = open_session{key, mark, expires};
     }
     LOG_INFO(("dashboard: " + user + " signed in from " + r.client()).c_str());
     send(fd, 200, "application/json", "{\"user\":" + socketley::json::quote(user) + "}",

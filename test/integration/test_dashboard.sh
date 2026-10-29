@@ -274,7 +274,17 @@ expect "a file no dns runtime serves is none of the page's" \
     "$(put "$(python3 -c 'import json; print(json.dumps({"runtime":"ns","path":"/etc/passwd","text":"x"}))')")" 404
 expect "and a change needs the page's header" "$(curl -s -o /dev/null -w '%{http_code}' -b "$T/jar" -X PUT --data-binary "$body" "$U/api/zone")" 403
 
+# Signing out ends the session at the daemon, so a copy of its cookie is no session either.
+saved=$(awk '$6 == "skl_dash" {print $7}' "$T/jar")
 expect "signing out ends the session" "$(code -X DELETE -b "$T/jar" -c "$T/jar" "$U/api/session") $(code -b "$T/jar" "$U/api/runtimes")" "204 401"
+expect "and a copy of its cookie kept from before" "$(code -b "skl_dash=$saved" "$U/api/runtimes")" 401
+# A key whose secret changes, or that leaves the file, ends the sessions it made.
+code -X POST -c "$T/jar2" -u "$ADMIN" "$U/api/session" >/dev/null
+expect "a fresh session reads" "$(code -b "$T/jar2" "$U/api/runtimes")" 200
+printf '[admin]\nadmin = true\n%s:dashtestrotatedsecretdashtestrotatedsecret\n[bob]\n%s\n' "${ADMIN%%:*}" "$BOB" > "$T/creds.new"
+mv "$T/creds.new" "$T/creds"
+sleep 1.2
+expect "until its key is given another secret" "$(code -b "$T/jar2" "$U/api/runtimes")" 401
 
 # ─── without credentials ────────────────────────────────────────────────────
 daemon_stop

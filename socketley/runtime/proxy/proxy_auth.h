@@ -44,6 +44,9 @@ public:
 
     // The id of the user an access key of the basic file signs for, empty for the default owner or no such key.
     std::string user_of(std::string_view access_key) const;
+    // The secret an access key of the basic file signs an admin in with now, the file read again if it changed; empty
+    // once the key is gone or no longer an admin's.
+    std::string admin_secret(std::string_view access_key);
 
     // Whether this is an idp:<runtime> --auth, which a request's cookies answer rather than its Authorization.
     bool idp() const { return m_kind == kind::idp; }

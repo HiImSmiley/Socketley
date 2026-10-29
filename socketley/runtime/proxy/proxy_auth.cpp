@@ -176,6 +176,17 @@ std::string proxy_auth::user_of(std::string_view access_key) const
     return u ? u->id : std::string();
 }
 
+std::string proxy_auth::admin_secret(std::string_view access_key)
+{
+    if (m_kind != kind::basic)
+        return {};
+    reload(std::chrono::steady_clock::now());
+    if (!m_loaded || !m_keys)
+        return {};
+    const auto user = m_keys->user_of(access_key);
+    return user && !user->admin ? std::string() : std::string(m_keys->secret(access_key));
+}
+
 bool proxy_auth::admit(std::string_view authorization) const
 {
     // An idp's sessions are cookies, which check_session answers.

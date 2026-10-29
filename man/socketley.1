@@ -17101,7 +17101,8 @@ checks them: an address that fails five times in fifteen minutes is refused
 even the right secret, 429, behind a proxy on this machine the address in its
 X\-Forwarded\-For. The session is a cookie sealed with a key the daemon draws at
 start, HttpOnly and SameSite=Strict (Secure behind HTTPS), good for twelve
-hours; a command also carries the page's own header, which no other site's
+hours, and ended at the daemon by signing out, by its key leaving the file or
+by the key being given another secret; a command also carries the page's own header, which no other site's
 request can, goes over the daemon's control socket as the CLI's does, and is
 logged with who sent it. The page sends only
 .BR create ,

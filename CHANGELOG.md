@@ -120,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lockout, and skipped SPF, DMARC, DNSBL and greylisting. A TCP visitor now
   comes from 127.0.0.2; an HTTP service, behind the entrance, still from
   127.0.0.1.
+- **Signing out of the dashboard ends the session at the daemon.** A
+  copy of the cookie stayed good for its twelve hours after sign-out, and
+  after its key was removed from the credentials file or given another
+  secret; the daemon now keeps its sessions and ends them at any of the
+  three.
 - **The dashboard takes X-Forwarded-For only from 127.0.0.1 or ::1, and
   only an address.** Any loopback peer could name a new client with each
   failed sign-in and never be barred, and a bare LF in the field wrote a

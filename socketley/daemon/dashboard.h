@@ -6,12 +6,13 @@
 // Signing in takes an access key and secret of an admin of the credentials file the daemon configuration names
 // (daemon.dashboard_credentials, a storage runtime's format), checked as a proxy's --auth basic: checks them, five
 // failures from one address barring it for fifteen minutes. A session is a cookie sealed with a key this process
-// draws at start, HttpOnly and SameSite=Strict, good for twelve hours; a change also carries the page's own header,
-// which no other site's request can. Without the credentials the page shows the figures, not the log or a zone, and
-// changes nothing.
+// draws at start, HttpOnly and SameSite=Strict, good for twelve hours unless signed out or its key's secret changes or
+// goes; a change also carries the page's own header, which no other site's request can. Without the credentials the
+// page shows the figures, not the log or a zone, and changes nothing.
 #include "../runtime/idp/idp_session.h"
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -70,7 +71,11 @@ private:
     // GET /api/zone?runtime=&path=: a dns runtime's zone file; PUT the same with its new text, checked as the runtime
     // would read it before it is written.
     void zone(int fd, const request& r);
-    std::string seal(std::string_view user, int64_t expires) const;
+    std::string seal(std::string_view user, std::string_view sid, int64_t expires) const;
+    // The user and session id a skl_dash value seals; false when its seal does not hold or it has ended.
+    bool unseal(std::string_view value, std::string& user, std::string& sid) const;
+    // Whether a session is still open: not signed out, and its key still an admin's with the secret it signed in by.
+    bool live(const std::string& sid) const;
 
     std::string m_credentials;
 
@@ -79,6 +84,15 @@ private:
     mutable socketley::idp::session_verifier m_idp;
     std::string m_key;
     std::unique_ptr<proxy_auth> m_auth;
+
+    // The sessions signed in by the credentials file, by id: the access key and a MAC of the secret they were made with.
+    struct open_session
+    {
+        std::string key, mark;
+        int64_t expires{0};
+    };
+    mutable std::mutex m_sessions_mutex;
+    mutable std::unordered_map<std::string, open_session> m_sessions;
     runtime_manager& m_manager;
 };
 
