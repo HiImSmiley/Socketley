@@ -67,13 +67,17 @@ def ws_ping_flood():
     ws.sendall(bytes([CONNECT << 4]) + varint(len(body)) + body)
     check("a 3.1.1 client with keep alive 0 is let in over WebSocket", ws.recv(4), b"\x20\x02\x00\x00")
     mask = os.urandom(4)
-    chunk = (bytes([0x89, 0x80 | 125]) + mask + (mask * 32)[:125]) * 1000
+    ping = bytes([0x89, 0x80 | 125]) + mask + (mask * 32)[:125]
+    chunk = ping * 1000
     raw.setblocking(False)
-    sent, moved = 0, time.time()
+    sent, off, moved = 0, 0, time.time()
     end = moved + 15
     while time.time() < end and sent < 2 * bound:
         try:
-            sent += raw.send(chunk)
+            # A short send goes on where it stopped, since one begun again cuts a frame in two and is refused for it.
+            n = raw.send(chunk[off:])
+            sent += n
+            off = (off + n) % len(chunk)
             moved = time.time()
         except BlockingIOError:
             if time.time() - moved > 2:
@@ -82,7 +86,7 @@ def ws_ping_flood():
     truth("pings from a client that reads no pongs stop being read (%d MiB taken)" % (sent >> 20), sent < bound)
     # Once it reads, it is read again: a PINGREQ behind every ping is answered, sent as the socket takes it.
     m = os.urandom(4)
-    pending = bytes([0x82, 0x82]) + m + bytes([(PINGREQ << 4) ^ m[0], m[1]])
+    pending = chunk[off:off + (-off) % len(ping)] + bytes([0x82, 0x82]) + m + bytes([(PINGREQ << 4) ^ m[0], m[1]])
     end = time.time() + 30
     tail = b""
     got = False

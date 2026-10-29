@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The MQTT WebSocket ping flood test sends a stream the broker can read.** On
+  a short send it began its 1000-frame chunk again instead of going on, cutting
+  a frame in two, so the broker rightly refused it and the test failed on the
+  reset; the broker itself loses no byte under the flood.
 - **A script's `socketley.start` answers once the runtime serves.** It forked
   the workers before answering but did not wait for them, so a script that
   started a server and reached it at once could still find the port closed on a
