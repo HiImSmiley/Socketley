@@ -163,6 +163,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate in it was an anchor and no name was checked, so any leaf the
   same public intermediate signed took the credentials; now the peer must
   show the file's first certificate.
+- **A script's pattern match is stopped by the deadline.** `string.find`,
+  `match`, `gmatch` and `gsub` backtracked inside one C call where the count
+  hook never fires, so `EVAL "return string.find(string.rep('a',1e5),'a*a*b')" 0`
+  held the shard for hours. EVAL's string library now matches with Lua 5.1's
+  rules in a matcher that looks at the deadline as it works, and refuses a
+  pattern nested more than 200 deep, as Lua 5.2 does.
 - **A presigned request is its signer's however it spells the signing
   parameters.** A URL whose `X-Amz-Algorithm` (or V2 `AWSAccessKeyId`) name was
   percent-encoded was verified with the signer's key but then judged as

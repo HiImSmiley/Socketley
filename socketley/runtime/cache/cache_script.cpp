@@ -4,6 +4,7 @@
 
 #include "resp_parser.h"
 #include "../../shared/lua/lua_context.h"
+#include "../../shared/lua/lua_pattern.h"
 
 #include <openssl/evp.h>
 #include <cstdio>
@@ -402,6 +403,7 @@ void cache_script_engine::ensure_state()
 {
     if (m_ready) return;
     m_ready = true;
+    lua_State* L = m_lua.lua_state();
 
     // Opened by name, and the list is the whole of the sandbox.  `io`, `os`,
     // `package`, `debug` and `ffi` are absent because a script here came from
@@ -418,17 +420,21 @@ void cache_script_engine::ensure_state()
                              "newproxy", "getfenv", "setfenv"})
         m_lua[gone] = sol::nil;
 
+    // A client's pattern is matched by one that answers to the deadline, as LuaJIT's backtracks in C where no hook fires.
+    lua_getglobal(L, "string");
+    lua_pattern::install(L, -1);
+    lua_pop(L, 1);
+
     // The deadline the rest of the tree already uses, on this state too: a
     // script that loops is stopped by the same count hook a callback is, and
     // the trace compiler stays off for the same reason -- a compiled trace
     // calls no hook back.
-    lua_deadline::install(m_lua.lua_state(), lua_deadline::default_ms());
+    lua_deadline::install(L, lua_deadline::default_ms());
 
     // Built ONCE.  These closures read m_call rather than capturing it, so the
     // table survives between evals -- rebuilding it per call cost as much as
     // the script did.
     sol::table redis = m_lua.create_table();
-    lua_State* L = m_lua.lua_state();
     redis.push();
     lua_pushlightuserdata(L, this);
     lua_pushcclosure(L, &cache_script_engine::call_raising, 1);

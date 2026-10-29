@@ -320,5 +320,40 @@ want "a script cannot run a script" "not allowed from script" \
 want "and the cache is still there" "+PONG" '[["PING"]]' "$PR"
 
 echo ""
+echo "--- 10. a pattern match answers to the deadline, and still matches as Lua 5.1 does ---"
+# LuaJIT's matcher backtracks inside one C call where the count hook never fires: this held the shard for hours.
+START=$(date +%s)
+got=$(resp '[["EVAL","return string.find(string.rep(\"a\", 100000), \"a*a*b\")","0"]]')
+ELAPSED=$(( $(date +%s) - START ))
+case "$got" in *deadline*) ok "a backtracking pattern is stopped (${ELAPSED}s)" ;;
+               *) bad "pattern deadline" "no deadline error" "got: ${got:-<nothing>}" ;; esac
+[ "$ELAPSED" -lt 30 ] && ok "and stopped in time" || bad "pattern deadline" "took ${ELAPSED}s"
+want "the cache answers after it" "PONG" '[["PING"]]'
+want "the method form is the same matcher" "deadline" \
+  '[["EVAL","return (\"a\"):rep(100000):match(\"a*a*b\")","0"]]'
+want "a plain find"            '*2 | :5 | :7 |' '[["EVAL","return {string.find(\"hello world\", \"o w\")}","0"]]'
+want "find with captures"      '*4 | :1 | :7 | $3 | key | $3 | val |' \
+  '[["EVAL","return {string.find(\"key=val\", \"(%w+)=(%w+)\")}","0"]]'
+want "an anchored miss"        '$3 | nil |' '[["EVAL","return tostring(string.find(\"abc\", \"^b\"))","0"]]'
+want "a balanced match"        '$7 | (a(b)c) |' '[["EVAL","return string.match(\"f(a(b)c) d\", \"%b()\")","0"]]'
+want "a frontier from an init" ':6 |' '[["EVAL","return string.find(\"THE (quick) fox\", \"%f[%a]%a+\", 5)","0"]]'
+want "a position capture"      ':3 |' '[["EVAL","return string.match(\"hello\", \"()ll()\")","0"]]'
+want "a back reference"        '$3 | abc |' '[["EVAL","return string.match(\"xabcabcx\", \"(abc)%1\")","0"]]'
+want "a lazy repetition"       '$3 | <a> |' '[["EVAL","return string.match(\"<a><b>\", \"<.->\")","0"]]'
+want "gsub with a template"    '$15 | <hello> <world> |' \
+  '[["EVAL","return (string.gsub(\"hello world\", \"(%w+)\", \"<%1>\"))","0"]]'
+want "gsub with a function"    '$3 | ABC |' \
+  '[["EVAL","return (string.gsub(\"abc\", \"%w\", function(c) return c:upper() end))","0"]]'
+want "gsub with a table"       '$3 | 1b2 |' \
+  '[["EVAL","return (string.gsub(\"abc\", \"%w\", {a = \"1\", c = 2}))","0"]]'
+want "gsub counts"             ':3 |' '[["EVAL","return select(2, string.gsub(\"aaa\", \"a\", \"b\"))","0"]]'
+want "gsub stops at its limit" '$3 | bba |' '[["EVAL","return (string.gsub(\"aaa\", \"a\", \"b\", 2))","0"]]'
+want "gmatch walks the subject" '$5 | a1,b2 |' \
+  '[["EVAL","local t = {} for k, v in string.gmatch(\"a=1, b=2\", \"(%w+)=(%w+)\") do t[#t+1] = k .. v end return table.concat(t, \",\")","0"]]'
+want "a malformed pattern is an error" "missing" '[["EVAL","return string.find(\"a\", \"[a\")","0"]]'
+want "a pattern nested past 200 is refused, not a C stack overflow" "too complex" \
+  '[["EVAL","return string.match(string.rep(\"a\", 300), string.rep(\"a?\", 300))","0"]]'
+
+echo ""
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && { echo "  OK"; exit 0; } || exit 1

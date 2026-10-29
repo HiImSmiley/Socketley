@@ -115,6 +115,10 @@ namespace lua_deadline
     // before a runtime_instance is freed outright, and not the same question
     // as remaining_ms() >= 0.
     bool in_callback() noexcept;
+
+    // Raises the deadline error on L once the armed invocation is past its
+    // deadline, for C code that runs long without executing a VM instruction.
+    void check(lua_State* L);
 }
 
 // One callback with the deadline armed for exactly the length of the call,

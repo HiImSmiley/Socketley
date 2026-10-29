@@ -217,7 +217,7 @@ long remaining_ms() noexcept
 // with nothing else -- a script that pcalls its own slow work -- with no C++
 // object alive at the raise and the deadline deliberately left expired so a
 // `while true do pcall(spin) end` still ends.
-static void hook(lua_State* L, lua_Debug*)
+void check(lua_State* L)
 {
     if (t_depth == 0)
         return;
@@ -246,6 +246,11 @@ static void hook(lua_State* L, lua_Debug*)
     // `what` carries the noun, so this reads as a sentence for a callback, for
     // the script's top level and for the daemon's configuration file alike.
     luaL_error(L, "%s exceeded the %ums deadline", what, ms);
+}
+
+static void hook(lua_State* L, lua_Debug*)
+{
+    check(L);
 }
 
 void install(lua_State* L, uint32_t limit_ms)
