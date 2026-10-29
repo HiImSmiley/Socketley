@@ -92,6 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the one on DATA; past 400 such resets in ten seconds the connection now ends
   with GOAWAY ENHANCE_YOUR_CALM, and a session that leaves 4 MiB unread is
   closed.
+- **A tunnel's TCP visitor is no program of the agent's machine.** An agent
+  dialled a service at 127.0.0.1 from 127.0.0.1, so a mail runtime offered as
+  `--tcp smtp:25=127.0.0.1:25` took every sender on the internet for this
+  machine's own programs: relayed to anywhere, signed in without TLS or
+  lockout, and skipped SPF, DMARC, DNSBL and greylisting. A TCP visitor now
+  comes from 127.0.0.2; an HTTP service, behind the entrance, still from
+  127.0.0.1.
 - **A presigned request is its signer's however it spells the signing
   parameters.** A URL whose `X-Amz-Algorithm` (or V2 `AWSAccessKeyId`) name was
   percent-encoded was verified with the signer's key but then judged as

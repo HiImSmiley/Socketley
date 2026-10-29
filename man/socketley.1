@@ -14265,7 +14265,10 @@ which sign in wherever the idp is trusted, and without the
 .B Authorization
 a service's
 .I auth
-took.
+took. A TCP
+visitor comes to a service at 127.0.0.1 or localhost from 127.0.0.2, so one
+that trusts this machine's own programs at 127.0.0.1, as mail lets them relay,
+takes it for a stranger; a service named at [::1] is reached from ::1.
 .PP
 .B Who may visit.
 An HTTP service invited as

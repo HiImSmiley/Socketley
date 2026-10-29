@@ -14,6 +14,7 @@
 #   * a tunnel edit refused on a later flag that leaves an earlier one in effect after --restart
 #   * the entrance's own address logged for who an agent or a person was
 #   * a TCP service given an address opened on every one, or not carried
+#   * a TCP visitor reaching a service as this machine's own 127.0.0.1, which mail lets relay
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -40,7 +41,7 @@ big = bytes(range(256)) * (5 * 1024 * 1024 // 256)
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def do_GET(self):
-        b = big if self.path == "/big" else ("hello from home %s" % self.path).encode()
+        b = big if self.path == "/big" else self.client_address[0].encode() if self.path == "/who" else ("hello from home %s" % self.path).encode()
         self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def log_message(self, *a): pass
 class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -51,7 +52,7 @@ class Echo(socketserver.BaseRequestHandler):
             d = self.request.recv(65536)
             if not d:
                 break
-            self.request.sendall(d)
+            self.request.sendall(self.client_address[0].encode() if d == b"who\n" else d)
         self.request.shutdown(1)
 class E(socketserver.ThreadingTCPServer):
     daemon_threads = True
@@ -140,6 +141,12 @@ while True:
     got += d
 t.join()
 check("three megabytes over TCP come back whole after the sender half-closes", (len(got), bytes(got) == data), (len(data), True))
+# A TCP visitor is a stranger to a service that trusts 127.0.0.1 as this machine's own programs, as mail's relay does.
+s = socket.create_connection(("127.0.0.1", pt), timeout=20)
+s.sendall(b"who\n")
+check("a TCP visitor reaches the service at home from 127.0.0.2", s.recv(64), b"127.0.0.2")
+s.close()
+check("an HTTP visitor, carried from the entrance, from 127.0.0.1", get("/who"), (200, b"127.0.0.1"))
 PY
 )
 "$BIN" stop home >/dev/null 2>&1; "$BIN" start home >/dev/null 2>&1

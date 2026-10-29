@@ -173,7 +173,7 @@ std::shared_ptr<leg> link::leg_of(uint32_t stream)
 
 void link::on_hello(const fields&) {}
 
-void link::on_open(uint32_t stream, std::string_view target, std::string_view)
+void link::on_open(uint32_t stream, std::string_view target, std::string_view peer)
 {
     // A person names a --forward target, and the edge names one of the agent's offers; an agent opens nothing.
     if (k == kind::agent)
@@ -181,7 +181,7 @@ void link::on_open(uint32_t stream, std::string_view target, std::string_view)
         s.reset(stream, reset_code::refused, out);
         return;
     }
-    run.dial_leg(*this, stream, target);
+    run.dial_leg(*this, stream, target, peer);
 }
 
 void link::on_data(uint32_t stream, std::string_view bytes)
@@ -363,7 +363,7 @@ void tunnel_run::leg_done_writing(const std::shared_ptr<leg>& g)
         g->srv->close_conn(g);
 }
 
-void tunnel_run::dial_leg(link& l, uint32_t stream, std::string_view target)
+void tunnel_run::dial_leg(link& l, uint32_t stream, std::string_view target, std::string_view peer)
 {
     std::string addr;
     if (l.k == link::kind::person)
@@ -390,8 +390,13 @@ void tunnel_run::dial_leg(link& l, uint32_t stream, std::string_view target)
     leg_hooks& dialler = m_edge ? *m_dial : *m_local;
     std::string why;
     std::shared_ptr<http::server_conn> c;
+    // A TCP visitor reaches a service on this machine from 127.0.0.2, not as its own programs' 127.0.0.1, while the
+    // entrance's HTTP hop ("local") stays 127.0.0.1 so that a service still takes X-Forwarded-For from it.
+    const bool stranger = l.k == link::kind::edge && peer != "local";
     if (!addr.empty() && target_endpoint(addr, ep))
-        c = dialler.srv.dial(ep.addr, ep.len, why);
+        c = dialler.srv.dial(ep.addr, ep.len, why,
+                             stranger && ep.addr.ss_family == AF_INET && is_loopback(ep.addr) ? htonl(INADDR_LOOPBACK + 1)
+                                                                                                : 0u);
     if (!c)
     {
         ++m_c.refused;

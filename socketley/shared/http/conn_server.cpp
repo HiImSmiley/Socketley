@@ -80,7 +80,8 @@ bool conn_server::listen_unix(const std::string& path, std::string& why)
     return true;
 }
 
-std::shared_ptr<server_conn> conn_server::dial(const sockaddr_storage& addr, socklen_t len, std::string& why)
+std::shared_ptr<server_conn> conn_server::dial(const sockaddr_storage& addr, socklen_t len, std::string& why,
+                                              uint32_t from_v4)
 {
     if (m_stopped)
     {
@@ -92,6 +93,21 @@ std::shared_ptr<server_conn> conn_server::dial(const sockaddr_storage& addr, soc
     {
         why = std::string("no socket: ") + std::strerror(errno);
         return nullptr;
+    }
+    if (from_v4 != 0 && addr.ss_family == AF_INET)
+    {
+        // The port is left to the connect, so a source address takes no port of its own from the ephemeral range.
+        int one = 1;
+        ::setsockopt(fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &one, sizeof one);
+        sockaddr_in from{};
+        from.sin_family = AF_INET;
+        from.sin_addr.s_addr = from_v4;
+        if (::bind(fd, reinterpret_cast<const sockaddr*>(&from), sizeof from) < 0)
+        {
+            why = std::string("no source address: ") + std::strerror(errno);
+            ::close(fd);
+            return nullptr;
+        }
     }
     auto c = m_hooks.make_conn();
     c->id = m_next_id++;

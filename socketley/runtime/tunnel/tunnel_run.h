@@ -192,8 +192,8 @@ private:
     // The leg's buffered bytes handed to its stream as far as the credit goes.
     void pump(leg& g);
     void leg_done_writing(const std::shared_ptr<leg>& g);
-    // A leg to `target` (`host:port`) for a stream the far side opened, refused when it cannot be begun.
-    void dial_leg(link& l, uint32_t stream, std::string_view target);
+    // A leg to `target` (`host:port`) for a stream the far side opened from `peer`, refused when it cannot be begun.
+    void dial_leg(link& l, uint32_t stream, std::string_view target, std::string_view peer);
 
     // ── the edge ──
     bool start_edge(std::string& why);

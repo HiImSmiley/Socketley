@@ -81,8 +81,9 @@ public:
     bool listen_tcp(uint32_t addr, uint16_t port, bool shared, std::string& why);
     // A Unix socket at `path`, made 0660 in place of whatever was there; false with `why` when it cannot be.
     bool listen_unix(const std::string& path, std::string& why);
-    // A connection to `addr`, its outcome told by the hooks' connected(); null with `why` when none could be begun.
-    std::shared_ptr<server_conn> dial(const sockaddr_storage& addr, socklen_t len, std::string& why);
+    // A connection to `addr`, from the IPv4 source `from_v4` (network order) unless it is 0, its outcome told by the
+    // hooks' connected(); null with `why` when none could be begun.
+    std::shared_ptr<server_conn> dial(const sockaddr_storage& addr, socklen_t len, std::string& why, uint32_t from_v4 = 0);
     void start_accepting();
     // Stops accepting and closes every connection; what the ring still owes them is waited for by drained().
     void stop();
