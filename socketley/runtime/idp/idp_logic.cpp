@@ -589,6 +589,14 @@ int64_t attempt_limits::wait(const std::string& key, int64_t now, int free)
     return std::max<int64_t>(0, last + delay - now);
 }
 
+bool attempt_limits::held_here(const std::string& key, int64_t now, int free)
+{
+    if (!m_keys.contains(key))
+        return false;
+    const entry& e = fresh(key, now);
+    return e.in_flight > 0 && static_cast<int64_t>(e.at.size() + e.elsewhere.size()) < free;
+}
+
 void attempt_limits::end(const std::string& key)
 {
     const auto it = m_keys.find(key);

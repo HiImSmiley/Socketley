@@ -320,6 +320,9 @@ private:
     std::unordered_map<std::string, uint32_t> m_devices_from;
     // Failures by address and by account, and the attempts at each being checked.
     attempt_limits m_limits;
+    // Mail's password checks for an account waiting for one of its own in flight to end, the oldest first.
+    std::unordered_map<std::string, std::deque<std::function<void()>>> m_mail_waiting;
+    void wake_mail(const std::string& acct);
     // Password checks given to the hashing threads and not answered yet.
     uint32_t m_hashing{0};
 

@@ -107,6 +107,8 @@ public:
     // Seconds before `key` may try again: none while its failures and attempts in flight are below `free`, then 30
     // after the last failure, doubling with each one more, to 300 at most.
     int64_t wait(const std::string& key, int64_t now, int free);
+    // Whether what holds `key` up is only this shard's own attempts still being checked, so the next can wait for one.
+    bool held_here(const std::string& key, int64_t now, int free);
     void begin(const std::string& key) { ++m_keys[key].in_flight; }
     void end(const std::string& key);
     // An attempt at `key` another shard began at `at` and is checking, and its end, counted beside this shard's own.

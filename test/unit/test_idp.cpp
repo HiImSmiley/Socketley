@@ -701,6 +701,24 @@ TEST_CASE("attempts in flight count against the bar, and an account waits longer
     CHECK_FALSE(l.barred("e", t + 61, 5));
     l.end("e");
 
+    // Only this shard's own attempts in flight holding a key up can be waited out here, failures and other shards not.
+    for (int i = 0; i < 10; ++i)
+        l.begin("h");
+    CHECK(l.wait("h", t, 10) > 0);
+    CHECK(l.held_here("h", t, 10));
+    l.end("h");
+    for (int i = 0; i < 6; ++i)
+        l.failed("h", t);
+    CHECK(l.held_here("h", t, 10));
+    l.begun_elsewhere("h", t);
+    for (int i = 0; i < 3; ++i)
+        l.failed("h", t);
+    CHECK_FALSE(l.held_here("h", t, 10));
+    CHECK_FALSE(l.held_here("none", t, 10));
+    for (int i = 0; i < 9; ++i)
+        l.end("h");
+    l.ended_elsewhere("h");
+
     for (int i = 0; i < 9; ++i)
         l.failed("u", t);
     CHECK(l.wait("u", t, 10) == 0);

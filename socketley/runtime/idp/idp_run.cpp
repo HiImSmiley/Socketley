@@ -69,6 +69,7 @@ constexpr int     miss_limit    = 5;
 constexpr int     network_limit = 16 * miss_limit;
 // Failures at one account before each try waits, from 30 seconds to 5 minutes, and wrong codes likewise.
 constexpr int     account_free  = 10;
+constexpr size_t  mail_waiting_max = 64;
 constexpr int     code_free     = 5;
 // Wrong codes one password step may be followed by before it must be given again.
 constexpr int     code_tries    = 3;
@@ -2998,6 +2999,23 @@ std::string admin_email(field_list& f)
 
 }   // namespace
 
+void idp_run::wake_mail(const std::string& acct)
+{
+    const auto it = m_mail_waiting.find(acct);
+    if (it == m_mail_waiting.end())
+        return;
+    if (it->second.empty())
+    {
+        m_mail_waiting.erase(it);
+        return;
+    }
+    auto next = std::move(it->second.front());
+    it->second.pop_front();
+    if (it->second.empty())
+        m_mail_waiting.erase(it);
+    next();
+}
+
 void idp_run::answer_command(uint64_t ticket, std::string_view text)
 {
     // A change a command made is said to the other shards before it is answered, so none answers from before it.
@@ -3098,10 +3116,21 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         const bool counted = args.size() > 3 && args[3] == "unguarded";
         std::string acct = "mail:" + (who ? std::string(who->username()) : user);
         socketley::ascii::lower_in_place(acct);
-        if (counted && m_limits.wait(acct, wall::now_sec(), account_free) > 0)
+        if (const int64_t now = wall::now_sec(); counted && m_limits.wait(acct, now, account_free) > 0)
         {
+            // A burst held up only by its own checks still running waits for one to end, as only an answer counts it.
+            if (auto& waiting = m_mail_waiting[acct]; m_limits.held_here(acct, now, account_free) &&
+                                                      waiting.size() < mail_waiting_max)
+            {
+                std::string again(command_marker);
+                for (const auto& a : args)
+                    again += a + "\n";
+                waiting.push_back([this, ticket, again = std::move(again)] { command(ticket, again); });
+                return;
+            }
             ++m_c.barred;
             answer_command(ticket, "error: wait");
+            wake_mail(acct);
             return;
         }
         if (counted)
@@ -3113,9 +3142,14 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             if (ok)
                 answer_command(ticket, "ok " + name + "\t" + email + "\t" + quota);
             else if (counted)
-                count_failed({acct}, wall::now_sec(), [this, ticket] { answer_command(ticket, "error: no"); });
+                return count_failed({acct}, wall::now_sec(), [this, ticket, acct] {
+                    answer_command(ticket, "error: no");
+                    wake_mail(acct);
+                });
             else
                 answer_command(ticket, "error: no");
+            if (counted)
+                wake_mail(acct);
         });
         return;
     }
