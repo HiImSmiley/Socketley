@@ -323,6 +323,7 @@ void proxy_client_connection::reset(int new_fd)
     auth_user.clear();
     auth_name.clear();
     auth_email.clear();
+    auth_proof.clear();
     last_activity = {};
     parked_backend_fd = -1;
     kept_alive = false;
@@ -4709,7 +4710,12 @@ bool proxy_instance::auth_admits(proxy_client_connection* conn)
         conn->auth_email = std::move(v.email);
     }
     if (v.pass)
+    {
+        conn->auth_proof = std::move(v.proof);
+        // The sweep is what asks again while the exchange lasts, an upgrade's tunnel or a stream included.
+        arm_response_deadline_sweep();
         return true;
+    }
     send_error(conn, v.status, v.body, true, v.headers);
     return false;
 }
@@ -8371,6 +8377,7 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     cconn->ex.awaiting_response = false;
     cconn->ex.awaiting_headers = false;
     cconn->ex.client_conn_close = false;
+    cconn->auth_proof.clear();
     cconn->ex.method.clear();
     cconn->ex.path.clear();
     cconn->ex.version.clear();
@@ -9409,6 +9416,10 @@ void proxy_instance::response_deadline_sweep()
     trace_splice_sweep();
 #endif
     const auto now = std::chrono::steady_clock::now();
+    // Once a second, every exchange --auth let in is asked whether what let it in still would.
+    const bool recheck_auth = m_auth.enabled() && now >= m_auth_recheck_due;
+    if (recheck_auth)
+        m_auth_recheck_due = now + std::chrono::seconds(1);
 
     // A snapshot, not the live count: giving up on a request can tear the pair
     // down and m_client_count falls with it, so using the live value as the
@@ -9440,6 +9451,18 @@ void proxy_instance::response_deadline_sweep()
 
         if (conn->closing)
             continue;
+
+        // A sign-in ended, a token taken out of the file, ends what it let in: a tunnel after a 101 never sends
+        // another head to be asked about.
+        if (!conn->auth_proof.empty())
+        {
+            if (recheck_auth && !m_auth.still_admits(conn->auth_proof))
+            {
+                close_pair(cfd, conn->ex.backend_fd, close_reason::force);
+                continue;
+            }
+            still_waiting = true;
+        }
 
         // The two CAN coincide, which the order here used to deny.
         // bound_pipelined_hold() arms the header deadline immediately before

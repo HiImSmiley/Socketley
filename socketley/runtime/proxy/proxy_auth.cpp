@@ -219,6 +219,19 @@ proxy_auth::verdict proxy_auth::check_session(std::string_view cookies, std::str
     return verdict::pass;
 }
 
+bool proxy_auth::still_admits(std::string_view proof)
+{
+    if (m_kind == kind::none)
+        return true;
+    if (m_kind == kind::idp)
+    {
+        std::string sub, username, email;
+        return check_session(proof, sub, username, email) == verdict::pass;
+    }
+    reload(std::chrono::steady_clock::now());
+    return admit(proof);
+}
+
 std::string proxy_auth::login_url(std::string_view return_to)
 {
     return m_sessions ? m_sessions->login_url(return_to) : std::string();
@@ -268,6 +281,8 @@ proxy_auth::request_verdict proxy_auth::decide(std::string_view head, std::strin
         int64_t retry_after = 0;
         const verdict r = check(fields > 1 ? std::string_view("-") : authorization, client, retry_after);
         v.pass = r == verdict::pass;
+        if (v.pass)
+            v.proof.assign(authorization);
         if (r == verdict::barred)
         {
             v.status = "429 Too Many Requests";
@@ -301,6 +316,7 @@ proxy_auth::request_verdict proxy_auth::decide(std::string_view head, std::strin
     if (check_session(cookies, v.sub, v.username, v.email) == verdict::pass)
     {
         v.pass = true;
+        v.proof = std::move(cookies);
         return v;
     }
     int accept_fields = 0, proto_fields = 0, host_fields = 0;

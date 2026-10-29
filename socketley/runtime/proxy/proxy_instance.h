@@ -292,6 +292,8 @@ struct alignas(64) proxy_client_connection
     std::string auth_user;
     std::string auth_name;
     std::string auth_email;
+    // What --auth let this exchange through by, asked again while it lasts; empty when nothing was asked.
+    std::string auth_proof;
 
     std::chrono::steady_clock::time_point last_activity{};
     // The backend kept idle for this connection's next request, or -1; see
@@ -1232,6 +1234,8 @@ private:
     std::unique_ptr<timer_op> m_response_sweep_timer;
     bool m_response_sweep_armed{false};
     bool m_response_sweep_warned{false};
+    // When the sweep next asks --auth again about the connections it let in.
+    std::chrono::steady_clock::time_point m_auth_recheck_due{};
 
     // Names are looked up off the loop, and this short chain runs only while an answer is still out.
     static constexpr long RESOLVE_POLL_NSEC = 100000000L;   // 100 ms

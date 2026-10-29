@@ -62,12 +62,16 @@ public:
         bool pass{false};
         std::string status, body, headers;
         std::string sub, username, email;
+        // What let it through, an Authorization or the Cookie fields, which a connection it opened is asked again by.
+        std::string proof;
     };
     // The request whose head runs from its request line to the blank line, from the socket's `peer` address, over
     // TLS here or not; `method`, `path` and `host` are what the caller read off it, and a hop on this machine is
     // believed about the client and the scheme it used.
     request_verdict decide(std::string_view head, std::string_view peer, bool tls, std::string_view method,
                            std::string_view path, std::string_view host);
+    // Whether the `proof` a request passed with would pass now, against the file or the provider as they are now.
+    bool still_admits(std::string_view proof);
 
     // Failures from one address that bar it, and for how long from the first of them.
     static constexpr uint32_t tries = 5;

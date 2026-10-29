@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its own five, so a site's /48 gave one attacker 65536 budgets of five
   guesses each a quarter of an hour; the /48 now shares one budget of
   sixteen /64s' worth, beside each /64's own.
+- **A connection the proxy's `--auth` let in ends when its sign-in does.**
+  `--auth` was asked once per request head, so a websocket or other upgrade,
+  and an answer still streaming, went on after its token left the file or its
+  idp sign-in was ended or its account disabled; such a connection is now
+  asked again every second and closed once it would be refused.
 - **An HTTP/2 or HTTP/3 stream's answer pauses its backend like a socket's.**
   A stream's answer was framed into the stream's own buffer at once, and the
   backend's read paused only on the stream's write queue, which that leaves
