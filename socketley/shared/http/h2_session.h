@@ -115,6 +115,8 @@ struct session
     std::chrono::steady_clock::time_point began{};
     std::chrono::steady_clock::time_point window_start{};
     uint32_t pings{0}, settings{0}, resets{0}, empty_data{0}, strays{0};
+    // RST_STREAMs a peer's frames have drawn from this side, held to resets_max like the peer's own.
+    uint32_t resets_out{0};
 };
 
 template <class S>
@@ -134,7 +136,7 @@ void tick_window(session<S>& s)
     if (now - s.window_start > std::chrono::seconds(10))
     {
         s.window_start = now;
-        s.pings = s.settings = s.resets = s.empty_data = s.strays = 0;
+        s.pings = s.settings = s.resets = s.empty_data = s.strays = s.resets_out = 0;
     }
 }
 

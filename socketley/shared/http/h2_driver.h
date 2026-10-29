@@ -298,13 +298,26 @@ void drain(session<S>& s, std::string& out, size_t unsent_now, size_t out_high, 
 // way, because the answer has to go somewhere.
 enum class event : uint8_t { stream_opened, stream_refused, reset_in, reset_out };
 
+// An RST_STREAM a peer's frame has drawn: past resets_max in a window the connection ends instead, since a peer that
+// never reads would otherwise grow the wire's queue by one reset per frame it sends.
+template <class S, class Host>
+void put_reset(session<S>& s, uint32_t sid, uint32_t code, Host& host)
+{
+    if (++s.resets_out > resets_max)
+    {
+        host.conn_error(ENHANCE_YOUR_CALM);
+        return;
+    }
+    put_rst(s.ctl, sid, code);
+    host.count(event::reset_out);
+}
+
 // A stream's own error ends it alone: the peer is told with an RST_STREAM, the stream is marked so none is sent
 // again, and the host lets go of whatever it kept for it.
 template <class S, class Host>
 void reset_stream(session<S>& s, uint32_t sid, uint32_t code, Host& host)
 {
-    put_rst(s.ctl, sid, code);
-    host.count(event::reset_out);
+    put_reset(s, sid, code, host);
     if (auto it = s.streams.find(sid); it != s.streams.end())
     {
         // The handle is copied out of the map first: stream_gone() is what ends the stream, and ending it erases
@@ -346,11 +359,7 @@ bool headers_in(session<S>& s, uint32_t sid, size_t max_head_bytes, Host& host)
     }
 
     s.last_sid = sid;
-    auto refuse = [&](uint32_t code)
-    {
-        put_rst(s.ctl, sid, code);
-        host.count(event::reset_out);
-    };
+    auto refuse = [&](uint32_t code) { put_reset(s, sid, code, host); };
     if (s.cont_refuse)
     {
         refuse(PROTOCOL_ERROR);

@@ -57,6 +57,9 @@ namespace
 
 // What waits in the connection's queue before more frames are put in it.
 constexpr size_t h2_out_high = 1024 * 1024;
+// What the wire may leave untaken before the session is given up: the DATA bound keeps an honest peer near
+// h2_out_high, so past this the queue is frames a peer that does not read keeps drawing.
+constexpr size_t h2_out_max = 4 * h2_out_high;
 
 // Streams a client may have open here at once, which is a memory bound and not a protocol one: each is a client
 // connection of its own, so eight of them cost eight structs and eight descriptors. Eight is already more in flight
@@ -430,7 +433,14 @@ void proxy_instance::h2_schedule(proxy_client_connection* conn)
         if (!out.empty())
         {
             conn->write_queue.emplace(std::move(out));
-            if (!conn->write_pending && !flush_client_write_queue(conn))
+            if (conn->write_queue.bytes() > h2_out_max)
+            {
+                // The rest would never be read, and shutting the socket ends the write in flight with it.
+                conn->write_queue.clear();
+                conn->closing = true;
+                ::shutdown(conn->fd, SHUT_RDWR);
+            }
+            else if (!conn->write_pending && !flush_client_write_queue(conn))
                 conn->closing = true;
         }
         // Whose last frame has gone: the stream's connection goes with it, which is also what frees its descriptor.
