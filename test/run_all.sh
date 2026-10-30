@@ -248,6 +248,7 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_storage_parsers) corpus=storageparsers ;;
         fuzz_dns)            corpus=dns ;;
         fuzz_db)             corpus=db ;;
+        fuzz_metrics_chunk)  corpus=metrics_chunk ;;
         fuzz_mqtt)           corpus=mqtt ;;
         fuzz_mail)           corpus=mail ;;
         fuzz_tunnel_mux)     corpus=tunnelmux ;;
