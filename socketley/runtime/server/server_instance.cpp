@@ -7205,7 +7205,9 @@ std::string server_instance::stats_lines() const
         size_t connected = 0;
         for (const auto& [_, uc] : m_upstreams)
             if (uc->established) ++connected;
-        out << "upstreams:" << connected << "/" << m_upstream_targets.size() << "\n";
+        out << "upstreams:" << connected << "/" << m_upstream_targets.size() << "\n"
+            << "upstreams_connected:" << connected << "\n"
+            << "upstreams_configured:" << m_upstream_targets.size() << "\n";
     }
     // The cross-runtime request queue and what it had to throw away, reported
     // here because a dropped auto-store batch is messages that are not in the

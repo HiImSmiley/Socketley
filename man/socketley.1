@@ -19888,6 +19888,106 @@ messages total, bytes in/out, and per-runtime breakdowns, among them
 (resident, a shared page counted once per shard) and
 .B socketley_runtime_memory_bytes
 (what the runtime costs the machine, a shared page counted by the share it holds).
+.PP
+Each running runtime adds the figures of its own
+.BR stats ,
+a family per figure named after its type and labelled
+.BR name :
+.BR socketley_server_ *,
+.BR socketley_client_ *,
+.BR socketley_proxy_ *
+(among them
+.BR _backends ,
+.BR _healthy_backends ,
+.B _backend_responses_total
+and
+.BR _backend_failures_total ),
+.BR socketley_cache_ *
+(among them
+.BR _keys ,
+.B _get_hits_total
+and
+.BR _get_misses_total ),
+.BR socketley_db_ *,
+.BR socketley_dns_ *
+(with
+.B socketley_dns_queries_total
+by
+.B transport
+and
+.B socketley_dns_responses_total
+by
+.BR rcode ),
+.BR socketley_idp_ *
+(among them
+.BR _sign_ins_barred_total ,
+sign-ins refused for too many failures),
+.BR socketley_mqtt_ *
+(messages by
+.BR qos ,
+drops by
+.BR reason ),
+.BR socketley_sync_ *
+(among them
+.BR _failing ),
+and the storage, mail and tunnel families under
+.B "STORAGE FLAGS"
+(Metrics);
+a tunnel edge adds
+.B socketley_tunnel_agents_joined
+and
+.BR socketley_tunnel_agents_connected ,
+the agents expected linked and those that are.
+Counters end in
+.BR _total .
+A figure no family names is
+.BI socketley_ type _stat
+with its name as the label
+.BR stat .
+.PP
+Beside them are the facts the daemon's alerts look at, each a series a rule can
+read:
+.B socketley_runtime_state
+(labels
+.BR name ,
+.BR type ,
+.BR state ;
+1 for the state a runtime is in, 0 for the other three),
+.B socketley_runtime_restarts_total
+(times a worker went down and was started again),
+.B socketley_cert_expiry_seconds
+(labels
+.BR name ,
+.BR path ;
+seconds until the certificate a runtime serves with ends, below 0 once it has,
+read every five minutes),
+.BR socketley_disk_free_ratio ,
+.B socketley_disk_free_bytes
+and
+.B socketley_disk_size_bytes
+(label
+.BR path ,
+the state directory's disk and each storage runtime's, each disk once),
+.BR socketley_host_memory_available_ratio ,
+.B _available_bytes
+and
+.BR _total_bytes ,
+.B socketley_runtime_quota_ratio
+(what a storage with
+.B \-\-max\-bytes
+or a cache with
+.B \-\-maxmemory
+and no eviction holds of its limit),
+.B socketley_mail_blocklisted
+(1 while a blocklist of its
+.B \-\-dnsbl
+names the address a mail runtime sends from) and
+.B socketley_git_mirror_failed
+(labels
+.BR name ,
+.BR repo ,
+.BR id ;
+1 when the last pull of a storage's git mirror failed, read every minute).
 .SH C++ SDK
 Socketley ships a three-tier modular C++ SDK in
 .BR include/linux/socketley/ .

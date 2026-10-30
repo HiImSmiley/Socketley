@@ -9748,6 +9748,7 @@ void proxy_instance::note_group_selected(std::string_view host, uint16_t port)
 
 void proxy_instance::note_backend_failure(proxy_client_connection* conn)
 {
+    ++m_backend_failures;
     if (conn->ex.backend_from_group)
         record_group_error(conn->ex.backend_host, conn->ex.backend_port);
     else
@@ -9756,6 +9757,7 @@ void proxy_instance::note_backend_failure(proxy_client_connection* conn)
 
 void proxy_instance::note_backend_success(proxy_client_connection* conn)
 {
+    ++m_backend_responses;
     if (conn->ex.backend_from_group)
         record_group_success(conn->ex.backend_host, conn->ex.backend_port);
     else
@@ -9954,6 +9956,8 @@ std::string proxy_instance::stats_lines() const
     }
 
     st::put(out, "peak_connections", m_peak_connections);
+    st::put(out, "backend_responses", m_backend_responses);
+    st::put(out, "backend_failures", m_backend_failures);
 
     size_t open_circuits = 0;
     for (const auto& cb : m_circuit_breakers)

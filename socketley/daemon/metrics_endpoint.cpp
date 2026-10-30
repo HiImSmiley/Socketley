@@ -16,6 +16,11 @@
 #include "../shared/util/proc_stat.h"
 #include "../shared/runtime/stats_text.h"
 #include "../shared/loop/eventfd_wake.h"
+#include "../shared/runtime/metric_catalog.h"
+#include "../shared/runtime/metric_text.h"
+#include "../shared/crypto/cert_keeper.h"
+#include "../shared/json/json_doc.h"
+#include "../runtime/storage/git_mirrors.h"
 
 #include <unistd.h>
 #include <cerrno>
@@ -36,9 +41,13 @@
 #include <sys/eventfd.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+
+namespace metric_catalog = socketley::metric_catalog;
 
 metrics_endpoint::metrics_endpoint(runtime_manager& mgr)
-    : m_manager(mgr)
+    : m_manager(mgr), m_facts(std::make_unique<fact_cache>())
 {
 }
 
@@ -395,25 +404,12 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
         dashboard::send(fd, 404, "text/plain; charset=utf-8", "Not Found\n");
 }
 
-// The same three characters as json_escape_into was before it was fixed, and
-// separate from it because Prometheus takes a raw tab in a label value and
-// rejects the \t that JSON now requires.
-static void label_escape_into(std::string& out, std::string_view s)
-{
-    for (char c : s)
-    {
-        if (c == '\\')      out += "\\\\";
-        else if (c == '"')  out += "\\\"";
-        else if (c == '\n') out += "\\n";
-        else                out += c;
-    }
-}
+using socketley::metric_text::label_escape_into;
+using socketley::metric_text::metric_head;
 
 static void json_append_uint(std::string& out, uint64_t v)
 {
-    char buf[24];
-    auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-    out.append(buf, end - buf);
+    socketley::metric_text::append_uint(out, v);
 }
 
 // CPU time and memory of a set of processes, read from /proc, as the shards of a runtime or the whole daemon.
@@ -563,65 +559,6 @@ static void append_usage_json(std::string& out, const process_usage& u)
     json_append_uint(out, u.processes);
 }
 
-// One storage runtime's `stats` text as figures: the lines are `key:value`, and
-// the ones that are not numbers are left out.
-struct storage_row
-{
-    std::string name;
-    std::vector<std::pair<std::string, uint64_t>> figures;
-
-    bool get(std::string_view key, uint64_t& out) const
-    {
-        for (const auto& [k, v] : figures)
-            if (k == key)
-            {
-                out = v;
-                return true;
-            }
-        return false;
-    }
-};
-
-static storage_row parse_storage_row(std::string_view name, std::string_view detail)
-{
-    storage_row row;
-    row.name = std::string(name);
-    socketley::stats_text::for_each_field(detail, [&](std::string_view key, std::string_view num) {
-        uint64_t v = 0;
-        const auto [end, ec] = std::from_chars(num.data(), num.data() + num.size(), v);
-        if (ec != std::errc{} || end != num.data() + num.size())
-            return;
-        // A sharded runtime's text is one section per shard, so a figure that
-        // comes again is the next shard's: added, except the ones every shard
-        // holds a whole copy of.
-        for (auto& [k, held] : row.figures)
-            if (k == key)
-            {
-                if (key != "buckets" && key != "max_bytes" && key != "tls" && key != "shard_index")
-                    held += v;
-                return;
-            }
-        row.figures.emplace_back(std::string(key), v);
-    });
-    return row;
-}
-
-// The series a storage runtime has that no other type does: what it holds, what
-// it was asked, what it moved and how it answered.
-// A family's two comment lines, the name said once for both.
-static void metric_head(std::string& out, std::string_view name, std::string_view type, std::string_view help)
-{
-    out += "# HELP ";
-    out += name;
-    out += ' ';
-    out += help;
-    out += "\n# TYPE ";
-    out += name;
-    out += ' ';
-    out += type;
-    out += '\n';
-}
-
 // A family of one unlabelled value, and the blank line after it.
 static void metric_scalar(std::string& out, std::string_view name, std::string_view type, std::string_view help,
                           uint64_t v)
@@ -633,286 +570,6 @@ static void metric_scalar(std::string& out, std::string_view name, std::string_v
     out += "\n\n";
 }
 
-static void append_storage_series(std::string& out, const std::vector<storage_row>& rows)
-{
-    if (rows.empty())
-        return;
-
-    // The figures a family of their own carries, which the catch-all at the end leaves out.
-    std::vector<std::string_view> named;
-    const auto family = [&](std::string_view metric, std::string_view type, std::string_view help,
-                            std::string_view key)
-    {
-        named.push_back(key);
-        out += '\n';
-        metric_head(out, metric, type, help);
-        for (const auto& r : rows)
-        {
-            uint64_t v;
-            if (!r.get(key, v))
-                continue;
-            out += metric;
-            out += "{name=\"";
-            label_escape_into(out, r.name);
-            out += "\"} ";
-            json_append_uint(out, v);
-            out += '\n';
-        }
-    };
-
-    family("socketley_storage_buckets", "gauge", "Buckets a storage runtime holds.", "buckets");
-    family("socketley_storage_objects", "gauge", "Objects a storage runtime holds.", "objects");
-    family("socketley_storage_bytes_stored", "gauge", "Object bytes a storage runtime holds.", "bytes");
-    family("socketley_storage_bytes_received_total", "counter",
-           "Bytes a storage runtime read from its clients, including protocol framing.", "bytes_in");
-    family("socketley_storage_bytes_sent_total", "counter",
-           "Bytes a storage runtime wrote to its clients, including protocol framing.", "bytes_out");
-    family("socketley_storage_zero_copy_bytes_total", "counter",
-           "Object bytes sent from file to socket without entering the process.", "zero_copy_bytes");
-    family("socketley_storage_tls_handshakes_total", "counter",
-           "TLS handshakes a storage runtime completed.", "tls_handshakes");
-    family("socketley_storage_tls_failures_total", "counter",
-           "TLS handshakes that failed or never finished.", "tls_failures");
-    family("socketley_storage_http2_connections_total", "counter",
-           "Connections a storage runtime served over HTTP/2.", "h2_conns");
-    family("socketley_storage_http2_streams_total", "counter",
-           "HTTP/2 streams a storage runtime opened, one per request.", "h2_streams");
-    family("socketley_storage_http2_refused_total", "counter",
-           "HTTP/2 streams refused for the limit on those open at once.", "h2_refused");
-    family("socketley_storage_http2_resets_received_total", "counter",
-           "HTTP/2 streams the client reset.", "h2_resets_in");
-    family("socketley_storage_http2_resets_sent_total", "counter",
-           "HTTP/2 streams a storage runtime reset.", "h2_resets_out");
-    family("socketley_storage_http2_goaways_total", "counter",
-           "HTTP/2 connections a storage runtime ended with GOAWAY.", "h2_goaways");
-    family("socketley_storage_http3_connections_total", "counter",
-           "QUIC connections a storage runtime served over HTTP/3.", "h3_conns");
-    family("socketley_storage_http3_open_connections", "gauge",
-           "QUIC connections a storage runtime has open now.", "h3_open");
-    family("socketley_storage_http3_streams_total", "counter",
-           "HTTP/3 streams a storage runtime opened, one per request.", "h3_streams");
-    family("socketley_storage_http3_retries_total", "counter",
-           "Retry packets a storage runtime sent to make new clients prove their address.", "h3_retries");
-    family("socketley_storage_http3_forwarded_total", "counter",
-           "QUIC packets a shard handed to the shard holding their connection, after a client moved.", "h3_forwarded");
-
-    // The subsystems a runtime runs beside its requests: what waits, what went, what failed.
-    static constexpr struct
-    {
-        const char* metric;
-        const char* type;
-        const char* help;
-        const char* key;
-    } subsystems[] = {
-        {"socketley_storage_notify_sent_total", "counter", "Event notifications delivered.", "notify_sent"},
-        {"socketley_storage_notify_failed_total", "counter", "Event notification attempts that failed.", "notify_failed"},
-        {"socketley_storage_notify_queued", "gauge", "Event notifications waiting to be delivered.", "notify_queued"},
-        {"socketley_storage_notify_dropped_total", "counter", "Event notifications dropped past the queue's bound.",
-         "notify_dropped"},
-        {"socketley_storage_replication_pending", "gauge", "Versions and delete markers waiting to be replicated.",
-         "replication_pending"},
-        {"socketley_storage_replication_completed_total", "counter", "Versions and delete markers a replication target took.",
-         "replication_completed"},
-        {"socketley_storage_replication_failed_total", "counter", "Versions a replication target refused for good.",
-         "replication_failed"},
-        {"socketley_storage_replication_retries_total", "counter", "Replication attempts tried again.", "replication_retries"},
-        {"socketley_storage_replication_bytes_total", "counter", "Body bytes replication targets took.", "replication_bytes"},
-        {"socketley_storage_cluster_pending", "gauge", "Changes waiting for another node of the cluster.", "cluster_pending"},
-        {"socketley_storage_cluster_sent_total", "counter", "Changes the other nodes of the cluster took.", "cluster_sent"},
-        {"socketley_storage_cluster_failed_total", "counter", "Changes the other nodes refused for good.", "cluster_failed"},
-        {"socketley_storage_cluster_received_total", "counter", "Bucket, IAM and share records other nodes sent.", "cluster_in"},
-        {"socketley_storage_cluster_seeding", "gauge", "Nodes this runtime has not yet sent everything it holds.",
-         "cluster_seeding"},
-        {"socketley_storage_cluster_overflows_total", "counter", "Queues for a node let go for a full resend.",
-         "cluster_overflows"},
-        {"socketley_storage_cluster_synced_total", "counter", "Writes answered once the nodes sync names had them.",
-         "cluster_synced"},
-        {"socketley_storage_cluster_sync_timeouts_total", "counter", "Writes answered when their wait for the nodes was over.",
-         "cluster_sync_timeouts"},
-        {"socketley_storage_scrub_objects_total", "counter", "Versions the scrub read back.", "scrub_objects"},
-        {"socketley_storage_scrub_bytes_total", "counter", "Bytes the scrub read back.", "scrub_bytes"},
-        {"socketley_storage_scrub_corrupt_total", "counter", "Copies the scrub found whose bytes are not their MD5's.",
-         "scrub_corrupt"},
-        {"socketley_storage_scrub_passes_total", "counter", "Whole passes of the scrub.", "scrub_passes"},
-        {"socketley_storage_scrub_heals_total", "counter", "Corrupt copies another node was asked to send again.",
-         "scrub_heals"},
-        {"socketley_storage_scrub_unhealed_total", "counter", "Corrupt copies no other node held whole.", "scrub_unhealed"},
-        {"socketley_storage_compressed_objects_total", "counter", "Versions compressed where they lie.",
-         "compressed_objects"},
-        {"socketley_storage_compressed_bytes_in_total", "counter", "Bytes of the versions compressed.",
-         "compressed_bytes_in"},
-        {"socketley_storage_compressed_bytes_out_total", "counter", "What the versions compressed take on disk.",
-         "compressed_bytes_out"},
-        {"socketley_storage_tier_moved_total", "counter", "Versions a lifecycle moved to a tier.", "tier_moved"},
-        {"socketley_storage_tier_moved_bytes_total", "counter", "Bytes of the versions moved to a tier.",
-         "tier_moved_bytes"},
-        {"socketley_storage_tier_failed_total", "counter", "Moves to a tier that did not finish.", "tier_failed"},
-        {"socketley_storage_tier_reads_total", "counter", "Windows read back from a tier for a client.", "tier_reads"},
-        {"socketley_storage_tier_read_failures_total", "counter", "Windows a tier did not give back.",
-         "tier_read_failures"},
-        {"socketley_storage_lifecycle_expired_total", "counter", "Objects and versions lifecycle rules removed.",
-         "lifecycle_expired"},
-        {"socketley_storage_lifecycle_aborted_total", "counter", "Uploads lifecycle rules aborted.", "lifecycle_aborted"},
-        {"socketley_storage_multipart_completed_total", "counter", "Multipart uploads completed.", "multipart_completed"},
-        {"socketley_storage_media_made_total", "counter", "Thumbnails and stream segments made.", "media_made"},
-        {"socketley_storage_media_failed_total", "counter", "Media that could not be made.", "media_failed"},
-        {"socketley_storage_fsyncs_total", "counter", "Syncs the store made for durability.", "fsyncs"},
-    };
-    for (const auto& f : subsystems)
-    {
-        // A family no runtime reports, as one of a build without the subsystem, has no lines to print.
-        if (std::none_of(rows.begin(), rows.end(), [&f](const storage_row& r) { uint64_t v; return r.get(f.key, v); }))
-            continue;
-        family(f.metric, f.type, f.help, f.key);
-    }
-
-    out += '\n';
-    metric_head(out, "socketley_storage_requests_total", "counter", "Requests a storage runtime served, by operation.");
-    static constexpr std::pair<const char*, const char*> ops[] = {
-        {"gets", "get"}, {"heads", "head"}, {"puts", "put"},
-        {"deletes", "delete"}, {"lists", "list"}, {"copies", "copy"},
-    };
-    for (const auto& [key, op] : ops)
-        named.push_back(key);
-    for (const auto& r : rows)
-        for (const auto& [key, op] : ops)
-        {
-            uint64_t v;
-            if (!r.get(key, v))
-                continue;
-            out += "socketley_storage_requests_total{name=\"";
-            label_escape_into(out, r.name);
-            out += "\",op=\"";
-            out += op;
-            out += "\"} ";
-            json_append_uint(out, v);
-            out += '\n';
-        }
-
-    // One line per code that has been answered, so a runtime that has never
-    // refused anything has no series to graph.
-    out += '\n';
-    metric_head(out, "socketley_storage_errors_total", "counter", "S3 errors a storage runtime answered, by code.");
-    for (const auto& r : rows)
-        for (const auto& [key, v] : r.figures)
-        {
-            if (key.compare(0, 6, "error_") != 0)
-                continue;
-            out += "socketley_storage_errors_total{name=\"";
-            label_escape_into(out, r.name);
-            out += "\",code=\"";
-            label_escape_into(out, std::string_view(key).substr(6));
-            out += "\"} ";
-            json_append_uint(out, v);
-            out += '\n';
-        }
-
-    // Every other figure of `stats`, by the name it has there, so nothing a runtime counts is missing from a scrape.
-    out += '\n';
-    metric_head(out, "socketley_storage_stat", "untyped", "A storage runtime's other stats figures, by name.");
-    for (const auto& r : rows)
-        for (const auto& [key, v] : r.figures)
-        {
-            if (key.starts_with("error_") || std::find(named.begin(), named.end(), key) != named.end())
-                continue;
-            out += "socketley_storage_stat{name=\"";
-            label_escape_into(out, r.name);
-            out += "\",stat=\"";
-            label_escape_into(out, key);
-            out += "\"} ";
-            json_append_uint(out, v);
-            out += '\n';
-        }
-}
-
-// A mail runtime's `stats` figures: what it took, delivered, deferred and bounced, what waits, and every other by name.
-// A tunnel's links and what went through them, each figure of its stats a family of its own.
-static void append_tunnel_series(std::string& out, const std::vector<storage_row>& rows)
-{
-    if (rows.empty())
-        return;
-    const auto family = [&](std::string_view metric, std::string_view type, std::string_view help, std::string_view key) {
-        out += '\n';
-        metric_head(out, metric, type, help);
-        for (const auto& r : rows)
-        {
-            uint64_t v = 0;
-            if (!r.get(key, v))
-                continue;
-            out += metric;
-            out += "{name=\"";
-            label_escape_into(out, r.name);
-            out += "\"} ";
-            json_append_uint(out, v);
-            out += '\n';
-        }
-    };
-    family("socketley_tunnel_links", "gauge", "Links a tunnel holds now: agents and people at an edge, the edge at an agent.",
-           "links");
-    family("socketley_tunnel_agents", "gauge", "Agents an edge knows, joined or invited.", "agents");
-    family("socketley_tunnel_streams_total", "counter", "Streams a tunnel opened for visitors and people.", "streams");
-    family("socketley_tunnel_refused_total", "counter", "Upgrades and streams a tunnel refused.", "refused");
-    family("socketley_tunnel_visitors_refused_total", "counter", "Requests a protected service's auth refused.",
-           "visitors_refused");
-    family("socketley_tunnel_bytes_in_total", "counter", "Bytes a tunnel read from its local connections and sent on.",
-           "bytes_in");
-    family("socketley_tunnel_bytes_out_total", "counter", "Bytes a tunnel received and wrote to its local connections.",
-           "bytes_out");
-    family("socketley_tunnel_shares", "gauge", "Ports people share at an edge now.", "shares");
-    family("socketley_tunnel_flows", "gauge", "UDP flows a tunnel carries now, a visitor each.", "flows");
-    family("socketley_tunnel_datagrams_total", "counter", "UDP datagrams a tunnel carried onto its link.", "datagrams");
-    family("socketley_tunnel_datagrams_dropped_total", "counter",
-           "UDP datagrams a tunnel dropped: no agent, a full link, too many flows, or cut.", "datagrams_dropped");
-}
-
-static void append_mail_series(std::string& out, const std::vector<storage_row>& rows)
-{
-    if (rows.empty())
-        return;
-    std::vector<std::string_view> named;
-    const auto family = [&](std::string_view metric, std::string_view type, std::string_view help, std::string_view key) {
-        named.push_back(key);
-        out += '\n';
-        metric_head(out, metric, type, help);
-        for (const auto& r : rows)
-        {
-            uint64_t v = 0;
-            if (!r.get(key, v))
-                continue;
-            out += metric;
-            out += "{name=\"";
-            label_escape_into(out, r.name);
-            out += "\"} ";
-            json_append_uint(out, v);
-            out += '\n';
-        }
-    };
-    family("socketley_mail_received_total", "counter", "Messages a mail runtime took.", "mail_received");
-    family("socketley_mail_delivered_total", "counter", "Recipients a mail runtime delivered to.", "mail_delivered");
-    family("socketley_mail_deferred_total", "counter", "Tries a mail runtime put off.", "mail_deferred");
-    family("socketley_mail_bounced_total", "counter", "Recipients a mail runtime failed for good.", "mail_bounced");
-    family("socketley_mail_stored_total", "counter", "Messages put into mailboxes.", "mail_stored");
-    family("socketley_mail_queued", "gauge", "Messages waiting in a mail runtime's queue.", "mail_queued");
-    family("socketley_mail_queued_bytes", "gauge", "Bytes waiting in a mail runtime's queue.", "mail_queued_bytes");
-    family("socketley_mail_quarantined_total", "counter", "Messages put into Junk.", "mail_quarantined");
-    family("socketley_mail_auth_failed_total", "counter", "Sign-ins a mail runtime refused.", "auth_failed");
-    out += '\n';
-    metric_head(out, "socketley_mail_stat", "untyped", "A mail runtime's other stats figures, by name.");
-    for (const auto& r : rows)
-        for (const auto& [key, v] : r.figures)
-        {
-            if (std::find(named.begin(), named.end(), key) != named.end())
-                continue;
-            out += "socketley_mail_stat{name=\"";
-            label_escape_into(out, r.name);
-            out += "\",stat=\"";
-            label_escape_into(out, key);
-            out += "\"} ";
-            json_append_uint(out, v);
-            out += '\n';
-        }
-}
-
 // One runtime as every view of the fleet reads it, taken under the manager's lock and written out after it.
 struct runtime_row
 {
@@ -922,25 +579,38 @@ struct runtime_row
     uint16_t port;
     // Published and not live, so nothing here walks a table the event loop rewrites.
     shard_stats::figures figures;
-    // What a storage's worker last published, whose counters are series of their own.
+    // What its worker last published, whose figures the catalog makes series of; /metrics alone reads it.
     std::string detail;
     std::vector<pid_t> pids;
+    // What the fact series read, /metrics alone again: restarts, the certificate served with, a storage's directory.
+    unsigned restarts{0};
+    std::string cert, dir;
 };
 
-static std::vector<runtime_row> runtime_rows(const runtime_manager& manager)
+// `full` for /metrics, which reads each runtime's published text and its configuration besides its figures.
+static std::vector<runtime_row> runtime_rows(const runtime_manager& manager, bool full = false)
 {
     std::shared_lock lock(manager.mutex);
     const auto& runtimes = manager.list();
     std::vector<runtime_row> rows;
     rows.reserve(runtimes.size());
     for (const auto& [name, rt] : runtimes)
+    {
         // The bound port, the one `ps` prints: an unset -p is the type's default.
-        rows.push_back({name, rt->get_type(), rt->get_state(), rt->effective_port(), rt->worker_figures(),
-                        rt->get_type() == runtime_storage || rt->get_type() == runtime_mail ||
-                                rt->get_type() == runtime_tunnel
-                            ? rt->stat_detail_snapshot()
-                            : std::string{},
-                        rt->shard_pids()});
+        runtime_row& r = rows.emplace_back(runtime_row{name, rt->get_type(), rt->get_state(), rt->effective_port(),
+                                                       rt->worker_figures(), {}, rt->shard_pids(), 0, {}, {}});
+        if (!full)
+            continue;
+        if (r.state == runtime_running)
+            r.detail = rt->stat_detail_snapshot();
+        r.restarts = rt->restart_count();
+        r.cert = dashboard::served_cert(*rt);
+        if (r.type == runtime_storage)
+        {
+            const auto held = rt->config_lock();
+            r.dir.assign(static_cast<const storage_instance*>(rt.get())->get_dir());
+        }
+    }
     return rows;
 }
 
@@ -961,9 +631,228 @@ static fleet_totals fleet_sum(const std::vector<runtime_row>& rows)
     return t;
 }
 
+// ─── Fact series: what the daemon's alerts look at, as series a rule can read ───
+
+namespace fact
+{
+
+using metric_catalog::family;
+using metric_catalog::kind;
+using metric_catalog::label;
+using metric_catalog::series;
+
+constexpr family state{"socketley_runtime_state", kind::gauge, "1 for the state a runtime is in, 0 for the other three."};
+constexpr family restarts{"socketley_runtime_restarts_total", kind::counter,
+                          "Times a runtime's worker went down and was started again."};
+constexpr family cert_expiry{"socketley_cert_expiry_seconds", kind::gauge,
+                             "Seconds until the certificate a runtime serves with ends, below 0 once it has."};
+constexpr family disk_ratio{"socketley_disk_free_ratio", kind::gauge,
+                            "The share of a disk under the state directory or a storage runtime still free."};
+constexpr family disk_free{"socketley_disk_free_bytes", kind::gauge, "Bytes of that disk still free."};
+constexpr family disk_size{"socketley_disk_size_bytes", kind::gauge, "Bytes that disk holds in all."};
+constexpr family mem_ratio{"socketley_host_memory_available_ratio", kind::gauge,
+                           "The share of the host's memory available, as MemAvailable over MemTotal."};
+constexpr family mem_avail{"socketley_host_memory_available_bytes", kind::gauge, "The host's MemAvailable."};
+constexpr family mem_total{"socketley_host_memory_total_bytes", kind::gauge, "The host's MemTotal."};
+constexpr family quota{"socketley_runtime_quota_ratio", kind::gauge,
+                       "What a runtime that refuses past its limit holds of it: a storage's --max-bytes, a cache's "
+                       "--max-memory without eviction."};
+constexpr family git_failed{"socketley_git_mirror_failed", kind::gauge,
+                            "1 when the last pull of a storage runtime's git mirror failed, 0 when it went through."};
+
+constexpr int64_t cert_every = 300;
+constexpr int64_t git_every = 60;
+
+}   // namespace fact
+
+struct metrics_endpoint::fact_cache
+{
+    // Each certificate's end in seconds since the epoch, INT64_MIN when it cannot be read, and when it was read.
+    std::unordered_map<std::string, std::pair<int64_t, int64_t>> certs;
+    // Each storage directory's mirrors: the runtime, the repository's name and id, and whether its last pull failed.
+    struct mirror
+    {
+        std::string runtime, repo, id;
+        bool failed;
+    };
+    std::vector<mirror> mirrors;
+    std::vector<std::string> mirror_dirs;
+    int64_t mirrors_at{INT64_MIN};
+    size_t last_size{0};
+};
+
+// MemTotal and MemAvailable in bytes, both 0 when /proc/meminfo cannot be read.
+static void host_memory(uint64_t& total, uint64_t& avail)
+{
+    total = avail = 0;
+    char buf[4096];
+    const int fd = ::open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    const ssize_t n = ::read(fd, buf, sizeof buf - 1);
+    ::close(fd);
+    if (n <= 0)
+        return;
+    buf[n] = '\0';
+    const auto kb = [&](const char* key) -> uint64_t {
+        const char* at = std::strstr(buf, key);
+        return at ? std::strtoull(at + std::strlen(key), nullptr, 10) * 1024 : 0;
+    };
+    total = kb("MemTotal:");
+    avail = kb("MemAvailable:");
+}
+
+static void append_facts(metrics_endpoint::fact_cache& cache, const std::string& state_dir,
+                         const std::vector<runtime_row>& rows, const std::vector<metric_catalog::figures>& figs,
+                         socketley::metric_text::writer& out)
+{
+    using fact::series;
+    using fact::label;
+    label ls[3];
+    for (const runtime_row& r : rows)
+    {
+        ls[0] = {"name", r.name};
+        ls[1] = {"type", type_to_string(r.type)};
+        for (const runtime_state s : {runtime_created, runtime_running, runtime_stopped, runtime_failed})
+        {
+            ls[2] = {"state", state_to_string(s)};
+            out(series::of(fact::state, std::span<const label>(ls, 3), uint64_t{r.state == s}));
+        }
+    }
+    for (const runtime_row& r : rows)
+    {
+        ls[0] = {"name", r.name};
+        out(series::of(fact::restarts, std::span<const label>(ls, 1), uint64_t{r.restarts}));
+    }
+
+    // Each certificate read when first named and every five minutes after, what is left counted down between.
+    const int64_t now = socketley::wall::now_sec();
+    std::erase_if(cache.certs, [&](const auto& kv) {
+        return std::none_of(rows.begin(), rows.end(), [&](const runtime_row& r) { return r.cert == kv.first; });
+    });
+    for (const runtime_row& r : rows)
+    {
+        if (r.cert.empty())
+            continue;
+        auto it = cache.certs.find(r.cert);
+        if (it == cache.certs.end() || now - it->second.second >= fact::cert_every)
+        {
+            cert_keeper::cert_facts c;
+            const bool ok = cert_keeper::read_cert(r.cert, c) && c.expiry_known;
+            it = cache.certs.insert_or_assign(r.cert, std::make_pair(ok ? now + c.expires_in : INT64_MIN, now)).first;
+        }
+        if (it->second.first == INT64_MIN)
+            continue;
+        ls[0] = {"name", r.name};
+        ls[1] = {"path", r.cert};
+        out(series::of(fact::cert_expiry, std::span<const label>(ls, 2), static_cast<double>(it->second.first - now)));
+    }
+
+    // The disks under the state directory and the storage runtimes, each disk once, by the first directory on it.
+    struct disk
+    {
+        std::string_view path;
+        uint64_t free, size;
+    };
+    std::vector<disk> disks;
+    std::vector<dev_t> devs;
+    const auto look = [&](std::string_view dir) {
+        struct statvfs v{};
+        struct stat st{};
+        const std::string d(dir);
+        if (d.empty() || ::statvfs(d.c_str(), &v) != 0 || v.f_blocks == 0 || ::stat(d.c_str(), &st) != 0 ||
+            std::find(devs.begin(), devs.end(), st.st_dev) != devs.end())
+            return;
+        devs.push_back(st.st_dev);
+        disks.push_back({dir, static_cast<uint64_t>(v.f_bavail) * v.f_frsize, static_cast<uint64_t>(v.f_blocks) * v.f_frsize});
+    };
+    look(state_dir);
+    for (const runtime_row& r : rows)
+        look(r.dir);
+    for (const disk& d : disks)
+    {
+        ls[0] = {"path", d.path};
+        out(series::of(fact::disk_ratio, std::span<const label>(ls, 1), static_cast<double>(d.free) / static_cast<double>(d.size)));
+    }
+    for (const disk& d : disks)
+    {
+        ls[0] = {"path", d.path};
+        out(series::of(fact::disk_free, std::span<const label>(ls, 1), d.free));
+    }
+    for (const disk& d : disks)
+    {
+        ls[0] = {"path", d.path};
+        out(series::of(fact::disk_size, std::span<const label>(ls, 1), d.size));
+    }
+
+    uint64_t total = 0, avail = 0;
+    host_memory(total, avail);
+    if (total > 0)
+    {
+        out(series::of(fact::mem_ratio, {}, static_cast<double>(avail) / static_cast<double>(total)));
+        out(series::of(fact::mem_avail, {}, avail));
+        out(series::of(fact::mem_total, {}, total));
+    }
+
+    // What a runtime holds against its limit, from the figures its series came from; a cache that evicts is full by
+    // design, so only one that refuses is said.
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        uint64_t used = 0, limit = 0, ev = 1;
+        if (rows[i].type == runtime_storage)
+        {
+            if (!figs[i].get("bytes", used) || !figs[i].get("max_bytes", limit))
+                continue;
+        }
+        else if (rows[i].type != runtime_cache || !figs[i].get("eviction", ev) || ev != 0 ||
+                 !figs[i].get("memory_used", used) || !figs[i].get("max_memory", limit))
+            continue;
+        if (limit == 0)
+            continue;
+        ls[0] = {"name", rows[i].name};
+        ls[1] = {"type", type_to_string(rows[i].type)};
+        out(series::of(fact::quota, std::span<const label>(ls, 2), static_cast<double>(used) / static_cast<double>(limit)));
+    }
+
+    // Git mirrors, read every minute and when a storage runtime comes or goes.
+    std::vector<std::string> dirs;
+    for (const runtime_row& r : rows)
+        if (!r.dir.empty())
+            dirs.push_back(r.dir);
+    if (now - cache.mirrors_at >= fact::git_every || dirs != cache.mirror_dirs)
+    {
+        cache.mirrors.clear();
+        for (const runtime_row& r : rows)
+        {
+            if (r.dir.empty())
+                continue;
+            socketley::storage::git_mirrors g;
+            g.open(r.dir, 1, {}, false, {});
+            for (const auto& repo : g.repos())
+            {
+                socketley::json::jvalue st;
+                if (!socketley::json::json_reader(g.state_json(repo.id)).document(st))
+                    continue;
+                const auto* ok = member(st, "ok");
+                if (ok && ok->k == socketley::json::jvalue::kind::boolean)
+                    cache.mirrors.push_back({r.name, repo.name, repo.id, !ok->b});
+            }
+        }
+        cache.mirror_dirs = std::move(dirs);
+        cache.mirrors_at = now;
+    }
+    for (const auto& m : cache.mirrors)
+    {
+        ls[0] = {"name", m.runtime};
+        ls[1] = {"repo", m.repo};
+        ls[2] = {"id", m.id};
+        out(series::of(fact::git_failed, std::span<const label>(ls, 3), uint64_t{m.failed}));
+    }
+}
+
 std::string metrics_endpoint::build_metrics() const
 {
-    const std::vector<runtime_row> snapshots = runtime_rows(m_manager);
+    std::vector<runtime_row> snapshots = runtime_rows(m_manager, true);
     const fleet_totals totals = fleet_sum(snapshots);
     const uint64_t total_connections = totals.sum.total_connections, total_messages = totals.sum.total_messages,
                    total_bytes_in = totals.sum.bytes_in, total_bytes_out = totals.sum.bytes_out,
@@ -971,7 +860,8 @@ std::string metrics_endpoint::build_metrics() const
     const uint64_t total_count = snapshots.size();
 
     std::string out;
-    out.reserve(2048 + snapshots.size() * 256);
+    // The last render's size, since a catalog series is about sixty bytes and a storage runtime has a hundred.
+    out.reserve(std::max<size_t>(m_facts->last_size, 2048 + snapshots.size() * 256));
 
     // Prometheus exposition format
     //
@@ -1116,31 +1006,26 @@ std::string metrics_endpoint::build_metrics() const
     }
     out += "\n";
 
-    std::vector<storage_row> storage_rows;
-    for (const auto& s : snapshots)
-        if (s.type == runtime_storage && s.state == runtime_running && !s.detail.empty())
-        {
-            storage_row row = parse_storage_row(s.name, s.detail);
-            // The byte counts are the shared table's, summed as the other
-            // runtimes' are, and not part of the published text.
-            row.figures.insert(row.figures.begin(),
-                               {{"bytes_in", s.figures.bytes_in}, {"bytes_out", s.figures.bytes_out}});
-            storage_rows.push_back(std::move(row));
-        }
-    append_storage_series(out, storage_rows);
-
-    std::vector<storage_row> mail_rows;
-    for (const auto& s : snapshots)
-        if (s.type == runtime_mail && s.state == runtime_running && !s.detail.empty())
-            mail_rows.push_back(parse_storage_row(s.name, s.detail));
-    append_mail_series(out, mail_rows);
-
-    std::vector<storage_row> tunnel_rows;
-    for (const auto& s : snapshots)
-        if (s.type == runtime_tunnel && s.state == runtime_running && !s.detail.empty())
-            tunnel_rows.push_back(parse_storage_row(s.name, s.detail));
-    append_tunnel_series(out, tunnel_rows);
-
+    // Each running runtime's own figures, read once, then written type by type through the catalog.
+    std::vector<metric_catalog::figures> figs(snapshots.size());
+    for (size_t i = 0; i < snapshots.size(); ++i)
+        if (runtime_row& s = snapshots[i]; s.state == runtime_running && !s.detail.empty())
+            figs[i].parse(s.type, std::move(s.detail), s.figures.bytes_in, s.figures.bytes_out);
+    socketley::metric_text::writer w(out);
+    std::vector<metric_catalog::source> sources;
+    sources.reserve(snapshots.size());
+    for (const metric_catalog::type_entry& e : metric_catalog::types())
+    {
+        sources.clear();
+        for (size_t i = 0; i < snapshots.size(); ++i)
+            if (snapshots[i].type == e.type && !figs[i].empty())
+                sources.push_back({snapshots[i].name, &figs[i]});
+        if (!sources.empty())
+            metric_catalog::emit(e, sources, w);
+    }
+    append_facts(*m_facts, m_state_dir, snapshots, figs, w);
+    w.finish();
+    m_facts->last_size = out.size();
     return out;
 }
 
@@ -1213,8 +1098,11 @@ void metrics_endpoint::sample()
             a.cert = dashboard::served_cert(*rt);
             // What it holds against its limit, from the same text the figures come from; a cache that evicts is
             // full by design, so only one that refuses is watched.
-            const std::string detail = rt->stat_detail_snapshot();
-            const storage_row row = parse_storage_row(name, detail);
+            std::string detail = rt->stat_detail_snapshot();
+            if (rt->get_type() == runtime_sync && rt->get_state() == runtime_running)
+                a.error = socketley::stats_text::field(detail, "last_error");
+            metric_catalog::figures row;
+            row.parse(rt->get_type(), std::move(detail));
             if (rt->get_type() == runtime_storage)
             {
                 {
@@ -1228,7 +1116,6 @@ void metrics_endpoint::sample()
             else if (rt->get_type() == runtime_sync && rt->get_state() == runtime_running)
             {
                 row.get("failing", a.failing);
-                a.error = socketley::stats_text::field(detail, "last_error");
             }
             else if (rt->get_type() == runtime_mail && rt->get_state() == runtime_running)
             {

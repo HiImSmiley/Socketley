@@ -36,6 +36,9 @@ public:
     bool start(uint16_t port, options o = {});
     void stop();
 
+    // What the fact series read slowly, kept from one render to the next.
+    struct fact_cache;
+
 private:
     void serve_loop();
     void serve(int fd, const dashboard::request& req, bool via);
@@ -63,6 +66,7 @@ private:
     std::thread m_thread;
     std::chrono::steady_clock::time_point m_start_time{};
 
+    std::unique_ptr<fact_cache> m_facts;
     mutable std::string m_cached_metrics;
     mutable std::string m_cached_json_overview;
     mutable std::string m_cached_json_runtimes;

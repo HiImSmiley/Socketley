@@ -1268,6 +1268,9 @@ private:
     size_t m_parked_count{0};
     // Loop turns seen, so a socket parked this turn can be told apart.
     uint64_t m_turn{0};
+    // What the circuit breakers were told, counted for `stats`: whole answers and failures of the backends.
+    uint64_t m_backend_responses{0};
+    uint64_t m_backend_failures{0};
 
     socketley::fd_table<proxy_conn_entry> m_conn_idx{MAX_FDS};
     backend_info m_scratch_backend{};

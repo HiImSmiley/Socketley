@@ -696,8 +696,15 @@ std::string tunnel_run::stats() const
         });
     if (m_up)
         links += m_up->srv.empty() ? 0 : 1;
+    // The agents expected linked and those that are, so an alert can say one is gone.
+    const size_t joined = static_cast<size_t>(std::count_if(m_agents.begin(), m_agents.end(),
+                                                            [](const agent& a) { return a.joined; }));
+    size_t connected = 0;
+    for (const auto& [who, weak] : m_agent_links)
+        connected += !who.starts_with("share:") && !weak.expired();
     return std::string("mode:") + (m_edge ? "edge" : "agent") + "\nlinks:" + std::to_string(links) +
-           "\nagents:" + std::to_string(m_agents.size()) + "\nlinks_made:" + std::to_string(m_c.links) +
+           "\nagents:" + std::to_string(m_agents.size()) + "\nagents_joined:" + std::to_string(joined) +
+           "\nagents_connected:" + std::to_string(connected) + "\nlinks_made:" + std::to_string(m_c.links) +
            "\nstreams:" + std::to_string(m_c.streams) + "\nrefused:" + std::to_string(m_c.refused) +
            "\njoined:" + std::to_string(m_c.joined) + "\nvisitors_refused:" + std::to_string(m_c.visitors_refused) +
            "\nshares:" + std::to_string(m_shares.size()) + "\nshared:" + std::to_string(m_c.shared) +
