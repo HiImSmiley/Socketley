@@ -106,15 +106,15 @@ echo '-- fine' > "$T/s.lua"
 echo 'this is not lua (' > "$T/s.lua"
 "$BIN" stop broke >/dev/null 2>&1
 "$BIN" start broke >/dev/null 2>&1
-for _ in $(seq 1 60); do listen 1 | grep -q '^socketley/alerts/failed:broke 1 ' && break; sleep 0.5; done
-a=$(listen 1 | grep '^socketley/alerts/failed:broke 1 ' | cut -d' ' -f3-)
+for _ in $(seq 1 60); do listen 1 | grep -qE '^socketley/alerts/RuntimeFailed:[^ ]*:broke:[^ ]* 1 ' && break; sleep 0.5; done
+a=$(listen 1 | grep -E '^socketley/alerts/RuntimeFailed:[^ ]*:broke:[^ ]* 1 ' | cut -d' ' -f3-)
 expect "an alert is kept on socketley/alerts/<id>, as its JSON" \
-    "$(echo "$a" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["id"], d["level"], d["title"])' 2>&1)" \
-    "failed:broke critical broke failed"
+    "$(echo "$a" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["id"].split(":")[0], d["runtime"], d["level"], d["title"])' 2>&1)" \
+    "RuntimeFailed broke critical broke failed"
 echo '-- fine' > "$T/s.lua"
 "$BIN" start broke >/dev/null 2>&1
-for _ in $(seq 1 60); do listen 1 | grep -q '^socketley/alerts/failed:broke ' || break; sleep 0.5; done
-expect "and cleared from it once the runtime runs again" "$(listen 1 | grep -c '^socketley/alerts/failed:broke ')" 0
+for _ in $(seq 1 120); do listen 1 | grep -qE '^socketley/alerts/RuntimeFailed:[^ ]*:broke:' || break; sleep 0.5; done
+expect "and cleared from it once the runtime runs again" "$(listen 1 | grep -cE '^socketley/alerts/RuntimeFailed:[^ ]*:broke:')" 0
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

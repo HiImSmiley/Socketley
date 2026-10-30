@@ -5,6 +5,7 @@
 #include "../shared/runtime/runtime_manager.h"
 #include "../shared/runtime/runtime_instance.h"
 #include "../shared/util/logging.h"
+#include "../shared/util/log_ring.h"
 #include "../shared/util/version.h"
 #include "../shared/runtime/runtime_definitions.h"
 #include "../shared/ipc/daemon_client.h"
@@ -21,10 +22,15 @@
 #include "../shared/crypto/cert_keeper.h"
 #include "../shared/json/json_doc.h"
 #include "../runtime/storage/git_mirrors.h"
+#include "../runtime/metrics/metrics_instance.h"
+#include "../shared/http/https_client.h"
+#include "../shared/ipc/ipc_framing.h"
+#include "ipc_client.h"
 
 #include <unistd.h>
 #include <cerrno>
 #include <cstddef>
+#include <cmath>
 #include <cstring>
 #include <charconv>
 #include <cstdlib>
@@ -61,11 +67,11 @@ bool metrics_endpoint::start(uint16_t port, options o)
     m_dash = std::make_unique<dashboard::server>(std::move(o.dashboard_credentials), std::move(o.dashboard_idp),
                                                  m_manager);
     m_state_dir = o.state_dir;
-    m_history = std::make_unique<history::keeper>(o.state_dir.empty() ? std::string() : o.state_dir + "/.history");
-    m_alerts = std::make_unique<alerts::monitor>(o.state_dir.empty() ? std::string() : o.state_dir + "/.alerts",
-                                                 std::move(o.alert_webhook), std::move(o.alert_send),
-                                                 std::move(o.alert_event));
-    m_history->load(socketley::wall::now_sec());
+    m_webhook = std::move(o.alert_webhook);
+    // What the daemon kept before a metrics runtime held its history and its alerts.
+    if (!m_state_dir.empty())
+        for (const char* f : {"/.history", "/.alerts"})
+            if (::unlink((m_state_dir + f).c_str()) < 0) {}
     // SOCK_CLOEXEC because the daemon forks proxy workers, and with
     // SO_REUSEADDR but not SO_REUSEPORT an inherited copy keeps the metrics
     // port bound after the daemon is gone.
@@ -128,8 +134,6 @@ bool metrics_endpoint::start(uint16_t port, options o)
 
     m_running.store(true, std::memory_order_release);
     m_start_time = std::chrono::steady_clock::now();
-    m_next_sample = m_start_time;
-    m_next_save = m_start_time + std::chrono::minutes(5);
     m_thread = std::thread(&metrics_endpoint::serve_loop, this);
     return true;
 }
@@ -146,8 +150,6 @@ void metrics_endpoint::stop()
 
     if (was && m_thread.joinable())
         m_thread.join();
-    if (was && m_history)
-        m_history->save();
 
     // Raw close — see serve_loop() for why none of this file's descriptors is
     // the event loop's to hold.
@@ -192,6 +194,156 @@ static bool host_is_loopback(const char* req)
            (ntohl(a.s_addr) >> 24) == 127;
 }
 
+// ─── The page's history and alerts, which a metrics runtime keeps ──────────
+
+// The metrics runtime the page reads: a running one that takes this daemon's own series, `metrics` before any other.
+static std::string dashboard_store(const runtime_manager& manager)
+{
+    std::shared_lock lock(manager.mutex);
+    std::string best;
+    for (const auto& [name, rt] : manager.list())
+    {
+        if (rt->get_type() != runtime_metrics || rt->get_state() != runtime_running)
+            continue;
+        bool local = false;
+        {
+            const auto held = rt->config_lock();
+            local = static_cast<const metrics_instance*>(rt.get())->get_local();
+        }
+        if (local && (best.empty() || name == "metrics"))
+            best = name;
+    }
+    return best;
+}
+
+// A `metrics` command asked of this daemon as the CLI asks it; its JSON, empty when it did not answer.
+static std::string ask_store(const std::string& store, std::initializer_list<std::string_view> args)
+{
+    std::string command = "metrics";
+    ipc_frame::append_arg((command += ' ', command), store);
+    for (const std::string_view a : args)
+        ipc_frame::append_arg((command += ' ', command), a);
+    std::string out;
+    return ipc_send(command, out) == 0 ? out : std::string();
+}
+
+std::string metrics_endpoint::history_json(std::string_view runtime, int64_t range, size_t points) const
+{
+    const std::string store = dashboard_store(m_manager);
+    if (store.empty())
+        return {};
+    range = std::clamp<int64_t>(range, 60, 366ll * 86400);
+    points = std::clamp<size_t>(points, 10, 1440);
+    const int64_t step = std::max<int64_t>(1, (range + static_cast<int64_t>(points) - 1) / static_cast<int64_t>(points));
+    const int64_t now = socketley::wall::now_sec();
+    const int64_t from = now - step * static_cast<int64_t>(points);
+    std::string sel;
+    if (!runtime.empty())
+    {
+        sel = "{name=\"";
+        for (const char c : runtime)
+            sel += c == '"' || c == '\\' ? std::string("\\") + c : std::string(1, c);
+        sel += "\"}";
+    }
+    // A rate over at least three samples of the default 10 s, and over the whole step once that is longer.
+    const std::string w = "[" + std::to_string(std::max<int64_t>(step, 30)) + "s]";
+    const auto part = [&](std::string_view key, const std::string& expr) {
+        return "label_replace(" + expr + ",\"k\",\"" + std::string(key) + "\",\"\",\"\")";
+    };
+    const std::string q = part("conn", "sum(socketley_runtime_connections" + sel + ")") + " or " +
+                          part("msg", "sum(rate(socketley_runtime_messages_total" + sel + w + "))") + " or " +
+                          part("in", "sum(rate(socketley_runtime_bytes_received_total" + sel + w + "))") + " or " +
+                          part("out", "sum(rate(socketley_runtime_bytes_sent_total" + sel + w + "))") + " or " +
+                          part("cpu", "100 * sum(rate(socketley_runtime_cpu_seconds_total" + sel + w + "))") + " or " +
+                          part("rss", "sum(socketley_runtime_memory_bytes" + sel + ")");
+    const std::string reply = ask_store(store, {"query_range", q, "--start", std::to_string(from + step), "--end",
+                                                std::to_string(now), "--step", std::to_string(step), "--json"});
+    socketley::json::jvalue doc;
+    if (reply.empty() || !socketley::json::json_reader(reply).document(doc))
+        return {};
+    const socketley::json::jvalue* data = socketley::json::member(doc, "data");
+    const socketley::json::jvalue* result = data ? socketley::json::member(*data, "result") : nullptr;
+    static constexpr std::string_view keys[6] = {"conn", "msg", "in", "out", "cpu", "rss"};
+    std::vector<std::string> col[6];
+    for (auto& c : col)
+        c.assign(points, "null");
+    // A runtime the store has no series of has no history, as one never seen had none.
+    if (!result || result->items.empty())
+        return {};
+    if (result)
+        for (const auto& series : result->items)
+        {
+            const socketley::json::jvalue* metric = socketley::json::member(series, "metric");
+            const socketley::json::jvalue* k = metric ? socketley::json::member(*metric, "k") : nullptr;
+            const socketley::json::jvalue* values = socketley::json::member(series, "values");
+            const auto at = k ? std::find(std::begin(keys), std::end(keys), k->s) : std::end(keys);
+            if (at == std::end(keys) || !values)
+                continue;
+            auto& c = col[at - std::begin(keys)];
+            for (const auto& v : values->items)
+            {
+                if (v.items.size() != 2)
+                    continue;
+                const int64_t t = std::strtoll(v.items[0].s.c_str(), nullptr, 10);
+                const int64_t i = (t - from) / step - 1;
+                if (i >= 0 && i < static_cast<int64_t>(points) && v.items[1].s != "NaN")
+                    c[static_cast<size_t>(i)] = v.items[1].s;
+            }
+        }
+    std::string j = "{\"from\":" + std::to_string(from) + ",\"step\":" + std::to_string(step);
+    for (size_t k = 0; k < 6; ++k)
+    {
+        j += ",\"";
+        j += keys[k];
+        j += "\":[";
+        for (size_t i = 0; i < points; ++i)
+            j += (i ? "," : "") + col[k][i];
+        j += ']';
+    }
+    return j + "}";
+}
+
+std::string metrics_endpoint::alerts_json() const
+{
+    const std::string store = dashboard_store(m_manager);
+    std::string reply = store.empty() ? std::string() : ask_store(store, {"alerts", "--recent", "--json"});
+    while (!reply.empty() && (reply.back() == '\n' || reply.back() == ' '))
+        reply.pop_back();
+    if (reply.size() < 2 || reply.front() != '{' || reply.back() != '}')
+        reply = "{\"active\":[],\"recent\":[]}";
+    reply.pop_back();
+    reply += ",\"webhook\":";
+    reply += m_webhook.empty() ? "false" : "true";
+    reply += ",\"store\":";
+    reply += socketley::json::quote(store);
+    return reply + "}";
+}
+
+// A message posted to the alerts' webhook to show it is reached; empty when it was, else why not.
+static std::string test_webhook(const std::string& webhook)
+{
+    if (webhook.empty())
+        return "No webhook is set: daemon.alert_webhook in the daemon's configuration.";
+    char host[256] = {};
+    if (::gethostname(host, sizeof host - 1) < 0)
+        host[0] = '\0';
+    const std::string h = host;
+    const std::string text = "\xf0\x9f\x94\x94 " + (h.empty() ? std::string() : h + ": ") +
+                             "socketley's alerts reach this hook.";
+    https_client::client c;
+    https_client::reply r;
+    std::string err;
+    if (!c.init(err, {}, "socketley-alerts") ||
+        !c.request("POST", webhook, "application/json",
+                   "{\"content\":" + socketley::json::quote(text) + ",\"text\":" + socketley::json::quote(text) +
+                       ",\"state\":\"test\",\"host\":" + socketley::json::quote(h) + "}",
+                   r, err, 10))
+        return err;
+    if (r.status < 200 || r.status >= 300)
+        return "The hook answered " + std::to_string(r.status) + (r.body.empty() ? "" : ": " + r.body.substr(0, 200));
+    return {};
+}
+
 void metrics_endpoint::serve_loop()
 {
     // Connections whose request is still arriving, read side by side so a peer that trickles holds only its own.
@@ -213,19 +365,7 @@ void metrics_endpoint::serve_loop()
     std::vector<struct pollfd> fds;
     while (m_running.load(std::memory_order_acquire))
     {
-        // Woken for the next point of the history too, which this thread takes between requests.
-        auto now = std::chrono::steady_clock::now();
-        if (now >= m_next_sample)
-        {
-            sample();
-            m_next_sample = std::max(m_next_sample + std::chrono::seconds(history::step), now + std::chrono::seconds(1));
-            if (now >= m_next_save)
-            {
-                m_history->save();
-                m_next_save = now + std::chrono::minutes(5);
-            }
-        }
-        now = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
         for (size_t i = waiting.size(); i-- > 0;)
             if (now >= waiting[i].deadline)
                 drop(i);
@@ -235,15 +375,16 @@ void metrics_endpoint::serve_loop()
         fds.clear();
         fds.push_back({ m_listen_fd, POLLIN, 0 });
         fds.push_back({ m_wake_fd,   POLLIN, 0 });
-        auto until = m_next_sample;
+        // Nothing to do between requests, so with none arriving the thread sleeps until one comes.
+        int timeout = -1;
         for (const pending& w : waiting)
         {
             fds.push_back({ w.fd, POLLIN, 0 });
-            until = std::min(until, w.deadline);
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(w.deadline - now).count();
+            timeout = static_cast<int>(std::clamp<int64_t>(timeout < 0 ? left : std::min<int64_t>(timeout, left), 0,
+                                                           60'000));
         }
-        const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(until - now);
-        int ready = poll(fds.data(), static_cast<nfds_t>(fds.size()),
-                         static_cast<int>(std::clamp<int64_t>(wait.count(), 0, history::step * 1000)));
+        int ready = poll(fds.data(), static_cast<nfds_t>(fds.size()), timeout);
         if (ready < 0)
         {
             if (errno == EINTR)
@@ -362,8 +503,7 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
             dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
             return;
         }
-        const int64_t now = socketley::wall::now_sec();
-        const std::string body = m_history->query(dashboard::query_field(req.query, "runtime"), now,
+        const std::string body = history_json(dashboard::query_field(req.query, "runtime"),
             std::strtoll(dashboard::query_field(req.query, "range").c_str(), nullptr, 10),
             std::strtoul(dashboard::query_field(req.query, "points").c_str(), nullptr, 10));
         dashboard::send(fd, 200, "application/json", body.empty() ? std::string("{}") : body);
@@ -374,10 +514,10 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
         if (!m_dash->may_read(req) || (path != "/api/alerts" && m_dash->session_of(req).empty()))
             dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
         else if (path == "/api/alerts")
-            dashboard::send(fd, 200, "application/json", m_alerts->json());
+            dashboard::send(fd, 200, "application/json", alerts_json());
         else if (req.method != "POST" || req.header("x-socketley-dashboard") != "1")
             dashboard::send(fd, 403, "text/plain; charset=utf-8", "A test comes from the dashboard's own page.\n");
-        else if (const std::string why = m_alerts->test(); why.empty())
+        else if (const std::string why = test_webhook(m_webhook); why.empty())
             dashboard::send(fd, 204, {}, {});
         else
             dashboard::send(fd, 502, "text/plain; charset=utf-8", why + "\n");
@@ -403,9 +543,6 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
     if (!m_dash->handle(fd, req))
         dashboard::send(fd, 404, "text/plain; charset=utf-8", "Not Found\n");
 }
-
-using socketley::metric_text::label_escape_into;
-using socketley::metric_text::metric_head;
 
 static void json_append_uint(std::string& out, uint64_t v)
 {
@@ -559,17 +696,6 @@ static void append_usage_json(std::string& out, const process_usage& u)
     json_append_uint(out, u.processes);
 }
 
-// A family of one unlabelled value, and the blank line after it.
-static void metric_scalar(std::string& out, std::string_view name, std::string_view type, std::string_view help,
-                          uint64_t v)
-{
-    metric_head(out, name, type, help);
-    out += name;
-    out += ' ';
-    json_append_uint(out, v);
-    out += "\n\n";
-}
-
 // One runtime as every view of the fleet reads it, taken under the manager's lock and written out after it.
 struct runtime_row
 {
@@ -588,6 +714,24 @@ struct runtime_row
 };
 
 // `full` for /metrics, which reads each runtime's published text and its configuration besides its figures.
+// The rows' processes' memory read again, at most once a second, for a page that asks for it.
+static void refresh_pss_of(const std::vector<runtime_row>& rows)
+{
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point last{};
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(1))
+            return;
+        last = now;
+    }
+    std::vector<pid_t> every{::getpid()};
+    for (const runtime_row& r : rows)
+        every.insert(every.end(), r.pids.begin(), r.pids.end());
+    refresh_pss(every);
+}
+
 static std::vector<runtime_row> runtime_rows(const runtime_manager& manager, bool full = false)
 {
     std::shared_lock lock(manager.mutex);
@@ -658,28 +802,29 @@ constexpr family quota{"socketley_runtime_quota_ratio", kind::gauge,
                        "What a runtime that refuses past its limit holds of it: a storage's --max-bytes, a cache's "
                        "--max-memory without eviction."};
 constexpr family git_failed{"socketley_git_mirror_failed", kind::gauge,
-                            "1 when the last pull of a storage runtime's git mirror failed, 0 when it went through."};
+                            "1 when the last pull of a storage runtime's git mirror failed, 0 when it went through; "
+                            "a failed one's error is its label."};
+constexpr family failure{"socketley_runtime_failure", kind::gauge,
+                         "1 for a runtime that failed, its last warning or error line as reason."};
+
+// A label's value of one line and at most 300 bytes, cut on a character's first byte.
+std::string one_line(std::string_view text)
+{
+    std::string v(text.substr(0, text.find('\n')));
+    if (v.size() > 300)
+    {
+        size_t at = 300;
+        while (at > 0 && (static_cast<unsigned char>(v[at]) & 0xC0) == 0x80)
+            --at;
+        v.resize(at);
+    }
+    return v;
+}
 
 constexpr int64_t cert_every = 300;
 constexpr int64_t git_every = 60;
 
 }   // namespace fact
-
-struct metrics_endpoint::fact_cache
-{
-    // Each certificate's end in seconds since the epoch, INT64_MIN when it cannot be read, and when it was read.
-    std::unordered_map<std::string, std::pair<int64_t, int64_t>> certs;
-    // Each storage directory's mirrors: the runtime, the repository's name and id, and whether its last pull failed.
-    struct mirror
-    {
-        std::string runtime, repo, id;
-        bool failed;
-    };
-    std::vector<mirror> mirrors;
-    std::vector<std::string> mirror_dirs;
-    int64_t mirrors_at{INT64_MIN};
-    size_t last_size{0};
-};
 
 // MemTotal and MemAvailable in bytes, both 0 when /proc/meminfo cannot be read.
 static void host_memory(uint64_t& total, uint64_t& avail)
@@ -704,7 +849,7 @@ static void host_memory(uint64_t& total, uint64_t& avail)
 
 static void append_facts(metrics_endpoint::fact_cache& cache, const std::string& state_dir,
                          const std::vector<runtime_row>& rows, const std::vector<metric_catalog::figures>& figs,
-                         socketley::metric_text::writer& out)
+                         metric_catalog::sink_ref out)
 {
     using fact::series;
     using fact::label;
@@ -718,6 +863,22 @@ static void append_facts(metrics_endpoint::fact_cache& cache, const std::string&
             ls[2] = {"state", state_to_string(s)};
             out(series::of(fact::state, std::span<const label>(ls, 3), uint64_t{r.state == s}));
         }
+    }
+    for (const runtime_row& r : rows)
+    {
+        if (r.state != runtime_failed)
+            continue;
+        // The newest line of it at warn or above that is not an alert's own, which says why it failed.
+        uint64_t next = 0;
+        std::string why;
+        for (const auto& l : log_ring::since(0, 20, r.name, "warn", next))
+            if (l.text.find(": alert: ") == std::string::npos && l.text.find("] alert: ") == std::string::npos)
+                why = l.text;
+        const std::string reason = fact::one_line(why);
+        ls[0] = {"name", r.name};
+        ls[1] = {"type", type_to_string(r.type)};
+        ls[2] = {"reason", reason};
+        out(series::of(fact::failure, std::span<const label>(ls, reason.empty() ? 2 : 3), uint64_t{1}));
     }
     for (const runtime_row& r : rows)
     {
@@ -834,8 +995,10 @@ static void append_facts(metrics_endpoint::fact_cache& cache, const std::string&
                 if (!socketley::json::json_reader(g.state_json(repo.id)).document(st))
                     continue;
                 const auto* ok = member(st, "ok");
+                const auto* err = member(st, "error");
                 if (ok && ok->k == socketley::json::jvalue::kind::boolean)
-                    cache.mirrors.push_back({r.name, repo.name, repo.id, !ok->b});
+                    cache.mirrors.push_back({r.name, repo.name, repo.id, !ok->b,
+                                             !ok->b && err ? fact::one_line(err->s) : std::string()});
             }
         }
         cache.mirror_dirs = std::move(dirs);
@@ -843,175 +1006,165 @@ static void append_facts(metrics_endpoint::fact_cache& cache, const std::string&
     }
     for (const auto& m : cache.mirrors)
     {
-        ls[0] = {"name", m.runtime};
-        ls[1] = {"repo", m.repo};
-        ls[2] = {"id", m.id};
-        out(series::of(fact::git_failed, std::span<const label>(ls, 3), uint64_t{m.failed}));
+        const label gl[4] = {{"name", m.runtime}, {"repo", m.repo}, {"id", m.id}, {"error", m.error}};
+        // Without an error label when it went through, so its series is the same pull after pull.
+        out(series::of(fact::git_failed, std::span<const label>(gl, m.error.empty() ? 3 : 4), uint64_t{m.failed}));
     }
 }
 
-std::string metrics_endpoint::build_metrics() const
+// ─── The walk /metrics and the local feed share ─────────────────────────────
+
+namespace top
 {
-    std::vector<runtime_row> snapshots = runtime_rows(m_manager, true);
+
+using metric_catalog::family;
+using metric_catalog::kind;
+
+constexpr family daemon_info{"socketley_daemon_info", kind::gauge, "The daemon these numbers come from."};
+constexpr family runtimes_total{"socketley_runtimes_total", kind::gauge, "Total number of runtimes."};
+constexpr family runtimes_running{"socketley_runtimes_running", kind::gauge, "Number of running runtimes."};
+constexpr family connections_total{"socketley_connections_total", kind::counter, "Total connections accepted."};
+constexpr family connections_active{"socketley_connections_active", kind::gauge, "Current active connections."};
+constexpr family messages_total{"socketley_messages_total", kind::counter, "Total messages processed."};
+constexpr family bytes_received{"socketley_bytes_received_total", kind::counter, "Total bytes received."};
+constexpr family bytes_sent{"socketley_bytes_sent_total", kind::counter, "Total bytes sent."};
+constexpr family lo_info{"socketley_fast_lo_info", kind::gauge,
+                         "The loopback shortcut's mode: off, own, all, trust, or unavailable."};
+constexpr family lo_sockets{"socketley_fast_lo_sockets", kind::gauge,
+                            "Sockets entered in the shortcut, by how they send now (as of the last sweep)."};
+constexpr family lo_entered{"socketley_fast_lo_entered_total", kind::counter, "Sockets entered in the shortcut."};
+constexpr family lo_tainted{"socketley_fast_lo_tainted_total", kind::counter, "Sockets pinned to TCP for good, by reason."};
+constexpr family lo_held{"socketley_fast_lo_held_bytes", kind::gauge,
+                         "Unread bytes redirected into receivers, summed across pairs."};
+constexpr family lo_budget{"socketley_fast_lo_budget_bytes", kind::gauge, "The global bound on held bytes."};
+constexpr family lo_pair{"socketley_fast_lo_pair_limit_bytes", kind::gauge, "The per-pair bound on held bytes."};
+constexpr family lo_over{"socketley_fast_lo_over_budget", kind::gauge,
+                         "1 while held bytes are at the global budget and new sends are tainted."};
+constexpr family rt_connections{"socketley_runtime_connections", kind::gauge, "Active connections per runtime."};
+constexpr family rt_messages{"socketley_runtime_messages_total", kind::counter, "Total messages per runtime."};
+constexpr family rt_bytes_in{"socketley_runtime_bytes_received_total", kind::counter, "Bytes a runtime received."};
+constexpr family rt_bytes_out{"socketley_runtime_bytes_sent_total", kind::counter, "Bytes a runtime sent."};
+constexpr family rt_cpu{"socketley_runtime_cpu_seconds_total", kind::counter,
+                        "CPU time of a runtime's processes, user and system."};
+constexpr family rt_rss{"socketley_runtime_resident_memory_bytes", kind::gauge,
+                        "Resident memory of a runtime's processes, a page shared between shards counted once per shard."};
+constexpr family rt_memory{"socketley_runtime_memory_bytes", kind::gauge,
+                           "What a runtime costs the machine: a page it shares counted by the share it holds of it, so "
+                           "the sum over the runtimes is the memory they hold between them."};
+
+}   // namespace top
+
+void metrics_endpoint::walk_series(const runtime_manager& manager, fact_cache& cache, const std::string& state_dir,
+                                   bool refresh_memory, metric_catalog::sink_ref out)
+{
+    using metric_catalog::label;
+    using metric_catalog::series;
+    std::vector<runtime_row> snapshots = runtime_rows(manager, true);
+    if (refresh_memory)
+    {
+        std::vector<pid_t> every;
+        for (const runtime_row& r : snapshots)
+            every.insert(every.end(), r.pids.begin(), r.pids.end());
+        refresh_pss(every);
+    }
     const fleet_totals totals = fleet_sum(snapshots);
-    const uint64_t total_connections = totals.sum.total_connections, total_messages = totals.sum.total_messages,
-                   total_bytes_in = totals.sum.bytes_in, total_bytes_out = totals.sum.bytes_out,
-                   active_connections = totals.sum.active_connections, running_count = totals.running;
-    const uint64_t total_count = snapshots.size();
 
-    std::string out;
-    // The last render's size, since a catalog series is about sixty bytes and a storage runtime has a hundred.
-    out.reserve(std::max<size_t>(m_facts->last_size, 2048 + snapshots.size() * 256));
-
-    // Prometheus exposition format
-    //
-    // Which daemon answered, first: several may serve one machine and every
-    // series below is identically named on each of them.  The scrape target
-    // distinguishes them only for whoever configured the scrape.
+    // Which daemon answered, first: several may serve one machine and every series below is identically named on each
+    // of them, which the scrape target tells apart only for whoever configured the scrape.
     std::string exe;
     uint64_t dev = 0, ino = 0;
     if (!socketley::self_exe_identity(exe, dev, ino))
         exe.clear();
+    char pid[24];
+    const auto pid_end = std::to_chars(pid, pid + sizeof pid, static_cast<uint64_t>(::getpid())).ptr;
+    const label info[] = {{"version", SOCKETLEY_VERSION},
+                          {"pid", std::string_view(pid, static_cast<size_t>(pid_end - pid))},
+                          {"socket", daemon_handler::socket_path},
+                          {"exe", exe}};
+    out(series::of(top::daemon_info, info, uint64_t{1}));
 
-    metric_head(out, "socketley_daemon_info", "gauge", "The daemon these numbers come from.");
-    out += "socketley_daemon_info{version=\"";
-    label_escape_into(out, SOCKETLEY_VERSION);
-    out += "\",pid=\"";
-    json_append_uint(out, static_cast<uint64_t>(::getpid()));
-    out += "\",socket=\"";
-    label_escape_into(out, daemon_handler::socket_path);
-    out += "\",exe=\"";
-    label_escape_into(out, exe);
-    out += "\"} 1\n\n";
-
-    metric_scalar(out, "socketley_runtimes_total", "gauge", "Total number of runtimes.", total_count);
-    metric_scalar(out, "socketley_runtimes_running", "gauge", "Number of running runtimes.", running_count);
-    metric_scalar(out, "socketley_connections_total", "counter", "Total connections accepted.", total_connections);
-    metric_scalar(out, "socketley_connections_active", "gauge", "Current active connections.", active_connections);
-    metric_scalar(out, "socketley_messages_total", "counter", "Total messages processed.", total_messages);
-    metric_scalar(out, "socketley_bytes_received_total", "counter", "Total bytes received.", total_bytes_in);
-    metric_scalar(out, "socketley_bytes_sent_total", "counter", "Total bytes sent.", total_bytes_out);
+    out(series::of(top::runtimes_total, {}, uint64_t{snapshots.size()}));
+    out(series::of(top::runtimes_running, {}, totals.running));
+    out(series::of(top::connections_total, {}, totals.sum.total_connections));
+    out(series::of(top::connections_active, {}, totals.sum.active_connections));
+    out(series::of(top::messages_total, {}, totals.sum.total_messages));
+    out(series::of(top::bytes_received, {}, totals.sum.bytes_in));
+    out(series::of(top::bytes_sent, {}, totals.sum.bytes_out));
 
     // The loopback shortcut, whose bytes no counter on lo sees.
     const socketley::fast_lo_figures lo = socketley::fast_lo_now();
-    metric_head(out, "socketley_fast_lo_info", "gauge",
-                "The loopback shortcut's mode: off, own, all, trust, or unavailable.");
-    out += "socketley_fast_lo_info{mode=\"";
-    label_escape_into(out, lo.mode);
-    out += "\"} 1\n\n";
+    label ls[2];
+    ls[0] = {"mode", lo.mode};
+    out(series::of(top::lo_info, std::span<const label>(ls, 1), uint64_t{1}));
     if (lo.mode != "off" && lo.mode != "unavailable")
     {
-        auto series = [&out](const char* name, const char* type, const char* help,
-                             std::initializer_list<std::pair<const char*, uint64_t>> vals) {
-            metric_head(out, name, type, help);
-            for (const auto& [labels, v] : vals)
-            {
-                out += name; out += labels; out += ' ';
-                json_append_uint(out, v);
-                out += '\n';
-            }
-            out += '\n';
+        const auto one = [&](const metric_catalog::family& f, std::string_view name, std::string_view value,
+                             uint64_t v) {
+            ls[0] = {name, value};
+            out(series::of(f, std::span<const label>(ls, name.empty() ? 0 : 1), v));
         };
-        series("socketley_fast_lo_sockets", "gauge",
-               "Sockets entered in the shortcut, by how they send now (as of the last sweep).",
-               { { "{path=\"shortcut\"}", lo.sockets_shortcut }, { "{path=\"tcp\"}", lo.sockets_tcp } });
-        series("socketley_fast_lo_entered_total", "counter", "Sockets entered in the shortcut.",
-               { { "", lo.entered } });
-        series("socketley_fast_lo_tainted_total", "counter",
-               "Sockets pinned to TCP for good, by reason.",
-               { { "{reason=\"bound\"}", lo.tainted_bound },
-                 { "{reason=\"unanswered\"}", lo.tainted_unanswered },
-                 { "{reason=\"budget\"}", lo.tainted_budget },
-                 { "{reason=\"peer_off\"}", lo.tainted_peer_off } });
-        series("socketley_fast_lo_held_bytes", "gauge",
-               "Unread bytes redirected into receivers, summed across pairs.", { { "", lo.held_bytes } });
-        series("socketley_fast_lo_budget_bytes", "gauge", "The global bound on held bytes.",
-               { { "", lo.budget_bytes } });
-        series("socketley_fast_lo_pair_limit_bytes", "gauge", "The per-pair bound on held bytes.",
-               { { "", lo.pair_bytes } });
-        series("socketley_fast_lo_over_budget", "gauge",
-               "1 while held bytes are at the global budget and new sends are tainted.",
-               { { "", lo.over_budget ? 1u : 0u } });
+        one(top::lo_sockets, "path", "shortcut", lo.sockets_shortcut);
+        one(top::lo_sockets, "path", "tcp", lo.sockets_tcp);
+        one(top::lo_entered, {}, {}, lo.entered);
+        one(top::lo_tainted, "reason", "bound", lo.tainted_bound);
+        one(top::lo_tainted, "reason", "unanswered", lo.tainted_unanswered);
+        one(top::lo_tainted, "reason", "budget", lo.tainted_budget);
+        one(top::lo_tainted, "reason", "peer_off", lo.tainted_peer_off);
+        one(top::lo_held, {}, {}, lo.held_bytes);
+        one(top::lo_budget, {}, {}, lo.budget_bytes);
+        one(top::lo_pair, {}, {}, lo.pair_bytes);
+        one(top::lo_over, {}, {}, lo.over_budget ? 1u : 0u);
     }
 
-    // Per-runtime metrics
-    metric_head(out, "socketley_runtime_connections", "gauge", "Active connections per runtime.");
+    // Per runtime, the registry naming the type, since a registered type has no enumerator to name.
     for (const auto& s : snapshots)
     {
         if (s.state != runtime_running)
             continue;
-
-        // The registry, not a switch over the four built-ins: a registered
-        // type has no enumerator to name and was scraped as "unknown".
-        const char* type_str = type_to_string(s.type);
-
-        out += "socketley_runtime_connections{name=\"";
-        label_escape_into(out, s.name);
-        out += "\",type=\"";
-        label_escape_into(out, type_str);
-        out += "\"} ";
-        json_append_uint(out, s.figures.active_connections);
-        out += "\n";
+        ls[0] = {"name", s.name};
+        ls[1] = {"type", type_to_string(s.type)};
+        out(series::of(top::rt_connections, std::span<const label>(ls, 2), s.figures.active_connections));
     }
-    out += "\n";
-
-    metric_head(out, "socketley_runtime_messages_total", "counter", "Total messages per runtime.");
     for (const auto& s : snapshots)
     {
-        out += "socketley_runtime_messages_total{name=\"";
-        label_escape_into(out, s.name);
-        out += "\"} ";
-        json_append_uint(out, s.figures.total_messages);
-        out += "\n";
+        ls[0] = {"name", s.name};
+        out(series::of(top::rt_messages, std::span<const label>(ls, 1), s.figures.total_messages));
     }
-
-    out += '\n';
-    metric_head(out, "socketley_runtime_cpu_seconds_total", "counter",
-                "CPU time of a runtime's processes, user and system.");
+    for (const auto& s : snapshots)
+    {
+        ls[0] = {"name", s.name};
+        out(series::of(top::rt_bytes_in, std::span<const label>(ls, 1), s.figures.bytes_in));
+    }
+    for (const auto& s : snapshots)
+    {
+        ls[0] = {"name", s.name};
+        out(series::of(top::rt_bytes_out, std::span<const label>(ls, 1), s.figures.bytes_out));
+    }
     std::vector<process_usage> usages;
     usages.reserve(snapshots.size());
     for (const auto& s : snapshots)
     {
         usages.push_back(usage_of(s.pids));
-        char buf[48];
-        std::snprintf(buf, sizeof buf, "%.2f", usages.back().cpu_seconds);
-        out += "socketley_runtime_cpu_seconds_total{name=\"";
-        label_escape_into(out, s.name);
-        out += "\"} ";
-        out += buf;
-        out += "\n";
+        ls[0] = {"name", s.name};
+        // To the hundredth, the clock tick /proc counts in.
+        out(series::of(top::rt_cpu, std::span<const label>(ls, 1), std::round(usages.back().cpu_seconds * 100) / 100));
     }
-    out += '\n';
-    metric_head(out, "socketley_runtime_resident_memory_bytes", "gauge",
-                "Resident memory of a runtime's processes, a page shared between shards counted once per shard.");
     for (size_t i = 0; i < snapshots.size(); ++i)
     {
-        out += "socketley_runtime_resident_memory_bytes{name=\"";
-        label_escape_into(out, snapshots[i].name);
-        out += "\"} ";
-        json_append_uint(out, usages[i].rss_bytes);
-        out += "\n";
+        ls[0] = {"name", snapshots[i].name};
+        out(series::of(top::rt_rss, std::span<const label>(ls, 1), usages[i].rss_bytes));
     }
-    out += '\n';
-    metric_head(out, "socketley_runtime_memory_bytes", "gauge",
-                "What a runtime costs the machine: a page it shares counted by the share it holds of it, so the sum "
-                "over the runtimes is the memory they hold between them.");
     for (size_t i = 0; i < snapshots.size(); ++i)
     {
-        out += "socketley_runtime_memory_bytes{name=\"";
-        label_escape_into(out, snapshots[i].name);
-        out += "\"} ";
-        json_append_uint(out, usages[i].memory_bytes);
-        out += "\n";
+        ls[0] = {"name", snapshots[i].name};
+        out(series::of(top::rt_memory, std::span<const label>(ls, 1), usages[i].memory_bytes));
     }
-    out += "\n";
 
     // Each running runtime's own figures, read once, then written type by type through the catalog.
     std::vector<metric_catalog::figures> figs(snapshots.size());
     for (size_t i = 0; i < snapshots.size(); ++i)
         if (runtime_row& s = snapshots[i]; s.state == runtime_running && !s.detail.empty())
             figs[i].parse(s.type, std::move(s.detail), s.figures.bytes_in, s.figures.bytes_out);
-    socketley::metric_text::writer w(out);
     std::vector<metric_catalog::source> sources;
     sources.reserve(snapshots.size());
     for (const metric_catalog::type_entry& e : metric_catalog::types())
@@ -1021,10 +1174,23 @@ std::string metrics_endpoint::build_metrics() const
             if (snapshots[i].type == e.type && !figs[i].empty())
                 sources.push_back({snapshots[i].name, &figs[i]});
         if (!sources.empty())
-            metric_catalog::emit(e, sources, w);
+            metric_catalog::emit(e, sources, out);
     }
-    append_facts(*m_facts, m_state_dir, snapshots, figs, w);
-    w.finish();
+    append_facts(cache, state_dir, snapshots, figs, out);
+}
+
+std::string metrics_endpoint::build_metrics() const
+{
+    std::string out;
+    // The last render's size, since a catalog series is about sixty bytes and a storage runtime has a hundred.
+    out.reserve(std::max<size_t>(m_facts->last_size, 4096));
+    {
+        socketley::metric_text::writer w(out);
+        // Memory read again at each render, at most one a second, since no sample of the daemon's reads it between;
+        // a process whose resident pages did not move keeps its Pss without a walk.
+        walk_series(m_manager, *m_facts, m_state_dir, true, w);
+        w.finish();
+    }
     m_facts->last_size = out.size();
     return out;
 }
@@ -1032,6 +1198,7 @@ std::string metrics_endpoint::build_metrics() const
 std::string metrics_endpoint::build_json_overview() const
 {
     const std::vector<runtime_row> rows = runtime_rows(m_manager);
+    refresh_pss_of(rows);
     const fleet_totals totals = fleet_sum(rows);
     const uint64_t total_connections = totals.sum.total_connections, total_messages = totals.sum.total_messages,
                    total_bytes_in = totals.sum.bytes_in, total_bytes_out = totals.sum.bytes_out,
@@ -1070,95 +1237,6 @@ std::string metrics_endpoint::build_json_overview() const
     return j;
 }
 
-void metrics_endpoint::sample()
-{
-    std::vector<std::pair<std::string, history::reading>> readings;
-    std::vector<std::vector<pid_t>> pids;
-    std::vector<alerts::facts> facts;
-    {
-        std::shared_lock lock(m_manager.mutex);
-        const auto& runtimes = m_manager.list();
-        readings.reserve(runtimes.size() + 1);
-        for (const auto& [name, rt] : runtimes)
-        {
-            const shard_stats::figures f = rt->worker_figures();
-            history::reading r;
-            r.connections = f.active_connections;
-            r.messages = f.total_messages;
-            r.bytes_in = f.bytes_in;
-            r.bytes_out = f.bytes_out;
-            readings.emplace_back(name, r);
-            pids.push_back(rt->shard_pids());
-
-            alerts::facts a;
-            a.name = name;
-            a.type = type_to_string(rt->get_type());
-            a.failed = rt->get_state() == runtime_failed;
-            a.restarts = rt->restart_count();
-            a.cert = dashboard::served_cert(*rt);
-            // What it holds against its limit, from the same text the figures come from; a cache that evicts is
-            // full by design, so only one that refuses is watched.
-            std::string detail = rt->stat_detail_snapshot();
-            if (rt->get_type() == runtime_sync && rt->get_state() == runtime_running)
-                a.error = socketley::stats_text::field(detail, "last_error");
-            metric_catalog::figures row;
-            row.parse(rt->get_type(), std::move(detail));
-            if (rt->get_type() == runtime_storage)
-            {
-                {
-                    const auto held = rt->config_lock();
-                    a.dir.assign(static_cast<const storage_instance*>(rt.get())->get_dir());
-                }
-                row.get("bytes", a.used);
-                row.get("max_bytes", a.limit);
-            }
-            // Only a running sync owes anything: a stopped one keeps the figures it stopped with.
-            else if (rt->get_type() == runtime_sync && rt->get_state() == runtime_running)
-            {
-                row.get("failing", a.failing);
-            }
-            else if (rt->get_type() == runtime_mail && rt->get_state() == runtime_running)
-            {
-                row.get("mail_queued", a.queued);
-                row.get("mail_self_listed", a.listed);
-            }
-            else if (uint64_t ev = 1; rt->get_type() == runtime_cache && row.get("eviction", ev) && ev == 0)
-            {
-                row.get("memory_used", a.used);
-                row.get("max_memory", a.limit);
-            }
-            facts.push_back(std::move(a));
-        }
-    }
-    // The daemon's own is the sum of its runtimes', its own process added to theirs.
-    history::reading all;
-    std::vector<pid_t> every{::getpid()};
-    for (const auto& p : pids)
-        every.insert(every.end(), p.begin(), p.end());
-    refresh_pss(every);
-    const process_usage own = usage_of({::getpid()});
-    all.cpu_seconds = own.cpu_seconds;
-    all.rss_bytes = own.memory_bytes;
-    for (size_t i = 0; i < readings.size(); ++i)
-    {
-        const process_usage u = usage_of(pids[i]);
-        history::reading& r = readings[i].second;
-        r.cpu_seconds = u.cpu_seconds;
-        // The chart plots what the runtime costs the machine, which is also what its tile says.
-        r.rss_bytes = u.memory_bytes;
-        all.connections += r.connections;
-        all.messages += r.messages;
-        all.bytes_in += r.bytes_in;
-        all.bytes_out += r.bytes_out;
-        all.cpu_seconds += u.cpu_seconds;
-        all.rss_bytes += u.memory_bytes;
-    }
-    readings.emplace_back(std::string(), all);
-    const int64_t now_ms = socketley::wall::now_ms();
-    m_history->record(now_ms, readings);
-    m_alerts->check(now_ms / 1000, facts, m_state_dir.empty() ? std::vector<std::string>{} : std::vector<std::string>{m_state_dir});
-}
-
 // One runtime as /api/runtimes and /api/runtime/<name> both write it, left open for what the second adds.
 static void append_runtime_row(std::string& j, std::string_view name, runtime_type type, runtime_state state,
                                uint16_t port, const shard_stats::figures& f, const std::vector<pid_t>& pids)
@@ -1187,6 +1265,7 @@ static void append_runtime_row(std::string& j, std::string_view name, runtime_ty
 std::string metrics_endpoint::build_json_runtimes() const
 {
     const std::vector<runtime_row> snapshots = runtime_rows(m_manager);
+    refresh_pss_of(snapshots);
 
     std::string j;
     j.reserve(snapshots.size() * 256);

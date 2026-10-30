@@ -1602,6 +1602,46 @@ project "fuzz_metrics_query"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the metrics runtime's rules file, its templates and one evaluation over a small store ───
+
+project "fuzz_metrics_rules"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz", "test/unit" }
+
+    files {
+        "test/fuzz/fuzz_metrics_rules.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/metrics/metrics_rules.cpp",
+        "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
+        "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
+        "socketley/runtime/metrics/metrics_text.cpp"
+    }
+
+    fuzz_target_settings()
+
+-- ─── Fuzz: the metrics runtime's remote-write codec, Snappy and the WriteRequest protobuf ───
+
+project "fuzz_metrics_remote"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_metrics_remote.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/metrics/metrics_remote.cpp"
+    }
+
+    fuzz_target_settings()
+
+
 -- ─── Fuzz: the storage runtime's parsers of whole inputs ───
 --
 -- An LZ4 block and a compressed body's table, a SelectObjectContent request and its records, an ACL and grant headers,
@@ -3372,6 +3412,109 @@ project "test_metrics_query"
             "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
             "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
             "socketley/runtime/metrics/metrics_text.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+
+-- The metrics runtime's recording and alerting rules over a real store in a temporary directory.
+project "test_metrics_rules"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley",
+        "test/unit"
+    }
+
+    files { "test/unit/test_metrics_rules.cpp", "socketley/runtime/metrics/metrics_rules.cpp",
+            "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
+            "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
+            "socketley/runtime/metrics/metrics_text.cpp", "socketley/runtime/metrics/metrics_store.cpp",
+            "socketley/runtime/metrics/metrics_chunk.cpp", "socketley/runtime/metrics/metrics_index.cpp",
+            "socketley/runtime/metrics/metrics_block.cpp", "socketley/shared/util/crc.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- The metrics runtime's remote-write codec: Snappy blocks and WriteRequests.
+project "test_metrics_remote"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_metrics_remote.cpp", "socketley/runtime/metrics/metrics_remote.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- The runtimes' latency histogram, its bucket bounds, and the catalog's histogram families.
+project "test_latency_histogram"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_latency_histogram.cpp", "socketley/shared/runtime/metric_catalog.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

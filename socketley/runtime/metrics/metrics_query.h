@@ -66,6 +66,24 @@ struct query_stats
 
 struct expr_node;
 
+// A query parsed once, for a caller that evaluates it again and again, as a rule does.
+class prepared_query
+{
+public:
+    prepared_query();
+    ~prepared_query();
+    prepared_query(prepared_query&&) noexcept;
+    prepared_query& operator=(prepared_query&&) noexcept;
+
+    bool empty() const { return !m_expr; }
+    // Whether it answers an instant vector or a scalar, which is all a range query and a rule take.
+    bool is_instant_value() const;
+
+private:
+    friend class query_engine;
+    std::unique_ptr<expr_node> m_expr;
+};
+
 class query_engine
 {
 public:
@@ -82,6 +100,11 @@ public:
 
     // Whether a query parses, with Prometheus's error where it does not.
     bool check(std::string_view query, query_error& err) const;
+
+    // The query parsed into `out`, false with Prometheus's error where it does not parse.
+    bool prepare(std::string_view query, prepared_query& out, query_error& err) const;
+    // A prepared query at `t_ms`, as eval_instant() of its text answers.
+    bool eval_instant(const prepared_query& query, int64_t t_ms, query_result& out, query_error& err);
 
     const query_stats& last_stats() const { return m_stats; }
     query_limits& limits() { return m_limits; }

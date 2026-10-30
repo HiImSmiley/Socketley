@@ -1329,6 +1329,25 @@ socketley db\-query shop customers '{"where":{"country":"de"},"limit":50}'
 .fi
 .RE
 .TP
+.BI "metrics " "metrics " "query \fIpromql\fR [\fB\-\-at \fItime\fR] | query_range \fIpromql\fR [\fB\-\-start\fR] [\fB\-\-end\fR] [\fB\-\-step\fR] | series \fIselector\fR | targets | rules | alerts [\fB\-\-recent\fR] | stats [\fB\-\-json\fR]"
+What a metrics runtime holds, asked as Grafana asks its Prometheus API: a
+PromQL query at a time or over a range, the series a selector names, the
+targets it scrapes with their health, its rules, the alerts pending and firing
+(with
+.B \-\-recent
+also the notifications of late, as the dashboard reads them), and its store's
+figures. A line a series or a target by default,
+.B \-\-json
+the API's answer; see
+.BR "METRICS FLAGS" .
+.RS
+.PP
+.nf
+socketley metrics metrics query 'sum by (name) (rate(socketley_runtime_messages_total[5m]))'
+socketley metrics metrics query_range 'up' \-\-start \-6h \-\-step 5m
+.fi
+.RE
+.TP
 .BI "mqtt\-pub " "mqtt " "\fR[\fB\-\-qos \fR0|1|2] [\fB\-\-retain\fR] \fItopic\fR [\fIpayload\fR]"
 A message published on an mqtt runtime as its own, at the QoS and retained when
 asked: the payload is the words after the topic, or stdin when there are none,
@@ -4910,7 +4929,7 @@ Set at
 changes it on a stopped proxy.
 .IP
 .nf
-socketley create proxy metrics \-p 9191 \-\-bind 127.0.0.1 \\
+socketley create proxy stats \-p 9191 \-\-bind 127.0.0.1 \\
     \-\-backend 127.0.0.1:9190 \-\-domain metrics \\
     \-\-auth basic:/etc/socketley/storage\-ui.creds \-s
 .fi
@@ -14474,6 +14493,304 @@ signs in as) when none is named.
 A tunnel takes no
 .BR \-\-shards :
 each agent's link is held by one process.
+.SH METRICS FLAGS
+A
+.B metrics
+runtime keeps what socketley and the machines around it measure, years of it,
+and answers for it with PromQL over the Prometheus HTTP API, so Grafana reads it
+as it reads a Prometheus. This daemon's own series reach it without a line of
+text: at each tick it asks the daemon for what changed since the last, the same
+series
+.B /metrics
+writes, with
+.B job="socketley"
+and
+.B instance
+the daemon's name; other daemons and any Prometheus endpoint are scraped. Its
+rules raise alerts the daemon's
+.BR daemon.alert_webhook ,
+.B daemon.alert_mail
+and
+.B daemon.events
+carry, and the dashboard draws its history from it.
+.PP
+.nf
+socketley create metrics metrics \-p 9090 \-\-scrape /etc/socketley/targets \-s
+socketley metrics metrics query 'rate(socketley_runtime_messages_total[5m])'
+.fi
+.PP
+Every sample is stamped with the time its tick was due, so a series' samples
+lie an interval apart and take one to three bytes each; two hours of them are
+cut into a block on disk, two hour blocks merged into a day, and coarser tiers
+of each five minutes and each hour, with the minimum, maximum, sum, count, last
+value and a counter's increase of the step, built beside them. A query over a
+long range reads the coarsest tier that still answers it exactly, so a year of
+a dashboard reads a year of hourly points rather than three million samples.
+.TP
+.BR \-p ", " \-\-port " \fIport\fR"
+The API's port, 9090 by default. It listens on 127.0.0.1 unless
+.B \-\-bind
+names another address, which only a runtime guarded by
+.B \-\-keys
+or
+.B \-\-idp
+may do; from outside the machine it is reached through the entrance with
+.BR \-\-domain ,
+as any HTTP runtime is.
+.TP
+.BI \-\-keys " file"
+Service keys, a line each of a name and a secret, as a
+.B db
+runtime reads them, read again when the file changes. A request carries one as
+.B Authorization: Bearer
+.I secret
+or as Basic with the name and the secret, which is what Grafana's data source
+sends.
+.TP
+.BI \-\-idp " idp"
+Lets in the sign-ins of that idp runtime, a browser's session cookie or an
+access token as Bearer.
+.TP
+.BI \-\-idp\-audience " clients"
+The clients, a comma between, one of which an access token's audience must
+name.
+.TP
+.BR \-\-local ", " \-\-no\-local
+Whether this daemon's own series are taken; on by default.
+.TP
+.BI \-\-scrape " file"
+The targets to scrape, a line each:
+.IP
+.nf
+# name url [every=<duration>] [timeout=<duration>] [bearer=<file>] [label=value ...]
+jetson http://127.0.0.1:9101/metrics every=15s site=home
+node   https://box.example.com/metrics bearer=/etc/socketley/node.token
+.fi
+.IP
+Each sample of a target is given
+.B job
+= its name and
+.B instance
+= its host and port, and its own labels; a target writes
+.BR up ,
+.B scrape_duration_seconds
+and
+.BR scrape_samples_scraped ,
+and the series it stops writing, or all of them when it does not answer, end at
+once with Prometheus's staleness marker. A file changed is read again at the
+next tick, and one that does not read leaves the targets as they were.
+A daemon at home reached through a
+.B tunnel
+is scraped as a loopback TCP service of its agent, so nothing is opened on its
+router.
+.TP
+.BI \-\-every " duration"
+How often this daemon's series are taken and a target is scraped without its
+own every=; 10s by default, from 1s to 1h.
+.TP
+.BI \-\-keep " duration"
+How long raw samples are kept; 30d by default.
+.TP
+.BI \-\-downsample " step" : keep\fR[,...]
+The coarser tiers, 5m:1y,1h:5y by default, or
+.BR none .
+The first step divides two hours, and each later one is a multiple of the one
+before that divides a day.
+.TP
+.BI \-\-max\-series " n"
+The most series held at once, 200000 by default; a new one past it is refused
+and counted in
+.BR socketley_metrics_series_refused_total ,
+so one target that sends a label per request cannot take the machine's memory.
+.TP
+.B \-\-durable
+Every sample logged as it arrives, so a crash loses none; without it a crash
+loses what the open chunks hold, a stop nothing.
+.TP
+.BI \-\-rules " file"
+Recording and alerting rules, laid over the built-in ones (the alerts
+.B DASHBOARD
+lists):
+.IP
+.nf
+every=10s
+alert DiskSpaceLow warning for=1m summary="{{ $labels.path }}: {{ $value | humanizePercentage }} free"
+    : socketley_disk_free_ratio < 0.15
+alert JetsonGone critical for=2m : up{job="jetson"} == 0
+record job:requests:rate5m : sum by (job) (rate(http_requests_total[5m]))
+off TargetDown
+.fi
+.IP
+A rule is a line, carried on by lines that begin with a space, its expression
+after
+.BR " : " .
+.B alert
+takes a name and a severity, then
+.BR for= ,
+.B keep=
+(how long it keeps firing once its condition is gone),
+.B every=
+for its own interval,
+.BI inhibits= rule\fR[,...]
+for alerts it silences on the labels both have,
+.BR summary= ,
+.B description=
+and
+.B runbook_url=
+as annotations, and any other
+.IB label = value
+as a label; values and annotations take Prometheus's templates
+.RB ( "{{ $value }}" ,
+.BR "{{ $labels.name }}" ,
+.BR humanize ,
+.BR humanize1024 ,
+.BR humanizePercentage ,
+.BR humanizeDuration ,
+.BR printf ).
+.B record
+writes its result as a series of that name.
+A rule named as a built-in one takes its place, and
+.BI off " name"
+leaves one out. The file is read again when it changes, and one that does not
+read leaves the rules as they were and is logged. An alert is pending while its
+condition holds for less than
+.BR for= ,
+then firing, which is when it is told of, and resolved, told of too; its state
+is kept in the runtime's directory, so a restart neither tells of one again nor
+starts its
+.B for=
+over. The
+.B ALERTS
+and
+.B ALERTS_FOR_STATE
+series are written as Prometheus writes them.
+.TP
+.BI \-\-notify " where"
+Where an alert is told of:
+.BR webhook ,
+.B mail
+and
+.B events
+with a comma between, the daemon's
+.BR daemon.alert_webhook ,
+.B daemon.alert_mail
+and
+.BR daemon.events ;
+all three by default, or
+.BR none .
+.TP
+.B \-\-receive
+Takes Prometheus remote_write at
+.BR "POST /api/v1/write" ,
+a Snappy-compressed WriteRequest of up to 16 MiB, its samples stored as they
+come and the ones refused counted in
+.BR stats ;
+a Prometheus, a Grafana Agent or another metrics runtime behind a firewall then
+sends what it has instead of being scraped.
+.TP
+.BI \-\-archive " url"
+An S3 bucket, and a key prefix after it, every block on disk is copied to once
+it holds a day or more or ended two days ago:
+.BI http[s]:// host / bucket\fR[/\fIprefix\fR]
+\(em a storage runtime of this daemon or any S3. What is copied is listed in
+.B archived
+in the runtime's directory and never copied again; a copy refused is tried
+again each minute, and said in the log once. The archive keeps what
+.B \-\-keep
+and
+.B \-\-downsample
+let go here: blocks copied back into
+.B blocks/
+of a stopped runtime are read at its start, a piece a later merge replaced
+dropped as one inside a bigger block. A block the retention removes while the
+archive refuses everything is not copied.
+.TP
+.BI \-\-archive\-credentials " file"
+The bucket's
+.B access_key
+and
+.BR secret_key ,
+and
+.B region
+and
+.B session_token
+when it takes them, a
+.IB key " = " value
+line each as a sync runtime's
+.B \-\-credentials
+holds them, read again at each copy.
+.PP
+.B The API.
+.BR /api/v1/query ,
+.BR query_range ,
+.BR series ,
+.BR labels ,
+.BI label/ name /values\fR,
+.BR metadata ,
+.BR targets ,
+.BR rules ,
+.BR alerts ,
+.BR status/buildinfo ,
+.B status/runtimeinfo
+and
+.B query_exemplars
+by GET or a POSTed form, answered in Prometheus's envelope;
+.B /-/healthy
+and
+.BR /-/ready ;
+and
+.B /metrics
+with the runtime's own figures. A Grafana data source of type Prometheus is
+pointed at
+.BI https:// domain
+or
+.BI http://127.0.0.1: port
+with the key as Basic auth or a Bearer header. The PromQL is Prometheus's:
+selectors, ranges and
+.BR offset ;
+the arithmetic, comparison and set operators with
+.BR on ,
+.BR ignoring ,
+.B group_left
+and
+.BR group_right ;
+the aggregations with
+.B by
+and
+.BR without ;
+.BR rate ,
+.BR irate ,
+.BR increase ,
+.BR delta ,
+.BR deriv ,
+.B predict_linear
+and the
+.B _over_time
+functions;
+.BR histogram_quantile ,
+.BR label_replace ,
+.BR label_join ,
+.BR absent ,
+the time and maths functions. Not taken: subqueries,
+.BR @ ,
+native histograms.
+.PP
+.B The CLI.
+.nf
+socketley metrics <rt> query '<promql>' [--at <time>]
+socketley metrics <rt> query_range '<promql>' [--start <time>] [--end <time>] [--step <duration>]
+socketley metrics <rt> series '<selector>' | targets | rules | alerts [--recent] | stats   [--json]
+.fi
+.PP
+A time is
+.BR now ,
+.BR \-1h ,
+unix seconds or RFC 3339; a range ends now and starts an hour back by default.
+.B \-\-json
+prints what the API answers.
+.B \-\-shards
+is refused: one process holds 100000 series at 10s, and a series is written by
+one process.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
@@ -17208,45 +17525,68 @@ without them the page shows the figures, as it always did, but not the log
 or a zone's text, which need a session whatever is configured, and changes
 nothing.
 .IP
-Its figures are drawn over the last fifteen minutes, hour, six hours or day, as
-chosen, the value and time under the pointer shown: the endpoint's thread takes
-a point every ten seconds for each runtime and for the daemon as a whole
-\(em connections and memory as they are, messages, bytes and CPU per second
-\(em keeps a day of them, and writes them to
-.B .history
-in the state directory every five minutes and when the daemon stops, readable
-by its user alone, so a restart keeps them; a runtime that is gone keeps its
-points until they are a day old.
+Its history and its alerts are a
+.B metrics
+runtime's (see
+.BR "METRICS FLAGS" ):
+a daemon started with the dashboard on and a way to sign in to it
+.RB ( daemon.dashboard_credentials
+or
+.BR daemon.dashboard_idp ),
+or with any of
+.BR daemon.alert_webhook ,
+.B daemon.alert_mail
+and
+.B daemon.events
+set, makes one named
+.B metrics
+the first time, on 127.0.0.1:9090 or the next free port above it, and never
+again once it was made, so one removed stays removed; with none running the
+page shows the figures as they are and no history. With several, the page reads
+the one named
+.BR metrics ,
+else any running one that takes this daemon's series.
+.IP
+Its figures are drawn over the last fifteen minutes, hour, six hours, day, week,
+month or year, as chosen, the value and time under the pointer shown: each
+runtime's and the daemon's connections and memory as they are, messages, bytes
+and CPU per second, read from the metrics runtime's store, which keeps them as
+long as its
+.B \-\-keep
+and
+.B \-\-downsample
+say.
 .BR "GET /api/history?runtime=" name "&range=" seconds "&points=" n
-gives one runtime's, or without a name the daemon's, as the mean of each of
+gives one runtime's, or without a name all of them together, as
 .I n
-buckets, null for one without a point: an object of
+points, null where there is none: an object of
 .B from
-(the first bucket's start, in seconds since 1970),
+(in seconds since 1970),
 .B step
-(a bucket's seconds) and the arrays
+(a point's seconds) and the arrays
 .BR conn ", " msg ", " in ", " out ", " cpu
 (percent of one CPU) and
 .BR rss ;
-the range is held between a minute and a day, the buckets between 10 and 1440.
+the range is held between a minute and a year, the points between 10 and 1440.
 .IP
-Its Alerts say what is wrong, looked at every ten seconds whether a page is
-open or not: a runtime that failed, with the last line it wrote that says why,
-or was started again three times within the hour; a certificate a runtime
-serves that ends within two weeks (critical within three days, or once it has
-ended); the disk under a storage runtime or the state directory, or the host's
-memory, at 90% (critical at 95%); a storage runtime at 90% of its
+Its Alerts are the metrics runtime's rules, the built-in ones unless its
+.B \-\-rules
+file changes them: a runtime that failed, or was started again three times
+within the hour; a sync runtime that cannot carry what it owes; a certificate a
+runtime serves that ends within two weeks (critical within three days, or once
+it has ended); the disk under a storage runtime or the state directory, or the
+host's memory, at 90% (critical at 95%); a storage runtime at 90% of its
 .B \-\-max\-bytes
 or a cache that refuses writes at 90% of its
 .BR \-\-maxmemory ;
 a git repository whose last pull failed; a mail runtime with a hundred messages
-waiting for five readings (critical at a thousand), or whose own address a
-blocklist of its
+waiting (critical at a thousand), or whose own address a blocklist of its
 .B \-\-dnsbl
-names. A level that comes and goes is raised
-after three readings and every alert is cleared after three without it; both
-are logged, listed on the page with the last hundred, shown on the overview,
-and \(em with
+names; a scraped target that does not answer for two minutes; a tunnel edge
+missing an agent that joined it, or dropping more than 1% of its datagrams; an
+idp runtime that barred more than twenty sign-ins in ten minutes. A critical
+alert silences the warning on the same thing. Each is logged, listed on the
+page with the notifications of late, shown on the overview, and \(em with
 .B daemon.alert_webhook
 set to an http or https URL \(em posted to it as JSON whose
 .B content
@@ -17268,11 +17608,9 @@ in the state directory and posted after a restart. With
 set to
 .BI mail:// runtime / address\fR[,\fIaddress\fR...]
 each is mailed as well, or instead, by that mail runtime, its subject the
-alert's first line, held the same way until the runtime runs. The alerts told of are kept
-in
-.B .alerts
-in the state directory, readable by the daemon's user alone, so a daemon
-started again does not tell of them a second time.
+alert's first line, held the same way until the runtime runs. The metrics
+runtime keeps its alerts' state in its directory, so one started again does not
+tell of them a second time.
 .BR "GET /api/alerts" ,
 and
 .B POST /api/alerts/test
@@ -17944,7 +18282,7 @@ socketley stop api   # Flushes write queues before closing
 UDP server (fire-and-forget messaging):
 .PP
 .nf
-socketley create server metrics -p 9000 --udp -b -s
+socketley create server stats -p 9000 --udp -b -s
 echo "cpu.load 0.42" | socat - UDP:localhost:9000
 .fi
 .PP

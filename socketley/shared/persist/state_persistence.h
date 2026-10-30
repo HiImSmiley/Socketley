@@ -233,6 +233,23 @@ struct runtime_config
     uint32_t db_backup_every = 86400;
     uint32_t db_backup_keep = 7;
 
+    // Metrics
+    std::string metrics_keys;
+    std::string metrics_idp;
+    std::string metrics_idp_audience;
+    bool metrics_no_local = false;
+    std::string metrics_scrape;
+    std::string metrics_archive;
+    std::string metrics_archive_credentials;
+    uint32_t metrics_every = 10;
+    uint64_t metrics_keep = 30ull * 86400;
+    std::string metrics_downsample = "5m:1y,1h:5y";
+    uint32_t metrics_max_series = 200000;
+    bool metrics_durable = false;
+    std::string metrics_rules;
+    std::string metrics_notify;
+    bool metrics_receive = false;
+
     // Mqtt; its snapshot is persistent_path and persistent_interval, as a cache's file is.
     std::string mqtt_users;
     std::string mqtt_idp;

@@ -27,6 +27,7 @@ class state_persistence;
 class cluster_discovery;
 class endpoint_table;
 class proxy_supervisor;
+class series_walk;
 class request_channel;
 class cluster_reconciler;
 struct cluster_event;
@@ -98,6 +99,9 @@ public:
     // This is how the cluster's reconciliation reaches create, start, stop and remove, and it returns once a worker
     // is forked rather than once it is serving.
     int run_internal(const std::vector<std::string>& words, std::string& out, bool cluster_owned);
+    // A metrics runtime made and started for the dashboard, once per state directory: none made when one exists, and
+    // none made again once it was, so removing it is kept.
+    void ensure_dashboard_store(const std::string& state_dir);
     // The entrance `create dns` makes as the dns runtime's child (--proxy, --proxy-port), 0 or the exit code.
     int make_dns_entrance(class dns_instance* dns, bool start);
     std::vector<std::string> dns_entrance_children(std::string_view dns_name) const;
@@ -217,6 +221,7 @@ private:
     int cmd_dnssec(ipc_connection* conn, const parsed_args& pa);
     // `tunnel <edge> invite|list|revoke`: the agents a tunnel edge takes, kept in its agents file.
     int cmd_tunnel(ipc_connection* conn, const parsed_args& pa);
+    int cmd_metrics(ipc_connection* conn, const parsed_args& pa);
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);
@@ -664,4 +669,21 @@ private:
 
     // A started runtime's verdict as a map call reports it: its worker up and its on_start clean.
     bool map_started(const std::string& name, std::string& err);
+
+    // A metrics runtime's pull of this daemon's series, answered once the handlers on the stack have unwound, since
+    // the walk takes the manager's lock; by name, as the supervisor may be gone by then.
+    struct pending_series_pull
+    {
+        std::string runtime;
+        uint32_t    shard{0};
+        std::string payload;
+    };
+    void queue_series_pull(proxy_supervisor* from, std::string payload);
+    // A metrics runtime's alert handed to the notifier --notify names, of the targets this daemon has.
+    void on_metrics_alert(proxy_supervisor* from, std::string_view payload);
+    void serve_series_pulls();
+    std::vector<pending_series_pull> m_series_queue;
+    io_request                       m_series_defer_req{};
+    bool                             m_series_defer_armed{false};
+    std::unique_ptr<series_walk>     m_series_walk;
 };

@@ -72,6 +72,7 @@ inline void metric_head(std::string& out, std::string_view name, std::string_vie
 inline void append_series(std::string& out, const metric_catalog::series& s)
 {
     out += s.fam->name;
+    out += s.suffix;
     if (!s.labels.empty())
     {
         out += '{';

@@ -1,4 +1,5 @@
 #include "metrics_store.h"
+#include <sys/file.h>
 
 #include <algorithm>
 #include <atomic>
@@ -573,6 +574,8 @@ struct store::impl
     std::string dir, blocks_dir, head_dir;
     store_config cfg;
     bool is_open{false};
+    // flock()ed while open, so a second process never writes the same files.
+    int lock_fd{-1};
 
     series_index index;
     std::vector<series_head> heads;
@@ -1398,6 +1401,24 @@ struct store::impl
         for (const std::string* p : {&dir, &blocks_dir, &head_dir})
             if (!private_dir(*p, true))
                 return why = *p + " is not a directory of this user's alone", false;
+        // One process a store: one before it that is still writing its stop is waited for, five seconds at most.
+        lock_fd = ::open((dir + "/lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (lock_fd < 0)
+            return why = dir + "/lock does not open", false;
+        bool waited = false;
+        for (int i = 0; ::flock(lock_fd, LOCK_EX | LOCK_NB) != 0; ++i)
+        {
+            if (errno != EWOULDBLOCK || i == 100)
+            {
+                ::close(lock_fd);
+                lock_fd = -1;
+                return why = dir + " is held by another process", false;
+            }
+            if (!waited)
+                LOG_INFO((dir + ": waiting for the process before this one to let go of it").c_str());
+            waited = true;
+            ::usleep(50'000);
+        }
         blocks.assign(cfg.tiers.size() + 1, {});
         fold_tmp.assign(cfg.tiers.size(), {});
         fold_finer.assign(cfg.tiers.size(), {});
@@ -1520,6 +1541,9 @@ struct store::impl
         bg.stop();
         save_meta(durability::data);
         is_open = false;
+        if (lock_fd >= 0)
+            ::close(lock_fd);
+        lock_fd = -1;
     }
 
     uint64_t ram() const

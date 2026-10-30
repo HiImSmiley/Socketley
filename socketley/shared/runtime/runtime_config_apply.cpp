@@ -13,6 +13,7 @@
 #include "../../runtime/idp/idp_instance.h"
 #include "../../runtime/tunnel/tunnel_instance.h"
 #include "../../runtime/db/db_instance.h"
+#include "../../runtime/metrics/metrics_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
 
@@ -181,6 +182,43 @@ void apply_tunnel_config(tunnel_instance& tn, const runtime_config& cfg, bool by
         tn.set_idp(cfg.tunnel_idp);
     if (asked("idp_audience", !cfg.tunnel_idp_audience.empty()))
         tn.set_idp_audience(cfg.tunnel_idp_audience);
+}
+
+void apply_metrics_config(metrics_instance& mt, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("keys", !cfg.metrics_keys.empty()))
+        mt.set_keys_path(cfg.metrics_keys);
+    if (asked("idp", !cfg.metrics_idp.empty()))
+        mt.set_idp(cfg.metrics_idp);
+    if (asked("idp_audience", !cfg.metrics_idp_audience.empty()))
+        mt.set_idp_audience(cfg.metrics_idp_audience);
+    if (asked("no_local", true))
+        mt.set_local(!cfg.metrics_no_local);
+    if (asked("scrape", !cfg.metrics_scrape.empty()))
+        mt.set_scrape_path(cfg.metrics_scrape);
+    if (asked("archive", !cfg.metrics_archive.empty()))
+        mt.set_archive(cfg.metrics_archive);
+    if (asked("archive_credentials", !cfg.metrics_archive_credentials.empty()))
+        mt.set_archive_credentials(cfg.metrics_archive_credentials);
+    if (asked("every", true))
+        mt.set_every(cfg.metrics_every);
+    if (asked("keep", true))
+        mt.set_keep(cfg.metrics_keep);
+    if (asked("downsample", true))
+        mt.set_downsample(cfg.metrics_downsample);
+    if (asked("max_series", true))
+        mt.set_max_series(cfg.metrics_max_series);
+    if (asked("durable", true))
+        mt.set_durable(cfg.metrics_durable);
+    if (asked("rules", !cfg.metrics_rules.empty()))
+        mt.set_rules_path(cfg.metrics_rules);
+    if (asked("notify", !cfg.metrics_notify.empty()))
+        mt.set_notify(cfg.metrics_notify);
+    if (asked("receive", true))
+        mt.set_receive(cfg.metrics_receive);
 }
 
 void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence)
@@ -599,6 +637,9 @@ bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by
             break;
         case runtime_tunnel:
             apply_tunnel_config(static_cast<tunnel_instance&>(rt), cfg, by_presence);
+            break;
+        case runtime_metrics:
+            apply_metrics_config(static_cast<metrics_instance&>(rt), cfg, by_presence);
             break;
     }
 

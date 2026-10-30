@@ -6,6 +6,7 @@
 // and a health-tick drain made a cross-process `cache set` cost 2000.02 ms.
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <sys/types.h>
@@ -150,6 +151,15 @@ public:
     using peer_handler = std::function<void(proxy_supervisor* from,
                                             std::string target)>;
     void set_peer_handler(peer_handler h) { m_on_peer = std::move(h); }
+
+    // A metrics runtime's pull of this daemon's series, and what the daemon keeps of what it sent this child, which
+    // goes with the supervisor so a child that is gone takes it along.
+    using series_handler = std::function<void(proxy_supervisor* from, std::string payload)>;
+    void set_series_handler(series_handler h) { m_on_series = std::move(h); }
+    // A metrics runtime's alert for the daemon's notifier.
+    void set_alert_handler(series_handler h) { m_on_alert = std::move(h); }
+    std::shared_ptr<void>& series_state() { return m_series_state; }
+    bool send_series_feed(const std::string& framed) { return write_frame(framed); }
 
     // One end of a link, handed to this child.  False means it stays on the
     // relay, which is where every crossing was before links existed.
@@ -431,6 +441,9 @@ private:
     stats_handler   m_on_stats;
     map_handler      m_on_map;
     peer_handler     m_on_peer;
+    series_handler   m_on_series;
+    series_handler   m_on_alert;
+    std::shared_ptr<void> m_series_state;
 
     bool         m_state_changed{false};
     bool         m_routes_changed{false};

@@ -11,7 +11,7 @@ namespace
 {
 
 // The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc, Idp, dB, Mqtt,
-// mail (E), tunnel (U).
+// mail (E), tunnel (U), metRics.
 struct row
 {
     std::string_view flag, types, kind, label, help, section, choices = {}, placeholder = {}, aliases = {};
@@ -20,18 +20,18 @@ struct row
 
 constexpr row rows[] = {
     // ── basics ──────────────────────────────────────────────────────────────
-    {"-p", "SCPKTDIBMEU", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
-    {"-s", "SCPKTDIBMEU", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
+    {"-p", "SCPKTDIBMEUR", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
+    {"-s", "SCPKTDIBMEUR", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
     {"-g", "SCPKTDME", "text", "Group", "A group its proxies reach all members of with --backend @group.", "Basics", {}, "web", "--group"},
     {"--lua", "SCPKTME", "path", "Lua script", "A script with the runtime's callbacks, run at start.", "Basics", {}, "/etc/socketley/app.lua"},
-    {"--test", "SCPKTDIBMEU", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
+    {"--test", "SCPKTDIBMEUR", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
 
     // ── network ─────────────────────────────────────────────────────────────
-    {"--bind", "SPKTDIBMEU", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
+    {"--bind", "SPKTDIBMEUR", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
     {"--listen", "SPKT", "text", "Unix socket", "Listen on a unix socket instead of a port.", "Network", {}, "unix:/run/socketley/app.sock"},
     {"--shards", "SPKTDIBME", "int", "Shards", "Worker processes sharing the port: the way one runtime uses more than one core.", "Network", {}, "4"},
-    {"--domain", "SPKTIBEU", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
-    {"--cpus", "SCPKTDIBME", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
+    {"--domain", "SPKTIBEUR", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
+    {"--cpus", "SCPKTDIBMER", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
 
     // ── TLS ─────────────────────────────────────────────────────────────────
     {"--tls", "SCPKTME", "switch", "TLS", "Encrypt its transport: terminate TLS on its port, or dial over it.", "TLS"},
@@ -52,7 +52,7 @@ constexpr row rows[] = {
     {"--reconnect", "C", "int", "Reconnect", "Connect again, backing off, when the connection is lost: the most attempts, 0 for no end.", "Limits", {}, "0"},
 
     // ── output ──────────────────────────────────────────────────────────────
-    {"--log", "SCPKTDMEU", "path", "State log", "A file it appends each state change to.", "Output", {}, "/var/log/socketley/app.log"},
+    {"--log", "SCPKTDMEUR", "path", "State log", "A file it appends each state change to.", "Output", {}, "/var/log/socketley/app.log"},
     {"-w", "SC", "path", "Message file", "A file every received message is written to.", "Output", {}, "/var/log/socketley/msgs"},
     {"-b", "SC", "switch", "Print messages", "Print every received message.", "Output"},
     {"-bp", "SC", "switch", "…with name", "Print them with the runtime's name before each.", "Output"},
@@ -174,6 +174,25 @@ constexpr row rows[] = {
     {"--backup-keep", "B", "int", "Keep", "How many backups are kept.", "Backups", {}, "7"},
     {"--repositories", "Y", "path", "Repositories", "The file a storage writes for a user's own sync runtime, which pulls their git repositories.", "Sync", {}, "/var/lib/socketley/storage/ui/.ui/sync/user.json"},
 
+    // ── metrics ─────────────────────────────────────────────────────────────
+    {"--scrape", "R", "path", "Scrape", "The targets it scrapes, a line each: name url, then every=, timeout= or labels.", "Metrics", {}, "/etc/socketley/metrics.targets"},
+    {"--every", "R", "duration", "Every", "How often a sample is taken; a target's every= takes the place of it.", "Metrics", {}, "10s"},
+    {"--keep", "R", "duration", "Keep", "How long the raw samples are kept.", "Metrics", {}, "30d"},
+    {"--downsample", "R", "text", "Tiers", "Coarser tiers kept longer, step:keep a comma between each, or none.", "Metrics", {}, "5m:1y,1h:5y"},
+    {"--max-series", "R", "int", "Max series", "The most series it keeps; a new one past it is refused and counted.", "Metrics", {}, "200000"},
+    {"--durable", "R", "switch", "Durable", "Log every sample as it comes, so a crash loses none.", "Metrics"},
+    {"--no-local", "R", "switch", "No local feed", "Leave this daemon's own series out.", "Metrics"},
+    {"--local", "R", "switch", "Local feed", "This daemon's own series, taken without text; the default.", "Metrics", {}, {}, {}, true},
+    {"--keys", "R", "path", "Keys", "Service keys Grafana or a script sends, by Bearer or Basic, name and secret a line.", "Metrics", {}, "/etc/socketley/metrics.keys"},
+    {"--idp", "R", "text", "Identity provider", "The idp runtime whose sign-ins and access tokens may read it.", "Metrics", {}, "auth"},
+    {"--idp-audience", "R", "list", "Token clients", "The idp's clients whose access tokens it takes.", "Metrics", {}, "grafana"},
+    {"--rules", "R", "path", "Rules", "Recording and alerting rules laid over the built-in ones, a rule a line.", "Rules", {}, "/etc/socketley/metrics.rules"},
+    {"--notify", "R", "list", "Notify", "Where alerts go of the daemon's own: webhook, mail and events, or none.", "Rules", {}, "webhook,events"},
+    {"--receive", "R", "switch", "Take remote_write", "Store what a Prometheus or agent sends to /api/v1/write.", "Metrics"},
+    {"--archive", "R", "text", "Archive", "An S3 bucket every finished block is copied to, so it outlives --keep.", "Archive", {}, "https://s3.example.com/metrics/home"},
+    {"--archive-credentials", "R", "path", "Archive keys", "The bucket's access_key and secret_key, a file as sync reads it.", "Archive", {}, "/etc/socketley/metrics.s3"},
+    {"--receive", "R", "switch", "Receive", "Take remote_write, kept for a later release.", "Metrics", {}, {}, {}, true},
+
     // ── mqtt ────────────────────────────────────────────────────────────────
     {"--users", "M", "path", "Users", "Accounts that sign in with a password, user:hash a line as `socketley mqtt-passwd` writes them.", "MQTT", {}, "/etc/socketley/mqtt.users"},
     {"--idp", "M", "text", "Identity provider", "The idp runtime whose access tokens sign clients in, given as the password.", "MQTT", {}, "auth"},
@@ -246,6 +265,16 @@ struct state_key_row
 };
 constexpr state_key_row state_keys[] = {
     {"-p", "port"},
+    {"--scrape", "scrape"},
+    {"--keep", "keep"},
+    {"--downsample", "downsample"},
+    {"--max-series", "max_series"},
+    {"--durable", "durable"},
+    {"--no-local", "no_local"},
+    {"--rules", "rules"},
+    {"--archive", "archive"},
+    {"--archive-credentials", "archive_credentials"},
+    {"--receive", "receive"},
     {"-g", "group"},
     {"--lua", "lua_script"},
     {"--bind", "bind"},
@@ -450,6 +479,7 @@ char letter_of(runtime_type type)
         case runtime_mqtt:    return 'M';
         case runtime_mail:    return 'E';
         case runtime_tunnel:  return 'U';
+        case runtime_metrics: return 'R';
         default:              return 0;
     }
 }
@@ -482,7 +512,7 @@ bool offered(std::string_view flag, runtime_type type)
 const std::string& json()
 {
     static const std::string out = [] {
-        std::string o = "{\"types\":[\"server\",\"client\",\"proxy\",\"cache\",\"storage\",\"dns\",\"sync\",\"idp\",\"db\",\"mqtt\",\"mail\",\"tunnel\"],\"flags\":[";
+        std::string o = "{\"types\":[\"server\",\"client\",\"proxy\",\"cache\",\"storage\",\"dns\",\"sync\",\"idp\",\"db\",\"mqtt\",\"mail\",\"tunnel\",\"metrics\"],\"flags\":[";
         bool first = true;
         for (const row& r : rows)
         {
@@ -496,7 +526,7 @@ const std::string& json()
             {
                 const char* name = t == 'S' ? "server" : t == 'C' ? "client" : t == 'P' ? "proxy" : t == 'K' ? "cache"
                                  : t == 'T' ? "storage" : t == 'Y' ? "sync" : t == 'I' ? "idp" : t == 'B' ? "db" : t == 'M' ? "mqtt" : t == 'E' ? "mail"
-                                 : t == 'U' ? "tunnel" : "dns";
+                                 : t == 'U' ? "tunnel" : t == 'R' ? "metrics" : "dns";
                 o += f2 ? "" : ",";
                 f2 = false;
                 socketley::json::quote_into(o, name);

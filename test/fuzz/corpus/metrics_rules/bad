@@ -1,0 +1,2 @@
+alert A warning summary="{{ $value " : up
+  : more

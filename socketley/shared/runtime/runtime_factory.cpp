@@ -13,6 +13,7 @@
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
+#include "../../runtime/metrics/metrics_instance.h"
 
 std::unique_ptr<runtime_instance> create_runtime(runtime_type type, std::string_view name)
 {
@@ -42,6 +43,8 @@ std::unique_ptr<runtime_instance> create_runtime(runtime_type type, std::string_
             return std::make_unique<mail_instance>(name);
         case runtime_tunnel:
             return std::make_unique<tunnel_instance>(name);
+        case runtime_metrics:
+            return std::make_unique<metrics_instance>(name);
         default:
             return type_registry::make(type, name);
     }

@@ -1,0 +1,88 @@
+(# socketley's own alerts over the series the daemon's /metrics writes, `name` the runtime: one reading is 10s, a
+# condition held for N readings is for=N*10s, and keep=20s clears an alert at its third reading without it.
+every=10s
+
+alert RuntimeFailed critical keep=20s inhibits=SyncFailing
+    summary="{{ $labels.name }} failed"
+    description="socketley show {{ $labels.name }} says why"
+    : socketley_runtime_state{state="failed"} == 1
+
+alert SyncFailing warning for=30s keep=20s
+    summary="{{ $labels.name }} cannot carry everything it owes"
+    description="{{ $value }} failures since the last thing it carried"
+    : socketley_sync_failing > 0
+
+alert RuntimeRestarting warning keep=20s
+    summary="{{ $labels.name }} was started again {{ $value | printf \"%.0f\" }} times in the last hour"
+    : increase(socketley_runtime_restarts_total[1h]) >= 3
+
+alert CertificateEnded critical keep=20s inhibits=CertificateExpiringSoon,CertificateExpiring
+    summary="The certificate of {{ $labels.name }} has ended"
+    description="{{ $labels.path }}"
+    : socketley_cert_expiry_seconds < 0
+alert CertificateExpiringSoon critical keep=20s inhibits=CertificateExpiring
+    summary="The certificate of {{ $labels.name }} ends in {{ $value | humanizeDuration }}"
+    description="{{ $labels.path }}"
+    : socketley_cert_expiry_seconds < 3 * 86400
+alert CertificateExpiring warning keep=20s
+    summary="The certificate of {{ $labels.name }} ends in {{ $value | humanizeDuration }}"
+    description="{{ $labels.path }}"
+    : socketley_cert_expiry_seconds < 14 * 86400
+
+alert DiskSpaceCritical critical for=30s keep=20s inhibits=DiskSpaceLow
+    summary="The disk of {{ $labels.path }} has {{ $value | humanizePercentage }} free"
+    : socketley_disk_free_ratio < 0.05
+alert DiskSpaceLow warning for=30s keep=20s
+    summary="The disk of {{ $labels.path }} has {{ $value | humanizePercentage }} free"
+    : socketley_disk_free_ratio < 0.10
+
+alert HostMemoryCritical critical for=30s keep=20s inhibits=HostMemoryLow
+    summary="The host has {{ $value | humanizePercentage }} of its memory available"
+    : socketley_host_memory_available_ratio < 0.05
+alert HostMemoryLow warning for=30s keep=20s
+    summary="The host has {{ $value | humanizePercentage }} of its memory available"
+    : socketley_host_memory_available_ratio < 0.10
+
+alert QuotaFull critical for=30s keep=20s inhibits=QuotaNearlyFull
+    summary="{{ $labels.name }} holds {{ $value | humanizePercentage }} of its limit"
+    : socketley_runtime_quota_ratio >= 0.98
+alert QuotaNearlyFull warning for=30s keep=20s
+    summary="{{ $labels.name }} holds {{ $value | humanizePercentage }} of its limit"
+    : socketley_runtime_quota_ratio >= 0.90
+
+alert MailQueueVeryLong critical for=50s keep=20s inhibits=MailQueueLong
+    summary="{{ $labels.name }} has {{ $value }} messages waiting"
+    description="socketley mail {{ $labels.name }} queue says why"
+    : socketley_mail_queued >= 1000
+alert MailQueueLong warning for=50s keep=20s
+    summary="{{ $labels.name }} has {{ $value }} messages waiting"
+    description="socketley mail {{ $labels.name }} queue says why"
+    : socketley_mail_queued >= 100
+
+alert MailBlocklisted critical keep=20s
+    summary="A blocklist names the address {{ $labels.name }} sends from"
+    description="socketley mail {{ $labels.name }} says which"
+    : socketley_mail_blocklisted == 1
+
+alert GitPullFailed warning keep=20s
+    summary="Git: pulling {{ $labels.repo }} into {{ $labels.name }} failed"
+    : socketley_git_mirror_failed == 1
+
+alert TargetDown warning for=2m keep=20s
+    summary="{{ $labels.job }} at {{ $labels.instance }} does not answer its scrape"
+    : up == 0
+
+alert TunnelAgentGone warning for=2m keep=20s
+    summary="{{ $labels.name }} misses {{ $value }} of the agents that joined it"
+    description="socketley tunnel {{ $labels.name }} agents says which"
+    : socketley_tunnel_agents_joined - socketley_tunnel_agents_connected > 0
+
+alert TunnelDatagramsDropped warning for=2m keep=20s
+    summary="{{ $labels.name }} drops {{ $value | humanizePercentage }} of the datagrams it is given"
+    : rate(socketley_tunnel_datagrams_dropped_total[5m])
+        / (rate(socketley_tunnel_datagrams_total[5m]) + rate(socketley_tunnel_datagrams_dropped_total[5m])) > 0.01
+
+alert IdpSignInsBarred warning keep=20s
+    summary="{{ $labels.name }} barred {{ $value | printf \"%.0f\" }} sign-ins in ten minutes"
+    description="Too many failures from one address or for one user"
+    : increase(socketley_idp_sign_ins_barred_total[10m]) > 20

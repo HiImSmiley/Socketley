@@ -5,11 +5,14 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
+#include "../shared/runtime/metric_catalog.h"
 #include "dashboard.h"
-#include "alerts.h"
-#include "history.h"
 
 class runtime_manager;
 
@@ -23,13 +26,10 @@ public:
     {
         // The file the dashboard's admins sign in from, empty for a read-only page.
         std::string dashboard_credentials;
-        // Where the history and the alerts told of are kept, empty to keep them in memory only.
+        // The state directory, whose disk the fact series measure.
         std::string state_dir;
-        // The URL alerts are posted to, empty for none, and what takes each message for it.
+        // The URL alerts are posted to, which the page's test reaches, empty for none.
         std::string alert_webhook;
-        std::function<void(std::string)> alert_send;
-        // What publishes each alert raised and cleared on daemon.events, empty for nothing.
-        std::function<void(std::string, std::string)> alert_event;
         // The idp runtime whose admins sign in to the dashboard, empty for none.
         std::string dashboard_idp;
     };
@@ -37,7 +37,29 @@ public:
     void stop();
 
     // What the fact series read slowly, kept from one render to the next.
-    struct fact_cache;
+    struct fact_cache
+    {
+        // Each certificate's end in seconds since the epoch, INT64_MIN when it cannot be read, and when it was read.
+        std::unordered_map<std::string, std::pair<int64_t, int64_t>> certs;
+        // Each storage directory's mirrors: the runtime, the repository's name and id, and whether its last pull failed.
+        struct mirror
+        {
+            std::string runtime, repo, id;
+            bool failed;
+            // What the failed pull said, its first line.
+            std::string error;
+        };
+        std::vector<mirror> mirrors;
+        std::vector<std::string> mirror_dirs;
+        int64_t mirrors_at{INT64_MIN};
+        size_t last_size{0};
+    };
+
+    // Every series /metrics writes, family after family, handed to `out`: the text of /metrics and a metrics runtime's
+    // local feed are this one walk, so the two cannot disagree on a name or a label. `refresh_memory` reads each
+    // process's memory again rather than taking what the last sample read.
+    static void walk_series(const runtime_manager& manager, fact_cache& cache, const std::string& state_dir,
+                            bool refresh_memory, socketley::metric_catalog::sink_ref out);
 
 private:
     void serve_loop();
@@ -46,15 +68,14 @@ private:
     std::string build_json_overview() const;
     std::string build_json_runtimes() const;
     std::string build_json_runtime(std::string_view name) const;
-    // Every runtime's figures and the daemon's, into the history, and a look for what is wrong.
-    void sample();
+    // The page's history of a runtime, '' for all of them, and its alerts, both read from a metrics runtime.
+    std::string history_json(std::string_view runtime, int64_t range, size_t points) const;
+    std::string alerts_json() const;
 
     runtime_manager& m_manager;
     std::unique_ptr<dashboard::server> m_dash;
-    std::unique_ptr<history::keeper> m_history;
-    std::unique_ptr<alerts::monitor> m_alerts;
     std::string m_state_dir;
-    std::chrono::steady_clock::time_point m_next_sample{}, m_next_save{};
+    std::string m_webhook;
     int m_listen_fd{-1};
 
     // How stop() reaches a thread parked waiting for a connection, so stopping

@@ -1225,6 +1225,16 @@ void proxy_supervisor::ingest()
             case worker_proto::frame_type::hello:
                 break;
 
+            case worker_proto::frame_type::series_pull:
+                if (m_on_series)
+                    m_on_series(this, std::move(payload));
+                break;
+
+            case worker_proto::frame_type::alert_note:
+                if (m_on_alert)
+                    m_on_alert(this, std::move(payload));
+                break;
+
             case worker_proto::frame_type::routes:
             {
                 // The declaration this child's script made, kept where

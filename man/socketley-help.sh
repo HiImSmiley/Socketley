@@ -238,7 +238,7 @@ cli_commands() {
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
     echo "  Create a new runtime: server, client, proxy, cache, storage, dns, sync, idp, db,"
-    echo "  mqtt, mail, tunnel, or a type"
+    echo "  mqtt, mail, tunnel, metrics, or a type"
     echo "  registered by a manifest in the daemon's types directory"
     echo "  (/etc/socketley/types/ or ~/.config/socketley/types/), whose"
     echo "  schema keys become --<key> flags. See REGISTERED TYPES in man."
@@ -483,6 +483,11 @@ cli_commands() {
     echo -e "  ${CYAN}socketley ssh-cert auth.example.com${NC}"
     echo ""
 
+    echo -e "${BOLD}metrics <metrics> query '<promql>' [--at <time>] | query_range '<promql>' [--start] [--end] [--step] | series '<selector>' | targets | rules | alerts [--recent] | stats [--json]${NC}"
+    echo "  Asks a metrics runtime what it stored, with PromQL, as Grafana asks"
+    echo "  its Prometheus API; targets, rules and alerts say what it scrapes and raises."
+    echo -e "  ${CYAN}socketley metrics metrics query 'rate(socketley_runtime_messages_total[5m])'${NC}"
+    echo ""
     echo -e "${BOLD}tunnel <edge> invite|set <agent> --http <name[=auth],...> --tcp <name:port> --udp <name:port> | list | shares | revoke <agent>${NC}"
     echo "  The agents a tunnel edge takes: invite prints an invitation used"
     echo "  once, set changes what an agent offers, revoke cuts it off. An HTTP"

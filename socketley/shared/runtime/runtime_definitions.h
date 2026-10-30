@@ -24,7 +24,8 @@ enum runtime_type : uint8_t
     runtime_db      = 8,
     runtime_mqtt    = 9,
     runtime_mail    = 10,
-    runtime_tunnel  = 11
+    runtime_tunnel  = 11,
+    runtime_metrics = 12
 };
 
 // The names, once.  Five places had this switch -- lua_context,
@@ -79,6 +80,11 @@ inline std::string shards_config_refusal(runtime_type type,
     if (type == runtime_tunnel)
         return "--shards is not available on a tunnel: each agent's link is held by one process, and a visitor "
                "reaching another shard would find no agent there\n";
+
+    // One process keeps the store's target load, and a series has exactly one writer.
+    if (type == runtime_metrics)
+        return "--shards is not available on a metrics runtime: each series is written by one process, and one "
+               "keeps 100000 series at 10s\n";
 
     if (type == runtime_sync)
         return "--shards is not available on a sync: it listens on nothing to share, and N of them would carry the "

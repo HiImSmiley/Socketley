@@ -25,6 +25,7 @@
 #include "../../shared/ipc/request_channel.h"
 #include "../../shared/net/endpoint_table.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/turn_clock.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/ipc/exit_bound.h"
 #include "../../shared/lua/lua_context.h"
@@ -299,9 +300,9 @@ public:
 
         auto last_stats = std::chrono::steady_clock::now();
 
-        // The one clock read a turn, taken after the drain and carried into the
-        // next turn's wait, because three reads a turn were 3% of a worker
-        // answering one connection.
+        // The one clock read a turn, the loop's own when it dispatched, carried
+        // into the next turn's wait, because three reads a turn were 3% of a
+        // worker answering one connection.
         auto now = last_stats;
 
         // The publish is on-change now rather than a heartbeat, because the
@@ -338,6 +339,7 @@ public:
             // Before the ring exists poll_completions() returns at once
             // whatever timeout it is handed, so the wait comes from a poll on
             // the control socket, which is its own notification.
+            bool dispatched = false;
             if (m_loop.ring_open())
             {
                 // The two states the ring cannot end on its own -- no recv
@@ -368,7 +370,10 @@ public:
                 // because a completion that changes nothing visible still ran
                 // code in this process.
                 if (m_loop.poll_completions(wait_ms) > 0)
+                {
                     stats_dirty = true;
+                    dispatched = true;
+                }
 
                 // Dispatched here rather than in on_cqe(), because on_config()
                 // is one of these frames and it builds this ring, and the
@@ -391,7 +396,8 @@ public:
                 stats_dirty = true;
             }
 
-            now = std::chrono::steady_clock::now();
+            // A turn that dispatched has read the clock already, and its stamp is the turn's time.
+            now = dispatched ? socketley::turn_clock::now() : std::chrono::steady_clock::now();
 
             // Whatever the socket would not take last turn, because a reply
             // sitting here is somebody's answer.
@@ -744,6 +750,10 @@ private:
                 if (m_rt)
                     m_rt->on_replica_order(payload);
                 break;
+            case worker_proto::frame_type::series_feed:
+                if (m_rt)
+                    m_rt->on_series_feed(payload);
+                break;
             // Said here as well as at the way out of the loop, because the
             // daemon tells every shard in one turn: a sibling can be gone
             // before this one has finished the turn it was told in.
@@ -978,6 +988,7 @@ private:
                          "crossings to other runtimes will relay through the daemon");
         }
         m_rt->set_runtime_manager(&m_manager);
+        m_rt->set_daemon_sink([this](const std::string& frame) { return m_writer.write(frame); });
 
         // ── and a send on its way out ───────────────────────────────────────
         // The mirror of the daemon's deliver sink, answering this worker's own
@@ -1130,6 +1141,8 @@ private:
         }
 
         m_manager.install_replica(entries);
+        if (m_rt)
+            m_rt->on_runtime_map(payload);
 
         if (logger::g_level <= log_debug)
         {

@@ -1255,3 +1255,37 @@ TEST_CASE("perf: 30 days of one series through the 5m tier")
         }
     }
 }
+
+TEST_CASE("a staleness marker set after a reopen ends what was there before it")
+{
+    tmpdir d;
+    std::string why;
+    store_config c;
+    const label_set ls = L({{"__name__", "gone"}, {"job", "socketley"}});
+    const int64_t t0 = T0 + 3600000;
+    {
+        store s;
+        REQUIRE_MESSAGE(s.open(d.sub("s"), c, why), why);
+        const uint32_t id = s.get_or_create(ls);
+        CHECK(s.append(id, t0, 1));
+        CHECK(s.append(id, t0 + 10000, 1));
+        s.tick(t0 + 10000);
+        s.stop();
+    }
+    store s;
+    REQUIRE_MESSAGE(s.open(d.sub("s"), c, why), why);
+    s.tick(t0 + 10500);
+    const uint32_t id = s.find(ls);
+    REQUIRE(id != no_series);
+    CHECK(s.mark_stale(id, t0 + 10500));
+    query_engine q(s);
+    query_result r;
+    query_error e;
+    REQUIRE(q.eval_instant("gone", t0 + 12000, r, e));
+    CHECK(r.series.empty());
+    std::vector<sample> raw;
+    s.samples(id, t0, t0 + 20000, raw);
+    REQUIRE(raw.size() == 3);
+    CHECK(is_stale(raw[2].v));
+    s.stop();
+}

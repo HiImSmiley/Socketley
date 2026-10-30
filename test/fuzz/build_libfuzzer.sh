@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -112,6 +112,12 @@ want fuzz_metrics_query && build fuzz_metrics_query "$ROOT/test/fuzz/fuzz_metric
     "$ROOT/socketley/runtime/metrics/metrics_query.cpp" "$ROOT/socketley/runtime/metrics/metrics_promql_parse.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_promql_eval.cpp" "$ROOT/socketley/runtime/metrics/metrics_regex.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_text.cpp"
+want fuzz_metrics_rules && build fuzz_metrics_rules "$ROOT/test/fuzz/fuzz_metrics_rules.cpp" \
+    "$ROOT/socketley/runtime/metrics/metrics_rules.cpp" "$ROOT/socketley/runtime/metrics/metrics_query.cpp" \
+    "$ROOT/socketley/runtime/metrics/metrics_promql_parse.cpp" "$ROOT/socketley/runtime/metrics/metrics_promql_eval.cpp" \
+    "$ROOT/socketley/runtime/metrics/metrics_regex.cpp" "$ROOT/socketley/runtime/metrics/metrics_text.cpp"
+want fuzz_metrics_remote && build fuzz_metrics_remote "$ROOT/test/fuzz/fuzz_metrics_remote.cpp" \
+    "$ROOT/socketley/runtime/metrics/metrics_remote.cpp"
 want fuzz_mqtt && build fuzz_mqtt "$ROOT/test/fuzz/fuzz_mqtt.cpp" "$ROOT/socketley/runtime/mqtt/mqtt_codec.cpp" \
     "$ROOT/socketley/runtime/mqtt/mqtt_topics.cpp" "$ROOT/socketley/runtime/mqtt/mqtt_broker.cpp" \
     "$ROOT/socketley/runtime/mqtt/mqtt_broker_store.cpp"

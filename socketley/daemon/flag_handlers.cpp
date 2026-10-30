@@ -25,6 +25,9 @@
 #include "../runtime/db/db_instance.h"
 #include "../runtime/mqtt/mqtt_instance.h"
 #include "../runtime/mail/mail_instance.h"
+#include "../runtime/metrics/metrics_instance.h"
+#include "../shared/http/http_url.h"
+#include "../runtime/metrics/metrics_query.h"
 #include "../runtime/idp/idp_logic.h"
 #include "../shared/net/ip_block.h"
 #include "../shared/net/dns_feed.h"
@@ -78,7 +81,9 @@ static int apply_bind_address(runtime_instance* instance, std::string_view addre
         std::cout << "invalid listen address \"" << text << "\": an IPv4 address such as 127.0.0.1\n";
         return 1;
     }
-    instance->set_bind_address(a.s_addr == htonl(INADDR_ANY) ? std::string() : text);
+    // A metrics runtime keeps 0.0.0.0 as given, since its API unset is loopback alone.
+    instance->set_bind_address(a.s_addr == htonl(INADDR_ANY) && instance->get_type() != runtime_metrics ? std::string()
+                                                                                                         : text);
     return 0;
 }
 
@@ -1922,6 +1927,141 @@ int parse_tunnel_flags(tunnel_instance* tn, const parsed_args& pa, size_t& i, st
         case fnv1a("--idp-audience"):
             return text("--idp-audience", "the clients, a comma between each, whose access tokens are taken",
                         [&](std::string_view v) { tn->set_idp_audience(v); });
+        default:
+            return -1;
+    }
+}
+
+int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+    const auto path = [&](const char* flag, const char* what, auto set) {
+        if (next.empty() || next.front() != '/')
+        {
+            std::cout << flag << " requires the absolute path of " << what << "\n";
+            return 1;
+        }
+        set(next);
+        ++i;
+        return 0;
+    };
+    // A Prometheus duration, as 10s, 30d or 1y, whole seconds from `min` to `max`.
+    const auto duration = [&](const char* usage, int64_t min, int64_t max, auto set) {
+        int64_t ms = 0;
+        if (next.empty() || !socketley::metrics::parse_duration(next, ms) || ms % 1000 != 0 || ms / 1000 < min ||
+            ms / 1000 > max)
+        {
+            std::cout << usage;
+            return 1;
+        }
+        set(ms / 1000);
+        ++i;
+        return 0;
+    };
+    switch (pa.hashes[i])
+    {
+        // The service keys, `name secret` a line, as a db's.
+        case fnv1a("--keys"):
+            return path("--keys", "a file with one key a line: name secret",
+                        [&](std::string_view v) { mt->set_keys_path(v); });
+        case fnv1a("--idp"):
+            if (next.empty() || next.find_first_of("/ ") != std::string_view::npos)
+            {
+                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                return 1;
+            }
+            mt->set_idp(next);
+            ++i;
+            return 0;
+        case fnv1a("--idp-audience"):
+            if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
+            {
+                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                return 1;
+            }
+            mt->set_idp_audience(next);
+            ++i;
+            return 0;
+        case fnv1a("--local"):
+            mt->set_local(true);
+            return 0;
+        case fnv1a("--no-local"):
+            mt->set_local(false);
+            return 0;
+        case fnv1a("--scrape"):
+            return path("--scrape", "a file with one target a line: name url [every=10s] [label=value ...]",
+                        [&](std::string_view v) { mt->set_scrape_path(v); });
+        case fnv1a("--every"):
+            return duration("--every requires how often a sample is taken, from 1s to 1h, as 10s\n", 1, 3600,
+                            [&](int64_t s) { mt->set_every(static_cast<uint32_t>(s)); });
+        case fnv1a("--keep"):
+            return duration("--keep requires how long raw samples are kept, at least 1h, as 30d\n", 3600,
+                            100ll * 365 * 86400, [&](int64_t s) { mt->set_keep(static_cast<uint64_t>(s)); });
+        case fnv1a("--downsample"):
+        {
+            std::vector<std::pair<int64_t, int64_t>> tiers;
+            std::string why;
+            if (next.empty() || !socketley::metrics::parse_downsample(next, tiers, why))
+            {
+                std::cout << "--downsample requires the tiers as step:keep, a comma between each, such as 5m:1y,1h:5y, "
+                             "or none" << (why.empty() ? "" : ": " + why) << "\n";
+                return 1;
+            }
+            mt->set_downsample(next);
+            ++i;
+            return 0;
+        }
+        case fnv1a("--max-series"):
+        {
+            uint32_t n = 0;
+            const auto r = std::from_chars(next.data(), next.data() + next.size(), n);
+            if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || n < 1)
+            {
+                std::cout << "--max-series requires how many series the store takes, from 1\n";
+                return 1;
+            }
+            mt->set_max_series(n);
+            ++i;
+            return 0;
+        }
+        case fnv1a("--durable"):
+            mt->set_durable(true);
+            return 0;
+        case fnv1a("--rules"):
+            return path("--rules", "a file of recording and alerting rules",
+                        [&](std::string_view v) { mt->set_rules_path(v); });
+        case fnv1a("--notify"):
+        {
+            if (uint8_t m = 0; next.empty() || !socketley::metrics::parse_notify(next, m))
+            {
+                std::cout << "--notify requires where alerts go of the daemon's own: webhook, mail and events, a comma "
+                             "between, or none\n";
+                return 1;
+            }
+            mt->set_notify(next);
+            ++i;
+            return 0;
+        }
+        case fnv1a("--receive"):
+            mt->set_receive(true);
+            return 0;
+        case fnv1a("--archive"):
+        {
+            socketley::http_target t;
+            std::string why;
+            if (next.empty() || !socketley::parse_http_url(next, t, why) || t.path.size() < 2)
+            {
+                std::cout << "--archive requires the S3 bucket blocks are copied to, as http[s]://host/bucket[/prefix]"
+                          << (why.empty() ? "" : ": " + why) << "\n";
+                return 1;
+            }
+            mt->set_archive(next);
+            ++i;
+            return 0;
+        }
+        case fnv1a("--archive-credentials"):
+            return path("--archive-credentials", "a file of the bucket's access_key and secret_key, as sync reads",
+                        [&](std::string_view v) { mt->set_archive_credentials(v); });
         default:
             return -1;
     }

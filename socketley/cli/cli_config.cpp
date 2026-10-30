@@ -388,7 +388,7 @@ bool copy_into(const std::filesystem::path& from, const std::filesystem::path& t
 int rank(std::string_view type)
 {
     static constexpr std::string_view order[] = {"dns", "idp", "storage", "db", "cache", "mqtt", "server",
-                                                 "client", "proxy", "mail", "sync"};
+                                                 "client", "proxy", "mail", "sync", "metrics"};
     const auto at = std::find(std::begin(order), std::end(order), type);
     return static_cast<int>(at - std::begin(order));
 }

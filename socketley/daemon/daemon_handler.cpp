@@ -24,6 +24,12 @@
 #include "../runtime/tunnel/tunnel_registry.h"
 #include "../runtime/proxy/proxy_auth.h"
 #include "../runtime/db/db_instance.h"
+#include "../runtime/metrics/metrics_instance.h"
+#include "../shared/persist/replaced_file.h"
+#include "../runtime/metrics/metrics_query.h"
+#include "../shared/http/url.h"
+#include "../shared/util/wall_clock.h"
+#include "series_feed.h"
 #include "../runtime/mqtt/mqtt_command.h"
 #include "../shared/util/base64.h"
 #include "../runtime/mqtt/mqtt_instance.h"
@@ -900,6 +906,12 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
                 if (!m_torn_down)
                     serve_map_requests();
             }
+            else if (req == &m_series_defer_req)
+            {
+                m_series_defer_armed = false;
+                if (!m_torn_down)
+                    serve_series_pulls();
+            }
             break;
         case op_timeout:
             if (m_alert_out.owns(req))
@@ -1564,6 +1576,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("db-query"):      return cmd_db_query(conn, pa);
         case fnv1a("dnssec"):        return cmd_dnssec(conn, pa);
         case fnv1a("tunnel"):        return cmd_tunnel(conn, pa);
+        case fnv1a("metrics"):       return cmd_metrics(conn, pa);
         case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
@@ -1690,6 +1703,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_tunnel:
                     result = parse_tunnel_flags(static_cast<tunnel_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_metrics:
+                    result = parse_metrics_flags(static_cast<metrics_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -2100,6 +2116,59 @@ int daemon_handler::make_dns_entrance(dns_instance* dns, bool start)
     }
     dns->set_proxy(proxy);
     return 0;
+}
+
+void daemon_handler::ensure_dashboard_store(const std::string& state_dir)
+{
+    const std::string marker = state_dir + "/.metrics-made";
+    struct stat st{};
+    if (::stat(marker.c_str(), &st) == 0)
+        return;
+    const auto mark = [&] {
+        if (!socketley::replace_file(marker, "", socketley::durability::none)) {}
+    };
+    std::string name = "metrics";
+    {
+        std::shared_lock lock(m_manager.mutex);
+        for (const auto& [n, rt] : m_manager.list())
+            if (rt->get_type() == runtime_metrics)
+                return mark();
+        if (m_manager.list().contains(std::string("metrics")))
+            name = "socketley-metrics";
+        if (m_manager.list().contains(name))
+            return mark();
+    }
+    // Prometheus's port when it is free, else the next free one above it, on loopback as the runtime listens.
+    uint16_t port = 0;
+    for (uint16_t p = socketley::metrics::default_port; p < socketley::metrics::default_port + 100 && !port; ++p)
+    {
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+            break;
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(p);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0)
+            port = p;
+        ::close(fd);
+    }
+    if (!port)
+    {
+        LOG_WARN("dashboard: no port from 9090 to 9189 is free for its metrics runtime; history and alerts wait for one "
+                 "made by hand: socketley create metrics metrics -p <port> -s");
+        return;
+    }
+    std::string out;
+    if (run_internal({"create", "metrics", name, "-p", std::to_string(port), "-s"}, out, false) != 0)
+    {
+        LOG_WARN(("dashboard: its metrics runtime could not be made: " + out).c_str());
+        return;
+    }
+    mark();
+    LOG_INFO(("dashboard: made the metrics runtime " + name + " on 127.0.0.1:" + std::to_string(port) +
+              ", which keeps the history and raises the alerts")
+                 .c_str());
 }
 
 // The entrances a dns runtime made for itself, which go where it goes.
@@ -3658,6 +3727,115 @@ int daemon_handler::cmd_db_restore(ipc_connection* conn, const parsed_args& pa)
         false);
 }
 
+// A metrics runtime asked what its API answers: a query, a range, the series a selector names, its targets or its
+// figures, as lines to read or with --json as the API's own JSON.
+int daemon_handler::cmd_metrics(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 3)
+    {
+        conn->write_buf = command_usage::line("metrics");
+        return 1;
+    }
+    const std::string name(pa.args[1]);
+    auto* inst = m_manager.get(name);
+    if (!inst || inst->get_type() != runtime_metrics)
+    {
+        conn->write_buf = "no metrics runtime named " + name + "\n";
+        return 1;
+    }
+    if (inst->get_state() != runtime_running)
+    {
+        conn->write_buf = "runtime is not running: " + name + "\n";
+        return 1;
+    }
+    const std::string_view action = pa.args[2];
+    bool json = false, recent = false;
+    std::string arg, at, start = "-1h", end = "now", step;
+    for (size_t i = 3; i < pa.count; ++i)
+    {
+        const std::string_view a = pa.args[i];
+        const bool has_value = i + 1 < pa.count;
+        if (a == "--json")
+            json = true;
+        else if (a == "--recent")
+            recent = true;
+        else if ((a == "--at" || a == "--start" || a == "--end" || a == "--step") && has_value)
+            (a == "--at" ? at : a == "--start" ? start : a == "--end" ? end : step) = std::string(pa.args[++i]);
+        else if (arg.empty() && !a.starts_with("--"))
+            arg = std::string(a);
+        else
+        {
+            conn->write_buf = "unknown argument: " + std::string(a) + "\n" + command_usage::line("metrics");
+            return 1;
+        }
+    }
+    // A time as the API takes it: `now`, a duration back or ahead of it, unix seconds or RFC 3339.
+    const auto when = [](const std::string& t) -> std::string {
+        const int64_t now = socketley::wall::now_ms();
+        int64_t d = 0;
+        int64_t ms = now;
+        if (t != "now")
+        {
+            if ((!t.starts_with('-') && !t.starts_with('+')) || !socketley::metrics::parse_duration(t.substr(1), d))
+                return t;
+            ms = t[0] == '-' ? now - d : now + d;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%lld.%03lld", static_cast<long long>(ms / 1000),
+                      static_cast<long long>(ms % 1000));
+        return buf;
+    };
+    const auto enc = [](std::string_view v) { return socketley::http::url_encode(v, false); };
+    std::string path, form;
+    if (action == "query" && !arg.empty())
+    {
+        path = "/api/v1/query";
+        form = "query=" + enc(arg) + (at.empty() ? std::string() : "&time=" + enc(when(at)));
+    }
+    else if (action == "query_range" && !arg.empty())
+    {
+        path = "/api/v1/query_range";
+        if (step.empty())
+            step = "60";
+        form = "query=" + enc(arg) + "&start=" + enc(when(start)) + "&end=" + enc(when(end)) + "&step=" + enc(step);
+    }
+    else if (action == "series" && !arg.empty())
+    {
+        path = "/api/v1/series";
+        form = "match%5B%5D=" + enc(arg);
+    }
+    else if (action == "targets" && arg.empty())
+        path = "/api/v1/targets";
+    else if (action == "stats" && arg.empty())
+        path = "/api/v1/status/store";
+    else if (action == "alerts" && arg.empty())
+    {
+        path = "/api/v1/alerts";
+        if (recent)
+            form = "recent=1";
+    }
+    else if (action == "rules" && arg.empty())
+        path = "/api/v1/rules";
+    else
+    {
+        conn->write_buf = command_usage::line("metrics");
+        return 1;
+    }
+    std::string payload(socketley::metrics::call_marker);
+    payload += json ? "json\n" : "text\n";
+    payload += path + "\n" + form;
+    std::string reply;
+    if (!ask_worker(conn, name, payload, reply, std::chrono::seconds(30)))
+        return 2;
+    const size_t nl = reply.find('\n');
+    const std::string_view status = std::string_view(reply).substr(0, nl);
+    std::string body = nl == std::string::npos ? std::string() : reply.substr(nl + 1);
+    if (!body.empty() && body.back() != '\n')
+        body += '\n';
+    conn->write_buf = std::move(body);
+    return status == "200" ? 0 : 1;
+}
+
 // A tunnel edge's agents: an invitation made, the agents listed, or one revoked, the edge's worker reading the file
 // again within a second and cutting off an agent no longer in it.
 int daemon_handler::cmd_tunnel(ipc_connection* conn, const parsed_args& pa)
@@ -4828,9 +5006,15 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
         before.idp          = std::string(tn_b->get_idp());
         before.idp_audience = std::string(tn_b->get_idp_audience());
     }
+    // A metrics runtime's own settings, put back with the rest when a later flag is refused.
+    std::optional<metrics_instance::settings> metrics_before;
+    if (type == runtime_metrics)
+        metrics_before = static_cast<const metrics_instance*>(instance)->get_settings();
 
     const auto restore_edit = [&]
     {
+        if (metrics_before)
+            static_cast<metrics_instance*>(instance)->set_settings(*metrics_before);
         instance->set_tls(before.tls);
         instance->set_cert_path(before.cert);
         instance->set_key_path(before.key);
@@ -4936,6 +5120,17 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
                         return 1;
                     }
                     result = parse_tunnel_flags(static_cast<tunnel_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_metrics:
+                    // A metrics runtime reads its own settings when it starts, as a tunnel does.
+                    if (is_running && runtime_schema::offered(pa.args[i], type))
+                    {
+                        restore_edit();
+                        std::cout << pa.args[i] << " changes a metrics runtime when it starts: socketley edit " << name
+                                  << " " << pa.args[i] << " ... --restart\n";
+                        return 1;
+                    }
+                    result = parse_metrics_flags(static_cast<metrics_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's fields reach its worker at the next
@@ -7070,6 +7265,41 @@ void daemon_handler::on_worker_route(proxy_supervisor* from, std::string_view to
 
 // socketley.create/.start/.stop/.remove asked by a script in a worker,
 // recorded here and served a turn later rather than where they arrive.
+void daemon_handler::queue_series_pull(proxy_supervisor* from, std::string payload)
+{
+    const runtime_instance* p = from ? from->placeholder() : nullptr;
+    if (m_torn_down || !p)
+        return;
+    m_series_queue.push_back({std::string(p->get_name()), from->shard_index(), std::move(payload)});
+    if (m_series_defer_armed)
+        return;
+    m_series_defer_req = {this, nullptr, -1, 0, op_nop};
+    m_series_defer_armed = m_loop.submit_nop(&m_series_defer_req);
+    // Unanswered, the pull is taken as lost by the worker, which asks for everything next time.
+    if (!m_series_defer_armed)
+        m_series_queue.clear();
+}
+
+void daemon_handler::serve_series_pulls()
+{
+    std::vector<pending_series_pull> batch;
+    batch.swap(m_series_queue);
+    if (!m_series_walk)
+        m_series_walk = std::make_unique<series_walk>(m_manager);
+    for (auto& q : batch)
+    {
+        const auto it = m_proxy_workers.find(q.runtime);
+        if (it == m_proxy_workers.end() || it->second.size() <= q.shard || !it->second[q.shard])
+            continue;
+        proxy_supervisor* sup = it->second[q.shard].get();
+        std::shared_ptr<void>& state = sup->series_state();
+        const std::string frame = m_series_walk->answer(state, q.payload);
+        // A frame the socket would not take leaves the worker behind what this side thinks it has, so both start over.
+        if (!frame.empty() && !sup->send_series_feed(frame))
+            state.reset();
+    }
+}
+
 void daemon_handler::queue_map_request(uint64_t ticket, int reply_fd,
                                        std::string op, std::string name,
                                        std::string config)
@@ -7235,7 +7465,8 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // are the exceptions: their work is done on a worker's own loop, which
         // only a worker turns.
         if (cfg.type == runtime_sync || cfg.type == runtime_idp || cfg.type == runtime_db ||
-            cfg.type == runtime_mqtt || cfg.type == runtime_mail || cfg.type == runtime_tunnel)
+            cfg.type == runtime_mqtt || cfg.type == runtime_mail || cfg.type == runtime_tunnel ||
+            cfg.type == runtime_metrics)
             inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(
@@ -7890,6 +8121,10 @@ void daemon_handler::reconcile_proxy_workers()
         // the daemon the two processes have something to say to each other.
         sup->set_peer_handler([this](proxy_supervisor* from, std::string target)
                               { link_peers(from, target); });
+        sup->set_series_handler([this](proxy_supervisor* from, std::string payload)
+                                { queue_series_pull(from, std::move(payload)); });
+        sup->set_alert_handler([this](proxy_supervisor* from, std::string payload)
+                               { on_metrics_alert(from, payload); });
 
         // The four map calls, recorded here and served a turn later, with
         // `this` outliving every supervisor it is installed on.
@@ -9393,6 +9628,27 @@ void daemon_handler::send_alert(std::string body)
         if (m_alert_hook)
             m_alert_out.add("alerts", std::move(b));
     });
+}
+
+void daemon_handler::on_metrics_alert(proxy_supervisor* from, std::string_view payload)
+{
+    const runtime_instance* p = from ? from->placeholder() : nullptr;
+    uint8_t to = 0;
+    std::string_view sub, event, body;
+    // Only a metrics runtime raises alerts, so a frame from any other worker is not taken.
+    if (!p || p->get_type() != runtime_metrics || !worker_proto::decode_alert_note(payload, to, sub, event, body))
+        return;
+    const bool hook = m_alert_hook && (to & socketley::metrics::notify_webhook);
+    const bool mail = m_alert_mail && (to & socketley::metrics::notify_mail);
+    if (hook || mail)
+        m_alert_box.post_done([this, hook, mail, b = std::string(body)]() mutable {
+            if (mail)
+                m_alert_out.add("alert-mail", b);
+            if (hook)
+                m_alert_out.add("alerts", std::move(b));
+        });
+    if (m_events && (to & socketley::metrics::notify_events))
+        send_event(std::string(sub), std::string(event));
 }
 
 void daemon_handler::send_event(std::string sub, std::string json)

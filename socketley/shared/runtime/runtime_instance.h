@@ -321,6 +321,15 @@ public:
     // The daemon's order to a cluster cache replica about its part, which no other runtime takes.
     virtual void on_replica_order(std::string_view /*payload*/) {}
 
+    // The daemon's answer to a series_pull and each runtime map it pushes, which only a metrics runtime reads.
+    virtual void on_series_feed(std::string_view /*payload*/) {}
+    virtual void on_runtime_map(std::string_view /*payload*/) {}
+
+    // A whole frame up the worker's control socket, false when it could not be queued; set only in a worker.
+    using daemon_sink = std::function<bool(const std::string& frame)>;
+    void set_daemon_sink(daemon_sink s) { m_daemon_sink = std::move(s); }
+    bool send_to_daemon(const std::string& frame) const { return m_daemon_sink && m_daemon_sink(frame); }
+
     // Atomic for the DAEMON's copy of these, not the worker's.
     //
     // Both processes hold a runtime_instance and they use these four
@@ -1034,6 +1043,9 @@ private:
 
     // See set_ref_sink.  Empty everywhere but in a worker.
     ref_sink m_ref_sink;
+
+    // See set_daemon_sink.
+    daemon_sink m_daemon_sink;
 
     std::shared_ptr<const route_table> m_worker_routes;
 

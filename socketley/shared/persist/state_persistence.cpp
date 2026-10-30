@@ -14,6 +14,7 @@
 #include "../../runtime/idp/idp_instance.h"
 #include "../../runtime/tunnel/tunnel_instance.h"
 #include "../../runtime/db/db_instance.h"
+#include "../../runtime/metrics/metrics_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
 #include "../../cli/command_hashing.h"
@@ -746,6 +747,26 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.db_backup_keep = db->get_backup_keep();
             break;
         }
+        case runtime_metrics:
+        {
+            auto* mt = static_cast<const metrics_instance*>(instance);
+            cfg.metrics_keys = std::string(mt->get_keys_path());
+            cfg.metrics_idp = std::string(mt->get_idp());
+            cfg.metrics_idp_audience = std::string(mt->get_idp_audience());
+            cfg.metrics_no_local = !mt->get_local();
+            cfg.metrics_scrape = std::string(mt->get_scrape_path());
+            cfg.metrics_archive = std::string(mt->get_archive());
+            cfg.metrics_archive_credentials = std::string(mt->get_archive_credentials());
+            cfg.metrics_every = mt->get_every();
+            cfg.metrics_keep = mt->get_keep();
+            cfg.metrics_downsample = std::string(mt->get_downsample());
+            cfg.metrics_max_series = mt->get_max_series();
+            cfg.metrics_durable = mt->get_durable();
+            cfg.metrics_rules = std::string(mt->get_rules_path());
+            cfg.metrics_notify = std::string(mt->get_notify());
+            cfg.metrics_receive = mt->get_receive();
+            break;
+        }
         case runtime_mqtt:
         {
             auto* mq = static_cast<const mqtt_instance*>(instance);
@@ -1232,6 +1253,31 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_int_field("backup_every", cfg.db_backup_every);
             append_int_field("backup_keep", cfg.db_backup_keep);
             break;
+        case runtime_metrics:
+            if (!cfg.metrics_keys.empty())
+                append_str_field("keys", cfg.metrics_keys);
+            if (!cfg.metrics_idp.empty())
+                append_str_field("idp", cfg.metrics_idp);
+            if (!cfg.metrics_idp_audience.empty())
+                append_str_field("idp_audience", cfg.metrics_idp_audience);
+            append_bool_field("no_local", cfg.metrics_no_local);
+            if (!cfg.metrics_scrape.empty())
+                append_str_field("scrape", cfg.metrics_scrape);
+            if (!cfg.metrics_archive.empty())
+                append_str_field("archive", cfg.metrics_archive);
+            if (!cfg.metrics_archive_credentials.empty())
+                append_str_field("archive_credentials", cfg.metrics_archive_credentials);
+            append_int_field("every", cfg.metrics_every);
+            append_int_field("keep", cfg.metrics_keep);
+            append_str_field("downsample", cfg.metrics_downsample);
+            append_int_field("max_series", cfg.metrics_max_series);
+            append_bool_field("durable", cfg.metrics_durable);
+            if (!cfg.metrics_rules.empty())
+                append_str_field("rules", cfg.metrics_rules);
+            if (!cfg.metrics_notify.empty())
+                append_str_field("notify", cfg.metrics_notify);
+            append_bool_field("receive", cfg.metrics_receive);
+            break;
         case runtime_mqtt:
             if (!cfg.mqtt_users.empty())
                 append_str_field("users", cfg.mqtt_users);
@@ -1580,6 +1626,25 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.db_backup_dir = json_get_string(json, "backup_dir");
             cfg.db_backup_every = json_get_uint32(json, "backup_every", 86400);
             cfg.db_backup_keep = json_get_uint32(json, "backup_keep", 7);
+            break;
+        case runtime_metrics:
+            cfg.metrics_keys = json_get_string(json, "keys");
+            cfg.metrics_idp = json_get_string(json, "idp");
+            cfg.metrics_idp_audience = json_get_string(json, "idp_audience");
+            cfg.metrics_no_local = json_get_bool(json, "no_local");
+            cfg.metrics_scrape = json_get_string(json, "scrape");
+            cfg.metrics_archive = json_get_string(json, "archive");
+            cfg.metrics_archive_credentials = json_get_string(json, "archive_credentials");
+            cfg.metrics_every = json_get_uint32(json, "every", 10);
+            cfg.metrics_keep = json_get_size(json, "keep", 30ull * 86400);
+            cfg.metrics_downsample = json_get_string(json, "downsample");
+            if (!json_has_key(json, "downsample"))
+                cfg.metrics_downsample = "5m:1y,1h:5y";
+            cfg.metrics_max_series = json_get_uint32(json, "max_series", 200000);
+            cfg.metrics_durable = json_get_bool(json, "durable");
+            cfg.metrics_rules = json_get_string(json, "rules");
+            cfg.metrics_notify = json_get_string(json, "notify");
+            cfg.metrics_receive = json_get_bool(json, "receive");
             break;
         case runtime_mqtt:
             cfg.mqtt_users = json_get_string(json, "users");

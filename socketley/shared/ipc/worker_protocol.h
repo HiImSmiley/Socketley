@@ -16,6 +16,7 @@
 #include "../cluster/cluster_view.h"
 #include "../util/byte_codec.h"
 #include "shard_stats.h"
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -63,6 +64,8 @@ enum class frame_type : uint16_t
     map_req    = 10, // payload: see encode_map_request
     route_up   = 11, // payload: see encode_route_frame
     config_err = 12, // payload: why a `config` was refused; see below
+    series_pull = 13, // payload: see encode_series_pull
+    alert_note  = 14, // payload: see encode_alert_note
 
     // daemon → worker, again
     deliver_ref = 27,  // payload: see encode_send_ref — the same frame coming
@@ -82,6 +85,9 @@ enum class frame_type : uint16_t
     // payload: a cluster::replica_order -- what a cluster cache replica is to
     // be, sent every tick so that the daemon's silence is what fences it.
     replica_order = 32,
+
+    // payload: see series_feed_writer -- the answer to a series_pull.
+    series_feed = 33,
 };
 
 // reload_err carries the diagnostic verbatim and is sent only when the reload
@@ -1092,6 +1098,205 @@ inline bool decode_chan_reply(std::string_view payload, chan_reply_view& p)
     p.ticket  = r.u64();
     p.status  = static_cast<uint8_t>(r.u8());
     p.payload = r.str();
+    return r.ok;
+}
+
+// ── The series feed ─────────────────────────────────────────────────────────
+// A metrics runtime's view of this daemon's own series, the ones /metrics writes, asked for at each of its ticks and
+// answered by difference: a family and a label set are sent once under an id, then only the values that changed and
+// the ids that went, and the whole again after `series_resync`.  It is a pull, so a daemon without a metrics runtime
+// does nothing at all for it.
+//
+//   series_pull:  u64 ticket (the sample time, ms), u8 flags
+//   series_feed:  u64 ticket, u8 flags, str instance,
+//                 u32 n { u32 family, u8 kind, str name, str help }
+//                 u32 n { u32 key, u32 family, u8 labels { str name, str value } }
+//                 u32 n { u32 key, u64 value as the bits of a double }
+//                 u32 n { u32 key gone }
+
+// A metrics runtime's alert for the daemon's notifier: u8 where (metrics::notify_*), str the events topic under
+// socketley/, str the retained event (empty clears it), str the webhook's and mail's body.
+inline std::string encode_alert_note(uint8_t to, std::string_view sub, std::string_view event, std::string_view body)
+{
+    std::string out;
+    out.push_back(static_cast<char>(to));
+    put_str(out, sub);
+    put_str(out, event);
+    put_str(out, body);
+    return out;
+}
+
+inline bool decode_alert_note(std::string_view payload, uint8_t& to, std::string_view& sub, std::string_view& event,
+                              std::string_view& body)
+{
+    reader r(payload.data(), payload.size());
+    to    = r.u8();
+    sub   = r.str();
+    event = r.str();
+    body  = r.str();
+    return r.ok;
+}
+
+// Asked by a worker that holds nothing of the daemon's yet, and answered with everything and ids that start over.
+inline constexpr uint8_t series_resync = 1;
+
+// The most labels a series of the feed carries, well above the four the daemon's widest family has.
+inline constexpr size_t series_max_labels = 32;
+
+inline std::string encode_series_pull(uint64_t ticket, uint8_t flags)
+{
+    std::string out;
+    socketley::bytes::append64(out, ticket);
+    out.push_back(static_cast<char>(flags));
+    return out;
+}
+
+inline bool decode_series_pull(std::string_view payload, uint64_t& ticket, uint8_t& flags)
+{
+    reader r(payload.data(), payload.size());
+    ticket = r.u64();
+    flags  = r.u8();
+    return r.ok;
+}
+
+// The four sections built side by side, since their counts are known only once the walk is over.
+class series_feed_writer
+{
+public:
+    void family(uint32_t id, uint8_t kind, std::string_view name, std::string_view help)
+    {
+        socketley::bytes::append32(m_fams, id);
+        m_fams.push_back(static_cast<char>(kind));
+        put_str(m_fams, name);
+        put_str(m_fams, help);
+        ++m_nf;
+    }
+
+    // `labels` is any range of objects with a `name` and a `value`.
+    template <class Labels>
+    void key(uint32_t id, uint32_t family, const Labels& labels)
+    {
+        socketley::bytes::append32(m_keys, id);
+        socketley::bytes::append32(m_keys, family);
+        const size_t at = m_keys.size();
+        m_keys.push_back('\0');
+        uint8_t n = 0;
+        for (const auto& l : labels)
+        {
+            if (n == series_max_labels)
+                break;
+            put_str(m_keys, l.name);
+            put_str(m_keys, l.value);
+            ++n;
+        }
+        m_keys[at] = static_cast<char>(n);
+        ++m_nk;
+    }
+
+    void value(uint32_t id, double v)
+    {
+        socketley::bytes::append32(m_vals, id);
+        uint64_t bits = 0;
+        std::memcpy(&bits, &v, sizeof bits);
+        socketley::bytes::append64(m_vals, bits);
+        ++m_nv;
+    }
+
+    void gone(uint32_t id)
+    {
+        socketley::bytes::append32(m_gone, id);
+        ++m_ng;
+    }
+
+    // The payload, the writer emptied for the next.
+    std::string finish(uint64_t ticket, uint8_t flags, std::string_view instance)
+    {
+        std::string out;
+        out.reserve(21 + instance.size() + 16 + m_fams.size() + m_keys.size() + m_vals.size() + m_gone.size());
+        socketley::bytes::append64(out, ticket);
+        out.push_back(static_cast<char>(flags));
+        put_str(out, instance);
+        for (auto [n, s] : {std::pair{m_nf, &m_fams}, {m_nk, &m_keys}, {m_nv, &m_vals}, {m_ng, &m_gone}})
+        {
+            socketley::bytes::append32(out, n);
+            out += *s;
+            s->clear();
+        }
+        m_nf = m_nk = m_nv = m_ng = 0;
+        return out;
+    }
+
+    uint32_t values() const { return m_nv; }
+
+private:
+    std::string m_fams, m_keys, m_vals, m_gone;
+    uint32_t    m_nf{0}, m_nk{0}, m_nv{0}, m_ng{0};
+};
+
+struct series_label_view
+{
+    std::string_view name;
+    std::string_view value;
+};
+
+// The feed handed to `v` section by section: head(ticket, flags, instance), family(id, kind, name, help),
+// key(id, family, span of series_label_view), value(id, double), gone(id); false for a frame that does not read.
+template <class V>
+bool decode_series_feed(std::string_view payload, V& v)
+{
+    reader r(payload.data(), payload.size());
+    const uint64_t ticket = r.u64();
+    const uint8_t flags = r.u8();
+    const std::string_view instance = r.str();
+    if (!r.ok)
+        return false;
+    v.head(ticket, flags, instance);
+
+    // A count is bounded by the bytes that could hold it, so a corrupt one ends the walk rather than spinning.
+    uint32_t n = r.u32();
+    for (uint32_t i = 0; i < n && r.ok; ++i)
+    {
+        const uint32_t id = r.u32();
+        const uint8_t kind = r.u8();
+        const std::string_view name = r.str();
+        const std::string_view help = r.str();
+        if (r.ok)
+            v.family(id, kind, name, help);
+    }
+    n = r.u32();
+    series_label_view ls[series_max_labels];
+    for (uint32_t i = 0; i < n && r.ok; ++i)
+    {
+        const uint32_t id = r.u32();
+        const uint32_t fam = r.u32();
+        const uint8_t nl = r.u8();
+        if (nl > series_max_labels)
+            return false;
+        for (uint8_t j = 0; j < nl && r.ok; ++j)
+        {
+            ls[j].name = r.str();
+            ls[j].value = r.str();
+        }
+        if (r.ok)
+            v.key(id, fam, std::span<const series_label_view>(ls, nl));
+    }
+    n = r.u32();
+    for (uint32_t i = 0; i < n && r.ok; ++i)
+    {
+        const uint32_t id = r.u32();
+        const uint64_t bits = r.u64();
+        double d = 0;
+        std::memcpy(&d, &bits, sizeof d);
+        if (r.ok)
+            v.value(id, d);
+    }
+    n = r.u32();
+    for (uint32_t i = 0; i < n && r.ok; ++i)
+    {
+        const uint32_t id = r.u32();
+        if (r.ok)
+            v.gone(id);
+    }
     return r.ok;
 }
 

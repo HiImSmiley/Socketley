@@ -994,15 +994,8 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     bool metrics_bound = false;
     if (metrics_port > 0)
     {
-        std::function<void(std::string)> alert_send;
-        std::function<void(std::string, std::string)> alert_event;
-        if (told_open && (!config.alert_webhook.empty() || !config.alert_mail.empty()))
-            alert_send = [&handler](std::string body) { handler.send_alert(std::move(body)); };
-        if (told_open && !config.events.empty())
-            alert_event = [&handler](std::string sub, std::string json)
-            { handler.send_event(std::move(sub), std::move(json)); };
-        metrics_bound = metrics.start(metrics_port, {config.dashboard_credentials, paths.state_dir.string(), config.alert_webhook,
-                                                     std::move(alert_send), std::move(alert_event), config.dashboard_idp});
+        metrics_bound = metrics.start(metrics_port, {config.dashboard_credentials, paths.state_dir.string(),
+                                                     config.alert_webhook, config.dashboard_idp});
         if (metrics_bound)
             LOG_INFO("metrics endpoint started");
         else
@@ -1018,6 +1011,11 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Restore persisted runtimes before entering the event loop
     restore_runtimes(persistence, manager, loop);
+    // The page's history and the alerts are a metrics runtime's, so a daemon whose dashboard signs people in, or that
+    // is told where alerts go, is given one once; a bare metrics_port is a scrape endpoint, which needs none.
+    if ((metrics_port > 0 && (!config.dashboard_credentials.empty() || !config.dashboard_idp.empty())) ||
+        !config.alert_webhook.empty() || !config.alert_mail.empty() || !config.events.empty())
+        handler.ensure_dashboard_store(paths.state_dir.string());
 
     // And fork their workers here rather than leaving it to the first health
     // tick: restore puts a runtime in `running` and spawns nothing, so the

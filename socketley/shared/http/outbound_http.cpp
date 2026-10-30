@@ -712,9 +712,9 @@ void http_peer::got(const char* p, size_t n)
     }
     // Past the cap is no answer this client reads, and not a truncated one handed on as whole; asked first, since the
     // read that crosses it can be the one that completes it.
-    if (m_in.size() > answer_cap)
+    if (const size_t cap = m_req.max_answer ? m_req.max_answer : answer_cap; m_in.size() > cap)
     {
-        finish(false, "the answer is larger than 1 MiB");
+        finish(false, "the answer is larger than " + std::to_string(cap >> 10) + " KiB");
         return;
     }
     if (answer_complete())

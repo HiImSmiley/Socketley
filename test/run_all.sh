@@ -251,6 +251,8 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_metrics_chunk)  corpus=metrics_chunk ;;
         fuzz_metrics_text)   corpus=metrics_text ;;
         fuzz_metrics_query)  corpus=metrics_query ;;
+        fuzz_metrics_rules)  corpus=metrics_rules ;;
+        fuzz_metrics_remote) corpus=metrics_remote ;;
         fuzz_mqtt)           corpus=mqtt ;;
         fuzz_mail)           corpus=mail ;;
         fuzz_tunnel_mux)     corpus=tunnelmux ;;

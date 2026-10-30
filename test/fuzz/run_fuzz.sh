@@ -175,6 +175,8 @@ declare -A CORPUS=(
     [fuzz_dns]=dns
     [fuzz_metrics_text]=metrics_text
     [fuzz_metrics_query]=metrics_query
+    [fuzz_metrics_rules]=metrics_rules
+    [fuzz_metrics_remote]=metrics_remote
     [fuzz_mqtt]=mqtt
     [fuzz_mail]=mail
     [fuzz_proxy_tunnel]=proxytunnel
@@ -183,7 +185,7 @@ declare -A CORPUS=(
     [fuzz_metrics_chunk]=metrics_chunk
 )
 
-read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_metrics_text fuzz_metrics_query fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk}"
+read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk}"
 
 # The pinned configurations the proxy seed corpus is replayed over, on top of
 # the default run.  ';' separated because the values themselves are comma

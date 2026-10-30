@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test: the dashboard's history of the last day.
+# Integration test: the dashboard's history, which the metrics runtime the daemon makes for it keeps.
 #
 # ─── WHAT THIS HOLDS DOWN ───────────────────────────────────────────────────
 #
@@ -7,9 +7,10 @@
 #   the points  a runtime's messages per second, its memory, and the daemon's
 #               own series, in the buckets asked for, null where there is no
 #               point; the range and the number of buckets are held in bounds
-#   a restart   the points are written to the state directory, private, and a
-#               daemon started again shows them before it has taken one of its
-#               own -- the runtimes it restores come after its first reading
+#   the store   a daemon whose dashboard signs people in is given a metrics
+#               runtime, private on disk, and the page reads it
+#   a restart   a daemon started again shows the points from before, once its
+#               metrics runtime is back
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -52,7 +53,9 @@ expect "the history needs a session" "$(curl -s -o /dev/null -w '%{http_code}' "
 "$BIN" create storage st -p "$S" --dir "$T/st" --anonymous -s >/dev/null 2>&1
 for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$S/" && break; sleep 0.1; done
 curl -s -o /dev/null -X PUT "http://127.0.0.1:$S/b"
-# Two readings ten seconds apart make the first point; traffic all through it.
+for _ in $(seq 1 50); do "$BIN" ls 2>/dev/null | grep -qE '^[0-9a-f]+ +metrics +metrics .*Up' && break; sleep 0.1; done
+expect "the daemon made a metrics runtime for its dashboard" "$("$BIN" ls | grep -cE '^[0-9a-f]+ +metrics +metrics .*Up')" 1
+# Its samples ten seconds apart, so a rate needs two of them; traffic all through.
 end=$((SECONDS + 23))
 while [ $SECONDS -lt $end ]; do curl -s -o /dev/null "http://127.0.0.1:$S/b"; sleep 0.05; done
 
@@ -67,21 +70,19 @@ expect "the daemon's own is there too" "$(hist "range=60&points=12" | j "max(v o
 expect "a runtime never seen has none" "$(hist "runtime=nope")" "{}"
 expect "the buckets are held in bounds" "$(hist "runtime=st&range=60&points=3" | j "len(d['msg'])") $(hist "runtime=st&range=60&points=99999" | j "len(d['msg'])")" "10 1440"
 now=$(date +%s)
-expect "and the range to a day" "$(hist "runtime=st&range=9999999&points=10" | j "abs(d['from'] - ($now - 86400)) <= 2")" True
+expect "and the range to a year" "$(hist "runtime=st&range=99999999&points=10" | j "abs(d['from'] - ($now - 366 * 86400)) <= 2")" True
 
 # ─── a restart ──────────────────────────────────────────────────────────────
+dir=$(find "$HOME" -type d -path '*/metrics/metrics' | head -1)
+expect "its store lies in the state directory, the daemon's user's alone" "$(stat -c %a "$dir" 2>/dev/null)" 700
 kill "$SOCKETLEY_DPID"; wait "$SOCKETLEY_DPID" 2>/dev/null
-file=$(find "$HOME" -name .history -type f | head -1)
-expect "the points are written to the state directory when the daemon stops" "$([ -s "$file" ] && echo yes)" yes
-expect "readable by the daemon's user alone" "$(stat -c %a "$file" 2>/dev/null)" 600
 : > "$SOCKETLEY_DLOG"
 daemon_start "$BIN"
 for _ in $(seq 1 50); do curl -s -o /dev/null "$U/" && break; sleep 0.1; done
 curl -s -X POST -c "$T/jar" -u "$ADMIN" "$U/api/session" >/dev/null
-expect "a daemon started again shows them at once" "$(hist "runtime=st&range=120&points=12" | j "max(v or 0 for v in d['msg']) > 2")" True
-sleep 1
-expect "and keeps them past its first reading, taken before its runtimes are back" \
-    "$(hist "runtime=st&range=120&points=12" | j "max(v or 0 for v in d['msg']) > 2")" True
+for _ in $(seq 1 50); do [ "$(hist "runtime=st&range=120&points=12" | j "max(v or 0 for v in d['msg']) > 2" 2>/dev/null)" = True ] && break; sleep 0.1; done
+expect "a daemon started again shows the points from before" "$(hist "runtime=st&range=120&points=12" | j "max(v or 0 for v in d['msg']) > 2")" True
+expect "and no second metrics runtime is made" "$("$BIN" ls | grep -c ' metrics ')" 1
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

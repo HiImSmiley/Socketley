@@ -9,12 +9,13 @@
 #include <type_traits>
 #include <vector>
 
+#include "latency_histogram.h"
 #include "runtime_definitions.h"
 
 namespace socketley::metric_catalog
 {
 
-enum class kind : uint8_t { counter, gauge, untyped };
+enum class kind : uint8_t { counter, gauge, untyped, histogram };
 
 // The name the exposition format's TYPE line gives a kind.
 const char* kind_name(kind k);
@@ -44,12 +45,17 @@ struct series
     // The value exactly, past what a double holds, when it is a whole number that is not negative.
     uint64_t               integer{0};
     bool                   integral{false};
+    // A histogram's `_bucket`, `_sum` or `_count`, which the series' name is the family's name followed by.
+    std::string_view       suffix{};
 
-    static series of(const family& f, std::span<const label> ls, uint64_t v)
+    static series of(const family& f, std::span<const label> ls, uint64_t v, std::string_view suffix = {})
     {
-        return {&f, ls, static_cast<double>(v), v, true};
+        return {&f, ls, static_cast<double>(v), v, true, suffix};
     }
-    static series of(const family& f, std::span<const label> ls, double v) { return {&f, ls, v, 0, false}; }
+    static series of(const family& f, std::span<const label> ls, double v, std::string_view suffix = {})
+    {
+        return {&f, ls, v, 0, false, suffix};
+    }
 };
 
 // A callable taken by reference, so a walk calls its sink without a std::function's allocation.
@@ -113,6 +119,7 @@ public:
 
 private:
     friend void emit(const type_entry&, std::span<const source>, sink_ref);
+    friend void emit_histogram(const field&, uint16_t, const source&, sink_ref);
 
     // A key by its place in the text, which a view would lose when a short text moves with its figures.
     struct other
@@ -137,6 +144,15 @@ private:
     std::vector<uint8_t>  m_has;
     // Everything else numeric, in the order the text first gave it.
     std::vector<other>    m_other;
+    // The histogram fields' figures, each shard's folded in, by field.
+    struct histogram_slot
+    {
+        uint16_t          field;
+        latency_histogram h;
+    };
+    std::vector<histogram_slot> m_hist;
+    // A histogram field's line, false when `key` names none.
+    bool put_histogram(std::string_view key, std::string_view value);
 };
 
 // A runtime as a walk reads it: the value of its `name` label and its figures.

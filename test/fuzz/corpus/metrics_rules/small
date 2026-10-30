@@ -1,0 +1,5 @@
+every=5s
+record r:x team=a : sum(up)
+alert A critical for=1m keep=30s inhibits=B summary="{{ $value | humanize }} {{ $labels.x }}" : up == 0
+alert B warning : up < 1
+off TargetDown

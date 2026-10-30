@@ -1,6 +1,7 @@
 #include "event_loop.h"
 #include "../util/logging.h"
 #include "eventfd_wake.h"
+#include "turn_clock.h"
 #include "../util/number_parse.h"
 #include "../util/settings.h"
 #include <unistd.h>
@@ -1320,6 +1321,8 @@ uint32_t event_loop::poll_completions(int timeout_ms)
         }
     }
 
+    // The turn's one clock read, which the worker paces itself by and a latency histogram subtracts from.
+    socketley::turn_clock::stamp();
     bool got_signal = false;
     m_last_batch = dispatch_ready(got_signal);
     return m_last_batch;
@@ -1353,6 +1356,7 @@ void event_loop::run()
                 break;
         }
 
+        socketley::turn_clock::stamp();
         bool got_signal = false;
         dispatch_ready(got_signal);
 

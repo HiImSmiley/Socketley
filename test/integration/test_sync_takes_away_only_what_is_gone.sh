@@ -221,15 +221,15 @@ expect "a target that is not there yet holds up no walk of the others" "$(keys t
 
 U="http://127.0.0.1:$M"
 curl -s -X POST -c "$T/jar" -u "$ADMIN" "$U/api/session" >/dev/null
-al() { curl -s -m 10 -b "$T/jar" "$U/api/alerts" | python3 -c "import json,sys; d=json.load(sys.stdin); print(any(a['id'] == 'sync:late' for a in d['active']))"; }
+al() { curl -s -m 10 -b "$T/jar" "$U/api/alerts" | python3 -c "import json,sys; d=json.load(sys.stdin); print(any(a['id'].startswith('SyncFailing:') and a['runtime'] == 'late' for a in d['active']))"; }
 "$BIN" create sync late --dir "$T/src" --storage box/later --credentials "$T/creds" -s >/dev/null 2>&1
-for _ in $(seq 1 60); do [ "$(al)" = True ] && break; sleep 1; done
+for _ in $(seq 1 90); do [ "$(al)" = True ] && break; sleep 1; done
 expect "a sync whose bucket is not there raises an alert" "$(al)" True
 "$BIN" stop late >/dev/null 2>&1
 for _ in $(seq 1 60); do [ "$(al)" = False ] && break; sleep 1; done
 expect "a sync stopped owes nothing, and its alert clears" "$(al)" False
 "$BIN" start late >/dev/null 2>&1
-for _ in $(seq 1 60); do [ "$(al)" = True ] && break; sleep 1; done
+for _ in $(seq 1 90); do [ "$(al)" = True ] && break; sleep 1; done
 expect "and started again still failing raises it again" "$(al)" True
 S -o /dev/null -X PUT "http://127.0.0.1:$P/later"
 for _ in $(seq 1 90); do [ "$(al)" = False ] && break; sleep 1; done

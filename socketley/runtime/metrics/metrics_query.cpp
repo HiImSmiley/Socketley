@@ -58,13 +58,43 @@ bool query_engine::check(std::string_view query, query_error& err) const
     return parse_promql(query, m_limits.max_query_length, e, err);
 }
 
+prepared_query::prepared_query() = default;
+prepared_query::~prepared_query() = default;
+prepared_query::prepared_query(prepared_query&&) noexcept = default;
+prepared_query& prepared_query::operator=(prepared_query&&) noexcept = default;
+
+bool prepared_query::is_instant_value() const
+{
+    return m_expr && (m_expr->type == value_type::vector || m_expr->type == value_type::scalar);
+}
+
+bool query_engine::prepare(std::string_view query, prepared_query& out, query_error& err) const
+{
+    out.m_expr.reset();
+    return parse_promql(query, m_limits.max_query_length, out.m_expr, err);
+}
+
 bool query_engine::eval_instant(std::string_view query, int64_t t_ms, query_result& out, query_error& err)
 {
     out = {};
     m_stats = {};
-    std::unique_ptr<expr_node> e;
-    if (!parse_promql(query, m_limits.max_query_length, e, err))
+    prepared_query q;
+    if (!prepare(query, q, err))
         return false;
+    return eval_instant(q, t_ms, out, err);
+}
+
+bool query_engine::eval_instant(const prepared_query& query, int64_t t_ms, query_result& out, query_error& err)
+{
+    out = {};
+    m_stats = {};
+    if (!query.m_expr)
+    {
+        err.type = "bad_data";
+        err.message = "no query";
+        return false;
+    }
+    const std::unique_ptr<expr_node>& e = query.m_expr;
     if (t_ms > max_time_ms || t_ms < -max_time_ms)
     {
         err.type = "bad_data";

@@ -158,6 +158,7 @@ Object.assign(P, {
   mqtt: '<circle cx="12" cy="12" r="2"/><path d="M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7M5.5 18.5a9.2 9.2 0 0 1 0-13M18.5 5.5a9.2 9.2 0 0 1 0 13"/>',
   mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
   tunnel: '<path d="M3.5 20v-8a8.5 8.5 0 0 1 17 0v8"/><path d="M8.5 20v-7a3.5 3.5 0 0 1 7 0v7"/><path d="M2.5 20h19"/>',
+  metrics: '<path d="M3.5 20.5h17"/><path d="M5 16.5l4.5-5 3.5 3 6-7.5"/><circle cx="19" cy="7" r="1.3"/>',
   sync: '<path d="M4 11a8 8 0 0 1 13.7-5.6L20 7.5"/><path d="M20 13a8 8 0 0 1-13.7 5.6L4 16.5"/><path d="M20 3.5V7.5h-4M4 20.5v-4h4"/>',
   open: '<path d="M14 3.5h6.5V10"/><path d="M20.5 3.5 11 13"/><path d="M17.5 14v5.2a1.3 1.3 0 0 1-1.3 1.3H4.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H10"/>',
   gauge: '<path d="M12 14l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>', cpu: '<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/>'
@@ -174,7 +175,8 @@ const TYPES = {
   db: ['db', 'Database', 'JSON documents for apps, each owned by an account of the sign-in.'],
   mqtt: ['mqtt', 'MQTT', 'A broker for devices, apps and browsers, whose sessions wait for clients that went away.'],
   mail: ['mail', 'Mail', 'A mail server for its domains and users: SMTP, a spool, DKIM, mailboxes in a storage, IMAP.'],
-  tunnel: ['tunnel', 'Tunnel', 'Reaches a machine with no public address: an edge here, or an agent that dials one.']
+  tunnel: ['tunnel', 'Tunnel', 'Reaches a machine with no public address: an edge here, or an agent that dials one.'],
+  metrics: ['metrics', 'Metrics', 'Every figure of this daemon and the endpoints it scrapes, kept for years and read by PromQL, as Grafana reads a Prometheus.']
 };
 const ARRAYS = new Set(['backends', 'upstreams']);
 const TUNNEL_AGENT = new Set(['--to', '--join', '--offer']);
@@ -206,7 +208,7 @@ let me = null, schema = null, view = { at: 'over' }, rts = [], meta = {}, over =
 // The daemon's rates now, from the last two polls.
 const cur = { msg: 0, bin: 0, bout: 0, cpu: 0 };
 // The daemon's history of the chosen range, by runtime and '' for the daemon, as /api/history gives it.
-const RANGES = [[900, '15m'], [3600, '1h'], [21600, '6h'], [86400, '24h']];
+const RANGES = [[900, '15m'], [3600, '1h'], [21600, '6h'], [86400, '24h'], [604800, '7d'], [2592000, '30d'], [31536000, '1y']];
 let range = +localStorage.getItem('skl_range') || 900, hover = null;
 const series = {};
 let alerts = { active: [], recent: [], webhook: false };
@@ -364,7 +366,7 @@ async function loadSeries(name) {
   if (had && had.loading) return;
   series[name] = Object.assign(had || {}, { loading: true });
   try {
-    const d = await (await must(await api('GET', '/api/history?runtime=' + encodeURIComponent(name) + '&range=' + range + '&points=' + Math.min(180, range / 10)))).json();
+    const d = await (await must(await api('GET', '/api/history?runtime=' + encodeURIComponent(name) + '&range=' + range + '&points=' + Math.max(10, Math.min(180, range / 10))))).json();
     series[name] = { at: Date.now(), range, d: d.from ? d : null };
     render(false);
   } catch (e) { series[name] = { at: Date.now(), range, d: null }; }
@@ -400,7 +402,8 @@ function spark(ln) {
   s.innerHTML = '<path class="f" d="' + f + '"/><path class="l" d="' + d + '"/>';
   return s;
 }
-const hhmm = t => new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+// The time under the pointer: the hour for a day or less, the day beside it for longer ranges.
+const hhmm = t => range > 86400 ? new Date(t * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 function tile(icon, k, v, s, ln) {
   const T = el('div', { class: 'tile' }, el('div', { class: 'k' }, ico(icon), el('span', { text: k })), el('div', { class: 'v', text: v }), s ? el('div', { class: 's', text: s }) : null);
   if (!ln) return T;
@@ -997,7 +1000,7 @@ function form(type, conf, editing, running) {
     if (!sections.has(f.section)) sections.set(f.section, []);
     sections.get(f.section).push(f);
   }
-  const OPEN = new Set(['Basics', 'Network', TYPES[type] ? TYPES[type][1] : '', 'Server', 'Client', 'Proxy', 'Cache', 'Storage', 'DNS', 'Sync', 'Identity', 'MQTT']);
+  const OPEN = new Set(['Basics', 'Network', TYPES[type] ? TYPES[type][1] : '', 'Server', 'Client', 'Proxy', 'Cache', 'Storage', 'DNS', 'Sync', 'Identity', 'MQTT', 'Metrics']);
   // Basics first, then what only this type has, then what every type has.
   const COMMON = ['Basics', 'Network', 'TLS', 'Limits', 'Output'];
   const order = [...sections.keys()].sort((a, b) => (a === 'Basics' ? -1 : b === 'Basics' ? 1 : COMMON.includes(a) - COMMON.includes(b)));

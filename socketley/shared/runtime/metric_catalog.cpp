@@ -16,6 +16,7 @@ const char* kind_name(kind k)
         case kind::counter: return "counter";
         case kind::gauge:   return "gauge";
         case kind::untyped: return "untyped";
+        case kind::histogram: return "histogram";
     }
     return "untyped";
 }
@@ -31,6 +32,12 @@ constexpr field counter(std::string_view key, std::string_view name, std::string
 constexpr field gauge(std::string_view key, std::string_view name, std::string_view help, merge how = merge::sum)
 {
     return field{key, family{name, kind::gauge, help}, {}, {}, how};
+}
+
+// A latency_histogram line, written as the family's buckets, sum and count.
+constexpr field histogram(std::string_view key, std::string_view name, std::string_view help)
+{
+    return field{key, family{name, kind::histogram, help}};
 }
 
 // A figure of a family several figures share, told apart by one label.
@@ -123,6 +130,8 @@ constexpr field storage_fields[] = {
     counter("media_made", "socketley_storage_media_made_total", "Thumbnails and stream segments made."),
     counter("media_failed", "socketley_storage_media_failed_total", "Media that could not be made."),
     counter("fsyncs", "socketley_storage_fsyncs_total", "Syncs the store made for durability."),
+    histogram("request_latency", "socketley_storage_request_duration_seconds",
+              "S3 requests from their first byte to their whole answer sent."),
     member("gets", storage_requests, "op", "get"),
     member("heads", storage_requests, "op", "head"),
     member("puts", storage_requests, "op", "put"),
@@ -148,6 +157,9 @@ constexpr field mail_fields[] = {
     gauge("mail_queued_bytes", "socketley_mail_queued_bytes", "Bytes waiting in a mail runtime's queue."),
     counter("mail_quarantined", "socketley_mail_quarantined_total", "Messages put into Junk."),
     counter("auth_failed", "socketley_mail_auth_failed_total", "Sign-ins a mail runtime refused."),
+    histogram("mail_delivery_latency", "socketley_mail_delivery_duration_seconds",
+              "Remote delivery attempts from a connection taking a message to the answer for its recipients, in loop "
+              "turns."),
     field{"mail_self_listed", family{"socketley_mail_blocklisted", kind::gauge,
                                      "1 while a blocklist of its --dnsbl names the address a mail runtime sends from."},
           {}, {}, merge::max, false, true},
@@ -189,6 +201,8 @@ constexpr field server_fields[] = {
             "Requests to its cache runtime refused for a full queue."),
     counter("cache_store_batches_dropped", "socketley_server_cache_store_batches_dropped_total",
             "Batches of messages for the cache a server dropped, so messages the cache does not hold."),
+    histogram("http_latency", "socketley_server_http_request_duration_seconds",
+              "HTTP requests from their head to their whole answer handed to the socket, in loop turns."),
     unnamed("mode", merge::first),
     unnamed("master_fd", merge::first),
 };
@@ -232,6 +246,12 @@ constexpr field proxy_fields[] = {
             "Retry packets a proxy sent to make new clients prove their address."),
     counter("h3_forwarded", "socketley_proxy_http3_forwarded_total",
             "QUIC packets a shard handed to the shard holding their connection."),
+    histogram("request_latency", "socketley_proxy_request_duration_seconds",
+              "HTTP requests from their head to the last byte of their backend's answer, in loop turns."),
+    histogram("connect_latency", "socketley_proxy_backend_connect_duration_seconds",
+              "New backend connections from the connect to its completion, in loop turns."),
+    histogram("first_byte_latency", "socketley_proxy_backend_first_byte_seconds",
+              "HTTP requests from the backend being asked, or connected, to its answer's first byte, in loop turns."),
 };
 
 // ── cache ───────────────────────────────────────────────────────────────────
@@ -249,6 +269,8 @@ constexpr field cache_fields[] = {
     gauge("master_link", "socketley_cache_master_link", "1 while a replica has a connection to its leader."),
     gauge("master_sync_in_progress", "socketley_cache_master_sync_in_progress",
           "1 while a replica's connection to its leader has not finished its first sync."),
+    histogram("batch_latency", "socketley_cache_batch_duration_seconds",
+              "A read's commands to their replies handed to the socket, per flush, in loop turns."),
     unnamed("mode", merge::first),
     unnamed("eviction", merge::first),
     unnamed("repl_role", merge::first),
@@ -286,6 +308,9 @@ constexpr field db_fields[] = {
           merge::max),
     counter("replicated", "socketley_db_replicated_total", "Writes a replica took from its primary."),
     counter("resets", "socketley_db_replica_resets_total", "Times a replica started again from a full copy."),
+    histogram("request_latency", "socketley_db_request_duration_seconds",
+              "Requests from their arrival to their answer, a wait for the disk or another shard included, in loop "
+              "turns."),
 };
 
 // ── dns ─────────────────────────────────────────────────────────────────────
@@ -337,6 +362,8 @@ constexpr field idp_fields[] = {
     counter("tokens", "socketley_idp_tokens_total", "Tokens an idp issued."),
     counter("refreshes", "socketley_idp_refreshes_total", "Tokens an idp refreshed."),
     counter("userinfo", "socketley_idp_userinfo_total", "Userinfo requests an idp answered."),
+    histogram("sign_in_latency", "socketley_idp_sign_in_duration_seconds",
+              "Password sign-ins from their form to their answer, the hash included, in loop turns."),
 };
 
 // ── mqtt ────────────────────────────────────────────────────────────────────
@@ -406,6 +433,28 @@ constexpr field sync_fields[] = {
     counter("runs", "socketley_sync_runs_total", "Pulls of a repository a sync ran."),
 };
 
+// ── metrics ─────────────────────────────────────────────────────────────────
+
+constexpr family metrics_refused{"socketley_metrics_samples_refused_total", kind::counter,
+                                 "Samples a metrics runtime refused, by why."};
+
+constexpr field metrics_fields[] = {
+    gauge("series", "socketley_metrics_series", "Series a metrics runtime holds."),
+    gauge("head_series", "socketley_metrics_head_series", "Series with samples not yet cut into a block."),
+    counter("samples", "socketley_metrics_samples_appended_total", "Samples a metrics runtime stored."),
+    counter("refused_series", "socketley_metrics_series_refused_total", "New series refused past --max-series."),
+    member("refused_out_of_order", metrics_refused, "reason", "out_of_order"),
+    member("refused_too_old", metrics_refused, "reason", "too_old"),
+    gauge("bytes_on_disk", "socketley_metrics_disk_bytes", "Bytes a metrics runtime's store holds on the disk."),
+    gauge("bytes_in_ram", "socketley_metrics_memory_bytes", "Bytes a metrics runtime's store holds in memory."),
+    gauge("targets", "socketley_metrics_targets", "Targets a metrics runtime scrapes."),
+    gauge("targets_up", "socketley_metrics_targets_up", "Targets whose last scrape answered."),
+    counter("scrapes", "socketley_metrics_scrapes_total", "Scrapes a metrics runtime made."),
+    counter("scrape_failures", "socketley_metrics_scrape_failures_total", "Scrapes that got no answer to store."),
+    counter("queries", "socketley_metrics_queries_total", "PromQL queries a metrics runtime answered."),
+    gauge("local_series", "socketley_metrics_local_series", "This daemon's own series the local feed holds."),
+};
+
 constexpr type_entry entries[] = {
     {runtime_storage, storage_fields,
      {"socketley_storage_stat", kind::untyped, "A storage runtime's other stats figures, by name."}, true},
@@ -423,6 +472,8 @@ constexpr type_entry entries[] = {
     {runtime_idp, idp_fields, {"socketley_idp_stat", kind::untyped, "An idp's other stats figures, by name."}},
     {runtime_mqtt, mqtt_fields, {"socketley_mqtt_stat", kind::untyped, "A broker's other stats figures, by name."}},
     {runtime_sync, sync_fields, {"socketley_sync_stat", kind::untyped, "A sync's other stats figures, by name."}},
+    {runtime_metrics, metrics_fields,
+     {"socketley_metrics_stat", kind::untyped, "A metrics runtime's other stats figures, by name."}},
 };
 
 // Each type's keys sorted, for the one lookup a figure costs; built once, on first use, by whichever thread comes.
@@ -430,6 +481,7 @@ struct key_index
 {
     std::vector<std::pair<std::string_view, uint16_t>> keys;
     std::vector<uint16_t> prefixes;
+    bool histograms{false};
 };
 
 const key_index& index_of(const type_entry& e)
@@ -444,6 +496,7 @@ const key_index& index_of(const type_entry& e)
                     out[t].prefixes.push_back(static_cast<uint16_t>(i));
                 else
                     out[t].keys.emplace_back(entries[t].fields[i].key, static_cast<uint16_t>(i));
+                out[t].histograms |= entries[t].fields[i].fam.type == kind::histogram;
             }
             std::sort(out[t].keys.begin(), out[t].keys.end());
         }
@@ -488,6 +541,7 @@ void figures::parse(runtime_type t, std::string detail, uint64_t bytes_in, uint6
     m_entry = entry_for(t);
     m_text = std::move(detail);
     m_other.clear();
+    m_hist.clear();
     if (!m_entry)
     {
         m_slot.clear();
@@ -507,13 +561,36 @@ void figures::parse(runtime_type t, std::string detail, uint64_t bytes_in, uint6
     // A key comes again only in a sharded runtime's text, which labels each section, so one of one section is never
     // searched for.
     const bool sharded = m_text.find("[shard ") != std::string::npos;
+    const bool histograms = index_of(*m_entry).histograms;
     socketley::stats_text::for_each_field(m_text, [&](std::string_view key, std::string_view num) {
         uint64_t v = 0;
         const auto [end, ec] = std::from_chars(num.data(), num.data() + num.size(), v);
         if (ec != std::errc{} || end != num.data() + num.size())
+        {
+            if (histograms)
+                put_histogram(key, num);
             return;
+        }
         put(key, v, sharded);
     });
+}
+
+bool figures::put_histogram(std::string_view key, std::string_view value)
+{
+    const int index = find_field(*m_entry, key);
+    if (index < 0 || m_entry->fields[static_cast<size_t>(index)].fam.type != kind::histogram)
+        return false;
+    latency_histogram h;
+    if (!latency_histogram::parse(value, h))
+        return false;
+    for (histogram_slot& s : m_hist)
+        if (s.field == index)
+        {
+            s.h.merge(h);
+            return true;
+        }
+    m_hist.push_back({static_cast<uint16_t>(index), h});
+    return true;
 }
 
 bool figures::put_field(std::string_view key, uint64_t v, int& index)
@@ -580,6 +657,32 @@ bool figures::get(std::string_view key, uint64_t& out) const
     return false;
 }
 
+// A runtime's histogram as the exposition format has it: cumulative buckets in ascending `le` up to +Inf, then the sum
+// in seconds and the count, which equals the +Inf bucket.
+void emit_histogram(const field& f, uint16_t index, const source& r, sink_ref out)
+{
+    for (const figures::histogram_slot& s : r.fig->m_hist)
+    {
+        if (s.field != index)
+            continue;
+        label ls[3];
+        size_t n = 0;
+        ls[n++] = {"name", r.name};
+        if (!f.label_name.empty())
+            ls[n++] = {f.label_name, f.label_value};
+        uint64_t seen = 0;
+        for (int b = 0; b < latency_histogram::buckets; ++b)
+        {
+            seen += s.h.bucket(b);
+            ls[n] = {"le", latency_histogram::le[static_cast<size_t>(b)]};
+            out(series::of(f.fam, std::span<const label>(ls, n + 1), seen, "_bucket"));
+        }
+        const std::span<const label> plain(ls, n);
+        out(series::of(f.fam, plain, static_cast<double>(s.h.sum_ns()) / 1e9, "_sum"));
+        out(series::of(f.fam, plain, seen, "_count"));
+    }
+}
+
 void emit(const type_entry& e, std::span<const source> runtimes, sink_ref out)
 {
     label ls[2];
@@ -610,6 +713,11 @@ void emit(const type_entry& e, std::span<const source> runtimes, sink_ref out)
                             ls[1] = {f.label_name, r.fig->key_of(o).substr(f.key.size())};
                             out(series::of(f.fam, std::span<const label>(ls, 2), o.value));
                         }
+                    continue;
+                }
+                if (f.fam.type == kind::histogram)
+                {
+                    emit_histogram(f, static_cast<uint16_t>(k), r, out);
                     continue;
                 }
                 if (!r.fig->m_has[k])

@@ -82,6 +82,8 @@ struct http_request
     bool        head_only{false};
     // How long the answer may take once the whole request is written.
     int         answer_secs{10};
+    // The most bytes the answer may hold, head included; 0 is 1 MiB.
+    size_t      max_answer{0};
 };
 
 // The exchanges of one target, one at a time, on a connection kept for the next while the host keeps it, as a proxy
