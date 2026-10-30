@@ -155,6 +155,12 @@ bool metrics_run::start(std::string& why)
             return false;
         m_archive_due = 0;
     }
+    if (m_owner.get_logs())
+    {
+        if (!m_logs.open(dir + "/logs", static_cast<int64_t>(m_owner.get_logs_keep()) * 1000, why))
+            return false;
+        m_local.keep_logs(&m_logs);
+    }
     m_rules->persist_at(dir + "/alerts", wall::now_ms_coarse());
 
     // Loopback unless --bind names another address, which config_refusal() lets through only behind --keys or --idp.
@@ -194,6 +200,7 @@ void metrics_run::stop()
     m_http.stop();
     if (m_rules)
         m_rules->flush(wall::now_ms_coarse());
+    m_logs.close();
     if (m_tick_armed)
         if (!m_loop.submit_timeout_remove(&m_tick_req)) {}
     if (m_opened)
@@ -285,6 +292,15 @@ void metrics_run::tick()
     }
     if (m_archive_due <= now + 2)
         m_archive_due = m_archive.tick(now);
+    if (m_logs.is_open())
+    {
+        m_logs.flush();
+        if (now - m_logs_retained >= 3'600'000)
+        {
+            m_logs_retained = now;
+            m_logs.retain(now);
+        }
+    }
     m_http.sweep(now / 1000, idle_secs);
     arm_tick();
 }
@@ -602,6 +618,9 @@ void metrics_run::handle(const std::shared_ptr<socketley::http::server_conn>& c,
                 R"({"status":"error","errorType":"unauthorized","error":"a key of --keys, or a sign-in of --idp, is needed"})");
         return;
     }
+    // A checkpoint is the daemon's to ask, for an export, and no client's.
+    if (rq.path.starts_with("/-/checkpoint"))
+        return respond(*c, 404, "text/plain; charset=utf-8", "no such path\n");
     if (rq.path == "/api/v1/write")
     {
         if (!m_owner.get_receive())
@@ -661,6 +680,10 @@ std::string metrics_run::stats() const
     const local_stats& l = m_local.stats();
     const scrape_figures& f = m_scrape.figures();
     return "series:" + std::to_string(s.series) + "\nhead_series:" + std::to_string(s.head_series) +
+           "\nmaintenance_held:" + std::to_string(s.held ? 1 : 0) +
+           "\nlog_lines:" + std::to_string(m_logs.stats().lines) +
+           "\nlog_bytes_on_disk:" + std::to_string(m_logs.stats().bytes_on_disk) +
+           "\nlog_files:" + std::to_string(m_logs.stats().files) +
            "\nsamples:" + std::to_string(s.samples_appended) + "\nrefused_series:" + std::to_string(s.refused_series) +
            "\nrefused_out_of_order:" + std::to_string(s.refused_out_of_order) +
            "\nrefused_too_old:" + std::to_string(s.refused_too_old) + "\nbytes_on_disk:" + std::to_string(s.bytes_on_disk) +

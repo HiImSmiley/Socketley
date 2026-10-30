@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "../daemon/ipc_client.h"
+#include "../shared/ipc/ipc_framing.h"
 #include "../shared/json/json_doc.h"
 #include "../shared/persist/paths.h"
 #include "../shared/persist/read_file.h"
@@ -423,6 +424,35 @@ int cli_export_full(int argc, char** argv)
         if (cli_db_backup(4, av) == 0 && fs::exists(to, ec))
             db_backed.insert(r.name);
     }
+
+    // A metrics runtime's open chunks written to its files and its merges held while the archive is written, so the
+    // copy holds every sample and no block is replaced under it; let go again however the export ends.
+    std::vector<std::string> held;
+    for (const auto& r : runtimes)
+    {
+        if (r.type != "metrics" || !live.count(r.name))
+            continue;
+        std::string command = "metrics ", answer;
+        ipc_frame::append_arg(command, r.name);
+        if (ipc_send(command + " checkpoint --hold 900", answer) == 0)
+            held.push_back(r.name);
+        else
+            std::cout << "the metrics runtime " << r.name << " did not write out what it holds; its last minutes may be "
+                      << "missing from the archive\n";
+    }
+    struct release_held
+    {
+        const std::vector<std::string>& names;
+        ~release_held()
+        {
+            for (const auto& n : names)
+            {
+                std::string command = "metrics ", answer;
+                ipc_frame::append_arg(command, n);
+                if (ipc_send(command + " checkpoint --hold 0", answer) != 0) {}
+            }
+        }
+    } release{held};
 
     std::set<std::string> take, leave;
     for (const auto& r : runtimes)

@@ -3750,7 +3750,7 @@ int daemon_handler::cmd_metrics(ipc_connection* conn, const parsed_args& pa)
     }
     const std::string_view action = pa.args[2];
     bool json = false, recent = false;
-    std::string arg, at, start = "-1h", end = "now", step;
+    std::string arg, at, start = "-1h", end = "now", step, hold, since, limit;
     for (size_t i = 3; i < pa.count; ++i)
     {
         const std::string_view a = pa.args[i];
@@ -3759,6 +3759,10 @@ int daemon_handler::cmd_metrics(ipc_connection* conn, const parsed_args& pa)
             json = true;
         else if (a == "--recent")
             recent = true;
+        else if (a == "--hold" && has_value)
+            hold = std::string(pa.args[++i]);
+        else if ((a == "--since" || a == "--limit") && has_value)
+            (a == "--since" ? since : limit) = std::string(pa.args[++i]);
         else if ((a == "--at" || a == "--start" || a == "--end" || a == "--step") && has_value)
             (a == "--at" ? at : a == "--start" ? start : a == "--end" ? end : step) = std::string(pa.args[++i]);
         else if (arg.empty() && !a.starts_with("--"))
@@ -3816,6 +3820,19 @@ int daemon_handler::cmd_metrics(ipc_connection* conn, const parsed_args& pa)
     }
     else if (action == "rules" && arg.empty())
         path = "/api/v1/rules";
+    // The kept log lines a LogQL query selects, all of this daemon's without one.
+    else if (action == "logs")
+    {
+        path = "/loki/api/v1/query_range";
+        form = "query=" + enc(arg.empty() ? std::string("{job=\"socketley\"}") : arg) +
+               "&since=" + enc(since.empty() ? std::string("1h") : since) + "&limit=" + enc(limit.empty() ? "100" : limit);
+    }
+    // What an export --full asks before it copies the files: the head written out, merges held for `hold` seconds.
+    else if (action == "checkpoint" && arg.empty())
+    {
+        path = "/-/checkpoint";
+        form = "hold=" + (hold.empty() ? std::string("0") : hold);
+    }
     else
     {
         conn->write_buf = command_usage::line("metrics");

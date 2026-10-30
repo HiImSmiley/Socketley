@@ -1139,24 +1139,53 @@ inline bool decode_alert_note(std::string_view payload, uint8_t& to, std::string
 
 // Asked by a worker that holds nothing of the daemon's yet, and answered with everything and ids that start over.
 inline constexpr uint8_t series_resync = 1;
+// Asked by a worker that keeps logs: the pull carries a u64 cursor of the daemon's log, and the feed ends with
+// u64 that cursor, u64 the next, u32 n { u64 ms, str level, str runtime, str text }, the lines after it.
+// The cursor sent back lets a worker take one section once, though two answers carry it.
+inline constexpr uint8_t series_logs = 2;
+// The most log lines one feed carries; the rest come with the next pull.
+inline constexpr size_t series_max_log_lines = 4096;
 
 // The most labels a series of the feed carries, well above the four the daemon's widest family has.
 inline constexpr size_t series_max_labels = 32;
 
-inline std::string encode_series_pull(uint64_t ticket, uint8_t flags)
+inline std::string encode_series_pull(uint64_t ticket, uint8_t flags, uint64_t log_cursor = 0)
 {
     std::string out;
     socketley::bytes::append64(out, ticket);
     out.push_back(static_cast<char>(flags));
+    if (flags & series_logs)
+        socketley::bytes::append64(out, log_cursor);
     return out;
 }
 
-inline bool decode_series_pull(std::string_view payload, uint64_t& ticket, uint8_t& flags)
+inline bool decode_series_pull(std::string_view payload, uint64_t& ticket, uint8_t& flags, uint64_t& log_cursor)
 {
     reader r(payload.data(), payload.size());
     ticket = r.u64();
     flags  = r.u8();
+    log_cursor = (flags & series_logs) && r.ok ? r.u64() : 0;
     return r.ok;
+}
+
+// The log section a feed ends with, appended to finish()'s payload.
+struct series_log_line
+{
+    uint64_t at_ms;
+    std::string_view level, runtime, text;
+};
+inline void append_series_logs(std::string& feed, uint64_t from, uint64_t next, std::span<const series_log_line> lines)
+{
+    socketley::bytes::append64(feed, from);
+    socketley::bytes::append64(feed, next);
+    socketley::bytes::append32(feed, static_cast<uint32_t>(lines.size()));
+    for (const auto& l : lines)
+    {
+        socketley::bytes::append64(feed, l.at_ms);
+        put_str(feed, l.level);
+        put_str(feed, l.runtime);
+        put_str(feed, l.text);
+    }
 }
 
 // The four sections built side by side, since their counts are known only once the walk is over.
@@ -1240,7 +1269,9 @@ struct series_label_view
 };
 
 // The feed handed to `v` section by section: head(ticket, flags, instance), family(id, kind, name, help),
-// key(id, family, span of series_label_view), value(id, double), gone(id); false for a frame that does not read.
+// key(id, family, span of series_label_view), value(id, double), gone(id), and with series_logs set
+// log_section(from, next), which says whether to take it, and log(line) for each of its lines; false for a frame that
+// does not read.
 template <class V>
 bool decode_series_feed(std::string_view payload, V& v)
 {
@@ -1296,6 +1327,22 @@ bool decode_series_feed(std::string_view payload, V& v)
         const uint32_t id = r.u32();
         if (r.ok)
             v.gone(id);
+    }
+    if (!(flags & series_logs) || !r.ok)
+        return r.ok;
+    const uint64_t from = r.u64();
+    const uint64_t next = r.u64();
+    n = r.u32();
+    const bool take = r.ok && v.log_section(from, next);
+    for (uint32_t i = 0; i < n && r.ok; ++i)
+    {
+        series_log_line l{};
+        l.at_ms = r.u64();
+        l.level = r.str();
+        l.runtime = r.str();
+        l.text = r.str();
+        if (r.ok && take)
+            v.log(l);
     }
     return r.ok;
 }

@@ -58,6 +58,8 @@ struct store_stats
     uint64_t bytes_on_disk{0};
     uint64_t bytes_in_ram{0};
     uint64_t blocks{0};
+    // Whether a checkpoint holds maintenance off.
+    bool held{false};
     uint64_t blocks_refused{0};
     uint64_t head_windows{0};
     uint64_t head_chunks{0};
@@ -91,6 +93,9 @@ public:
     int64_t tick(int64_t now);
     // Whether background work is in flight, which a later tick() takes in.
     bool busy() const;
+    // Everything in the head written to its files and synced, and no maintenance started before `hold_until`, so a
+    // copy of the directory taken now holds every sample and no block is replaced under it.
+    void checkpoint(int64_t hold_until);
 
     // The background work finished and taken in, the open chunks logged and every file synced; nothing may follow.
     void stop();

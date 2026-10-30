@@ -86,6 +86,11 @@ public:
     std::string_view get_notify() const { return m_c.notify; }
     void set_receive(bool on) { m_c.receive = on; }
     bool get_receive() const { return m_c.receive; }
+    // The daemon's log lines kept too (--logs), and for how many seconds (--logs-keep).
+    void set_logs(bool on) { m_c.logs = on; }
+    bool get_logs() const { return m_c.logs; }
+    void set_logs_keep(uint64_t s) { m_c.logs_keep = s; }
+    uint64_t get_logs_keep() const { return m_c.logs_keep; }
     // An S3 bucket and prefix every finished block is copied to (--archive), and the credentials it is signed with.
     void set_archive(std::string_view u) { m_c.archive = std::string(u); }
     std::string_view get_archive() const { return m_c.archive; }
@@ -113,6 +118,8 @@ public:
         bool receive{false};
         std::string archive;
         std::string archive_credentials;
+        bool logs{false};
+        uint64_t logs_keep{14ull * 86400};
     };
     const settings& get_settings() const { return m_c; }
     void set_settings(const settings& s) { m_c = s; }

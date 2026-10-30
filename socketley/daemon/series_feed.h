@@ -50,7 +50,7 @@ public:
     };
 
     // Begins an answer; `resync` forgets everything sent before, so ids start over.
-    void begin(bool resync);
+    void begin(bool resync, bool logs);
     // The frame's payload, with what went since the last answer and the ids it held freed for the next.
     std::string finish(uint64_t ticket, std::string_view instance);
 

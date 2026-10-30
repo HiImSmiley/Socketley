@@ -209,6 +209,22 @@ void metrics_run::api(std::string_view path, const api_params& p, api_reply& out
         return success(out, "{}");
     if (path == "/api/v1/query_exemplars")
         return success(out, "[]");
+    if (path.starts_with("/loki/api/v1/"))
+        return api_logs(path, p, out, text);
+    if (path == "/-/checkpoint")
+    {
+        std::string_view h;
+        int64_t secs = 0;
+        if (p.get("hold", h))
+            std::from_chars(h.data(), h.data() + h.size(), secs);
+        const int64_t now = wall::now_ms_coarse();
+        m_store.checkpoint(secs > 0 ? now + std::min<int64_t>(secs, 3600) * 1000 : INT64_MIN);
+        m_store_due = now;
+        out.body = secs > 0 ? "written, maintenance held for " + std::to_string(std::min<int64_t>(secs, 3600)) + "s\n"
+                            : "written\n";
+        out.type = "text/plain; charset=utf-8";
+        return;
+    }
     if (path == "/api/v1/rules")
     {
         rules_filter f;
@@ -307,6 +323,128 @@ void metrics_run::api_query(const api_params& p, api_reply& out, bool text, bool
     std::string d;
     render_json(r, d);
     success(out, d);
+}
+
+namespace
+{
+
+// A Loki time: nanoseconds as an integer, or seconds and RFC 3339 as Prometheus takes them.
+bool loki_time(std::string_view s, int64_t& ms)
+{
+    int64_t n = 0;
+    const auto r = std::from_chars(s.data(), s.data() + s.size(), n);
+    if (r.ec == std::errc() && r.ptr == s.data() + s.size() && s.size() >= 16)
+        return ms = n / 1'000'000, true;
+    return parse_api_time(s, ms);
+}
+
+}   // namespace
+
+void metrics_run::api_logs(std::string_view path, const api_params& p, api_reply& out, bool text)
+{
+    if (!m_logs.is_open())
+        return fail(out, text, 404, "not_found", "this metrics runtime keeps no logs: --logs");
+    m_logs.flush();
+    const int64_t now = wall::now_ms();
+    std::string_view v;
+    int64_t start = now - 3'600'000, end = now;
+    if (p.get("start", v) && !v.empty() && !loki_time(v, start))
+        return fail(out, text, 400, "bad_data", "invalid start: " + std::string(v));
+    if (p.get("end", v) && !v.empty() && !loki_time(v, end))
+        return fail(out, text, 400, "bad_data", "invalid end: " + std::string(v));
+    if (p.get("since", v) && !v.empty())
+    {
+        int64_t d = 0;
+        if (!parse_duration(v, d))
+            return fail(out, text, 400, "bad_data", "invalid since: " + std::string(v));
+        start = end - d;
+    }
+    const std::string_view inst = m_local.instance();
+    std::string d;
+    if (path == "/loki/api/v1/labels")
+    {
+        log_label_names(m_logs, inst, start, end, d);
+        return success(out, d);
+    }
+    if (path.starts_with("/loki/api/v1/label/") && path.ends_with("/values"))
+    {
+        const std::string_view name = path.substr(19, path.size() - 19 - 7);
+        log_label_values(m_logs, inst, name, start, end, d);
+        return success(out, d);
+    }
+    const bool range = path == "/loki/api/v1/query_range";
+    if (!range && path != "/loki/api/v1/query")
+        return fail(out, text, 404, "not_found", "no such API: " + std::string(path));
+    std::string_view q;
+    if (!p.get("query", q) || q.empty())
+        return fail(out, text, 400, "bad_data", "query is required");
+    size_t limit = 100;
+    if (p.get("limit", v) && !v.empty())
+    {
+        uint64_t n = 0;
+        if (std::from_chars(v.data(), v.data() + v.size(), n).ec != std::errc() || n == 0)
+            return fail(out, text, 400, "bad_data", "invalid limit: " + std::string(v));
+        limit = static_cast<size_t>(std::min<uint64_t>(n, 50'000));
+    }
+    const bool backward = !(p.get("direction", v) && v == "forward");
+    logql lq;
+    bool is_log = true;
+    std::string why;
+    if (!parse_logql(q, lq, is_log, why))
+        return fail(out, text, 400, "bad_data", why);
+    // Without a selector it is PromQL, which the metrics engine answers, as Grafana's check `vector(1)+vector(1)`.
+    if (!is_log)
+    {
+        api_params pp = p;
+        return api_query(pp, out, text, range);
+    }
+    if (range)
+    {
+        int64_t step = std::max<int64_t>(1000, (end - start) / 250);
+        if (p.get("step", v) && !v.empty())
+        {
+            double secs = 0;
+            int64_t dms = 0;
+            if (parse_duration(v, dms))
+                step = dms;
+            else if (std::from_chars(v.data(), v.data() + v.size(), secs).ec == std::errc() && secs > 0)
+                step = static_cast<int64_t>(secs * 1000);
+            else
+                return fail(out, text, 400, "bad_data", "invalid step: " + std::string(v));
+        }
+        if (end < start || (end - start) / std::max<int64_t>(step, 1) > 11'000)
+            return fail(out, text, 400, "bad_data", "the range holds more than 11000 steps");
+        logql_range(m_logs, lq, inst, start, end, step, limit, backward, d);
+    }
+    else
+    {
+        int64_t t = now;
+        if (p.get("time", v) && !v.empty() && !loki_time(v, t))
+            return fail(out, text, 400, "bad_data", "invalid time: " + std::string(v));
+        logql_instant(m_logs, lq, inst, t, limit, d);
+    }
+    if (!text)
+        return success(out, d);
+    // For the CLI, a line a log line, oldest first, as the daemon wrote it.
+    if (!lq.fn.empty())
+    {
+        out.body = d;
+        out.type = "application/json";
+        return;
+    }
+    label_set ls;
+    std::vector<std::string> rows;
+    m_logs.scan(start, end, true, [&](const log_view& l) {
+        log_labels(l, inst, ls);
+        if (logql_matches(lq, ls, l.text))
+            rows.emplace_back(std::string(l.text));
+        return rows.size() < limit;
+    });
+    std::string body;
+    for (size_t i = rows.size(); i-- > 0;)
+        body += rows[i] + "\n";
+    out.body = std::move(body);
+    out.type = "text/plain; charset=utf-8";
 }
 
 bool metrics_run::time_range(const api_params& p, int64_t& mint, int64_t& maxt, api_reply& out)

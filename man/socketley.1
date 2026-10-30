@@ -1329,14 +1329,16 @@ socketley db\-query shop customers '{"where":{"country":"de"},"limit":50}'
 .fi
 .RE
 .TP
-.BI "metrics " "metrics " "query \fIpromql\fR [\fB\-\-at \fItime\fR] | query_range \fIpromql\fR [\fB\-\-start\fR] [\fB\-\-end\fR] [\fB\-\-step\fR] | series \fIselector\fR | targets | rules | alerts [\fB\-\-recent\fR] | stats [\fB\-\-json\fR]"
+.BI "metrics " "metrics " "query \fIpromql\fR [\fB\-\-at \fItime\fR] | query_range \fIpromql\fR [\fB\-\-start\fR] [\fB\-\-end\fR] [\fB\-\-step\fR] | series \fIselector\fR | targets | rules | alerts [\fB\-\-recent\fR] | logs [\fIlogql\fR] [\fB\-\-since\fR] [\fB\-\-limit\fR] | stats [\fB\-\-json\fR]"
 What a metrics runtime holds, asked as Grafana asks its Prometheus API: a
 PromQL query at a time or over a range, the series a selector names, the
 targets it scrapes with their health, its rules, the alerts pending and firing
 (with
 .B \-\-recent
-also the notifications of late, as the dashboard reads them), and its store's
-figures. A line a series or a target by default,
+also the notifications of late, as the dashboard reads them), the log lines a
+LogQL query selects, oldest first (with
+.BR \-\-logs ;
+an hour and 100 lines by default), and its store's figures. A line a series or a target by default,
 .B \-\-json
 the API's answer; see
 .BR "METRICS FLAGS" .
@@ -14688,6 +14690,49 @@ come and the ones refused counted in
 a Prometheus, a Grafana Agent or another metrics runtime behind a firewall then
 sends what it has instead of being scraped.
 .TP
+.BR \-\-logs ", " \-\-no\-logs
+Keeps every line the daemon and its runtimes write as well, taken with the
+series at each tick, a file a day in
+.B logs/
+of the runtime's directory, and answers for them with LogQL over Loki's API,
+so Grafana's Loki data source reads it as it reads a Loki. A line is labelled
+.BR job="socketley" ,
+.B instance
+(the daemon),
+.B level
+.RB ( debug ", " info ", " warn ", " error )
+and
+.B name
+(the runtime it is about: the one that wrote it, or the one a line of the
+daemon's names); a start takes no line twice.
+.B socketley_log_lines_total
+counts them by
+.B name
+and
+.BR level ,
+for a rule such as
+.BR "increase(socketley_log_lines_total{level=\(dqerror\(dq}[5m]) > 0" .
+LogQL taken: a selector with
+.BR = ", " != ", " =~ ", " !~ ,
+line filters
+.BR "|= \(dqtext\(dq" ,
+.BR "!= \(dqtext\(dq" ,
+.B |~ \(dqregex\(dq
+and
+.B !~ \(dqregex\(dq
+(found anywhere in the line), and over them
+.BR count_over_time ,
+.BR rate ,
+.B bytes_over_time
+and
+.B bytes_rate
+with
+.BR sum ", " count ", " min ", " max ", " avg
+by or without labels; a query without a selector is PromQL. Off by default.
+.TP
+.BI \-\-logs\-keep " duration"
+How long log lines are kept, in whole days; 14d by default.
+.TP
 .BI \-\-archive " url"
 An S3 bucket, and a key prefix after it, every block on disk is copied to once
 it holds a day or more or ended two days ago:
@@ -14738,6 +14783,13 @@ by GET or a POSTed form, answered in Prometheus's envelope;
 .B /-/healthy
 and
 .BR /-/ready ;
+with
+.BR \-\-logs ,
+.BR /loki/api/v1/query_range ,
+.BR query ,
+.B labels
+and
+.BI label/ name /values\fR;
 and
 .B /metrics
 with the runtime's own figures. A Grafana data source of type Prometheus is
@@ -14780,7 +14832,15 @@ native histograms.
 socketley metrics <rt> query '<promql>' [--at <time>]
 socketley metrics <rt> query_range '<promql>' [--start <time>] [--end <time>] [--step <duration>]
 socketley metrics <rt> series '<selector>' | targets | rules | alerts [--recent] | stats   [--json]
+socketley metrics <rt> logs ['<logql>'] [--since <duration>] [--limit <n>]
 .fi
+.PP
+.B socketley export
+writes a metrics runtime's settings as any runtime's;
+.B socketley export \-\-full
+first has a running one write out what its head holds and hold its merges
+until the archive is written, so a restore brings back every sample to that
+moment.
 .PP
 A time is
 .BR now ,

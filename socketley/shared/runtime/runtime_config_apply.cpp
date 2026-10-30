@@ -213,6 +213,10 @@ void apply_metrics_config(metrics_instance& mt, const runtime_config& cfg, bool 
         mt.set_max_series(cfg.metrics_max_series);
     if (asked("durable", true))
         mt.set_durable(cfg.metrics_durable);
+    if (asked("logs", true))
+        mt.set_logs(cfg.metrics_logs);
+    if (asked("logs_keep", true))
+        mt.set_logs_keep(cfg.metrics_logs_keep);
     if (asked("rules", !cfg.metrics_rules.empty()))
         mt.set_rules_path(cfg.metrics_rules);
     if (asked("notify", !cfg.metrics_notify.empty()))

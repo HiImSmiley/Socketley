@@ -576,6 +576,8 @@ struct store::impl
     bool is_open{false};
     // flock()ed while open, so a second process never writes the same files.
     int lock_fd{-1};
+    // No cut, merge or retention starts before this, while a copy of the files is being made.
+    int64_t hold_until{INT64_MIN};
 
     series_index index;
     std::vector<series_head> heads;
@@ -1606,7 +1608,7 @@ int64_t store::tick(int64_t now)
     s.now = std::max(s.now, now);
     s.take_in(s.bg.take());
     s.write_logs(s.cfg.durable);
-    if (!s.bg.busy())
+    if (!s.bg.busy() && now >= s.hold_until)
     {
         s.retain();
         if (s.retry_after == INT64_MIN || now >= s.retry_after)
@@ -1622,6 +1624,23 @@ int64_t store::tick(int64_t now)
 
 bool store::busy() const { return m->bg.busy(); }
 
+void store::checkpoint(int64_t hold_until)
+{
+    impl& s = *m;
+    if (!s.is_open)
+        return;
+    s.take_in(s.bg.wait());
+    for (uint32_t id = 0; id < s.heads.size(); ++id)
+        s.close_open(id, s.heads[id], false);
+    for (head_log& l : s.logs)
+    {
+        s.write_log(l);
+        if (l.fd >= 0 && ::fdatasync(l.fd) != 0) {}
+    }
+    s.save_meta(durability::data);
+    s.hold_until = hold_until;
+}
+
 void store::stop() { m->stop_store(); }
 
 store_stats store::stats() const
@@ -1629,6 +1648,7 @@ store_stats store::stats() const
     const impl& s = *m;
     store_stats st;
     st.series = s.index.size();
+    st.held = s.hold_until > s.now;
     st.head_series = s.head_series;
     st.samples_appended = s.appended;
     st.refused_out_of_order = s.out_of_order;

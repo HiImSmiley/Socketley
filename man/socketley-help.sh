@@ -483,10 +483,11 @@ cli_commands() {
     echo -e "  ${CYAN}socketley ssh-cert auth.example.com${NC}"
     echo ""
 
-    echo -e "${BOLD}metrics <metrics> query '<promql>' [--at <time>] | query_range '<promql>' [--start] [--end] [--step] | series '<selector>' | targets | rules | alerts [--recent] | stats [--json]${NC}"
+    echo -e "${BOLD}metrics <metrics> query '<promql>' [--at <time>] | query_range '<promql>' [--start] [--end] [--step] | series '<selector>' | targets | rules | alerts [--recent] | logs ['<logql>'] [--since] [--limit] | stats [--json]${NC}"
     echo "  Asks a metrics runtime what it stored, with PromQL, as Grafana asks"
     echo "  its Prometheus API; targets, rules and alerts say what it scrapes and raises."
     echo -e "  ${CYAN}socketley metrics metrics query 'rate(socketley_runtime_messages_total[5m])'${NC}"
+    echo -e "  ${CYAN}socketley metrics metrics logs '{name=\"web\", level=\"error\"} |= \"timeout\"' --since 1d${NC}"
     echo ""
     echo -e "${BOLD}tunnel <edge> invite|set <agent> --http <name[=auth],...> --tcp <name:port> --udp <name:port> | list | shares | revoke <agent>${NC}"
     echo "  The agents a tunnel edge takes: invite prints an invitation used"

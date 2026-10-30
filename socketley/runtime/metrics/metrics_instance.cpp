@@ -79,6 +79,8 @@ std::string metrics_instance::config_refusal() const
         return "metrics: --every is from 1s to 1h\n";
     if (m_c.keep < 3600)
         return "metrics: --keep is at least 1h\n";
+    if (m_c.logs_keep < 3600)
+        return "metrics: --logs-keep is at least 1h\n";
     std::vector<std::pair<int64_t, int64_t>> tiers;
     if (std::string why; !socketley::metrics::parse_downsample(m_c.downsample, tiers, why))
         return "metrics: --downsample " + m_c.downsample + ": " + why + "\n";

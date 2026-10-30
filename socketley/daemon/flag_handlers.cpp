@@ -1948,8 +1948,15 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
     // A Prometheus duration, as 10s, 30d or 1y, whole seconds from `min` to `max`.
     const auto duration = [&](const char* usage, int64_t min, int64_t max, auto set) {
         int64_t ms = 0;
-        if (next.empty() || !socketley::metrics::parse_duration(next, ms) || ms % 1000 != 0 || ms / 1000 < min ||
-            ms / 1000 > max)
+        // A bare number is seconds, as show and an export write these settings.
+        uint64_t secs = 0;
+        const auto r = std::from_chars(next.data(), next.data() + next.size(), secs);
+        const bool bare = !next.empty() && r.ec == std::errc() && r.ptr == next.data() + next.size() &&
+                          secs <= static_cast<uint64_t>(max);
+        if (bare)
+            ms = static_cast<int64_t>(secs) * 1000;
+        if (next.empty() || (!bare && !socketley::metrics::parse_duration(next, ms)) || ms % 1000 != 0 ||
+            ms / 1000 < min || ms / 1000 > max)
         {
             std::cout << usage;
             return 1;
@@ -2027,6 +2034,15 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
         case fnv1a("--durable"):
             mt->set_durable(true);
             return 0;
+        case fnv1a("--logs"):
+            mt->set_logs(true);
+            return 0;
+        case fnv1a("--no-logs"):
+            mt->set_logs(false);
+            return 0;
+        case fnv1a("--logs-keep"):
+            return duration("--logs-keep requires how long log lines are kept, at least 1h, as 14d\n", 3600,
+                            100ll * 365 * 86400, [&](int64_t s) { mt->set_logs_keep(static_cast<uint64_t>(s)); });
         case fnv1a("--rules"):
             return path("--rules", "a file of recording and alerting rules",
                         [&](std::string_view v) { mt->set_rules_path(v); });

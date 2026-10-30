@@ -1,4 +1,5 @@
 #include "series_feed.h"
+#include "../shared/util/log_ring.h"
 
 #include <bit>
 #include <unistd.h>
@@ -27,18 +28,31 @@ series_walk::~series_walk() = default;
 
 std::string series_walk::answer(std::shared_ptr<void>& state, std::string_view payload)
 {
-    uint64_t ticket = 0;
+    uint64_t ticket = 0, cursor = 0;
     uint8_t flags = 0;
-    if (!worker_proto::decode_series_pull(payload, ticket, flags))
+    if (!worker_proto::decode_series_pull(payload, ticket, flags, cursor))
         return {};
     const bool resync = (flags & worker_proto::series_resync) || !state;
     if (!state)
         state = std::make_shared<series_feed>();
     auto& feed = *static_cast<series_feed*>(state.get());
-    feed.begin(resync);
+    const bool logs = flags & worker_proto::series_logs;
+    feed.begin(resync, logs);
     series_feed::encoder enc(feed);
     metrics_endpoint::walk_series(m_manager, m_facts->cache, m_state_dir, true, enc);
-    return worker_proto::frame(worker_proto::frame_type::series_feed, feed.finish(ticket, m_instance));
+    std::string body = feed.finish(ticket, m_instance);
+    if (logs)
+    {
+        // The daemon's recent log after the worker's cursor, the daemon's own lines and every worker's stderr.
+        uint64_t next = cursor;
+        const auto lines = log_ring::since(cursor, worker_proto::series_max_log_lines, "", "", next);
+        std::vector<worker_proto::series_log_line> wire;
+        wire.reserve(lines.size());
+        for (const auto& l : lines)
+            wire.push_back({static_cast<uint64_t>(l.at_ms), l.level, l.runtime, l.text});
+        worker_proto::append_series_logs(body, cursor, next, wire);
+    }
+    return worker_proto::frame(worker_proto::frame_type::series_feed, body);
 }
 
 void series_feed::encoder::operator()(const socketley::metric_catalog::series& s)
@@ -46,10 +60,10 @@ void series_feed::encoder::operator()(const socketley::metric_catalog::series& s
     m_feed.add(s);
 }
 
-void series_feed::begin(bool resync)
+void series_feed::begin(bool resync, bool logs)
 {
     ++m_gen;
-    m_flags = resync ? worker_proto::series_resync : 0;
+    m_flags = static_cast<uint8_t>((resync ? worker_proto::series_resync : 0) | (logs ? worker_proto::series_logs : 0));
     if (!resync)
         return;
     m_keys.clear();

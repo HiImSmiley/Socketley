@@ -22,6 +22,37 @@ metric_type type_of_kind(uint8_t kind)
 }   // namespace
 
 // The frame's sections applied to the feed as they are read.
+namespace
+{
+
+// The runtime a daemon's line is about: the quoted name after `runtime` or a type's name, first thing after its tags.
+std::string_view named_runtime(std::string_view text)
+{
+    size_t at = 0;
+    while (at < text.size() && text[at] == '[')
+    {
+        const size_t e = text.find("] ", at);
+        if (e == std::string_view::npos)
+            return {};
+        at = e + 2;
+    }
+    const size_t q = text.find(" '", at);
+    if (q == std::string_view::npos || q - at > 16)
+        return {};
+    static constexpr std::string_view words[] = {"runtime", "server", "client", "proxy", "cache", "storage", "dns",
+                                                 "sync", "idp", "db", "mqtt", "mail", "tunnel", "metrics"};
+    const std::string_view w = text.substr(at, q - at);
+    if (std::find(std::begin(words), std::end(words), w) == std::end(words))
+        return {};
+    const size_t e = text.find('\'', q + 2);
+    if (e == std::string_view::npos || e - q - 2 > 128 || e == q + 2)
+        return {};
+    const std::string_view name = text.substr(q + 2, e - q - 2);
+    return name.find(' ') == std::string_view::npos ? name : std::string_view{};
+}
+
+}   // namespace
+
 struct feed_visitor
 {
     local_feed& f;
@@ -109,6 +140,34 @@ struct feed_visitor
         f.m_keys[id].moved = true;
     }
 
+    // A section of log lines is taken once: the one that goes on from the cursor this worker holds.
+    bool log_section(uint64_t from, uint64_t next)
+    {
+        if (!f.m_logs || from != f.m_log_cursor)
+            return false;
+        first_logs = from == 0;
+        f.m_log_cursor = next;
+        return true;
+    }
+
+    void log(const worker_proto::series_log_line& l)
+    {
+        const int64_t t = static_cast<int64_t>(l.at_ms);
+        // The first lines after a start are the daemon's newest, some of them kept before the restart.
+        if (first_logs && t <= f.m_logs->last_t())
+            return;
+        // A line about a runtime names it as `runtime '<name>'` or `<type> '<name>'` after its tags, and is that
+        // runtime's whichever process wrote it: the daemon, or a worker passing on the daemon's state.
+        std::string_view rt = named_runtime(l.text);
+        if (rt.empty())
+            rt = l.runtime;
+        f.m_logs->append(t, l.level, rt, l.text);
+        ++f.m_stats.log_lines;
+        f.m_log_counts[{std::string(rt), std::string(l.level)}].n += 1;
+    }
+
+    bool first_logs{false};
+
     void gone(uint32_t id)
     {
         if (id >= f.m_keys.size() || !f.m_keys[id].live)
@@ -134,13 +193,16 @@ std::string local_feed::pull(int64_t stamp, bool extra, int64_t now)
     for (const pending& p : m_pending)
         if (p.extra == extra)
             return {};
-    const uint8_t flags = m_resync ? worker_proto::series_resync : 0;
+    uint8_t flags = m_resync ? worker_proto::series_resync : 0;
+    // A tick's pull carries the log cursor; one between ticks leaves the lines to it.
+    if (m_logs && !extra)
+        flags |= worker_proto::series_logs;
     m_resync = false;
     m_pending.push_back({stamp, now, extra});
     if (extra)
         ++m_stats.extra;
     return worker_proto::frame(worker_proto::frame_type::series_pull,
-                               worker_proto::encode_series_pull(static_cast<uint64_t>(stamp), flags));
+                               worker_proto::encode_series_pull(static_cast<uint64_t>(stamp), flags, m_log_cursor));
 }
 
 void local_feed::refused(int64_t stamp)
@@ -182,8 +244,31 @@ void local_feed::on_feed(std::string_view payload)
     m_pending.erase(it);
     append(v.stamp, extra);
     if (!extra)
+    {
         put_up(v.stamp, 1);
+        count_logs(v.stamp);
+    }
     m_stats.last_ms = v.stamp;
+}
+
+void local_feed::count_logs(int64_t stamp)
+{
+    for (auto& [key, c] : m_log_counts)
+    {
+        if (c.series == no_series)
+        {
+            label_set ls = {{std::string(name_label), "socketley_log_lines_total"}, {"instance", m_instance},
+                            {"job", "socketley"}, {"level", key.second}};
+            if (!key.first.empty())
+                ls.push_back({"name", key.first});
+            std::sort(ls.begin(), ls.end(), [](const label& a, const label& b) { return a.name < b.name; });
+            c.series = m_store.get_or_create(ls);
+            m_store.set_meta("socketley_log_lines_total", metric_type::counter,
+                             "Log lines the daemon and its workers wrote, by runtime and level, since this runtime started.");
+        }
+        if (c.series != no_series)
+            m_store.append(c.series, stamp, c.n);
+    }
 }
 
 void local_feed::put_up(int64_t stamp, double v)

@@ -122,6 +122,8 @@ private:
     void api_metadata(const api_params& p, api_reply& out);
     void api_targets(api_reply& out, bool text);
     void api_stats(api_reply& out, bool text);
+    // Loki's API over the kept log lines: query_range, query, labels, label values; `text` the CLI's lines.
+    void api_logs(std::string_view path, const api_params& p, api_reply& out, bool text);
     void self_metrics(api_reply& out);
     // The ids every match[] selects in [mint, maxt], false with the reply filled in when one does not parse.
     bool matched(const api_params& p, int64_t mint, int64_t maxt, std::vector<uint32_t>& ids, api_reply& out,
@@ -143,6 +145,8 @@ private:
     uint64_t m_blocks_seen{0};
     std::unique_ptr<rule_engine> m_rules;
     remote::write_decoder m_remote;
+    log_store m_logs;
+    int64_t m_logs_retained{0};
     std::optional<socketley::file_stamp> m_rules_stamp;
     std::optional<socketley::file_stamp> m_rules_refused;
     int64_t m_rules_due{0};

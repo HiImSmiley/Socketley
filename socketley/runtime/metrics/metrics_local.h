@@ -3,12 +3,14 @@
 // the families and label sets it has not sent yet, the values that changed and the series that went, and this side
 // keeps the rest and appends every series at the time the pull was scheduled for.
 #include <cstdint>
+#include <map>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "../../shared/ipc/worker_protocol.h"
+#include "metrics_logs.h"
 #include "metrics_store.h"
 
 namespace socketley::metrics
@@ -25,12 +27,17 @@ struct local_stats
     uint64_t extra{0};
     uint64_t series{0};
     int64_t  last_ms{0};
+    // Log lines kept (--logs).
+    uint64_t log_lines{0};
 };
 
 class local_feed
 {
 public:
     explicit local_feed(store& s) : m_store(s) {}
+
+    // The daemon's log lines kept in `logs` as well, each pull asking for those after the last.
+    void keep_logs(log_store* logs) { m_logs = logs; }
 
     // The frame asking for `stamp`, empty while a pull of its kind is still owed an answer; an `extra` one appends
     // only what is new or changed, for a runtime that came, went or changed state between two ticks.
@@ -89,6 +96,16 @@ private:
     uint32_t m_up{no_series};
     // Whether a resync has been applied since this process started.
     bool m_started{false};
+    log_store* m_logs{nullptr};
+    uint64_t m_log_cursor{0};
+    // socketley_log_lines_total by runtime and level, counted here as the lines come.
+    struct log_count
+    {
+        uint32_t series{no_series};
+        double n{0};
+    };
+    std::map<std::pair<std::string, std::string>, log_count> m_log_counts;
+    void count_logs(int64_t stamp);
     void put_up(int64_t stamp, double v);
     label_set m_scratch;
 };

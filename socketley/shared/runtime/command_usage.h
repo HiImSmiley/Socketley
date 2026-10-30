@@ -72,7 +72,7 @@ inline constexpr std::string_view for_verb(std::string_view verb)
                "sieve <user> list|get <name>|put <name> <file|->|check <file|->|activate <name>|deactivate|delete <name>]";
     if (verb == "metrics")
         return "metrics <metrics> query '<promql>' [--at <time>] | query_range '<promql>' [--start <time>] "
-               "[--end <time>] [--step <duration>] | series '<selector>' | targets | rules | alerts [--recent] | stats  [--json]";
+               "[--end <time>] [--step <duration>] | series '<selector>' | targets | rules | alerts [--recent] | logs ['<logql>'] [--since <duration>] [--limit <n>] | stats  [--json]";
     if (verb == "cluster")
         return "cluster [ls|ps|group <name>|stats|watch|show <daemon>|raft-status|placement|"
                "create <type> <name> [flags] [--replicas <n>]|scale <name> <n>|remove <name>]";
