@@ -606,6 +606,15 @@ int cli_dispatch(int argc, char** argv)
     // A users file is written here and needs no daemon, which reaching for one would have forked and left running.
     if (cmd == "mqtt-passwd")
         return cli_mqtt_passwd(argc, argv);
+    // `socketley mqtt passwd <file> <user>`, the topic's own command; any other `mqtt <verb>` is a runtime named mqtt.
+    if (cmd == "mqtt" && argc >= 3 && std::string_view(argv[2]) == "passwd")
+    {
+        std::vector<char*> av = {argv[0], const_cast<char*>("mqtt-passwd")};
+        for (int i = 3; i < argc; ++i)
+            av.push_back(argv[i]);
+        av.push_back(nullptr);
+        return cli_mqtt_passwd(static_cast<int>(av.size()) - 1, av.data());
+    }
 
     // All other commands need the daemon — auto-start if not running
     if (!ensure_daemon())
@@ -701,6 +710,10 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("idp-ssh"):
             return cli_idp_ssh(argc, argv);
         case fnv1a("tunnel"):
+            // `socketley tunnel invite ...` is a runtime named tunnel; `tunnel <edge> invite` and join, connect,
+            // share and ssh stay as they were.
+            if (argc >= 3 && cli_is_type_verb("tunnel", argv[2]))
+                return cli_runtime_verb(argc, argv);
             return cli_tunnel(argc, argv);
         case fnv1a("db-backup"):
             return cli_db_backup(argc, argv);
@@ -715,7 +728,11 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("mqtt-retained"):
         case fnv1a("dnssec"):
         case fnv1a("db-query"):
+            return cli_forward(argc, argv);
         case fnv1a("metrics"):
+            // `socketley metrics query ...` is the runtime named metrics; `metrics <metrics> query` is the older form.
+            if (argc >= 3 && cli_is_type_verb("metrics", argv[2]))
+                return cli_runtime_verb(argc, argv);
             return cli_forward(argc, argv);
         case fnv1a("db-restore"):
         {
@@ -736,16 +753,16 @@ int cli_dispatch(int argc, char** argv)
             return cli_import(argc, argv);
 
         default:
-            // Check for runtime action: socketley <name> <action> [args]
+            // `socketley <runtime> <verb> ...`, the verb read against the runtime's type.
             if (argc >= 3)
-                return cli_runtime_action(argc, argv);
+                return cli_runtime_verb(argc, argv);
 
             // Check for stdin shortcut: socketley <name> with piped input
             if (!isatty(STDIN_FILENO))
                 return cli_stdin_send(argv);
 
-            std::cerr << "unknown command\n";
-            return 1;
+            // A runtime's name alone lists its verbs.
+            return cli_runtime_verb(argc, argv);
     }
 }
 

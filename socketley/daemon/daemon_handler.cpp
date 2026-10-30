@@ -3755,7 +3755,7 @@ int daemon_handler::cmd_metrics(ipc_connection* conn, const parsed_args& pa)
     {
         const std::string_view a = pa.args[i];
         const bool has_value = i + 1 < pa.count;
-        if (a == "--json")
+        if (a == "--json" || a == "-j")
             json = true;
         else if (a == "--recent")
             recent = true;
