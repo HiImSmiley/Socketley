@@ -1,0 +1,1 @@
+irate(requests_total[1m]) + idelta(temp[1m])

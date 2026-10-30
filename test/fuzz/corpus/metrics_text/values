@@ -1,0 +1,12 @@
+a NaN
+b +Inf
+c -Inf
+d Inf
+e -1.5E3
+f .5
+g 1.
+h 1e-400
+i 0 -5
+j -0
+k 1e400
+l 0x10

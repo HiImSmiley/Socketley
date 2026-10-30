@@ -1,0 +1,1 @@
+deriv(temp[10m]) - predict_linear(temp[10m], 3600)

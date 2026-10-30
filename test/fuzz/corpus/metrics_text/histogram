@@ -1,0 +1,7 @@
+# HELP http_request_duration_seconds Latency.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{handler="/",le="0.005"} 1342
+http_request_duration_seconds_bucket{handler="/",le="0.01"} 1350
+http_request_duration_seconds_bucket{handler="/",le="+Inf"} 1351
+http_request_duration_seconds_sum{handler="/"} 4.21
+http_request_duration_seconds_count{handler="/"} 1351

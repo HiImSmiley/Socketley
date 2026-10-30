@@ -1,0 +1,12 @@
+# TYPE h histogram
+h_bucket{le="1"} 1
+h_sum 1
+h_count 1
+h_other 1
+# TYPE s summary
+s_sum 1
+# TYPE c counter
+c 1
+c_total 1
+# TYPE g untyped
+g 1

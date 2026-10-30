@@ -1,0 +1,13 @@
+# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.
+# TYPE go_gc_duration_seconds summary
+go_gc_duration_seconds{quantile="0"} 2.6542e-05
+go_gc_duration_seconds{quantile="1"} 0.000338416
+go_gc_duration_seconds_sum 0.012734917
+go_gc_duration_seconds_count 287
+# HELP node_cpu_seconds_total Seconds the CPUs spent in each mode.
+# TYPE node_cpu_seconds_total counter
+node_cpu_seconds_total{cpu="0",mode="idle"} 394851.43
+node_cpu_seconds_total{cpu="0",mode="user"} 4823.9
+# TYPE node_filesystem_avail_bytes gauge
+node_filesystem_avail_bytes{device="/dev/nvme0n1p2",fstype="ext4",mountpoint="/"} 1.73264674816e+11
+node_load1 0.52

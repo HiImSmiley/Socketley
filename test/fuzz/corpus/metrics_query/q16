@@ -1,0 +1,1 @@
+stddev_over_time(temp[10m]) / stdvar(temp)

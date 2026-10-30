@@ -1,0 +1,2 @@
+m{a="x\\y",b="q\"t",c="l1\nl2",d="\t"} 1
+# HELP m a\nb\\c
