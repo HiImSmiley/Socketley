@@ -980,7 +980,7 @@ static void append_facts(metrics_endpoint::fact_cache& cache, const std::string&
     for (const runtime_row& r : rows)
         if (!r.dir.empty())
             dirs.push_back(r.dir);
-    if (now - cache.mirrors_at >= fact::git_every || dirs != cache.mirror_dirs)
+    if (cache.mirrors_at == INT64_MIN || now - cache.mirrors_at >= fact::git_every || dirs != cache.mirror_dirs)
     {
         cache.mirrors.clear();
         for (const runtime_row& r : rows)
