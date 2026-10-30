@@ -34,8 +34,8 @@ if [ -z "${SL_PORT_BASE:-}" ]; then
         sl_listening=$(ss -ltnH 2>/dev/null | awk '{ n = split($4, a, ":"); print a[n] }')
 
         SL_PORT_BASE=""
-        for sl_try in 19000 21000 23000 25000 27000 29000 \
-                      5000 7000 9000 11000 13000 15000 17000; do
+        . "$(dirname "${BASH_SOURCE[0]}")/lib_windows.sh"
+        for sl_try in $(sl_port_windows); do
             # The lock first, because it is cheap and is what makes two shells
             # racing for one window resolve rather than both proceed, on a
             # descriptor that stays open for the life of this shell -- with the

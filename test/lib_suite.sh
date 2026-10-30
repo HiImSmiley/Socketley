@@ -20,7 +20,8 @@ suite_wants_serial() {   # file -> 0 when it must run alone
 suite_free_windows() {
     local listening w p busy n=0
     listening=$(ss -ltnH 2>/dev/null | awk '{ n = split($4, a, ":"); print a[n] }')
-    for w in 19000 21000 23000 25000 27000 29000 5000 7000 9000 11000 13000 15000 17000; do
+    . "$(dirname "${BASH_SOURCE[0]}")/integration/lib_windows.sh"
+    for w in $(sl_port_windows); do
         flock -n "/tmp/socketley-ports-$w.lock" true 2>/dev/null || continue
         busy=""
         for p in $listening; do
