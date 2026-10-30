@@ -132,7 +132,8 @@ struct head_chunk
     uint16_t n;
 };
 
-// The closed chunks of one aligned window, immutable once sealed, which is when a cut may read it off the loop.
+// The closed chunks of one aligned window (start, start + block_ms], immutable once sealed, which is when a cut may
+// read it off the loop.
 struct head_window
 {
     int64_t start{0};
@@ -581,7 +582,7 @@ struct store::impl
     // Blocks by kind, raw first and then each tier, each list ascending by mint.
     std::vector<std::vector<std::shared_ptr<block>>> blocks;
 
-    // Samples before this lie in a window already cut, and are refused.
+    // Samples at or before this lie in a window already cut, and are refused.
     int64_t floor{INT64_MIN};
     int64_t now{INT64_MIN};
     int64_t max_t{INT64_MIN};
@@ -600,9 +601,14 @@ struct store::impl
     std::vector<std::pair<std::string_view, std::string_view>> pairs;
     std::vector<uint32_t> chain;
     std::vector<uint32_t> candidates;
+    // What a tier read reuses: the points it hands out, and per tier what is folded past its last block.
+    std::vector<tier_point> agg_pts;
+    std::vector<std::vector<tier_point>> fold_tmp, fold_finer;
+    std::vector<sample> fold_raw;
 
     // ── layout ──
 
+    // Every sample after this is in the head.
     int64_t head_lo() const { return windows.empty() ? floor : std::min(floor, windows.front()->start); }
 
     // The clock tick() is given, so one sample stamped far ahead cannot expire every block; before a tick, the samples.
@@ -800,12 +806,12 @@ struct store::impl
             ++out_of_order;
             return false;
         }
-        if (t < floor || t > max_abs_time || t < -max_abs_time)
+        if (t <= floor || t > max_abs_time || t < -max_abs_time)
         {
             ++too_old;
             return false;
         }
-        const int64_t w = align_down(t, block_ms);
+        const int64_t w = window_of(t, block_ms);
         if (s.slot != no_slot)
         {
             const head_slot& hs = slab.at(s.slot);
@@ -821,7 +827,7 @@ struct store::impl
             window_at(w);
         }
         hs.ap.append(hs.data, slot_data_bytes, t, v);
-        if (s.last_t < head_lo())
+        if (s.last_t <= head_lo())
             s.head_mint = t;
         if (!s.counted)
         {
@@ -900,7 +906,7 @@ struct store::impl
         head_series = 0;
         for (series_head& s : heads)
         {
-            s.counted = s.last_t != INT64_MIN && s.last_t >= lo;
+            s.counted = s.last_t != INT64_MIN && s.last_t > lo;
             head_series += s.counted;
         }
     }
@@ -978,7 +984,7 @@ struct store::impl
                     continue;
                 const int64_t ps = align_down(b->mint(), span), pe = ps + span;
                 // A day past this tier's retention is still merged when the next tier is built from it.
-                const bool wanted = pe > keep_from || (span == day_ms && feeds_next(kind) && pe > horizon(keep_of(kind + 1)));
+                const bool wanted = pe >= keep_from || (span == day_ms && feeds_next(kind) && pe >= horizon(keep_of(kind + 1)));
                 if (pe > floor || !wanted)
                     continue;
                 // A tier built from the one below waits until every day of that one in the span is merged.
@@ -1039,8 +1045,8 @@ struct store::impl
             for (const auto& b : blocks[k])
             {
                 // A part of a day the next tier is not yet built from waits for that day's merge.
-                const bool feeding = feeds_next(k) && b->maxt() - b->mint() < day_ms && b->maxt() > horizon(keep_of(k + 1));
-                if (b->maxt() <= keep_from && !feeding)
+                const bool feeding = feeds_next(k) && b->maxt() - b->mint() < day_ms && b->maxt() >= horizon(keep_of(k + 1));
+                if (b->maxt() < keep_from && !feeding)
                     gone.push_back(b);
             }
             for (const auto& b : gone)
@@ -1054,27 +1060,25 @@ struct store::impl
     {
         const series_head& s = heads[id];
         const int64_t lo = head_lo();
-        if (s.last_t >= lo && s.last_t >= mint && std::max(s.head_mint, lo) <= maxt)
+        if (s.last_t > lo && s.last_t >= mint && std::max(s.head_mint, lo) <= maxt)
             return true;
         for (size_t k = 0; k < blocks.size(); ++k)
         {
             const int64_t step = step_of(k);
             for (const auto& b : blocks[k])
             {
-                if (b->mint() > maxt)
+                if (b->mint() >= maxt)
                     break;
-                if (b->maxt() <= mint)
+                if (b->maxt() < mint)
                     continue;
                 const uint32_t local = b->local_of(id);
                 if (local == no_series)
                     continue;
                 int64_t lo_t = 0, hi_t = 0;
                 b->range(local, lo_t, hi_t);
+                // A tier's point at t holds the samples in (t - step, t].
                 if (step > 0)
-                {
-                    lo_t -= step;
-                    hi_t -= 1;
-                }
+                    lo_t -= step - 1;
                 if (lo_t <= maxt && hi_t >= mint)
                     return true;
             }
@@ -1105,9 +1109,9 @@ struct store::impl
         };
         for (const auto& b : blocks[0])
         {
-            if (b->mint() > maxt)
+            if (b->mint() >= maxt)
                 break;
-            if (b->maxt() <= mint)
+            if (b->maxt() < mint)
                 continue;
             const uint32_t local = b->local_of(id);
             if (local == no_series)
@@ -1122,9 +1126,9 @@ struct store::impl
         }
         for (const auto& w : windows)
         {
-            if (w->start > maxt)
+            if (w->start >= maxt)
                 break;
-            if (w->start + block_ms <= mint)
+            if (w->start + block_ms < mint)
                 continue;
             w->chain_of(id, chain);
             for (uint32_t c : chain)
@@ -1153,7 +1157,6 @@ struct store::impl
         const auto& list = blocks[k + 1];
         int64_t covered = INT64_MIN;
         int64_t last = INT64_MIN;
-        std::vector<tier_point> tmp;
         for (const auto& b : list)
         {
             covered = std::max(covered, b->maxt());
@@ -1167,36 +1170,41 @@ struct store::impl
                     return false;
                 if (c.maxt <= lo)
                     return true;
-                tmp.clear();
-                decode_tier_chunk(c.bytes, tmp);
-                for (const tier_point& p : tmp)
-                    if (p.t > lo && p.t <= hi && p.t > last)
+                // Decoded in place behind what is there, and what lies outside (lo, hi] or repeats squeezed out.
+                const size_t from = out.size();
+                decode_tier_chunk(c.bytes, out);
+                size_t keep = from;
+                for (size_t i = from; i < out.size(); ++i)
+                    if (out[i].t > lo && out[i].t <= hi && out[i].t > last)
                     {
-                        out.push_back(p);
-                        last = p.t;
+                        last = out[i].t;
+                        out[keep++] = out[i];
                     }
+                out.resize(keep);
                 return true;
             });
         }
         if (hi <= covered)
             return;
         const int64_t a = std::max(lo, covered);
-        const int64_t first_end = step_end(a, step), last_end = align_down(hi, step);
+        const int64_t first_end = align_down(a, step) + step, last_end = align_down(hi, step);
         if (last_end < first_end)
             return;
+        auto& tmp = fold_tmp[k];
         tmp.clear();
         {
             tier_folder f(step, tmp);
             if (k == 0)
             {
-                std::vector<sample> raw;
-                read_samples(id, first_end - step, last_end - 1, raw);
-                for (const sample& x : raw)
+                fold_raw.clear();
+                read_samples(id, first_end - step + 1, last_end, fold_raw);
+                for (const sample& x : fold_raw)
                     f.add(x.t, x.v);
             }
             else
             {
-                std::vector<tier_point> finer;
+                auto& finer = fold_finer[k];
+                finer.clear();
                 collect(k - 1, id, first_end - step, last_end, finer);
                 for (const tier_point& p : finer)
                     f.add(p);
@@ -1236,9 +1244,9 @@ struct store::impl
             tmp.clear();
             // A chunk that does not decode whole inside one window, in order, as its record says, is skipped.
             const bool bounded = mint >= -max_abs_time && maxt <= max_abs_time;
-            const int64_t w = bounded ? align_down(mint, block_ms) : 0;
+            const int64_t w = bounded ? window_of(mint, block_ms) : 0;
             bool ok = bounded && it != ids.end() && bytes.size() <= slot_data_bytes && decode_chunk(bytes, tmp) &&
-                      !tmp.empty() && tmp.front().t == mint && tmp.back().t == maxt && maxt < w + block_ms;
+                      !tmp.empty() && tmp.front().t == mint && tmp.back().t == maxt && maxt <= w + block_ms;
             for (size_t i = 1; ok && i < tmp.size(); ++i)
                 ok = tmp[i].t > tmp[i - 1].t;
             if (!ok)
@@ -1248,11 +1256,11 @@ struct store::impl
             }
             const uint32_t g = it->second;
             series_head& h = s.heads[g];
-            if (mint > h.last_t && mint >= s.floor)
+            if (mint > h.last_t && mint > s.floor)
             {
                 s.close_open(g, h, true);
                 s.window_at(w)->add(g, mint, maxt, static_cast<uint16_t>(tmp.size()), bytes);
-                if (h.last_t < s.head_lo())
+                if (h.last_t <= s.head_lo())
                     h.head_mint = mint;
                 h.last_t = maxt;
                 if (maxt > s.max_t)
@@ -1391,6 +1399,8 @@ struct store::impl
             if (!private_dir(*p, true))
                 return why = *p + " is not a directory of this user's alone", false;
         blocks.assign(cfg.tiers.size() + 1, {});
+        fold_tmp.assign(cfg.tiers.size(), {});
+        fold_finer.assign(cfg.tiers.size(), {});
 
         // Blocks: each checked whole, a damaged one set aside, one inside another of its kind dropped.
         std::vector<std::string> names;
@@ -1653,12 +1663,13 @@ void store::aggregates(uint32_t id, int64_t step, int64_t mint, int64_t maxt, st
     maxt = std::clamp(maxt, -max_abs_time, max_abs_time);
     if (k <= 0 || id >= m->heads.size() || mint >= maxt)
         return;
-    std::vector<tier_point> pts;
+    auto& pts = m->agg_pts;
+    pts.clear();
     m->collect(static_cast<size_t>(k - 1), id, mint - step, maxt, pts);
     const tier_point* prev = nullptr;
     for (const tier_point& p : pts)
     {
-        if (p.t > mint)
+        if (p.t > mint && p.count > 0)
             out.push_back(to_agg(p, prev, step));
         prev = &p;
     }

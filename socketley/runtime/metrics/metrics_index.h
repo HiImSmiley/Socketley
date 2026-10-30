@@ -18,9 +18,6 @@ namespace socketley::metrics
 
 inline constexpr uint32_t no_series = 0xFFFFFFFFu;
 
-// Whether `pattern` is a regex a matcher takes, RE2 syntax as far as POSIX ERE carries it; the reason in `why`.
-bool regex_valid(std::string_view pattern, std::string* why = nullptr);
-
 // Whether `ls` is sorted by name, its names unique and none of its values empty.
 bool is_normal(const label_set& ls);
 // `in` sorted with its empty values dropped into `out`; false when two labels share a name.
@@ -116,7 +113,8 @@ private:
     uint64_t key_hash(const label_set& ls) const;
     const name_entry* name_of(std::string_view name) const;
     uint32_t posting_of(uint32_t name, uint32_t value) const;
-    const compiled& regex(std::string_view pattern) const;
+    // A matcher's regex in RE2 syntax, matched in linear time by metrics_regex, compiled once for a few dozen patterns.
+    const compiled& compiled_for(std::string_view pattern) const;
 
     // Symbols: their bytes back to back, the start of each, and the table that finds one by its bytes.
     std::string m_sym_bytes;

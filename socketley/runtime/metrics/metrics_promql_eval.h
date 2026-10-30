@@ -76,6 +76,7 @@ private:
     void     drop_empty(std::vector<vseries>& vec);
     value    scalar_value(double v) const;
 
+    bool    tier_per_step(int64_t s) const;
     int64_t plan_instant(int64_t t0);
     int64_t plan_range(fn f, int64_t range, int64_t t0, int64_t& range_eff);
 

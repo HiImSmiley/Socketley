@@ -780,7 +780,7 @@ TEST_CASE("the regex engine reads RE2 syntax and matches whole strings")
 namespace
 {
 
-// Increments over [from, to), from the last sample before it, a reset counted as the counter starting from zero.
+// Increments over (from, to], from the last sample before it, a reset counted as the counter starting from zero.
 double brute_increase(const std::vector<sample>& s, int64_t from, int64_t to, bool& any)
 {
     bool have = false;
@@ -788,9 +788,9 @@ double brute_increase(const std::vector<sample>& s, int64_t from, int64_t to, bo
     any = false;
     for (const auto& x : s)
     {
-        if (x.t >= to)
+        if (x.t > to)
             break;
-        if (x.t >= from)
+        if (x.t > from)
         {
             any = true;
             if (have)
@@ -809,22 +809,25 @@ struct tiered
     query_engine without{src};
     std::vector<uint32_t> counters, gauges;
 
-    tiered()
+    // Unaligned every 15 s, 3 s past the minute's quarter, so no sample lies on a step's edge; aligned every 10 s on the
+    // grid the runtime's tick stamps, so one sample lies on every edge.
+    explicit tiered(bool aligned)
     {
         without.limits().use_tiers = false;
         src.tiers = {300 * sec, 3600 * sec};
+        const int64_t every = aligned ? 10 * sec : 15 * sec, first = aligned ? 10 * sec : 3 * sec;
+        const int n = static_cast<int>(48 * 3600 * sec / every);
         for (int i = 0; i < 3; ++i)
         {
             std::vector<sample> c, g;
             double v = 0;
-            // Every 15 s, 3 s past the minute's quarter, so no sample lies on a step's edge.
-            for (int j = 0; j < 2 * 5760; ++j)
+            for (int j = 0; j < n; ++j)
             {
                 v += j % 7 + i;
                 if (j % 1000 == 999)
                     v = j % 5;
-                c.push_back({3 * sec + j * 15 * sec, v});
-                g.push_back({3 * sec + j * 15 * sec, static_cast<double>((j * 37 + i * 11) % 101) - 50});
+                c.push_back({first + j * every, v});
+                g.push_back({first + j * every, static_cast<double>((j * 37 + i * 11) % 101) - 50});
             }
             counters.push_back(src.add({{"__name__", "c"}, {"i", std::to_string(i)}}, c));
             gauges.push_back(src.add({{"__name__", "g"}, {"i", std::to_string(i)}}, g));
@@ -844,7 +847,10 @@ struct tiered
 
 TEST_CASE("the planner reads a tier where window and step are whole steps of it, and it equals brute force")
 {
-    tiered t;
+    for (const bool aligned : {false, true})
+    {
+    CAPTURE(aligned);
+    tiered t(aligned);
     const int64_t h = 3600 * sec;
     for (const char* f : {"avg_over_time", "min_over_time", "max_over_time", "sum_over_time", "count_over_time",
                           "last_over_time"})
@@ -866,21 +872,35 @@ TEST_CASE("the planner reads a tier where window and step are whole steps of it,
         }
     }
 
-    // An instant selector at hour steps is the tier's last, the same sample the lookback finds.
+    // An instant selector at hour steps is the five-minute tier's last, the same sample the lookback finds, and a
+    // series silent for the half hour before an evaluation time is absent there from both.
     {
-        const auto a = t.run(t.with, "g", 12 * h, 36 * h, h);
-        CHECK(t.with.last_stats().tier_selectors == 1);
-        const auto b = t.run(t.without, "g", 12 * h, 36 * h, h);
-        REQUIRE(a.series.size() == b.series.size());
-        for (size_t i = 0; i < a.series.size(); ++i)
+        std::vector<sample> q;
+        for (int64_t x = 10 * sec; x <= 48 * h; x += 10 * sec)
+            if (x <= 20 * h - h / 2 || x > 20 * h)
+                q.push_back({x, static_cast<double>(x / sec % 17)});
+        t.src.add({{"__name__", "quiet"}}, q);
+        for (const char* sel : {"g", "quiet"})
         {
-            REQUIRE(a.series[i].points.size() == b.series[i].points.size());
-            for (size_t k = 0; k < a.series[i].points.size(); ++k)
-                CHECK(a.series[i].points[k].v == b.series[i].points[k].v);
+            const auto a = t.run(t.with, sel, 12 * h, 36 * h, h);
+            CHECK(t.with.last_stats().tier_selectors == 1);
+            const auto b = t.run(t.without, sel, 12 * h, 36 * h, h);
+            REQUIRE(a.series.size() == b.series.size());
+            for (size_t i = 0; i < a.series.size(); ++i)
+            {
+                REQUIRE(a.series[i].points.size() == b.series[i].points.size());
+                for (size_t k = 0; k < a.series[i].points.size(); ++k)
+                    CHECK(a.series[i].points[k].v == b.series[i].points[k].v);
+            }
         }
+        const auto a = t.run(t.with, "quiet", 12 * h, 36 * h, h);
+        REQUIRE(a.series.size() == 1);
+        CHECK(a.series[0].points.size() == 24);
+        // The five-minute tier read whole: a day of it and the step at its start, less the silent half hour.
+        CHECK(t.with.last_stats().tier_points == 24 * 12 + 1 - 6);
     }
 
-    // rate and increase from `inc` are the increments of [T - 1h, T) over the window, resets folded in.
+    // rate and increase from `inc` are the increments of (T - 1h, T] over the window, resets folded in.
     auto check_rate = [&](std::string_view q, int64_t step, int64_t range, bool increase, int64_t stretched) {
         const auto a = t.run(t.with, q, 12 * h, 36 * h, step);
         CHECK_MESSAGE(t.with.last_stats().tier_selectors == 1, q);
@@ -928,6 +948,7 @@ TEST_CASE("the planner reads a tier where window and step are whole steps of it,
     CHECK(t.with.last_stats().tier_selectors == 1);
     t.run(t.with, "rate(c[1h] offset 1m)", 12 * h, 36 * h, h);
     CHECK(t.with.last_stats().tier_selectors == 0);
+    }
 }
 
 namespace

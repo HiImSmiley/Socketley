@@ -37,6 +37,9 @@ inline int64_t floor_div(int64_t a, int64_t b)
 // The start of the `span`-aligned window holding `t`.
 inline int64_t align_down(int64_t t, int64_t span) { return floor_div(t, span) * span; }
 
+// The start of the left-open `span`-aligned window (start, start + span] holding `t`, as every window here is.
+inline int64_t window_of(int64_t t, int64_t span) { return align_down(t - 1, span); }
+
 // Subtraction that wraps rather than overflows, as the codec's deltas may.
 inline int64_t wrap_sub(int64_t a, int64_t b)
 {
@@ -65,20 +68,33 @@ class bit_reader
 {
 public:
     bit_reader() = default;
-    bit_reader(const uint8_t* p, size_t bytes) : m_p(p), m_bits(bytes * 8) {}
+    bit_reader(const uint8_t* p, size_t bytes) : m_p(p), m_bytes(bytes), m_bits(bytes * 8) {}
 
     // `n` bits, at most 64, or false when fewer are left.
     bool get(unsigned n, uint64_t& out)
     {
         if (n > m_bits - m_pos)
             return false;
+        const size_t byte = m_pos >> 3;
+        const auto off = static_cast<unsigned>(m_pos & 7);
+        // One big-endian word holds the field whenever eight bytes are left and the field does not run past them.
+        if (n > 0 && off + n <= 64 && byte + 8 <= m_bytes)
+        {
+            uint64_t w;
+            std::memcpy(&w, m_p + byte, 8);
+            if constexpr (std::endian::native == std::endian::little)
+                w = std::byteswap(w);
+            out = (w << off) >> (64 - n);
+            m_pos += n;
+            return true;
+        }
         uint64_t v = 0;
         while (n > 0)
         {
             const unsigned room = 8 - static_cast<unsigned>(m_pos & 7);
             const unsigned take = n < room ? n : room;
-            const unsigned byte = m_p[m_pos >> 3];
-            v = (v << take) | ((byte >> (room - take)) & ((1u << take) - 1));
+            const unsigned b = m_p[m_pos >> 3];
+            v = (v << take) | ((b >> (room - take)) & ((1u << take) - 1));
             m_pos += take;
             n -= take;
         }
@@ -88,15 +104,16 @@ public:
 
     bool bit(bool& out)
     {
-        uint64_t v = 0;
-        if (!get(1, v))
+        if (m_pos >= m_bits)
             return false;
-        out = v != 0;
+        out = (m_p[m_pos >> 3] >> (7 - (m_pos & 7))) & 1;
+        ++m_pos;
         return true;
     }
 
 private:
     const uint8_t* m_p{nullptr};
+    size_t m_bytes{0};
     size_t m_bits{0};
     size_t m_pos{0};
 };
@@ -224,8 +241,8 @@ inline void fold_point(tier_point& p, const tier_point& q)
     p.last = q.last;
 }
 
-// The step of `step` that `t` falls in, by the time it ends.
-inline int64_t step_end(int64_t t, int64_t step) { return align_down(t, step) + step; }
+// The step of `step` that `t` falls in, by the time it ends: a time on an edge ends its step.
+inline int64_t step_end(int64_t t, int64_t step) { return window_of(t, step) + step; }
 
 // Raw samples folded, in time order, into the points of one tier.
 class tier_folder
@@ -252,7 +269,7 @@ public:
     // Finer points, in time order, folded into this coarser tier.
     void add(const tier_point& q)
     {
-        const int64_t e = step_end(q.t - 1, m_step);
+        const int64_t e = step_end(q.t, m_step);
         if (m_open && e == m_p.t)
         {
             fold_point(m_p, q);

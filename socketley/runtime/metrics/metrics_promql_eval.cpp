@@ -647,13 +647,18 @@ value evaluator::scalar_value(double v) const
     return out;
 }
 
-// An instant selector reads the tier S whose points end on every evaluation time, its `last` the value there.
+// A tier's point is read only where a step needs it once more of them lie between two steps than a stored chunk holds,
+// since a read decodes a whole chunk.
+bool evaluator::tier_per_step(int64_t s) const { return m_step > 0 && m_step / s > 1024; }
+
+// An instant selector reads the tier S no longer than the lookback whose points end on every evaluation time, its `last`
+// the sample the lookback finds but for a staleness marker, which no tier holds.
 int64_t evaluator::plan_instant(int64_t t0)
 {
     if (!m_lim.use_tiers || m_step <= 0)
         return 0;
     // A coarser tier that does not divide the step gives way to the next finer one.
-    for (int64_t s = m_src.tier_for(t0, m_step); s > 0; s = m_src.tier_for(t0, s - 1))
+    for (int64_t s = m_src.tier_for(t0, std::min(m_step, m_lim.lookback_ms)); s > 0; s = m_src.tier_for(t0, s - 1))
         if (!(m_step % s) && !floor_mod(t0, s))
             return s;
     return 0;
@@ -707,15 +712,13 @@ value evaluator::vector_selector(const expr_node& e, bool timestamps)
         ++m_stats.tier_selectors;
         select(e, t0 - s, t1, ids);
         auto& pts = m_sc.points;
-        const bool per_step = m_step > s;
+        const bool per_step = tier_per_step(s);
         for (uint32_t id : ids)
         {
             std::fill(row.begin(), row.end(), hole());
             uint64_t work = 0;
-            auto take = [&](size_t k, const agg_point& p) {
-                if (p.count > 0 && !is_stale(p.last))
-                    row[k] = canon(p.last);
-            };
+            // A tier holds no NaN, the staleness marker among them, so its `last` is always a value.
+            auto take = [&](size_t k, const agg_point& p) { row[k] = canon(p.last); };
             if (per_step)
                 for (size_t k = 0; k < m_n; ++k)
                 {
@@ -919,32 +922,19 @@ double evaluator::tier_window(fn f, std::span<const agg_point> w, int64_t range,
         {
             double sum = 0, c = 0;
             for (const auto& p : w)
-                if (p.count > 0)
-                    kahan_inc(p.sum, sum, c);
+                kahan_inc(p.sum, sum, c);
             sum = std::isinf(sum) ? sum : sum + c;
             return f == fn::sum_over_time ? sum : sum / count;
         }
         case fn::count_over_time: return count;
         case fn::min_over_time: case fn::max_over_time:
         {
-            bool first = true;
-            double m = 0;
+            double m = f == fn::min_over_time ? w[0].min : w[0].max;
             for (const auto& p : w)
-            {
-                if (p.count <= 0)
-                    continue;
-                const double x = f == fn::min_over_time ? p.min : p.max;
-                if (first || std::isnan(m) || (f == fn::min_over_time ? x < m : x > m))
-                    m = x;
-                first = false;
-            }
+                m = f == fn::min_over_time ? std::min(m, p.min) : std::max(m, p.max);
             return m;
         }
-        case fn::last_over_time:
-            for (size_t i = w.size(); i-- > 0;)
-                if (w[i].count > 0 && !is_stale(w[i].last))
-                    return canon(w[i].last);
-            return hole();
+        case fn::last_over_time: return canon(w.back().last);
         default: return 1;
     }
 }
@@ -1008,7 +998,7 @@ value evaluator::range_call(const expr_node& e)
         {
             auto& pts = m_sc.points;
             uint64_t work = 0;
-            if (m_step > range_eff)
+            if (tier_per_step(s))
                 for (size_t k = 0; k < m_n; ++k)
                 {
                     const int64_t te = t0 + static_cast<int64_t>(k) * step;

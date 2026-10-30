@@ -1,7 +1,7 @@
 #pragma once
-// The metrics runtime's store: samples appended into fixed-size head chunks, each aligned two hours cut into an
-// immutable block, blocks merged into longer ones, downsampled into tiers and deleted past their retention, and all of
-// it read back as one series_source.
+// The metrics runtime's store: samples appended into fixed-size head chunks, each aligned left-open two hours
+// (start, start + 2h] cut into an immutable block, blocks merged into longer ones, downsampled into tiers and deleted
+// past their retention, and all of it read back as one series_source.
 //
 // Under its directory:
 //   blocks/<kind>_<mint>_<maxt>.blk   immutable blocks, `raw` or `s<step>` for a tier

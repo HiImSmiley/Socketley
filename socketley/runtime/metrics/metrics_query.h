@@ -22,7 +22,8 @@ struct query_limits
     int64_t  lookback_ms{300'000};
     // Prometheus's cap on (end - start) / step.
     int64_t  max_points_per_series{11'000};
-    // Off reads raw samples only, which the tests use as the reference for the tiers.
+    // Off reads raw samples only, which the tests use as the reference for the tiers: a tier answers as raw does but
+    // that it holds no NaN, so a NaN sample and a staleness marker take no part in what it answers.
     bool     use_tiers{true};
 };
 

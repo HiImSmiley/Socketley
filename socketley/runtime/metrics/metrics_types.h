@@ -43,8 +43,10 @@ inline constexpr uint64_t stale_bits = 0x7ff0000000000002ull;
 inline double stale_nan() { return std::bit_cast<double>(stale_bits); }
 inline bool   is_stale(double v) { return std::bit_cast<uint64_t>(v) == stale_bits; }
 
-// One step of a coarser tier: what the raw samples in [t - step, t) were, `inc` the counter increase across the
-// step with resets folded in and measured from the previous step's last sample.
+// One step of a coarser tier: what the raw samples in (t - step, t] were, left-open as a Prometheus 3 range is, `inc`
+// the counter increase across the step with resets folded in and measured from the previous step's last sample.
+// NaN, the staleness marker among them, takes no part, so `count` counts the other samples and a step holding only NaN
+// has no point; a series that ended inside a step still has that step's `last`.
 struct agg_point
 {
     int64_t t{0};
@@ -82,7 +84,7 @@ public:
 
     // The step of the coarsest tier no coarser than `resolution` that still holds data back to `mint`; 0 is raw.
     virtual int64_t tier_for(int64_t mint, int64_t resolution) const = 0;
-    // The points of `id` in tier `step` whose steps end in (mint, maxt], ascending, appended to `out`.
+    // The points of `id` in tier `step` whose steps end in (mint, maxt], ascending, each with a count above zero.
     virtual void aggregates(uint32_t id, int64_t step, int64_t mint, int64_t maxt, std::vector<agg_point>& out) = 0;
 
     virtual void label_names(std::vector<std::string>& out) const = 0;

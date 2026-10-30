@@ -113,7 +113,7 @@ void block_file(const uint8_t* p, size_t n)
         auto* d = reinterpret_cast<uint8_t*>(f.data());
         uint8_t* ft = d + f.size() - footer;
         std::memcpy(ft, "SKLMBLK1", 8);
-        socketley::bytes::store32(ft + 8, 1);
+        socketley::bytes::store32(ft + 8, mt::block_version);
         const uint64_t body = f.size() - footer;
         for (int i = 0; i < 4; ++i)
         {

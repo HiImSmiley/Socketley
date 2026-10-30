@@ -1,6 +1,7 @@
 #pragma once
 // A series_source over vectors, with tiers computed from the raw samples by the rule metrics_types.h states: a point
-// at t holds the samples in [t - step, t), its `inc` measured from the last sample before them with resets folded in.
+// at t holds the samples in (t - step, t] but NaN, its `inc` measured from the previous step's last sample with resets
+// folded in.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -129,35 +130,39 @@ public:
             return it->second;
         std::vector<agg_point> pts;
         const auto& s = series[id].samples;
-        bool have_prev = false;
         double prev = 0;
+        int64_t prev_end = std::numeric_limits<int64_t>::min();
         size_t i = 0;
         while (i < s.size())
         {
-            if (is_stale(s[i].v))
+            if (std::isnan(s[i].v))
             {
                 ++i;
                 continue;
             }
-            const int64_t end = (s[i].t >= 0 ? s[i].t / step : (s[i].t - step + 1) / step) * step + step;
+            // The step whose end is the first multiple of `step` at or after the sample.
+            const int64_t q = s[i].t / step - (s[i].t % step < 0 ? 1 : 0);
+            const int64_t end = (s[i].t % step == 0 ? q : q + 1) * step;
             agg_point p;
             p.t = end;
             bool first = true;
             double sum = 0, c = 0;
-            for (; i < s.size() && s[i].t < end; ++i)
+            for (; i < s.size() && s[i].t <= end; ++i)
             {
                 const double v = s[i].v;
-                if (is_stale(v))
+                if (std::isnan(v))
                     continue;
                 if (first)
                 {
                     p.min = p.max = v;
+                    if (prev_end == end - step)
+                        p.inc += v >= prev ? v - prev : v;
                     first = false;
                 }
-                if (v < p.min || std::isnan(p.min))
-                    p.min = v;
-                if (v > p.max || std::isnan(p.max))
-                    p.max = v;
+                else
+                    p.inc += v >= prev ? v - prev : v;
+                p.min = std::min(p.min, v);
+                p.max = std::max(p.max, v);
                 const double t = sum + v;
                 if (std::isinf(t))
                     c = 0;
@@ -168,14 +173,11 @@ public:
                 sum = t;
                 p.count += 1;
                 p.last = v;
-                if (have_prev)
-                    p.inc += v >= prev ? v - prev : v;
                 prev = v;
-                have_prev = true;
             }
             p.sum = std::isinf(sum) ? sum : sum + c;
-            if (p.count > 0)
-                pts.push_back(p);
+            prev_end = end;
+            pts.push_back(p);
         }
         return m_tiers.emplace(key, std::move(pts)).first->second;
     }

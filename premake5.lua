@@ -3299,7 +3299,10 @@ project "test_metrics_store"
 
     files { "test/unit/test_metrics_store.cpp", "socketley/runtime/metrics/metrics_chunk.cpp",
             "socketley/runtime/metrics/metrics_index.cpp", "socketley/runtime/metrics/metrics_block.cpp",
-            "socketley/runtime/metrics/metrics_store.cpp", "socketley/shared/util/crc.cpp" }
+            "socketley/runtime/metrics/metrics_store.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
+            "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
+            "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_text.cpp",
+            "socketley/shared/util/crc.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

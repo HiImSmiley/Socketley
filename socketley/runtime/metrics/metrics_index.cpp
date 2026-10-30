@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <cctype>
 #include <numeric>
-#include <regex.h>
 
 #include "../../shared/util/keyed_hash.h"
+#include "metrics_regex.h"
 
 namespace socketley::metrics
 {
@@ -22,135 +22,6 @@ uint64_t mix64(uint64_t x)
 }
 
 bool label_less(const label& a, const label& b) { return a.name < b.name; }
-
-// RE2's spelling of the shorthand classes, as a bracket expression's inside.
-const char* class_body(char e)
-{
-    switch (e)
-    {
-        case 'd': return "0-9";
-        case 'w': return "[:alnum:]_";
-        case 's': return "[:space:]";
-        default: return nullptr;
-    }
-}
-
-// `p` as an anchored POSIX ERE in `out`, with the flags it compiles under; false with `why` for what ERE lacks.
-bool translate(std::string_view p, std::string& out, int& flags, std::string& why)
-{
-    flags = REG_EXTENDED | REG_NOSUB;
-    size_t i = 0;
-    if (p.starts_with("(?i)"))
-    {
-        flags |= REG_ICASE;
-        i = 4;
-    }
-    out = "^(";
-    bool in_class = false;
-    bool class_start = false;
-    for (; i < p.size(); ++i)
-    {
-        const char c = p[i];
-        if (in_class)
-        {
-            if (c == '\\')
-            {
-                if (i + 1 >= p.size())
-                    return why = "a trailing backslash", false;
-                const char e = p[++i];
-                if (const char* b = class_body(e))
-                    out += b;
-                else if (e == 'n')
-                    out += '\n';
-                else if (e == 't')
-                    out += '\t';
-                else if (std::ispunct(static_cast<unsigned char>(e)) && e != ']' && e != '[' && e != '^' && e != '-' &&
-                         e != '\\')
-                    out += e;
-                else
-                    return why = std::string("the escape \\") + e + " inside a class is not supported", false;
-                class_start = false;
-                continue;
-            }
-            if (c == '[' && i + 1 < p.size() && p[i + 1] == ':')
-            {
-                const size_t end = p.find(":]", i + 2);
-                if (end == std::string_view::npos)
-                    return why = "an unterminated [:class:]", false;
-                out.append(p.substr(i, end + 2 - i));
-                i = end + 1;
-                class_start = false;
-                continue;
-            }
-            if (c == '^' && class_start && out.back() == '[')
-            {
-                out += '^';
-                continue;
-            }
-            if (c == ']' && !class_start)
-                in_class = false;
-            out += c;
-            class_start = false;
-            continue;
-        }
-        switch (c)
-        {
-            case '\\':
-            {
-                if (i + 1 >= p.size())
-                    return why = "a trailing backslash", false;
-                const char e = p[++i];
-                if (const char* b = class_body(static_cast<char>(std::tolower(static_cast<unsigned char>(e)))))
-                {
-                    out += std::isupper(static_cast<unsigned char>(e)) ? "[^" : "[";
-                    out += b;
-                    out += ']';
-                }
-                else if (e == 'n')
-                    out += '\n';
-                else if (e == 't')
-                    out += '\t';
-                else if (std::ispunct(static_cast<unsigned char>(e)))
-                {
-                    out += '\\';
-                    out += e;
-                }
-                else
-                    return why = std::string("the escape \\") + e + " is not supported", false;
-                break;
-            }
-            case '[':
-                in_class = true;
-                class_start = true;
-                out += '[';
-                break;
-            case '(':
-                if (i + 1 < p.size() && p[i + 1] == '?')
-                {
-                    if (p.substr(i, 3) != "(?:")
-                        return why = "only (?: and a leading (?i) are supported among (? groups", false;
-                    i += 2;
-                }
-                out += '(';
-                break;
-            case '*':
-            case '+':
-            case '?':
-            case '}':
-                out += c;
-                // Laziness changes where a match ends, never whether a fully anchored one exists.
-                if (i + 1 < p.size() && p[i + 1] == '?')
-                    ++i;
-                break;
-            default:
-                out += c;
-        }
-    }
-    if (in_class)
-        return why = "an unterminated [", false;
-    out += ")$";
-    return true;
-}
 
 bool is_meta(char c)
 {
@@ -220,32 +91,6 @@ void union_of(const std::vector<const std::vector<uint32_t>*>& lists, uint32_t u
 
 }   // namespace
 
-bool regex_valid(std::string_view pattern, std::string* why)
-{
-    std::string ere, reason;
-    int flags = 0;
-    if (!translate(pattern, ere, flags, reason))
-    {
-        if (why)
-            *why = reason;
-        return false;
-    }
-    regex_t re;
-    const int rc = ::regcomp(&re, ere.c_str(), flags);
-    if (rc != 0)
-    {
-        if (why)
-        {
-            char buf[256];
-            ::regerror(rc, &re, buf, sizeof buf);
-            *why = buf;
-        }
-        return false;
-    }
-    ::regfree(&re);
-    return true;
-}
-
 bool is_normal(const label_set& ls)
 {
     for (size_t i = 0; i < ls.size(); ++i)
@@ -300,35 +145,20 @@ struct series_index::compiled
     std::string pattern;
     kind k{kind::invalid};
     std::vector<std::string> lits;
-    regex_t re{};
-    bool has_re{false};
+    metrics::regex re;
 
     explicit compiled(std::string_view p) : pattern(p)
     {
+        std::string why;
         if (p == ".*")
             k = kind::any;
         else if (p == ".+")
             k = kind::nonempty;
         else if (literal_alternatives(p, lits))
             k = kind::literals;
-        else
-        {
-            std::string ere, why;
-            int flags = 0;
-            if (translate(p, ere, flags, why) && ::regcomp(&re, ere.c_str(), flags) == 0)
-            {
-                has_re = true;
-                k = kind::general;
-            }
-        }
+        else if (re.compile(p, why))
+            k = kind::general;
     }
-    ~compiled()
-    {
-        if (has_re)
-            ::regfree(&re);
-    }
-    compiled(const compiled&) = delete;
-    compiled& operator=(const compiled&) = delete;
 
     bool accepts(std::string_view v) const
     {
@@ -340,11 +170,7 @@ struct series_index::compiled
             case kind::invalid: return false;
             case kind::general: break;
         }
-        static const char empty[1] = {0};
-        regmatch_t m[1];
-        m[0].rm_so = 0;
-        m[0].rm_eo = static_cast<regoff_t>(v.size());
-        return ::regexec(&re, v.empty() ? empty : v.data(), 1, m, REG_STARTEND) == 0;
+        return re.matches(v);
     }
 };
 
@@ -356,7 +182,7 @@ series_index::series_index()
 
 series_index::~series_index() = default;
 
-const series_index::compiled& series_index::regex(std::string_view pattern) const
+const series_index::compiled& series_index::compiled_for(std::string_view pattern) const
 {
     for (const auto& c : m_regexes)
         if (c->pattern == pattern)
@@ -499,7 +325,7 @@ void series_index::match(std::span<const matcher> ms, std::vector<uint32_t>& out
             lits.push_back(m.value);
         else
         {
-            c = &regex(m.value);
+            c = &compiled_for(m.value);
             if (c->k == compiled::kind::any)
                 return !negate;
             if (c->k == compiled::kind::invalid)

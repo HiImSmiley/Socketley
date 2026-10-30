@@ -25,7 +25,6 @@ namespace
 {
 
 constexpr char block_magic[8] = {'S', 'K', 'L', 'M', 'B', 'L', 'K', '1'};
-constexpr uint32_t block_version = 1;
 constexpr size_t sections = 4;
 constexpr size_t footer_bytes = 8 + 4 + 3 * 8 + sections * 20 + 4;
 constexpr char log_magic[8] = {'S', 'K', 'L', 'M', 'H', 'L', 'G', '1'};
@@ -227,7 +226,6 @@ std::shared_ptr<block> block::open(const std::string& path, std::string& why)
     if (!table(off[2], len[2], b->m_nseries, b->m_series_off, b->m_series))
         return refuse("a series table that does not add up");
 
-    const bool raw = b->m_step == 0;
     for (uint32_t i = 0; i < b->m_nseries; ++i)
     {
         const uint32_t eo = load32(b->m_series_off + 4 * uint64_t(i));
@@ -263,7 +261,7 @@ std::shared_ptr<block> block::open(const std::string& path, std::string& why)
             const uint32_t clen = load32(cm + 16);
             if (cmin > cmax || (c > 0 && cmin <= last) || coff > len[0] || clen > len[0] - coff)
                 return refuse("a chunk out of order or outside the chunks");
-            const bool inside = raw ? cmin >= b->m_mint && cmax < b->m_maxt : cmin > b->m_mint && cmax <= b->m_maxt;
+            const bool inside = cmin > b->m_mint && cmax <= b->m_maxt;
             if (!inside)
                 return refuse("a chunk outside the block's window");
             if (c == 0 && cmin != smin)

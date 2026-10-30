@@ -1,7 +1,7 @@
 #pragma once
 // Blocks, the immutable files a store's history lies in, and the head log its open window is kept in.
 //
-// A block is one aligned window of one kind, raw chunks or the points of one tier, laid out as
+// A block is one aligned window (mint, maxt] of one kind, raw chunks or the points of one tier ending in it, laid out as
 //   chunks    back to back, each a metrics_chunk.h chunk
 //   symbols   u32 n | u32 off[n+1] | the bytes
 //   series    u32 n | u32 off[n+1] | per series: u32 labels | (u32 name, u32 value)* | i64 mint | i64 maxt |
@@ -34,8 +34,10 @@ inline constexpr int64_t hour_ms = 60 * minute_ms;
 inline constexpr int64_t day_ms = 24 * hour_ms;
 // The window a block is cut from the head at.
 inline constexpr int64_t block_ms = 2 * hour_ms;
+// The footer's version, 2 since every window is left-open.
+inline constexpr uint32_t block_version = 2;
 
-// A block file's name for its kind (0 raw, else a tier's step) and window [mint, maxt).
+// A block file's name for its kind (0 raw, else a tier's step) and window (mint, maxt].
 std::string block_name(int64_t step, int64_t mint, int64_t maxt);
 bool parse_block_name(std::string_view name, int64_t& step, int64_t& mint, int64_t& maxt);
 

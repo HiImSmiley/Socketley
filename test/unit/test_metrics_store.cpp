@@ -20,6 +20,7 @@
 #include "runtime/metrics/metrics_block.h"
 #include "runtime/metrics/metrics_chunk.h"
 #include "runtime/metrics/metrics_index.h"
+#include "runtime/metrics/metrics_query.h"
 #include "runtime/metrics/metrics_store.h"
 
 using namespace socketley::metrics;
@@ -103,6 +104,9 @@ struct ref_point
     double min{0}, max{0}, sum{0}, count{0}, last{0}, first{0}, inc{0};
 };
 
+// The first multiple of `step` at or after `t`, which ends the left-open step (e - step, e] holding `t`.
+int64_t ceil_to(int64_t t, int64_t step) { return t % step == 0 ? t : (t / step + 1) * step; }
+
 std::map<int64_t, ref_point> brute(const std::vector<sample>& xs, int64_t step)
 {
     std::map<int64_t, ref_point> m;
@@ -111,7 +115,7 @@ std::map<int64_t, ref_point> brute(const std::vector<sample>& xs, int64_t step)
     {
         if (std::isnan(x.v))
             continue;
-        const int64_t e = step_end(x.t, step);
+        const int64_t e = ceil_to(x.t, step);
         auto [it, made] = m.try_emplace(e);
         ref_point& p = it->second;
         if (made)
@@ -124,7 +128,7 @@ std::map<int64_t, ref_point> brute(const std::vector<sample>& xs, int64_t step)
             p.count += 1;
             p.last = x.v;
         }
-        if (prev && step_end(prev->t, step) == e)
+        if (prev && ceil_to(prev->t, step) == e)
             p.inc += counter_rise(prev->v, x.v);
         prev = &x;
     }
@@ -376,7 +380,7 @@ TEST_CASE("index: matchers follow Prometheus, an empty value matching a missing 
     CHECK(q({{"nolabel", match_op::ne, "x"}}) == V{a, b, c, d});
     CHECK(q({{"job", match_op::eq, "nothere"}}).empty());
 
-    // Fully anchored, the literal and alternation fast paths, .* and .+, and a regex compiled to POSIX.
+    // Fully anchored, the literal and alternation fast paths, .* and .+, and the rest through metrics_regex.
     CHECK(q({{"job", match_op::re, "web"}}) == V{b});
     CHECK(q({{"job", match_op::re, "we"}}).empty());
     CHECK(q({{"job", match_op::re, "web.*"}}) == V{b, c});
@@ -396,9 +400,11 @@ TEST_CASE("index: matchers follow Prometheus, an empty value matching a missing 
     CHECK(q({{"env", match_op::re, "d.*|"}}) == V{b, c});
     CHECK(q({{"__name__", match_op::eq, "up"}, {"job", match_op::re, "web.*"}, {"env", match_op::ne, "dev"}}) == V{c});
 
-    CHECK(regex_valid("web\\d+|api"));
-    CHECK_FALSE(regex_valid("web("));
-    CHECK_FALSE(regex_valid("\\bword"));
+    // RE2 syntax that POSIX ERE lacks, matched by the query engine's own regex.
+    CHECK(q({{"job", match_op::re, "\\bweb\\b"}}) == V{b});
+    CHECK(q({{"job", match_op::re, "(?P<x>web)\\d"}}) == V{c});
+    CHECK(q({{"job", match_op::re, "(?:a|w)\\w+"}}) == V{a, b, c});
+    CHECK(q({{"job", match_op::re, "[[:alpha:]]+"}}) == V{a, b, d});
     // An invalid regex matches nothing and its negation everything.
     CHECK(q({{"job", match_op::re, "("}}).empty());
     CHECK(q({{"job", match_op::nre, "("}}) == V{a, b, c, d});
@@ -482,7 +488,7 @@ TEST_CASE("store: a sample stamped years ahead expires nothing and refuses nobod
     std::string why;
     REQUIRE(s.open(d.path, small_config(), why));
     const uint32_t id = s.get_or_create(L({{"__name__", "now"}}));
-    for (int64_t k = 0; k < 4 * 360; ++k)
+    for (int64_t k = 1; k <= 4 * 360; ++k)
         REQUIRE(s.append(id, T0 + k * 10'000, 1));
     settle(s, T0 + 4 * hour_ms);
     const uint64_t blocks = s.stats().blocks;
@@ -509,11 +515,11 @@ TEST_CASE("store: a window is cut into a block, read across head and block, and 
         for (int i = 0; i < 3; ++i)
             ids[i] = s.get_or_create(L({{"__name__", "m"}, {"i", std::to_string(i).c_str()}}));
         s.set_meta("m", metric_type::counter, "a test metric");
-        // Four hours: the first window is cut once samples reach an hour past its end.
+        // Four hours, the first window (T0, T0 + 2h] cut once samples reach an hour past its end.
         for (int64_t k = 0; k < 4 * 360; ++k)
             for (int i = 0; i < 3; ++i)
             {
-                const sample x{T0 + k * 10'000 + i, double(k * (i + 1))};
+                const sample x{T0 + k * 10'000 + i + 1, double(k * (i + 1))};
                 REQUIRE(s.append(ids[i], x.t, x.v));
                 want[i].push_back(x);
             }
@@ -654,7 +660,7 @@ TEST_CASE("store: a torn head log tail is cut and the records before it kept")
     const uint32_t id = s.get_or_create(L({{"__name__", "c"}}));
     for (int k = 0; k < 100; ++k)
     {
-        REQUIRE(s.append(id, T0 + k * 10'000, k));
+        REQUIRE(s.append(id, T0 + (k + 1) * 10'000, k));
         if (k % 10 == 9)
             s.tick(T0 + k * 10'000);
     }
@@ -693,7 +699,7 @@ TEST_CASE("store: a damaged block is refused with its reason and the store opens
         std::string why;
         REQUIRE(s.open(d.path, small_config(), why));
         const uint32_t id = s.get_or_create(L({{"__name__", "m"}}));
-        for (int64_t k = 0; k < 6 * 360; ++k)
+        for (int64_t k = 1; k <= 6 * 360; ++k)
             REQUIRE(s.append(id, T0 + k * 10'000, double(k)));
         settle(s, T0 + 6 * hour_ms);
         CHECK(s.stats().blocks == 4);
@@ -722,7 +728,7 @@ TEST_CASE("store: a damaged block is refused with its reason and the store opens
     REQUIRE(id != no_series);
     const auto got = all_samples(s, id);
     CHECK(got.size() == 6 * 360 - 720);
-    CHECK(got.front().t == T0 + block_ms);
+    CHECK(got.front().t == T0 + block_ms + 10'000);
 }
 
 // ── compaction, tiers, retention ──────────────────────────────────────────
@@ -730,14 +736,17 @@ TEST_CASE("store: a damaged block is refused with its reason and the store opens
 namespace
 {
 
-// Random counters with resets and gaps, and gauges with NaN and stale markers, over `hours`, ticked as it goes.
+// Random counters with resets and gaps, and gauges with NaN and stale markers unless `nan` is off, over `hours`, ticked
+// as it goes: unaligned a few hundred ms off the 10 s grid, aligned on it as the runtime's tick stamps, so a sample lies
+// on every edge of a step and of a window.
 struct workload
 {
     std::vector<uint32_t> ids;
     std::vector<std::vector<sample>> xs;
     int64_t end{0};
 
-    workload(store& s, int series, int64_t hours, uint64_t seed, int64_t tick_every = hour_ms)
+    workload(store& s, int series, int64_t hours, uint64_t seed, int64_t tick_every = hour_ms, bool aligned = false,
+             bool nan = true)
     {
         std::mt19937_64 rng(seed);
         xs.resize(series);
@@ -764,12 +773,13 @@ struct workload
                 else
                 {
                     x = double(int64_t(rng() % 2001) - 1000) / 8.0;
-                    if (rng() % 300 == 0)
+                    if (rng() % 300 == 0 && nan)
                         x = std::nan("");
-                    if (rng() % 300 == 0)
+                    if (rng() % 300 == 0 && nan)
                         x = stale_nan();
                 }
-                const sample smp{base + int64_t(rng() % 401) - 200 + 300, x};
+                const int64_t jitter = int64_t(rng() % 401) - 200 + 300;
+                const sample smp{aligned ? base + 10'000 : base + jitter, x};
                 REQUIRE(s.append(ids[i], smp.t, smp.v));
                 xs[i].push_back(smp);
             }
@@ -879,11 +889,14 @@ TEST_CASE("store: what a crash between writing a block and deleting what it repl
 
 TEST_CASE("store: the tiers' min, max, sum, count, last and inc match a brute force across head, blocks and tiers")
 {
+    for (const bool aligned : {false, true})
+    {
+    CAPTURE(aligned);
     tmpdir d;
     store s;
     std::string why;
     REQUIRE(s.open(d.path, small_config(), why));
-    workload w(s, 6, 53, 21);
+    workload w(s, 6, 53, 21, hour_ms, aligned);
     settle(s, w.end);
     // Two whole days merged, the 1h tier built for both, the third day in 2h blocks and the head.
     bool second_day = false;
@@ -907,6 +920,109 @@ TEST_CASE("store: the tiers' min, max, sum, count, last and inc match a brute fo
     std::vector<agg_point> none;
     s.aggregates(w.ids[0], 7 * minute_ms, T0, w.end, none);
     CHECK(none.empty());
+    if (aligned)
+    {
+        // The sample on an edge ends the step it closes, so an hour's point holds its 360 samples.
+        std::vector<agg_point> one;
+        s.aggregates(w.ids[0], hour_ms, T0 + 9 * hour_ms, T0 + 10 * hour_ms, one);
+        REQUIRE(one.size() == 1);
+        const auto& xs = w.xs[0];
+        const auto in = std::count_if(xs.begin(), xs.end(), [](const sample& x) {
+            return x.t > T0 + 9 * hour_ms && x.t <= T0 + 10 * hour_ms;
+        });
+        CHECK(one[0].count == double(in));
+        const auto on_edge = std::find_if(xs.begin(), xs.end(), [](const sample& x) { return x.t == T0 + 10 * hour_ms; });
+        if (on_edge != xs.end())
+            CHECK(one[0].last == on_edge->v);
+    }
+    }
+}
+
+namespace
+{
+
+query_result range_query(query_engine& e, std::string_view q, int64_t start, int64_t end, int64_t step)
+{
+    query_result r;
+    query_error err;
+    REQUIRE_MESSAGE(e.eval_range(q, start, end, step, r, err), std::string(q) << ": " << err.message);
+    return r;
+}
+
+void check_same(const query_result& a, const query_result& b, std::string_view q)
+{
+    REQUIRE_MESSAGE(a.series.size() == b.series.size(), q);
+    for (size_t i = 0; i < a.series.size(); ++i)
+    {
+        CHECK(a.series[i].labels == b.series[i].labels);
+        REQUIRE_MESSAGE(a.series[i].points.size() == b.series[i].points.size(), q << " series " << i);
+        for (size_t k = 0; k < a.series[i].points.size(); ++k)
+        {
+            CHECK(a.series[i].points[k].t == b.series[i].points[k].t);
+            CHECK_MESSAGE(near(a.series[i].points[k].v, b.series[i].points[k].v),
+                          q << " at " << a.series[i].points[k].t << ": " << a.series[i].points[k].v << " against "
+                            << b.series[i].points[k].v);
+        }
+    }
+}
+
+}   // namespace
+
+TEST_CASE("store and query: the tiers answer as raw does, with a sample on every edge or on none")
+{
+    for (const bool aligned : {false, true})
+    {
+        CAPTURE(aligned);
+        tmpdir d;
+        store s;
+        std::string why;
+        REQUIRE(s.open(d.path, small_config(), why));
+        workload w(s, 4, 75, 7, hour_ms, aligned, false);
+        settle(s, w.end);
+        query_engine with(s), without(s);
+        without.limits().use_tiers = false;
+        // Hours over merged days, 2h blocks and the head, and five minutes over the last day and a half.
+        const struct { int64_t from, step; const char* range; } spans[] = {
+            {T0 + hour_ms, hour_ms, "1h"}, {w.end - 36 * hour_ms, 5 * minute_ms, "5m"}};
+        for (const auto& sp : spans)
+        {
+            for (const char* f : {"avg_over_time", "min_over_time", "max_over_time", "sum_over_time",
+                                  "count_over_time", "last_over_time"})
+            {
+                const std::string q = std::string(f) + "({__name__=~\"c|g\"}[" + sp.range + "])";
+                const auto a = range_query(with, q, sp.from, w.end, sp.step);
+                CHECK_MESSAGE(with.last_stats().tier_selectors == 1, q);
+                CHECK(with.last_stats().raw_samples == 0);
+                check_same(a, range_query(without, q, sp.from, w.end, sp.step), q);
+            }
+            const auto a = range_query(with, "g", sp.from, w.end, sp.step);
+            CHECK(with.last_stats().tier_selectors == 1);
+            check_same(a, range_query(without, "g", sp.from, w.end, sp.step), "g");
+
+            // increase over a tier is the sum of each step's, a rise counted where its two samples lie in one step
+            // or in two steps side by side.
+            const std::string q = std::string("increase(c[") + sp.range + "])";
+            const auto inc = range_query(with, q, sp.from, w.end, sp.step);
+            CHECK(with.last_stats().tier_selectors == 1);
+            REQUIRE(inc.series.size() == 2);
+            for (size_t i = 0; i < inc.series.size(); ++i)
+            {
+                const auto& xs = w.xs[2 * i];
+                CHECK(label_value(inc.series[i].labels, "i") == label_value(s.labels(w.ids[2 * i]), "i"));
+                for (const auto& p : inc.series[i].points)
+                {
+                    double want = 0;
+                    for (size_t k = 1; k < xs.size(); ++k)
+                    {
+                        const int64_t ea = ceil_to(xs[k - 1].t, sp.step), eb = ceil_to(xs[k].t, sp.step);
+                        if (xs[k].t > p.t - sp.step && xs[k].t <= p.t && (ea == eb || ea == eb - sp.step))
+                            want += counter_rise(xs[k - 1].v, xs[k].v);
+                    }
+                    CHECK_MESSAGE(near(p.v, want), q << " at " << p.t);
+                }
+            }
+        }
+    }
 }
 
 TEST_CASE("store: retention deletes whole blocks past their window, the coarser tiers outliving raw")
@@ -926,7 +1042,7 @@ TEST_CASE("store: retention deletes whole blocks past their window, the coarser 
         int64_t step = 0, lo = 0, hi = 0;
         REQUIRE(parse_block_name(n, step, lo, hi));
         const int64_t keep = step == 0 ? c.keep_raw : step == 5 * minute_ms ? c.tiers[0].keep : c.tiers[1].keep;
-        CHECK(hi > w.end - keep);
+        CHECK(hi >= w.end - keep);
     }
     CHECK_FALSE(fs::exists(d.sub("blocks/" + block_name(0, T0, T0 + day_ms))));
     CHECK_FALSE(fs::exists(d.sub("blocks/" + block_name(5 * minute_ms, T0, T0 + day_ms))));
@@ -1023,13 +1139,14 @@ TEST_CASE("perf: append to 100k series, once and then ten rounds")
         for (int i = 0; i < 100'000; ++i)
             ids.push_back(s.get_or_create(L({{"__name__", "bench"}, {"i", std::to_string(i).c_str()}})));
         auto t0 = clk::now();
+        // Inside one window, (T0, T0 + 2h], so no chunk closes at its edge.
         for (uint32_t id : ids)
-            s.append(id, T0, 1.0);
+            s.append(id, T0 + 10'000, 1.0);
         const double first = std::chrono::duration<double, std::nano>(clk::now() - t0).count() / 1e5;
         t0 = clk::now();
         for (int r = 1; r <= 10; ++r)
             for (uint32_t id : ids)
-                s.append(id, T0 + r * 10'000, double(r * (id % 100)));
+                s.append(id, T0 + (r + 1) * 10'000, double(r * (id % 100)));
         const double rounds = std::chrono::duration<double, std::nano>(clk::now() - t0).count() / 1e6;
         std::printf("[perf] append: 100k series x 1 sample %.1f ns each, then 10 rounds %.1f ns each\n", first, rounds);
         CHECK(s.stats().samples_appended == 1'100'000);
@@ -1114,5 +1231,27 @@ TEST_CASE("perf: 30 days of one series through the 5m tier")
                     static_cast<unsigned long long>(s.stats().blocks));
         CHECK(pts.size() == size_t(month_days * 288));
         CHECK(ms < 50);
+
+        // What a 30-day Grafana panel at a one-hour step costs, through the tiers and raw.
+        query_engine with(s), without(s);
+        without.limits().use_tiers = false;
+        for (const char* q : {"one", "avg_over_time(one[1h])", "rate(one[5m])", "rate(one[1h])"})
+        {
+            double best[2] = {1e30, 1e30};
+            uint64_t read[2] = {0, 0};
+            for (int arm = 0; arm < 2; ++arm)
+                for (int i = 0; i < 5; ++i)
+                {
+                    query_engine& e = arm == 0 ? with : without;
+                    const auto t1 = clk::now();
+                    const auto r = range_query(e, q, end - month_days * day_ms, end, hour_ms);
+                    best[arm] = std::min(best[arm], std::chrono::duration<double, std::milli>(clk::now() - t1).count());
+                    read[arm] = arm == 0 ? e.last_stats().tier_points : e.last_stats().raw_samples;
+                    REQUIRE(r.series.size() == 1);
+                }
+            std::printf("[perf] %lld days at step 1h, %s: tiers %.3f ms (%llu points), raw %.3f ms (%llu samples)\n",
+                        static_cast<long long>(month_days), q, best[0], static_cast<unsigned long long>(read[0]),
+                        best[1], static_cast<unsigned long long>(read[1]));
+        }
     }
 }
