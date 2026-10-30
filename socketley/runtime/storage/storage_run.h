@@ -30,6 +30,7 @@
 #include "checksum.h"
 #include "multipart.h"
 #include "../../shared/http/notifier.h"
+#include "../../shared/runtime/latency_histogram.h"
 #include "object_store.h"
 #include "post_policy.h"
 #include "cluster.h"
@@ -70,6 +71,8 @@ namespace socketley::storage
 // what it holds.
 struct storage_counters
 {
+    // A request's first byte to its whole answer sent, refusals included and requests the client cut off not.
+    socketley::latency_histogram request_latency;
     uint64_t requests{0};
     uint64_t gets{0};
     uint64_t heads{0};

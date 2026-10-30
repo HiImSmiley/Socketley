@@ -20325,7 +20325,48 @@ names the address a mail runtime sends from) and
 .BR name ,
 .BR repo ,
 .BR id ;
-1 when the last pull of a storage's git mirror failed, read every minute).
+1 when the last pull of a storage's git mirror failed, read every minute, and
+.B error
+what the failed one said),
+.B socketley_runtime_failure
+(labels
+.BR name ,
+.BR type ,
+.BR reason ;
+1 for a runtime that failed, its last warning or error line the reason) and
+.B socketley_runtime_bytes_received_total
+and
+.B _sent_total
+per runtime.
+.PP
+How long the work takes is a Prometheus histogram per runtime, buckets from
+64 microseconds doubling to 16.8 seconds and
+.BR +Inf ,
+each request measured from the start of the loop turn that read it to the start
+of the turn that answered it, so a request answered in the turn it came in is 0
+and no clock is read for it:
+.B socketley_proxy_request_duration_seconds
+(an HTTP request's head to its answer's last byte),
+.B socketley_proxy_backend_connect_duration_seconds
+and
+.BR socketley_proxy_backend_first_byte_seconds ,
+.BR socketley_server_http_request_duration_seconds ,
+.B socketley_cache_batch_duration_seconds
+(a read's commands to their replies handed on),
+.BR socketley_db_request_duration_seconds ,
+.BR socketley_idp_sign_in_duration_seconds ,
+.B socketley_mail_delivery_duration_seconds
+and
+.BR socketley_storage_request_duration_seconds ,
+each with
+.B _bucket
+.RB ( le ),
+.B _sum
+and
+.BR _count ,
+the shards' added together;
+.B histogram_quantile(0.99, rate(socketley_proxy_request_duration_seconds_bucket[5m]))
+reads one's 99th percentile.
 .SH C++ SDK
 Socketley ships a three-tier modular C++ SDK in
 .BR include/linux/socketley/ .

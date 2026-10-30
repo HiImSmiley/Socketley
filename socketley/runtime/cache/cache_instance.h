@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 
 #include "../../shared/runtime/runtime_instance.h"
+#include "../../shared/runtime/latency_histogram.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/ipc/request_channel.h"
 
@@ -128,6 +129,8 @@ struct client_connection
     // -- ids and not pointers, since the struct may be pooled by the time a
     // reply lands.
     std::vector<uint64_t> batches;
+    // The turn stamp of the first read whose replies are owed, 0 once they are out.
+    uint64_t batch_ns{0};
 
     // What those crossings carried and have not answered, which is the one
     // thing that stops this connection being read.
@@ -533,6 +536,8 @@ public:
     uint64_t m_stat_get_hits{0};
     uint64_t m_stat_get_misses{0};
     uint64_t m_stat_keys_expired{0};
+    // A read's commands to their replies handed on, per flush, in loop turns.
+    socketley::latency_histogram m_lat_batch;
 
     // Cache management (for cmd_action)
     uint32_t get_size() const;

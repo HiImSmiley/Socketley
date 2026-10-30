@@ -16,6 +16,7 @@
 #include <sys/uio.h>
 
 #include "../../shared/runtime/runtime_instance.h"
+#include "../../shared/runtime/latency_histogram.h"
 #include "../../shared/http/route_table.h"
 #include "../../shared/loop/write_queue.h"
 #include "../../shared/loop/event_loop_definitions.h"
@@ -186,6 +187,10 @@ struct proxy_exchange
     // no further bytes to count.
     bool awaiting_headers{false};
     std::chrono::steady_clock::time_point header_deadline{};
+
+    // Turn stamps: the request's head complete, and the backend asked for it or, after a fresh connect, connected.
+    uint64_t began_ns{0};
+    uint64_t backend_ns{0};
 };
 
 // An HTTP/2 session and one stream's protocol state, opaque here for the same reason the storage keeps them so:
@@ -1271,6 +1276,10 @@ private:
     // What the circuit breakers were told, counted for `stats`: whole answers and failures of the backends.
     uint64_t m_backend_responses{0};
     uint64_t m_backend_failures{0};
+    // Head to the backend's last byte, a fresh connect, and the backend asked to its first byte, HTTP's but the connect.
+    socketley::latency_histogram m_lat_request;
+    socketley::latency_histogram m_lat_connect;
+    socketley::latency_histogram m_lat_first_byte;
 
     socketley::fd_table<proxy_conn_entry> m_conn_idx{MAX_FDS};
     backend_info m_scratch_backend{};

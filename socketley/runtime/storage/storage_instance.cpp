@@ -674,5 +674,7 @@ std::string storage_instance::stats_lines() const
             << "shard_hot_holds_served:" << n.hot_holds_in << "\n"
             << "shard_peer_failures:" << n.peer_failures << "\n";
     }
-    return out.str();
+    std::string text = out.str();
+    c.request_latency.put(text, "request_latency");
+    return text;
 }

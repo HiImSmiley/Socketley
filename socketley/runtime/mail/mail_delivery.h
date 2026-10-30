@@ -25,6 +25,7 @@
 #include "mail_spool.h"
 #include "mail_tls_policy.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/runtime/latency_histogram.h"
 #include "../../shared/loop/file_io.h"
 
 class tls_context;
@@ -252,6 +253,8 @@ private:
     std::shared_ptr<bool> m_alive;
 
     uint64_t m_delivered{0};
+    // A remote attempt from a connection taking the message to the answer for its recipients, in loop turns.
+    socketley::latency_histogram m_lat_delivery;
     uint64_t m_deferred{0};
     uint64_t m_failed{0};
     uint64_t m_bounced{0};

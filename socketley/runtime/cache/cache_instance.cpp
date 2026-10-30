@@ -11,6 +11,7 @@
 #include "../../shared/util/trace.h"
 #include "resp_parser.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/turn_clock.h"
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/lua/lua_context.h"
 #include "../../shared/util/logging.h"
@@ -2409,6 +2410,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // above and which completions count is a per-runtime decision that already
     // diverges.
     stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
+    if (conn->batch_ns == 0)
+        conn->batch_ns = socketley::turn_clock::now_ns();
 
     // On a TLS connection these bytes are ciphertext and tls_feed puts
     // plaintext into partial, so everything below reads the same buffer it
@@ -7900,6 +7903,8 @@ bool cache_instance::flush_responses(client_connection* conn)
         return true;
     }
     SKL_TRACE_ADD(conn, bytes_queued, conn->response_buf.size());
+    // Once a read's replies are out; a flush of a push no read asked for counts nothing.
+    m_lat_batch.observe(std::exchange(conn->batch_ns, 0), socketley::turn_clock::now_ns());
 
     if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= write_buffer_bytes()))
     {
@@ -13371,6 +13376,11 @@ std::string cache_instance::stats_lines() const
         // from a leader that accepts and then says nothing.
         << "master_sync_in_progress:" << ((m_master && !m_master->synced) ? 1 : 0) << "\n"
         << "followers:" << m_followers.size() << "\n";
+    {
+        std::string line;
+        m_lat_batch.put(line, "batch_latency");
+        out << line;
+    }
     if (m_role)
         out << socketley::cluster::report_lines(*m_role, role_clock_ms());
     return out.str();

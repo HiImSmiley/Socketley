@@ -1,4 +1,5 @@
 #include "mail_delivery.h"
+#include "../../shared/loop/turn_clock.h"
 
 #include <algorithm>
 #include <charconv>
@@ -173,6 +174,8 @@ struct delivery::out_conn
     bool writing{false};
     // The message it carries, the commands not yet sent where there is no pipelining, and what each reply answers.
     std::unique_ptr<item> cur;
+    // The turn stamp of the moment it took `cur`.
+    uint64_t cur_began_ns{0};
     std::deque<std::string> unsent;
     std::deque<char> expect;
     std::vector<int> rcpt_code;
@@ -2074,6 +2077,7 @@ void delivery::stats(std::string& out) const
     put(out, "mail_out_tls_refused", m_tls_refused);
     put(out, "mail_sts_fetched", m_sts_fetched);
     put(out, "mail_sts_testing_failures", m_sts_testing_failed);
+    m_lat_delivery.put(out, "mail_delivery_latency");
 }
 
 // ── One connection ──────────────────────────────────────────────────────────
@@ -2084,6 +2088,7 @@ void delivery::open_conn(route& r)
     c->id = m_next_conn++;
     c->route = r.key;
     c->cur = std::make_unique<item>(std::move(r.waiting.front()));
+    c->cur_began_ns = socketley::turn_clock::now_ns();
     r.waiting.pop_front();
     ++r.active;
     out_conn& raw = *c;
@@ -2869,6 +2874,7 @@ void delivery::conn_next(out_conn& c)
             return;
         }
         c.cur = std::make_unique<item>(std::move(r.waiting.front()));
+        c.cur_began_ns = socketley::turn_clock::now_ns();
         r.waiting.pop_front();
     }
     conn_begin(c);
@@ -3110,6 +3116,7 @@ void delivery::conn_end_item(out_conn& c, int code, const std::string& text)
     if (!c.cur)
         return;
     std::unique_ptr<item> it = std::move(c.cur);
+    m_lat_delivery.observe(c.cur_began_ns, socketley::turn_clock::now_ns());
     ++c.item_no;
     c.reading = false;
     const bool data_answered = c.state == out_conn::st::dot;
@@ -3202,6 +3209,7 @@ void delivery::conn_fail(out_conn& c, const std::string& why, move_on next)
     if (c.cur)
     {
         std::unique_ptr<item> it = std::move(c.cur);
+        m_lat_delivery.observe(c.cur_began_ns, socketley::turn_clock::now_ns());
         const bool permanent = why.size() > 0 && why[0] == '5';
         for (size_t t = 0; t < it->to.size(); ++t)
         {

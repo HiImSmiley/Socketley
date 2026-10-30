@@ -1,4 +1,5 @@
 #include "db_run.h"
+#include "../../shared/loop/turn_clock.h"
 
 #include <algorithm>
 #include <charconv>
@@ -317,6 +318,7 @@ void db_run::synced(bool ok, uint64_t covered)
             if (w.c->dead)
                 continue;
             w.c->keep_alive = false;
+            answered(*w.c);
             put_head(w.c->out, *w.c, 503, "application/json", body.size(), {});
             w.c->out += body;
             w.c->waiting = false;
@@ -343,6 +345,7 @@ void db_run::synced(bool ok, uint64_t covered)
         }
         if (w.c->dead)
             continue;
+        answered(*w.c);
         w.c->out += w.held;
         if (m_stopped)
             w.c->waiting = false;
@@ -947,7 +950,14 @@ std::string db_run::stats() const
                          : std::string()) +
            replica + (m_broken ? "\nbroken:the journal could not be synced; restart" : "") +
            (m_schema_error.empty() ? std::string() : "\nschema_error:" + m_schema_error) +
-           (m_keys_error.empty() ? std::string() : "\nkeys_error:" + m_keys_error) + "\n";
+           (m_keys_error.empty() ? std::string() : "\nkeys_error:" + m_keys_error) + "\n" + latency_line();
+}
+
+std::string db_run::latency_line() const
+{
+    std::string out;
+    m_lat.put(out, "request_latency");
+    return out;
 }
 
 void db_run::reload_files(std::string& why)
@@ -1007,6 +1017,7 @@ void db_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
     {
         request rq;
         int refusal = 400;
+        c->began_ns = socketley::turn_clock::now_ns();
         const int r = take_request(*c, rq, refusal);
         if (r == 0)
             break;
@@ -1229,9 +1240,15 @@ void db_run::respond(const std::shared_ptr<conn>& c, int status, std::string_vie
 {
     if (status >= 400)
         ++m_c.refused;
+    answered(*c);
     put_head(c->out, *c, status, "application/json", body.size(), extra, version);
     if (!head_only)
         c->out += body;
+}
+
+void db_run::answered(const conn& c)
+{
+    m_lat.observe(c.began_ns, socketley::turn_clock::now_ns());
 }
 
 std::string db_run::cors(const request& rq) const

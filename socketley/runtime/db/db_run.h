@@ -27,6 +27,7 @@
 #include "../idp/idp_session.h"
 #include "../../shared/lua/db_call.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/runtime/latency_histogram.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/ipc/request_channel.h"
@@ -96,6 +97,8 @@ private:
         uint64_t at_seq{0};
         size_t at_skip{0};
         bool behind{false};
+        // The turn stamp of the request being answered.
+        uint64_t began_ns{0};
     };
 
     struct request
@@ -279,6 +282,10 @@ private:
             backups{0}, backup_failures{0}, replicated{0}, resets{0}, crossed{0}, crossings_served{0},
             caught_up{0}, reopened{0};
     } m_c;
+    // A request taken to its answer put out, a wait for the disk or for shard 0 included, in loop turns.
+    socketley::latency_histogram m_lat;
+    void answered(const conn& c);
+    std::string latency_line() const;
 };
 
 }   // namespace socketley::db

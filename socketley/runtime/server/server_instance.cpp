@@ -13,6 +13,7 @@
 #include "../../shared/net/unix_listener.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/turn_clock.h"
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/ipc/route_relay.h"
 #include "../../shared/lua/lua_context.h"
@@ -1732,6 +1733,8 @@ void server_instance::queue_http_response(server_connection* conn,
     // and allowed while closing, since a refusal marks that after queueing.
     if (!admit_send(conn, resp->size(), true))
         return;
+    if (ends_exchange)
+        http_answered(conn);
     if (ends_exchange && !conn->http_keep_alive && send_final_and_fin(conn, *resp))
         return;
     // Nothing ahead of it, so it goes straight into the batch that
@@ -1750,6 +1753,11 @@ void server_instance::queue_http_response(server_connection* conn,
     conn->write_queue.push(std::move(resp));
     if (!conn->write_pending)
         flush_write_queue(conn);
+}
+
+void server_instance::http_answered(const server_connection* conn)
+{
+    m_lat_http.observe(conn->http_began_ns, socketley::turn_clock::now_ns());
 }
 
 void server_instance::refuse_http_request(server_connection* conn,
@@ -3785,6 +3793,7 @@ void server_instance::handle_file_stream(struct io_uring_cqe* cqe, server_connec
     }
 
     stream_file_cleanup(conn);
+    http_answered(conn);
     if (!conn->http_keep_alive)
     {
         conn->closing = true;
@@ -4017,6 +4026,7 @@ bool server_instance::end_chunked_response(server_connection* conn)
     // streamed answer and then a 404 behind it.  It is cleared where the next
     // request's headers are parsed instead.
     conn->chunked_response = false;
+    http_answered(conn);
 
     if (!conn->http_keep_alive)
     {
@@ -4579,6 +4589,7 @@ reparse:
         // cleared here and not in the sweep, because the sweep may be thirty
         // seconds away and this connection is a client again now.
         conn->awaiting_headers = false;
+        conn->http_began_ns = socketley::turn_clock::now_ns();
 
         // Down before the refusals below, which can answer ahead of the
         // request line being parsed and would otherwise answer for the last
@@ -6940,6 +6951,7 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
 
     // Splice complete — clean up and handle keep-alive
     splice_cleanup(conn);
+    http_answered(conn);
 
     if (!conn->http_keep_alive)
     {
@@ -7198,6 +7210,12 @@ std::string server_instance::stats_lines() const
     out << "peak_connections:" << m_stat_peak_connections << "\n"
         << "mode:" << static_cast<int>(m_mode) << "\n"
         << "udp:" << (m_udp ? "true" : "false") << "\n";
+    if (!m_http_dir.empty() || m_lat_http.count() > 0)
+    {
+        std::string line;
+        m_lat_http.put(line, "http_latency");
+        out << line;
+    }
     if (m_mode == mode_master)
         out << "master_fd:" << m_master_fd << "\n";
     if (!m_upstream_targets.empty())

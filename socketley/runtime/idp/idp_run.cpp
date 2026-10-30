@@ -1,4 +1,5 @@
 #include "idp_run.h"
+#include "../../shared/loop/turn_clock.h"
 #include "idp_totp.h"
 #include "../../shared/util/qr_code.h"
 
@@ -374,7 +375,14 @@ std::string idp_run::stats() const
                                "\ncrossings_served:" + std::to_string(m_c.crossings_served) +
                                "\nreopened:" + std::to_string(m_c.reopened)
                          : std::string()) +
-           (m_clients_error.empty() ? std::string() : "\nclients_error:" + m_clients_error) + "\n";
+           (m_clients_error.empty() ? std::string() : "\nclients_error:" + m_clients_error) + "\n" + latency_line();
+}
+
+std::string idp_run::latency_line() const
+{
+    std::string out;
+    m_lat_sign_in.put(out, "sign_in_latency");
+    return out;
 }
 
 // ─── Connections ────────────────────────────────────────────────────────────
@@ -1232,8 +1240,9 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
     const std::vector<std::string> held = hold(ip, acct);
     std::weak_ptr<conn> weak = c;
     const bool remember = param(p, "remember") == "1";
+    const uint64_t began = socketley::turn_clock::now_ns();
     c->waiting = true;
-    check_password(who, password, [this, weak, p = std::move(p), ip, held, acct, user, remember](bool ok)
+    check_password(who, password, [this, weak, p = std::move(p), ip, held, acct, user, remember, began](bool ok)
     {
         release(held);
         auto cc = weak.lock();
@@ -1245,11 +1254,12 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             ++m_c.refused;
             LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": a sign-in as \"" + user + "\" from " + ip +
                       " was refused").c_str());
-            missed(ip, acct, wall::now_sec(), [this, weak, p]
+            missed(ip, acct, wall::now_sec(), [this, weak, p, began]
             {
                 auto c2 = weak.lock();
                 if (!c2 || c2->dead)
                     return;
+                m_lat_sign_in.observe(began, socketley::turn_clock::now_ns());
                 c2->waiting = false;
                 login_page(c2, p, "The user or password is not right.", 401);
                 m_http.resume(c2);
@@ -1257,6 +1267,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             return;
         }
         cc->waiting = false;
+        m_lat_sign_in.observe(began, socketley::turn_clock::now_ns());
         // The code before a forced reset, so a password alone never sets a new one and signs in with it.
         if (!a->field("totp").empty())
         {

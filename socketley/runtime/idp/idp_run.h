@@ -20,6 +20,7 @@
 #include "idp_shard.h"
 #include "../../shared/http/conn_server.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/runtime/latency_histogram.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
@@ -351,6 +352,9 @@ private:
         uint64_t sign_ins{0}, refused{0}, barred{0}, codes{0}, tokens{0}, refreshes{0}, userinfo{0}, devices{0}, ssh_certs{0};
         uint64_t crossed{0}, crossings_served{0}, reopened{0};
     } m_c;
+    // A password sign-in from its form to its answer, the hash and a refusal's record included, in loop turns.
+    socketley::latency_histogram m_lat_sign_in;
+    std::string latency_line() const;
 };
 
 }   // namespace socketley::idp

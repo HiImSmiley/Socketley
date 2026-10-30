@@ -4,6 +4,7 @@
 #include "proxy_instance.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/turn_clock.h"
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/runtime/stats_text.h"
 #include "../../shared/lua/lua_context.h"
@@ -3859,6 +3860,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
         }
 
         conn->ex.header_parsed = true;
+        conn->ex.began_ns = socketley::turn_clock::now_ns();
         // The block arrived; what happens next is the request's own business
         // and is timed by --backend-timeout, not by this.
         conn->ex.awaiting_headers = false;
@@ -4340,6 +4342,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         {
             // Mark that we've started receiving response data — no retry after this
             ce.client->ex.response_started = true;
+            m_lat_first_byte.observe(ce.client->ex.backend_ns, socketley::turn_clock::now_ns());
             // The backend has answered, so the first-byte deadline is over:
             // cutting a slow or streaming body short would be a new defect
             // rather than a fix.
@@ -4401,6 +4404,9 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // Forward to client
     const bool response_ends = m_protocol == protocol_http && !conn->splice_active &&
                                backend_response_complete(conn);
+    if (response_ends && conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+        if (const auto& ce = m_conn_idx[conn->client_fd]; ce.side == conn_client)
+            m_lat_request.observe(ce.client->ex.began_ns, socketley::turn_clock::now_ns());
     const bool lent = closing_head.empty()
         ? forward_to_client(conn, {data_ptr, forward_len},
                             lendable_buf(is_provided, buf_id, forward_len), response_ends)
@@ -6696,6 +6702,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     // the path is the whole address.
     if (SOCKETLEY_UNLIKELY(!target || (target->resolved_port == 0 && !target->is_unix)))
         return false;
+    conn->ex.backend_ns = socketley::turn_clock::now_ns();
 
     // The wait starts here rather than at the first byte sent, so the
     // handshake and the queueing are inside it, armed in the one place every
@@ -6860,6 +6867,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     {
         // Instant connect success — set up backend inline (same as handle_connect)
         conn->ex.backend_fd = bfd;
+        m_lat_connect.observe(conn->ex.backend_ns, socketley::turn_clock::now_ns());
 
         auto bconn = backend_pool_acquire(bfd, conn);
         bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
@@ -9185,6 +9193,11 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     }
 
     conn->ex.backend_fd = bfd;
+    {
+        const uint64_t now = socketley::turn_clock::now_ns();
+        m_lat_connect.observe(conn->ex.backend_ns, now);
+        conn->ex.backend_ns = now;
+    }
 
     auto bconn = backend_pool_acquire(bfd, conn);
     bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
@@ -9958,6 +9971,12 @@ std::string proxy_instance::stats_lines() const
     st::put(out, "peak_connections", m_peak_connections);
     st::put(out, "backend_responses", m_backend_responses);
     st::put(out, "backend_failures", m_backend_failures);
+    m_lat_connect.put(out, "connect_latency");
+    if (m_protocol == protocol_http)
+    {
+        m_lat_request.put(out, "request_latency");
+        m_lat_first_byte.put(out, "first_byte_latency");
+    }
 
     size_t open_circuits = 0;
     for (const auto& cb : m_circuit_breakers)

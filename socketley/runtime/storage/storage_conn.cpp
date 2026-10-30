@@ -1816,6 +1816,11 @@ void storage_run::finish_request(const std::shared_ptr<conn>& c)
 {
     if (c->dead)
         return;
+    const auto now = std::chrono::steady_clock::now();
+    m_c.request_latency.observe_ns(
+        now > c->request_began
+            ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - c->request_began).count())
+            : 0);
     // A stream is not reused: its answer ends it.
     if (c->h2s)
     {
@@ -1841,7 +1846,7 @@ void storage_run::finish_request(const std::shared_ptr<conn>& c)
     reset_request(c);
     c->close_after_write = false;
     c->ph = phase::head;
-    c->last_progress = std::chrono::steady_clock::now();
+    c->last_progress = now;
     c->request_began = c->last_progress;
     // A pipelined request may already be waiting behind the one just answered.
     if (!c->in.empty())

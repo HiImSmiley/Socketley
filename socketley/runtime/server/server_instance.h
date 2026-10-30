@@ -18,6 +18,7 @@
 
 #include "../../shared/net/conn_identity.h"
 #include "../../shared/runtime/runtime_instance.h"
+#include "../../shared/runtime/latency_histogram.h"
 #include "../../shared/net/unix_companion.h"
 #include "../../shared/loop/write_queue.h"
 #include "../../shared/net/direct_send.h"
@@ -211,6 +212,8 @@ struct alignas(64) server_connection
     // an http_request holds into it would dangle.  The proxy keeps the same
     // two things for the same reason, as saved_request and body_remaining.
     size_t body_remaining{0};
+    // The turn stamp of the head of the HTTP request being answered.
+    uint64_t http_began_ns{0};
     // ── A file sent in pieces, for a connection with no splice arm ──────────
     // TLS cannot be spliced -- that would hand the peer plaintext inside an
     // encrypted stream -- so before this a TLS listener answered every request
@@ -1379,6 +1382,9 @@ private:
 
     // Stats
     uint32_t m_stat_peak_connections{0};
+    // An HTTP request's head to its whole answer handed to the socket, in loop turns.
+    socketley::latency_histogram m_lat_http;
+    void http_answered(const server_connection* conn);
 
     // Connection pool: pre-allocated connections for reuse (avoids malloc per accept)
     static constexpr size_t CONN_POOL_INIT = 64;
