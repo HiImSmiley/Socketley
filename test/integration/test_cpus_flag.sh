@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
+# suite: all-cpus -- it counts the CPUs online and names the ones past the last
 # Its own daemons on their own socket and state directory, because the CPU set
 # is fixed when a ring is created so seeing two values takes two daemons -- and
 # every one of them is killed by the pid this script started, never by name,

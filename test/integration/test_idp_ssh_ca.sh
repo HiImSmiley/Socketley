@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
+# suite: host -- ssh, which refuses the system's config files when a user namespace shows them owned by nobody
 # The idp's SSH certificate authority (--ssh-ca), end to end against a real sshd: socketley login, socketley
 # ssh-cert, a login by the certificate, and a host certificate a client trusts by @cert-authority.
 #
@@ -57,7 +58,9 @@ echo "$CA" > "$T/ca.pub"
 
 # Signs a person in from the command line, allowing the code as the browser would.
 login_as() {   # login_as <user> <password> <client> <config dir>
-    XDG_CONFIG_HOME="$4" "$BIN" login "$I" --client "$3" > "$T/login.out" 2>&1 &
+    # Emptied before, not by the redirection the background child makes after the file was read for the code.
+    : > "$T/login.out"
+    XDG_CONFIG_HOME="$4" "$BIN" login "$I" --client "$3" >> "$T/login.out" 2>&1 &
     local pid=$!
     for _ in $(seq 1 50); do grep -q "allow the code" "$T/login.out" && break; sleep 0.1; done
     python3 - "$PI" "$(sed -n 's/^and allow the code //p' "$T/login.out")" "$1" "$2" <<'PY' >/dev/null 2>&1

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: host -- a pid another user owns, which a process namespace of its own has none of
 # Integration test: `attach --pid` only accepts a process the caller owns.
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────

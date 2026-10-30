@@ -60,7 +60,7 @@ suite_sanitize_slots() {
 
 # Where the last run's per-file seconds are kept, so the longest files start
 # first and the run does not end on one 85-second file started last.
-SUITE_DURATIONS="${SUITE_DURATIONS:-/tmp/socketley-test-durations-$(id -u)}"
+SUITE_DURATIONS="${SUITE_DURATIONS:-/tmp/socketley-test-durations-$(id -u)-${SOCKETLEY_CONFIG:-Release}}"
 
 suite_longest_first() {   # list-file -> the same paths, slowest last run first
     awk -v d="$SUITE_DURATIONS" '
@@ -76,4 +76,62 @@ suite_save_durations() {   # dir -> its <file>.secs merged into the record
       for f in "$dir"/*.secs; do [ -f "$f" ] && echo "$(cat "$f") $(basename "$f" .secs)"; done
     } | awk '{ secs[$2] = $1 } END { for (k in secs) print secs[k], k }' > "$tmp"
     mv -f "$tmp" "$SUITE_DURATIONS"
+}
+
+# ─── Namespaces of a file's own ─────────────────────────────────────────────
+# A file run in a user, network, mount and process namespace of its own has a
+# loopback with every port, a /tmp of its own and a process table of its own:
+# no port window, no shared socket and no other file's daemon can reach it, and
+# the kernel ends every process it left when it ends.  A file that needs the
+# host's own processes or files as root owns them says `# suite: host` and runs
+# on the host beside the others, in a port window as before.  Where the machine forbids
+# unprivileged user namespaces (Ubuntu's AppArmor default), files share the host
+# as before.
+suite_ns_ok() {
+    unshare --user --map-current-user --keep-caps --net --mount --pid --fork --mount-proc \
+        sh -c 'ip link set lo up && mount --bind /var/tmp /tmp && setpriv --inh-caps=-all --ambient-caps=-all true' \
+        2>/dev/null
+}
+
+suite_ns_run() {   # root file -> the file's exit, run in namespaces of its own with its /tmp under root
+    local dir="$1/$(basename "$2" .sh)"
+    rm -rf "$dir"; mkdir -p "$dir"
+    # The capabilities the namespace gives are kept for bringing the loopback up and mounting /tmp, and given up
+    # before the file runs, so it is the user it would be on the host: a file of mode 000 is refused to it.
+    unshare --user --map-current-user --keep-caps --net --mount --pid --fork --mount-proc --kill-child -- bash -c '
+        ip link set lo up || exit 2
+        # An address that is not loopback, which a test of what reaches this machine from elsewhere needs.
+        ip link add sl0 type dummy 2>/dev/null && ip addr add 192.0.2.1/24 dev sl0 && ip link set sl0 up
+        mount --bind "$1" /tmp || exit 2
+        export HOME=/tmp/home SOCKETLEY_SOCKET=/tmp/suite.sock
+        mkdir -p "$HOME"
+        exec setpriv --inh-caps=-all --ambient-caps=-all bash "$2"' _ "$dir" "$2"
+}
+
+# A job waits to start while less than `bytes` of memory is free, so as many run
+# as the machine holds at that moment rather than as a guess made at the start.
+suite_wait_memory() {   # bytes
+    local free
+    for _ in $(seq 1 600); do
+        free=$(awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo)
+        [ "$free" -ge "$1" ] && return 0
+        sleep 1
+    done
+    return 0
+}
+
+# Commands run side by side, a line of the list each, `name<TAB>command`, the
+# command's output, exit and seconds left in `dir` under its name.
+suite_run_jobs() {   # list dir parallel
+    local list=$1 dir=$2 par=$3
+    export SUITE_JOB_DIR="$dir"
+    awk -F'\t' '{ print $1 }' "$list" | while IFS= read -r name; do
+        printf '%s\0' "$name"
+    done | xargs -0 -I{} -P"$par" bash -c '
+        name=$1
+        cmd=$(awk -F"\t" -v n="$name" "\$1 == n { print \$2; exit }" "$2")
+        t0=$(date +%s)
+        bash -c "$cmd" > "$SUITE_JOB_DIR/$name.log" 2>&1
+        echo $? > "$SUITE_JOB_DIR/$name.rc"
+        echo $(( $(date +%s) - t0 )) > "$SUITE_JOB_DIR/$name.secs"' _ {} "$list"
 }

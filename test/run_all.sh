@@ -24,6 +24,9 @@ fi
 [ -x "$SYS_BIN" ] || { echo "ERROR: socketley not found (tried \$SOCKETLEY_BIN, $BIN_DIR/, PATH)"; exit 1; }
 SYS_BIN=$(readlink -f "$SYS_BIN")
 echo "Testing binary: $SYS_BIN"
+# A smaller quarantine for the sanitizer build's processes, so many files fit in memory side by side; a freed block
+# is still held back 64 MiB long in each process.
+[ "$SOCKETLEY_CONFIG" = Sanitize ] && export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}quarantine_size_mb=64"
 
 # ─── A port window of this run's own ────────────────────────────────────────
 # The port window is claimed once and exported, held for the whole run so two
@@ -124,6 +127,23 @@ run_test() {
     echo ""
 }
 
+# The jobs suite_run_jobs ran, their output in the list's order, each red one run again alone: green alone is
+# counted as passed and named at the end, since a race that load exposes is still a race.
+. "$SCRIPT_DIR/lib_suite.sh"
+ALONE_ONLY=""
+report_jobs() {   # list dir
+    local name cmd
+    while IFS=$'\t' read -r name cmd; do
+        cat "$2/$name.log" 2>/dev/null
+        note_skips "$name" "$2/$name.log"
+        if [ "$(cat "$2/$name.rc" 2>/dev/null)" = 0 ]; then PASS=$((PASS+1)); echo ""; continue; fi
+        echo "  -- red beside others; run again alone:"
+        if bash -c "$cmd" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
+        else FAIL=$((FAIL+1)); FAILED="$FAILED$name"$'\n'; fi
+        echo ""
+    done < "$1"
+}
+
 echo "=============================="
 echo " Socketley Test Suite"
 echo "=============================="
@@ -181,6 +201,7 @@ echo "  ($unit_expected unit targets defined in premake5.lua, all present)"
 echo ""
 
 unit_found=0
+UNIT_JOBS=$(mktemp); UNIT_DIR=$(mktemp -d)
 for t in "$BIN_DIR"/test_*; do
     [ -f "$t" ] && [ -x "$t" ] || continue
     unit_found=$((unit_found + 1))
@@ -189,8 +210,12 @@ for t in "$BIN_DIR"/test_*; do
         *) echo "NOTE: $(basename "$t") is in $BIN_DIR but no project builds it;"
            echo "      it is run below, and what it passes says nothing about this tree." ;;
     esac
-    run_test "$(basename "$t" | sed 's/^test_//')" "$t"
+    printf '%s\t%q\n' "$(basename "$t" | sed 's/^test_//')" "$t" >> "$UNIT_JOBS"
 done
+# Side by side, each binary its own process with nothing shared but the machine.
+suite_run_jobs "$UNIT_JOBS" "$UNIT_DIR" "$(nproc)"
+report_jobs "$UNIT_JOBS" "$UNIT_DIR"
+rm -rf "$UNIT_JOBS" "$UNIT_DIR"
 
 # An empty glob would otherwise sail through this section reporting nothing
 # wrong, which is how a build that produced no tests passes a test suite.
@@ -227,6 +252,7 @@ fi
 echo "  ($fuzz_expected fuzz targets defined in premake5.lua, all present)"
 echo ""
 fuzz_found=0
+FUZZ_JOBS=$(mktemp); FUZZ_DIR=$(mktemp -d)
 for f in "$BIN_DIR"/fuzz_*; do
     [ -f "$f" ] && [ -x "$f" ] || continue
     fname=$(basename "$f")
@@ -267,8 +293,11 @@ for f in "$BIN_DIR"/fuzz_*; do
         exit 1
     fi
     fuzz_found=$((fuzz_found + 1))
-    run_test "${fname#fuzz_} corpus" timeout 300 "$f" "$FUZZ_CORPUS_DIR/$corpus"
+    printf '%s\t%q %q %q %q\n' "${fname#fuzz_}_corpus" timeout 300 "$f" "$FUZZ_CORPUS_DIR/$corpus" >> "$FUZZ_JOBS"
 done
+suite_run_jobs "$FUZZ_JOBS" "$FUZZ_DIR" "$(nproc)"
+report_jobs "$FUZZ_JOBS" "$FUZZ_DIR"
+rm -rf "$FUZZ_JOBS" "$FUZZ_DIR"
 
 if [ "$fuzz_found" -eq 0 ]; then
     echo "ERROR: no fuzz targets found in $BIN_DIR"
@@ -323,17 +352,39 @@ check_leaked_daemons() {
 # runs alone afterwards exactly as before.  Every file's output is printed in
 # glob order once the parallel pass is over, and counted the same way.
 . "$SCRIPT_DIR/lib_suite.sh"
-PAR_LIST=$(mktemp); SERIAL_LIST=$(mktemp); RESDIR=$(mktemp -d)
+PAR_LIST=$(mktemp); SERIAL_LIST=$(mktemp); QUIET_LIST=$(mktemp); RESDIR=$(mktemp -d)
+# In namespaces of its own a file needs no port window and shares no socket, so every file but a quiet one runs side
+# by side, and a quiet one runs on cores of its own beside them; without, as before.
+NS_ROOT=""
+if [ -z "${SUITE_NO_NS:-}" ] && suite_ns_ok; then
+    NS_ROOT=$(mktemp -d /var/tmp/socketley-ns.XXXXXX)
+fi
+export NS_ROOT SCRIPT_DIR
 for script in "$SCRIPT_DIR"/integration/test_*.sh; do
     [ -f "$script" ] || continue
-    if suite_wants_serial "$script"; then echo "$script" >> "$SERIAL_LIST"
-    else echo "$script" >> "$PAR_LIST"; fi
+    if [ -n "$NS_ROOT" ] && grep -q '^# suite: quiet' "$script"; then echo "$script" >> "$QUIET_LIST"
+    elif [ -n "$NS_ROOT" ] || ! suite_wants_serial "$script"; then echo "$script" >> "$PAR_LIST"
+    else echo "$script" >> "$SERIAL_LIST"; fi
 done
-PAR="${SUITE_PAR:-$(suite_free_windows)}"
-[ "$PAR" -gt "$(nproc)" ] && PAR=$(nproc)
-if [ "$SOCKETLEY_CONFIG" = Sanitize ] && [ -z "${SUITE_PAR:-}" ]; then
-    MEM_PAR=$(suite_sanitize_slots)
-    [ "$PAR" -gt "$MEM_PAR" ] && PAR=$MEM_PAR
+CORES=$(nproc)
+QUIET_CPUS="" MAIN_CPUS=""
+if [ -n "$NS_ROOT" ] && [ "$CORES" -ge 16 ] && [ -s "$QUIET_LIST" ]; then
+    QUIET_CPUS="${SUITE_QUIET_CPUS:-0-3}"
+    MAIN_CPUS="${SUITE_MAIN_CPUS:-4-$((CORES - 1))}"
+elif [ -s "$QUIET_LIST" ]; then
+    cat "$QUIET_LIST" >> "$SERIAL_LIST"; : > "$QUIET_LIST"
+fi
+if [ -n "$NS_ROOT" ]; then
+    # Started while the memory they need is free, rather than counted from a guess at the start.
+    PAR="${SUITE_PAR:-$CORES}"
+    if [ "$SOCKETLEY_CONFIG" = Sanitize ]; then export SUITE_START_FREE=$((3 << 30)); else export SUITE_START_FREE=$((1 << 30)); fi
+else
+    PAR="${SUITE_PAR:-$(suite_free_windows)}"
+    [ "$PAR" -gt "$CORES" ] && PAR=$CORES
+    if [ "$SOCKETLEY_CONFIG" = Sanitize ] && [ -z "${SUITE_PAR:-}" ]; then
+        MEM_PAR=$(suite_sanitize_slots)
+        [ "$PAR" -gt "$MEM_PAR" ] && PAR=$MEM_PAR
+    fi
 fi
 # Marks every process of this run, so a daemon a parallel file leaked can be
 # found without the window it claimed.
@@ -342,9 +393,17 @@ export SOCKETLEY_SUITE_RUN="$SUITE_HOME"
 run_one_parallel() {   # file -> its log, exit code and seconds in RESDIR
     local f=$1 name t0 rc tries=0
     name=$(basename "$f")
+    [ -n "${SUITE_START_FREE:-}" ] && suite_wait_memory "$SUITE_START_FREE"
     t0=$(date +%s)
+    # A file that counts the machine's CPUs gets all of them back, whatever cores this pass was given.
+    grep -q '^# suite: all-cpus' "$f" && taskset -cp "0-$(( $(nproc --all) - 1 ))" $$ >/dev/null
     while :; do
-        ( unset SL_PORT_BASE; timeout 900 bash "$f" ) >"$RESDIR/$name.log" 2>&1
+        if [ -n "${NS_ROOT:-}" ] && ! grep -q '^# suite: host' "$f"; then
+            ( unset SL_PORT_BASE; timeout 900 bash -c '. "$1/lib_suite.sh"; suite_ns_run "$2" "$3"' _ \
+                  "$SCRIPT_DIR" "$NS_ROOT" "$f" ) >"$RESDIR/$name.log" 2>&1
+        else
+            ( unset SL_PORT_BASE; timeout 900 bash "$f" ) >"$RESDIR/$name.log" 2>&1
+        fi
         rc=$?
         # A window taken by a file that is still tearing down is a wait, not a
         # failure -- counted as one, it emptied the whole list in seconds.
@@ -357,16 +416,22 @@ run_one_parallel() {   # file -> its log, exit code and seconds in RESDIR
     echo "$rc" > "$RESDIR/$name.rc"
     echo $(( $(date +%s) - t0 )) > "$RESDIR/$name.secs"
 }
-export -f run_one_parallel
+export -f run_one_parallel suite_wait_memory
 export RESDIR
 
 if [ "$PAR" -gt 1 ]; then
-    echo "  ($(wc -l < "$PAR_LIST") files $PAR at a time, $(wc -l < "$SERIAL_LIST") alone after them)"
+    echo "  ($(wc -l < "$PAR_LIST") files $PAR at a time${QUIET_CPUS:+, $(wc -l < "$QUIET_LIST") quiet ones one at a time on cores $QUIET_CPUS}${NS_ROOT:+, each in namespaces of its own}, $(wc -l < "$SERIAL_LIST") alone after them)"
     echo ""
-    suite_longest_first "$PAR_LIST" | xargs -d '\n' -n1 -P"$PAR" bash -c 'run_one_parallel "$1"' _
+    if [ -n "$QUIET_CPUS" ]; then
+        suite_longest_first "$QUIET_LIST" | taskset -c "$QUIET_CPUS" xargs -d '\n' -n1 -P1 bash -c 'run_one_parallel "$1"' _ &
+        quiet_pid=$!
+        suite_longest_first "$PAR_LIST" | taskset -c "$MAIN_CPUS" xargs -d '\n' -n1 -P"$PAR" bash -c 'run_one_parallel "$1"' _
+        wait "$quiet_pid"
+    else
+        suite_longest_first "$PAR_LIST" | xargs -d '\n' -n1 -P"$PAR" bash -c 'run_one_parallel "$1"' _
+    fi
     # A file red beside others and green alone is load, not this tree -- but it
     # is named at the end, because a race that load exposes is still a race.
-    ALONE_ONLY=""
     while IFS= read -r script; do
         name=$(basename "$script")
         cat "$RESDIR/$name.log" 2>/dev/null
@@ -376,7 +441,7 @@ if [ "$PAR" -gt 1 ]; then
         if bash "$script" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
         else FAIL=$((FAIL+1)); FAILED="$FAILED$name"$'\n'; fi
         echo ""
-    done < "$PAR_LIST"
+    done < <(sort "$PAR_LIST" "$QUIET_LIST")
     # What a parallel file left running, found by this run's mark.
     for d in /proc/[0-9]*; do
         p=${d#/proc/}
@@ -387,7 +452,7 @@ if [ "$PAR" -gt 1 ]; then
         kill -9 "$p" 2>/dev/null || true
     done
 else
-    cat "$PAR_LIST" >> "$SERIAL_LIST"
+    cat "$PAR_LIST" "$QUIET_LIST" >> "$SERIAL_LIST"
 fi
 
 while IFS= read -r script; do
@@ -398,7 +463,8 @@ while IFS= read -r script; do
     check_leaked_daemons "$name"
 done < <(sort "$SERIAL_LIST")
 suite_save_durations "$RESDIR"
-rm -rf "$PAR_LIST" "$SERIAL_LIST" "$RESDIR"
+rm -rf "$PAR_LIST" "$SERIAL_LIST" "$QUIET_LIST" "$RESDIR"
+[ -n "$NS_ROOT" ] && rm -rf "$NS_ROOT"
 
 if [ -n "$LEAKED_FILES" ]; then
     echo "─── files that left a daemon running ──────────────────────────────"

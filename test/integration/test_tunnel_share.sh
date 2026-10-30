@@ -51,7 +51,10 @@ for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$I/jwks")
 for _ in $(seq 1 50); do ss -ltn "sport = :$PE" | grep -q LISTEN && break; sleep 0.1; done
 
 login_as() {   # login_as <user> <password> <config dir>: the device code allowed as a browser signed in would
-    XDG_CONFIG_HOME="$3" "$BIN" login "$I" > "$T/login.out" 2>&1 &
+    # Emptied here and not by the redirection, which the background child makes after this shell has read the file:
+    # it read the code of the sign-in before, already used, and the login it started waited for good.
+    : > "$T/login.out"
+    XDG_CONFIG_HOME="$3" "$BIN" login "$I" >> "$T/login.out" 2>&1 &
     local pid=$!
     for _ in $(seq 1 50); do grep -q "allow the code" "$T/login.out" && break; sleep 0.1; done
     python3 - "$PI" "$(sed -n 's/^and allow the code //p' "$T/login.out")" "$1" "$2" <<'PY' >/dev/null 2>&1
@@ -71,6 +74,8 @@ cookie = (post("/login", {"username": sys.argv[3], "password": sys.argv[4]}).get
 post("/device", {"user_code": sys.argv[2], "action": "allow", "password": sys.argv[4]}, cookie)
 PY
     for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    # A login still waiting has been refused; ended, so the test goes on to say so rather than wait with it.
+    kill "$pid" 2>/dev/null
     wait "$pid"
 }
 sock_of() {

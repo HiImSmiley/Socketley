@@ -105,7 +105,9 @@ post("/device", {"user_code": sys.argv[2], "action": "allow", "password": sys.ar
 PY
 }
 login_as() {   # login_as <user> <password> <client, or empty for the default> <config dir>
-    XDG_CONFIG_HOME="$4" "$BIN" login "$I" ${3:+--client "$3"} > "$T/login.out" 2>&1 &
+    # Emptied before, not by the redirection the background child makes after the file was read for the code.
+    : > "$T/login.out"
+    XDG_CONFIG_HOME="$4" "$BIN" login "$I" ${3:+--client "$3"} >> "$T/login.out" 2>&1 &
     local pid=$!
     allow_code "$T/login.out" "$1" "$2"
     for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
