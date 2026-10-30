@@ -416,8 +416,10 @@ TEST_CASE("an expression that does not compile is refused with the parser's code
     CHECK(sql_refusal("SELECT s.a FROM S3Object[*].x s") == "UnsupportedSqlStructure");
     CHECK(sql_refusal("SELECT * FROM S3Object WHERE _1 LIKE 'a' ESCAPE 'xy'") == "LikeInvalidInputs");
     CHECK(sql_refusal("SELECT * FROM S3Object WHERE _1 LIKE 'a!' ESCAPE '!'") == "LikeInvalidInputs");
-    CHECK(sql_refusal("SELECT " + std::string(200, '(') + "1" + std::string(200, ')') + " FROM S3Object") ==
-          "UnsupportedSqlStructure");
+    // Appended in place, since GCC 15 takes the + of a short literal and a long string for an overflow of the first.
+    std::string deep = "SELECT ";
+    deep.append(200, '(').append("1").append(200, ')').append(" FROM S3Object");
+    CHECK(sql_refusal(deep) == "UnsupportedSqlStructure");
     std::string chain = "SELECT 1";
     for (int i = 0; i < 300; ++i)
         chain += " + 1";

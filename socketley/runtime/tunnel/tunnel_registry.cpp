@@ -59,7 +59,8 @@ bool parse_service(std::string_view s, service& out)
     if (!s.starts_with("tcp:") && !s.starts_with("udp:"))
         return false;
     out.udp = s.starts_with("udp:");
-    s.remove_prefix(4);
+    // substr and not remove_prefix, whose bound GCC 15 no longer sees from the starts_with above.
+    s = s.substr(4);
     // `<name>:<port>`, or `<name>:<address>:<port>` for a port opened on that address alone.
     const size_t first = s.find(':'), colon = s.rfind(':');
     if (colon == std::string_view::npos)
