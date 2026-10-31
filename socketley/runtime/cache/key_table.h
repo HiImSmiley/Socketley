@@ -8,6 +8,9 @@
 // dependent misses a lookup once the keyspace is out of cache.  Here it is the
 // slot line and the entry, and the slot line can be fetched ahead.
 //
+// Each table places keys by a random seed of its own, so one table's slot order says nothing of where its keys go in
+// another: a follower filled in its primary's order made one cluster of a third of its slots and probed it per key.
+//
 // Entries never move once placed, except when the whole table is rebuilt: an
 // erase leaves a tombstone rather than shifting a neighbour back, so a SCAN
 // walking slot order sees every key that stayed, and scan_epoch() changes on
@@ -25,6 +28,9 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <random>
+#include <atomic>
+#include <unistd.h>
 
 #include "../../shared/util/transparent_string.h"
 
@@ -90,6 +96,23 @@ private:
     };
 
     static uint64_t hash_of(std::string_view k) { return string_hash{}(k); }
+    // A seed no other table shares, in this process or another forked from the same parent; odd, so never 0.
+    static uint32_t next_seed()
+    {
+        static const uint64_t base = (uint64_t{std::random_device{}()} << 32) ^ std::random_device{}();
+        static std::atomic<uint64_t> n{0};
+        uint64_t z = base ^ (uint64_t(::getpid()) << 40) ^ n.fetch_add(0x9E3779B97F4A7C15ull, std::memory_order_relaxed);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return static_cast<uint32_t>(z ^ (z >> 31)) | 1;
+    }
+    // The slot a hash starts its probe at: the top bits of hash and seed multiplied, over a power-of-two capacity, so a
+    // table grown keeps its order and a rebuild writes the new array front to back.
+    size_t home(uint64_t h) const
+    {
+        const uint64_t s = (uint64_t{m_seed} << 32) | m_seed;
+        return static_cast<size_t>(((h ^ s) * 0x9E3779B97F4A7C15ull) >> (64 - __builtin_ctzll(m_cap)));
+    }
     static uint64_t tag_of(uint64_t h) { return h & ~ADDR_MASK; }
     static uint64_t word(uint64_t h, entry* e) { return tag_of(h) | reinterpret_cast<uint64_t>(e); }
 
@@ -191,6 +214,7 @@ public:
         if (!m_slots)
             throw std::bad_alloc();
         m_cap = o.m_cap;
+        m_seed = o.m_seed;
         try
         {
             // Slot for slot, tombstones included, so the copy probes alike.
@@ -316,12 +340,12 @@ public:
     static uint64_t hash_for_prefetch(std::string_view k) { return hash_of(k); }
     void prefetch_slot(uint64_t h) const
     {
-        if (m_cap) __builtin_prefetch(&m_slots[h & (m_cap - 1)]);
+        if (m_cap) __builtin_prefetch(&m_slots[home(h)]);
     }
     void prefetch_entry(uint64_t h) const
     {
         if (!m_cap) return;
-        const slot& s = m_slots[h & (m_cap - 1)];
+        const slot& s = m_slots[home(h)];
         if (s.live() && tag_of(s.w) == tag_of(h)) __builtin_prefetch(s.e());
     }
 
@@ -387,6 +411,8 @@ private:
     size_t   m_size{0};
     size_t   m_tombs{0};
     uint32_t m_epoch{0};
+    // In the four bytes after m_epoch that alignment left, so a table is no larger for it; 0 until it has slots.
+    uint32_t m_seed{0};
 
     size_t locate(std::string_view k, uint64_t h) const
     {
@@ -394,7 +420,7 @@ private:
             return NPOS;
         const size_t   mask = m_cap - 1;
         const uint64_t tag  = tag_of(h);
-        for (size_t i = h & mask;; i = (i + 1) & mask)
+        for (size_t i = home(h);; i = (i + 1) & mask)
         {
             const slot& s = m_slots[i];
             if (s.live() && tag_of(s.w) == tag && string_equal{}(s.e()->first, k))
@@ -409,7 +435,7 @@ private:
     size_t free_slot(uint64_t h) const
     {
         const size_t mask = m_cap - 1;
-        for (size_t i = h & mask;; i = (i + 1) & mask)
+        for (size_t i = home(h);; i = (i + 1) & mask)
             if (!m_slots[i].live())
                 return i;
     }
@@ -460,20 +486,24 @@ private:
         if (!fresh)
             throw std::bad_alloc();
         // The slot keeps only the top of the hash, so the home slot is hashed
-        // again from the key.
+        // again from the key; a table's first array takes its seed.
         const size_t mask = cap - 1;
-        for (size_t i = 0; i < m_cap; ++i)
+        const slot*  old  = m_slots;
+        const size_t old_cap = m_cap;
+        m_slots = fresh;
+        m_cap   = cap;
+        if (m_seed == 0)
+            m_seed = next_seed();
+        for (size_t i = 0; i < old_cap; ++i)
         {
-            const slot& s = m_slots[i];
+            const slot& s = old[i];
             if (!s.live())
                 continue;
-            size_t j = hash_of(s.e()->first) & mask;
+            size_t j = home(hash_of(s.e()->first));
             while (fresh[j].w != EMPTY) j = (j + 1) & mask;
             fresh[j] = s;
         }
-        std::free(m_slots);
-        m_slots = fresh;
-        m_cap   = cap;
+        std::free(const_cast<slot*>(old));
         m_tombs = 0;
         ++m_epoch;
     }
@@ -485,12 +515,14 @@ private:
         std::free(m_slots);
         m_slots = nullptr;
         m_cap = m_size = m_tombs = 0;
+        // A table emptied, as by FLUSHALL, is filled again by a new seed.
+        m_seed = 0;
     }
 
     void steal(key_table& o)
     {
         m_slots = o.m_slots; m_cap = o.m_cap; m_size = o.m_size;
-        m_tombs = o.m_tombs; m_epoch = o.m_epoch + 1;
+        m_tombs = o.m_tombs; m_epoch = o.m_epoch + 1; m_seed = o.m_seed;
         o.m_slots = nullptr; o.m_cap = o.m_size = o.m_tombs = 0;
     }
 };

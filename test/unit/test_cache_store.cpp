@@ -2035,6 +2035,26 @@ TEST_CASE("key_table finds what it holds and nothing else")
     CHECK(t.find("")->second == "empty key");
 }
 
+TEST_CASE("key_table filled in another table's slot order does not cluster")
+{
+    // A full sync sends the primary's keys in its slot order, the low bits of the hash over twice the slots the
+    // follower's table has while it grows: placed by those bits, that order made one run of a third of the table and
+    // probed it per key, 0.63 s for these 300,000 against 0.016 s, and 60x slower for a follower of four million.
+    std::vector<std::string> keys;
+    for (int i = 0; i < 300000; ++i)
+        keys.push_back("k" + std::to_string(i));
+    const uint64_t m = (uint64_t{1} << 19) - 1;
+    std::sort(keys.begin(), keys.end(), [&](const std::string& a, const std::string& b)
+              { return (string_hash{}(a) & m) < (string_hash{}(b) & m); });
+    key_table<int> t;
+    const auto t0 = thread_cpu_now();
+    for (const auto& k : keys)
+        t.try_emplace(k, 1);
+    CHECK(thread_cpu_now() - t0 < std::chrono::milliseconds(300));
+    CHECK(t.size() == keys.size());
+    CHECK(t.find("k299999") != t.end());
+}
+
 TEST_CASE("key_table erase leaves every other key reachable")
 {
     key_table<int> t;
