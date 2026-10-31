@@ -1080,6 +1080,7 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
         // One page of the folder at a time, the next asked for once this one is handed out.
         std::vector<list_entry> keys;
         size_t at{0}, failed{0}, inflight{0};
+        uint64_t inflight_bytes{0};
         bool more{false}, listing{false};
         // A completion that comes back inside the loop that started it asks for one more turn instead of recursing.
         bool pumping{false}, again{false}, answered{false};
@@ -1101,21 +1102,22 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
     w->q.max_keys = 1000;
     walk* raw = w.get();
 
-    // An object done, well or not, makes room for the next.
-    auto done = [raw]()
+    // An object done, well or not, makes room for the next, and gives back the bytes it held.
+    auto done = [raw](uint64_t held)
     {
         --raw->inflight;
+        raw->inflight_bytes -= held;
         raw->next();
     };
-    auto remove_then_done = [this, raw, done](const std::string& key)
+    auto remove_then_done = [this, raw, done](const std::string& key, uint64_t held)
     {
-        m_store.remove_version(raw->bucket, key, {}, [this, raw, key, done, hold = raw->self.lock()](remove_result rr)
+        m_store.remove_version(raw->bucket, key, {}, [this, raw, key, done, held, hold = raw->self.lock()](remove_result rr)
         {
             if (rr.status != st::ok)
                 ++raw->failed;
             else if (rr.existed)
                 notify_delete(raw->bucket, key);
-            done();
+            done(held);
         });
     };
     w->one = [this, raw, done, remove_then_done](const list_entry& e)
@@ -1126,29 +1128,30 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
             const auto cc = raw->who.lock();
             return cc && !cc->dead && app_allowed(cc, method, bucket, key);
         };
+        const uint64_t held = raw->removing ? 0 : e.meta.size;
         const std::string dst_key = raw->removing ? std::string{} : raw->dst_prefix + e.key.substr(raw->prefix.size());
         if ((!raw->keep_source && !allowed("DELETE", raw->bucket, e.key)) ||
             (!raw->removing && (!allowed("GET", raw->bucket, e.key) || !allowed("PUT", raw->dst_bucket, dst_key))))
         {
             ++raw->failed;
-            done();
+            done(held);
             return;
         }
         if (raw->removing)
         {
-            remove_then_done(e.key);
+            remove_then_done(e.key, held);
             return;
         }
         // A copy reads the object whole, so one past the bound, or one only its client's key opens, is not copied.
         if (e.meta.size > tree_object_max || sse_mode_of(e.meta) == sse_mode::c)
         {
             ++raw->failed;
-            done();
+            done(held);
             return;
         }
         const std::string src_key = e.key;
         m_store.open_object(raw->bucket, e.key, static_cast<size_t>(stored_size(e.meta)),
-                            [this, raw, done, remove_then_done, dst_key, src_key, hold = raw->self.lock()](open_result o)
+                            [this, raw, done, remove_then_done, dst_key, src_key, held, hold = raw->self.lock()](open_result o)
         {
             if (o.fd >= 0)
                 m_loop.close_fd(o.fd);
@@ -1169,7 +1172,7 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
             if (!ok || body.size() != o.meta.size)
             {
                 ++raw->failed;
-                done();
+                done(held);
                 return;
             }
             // What a file's COPY keeps, its headers, user metadata and tags; nothing of how the source was stored.
@@ -1182,23 +1185,24 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
             set_tags_extra(meta, tags_of(o.meta));
             s3_error err;
             auto put = put_whole(raw->dst_bucket, dst_key, std::move(meta), std::move(body),
-                                 [raw, done, remove_then_done, src_key, hold](st s, const put_result*)
+                                 [raw, done, remove_then_done, src_key, held, hold](st s, const put_result*)
             {
                 if (s != st::ok)
                     ++raw->failed;
                 if (s == st::ok && !raw->keep_source)
-                    remove_then_done(src_key);
+                    remove_then_done(src_key, held);
                 else
-                    done();
+                    done(held);
             }, err);
             if (!put)
             {
                 ++raw->failed;
-                done();
+                done(held);
             }
         });
     };
-    // Removals go 32 at a time, which their syncs share; copies 4, as each holds an object in memory.
+    // 32 at a time, which their syncs share; copies hold their objects whole, so they are as many as fit in one
+    // object's bound, and at least one.
     w->next = [this, raw]()
     {
         if (raw->pumping)
@@ -1207,13 +1211,16 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
             return;
         }
         raw->pumping = true;
-        const size_t window = raw->removing ? 32 : 4;
         do
         {
             raw->again = false;
-            while (raw->inflight < window && raw->at < raw->keys.size())
+            while (raw->inflight < 32 && raw->at < raw->keys.size())
             {
+                const uint64_t held = raw->removing ? 0 : raw->keys[raw->at].meta.size;
+                if (raw->inflight > 0 && raw->inflight_bytes + held > tree_object_max)
+                    break;
                 ++raw->inflight;
+                raw->inflight_bytes += held;
                 const list_entry e = raw->keys[raw->at++];
                 raw->one(e);
             }
