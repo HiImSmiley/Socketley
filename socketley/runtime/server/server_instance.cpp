@@ -2,6 +2,7 @@
 #include "../../shared/net/socket_tuning.h"
 #include "../../shared/loop/conn_alloc.h"
 #include "server_instance.h"
+#include "../../shared/http/mime.h"
 #include "../../shared/lua/lua_suspend.h"
 #include "../../shared/loop/coarse_clock.h"
 #include "../../shared/net/conn_reachability.h"
@@ -614,37 +615,6 @@ const std::vector<upstream_target>& server_instance::get_upstream_targets() cons
     return m_upstream_targets;
 }
 
-static std::string_view http_content_type(std::string_view ext)
-{
-    switch (fnv1a(ext))
-    {
-        case fnv1a(".html"): case fnv1a(".htm"):
-            return "text/html; charset=utf-8";
-        case fnv1a(".css"):  return "text/css; charset=utf-8";
-        case fnv1a(".js"):   return "application/javascript; charset=utf-8";
-        case fnv1a(".json"): return "application/json; charset=utf-8";
-        case fnv1a(".png"):  return "image/png";
-        case fnv1a(".jpg"):  case fnv1a(".jpeg"):
-            return "image/jpeg";
-        case fnv1a(".gif"):  return "image/gif";
-        case fnv1a(".svg"):  return "image/svg+xml";
-        case fnv1a(".ico"):  return "image/x-icon";
-        case fnv1a(".woff2"): return "font/woff2";
-        case fnv1a(".woff"): return "font/woff";
-        case fnv1a(".ttf"):  return "font/ttf";
-        case fnv1a(".txt"):  return "text/plain; charset=utf-8";
-        case fnv1a(".xml"):  return "application/xml";
-        case fnv1a(".wasm"): return "application/wasm";
-        case fnv1a(".webp"): return "image/webp";
-        case fnv1a(".mp4"):  return "video/mp4";
-        case fnv1a(".webm"): return "video/webm";
-        case fnv1a(".mp3"):  return "audio/mpeg";
-        case fnv1a(".ogg"):  return "audio/ogg";
-        case fnv1a(".pdf"):  return "application/pdf";
-        default:             return "application/octet-stream";
-    }
-}
-
 static constexpr std::string_view WS_INJECT_SCRIPT =
     "<script>const socketley=new WebSocket("
     "`ws${location.protocol==='https:'?'s':''}://${location.host}`);</script>";
@@ -1075,7 +1045,7 @@ void server_instance::rebuild_http_cache()
         std::string ext = entry.path().extension().string();
         for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         uint32_t ext_hash = fnv1a(ext);
-        auto ct = http_content_type(ext);
+        auto ct = socketley::http::content_type_of(ext);
 
         // Inject WebSocket script into HTML files
         if (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"))
@@ -1406,7 +1376,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         uint32_t ext_hash = fnv1a(ext);
         bool is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
-        auto ct = http_content_type(ext);
+        auto ct = socketley::http::content_type_of(ext);
 
         // ─── The range, against the length it is defined by ─────────────
         // Not for HTML: the injected script changes the body's length, so a

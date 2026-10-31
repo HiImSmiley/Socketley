@@ -738,29 +738,6 @@ std::string encode_part_numbers(const std::vector<uint32_t>& numbers, size_t max
     return out;
 }
 
-bool etag_list_matches(std::string_view list, std::string_view etag)
-{
-    auto trim = [](std::string_view v)
-    {
-        while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
-            v.remove_prefix(1);
-        while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
-            v.remove_suffix(1);
-        return v;
-    };
-    while (!list.empty())
-    {
-        std::string_view one = trim(take_item(list));
-        if (one.starts_with("W/"))
-            one.remove_prefix(2);
-        if (one.size() >= 2 && one.front() == '"' && one.back() == '"')
-            one = one.substr(1, one.size() - 2);
-        if (one == "*" || one == etag)
-            return true;
-    }
-    return false;
-}
-
 bool part_list_of(const object_meta& m, part_list& out)
 {
     out.numbers.clear();

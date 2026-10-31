@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "dav_store.h"
+#include "../../shared/http/conditional.h"
 #include "../../shared/util/xml_doc.h"
 
 namespace socketley::mail
@@ -92,12 +93,7 @@ std::string unpct(std::string_view s)
 
 std::string http_date(int64_t ms)
 {
-    const time_t t = static_cast<time_t>(ms / 1000);
-    std::tm tm{};
-    ::gmtime_r(&t, &tm);
-    char buf[64];
-    std::strftime(buf, sizeof buf, "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    return buf;
+    return socketley::http::http_date_of(ms / 1000);
 }
 
 std::string unquote(std::string_view etag)

@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include "../../shared/http/conditional.h"
+
 #include "checksum.h"
 #include "digest.h"
 
@@ -276,7 +278,7 @@ struct object_meta
 };
 
 // Whether a comma-separated If-Match / If-None-Match list names `etag`, quoted or weak, or is "*".
-bool etag_list_matches(std::string_view list, std::string_view etag);
+using socketley::http::etag_list_matches;
 
 // The extra entry an object's tags are kept in: each tag's key and value, each followed by a NUL.
 inline constexpr std::string_view tags_extra = "x-amz-tagging";

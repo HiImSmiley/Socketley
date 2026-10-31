@@ -3,6 +3,7 @@
 // of its own, a few at a time. Nothing crosses the client's line but the request and the answer, and the job goes on
 // to its end when the page that asked for it is closed.
 #include "storage_run.h"
+#include "../../shared/http/mime.h"
 
 #include "body_reader.h"
 #include "checksum.h"
@@ -116,36 +117,6 @@ std::string clean_path(std::string_view name, bool& dir)
         out += part;
     }
     return out;
-}
-
-// The type a browser is told a written file is, by its extension, as the page's own upload names it.
-std::string_view type_of(std::string_view name)
-{
-    const size_t dot = name.rfind('.');
-    if (dot == std::string_view::npos || name.find('/', dot) != std::string_view::npos)
-        return "application/octet-stream";
-    std::string e(name.substr(dot + 1));
-    for (char& ch : e)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    static const std::pair<std::string_view, std::string_view> types[] = {
-        {"jpg", "image/jpeg"},        {"jpeg", "image/jpeg"},       {"png", "image/png"},
-        {"gif", "image/gif"},         {"webp", "image/webp"},       {"avif", "image/avif"},
-        {"heic", "image/heic"},       {"bmp", "image/bmp"},         {"svg", "image/svg+xml"},
-        {"mp4", "video/mp4"},         {"m4v", "video/mp4"},         {"mov", "video/quicktime"},
-        {"mkv", "video/x-matroska"},  {"webm", "video/webm"},       {"avi", "video/x-msvideo"},
-        {"mp3", "audio/mpeg"},        {"m4a", "audio/mp4"},         {"aac", "audio/aac"},
-        {"flac", "audio/flac"},       {"ogg", "audio/ogg"},         {"opus", "audio/ogg"},
-        {"wav", "audio/wav"},         {"pdf", "application/pdf"},   {"zip", "application/zip"},
-        {"txt", "text/plain"},        {"md", "text/markdown"},      {"json", "application/json"},
-        {"csv", "text/csv"},          {"html", "text/html"},        {"htm", "text/html"},
-        {"css", "text/css"},          {"js", "text/javascript"},    {"mjs", "text/javascript"},
-        {"xml", "application/xml"},   {"yml", "text/yaml"},         {"yaml", "text/yaml"},
-        {"srt", "text/plain"},        {"vtt", "text/vtt"},
-    };
-    for (const auto& [k, v] : types)
-        if (k == e)
-            return v;
-    return "application/octet-stream";
 }
 
 // A string as JSON, a byte that begins no whole UTF-8 sequence written as U+FFFD, since a ZIP names its entries in
@@ -532,7 +503,7 @@ void storage_run::unzip_job::start_entry(size_t i)
             return;
         }
         object_meta m;
-        m.content_type = type_of(e.key);
+        m.content_type = socketley::http::content_type_of(e.key);
         s3_error err;
         auto op = self->run->begin_own_put(self->bucket, e.key, std::move(m), e.usize, err);
         auto src = op ? self->reader(first, e.csize) : nullptr;

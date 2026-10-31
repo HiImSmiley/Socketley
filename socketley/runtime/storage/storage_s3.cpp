@@ -1909,38 +1909,17 @@ void render_object_headers(const s3_request& q, const object_meta& m, std::strin
 
 enum class cond { proceed, not_modified, precondition_failed };
 
-// RFC 9110 13.2.2 in the order it fixes: If-Match, If-Unmodified-Since,
-// If-None-Match, If-Modified-Since.
+// RFC 9110 13.2.2's preconditions, against the object as it is now.
 cond evaluate(const s3_request& q, const object_meta& m)
 {
-    const int64_t mtime_s = m.mtime_ms / 1000;
-
-    const std::string_view im = q.header("if-match");
-    if (!im.empty())
+    switch (socketley::http::evaluate({q.header("if-match"), q.header("if-unmodified-since"),
+                                       q.header("if-none-match"), q.header("if-modified-since")},
+                                      m.etag(), m.mtime_ms / 1000))
     {
-        if (!etag_list_matches(im, m.etag()))
-            return cond::precondition_failed;
+        case socketley::http::precondition::failed: return cond::precondition_failed;
+        case socketley::http::precondition::not_modified: return cond::not_modified;
+        default: return cond::proceed;
     }
-    else if (const std::string_view ius = q.header("if-unmodified-since"); !ius.empty())
-    {
-        const int64_t t = parse_http_date(ius);
-        if (t >= 0 && mtime_s > t)
-            return cond::precondition_failed;
-    }
-
-    const std::string_view inm = q.header("if-none-match");
-    if (!inm.empty())
-    {
-        if (etag_list_matches(inm, m.etag()))
-            return cond::not_modified;
-    }
-    else if (const std::string_view ims = q.header("if-modified-since"); !ims.empty())
-    {
-        const int64_t t = parse_http_date(ims);
-        if (t >= 0 && mtime_s <= t)
-            return cond::not_modified;
-    }
-    return cond::proceed;
 }
 
 // What a GetObjectAttributes request asks for, from x-amz-object-attributes and the part paging headers.

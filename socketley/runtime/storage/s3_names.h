@@ -9,6 +9,7 @@
 #include <ctime>
 #include <string>
 #include <string_view>
+#include "../../shared/http/conditional.h"
 #include "../../shared/http/url.h"
 
 namespace socketley::storage
@@ -196,27 +197,7 @@ inline std::string iso8601(int64_t ms)
 // Mon, 02 Jan 2006 15:04:05 GMT, the HTTP date every header carries.
 inline std::string http_date(int64_t ms)
 {
-    static constexpr std::string_view days[]   = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-    static constexpr std::string_view months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    const utc_fields f = utc_of(ms);
-    std::string out;
-    out.reserve(32);
-    out += days[f.weekday];
-    out += ", ";
-    append_digits(out, f.day, 2);
-    out.push_back(' ');
-    out += months[f.month - 1];
-    out.push_back(' ');
-    append_year(out, f.year);
-    out.push_back(' ');
-    append_digits(out, f.hour, 2);
-    out.push_back(':');
-    append_digits(out, f.minute, 2);
-    out.push_back(':');
-    append_digits(out, f.second, 2);
-    out += " GMT";
-    return out;
+    return socketley::http::http_date_of(ms >= 0 ? ms / 1000 : (ms - 999) / 1000);
 }
 
 inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
@@ -293,17 +274,6 @@ inline bool parse_iso8601(std::string_view s, int64_t& ms, bool& midnight)
     return true;
 }
 
-// Seconds since the epoch of an HTTP date, or -1 when it is not one.
-inline int64_t parse_http_date(std::string_view s)
-{
-    struct tm tm{};
-    const std::string z(s);
-    const char* end = strptime(z.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    // The whole of it, and no instant before 1970, which leaves -1 meaning only "not a date".
-    if (!end || *end != '\0')
-        return -1;
-    const int64_t t = static_cast<int64_t>(timegm(&tm));
-    return t < 0 ? -1 : t;
-}
+using socketley::http::parse_http_date;
 
 }   // namespace socketley::storage
