@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
+# suite: host -- <bucket>.localhost is resolved by the system's resolver, which a network namespace of its own cannot reach
 # Integration test: virtual-hosted-style addressing on a storage runtime.
 #
 # ─── WHAT THIS HOLDS DOWN ───────────────────────────────────────────────────

@@ -2,6 +2,7 @@
 #include <cstring>
 #include <algorithm>
 #include "doctest.h"
+#include "thread_cpu.h"
 #include "../../socketley/runtime/cache/cache_store.h"
 #include "../../socketley/shared/util/glob_match.h"
 #include <chrono>
@@ -4505,9 +4506,9 @@ bool glob_reference(std::string_view pat, std::string_view str)
 
 double glob_seconds(const std::string& pat, const std::string& str, bool& matched)
 {
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto t0 = thread_cpu_now();
     matched = socketley::glob_match(pat, str);
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return std::chrono::duration<double>(thread_cpu_now() - t0).count();
 }
 
 }  // namespace
@@ -4560,9 +4561,9 @@ TEST_CASE("glob_match answers a pattern built to backtrack in linear time")
     cache_store store;
     store.set(key, "1");
     std::vector<std::string_view> out;
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto t0 = thread_cpu_now();
     store.keys("*" + run + "b", out);
-    CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 3.0);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 3.0);
     CHECK(out.empty());
     store.keys("*" + run, out);
     CHECK(out.size() == 1);

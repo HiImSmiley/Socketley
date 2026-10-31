@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# suite: host -- like test_cluster, a group's remote member is not reached over TCP inside a network namespace, not yet understood
 # Integration test: a proxy naming a group takes each local member's node.
 #
 # ─── WHAT THIS EXISTS TO CATCH ─────────────────────────────────────────────

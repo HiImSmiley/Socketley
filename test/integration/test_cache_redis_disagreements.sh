@@ -169,10 +169,9 @@ case "$SG" in
 esac
 
 # ── 4. TTL rounds the way Redis rounds ─────────────────────────────────────
-resp "$(python3 -c "import json;print(json.dumps([['SETEX','t10','10','v']]))")" >/dev/null
-T10=$(printf '%s' "$(resp "$(python3 -c "import json;print(json.dumps([['TTL','t10']]))")")" | tr -d ' |')
-resp "$(python3 -c "import json;print(json.dumps([['SET','t1','v','EX','1']]))")" >/dev/null
-T1=$(printf '%s' "$(resp "$(python3 -c "import json;print(json.dumps([['TTL','t1']]))")")" | tr -d ' |')
+# Set and read in one pipeline, so no half second of a busy box passes between them.
+T10=$(resp "$(python3 -c "import json;print(json.dumps([['SETEX','t10','10','v'],['TTL','t10']]))")" hold | grep -o ':[0-9-]*' | tail -1)
+T1=$(resp "$(python3 -c "import json;print(json.dumps([['SET','t1','v','EX','1'],['TTL','t1']]))")" hold | grep -o ':[0-9-]*' | tail -1)
 if [ "$T10" = ":10" ] && [ "$T1" = ":1" ]; then
     ok "TTL rounds: EX 10 reads 10 and EX 1 reads 1"
 else

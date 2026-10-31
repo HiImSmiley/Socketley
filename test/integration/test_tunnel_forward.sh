@@ -260,13 +260,13 @@ EOF
     "$SSHD" -D -f "$T/sshd_config" -E "$T/sshd.log" &
     SSHD_PID=$!
     for _ in $(seq 1 50); do ss -ltn "sport = :$PS" | grep -q LISTEN && break; sleep 0.1; done
-    out=$(ssh -i "$T/key" -o CertificateFile="$T/key-cert.pub" -o IdentitiesOnly=yes -o BatchMode=yes \
+    out=$(ssh -F none -i "$T/key" -o CertificateFile="$T/key-cert.pub" -o IdentitiesOnly=yes -o BatchMode=yes \
               -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
               -o ProxyCommand="$BIN tunnel connect http://127.0.0.1:$PE 127.0.0.1:$PS --idp $I" \
               "$USER@through-the-tunnel" echo in 2>&1 | grep -v '^Warning: Permanently added')
     [ "$out" = in ] && ok || bad "ssh gets in through the tunnel by its certificate" "$out"
     in_by_cert() {
-        ssh -i "$T/key" -o CertificateFile="$T/key-cert.pub" -o IdentitiesOnly=yes -o BatchMode=yes \
+        ssh -F none -i "$T/key" -o CertificateFile="$T/key-cert.pub" -o IdentitiesOnly=yes -o BatchMode=yes \
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$PS" \
             "$USER@127.0.0.1" echo in 2>&1 | grep -v '^Warning: Permanently added'
     }

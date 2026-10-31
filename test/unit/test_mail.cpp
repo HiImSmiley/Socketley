@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
+#include "thread_cpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1228,19 +1229,18 @@ TEST_CASE("DEFLATE: what the compressor writes in pieces, each flushed, the infl
 
 TEST_CASE("MIME: hostile shapes cost their length, and parameters and charsets read as clients write them")
 {
-    using clock = std::chrono::steady_clock;
     // A header of a million bytes of words never closed, and of a quarter million "Re: ", each read in linear time.
     std::string open_words;
     while (open_words.size() < (1u << 20))
         open_words += "=?x?q?a";
-    auto t0 = clock::now();
+    auto t0 = thread_cpu_now();
     CHECK(mime::decode_words(open_words).size() == open_words.size());
     std::string res;
     while (res.size() < (1u << 20))
         res += "Re: ";
     res += "Lunch";
     CHECK(socketley::mail::imap_order::base_subject(res) == "Lunch");
-    CHECK(clock::now() - t0 < std::chrono::seconds(2));
+    CHECK(thread_cpu_now() - t0 < std::chrono::seconds(2));
     // Fifty thousand empty parts are read as ten thousand at most.
     std::string many = "Content-Type: multipart/mixed; boundary=b\r\n\r\n";
     for (int i = 0; i < 50000; ++i)
@@ -1314,9 +1314,9 @@ TEST_CASE("SORT and THREAD: a display name with a comma, and a reply chain fifty
                         std::to_string(i) + "@c>\r\n\r\n");
         chain.push_back(std::move(c));
     }
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto t0 = thread_cpu_now();
     const std::string t = io::references(chain);
-    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3));
+    CHECK(thread_cpu_now() - t0 < std::chrono::seconds(3));
     CHECK(t.find("(50000") == std::string::npos);
     CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
 }

@@ -406,7 +406,9 @@ for M, _ in views[1:]:
     M.noop()
     typ, data = M.uid("FETCH", str(first), "(FLAGS)")
     seen += b"\\Flagged" in data[0]
-print(len(errs), same, unique, seen)
+subjects = sorted(views[0][1].values())
+print(len(errs), same, unique, seen, len(views[0][1]), len(set(subjects)),
+      [x.decode() for x in set(subjects) if subjects.count(x) > 1][:5])
 PY
 )
 set -- $r

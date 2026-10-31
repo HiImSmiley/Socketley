@@ -362,12 +362,16 @@ PAR_LIST=$(mktemp); SERIAL_LIST=$(mktemp); QUIET_LIST=$(mktemp); RESDIR=$(mktemp
 # by side, and a quiet one runs on cores of its own beside them; without, as before.
 NS_ROOT=""
 if [ -z "${SUITE_NO_NS:-}" ] && suite_ns_ok; then
-    NS_ROOT=$(mktemp -d /var/tmp/socketley-ns.XXXXXX)
+    # On what /tmp is, tmpfs or a disk, so a file's syncs cost what they cost when it runs alone.
+    NS_ROOT=$(mktemp -d /tmp/socketley-ns.XXXXXX)
 fi
 export NS_ROOT SCRIPT_DIR
 for script in "$SCRIPT_DIR"/integration/test_*.sh; do
     [ -f "$script" ] || continue
-    if [ -n "$NS_ROOT" ] && grep -q '^# suite: quiet' "$script"; then echo "$script" >> "$QUIET_LIST"
+    # A quiet file that needs the host's own network disturbs every other one, so it runs alone after them.
+    if [ -n "$NS_ROOT" ] && grep -q '^# suite: quiet' "$script" && grep -q '^# suite: host' "$script"; then
+        echo "$script" >> "$SERIAL_LIST"
+    elif [ -n "$NS_ROOT" ] && grep -q '^# suite: quiet' "$script"; then echo "$script" >> "$QUIET_LIST"
     elif [ -n "$NS_ROOT" ] || ! suite_wants_serial "$script"; then echo "$script" >> "$PAR_LIST"
     else echo "$script" >> "$SERIAL_LIST"; fi
 done
@@ -394,21 +398,25 @@ fi
 # found without the window it claimed.
 export SOCKETLEY_SUITE_RUN="$SUITE_HOME"
 
+# A file in namespaces of its own unless it needs the host's, the same in the parallel pass and when run again alone.
+run_file() {   # file
+    if [ -n "${NS_ROOT:-}" ] && ! grep -q '^# suite: host' "$1"; then
+        bash -c '. "$1/lib_suite.sh"; suite_ns_run "$2" "$3"' _ "$SCRIPT_DIR" "$NS_ROOT" "$1"
+    else
+        bash "$1"
+    fi
+}
+
 run_one_parallel() {   # file -> its log, exit code and seconds in RESDIR
     local f=$1 name t0 rc tries=0
     name=$(basename "$f")
     local need; need=$(suite_mem_need "$name"); suite_budget_reserve "$need"
-    export SUITE_FILE_TAG="$name"
+    export SUITE_FILE_TAG="$SUITE_TAG_RUN/$name"
     t0=$(date +%s)
     # A file that counts the machine's CPUs gets all of them back, whatever cores this pass was given.
     grep -q '^# suite: all-cpus' "$f" && taskset -cp "0-$(( $(nproc --all) - 1 ))" $$ >/dev/null
     while :; do
-        if [ -n "${NS_ROOT:-}" ] && ! grep -q '^# suite: host' "$f"; then
-            ( unset SL_PORT_BASE; timeout 900 bash -c '. "$1/lib_suite.sh"; suite_ns_run "$2" "$3"' _ \
-                  "$SCRIPT_DIR" "$NS_ROOT" "$f" ) >"$RESDIR/$name.log" 2>&1
-        else
-            ( unset SL_PORT_BASE; timeout 900 bash "$f" ) >"$RESDIR/$name.log" 2>&1
-        fi
+        ( unset SL_PORT_BASE; timeout 900 bash -c 'run_file "$1"' _ "$f" ) >"$RESDIR/$name.log" 2>&1
         rc=$?
         # A window taken by a file that is still tearing down is a wait, not a
         # failure -- counted as one, it emptied the whole list in seconds.
@@ -422,7 +430,7 @@ run_one_parallel() {   # file -> its log, exit code and seconds in RESDIR
     echo $(( $(date +%s) - t0 )) > "$RESDIR/$name.secs"
     suite_budget_release "$need"
 }
-export -f run_one_parallel suite_mem_need suite_budget_reserve suite_budget_release
+export -f run_file run_one_parallel suite_mem_need suite_budget_reserve suite_budget_release
 export SUITE_MEM_RECORD SUITE_BUDGET_FILE
 export RESDIR
 
@@ -445,7 +453,7 @@ if [ "$PAR" -gt 1 ]; then
         note_skips "$name" "$RESDIR/$name.log"
         if [ "$(cat "$RESDIR/$name.rc" 2>/dev/null)" = 0 ]; then PASS=$((PASS+1)); echo ""; continue; fi
         echo "  -- red beside $PAR others; run again alone:"
-        if bash "$script" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
+        if run_file "$script" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
         else FAIL=$((FAIL+1)); FAILED="$FAILED$name"$'\n'; fi
         echo ""
     done < <(sort "$PAR_LIST" "$QUIET_LIST")

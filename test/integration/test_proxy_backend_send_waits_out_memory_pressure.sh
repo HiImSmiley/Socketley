@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # suite: quiet -- puts the whole machine under TCP memory pressure on purpose.
+# suite: host -- tcp_mem and the pressure it sets are the machine's, which a network namespace of its own does not show
 # Integration test: a TCP proxy's send to its backend waits out TCP memory
 # pressure instead of dropping the pair
 #

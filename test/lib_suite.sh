@@ -95,7 +95,9 @@ suite_ns_ok() {
 
 suite_ns_run() {   # root file -> the file's exit, run in namespaces of its own with its /tmp under root
     local dir="$1/$(basename "$2" .sh)"
-    rm -rf "$dir"; mkdir -p "$dir"
+    rm -rf "$dir" "$dir.hosts"; mkdir -p "$dir"
+    # The machine's name is its address beside the loopback, as the host's resolver, out of reach here, would say.
+    { cat /etc/hosts; echo "198.18.0.1 $(hostname)"; } > "$dir.hosts"
     # The capabilities the namespace gives are kept for bringing the loopback up and mounting /tmp, and given up
     # before the file runs, so it is the user it would be on the host: a file of mode 000 is refused to it.
     unshare --user --map-current-user --keep-caps --net --mount --pid --fork --mount-proc --kill-child -- bash -c '
@@ -103,10 +105,15 @@ suite_ns_run() {   # root file -> the file's exit, run in namespaces of its own 
         # An address that is not loopback, which a test of what reaches this machine from elsewhere needs, in the
         # benchmarking range no test names: 192.0.2.x is what tests use for an address the host does not have.
         ip link add sl0 type dummy 2>/dev/null && ip addr add 198.18.0.1/24 dev sl0 && ip link set sl0 up
+        mount --bind "$1.hosts" /etc/hosts || exit 2
         mount --bind "$1" /tmp || exit 2
         export HOME=/tmp/home SOCKETLEY_SOCKET=/tmp/suite.sock
         mkdir -p "$HOME"
         exec setpriv --inh-caps=-all --ambient-caps=-all bash "$2"' _ "$dir" "$2"
+    local rc=$?
+    # Its /tmp goes with it, as on tmpfs it is memory.
+    chmod -R u+rwx "$dir" 2>/dev/null; rm -rf "$dir" "$dir.hosts"
+    return "$rc"
 }
 
 # ─── A memory budget the suites on the machine share ────────────────────────
@@ -116,10 +123,13 @@ suite_ns_run() {   # root file -> the file's exit, run in namespaces of its own 
 # reserves what it held at its peak the last time, or a default for its build,
 # from a budget of the machine's memory less a margin, and starts only once the
 # reservations held fit; the first is always let in.  A sampler records each
-# job's peak (its processes' anonymous memory and swap, found by the tag they
-# inherit) for the next run.
+# job's peak (its processes' share of anonymous memory and swap, found by the
+# tag they inherit) for the next run.
 SUITE_MEM_RECORD="${SUITE_MEM_RECORD:-/var/tmp/socketley-test-memory-$(id -u)-${SOCKETLEY_CONFIG:-Release}}"
 SUITE_BUDGET_FILE="/tmp/socketley-suite-budget-$(id -u)"
+# A tag names its run as well as its file, so a sampler counts none of a suite running beside its own.
+SUITE_TAG_RUN="${SUITE_TAG_RUN:-${SOCKETLEY_CONFIG:-Release}.$$}"
+export SUITE_TAG_RUN
 
 suite_mem_need() {   # name -> kB to reserve
     local kb
@@ -130,9 +140,10 @@ suite_mem_need() {   # name -> kB to reserve
 
 suite_budget_reserve() {   # kB
     local budget held
-    budget=$(awk '/^MemTotal:/ { print $2 - 3145728 }' /proc/meminfo)
     exec 8>"$SUITE_BUDGET_FILE.lock"
     while :; do
+        # What the files' own /tmp holds, when it is tmpfs, is memory no reservation counts.
+        budget=$(awk '/^MemTotal:/ { t = $2 } /^Shmem:/ { s = $2 } END { print t - s - 3145728 }' /proc/meminfo)
         flock 8
         held=$(cat "$SUITE_BUDGET_FILE" 2>/dev/null || echo 0)
         if [ "$held" -le 0 ] || [ $((held + $1)) -le "$budget" ]; then
@@ -161,9 +172,11 @@ suite_mem_sampler() {   # dir
     while :; do
         declare -A now=()
         for d in /proc/[0-9]*; do
-            tag=$( { tr '\0' '\n' <"$d/environ"; } 2>/dev/null | sed -n 's/^SUITE_FILE_TAG=//p' )
+            tag=$( { tr '\0' '\n' <"$d/environ"; } 2>/dev/null | sed -n "s|^SUITE_FILE_TAG=$SUITE_TAG_RUN/||p" )
             [ -n "$tag" ] || continue
-            kb=$(awk '/^(RssAnon|VmSwap):/ { s += $2 } END { print s + 0 }' "$d/status" 2>/dev/null)
+            # Proportional, so the pages a forked worker still shares with its parent count once.
+            kb=$(awk '/^(Pss_Anon|SwapPss):/ { s += $2 } END { print s + 0 }' "$d/smaps_rollup" 2>/dev/null) ||
+                kb=$(awk '/^(RssAnon|VmSwap):/ { s += $2 } END { print s + 0 }' "$d/status" 2>/dev/null)
             now[$tag]=$(( ${now[$tag]:-0} + ${kb:-0} ))
         done
         for tag in "${!now[@]}"; do
@@ -197,7 +210,7 @@ suite_run_jobs() {   # list dir parallel
         cmd=$(awk -F"\t" -v n="$name" "\$1 == n { print \$2; exit }" "$2")
         need=$(suite_mem_need "$name"); suite_budget_reserve "$need"
         t0=$(date +%s)
-        SUITE_FILE_TAG="$name" bash -c "$cmd" > "$SUITE_JOB_DIR/$name.log" 2>&1
+        SUITE_FILE_TAG="$SUITE_TAG_RUN/$name" bash -c "$cmd" > "$SUITE_JOB_DIR/$name.log" 2>&1
         echo $? > "$SUITE_JOB_DIR/$name.rc"
         suite_budget_release "$need"
         echo $(( $(date +%s) - t0 )) > "$SUITE_JOB_DIR/$name.secs"' _ {} "$list"

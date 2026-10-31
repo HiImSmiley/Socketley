@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
-# suite: host -- ssh, which refuses the system's config files when a user namespace shows them owned by nobody
 # The idp's SSH certificate authority (--ssh-ca), end to end against a real sshd: socketley login, socketley
 # ssh-cert, a login by the certificate, and a host certificate a client trusts by @cert-authority.
 #
@@ -156,7 +155,7 @@ for _ in $(seq 1 50); do ss -ltn "sport = :$PS" | grep -q LISTEN && break; sleep
 echo "@cert-authority [127.0.0.1]:$PS $CA" > "$T/known_hosts"
 ssh_in() {   # ssh_in <key> [extra options...]
     local key=$1; shift
-    ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$T/known_hosts" \
+    ssh -F none -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$T/known_hosts" \
         -o StrictHostKeyChecking=yes -o ConnectTimeout=5 "$@" -p "$PS" "$USER@127.0.0.1" echo in 2>&1
 }
 out=$(ssh_in "$T/alice_key" -o CertificateFile="$T/alice_key-cert.pub")

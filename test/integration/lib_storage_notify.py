@@ -489,10 +489,11 @@ def mode_main(port, hook_port, other_port):
               wait_for(lambda: said("3 event(s) to be notified of were dropped while it was full") == 1, 5),
               said("event(s) to be notified of were dropped"))
 
-    s = stats_shards()[0]
+    # Summed over the shards, as each PUT is counted by the shard that took it.
     check("stats counts what was sent, failed, queued and dropped",
-          all(k in s for k in ("notify_sent", "notify_failed", "notify_queued", "notify_dropped")) and
-          int(s["notify_sent"]) >= 20 and s["notify_queued"] == "0", s)
+          all(k in s for s in stats_shards().values()
+              for k in ("notify_sent", "notify_failed", "notify_queued", "notify_dropped")) and
+          stat("notify_sent") >= 20 and wait_for(lambda: stat("notify_queued") == 0, 5), nstats())
 
     # Removing the configuration stops the events.
     check("an empty configuration removes it", put_cfg(doc())[:2] == (200, None))

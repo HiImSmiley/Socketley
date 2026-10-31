@@ -1,4 +1,5 @@
 #include "doctest.h"
+#include "thread_cpu.h"
 
 #include <chrono>
 #include <map>
@@ -298,9 +299,9 @@ TEST_CASE("sieve: :matches is quadratic at worst, never exponential")
         pattern += "*a";
     pattern += "*b";
     const std::string message = "Subject: " + std::string(20000, 'a') + "\n\nb\n";
-    const auto start = std::chrono::steady_clock::now();
+    const auto start = thread_cpu_now();
     const outcome o = run("if header :matches \"subject\" \"" + pattern + "\" { discard; }", message);
-    const auto took = std::chrono::steady_clock::now() - start;
+    const auto took = thread_cpu_now() - start;
     CHECK(o.error.empty());
     CHECK(summary(o) == "keep");
     CHECK(took < std::chrono::seconds(2));
