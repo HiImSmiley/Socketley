@@ -1011,11 +1011,6 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Restore persisted runtimes before entering the event loop
     restore_runtimes(persistence, manager, loop);
-    // The page's history and the alerts are a metrics runtime's, so a daemon whose dashboard signs people in, or that
-    // is told where alerts go, is given one once; a bare metrics_port is a scrape endpoint, which needs none.
-    if ((metrics_port > 0 && (!config.dashboard_credentials.empty() || !config.dashboard_idp.empty())) ||
-        !config.alert_webhook.empty() || !config.alert_mail.empty() || !config.events.empty())
-        handler.ensure_dashboard_store(paths.state_dir.string());
 
     // And fork their workers here rather than leaving it to the first health
     // tick: restore puts a runtime in `running` and spawns nothing, so the
@@ -1027,6 +1022,11 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // After the restore, so what the daemon kept is what it has, and the file adds what it has not.
     make_setup_runtimes(resolve_config_path(paths.config_path.string()), handler, manager);
 #endif
+    // The page's history and the alerts are a metrics runtime's, so a daemon whose dashboard signs people in, or that
+    // is told where alerts go, is given one once and after its configuration file, whose own one then counts.
+    if ((metrics_port > 0 && (!config.dashboard_credentials.empty() || !config.dashboard_idp.empty())) ||
+        !config.alert_webhook.empty() || !config.alert_mail.empty() || !config.events.empty())
+        handler.ensure_dashboard_store(paths.state_dir.string());
 
     // After the socket is served and before the loop, so an entry exists only
     // for a daemon that is actually answering.

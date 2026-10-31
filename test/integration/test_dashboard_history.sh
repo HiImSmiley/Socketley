@@ -84,6 +84,29 @@ for _ in $(seq 1 50); do [ "$(hist "runtime=st&range=120&points=12" | j "max(v o
 expect "a daemon started again shows the points from before" "$(hist "runtime=st&range=120&points=12" | j "max(v or 0 for v in d['msg']) > 2")" True
 expect "and no second metrics runtime is made" "$("$BIN" ls | grep -c ' metrics ')" 1
 
+# A configuration file of a fresh daemon that declares its own metrics runtime gets that one, not a second made first.
+daemon_stop
+daemon_isolate dashhist_own
+T2="$SOCKETLEY_TMPD"
+M2=$((SL_PORT_BASE+1952))
+mkdir -p "$T2/runtimes"
+printf '[admin]\nadmin = true\n%s\n' "$ADMIN" > "$T2/creds"
+cat > "$T2/runtimes/metrics.lua" <<EOF
+return { type = "metrics", name = "metrics", port = $((SL_PORT_BASE+1953)), bind = "127.0.0.1", domain = { "watch" },
+         logs = true, start = true }
+EOF
+cat > "$T2/daemon.lua" <<EOF
+daemon = { metrics_port = $M2, dashboard_credentials = "$T2/creds" }
+runtimes = { include "runtimes/metrics.lua" }
+EOF
+export SOCKETLEY_CONFIG="$T2/daemon.lua"
+daemon_start "$BIN"
+for _ in $(seq 1 50); do "$BIN" ls | grep -qE ' metrics .* Up ' && break; sleep 0.1; done
+OWN=$("$BIN" show metrics 2>/dev/null)
+expect "a metrics runtime the configuration file declares is the daemon's, as the file says" \
+    "$(printf '%s' "$OWN" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("domain"), d.get("logs"))' 2>/dev/null) $("$BIN" ls | grep -c ' metrics ')" \
+    "watch True 1"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
