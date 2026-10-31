@@ -19,10 +19,14 @@
 #include <fcntl.h>
 #include <iterator>
 #include <memory>
+#include <poll.h>
 #include <linux/openat2.h>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/sendfile.h>
+#include <sys/uio.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -177,10 +181,11 @@ constexpr uint32_t file_window = 256 * 1024;
 // submit_splice).
 constexpr uint64_t keep_max_file = 256 * 1024;
 constexpr size_t keep_max_total = 64u << 20;
-// Above that a file on a plain connection is spliced, through a pipe this large, since the hand-off is paid per
-// operation and not per byte; and at most this many pipes at once, the server runtime's bound.
-constexpr uint32_t splice_window = 1u << 20;
-constexpr uint32_t max_file_pipes = 256;
+// Above it a file on a plain connection is sent by sendfile from the loop, as much as one call takes up to this much
+// before the loop turns, into a send buffer asked for at this size (the kernel doubles it, to tcp_wmem's 4 MiB here,
+// which is as far as nginx's autotuned sockets grow).
+constexpr uint64_t sendfile_burst = 4u << 20;
+constexpr int file_sndbuf = 2 << 20;
 
 }   // namespace
 
@@ -498,7 +503,11 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, con
         ++m_files_not_modified;
     conn->partial.erase(0, end + 4);
     conn->ex.response_started = true;
+    const bool body = !head_only && (status.starts_with("200") || status.starts_with("206"));
     conn->write_queue.push(std::move(out));
+    // A kept file's bytes go behind its head in the same write, a slice of the one copy every request shares.
+    if (kept && body && length > 0)
+        conn->write_queue.push(socketley::write_chunk(kept, static_cast<uint32_t>(first), static_cast<uint32_t>(length)));
     if (!conn->write_pending && !flush_client_write_queue(conn))
     {
         close_pair(conn->fd, conn->ex.backend_fd);
@@ -511,19 +520,8 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, con
         close_pair(conn->fd, conn->ex.backend_fd);
         return;
     }
-    const bool body = !head_only && (status.starts_with("200") || status.starts_with("206"));
-    // A kept file's bytes are queued behind its head, a slice of the one copy every request shares.
     if (kept)
     {
-        if (body && length > 0)
-        {
-            conn->write_queue.push(socketley::write_chunk(kept, static_cast<uint32_t>(first), static_cast<uint32_t>(length)));
-            if (!conn->write_pending && !flush_client_write_queue(conn))
-            {
-                close_pair(conn->fd, conn->ex.backend_fd);
-                return;
-            }
-        }
         conn->file = std::move(f);
         fcgi_file_next(conn);
         return;
@@ -538,14 +536,12 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, con
         f->keep_stat = st;
     }
     // TLS and a stream frame what they send, so only a plain connection takes the bytes straight from the file.
-    else if (f->left > keep_max_file && conn->ssl == nullptr && conn->h2_parent == nullptr && conn->h3s == nullptr &&
-             *m_file_pipes < max_file_pipes && ::pipe2(f->pipe, O_NONBLOCK | O_CLOEXEC) == 0)
+    else if (f->left > 0 && conn->ssl == nullptr && conn->h2_parent == nullptr && conn->h3s == nullptr)
     {
-        if (::fcntl(f->pipe[0], F_SETPIPE_SZ, static_cast<int>(splice_window)) < 0) {}
-        const int got = ::fcntl(f->pipe[0], F_GETPIPE_SZ);
-        f->pipe_size = got > 0 ? static_cast<uint32_t>(got) : 65536u;
-        f->pipes = m_file_pipes;
-        ++*f->pipes;
+        f->sendfile = true;
+        // The listener's 256 KiB would have each burst stop and wait for room several times a file.
+        if (f->left > keep_max_file &&
+            ::setsockopt(conn->fd, SOL_SOCKET, SO_SNDBUF, &file_sndbuf, sizeof file_sndbuf) < 0) {}
     }
     conn->file = std::move(f);
     fcgi_file_next(conn);
@@ -559,7 +555,7 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn)
     if (f.reading || conn->closing || !m_loop)
         return;
     const bool stream = conn->h2_parent != nullptr || conn->h3s != nullptr;
-    if (f.left == 0 && f.in_pipe == 0)
+    if (f.left == 0)
     {
         if (!stream && (conn->write_pending || !conn->write_queue.empty()))
             return;
@@ -569,21 +565,55 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn)
     }
     const int fd = conn->fd;
     const uint32_t gen = conn->generation;
-    if (f.pipe[0] >= 0)
+    // A burst whose last byte is not in the page cache would hold the loop on the disk, so that window is read through
+    // the ring instead, which also has the kernel read ahead of it.
+    char probe = 0;
+    iovec pv{&probe, 1};
+    const bool cold = f.sendfile &&
+                      ::preadv2(f.fd, &pv, 1, static_cast<off_t>(f.off + std::min(f.left, sendfile_burst) - 1), RWF_NOWAIT) < 0 &&
+                      errno == EAGAIN;
+    if (f.sendfile && !cold)
     {
         // The head goes out first, through the write queue, and nothing else writes to the socket until the file has.
         if (conn->write_pending || !conn->write_queue.empty())
             return;
-        const bool out = f.in_pipe > 0;
-        const auto n = out ? f.in_pipe : static_cast<uint32_t>(std::min<uint64_t>(f.left, f.pipe_size));
+        // sendfile on the loop thread, the way nginx sends a file, where an io_uring splice is a hand-off to an io-wq
+        // worker per operation; non-blocking for the call alone, since the ring's own writes need the socket blocking,
+        // and nothing of the ring runs on it meanwhile (SINGLE_ISSUER, DEFER_TASKRUN).
+        const int flags = ::fcntl(fd, F_GETFL);
+        bool failed = flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0;
+        for (uint64_t budget = sendfile_burst; !failed && f.left > 0 && budget > 0;)
+        {
+            auto off = static_cast<off_t>(f.off);
+            const ssize_t n = ::sendfile(fd, f.fd, &off, static_cast<size_t>(std::min(f.left, budget)));
+            if (n > 0)
+            {
+                f.off += static_cast<uint64_t>(n);
+                f.left -= static_cast<uint64_t>(n);
+                budget -= std::min<uint64_t>(budget, static_cast<uint64_t>(n));
+                stat_add(m_stat_bytes_out, static_cast<uint64_t>(n));
+                continue;
+            }
+            // A file that shrank under the length already on the wire, or a client gone, ends the connection.
+            failed = n == 0 || errno != EAGAIN;
+            break;
+        }
+        if (flags >= 0 && ::fcntl(fd, F_SETFL, flags) < 0)
+            failed = true;
+        if (failed)
+        {
+            conn->file.reset();
+            close_pair(fd, conn->ex.backend_fd);
+            return;
+        }
+        // Room on the socket, or the next turn when the burst ran out, says when to go on; the end of the file is reached
+        // from there too, never from inside the request that began it.
         f.reading = true;
         std::shared_ptr<fcgi_file> keep = conn->file;
-        const auto cb = [this, fd, gen, keep, out](int64_t res) { fcgi_file_spliced(fd, gen, keep, res, out); };
-        if (!(out ? m_files->io.splice(f.pipe[0], socketley::file_io::at_stream, fd, n, cb)
-                  : m_files->io.splice(f.fd, f.off, f.pipe[1], n, cb)))
+        if (!m_files->io.poll(fd, POLLOUT, [this, fd, gen, keep](int64_t res) { fcgi_file_polled(fd, gen, keep, res); }))
         {
             f.reading = false;
-            close_pair(conn->fd, conn->ex.backend_fd);
+            close_pair(fd, conn->ex.backend_fd);
         }
         return;
     }
@@ -646,8 +676,7 @@ void proxy_instance::fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<
     fcgi_file_next(conn);
 }
 
-void proxy_instance::fcgi_file_spliced(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res,
-                                       bool to_socket)
+void proxy_instance::fcgi_file_polled(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res)
 {
     f->reading = false;
     if (!m_loop || fd < 0 || fd >= MAX_FDS || m_conn_idx[fd].side != conn_client)
@@ -655,25 +684,11 @@ void proxy_instance::fcgi_file_spliced(int fd, uint32_t gen, const std::shared_p
     proxy_client_connection* conn = m_conn_idx[fd].client;
     if (conn->generation != gen || conn->file != f || conn->closing)
         return;
-    // A file that shrank, or a client gone, with the length already on the wire: the connection ends.
-    if (res <= 0)
+    if (res < 0 || (res & (POLLERR | POLLHUP)) != 0)
     {
         conn->file.reset();
         close_pair(fd, conn->ex.backend_fd);
         return;
-    }
-    const auto n = static_cast<uint32_t>(res);
-    if (to_socket)
-    {
-        f->in_pipe -= std::min(n, f->in_pipe);
-        stat_add(m_stat_bytes_out, n);
-    }
-    else
-    {
-        const uint64_t got = std::min<uint64_t>(n, f->left);
-        f->in_pipe += static_cast<uint32_t>(got);
-        f->off += got;
-        f->left -= got;
     }
     fcgi_file_next(conn);
 }

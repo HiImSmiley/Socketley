@@ -65,6 +65,9 @@ public:
     // without their passing through this process.
     bool splice(int fd_in, uint64_t off, int fd_out, uint32_t len, done cb);
 
+    // `cb` with the events once `fd` is ready for those in `mask` (POLLOUT, POLLIN), or with a negative errno.
+    bool poll(int fd, unsigned mask, done cb);
+
     // `cb` once `wait` has passed, with 0.
     bool after(std::chrono::nanoseconds wait, done cb);
 
@@ -74,7 +77,7 @@ public:
         return type == op_file_read || type == op_file_write || type == op_fsync ||
                type == op_rename || type == op_unlink || type == op_openat ||
                type == op_mkdir || type == op_link || type == op_connect || type == op_io_splice ||
-               type == op_file_timer;
+               type == op_file_timer || type == op_file_poll;
     }
 
     // Runs the callback of the operation `cqe` completes.

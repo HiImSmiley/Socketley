@@ -101,6 +101,9 @@ bool file_io::submit(op* o)
         case op_file_timer:
             queued = m_loop->submit_timeout(&o->ts, &o->req);
             break;
+        case op_file_poll:
+            queued = m_loop->submit_poll_add(o->fd, static_cast<unsigned>(o->flags), &o->req);
+            break;
         default:
             break;
     }
@@ -271,6 +274,22 @@ bool file_io::after(std::chrono::nanoseconds wait, done cb)
     o->ts.tv_sec  = wait.count() / 1000000000;
     o->ts.tv_nsec = wait.count() % 1000000000;
     o->cb         = std::move(cb);
+    if (!submit(o))
+    {
+        delete o;
+        return false;
+    }
+    m_live.insert(o);
+    return true;
+}
+
+bool file_io::poll(int fd, unsigned mask, done cb)
+{
+    auto* o = new op;
+    o->kind  = op_file_poll;
+    o->fd    = fd;
+    o->flags = static_cast<int>(mask);
+    o->cb    = std::move(cb);
     if (!submit(o))
     {
         delete o;

@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <netinet/udp.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -424,17 +425,18 @@ void endpoint::forward(uint32_t owner, const sockaddr_storage& local, socklen_t 
 {
     if (inbox < 0 || local_len > 255 || remote_len > 255)
         return;
-    std::vector<uint8_t> msg;
-    msg.reserve(2 + local_len + remote_len + len);
-    msg.push_back(static_cast<uint8_t>(remote_len));
-    msg.insert(msg.end(), reinterpret_cast<const uint8_t*>(&remote), reinterpret_cast<const uint8_t*>(&remote) + remote_len);
-    msg.push_back(static_cast<uint8_t>(local_len));
-    msg.insert(msg.end(), reinterpret_cast<const uint8_t*>(&local), reinterpret_cast<const uint8_t*>(&local) + local_len);
-    msg.insert(msg.end(), data, data + len);
+    // The datagram in its five parts, gathered by the kernel rather than copied into one buffer here.
+    uint8_t rl = static_cast<uint8_t>(remote_len), ll = static_cast<uint8_t>(local_len);
+    iovec parts[5] = {{&rl, 1}, {const_cast<sockaddr_storage*>(&remote), remote_len}, {&ll, 1},
+                      {const_cast<sockaddr_storage*>(&local), local_len}, {const_cast<uint8_t*>(data), len}};
     sockaddr_un un{};
-    const socklen_t ul = inbox_addr(port, owner, un);
+    msghdr m{};
+    m.msg_name = &un;
+    m.msg_namelen = inbox_addr(port, owner, un);
+    m.msg_iov = parts;
+    m.msg_iovlen = 5;
     // A shard that is not there, or whose inbox is full, loses the packet as the path would; QUIC sends it again.
-    if (::sendto(inbox, msg.data(), msg.size(), MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&un), ul) > 0)
+    if (::sendmsg(inbox, &m, MSG_DONTWAIT) > 0)
         h->count(event::forwarded);
 }
 

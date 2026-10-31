@@ -5039,9 +5039,12 @@ If\-None\-Match, If\-Modified\-Since, If\-Match and If\-Unmodified\-Since
 under keep\-alive. A file up to 256 KiB is kept in memory after its first GET,
 64 MiB in all, and asked of the disk with one
 .BR statx (2)
-a request, which a file replaced under its name answers; a larger one is
-spliced from the page cache on a plain connection, and read 256 KiB at a time
-over TLS.
+a request, which a file replaced under its name answers; a larger one is sent
+with
+.BR sendfile (2)
+on a plain connection, 4 MiB a turn at most, and read through the ring instead
+of waited on where it is not in the page cache, and over TLS read 256 KiB at a
+time.
 .IP
 A
 .B Proxy

@@ -222,17 +222,13 @@ struct fcgi_file
     uint64_t off{0};
     uint64_t left{0};
     std::string buf;
-    // An operation on the file or the pipe is in flight.
+    // A read of the file, or a wait for room on the socket, is in flight.
     bool reading{false};
-    // Sent file -> pipe -> socket without passing through this process, on a plain HTTP/1.1 connection: the pipe,
-    // what it holds, and the count of such pipes the proxy has open, which this one leaves when it goes.
-    int pipe[2]{-1, -1};
-    uint32_t in_pipe{0};
-    uint32_t pipe_size{0};
+    // Sent by sendfile from the loop, on a plain HTTP/1.1 connection.
+    bool sendfile{false};
     // A whole file read for a GET, which is then kept under this name for the requests after it.
     std::string keep_as;
     struct stat keep_stat{};
-    std::shared_ptr<uint32_t> pipes;
     fcgi_file() = default;
     fcgi_file(const fcgi_file&) = delete;
     fcgi_file& operator=(const fcgi_file&) = delete;
@@ -240,12 +236,6 @@ struct fcgi_file
     {
         if (fd >= 0)
             ::close(fd);
-        if (pipe[0] >= 0)
-            ::close(pipe[0]);
-        if (pipe[1] >= 0)
-            ::close(pipe[1]);
-        if (pipes)
-            --*pipes;
     }
 };
 
@@ -1236,9 +1226,7 @@ private:
                          std::shared_ptr<const std::string> kept = {});
     void fcgi_file_next(proxy_client_connection* conn);
     void fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
-    void fcgi_file_spliced(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res, bool to_socket);
-    // The splice pipes served files hold now, bounded so a burst of downloads cannot take the process's descriptors.
-    std::shared_ptr<uint32_t> m_file_pipes{std::make_shared<uint32_t>(0)};
+    void fcgi_file_polled(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
     // Small files kept whole, as the server runtime keeps them: one statx a request says the bytes are still the
     // file's, where an open, a stat and a read were.
     struct fcgi_kept

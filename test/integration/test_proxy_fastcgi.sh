@@ -210,6 +210,14 @@ r=$(curl -s "$U/escape.php")
 expect "a link out of --root is never the script" "$(j "$(last)" 'd["SCRIPT_FILENAME"]')" "$W/index.php"
 r=$(curl -s "$U/alias.php")
 expect "a link that stays inside is" "$(j "$(last)" 'd["SCRIPT_FILENAME"]')" "$W/alias.php"
+# A script found once is asked of the disk again by inode; what is asked is that it is never one it no longer is.
+printf '<?php\n' > "$W/known.php"; curl -s -o /dev/null "$U/known.php"; curl -s -o /dev/null "$U/known.php"
+rm "$W/known.php"; ln -s "$T/outside/evil.php" "$W/known.php"
+r=$(curl -s "$U/known.php")
+expect "a known script swapped for a link out of --root is no longer the script" "$(j "$(last)" 'd["SCRIPT_FILENAME"]')" "$W/index.php"
+rm "$W/known.php"
+r=$(curl -s "$U/known.php")
+expect "nor one that is gone" "$(j "$(last)" 'd["SCRIPT_NAME"]')" "/index.php"
 r=$(curl -s "$U/uploads/avatar.jpg/x.php")
 expect "an upload asked for as /upload.jpg/x.php is never the script: the index script is" \
     "$(j "$(last)" 'd["SCRIPT_FILENAME"]')" "$W/index.php"
@@ -244,6 +252,10 @@ expect "a large file arrives whole, a window at a time as a slow client takes it
     "$(sha256sum < "$T/v.out" | cut -c1-16)" "$(sha256sum < "$W/uploads/video.mp4" | cut -c1-16)"
 expect "and a range far into it is its bytes" "$(curl -s -r 2500000-2500009 "$U/uploads/video.mp4" | od -An -tx1 | tr -d ' \n')" \
     "$(dd if="$W/uploads/video.mp4" bs=1 skip=2500000 count=10 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)' \
+    "$W/uploads/video.mp4"
+expect "a large file out of the page cache arrives whole, read through the ring rather than waited on" \
+    "$(curl -s "$U/uploads/video.mp4" | sha256sum | cut -c1-16)" "$(sha256sum < "$W/uploads/video.mp4" | cut -c1-16)"
 expect "a large range is its bytes, sent straight from the file" \
     "$(curl -s -r 1000000-1999999 "$U/uploads/video.mp4" | sha256sum | cut -c1-16)" \
     "$(dd if="$W/uploads/video.mp4" bs=1000000 skip=1 count=1 2>/dev/null | sha256sum | cut -c1-16)"
