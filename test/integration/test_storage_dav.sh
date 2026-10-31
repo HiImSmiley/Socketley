@@ -329,9 +329,17 @@ print("bad=%s unique=%s test=%s size=%s contents=%s" % (bad, len(set(names)) == 
       os.path.getsize(sys.argv[1]) == int(sys.argv[2]), contents))
 ZEOF
 }
-for k in 'z/../../evil.txt' 'z/./dot.txt' 'z//double.txt' 'z/double.txt' 'z/back%5Cslash.txt' 'z/a/../a.txt' 'z/a.txt' 'z/ctrl%01name.txt'; do
-    printf '%s' "$k" | curl -s -m 30 --path-as-is --aws-sigv4 "aws:amz:us-east-1:s3" -u "$A" -T - -o /dev/null "$U/docs/$k"
-done
+# Put by boto3, which sends a key's path as it is; curl 8.18 refuses --aws-sigv4 beside --path-as-is.
+python3 - "$U" "${A%%:*}" "${A#*:}" 'z/../../evil.txt' 'z/./dot.txt' 'z//double.txt' 'z/double.txt' 'z/back%5Cslash.txt' 'z/a/../a.txt' 'z/a.txt' 'z/ctrl%01name.txt' <<'PEOF'
+import sys, boto3, urllib.parse
+from botocore.config import Config
+u, key, secret = sys.argv[1:4]
+s3 = boto3.client("s3", endpoint_url=u, aws_access_key_id=key, aws_secret_access_key=secret, region_name="us-east-1",
+                  config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+# A %XX in a name is the byte curl's URL carried: a backslash, a control character.
+for k in sys.argv[4:]:
+    s3.put_object(Bucket="docs", Key=urllib.parse.unquote(k), Body=k.encode())
+PEOF
 len=$(curl -s -u "$A" -o "$T/z.zip" -D - "$U/~dav/docs/z/?zip" | grep -i '^content-length' | tr -d '\r' | cut -d' ' -f2)
 check "a ZIP's names stay inside the folder, plain, and each once, and each holds its key's object" "$(zipsafe "$T/z.zip" "$len")" \
       "bad=[] unique=True test=None size=True contents=['z/../../evil.txt', 'z/./dot.txt', 'z//double.txt', 'z/a.txt', 'z/a/../a.txt', 'z/back%5Cslash.txt', 'z/ctrl%01name.txt', 'z/double.txt']"

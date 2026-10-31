@@ -100,24 +100,87 @@ suite_ns_run() {   # root file -> the file's exit, run in namespaces of its own 
     # before the file runs, so it is the user it would be on the host: a file of mode 000 is refused to it.
     unshare --user --map-current-user --keep-caps --net --mount --pid --fork --mount-proc --kill-child -- bash -c '
         ip link set lo up || exit 2
-        # An address that is not loopback, which a test of what reaches this machine from elsewhere needs.
-        ip link add sl0 type dummy 2>/dev/null && ip addr add 192.0.2.1/24 dev sl0 && ip link set sl0 up
+        # An address that is not loopback, which a test of what reaches this machine from elsewhere needs, in the
+        # benchmarking range no test names: 192.0.2.x is what tests use for an address the host does not have.
+        ip link add sl0 type dummy 2>/dev/null && ip addr add 198.18.0.1/24 dev sl0 && ip link set sl0 up
         mount --bind "$1" /tmp || exit 2
         export HOME=/tmp/home SOCKETLEY_SOCKET=/tmp/suite.sock
         mkdir -p "$HOME"
         exec setpriv --inh-caps=-all --ambient-caps=-all bash "$2"' _ "$dir" "$2"
 }
 
-# A job waits to start while less than `bytes` of memory is free, so as many run
-# as the machine holds at that moment rather than as a guess made at the start.
-suite_wait_memory() {   # bytes
-    local free
-    for _ in $(seq 1 600); do
-        free=$(awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo)
-        [ "$free" -ge "$1" ] && return 0
-        sleep 1
+# ─── A memory budget the suites on the machine share ────────────────────────
+# A sanitizer process grows to some 400 MiB in its first seconds, so memory free
+# at a job's start says nothing about what it will hold: twenty-eight files let
+# in at once grew past the machine and the OOM killer took the gate.  So a job
+# reserves what it held at its peak the last time, or a default for its build,
+# from a budget of the machine's memory less a margin, and starts only once the
+# reservations held fit; the first is always let in.  A sampler records each
+# job's peak (its processes' anonymous memory and swap, found by the tag they
+# inherit) for the next run.
+SUITE_MEM_RECORD="${SUITE_MEM_RECORD:-/var/tmp/socketley-test-memory-$(id -u)-${SOCKETLEY_CONFIG:-Release}}"
+SUITE_BUDGET_FILE="/tmp/socketley-suite-budget-$(id -u)"
+
+suite_mem_need() {   # name -> kB to reserve
+    local kb
+    kb=$(awk -v n="$1" '$2 == n { print $1; exit }' "$SUITE_MEM_RECORD" 2>/dev/null)
+    [ -n "$kb" ] || { [ "${SOCKETLEY_CONFIG:-Release}" = Sanitize ] && kb=1600000 || kb=500000; }
+    echo $(( kb + kb / 5 + 50000 ))
+}
+
+suite_budget_reserve() {   # kB
+    local budget held
+    budget=$(awk '/^MemTotal:/ { print $2 - 3145728 }' /proc/meminfo)
+    exec 8>"$SUITE_BUDGET_FILE.lock"
+    while :; do
+        flock 8
+        held=$(cat "$SUITE_BUDGET_FILE" 2>/dev/null || echo 0)
+        if [ "$held" -le 0 ] || [ $((held + $1)) -le "$budget" ]; then
+            echo $((held + $1)) > "$SUITE_BUDGET_FILE"
+            flock -u 8; exec 8>&-
+            return 0
+        fi
+        flock -u 8
+        sleep 0.5
     done
-    return 0
+}
+
+suite_budget_release() {   # kB
+    local held
+    exec 8>"$SUITE_BUDGET_FILE.lock"
+    flock 8
+    held=$(cat "$SUITE_BUDGET_FILE" 2>/dev/null || echo 0)
+    held=$((held - $1)); [ "$held" -lt 0 ] && held=0
+    echo "$held" > "$SUITE_BUDGET_FILE"
+    flock -u 8; exec 8>&-
+}
+
+# Every two seconds, each tagged job's processes summed and its peak kept in `dir`/<tag>.mem.
+suite_mem_sampler() {   # dir
+    local dir=$1 d tag kb
+    while :; do
+        declare -A now=()
+        for d in /proc/[0-9]*; do
+            tag=$( { tr '\0' '\n' <"$d/environ"; } 2>/dev/null | sed -n 's/^SUITE_FILE_TAG=//p' )
+            [ -n "$tag" ] || continue
+            kb=$(awk '/^(RssAnon|VmSwap):/ { s += $2 } END { print s + 0 }' "$d/status" 2>/dev/null)
+            now[$tag]=$(( ${now[$tag]:-0} + ${kb:-0} ))
+        done
+        for tag in "${!now[@]}"; do
+            [ "${now[$tag]}" -gt "$(cat "$dir/$tag.mem" 2>/dev/null || echo 0)" ] && echo "${now[$tag]}" > "$dir/$tag.mem"
+        done
+        unset now
+        sleep 2
+    done
+}
+
+suite_save_memory() {   # dir -> its <tag>.mem merged into the record
+    local tmp
+    tmp=$(mktemp "${SUITE_MEM_RECORD}.XXXXXX") || return 0
+    { cat "$SUITE_MEM_RECORD" 2>/dev/null
+      for f in "$1"/*.mem; do [ -f "$f" ] && echo "$(cat "$f") $(basename "$f" .mem)"; done
+    } | awk '{ kb[$2] = $1 } END { for (k in kb) print kb[k], k }' > "$tmp"
+    mv -f "$tmp" "$SUITE_MEM_RECORD"
 }
 
 # Commands run side by side, a line of the list each, `name<TAB>command`, the
@@ -125,13 +188,17 @@ suite_wait_memory() {   # bytes
 suite_run_jobs() {   # list dir parallel
     local list=$1 dir=$2 par=$3
     export SUITE_JOB_DIR="$dir"
+    export -f suite_mem_need suite_budget_reserve suite_budget_release
+    export SUITE_MEM_RECORD SUITE_BUDGET_FILE SOCKETLEY_CONFIG
     awk -F'\t' '{ print $1 }' "$list" | while IFS= read -r name; do
         printf '%s\0' "$name"
     done | xargs -0 -I{} -P"$par" bash -c '
         name=$1
         cmd=$(awk -F"\t" -v n="$name" "\$1 == n { print \$2; exit }" "$2")
+        need=$(suite_mem_need "$name"); suite_budget_reserve "$need"
         t0=$(date +%s)
-        bash -c "$cmd" > "$SUITE_JOB_DIR/$name.log" 2>&1
+        SUITE_FILE_TAG="$name" bash -c "$cmd" > "$SUITE_JOB_DIR/$name.log" 2>&1
         echo $? > "$SUITE_JOB_DIR/$name.rc"
+        suite_budget_release "$need"
         echo $(( $(date +%s) - t0 )) > "$SUITE_JOB_DIR/$name.secs"' _ {} "$list"
 }

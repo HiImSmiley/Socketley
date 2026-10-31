@@ -12,6 +12,9 @@
 #   * --scrub taking what is no duration
 # suite: isolated
 set -uo pipefail
+# Clients as before botocore 1.36, which sent and checked checksums only where S3 required them: it reads objects it damaged on purpose, which a client checking every answer's checksum refuses to hand over.
+# An older botocore ignores these and already is that client.
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")

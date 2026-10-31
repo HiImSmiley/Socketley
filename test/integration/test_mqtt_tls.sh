@@ -35,13 +35,16 @@ printf 'alicepass1\n' | "$BIN" mqtt-passwd "$T/users" alice >/dev/null 2>&1
 # A CA, the broker's certificate, a device's, and one of another CA.
 (
     cd "$T"
-    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=test-ca" -keyout ca.key -out ca.pem
+    # A CA as a strict verifier wants one, its key usage said: Python 3.13 and later refuse one that says none.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=test-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -keyout ca.key -out ca.pem
     openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout srv.key -out srv.csr
     printf 'subjectAltName=IP:127.0.0.1\n' > srv.ext
     openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile srv.ext -out srv.pem
     openssl req -newkey rsa:2048 -nodes -subj "/CN=device-7" -keyout dev.key -out dev.csr
     openssl x509 -req -in dev.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -out dev.pem
-    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=other-ca" -keyout other.key -out other.pem
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=other-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -keyout other.key -out other.pem
     openssl req -newkey rsa:2048 -nodes -subj "/CN=intruder" -keyout bad.key -out bad.csr
     openssl x509 -req -in bad.csr -CA other.pem -CAkey other.key -CAcreateserial -days 2 -out bad.pem
 ) >/dev/null 2>&1

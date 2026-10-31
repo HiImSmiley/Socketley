@@ -36,6 +36,7 @@ import hashlib
 import http.client
 import json
 import os
+from lib_disk import counts_writes
 import re
 import signal
 import socket
@@ -349,8 +350,12 @@ def mode_main(port, data):
     w0 = write_bytes()
     up, r = mpu(s3, "mp", p, create={"ServerSideEncryption": "AES256"})
     ratio = (write_bytes() - w0) / len(whole)
-    check("an encrypted upload of equal parts is sealed where the object needs it, written once (%.3fx)" % ratio,
-          0.95 <= ratio <= 1.10, ratio)
+    # On tmpfs, where /tmp is on some machines, nothing written is counted, and the ratio says nothing.
+    if counts_writes(data):
+        check("an encrypted upload of equal parts is sealed where the object needs it, written once (%.3fx)" % ratio,
+              0.95 <= ratio <= 1.10, ratio)
+    else:
+        print("  SKIP: written once -- %s is on tmpfs, which counts no writes" % data)
     check("CreateMultipartUpload with AES256 is answered with it", up.get("ServerSideEncryption") == "AES256", up)
     check("CompleteMultipartUpload says AES256", r.get("ServerSideEncryption") == "AES256", r)
     g = s3.get_object(Bucket=B, Key="mp")
@@ -371,7 +376,10 @@ def mode_main(port, data):
     mpu(s3, "mpcopy", q, create={"ServerSideEncryption": "AES256"})
     wq = b"".join(q)
     ratio = (write_bytes() - w0) / len(wq)
-    check("and one of unequal parts is copied, sealed bytes as they are (%.3fx)" % ratio, 1.8 <= ratio <= 2.2, ratio)
+    if counts_writes(data):
+        check("and one of unequal parts is copied, sealed bytes as they are (%.3fx)" % ratio, 1.8 <= ratio <= 2.2, ratio)
+    else:
+        print("  SKIP: copied once -- %s is on tmpfs, which counts no writes" % data)
     check("an encrypted upload of unequal parts reads back whole",
           s3.get_object(Bucket=B, Key="mpcopy")["Body"].read() == wq)
     check("and its second part by number", s3.get_object(Bucket=B, Key="mpcopy", PartNumber=2)["Body"].read() == q[1])

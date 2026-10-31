@@ -46,6 +46,9 @@
 #
 # The assertions live in lib_storage_sse.py, which prints one line each.
 set -uo pipefail
+# Clients as before botocore 1.36, which sent and checked checksums only where S3 required them: it checks what the server keeps for an upload that carries no checksum, which a client sending CRC32 on every upload never makes.
+# An older botocore ignores these and already is that client.
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")

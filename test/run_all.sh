@@ -24,9 +24,10 @@ fi
 [ -x "$SYS_BIN" ] || { echo "ERROR: socketley not found (tried \$SOCKETLEY_BIN, $BIN_DIR/, PATH)"; exit 1; }
 SYS_BIN=$(readlink -f "$SYS_BIN")
 echo "Testing binary: $SYS_BIN"
-# A smaller quarantine for the sanitizer build's processes, so many files fit in memory side by side; a freed block
-# is still held back 64 MiB long in each process.
-[ "$SOCKETLEY_CONFIG" = Sanitize ] && export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}quarantine_size_mb=64"
+# A smaller quarantine, shorter stacks kept for reports and freed memory given back sooner, for the sanitizer build's
+# processes, so more files fit in memory side by side; a freed block is still held back 16 MiB long in each.
+[ "$SOCKETLEY_CONFIG" = Sanitize ] &&
+    export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}quarantine_size_mb=16:malloc_context_size=10:allocator_release_to_os_interval_ms=500"
 
 # ─── A port window of this run's own ────────────────────────────────────────
 # The port window is claimed once and exported, held for the whole run so two
@@ -130,6 +131,10 @@ run_test() {
 # The jobs suite_run_jobs ran, their output in the list's order, each red one run again alone: green alone is
 # counted as passed and named at the end, since a race that load exposes is still a race.
 . "$SCRIPT_DIR/lib_suite.sh"
+# The peaks this run's jobs reach, sampled throughout and kept for the next run's reservations.
+MEMDIR=$(mktemp -d)
+suite_mem_sampler "$MEMDIR" & SAMPLER_PID=$!
+trap 'kill "$SAMPLER_PID" 2>/dev/null; cleanup' EXIT
 ALONE_ONLY=""
 report_jobs() {   # list dir
     local name cmd
@@ -377,7 +382,6 @@ fi
 if [ -n "$NS_ROOT" ]; then
     # Started while the memory they need is free, rather than counted from a guess at the start.
     PAR="${SUITE_PAR:-$CORES}"
-    if [ "$SOCKETLEY_CONFIG" = Sanitize ]; then export SUITE_START_FREE=$((3 << 30)); else export SUITE_START_FREE=$((1 << 30)); fi
 else
     PAR="${SUITE_PAR:-$(suite_free_windows)}"
     [ "$PAR" -gt "$CORES" ] && PAR=$CORES
@@ -393,7 +397,8 @@ export SOCKETLEY_SUITE_RUN="$SUITE_HOME"
 run_one_parallel() {   # file -> its log, exit code and seconds in RESDIR
     local f=$1 name t0 rc tries=0
     name=$(basename "$f")
-    [ -n "${SUITE_START_FREE:-}" ] && suite_wait_memory "$SUITE_START_FREE"
+    local need; need=$(suite_mem_need "$name"); suite_budget_reserve "$need"
+    export SUITE_FILE_TAG="$name"
     t0=$(date +%s)
     # A file that counts the machine's CPUs gets all of them back, whatever cores this pass was given.
     grep -q '^# suite: all-cpus' "$f" && taskset -cp "0-$(( $(nproc --all) - 1 ))" $$ >/dev/null
@@ -415,8 +420,10 @@ run_one_parallel() {   # file -> its log, exit code and seconds in RESDIR
     done
     echo "$rc" > "$RESDIR/$name.rc"
     echo $(( $(date +%s) - t0 )) > "$RESDIR/$name.secs"
+    suite_budget_release "$need"
 }
-export -f run_one_parallel suite_wait_memory
+export -f run_one_parallel suite_mem_need suite_budget_reserve suite_budget_release
+export SUITE_MEM_RECORD SUITE_BUDGET_FILE
 export RESDIR
 
 if [ "$PAR" -gt 1 ]; then
@@ -463,6 +470,7 @@ while IFS= read -r script; do
     check_leaked_daemons "$name"
 done < <(sort "$SERIAL_LIST")
 suite_save_durations "$RESDIR"
+kill "$SAMPLER_PID" 2>/dev/null; suite_save_memory "$MEMDIR"; rm -rf "$MEMDIR"
 rm -rf "$PAR_LIST" "$SERIAL_LIST" "$QUIET_LIST" "$RESDIR"
 [ -n "$NS_ROOT" ] && rm -rf "$NS_ROOT"
 

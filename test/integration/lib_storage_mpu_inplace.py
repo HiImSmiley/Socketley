@@ -16,6 +16,7 @@ runtime's shards, in order.  Prints one PASS or FAIL line per assertion and a
 final "Results:" line, and exits with the number of failures.
 """
 import hashlib
+from lib_disk import counts_writes
 import http.client
 import json
 import os
@@ -209,8 +210,11 @@ def mode_bytes(data, nodes, pids):
     print("  info: %d MiB stored in %d parts of %d MiB, the workers wrote %.1f MiB (%.3fx)" %
           (total // MiB, nparts, size // MiB, (after - before) / MiB, ratio))
     check("an upload of equal parts completes", status == 200, status)
-    check("its bytes are written once, not copied at the end (%.3fx the object, at most 1.10x)" % ratio,
-          0.95 <= ratio <= 1.10, ratio)
+    if counts_writes(data):
+        check("its bytes are written once, not copied at the end (%.3fx the object, at most 1.10x)" % ratio,
+              0.95 <= ratio <= 1.10, ratio)
+    else:
+        print("  SKIP: written once -- %s is on tmpfs, which counts no writes" % data)
     object_is(nodes, "bytes/a", parts, "bytes")
     check("nothing is left of the upload", wait_for(lambda: not os.path.exists(upload_dir(data, uid))))
     check("and nothing in tmp/", wait_for(lambda: tmp_files(data) == []), tmp_files(data))
@@ -428,7 +432,7 @@ def mode_shards(data, nodes, pids):
     ratio = (after - before) / (64 * MiB)
     print("  info: 64 MiB through %d shards, their workers wrote %.1f MiB (%.3fx)" % (n, (after - before) / MiB, ratio))
     check("on %d shards an upload of equal parts is written once too (%.3fx, at most 1.10x)" % (n, ratio),
-          status == 200 and 0.95 <= ratio <= 1.10, (status, ratio))
+          status == 200 and (0.95 <= ratio <= 1.10 or not counts_writes(data)), (status, ratio))
     object_is(nodes[:1], "sh/bytes", parts, "shards bytes")
     check("nothing is left in tmp/", wait_for(lambda: tmp_files(data) == []), tmp_files(data))
 

@@ -189,7 +189,10 @@ if [ "$SANITIZED" = 1 ]; then
 else
 THREE=$(peak_added_during three)
 MULT=$(awk -v a="${ONE:-0}" -v b="${THREE:-0}" 'BEGIN{printf "%.2f", (a>0? b/a : 99)}')
-if under "$MULT" 2 && cmp -s "$WWW/big.bin" "$WORK/g3"; then
+# A factor, or, where one request added next to nothing to measure against, the difference against the allowance
+# above: two more requests holding the body would add two files' worth.
+MORE=$(awk -v a="${ONE:-0}" -v b="${THREE:-0}" 'BEGIN{d=b-a; print (d>0?d:0)}')
+if { under "$MULT" 2 || [ "$MORE" -lt "$ALLOW" ]; } && cmp -s "$WWW/big.bin" "$WORK/g3"; then
     echo "  three at once added ${MULT}x what one added (${THREE} kB)"
     pass
 else fail "three at once do not multiply the memory" \
