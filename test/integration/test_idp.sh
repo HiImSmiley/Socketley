@@ -728,7 +728,8 @@ expect "but to one under the cookie domain" \
 
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
-STATS=$("$BIN" stats auth 2>/dev/null)
+# The worker started again reports at its first tick, and until then `stats` says it has not.
+for _ in $(seq 1 50); do STATS=$("$BIN" stats auth 2>/dev/null); case "$STATS" in *worker_report:none*) sleep 0.1 ;; *) break ;; esac; done
 case "$STATS" in *"accounts:14"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"

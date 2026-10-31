@@ -7752,7 +7752,10 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
     }
 
     if (!any)
+    {
+        inst->forget_worker_stats();
         return;
+    }
 
     inst->m_stat_total_connections.store(sum.total_connections, std::memory_order_relaxed);
     inst->m_stat_total_messages.store(sum.total_messages, std::memory_order_relaxed);

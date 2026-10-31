@@ -451,6 +451,15 @@ public:
         m_worker_backed.store(true, std::memory_order_release);
     }
 
+    // A worker started again has not reported yet, so `stats` says so rather than show the last one's figures.
+    void forget_worker_stats()
+    {
+        if (!m_worker_backed.exchange(false, std::memory_order_acq_rel))
+            return;
+        std::lock_guard<std::mutex> lock(m_stat_detail_mutex);
+        m_stat_detail.clear();
+    }
+
     // True once a worker has reported at least once, an atomic rather than
     // something under m_stat_detail_mutex because an in-process proxy reads it
     // on its own accept path.
