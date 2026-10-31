@@ -306,6 +306,8 @@ function crumbs(parts) {
 // ─── figures ────────────────────────────────────────────────────────────────
 async function poll() {
   clearTimeout(timer);
+  // A tab nobody looks at asks for nothing, and asks at once when it is looked at again.
+  if (document.hidden) return;
   try {
     const [o, r, al] = await Promise.all([api('GET', '/api/overview').then(must).then(x => x.json()), api('GET', '/api/runtimes').then(must).then(x => x.json()),
       api('GET', '/api/alerts').then(x => x.ok ? x.json() : alerts).catch(() => alerts)]);
@@ -328,6 +330,7 @@ async function poll() {
   } catch (e) { if (me) toast(e.message, 'bad'); }
   if (me) timer = setTimeout(poll, 2000);
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && me) poll(); });
 // The names an entrance sends to each runtime, read seldom: routes change with a configuration, not with the figures.
 let hosts = {}, hostsAt = 0;
 // A wildcard stands for every host under it and names no page of its own, so it opens nothing.
@@ -726,7 +729,7 @@ function logsView() {
     el('div', { class: 'logbar' }, rt, lv, q, quietRow, pause), box);
   const tick = async () => {
     if (logState !== st || view.at !== 'logs') return;
-    if (!st.paused) await tailInto(box, st, rt.value, 2000, lv.value, q.value, quiet.checked);
+    if (!st.paused && !document.hidden) await tailInto(box, st, rt.value, 2000, lv.value, q.value, quiet.checked);
     clearTimeout(st.t); st.t = setTimeout(tick, 2000);
   };
   tick();
