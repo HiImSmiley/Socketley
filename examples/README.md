@@ -76,6 +76,8 @@ examples/
   `https://` backend whose chain and name are verified
 - `multi-backend.lua` + `multi-backend-handler.lua` - Method- and path-based
   backend selection. Needs `--strategy lua`; the config sets it
+- `php-site.sh` - A PHP site: php-fpm by FastCGI for the scripts, the proxy
+  itself for the files, `index.php` as the front controller
 
 ### Cache
 - `basic-cache.sh` - In-memory key-value store

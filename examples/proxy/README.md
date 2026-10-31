@@ -74,6 +74,10 @@ undeclared method at the edge with `405` and an `Allow` header. Declared in the
 handler's script, not on the proxy — a method list written down in two runtimes
 is one truth in two places, and two places drift.
 
+### PHP Site
+`./php-site.sh <domain> <document root>` -- `--backend fastcgi://unix:/run/php/php-fpm.sock --root <dir>`: scripts run
+by php-fpm, the site's other files served by the proxy, every other path to `index.php`.
+
 ## Key Concepts
 
 ### Path-Based Routing (HTTP Mode)

@@ -253,6 +253,12 @@ proxy_instance::~proxy_instance()
     close_tracked(m_listen_fd);
     if (m_fcgi_root_fd >= 0)
         ::close(m_fcgi_root_fd);
+    // A read still owed writes into a window its pump holds, so a pump with one in flight is left to the process.
+    if (m_files && m_files->io.inflight() > 0)
+    {
+        fcgi_file_pump* owed = m_files.release();
+        static_cast<void>(owed);
+    }
 
     // Close any pooled backend connections, and free the sessions the
     // encrypted ones hold — the pool owns both.
@@ -285,6 +291,7 @@ void proxy_client_connection::reset(int new_fd)
     generation = next_io_generation();
     connect_reattempted = false;
     fd = new_fd;
+    file.reset();
     // client_pool_release() already did this, repeated because a struct
     // leaving the pool must not carry the previous connection's session.
     tls_context::free_ssl(ssl);
@@ -433,6 +440,7 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     if (SOCKETLEY_UNLIKELY(conn->h3s != nullptr))
         h3_child_gone(conn.get());
     conn->h2.reset();
+    conn->file.reset();
     // The splice pipes go back to the kernel here even when the struct does
     // not, and close_tracked() is what makes that safe: a pipe number is
     // reissued as readily as a socket number.
@@ -1137,6 +1145,11 @@ bool proxy_instance::client_backpressured(const proxy_backend_connection* conn) 
 
 void proxy_instance::resume_stream_backend(proxy_client_connection* child)
 {
+    if (SOCKETLEY_UNLIKELY(child->file != nullptr))
+    {
+        fcgi_file_next(child);
+        return;
+    }
     if (child->closing || child->connect_pending || child->ex.backend_fd < 0 || child->ex.backend_fd >= MAX_FDS)
         return;
     const int bfd = child->ex.backend_fd;
@@ -2006,6 +2019,8 @@ bool proxy_instance::setup(event_loop& loop)
         }
         if (!open_fcgi_root())
             return false;
+        if (!m_files && m_loop)
+            m_files = std::make_unique<fcgi_file_pump>(*m_loop);
         // An HTTP probe is a request php-fpm cannot read, so its health is whether it takes a connection.
         if (m_mesh.health_check == mesh_config::health_http)
             m_mesh.health_check = mesh_config::health_tcp;
@@ -2460,6 +2475,18 @@ void proxy_instance::teardown(event_loop& /*loop*/)
             owed[0] = &m_health_timeout_timer->req;
             retire(std::shared_ptr<void>(std::move(m_health_timeout_timer)), owed, 1);
         }
+    }
+
+    // The file reads go with the run, and the next one starts a pump of its own.
+    if (m_files && m_loop)
+    {
+        m_loop->deregister_owner(m_files.get());
+        if (m_files->io.inflight() > 0)
+        {
+            fcgi_file_pump* owed = m_files.release();
+            static_cast<void>(owed);
+        }
+        m_files.reset();
     }
 
     m_idle_sweep_armed = false;
@@ -10075,6 +10102,11 @@ std::string proxy_instance::stats_lines() const
     st::put(out, "peak_connections", m_peak_connections);
     st::put(out, "backend_responses", m_backend_responses);
     st::put(out, "backend_failures", m_backend_failures);
+    if (m_fastcgi)
+    {
+        st::put(out, "files_served", m_files_served);
+        st::put(out, "files_not_modified", m_files_not_modified);
+    }
     m_lat_connect.put(out, "connect_latency");
     if (m_protocol == protocol_http)
     {
@@ -11152,6 +11184,8 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
 
     if (SOCKETLEY_UNLIKELY(conn->h2 != nullptr))
         h2_wrote(conn);
+    if (SOCKETLEY_UNLIKELY(conn->file != nullptr))
+        fcgi_file_next(conn);
 
     // Backpressure resume: if client write queue drained below threshold, restart backend reads
     if (conn->write_queue.bytes() < write_watermark_bytes() &&

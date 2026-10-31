@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <iterator>
+#include <memory>
 #include <linux/openat2.h>
 #include <string>
 #include <string_view>
@@ -24,7 +26,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "../../shared/http/conditional.h"
 #include "../../shared/http/fastcgi.h"
+#include "../../shared/http/mime.h"
 #include "../../shared/http/status.h"
 #include "../../shared/http/url.h"
 #include "../../shared/net/peer_address.h"
@@ -141,6 +145,32 @@ void append_chunk(std::string& out, std::string_view data)
     out += "\r\n";
 }
 
+// A file a site keeps beside its pages and never means to hand out: a script's source by another name, an editor's or
+// a deploy's leftover copy, a dump or an include -- each a classic way a database password reaches the public.
+bool private_name(std::string_view rel)
+{
+    const size_t slash = rel.rfind('/');
+    const std::string_view name = slash == std::string_view::npos ? rel : rel.substr(slash + 1);
+    if (name.ends_with('~'))
+        return true;
+    std::string lower(name);
+    for (char& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find(".php.") != std::string::npos)
+        return true;
+    const size_t dot = lower.rfind('.');
+    if (dot == std::string::npos)
+        return false;
+    const std::string_view ext = std::string_view(lower).substr(dot + 1);
+    static constexpr std::string_view never[] = {"bak", "old", "orig", "save", "swp", "swo", "tmp", "inc", "sql",
+                                                 "ini", "log", "phtml", "phar", "phps", "php3", "php4", "php5",
+                                                 "php7", "php8", "dist"};
+    return std::find(std::begin(never), std::end(never), ext) != std::end(never);
+}
+
+// The largest read of a served file, and so the most of it this proxy holds per connection above the write queue.
+constexpr uint32_t file_window = 256 * 1024;
+
 }   // namespace
 
 void proxy_instance::set_root(std::string_view dir)
@@ -180,15 +210,14 @@ bool proxy_instance::open_fcgi_root()
     return true;
 }
 
-// Whether `rel`, a path under --root without its leading slash, is a regular file beneath it; `dir` says a directory.
-bool proxy_instance::fcgi_regular(std::string_view rel, bool& dir) const
+// `rel`, a path under --root without its leading slash, opened beneath it with `flags`, and its stat; -1 if it is not.
+int proxy_instance::fcgi_open(std::string_view rel, int flags, struct stat& st) const
 {
-    dir = false;
     if (m_fcgi_root_fd < 0)
-        return false;
+        return -1;
     const std::string path = rel.empty() ? std::string(".") : std::string(rel);
     struct open_how how{};
-    how.flags = static_cast<uint64_t>(O_PATH | O_CLOEXEC);
+    how.flags = static_cast<uint64_t>(flags | O_CLOEXEC);
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
     long r = ::syscall(__NR_openat2, m_fcgi_root_fd, path.c_str(), &how, sizeof how);
     // An absolute link is refused by RESOLVE_BENEATH wherever it points, so it is followed and kept when it stays in.
@@ -197,16 +226,30 @@ bool proxy_instance::fcgi_regular(std::string_view rel, bool& dir) const
         char real[PATH_MAX];
         if (!::realpath((m_fcgi_root + "/" + path).c_str(), real) ||
             !std::string_view(real).starts_with(m_fcgi_root_real + "/"))
-            return false;
-        r = ::open(real, O_PATH | O_CLOEXEC);
+            return -1;
+        r = ::open(real, flags | O_CLOEXEC);
     }
     if (r < 0)
-        return false;
+        return -1;
+    if (::fstat(static_cast<int>(r), &st) != 0)
+    {
+        ::close(static_cast<int>(r));
+        return -1;
+    }
+    return static_cast<int>(r);
+}
+
+// Whether `rel` is a regular file beneath --root; `dir` says a directory.
+bool proxy_instance::fcgi_regular(std::string_view rel, bool& dir) const
+{
     struct stat st{};
-    const bool ok = ::fstat(static_cast<int>(r), &st) == 0;
-    ::close(static_cast<int>(r));
-    dir = ok && S_ISDIR(st.st_mode);
-    return ok && S_ISREG(st.st_mode);
+    const int fd = fcgi_open(rel, O_PATH, st);
+    dir = false;
+    if (fd < 0)
+        return false;
+    ::close(fd);
+    dir = S_ISDIR(st.st_mode);
+    return S_ISREG(st.st_mode);
 }
 
 bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_view path)
@@ -271,10 +314,19 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
         if (fcgi_regular(index, d2))
             return take("/" + index, {});
     }
-    // An existing file that is no script is the site's own, which only the root may serve and never the interpreter.
+    // An existing file that is no script is the site's own, served from here and never handed to the interpreter.
     if (file)
     {
-        send_error(conn, "404 Not Found", "Not Found\n");
+        struct stat st{};
+        const int ffd = m_files && !private_name(rel) ? fcgi_open(rel, O_RDONLY, st) : -1;
+        if (ffd < 0 || !S_ISREG(st.st_mode))
+        {
+            if (ffd >= 0)
+                ::close(ffd);
+            send_error(conn, "404 Not Found", "Not Found\n");
+            return false;
+        }
+        fcgi_serve_file(conn, ffd, st, rel);
         return false;
     }
     // Nothing at the path: the index script answers it, as a front controller does every route it was not given.
@@ -283,6 +335,195 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
         return take("/" + m_fcgi_index, {});
     send_error(conn, "404 Not Found", "Not Found\n");
     return false;
+}
+
+// The answer for a file of the site's own: its preconditions (RFC 9110 13), a single range (14), and then its bytes
+// a window at a time as the client takes them; under keep-alive, so a page's assets share the connection its page came
+// on.
+void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, const struct stat& st, std::string_view rel)
+{
+    auto f = std::make_shared<fcgi_file>();
+    f->fd = ffd;
+    const size_t end = conn->partial.find("\r\n\r\n");
+    parsed_head h;
+    if (end == std::string::npos || !parse_head(std::string_view(conn->partial).substr(0, end + 4), h))
+    {
+        send_error(conn, "400 Bad Request", "Bad Request\n");
+        return;
+    }
+    const bool head_only = h.method == "HEAD";
+    if (!head_only && h.method != "GET")
+    {
+        send_error(conn, "405 Method Not Allowed", "Method Not Allowed\n", true, "Allow: GET, HEAD\r\n");
+        return;
+    }
+
+    const auto size = static_cast<uint64_t>(st.st_size);
+    const int64_t mtime = static_cast<int64_t>(st.st_mtim.tv_sec);
+    char tag[64];
+    const int tn = std::snprintf(tag, sizeof tag, "%llx-%lx-%llx", static_cast<unsigned long long>(st.st_mtim.tv_sec),
+                                 static_cast<unsigned long>(st.st_mtim.tv_nsec), static_cast<unsigned long long>(size));
+    const std::string etag(tag, tn > 0 ? static_cast<size_t>(tn) : 0);
+    const std::string modified = socketley::http::http_date_of(mtime);
+    const auto pre = socketley::http::evaluate({field_of(h, "if-match"), field_of(h, "if-unmodified-since"),
+                                                field_of(h, "if-none-match"), field_of(h, "if-modified-since")},
+                                               etag, mtime);
+    if (pre == socketley::http::precondition::failed)
+    {
+        send_error(conn, "412 Precondition Failed", "Precondition Failed\n");
+        return;
+    }
+
+    std::string_view status = "200 OK";
+    uint64_t first = 0, length = size;
+    std::string range_field;
+    if (pre == socketley::http::precondition::not_modified)
+        status = "304 Not Modified";
+    else if (const std::string_view range = field_of(h, "range"); !head_only && !range.empty())
+    {
+        // A range of a file that has changed since the client's copy is no part of that copy (13.1.5).
+        const std::string_view if_range = field_of(h, "if-range");
+        if (if_range.empty() || if_range == "\"" + etag + "\"" || if_range == modified)
+        {
+            const http_range r = http_parse_range(range, static_cast<size_t>(size));
+            if (r.unsatisfiable)
+            {
+                status = "416 Range Not Satisfiable";
+                length = 0;
+                range_field = "Content-Range: bytes */" + std::to_string(size) + "\r\n";
+            }
+            else if (r.usable)
+            {
+                status = "206 Partial Content";
+                first = r.first;
+                length = static_cast<uint64_t>(r.last - r.first + 1);
+                range_field = "Content-Range: bytes " + std::to_string(r.first) + "-" + std::to_string(r.last) + "/" +
+                              std::to_string(size) + "\r\n";
+            }
+        }
+    }
+    // A body after a request this answers without reading leaves no boundary to find the next request at; and the
+    // client's own word on the connection is read here, since rewrite_http_request, which reads it for a backend's
+    // answer, is never reached.
+    bool asked_close = false, asked_keep = false;
+    for (const auto& [n, v] : h.fields)
+        if (iequal(n, "connection"))
+        {
+            asked_close = asked_close || http_list_has_token(v, "close", 5);
+            asked_keep = asked_keep || http_list_has_token(v, "keep-alive", 10);
+        }
+    const bool http10 = h.version == "HTTP/1.0";
+    if (conn->ex.declared_body_len > 0 || conn->ex.declared_body_chunked || asked_close || (http10 && !asked_keep))
+        conn->ex.client_conn_close = true;
+
+    std::string out;
+    out.reserve(320);
+    out += "HTTP/1.1 ";
+    out += status;
+    out += "\r\n";
+    if (status.starts_with("416"))
+        out += range_field + "Content-Length: 0\r\n";
+    else if (!status.starts_with("304"))
+    {
+        out += "Content-Type: ";
+        out += socketley::http::content_type_of(rel);
+        out += "\r\nContent-Length: " + std::to_string(length) + "\r\n" + range_field + "Accept-Ranges: bytes\r\n";
+        out += "X-Content-Type-Options: nosniff\r\n";
+    }
+    out += "ETag: \"" + etag + "\"\r\nLast-Modified: " + modified + "\r\n";
+    if (conn->ex.client_conn_close)
+        out += "Connection: close\r\n";
+    else if (http10)
+        out += "Connection: keep-alive\r\n";
+    out += "\r\n";
+
+    ++m_files_served;
+    if (pre == socketley::http::precondition::not_modified)
+        ++m_files_not_modified;
+    conn->partial.erase(0, end + 4);
+    conn->ex.response_started = true;
+    conn->write_queue.push(std::move(out));
+    if (!conn->write_pending && !flush_client_write_queue(conn))
+    {
+        close_pair(conn->fd, conn->ex.backend_fd);
+        return;
+    }
+    // The next request is read as this answer goes out, as it is behind a backend's, since this returns past the
+    // re-arm at the end of drive_client_request.
+    if (!conn->closing && !conn->read_pending && !arm_read(conn->fd, conn))
+    {
+        close_pair(conn->fd, conn->ex.backend_fd);
+        return;
+    }
+    const bool body = !head_only && (status.starts_with("200") || status.starts_with("206"));
+    f->off = first;
+    f->left = body ? length : 0;
+    conn->file = std::move(f);
+    fcgi_file_next(conn);
+}
+
+// The next window of the file, once what the client holds is below the pacing point; at its end the exchange is over,
+// after the write that carries the last of it, so a pipelined request is never parsed from inside this one's answer.
+void proxy_instance::fcgi_file_next(proxy_client_connection* conn)
+{
+    fcgi_file& f = *conn->file;
+    if (f.reading || conn->closing || !m_loop)
+        return;
+    const bool stream = conn->h2_parent != nullptr || conn->h3s != nullptr;
+    if (f.left == 0)
+    {
+        if (!stream && (conn->write_pending || !conn->write_queue.empty()))
+            return;
+        conn->file.reset();
+        reset_client_for_next_request(conn);
+        return;
+    }
+    size_t held = conn->write_queue.bytes();
+    if (stream)
+        held += stream_answer_held(conn);
+    if (held >= write_watermark_bytes())
+        return;
+    const auto n = static_cast<uint32_t>(std::min<uint64_t>(f.left, file_window));
+    f.buf.resize(n);
+    f.reading = true;
+    const int fd = conn->fd;
+    const uint32_t gen = conn->generation;
+    std::shared_ptr<fcgi_file> keep = conn->file;
+    if (!m_files->io.pread(f.fd, f.buf.data(), n, f.off,
+                           [this, fd, gen, keep](int64_t res) { fcgi_file_read(fd, gen, keep, res); }))
+    {
+        f.reading = false;
+        close_pair(conn->fd, conn->ex.backend_fd);
+    }
+}
+
+void proxy_instance::fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res)
+{
+    f->reading = false;
+    if (!m_loop || fd < 0 || fd >= MAX_FDS || m_conn_idx[fd].side != conn_client)
+        return;
+    proxy_client_connection* conn = m_conn_idx[fd].client;
+    if (conn->generation != gen || conn->file != f || conn->closing)
+        return;
+    // The length is on the wire already, so a file that shrank or failed under the read ends the connection.
+    if (res <= 0)
+    {
+        conn->file.reset();
+        close_pair(fd, conn->ex.backend_fd);
+        return;
+    }
+    const auto got = static_cast<uint64_t>(std::min<int64_t>(res, static_cast<int64_t>(f->left)));
+    f->buf.resize(static_cast<size_t>(got));
+    f->off += got;
+    f->left -= got;
+    conn->write_queue.push(std::move(f->buf));
+    f->buf = std::string();
+    if (!conn->write_pending && !flush_client_write_queue(conn))
+    {
+        close_pair(fd, conn->ex.backend_fd);
+        return;
+    }
+    fcgi_file_next(conn);
 }
 
 bool proxy_instance::fastcgi_encode(proxy_client_connection* conn, fcgi_leg& leg, std::string_view in, std::string& out)
@@ -457,6 +698,10 @@ bool proxy_instance::fastcgi_decode(proxy_backend_connection* conn, std::string_
                 break;
             if (hr == fcgi::head_result::bad)
                 return broken("answered with a CGI head that is not one");
+            // nginx's internal redirect names a location this proxy does not have, and the script's empty body as a 200 would
+            // be a download that silently came back empty.
+            if (!h.accel_redirect.empty())
+                return broken("named a file by X-Accel-Redirect, which is nginx's (readfile() hands a file out here)");
             leg.cgi_done = true;
             out += "HTTP/1.1 " + std::to_string(h.status) + " " +
                    (h.reason.empty() ? std::string(socketley::http::status_text(h.status)) : h.reason) + "\r\n";

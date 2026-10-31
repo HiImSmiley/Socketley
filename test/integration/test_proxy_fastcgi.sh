@@ -41,6 +41,8 @@ for f in index.php hello.php shop/index.php shop/cart.php; do printf '<?php echo
 printf 'GIF89a <?php system("id"); ?>' > "$W/uploads/avatar.jpg"
 printf 'SECRET=1\n' > "$W/.env"
 printf 'body{}\n' > "$W/style.css"
+for f in config.inc wp-config.php.bak 'index.php~' old.phtml dump.sql; do printf 'DB_PASSWORD=x\n' > "$W/$f"; done
+head -c 3000000 /dev/urandom > "$W/uploads/video.mp4"
 printf '[core]\n' > "$W/.git/config"
 printf '<?php echo 1;\n' > "$W/.git/hook.php"
 mkdir -p "$W/.well-known" "$T/outside"
@@ -104,6 +106,7 @@ def serve(c, n):
         elif mode == "redirect": head = b"Location: https://example.test/there\r\n\r\n"; body = b""
         elif mode == "big": head = b"Content-Type: application/octet-stream\r\n\r\n"; body = bytes(range(256)) * 800
         elif mode == "nohead": head = b""; body = b""
+        elif mode == "accel": head = b"X-Accel-Redirect: /private/a.zip\r\nContent-Length: 0\r\n\r\n"; body = b""
         else: head = b"Content-Type: application/json\r\nX-Script: yes\r\n\r\n"; body = json.dumps(info).encode()
         whole = head + body
         for i in range(0, len(whole), 30000): out += rec(6, whole[i:i+30000])
@@ -171,6 +174,9 @@ curl -s -o /dev/null -H 'X-Mode: stderr' "$U/hello.php"
 for _ in $(seq 1 20); do grep -q 'told the log' "$SOCKETLEY_DLOG" && break; sleep 0.1; done
 has "what the script writes to STDERR is in the log" "$(cat "$SOCKETLEY_DLOG")" 'PHP Warning: told the log'
 expect "a server that answers no CGI head is a 502" "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Mode: nohead' "$U/hello.php")" 502
+expect "an X-Accel-Redirect is refused rather than answered empty" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Mode: accel' "$U/hello.php")" 502
+has "and says why in the log" "$(cat "$SOCKETLEY_DLOG")" 'X-Accel-Redirect'
 expect "and one that answers garbage" "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Mode: garbage' "$U/hello.php")" 502
 
 # ── one connection to the server for many requests ──────────────────────────
@@ -186,7 +192,9 @@ expect "a path out of --root is refused" "$(code '/../../etc/passwd')" 404
 expect "and one spelled with %2e%2e" "$(code '/%2e%2e/%2e%2e/etc/passwd')" 404
 expect "a hidden file is not served" "$(code '/.env')" 404
 expect "nor a hidden directory's" "$(code '/.git/config')" 404
-expect "an existing file that is no script does not reach the server" "$(code '/style.css')" 404
+for f in /config.inc /wp-config.php.bak /index.php~ /old.phtml /dump.sql; do
+    expect "a file a site keeps but never hands out ($f) is not served" "$(code "$f")" 404
+done
 expect "nor a script in a hidden directory" "$(code '/.git/hook.php')" 404
 expect "none of them did" "$(wc -l < "$T/stub.log")" 0
 r=$(curl -s "$U/.well-known/acme.php")
@@ -198,6 +206,91 @@ expect "a link that stays inside is" "$(j "$(last)" 'd["SCRIPT_FILENAME"]')" "$W
 r=$(curl -s "$U/uploads/avatar.jpg/x.php")
 expect "an upload asked for as /upload.jpg/x.php is never the script: the index script is" \
     "$(j "$(last)" 'd["SCRIPT_FILENAME"]')" "$W/index.php"
+
+# ── a file of the site's own is served from here ───────────────────────────
+: > "$T/stub.log"
+r=$(curl -s -D "$T/sh" "$U/style.css")
+expect "an existing file that is no script is the site's own" "$(head -1 "$T/sh" | tr -d '\r') $r" "HTTP/1.1 200 OK body{}"
+has "with its type, its validators and that it takes ranges" "$(cat "$T/sh")" 'Content-Type: text/css; charset=utf-8'
+has "an ETag" "$(cat "$T/sh")" '^ETag: "'
+has "a Last-Modified" "$(cat "$T/sh")" '^Last-Modified: [A-Z][a-z]{2}, '
+has "and Accept-Ranges" "$(cat "$T/sh")" '^Accept-Ranges: bytes'
+TAG=$(grep -i '^ETag:' "$T/sh" | cut -d' ' -f2 | tr -d '\r')
+LM=$(grep -i '^Last-Modified:' "$T/sh" | cut -d' ' -f2- | tr -d '\r')
+expect "the copy a client holds is not sent again (If-None-Match)" \
+    "$(curl -s -o "$T/nm" -w '%{http_code} %{size_download}' -H "If-None-Match: $TAG" "$U/style.css")" "304 0"
+expect "nor by its date (If-Modified-Since)" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "If-Modified-Since: $LM" "$U/style.css")" 304
+expect "and a copy that is not the file's is" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'If-None-Match: "other"' "$U/style.css")" 200
+expect "a range is the bytes it names" "$(curl -s -D "$T/rh" -r 2-4 "$U/style.css") $(grep -ci '^Content-Range: bytes 2-4/7' "$T/rh")" "dy{ 1"
+expect "a range past the end is 416" "$(curl -s -o /dev/null -w '%{http_code}' -r 100- "$U/style.css")" 416
+expect "and a range of a copy that is not the file's is the whole file (If-Range)" \
+    "$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -r 2-4 -H 'If-Range: "other"' "$U/style.css")" "200 7"
+expect "a HEAD has the length and no body" \
+    "$(curl -s -I -o "$T/hh" -w '%{http_code} %{size_download}' "$U/style.css") $(grep -ci '^Content-Length: 7' "$T/hh")" "200 0 1"
+expect "a file takes GET and HEAD alone" "$(curl -s -o /dev/null -w '%{http_code}' -X POST -d x "$U/style.css")" 405
+expect "files share a connection, as a page's assets do" \
+    "$(curl -s -m 5 -o /dev/null -o /dev/null -w '%{num_connects}' "$U/style.css" "$U/style.css" | tr -d '\n')" "10"
+curl -s -o "$T/v.out" --limit-rate 4M "$U/uploads/video.mp4"
+expect "a large file arrives whole, a window at a time as a slow client takes it" \
+    "$(sha256sum < "$T/v.out" | cut -c1-16)" "$(sha256sum < "$W/uploads/video.mp4" | cut -c1-16)"
+expect "and a range far into it is its bytes" "$(curl -s -r 2500000-2500009 "$U/uploads/video.mp4" | od -An -tx1 | tr -d ' \n')" \
+    "$(dd if="$W/uploads/video.mp4" bs=1 skip=2500000 count=10 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+piped=$(python3 - "$P" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.sendall(b"GET /style.css HTTP/1.1\r\nHost: site\r\n\r\nHEAD /style.css HTTP/1.1\r\nHost: site\r\n\r\n"
+          b"GET /style.css HTTP/1.1\r\nHost: site\r\nConnection: close\r\n\r\n")
+d = b""
+s.settimeout(5)
+try:
+    while True:
+        b = s.recv(65536)
+        if not b: break
+        d += b
+except socket.timeout:
+    d += b"<timeout>"
+print(d.count(b"HTTP/1.1 200 OK"), d.count(b"body{}"), d.count(b"<timeout>"))
+PY
+)
+expect "pipelined requests are answered in order, each once" "$piped" "3 2 0"
+expect "an HTTP/1.0 request is answered and closed, as 1.0 has it" \
+    "$(curl -s -0 -o /dev/null -o /dev/null -w '%{http_code} %{num_connects}' "$U/style.css" "$U/style.css" | tr -d '\n')" "200 1200 1"
+body_after=$(python3 - "$P" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.sendall(b"GET /style.css HTTP/1.1\r\nHost: site\r\nContent-Length: 40\r\n\r\nGET /hello.php HTTP/1.1\r\nHost: site\r\n\r\n")
+d = b""
+s.settimeout(5)
+try:
+    while True:
+        b = s.recv(65536)
+        if not b: break
+        d += b
+except socket.timeout:
+    d += b"<timeout>"
+print(d.count(b"HTTP/1.1"), d.count(b"Connection: close"))
+PY
+)
+expect "a body after a GET of a file ends the connection, and is never read as a request" "$body_after" "1 1"
+expect "no file reached the server" "$(wc -l < "$T/stub.log")" 0
+st=$("$BIN" stats site 2>&1)
+has "stats count the files served" "$st" 'files_served: ?[1-9]'
+has "and the 304s among them" "$st" 'files_not_modified: ?[1-9]'
+
+# ── over TLS, a window at a time through the record layer ───────────────────
+if command -v openssl >/dev/null 2>&1; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=site -keyout "$T/s.key" -out "$T/s.pem" >/dev/null 2>&1
+    "$BIN" create proxy sitetls -p $((P+2)) --domain sitetls --backend "fastcgi://unix:$T/stub.sock" --root "$W" \
+        --tls --cert "$T/s.pem" --key "$T/s.key" -s >/dev/null 2>&1 || bad "a FastCGI proxy over TLS is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+    TU="https://127.0.0.1:$((P+2))"
+    for _ in $(seq 1 50); do curl -sk -o /dev/null "$TU/style.css" && break; sleep 0.1; done
+    curl -sk -o "$T/vt.out" -H 'Host: sitetls' "$TU/uploads/video.mp4"
+    expect "a large file over TLS arrives whole" "$(sha256sum < "$T/vt.out" | cut -c1-16)" \
+        "$(sha256sum < "$W/uploads/video.mp4" | cut -c1-16)"
+    expect "and a script's answer over TLS" "$(j "$(curl -sk -H 'Host: sitetls' "$TU/hello.php")" 'd["SCRIPT_NAME"]')" "/hello.php"
+fi
 
 # ── php-fpm, where it is installed ──────────────────────────────────────────
 FPM=$(ls /usr/sbin/php-fpm* 2>/dev/null | head -1)

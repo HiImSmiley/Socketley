@@ -13,12 +13,15 @@
 #include <optional>
 #include <functional>
 #include <netinet/in.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
 #include "../../shared/runtime/runtime_instance.h"
 #include "../../shared/runtime/latency_histogram.h"
 #include "../../shared/http/route_table.h"
 #include "../../shared/loop/write_queue.h"
+#include "../../shared/loop/file_io.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/crypto/tls_context.h"
 #include "../../shared/util/trace.h"
@@ -211,6 +214,33 @@ struct proxy_h2_stream;
 struct proxy_h2_conn_free { void operator()(proxy_h2_conn* s) const; };
 struct proxy_h2_stream_free { void operator()(proxy_h2_stream* s) const; };
 
+// A file a FastCGI proxy serves itself, a window at a time; shared with the read in flight, which may outlive the
+// connection it was for.
+struct fcgi_file
+{
+    int fd{-1};
+    uint64_t off{0};
+    uint64_t left{0};
+    std::string buf;
+    bool reading{false};
+    fcgi_file() = default;
+    fcgi_file(const fcgi_file&) = delete;
+    fcgi_file& operator=(const fcgi_file&) = delete;
+    ~fcgi_file()
+    {
+        if (fd >= 0)
+            ::close(fd);
+    }
+};
+
+// The reads of those files, on the runtime's ring under an owner of their own, so the proxy's dispatch never sees them.
+struct fcgi_file_pump final : io_handler
+{
+    explicit fcgi_file_pump(event_loop& loop) : io(loop, this) {}
+    void on_cqe(struct io_uring_cqe* cqe) override { io.on_cqe(cqe); }
+    socketley::file_io io;
+};
+
 struct alignas(64) proxy_client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
@@ -270,6 +300,8 @@ struct alignas(64) proxy_client_connection
     // === COLD fields ===
     int pipe_to_backend[2]{-1, -1};
     proxy_exchange ex;
+    // The file this connection is being answered with, when its proxy serves one itself.
+    std::shared_ptr<fcgi_file> file;
 
     // Non-null only on a client that chose h2 by ALPN: its session, its streams and the frames waiting for the wire.
     std::unique_ptr<proxy_h2_conn, proxy_h2_conn_free> h2;
@@ -1181,7 +1213,13 @@ private:
     bool fastcgi_encode(proxy_client_connection* conn, fcgi_leg& leg, std::string_view in, std::string& out);
     bool fastcgi_decode(proxy_backend_connection* conn, std::string_view in, std::string& out);
     bool fcgi_regular(std::string_view rel, bool& dir) const;
+    int fcgi_open(std::string_view rel, int flags, struct stat& st) const;
     bool open_fcgi_root();
+    // A file beneath --root answered by this proxy, its next window read once the client has room, and that read's end.
+    void fcgi_serve_file(proxy_client_connection* conn, int fd, const struct stat& st, std::string_view rel);
+    void fcgi_file_next(proxy_client_connection* conn);
+    void fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
+    std::unique_ptr<fcgi_file_pump> m_files;
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 
     // ── the entrance ────────────────────────────────────────────────────────
@@ -1337,6 +1375,8 @@ private:
     // What the circuit breakers were told, counted for `stats`: whole answers and failures of the backends.
     uint64_t m_backend_responses{0};
     uint64_t m_backend_failures{0};
+    uint64_t m_files_served{0};
+    uint64_t m_files_not_modified{0};
     // Head to the backend's last byte, a fresh connect, and the backend asked to its first byte, HTTP's but the connect.
     socketley::latency_histogram m_lat_request;
     socketley::latency_histogram m_lat_connect;

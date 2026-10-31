@@ -2270,6 +2270,9 @@ Field	Type	Description
 _
 protocol	string	"http" or "tcp" \fB(requires restart)\fR
 strategy	string	"round-robin", "random", or "lua"
+root	string	A FastCGI proxy's directory (\fB\-\-root\fR)
+fastcgi_root	string	It as the application server sees it
+index	string	The index script (default "index.php")
 backends	array	T{
 .ad l
 List of backend addresses ["ip:port", "@group", ...]
@@ -4961,6 +4964,104 @@ process that has gone, both answer the client
 .B 502
 \(em the same answer an unreachable TCP backend gets, and for the same reason:
 that is the far end failing, not this one.
+.IP
+.BI fastcgi://unix: /path/to.sock
+or
+.BI fastcgi:// host : port
+is an application server spoken to by FastCGI \(em php\-fpm, or anything
+else that takes the responder role \(em instead of HTTP. Such a proxy needs
+.BR \-\-root ,
+speaks
+.B \-\-protocol http
+to its clients, and has no backend of any other kind; each of these is refused
+at
+.BR create .
+Pools, deadlines, retries, the circuit breaker and the TLS listener work on it
+as on any backend.
+.IP
+A request goes, in this order:
+to the first path segment ending in
+.B .php
+that is a regular file beneath
+.B \-\-root
+(what follows it is
+.BR PATH_INFO );
+to a directory's
+.BR \-\-index ;
+to an existing file that is no script, which the proxy serves itself; and
+otherwise to the index script at the top of
+.BR \-\-root ,
+as a front controller is, with the path in
+.BR REQUEST_URI .
+A script is found with
+.BR openat2 (2)
+and
+.BR RESOLVE_BENEATH ,
+so a link out of the root is never one; an absolute link is followed only when
+its target stays inside. Because a script must exist,
+.B /upload.jpg/x.php
+is never handed to the interpreter, whatever
+.B cgi.fix_pathinfo
+says.
+.IP
+Never served, as a script or a file: a path that walks up, a hidden segment but
+.BR .well\-known ,
+and the names a site keeps but does not hand out \(em a name ending in
+.BR ~ ,
+one holding
+.BR .php. ,
+and the extensions
+.BR bak ,
+.BR old ,
+.BR orig ,
+.BR save ,
+.BR swp ,
+.BR swo ,
+.BR tmp ,
+.BR dist ,
+.BR inc ,
+.BR sql ,
+.BR ini ,
+.BR log ,
+.BR phtml ,
+.BR phar ,
+.B phps
+and
+.BR php3 \(en php8 .
+They are 404.
+.IP
+A file is served with its type, an ETag and Last\-Modified, answers
+If\-None\-Match, If\-Modified\-Since, If\-Match and If\-Unmodified\-Since
+(RFC 9110 13.2.2), one range with If\-Range, GET and HEAD alone (405 otherwise),
+and is read from the disk a window of 256 KiB at a time as the client takes it,
+under keep\-alive.
+.IP
+A
+.B Proxy
+header is never passed on (httpoxy), nor any header whose name holds an
+underscore, which a server would read as the same variable as its dashed twin.
+.B HTTPS
+is on when this proxy ended TLS, or an entrance in front of it did and said so
+over the loopback. What a script writes to STDERR reaches the log, at most
+twenty lines a minute. An
+.B X\-Accel\-Redirect
+is nginx's internal redirect and is answered 502; a script hands a file out
+with
+.BR readfile() .
+.TP
+.BI "\-\-root " directory
+The directory a FastCGI proxy's scripts and files are in, absolute.
+.TP
+.BI "\-\-fastcgi\-root " directory
+The same directory as the application server sees it, when that differs
+(a server in a container), named to it in
+.B SCRIPT_FILENAME
+and
+.BR DOCUMENT_ROOT .
+.TP
+.BI "\-\-index " name
+The script a directory and an unmatched path go to (default
+.BR index.php ).
 .TP
 .BI "\-\-strategy " "strategy"
 Load balancing strategy:
@@ -15260,6 +15361,9 @@ udp (bool)                 \-\-udp
 backends (array)           \-\-backend a,b,c
 protocol                   \-\-protocol
 strategy                   \-\-strategy
+root                       \-\-root
+fastcgi_root               \-\-fastcgi\-root
+index                      \-\-index
 health_check               \-\-health\-check
 health_interval            \-\-health\-interval  30, or 5m / 2h
 health_path                \-\-health\-path
