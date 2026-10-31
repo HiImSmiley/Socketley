@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <utility>
@@ -171,6 +172,15 @@ bool private_name(std::string_view rel)
 
 // The largest read of a served file, and so the most of it this proxy holds per connection above the write queue.
 constexpr uint32_t file_window = 256 * 1024;
+// Kept whole up to this size and this total, the server runtime's own figures: below it one write of bytes in memory
+// costs less than any splice, whose every operation is a hand-off to an io-wq worker (event_loop.h, at
+// submit_splice).
+constexpr uint64_t keep_max_file = 256 * 1024;
+constexpr size_t keep_max_total = 64u << 20;
+// Above that a file on a plain connection is spliced, through a pipe this large, since the hand-off is paid per
+// operation and not per byte; and at most this many pipes at once, the server runtime's bound.
+constexpr uint32_t splice_window = 1u << 20;
+constexpr uint32_t max_file_pipes = 256;
 
 }   // namespace
 
@@ -185,6 +195,8 @@ void proxy_instance::set_root(std::string_view dir)
         return;
     }
     // A serving proxy moves to the new root once it is open, so the descriptor and the name never disagree.
+    m_kept.clear();
+    m_kept_bytes = 0;
     std::string before = std::exchange(m_fcgi_root, std::move(root));
     if (!open_fcgi_root())
     {
@@ -315,6 +327,8 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
             break;
         at = slash + 1;
     }
+    if (SOCKETLEY_LIKELY(!m_kept.empty()) && fcgi_serve_kept(conn, rel))
+        return false;
     bool dir = false;
     const bool file = fcgi_regular(rel, dir);
     if (dir)
@@ -350,10 +364,39 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
     return false;
 }
 
+// A kept file still the one on disk, answered from memory; false sends the request down the path that opens it.  The
+// statx follows links where the open beneath --root would not, which is safe because what it decides is only whether
+// these bytes are still that file's: a path that now leads elsewhere names another inode, and is opened afresh.
+bool proxy_instance::fcgi_serve_kept(proxy_client_connection* conn, std::string_view rel)
+{
+    const auto it = m_kept.find(rel);
+    if (it == m_kept.end())
+        return false;
+    struct statx sx{};
+    const unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
+    const std::string path(rel);
+    const fcgi_kept& k = it->second;
+    if (::statx(m_fcgi_root_fd, path.c_str(), 0, want, &sx) != 0 || (sx.stx_mask & want) != want ||
+        !S_ISREG(sx.stx_mode) || makedev(sx.stx_dev_major, sx.stx_dev_minor) != k.dev ||
+        static_cast<ino_t>(sx.stx_ino) != k.ino || static_cast<off_t>(sx.stx_size) != k.size ||
+        sx.stx_mtime.tv_sec != k.mtime.tv_sec || sx.stx_mtime.tv_nsec != k.mtime.tv_nsec)
+    {
+        m_kept_bytes -= it->second.body->size();
+        m_kept.erase(it);
+        return false;
+    }
+    struct stat st{};
+    st.st_size = k.size;
+    st.st_mtim = k.mtime;
+    fcgi_serve_file(conn, -1, st, rel, k.body);
+    return true;
+}
+
 // The answer for a file of the site's own: its preconditions (RFC 9110 13), a single range (14), and then its bytes
 // a window at a time as the client takes them; under keep-alive, so a page's assets share the connection its page came
 // on.
-void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, const struct stat& st, std::string_view rel)
+void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, const struct stat& st, std::string_view rel,
+                                     std::shared_ptr<const std::string> kept)
 {
     auto f = std::make_shared<fcgi_file>();
     f->fd = ffd;
@@ -469,8 +512,41 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, con
         return;
     }
     const bool body = !head_only && (status.starts_with("200") || status.starts_with("206"));
+    // A kept file's bytes are queued behind its head, a slice of the one copy every request shares.
+    if (kept)
+    {
+        if (body && length > 0)
+        {
+            conn->write_queue.push(socketley::write_chunk(kept, static_cast<uint32_t>(first), static_cast<uint32_t>(length)));
+            if (!conn->write_pending && !flush_client_write_queue(conn))
+            {
+                close_pair(conn->fd, conn->ex.backend_fd);
+                return;
+            }
+        }
+        conn->file = std::move(f);
+        fcgi_file_next(conn);
+        return;
+    }
     f->off = first;
     f->left = body ? length : 0;
+    // A whole small file asked for by a GET is read once and kept, while there is room for it.
+    if (status.starts_with("200") && body && size > 0 && size <= keep_max_file &&
+        m_kept_bytes + size <= keep_max_total && !rel.empty())
+    {
+        f->keep_as = std::string(rel);
+        f->keep_stat = st;
+    }
+    // TLS and a stream frame what they send, so only a plain connection takes the bytes straight from the file.
+    else if (f->left > keep_max_file && conn->ssl == nullptr && conn->h2_parent == nullptr && conn->h3s == nullptr &&
+             *m_file_pipes < max_file_pipes && ::pipe2(f->pipe, O_NONBLOCK | O_CLOEXEC) == 0)
+    {
+        if (::fcntl(f->pipe[0], F_SETPIPE_SZ, static_cast<int>(splice_window)) < 0) {}
+        const int got = ::fcntl(f->pipe[0], F_GETPIPE_SZ);
+        f->pipe_size = got > 0 ? static_cast<uint32_t>(got) : 65536u;
+        f->pipes = m_file_pipes;
+        ++*f->pipes;
+    }
     conn->file = std::move(f);
     fcgi_file_next(conn);
 }
@@ -483,12 +559,32 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn)
     if (f.reading || conn->closing || !m_loop)
         return;
     const bool stream = conn->h2_parent != nullptr || conn->h3s != nullptr;
-    if (f.left == 0)
+    if (f.left == 0 && f.in_pipe == 0)
     {
         if (!stream && (conn->write_pending || !conn->write_queue.empty()))
             return;
         conn->file.reset();
         reset_client_for_next_request(conn);
+        return;
+    }
+    const int fd = conn->fd;
+    const uint32_t gen = conn->generation;
+    if (f.pipe[0] >= 0)
+    {
+        // The head goes out first, through the write queue, and nothing else writes to the socket until the file has.
+        if (conn->write_pending || !conn->write_queue.empty())
+            return;
+        const bool out = f.in_pipe > 0;
+        const auto n = out ? f.in_pipe : static_cast<uint32_t>(std::min<uint64_t>(f.left, f.pipe_size));
+        f.reading = true;
+        std::shared_ptr<fcgi_file> keep = conn->file;
+        const auto cb = [this, fd, gen, keep, out](int64_t res) { fcgi_file_spliced(fd, gen, keep, res, out); };
+        if (!(out ? m_files->io.splice(f.pipe[0], socketley::file_io::at_stream, fd, n, cb)
+                  : m_files->io.splice(f.fd, f.off, f.pipe[1], n, cb)))
+        {
+            f.reading = false;
+            close_pair(conn->fd, conn->ex.backend_fd);
+        }
         return;
     }
     size_t held = conn->write_queue.bytes();
@@ -499,8 +595,6 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn)
     const auto n = static_cast<uint32_t>(std::min<uint64_t>(f.left, file_window));
     f.buf.resize(n);
     f.reading = true;
-    const int fd = conn->fd;
-    const uint32_t gen = conn->generation;
     std::shared_ptr<fcgi_file> keep = conn->file;
     if (!m_files->io.pread(f.fd, f.buf.data(), n, f.off,
                            [this, fd, gen, keep](int64_t res) { fcgi_file_read(fd, gen, keep, res); }))
@@ -529,12 +623,57 @@ void proxy_instance::fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<
     f->buf.resize(static_cast<size_t>(got));
     f->off += got;
     f->left -= got;
-    conn->write_queue.push(std::move(f->buf));
+    if (!f->keep_as.empty() && f->off == static_cast<uint64_t>(f->keep_stat.st_size) && f->left == 0 &&
+        m_kept_bytes + f->buf.size() <= keep_max_total)
+    {
+        auto body = std::make_shared<const std::string>(std::move(f->buf));
+        // Two connections may read the same file at once, and the second one's copy replaces the first's.
+        auto [it, fresh] = m_kept.try_emplace(std::move(f->keep_as));
+        if (!fresh)
+            m_kept_bytes -= it->second.body->size();
+        it->second = fcgi_kept{f->keep_stat.st_dev, f->keep_stat.st_ino, f->keep_stat.st_size, f->keep_stat.st_mtim, body};
+        m_kept_bytes += body->size();
+        conn->write_queue.push(socketley::write_chunk(std::move(body)));
+    }
+    else
+        conn->write_queue.push(std::move(f->buf));
     f->buf = std::string();
     if (!conn->write_pending && !flush_client_write_queue(conn))
     {
         close_pair(fd, conn->ex.backend_fd);
         return;
+    }
+    fcgi_file_next(conn);
+}
+
+void proxy_instance::fcgi_file_spliced(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res,
+                                       bool to_socket)
+{
+    f->reading = false;
+    if (!m_loop || fd < 0 || fd >= MAX_FDS || m_conn_idx[fd].side != conn_client)
+        return;
+    proxy_client_connection* conn = m_conn_idx[fd].client;
+    if (conn->generation != gen || conn->file != f || conn->closing)
+        return;
+    // A file that shrank, or a client gone, with the length already on the wire: the connection ends.
+    if (res <= 0)
+    {
+        conn->file.reset();
+        close_pair(fd, conn->ex.backend_fd);
+        return;
+    }
+    const auto n = static_cast<uint32_t>(res);
+    if (to_socket)
+    {
+        f->in_pipe -= std::min(n, f->in_pipe);
+        stat_add(m_stat_bytes_out, n);
+    }
+    else
+    {
+        const uint64_t got = std::min<uint64_t>(n, f->left);
+        f->in_pipe += static_cast<uint32_t>(got);
+        f->off += got;
+        f->left -= got;
     }
     fcgi_file_next(conn);
 }
@@ -600,7 +739,9 @@ bool proxy_instance::fastcgi_encode(proxy_client_connection* conn, fcgi_leg& leg
                 if (!conn->write_pending && !flush_client_write_queue(conn))
                     return false;
             }
-            fcgi::append_begin(out, true);
+            // Without FCGI_KEEP_CONN, so php-fpm's worker is free the moment it has answered: a kept connection holds it,
+            // and with more of them than workers the rest wait in its backlog for a worker that never comes free.
+            fcgi::append_begin(out, false);
             if (h.chunked)
             {
                 leg.out = fcgi_leg::out_phase::body_chunked;

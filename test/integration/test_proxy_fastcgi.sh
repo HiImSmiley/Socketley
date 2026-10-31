@@ -184,11 +184,13 @@ expect "an X-Accel-Redirect is refused rather than answered empty" \
 has "and says why in the log" "$(cat "$SOCKETLEY_DLOG")" 'X-Accel-Redirect'
 expect "and one that answers garbage" "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Mode: garbage' "$U/hello.php")" 502
 
-# ── one connection to the server for many requests ──────────────────────────
+# ── a connection to the server per request ─────────────────────────────────
+# One of php-fpm's workers serves a connection for as long as it lasts, so a kept one holds a worker from everyone.
 : > "$T/stub.log"
 curl -s -o /dev/null -o /dev/null "$U/hello.php?n=1" "$U/hello.php?n=2"
-expect "two requests share one connection to the server" "$(python3 -c '
-import json,sys; print(len(set(json.loads(l)["conn"] for l in open(sys.argv[1]))))' "$T/stub.log")" 1
+expect "each request is a connection of its own, which the server closes" "$(python3 -c '
+import json,sys; print(len(set(json.loads(l)["conn"] for l in open(sys.argv[1]))))' "$T/stub.log")" 2
+expect "and no connection is kept for it" "$("$BIN" stats site 2>&1 | grep -c '^pooled_connections')" 0
 
 # ── what never reaches the interpreter ──────────────────────────────────────
 : > "$T/stub.log"
@@ -242,6 +244,11 @@ expect "a large file arrives whole, a window at a time as a slow client takes it
     "$(sha256sum < "$T/v.out" | cut -c1-16)" "$(sha256sum < "$W/uploads/video.mp4" | cut -c1-16)"
 expect "and a range far into it is its bytes" "$(curl -s -r 2500000-2500009 "$U/uploads/video.mp4" | od -An -tx1 | tr -d ' \n')" \
     "$(dd if="$W/uploads/video.mp4" bs=1 skip=2500000 count=10 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+expect "a large range is its bytes, sent straight from the file" \
+    "$(curl -s -r 1000000-1999999 "$U/uploads/video.mp4" | sha256sum | cut -c1-16)" \
+    "$(dd if="$W/uploads/video.mp4" bs=1000000 skip=1 count=1 2>/dev/null | sha256sum | cut -c1-16)"
+expect "and the connection serves the next request after a file sent that way" \
+    "$(curl -s -m 10 -o /dev/null -o /dev/null -w '%{http_code}%{num_connects} ' "$U/uploads/video.mp4" "$U/style.css")" "2001 2000 "
 piped=$(python3 - "$P" <<'PY'
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
@@ -279,6 +286,16 @@ print(d.count(b"HTTP/1.1"), d.count(b"Connection: close"))
 PY
 )
 expect "a body after a GET of a file ends the connection, and is never read as a request" "$body_after" "1 1"
+# A small file is kept in memory after its first GET; what is asked of it is that it is never stale and never another's.
+printf 'v1\n' > "$W/kept.txt"; curl -s -o /dev/null "$U/kept.txt"; curl -s -o /dev/null "$U/kept.txt"
+printf 'version two\n' > "$W/kept.txt"
+expect "a kept file that changed is sent as it is now" "$(curl -s "$U/kept.txt")" "version two"
+printf 'version 3!!\n' > "$T/next.txt"; touch -r "$W/kept.txt" "$T/next.txt"; mv "$T/next.txt" "$W/kept.txt"
+expect "and one moved into place with the same size and time, a new file under the old name" \
+    "$(curl -s "$U/kept.txt")" "version 3!!"
+printf 'SECRET\n' > "$T/outside/secret.txt"; rm "$W/kept.txt"; ln -s "$T/outside/secret.txt" "$W/kept.txt"
+hasnt "and a link out of --root put in its place is not followed" "$(curl -s "$U/kept.txt")" 'SECRET'
+rm -f "$W/kept.txt"; : > "$T/stub.log"; curl -s -o /dev/null "$U/style.css"
 expect "no file reached the server" "$(wc -l < "$T/stub.log")" 0
 st=$("$BIN" stats site 2>&1)
 has "stats count the files served" "$st" 'files_served: ?[1-9]'
@@ -323,6 +340,7 @@ echo json_encode(['method' => $_SERVER['REQUEST_METHOD'], 'post' => $_POST, 'get
                   'cookie' => $_COOKIE, 'self' => $_SERVER['PHP_SELF'], 'proxy' => getenv('HTTP_PROXY') ?: null]);
 PHP
     printf '<?php http_response_code(418); echo "teapot";\n' > "$T/php/teapot.php"
+    printf '<?php usleep(100000); echo "slow";\n' > "$T/php/slow.php"
     printf '<?php echo "front ", $_SERVER["REQUEST_URI"];\n' > "$T/php/index.php"
     cat > "$T/fpm.conf" <<EOF
 [global]
@@ -333,6 +351,7 @@ pid = $T/fpm.pid
 listen = $T/fpm.sock
 pm = static
 pm.max_children = 2
+pm.max_requests = 0
 clear_env = yes
 security.limit_extensions = .php
 EOF
@@ -349,6 +368,16 @@ EOF
     has "set by setcookie" "$(cat "$T/ph")" 'Set-Cookie: seen=yes'
     expect "a status the script sets is the answer's" "$(curl -s -o /dev/null -w '%{http_code}' "$V/teapot.php")" 418
     expect "a route nothing answers is the front controller's" "$(curl -s "$V/some/route?x=1")" "front /some/route?x=1"
+    # Two workers and twelve requests at once, three times over: a kept connection would hold a worker each, and the
+    # rest would wait in php-fpm's backlog for one that never came free, until the deadline and the breaker.
+    codes=""
+    for _ in 1 2 3; do
+        codes+=$(curl -s -w '%{http_code}\n' --parallel --parallel-immediate --parallel-max 12 \
+            $(for i in $(seq 1 12); do printf -- '-o /dev/null %s ' "$V/slow.php?i=$i"; done))$'\n'
+    done
+    expect "more requests at once than php-fpm has workers are all answered" \
+        "$(printf '%s' "$codes" | grep -c '^200$')" 36
+    expect "and none of them opened the breaker" "$("$BIN" stats php 2>&1 | grep -c 'circuit:open')" 0
 else
     echo "  SKIP: php-fpm is not installed, so only the stub server's half ran"
 fi

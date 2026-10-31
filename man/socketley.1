@@ -4976,8 +4976,11 @@ speaks
 to its clients, and has no backend of any other kind; each of these is refused
 at
 .BR create .
-Pools, deadlines, retries, the circuit breaker and the TLS listener work on it
-as on any backend.
+Deadlines, retries, the circuit breaker and the TLS listener work on it as on
+any backend. A connection to the application server is not kept: one of
+php\-fpm's workers serves a connection for as long as it lasts, so a kept one
+would hold that worker from every other request, and with more of them than
+workers the rest would wait in its backlog until their deadline.
 .IP
 A request goes, in this order:
 to the first path segment ending in
@@ -5033,8 +5036,12 @@ They are 404.
 A file is served with its type, an ETag and Last\-Modified, answers
 If\-None\-Match, If\-Modified\-Since, If\-Match and If\-Unmodified\-Since
 (RFC 9110 13.2.2), one range with If\-Range, GET and HEAD alone (405 otherwise),
-and is read from the disk a window of 256 KiB at a time as the client takes it,
-under keep\-alive.
+under keep\-alive. A file up to 256 KiB is kept in memory after its first GET,
+64 MiB in all, and asked of the disk with one
+.BR statx (2)
+a request, which a file replaced under its name answers; a larger one is
+spliced from the page cache on a plain connection, and read 256 KiB at a time
+over TLS.
 .IP
 A
 .B Proxy

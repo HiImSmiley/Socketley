@@ -7611,6 +7611,10 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
     // by answering HTTP/1.0 without keep-alive.
     if (bconn->http_frame.conn_close)
         return false;
+    // An application server closes behind every answer, since one of its workers serves a connection for as long as
+    // it lasts and a pooled one would hold that worker from every other request.
+    if (bconn->fcgi != nullptr)
+        return false;
     // Where this response ended could not be established, and reuse needs both
     // ends to agree the stream is at a message boundary -- asked here, because
     // every path that pools comes through.

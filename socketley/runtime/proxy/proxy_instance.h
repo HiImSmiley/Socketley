@@ -222,7 +222,17 @@ struct fcgi_file
     uint64_t off{0};
     uint64_t left{0};
     std::string buf;
+    // An operation on the file or the pipe is in flight.
     bool reading{false};
+    // Sent file -> pipe -> socket without passing through this process, on a plain HTTP/1.1 connection: the pipe,
+    // what it holds, and the count of such pipes the proxy has open, which this one leaves when it goes.
+    int pipe[2]{-1, -1};
+    uint32_t in_pipe{0};
+    uint32_t pipe_size{0};
+    // A whole file read for a GET, which is then kept under this name for the requests after it.
+    std::string keep_as;
+    struct stat keep_stat{};
+    std::shared_ptr<uint32_t> pipes;
     fcgi_file() = default;
     fcgi_file(const fcgi_file&) = delete;
     fcgi_file& operator=(const fcgi_file&) = delete;
@@ -230,6 +240,12 @@ struct fcgi_file
     {
         if (fd >= 0)
             ::close(fd);
+        if (pipe[0] >= 0)
+            ::close(pipe[0]);
+        if (pipe[1] >= 0)
+            ::close(pipe[1]);
+        if (pipes)
+            --*pipes;
     }
 };
 
@@ -1216,9 +1232,26 @@ private:
     int fcgi_open(std::string_view rel, int flags, struct stat& st) const;
     bool open_fcgi_root();
     // A file beneath --root answered by this proxy, its next window read once the client has room, and that read's end.
-    void fcgi_serve_file(proxy_client_connection* conn, int fd, const struct stat& st, std::string_view rel);
+    void fcgi_serve_file(proxy_client_connection* conn, int fd, const struct stat& st, std::string_view rel,
+                         std::shared_ptr<const std::string> kept = {});
     void fcgi_file_next(proxy_client_connection* conn);
     void fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
+    void fcgi_file_spliced(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res, bool to_socket);
+    // The splice pipes served files hold now, bounded so a burst of downloads cannot take the process's descriptors.
+    std::shared_ptr<uint32_t> m_file_pipes{std::make_shared<uint32_t>(0)};
+    // Small files kept whole, as the server runtime keeps them: one statx a request says the bytes are still the
+    // file's, where an open, a stat and a read were.
+    struct fcgi_kept
+    {
+        dev_t dev{};
+        ino_t ino{};
+        off_t size{};
+        struct timespec mtime{};
+        std::shared_ptr<const std::string> body;
+    };
+    std::unordered_map<std::string, fcgi_kept, string_hash, string_equal> m_kept;
+    size_t m_kept_bytes{0};
+    bool fcgi_serve_kept(proxy_client_connection* conn, std::string_view rel);
     std::unique_ptr<fcgi_file_pump> m_files;
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 
