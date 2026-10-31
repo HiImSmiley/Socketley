@@ -251,6 +251,8 @@ bool proxy_instance::absorb_retired(io_request* req, struct io_uring_cqe* cqe)
 proxy_instance::~proxy_instance()
 {
     close_tracked(m_listen_fd);
+    if (m_fcgi_root_fd >= 0)
+        ::close(m_fcgi_root_fd);
 
     // Close any pooled backend connections, and free the sessions the
     // encrypted ones hold — the pool owns both.
@@ -357,6 +359,8 @@ void proxy_backend_connection::reset(int new_fd)
     // different peer.
     tls_context::free_ssl(ssl);
     ssl = nullptr;
+    // A pooled struct taken for another backend is no FastCGI leg until its first request makes it one.
+    fcgi.reset();
     tls_state = tls_conn_none;
     tls_peer_closed = false;
     read_pending = false;
@@ -975,6 +979,21 @@ void proxy_instance::drop_departed_endpoints()
 proxy_protocol proxy_instance::get_protocol() const { return m_protocol; }
 proxy_strategy proxy_instance::get_strategy() const { return m_strategy; }
 const std::vector<backend_info>& proxy_instance::get_backends() const { return m_backends; }
+
+// Application servers or HTTP ones, not both, since a request is written as one or the other; and a document root
+// to find the scripts under, which nothing else in a FastCGI request names.
+std::string proxy_instance::config_refusal() const
+{
+    const auto fcgi = [](const backend_info& b) { return std::string_view(b.address).starts_with("fastcgi://"); };
+    const size_t n = static_cast<size_t>(std::count_if(m_backends.begin(), m_backends.end(), fcgi));
+    if (n == 0)
+        return {};
+    if (n != m_backends.size() || m_protocol != protocol_http)
+        return "fastcgi:// backends are all of a proxy's backends, and its --protocol is http\n";
+    if (m_fcgi_root.empty())
+        return "fastcgi:// backends need --root, the directory the scripts are in\n";
+    return {};
+}
 const mesh_config& proxy_instance::get_mesh_config() const { return m_mesh; }
 
 void proxy_instance::set_health_check(mesh_config::health_type type) { m_mesh.health_check = type; }
@@ -1512,6 +1531,35 @@ bool proxy_instance::resolve_backend(backend_info& b)
         return true;
     }
 
+    // ─── fastcgi://unix:/path or fastcgi://host:port, an application server ──
+    if (std::string_view(b.address).starts_with("fastcgi://"))
+    {
+        b.fastcgi = true;
+        const std::string_view where = std::string_view(b.address).substr(10);
+        if (where.starts_with("unix:"))
+            return configure_unix_backend(b, where.substr(5), "\"" + b.address + "\"");
+        std::string_view host;
+        uint16_t port = 0;
+        bool tls = false;
+        if (where.starts_with("http") || !split_address(where, host, port, &tls) || port == 0 || tls)
+        {
+            LOG_ERROR(("proxy backend \"" + b.address +
+                       "\": a FastCGI backend is fastcgi://unix:/path or fastcgi://host:port").c_str());
+            return false;
+        }
+        b.resolved_host = std::string(host);
+        b.resolved_port = port;
+        if (inet_pton(AF_INET, b.resolved_host.c_str(), &b.cached_addr.sin_addr) != 1)
+        {
+            LOG_ERROR(("proxy backend \"" + b.address + "\": a FastCGI backend is named by its address").c_str());
+            return false;
+        }
+        b.cached_addr.sin_family = AF_INET;
+        b.cached_addr.sin_port = htons(port);
+        b.has_cached_addr = true;
+        return true;
+    }
+
     // ─── unix:/path/to.sock ─────────────────────────────────────────────────
     if (std::string_view(b.address).starts_with("unix:"))
         return configure_unix_backend(b, std::string_view(b.address).substr(5),
@@ -1944,6 +1992,24 @@ bool proxy_instance::setup(event_loop& loop)
         any_backend_tls = any_backend_tls || b.tls;
     }
     m_backends_resolved = true;
+
+    // config_refusal() has made sure these are all the backends and that --root names where the scripts are.
+    const size_t fcgi_count = static_cast<size_t>(
+        std::count_if(m_backends.begin(), m_backends.end(), [](const backend_info& b) { return b.fastcgi; }));
+    m_fastcgi = fcgi_count > 0;
+    if (m_fastcgi)
+    {
+        if (any_backend_tls)
+        {
+            LOG_ERROR(("proxy " + std::string(get_name()) + ": fastcgi:// backends are spoken to without TLS").c_str());
+            return false;
+        }
+        if (!open_fcgi_root())
+            return false;
+        // An HTTP probe is a request php-fpm cannot read, so its health is whether it takes a connection.
+        if (m_mesh.health_check == mesh_config::health_http)
+            m_mesh.health_check = mesh_config::health_tcp;
+    }
 
     if (any_backend_tls)
     {
@@ -3923,6 +3989,11 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             run_request_filters(conn))
             return;   // answered by a filter; no backend was ever chosen
 
+        // A FastCGI proxy decides here which script answers, or answers itself; nothing reaches the interpreter that
+        // is not a script beneath --root.
+        if (SOCKETLEY_UNLIKELY(m_fastcgi) && !route_fastcgi(conn, new_path))
+            return;
+
         // Select and connect to backend
         auto* target = select_and_resolve_backend(conn);
         if (SOCKETLEY_UNLIKELY(!target))
@@ -4312,6 +4383,33 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         tls_plain.swap(conn->partial);
         data_ptr = tls_plain.data();
         data_len = tls_plain.size();
+    }
+
+    // An application server's records, made the HTTP answer everything below reads; a read that finished no part of
+    // one waits for the next.
+    std::string fcgi_http;
+    if (SOCKETLEY_UNLIKELY(conn->fcgi != nullptr))
+    {
+        if (!fastcgi_decode(conn, {data_ptr, data_len}, fcgi_http) && fcgi_http.empty())
+            conn->closing = true;
+        if (is_provided)
+        {
+            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            is_provided = false;
+        }
+        if (fcgi_http.empty())
+        {
+            if (conn->closing)
+            {
+                close_pair(conn->client_fd, fd);
+                return;
+            }
+            if (!conn->read_pending && SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
+                close_pair(conn->client_fd, fd);
+            return;
+        }
+        data_ptr = fcgi_http.data();
+        data_len = fcgi_http.size();
     }
 
     // A reused socket whose answer does not open with a status line is still
@@ -7008,6 +7106,9 @@ void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_bac
     // guarded here for the same reason as the line above, since leaving splice_active false is all it takes.
     if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr || conn->h3s != nullptr))
         return;
+    // Nor to an application server, whose records are translated and never relayed as they come.
+    if (SOCKETLEY_UNLIKELY(m_fastcgi))
+        return;
     if (on_fast_lo(conn->fd, bconn->fd))
         return;
 
@@ -8401,6 +8502,9 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     cconn->ex.body_unbounded = false;
     cconn->ex.req_chunk = {};
     cconn->ex.saved_request.clear();
+    cconn->ex.fcgi_script.clear();
+    cconn->ex.fcgi_filename.clear();
+    cconn->ex.fcgi_path_info.clear();
 
     // conn->partial is deliberately not cleared, because the pipelined request
     // in it has to go through the framing checks -- and nothing else will wake
@@ -10225,6 +10329,24 @@ bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         }
     }
 #endif
+
+    // To an application server the request goes as FastCGI records, written from what would have been sent as HTTP.
+    if (SOCKETLEY_UNLIKELY(!conn->ex.fcgi_script.empty()))
+    {
+        if (!bconn->fcgi)
+            bconn->fcgi = std::make_unique<fcgi_leg>();
+        std::string records;
+        if (!fastcgi_encode(conn, *bconn->fcgi, hook_modified ? std::string_view(hook_storage) : data, records))
+        {
+            send_error(conn, "400 Bad Request", "Bad Request\n");
+            bconn->closing = true;
+            return false;
+        }
+        if (records.empty())
+            return false;
+        hook_storage = std::move(records);
+        hook_modified = true;
+    }
 
     SKL_TRACE_ADD(bconn, bytes_queued, (unsigned long long)data.size());
     if (SOCKETLEY_UNLIKELY(bconn->write_queue.bytes() >= write_buffer_bytes()))

@@ -51,6 +51,12 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
         prx.set_health_interval(cfg.health_interval);
     if (want("health_path", !cfg.health_path.empty()))
         prx.set_health_path(cfg.health_path);
+    if (want("root", !cfg.fcgi_root.empty()))
+        prx.set_root(cfg.fcgi_root);
+    if (want("fastcgi_root", !cfg.fcgi_remote_root.empty()))
+        prx.set_fastcgi_root(cfg.fcgi_remote_root);
+    if (want("index", !cfg.fcgi_index.empty()))
+        prx.set_index(cfg.fcgi_index);
     if (want("health_threshold", cfg.health_threshold != defaults.health_threshold))
         prx.set_health_threshold(cfg.health_threshold);
     if (want("circuit_threshold", cfg.circuit_threshold != defaults.circuit_threshold))

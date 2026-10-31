@@ -656,6 +656,9 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.health_check = static_cast<uint8_t>(mesh.health_check);
             cfg.health_interval = mesh.health_interval;
             cfg.health_path = mesh.health_path;
+            cfg.fcgi_root = std::string(prx->get_root());
+            cfg.fcgi_remote_root = std::string(prx->get_fastcgi_root());
+            cfg.fcgi_index = std::string(prx->get_index());
             cfg.health_threshold = mesh.health_threshold;
             cfg.circuit_threshold = mesh.circuit_threshold;
             cfg.circuit_timeout = mesh.circuit_timeout;
@@ -1089,6 +1092,12 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_int_field("health_interval", cfg.health_interval);
             if (!cfg.health_path.empty() && cfg.health_path != "/health")
                 append_str_field("health_path", cfg.health_path);
+            if (!cfg.fcgi_root.empty())
+                append_str_field("root", cfg.fcgi_root);
+            if (!cfg.fcgi_remote_root.empty())
+                append_str_field("fastcgi_root", cfg.fcgi_remote_root);
+            if (!cfg.fcgi_index.empty() && cfg.fcgi_index != "index.php")
+                append_str_field("index", cfg.fcgi_index);
             if (!cfg.proxy_auth.empty())
                 append_str_field("auth", cfg.proxy_auth);
             if (cfg.https_redirect != 0)
@@ -1523,6 +1532,9 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.health_check = static_cast<uint8_t>(json_get_int(json, "health_check"));
             { auto v = json_get_int(json, "health_interval"); if (v > 0) cfg.health_interval = v; }
             { auto s = json_get_string(json, "health_path"); if (!s.empty()) cfg.health_path = s; }
+            cfg.fcgi_root = json_get_string(json, "root");
+            cfg.fcgi_remote_root = json_get_string(json, "fastcgi_root");
+            cfg.fcgi_index = json_get_string(json, "index");
             cfg.proxy_auth = json_get_string(json, "auth");
             { auto v = json_get_int(json, "redirect_https"); if (v > 0 && v <= 65535) cfg.https_redirect = static_cast<uint16_t>(v); }
             { auto v = json_get_int(json, "health_threshold"); if (v > 0) cfg.health_threshold = v; }

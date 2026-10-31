@@ -66,6 +66,8 @@ struct backend_info
     // because resolve_backend refuses a path that is not absolute.
     bool is_unix = false;
     std::string unix_path;
+    // An application server such as php-fpm, reached by FastCGI (fastcgi://unix:/path or fastcgi://host:port).
+    bool fastcgi = false;
     struct sockaddr_in cached_addr{};
 
     // The table's node list this backend was resolved against, empty when it
@@ -175,6 +177,11 @@ struct proxy_exchange
     bool backend_from_group{false};
     std::string backend_host;
     uint16_t backend_port{0};
+    // A FastCGI proxy's route for this request: the script under --root as a URL path, as the application server
+    // finds it, and what of the path follows it; an empty script is no FastCGI request.
+    std::string fcgi_script;
+    std::string fcgi_filename;
+    std::string fcgi_path_info;
 
     // A request handed to the backend with no answer yet, which nothing else
     // bounded: a backend that accepts and stops answering fails no check, and
@@ -358,6 +365,29 @@ struct alignas(64) proxy_client_connection
     void reset(int new_fd);
 };
 
+// The FastCGI translation of one connection to an application server: the HTTP/1.1 request the proxy writes made
+// records, and the records read back made the HTTP/1.1 answer the rest of the proxy relays.  One request at a time,
+// reset when the server ends it, so a pooled connection starts the next one clean.
+struct fcgi_leg
+{
+    enum class out_phase : uint8_t { head, body_length, body_chunked, done };
+    out_phase out{out_phase::head};
+    // The request head until its blank line, kept for the CGI variables a chunked body sends at its end.
+    std::string head;
+    size_t body_left{0};
+    http_chunked_decoder chunk{};
+    std::string body;
+    bool head_request{false};
+
+    // Record bytes not yet whole, the CGI head not yet whole, and the line of STDERR not yet ended.
+    std::string raw;
+    std::string cgi;
+    std::string err;
+    bool cgi_done{false};
+    bool chunked{false};
+    bool bodiless{false};
+};
+
 struct alignas(64) proxy_backend_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
@@ -450,6 +480,9 @@ struct alignas(64) proxy_backend_connection
 
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
+
+    // Set on a leg to a fastcgi:// backend, which then writes records and reads them, and null on every other.
+    std::unique_ptr<fcgi_leg> fcgi;
 
     // See proxy_client_connection::read_buf.
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
@@ -629,11 +662,20 @@ public:
     proxy_strategy get_strategy() const;
     const std::vector<backend_info>& get_backends() const;
     const mesh_config& get_mesh_config() const;
+    std::string config_refusal() const override;
 
     // Service mesh configuration
     void set_health_check(mesh_config::health_type type);
     void set_health_interval(int seconds);
     void set_health_path(std::string_view path);
+    // A FastCGI proxy's document root (--root), the same root as the application server sees it (--fastcgi-root,
+    // empty for the same path), and the script a directory and a path nothing answers are sent to (--index).
+    void set_root(std::string_view dir);
+    std::string_view get_root() const { return m_fcgi_root; }
+    void set_fastcgi_root(std::string_view dir);
+    std::string_view get_fastcgi_root() const { return m_fcgi_remote_root; }
+    void set_index(std::string_view name);
+    std::string_view get_index() const { return m_fcgi_index; }
     void set_health_threshold(int threshold);
     void set_circuit_threshold(int threshold);
     void set_circuit_timeout(int seconds);
@@ -1121,6 +1163,25 @@ private:
     proxy_protocol m_protocol = protocol_http;
     proxy_strategy m_strategy = strategy_round_robin;
     std::vector<backend_info> m_backends;
+    // FastCGI: whether the backends are application servers, the root and its descriptor (O_PATH, opened at setup),
+    // the root the server sees, and the index script.
+    bool m_fastcgi{false};
+    std::string m_fcgi_root;
+    int m_fcgi_root_fd{-1};
+    std::string m_fcgi_root_real;
+    std::string m_fcgi_remote_root;
+    std::string m_fcgi_index{"index.php"};
+    // STDERR lines logged this minute and when the minute began, so a script warning on every request is said a few
+    // times a minute and not once a request.
+    uint32_t m_fcgi_err_lines{0};
+    int64_t m_fcgi_err_minute{0};
+    // proxy_fastcgi.cpp: the route of a request (false when answered here), the request written as records, the
+    // records read back as HTTP, false for a stream that is not FastCGI.
+    bool route_fastcgi(proxy_client_connection* conn, std::string_view path);
+    bool fastcgi_encode(proxy_client_connection* conn, fcgi_leg& leg, std::string_view in, std::string& out);
+    bool fastcgi_decode(proxy_backend_connection* conn, std::string_view in, std::string& out);
+    bool fcgi_regular(std::string_view rel, bool& dir) const;
+    bool open_fcgi_root();
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 
     // ── the entrance ────────────────────────────────────────────────────────

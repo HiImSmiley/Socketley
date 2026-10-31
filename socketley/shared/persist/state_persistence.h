@@ -136,6 +136,10 @@ struct runtime_config
     std::string mesh_client_ca;
     std::string mesh_client_cert;
     std::string mesh_client_key;
+    // --root, --fastcgi-root and --index, a FastCGI proxy's.
+    std::string fcgi_root;
+    std::string fcgi_remote_root;
+    std::string fcgi_index;
     // --auth and --redirect-https.
     std::string proxy_auth;
     uint16_t https_redirect = 0;

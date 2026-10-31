@@ -1092,6 +1092,33 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
 {
     switch (pa.hashes[i])
     {
+        // A FastCGI proxy's directories, absolute because the daemon reads them and not the shell that named them.
+        case fnv1a("--root"):
+        case fnv1a("--fastcgi-root"):
+        {
+            const bool remote = pa.hashes[i] == fnv1a("--fastcgi-root");
+            if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].front() != '/')
+            {
+                std::cout << (remote ? "--fastcgi-root" : "--root") << " requires an absolute directory\n";
+                return 1;
+            }
+            if (remote)
+                proxy->set_fastcgi_root(pa.args[++i]);
+            else
+                proxy->set_root(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--index"):
+        {
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (v.empty() || v.find('/') != std::string_view::npos || v.starts_with('.'))
+            {
+                std::cout << "--index requires a file name, as index.php\n";
+                return 1;
+            }
+            proxy->set_index(pa.args[++i]);
+            return 0;
+        }
         case fnv1a("--strategy"):
         {
             if (i + 1 >= pa.count)
