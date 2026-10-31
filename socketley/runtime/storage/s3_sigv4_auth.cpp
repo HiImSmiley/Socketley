@@ -745,6 +745,19 @@ bool sigv4_authenticator::iam_changed()
     return socketley::file_stamp::of(m_cfg.iam_file) != m_iam_stamp.stamp;
 }
 
+// A key another shard's IAM call just wrote is in the file before that call is answered, so a miss looks there at once:
+// a stat, where a throttle shared with the periodic probe refused the key for the next 20 ms after it.
+std::string_view sigv4_authenticator::secret_or_reload(std::string_view access_key)
+{
+    std::string_view s = m_creds.secret(access_key);
+    if (s.empty() && iam_changed())
+    {
+        refresh();
+        s = m_creds.secret(access_key);
+    }
+    return s;
+}
+
 void sigv4_authenticator::refresh()
 {
     std::string err;
@@ -967,19 +980,7 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
     {
         if (token.empty())
         {
-            std::string_view s = m_creds.secret(access_key);
-            // A key the IAM API just made on another shard is looked for again in the file, at most every 20 ms.
-            if (s.empty() && !m_cfg.iam_file.empty() &&
-                std::chrono::steady_clock::now() - m_last_iam_probe > std::chrono::milliseconds(20))
-            {
-                m_last_iam_probe = std::chrono::steady_clock::now();
-                if (iam_changed())
-                {
-                    refresh();
-                    s = m_creds.secret(access_key);
-                }
-            }
-            return s;
+            return secret_or_reload(access_key);
         }
         return session_secret(token, access_key, now, session_user, expired);
     };
@@ -1028,12 +1029,7 @@ auth_verdict sigv4_authenticator::authorize_basic(std::string_view access_key, s
 {
     maybe_reload();
     auth_verdict v;
-    std::string_view want = m_creds.secret(access_key);
-    if (want.empty() && iam_changed())
-    {
-        refresh();
-        want = m_creds.secret(access_key);
-    }
+    const std::string_view want = secret_or_reload(access_key);
     // Compared in constant time, as a signature is, so the secret is not guessed by how long a refusal takes.
     if (want.empty() || !crypto::secure_equal(want, secret))
     {
@@ -1116,7 +1112,7 @@ auth_verdict sigv4_authenticator::authorize_key(std::string_view access_key)
 {
     maybe_reload();
     auth_verdict v;
-    if (m_creds.secret(access_key).empty())
+    if (secret_or_reload(access_key).empty())
     {
         v.allowed = false;
         v.error   = {"AccessDenied", "The access key is not one of this runtime's.", 403};
@@ -1189,7 +1185,7 @@ auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
     };
     if (sig.algorithm.empty() && !sig.v2_access_key.empty())
     {
-        const std::string_view key = m_creds.secret(sig.v2_access_key);
+        const std::string_view key = secret_or_reload(sig.v2_access_key);
         if (key.empty())
             return refuse("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403);
         const std::string raw = crypto::hmac_sha1(key, sig.policy);
@@ -1217,7 +1213,7 @@ auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
     if (rest.empty() || date.size() != 8 || parts[3] != "aws4_request" || service != "s3" || region.empty() ||
         !sig.amz_date.starts_with(date))
         return refuse("InvalidArgument", "The x-amz-credential or x-amz-date of the form is malformed.", 400);
-    const std::string_view secret = m_creds.secret(rest);
+    const std::string_view secret = secret_or_reload(rest);
     if (secret.empty())
         return refuse("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403);
     const auto mac = [](std::string_view key, std::string_view msg) { return crypto::hmac_sha256(key, msg); };

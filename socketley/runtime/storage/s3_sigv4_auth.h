@@ -210,6 +210,8 @@ private:
     // Reads the IAM file into `set`, its roles into m_roles.
     void add_iam(credential_set& set);
     bool iam_changed();
+    // An access key's secret, the IAM file read again first when it is not here and the file changed since.
+    std::string_view secret_or_reload(std::string_view access_key);
 };
 
 // The hook for a body that is aws-chunked with no signature, which a request
