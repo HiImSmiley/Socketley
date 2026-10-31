@@ -201,6 +201,8 @@ public:
     void each_alert(const std::function<void(const alert_event&)>& fn) const;
     // One line an alert, `state alertname severity labels summary` with tabs between, for the CLI.
     void render_alerts_text(std::string& out) const;
+    // A line a rule for `socketley metrics rules`: alert or record, its name, state, severity, for and query.
+    void render_rules_text(std::string& out) const;
 
     size_t rule_count() const;
     // Pending and firing alerts.

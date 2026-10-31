@@ -159,6 +159,8 @@ H=$(cat "$T/hook.log")
 has "a firing alert reaches the daemon's webhook" "$H" '"text":"[^"]*cache c2 stopped\\nit was asked to","state":"firing"'
 has "with the alert as the dashboard reads it" "$H" '"alert":\{"id":"CacheStopped:[^"]*","level":"critical","runtime":"c2"'
 has "the alert is listed" "$(S metrics ma alerts)" '^firing	CacheStopped	critical	.*name=c2'
+has "and the rules are a table as targets are, its own rule firing among them" "$(S metrics ma rules)" '^alert	CacheStopped	firing	critical	'
+hasnt "not the API's JSON" "$(S metrics ma rules)" '^\{"status"'
 has "ALERTS is written" "$(F /api/v1/query 'ALERTS{alertname="CacheStopped"}')" '"alertstate":"firing"'
 S start c2 >/dev/null
 until_has 'cat "$T/hook.log"' 'cache c2 stopped -- resolved' 60 || true

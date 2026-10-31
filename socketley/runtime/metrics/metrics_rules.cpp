@@ -1996,6 +1996,30 @@ void rule_engine::render_alerts_text(std::string& out) const
         }
 }
 
+void rule_engine::render_rules_text(std::string& out) const
+{
+    for (const auto& r : m->rules)
+    {
+        const bool alert = r->def.k == rule_def::kind::alert;
+        alert_state worst = alert_state::inactive;
+        for (const auto& [ls, a] : r->alerts)
+            worst = std::max(worst, a.state);
+        out += alert ? "alert\t" : "record\t";
+        out += r->def.name;
+        out += '\t';
+        out += alert ? state_name(worst) : std::string_view("-");
+        out += '\t';
+        out += alert ? std::string_view(r->def.severity) : std::string_view("-");
+        out += '\t';
+        out += alert && r->def.for_ms ? "for " + duration_text(r->def.for_ms) : std::string("-");
+        out += '\t';
+        // One line, as a query written over several reads the same.
+        for (const char c : r->def.expr)
+            out += c == '\n' ? ' ' : c;
+        out += '\n';
+    }
+}
+
 size_t rule_engine::rule_count() const { return m->rules.size(); }
 
 size_t rule_engine::active_alerts() const

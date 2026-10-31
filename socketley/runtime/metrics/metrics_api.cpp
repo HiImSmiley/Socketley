@@ -238,6 +238,14 @@ void metrics_run::api(std::string_view path, const api_params& p, api_reply& out
         if (std::string_view x; p.get("exclude_alerts", x))
             f.exclude_alerts = x == "true" || x == "1";
         std::string d;
+        if (text)
+        {
+            if (m_rules)
+                m_rules->render_rules_text(d);
+            out.body = std::move(d);
+            out.type = "text/plain; charset=utf-8";
+            return;
+        }
         if (m_rules)
             m_rules->render_rules(d, f);
         else
