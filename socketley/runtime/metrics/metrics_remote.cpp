@@ -212,7 +212,8 @@ reader sub(std::string_view s)
 
 size_t varint_size(uint64_t v)
 {
-    return static_cast<size_t>(std::max(1, (std::bit_width(v) + 6) / 7));
+    // bit_width is int since LWG 3656 and the operand's type in GCC 12's library, so the sum is made an int here.
+    return static_cast<size_t>(std::max(1, static_cast<int>((std::bit_width(v) + 6) / 7)));
 }
 
 void put_varint(std::string& out, uint64_t v)

@@ -1,6 +1,7 @@
 #include "metrics_regex.h"
 
 #include <algorithm>
+#include <cstddef>
 
 namespace socketley::metrics
 {
@@ -1048,7 +1049,7 @@ bool regex::run(std::string_view s, int* out, int ncap) const
                     break;
                 default:
                     if (nc)
-                        std::copy(m_cur.begin(), m_cur.end(), l->caps.begin() + static_cast<ptrdiff_t>(slot * nc));
+                        std::copy(m_cur.begin(), m_cur.end(), l->caps.begin() + static_cast<std::ptrdiff_t>(slot * nc));
                     break;
             }
         }
@@ -1064,7 +1065,7 @@ bool regex::run(std::string_view s, int* out, int ncap) const
                 if (m_prog[clist->dense[i]].op == op_match)
                 {
                     if (nc)
-                        std::copy_n(clist->caps.begin() + static_cast<ptrdiff_t>(i * nc), nc, out);
+                        std::copy_n(clist->caps.begin() + static_cast<std::ptrdiff_t>(i * nc), nc, out);
                     return true;
                 }
             return false;
@@ -1090,7 +1091,7 @@ bool regex::run(std::string_view s, int* out, int ncap) const
             if (!ok)
                 continue;
             if (nc)
-                std::copy_n(clist->caps.begin() + static_cast<ptrdiff_t>(i * nc), nc, m_cur.begin());
+                std::copy_n(clist->caps.begin() + static_cast<std::ptrdiff_t>(i * nc), nc, m_cur.begin());
             follow(nlist, pc + 1, pos + w);
         }
         std::swap(clist, nlist);
