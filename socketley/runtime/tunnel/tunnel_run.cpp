@@ -1156,6 +1156,31 @@ void tunnel_run::answer_front(const std::shared_ptr<http::server_conn>& c, int s
 }
 
 // A signed-in admin of the edge's idp adds an agent, answered with the invitation its CLI joins with at once.
+void tunnel_run::note_refused(const std::string& name, const std::string& from)
+{
+    const int64_t now = wall::now_sec_coarse();
+    if (m_refused.size() > 256)
+        m_refused.clear();
+    // By address, not port, since each dial comes from a port of its own: a.b.c.d:port, [v6]:port, or a bare address.
+    std::string_view host = from;
+    if (host.starts_with('['))
+        host = host.substr(0, host.find(']') + 1);
+    else if (std::count(host.begin(), host.end(), ':') == 1)
+        host = host.substr(0, host.find(':'));
+    auto& [said, since] = m_refused["\"" + name + "\" refused from " + std::string(host)];
+    if (said != 0 && now - said < 60)
+    {
+        ++since;
+        return;
+    }
+    std::string line = "tunnel " + std::string(m_owner.get_name()) + ": agent \"" + name + "\" refused from " + from;
+    if (since)
+        line += ", and " + std::to_string(since) + " time(s) more since it was last said";
+    LOG_INFO(line.c_str());
+    said = now;
+    since = 0;
+}
+
 void tunnel_run::join_by_person(const std::shared_ptr<http::server_conn>& c, std::string_view head)
 {
     const std::string_view auth = header_of(head, "authorization");
@@ -1269,8 +1294,7 @@ void tunnel_run::front_request(const std::shared_ptr<http::server_conn>& c)
         const auto it = std::find_if(m_agents.begin(), m_agents.end(), [&](const agent& a) { return a.name == name; });
         if (it == m_agents.end() || !it->joined || it->secret_hash != hash_secret(secret))
         {
-            LOG_INFO(("tunnel " + std::string(m_owner.get_name()) + ": agent \"" + name + "\" refused from " +
-                      client_of(c->peer, head)).c_str());
+            note_refused(name, client_of(c->peer, head));
             refuse_front(c, 401, "this agent's key is not one the edge holds");
             return;
         }

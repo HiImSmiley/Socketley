@@ -337,6 +337,16 @@ case "$out" in *"hello from home"*) bad "a revoked agent is carried no more" "$o
 for _ in $(seq 1 30); do [ "$("$BIN" stats t 2>/dev/null | sed -n 's/^links://p')" = 0 ] && break; sleep 0.2; done
 [ "$("$BIN" stats t 2>/dev/null | sed -n 's/^links://p')" = 0 ] && ok || bad "and its link is cut" "$("$BIN" stats t 2>&1 | grep links)"
 
+# An agent the edge does not hold dials again every few seconds: refused each time, and said once, not once a dial.
+before=$(grep -c 'agent "stranger" refused' "$SOCKETLEY_DLOG" 2>/dev/null)
+for _ in 1 2 3 4 5; do
+    curl -s -o /dev/null -m 3 -H "Connection: Upgrade" -H "Upgrade: socketley-tunnel/1" \
+         -H "Authorization: Tunnel stranger.$(printf 'g%.0s' $(seq 1 40))" "http://127.0.0.1:$PE/.tunnel"
+done
+sleep 0.5
+said=$(( $(grep -c 'agent "stranger" refused' "$SOCKETLEY_DLOG" 2>/dev/null) - ${before:-0} ))
+[ "$said" = 1 ] && ok || bad "an agent refused five times in a row is said once" "said $said time(s)"
+
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

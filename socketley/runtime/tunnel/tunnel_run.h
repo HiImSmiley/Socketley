@@ -247,6 +247,8 @@ private:
     void refuse_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view why);
     void answer_front(const std::shared_ptr<http::server_conn>& c, int status, std::string_view body);
     void join_by_person(const std::shared_ptr<http::server_conn>& c, std::string_view head);
+    // An agent refused, said at once and then once a minute with how often since, as it dials again every few seconds.
+    void note_refused(const std::string& name, const std::string& from);
     void upgraded(const std::shared_ptr<http::server_conn>& c, link::kind k, std::string who,
                   std::string_view extra_headers, std::string sub = {}, int64_t signed_in_ms = 0, bool admin = false);
     // Whether a person's sign-in still holds at the idp, its admin bit made what the account's is now.
@@ -292,6 +294,8 @@ private:
     std::vector<agent> m_agents;
     int64_t m_agents_mtime{-1};
     std::unordered_map<std::string, std::weak_ptr<link>> m_agent_links;
+    // Per agent and address refused: when it was last said, and how often since; cleared past 256, as a stranger names any.
+    std::unordered_map<std::string, std::pair<int64_t, uint64_t>> m_refused;
     // People's shares by name: whose they are, until when, and the link carrying them once it is up.
     struct share_entry
     {
