@@ -538,6 +538,10 @@ void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
         prx.set_backend_timeout(cfg.backend_timeout);
         if (cfg.retry_count >= 0)      prx.set_retry_count(cfg.retry_count);
         prx.set_retry_all(cfg.retry_all);
+        // A FastCGI proxy's directories are read per request, the root reopened by set_root before it is used.
+        if (!cfg.fcgi_root.empty())    prx.set_root(cfg.fcgi_root);
+        prx.set_fastcgi_root(cfg.fcgi_remote_root);
+        prx.set_index(cfg.fcgi_index);
     }
 
     // A storage quota is read at each put, so it moves under a serving runtime.

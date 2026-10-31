@@ -163,6 +163,11 @@ r=$(curl -s -X POST --data-binary @"$T/big.bin" "$U/hello.php")
 expect "a body over several records arrives whole" "$(j "$(last)" 'd["CONTENT_LENGTH"]+" "+d["stdin_sha"]')" \
     "300000 $(sha256sum < "$T/big.bin" | cut -c1-64)"
 
+head -c 2000000 /dev/urandom > "$T/upload.bin"
+t=$(curl -s -o /dev/null -w '%{time_total}' -X POST --data-binary @"$T/upload.bin" "$U/hello.php")
+expect "an upload that asks to continue is told to at once, not after the client's own second of waiting" \
+    "$(python3 -c "import sys; print(float(sys.argv[1]) < 0.5)" "$t") $(j "$(last)" 'd["CONTENT_LENGTH"]')" "True 2000000"
+
 # ── answers ─────────────────────────────────────────────────────────────────
 expect "a script's Status is the answer's" "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Mode: 404' "$U/hello.php")" 404
 expect "a Location with no Status is a redirect" \
@@ -278,6 +283,20 @@ expect "no file reached the server" "$(wc -l < "$T/stub.log")" 0
 st=$("$BIN" stats site 2>&1)
 has "stats count the files served" "$st" 'files_served: ?[1-9]'
 has "and the 304s among them" "$st" 'files_not_modified: ?[1-9]'
+
+# ── a new --root, on a proxy that is running ────────────────────────────────
+W2="$T/www2"; mkdir -p "$W2"; printf '<?php\n' > "$W2/only2.php"; printf 'two\n' > "$W2/two.txt"
+"$BIN" edit site --root "$W2" >/dev/null 2>&1 || bad "a new --root is taken" "refused"
+for _ in $(seq 1 30); do [ "$(code /two.txt)" = 200 ] && break; sleep 0.2; done
+expect "a new --root is the one files come from" "$(curl -s "$U/two.txt")" "two"
+r=$(curl -s "$U/only2.php")
+expect "and the one scripts are found in and named by" "$(j "$(last)" 'd["SCRIPT_FILENAME"]')" "$W2/only2.php"
+expect "and the old one is not looked in" "$(code /style.css)" 404
+"$BIN" edit site --root "$T/nowhere" >/dev/null 2>&1
+sleep 0.5
+expect "a root that cannot be opened leaves the one that could" "$(curl -s "$U/two.txt")" "two"
+"$BIN" edit site --root "$W" >/dev/null 2>&1
+for _ in $(seq 1 30); do [ "$(code /style.css)" = 200 ] && break; sleep 0.2; done
 
 # ── over TLS, a window at a time through the record layer ───────────────────
 if command -v openssl >/dev/null 2>&1; then

@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <utility>
 
 #include "../../shared/http/conditional.h"
 #include "../../shared/http/fastcgi.h"
@@ -175,9 +176,21 @@ constexpr uint32_t file_window = 256 * 1024;
 
 void proxy_instance::set_root(std::string_view dir)
 {
-    m_fcgi_root = std::string(dir);
-    while (m_fcgi_root.size() > 1 && m_fcgi_root.back() == '/')
-        m_fcgi_root.pop_back();
+    std::string root(dir);
+    while (root.size() > 1 && root.back() == '/')
+        root.pop_back();
+    if (m_fcgi_root_fd < 0 || root == m_fcgi_root)
+    {
+        m_fcgi_root = std::move(root);
+        return;
+    }
+    // A serving proxy moves to the new root once it is open, so the descriptor and the name never disagree.
+    std::string before = std::exchange(m_fcgi_root, std::move(root));
+    if (!open_fcgi_root())
+    {
+        m_fcgi_root = std::move(before);
+        if (!open_fcgi_root()) {}
+    }
 }
 
 void proxy_instance::set_fastcgi_root(std::string_view dir)
@@ -578,6 +591,15 @@ bool proxy_instance::fastcgi_encode(proxy_client_connection* conn, fcgi_leg& leg
             if (!parse_head(leg.head, h))
                 return false;
             leg.head_request = iequal(h.method, "HEAD");
+            // An application server never answers 100 Continue, so a client that asked to be told waited its own
+            // timeout for every upload; this proxy is the origin it asked, and tells it.
+            if ((h.chunked || h.length > 0) && iequal(field_of(h, "expect"), "100-continue") && !conn->h2_parent &&
+                !conn->h3s && !conn->closing)
+            {
+                conn->write_queue.push(std::string("HTTP/1.1 100 Continue\r\n\r\n"));
+                if (!conn->write_pending && !flush_client_write_queue(conn))
+                    return false;
+            }
             fcgi::append_begin(out, true);
             if (h.chunked)
             {
