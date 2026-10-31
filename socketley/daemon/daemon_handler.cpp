@@ -20,6 +20,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
+#include "../runtime/idp/idp_ssh_certs.h"
 #include "../runtime/tunnel/tunnel_instance.h"
 #include "../runtime/tunnel/tunnel_registry.h"
 #include "../runtime/proxy/proxy_auth.h"
@@ -5463,6 +5464,59 @@ static std::string_view import_document(const parsed_args& pa)
     return std::string_view(b, static_cast<size_t>(e - b));
 }
 
+namespace
+{
+
+// What a runtime keeps under the state directory in its own name, at the paths its type reads it from.
+std::vector<std::string> named_state(runtime_type type, std::string_view name)
+{
+    switch (type)
+    {
+        case runtime_tunnel:  return {socketley::tunnel::edge_dir(name)};
+        case runtime_db:      return {db_data_dir(name)};
+        case runtime_metrics: return {metrics_data_dir(name)};
+        case runtime_mqtt:    return {mqtt_default_snapshot(name)};
+        case runtime_dns:     return {dns_dnssec_dir(name)};
+        case runtime_sync:    return {sync_index_path(name)};
+        case runtime_idp:
+            return {idp_key_path(name), idp_jwks_path(name), idp_standing_path(name), idp_accounts_dir(name),
+                    idp_ssh_ca_path(name), socketley::idp::ssh_certs_path(name), socketley::idp::ssh_krl_path(name)};
+        default:              return {};
+    }
+}
+
+// Moved all or none, so a rename that fails part way leaves every piece where the old name finds it.
+bool rename_named_state(runtime_type type, std::string_view from, std::string_view to, std::string& why)
+{
+    const std::vector<std::string> a = named_state(type, from), b = named_state(type, to);
+    std::error_code ec;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::filesystem::exists(a[i], ec) && std::filesystem::exists(b[i], ec))
+        {
+            why = "the state of " + std::string(to) + " is there already: " + b[i];
+            return false;
+        }
+    std::vector<size_t> moved;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        if (!std::filesystem::exists(a[i], ec))
+            continue;
+        std::filesystem::rename(a[i], b[i], ec);
+        if (ec)
+        {
+            why = a[i] + " could not be renamed: " + ec.message();
+            std::error_code undo;
+            for (auto it = moved.rbegin(); it != moved.rend(); ++it)
+                std::filesystem::rename(b[*it], a[*it], undo);
+            return false;
+        }
+        moved.push_back(i);
+    }
+    return true;
+}
+
+}   // namespace
+
 int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool may_restart)
 {
     if (may_restart && pa.count >= 3 && asks_restart(pa))
@@ -6113,25 +6167,24 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
 
     if (renamed)
     {
-        // A mail runtime's spool, keys and mailboxes' state are files named for it, moved with it.
+        // What a runtime keeps in its name goes with it: a mail runtime's spool, keys and mailboxes, and every other
+        // type's at the paths named_state() gives.
         const runtime_instance* before = m_manager.get(old_name);
-        const bool mail = before && before->get_type() == runtime_mail;
+        const runtime_type was = before ? before->get_type() : runtime_server;
         if (!m_manager.rename(old_name, cfg.name))
         {
             conn->write_buf = "rename failed: name already taken\n";
             return 1;
         }
-        if (std::string why; mail && !mail_rename_state(old_name, cfg.name, why))
+        if (std::string why; was == runtime_mail && !mail_rename_state(old_name, cfg.name, why))
             LOG_WARN(("mail " + cfg.name + ": its state stayed under " + old_name + ": " + why).c_str());
+        if (std::string why; !rename_named_state(was, old_name, cfg.name, why))
+            LOG_WARN((cfg.name + ": its state stayed under " + old_name + ": " + why).c_str());
         instance = m_manager.get(cfg.name);
         // The children it took along name it on disk too.
         for (const auto& child : m_manager.get_children(cfg.name))
             if (auto* c = m_manager.get(child); c && !c->get_test_mode() && !c->is_lua_created())
                 m_persistence->save_runtime(c);
-        // What a sync carried goes with its name, or the renamed job would carry its whole directory again.
-        if (instance && instance->get_type() == runtime_sync &&
-            ::rename(sync_index_path(old_name).c_str(), sync_index_path(cfg.name).c_str()) != 0 && errno != ENOENT)
-            LOG_WARN(("sync " + cfg.name + ": its index stayed under " + old_name + ": " + std::strerror(errno)).c_str());
         m_persistence->remove_runtime(old_name);
     }
     m_persistence->save_runtime(instance);
