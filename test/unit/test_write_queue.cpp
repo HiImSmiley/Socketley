@@ -383,6 +383,20 @@ TEST_CASE("after a short write the rest of the batch is sent from where its shor
     CHECK(iovs[0].iov_base == batch[0].data() + 3);
 }
 
+TEST_CASE("a batch borrowed from the caller's bytes, its slots empty, is left where the send stopped")
+{
+    // send_ws_message(): a header on the stack and the script's payload, and a send that took the header and part of
+    // the payload; the empty slots' buffers are inside the slots, so moving one must not move the iovec with it.
+    char hdr[4] = { 'H', 'D', 'R', '!' };
+    const std::string payload(100, 'p');
+    socketley::write_chunk batch[2];
+    struct iovec iovs[2] = { { hdr, sizeof(hdr) }, { const_cast<char*>(payload.data()), payload.size() } };
+    const uint32_t left = socketley::drop_written(batch, iovs, 2, 10);
+    REQUIRE(left == 1);
+    CHECK(iovs[0].iov_base == payload.data() + 6);
+    CHECK(sent_by(iovs, left) == std::string(94, 'p'));
+}
+
 TEST_CASE("bytes that do not live in their entry are sent from where they were")
 {
     // A ring buffer lent to the queue, or a shared segment, stays put however the entry holding it moves.

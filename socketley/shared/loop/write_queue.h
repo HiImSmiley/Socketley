@@ -480,8 +480,9 @@ uint32_t drop_written(struct iovec* iovs, uint32_t count, size_t written, Move&&
         const size_t   off  = old ? static_cast<size_t>(at - old) : 0;
         if (from != i)
             move_entry(i, from);
+        // Only bytes that lived in their entry move with it; any other iovec stays where it pointed.
         const char* now = bytes_of(i);
-        iovs[i].iov_base = now ? const_cast<char*>(now) + off : at;
+        iovs[i].iov_base = old && now ? const_cast<char*>(now) + off : at;
         iovs[i].iov_len  = len;
     }
     return left;
@@ -492,7 +493,8 @@ inline uint32_t drop_written(write_chunk* batch, struct iovec* iovs, uint32_t co
 {
     const uint32_t left = drop_written(
         iovs, count, written, [&](uint32_t to, uint32_t from) { batch[to] = std::move(batch[from]); },
-        [&](uint32_t i) { return batch[i].data(); });
+        // An empty slot holds no bytes, and its data() is a buffer inside the slot that moves with it.
+        [&](uint32_t i) -> const char* { return batch[i].size() ? batch[i].data() : nullptr; });
     for (uint32_t i = left; i < count; ++i)
         batch[i].clear();
     return left;
