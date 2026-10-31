@@ -71,10 +71,10 @@ daemon_isolate fastlo
 # The probes and the capped copy outlive each daemon's TMPD, which daemon_stop deletes.
 WORK=$(mktemp -d /tmp/socketley-fastlo-work-XXXXXX)
 daemon_watch "$WORK"
-ECHOPID=""; SPLPID=""; ORIGINPID=""; HCPID=""; NSPID=""
+ECHOPID=""; SPLPID=""; ORIGINPID=""; HCPID=""; NSPID=""; CAPDIR=""
 cleanup(){ [ -n "$NSPID" ] && sudo -n kill -9 "$NSPID" 2>/dev/null || true
     for p in "$ECHOPID" "$SPLPID" "$ORIGINPID" "$HCPID"; do [ -n "$p" ] && { kill -9 "$p" 2>/dev/null || true; }; done
-    daemon_stop; rm -rf "$WORK"; }
+    daemon_stop; rm -rf "$WORK"; [ -z "$CAPDIR" ] || rm -rf "$CAPDIR"; }
 trap cleanup EXIT
 
 CPORT=$((SL_PORT_BASE + 1811))
@@ -279,7 +279,8 @@ else
 fi
 
 # ─── the capped copy ────────────────────────────────────────────────────────
-CAPBIN="$WORK/socketley-fastlo"
+CAPDIR=$(cap_dir)
+CAPBIN="$CAPDIR/socketley-fastlo"
 cp "$BIN" "$CAPBIN"
 if ! sudo -n setcap cap_bpf,cap_net_admin+ep "$CAPBIN" 2>/dev/null; then
     echo "  SKIP: the shortcut itself (no sudo -n setcap for CAP_BPF/CAP_NET_ADMIN)"
@@ -315,6 +316,22 @@ else fail "all: reply direction" "the cache's replies to a foreign client go by 
 OUT=$("$BIN" daemon stats 2>&1 || true)
 if grep -q '^fast_lo:all$' <<<"$OUT"; then pass
 else fail "all stats" "daemon stats names the mode it runs" "out: $OUT"; fi
+
+# A FastCGI proxy behind an entrance answers a file by sendfile from one of our sockets into another, which is the
+# pair the shortcut redirects: the file must arrive whole, the small one beside it too.
+FW="$WORK/fcgi-www"; mkdir -p "$FW"
+head -c 3000000 /dev/urandom >"$FW/big.bin"; printf 'small\n' >"$FW/s.css"; printf '<?php\n' >"$FW/index.php"
+"$BIN" create proxy fsite -p $((SL_PORT_BASE + 1825)) --domain fsite.test --backend "fastcgi://unix:$WORK/no-fpm.sock" \
+    --root "$FW" -s >/dev/null 2>&1
+"$BIN" create proxy fent -p $((SL_PORT_BASE + 1824)) -s >/dev/null 2>&1
+fe() { curl -s -m 10 --resolve "fsite.test:$((SL_PORT_BASE + 1824)):127.0.0.1" "http://fsite.test:$((SL_PORT_BASE + 1824))$1"; }
+for _ in $(seq 1 50); do [ "$(fe /s.css)" = small ] && break; sleep 0.2; done
+WANT=$(sha256sum <"$FW/big.bin" | cut -c1-16)
+GOT=$(for _ in 1 2 3; do fe /big.bin | sha256sum | cut -c1-16; done | sort -u)
+if [ "$GOT" = "$WANT" ] && [ "$(fe /s.css)" = small ]; then pass
+else fail "all: fastcgi file through the entrance" "a sendfile'd file and a kept one arrive whole between our own sockets" \
+    "got $GOT want $WANT, small: $(fe /s.css)"; fi
+"$BIN" remove fent fsite >/dev/null 2>&1 || true
 
 # Another daemon of the same binary in the same cgroup is not this daemon.
 OTHERSOCK="$WORK/other.sock"

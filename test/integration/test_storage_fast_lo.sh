@@ -34,12 +34,12 @@ ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; fi; }
 
-CAPBIN="$WORK/socketley-fastlo"
+CAPDIR=$(cap_dir); CAPBIN="$CAPDIR/socketley-fastlo"
 cleanup() {
     for r in sf_stg sf_px; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.3
     daemon_stop
-    rm -rf "$WORK"
+    rm -rf "$WORK" "$CAPDIR"
 }
 trap cleanup EXIT
 

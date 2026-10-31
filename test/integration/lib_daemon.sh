@@ -38,6 +38,19 @@ daemon_isolate() {
 # own trap has done both and the watcher finds nothing to kill.  Its descriptors are closed so a
 # runner reading this test's output does not wait on it.
 #
+# cap_dir  -- a fresh directory where a copy's file capabilities count, for a test that setcap's one: not on a nosuid
+# mount, which /tmp often is and where the kernel ignores them; the caller removes it.
+cap_dir() {
+    local d
+    for d in /var/tmp "$HOME"; do
+        if [ -w "$d" ] && ! findmnt -no OPTIONS --target "$d" 2>/dev/null | grep -qw nosuid; then
+            mktemp -d "$d/socketley-cap-XXXXXX" && return 0
+        fi
+    done
+    mktemp -d /tmp/socketley-cap-XXXXXX
+}
+
+#
 # daemon_watch TMPD  -- for a file that does not use daemon_isolate, whose
 # daemons' sockets all lie under TMPD, exported or given per command.
 daemon_watch() {

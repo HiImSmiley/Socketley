@@ -76,7 +76,8 @@ daemon_isolate fastlolim
 WORK=$(mktemp -d /tmp/socketley-fastlolim-work-XXXXXX)
 daemon_watch "$WORK"
 BEPID=""
-cleanup(){ [ -n "$BEPID" ] && { kill -9 "$BEPID" 2>/dev/null || true; }; daemon_stop; rm -rf "$WORK"; }
+CAPDIR=""
+cleanup(){ [ -n "$BEPID" ] && { kill -9 "$BEPID" 2>/dev/null || true; }; daemon_stop; rm -rf "$WORK"; [ -z "$CAPDIR" ] || rm -rf "$CAPDIR"; }
 trap cleanup EXIT
 
 PXPORT=$((SL_PORT_BASE + 1836))
@@ -245,7 +246,7 @@ done
 pass  # the loop above only fails; reaching here is the pass
 
 # ─── the capped copy ────────────────────────────────────────────────────────
-CAPBIN="$WORK/socketley-fastlolim"
+CAPDIR=$(cap_dir); CAPBIN="$CAPDIR/socketley-fastlolim"
 cp "$BIN" "$CAPBIN"; chmod 755 "$CAPBIN"
 if ! sudo -n setcap cap_bpf,cap_net_admin+ep "$CAPBIN" 2>/dev/null; then
     echo "  SKIP: the bound itself (no sudo -n setcap for CAP_BPF/CAP_NET_ADMIN)"
