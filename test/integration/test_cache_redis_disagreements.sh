@@ -181,6 +181,15 @@ else
         "and a client treating TTL == 0 as 'expiring now' then acts a second early"
 fi
 
+# ── 5. A blank line between commands is nothing, as Redis reads it ─────────
+# redis-cli --pipe ends its stream with "\r\n*2\r\n$4\r\nECHO\r\n$20\r\n<mark>\r\n" and waits for the mark; a
+# blank line answered as a protocol error closed the connection, so every --pipe import ended in "ERR protocol error".
+BL=$(resp "$(python3 -c "import json;print(json.dumps(['*1\r\n\$4\r\nPING\r\n\r\n  \r\n*2\r\n\$4\r\nECHO\r\n\$4\r\nmark\r\n']))")" hold)
+case "$BL" in
+    *'+PONG | $4 | mark'*) ok "blank lines between commands are skipped, as redis-cli --pipe needs" ;;
+    *) bad "a blank line between commands is skipped" "said: ${BL:-<nothing>}" ;;
+esac
+
 "$BIN" stop cd_c >/dev/null 2>&1; "$BIN" remove cd_c >/dev/null 2>&1
 daemon_stop
 trap - EXIT

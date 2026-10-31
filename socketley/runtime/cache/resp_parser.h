@@ -249,6 +249,21 @@ enum class parse_result { ok, incomplete, error, too_many_args, value_too_large 
 // `max_bulk` defaults to what the constant was, which keeps every caller that
 // has no runtime to ask -- the unit tests and the fuzz target -- compiling and
 // testing the same limit they always did.
+// The bytes of the blank lines in front of a command, which Redis skips: redis-cli --pipe puts one before its last ECHO.
+inline size_t blank_lines(std::string_view buf) noexcept
+{
+    size_t i = 0;
+    for (;;)
+    {
+        size_t j = i;
+        while (j < buf.size() && buf[j] == ' ')
+            ++j;
+        if (j + 1 >= buf.size() || buf[j] != '\r' || buf[j + 1] != '\n')
+            return i;
+        i = j + 2;
+    }
+}
+
 inline parse_result parse_message(std::string_view buf, std::vector<std::string>& args,
                                   size_t& consumed, int max_bulk = RESP_MAX_BULK_LEN)
 {
@@ -260,6 +275,14 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
 
     if (__builtin_expect(sz == 0, 0))
         return parse_result::incomplete;
+
+    if (const size_t blank = (buf[0] == ' ' || buf[0] == '\r') ? blank_lines(buf) : 0; blank > 0)
+    {
+        const parse_result r = parse_message(buf.substr(blank), args, consumed, max_bulk);
+        if (r == parse_result::ok)
+            consumed += blank;
+        return r;
+    }
 
     if (__builtin_expect(data[0] != '*', 0))
     {
@@ -376,6 +399,14 @@ inline parse_result parse_message_views(std::string_view buf,
 
     if (__builtin_expect(sz == 0, 0))
         return parse_result::incomplete;
+
+    if (const size_t blank = (buf[0] == ' ' || buf[0] == '\r') ? blank_lines(buf) : 0; blank > 0)
+    {
+        const parse_result r = parse_message_views(buf.substr(blank), args, max_args, argc, consumed, max_bulk);
+        if (r == parse_result::ok)
+            consumed += blank;
+        return r;
+    }
 
     if (__builtin_expect(data[0] != '*', 0))
     {

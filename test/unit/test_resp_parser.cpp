@@ -217,6 +217,24 @@ TEST_CASE("RESP parsing — parse_message_views, the parser the runtimes call")
         CHECK(consumed == buf.size());
     }
 
+    // redis-cli --pipe ends with "\r\n*2\r\n$4\r\nECHO...", and Redis reads a blank line as nothing.
+    SUBCASE("blank lines between commands are skipped, as Redis skips them")
+    {
+        std::string buf = "\r\n  \r\n*1\r\n$4\r\nPING\r\n";
+        auto result = resp::parse_message_views(buf, views, MAX_ARGS, argc, consumed);
+        CHECK(result == resp::parse_result::ok);
+        REQUIRE(argc == 1);
+        CHECK(views[0] == "PING");
+        CHECK(consumed == buf.size());
+        std::vector<std::string> ref;
+        size_t ref_consumed = 0;
+        CHECK(resp::parse_message(buf, ref, ref_consumed) == resp::parse_result::ok);
+        CHECK(ref_consumed == buf.size());
+        CHECK(resp::parse_message_views("\r\n", views, MAX_ARGS, argc, consumed) == resp::parse_result::incomplete);
+        CHECK(resp::parse_message_views("\r\nset k v\r\n", views, MAX_ARGS, argc, consumed) == resp::parse_result::ok);
+        CHECK(argc == 3);
+    }
+
     // The array ceiling, which is this parser's and not the reference's: an
     // array declaring more elements than the caller offered room for is refused
     // rather than truncated.  fuzz_resp.cpp skips its differential comparison
