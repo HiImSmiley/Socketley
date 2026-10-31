@@ -3010,12 +3010,13 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
         cb(adopt ? st::ok : st::bucket_exists);
         return;
     }
-    if (m_creating.contains(name))
+    // A second create of a bucket being made is answered with the first's outcome, as one that was there already.
+    if (const auto it = m_creating.find(name); it != m_creating.end())
     {
-        cb(st::busy);
+        it->second.push_back([adopt, cb = std::move(cb)](st s) { cb(s == st::ok && !adopt ? st::bucket_exists : s); });
         return;
     }
-    m_creating.insert(name);
+    m_creating.try_emplace(name);
     ++m_inflight;
 
     auto cs  = std::make_shared<create_state>();
@@ -3053,9 +3054,11 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                     m_loop->close_fd(*fd);
                     *fd = -1;
                 }
-            m_creating.erase(cs->name);
+            auto waiting = m_creating.extract(cs->name);
             --m_inflight;
             cs->cb(why);
+            for (auto& w : waiting.mapped())
+                w(why);
         };
         auto next = [self](int64_t r) { if (self) (*self)(r); };
         const int stage = cs->stage++;
@@ -3165,9 +3168,11 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                     for (const bucket_doc kind : all_bucket_docs)
                         set_doubt(*b, kind, 0);
                 m_buckets.emplace(cs->name, std::move(b));
-                m_creating.erase(cs->name);
+                auto waiting = m_creating.extract(cs->name);
                 --m_inflight;
                 cs->cb(st::ok);
+                for (auto& w : waiting.mapped())
+                    w(st::ok);
                 return;
             }
         }

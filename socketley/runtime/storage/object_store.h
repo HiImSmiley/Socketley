@@ -1274,7 +1274,8 @@ private:
     // An exclusive flock on .lock.<shard>, holding the shard count, from open until close has written or declined the marker.
     int           m_lock_fd{-1};
     std::map<std::string, std::unique_ptr<bucket>, std::less<>> m_buckets;
-    std::unordered_set<std::string> m_creating;
+    // The buckets being made, each with the creates that came while it was.
+    std::unordered_map<std::string, std::vector<std::function<void(st)>>> m_creating;
     shard_peers* m_peers{nullptr};
     hash_pool*   m_hash{nullptr};
     std::function<bool(std::string_view)> m_drop_guard;

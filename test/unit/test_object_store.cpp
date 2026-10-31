@@ -668,6 +668,23 @@ TEST_CASE("buckets are created, listed, and refused when they exist or hold obje
     CHECK(r.put("nothere", "k", "v").status == st::no_such_bucket);
 }
 
+TEST_CASE("creates of a bucket that is being made are answered as the first is, not refused as busy")
+{
+    tmpdir d;
+    rig r(d.path);
+    std::vector<st> got;
+    for (int i = 0; i < 3; ++i)
+        r.store->create_bucket("mail", {}, [&](st s) { got.push_back(s); });
+    REQUIRE(r.until([&] { return got.size() == 3; }));
+    CHECK(got[0] == st::ok);
+    CHECK(got[1] == st::bucket_exists);
+    CHECK(got[2] == st::bucket_exists);
+    CHECK(r.store->has_bucket("mail"));
+    CHECK_FALSE(r.store->working());
+    // One made after them is refused as there already, at once.
+    CHECK(r.make_bucket("mail") == st::bucket_exists);
+}
+
 TEST_CASE("a put is readable back byte for byte, with its etag, and overwrites in place")
 {
     tmpdir d;
