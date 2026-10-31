@@ -26,6 +26,8 @@ int cli_runtime_action(int argc, char** argv);
 // `socketley <runtime> <verb> ...`, in cli_verbs.cpp: the verb read against the runtime's type.
 int cli_runtime_verb(int argc, char** argv);
 bool cli_is_type_verb(std::string_view type, std::string_view verb);
+// Whether `socketley <command> <word>` is for the runtime named as the command: its type's verb, or every runtime's.
+bool cli_names_runtime(std::string_view command, std::string_view word);
 int cli_interactive(int argc, char** argv);
 
 // The same session from a command this process built rather than from argv,

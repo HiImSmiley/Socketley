@@ -1,6 +1,7 @@
 // `socketley <runtime> <verb> ...`: whatever belongs to one runtime said with its name first, the verb read against
 // its type and the command it has always been run as. The older forms (`db-query <db>`, `mqtt-pub <mqtt>`,
 // `tunnel <edge> invite`, `metrics <metrics> query`, ...) stay, so a script and the dashboard keep working.
+#include <algorithm>
 #include "cli.h"
 
 #include <cctype>
@@ -141,6 +142,15 @@ bool cli_is_type_verb(std::string_view type, std::string_view word)
         if (v.type == type && v.name == word)
             return true;
     return false;
+}
+
+bool cli_names_runtime(std::string_view command, std::string_view word)
+{
+    if (cli_is_type_verb(command, word))
+        return true;
+    // Every runtime's verbs too, when a runtime is named as the command, so it answers `show` and `stop` as any other.
+    const bool everyones = word == "help" || std::find(std::begin(lifecycle), std::end(lifecycle), word) != std::end(lifecycle);
+    return everyones && !type_of(command).empty();
 }
 
 int cli_runtime_verb(int argc, char** argv)

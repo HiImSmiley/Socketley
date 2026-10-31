@@ -49,6 +49,8 @@ same "an mqtt broker's sessions" "$(S broker sessions 2>&1)" "$(S mqtt-sessions 
 same "a metrics runtime's query" "$(S m query 'count(up)' 2>&1)" "$(S metrics m query 'count(up)' 2>&1)"
 has "the runtime named metrics, by its verbs" "$(S metrics query 'count(up)' 2>&1)" '^[0-9]+$|^\{\} [0-9]+$'
 same "and its older form" "$(S metrics targets 2>&1 | cut -f1,3)" "$(S metrics metrics targets 2>&1 | cut -f1,3)"
+has "and every runtime's verbs" "$(S metrics show 2>&1)" '"name": "metrics"'
+has "its help" "$(S metrics help 2>&1)" 'query .*|targets'
 expect "a backup by the db's name" "$(S shop backup "$T/shop.bak" >/dev/null 2>&1; echo $?) $([ -s "$T/shop.bak" ] && echo kept)" "0 kept"
 
 # ── the lifecycle by a runtime's name ───────────────────────────────────────

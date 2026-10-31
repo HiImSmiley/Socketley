@@ -712,7 +712,7 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("tunnel"):
             // `socketley tunnel invite ...` is a runtime named tunnel; `tunnel <edge> invite` and join, connect,
             // share and ssh stay as they were.
-            if (argc >= 3 && cli_is_type_verb("tunnel", argv[2]))
+            if (argc >= 3 && cli_names_runtime("tunnel", argv[2]))
                 return cli_runtime_verb(argc, argv);
             return cli_tunnel(argc, argv);
         case fnv1a("db-backup"):
@@ -731,7 +731,7 @@ int cli_dispatch(int argc, char** argv)
             return cli_forward(argc, argv);
         case fnv1a("metrics"):
             // `socketley metrics query ...` is the runtime named metrics; `metrics <metrics> query` is the older form.
-            if (argc >= 3 && cli_is_type_verb("metrics", argv[2]))
+            if (argc >= 3 && cli_names_runtime("metrics", argv[2]))
                 return cli_runtime_verb(argc, argv);
             return cli_forward(argc, argv);
         case fnv1a("db-restore"):
