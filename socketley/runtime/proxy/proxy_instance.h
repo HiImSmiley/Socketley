@@ -1224,7 +1224,7 @@ private:
     // A file beneath --root answered by this proxy, its next window read once the client has room, and that read's end.
     void fcgi_serve_file(proxy_client_connection* conn, int fd, const struct stat& st, std::string_view rel,
                          std::shared_ptr<const std::string> kept = {});
-    void fcgi_file_next(proxy_client_connection* conn);
+    void fcgi_file_next(proxy_client_connection* conn, bool inline_call = false);
     void fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
     void fcgi_file_polled(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
     // Small files kept whole, as the server runtime keeps them: one statx a request says the bytes are still the

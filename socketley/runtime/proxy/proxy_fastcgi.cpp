@@ -504,11 +504,48 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, con
     conn->partial.erase(0, end + 4);
     conn->ex.response_started = true;
     const bool body = !head_only && (status.starts_with("200") || status.starts_with("206"));
-    conn->write_queue.push(std::move(out));
+    if (!kept)
+    {
+        f->off = first;
+        f->left = body ? length : 0;
+        // A whole small file asked for by a GET is read once and kept, while there is room for it.
+        if (status.starts_with("200") && body && size > 0 && size <= keep_max_file &&
+            m_kept_bytes + size <= keep_max_total && !rel.empty())
+        {
+            f->keep_as = std::string(rel);
+            f->keep_stat = st;
+        }
+        // TLS and a stream frame what they send, so only a plain connection takes the bytes straight from the file.
+        else if (f->left > 0 && conn->ssl == nullptr && conn->h2_parent == nullptr && conn->h3s == nullptr)
+        {
+            f->sendfile = true;
+            // The listener's 256 KiB would have each burst stop and wait for room several times a file.
+            if (f->left > keep_max_file &&
+                ::setsockopt(conn->fd, SOL_SOCKET, SO_SNDBUF, &file_sndbuf, sizeof file_sndbuf) < 0) {}
+        }
+    }
+    // A file sent by sendfile has its head sent here and now, held for the first of its bytes (MSG_MORE), so the
+    // file follows in this same turn and not one completion later; what the socket does not take is queued.
+    if (f->sendfile && !conn->write_pending && conn->write_queue.empty())
+    {
+        const ssize_t n = ::send(conn->fd, out.data(), out.size(), MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE);
+        if (n < 0 && errno != EAGAIN)
+        {
+            close_pair(conn->fd, conn->ex.backend_fd);
+            return;
+        }
+        if (n > 0)
+        {
+            stat_add(m_stat_bytes_out, static_cast<uint64_t>(n));
+            out.erase(0, static_cast<size_t>(n));
+        }
+    }
+    if (!out.empty())
+        conn->write_queue.push(std::move(out));
     // A kept file's bytes go behind its head in the same write, a slice of the one copy every request shares.
     if (kept && body && length > 0)
         conn->write_queue.push(socketley::write_chunk(kept, static_cast<uint32_t>(first), static_cast<uint32_t>(length)));
-    if (!conn->write_pending && !flush_client_write_queue(conn))
+    if (!conn->write_pending && !conn->write_queue.empty() && !flush_client_write_queue(conn))
     {
         close_pair(conn->fd, conn->ex.backend_fd);
         return;
@@ -520,36 +557,14 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, con
         close_pair(conn->fd, conn->ex.backend_fd);
         return;
     }
-    if (kept)
-    {
-        conn->file = std::move(f);
-        fcgi_file_next(conn);
-        return;
-    }
-    f->off = first;
-    f->left = body ? length : 0;
-    // A whole small file asked for by a GET is read once and kept, while there is room for it.
-    if (status.starts_with("200") && body && size > 0 && size <= keep_max_file &&
-        m_kept_bytes + size <= keep_max_total && !rel.empty())
-    {
-        f->keep_as = std::string(rel);
-        f->keep_stat = st;
-    }
-    // TLS and a stream frame what they send, so only a plain connection takes the bytes straight from the file.
-    else if (f->left > 0 && conn->ssl == nullptr && conn->h2_parent == nullptr && conn->h3s == nullptr)
-    {
-        f->sendfile = true;
-        // The listener's 256 KiB would have each burst stop and wait for room several times a file.
-        if (f->left > keep_max_file &&
-            ::setsockopt(conn->fd, SOL_SOCKET, SO_SNDBUF, &file_sndbuf, sizeof file_sndbuf) < 0) {}
-    }
     conn->file = std::move(f);
-    fcgi_file_next(conn);
+    fcgi_file_next(conn, true);
 }
 
 // The next window of the file, once what the client holds is below the pacing point; at its end the exchange is over,
-// after the write that carries the last of it, so a pipelined request is never parsed from inside this one's answer.
-void proxy_instance::fcgi_file_next(proxy_client_connection* conn)
+// after the write that carries the last of it, so a pipelined request is never parsed from inside this one's answer --
+// which is also why `inline_call`, the call from the request itself, ends it at once only when nothing follows it.
+void proxy_instance::fcgi_file_next(proxy_client_connection* conn, bool inline_call)
 {
     fcgi_file& f = *conn->file;
     if (f.reading || conn->closing || !m_loop)
@@ -606,8 +621,13 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn)
             close_pair(fd, conn->ex.backend_fd);
             return;
         }
-        // Room on the socket, or the next turn when the burst ran out, says when to go on; the end of the file is reached
-        // from there too, never from inside the request that began it.
+        if (f.left == 0 && (!inline_call || conn->partial.empty()))
+        {
+            conn->file.reset();
+            reset_client_for_next_request(conn);
+            return;
+        }
+        // Room on the socket, or the next turn when the burst ran out, says when to go on.
         f.reading = true;
         std::shared_ptr<fcgi_file> keep = conn->file;
         if (!m_files->io.poll(fd, POLLOUT, [this, fd, gen, keep](int64_t res) { fcgi_file_polled(fd, gen, keep, res); }))
