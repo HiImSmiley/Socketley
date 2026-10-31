@@ -48,6 +48,9 @@ up() {
 }
 
 ms() { date +%s%3N; }
+# What the daemon said since line $1, so a stop and start that answered sooner than the old worker's stop allows -- seen
+# twice beside a full gate, never alone -- says which worker went when.
+since_log() { tail -n +"$(($1 + 1))" "$SOCKETLEY_DLOG" | grep -v DEBUG | tail -40 | sed 's/^/    log: /'; }
 
 echo "=== Integration: a restart whose old worker is slow to stop ==="
 command -v python3 >/dev/null 2>&1 || { echo "  FAIL: python3 is required"; exit 1; }
@@ -86,6 +89,7 @@ for verb in restart reload; do
         ok "$verb: answered 0 after ${T} ms, once the old worker had stopped"
     else
         bad "$verb" "answered $RC after ${T} ms: $(tr '\n' ' ' < "$SOCKETLEY_TMPD/$verb.out")"
+        since_log "$LOGGED"
     fi
     up || { bad "$verb: up" "the runtime did not answer after the $verb"; continue; }
 
@@ -109,6 +113,7 @@ done
 for i in $(seq 1 20); do
     curl -s -o /dev/null -X PUT --data-binary "v3-$i" "http://127.0.0.1:$PORT/bkt/k3-$i"
 done
+LOGGED=$(wc -l < "$SOCKETLEY_DLOG")
 T0=$(ms)
 "$BIN" edit stgsl --shards 999 --restart > "$SOCKETLEY_TMPD/refused.out" 2>&1
 RC=$?
@@ -118,6 +123,7 @@ if [ "$RC" -eq 1 ] && [ "$T" -ge 2500 ]; then
     ok "a refused change answered 1 after ${T} ms, with the start it waited for"
 else
     bad "refused change" "answered $RC after ${T} ms: $OUT"
+    since_log "$LOGGED"
 fi
 grep -q "between 1 and" <<<"$OUT" && ok "and the refusal's own words came with it" \
                                  || bad "refused change: why" "said: $OUT"
