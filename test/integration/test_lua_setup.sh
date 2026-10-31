@@ -65,6 +65,11 @@ cat > "$S/runtimes/auth.lua" <<EOF
 return { type = "idp", name = "auth", port = $((P+1)), bind = "127.0.0.1", issuer = "https://auth.try.test",
          cookie_domain = "try.test", domain = "auth", start = true }
 EOF
+# A metrics runtime keeping its logs, every key of its own a key of its flag's name.
+cat > "$S/runtimes/more/3-watch.lua" <<EOF
+return { type = "metrics", name = "watch", port = $((P+11)), bind = "127.0.0.1", every = "5s", keep = "7d",
+         downsample = "5m:30d", max_series = 50000, logs = true, logs_keep = "3d", idp = "auth", start = true }
+EOF
 cat > "$S/runtimes/more/1-store.lua" <<EOF
 return { type = "storage", name = "store", port = $((P+2)), bind = "127.0.0.1", dir = "$W/data/store",
          credentials = "secrets/store.creds", idp = "auth", sync = "per-user", start = true }
@@ -88,8 +93,8 @@ up_seconds() { "$BIN" ls | awk -v n="$1" '$2 == n { for (i = 1; i <= NF; i++) if
 (cd /; "$BIN" --lua "$S/config.lua") > "$W/out" 2>&1; rc=$?
 [ "$rc" -eq 0 ] && ok "--lua makes the runtimes config.lua and the files it includes describe" || bad "--lua makes them" "rc $rc: $(cat "$W/out")"
 for _ in $(seq 1 50); do [ "$(up_seconds post)" != "" ] && break; sleep 0.1; done
-n=$("$BIN" ls | grep -cE ' (ns|auth|store|post) .* Up ')
-[ "$n" -eq 4 ] && ok "a file's runtime, and each of a directory's, is made and started" || bad "each runtime is made and started" "$("$BIN" ls)"
+n=$("$BIN" ls | grep -cE ' (ns|auth|store|post|watch) .* Up ')
+[ "$n" -eq 5 ] && ok "a file's runtime, and each of a directory's, is made and started" || bad "each runtime is made and started" "$("$BIN" ls)"
 [ "$(field post submission)/$(field post imap)/$(field post sieve)/$(field post web)/$(field post dnsbl)" = "$((P+4))/$((P+5))/$((P+6))/$((P+7))/zen.spamhaus.org" ] \
     && ok "a mail runtime's ports, its dnsbl and its web port are keys of their flags' names" || bad "a mail runtime's keys" "$(show post)"
 [ "$(field store credentials)" = "$S/secrets/store.creds" ] && [ "$(field post cert_path)" = "$S/secrets/cert.pem" ] \
@@ -136,12 +141,12 @@ grep -q 'www  A    127.0.0.9' "$W/exp/zones/try.test.zone" && grep -q 'submissio
 grep -q "$S/secrets/store.creds" "$W/exp/config.lua" && ok "what the setup reads and does not hold is named in config.lua" \
     || bad "the files named" "$(head -12 "$W/exp/config.lua")"
 order=$(grep -o 'runtimes/[a-z]*\.lua' "$W/exp/config.lua" | tr '\n' ' ')
-[ "$order" = "runtimes/ns.lua runtimes/auth.lua runtimes/store.lua runtimes/post.lua " ] \
+[ "$order" = "runtimes/ns.lua runtimes/auth.lua runtimes/store.lua runtimes/post.lua runtimes/watch.lua " ] \
     && ok "in an order that makes a runtime before those that name it" || bad "the order" "$order"
 out=$("$BIN" export "$W/exp" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "export does not write over a setup" || bad "export over a setup" "rc $rc: $out"
 # The zone is the export's copy now, beside its config.lua.
-for n in ns auth store post; do show "$n" | grep -v '"id"\|was_running' | sed "s|$S/zones/|$W/exp/zones/|" > "$W/before.$n"; done
+for n in ns auth store post watch; do show "$n" | grep -v '"id"\|was_running' | sed "s|$S/zones/|$W/exp/zones/|" > "$W/before.$n"; done
 
 # ─── a fresh daemon whose configuration file is the export ──────────────────
 daemon_stop
@@ -152,14 +157,14 @@ dofile("$W/exp/config.lua")
 EOF
 export SOCKETLEY_CONFIG="$W/exp/own.lua"
 daemon_start "$BIN"
-for _ in $(seq 1 100); do [ "$("$BIN" ls | grep -cE ' (ns|auth|store|post) .* Up ')" -eq 4 ] && break; sleep 0.1; done
-[ "$("$BIN" ls | grep -cE ' (ns|auth|store|post) .* Up ')" -eq 4 ] && ok "a fresh daemon makes and starts the runtimes of its configuration file" \
+for _ in $(seq 1 100); do [ "$("$BIN" ls | grep -cE ' (ns|auth|store|post|watch) .* Up ')" -eq 5 ] && break; sleep 0.1; done
+[ "$("$BIN" ls | grep -cE ' (ns|auth|store|post|watch) .* Up ')" -eq 5 ] && ok "a fresh daemon makes and starts the runtimes of its configuration file" \
     || bad "a fresh daemon makes them" "$("$BIN" ls) $(grep -i config "$SOCKETLEY_DLOG" | tail -5)"
 same=0
-for n in ns auth store post; do
+for n in ns auth store post watch; do
     if diff <(show "$n" | grep -v '"id"\|was_running') "$W/before.$n" > "$W/diff.$n"; then same=$((same+1)); fi
 done
-[ "$same" -eq 4 ] && ok "each as it was on the daemon the export was written from" || bad "each as it was" "$(cat "$W"/diff.*)"
+[ "$same" -eq 5 ] && ok "each as it was on the daemon the export was written from" || bad "each as it was" "$(cat "$W"/diff.*)"
 out=$("$BIN" --lua "$W/exp/own.lua" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "--lua takes the daemon's own file, whose start-only settings are its next start's" || bad "the daemon's own file" "rc $rc: $out"
 
