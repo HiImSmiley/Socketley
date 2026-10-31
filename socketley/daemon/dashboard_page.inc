@@ -189,6 +189,8 @@ const toBytes = v => { const m = /^(\d+(?:\.\d+)?)\s*([kmgt])?b?$/i.exec(String(
 const fromBytes = b => { b = +b; for (const [u, n] of [['T', 2 ** 40], ['G', 2 ** 30], ['M', 2 ** 20], ['K', 1024]]) if (b >= n && b % n === 0) return b / n + u; return String(b); };
 // Whole bytes: a rate is two counters' difference over the time between two polls, and its fractions mean nothing.
 const rate = n => human(Math.round(+n || 0)) + '/s';
+// A size to a tenth of its unit past 100, finer than `human`, for the hover over a gauge drawn to a tenth of its value.
+const exact = n => { n = +n || 0; if (n < 1000) return Math.round(n) + ' B'; const u = ['KB', 'MB', 'GB', 'TB', 'PB']; let i = -1; do { n /= 1000; i++; } while (n >= 1000 && i < u.length - 1); return n.toFixed(n >= 100 ? 1 : 2) + ' ' + u[i]; };
 const count = n => { n = +n || 0; return n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(0) + 'k' : String(Math.round(n)); };
 const ago = s => { s = Math.floor(s); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m + 'm' : m + 'm ' + (s % 60) + 's'; };
 
@@ -387,7 +389,9 @@ function spark(ln) {
   const s = document.createElementNS(SVGNS, 'svg'); s.setAttribute('class', 'spark'); s.setAttribute('viewBox', '0 0 100 30'); s.setAttribute('preserveAspectRatio', 'none');
   const vals = ln.vals, n = vals.length, some = vals.filter(v => v !== null);
   if (some.length < 2) return s;
-  const lo = ln.span ? Math.min(...some) : 0, top = Math.max(...some) - lo;
+  // A gauge spans at least a tenth of its greatest value, so a change of a few hundred kilobytes in 116 MB stays flat.
+  const mx = Math.max(...some), mn = Math.min(...some), want = Math.max(mx - mn, mx * 0.1);
+  const lo = ln.span ? Math.max(0, mn - (want - (mx - mn)) / 2) : 0, top = ln.span ? Math.max(want, mx - lo) : mx;
   const y = v => top ? 28 - ((v - lo) / top) * 26 : ln.span ? 15 : 28;
   // A stretch without points is a gap in the line, not a fall to zero.
   let d = '', f = '', run = [];
@@ -455,7 +459,7 @@ function overview() {
       tile('download', 'In', rate(cur.bin), human(over.bytes_in) + ' since start', line('', 'in', rate)),
       tile('upload', 'Out', rate(cur.bout), human(over.bytes_out) + ' since start', line('', 'out', rate)),
       tile('cpu', 'CPU', pct(cur.cpu), cpus + ' CPUs · ' + over.processes + ' processes', line('', 'cpu', pct, false, 1 / cpus)),
-      tile('gauge', 'Memory', human(over.memory_bytes), 'held, daemon and workers', line('', 'rss', human, true))));
+      tile('gauge', 'Memory', human(over.memory_bytes), 'held, daemon and workers', line('', 'rss', exact, true))));
   C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('server')), el('span', { text: 'Runtimes' }), el('span', { class: 'n', text: String(rts.length) }))), table(rts));
 }
 function runtimes() {
@@ -559,7 +563,7 @@ async function detail(full) {
     tile('download', 'In', rate(r.in_s || 0), human(r.bytes_in) + ' since start', line(n, 'in', rate)),
     tile('upload', 'Out', rate(r.out_s || 0), human(r.bytes_out) + ' since start', line(n, 'out', rate)),
     tile('cpu', 'CPU', pct(r.cpu_p || 0), r.processes + ' process' + (r.processes === 1 ? '' : 'es'), line(n, 'cpu', pct)),
-    tile('gauge', 'Memory', human(r.memory_bytes), 'held, every shard', line(n, 'rss', human, true)));
+    tile('gauge', 'Memory', human(r.memory_bytes), 'held, every shard', line(n, 'rss', exact, true)));
   if (!full && shown.stamp && Date.now() - shown.stamp > 5000) statsText(r.name);
   tailInto($('#dLog'), shown, r.name, 300);
   if (r.state === 'failed' && why[r.name]) H.append(el('div', { id: 'dWhy', class: 'panel', style: 'border-color:rgba(251,88,118,.4)' }, el('h3', {}, ico('info'), el('span', { text: 'Why it failed' })), el('div', { class: 'kv' }, el('div', { class: 'k', text: new Date(why[r.name].at).toLocaleString() }), el('div', { class: 'v', text: clean(why[r.name].text) }))));
