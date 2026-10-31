@@ -6,6 +6,7 @@
 #include <thread>
 #include <sstream>
 #include <vector>
+#include <termios.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -930,21 +931,51 @@ int cli_forward(int argc, char** argv)
     return exit_code;
 }
 
-// `--password -` takes the password from the first line of stdin, so it need not be on a command line others can read.
+// One line of a password, read without echo on a terminal and as it comes from a pipe.
+bool cli_read_secret(const char* prompt, std::string& out)
+{
+    out.clear();
+    if (!isatty(STDIN_FILENO))
+    {
+        if (!std::getline(std::cin, out))
+            return false;
+        if (!out.empty() && out.back() == '\r')
+            out.pop_back();
+        return true;
+    }
+    termios before{};
+    if (tcgetattr(STDIN_FILENO, &before) != 0)
+        return false;
+    termios quiet = before;
+    quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+    std::cerr << prompt << std::flush;
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet) != 0)
+        return false;
+    const bool got = static_cast<bool>(std::getline(std::cin, out));
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &before) != 0) {}
+    std::cerr << "\n";
+    return got;
+}
+
+// `--password -` takes the password from the first line of stdin, so it need not be on a command line others can read,
+// and on a terminal asks for it twice without showing it.
 int cli_idp_user(int argc, char** argv)
 {
     std::vector<std::string> args(argv, argv + argc);
     for (size_t i = 0; i + 1 < args.size(); ++i)
         if (args[i] == "--password" && args[i + 1] == "-")
         {
-            std::string line;
-            if (!std::getline(std::cin, line))
+            std::string line, again;
+            if (!cli_read_secret("password: ", line) || line.empty())
             {
                 std::cout << "--password - reads the password from stdin, which gave none\n";
                 return 1;
             }
-            if (!line.empty() && line.back() == '\r')
-                line.pop_back();
+            if (isatty(STDIN_FILENO) && (!cli_read_secret("again: ", again) || again != line))
+            {
+                std::cout << "the passwords differ\n";
+                return 1;
+            }
             args[i + 1] = line;
         }
     std::vector<char*> ptrs;

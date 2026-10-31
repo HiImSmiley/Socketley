@@ -32,31 +32,6 @@ void on_stop_signal(int)
     g_stop = 1;
 }
 
-// One line of a password, read without echo on a terminal and as it comes from a pipe.
-bool read_password(const char* prompt, std::string& out)
-{
-    out.clear();
-    if (!isatty(STDIN_FILENO))
-    {
-        if (!std::getline(std::cin, out))
-            return false;
-        if (!out.empty() && out.back() == '\r')
-            out.pop_back();
-        return true;
-    }
-    termios before{};
-    if (tcgetattr(STDIN_FILENO, &before) != 0)
-        return false;
-    termios quiet = before;
-    quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
-    std::cerr << prompt << std::flush;
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet) != 0)
-        return false;
-    const bool got = static_cast<bool>(std::getline(std::cin, out));
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &before) != 0) {}
-    std::cerr << "\n";
-    return got;
-}
 
 }   // namespace
 
@@ -232,12 +207,12 @@ int cli_mqtt_passwd(int argc, char** argv)
     if (!remove)
     {
         std::string pw, again;
-        if (!read_password("password: ", pw) || pw.empty())
+        if (!cli_read_secret("password: ", pw) || pw.empty())
         {
             std::cout << "no password given\n";
             return 1;
         }
-        if (isatty(STDIN_FILENO) && (!read_password("again: ", again) || again != pw))
+        if (isatty(STDIN_FILENO) && (!cli_read_secret("again: ", again) || again != pw))
         {
             std::cout << "the passwords differ\n";
             return 1;

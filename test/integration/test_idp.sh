@@ -732,5 +732,43 @@ case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the 
 for _ in $(seq 1 50); do STATS=$("$BIN" stats auth 2>/dev/null); case "$STATS" in *worker_report:none*) sleep 0.1 ;; *) break ;; esac; done
 case "$STATS" in *"accounts:14"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
+# At a terminal, --password - asks twice and shows neither, as a password prompt does: typed only once each is asked.
+out=$(python3 - "$BIN" <<'PY'
+import os, pty, select, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1], "idp-user", "auth", "passwd", "lea", "--password", "-"])
+seen = b""
+def until(word, secs=10):
+    global seen
+    end = time.time() + secs
+    while word not in seen and time.time() < end:
+        if not select.select([fd], [], [], 0.2)[0]:
+            continue
+        try:
+            seen += os.read(fd, 4096)
+        except OSError:
+            break
+for prompt in (b"password:", b"again:"):
+    until(prompt)
+    os.write(fd, b"Typedsecret12345\n")
+until(b"\0", 3)
+for _ in range(50):
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done:
+        break
+    time.sleep(0.1)
+else:
+    os.kill(pid, 9)
+    done, status = os.waitpid(pid, 0)
+print(seen.decode(errors="replace").replace("\r", "").replace("\n", " "), "rc=%d" % (os.waitstatus_to_exitcode(status)))
+PY
+)
+case "$out" in
+    *Typedsecret12345*) bad "a password typed at a terminal is not shown" "$out" ;;
+    *"password:"*"again:"*"rc=0"*) ok ;;
+    *) bad "a password typed at a terminal is asked for twice and set" "$out" ;;
+esac
+
 echo "  Results: $PASS/$((PASS+FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]
