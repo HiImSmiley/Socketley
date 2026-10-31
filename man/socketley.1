@@ -5042,8 +5042,10 @@ header is never passed on (httpoxy), nor any header whose name holds an
 underscore, which a server would read as the same variable as its dashed twin.
 .B HTTPS
 is on when this proxy ended TLS, or an entrance in front of it did and said so
-over the loopback. What a script writes to STDERR reaches the log, at most
-twenty lines a minute. An
+over the loopback. An upload that sends
+.B Expect: 100\-continue
+is told to continue by the proxy, since an application server never says so.
+What a script writes to STDERR reaches the log, at most twenty lines a minute. An
 .B X\-Accel\-Redirect
 is nginx's internal redirect and is answered 502; a script hands a file out
 with
