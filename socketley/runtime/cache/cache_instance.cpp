@@ -9927,6 +9927,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             emit_cluster(conn, args[1], argc >= 3 ? args[2] : std::string_view{}, true);
             break;
         }
+        // A follower of a --resp cache asks here; what follows is the replication stream, lines and not RESP.
+        case fnv1a("replicate"):
+        {
+            handle_replicate_request(conn);
+            return;
+        }
         case fnv1a("dbsize"):
         {
             // dbsize [type t] -- the count of one map, answered from its size
@@ -13083,10 +13089,11 @@ void cache_instance::handle_master_connect(struct io_uring_cqe* cqe, io_request*
         return;
     }
 
-    // Ten bytes into the send buffer of a socket that has just connected, so
-    // the short write this cannot handle is not one that happens.
-    const char* cmd = "replicate\n";
-    if (::write(fd, cmd, 10) < 0)
+    // Eleven bytes into the send buffer of a socket that has just connected, so
+    // the short write this cannot handle is not one that happens; ended by CRLF
+    // so a --resp leader's inline reader takes it as the line reader does.
+    const char* cmd = "replicate\r\n";
+    if (::write(fd, cmd, 11) < 0)
     {
         close_tracked(fd);
         LOG_ERROR("cache: the master link connected and would not take `replicate`");

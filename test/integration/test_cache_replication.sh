@@ -400,6 +400,18 @@ assert_eq "$(send_to "$FOLLOWER_PORT" 'exists ghostkey')" "0" \
 assert_eq "$(send_to "$FOLLOWER_PORT" 'llen ghostlist')" "2" \
     "and a list the follower already had was not appended to twice"
 
+# A leader that speaks only RESP (--resp) is followed too: the follower's request is a CRLF line its inline reader
+# takes, and `replicate` is a command of its RESP dispatch.  Before, the request waited for a CR that never came.
+RESP_LEADER=$((SL_PORT_BASE+294)); RESP_FOLLOWER=$((SL_PORT_BASE+295))
+"$BIN" create cache replrespl -p "$RESP_LEADER" --resp -s >/dev/null 2>&1
+sleep 0.5
+printf '*3\r\n$3\r\nSET\r\n$5\r\nrkey1\r\n$2\r\nv1\r\n*3\r\n$3\r\nSET\r\n$5\r\nrkey2\r\n$2\r\nv2\r\n' |
+    nc -q 1 127.0.0.1 "$RESP_LEADER" >/dev/null 2>&1
+"$BIN" create cache replrespf -p "$RESP_FOLLOWER" --replicate "127.0.0.1:$RESP_LEADER" -s >/dev/null 2>&1
+for _ in $(seq 1 50); do [ "$(key_count replrespf)" = 2 ] && break; sleep 0.1; done
+assert_eq "$(key_count replrespf)" "2" "a follower of a --resp leader gets its dump"
+assert_eq "$(send_to "$RESP_FOLLOWER" 'get rkey2')" "v2" "and the values in it"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
