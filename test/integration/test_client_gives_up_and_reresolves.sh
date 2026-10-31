@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: host -- HOSTALIASES moves a name only through DNS, which a network namespace of its own cannot reach
 # Integration test: a client that stopped trying, and one whose peer moved.
 #
 # ─── WHAT THIS EXISTS TO CATCH ─────────────────────────────────────────────

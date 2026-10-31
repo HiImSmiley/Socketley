@@ -93,7 +93,7 @@ suite_ns_ok() {
         2>/dev/null
 }
 
-suite_ns_run() {   # root file -> the file's exit, run in namespaces of its own with its /tmp under root
+suite_ns_run() {   # root file [command] -> the exit of the file, or of the command named by it, run in namespaces of its own with its /tmp under root
     local dir="$1/$(basename "$2" .sh)"
     rm -rf "$dir" "$dir.hosts"; mkdir -p "$dir"
     # The machine's name is its address beside the loopback, as the host's resolver, out of reach here, would say.
@@ -109,7 +109,8 @@ suite_ns_run() {   # root file -> the file's exit, run in namespaces of its own 
         mount --bind "$1" /tmp || exit 2
         export HOME=/tmp/home SOCKETLEY_SOCKET=/tmp/suite.sock
         mkdir -p "$HOME"
-        exec setpriv --inh-caps=-all --ambient-caps=-all bash "$2"' _ "$dir" "$2"
+        [ -n "$3" ] && exec setpriv --inh-caps=-all --ambient-caps=-all bash -c "$3"
+        exec setpriv --inh-caps=-all --ambient-caps=-all bash "$2"' _ "$dir" "$2" "${3:-}"
     local rc=$?
     # Its /tmp goes with it, as on tmpfs it is memory.
     chmod -R u+rwx "$dir" 2>/dev/null; rm -rf "$dir" "$dir.hosts"
@@ -196,13 +197,18 @@ suite_save_memory() {   # dir -> its <tag>.mem merged into the record
     mv -f "$tmp" "$SUITE_MEM_RECORD"
 }
 
+# A job's command in namespaces of its own when the run has them, so two suites' binaries never meet on a port.
+suite_job() {   # name command
+    if [ -n "${NS_ROOT:-}" ]; then suite_ns_run "$NS_ROOT" "job-$1" "$2"; else bash -c "$2"; fi
+}
+
 # Commands run side by side, a line of the list each, `name<TAB>command`, the
 # command's output, exit and seconds left in `dir` under its name.
 suite_run_jobs() {   # list dir parallel
     local list=$1 dir=$2 par=$3
     export SUITE_JOB_DIR="$dir"
-    export -f suite_mem_need suite_budget_reserve suite_budget_release
-    export SUITE_MEM_RECORD SUITE_BUDGET_FILE SOCKETLEY_CONFIG
+    export -f suite_mem_need suite_budget_reserve suite_budget_release suite_ns_run suite_job
+    export SUITE_MEM_RECORD SUITE_BUDGET_FILE SOCKETLEY_CONFIG NS_ROOT
     awk -F'\t' '{ print $1 }' "$list" | while IFS= read -r name; do
         printf '%s\0' "$name"
     done | xargs -0 -I{} -P"$par" bash -c '
@@ -210,7 +216,7 @@ suite_run_jobs() {   # list dir parallel
         cmd=$(awk -F"\t" -v n="$name" "\$1 == n { print \$2; exit }" "$2")
         need=$(suite_mem_need "$name"); suite_budget_reserve "$need"
         t0=$(date +%s)
-        SUITE_FILE_TAG="$SUITE_TAG_RUN/$name" bash -c "$cmd" > "$SUITE_JOB_DIR/$name.log" 2>&1
+        SUITE_FILE_TAG="$SUITE_TAG_RUN/$name" suite_job "$name" "$cmd" > "$SUITE_JOB_DIR/$name.log" 2>&1
         echo $? > "$SUITE_JOB_DIR/$name.rc"
         suite_budget_release "$need"
         echo $(( $(date +%s) - t0 )) > "$SUITE_JOB_DIR/$name.secs"' _ {} "$list"

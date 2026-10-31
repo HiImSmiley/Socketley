@@ -100,6 +100,9 @@ cleanup() {
     case "${SUITE_HOME:-}" in
         */socketley-suite-home.*) rm -rf "$SUITE_HOME" ;;
     esac
+    case "${NS_ROOT:-}" in
+        /tmp/socketley-ns.*) chmod -R u+rwx "$NS_ROOT" 2>/dev/null; rm -rf "$NS_ROOT" ;;
+    esac
 }
 trap cleanup EXIT
 
@@ -135,6 +138,12 @@ run_test() {
 MEMDIR=$(mktemp -d)
 suite_mem_sampler "$MEMDIR" & SAMPLER_PID=$!
 trap 'kill "$SAMPLER_PID" 2>/dev/null; cleanup' EXIT
+NS_ROOT=""
+if [ -z "${SUITE_NO_NS:-}" ] && suite_ns_ok; then
+    # On what /tmp is, tmpfs or a disk, so a file's syncs cost what they cost when it runs alone.
+    NS_ROOT=$(mktemp -d /tmp/socketley-ns.XXXXXX)
+fi
+export NS_ROOT SCRIPT_DIR
 ALONE_ONLY=""
 report_jobs() {   # list dir
     local name cmd
@@ -143,7 +152,7 @@ report_jobs() {   # list dir
         note_skips "$name" "$2/$name.log"
         if [ "$(cat "$2/$name.rc" 2>/dev/null)" = 0 ]; then PASS=$((PASS+1)); echo ""; continue; fi
         echo "  -- red beside others; run again alone:"
-        if bash -c "$cmd" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
+        if suite_job "$name" "$cmd" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
         else FAIL=$((FAIL+1)); FAILED="$FAILED$name"$'\n'; fi
         echo ""
     done < "$1"
@@ -360,12 +369,6 @@ check_leaked_daemons() {
 PAR_LIST=$(mktemp); SERIAL_LIST=$(mktemp); QUIET_LIST=$(mktemp); RESDIR=$(mktemp -d)
 # In namespaces of its own a file needs no port window and shares no socket, so every file but a quiet one runs side
 # by side, and a quiet one runs on cores of its own beside them; without, as before.
-NS_ROOT=""
-if [ -z "${SUITE_NO_NS:-}" ] && suite_ns_ok; then
-    # On what /tmp is, tmpfs or a disk, so a file's syncs cost what they cost when it runs alone.
-    NS_ROOT=$(mktemp -d /tmp/socketley-ns.XXXXXX)
-fi
-export NS_ROOT SCRIPT_DIR
 for script in "$SCRIPT_DIR"/integration/test_*.sh; do
     [ -f "$script" ] || continue
     # A quiet file that needs the host's own network disturbs every other one, so it runs alone after them.
@@ -480,7 +483,6 @@ done < <(sort "$SERIAL_LIST")
 suite_save_durations "$RESDIR"
 kill "$SAMPLER_PID" 2>/dev/null; suite_save_memory "$MEMDIR"; rm -rf "$MEMDIR"
 rm -rf "$PAR_LIST" "$SERIAL_LIST" "$QUIET_LIST" "$RESDIR"
-[ -n "$NS_ROOT" ] && rm -rf "$NS_ROOT"
 
 if [ -n "$LEAKED_FILES" ]; then
     echo "─── files that left a daemon running ──────────────────────────────"

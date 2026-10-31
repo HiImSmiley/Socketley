@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# suite: isolated -- its own daemons, sockets, state directories and port window, so it runs beside the others
+# suite: quiet -- a restarted node takes a million keys back within 150 s, which 28 files and a second suite beside it can starve
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 # A cluster cache replicates asynchronously: the primary acknowledges a write
