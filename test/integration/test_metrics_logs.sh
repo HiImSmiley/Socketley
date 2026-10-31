@@ -41,7 +41,9 @@ echo '-- fine' > "$T/s.lua"
 S create server broke -p $((P+2)) --lua "$T/s.lua" -s >/dev/null
 echo 'this is not lua (' > "$T/s.lua"
 S stop broke >/dev/null; S start broke >/dev/null 2>&1
-for _ in $(seq 1 200); do S metrics m logs '{name="broke", level="error"}' 2>/dev/null | grep -q . && break; sleep 0.1; done
+# The worker's own error comes first and the daemon's comes when it sees the worker go, so the wait is for the latter,
+# which every check below reads.
+for _ in $(seq 1 300); do S metrics m logs '{name="broke", level="error"}' 2>/dev/null | grep -q "runtime 'broke': .*exited unexp" && break; sleep 0.1; done
 sleep 1.2
 
 # ── the lines, and the CLI ──────────────────────────────────────────────────
