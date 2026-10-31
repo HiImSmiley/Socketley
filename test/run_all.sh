@@ -272,6 +272,7 @@ for f in "$BIN_DIR"/fuzz_*; do
     fname=$(basename "$f")
     case "$fname" in
         fuzz_resp)           corpus=resp ;;
+        fuzz_fastcgi)        corpus=fastcgi ;;
         fuzz_ws_frame)       corpus=ws ;;
         fuzz_http_request)   corpus=http ;;
         fuzz_http_response)  corpus=httpresp ;;

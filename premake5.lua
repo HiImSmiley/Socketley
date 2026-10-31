@@ -619,6 +619,27 @@ project "test_shard_stats"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: the FastCGI client codec ───
+
+project "test_fastcgi"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_fastcgi.cpp", "socketley/shared/http/fastcgi.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
 -- ─── Test: RESP parser ───
 
 project "test_resp_parser"
@@ -1269,6 +1290,24 @@ local function fuzz_target_settings()
         optimize "Off"
     filter {}
 end
+
+-- ─── Fuzz: the FastCGI client codec, what an application server sends a proxy ───
+
+project "fuzz_fastcgi"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_fastcgi.cpp",
+        "socketley/shared/http/fastcgi.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
 
 -- ─── Fuzz: RESP2 command parsing (header-only, no libs) ───
 
