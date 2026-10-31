@@ -26,6 +26,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 daemon_isolate stgmpi
 
 D="$SOCKETLEY_TMPD"
+. "$HERE/lib_disk.sh"
+# The objects where writes are counted, so the written-once checks run on a machine whose /tmp is tmpfs too.
+DISK=$(disk_dir "$D")
 SOCK1="$D/one.sock"
 SOCK4="$D/four.sock"
 export MPU_STATE="$D/state.json"
@@ -39,6 +42,7 @@ cleanup() {
     sleep 0.3
     for r in mpi mpi4; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
     daemon_stop
+    disk_dir_done "$DISK"
 }
 trap cleanup EXIT
 
@@ -63,7 +67,7 @@ command -v python3 >/dev/null 2>&1 || { echo "  FAIL: python3 is required"; exit
 daemon_start "$BIN"
 
 # ── one shard ───────────────────────────────────────────────────────────────
-DATA1="$D/objects-one"
+DATA1="$DISK/objects-one"
 "$BIN" create storage mpi --listen "unix:$SOCK1" --dir "$DATA1" --anonymous -s >/dev/null 2>&1 ||
     { echo "  FAIL [create]: the runtime was not created"; exit 1; }
 wait_node "$SOCK1" || bad "the runtime comes up" "no answer on $SOCK1"
@@ -80,7 +84,7 @@ wait_node "$SOCK1" || bad "the runtime comes back" "no answer on $SOCK1"
 run_lib "and the upload completes after it" after "$DATA1" "$SOCK1"
 
 # ── four shards ─────────────────────────────────────────────────────────────
-DATA4="$D/objects-four"
+DATA4="$DISK/objects-four"
 "$BIN" create storage mpi4 --listen "unix:$SOCK4" --dir "$DATA4" --anonymous --shards 4 -s >/dev/null 2>&1 ||
     { bad "create with --shards 4" "the runtime was not created"; }
 N4=()

@@ -63,6 +63,9 @@ P1=$((SL_PORT_BASE+1650))
 P2=$((SL_PORT_BASE+1651))
 P3=$((SL_PORT_BASE+1652))
 T="$SOCKETLEY_TMPD"
+. "$HERE/lib_disk.sh"
+# The objects where writes are counted, so the written-once checks run on a machine whose /tmp is tmpfs too.
+DISK=$(disk_dir "$T")
 CERTS="$T/certs"
 
 PASS=0; FAIL=0; TOTAL=0
@@ -78,6 +81,7 @@ cleanup() {
     sleep 0.3
     for r in $RUNTIMES; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
     daemon_stop
+    disk_dir_done "$DISK"
 }
 trap cleanup EXIT
 
@@ -147,7 +151,7 @@ out=$("$BIN" create storage x3 -p "$P3" --dir "$T/x3" --anonymous --sse-key-file
 expect "--sse-key-file with no path is refused" "$rc" 1
 
 # ── a cleartext runtime with a master key ───────────────────────────────────
-DATA="$T/objects"
+DATA="$DISK/objects"
 if ! "$BIN" create storage sse -p "$P1" --dir "$DATA" --anonymous --sse-key-file "$KEY" -s >/dev/null 2>&1; then
     echo "  FAIL [create]: the runtime was not created"
     exit 1
@@ -194,7 +198,7 @@ else
 fi
 
 # ── two shards ──────────────────────────────────────────────────────────────
-SDATA="$T/shardobjects"
+SDATA="$DISK/shardobjects"
 SOCK="$T/sses.sock"
 NODES=("$T/sses#0.sock" "$T/sses#1.sock")
 if ! "$BIN" create storage sses --listen "unix:$SOCK" --dir "$SDATA" --anonymous --sse-key-file "$KEY" \

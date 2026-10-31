@@ -110,7 +110,9 @@ fi
 for _ in $(seq 1 40); do got=$(qd ui.example.com A); [ "$got" = 198.51.100.7 ] && break; sleep 0.2; done
 expect "--publish names the address instead" "$got" "198.51.100.7"
 expect "a storage runtime's buckets under its short name" "$(qd photos.ui.example.com A)" "198.51.100.7"
-expect "a cache's name is published too" "$(qd mycache.example.com A)" "198.51.100.7"
+# The daemon writes the names a second apart at least, and a dns runtime reads them once a second.
+for _ in $(seq 1 40); do got=$(qd mycache.example.com A); [ "$got" = 198.51.100.7 ] && break; sleep 0.2; done
+expect "a cache's name is published too" "$got" "198.51.100.7"
 expect "a name the zone file gives an address keeps it" "$(qd mail.example.com A)" "192.0.2.25"
 
 # ── a zone given by its name ────────────────────────────────────────────────
