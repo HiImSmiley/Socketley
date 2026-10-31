@@ -79,7 +79,7 @@ parsers = {"parse_common_flags": None, "parse_shared_flags": None, "parse_server
            "parse_proxy_gate_flag": "proxy", "parse_proxy_flags": "proxy", "parse_cache_flags": "cache",
            "parse_dns_flags": "dns", "parse_storage_flags": "storage", "parse_sync_flags": "sync",
            "parse_idp_flags": "idp", "parse_db_flags": "db", "parse_mqtt_flags": "mqtt", "parse_mail_flags": "mail",
-           "parse_tunnel_flags": "tunnel"}
+           "parse_tunnel_flags": "tunnel", "parse_metrics_flags": "metrics"}
 out = []
 for fn, ty in parsers.items():
     m = re.search(r"\n(?:static )?int " + fn + r"\(.*?\n\}\n", src, re.S)
@@ -90,6 +90,13 @@ for fn, ty in parsers.items():
             out.append(flag + " (" + fn + ")")
         elif ty and ty not in known[flag]:
             out.append(flag + " not offered for " + ty)
+# A flag is one row per type: a second row of it, as --receive's stale one was, is a second field on the page.
+seen = {}
+for f in schema["flags"]:
+    for t in f["types"]:
+        if (f["flag"], t) in seen:
+            out.append(f["flag"] + " twice for " + t)
+        seen[(f["flag"], t)] = True
 print(" ".join(sorted(out)) or "none")
 PY
 )

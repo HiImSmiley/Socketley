@@ -194,7 +194,6 @@ constexpr row rows[] = {
     {"--receive", "R", "switch", "Take remote_write", "Store what a Prometheus or agent sends to /api/v1/write.", "Metrics"},
     {"--archive", "R", "text", "Archive", "An S3 bucket every finished block is copied to, so it outlives --keep.", "Archive", {}, "https://s3.example.com/metrics/home"},
     {"--archive-credentials", "R", "path", "Archive keys", "The bucket's access_key and secret_key, a file as sync reads it.", "Archive", {}, "/etc/socketley/metrics.s3"},
-    {"--receive", "R", "switch", "Receive", "Take remote_write, kept for a later release.", "Metrics", {}, {}, {}, true},
 
     // ── mqtt ────────────────────────────────────────────────────────────────
     {"--users", "M", "path", "Users", "Accounts that sign in with a password, user:hash a line as `socketley mqtt-passwd` writes them.", "MQTT", {}, "/etc/socketley/mqtt.users"},
