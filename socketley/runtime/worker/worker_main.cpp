@@ -2129,6 +2129,8 @@ private:
                     worker_proto::frame_type::start_err, why))) {}
         }
 
+        // The first figures ahead of the state that ends the daemon's wait, so a `stats` after `start` reads this worker.
+        if (!push_stats()) {}
         send_state();
     }
 
