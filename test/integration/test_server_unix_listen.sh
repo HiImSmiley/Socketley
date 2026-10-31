@@ -370,7 +370,12 @@ setup_refusal() {
     rc=$?
     set -e
     local after
-    after=$(tail -c "+$((before + 1))" "$SOCKETLEY_DLOG")
+    # The worker's reason reaches the daemon's log a moment after the refusal, later still beside other files.
+    for _ in $(seq 1 30); do
+        after=$(tail -c "+$((before + 1))" "$SOCKETLEY_DLOG")
+        grep -qF -- "$needle" <<<"$after" && break
+        sleep 0.1
+    done
     if [ "$rc" -ne 0 ] && grep -qF -- "$needle" <<<"$after"; then pass
     else fail "$name is refused at start" \
               "exit $rc; the log said: ${after:0:200}"; fi
