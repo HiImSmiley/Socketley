@@ -36,6 +36,7 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() { "$BIN" stop ic 2>/dev/null || true; "$BIN" remove ic 2>/dev/null || true; daemon_stop; }
 trap cleanup EXIT
+daemon_start "$BIN"
 
 ok() {
     TOTAL=$((TOTAL+1))

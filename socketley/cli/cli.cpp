@@ -172,8 +172,8 @@ bool ensure_daemon(bool start)
         _exit(1);
     }
 
-    // Parent: wait for daemon to be ready
-    for (int i = 0; i < 50; ++i)   // 50 * 20ms = 1s max
+    // Parent: wait for daemon to be ready, five seconds at most, since a loaded machine or a sanitizer build took past one.
+    for (int i = 0; i < 250; ++i)   // 250 * 20ms
     {
         usleep(20000);
         if (socket_answers())
