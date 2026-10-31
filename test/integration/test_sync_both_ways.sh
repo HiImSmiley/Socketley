@@ -75,8 +75,8 @@ conflict() { ls "$T/here" | grep -c "^clash (conflict .*)\.txt$"; }
 until_ok 30 test "$(keys docs | grep -o 'conflict' | wc -l)" = 1
 expect "the storage's files are brought here, folders and all" "$(cat "$T/here/from-storage.txt") $(cat "$T/here/deep/er/note.txt" 2>/dev/null)" "storage deep"
 expect "and this side's carried out" "$(S "http://127.0.0.1:$P/docs/from-here.txt")" here
-# The worker reports at its next tick after the round, which on tmpfs comes after the keys do.
-until_ok 10 test -n "$(st both brought)"
+# The worker reports at its first tick after the round, which on tmpfs comes after the keys do.
+until_ok 10 test "$(st both conflicts)" = 1
 expect "a file both had the same is left as it is" "$(cat "$T/here/same.txt") $(st both brought)" "same 3"
 expect "one both had and that differs keeps this side's at its name, on both sides" \
     "$(cat "$T/here/clash.txt") $(S "http://127.0.0.1:$P/docs/clash.txt")" "mine mine"
