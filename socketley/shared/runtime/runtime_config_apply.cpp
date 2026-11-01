@@ -57,6 +57,8 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
         prx.set_fastcgi_root(cfg.fcgi_remote_root);
     if (want("index", !cfg.fcgi_index.empty()))
         prx.set_index(cfg.fcgi_index);
+    if (want("compress", cfg.fcgi_compress))
+        prx.set_compress(cfg.fcgi_compress);
     if (want("health_threshold", cfg.health_threshold != defaults.health_threshold))
         prx.set_health_threshold(cfg.health_threshold);
     if (want("circuit_threshold", cfg.circuit_threshold != defaults.circuit_threshold))
@@ -542,6 +544,7 @@ void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
         if (!cfg.fcgi_root.empty())    prx.set_root(cfg.fcgi_root);
         prx.set_fastcgi_root(cfg.fcgi_remote_root);
         prx.set_index(cfg.fcgi_index);
+        prx.set_compress(cfg.fcgi_compress);
     }
 
     // A storage quota is read at each put, so it moves under a serving runtime.

@@ -33,6 +33,7 @@
 #include <utility>
 
 #include "../../shared/http/conditional.h"
+#include "../../shared/http/encoding.h"
 #include "../../shared/http/fastcgi.h"
 #include "../../shared/http/mime.h"
 #include "../../shared/http/status.h"
@@ -141,6 +142,29 @@ std::string_view field_of(const parsed_head& h, std::string_view name)
     return {};
 }
 
+// One field of a head, found without parse_head's list, for a request that asks only it.
+std::string_view head_field(std::string_view head, std::string_view name)
+{
+    for (size_t at = head.find("\r\n"); at != std::string_view::npos && at + 2 < head.size();)
+    {
+        const size_t from = at + 2, e = head.find("\r\n", from);
+        const std::string_view f = head.substr(from, e == std::string_view::npos ? std::string_view::npos : e - from);
+        if (f.size() > name.size() && f[name.size()] == ':' && iequal(f.substr(0, name.size()), name))
+            return trim(f.substr(name.size() + 1));
+        at = e;
+    }
+    return {};
+}
+
+// Whether a statx is still the file a kept entry was taken from.
+bool same_file(const struct statx& sx, dev_t dev, ino_t ino, off_t size, const struct timespec& mtime)
+{
+    constexpr unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
+    return (sx.stx_mask & want) == want && S_ISREG(sx.stx_mode) && makedev(sx.stx_dev_major, sx.stx_dev_minor) == dev &&
+           static_cast<ino_t>(sx.stx_ino) == ino && static_cast<off_t>(sx.stx_size) == size &&
+           sx.stx_mtime.tv_sec == mtime.tv_sec && sx.stx_mtime.tv_nsec == mtime.tv_nsec;
+}
+
 void append_chunk(std::string& out, std::string_view data)
 {
     if (data.empty())
@@ -165,10 +189,15 @@ bool private_name(std::string_view rel)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (lower.find(".php.") != std::string::npos)
         return true;
-    const size_t dot = lower.rfind('.');
+    std::string_view base = lower;
+    // A compressed copy of a file kept from the public is kept from it too: dump.sql.gz is the dump.
+    for (const std::string_view packed : {std::string_view(".gz"), std::string_view(".br")})
+        if (base.size() > packed.size() && base.ends_with(packed))
+            base.remove_suffix(packed.size());
+    const size_t dot = base.rfind('.');
     if (dot == std::string::npos)
         return false;
-    const std::string_view ext = std::string_view(lower).substr(dot + 1);
+    const std::string_view ext = base.substr(dot + 1);
     static constexpr std::string_view never[] = {"bak", "old", "orig", "save", "swp", "swo", "tmp", "inc", "sql",
                                                  "ini", "log", "phtml", "phar", "phps", "php3", "php4", "php5",
                                                  "php7", "php8", "dist"};
@@ -329,9 +358,48 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
             break;
         at = slash + 1;
     }
-    if (SOCKETLEY_LIKELY(!m_kept.empty()) && fcgi_serve_kept(conn, rel))
+    // A file of the site's own opened beneath --root and answered, its descriptor kept when it is large.
+    const auto open_and_serve = [&](std::string_view at, std::string_view type_of, std::string_view coding) {
+        struct stat st{};
+        const int ffd = m_files ? fcgi_open(at, O_RDONLY, st) : -1;
+        if (ffd < 0 || !S_ISREG(st.st_mode))
+        {
+            if (ffd >= 0)
+                ::close(ffd);
+            return false;
+        }
+        auto src = std::make_shared<fcgi_fd>(ffd);
+        if (static_cast<uint64_t>(st.st_size) > keep_max_file && !at.empty())
+        {
+            if (m_open.size() >= max_open_files)
+                m_open.clear();
+            m_open[std::string(at)] = fcgi_open_entry{st.st_dev, st.st_ino, st.st_size, st.st_mtim, src};
+        }
+        fcgi_serve_file(conn, std::move(src), st, at, {}, type_of, coding);
+        return true;
+    };
+    // --compress: the copy of the file a site's build put beside it, sent in its place to a client that takes it; the
+    // statx it took of each is the one the kept entries are checked against.
+    std::string packed;
+    struct statx file_sx{}, copy_sx{};
+    const struct statx* file_known = nullptr;
+    if (SOCKETLEY_UNLIKELY(m_fcgi_compress))
+    {
+        const std::string_view coding = fcgi_packed(conn, rel, packed, file_sx, copy_sx, file_known);
+        if (!coding.empty())
+        {
+            if (!m_kept.empty() && fcgi_serve_kept(conn, packed, rel, coding, &copy_sx))
+                return false;
+            if (!m_open.empty() && fcgi_serve_open(conn, packed, rel, coding, &copy_sx))
+                return false;
+            // A copy gone between the asking and the opening leaves the file itself to answer, below.
+            if (open_and_serve(packed, rel, coding))
+                return false;
+        }
+    }
+    if (SOCKETLEY_LIKELY(!m_kept.empty()) && fcgi_serve_kept(conn, rel, {}, {}, file_known))
         return false;
-    if (!m_open.empty() && fcgi_serve_open(conn, rel))
+    if (!m_open.empty() && fcgi_serve_open(conn, rel, {}, {}, file_known))
         return false;
     bool dir = false;
     const bool file = fcgi_regular(rel, dir);
@@ -348,24 +416,8 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
     // An existing file that is no script is the site's own, served from here and never handed to the interpreter.
     if (file)
     {
-        struct stat st{};
-        const int ffd = m_files && !private_name(rel) ? fcgi_open(rel, O_RDONLY, st) : -1;
-        if (ffd < 0 || !S_ISREG(st.st_mode))
-        {
-            if (ffd >= 0)
-                ::close(ffd);
+        if (private_name(rel) || !open_and_serve(rel, {}, {}))
             send_error(conn, "404 Not Found", "Not Found\n");
-            return false;
-        }
-        auto src = std::make_shared<fcgi_fd>(ffd);
-        // A large file's descriptor is kept for the requests after this one; a small one is kept as bytes instead.
-        if (static_cast<uint64_t>(st.st_size) > keep_max_file && !rel.empty())
-        {
-            if (m_open.size() >= max_open_files)
-                m_open.clear();
-            m_open[std::string(rel)] = fcgi_open_entry{st.st_dev, st.st_ino, st.st_size, st.st_mtim, src};
-        }
-        fcgi_serve_file(conn, std::move(src), st, rel);
         return false;
     }
     // Nothing at the path: the index script answers it, as a front controller does every route it was not given.
@@ -376,22 +428,68 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
     return false;
 }
 
+// The coding of a compressed copy beside `rel` this client takes, br before gzip, and the copy's path in `packed`: not
+// for a range, which is of the file and not of a copy, nor for a file kept from the public, and never a copy older than
+// the file, which a build that changed one and not the other leaves behind.  The statx only decides; the copy is opened
+// beneath --root like any file.
+std::string_view proxy_instance::fcgi_packed(proxy_client_connection* conn, std::string_view rel, std::string& packed,
+                                             struct statx& file, struct statx& copy, const struct statx*& file_known) const
+{
+    if (rel.empty() || private_name(rel) || socketley::http::compressed_type(socketley::http::content_type_of(rel)))
+        return {};
+    const size_t end = conn->partial.find("\r\n\r\n");
+    if (end == std::string::npos)
+        return {};
+    const std::string_view head = std::string_view(conn->partial).substr(0, end + 2);
+    const std::string_view accepts = head_field(head, "accept-encoding");
+    if (accepts.empty() || !head_field(head, "range").empty())
+        return {};
+    constexpr unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
+    const std::string path(rel);
+    if (::statx(m_fcgi_root_fd, path.c_str(), 0, want, &file) != 0 || !S_ISREG(file.stx_mode))
+        return {};
+    file_known = &file;
+    static constexpr std::pair<std::string_view, std::string_view> copies[] = {{"br", ".br"}, {"gzip", ".gz"}};
+    for (const auto& [coding, ext] : copies)
+    {
+        if (!socketley::http::accepts_coding(accepts, coding))
+            continue;
+        std::string at = path + std::string(ext);
+        if (::statx(m_fcgi_root_fd, at.c_str(), 0, want, &copy) == 0 && S_ISREG(copy.stx_mode) &&
+            (copy.stx_mtime.tv_sec > file.stx_mtime.tv_sec ||
+             (copy.stx_mtime.tv_sec == file.stx_mtime.tv_sec && copy.stx_mtime.tv_nsec >= file.stx_mtime.tv_nsec)))
+        {
+            packed = std::move(at);
+            return coding;
+        }
+    }
+    return {};
+}
+
+// Whether the file under `rel` is still the one a kept entry was taken from, by the statx the caller already took or
+// by one taken here.
+bool proxy_instance::fcgi_still(std::string_view rel, const struct statx* known, dev_t dev, ino_t ino, off_t size,
+                                const struct timespec& mtime) const
+{
+    if (known != nullptr)
+        return same_file(*known, dev, ino, size, mtime);
+    struct statx sx{};
+    const std::string path(rel);
+    return ::statx(m_fcgi_root_fd, path.c_str(), 0, STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE, &sx) == 0 &&
+           same_file(sx, dev, ino, size, mtime);
+}
+
 // A kept file still the one on disk, answered from memory; false sends the request down the path that opens it.  The
 // statx follows links where the open beneath --root would not, which is safe because what it decides is only whether
 // these bytes are still that file's: a path that now leads elsewhere names another inode, and is opened afresh.
-bool proxy_instance::fcgi_serve_kept(proxy_client_connection* conn, std::string_view rel)
+bool proxy_instance::fcgi_serve_kept(proxy_client_connection* conn, std::string_view rel, std::string_view type_of,
+                                     std::string_view coding, const struct statx* known)
 {
     const auto it = m_kept.find(rel);
     if (it == m_kept.end())
         return false;
-    struct statx sx{};
-    const unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
-    const std::string path(rel);
     const fcgi_kept& k = it->second;
-    if (::statx(m_fcgi_root_fd, path.c_str(), 0, want, &sx) != 0 || (sx.stx_mask & want) != want ||
-        !S_ISREG(sx.stx_mode) || makedev(sx.stx_dev_major, sx.stx_dev_minor) != k.dev ||
-        static_cast<ino_t>(sx.stx_ino) != k.ino || static_cast<off_t>(sx.stx_size) != k.size ||
-        sx.stx_mtime.tv_sec != k.mtime.tv_sec || sx.stx_mtime.tv_nsec != k.mtime.tv_nsec)
+    if (!fcgi_still(rel, known, k.dev, k.ino, k.size, k.mtime))
     {
         m_kept_bytes -= it->second.body->size();
         m_kept.erase(it);
@@ -401,25 +499,20 @@ bool proxy_instance::fcgi_serve_kept(proxy_client_connection* conn, std::string_
     st.st_size = k.size;
     st.st_mtim = k.mtime;
     st.st_ino = k.ino;
-    fcgi_serve_file(conn, nullptr, st, rel, k.body);
+    fcgi_serve_file(conn, nullptr, st, rel, k.body, type_of, coding);
     return true;
 }
 
 // A kept descriptor still the file under its name, answered from it; false opens the file afresh, for the reason
 // fcgi_serve_kept gives.
-bool proxy_instance::fcgi_serve_open(proxy_client_connection* conn, std::string_view rel)
+bool proxy_instance::fcgi_serve_open(proxy_client_connection* conn, std::string_view rel, std::string_view type_of,
+                                     std::string_view coding, const struct statx* known)
 {
     const auto it = m_open.find(rel);
     if (it == m_open.end())
         return false;
-    struct statx sx{};
-    const unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
-    const std::string path(rel);
     const fcgi_open_entry& o = it->second;
-    if (::statx(m_fcgi_root_fd, path.c_str(), 0, want, &sx) != 0 || (sx.stx_mask & want) != want ||
-        !S_ISREG(sx.stx_mode) || makedev(sx.stx_dev_major, sx.stx_dev_minor) != o.dev ||
-        static_cast<ino_t>(sx.stx_ino) != o.ino || static_cast<off_t>(sx.stx_size) != o.size ||
-        sx.stx_mtime.tv_sec != o.mtime.tv_sec || sx.stx_mtime.tv_nsec != o.mtime.tv_nsec)
+    if (!fcgi_still(rel, known, o.dev, o.ino, o.size, o.mtime))
     {
         m_open.erase(it);
         return false;
@@ -428,7 +521,7 @@ bool proxy_instance::fcgi_serve_open(proxy_client_connection* conn, std::string_
     st.st_size = o.size;
     st.st_mtim = o.mtime;
     st.st_ino = o.ino;
-    fcgi_serve_file(conn, o.src, st, rel);
+    fcgi_serve_file(conn, o.src, st, rel, {}, type_of, coding);
     return true;
 }
 
@@ -436,7 +529,8 @@ bool proxy_instance::fcgi_serve_open(proxy_client_connection* conn, std::string_
 // a window at a time as the client takes them; under keep-alive, so a page's assets share the connection its page came
 // on.
 void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_ptr<fcgi_fd> src, const struct stat& st,
-                                     std::string_view rel, std::shared_ptr<const std::string> kept)
+                                     std::string_view rel, std::shared_ptr<const std::string> kept,
+                                     std::string_view type_of, std::string_view coding)
 {
     auto f = std::make_shared<fcgi_file>();
     f->fd = src ? src->fd : -1;
@@ -520,11 +614,19 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_
     else if (!status.starts_with("304"))
     {
         out += "Content-Type: ";
-        out += socketley::http::content_type_of(rel);
+        out += socketley::http::content_type_of(type_of.empty() ? rel : type_of);
+        if (!coding.empty())
+        {
+            out += "\r\nContent-Encoding: ";
+            out += coding;
+        }
         out += "\r\nContent-Length: " + std::to_string(length) + "\r\n" + range_field + "Accept-Ranges: bytes\r\n";
         out += "X-Content-Type-Options: nosniff\r\n";
     }
     out += "ETag: \"" + etag + "\"\r\nLast-Modified: " + modified + "\r\n";
+    // With --compress a file may come back as a copy, so a cache keys its answers by what the client takes.
+    if (m_fcgi_compress)
+        out += "Vary: Accept-Encoding\r\n";
     if (conn->ex.client_conn_close)
         out += "Connection: close\r\n";
     else if (http10)

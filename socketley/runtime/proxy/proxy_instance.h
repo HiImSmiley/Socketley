@@ -728,6 +728,8 @@ public:
     std::string_view get_fastcgi_root() const { return m_fcgi_remote_root; }
     void set_index(std::string_view name);
     std::string_view get_index() const { return m_fcgi_index; }
+    void set_compress(bool on) { m_fcgi_compress = on; }
+    bool get_compress() const { return m_fcgi_compress; }
     void set_health_threshold(int threshold);
     void set_circuit_threshold(int threshold);
     void set_circuit_timeout(int seconds);
@@ -1223,6 +1225,7 @@ private:
     std::string m_fcgi_root_real;
     std::string m_fcgi_remote_root;
     std::string m_fcgi_index{"index.php"};
+    bool m_fcgi_compress{false};
     // STDERR lines logged this minute and when the minute began, so a script warning on every request is said a few
     // times a minute and not once a request.
     uint32_t m_fcgi_err_lines{0};
@@ -1236,8 +1239,15 @@ private:
     int fcgi_open(std::string_view rel, int flags, struct stat& st) const;
     bool open_fcgi_root();
     // A file beneath --root answered by this proxy, its next window read once the client has room, and that read's end.
+    // `type_of` names the file whose type the answer has and `coding` the compression of a copy sent in its place.
     void fcgi_serve_file(proxy_client_connection* conn, std::shared_ptr<fcgi_fd> src, const struct stat& st,
-                         std::string_view rel, std::shared_ptr<const std::string> kept = {});
+                         std::string_view rel, std::shared_ptr<const std::string> kept = {},
+                         std::string_view type_of = {}, std::string_view coding = {});
+    // --compress: the coding of a copy beside `rel` this client takes and its path, or an empty coding.
+    std::string_view fcgi_packed(proxy_client_connection* conn, std::string_view rel, std::string& packed,
+                                 struct statx& file, struct statx& copy, const struct statx*& file_known) const;
+    bool fcgi_still(std::string_view rel, const struct statx* known, dev_t dev, ino_t ino, off_t size,
+                    const struct timespec& mtime) const;
     void fcgi_file_next(proxy_client_connection* conn, bool inline_call = false);
     void fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
     void fcgi_file_polled(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
@@ -1253,7 +1263,8 @@ private:
     };
     std::unordered_map<std::string, fcgi_kept, string_hash, string_equal> m_kept;
     size_t m_kept_bytes{0};
-    bool fcgi_serve_kept(proxy_client_connection* conn, std::string_view rel);
+    bool fcgi_serve_kept(proxy_client_connection* conn, std::string_view rel, std::string_view type_of = {},
+                         std::string_view coding = {}, const struct statx* known = nullptr);
     // Large files' descriptors kept open between requests, nginx's open_file_cache: the same statx says the descriptor
     // is still the file under that name, where an open beneath --root, a stat and a close were.
     struct fcgi_open_entry
@@ -1265,7 +1276,8 @@ private:
         std::shared_ptr<fcgi_fd> src;
     };
     std::unordered_map<std::string, fcgi_open_entry, string_hash, string_equal> m_open;
-    bool fcgi_serve_open(proxy_client_connection* conn, std::string_view rel);
+    bool fcgi_serve_open(proxy_client_connection* conn, std::string_view rel, std::string_view type_of = {},
+                         std::string_view coding = {}, const struct statx* known = nullptr);
     std::unique_ptr<fcgi_file_pump> m_files;
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 

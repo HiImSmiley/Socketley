@@ -2273,6 +2273,7 @@ strategy	string	"round-robin", "random", or "lua"
 root	string	A FastCGI proxy's directory (\fB\-\-root\fR)
 fastcgi_root	string	It as the application server sees it
 index	string	The index script (default "index.php")
+compress	bool	Compressed copies (\fB\-\-compress\fR)
 backends	array	T{
 .ad l
 List of backend addresses ["ip:port", "@group", ...]
@@ -4161,11 +4162,9 @@ capped at 1 MB. So the default allows 64, and a runtime configured small because
 it serves many streams gets MORE pipes out of the same budget rather than fewer.
 Past the count the read path serves the remainder exactly as it did before.
 .IP
-More requests reach for a pipe than used to: the splice arm now starts at
-256 KiB rather than at 1 MiB, because that is where a kept response stops being
-the faster answer. A server of 300 KiB images that never touched this budget
-before may now sit against it, and what it gets when it does is the read path,
-which is what it had for those files all along.
+A file goes this way from 64 KiB on a plaintext connection, but only a window
+out of the page cache reaches for a pipe, so a server of warm images never sits
+against this budget; one that does gets the read path, as before.
 .IP
 That boundary is worth knowing, because the fallback is not merely slower. Worker
 throughput and RSS on 4 MiB files:
@@ -4259,26 +4258,19 @@ operator can see the size of before starting: once the kept responses reach
 whether the connection asking has a faster path available at all.
 .IP
 .nf
-plaintext, not .html   256 KiB   anything larger is spliced instead
-TLS, or an .html         1 MiB   neither has a splice arm
+plaintext, not .html    64 KiB   anything larger goes by sendfile instead
+TLS, or an .html         1 MiB   neither has a sendfile arm
 .fi
 .IP
 That split is measured rather than tidy. A kept response is sent by copying it
-into the socket; splicing sends the page cache by reference and copies nothing.
-At 64 concurrent requests for a 1 MiB file that is 5,931 responses a second kept
-against 14,049 spliced, and 11,977 against 26,599 at 512 KiB \(em so keeping a
-large file makes serving it slower, not faster. Small files reverse it, because
-splice's own setup is then the whole cost: at 4 KiB it is 146,987 a second kept
-against 66,905 spliced.
+into the socket; sendfile sends the page cache by reference and copies nothing,
+but costs a call and a descriptor of its own. One core, interleaved, in us of CPU
+a request, kept against sendfile: 4.7 against 7.9 at 8 KiB, 10.4 against 11.4 at
+64 KiB, 15.6 against 14.3 at 128 KiB and 27.8 against 23.9 at 256 KiB \(em so
+past 64 KiB keeping a file makes serving it dearer, and costs the map twice its
+size besides.
 .IP
-The cap sits at 256 KiB rather than lower because splice buys that throughput
-partly with CPU, and the price falls with size: per MiB served it is 340 us at
-256 KiB, 163 us at 1 MiB and 143 us at 2 MiB, against a flat ~170 us for the
-copy. Above the cap the trade is free or better; at 256 KiB it would be 59 per
-cent more CPU for 115 per cent more throughput, which is a trade and not
-something a default should decide for an operator.
-.IP
-A TLS connection cannot splice at all, since that would hand the peer plaintext
+A TLS connection cannot sendfile at all, since that would hand the peer plaintext
 in the middle of an encrypted stream, and an .html has a script injected into it
 \(em so for those two the larger cap stands, and there the map is what keeps a
 file from being read, and allocated, once per request.
@@ -5031,7 +5023,11 @@ and the names a site keeps but does not hand out \(em a name ending in
 .BR ~ ,
 one holding
 .BR .php. ,
-and the extensions
+and the extensions, also with
+.B .gz
+or
+.B .br
+after them,
 .BR bak ,
 .BR old ,
 .BR orig ,
@@ -5054,7 +5050,7 @@ They are 404.
 A file is served with its type, an ETag and Last\-Modified, answers
 If\-None\-Match, If\-Modified\-Since, If\-Match and If\-Unmodified\-Since
 (RFC 9110 13.2.2), one range with If\-Range, GET and HEAD alone (405 otherwise),
-under keep\-alive. A file up to 256 KiB is kept in memory after its first GET,
+under keep\-alive. A file up to 16 KiB is kept in memory after its first GET,
 64 MiB in all, and asked of the disk with one
 .BR statx (2)
 a request, which a file replaced under its name answers; a larger one is sent
@@ -5081,6 +5077,27 @@ with
 .TP
 .BI "\-\-root " directory
 The directory a FastCGI proxy's scripts and files are in, absolute.
+.TP
+.B \-\-compress
+Send a file's compressed copy beside it, made by the site's build \(em
+.B app.css.br
+or
+.B app.css.gz
+for
+.B app.css
+\(em to a client whose
+.B Accept\-Encoding
+takes that coding, br before gzip, with
+.B Content\-Encoding
+and its own ETag; every file answer then says
+.BR "Vary: Accept\-Encoding" .
+A copy older than its file is never sent, since that is a build that changed one
+and not the other, nor one for a range, which is of the file, nor a copy whose
+file is missing or kept from the public, nor one beside an image, a video, a woff
+font, a zip or a pdf, whose format is compressed already; a compressed copy of a name kept from
+the public is kept from it too, with or without the flag. Nothing is compressed
+or decompressed by the proxy, so no compression library is linked and nothing a
+client sends is decoded.
 .TP
 .BI "\-\-fastcgi\-root " directory
 The same directory as the application server sees it, when that differs
@@ -15396,6 +15413,7 @@ strategy                   \-\-strategy
 root                       \-\-root
 fastcgi_root               \-\-fastcgi\-root
 index                      \-\-index
+compress (bool)            \-\-compress
 health_check               \-\-health\-check
 health_interval            \-\-health\-interval  30, or 5m / 2h
 health_path                \-\-health\-path

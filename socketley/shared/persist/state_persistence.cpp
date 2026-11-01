@@ -659,6 +659,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.fcgi_root = std::string(prx->get_root());
             cfg.fcgi_remote_root = std::string(prx->get_fastcgi_root());
             cfg.fcgi_index = std::string(prx->get_index());
+            cfg.fcgi_compress = prx->get_compress();
             cfg.health_threshold = mesh.health_threshold;
             cfg.circuit_threshold = mesh.circuit_threshold;
             cfg.circuit_timeout = mesh.circuit_timeout;
@@ -1098,6 +1099,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("fastcgi_root", cfg.fcgi_remote_root);
             if (!cfg.fcgi_index.empty() && cfg.fcgi_index != "index.php")
                 append_str_field("index", cfg.fcgi_index);
+            if (cfg.fcgi_compress)
+                append_bool_field("compress", true);
             if (!cfg.proxy_auth.empty())
                 append_str_field("auth", cfg.proxy_auth);
             if (cfg.https_redirect != 0)
@@ -1535,6 +1538,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.fcgi_root = json_get_string(json, "root");
             cfg.fcgi_remote_root = json_get_string(json, "fastcgi_root");
             cfg.fcgi_index = json_get_string(json, "index");
+            cfg.fcgi_compress = json_get_bool(json, "compress");
             cfg.proxy_auth = json_get_string(json, "auth");
             { auto v = json_get_int(json, "redirect_https"); if (v > 0 && v <= 65535) cfg.https_redirect = static_cast<uint16_t>(v); }
             { auto v = json_get_int(json, "health_threshold"); if (v > 0) cfg.health_threshold = v; }

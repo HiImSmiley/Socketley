@@ -1108,6 +1108,10 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
                 proxy->set_root(pa.args[++i]);
             return 0;
         }
+        // The .br and .gz copies a site's build put beside its files, sent instead of them (proxy_fastcgi.cpp).
+        case fnv1a("--compress"):
+            proxy->set_compress(true);
+            return 0;
         case fnv1a("--index"):
         {
             const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
