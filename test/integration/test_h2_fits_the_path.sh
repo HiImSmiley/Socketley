@@ -49,23 +49,26 @@ mkdir -p "$T/www"; head -c $((64 << 20)) /dev/urandom > "$T/www/big.bin"
 "$BIN" create proxy ent -p "$P" --tls --cert "$T/e.pem" --key "$T/e.key" -s >/dev/null 2>&1
 for _ in $(seq 1 60); do f=$(find "$T" -name 'routes-ent' | head -1); [ -n "$f" ] && grep -q files.example.com "$f" && break; sleep 0.2; done
 
-# The most of the entrance's connection the kernel holds unsent across two seconds of a download read slowly.
+# The most of the entrance's connection the kernel holds unsent while a download is read slowly: `polls` tenths of a
+# second, or until `enough` bytes are seen, since a loaded box fills the buffer late but fills it.
 unsent_peak() {
+    local polls=$1 enough=$2
     curl -sk --http2 --limit-rate 2M -m 20 -o /dev/null --resolve "files.example.com:$P:127.0.0.1" \
         "https://files.example.com:$P/big.bin" & CURL_PID=$!
     local peak=0 n
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 "$polls"); do
         sleep 0.1
         n=$(ss -tinH state established "( sport = :$P )" 2>/dev/null | grep -o 'notsent:[0-9]*' | cut -d: -f2 | sort -n | tail -1)
         [ -n "$n" ] && [ "$n" -gt "$peak" ] && peak=$n
+        [ "$peak" -ge "$enough" ] && break
     done
     kill $CURL_PID 2>/dev/null; wait $CURL_PID 2>/dev/null; CURL_PID=""
     echo "$peak"
 }
 
-lan=$(unsent_peak)
+lan=$(unsent_peak 80 $((1 << 20)))
 tc qdisc change dev lo root netem delay 2ms
-wan=$(unsent_peak)
+wan=$(unsent_peak 30 $((64 << 20)))
 echo "  unsent at most: ${lan} bytes on loopback, ${wan} with a 4 ms round trip"
 if [ "$wan" -le $((512 << 10)) ]; then ok
 else bad "over a round trip the kernel holds little of what is framed" "$wan bytes unsent, past 512 KiB"; fi
