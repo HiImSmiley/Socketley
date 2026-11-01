@@ -867,6 +867,11 @@ public:
     void hot_invalidate(std::string_view bucket, std::string_view key);
     // A sibling started, so every copy of its keys may be older than its files, and so may every read in flight.
     void hot_forget_owner(uint32_t shard);
+    // A large plain object's file kept open for the next GET of the version `current` names: a copy of its
+    // descriptor and where its body begins, or -1 when none is kept for that version.
+    int kept_open(std::string_view bucket, std::string_view key, const object_meta& current, uint64_t& data_off);
+    // Keeps a copy of `fd`, the file `read` came from, when it is a large plain object this shard indexes as it is.
+    void keep_open(std::string_view bucket, std::string_view key, const object_meta& read, int fd, uint64_t data_off);
 
     // The metadata of any object, from memory when this shard owns the key and
     // from the object's own header otherwise.
@@ -1342,6 +1347,19 @@ private:
     void hot_drop(std::string_view bucket, std::string_view key);
     void hot_drop_bucket(std::string_view bucket);
     const std::string& hot_id(std::string_view bucket, std::string_view key);
+    // What keep_open holds: no ring op ever names these descriptors, which are lent out as copies.
+    struct kept_file
+    {
+        int         fd{-1};
+        uint64_t    data_off{0};
+        object_meta meta;
+    };
+    std::unordered_map<std::string, kept_file> m_kept;
+    // A bound on the descriptors this holds, as the server's and the FastCGI proxy's.
+    static constexpr size_t kept_max = 256;
+    void kept_drop(std::string_view bucket, std::string_view key);
+    void kept_drop_bucket(std::string_view bucket);
+    void kept_clear();
     std::list<hot_entry>                                         m_hot_lru;   // most recent first
     std::unordered_map<std::string_view, std::list<hot_entry>::iterator> m_hot_index;
     uint64_t    m_hot_bytes{0};

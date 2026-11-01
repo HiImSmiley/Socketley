@@ -2524,7 +2524,28 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
 
     c->after_write = conn::after_kind::pump;
     access_log(c, head.status, len);
-    queue_write(c, response_head(*c, head));
+    std::string h = response_head(*c, head);
+    // With nothing ahead of it and no request waiting behind, the head goes at once, held for the file's first bytes,
+    // and the file follows in this turn rather than one write completion later; what the socket does not take is queued.
+    if (c->spliced && !c->h2 && !c->wr_pending && c->wbuf.empty() && c->wq.empty() && c->in.empty())
+    {
+        const ssize_t n = file_send::send_head(c->fd, h);
+        if (n < 0)
+        {
+            close_conn(c);
+            return;
+        }
+        m_c.bytes_out += static_cast<uint64_t>(n);
+        runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(n));
+        if (static_cast<size_t>(n) == h.size())
+        {
+            c->after_write = conn::after_kind::none;
+            file_pump(c);
+            return;
+        }
+        h.erase(0, static_cast<size_t>(n));
+    }
+    queue_write(c, std::move(h));
 }
 
 void storage_run::file_pump(const std::shared_ptr<conn>& c)

@@ -281,6 +281,82 @@ void object_store::hot_put_foreign(std::string_view bucket_name, std::string_vie
         });
 }
 
+int object_store::kept_open(std::string_view bucket_name, std::string_view key, const object_meta& current,
+                           uint64_t& data_off)
+{
+    if (m_kept.empty())
+        return -1;
+    const auto it = m_kept.find(hot_id(bucket_name, key));
+    if (it == m_kept.end())
+        return -1;
+    const kept_file& k = it->second;
+    const bucket* b = find_bucket(bucket_name);
+    // The index names the version, as for a held copy: every change to a key's record drops it through hot_drop first.
+    if (!b || b->closing || !same_version(k.meta, current))
+    {
+        ::close(k.fd);
+        m_kept.erase(it);
+        return -1;
+    }
+    const int fd = ::fcntl(k.fd, F_DUPFD_CLOEXEC, 0);
+    if (fd >= 0)
+        data_off = k.data_off;
+    return fd;
+}
+
+void object_store::keep_open(std::string_view bucket_name, std::string_view key, const object_meta& read, int fd,
+                             uint64_t data_off)
+{
+    if (read.size <= hot_max_object || is_delete_marker(read) || is_encrypted(read) || is_compressed(read) ||
+        is_tiered(read))
+        return;
+    // A read that raced a commit brought in the old version, which must not outlive it.
+    const object_meta* cur = find(bucket_name, key);
+    if (!cur || !same_version(*cur, read))
+        return;
+    const int own = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (own < 0)
+        return;
+    if (m_kept.size() >= kept_max)
+        kept_clear();
+    auto [it, fresh] = m_kept.try_emplace(std::string(hot_id(bucket_name, key)));
+    if (!fresh)
+        ::close(it->second.fd);
+    it->second = kept_file{own, data_off, read};
+}
+
+void object_store::kept_drop(std::string_view bucket_name, std::string_view key)
+{
+    if (m_kept.empty())
+        return;
+    const auto it = m_kept.find(hot_id(bucket_name, key));
+    if (it == m_kept.end())
+        return;
+    ::close(it->second.fd);
+    m_kept.erase(it);
+}
+
+void object_store::kept_drop_bucket(std::string_view bucket_name)
+{
+    for (auto it = m_kept.begin(); it != m_kept.end();)
+    {
+        if (std::string_view(it->first).substr(0, it->first.find('\0')) == bucket_name)
+        {
+            ::close(it->second.fd);
+            it = m_kept.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
+void object_store::kept_clear()
+{
+    for (auto& [id, k] : m_kept)
+        ::close(k.fd);
+    m_kept.clear();
+}
+
 void object_store::hot_invalidate(std::string_view bucket_name, std::string_view key)
 {
     hot_note_drop(drop_hash(hot_id(bucket_name, key)));
@@ -311,6 +387,7 @@ void object_store::hot_forget_owner(uint32_t shard)
 
 void object_store::hot_drop(std::string_view bucket_name, std::string_view key)
 {
+    kept_drop(bucket_name, key);
     if (m_hot_index.empty())
         return;
     auto it = m_hot_index.find(hot_id(bucket_name, key));
@@ -324,6 +401,7 @@ void object_store::hot_drop(std::string_view bucket_name, std::string_view key)
 
 void object_store::hot_drop_bucket(std::string_view bucket_name)
 {
+    kept_drop_bucket(bucket_name);
     hot_note_drop(0);
     for (auto it = m_hot_lru.begin(); it != m_hot_lru.end();)
     {

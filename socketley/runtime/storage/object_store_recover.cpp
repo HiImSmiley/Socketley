@@ -1589,6 +1589,8 @@ void object_store::close(bool clean)
 {
     *m_alive = false;
     stop_syncer();
+    // A stopped store holds no object open.
+    kept_clear();
     if (m_removed_fd >= 0)
     {
         ::close(m_removed_fd);

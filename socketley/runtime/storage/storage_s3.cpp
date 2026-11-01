@@ -2556,6 +2556,17 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
         answer(c, *hot.meta, -1, 0, *hot.body, true);
         return;
     }
+    // A large object of this shard's whose file is kept open is answered from it, with no open and no header read.
+    if (mem && mem->size > object_store::hot_max_object)
+    {
+        uint64_t data_off = 0;
+        const int fd = m_store.kept_open(q.bucket, q.key, *mem, data_off);
+        if (fd >= 0)
+        {
+            answer(c, *mem, fd, data_off, std::string{}, false);
+            return;
+        }
+    }
     const uint64_t drop_epoch = m_store.hot_epoch();
 
     // Small objects are read whole with their header, in one read; a key whose
@@ -2628,6 +2639,8 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
             else
                 m_store.hot_put_foreign(b, k, drop_epoch, o.meta, whole);
         }
+        else if (mine)
+            m_store.keep_open(b, k, o.meta, o.fd, o.data_off);
         answer(cc, o.meta, o.fd, o.data_off, o.prefetch, false);
     });
 }
