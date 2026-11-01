@@ -430,6 +430,11 @@ void metrics_endpoint::serve_loop()
                 else
                     serve(waiting[i].fd, req, via);
             }
+            // Answered and not only dropped, so the page says why rather than that the network failed.
+            else if (got == dashboard::parse_state::too_large)
+                dashboard::send(waiting[i].fd, 413, "text/plain; charset=utf-8", "The request is too large.\n");
+            else
+                dashboard::send(waiting[i].fd, 400, "text/plain; charset=utf-8", "The request could not be read.\n");
             drop(i);
         }
 

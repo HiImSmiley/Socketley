@@ -232,7 +232,7 @@ expect "a peer other than the entrance is barred by its own address, whatever cl
 expect "a hop that is no address is not taken as the client" \
     "$(raw_session 127.0.0.1 'not-an-address' "${ADMIN%%:*}:guess") $(grep -c 'refused from not-an-address' "$SOCKETLEY_DLOG")" "401 0"
 expect "and a field with a bare LF is refused, so it writes no line of its choosing" \
-    "$(raw_session 127.0.0.1 '203.0.113.5|[12:00:00] [WARN] dashboard: forged line' "${ADMIN%%:*}:guess") $(grep -c '^\[12:00:00\] \[WARN\] dashboard: forged line' "$SOCKETLEY_DLOG")" "none 0"
+    "$(raw_session 127.0.0.1 '203.0.113.5|[12:00:00] [WARN] dashboard: forged line' "${ADMIN%%:*}:guess") $(grep -c '^\[12:00:00\] \[WARN\] dashboard: forged line' "$SOCKETLEY_DLOG")" "400 0"
 expect "a forged cookie is no session" "$(code -b 'skl_dash=AKIADASHTESTADMIN000.9999999999.00' "$U/api/runtimes")" 401
 # A browser sends one cookie of a name per domain it was set for, so a forged one beside the real one must not win.
 dash=$(awk '$6 == "skl_dash" {print $7}' "$T/jar")
@@ -323,6 +323,15 @@ bad=$(python3 -c 'import json,sys; print(json.dumps({"runtime":"ns","path":sys.a
 expect "a zone that does not parse is refused" "$(put "$bad")" 400
 has "saying where" "$(cat "$T/put.out")" "999.1.1.1"
 expect "and the file is as it was" "$(grep -c '999.1.1.1' "$zpath")" 0
+# A zone past the 1 MiB a request used to be held to, under the 4 MiB a zone may be, is written; a request past what
+# any zone needs is answered 413 rather than dropped without a word.
+python3 -c 'import json,sys; t=sys.argv[2]+"\n"+"".join("big%d TXT \"%s\"\n" % (i, "z"*180) for i in range(8000)); print(json.dumps({"runtime":"ns","path":sys.argv[1],"text":t}))' "$zpath" "$zone_text" > "$T/big.json"
+expect "a zone of $(wc -c < "$T/big.json") bytes is written" "$(put @"$T/big.json")" 204
+for _ in $(seq 1 30); do got=$(dig @127.0.0.1 -p $((P+4)) +short big7999.example.com TXT 2>/dev/null); [ -n "$got" ] && break; sleep 0.2; done
+expect "and its last record served" "${got:0:4}" '"zzz'
+head -c $((10 << 20)) /dev/zero | tr '\0' x > "$T/huge"
+expect "a request larger than any zone is answered 413" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -X PUT --data-binary @"$T/huge" "$U/api/zone")" 413
 expect "a file no dns runtime serves is none of the page's" \
     "$(put "$(python3 -c 'import json; print(json.dumps({"runtime":"ns","path":"/etc/passwd","text":"x"}))')")" 404
 expect "and a change needs the page's header" "$(curl -s -o /dev/null -w '%{http_code}' -b "$T/jar" -X PUT --data-binary "$body" "$U/api/zone")" 403

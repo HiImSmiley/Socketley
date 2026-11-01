@@ -168,7 +168,7 @@ parse_state parse_request(std::string_view in, request& out, size_t max_body)
     const std::string_view cl = r.header("content-length");
     const size_t want = cl.empty() ? 0 : std::strtoull(std::string(cl).c_str(), nullptr, 10);
     if (want > max_body)
-        return parse_state::bad;
+        return parse_state::too_large;
     if (in.size() - (end + 4) < want)
         return parse_state::more;
     r.body.assign(in.substr(end + 4, want));

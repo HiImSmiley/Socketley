@@ -35,9 +35,11 @@ struct request
 };
 
 // What the bytes of a connection so far are: a whole request, the start of one, or none that will be.
-enum class parse_state { more, done, bad };
+enum class parse_state { more, done, bad, too_large };
+// The most a request's body may be: a zone's 4 MiB of text as the editor sends it, JSON-escaped, with room to spare.
+inline constexpr size_t max_request_body = 9u << 20;
 // The request `in` holds, its head and a body of at most `max_body`, put in `r` (whose peer is kept) once whole.
-parse_state parse_request(std::string_view in, request& r, size_t max_body = 1 << 20);
+parse_state parse_request(std::string_view in, request& r, size_t max_body = max_request_body);
 // What a certificate file says of itself; false when it holds none.
 // The certificate file a runtime serves with, its --cert or the one --acme keeps for its first name; empty for none.
 std::string served_cert(const runtime_instance& rt);
