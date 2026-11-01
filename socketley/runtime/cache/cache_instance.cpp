@@ -1972,7 +1972,7 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
             // The same ceiling the cleartext path applies, checked inside the
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
-            if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
+            if (SOCKETLEY_UNLIKELY(read_overflows(conn->partial.size(), conn->read_arrived)))
             {
                 // Said out loud here as well as on the cleartext path.  The
                 // two halves had the same condition and only one of them left
@@ -2414,6 +2414,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // above and which completions count is a per-runtime decision that already
     // diverges.
     stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
+    conn->read_arrived = static_cast<uint32_t>(cqe->res);
     if (conn->batch_ns == 0)
         conn->batch_ns = socketley::turn_clock::now_ns();
 
@@ -2447,7 +2448,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         SKL_TRACE_ADD(conn, reads, 1);
     }
 
-    if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
+    if (SOCKETLEY_UNLIKELY(read_overflows(conn->partial.size(), conn->read_arrived)))
     {
         // A line that never ends and nothing else, because the pump parses
         // every whole command as it arrives, crossing or no crossing.

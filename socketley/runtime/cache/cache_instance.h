@@ -78,6 +78,8 @@ struct client_connection
     static constexpr size_t   READ_BUF_BYTES = 4096;
     std::unique_ptr<char[]>   read_buf;
     std::string partial;
+    // What the read being taken in brought, which read_overflows() allows on top of the bound.
+    uint32_t read_arrived{0};
     std::string response_buf;
     // Owned replies, and slices of a published message's segment.
     socketley::byte_counted_queue<socketley::write_chunk> write_queue;

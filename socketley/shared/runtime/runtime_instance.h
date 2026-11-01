@@ -272,6 +272,10 @@ public:
     void set_read_buffer(size_t bytes);
     size_t get_read_buffer() const;
     size_t read_buffer_bytes() const { return m_read_buffer; }
+    // Whether a connection holds more than --read-buffer that no message has ended, allowing what the read in hand
+    // brought: one completion may carry megabytes of whole messages once the socket's buffer autotunes, and they are
+    // parsed only after it is taken in.
+    bool read_overflows(size_t unparsed, size_t arrived) const { return unparsed > m_read_buffer + arrived; }
     // Half, and as an int because the RESP decoders compare a parsed int
     // against it; clamped so a very large buffer cannot make it negative.
     int read_bulk_limit() const

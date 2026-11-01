@@ -150,6 +150,8 @@ struct alignas(64) server_connection
 
     // === WARM fields (message processing path) ===
     std::string partial;
+    // What the read being taken in brought, which read_overflows() allows on top of the bound.
+    uint32_t read_arrived{0};
     socketley::byte_counted_queue<socketley::write_chunk> write_queue;
 
     // Relay traffic that arrived before this connection said what it speaks,

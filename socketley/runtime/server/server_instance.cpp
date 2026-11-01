@@ -3769,7 +3769,7 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
             // The same ceiling the cleartext path applies, checked inside the
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
-            if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
+            if (SOCKETLEY_UNLIKELY(read_overflows(conn->partial.size(), conn->read_arrived)))
             {
                 conn->closing = true;
                 break;
@@ -5072,6 +5072,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
         conn->last_activity = std::chrono::steady_clock::now();
     stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
+    conn->read_arrived = static_cast<uint32_t>(cqe->res);
 
     // A connection on its way out takes nothing more in, because a multishot
     // recv stays armed after `closing` is set and went on filling `partial`
@@ -5146,7 +5147,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(!conn->spoke) && !conn->partial.empty())
         conn->spoke = true;
 
-    if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
+    if (SOCKETLEY_UNLIKELY(read_overflows(conn->partial.size(), conn->read_arrived)))
     {
         // Said rather than done in silence.  What this used to be was
         // `closing = true` and nothing else: a websocket peer sending a frame
