@@ -158,8 +158,10 @@ void archiver::start(const std::string& name)
             ::close(fd);
         return;
     }
-    auto file = std::shared_ptr<int>(new int(fd), [](int* p) {
-        ::close(*p);
+    // Closed through the loop, which holds it open while a splice the ring has not reported still names it.
+    event_loop* loop = &m_loop;
+    auto file = std::shared_ptr<int>(new int(fd), [loop](int* p) {
+        loop->close_fd(*p);
         delete p;
     });
     const uint64_t len = static_cast<uint64_t>(st.st_size);
