@@ -43,6 +43,7 @@ runtime_instance::~runtime_instance() = default;
 
 void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
 {
+    armed = false;
     if (!rt)
     {
         if (loop) loop->deregister_owner(this);
@@ -67,6 +68,7 @@ void runtime_instance::start_tick_timer()
     m_tick->ts = { static_cast<long long>(ms / 1000),
                    static_cast<long long>((ms % 1000) * 1000000LL) };
     m_tick->last = std::chrono::steady_clock::now();
+    m_tick->armed = true;
     if (!m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req))
     {
         LOG_ERROR("runtime tick timer refused: on_tick will not run again for "
@@ -79,6 +81,18 @@ void runtime_instance::start_tick_timer()
         m_event_loop->deregister_owner(dead);
         delete dead;
     }
+}
+
+// The handler frees itself on its own last completion, which a cancel brings now rather than a period later, after a
+// stopping worker has given its ring at most ten milliseconds and torn it down.
+void runtime_instance::release_tick()
+{
+    tick_handler* const t = m_tick;
+    if (!t)
+        return;
+    m_tick = nullptr;
+    t->rt = nullptr;
+    if (t->armed && t->loop && !t->loop->submit_cancel_request(&t->req)) {}
 }
 
 void runtime_instance::fire_tick(int res)
@@ -113,6 +127,7 @@ void runtime_instance::fire_tick(int res)
 
     // The re-arm, on the same reasoning as the first: this completion is the
     // last thing that will name this handler unless the submission takes.
+    m_tick->armed = true;
     if (!m_event_loop->submit_timeout(&m_tick->ts, &m_tick->req))
     {
         LOG_ERROR("runtime tick timer could not be re-armed: on_tick will not "
@@ -325,7 +340,7 @@ bool runtime_instance::stop(event_loop& loop)
         return true;  // skip teardown(), on_stop
     }
 
-    if (m_tick) { m_tick->rt = nullptr; m_tick = nullptr; }
+    release_tick();
     invoke_on_stop();
 
     // The script's own timers and subscriptions, severed after on_stop so one
@@ -736,10 +751,8 @@ bool runtime_instance::reload_lua_script()
     bool should_tick = m_lua->has_on_tick();
     if (!m_tick && should_tick)
         start_tick_timer();
-    else if (m_tick && !should_tick) {
-        m_tick->rt = nullptr;
-        m_tick = nullptr;
-    }
+    else if (m_tick && !should_tick)
+        release_tick();
 
     // The new script's set-up runs, because the assignment above destroyed
     // every subscription and timer the outgoing context held; on_stop is

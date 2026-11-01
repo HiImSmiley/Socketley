@@ -1096,8 +1096,11 @@ private:
         io_request req{};
         struct __kernel_timespec ts{};
         std::chrono::steady_clock::time_point last{};
+        // A timeout of it is in the ring, which a release cancels.
+        bool armed{false};
         void on_cqe(struct io_uring_cqe* cqe) override;
     };
+    void release_tick();
     tick_handler* m_tick{nullptr};
     void start_tick_timer();
     void fire_tick(int res);
