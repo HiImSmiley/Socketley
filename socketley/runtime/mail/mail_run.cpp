@@ -2588,6 +2588,18 @@ void mail_run::conn::reply_shared(const std::shared_ptr<const std::string>& byte
         run->flush(*this);
 }
 
+// Taken as input is, so the head and the body go in one write.
+void mail_run::conn::reply_with_body(std::string_view head, const std::shared_ptr<const std::string>& body)
+{
+    const bool was = in_input;
+    in_input = true;
+    reply(head);
+    reply_shared(body, 0, body->size());
+    in_input = was;
+    if (!in_input && !dead)
+        run->flush(*this);
+}
+
 void mail_run::conn::when_drained(std::function<void()> f)
 {
     run->flush(*this);

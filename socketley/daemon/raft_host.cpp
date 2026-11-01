@@ -260,15 +260,19 @@ struct raft_host::link : io_handler
         }
         if (ssl)
         {
-            while (state == phase::ready && !queue.empty())
+            // Consumed by offset and erased once, where an erase per 64 KiB moved the rest of an 8 MiB frame each time.
+            size_t taken = 0;
+            while (state == phase::ready && taken < queue.size())
             {
-                const int n = tls_context::ssl_write(ssl, queue.data(), static_cast<int>(std::min<size_t>(queue.size(), 65536)));
+                const int n = tls_context::ssl_write(ssl, queue.data() + taken,
+                                                     static_cast<int>(std::min<size_t>(queue.size() - taken, 65536)));
                 if (n < 0)
                     return fail("TLS write failed");
                 if (n == 0)
                     break;
-                queue.erase(0, static_cast<size_t>(n));
+                taken += static_cast<size_t>(n);
             }
+            queue.erase(0, taken);
             tls_context::take_out(ssl, wire_out);
         }
         else if (state == phase::ready)

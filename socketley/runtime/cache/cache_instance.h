@@ -1358,6 +1358,7 @@ private:
     // Queue data for a follower and start writing if nothing is in flight,
     // false when the follower must be dropped.
     bool follower_write(follower_conn& f, std::string_view data);
+    bool follower_write_owned(follower_conn& f, std::string&& data);
     // Continue or finish a follower write after its completion arrives.
     void handle_follower_write(struct io_uring_cqe* cqe, follower_conn& f);
     // Drop followers marked dead and ask their client connections to close.

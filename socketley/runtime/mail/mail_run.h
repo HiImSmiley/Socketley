@@ -251,6 +251,7 @@ private:
         void remove(const std::string& user, std::vector<uint32_t> uids, std::function<void(bool)> done) override;
         void acknowledge() override;
         void reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len) override;
+        void reply_with_body(std::string_view head, const std::shared_ptr<const std::string>& body) override;
         size_t backlog() const override { return owed + zplain.size(); }
         bool start_compress() override;
         void later(std::function<void()> f) override;

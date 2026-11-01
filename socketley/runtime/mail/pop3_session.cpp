@@ -143,7 +143,8 @@ std::string pop3_session::multiline(std::string_view message, int64_t lines)
         if (!body && l.empty())
             body = true;
     }
-    return out + ".\r\n";
+    out.append(".\r\n");
+    return out;
 }
 
 void pop3_session::sign_in(std::string user, std::string password)

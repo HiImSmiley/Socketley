@@ -344,7 +344,8 @@ bool proxy_instance::h2_child_flush(proxy_client_connection* child)
     while (!child->write_queue.empty())
     {
         auto chunk = child->write_queue.take_front();
-        h2::frame_answer(s, st, std::string(chunk.data(), chunk.size()));
+        // An owned piece (a file window, a relayed chunk) moves into the frame, which frame_answer takes it to do.
+        h2::frame_answer(s, st, chunk.owns() ? chunk.take_owned() : std::string(chunk.view()));
         chunk.clear();
     }
     child->last_activity = std::chrono::steady_clock::now();

@@ -45,6 +45,13 @@ public:
     {
         virtual ~hooks() = default;
         virtual void reply(std::string_view bytes) = 0;
+        // A head and then a body the store holds, the body said without copying it where the connection allows.
+        virtual void reply_with_body(std::string_view head, const std::shared_ptr<const std::string>& body)
+        {
+            std::string all(head);
+            all.append(*body);
+            reply(all);
+        }
         virtual void close() = 0;
         virtual void login(std::string user, std::string password, std::function<void(account, std::string)> done) = 0;
         // An idp bearer token, the user it was given to.
@@ -130,6 +137,7 @@ public:
 private:
     void run();
     void handle(request rq);
+    std::string head_of(int code, std::string_view type, size_t length, std::string_view extra) const;
     void respond(int code, std::string_view type, std::string_view body, std::string_view extra = {});
     void fail(int code, std::string_view type, std::string_view detail);
     void finished();

@@ -12693,6 +12693,15 @@ void cache_instance::follower_kick(follower_conn& f)
     }
 }
 
+// The whole dataset of a full sync moves in when nothing is queued ahead of it, where an append held it twice at once.
+bool cache_instance::follower_write_owned(follower_conn& f, std::string&& data)
+{
+    if (f.dead || f.fd < 0 || !f.queued.empty())
+        return follower_write(f, std::string_view(data));
+    f.queued = std::move(data);
+    return follower_write(f, std::string_view{});
+}
+
 bool cache_instance::follower_write(follower_conn& f, std::string_view data)
 {
     if (f.dead || f.fd < 0)
@@ -12977,7 +12986,7 @@ bool cache_instance::send_full_dump(follower_conn& f)
     // Queued rather than written synchronously, because a dataset exceeds the
     // socket buffer and the follower may be a runtime inside this very daemon.
     f.sync_left = f.backlog() + buf.size();
-    return follower_write(f, buf);
+    return follower_write_owned(f, std::move(buf));
 }
 
 bool cache_instance::connect_to_master()

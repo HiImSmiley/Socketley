@@ -316,18 +316,24 @@ void jmap_session::run()
     }
 }
 
-void jmap_session::respond(int code, std::string_view type, std::string_view body, std::string_view extra)
+std::string jmap_session::head_of(int code, std::string_view type, size_t length, std::string_view extra) const
 {
     std::string out = "HTTP/1.1 " + std::to_string(code) + " " + reason_of(code) + "\r\n";
     if (!type.empty())
         out += "Content-Type: " + std::string(type) + "\r\n";
-    out += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    out += "Content-Length: " + std::to_string(length) + "\r\n";
     // A web client of another origin may call it with the user's credentials, never with the webmail's cookie.
     if (!m_from_page)
         out += "Access-Control-Allow-Origin: *\r\n";
     out += "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
     out.append(extra);
     out += "\r\n";
+    return out;
+}
+
+void jmap_session::respond(int code, std::string_view type, std::string_view body, std::string_view extra)
+{
+    std::string out = head_of(code, type, body.size(), extra);
     out.append(body);
     m_hooks.reply(out);
 }
@@ -970,7 +976,9 @@ void jmap_session::download(const std::string& account, const std::string& id, c
             fail(404, "urn:ietf:params:jmap:error:notFound", "no such blob");
             return finished();
         }
-        respond(200, type, *bytes, "Content-Disposition: attachment; filename=\"" + file + "\"\r\n");
+        // The blob the store holds goes out as it is, where building an answer around it copied it twice.
+        m_hooks.reply_with_body(
+            head_of(200, type, bytes->size(), "Content-Disposition: attachment; filename=\"" + file + "\"\r\n"), bytes);
         finished();
     });
 }
