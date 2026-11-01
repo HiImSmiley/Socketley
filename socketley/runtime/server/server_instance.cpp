@@ -7002,11 +7002,6 @@ void server_instance::sendfile_next(server_connection* conn, bool inline_call)
             fail();
         return;
     }
-    if (conn->splice_remaining > socketley::file_send::large && !conn->big_sndbuf)
-    {
-        conn->big_sndbuf = true;
-        socketley::file_send::raise_send_buffer(conn->fd);
-    }
     uint64_t left = conn->splice_remaining, sent = 0;
     const auto b = socketley::file_send::send(conn->fd, conn->sock_flags, conn->splice_file_fd, conn->splice_off, left, sent);
     conn->splice_remaining = static_cast<size_t>(left);

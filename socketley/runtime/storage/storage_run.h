@@ -516,11 +516,9 @@ struct conn
     uint64_t    file_off{0};
     uint64_t    file_left{0};
     std::string sbuf;
-    // Sent from its file by the kernel (shared/net/file_send.h), the socket's own flags read once, its send buffer
-    // raised once for a large object.
+    // Sent from its file by the kernel (shared/net/file_send.h), the socket's own flags read once.
     bool        spliced{false};
     int         sock_flags{-1};
-    bool        big_sndbuf{false};
     // The response is for a range or a whole object, kept for the counters.
     uint64_t    sent_body{0};
 

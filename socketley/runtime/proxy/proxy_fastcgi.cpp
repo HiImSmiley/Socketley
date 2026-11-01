@@ -634,15 +634,7 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_
         }
         // TLS and a stream frame what they send, so only a plain connection takes the bytes straight from the file.
         else if (f->left > 0 && conn->ssl == nullptr && conn->h2_parent == nullptr && conn->h3s == nullptr)
-        {
             f->sendfile = true;
-            // Autotuning grows the buffer only as the peer drains it, and each burst would stop for room on the way.
-            if (f->left > socketley::file_send::large && !conn->fcgi_sndbuf)
-            {
-                conn->fcgi_sndbuf = true;
-                socketley::file_send::raise_send_buffer(conn->fd);
-            }
-        }
     }
     // A file sent by sendfile has its head sent here and now, so the file follows in this same turn and not one
     // completion later; what the socket does not take is queued.

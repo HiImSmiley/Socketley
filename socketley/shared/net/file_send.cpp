@@ -59,9 +59,5 @@ ssize_t send_head(int sock, std::string_view head)
     return errno == EAGAIN ? 0 : -1;
 }
 
-void raise_send_buffer(int sock)
-{
-    if (::setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof send_buffer) < 0) {}
-}
 
 }   // namespace socketley::file_send

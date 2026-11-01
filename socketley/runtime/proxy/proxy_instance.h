@@ -368,9 +368,8 @@ struct alignas(64) proxy_client_connection
     // An exchange on this connection has finished and it stayed open, which
     // is the evidence park_backend waits for.
     bool kept_alive{false};
-    // A FastCGI proxy's file answers: the socket's own flags, read once, and whether its send buffer was raised.
+    // A FastCGI proxy's file answers: the socket's own flags, read once.
     int fcgi_sock_flags{-1};
-    bool fcgi_sndbuf{false};
 
     // Bumped on every reuse from the pool and stamped into io_requests, so
     // late completions from the previous occupant can be recognised and

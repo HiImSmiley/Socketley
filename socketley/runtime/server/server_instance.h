@@ -214,7 +214,6 @@ struct alignas(64) server_connection
     bool splice_sendfile{false};
     uint64_t splice_off{0};
     int sock_flags{-1};
-    bool big_sndbuf{false};
     // ─── A request body being streamed rather than gathered ─────────────
     // How many body bytes are still owed for the request whose headers were
     // already parsed, and the head itself, owned -- because the point of
@@ -401,7 +400,6 @@ struct alignas(64) server_connection
         splice_sendfile = false;
         splice_off = 0;
         sock_flags = -1;
-        big_sndbuf = false;
         // A struct that carried a half-received body would take the next
         // client's first bytes for the rest of somebody else's upload.
         body_remaining = 0;

@@ -287,7 +287,6 @@ void proxy_client_connection::reset(int new_fd)
     fd = new_fd;
     file.reset();
     fcgi_sock_flags = -1;
-    fcgi_sndbuf = false;
     // client_pool_release() already did this, repeated because a struct
     // leaving the pool must not carry the previous connection's session.
     tls_context::free_ssl(ssl);

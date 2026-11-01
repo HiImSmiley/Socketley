@@ -14,12 +14,9 @@
 namespace socketley::file_send
 {
 
-// At most this much one call sends before the loop turns, and the send buffer a connection sending a file this
-// large asks for (the kernel doubles it, to tcp_wmem's 4 MiB here, as far as nginx's autotuned sockets grow).
+// At most this much one call sends before the loop turns.  The socket's send buffer is left to autotune: a size set
+// on it locks it, which at a stock net.core.wmem_max is ~416 KiB, a WAN download's cap per round trip.
 inline constexpr uint64_t burst_max = 4u << 20;
-inline constexpr int send_buffer = 2 << 20;
-// From this size a file is worth a raised send buffer; below it one burst is a single short sendfile anyway.
-inline constexpr uint64_t large = 256u << 10;
 
 // Whether the burst [off, off + min(left, burst_max)) ends out of the page cache, where sendfile would hold the loop on
 // the disk; the caller then reads that window through the ring, which also has the kernel read ahead.  tmpfs, which
@@ -40,8 +37,5 @@ burst send(int sock, int& sock_flags, int file_fd, uint64_t& off, uint64_t& left
 // The head of a file answer sent at once, held for the file's first bytes (MSG_MORE) so they travel together: the
 // bytes the socket took, which may be fewer, or -1 when the client is gone.  Only when nothing else is queued.
 ssize_t send_head(int sock, std::string_view head);
-
-// The send buffer raised for a connection about to send a large file, which the caller does once per connection.
-void raise_send_buffer(int sock);
 
 }   // namespace socketley::file_send

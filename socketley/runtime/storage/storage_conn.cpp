@@ -2557,11 +2557,6 @@ void storage_run::file_pump(const std::shared_ptr<conn>& c)
     // out: this runs from its write's completion or from a wait for room, so no ring op is on the socket.
     if (c->spliced && !file_send::cold(c->file_fd, c->file_off, c->file_left))
     {
-        if (c->file_left > file_send::large && !c->big_sndbuf)
-        {
-            c->big_sndbuf = true;
-            file_send::raise_send_buffer(c->fd);
-        }
         uint64_t sent = 0;
         const auto b = file_send::send(c->fd, c->sock_flags, c->file_fd, c->file_off, c->file_left, sent);
         if (sent > 0)
