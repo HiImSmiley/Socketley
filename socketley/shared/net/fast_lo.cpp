@@ -333,7 +333,7 @@ static constexpr int16_t K_INIT = -88;   // state_val (32 bytes), a fresh socket
 // to any local listener -- enters the sockhash with a zeroed backlog counter,
 // and the close of such a socket deletes what it left in the maps.
 static int load_ops(int socks, int ports, int mine, int state, int snap, int pids,
-                    int counters, bool all, uint64_t pair_bytes, uint64_t netns_cookie)
+                    int counters, bool all, uint64_t first_mark, uint64_t netns_cookie)
 {
     bpf_asm a;
     const int out = a.label(), listen = a.label(), st = a.label(), connect = a.label();
@@ -492,13 +492,13 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
         a.jmp(enter);
     }
 
-    // Enter: a zero backlog whose first check falls at the per-pair bound, the
+    // Enter: a zero backlog whose first check falls at the per-pair bound or a sixteenth of the budget, the
     // state callback that deletes it on close, and the sockhash.
     a.bind(enter);
     a.movi(BPF_REG_1, 0);
     a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, count)), BPF_REG_1);
     a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, ask)), BPF_REG_1);
-    a.ld64(BPF_REG_1, pair_bytes); a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, mark)), BPF_REG_1);
+    a.ld64(BPF_REG_1, first_mark); a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, mark)), BPF_REG_1);
     a.ldw(BPF_REG_1, BPF_REG_10, K_OURS); a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, ours)), BPF_REG_1);
     // NOEXIST: a live entry with our tuple must not be overwritten -- the close
     // callback deletes, so a reused tuple finds the key free.
@@ -561,7 +561,7 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
 // to TCP for good -- real backpressure, and order kept because tcp_bpf_recvmsg
 // drains the redirect queue before the TCP receive queue.
 static int load_msg(int socks, int state, int snap, int ring, int budget, int counters,
-                    uint64_t pair_bytes, bool trust)
+                    uint64_t pair_bytes, uint64_t ask_step, bool trust)
 {
     bpf_asm a;
     const int pass = a.label(), do_redir = a.label(), taint_pass = a.label();
@@ -639,7 +639,7 @@ static int load_msg(int socks, int state, int snap, int ring, int budget, int co
     a.bind(applied);
     a.stx8(BPF_REG_8, offsetof(state_val, count), BPF_REG_9);
     a.erase(snap, self);
-    a.mov(BPF_REG_1, BPF_REG_9); a.ld64(BPF_REG_2, pair_bytes / 2); a.add(BPF_REG_1, BPF_REG_2);
+    a.mov(BPF_REG_1, BPF_REG_9); a.ld64(BPF_REG_2, ask_step); a.add(BPF_REG_1, BPF_REG_2);
     a.stx8(BPF_REG_8, offsetof(state_val, mark), BPF_REG_1);
     // The peer really holds the bound or more: a stalled reader.
     a.lddw(BPF_REG_1, BPF_REG_10, rsave); a.ld64(BPF_REG_2, pair_bytes); a.jge(BPF_REG_1, BPF_REG_2, t_bound);
@@ -1183,11 +1183,14 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
             ? "no CAP_BPF (run the daemon as root or setcap cap_bpf,cap_net_admin+ep)"
             : "map creation failed", errno);
 
+    // A pair is checked at least every sixteenth of the global budget, so pairs that stall together are seen
+    // before they hold much past it; at the default limits that is the per-pair bound's own half.
+    const uint64_t sixteenth = m_limits.global_bytes / 16;
     m_ops = load_ops(m_socks, m_ports, m_mine, m_state, m_snap, m_pids, m_counters,
-                     mode != fast_lo_mode::own, m_limits.pair_bytes, m_netns_cookie);
+                     mode != fast_lo_mode::own, std::min(m_limits.pair_bytes, sixteenth), m_netns_cookie);
     if (m_ops >= 0)
         m_msg = load_msg(m_socks, m_state, m_snap, m_ring, m_budget, m_counters, m_limits.pair_bytes,
-                         mode == fast_lo_mode::trust);
+                         std::min(m_limits.pair_bytes / 2, sixteenth), mode == fast_lo_mode::trust);
     if (m_ops < 0 || m_msg < 0)
         return fail(denied(errno) ? "no CAP_BPF/CAP_NET_ADMIN to load the programs"
                                   : load_refusal(), errno);
@@ -1361,7 +1364,7 @@ int main()
     }
     for (bool trust : { false, true })
     {
-        const int msg = load_msg(socks, state, snap, ring, budget, counters, 4ull << 20, trust);
+        const int msg = load_msg(socks, state, snap, ring, budget, counters, 4ull << 20, 2ull << 20, trust);
         std::printf("load_msg(trust=%d) = %d errno=%d\n", trust, msg, errno);
         if (msg < 0) std::printf("%s\n", g_verifier_log);
     }

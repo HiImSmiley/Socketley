@@ -438,9 +438,11 @@ after the taint is still read after the ones already redirected.
 Two edges the bound does not catch tightly: a pair moving gigabytes a second
 whose answer is held up for more than about a millisecond (the reconciler
 starved of CPU) reaches the hard ceiling and is tainted, which costs speed and
-not bytes; and many pairs stalling in the same instant can each hold their
-per-pair bound before the global flag is raised, which then holds the sum
-there.
+not bytes; and pairs stalling together are each checked at least every
+sixteenth of the global budget, so the sum they reach before the flag is raised
+is the budget plus a sixteenth per pair \(em eight pairs against
+.B 4,12
+held 13.4 MiB, where checking only at the per-pair marks let them hold 23.5.
 .IP \(bu 2
 Shortcut bytes skip netfilter, conntrack and the loopback device: nftables rules
 on
