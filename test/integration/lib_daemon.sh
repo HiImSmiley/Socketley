@@ -40,6 +40,20 @@ daemon_isolate() {
 #
 # cap_dir  -- a fresh directory where a copy's file capabilities count, for a test that setcap's one: not on a nosuid
 # mount, which /tmp often is and where the kernel ignores them; the caller removes it.
+# Kill what still runs from a cap_dir copy, matched on argv[0]: a binary with file capabilities is not dumpable, so
+# its environ, exe and fds -- what daemon_pids and daemon_sweep read -- are hidden, and one left running keeps its
+# sockops program on the root cgroup for every socket on the box.
+cap_sweep() {
+    local dir=$1 d p
+    [ -n "$dir" ] && [ -d "$dir" ] || return 0
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        { head -z -n1 "$d/cmdline" | tr -d "\0"; } 2>/dev/null | grep -q "^$dir/" || continue
+        kill -9 "$p" 2>/dev/null || true
+    done
+    return 0
+}
+
 cap_dir() {
     local d
     for d in /var/tmp "$HOME"; do

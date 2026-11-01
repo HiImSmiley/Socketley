@@ -74,7 +74,7 @@ daemon_watch "$WORK"
 ECHOPID=""; SPLPID=""; ORIGINPID=""; HCPID=""; NSPID=""; CAPDIR=""
 cleanup(){ [ -n "$NSPID" ] && sudo -n kill -9 "$NSPID" 2>/dev/null || true
     for p in "$ECHOPID" "$SPLPID" "$ORIGINPID" "$HCPID"; do [ -n "$p" ] && { kill -9 "$p" 2>/dev/null || true; }; done
-    daemon_stop; rm -rf "$WORK"; [ -z "$CAPDIR" ] || rm -rf "$CAPDIR"; }
+    daemon_stop; cap_sweep "$CAPDIR"; rm -rf "$WORK"; [ -z "$CAPDIR" ] || rm -rf "$CAPDIR"; }
 trap cleanup EXIT
 
 CPORT=$((SL_PORT_BASE + 1811))
@@ -281,6 +281,7 @@ fi
 # ─── the capped copy ────────────────────────────────────────────────────────
 CAPDIR=$(cap_dir)
 CAPBIN="$CAPDIR/socketley-fastlo"
+daemon_watch "$CAPDIR"   # an interrupted run's capped copies go with it
 cp "$BIN" "$CAPBIN"
 if ! sudo -n setcap cap_bpf,cap_net_admin+ep "$CAPBIN" 2>/dev/null; then
     echo "  SKIP: the shortcut itself (no sudo -n setcap for CAP_BPF/CAP_NET_ADMIN)"

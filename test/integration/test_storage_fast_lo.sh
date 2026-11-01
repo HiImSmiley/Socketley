@@ -35,10 +35,12 @@ bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; fi; }
 
 CAPDIR=$(cap_dir); CAPBIN="$CAPDIR/socketley-fastlo"
+daemon_watch "$CAPDIR"   # an interrupted run's capped copies go with it
 cleanup() {
     for r in sf_stg sf_px; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.3
     daemon_stop
+    cap_sweep "$CAPDIR"
     rm -rf "$WORK" "$CAPDIR"
 }
 trap cleanup EXIT
