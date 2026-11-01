@@ -470,9 +470,8 @@ bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
     // has, and removed not for the delay but because a SYN-RECV connection
     // dies with the listener unnoticed -- which for a pooled cache client is
     // discovered at the moment somebody's request is written into it.
-    int rcvbuf = 131072;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
+    // No SO_RCVBUF or SO_SNDBUF: either locks its buffer on every accepted socket against autotuning, and a
+    // connection then carries at most the buffer per round trip (the proxy's and the server's measured cap).
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
