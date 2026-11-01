@@ -6995,13 +6995,15 @@ void server_instance::sendfile_next(server_connection* conn, bool inline_call)
         if (!conn_ops_pending(conn))
             close_conn(conn);
     };
-    if (socketley::file_send::cold(conn->splice_file_fd, conn->splice_off, conn->splice_remaining))
+    // A window out of the page cache goes through a pipe, read by the ring, while one can be had; past the pipe
+    // budget it is sent as it is, which waits on the disk rather than dropping the download.
+    if (socketley::file_send::cold(conn->splice_file_fd, conn->splice_off, conn->splice_remaining) &&
+        splice_pipe_acquire(conn))
     {
         // splice() from a file advances its offset and takes no argument for where to begin.
         conn->splice_sendfile = false;
-        if (!splice_pipe_acquire(conn) ||
-            lseek(conn->splice_file_fd, static_cast<off_t>(conn->splice_off), SEEK_SET) !=
-                static_cast<off_t>(conn->splice_off))
+        if (lseek(conn->splice_file_fd, static_cast<off_t>(conn->splice_off), SEEK_SET) !=
+            static_cast<off_t>(conn->splice_off))
         {
             fail();
             return;
@@ -7092,6 +7094,8 @@ void server_instance::handle_splice_in(struct io_uring_cqe* cqe, server_connecti
 
     auto bytes_in = static_cast<size_t>(cqe->res);
     conn->splice_remaining -= bytes_in;
+    // Kept with the file's own offset, which the splice advanced, so sendfile can take up where it stops.
+    conn->splice_off += bytes_in;
     conn->splice_pipe_pending = static_cast<uint32_t>(bytes_in);
 
     // Submit pipe→socket splice
@@ -7161,20 +7165,11 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
         return;
     }
 
+    // The pipe is empty, so the rest is asked again whether it is in the page cache, and sent by sendfile once it is.
     if (conn->splice_remaining > 0)
     {
-        // More file data to transfer — submit next file→pipe chunk
-        uint32_t chunk = static_cast<uint32_t>(std::min(conn->splice_remaining, size_t(UINT32_MAX)));
-        conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice, conn->generation };
-        conn->splice_in_pending =
-            m_loop->submit_splice(conn->splice_file_fd, conn->splice_pipe[1], chunk, &conn->splice_in_req);
-        if (SOCKETLEY_UNLIKELY(!conn->splice_in_pending))
-        {
-            splice_cleanup(conn);
-            conn->closing = true;
-            if (!conn_ops_pending(conn))
-                close_conn(conn);
-        }
+        conn->splice_sendfile = true;
+        sendfile_next(conn);
         return;
     }
 
