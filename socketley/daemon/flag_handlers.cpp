@@ -920,6 +920,10 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         case fnv1a("--http-cache"):
             srv->set_http_cache(true);
             return 0;
+        // The .br and .gz copies a site's build put beside its files, sent instead of them (serve_http).
+        case fnv1a("--compress"):
+            srv->set_compress(true);
+            return 0;
         // The web origins besides its own whose pages may open a WebSocket here.
         case fnv1a("--origins"):
         {

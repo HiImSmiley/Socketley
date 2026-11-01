@@ -2249,6 +2249,7 @@ master_pw	string	Static password for master mode
 send_to	string	"sender", "others", "master", comma separated
 http_dir	string	Static file root, as \fB\-\-http\fR
 http_cache	bool	Hold those files in memory, as \fB\-\-http\-cache\fR
+compress	bool	Compressed copies (\fB\-\-compress\fR)
 origins	string	Other web origins that may open a WebSocket, as \fB\-\-origins\fR
 upstreams	array	Upstream addresses, as \fB\-\-upstream\fR
 .TE
@@ -4293,6 +4294,29 @@ per request. The cache is rebuilt on
 and only then: a file edited on disk is
 .B not
 picked up, which is the reason to use this flag and the reason not to.
+.TP
+.B \-\-compress
+With \-\-http, send a file's compressed copy beside it, made by the site's
+build \(em
+.B app.css.br
+or
+.B app.css.gz
+for
+.B app.css
+\(em to a client whose
+.B Accept\-Encoding
+takes that coding, br before gzip, with
+.B Content\-Encoding
+and the copy's own ETag; every file answer then says
+.BR "Vary: Accept\-Encoding" .
+Never a copy older than its file, one for a range, one beside a page (whose
+copy lacks the injected script), an image, a video, a woff font, a zip or a
+pdf. A copy asked for by its own name is sent as itself. With
+.B \-\-http\-cache
+the copies are kept at start beside the files, judged against them then. The
+same measurement as the proxy's: a page's 3.8 MB of scripts over 10 Mbit and
+50 ms in 0.97 s rather than 3.51. Nothing is compressed or decompressed by the
+server.
 Each file is held twice, once with a
 .B Connection: keep\-alive
 response header and once with
@@ -15397,6 +15421,7 @@ mode                       \-\-mode
 udp (bool)                 \-\-udp
 http                       \-\-http
 http_cache (bool)          \-\-http\-cache
+compress (bool)            \-\-compress
 origins                    \-\-origins
 master_pw                  \-\-master\-pw
 send_to (string)           \-\-send\-to

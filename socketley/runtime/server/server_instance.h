@@ -793,6 +793,8 @@ public:
     const std::filesystem::path& get_http_dir() const;
     void set_http_cache(bool enabled);
     bool get_http_cache() const;
+    void set_compress(bool on) { m_http_compress = on; }
+    bool get_compress() const { return m_http_compress; }
     void rebuild_http_cache();
 
     // False when the address named a port that cannot work, storing nothing in
@@ -1070,7 +1072,8 @@ private:
     void finish_streamed_body(server_connection* conn);
 
     void serve_http(server_connection* conn, const std::string& path,
-                    std::string_view range_hdr = {}, std::string_view if_none_match = {});
+                    std::string_view range_hdr = {}, std::string_view if_none_match = {},
+                    std::string_view accept_encoding = {});
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
     // `ends_exchange` false when bytes still follow or a refusal owns the teardown.
     void queue_http_response(server_connection* conn, std::shared_ptr<const std::string> resp,
@@ -1491,6 +1494,7 @@ private:
     int m_http_root_fd{-1};
     void open_http_root();
     bool m_http_cache_enabled{false};
+    bool m_http_compress{false};
     // Both variants are prebuilt, because a cache hit has to stay a refcount
     // bump and the response's own Connection header has to match what the
     // client asked for.

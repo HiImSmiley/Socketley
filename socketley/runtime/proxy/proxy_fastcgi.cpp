@@ -428,42 +428,24 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
     return false;
 }
 
-// The coding of a compressed copy beside `rel` this client takes, br before gzip, and the copy's path in `packed`: not
-// for a range, which is of the file and not of a copy, nor for a file kept from the public, and never a copy older than
-// the file, which a build that changed one and not the other leaves behind.  The statx only decides; the copy is opened
-// beneath --root like any file.
+// The copy pick_copy finds for this client, but not for a range, which is of the file and not of a copy, nor for a file
+// kept from the public; the statx only decides, and the copy is opened beneath --root like any file.
 std::string_view proxy_instance::fcgi_packed(proxy_client_connection* conn, std::string_view rel, std::string& packed,
                                              struct statx& file, struct statx& copy, const struct statx*& file_known) const
 {
-    if (rel.empty() || private_name(rel) || socketley::http::compressed_type(socketley::http::content_type_of(rel)))
+    if (private_name(rel))
         return {};
     const size_t end = conn->partial.find("\r\n\r\n");
     if (end == std::string::npos)
         return {};
     const std::string_view head = std::string_view(conn->partial).substr(0, end + 2);
-    const std::string_view accepts = head_field(head, "accept-encoding");
-    if (accepts.empty() || !head_field(head, "range").empty())
+    if (!head_field(head, "range").empty())
         return {};
-    constexpr unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
-    const std::string path(rel);
-    if (::statx(m_fcgi_root_fd, path.c_str(), 0, want, &file) != 0 || !S_ISREG(file.stx_mode))
-        return {};
-    file_known = &file;
-    static constexpr std::pair<std::string_view, std::string_view> copies[] = {{"br", ".br"}, {"gzip", ".gz"}};
-    for (const auto& [coding, ext] : copies)
-    {
-        if (!socketley::http::accepts_coding(accepts, coding))
-            continue;
-        std::string at = path + std::string(ext);
-        if (::statx(m_fcgi_root_fd, at.c_str(), 0, want, &copy) == 0 && S_ISREG(copy.stx_mode) &&
-            (copy.stx_mtime.tv_sec > file.stx_mtime.tv_sec ||
-             (copy.stx_mtime.tv_sec == file.stx_mtime.tv_sec && copy.stx_mtime.tv_nsec >= file.stx_mtime.tv_nsec)))
-        {
-            packed = std::move(at);
-            return coding;
-        }
-    }
-    return {};
+    bool known = false;
+    const std::string_view coding =
+        socketley::http::pick_copy(m_fcgi_root_fd, rel, head_field(head, "accept-encoding"), packed, file, copy, known);
+    file_known = known ? &file : nullptr;
+    return coding;
 }
 
 // Whether the file under `rel` is still the one a kept entry was taken from, by the statx the caller already took or

@@ -133,8 +133,8 @@ struct runtime_config
     int backend_timeout = socketley::mesh_defaults::backend_timeout;
     int retry_count = 0;
     bool retry_all = false;
-    // A FastCGI proxy sends a file's compressed copy beside it (--compress).
-    bool fcgi_compress = false;
+    // A server's --http or a FastCGI proxy sends a file's compressed copy beside it (--compress).
+    bool compress = false;
     std::string mesh_client_ca;
     std::string mesh_client_cert;
     std::string mesh_client_key;

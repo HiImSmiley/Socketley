@@ -1,9 +1,14 @@
 #pragma once
-// Content codings a client accepts (RFC 9110 12.5.3), asked when a runtime has a file's compressed copy beside it.
+// Content codings a client accepts (RFC 9110 12.5.3), and the compressed copy beside a file a runtime sends for one.
 // Only ever encodings this server sends; nothing here decodes what a client sends.
+#include <fcntl.h>
+#include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <utility>
 
 #include "../util/text_list.h"
+#include "mime.h"
 
 namespace socketley::http
 {
@@ -76,6 +81,36 @@ inline bool compressed_type(std::string_view type)
         return type != "audio/wav";
     return type.starts_with("video/") || type.starts_with("font/woff") || type == "application/zip" ||
            type == "application/pdf";
+}
+
+// The compressed copy beside `rel`, beneath `root_fd`, that a client asking with `accepts` takes, br before gzip: its
+// coding, with its path in `at`, its statx in `copy` and the file's in `file`, the last also when no copy is sent and
+// `file_known` then says so.  Never a copy older than the file, which a build that changed one and not the other
+// leaves behind, nor one beside a format compressed already.
+inline std::string_view pick_copy(int root_fd, std::string_view rel, std::string_view accepts, std::string& at,
+                                  struct statx& file, struct statx& copy, bool& file_known)
+{
+    file_known = false;
+    if (rel.empty() || accepts.empty() || compressed_type(content_type_of(rel)))
+        return {};
+    constexpr unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
+    at.assign(rel);
+    if (::statx(root_fd, at.c_str(), 0, want, &file) != 0 || !S_ISREG(file.stx_mode))
+        return {};
+    file_known = true;
+    static constexpr std::pair<std::string_view, std::string_view> copies[] = {{"br", ".br"}, {"gzip", ".gz"}};
+    for (const auto& [coding, ext] : copies)
+    {
+        if (!accepts_coding(accepts, coding))
+            continue;
+        at.resize(rel.size());
+        at.append(ext);
+        if (::statx(root_fd, at.c_str(), 0, want, &copy) == 0 && S_ISREG(copy.stx_mode) &&
+            (copy.stx_mtime.tv_sec > file.stx_mtime.tv_sec ||
+             (copy.stx_mtime.tv_sec == file.stx_mtime.tv_sec && copy.stx_mtime.tv_nsec >= file.stx_mtime.tv_nsec)))
+            return coding;
+    }
+    return {};
 }
 
 }   // namespace socketley::http

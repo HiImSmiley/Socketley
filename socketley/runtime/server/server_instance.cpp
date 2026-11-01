@@ -3,6 +3,7 @@
 #include "../../shared/loop/conn_alloc.h"
 #include "server_instance.h"
 #include "../../shared/http/conditional.h"
+#include "../../shared/http/encoding.h"
 #include "../../shared/http/mime.h"
 #include "../../shared/net/file_send.h"
 #include "../../shared/lua/lua_suspend.h"
@@ -621,6 +622,10 @@ const std::vector<upstream_target>& server_instance::get_upstream_targets() cons
     return m_upstream_targets;
 }
 
+// With --compress a file may come back as its copy, so a cache keys every file answer by what the client takes; it
+// follows the type, as the coding's own field does, so every response shape carries both.
+static constexpr std::string_view VARY_FIELD = "\r\nVary: Accept-Encoding";
+
 static constexpr std::string_view WS_INJECT_SCRIPT =
     "<script>const socketley=new WebSocket("
     "`ws${location.protocol==='https:'?'s':''}://${location.host}`);</script>";
@@ -769,12 +774,14 @@ static std::string build_http_206_headers(std::string_view content_type,
 }
 
 // The client's copy is the file: its validator and no body (RFC 9110 15.4.5).
-static std::string build_http_304(std::string_view etag, bool keep_alive)
+static std::string build_http_304(std::string_view etag, bool keep_alive, bool vary = false)
 {
     std::string resp;
-    resp.reserve(96);
+    resp.reserve(128);
     resp.append("HTTP/1.1 304 Not Modified");
     append_etag(resp, etag);
+    if (vary)
+        resp.append(VARY_FIELD);
     resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
     return resp;
 }
@@ -1087,11 +1094,42 @@ void server_instance::rebuild_http_cache()
         std::string ext = entry.path().extension().string();
         for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         uint32_t ext_hash = fnv1a(ext);
-        auto ct = socketley::http::content_type_of(ext);
+        std::string ct(socketley::http::content_type_of(ext));
+        if (m_http_compress)
+            ct.append(VARY_FIELD);
 
         // Inject WebSocket script into HTML files
         if (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"))
             content = inject_ws_script(content);
+
+        // --compress: a copy no older than the file beside it is kept a second time, under that file's name, a NUL and
+        // its coding, for a client that takes it.
+        if (m_http_compress && m_http_root_fd >= 0)
+            for (const auto& [coding, packed] : {std::pair<std::string_view, std::string_view>{"br", ".br"},
+                                                 std::pair<std::string_view, std::string_view>{"gzip", ".gz"}})
+            {
+                const std::string rel_s = rel.string();
+                if (rel_s.size() <= packed.size() || !rel_s.ends_with(packed))
+                    continue;
+                const std::string file = rel_s.substr(0, rel_s.size() - packed.size());
+                const std::string_view type = socketley::http::content_type_of(file);
+                struct statx fx{};
+                if (type.starts_with("text/html") || socketley::http::compressed_type(type) ||
+                    ::statx(m_http_root_fd, file.c_str(), 0, STATX_TYPE | STATX_MTIME, &fx) != 0 ||
+                    !S_ISREG(fx.stx_mode) || fx.stx_mtime.tv_sec > cst.st_mtim.tv_sec ||
+                    (fx.stx_mtime.tv_sec == cst.st_mtim.tv_sec && fx.stx_mtime.tv_nsec > cst.st_mtim.tv_nsec))
+                    continue;
+                std::string typed(type);
+                typed.append("\r\nContent-Encoding: ").append(coding).append(VARY_FIELD);
+                std::string key = "/" + file;
+                key.push_back('\0');
+                key.append(coding);
+                m_http_cache[key] = {
+                    std::make_shared<const std::string>(build_http_response(typed, content, true, etag)),
+                    std::make_shared<const std::string>(build_http_response(typed, content, false, etag)),
+                    etag
+                };
+            }
 
         // Both variants stored, because a single keep-alive string answered
         // `Connection: keep-alive` to every request including the ones that
@@ -1189,13 +1227,15 @@ void server_instance::open_http_root()
 }
 
 void server_instance::serve_http(server_connection* conn, const std::string& path,
-                                 std::string_view range_hdr, std::string_view if_none_match)
+                                 std::string_view range_hdr, std::string_view if_none_match,
+                                 std::string_view accept_encoding)
 {
     // The client already holds this file: a 304 and no body.
     const auto not_modified = [&](std::string_view etag) {
         if (if_none_match.empty() || etag.empty() || !socketley::http::etag_list_matches(if_none_match, etag))
             return false;
-        queue_http_response(conn, std::make_shared<const std::string>(build_http_304(etag, conn->http_keep_alive)));
+        queue_http_response(conn, std::make_shared<const std::string>(
+                                      build_http_304(etag, conn->http_keep_alive, m_http_compress)));
         if (!conn->http_keep_alive)
             conn->closing = true;
         else
@@ -1263,7 +1303,24 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
     if (m_http_cache_enabled && !m_http_cache.empty())
     {
         // Cached mode: zero-copy lookup — just bump shared_ptr refcount
-        auto it = m_http_cache.find(url_path);
+        auto it = m_http_cache.end();
+        // A copy is kept under its file's name, a NUL and its coding, which no request names.
+        if (SOCKETLEY_UNLIKELY(m_http_compress) && range_hdr.empty() && !accept_encoding.empty())
+        {
+            std::string key(url_path);
+            key.push_back('\0');
+            for (const std::string_view coding : {std::string_view("br"), std::string_view("gzip")})
+            {
+                if (!socketley::http::accepts_coding(accept_encoding, coding))
+                    continue;
+                key.resize(url_path.size() + 1);
+                key.append(coding);
+                if ((it = m_http_cache.find(key)) != m_http_cache.end())
+                    break;
+            }
+        }
+        if (it == m_http_cache.end())
+            it = m_http_cache.find(url_path);
         if (it != m_http_cache.end() && not_modified(it->second.etag))
             return;
         queue_http_response(conn, it != m_http_cache.end()
@@ -1299,6 +1356,27 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         // One statx decides whether the kept bytes are still the file's, and
         // dev+ino is in the comparison because `mv` into place plus `touch -r`
         // makes an (mtime, size) check serve the old bytes forever.
+        // --compress: the copy beside the file this client takes is answered in its place, under the copy's name with a
+        // NUL after it, which keeps its kept answer apart from the copy asked for by name and ends the name for the
+        // calls below; its type and coding fields ride after the file's own type.
+        std::string coded_key, coded_ct;
+        struct statx copy_sx{};
+        if (SOCKETLEY_UNLIKELY(m_http_compress) && range_hdr.empty() && m_http_root_fd >= 0 &&
+            !socketley::http::content_type_of(url_path).starts_with("text/html"))
+        {
+            struct statx file_sx{};
+            bool file_known = false;
+            std::string at;
+            const std::string_view coding = socketley::http::pick_copy(m_http_root_fd, url_path.substr(1),
+                                                                       accept_encoding, at, file_sx, copy_sx,
+                                                                       file_known);
+            if (!coding.empty())
+            {
+                coded_ct.append(socketley::http::content_type_of(url_path)).append("\r\nContent-Encoding: ").append(coding);
+                coded_key.append("/").append(at).push_back('\0');
+                url_path = coded_key;
+            }
+        }
         const std::string_view rel_view = url_path.substr(1);
         const char* rel_path = rel_view.empty() ? "." : rel_view.data();
 
@@ -1314,9 +1392,9 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             auto rit = m_http_reval.find(url_path);
             if (rit != m_http_reval.end())
             {
-                struct statx sx{};
+                struct statx sx = copy_sx;
                 const unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
-                if (::statx(m_http_root_fd, rel_path, 0, want, &sx) == 0 &&
+                if ((!coded_key.empty() || ::statx(m_http_root_fd, rel_path, 0, want, &sx) == 0) &&
                     (sx.stx_mask & want) == want &&
                     S_ISREG(sx.stx_mode) &&
                     makedev(sx.stx_dev_major, sx.stx_dev_minor) == rit->second.dev &&
@@ -1382,7 +1460,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
 
         if (!used_beneath)
         {
-        fs::path file_path = m_http_base / url_path.substr(1); // strip leading /
+        fs::path file_path = m_http_base / rel_path;
         resolved = fs::canonical(file_path, ec);
 
         // Verify the resolved path is within the base directory (symlink escape check)
@@ -1440,8 +1518,15 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         for (auto& c : ext)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         uint32_t ext_hash = fnv1a(ext);
-        bool is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
-        auto ct = socketley::http::content_type_of(ext);
+        bool is_html = coded_key.empty() && (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
+        std::string_view ct = coded_key.empty() ? socketley::http::content_type_of(ext) : std::string_view(coded_ct);
+        if (SOCKETLEY_UNLIKELY(m_http_compress))
+        {
+            if (coded_key.empty())
+                coded_ct.assign(ct);
+            coded_ct.append(VARY_FIELD);
+            ct = coded_ct;
+        }
 
         // ─── The range, against the length it is defined by ─────────────
         // Not for HTML: the injected script changes the body's length, so a
@@ -2027,7 +2112,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         // views into conn->partial and the erase below is what they point at.
         // The size is not known yet either, so the numbers are resolved in
         // serve_http once fstat has answered -- this only carries the text.
-        std::string range_hdr, if_none_match;
+        std::string range_hdr, if_none_match, accept_encoding;
         for (const auto& [k, v] : req.headers)
         {
             const uint32_t h = fnv1a_lower(k);
@@ -2035,9 +2120,11 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
                 range_hdr.assign(v);
             else if (h == fnv1a("if-none-match"))
                 if_none_match.assign(v);
+            else if (h == fnv1a("accept-encoding") && m_http_compress)
+                accept_encoding.assign(v);
         }
         conn->partial.erase(0, total_consumed);
-        serve_http(conn, path_str, range_hdr, if_none_match);
+        serve_http(conn, path_str, range_hdr, if_none_match, accept_encoding);
     }
     else
     {
