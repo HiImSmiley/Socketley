@@ -1,5 +1,6 @@
 #include "tunnel_run.h"
 #include "tunnel_instance.h"
+#include "../../shared/net/socket_tuning.h"
 
 #include <algorithm>
 #include <cctype>
@@ -308,7 +309,12 @@ bool leg_hooks::written(const std::shared_ptr<http::server_conn>& c)
     const auto g = std::static_pointer_cast<leg>(c);
     if (g->l && g->unacked)
     {
-        g->l->s.consumed(g->stream, g->unacked, g->l->out);
+        // The link's round trip, which tells a window that limits the stream from a reader that does.
+        const auto t = g->l->transport.lock();
+        const uint32_t rtt = t ? socket_tuning::rtt_us(t->fd) : 0;
+        const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        g->l->s.consumed(g->stream, g->unacked, g->l->out, static_cast<uint64_t>(now), rtt);
         g->unacked = 0;
         run.flush_link(*g->l);
     }

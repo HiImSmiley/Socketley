@@ -169,6 +169,39 @@ TEST_CASE("a stream sends no more than its credit, and the reader's consumption 
     CHECK(p.a.credit(s) == initial_window);
 }
 
+TEST_CASE("a window that limits the stream grows, and one a slow reader holds does not")
+{
+    pair_of p;
+    const uint32_t s = p.a.open("svc", "peer", p.a_out);
+    REQUIRE(p.pump());
+    const uint32_t rtt = 50000;
+    // Half the window back at 0 and again 10 ms later: faster than the round trip, so the second grant doubles it.
+    CHECK(p.a.send(s, std::string(initial_window, 'x'), p.a_out) == initial_window);
+    REQUIRE(p.pump());
+    p.b.consumed(s, initial_window / 2, p.b_out, 1000000, rtt);
+    p.b.consumed(s, initial_window / 2, p.b_out, 1010000, rtt);
+    REQUIRE(p.pump());
+    CHECK(p.a.credit(s) == 2 * initial_window);
+    // Taken a round trip apart, the reader is what limits the stream, and the window stays.
+    CHECK(p.a.send(s, std::string(2 * initial_window, 'x'), p.a_out) == 2 * initial_window);
+    REQUIRE(p.pump());
+    p.b.consumed(s, initial_window, p.b_out, 1200000, rtt);
+    p.b.consumed(s, initial_window, p.b_out, 1300000, rtt);
+    REQUIRE(p.pump());
+    CHECK(p.a.credit(s) == 2 * initial_window);
+    // Never past the most a window may be, however fast.
+    uint64_t t = 2000000;
+    for (int i = 0; i < 40; ++i)
+    {
+        const uint32_t c = p.a.credit(s);
+        CHECK(p.a.send(s, std::string(c, 'x'), p.a_out) == c);
+        REQUIRE(p.pump());
+        p.b.consumed(s, c, p.b_out, t += 100, rtt);
+        REQUIRE(p.pump());
+    }
+    CHECK(p.a.credit(s) <= max_window);
+}
+
 TEST_CASE("resets, refusals, the stream limit, pings and goaway")
 {
     pair_of p;

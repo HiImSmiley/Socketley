@@ -287,20 +287,29 @@ void session::reset(uint32_t stream, reset_code code, std::string& out)
     put(frame_type::reset, stream, std::string_view(&c, 1), out);
 }
 
-void session::consumed(uint32_t stream, size_t n, std::string& out)
+void session::consumed(uint32_t stream, size_t n, std::string& out, uint64_t now_us, uint32_t rtt_us)
 {
     const auto it = m_streams.find(stream);
     if (it == m_streams.end() || n == 0)
         return;
     stream_state& s = it->second;
     // Never more back than was taken, whatever the caller counts.
-    s.unacked = static_cast<uint32_t>(std::min<uint64_t>(uint64_t{s.unacked} + n, initial_window - s.recv_credit));
-    if (s.unacked < initial_window / 2 || s.got_close)
+    s.unacked = static_cast<uint32_t>(std::min<uint64_t>(uint64_t{s.unacked} + n, s.window - s.recv_credit));
+    if (s.unacked < s.window / 2 || s.got_close)
         return;
+    uint32_t grant = s.unacked;
+    // Half the window taken in less than a round trip: the sender waits on credit, not this side on its reader, so
+    // the window doubles, which is TCP's receive autotuning.  A slow reader never gets it there, and holds no more.
+    if (rtt_us > 0 && s.last_grant_us > 0 && now_us - s.last_grant_us < rtt_us && s.window < max_window)
+    {
+        grant += s.window;
+        s.window *= 2;
+    }
+    s.last_grant_us = now_us;
     std::string p;
-    put_u32(p, s.unacked);
+    put_u32(p, grant);
     put(frame_type::window, stream, p, out);
-    s.recv_credit += s.unacked;
+    s.recv_credit += grant;
     s.unacked = 0;
 }
 

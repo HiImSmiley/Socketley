@@ -29,6 +29,9 @@ inline constexpr size_t header_size = 9;
 // The largest payload a frame carries, and what a stream may have in flight before the reader grants more.
 inline constexpr uint32_t max_payload = 64 * 1024;
 inline constexpr uint32_t initial_window = 256 * 1024;
+// The most a receiver grows a stream's window to, which it does only while the window and not the reader is what
+// limits the stream.
+inline constexpr uint32_t max_window = 8u << 20;
 inline constexpr size_t max_target = 255;
 inline constexpr size_t max_hello = 4096;
 
@@ -96,8 +99,9 @@ public:
     size_t send(uint32_t stream, std::string_view bytes, std::string& out);
     void close(uint32_t stream, std::string& out);
     void reset(uint32_t stream, reset_code code, std::string& out);
-    // `n` bytes of the stream's data handed on, which gives the far side credit back once half of it is used.
-    void consumed(uint32_t stream, size_t n, std::string& out);
+    // `n` bytes of the stream's data handed on, which gives the far side credit back once half of it is used: at
+    // `now_us`, over a link whose round trip is `rtt_us`, which doubles the window when half of it went faster.
+    void consumed(uint32_t stream, size_t n, std::string& out, uint64_t now_us = 0, uint32_t rtt_us = 0);
     void ping(std::string_view token, std::string& out);
     // A datagram of `flow` for `service` sent; false for a flow of 0, a service no open could name, or bytes past a
     // frame, which the caller drops as a full socket would.
@@ -118,6 +122,9 @@ private:
         // What the far side may still send, and what has been consumed since credit was last given back.
         uint32_t recv_credit{initial_window};
         uint32_t unacked{0};
+        // The window this side grants, and when it last gave credit back.
+        uint32_t window{initial_window};
+        uint64_t last_grant_us{0};
         bool sent_close{false};
         bool got_close{false};
     };
