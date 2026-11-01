@@ -1,4 +1,5 @@
 #include "outbound_http.h"
+#include "../net/file_send.h"
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +16,7 @@
 #include <unistd.h>
 
 #include <openssl/ssl.h>
+#include <poll.h>
 
 #include "http_framing.h"
 #include "../net/async_resolver.h"
@@ -370,6 +372,7 @@ void http_peer::connect()
     const http_endpoint& ep = m_addrs[m_cur % m_addrs.size()];
     // Blocking, so a write the kernel cannot take whole waits in the ring for room rather than failing with EAGAIN.
     m_fd = ::socket(ep.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    m_sock_flags = -1;
     if (m_fd < 0)
     {
         finish(false, "no socket could be made");
@@ -462,7 +465,7 @@ void http_peer::advance()
         }
         if (plain.empty() && m_req.file_fd >= 0 && (m_file_sent < m_req.file_len || m_in_pipe > 0))
         {
-            splice_body();
+            file_body();
             return;
         }
         // A file body that is all sent leaves the pipe empty, for the next request's.
@@ -522,11 +525,11 @@ void http_peer::advance()
             });
             return;
         }
+        // Sent once a turn finds nothing left to write, as a body from a source is asked for after its head.
+        const bool nothing_more = plain.empty() && m_tls_rest_off >= m_tls_rest.size();
         if (!plain.empty() && !m_ssl)
         {
             send(std::make_shared<std::string>(std::move(plain)), 0);
-        // Sent once a turn finds nothing left to write, as a body from a source is asked for after its head.
-        const bool nothing_more = plain.empty() && m_tls_rest_off >= m_tls_rest.size();
             return;
         }
         if (!plain.empty())
@@ -584,6 +587,50 @@ void http_peer::drop_pipe()
             *fd = -1;
         }
     m_pipe_dirty = false;
+}
+
+// A file body by sendfile from the loop, where a splice through the ring was an io-wq hand-off a step; a window out of
+// the page cache, and what is still in the pipe from one, go by the pipe, which the ring reads without holding the loop.
+void http_peer::file_body()
+{
+    if (m_in_pipe > 0 ||
+        socketley::file_send::cold(m_req.file_fd, m_req.file_off + m_file_sent, m_req.file_len - m_file_sent))
+    {
+        splice_body();
+        return;
+    }
+    uint64_t off = m_req.file_off + m_file_sent, left = m_req.file_len - m_file_sent, sent = 0;
+    const auto b = socketley::file_send::send(m_fd, m_sock_flags, m_req.file_fd, off, left, sent);
+    m_file_sent += sent;
+    if (sent > 0)
+        m_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(stall_secs);
+    if (b == socketley::file_send::burst::failed)
+    {
+        // A host that answered before it had the whole body, and closed, may have left its answer.
+        m_write_failed = true;
+        receive();
+        return;
+    }
+    if (b == socketley::file_send::burst::done)
+    {
+        advance();
+        return;
+    }
+    const uint64_t gen = m_gen;
+    auto alive = m_alive;
+    if (!m_io.poll(m_fd, POLLOUT, [this, alive, gen](int64_t res)
+        {
+            if (!*alive || m_gen != gen)
+                return;
+            if (res < 0 || (res & (POLLERR | POLLHUP)) != 0)
+            {
+                m_write_failed = true;
+                receive();
+                return;
+            }
+            file_body();
+        }))
+        finish(false, "the ring is full");
 }
 
 void http_peer::splice_body()

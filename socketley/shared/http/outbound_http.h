@@ -141,6 +141,7 @@ private:
     void send(std::shared_ptr<std::string> bytes, size_t off);
     // Moves the next piece of a file body through the pipe into the socket, then advances once all is sent.
     void splice_body();
+    void file_body();
     // Closes the pipe, which a transfer cut short leaves holding bytes no later one may send.
     void drop_pipe();
     // Hands what the record layer has to say to send(); false when it had nothing.
@@ -194,6 +195,8 @@ private:
     // A body held in memory that the record layer has not taken yet, and how far it has.
     std::string m_tls_rest;
     size_t      m_tls_rest_off{0};
+    // The socket's own flags, read once for sendfile, which makes it non-blocking for the call alone.
+    int         m_sock_flags{-1};
     // A file body's pipe, its bytes sent so far and those in the pipe; dirty from a transfer's start to its end.
     int         m_pipe_rd{-1};
     int         m_pipe_wr{-1};
