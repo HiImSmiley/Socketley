@@ -991,12 +991,27 @@ size_t client_instance::deliver_lines(const char* data, size_t len, size_t searc
     return used;
 }
 
-// The complete lines partial holds, where `scanned` is how much of it an
-// earlier read already searched, and a partial over the bound is refused.
+// Whether every line in `s`, with its newline, and its unfinished tail fit in `limit` bytes.
+static bool lines_fit(std::string_view s, size_t limit)
+{
+    for (size_t start = 0;;)
+    {
+        const void* nl = std::memchr(s.data() + start, '\n', s.size() - start);
+        if (!nl)
+            return s.size() - start <= limit;
+        const size_t end = static_cast<size_t>(static_cast<const char*>(nl) - s.data()) + 1;
+        if (end - start > limit)
+            return false;
+        start = end;
+    }
+}
+
+// The complete lines partial holds, where `scanned` is how much of it an earlier read already searched, and a line or
+// an unfinished one over the bound is refused -- not the read that brought it, which may hold many whole lines.
 void client_instance::deliver_partial(size_t scanned)
 {
     std::string& partial = m_conn->partial;
-    if (partial.size() > read_buffer_bytes())
+    if (partial.size() > read_buffer_bytes() && !lines_fit(partial, read_buffer_bytes()))
     {
         m_conn->closing = true;
         return;
@@ -1430,8 +1445,7 @@ void client_instance::tls_feed(const char* data, size_t len)
             // The same ceiling the cleartext path applies, checked inside the
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
-            if (SOCKETLEY_UNLIKELY(m_conn->partial.size() >
-                                   read_buffer_bytes()))
+            if (SOCKETLEY_UNLIKELY(read_overflows(m_conn->partial.size(), len)))
             {
                 m_conn->closing = true;
                 break;
