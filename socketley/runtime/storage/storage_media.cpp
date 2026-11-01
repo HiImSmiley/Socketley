@@ -16,6 +16,7 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -1292,13 +1293,21 @@ bool storage_run::media_serve(const std::shared_ptr<conn>& c, const media_want& 
     // A thumbnail, a playlist or an init segment goes out with its head in one write.
     if (len <= small_file)
     {
+        // Read here only when the page cache holds it all, where a pread of a cold thumbnail held every connection on
+        // the loop for the disk; anything else goes as a large body does, read through the ring.  tmpfs cannot be
+        // asked (EOPNOTSUPP) and is always in memory.
         head.body.resize(len);
-        const ssize_t got = ::pread(fd, head.body.data(), len, static_cast<off_t>(off));
-        ::close(fd);
-        if (got != static_cast<ssize_t>(len))
-            return false;
-        send_response(c, std::move(head));
-        return true;
+        iovec v{head.body.data(), len};
+        ssize_t got = ::preadv2(fd, &v, 1, static_cast<off_t>(off), RWF_NOWAIT);
+        if (got < 0 && errno == EOPNOTSUPP)
+            got = ::pread(fd, head.body.data(), len, static_cast<off_t>(off));
+        if (got == static_cast<ssize_t>(len))
+        {
+            ::close(fd);
+            send_response(c, std::move(head));
+            return true;
+        }
+        head.body.clear();
     }
     send_file(c, std::move(head), fd, off, len);
     return true;
