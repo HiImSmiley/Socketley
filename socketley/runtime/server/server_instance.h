@@ -905,6 +905,14 @@ private:
         return !conn->http_seen && conn->proto != proto_resp;
     }
 
+    // May a script's raw message go to this connection: not to one that has spoken HTTP and not upgraded, where its
+    // bytes are no message of the protocol and land inside whatever answer is on the wire -- a file sent from the
+    // loop among them.
+    static bool raw_targetable(const server_connection* conn)
+    {
+        return !conn->http_seen || conn->proto == proto_ws;
+    }
+
     // May the deadline release this connection's hold: still unclassified,
     // never spoken, and with any TLS handshake finished, since a session still
     // exchanging records has no keys to encrypt with.

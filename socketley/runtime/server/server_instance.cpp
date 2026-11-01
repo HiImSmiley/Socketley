@@ -7532,6 +7532,8 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
 
     if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
         return send_ws_message(conn, msg);
+    if (SOCKETLEY_UNLIKELY(!raw_targetable(conn)))
+        return false;
 
     const bool add_nl = msg.empty() || msg.back() != '\n';
     if (SOCKETLEY_LIKELY(m_loop && conn->ssl == nullptr && conn->write_queue.empty()
@@ -7741,7 +7743,7 @@ bool server_instance::write_to_ref(const conn_ref& ref, std::string_view msg)
         return false;
 
     auto* conn = m_conn_idx[fd];
-    if (!conn || conn->ref_serial != ref.serial || conn->closing)
+    if (!conn || conn->ref_serial != ref.serial || conn->closing || !raw_targetable(conn))
         return false;
 
     std::string buf;
