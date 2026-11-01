@@ -1,4 +1,5 @@
 #include "mail_web.h"
+#include "../../shared/util/deflate.h"
 
 #include <openssl/sha.h>
 
@@ -43,6 +44,8 @@ const web_page& webmail_page()
             w.etag += hex[static_cast<unsigned char>(digest[i]) & 15];
         }
         w.etag += "\"";
+        w.gz = socketley::gzip_of(w.html);
+        w.gz_etag = w.etag.substr(0, w.etag.size() - 1) + "-gz\"";
         const size_t from = w.html.find("<script>") + 8, to = w.html.find("</script>", from);
         // Mail's own HTML is shown in a frame of the page's, sandboxed and without scripts, its remote images only once
         // the reader asks for them; nothing else is fetched from anywhere but here.

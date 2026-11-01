@@ -53,4 +53,7 @@ private:
     static constexpr uint32_t max_good = 1u << 16;
 };
 
+// `in` as one gzip member (RFC 1952): its header, DEFLATE, and the CRC-32 and length a reader checks it by.
+std::string gzip_of(std::string_view in, deflater::effort e = deflater::effort::best);
+
 }   // namespace socketley

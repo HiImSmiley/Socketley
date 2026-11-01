@@ -102,6 +102,12 @@ script = page.split(b"<script>", 1)[1].split(b"</script>", 1)[0] if b"<script>" 
 want = "'sha256-" + base64.b64encode(hashlib.sha256(script).digest()).decode() + "'"
 check("the page is served as HTML with nosniff and an ETag", st == 200 and h.get("content-type", "").startswith("text/html")
       and h.get("x-content-type-options") == "nosniff" and h.get("etag"), (st, h))
+import gzip as _gzip
+gst, gh, gpage = web("GET", "/", headers={"Accept-Encoding": "gzip"})
+check("to a browser that takes gzip the page goes gzipped, under its own ETag, the same page inflated",
+      gst == 200 and gh.get("content-encoding") == "gzip" and "accept-encoding" in gh.get("vary", "").lower()
+      and gh.get("etag") != h.get("etag") and _gzip.decompress(gpage) == page and len(gpage) * 2 < len(page),
+      (gst, gh.get("content-encoding"), gh.get("etag"), h.get("etag"), len(gpage), len(page)))
 check("its CSP lets its one script run by that script's hash, and no frame embed it", want in csp
       and "frame-ancestors 'none'" in csp and "unsafe-inline" not in csp.split("script-src", 1)[1].split(";", 1)[0], csp)
 # The page's CSS cleaning, run by node where there is one: no < to end its <style>, and nothing fetched while blocked.

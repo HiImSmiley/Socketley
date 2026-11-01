@@ -336,6 +336,12 @@ expect "a file no dns runtime serves is none of the page's" \
     "$(put "$(python3 -c 'import json; print(json.dumps({"runtime":"ns","path":"/etc/passwd","text":"x"}))')")" 404
 expect "and a change needs the page's header" "$(curl -s -o /dev/null -w '%{http_code}' -b "$T/jar" -X PUT --data-binary "$body" "$U/api/zone")" 403
 
+# The page itself, gzipped to a browser that takes it and the same page inflated.
+plain_sha=$(curl -s "$U/" | sha256sum | cut -c1-16)
+gz_hdr=$(curl -s -D - -o "$T/page.gz" -H 'Accept-Encoding: gzip' "$U/" | tr -d '\r' | grep -ci '^content-encoding: gzip')
+expect "the page goes gzipped to a browser that takes it, and inflates to itself" \
+    "$gz_hdr $(gunzip -c "$T/page.gz" 2>/dev/null | sha256sum | cut -c1-16) $(( $(wc -c < "$T/page.gz") * 2 < $(curl -s "$U/" | wc -c) ))" "1 $plain_sha 1"
+
 # Signing out ends the session at the daemon, so a copy of its cookie is no session either.
 saved=$(awk '$6 == "skl_dash" {print $7}' "$T/jar")
 expect "signing out ends the session" "$(code -X DELETE -b "$T/jar" -c "$T/jar" "$U/api/session") $(code -b "$T/jar" "$U/api/runtimes")" "204 401"

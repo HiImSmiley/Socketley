@@ -12,6 +12,9 @@ struct web_page
     std::string html;
     std::string etag;
     std::string csp;
+    // The page gzipped once, and its own ETag, for a browser that takes gzip.
+    std::string gz;
+    std::string gz_etag;
 };
 
 const web_page& webmail_page();

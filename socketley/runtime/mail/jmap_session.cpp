@@ -1,4 +1,5 @@
 #include "jmap_session.h"
+#include "../../shared/http/encoding.h"
 #include "dav.h"
 #include "mail_setup.h"
 
@@ -987,15 +988,19 @@ void jmap_session::page(const request& rq)
 {
     // The page changes only with the binary, so a browser's copy is asked after and answered 304 while it holds.
     const web_page& w = webmail_page();
-    const bool same = rq.header("if-none-match").find(w.etag) != std::string::npos;
+    const bool packed = socketley::http::accepts_coding(rq.header("accept-encoding"), "gzip");
+    const std::string& etag = packed ? w.gz_etag : w.etag;
+    const std::string& body = packed ? w.gz : w.html;
+    const bool same = rq.header("if-none-match").find(etag) != std::string::npos;
     std::string out = same ? "HTTP/1.1 304 Not Modified\r\n" : "HTTP/1.1 200 OK\r\n";
-    out += "ETag: " + w.etag + "\r\nCache-Control: no-cache\r\n";
+    out += "ETag: " + etag + "\r\nCache-Control: no-cache\r\nVary: Accept-Encoding\r\n";
     if (!same)
-        out += "Content-Type: text/html; charset=utf-8\r\nContent-Length: " + std::to_string(w.html.size()) + "\r\n";
+        out += std::string("Content-Type: text/html; charset=utf-8\r\n") + (packed ? "Content-Encoding: gzip\r\n" : "") +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n";
     out += "Content-Security-Policy: " + w.csp +
            "\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\r\n";
     if (!same && rq.method != "HEAD")
-        out += w.html;
+        out += body;
     m_hooks.reply(out);
 }
 

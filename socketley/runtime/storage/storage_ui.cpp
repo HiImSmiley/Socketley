@@ -3,6 +3,8 @@
 // secret (/~ui/session); the films each user has part watched (/~ui/progress); and who else a library is shared with
 // (/~ui/access).
 #include "storage_run.h"
+#include "../../shared/util/deflate.h"
+#include "../../shared/http/encoding.h"
 #include "storage_ui_kit.h"
 
 #include <sys/file.h>
@@ -411,10 +413,17 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
         return;
     }
     // The page changes only with the binary, so a browser's copy is asked after and answered 304 while it holds.
-    static const std::string etag = "\"" + sha256_hex(ui_page).substr(0, 16) + "\"";
+    // And compressed once, for a browser that takes gzip: the page is a third of a megabyte, over a WAN a round trip
+    // or two of the link's.
+    static const std::string gz = socketley::gzip_of(ui_page);
+    const bool packed = socketley::http::accepts_coding(r.header("accept-encoding"), "gzip");
+    static const std::string plain_etag = "\"" + sha256_hex(ui_page).substr(0, 16) + "\"";
+    static const std::string gz_etag = "\"" + sha256_hex(ui_page).substr(0, 16) + "-gz\"";
+    const std::string& etag = packed ? gz_etag : plain_etag;
     response resp;
     resp.headers.emplace_back("ETag", etag);
     resp.headers.emplace_back("Cache-Control", "no-cache");
+    resp.headers.emplace_back("Vary", "Accept-Encoding");
     if (r.header("if-none-match").find(etag) != std::string_view::npos)
     {
         resp.status = 304;
@@ -437,7 +446,9 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
     }();
     resp.headers.emplace_back("Content-Security-Policy", csp);
     resp.headers.emplace_back("X-Content-Type-Options", "nosniff");
-    resp.body_view = ui_page;
+    if (packed)
+        resp.headers.emplace_back("Content-Encoding", "gzip");
+    resp.body_view = packed ? std::string_view(gz) : ui_page;
     resp.head_only = r.method == "HEAD";
     send_response(c, std::move(resp));
 }

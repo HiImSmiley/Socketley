@@ -1,4 +1,6 @@
 #include "dashboard.h"
+#include "../shared/util/deflate.h"
+#include "../shared/http/encoding.h"
 #include "../shared/ipc/ipc_framing.h"
 
 #include <openssl/crypto.h>
@@ -275,9 +277,12 @@ bool server::handle(int fd, const request& r)
 {
     if (r.path == "/" || r.path == "/dashboard")
     {
-        send(fd, 200, "text/html; charset=utf-8", page(),
-             "Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' "
-             "'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'\r\n");
+        static const std::string gz = socketley::gzip_of(page());
+        const bool packed = socketley::http::accepts_coding(r.header("accept-encoding"), "gzip");
+        send(fd, 200, "text/html; charset=utf-8", packed ? std::string_view(gz) : std::string_view(page()),
+             std::string("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' "
+                         "'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'\r\nVary: Accept-Encoding\r\n") +
+                 (packed ? "Content-Encoding: gzip\r\n" : ""));
         return true;
     }
     if (r.path == "/api/session")

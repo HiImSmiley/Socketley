@@ -1,4 +1,5 @@
 #include "deflate.h"
+#include "crc.h"
 
 #include <algorithm>
 #include <array>
@@ -551,6 +552,20 @@ void deflater::block(size_t from, size_t end, std::string& out)
     if (m_bitcount > 0)
         bits(0, 8 - m_bitcount, out);
     out.append("\x00\x00\xff\xff", 4);
+}
+
+std::string gzip_of(std::string_view in, deflater::effort e)
+{
+    std::string out("\x1f\x8b\x08\x00\x00\x00\x00\x00", 8);
+    out += static_cast<char>(e == deflater::effort::best ? 2 : 4);
+    out += '\x03';
+    deflater z(e);
+    z.compress(in, out);
+    z.finish(out);
+    for (const uint32_t v : {crc::crc32(in), static_cast<uint32_t>(in.size())})
+        for (int i = 0; i < 4; ++i)
+            out += static_cast<char>((v >> (8 * i)) & 0xff);
+    return out;
 }
 
 }   // namespace socketley
