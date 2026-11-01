@@ -186,6 +186,8 @@ constexpr size_t keep_max_total = 64u << 20;
 // which is as far as nginx's autotuned sockets grow).
 constexpr uint64_t sendfile_burst = 4u << 20;
 constexpr int file_sndbuf = 2 << 20;
+// Large files whose descriptors are kept open at once, a bound on the descriptors this costs.
+constexpr size_t max_open_files = 256;
 
 }   // namespace
 
@@ -202,6 +204,7 @@ void proxy_instance::set_root(std::string_view dir)
     // A serving proxy moves to the new root once it is open, so the descriptor and the name never disagree.
     m_kept.clear();
     m_kept_bytes = 0;
+    m_open.clear();
     std::string before = std::exchange(m_fcgi_root, std::move(root));
     if (!open_fcgi_root())
     {
@@ -334,6 +337,8 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
     }
     if (SOCKETLEY_LIKELY(!m_kept.empty()) && fcgi_serve_kept(conn, rel))
         return false;
+    if (!m_open.empty() && fcgi_serve_open(conn, rel))
+        return false;
     bool dir = false;
     const bool file = fcgi_regular(rel, dir);
     if (dir)
@@ -358,7 +363,15 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
             send_error(conn, "404 Not Found", "Not Found\n");
             return false;
         }
-        fcgi_serve_file(conn, ffd, st, rel);
+        auto src = std::make_shared<fcgi_fd>(ffd);
+        // A large file's descriptor is kept for the requests after this one; a small one is kept as bytes instead.
+        if (static_cast<uint64_t>(st.st_size) > keep_max_file && !rel.empty())
+        {
+            if (m_open.size() >= max_open_files)
+                m_open.clear();
+            m_open[std::string(rel)] = fcgi_open_entry{st.st_dev, st.st_ino, st.st_size, st.st_mtim, src};
+        }
+        fcgi_serve_file(conn, std::move(src), st, rel);
         return false;
     }
     // Nothing at the path: the index script answers it, as a front controller does every route it was not given.
@@ -393,18 +406,45 @@ bool proxy_instance::fcgi_serve_kept(proxy_client_connection* conn, std::string_
     struct stat st{};
     st.st_size = k.size;
     st.st_mtim = k.mtime;
-    fcgi_serve_file(conn, -1, st, rel, k.body);
+    fcgi_serve_file(conn, nullptr, st, rel, k.body);
+    return true;
+}
+
+// A kept descriptor still the file under its name, answered from it; false opens the file afresh, for the reason
+// fcgi_serve_kept gives.
+bool proxy_instance::fcgi_serve_open(proxy_client_connection* conn, std::string_view rel)
+{
+    const auto it = m_open.find(rel);
+    if (it == m_open.end())
+        return false;
+    struct statx sx{};
+    const unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
+    const std::string path(rel);
+    const fcgi_open_entry& o = it->second;
+    if (::statx(m_fcgi_root_fd, path.c_str(), 0, want, &sx) != 0 || (sx.stx_mask & want) != want ||
+        !S_ISREG(sx.stx_mode) || makedev(sx.stx_dev_major, sx.stx_dev_minor) != o.dev ||
+        static_cast<ino_t>(sx.stx_ino) != o.ino || static_cast<off_t>(sx.stx_size) != o.size ||
+        sx.stx_mtime.tv_sec != o.mtime.tv_sec || sx.stx_mtime.tv_nsec != o.mtime.tv_nsec)
+    {
+        m_open.erase(it);
+        return false;
+    }
+    struct stat st{};
+    st.st_size = o.size;
+    st.st_mtim = o.mtime;
+    fcgi_serve_file(conn, o.src, st, rel);
     return true;
 }
 
 // The answer for a file of the site's own: its preconditions (RFC 9110 13), a single range (14), and then its bytes
 // a window at a time as the client takes them; under keep-alive, so a page's assets share the connection its page came
 // on.
-void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, const struct stat& st, std::string_view rel,
-                                     std::shared_ptr<const std::string> kept)
+void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_ptr<fcgi_fd> src, const struct stat& st,
+                                     std::string_view rel, std::shared_ptr<const std::string> kept)
 {
     auto f = std::make_shared<fcgi_file>();
-    f->fd = ffd;
+    f->fd = src ? src->fd : -1;
+    f->src = std::move(src);
     const size_t end = conn->partial.find("\r\n\r\n");
     parsed_head h;
     if (end == std::string::npos || !parse_head(std::string_view(conn->partial).substr(0, end + 4), h))
@@ -520,8 +560,11 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, int ffd, con
         {
             f->sendfile = true;
             // The listener's 256 KiB would have each burst stop and wait for room several times a file.
-            if (f->left > keep_max_file &&
-                ::setsockopt(conn->fd, SOL_SOCKET, SO_SNDBUF, &file_sndbuf, sizeof file_sndbuf) < 0) {}
+            if (f->left > keep_max_file && !conn->fcgi_sndbuf)
+            {
+                conn->fcgi_sndbuf = true;
+                if (::setsockopt(conn->fd, SOL_SOCKET, SO_SNDBUF, &file_sndbuf, sizeof file_sndbuf) < 0) {}
+            }
         }
     }
     // A file sent by sendfile has its head sent here and now, held for the first of its bytes (MSG_MORE), so the
@@ -595,7 +638,9 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn, bool inline_c
         // sendfile on the loop thread, the way nginx sends a file, where an io_uring splice is a hand-off to an io-wq
         // worker per operation; non-blocking for the call alone, since the ring's own writes need the socket blocking,
         // and nothing of the ring runs on it meanwhile (SINGLE_ISSUER, DEFER_TASKRUN).
-        const int flags = ::fcntl(fd, F_GETFL);
+        if (conn->fcgi_sock_flags < 0)
+            conn->fcgi_sock_flags = ::fcntl(fd, F_GETFL);
+        const int flags = conn->fcgi_sock_flags;
         bool failed = flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0;
         for (uint64_t budget = sendfile_burst; !failed && f.left > 0 && budget > 0;)
         {

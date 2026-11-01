@@ -292,6 +292,8 @@ void proxy_client_connection::reset(int new_fd)
     connect_reattempted = false;
     fd = new_fd;
     file.reset();
+    fcgi_sock_flags = -1;
+    fcgi_sndbuf = false;
     // client_pool_release() already did this, repeated because a struct
     // leaving the pool must not carry the previous connection's session.
     tls_context::free_ssl(ssl);
@@ -2477,6 +2479,10 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         }
     }
 
+    // The kept files and descriptors go with the run, so a stopped proxy holds no file open.
+    m_open.clear();
+    m_kept.clear();
+    m_kept_bytes = 0;
     // The file reads go with the run, and the next one starts a pump of its own.
     if (m_files && m_loop)
     {

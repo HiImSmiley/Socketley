@@ -216,8 +216,24 @@ struct proxy_h2_stream_free { void operator()(proxy_h2_stream* s) const; };
 
 // A file a FastCGI proxy serves itself, a window at a time; shared with the read in flight, which may outlive the
 // connection it was for.
+// An open file a FastCGI proxy serves from, shared by the requests sending it and, for a large one, kept between them.
+struct fcgi_fd
+{
+    int fd{-1};
+    explicit fcgi_fd(int f) : fd(f) {}
+    fcgi_fd(const fcgi_fd&) = delete;
+    fcgi_fd& operator=(const fcgi_fd&) = delete;
+    ~fcgi_fd()
+    {
+        if (fd >= 0)
+            ::close(fd);
+    }
+};
+
 struct fcgi_file
 {
+    // The file, and the descriptor it lends: sendfile and pread name their own offsets, so requests may share one.
+    std::shared_ptr<fcgi_fd> src;
     int fd{-1};
     uint64_t off{0};
     uint64_t left{0};
@@ -232,11 +248,6 @@ struct fcgi_file
     fcgi_file() = default;
     fcgi_file(const fcgi_file&) = delete;
     fcgi_file& operator=(const fcgi_file&) = delete;
-    ~fcgi_file()
-    {
-        if (fd >= 0)
-            ::close(fd);
-    }
 };
 
 // The reads of those files, on the runtime's ring under an owner of their own, so the proxy's dispatch never sees them.
@@ -352,6 +363,9 @@ struct alignas(64) proxy_client_connection
     // An exchange on this connection has finished and it stayed open, which
     // is the evidence park_backend waits for.
     bool kept_alive{false};
+    // A FastCGI proxy's file answers: the socket's own flags, read once, and whether its send buffer was raised.
+    int fcgi_sock_flags{-1};
+    bool fcgi_sndbuf{false};
 
     // Bumped on every reuse from the pool and stamped into io_requests, so
     // late completions from the previous occupant can be recognised and
@@ -1222,8 +1236,8 @@ private:
     int fcgi_open(std::string_view rel, int flags, struct stat& st) const;
     bool open_fcgi_root();
     // A file beneath --root answered by this proxy, its next window read once the client has room, and that read's end.
-    void fcgi_serve_file(proxy_client_connection* conn, int fd, const struct stat& st, std::string_view rel,
-                         std::shared_ptr<const std::string> kept = {});
+    void fcgi_serve_file(proxy_client_connection* conn, std::shared_ptr<fcgi_fd> src, const struct stat& st,
+                         std::string_view rel, std::shared_ptr<const std::string> kept = {});
     void fcgi_file_next(proxy_client_connection* conn, bool inline_call = false);
     void fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
     void fcgi_file_polled(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res);
@@ -1240,6 +1254,18 @@ private:
     std::unordered_map<std::string, fcgi_kept, string_hash, string_equal> m_kept;
     size_t m_kept_bytes{0};
     bool fcgi_serve_kept(proxy_client_connection* conn, std::string_view rel);
+    // Large files' descriptors kept open between requests, nginx's open_file_cache: the same statx says the descriptor
+    // is still the file under that name, where an open beneath --root, a stat and a close were.
+    struct fcgi_open_entry
+    {
+        dev_t dev{};
+        ino_t ino{};
+        off_t size{};
+        struct timespec mtime{};
+        std::shared_ptr<fcgi_fd> src;
+    };
+    std::unordered_map<std::string, fcgi_open_entry, string_hash, string_equal> m_open;
+    bool fcgi_serve_open(proxy_client_connection* conn, std::string_view rel);
     std::unique_ptr<fcgi_file_pump> m_files;
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 

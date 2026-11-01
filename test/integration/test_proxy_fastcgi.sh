@@ -308,6 +308,16 @@ expect "and one moved into place with the same size and time, a new file under t
 printf 'SECRET\n' > "$T/outside/secret.txt"; rm "$W/kept.txt"; ln -s "$T/outside/secret.txt" "$W/kept.txt"
 hasnt "and a link out of --root put in its place is not followed" "$(curl -s "$U/kept.txt")" 'SECRET'
 rm -f "$W/kept.txt"; : > "$T/stub.log"; curl -s -o /dev/null "$U/style.css"
+# A large file's descriptor is kept open between requests; the same questions of it.
+head -c 400000 /dev/urandom > "$W/large.bin"; curl -s -o /dev/null "$U/large.bin"
+L1=$(curl -s "$U/large.bin" | sha256sum | cut -c1-16)
+expect "a large file is the same bytes from a kept descriptor" "$L1" "$(sha256sum < "$W/large.bin" | cut -c1-16)"
+head -c 400000 /dev/urandom > "$T/large.new"; touch -r "$W/large.bin" "$T/large.new"; mv "$T/large.new" "$W/large.bin"
+expect "and a new file moved in under its name, with its size and time, is sent as the new one" \
+    "$(curl -s "$U/large.bin" | sha256sum | cut -c1-16)" "$(sha256sum < "$W/large.bin" | cut -c1-16)"
+rm "$W/large.bin"
+hasnt "and one deleted is not sent from the descriptor still open" "$(curl -s -o /dev/null -w '%{size_download}' "$U/large.bin")" '^400000$'
+: > "$T/stub.log"; curl -s -o /dev/null "$U/style.css"
 expect "no file reached the server" "$(wc -l < "$T/stub.log")" 0
 st=$("$BIN" stats site 2>&1)
 has "stats count the files served" "$st" 'files_served: ?[1-9]'
