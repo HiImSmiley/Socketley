@@ -1308,7 +1308,8 @@ private:
     struct master_link
     {
         io_request read_req{};
-        char buf[4096]{};
+        // A read as large as a full sync can use, since the link is one per follower and allocated per connect.
+        char buf[256 * 1024]{};
         std::string partial;
         int fd{-1};
         bool read_pending{false};
