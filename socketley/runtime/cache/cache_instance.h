@@ -80,6 +80,9 @@ struct client_connection
     std::string partial;
     // What the read being taken in brought, which read_overflows() allows on top of the bound.
     uint32_t read_arrived{0};
+    // How much of `partial` the text protocol has searched for a newline and not found, so a long line is not
+    // searched again from its start on every read; it holds only while `partial` is that long.
+    size_t text_searched{0};
     std::string response_buf;
     // Owned replies, and slices of a published message's segment.
     socketley::byte_counted_queue<socketley::write_chunk> write_queue;

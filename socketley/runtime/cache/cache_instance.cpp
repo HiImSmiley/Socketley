@@ -2184,8 +2184,17 @@ bool cache_instance::parse_text_lines(client_connection* conn)
     bool   cut = false;
     size_t scan_from = 0;
     size_t pos;
-    while ((pos = conn->partial.find('\n', scan_from)) != std::string::npos)
+    size_t search = conn->text_searched <= conn->partial.size() ? conn->text_searched : 0;
+    conn->text_searched = 0;
+    bool ran_out = false;
+    for (;;)
     {
+        if ((pos = conn->partial.find('\n', std::max(scan_from, search))) == std::string::npos)
+        {
+            ran_out = true;
+            break;
+        }
+        search = 0;
         // A run of routed commands is cut here, in the loop that decides what
         // has been consumed, with the rest left in `partial` for the batch
         // after this one.
@@ -2246,6 +2255,9 @@ bool cache_instance::parse_text_lines(client_connection* conn)
         else
             conn->partial.erase(0, scan_from);
     }
+    // All that is left was searched, unless the loop stopped with whole lines still in it.
+    if (ran_out)
+        conn->text_searched = conn->partial.size();
 
     // Whatever was pipelined behind REPLICATE is refused, not executed.
     if (SOCKETLEY_UNLIKELY(conn->is_follower && !conn->partial.empty()))
@@ -2415,6 +2427,9 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // diverges.
     stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
     conn->read_arrived = static_cast<uint32_t>(cqe->res);
+    // A search offset names the partial it was taken over; changed since, it names nothing.
+    if (conn->partial.size() != conn->text_searched)
+        conn->text_searched = 0;
     if (conn->batch_ns == 0)
         conn->batch_ns = socketley::turn_clock::now_ns();
 
