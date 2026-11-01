@@ -525,6 +525,8 @@ void http_peer::advance()
         if (!plain.empty() && !m_ssl)
         {
             send(std::make_shared<std::string>(std::move(plain)), 0);
+        // Sent once a turn finds nothing left to write, as a body from a source is asked for after its head.
+        const bool nothing_more = plain.empty() && m_tls_rest_off >= m_tls_rest.size();
             return;
         }
         if (!plain.empty())
@@ -548,7 +550,8 @@ void http_peer::advance()
         }
         m_tls_rest.clear();
         m_tls_rest_off = 0;
-        m_sent = true;
+        if (nothing_more)
+            m_sent = true;
     }
     if (m_ssl && !m_write_failed && flush_cipher())
         return;
