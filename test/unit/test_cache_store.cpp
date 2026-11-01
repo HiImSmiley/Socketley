@@ -2046,11 +2046,20 @@ TEST_CASE("key_table filled in another table's slot order does not cluster")
     const uint64_t m = (uint64_t{1} << 19) - 1;
     std::sort(keys.begin(), keys.end(), [&](const std::string& a, const std::string& b)
               { return (string_hash{}(a) & m) < (string_hash{}(b) & m); });
+    // Against the same keys in no order, in this run, so a loaded box or a sanitizer slows both alike.
+    std::vector<std::string> mixed = keys;
+    std::shuffle(mixed.begin(), mixed.end(), std::mt19937(7));
+    key_table<int> u;
+    auto t0 = thread_cpu_now();
+    for (const auto& k : mixed)
+        u.try_emplace(k, 1);
+    const auto unordered = thread_cpu_now() - t0;
     key_table<int> t;
-    const auto t0 = thread_cpu_now();
+    t0 = thread_cpu_now();
     for (const auto& k : keys)
         t.try_emplace(k, 1);
-    CHECK(thread_cpu_now() - t0 < std::chrono::milliseconds(300));
+    const auto ordered = thread_cpu_now() - t0;
+    CHECK(ordered < unordered * 4);
     CHECK(t.size() == keys.size());
     CHECK(t.find("k299999") != t.end());
 }

@@ -93,7 +93,7 @@ def one(i):
         return
     s.settimeout(5)
     s.sendall(b"GET /s HTTP/1.1\r\nHost: x\r\n\r\n")
-    got = 0
+    got, paused = 0, False
     while got < want and time.monotonic() < deadline:
         try:
             b = s.recv(65536)
@@ -102,6 +102,10 @@ def one(i):
         if not b:
             break
         got += len(b)
+        # A pause once the stream has begun backs every queue up, however slowly the runtime produces.
+        if got >= 65536 and not paused:
+            paused = True
+            time.sleep(2)
         if got % (512 * 1024) < 65536:
             time.sleep(0.004)
     try:
