@@ -2,7 +2,9 @@
 #include "../../shared/net/socket_tuning.h"
 #include "../../shared/loop/conn_alloc.h"
 #include "server_instance.h"
+#include "../../shared/http/conditional.h"
 #include "../../shared/http/mime.h"
+#include "../../shared/net/file_send.h"
 #include "../../shared/lua/lua_suspend.h"
 #include "../../shared/loop/coarse_clock.h"
 #include "../../shared/net/conn_reachability.h"
@@ -401,6 +403,10 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
 
     if (fd >= 0 && fd < MAX_FDS)
         m_conn_idx[fd] = nullptr;
+    // A wait for room for sendfile completes only on the socket's events, and the ring's own reference outlives the
+    // close, so the socket is shut first: the poll then answers at once and the struct is not held for a silent peer.
+    if (SOCKETLEY_UNLIKELY(conn->splice_sendfile && conn->splice_out_pending) && fd >= 0)
+        ::shutdown(fd, SHUT_RDWR);
     close_tracked(fd);
 
     // The file a response is served out of is this connection's and a retired
@@ -639,12 +645,24 @@ static std::string inject_ws_script(std::string_view content)
     return result;
 }
 
-static std::string build_http_response(std::string_view content_type, std::string_view body, bool keep_alive)
+// The validator a file answer carries, so a client holding the file asks with If-None-Match and is answered 304.
+static void append_etag(std::string& resp, std::string_view etag)
+{
+    if (etag.empty())
+        return;
+    resp.append("\r\nETag: \"");
+    resp.append(etag);
+    resp.push_back('"');
+}
+
+static std::string build_http_response(std::string_view content_type, std::string_view body, bool keep_alive,
+                                       std::string_view etag = {})
 {
     std::string resp;
     resp.reserve(128 + body.size());
     resp.append("HTTP/1.1 200 OK\r\nContent-Type: ");
     resp.append(content_type);
+    append_etag(resp, etag);
     resp.append("\r\nContent-Length: ");
     char len_buf[24];
     auto [len_end, len_ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
@@ -660,7 +678,8 @@ static std::string build_http_response(std::string_view content_type, std::strin
 static std::string build_http_response_at(std::string_view content_type,
                                           std::string_view content,
                                           size_t inject_at,
-                                          bool keep_alive)
+                                          bool keep_alive,
+                                          std::string_view etag = {})
 {
     const bool inject = inject_at != std::string_view::npos;
     const size_t body_len = content.size() + (inject ? WS_INJECT_SCRIPT.size() : 0);
@@ -669,6 +688,7 @@ static std::string build_http_response_at(std::string_view content_type,
     resp.reserve(160 + body_len);
     resp.append("HTTP/1.1 200 OK\r\nContent-Type: ");
     resp.append(content_type);
+    append_etag(resp, etag);
     // Here as well as on the splice arm's headers, and the omission was worth
     // measuring: a first request for a small file takes THIS arm, so a whole
     // file was answered without the field while a slice of it was answered
@@ -706,12 +726,14 @@ static void append_num(std::string& out, size_t n)
     out.append(buf, end - buf);
 }
 
-static std::string build_http_headers_only(std::string_view content_type, size_t body_size, bool keep_alive)
+static std::string build_http_headers_only(std::string_view content_type, size_t body_size, bool keep_alive,
+                                           std::string_view etag = {})
 {
     std::string resp;
     resp.reserve(160);
     resp.append("HTTP/1.1 200 OK\r\nContent-Type: ");
     resp.append(content_type);
+    append_etag(resp, etag);
     // Said on the whole-file answer, because a player asks for the file and
     // decides from this header whether it may seek at all.  Without it a
     // conforming client downloads linearly and cannot scrub.
@@ -727,12 +749,13 @@ static std::string build_http_headers_only(std::string_view content_type, size_t
 // client then waits forever for bytes the server already finished sending.
 static std::string build_http_206_headers(std::string_view content_type,
                                           size_t first, size_t last, size_t total,
-                                          bool keep_alive)
+                                          bool keep_alive, std::string_view etag = {})
 {
     std::string resp;
     resp.reserve(192);
     resp.append("HTTP/1.1 206 Partial Content\r\nContent-Type: ");
     resp.append(content_type);
+    append_etag(resp, etag);
     resp.append("\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ");
     append_num(resp, first);
     resp.push_back('-');
@@ -741,6 +764,17 @@ static std::string build_http_206_headers(std::string_view content_type,
     append_num(resp, total);
     resp.append("\r\nContent-Length: ");
     append_num(resp, last - first + 1);
+    resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
+    return resp;
+}
+
+// The client's copy is the file: its validator and no body (RFC 9110 15.4.5).
+static std::string build_http_304(std::string_view etag, bool keep_alive)
+{
+    std::string resp;
+    resp.reserve(96);
+    resp.append("HTTP/1.1 304 Not Modified");
+    append_etag(resp, etag);
     resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
     return resp;
 }
@@ -1021,6 +1055,14 @@ void server_instance::rebuild_http_cache()
 
         // Read through the descriptor that was checked, because opening the path again reads whatever it names by then.
         std::string content;
+        struct stat cst{};
+        if ((cfd >= 0 ? ::fstat(cfd, &cst) : ::stat(entry.path().c_str(), &cst)) != 0)
+        {
+            if (cfd >= 0)
+                ::close(cfd);
+            continue;
+        }
+        const std::string etag = socketley::http::etag_of(socketley::file_stamp::of(cst));
         if (cfd >= 0)
         {
             char rbuf[65536];
@@ -1055,8 +1097,9 @@ void server_instance::rebuild_http_cache()
         // `Connection: keep-alive` to every request including the ones that
         // asked to close.
         m_http_cache[url_path] = {
-            std::make_shared<const std::string>(build_http_response(ct, content, true)),
-            std::make_shared<const std::string>(build_http_response(ct, content, false))
+            std::make_shared<const std::string>(build_http_response(ct, content, true, etag)),
+            std::make_shared<const std::string>(build_http_response(ct, content, false, etag)),
+            etag
         };
     }
 }
@@ -1116,6 +1159,7 @@ void server_instance::http_reval_store(const std::string& url_path, const struct
     e.size       = static_cast<uint64_t>(st.st_size);
     e.mtime_sec  = st.st_mtim.tv_sec;
     e.mtime_nsec = static_cast<uint32_t>(st.st_mtim.tv_nsec);
+    e.etag       = socketley::http::etag_of(socketley::file_stamp::of(st));
     e.bytes      = cost;
     e.response       = std::move(ka);
     e.response_close = std::move(cl);
@@ -1145,8 +1189,19 @@ void server_instance::open_http_root()
 }
 
 void server_instance::serve_http(server_connection* conn, const std::string& path,
-                                 std::string_view range_hdr)
+                                 std::string_view range_hdr, std::string_view if_none_match)
 {
+    // The client already holds this file: a 304 and no body.
+    const auto not_modified = [&](std::string_view etag) {
+        if (if_none_match.empty() || etag.empty() || !socketley::http::etag_list_matches(if_none_match, etag))
+            return false;
+        queue_http_response(conn, std::make_shared<const std::string>(build_http_304(etag, conn->http_keep_alive)));
+        if (!conn->http_keep_alive)
+            conn->closing = true;
+        else
+            conn->proto = proto_unknown;
+        return true;
+    };
     // Cleared per request and not per connection: under keep-alive this struct
     // serves the next request without a reset(), and a path that does not
     // reach the two arms below -- a 404, a cache hit -- would leave the last
@@ -1209,6 +1264,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
     {
         // Cached mode: zero-copy lookup — just bump shared_ptr refcount
         auto it = m_http_cache.find(url_path);
+        if (it != m_http_cache.end() && not_modified(it->second.etag))
+            return;
         queue_http_response(conn, it != m_http_cache.end()
             ? (conn->http_keep_alive ? it->second.response : it->second.response_close)
             : http_404_response(conn->http_keep_alive));
@@ -1268,6 +1325,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                     sx.stx_mtime.tv_sec == rit->second.mtime_sec &&
                     sx.stx_mtime.tv_nsec == rit->second.mtime_nsec)
                 {
+                    if (not_modified(rit->second.etag))
+                        return;
                     queue_http_response(conn, conn->http_keep_alive ? rit->second.response
                                                                     : rit->second.response_close);
                     if (!conn->http_keep_alive)
@@ -1367,6 +1426,12 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                 conn->proto = proto_unknown;
             return;
         }
+        conn->file_etag = socketley::http::etag_of(socketley::file_stamp::of(st));
+        if (not_modified(conn->file_etag))
+        {
+            close_tracked(ffd);
+            return;
+        }
 
         auto fsize = static_cast<size_t>(st.st_size);
 
@@ -1406,7 +1471,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         {
             close_tracked(ffd);
             queue_http_response(conn, std::make_shared<const std::string>(build_http_response(
-                ct, is_html ? inject_ws_script({}) : std::string(), conn->http_keep_alive)));
+                ct, is_html ? inject_ws_script({}) : std::string(), conn->http_keep_alive, conn->file_etag)));
             if (!conn->http_keep_alive)
                 conn->closing = true;
             else
@@ -1446,7 +1511,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         {
             close_tracked(ffd);
             queue_http_response(conn, std::make_shared<const std::string>(
-                build_http_headers_only(ct, fsize, conn->http_keep_alive)));
+                build_http_headers_only(ct, fsize, conn->http_keep_alive, conn->file_etag)));
             if (!conn->http_keep_alive)
                 conn->closing = true;
             else
@@ -1454,23 +1519,16 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             return;
         }
 
-        // Splice path for non-HTML files, never on a TLS connection, because
+        // The kernel's path for non-HTML files, never on a TLS connection, because
         // it would hand the peer plaintext in the middle of an encrypted
-        // stream.
-        // The cap is asked last, because acquiring a pipe for a request that
-        // then declines the path would hold one for nothing.
-        if (!is_html && !conn->ssl && !reval_take && splice_pipe_acquire(conn))
+        // stream: sendfile from the loop, with no pipe, so no cap on how many.
+        if (!is_html && !conn->ssl && !reval_take)
         {
-            // The slice's start becomes the descriptor's offset, because
-            // splice() from a file advances that offset and has no argument
-            // for where to begin.  A failure here would splice from 0 and
-            // answer a 206 whose Content-Range says otherwise, so it falls
-            // through to the read arm instead of serving the wrong bytes.
-            if (send_first == 0 || lseek(ffd, static_cast<off_t>(send_first), SEEK_SET)
-                                       == static_cast<off_t>(send_first))
             {
                 conn->splice_file_fd = ffd;
                 conn->splice_remaining = send_len;
+                conn->splice_off = send_first;
+                conn->splice_sendfile = true;
                 conn->splice_pipe_pending = 0;
                 conn->splice_pending = true;
                 conn->file_content_type = std::string(ct);
@@ -1482,8 +1540,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                 queue_http_response(conn, std::make_shared<const std::string>(
                     rng.usable
                         ? build_http_206_headers(ct, rng.first, rng.last, fsize,
-                                                 conn->http_keep_alive)
-                        : build_http_headers_only(ct, fsize, conn->http_keep_alive)),
+                                                 conn->http_keep_alive, conn->file_etag)
+                        : build_http_headers_only(ct, fsize, conn->http_keep_alive, conn->file_etag)),
                     /*ends_exchange=*/false);
                 return;
             }
@@ -1503,8 +1561,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             queue_http_response(conn, std::make_shared<const std::string>(
                 rng.usable
                     ? build_http_206_headers(ct, rng.first, rng.last, fsize,
-                                             conn->http_keep_alive)
-                    : build_http_headers_only(ct, fsize, conn->http_keep_alive)),
+                                             conn->http_keep_alive, conn->file_etag)
+                    : build_http_headers_only(ct, fsize, conn->http_keep_alive, conn->file_etag)),
                 /*ends_exchange=*/false);
             if (SOCKETLEY_UNLIKELY(!stream_file_begin(conn, ffd, send_first, send_len)))
             {
@@ -1966,15 +2024,17 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         // views into conn->partial and the erase below is what they point at.
         // The size is not known yet either, so the numbers are resolved in
         // serve_http once fstat has answered -- this only carries the text.
-        std::string range_hdr;
+        std::string range_hdr, if_none_match;
         for (const auto& [k, v] : req.headers)
-            if (fnv1a_lower(k) == fnv1a("range"))
-            {
+        {
+            const uint32_t h = fnv1a_lower(k);
+            if (h == fnv1a("range"))
                 range_hdr.assign(v);
-                break;
-            }
+            else if (h == fnv1a("if-none-match"))
+                if_none_match.assign(v);
+        }
         conn->partial.erase(0, total_consumed);
-        serve_http(conn, path_str, range_hdr);
+        serve_http(conn, path_str, range_hdr, if_none_match);
     }
     else
     {
@@ -6618,6 +6678,12 @@ void server_instance::after_write(server_connection* conn)
         if (SOCKETLEY_UNLIKELY(conn->closing && !conn_ops_pending(conn)))
             close_conn(conn);
     }
+    else if (SOCKETLEY_UNLIKELY(conn->splice_pending && conn->splice_sendfile && !conn->closing))
+    {
+        // Headers sent: the file follows.
+        conn->splice_pending = false;
+        sendfile_next(conn);
+    }
     else if (SOCKETLEY_UNLIKELY(conn->splice_pending && conn->splice_pipe[0] >= 0 && !conn->closing))
     {
         // Headers sent — start file→pipe splice
@@ -6758,9 +6824,9 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     if (store)
     {
         auto ka = std::make_shared<const std::string>(build_http_response_at(
-            conn->file_content_type, file_content, inject_at, true));
+            conn->file_content_type, file_content, inject_at, true, conn->file_etag));
         auto cl = std::make_shared<const std::string>(build_http_response_at(
-            conn->file_content_type, file_content, inject_at, false));
+            conn->file_content_type, file_content, inject_at, false, conn->file_etag));
         queue_http_response(conn, conn->http_keep_alive ? ka : cl);
         http_reval_store(conn->file_url_path, conn->file_st, std::move(ka), std::move(cl));
     }
@@ -6773,14 +6839,14 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         std::string out = build_http_206_headers(
             conn->file_content_type, conn->range_first,
             conn->range_first + file_content.size() - 1,
-            conn->range_total, conn->http_keep_alive);
+            conn->range_total, conn->http_keep_alive, conn->file_etag);
         out.append(file_content);
         queue_http_response(conn, std::make_shared<const std::string>(std::move(out)));
     }
     else
     {
         queue_http_response(conn, std::make_shared<const std::string>(build_http_response_at(
-            conn->file_content_type, file_content, inject_at, conn->http_keep_alive)));
+            conn->file_content_type, file_content, inject_at, conn->http_keep_alive, conn->file_etag)));
     }
     conn->is_range = false;
     conn->file_url_path.clear();
@@ -6809,6 +6875,76 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     }
 }
 
+// sendfile in bursts from the loop; a window out of the page cache turns the rest of this answer over to the pipe arm,
+// from the offset reached, so the loop is never held on the disk.
+void server_instance::sendfile_next(server_connection* conn)
+{
+    const auto fail = [&] {
+        conn->closing = true;
+        splice_cleanup(conn);
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
+    };
+    if (socketley::file_send::cold(conn->splice_file_fd, conn->splice_off, conn->splice_remaining))
+    {
+        // splice() from a file advances its offset and takes no argument for where to begin.
+        conn->splice_sendfile = false;
+        if (!splice_pipe_acquire(conn) ||
+            lseek(conn->splice_file_fd, static_cast<off_t>(conn->splice_off), SEEK_SET) !=
+                static_cast<off_t>(conn->splice_off))
+        {
+            fail();
+            return;
+        }
+        const auto chunk = static_cast<uint32_t>(std::min(conn->splice_remaining, size_t(UINT32_MAX)));
+        conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice, conn->generation };
+        conn->splice_in_pending =
+            m_loop->submit_splice(conn->splice_file_fd, conn->splice_pipe[1], chunk, &conn->splice_in_req);
+        if (SOCKETLEY_UNLIKELY(!conn->splice_in_pending))
+            fail();
+        return;
+    }
+    if (conn->splice_remaining > socketley::file_send::large && !conn->big_sndbuf)
+    {
+        conn->big_sndbuf = true;
+        socketley::file_send::raise_send_buffer(conn->fd);
+    }
+    uint64_t left = conn->splice_remaining, sent = 0;
+    const auto b = socketley::file_send::send(conn->fd, conn->sock_flags, conn->splice_file_fd, conn->splice_off, left, sent);
+    conn->splice_remaining = static_cast<size_t>(left);
+    stat_add(m_stat_bytes_out, sent);
+    if (b == socketley::file_send::burst::failed)
+    {
+        fail();
+        return;
+    }
+    if (b == socketley::file_send::burst::more)
+    {
+        // Room on the socket, or the next turn when the burst ran out, says when to go on.
+        conn->splice_out_req = { this, nullptr, conn->fd, 0, op_splice, conn->generation };
+        conn->splice_out_pending = m_loop->submit_poll_add(conn->fd, POLLOUT, &conn->splice_out_req);
+        if (SOCKETLEY_UNLIKELY(!conn->splice_out_pending))
+            fail();
+        return;
+    }
+    // The whole file is out: the exchange ends as a spliced one does.
+    splice_cleanup(conn);
+    http_answered(conn);
+    if (!conn->http_keep_alive)
+    {
+        conn->closing = true;
+        maybe_shutdown_write(conn);
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
+        return;
+    }
+    conn->proto = proto_unknown;
+    if (!conn->read_pending && !arm_conn_read(conn))
+        return;
+    // Last statement, for the reason the pipe arm's end gives.
+    parse_partial(conn);
+}
+
 void server_instance::splice_cleanup(server_connection* conn)
 {
     // Not while a splice is armed, because this closes the file the kernel is
@@ -6823,6 +6959,8 @@ void server_instance::splice_cleanup(server_connection* conn)
         conn->splice_file_fd = -1;
     }
     conn->splice_remaining = 0;
+    conn->splice_sendfile = false;
+    conn->splice_off = 0;
     conn->splice_pipe_pending = 0;
     conn->splice_pending = false;
 
@@ -6870,6 +7008,21 @@ void server_instance::handle_splice_in(struct io_uring_cqe* cqe, server_connecti
 void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn)
 {
     conn->splice_out_pending = false;
+
+    // A wait for room for sendfile, not a splice: its result is the poll's events.
+    if (conn->splice_sendfile)
+    {
+        if (SOCKETLEY_UNLIKELY(cqe->res < 0 || (cqe->res & (POLLERR | POLLHUP)) != 0 || conn->closing))
+        {
+            conn->closing = true;
+            splice_cleanup(conn);
+            if (!conn_ops_pending(conn))
+                close_conn(conn);
+            return;
+        }
+        sendfile_next(conn);
+        return;
+    }
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || conn->closing))
     {

@@ -191,6 +191,8 @@ struct alignas(64) server_connection
     // store.
     std::string file_url_path;
     struct stat file_st{};
+    // The validator of the file this connection answers with now.
+    std::string file_etag;
 
     // Splice state for zero-copy file serving (non-HTML only)
     io_request splice_in_req;
@@ -205,6 +207,12 @@ struct alignas(64) server_connection
     // existed to prevent.
     int splice_pipe[2]{-1, -1};
     size_t splice_remaining{0};
+    // The file goes by sendfile from the loop (shared/net/file_send.h), at this offset; the pipe arm above is what a
+    // window out of the page cache falls back to.  The socket's own flags are read once, its send buffer raised once.
+    bool splice_sendfile{false};
+    uint64_t splice_off{0};
+    int sock_flags{-1};
+    bool big_sndbuf{false};
     // ─── A request body being streamed rather than gathered ─────────────
     // How many body bytes are still owed for the request whose headers were
     // already parsed, and the head itself, owned -- because the point of
@@ -381,12 +389,17 @@ struct alignas(64) server_connection
         file_content_type.clear();
         file_is_html = false;
         file_url_path.clear();
+        file_etag.clear();
         file_st = {};
         file_read_pending = false;
         splice_in_req = {};
         splice_out_req = {};
         if (splice_file_fd >= 0) { close(splice_file_fd); splice_file_fd = -1; }
         splice_remaining = 0;
+        splice_sendfile = false;
+        splice_off = 0;
+        sock_flags = -1;
+        big_sndbuf = false;
         // A struct that carried a half-received body would take the next
         // client's first bytes for the rest of somebody else's upload.
         body_remaining = 0;
@@ -953,6 +966,8 @@ private:
     void parse_partial(server_connection* conn);
     void handle_splice_in(struct io_uring_cqe* cqe, server_connection* conn);
     void handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn);
+    // The next burst of a file sent by sendfile, from a write's completion or a wait for room on the socket.
+    void sendfile_next(server_connection* conn);
     void splice_cleanup(server_connection* conn);
     void invoke_on_websocket(int fd);
 
@@ -1047,7 +1062,7 @@ private:
     void finish_streamed_body(server_connection* conn);
 
     void serve_http(server_connection* conn, const std::string& path,
-                    std::string_view range_hdr = {});
+                    std::string_view range_hdr = {}, std::string_view if_none_match = {});
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
     // `ends_exchange` false when bytes still follow or a refusal owns the teardown.
     void queue_http_response(server_connection* conn, std::shared_ptr<const std::string> resp,
@@ -1475,6 +1490,7 @@ private:
     {
         std::shared_ptr<const std::string> response;        // Connection: keep-alive
         std::shared_ptr<const std::string> response_close;  // Connection: close
+        std::string etag;
     };
     std::unordered_map<std::string, cached_file, string_hash, string_equal> m_http_cache;
 
@@ -1491,6 +1507,7 @@ private:
         int64_t  mtime_sec{0};
         uint32_t mtime_nsec{0};
         size_t   bytes{0};   // what this entry costs, both variants together
+        std::string etag;
         std::shared_ptr<const std::string> response;        // Connection: keep-alive
         std::shared_ptr<const std::string> response_close;  // Connection: close
     };

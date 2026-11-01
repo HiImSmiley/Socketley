@@ -4069,7 +4069,17 @@ holding documents this server did not author \(em uploads, a generated report,
 a third\-party page \(em is delivered altered, with a script that opens a
 WebSocket back to this runtime. There is no flag to turn it off; if that is not
 wanted, serve those files from something else.
-Content-Type is detected from the file extension. WebSocket upgrades continue
+Content-Type is detected from the file extension. Every file answer carries an
+.B ETag
+of the file's inode, modification time and size, and a request whose
+.B If\-None\-Match
+names it is answered
+.B 304
+with no body; no
+.B Last\-Modified
+is sent, so a browser asks again on every load rather than trusting a copy it
+guessed was fresh, and a changed or replaced file is always sent anew.
+WebSocket upgrades continue
 to work as before on the same port. Only GET requests are served; other HTTP
 methods fall through to raw TCP handling.
 .IP
@@ -4121,6 +4131,14 @@ either, rather than inviting a seek that cannot be honoured.
 .IP
 .B "Concurrency of the zero-copy path."
 A file is sent with
+.BR sendfile (2)
+from the event loop, on a socket made non\-blocking for that call alone, so no
+pipe is held and nothing caps how many go at once; measured against the
+io_uring splice it replaced, a 2 MiB file costs 85 us of CPU instead of 158
+and 64 slow readers hold no kernel threads instead of 64. A window not in the
+page cache is spliced through a pipe instead, so the loop never waits on the
+disk, and what follows is about that pipe.
+A file used to be sent with
 .BR splice (2)
 through a pipe, which keeps the bytes out of user space entirely. That pipe used
 to be one per runtime, so exactly one connection at a time could take the path
@@ -8064,7 +8082,7 @@ installs a replaced one. Every accepted connection is given a session before its
 first byte is read, so a plaintext client meets the handshake and is refused,
 never served in the clear, and a peer that sits in the handshake for thirty
 seconds is dropped. A download over TLS is read from the file and encrypted; only
-plain TCP is sent by splice, so
+plain TCP is sent by sendfile, so
 .B zero_copy_bytes
 stays 0 for it. TLS and
 .B \-\-listen unix:
@@ -10848,8 +10866,10 @@ buffer, is hashed as it passes (on helper threads from 256 KiB up, so that the
 loop is not the one core that hashes every upload) and written while the next
 bytes arrive, so a gigabyte upload costs a few megabytes of memory. A GET of 64 KiB or more is sent
 by
-.BR splice (2)
-from the file through a pipe to the socket without entering the process, and the
+.BR sendfile (2)
+from the file to the socket without entering the process, a burst at a time from
+the event loop (a stretch not in the page cache is read through the ring
+instead), and the
 bytes that took that path are counted as
 .B zero_copy_bytes
 in
