@@ -559,7 +559,7 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_
         else if (f->left > 0 && conn->ssl == nullptr && conn->h2_parent == nullptr && conn->h3s == nullptr)
         {
             f->sendfile = true;
-            // The listener's 256 KiB would have each burst stop and wait for room several times a file.
+            // Autotuning grows the buffer only as the peer drains it, and each burst would stop for room on the way.
             if (f->left > keep_max_file && !conn->fcgi_sndbuf)
             {
                 conn->fcgi_sndbuf = true;

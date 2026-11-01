@@ -174,9 +174,6 @@ static bool on_fast_lo(int client_fd, int backend_fd)
            (socketley::fast_lo_covers(client_fd) || socketley::fast_lo_covers(backend_fd));
 }
 
-// Socket buffer sizes: 256KB gives good throughput for bulk transfers
-static constexpr int SOCK_BUF_SIZE = 256 * 1024;
-
 // Splice pipe capacity: 64KB is the default, but we can request more via F_SETPIPE_SZ
 static constexpr int SPLICE_PIPE_SIZE = 256 * 1024;
 
@@ -1436,17 +1433,11 @@ size_t proxy_instance::total_queued_bytes() const
     return total;
 }
 
-// Tune socket for high-throughput proxying: TCP_NODELAY, SO_SNDBUF/RCVBUF, keepalive
+// A backend connection's TCP_NODELAY and keepalive; its buffers are the kernel's to size, as the clients' are.
 inline void proxy_instance::tune_socket(int fd)
 {
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-    // Increase kernel socket buffers for throughput
-    int buf_size = SOCK_BUF_SIZE;
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
-
     socket_tuning::keepalive_dead_peer(fd);
 }
 
@@ -2156,7 +2147,9 @@ bool proxy_instance::setup(event_loop& loop)
         // listener's socket, so every client already carries these.  The
         // backend connect below keeps tune_socket(), because a connect has no
         // listener to inherit from.
-        socket_tuning::tcp_listener_defaults(m_listen_fd, SOCK_BUF_SIZE, SOCK_BUF_SIZE);
+        // Both buffers autotuned: a fixed size locks them, and one connection then carries at most the buffer per round
+        // trip -- measured over a 50 ms one, 9.1-9.5 MB/s against nginx's 47-49 in the same place.
+        socket_tuning::tcp_listener_defaults(m_listen_fd, 0, 0);
 
         // No TCP_DEFER_ACCEPT, because a client-speaks-first protocol does not
         // make it free -- a SYN-RECV connection is dropped without FIN or RST
