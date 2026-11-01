@@ -169,3 +169,61 @@ TEST_CASE("keep-alive is the version's, and the last Connection field's when the
     CHECK(take("GET / HTTP/1.1\r\nConnection: Upgrade, close\r\n\r\n").v.close);
     CHECK(take("GET / HTTP/1.1\r\nConnection: close\r\n\r\n").fields.empty());
 }
+
+// ─── The dates and tags a file answer carries, written without printf ─────────
+#include "shared/http/conditional.h"
+#include <cstdio>
+#include <ctime>
+#include <random>
+
+namespace
+{
+std::string date_by_libc(int64_t secs)
+{
+    static constexpr const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static constexpr const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const time_t t = static_cast<time_t>(secs);
+    std::tm tm{};
+    if (!::gmtime_r(&t, &tm))
+        return {};
+    char buf[64];
+    const int n = std::snprintf(buf, sizeof buf, "%s, %02d %s %04lld %02d:%02d:%02d GMT", days[tm.tm_wday], tm.tm_mday,
+                                months[tm.tm_mon], static_cast<long long>(tm.tm_year) + 1900, tm.tm_hour, tm.tm_min,
+                                tm.tm_sec);
+    return std::string(buf, static_cast<size_t>(n));
+}
+}   // namespace
+
+TEST_CASE("an HTTP date is gmtime's, for every second it is asked of")
+{
+    // The edges a civil-date formula gets wrong: the epoch and the day before it, leap days of a century that is and
+    // one that is not a leap year, the last second of 9999 and the first of 10000, and year 0.
+    const int64_t edges[] = {0, -1, 86399, 86400, -86400, -86401, 951782400, 951868799, 4107456000, 4107542399,
+                             68169600, 253402300799, 253402300800, -62167219200, -62167219201, 1793491200};
+    for (const int64_t s : edges)
+        CHECK(socketley::http::http_date_of(s) == date_by_libc(s));
+    std::mt19937_64 rng(11);
+    std::uniform_int_distribution<int64_t> any(-62167219200, 253402300799);
+    int same = 0;
+    for (int i = 0; i < 200000; ++i)
+    {
+        const int64_t s = any(rng);
+        same += socketley::http::http_date_of(s) == date_by_libc(s);
+    }
+    CHECK(same == 200000);
+}
+
+TEST_CASE("a file's ETag is its inode, time and size in hex, as %llx writes them")
+{
+    std::mt19937_64 rng(3);
+    for (int i = 0; i < 20000; ++i)
+    {
+        const socketley::file_stamp s{static_cast<int64_t>(rng() >> (i % 64)), static_cast<int64_t>(rng() >> (i % 63)),
+                                      i % 5 == 0 ? 0 : rng()};
+        char want[64];
+        const int n = std::snprintf(want, sizeof want, "%llx-%llx-%llx", static_cast<unsigned long long>(s.ino),
+                                    static_cast<unsigned long long>(s.mtime_ns), static_cast<unsigned long long>(s.size));
+        CHECK(socketley::http::etag_of(s) == std::string(want, static_cast<size_t>(n)));
+    }
+}

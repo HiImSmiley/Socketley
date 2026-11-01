@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <string>
 #include <string_view>
@@ -41,10 +42,25 @@ inline bool etag_list_matches(std::string_view list, std::string_view etag)
 // so a file moved in under the name with the old one's size and time (mv after touch -r) is not the client's copy.
 inline std::string etag_of(const file_stamp& s)
 {
-    char tag[64];
-    const int n = std::snprintf(tag, sizeof tag, "%llx-%llx-%llx", static_cast<unsigned long long>(s.ino),
-                                static_cast<unsigned long long>(s.mtime_ns), static_cast<unsigned long long>(s.size));
-    return n > 0 ? std::string(tag, static_cast<size_t>(n)) : std::string();
+    // The digits written here, as %llx would, where snprintf was a file answer's largest piece of its own work.
+    char tag[3 * 16 + 2];
+    char* p = tag;
+    const auto hex = [&p](unsigned long long v)
+    {
+        char t[16];
+        int n = 0;
+        do
+            t[n++] = "0123456789abcdef"[v & 15];
+        while ((v >>= 4) != 0);
+        while (n > 0)
+            *p++ = t[--n];
+    };
+    hex(static_cast<unsigned long long>(s.ino));
+    *p++ = '-';
+    hex(static_cast<unsigned long long>(s.mtime_ns));
+    *p++ = '-';
+    hex(static_cast<unsigned long long>(s.size));
+    return std::string(tag, static_cast<size_t>(p - tag));
 }
 
 // Mon, 02 Jan 2006 15:04:05 GMT, the HTTP date of the second `secs` since the epoch.
@@ -53,6 +69,49 @@ inline std::string http_date_of(int64_t secs)
     static constexpr const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     static constexpr const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    // The civil date of the day count, by the inverse of Hinnant's days_from_civil: gmtime_r takes the time zone lock
+    // and snprintf parses its format, which was most of what a Last-Modified cost.
+    {
+        const int64_t day = secs >= 0 ? secs / 86400 : -((-secs + 86399) / 86400);
+        const int64_t sod = secs - day * 86400;
+        const int64_t z = day + 719468;
+        const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+        const int64_t doe = z - era * 146097;
+        const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        const int64_t mp = (5 * doy + 2) / 153;
+        const int64_t mday = doy - (153 * mp + 2) / 5 + 1;
+        const int64_t mon = mp < 10 ? mp + 2 : mp - 10;
+        const int64_t year = yoe + era * 400 + (mon < 2 ? 1 : 0);
+        // Four digits, which is every year the format below writes without widening.
+        if (year >= 0 && year <= 9999)
+        {
+            const int64_t wday = ((day % 7) + 11) % 7;
+            char b[29];
+            const auto two = [&b](int at, int64_t v)
+            {
+                b[at] = static_cast<char>('0' + v / 10);
+                b[at + 1] = static_cast<char>('0' + v % 10);
+            };
+            std::memcpy(b, days[wday], 3);
+            b[3] = ',';
+            b[4] = ' ';
+            two(5, mday);
+            b[7] = ' ';
+            std::memcpy(b + 8, months[mon], 3);
+            b[11] = ' ';
+            two(12, year / 100);
+            two(14, year % 100);
+            b[16] = ' ';
+            two(17, sod / 3600);
+            b[19] = ':';
+            two(20, sod / 60 % 60);
+            b[22] = ':';
+            two(23, sod % 60);
+            std::memcpy(b + 25, " GMT", 4);
+            return std::string(b, sizeof b);
+        }
+    }
     const time_t t = static_cast<time_t>(secs);
     std::tm tm{};
     if (!::gmtime_r(&t, &tm))
