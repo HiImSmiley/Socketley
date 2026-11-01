@@ -2035,7 +2035,8 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     // onto every connection this listener hands out.  On a connection storm --
     // which the comment below says this path is measured on -- that was six
     // syscalls per accept for values the socket already had.
-    socket_tuning::tcp_listener_defaults(m_listen_fd, 131072, 0);
+    // Both buffers autotuned: a fixed receive buffer locks it, and an upload then carries at most it per round trip.
+    socket_tuning::tcp_listener_defaults(m_listen_fd, 0, 0);
 
     // No TCP_DEFER_ACCEPT, because a connection in SYN-RECV is one this server
     // does not know exists -- no on_connect, no count, and silently dropped

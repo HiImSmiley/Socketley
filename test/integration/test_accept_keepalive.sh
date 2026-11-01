@@ -87,7 +87,7 @@ if [ "$got" = "yes" ]; then ok; else
     bad "the proxy kept its keepalive" "ss says '$got'"
 fi
 
-echo "--- 2b. the proxy leaves its buffers to the kernel ---"
+echo "--- 2b. the proxy and the server leave their buffers to the kernel ---"
 # A size set on the listener locks the buffers of every accepted socket, and one connection then carries at most the
 # buffer per round trip: over a 50 ms one, 9.4 MB/s through the entrance against nginx's 48.  An accepted socket
 # that autotunes starts at the kernel's defaults, the ones a plain listener's socket starts at.
@@ -98,10 +98,14 @@ s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(1); c, _ = s.accept(); time.sl
 wait_port "$PORT_PLAIN" || true
 exec 6<>"/dev/tcp/127.0.0.1/$PORT_PLAIN"
 sleep 0.5
-plain=$(bufs "$PORT_PLAIN"); proxied=$(bufs "$PORT_PROXY")
+plain=$(bufs "$PORT_PLAIN"); proxied=$(bufs "$PORT_PROXY"); served=$(bufs "$PORT_SERVER")
 kill "$PLAINPID" 2>/dev/null; exec 6>&-
 if [ -n "$plain" ] && [ "$proxied" = "$plain" ]; then ok; else
     bad "an accepted proxy connection starts with the kernel's buffers, autotuned" "proxy: '$proxied', plain socket: '$plain'"
+fi
+# The server's receive buffer the same: locked at 128 KiB, an upload over a 50 ms link came in at 3 MB/s, not 37.
+if [ -n "$plain" ] && [ "$served" = "$plain" ]; then ok; else
+    bad "an accepted server connection starts with the kernel's buffers, autotuned" "server: '$served', plain socket: '$plain'"
 fi
 
 echo "--- 3. a unix listener is not charged for a TCP option ---"
