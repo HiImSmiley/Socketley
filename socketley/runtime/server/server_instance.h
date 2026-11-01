@@ -31,6 +31,21 @@
 
 class runtime_manager;
 
+// A large file's descriptor, kept between the requests that send it and shared by them: sendfile and the pipe arm
+// name their own offsets.  Only ever named by synchronous calls, so a plain close is the right one.
+struct http_open_fd
+{
+    int fd{-1};
+    explicit http_open_fd(int f) : fd(f) {}
+    http_open_fd(const http_open_fd&) = delete;
+    http_open_fd& operator=(const http_open_fd&) = delete;
+    ~http_open_fd()
+    {
+        if (fd >= 0)
+            ::close(fd);
+    }
+};
+
 // tls_conn_state lives in shared/crypto/tls_context.h, included above: the proxy runs
 // the same state machine on both of its legs, and a second spelling of it
 // would be a second thing to keep in step.
@@ -200,6 +215,8 @@ struct alignas(64) server_connection
     io_request splice_in_req;
     io_request splice_out_req;
     int splice_file_fd{-1};
+    // Set when splice_file_fd is a kept descriptor, which this connection lets go of rather than closes.
+    std::shared_ptr<const http_open_fd> splice_file_hold;
     // This connection's own pipe, not the runtime's.  One shared pipe meant
     // exactly one connection could take the zero-copy path at a time, and
     // everything else fell back to read+write -- measured at 975 us against
@@ -329,7 +346,7 @@ struct alignas(64) server_connection
     {
         free(file_buf);
         if (file_fd >= 0)        close(file_fd);
-        if (splice_file_fd >= 0) close(splice_file_fd);
+        if (splice_file_fd >= 0 && !splice_file_hold) close(splice_file_fd);
         if (stream_fd >= 0)      close(stream_fd);
         // The session, for a struct that never reached pool_release(), safe
         // here because no submission ever named it.
@@ -395,7 +412,9 @@ struct alignas(64) server_connection
         file_read_pending = false;
         splice_in_req = {};
         splice_out_req = {};
-        if (splice_file_fd >= 0) { close(splice_file_fd); splice_file_fd = -1; }
+        if (splice_file_fd >= 0 && !splice_file_hold) close(splice_file_fd);
+        splice_file_fd = -1;
+        splice_file_hold.reset();
         splice_remaining = 0;
         splice_sendfile = false;
         splice_off = 0;
@@ -1524,6 +1543,22 @@ private:
         std::shared_ptr<const std::string> response_close;  // Connection: close
     };
     std::unordered_map<std::string, reval_file, string_hash, string_equal> m_http_reval;
+
+    // A file too large for the map above keeps its descriptor here instead, checked by the same statx: one call where
+    // openat2, fstat and close were three, 267 ns against 750.
+    struct open_file
+    {
+        dev_t    dev{0};
+        ino_t    ino{0};
+        uint64_t size{0};
+        int64_t  mtime_sec{0};
+        uint32_t mtime_nsec{0};
+        std::string etag;
+        std::shared_ptr<const http_open_fd> src;
+    };
+    std::unordered_map<std::string, open_file, string_hash, string_equal> m_http_open;
+    // A bound on the descriptors this holds, as the FastCGI proxy's.
+    static constexpr size_t HTTP_OPEN_MAX = 256;
     size_t m_http_reval_bytes{0};
     bool   m_http_reval_full_logged{false};
 

@@ -1225,6 +1225,7 @@ void server_instance::open_http_root()
     // Every key in the revalidating map is relative to the descriptor being
     // replaced, so it does not survive the replacement.
     m_http_reval.clear();
+    m_http_open.clear();
     m_http_reval_bytes = 0;
     m_http_reval_full_logged = false;
     m_http_root_fd = ::open(m_http_base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1435,7 +1436,43 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         int ffd = -1;
         bool used_beneath = false;
         fs::path resolved;
-        if (m_http_root_fd >= 0)
+        // A kept descriptor, when the file under the name is still the one it was opened on.
+        std::shared_ptr<const http_open_fd> held;
+        struct stat held_st{};
+        std::string_view held_etag;
+        if (!m_http_open.empty() && http_reval_active())
+        {
+            auto oit = m_http_open.find(url_path);
+            if (oit != m_http_open.end())
+            {
+                struct statx sx = copy_sx;
+                const unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
+                const open_file& o = oit->second;
+                if ((!coded_key.empty() || ::statx(m_http_root_fd, rel_path, 0, want, &sx) == 0) &&
+                    (sx.stx_mask & want) == want && S_ISREG(sx.stx_mode) &&
+                    makedev(sx.stx_dev_major, sx.stx_dev_minor) == o.dev && static_cast<ino_t>(sx.stx_ino) == o.ino &&
+                    sx.stx_size == o.size && sx.stx_mtime.tv_sec == o.mtime_sec && sx.stx_mtime.tv_nsec == o.mtime_nsec)
+                {
+                    held = o.src;
+                    held_etag = o.etag;
+                    held_st.st_mode = S_IFREG;
+                    held_st.st_dev = o.dev;
+                    held_st.st_ino = o.ino;
+                    held_st.st_size = static_cast<off_t>(o.size);
+                    held_st.st_mtim = {static_cast<time_t>(o.mtime_sec), static_cast<long>(o.mtime_nsec)};
+                    ffd = held->fd;
+                    used_beneath = true;
+                }
+                else
+                    m_http_open.erase(oit);
+            }
+        }
+        // Lets go of the file on a path that answers without it: a kept descriptor stays open for the next request.
+        const auto drop_file = [&] {
+            if (!held)
+                close_tracked(ffd);
+        };
+        if (!held && m_http_root_fd >= 0)
         {
             const char* rel = rel_path;
             struct open_how how{};
@@ -1446,11 +1483,6 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             {
                 ffd = static_cast<int>(r);
                 used_beneath = true;
-                // The path is still needed for the extension, and leaving it
-                // empty served every file with the wrong type -- which under
-                // keep-alive desynchronised the connection rather than merely
-                // mislabelling it.
-                resolved = m_http_base / rel;
             }
             else if (errno != ENOSYS)
             {
@@ -1500,8 +1532,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             return;
         }
 
-        struct stat st;
-        if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode))
+        struct stat st = held_st;
+        if (!held && (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode)))
         {
             close_tracked(ffd);
             queue_http_response(conn, http_404_response(conn->http_keep_alive));
@@ -1511,17 +1543,29 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                 conn->proto = proto_unknown;
             return;
         }
-        conn->file_etag = socketley::http::etag_of(socketley::file_stamp::of(st));
+        if (held)
+            conn->file_etag.assign(held_etag);
+        else
+            conn->file_etag = socketley::http::etag_of(socketley::file_stamp::of(st));
         if (not_modified(conn->file_etag))
         {
-            close_tracked(ffd);
+            drop_file();
             return;
         }
 
         auto fsize = static_cast<size_t>(st.st_size);
 
-        // Detect content type
-        std::string ext = resolved.extension().string();
+        // Detect content type, from the name asked for: the extension fs::path would give, without building one.
+        std::string ext;
+        if (used_beneath)
+        {
+            const std::string_view name = rel_view.substr(rel_view.rfind('/') + 1);
+            const size_t dot = name.rfind('.');
+            if (dot != std::string_view::npos && dot != 0 && name != "..")
+                ext.assign(name.substr(dot));
+        }
+        else
+            ext = resolved.extension().string();
         for (auto& c : ext)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         uint32_t ext_hash = fnv1a(ext);
@@ -1547,7 +1591,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             rng = http_range{};
         if (SOCKETLEY_UNLIKELY(rng.unsatisfiable))
         {
-            close_tracked(ffd);
+            drop_file();
             queue_http_response(conn, std::make_shared<const std::string>(
                 build_http_416(fsize, conn->http_keep_alive)));
             if (!conn->http_keep_alive)
@@ -1564,7 +1608,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         // with 0 and 0 was being answered as 404.
         if (fsize == 0)
         {
-            close_tracked(ffd);
+            drop_file();
             queue_http_response(conn, std::make_shared<const std::string>(build_http_response(
                 ct, is_html ? inject_ws_script({}) : std::string(), conn->http_keep_alive, conn->file_etag)));
             if (!conn->http_keep_alive)
@@ -1586,7 +1630,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         // because its Content-Length counts the injected script.
         if (conn->http_head && !is_html)
         {
-            close_tracked(ffd);
+            drop_file();
             queue_http_response(conn, std::make_shared<const std::string>(
                 build_http_headers_only(ct, fsize, conn->http_keep_alive, conn->file_etag)));
             if (!conn->http_keep_alive)
@@ -1602,7 +1646,18 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         if (!is_html && !conn->ssl && !reval_take)
         {
             {
+                // A large file's descriptor is kept for the requests after this one.
+                if (!held && used_beneath && http_reval_active() && fsize > HTTP_REVAL_SENDFILE_MAX_FILE)
+                {
+                    if (m_http_open.size() >= HTTP_OPEN_MAX)
+                        m_http_open.clear();
+                    held = std::make_shared<const http_open_fd>(ffd);
+                    m_http_open[std::string(url_path)] = open_file{st.st_dev, st.st_ino, static_cast<uint64_t>(st.st_size),
+                                                      static_cast<int64_t>(st.st_mtim.tv_sec),
+                                                      static_cast<uint32_t>(st.st_mtim.tv_nsec), conn->file_etag, held};
+                }
                 conn->splice_file_fd = ffd;
+                conn->splice_file_hold = std::move(held);
                 conn->splice_remaining = send_len;
                 conn->splice_off = send_first;
                 conn->splice_sendfile = true;
@@ -1641,6 +1696,19 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                     head.erase(0, static_cast<size_t>(n));
                 }
                 queue_http_response(conn, std::make_shared<const std::string>(std::move(head)), /*ends_exchange=*/false);
+                return;
+            }
+        }
+
+        // The paths below own the descriptor they are given; a kept one is lent as a copy, whose reads name offsets.
+        if (SOCKETLEY_UNLIKELY(held != nullptr))
+        {
+            ffd = ::fcntl(held->fd, F_DUPFD_CLOEXEC, 0);
+            held.reset();
+            if (ffd < 0)
+            {
+                queue_http_response(conn, http_500_response());
+                conn->closing = true;
                 return;
             }
         }
@@ -2580,6 +2648,7 @@ bool server_instance::setup(event_loop& loop)
     // request, read here so a restart picks it up.
     m_http_reval_enabled = socketley::settings::flag("SOCKETLEY_HTTP_REVALIDATE", true);
     m_http_reval.clear();
+    m_http_open.clear();
     m_http_reval_bytes = 0;
     m_http_reval_full_logged = false;
 
@@ -2674,6 +2743,8 @@ void server_instance::teardown(event_loop& loop)
         flush_cache_store();
     }
     m_cache_store_batch.clear();
+    // A stopped server holds no file open.
+    m_http_open.clear();
 
     if (m_udp)
     {
@@ -2807,7 +2878,10 @@ void server_instance::teardown(event_loop& loop)
         // closing the file ends them while file_buf stays allocated, being
         // where the kernel writes.
         if (conn->file_fd >= 0) { close_tracked(conn->file_fd); conn->file_fd = -1; }
-        if (conn->splice_file_fd >= 0) { close_tracked(conn->splice_file_fd); conn->splice_file_fd = -1; }
+        if (conn->splice_file_fd >= 0 && !conn->splice_file_hold)
+            close_tracked(conn->splice_file_fd);
+        conn->splice_file_fd = -1;
+        conn->splice_file_hold.reset();
         conn->splice_remaining = 0;
         conn->splice_pipe_pending = 0;
         conn->splice_pending = false;
@@ -6799,8 +6873,8 @@ void server_instance::after_write(server_connection* conn)
         conn->splice_pending = false;
         uint32_t chunk = static_cast<uint32_t>(std::min(conn->splice_remaining, size_t(UINT32_MAX)));
         conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice, conn->generation };
-        conn->splice_in_pending =
-            m_loop->submit_splice(conn->splice_file_fd, conn->splice_pipe[1], chunk, &conn->splice_in_req);
+        conn->splice_in_pending = m_loop->submit_splice_file(conn->splice_file_fd, conn->splice_off,
+                                                             conn->splice_pipe[1], chunk, &conn->splice_in_req, op_splice);
         if (SOCKETLEY_UNLIKELY(!conn->splice_in_pending))
         {
             // Nothing reached the ring, so the pipe goes back and the
@@ -7000,18 +7074,24 @@ void server_instance::sendfile_next(server_connection* conn, bool inline_call)
     if (socketley::file_send::cold(conn->splice_file_fd, conn->splice_off, conn->splice_remaining) &&
         splice_pipe_acquire(conn))
     {
-        // splice() from a file advances its offset and takes no argument for where to begin.
-        conn->splice_sendfile = false;
-        if (lseek(conn->splice_file_fd, static_cast<off_t>(conn->splice_off), SEEK_SET) !=
-            static_cast<off_t>(conn->splice_off))
+        // The ring reads a descriptor of the connection's own, so none it names is closed by the map, and at the offset
+        // the connection names, since a copy shares the kept one's position.
+        if (conn->splice_file_hold)
         {
-            fail();
-            return;
+            const int own = ::fcntl(conn->splice_file_fd, F_DUPFD_CLOEXEC, 0);
+            if (own < 0)
+            {
+                fail();
+                return;
+            }
+            conn->splice_file_fd = own;
+            conn->splice_file_hold.reset();
         }
+        conn->splice_sendfile = false;
         const auto chunk = static_cast<uint32_t>(std::min(conn->splice_remaining, size_t(UINT32_MAX)));
         conn->splice_in_req = { this, nullptr, conn->fd, chunk, op_splice, conn->generation };
-        conn->splice_in_pending =
-            m_loop->submit_splice(conn->splice_file_fd, conn->splice_pipe[1], chunk, &conn->splice_in_req);
+        conn->splice_in_pending = m_loop->submit_splice_file(conn->splice_file_fd, conn->splice_off,
+                                                             conn->splice_pipe[1], chunk, &conn->splice_in_req, op_splice);
         if (SOCKETLEY_UNLIKELY(!conn->splice_in_pending))
             fail();
         return;
@@ -7060,11 +7140,10 @@ void server_instance::splice_cleanup(server_connection* conn)
     if (SOCKETLEY_UNLIKELY(conn->splice_in_pending || conn->splice_out_pending))
         return;
 
-    if (conn->splice_file_fd >= 0)
-    {
+    if (conn->splice_file_fd >= 0 && !conn->splice_file_hold)
         close_tracked(conn->splice_file_fd);
-        conn->splice_file_fd = -1;
-    }
+    conn->splice_file_fd = -1;
+    conn->splice_file_hold.reset();
     conn->splice_remaining = 0;
     conn->splice_sendfile = false;
     conn->splice_off = 0;
