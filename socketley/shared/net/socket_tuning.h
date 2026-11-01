@@ -1,8 +1,10 @@
 #pragma once
 // Keepalive as this tree tunes it, in one place because a peer that loses power
 // sends nothing and every listener owes the same answer to that.
+#include <cerrno>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <string_view>
 #include <sys/socket.h>
 
 namespace socket_tuning {
@@ -54,6 +56,16 @@ inline void tcp_listener_defaults(int fd, int rcvbuf, int sndbuf)
         if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {}
     if (sndbuf > 0)
         if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {}
+}
+
+// The congestion control a listener's accepted sockets run, which they take from it as they take the options above:
+// 0, or the errno the kernel refused it with -- EPERM for one not in net.ipv4.tcp_allowed_congestion_control to a
+// process without CAP_NET_ADMIN, ENOENT for one this kernel does not have.
+inline int congestion(int fd, std::string_view name)
+{
+    if (name.empty())
+        return 0;
+    return setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, name.data(), static_cast<socklen_t>(name.size())) < 0 ? errno : 0;
 }
 
 }  // namespace socket_tuning

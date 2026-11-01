@@ -42,6 +42,8 @@ struct runtime_config
     double rate_limit = 0.0;
     double global_rate_limit = 0.0;
     uint32_t idle_timeout = 0;
+    // The TCP congestion control its listener's connections run (--congestion), the kernel's default when empty.
+    std::string congestion;
     // 0 means "not given", so a record written before this existed restores a
     // runtime to the default rather than to a bound of zero.
     size_t   write_buffer = 0;

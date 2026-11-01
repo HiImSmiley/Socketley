@@ -2213,6 +2213,10 @@ idle_timeout	number	T{
 .ad l
 Close idle connections after N seconds (0 = disabled)
 T}
+congestion	string	T{
+.ad l
+TCP congestion control of accepted connections (\fB\-\-congestion\fR)
+T}
 drain	bool	T{
 .ad l
 Graceful shutdown (flush writes before close)
@@ -3232,6 +3236,34 @@ nothing for an hour is quiet and alive, and keepalive leaves it alone; only
 .B \-\-idle\-timeout
 closes that one. A unix listener is not given keepalive, having no peer that
 can disappear silently.
+.TP
+.BI "\-\-congestion " name
+The TCP congestion control every connection a server, a proxy, a cache or a
+storage accepts runs, by the kernel's name for it \(em
+.BR bbr ,
+.BR cubic ,
+.B reno
+\(em set once on the listener, which each accepted socket inherits. Without it
+the host's default
+.RB ( net.ipv4.tcp_congestion_control )
+stands. A loss-based control such as cubic halves its rate at every lost
+packet; bbr paces to the path's measured bandwidth and holds it. One 32 MB
+download over 100 Mbit and a 50 ms round trip, three interleaved runs:
+.IP
+.nf
+loss   cubic              bbr
+0%     10.21 MB/s         10.13 MB/s
+1%     0.38\-0.49 MB/s    9.76\-9.87 MB/s
+2%     0.26\-0.27 MB/s    9.59\-9.63 MB/s
+.fi
+.IP
+The kernel decides what may be chosen: a process without CAP_NET_ADMIN only
+what
+.B net.ipv4.tcp_allowed_congestion_control
+lists, and only a control already loaded
+.RB ( "modprobe tcp_bbr" ).
+A name it refuses fails the start, and the log says why; it is never quietly
+the default instead.
 .TP
 .B \-\-drain
 Enable graceful shutdown. When stopping, the runtime closes its listener
@@ -15406,6 +15438,7 @@ max_connections            \-\-max\-connections
 rate_limit                 \-\-rate\-limit
 global_rate_limit          \-\-global\-rate\-limit
 idle_timeout               \-\-idle\-timeout  300, or 5m / 2h / 1d
+congestion                 \-\-congestion    bbr
 write_buffer               \-\-write\-buffer   8M, 256K, 65536
 read_buffer                \-\-read\-buffer    1M, 8M, 65536
 drain (bool)               \-\-drain

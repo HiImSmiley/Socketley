@@ -171,6 +171,11 @@ public:
     // Idle connection timeout (seconds, 0 = disabled)
     void set_idle_timeout(uint32_t seconds);
     uint32_t get_idle_timeout() const;
+    // --congestion: the TCP congestion control every connection this runtime accepts runs, set once on its listener.
+    void set_congestion(std::string name) { m_congestion = std::move(name); }
+    const std::string& get_congestion() const { return m_congestion; }
+    // False, said in the log, when the kernel refuses the listener its --congestion.
+    bool apply_congestion(int listen_fd) const;
 
     // ─── How much may be owed to one connection ─────────────────────────────
     // The write queue's bound, per connection, which was two compile-time
@@ -954,6 +959,7 @@ private:
     double m_global_tokens = 0.0;
     std::chrono::steady_clock::time_point m_global_last{};
     uint32_t m_idle_timeout = 0;
+    std::string m_congestion;
     // Defaulted to what the constants were, so a runtime nobody configures
     // behaves exactly as before.
     size_t m_write_buffer = socketley::write_queue_max_bytes;

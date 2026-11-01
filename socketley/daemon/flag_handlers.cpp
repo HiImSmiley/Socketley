@@ -468,6 +468,32 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
+        // The kernel's own name for it, checked by the kernel when the listener is made, since what it has and
+        // allows is the host's to say; a server, a proxy, a cache and a storage are the listeners that set it.
+        case fnv1a("--congestion"):
+        {
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            const bool named = !v.empty() && v.size() < 16 &&
+                               std::all_of(v.begin(), v.end(), [](char c) {
+                                   return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+                               });
+            if (!named)
+            {
+                std::cout << "--congestion requires a congestion control's name, such as bbr or cubic\n";
+                return 1;
+            }
+            const runtime_type t = instance->get_type();
+            if (t != runtime_server && t != runtime_proxy && t != runtime_cache && t != runtime_storage)
+            {
+                std::cout << "--congestion applies to a server, a proxy, a cache or a storage: their listeners are "
+                             "where it is set\n";
+                return 1;
+            }
+            instance->set_congestion(std::string(v));
+            ++i;
+            return 0;
+        }
+
         case fnv1a("--read-buffer"):
         {
             size_t bytes;

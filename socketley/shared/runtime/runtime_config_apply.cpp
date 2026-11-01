@@ -467,6 +467,7 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     if (cfg.rate_limit > 0.0)        rt.set_rate_limit(cfg.rate_limit);
     if (cfg.global_rate_limit > 0.0) rt.set_global_rate_limit(cfg.global_rate_limit);
     if (cfg.idle_timeout > 0)        rt.set_idle_timeout(cfg.idle_timeout);
+    if (!cfg.congestion.empty())     rt.set_congestion(cfg.congestion);
     if (cfg.write_buffer > 0)        rt.set_write_buffer(cfg.write_buffer);
     if (cfg.read_buffer > 0)         rt.set_read_buffer(cfg.read_buffer);
     if (cfg.drain)                   rt.set_drain(true);

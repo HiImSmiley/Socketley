@@ -5,6 +5,7 @@
 #include "../ipc/worker_env.h"
 #include "../lua/lua_suspend.h"
 #include "../util/logging.h"
+#include "../net/socket_tuning.h"
 #include "../crypto/tls_context.h"
 #include "../crypto/cert_keeper.h"
 #include "../loop/blocking_write.h"
@@ -1170,6 +1171,20 @@ void runtime_instance::set_read_buffer(size_t bytes)
 size_t runtime_instance::get_read_buffer() const { return m_read_buffer; }
 
 void runtime_instance::set_idle_timeout(uint32_t seconds) { m_idle_timeout = seconds; }
+
+bool runtime_instance::apply_congestion(int listen_fd) const
+{
+    const int err = socket_tuning::congestion(listen_fd, m_congestion);
+    if (err == 0)
+        return true;
+    std::string why = std::strerror(err);
+    if (err == EPERM)
+        why += ": without CAP_NET_ADMIN only what net.ipv4.tcp_allowed_congestion_control lists may be chosen";
+    else if (err == ENOENT)
+        why += ": this kernel has no such congestion control (net.ipv4.tcp_available_congestion_control)";
+    LOG_ERROR((std::string(get_name()) + ": --congestion " + m_congestion + " was refused: " + why).c_str());
+    return false;
+}
 uint32_t runtime_instance::get_idle_timeout() const { return m_idle_timeout; }
 
 void runtime_instance::set_drain(bool enabled) { m_drain = enabled; }

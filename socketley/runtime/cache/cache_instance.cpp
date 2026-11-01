@@ -465,6 +465,11 @@ bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
     if (reuseport)
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    if (!apply_congestion(fd))
+    {
+        close_tracked(fd);
+        return false;
+    }
 
     // No TCP_DEFER_ACCEPT, measured at +7.9% on the only shape a cache client
     // has, and removed not for the delay but because a SYN-RECV connection

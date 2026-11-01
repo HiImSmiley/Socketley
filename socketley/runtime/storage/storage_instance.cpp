@@ -216,6 +216,11 @@ bool storage_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
     // The buffers are left to the kernel: a body of gigabytes is what autotuning
     // is for, and the sizes a small-message runtime pins would cap it.
     socket_tuning::tcp_listener_defaults(fd, 0, 0);
+    if (!apply_congestion(fd))
+    {
+        ::close(fd);
+        return false;
+    }
 
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;

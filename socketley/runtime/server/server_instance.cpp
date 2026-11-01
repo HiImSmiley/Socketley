@@ -2187,6 +2187,12 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     // syscalls per accept for values the socket already had.
     // Both buffers autotuned: a fixed receive buffer locks it, and an upload then carries at most it per round trip.
     socket_tuning::tcp_listener_defaults(m_listen_fd, 0, 0);
+    if (!apply_congestion(m_listen_fd))
+    {
+        close_tracked(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
 
     // No TCP_DEFER_ACCEPT, because a connection in SYN-RECV is one this server
     // does not know exists -- no on_connect, no count, and silently dropped

@@ -2150,6 +2150,12 @@ bool proxy_instance::setup(event_loop& loop)
         // Both buffers autotuned: a fixed size locks them, and one connection then carries at most the buffer per round
         // trip -- measured over a 50 ms one, 9.1-9.5 MB/s against nginx's 47-49 in the same place.
         socket_tuning::tcp_listener_defaults(m_listen_fd, 0, 0);
+        if (!apply_congestion(m_listen_fd))
+        {
+            close_tracked(m_listen_fd);
+            m_listen_fd = -1;
+            return false;
+        }
 
         // No TCP_DEFER_ACCEPT, because a client-speaks-first protocol does not
         // make it free -- a SYN-RECV connection is dropped without FIN or RST

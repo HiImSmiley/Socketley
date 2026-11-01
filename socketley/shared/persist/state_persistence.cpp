@@ -587,6 +587,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.rate_limit = instance->get_rate_limit();
     cfg.global_rate_limit = instance->get_global_rate_limit();
     cfg.idle_timeout = instance->get_idle_timeout();
+    cfg.congestion = instance->get_congestion();
     cfg.write_buffer = instance->get_write_buffer();
     cfg.read_buffer  = instance->get_read_buffer();
     cfg.drain = instance->get_drain();
@@ -972,6 +973,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         append_double_field("global_rate_limit", cfg.global_rate_limit);
     if (cfg.idle_timeout > 0)
         append_int_field("idle_timeout", cfg.idle_timeout);
+    if (!cfg.congestion.empty())
+        append_str_field("congestion", cfg.congestion);
     // Written only when it differs, so the records of every runtime nobody
     // configured stay byte-identical to what they were.
     if (cfg.write_buffer > 0 && cfg.write_buffer != socketley::write_queue_max_bytes)
@@ -1475,6 +1478,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.rate_limit = json_get_double(json, "rate_limit");
     cfg.global_rate_limit = json_get_double(json, "global_rate_limit");
     cfg.idle_timeout = json_get_uint32(json, "idle_timeout");
+    cfg.congestion = json_get_string(json, "congestion");
     cfg.write_buffer = json_get_size(json, "write_buffer");
     cfg.read_buffer  = json_get_size(json, "read_buffer");
     cfg.drain = json_get_bool(json, "drain");

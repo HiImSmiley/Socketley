@@ -72,7 +72,7 @@ private:
 constexpr std::string_view reserved_keys[] = {
     "name", "id", "type", "port", "listen", "was_running", "log_file",
     "write_file", "lua_script", "bash_output", "bash_prefix", "bash_timestamp",
-    "max_connections", "rate_limit", "global_rate_limit", "idle_timeout",
+    "max_connections", "rate_limit", "global_rate_limit", "idle_timeout", "congestion",
     "write_buffer", "write-buffer", "read_buffer", "read-buffer",
     "drain", "reconnect", "tls", "cert_path", "key_path", "ca_path", "target",
     "cache_name", "group", "owner", "child_policy", "shards", "shard_index",
