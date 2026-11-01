@@ -2307,7 +2307,10 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
             // An empty part has no byte a Content-Range could name.
             ranged = len > 0;
         }
-        else if (const std::string_view rh = rq.header("range"); !rh.empty() && !cc->website_status)
+        // A range of an object replaced since the client's copy is no part of it, so the whole object instead.
+        else if (const std::string_view rh = rq.header("range");
+                 !rh.empty() && !cc->website_status &&
+                 socketley::http::if_range_holds(rq.header("if-range"), m.etag(), m.mtime_ms / 1000))
         {
             const http_range hr = http_parse_range(rh, static_cast<size_t>(m.size));
             if (hr.unsatisfiable)

@@ -1099,7 +1099,8 @@ void server_instance::rebuild_http_cache()
             ct.append(VARY_FIELD);
 
         // Inject WebSocket script into HTML files
-        if (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"))
+        const bool html = ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm");
+        if (html)
             content = inject_ws_script(content);
 
         // --compress: a copy no older than the file beside it is kept a second time, under that file's name, a NUL and
@@ -1134,9 +1135,14 @@ void server_instance::rebuild_http_cache()
         // Both variants stored, because a single keep-alive string answered
         // `Connection: keep-alive` to every request including the ones that
         // asked to close.
+        // Accept-Ranges as the disk path says it, since a range is served from the file; not on a page, whose
+        // injected script moves every offset.
+        const size_t whole = std::string_view::npos;
         m_http_cache[url_path] = {
-            std::make_shared<const std::string>(build_http_response(ct, content, true, etag)),
-            std::make_shared<const std::string>(build_http_response(ct, content, false, etag)),
+            std::make_shared<const std::string>(html ? build_http_response(ct, content, true, etag)
+                                                     : build_http_response_at(ct, content, whole, true, etag)),
+            std::make_shared<const std::string>(html ? build_http_response(ct, content, false, etag)
+                                                     : build_http_response_at(ct, content, whole, false, etag)),
             etag
         };
     }
@@ -1228,7 +1234,7 @@ void server_instance::open_http_root()
 
 void server_instance::serve_http(server_connection* conn, const std::string& path,
                                  std::string_view range_hdr, std::string_view if_none_match,
-                                 std::string_view accept_encoding)
+                                 std::string_view accept_encoding, std::string_view if_range)
 {
     // The client already holds this file: a 304 and no body.
     const auto not_modified = [&](std::string_view etag) {
@@ -1300,7 +1306,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         return;
     }
 
-    if (m_http_cache_enabled && !m_http_cache.empty())
+    // A range is cut from the file itself, which the cached whole-file answers cannot give.
+    if (m_http_cache_enabled && !m_http_cache.empty() && range_hdr.empty())
     {
         // Cached mode: zero-copy lookup — just bump shared_ptr refcount
         auto it = m_http_cache.end();
@@ -1533,8 +1540,11 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         // byte offset into the file is not an offset into what is served.
         // 14.2 lets a server ignore the field, and that is the honest answer
         // here rather than a slice of something else.
-        const http_range rng = is_html ? http_range{}
-                                       : http_parse_range(range_hdr, fsize);
+        http_range rng = is_html ? http_range{} : http_parse_range(range_hdr, fsize);
+        // A range of a file that has changed since the client's copy is no part of that copy: the whole file instead.
+        // No Last-Modified is sent, so a date names no copy this server gave out.
+        if (rng.usable && !socketley::http::if_range_holds(if_range, conn->file_etag, -1))
+            rng = http_range{};
         if (SOCKETLEY_UNLIKELY(rng.unsatisfiable))
         {
             close_tracked(ffd);
@@ -2112,7 +2122,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         // views into conn->partial and the erase below is what they point at.
         // The size is not known yet either, so the numbers are resolved in
         // serve_http once fstat has answered -- this only carries the text.
-        std::string range_hdr, if_none_match, accept_encoding;
+        std::string range_hdr, if_none_match, accept_encoding, if_range;
         for (const auto& [k, v] : req.headers)
         {
             const uint32_t h = fnv1a_lower(k);
@@ -2122,9 +2132,11 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
                 if_none_match.assign(v);
             else if (h == fnv1a("accept-encoding") && m_http_compress)
                 accept_encoding.assign(v);
+            else if (h == fnv1a("if-range"))
+                if_range.assign(v);
         }
         conn->partial.erase(0, total_consumed);
-        serve_http(conn, path_str, range_hdr, if_none_match, accept_encoding);
+        serve_http(conn, path_str, range_hdr, if_none_match, accept_encoding, if_range);
     }
     else
     {

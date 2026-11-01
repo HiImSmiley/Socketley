@@ -553,7 +553,7 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_
     {
         // A range of a file that has changed since the client's copy is no part of that copy (13.1.5).
         const std::string_view if_range = field_of(h, "if-range");
-        if (if_range.empty() || if_range == "\"" + etag + "\"" || if_range == modified)
+        if (socketley::http::if_range_holds(if_range, etag, mtime))
         {
             const http_range r = http_parse_range(range, static_cast<size_t>(size));
             if (r.unsatisfiable)

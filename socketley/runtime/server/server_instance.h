@@ -1073,7 +1073,7 @@ private:
 
     void serve_http(server_connection* conn, const std::string& path,
                     std::string_view range_hdr = {}, std::string_view if_none_match = {},
-                    std::string_view accept_encoding = {});
+                    std::string_view accept_encoding = {}, std::string_view if_range = {});
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
     // `ends_exchange` false when bytes still follow or a refusal owns the teardown.
     void queue_http_response(server_connection* conn, std::shared_ptr<const std::string> resp,

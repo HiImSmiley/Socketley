@@ -88,6 +88,17 @@ struct conditions
     std::string_view if_modified_since;
 };
 
+// Whether a Range may be answered as asked (RFC 9110 13.1.5): no If-Range, or one naming this copy by its strong ETag
+// or by a Last-Modified date the answer gave (`mtime_s` below zero when none was given); otherwise the whole file.
+inline bool if_range_holds(std::string_view if_range, std::string_view etag, int64_t mtime_s)
+{
+    if (if_range.empty())
+        return true;
+    if (if_range.size() == etag.size() + 2 && if_range.front() == '"' && if_range.back() == '"')
+        return if_range.substr(1, etag.size()) == etag;
+    return mtime_s >= 0 && if_range.front() != 'W' && if_range.front() != '"' && parse_http_date(if_range) == mtime_s;
+}
+
 // RFC 9110 13.2.2 in the order it fixes: If-Match, If-Unmodified-Since, If-None-Match, If-Modified-Since.
 inline precondition evaluate(const conditions& c, std::string_view etag, int64_t mtime_s)
 {
