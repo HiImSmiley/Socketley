@@ -276,9 +276,14 @@ struct alignas(64) proxy_client_connection
     // that ends it or by any other completion that ends it first.  The backend
     // half of this is proxy_backend_connection::recv_withdrawing.
     bool recv_withdrawing{false};
+    // This side's reads go by splice, its bytes through a pipe to the peer's socket and never into memory here.
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
+    // Reads in a row that filled the buffer, which turns this side over to splice, and once it splices, splices in a
+    // row that would not have, which turns it back.
+    uint8_t full_reads{0};
+    bool splice_small{false};
     // Our FIN is out, sent before the armed read comes back so the client is not the one to close.
     bool wr_shutdown{false};
     uint32_t write_batch_count{0};
@@ -454,9 +459,12 @@ struct alignas(64) proxy_backend_connection
     uint8_t drained_reads{0};
     // Sends refused for memory in a row, which sets how long the next one waits.
     uint8_t send_retries{0};
+    // As on the client side: this side's reads go by splice, and what turns them over and back.
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
+    uint8_t full_reads{0};
+    bool splice_small{false};
     // The response is finished and this connection is on its way to the pool
     // with a cancelled read still owed, so nothing may touch the fd until that
     // completion lands.
@@ -1029,11 +1037,18 @@ private:
     void finish_pool_drain(proxy_backend_connection* bconn,
                            struct io_uring_cqe* cqe, io_request* req);
     void setup_splice_pipes(proxy_client_connection* conn, proxy_backend_connection* bconn);
-    void start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn);
+    // False when arming a side failed and the pair was closed.
+    bool start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn);
     // Waits for the socket end of a splice pipeline to have something before
     // letting the splice in, because arming it directly costs a kernel thread
     // per idle connection.
     bool arm_splice_in_poll(int src_fd, io_request* req);
+    // A splice made here, on the loop, and its completion handled at once.
+    bool splice_now(int in, int out, uint32_t len, io_request* req);
+    void close_splice_pipe(int (&p)[2]);
+    bool splice_eligible(const proxy_client_connection* conn, const proxy_backend_connection* bconn);
+    // One side of a pair turned over to splice once its reads show a stream.
+    void splice_side_on(proxy_client_connection* conn, proxy_backend_connection* bconn, bool client_side);
 
     // Both take the endpoint as well as the index, and `want_tls` is part of
     // the key rather than a preference, because an encrypted socket handed a
@@ -1585,10 +1600,14 @@ private:
     // Consecutive draining reads after which a TCP relay's connection is armed
     // multishot below that count, see earned_multishot().
     static constexpr uint8_t MULTISHOT_DRAINED_READS = 8;
+    // Reads in a row that filled the buffer after which a TCP relay's side splices instead of copying, and splices in
+    // a row that would not have after which it copies again.
+    static constexpr uint8_t splice_after_full_reads = 4;
     // The kernel can do IORING_OP_SPLICE, which says nothing about whether
     // this proxy uses it.
     bool m_splice_supported{false};
-    // And it is switched on for this instance, off by default.
+    // SOCKETLEY_PROXY_SPLICE: a pair splices from its first byte and stays so, where otherwise a side splices only
+    // while it streams.
     bool m_splice_enabled{false};
 
     // Connection pool for backend reuse (avoids connect() per request)

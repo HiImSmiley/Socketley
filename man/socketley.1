@@ -467,10 +467,10 @@ A pair enters only when both ends are in the map before its first byte, and a
 socket that sent a byte by TCP stays on TCP for its lifetime, so no byte
 overtakes another. A client sending TCP Fast Open data stays on TCP.
 .IP \(bu 2
-The proxy's
-.B SOCKETLEY_PROXY_SPLICE
-path reads a queue a socket on the shortcut does not fill, so a proxied pair
-with a 127.0.0.1 leg stays on the copy path while it is on.
+A
+.B \-\-protocol tcp
+proxy's splice reads a queue a socket on the shortcut does not fill, so a
+proxied pair with a 127.0.0.1 leg stays on the copy path.
 .IP \(bu 2
 Under
 .B own
@@ -20171,38 +20171,45 @@ ruling the cache out when diagnosing something else.
 Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_PROXY_SPLICE
-Forward
+A
 .B \-\-protocol tcp
-proxy traffic with
-.BR splice (2)
-through io_uring instead of copying it through userspace. Unset (off) by
-default; any value other than
+proxy splices a pair from its first byte to its last, instead of only while a
+side streams. Unset by default; any value other than
 .B 0
 turns it on. Read once per process and inherited by worker processes.
 .IP
-Off because it is slower here, and not by a little.
-.B IORING_OP_SPLICE
-is prepped
-.B REQ_F_FORCE_ASYNC
-in the kernel, so every splice is handed to an io\-wq worker thread \(em a cost
-per transfer that no way of submitting it avoids. Measured on loopback, one
-connection, serial round trips through a proxy in front of an echoing backend,
-round\-trip p50: 47.9\ \(mcs spliced against 26.3\ \(mcs copied at 128 B, 57.3
-against 38.4 at 16 KB, and 394.5 against 350.5 at 256 KB. The copy path wins at
-every size measured. It also costs a third less CPU \(em 0.53 cores against
-0.86 at 128 B, which is 2.9 times the CPU per request for splice.
+Without it each side of a pair decides for itself. It copies through a buffer
+until four reads in a row have filled it \(em a stream \(em and then moves its
+bytes with
+.BR splice (2)
+through a pipe, called on the event loop with both sockets non\-blocking for
+the call, never through io_uring, whose splice is an io\-wq hand\-off per
+transfer. Four splices in a row that would not have filled the buffer are
+messages, and the side goes back to copying and gives its pipe back. Each
+switch waits until nothing of the other path is in flight or queued, so no byte
+overtakes another. One core, loopback, through the proxy:
 .IP
-It is kept because what was measured is one machine and one shape of traffic.
-Zero copy is a claim about memory bandwidth; the case it could still win is
-bulk streaming across a real NIC on a box with less of it, and nobody has
-measured that. A TLS listener or TLS backend never splices whatever this is set
-to, nor does a pair with a 127.0.0.1 leg while the daemon runs with
+.nf
+                        copy             adaptive         from the first byte
+4 GB stream             3.4\-4.2 GB/s     9.3\-9.9 GB/s     10.1 GB/s
+  CPU per GB            0.24\-0.30 s      0.08\-0.11 s      0.08\-0.10 s
+64 B messages, 32 conns 6.95 us           6.86 us          10.36 us
+4 KB messages           7.41 us           7.37 us          9.28 us
+.fi
+.IP
+So the variable is for measuring, not for speed. A TLS listener or TLS backend
+never splices, nor does a pair with a 127.0.0.1 leg while the daemon runs with
 .BR \-\-fast\-lo ,
-and neither does a proxy with an
+a proxy with an
 .B on_proxy_request
 or
 .B on_proxy_response
-hook \(em the kernel moves those bytes without the script ever seeing them.
+hook \(em the kernel moves those bytes without the script ever seeing them \(em
+or one with a
+.B \-\-rate\-limit
+or
+.BR \-\-global\-rate\-limit ,
+charged per read.
 .TP
 .B SOCKETLEY_FAST_LO
 Set by a daemon started with

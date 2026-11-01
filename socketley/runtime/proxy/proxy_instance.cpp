@@ -153,11 +153,8 @@ static inline bool retry_safe_method(std::string_view method, bool retry_all)
            method == "DELETE" || method == "OPTIONS";
 }
 
-// Splice is off unless SOCKETLEY_PROXY_SPLICE says otherwise, because
-// IORING_OP_SPLICE is prepped REQ_F_FORCE_ASYNC and costs a thread hand-off
-// per transfer -- the copy path measured 1.79x the rate at 128 B and still
-// 1.14x at 256 KB, at a third of the CPU -- and the code stays because bulk
-// streaming across a real NIC was never measured here.
+// SOCKETLEY_PROXY_SPLICE splices a pair from its first byte; without it a side splices only while its reads fill the
+// buffer, because a message costs a splice more than a copy and a stream costs it less.
 static bool splice_opt_in()
 {
     static const bool on = [] {
@@ -304,6 +301,8 @@ void proxy_client_connection::reset(int new_fd)
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
+    full_reads = 0;
+    splice_small = false;
     wr_shutdown = false;
     drained_reads = 0;
     write_batch_count = 0;
@@ -375,6 +374,8 @@ void proxy_backend_connection::reset(int new_fd)
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
+    full_reads = 0;
+    splice_small = false;
     pool_draining = false;
     recv_withdrawing = false;
     sent_to_client = false;
@@ -2098,7 +2099,7 @@ bool proxy_instance::setup(event_loop& loop)
             io_uring_free_probe(probe);
         }
     }
-    m_splice_enabled = m_splice_supported && splice_opt_in();
+    m_splice_enabled = splice_opt_in();
 
     // Pre-build prefix once to avoid per-request allocation; a proxy with
     // --domain is reached by its name instead, and passes the path on as it came.
@@ -3693,6 +3694,16 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         if (is_provided && !lent)
             m_loop->return_buf(BUF_GROUP_ID, buf_id);
 
+        // Four reads in a row that filled the buffer are a stream, and this side is turned over to splice; the
+        // read in hand has gone to the backend's queue, and the splice starts once that has been taken.
+        if (!m_splice_enabled && !multishot_more && !conn->splice_active && !conn->closing)
+        {
+            conn->full_reads = data_len >= PROXY_READ_BUF_SIZE ? static_cast<uint8_t>(conn->full_reads + 1) : 0;
+            if (conn->full_reads >= splice_after_full_reads && conn->ex.backend_fd >= 0 &&
+                conn->ex.backend_fd < MAX_FDS && m_conn_idx[conn->ex.backend_fd].side == conn_backend)
+                splice_side_on(conn, m_conn_idx[conn->ex.backend_fd].backend, true);
+        }
+
         if (SOCKETLEY_LIKELY(!conn->closing) && conn->splice_active &&
             conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS)
         {
@@ -4621,9 +4632,28 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         }
     }
 
+    // The client leg's rule on this one: a stream turns it over to splice, which starts once the client has taken
+    // what is queued for it.
+    if (m_protocol == protocol_tcp && !m_splice_enabled && !multishot_more && !conn->splice_active &&
+        !conn->closing && conn->client_fd >= 0 && conn->client_fd < MAX_FDS &&
+        m_conn_idx[conn->client_fd].side == conn_client)
+    {
+        conn->full_reads = data_len >= PROXY_READ_BUF_SIZE ? static_cast<uint8_t>(conn->full_reads + 1) : 0;
+        if (conn->full_reads >= splice_after_full_reads)
+        {
+            auto* cconn = m_conn_idx[conn->client_fd].client;
+            splice_side_on(cconn, conn, false);
+            if (conn->splice_active && !conn->read_pending)
+            {
+                start_splice_forwarding(cconn, conn);
+                return;
+            }
+        }
+    }
+
     if (SOCKETLEY_LIKELY(!conn->closing))
     {
-        if (!conn->read_pending)
+        if (!conn->read_pending && !conn->splice_active)
         {
             // Backpressure: pause backend reads while the client write queue
             // fills, and handle_client_write resumes them when it drains.
@@ -4634,7 +4664,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                     return;
                 }
         }
-        else
+        else if (conn->read_pending)
             decline_armed_read(conn);
     }
     else if (!conn->write_pending)
@@ -7127,49 +7157,67 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     return true;  // connect_pending = true — caller must check
 }
 
+// Whether a pair's bytes may skip this process: not with a TLS session on either leg, whose record layer never sees
+// a splice; not a stream's connection, framed onto its parent; not to an application server, whose records are
+// translated; not on the loopback shortcut, whose queue splice does not read; and not where a script or a rate
+// limit has to see each read.
+bool proxy_instance::splice_eligible(const proxy_client_connection* conn, const proxy_backend_connection* bconn)
+{
+    if (m_protocol != protocol_tcp || conn->ssl != nullptr || bconn->ssl != nullptr || conn->h2_parent != nullptr ||
+        conn->h3s != nullptr || m_fastcgi || conn->rl_max > 0 || get_global_rate_limit() > 0.0 ||
+        on_fast_lo(conn->fd, bconn->fd))
+        return false;
+#ifndef SOCKETLEY_NO_LUA
+    if (auto* lctx = lua(); lctx && (lctx->has_on_proxy_request() || lctx->has_on_proxy_response()))
+        return false;
+#endif
+    return true;
+}
+
+// A pipe for one side's splice, O_CLOEXEC so a worker forked mid-transfer does not hold it.
+static bool open_splice_pipe(int (&p)[2])
+{
+    if (p[0] >= 0)
+        return true;
+    if (pipe2(p, O_NONBLOCK | O_CLOEXEC) < 0)
+    {
+        p[0] = p[1] = -1;
+        return false;
+    }
+    if (fcntl(p[0], F_SETPIPE_SZ, SPLICE_PIPE_SIZE) < 0) {}
+    return true;
+}
+
+// And given back, empty, when its side goes back to copying.
+void proxy_instance::close_splice_pipe(int (&p)[2])
+{
+    for (int& end : p)
+        if (end >= 0)
+        {
+            close_tracked(end);
+            end = -1;
+        }
+}
+
 void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_backend_connection* bconn)
 {
-    // Never on a connection with a TLS session on either leg, because a splice
-    // moves bytes the record layer never sees -- guarded here rather than at
-    // the three call sites, since leaving splice_active false is all it takes.
-    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr || bconn->ssl != nullptr))
+    if (!splice_eligible(conn, bconn) || !open_splice_pipe(conn->pipe_to_backend) ||
+        !open_splice_pipe(bconn->pipe_to_client))
         return;
-    // Nor on a stream's connection, whose bytes are framed onto its parent rather than written to a descriptor --
-    // guarded here for the same reason as the line above, since leaving splice_active false is all it takes.
-    if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr || conn->h3s != nullptr))
-        return;
-    // Nor to an application server, whose records are translated and never relayed as they come.
-    if (SOCKETLEY_UNLIKELY(m_fastcgi))
-        return;
-    if (on_fast_lo(conn->fd, bconn->fd))
-        return;
-
-    // O_CLOEXEC on both pipe pairs, because a worker forked mid-transfer would
-    // inherit four descriptors per connection in flight and hold them until it
-    // exits.
-    if (pipe2(conn->pipe_to_backend, O_NONBLOCK | O_CLOEXEC) < 0)
-        return;
-
-    // Create pipe for backend -> client direction
-    if (pipe2(bconn->pipe_to_client, O_NONBLOCK | O_CLOEXEC) < 0)
-    {
-        close_tracked(conn->pipe_to_backend[0]);
-        close_tracked(conn->pipe_to_backend[1]);
-        conn->pipe_to_backend[0] = -1;
-        conn->pipe_to_backend[1] = -1;
-        return;
-    }
-
-    // Increase pipe buffer sizes for throughput
-    if (fcntl(conn->pipe_to_backend[0], F_SETPIPE_SZ, SPLICE_PIPE_SIZE) < 0) {}
-    if (fcntl(bconn->pipe_to_client[0], F_SETPIPE_SZ, SPLICE_PIPE_SIZE) < 0) {}
-
     conn->splice_active = true;
     bconn->splice_active = true;
 #ifdef SOCKETLEY_TRACE
     conn->tr.splice_cqe_ms  = ::skl_trace::now_ms();
     bconn->tr.splice_cqe_ms = ::skl_trace::now_ms();
 #endif
+}
+
+void proxy_instance::splice_side_on(proxy_client_connection* conn, proxy_backend_connection* bconn, bool client_side)
+{
+    if (!splice_eligible(conn, bconn) || !open_splice_pipe(client_side ? conn->pipe_to_backend : bconn->pipe_to_client))
+        return;
+    (client_side ? conn->splice_active : bconn->splice_active) = true;
+    (client_side ? conn->full_reads : bconn->full_reads) = 0;
 }
 
 // The socket half is a poll and not the splice, because io_uring runs every
@@ -7184,38 +7232,72 @@ bool proxy_instance::arm_splice_in_poll(int src_fd, io_request* req)
     return m_loop->submit_poll_add(src_fd, POLLIN, req);
 }
 
-void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn)
+// Each side's splice starts once nothing of the copy path is ahead of it: no read of its own in flight, whose bytes
+// the splice would overtake, and nothing queued for the socket it splices into.
+bool proxy_instance::start_splice_forwarding(proxy_client_connection* conn, proxy_backend_connection* bconn)
 {
-    if (!m_loop || !conn->splice_active || !bconn->splice_active)
-        return;
-
-    // Not while a userspace read is in flight, because two independent writers
-    // put later data ahead of earlier -- and never once the client has
-    // reported end of stream, stated here because all four call sites can
-    // reach it with client_eof set.
-    if (!conn->splice_in_pending && !conn->read_pending && !conn->client_eof)
+    if (!m_loop)
+        return true;
+    if (conn->splice_active && !conn->splice_in_pending && !conn->splice_out_pending && !conn->read_pending &&
+        !conn->client_eof && !conn->closing && bconn->write_queue.empty() && !bconn->write_pending)
     {
         conn->splice_in_pending = true;
         if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
         {
             conn->splice_in_pending = false;
             close_pair(conn->fd, conn->ex.backend_fd);
-            return;
+            return false;
         }
     }
-
-    // Backend -> pipe_write (first leg of backend -> client), which a backend
-    // at end of stream has no more of.
-    if (!bconn->splice_in_pending && !bconn->backend_eof)
+    if (bconn->splice_active && !bconn->splice_in_pending && !bconn->splice_out_pending && !bconn->read_pending &&
+        !bconn->backend_eof && !bconn->closing && conn->write_queue.empty() && !conn->write_pending)
     {
         bconn->splice_in_pending = true;
         if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(bconn->fd, &bconn->splice_in_req)))
         {
             bconn->splice_in_pending = false;
             close_pair(bconn->client_fd, bconn->fd);
-            return;
+            return false;
         }
     }
+    return true;
+}
+
+// io_uring runs a splice on an io-wq worker, a hand-off per transfer that cost more than the copy it saves; made here
+// it is a call.  Both ends are non-blocking for the call: a blocking socket would hold the loop in tcp_splice_read, and
+// answers 0 there for an empty queue it would otherwise wait on, which reads as the peer's end of stream.
+static bool nonblocking_for_call(int fd, int& flags)
+{
+    flags = ::fcntl(fd, F_GETFL);
+    return flags >= 0 && !(flags & O_NONBLOCK) && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+bool proxy_instance::splice_now(int in, int out, uint32_t len, io_request* req)
+{
+    int in_flags = 0, out_flags = 0;
+    const bool in_toggled = nonblocking_for_call(in, in_flags);
+    const bool out_toggled = nonblocking_for_call(out, out_flags);
+    ssize_t moved = 0;
+    int err = 0;
+    while (static_cast<size_t>(moved) < len)
+    {
+        const ssize_t r = ::splice(in, nullptr, out, nullptr, len - static_cast<size_t>(moved),
+                                   SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
+        if (r > 0)
+        {
+            moved += r;
+            continue;
+        }
+        if (r < 0)
+            err = errno;
+        break;
+    }
+    if (in_toggled && ::fcntl(in, F_SETFL, in_flags) < 0) {}
+    if (out_toggled && ::fcntl(out, F_SETFL, out_flags) < 0) {}
+    struct io_uring_cqe done{};
+    done.res = moved > 0 ? static_cast<int32_t>(moved) : (err != 0 ? -err : 0);
+    handle_splice(&done, req);
+    return true;
 }
 
 void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
@@ -7242,8 +7324,8 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 conn->splice_out_req.type = op_splice;
                 if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing || conn->ex.backend_fd < 0 ||
                                        conn->pipe_to_backend[0] < 0 ||
-                                       !m_loop->submit_splice(conn->pipe_to_backend[0], conn->ex.backend_fd,
-                                                              PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
+                                       !splice_now(conn->pipe_to_backend[0], conn->ex.backend_fd, SPLICE_PIPE_SIZE,
+                                                  &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
                     close_pair(conn->fd, conn->ex.backend_fd);
@@ -7255,9 +7337,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             conn->splice_in_req.type = op_splice;
             if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing ||
                                    conn->pipe_to_backend[1] < 0 ||
-                                   !m_loop->submit_splice(conn->fd, conn->pipe_to_backend[1],
-                                                          PROXY_READ_BUF_SIZE,
-                                                          &conn->splice_in_req)))
+                                   !splice_now(conn->fd, conn->pipe_to_backend[1], SPLICE_PIPE_SIZE, &conn->splice_in_req)))
             {
                 conn->splice_in_pending = false;
                 close_pair(conn->fd, conn->ex.backend_fd);
@@ -7272,8 +7352,8 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 conn->splice_out_req.type = op_splice;
                 if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing || conn->client_fd < 0 ||
                                        conn->pipe_to_client[0] < 0 ||
-                                       !m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
-                                                              PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
+                                       !splice_now(conn->pipe_to_client[0], conn->client_fd, SPLICE_PIPE_SIZE,
+                                                  &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
                     close_pair(conn->client_fd, conn->fd);
@@ -7285,9 +7365,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             conn->splice_in_req.type = op_splice;
             if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing ||
                                    conn->pipe_to_client[1] < 0 ||
-                                   !m_loop->submit_splice(conn->fd, conn->pipe_to_client[1],
-                                                          PROXY_READ_BUF_SIZE,
-                                                          &conn->splice_in_req)))
+                                   !splice_now(conn->fd, conn->pipe_to_client[1], SPLICE_PIPE_SIZE, &conn->splice_in_req)))
             {
                 conn->splice_in_pending = false;
                 close_pair(conn->client_fd, conn->fd);
@@ -7307,6 +7385,20 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             SKL_TRACE_SET(conn, last_splice_res, cqe->res);
             SKL_TRACE_SET(conn, splice_leg, entry.side == conn_client ? 1u : 3u);
             if (cqe->res > 0) { SKL_TRACE_ADD(conn, spliced, (unsigned long long)cqe->res); SKL_TRACE_ADD(conn, sp_in, (unsigned long long)cqe->res); }
+            if (cqe->res > 0)
+            {
+                // Counted and timed as a read of the copy path is; four in a row that would not have filled a copy's
+                // buffer are messages, not a stream.
+                stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
+                stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
+                stat_add(m_stat_total_messages, 1);
+                if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
+                    conn->last_activity = std::chrono::steady_clock::now();
+                conn->full_reads = cqe->res < static_cast<int>(PROXY_READ_BUF_SIZE)
+                                       ? static_cast<uint8_t>(conn->full_reads < 255 ? conn->full_reads + 1 : 255)
+                                       : 0;
+                conn->splice_small = conn->full_reads >= splice_after_full_reads;
+            }
 
             if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
             {
@@ -7340,7 +7432,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (conn->ex.backend_fd >= 0)
             {
                 conn->splice_out_pending = true;
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->ex.backend_fd,
+                if (SOCKETLEY_UNLIKELY(!splice_now(conn->pipe_to_backend[0], conn->ex.backend_fd,
                                       static_cast<uint32_t>(cqe->res), &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
@@ -7393,7 +7485,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (pipe_left > 0 && conn->ex.backend_fd >= 0)
             {
                 conn->splice_out_pending = true;
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->ex.backend_fd,
+                if (SOCKETLEY_UNLIKELY(!splice_now(conn->pipe_to_backend[0], conn->ex.backend_fd,
                                       static_cast<uint32_t>(pipe_left), &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
@@ -7427,6 +7519,18 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 return;
             }
 
+            // A message rather than a stream goes back to the copy path, which costs it less; nothing is in the pipe
+            // or in flight on this side now, so nothing can be overtaken.
+            if (SOCKETLEY_LIKELY(!conn->closing) && !m_splice_enabled && conn->splice_small)
+            {
+                conn->splice_active = false;
+                conn->full_reads = 0;
+                close_splice_pipe(conn->pipe_to_backend);
+                if (!conn->read_pending && client_read_armable(conn) && !backend_backpressured(conn) &&
+                    SOCKETLEY_UNLIKELY(!arm_read(conn->fd, conn)))
+                    close_pair(conn->fd, conn->ex.backend_fd);
+                return;
+            }
             // Re-arm the inbound leg through readiness, because the connection
             // is quiet again and that is exactly the state a splice must not
             // be left parked in.
@@ -7456,6 +7560,18 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             SKL_TRACE_SET(conn, last_splice_res, cqe->res);
             SKL_TRACE_SET(conn, splice_leg, entry.side == conn_client ? 1u : 3u);
             if (cqe->res > 0) { SKL_TRACE_ADD(conn, spliced, (unsigned long long)cqe->res); SKL_TRACE_ADD(conn, sp_in, (unsigned long long)cqe->res); }
+            if (cqe->res > 0)
+            {
+                // As on the client leg, and the client's clock is the one an idle sweep reads.
+                stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
+                if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0) && conn->client_fd >= 0 && conn->client_fd < MAX_FDS &&
+                    m_conn_idx[conn->client_fd].side == conn_client)
+                    m_conn_idx[conn->client_fd].client->last_activity = std::chrono::steady_clock::now();
+                conn->full_reads = cqe->res < static_cast<int>(PROXY_READ_BUF_SIZE)
+                                       ? static_cast<uint8_t>(conn->full_reads < 255 ? conn->full_reads + 1 : 255)
+                                       : 0;
+                conn->splice_small = conn->full_reads >= splice_after_full_reads;
+            }
 
             if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
             {
@@ -7494,7 +7610,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 m_conn_idx[conn->client_fd].client->ex.backend_fd == conn->fd)
             {
                 conn->splice_out_pending = true;
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
+                if (SOCKETLEY_UNLIKELY(!splice_now(conn->pipe_to_client[0], conn->client_fd,
                                       static_cast<uint32_t>(cqe->res), &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
@@ -7546,7 +7662,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (pipe_left > 0 && conn->client_fd >= 0)
             {
                 conn->splice_out_pending = true;
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
+                if (SOCKETLEY_UNLIKELY(!splice_now(conn->pipe_to_client[0], conn->client_fd,
                                       static_cast<uint32_t>(pipe_left), &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
@@ -7556,6 +7672,17 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 return;
             }
 
+            // As on the client leg: a message goes back to the copy path.
+            if (SOCKETLEY_LIKELY(!conn->closing) && !m_splice_enabled && conn->splice_small)
+            {
+                conn->splice_active = false;
+                conn->full_reads = 0;
+                close_splice_pipe(conn->pipe_to_client);
+                if (!conn->read_pending && backend_read_armable(conn) && !client_backpressured(conn) &&
+                    SOCKETLEY_UNLIKELY(!arm_read(conn->fd, conn)))
+                    close_pair(conn->client_fd, conn->fd);
+                return;
+            }
             // Re-arm the inbound leg (backend -> pipe), on readiness for the
             // reason given above: the exchange is over and this socket is quiet
             // until the next request comes down the other side.
@@ -11196,6 +11323,16 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
     if (SOCKETLEY_UNLIKELY(conn->file != nullptr))
         fcgi_file_next(conn);
 
+    // The backend's side waits for this queue as the client's waits for the backend's, see handle_backend_write.
+    if (conn->write_queue.empty() && !conn->write_pending && conn->ex.backend_fd >= 0 &&
+        conn->ex.backend_fd < MAX_FDS && m_conn_idx[conn->ex.backend_fd].side == conn_backend &&
+        m_conn_idx[conn->ex.backend_fd].backend->client_fd == fd &&
+        (conn->splice_active || m_conn_idx[conn->ex.backend_fd].backend->splice_active))
+    {
+        if (!start_splice_forwarding(conn, m_conn_idx[conn->ex.backend_fd].backend))
+            return;
+    }
+
     // Backpressure resume: if client write queue drained below threshold, restart backend reads
     if (conn->write_queue.bytes() < write_watermark_bytes() &&
         conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS)
@@ -11318,13 +11455,12 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     // Splice was held back while queued bytes were still on their way to this
     // socket; now that the queue has drained it is safe to let the kernel take
     // over without anything overtaking what came before.
-    if (conn->write_queue.empty() && !conn->write_pending && !conn->splice_in_pending &&
-        conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+    if (conn->write_queue.empty() && !conn->write_pending && conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& se = m_conn_idx[conn->client_fd];
-        if (se.side == conn_client && se.client->splice_active && conn->splice_active &&
-            !se.client->client_eof)
-            start_splice_forwarding(se.client, conn);
+        if (se.side == conn_client && se.client->ex.backend_fd == fd && (se.client->splice_active || conn->splice_active))
+            if (!start_splice_forwarding(se.client, conn))
+                return;
     }
 
     // The client's half-close, held back for exactly the same reason and let go
