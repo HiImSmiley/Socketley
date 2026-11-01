@@ -3,14 +3,14 @@
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
-# handle_file_read() will not splice a file it may keep, because keeping it
+# handle_file_read() will not sendfile a file it may keep, because keeping it
 # needs the bytes in user space.  So the per-file cap on the revalidation map is
 # also the size at which a plaintext download stops being copied and starts
-# being spliced, and the two are one decision.  Measured at 64 concurrent, a
-# 1 MiB file is 5,931 responses a second kept against 14,049 spliced, which is
-# why the cap for a connection that CAN splice is 256 KiB and not 1 MiB.
+# going by sendfile, and the two are one decision: the cap for a connection that
+# CAN sendfile is 64 KiB, where sendfile from the page cache starts costing less
+# than the copy.
 #
-# A TLS connection cannot splice at all -- that would hand the peer plaintext in
+# A TLS connection cannot sendfile at all -- that would hand the peer plaintext in
 # the middle of an encrypted stream -- and an injected .html is read for the same
 # reason it is injected.  For those two the cap stays at 1 MiB, because there the
 # map is the only thing standing between a large file and one allocation of its
@@ -32,18 +32,17 @@
 # reported at both doors now, and the count of it is asserted here -- once per
 # runtime that fills, never for one that keeps nothing.
 #
-#   * 300 KiB over plaintext must NOT fill the map.  This is the assertion that
-#     fails on the build before this one, where the cap was 1 MiB for everybody.
-#   * 200 KiB over plaintext MUST fill it, so a cap set to zero -- or a map
+#   * 100 KiB over plaintext must NOT fill the map: above the cap.
+#   * 48 KiB over plaintext MUST fill it, so a cap set to zero -- or a map
 #     switched off -- is not mistaken for the line above.
-#   * 300 KiB over TLS MUST fill it.  This is the one that catches the predicate
+#   * 100 KiB over TLS MUST fill it.  This is the one that catches the predicate
 #     being written the wrong way round, which would put a TLS listener on one
 #     allocation the size of the file per request, unbounded by concurrency.
 #   * the line itself, so the report that exists for an operator is known to
 #     reach them: nothing from the arm that keeps nothing, one from each arm
 #     that fills.
 #   * the bytes, before any of the above means anything, on both listeners and
-#     across a replacement -- a file that is now spliced at this size must still
+#     across a replacement -- a file that now goes by sendfile at this size must still
 #     be served whole and must still be the file that is on disk now.
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -60,7 +59,7 @@ trap 'rc=$?; echo "  ABORTED at line $LINENO (exit $rc): ${BASH_COMMAND}"; exit 
 pass(){ TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; for l in "${@:3}"; do echo "        $l"; done; }
 
-echo "=== Integration: the revalidation cap depends on whether the connection can splice ==="
+echo "=== Integration: the revalidation cap depends on whether the connection can sendfile ==="
 
 if ! command -v openssl >/dev/null 2>&1; then
     echo "  SKIP: openssl CLI not available (needed for the TLS arm)"
@@ -73,10 +72,10 @@ BIG="$WORK/big"; SMALL="$WORK/small"
 mkdir -p "$BIG" "$SMALL"
 
 # Sized from what an entry actually costs: both finished responses, so about
-# twice the file.  130 files of 300 KiB is ~78 MiB of entries and 200 of
-# 200 KiB is ~82 MiB, each comfortably past the 64 MiB total.
-BIG_N=130;   BIG_KB=300
-SMALL_N=200; SMALL_KB=200
+# twice the file.  400 files of 100 KiB is ~80 MiB of entries and 800 of
+# 48 KiB is ~77 MiB, each comfortably past the 64 MiB total.
+BIG_N=400;   BIG_KB=100
+SMALL_N=800; SMALL_KB=48
 for i in $(seq 1 $BIG_N);   do head -c $((BIG_KB*1024))   /dev/zero | tr '\0' 'b' > "$BIG/b$i.bin"; done
 for i in $(seq 1 $SMALL_N); do head -c $((SMALL_KB*1024)) /dev/zero | tr '\0' 's' > "$SMALL/s$i.bin"; done
 
@@ -135,7 +134,7 @@ if cmp -s "$BIG/b1.bin" "$WORK/got_plain" && cmp -s "$BIG/b1.bin" "$WORK/got_tls
 else fail "a ${BIG_KB} KiB file is served whole on both listeners" \
           "plain $(wc -c < "$WORK/got_plain" 2>/dev/null || echo 0) bytes, TLS $(wc -c < "$WORK/got_tls" 2>/dev/null || echo 0), file $((BIG_KB*1024))"; fi
 
-# ── 1. and it is still the file that is on disk NOW, on the spliced path ────
+# ── 1. and it is still the file that is on disk NOW, on the sendfile path ───
 printf 'REPLACED' >> "$BIG/b1.bin"
 curl -s -m 20 "http://127.0.0.1:$((P+1))/b1.bin" -o "$WORK/got2" 2>/dev/null || true
 if cmp -s "$BIG/b1.bin" "$WORK/got2"; then pass
@@ -150,7 +149,7 @@ if [ -z "${W_BIG:-}" ] || [ -z "${W_SMALL:-}" ] || [ -z "${W_TLS:-}" ]; then
     exit 2
 fi
 
-# ── 2. 300 KiB over plaintext must keep nothing ─────────────────────────────
+# ── 2. 100 KiB over plaintext must keep nothing ─────────────────────────────
 L0=$(full_lines)
 A=$(rss_mb "$W_BIG")
 SERVED=$(walk "http://127.0.0.1:$((P+1))" b "$BIG_N")
@@ -161,13 +160,13 @@ if [ "$SERVED" != "$BIG_N" ] || ! kill -0 "$W_BIG" 2>/dev/null; then
     fail "${BIG_KB} KiB over plaintext is served before it is judged" \
          "$SERVED of $BIG_N files came back 200, worker $W_BIG $(kill -0 "$W_BIG" 2>/dev/null && echo alive || echo gone)"
 elif ! over "$G_BIG" 16; then pass
-else fail "${BIG_KB} KiB over plaintext is spliced, not kept" \
+else fail "${BIG_KB} KiB over plaintext is sent by sendfile, not kept" \
           "the worker retained ${G_BIG} MB after $BIG_N files of $BIG_KB KiB, and the map's" \
           "own limit is 64 MB -- so these were copied into memory and kept, on a" \
-          "connection that could have spliced them from the page cache instead"; fi
+          "connection that could have sent them from the page cache instead"; fi
 
 L1=$(full_lines)
-# ── 3. 200 KiB over plaintext must still be kept ───────────────────────────
+# ── 3. 48 KiB over plaintext must still be kept ────────────────────────────
 A=$(rss_mb "$W_SMALL")
 walk "http://127.0.0.1:$((P+2))" s "$SMALL_N" >/dev/null
 sleep 0.5
@@ -180,7 +179,7 @@ else fail "${SMALL_KB} KiB over plaintext is still kept" \
           "proves nothing"; fi
 
 L2=$(full_lines)
-# ── 4. 300 KiB over TLS must be kept: TLS has no splice arm ────────────────
+# ── 4. 100 KiB over TLS must be kept: TLS has no sendfile arm ──────────────
 A=$(rss_mb "$W_TLS")
 walk "https://127.0.0.1:$((P+3))" b "$BIG_N" -k >/dev/null
 sleep 0.5
@@ -188,7 +187,7 @@ G_TLS=$(grew "$A" "$(rss_mb "$W_TLS")")
 if over "$G_TLS" 32; then pass
 else fail "${BIG_KB} KiB over TLS is kept" \
           "the TLS worker retained only ${G_TLS} MB over $BIG_N files of $BIG_KB KiB." \
-          "TLS cannot splice, so a listener that keeps none of them answers every" \
+          "TLS cannot sendfile, so a listener that keeps none of them answers every" \
           "request with one allocation the size of the file, bounded by nothing" \
           "but how many the client asks for at once"; fi
 L3=$(full_lines)

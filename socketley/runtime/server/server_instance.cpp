@@ -1479,27 +1479,9 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             return;
         }
 
-        // Whether this miss may become a map entry, which needs the bytes in
-        // user space -- and the size it stops at depends on whether THIS
-        // connection has the splice arm at all, because a kept response is sent
-        // by COPYING it into the socket and the alternative sends the page cache
-        // by reference.  Measured at 64 concurrent: 1 MiB is 5,931 responses a
-        // second kept against 14,049 spliced, 512 KiB 11,977 against 26,599, and
-        // the other way round at 4 KiB, 146,987 kept against 66,905, where
-        // splice's own setup is the whole cost.  The 17.19 us against read's
-        // 0.72 that this comment used to cite is that small-transfer figure, and
-        // it was read as though it held at the cap.
-        // 256 KiB and not lower, because splice buys that throughput partly with
-        // CPU and the price falls with size: per MiB it is 340 us at 256 KiB,
-        // 163 at 1 MiB and 143 at 2 MiB, against a flat ~170 for the copy.  So
-        // above the cap the trade is free or better, at 512 KiB it is +31% CPU
-        // for +122% throughput, and at 256 KiB it would be +59% for +115% --
-        // a trade rather than a win, which is not what a default should make.
-        // A TLS connection and an injected .html have no splice arm, so for them
-        // the cap stays where it was: there the map is what keeps a file from
-        // being read, and allocated, once per request.
-        const size_t reval_cap = (!is_html && !conn->ssl) ? HTTP_REVAL_SPLICE_MAX_FILE
-                                                          : HTTP_REVAL_MAX_FILE;
+        // Kept as bytes up to the size where sendfile from the page cache costs less than copying them, which a TLS
+        // connection or an injected page cannot take.
+        const size_t reval_cap = (!is_html && !conn->ssl) ? HTTP_REVAL_SENDFILE_MAX_FILE : HTTP_REVAL_MAX_FILE;
         const bool reval_take = reval_ok && used_beneath &&
                                 fsize <= reval_cap &&
                                 m_http_reval_bytes < HTTP_REVAL_MAX_TOTAL;
@@ -1536,13 +1518,34 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                 conn->range_first = send_first;
                 conn->range_total = fsize;
 
-                // Send HTTP headers via normal write path; splice starts after headers are sent
-                queue_http_response(conn, std::make_shared<const std::string>(
-                    rng.usable
-                        ? build_http_206_headers(ct, rng.first, rng.last, fsize,
-                                                 conn->http_keep_alive, conn->file_etag)
-                        : build_http_headers_only(ct, fsize, conn->http_keep_alive, conn->file_etag)),
-                    /*ends_exchange=*/false);
+                std::string head = rng.usable
+                    ? build_http_206_headers(ct, rng.first, rng.last, fsize, conn->http_keep_alive, conn->file_etag)
+                    : build_http_headers_only(ct, fsize, conn->http_keep_alive, conn->file_etag);
+                // With nothing ahead of it the head goes at once, held for the file's first bytes, and the file
+                // follows in this turn rather than one write completion later; what the socket does not take is
+                // queued, and the file waits for it as before.
+                if (conn->write_queue.empty() && !conn->write_pending && conn->write_batch_count == 0 &&
+                    admit_send(conn, head.size(), true))
+                {
+                    const ssize_t n = socketley::file_send::send_head(conn->fd, head);
+                    if (n < 0)
+                    {
+                        conn->closing = true;
+                        splice_cleanup(conn);
+                        if (!conn_ops_pending(conn))
+                            close_conn(conn);
+                        return;
+                    }
+                    stat_add(m_stat_bytes_out, static_cast<uint64_t>(n));
+                    if (static_cast<size_t>(n) == head.size())
+                    {
+                        conn->splice_pending = false;
+                        sendfile_next(conn, true);
+                        return;
+                    }
+                    head.erase(0, static_cast<size_t>(n));
+                }
+                queue_http_response(conn, std::make_shared<const std::string>(std::move(head)), /*ends_exchange=*/false);
                 return;
             }
         }
@@ -6876,8 +6879,9 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
 }
 
 // sendfile in bursts from the loop; a window out of the page cache turns the rest of this answer over to the pipe arm,
-// from the offset reached, so the loop is never held on the disk.
-void server_instance::sendfile_next(server_connection* conn)
+// from the offset reached, so the loop is never held on the disk.  `inline_call`, from the request itself, ends the
+// exchange at once only when no pipelined request waits, which would otherwise be parsed from inside this one.
+void server_instance::sendfile_next(server_connection* conn, bool inline_call)
 {
     const auto fail = [&] {
         conn->closing = true;
@@ -6918,7 +6922,7 @@ void server_instance::sendfile_next(server_connection* conn)
         fail();
         return;
     }
-    if (b == socketley::file_send::burst::more)
+    if (b == socketley::file_send::burst::more || (inline_call && !conn->partial.empty()))
     {
         // Room on the socket, or the next turn when the burst ran out, says when to go on.
         conn->splice_out_req = { this, nullptr, conn->fd, 0, op_splice, conn->generation };

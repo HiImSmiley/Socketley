@@ -177,10 +177,8 @@ bool private_name(std::string_view rel)
 
 // The largest read of a served file, and so the most of it this proxy holds per connection above the write queue.
 constexpr uint32_t file_window = 256 * 1024;
-// Kept whole up to this size and this total, the server runtime's own figures: below it one write of bytes in memory
-// costs less than any splice, whose every operation is a hand-off to an io-wq worker (event_loop.h, at
-// submit_splice).
-constexpr uint64_t keep_max_file = 256 * 1024;
+// Kept whole up to this size and this total, below which one write from memory costs less than sendfile.
+constexpr uint64_t keep_max_file = 16 * 1024;
 constexpr size_t keep_max_total = 64u << 20;
 // Large files whose descriptors are kept open at once, a bound on the descriptors this costs.
 constexpr size_t max_open_files = 256;

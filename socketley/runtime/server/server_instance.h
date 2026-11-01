@@ -975,7 +975,7 @@ private:
     void handle_splice_in(struct io_uring_cqe* cqe, server_connection* conn);
     void handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn);
     // The next burst of a file sent by sendfile, from a write's completion or a wait for room on the socket.
-    void sendfile_next(server_connection* conn);
+    void sendfile_next(server_connection* conn, bool inline_call = false);
     void splice_cleanup(server_connection* conn);
     void invoke_on_websocket(int fd);
 
@@ -1528,9 +1528,8 @@ private:
     // map.
     static constexpr size_t HTTP_REVAL_MAX_FILE  = 1u << 20;   // 1 MiB
     static constexpr size_t HTTP_REVAL_MAX_TOTAL = 64u << 20;  // 64 MiB
-    // The cap for a connection that has the splice arm available, which is a
-    // different question: see the measurement at the reval_take that reads it.
-    static constexpr size_t HTTP_REVAL_SPLICE_MAX_FILE = 256u << 10;  // 256 KiB
+    // The cap for a connection a file can be sent to by sendfile, above which that costs less than a copy.
+    static constexpr size_t HTTP_REVAL_SENDFILE_MAX_FILE = 64u << 10;
 
     // SOCKETLEY_HTTP_REVALIDATE=0 restores the per-request open and read
     // exactly, read once at start.
