@@ -8351,6 +8351,8 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
 
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    // An upstream gone without a FIN is found by the probes, as an accepted client is.
+    socket_tuning::keepalive_dead_peer(fd);
 
     if (connect(fd, reinterpret_cast<const struct sockaddr*>(&uc->cached_addr),
                 sizeof(uc->cached_addr)) < 0 && errno != EINPROGRESS)

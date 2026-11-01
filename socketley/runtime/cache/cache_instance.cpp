@@ -13013,6 +13013,8 @@ bool cache_instance::connect_to_master()
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return false;
+    // A replica only reads, and a leader gone without a FIN would otherwise leave it waiting on the link for ever.
+    socket_tuning::keepalive_dead_peer(fd);
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
