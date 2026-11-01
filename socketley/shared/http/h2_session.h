@@ -13,6 +13,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "../net/socket_tuning.h"
 #include "h2_frame.h"
 #include "hpack.h"
 #include "http_framing.h"
@@ -78,6 +79,8 @@ struct stream
 template <class S>
 struct session
 {
+    // What waits in the connection's queue before more frames are put in it; fit_to_path() shortens it.
+    size_t   out_high{1u << 20};
     bool     preface_ok{false};
     bool     got_settings{false};
     uint32_t peer_init_win{h2::default_window};
@@ -129,6 +132,19 @@ void enqueue(session<S>& s, stream& st)
 }
 
 // The flood counters start again every ten seconds.
+// On a path with a round trip, frames wait in the session, where a stream that opens later goes ahead of them, and not
+// in the kernel's buffer behind them, which over a WAN holds most of a second of the link; on a LAN that buffer
+// drains as fast as it fills, and holding it short would only cap the rate.
+template <class S>
+void fit_to_path(session<S>& s, int fd)
+{
+    if (socket_tuning::rtt_us(fd) < 1000)
+        return;
+    const int lowat = 16 * 1024;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat)) < 0) {}
+    s.out_high = 256 * 1024;
+}
+
 template <class S>
 void tick_window(session<S>& s)
 {

@@ -44,8 +44,6 @@ using h2::resets_max;
 using h2::settings_max;
 using h2::stream_window;
 
-// What waits in the connection's queue before more frames are put in it.
-constexpr size_t   out_high        = 1024 * 1024;
 // What one turn hands a stream's phase.
 constexpr size_t   pull_slice      = 64 * 1024;
 // Seconds a TLS connection that chose HTTP/2 has to send its preface.
@@ -83,6 +81,7 @@ void storage_run::h2_start(const std::shared_ptr<conn>& c)
     c->ph = phase::h2;
     c->h2.reset(new h2_session);
     h2_session& s = *c->h2;
+    h2::fit_to_path(s, c->fd);
     s.began = s.window_start = std::chrono::steady_clock::now();
     // The settings this side reads by, and the connection's window opened past the 64 KiB it starts with.
     h2::put_settings(s.ctl, {{h2::MAX_CONCURRENT_STREAMS, max_streams},
@@ -493,7 +492,7 @@ void storage_run::h2_schedule(const std::shared_ptr<conn>& c)
     std::string& out = c->wq;
     const size_t start = out.size();
     std::vector<std::shared_ptr<conn>> ended;
-    h2::drain(s, out, unsent(*c), out_high,
+    h2::drain(s, out, unsent(*c), s.out_high,
               [](const std::shared_ptr<conn>& sc) { sc->last_progress = std::chrono::steady_clock::now(); },
               [&](const std::shared_ptr<conn>& sc) { ended.push_back(sc); },
               // A stream with nothing left to send is asked for its next piece only if it is waiting to be asked.

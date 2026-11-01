@@ -55,11 +55,9 @@ void proxy_h2_stream_free::operator()(proxy_h2_stream* s) const { delete s; }
 namespace
 {
 
-// What waits in the connection's queue before more frames are put in it.
-constexpr size_t h2_out_high = 1024 * 1024;
-// What the wire may leave untaken before the session is given up: the DATA bound keeps an honest peer near
-// h2_out_high, so past this the queue is frames a peer that does not read keeps drawing.
-constexpr size_t h2_out_max = 4 * h2_out_high;
+// What the wire may leave untaken before the session is given up: the DATA bound keeps an honest peer near the
+// session's out_high, so past this the queue is frames a peer that does not read keeps drawing.
+constexpr size_t h2_out_max = 4u << 20;
 
 // Streams a client may have open here at once, which is a memory bound and not a protocol one: each is a client
 // connection of its own, so eight of them cost eight structs and eight descriptors. Eight is already more in flight
@@ -90,6 +88,7 @@ void proxy_instance::h2_begin(proxy_client_connection* conn)
 {
     conn->h2.reset(new proxy_h2_conn);
     proxy_h2_conn& s = *conn->h2;
+    h2::fit_to_path(s, conn->fd);
     s.max_live = h2_max_live;
     s.began = s.window_start = std::chrono::steady_clock::now();
     // The settings this side reads by, and the connection's window opened past the 64 KiB it starts with.
@@ -423,7 +422,7 @@ void proxy_instance::h2_stream_gone(proxy_client_connection* child)
 void proxy_instance::h2_wrote(proxy_client_connection* conn)
 {
     if (!conn->h2 || conn->closing || conn->fd < 0 || conn->h2->rr.empty() ||
-        conn->write_queue.bytes() >= h2_out_high)
+        conn->write_queue.bytes() >= conn->h2->out_high)
         return;
     h2_schedule(conn);
 }
@@ -447,7 +446,7 @@ void proxy_instance::h2_schedule(proxy_client_connection* conn)
         std::vector<proxy_client_connection*> ended;
         // By descriptor, since a stream that ends in this turn is gone before its backend could be read again.
         std::vector<int> wrote;
-        h2::drain(s, out, conn->write_queue.bytes(), h2_out_high,
+        h2::drain(s, out, conn->write_queue.bytes(), s.out_high,
                   [&](proxy_client_connection* child)
                   {
                       child->last_activity = std::chrono::steady_clock::now();

@@ -58,6 +58,14 @@ inline void tcp_listener_defaults(int fd, int rcvbuf, int sndbuf)
         if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {}
 }
 
+// The round trip the kernel has measured on a connection, in microseconds, 0 before it has one.
+inline uint32_t rtt_us(int fd)
+{
+    struct tcp_info ti{};
+    socklen_t n = sizeof(ti);
+    return getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &n) == 0 ? ti.tcpi_rtt : 0;
+}
+
 // The congestion control a listener's accepted sockets run, which they take from it as they take the options above:
 // 0, or the errno the kernel refused it with -- EPERM for one not in net.ipv4.tcp_allowed_congestion_control to a
 // process without CAP_NET_ADMIN, ENOENT for one this kernel does not have.
