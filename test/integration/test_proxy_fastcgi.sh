@@ -302,7 +302,10 @@ expect "a body after a GET of a file ends the connection, and is never read as a
 printf 'v1\n' > "$W/kept.txt"; curl -s -o /dev/null "$U/kept.txt"; curl -s -o /dev/null "$U/kept.txt"
 printf 'version two\n' > "$W/kept.txt"
 expect "a kept file that changed is sent as it is now" "$(curl -s "$U/kept.txt")" "version two"
+KTAG=$(curl -s -D - -o /dev/null "$U/kept.txt" | tr -d '\r' | awk -F': ' 'tolower($1)=="etag"{print $2}')
 printf 'version 3!!\n' > "$T/next.txt"; touch -r "$W/kept.txt" "$T/next.txt"; mv "$T/next.txt" "$W/kept.txt"
+expect "and a client holding the old one is not told it is the same (the inode is in the tag)" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: $KTAG" "$U/kept.txt")" 200
 expect "and one moved into place with the same size and time, a new file under the old name" \
     "$(curl -s "$U/kept.txt")" "version 3!!"
 printf 'SECRET\n' > "$T/outside/secret.txt"; rm "$W/kept.txt"; ln -s "$T/outside/secret.txt" "$W/kept.txt"

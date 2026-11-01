@@ -421,14 +421,12 @@ struct conn
 
     io_request rd_req{};
     io_request wr_req{};
-    io_request sp_in_req{};
-    io_request sp_out_req{};
     bool       rd_pending{false};
     bool       wr_pending{false};
-    bool       sp_in_pending{false};
     // A read of the object's file into sbuf the ring has not answered, which the conn must outlive.
     bool       file_rd_pending{false};
-    bool       sp_out_pending{false};
+    // A wait for room on the socket while the object is sent from its file.
+    bool       poll_pending{false};
     bool       closing{false};
 
     // A recv lands in a buffer the ring lends for the length of the completion, and for a body
@@ -517,12 +515,12 @@ struct conn
     int         file_fd{-1};
     uint64_t    file_off{0};
     uint64_t    file_left{0};
-    int         pipe_rd{-1};
-    int         pipe_wr{-1};
-    uint64_t    pipe_held{0};
-    uint32_t    pipe_size{0};
     std::string sbuf;
+    // Sent from its file by the kernel (shared/net/file_send.h), the socket's own flags read once, its send buffer
+    // raised once for a large object.
     bool        spliced{false};
+    int         sock_flags{-1};
+    bool        big_sndbuf{false};
     // The response is for a range or a whole object, kept for the counters.
     uint64_t    sent_body{0};
 
@@ -767,8 +765,6 @@ public:
     void pace_tick();
     void read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     void write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
-    void splice_in_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
-    void splice_out_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     // Plaintext, wherever it came from: the socket's bytes or a session's.
     void plain_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
     void tls_in(const std::shared_ptr<conn>& c, const char* data, size_t n);
@@ -876,8 +872,6 @@ public:
     void send_file(const std::shared_ptr<conn>& c, response head, int fd, uint64_t off, uint64_t len);
     void file_pump(const std::shared_ptr<conn>& c);
     void file_done(const std::shared_ptr<conn>& c);
-    bool pipe_acquire(conn& c);
-    void pipe_release(conn& c);
     void stream_read_done(const std::shared_ptr<conn>& c, int64_t res);
 
     // ── Scripts ─────────────────────────────────────────────────────────────
@@ -1543,8 +1537,6 @@ private:
     // memory the ring writes into outlives the close.
     std::vector<std::shared_ptr<conn>> m_closing;
 
-    struct pooled_pipe { int rd; int wr; uint32_t size; };
-    std::vector<pooled_pipe> m_pipes;
     std::vector<std::shared_ptr<char[]>> m_hook_buffers;
 
     struct timer

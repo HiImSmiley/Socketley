@@ -37,6 +37,7 @@
 #include "../../shared/http/mime.h"
 #include "../../shared/http/status.h"
 #include "../../shared/http/url.h"
+#include "../../shared/net/file_send.h"
 #include "../../shared/net/peer_address.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/wall_clock.h"
@@ -181,11 +182,6 @@ constexpr uint32_t file_window = 256 * 1024;
 // submit_splice).
 constexpr uint64_t keep_max_file = 256 * 1024;
 constexpr size_t keep_max_total = 64u << 20;
-// Above it a file on a plain connection is sent by sendfile from the loop, as much as one call takes up to this much
-// before the loop turns, into a send buffer asked for at this size (the kernel doubles it, to tcp_wmem's 4 MiB here,
-// which is as far as nginx's autotuned sockets grow).
-constexpr uint64_t sendfile_burst = 4u << 20;
-constexpr int file_sndbuf = 2 << 20;
 // Large files whose descriptors are kept open at once, a bound on the descriptors this costs.
 constexpr size_t max_open_files = 256;
 
@@ -406,6 +402,7 @@ bool proxy_instance::fcgi_serve_kept(proxy_client_connection* conn, std::string_
     struct stat st{};
     st.st_size = k.size;
     st.st_mtim = k.mtime;
+    st.st_ino = k.ino;
     fcgi_serve_file(conn, nullptr, st, rel, k.body);
     return true;
 }
@@ -432,6 +429,7 @@ bool proxy_instance::fcgi_serve_open(proxy_client_connection* conn, std::string_
     struct stat st{};
     st.st_size = o.size;
     st.st_mtim = o.mtime;
+    st.st_ino = o.ino;
     fcgi_serve_file(conn, o.src, st, rel);
     return true;
 }
@@ -461,10 +459,7 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_
 
     const auto size = static_cast<uint64_t>(st.st_size);
     const int64_t mtime = static_cast<int64_t>(st.st_mtim.tv_sec);
-    char tag[64];
-    const int tn = std::snprintf(tag, sizeof tag, "%llx-%lx-%llx", static_cast<unsigned long long>(st.st_mtim.tv_sec),
-                                 static_cast<unsigned long>(st.st_mtim.tv_nsec), static_cast<unsigned long long>(size));
-    const std::string etag(tag, tn > 0 ? static_cast<size_t>(tn) : 0);
+    const std::string etag = socketley::http::etag_of(socketley::file_stamp::of(st));
     const std::string modified = socketley::http::http_date_of(mtime);
     const auto pre = socketley::http::evaluate({field_of(h, "if-match"), field_of(h, "if-unmodified-since"),
                                                 field_of(h, "if-none-match"), field_of(h, "if-modified-since")},
@@ -560,19 +555,19 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_
         {
             f->sendfile = true;
             // Autotuning grows the buffer only as the peer drains it, and each burst would stop for room on the way.
-            if (f->left > keep_max_file && !conn->fcgi_sndbuf)
+            if (f->left > socketley::file_send::large && !conn->fcgi_sndbuf)
             {
                 conn->fcgi_sndbuf = true;
-                if (::setsockopt(conn->fd, SOL_SOCKET, SO_SNDBUF, &file_sndbuf, sizeof file_sndbuf) < 0) {}
+                socketley::file_send::raise_send_buffer(conn->fd);
             }
         }
     }
-    // A file sent by sendfile has its head sent here and now, held for the first of its bytes (MSG_MORE), so the
-    // file follows in this same turn and not one completion later; what the socket does not take is queued.
+    // A file sent by sendfile has its head sent here and now, so the file follows in this same turn and not one
+    // completion later; what the socket does not take is queued.
     if (f->sendfile && !conn->write_pending && conn->write_queue.empty())
     {
-        const ssize_t n = ::send(conn->fd, out.data(), out.size(), MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE);
-        if (n < 0 && errno != EAGAIN)
+        const ssize_t n = socketley::file_send::send_head(conn->fd, out);
+        if (n < 0)
         {
             close_pair(conn->fd, conn->ex.backend_fd);
             return;
@@ -623,44 +618,16 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn, bool inline_c
     }
     const int fd = conn->fd;
     const uint32_t gen = conn->generation;
-    // A burst whose last byte is not in the page cache would hold the loop on the disk, so that window is read through
-    // the ring instead, which also has the kernel read ahead of it.
-    char probe = 0;
-    iovec pv{&probe, 1};
-    const bool cold = f.sendfile &&
-                      ::preadv2(f.fd, &pv, 1, static_cast<off_t>(f.off + std::min(f.left, sendfile_burst) - 1), RWF_NOWAIT) < 0 &&
-                      errno == EAGAIN;
-    if (f.sendfile && !cold)
+    // A cold burst is read through the ring instead (file_send::cold), which also has the kernel read ahead of it.
+    if (f.sendfile && !socketley::file_send::cold(f.fd, f.off, f.left))
     {
         // The head goes out first, through the write queue, and nothing else writes to the socket until the file has.
         if (conn->write_pending || !conn->write_queue.empty())
             return;
-        // sendfile on the loop thread, the way nginx sends a file, where an io_uring splice is a hand-off to an io-wq
-        // worker per operation; non-blocking for the call alone, since the ring's own writes need the socket blocking,
-        // and nothing of the ring runs on it meanwhile (SINGLE_ISSUER, DEFER_TASKRUN).
-        if (conn->fcgi_sock_flags < 0)
-            conn->fcgi_sock_flags = ::fcntl(fd, F_GETFL);
-        const int flags = conn->fcgi_sock_flags;
-        bool failed = flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0;
-        for (uint64_t budget = sendfile_burst; !failed && f.left > 0 && budget > 0;)
-        {
-            auto off = static_cast<off_t>(f.off);
-            const ssize_t n = ::sendfile(fd, f.fd, &off, static_cast<size_t>(std::min(f.left, budget)));
-            if (n > 0)
-            {
-                f.off += static_cast<uint64_t>(n);
-                f.left -= static_cast<uint64_t>(n);
-                budget -= std::min<uint64_t>(budget, static_cast<uint64_t>(n));
-                stat_add(m_stat_bytes_out, static_cast<uint64_t>(n));
-                continue;
-            }
-            // A file that shrank under the length already on the wire, or a client gone, ends the connection.
-            failed = n == 0 || errno != EAGAIN;
-            break;
-        }
-        if (flags >= 0 && ::fcntl(fd, F_SETFL, flags) < 0)
-            failed = true;
-        if (failed)
+        uint64_t sent = 0;
+        const auto b = socketley::file_send::send(fd, conn->fcgi_sock_flags, f.fd, f.off, f.left, sent);
+        stat_add(m_stat_bytes_out, sent);
+        if (b == socketley::file_send::burst::failed)
         {
             conn->file.reset();
             close_pair(fd, conn->ex.backend_fd);

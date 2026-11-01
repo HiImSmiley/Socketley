@@ -4,6 +4,7 @@
 #include "../../shared/json/json_doc.h"
 #include "../../shared/storage/git_names.h"
 
+#include <poll.h>
 #include <algorithm>
 #include <unordered_set>
 #include <dirent.h>
@@ -27,6 +28,7 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/persist/state_persistence.h"
+#include "../../shared/net/file_send.h"
 #include "../../shared/net/unix_listener.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/http/status.h"
@@ -46,7 +48,6 @@ namespace
 {
 
 constexpr size_t   max_head_bytes      = 32 * 1024;
-constexpr size_t   pipe_bytes          = 1u << 20;
 constexpr size_t   stream_chunk        = 256 * 1024;
 // What one recv brings a heavy hook, so the hop to its thread is paid per quarter megabyte.
 constexpr size_t   hook_read_bytes     = 256 * 1024;
@@ -168,14 +169,7 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     m_multishot = m_ring && m_loop.recv_multishot_enabled();
 }
 
-storage_run::~storage_run()
-{
-    for (const pooled_pipe& p : m_pipes)
-    {
-        ::close(p.rd);
-        ::close(p.wr);
-    }
-}
+storage_run::~storage_run() = default;
 
 bool storage_run::open(std::string& err)
 {
@@ -438,8 +432,6 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
             read_done(c, cqe);
             break;
         case op_write:      write_done(c, cqe); break;
-        case op_splice_file: splice_in_done(c, cqe); break;
-        case op_splice:     splice_out_done(c, cqe); break;
         default: break;
     }
 }
@@ -793,7 +785,6 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
         m_loop.close_fd(c->file_fd);
         c->file_fd = -1;
     }
-    pipe_release(*c);
     if (c->ssl)
     {
         tls_context::free_ssl(c->ssl);
@@ -809,13 +800,13 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
     c->on_body     = false;
 
     m_conns.erase(c->id);
-    if (c->rd_pending || c->wr_pending || c->sp_in_pending || c->sp_out_pending || c->file_rd_pending)
+    if (c->rd_pending || c->wr_pending || c->poll_pending || c->file_rd_pending)
         m_closing.push_back(c);
 }
 
 void storage_run::maybe_release(const std::shared_ptr<conn>& c)
 {
-    if (!c->dead || c->rd_pending || c->wr_pending || c->sp_in_pending || c->sp_out_pending || c->file_rd_pending)
+    if (!c->dead || c->rd_pending || c->wr_pending || c->poll_pending || c->file_rd_pending)
         return;
     auto it = std::find(m_closing.begin(), m_closing.end(), c);
     if (it != m_closing.end())
@@ -1842,7 +1833,6 @@ void storage_run::finish_request(const std::shared_ptr<conn>& c)
         m_loop.close_fd(c->file_fd);
         c->file_fd = -1;
     }
-    pipe_release(*c);
     reset_request(c);
     c->close_after_write = false;
     c->ph = phase::head;
@@ -2503,46 +2493,6 @@ void storage_run::put_refused(const std::shared_ptr<conn>& c, const s3_error& e)
 
 // ─── An object on its way out ───────────────────────────────────────────────
 
-bool storage_run::pipe_acquire(conn& c)
-{
-    if (c.pipe_rd >= 0)
-        return true;
-    if (!m_pipes.empty())
-    {
-        c.pipe_rd   = m_pipes.back().rd;
-        c.pipe_wr   = m_pipes.back().wr;
-        c.pipe_size = m_pipes.back().size;
-        m_pipes.pop_back();
-        return true;
-    }
-    int fds[2];
-    if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0)
-        return false;
-    if (::fcntl(fds[0], F_SETPIPE_SZ, static_cast<int>(pipe_bytes)) < 0) {}
-    c.pipe_rd = fds[0];
-    c.pipe_wr = fds[1];
-    const int sz = ::fcntl(fds[0], F_GETPIPE_SZ);
-    c.pipe_size = sz > 0 ? static_cast<uint32_t>(sz) : 65536u;
-    return true;
-}
-
-void storage_run::pipe_release(conn& c)
-{
-    if (c.pipe_rd < 0)
-        return;
-    // Back in the pool only when empty and unused; anything else is closed,
-    // because a pipe with bytes in it would put them in the next stream.
-    if (c.pipe_held == 0 && !c.sp_in_pending && !c.sp_out_pending && m_pipes.size() < 64)
-        m_pipes.push_back({c.pipe_rd, c.pipe_wr, c.pipe_size});
-    else
-    {
-        m_loop.close_fd(c.pipe_rd);
-        m_loop.close_fd(c.pipe_wr);
-    }
-    c.pipe_rd = c.pipe_wr = -1;
-    c.pipe_held = 0;
-}
-
 void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int fd, uint64_t off, uint64_t len)
 {
     if (c->dead)
@@ -2564,10 +2514,9 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
     c->file_left = len;
     c->ph        = phase::respond;
     c->close_after_write = head.close;
-    // A body worth the pipe goes file to socket in the kernel, and the rest is
-    // read here and written from memory.
-    // Not on a session: a splice moves bytes the record layer never sees.
-    c->spliced = !c->ssl && !c->stream() && len >= m_zero_copy_min && pipe_acquire(*c);
+    // A body worth it goes file to socket in the kernel, and the rest is read here and written from memory.
+    // Not on a session: sendfile moves bytes the record layer never sees.
+    c->spliced = !c->ssl && !c->stream() && len >= m_zero_copy_min;
     if (c->spliced)
         ++m_c.zero_copy_gets;
     else
@@ -2603,18 +2552,60 @@ void storage_run::file_pump(const std::shared_ptr<conn>& c)
         return;
     }
 
-    if (c->spliced)
+    // sendfile from the loop (shared/net/file_send.h), where a splice was two io-wq hand-offs a pipe-full and a worker
+    // parked on every slow reader; a burst out of the page cache is read through the ring below instead.  The head is
+    // out: this runs from its write's completion or from a wait for room, so no ring op is on the socket.
+    if (c->spliced && !file_send::cold(c->file_fd, c->file_off, c->file_left))
     {
-        const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(c->file_left, c->pipe_size));
-        c->sp_in_req = io_request{};
-        c->sp_in_req.owner  = this;
-        c->sp_in_req.buffer = reinterpret_cast<char*>(c.get());
-        if (!m_loop.submit_splice_file(c->file_fd, c->file_off, c->pipe_wr, n, &c->sp_in_req))
+        if (c->file_left > file_send::large && !c->big_sndbuf)
+        {
+            c->big_sndbuf = true;
+            file_send::raise_send_buffer(c->fd);
+        }
+        uint64_t sent = 0;
+        const auto b = file_send::send(c->fd, c->sock_flags, c->file_fd, c->file_off, c->file_left, sent);
+        if (sent > 0)
+        {
+            c->last_progress = std::chrono::steady_clock::now();
+            m_c.bytes_out += sent;
+            m_c.zero_copy_bytes += sent;
+            runtime_instance::stat_add(m_owner.m_stat_bytes_out, sent);
+        }
+        if (b == file_send::burst::failed)
         {
             close_conn(c);
             return;
         }
-        c->sp_in_pending = true;
+        if (b == file_send::burst::done)
+        {
+            file_done(c);
+            return;
+        }
+        std::weak_ptr<conn> weak = c;
+        if (!m_io.poll(c->fd, POLLOUT,
+                [this, weak](int64_t res)
+                {
+                    auto cc = weak.lock();
+                    if (!cc)
+                        return;
+                    cc->poll_pending = false;
+                    if (cc->dead)
+                    {
+                        maybe_release(cc);
+                        return;
+                    }
+                    if (res < 0 || (res & (POLLERR | POLLHUP)) != 0)
+                    {
+                        close_conn(cc);
+                        return;
+                    }
+                    file_pump(cc);
+                }))
+        {
+            close_conn(c);
+            return;
+        }
+        c->poll_pending = true;
         return;
     }
 
@@ -2660,70 +2651,6 @@ void storage_run::stream_read_done(const std::shared_ptr<conn>& c, int64_t res)
     piece.swap(c->sbuf);
     piece.resize(static_cast<size_t>(res));
     queue_write(c, std::move(piece));
-}
-
-void storage_run::splice_in_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe)
-{
-    c->sp_in_pending = false;
-    if (c->dead)
-    {
-        maybe_release(c);
-        return;
-    }
-    if (cqe->res <= 0)
-    {
-        close_conn(c);
-        return;
-    }
-    c->file_off  += static_cast<uint64_t>(cqe->res);
-    c->file_left -= static_cast<uint64_t>(cqe->res);
-    c->pipe_held  = static_cast<uint64_t>(cqe->res);
-
-    c->sp_out_req = io_request{};
-    c->sp_out_req.owner  = this;
-    c->sp_out_req.buffer = reinterpret_cast<char*>(c.get());
-    if (!m_loop.submit_splice(c->pipe_rd, c->fd, static_cast<uint32_t>(c->pipe_held), &c->sp_out_req))
-    {
-        close_conn(c);
-        return;
-    }
-    c->sp_out_pending = true;
-}
-
-void storage_run::splice_out_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe)
-{
-    c->sp_out_pending = false;
-    if (c->dead)
-    {
-        maybe_release(c);
-        return;
-    }
-    if (cqe->res <= 0)
-    {
-        close_conn(c);
-        return;
-    }
-    const uint64_t n = static_cast<uint64_t>(cqe->res);
-    c->pipe_held = c->pipe_held >= n ? c->pipe_held - n : 0;
-    c->last_progress = std::chrono::steady_clock::now();
-    m_c.bytes_out += n;
-    m_c.zero_copy_bytes += n;
-    runtime_instance::stat_add(m_owner.m_stat_bytes_out, n);
-
-    if (c->pipe_held > 0)
-    {
-        c->sp_out_req = io_request{};
-        c->sp_out_req.owner  = this;
-        c->sp_out_req.buffer = reinterpret_cast<char*>(c.get());
-        if (!m_loop.submit_splice(c->pipe_rd, c->fd, static_cast<uint32_t>(c->pipe_held), &c->sp_out_req))
-        {
-            close_conn(c);
-            return;
-        }
-        c->sp_out_pending = true;
-        return;
-    }
-    file_pump(c);
 }
 
 void storage_run::file_done(const std::shared_ptr<conn>& c)

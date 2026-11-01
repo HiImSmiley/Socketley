@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "../persist/file_stamp.h"
 #include "../util/text_list.h"
 
 namespace socketley::http
@@ -34,6 +35,16 @@ inline bool etag_list_matches(std::string_view list, std::string_view etag)
             return true;
     }
     return false;
+}
+
+// A file's entity tag, unquoted as evaluate() takes it: its inode, its modification to the nanosecond and its size,
+// so a file moved in under the name with the old one's size and time (mv after touch -r) is not the client's copy.
+inline std::string etag_of(const file_stamp& s)
+{
+    char tag[64];
+    const int n = std::snprintf(tag, sizeof tag, "%llx-%llx-%llx", static_cast<unsigned long long>(s.ino),
+                                static_cast<unsigned long long>(s.mtime_ns), static_cast<unsigned long long>(s.size));
+    return n > 0 ? std::string(tag, static_cast<size_t>(n)) : std::string();
 }
 
 // Mon, 02 Jan 2006 15:04:05 GMT, the HTTP date of the second `secs` since the epoch.
