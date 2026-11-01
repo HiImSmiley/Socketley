@@ -31,7 +31,9 @@ rename() {   # rename <from> <to>
     "$BIN" show "$1" 2>/dev/null | sed "s/\"name\": \"$1\"/\"name\": \"$2\"/" > "$T/$1.json"
     "$BIN" import "$1" < "$T/$1.json" >/dev/null 2>&1
 }
-state_root() { find "$HOME/.local/share" -maxdepth 3 -type d -name 'runtimes*' 2>/dev/null | head -1; }
+# The daemon's own word for its state directory: a runtimes directory of another name can sit beside it, and which one a
+# find lists first is the file system's order.
+state_root() { grep -o 'state directory: .*' "$SOCKETLEY_DLOG" 2>/dev/null | head -1 | cut -d' ' -f3-; }
 
 # ── an idp and its accounts ─────────────────────────────────────────────────
 "$BIN" create idp auth -p "$P" --issuer "http://127.0.0.1:$P" -s >/dev/null 2>&1

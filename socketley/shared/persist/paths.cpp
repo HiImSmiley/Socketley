@@ -77,7 +77,6 @@ socketley_paths socketley_paths::resolve()
 
         std::error_code ec;
         fs::create_directories("/run/socketley", ec);
-        fs::create_directories(p.state_dir, ec);
     }
     else
     {
@@ -98,10 +97,6 @@ socketley_paths socketley_paths::resolve()
             p.state_dir   = "/tmp/socketley-runtimes-" + std::to_string(uid);
             p.config_path.clear();
         }
-
-        std::error_code ec;
-        if (!in_tmp)
-            fs::create_directories(p.state_dir, ec);
 
         // If system daemon is running and socket is accessible, prefer it
         if (installed && access("/run/socketley/socketley.sock", R_OK | W_OK) == 0)
@@ -131,9 +126,14 @@ socketley_paths socketley_paths::resolve()
         {
             p.legacy_state_dir = p.state_dir;
             p.state_dir += "." + socket_key(want);
-            if (!in_tmp)
-                fs::create_directories(p.state_dir, ec);
         }
+    }
+
+    // Made once it is decided, so a daemon keyed to its socket leaves no empty default directory behind it.
+    if (!in_tmp && !p.state_dir.empty())
+    {
+        std::error_code ec;
+        fs::create_directories(p.state_dir, ec);
     }
 
     if (in_tmp && !socketley::private_dir(p.state_dir.string(), true))
