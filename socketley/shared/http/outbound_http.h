@@ -191,6 +191,9 @@ private:
     bool        m_head_given{false};
     // The head of a request whose body comes from a source, held for the body's first piece.
     std::string m_head_out;
+    // A body held in memory that the record layer has not taken yet, and how far it has.
+    std::string m_tls_rest;
+    size_t      m_tls_rest_off{0};
     // A file body's pipe, its bytes sent so far and those in the pipe; dirty from a transfer's start to its end.
     int         m_pipe_rd{-1};
     int         m_pipe_wr{-1};

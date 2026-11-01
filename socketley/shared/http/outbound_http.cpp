@@ -324,6 +324,8 @@ void http_peer::exchange(http_request req, std::function<void(http_answer)> done
     m_head_given   = false;
     m_source_done  = false;
     m_head_out.clear();
+    m_tls_rest.clear();
+    m_tls_rest_off = 0;
     m_file_sent    = 0;
     m_in_pipe      = 0;
     m_sent         = false;
@@ -520,27 +522,33 @@ void http_peer::advance()
             });
             return;
         }
-        if (plain.empty())
-            m_sent = true;
+        if (!plain.empty() && !m_ssl)
+        {
+            send(std::make_shared<std::string>(std::move(plain)), 0);
+            return;
+        }
         if (!plain.empty())
         {
-            if (!m_ssl)
+            m_tls_rest     = std::move(plain);
+            m_tls_rest_off = 0;
+        }
+        // As much as the record layer's buffer takes, and the rest after each flush, whose completion comes back here.
+        while (m_ssl && m_tls_rest_off < m_tls_rest.size())
+        {
+            const int n = tls_context::ssl_write(m_ssl, m_tls_rest.data() + m_tls_rest_off,
+                                                 static_cast<int>(std::min(m_tls_rest.size() - m_tls_rest_off, tls_piece)));
+            if (n == 0 && flush_cipher())
+                return;
+            if (n <= 0)
             {
-                send(std::make_shared<std::string>(std::move(plain)), 0);
+                finish(false, "the record layer took no more");
                 return;
             }
-            for (size_t off = 0; off < plain.size();)
-            {
-                const int n = tls_context::ssl_write(m_ssl, plain.data() + off,
-                                                     static_cast<int>(std::min(plain.size() - off, tls_piece)));
-                if (n <= 0)
-                {
-                    finish(false, "the record layer took no more");
-                    return;
-                }
-                off += static_cast<size_t>(n);
-            }
+            m_tls_rest_off += static_cast<size_t>(n);
         }
+        m_tls_rest.clear();
+        m_tls_rest_off = 0;
+        m_sent = true;
     }
     if (m_ssl && !m_write_failed && flush_cipher())
         return;
