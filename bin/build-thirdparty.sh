@@ -20,6 +20,8 @@ WHAT=${1:-all}
 LIBURING_TAG=liburing-2.15   # pinned deliberately: see thirdparty/liburing/README
 # Pinned as liburing is: a release that changes under the build is a different build. OpenSSL 3.5 is an LTS line.
 OPENSSL_TAG=openssl-3.5.9
+# Kernel TLS, for a runtime that hands a connection's send key to the kernel; a _TAG, so a change rebuilds OpenSSL.
+OPENSSL_OPTIONS_TAG=enable-ktls
 NGHTTP3_TAG=v1.18.0
 NGTCP2_TAG=v1.25.0
 PREMAKE_REF=v5.0.0-beta8   # bin/premake5's version; not a _TAG, so a change here rebuilds no library in scripts/update.sh
@@ -107,7 +109,7 @@ build_premake() {
 
 build_http3() {
   # Left alone when the archives of these very tags are there, so a second run costs a few stats.
-  local stamp="$OPENSSL_TAG $NGHTTP3_TAG $NGTCP2_TAG"
+  local stamp="$OPENSSL_TAG $OPENSSL_OPTIONS_TAG $NGHTTP3_TAG $NGTCP2_TAG"
   if [ "$(cat "$ROOT/thirdparty/ngtcp2/.built" 2>/dev/null)" = "$stamp" ] && \
      [ -f "$ROOT/thirdparty/openssl/lib/libssl.a" ] && [ -f "$ROOT/thirdparty/nghttp3/lib/libnghttp3.a" ] && \
      [ -f "$ROOT/thirdparty/ngtcp2/lib/libngtcp2_crypto_ossl.a" ]; then
@@ -126,7 +128,7 @@ build_http3() {
   git clone --depth 1 --branch "$OPENSSL_TAG" https://github.com/openssl/openssl.git "$tmp/openssl" >/dev/null 2>&1 \
     || { echo "   FAILED: could not clone OpenSSL"; return 2; }
   rm -rf "$ossl" && mkdir -p "$ossl"
-  ( cd "$tmp/openssl" && ./Configure no-shared no-tests no-docs no-apps --prefix="$ossl" --libdir=lib \
+  ( cd "$tmp/openssl" && ./Configure $OPENSSL_OPTIONS_TAG no-shared no-tests no-docs no-apps --prefix="$ossl" --libdir=lib \
         --openssldir=/usr/lib/ssl -fPIC >/dev/null && make -j"$jobs" build_libs >/dev/null 2>&1 && make install_dev >/dev/null 2>&1 ) \
     || { echo "   FAILED: OpenSSL build"; return 2; }
   # The archives only: a headers-and-archive tree, which premake puts before the system's.

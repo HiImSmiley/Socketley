@@ -124,6 +124,21 @@ public:
 
     // Check if SSL needs to write (has pending encrypted output)
     static bool has_pending_out(SSL* ssl);
+
+    // ─── Kernel TLS, on a socket a runtime lends ────────────────────────────
+    // start_kernel_tls changes a TLS 1.3 connection's send key and OpenSSL hands the new one to the kernel, which
+    // encrypts all that is written to the socket from that point -- sendfile included -- while OpenSSL writes
+    // plaintext.  The point is a mark in the stream: take_out stops at it and at every record of a type of its own,
+    // and kernel_step sends what is there.  allow_kernel_tls is false when this build cannot.
+    static bool allow_kernel_tls(SSL* ssl, int fd);
+    // on: the kernel has the key or will at its mark; unavailable: the socket has no TLS layer, nor will any other.
+    enum class kernel_switch { no, on, unavailable, failed };
+    static kernel_switch start_kernel_tls(SSL* ssl);
+    enum class kernel_step_result { idle, progressed, wait, failed };
+    // What take_out stopped at: the key put on the socket, or a typed record sent; wait means the socket is full.
+    static kernel_step_result kernel_step(SSL* ssl);
+    // The kernel encrypts and no application data of OpenSSL's is waiting, so the socket may be written to directly.
+    static bool kernel_ready(SSL* ssl);
     // Offers HTTP/2 by ALPN to a client that asks for "h2", HTTP/1.1 being what one that does not speaks; off unless a
     // runtime that serves HTTP/2 turns it on. Whether a finished handshake chose it.
     void enable_h2(bool on);

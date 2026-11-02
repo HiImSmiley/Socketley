@@ -15,6 +15,18 @@
 #define SOCKETLEY_HAS_TLS 0
 #endif
 
+// The kernel's TLS layer, which OpenSSL hands a key to when it is built with it and the socket is one a runtime lends.
+#if SOCKETLEY_HAS_TLS && !defined(OPENSSL_NO_KTLS) && defined(__linux__)
+#define SOCKETLEY_KTLS 1
+#include <deque>
+#include <linux/tls.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#else
+#define SOCKETLEY_KTLS 0
+#endif
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -42,12 +54,64 @@ struct out_bio
 {
     std::string buf;
     size_t      off = 0;
+#if SOCKETLEY_KTLS
+    // A socket lent for kernel TLS, and the stream counted in bytes ever written and ever taken, so marks outlive take_out.
+    int      fd = -1;
+    uint64_t written = 0;
+    uint64_t taken = 0;
+    bool     ulp = false;
+    bool     kernel = false;
+    // The socket has no TLS layer to give, or the kernel refused a key: nothing goes to it again.
+    bool     refused = false;
+    bool     broken = false;
+    // A key OpenSSL handed over, put on the socket once every byte before `at` has gone: those it encrypted itself.
+    struct key_at
+    {
+        uint64_t    at;
+        std::string info;
+    };
+    std::deque<key_at> keys;
+    // A record of a type of its own -- a ticket, an alert, a key update -- which only a sendmsg with its type carries.
+    struct typed_at
+    {
+        uint64_t      at;
+        uint64_t      len;
+        unsigned char type;
+    };
+    std::deque<typed_at> typed;
+    int next_type = -1;
+
+    // The first mark at or after what was taken, which take_out stops at.
+    uint64_t next_mark() const
+    {
+        uint64_t m = UINT64_MAX;
+        if (!keys.empty())
+            m = keys.front().at;
+        if (!typed.empty())
+            m = std::min(m, typed.front().at);
+        return m;
+    }
+    ~out_bio()
+    {
+        for (auto& k : keys)
+            OPENSSL_cleanse(k.info.data(), k.info.size());
+    }
+#endif
 };
 
 int out_write(BIO* b, const char* data, size_t len, size_t* written)
 {
     BIO_clear_retry_flags(b);
-    static_cast<out_bio*>(BIO_get_data(b))->buf.append(data, len);
+    auto* o = static_cast<out_bio*>(BIO_get_data(b));
+#if SOCKETLEY_KTLS
+    if (o->next_type >= 0)
+    {
+        o->typed.push_back({o->written, len, static_cast<unsigned char>(o->next_type)});
+        o->next_type = -1;
+    }
+    o->written += len;
+#endif
+    o->buf.append(data, len);
     *written = len;
     return 1;
 }
@@ -66,6 +130,9 @@ int out_read(BIO* b, char* data, size_t len, size_t* read)
     }
     std::memcpy(data, o->buf.data() + o->off, n);
     o->off += n;
+#if SOCKETLEY_KTLS
+    o->taken += n;
+#endif
     if (o->off == o->buf.size())
     {
         o->buf.clear();
@@ -74,13 +141,58 @@ int out_read(BIO* b, char* data, size_t len, size_t* read)
     return 1;
 }
 
-long out_ctrl(BIO* b, int cmd, long, void*)
+#if SOCKETLEY_KTLS
+// OpenSSL's own numbers for these, which its public header names in a comment only.
+constexpr int ctrl_set_ktls = 72;
+constexpr int ctrl_set_ktls_type = 74;
+constexpr int ctrl_clear_ktls_type = 75;
+
+// Takes the key OpenSSL configured for the kernel, to put on the socket at the point the stream has reached.
+bool out_take_key(out_bio* o, const void* info)
 {
-    const auto* o = static_cast<const out_bio*>(BIO_get_data(b));
+    size_t len = 0;
+    switch (static_cast<const tls_crypto_info*>(info)->cipher_type)
+    {
+        case TLS_CIPHER_AES_GCM_128:       len = sizeof(tls12_crypto_info_aes_gcm_128); break;
+        case TLS_CIPHER_AES_GCM_256:       len = sizeof(tls12_crypto_info_aes_gcm_256); break;
+        case TLS_CIPHER_AES_CCM_128:       len = sizeof(tls12_crypto_info_aes_ccm_128); break;
+        case TLS_CIPHER_CHACHA20_POLY1305: len = sizeof(tls12_crypto_info_chacha20_poly1305); break;
+        default: return false;
+    }
+    // The first key needs the socket's TLS layer: a kernel without it refuses here, while OpenSSL can still go on alone.
+    if (!o->ulp)
+    {
+        if (::setsockopt(o->fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls")) != 0)
+        {
+            o->refused = true;
+            return false;
+        }
+        o->ulp = true;
+    }
+    o->keys.push_back({o->written, std::string(static_cast<const char*>(info), len)});
+    return true;
+}
+#endif
+
+long out_ctrl(BIO* b, int cmd, long num, void* ptr)
+{
+    auto* o = static_cast<out_bio*>(BIO_get_data(b));
     switch (cmd)
     {
         case BIO_CTRL_PENDING: return static_cast<long>(o->buf.size() - o->off);
         case BIO_CTRL_FLUSH:   return 1;
+#if SOCKETLEY_KTLS
+        // The send direction only, on a lent socket; once a key went to the kernel every later one must, since OpenSSL
+        // refused here goes on encrypting itself, and the kernel would encrypt that again.
+        case ctrl_set_ktls:
+            return o->fd >= 0 && num == 1 && out_take_key(o, ptr) ? 1 : 0;
+        case BIO_CTRL_GET_KTLS_SEND:  return o->kernel || !o->keys.empty() ? 1 : 0;
+        case ctrl_set_ktls_type:      o->next_type = static_cast<int>(num); return 1;
+        case ctrl_clear_ktls_type:    o->next_type = -1; return 1;
+#else
+        (void)num;
+        (void)ptr;
+#endif
         default:               return 0;
     }
 }
@@ -1133,7 +1245,14 @@ size_t tls_context::take_out(SSL* ssl, std::string& out, size_t max)
     out_bio* o = out_of(ssl);
     if (!o)
         return 0;
-    const size_t n = std::min(max, o->buf.size() - o->off);
+    size_t n = std::min(max, o->buf.size() - o->off);
+#if SOCKETLEY_KTLS
+    // Up to the next key change or typed record, which kernel_step sends, and nothing past it.
+    const uint64_t mark = o->next_mark();
+    if (mark != UINT64_MAX)
+        n = static_cast<size_t>(std::min<uint64_t>(n, mark - o->taken));
+    o->taken += n;
+#endif
     if (n == 0)
         return 0;
     if (out.empty() && o->off == 0 && n == o->buf.size())
@@ -1167,6 +1286,145 @@ void tls_context::reserve_out(SSL* ssl, size_t n)
 #else
     (void)ssl;
     (void)n;
+#endif
+}
+
+bool tls_context::allow_kernel_tls(SSL* ssl, int fd)
+{
+#if SOCKETLEY_KTLS
+    out_bio* o = out_of(ssl);
+    if (!o || fd < 0)
+        return false;
+    o->fd = fd;
+    return true;
+#else
+    (void)ssl;
+    (void)fd;
+    return false;
+#endif
+}
+
+tls_context::kernel_switch tls_context::start_kernel_tls(SSL* ssl)
+{
+#if SOCKETLEY_KTLS
+    out_bio* o = out_of(ssl);
+    if (!o || o->fd < 0 || o->broken)
+        return kernel_switch::no;
+    if (o->kernel || !o->keys.empty())
+        return kernel_switch::on;
+    if (o->refused || SSL_version(ssl) != TLS1_3_VERSION || !SSL_is_init_finished(ssl))
+        return kernel_switch::no;
+    // A new send key, which OpenSSL now hands to the kernel: TLS 1.3 changes keys at any record, so a connection
+    // pays for kernel TLS from the first answer it is worth it for, and one that never asks for one never does.
+    SSL_set_options(ssl, SSL_OP_ENABLE_KTLS);
+    if (SSL_key_update(ssl, SSL_KEY_UPDATE_NOT_REQUESTED) != 1 || SSL_do_handshake(ssl) != 1)
+    {
+        ERR_clear_error();
+        o->broken = true;
+        return kernel_switch::failed;
+    }
+    if (!o->keys.empty())
+        return kernel_switch::on;
+    // Refused, and the new key is OpenSSL's to use, as every key after it.
+    SSL_clear_options(ssl, SSL_OP_ENABLE_KTLS);
+    return o->refused ? kernel_switch::unavailable : kernel_switch::no;
+#else
+    (void)ssl;
+    return kernel_switch::no;
+#endif
+}
+
+#if SOCKETLEY_KTLS
+namespace
+{
+// Puts on the socket the key whose mark the stream has reached; false when the kernel refused it.
+bool apply_due_key(out_bio* o)
+{
+    auto& k = o->keys.front();
+    const int r = ::setsockopt(o->fd, SOL_TLS, TLS_TX, k.info.data(), static_cast<socklen_t>(k.info.size()));
+    OPENSSL_cleanse(k.info.data(), k.info.size());
+    o->keys.pop_front();
+    if (r != 0)
+    {
+        o->broken = true;
+        return false;
+    }
+    o->kernel = true;
+    return true;
+}
+}   // namespace
+#endif
+
+tls_context::kernel_step_result tls_context::kernel_step(SSL* ssl)
+{
+#if SOCKETLEY_KTLS
+    out_bio* o = out_of(ssl);
+    if (!o)
+        return kernel_step_result::idle;
+    if (o->broken)
+        return kernel_step_result::failed;
+    // A later key the kernel cannot take leaves nothing that could be sent correctly, so the connection ends.
+    if (!o->keys.empty() && o->keys.front().at == o->taken)
+        return apply_due_key(o) ? kernel_step_result::progressed : kernel_step_result::failed;
+    if (!o->typed.empty() && o->typed.front().at == o->taken)
+    {
+        auto& t = o->typed.front();
+        alignas(cmsghdr) char ctl[CMSG_SPACE(sizeof(unsigned char))]{};
+        iovec v{o->buf.data() + o->off, static_cast<size_t>(t.len)};
+        msghdr m{};
+        m.msg_iov = &v;
+        m.msg_iovlen = 1;
+        m.msg_control = ctl;
+        m.msg_controllen = sizeof ctl;
+        cmsghdr* c = CMSG_FIRSTHDR(&m);
+        c->cmsg_level = SOL_TLS;
+        c->cmsg_type = TLS_SET_RECORD_TYPE;
+        c->cmsg_len = CMSG_LEN(sizeof(unsigned char));
+        *CMSG_DATA(c) = t.type;
+        const ssize_t n = ::sendmsg(o->fd, &m, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0)
+            return errno == EAGAIN || errno == EWOULDBLOCK ? kernel_step_result::wait : kernel_step_result::failed;
+        const auto took = static_cast<uint64_t>(n);
+        o->off += static_cast<size_t>(took);
+        o->taken += took;
+        t.at += took;
+        t.len -= took;
+        if (t.len == 0)
+            o->typed.pop_front();
+        if (o->off == o->buf.size())
+        {
+            o->buf.clear();
+            o->off = 0;
+        }
+        return kernel_step_result::progressed;
+    }
+    return kernel_step_result::idle;
+#else
+    (void)ssl;
+    return kernel_step_result::idle;
+#endif
+}
+
+bool tls_context::kernel_ready(SSL* ssl)
+{
+#if SOCKETLEY_KTLS
+    out_bio* o = out_of(ssl);
+    if (!o || o->broken)
+        return false;
+    // A key handed over with nothing written after it is put on the socket here, before what is about to be written.
+    while (!o->keys.empty() && o->keys.front().at == o->taken)
+        if (!apply_due_key(o))
+            return false;
+    if (!o->kernel)
+        return false;
+    // Records of their own type may wait, since TLS takes them between any two; application data may not be overtaken.
+    uint64_t typed = 0;
+    for (const auto& t : o->typed)
+        typed += t.len;
+    return o->written - o->taken == typed;
+#else
+    (void)ssl;
+    return false;
 #endif
 }
 

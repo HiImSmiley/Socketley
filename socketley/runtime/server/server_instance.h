@@ -296,6 +296,9 @@ struct alignas(64) server_connection
     // with a splice still running.
     bool splice_in_pending{false};
     bool splice_out_pending{false};
+    // A wait for room for a record of its own type, which kernel TLS sends with its type and the socket was full for.
+    io_request tls_wait_req;
+    bool tls_wait_pending{false};
 
     // WebSocket handshake headers (non-empty only for ws_active connections)
     std::string ws_cookie;
@@ -449,6 +452,8 @@ struct alignas(64) server_connection
         splice_pending = false;
         splice_in_pending = false;
         splice_out_pending = false;
+        tls_wait_req = {};
+        tls_wait_pending = false;
         http_keep_alive = false;
         http_head = false;
         proto = proto_unknown;
@@ -1569,10 +1574,16 @@ private:
     static constexpr size_t HTTP_REVAL_MAX_TOTAL = 64u << 20;  // 64 MiB
     // The cap for a connection a file can be sent to by sendfile, above which that costs less than a copy.
     static constexpr size_t HTTP_REVAL_SENDFILE_MAX_FILE = 64u << 10;
+    // A file over this on a TLS 1.3 connection moves its send key to the kernel and goes by sendfile; below it the
+    // copy encrypted here costs less, and is what a connection that never asks for a larger one keeps.
+    static constexpr size_t HTTP_KERNEL_TLS_MIN_FILE = 256u << 10;
 
     // SOCKETLEY_HTTP_REVALIDATE=0 restores the per-request open and read
     // exactly, read once at start.
     bool m_http_reval_enabled{true};
+    // TLS connections hand their send key to the kernel, so a file goes by sendfile over them too; SOCKETLEY_KERNEL_TLS=0
+    // keeps every record in user space.
+    bool m_kernel_tls{true};
     bool http_reval_active() const { return m_http_reval_enabled && m_http_root_fd >= 0; }
     bool http_reval_would_fit(const std::string& url_path, size_t cost) const;
     // Says once that the map stopped taking files; see the definition for why

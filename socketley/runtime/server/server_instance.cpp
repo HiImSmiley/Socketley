@@ -183,7 +183,7 @@ conn_ref server_instance::ref_for_fd(int fd) const
 bool server_instance::conn_ops_pending(const server_connection* conn) const
 {
     return conn->read_pending || conn->write_pending || direct_owed(conn)
-        || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending
+        || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending || conn->tls_wait_pending
         // The streamed file's read writes into this struct's own buffer, so a
         // reuse while it is armed is the kernel writing into the next client's
         // connection.
@@ -196,7 +196,7 @@ bool server_instance::conn_ops_pending(const server_connection* conn) const
 socketley::reach::owed server_instance::conn_owed(const server_connection* conn) const
 {
     socketley::reach::owed o;
-    o.write          = conn->write_pending || direct_owed(conn);
+    o.write          = conn->write_pending || direct_owed(conn) || conn->tls_wait_pending;
     o.file_read      = conn->file_read_pending;
     o.splice_in      = conn->splice_in_pending;
     o.splice_out     = conn->splice_out_pending;
@@ -1620,7 +1620,30 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
 
         // Kept as bytes up to the size where sendfile from the page cache costs less than copying them, which a TLS
         // connection or an injected page cannot take.
-        const size_t reval_cap = (!is_html && !conn->ssl) ? HTTP_REVAL_SENDFILE_MAX_FILE : HTTP_REVAL_MAX_FILE;
+        // A TLS connection whose send key is the kernel's, or that a file this size moves to it, takes sendfile as a
+        // plain one does.
+        bool plain_socket = !conn->ssl;
+        if (conn->ssl && !is_html && m_kernel_tls && send_len > HTTP_KERNEL_TLS_MIN_FILE)
+        {
+            const auto k = tls_context::start_kernel_tls(conn->ssl);
+            plain_socket = k == tls_context::kernel_switch::on;
+            if (k == tls_context::kernel_switch::unavailable)
+            {
+                m_kernel_tls = false;
+                LOG_WARN("server: the kernel has no TLS layer to give (modprobe tls), so files over TLS are encrypted here");
+            }
+            else if (k == tls_context::kernel_switch::failed)
+            {
+                drop_file();
+                conn->closing = true;
+                return;
+            }
+        }
+        else if (conn->ssl && !is_html && tls_context::kernel_ready(conn->ssl))
+            plain_socket = true;
+        // What a TLS connection keeps as bytes stops where the kernel takes over.
+        const size_t reval_cap = (!is_html && plain_socket) ? HTTP_REVAL_SENDFILE_MAX_FILE
+                               : m_kernel_tls && conn->ssl ? HTTP_KERNEL_TLS_MIN_FILE : HTTP_REVAL_MAX_FILE;
         const bool reval_take = reval_ok && used_beneath &&
                                 fsize <= reval_cap &&
                                 m_http_reval_bytes < HTTP_REVAL_MAX_TOTAL;
@@ -1640,10 +1663,9 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             return;
         }
 
-        // The kernel's path for non-HTML files, never on a TLS connection, because
-        // it would hand the peer plaintext in the middle of an encrypted
-        // stream: sendfile from the loop, with no pipe, so no cap on how many.
-        if (!is_html && !conn->ssl && !reval_take)
+        // The kernel's path for non-HTML files, on a TLS connection only once the kernel holds its send key, since
+        // otherwise it would hand the peer plaintext in the middle of an encrypted stream: sendfile from the loop.
+        if (!is_html && plain_socket && !reval_take)
         {
             {
                 // A large file's descriptor is kept for the requests after this one.
@@ -1675,7 +1697,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                 // follows in this turn rather than one write completion later; what the socket does not take is
                 // queued, and the file waits for it as before.
                 if (conn->write_queue.empty() && !conn->write_pending && conn->write_batch_count == 0 &&
-                    admit_send(conn, head.size(), true))
+                    (!conn->ssl || tls_context::kernel_ready(conn->ssl)) && admit_send(conn, head.size(), true))
                 {
                     const ssize_t n = socketley::file_send::send_head(conn->fd, head);
                     if (n < 0)
@@ -2647,6 +2669,7 @@ bool server_instance::setup(event_loop& loop)
     // SOCKETLEY_HTTP_REVALIDATE=0 puts disk mode back on an open and read per
     // request, read here so a restart picks it up.
     m_http_reval_enabled = socketley::settings::flag("SOCKETLEY_HTTP_REVALIDATE", true);
+    m_kernel_tls = socketley::settings::flag("SOCKETLEY_KERNEL_TLS", true);
     m_http_reval.clear();
     m_http_open.clear();
     m_http_reval_bytes = 0;
@@ -3024,6 +3047,14 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                     handle_splice_in(cqe, conn);
                 else if (req == &conn->splice_out_req)
                     handle_splice_out(cqe, conn);
+                else if (req == &conn->tls_wait_req)
+                {
+                    // Room for the typed record, or the end of the connection.
+                    conn->tls_wait_pending = false;
+                    if (cqe->res < 0 || (cqe->res & (POLLERR | POLLHUP)) != 0)
+                        conn->closing = true;
+                    after_write(conn);
+                }
             }
             // No `else`: the pipe belongs to the connection rather than to the
             // runtime, and a struct that is no longer in m_conn_idx has either
@@ -3550,6 +3581,8 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
     if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
     {
         ptr->ssl = m_tls->create_ssl_server();
+        if (ptr->ssl && m_kernel_tls && !tls_context::allow_kernel_tls(ptr->ssl, client_fd))
+            m_kernel_tls = false;
         if (SOCKETLEY_UNLIKELY(!ptr->ssl))
         {
             // No session, no encryption, so no connection, because serving
@@ -6568,8 +6601,29 @@ void server_instance::tls_flush(server_connection* conn)
     // owns, because the BIO's storage moves under an SQE -- and it rides in
     // write_batch[0] so the short-write retry needs no TLS case.
     auto cipher = std::make_shared<std::string>();
-    if (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, *cipher) == 0))
-        return;
+    while (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, *cipher) == 0))
+    {
+        // A mark in the stream: the send key going to the kernel, or a record of its own type sent here.
+        const auto step = tls_context::kernel_step(conn->ssl);
+        if (step == tls_context::kernel_step_result::failed)
+        {
+            conn->closing = true;
+            return;
+        }
+        if (step == tls_context::kernel_step_result::wait)
+        {
+            if (!conn->tls_wait_pending)
+            {
+                conn->tls_wait_req = { this, nullptr, conn->fd, 0, op_splice, conn->generation };
+                conn->tls_wait_pending = m_loop->submit_poll_add(conn->fd, POLLOUT, &conn->tls_wait_req);
+                if (!conn->tls_wait_pending)
+                    conn->closing = true;
+            }
+            return;
+        }
+        if (step == tls_context::kernel_step_result::idle || !tls_context::has_pending_out(conn->ssl))
+            return;
+    }
 
     // Nothing is in flight (checked above), so any refs still held are from a
     // completed write and are this function's to drop.
@@ -7070,6 +7124,12 @@ void server_instance::sendfile_next(server_connection* conn, bool inline_call)
         if (!conn_ops_pending(conn))
             close_conn(conn);
     };
+    // Plaintext reaches a TLS connection's socket only once the kernel holds its send key and nothing of OpenSSL's waits.
+    if (conn->ssl && !tls_context::kernel_ready(conn->ssl))
+    {
+        fail();
+        return;
+    }
     // A window out of the page cache goes through a pipe, read by the ring, while one can be had; past the pipe
     // budget it is sent as it is, which waits on the disk rather than dropping the download.
     if (socketley::file_send::cold(conn->splice_file_fd, conn->splice_off, conn->splice_remaining) &&
