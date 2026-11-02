@@ -3943,8 +3943,9 @@ void server_instance::stream_file_more(server_connection* conn, bool force)
     const size_t want = static_cast<size_t>(
         std::min<uint64_t>(conn->stream_remaining, HTTP_STREAM_PIECE));
     // Read into the string's own storage, so the piece is moved into the queue
-    // rather than copied into it.
-    conn->stream_buf.resize(want);
+    // rather than copied into it; sized without being cleared, since the read
+    // writes every byte that is kept.
+    conn->stream_buf.resize_and_overwrite(want, [](char*, size_t len) { return len; });
     conn->stream_req = { this, conn->stream_buf.data(), conn->fd,
                          static_cast<uint32_t>(want), op_file_read, conn->generation };
     if (!m_loop->submit_file_read(conn->stream_fd, conn->stream_buf.data(),

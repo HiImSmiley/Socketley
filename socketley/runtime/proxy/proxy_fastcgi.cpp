@@ -729,7 +729,8 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn, bool inline_c
     if (held >= write_watermark_bytes())
         return;
     const auto n = static_cast<uint32_t>(std::min<uint64_t>(f.left, file_window));
-    f.buf.resize(n);
+    // Sized without being cleared: the read writes every byte that is sent.
+    f.buf.resize_and_overwrite(n, [](char*, size_t len) { return len; });
     f.reading = true;
     std::shared_ptr<fcgi_file> keep = conn->file;
     if (!m_files->io.pread(f.fd, f.buf.data(), n, f.off,
