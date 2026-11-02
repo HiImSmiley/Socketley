@@ -66,6 +66,8 @@ struct leg : http::server_conn
     // A refusal, written once the far side has answered all that went before it, and the visitor closed after.
     std::string refusal;
     bool refused{false};
+    // Waiting for its link's transport to drain rather than for credit.
+    bool parked{false};
 };
 
 // A UDP socket of the tunnel and its one receive in flight: a UDP service's port at the edge, or a flow's own socket
@@ -104,6 +106,10 @@ public:
     session s;
     // Frames waiting to go out on the transport.
     std::string out;
+    // On a path with a round trip, how much stream data may wait unsent, so a frame that opens, credits or pings a
+    // stream waits behind that and not behind every stream's window; and the streams waiting for it to drain.
+    size_t out_high{SIZE_MAX};
+    std::vector<uint32_t> parked;
     std::unordered_map<uint32_t, std::shared_ptr<leg>> legs;
     std::weak_ptr<http::server_conn> transport;
     // A person who is an admin of the edge's idp, who may reach an agent's TCP service by its name.
@@ -166,6 +172,7 @@ public:
 
     std::shared_ptr<http::server_conn> make_conn() override;
     void serve(const std::shared_ptr<http::server_conn>& c) override;
+    bool written(const std::shared_ptr<http::server_conn>& c) override;
     bool keeps_open(const http::server_conn& c) const override;
     void closing(const std::shared_ptr<http::server_conn>& c) override;
 };
@@ -180,6 +187,7 @@ public:
 
     std::shared_ptr<http::server_conn> make_conn() override;
     void serve(const std::shared_ptr<http::server_conn>& c) override;
+    bool written(const std::shared_ptr<http::server_conn>& c) override;
     bool keeps_open(const http::server_conn&) const override { return true; }
     void closing(const std::shared_ptr<http::server_conn>& c) override;
     void connected(const std::shared_ptr<http::server_conn>& c, int res) override;
@@ -210,6 +218,10 @@ private:
     void tick();
     // What the link has to say sent on its transport, through TLS at an agent.
     void flush_link(link& l);
+    // What the link has handed its transport and the transport not yet written.
+    size_t link_backlog(const link& l) const;
+    // The streams that waited for the transport, read again now that it has written everything.
+    void link_drained(link& l);
     // Every leg of a link that ended closed, and the link forgotten wherever it was named.
     void drop_link(link& l);
     // A link at the edge told why it ends and closed once that is written, so the far side reads the reason, not a cut.

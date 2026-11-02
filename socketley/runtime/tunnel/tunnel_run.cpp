@@ -195,6 +195,13 @@ struct upstream_conn : http::server_conn
 link::link(tunnel_run& r, kind kd, std::string w, const std::shared_ptr<http::server_conn>& t)
     : run(r), k(kd), who(std::move(w)), s(kd == kind::edge, *this), transport(t), last_heard(wall::now_sec())
 {
+    // On a LAN the kernel's buffer drains as fast as it fills, and holding it short would only cap the rate.
+    if (t && t->fd >= 0 && socket_tuning::rtt_us(t->fd) >= 1000)
+    {
+        const int lowat = 16 * 1024;
+        if (::setsockopt(t->fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof lowat) < 0) {}
+        out_high = 256 * 1024;
+    }
 }
 
 std::shared_ptr<leg> link::leg_of(uint32_t stream)
@@ -367,13 +374,21 @@ void tunnel_run::pump(leg& g)
         return;
     }
     const size_t limit = g.gated ? g.cleared : g.in.size();
-    const size_t n = g.l->s.send(g.stream, std::string_view(g.in).substr(0, limit), g.l->out);
+    const size_t backlog = link_backlog(*g.l);
+    const size_t room = backlog < g.l->out_high ? g.l->out_high - backlog : 0;
+    const size_t n = g.l->s.send(g.stream, std::string_view(g.in).substr(0, std::min(limit, room)), g.l->out);
     g.in.erase(0, n);
     if (g.gated)
         g.cleared -= n;
     m_c.bytes_in += n;
-    // A stream out of credit stops its socket being read until the far side gives more.
+    // A stream out of credit stops its socket being read until the far side gives more, and one out of room until
+    // the transport has written what is before it.
     g.waiting = g.gated ? g.cleared != 0 || !g.refusal.empty() : !g.in.empty();
+    if (n == room && n < limit && !g.parked)
+    {
+        g.parked = true;
+        g.l->parked.push_back(g.stream);
+    }
     flush_link(*g.l);
     if (g.near_closed && (g.gated ? g.cleared == 0 : g.in.empty()))
     {
@@ -605,6 +620,28 @@ void tunnel_run::tick()
         dial_edge();
     tend_udp(now);
     arm_tick();
+}
+
+size_t tunnel_run::link_backlog(const link& l) const
+{
+    const auto t = l.transport.lock();
+    return l.out.size() + (t ? t->unsent() : 0);
+}
+
+void tunnel_run::link_drained(link& l)
+{
+    std::vector<uint32_t> streams;
+    streams.swap(l.parked);
+    for (const uint32_t stream : streams)
+    {
+        const auto it = l.legs.find(stream);
+        if (it == l.legs.end())
+            continue;
+        const std::shared_ptr<leg> g = it->second;
+        g->parked = false;
+        if (g->waiting && !g->dead)
+            g->srv->resume(g);
+    }
 }
 
 void tunnel_run::flush_link(link& l)
@@ -999,6 +1036,13 @@ void front_hooks::serve(const std::shared_ptr<http::server_conn>& c)
     }
     c->in.clear();
     run.flush_link(*l);
+}
+
+bool front_hooks::written(const std::shared_ptr<http::server_conn>& c)
+{
+    if (const auto& l = static_cast<front_conn&>(*c).l; l && !l->parked.empty())
+        run.link_drained(*l);
+    return false;
 }
 
 bool front_hooks::keeps_open(const http::server_conn& c) const
@@ -1763,6 +1807,13 @@ void upstream_hooks::serve(const std::shared_ptr<http::server_conn>& c)
         run.from_edge(c, std::move(plain));
     if (closed && !c->dead)
         srv.close_conn(c);
+}
+
+bool upstream_hooks::written(const std::shared_ptr<http::server_conn>& c)
+{
+    if (const auto& l = static_cast<upstream_conn&>(*c).l; l && !l->parked.empty())
+        run.link_drained(*l);
+    return false;
 }
 
 void upstream_hooks::closing(const std::shared_ptr<http::server_conn>& c)
