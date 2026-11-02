@@ -47,7 +47,8 @@ up() {
     return 1
 }
 
-ms() { date +%s%3N; }
+# The boot clock, read in hundredths: a hold of 2500 ms may read 10 ms short, never 700 as the wall clock did.
+ms() { mono_ms; }
 # What the daemon said since line $1, so a stop and start that answered sooner than the old worker's stop allows -- seen
 # twice beside a full gate, never alone -- says which worker went when.
 since_log() { tail -n +"$(($1 + 1))" "$SOCKETLEY_DLOG" | grep -v DEBUG | tail -40 | sed 's/^/    log: /'; }
@@ -85,7 +86,7 @@ for verb in restart reload; do
 
     [ "$LS" -lt 1000 ] && ok "$verb: the daemon answered ls in ${LS} ms while the $verb waited" \
                        || bad "$verb: loop" "ls took ${LS} ms while the $verb waited"
-    if [ "$RC" -eq 0 ] && [ "$T" -ge 2500 ]; then
+    if [ "$RC" -eq 0 ] && [ "$T" -ge 2490 ]; then
         ok "$verb: answered 0 after ${T} ms, once the old worker had stopped"
     else
         bad "$verb" "answered $RC after ${T} ms: $(tr '\n' ' ' < "$SOCKETLEY_TMPD/$verb.out")"
@@ -119,7 +120,7 @@ T0=$(ms)
 RC=$?
 T=$(( $(ms) - T0 ))
 OUT=$(tr '\n' ' ' < "$SOCKETLEY_TMPD/refused.out")
-if [ "$RC" -eq 1 ] && [ "$T" -ge 2500 ]; then
+if [ "$RC" -eq 1 ] && [ "$T" -ge 2490 ]; then
     ok "a refused change answered 1 after ${T} ms, with the start it waited for"
 else
     bad "refused change" "answered $RC after ${T} ms: $OUT"

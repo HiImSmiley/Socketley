@@ -137,10 +137,10 @@ survivors=()
 for n in a b c; do [ "$n" != "$L" ] && survivors+=("$n"); done
 kill -9 "$(cat "$T/$L.pid")"
 wait "$(cat "$T/$L.pid")" 2>/dev/null || true
-t0=$(date +%s%N)
+t0=$(mono_ns)
 new_leader() { local n; n=$(leader_of "${survivors[@]}") || return 1; [ "$(myid "$n")" != "$old_id" ]; }
 if wait_for 10 new_leader; then
-    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    ms=$(( ($(mono_ns) - t0) / 1000000 ))
     ok
     echo "  new leader $(leader_of "${survivors[@]}") elected ${ms} ms after kill -9 of $L"
 else

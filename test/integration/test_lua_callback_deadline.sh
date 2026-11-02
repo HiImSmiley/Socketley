@@ -187,10 +187,10 @@ sleep 0.4
 # ── 1. The operator is not locked out ───────────────────────────────────────
 #
 # Issued while the callback is still inside its budget.
-T0=$(date +%s.%N)
+T0=$(mono_s)
 STATS_RC=0
 STATS_OUT=$("$BIN" stats dl_byst 2>&1) || STATS_RC=$?
-T1=$(date +%s.%N)
+T1=$(mono_s)
 ELAPSED=$(echo "$T1 - $T0" | bc)
 
 if [ "$STATS_RC" = "0" ]; then pass; else
@@ -205,9 +205,9 @@ fi
 # every runtime in its own process the daemon is no longer blocked, and the
 # elapsed time rather than the presence of a reply is the measurement since a
 # client waiting past the deadline does get its reply.
-S0=$(date +%s.%N)
+S0=$(mono_s)
 SPIN_DURING=$(printf 'hello-during\n' | timeout 8 nc -q 2 127.0.0.1 "$SPIN_PORT" 2>/dev/null || true)
-S1=$(date +%s.%N)
+S1=$(mono_s)
 SPIN_ELAPSED=$(echo "$S1 - $S0" | bc)
 
 if [ "$(echo "$SPIN_ELAPSED > 0.3" | bc)" = "1" ]; then pass; else
@@ -298,9 +298,9 @@ esac
 # 400ms of blocking socketley.http inside a 1500ms budget, because a deadline
 # that fires on the documented use of the one blocking primitive this tree
 # ships is worse than no deadline.
-SLOW_T0=$(date +%s.%N)
+SLOW_T0=$(mono_s)
 SLOW_OUT=$(say dl_slow "$SLOW_PORT" slow)
-SLOW_T1=$(date +%s.%N)
+SLOW_T1=$(mono_s)
 SLOW_ELAPSED=$(echo "$SLOW_T1 - $SLOW_T0" | bc)
 case "$SLOW_OUT" in
     *echo:slow*) pass ;;

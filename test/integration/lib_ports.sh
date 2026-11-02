@@ -18,6 +18,7 @@
 # SL_PORT_BASE is exported, which is what lets run_all.sh claim one window for
 # a whole run and what lets a python child read its ports out of the
 # environment.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_clock.sh"
 
 # Already claimed by this shell (or handed down deliberately by a parent that
 # claimed one): use it and do not claim a second.

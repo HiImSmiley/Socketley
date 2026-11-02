@@ -429,7 +429,7 @@ CONVERGE_MS=$((STATS_MS * 4))
 # Both arms are re-read, because both are workers now and a reference sampled
 # once can be stale -- measured under Sanitize as two arms that agreed within
 # one interval being reported as never converging.
-now_ms() { date +%s%3N; }
+now_ms() { mono_ms; }
 GET_T0=$(now_ms)
 GET_WAITED=0
 while [ "$OOP_get" != "$IN_get" ] || [ "$IN_get" != "$WANT_GET" ]; do

@@ -116,14 +116,14 @@ lag_once() {                       # -> milliseconds, or 9999 if it never moved
     base=$(field px_oop connections)
     case "$base" in ''|*[!0-9]*) printf '9999'; return ;; esac
     exec 8<>"/dev/tcp/127.0.0.1/$PX_OOP_PORT" 2>/dev/null || { printf '9999'; return; }
-    t0=$(date +%s%3N)
+    t0=$(mono_ms)
     v="$base"
     for i in $(seq 1 400); do
         v=$(field px_oop connections)
         [ "$v" != "$base" ] && break
     done
     if [ "$v" = "$base" ]; then printf '9999'
-    else printf '%s' "$(( $(date +%s%3N) - t0 ))"; fi
+    else printf '%s' "$(( $(mono_ms) - t0 ))"; fi
     exec 8>&-
     # Back to the baseline before the next attempt and bounded, because a reap
     # this loop never sees would leave the count high and make the next attempt
@@ -145,8 +145,8 @@ MEDIAN=$(printf '%s\n' $LAGS | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/
 # here, as a median of ten, and the bound is on what the lag adds to it.
 CLI=""
 for _ in $(seq 1 10); do
-    t0=$(date +%s%3N); field px_oop connections >/dev/null
-    CLI="$CLI $(( $(date +%s%3N) - t0 ))"
+    t0=$(mono_ms); field px_oop connections >/dev/null
+    CLI="$CLI $(( $(mono_ms) - t0 ))"
 done
 CLI_MS=$(printf '%s\n' $CLI | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
 echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS ), one stats round trip ${CLI_MS} ms"
@@ -183,9 +183,9 @@ if [ -n "$WORKER_PID" ]; then
     done
 
     kill -STOP "$WORKER_PID" 2>/dev/null || true
-    S=$(date +%s%3N)
+    S=$(mono_ms)
     STOPPED=$(field px_oop connections)
-    E=$(date +%s%3N)
+    E=$(mono_ms)
     MS=$((E - S))
     kill -CONT "$WORKER_PID" 2>/dev/null || true
     exec 8>&-

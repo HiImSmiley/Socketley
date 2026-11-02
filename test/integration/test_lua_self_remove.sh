@@ -198,10 +198,10 @@ fi
 # The three assertions are kept because what they measure is unchanged: the
 # call is answered, the frame that made it runs on, and the runtime really is
 # gone.  A build that got any of those wrong would still be wrong.
-NEW_T0=$(date +%s%N)
+NEW_T0=$(mono_ns)
 "$BIN" create server selfrm_new -p "$NEW_PORT" --lua "$NEW_LUA" -s \
     >/dev/null 2>&1 || true
-NEW_MS=$(( ($(date +%s%N) - NEW_T0) / 1000000 ))
+NEW_MS=$(( ($(mono_ns) - NEW_T0) / 1000000 ))
 
 # Three assertions, and the first two exist so the third cannot pass on a build
 # where nothing ran.  A script that was never loaded would satisfy "the daemon

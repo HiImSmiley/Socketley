@@ -264,7 +264,7 @@ failover_round() {   # failover_round <label> <victim>
     local label=$1 v=$2 alive=() n dup=0
     for n in a b c; do [ "$n" != "$v" ] && alive+=("$n"); done
     local t0
-    t0=$(date +%s%N)
+    t0=$(mono_ns)
     node_kill "$v"
     local got=0 ms=0
     while :; do
@@ -362,7 +362,7 @@ check 'grep -q "installed a snapshot\|snapshot [1-9][0-9]* and" "$T/a.log" "$T/b
 H=$(holders api a b c)
 keep=${H%% *}
 others=(); for n in a b c; do [ "$n" != "$keep" ] && others+=("$n"); done
-t0=$(date +%s%N)
+t0=$(mono_ns)
 for n in "${others[@]}"; do node_kill "$n"; done
 gone=0
 while [ "$(ms_since "$t0")" -lt 15000 ]; do

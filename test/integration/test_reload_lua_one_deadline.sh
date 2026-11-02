@@ -83,7 +83,7 @@ fi
 secs() { python3 -c "print(f'{$2 - $1:.2f}')"; }
 
 # Warm first, so the frozen number is about the WAIT and not about reloading.
-S=$(date +%s.%N); "$BIN" reload-lua '*' >/dev/null 2>&1; E=$(date +%s.%N)
+S=$(mono_s); "$BIN" reload-lua '*' >/dev/null 2>&1; E=$(mono_s)
 WARM=$(secs "$S" "$E")
 if python3 -c "import sys; sys.exit(0 if $WARM < 1.0 else 1)"; then
     ok "a reload with every worker answering costs nothing (${WARM}s)"
@@ -94,7 +94,7 @@ else
 fi
 
 for p in $STOPPED; do kill -STOP "$p" 2>/dev/null; done
-S=$(date +%s.%N); OUT=$("$BIN" reload-lua '*' 2>&1); RC=$?; E=$(date +%s.%N)
+S=$(mono_s); OUT=$("$BIN" reload-lua '*' 2>&1); RC=$?; E=$(mono_s)
 FROZEN=$(secs "$S" "$E")
 for p in $STOPPED; do kill -CONT "$p" 2>/dev/null; done
 STOPPED=""

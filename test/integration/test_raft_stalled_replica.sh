@@ -108,9 +108,9 @@ misses=0; slow=0; saw_placement=0
 t0=$(date +%s)
 while [ $(( $(date +%s) - t0 )) -lt 15 ]; do
     [ "$(count_serving okay a b c)" = 3 ] || misses=$((misses+1))
-    s=$(date +%s%N)
+    s=$(mono_ns)
     saw "^hang" as b cluster placement && saw_placement=1 || true
-    [ $(( ($(date +%s%N) - s) / 1000000 )) -gt 1500 ] && slow=$((slow+1))
+    [ $(( ($(mono_ns) - s) / 1000000 )) -gt 1500 ] && slow=$((slow+1))
     sleep 0.3
 done
 after=$(terms)

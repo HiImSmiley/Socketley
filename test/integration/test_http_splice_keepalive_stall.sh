@@ -131,15 +131,15 @@ P=$((SL_PORT_BASE + 1620))
 # pinned one on the same daemon measured 23 and 26 of 120.
 rc_txt=0
 echo -n "  2 MiB non-HTML (splice path): "
-t0=$(date +%s%N)
+t0=$(mono_ns)
 taskset -c 1 "$CLIENT" "$P" 20 "$BURSTS" 2000 /big.txt MARKER-BIG || rc_txt=$?
-echo "    elapsed $(( ($(date +%s%N) - t0) / 1000000 )) ms"
+echo "    elapsed $(( ($(mono_ns) - t0) / 1000000 )) ms"
 
 rc_html=0
 echo -n "  2 MiB HTML     (read path, control): "
-t0=$(date +%s%N)
+t0=$(mono_ns)
 taskset -c 1 "$CLIENT" "$P" 20 "$CTRL_BURSTS" 2000 /big.html MARKER-BIG || rc_html=$?
-echo "    elapsed $(( ($(date +%s%N) - t0) / 1000000 )) ms"
+echo "    elapsed $(( ($(mono_ns) - t0) / 1000000 )) ms"
 
 # The control's status used to be thrown away with `|| true` while the failure
 # message below told the reader to look at it, so nobody could.

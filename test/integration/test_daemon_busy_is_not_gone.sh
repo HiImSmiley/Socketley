@@ -79,9 +79,9 @@ else
     bad "the instrument is up" "no socket at $QUIET; nothing below can be asked"
 fi
 
-S=$(date +%s.%N)
+S=$(mono_s)
 QOUT=$(SOCKETLEY_SOCKET="$QUIET" "$BIN" daemon stop 2>&1); QRC=$?
-E=$(date +%s.%N)
+E=$(mono_s)
 QSECS=$(secs "$S" "$E")
 kill "$LPID" 2>/dev/null; LPID=""
 

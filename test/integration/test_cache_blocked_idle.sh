@@ -60,9 +60,9 @@ else
     bad "a waiter with no deadline woke the worker $WAKES times in ${WINDOW}s (bound 20)"
 fi
 
-T0=$(date +%s%3N)
+T0=$(mono_ms)
 TIMED=$(redis-cli -p "$PORT" blpop other 0.5 2>&1)
-MS=$(( $(date +%s%3N) - T0 ))
+MS=$(( $(mono_ms) - T0 ))
 if [ -z "$(echo "$TIMED" | tr -d '[:space:]')" ] || [ "$TIMED" = "(nil)" ]; then
     if [ "$MS" -lt 2000 ]; then ok "a waiter with a deadline is still ended at it (${MS} ms for 500)"
     else bad "a 500 ms BLPOP took ${MS} ms to end"; fi

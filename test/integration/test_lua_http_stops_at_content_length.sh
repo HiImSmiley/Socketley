@@ -180,14 +180,14 @@ LUAEOF
 # Timed from outside: five calls that each waited out a 4s deadline would take
 # twenty seconds, and five that stop at their framing take almost none.  The
 # assertion is on the answers; this is what makes a regression legible.
-T0=$(date +%s%N)
+T0=$(mono_ns)
 "$BIN" create server clen_caller -p "$CALLER" --lua "$SOCKETLEY_TMPD/probe.lua" >/dev/null 2>&1
 "$BIN" start clen_caller >/dev/null 2>&1
 for i in $(seq 1 250); do
     grep -q "CLEN DONE" "$SOCKETLEY_DLOG" 2>/dev/null && break
     sleep 0.1
 done
-T1=$(date +%s%N)
+T1=$(mono_ns)
 ELAPSED_MS=$(( (T1 - T0) / 1000000 ))
 
 line_for() { grep -oE "CLEN $1 .*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1; }

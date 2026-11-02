@@ -103,9 +103,9 @@ check "of the width asked for" "$(width "$T/t2.jpg")" 128
 check "a film shorter than the still's offset has one" "$(get "$T/t3.jpg" -u "$A" "$U/~media/thumb-128/films/short.mp4")" 200
 check "and it is a picture" "$(width "$T/t3.jpg")" 128
 made=$(ls "$T/media/.media" | grep -c '^[0-9a-f]\{64\}$')
-t0=$(date +%s%N)
+t0=$(mono_ns)
 check "a thumbnail asked for again" "$(get "$T/t1b.jpg" -u "$A" "$U/~media/thumb-256/films/clip.mp4")" 200
-t1=$(date +%s%N)
+t1=$(mono_ns)
 check "is the one kept" "$(cmp -s "$T/t1.jpg" "$T/t1b.jpg" && echo same)" same
 check "and nothing is made for it" "$(ls "$T/media/.media" | grep -c '^[0-9a-f]\{64\}$')" "$made"
 check "by ffmpeg" "$(stat media_made)" 3
@@ -173,7 +173,7 @@ pids=(); n=0
 for path in hls-240/films/short.mp4/seg00000.m4s hls-360/films/short.mp4/seg00000.m4s hls-480/films/short.mp4/seg00000.m4s \
             hls-720/films/short.mp4/seg00000.m4s hls-copy/films/short.mp4/index.m3u8; do
     n=$((n + 1))
-    { curl -s -m 60 -u "$A" -o /dev/null "$U/~media/$path"; date +%s%N > "$T/five$n"; } & pids+=($!)
+    { curl -s -m 60 -u "$A" -o /dev/null "$U/~media/$path"; mono_ns > "$T/five$n"; } & pids+=($!)
 done
 wait "${pids[@]}"
 ms=$(( ($(sort -n "$T"/five? | tail -1) - $(sort -n "$T"/five? | head -1)) / 1000000 ))
@@ -206,7 +206,7 @@ ff -f lavfi -i testsrc2=size=640x360:rate=25 -f lavfi -i sine=frequency=330 -t 1
 code -u "$A" -T "$T/long.mp4" "$U/~dav/films/long.mp4" >/dev/null
 L="$U/~media/hls-240/films/long.mp4"
 get "$T/init.mp4" -u "$A" "$L/init.mp4" >/dev/null
-t0=$(date +%s%N)
+t0=$(mono_ns)
 check "a segment 48 s in, asked for first" "$(get "$T/s12.m4s" -u "$A" "$L/seg00012.m4s")" 200
 cat "$T/init.mp4" "$T/s12.m4s" > "$T/s12.mp4"
 check "begins 48 s into the film" "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=start_time -of csv=p=0 "$T/s12.mp4" | secs)" 48

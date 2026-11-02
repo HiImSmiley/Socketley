@@ -2,6 +2,7 @@
 #
 # The caller has sourced lib_daemon.sh and lib_raft.sh and set HERE (this directory), T, CB (a port block whose last digit is free: replica n of a cache
 # spec written -p "$((CB / 10)){node}" listens on $((CB / 10))n) and PB (the Raft port block).  The nodes are named 1, 2 and 3, and the cache is c.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_clock.sh"
 
 CLIENT="$HERE/lib_cache_client.py"
 raft_port() { echo $((PB + $1 - 1)); }
@@ -51,7 +52,7 @@ takers() {
 }
 
 cmd() { timeout 10 python3 "$CLIENT" cmd "$@"; }
-now_ns() { date +%s%N; }
+now_ns() { mono_ns; }
 
 # Every node in $@ that is up holds a replica that follows the primary $1 in epoch $2 and has finished its first sync.
 settled_on() {

@@ -3,6 +3,7 @@
 # The caller sets BIN, T (a temp directory every daemon's socket lies under, watched by daemon_watch) and NODES=(),
 # and keeps its own pass and fail counts.  A node is a name: its state lives in $T/<name>/home, its socket is
 # $T/<name>.sock, its log $T/<name>.log and its pid $T/<name>.pid.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_clock.sh"
 
 sock() { echo "$T/$1.sock"; }
 
@@ -74,7 +75,7 @@ saw() {
     grep -qE -- "$pat" <<<"$o"
 }
 
-ms_since() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
+ms_since() { echo $(( ($(mono_ns) - $1) / 1000000 )); }
 
 # A node's death as a machine losing power: its daemon is killed and so are its workers, which the kernel does anyway when their parent goes.
 node_kill() {

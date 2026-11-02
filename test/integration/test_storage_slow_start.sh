@@ -29,7 +29,7 @@ PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "got '$2', want '$3'"; fi; }
-now_ms() { date +%s%3N; }
+now_ms() { mono_ms; }
 
 daemon_isolate stgslowstart
 trap 'daemon_stop' EXIT

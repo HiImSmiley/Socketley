@@ -200,9 +200,9 @@ sleep 0.6
 # Seconds the proxy made the client wait, to two decimals.
 waited() {
     local t0 t1
-    t0=$(date +%s.%N)
+    t0=$(mono_s)
     curl -s -o /dev/null --max-time 20 "http://127.0.0.1:$PX/ep/" 2>/dev/null || true
-    t1=$(date +%s.%N)
+    t1=$(mono_s)
     awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}'
 }
 

@@ -185,14 +185,14 @@ lag_once() {                       # -> milliseconds, or 9999 if it never moved
     base=$(conns)
     case "$base" in ''|*[!0-9]*) printf '9999'; return ;; esac
     exec 8<>"/dev/tcp/127.0.0.1/$LIVE_PORT" 2>/dev/null || { printf '9999'; return; }
-    t0=$(date +%s%3N)
+    t0=$(mono_ms)
     v="$base"
     for i in $(seq 1 400); do
         v=$(conns)
         [ "$v" != "$base" ] && break
     done
     if [ "$v" = "$base" ]; then printf '9999'
-    else printf '%s' "$(( $(date +%s%3N) - t0 ))"; fi
+    else printf '%s' "$(( $(mono_ms) - t0 ))"; fi
     exec 8>&-
     for i in $(seq 1 60); do
         [ "$(conns)" = "$base" ] && break
@@ -209,8 +209,8 @@ MEDIAN=$(printf '%s\n' $LAGS | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/
 # bound is on what the lag adds to it, as test_worker_stats_live.sh does.
 CLI=""
 for _ in $(seq 1 10); do
-    t0=$(date +%s%3N); conns >/dev/null
-    CLI="$CLI $(( $(date +%s%3N) - t0 ))"
+    t0=$(mono_ms); conns >/dev/null
+    CLI="$CLI $(( $(mono_ms) - t0 ))"
 done
 CLI_MS=$(printf '%s\n' $CLI | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
 echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS ), one stats round trip ${CLI_MS} ms"
@@ -246,8 +246,8 @@ sleep 1
 # Sanitize the CLI process alone costs ~170 ms before it reaches the daemon.
 RT=""
 for _ in $(seq 1 5); do
-    t0=$(date +%s%3N); "$BIN" stats idlert >/dev/null 2>&1
-    RT="$RT $(( $(date +%s%3N) - t0 ))"
+    t0=$(mono_ms); "$BIN" stats idlert >/dev/null 2>&1
+    RT="$RT $(( $(mono_ms) - t0 ))"
 done
 RT_MS=$(printf '%s\n' $RT | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
 
@@ -255,8 +255,8 @@ RT_MS=$(printf '%s\n' $RT | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]
 RL=""; RL_FAILED=0
 for _ in $(seq 1 3); do
     sleep 1
-    t0=$(date +%s%3N); "$BIN" reload-lua idlert >/dev/null 2>&1 || RL_FAILED=$((RL_FAILED+1))
-    RL="$RL $(( $(date +%s%3N) - t0 ))"
+    t0=$(mono_ms); "$BIN" reload-lua idlert >/dev/null 2>&1 || RL_FAILED=$((RL_FAILED+1))
+    RL="$RL $(( $(mono_ms) - t0 ))"
 done
 # A refused reload is fast and would pass the bound without the worker ever being woken.
 if [ "$RL_FAILED" -eq 0 ]; then ok "every reload-lua succeeded"

@@ -8,6 +8,7 @@
 # that binds anything sources both, calls daemon_isolate before touching the
 # daemon, and puts daemon_stop last in cleanup because it deletes the state
 # directory.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_clock.sh"
 
 # Claim a private socket, state directory and log, before the first CLI command
 # auto-starts a daemon against whatever SOCKETLEY_SOCKET says -- HOME included,

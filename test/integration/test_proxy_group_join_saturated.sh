@@ -227,7 +227,7 @@ if [ "$RATE" -ge "$MIN_RATE" ]; then ok; else
 fi
 
 # ── the join ────────────────────────────────────────────────────────────────
-T0=$(date +%s.%N)
+T0=$(mono_s)
 create_ok "member 3 joins under load" \
     "$BIN" create proxy sjm3 -p $M3 --backend "127.0.0.1:$BE3" --protocol tcp -g $GRP -s
 
@@ -237,7 +237,7 @@ create_ok "member 3 joins under load" \
 FOUND=""
 DEADLINE=$(python3 -c "print($T0 + $JOIN_BOUND)")
 while :; do
-    NOW=$(date +%s.%N)
+    NOW=$(mono_s)
     if awk -v t0="$T0" '$1 >= t0 && $2 == "be3" {found=1; exit} END{exit !found}' "$EVF" 2>/dev/null; then
         FOUND=$(awk -v t0="$T0" '$1 >= t0 && $2 == "be3" {print $1; exit}' "$EVF")
         break

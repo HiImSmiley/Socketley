@@ -7,6 +7,7 @@
 # exactly when the whole suite is running -- so these ask the thing under test
 # to do its job through the same path as the measurement, with a whole-second
 # timeout and no sleep after success.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_clock.sh"
 
 # A connection is accepted, which is still the right check when that is all
 # that is being claimed and is the precondition the others build on.
@@ -184,10 +185,10 @@ PY
 ready_conns() {
     local bin=$1 name=$2 want=$3 timeout=${4:-15}
     local start deadline now out conn age sampled
-    start=$(date +%s%3N)
+    start=$(mono_ms)
     deadline=$(( start + timeout * 1000 ))
-    while [ "$(date +%s%3N)" -le "$deadline" ]; do
-        now=$(date +%s%3N)
+    while [ "$(mono_ms)" -le "$deadline" ]; do
+        now=$(mono_ms)
         out=$("$bin" stats "$name" 2>/dev/null) || true
         conn=$(printf '%s\n' "$out" | awk -F: '$1 == "connections" { print $2; exit }')
         age=$(printf '%s\n'  "$out" | awk -F: '$1 == "figures_age_ms" { print $2; exit }')
