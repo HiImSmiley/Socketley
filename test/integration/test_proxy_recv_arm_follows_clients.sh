@@ -241,7 +241,8 @@ run_arm() {   # tag [clients] [path] [hold] [samples]   (the pin is the caller's
     # after the storm is up and before it closes is what the proxy HOLDS while
     # the clients sit there, and that is the only one a withdrawal moves: it
     # cannot un-queue what arrived before the turn that withdrew the read.
-    local up=0
+    local up=0 kq
+    ARM_KERNEL=0
     : >"$WORK/rss.$tag"
     for i in $(seq 1 "$samples"); do
         sleep 0.1
@@ -253,6 +254,11 @@ run_arm() {   # tag [clients] [path] [hold] [samples]   (the pin is the caller's
         # non-empty file is the storm being up.
         [ "$up" = 0 ] && [ -s "$WORK/slow.$tag" ] && up=1
         [ "$up" = 1 ] && echo "$r" >>"$WORK/rss.$tag"
+        # What the kernel holds on the way to the clients, which no arm of the proxy has to.
+        kq=$( { ss -tnH state established "( dport = :$PPORT )" 2>/dev/null | awk '{s+=$1} END{print s+0}'
+                ss -tnH state established "( sport = :$PPORT )" 2>/dev/null | awk '{s+=$2} END{print s+0}'; } |
+              awk '{s+=$1} END{print int(s/1048576)}')
+        [ "${kq:-0}" -gt "$ARM_KERNEL" ] && ARM_KERNEL=$kq
     done
     wait "$sp" 2>/dev/null || true
     ARM_OPENED=$(head -1 "$WORK/slow.$tag" 2>/dev/null || echo 0)
@@ -344,15 +350,16 @@ for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sle
 # holding exactly 383 MB.
 unset SOCKETLEY_RECV_MULTISHOT
 run_arm bigrule "$MANY_CLIENTS" /pa/mid 10 400
-HELD_BR=$ARM_STEADY; OPENED_BR=$ARM_OPENED; SAMPLES_BR=$ARM_SAMPLES
+HELD_BR=$ARM_STEADY; OPENED_BR=$ARM_OPENED; SAMPLES_BR=$ARM_SAMPLES; KERNEL_BR=$ARM_KERNEL
 echo "  above the threshold, the rule: $OPENED_BR slow clients, held ${HELD_BR} MB (peak ${HELD} MB)"
 daemon_stop
 for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
 
 export SOCKETLEY_RECV_MULTISHOT=1
 run_arm bigpin "$MANY_CLIENTS" /pa/mid 10 400
-HELD_BP=$ARM_STEADY; OPENED_BP=$ARM_OPENED
+HELD_BP=$ARM_STEADY; OPENED_BP=$ARM_OPENED; KERNEL_BP=$ARM_KERNEL
 echo "  above the threshold, pinned:   $OPENED_BP slow clients, held ${HELD_BP} MB (peak ${HELD} MB)"
+echo "  the kernel's queues toward the clients held $KERNEL_BR and $KERNEL_BP MB"
 daemon_stop
 unset SOCKETLEY_RECV_MULTISHOT
 for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
@@ -367,6 +374,12 @@ elif [ "${OPENED_BR:-0}" -lt $((MANY_CLIENTS / 2)) ] || [ "${OPENED_BP:-0}" -lt 
 elif [ "${SAMPLES_BR:-0}" -le 0 ]; then
     fail "above the threshold the rule still bounds the queue" \
          "the rule arm took no RSS sample while its storm was up, so its ${HELD_BR} MB is no measurement"
+elif [ $(( KERNEL_BP * 100 )) -ge $(( OPENED_BP * (BODY_MID >> 20) * 90 )) ]; then
+    # A kernel that buffers whole bodies in the sockets toward clients that never read leaves the proxy nothing to
+    # hold in either arm: on a 28-core desktop the queues took 1100 MB of 1100 bodies and both arms held 82 MB.
+    not_asserted "above the threshold the rule still bounds the queue" \
+        "the kernel's queues toward the clients took $KERNEL_BP MB of $OPENED_BP bodies of $((BODY_MID >> 20)) MB, so" \
+        "the proxy had nothing left to hold (${HELD_BR} against ${HELD_BP} MB) and the ratio says nothing"
 elif [ "${HELD_BP:-0}" -le 0 ]; then
     fail "above the threshold the rule still bounds the queue" \
          "the pinned arm held ${HELD_BP} MB, so there is no ratio to take" \
