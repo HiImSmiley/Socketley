@@ -1,4 +1,5 @@
 #include "outbound_http.h"
+#include "../util/settings.h"
 #include "../net/file_send.h"
 
 #include <algorithm>
@@ -36,6 +37,8 @@ constexpr size_t answer_cap = 1u << 20;
 constexpr uint32_t read_bytes = 16 * 1024;
 // The most plaintext handed to the record layer at once.
 constexpr size_t tls_piece = 1u << 20;
+// A file body over this moves a TLS connection's send key to the kernel and goes by sendfile, as a server's file does.
+constexpr uint64_t kernel_tls_min = 256u << 10;
 
 std::string_view trim(std::string_view s)
 {
@@ -330,6 +333,8 @@ void http_peer::exchange(http_request req, std::function<void(http_answer)> done
     m_tls_rest_off = 0;
     m_file_sent    = 0;
     m_in_pipe      = 0;
+    m_file_kernel  = false;
+    m_file_by_source = false;
     m_sent         = false;
     m_write_failed = false;
     m_eof          = false;
@@ -458,20 +463,36 @@ void http_peer::advance()
                 plain.clear();
             }
         }
-        if (plain.empty() && m_req.file_fd >= 0 && m_ssl)
+        // Over TLS a file goes by sendfile once the connection's send key is the kernel's, which a body this size moves.
+        if (plain.empty() && m_req.file_fd >= 0 && m_ssl && !m_file_kernel && !m_file_by_source)
         {
-            finish(false, "a body from a file does not go over TLS");
-            return;
+            static const bool kernel_tls = socketley::settings::flag("SOCKETLEY_KERNEL_TLS", true);
+            m_file_kernel = kernel_tls && m_req.file_len > kernel_tls_min && tls_context::allow_kernel_tls(m_ssl, m_fd) &&
+                            tls_context::start_kernel_tls(m_ssl) == tls_context::kernel_switch::on;
+            m_file_by_source = !m_file_kernel;
+            if (m_file_by_source && !m_req.source)
+            {
+                finish(false, "a body from a file goes over TLS only through the kernel's, which this one cannot");
+                return;
+            }
         }
-        if (plain.empty() && m_req.file_fd >= 0 && (m_file_sent < m_req.file_len || m_in_pipe > 0))
+        if (plain.empty() && m_req.file_fd >= 0 && !m_file_by_source &&
+            (m_file_sent < m_req.file_len || m_in_pipe > 0))
         {
+            // What OpenSSL holds before the switch goes first, and nothing in the clear reaches a socket it encrypts for.
+            if (m_ssl && !tls_context::kernel_ready(m_ssl))
+            {
+                if (!flush_cipher() && !m_write_failed)
+                    finish(false, "the kernel took no send key");
+                return;
+            }
             file_body();
             return;
         }
         // A file body that is all sent leaves the pipe empty, for the next request's.
         if (m_req.file_fd >= 0)
             m_pipe_dirty = false;
-        if (plain.empty() && m_req.source && !m_source_done)
+        if (plain.empty() && m_req.source && !m_source_done && (m_req.file_fd < 0 || m_file_by_source))
         {
             const uint64_t gen = m_gen;
             auto alive = m_alive;
@@ -572,8 +593,38 @@ void http_peer::advance()
 bool http_peer::flush_cipher()
 {
     std::string cipher;
-    if (tls_context::take_out(m_ssl, cipher) == 0)
-        return false;
+    while (tls_context::take_out(m_ssl, cipher) == 0)
+    {
+        // A mark in the stream: the send key going to the kernel, or a record of its own type sent here.
+        const auto step = tls_context::kernel_step(m_ssl);
+        if (step == tls_context::kernel_step_result::failed)
+        {
+            m_write_failed = true;
+            receive();
+            return true;
+        }
+        if (step == tls_context::kernel_step_result::wait)
+        {
+            const uint64_t gen = m_gen;
+            auto alive = m_alive;
+            if (!m_io.poll(m_fd, POLLOUT, [this, alive, gen](int64_t res)
+                {
+                    if (!*alive || m_gen != gen)
+                        return;
+                    if (res < 0 || (res & (POLLERR | POLLHUP)) != 0)
+                    {
+                        m_write_failed = true;
+                        receive();
+                        return;
+                    }
+                    advance();
+                }))
+                finish(false, "the ring is full");
+            return true;
+        }
+        if (step == tls_context::kernel_step_result::idle || !tls_context::has_pending_out(m_ssl))
+            return false;
+    }
     send(std::make_shared<std::string>(std::move(cipher)), 0);
     return true;
 }

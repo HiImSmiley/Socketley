@@ -1379,11 +1379,11 @@ std::vector<std::pair<std::string, std::string>> node_headers(const object_meta&
     return h;
 }
 
-// Whether `len` bytes of `m` go to `target` straight from the file: bytes stored as they are, on a connection without TLS, and
-// enough of them to be worth the pipe.
+// Whether `len` bytes of `m` may go to `target` straight from the file: bytes stored as they are, and enough of them to
+// be worth it -- over TLS through the kernel's encryption, so with the source beside the file for where that cannot be.
 bool spliceable(const http_target& target, const object_meta& m, uint64_t len)
 {
-    return !target.tls && !is_encrypted(m) && !is_compressed(m) && len >= 64 * 1024;
+    return !is_encrypted(m) && !is_compressed(m) && len >= (target.tls ? 256u * 1024 : 64u * 1024);
 }
 
 // The object's own checksum in `algo`, empty when it keeps none.
@@ -1413,7 +1413,7 @@ void replicator::send_single(lane& l, const std::shared_ptr<job>& j)
         rq.file_off = j->data_off;
         rq.file_len = m.size;
     }
-    else if (m.size)
+    if (m.size && (rq.file_fd < 0 || l.target.http.tls))
         rq.source = body_of(j, 0, m.size);
     exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
     {
@@ -1485,7 +1485,7 @@ void replicator::mpu_part(lane& l, const std::shared_ptr<job>& j)
         rq.file_off = j->data_off + first;
         rq.file_len = len;
     }
-    else if (len)
+    if (len && (rq.file_fd < 0 || l.target.http.tls))
         rq.source = body_of(j, first, len);
     exchange(l, j, std::move(rq), [this, number](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
     {

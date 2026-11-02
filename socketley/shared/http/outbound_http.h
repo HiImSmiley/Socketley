@@ -73,8 +73,9 @@ struct http_request
     std::string body;
     // A body handed out a piece at a time after the head and `body`, none when empty.
     http_body_source source;
-    // Or a body moved straight from a file by splice, [file_off, file_off + file_len) of `file_fd`, which the caller
-    // keeps open; only on a connection without TLS, whose bytes never pass through this process.
+    // Or a body moved straight from a file by sendfile, [file_off, file_off + file_len) of `file_fd`, which the caller
+    // keeps open; over TLS once the connection's send key is the kernel's, with `source` given beside it for where that
+    // cannot be.
     int         file_fd{-1};
     uint64_t    file_off{0};
     uint64_t    file_len{0};
@@ -204,6 +205,9 @@ private:
     uint64_t    m_file_sent{0};
     uint32_t    m_in_pipe{0};
     bool        m_pipe_dirty{false};
+    // Over TLS: the file body goes by sendfile through kernel TLS, or by the source where the kernel cannot take it.
+    bool        m_file_kernel{false};
+    bool        m_file_by_source{false};
     bool        m_source_done{false};
     bool        m_sent{false};
     // A write failed, so the answer the host may have sent before closing is all that is left to read.
