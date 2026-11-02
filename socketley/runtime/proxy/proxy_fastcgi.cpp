@@ -803,7 +803,12 @@ bool proxy_instance::fcgi_kernel_file(proxy_client_connection* conn, uint64_t le
 {
     if (tls_context::kernel_ready(conn->ssl))
         return true;
-    if (!m_kernel_tls || left <= kernel_tls_min)
+    return left > kernel_tls_min && client_kernel_tls(conn);
+}
+
+bool proxy_instance::client_kernel_tls(proxy_client_connection* conn)
+{
+    if (!m_kernel_tls)
         return false;
     const auto k = tls_context::start_kernel_tls(conn->ssl);
     if (k == tls_context::kernel_switch::unavailable)

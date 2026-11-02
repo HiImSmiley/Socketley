@@ -375,6 +375,7 @@ void proxy_backend_connection::reset(int new_fd)
     splice_in_pending = false;
     splice_out_pending = false;
     full_reads = 0;
+    tls_relayed = 0;
     splice_small = false;
     pool_draining = false;
     recv_withdrawing = false;
@@ -2015,7 +2016,6 @@ bool proxy_instance::setup(event_loop& loop)
             return false;
         if (!m_files && m_loop)
             m_files = std::make_unique<fcgi_file_pump>(*m_loop);
-        m_kernel_tls = socketley::settings::flag("SOCKETLEY_KERNEL_TLS", true);
         // An HTTP probe is a request php-fpm cannot read, so its health is whether it takes a connection.
         if (m_mesh.health_check == mesh_config::health_http)
             m_mesh.health_check = mesh_config::health_tcp;
@@ -2101,6 +2101,7 @@ bool proxy_instance::setup(event_loop& loop)
         }
     }
     m_splice_enabled = splice_opt_in();
+    m_kernel_tls = socketley::settings::flag("SOCKETLEY_KERNEL_TLS", true);
 
     // Pre-build prefix once to avoid per-request allocation; a proxy with
     // --domain is reached by its name instead, and passes the path on as it came.
@@ -3145,7 +3146,8 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
                 close_pair(client_fd, -1);
                 goto proxy_resubmit_accept;
             }
-            if (m_kernel_tls && m_files && !tls_context::allow_kernel_tls(ptr->ssl, client_fd))
+            if (m_kernel_tls && (m_files || m_protocol == protocol_tcp) &&
+                !tls_context::allow_kernel_tls(ptr->ssl, client_fd))
                 m_kernel_tls = false;
             ptr->tls_state = tls_conn_handshake;
             ptr->handshake_since = std::chrono::steady_clock::now();
@@ -4646,7 +4648,12 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         m_conn_idx[conn->client_fd].side == conn_client)
     {
         conn->full_reads = data_len >= PROXY_READ_BUF_SIZE ? static_cast<uint8_t>(conn->full_reads + 1) : 0;
-        if (conn->full_reads >= splice_after_full_reads)
+        // A TLS client goes by what has come, as a file does, since how a backend cuts its stream decides whether reads
+        // fill: behind a backend that corks, 3 of 16 streaming clients ever filled four in a row.
+        const bool tls_client = m_conn_idx[conn->client_fd].client->ssl != nullptr;
+        if (tls_client)
+            conn->tls_relayed += data_len;
+        if (tls_client ? conn->tls_relayed > kernel_tls_min : conn->full_reads >= splice_after_full_reads)
         {
             auto* cconn = m_conn_idx[conn->client_fd].client;
             splice_side_on(cconn, conn, false);
@@ -7168,9 +7175,10 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 // a splice; not a stream's connection, framed onto its parent; not to an application server, whose records are
 // translated; not on the loopback shortcut, whose queue splice does not read; and not where a script or a rate
 // limit has to see each read.
-bool proxy_instance::splice_eligible(const proxy_client_connection* conn, const proxy_backend_connection* bconn)
+bool proxy_instance::splice_eligible(proxy_client_connection* conn, const proxy_backend_connection* bconn,
+                                     bool client_side)
 {
-    if (m_protocol != protocol_tcp || conn->ssl != nullptr || bconn->ssl != nullptr || conn->h2_parent != nullptr ||
+    if (m_protocol != protocol_tcp || bconn->ssl != nullptr || conn->h2_parent != nullptr ||
         conn->h3s != nullptr || m_fastcgi || conn->rl_max > 0 || get_global_rate_limit() > 0.0 ||
         on_fast_lo(conn->fd, bconn->fd))
         return false;
@@ -7178,7 +7186,9 @@ bool proxy_instance::splice_eligible(const proxy_client_connection* conn, const 
     if (auto* lctx = lua(); lctx && (lctx->has_on_proxy_request() || lctx->has_on_proxy_response()))
         return false;
 #endif
-    return true;
+    // A TLS client's side splices only what goes to it, once its send key is the kernel's, which is asked for last;
+    // what it sends is decrypted here.
+    return conn->ssl == nullptr || (!client_side && client_kernel_tls(conn));
 }
 
 // A pipe for one side's splice, O_CLOEXEC so a worker forked mid-transfer does not hold it.
@@ -7208,7 +7218,12 @@ void proxy_instance::close_splice_pipe(int (&p)[2])
 
 void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_backend_connection* bconn)
 {
-    if (!splice_eligible(conn, bconn) || !open_splice_pipe(conn->pipe_to_backend) ||
+    if (conn->ssl != nullptr)
+    {
+        splice_side_on(conn, bconn, false);
+        return;
+    }
+    if (!splice_eligible(conn, bconn, true) || !open_splice_pipe(conn->pipe_to_backend) ||
         !open_splice_pipe(bconn->pipe_to_client))
         return;
     conn->splice_active = true;
@@ -7219,9 +7234,18 @@ void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_bac
 #endif
 }
 
+bool proxy_instance::backend_feeds_kernel_tls(const proxy_backend_connection* bconn) const
+{
+    if (bconn->client_fd < 0 || bconn->client_fd >= MAX_FDS || m_conn_idx[bconn->client_fd].side != conn_client)
+        return false;
+    const proxy_client_connection* c = m_conn_idx[bconn->client_fd].client;
+    return c->ssl != nullptr && tls_context::kernel_ready(c->ssl);
+}
+
 void proxy_instance::splice_side_on(proxy_client_connection* conn, proxy_backend_connection* bconn, bool client_side)
 {
-    if (!splice_eligible(conn, bconn) || !open_splice_pipe(client_side ? conn->pipe_to_backend : bconn->pipe_to_client))
+    if (!splice_eligible(conn, bconn, client_side) ||
+        !open_splice_pipe(client_side ? conn->pipe_to_backend : bconn->pipe_to_client))
         return;
     (client_side ? conn->splice_active : bconn->splice_active) = true;
     (client_side ? conn->full_reads : bconn->full_reads) = 0;
@@ -7257,7 +7281,8 @@ bool proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
         }
     }
     if (bconn->splice_active && !bconn->splice_in_pending && !bconn->splice_out_pending && !bconn->read_pending &&
-        !bconn->backend_eof && !bconn->closing && conn->write_queue.empty() && !conn->write_pending)
+        !bconn->backend_eof && !bconn->closing && conn->write_queue.empty() && !conn->write_pending &&
+        (conn->ssl == nullptr || tls_context::kernel_ready(conn->ssl)))
     {
         bconn->splice_in_pending = true;
         if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(bconn->fd, &bconn->splice_in_req)))
@@ -7679,8 +7704,10 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 return;
             }
 
-            // As on the client leg: a message goes back to the copy path.
-            if (SOCKETLEY_LIKELY(!conn->closing) && !m_splice_enabled && conn->splice_small)
+            // As on the client leg: a message goes back to the copy path -- but not to a TLS client whose send key is
+            // the kernel's, where the copy path is the dearer of the two.
+            if (SOCKETLEY_LIKELY(!conn->closing) && !m_splice_enabled && conn->splice_small &&
+                !backend_feeds_kernel_tls(conn))
             {
                 conn->splice_active = false;
                 conn->full_reads = 0;

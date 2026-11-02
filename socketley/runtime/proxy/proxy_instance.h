@@ -464,6 +464,8 @@ struct alignas(64) proxy_backend_connection
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
+    // What the backend has relayed to a TLS client, which turns its side over to splice through kernel TLS.
+    uint64_t tls_relayed{0};
     uint8_t full_reads{0};
     bool splice_small{false};
     // The response is finished and this connection is on its way to the pool
@@ -1047,7 +1049,7 @@ private:
     // A splice made here, on the loop, and its completion handled at once.
     bool splice_now(int in, int out, uint32_t len, io_request* req);
     void close_splice_pipe(int (&p)[2]);
-    bool splice_eligible(const proxy_client_connection* conn, const proxy_backend_connection* bconn);
+    bool splice_eligible(proxy_client_connection* conn, const proxy_backend_connection* bconn, bool client_side);
     // One side of a pair turned over to splice once its reads show a stream.
     void splice_side_on(proxy_client_connection* conn, proxy_backend_connection* bconn, bool client_side);
 
@@ -1301,6 +1303,10 @@ private:
     bool m_kernel_tls{true};
     // Whether this file goes to a TLS client by sendfile, moving the connection's send key to the kernel to.
     bool fcgi_kernel_file(proxy_client_connection* conn, uint64_t left);
+    // Moves a TLS client's send key to the kernel, or says it is there or will be; false where it cannot be.
+    bool client_kernel_tls(proxy_client_connection* conn);
+    // The backend's splice feeds a TLS client whose send key is the kernel's.
+    bool backend_feeds_kernel_tls(const proxy_backend_connection* bconn) const;
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 
     // ── the entrance ────────────────────────────────────────────────────────
