@@ -117,7 +117,8 @@ def check(acked_path, target, cutoff_ns, kill_ns):
             parts = line.split()
             if len(parts) == 3:
                 acked.append((int(parts[0]), int(parts[1]), parts[2]))
-    conn = dial(target, 5.0)
+    # Read after the kills, where nothing is timed: a batch of answers may wait on a loaded box or a sanitizer.
+    conn = dial(target, 30.0)
     f = conn.makefile("rwb", buffering=0)
     missing = []
     holes = 0

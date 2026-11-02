@@ -282,10 +282,16 @@ if phase == "reread":
         check("a password changed in the file is taken while running",
               code_of(pa, client_id="r1", username="alice", password="alicenew9"), 0)
         check("and the old one refused", code_of(pa, client_id="r2", username="alice", password="alicepass1"), 0x86)
-        al = connected(pa, "alice-r", username="alice", password="alicenew9")
-        check("rules changed in the file are taken while running", al.subscribe(("public/#", 1), ("granted/now", 1)),
-              [0x87, 1])
-        al.disconnect()
+        # The rules are a file of their own, which a tick may take after the passwords.
+        end = time.time() + 5
+        while True:
+            al = connected(pa, "alice-r", username="alice", password="alicenew9")
+            got = al.subscribe(("public/#", 1), ("granted/now", 1))
+            al.disconnect()
+            if got == [0x87, 1] or time.time() >= end:
+                break
+            time.sleep(0.2)
+        check("rules changed in the file are taken while running", got, [0x87, 1])
         q = Client(pa, version=4)
         check("alice comes back to her session", q.connect("alice-q", clean=False, username="alice",
                                                           password="alicenew9")[:2], (True, 0))
