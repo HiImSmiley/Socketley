@@ -1108,6 +1108,9 @@ private:
     void queue_http_response(server_connection* conn, std::shared_ptr<const std::string> resp,
                              bool ends_exchange = true);
     bool send_final_and_fin(server_connection* conn, std::string_view data);
+    // A cached response, the keep-alive one whole or the close header over the same body, so the body is kept once.
+    void queue_cached_response(server_connection* conn, const std::shared_ptr<const std::string>& ka,
+                               const std::shared_ptr<const std::string>& close_head, uint32_t body_at);
 
     // Answer a request whose framing could not be established and end the
     // connection, in one function because a refusal that forgets to clear
@@ -1524,13 +1527,13 @@ private:
     void open_http_root();
     bool m_http_cache_enabled{false};
     bool m_http_compress{false};
-    // Both variants are prebuilt, because a cache hit has to stay a refcount
-    // bump and the response's own Connection header has to match what the
-    // client asked for.
+    // The keep-alive response and the close one's header, which goes out ahead of the keep-alive one's body, so a hit
+    // stays a refcount bump with the Connection header the client asked for and the body is not kept twice.
     struct cached_file
     {
-        std::shared_ptr<const std::string> response;        // Connection: keep-alive
-        std::shared_ptr<const std::string> response_close;  // Connection: close
+        std::shared_ptr<const std::string> response;     // Connection: keep-alive
+        std::shared_ptr<const std::string> close_head;   // Connection: close, its header alone
+        uint32_t body_at{0};
         std::string etag;
     };
     std::unordered_map<std::string, cached_file, string_hash, string_equal> m_http_cache;
@@ -1549,8 +1552,9 @@ private:
         uint32_t mtime_nsec{0};
         size_t   bytes{0};   // what this entry costs, both variants together
         std::string etag;
-        std::shared_ptr<const std::string> response;        // Connection: keep-alive
-        std::shared_ptr<const std::string> response_close;  // Connection: close
+        std::shared_ptr<const std::string> response;     // Connection: keep-alive
+        std::shared_ptr<const std::string> close_head;   // Connection: close, its header alone
+        uint32_t body_at{0};
     };
     std::unordered_map<std::string, reval_file, string_hash, string_equal> m_http_reval;
 
@@ -1595,8 +1599,7 @@ private:
     // it is called from two places.
     void note_http_reval_full();
     void http_reval_store(const std::string& url_path, const struct stat& st,
-                          std::shared_ptr<const std::string> ka,
-                          std::shared_ptr<const std::string> cl);
+                          std::shared_ptr<const std::string> ka);
 
     // Splice pipe for zero-copy file serving (shared across connections, one at a time)
     // How many connections hold a splice pipe right now.  A cap and not a

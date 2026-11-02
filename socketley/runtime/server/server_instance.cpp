@@ -724,6 +724,19 @@ static std::string build_http_response_at(std::string_view content_type,
     return resp;
 }
 
+// The close response's header for a keep-alive one, and where the body they share begins.
+static std::shared_ptr<const std::string> close_head_of(const std::string& ka, uint32_t& body_at)
+{
+    static constexpr std::string_view ka_end = "\r\nConnection: keep-alive\r\n\r\n";
+    const size_t at = ka.find(ka_end);
+    if (at == std::string::npos)
+        return nullptr;
+    body_at = static_cast<uint32_t>(at + ka_end.size());
+    std::string head(ka, 0, at);
+    head.append("\r\nConnection: close\r\n\r\n");
+    return std::make_shared<const std::string>(std::move(head));
+}
+
 static void append_num(std::string& out, size_t n)
 {
     char buf[24];
@@ -1125,26 +1138,20 @@ void server_instance::rebuild_http_cache()
                 std::string key = "/" + file;
                 key.push_back('\0');
                 key.append(coding);
-                m_http_cache[key] = {
-                    std::make_shared<const std::string>(build_http_response(typed, content, true, etag)),
-                    std::make_shared<const std::string>(build_http_response(typed, content, false, etag)),
-                    etag
-                };
+                cached_file& e = m_http_cache[key];
+                e.response = std::make_shared<const std::string>(build_http_response(typed, content, true, etag));
+                e.close_head = close_head_of(*e.response, e.body_at);
+                e.etag = etag;
             }
 
-        // Both variants stored, because a single keep-alive string answered
-        // `Connection: keep-alive` to every request including the ones that
-        // asked to close.
         // Accept-Ranges as the disk path says it, since a range is served from the file; not on a page, whose
         // injected script moves every offset.
         const size_t whole = std::string_view::npos;
-        m_http_cache[url_path] = {
-            std::make_shared<const std::string>(html ? build_http_response(ct, content, true, etag)
-                                                     : build_http_response_at(ct, content, whole, true, etag)),
-            std::make_shared<const std::string>(html ? build_http_response(ct, content, false, etag)
-                                                     : build_http_response_at(ct, content, whole, false, etag)),
-            etag
-        };
+        cached_file& e = m_http_cache[url_path];
+        e.response = std::make_shared<const std::string>(html ? build_http_response(ct, content, true, etag)
+                                                              : build_http_response_at(ct, content, whole, true, etag));
+        e.close_head = close_head_of(*e.response, e.body_at);
+        e.etag = etag;
     }
 }
 
@@ -1184,9 +1191,10 @@ void server_instance::note_http_reval_full()
 }
 
 void server_instance::http_reval_store(const std::string& url_path, const struct stat& st,
-                                       std::shared_ptr<const std::string> ka,
-                                       std::shared_ptr<const std::string> cl)
+                                       std::shared_ptr<const std::string> ka)
 {
+    uint32_t body_at = 0;
+    auto cl = ka ? close_head_of(*ka, body_at) : nullptr;
     size_t cost = (ka ? ka->size() : 0) + (cl ? cl->size() : 0);
     if (!http_reval_would_fit(url_path, cost))
     {
@@ -1205,8 +1213,9 @@ void server_instance::http_reval_store(const std::string& url_path, const struct
     e.mtime_nsec = static_cast<uint32_t>(st.st_mtim.tv_nsec);
     e.etag       = socketley::http::etag_of(socketley::file_stamp::of(st));
     e.bytes      = cost;
-    e.response       = std::move(ka);
-    e.response_close = std::move(cl);
+    e.response   = std::move(ka);
+    e.close_head = std::move(cl);
+    e.body_at    = body_at;
     m_http_reval_bytes += cost;
 }
 
@@ -1331,9 +1340,10 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             it = m_http_cache.find(url_path);
         if (it != m_http_cache.end() && not_modified(it->second.etag))
             return;
-        queue_http_response(conn, it != m_http_cache.end()
-            ? (conn->http_keep_alive ? it->second.response : it->second.response_close)
-            : http_404_response(conn->http_keep_alive));
+        if (it != m_http_cache.end())
+            queue_cached_response(conn, it->second.response, it->second.close_head, it->second.body_at);
+        else
+            queue_http_response(conn, http_404_response(conn->http_keep_alive));
         if (!conn->http_keep_alive)
             conn->closing = true;
         else
@@ -1413,8 +1423,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                 {
                     if (not_modified(rit->second.etag))
                         return;
-                    queue_http_response(conn, conn->http_keep_alive ? rit->second.response
-                                                                    : rit->second.response_close);
+                    queue_cached_response(conn, rit->second.response, rit->second.close_head, rit->second.body_at);
                     if (!conn->http_keep_alive)
                         conn->closing = true;
                     else
@@ -1967,6 +1976,60 @@ void server_instance::queue_http_response(server_connection* conn,
         return;
     }
     conn->write_queue.push(std::move(resp));
+    if (!conn->write_pending)
+        flush_write_queue(conn);
+}
+
+void server_instance::queue_cached_response(server_connection* conn, const std::shared_ptr<const std::string>& ka,
+                                            const std::shared_ptr<const std::string>& close_head, uint32_t body_at)
+{
+    // A HEAD answered by the header alone, which the close one is.
+    if (conn->http_keep_alive || !close_head || conn->http_head)
+    {
+        queue_http_response(conn, conn->http_keep_alive || !close_head ? ka : close_head);
+        return;
+    }
+    const size_t body = ka->size() - body_at;
+    if (!admit_send(conn, close_head->size() + body, true))
+        return;
+    http_answered(conn);
+    // The header and the body in one send where nothing is ahead of them, as send_final_and_fin() sends one.
+    size_t off = 0;
+    const size_t total = close_head->size() + body;
+    if (conn->fd >= 0 && conn->ssl == nullptr && !conn->wr_shutdown && !conn->write_pending && !conn_has_output(conn) &&
+        conn->cache_pending == 0 && !conn->splice_pending && !conn->splice_in_pending && !conn->splice_out_pending)
+    {
+        while (off < total)
+        {
+            struct iovec iov[2];
+            int n_iov = 0;
+            if (off < close_head->size())
+                iov[n_iov++] = {const_cast<char*>(close_head->data() + off), close_head->size() - off};
+            const size_t in_body = off > close_head->size() ? off - close_head->size() : 0;
+            iov[n_iov++] = {const_cast<char*>(ka->data() + body_at + in_body), body - in_body};
+            struct msghdr m{};
+            m.msg_iov = iov;
+            m.msg_iovlen = static_cast<size_t>(n_iov);
+            const ssize_t n = ::sendmsg(conn->fd, &m, MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE);
+            if (n > 0) { off += static_cast<size_t>(n); continue; }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        stat_add(m_stat_bytes_out, off);
+        if (off == total)
+        {
+            conn->wr_shutdown = true;
+            if (shutdown(conn->fd, SHUT_WR) < 0) {}
+            return;
+        }
+    }
+    // What is left, the header's rest owned and the body a slice of the keep-alive response.
+    if (off < close_head->size())
+        conn->write_queue.push(socketley::write_chunk(close_head->substr(off)));
+    const size_t in_body = off > close_head->size() ? off - close_head->size() : 0;
+    if (in_body < body)
+        conn->write_queue.push(socketley::write_chunk(ka, static_cast<uint32_t>(body_at + in_body),
+                                                      static_cast<uint32_t>(body - in_body)));
     if (!conn->write_pending)
         flush_write_queue(conn);
 }
@@ -7056,7 +7119,7 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     const bool keepable = !conn->is_range && !conn->file_url_path.empty() &&
                           static_cast<uint64_t>(cqe->res) ==
                               static_cast<uint64_t>(conn->file_st.st_size);
-    const bool fits = http_reval_would_fit(conn->file_url_path, 2 * (128 + body_len));
+    const bool fits = http_reval_would_fit(conn->file_url_path, 2 * 128 + body_len);
     // This is the door the full map is actually refused at, so this is where it
     // gets said -- and only for a file that was otherwise keepable, since a 206
     // or a short read is declined for its own reasons and says nothing about the
@@ -7068,10 +7131,10 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     {
         auto ka = std::make_shared<const std::string>(build_http_response_at(
             conn->file_content_type, file_content, inject_at, true, conn->file_etag));
-        auto cl = std::make_shared<const std::string>(build_http_response_at(
-            conn->file_content_type, file_content, inject_at, false, conn->file_etag));
-        queue_http_response(conn, conn->http_keep_alive ? ka : cl);
-        http_reval_store(conn->file_url_path, conn->file_st, std::move(ka), std::move(cl));
+        http_reval_store(conn->file_url_path, conn->file_st, ka);
+        uint32_t body_at = 0;
+        const auto cl = conn->http_keep_alive ? nullptr : close_head_of(*ka, body_at);
+        queue_cached_response(conn, ka, cl, body_at);
     }
     else if (conn->is_range)
     {
