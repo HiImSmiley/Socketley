@@ -1692,6 +1692,10 @@ private:
     // A cap on what streaming puts hold, so a thousand uploaders cannot ask for a thousand buffers.
     uint32_t    m_max_active_puts{512};
     size_t      m_zero_copy_min{64 * 1024};
+    // An object over this on a TLS 1.3 connection moves its send key to the kernel and goes by sendfile, as the
+    // server's files do; SOCKETLEY_KERNEL_TLS=0 keeps every record in user space.
+    static constexpr uint64_t kernel_tls_min = 256u << 10;
+    bool        m_kernel_tls{true};
     size_t      m_max_conns{0};
     // Whether a recv can be lent a buffer by the ring, and be armed once to keep delivering.
     bool        m_ring{false};

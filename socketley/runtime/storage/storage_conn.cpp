@@ -161,6 +161,7 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     m_h2 = settings::flag("SOCKETLEY_STORAGE_HTTP2", m_h2);
     if (const auto v = settings::number<size_t>("SOCKETLEY_STORAGE_SPLICE_MIN"))
         m_zero_copy_min = *v;
+    m_kernel_tls = settings::flag("SOCKETLEY_KERNEL_TLS", true);
     // A count the tests shrink to make the ring run dry; zero takes it away.
     uint32_t ring_bufs = ring_buf_count;
     if (const auto v = settings::number<uint32_t>("SOCKETLEY_STORAGE_RECV_BUFS"); v && (*v & (*v - 1)) == 0)
@@ -538,6 +539,8 @@ void storage_run::adopt(int fd)
             m_loop.close_fd(fd);
             return;
         }
+        if (m_kernel_tls && !tls_context::allow_kernel_tls(c->ssl, fd))
+            m_kernel_tls = false;
         c->tls_state = tls_conn_handshake;
     }
     m_conns.emplace(c->id, c);
@@ -1438,6 +1441,53 @@ bool storage_run::tls_encrypt(const std::shared_ptr<conn>& c)
     }
     if (c->wbuf.size() - c->woff < tls_write_cap)
         tls_context::take_out(c->ssl, c->wbuf, tls_write_cap - (c->wbuf.size() - c->woff));
+    // A mark the records stopped at, met once nothing before it is left to write: the send key going to the kernel,
+    // or a record of its own type sent here.
+    while (c->woff >= c->wbuf.size() && tls_context::has_pending_out(c->ssl))
+    {
+        const auto step = tls_context::kernel_step(c->ssl);
+        if (step == tls_context::kernel_step_result::failed)
+        {
+            close_conn(c);
+            return false;
+        }
+        if (step == tls_context::kernel_step_result::wait)
+        {
+            // Room on the socket says when to go on; a wait already armed for a file goes on with it instead.
+            if (!c->poll_pending)
+            {
+                std::weak_ptr<conn> weak = c;
+                if (!m_io.poll(c->fd, POLLOUT,
+                        [this, weak](int64_t res)
+                        {
+                            auto cc = weak.lock();
+                            if (!cc)
+                                return;
+                            cc->poll_pending = false;
+                            if (cc->dead)
+                            {
+                                maybe_release(cc);
+                                return;
+                            }
+                            if (res < 0 || (res & (POLLERR | POLLHUP)) != 0)
+                            {
+                                close_conn(cc);
+                                return;
+                            }
+                            pump_write(cc);
+                        }))
+                {
+                    close_conn(c);
+                    return false;
+                }
+                c->poll_pending = true;
+            }
+            return true;
+        }
+        if (step == tls_context::kernel_step_result::idle)
+            break;
+        tls_context::take_out(c->ssl, c->wbuf, tls_write_cap);
+    }
     return true;
 }
 
@@ -2515,8 +2565,28 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
     c->ph        = phase::respond;
     c->close_after_write = head.close;
     // A body worth it goes file to socket in the kernel, and the rest is read here and written from memory.
-    // Not on a session: sendfile moves bytes the record layer never sees.
+    // Not on a session whose send key is OpenSSL's: sendfile moves bytes the record layer never sees.
     c->spliced = !c->ssl && !c->stream() && len >= m_zero_copy_min;
+    // A TLS connection of one exchange at a time takes the same path once a large object moves its key to the kernel.
+    if (c->ssl && !c->stream() && !c->h2 && m_kernel_tls && len > kernel_tls_min)
+    {
+        const auto k = tls_context::start_kernel_tls(c->ssl);
+        c->spliced = k == tls_context::kernel_switch::on;
+        if (k == tls_context::kernel_switch::unavailable)
+        {
+            m_kernel_tls = false;
+            LOG_WARN("storage: the kernel has no TLS layer to give (modprobe tls), so objects over TLS are encrypted here");
+        }
+        else if (k == tls_context::kernel_switch::failed)
+        {
+            m_loop.close_fd(fd);
+            c->file_fd = -1;
+            close_conn(c);
+            return;
+        }
+    }
+    else if (c->ssl && !c->stream() && !c->h2 && len >= m_zero_copy_min && tls_context::kernel_ready(c->ssl))
+        c->spliced = true;
     if (c->spliced)
         ++m_c.zero_copy_gets;
     else
@@ -2527,7 +2597,8 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
     std::string h = response_head(*c, head);
     // With nothing ahead of it and no request waiting behind, the head goes at once, held for the file's first bytes,
     // and the file follows in this turn rather than one write completion later; what the socket does not take is queued.
-    if (c->spliced && !c->h2 && !c->wr_pending && c->wbuf.empty() && c->wq.empty() && c->in.empty())
+    if (c->spliced && !c->h2 && !c->wr_pending && c->wbuf.empty() && c->wq.empty() && c->in.empty() &&
+        (!c->ssl || tls_context::kernel_ready(c->ssl)))
     {
         const ssize_t n = file_send::send_head(c->fd, h);
         if (n < 0)
@@ -2576,6 +2647,12 @@ void storage_run::file_pump(const std::shared_ptr<conn>& c)
     // sendfile from the loop (shared/net/file_send.h), where a splice was two io-wq hand-offs a pipe-full and a worker
     // parked on every slow reader; a burst out of the page cache is read through the ring below instead.  The head is
     // out: this runs from its write's completion or from a wait for room, so no ring op is on the socket.
+    // Plaintext reaches a TLS connection's socket only once the kernel holds its send key.
+    if (c->spliced && c->ssl && !tls_context::kernel_ready(c->ssl))
+    {
+        close_conn(c);
+        return;
+    }
     if (c->spliced && !file_send::cold(c->file_fd, c->file_off, c->file_left))
     {
         uint64_t sent = 0;

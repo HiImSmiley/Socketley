@@ -370,6 +370,8 @@ struct alignas(64) proxy_client_connection
     bool kept_alive{false};
     // A FastCGI proxy's file answers: the socket's own flags, read once.
     int fcgi_sock_flags{-1};
+    // A wait for room for a record of its own type, which kernel TLS sends with its type and the socket was full for.
+    bool tls_wait{false};
 
     // Bumped on every reuse from the pool and stamped into io_requests, so
     // late completions from the previous occupant can be recognised and
@@ -1293,6 +1295,12 @@ private:
     bool fcgi_serve_open(proxy_client_connection* conn, std::string_view rel, std::string_view type_of = {},
                          std::string_view coding = {}, const struct statx* known = nullptr);
     std::unique_ptr<fcgi_file_pump> m_files;
+    // A file over this on a TLS 1.3 connection of one exchange at a time moves its send key to the kernel and goes by
+    // sendfile; SOCKETLEY_KERNEL_TLS=0 keeps every record in user space.
+    static constexpr uint64_t kernel_tls_min = 256u << 10;
+    bool m_kernel_tls{true};
+    // Whether this file goes to a TLS client by sendfile, moving the connection's send key to the kernel to.
+    bool fcgi_kernel_file(proxy_client_connection* conn, uint64_t left);
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 
     // ── the entrance ────────────────────────────────────────────────────────

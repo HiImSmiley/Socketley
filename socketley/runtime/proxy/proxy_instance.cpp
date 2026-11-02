@@ -287,6 +287,7 @@ void proxy_client_connection::reset(int new_fd)
     fd = new_fd;
     file.reset();
     fcgi_sock_flags = -1;
+    tls_wait = false;
     // client_pool_release() already did this, repeated because a struct
     // leaving the pool must not carry the previous connection's session.
     tls_context::free_ssl(ssl);
@@ -2014,6 +2015,7 @@ bool proxy_instance::setup(event_loop& loop)
             return false;
         if (!m_files && m_loop)
             m_files = std::make_unique<fcgi_file_pump>(*m_loop);
+        m_kernel_tls = socketley::settings::flag("SOCKETLEY_KERNEL_TLS", true);
         // An HTTP probe is a request php-fpm cannot read, so its health is whether it takes a connection.
         if (m_mesh.health_check == mesh_config::health_http)
             m_mesh.health_check = mesh_config::health_tcp;
@@ -3143,6 +3145,8 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
                 close_pair(client_fd, -1);
                 goto proxy_resubmit_accept;
             }
+            if (m_kernel_tls && m_files && !tls_context::allow_kernel_tls(ptr->ssl, client_fd))
+                m_kernel_tls = false;
             ptr->tls_state = tls_conn_handshake;
             ptr->handshake_since = std::chrono::steady_clock::now();
         }
@@ -11035,8 +11039,47 @@ bool proxy_instance::tls_flush(Conn* conn)
     // owns, because the BIO's storage moves under an SQE -- and it rides in
     // write_batch[0] so the retry paths need no TLS case.
     std::string cipher;
-    if (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, cipher) == 0))
-        return true;
+    while (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, cipher) == 0))
+    {
+        // A mark in the stream, on a client whose send key moves to the kernel: the key put on the socket, or a
+        // record of its own type sent here.
+        const auto step = tls_context::kernel_step(conn->ssl);
+        if (step == tls_context::kernel_step_result::failed)
+        {
+            conn->closing = true;
+            return true;
+        }
+        if (step == tls_context::kernel_step_result::wait)
+        {
+            if constexpr (std::is_same_v<Conn, proxy_client_connection>)
+            {
+                // Room on the socket says when to go on, judged by the descriptor and generation it was asked for.
+                if (!conn->tls_wait && m_files)
+                {
+                    const int fd = conn->fd;
+                    const uint32_t gen = conn->generation;
+                    conn->tls_wait = m_files->io.poll(fd, POLLOUT, [this, fd, gen](int64_t res)
+                    {
+                        if (!m_loop || fd < 0 || fd >= MAX_FDS || m_conn_idx[fd].side != conn_client)
+                            return;
+                        proxy_client_connection* c = m_conn_idx[fd].client;
+                        if (c->generation != gen || c->closing)
+                            return;
+                        c->tls_wait = false;
+                        if (res < 0 || (res & (POLLERR | POLLHUP)) != 0 || !flush_client_write_queue(c))
+                            close_pair(fd, c->ex.backend_fd);
+                    });
+                    if (!conn->tls_wait)
+                        conn->closing = true;
+                }
+            }
+            else
+                conn->closing = true;
+            return true;
+        }
+        if (step == tls_context::kernel_step_result::idle || !tls_context::has_pending_out(conn->ssl))
+            return true;
+    }
 
     // Nothing is in flight (checked above), so any batch entries still held are
     // from a completed write and are this function's to drop.

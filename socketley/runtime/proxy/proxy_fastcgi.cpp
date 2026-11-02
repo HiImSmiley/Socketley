@@ -632,13 +632,21 @@ void proxy_instance::fcgi_serve_file(proxy_client_connection* conn, std::shared_
             f->keep_as = std::string(rel);
             f->keep_stat = st;
         }
-        // TLS and a stream frame what they send, so only a plain connection takes the bytes straight from the file.
-        else if (f->left > 0 && conn->ssl == nullptr && conn->h2_parent == nullptr && conn->h3s == nullptr)
+        // A stream frames what it sends, and TLS too until the kernel holds its send key, so only a plain connection
+        // or one whose key moves to the kernel takes the bytes straight from the file.
+        else if (f->left > 0 && conn->h2_parent == nullptr && conn->h3s == nullptr &&
+                 (conn->ssl == nullptr || fcgi_kernel_file(conn, f->left)))
             f->sendfile = true;
+        if (conn->closing)
+        {
+            close_pair(conn->fd, conn->ex.backend_fd);
+            return;
+        }
     }
     // A file sent by sendfile has its head sent here and now, so the file follows in this same turn and not one
     // completion later; what the socket does not take is queued.
-    if (f->sendfile && !conn->write_pending && conn->write_queue.empty())
+    if (f->sendfile && !conn->write_pending && conn->write_queue.empty() &&
+        (conn->ssl == nullptr || tls_context::kernel_ready(conn->ssl)))
     {
         const ssize_t n = socketley::file_send::send_head(conn->fd, out);
         if (n < 0)
@@ -698,6 +706,14 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn, bool inline_c
         // The head goes out first, through the write queue, and nothing else writes to the socket until the file has.
         if (conn->write_pending || !conn->write_queue.empty())
             return;
+        // Plaintext reaches a TLS client's socket only once the kernel holds its send key and no record waits before it.
+        if (conn->ssl != nullptr && !tls_context::kernel_ready(conn->ssl))
+        {
+            if (tls_context::has_pending_out(conn->ssl) && flush_client_write_queue(conn))
+                return;
+            close_pair(conn->fd, conn->ex.backend_fd);
+            return;
+        }
         uint64_t sent = 0;
         const auto b = socketley::file_send::send(fd, conn->fcgi_sock_flags, f.fd, f.off, f.left, sent);
         stat_add(m_stat_bytes_out, sent);
@@ -781,6 +797,23 @@ void proxy_instance::fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<
         return;
     }
     fcgi_file_next(conn);
+}
+
+bool proxy_instance::fcgi_kernel_file(proxy_client_connection* conn, uint64_t left)
+{
+    if (tls_context::kernel_ready(conn->ssl))
+        return true;
+    if (!m_kernel_tls || left <= kernel_tls_min)
+        return false;
+    const auto k = tls_context::start_kernel_tls(conn->ssl);
+    if (k == tls_context::kernel_switch::unavailable)
+    {
+        m_kernel_tls = false;
+        LOG_WARN("proxy: the kernel has no TLS layer to give (modprobe tls), so files over TLS are encrypted here");
+    }
+    else if (k == tls_context::kernel_switch::failed)
+        conn->closing = true;
+    return k == tls_context::kernel_switch::on;
 }
 
 void proxy_instance::fcgi_file_polled(int fd, uint32_t gen, const std::shared_ptr<fcgi_file>& f, int64_t res)
