@@ -137,7 +137,7 @@ template <class S>
 void fit_to_path(session<S>& s, int fd)
 {
     if (socket_tuning::fit_to_path(fd))
-        s.out_high = 256 * 1024;
+        s.out_high = 64 * 1024;
 }
 
 template <class S>
