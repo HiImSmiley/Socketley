@@ -6600,7 +6600,7 @@ void server_instance::tls_flush(server_connection* conn)
     // Ciphertext copied out of the write BIO into a buffer this connection
     // owns, because the BIO's storage moves under an SQE -- and it rides in
     // write_batch[0] so the short-write retry needs no TLS case.
-    auto cipher = std::make_shared<std::string>();
+    auto cipher = tls_context::out_buffer();
     while (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, *cipher) == 0))
     {
         // A mark in the stream: the send key going to the kernel, or a record of its own type sent here.

@@ -11038,8 +11038,8 @@ bool proxy_instance::tls_flush(Conn* conn)
     // Ciphertext taken out of the write BIO into a buffer this connection
     // owns, because the BIO's storage moves under an SQE -- and it rides in
     // write_batch[0] so the retry paths need no TLS case.
-    std::string cipher;
-    while (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, cipher) == 0))
+    auto cipher = tls_context::out_buffer();
+    while (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, *cipher) == 0))
     {
         // A mark in the stream, on a client whose send key moves to the kernel: the key put on the socket, or a
         // record of its own type sent here.
@@ -11086,7 +11086,7 @@ bool proxy_instance::tls_flush(Conn* conn)
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
         conn->write_batch[i].clear();
 
-    conn->write_batch[0] = std::move(cipher);
+    conn->write_batch[0] = socketley::write_chunk(std::shared_ptr<const std::string>(std::move(cipher)));
     conn->write_iovs[0].iov_base = const_cast<char*>(conn->write_batch[0].data());
     conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
     conn->write_batch_count = 1;

@@ -235,6 +235,52 @@ const BIO_METHOD* out_method()
     return m;
 }
 
+// Record buffers a write is done with, kept for the next answer's records: one freed past the allocator's mmap threshold
+// went back to the kernel, and the next was faulted in and zeroed again, up to 205 faults a 1 MiB answer.
+constexpr size_t spare_min = 64u << 10;
+constexpr size_t spare_max = 8u << 20;
+constexpr size_t spare_total_max = 32u << 20;
+constexpr size_t spare_count_max = 32;
+struct spare_pool
+{
+    std::vector<std::string> bufs;
+    size_t bytes = 0;
+};
+spare_pool& spares()
+{
+    static thread_local spare_pool p;
+    return p;
+}
+
+void give_spare(std::string* s)
+{
+    auto& p = spares();
+    const size_t cap = s->capacity();
+    if (cap >= spare_min && cap <= spare_max && p.bufs.size() < spare_count_max && p.bytes + cap <= spare_total_max)
+    {
+        s->clear();
+        p.bytes += cap;
+        p.bufs.push_back(std::move(*s));
+    }
+    delete s;
+}
+
+// The smallest kept buffer that holds `n`, swapped into `into`, which is empty.
+void take_spare(std::string& into, size_t n)
+{
+    auto& p = spares();
+    size_t best = p.bufs.size();
+    for (size_t i = 0; i < p.bufs.size(); ++i)
+        if (p.bufs[i].capacity() >= n && (best == p.bufs.size() || p.bufs[i].capacity() < p.bufs[best].capacity()))
+            best = i;
+    if (best == p.bufs.size())
+        return;
+    p.bytes -= p.bufs[best].capacity();
+    into.swap(p.bufs[best]);
+    p.bufs[best] = std::move(p.bufs.back());
+    p.bufs.pop_back();
+}
+
 out_bio* out_of(const SSL* ssl)
 {
     BIO* wbio = ssl ? SSL_get_wbio(ssl) : nullptr;
@@ -1282,10 +1328,23 @@ void tls_context::reserve_out(SSL* ssl, size_t n)
 {
 #if SOCKETLEY_HAS_TLS
     if (out_bio* o = out_of(ssl))
+    {
+        if (o->buf.empty() && o->buf.capacity() < n && n >= spare_min)
+            take_spare(o->buf, n);
         o->buf.reserve(o->buf.size() + n);
+    }
 #else
     (void)ssl;
     (void)n;
+#endif
+}
+
+std::shared_ptr<std::string> tls_context::out_buffer()
+{
+#if SOCKETLEY_HAS_TLS
+    return std::shared_ptr<std::string>(new std::string, give_spare);
+#else
+    return std::make_shared<std::string>();
 #endif
 }
 

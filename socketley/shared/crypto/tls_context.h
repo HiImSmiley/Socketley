@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 #include <string>
 #include <string_view>
 #include <cstdint>
@@ -115,8 +116,11 @@ public:
     // Moves up to `max` bytes of the records waiting to be sent onto the end of `out`, and says how many: all of them
     // into an empty `out` without a copy.
     static size_t take_out(SSL* ssl, std::string& out, size_t max = SIZE_MAX);
-    // Room for `n` more bytes of records, so a large write grows the buffer once rather than by doubling.
+    // Room for `n` more bytes of records, so a large write grows the buffer once rather than by doubling; a buffer
+    // an out_buffer was done with is taken for it when one is large enough.
     static void reserve_out(SSL* ssl, size_t n);
+    // An empty string to take records into, whose storage is kept for the next records once its last owner lets go.
+    static std::shared_ptr<std::string> out_buffer();
 
     // Returns bytes written, 0 nothing to do, -1 fatal -- including the peer
     // exceeding max_bio_buffered, where the caller must close rather than retry.
