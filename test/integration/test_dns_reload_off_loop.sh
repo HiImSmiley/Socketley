@@ -20,19 +20,21 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 
 echo "=== Integration: a dns runtime reloads a large zone off its loop ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
-if nm -C "$BIN" 2>/dev/null | grep -q '__asan_'; then
-    echo "  SKIP: a stall in milliseconds measures the sanitizer, not the reload"; exit 0
-fi
+# Under the sanitizer every row runs but the ones that time something.
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate dnsreload
 T=$SOCKETLEY_TMPD
 P=$((SL_PORT_BASE + 1929))
 unset SOCKETLEY_CONFIG
 trap 'daemon_stop' EXIT
-python3 - "$T/big.zone" <<'PY'
+# A tenth of it under the sanitizer, where only the rows that do not time anything run.
+N=300000; [ "$sanitized" = 1 ] && N=30000
+python3 - "$T/big.zone" "$N" <<'PY'
 import sys
 with open(sys.argv[1], "w") as f:
     f.write("$ORIGIN big.test.\n$TTL 60\n@ SOA ns host 1 1 1 1 1\n@ NS ns\nns A 192.0.2.1\n")
-    for i in range(300000):
+    for i in range(int(sys.argv[2])):
         f.write("h%d A 10.%d.%d.%d\n" % (i, (i >> 16) & 255, (i >> 8) & 255, i & 255))
 PY
 daemon_start "$BIN"
@@ -66,16 +68,17 @@ while not stop[0]:
     time.sleep(0.0005)
 th.join()
 served = False
-for _ in range(100):
+for _ in range(300):
     if query(s, "e2.big.test", 3) == 1:
         served = True; break
     time.sleep(0.1)
 print("worst %.1f served %s" % (worst[0], served))
 PY
 )
-echo "  the worst query across three reloads of 300,000 records: $out"
+echo "  the worst query across three reloads of $N records: $out"
 w=$(sed -n 's/^worst \([0-9.]*\) .*/\1/p' <<<"$out")
-if awk -v w="${w:-999}" 'BEGIN{exit !(w < 40)}'; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [stall]: a stall in milliseconds measures the sanitizer, not the reload"
+elif awk -v w="${w:-999}" 'BEGIN{exit !(w < 40)}'; then ok
 else bad "a query never waits behind a reload" "$out"; fi
 case "$out" in *"served True") ok ;; *) bad "and the last edit is served" "$out" ;; esac
 reloads=$("$BIN" stats ns 2>/dev/null | awk -F: '$1=="zone_reloads" {print $2}')

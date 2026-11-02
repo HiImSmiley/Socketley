@@ -23,9 +23,9 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: a cache's TTL sweep holds its loop briefly, and removes what is due ==="
 command -v redis-cli >/dev/null 2>&1 || { echo "  SKIP: redis-cli is required"; exit 0; }
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
-if nm -C "$BIN" 2>/dev/null | grep -q '__asan_'; then
-    echo "  SKIP: a stall in milliseconds measures the sanitizer, not the sweep"; exit 0
-fi
+# Under the sanitizer the cursor is still walked and checked, and only the stall is not measured.
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate ttlsweep
 P=$((SL_PORT_BASE + 1925))
 unset SOCKETLEY_CONFIG
@@ -55,11 +55,13 @@ print("%.1f" % worst)
 PY
 )
 echo "  the worst PING among 2.3 million keys with a deadline: ${worst} ms"
-if awk -v w="$worst" 'BEGIN{exit !(w < 15)}'; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [stall]: a stall in milliseconds measures the sanitizer, not the sweep"
+elif awk -v w="$worst" 'BEGIN{exit !(w < 15)}'; then ok
 else bad "the sweep holds the loop briefly" "a PING waited ${worst} ms"; fi
 
-# The 300,000 short ones expired seconds ago, and a sweep that goes on from where it stopped has reached them all.
-for _ in $(seq 1 100); do [ "$(redis-cli -p "$P" dbsize)" -le 2000000 ] && break; sleep 0.1; done
+# The 300,000 short ones expired seconds ago, and a sweep that goes on from where it stopped reaches them all: within
+# a second here, and a minute or two under the sanitizer, whose millisecond of sweep covers a twentieth of the keys.
+for _ in $(seq 1 1800); do [ "$(redis-cli -p "$P" dbsize)" -le 2000000 ] && break; sleep 0.1; done
 n=$(redis-cli -p "$P" dbsize)
 if [ "${n:-0}" = 2000000 ]; then ok; else bad "and every key that is due is removed by it" "dbsize $n, 2000000 should be left"; fi
 

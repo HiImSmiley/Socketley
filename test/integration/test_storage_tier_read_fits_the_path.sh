@@ -34,9 +34,9 @@ echo "=== Integration: a read back from a tier fits the path ==="
 ip link set lo up; ip link set dev lo mtu 1500
 command -v tc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || { echo "  SKIP: tc and python3 are required"; exit 0; }
 python3 -c "import boto3" 2>/dev/null || { echo "  SKIP: boto3 is required"; exit 0; }
-if nm -C "$BIN" 2>/dev/null | grep -q '__asan_'; then
-    echo "  SKIP: a rate measures the sanitizer, not the windows"; exit 0
-fi
+# Under the sanitizer every row runs but the ones that time something.
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate tierpath
 T=$SOCKETLEY_TMPD
 PS=$((SL_PORT_BASE + 1996)); PT=$((SL_PORT_BASE + 1997))
@@ -93,7 +93,8 @@ read -r moved whole best rates <<<"$out"
 echo "  48 MiB read back from a tier 50 ms away, four times: ${rates:-$out} MB/s"
 [ "$moved" = True ] && ok || bad "the version moves to the tier" "$out"
 [ "$whole" = True ] && ok || bad "and is read back whole" "$out"
-if awk -v b="${best:-0}" 'BEGIN{exit !(b >= 28)}'; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [rate]: a rate measures the sanitizer, not the windows"
+elif awk -v b="${best:-0}" 'BEGIN{exit !(b >= 28)}'; then ok
 else bad "at more than one 512 KiB window a round trip" "the best of four ${best:-none} MB/s"; fi
 
 echo

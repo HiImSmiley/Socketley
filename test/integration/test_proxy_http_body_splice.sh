@@ -138,7 +138,7 @@ for row in keepalive:4:"a kept-alive connection gets each answer whole, a short 
 done
 
 # What the copy path cost per GiB against what splice costs, read off the proxy's processes.
-if nm -C "$BIN" 2>/dev/null | grep -q '__asan_'; then
+if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null; then
     echo "  SKIP [cpu]: CPU per GiB measures the sanitizer, not the splice"
 else
     cpu() { local t=0 p; for p in $(ss -ltnpH "sport = :$PH" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do

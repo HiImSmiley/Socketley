@@ -23,9 +23,9 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 
 echo "=== Integration: a JMAP download of a large attachment is made off the loop ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
-if nm -C "$BIN" 2>/dev/null | grep -q '__asan_'; then
-    echo "  SKIP: a stall in milliseconds measures the sanitizer, not the download"; exit 0
-fi
+# Under the sanitizer every row runs but the ones that time something.
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate jmapdl
 T=$SOCKETLEY_TMPD
 PI=$((SL_PORT_BASE + 1981)); PS=$((SL_PORT_BASE + 1982)); P=$((SL_PORT_BASE + 1983))
@@ -97,7 +97,8 @@ read -r att whole worst <<<"$out"
 echo "  five downloads of a 16 MiB attachment: ${whole:-0} whole, the worst JMAP request beside them ${worst:-none} ms"
 [ "${att:-none}" != none ] && ok || bad "the message and its attachment arrive" "$out"
 [ "${whole:-0}" = 5 ] && ok || bad "every download is the attachment, whole" "${whole:-0} of 5"
-if awk -v w="${worst:-999}" 'BEGIN{exit !(w < 25)}'; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [stall]: a stall in milliseconds measures the sanitizer, not the download"
+elif awk -v w="${worst:-999}" 'BEGIN{exit !(w < 25)}'; then ok
 else bad "a request beside them never waits behind the parse and the decoding" "${worst:-none} ms"; fi
 
 echo

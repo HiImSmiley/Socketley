@@ -22,9 +22,9 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 
 echo "=== Integration: an mqtt broker writes a large snapshot off its loop ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
-if nm -C "$BIN" 2>/dev/null | grep -q '__asan_'; then
-    echo "  SKIP: a stall in milliseconds measures the sanitizer, not the snapshot"; exit 0
-fi
+# Under the sanitizer every row runs but the ones that time something.
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate mqttsnap
 P=$((SL_PORT_BASE + 1946))
 unset SOCKETLEY_CONFIG
@@ -57,12 +57,13 @@ PY
 )
 echo "  the worst PINGREQ beside a 60 MB snapshot each second: $out"
 w=$(sed -n 's/^worst \([0-9.]*\)$/\1/p' <<<"$out")
-if awk -v w="${w:-999}" 'BEGIN{exit !(w < 30)}'; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [stall]: a stall in milliseconds measures the sanitizer, not the snapshot"
+elif awk -v w="${w:-999}" 'BEGIN{exit !(w < 30)}'; then ok
 else bad "a packet never waits behind the snapshot" "$out"; fi
 
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1
 kept=""
-for _ in $(seq 1 100); do
+for _ in $(seq 1 600); do
     kept=$(grep -o 'session(s) and [0-9]* retained message(s) kept' "$SOCKETLEY_DLOG" | tail -1 | awk '{print $3}')
     [ "$(grep -c 'retained message(s) kept' "$SOCKETLEY_DLOG")" -ge 2 ] && break
     sleep 0.1

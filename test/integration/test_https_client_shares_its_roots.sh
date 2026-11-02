@@ -22,9 +22,9 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: the https client reads its roots once, and again when they change ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 command -v openssl >/dev/null 2>&1 || { echo "  SKIP: openssl is required"; exit 0; }
-if nm -C "$BIN" 2>/dev/null | grep -q '__asan_'; then
-    echo "  SKIP: CPU per request measures the sanitizer, not the roots"; exit 0
-fi
+# Under the sanitizer every row runs but the ones that time something.
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate httpsroots
 T=$SOCKETLEY_TMPD
 M=$((SL_PORT_BASE + 1937))
@@ -84,7 +84,8 @@ per=$(awk -v a="$c0" -v b="$c1" 'BEGIN{printf "%.1f", (b - a) / 60}')
 echo "  the daemon's CPU per alert posted over https: ${per} ms"
 if [ "$first" = 204 ] && [ "$codes" = "$(printf '204%.0s' $(seq 1 60))" ]; then ok
 else bad "every alert reaches the hook" "first $first, then $codes"; fi
-if awk -v p="$per" 'BEGIN{exit !(p < 1.5)}'; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [cpu]: CPU per request measures the sanitizer, not the roots"
+elif awk -v p="$per" 'BEGIN{exit !(p < 1.5)}'; then ok
 else bad "the roots are read once, not per request" "${per} ms of CPU per alert"; fi
 
 # The roots replaced in place by another CA, and the hook presenting that CA's leaf: taken without a restart.

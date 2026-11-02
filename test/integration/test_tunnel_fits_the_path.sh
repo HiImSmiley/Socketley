@@ -33,9 +33,9 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: a tunnel link fits the path ==="
 ip link set lo up
 command -v tc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || { echo "  SKIP: tc and python3 are required"; exit 0; }
-if nm -C "$BIN" 2>/dev/null | grep -q '__asan_'; then
-    echo "  SKIP: a rate and a latency in milliseconds measure the sanitizer, not the link"; exit 0
-fi
+# Under the sanitizer every row runs but the ones that time something.
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate tunnelpath
 PE=$((SL_PORT_BASE + 1990)); PT=$((SL_PORT_BASE + 1991)); PU=$((SL_PORT_BASE + 1992))
 PX=$((SL_PORT_BASE + 1993)); PB=$((SL_PORT_BASE + 1994))
@@ -122,13 +122,16 @@ sleep 1
 read -r wan_unsent echo_ms rate < <(load 6 30)
 echo "  unsent at most: ${lan_unsent} bytes on loopback, ${wan_unsent} on the path;" \
      "a new stream beside six downloads answered in ${echo_ms} ms, the downloads at ${rate} MB/s"
-if awk -v e="${echo_ms:-99999}" 'BEGIN{exit !(e > 0 && e < 400)}'; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [timing]: a rate and a latency in milliseconds measure the sanitizer, not the link"
+elif awk -v e="${echo_ms:-99999}" 'BEGIN{exit !(e > 0 && e < 400)}'; then ok
 else bad "a new stream beside bulk ones is answered within a few round trips" "${echo_ms} ms at the median"; fi
-if awk -v r="${rate:-0}" 'BEGIN{exit !(r >= 4.2)}'; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [timing]: a rate and a latency in milliseconds measure the sanitizer, not the link"
+elif awk -v r="${rate:-0}" 'BEGIN{exit !(r >= 4.2)}'; then ok
 else bad "and the downloads still fill the path's 4.7 MB/s" "${rate} MB/s"; fi
 if [ "${wan_unsent:-999999999}" -le $((512 << 10)) ]; then ok
 else bad "over a round trip the kernel holds little of the link's data" "$wan_unsent bytes unsent"; fi
-if [ "${lan_unsent:-0}" -ge $((256 << 10)) ]; then ok
+if [ "$sanitized" = 1 ]; then echo "  SKIP [loopback]: how fast the buffer fills measures the sanitizer"
+elif [ "${lan_unsent:-0}" -ge $((256 << 10)) ]; then ok
 else bad "and on loopback the buffer is left whole, which would otherwise cap the rate" "only $lan_unsent bytes unsent"; fi
 
 echo

@@ -45,7 +45,12 @@ pair() {   # arm port-offset [setting]
     "$BIN" create storage "dst$arm" -p "$PD" --dir "$T/dst$arm" --credentials "$T/creds" --tls --cert "$T/c.pem" \
         --key "$T/k.pem" -s >/dev/null 2>&1
     for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$PS/" && break; sleep 0.1; done
-    for _ in $(seq 1 50); do curl -sk -o /dev/null "https://127.0.0.1:$PD/" && break; sleep 0.1; done
+    # Signed, so the probe is no client error the row below would count.
+    for _ in $(seq 1 50); do
+        [ "$(curl -sk -o /dev/null -w '%{http_code}' --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" \
+              "https://127.0.0.1:$PD/")" = 200 ] && break
+        sleep 0.1
+    done
     PYTHONWARNINGS=ignore python3 - "$PS" "$PD" "$AK" "$SK" <<'PY'
 import boto3, sys
 from botocore.config import Config
@@ -79,9 +84,10 @@ read -r PS PD < <(pair on 1922 | tail -1)
 errors_of() { "$BIN" stats "$1" 2>/dev/null | awk -F: '$1=="client_errors" {print $2}'; }
 done_of() { "$BIN" stats "$1" 2>/dev/null | awk -F: '$1=="replication_completed" {print $2}'; }
 wait_done() { for _ in $(seq 1 200); do [ "$(done_of "$1")" -ge "$2" ] 2>/dev/null && return; sleep 0.05; done; }
-t0=$(tx); e0=$(errors_of dston)
+sleep 1; t0=$(tx); e0=$(errors_of dston)
 curl -s -T "$T/big" "http://127.0.0.1:$PS/srcb/big" >/dev/null
-wait_done srcon 1; sleep 0.5; e1=$(errors_of dston)
+# Past the workers' publishing of their counters, a quarter of a second, so an error behind the body is in e1.
+wait_done srcon 1; sleep 1; e1=$(errors_of dston)
 got=$(replica "$PD" big)
 if [ "$got" = "$(sha "$T/big")" ] && [ "$(tx)" -gt "$t0" ]; then ok
 else bad "a large object reaches an https target whole, through kernel TLS" "replica $got, kernel TLS sockets $t0 -> $(tx)"; fi
