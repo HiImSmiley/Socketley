@@ -2176,6 +2176,30 @@ void imap_store::delete_object(const std::string& key, std::function<void(bool)>
     }
 }
 
+void imap_store::put_new(std::function<std::string()> name, std::shared_ptr<const std::string> data,
+                         std::function<void(std::string key)> done, int tries)
+{
+    std::string key = name();
+    m_run.boxes()->make_bucket([this, name = std::move(name), data, done = std::move(done), key, tries,
+                                alive = m_alive](bool made) mutable {
+        if (!*alive)
+            return;
+        if (!made)
+        {
+            done({});
+            return;
+        }
+        put_made(key, *data, [done, key](bool ok) { done(ok ? key : std::string()); }, true,
+                 [this, name, data, done, tries]() {
+                     // Three names taken in a row is no chance meeting: the write is refused, not tried for ever.
+                     if (tries >= 2)
+                         done({});
+                     else
+                         put_new(name, data, done, tries + 1);
+                 });
+    });
+}
+
 void imap_store::put_object(std::string key, std::string data, std::function<void(bool)> done)
 {
     // A mailbox written by IMAP before any mail came to it has no bucket yet.
@@ -2192,7 +2216,8 @@ void imap_store::put_object(std::string key, std::string data, std::function<voi
     });
 }
 
-void imap_store::put_made(std::string key, std::string data, std::function<void(bool)> done)
+void imap_store::put_made(std::string key, std::string data, std::function<void(bool)> done, bool fresh,
+                          std::function<void()> taken)
 {
     mailboxes* boxes = m_run.boxes();
     if (data.size() <= rpc::max_value)
@@ -2203,11 +2228,21 @@ void imap_store::put_made(std::string key, std::string data, std::function<void(
         rq.key = std::move(key);
         rq.content_type = "message/rfc822";
         rq.data = std::move(data);
-        boxes->ask(boxes->storage(), rpc::encode(rq), [done, alive = m_alive](request_status st, std::string_view b) {
+        // A new message's name is asked to be free under the key's lane, where nothing can take it in between.
+        if (fresh)
+            rq.if_none_match = "*";
+        boxes->ask(boxes->storage(), rpc::encode(rq),
+                   [done, taken, alive = m_alive](request_status st, std::string_view b) {
             if (!*alive)
                 return;
             rpc::reply r;
-            done(st == request_status::ok && rpc::decode(b, rpc::op::put, r) && r.ok);
+            const bool decoded = st == request_status::ok && rpc::decode(b, rpc::op::put, r);
+            if (decoded && !r.ok && r.code == "PreconditionFailed" && taken)
+            {
+                taken();
+                return;
+            }
+            done(decoded && r.ok);
         });
         return;
     }
@@ -2426,7 +2461,7 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
         const std::string base = k.substr(k.rfind('/') + 1);
         j->keys[i] = taken.insert(base).second && base.ends_with(".eml")
                          ? name + "/" + dest->name + "/" + base
-                         : name + "/" + dest->name + "/" + new_spool_id(0) + ".eml";
+                         : name + "/" + dest->name + "/" + new_spool_id(m_run.shard()) + ".eml";
     }
     // Up to 32 and 16 MiB read and written at once, logged in the order asked as they are in, so the UIDs answered keep that order.
     j->state.assign(j->todo.size(), 0);
@@ -2544,7 +2579,6 @@ void imap_store::append(const std::string& name, const std::string& folder, std:
         return;
     }
     std::shared_ptr<imap_folder> f = it->second;
-    const std::string key = name + "/" + f->name + "/" + new_spool_id(0) + ".eml";
     const uint64_t size = message.size();
     if (!reserve(name, size))
     {
@@ -2552,10 +2586,13 @@ void imap_store::append(const std::string& name, const std::string& folder, std:
         return;
     }
     auto bytes = std::make_shared<const std::string>(std::move(message));
-    put_object(key, *bytes,
-               [this, name, f, key, size, flags, keywords = std::move(keywords), date_ms, done, bytes](bool ok) {
+    // Named by this shard, so two shards writing in the same microsecond never give one name to two messages.
+    const std::string prefix = name + "/" + f->name + "/";
+    const uint32_t shard = m_run.shard();
+    put_new([prefix, shard] { return prefix + new_spool_id(shard) + ".eml"; }, bytes,
+            [this, name, f, size, flags, keywords = std::move(keywords), date_ms, done, bytes](std::string key) {
         unreserve(name, size);
-        if (!ok)
+        if (key.empty())
         {
             done(refusal::storage, 0, 0);
             return;

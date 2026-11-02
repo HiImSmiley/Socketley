@@ -208,6 +208,8 @@ inline constexpr setting table[] = {
      "milliseconds a mail runtime's spam filter leaves what the shards learned in its journal before it is folded in"},
     {"SOCKETLEY_IDP_COMPACT_AFTER", kind::number, audience::test, 1, 1000000, "1000",
      "account changes an idp journals before it folds them into its snapshot"},
+    {"SOCKETLEY_MAIL_SPOOL_FROZEN_US", kind::number, audience::test, 1, no_max, "the clock",
+     "the microsecond every mail message id of the process is named after, so two writers meet in one"},
     {"SOCKETLEY_MAIL_QUEUE_SCALE", kind::number, audience::test, 1, 100000, "1",
      "how many times faster a mail runtime's retries, queue lifetime and --autoexpunge run"},
     {"SOCKETLEY_MAIL_BUSY_HOLD_MS", kind::number, audience::test, 0, no_max, "30000",

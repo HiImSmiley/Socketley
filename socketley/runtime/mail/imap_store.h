@@ -309,7 +309,12 @@ private:
     void sync(const std::string& user, const std::shared_ptr<imap_folder>& f, std::string after,
               std::vector<std::pair<std::string, std::pair<uint64_t, int64_t>>> seen);
     void put_object(std::string key, std::string data, std::function<void(bool)> done);
-    void put_made(std::string key, std::string data, std::function<void(bool)> done);
+    void put_made(std::string key, std::string data, std::function<void(bool)> done, bool fresh = false,
+                  std::function<void()> taken = nullptr);
+    // A new message's bytes under a name `name` makes, never over another's: a name taken meanwhile is made again; the
+    // name it went under to `done`, empty where it could not be written.
+    void put_new(std::function<std::string()> name, std::shared_ptr<const std::string> data,
+                 std::function<void(std::string key)> done, int tries = 0);
     void delete_object(const std::string& key, std::function<void(bool)> done);
     // `f` emptied, its messages copied to `to` first where it names a folder, and its D logged; again for what came in
     // meanwhile, `passes` times at most.

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <random>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -245,8 +246,11 @@ size_t spool_entry::waiting() const
 
 std::string new_spool_id(uint32_t shard)
 {
-    static std::atomic<uint32_t> seq{0};
-    const uint64_t us = static_cast<uint64_t>(
+    // From a place of its own in each process, so two runtimes that both call themselves shard 0 and write in the same
+    // microsecond still name two messages apart.
+    static std::atomic<uint32_t> seq{std::random_device{}()};
+    static const auto frozen = settings::number<uint64_t>("SOCKETLEY_MAIL_SPOOL_FROZEN_US");
+    const uint64_t us = frozen ? *frozen : static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count());
     char buf[40];

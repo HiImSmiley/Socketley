@@ -19887,6 +19887,13 @@ on; 1000 when unset.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_MAIL_SPOOL_FROZEN_US
+A test aid: the microsecond every message a mail runtime names is named after,
+in place of the clock, so writers in two shards meet in one name as they would
+in the same microsecond; the clock when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_MAIL_QUEUE_SCALE
 A test aid: how many times faster a mail runtime's retries and
 .B \-\-queue\-lifetime
