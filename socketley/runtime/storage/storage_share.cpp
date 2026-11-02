@@ -737,47 +737,70 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
     }
     // A download counts against the link's limit, once per reading from the start: a player's later ranges do not.
     const std::string_view range = r.header("range");
-    if (r.method == "GET" && s.max_downloads && (range.empty() || range.starts_with("bytes=0-")))
+    if (r.method == "GET" && s.max_downloads && (range.empty() || range.starts_with("bytes=0-")) && !c->share_counted)
     {
-        // Locked by a file of its own: the link's file is renamed over at every count, and a lock on it would be on
-        // the inode another request no longer opens.
-        const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-        bool allowed = false;
-        if (fd >= 0 && ::flock(fd, LOCK_EX) == 0)
+        // Counted on a helper thread, since the count is written and synced under the link's lock: on the loop each
+        // held every other request for two syncs of the disk. The request is then taken up again from its start.
+        struct count
         {
+            bool allowed{false};
             share_link now;
-            if (read_whole_file(path, text) && parse_share(text, now) && now.downloads < now.max_downloads)
-            {
-                // A node of a cluster counts its own, which every node adds up with the others'.
-                if (!m_cluster_self.empty())
-                {
-                    if (now.by_node.empty() && now.downloads)
-                        now.by_node["-"] = now.downloads;
-                    ++now.by_node[m_cluster_self];
-                }
-                ++now.downloads;
-                if (now.burn && now.downloads >= now.max_downloads)
-                    now.drained_ms = wall::now_ms();
-                allowed = replace_file(path, share_json(now), durability::data_and_dir);
-                if (allowed)
-                    share_sent(id, share_json(now), {});
-                if (allowed && !now.notify.empty())
-                    share_tell(now.notify, "downloaded", now.bucket, now.key, now.downloads, now.max_downloads, now.expires_ms,
-                               now.burn);
-                if (allowed)
-                    inbox_add(now.owner, "share", "Downloaded: " + std::string(last_name_of(key)),
-                              std::to_string(now.downloads) + " of " + std::to_string(now.max_downloads) +
-                                  " downloads through your link");
-            }
-            ::flock(fd, LOCK_UN);
-        }
-        if (fd >= 0)
-            ::close(fd);
-        if (!allowed)
+        };
+        auto job = std::make_shared<count>();
+        const auto work = [job, path, self = m_cluster_self]
         {
-            app_reply(c, 410, "This link has been used as often as it may be.\n");
-            return;
-        }
+            // Locked by a file of its own: the link's file is renamed over at every count, and a lock on it would be
+            // on the inode another request no longer opens.
+            const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+            if (fd >= 0 && ::flock(fd, LOCK_EX) == 0)
+            {
+                std::string text;
+                share_link& now = job->now;
+                if (read_whole_file(path, text) && parse_share(text, now) && now.downloads < now.max_downloads)
+                {
+                    // A node of a cluster counts its own, which every node adds up with the others'.
+                    if (!self.empty())
+                    {
+                        if (now.by_node.empty() && now.downloads)
+                            now.by_node["-"] = now.downloads;
+                        ++now.by_node[self];
+                    }
+                    ++now.downloads;
+                    if (now.burn && now.downloads >= now.max_downloads)
+                        now.drained_ms = wall::now_ms();
+                    job->allowed = replace_file(path, share_json(now), durability::data_and_dir);
+                }
+                ::flock(fd, LOCK_UN);
+            }
+            if (fd >= 0)
+                ::close(fd);
+        };
+        const auto done = [this, job, id, key, weak = std::weak_ptr<conn>(c)]
+        {
+            const share_link& now = job->now;
+            if (job->allowed)
+            {
+                share_sent(id, share_json(now), {});
+                if (!now.notify.empty())
+                    share_tell(now.notify, "downloaded", now.bucket, now.key, now.downloads, now.max_downloads,
+                               now.expires_ms, now.burn);
+                inbox_add(now.owner, "share", "Downloaded: " + std::string(last_name_of(key)),
+                          std::to_string(now.downloads) + " of " + std::to_string(now.max_downloads) +
+                              " downloads through your link");
+            }
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (!job->allowed)
+            {
+                app_reply(cc, 410, "This link has been used as often as it may be.\n");
+                return;
+            }
+            cc->share_counted = true;
+            op_share(cc);
+        };
+        m_hash.submit(m_hash.next_lane(), work, done);
+        return;
     }
     // A folder's link read with ?zip is the folder, or the part of it under the path, as one archive; it counts as one
     // download.

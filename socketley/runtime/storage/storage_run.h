@@ -561,6 +561,8 @@ struct conn
     std::string app_header;
     // The share a request to ~share was let in by, for what it may still do.
     std::string share_id;
+    // Its download counted already, off the loop, and the request taken up again.
+    bool share_counted{false};
     // The key a website request asked for, before its index document was added.
     std::string website_key;
     // The failure a website request is serving its error document for, and its status.

@@ -1846,6 +1846,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->on_answer = nullptr;
     c->app_header.clear();
     c->share_id.clear();
+    c->share_counted = false;
     // A large GET's or a signed PUT's buffers are not kept for the rest of a keep-alive connection's life.
     if (c->sbuf.capacity() > 64 * 1024)
         std::string().swap(c->sbuf);
