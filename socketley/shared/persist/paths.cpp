@@ -66,6 +66,11 @@ socketley_paths socketley_paths::resolve()
             is_privileged = true;
     }
 
+    // Root of a user namespace on the host's own filesystem owns none of the system directories, which are the system
+    // daemon's: a state directory chosen there could not be written, and an entrance's routes went nowhere.
+    if (installed && is_privileged && access("/var/lib/socketley", F_OK) == 0 && access("/var/lib/socketley", W_OK) != 0)
+        is_privileged = false;
+
     if (installed && is_privileged)
     {
         p.system_mode = true;

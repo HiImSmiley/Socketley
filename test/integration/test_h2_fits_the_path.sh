@@ -47,7 +47,14 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=files.example.com \
 mkdir -p "$T/www"; head -c $((64 << 20)) /dev/urandom > "$T/www/big.bin"
 "$BIN" create server files -p $((P+1)) --http "$T/www" --domain files.example.com -s >/dev/null 2>&1
 "$BIN" create proxy ent -p "$P" --tls --cert "$T/e.pem" --key "$T/e.key" -s >/dev/null 2>&1
-for _ in $(seq 1 60); do f=$(find "$T" -name 'routes-ent' | head -1); [ -n "$f" ] && grep -q files.example.com "$f" && break; sleep 0.2; done
+routed=0
+for _ in $(seq 1 60); do f=$(find "$T" -name 'routes-ent' | head -1); [ -n "$f" ] && grep -q files.example.com "$f" && { routed=1; break; }; sleep 0.2; done
+# A download that is a 404 holds nothing unsent either, and the rows below would measure that.
+if [ "$routed" != 1 ]; then
+    echo "  FATAL: the entrance never wrote a route to files.example.com: $(grep -m1 'routes' "$SOCKETLEY_DLOG")"
+    echo "=== Results: 0 passed, 1 failed ==="
+    exit 1
+fi
 
 # The most of the entrance's connection the kernel holds unsent while a download is read slowly: `polls` tenths of a
 # second, or until `enough` bytes are seen, since a loaded box fills the buffer late but fills it.
@@ -66,13 +73,14 @@ unsent_peak() {
     echo "$peak"
 }
 
-lan=$(unsent_peak 80 $((1 << 20)))
+lan=$(unsent_peak 80 $((256 << 10)))
 tc qdisc change dev lo root netem delay 2ms
 wan=$(unsent_peak 30 $((64 << 20)))
 echo "  unsent at most: ${lan} bytes on loopback, ${wan} with a 4 ms round trip"
 if [ "$wan" -le $((512 << 10)) ]; then ok
 else bad "over a round trip the kernel holds little of what is framed" "$wan bytes unsent, past 512 KiB"; fi
-if [ "$lan" -ge $((1 << 20)) ]; then ok
+# Held short, it stays near the 16 KiB low-water mark (45-65 KB measured); left whole it was 650 KB to 2.5 MB.
+if [ "$lan" -ge $((256 << 10)) ]; then ok
 else bad "and on loopback the buffer is left whole, which would otherwise cap the rate" "only $lan bytes unsent"; fi
 
 echo
