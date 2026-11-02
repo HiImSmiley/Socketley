@@ -20172,6 +20172,25 @@ ruling the cache out when diagnosing something else.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_KERNEL_TLS
+Set to
+.B 0
+to keep every TLS record in this process. Otherwise a TLS 1.3 connection of a
+server, a storage or a proxy that sends a file or object over 256 KiB, or a
+TCP proxy's client a backend streams that much to, changes its send key and
+hands the new one to the kernel's TLS layer, which then encrypts what is sent
+\(em by sendfile from the page cache, or spliced from the backend \(em at about
+half the CPU of encrypting a copy here. A connection that never asks for that
+much stays as it was, since for small answers the copy encrypted here costs
+less. HTTP/2 connections are never moved. Needs the kernel's
+.B tls
+module
+.RB ( "modprobe tls" );
+without it the connection goes on in user space under its new key and the
+runtime says so once in its log. Read when the runtime starts.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_PROXY_SPLICE
 A
 .B \-\-protocol tcp
