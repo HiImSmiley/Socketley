@@ -11,8 +11,10 @@ namespace
 {
 
 constexpr uint64_t window_bytes = 1u << 20;
-// A window from elsewhere is half that, under the most of an answer the HTTP client keeps.
-constexpr uint64_t remote_window_bytes = 512u << 10;
+// A window from elsewhere starts at half that and doubles to twice it, so a long read pays a round trip per 2 MiB on
+// one connection kept busy, and a short one holds no more than it asked.
+constexpr uint64_t remote_window_first = 512u << 10;
+constexpr uint64_t remote_window_most  = 2u << 20;
 // A window this small is opened where it lands, since the hop to a thread costs more.
 constexpr size_t open_inline_max = 64 * 1024;
 
@@ -73,6 +75,7 @@ std::shared_ptr<body_reader> body_reader::make_remote(std::shared_ptr<bool> aliv
     std::shared_ptr<body_reader> r(new body_reader);
     r->m_alive  = std::move(alive);
     r->m_remote = std::move(fetch);
+    r->m_remote_window = remote_window_first;
     r->m_pos    = first;
     r->m_end    = first + len;
     return r;
@@ -240,7 +243,8 @@ void body_reader::fetch()
         uint64_t off = 0, want = 0;
         if (m_remote)
         {
-            want   = std::min(remote_window_bytes, m_end - m_pos);
+            want   = std::min(m_remote_window, m_end - m_pos);
+            m_remote_window = std::min(m_remote_window * 2, remote_window_most);
             s.skip = 0;
             s.len  = static_cast<size_t>(want);
             s.state = slot_state::busy;

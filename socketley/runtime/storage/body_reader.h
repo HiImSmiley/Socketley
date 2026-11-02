@@ -83,6 +83,8 @@ private:
     std::shared_ptr<const lz4_table> m_table;
     std::optional<lz4_record> m_squeezed;
     remote_fetch m_remote;
+    // The size of the next window from elsewhere.
+    uint64_t   m_remote_window{0};
     // A window being started, whose fetch may answer before it returns.
     bool       m_fetching{false};
     std::optional<sse_key> m_key;

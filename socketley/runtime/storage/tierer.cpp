@@ -446,6 +446,8 @@ std::shared_ptr<body_reader> tierer::reader(const object_meta& m, uint64_t first
         http_request rq;
         rq.head = head(*t, "GET", key, {}, {{"range", "bytes=" + std::to_string(off) + "-" + std::to_string(off + n - 1)}},
                        0);
+        // A window past the 1 MiB an answer is held to by default, with room for its head.
+        rq.max_answer = static_cast<size_t>(n) + (64 << 10);
         exchange(*t, std::move(rq), [this, alive, n, give](http_answer a)
         {
             if (!*alive)
