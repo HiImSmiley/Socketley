@@ -7,6 +7,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "../../shared/loop/blocking_write.h"
@@ -467,6 +468,42 @@ bool seglog::read(const location& at, std::string& out)
     }
     const int fd = fd_of(at.seg);
     return fd >= 0 && pread_all(fd, out.data(), at.len, at.off);
+}
+
+int seglog::read_cached(const location& at, std::string& out)
+{
+    if (at.seg == m_active && at.off >= m_written)
+        return read(at, out) ? 1 : -1;
+    const int fd = fd_of(at.seg);
+    if (fd < 0)
+        return -1;
+    out.resize(at.len);
+    size_t got = 0;
+    while (got < at.len)
+    {
+        struct iovec v{out.data() + got, at.len - got};
+        const ssize_t r = ::preadv2(fd, &v, 1, static_cast<off_t>(at.off + got), RWF_NOWAIT);
+        if (r < 0 && errno == EINTR)
+            continue;
+        // A part not in the page cache stops it short, as an EAGAIN does the whole; a file that cannot be asked so is
+        // read as before.
+        if (r < 0 && errno == EAGAIN)
+            return 0;
+        if (r < 0 && errno == EOPNOTSUPP)
+            return pread_all(fd, out.data() + got, at.len - got, at.off + got) ? 1 : -1;
+        if (r <= 0)
+            return -1;
+        got += static_cast<size_t>(r);
+    }
+    return 1;
+}
+
+int seglog::dup_fd_of(const location& at)
+{
+    if (at.seg == m_active && at.off >= m_written)
+        return -1;
+    const int fd = fd_of(at.seg);
+    return fd < 0 ? -1 : ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
 }
 
 bool seglog::roll_if_full(std::string& why)

@@ -238,6 +238,21 @@ public:
     size_t segments() const { return m_log.sealed().size() + 1; }
     uint64_t cache_hits() const { return m_hits; }
     uint64_t cache_misses() const { return m_misses; }
+
+    // A reading request first tried without waiting for the disk: a document the page cache does not hold is noted in
+    // `wanted` and read as missing, and one in `fetched`, by where it lies, is read from there; null ends it.
+    struct fetched_doc
+    {
+        location at;
+        std::string json;
+    };
+    void probe(std::vector<location>* wanted, const std::vector<fetched_doc>* fetched)
+    {
+        m_wanted = wanted;
+        m_fetched = fetched;
+    }
+    // The documents a probe noted, as a descriptor of their own each and where they lie in it.
+    int dup_fd_of(const location& at) { return m_log.dup_fd_of(at); }
     uint64_t merges() const { return m_merges; }
     std::vector<std::string> collection_names() const;
 
@@ -298,6 +313,8 @@ private:
     void live_add(const doc& d, int64_t sign);
 
     seglog m_log;
+    std::vector<location>* m_wanted{nullptr};
+    const std::vector<fetched_doc>* m_fetched{nullptr};
     schema m_schema;
     std::unordered_map<std::string, coll_state, string_hash, string_equal> m_colls;
     size_t m_docs{0};

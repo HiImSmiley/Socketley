@@ -1,6 +1,7 @@
 #include "db_store.h"
 
 #include <algorithm>
+#include <tuple>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -630,8 +631,33 @@ bool store::json_of(const doc& d, std::string& out)
         out.assign(j);
         return true;
     }
+    if (m_fetched)
+    {
+        // Sorted by where each lies, by the read that brought them.
+        const auto it = std::lower_bound(m_fetched->begin(), m_fetched->end(), d.at, [](const fetched_doc& f, const location& at) {
+            return std::tie(f.at.seg, f.at.off) < std::tie(at.seg, at.off);
+        });
+        if (it != m_fetched->end() && it->at.seg == d.at.seg && it->at.off == d.at.off && it->at.len == d.at.len)
+        {
+            out.assign(it->json);
+            cache_put(d, out);
+            return true;
+        }
+    }
     ++m_misses;
-    if (!m_log.read(d.at, out))
+    if (m_wanted)
+    {
+        const int r = m_log.read_cached(d.at, out);
+        if (r == 0)
+        {
+            m_wanted->push_back(d.at);
+            out.clear();
+            return false;
+        }
+        if (r < 0)
+            return false;
+    }
+    else if (!m_log.read(d.at, out))
         return false;
     cache_put(d, out);
     return true;

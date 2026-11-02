@@ -13178,7 +13178,14 @@ write is one record, appended to the newest segment, which is closed at 64 MiB
 and another begun. Memory holds where each document lies, its version, owner
 and the values its indexes order it by, and a cache of the documents last read
 .RB ( \-\-cache );
-the rest are read from the disk, so a database holds far more than memory. Sealed
+the rest are read from the disk, so a database holds far more than memory. A
+read that needs a document the page cache does not hold is tried first without
+it, the document brought through the ring, and the read answered then, so a slow
+disk holds that read and not every other; past three tries it waits in line.
+.B stats
+counts them as
+.BR fetched .
+Sealed
 segments whose documents have mostly been written again or deleted are merged
 off the event loop into one of their living documents, and the old ones go. A
 record torn by a crash ends the newest segment where the last whole one does;

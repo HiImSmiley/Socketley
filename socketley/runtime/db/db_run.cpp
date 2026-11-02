@@ -2,6 +2,7 @@
 #include "../../shared/loop/turn_clock.h"
 
 #include <algorithm>
+#include <tuple>
 #include <charconv>
 #include <ctime>
 #include <chrono>
@@ -934,7 +935,8 @@ std::string db_run::stats() const
            "\nmerges:" + std::to_string(m_store.merges()) + "\ncache_hits:" + std::to_string(m_store.cache_hits()) +
            "\ncache_misses:" + std::to_string(m_store.cache_misses()) + "\nseq:" + std::to_string(m_store.seq()) +
            "\ndurable:" + std::to_string(m_durable) + "\nkeys:" + std::to_string(m_keys.size()) +
-           "\nreads:" + std::to_string(m_c.reads) + "\nwrites:" + std::to_string(m_c.writes) +
+           "\nreads:" + std::to_string(m_c.reads) + "\nfetched:" + std::to_string(m_c.fetched) +
+           "\nwrites:" + std::to_string(m_c.writes) +
            "\nqueries:" + std::to_string(m_c.queries) + "\nsyncs:" + std::to_string(m_c.syncs) +
            "\nrefused:" + std::to_string(m_c.refused) + "\nconflicts:" + std::to_string(m_c.conflicts) +
            "\nexpired:" + std::to_string(m_c.expired) + "\nfeeds:" + std::to_string(feeds) +
@@ -1428,7 +1430,24 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
         open_feed(c, rq, coll, !feed, path == "/_replicate");
         return;
     }
+    // A read is tried first without waiting for the disk, so a document it needs from there is brought through the
+    // ring while every other connection is answered; past a few tries it waits as a write does.
+    std::vector<location> wanted;
+    const bool probing = (reads || (rq.method == "POST" && path.ends_with("/_query"))) && c->probes < 3;
+    m_store.probe(probing ? &wanted : nullptr, &c->fetched);
+    const counters before = m_c;
     answer a = execute(who, rq.method, path, rq.body, rq.if_match, rq.if_none_match);
+    m_store.probe(nullptr, nullptr);
+    if (probing && !wanted.empty() && !a.forward)
+    {
+        // The try is not the answer, and is not counted as one.
+        m_c = before;
+        m_c.fetched += wanted.size();
+        fetch_and_retry(c, rq, std::move(wanted));
+        return;
+    }
+    c->fetched.clear();
+    c->probes = 0;
     if (a.forward)
     {
         // Answered when shard 0 has, and nothing behind it on this connection meanwhile.
@@ -1459,6 +1478,70 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
     // A buffer one large answer grew is not held for the small ones after it.
     if (m_spare.capacity() > (1u << 20))
         std::string().swap(m_spare);
+}
+
+void db_run::fetch_and_retry(const std::shared_ptr<conn>& c, const request& rq, std::vector<location> wanted)
+{
+    struct job
+    {
+        request rq;
+        std::vector<store::fetched_doc> docs;
+        size_t left{0};
+    };
+    auto j = std::make_shared<job>();
+    j->rq = rq;
+    std::sort(wanted.begin(), wanted.end(), [](const location& a, const location& b) {
+        return std::tie(a.seg, a.off) < std::tie(b.seg, b.off);
+    });
+    wanted.erase(std::unique(wanted.begin(), wanted.end(), [](const location& a, const location& b) {
+                     return a.seg == b.seg && a.off == b.off;
+                 }), wanted.end());
+    // What the tries before brought stays, for a read that needs it again.
+    j->docs = std::move(c->fetched);
+    c->fetched.clear();
+    ++c->probes;
+    c->waiting = true;
+    const auto done = [this, j, weak = std::weak_ptr<conn>(c)]
+    {
+        auto cc = weak.lock();
+        if (m_stopped || !cc || cc->dead)
+            return;
+        std::erase_if(j->docs, [](const store::fetched_doc& f) { return f.json.size() != f.at.len; });
+        std::sort(j->docs.begin(), j->docs.end(), [](const store::fetched_doc& a, const store::fetched_doc& b) {
+            return std::tie(a.at.seg, a.at.off) < std::tie(b.at.seg, b.at.off);
+        });
+        cc->fetched = std::move(j->docs);
+        cc->waiting = false;
+        handle(cc, j->rq);
+        if (!cc->waiting)
+            m_http.resume(cc);
+    };
+    const size_t had = j->docs.size();
+    j->docs.resize(had + wanted.size());
+    j->left = wanted.size() + 1;
+    for (size_t i = 0; i < wanted.size(); ++i)
+    {
+        store::fetched_doc& f = j->docs[had + i];
+        f.at = wanted[i];
+        f.json.resize(f.at.len);
+        const int fd = m_store.dup_fd_of(f.at);
+        // One that cannot be read through the ring is read in line at the next try.
+        if (fd < 0 || !m_io.pread(fd, f.json.data(), f.at.len, f.at.off, [j, &f, fd, done](int64_t res) {
+                ::close(fd);
+                if (res != static_cast<int64_t>(f.at.len))
+                    f.json.clear();
+                if (--j->left == 0)
+                    done();
+            }))
+        {
+            if (fd >= 0)
+                ::close(fd);
+            f.json.clear();
+            --j->left;
+        }
+    }
+    if (--j->left == 0)
+        done();
 }
 
 db_run::answer db_run::spare_answer()

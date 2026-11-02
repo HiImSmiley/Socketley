@@ -60,6 +60,11 @@ public:
     int fd() const { return m_fd; }
     // The bytes at `at`, from the file or from what is not yet written to it.
     bool read(const location& at, std::string& out);
+    // The same only where the page cache holds them: 1 read, 0 the disk would be waited for, -1 not readable.
+    int read_cached(const location& at, std::string& out);
+    // A descriptor of its own on the segment `at` is in, for a read through the ring that a merge removing the
+    // segment meanwhile does not disturb; -1 for one only memory holds or none.
+    int dup_fd_of(const location& at);
 
     // A new newest segment when this one is past segment_bytes, its own records written first.
     bool roll_if_full(std::string& why);

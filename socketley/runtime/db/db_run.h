@@ -99,6 +99,10 @@ private:
         bool behind{false};
         // The turn stamp of the request being answered.
         uint64_t began_ns{0};
+        // A read answered once the documents it needed from the disk were brought through the ring: those, by where
+        // they lie, and how many times it has been tried.
+        std::vector<store::fetched_doc> fetched;
+        uint32_t probes{0};
     };
 
     struct request
@@ -138,6 +142,8 @@ private:
 
     int take_request(conn& c, request& rq, int& refusal);
     void handle(const std::shared_ptr<conn>& c, request& rq);
+    // The documents a read could not take from memory brought through the ring, and the read made again with them.
+    void fetch_and_retry(const std::shared_ptr<conn>& c, const request& rq, std::vector<location> wanted);
     // A response's head appended to `o`, with an ETag for `version` when it is one.
     void put_head(std::string& o, const conn& c, int status, std::string_view type, size_t length,
                   std::string_view extra, uint64_t version = 0) const;
@@ -280,7 +286,7 @@ private:
     {
         uint64_t reads{0}, writes{0}, queries{0}, syncs{0}, refused{0}, conflicts{0}, calls{0}, expired{0}, events{0},
             backups{0}, backup_failures{0}, replicated{0}, resets{0}, crossed{0}, crossings_served{0},
-            caught_up{0}, reopened{0};
+            caught_up{0}, reopened{0}, fetched{0};
     } m_c;
     // A request taken to its answer put out, a wait for the disk or for shard 0 included, in loop turns.
     socketley::latency_histogram m_lat;
