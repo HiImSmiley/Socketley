@@ -1255,6 +1255,8 @@ public:
     st share_take(const std::string& id, const std::string& json);
     // Links that burn what they name, ended at their expiry or after their last download: looked over by the sweep.
     void share_burn_tick();
+    bool mark_link(const share_link& s);
+    std::string owner_marks(std::string_view owner) const;
     void share_burn(std::string id, std::string bucket, std::string key, bool folder);
     // A link's webhook told of a download or of its files' removal, in order, one exchange at a time per URL, and
     // again until it takes it, across a restart.
@@ -1492,6 +1494,8 @@ private:
     size_t            m_burns{0};
     std::unordered_set<std::string> m_burning;
     std::chrono::steady_clock::time_point m_burn_next{};
+    // Whether every link has been looked over once for one with no marks, as an older build made them.
+    bool              m_links_marked{false};
     // What a lifecycle day is, shorter only under SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS, a test aid.
     int64_t           m_lc_day_ms{0};
     std::unique_ptr<lifecycle_pass> m_lc;

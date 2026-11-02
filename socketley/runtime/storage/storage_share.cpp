@@ -28,6 +28,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/util/hex.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
@@ -857,19 +858,37 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
     const user_identity* u = c->user.get();
     if (r.method == "GET")
     {
-        // The caller's links, every link for an admin.
+        // The caller's links, by their marks once every link has them, and every link for an admin.
         std::string o = "[";
         bool first = true;
-        if (DIR* d = ::opendir(dir.c_str()))
+        const bool by_marks = m_links_marked && u && !u->admin;
+        const std::string marks = by_marks ? owner_marks(u->id) : std::string();
+        if (DIR* d = ::opendir(by_marks ? marks.c_str() : dir.c_str()))
         {
+            const int64_t t = wall::now_ms();
             while (dirent* e = ::readdir(d))
             {
-                std::string_view n = e->d_name;
-                if (!n.ends_with(".json"))
+                std::string n = e->d_name;
+                if (by_marks)
+                {
+                    if (!valid_id(n))
+                        continue;
+                    n += ".json";
+                }
+                else if (!std::string_view(n).ends_with(".json"))
                     continue;
                 std::string text;
                 share_link s;
-                if (!read_whole_file(dir + "/" + std::string(n), text) || !parse_share(text, s))
+                if (!read_whole_file(dir + "/" + n, text))
+                {
+                    // A mark whose link is gone, older than a link being made beside it.
+                    struct stat mb{};
+                    const std::string mark = marks + "/" + e->d_name;
+                    if (by_marks && ::stat(mark.c_str(), &mb) == 0 && t - static_cast<int64_t>(mb.st_mtim.tv_sec) * 1000 > 60000)
+                        ::unlink(mark.c_str());
+                    continue;
+                }
+                if (!parse_share(text, s))
                     continue;
                 // An expired link is gone for good, and is cleared away here rather than listed.
                 if (s.expires_ms && wall::now_ms() > s.expires_ms)
@@ -975,6 +994,12 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
         app_reply(c, 500, "The links' folder cannot be made.\n");
         return;
     }
+    // Marked before it is kept, so no look over the marks misses it.
+    if (!mark_link(s))
+    {
+        app_reply(c, 500, "The link could not be kept.\n");
+        return;
+    }
     if (!replace_file(dir + "/" + s.id + ".json", share_json(s), durability::data_and_dir))
     {
         app_reply(c, 500, "The link could not be kept.\n");
@@ -1020,6 +1045,8 @@ st storage_run::share_take(const std::string& id, const std::string& json)
     if (!parse_share(json, in) || in.id != id)
         return st::invalid_bucket_name;
     if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
+        return st::io_error;
+    if (!mark_link(in))
         return st::io_error;
     const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0 || ::flock(fd, LOCK_EX) < 0)
@@ -1071,6 +1098,31 @@ std::vector<std::string> storage_run::share_records()
 // names is removed; the file goes when that is done. The shard that renamed it stamps it and removes; a .burning file
 // stamped more than a minute ago was left by a stop and is taken up again, stamped anew, by the first shard to see it.
 
+// A link has a mark under .shares/owner/<its maker in hex>/ and, when it burns, one under .shares/burn/, so a look for
+// either reads those links and not every link.
+bool storage_run::mark_link(const share_link& s)
+{
+    const std::string dir = m_store.options().dir + "/.shares";
+    const auto mark = [](const std::string& in, const std::string& id)
+    {
+        if (::mkdir(in.c_str(), 0700) < 0 && errno != EEXIST)
+            return false;
+        const int fd = ::open((in + "/" + id).c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0)
+            return false;
+        ::close(fd);
+        return true;
+    };
+    if (::mkdir((dir + "/owner").c_str(), 0700) < 0 && errno != EEXIST)
+        return false;
+    return mark(owner_marks(s.owner), s.id) && (!s.burn || mark(dir + "/burn", s.id));
+}
+
+std::string storage_run::owner_marks(std::string_view owner) const
+{
+    return m_store.options().dir + "/.shares/owner/o" + socketley::hex_encode(owner);
+}
+
 void storage_run::share_burn_tick()
 {
     const auto now = std::chrono::steady_clock::now();
@@ -1079,8 +1131,30 @@ void storage_run::share_burn_tick()
     m_burn_next = now + std::chrono::seconds(5);
     const std::string dir = m_store.options().dir + "/.shares";
     const int64_t t = wall::now_ms();
+    // Once a start, every link is read for one with no marks, which an older build or a crash left.
+    if (!m_links_marked)
+    {
+        if (DIR* d = ::opendir(dir.c_str()))
+        {
+            bool all = true;
+            while (dirent* e = ::readdir(d))
+            {
+                const std::string_view n = e->d_name;
+                if (!n.ends_with(".burning") && !n.ends_with(".json"))
+                    continue;
+                std::string text;
+                share_link s;
+                if (read_whole_file(dir + "/" + std::string(n), text) && parse_share(text, s) && valid_id(s.id))
+                    all = mark_link(s) && all;
+            }
+            ::closedir(d);
+            m_links_marked = all;
+        }
+        else
+            m_links_marked = errno == ENOENT;
+    }
     size_t seen = 0;
-    DIR* d = ::opendir(dir.c_str());
+    DIR* d = ::opendir((dir + "/burn").c_str());
     if (!d)
     {
         m_burns = 0;
@@ -1088,14 +1162,29 @@ void storage_run::share_burn_tick()
     }
     while (dirent* e = ::readdir(d))
     {
-        const std::string_view n = e->d_name;
-        const bool burning = n.ends_with(".burning");
-        if (!burning && !n.ends_with(".json"))
+        const std::string id = e->d_name;
+        if (!valid_id(id))
             continue;
         std::string text;
         share_link s;
-        const std::string path = dir + "/" + std::string(n);
-        if (!read_whole_file(path, text) || !parse_share(text, s) || !s.burn)
+        bool burning = false;
+        std::string path = dir + "/" + id + ".json";
+        bool found = read_whole_file(path, text);
+        if (!found)
+        {
+            path = dir + "/" + id + ".burning";
+            found = burning = read_whole_file(path, text);
+        }
+        if (!found)
+        {
+            // A mark whose link is gone, revoked or burned, older than a link being made beside it.
+            struct stat mb{};
+            const std::string mark = dir + "/burn/" + id;
+            if (::stat(mark.c_str(), &mb) == 0 && t - static_cast<int64_t>(mb.st_mtim.tv_sec) * 1000 > 60000)
+                ::unlink(mark.c_str());
+            continue;
+        }
+        if (!parse_share(text, s) || !s.burn)
             continue;
         ++seen;
         if (m_burning.count(s.id))
@@ -1159,6 +1248,7 @@ void storage_run::share_burn(std::string id, std::string bucket, std::string key
             return;
         }
         ::unlink((m_store.options().dir + "/.shares/" + b->id + ".burning").c_str());
+        ::unlink((m_store.options().dir + "/.shares/burn/" + b->id).c_str());
         m_burning.erase(b->id);
         LOG_INFO(("storage: link " + b->id + " ended and removed " + std::to_string(b->removed) + " object(s) of " +
                   b->bucket).c_str());
