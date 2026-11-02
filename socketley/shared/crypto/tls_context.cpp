@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "cert_keeper.h"
+#include "../persist/file_stamp.h"
 #include "../util/spare_buffers.h"
 #include "../util/logging.h"
 #include "../util/number_parse.h"
@@ -1190,6 +1191,68 @@ SSL_CTX* tls_context::make_client_ctx(std::string_view ca_file, std::string& why
     }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
     return ctx;
+#else
+    (void)ca_file;
+    why = "this build has no TLS";
+    return nullptr;
+#endif
+}
+
+SSL_CTX* tls_context::shared_client_ctx(std::string_view ca_file, std::string& why)
+{
+#if SOCKETLEY_HAS_TLS
+    // The files the roots come from, whose change makes the context again: the CA file, or SSL_CERT_FILE and the
+    // bundle load_system_roots reads beside it.
+    socketley::file_stamp now[2];
+    if (!ca_file.empty())
+        now[0] = socketley::file_stamp::of(std::string(ca_file));
+    else
+    {
+        if (const char* env = std::getenv("SSL_CERT_FILE"); env && *env)
+            now[0] = socketley::file_stamp::of(env);
+        static const char* const bundles[] = {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                                              "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem"};
+        for (const char* f : bundles)
+            if (::access(f, R_OK) == 0)
+            {
+                now[1] = socketley::file_stamp::of(f);
+                break;
+            }
+    }
+    struct made
+    {
+        std::string ca;
+        socketley::file_stamp stamp[2];
+        SSL_CTX* ctx;
+    };
+    static std::mutex lock;
+    // Never destroyed, so the contexts stay reachable to the very end and none reads as leaked.
+    static auto* const kept = new std::vector<made>;
+    std::lock_guard<std::mutex> hold(lock);
+    for (auto& m : *kept)
+        if (m.ca == ca_file)
+        {
+            if (m.stamp[0] == now[0] && m.stamp[1] == now[1])
+            {
+                SSL_CTX_up_ref(m.ctx);
+                return m.ctx;
+            }
+            SSL_CTX* fresh = make_client_ctx(ca_file, why);
+            if (!fresh)
+                return nullptr;
+            SSL_CTX_free(m.ctx);
+            m.ctx = fresh;
+            m.stamp[0] = now[0];
+            m.stamp[1] = now[1];
+            SSL_CTX_up_ref(fresh);
+            return fresh;
+        }
+    SSL_CTX* fresh = make_client_ctx(ca_file, why);
+    if (!fresh)
+        return nullptr;
+    kept->push_back({std::string(ca_file), {now[0], now[1]}, fresh});
+    SSL_CTX_up_ref(fresh);
+    return fresh;
 #else
     (void)ca_file;
     why = "this build has no TLS";

@@ -156,6 +156,9 @@ public:
     // A TLS 1.2+ client context that verifies every peer against `ca_file`, or the system's roots when it is empty;
     // null with `why` naming what could not be loaded, since a context with no roots verifies nobody.
     static SSL_CTX* make_client_ctx(std::string_view ca_file, std::string& why);
+    // The same, made once per CA file and made again when that file changes: a reference the caller frees, to a context
+    // never changed once made, so threads share it.
+    static SSL_CTX* shared_client_ctx(std::string_view ca_file, std::string& why);
 
     // Pins the name the peer's certificate must carry: an address literal as an iPAddress SAN and never as SNI, a
     // host name with SNI and no partial-label wildcard; false leaves `ssl` unusable, never half-verified.

@@ -112,7 +112,7 @@ bool client::init(std::string& err, const std::string& ca_file, std::string user
 {
     m_agent = std::move(user_agent);
     std::string why;
-    m_ctx = tls_context::make_client_ctx(ca_file, why);
+    m_ctx = tls_context::shared_client_ctx(ca_file, why);
     return m_ctx || fail(err, why);
 }
 
