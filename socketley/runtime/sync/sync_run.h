@@ -228,6 +228,8 @@ private:
     void fetch_range(target& t, lane& l);
     // The fetch on `l` is over: placed when it is whole, its temporary file removed when it is not.
     void fetch_end(target& t, lane& l, bool whole);
+    // A fetched file put at its name once its bytes are on the disk, or let go of.
+    void place_fetched(const std::string& target_name, fetch& f, bool synced);
     void finish_pull();
     // The path below --dir a key names, false for one outside --prefix or one no file may be named.
     bool rel_of_key(std::string_view key, std::string& rel) const;
@@ -237,6 +239,8 @@ private:
     socketley::http_request signed_bucket_request(const target& t, std::string_view query) const;
     bool m_pull_due{false};
     bool m_pulling{false};
+    // Fetched files whose sync is in the ring, which a pull is not over before.
+    size_t m_placing{0};
     // The listing is still being read, so no fetch is decided yet.
     bool m_listing{false};
     std::chrono::steady_clock::time_point m_last_pull{};

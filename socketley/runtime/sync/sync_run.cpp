@@ -57,6 +57,8 @@ constexpr uint64_t fetch_range_bytes = 8ull << 20;
 constexpr int default_pull_secs = 60;
 // Where a file brought from the storage is written until it is whole, below --dir so the rename is atomic.
 constexpr const char* temp_dir = ".socketley-sync";
+// The most fetched files whose sync is in the ring at once.
+constexpr size_t max_placing = 32;
 // One read of inotify takes this much: some hundred events, more than a burst of saves makes.
 constexpr uint32_t watch_buf_size = 64 * 1024;
 // A file is looked at once it is written and closed, moved in, touched or removed; one merely created is still being
@@ -1628,6 +1630,9 @@ void sync_run::pump_fetch(target& t)
             break;
         if (l.busy || l.peer->busy())
             continue;
+        // Each file being synced holds a descriptor and a kernel worker, so no more are brought until some are in place.
+        if (m_placing >= max_placing)
+            break;
         l.get = std::make_unique<fetch>(std::move(m_fetches.front()));
         m_fetches.pop_front();
         l.busy = true;
@@ -1654,8 +1659,9 @@ void sync_run::pump_fetch(target& t)
         else
             fetch_range(t, l);
     }
-    // Every fetch is over once no lane holds one and none waits.
-    if (m_fetches.empty() && std::none_of(t.lanes.begin(), t.lanes.end(), [](const auto& l) { return l->get != nullptr; }))
+    // Every fetch is over once no lane holds one, none waits and none is being put in place.
+    if (m_fetches.empty() && m_placing == 0 &&
+        std::none_of(t.lanes.begin(), t.lanes.end(), [](const auto& l) { return l->get != nullptr; }))
         finish_pull();
 }
 
@@ -1720,14 +1726,37 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
     l.busy = false;
     if (!f)
         return;
-    bool placed = false;
-    bool synced = whole && f->fd >= 0;
-    if (synced && ::fsync(f->fd) != 0)
+    // Synced through the ring, so the lane brings its next file while the disk takes this one.
+    if (whole && f->fd >= 0 && !m_stopped)
     {
-        note(f->rel + ": syncing it here failed: " + std::strerror(errno));
-        owe_retry();
-        synced = false;
+        std::shared_ptr<fetch> held(std::move(f));
+        ++m_placing;
+        if (m_io.fsync(held->fd, false, [this, held, name = t.name](int64_t res) {
+                --m_placing;
+                if (res < 0)
+                {
+                    note(held->rel + ": syncing it here failed: " + std::strerror(static_cast<int>(-res)));
+                    owe_retry();
+                }
+                place_fetched(name, *held, res >= 0 && !m_stopped);
+            }))
+            return;
+        --m_placing;
+        f = std::make_unique<fetch>(std::move(*held));
+        if (::fsync(f->fd) != 0)
+        {
+            note(f->rel + ": syncing it here failed: " + std::strerror(errno));
+            owe_retry();
+            whole = false;
+        }
     }
+    place_fetched(t.name, *f, whole && f->fd >= 0);
+}
+
+void sync_run::place_fetched(const std::string& target_name, fetch& fr, bool synced)
+{
+    fetch* f = &fr;
+    bool placed = false;
     if (synced)
     {
         // The folder it goes in, opened and made by the kernel below --dir, so no link there before or swapped in
@@ -1768,9 +1797,9 @@ void sync_run::fetch_end(target& t, lane& l, bool whole)
             // The name as the storage has it is now the same on both sides; a conflict copy is new to both, and the
             // walk carries it out, as it does this side's file over the storage's, which it now knows the etag of.
             if (name == f->rel && ::fstatat(at, name_leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
-                !m_index.carried(t.name, f->rel, index_entry{uint64_t(st.st_size), mtime_of(st), f->etag}, why))
+                !m_index.carried(target_name, f->rel, index_entry{uint64_t(st.st_size), mtime_of(st), f->etag}, why))
                 note(why);
-            if (name != f->rel && !m_index.carried(t.name, f->rel, index_entry{0, -1, f->etag}, why))
+            if (name != f->rel && !m_index.carried(target_name, f->rel, index_entry{0, -1, f->etag}, why))
                 note(why);
             m_stats.failing = 0;
         }
