@@ -142,6 +142,7 @@ bool account_store::apply(std::string_view record)
             unindex(it->second);
             m_accounts.erase(it);
             ++m_standing_changes;
+            note_standing(id);
         }
         return true;
     }
@@ -163,7 +164,10 @@ bool account_store::apply(std::string_view record)
     a.id = id;
     unindex(a);
     if (made || std::any_of(fl.begin(), fl.end(), [](const auto& kv) { return shapes_standing(kv.first); }))
+    {
         ++m_standing_changes;
+        note_standing(id);
+    }
     for (auto& [k, v] : fl)
     {
         if (v.empty())
@@ -179,6 +183,8 @@ bool account_store::read_snapshot(const std::string& path, std::string& why)
 {
     // Accounts read again are a standing to be made again.
     ++m_standing_changes;
+    m_standing_all = true;
+    m_standing_dirty.clear();
     std::ifstream f(path);
     if (!f)
         return true;   // no snapshot yet: everything is in the journal
@@ -820,6 +826,29 @@ std::vector<const account*> account_store::all() const
     for (const auto& [k, a] : keyed)
         out.push_back(a);
     return out;
+}
+
+void account_store::note_standing(const std::string& id)
+{
+    // A shard that only follows the journal makes no standing, and past one an account the whole is made again.
+    if (m_following || m_standing_all)
+        return;
+    if (m_standing_dirty.size() >= m_accounts.size())
+    {
+        m_standing_all = true;
+        m_standing_dirty.clear();
+        return;
+    }
+    m_standing_dirty.push_back(id);
+}
+
+bool account_store::take_standing_dirty(std::vector<std::string>& ids)
+{
+    const bool all = m_standing_all;
+    m_standing_all = false;
+    ids.swap(m_standing_dirty);
+    m_standing_dirty.clear();
+    return all;
 }
 
 std::vector<const account*> account_store::by_email(std::string_view email) const

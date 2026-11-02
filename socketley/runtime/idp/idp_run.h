@@ -259,10 +259,15 @@ private:
     bool cross(uint32_t shard, const shard_call& call, std::function<void(bool, std::string_view)> then);
     // Shard 0's journal as far as it has written it: said to the other shards, which read it before every answer, and
     // the accounts' standing written beside the key once a change has altered it.
-    void publish_accounts();
+    // `then` runs once the standing is on the disk as of every change made so far.
+    void publish_accounts(std::function<void()> then = {});
     // Each account's standing where the runtimes that verify its sessions alone read it, by shard 0 alone, as it
-    // writes the accounts; false when it could not be written, which the next change tries again.
+    // writes the accounts; false when it could not be written, which the next change tries again. In line, at start.
     bool publish_standing();
+    // The same off the loop, the waiters each run once a write covering their change has ended.
+    void write_standing();
+    // The lines of the accounts whose standing changed, made again, and the whole file made from every line.
+    std::string standing_doc();
     void catch_up();
 
     void answer_command(uint64_t ticket, std::string_view text);
@@ -343,9 +348,15 @@ private:
     bool m_reader{false};
     uint64_t m_told_id{0}, m_told_end{0};
     std::string m_follow_error;
-    // The accounts' change count the standing was last written at, and what it said.
+    // The accounts' change count the standing was last written at, each account's line of it by id, the write under
+    // way, and who waits for one as of which change count.
     uint64_t m_standing_at{UINT64_MAX};
-    std::string m_standing;
+    std::unordered_map<std::string, std::string> m_standing_lines;
+    bool m_standing_writing{false};
+    std::vector<std::pair<uint64_t, std::function<void()>>> m_standing_waiters;
+    // The thread the standing is written and synced on, apart from the sign-ins' hashing, which it would wait behind.
+    hash_pool m_standing_pool{1};
+    bool m_standing_attached{false};
     std::unordered_map<uint64_t, std::function<void(bool, std::string_view)>> m_crossed;
     uint64_t m_next_cookie{1};
 

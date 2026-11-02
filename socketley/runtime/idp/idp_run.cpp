@@ -243,6 +243,7 @@ idp_run::~idp_run()
 {
     *m_alive = false;
     m_hash.stop();
+    m_standing_pool.stop();
     m_loop.deregister_owner(this);
     if (m_key)
         EVP_PKEY_free(m_key);
@@ -328,6 +329,7 @@ bool idp_run::start(std::string& why)
     m_loop.register_owner(this);
     if (!m_hash.attach(m_io))
         m_hash.stop();
+    m_standing_attached = !m_reader && m_standing_pool.attach(m_io);
 
     if (!m_http.listen_tcp(m_owner.bind_in_addr(), m_owner.effective_port(), m_shards > 1, why))
         return false;
@@ -349,6 +351,8 @@ void idp_run::stop()
     m_http.stop();
     // The hashing thread ends before the descriptor it wakes the loop through is closed.
     m_hash.retire(m_loop);
+    m_standing_pool.retire(m_loop);
+    m_standing_waiters.clear();
     m_accounts.close();
 }
 
@@ -3085,9 +3089,10 @@ void idp_run::answer_durable(uint64_t ticket, std::string text)
 void idp_run::answer_command(uint64_t ticket, std::string_view text)
 {
     // A change a command made is said to the other shards before it is answered, so none answers from before it.
-    publish_accounts();
-    if (auto* mgr = m_owner.get_runtime_manager())
-        mgr->requests().complete_deferred(ticket, request_status::ok, text);
+    publish_accounts([this, ticket, text = std::string(text)] {
+        if (auto* mgr = m_owner.get_runtime_manager())
+            mgr->requests().complete_deferred(ticket, request_status::ok, text);
+    });
 }
 
 void idp_run::command(uint64_t ticket, std::string_view payload)
@@ -3622,17 +3627,14 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
 
 // ─── Shards ─────────────────────────────────────────────────────────────────
 
-bool idp_run::publish_standing()
+std::string idp_run::standing_doc()
 {
-    // Made again only after a change to what it is made of: a token refreshed or a name changed leaves it as it was.
-    if (m_reader || m_accounts.standing_changes() == m_standing_at)
-        return true;
-    std::string doc(standing_format);
-    m_accounts.each([&](const account& a)
+    const auto line_of = [](const account& a)
     {
+        std::string line;
         // An id a line cannot hold is left out, so its sessions are refused rather than misread.
         if (a.id.find_first_of(" \t\r\n") != std::string::npos)
-            return;
+            return line;
         standing s;
         const std::string_view before = a.field("revoked_before");
         std::from_chars(before.data(), before.data() + before.size(), s.revoked_before);
@@ -3642,27 +3644,110 @@ bool idp_run::publish_standing()
         for (const auto& [k, v] : a.fields)
             if (k.starts_with(signed_out_prefix) && k.size() > signed_out_prefix.size())
                 s.ended.push_back(k.substr(signed_out_prefix.size()));
-        append_standing(doc, a.id, s);
-    });
-    if (doc != m_standing)
+        append_standing(line, a.id, s);
+        return line;
+    };
+    std::vector<std::string> dirty;
+    if (m_accounts.take_standing_dirty(dirty))
     {
-        // Synced, since a crash that brought back the file before a sign-out would let its sessions in again.
-        std::string why;
-        const std::string path = idp_standing_path(m_owner.get_name());
-        if (!replace_file(path, doc, durability::data_and_dir, &why))
-        {
-            LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + path + " could not be written: " + why).c_str());
-            return false;
-        }
-        m_standing = std::move(doc);
+        m_standing_lines.clear();
+        m_accounts.each([&](const account& a) { m_standing_lines[a.id] = line_of(a); });
     }
-    m_standing_at = m_accounts.standing_changes();
+    else
+        for (const std::string& id : dirty)
+        {
+            if (const account* a = m_accounts.by_id(id))
+                m_standing_lines[id] = line_of(*a);
+            else
+                m_standing_lines.erase(id);
+        }
+    size_t bytes = standing_format.size();
+    for (const auto& [id, line] : m_standing_lines)
+        bytes += line.size();
+    std::string doc;
+    doc.reserve(bytes);
+    doc.append(standing_format);
+    for (const auto& [id, line] : m_standing_lines)
+        doc.append(line);
+    return doc;
+}
+
+bool idp_run::publish_standing()
+{
+    // Made again only after a change to what it is made of: a token refreshed or a name changed leaves it as it was.
+    if (m_reader || m_accounts.standing_changes() == m_standing_at)
+        return true;
+    const uint64_t at = m_accounts.standing_changes();
+    // Synced, since a crash that brought back the file before a sign-out would let its sessions in again.
+    std::string why;
+    const std::string path = idp_standing_path(m_owner.get_name());
+    if (!replace_file(path, standing_doc(), durability::data_and_dir, &why))
+    {
+        LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + path + " could not be written: " + why).c_str());
+        return false;
+    }
+    m_standing_at = at;
     return true;
 }
 
-void idp_run::publish_accounts()
+void idp_run::write_standing()
 {
-    publish_standing();
+    if (m_standing_writing)
+        return;
+    const uint64_t at = m_accounts.standing_changes();
+    const auto release = [this](uint64_t upto)
+    {
+        auto waiting = std::move(m_standing_waiters);
+        m_standing_waiters.clear();
+        for (auto& [need, then] : waiting)
+        {
+            if (need <= upto)
+                then();
+            else
+                m_standing_waiters.emplace_back(need, std::move(then));
+        }
+    };
+    if (at == m_standing_at || m_reader)
+    {
+        release(UINT64_MAX);
+        return;
+    }
+    if (!m_standing_attached || !m_standing_pool.enabled())
+    {
+        publish_standing();
+        release(at);
+        return;
+    }
+    m_standing_writing = true;
+    auto doc = std::make_shared<std::string>(standing_doc());
+    auto why = std::make_shared<std::string>();
+    auto ok = std::make_shared<bool>(false);
+    m_standing_pool.submit(0,
+        [doc, why, ok, path = idp_standing_path(m_owner.get_name())]
+        {
+            *ok = replace_file(path, *doc, durability::data_and_dir, why.get());
+        },
+        [this, alive = m_alive, at, why, ok, release]
+        {
+            if (!*alive)
+                return;
+            m_standing_writing = false;
+            if (*ok)
+                m_standing_at = at;
+            else
+                LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + idp_standing_path(m_owner.get_name()) +
+                          " could not be written: " + *why).c_str());
+            // Answered either way, as the line before this took it: the next change tries the file again.
+            release(at);
+            write_standing();
+        });
+}
+
+void idp_run::publish_accounts(std::function<void()> then)
+{
+    if (then)
+        m_standing_waiters.emplace_back(m_accounts.standing_changes(), std::move(then));
+    write_standing();
     if (m_shards <= 1 || m_reader)
         return;
     const uint64_t id = m_accounts.journal_id(), end = m_accounts.journal_end();
@@ -3765,8 +3850,9 @@ void idp_run::update_account(const std::string& id, field_list fields,
         }
         // Answered, and told to the other shards, once the change is on the disk.
         m_accounts.when_durable([this, then](bool durable) {
-            publish_accounts();
-            then(durable, durable ? std::string() : std::string("the change could not be written to the disk"));
+            publish_accounts([then, durable] {
+                then(durable, durable ? std::string() : std::string("the change could not be written to the disk"));
+            });
         });
         return;
     }
@@ -3827,10 +3913,11 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
                 return;
             }
             m_accounts.when_durable([this, ticket](bool durable) {
-                publish_accounts();
-                if (auto* m = m_owner.get_runtime_manager())
-                    m->requests().complete_deferred(ticket, request_status::ok,
-                        encode_result(durable, durable ? "" : "the change could not be written to the disk"));
+                publish_accounts([this, ticket, durable] {
+                    if (auto* m = m_owner.get_runtime_manager())
+                        m->requests().complete_deferred(ticket, request_status::ok,
+                            encode_result(durable, durable ? "" : "the change could not be written to the disk"));
+                });
             });
             return;
         }

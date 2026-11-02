@@ -81,6 +81,8 @@ public:
     uint64_t changes() const { return m_changes; }
     // The same, added to only by an account made or removed or a field shapes_standing() names.
     uint64_t standing_changes() const { return m_standing_changes; }
+    // The ids of those changes since the last take, or true for every account, as after the store was read whole.
+    bool take_standing_dirty(std::vector<std::string>& ids);
 
     const account* by_id(std::string_view id) const;
     // By username, case aside.
@@ -121,6 +123,7 @@ private:
     bool commit_many(const std::vector<std::string>& records, std::string& why);
     bool apply(std::string_view record);
     void index(const account& a);
+    void note_standing(const std::string& id);
     void unindex(const account& a);
     bool read_snapshot(const std::string& path, std::string& why);
     void note_journal();
@@ -145,6 +148,8 @@ private:
     uint64_t m_journal_end{0};
     uint64_t m_changes{0};
     uint64_t m_standing_changes{0};
+    std::vector<std::string> m_standing_dirty;
+    bool m_standing_all{true};
     // A commit is applied at once, so the next one sees it, and is made durable by a group sync through the ring:
     // the changes committed while one is in flight go in the next, and each waiter runs once its own are in one.
     file_io* m_io{nullptr};

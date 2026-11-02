@@ -9,6 +9,7 @@
 #   * a standing that a write which changes it leaves as it was: a disabled account's sessions still let in
 #   * an account found by its address through the same sort: every mail runtime's lookup and verify, 240 ms each
 #   * an address index that keeps an address an account no longer holds, or misses the one it now holds
+#   * the standing written whole and synced on the loop at each change to it: a disable held it 44 ms
 #   * a compaction that writes the snapshot of every account in one piece on the loop: 90 ms once every thousand
 #     writes, here made to come within the timed ones
 #   * a snapshot written in pieces while writes go on that a restart reads back as other than the last of them
@@ -90,16 +91,22 @@ t0 = time.perf_counter()
 for i in range(20):
     subprocess.run([b, "idp-user", "auth", "lookup", "u%d@example.test" % (1000 + i)], stdout=subprocess.DEVNULL)
 l = (time.perf_counter() - t0) * 1000 / 20
+mark = len(lat)
+for i in range(20):
+    subprocess.run([b, "idp-user", "auth", "disable" if i % 2 == 0 else "enable", "u%d" % (300 + i // 2)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 stop[0] = True; th.join()
-print("%.1f %.1f %.1f" % (w, max(lat), l))
+print("%.1f %.1f %.1f %.1f" % (w, max(lat[:mark]), l, max(lat[mark:] or [0])))
 PY
 )
-read -r per_write worst per_lookup <<<"$out"
+read -r per_write worst per_lookup worst_standing <<<"$out"
 echo "  at $N accounts: ${per_write:-?} ms a write, the loop's worst answer meanwhile ${worst:-?} ms, ${per_lookup:-?} ms a lookup by address"
+echo "  and its worst answer beside twenty accounts disabled and enabled: ${worst_standing:-?} ms"
 if [ "$sanitized" = 1 ]; then echo "  SKIP [stall]: milliseconds measure the sanitizer, not the store"
 else
     awk -v w="${worst:-9999}" 'BEGIN{exit !(w < 40)}' && ok || bad "a write leaves the loop answering" "$out"
     awk -v l="${per_lookup:-9999}" 'BEGIN{exit !(l < 60)}' && ok || bad "a lookup by address is not a pass over the store" "$out"
+    awk -v m="${worst_standing:-9999}" 'BEGIN{exit !(m < 25)}' && ok || bad "a change to the standing is written off the loop" "$out"
 fi
 
 # The standing follows a write that changes it, and only one.
