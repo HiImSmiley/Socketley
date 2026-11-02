@@ -91,8 +91,7 @@ public:
 
     bool write(std::string_view framed)
     {
-        if (!m_gate.admit(pending(), framed.size(), MAX_BACKLOG,
-                          "frame writer: backlog full; the peer is not reading"))
+        if (!admit(framed.size()))
             return false;
         m_out.append(framed);
 
@@ -108,13 +107,19 @@ public:
     template <class Fill>
     bool write_with(size_t size, Fill&& fill)
     {
-        if (!m_gate.admit(pending(), size, MAX_BACKLOG,
-                          "frame writer: backlog full; the peer is not reading"))
+        if (!admit(size))
             return false;
         fill(m_out);
         if (!m_loop)
             blocking_flush();
         return true;
+    }
+
+    // A frame with nothing queued ahead of it goes at any size: the cap bounds a backlog, and one frame is none.
+    bool admit(size_t size)
+    {
+        return pending() == 0 ||
+               m_gate.admit(pending(), size, MAX_BACKLOG, "frame writer: backlog full; the peer is not reading");
     }
 
     void flush()

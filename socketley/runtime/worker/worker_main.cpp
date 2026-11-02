@@ -1273,6 +1273,15 @@ private:
 
         if (to.link_serial == 0)
         {
+            // Past what the daemon reads, which it would take for a corrupt stream, the answer is said to be too large.
+            std::string too_large;
+            if (worker_proto::chan_reply_frame_size(reply) - worker_proto::header_size > worker_proto::max_payload)
+            {
+                too_large = "error: the answer is " + std::to_string(reply.size()) +
+                            " bytes, more than a worker may send (" +
+                            std::to_string(worker_proto::max_payload >> 20) + " MiB)";
+                reply = too_large;
+            }
             if (!m_writer.write_with(
                     worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
                         worker_proto::append_chan_reply_frame(
