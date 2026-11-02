@@ -156,6 +156,10 @@ endpoint_ptr open(const options& o, host& h, event_loop& loop, std::string& err)
 // endpoint's reads and timers carry no connection of their own.
 bool owns(const endpoint& e, const io_request* req);
 void completion(endpoint& e, io_request* req, int res);
+// An endpoint let go of with a read or a timer still in the ring is kept, stopped, until the last of them is
+// answered, and the host hands those completions here: a request of one of them, and its completion.
+bool owns_retired(const io_request* req);
+void completion_retired(io_request* req, int res);
 
 // Once per turn of the loop, after the completions: every connection whose state moved writes its packets.
 void flush(endpoint& e);

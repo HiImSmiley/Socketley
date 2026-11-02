@@ -500,8 +500,13 @@ void endpoint::cqe(io_request* req, int res)
     }
     if (req == &tm)
     {
+        // Taken back: by a re-arm, which armed another, or by the stop, after which none is armed.
         if (res == -ECANCELED)
+        {
+            if (stopped)
+                tm_armed = false;
             return;
+        }
         tm_armed = false;
         if (!stopped)
             expire();
@@ -1290,6 +1295,8 @@ size_t endpoint::open_conns() const
 
 void endpoint::stop()
 {
+    // Before anything else, so no completion still on its way reads a packet or arms another read.
+    stopped = true;
     // Every client is told the connection ends, as HTTP/2's GOAWAY tells it.
     auto all = conns;
     for (auto& hc : all)
@@ -1650,7 +1657,56 @@ void gone(stream& st)
 
 // ─── The endpoint a runtime holds ───────────────────────────────────────────
 
-void endpoint_free::operator()(endpoint* e) const { delete e; }
+namespace
+{
+// Endpoints let go of with a completion still owed, one list per loop, as every endpoint is its loop's alone; what
+// is still on it when its thread ends is freed then, as no completion is read after.
+struct retired_list
+{
+    std::vector<endpoint*> v;
+    ~retired_list()
+    {
+        for (endpoint* e : v)
+            delete e;
+    }
+};
+thread_local retired_list retired;
+bool busy(const endpoint& e) { return e.rd_pending || e.in_pending || e.tm_armed; }
+}
+
+void endpoint_free::operator()(endpoint* e) const
+{
+    if (!e)
+        return;
+    if (!e->stopped)
+        e->stop();
+    // A read or a timer the ring still holds names this object, which is freed once it has answered.
+    if (busy(*e))
+    {
+        retired.v.push_back(e);
+        return;
+    }
+    delete e;
+}
+
+bool owns_retired(const io_request* req)
+{
+    return std::any_of(retired.v.begin(), retired.v.end(), [req](const endpoint* e) { return owns(*e, req); });
+}
+
+void completion_retired(io_request* req, int res)
+{
+    const auto it = std::find_if(retired.v.begin(), retired.v.end(), [req](const endpoint* e) { return owns(*e, req); });
+    if (it == retired.v.end())
+        return;
+    endpoint* e = *it;
+    e->cqe(req, res);
+    if (!busy(*e))
+    {
+        retired.v.erase(it);
+        delete e;
+    }
+}
 
 endpoint_ptr open(const options& o, host& h, event_loop& loop, std::string& err)
 {
@@ -1699,6 +1755,8 @@ namespace socketley::h3
 // What a runtime holds of HTTP/3 whether or not it is built in: an endpoint never opened, a stream never made.
 void endpoint_free::operator()(endpoint*) const {}
 ssl_st* tls_of(const stream&) { return nullptr; }
+bool owns_retired(const io_request*) { return false; }
+void completion_retired(io_request*, int) {}
 
 }   // namespace socketley::h3
 

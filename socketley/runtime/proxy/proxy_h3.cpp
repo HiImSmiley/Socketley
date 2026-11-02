@@ -92,10 +92,17 @@ bool proxy_instance::h3_open(uint16_t port)
 
 bool proxy_instance::h3_owns(const io_request* req) const
 {
-    return m_h3 && socketley::h3::owns(*m_h3, req);
+    return (m_h3 && socketley::h3::owns(*m_h3, req)) || socketley::h3::owns_retired(req);
 }
 
-void proxy_instance::h3_cqe(io_request* req, int res) { socketley::h3::completion(*m_h3, req, res); }
+// A completion of an endpoint a restart replaced goes to it, kept until its last is in.
+void proxy_instance::h3_cqe(io_request* req, int res)
+{
+    if (m_h3 && socketley::h3::owns(*m_h3, req))
+        socketley::h3::completion(*m_h3, req, res);
+    else
+        socketley::h3::completion_retired(req, res);
+}
 void proxy_instance::h3_flush() { if (m_h3) socketley::h3::flush(*m_h3); }
 void proxy_instance::h3_stop() { if (m_h3) socketley::h3::stop(*m_h3); }
 

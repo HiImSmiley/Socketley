@@ -90,8 +90,15 @@ bool storage_run::h3_open(uint16_t port, uint16_t advertise, uint32_t shard, uin
     return true;
 }
 
-bool storage_run::h3_owns(io_request* req) const { return m_h3 && h3::owns(*m_h3, req); }
-void storage_run::h3_cqe(io_request* req, int res) { h3::completion(*m_h3, req, res); }
+bool storage_run::h3_owns(io_request* req) const { return (m_h3 && h3::owns(*m_h3, req)) || h3::owns_retired(req); }
+// A completion of an endpoint a restart replaced goes to it, kept until its last is in.
+void storage_run::h3_cqe(io_request* req, int res)
+{
+    if (m_h3 && h3::owns(*m_h3, req))
+        h3::completion(*m_h3, req, res);
+    else
+        h3::completion_retired(req, res);
+}
 void storage_run::h3_flush_dirty() { if (m_h3) h3::flush(*m_h3); }
 size_t storage_run::h3_open_conns() const { return m_h3 ? h3::open_conns(*m_h3) : 0; }
 void storage_run::h3_stop() { if (m_h3) h3::stop(*m_h3); }
