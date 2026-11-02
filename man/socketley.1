@@ -20685,7 +20685,10 @@ messages total, bytes in/out, and per-runtime breakdowns, among them
 .B socketley_runtime_resident_memory_bytes
 (resident, a shared page counted once per shard) and
 .B socketley_runtime_memory_bytes
-(what the runtime costs the machine, a shared page counted by the share it holds).
+(what the runtime costs the machine, a shared page counted by the share it holds), and the daemon's own
+.B socketley_daemon_cpu_seconds_total
+and
+.BR socketley_daemon_memory_bytes .
 .PP
 Each running runtime adds the figures of its own
 .BR stats ,

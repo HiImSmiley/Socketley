@@ -7,6 +7,8 @@
 #   the points  a runtime's messages per second, its memory, and the daemon's
 #               own series, in the buckets asked for, null where there is no
 #               point; the range and the number of buckets are held in bounds
+#   the overall the overview's memory line counts the daemon as its figure does,
+#               so its last point is the figure and not 9 MB short of it
 #   the store   a daemon whose dashboard signs people in is given a metrics
 #               runtime, private on disk, and the page reads it
 #   a restart   a daemon started again shows the points from before, once its
@@ -67,6 +69,17 @@ expect "with the messages it was sent, per second" "$(echo "$h" | j "max(v or 0 
 expect "and its memory" "$(echo "$h" | j "max(v or 0 for v in d['rss']) > 1e6")" True
 expect "a bucket without a point is null, not 0" "$(echo "$h" | j "d['msg'][0]")" None
 expect "the daemon's own is there too" "$(hist "range=60&points=12" | j "max(v or 0 for v in d['msg']) > 2")" True
+# The overview's line ends where its figure stands: the daemon's own memory is counted in both, as the tile says.
+expect "the daemon's own memory is a series of its own" \
+    "$(curl -s -m 10 -b "$T/jar" "$U/metrics" | awk '$1=="socketley_daemon_memory_bytes" {print ($2 > 1e6)}')" 1
+for _ in $(seq 1 30); do
+    ov=$(curl -s -m 10 -b "$T/jar" "$U/api/overview" | j "d['memory_bytes']")
+    last=$(hist "range=60&points=12" | j "[v for v in d['rss'] if v][-1]")
+    awk -v a="$ov" -v b="$last" 'BEGIN{exit !(a > 0 && (a - b) / a < 0.15 && (b - a) / a < 0.15)}' && break
+    sleep 1
+done
+expect "and the overview's memory line ends at the memory the overview says, daemon and workers" \
+    "$(awk -v a="$ov" -v b="$last" 'BEGIN{print (a > 0 && (a - b) / a < 0.15 && (b - a) / a < 0.15) ? "near" : "apart " b " of " a}')" near
 expect "a runtime never seen has none" "$(hist "runtime=nope")" "{}"
 expect "the buckets are held in bounds" "$(hist "runtime=st&range=60&points=3" | j "len(d['msg'])") $(hist "runtime=st&range=60&points=99999" | j "len(d['msg'])")" "10 1440"
 now=$(date +%s)

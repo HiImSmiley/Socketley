@@ -250,12 +250,16 @@ std::string metrics_endpoint::history_json(std::string_view runtime, int64_t ran
     const auto part = [&](std::string_view key, const std::string& expr) {
         return "label_replace(" + expr + ",\"k\",\"" + std::string(key) + "\",\"\",\"\")";
     };
+    // The whole fleet's CPU and memory count the daemon as the overview's figures do; a time before its own series
+    // existed sums the runtimes alone.
+    const std::string self_cpu = sel.empty() ? " or rate(socketley_daemon_cpu_seconds_total" + w + ")" : std::string();
+    const std::string self_mem = sel.empty() ? " or socketley_daemon_memory_bytes" : std::string();
     const std::string q = part("conn", "sum(socketley_runtime_connections" + sel + ")") + " or " +
                           part("msg", "sum(rate(socketley_runtime_messages_total" + sel + w + "))") + " or " +
                           part("in", "sum(rate(socketley_runtime_bytes_received_total" + sel + w + "))") + " or " +
                           part("out", "sum(rate(socketley_runtime_bytes_sent_total" + sel + w + "))") + " or " +
-                          part("cpu", "100 * sum(rate(socketley_runtime_cpu_seconds_total" + sel + w + "))") + " or " +
-                          part("rss", "sum(socketley_runtime_memory_bytes" + sel + ")");
+                          part("cpu", "100 * sum(rate(socketley_runtime_cpu_seconds_total" + sel + w + ")" + self_cpu + ")") +
+                          " or " + part("rss", "sum(socketley_runtime_memory_bytes" + sel + self_mem + ")");
     const std::string reply = ask_store(store, {"query_range", q, "--start", std::to_string(from + step), "--end",
                                                 std::to_string(now), "--step", std::to_string(step), "--json"});
     socketley::json::jvalue doc;
@@ -1026,6 +1030,10 @@ using metric_catalog::family;
 using metric_catalog::kind;
 
 constexpr family daemon_info{"socketley_daemon_info", kind::gauge, "The daemon these numbers come from."};
+constexpr family daemon_cpu{"socketley_daemon_cpu_seconds_total", kind::counter,
+                            "CPU time of the daemon's own process, user and system."};
+constexpr family daemon_memory{"socketley_daemon_memory_bytes", kind::gauge,
+                               "What the daemon's own process costs the machine, a shared page counted by its share."};
 constexpr family runtimes_total{"socketley_runtimes_total", kind::gauge, "Total number of runtimes."};
 constexpr family runtimes_running{"socketley_runtimes_running", kind::gauge, "Number of running runtimes."};
 constexpr family connections_total{"socketley_connections_total", kind::counter, "Total connections accepted."};
@@ -1067,7 +1075,7 @@ void metrics_endpoint::walk_series(const runtime_manager& manager, fact_cache& c
     std::vector<runtime_row> snapshots = runtime_rows(manager, true);
     if (refresh_memory)
     {
-        std::vector<pid_t> every;
+        std::vector<pid_t> every{::getpid()};
         for (const runtime_row& r : snapshots)
             every.insert(every.end(), r.pids.begin(), r.pids.end());
         refresh_pss(every);
@@ -1087,6 +1095,10 @@ void metrics_endpoint::walk_series(const runtime_manager& manager, fact_cache& c
                           {"socket", daemon_handler::socket_path},
                           {"exe", exe}};
     out(series::of(top::daemon_info, info, uint64_t{1}));
+    // The daemon's own share, which the dashboard's totals count beside the runtimes'.
+    const process_usage self = usage_of({::getpid()});
+    out(series::of(top::daemon_cpu, {}, std::round(self.cpu_seconds * 100) / 100));
+    out(series::of(top::daemon_memory, {}, self.memory_bytes));
 
     out(series::of(top::runtimes_total, {}, uint64_t{snapshots.size()}));
     out(series::of(top::runtimes_running, {}, totals.running));
