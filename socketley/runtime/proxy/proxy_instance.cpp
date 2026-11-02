@@ -377,6 +377,7 @@ void proxy_backend_connection::reset(int new_fd)
     full_reads = 0;
     tls_relayed = 0;
     splice_small = false;
+    splice_body = false;
     pool_draining = false;
     recv_withdrawing = false;
     sent_to_client = false;
@@ -2020,6 +2021,9 @@ bool proxy_instance::setup(event_loop& loop)
         if (m_mesh.health_check == mesh_config::health_http)
             m_mesh.health_check = mesh_config::health_tcp;
     }
+    // A TLS client whose send key moves to the kernel may wait for room on its socket, which this polls for.
+    if (m_tls && !m_files && m_loop)
+        m_files = std::make_unique<fcgi_file_pump>(*m_loop);
 
     if (any_backend_tls)
     {
@@ -3146,8 +3150,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
                 close_pair(client_fd, -1);
                 goto proxy_resubmit_accept;
             }
-            if (m_kernel_tls && (m_files || m_protocol == protocol_tcp) &&
-                !tls_context::allow_kernel_tls(ptr->ssl, client_fd))
+            if (m_kernel_tls && !tls_context::allow_kernel_tls(ptr->ssl, client_fd))
                 m_kernel_tls = false;
             ptr->tls_state = tls_conn_handshake;
             ptr->handshake_since = std::chrono::steady_clock::now();
@@ -4169,6 +4172,8 @@ proxy_http_resubmit:
     }
 }
 
+static bool open_splice_pipe(int (&p)[2]);
+
 void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
@@ -4596,47 +4601,25 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             begin_tunnel(ce.client);
     }
 
-    // The "is it finished" half of the pool test is one shared predicate now,
-    // so a change to what finished means reaches the teardown paths as well as
-    // this one -- and a backend that closes without saying close, HTTP/1.0, is
-    // let go of here with its client kept, because the pool gate refuses it.
-    if (m_protocol == protocol_http && !conn->http_frame.close_said &&
-        !conn->closing && !conn->splice_active &&
-        backend_response_complete(conn))
-    {
-        if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
-        {
-            auto& ce = m_conn_idx[conn->client_fd];
-            if (ce.side == conn_client && !ce.client->closing)
-            {
-                // The client's own `Connection: close` is not a condition
-                // here, because it says nothing about whether the backend
-                // socket is at a message boundary -- refusing on it cost a
-                // backend connection per request -- and the group guard read
-                // slot 0, so an @group gateway never detached and every later
-                // request reached the member with the prefix still on it.
-                if (park_backend(ce.client, conn))
-                    return;
-                detach_and_pool_backend(ce.client, fd);
-                return;
-            }
-        }
-    }
+    if (m_protocol == protocol_http && http_answer_settled(conn, fd))
+        return;
 
-    // ── the end of the hold ─────────────────────────────────────────────────
-    // A held half-closed client whose answer is now complete is closed here,
-    // because everything past the detach had no ending at all and the pair sat
-    // with only the backend's idle read armed -- asked out of
-    // client_answer_owed(), the same predicate the hold and the invariant use.
-    if (m_protocol == protocol_http && conn->client_fd >= 0 &&
-        conn->client_fd < MAX_FDS)
+    // The rest of a long body of a known length goes by splice, once the client has taken what is queued for it.
+    if (m_protocol == protocol_http && !multishot_more && !conn->splice_active && !conn->closing &&
+        http_body_spliceable(conn) && open_splice_pipe(conn->pipe_to_client))
     {
-        auto& ce = m_conn_idx[conn->client_fd];
-        if (ce.side == conn_client && ce.client->client_eof &&
-            !ce.client->closing && !client_answer_owed(ce.client, conn))
+        conn->splice_active = true;
+        conn->splice_body = true;
+        conn->full_reads = 0;
+        proxy_client_connection* cconn = m_conn_idx[conn->client_fd].client;
+        if (!send_new_key(cconn))
         {
-            ce.client->closing = true;
-            close_pair(ce.client->fd, fd);
+            close_pair(conn->client_fd, fd);
+            return;
+        }
+        if (!conn->read_pending)
+        {
+            start_splice_forwarding(cconn, conn);
             return;
         }
     }
@@ -4657,6 +4640,11 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         {
             auto* cconn = m_conn_idx[conn->client_fd].client;
             splice_side_on(cconn, conn, false);
+            if (conn->splice_active && !send_new_key(cconn))
+            {
+                close_pair(conn->client_fd, fd);
+                return;
+            }
             if (conn->splice_active && !conn->read_pending)
             {
                 start_splice_forwarding(cconn, conn);
@@ -7242,6 +7230,95 @@ bool proxy_instance::backend_feeds_kernel_tls(const proxy_backend_connection* bc
     return c->ssl != nullptr && tls_context::kernel_ready(c->ssl);
 }
 
+bool proxy_instance::send_new_key(proxy_client_connection* c)
+{
+    // The record that changes the key goes out now, behind what the client has been sent, so a client with nothing in
+    // flight does not wait for a write that will never complete.
+    return c->ssl == nullptr || c->write_pending || !tls_owes_output(c) || flush_client_write_queue(c);
+}
+
+bool proxy_instance::http_body_spliceable(proxy_backend_connection* conn)
+{
+    const http_response_framing& f = conn->http_frame;
+    if (!m_splice_supported || !f.headers_parsed || !f.has_content_length || f.chunked || f.transfer_encoding ||
+        f.no_body || f.unknown || f.overrun || f.switched_protocols || f.body_remaining < http_body_splice_min ||
+        conn->ssl != nullptr || conn->fcgi != nullptr || m_fastcgi || m_cb_on_proxy_response ||
+        get_global_rate_limit() > 0.0 || conn->client_fd < 0 || conn->client_fd >= MAX_FDS)
+        return false;
+    const proxy_conn_entry& ce = m_conn_idx[conn->client_fd];
+    if (ce.side != conn_client || ce.client->ex.backend_fd != conn->fd)
+        return false;
+    proxy_client_connection* c = ce.client;
+    if (c->closing || c->h2_parent != nullptr || c->h3s != nullptr || c->file != nullptr || c->rl_max > 0 ||
+        on_fast_lo(c->fd, conn->fd))
+        return false;
+#ifndef SOCKETLEY_NO_LUA
+    if (auto* lctx = lua(); lctx && lctx->has_on_proxy_response())
+        return false;
+#endif
+    // A TLS client takes it once its send key is the kernel's, which is asked for here.
+    return c->ssl == nullptr || client_kernel_tls(c);
+}
+
+void proxy_instance::http_body_spliced(proxy_backend_connection* conn)
+{
+    conn->splice_active = false;
+    conn->splice_body = false;
+    conn->full_reads = 0;
+    close_splice_pipe(conn->pipe_to_client);
+    const int fd = conn->fd;
+    if (conn->client_fd < 0 || conn->client_fd >= MAX_FDS || m_conn_idx[conn->client_fd].side != conn_client ||
+        m_conn_idx[conn->client_fd].client->ex.backend_fd != fd)
+    {
+        close_pair(-1, fd);
+        return;
+    }
+    proxy_client_connection* cconn = m_conn_idx[conn->client_fd].client;
+    m_lat_request.observe(cconn->ex.began_ns, socketley::turn_clock::now_ns());
+    // A client that asked to close hears the end as a FIN behind the body, as a copied answer's last send gives it.
+    send_final_and_fin(cconn, {});
+    // The armed read is what the pool takes back, and what hears the backend close the socket.
+    if (!conn->read_pending && backend_read_armable(conn) && SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+    {
+        close_pair(conn->client_fd, fd);
+        return;
+    }
+    http_answer_settled(conn, fd);
+}
+
+bool proxy_instance::http_answer_settled(proxy_backend_connection* conn, int fd)
+{
+    if (conn->client_fd < 0 || conn->client_fd >= MAX_FDS)
+        return false;
+    const proxy_conn_entry& ce = m_conn_idx[conn->client_fd];
+    if (ce.side != conn_client)
+        return false;
+    // The "is it finished" half of the pool test is one shared predicate, so a change to what finished means reaches
+    // the teardown paths as well as this one -- and a backend that closes without saying close, HTTP/1.0, is let go of
+    // here with its client kept, because the pool gate refuses it.
+    if (!conn->http_frame.close_said && !conn->closing && !conn->splice_active && !ce.client->closing &&
+        backend_response_complete(conn))
+    {
+        // The client's own `Connection: close` is not a condition here, because it says nothing about whether the
+        // backend socket is at a message boundary -- refusing on it cost a backend connection per request -- and the
+        // group guard read slot 0, so an @group gateway never detached and every later request reached the member
+        // with the prefix still on it.
+        if (!park_backend(ce.client, conn))
+            detach_and_pool_backend(ce.client, fd);
+        return true;
+    }
+    // A held half-closed client whose answer is now complete is closed here, because everything past the detach had
+    // no ending at all and the pair sat with only the backend's idle read armed -- asked out of client_answer_owed(),
+    // the same predicate the hold and the invariant use.
+    if (ce.client->client_eof && !ce.client->closing && !client_answer_owed(ce.client, conn))
+    {
+        ce.client->closing = true;
+        close_pair(ce.client->fd, fd);
+        return true;
+    }
+    return false;
+}
+
 void proxy_instance::splice_side_on(proxy_client_connection* conn, proxy_backend_connection* bconn, bool client_side)
 {
     if (!splice_eligible(conn, bconn, client_side) ||
@@ -7282,6 +7359,7 @@ bool proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
     }
     if (bconn->splice_active && !bconn->splice_in_pending && !bconn->splice_out_pending && !bconn->read_pending &&
         !bconn->backend_eof && !bconn->closing && conn->write_queue.empty() && !conn->write_pending &&
+        !(bconn->splice_body && bconn->http_frame.body_remaining == 0) &&
         (conn->ssl == nullptr || tls_context::kernel_ready(conn->ssl)))
     {
         bconn->splice_in_pending = true;
@@ -7395,9 +7473,14 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (SOCKETLEY_UNLIKELY(req != &conn->splice_in_req))
                 return;
             conn->splice_in_req.type = op_splice;
+            // A body goes to its last byte and no further, since what follows it is the next answer's head.
+            const uint32_t want = conn->splice_body
+                                      ? static_cast<uint32_t>(std::min<size_t>(SPLICE_PIPE_SIZE,
+                                                                               conn->http_frame.body_remaining))
+                                      : static_cast<uint32_t>(SPLICE_PIPE_SIZE);
             if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing ||
                                    conn->pipe_to_client[1] < 0 ||
-                                   !splice_now(conn->fd, conn->pipe_to_client[1], SPLICE_PIPE_SIZE, &conn->splice_in_req)))
+                                   !splice_now(conn->fd, conn->pipe_to_client[1], want, &conn->splice_in_req)))
             {
                 conn->splice_in_pending = false;
                 close_pair(conn->client_fd, conn->fd);
@@ -7594,6 +7677,9 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (cqe->res > 0) { SKL_TRACE_ADD(conn, spliced, (unsigned long long)cqe->res); SKL_TRACE_ADD(conn, sp_in, (unsigned long long)cqe->res); }
             if (cqe->res > 0)
             {
+                if (conn->splice_body)
+                    conn->http_frame.body_remaining -=
+                        std::min(conn->http_frame.body_remaining, static_cast<size_t>(cqe->res));
                 // As on the client leg, and the client's clock is the one an idle sweep reads.
                 stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
                 if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0) && conn->client_fd >= 0 && conn->client_fd < MAX_FDS &&
@@ -7704,12 +7790,20 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 return;
             }
 
+            // A body gone to its last byte gives the socket back to the copy path, for the next answer's head.
+            if (conn->splice_body && conn->http_frame.body_remaining == 0 && SOCKETLEY_LIKELY(!conn->closing))
+            {
+                http_body_spliced(conn);
+                return;
+            }
             // As on the client leg: a message goes back to the copy path -- but not to a TLS client whose send key is
-            // the kernel's, where the copy path is the dearer of the two.
+            // the kernel's, where the copy path is the dearer of the two.  A body the copy path takes on from here is
+            // scanned on from what is left of it.
             if (SOCKETLEY_LIKELY(!conn->closing) && !m_splice_enabled && conn->splice_small &&
                 !backend_feeds_kernel_tls(conn))
             {
                 conn->splice_active = false;
+                conn->splice_body = false;
                 conn->full_reads = 0;
                 close_splice_pipe(conn->pipe_to_client);
                 if (!conn->read_pending && backend_read_armable(conn) && !client_backpressured(conn) &&

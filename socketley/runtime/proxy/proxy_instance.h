@@ -468,6 +468,9 @@ struct alignas(64) proxy_backend_connection
     uint64_t tls_relayed{0};
     uint8_t full_reads{0};
     bool splice_small{false};
+    // An answer's body of a known length goes by splice, http_frame.body_remaining counting what is left, and the copy
+    // path reads the next answer's head once it has gone.
+    bool splice_body{false};
     // The response is finished and this connection is on its way to the pool
     // with a cancelled read still owed, so nothing may touch the fd until that
     // completion lands.
@@ -1307,6 +1310,19 @@ private:
     bool client_kernel_tls(proxy_client_connection* conn);
     // The backend's splice feeds a TLS client whose send key is the kernel's.
     bool backend_feeds_kernel_tls(const proxy_backend_connection* bconn) const;
+    // An HTTP answer's body at least this long goes by splice from its first read on, where copying it cost ten times
+    // the CPU.
+    static constexpr size_t http_body_splice_min = 256u << 10;
+    // Whether what is left of this answer's body goes by splice: of a known length, past the threshold, and to a client
+    // nothing between them reads or reshapes.
+    bool http_body_spliceable(proxy_backend_connection* conn);
+    // A TLS client's record that moves its send key to the kernel written out now; false when the write fails.
+    bool send_new_key(proxy_client_connection* c);
+    // The spliced body is out to its last byte, and the answer ends as a copied one does.
+    void http_body_spliced(proxy_backend_connection* conn);
+    // An answer that has ended is settled: its backend parked or pooled, or a held half-closed client closed; true
+    // when the pair is no longer this caller's to touch.
+    bool http_answer_settled(proxy_backend_connection* conn, int fd);
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
 
     // ── the entrance ────────────────────────────────────────────────────────

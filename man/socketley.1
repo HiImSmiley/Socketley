@@ -20183,8 +20183,9 @@ Inherited by worker processes, which have no command line of their own.
 Set to
 .B 0
 to keep every TLS record in this process. Otherwise a TLS 1.3 connection of a
-server, a storage or a proxy that sends a file or object over 256 KiB, or a
-TCP proxy's client a backend streams that much to, changes its send key and
+server, a storage or a proxy that sends a file or object over 256 KiB, a TCP
+proxy's client a backend streams that much to, or an HTTP/1.1 proxy's client
+an answer's body of that known length goes to, changes its send key and
 hands the new one to the kernel's TLS layer, which then encrypts what is sent
 \(em by sendfile from the page cache, or spliced from the backend \(em at about
 half the CPU of encrypting a copy here. A connection that never asks for that
