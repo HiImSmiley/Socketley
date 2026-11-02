@@ -4303,7 +4303,11 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                                                   : conn->sent_to_client;
                 const bool backend_failed =
                     (cqe->res < 0) || !backend_answered || never_framed;
-                if (backend_failed && !teardown_is_ours)
+                // A TCP backend's clean close after the client's own FIN is its answer to it, however little came
+                // before: a client that connects and goes -- a health check, a scanner -- opened the breaker of a
+                // healthy backend after five.
+                const bool after_client_fin = m_protocol == protocol_tcp && cqe->res == 0 && ce.client->client_eof;
+                if (backend_failed && !teardown_is_ours && !after_client_fin)
                     note_backend_failure(ce.client);
 
                 // The backend went away before a byte of the answer did, and
