@@ -501,23 +501,36 @@ void account_store::synced(bool ok)
         sync_next();
 }
 
+namespace
+{
+
+std::string snapshot_header()
+{
+    return "{\"format\":" + socketley::json::quote(journal_owner) + ",\"version\":" +
+           std::to_string(account_store::format_version) + "}\n";
+}
+
+void append_snapshot_line(std::string& out, const account& a)
+{
+    out += "{\"id\":" + socketley::json::quote(a.id) + ",\"fields\":{";
+    bool first = true;
+    for (const auto& [k, v] : a.fields)
+    {
+        if (!first)
+            out += ',';
+        first = false;
+        out += socketley::json::quote(k) + ":" + socketley::json::quote(v);
+    }
+    out += "}}\n";
+}
+
+}   // namespace
+
 std::string account_store::snapshot_text() const
 {
-    std::string out = "{\"format\":" + socketley::json::quote(journal_owner) + ",\"version\":" +
-                      std::to_string(format_version) + "}\n";
+    std::string out = snapshot_header();
     for (const auto& [id, a] : m_accounts)
-    {
-        out += "{\"id\":" + socketley::json::quote(id) + ",\"fields\":{";
-        bool first = true;
-        for (const auto& [k, v] : a.fields)
-        {
-            if (!first)
-                out += ',';
-            first = false;
-            out += socketley::json::quote(k) + ":" + socketley::json::quote(v);
-        }
-        out += "}}\n";
-    }
+        append_snapshot_line(out, a);
     return out;
 }
 
@@ -560,7 +573,12 @@ bool account_store::compact(std::string& why)
 struct account_store::compaction
 {
     uint64_t gen{0};
+    // The ids when it began, written a piece a completion with each account as it is then, which the tail replayed
+    // over it leaves as it is because a record only sets fields or removes an account.
+    std::vector<std::string> ids;
+    size_t next_id{0};
     std::string text;
+    uint64_t at{0};
     uint64_t written{0};
     int fd{-1};
     int dir{-1};
@@ -574,7 +592,10 @@ void account_store::compact_async()
         return;
     auto job = std::make_shared<compaction>();
     job->gen = m_gen;
-    job->text = snapshot_text();
+    job->ids.reserve(m_accounts.size());
+    for (const auto& [id, a] : m_accounts)
+        job->ids.push_back(id);
+    job->text = snapshot_header();
     m_compacting = true;
     m_compact_from = m_committed;
     m_tail.clear();
@@ -626,10 +647,20 @@ void account_store::compact_step(const std::shared_ptr<compaction>& job, int ste
             break;
         case 1:
         case 2:
+            // The next piece once this one is out, so the loop is held for a piece and not for the store.
+            while (job->written == job->text.size() && job->next_id < job->ids.size())
+            {
+                job->at += job->written;
+                job->written = 0;
+                job->text.clear();
+                for (; job->next_id < job->ids.size() && job->text.size() < (256u << 10); ++job->next_id)
+                    if (const auto it = m_accounts.find(job->ids[job->next_id]); it != m_accounts.end())
+                        append_snapshot_line(job->text, it->second);
+            }
             if (job->written < job->text.size())
             {
                 const auto n = static_cast<uint32_t>(std::min<uint64_t>(job->text.size() - job->written, 1u << 30));
-                queued = m_io->pwrite(job->fd, job->text.data() + job->written, n, job->written, next(2));
+                queued = m_io->pwrite(job->fd, job->text.data() + job->written, n, job->at + job->written, next(2));
                 break;
             }
             queued = m_io->sync(job->fd, true, next(3));

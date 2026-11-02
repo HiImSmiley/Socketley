@@ -9,6 +9,9 @@
 #   * a standing that a write which changes it leaves as it was: a disabled account's sessions still let in
 #   * an account found by its address through the same sort: every mail runtime's lookup and verify, 240 ms each
 #   * an address index that keeps an address an account no longer holds, or misses the one it now holds
+#   * a compaction that writes the snapshot of every account in one piece on the loop: 90 ms once every thousand
+#     writes, here made to come within the timed ones
+#   * a snapshot written in pieces while writes go on that a restart reads back as other than the last of them
 #   * an answer over the 4 MiB a worker's writer queues refused whole, even with nothing ahead of it: the list of
 #     100,000 accounts never came, and the command waited out its bound
 set -uo pipefail
@@ -34,7 +37,8 @@ PI=$((SL_PORT_BASE + 1953))
 N=100000
 unset SOCKETLEY_CONFIG
 trap 'daemon_stop' EXIT
-daemon_start "$BIN"
+# A compaction every thirty records, so one comes within the writes timed below.
+SOCKETLEY_IDP_COMPACT_AFTER=30 daemon_start "$BIN"
 printf 'spa - http://localhost:5173/cb\n' > "$T/clients"
 "$BIN" create idp auth -p "$PI" --clients "$T/clients" --issuer "http://127.0.0.1:$PI" -s >/dev/null 2>&1
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PI/jwks")" != 000 ] && break; sleep 0.1; done
@@ -94,7 +98,7 @@ read -r per_write worst per_lookup <<<"$out"
 echo "  at $N accounts: ${per_write:-?} ms a write, the loop's worst answer meanwhile ${worst:-?} ms, ${per_lookup:-?} ms a lookup by address"
 if [ "$sanitized" = 1 ]; then echo "  SKIP [stall]: milliseconds measure the sanitizer, not the store"
 else
-    awk -v w="${worst:-9999}" 'BEGIN{exit !(w < 60)}' && ok || bad "a write leaves the loop answering" "$out"
+    awk -v w="${worst:-9999}" 'BEGIN{exit !(w < 40)}' && ok || bad "a write leaves the loop answering" "$out"
     awk -v l="${per_lookup:-9999}" 'BEGIN{exit !(l < 60)}' && ok || bad "a lookup by address is not a pass over the store" "$out"
 fi
 
@@ -118,6 +122,15 @@ r=$("$BIN" idp-user auth lookup zed@example.test 2>&1)
 case "$r" in "none"*) ok ;; *) bad "and not by the one it gave up" "$r" ;; esac
 r=$("$BIN" idp-user auth lookup yod@example.test 2>&1)
 case "$r" in "ok u77"*) ok ;; *) bad "but by the one it holds now" "$r" ;; esac
+
+# Back from the snapshot the compaction wrote while the writes went on, and the journal behind it.
+"$BIN" stop auth >/dev/null 2>&1
+"$BIN" start auth >/dev/null 2>&1
+for _ in $(seq 1 600); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PI/jwks")" = 200 ] && break; sleep 0.1; done
+r=$("$BIN" idp-user auth show u5 2>&1 | grep '^name:')
+[ "$r" = "name: n39" ] && ok || bad "a restart reads back the last write" "${r:-no name}"
+r=$("$BIN" idp-user auth show u7 2>&1 | grep -c '^disabled: 1')
+[ "$r" = 1 ] && ok || bad "and the account disabled" "$("$BIN" idp-user auth show u7 2>&1 | head -5 | tr '\n' ' ')"
 
 # All of them, in one answer of about 4.6 MB.
 "$BIN" idp-user auth list > "$T/list" 2>&1
