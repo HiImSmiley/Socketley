@@ -1052,48 +1052,20 @@ void storage_run::share_sent(const std::string& id, std::string json, std::funct
         then();
 }
 
-st storage_run::share_take(const std::string& id, const std::string& json)
+static st take_share_at(const std::string& root, const std::string& id, const std::string& json);
+
+void storage_run::share_take(const std::string& id, std::string json, std::function<void(st)> then)
 {
-    if (!valid_id(id))
-        return st::invalid_bucket_name;
-    const std::string dir  = m_store.options().dir + "/.shares";
-    const std::string path = dir + "/" + id + ".json";
-    if (json.empty())
+    // Off the loop: the link's file is merged, written and synced twice under its lock.
+    if (!m_hash.enabled())
     {
-        ::unlink(path.c_str());
-        ::unlink((path + ".lock").c_str());
-        return st::ok;
+        then(take_share_at(m_store.options().dir, id, json));
+        return;
     }
-    share_link in;
-    if (!parse_share(json, in) || in.id != id)
-        return st::invalid_bucket_name;
-    if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
-        return st::io_error;
-    if (!mark_link(in))
-        return st::io_error;
-    const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0 || ::flock(fd, LOCK_EX) < 0)
-    {
-        if (fd >= 0)
-            ::close(fd);
-        return st::io_error;
-    }
-    // Each node's count only grows, and the downloads are their sum.
-    std::string text;
-    share_link now;
-    if (read_whole_file(path, text) && parse_share(text, now))
-        for (const auto& [node, n] : now.by_node)
-            in.by_node[node] = std::max(in.by_node[node], n);
-    if (!in.by_node.empty())
-    {
-        in.downloads = 0;
-        for (const auto& [node, n] : in.by_node)
-            in.downloads += n;
-    }
-    const bool ok = replace_file(path, share_json(in), durability::data_and_dir);
-    ::flock(fd, LOCK_UN);
-    ::close(fd);
-    return ok ? st::ok : st::io_error;
+    auto result = std::make_shared<st>(st::ok);
+    m_hash.submit(m_hash.next_lane(),
+                  [result, root = m_store.options().dir, id, json = std::move(json)] { *result = take_share_at(root, id, json); },
+                  [result, then = std::move(then)] { then(*result); });
 }
 
 std::vector<std::string> storage_run::share_records()
@@ -1123,9 +1095,10 @@ std::vector<std::string> storage_run::share_records()
 
 // A link has a mark under .shares/owner/<its maker in hex>/ and, when it burns, one under .shares/burn/, so a look for
 // either reads those links and not every link.
-bool storage_run::mark_link(const share_link& s)
+// A link's marks under `root`, as storage_run::mark_link() makes them, for a thread that has no runtime to ask.
+static bool mark_link_in(const std::string& root, const share_link& s)
 {
-    const std::string dir = m_store.options().dir + "/.shares";
+    const std::string dir = root + "/.shares";
     const auto mark = [](const std::string& in, const std::string& id)
     {
         if (::mkdir(in.c_str(), 0700) < 0 && errno != EEXIST)
@@ -1138,7 +1111,57 @@ bool storage_run::mark_link(const share_link& s)
     };
     if (::mkdir((dir + "/owner").c_str(), 0700) < 0 && errno != EEXIST)
         return false;
-    return mark(owner_marks(s.owner), s.id) && (!s.burn || mark(dir + "/burn", s.id));
+    return mark(dir + "/owner/o" + socketley::hex_encode(s.owner), s.id) && (!s.burn || mark(dir + "/burn", s.id));
+}
+
+// A link another node made, counted or revoked, taken under `root`; on a helper thread, as it is synced.
+static st take_share_at(const std::string& root, const std::string& id, const std::string& json)
+{
+    if (!valid_id(id))
+        return st::invalid_bucket_name;
+    const std::string dir  = root + "/.shares";
+    const std::string path = dir + "/" + id + ".json";
+    if (json.empty())
+    {
+        ::unlink(path.c_str());
+        ::unlink((path + ".lock").c_str());
+        return st::ok;
+    }
+    share_link in;
+    if (!parse_share(json, in) || in.id != id)
+        return st::invalid_bucket_name;
+    if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
+        return st::io_error;
+    if (!mark_link_in(root, in))
+        return st::io_error;
+    const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || ::flock(fd, LOCK_EX) < 0)
+    {
+        if (fd >= 0)
+            ::close(fd);
+        return st::io_error;
+    }
+    // Each node's count only grows, and the downloads are their sum.
+    std::string text;
+    share_link now;
+    if (read_whole_file(path, text) && parse_share(text, now))
+        for (const auto& [node, n] : now.by_node)
+            in.by_node[node] = std::max(in.by_node[node], n);
+    if (!in.by_node.empty())
+    {
+        in.downloads = 0;
+        for (const auto& [node, n] : in.by_node)
+            in.downloads += n;
+    }
+    const bool ok = replace_file(path, share_json(in), durability::data_and_dir);
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return ok ? st::ok : st::io_error;
+}
+
+bool storage_run::mark_link(const share_link& s)
+{
+    return mark_link_in(m_store.options().dir, s);
 }
 
 std::string storage_run::owner_marks(std::string_view owner) const

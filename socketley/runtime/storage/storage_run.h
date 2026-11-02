@@ -1254,7 +1254,7 @@ public:
     // given; one another node told taken, its downloads the larger count; and every link as records, in
     // storage_share.cpp.
     void share_sent(const std::string& id, std::string json, std::function<void()> then);
-    st share_take(const std::string& id, const std::string& json);
+    void share_take(const std::string& id, std::string json, std::function<void(st)> then);
     // Links that burn what they name, ended at their expiry or after their last download: looked over by the sweep.
     void share_burn_tick();
     bool mark_link(const share_link& s);

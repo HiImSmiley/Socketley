@@ -228,7 +228,7 @@ void storage_run::op_cluster(const std::shared_ptr<conn>& c)
             answer(iam_take(std::atoll(rec.owner.c_str()), rec.value));
             return;
         case 'h':
-            answer(share_take(rec.owner, rec.value));
+            share_take(rec.owner, std::move(rec.value), answer);
             return;
         case 'q':
             // Another node lost its copy to a disk, and is sent this one again.
