@@ -286,6 +286,9 @@ public:
     bool persist(std::string_view key);
     void check_expiry(std::string_view key);
     std::vector<std::string> sweep_expired();  // removes expired keys, returns their names
+    // The same from where the last call stopped until a millisecond or 10,000 keys are spent; `more` says the table's
+    // end was not reached, and the next call goes on from there.
+    std::vector<std::string> sweep_some_expired(bool& more);
     bool has_expiry_keys() const { return !m_expiry.empty(); }
 
     // --- Millisecond-precision TTL ---
@@ -944,6 +947,10 @@ private:
     zset_map m_zsets;
     stream_map m_streams;
     expiry_map m_expiry;
+    // Where the sweep goes on, and the table layout it is a position in: a rebuild moves entries, and the sweep starts
+    // over then.
+    size_t   m_sweep_at{0};
+    uint32_t m_sweep_epoch{0};
 
     // Eviction / Memory
     size_t m_max_memory = 0;

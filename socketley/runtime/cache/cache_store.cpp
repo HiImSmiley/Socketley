@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
+#include <iterator>
 #include "../../shared/util/glob_match.h"
 #include "../../shared/util/wall_clock.h"
 #include <fcntl.h>
@@ -1232,16 +1233,47 @@ void cache_store::check_expiry(std::string_view key)
 
 std::vector<std::string> cache_store::sweep_expired()
 {
+    m_sweep_at = 0;
+    std::vector<std::string> all;
+    for (bool more = true; more;)
+    {
+        auto some = sweep_some_expired(more);
+        all.insert(all.end(), std::make_move_iterator(some.begin()), std::make_move_iterator(some.end()));
+    }
+    return all;
+}
+
+std::vector<std::string> cache_store::sweep_some_expired(bool& more)
+{
+    // At most a millisecond of the loop, or this many keys, a sweep: one over every key with a deadline held the loop
+    // 26 ms at a million of them and 86 at five million, twice a second.  A read finds a key expired either way.
+    constexpr auto budget = std::chrono::milliseconds(1);
+    constexpr size_t keys_max = 10000;
     std::vector<std::string> expired;
+    more = false;
     if (__builtin_expect(m_expiry.empty(), 1))
         return expired;
 
-    auto now = std::chrono::steady_clock::now();
-    for (const auto& [key, tp] : m_expiry)
+    const auto now = std::chrono::steady_clock::now();
+    const size_t cap = m_expiry.bucket_count();
+    if (m_sweep_epoch != m_expiry.scan_epoch() || m_sweep_at >= cap)
     {
-        if (now >= tp)
-            expired.emplace_back(key);
+        m_sweep_epoch = m_expiry.scan_epoch();
+        m_sweep_at = 0;
     }
+    size_t b = m_sweep_at;
+    while (b < cap)
+    {
+        for (auto it = m_expiry.begin(b); it != m_expiry.end(b); ++it)
+            if (now >= it->second)
+                expired.emplace_back(it->first);
+        ++b;
+        if ((b & 4095) == 0 &&
+            (expired.size() >= keys_max || std::chrono::steady_clock::now() - now >= budget))
+            break;
+    }
+    m_sweep_at = b;
+    more = b < cap;
     for (const auto& key : expired)
         del(key);
     return expired;

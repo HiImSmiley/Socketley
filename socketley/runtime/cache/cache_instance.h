@@ -1408,6 +1408,8 @@ private:
 
     // Periodic TTL sweep timer
     std::unique_ptr<timer_op> m_ttl_timer;
+    // The interval between sweeps once one has reached the table's end.
+    long m_ttl_sweep_ms{500};
 
     // Cached config values (read once in setup, avoid virtual calls on hot path)
     uint32_t m_idle_timeout_cached{0};

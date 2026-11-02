@@ -836,6 +836,7 @@ bool cache_instance::setup(event_loop& loop)
     // the interval trades memory against CPU, never correctness, since every
     // read path checks expiry itself.
     const long sweep_ms = socketley::settings::number<long>("SOCKETLEY_CACHE_TTL_SWEEP_MS").value_or(500);
+    m_ttl_sweep_ms = sweep_ms;
     // Fresh timers for this run, because the sweep that was running at the
     // stop cannot be cancelled and m_ttl_timer_armed cannot tell the
     // difference.
@@ -1228,7 +1229,8 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         m_ttl_timer_armed = false;
         if (!m_has_ttl_keys)
             return;    // nothing to expire: stay off until mark_ttl_keys()
-        auto expired_keys = m_store.sweep_expired();
+        bool more = false;
+        auto expired_keys = m_store.sweep_some_expired(more);
         m_has_ttl_keys = m_store.has_expiry_keys();
         m_stat_keys_expired += expired_keys.size();
 #ifndef SOCKETLEY_NO_LUA
@@ -1244,9 +1246,14 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         }
 #endif
         // Only keep sweeping while keys with an expiry remain, since
-        // sweep_expired() may have removed the last one.
+        // sweep_expired() may have removed the last one -- soon while a sweep is under way, so a cycle over millions
+        // of keys takes a second or two, a millisecond at a time.
         if (m_has_ttl_keys)
+        {
+            const long ms = more ? 50 : m_ttl_sweep_ms;
+            m_ttl_timer->ts = { ms / 1000, (ms % 1000) * 1'000'000 };
             arm_ttl_timer();
+        }
         return;
     }
 
