@@ -5,6 +5,7 @@
 #include "dns_zone.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <functional>
 #include <sstream>
 #include <memory>
+#include <thread>
 #include <unordered_map>
 
 #include <arpa/inet.h>
@@ -22,7 +24,9 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -31,6 +35,7 @@
 #include "../../shared/net/endpoint.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/eventfd_wake.h"
 #include "../../shared/net/ip_block.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/logging.h"
@@ -352,6 +357,8 @@ private:
     void arm_tick();
     void tick();
     void check_zones();
+    void reload_done();
+    void arm_wake();
     void queue_notify(const zone& z);
     void send_notify(notify_job& j);
     // Whether the secondary has answered `j`, read without waiting.
@@ -413,6 +420,32 @@ private:
     // With --dnssec, what signs each zone as it is loaded, and the key of each by its apex.
     zone_signer m_signer;
     std::unordered_map<std::string, zone_key> m_keys;
+
+    // A reload read, checked and signed off the loop, which answers from the zones before it meanwhile.
+    struct reload_job
+    {
+        std::vector<std::string> paths;
+        extra_records extra;
+        std::shared_ptr<const zone_set> prior;
+        std::shared_ptr<zone_set> next;
+        // The zones of files that are no zone now, kept as they were, and how each file stood when it was read.
+        std::vector<const zone*> kept;
+        std::vector<std::pair<std::string, socketley::file_stamp>> broken;
+        bool whole{false};
+        std::string why;
+        std::atomic<bool> done{false};
+        std::thread th;
+    };
+    static void read_zones(reload_job& j, const zone_signer* sign);
+    std::unique_ptr<reload_job> m_reload;
+    // A file that is no zone, as it stood when read, so it is not read again until it changes.
+    std::unordered_map<std::string, socketley::file_stamp> m_broken;
+    // The zone sets a reload replaced, let go of off the loop.
+    std::thread m_retire;
+    int m_wake_fd{-1};
+    io_request m_wake_req{};
+    uint64_t m_wake_buf{0};
+    bool m_wake_armed{false};
 };
 
 bool dns_run::start(std::string& why)
@@ -502,6 +535,9 @@ bool dns_run::start(std::string& why)
     for (auto& l : m_tcp)
         arm_accept(*l);
     arm_tick();
+    // Without one a reload is read on the loop, as it is at start.
+    m_wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    arm_wake();
 
     for (const auto& z : m_zones->zones)
     {
@@ -630,6 +666,16 @@ void dns_run::stop()
     for (auto& c : all)
         close_conn(c);
     if (m_tick_armed && !m_loop.submit_timeout_remove(&m_tick)) {}
+    if (m_reload && m_reload->th.joinable())
+        m_reload->th.join();
+    m_reload.reset();
+    if (m_retire.joinable())
+        m_retire.join();
+    if (m_wake_fd >= 0)
+    {
+        m_loop.close_fd(m_wake_fd);
+        m_wake_fd = -1;
+    }
     for (auto& j : m_notify)
         drop_notify(j);
     m_notify.clear();
@@ -1249,8 +1295,53 @@ extra_records dns_run::feed_extra()
     return x;
 }
 
+// Every zone of a reload read and checked; where one is not a zone each file is taken on its own, a sound one as it now
+// is and a broken one as it was served.
+void dns_run::read_zones(reload_job& j, const zone_signer* sign)
+{
+    j.next = std::make_shared<zone_set>();
+    j.whole = load_all(j.paths, *j.next, j.why, &j.extra, sign);
+    if (j.whole)
+        return;
+    j.next->zones.clear();
+    for (const auto& p : j.paths)
+    {
+        auto z = std::make_shared<zone>();
+        std::string ignored;
+        bool sound = load_zone(p, {}, *z, ignored);
+        if (sound)
+        {
+            add_extra(*z, j.extra);
+            if (sign && *sign && !(*sign)(*z, ignored))
+                sound = false;
+            for (const auto& other : j.next->zones)
+                if (other->origin == z->origin)
+                    sound = false;
+            for (const auto& o : j.prior->zones)
+                if (o->path != p && o->origin == z->origin)
+                    sound = false;
+        }
+        if (sound)
+        {
+            j.next->zones.push_back(std::move(z));
+            continue;
+        }
+        for (const auto& o : j.prior->zones)
+            if (o->path == p)
+            {
+                j.kept.push_back(o.get());
+                j.next->zones.push_back(o);
+                if (const socketley::file_stamp now = socketley::file_stamp::of(p); now.exists())
+                    j.broken.emplace_back(p, now);
+            }
+    }
+}
+
 void dns_run::check_zones()
 {
+    // A reload under way is looked at again once it has been served.
+    if (m_reload)
+        return;
     bool changed = dns_feed::stamp_ns() != m_feed_stamp;
     // This machine's addresses, looked at once a minute when they are what is published.
     if (m_auto_addresses && steady_sec() - m_addresses_at >= 60)
@@ -1275,59 +1366,68 @@ void dns_run::check_zones()
     {
         // A file gone for a moment is no change; it is read again once it is back.
         const socketley::file_stamp now = socketley::file_stamp::of(z->path);
-        if (now.exists() && now != z->stamp)
+        const auto seen = m_broken.find(z->path);
+        if (now.exists() && now != z->stamp && (seen == m_broken.end() || seen->second != now))
             changed = true;
     }
     if (!changed)
         return;
-    auto next = std::make_shared<zone_set>();
-    std::string why;
-    const extra_records extra = feed_extra();
-    std::vector<const zone*> kept;
-    if (!load_all(m_paths, *next, why, &extra, &m_signer))
+    auto job = std::make_unique<reload_job>();
+    job->paths = m_paths;
+    job->extra = feed_extra();
+    job->prior = m_zones;
+    reload_job* raw = job.get();
+    const zone_signer* sign = &m_signer;
+    m_reload = std::move(job);
+    if (m_wake_fd < 0)
+    {
+        read_zones(*raw, sign);
+        raw->done = true;
+        reload_done();
+        return;
+    }
+    const int wake = m_wake_fd;
+    raw->th = std::thread([raw, sign, wake] {
+        read_zones(*raw, sign);
+        raw->done.store(true, std::memory_order_release);
+        socketley::eventfd_bump(wake);
+    });
+}
+
+void dns_run::arm_wake()
+{
+    if (m_wake_armed || m_wake_fd < 0 || m_stopped)
+        return;
+    // Polled, not read: the ring's read is a socket's recv, which an eventfd answers at once with ENOTSOCK.
+    m_wake_req = io_request{};
+    m_wake_req.owner = this;
+    m_wake_req.fd = m_wake_fd;
+    m_wake_req.type = op_poll;
+    m_wake_armed = m_loop.submit_poll_add(m_wake_fd, POLLIN, &m_wake_req);
+}
+
+void dns_run::reload_done()
+{
+    if (!m_reload || !m_reload->done.load(std::memory_order_acquire))
+        return;
+    if (m_reload->th.joinable())
+        m_reload->th.join();
+    const std::unique_ptr<reload_job> j = std::move(m_reload);
+    if (!j->whole)
     {
         ++m_c.reload_failures;
-        LOG_ERROR(("dns: zone not reloaded, still serving the one before: " + why).c_str());
-        // Each file on its own: a sound one is taken, and a broken one keeps what it served, remembered as seen so it
-        // is not read again every second.
-        next->zones.clear();
-        for (const auto& p : m_paths)
-        {
-            auto z = std::make_shared<zone>();
-            std::string ignored;
-            bool sound = load_zone(p, {}, *z, ignored);
-            if (sound)
-            {
-                add_extra(*z, extra);
-                if (m_signer && !m_signer(*z, ignored))
-                    sound = false;
-                for (const auto& other : next->zones)
-                    if (other->origin == z->origin)
-                        sound = false;
-                for (const auto& o : m_zones->zones)
-                    if (o->path != p && o->origin == z->origin)
-                        sound = false;
-            }
-            if (!sound)
-            {
-                const zone* old = nullptr;
-                for (const auto& o : m_zones->zones)
-                    if (o->path == p)
-                        old = o.get();
-                if (!old)
-                    continue;
-                z = std::make_shared<zone>(*old);
-                if (const socketley::file_stamp now = socketley::file_stamp::of(p); now.exists())
-                    z->stamp = now;
-                kept.push_back(z.get());
-            }
-            next->zones.push_back(std::move(z));
-        }
+        LOG_ERROR(("dns: zone not reloaded, still serving the one before: " + j->why).c_str());
     }
+    m_broken.clear();
+    for (auto& [p, st] : j->broken)
+        m_broken[p] = st;
+    const std::vector<const zone*>& kept = j->kept;
+    const std::shared_ptr<zone_set> next = j->next;
     if (kept.size() < next->zones.size())
         ++m_c.reloads;
-    const std::shared_ptr<const zone_set> prior = std::move(m_zones);
+    std::shared_ptr<const zone_set> prior = std::move(m_zones);
     m_zones = next;
+    j->prior.reset();
     for (const auto& z : next->zones)
     {
         if (std::find(kept.begin(), kept.end(), z.get()) != kept.end())
@@ -1342,6 +1442,10 @@ void dns_run::check_zones()
         if (newer)
             queue_notify(*z);
     }
+    // A large zone takes milliseconds to free, which the queries behind it would wait.
+    if (m_retire.joinable())
+        m_retire.join();
+    m_retire = std::thread([old = std::move(prior)]() mutable { old.reset(); });
 }
 
 void dns_run::queue_notify(const zone& z)
@@ -1426,6 +1530,16 @@ void dns_run::on_cqe(struct io_uring_cqe* cqe)
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
     if (!req)
         return;
+    if (req == &m_wake_req)
+    {
+        m_wake_armed = false;
+        if (m_stopped)
+            return;
+        if (::read(m_wake_fd, &m_wake_buf, sizeof m_wake_buf) < 0) {}
+        reload_done();
+        arm_wake();
+        return;
+    }
     if (req == &m_tick)
     {
         if (cqe->res == -ECANCELED)
