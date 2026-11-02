@@ -125,7 +125,9 @@ ready_tcp 127.0.0.1 "$P" >/dev/null 2>&1 || true
 
 # The worker and not the daemon: the pipes are the serving process's.
 WPID=$("$BIN" stats sd_srv 2>/dev/null | awk -F: '/^pid:/ {gsub(/[^0-9]/,"",$2); print $2}' | head -1)
-fds() { ls -1 "/proc/$WPID/fd" 2>/dev/null | wc -l; }
+# Pipes and sockets: the files themselves are kept open between requests, one descriptor each, and counted apart.
+fds() { find "/proc/$WPID/fd" -mindepth 1 -maxdepth 1 ! -lname "$WWW/*" 2>/dev/null | wc -l; }
+kept() { find "/proc/$WPID/fd" -mindepth 1 -maxdepth 1 -lname "$WWW/*" 2>/dev/null | wc -l; }
 
 if [ -n "${WPID:-}" ] && [ -d "/proc/$WPID/fd" ]; then ok; else
     bad "the worker's descriptors can be counted" \
@@ -254,7 +256,11 @@ check "the server still serves after all of it" "ok" "$(run_downloads 4 1)"
 check "and the runtime is up"                   "Up" \
       "$("$BIN" ps -a 2>/dev/null | awk '$2=="sd_srv" { print $7 }')"
 
-echo "  measured: worker fds base=$BASE concurrent=$AFTER sequential=$SEQ aborted=$ABORTED"
+KEPT=$(kept)
+if [ "$KEPT" -le 8 ]; then ok; else
+    bad "the files are kept open one descriptor each at most" "$KEPT descriptors on 8 files"; fi
+
+echo "  measured: worker fds base=$BASE concurrent=$AFTER sequential=$SEQ aborted=$ABORTED, files kept $KEPT"
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 [ "$FAIL" -eq 0 ]
