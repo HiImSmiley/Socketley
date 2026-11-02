@@ -75,9 +75,10 @@ subprocess.run(["tc", "qdisc", "add", "dev", "lo", "parent", "1:3", "handle", "3
 for m in ("sport", "dport"):
     subprocess.run(["tc", "filter", "add", "dev", "lo", "parent", "1:", "protocol", "ip", "u32", "match", "ip", m, pt,
                     "0xffff", "flowid", "1:3"], check=True)
-# Four reads, the best of which is the path's: one that starts on a cold connection is slower, and says nothing.
+# Six reads, the best of which is the path's: one that starts on a cold connection is slower, and says nothing, and a
+# read settles on one of a few plateaus (24, 39, 49, 73 MB/s) by the state its connection is in.
 rates, whole = [], True
-for _ in range(4):
+for _ in range(6):
     t0 = time.time()
     try:
         got = s.get_object(Bucket="hot", Key="big")["Body"].read()
@@ -90,12 +91,12 @@ print("%s %s %.1f %s" % (moved, whole, max(rates), " ".join("%.1f" % r for r in 
 PY
 )
 read -r moved whole best rates <<<"$out"
-echo "  48 MiB read back from a tier 50 ms away, four times: ${rates:-$out} MB/s"
+echo "  48 MiB read back from a tier 50 ms away, six times: ${rates:-$out} MB/s"
 [ "$moved" = True ] && ok || bad "the version moves to the tier" "$out"
 [ "$whole" = True ] && ok || bad "and is read back whole" "$out"
 if [ "$sanitized" = 1 ]; then echo "  SKIP [rate]: a rate measures the sanitizer, not the windows"
 elif awk -v b="${best:-0}" 'BEGIN{exit !(b >= 28)}'; then ok
-else bad "at more than one 512 KiB window a round trip" "the best of four ${best:-none} MB/s"; fi
+else bad "at more than one 512 KiB window a round trip" "the best of six ${best:-none} MB/s"; fi
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
