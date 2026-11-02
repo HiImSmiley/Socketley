@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 #include "../../shared/crypto/ssh_cert.h"
-#include "../../shared/loop/blocking_write.h"
+#include "../../shared/persist/replaced_file.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/text_list.h"
@@ -28,12 +28,7 @@ std::string idp_dir()
 // The whole of `text` at `path`, by a rename, so a reader never finds half of it.
 bool replace(const std::string& path, std::string_view text, mode_t mode)
 {
-    const std::string tmp = path + ".new";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
-    bool ok = fd >= 0 && ::fchmod(fd, mode) == 0 && write_all(fd, text.data(), text.size()) && ::fsync(fd) == 0;
-    if (fd >= 0)
-        ::close(fd);
-    return ok && ::rename(tmp.c_str(), path.c_str()) == 0;
+    return socketley::replace_file(path, text, socketley::durability::data, nullptr, mode);
 }
 
 bool number(std::string_view s, uint64_t& out)

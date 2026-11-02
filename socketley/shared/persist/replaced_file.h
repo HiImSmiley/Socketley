@@ -33,9 +33,10 @@ enum class durability : uint8_t
 
 // `data` as the whole of `path`, written beside it under a name no other writer uses and renamed over it, so a reader
 // in any process sees the old content or the new; false with `why` at the step that failed. With data_and_dir a
-// failed directory sync is false after the new content is already in place.
+// failed directory sync is false after the new content is already in place. An owner other than -1 is given to the
+// new file before it takes the name, where this process may give it.
 inline bool replace_file(const std::string& path, std::string_view data, durability sync, std::string* why = nullptr,
-                         mode_t mode = 0600)
+                         mode_t mode = 0600, uid_t owner = static_cast<uid_t>(-1), gid_t group = static_cast<gid_t>(-1))
 {
     static std::atomic<uint64_t> next{0};
     // Ending in .tmp, which is how a start that finds one a crash left recognises it.
@@ -50,6 +51,7 @@ inline bool replace_file(const std::string& path, std::string_view data, durabil
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
     if (fd < 0)
         return failed("open");
+    if ((owner != static_cast<uid_t>(-1) || group != static_cast<gid_t>(-1)) && ::fchown(fd, owner, group) != 0) {}
     if (::fchmod(fd, mode) != 0 || !write_all(fd, data.data(), data.size()) ||
         (sync != durability::none && ::fsync(fd) != 0))
     {

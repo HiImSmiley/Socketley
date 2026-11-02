@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 #include "../../shared/crypto/jws.h"
-#include "../../shared/loop/blocking_write.h"
+#include "../../shared/persist/replaced_file.h"
 #include "../../shared/net/unix_listener.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/persist/read_file.h"
@@ -138,12 +138,7 @@ bool save_shares(std::string_view edge, const std::vector<share>& shares, std::s
     for (const share& sh : shares)
         text += render_service(sh.svc) + " " + sh.who + " " + std::to_string(sh.until) + "\n";
     // Replaced whole, so the daemon reading it between two shares never reads half of one.
-    const std::string path = shares_path(edge), tmp = path + ".new";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    bool ok = fd >= 0 && write_all(fd, text.data(), text.size());
-    if (fd >= 0)
-        ::close(fd);
-    ok = ok && ::rename(tmp.c_str(), path.c_str()) == 0;
+    const bool ok = socketley::replace_file(shares_path(edge), text, socketley::durability::data, nullptr, 0600);
     if (!ok)
         why = "the shares of " + std::string(edge) + " could not be written";
     return ok;
@@ -362,12 +357,7 @@ bool update_agents(std::string_view edge, const std::function<bool(std::vector<a
     if (ok)
     {
         const std::string text = render_agents(agents);
-        const std::string path = agents_path(edge), tmp = path + ".new";
-        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        ok = fd >= 0 && write_all(fd, text.data(), text.size()) && ::fsync(fd) == 0;
-        if (fd >= 0)
-            ::close(fd);
-        ok = ok && ::rename(tmp.c_str(), path.c_str()) == 0;
+        ok = socketley::replace_file(agents_path(edge), text, socketley::durability::data, nullptr, 0600);
         if (!ok)
             why = "the agents of " + std::string(edge) + " could not be written";
     }

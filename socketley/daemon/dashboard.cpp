@@ -23,6 +23,7 @@
 #include "../runtime/storage/storage_ui_kit.h"
 #include "../shared/json/json_doc.h"
 #include "../shared/loop/blocking_write.h"
+#include "../shared/persist/replaced_file.h"
 #include "../shared/util/logging.h"
 #include "../shared/util/log_ring.h"
 #include "../shared/crypto/cert_keeper.h"
@@ -738,26 +739,15 @@ void server::zone(int fd, const request& r)
         send(fd, 400, "text/plain; charset=utf-8", why.empty() ? std::string("The zone is too large.\n") : why + "\n");
         return;
     }
-    const std::string tmp = path + ".dashboard." + std::to_string(::getpid());
+    // The zone keeps the mode and owner it had, which the dns runtime's group reads it by, before it takes the name:
+    // a moment unreadable would be a reload that fails and is not tried again until the file changes.
+    struct stat old{};
+    const bool had = ::stat(path.c_str(), &old) == 0;
+    if (!socketley::replace_file(path, text, socketley::durability::data, nullptr, had ? old.st_mode & 07777 : 0644,
+                                 had ? old.st_uid : static_cast<uid_t>(-1), had ? old.st_gid : static_cast<gid_t>(-1)))
     {
-        struct stat old{};
-        const bool had = ::stat(path.c_str(), &old) == 0;
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        f << text;
-        f.close();
-        // The zone keeps the mode and owner it had, which the dns runtime's group reads it by.
-        if (had)
-        {
-            if (::chmod(tmp.c_str(), old.st_mode & 07777) != 0) {}
-            if (::chown(tmp.c_str(), old.st_uid, old.st_gid) != 0) {}
-        }
-        std::error_code ec;
-        if (!f || (std::filesystem::rename(tmp, path, ec), ec))
-        {
-            ::unlink(tmp.c_str());
-            send(fd, 500, "text/plain; charset=utf-8", "The zone could not be written.\n");
-            return;
-        }
+        send(fd, 500, "text/plain; charset=utf-8", "The zone could not be written.\n");
+        return;
     }
     LOG_INFO(("dashboard: " + session_of(r) + " wrote the zone " + path + ", serial " + std::to_string(z.serial)).c_str());
     send(fd, 204, {}, {});

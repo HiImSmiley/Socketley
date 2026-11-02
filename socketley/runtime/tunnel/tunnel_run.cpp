@@ -20,7 +20,7 @@
 #include "../proxy/proxy_auth.h"
 #include "../../shared/http/cookie.h"
 #include "../../shared/http/request_head.h"
-#include "../../shared/loop/blocking_write.h"
+#include "../../shared/persist/replaced_file.h"
 #include "../../shared/net/endpoint.h"
 #include "../../shared/net/peer_address.h"
 #include "../../shared/persist/read_file.h"
@@ -1950,12 +1950,7 @@ void tunnel_run::from_edge(const std::shared_ptr<http::server_conn>& c, std::str
             const std::string path = agent_key_path(m_owner.get_name());
             std::error_code ec;
             std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-            const int fd = ::open((path + ".new").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-            const std::string text = std::string(key) + "\n";
-            const bool ok = fd >= 0 && write_all(fd, text.data(), text.size()) && ::fsync(fd) == 0;
-            if (fd >= 0)
-                ::close(fd);
-            if (!ok || ::rename((path + ".new").c_str(), path.c_str()) != 0)
+            if (!socketley::replace_file(path, std::string(key) + "\n", socketley::durability::data, nullptr, 0600))
                 LOG_ERROR(("tunnel " + std::string(m_owner.get_name()) + ": the key could not be kept in " + path +
                            "; the next connection cannot join again").c_str());
             m_credential = std::string(key);

@@ -315,10 +315,13 @@ expect "a zone is listed with its origin" "$(edge | j "[z['origin'] for z in d['
 zone_text=$(curl -s -b "$T/jar" -G --data-urlencode "runtime=ns" --data-urlencode "path=$zpath" "$U/api/zone")
 has "and read whole" "$zone_text" "SOA"
 put() { curl -s -o "$T/put.out" -w '%{http_code}' -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -X PUT --data-binary "$1" "$U/api/zone"; }
+# The mode the zone had, which the dns runtime's group may read it by, is the one it keeps.
+chmod 640 "$zpath"
 body=$(python3 -c 'import json,sys; t=sys.argv[3].replace("hostmaster 2026","hostmaster 2027") + "\nhello TXT \"from the dashboard\"\n"; print(json.dumps({"runtime":sys.argv[1],"path":sys.argv[2],"text":t}))' ns "$zpath" "$zone_text")
 expect "an edit is written" "$(put "$body")" 204
 for _ in $(seq 1 30); do got=$(dig @127.0.0.1 -p $((P+4)) +short hello.example.com TXT 2>/dev/null); [ -n "$got" ] && break; sleep 0.2; done
 expect "and served" "$got" '"from the dashboard"'
+expect "and keeps the mode it had" "$(stat -c %a "$zpath")" 640
 bad=$(python3 -c 'import json,sys; print(json.dumps({"runtime":"ns","path":sys.argv[1],"text":sys.argv[2]+"\nbroken A 999.1.1.1\n"}))' "$zpath" "$zone_text")
 expect "a zone that does not parse is refused" "$(put "$bad")" 400
 has "saying where" "$(cat "$T/put.out")" "999.1.1.1"
