@@ -469,6 +469,17 @@ public:
 
     // Sessions, subscriptions, queues, unanswered messages and retained messages as bytes.
     std::string snapshot() const;
+    // What a snapshot holds, taken on the loop: the retained messages by reference, since a stored one never changes,
+    // and each session as bytes, so the bytes of the whole can be written on any thread.
+    struct snapshot_parts
+    {
+        std::vector<message_ptr> retained;
+        std::vector<std::string> sessions;
+        size_t size{0};
+    };
+    snapshot_parts snapshot_now() const;
+    // Those parts as snapshot() gives them, appended to `out`.
+    static void write_snapshot(const snapshot_parts& parts, std::string& out);
     // What a snapshot held, taken in at start; false with `why` when the bytes are not one.
     bool restore(std::string_view bytes, std::string& why);
     // Whether anything a snapshot holds changed since the last call.

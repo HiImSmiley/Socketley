@@ -1148,9 +1148,8 @@ void mqtt_run::persist(bool now_and_wait)
         return;
     }
     m_routes_dirty = false;
-    socketley::bytes::writer w;
-    w.u32(snapshot_magic);
-    w.bytes(m_broker->snapshot());
+    // Taken now, written to bytes where the file is written: the retained messages are shared, not copied, here.
+    auto parts = std::make_shared<broker::snapshot_parts>(m_broker->snapshot_now());
     // What is in flight is kept in its place, so a restart sends it again rather than losing it.
     std::vector<std::vector<const route_request*>> flying;
     if (m_routes && !m_route_asks.empty())
@@ -1167,12 +1166,21 @@ void mqtt_run::persist(bool now_and_wait)
             if (m_route_posting[i])
                 flying[i].push_back(&*m_route_posting[i]);
     }
-    w.bytes(m_routes ? m_routes->save(flying) : std::string());
-    std::string data = w.take();
+    auto routes = std::make_shared<const std::string>(m_routes ? m_routes->save(flying) : std::string());
+    // The magic, the broker's snapshot as one length-prefixed piece written in place, and the routes'.
+    const auto encode = [parts, routes] {
+        std::string data(8, '\0');
+        socketley::bytes::store32(data.data(), snapshot_magic);
+        broker::write_snapshot(*parts, data);
+        socketley::bytes::store32(data.data() + 4, static_cast<uint32_t>(data.size() - 8));
+        socketley::bytes::append32(data, static_cast<uint32_t>(routes->size()));
+        data.append(*routes);
+        return data;
+    };
     if (now_and_wait || !m_pool.enabled())
     {
         std::string why;
-        if (!socketley::replace_file(path, data, socketley::durability::data, &why))
+        if (!socketley::replace_file(path, encode(), socketley::durability::data, &why))
             LOG_ERROR(("mqtt " + std::string(m_owner.get_name()) + ": the snapshot could not be written: " + why)
                           .c_str());
         else
@@ -1183,8 +1191,8 @@ void mqtt_run::persist(bool now_and_wait)
     auto result = std::make_shared<std::string>();
     auto ok = std::make_shared<bool>(false);
     m_pool.submit(0,
-                  [path, data = std::move(data), result, ok] {
-                      *ok = socketley::replace_file(path, data, socketley::durability::data, result.get());
+                  [path, encode, result, ok] {
+                      *ok = socketley::replace_file(path, encode(), socketley::durability::data, result.get());
                   },
                   [this, alive = m_alive, result, ok] {
                       if (!*alive)

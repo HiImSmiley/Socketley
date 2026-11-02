@@ -305,21 +305,43 @@ void broker::install_session(std::unique_ptr<session> s, const std::vector<std::
 
 std::string broker::snapshot() const
 {
-    bytes::writer w;
+    std::string out;
+    write_snapshot(snapshot_now(), out);
+    return out;
+}
+
+broker::snapshot_parts broker::snapshot_now() const
+{
+    snapshot_parts p;
+    // The broker's own '$' figures are made again after a start, not read back stale.
+    m_retained.each([&](const std::shared_ptr<const message>& m) {
+        if (m->topic.starts_with('$'))
+            return;
+        p.size += m->topic.size() + m->payload.size() + 64;
+        p.retained.push_back(m);
+    });
+    p.sessions.reserve(m_sessions.size());
+    for (const auto& [id, s] : m_sessions)
+    {
+        p.sessions.push_back(encode_session(*s));
+        p.size += p.sessions.back().size() + 4;
+    }
+    return p;
+}
+
+void broker::write_snapshot(const snapshot_parts& parts, std::string& out)
+{
+    bytes::writer w(out);
+    w.reserve(out.size() + parts.size + 16);
     w.u32(snapshot_magic);
     w.u8(snapshot_version);
-    // The broker's own '$' figures are made again after a start, not read back stale.
-    uint32_t n = 0;
-    m_retained.each([&](const std::shared_ptr<const message>& m) { n += !m->topic.starts_with('$'); });
-    w.u32(n);
-    m_retained.each([&](const std::shared_ptr<const message>& m) {
-        if (!m->topic.starts_with('$'))
-            put_message(w, *m);
-    });
-    w.u32(static_cast<uint32_t>(m_sessions.size()));
-    for (const auto& [id, s] : m_sessions)
-        w.bytes(encode_session(*s));
-    return w.take();
+    w.u32(static_cast<uint32_t>(parts.retained.size()));
+    for (const auto& m : parts.retained)
+        put_message(w, *m);
+    w.u32(static_cast<uint32_t>(parts.sessions.size()));
+    for (const auto& one : parts.sessions)
+        w.bytes(one);
+    out = w.take();
 }
 
 bool broker::restore(std::string_view in, std::string& why)
