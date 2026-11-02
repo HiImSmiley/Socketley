@@ -226,7 +226,9 @@ void notifier::forget_idle(std::chrono::steady_clock::duration idle)
     };
     std::erase_if(m_lanes, [&](const std::unique_ptr<lane>& l)
     {
-        return l->peer && !l->busy && l->q.empty() && now - l->used > idle && !l->peer->busy() && !staged(l.get());
+        if (!l->peer || l->busy || l->flying || !l->q.empty() || now - l->used <= idle || l->peer->busy() || staged(l.get()))
+            return false;
+        return std::none_of(l->more.begin(), l->more.end(), [](const auto& p) { return p->busy(); });
     });
 }
 
@@ -270,7 +272,11 @@ uint64_t notifier::resolves() const
 {
     uint64_t n = 0;
     for (const auto& l : m_lanes)
+    {
         n += l->peer ? l->peer->resolves() : 0;
+        for (const auto& p : l->more)
+            n += p->resolves();
+    }
     return n;
 }
 
@@ -278,7 +284,11 @@ uint64_t notifier::connects() const
 {
     uint64_t n = 0;
     for (const auto& l : m_lanes)
+    {
         n += l->peer ? l->peer->connects() : 0;
+        for (const auto& p : l->more)
+            n += p->connects();
+    }
     return n;
 }
 
@@ -286,7 +296,11 @@ uint64_t notifier::reuses() const
 {
     uint64_t n = 0;
     for (const auto& l : m_lanes)
+    {
         n += l->peer ? l->peer->reuses() : 0;
+        for (const auto& p : l->more)
+            n += p->reuses();
+    }
     return n;
 }
 
@@ -312,7 +326,7 @@ bool notifier::open(const std::string& dir, std::string_view sub, uint32_t shard
             ++dropped;
             return false;
         }
-        l->q.push_back({id, std::move(json), std::move(sub), retain != 0});
+        enqueue(*l, {id, std::move(json), std::move(sub), retain != 0});
         ++m_queued;
         return true;
     }, err);
@@ -351,7 +365,7 @@ bool notifier::add(std::string_view target, std::string json, std::string_view s
         w.u8(retain ? 1 : 0);
     }
     const uint64_t id = m_box.add(w.take());
-    l->q.push_back({id, std::move(json), std::string(sub), retain});
+    enqueue(*l, {id, std::move(json), std::string(sub), retain});
     ++m_queued;
     start(*l);
     return true;
@@ -408,7 +422,7 @@ void notifier::settle(uint64_t ticket, bool made, std::function<void()> then)
             --m_queued;
             continue;
         }
-        l->q.push_back(std::move(ev));
+        enqueue(*l, std::move(ev));
         start(*l);
     }
     m_box.settle(ticket, made, std::move(then));
@@ -439,9 +453,11 @@ void notifier::on_timer()
         lane& l = *lp;
         if (l.peer)
             l.peer->tick(now);
+        for (auto& p : l.more)
+            p->tick(now);
         if (!l.busy && !l.q.empty() && now >= l.next_try)
             start(l);
-        waiting = waiting || l.busy || !l.q.empty();
+        waiting = waiting || l.busy || l.flying || !l.q.empty();
     }
     if (waiting)
         arm_timer();
@@ -456,29 +472,115 @@ void notifier::start(lane& l)
         arm_timer();
         return;
     }
-    const pending& ev = l.q.front();
     if (!l.peer)
     {
-        start_runtime(l, ev);
+        start_runtime(l, l.q.front());
         return;
     }
-    const http_target& t = l.peer->target();
-    http_request rq;
-    rq.head = "POST " + t.path + " HTTP/1.1\r\nHost: " + t.authority() +
-              "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(ev.json.size()) +
-              "\r\nConnection: keep-alive\r\nUser-Agent: socketley-" + m_who + "\r\nX-Socketley-Event-Id: " +
-              std::to_string(ev.id) + "\r\n\r\n";
-    // A webhook says all it has to say in its status, but its whole answer is read so the connection carries the next.
-    rq.body      = ev.json;
-    l.busy = true;
-    arm_timer();
-    auto alive = m_alive;
-    lane* lp = &l;
-    l.peer->exchange(std::move(rq), [this, alive, lp](http_answer a)
+    start_webhook(l);
+}
+
+// What an event is about, read from its JSON: the object of a bucket's record or of a link's message, else nothing.
+static std::string order_of(std::string_view json)
+{
+    namespace js = socketley::json;
+    js::jvalue doc;
+    if (!js::json_reader(json).document(doc) || doc.k != js::jvalue::kind::object)
+        return {};
+    if (const js::jvalue* recs = js::member(doc, "Records"); recs && recs->k == js::jvalue::kind::array && !recs->items.empty())
+        if (const js::jvalue* s3 = js::member(recs->items.front(), "s3"))
+        {
+            const js::jvalue* b = js::member(*s3, "bucket");
+            const js::jvalue* o = js::member(*s3, "object");
+            if (b && o)
+                return std::string(js::string_of(*b, "name")) + "/" + std::string(js::string_of(*o, "key"));
+        }
+    if (const std::string_view key = js::string_of(doc, "key"); !key.empty())
+        return std::string(js::string_of(doc, "bucket")) + "/" + std::string(key);
+    return {};
+}
+
+void notifier::enqueue(lane& l, pending ev)
+{
+    if (l.peer)
+        ev.order = order_of(ev.json);
+    l.q.push_back(std::move(ev));
+}
+
+http_peer* notifier::free_peer(lane& l)
+{
+    if (!l.peer->busy())
+        return l.peer.get();
+    for (auto& p : l.more)
+        if (!p->busy())
+            return p.get();
+    if (1 + l.more.size() >= webhook_inflight)
+        return nullptr;
+    l.more.push_back(std::make_unique<http_peer>(m_loop, m_io, m_resolver, l.target.http, m_hosts_file,
+                                                 m_who + ": the notification target " + l.name));
+    return l.more.back().get();
+}
+
+void notifier::start_webhook(lane& l)
+{
+    // The first event of each object in the queue's front goes, unless it is under way, and every later one of the
+    // same object waits for it.
+    std::vector<std::string_view> seen;
+    size_t looked = 0;
+    for (size_t i = 0; i < l.q.size() && l.flying < webhook_inflight && looked < 64; ++i, ++looked)
     {
-        if (*alive)
-            finish(*lp, a.status / 100 == 2);
-    });
+        pending& ev = l.q[i];
+        if (std::find(seen.begin(), seen.end(), std::string_view(ev.order)) != seen.end())
+            continue;
+        seen.emplace_back(ev.order);
+        if (ev.flying)
+            continue;
+        http_peer* peer = free_peer(l);
+        if (!peer)
+            break;
+        const http_target& t = peer->target();
+        http_request rq;
+        rq.head = "POST " + t.path + " HTTP/1.1\r\nHost: " + t.authority() +
+                  "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(ev.json.size()) +
+                  "\r\nConnection: keep-alive\r\nUser-Agent: socketley-" + m_who + "\r\nX-Socketley-Event-Id: " +
+                  std::to_string(ev.id) + "\r\n\r\n";
+        // A webhook says all it has to say in its status, but its whole answer is read so the connection carries the
+        // next.
+        rq.body   = ev.json;
+        ev.flying = true;
+        ++l.flying;
+        arm_timer();
+        auto alive = m_alive;
+        lane* lp = &l;
+        peer->exchange(std::move(rq), [this, alive, lp, id = ev.id](http_answer a)
+        {
+            if (*alive)
+                finish_webhook(*lp, id, a.status / 100 == 2);
+        });
+    }
+}
+
+void notifier::finish_webhook(lane& l, uint64_t id, bool ok)
+{
+    --l.flying;
+    if (m_stopped)
+        return;
+    const auto it = std::find_if(l.q.begin(), l.q.end(), [id](const pending& p) { return p.id == id; });
+    if (it == l.q.end())
+        return;
+    if (!ok)
+    {
+        it->flying = false;
+        back_off(l);
+        return;
+    }
+    ++m_c.sent;
+    m_box.done(id);
+    l.q.erase(it);
+    --m_queued;
+    l.failures = 0;
+    l.next_try = {};
+    start(l);
 }
 
 // An event as a mail: its subject the alert's first line or what the event is, its text the event's own words where

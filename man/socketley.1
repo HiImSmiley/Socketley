@@ -9695,7 +9695,10 @@ record saying it was made, which is synced before the next change of the key may
 start. A start keeps an event whose change has no such record only when the object
 files show the change (its ETag, size, time and version, or the key or version gone
 for a removal), so a crash never sends an event for a change that was not made.
-A webhook is sent one event at a time, in order: a 2xx answer
+A webhook is sent up to four events at once, each on a connection of its own,
+and the events of one object one at a time and in the order they happened, so a
+removal never overtakes the write before it; an event about no object waits for
+the one before it of the same kind. A 2xx answer
 delivers it, and anything else, a refused or failed connection, or no answer in 10
 seconds, is a failure tried again after 0.25 s, doubling to 8 s. A delivered
 event's record is followed by one saying so, written at once and synced with the
@@ -11439,10 +11442,15 @@ Slack
 .RB ( https://hooks.slack.com/ )
 and
 .BR https://ntfy.sh/ ;
-any other is 400. A webhook's requests go one at a time, at most 16 waiting. In a versioned bucket the removal is a delete marker and the
+any other is 400. A webhook's requests go up to four at once, those about one file one at a time, at most 16 waiting. In a versioned bucket the removal is a delete marker and the
 versions stay. A cluster does not make them. Links are files in
 .IR dir /.shares/,
-read by every shard.
+read by every shard, each with a mark under
+.I .shares/owner/
+by its maker and, when it burns, under
+.IR .shares/burn/ ,
+so a user's list and the look for links that burn read only those; a start reads
+every link once for one with no marks, as an older build made them.
 .TP
 .B /~media/\fIvariant\fB/\fIbucket\fB/\fIkey\fR
 Media made by ffmpeg from an object, and kept.

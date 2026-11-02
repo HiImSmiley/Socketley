@@ -71,6 +71,8 @@ public:
     // The pause after a target's first failure, doubled by each further one up to the cap.
     static constexpr int64_t backoff_first_ms = 250;
     static constexpr int64_t backoff_cap_ms   = 8000;
+    // The most events a webhook is sent at once, each on a connection of its own; two of one object never at once.
+    static constexpr uint32_t webhook_inflight = 4;
 
     // `owner` is the handler the timer's completion is delivered to, which hands it to on_timer(); `who` begins its
     // log lines and names it to a webhook.
@@ -141,16 +143,24 @@ private:
         // A broker's: the topic under the target's it is published on, and whether the broker keeps it.
         std::string sub;
         bool        retain{false};
+        // What it is about, a bucket's object or a link, whose events go one at a time and in order; empty for one
+        // about nothing, which go in order among themselves.
+        std::string order{};
+        bool        flying{false};
     };
-    // One target's queue and the one delivery it has in flight.
+    // One target's queue and the deliveries it has in flight: one to another runtime, up to webhook_inflight to a
+    // webhook.
     struct lane
     {
         std::string name;
         notify_target target;
-        // A webhook's connection, none for a target of another runtime.
+        // A webhook's connections, none for a target of another runtime; the first made with the lane, the rest as
+        // events of other objects wait.
         std::unique_ptr<http_peer> peer;
+        std::vector<std::unique_ptr<http_peer>> more;
         std::deque<pending> q;
         bool        busy{false};
+        uint32_t    flying{0};
         uint32_t    failures{0};
         std::chrono::steady_clock::time_point next_try{};
         // When an event was last queued for it, for forget_idle().
@@ -163,6 +173,14 @@ private:
     // The resolver waited for on the loop, once; false when it cannot be.
     bool resolver_ready();
     void start(lane& l);
+    // A webhook's events of objects none of whose earlier events is still owed, each on a connection not in use.
+    void start_webhook(lane& l);
+    // A webhook's connection with nothing on it, made when there are fewer than webhook_inflight; null when none is.
+    http_peer* free_peer(lane& l);
+    // A webhook delivery of the event `id` ended.
+    void finish_webhook(lane& l, uint64_t id, bool ok);
+    // An event queued, its order taken from what it is about.
+    void enqueue(lane& l, pending ev);
     // A delivery to another runtime of the daemon.
     void start_runtime(lane& l, const pending& ev);
     // The delivery at the front of the queue ended, delivered or not.

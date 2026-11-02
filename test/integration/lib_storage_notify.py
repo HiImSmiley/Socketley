@@ -541,8 +541,9 @@ def mode_keep(port, hook_port, secure_port=None, cert=None, key=None):
     got = lambda: len([k for _, k, _ in hook.records() if k.startswith("ka/")])
     check("twenty events reach a webhook that keeps its connections", wait_for(lambda: got() == 20, 20), got())
     # The counters reach `stats` a moment after the deliveries they count.
-    check("over one connection, the rest going on the one kept",
-          wait_for(lambda: stat("notify_reuses") - r0 >= 18, 5) and stat("notify_connects") - c0 <= 2, nstats())
+    # Up to four at once, each on a connection of its own, and every other event on one of those kept.
+    check("over at most four connections, the rest going on those kept",
+          wait_for(lambda: stat("notify_reuses") - r0 >= 16, 5) and stat("notify_connects") - c0 <= 4, nstats())
     # The host gives up on the connection while it is kept, and the next event goes on a new one.
     time.sleep(2.5)
     c1 = stat("notify_connects")
@@ -569,9 +570,9 @@ def mode_keep(port, hook_port, secure_port=None, cert=None, key=None):
         c3, r3 = stat("notify_connects"), stat("notify_reuses")
         for i in range(10):
             req("PUT", "/%s/kas/%02d" % (B, i), b"kept")
-        check("ten events to an https webhook share one handshake",
+        check("ten events to an https webhook share at most four handshakes",
               wait_for(lambda: len([k for _, k, _ in secure.records() if k.startswith("kas/")]) == 10, 20) and
-              wait_for(lambda: stat("notify_reuses") - r3 >= 8, 5) and stat("notify_connects") - c3 <= 2, nstats())
+              wait_for(lambda: stat("notify_reuses") - r3 >= 6, 5) and stat("notify_connects") - c3 <= 4, nstats())
         secure.down()
     check("put back for the next half", put_cfg(doc(rule("Queue", "created", ARN + "hook", ["s3:ObjectCreated:*"],
                                                         prefix="r/")))[:2] == (200, None))
