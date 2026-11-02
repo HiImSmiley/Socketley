@@ -318,6 +318,7 @@ bool idp_run::start(std::string& why)
     if (!(m_reader ? m_accounts.follow_open(idp_accounts_dir(m_owner.get_name()), why)
                    : m_accounts.open(idp_accounts_dir(m_owner.get_name()), why)))
         return false;
+    m_accounts.set_io(&m_io, &m_loop);
     // The accounts' standing beside the key, before any session is signed, so a proxy never verifies one without it.
     if (!publish_standing())
     {
@@ -3076,6 +3077,13 @@ void idp_run::wake_mail(const std::string& acct)
     next();
 }
 
+void idp_run::answer_durable(uint64_t ticket, std::string text)
+{
+    m_accounts.when_durable([this, ticket, text = std::move(text)](bool durable) {
+        answer_command(ticket, durable ? std::string_view(text) : std::string_view("error: the change could not be written to the disk"));
+    });
+}
+
 void idp_run::answer_command(uint64_t ticket, std::string_view text)
 {
     // A change a command made is said to the other shards before it is answered, so none answers from before it.
@@ -3322,7 +3330,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             if (!m_accounts.create(f, id, why))
                 answer_command(ticket, "error: " + why);
             else
-                answer_command(ticket, id + "\n");
+                answer_durable(ticket, id + "\n");
         };
         if (password.empty())
             create(std::move(fields));
@@ -3353,7 +3361,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         if (!write_account(id, f, why))
             answer_command(ticket, "error: " + why);
         else
-            answer_command(ticket, done);
+            answer_durable(ticket, std::string(done));
     };
     // totp <user> on|off: a second step of signing in, its key given once to put into an authenticator app.
     if (action == "totp")
@@ -3550,7 +3558,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         else if (revoke_ssh([&](const auto& c) { return c.sub == id; }, why) < 0)
             answer_command(ticket, "error: the account is removed, but its SSH certificates are not revoked: " + why);
         else
-            answer_command(ticket, "");
+            answer_durable(ticket, "");
         return;
     }
     if (action == "show")
@@ -3611,7 +3619,7 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
     }
     std::string errors;
     const size_t added = m_accounts.create_many(fresh, errors);
-    answer_command(ticket, std::to_string(added) + " " + std::to_string(kept) + "\n" + errors + admins);
+    answer_durable(ticket, std::to_string(added) + " " + std::to_string(kept) + "\n" + errors + admins);
 }
 
 // ─── Shards ─────────────────────────────────────────────────────────────────
@@ -3751,9 +3759,16 @@ void idp_run::update_account(const std::string& id, field_list fields,
     if (!m_reader)
     {
         std::string why;
-        const bool ok = write_account(id, fields, why);
-        publish_accounts();
-        then(ok, why);
+        if (!write_account(id, fields, why))
+        {
+            then(false, why);
+            return;
+        }
+        // Answered, and told to the other shards, once the change is on the disk.
+        m_accounts.when_durable([this, then](bool durable) {
+            publish_accounts();
+            then(durable, durable ? std::string() : std::string("the change could not be written to the disk"));
+        });
         return;
     }
     auto answered = [this, then](bool delivered, std::string_view reply)
@@ -3807,8 +3822,17 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
             const bool ok = !m_reader && write_account(call.key, call.fields, why);
             if (m_reader)
                 why = "the accounts are written by shard 0";
-            publish_accounts();
-            mgr->requests().complete_deferred(ticket, request_status::ok, encode_result(ok, why));
+            if (!ok)
+            {
+                mgr->requests().complete_deferred(ticket, request_status::ok, encode_result(false, why));
+                return;
+            }
+            m_accounts.when_durable([this, ticket](bool durable) {
+                publish_accounts();
+                if (auto* m = m_owner.get_runtime_manager())
+                    m->requests().complete_deferred(ticket, request_status::ok,
+                        encode_result(durable, durable ? "" : "the change could not be written to the disk"));
+            });
             return;
         }
         case shard_call::miss:

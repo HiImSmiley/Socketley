@@ -266,6 +266,8 @@ private:
     void catch_up();
 
     void answer_command(uint64_t ticket, std::string_view text);
+    // The same once every account change made so far is on the disk, and told to the other shards.
+    void answer_durable(uint64_t ticket, std::string text);
     // One page of a storage's users, as its request channel answers `users`, taken in as accounts.
     void import_page(uint64_t ticket, std::string_view reply);
 

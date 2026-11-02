@@ -19880,6 +19880,13 @@ minutes.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_IDP_COMPACT_AFTER
+A test aid: how many account changes an idp runtime journals before it folds
+them into its snapshot, so a test sees the snapshot written while changes go
+on; 1000 when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_MAIL_QUEUE_SCALE
 A test aid: how many times faster a mail runtime's retries and
 .B \-\-queue\-lifetime

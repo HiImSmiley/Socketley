@@ -1,4 +1,6 @@
 #include "idp_accounts.h"
+#include "../../shared/loop/file_io.h"
+#include "../../shared/util/settings.h"
 
 #include <algorithm>
 #include <cctype>
@@ -30,7 +32,11 @@ constexpr uint8_t op_put    = 1;
 constexpr uint8_t op_remove = 2;
 constexpr std::string_view journal_owner = "socketley-idp-accounts";
 // Past this many records the journal is folded into a snapshot, so a start replays a bounded tail.
-constexpr uint64_t compact_after = 1000;
+uint64_t compact_after()
+{
+    static const uint64_t n = socketley::settings::number<uint64_t>("SOCKETLEY_IDP_COMPACT_AFTER").value_or(1000);
+    return n;
+}
 
 std::string lower(std::string_view s)
 {
@@ -269,7 +275,7 @@ bool account_store::open(const std::string& dir, std::string& why)
         return false;
     }
     note_journal();
-    if (m_journal_records >= compact_after && !compact(why))
+    if (m_journal_records >= compact_after() && !compact(why))
         return false;
     return true;
 }
@@ -329,7 +335,21 @@ bool account_store::follow(uint64_t journal, uint64_t end)
 
 void account_store::close()
 {
+    // Its waiters are answered now, as refused, and a sync still in flight finds a store of another generation.
+    ++m_gen;
+    auto waiting = std::move(m_waiting);
+    m_waiting.clear();
+    for (auto& [seq, then] : waiting)
+        then(false);
+    if (m_loop && m_syncing)
+        m_loop->close_fd(m_journal.release());
     m_journal.close();
+    m_syncing = false;
+    m_committed = m_synced = m_syncing_upto = m_synced_old = m_compact_from = 0;
+    m_broken = false;
+    m_compacting = false;
+    m_tail.clear();
+    m_compact_ready.reset();
     if (m_follow_fd >= 0)
         ::close(m_follow_fd);
     m_follow_fd = -1;
@@ -359,26 +379,113 @@ bool account_store::commit_many(const std::vector<std::string>& records, std::st
         why = "the accounts are not open";
         return false;
     }
+    if (m_broken)
+    {
+        why = "the accounts' disk refused a change, so the store takes none until it is restarted";
+        return false;
+    }
     for (const auto& r : records)
         m_journal.append(r);
-    if (!m_journal.sync())
+    if (!m_journal.flush())
     {
         why = "the change could not be written to the disk";
         return false;
     }
-    note_journal();
+    // In the journal's file and so in a dump a restart replays; on the disk once the sync it goes in is done, which
+    // the answer to it waits for (when_durable), while the loop goes on with the next request.
+    struct stat st{};
+    if (::fstat(m_journal.fd(), &st) == 0)
+        m_flushed_end = static_cast<uint64_t>(st.st_size);
     for (const auto& r : records)
         apply(r);
+    if (m_compacting)
+        m_tail.insert(m_tail.end(), records.begin(), records.end());
     m_journal_records += records.size();
-    if (m_journal_records >= compact_after)
+    ++m_committed;
+    if (!m_io)
     {
-        std::string ignored;
-        compact(ignored);
+        // No ring to sync through: the commit's own, as before.
+        const bool ok = ::fdatasync(m_journal.fd()) == 0;
+        if (ok)
+            m_journal_end = m_flushed_end;
+        m_syncing_upto = m_committed;
+        synced(ok);
+        if (!ok)
+        {
+            why = "the change could not be written to the disk";
+            return false;
+        }
+        return true;
     }
+    sync_next();
     return true;
 }
 
-bool account_store::compact(std::string& why)
+void account_store::when_durable(std::function<void(bool)> then)
+{
+    if (m_synced >= m_committed)
+    {
+        then(!m_broken);
+        return;
+    }
+    m_waiting.emplace_back(m_committed, std::move(then));
+    sync_next();
+}
+
+void account_store::sync_next()
+{
+    if (m_syncing || !m_io || m_synced >= m_committed || !m_journal.is_open())
+        return;
+    m_syncing = true;
+    m_syncing_upto = m_committed;
+    const uint64_t end = m_flushed_end;
+    const uint64_t gen = m_gen;
+    if (!m_io->sync(m_journal.fd(), true, [this, end, gen](int64_t res) {
+            if (gen != m_gen)
+                return;
+            m_syncing = false;
+            if (res >= 0)
+                m_journal_end = end;
+            synced(res >= 0);
+        }))
+    {
+        m_syncing = false;
+        synced(false);
+    }
+}
+
+void account_store::synced(bool ok)
+{
+    if (ok)
+        m_synced_old = m_syncing_upto;
+    else
+        m_broken = true;
+    m_synced = m_compacting ? std::min(m_synced_old, m_compact_from) : m_synced_old;
+    // A compaction's fresh journal goes in once no sync names the old one.
+    if (ok && m_compact_ready && !m_syncing)
+    {
+        auto job = std::move(m_compact_ready);
+        compact_step(job, 7);
+        return;
+    }
+    if (ok && !m_compacting && m_journal_records >= compact_after())
+        compact_async();
+    std::vector<std::pair<uint64_t, std::function<void(bool)>>> due;
+    for (auto it = m_waiting.begin(); it != m_waiting.end();)
+        if (!ok || it->first <= m_synced)
+        {
+            due.push_back(std::move(*it));
+            it = m_waiting.erase(it);
+        }
+        else
+            ++it;
+    for (auto& [seq, then] : due)
+        then(ok);
+    if (ok)
+        sync_next();
+}
+
+std::string account_store::snapshot_text() const
 {
     std::string out = "{\"format\":" + socketley::json::quote(journal_owner) + ",\"version\":" +
                       std::to_string(format_version) + "}\n";
@@ -395,6 +502,17 @@ bool account_store::compact(std::string& why)
         }
         out += "}}\n";
     }
+    return out;
+}
+
+bool account_store::compact(std::string& why)
+{
+    if (m_compacting || m_syncing)
+    {
+        why = "a compaction or a sync is under way";
+        return false;
+    }
+    const std::string out = snapshot_text();
     if (!write_whole(m_dir + "/accounts.snapshot", out))
     {
         why = "the accounts snapshot could not be written";
@@ -421,6 +539,213 @@ bool account_store::compact(std::string& why)
     note_journal();
     m_journal_records = 0;
     return true;
+}
+
+struct account_store::compaction
+{
+    uint64_t gen{0};
+    std::string text;
+    uint64_t written{0};
+    int fd{-1};
+    int dir{-1};
+    size_t tail_in{0};
+    mutation_journal fresh;
+};
+
+void account_store::compact_async()
+{
+    if (m_compacting || m_compact_ready || !m_io || !m_loop || m_following || !m_journal.is_open())
+        return;
+    auto job = std::make_shared<compaction>();
+    job->gen = m_gen;
+    job->text = snapshot_text();
+    m_compacting = true;
+    m_compact_from = m_committed;
+    m_tail.clear();
+    compact_step(job, 0);
+}
+
+// One step a completion: the snapshot written beside, synced, renamed and its directory synced; the fresh journal
+// with the tail, synced, renamed and the directory synced; and, on the loop, the fresh journal taken.
+void account_store::compact_step(const std::shared_ptr<compaction>& job, int step)
+{
+    // A store closed meanwhile: what the compaction holds open goes, and nothing else of it is done.
+    if (job->gen != m_gen)
+    {
+        for (int* fd : {&job->fd, &job->dir})
+            if (*fd >= 0)
+            {
+                ::close(*fd);
+                *fd = -1;
+            }
+        return;
+    }
+    const std::string snap = m_dir + "/accounts.snapshot", jpath = m_dir + "/accounts.journal";
+    const auto next = [this, job](int s) {
+        return [this, job, s](int64_t res) {
+            if (job->gen != m_gen)
+            {
+                if (s == 1 && res >= 0)
+                    ::close(static_cast<int>(res));
+                compact_step(job, -1);
+                return;
+            }
+            if (res < 0)
+            {
+                compact_done(job, false);
+                return;
+            }
+            if (s == 1)
+                job->fd = static_cast<int>(res);
+            if (s == 2)
+                job->written += static_cast<uint64_t>(res);
+            compact_step(job, s);
+        };
+    };
+    bool queued = true;
+    switch (step)
+    {
+        case 0:
+            queued = m_io->openat(AT_FDCWD, snap + ".new", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600, next(1));
+            break;
+        case 1:
+        case 2:
+            if (job->written < job->text.size())
+            {
+                const auto n = static_cast<uint32_t>(std::min<uint64_t>(job->text.size() - job->written, 1u << 30));
+                queued = m_io->pwrite(job->fd, job->text.data() + job->written, n, job->written, next(2));
+                break;
+            }
+            queued = m_io->sync(job->fd, true, next(3));
+            break;
+        case 3:
+            m_loop->close_fd(job->fd);
+            job->fd = -1;
+            queued = m_io->renameat(AT_FDCWD, snap + ".new", AT_FDCWD, snap, next(4));
+            break;
+        case 4:
+        case 6:
+            job->dir = ::open(m_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            queued = job->dir >= 0 && m_io->sync(job->dir, false, [this, job, step](int64_t res) {
+                if (job->gen != m_gen)
+                {
+                    compact_step(job, -1);
+                    return;
+                }
+                m_loop->close_fd(job->dir);
+                job->dir = -1;
+                if (res < 0)
+                    compact_done(job, false);
+                else
+                    compact_step(job, step + 1);
+            });
+            break;
+        case 5:
+        {
+            // The fresh journal begins with what was committed since the snapshot was taken.
+            ::unlink((jpath + ".new").c_str());
+            if (!job->fresh.open_append(jpath + ".new", journal_owner))
+            {
+                compact_done(job, false);
+                return;
+            }
+            for (; job->tail_in < m_tail.size(); ++job->tail_in)
+                job->fresh.append(m_tail[job->tail_in]);
+            if (!job->fresh.flush())
+            {
+                compact_done(job, false);
+                return;
+            }
+            queued = m_io->sync(job->fresh.fd(), true, [this, job](int64_t res) {
+                if (job->gen != m_gen)
+                    return;
+                if (res < 0)
+                {
+                    compact_done(job, false);
+                    return;
+                }
+                m_loop->close_fd(job->fresh.release());
+                if (!m_io->renameat(AT_FDCWD, m_dir + "/accounts.journal.new", AT_FDCWD, m_dir + "/accounts.journal",
+                                    [this, job](int64_t r) {
+                                        if (job->gen != m_gen)
+                                            return;
+                                        if (r < 0)
+                                            compact_done(job, false);
+                                        else
+                                            compact_step(job, 6);
+                                    }))
+                    compact_done(job, false);
+            });
+            break;
+        }
+        case 7:
+            // Taken on the loop once no sync names the old journal, which the rename has unlinked.
+            if (m_syncing)
+            {
+                m_compact_ready = job;
+                return;
+            }
+            compact_done(job, true);
+            return;
+        default:
+            return;
+    }
+    if (!queued)
+        compact_done(job, false);
+}
+
+void account_store::compact_done(const std::shared_ptr<compaction>& job, bool ok)
+{
+    if (job->fd >= 0)
+        m_loop->close_fd(job->fd);
+    if (job->dir >= 0)
+        m_loop->close_fd(job->dir);
+    job->fd = job->dir = -1;
+    if (job->fresh.is_open())
+        m_loop->close_fd(job->fresh.release());
+    if (ok)
+    {
+        // The fresh journal, under the journal's name, with the rest of the tail behind what it was begun with.
+        const std::string jpath = m_dir + "/accounts.journal";
+        m_loop->close_fd(m_journal.release());
+        ok = m_journal.open_append(jpath, journal_owner);
+        if (ok)
+        {
+            struct stat st{};
+            if (::fstat(m_journal.fd(), &st) == 0)
+            {
+                m_journal_id = static_cast<uint64_t>(st.st_ino);
+                m_journal_end = static_cast<uint64_t>(st.st_size);
+            }
+            for (size_t i = job->tail_in; i < m_tail.size(); ++i)
+                m_journal.append(m_tail[i]);
+            ok = m_journal.flush();
+            if (::fstat(m_journal.fd(), &st) == 0)
+                m_flushed_end = static_cast<uint64_t>(st.st_size);
+            m_journal_records = m_tail.size();
+        }
+        if (!ok)
+            m_broken = true;
+    }
+    else
+    {
+        ::unlink((m_dir + "/accounts.snapshot.new").c_str());
+        ::unlink((m_dir + "/accounts.journal.new").c_str());
+    }
+    m_compacting = false;
+    m_tail.clear();
+    if (m_broken)
+    {
+        synced(false);
+        return;
+    }
+    // Where it went in, what was committed before it began is in the snapshot, and what came after is in the fresh
+    // journal, on the disk once the next sync, of the fresh one, says so; where it failed, the old journal's syncs
+    // stand as they were.
+    if (ok)
+        m_synced_old = m_compact_from;
+    m_synced = m_synced_old;
+    sync_next();
 }
 
 const account* account_store::by_id(std::string_view id) const

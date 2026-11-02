@@ -10,7 +10,9 @@
 // as a snapshot now and then and the journal cut behind it. A snapshot names its format version; one newer than this
 // build reads is refused rather than rewritten without what it does not understand.
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -18,6 +20,12 @@
 #include <vector>
 
 #include "../../shared/persist/mutation_journal.h"
+
+namespace socketley
+{
+class file_io;
+}
+class event_loop;
 
 namespace socketley::idp
 {
@@ -49,6 +57,16 @@ public:
 
     // The accounts kept under `dir`, read whole: the snapshot, then every journal record after it.
     bool open(const std::string& dir, std::string& why);
+    // The ring a commit's sync goes through, off the loop, and the loop that closes the journal it may still name;
+    // without them the sync is made in the commit.
+    void set_io(file_io* io, event_loop* loop)
+    {
+        m_io = io;
+        m_loop = loop;
+    }
+    // Runs `then` once every change committed so far is on the disk, with false when the disk refused it -- from then
+    // on the store takes no change, its memory being ahead of its disk until a restart replays the journal.
+    void when_durable(std::function<void(bool)> then);
     // The same, as a shard that does not write them reads them: the journal stays open, for follow().
     bool follow_open(const std::string& dir, std::string& why);
     // The records the writer has added up to `end` of the journal `journal` names; false when it has since begun
@@ -95,6 +113,15 @@ private:
     void unindex(const account& a);
     bool read_snapshot(const std::string& path, std::string& why);
     void note_journal();
+    void sync_next();
+    void synced(bool ok);
+    // The snapshot and a fresh journal written through the ring while commits go on, the ones made meanwhile kept in
+    // m_tail to begin the fresh journal with; compact() does the same on the loop, without a ring.
+    struct compaction;
+    std::string snapshot_text() const;
+    void compact_async();
+    void compact_step(const std::shared_ptr<compaction>& job, int step);
+    void compact_done(const std::shared_ptr<compaction>& job, bool ok);
 
     std::string m_dir;
     std::unordered_map<std::string, account> m_accounts;
@@ -105,6 +132,26 @@ private:
     uint64_t m_journal_id{0};
     uint64_t m_journal_end{0};
     uint64_t m_changes{0};
+    // A commit is applied at once, so the next one sees it, and is made durable by a group sync through the ring:
+    // the changes committed while one is in flight go in the next, and each waiter runs once its own are in one.
+    file_io* m_io{nullptr};
+    event_loop* m_loop{nullptr};
+    // Bumped by close(), so a sync that ends after it finds the store it was made for gone.
+    uint64_t m_gen{0};
+    uint64_t m_committed{0};
+    uint64_t m_synced{0};
+    uint64_t m_syncing_upto{0};
+    uint64_t m_flushed_end{0};
+    bool m_syncing{false};
+    bool m_broken{false};
+    std::vector<std::pair<uint64_t, std::function<void(bool)>>> m_waiting;
+    // A compaction under way: the commits made since it began, and the one durable point its waiters stop at until
+    // the fresh journal that holds them is on the disk -- the old one is unlinked by the rename.
+    bool m_compacting{false};
+    uint64_t m_compact_from{0};
+    uint64_t m_synced_old{0};
+    std::vector<std::string> m_tail;
+    std::shared_ptr<compaction> m_compact_ready;
     bool m_following{false};
     int m_follow_fd{-1};
     uint64_t m_follow_off{0};

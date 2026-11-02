@@ -3093,9 +3093,11 @@ project "test_idp"
         "socketley"
     }
 
-    links { "crypto", "dl" }
+    -- The account store syncs through the loop's file_io, which the test never opens a ring for.
+    links { "crypto", "dl", "uring:static" }
 
     files { "test/unit/test_idp.cpp", "socketley/runtime/idp/idp_logic.cpp", "socketley/runtime/idp/idp_accounts.cpp",
+            "socketley/shared/loop/event_loop.cpp", "socketley/shared/loop/file_io.cpp",
             "socketley/runtime/idp/idp_shard.cpp", "socketley/runtime/idp/idp_ssh_certs.cpp", "socketley/shared/crypto/jws.cpp",
             "socketley/shared/crypto/key_file.cpp", "socketley/shared/crypto/ssh_cert.cpp", "socketley/shared/crypto/ed25519.cpp",
             "socketley/shared/persist/paths.cpp", "socketley/shared/util/base64.cpp" }

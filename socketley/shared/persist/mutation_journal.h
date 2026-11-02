@@ -268,6 +268,15 @@ public:
         m_pending.clear();
     }
 
+    // The descriptor given up to a caller that closes it itself, through a loop whose ring may still name it.
+    int release()
+    {
+        const int fd = m_fd;
+        m_fd = -1;
+        m_pending.clear();
+        return fd;
+    }
+
     bool   is_open() const       { return m_fd >= 0; }
     // The descriptor, for a caller that syncs it off its loop after flush().
     int    fd() const            { return m_fd; }
