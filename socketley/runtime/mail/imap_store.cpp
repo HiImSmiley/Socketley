@@ -2075,6 +2075,47 @@ bool imap_store::parsed(const std::string& key, std::shared_ptr<const std::strin
     return true;
 }
 
+void imap_store::section(const std::string& key, const std::shared_ptr<const std::string>& bytes, std::string section,
+                         std::function<void(std::shared_ptr<const std::string>)> done)
+{
+    std::shared_ptr<const mime::part> part;
+    if (const auto it = m_cache.find(key); it != m_cache.end())
+        part = it->second.part;
+    if (bytes->size() <= (1u << 20))
+    {
+        if (!part)
+            part = structure(key, bytes);
+        auto out = std::make_shared<std::string>();
+        done(mime::binary_of(*bytes, *part, section, *out) > 0 ? out : nullptr);
+        return;
+    }
+    // Parsing and decoding 16 MiB took 60 to 80 ms, which every other client of the loop waited.
+    auto made = std::make_shared<std::shared_ptr<const mime::part>>(part);
+    auto out = std::make_shared<std::string>();
+    auto ok = std::make_shared<bool>(false);
+    m_run.pool().submit(
+        0,
+        [bytes, made, out, ok, section = std::move(section)] {
+            if (!*made)
+                *made = std::make_shared<const mime::part>(mime::parse(*bytes));
+            *ok = mime::binary_of(*bytes, **made, section, *out) > 0;
+        },
+        [this, key, bytes, made, out, ok, had = part != nullptr, done = std::move(done), alive = m_alive] {
+            if (!*alive)
+                return;
+            if (!had)
+            {
+                cached& c = touch(key);
+                if (!c.bytes)
+                    c.bytes = bytes;
+                c.part = *made;
+                recount(c);
+                evict();
+            }
+            done(*ok ? out : nullptr);
+        });
+}
+
 bool imap_store::parse_later(const std::string& key, const std::shared_ptr<const std::string>& bytes,
                              std::function<void()> done)
 {

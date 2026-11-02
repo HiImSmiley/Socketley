@@ -1146,14 +1146,11 @@ void jmap_session::blob(const std::string& id, std::function<void(std::shared_pt
     const imap_message* m = w.m();
     std::string section = us == std::string::npos ? std::string() : id.substr(us + 1);
     std::replace(section.begin(), section.end(), '-', '.');
-    m_store.body(m->key, m->size, [section, done](std::shared_ptr<const std::string> bytes) {
+    // The store calls back only while it lives, so it is there to ask for the part.
+    m_store.body(m->key, m->size, [store = &m_store, key = m->key, section, done](std::shared_ptr<const std::string> bytes) {
         if (!bytes || section.empty())
             return done(bytes);
-        const mime::part root = mime::parse(*bytes);
-        auto out = std::make_shared<std::string>();
-        if (mime::binary_of(*bytes, root, section, *out) <= 0)
-            return done(nullptr);
-        done(out);
+        store->section(key, bytes, section, done);
     });
 }
 

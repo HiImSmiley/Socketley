@@ -185,6 +185,10 @@ public:
     std::shared_ptr<const mime::part> structure(const std::string& key, const std::shared_ptr<const std::string>& bytes);
     // Its bytes and structure where the cache holds both, read now; false where it does not.
     bool parsed(const std::string& key, std::shared_ptr<const std::string>& bytes, std::shared_ptr<const mime::part>& part);
+    // Part `section` of the message `key`, its transfer encoding undone, to `done`, null where there is no such part: a
+    // message too large to parse on the loop is parsed and decoded on the pool, and its structure kept either way.
+    void section(const std::string& key, const std::shared_ptr<const std::string>& bytes, std::string section,
+                 std::function<void(std::shared_ptr<const std::string>)> done);
     // True where a message too large to parse on the loop is parsed on the pool, `done` called once structure() has it.
     bool parse_later(const std::string& key, const std::shared_ptr<const std::string>& bytes, std::function<void()> done);
 
