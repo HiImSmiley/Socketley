@@ -79,12 +79,23 @@ public:
     uint64_t journal_end() const { return m_journal_end; }
     // A count every change made or read adds to, so what is derived from the accounts is made again only after one.
     uint64_t changes() const { return m_changes; }
+    // The same, added to only by an account made or removed or a field shapes_standing() names.
+    uint64_t standing_changes() const { return m_standing_changes; }
 
     const account* by_id(std::string_view id) const;
     // By username, case aside.
     const account* by_name(std::string_view username) const;
     // Every account, ordered by username.
     std::vector<const account*> all() const;
+    // Every account in no order, for a pass that needs none.
+    template <class F>
+    void each(F&& f) const
+    {
+        for (const auto& [id, a] : m_accounts)
+            f(a);
+    }
+    // The accounts holding `email`, case aside, ordered by username.
+    std::vector<const account*> by_email(std::string_view email) const;
     size_t size() const { return m_accounts.size(); }
 
     // A new account under a new id with `fields`, which must hold a username no other account has.
@@ -125,13 +136,15 @@ private:
 
     std::string m_dir;
     std::unordered_map<std::string, account> m_accounts;
-    // Usernames lower-cased, to the id they name.
+    // Usernames lower-cased, to the id they name; and e-mail addresses lower-cased, to the ids holding them.
     std::unordered_map<std::string, std::string> m_names;
+    std::unordered_multimap<std::string, std::string> m_emails;
     mutation_journal m_journal;
     uint64_t m_journal_records{0};
     uint64_t m_journal_id{0};
     uint64_t m_journal_end{0};
     uint64_t m_changes{0};
+    uint64_t m_standing_changes{0};
     // A commit is applied at once, so the next one sees it, and is made durable by a group sync through the ring:
     // the changes committed while one is in flight go in the next, and each waiter runs once its own are in one.
     file_io* m_io{nullptr};

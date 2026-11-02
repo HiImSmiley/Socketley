@@ -199,6 +199,15 @@ struct standing
 };
 using standing_table = std::unordered_map<std::string, standing, string_hash, string_equal>;
 
+// A session signed out on its own, a field each, so.<sid> holding when it would have expired.
+inline constexpr std::string_view signed_out_prefix = "so.";
+// Whether an account's standing line is made from this field.
+inline bool shapes_standing(std::string_view field)
+{
+    return field == "revoked_before" || field == "groups" || field == "disabled" || field == "reset" ||
+           field.starts_with(signed_out_prefix);
+}
+
 // The file's first line, which names its format.
 inline constexpr std::string_view standing_format = "socketley-idp-standing 1\n";
 

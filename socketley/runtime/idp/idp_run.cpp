@@ -82,9 +82,7 @@ constexpr std::string_view family_prefix = "rt.";
 constexpr int64_t ssh_auth_secs = 12 * 3600;
 // Why a change that waited on a field still holding a value was not made.
 constexpr std::string_view changed_meanwhile = "the account changed meanwhile";
-// A session signed out on its own, a field each, so.<sid> holding when it would have expired; past the most an
-// account keeps, a sign-out ends all of its sessions instead.
-constexpr std::string_view signed_out_prefix = "so.";
+// Past the most sign-outs an account keeps, a sign-out ends all of its sessions instead.
 constexpr size_t  max_signed_out = 32;
 
 std::string peer_text(const sockaddr_storage& a)
@@ -809,18 +807,18 @@ std::string idp_run::self_email_problem(const account& who, std::string_view ema
     const std::string_view domain = email.substr(at + 1);
     // The name a mail runtime files the address under, its +tag aside.
     const std::string_view base = email.substr(0, std::min(at, email.find('+')));
-    bool served = own_domain(domain);
-    for (const account* a : m_accounts.all())
-    {
-        if (a->id == who.id || !email_trusted(*a))
-            continue;
-        const std::string_view theirs = a->field("email");
-        if (socketley::ascii::iequals(theirs, email))
+    for (const account* a : m_accounts.by_email(email))
+        if (a->id != who.id && email_trusted(*a))
             return "that address is another account's";
-        // A domain an admin gave an address in is one a mail runtime here may serve.
-        if (socketley::ascii::iequals(theirs.substr(theirs.find('@') + 1), domain))
+    bool served = own_domain(domain);
+    // A domain an admin gave an address in is one a mail runtime here may serve.
+    m_accounts.each([&](const account& a)
+    {
+        const std::string_view theirs = a.field("email");
+        if (!served && a.id != who.id && socketley::ascii::iequals(theirs.substr(theirs.find('@') + 1), domain) &&
+            email_trusted(a))
             served = true;
-    }
+    });
     if (const account* a = served ? m_accounts.by_name(base) : nullptr; a && a->id != who.id)
         return "that address is another account's";
     return {};
@@ -3196,8 +3194,8 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         const size_t at = name.find('@');
         if (at == std::string_view::npos)
             return nullptr;
-        for (const account* a : m_accounts.all())
-            if (email_trusted(*a) && socketley::ascii::iequals(a->field("email"), name))
+        for (const account* a : m_accounts.by_email(name))
+            if (email_trusted(*a))
                 return a;
         return m_accounts.by_name(name.substr(0, at));
     };
@@ -3626,25 +3624,26 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
 
 bool idp_run::publish_standing()
 {
-    if (m_reader || m_accounts.changes() == m_standing_at)
+    // Made again only after a change to what it is made of: a token refreshed or a name changed leaves it as it was.
+    if (m_reader || m_accounts.standing_changes() == m_standing_at)
         return true;
     std::string doc(standing_format);
-    for (const account* a : m_accounts.all())
+    m_accounts.each([&](const account& a)
     {
         // An id a line cannot hold is left out, so its sessions are refused rather than misread.
-        if (a->id.find_first_of(" \t\r\n") != std::string::npos)
-            continue;
+        if (a.id.find_first_of(" \t\r\n") != std::string::npos)
+            return;
         standing s;
-        const std::string_view before = a->field("revoked_before");
+        const std::string_view before = a.field("revoked_before");
         std::from_chars(before.data(), before.data() + before.size(), s.revoked_before);
-        s.admin = a->in_group("admins");
-        s.disabled = a->disabled();
-        s.reset = a->field("reset") == "1";
-        for (const auto& [k, v] : a->fields)
+        s.admin = a.in_group("admins");
+        s.disabled = a.disabled();
+        s.reset = a.field("reset") == "1";
+        for (const auto& [k, v] : a.fields)
             if (k.starts_with(signed_out_prefix) && k.size() > signed_out_prefix.size())
                 s.ended.push_back(k.substr(signed_out_prefix.size()));
-        append_standing(doc, a->id, s);
-    }
+        append_standing(doc, a.id, s);
+    });
     if (doc != m_standing)
     {
         // Synced, since a crash that brought back the file before a sign-out would let its sessions in again.
@@ -3657,7 +3656,7 @@ bool idp_run::publish_standing()
         }
         m_standing = std::move(doc);
     }
-    m_standing_at = m_accounts.changes();
+    m_standing_at = m_accounts.standing_changes();
     return true;
 }
 

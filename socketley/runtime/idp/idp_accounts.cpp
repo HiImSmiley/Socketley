@@ -109,6 +109,8 @@ void account_store::index(const account& a)
 {
     if (const std::string_view u = a.username(); !u.empty())
         m_names[lower(u)] = a.id;
+    if (const std::string_view e = a.field("email"); !e.empty())
+        m_emails.emplace(lower(e), a.id);
 }
 
 void account_store::unindex(const account& a)
@@ -116,6 +118,13 @@ void account_store::unindex(const account& a)
     if (const std::string_view u = a.username(); !u.empty())
         if (const auto it = m_names.find(lower(u)); it != m_names.end() && it->second == a.id)
             m_names.erase(it);
+    if (const std::string_view e = a.field("email"); !e.empty())
+        for (auto [it, end] = m_emails.equal_range(lower(e)); it != end; ++it)
+            if (it->second == a.id)
+            {
+                m_emails.erase(it);
+                break;
+            }
 }
 
 bool account_store::apply(std::string_view record)
@@ -132,6 +141,7 @@ bool account_store::apply(std::string_view record)
         {
             unindex(it->second);
             m_accounts.erase(it);
+            ++m_standing_changes;
         }
         return true;
     }
@@ -148,9 +158,12 @@ bool account_store::apply(std::string_view record)
             return false;
         fl.emplace_back(std::move(k), std::move(v));
     }
-    account& a = m_accounts[id];
+    const auto [it, made] = m_accounts.try_emplace(id);
+    account& a = it->second;
     a.id = id;
     unindex(a);
+    if (made || std::any_of(fl.begin(), fl.end(), [](const auto& kv) { return shapes_standing(kv.first); }))
+        ++m_standing_changes;
     for (auto& [k, v] : fl)
     {
         if (v.empty())
@@ -164,6 +177,8 @@ bool account_store::apply(std::string_view record)
 
 bool account_store::read_snapshot(const std::string& path, std::string& why)
 {
+    // Accounts read again are a standing to be made again.
+    ++m_standing_changes;
     std::ifstream f(path);
     if (!f)
         return true;   // no snapshot yet: everything is in the journal
@@ -357,6 +372,7 @@ void account_store::close()
     m_following = false;
     m_accounts.clear();
     m_names.clear();
+    m_emails.clear();
     m_journal_records = 0;
     m_journal_id = 0;
     m_journal_end = 0;
@@ -762,10 +778,25 @@ const account* account_store::by_name(std::string_view username) const
 
 std::vector<const account*> account_store::all() const
 {
-    std::vector<const account*> out;
-    out.reserve(m_accounts.size());
+    // Each key lower-cased once, not once a comparison.
+    std::vector<std::pair<std::string, const account*>> keyed;
+    keyed.reserve(m_accounts.size());
     for (const auto& [id, a] : m_accounts)
-        out.push_back(&a);
+        keyed.emplace_back(lower(a.username()), &a);
+    std::sort(keyed.begin(), keyed.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    std::vector<const account*> out;
+    out.reserve(keyed.size());
+    for (const auto& [k, a] : keyed)
+        out.push_back(a);
+    return out;
+}
+
+std::vector<const account*> account_store::by_email(std::string_view email) const
+{
+    std::vector<const account*> out;
+    for (auto [it, end] = m_emails.equal_range(lower(email)); it != end; ++it)
+        if (const account* a = by_id(it->second))
+            out.push_back(a);
     std::sort(out.begin(), out.end(), [](const account* x, const account* y) {
         return lower(x->username()) < lower(y->username());
     });
