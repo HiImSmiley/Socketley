@@ -317,6 +317,9 @@ public:
         all.append(body);
         send(conn, all);
     }
+    // A PINGRESP or an acknowledgement, which a transport may send ahead of the PUBLISHes waiting before it, so a
+    // client that reads slowly is not taken for dead behind its own backlog.
+    virtual void send_control(uint64_t conn, std::string_view bytes) { send(conn, bytes); }
     // Bytes handed to send() for this connection and not yet gone.
     virtual size_t backlog(uint64_t conn) const = 0;
     // Ends a connection once what was sent has gone; disconnected() follows.

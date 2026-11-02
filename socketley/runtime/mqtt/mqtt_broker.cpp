@@ -143,7 +143,7 @@ void broker::send_ack(connection& c, packet_type type, uint16_t id, uint8_t code
         const char b[4] = {static_cast<char>((static_cast<uint8_t>(type) << 4) |
                                              (type == packet_type::pubrel ? 0x02 : 0x00)),
                            2, static_cast<char>(id >> 8), static_cast<char>(id & 0xFF)};
-        send_packet(c, std::string_view(b, sizeof b));
+        m_io.send_control(c.id, std::string_view(b, sizeof b));
         return;
     }
     ack_packet a;
@@ -152,7 +152,7 @@ void broker::send_ack(connection& c, packet_type type, uint16_t id, uint8_t code
     a.reason    = code;
     std::string out;
     write_ack(out, c.level, a);
-    send_packet(c, out);
+    m_io.send_control(c.id, out);
 }
 
 // ── The transport's side ────────────────────────────────────────────────────
@@ -311,7 +311,7 @@ bool broker::handle(connection& c, const frame& f)
             }
             std::string out;
             write_pingresp(out);
-            send_packet(c, out);
+            m_io.send_control(c.id, out);
             return true;
         }
         case packet_type::disconnect:  return on_disconnect(c, f);

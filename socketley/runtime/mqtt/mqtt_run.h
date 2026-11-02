@@ -63,6 +63,7 @@ public:
 
     // ── broker_io ───────────────────────────────────────────────────────────
     void send(uint64_t conn, std::string_view bytes) override;
+    void send_control(uint64_t conn, std::string_view bytes) override;
     void send_parts(uint64_t conn, std::string_view head, const std::shared_ptr<const std::string>& owner,
                     std::string_view body) override;
     size_t backlog(uint64_t conn) const override;
@@ -96,6 +97,8 @@ public:
     void on_request_reply(uint64_t cookie, request_status st, std::string_view reply) override;
 
 private:
+    // The most a fitted connection's write takes, and its chunks hold: a client's PINGRESP waits behind no more.
+    static constexpr size_t fitted_batch = 64 * 1024;
     struct conn
     {
         uint64_t id{0};
@@ -134,6 +137,10 @@ private:
         bool ws_open{false};
         std::string ws_in;
         bool told_broker{false};
+        // On a path with a round trip: a write takes at most a batch, and the kernel holds little unsent, so what
+        // `urgent` holds -- a PINGRESP, an acknowledgement -- goes ahead of the PUBLISHes still queued.
+        bool fitted{false};
+        std::string urgent;
         size_t unsent() const { return owed; }
     };
     struct listener

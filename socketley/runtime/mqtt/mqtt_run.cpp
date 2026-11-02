@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -21,6 +22,7 @@
 #include "../../shared/http/ws_protocol.h"
 #include "../../shared/ipc/route_relay.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/net/socket_tuning.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/runtime/runtime_manager.h"
@@ -399,6 +401,13 @@ void mqtt_run::accept_done(listener& l, struct io_uring_cqe* cqe)
             if (::getpeername(fd, reinterpret_cast<sockaddr*>(&c->peer), &len) < 0) {}
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            // On a LAN the kernel's buffer drains as fast as it fills, and holding it short would only cap the rate.
+            if (socket_tuning::rtt_us(fd) >= 1000)
+            {
+                const int lowat = 16 * 1024;
+                if (::setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof lowat) < 0) {}
+                c->fitted = true;
+            }
             c->ws = l.ws;
             c->closing_ms = now_ms();
             if (m_tls)
@@ -754,6 +763,26 @@ void mqtt_run::send(uint64_t id, std::string_view bytes)
     raw_out(*c, bytes);
 }
 
+void mqtt_run::send_control(uint64_t id, std::string_view bytes)
+{
+    conn* c = find(id);
+    if (!c || c->dead)
+        return;
+    // TLS has made records of what was queued already, in their order; only the clear can be overtaken.
+    if (c->ssl || !c->fitted)
+    {
+        send(id, bytes);
+        return;
+    }
+    const size_t before = c->urgent.size();
+    if (c->ws)
+        ws_frame_binary_into(c->urgent, bytes);
+    else
+        c->urgent.append(bytes);
+    c->owed += c->urgent.size() - before;
+    flush(*c);
+}
+
 void mqtt_run::raw_out(conn& c, std::string_view bytes)
 {
     if (c.dead)
@@ -781,7 +810,8 @@ void mqtt_run::queue_owned(conn& c, std::string_view bytes)
     if (bytes.empty())
         return;
     c.owed += bytes.size();
-    if (!c.queue.empty() && c.queue.back().owns())
+    // A fitted connection's chunks stay a batch long, so a write can stop between them.
+    if (!c.queue.empty() && c.queue.back().owns() && (!c.fitted || c.queue.back().size() < fitted_batch))
         c.queue.back().append(bytes);
     else
     {
@@ -860,13 +890,36 @@ void mqtt_run::flush(conn& c)
         c.sending.clear();
         c.sending_at = 0;
         c.sent = 0;
-        if (c.queue.empty())
+        if (c.queue.empty() && c.urgent.empty())
         {
             if (c.closing)
                 m_close_soon.push_back(c.id);
             return;
         }
-        c.sending.swap(c.queue);
+        if (!c.urgent.empty())
+        {
+            c.sending.emplace_back(std::move(c.urgent));
+            c.urgent.clear();
+        }
+        if (!c.fitted)
+        {
+            if (c.sending.empty())
+                c.sending.swap(c.queue);
+            else
+            {
+                std::move(c.queue.begin(), c.queue.end(), std::back_inserter(c.sending));
+                c.queue.clear();
+            }
+        }
+        else
+        {
+            // A batch at a time, so whatever is made urgent meanwhile waits behind one batch and not the backlog.
+            size_t took = 0, n = 0;
+            while (n < c.queue.size() && (n == 0 || took < fitted_batch))
+                took += c.queue[n++].size();
+            std::move(c.queue.begin(), c.queue.begin() + static_cast<std::ptrdiff_t>(n), std::back_inserter(c.sending));
+            c.queue.erase(c.queue.begin(), c.queue.begin() + static_cast<std::ptrdiff_t>(n));
+        }
     }
     c.wr        = io_request{};
     c.wr.owner  = this;
