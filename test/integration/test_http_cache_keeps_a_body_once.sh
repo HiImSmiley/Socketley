@@ -23,6 +23,8 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 
 echo "=== Integration: the content cache keeps a body once ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate bodyonce
 T=$SOCKETLEY_TMPD
 PM=$((SL_PORT_BASE + 1958)); PD=$((SL_PORT_BASE + 1959))
@@ -85,7 +87,9 @@ echo "  every file, of 2 MiB and 48 KiB, asked twice of both caches, keep-alive 
 case "$out" in "0 "*) ok ;; *) bad "every answer is the file, with the Connection asked for" "$out" ;; esac
 rss=$(rss_of "$PM")
 echo "  the in-memory cache's worker holds ${rss} MiB for 40 MiB of files"
-[ "${rss:-999}" -lt 70 ] && ok || bad "a body is kept once in memory" "${rss} MiB"
+if [ "$sanitized" = 1 ]; then echo "  SKIP [memory]: a resident size measures the sanitizer's quarantine, not the cache"
+elif [ "${rss:-999}" -lt 70 ]; then ok
+else bad "a body is kept once in memory" "${rss} MiB"; fi
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="

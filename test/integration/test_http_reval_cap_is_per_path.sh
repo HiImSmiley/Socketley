@@ -71,11 +71,11 @@ P=$((SL_PORT_BASE + 1640))
 BIG="$WORK/big"; SMALL="$WORK/small"
 mkdir -p "$BIG" "$SMALL"
 
-# Sized from what an entry actually costs: both finished responses, so about
-# twice the file.  400 files of 100 KiB is ~80 MiB of entries and 800 of
-# 48 KiB is ~77 MiB, each comfortably past the 64 MiB total.
-BIG_N=400;   BIG_KB=100
-SMALL_N=800; SMALL_KB=48
+# Sized from what an entry actually costs: the keep-alive response and the close
+# one's header, so about the file.  800 files of 100 KiB is ~80 MiB of entries
+# and 1600 of 48 KiB is ~77 MiB, each comfortably past the 64 MiB total.
+BIG_N=800;   BIG_KB=100
+SMALL_N=1600; SMALL_KB=48
 for i in $(seq 1 $BIG_N);   do head -c $((BIG_KB*1024))   /dev/zero | tr '\0' 'b' > "$BIG/b$i.bin"; done
 for i in $(seq 1 $SMALL_N); do head -c $((SMALL_KB*1024)) /dev/zero | tr '\0' 's' > "$SMALL/s$i.bin"; done
 
