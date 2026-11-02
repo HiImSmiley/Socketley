@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <utility>
 
+#include "../../shared/util/spare_buffers.h"
 #include "../../shared/http/conditional.h"
 #include "../../shared/http/encoding.h"
 #include "../../shared/http/fastcgi.h"
@@ -745,7 +746,8 @@ void proxy_instance::fcgi_file_next(proxy_client_connection* conn, bool inline_c
     if (held >= write_watermark_bytes())
         return;
     const auto n = static_cast<uint32_t>(std::min<uint64_t>(f.left, file_window));
-    // Sized without being cleared: the read writes every byte that is sent.
+    // Sized without being cleared, the read writing every byte that is sent, and in a kept buffer when one fits.
+    socketley::spare::take(f.buf, n);
     f.buf.resize_and_overwrite(n, [](char*, size_t len) { return len; });
     f.reading = true;
     std::shared_ptr<fcgi_file> keep = conn->file;
@@ -789,7 +791,12 @@ void proxy_instance::fcgi_file_read(int fd, uint32_t gen, const std::shared_ptr<
         conn->write_queue.push(socketley::write_chunk(std::move(body)));
     }
     else
-        conn->write_queue.push(std::move(f->buf));
+    {
+        // In a buffer that is kept once the write is done with it, for the next window.
+        auto piece = socketley::spare::buffer();
+        piece->swap(f->buf);
+        conn->write_queue.push(socketley::write_chunk(std::shared_ptr<const std::string>(std::move(piece))));
+    }
     f->buf = std::string();
     if (!conn->write_pending && !flush_client_write_queue(conn))
     {
