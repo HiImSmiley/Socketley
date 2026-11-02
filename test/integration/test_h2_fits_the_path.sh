@@ -34,6 +34,8 @@ ip link set lo up
 command -v tc >/dev/null 2>&1 && tc qdisc add dev lo root netem delay 0ms 2>/dev/null \
     || { echo "  SKIP: no netem here"; exit 0; }
 curl -V 2>/dev/null | grep -qi nghttp2 || { echo "  SKIP: this curl has no HTTP/2"; exit 0; }
+sanitized=0
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate h2path
 T=$SOCKETLEY_TMPD
 P=$((SL_PORT_BASE + 1995))
@@ -80,7 +82,9 @@ echo "  unsent at most: ${lan} bytes on loopback, ${wan} with a 4 ms round trip"
 if [ "$wan" -le $((512 << 10)) ]; then ok
 else bad "over a round trip the kernel holds little of what is framed" "$wan bytes unsent, past 512 KiB"; fi
 # Held short, it stays near the 16 KiB low-water mark (45-65 KB measured); left whole it was 650 KB to 2.5 MB.
-if [ "$lan" -ge $((256 << 10)) ]; then ok
+# How fast the buffer fills is how fast the entrance writes, which a sanitizer beside a loaded suite slows below it.
+if [ "$sanitized" = 1 ]; then echo "  SKIP [loopback]: how fast the buffer fills measures the sanitizer"
+elif [ "$lan" -ge $((256 << 10)) ]; then ok
 else bad "and on loopback the buffer is left whole, which would otherwise cap the rate" "only $lan bytes unsent"; fi
 
 echo
