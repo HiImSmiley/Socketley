@@ -16585,11 +16585,10 @@ A callback stopped at its deadline has still held the loop for that long, so a
 CLI command issued during the stall can hit its own five second receive timeout
 and report the daemon unreachable; it succeeds on the retry. A runaway
 .B on_tick
-is stopped on every tick rather than once. And
-.BR getaddrinfo (3),
-inside
-.BR socketley.http ,
-executes no VM instructions and is not interrupted.
+is stopped on every tick rather than once. And name resolution inside
+.B socketley.http
+executes no VM instructions: it is not interrupted, it is given up on at the
+call's deadline.
 .SS Proxy Filter Chain
 Proxy only, HTTP mode only.
 .B filters
@@ -20379,8 +20378,9 @@ bounded by something \(em a client and a server re-resolve at most once per
 second of reconnect backoff, a proxy once per thirty-second sweep, the rest run
 once at start.
 .B socketley.http()
-was the exception: it resolved on every call, and neither the call's own
-deadline nor the callback budget covers a resolver.
+was the exception: it resolved on every call. It now asks on a thread of its
+own and gives up at the call's deadline, so a resolver that does not answer
+costs a call its timeout rather than the loop every retry the resolver makes.
 .TP
 .B SOCKETLEY_RAFT_TICK_MS
 The Raft tick of a daemon started with

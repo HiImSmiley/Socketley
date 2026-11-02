@@ -76,7 +76,13 @@ void lua_diag::report_raise(const sol::protected_function_result& r, std::string
 #include <unistd.h>
 #include <cerrno>
 #include <charconv>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <system_error>
+#include <thread>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -998,11 +1004,88 @@ void lua_context::update_self_state(const char* state_str)
 // ---------------------------------------------------------------------------
 // socketley.http is a synchronous client that verifies the chain and the host
 // name, still blocks the event-loop thread, and is bounded by one deadline
-// clamped to what is left of the callback's budget -- with getaddrinfo() the
-// residual neither bound reaches.
+// clamped to what is left of the callback's budget, name resolution included.
 // ---------------------------------------------------------------------------
 
 using http_clock = std::chrono::steady_clock;
+
+// The first address of host:port, asked on a thread of its own and waited for until `deadline`: getaddrinfo() has no
+// bound of its own, and a resolver that does not answer held the loop through its every retry. The thread finishes on
+// its own when the wait gave up, into state it shares, so nothing is left pointing at this frame.
+static bool resolve_within(const std::string& host, const char* port, http_clock::time_point deadline,
+                           socketley::resolve_cache::entry& out, std::string& why)
+{
+    struct state
+    {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done{false};
+        int rc{EAI_FAIL};
+        socketley::resolve_cache::entry peer{};
+        bool fits{true};
+    };
+    // Threads left behind by lookups that were given up on, capped so a script calling a dead resolver in a loop
+    // cannot pile them up.
+    static std::atomic<int> outstanding{0};
+    if (outstanding.fetch_add(1, std::memory_order_relaxed) >= 8)
+    {
+        outstanding.fetch_sub(1, std::memory_order_relaxed);
+        why = "DNS resolution failed for: " + host + " (eight lookups already waiting on the resolver)";
+        return false;
+    }
+    auto st = std::make_shared<state>();
+    try
+    {
+        std::thread([st, host, port = std::string(port)] {
+            struct addrinfo hints{}, *addrs = nullptr;
+            hints.ai_family   = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            const int rc = getaddrinfo(host.c_str(), port.c_str(), &hints, &addrs);
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->rc = rc == 0 && !addrs ? EAI_FAIL : rc;
+            // The first entry, its length checked before the copy, since it decides how much is written.
+            if (rc == 0 && addrs)
+            {
+                st->fits = addrs->ai_addrlen <= sizeof(st->peer.addr);
+                if (st->fits)
+                {
+                    std::memcpy(&st->peer.addr, addrs->ai_addr, addrs->ai_addrlen);
+                    st->peer.len    = addrs->ai_addrlen;
+                    st->peer.family = addrs->ai_family;
+                }
+            }
+            if (addrs)
+                freeaddrinfo(addrs);
+            st->done = true;
+            st->cv.notify_one();
+            outstanding.fetch_sub(1, std::memory_order_relaxed);
+        }).detach();
+    }
+    catch (const std::system_error&)
+    {
+        outstanding.fetch_sub(1, std::memory_order_relaxed);
+        why = "DNS resolution failed for: " + host + " (no thread to ask on)";
+        return false;
+    }
+    std::unique_lock<std::mutex> lk(st->mu);
+    if (!st->cv.wait_until(lk, deadline, [&] { return st->done; }))
+    {
+        why = "DNS resolution for " + host + " took longer than the request's deadline";
+        return false;
+    }
+    if (st->rc != 0)
+    {
+        why = "DNS resolution failed for: " + host;
+        return false;
+    }
+    if (!st->fits)
+    {
+        why = "DNS returned an address too large for: " + host;
+        return false;
+    }
+    out = st->peer;
+    return true;
+}
 
 
 // How long a resolved address is reused before asking again.  A ceiling and
@@ -1293,26 +1376,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     socketley::resolve_cache::entry peer;
     if (!reuse || !dns_cache.get(dns_key, peer))
     {
-        struct addrinfo hints{}, *addrs = nullptr;
-        hints.ai_family   = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs) {
-            result["error"] = "DNS resolution failed for: " + host;
-            return result;
-        }
-        // The first entry and nothing else, which is all this function has
-        // ever used out of the list -- and the length is checked before the
-        // copy rather than trusted, since it decides how much is written.
-        const bool fits = addrs->ai_addrlen <= sizeof(peer.addr);
-        if (fits)
-        {
-            std::memcpy(&peer.addr, addrs->ai_addr, addrs->ai_addrlen);
-            peer.len    = addrs->ai_addrlen;
-            peer.family = addrs->ai_family;
-        }
-        freeaddrinfo(addrs);
-        if (!fits) {
-            result["error"] = "DNS returned an address too large for: " + host;
+        std::string why;
+        if (!resolve_within(host, port_buf, deadline, peer, why)) {
+            result["error"] = why;
             return result;
         }
         if (reuse)
