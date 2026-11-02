@@ -132,17 +132,12 @@ void enqueue(session<S>& s, stream& st)
 }
 
 // The flood counters start again every ten seconds.
-// On a path with a round trip, frames wait in the session, where a stream that opens later goes ahead of them, and not
-// in the kernel's buffer behind them, which over a WAN holds most of a second of the link; on a LAN that buffer
-// drains as fast as it fills, and holding it short would only cap the rate.
+// A session on a path with a round trip holds its frames itself, where a stream that opens later goes ahead of them.
 template <class S>
 void fit_to_path(session<S>& s, int fd)
 {
-    if (socket_tuning::rtt_us(fd) < 1000)
-        return;
-    const int lowat = 16 * 1024;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat)) < 0) {}
-    s.out_high = 256 * 1024;
+    if (socket_tuning::fit_to_path(fd))
+        s.out_high = 256 * 1024;
 }
 
 template <class S>

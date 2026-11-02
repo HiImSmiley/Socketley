@@ -173,6 +173,8 @@ private:
     void ws_handshake(conn& c);
     void ws_frames(conn& c);
     void raw_out(conn& c, std::string_view bytes);
+    // Bytes already framed, sent ahead of what is queued on a fitted clear connection.
+    void urgent_out(conn& c, std::string_view framed);
     // Bytes of the connection's own at the end of what it owes.
     static void queue_owned(conn& c, std::string_view bytes);
     // What OpenSSL has encrypted, moved to the end of what the connection owes.

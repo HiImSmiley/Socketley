@@ -66,6 +66,18 @@ inline uint32_t rtt_us(int fd)
     return getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &n) == 0 ? ti.tcpi_rtt : 0;
 }
 
+// On a path with a round trip, what a connection has framed waits in its own queue, where a frame made later may go
+// ahead of it, and not in the kernel's buffer behind it; on a LAN that buffer drains as fast as it fills, and holding
+// it short would only cap the rate. True where it was held short, which is when the caller bounds its writes too.
+inline bool fit_to_path(int fd)
+{
+    if (rtt_us(fd) < 1000)
+        return false;
+    const int lowat = 16 * 1024;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat)) < 0) {}
+    return true;
+}
+
 // The congestion control a listener's accepted sockets run, which they take from it as they take the options above:
 // 0, or the errno the kernel refused it with -- EPERM for one not in net.ipv4.tcp_allowed_congestion_control to a
 // process without CAP_NET_ADMIN, ENOENT for one this kernel does not have.

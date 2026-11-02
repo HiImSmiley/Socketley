@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <queue>
+#include <deque>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -388,20 +388,28 @@ public:
     void push(const T& value)
     {
         m_bytes += write_queue_size_of(value);
-        m_queue.push(value);
+        m_queue.push_back(value);
     }
 
     void push(T&& value)
     {
         m_bytes += write_queue_size_of(value);
-        m_queue.push(std::move(value));
+        m_queue.push_back(std::move(value));
     }
 
     template <typename... Args>
     void emplace(Args&&... args)
     {
-        m_queue.emplace(std::forward<Args>(args)...);
+        m_queue.emplace_back(std::forward<Args>(args)...);
         m_bytes += write_queue_size_of(m_queue.back());
+    }
+
+    // An entry ahead of every other, for a queue whose writer takes out what it sends, so nothing at the front is
+    // in flight: a frame that answers the peer -- a PONG -- then waits behind one write and not behind the backlog.
+    void push_front(T value)
+    {
+        m_bytes += write_queue_size_of(value);
+        m_queue.push_front(std::move(value));
     }
 
     void pop()
@@ -409,7 +417,7 @@ public:
         if (m_queue.empty())
             return;
         charge_back(write_queue_size_of(m_queue.front()));
-        m_queue.pop();
+        m_queue.pop_front();
     }
 
     // Hand the front entry to the caller and drop it, accounting for its size
@@ -418,14 +426,14 @@ public:
     {
         const size_t n = write_queue_size_of(m_queue.front());
         T value = std::move(m_queue.front());
-        m_queue.pop();
+        m_queue.pop_front();
         charge_back(n);
         return value;
     }
 
     void clear()
     {
-        m_queue = std::queue<T>{};
+        m_queue.clear();
         m_bytes = 0;
     }
 
@@ -455,7 +463,7 @@ private:
         m_bytes = (m_bytes >= n) ? m_bytes - n : 0;
     }
 
-    std::queue<T> m_queue;
+    std::deque<T> m_queue;
     size_t        m_bytes{0};
 };
 

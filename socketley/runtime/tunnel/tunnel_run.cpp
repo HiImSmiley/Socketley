@@ -195,13 +195,8 @@ struct upstream_conn : http::server_conn
 link::link(tunnel_run& r, kind kd, std::string w, const std::shared_ptr<http::server_conn>& t)
     : run(r), k(kd), who(std::move(w)), s(kd == kind::edge, *this), transport(t), last_heard(wall::now_sec())
 {
-    // On a LAN the kernel's buffer drains as fast as it fills, and holding it short would only cap the rate.
-    if (t && t->fd >= 0 && socket_tuning::rtt_us(t->fd) >= 1000)
-    {
-        const int lowat = 16 * 1024;
-        if (::setsockopt(t->fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof lowat) < 0) {}
+    if (t && t->fd >= 0 && socket_tuning::fit_to_path(t->fd))
         out_high = 256 * 1024;
-    }
 }
 
 std::shared_ptr<leg> link::leg_of(uint32_t stream)

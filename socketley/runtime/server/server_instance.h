@@ -322,6 +322,10 @@ struct alignas(64) server_connection
     // WebSocket fragment reassembly (zero-alloc, in-place compaction in partial)
     size_t ws_frag_len{0};
     uint8_t ws_frag_opcode{0};
+    // A websocket on a path with a round trip (socket_tuning::fit_to_path): a write takes at most FITTED_BATCH, so a
+    // PONG put at the front of the queue waits behind no more.
+    bool fitted{false};
+    static constexpr size_t FITTED_BATCH = 64 * 1024;
 
     // Idle connection tracking
     std::chrono::steady_clock::time_point last_activity{};
@@ -468,6 +472,7 @@ struct alignas(64) server_connection
         cache_pending = 0;
         ws_frag_len = 0;
         ws_frag_opcode = 0;
+        fitted = false;
         pipe_peer_fd = -1;
         // A slot comes back from the pool for a new peer, and a clock left
         // running belongs to the last one -- which would drop the new peer

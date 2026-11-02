@@ -4616,6 +4616,7 @@ reparse:
                     flush_write_queue(conn);
 
                 conn->proto = proto_ws;
+                conn->fitted = socket_tuning::fit_to_path(conn->fd);
                 invoke_on_websocket(conn->fd);
                 conn->partial.erase(0, hdr_end + 4);
             }
@@ -4678,8 +4679,10 @@ reparse:
                     std::string pong;
                     pong.reserve(4 + payload.size());
                     ws_frame_pong_into(pong, payload);
-                    conn->write_queue.push_coalesced(std::move(pong),
-                        server_connection::WRITE_COALESCE_LIMIT);
+                    // Ahead of the frames queued for this peer, which RFC 6455 5.4 allows a control frame, so a
+                    // keepalive is answered behind what is in flight and not behind a backlog.  A Close is not:
+                    // after it no data frame may follow, and the queued ones would.
+                    conn->write_queue.push_front(std::move(pong));
                     if (!conn->write_pending)
                         flush_write_queue(conn);
                 }
@@ -6669,10 +6672,13 @@ void server_instance::flush_write_queue(server_connection* conn)
     if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty()))
         return;
 
-    // Coalesce up to MAX_WRITE_BATCH messages into a single writev
+    // Coalesce up to MAX_WRITE_BATCH messages into a single writev, and on a fitted websocket no more than a batch.
     uint32_t count = 0;
-    while (!conn->write_queue.empty() && count < server_connection::MAX_WRITE_BATCH)
+    size_t took = 0;
+    while (!conn->write_queue.empty() && count < server_connection::MAX_WRITE_BATCH &&
+           (!conn->fitted || count == 0 || took < server_connection::FITTED_BATCH))
     {
+        took += conn->write_queue.front().size();
         conn->write_batch[count] = conn->write_queue.take_front();
 
         conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count].data());

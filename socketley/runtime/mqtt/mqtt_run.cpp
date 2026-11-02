@@ -401,13 +401,7 @@ void mqtt_run::accept_done(listener& l, struct io_uring_cqe* cqe)
             if (::getpeername(fd, reinterpret_cast<sockaddr*>(&c->peer), &len) < 0) {}
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-            // On a LAN the kernel's buffer drains as fast as it fills, and holding it short would only cap the rate.
-            if (socket_tuning::rtt_us(fd) >= 1000)
-            {
-                const int lowat = 16 * 1024;
-                if (::setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof lowat) < 0) {}
-                c->fitted = true;
-            }
+            c->fitted = socket_tuning::fit_to_path(fd);
             c->ws = l.ws;
             c->closing_ms = now_ms();
             if (m_tls)
@@ -718,7 +712,11 @@ void mqtt_run::ws_frames(conn& c)
             {
                 std::string pong;
                 ws_frame_pong_into(pong, std::string_view(f.payload_ptr, f.payload_len));
-                raw_out(c, pong);
+                // Ahead of the queued frames where they can be overtaken, which RFC 6455 5.4 allows a control frame.
+                if (c.fitted && !c.ssl)
+                    urgent_out(c, pong);
+                else
+                    raw_out(c, pong);
                 break;
             }
             case WS_OP_CLOSE:
@@ -774,13 +772,21 @@ void mqtt_run::send_control(uint64_t id, std::string_view bytes)
         send(id, bytes);
         return;
     }
-    const size_t before = c->urgent.size();
     if (c->ws)
-        ws_frame_binary_into(c->urgent, bytes);
+    {
+        std::string frame;
+        ws_frame_binary_into(frame, bytes);
+        urgent_out(*c, frame);
+    }
     else
-        c->urgent.append(bytes);
-    c->owed += c->urgent.size() - before;
-    flush(*c);
+        urgent_out(*c, bytes);
+}
+
+void mqtt_run::urgent_out(conn& c, std::string_view framed)
+{
+    c.urgent.append(framed);
+    c.owed += framed.size();
+    flush(c);
 }
 
 void mqtt_run::raw_out(conn& c, std::string_view bytes)
