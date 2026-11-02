@@ -2544,8 +2544,7 @@ bool server_instance::setup(event_loop& loop)
         // it: what overruns the receive buffer is gone silently.  Measured on
         // the burst a runtime inside one callback cannot drain -- 221 hundred-
         // byte datagrams survived on the kernel default, 2,184 on this.
-        int udp_rcvbuf = 1024 * 1024;
-        setsockopt(m_udp_fd, SOL_SOCKET, SO_RCVBUF, &udp_rcvbuf, sizeof(udp_rcvbuf));
+        socket_tuning::datagram_buffers(m_udp_fd, 1024 * 1024, 0);
 
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;

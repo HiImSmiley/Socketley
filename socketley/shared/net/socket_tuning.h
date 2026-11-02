@@ -1,11 +1,13 @@
 #pragma once
-// Keepalive as this tree tunes it, in one place because a peer that loses power
-// sends nothing and every listener owes the same answer to that.
+// Socket options as this tree tunes them, in one place because every listener owes a peer the same.
 #include <cerrno>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <string>
 #include <string_view>
 #include <sys/socket.h>
+
+#include "../util/logging.h"
 
 namespace socket_tuning {
 
@@ -56,6 +58,28 @@ inline void tcp_listener_defaults(int fd, int rcvbuf, int sndbuf)
         if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {}
     if (sndbuf > 0)
         if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {}
+}
+
+// A datagram socket's buffers, which have no window behind them: what overruns one is lost, so they are forced past
+// net.core.rmem_max and wmem_max where this process may, and a receive buffer those cap is said once a process.
+inline void datagram_buffers(int fd, int rcvbuf, int sndbuf)
+{
+    if (rcvbuf > 0 && setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf)) < 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {}
+    if (sndbuf > 0 && setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) < 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {}
+    // The kernel doubles what it grants, for its own bookkeeping.
+    int got = 0;
+    socklen_t n = sizeof(got);
+    static bool said = false;
+    if (rcvbuf > 0 && !said && getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &n) == 0 && got / 2 < rcvbuf)
+    {
+        said = true;
+        LOG_WARN(("a datagram socket's receive buffer is " + std::to_string(got / 2 / 1024) + " KiB of the " +
+                  std::to_string(rcvbuf / 1024) + " KiB asked, and a burst past it is lost; sysctl net.core.rmem_max=" +
+                  std::to_string(rcvbuf) + " gives it all")
+                     .c_str());
+    }
 }
 
 // The round trip the kernel has measured on a connection, in microseconds, 0 before it has one.

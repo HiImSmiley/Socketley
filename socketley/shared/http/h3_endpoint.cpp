@@ -33,6 +33,7 @@
 #include <openssl/ssl.h>
 
 #include "../loop/event_loop.h"
+#include "../net/socket_tuning.h"
 #include "../util/logging.h"
 #include "../crypto/tls_context.h"
 #include "../util/number_parse.h"
@@ -341,9 +342,7 @@ bool endpoint::open(uint16_t port, uint16_t advertise, uint32_t shard, uint32_t 
     // stream of them needs.
     setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof one);
     setsockopt(fd, IPPROTO_UDP, UDP_GRO, &one, sizeof one);
-    int buf = 4 << 20;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
+    socket_tuning::datagram_buffers(fd, 4 << 20, 4 << 20);
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = INADDR_ANY;
@@ -387,8 +386,8 @@ bool endpoint::open(uint16_t port, uint16_t advertise, uint32_t shard, uint32_t 
         }
         else if (inbox >= 0)
         {
-            int sz = 4 << 20, on = 1;
-            setsockopt(this->inbox, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+            int on = 1;
+            socket_tuning::datagram_buffers(this->inbox, 4 << 20, 0);
             setsockopt(this->inbox, SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
         }
     }

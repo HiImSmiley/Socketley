@@ -1,6 +1,7 @@
 #include "dns_instance.h"
 #include "dns_answer.h"
 #include "dns_sign.h"
+#include "../../shared/net/socket_tuning.h"
 #include "dns_wire.h"
 #include "dns_zone.h"
 
@@ -557,15 +558,8 @@ bool dns_run::open_udp(int family, uint16_t port, uint32_t bind4)
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     // Every shard binds the port; the kernel spreads the datagrams over them by their addresses.
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
-    // A burst of queries waits in the socket while a batch is answered, and is dropped once the buffer is full; the
-    // kernel's default holds a few hundred, so it is raised to what net.core.rmem_max allows, forced past it where
-    // this process may.
-    for (const int opt : {SO_RCVBUF, SO_SNDBUF})
-    {
-        const int want = udp_sock_buf;
-        if (::setsockopt(fd, SOL_SOCKET, opt == SO_RCVBUF ? SO_RCVBUFFORCE : SO_SNDBUFFORCE, &want, sizeof want) < 0 &&
-            ::setsockopt(fd, SOL_SOCKET, opt, &want, sizeof want) < 0) {}
-    }
+    // A burst of queries waits in the socket while a batch is answered, and the kernel's default holds a few hundred.
+    socket_tuning::datagram_buffers(fd, udp_sock_buf, udp_sock_buf);
     bool pktinfo = false;
     int rc = -1;
     if (family == AF_INET)
