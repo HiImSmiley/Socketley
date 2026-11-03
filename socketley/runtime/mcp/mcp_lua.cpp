@@ -67,9 +67,11 @@ bool schema_of(const sol::object& o, bool object, std::string& out, std::string&
 
 sol::table caller_table(sol::state_view L, const caller& who)
 {
-    sol::table t = L.create_table(0, 2);
+    sol::table t = L.create_table(0, 3);
     t["name"] = who.name;
     t["admin"] = who.admin;
+    if (!who.sub.empty())
+        t["sub"] = who.sub;
     return t;
 }
 

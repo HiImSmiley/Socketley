@@ -55,6 +55,8 @@ struct caller
 {
     std::string name;
     bool admin{false};
+    // The account's id, which never changes, for one signed in through --idp; empty for a key.
+    std::string sub;
 };
 
 // A tool's answer: a JSON array of content blocks, a JSON value of structured output or empty, and whether the tool

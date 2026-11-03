@@ -201,11 +201,11 @@ TEST_CASE("a tool for administrators is shown to and called by an administrator 
 {
     fake b;
     const std::string call = R"({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"stop",)" + meta + "}}";
-    CHECK(error_code(handle(b, info, modern("tools/call", "stop"), call, caller{"ops", false})) == -32602);
-    CHECK(handle(b, info, modern("tools/call", "stop"), call, caller{"root", true}).status == 200);
+    CHECK(error_code(handle(b, info, modern("tools/call", "stop"), call, caller{"ops", false, {}})) == -32602);
+    CHECK(handle(b, info, modern("tools/call", "stop"), call, caller{"root", true, {}}).status == 200);
     const js::jvalue v = parsed(handle(b, info, modern("tools/list"),
                                        R"({"jsonrpc":"2.0","id":8,"method":"tools/list","params":{)" + meta + "}}",
-                                       caller{"root", true}));
+                                       caller{"root", true, {}}));
     CHECK(js::member(result_of(v), "tools")->items.size() == 3);
 }
 

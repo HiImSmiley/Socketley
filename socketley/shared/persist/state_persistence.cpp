@@ -722,6 +722,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.idp_clients = std::string(ip->get_clients());
             cfg.idp_issuer = std::string(ip->get_issuer_flag());
             cfg.idp_cookie_domain = std::string(ip->get_cookie_domain());
+            cfg.idp_resources = std::string(ip->get_resources());
             cfg.idp_ssh_ca_hours = ip->get_ssh_ca_hours();
             break;
         }
@@ -762,6 +763,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mcp_origins = std::string(mc->get_origins());
             cfg.mcp_tools = std::string(mc->get_tools());
             cfg.mcp_instructions = std::string(mc->get_instructions());
+            cfg.mcp_idp = std::string(mc->get_idp());
+            cfg.mcp_idp_audience = std::string(mc->get_idp_audience());
             break;
         }
         case runtime_metrics:
@@ -1243,6 +1246,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("issuer", cfg.idp_issuer);
             if (!cfg.idp_cookie_domain.empty())
                 append_str_field("cookie_domain", cfg.idp_cookie_domain);
+            if (!cfg.idp_resources.empty())
+                append_str_field("resources", cfg.idp_resources);
             if (cfg.idp_ssh_ca_hours)
                 append_int_field("ssh_ca", cfg.idp_ssh_ca_hours);
             break;
@@ -1293,6 +1298,10 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_str_field("tools", cfg.mcp_tools);
             if (!cfg.mcp_instructions.empty())
                 append_str_field("instructions", cfg.mcp_instructions);
+            if (!cfg.mcp_idp.empty())
+                append_str_field("idp", cfg.mcp_idp);
+            if (!cfg.mcp_idp_audience.empty())
+                append_str_field("idp_audience", cfg.mcp_idp_audience);
             break;
         case runtime_metrics:
             if (!cfg.metrics_keys.empty())
@@ -1651,6 +1660,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.idp_clients = json_get_string(json, "clients");
             cfg.idp_issuer = json_get_string(json, "issuer");
             cfg.idp_cookie_domain = json_get_string(json, "cookie_domain");
+            cfg.idp_resources = json_get_string(json, "resources");
             cfg.idp_ssh_ca_hours = json_get_uint32(json, "ssh_ca");
             break;
         case runtime_tunnel:
@@ -1684,6 +1694,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             if (cfg.mcp_tools.empty())
                 cfg.mcp_tools = "none";
             cfg.mcp_instructions = json_get_string(json, "instructions");
+            cfg.mcp_idp = json_get_string(json, "idp");
+            cfg.mcp_idp_audience = json_get_string(json, "idp_audience");
             break;
         case runtime_metrics:
             cfg.metrics_keys = json_get_string(json, "keys");

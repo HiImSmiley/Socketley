@@ -27,6 +27,8 @@ struct code_entry
     // When the code was given, in milliseconds, for a sign-out everywhere since.
     int64_t issued_ms{0};
     int64_t expires{0};
+    // The resource server its access token is for, empty for the client itself.
+    std::string resource;
 };
 
 // A device grant (RFC 8628) waiting for its person, kept by the shard its user code names.

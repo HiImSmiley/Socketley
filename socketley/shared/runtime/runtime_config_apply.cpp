@@ -168,6 +168,8 @@ void apply_idp_config(idp_instance& ip, const runtime_config& cfg, bool by_prese
         ip.set_issuer(cfg.idp_issuer);
     if (asked("cookie_domain", !cfg.idp_cookie_domain.empty()))
         ip.set_cookie_domain(cfg.idp_cookie_domain);
+    if (asked("resources", !cfg.idp_resources.empty()))
+        ip.set_resources(cfg.idp_resources);
     if (asked("ssh_ca", cfg.idp_ssh_ca_hours != 0))
         ip.set_ssh_ca_hours(cfg.idp_ssh_ca_hours);
 }
@@ -249,6 +251,10 @@ void apply_mcp_config(mcp_instance& mc, const runtime_config& cfg, bool by_prese
         mc.set_tools(cfg.mcp_tools);
     if (asked("instructions", !cfg.mcp_instructions.empty()))
         mc.set_instructions(cfg.mcp_instructions);
+    if (asked("idp", !cfg.mcp_idp.empty()))
+        mc.set_idp(cfg.mcp_idp);
+    if (asked("idp_audience", !cfg.mcp_idp_audience.empty()))
+        mc.set_idp_audience(cfg.mcp_idp_audience);
 }
 
 void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence)

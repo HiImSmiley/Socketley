@@ -56,6 +56,104 @@ TEST_CASE("a clients file is read whole or not at all")
     CHECK_FALSE(parse_clients("we/ird s https://a.example/cb\n", c, why));
 }
 
+TEST_CASE("a loopback redirect is taken at any port, and nothing that only reads like this machine is")
+{
+    client c;
+    c.redirects = {"http://localhost/callback", "http://127.0.0.1/callback", "https://app.example.com/cb"};
+    CHECK(c.allows("http://localhost/callback"));
+    CHECK(c.allows("http://localhost:53682/callback"));
+    CHECK(c.allows("http://127.0.0.1:8080/callback"));
+    CHECK_FALSE(c.allows("http://localhost:53682/other"));
+    CHECK_FALSE(c.allows("http://localhost.evil.example/callback"));
+    CHECK_FALSE(c.allows("http://localhost:/callback"));
+    CHECK_FALSE(c.allows("http://[::1]:9/callback"));
+    CHECK_FALSE(c.allows("https://app.example.com:8443/cb"));
+    CHECK_FALSE(c.allows("https://localhost/callback"));
+}
+
+TEST_CASE("a client named by its metadata document's address is one with a path and nothing that hides another")
+{
+    CHECK(metadata_client_id("https://claude.ai/oauth/claude-code-client-metadata"));
+    CHECK(metadata_client_id("https://app.example.com:8443/client.json"));
+    CHECK_FALSE(metadata_client_id("http://app.example.com/client.json"));
+    CHECK_FALSE(metadata_client_id("https://app.example.com"));
+    CHECK_FALSE(metadata_client_id("https://app.example.com/"));
+    CHECK_FALSE(metadata_client_id("https://app.example.com/client.json?x=1"));
+    CHECK_FALSE(metadata_client_id("https://app.example.com/client.json#x"));
+    CHECK_FALSE(metadata_client_id("https://app.example.com/a/../client.json"));
+    CHECK_FALSE(metadata_client_id("https://app.example.com/./client.json"));
+    CHECK_FALSE(metadata_client_id("https://user@app.example.com/client.json"));
+    CHECK_FALSE(metadata_client_id("https://app.example.com/client json"));
+    CHECK_FALSE(metadata_client_id("wiki"));
+}
+
+TEST_CASE("a metadata document is taken for its own address alone, as a public client with safe redirects")
+{
+    // Claude Code's own, as https://claude.ai/oauth/claude-code-client-metadata serves it.
+    const std::string_view url = "https://claude.ai/oauth/claude-code-client-metadata";
+    const std::string_view doc =
+        R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"Claude Code",)"
+        R"("client_uri":"https://claude.ai","redirect_uris":["http://localhost/callback","http://127.0.0.1/callback"],)"
+        R"("grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"})";
+    client c;
+    std::string why;
+    REQUIRE(parse_client_metadata(url, doc, c, why));
+    CHECK(c.id == url);
+    CHECK(c.name == "Claude Code");
+    CHECK(c.metadata);
+    CHECK(c.is_public());
+    CHECK_FALSE(c.device);
+    CHECK(c.allows("http://localhost:41234/callback"));
+    CHECK_FALSE(c.allows("https://claude.ai/callback"));
+
+    const auto refused = [&](std::string_view d) { return !parse_client_metadata(url, d, c, why); };
+    CHECK(refused(R"({"client_id":"https://evil.example/c","client_name":"x","redirect_uris":["https://evil.example/cb"]})"));
+    CHECK(refused(R"({"client_name":"x","redirect_uris":["https://a.example/cb"]})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","redirect_uris":["https://a.example/cb"]})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"x","redirect_uris":[]})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"x",)"
+                  R"("redirect_uris":["http://a.example/cb"]})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"x",)"
+                  R"("redirect_uris":["https://a.example/cb#f"]})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"x",)"
+                  R"("redirect_uris":["https://a.example/cb"],"token_endpoint_auth_method":"client_secret_basic"})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"x",)"
+                  R"("redirect_uris":["https://a.example/cb"],"token_endpoint_auth_methods_supported":["private_key_jwt"]})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"x",)"
+                  R"("redirect_uris":["https://a.example/cb"],"client_secret":"s"})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"x",)"
+                  R"("redirect_uris":["https://a.example/cb"],"grant_types":["client_credentials"]})"));
+    CHECK(refused(R"({"client_id":"https://claude.ai/oauth/claude-code-client-metadata","client_name":"a\nb",)"
+                  R"("redirect_uris":["https://a.example/cb"]})"));
+    CHECK(refused("[]"));
+    CHECK(refused("not json"));
+}
+
+TEST_CASE("a metadata document is kept as its Cache-Control says, within a minute and a day")
+{
+    CHECK(metadata_keep_secs("") == 300);
+    CHECK(metadata_keep_secs("public, max-age=3600") == 3600);
+    CHECK(metadata_keep_secs("Max-Age=5") == 60);
+    CHECK(metadata_keep_secs("max-age=31536000") == 86400);
+    CHECK(metadata_keep_secs("no-store") == 60);
+    CHECK(metadata_keep_secs("max-age=x") == 300);
+}
+
+TEST_CASE("a resource server is named as tokens name it, and nothing but an https address is one")
+{
+    CHECK(canonical_resource("https://mcp.example.com/mcp") == "https://mcp.example.com/mcp");
+    CHECK(canonical_resource("HTTPS://MCP.Example.COM/Mcp") == "https://mcp.example.com/Mcp");
+    CHECK(canonical_resource("https://mcp.example.com/") == "https://mcp.example.com");
+    CHECK(canonical_resource("https://mcp.example.com:8443") == "https://mcp.example.com:8443");
+    CHECK(canonical_resource("http://127.0.0.1:9600/mcp") == "http://127.0.0.1:9600/mcp");
+    CHECK(canonical_resource("http://mcp.example.com/mcp").empty());
+    CHECK(canonical_resource("https://mcp.example.com/mcp#f").empty());
+    CHECK(canonical_resource("https://mcp.example.com/mcp?a=1").empty());
+    CHECK(canonical_resource("https://u@mcp.example.com/mcp").empty());
+    CHECK(canonical_resource("mcp.example.com").empty());
+    CHECK(canonical_resource("").empty());
+}
+
 TEST_CASE("a form is decoded, and a pair that does not decode is left out")
 {
     const params p = parse_form("a=1&b=x+y&c=%2Fpath%3Fq&bad=%zz&&d");
@@ -486,7 +584,7 @@ TEST_CASE("the shards' questions and answers come back as they were sent")
     CHECK_FALSE(decode_call("not a call", d));
     CHECK_FALSE(decode_call(encode_call(c).substr(0, cross_marker.size() + 3), d));
 
-    code_entry e{"wiki", "http://x/cb", "sub", "n", "openid", "chal", 10, 10500, 20};
+    code_entry e{"wiki", "http://x/cb", "sub", "n", "openid", "chal", 10, 10500, 20, "https://mcp.example.com/mcp"};
     bool found = false;
     code_entry f;
     REQUIRE(decode_code(encode_code(&e), found, f));
@@ -495,6 +593,7 @@ TEST_CASE("the shards' questions and answers come back as they were sent")
     CHECK(f.challenge == "chal");
     CHECK(f.issued_ms == 10500);
     CHECK(f.expires == 20);
+    CHECK(f.resource == "https://mcp.example.com/mcp");
 
     device_entry de;
     de.sub = "sub";

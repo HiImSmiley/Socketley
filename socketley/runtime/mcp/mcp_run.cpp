@@ -78,6 +78,14 @@ bool mcp_run::start(std::string& why)
         }
     if (!m_owner.get_keys_path().empty() && !reload_keys(why))
         return false;
+    if (!m_owner.get_idp().empty())
+    {
+        m_resource = m_owner.resource();
+        const std::string_view more = m_owner.get_idp_audience();
+        m_idp.configure(m_owner.get_idp(), more.empty() ? m_resource : m_resource + "," + std::string(more));
+        m_metadata_url = resource_metadata_url();
+        m_metadata_path = m_metadata_url.substr(m_metadata_url.find('/', m_metadata_url.find("://") + 3));
+    }
     collect();
     if (!m_http.listen_tcp(m_owner.bind_in_addr(), m_owner.effective_port(), m_owner.get_shards() > 1, why))
         return false;
@@ -307,6 +315,49 @@ bool mcp_run::daemon_tool(const tool_def& t, const json::jvalue& args, const cal
     return text(name + (op == "start" ? " is starting" : " is stopping"));
 }
 
+bool mcp_run::authenticate(std::string_view a, caller& who)
+{
+    if (a.size() <= 7 || !(a.starts_with("Bearer ") || a.starts_with("bearer ")))
+        return false;
+    const std::string_view token = a.substr(7);
+    if (!m_owner.get_keys_path().empty())
+    {
+        std::string why;
+        if (!reload_keys(why) && why != m_keys_error)
+        {
+            LOG_WARN(("mcp " + std::string(m_owner.get_name()) + ": " + why + "; the keys read before stay").c_str());
+            m_keys_error = why;
+        }
+        if (const auto it = m_keys.find(std::string(token)); it != m_keys.end())
+        {
+            who = caller{it->second.name, it->second.admin, {}};
+            return true;
+        }
+    }
+    socketley::idp::session_verifier::who w;
+    if (!m_idp.enabled() || !m_idp.check_bearer(token, w))
+        return false;
+    who = caller{w.username, w.admin, w.sub};
+    return true;
+}
+
+std::string mcp_run::resource_metadata_url() const
+{
+    const size_t path = m_resource.find('/', m_resource.find("://") + 3);
+    return m_resource.substr(0, path) + "/.well-known/oauth-protected-resource" +
+           (path == std::string::npos ? std::string() : m_resource.substr(path));
+}
+
+std::string mcp_run::resource_metadata()
+{
+    const std::string issuer = m_idp.issuer();
+    if (issuer.empty())
+        return {};
+    return "{\"resource\":" + js::quote(m_resource) + ",\"authorization_servers\":[" + js::quote(issuer) +
+           "],\"scopes_supported\":[\"openid\",\"offline_access\"],\"bearer_methods_supported\":[\"header\"],"
+           "\"resource_name\":" + js::quote(m_owner.get_name()) + "}";
+}
+
 void mcp_run::answer(const std::shared_ptr<socketley::http::server_conn>& c, int status, std::string_view body,
                      std::string_view extra)
 {
@@ -365,10 +416,26 @@ void mcp_run::serve(const std::shared_ptr<socketley::http::server_conn>& c)
                                std::find(m_origins.begin(), m_origins.end(), origin) != m_origins.end();
         std::string cors;
         if (!origin.empty() && origin_ok)
-            cors = "Access-Control-Allow-Origin: " + (m_any_origin ? std::string("*") : origin) + "\r\nVary: Origin\r\n";
+            cors = "Access-Control-Allow-Origin: " + (m_any_origin ? std::string("*") : origin) +
+                   "\r\nAccess-Control-Expose-Headers: WWW-Authenticate\r\nVary: Origin\r\n";
         if (!origin_ok)
         {
             answer(c, 403, R"({"error":"this origin may not call the server"})");
+            continue;
+        }
+        // Where a client finds the idp it signs in at, asked before it has a token, at the address the revision
+        // has it look first and at the host's own.
+        if (m_idp.enabled() && (path == m_metadata_path || path == "/.well-known/oauth-protected-resource"))
+        {
+            if (method == "OPTIONS")
+                answer(c, 204, {}, "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET\r\n"
+                                   "Access-Control-Max-Age: 600\r\n");
+            else if (method != "GET" && method != "HEAD")
+                answer(c, 405, {}, "Allow: GET\r\n");
+            else if (const std::string doc = resource_metadata(); doc.empty())
+                answer(c, 503, R"({"error":"the idp's key is not known yet"})", "Retry-After: 1\r\n");
+            else
+                answer(c, 200, doc, "Access-Control-Allow-Origin: *\r\n");
             continue;
         }
         if (path != "/mcp" && path != "/")
@@ -390,25 +457,16 @@ void mcp_run::serve(const std::shared_ptr<socketley::http::server_conn>& c)
             continue;
         }
         caller who;
-        if (!m_owner.get_keys_path().empty())
+        if ((!m_owner.get_keys_path().empty() || m_idp.enabled()) && !authenticate(authorization, who))
         {
-            std::string why;
-            if (!reload_keys(why) && why != m_keys_error)
-            {
-                LOG_WARN(("mcp " + std::string(m_owner.get_name()) + ": " + why + "; the keys read before stay").c_str());
-                m_keys_error = why;
-            }
-            const std::string_view a = authorization;
-            const auto it = a.size() > 7 && (a.starts_with("Bearer ") || a.starts_with("bearer "))
-                                ? m_keys.find(std::string(a.substr(7)))
-                                : m_keys.end();
-            if (it == m_keys.end())
-            {
-                answer(c, 401, R"({"error":"a key of this server is asked for"})",
-                       cors + "WWW-Authenticate: Bearer realm=\"mcp\"\r\n");
-                continue;
-            }
-            who = caller{it->second.name, it->second.admin};
+            // A client that can sign in is told where, and which scopes to ask for (RFC 9728 5.1).
+            const std::string challenge =
+                m_idp.enabled()
+                    ? "WWW-Authenticate: Bearer resource_metadata=\"" + m_metadata_url + "\", scope=\"openid offline_access\"" +
+                          (authorization.empty() ? std::string() : ", error=\"invalid_token\"") + "\r\n"
+                    : std::string("WWW-Authenticate: Bearer realm=\"mcp\"\r\n");
+            answer(c, 401, R"({"error":"a key or a sign-in of this server is asked for"})", cors + challenge);
+            continue;
         }
         collect();
         const reply rep = handle(*this, m_info, h, body, who);

@@ -49,12 +49,210 @@ std::vector<std::string_view> words(std::string_view line)
 
 }   // namespace
 
+namespace
+{
+
+// A loopback http address with its port taken out, empty for any other address.
+std::string loopback_sans_port(std::string_view url)
+{
+    if (!url.starts_with("http://"))
+        return {};
+    std::string_view rest = url.substr(7);
+    std::string_view host;
+    for (const std::string_view h : {std::string_view("127.0.0.1"), std::string_view("localhost"), std::string_view("[::1]")})
+        if (rest.starts_with(h))
+            host = h;
+    if (host.empty())
+        return {};
+    rest.remove_prefix(host.size());
+    if (rest.starts_with(':'))
+    {
+        size_t i = 1;
+        while (i < rest.size() && std::isdigit(static_cast<unsigned char>(rest[i])))
+            ++i;
+        if (i == 1)
+            return {};
+        rest.remove_prefix(i);
+    }
+    // Only a path may follow, or "localhost.evil.example" would read as this machine.
+    if (!rest.empty() && rest.front() != '/')
+        return {};
+    return "http://" + std::string(host) + std::string(rest);
+}
+
+bool control_or_space(std::string_view s)
+{
+    return std::any_of(s.begin(), s.end(), [](char c) { return static_cast<unsigned char>(c) <= 0x20 || c == 0x7f; });
+}
+
+}   // namespace
+
 bool client::allows(std::string_view redirect) const
 {
+    const std::string loop = loopback_sans_port(redirect);
     for (const auto& r : redirects)
-        if (r == redirect)
+        if (r == redirect || (!loop.empty() && loopback_sans_port(r) == loop))
             return true;
     return false;
+}
+
+bool metadata_client_id(std::string_view id)
+{
+    if (id.size() > 2048 || !id.starts_with("https://") || control_or_space(id) || url_host(id).empty() ||
+        id.find_first_of("?#\\") != std::string_view::npos)
+        return false;
+    const size_t slash = id.find('/', 8);
+    if (slash == std::string_view::npos || slash + 1 == id.size())
+        return false;
+    for (std::string_view path = id.substr(slash + 1); !path.empty();)
+    {
+        const std::string_view seg = take_item(path, '/');
+        if (seg == "." || seg == "..")
+            return false;
+    }
+    return true;
+}
+
+bool parse_client_metadata(std::string_view url, std::string_view doc, client& out, std::string& why)
+{
+    using socketley::json::jvalue;
+    jvalue v;
+    if (!socketley::json::json_reader(doc).document(v) || v.k != jvalue::kind::object)
+    {
+        why = "the metadata document is no JSON object";
+        return false;
+    }
+    const auto strings = [](const jvalue& a, std::vector<std::string>& to) {
+        if (a.k != jvalue::kind::array)
+            return false;
+        for (const auto& i : a.items)
+        {
+            if (i.k != jvalue::kind::string)
+                return false;
+            to.push_back(i.s);
+        }
+        return true;
+    };
+    client c;
+    bool id_seen = false;
+    std::vector<std::string> redirects;
+    for (const auto& [k, m] : v.members)
+    {
+        std::vector<std::string> list;
+        if (k == "client_id")
+        {
+            if (m.k != jvalue::kind::string || m.s != url)
+            {
+                why = "the metadata document names another client id than its own address";
+                return false;
+            }
+            id_seen = true;
+        }
+        else if (k == "client_name")
+        {
+            if (m.k != jvalue::kind::string || m.s.empty() || m.s.size() > 200 ||
+                std::any_of(m.s.begin(), m.s.end(), [](char ch) { return static_cast<unsigned char>(ch) < 0x20 || ch == 0x7f; }))
+            {
+                why = "client_name is no name of up to 200 bytes";
+                return false;
+            }
+            c.name = m.s;
+        }
+        else if (k == "redirect_uris")
+        {
+            if (!strings(m, redirects) || redirects.empty() || redirects.size() > 16)
+            {
+                why = "redirect_uris is no list of one to sixteen addresses";
+                return false;
+            }
+        }
+        else if (k == "client_secret" || k == "client_secret_expires_at")
+        {
+            why = "a client known by its address has no secret";
+            return false;
+        }
+        else if (k == "token_endpoint_auth_method")
+        {
+            if (m.k != jvalue::kind::string || m.s != "none")
+            {
+                why = "token_endpoint_auth_method is none here, a public client proving itself by PKCE";
+                return false;
+            }
+        }
+        else if (k == "token_endpoint_auth_methods_supported")
+        {
+            if (!strings(m, list) || std::find(list.begin(), list.end(), "none") == list.end())
+            {
+                why = "token_endpoint_auth_methods_supported does not hold none, a public client proving itself by PKCE";
+                return false;
+            }
+        }
+        else if (k == "grant_types" || k == "response_types")
+        {
+            const std::string_view want = k == "grant_types" ? "authorization_code" : "code";
+            if (!strings(m, list) || std::find(list.begin(), list.end(), want) == list.end())
+            {
+                why = k + " does not hold " + std::string(want);
+                return false;
+            }
+        }
+    }
+    if (!id_seen || c.name.empty() || redirects.empty())
+    {
+        why = "the metadata document lacks client_id, client_name or redirect_uris";
+        return false;
+    }
+    for (const auto& r : redirects)
+    {
+        const bool local = !loopback_sans_port(r).empty();
+        if (control_or_space(r) || r.find('#') != std::string::npos || (!local && (!r.starts_with("https://") || url_host(r).empty())))
+        {
+            why = "the redirect \"" + r + "\" is no https address (http only on this machine) without a fragment";
+            return false;
+        }
+    }
+    c.id.assign(url);
+    c.redirects = std::move(redirects);
+    c.metadata = true;
+    out = std::move(c);
+    return true;
+}
+
+int64_t metadata_keep_secs(std::string_view cache_control)
+{
+    std::string cc;
+    for (const char ch : cache_control)
+        cc += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (cc.find("no-store") != std::string::npos || cc.find("no-cache") != std::string::npos)
+        return 60;
+    const size_t at = cc.find("max-age=");
+    if (at == std::string::npos)
+        return 300;
+    int64_t secs = 0;
+    const char* from = cc.data() + at + 8;
+    if (std::from_chars(from, cc.data() + cc.size(), secs).ec != std::errc{})
+        return 300;
+    return std::clamp<int64_t>(secs, 60, 86400);
+}
+
+std::string canonical_resource(std::string_view url)
+{
+    if (url.size() > 2048 || control_or_space(url) || url.find_first_of("?#\\") != std::string_view::npos)
+        return {};
+    const size_t scheme_end = url.find("://");
+    if (scheme_end == std::string_view::npos)
+        return {};
+    const size_t path_at = std::min(url.find('/', scheme_end + 3), url.size());
+    std::string out;
+    for (size_t i = 0; i < path_at; ++i)
+        out += static_cast<char>(std::tolower(static_cast<unsigned char>(url[i])));
+    const std::string host = url_host(out);
+    const bool local = host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+    if (host.empty() || !(out.starts_with("https://") || (out.starts_with("http://") && local)))
+        return {};
+    if (const std::string_view path = url.substr(path_at); path != "/")
+        out.append(path);
+    return out;
 }
 
 bool parse_clients(std::string_view text, std::vector<client>& out, std::string& why)

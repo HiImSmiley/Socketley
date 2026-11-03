@@ -19,6 +19,8 @@
 
 #include "idp_instance.h"
 #include "../../shared/http/http_framing.h"
+#include "../../shared/http/https_client.h"
+#include "../../shared/util/settings.h"
 #include "../../shared/crypto/ed25519.h"
 #include "../../shared/crypto/jws.h"
 #include "../../shared/crypto/ssh_cert.h"
@@ -218,7 +220,7 @@ std::string page(std::string_view title, std::string_view body)
 
 // The parameters an authorize request carries through the sign-in form, and nothing else.
 constexpr std::string_view carried[] = {"client_id", "redirect_uri", "response_type", "scope", "state", "nonce",
-                                        "code_challenge", "code_challenge_method", "rd"};
+                                        "code_challenge", "code_challenge_method", "resource", "rd"};
 
 // One scrypt holds 16 MiB and a thread makes up to four at once, so four threads are sixteen at most, shared out
 // among the shards.
@@ -244,6 +246,7 @@ idp_run::~idp_run()
     *m_alive = false;
     m_hash.stop();
     m_standing_pool.stop();
+    m_fetch_pool.stop();
     m_loop.deregister_owner(this);
     if (m_key)
         EVP_PKEY_free(m_key);
@@ -330,6 +333,11 @@ bool idp_run::start(std::string& why)
     if (!m_hash.attach(m_io))
         m_hash.stop();
     m_standing_attached = !m_reader && m_standing_pool.attach(m_io);
+    for (std::string_view rest = m_owner.get_resources(); !rest.empty();)
+        if (const std::string r = canonical_resource(socketley::take_item(rest, ',')); !r.empty())
+            m_resources.push_back(r);
+    // Only a provider that gives tokens for a resource server takes applications known by their address.
+    m_fetch_attached = !m_resources.empty() && m_fetch_pool.attach(m_io);
 
     if (!m_http.listen_tcp(m_owner.bind_in_addr(), m_owner.effective_port(), m_shards > 1, why))
         return false;
@@ -352,6 +360,8 @@ void idp_run::stop()
     // The hashing thread ends before the descriptor it wakes the loop through is closed.
     m_hash.retire(m_loop);
     m_standing_pool.retire(m_loop);
+    m_fetch_pool.retire(m_loop);
+    m_fetching.clear();
     m_standing_waiters.clear();
     m_accounts.close();
 }
@@ -373,6 +383,10 @@ std::string idp_run::stats() const
            "\nsign_ins_refused:" + std::to_string(m_c.refused) + "\nsign_ins_barred:" + std::to_string(m_c.barred) +
            "\ncodes:" + std::to_string(m_c.codes) + "\ntokens:" + std::to_string(m_c.tokens) +
            "\nrefreshes:" + std::to_string(m_c.refreshes) + "\nuserinfo:" + std::to_string(m_c.userinfo) +
+           (m_resources.empty() ? std::string()
+                                : "\nconsents:" + std::to_string(m_c.consents) +
+                                      "\nclient_fetches:" + std::to_string(m_c.client_fetches) +
+                                      "\nclient_fetch_failures:" + std::to_string(m_c.client_fetch_failures)) +
            (m_shards > 1 ? "\nshard:" + std::to_string(m_shard) + "/" + std::to_string(m_shards) +
                                "\nrole:" + (m_reader ? "reader" : "writer") + "\ncrossed:" + std::to_string(m_c.crossed) +
                                "\ncrossings_served:" + std::to_string(m_c.crossings_served) +
@@ -577,13 +591,13 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
     }
     // A form that signs in or changes an account is taken only from this provider's pages, or a browser on another
     // site could post one and sign its visitor into an account of the site's choosing.
-    if (post && (p == "/login" || p == "/authorize" || p == "/device" || p.starts_with("/account")) &&
+    if (post && (p == "/login" || p == "/authorize" || p == "/consent" || p == "/device" || p.starts_with("/account")) &&
         !form_origin_allowed(rq.origin.empty() ? rq.referer : rq.origin, m_issuer, m_cookie_domain))
     {
         respond(c, 403, "text/plain", "a form posted from another site is not taken here\n");
         return;
     }
-    if (p == "/.well-known/openid-configuration" && get)
+    if ((p == "/.well-known/openid-configuration" || p == "/.well-known/oauth-authorization-server") && get)
         discovery(c);
     else if (p == "/jwks" && get)
         jwks(c);
@@ -593,6 +607,8 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         sign_in(c, rq);
     else if (p == "/token" && post)
         token(c, rq);
+    else if (p == "/consent" && post)
+        consent_post(c, rq);
     else if (p == "/device_authorization" && post)
         device_authorization(c, rq);
     else if (p == "/device" && get)
@@ -619,7 +635,8 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
         password_post(c, rq);
     else if ((p == "/account/totp" || p == "/account/app-password") && post)
         security_post(c, rq);
-    else if (p == "/.well-known/openid-configuration" || p == "/jwks" || p == "/authorize" || p == "/login" ||
+    else if (p == "/.well-known/openid-configuration" || p == "/.well-known/oauth-authorization-server" ||
+             p == "/consent" || p == "/jwks" || p == "/authorize" || p == "/login" ||
              p == "/token" || p == "/userinfo" || p == "/logout" || p == "/" || p.starts_with("/account") ||
              p == "/device" || p == "/device_authorization" || p == "/ssh/ca.pub" || p == "/ssh/user-cert" ||
              p == "/ssh/krl")
@@ -644,7 +661,10 @@ void idp_run::discovery(const std::shared_ptr<conn>& c)
                 "[\"ES256\"],\"scopes_supported\":[\"openid\",\"profile\",\"email\",\"offline_access\"],"
                 "\"token_endpoint_auth_methods_supported\":[\"client_secret_basic\",\"client_secret_post\",\"none\"],"
                 "\"code_challenge_methods_supported\":[\"S256\"],\"claims_supported\":[\"sub\",\"name\","
-                "\"preferred_username\",\"email\",\"groups\"]}",
+                "\"preferred_username\",\"email\",\"groups\"]" +
+                // An application may name itself by the address of its metadata document where a token may be had
+                // for a resource server.
+                (m_resources.empty() ? std::string() : ",\"client_id_metadata_document_supported\":true") + "}",
             any_origin);
 }
 
@@ -695,7 +715,106 @@ const client* idp_run::find_client(std::string_view id)
     for (const auto& c : m_clients)
         if (c.id == id)
             return &c;
+    // Found at whatever age, since a sign-in under way was let begin with it; where one begins it is fetched again.
+    if (const auto it = m_fetched.find(std::string(id)); it != m_fetched.end())
+        return &it->second.cl;
     return nullptr;
+}
+
+bool idp_run::needs_fetch(std::string_view id) const
+{
+    if (!m_fetch_attached || !metadata_client_id(id))
+        return false;
+    const auto it = m_fetched.find(std::string(id));
+    return it == m_fetched.end() || it->second.fresh_until <= wall::now_sec();
+}
+
+void idp_run::fetch_client(const std::shared_ptr<conn>& c, const std::string& id,
+                           std::function<void(const std::shared_ptr<conn>&)> then)
+{
+    // A stranger may name any address, so the fetches at once are bounded, and one past the bound finds no client.
+    constexpr size_t max_fetching = 16;
+    if (!m_fetching.contains(id) && m_fetching.size() >= max_fetching)
+    {
+        ++m_c.client_fetch_failures;
+        then(c);
+        return;
+    }
+    std::weak_ptr<conn> weak = c;
+    c->waiting = true;
+    auto& waiting = m_fetching[id];
+    waiting.push_back([this, weak, then = std::move(then)] {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        cc->waiting = false;
+        then(cc);
+        if (!cc->waiting)
+            m_http.resume(cc);
+    });
+    if (waiting.size() > 1)
+        return;
+    struct fetched
+    {
+        int status{0};
+        std::string body, type, cache, why;
+    };
+    auto out = std::make_shared<fetched>();
+    const char* ca = settings::text("SOCKETLEY_IDP_CLIENT_CA");
+    const char* to = settings::text("SOCKETLEY_IDP_CLIENT_CONNECT");
+    m_fetch_pool.submit(
+        m_fetch_pool.next_lane(),
+        [id, out, ca = std::string(ca ? ca : ""), to = std::string(to ? to : "")] {
+            https_client::client cl;
+            if (!cl.init(out->why, ca))
+                return;
+            if (!to.empty())
+                cl.connect_to(to);
+            // The address is a stranger's to name, so it is dialled only where it is public.
+            cl.public_only(true);
+            https_client::reply rep;
+            // A document is a few hundred bytes; the draft has an authorization server read five kilobytes at most.
+            if (!cl.request("GET", id, {}, {}, rep, out->why, 5, 5120, {{"Accept", "application/json"}}))
+                return;
+            out->status = rep.status;
+            out->body = std::move(rep.body);
+            out->type = rep.header("content-type");
+            out->cache = rep.header("cache-control");
+        },
+        [this, id, out, alive = m_alive] {
+            if (!*alive)
+                return;
+            client cl;
+            std::string why = out->why;
+            if (why.empty() && out->status != 200)
+                why = "it answered " + std::to_string(out->status);
+            else if (why.empty() && out->type.find("json") == std::string::npos)
+                why = "it is no JSON";
+            if (why.empty() && parse_client_metadata(id, out->body, cl, why))
+            {
+                constexpr size_t max_fetched = 1024;
+                if (!m_fetched.contains(id) && m_fetched.size() >= max_fetched)
+                    m_fetched.erase(std::min_element(m_fetched.begin(), m_fetched.end(), [](const auto& a, const auto& b) {
+                        return a.second.fresh_until < b.second.fresh_until;
+                    }));
+                m_fetched[id] = fetched_client{std::move(cl), wall::now_sec() + metadata_keep_secs(out->cache)};
+                m_fetch_said.erase(id);
+                ++m_c.client_fetches;
+            }
+            else
+            {
+                // A document that no longer reads is no longer the application's word, so what was kept of it goes.
+                m_fetched.erase(id);
+                ++m_c.client_fetch_failures;
+                if (m_fetch_said.size() < 64 && m_fetch_said.insert(id).second)
+                    LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": the client metadata document " + id +
+                              " is not taken: " + why).c_str());
+            }
+            auto waiters = std::move(m_fetching[id]);
+            m_fetching.erase(id);
+            for (auto& w : waiters)
+                w();
+        });
 }
 
 // ─── Sessions ───────────────────────────────────────────────────────────────
@@ -982,9 +1101,22 @@ const client* idp_run::checked_client(const std::shared_ptr<conn>& c, const para
         fail("unsupported_response_type", "only the authorization code flow is served");
         return nullptr;
     }
-    if (!has_scope(param(p, "scope"), "openid"))
+    bool bad_resource = false;
+    const std::string resource = requested_resource(p, bad_resource);
+    // A token for a resource server is an OAuth grant, where a client that asks no scope is given openid.
+    if (!has_scope(param(p, "scope"), "openid") && !(param(p, "scope").empty() && !resource.empty()))
     {
         fail("invalid_scope", "the scope must hold openid");
+        return nullptr;
+    }
+    if (bad_resource)
+    {
+        fail("invalid_target", "the resource is not one this provider gives tokens for");
+        return nullptr;
+    }
+    if (cl->metadata && resource.empty())
+    {
+        fail("invalid_target", "an application known by its address asks for a token for one of this provider's resources");
         return nullptr;
     }
     const std::string_view challenge = param(p, "code_challenge");
@@ -999,6 +1131,25 @@ const client* idp_run::checked_client(const std::shared_ptr<conn>& c, const para
         return nullptr;
     }
     return cl;
+}
+
+std::string idp_run::requested_resource(const params& p, bool& bad) const
+{
+    bad = false;
+    std::string out;
+    size_t named = 0;
+    for (const auto& [k, v] : p)
+        if (k == "resource")
+        {
+            ++named;
+            out = canonical_resource(v);
+            if (out.empty() || std::find(m_resources.begin(), m_resources.end(), out) == m_resources.end())
+                bad = true;
+        }
+    // One token is for one resource server, so a request naming several is refused rather than given one of them.
+    if (named > 1)
+        bad = true;
+    return bad ? std::string() : out;
 }
 
 void idp_run::login_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status)
@@ -1159,10 +1310,15 @@ void idp_run::reset_after_sign_in(const std::shared_ptr<conn>& c, const account&
     reset_page(c, token, {}, 200);
 }
 
-void idp_run::authorize(const std::shared_ptr<conn>& c, const request& rq)
+void idp_run::authorize(const std::shared_ptr<conn>& c, const request& rq, bool fetched)
 {
     const params p = parse_form(rq.query);
     const bool oauth = rq.path == "/authorize";
+    if (const std::string id(param(p, "client_id")); oauth && !fetched && needs_fetch(id))
+    {
+        fetch_client(c, id, [this, rq](const std::shared_ptr<conn>& cc) { authorize(cc, rq, true); });
+        return;
+    }
     if (oauth)
     {
         if (!checked_client(c, p))
@@ -1411,7 +1567,7 @@ void idp_run::hash_password(std::string_view password, std::function<void(std::s
 }
 
 void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie,
-                    int64_t auth_time)
+                    int64_t auth_time, bool consented)
 {
     // A code goes only to one of the client's own addresses, whichever path the sign-in came by.
     const client* cl = nullptr;
@@ -1429,12 +1585,20 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
         redirect(c, rd.empty() || !return_allowed(rd, m_issuer, m_cookie_domain) ? std::string_view("/") : rd, set_cookie);
         return;
     }
+    // An application nobody here registered is let in by the person it asks for, every time it asks.
+    if (cl->metadata && !consented)
+    {
+        consent_page(c, p, who, *cl, set_cookie);
+        return;
+    }
+    bool bad_resource = false;
     code_entry e;
     e.client_id = cl->id;
     e.redirect.assign(param(p, "redirect_uri"));
     e.sub = who.id;
     e.nonce.assign(param(p, "nonce"));
-    e.scope.assign(param(p, "scope"));
+    e.scope.assign(param(p, "scope").empty() ? std::string_view("openid") : param(p, "scope"));
+    e.resource = requested_resource(p, bad_resource);
     e.challenge.assign(param(p, "code_challenge"));
     const int64_t now = wall::now_sec();
     e.auth_time = auth_time ? auth_time : now;
@@ -1460,6 +1624,61 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
         to += "&state=" + url_encode(state);
     to += "&iss=" + url_encode(m_issuer);
     redirect(c, to, set_cookie);
+}
+
+void idp_run::consent_page(const std::shared_ptr<conn>& c, const params& p, const account& who, const client& cl,
+                           std::string_view set_cookie)
+{
+    std::string hidden;
+    for (const auto name : carried)
+        if (const std::string_view v = param(p, name); !v.empty())
+            hidden += "<input type=\"hidden\" name=\"" + std::string(name) + "\" value=\"" + html_escape(v) + "\">";
+    const std::string_view back = param(p, "redirect_uri");
+    const std::string back_host = url_host(back);
+    const bool local = back.starts_with("http://") && (back_host == "localhost" || back_host == "127.0.0.1" || back_host == "[::1]");
+    bool bad = false;
+    const std::string resource = requested_resource(p, bad);
+    // The name is the application's own word; the host of its address is the one thing about it that is checked.
+    const std::string body =
+        "<h1>Allow access?</h1><p><b>" + html_escape(cl.name) + "</b> of <b>" + html_escape(url_host(cl.id)) +
+        "</b> asks to use <b>" + html_escape(resource) + "</b> as <b>" + html_escape(who.username()) + "</b>.</p>"
+        "<p class=\"mut\">" +
+        (local ? std::string("It hands what you allow to a program on this computer. Allow it only if you started it "
+                             "yourself just now.")
+               : "It hands what you allow to " + html_escape(back_host) + ".") +
+        (has_scope(param(p, "scope"), "offline_access") ? " It stays signed in until you sign out everywhere." : "") +
+        "</p><form method=\"post\" action=\"/consent\">" + hidden +
+        "<div class=\"acts\"><button class=\"btn\" type=\"submit\" name=\"allow\" value=\"0\">Deny</button>"
+        "<button class=\"btn pri\" type=\"submit\" name=\"allow\" value=\"1\">Allow</button></div></form>";
+    respond(c, 200, "text/html; charset=utf-8", page("Allow access", body), set_cookie);
+}
+
+void idp_run::consent_post(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const params p = parse_form(rq.body);
+    int64_t auth_time = 0;
+    const account* who = session_of(rq, &auth_time);
+    if (!who)
+    {
+        respond(c, 400, "text/html; charset=utf-8",
+                page("Sign-in ended", "<h1>This sign-in has ended</h1><p class=\"mut\">Start it again from the "
+                                      "application.</p>"));
+        return;
+    }
+    const client* cl = checked_client(c, p);
+    if (!cl)
+        return;
+    if (param(p, "allow") != "1")
+    {
+        const std::string_view back = param(p, "redirect_uri");
+        const std::string_view state = param(p, "state");
+        redirect(c, std::string(back) + (back.find('?') == std::string_view::npos ? "?" : "&") +
+                        "error=access_denied&error_description=" + url_encode("the person did not allow it") +
+                        (state.empty() ? "" : "&state=" + url_encode(state)) + "&iss=" + url_encode(m_issuer));
+        return;
+    }
+    ++m_c.consents;
+    grant(c, p, *who, {}, auth_time, true);
 }
 
 // ─── Tokens ─────────────────────────────────────────────────────────────────
@@ -1506,7 +1725,9 @@ void idp_run::send_tokens(const std::shared_ptr<conn>& c, const client& cl, cons
     const int64_t now = wall::now_sec();
     const std::string jti = random_b64url(32);
     const std::string profile = profile_claims(who);
-    const std::string aud = socketley::json::quote(cl.id);
+    const std::string client_id = socketley::json::quote(cl.id);
+    // An access token for a resource server names it, and is taken by no runtime that takes the client's own.
+    const std::string aud = e.resource.empty() ? client_id : socketley::json::quote(e.resource);
     const std::string scope = socketley::json::quote(e.scope);
     const std::string exp = std::to_string(now + token_secs);
     std::string common;
@@ -1517,12 +1738,12 @@ void idp_run::send_tokens(const std::shared_ptr<conn>& c, const client& cl, cons
     // Each token's claims made in the one string, the common ones first.
     std::string claims;
     claims.reserve(common.size() + profile.size() + 256);
-    claims.assign(common).append(",\"aud\":").append(aud).append(",\"exp\":").append(exp);
+    claims.assign(common).append(",\"aud\":").append(client_id).append(",\"exp\":").append(exp);
     if (!e.nonce.empty())
         claims.append(",\"nonce\":").append(socketley::json::quote(e.nonce));
     claims.append(profile);
     const std::string id_token = sign_token(m_key, m_kid, "JWT", claims);
-    claims.assign(common).append(",\"aud\":").append(aud).append(",\"client_id\":").append(aud);
+    claims.assign(common).append(",\"aud\":").append(aud).append(",\"client_id\":").append(client_id);
     claims.append(",\"scope\":").append(scope).append(",\"jti\":\"").append(jti).append("\",\"exp\":").append(exp);
     claims.append(profile);
     // The admin bit a session cookie carries, so a runtime taking the token can tell an admin as it does from a cookie.
@@ -1531,8 +1752,10 @@ void idp_run::send_tokens(const std::shared_ptr<conn>& c, const client& cl, cons
     std::string refresh;
     if (!family.empty())
     {
-        claims.assign(common).append(",\"aud\":\"refresh\",\"client_id\":").append(aud).append(",\"scope\":");
-        claims.append(scope).append(",\"fam\":\"").append(family).append("\",\"gen\":");
+        claims.assign(common).append(",\"aud\":\"refresh\",\"client_id\":").append(client_id);
+        if (!e.resource.empty())
+            claims.append(",\"resource\":").append(socketley::json::quote(e.resource));
+        claims.append(",\"scope\":").append(scope).append(",\"fam\":\"").append(family).append("\",\"gen\":");
         claims.append(std::to_string(generation)).append(",\"exp\":").append(std::to_string(now + refresh_secs));
         refresh = sign_secret_token(m_secret, "refresh+jwt", claims);
     }
@@ -1594,9 +1817,14 @@ const client* idp_run::requesting_client(const std::shared_ptr<conn>& c, const r
     return cl;
 }
 
-void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
+void idp_run::token(const std::shared_ptr<conn>& c, const request& rq, bool fetched)
 {
     const params p = parse_form(rq.body);
+    if (const std::string id(param(p, "client_id")); !fetched && needs_fetch(id))
+    {
+        fetch_client(c, id, [this, rq](const std::shared_ptr<conn>& cc) { token(cc, rq, true); });
+        return;
+    }
     const client* cl = requesting_client(c, rq, p);
     if (!cl)
         return;
@@ -1664,6 +1892,15 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
             json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
             return;
         }
+        // A refresh is for the resource server its sign-in was, and for none this provider no longer serves.
+        const std::string resource = claim(r, "resource");
+        const std::string_view asked = param(p, "resource");
+        if ((!asked.empty() && canonical_resource(asked) != resource) ||
+            (!resource.empty() && std::find(m_resources.begin(), m_resources.end(), resource) == m_resources.end()))
+        {
+            json_error(c, 400, "invalid_target", "the resource is not the one the refresh token was given for");
+            return;
+        }
         refresh_grant(c, *cl, r, *who);
         return;
     }
@@ -1710,6 +1947,7 @@ void idp_run::refresh_grant(const std::shared_ptr<conn>& c, const client& cl, co
     e.sub = who.id;
     e.scope = claim(r, "scope");
     e.auth_time = claim_int(r, "auth_time");
+    e.resource = claim(r, "resource");
     std::weak_ptr<conn> weak = c;
     c->waiting = true;
     // The next generation taken only while this one is still the newest, so the same token sent twice gets one.
@@ -2407,6 +2645,11 @@ void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const p
     if (!e.challenge.empty() && !pkce_matches(param(p, "code_verifier"), e.challenge))
     {
         json_error(c, 400, "invalid_grant", "the code verifier does not match the challenge");
+        return;
+    }
+    if (const std::string_view asked = param(p, "resource"); !asked.empty() && canonical_resource(asked) != e.resource)
+    {
+        json_error(c, 400, "invalid_target", "the resource is not the one the code was given for");
         return;
     }
     // As for a device, a code given before the account was disabled, made to reset or signed out everywhere is void.

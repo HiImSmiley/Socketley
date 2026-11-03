@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <sys/socket.h>
@@ -93,9 +94,14 @@ private:
 
     void discovery(const std::shared_ptr<conn>& c);
     void jwks(const std::shared_ptr<conn>& c);
-    void authorize(const std::shared_ptr<conn>& c, const request& rq);
+    // `fetched` once the metadata document of the client it names has been asked for.
+    void authorize(const std::shared_ptr<conn>& c, const request& rq, bool fetched = false);
     void sign_in(const std::shared_ptr<conn>& c, const request& rq);
-    void token(const std::shared_ptr<conn>& c, const request& rq);
+    void token(const std::shared_ptr<conn>& c, const request& rq, bool fetched = false);
+    // What an application known by its address asks of a signed-in person, and the person's answer.
+    void consent_page(const std::shared_ptr<conn>& c, const params& p, const account& who, const client& cl,
+                      std::string_view set_cookie);
+    void consent_post(const std::shared_ptr<conn>& c, const request& rq);
     void userinfo(const std::shared_ptr<conn>& c, const request& rq);
     void logout(const std::shared_ptr<conn>& c, const request& rq);
     void home(const std::shared_ptr<conn>& c, const request& rq);
@@ -152,9 +158,13 @@ private:
     // What an authorize request asks, checked: the client and its redirect, or an error page when there is no
     // address to send the error to.
     const client* checked_client(const std::shared_ptr<conn>& c, const params& p);
-    // The code for a signed-in account, sent to the client's redirect, or the browser sent on.
+    // The code for a signed-in account, sent to the client's redirect, or the browser sent on; an application known
+    // by its address is first allowed by the person, `consented` once they have.
     void grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie,
-               int64_t auth_time = 0);
+               int64_t auth_time = 0, bool consented = false);
+    // The resource server a request names, as tokens name it, empty for none; `bad` when it names one this provider
+    // gives no tokens for, or more than one.
+    std::string requested_resource(const params& p, bool& bad) const;
     void login_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status);
     void reset_page(const std::shared_ptr<conn>& c, const std::string& token, std::string_view error, int status);
     // A sign-in whose password, and code where the account has one, were right, sent to set its password again.
@@ -237,6 +247,12 @@ private:
     bool hashing_full() const { return m_hashing >= 64; }
     const client* find_client(std::string_view id);
     void load_clients();
+    // Whether `id` is a client known by its metadata document, not fetched lately.
+    bool needs_fetch(std::string_view id) const;
+    // The document of `id` fetched off the loop, and `then` run once it was taken or refused; at once, finding no
+    // client, when too many are being fetched.
+    void fetch_client(const std::shared_ptr<conn>& c, const std::string& id,
+                      std::function<void(const std::shared_ptr<conn>&)> then);
     // The profile claims every token of the account carries.
     std::string profile_claims(const account& who) const;
     // Whether `who`'s e-mail is one an admin gave them, or their own username on a domain of this provider's: what a
@@ -322,6 +338,22 @@ private:
 
     account_store m_accounts;
     std::vector<client> m_clients;
+    // The resource servers of --resources, as each names itself.
+    std::vector<std::string> m_resources;
+    // Clients known by the address of their metadata document, kept as its Cache-Control says.
+    struct fetched_client
+    {
+        client cl;
+        int64_t fresh_until{0};
+    };
+    std::unordered_map<std::string, fetched_client> m_fetched;
+    // The requests waiting on a document being fetched, by its address.
+    std::unordered_map<std::string, std::vector<std::function<void()>>> m_fetching;
+    // Addresses whose document was refused, each said once in the log.
+    std::unordered_set<std::string> m_fetch_said;
+    // The threads documents are fetched on, apart from the sign-ins' hashing, which a slow host would hold up.
+    hash_pool m_fetch_pool{2};
+    bool m_fetch_attached{false};
     std::string m_clients_error;
     std::optional<socketley::file_stamp> m_clients_stamp;
     int64_t m_clients_checked{0};
@@ -363,6 +395,7 @@ private:
     struct counters
     {
         uint64_t sign_ins{0}, refused{0}, barred{0}, codes{0}, tokens{0}, refreshes{0}, userinfo{0}, devices{0}, ssh_certs{0};
+        uint64_t consents{0}, client_fetches{0}, client_fetch_failures{0};
         uint64_t crossed{0}, crossings_served{0}, reopened{0};
     } m_c;
     // A password sign-in from its form to its answer, the hash and a refusal's record included, in loop turns.

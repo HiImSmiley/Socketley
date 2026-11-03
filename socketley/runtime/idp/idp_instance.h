@@ -53,6 +53,11 @@ public:
     void set_cookie_domain(std::string_view d) { m_cookie_domain = std::string(d); }
     std::string_view get_cookie_domain() const { return m_cookie_domain; }
 
+    // The resource servers (--resources), comma-separated addresses, an access token may be given for (RFC 8707); with
+    // any, an application may also sign in by the https address of its metadata document.
+    void set_resources(std::string_view list) { m_resources = std::string(list); }
+    std::string_view get_resources() const { return m_resources; }
+
     // How many hours an SSH user certificate it signs holds (--ssh-ca), 0 when it signs none.
     void set_ssh_ca_hours(uint32_t h) { m_ssh_ca_hours = h; }
     uint32_t get_ssh_ca_hours() const { return m_ssh_ca_hours; }
@@ -75,6 +80,7 @@ private:
     std::string m_clients;
     std::string m_issuer;
     std::string m_cookie_domain;
+    std::string m_resources;
     uint32_t m_ssh_ca_hours{0};
 
     std::unique_ptr<socketley::idp::idp_run> m_run;

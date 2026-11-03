@@ -216,6 +216,7 @@ struct runtime_config
     std::string idp_clients;
     std::string idp_issuer;
     std::string idp_cookie_domain;
+    std::string idp_resources;
     uint32_t idp_ssh_ca_hours = 0;
 
     // Tunnel
@@ -247,6 +248,8 @@ struct runtime_config
     std::string mcp_origins;
     std::string mcp_tools = "none";
     std::string mcp_instructions;
+    std::string mcp_idp;
+    std::string mcp_idp_audience;
 
     // Metrics
     std::string metrics_keys;

@@ -88,7 +88,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     }
     else if (data[0] % 4 == 3)
         h.protocol_version = "2099-01-01";
-    const mcp::reply r = mcp::handle(b, info, h, body, mcp::caller{"f", (data[0] & 0x80) != 0});
+    const mcp::reply r = mcp::handle(b, info, h, body, mcp::caller{"f", (data[0] & 0x80) != 0, {}});
     FUZZ_CHECK(r.status == 200 || r.status == 202 || r.status == 400 || r.status == 404, "a status the transport names");
     if (r.status == 202)
     {

@@ -1,6 +1,7 @@
 #include "mcp_instance.h"
 
 #include "mcp_run.h"
+#include "../idp/idp_logic.h"
 #include "../../shared/util/logging.h"
 
 mcp_instance::mcp_instance(std::string_view name) : runtime_instance(runtime_mcp, name) {}
@@ -13,11 +14,29 @@ std::string mcp_instance::config_refusal() const
         return "mcp: -p is required: the port the entrance or a client reaches the server on\n";
     if (!get_listen_path().empty())
         return "mcp: --listen unix: is not served; the server listens on its port\n";
-    if (m_keys.empty() && !m_anonymous)
-        return "mcp: give --keys, the file of the keys that may ask, or --anonymous for a port only this machine reaches\n";
+    if (m_keys.empty() && !m_anonymous && m_idp.empty())
+        return "mcp: give --keys, the file of the keys that may ask, --idp, the idp runtime whose people sign in, or "
+               "--anonymous for a port only this machine reaches\n";
+    if (m_anonymous && (!m_keys.empty() || !m_idp.empty()))
+        return "mcp: --anonymous lets anyone ask, so it goes with neither --keys nor --idp\n";
+    if (!m_idp.empty() && resource().empty())
+        return "mcp: --idp needs a --domain, the name clients reach the server at, which its tokens name; the first "
+               "is a whole name such as mcp.example.com, since one without a dot stands for a name under every zone\n";
+    if (!m_idp_audience.empty() && m_idp.empty())
+        return "mcp: --idp-audience names clients of the --idp runtime, which is not given\n";
     if (m_tools != "none" && m_tools != "daemon")
         return "mcp: --tools is none or daemon, not " + m_tools + "\n";
     return {};
+}
+
+std::string mcp_instance::resource() const
+{
+    const std::string_view domains = get_domains();
+    const std::string_view first = domains.substr(0, domains.find(','));
+    // A name without a dot is one under each zone a dns runtime serves, so it names no one address.
+    if (first.find('.') == std::string_view::npos || first.starts_with("*."))
+        return {};
+    return socketley::idp::canonical_resource("https://" + std::string(first) + "/mcp");
 }
 
 void mcp_instance::on_cqe(struct io_uring_cqe*)

@@ -1794,6 +1794,32 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
             ip->set_cookie_domain(pa.args[++i]);
             return 0;
         }
+        // The resource servers an access token may be given for, as each names itself.
+        case fnv1a("--resources"):
+        {
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            std::string canonical;
+            for (std::string_view rest = v; !rest.empty();)
+            {
+                const std::string_view one = socketley::take_item(rest, ',');
+                const std::string c = socketley::idp::canonical_resource(one);
+                if (c.empty())
+                {
+                    canonical.clear();
+                    break;
+                }
+                canonical += (canonical.empty() ? "" : ",") + c;
+            }
+            if (canonical.empty())
+            {
+                std::cout << "--resources requires the https addresses of the servers tokens are given for, "
+                             "comma-separated, such as https://mcp.example.com/mcp\n";
+                return 1;
+            }
+            ip->set_resources(canonical);
+            ++i;
+            return 0;
+        }
         // A certificate authority for SSH, its user certificates holding this many hours.
         case fnv1a("--ssh-ca"):
         {
@@ -2036,6 +2062,23 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
                 return 1;
             }
             mc->set_instructions(pa.args[++i]);
+            return 0;
+        // The idp runtime whose people sign in, by an access token given for this server.
+        case fnv1a("--idp"):
+            if (next.empty() || next.find_first_of("/ ") != std::string_view::npos)
+            {
+                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                return 1;
+            }
+            mc->set_idp(pa.args[++i]);
+            return 0;
+        case fnv1a("--idp-audience"):
+            if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
+            {
+                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                return 1;
+            }
+            mc->set_idp_audience(pa.args[++i]);
             return 0;
         default:
             return -1;

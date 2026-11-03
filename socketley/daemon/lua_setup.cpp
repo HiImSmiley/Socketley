@@ -152,6 +152,7 @@ constexpr config_key config_keys[] = {
     { "clients",            "--clients",            key_kind::text    },
     { "issuer",             "--issuer",             key_kind::text    },
     { "cookie_domain",      "--cookie-domain",      key_kind::text    },
+    { "resources",          "--resources",          key_kind::text    },
     { "ssh_ca",             "--ssh-ca",             key_kind::integer },
     // ── tunnel ──────────────────────────────────────────────────────────────
     { "to",                 "--to",                 key_kind::text    },

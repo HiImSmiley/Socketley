@@ -56,6 +56,7 @@ std::string encode_code(const code_entry* e)
         w.bytes(e->nonce);
         w.bytes(e->scope);
         w.bytes(e->challenge);
+        w.bytes(e->resource);
         w.u64(static_cast<uint64_t>(e->auth_time));
         w.u64(static_cast<uint64_t>(e->issued_ms));
         w.u64(static_cast<uint64_t>(e->expires));
@@ -72,7 +73,8 @@ bool decode_code(std::string_view in, bool& found, code_entry& out)
     {
         uint64_t auth = 0, issued = 0, exp = 0;
         if (!r.bytes(out.client_id, 4096) || !r.bytes(out.redirect, 4096) || !r.bytes(out.sub, 4096) ||
-            !r.bytes(out.nonce, 4096) || !r.bytes(out.scope, 4096) || !r.bytes(out.challenge, 4096) || !r.u64(auth) ||
+            !r.bytes(out.nonce, 4096) || !r.bytes(out.scope, 4096) || !r.bytes(out.challenge, 4096) ||
+            !r.bytes(out.resource, 4096) || !r.u64(auth) ||
             !r.u64(issued) || !r.u64(exp))
             return false;
         out.auth_time = static_cast<int64_t>(auth);

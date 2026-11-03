@@ -13,6 +13,7 @@
 #include "../../shared/http/conn_server.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/event_loop_definitions.h"
+#include "../idp/idp_session.h"
 
 class mcp_instance;
 
@@ -59,6 +60,11 @@ private:
     // What the script declared and the daemon's tools, as the lists the protocol shows.
     void collect();
     bool daemon_tool(const tool_def& t, const json::jvalue& args, const caller& who, tool_result& out);
+    // Who a bearer token names, by a key of --keys or a sign-in of --idp; false when neither.
+    bool authenticate(std::string_view authorization, caller& who);
+    // The protected resource metadata (RFC 9728) a client finds the idp by, and where it is.
+    std::string resource_metadata();
+    std::string resource_metadata_url() const;
     void arm_tick();
 
     mcp_instance& m_owner;
@@ -70,6 +76,11 @@ private:
     std::vector<prompt_def> m_prompts;
     size_t m_declared_seen{SIZE_MAX};
     std::unordered_map<std::string, key> m_keys;
+    // The address its tokens name, and what verifies the idp's sign-ins against it.
+    std::string m_resource;
+    socketley::idp::session_verifier m_idp;
+    std::string m_metadata_url;
+    std::string m_metadata_path;
     int64_t m_keys_mtime{-1};
     std::string m_keys_error;
     std::vector<std::string> m_origins;

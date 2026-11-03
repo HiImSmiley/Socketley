@@ -366,6 +366,10 @@ constexpr field idp_fields[] = {
     counter("tokens", "socketley_idp_tokens_total", "Tokens an idp issued."),
     counter("refreshes", "socketley_idp_refreshes_total", "Tokens an idp refreshed."),
     counter("userinfo", "socketley_idp_userinfo_total", "Userinfo requests an idp answered."),
+    counter("consents", "socketley_idp_consents_total", "Applications known by their address a person allowed."),
+    counter("client_fetches", "socketley_idp_client_fetches_total", "Client metadata documents an idp fetched and took."),
+    counter("client_fetch_failures", "socketley_idp_client_fetch_failures_total",
+            "Client metadata documents that could not be fetched or were refused."),
     histogram("sign_in_latency", "socketley_idp_sign_in_duration_seconds",
               "Password sign-ins from their form to their answer, the hash included, in loop turns."),
 };

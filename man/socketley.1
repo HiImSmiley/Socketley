@@ -13035,7 +13035,9 @@ The applications that sign in through it, one a line:
 with
 .B \-
 as the secret of a public client, which must then send a PKCE challenge. A
-redirect is an https address compared whole, http only on localhost. In place
+redirect is an https address compared whole, or an http one on this machine
+(localhost, 127.0.0.1) taken at any port, which an application on the machine
+picks as it runs. In place
 of a redirect,
 .B device
 lets the client sign a person in by the device grant, as
@@ -13075,6 +13077,35 @@ not given,
 .BI https:// name
 for the first
 .BR \-\-domain .
+.TP
+.BI "\-\-resources " list
+The resource servers, comma-separated https addresses such as
+.BR https://mcp.example.com/mcp ,
+an access token may be given for (RFC 8707): an application that sends
+.B resource
+with one of them at
+.B /authorize
+is given an access token naming it as its audience, which a runtime taking
+tokens for its own clients does not take; an
+.B mcp
+runtime with
+.B \-\-idp
+takes it. With any, an application may also sign in by the https address of
+its client metadata document as its client id, as MCP clients such as Claude
+Code do: the document is fetched from public addresses alone, five kilobytes at
+most, kept as its
+.B Cache\-Control
+says within a minute and a day, and taken only for a public client sending a
+PKCE challenge, with redirects of https or on this machine. Such an
+application is let in only for one of these resources, and only once the
+signed-in person has allowed it on a page that names it, its host, the
+resource and where it is sent back to, every time it asks.
+.B stats
+counts
+.BR consents ,
+.B client_fetches
+and
+.BR client_fetch_failures .
 .TP
 .BI "\-\-cookie\-domain " domain
 The domain whose names share the sign-in cookie, so a user signed in here is
@@ -15298,10 +15329,13 @@ and says why in the log.
 Asked by anyone, with no key: for a port only this machine reaches
 .RB ( "\-\-bind 127.0.0.1" ).
 One of
-.B \-\-keys
+.BR \-\-keys ,
+.B \-\-idp
 and
 .B \-\-anonymous
-is required.
+is required, and
+.B \-\-anonymous
+goes with neither of the others.
 .TP
 .BI "\-\-origins " list
 The web origins a browser may call it from, comma-separated, or
@@ -15311,6 +15345,33 @@ for any. A request with any other
 is
 .BR 403 ,
 as the revision asks of every server; a client that is no browser sends none.
+.TP
+.BI "\-\-idp " runtime
+The idp runtime whose people sign in, as the MCP revisions have a client do:
+a request without a token is
+.B 401
+with
+.B WWW\-Authenticate: Bearer resource_metadata
+naming
+.BR /.well\-known/oauth\-protected\-resource/mcp ,
+which says the server is
+.BI https:// name /mcp
+for the first
+.BR \-\-domain ,
+a whole name such as
+.BR mcp.example.com ,
+and names the idp; the client signs in there for that resource, and its access
+token is taken for that audience alone. The idp gives such tokens with
+.B \-\-resources
+naming the address. A key of
+.B \-\-keys
+is taken beside it. An account of the idp's
+.B admins
+group is an admin here; one disabled or signed out everywhere is refused from
+its next request.
+.TP
+.BI "\-\-idp\-audience " clients
+The idp's clients, comma-separated, whose own access tokens are taken as well.
 .TP
 .BR "\-\-tools none" | daemon
 .B daemon
@@ -15387,10 +15448,13 @@ and
 .BR text .
 Each gets
 .BR who ,
-the key's
+the key's or the account's
 .B name
 and whether it is
 .BR admin ,
+and for an account its
+.BR sub ,
+the id that never changes,
 and runs on the event loop inside the callback deadline. A declaration that
 does not read answers
 .B nil
@@ -20104,6 +20168,19 @@ Inherited by worker processes, which have no command line of their own.
 A test aid: the milliseconds what a mail runtime's spam filter learned stays in
 its journal before the first shard folds it into the filter's file; unset, ten
 minutes.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_IDP_CLIENT_CA
+A test aid: a file of CA certificates the certificate of a client metadata
+document an idp fetches is checked against; the system's when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_IDP_CLIENT_CONNECT
+A test aid: the host:port every client metadata document is fetched from, the
+address's own name still the one sent and checked; the address's host when
+unset.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

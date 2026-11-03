@@ -38,7 +38,12 @@ struct client
     // Whether its access tokens may ask for SSH certificates, which `ssh` in place of a redirect allows.
     bool ssh{false};
 
+    // What a person is shown it is, and whether it named itself by the https address of its metadata document.
+    std::string name;
+    bool metadata{false};
+
     bool is_public() const { return secret.empty(); }
+    // Compared whole, but a loopback address at any port, which the application takes as it runs (RFC 8252 7.3).
     bool allows(std::string_view redirect) const;
 };
 
@@ -46,6 +51,21 @@ struct client
 // for the device grant, `ssh` for SSH certificates, `#` starting a comment; false with `why` naming the line for anything else, so a client is
 // never half read.
 bool parse_clients(std::string_view text, std::vector<client>& out, std::string& why);
+
+// Whether `id` is a client id that is the address of its metadata document: https, a path, and no credentials, query,
+// fragment or dot segment, as draft-ietf-oauth-client-id-metadata-document has it.
+bool metadata_client_id(std::string_view id);
+
+// The client the metadata document `doc`, fetched from `url`, describes: a public client, its redirects https or on this
+// machine; false with `why` when it is another address's document or asks for what this provider does not give one.
+bool parse_client_metadata(std::string_view url, std::string_view doc, client& out, std::string& why);
+
+// How long a metadata document is kept, by its Cache-Control max-age within a minute and a day, five minutes without.
+int64_t metadata_keep_secs(std::string_view cache_control);
+
+// A resource server's address as a token names it (RFC 8707), its scheme and host lower case and a lone / dropped;
+// empty for anything but an https address, or http on this machine, without a query or fragment.
+std::string canonical_resource(std::string_view url);
 
 using params = std::vector<std::pair<std::string, std::string>>;
 

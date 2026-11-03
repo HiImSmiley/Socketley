@@ -9,6 +9,11 @@
 --   claude mcp add --transport http shop http://127.0.0.1:9600/mcp \
 --       --header "Authorization: Bearer <claude's secret>"
 --
+-- Or people sign in through an idp runtime, Claude Code opening the sign-in page itself:
+--   socketley create idp auth -p 9500 --domain auth.example.com --resources https://shop.example.com/mcp -s
+--   socketley create mcp shop -p 9600 --domain shop.example.com --idp auth --lua examples/mcp/shop.lua -s
+--   claude mcp add --transport http shop https://shop.example.com/mcp
+--
 -- The client is offered three tools of this script -- an order's state, the
 -- orders of a customer, and marking one sent, which only an admin's key sees --
 -- the catalog as a resource, a prompt that writes a customer a note, and with
