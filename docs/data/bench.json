@@ -1,0 +1,1773 @@
+{
+ "updated": "2026-11-03",
+ "box": {
+  "cpu": "AMD Ryzen 9 9950X3D (KVM guest)",
+  "vcpus": 28,
+  "mem": "24 GiB",
+  "os": "Ubuntu 26.04",
+  "kernel": "7.0.0-42"
+ },
+ "sets": [
+  {
+   "id": "cache-depth1",
+   "runtime": "cache",
+   "title": "Redis protocol, one command per round trip",
+   "vs": [
+    "Redis 8.0.5",
+    "Valkey 9.0.4"
+   ],
+   "arms": [
+    "socketley",
+    "Redis 8.0.5",
+    "Valkey 9.0.4"
+   ],
+   "tool": "6 redis-benchmark processes × 50 connections",
+   "commit": "c7d4c42b",
+   "passes": 11,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "SET",
+     "v": [
+      231795.0,
+      203071.0,
+      208448.0
+     ],
+     "cpu": [
+      0.998,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.74,
+      1.539,
+      1.475
+     ],
+     "r": [
+      [
+       1.085,
+       0.889,
+       2.031
+      ],
+      [
+       1.112,
+       0.859,
+       2.003
+      ]
+     ]
+    },
+    {
+     "name": "GET",
+     "v": [
+      234598.0,
+      205874.0,
+      149334.0
+     ],
+     "cpu": [
+      0.998,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.752,
+      1.561,
+      1.514
+     ],
+     "r": [
+      [
+       1.035,
+       0.924,
+       1.551
+      ],
+      [
+       1.591,
+       0.971,
+       2.154
+      ]
+     ]
+    },
+    {
+     "name": "LPUSH",
+     "v": [
+      230078.0,
+      219839.0,
+      239897.0
+     ],
+     "cpu": [
+      0.999,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.723,
+      1.539,
+      1.478
+     ],
+     "r": [
+      [
+       1.115,
+       0.906,
+       2.075
+      ],
+      [
+       0.959,
+       0.85,
+       2.064
+      ]
+     ]
+    },
+    {
+     "name": "LPOP",
+     "v": [
+      236816.0,
+      234125.0,
+      240688.0
+     ],
+     "cpu": [
+      0.998,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.739,
+      1.52,
+      1.461
+     ],
+     "r": [
+      [
+       1.032,
+       0.918,
+       1.755
+      ],
+      [
+       1.009,
+       0.938,
+       1.569
+      ]
+     ]
+    },
+    {
+     "name": "SADD",
+     "v": [
+      237325.0,
+      187996.0,
+      180064.0
+     ],
+     "cpu": [
+      0.999,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.74,
+      1.554,
+      1.509
+     ],
+     "r": [
+      [
+       1.248,
+       0.87,
+       2.024
+      ],
+      [
+       1.35,
+       1.047,
+       2.133
+      ]
+     ]
+    },
+    {
+     "name": "HSET",
+     "v": [
+      229438.0,
+      203466.0,
+      228335.0
+     ],
+     "cpu": [
+      0.999,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.732,
+      1.54,
+      1.487
+     ],
+     "r": [
+      [
+       1.099,
+       0.844,
+       1.689
+      ],
+      [
+       0.992,
+       0.918,
+       2.071
+      ]
+     ]
+    },
+    {
+     "name": "ZADD",
+     "v": [
+      233744.0,
+      174170.0,
+      209246.0
+     ],
+     "cpu": [
+      0.999,
+      1.0,
+      0.999
+     ],
+     "ccpu": [
+      1.729,
+      1.53,
+      1.479
+     ],
+     "r": [
+      [
+       1.387,
+       0.893,
+       1.934
+      ],
+      [
+       1.183,
+       0.9,
+       2.273
+      ]
+     ]
+    }
+   ],
+   "unit": "ops/s",
+   "better": "higher",
+   "pin": "servers on one core, clients on 20 others",
+   "note": "Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches."
+  },
+  {
+   "id": "cache-depth100",
+   "runtime": "cache",
+   "title": "Redis protocol, 100 commands per message (pipelined)",
+   "vs": [
+    "Redis 8.0.5",
+    "Valkey 9.0.4"
+   ],
+   "arms": [
+    "socketley",
+    "Redis 8.0.5",
+    "Valkey 9.0.4"
+   ],
+   "tool": "6 redis-benchmark processes × 50 connections",
+   "commit": "c7d4c42b",
+   "passes": 11,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "SET",
+     "v": [
+      11138987.0,
+      4888826.0,
+      2852111.0
+     ],
+     "cpu": [
+      0.998,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.324,
+      0.446,
+      0.272
+     ],
+     "r": [
+      [
+       2.265,
+       2.167,
+       2.637
+      ],
+      [
+       3.906,
+       3.739,
+       4.112
+      ]
+     ]
+    },
+    {
+     "name": "GET",
+     "v": [
+      11676547.0,
+      5363412.0,
+      3963581.0
+     ],
+     "cpu": [
+      0.999,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.356,
+      0.579,
+      0.386
+     ],
+     "r": [
+      [
+       2.221,
+       1.959,
+       2.57
+      ],
+      [
+       3.0,
+       2.764,
+       3.607
+      ]
+     ]
+    },
+    {
+     "name": "LPUSH",
+     "v": [
+      9279024.0,
+      4453582.0,
+      3006832.0
+     ],
+     "cpu": [
+      0.997,
+      0.998,
+      0.999
+     ],
+     "ccpu": [
+      1.021,
+      0.394,
+      0.34
+     ],
+     "r": [
+      [
+       2.075,
+       1.995,
+       2.324
+      ],
+      [
+       3.071,
+       3.029,
+       3.285
+      ]
+     ]
+    },
+    {
+     "name": "LPOP",
+     "v": [
+      10557689.0,
+      3677406.0,
+      2694930.0
+     ],
+     "cpu": [
+      0.998,
+      1.0,
+      0.999
+     ],
+     "ccpu": [
+      1.212,
+      0.403,
+      0.309
+     ],
+     "r": [
+      [
+       2.871,
+       2.659,
+       3.259
+      ],
+      [
+       3.909,
+       3.723,
+       4.2
+      ]
+     ]
+    },
+    {
+     "name": "SADD",
+     "v": [
+      11419379.0,
+      5047607.0,
+      3471254.0
+     ],
+     "cpu": [
+      0.997,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.251,
+      0.5,
+      0.376
+     ],
+     "r": [
+      [
+       2.314,
+       2.063,
+       2.762
+      ],
+      [
+       3.27,
+       3.032,
+       3.684
+      ]
+     ]
+    },
+    {
+     "name": "HSET",
+     "v": [
+      9956561.0,
+      4126592.0,
+      2860085.0
+     ],
+     "cpu": [
+      0.999,
+      1.0,
+      0.999
+     ],
+     "ccpu": [
+      1.074,
+      0.504,
+      0.352
+     ],
+     "r": [
+      [
+       2.37,
+       2.086,
+       2.856
+      ],
+      [
+       3.48,
+       3.189,
+       3.84
+      ]
+     ]
+    },
+    {
+     "name": "ZADD",
+     "v": [
+      9599848.0,
+      3840653.0,
+      2728183.0
+     ],
+     "cpu": [
+      0.998,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.041,
+      0.483,
+      0.322
+     ],
+     "r": [
+      [
+       2.376,
+       2.146,
+       2.876
+      ],
+      [
+       3.439,
+       3.179,
+       3.693
+      ]
+     ]
+    }
+   ],
+   "unit": "ops/s",
+   "better": "higher",
+   "pin": "servers on one core, clients on 20 others",
+   "note": "The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. One key, the easy case for every cache.",
+   "headline": 1
+  },
+  {
+   "id": "cache-depth100k100k",
+   "runtime": "cache",
+   "title": "Pipelined, keys drawn from 100,000",
+   "vs": [
+    "Redis 8.0.5",
+    "Valkey 9.0.4"
+   ],
+   "arms": [
+    "socketley",
+    "Redis 8.0.5",
+    "Valkey 9.0.4"
+   ],
+   "tool": "6 redis-benchmark processes × 50 connections",
+   "commit": "c7d4c42b",
+   "passes": 11,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "SET",
+     "v": [
+      9711256.0,
+      3952296.0,
+      2768843.0
+     ],
+     "cpu": [
+      0.998,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.248,
+      0.43,
+      0.289
+     ],
+     "r": [
+      [
+       2.457,
+       2.3,
+       2.999
+      ],
+      [
+       3.512,
+       3.407,
+       3.556
+      ]
+     ]
+    },
+    {
+     "name": "GET",
+     "v": [
+      10013598.0,
+      4644533.0,
+      3843328.0
+     ],
+     "cpu": [
+      0.997,
+      1.0,
+      0.998
+     ],
+     "ccpu": [
+      1.295,
+      0.475,
+      0.378
+     ],
+     "r": [
+      [
+       2.178,
+       2.102,
+       2.555
+      ],
+      [
+       2.605,
+       2.563,
+       2.751
+      ]
+     ]
+    },
+    {
+     "name": "SADD",
+     "v": [
+      8971230.0,
+      4340872.0,
+      3244993.0
+     ],
+     "cpu": [
+      0.997,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      1.077,
+      0.449,
+      0.335
+     ],
+     "r": [
+      [
+       2.044,
+       1.991,
+       2.504
+      ],
+      [
+       2.775,
+       2.73,
+       2.827
+      ]
+     ]
+    },
+    {
+     "name": "HSET",
+     "v": [
+      6483609.0,
+      3535399.0,
+      2572786.0
+     ],
+     "cpu": [
+      0.998,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      0.79,
+      0.39,
+      0.292
+     ],
+     "r": [
+      [
+       1.822,
+       1.727,
+       2.023
+      ],
+      [
+       2.557,
+       2.41,
+       2.626
+      ]
+     ]
+    },
+    {
+     "name": "ZADD",
+     "v": [
+      1557995.0,
+      1233295.0,
+      1125601.0
+     ],
+     "cpu": [
+      0.998,
+      0.999,
+      0.999
+     ],
+     "ccpu": [
+      0.22,
+      0.184,
+      0.168
+     ],
+     "r": [
+      [
+       1.26,
+       1.243,
+       1.28
+      ],
+      [
+       1.378,
+       1.348,
+       1.402
+      ]
+     ]
+    }
+   ],
+   "unit": "ops/s",
+   "better": "higher",
+   "pin": "servers on one core, clients on 20 others",
+   "note": "The keyspace no longer fits the caches, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each."
+  },
+  {
+   "id": "server-http",
+   "runtime": "server",
+   "title": "HTTP: static files and a fixed answer",
+   "vs": [
+    "nginx 1.28.3"
+   ],
+   "arms": [
+    "socketley",
+    "nginx 1.28.3"
+   ],
+   "tool": "wrk 8 threads, 8 s a run",
+   "commit": "c7d4c42b",
+   "passes": 9,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "1 KiB file, keep-alive, 256 connections",
+     "v": [
+      281310.0,
+      51954.0
+     ],
+     "cpu": [
+      0.998,
+      0.998
+     ],
+     "ccpu": [
+      1.517,
+      0.84
+     ],
+     "r": [
+      [
+       5.307,
+       4.949,
+       5.824
+      ]
+     ]
+    },
+    {
+     "name": "64 KiB file, keep-alive, 256 connections",
+     "v": [
+      92739.0,
+      44820.0
+     ],
+     "cpu": [
+      0.998,
+      0.997
+     ],
+     "ccpu": [
+      1.416,
+      0.995
+     ],
+     "r": [
+      [
+       2.075,
+       1.976,
+       2.127
+      ]
+     ]
+    },
+    {
+     "name": "1 KiB file, a connection per request, 64 at once",
+     "v": [
+      87200.0,
+      32878.0
+     ],
+     "cpu": [
+      0.996,
+      0.998
+     ],
+     "ccpu": [
+      2.431,
+      1.48
+     ],
+     "r": [
+      [
+       2.644,
+       2.559,
+       2.859
+      ]
+     ]
+    },
+    {
+     "name": "fixed answer (Lua handler / nginx return), keep-alive",
+     "v": [
+      225260.0,
+      76338.0
+     ],
+     "cpu": [
+      0.998,
+      0.998
+     ],
+     "ccpu": [
+      1.078,
+      1.036
+     ],
+     "r": [
+      [
+       2.883,
+       2.821,
+       3.084
+      ]
+     ]
+    }
+   ],
+   "unit": "req/s",
+   "better": "higher",
+   "pin": "each server on one core, wrk on 20 others",
+   "note": "socketley <code>--http dir --http-cache</code> against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua <code>on_http_request</code> on socketley and a <code>return 200</code> on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row.",
+   "caveat": "likely higher on this VM than on hardware; see the notes",
+   "headline": 0
+  },
+  {
+   "id": "proxy-http",
+   "runtime": "proxy",
+   "title": "Reverse proxy, HTTP and TCP",
+   "vs": [
+    "HAProxy 3.2.25",
+    "nginx 1.28.3"
+   ],
+   "arms": [
+    "socketley",
+    "HAProxy 3.2.25",
+    "nginx 1.28.3"
+   ],
+   "tool": "wrk 8 threads, 8 s a run",
+   "commit": "c7d4c42b",
+   "passes": 9,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "HTTP, 1 KiB, keep-alive, 32 connections",
+     "v": [
+      54030.0,
+      40324.0,
+      29813.0
+     ],
+     "cpu": [
+      1.0,
+      1.0,
+      1.0
+     ],
+     "ccpu": [
+      0.845,
+      0.668,
+      0.531
+     ],
+     "r": [
+      [
+       1.34,
+       1.3,
+       1.374
+      ],
+      [
+       1.812,
+       1.77,
+       1.838
+      ]
+     ]
+    },
+    {
+     "name": "HTTP, 1 KiB, keep-alive, 256 connections",
+     "v": [
+      33785.0,
+      36035.0,
+      31548.0
+     ],
+     "cpu": [
+      0.998,
+      0.998,
+      0.998
+     ],
+     "ccpu": [
+      0.57,
+      0.577,
+      0.515
+     ],
+     "r": [
+      [
+       0.934,
+       0.684,
+       1.114
+      ],
+      [
+       1.061,
+       0.766,
+       1.302
+      ]
+     ]
+    },
+    {
+     "name": "HTTP, 64 KiB, keep-alive, 256 connections",
+     "v": [
+      26379.0,
+      21665.0,
+      15799.0
+     ],
+     "cpu": [
+      0.998,
+      0.998,
+      0.997
+     ],
+     "ccpu": [
+      0.82,
+      0.682,
+      0.528
+     ],
+     "r": [
+      [
+       1.218,
+       1.167,
+       1.243
+      ],
+      [
+       1.662,
+       1.638,
+       1.694
+      ]
+     ]
+    },
+    {
+     "name": "HTTP, 1 KiB, a connection per request, 64 at once",
+     "v": [
+      42911.0,
+      26449.0,
+      20988.0
+     ],
+     "cpu": [
+      0.998,
+      0.998,
+      0.998
+     ],
+     "ccpu": [
+      1.331,
+      1.034,
+      0.934
+     ],
+     "r": [
+      [
+       1.634,
+       1.616,
+       1.703
+      ],
+      [
+       2.052,
+       1.964,
+       2.135
+      ]
+     ]
+    },
+    {
+     "name": "TCP relay, 1 KiB over HTTP keep-alive, 256 connections",
+     "v": [
+      99608.0,
+      43421.0,
+      70626.0
+     ],
+     "cpu": [
+      0.999,
+      0.999,
+      0.998
+     ],
+     "ccpu": [
+      1.063,
+      0.753,
+      0.943
+     ],
+     "r": [
+      [
+       2.28,
+       2.169,
+       2.385
+      ],
+      [
+       1.406,
+       1.352,
+       1.507
+      ]
+     ]
+    }
+   ],
+   "unit": "req/s",
+   "better": "higher",
+   "pin": "each proxy on one core, the nginx backend on four, wrk on 20",
+   "note": "All three forward <code>/px/…</code> with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with <code>http-reuse always</code>; nginx keeps 256 idle backend connections (<code>keepalive 256</code>). socketley keeps at most 32 parked and 32 pooled per backend, a fixed bound, so past about 64 requests at once it opens backend connections again: compare the 32- and the 256-connection rows.",
+   "headline": 1
+  },
+  {
+   "id": "dns-auth",
+   "runtime": "dns",
+   "title": "Authoritative DNS, one zone of 10,000 names",
+   "vs": [
+    "NSD 4.14.0",
+    "Knot 3.5.3"
+   ],
+   "arms": [
+    "socketley",
+    "NSD 4.14.0",
+    "Knot 3.5.3"
+   ],
+   "tool": "dnsperf 8 threads, 32 sockets, 8 s a run, zone of 10000 names",
+   "commit": "c7d4c42b",
+   "passes": 9,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "A queries over UDP",
+     "v": [
+      445777.0,
+      350822.0,
+      294908.0
+     ],
+     "cpu": [
+      0.998,
+      0.896,
+      0.907
+     ],
+     "ccpu": [
+      1.926,
+      2.034,
+      1.776
+     ],
+     "r": [
+      [
+       1.278,
+       1.237,
+       1.307
+      ],
+      [
+       1.531,
+       1.489,
+       1.577
+      ]
+     ]
+    },
+    {
+     "name": "A queries over TCP, 128 connections",
+     "v": [
+      191398.0,
+      54827.0,
+      61275.0
+     ],
+     "cpu": [
+      0.995,
+      0.942,
+      0.99
+     ],
+     "ccpu": [
+      1.674,
+      1.799,
+      1.454
+     ],
+     "r": [
+      [
+       3.532,
+       3.29,
+       3.644
+      ],
+      [
+       3.099,
+       2.922,
+       3.343
+      ]
+     ]
+    }
+   ],
+   "unit": "q per core·s",
+   "better": "higher",
+   "pin": "each server one worker on one core, dnsperf on 20 others",
+   "note": "Queries answered per second of server CPU (rate ÷ cores), because no server saturates its core at a window of 500 outstanding queries, and with more NSD and Knot drop UDP from their default socket buffers and dnsperf waits out each loss. socketley runs with <code>--rrl 0 --proxy none</code>: its response rate limit, on by default, would throttle one client host, and NSD and Knot have none by default. 90% of queries find a name, 10% are NXDOMAIN.",
+   "headline": 0
+  },
+  {
+   "id": "mqtt-broker",
+   "runtime": "mqtt",
+   "title": "MQTT broker, deliveries per second",
+   "vs": [
+    "Mosquitto 2.0.22"
+   ],
+   "arms": [
+    "socketley",
+    "Mosquitto 2.0.22"
+   ],
+   "tool": "mqbench (MQTT 3.1.1), 6 s a run",
+   "commit": "c7d4c42b",
+   "passes": 9,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B",
+     "v": [
+      8001448.0,
+      793385.0
+     ],
+     "cpu": [
+      0.967,
+      0.991
+     ],
+     "ccpu": [
+      0.525,
+      0.057
+     ],
+     "r": [
+      [
+       10.114,
+       9.958,
+       10.28
+      ]
+     ],
+     "unit": "msg/s",
+     "better": "higher"
+    },
+    {
+     "name": "fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B",
+     "v": [
+      11981113.0,
+      501737.0
+     ],
+     "cpu": [
+      0.998,
+      0.994
+     ],
+     "ccpu": [
+      0.784,
+      0.43
+     ],
+     "r": [
+      [
+       23.015,
+       20.475,
+       30.987
+      ]
+     ],
+     "unit": "msg/s",
+     "better": "higher"
+    },
+    {
+     "name": "fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B",
+     "v": [
+      1463538.0,
+      69348.0
+     ],
+     "cpu": [
+      0.998,
+      0.999
+     ],
+     "ccpu": [
+      1.204,
+      1.093
+     ],
+     "r": [
+      [
+       21.203,
+       21.015,
+       21.419
+      ]
+     ],
+     "unit": "msg/s",
+     "better": "higher"
+    },
+    {
+     "name": "round trip, QoS 1 publish to own delivery",
+     "v": [
+      26.6,
+      42.7
+     ],
+     "cpu": [
+      0.914,
+      0.676
+     ],
+     "ccpu": [
+      0.644,
+      0.628
+     ],
+     "r": [
+      [
+       1.608,
+       1.596,
+       1.624
+      ]
+     ],
+     "unit": "µs",
+     "better": "lower"
+    }
+   ],
+   "unit": "msg/s",
+   "better": "higher",
+   "pin": "each broker on one core, mqbench on 20 others",
+   "note": "MQTT 3.1.1, 64-byte payloads; Mosquitto with persistence off and unbounded queues, socketley <code>--anonymous --session-queue 100000</code>. A fan-out delivery costs Mosquitto about 4 µs of CPU, one write each; socketley coalesces the writes to a subscriber, which is the whole of the fan-out difference. The round trip is a QoS 1 publish to the publisher's own subscription.",
+   "headline": 2
+  },
+  {
+   "id": "storage-s3",
+   "runtime": "storage",
+   "title": "S3 over HTTP, SigV4",
+   "vs": [
+    "MinIO 2025-09-07"
+   ],
+   "arms": [
+    "socketley",
+    "MinIO 2025-09-07"
+   ],
+   "tool": "warp 1.3.1, 8s a run, SigV4 over plain HTTP; six warp processes",
+   "commit": "c7d4c42b",
+   "passes": 7,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "GET 4 KiB, 1 connection",
+     "v": [
+      8277.0,
+      2657.0
+     ],
+     "cpu": [
+      0.18,
+      0.84
+     ],
+     "ccpu": [
+      0.99,
+      0.44
+     ],
+     "r": [
+      [
+       3.116,
+       3.106,
+       3.144
+      ]
+     ]
+    },
+    {
+     "name": "GET 4 KiB, 4 × 16 connections",
+     "v": [
+      205747.0,
+      17123.0
+     ],
+     "cpu": [
+      1.94,
+      3.12
+     ],
+     "ccpu": [
+      13.59,
+      2.89
+     ],
+     "r": [
+      [
+       12.021,
+       11.894,
+       12.357
+      ]
+     ]
+    },
+    {
+     "name": "GET 1 MiB, 4 × 16 connections",
+     "v": [
+      30604.0,
+      5375.0
+     ],
+     "cpu": [
+      2.86,
+      2.84
+     ],
+     "ccpu": [
+      10.69,
+      2.45
+     ],
+     "r": [
+      [
+       5.692,
+       5.548,
+       5.862
+      ]
+     ]
+    },
+    {
+     "name": "PUT 4 KiB, 4 × 16 connections, into an empty store",
+     "v": [
+      55920.0,
+      12426.0
+     ],
+     "cpu": [
+      2.579,
+      2.65
+     ],
+     "ccpu": [
+      8.708,
+      2.052
+     ],
+     "r": [
+      [
+       4.478,
+       4.378,
+       4.64
+      ]
+     ]
+    }
+   ],
+   "unit": "obj/s",
+   "better": "higher",
+   "pin": "both servers on the same four cores (socketley as four shards), six warp processes on 20 others",
+   "note": "MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.",
+   "caveat": "a floor: the load generator ran out before socketley did",
+   "headline": 1
+  },
+  {
+   "id": "db-docs",
+   "runtime": "db",
+   "title": "JSON documents over HTTP",
+   "vs": [
+    "MongoDB 9.0.4",
+    "PocketBase 0.40.5"
+   ],
+   "arms": [
+    "socketley",
+    "MongoDB 9.0.4",
+    "PocketBase 0.40.5"
+   ],
+   "tool": "loadgen, 8s a run, 100,000 documents, data on tmpfs",
+   "commit": "c7d4c42b",
+   "passes": 7,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "read one document by id, 64 clients",
+     "v": [
+      666213.0,
+      145310.0,
+      33925.0
+     ],
+     "cpu": [
+      3.494,
+      3.879,
+      3.858
+     ],
+     "ccpu": [
+      13.197,
+      9.019,
+      1.061
+     ],
+     "r": [
+      [
+       4.559,
+       4.432,
+       4.73
+      ],
+      [
+       19.648,
+       19.224,
+       19.95
+      ]
+     ]
+    },
+    {
+     "name": "replace one document, 64 clients",
+     "v": [
+      112130.0,
+      101399.0,
+      11348.0
+     ],
+     "cpu": [
+      2.922,
+      3.938,
+      2.724
+     ],
+     "ccpu": [
+      4.761,
+      6.517,
+      0.423
+     ],
+     "r": [
+      [
+       1.105,
+       1.058,
+       1.135
+      ],
+      [
+       9.929,
+       9.7,
+       10.127
+      ]
+     ]
+    },
+    {
+     "name": "query on an indexed field, 64 clients",
+     "v": [
+      472060.0,
+      80446.0,
+      21455.0
+     ],
+     "cpu": [
+      3.599,
+      3.905,
+      3.781
+     ],
+     "ccpu": [
+      11.94,
+      7.336,
+      0.698
+     ],
+     "r": [
+      [
+       5.916,
+       5.355,
+       6.202
+      ],
+      [
+       22.183,
+       20.905,
+       23.189
+      ]
+     ]
+    },
+    {
+     "name": "mixed: 90% reads, 10% writes, 64 clients",
+     "v": [
+      311658.0,
+      124287.0,
+      37695.0
+     ],
+     "cpu": [
+      3.636,
+      3.912,
+      3.602
+     ],
+     "ccpu": [
+      10.087,
+      7.977,
+      1.173
+     ],
+     "r": [
+      [
+       2.509,
+       2.399,
+       2.646
+      ],
+      [
+       8.235,
+       7.882,
+       8.791
+      ]
+     ]
+    }
+   ],
+   "unit": "req/s",
+   "better": "higher",
+   "pin": "all three on the same four cores (socketley as four shards), loadgen on 20 others",
+   "note": "100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db sends every write to shard 0, so writes take one core however many shards there are.",
+   "headline": 3
+  },
+  {
+   "id": "tunnel-rev",
+   "runtime": "tunnel",
+   "title": "A TCP service behind an edge",
+   "vs": [
+    "frp 0.71.1"
+   ],
+   "arms": [
+    "socketley",
+    "frp 0.71.1"
+   ],
+   "tool": "tb_client, one connection",
+   "commit": "c7d4c42b",
+   "passes": 9,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "round trip through the tunnel, 64 B echo",
+     "v": [
+      88.5,
+      168.0
+     ],
+     "cpu": [
+      0.868,
+      1.348
+     ],
+     "ccpu": [
+      0.169,
+      0.093
+     ],
+     "r": [
+      [
+       1.898,
+       1.881,
+       1.91
+      ]
+     ],
+     "unit": "µs",
+     "better": "lower"
+    },
+    {
+     "name": "throughput, 512 MiB echoed through the tunnel",
+     "v": [
+      649.0,
+      855.0
+     ],
+     "cpu": [
+      1.917,
+      1.841
+     ],
+     "ccpu": [
+      0.622,
+      0.308
+     ],
+     "r": [
+      [
+       0.758,
+       0.718,
+       0.825
+      ]
+     ],
+     "unit": "MiB/s",
+     "better": "higher"
+    }
+   ],
+   "unit": "MiB/s",
+   "better": "higher",
+   "pin": "agent and edge (frpc and frps) on the same two cores, the echo service on a third",
+   "note": "socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in about half frp's time and moves bulk data at three quarters of its rate.",
+   "headline": 1
+  },
+  {
+   "id": "metrics",
+   "runtime": "metrics",
+   "title": "Scraping 100,000 series a second",
+   "vs": [
+    "Prometheus 2.53.5",
+    "VictoriaMetrics 1.112"
+   ],
+   "arms": [
+    "socketley",
+    "Prometheus 2.53.5",
+    "VictoriaMetrics 1.112"
+   ],
+   "tool": "50 targets × 2000 series, scraped every 1 s by all three at once",
+   "commit": "c7d4c42b",
+   "passes": 7,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "CPU per sample ingested",
+     "v": [
+      1.375,
+      0.78,
+      1.122
+     ],
+     "cpu": [
+      0.137,
+      0.078,
+      0.112
+     ],
+     "ccpu": [
+      0,
+      0,
+      0
+     ],
+     "r": [
+      [
+       0.567,
+       0.561,
+       0.594
+      ],
+      [
+       0.821,
+       0.81,
+       0.85
+      ]
+     ],
+     "unit": "µs",
+     "better": "lower"
+    },
+    {
+     "name": "resident memory",
+     "v": [
+      273.0,
+      404.0,
+      117.0
+     ],
+     "cpu": [
+      null,
+      null,
+      null
+     ],
+     "ccpu": [
+      0,
+      0,
+      0
+     ],
+     "r": [
+      [
+       1.478,
+       1.234,
+       2.235
+      ],
+      [
+       0.443,
+       0.312,
+       0.687
+      ]
+     ],
+     "unit": "MB",
+     "better": "lower"
+    },
+    {
+     "name": "range query, 5 min of every path",
+     "v": [
+      211.0,
+      659.0,
+      136.0
+     ],
+     "cpu": [
+      null,
+      null,
+      null
+     ],
+     "ccpu": [
+      0,
+      0,
+      0
+     ],
+     "r": [
+      [
+       3.117,
+       2.54,
+       3.435
+      ],
+      [
+       0.643,
+       0.477,
+       1.113
+      ]
+     ],
+     "unit": "ms",
+     "better": "lower"
+    }
+   ],
+   "unit": "µs",
+   "better": "lower",
+   "pin": "all three at once on the same two cores, the targets on four others; each pass a 60 s window",
+   "note": "50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.",
+   "headline": 0
+  },
+  {
+   "id": "sync",
+   "runtime": "sync",
+   "title": "Carrying a directory into a storage",
+   "vs": [
+    "rclone 1.60.1"
+   ],
+   "arms": [
+    "socketley",
+    "rclone 1.60.1"
+   ],
+   "tool": "the carriers themselves; the storage target is one socketley storage runtime on other cores",
+   "commit": "c7d4c42b",
+   "passes": 7,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "first copy, 2000 files of 64 KiB and 50 of 1 MiB",
+     "v": [
+      7092.0,
+      3526.0
+     ],
+     "cpu": [
+      0.173,
+      1.475
+     ],
+     "ccpu": [
+      0.0,
+      0.0
+     ],
+     "r": [
+      [
+       2.007,
+       1.953,
+       2.078
+      ]
+     ]
+    },
+    {
+     "name": "1000 files changed after it",
+     "v": [
+      4124.0,
+      2948.0
+     ],
+     "cpu": [
+      0.207,
+      1.667
+     ],
+     "ccpu": [
+      0.0,
+      0.0
+     ],
+     "r": [
+      [
+       1.392,
+       1.354,
+       1.509
+      ]
+     ]
+    }
+   ],
+   "unit": "files/s",
+   "better": "higher",
+   "pin": "the carrier on two cores, the target storage runtime in a daemon of its own on four others",
+   "note": "The same socketley storage runtime is the target for both, on tmpfs. rclone is the 1.60 Ubuntu packages (default four transfers); a socketley sync job is one runtime that keeps watching the directory and carries a change when inotify reports it, where rclone walks both sides again. A job's end is read off its figures, which refresh every 250 ms, so each run is made several seconds long."
+  },
+  {
+   "id": "idp",
+   "runtime": "idp",
+   "title": "OpenID Connect provider",
+   "vs": [
+    "Keycloak 26.8.1"
+   ],
+   "arms": [
+    "socketley",
+    "Keycloak 26.8.1"
+   ],
+   "tool": "idpgen, 8s a run, 200 accounts",
+   "commit": "c7d4c42b",
+   "passes": 7,
+   "date": "2026-11-03",
+   "rows": [
+    {
+     "name": "sign-in: authorization code with a password, 4 clients",
+     "v": [
+      106.0,
+      191.0
+     ],
+     "cpu": [
+      2.998,
+      3.891
+     ],
+     "ccpu": [
+      0.046,
+      0.103
+     ],
+     "r": [
+      [
+       0.592,
+       0.523,
+       0.701
+      ]
+     ]
+    },
+    {
+     "name": "refresh token, 64 clients",
+     "v": [
+      49329.0,
+      2415.0
+     ],
+     "cpu": [
+      2.493,
+      3.89
+     ],
+     "ccpu": [
+      4.313,
+      0.302
+     ],
+     "r": [
+      [
+       20.482,
+       18.97,
+       21.186
+      ]
+     ]
+    },
+    {
+     "name": "userinfo, 64 clients",
+     "v": [
+      175323.0,
+      19944.0
+     ],
+     "cpu": [
+      2.475,
+      3.891
+     ],
+     "ccpu": [
+      10.711,
+      1.523
+     ],
+     "r": [
+      [
+       8.772,
+       8.203,
+       9.16
+      ]
+     ]
+    },
+    {
+     "name": "JWKS, 64 clients",
+     "v": [
+      175754.0,
+      30059.0
+     ],
+     "cpu": [
+      2.214,
+      3.898
+     ],
+     "ccpu": [
+      11.237,
+      2.355
+     ],
+     "r": [
+      [
+       5.912,
+       5.756,
+       6.06
+      ]
+     ]
+    }
+   ],
+   "unit": "req/s",
+   "better": "higher",
+   "pin": "both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen on 20 others",
+   "note": "200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. On refresh, userinfo and JWKS socketley uses two and a half of its four cores while idpgen takes up to eleven, so those ratios are floors. A sign-in runs four at a time, since socketley refuses a fifth from one address while four are being checked.",
+   "caveat": "a floor: the load generator ran out before socketley did",
+   "headline": 1
+  }
+ ]
+}

@@ -1,0 +1,15 @@
+<p>A <b>mail</b> runtime is a mail server. It takes the mail of its domains and the mail its users send, keeps each message in a spool synced to disk before it says 250, hands mail for elsewhere to the domain's exchanger or a smarthost, and keeps its users' mailboxes in a <a href="#/rt/storage">storage</a> runtime, read over IMAP, POP3, JMAP or in the browser. A <a href="#/rt/dns">dns</a> runtime gives its domains their records, an <a href="#/rt/idp">idp</a> runtime its users, and every other runtime, the CLI and the daemon's alerts can send through it.</p>
+<pre class="code">socketley create mail m -p 25 --dns ns --no-reply -s            <i># only sends: alerts, notices</i>
+socketley send m --to ops@example.com --subject "Backup done" --text ok
+
+socketley create mail m -p 25 --dns ns --idp auth --storage files/mail \
+    --submission 587 --imap 143 --tls -s</pre>
+
+<h3>What it does</h3>
+<ul>
+<li><b>Receiving</b>: SMTP on 25 with SPF, DKIM, DMARC and ARC checked, <code>--greylist</code>, DNS block lists, <code>--clamav</code> and <code>--rspamd</code> when given, <code>--refuse-attachments</code>, and Sieve filters per user (ManageSieve on <code>--sieve</code>).</li>
+<li><b>Sending</b>: <code>--submission</code> (STARTTLS) and <code>--submissions</code> (TLS) for users, DKIM signing with key rotation (<code>--dkim-selector</code>, <code>--dkim-next</code>), delivery over DANE and MTA-STS, retries until <code>--queue-lifetime</code>, or a <code>--relay</code> smarthost.</li>
+<li><b>Reading</b>: <code>--imap</code>/<code>--imaps</code>, <code>--pop3</code>/<code>--pop3s</code>, <code>--jmap</code>, and webmail on <code>--web</code>; quotas with <code>--default-quota</code>.</li>
+<li><b>The domain's records</b>: through <code>--dns</code> it publishes MX, SPF, DKIM, DMARC (<code>--dmarc-policy</code>, <code>--dmarc-rua</code>), MTA-STS, TLS-RPT and BIMI, and with <code>--reports</code> reads the reports others send back.</li>
+<li><b>Operating it</b>: <code>socketley mail queue|show|flush|drop|trace|usage</code>, suppression lists, and <code>on_rcpt</code>/<code>on_message</code> in Lua.</li>
+</ul>

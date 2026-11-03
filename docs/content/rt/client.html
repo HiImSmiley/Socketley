@@ -1,0 +1,14 @@
+<p>A <b>client</b> is the other end: a long-living connection this daemon dials and keeps, to a socketley server or anything else that speaks TCP or UDP, optionally over TLS. It reconnects with back-off when the line drops, so a script on it can treat the peer as always there, and what arrives can be printed, written to a file or handled in Lua.</p>
+<pre class="code">socketley create client feed -t 10.0.0.5:9000 --reconnect 0 -b -s   <i># print what arrives, reconnect for ever</i>
+socketley send feed "subscribe prices"
+socketley create client probe -t unix:/run/app.sock --lua probe.lua -s</pre>
+
+<h3>What it does</h3>
+<ul>
+<li><b>Targets</b>: <code>-t host:port</code> or <code>-t unix:/path</code>; <code>--udp</code> for datagrams.</li>
+<li><b>TLS</b> with <code>--tls</code>, verifying the chain against <code>--ca</code> or the system store and the host name from <code>-t</code>, presenting <code>--cert</code>/<code>--key</code> when the server asks. There is no switch to skip verification.</li>
+<li><b>Reconnects</b> with <code>--reconnect [n]</code>, backing off, <code>0</code> for no end.</li>
+<li><b>Output</b>: <code>-b</code>, <code>-bp</code>, <code>-bt</code>, <code>-bpt</code> print each message with the name and time; <code>-w file</code> writes them.</li>
+<li><b>Direction</b>: <code>--mode inout|in|out</code>.</li>
+<li><b>Lua</b>: <code>on_connect</code>, <code>on_message</code>, <code>on_disconnect</code>, timers, and <code>self.send()</code> with back-pressure through <code>self.pending()</code> and <code>on_writable</code>.</li>
+</ul>

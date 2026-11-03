@@ -1,0 +1,32 @@
+<p>A runtime created with <code>--lua file</code> runs that script in its worker: LuaJIT, Lua 5.1 syntax, with the runtime as <code>self</code>. The script is loaded at <code>start</code> and replaced in place with <code>socketley reload-lua name</code>, connections kept. Callbacks are plain global functions; a runtime calls those its type has.</p>
+<pre class="code">-- a server that answers each line, counts clients and says the time every minute
+local n = 0
+function on_connect(id)    n = n + 1 end
+function on_disconnect(id) n = n - 1 end
+function on_client_message(id, msg)
+    self.send(id, "you said: " .. msg)
+end
+socketley.set_interval(60000, function()
+    self.broadcast(os.date("%H:%M") .. ", " .. n .. " online")
+end)</pre>
+
+<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>A callback runs on the runtime's only thread. Everything here that waits does so without blocking it, with one exception named in its entry: <code>socketley.http</code>. Every callback runs under a deadline, so one that loops for ever is ended and the runtime goes on; see <b>Callback Deadline</b> below.</div></div>
+
+<h2>Callbacks</h2>
+<x-man s="lua-configuration.available-callbacks"></x-man>
+
+<h2>What a script calls</h2>
+<x-man s="lua-configuration.runtime-methods-in-lua" fold></x-man>
+<x-man s="lua-configuration.global-functions" fold></x-man>
+<x-man s="lua-configuration.runtime-management-api" fold></x-man>
+
+<h2>The rest</h2>
+<x-man s="lua-configuration.configuration-file-format" fold></x-man>
+<x-man s="lua-configuration.a-machine-s-setup" fold></x-man>
+<x-man s="lua-configuration.handler-privileges" fold></x-man>
+<x-man s="lua-configuration.callback-deadline" fold></x-man>
+<x-man s="lua-configuration.proxy-filter-chain" fold></x-man>
+<x-man s="lua-configuration.declared-routes" fold></x-man>
+<x-man s="lua-configuration.cluster-introspection-api" fold></x-man>
+<x-man s="lua-configuration.cluster-event-callbacks" fold></x-man>
+<p>Runtime-specific script APIs are in their own sections: <a href="#/man/storage-flags.lua">storage</a>, <a href="#/man/storage-flags.socketley-storage">socketley.storage</a>, and the Lua parts of the <a href="#/rt/mqtt">mqtt</a> and <a href="#/rt/mail">mail</a> manuals. Working scripts for every type are in <code>examples/</code> of the repository.</p>

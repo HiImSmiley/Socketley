@@ -1,0 +1,15 @@
+<p>A <b>sync</b> runtime is one job that carries files between a directory and a <a href="#/rt/storage">storage</a>, out to it, in from it, or both ways. One runtime is one job, so what goes wrong with it has its own line in <code>socketley ls</code>, its own figures, its own log lines and its own alert. It listens on nothing.</p>
+<pre class="code">socketley create sync photos --dir /srv/photos --storage ui/photos \
+    --credentials /etc/socketley/sync.creds --mode out -s
+socketley create sync offsite --dir /srv/photos \
+    --storage https://files.example.com/photos --credentials /etc/socketley/offsite.creds \
+    --every 1h --exclude '*.tmp,.git/*' -s</pre>
+
+<h3>What it does</h3>
+<ul>
+<li><b>Where</b>: <code>--storage</code> is a storage runtime and a bucket (<code>ui/photos</code>), a host and port, or any S3 URL, with the bucket last; more than one target is taken only with <code>--mode out</code>.</li>
+<li><b>Which way</b>: <code>--mode out</code> mirrors the directory to the bucket, <code>in</code> the bucket to the directory, <code>inout</code> both, a change on either side carried to the other.</li>
+<li><b>When</b>: on every change the kernel reports in the directory, and a whole walk every <code>--every</code> to catch what was missed.</li>
+<li><b>What</b>: everything below <code>--dir</code> but the <code>--exclude</code> patterns, under <code>--prefix</code> in the bucket.</li>
+<li><b>Git</b>: with <code>--repositories</code> it pulls users' git repositories for a storage's web interface.</li>
+</ul>

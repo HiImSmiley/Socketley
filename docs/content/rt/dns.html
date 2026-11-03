@@ -1,0 +1,15 @@
+<p>A <b>dns</b> runtime is an authoritative name server: it answers, over UDP and TCP on one port, for the zones it is given and for nothing else. It asks no other server and caches nothing, so a name outside its zones is answered REFUSED and it can never be an open resolver. Given <code>--publish</code> it also answers for the names runtimes carry with <code>--domain</code>, and it proves wildcard certificates for ACME over DNS-01.</p>
+<pre class="code">socketley create dns ns --zone example.com --publish 203.0.113.7 -s   <i># writes a zone file to start from</i>
+dig @127.0.0.1 example.com SOA
+socketley create dns ns2 --zone /etc/socketley/example.com.zone \
+    --publish 203.0.113.7 --transfer 203.0.113.53 --notify 203.0.113.53 --dnssec -s</pre>
+
+<h3>What it does</h3>
+<ul>
+<li><b>Zone files</b> in RFC 1035 master format: wildcards, CNAMEs followed inside the zone, delegations with glue; an edited file is served within a second.</li>
+<li><b>Transport</b>: EDNS with answers kept to 1232 bytes, truncation and retry over TCP, port 53 unless <code>-p</code> says otherwise, IPv4 and IPv6.</li>
+<li><b>Secondaries</b>: AXFR to the addresses <code>--transfer</code> names, NOTIFY to those <code>--notify</code> names.</li>
+<li><b>DNSSEC</b> with <code>--dnssec</code>: zones signed online, and <code>socketley <code>socketley dns ds</code> prints the DS record for the parentlt;name<code>socketley dns ds</code> prints the DS record for the parentgt; dnssec</code> prints the DS record for the parent.</li>
+<li><b>Abuse</b>: response rate limiting per network with <code>--rrl</code>.</li>
+<li><b>Runtimes' names</b>: <code>--publish</code> answers the <code>--domain</code> names of this daemon's runtimes; <code>--proxy</code> makes the entrance those names reach, see <a href="#/man/dns-flags.names-runtimes-are-reached-by">names runtimes are reached by</a>.</li>
+</ul>

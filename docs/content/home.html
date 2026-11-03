@@ -1,0 +1,27 @@
+<pre class="code">curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
+socketley create cache store -p 6379 -s          <i># a Redis-compatible cache</i>
+socketley create server api -p 9000 --lua api.lua -s
+socketley create proxy edge -p 8080 --backend api -s
+socketley ls</pre>
+
+<h2>What it is</h2>
+<p>socketley is one binary. Run as <code>socketley daemon</code> it keeps <b>runtimes</b>: long-living network services, each made with one command, each running in a worker process of its own on an io_uring event loop. Run as anything else it is the CLI that talks to that daemon over a unix socket, the way <code>docker</code> talks to <code>dockerd</code>.</p>
+<p>A runtime has a type and a name. The type decides what it speaks; the name is how everything else reaches it: a proxy routes to <code>--backend api</code>, a server script asks the cache <code>store</code>, the DNS runtime answers for the names runtimes are given. Every runtime is created, started, stopped, edited, exported and removed the same way, and comes back by itself when the daemon restarts.</p>
+
+<h2>The runtimes</h2>
+<x-cards></x-cards>
+
+<h2>Against what people run instead</h2>
+<p>A headline row of each runtime's <a href="#/bench">benchmarks</a>, socketley's rate over the reference's, with the range across passes. Every set, its method and its notes are on the benchmarks page.</p>
+<x-glance></x-glance>
+
+<h2>Where to go next</h2>
+<ul>
+<li><a href="#/install">Install</a> it, then take the <a href="#/tour">ten-minute tour</a>: a server, a cache and a proxy, scripted and inspected.</li>
+<li><a href="#/concepts">Concepts</a>: the daemon, a runtime's life, names, ports, TLS, shards and the cluster, each in a few paragraphs.</li>
+<li>Every runtime has a page with its overview, <b>every flag</b> it takes, its <b>benchmarks</b> and its whole section of the manual.</li>
+<li><a href="#/cli">CLI</a>, <a href="#/flags">all flags</a>, <a href="#/lua">Lua</a> and the <a href="#/man">manual</a> are the reference; the search box at the top (<code>/</code>) finds any flag, command, callback or setting.</li>
+<li><a href="#/bench">Benchmarks</a>: each runtime against the server it replaces, with the method written down.</li>
+</ul>
+
+<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>The reference parts of this site, every flag, command, callback and variable, are generated from <code>man/socketley.1</code> and the dashboard's flag table, which the test suite holds against the code. When this page and <code>man socketley</code> disagree, the manual is right and this page is stale.</div></div>

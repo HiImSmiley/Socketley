@@ -1,0 +1,41 @@
+<p>Ten minutes, three runtimes. Every command here works against a fresh install; nothing has to be written to a file except one short script.</p>
+
+<h2>1. A server</h2>
+<pre class="code">socketley create server chat -p 9000 -s
+socketley ls</pre>
+<p><code>create</code> makes a runtime and <code>-s</code> starts it at once. Open two terminals with <code>nc 127.0.0.1 9000</code>: a line typed in one appears in the other, because a server without a script relays what each client says to the others. <code>socketley send chat "hello"</code> sends to all of them from the CLI.</p>
+
+<h2>2. A script</h2>
+<p>Write <code>echo.lua</code>:</p>
+<pre class="code">function on_client_message(id, msg)
+    self.send(id, "you said: " .. msg)
+end</pre>
+<pre class="code">socketley create server echo -p 9001 --lua echo.lua -s
+printf 'hi\n' | nc -q1 127.0.0.1 9001</pre>
+<p><code>on_client_message</code> is told who spoke, and <code>self.send(id, …)</code> answers that connection. Edit the file and run <code>socketley reload-lua echo</code>; connections stay open. Every callback and method is on the <a href="#/lua">Lua page</a>.</p>
+
+<h2>3. A cache</h2>
+<pre class="code">socketley create cache store -p 6379 -s
+redis-cli -p 6379 SET visits 0
+redis-cli -p 6379 INCR visits</pre>
+<p>The cache speaks the Redis protocol, so <code>redis-cli</code> and any Redis library work. It also answers plain text: <code>printf 'get visits\n' | nc -q1 127.0.0.1 6379</code>.</p>
+
+<h2>4. A proxy</h2>
+<pre class="code">socketley create server web -p 9100 --http ./site -s
+socketley create proxy gw -p 8080 --backend web -s
+curl http://127.0.0.1:8080/gw/index.html</pre>
+<p>The backend is named by its runtime name, so the proxy follows it if its port changes. A request to <code>/gw/...</code> reaches the backend as <code>/...</code>; give the proxy <code>--domain</code> names and put it behind the entrance to serve sites under their own names with certificates.</p>
+
+<h2>5. Look at it</h2>
+<pre class="code">socketley ls                 <i># every runtime, its state and port</i>
+socketley stats gw           <i># live counters</i>
+socketley show echo          <i># its configuration as JSON</i>
+socketley edit gw --backend-timeout 5s --restart
+socketley stop chat; socketley remove chat</pre>
+<p>Restart the daemon (<code>sudo systemctl restart socketley</code>): every runtime that was running comes back by itself. The <a href="#/man/dashboard">dashboard</a> shows the same in a browser.</p>
+
+<h2>Where next</h2>
+<ul>
+<li>Each runtime's page: <a href="#/rt/server">server</a>, <a href="#/rt/proxy">proxy</a>, <a href="#/rt/cache">cache</a>, and the ten others.</li>
+<li><a href="#/concepts">Concepts</a> for what every runtime shares, <a href="#/deploy">deployment</a> before running it for real.</li>
+</ul>

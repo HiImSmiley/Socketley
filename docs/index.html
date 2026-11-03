@@ -1,83 +1,32 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Socketley Documentation</title>
-<link rel="stylesheet" href="css/style.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#07080c">
+<meta name="description" content="socketley: one Linux daemon and CLI for servers, proxies, a Redis-compatible cache, S3 storage, documents, DNS, sign-in, MQTT, mail, metrics and tunnels. Every runtime, flag, command and Lua call, and the benchmarks.">
+<title>Documentation · socketley</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='1' y2='1'%3E%3Cstop stop-color='%23c084fc'/%3E%3Cstop offset='.55' stop-color='%23f472b6'/%3E%3Cstop offset='1' stop-color='%23fb923c'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='24' height='24' rx='6' fill='url(%23g)'/%3E%3Cpath d='M4 12h3.5l2-5 4 10 2-5H20' fill='none' stroke='%23fff' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/kit.css">
+<link rel="stylesheet" href="css/docs.css">
 </head>
 <body>
-
-<button class="menu-toggle" id="menuToggle" aria-label="Toggle menu">&#9776;</button>
-<div class="overlay" id="overlay"></div>
-
-<aside class="sidebar" id="sidebar">
-  <div class="sidebar-header">
-    <div class="brand">
-      <h1>Socketley</h1>
-      <p>Documentation</p>
-      <a class="github-link" href="https://github.com/HiImSmiley/Socketley" target="_blank" rel="noopener">
-        <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-        GitHub
-      </a>
+<div id="aurora"><i></i><i></i><i></i></div>
+<div id="app">
+  <aside id="side"></aside>
+  <div id="main">
+    <div id="top">
+      <button class="ib" id="menuB" aria-label="Menu"></button>
+      <nav class="crumbs" id="crumbs"></nav>
+      <div class="search" id="srch"><input class="inp" id="q" placeholder="Search flags, commands, callbacks" spellcheck="false" autocomplete="off" aria-label="Search"><kbd>/</kbd></div>
+      <a class="gh" href="https://github.com/HiImSmiley/Socketley" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a>
     </div>
+    <div id="scroll"><div id="content"></div></div>
   </div>
-
-  <!-- Tab Switcher -->
-  <div class="tab-switcher">
-    <button class="tab-btn" data-tab="socketley">Socketley</button>
-    <button class="tab-btn" data-tab="lua">Lua</button>
-    <button class="tab-btn" data-tab="examples">Examples</button>
-  </div>
-
-  <!-- Socketley Sub-tabs (CLI | C++ SDK) -->
-  <div id="skSubTabs" class="sub-tab-switcher" style="display:none">
-    <button class="sub-tab-btn active" data-subtab="cli" data-subtab-group="sk">CLI</button>
-    <button class="sub-tab-btn" data-subtab="sdk" data-subtab-group="sk">C++ SDK</button>
-  </div>
-
-  <!-- SDK Platform switcher (Linux | Other) -->
-  <div id="skSdkPlatTabs" class="sub-tab-switcher" style="display:none">
-    <button class="sub-tab-btn active" data-subtab="linux" data-subtab-group="sk-sdk">Linux</button>
-    <button class="sub-tab-btn" data-subtab="other" data-subtab-group="sk-sdk">Other</button>
-  </div>
-
-  <!-- Lua Sub-tabs (API | Addons) -->
-  <div id="luaSubTabs" class="sub-tab-switcher" style="display:none">
-    <button class="sub-tab-btn active" data-subtab="api" data-subtab-group="lua">API</button>
-    <button class="sub-tab-btn" data-subtab="addons" data-subtab-group="lua">Addons</button>
-  </div>
-
-  <!-- Examples Sub-tabs (CLI | C++ SDK) -->
-  <div id="exSubTabs" class="sub-tab-switcher" style="display:none">
-    <button class="sub-tab-btn active" data-subtab="cli" data-subtab-group="ex">CLI</button>
-    <button class="sub-tab-btn" data-subtab="sdk" data-subtab-group="ex">C++ SDK</button>
-  </div>
-
-  <!-- Examples SDK Platform switcher (Linux | Other) -->
-  <div id="exSdkPlatTabs" class="sub-tab-switcher" style="display:none">
-    <button class="sub-tab-btn active" data-subtab="linux" data-subtab-group="ex-sdk">Linux</button>
-    <button class="sub-tab-btn" data-subtab="other" data-subtab-group="ex-sdk">Other</button>
-  </div>
-
-  <!-- Search -->
-  <div class="search-box">
-    <input type="text" id="search" placeholder="Search docs..." autocomplete="off">
-  </div>
-
-  <nav id="sidebarNav">
-  </nav>
-</aside>
-
-<div id="content-socketley" class="content"></div>
-<div id="content-socketley-sdk" class="content" style="display:none"></div>
-<div id="content-socketley-sdk-cross" class="content" style="display:none"></div>
-<div id="content-lua" class="content" style="display:none"></div>
-<div id="content-addons" class="content" style="display:none"></div>
-<div id="content-examples" class="content" style="display:none"></div>
-<div id="content-examples-sdk" class="content" style="display:none"></div>
-<div id="content-examples-sdk-cross" class="content" style="display:none"></div>
-
-<script src="js/app.js"></script>
+</div>
+<div id="toasts"></div>
+<noscript><p style="padding:24px">This documentation needs JavaScript. The same content is the manual page: <code>man socketley</code>.</p></noscript>
+<script src="js/kit.js"></script>
+<script src="js/docs.js"></script>
 </body>
 </html>
