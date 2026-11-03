@@ -69,7 +69,8 @@ private:
     std::string build_json_runtimes() const;
     std::string build_json_runtime(std::string_view name) const;
     // The page's history of a runtime, '' for all of them, and its alerts, both read from a metrics runtime.
-    std::string history_json(std::string_view runtime, int64_t range, size_t points) const;
+    // `since` the last bucket a page holds, for the ones after it alone.
+    std::string history_json(std::string_view runtime, int64_t range, size_t points, int64_t since = 0) const;
     std::string alerts_json() const;
 
     runtime_manager& m_manager;

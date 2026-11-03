@@ -48,6 +48,8 @@ std::string served_cert(const runtime_instance& rt);
 std::string query_field(std::string_view query, std::string_view name);
 // One answer, closing the connection.
 void send(int fd, int status, std::string_view type, std::string_view body, std::string_view extra_headers = {});
+// A JSON answer, gzipped for a client that takes it once it is large enough for that to save a packet.
+void send_json(int fd, const request& r, std::string_view body);
 
 class server
 {

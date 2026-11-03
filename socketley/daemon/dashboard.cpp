@@ -194,6 +194,17 @@ void send(int fd, int status, std::string_view type, std::string_view body, std:
     socketley::write_all_until(fd, out.data(), out.size(), std::chrono::steady_clock::now() + std::chrono::seconds(3));
 }
 
+void send_json(int fd, const request& r, std::string_view body)
+{
+    if (body.size() < 512 || !socketley::http::accepts_coding(r.header("accept-encoding"), "gzip"))
+    {
+        send(fd, 200, "application/json", body, "Vary: Accept-Encoding\r\n");
+        return;
+    }
+    send(fd, 200, "application/json", socketley::gzip_of(body, socketley::deflater::effort::fast),
+         "Vary: Accept-Encoding\r\nContent-Encoding: gzip\r\n");
+}
+
 server::server(std::string credentials, std::string idp, runtime_manager& manager)
     : m_credentials(std::move(credentials)), m_manager(manager)
 {
@@ -472,7 +483,7 @@ void server::logs(int fd, const request& r)
              ",\"rt\":" + socketley::json::quote(e.runtime) + ",\"lv\":\"" + e.level + "\",\"text\":" + socketley::json::quote(e.text) + "}";
     }
     o += "]}";
-    send(fd, 200, "application/json", o);
+    send_json(fd, r, o);
 }
 
 namespace
@@ -653,7 +664,7 @@ void server::edge(int fd, const request& r)
             first = false;
         }
     o += "]}";
-    send(fd, 200, "application/json", o);
+    send_json(fd, r, o);
 }
 
 void server::zone(int fd, const request& r)

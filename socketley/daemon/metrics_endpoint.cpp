@@ -227,7 +227,7 @@ static std::string ask_store(const std::string& store, std::initializer_list<std
     return ipc_send(command, out) == 0 ? out : std::string();
 }
 
-std::string metrics_endpoint::history_json(std::string_view runtime, int64_t range, size_t points) const
+std::string metrics_endpoint::history_json(std::string_view runtime, int64_t range, size_t points, int64_t since) const
 {
     const std::string store = dashboard_store(m_manager);
     if (store.empty())
@@ -235,8 +235,18 @@ std::string metrics_endpoint::history_json(std::string_view runtime, int64_t ran
     range = std::clamp<int64_t>(range, 60, 366ll * 86400);
     points = std::clamp<size_t>(points, 10, 1440);
     const int64_t step = std::max<int64_t>(1, (range + static_cast<int64_t>(points) - 1) / static_cast<int64_t>(points));
-    const int64_t now = socketley::wall::now_sec();
-    const int64_t from = now - step * static_cast<int64_t>(points);
+    int64_t now = socketley::wall::now_sec();
+    int64_t from = now - step * static_cast<int64_t>(points);
+    // A page that holds the buckets up to `since` is sent those after it on its own grid, and the two before them
+    // again, since their samples may have come in late; one too old for the range is sent the whole of it.
+    if (since > from && since <= now)
+    {
+        from = since - 3 * step;
+        points = static_cast<size_t>((now - from) / step);
+        now = from + step * static_cast<int64_t>(points);
+    }
+    if (points == 0)
+        return {};
     std::string sel;
     if (!runtime.empty())
     {
@@ -290,8 +300,13 @@ std::string metrics_endpoint::history_json(std::string_view runtime, int64_t ran
                     continue;
                 const int64_t t = std::strtoll(v.items[0].s.c_str(), nullptr, 10);
                 const int64_t i = (t - from) / step - 1;
-                if (i >= 0 && i < static_cast<int64_t>(points) && v.items[1].s != "NaN")
-                    c[static_cast<size_t>(i)] = v.items[1].s;
+                if (i < 0 || i >= static_cast<int64_t>(points) || v.items[1].s == "NaN")
+                    continue;
+                // Four figures, as many as a line or a hover shows: the store's seventeen made most of the answer.
+                char buf[32];
+                const double x = std::strtod(v.items[1].s.c_str(), nullptr);
+                const int n = std::snprintf(buf, sizeof buf, "%.4g", x);
+                c[static_cast<size_t>(i)] = std::isfinite(x) && n > 0 ? std::string(buf, static_cast<size_t>(n)) : "null";
             }
         }
     std::string j = "{\"from\":" + std::to_string(from) + ",\"step\":" + std::to_string(step);
@@ -514,8 +529,27 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
         }
         const std::string body = history_json(dashboard::query_field(req.query, "runtime"),
             std::strtoll(dashboard::query_field(req.query, "range").c_str(), nullptr, 10),
-            std::strtoul(dashboard::query_field(req.query, "points").c_str(), nullptr, 10));
-        dashboard::send(fd, 200, "application/json", body.empty() ? std::string("{}") : body);
+            std::strtoul(dashboard::query_field(req.query, "points").c_str(), nullptr, 10),
+            std::strtoll(dashboard::query_field(req.query, "since").c_str(), nullptr, 10));
+        dashboard::send_json(fd, req, body.empty() ? std::string("{}") : body);
+        return;
+    }
+    // What an open page asks every two seconds, in one answer rather than three whose headers outweighed them.
+    if (path == "/api/live")
+    {
+        if (!m_dash->may_read(req))
+        {
+            dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
+            return;
+        }
+        std::string body = "{\"overview\":";
+        body += refresh(m_cached_json_overview, [&] { return build_json_overview(); });
+        body += ",\"runtimes\":";
+        body += refresh(m_cached_json_runtimes, [&] { return build_json_runtimes(); });
+        body += ",\"alerts\":";
+        body += alerts_json();
+        body += '}';
+        dashboard::send_json(fd, req, body);
         return;
     }
     if (path == "/api/alerts" || path == "/api/alerts/test")
@@ -523,7 +557,7 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
         if (!m_dash->may_read(req) || (path != "/api/alerts" && m_dash->session_of(req).empty()))
             dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
         else if (path == "/api/alerts")
-            dashboard::send(fd, 200, "application/json", alerts_json());
+            dashboard::send_json(fd, req, alerts_json());
         else if (req.method != "POST" || req.header("x-socketley-dashboard") != "1")
             dashboard::send(fd, 403, "text/plain; charset=utf-8", "A test comes from the dashboard's own page.\n");
         else if (const std::string why = test_webhook(m_webhook); why.empty())
@@ -540,11 +574,11 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
             return;
         }
         if (path == "/api/overview")
-            dashboard::send(fd, 200, "application/json", refresh(m_cached_json_overview, [&] { return build_json_overview(); }));
+            dashboard::send_json(fd, req, refresh(m_cached_json_overview, [&] { return build_json_overview(); }));
         else if (path == "/api/runtimes")
-            dashboard::send(fd, 200, "application/json", refresh(m_cached_json_runtimes, [&] { return build_json_runtimes(); }));
+            dashboard::send_json(fd, req, refresh(m_cached_json_runtimes, [&] { return build_json_runtimes(); }));
         else if (const std::string body = build_json_runtime(path.substr(13)); path.starts_with("/api/runtime/") && !body.empty())
-            dashboard::send(fd, 200, "application/json", body);
+            dashboard::send_json(fd, req, body);
         else
             dashboard::send(fd, 404, "text/plain; charset=utf-8", "Not Found\n");
         return;

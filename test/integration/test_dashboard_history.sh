@@ -84,6 +84,22 @@ expect "a runtime never seen has none" "$(hist "runtime=nope")" "{}"
 expect "the buckets are held in bounds" "$(hist "runtime=st&range=60&points=3" | j "len(d['msg'])") $(hist "runtime=st&range=60&points=99999" | j "len(d['msg'])")" "10 1440"
 now=$(date +%s)
 expect "and the range to a year" "$(hist "runtime=st&range=99999999&points=10" | j "abs(d['from'] - ($now - 366 * 86400)) <= 2")" True
+# A page that holds the buckets up to its last is sent those after it on its own grid and the two before, not the range.
+h=$(hist "runtime=st&range=600&points=60")
+last=$(echo "$h" | j "d['from'] + d['step'] * len(d['msg'])")
+sleep 1
+inc=$(hist "runtime=st&range=600&points=60&since=$last")
+expect "a page's next ask is sent the buckets after its last and the two before" \
+    "$(echo "$inc" | j "(d['from'] == $last - 3 * d['step'], 2 <= len(d['msg']) <= 4)")" "(True, True)"
+expect "and one too old for the range the whole of it" "$(hist "runtime=st&range=600&points=60&since=1000" | j "len(d['msg'])")" 60
+expect "a value is said in four figures, as many as a line shows" \
+    "$(echo "$h" | j "max(len(repr(v)) for k in ('rss','in','out','msg','cpu') for v in d[k] if v is not None) <= 10")" True
+# Sent gzipped to a browser that takes it.
+enc=$(curl -s -m 10 -b "$T/jar" -H 'Accept-Encoding: gzip' -D - -o "$T/gz" "$U/api/history?runtime=&range=900&points=90" | tr -d '\r' | sed -n 's/^Content-Encoding: //Ip')
+expect "what a page asks every two seconds is one answer" \
+    "$(curl -s -m 10 -b "$T/jar" "$U/api/live" | j "(sorted(d), 'memory_bytes' in d['overview'], any(x['name'] == 'st' for x in d['runtimes']))")" \
+    "(['alerts', 'overview', 'runtimes'], True, True)"
+expect "the history is sent gzipped to a client that takes it" "$enc $(gzip -dc "$T/gz" | j "len(d['msg'])")" "gzip 90"
 
 # ─── a restart ──────────────────────────────────────────────────────────────
 dir=$(find "$HOME" -type d -path '*/metrics/metrics' | head -1)

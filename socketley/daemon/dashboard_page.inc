@@ -309,9 +309,9 @@ async function poll() {
   // A tab nobody looks at asks for nothing, and asks at once when it is looked at again.
   if (document.hidden) return;
   try {
-    const [o, r, al] = await Promise.all([api('GET', '/api/overview').then(must).then(x => x.json()), api('GET', '/api/runtimes').then(must).then(x => x.json()),
-      api('GET', '/api/alerts').then(x => x.ok ? x.json() : alerts).catch(() => alerts)]);
-    alerts = al;
+    const lv = await (await must(await api('GET', '/api/live'))).json();
+    const o = lv.overview, r = lv.runtimes;
+    alerts = lv.alerts || alerts;
     const now = Date.now() / 1000, dt = prev.t ? now - prev.t : 0;
     if (dt > 0) {
       cur.msg = Math.max(0, (o.messages_total - prev.msg) / dt); cur.bin = Math.max(0, (o.bytes_in - prev.bin) / dt); cur.bout = Math.max(0, (o.bytes_out - prev.bout) / dt);
@@ -370,11 +370,27 @@ async function loadSeries(name) {
   if (had && had.range === range && Date.now() - had.at < 10000) return;
   if (had && had.loading) return;
   series[name] = Object.assign(had || {}, { loading: true });
+  // What the page holds is added to: the buckets after its last, and the few before it, which may have filled since.
+  const old = had && had.range === range && had.d ? had.d : null, pts = Math.max(10, Math.min(180, range / 10));
+  const keys = ['conn', 'msg', 'in', 'out', 'cpu', 'rss'];
   try {
-    const d = await (await must(await api('GET', '/api/history?runtime=' + encodeURIComponent(name) + '&range=' + range + '&points=' + Math.max(10, Math.min(180, range / 10))))).json();
-    series[name] = { at: Date.now(), range, d: d.from ? d : null };
+    const d = await (await must(await api('GET', '/api/history?runtime=' + encodeURIComponent(name) + '&range=' + range + '&points=' + pts +
+      (old ? '&since=' + (old.from + old.step * old.msg.length) : '')))).json();
+    let got = d.from ? d : null;
+    if (old && got && got.step === old.step && got.from >= old.from) {
+      const m = Object.assign({}, old);
+      for (const k of keys) m[k] = old[k].slice();
+      for (let j = 0; j < got.msg.length; j++) {
+        const i = (got.from - m.from) / m.step + j;
+        for (const k of keys) m[k][i] = got[k][j];
+      }
+      const over = m.msg.length - pts;
+      if (over > 0) { for (const k of keys) m[k] = m[k].slice(over); m.from += over * m.step; }
+      got = m;
+    }
+    series[name] = { at: Date.now(), range, d: got || old };
     render(false);
-  } catch (e) { series[name] = { at: Date.now(), range, d: null }; }
+  } catch (e) { series[name] = { at: Date.now(), range, d: old }; }
 }
 function rangePick() {
   return el('div', { class: 'rng' }, ...RANGES.map(([v, t]) => el('button', { class: v === range ? 'on' : '', text: t, title: 'The last ' + t,
