@@ -3,13 +3,14 @@
 dig @127.0.0.1 example.com SOA
 socketley create dns ns2 --zone /etc/socketley/example.com.zone \
     --publish 203.0.113.7 --transfer 203.0.113.53 --notify 203.0.113.53 --dnssec -s</pre>
+<p>A zone given by its name is written with this machine's public address for its name servers; <code>--publish</code> gives it, and only a machine with a public address on an interface may leave it out. <code>create</code> also makes an entrance (<code>--proxy</code>), which asks Let's Encrypt for each zone's certificate as it starts, except for names reserved for examples and tests such as <code>example.com</code>, <code>.test</code> and <code>.internal</code>: a lab whose names are real gives <code>--proxy none</code>. And <code>--rrl</code> answers one client network at most 100 times a second, so a load test from one host gives <code>--rrl 0</code>.</p>
 
 <h3>What it does</h3>
 <ul>
 <li><b>Zone files</b> in RFC 1035 master format: wildcards, CNAMEs followed inside the zone, delegations with glue; an edited file is served within a second.</li>
 <li><b>Transport</b>: EDNS with answers kept to 1232 bytes, truncation and retry over TCP, port 53 unless <code>-p</code> says otherwise, IPv4 and IPv6.</li>
 <li><b>Secondaries</b>: AXFR to the addresses <code>--transfer</code> names, NOTIFY to those <code>--notify</code> names.</li>
-<li><b>DNSSEC</b> with <code>--dnssec</code>: zones signed online, and <code>socketley <code>socketley dns ds</code> prints the DS record for the parentlt;name<code>socketley dns ds</code> prints the DS record for the parentgt; dnssec</code> prints the DS record for the parent.</li>
+<li><b>DNSSEC</b> with <code>--dnssec</code>: zones signed online, and <code>socketley &lt;name&gt; dnssec</code> prints the DS record for the parent.</li>
 <li><b>Abuse</b>: response rate limiting per network with <code>--rrl</code>.</li>
 <li><b>Runtimes' names</b>: <code>--publish</code> answers the <code>--domain</code> names of this daemon's runtimes; <code>--proxy</code> makes the entrance those names reach, see <a href="#/man/dns-flags.names-runtimes-are-reached-by">names runtimes are reached by</a>.</li>
 </ul>

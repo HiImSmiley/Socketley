@@ -777,16 +777,16 @@
     "nginx 1.28.3"
    ],
    "tool": "wrk 8 threads, 8 s a run",
-   "commit": "c7d4c42b",
+   "commit": "9f644c07",
    "passes": 9,
    "date": "2026-11-03",
    "rows": [
     {
      "name": "HTTP, 1 KiB, keep-alive, 32 connections",
      "v": [
-      54030.0,
-      40324.0,
-      29813.0
+      55631.0,
+      41189.0,
+      30121.0
      ],
      "cpu": [
       1.0,
@@ -794,89 +794,89 @@
       1.0
      ],
      "ccpu": [
-      0.845,
-      0.668,
-      0.531
+      0.824,
+      0.672,
+      0.532
      ],
      "r": [
       [
-       1.34,
-       1.3,
-       1.374
+       1.355,
+       1.311,
+       1.44
       ],
       [
-       1.812,
-       1.77,
-       1.838
+       1.855,
+       1.809,
+       1.93
       ]
      ]
     },
     {
      "name": "HTTP, 1 KiB, keep-alive, 256 connections",
      "v": [
-      33785.0,
-      36035.0,
-      31548.0
+      45322.0,
+      36288.0,
+      31632.0
      ],
      "cpu": [
       0.998,
-      0.998,
+      0.999,
       0.998
      ],
      "ccpu": [
-      0.57,
-      0.577,
+      0.734,
+      0.576,
       0.515
      ],
      "r": [
       [
-       0.934,
-       0.684,
-       1.114
+       1.249,
+       1.207,
+       1.281
       ],
       [
-       1.061,
-       0.766,
-       1.302
+       1.433,
+       1.403,
+       1.467
       ]
      ]
     },
     {
      "name": "HTTP, 64 KiB, keep-alive, 256 connections",
      "v": [
-      26379.0,
-      21665.0,
-      15799.0
+      27042.0,
+      22108.0,
+      15824.0
      ],
      "cpu": [
       0.998,
       0.998,
-      0.997
+      0.998
      ],
      "ccpu": [
-      0.82,
-      0.682,
+      0.85,
+      0.681,
       0.528
      ],
      "r": [
       [
-       1.218,
+       1.23,
        1.167,
-       1.243
+       1.268
       ],
       [
-       1.662,
-       1.638,
-       1.694
+       1.714,
+       1.696,
+       1.734
       ]
      ]
     },
     {
      "name": "HTTP, 1 KiB, a connection per request, 64 at once",
      "v": [
-      42911.0,
-      26449.0,
-      20988.0
+      44142.0,
+      26817.0,
+      21032.0
      ],
      "cpu": [
       0.998,
@@ -884,50 +884,50 @@
       0.998
      ],
      "ccpu": [
-      1.331,
-      1.034,
-      0.934
+      1.307,
+      1.023,
+      0.963
      ],
      "r": [
       [
-       1.634,
-       1.616,
-       1.703
+       1.632,
+       1.583,
+       1.757
       ],
       [
-       2.052,
-       1.964,
-       2.135
+       2.082,
+       1.992,
+       2.217
       ]
      ]
     },
     {
      "name": "TCP relay, 1 KiB over HTTP keep-alive, 256 connections",
      "v": [
-      99608.0,
-      43421.0,
-      70626.0
+      95025.0,
+      43856.0,
+      68934.0
      ],
      "cpu": [
       0.999,
       0.999,
-      0.998
+      0.999
      ],
      "ccpu": [
-      1.063,
-      0.753,
-      0.943
+      1.019,
+      0.762,
+      0.918
      ],
      "r": [
       [
-       2.28,
-       2.169,
-       2.385
+       2.194,
+       2.051,
+       2.305
       ],
       [
-       1.406,
-       1.352,
-       1.507
+       1.361,
+       1.319,
+       1.466
       ]
      ]
     }
@@ -935,7 +935,7 @@
    "unit": "req/s",
    "better": "higher",
    "pin": "each proxy on one core, the nginx backend on four, wrk on 20",
-   "note": "All three forward <code>/px/…</code> with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with <code>http-reuse always</code>; nginx keeps 256 idle backend connections (<code>keepalive 256</code>). socketley keeps at most 32 parked and 32 pooled per backend, a fixed bound, so past about 64 requests at once it opens backend connections again: compare the 32- and the 256-connection rows.",
+   "note": "All three forward <code>/px/…</code> with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with <code>http-reuse always</code>; nginx keeps 256 idle backend connections (<code>keepalive 256</code>); socketley keeps as many backend connections as were busy at once.",
    "headline": 1
   },
   {
@@ -1396,7 +1396,7 @@
    "unit": "req/s",
    "better": "higher",
    "pin": "all three on the same four cores (socketley as four shards), loadgen on 20 others",
-   "note": "100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db sends every write to shard 0, so writes take one core however many shards there are.",
+   "note": "100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db hands every write to shard 0, so its writes are at most what one shard takes, at more cores; reads and queries spread over all four.",
    "headline": 3
   },
   {
@@ -1484,21 +1484,21 @@
     "VictoriaMetrics 1.112"
    ],
    "tool": "50 targets × 2000 series, scraped every 1 s by all three at once",
-   "commit": "c7d4c42b",
+   "commit": "9f644c07",
    "passes": 7,
    "date": "2026-11-03",
    "rows": [
     {
      "name": "CPU per sample ingested",
      "v": [
-      1.375,
-      0.78,
-      1.122
+      0.28,
+      0.743,
+      1.025
      ],
      "cpu": [
-      0.137,
-      0.078,
-      0.112
+      0.028,
+      0.074,
+      0.102
      ],
      "ccpu": [
       0,
@@ -1507,14 +1507,14 @@
      ],
      "r": [
       [
-       0.567,
-       0.561,
-       0.594
+       2.692,
+       2.568,
+       2.736
       ],
       [
-       0.821,
-       0.81,
-       0.85
+       3.683,
+       3.58,
+       3.845
       ]
      ],
      "unit": "µs",
@@ -1523,9 +1523,9 @@
     {
      "name": "resident memory",
      "v": [
-      273.0,
-      404.0,
-      117.0
+      277.0,
+      363.0,
+      119.0
      ],
      "cpu": [
       null,
@@ -1539,14 +1539,14 @@
      ],
      "r": [
       [
-       1.478,
-       1.234,
-       2.235
+       1.201,
+       1.044,
+       1.964
       ],
       [
-       0.443,
-       0.312,
-       0.687
+       0.429,
+       0.295,
+       0.788
       ]
      ],
      "unit": "MB",
@@ -1555,9 +1555,9 @@
     {
      "name": "range query, 5 min of every path",
      "v": [
-      211.0,
-      659.0,
-      136.0
+      210.0,
+      669.0,
+      118.0
      ],
      "cpu": [
       null,
@@ -1571,14 +1571,14 @@
      ],
      "r": [
       [
-       3.117,
-       2.54,
-       3.435
+       3.175,
+       2.983,
+       3.254
       ],
       [
-       0.643,
-       0.477,
-       1.113
+       0.561,
+       0.53,
+       1.211
       ]
      ],
      "unit": "ms",
