@@ -1841,10 +1841,35 @@ void db_run::publish_log()
     m_told_layout = layout;
     m_owner.shard_stats_table().publish_words(m_durable, layout);
     // A word to each reading shard, so its streams hear of the change without waiting for a read or a tick.
-    if (auto* mgr = m_owner.get_runtime_manager())
-        for (uint32_t j = 1; j < m_shards; ++j)
-            mgr->requests().post(this, 0, shard_target(m_owner.get_name(), j), nudge_marker,
-                                 request_class::background);
+    for (uint32_t j = 1; j < m_shards; ++j)
+        nudge(j);
+}
+
+// The cookie of a nudge, above every crossing's, names the shard it went to.
+static constexpr uint64_t nudge_cookie = uint64_t(1) << 63;
+
+void db_run::nudge(uint32_t j)
+{
+    if (m_nudge_flying.size() < m_shards)
+    {
+        m_nudge_flying.resize(m_shards, 0);
+        m_nudge_owed.resize(m_shards, 0);
+        m_nudge_sent.resize(m_shards);
+    }
+    // A nudge only says there is more log, so one already on its way says it for this one too; a reply lost on a
+    // link that went down is not waited for past a second.
+    const auto now = std::chrono::steady_clock::now();
+    if (m_nudge_flying[j] && now - m_nudge_sent[j] < std::chrono::seconds(1))
+    {
+        m_nudge_owed[j] = 1;
+        return;
+    }
+    auto* mgr = m_owner.get_runtime_manager();
+    const bool sent = mgr && mgr->requests().post(this, nudge_cookie | j, shard_target(m_owner.get_name(), j),
+                                                  nudge_marker, request_class::background);
+    m_nudge_flying[j] = sent;
+    m_nudge_owed[j] = !sent;
+    m_nudge_sent[j] = now;
 }
 
 void db_run::try_follow()
@@ -1938,7 +1963,18 @@ bool db_run::cross(uint32_t shard, const crossing& what, crossed then)
 
 void db_run::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
 {
-    // A nudge's answer, cookie 0, says nothing.
+    // A nudge's answer says nothing but that the next may go.
+    if (cookie & nudge_cookie)
+    {
+        const uint32_t j = static_cast<uint32_t>(cookie & ~nudge_cookie);
+        if (j < m_nudge_flying.size())
+        {
+            m_nudge_flying[j] = 0;
+            if (m_nudge_owed[j])
+                nudge(j);
+        }
+        return;
+    }
     const auto it = m_crossed.find(cookie);
     if (it == m_crossed.end())
         return;

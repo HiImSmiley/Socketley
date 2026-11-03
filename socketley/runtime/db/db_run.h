@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <chrono>
 #include <vector>
 
 #include <sys/socket.h>
@@ -189,6 +190,7 @@ private:
     // Shard 0's log on the disk up to its latest change: said to the shards that read it, which take it in before
     // they answer, so a read sees every write answered before it began.
     void publish_log();
+    void nudge(uint32_t shard);
     void catch_up();
     void try_follow();
     uint64_t log_word(uint32_t k) const;
@@ -225,6 +227,10 @@ private:
     uint64_t m_told_durable{0}, m_told_layout{0};
     std::unordered_map<uint64_t, crossed> m_crossed;
     uint64_t m_next_cookie{1};
+    // One nudge in flight per reading shard, and whether more log came since: each parks a ticket on this shard's
+    // channel until answered, and one per sync filled the table the reading shards' writes are parked in.
+    std::vector<uint8_t> m_nudge_flying, m_nudge_owed;
+    std::vector<std::chrono::steady_clock::time_point> m_nudge_sent;
     // The buffer the last answer's body was built in, kept for the next.
     std::string m_spare;
 
