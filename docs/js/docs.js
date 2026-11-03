@@ -34,7 +34,7 @@ const RT = [
   ['storage', 'S3 object storage over a directory, with versioning, replication, a web drive and git', 'MinIO'],
   ['db', 'JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups', 'MongoDB, PocketBase'],
   ['dns', 'Authoritative name server for its zones, over UDP and TCP, with DNSSEC and transfers', 'NSD, Knot'],
-  ['idp', 'OpenID Connect provider with its own accounts, second factors, passkeys and SSH certificates', 'Keycloak'],
+  ['idp', 'OpenID Connect provider with its own accounts, second factors, app passwords and SSH certificates', 'Keycloak'],
   ['mail', 'Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage', ''],
   ['mqtt', 'MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules', 'Mosquitto'],
   ['metrics', 'Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs', 'Prometheus, VictoriaMetrics'],

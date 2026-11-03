@@ -1669,95 +1669,95 @@
     "Keycloak 26.8.1"
    ],
    "tool": "idpgen, 8s a run, 200 accounts",
-   "commit": "c7d4c42b",
+   "commit": "396cc846",
    "passes": 7,
    "date": "2026-11-03",
    "rows": [
     {
-     "name": "sign-in: authorization code with a password, 4 clients",
+     "name": "sign-in: authorization code with a password, 16 clients",
      "v": [
-      106.0,
-      191.0
+      260.0,
+      188.0
      ],
      "cpu": [
-      2.998,
-      3.891
+      3.988,
+      3.923
      ],
      "ccpu": [
-      0.046,
-      0.103
+      0.109,
+      0.123
      ],
      "r": [
       [
-       0.592,
-       0.523,
-       0.701
+       1.349,
+       1.325,
+       1.723
       ]
      ]
     },
     {
      "name": "refresh token, 64 clients",
      "v": [
-      49329.0,
-      2415.0
+      47698.0,
+      2392.0
      ],
      "cpu": [
-      2.493,
-      3.89
+      2.485,
+      3.88
      ],
      "ccpu": [
-      4.313,
-      0.302
+      4.168,
+      0.304
      ],
      "r": [
       [
-       20.482,
-       18.97,
-       21.186
+       19.936,
+       19.128,
+       20.379
       ]
      ]
     },
     {
      "name": "userinfo, 64 clients",
      "v": [
-      175323.0,
-      19944.0
+      167920.0,
+      20110.0
      ],
      "cpu": [
-      2.475,
-      3.891
+      2.44,
+      3.909
      ],
      "ccpu": [
-      10.711,
-      1.523
+      10.55,
+      1.551
      ],
      "r": [
       [
-       8.772,
-       8.203,
-       9.16
+       8.334,
+       8.267,
+       8.974
       ]
      ]
     },
     {
      "name": "JWKS, 64 clients",
      "v": [
-      175754.0,
-      30059.0
+      172230.0,
+      28437.0
      ],
      "cpu": [
-      2.214,
-      3.898
+      2.208,
+      3.895
      ],
      "ccpu": [
-      11.237,
-      2.355
+      11.159,
+      2.246
      ],
      "r": [
       [
-       5.912,
-       5.756,
-       6.06
+       6.055,
+       5.978,
+       6.435
       ]
      ]
     }
@@ -1765,7 +1765,7 @@
    "unit": "req/s",
    "better": "higher",
    "pin": "both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen on 20 others",
-   "note": "200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. On refresh, userinfo and JWKS socketley uses two and a half of its four cores while idpgen takes up to eleven, so those ratios are floors. A sign-in runs four at a time, since socketley refuses a fifth from one address while four are being checked.",
+   "note": "200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. On refresh, userinfo and JWKS socketley uses two and a half of its four cores while idpgen takes up to eleven, so those ratios are floors. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.",
    "caveat": "a floor: the load generator ran out before socketley did",
    "headline": 1
   }
