@@ -172,7 +172,11 @@ c2.close(); r.kill(); r.wait()
 
 # ── A sharded server: every shard gets the session ────────────────────────
 t = session(binp, sock, "ia_shd")
-time.sleep(4); drain(t, 0.5)
+time.sleep(4)
+# What the session said and what the daemon says of the runtime, printed with the rest when an assertion below fails.
+report("SHD_SESSION_SAID", repr(drain(t, 0.5)[-200:]))
+report("SHD_LS", " ".join(l for l in subprocess.run([binp, "ls"], env=dict(os.environ, SOCKETLEY_SOCKET=sock),
+                                                    capture_output=True, text=True).stdout.split("\n") if "ia_shd" in l))
 conns = []
 for _ in range(6):
     k = socket.create_connection(("127.0.0.1", p_shd), 5); k.settimeout(3)
