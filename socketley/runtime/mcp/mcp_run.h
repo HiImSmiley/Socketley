@@ -37,8 +37,7 @@ public:
     const std::vector<tool_def>& tools() const override { return m_tools; }
     const std::vector<resource_def>& resources() const override { return m_resources; }
     const std::vector<prompt_def>& prompts() const override { return m_prompts; }
-    bool call_tool(const tool_def& t, const json::jvalue& args, const caller& who, tool_result& out,
-                   std::string& why) override;
+    void call_tool(const tool_def& t, const json::jvalue& args, const caller& who, tool_done done) override;
     bool read_resource(const resource_def& r, const caller& who, std::string& contents, std::string& why) override;
     bool get_prompt(const prompt_def& p, const json::jvalue& args, const caller& who, std::string& messages,
                     std::string& description, std::string& why) override;

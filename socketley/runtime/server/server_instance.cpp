@@ -6194,7 +6194,9 @@ server_instance::fanout_count server_instance::queue_broadcast(
     {
         int fd = m_active_fds[i];
         auto* conn = m_conn_idx[fd];
-        if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || fd == exclude_fd2 || conn->closing))
+        // A connection closing while a handler's answer is owed to it is still written to, as send() writes to it.
+        if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || fd == exclude_fd2 ||
+                               (conn->closing && conn->cache_pending == 0)))
             continue;
 
         // An HTTP or RESP client is skipped rather than held, because no

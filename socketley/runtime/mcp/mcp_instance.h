@@ -22,7 +22,7 @@ class mcp_run;
 struct lua_tool
 {
     tool_def def;
-    std::function<bool(const json::jvalue&, const caller&, tool_result&, std::string&)> call;
+    std::function<void(const json::jvalue&, const caller&, tool_done)> call;
 };
 struct lua_resource
 {

@@ -68,6 +68,10 @@ struct tool_result
     bool is_error{false};
 };
 
+// A tool's end: false with `why` for a failure of the server's own, which is a JSON-RPC error; a tool that ran and
+// failed sets is_error instead.
+using tool_done = std::function<void(bool ok, tool_result out, std::string why)>;
+
 class backend
 {
 public:
@@ -75,10 +79,8 @@ public:
     virtual const std::vector<tool_def>& tools() const = 0;
     virtual const std::vector<resource_def>& resources() const = 0;
     virtual const std::vector<prompt_def>& prompts() const = 0;
-    // False with `why` for a failure of the server's own, which is a JSON-RPC error; a tool that ran and failed sets
-    // out.is_error instead.
-    virtual bool call_tool(const tool_def& t, const json::jvalue& args, const caller& who, tool_result& out,
-                           std::string& why) = 0;
+    // `done` hears the tool's end once, at once or after a handler that waited has run on.
+    virtual void call_tool(const tool_def& t, const json::jvalue& args, const caller& who, tool_done done) = 0;
     // The contents array of the resource; false with `why` when it cannot be read.
     virtual bool read_resource(const resource_def& r, const caller& who, std::string& contents, std::string& why) = 0;
     // The messages array and a description; false with `why` when the prompt cannot be made.
@@ -106,6 +108,10 @@ struct reply
     std::string body;
 };
 
+// The answer to one message, handed to `answer` at once or once the tool it calls has finished.
+void handle(backend& b, const server_info& info, const headers& h, std::string_view body, const caller& who,
+            std::function<void(reply)> answer);
+// The same for a backend whose tools finish at once.
 reply handle(backend& b, const server_info& info, const headers& h, std::string_view body, const caller& who);
 
 // Counted by handle(), for stats.

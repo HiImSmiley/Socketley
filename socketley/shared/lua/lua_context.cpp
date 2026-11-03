@@ -10,6 +10,7 @@
 #include "lua_db_api.h"
 #include "lua_mqtt_api.h"
 #include "lua_mail_api.h"
+#include "lua_http.h"
 #include "../../runtime/mqtt/mqtt_lua_table.h"
 #include "../../runtime/mcp/mcp_lua_table.h"
 #include "../util/settings.h"
@@ -993,6 +994,8 @@ void lua_context::cancel_timers()
         m_mqtt_client->cancel();
     if (m_mail_client)
         m_mail_client->cancel();
+    if (m_http_client)
+        m_http_client->cancel();
 }
 
 void lua_context::update_self_state(const char* state_str)
@@ -1171,7 +1174,7 @@ static std::string ssl_error_text()
 }
 #endif
 
-static sol::table socketley_http_call(sol::state& lua, sol::table opts)
+sol::table lua_http_blocking(sol::state& lua, const sol::table& opts)
 {
     sol::table result = lua.create_table();
     result["ok"]     = false;
@@ -1179,76 +1182,19 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     result["body"]   = std::string{};
     result["error"]  = std::string{};
 
-    // A pointer key: gcc folds sol2's literal-key getters of two lengths into one and warns of a bound none crosses.
-    sol::optional<std::string> url_opt = opts.get<sol::optional<std::string>>(static_cast<const char*>("url"));
-    if (!url_opt || url_opt->empty()) { result["error"] = "url required"; return result; }
-
-    // ─── The three optional keys, checked ───────────────────────────────────
-    // Checked reads rather than a converting optional, because whether a
-    // conversion throws is a property of the build, and a `timeout_ms` that
-    // was written down and unreadable is reported through result.error rather
-    // than silently defaulted.
-    std::string url = *url_opt;
-
-    std::string method = "GET";
-    if (sol::object o = opts["method"]; o.valid() && o != sol::nil)
+    lua_http_options o;
+    if (std::string bad; !read_lua_http_options(opts, o, bad))
     {
-        if (o.get_type() != sol::type::string)
-        {
-            result["error"] = "method must be a string";
-            return result;
-        }
-        method = o.as<std::string>();
+        result["error"] = bad;
+        return result;
     }
-
+    std::string url = o.url;
+    const std::string& method = o.method;
     // Asked case-insensitively, because nothing here upper-cases `method`.
     const bool is_head = (method.size() == 4 &&
                           strncasecmp(method.c_str(), "HEAD", 4) == 0);
-
-    std::string body;
-    if (sol::object o = opts["body"]; o.valid() && o != sol::nil)
-    {
-        if (o.get_type() != sol::type::string)
-        {
-            result["error"] = "body must be a string";
-            return result;
-        }
-        body = o.as<std::string>();
-    }
-
-    int timeout_ms = 5000;
-    if (sol::object o = opts["timeout_ms"]; o.valid() && o != sol::nil)
-    {
-        const double d = (o.get_type() == sol::type::number) ? o.as<double>() : -1.0;
-        if (o.get_type() != sol::type::number || d != std::floor(d) ||
-            d < 1.0 || d > 3600000.0)
-        {
-            result["error"] = "timeout_ms must be a whole number of "
-                              "milliseconds in 1..3600000";
-            return result;
-        }
-        timeout_ms = static_cast<int>(d);
-    }
-
-    // The fourth of the optional keys, checked here with the other three and
-    // not at the point of use.  A converting optional cannot tell "not given"
-    // from "given as the wrong thing", so headers = "Content-Type: text/plain"
-    // -- a string where the man page documents a table -- was dropped in
-    // silence and the request went without it.
-    //
-    // Before the socket, the resolver and the TLS context, because a refusal
-    // down there has three things to unwind and this one has none.
-    sol::optional<sol::table> hdrs;
-    if (sol::object o = opts["headers"]; o.valid() && o != sol::nil)
-    {
-        if (o.get_type() != sol::type::table)
-        {
-            result["error"] = "headers must be a table of string keys and "
-                              "string values";
-            return result;
-        }
-        hdrs = o.as<sol::table>();
-    }
+    const std::string& body = o.body;
+    int timeout_ms = o.timeout_ms;
 
     // Inside the callback's budget and not beside it, with remaining_ms() of
     // -1 leaving timeout_ms as the script wrote it.
@@ -1432,12 +1378,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     // choosing into the request; one that cannot go out as given is refused, not sent altered.
     bool fields_ok = http_field_name_ok(method) && !path.empty() &&
                      path.find_first_of(std::string_view(" \r\n\0", 4)) == std::string_view::npos;
-    if (hdrs)
-        (*hdrs).for_each([&](sol::object k, sol::object v) {
-            if (!k.is<std::string>() || !v.is<std::string>() ||
-                !http_field_name_ok(k.as<std::string>()) || !http_field_value_ok(v.as<std::string>()))
-                fields_ok = false;
-        });
+    for (const auto& [k, v] : o.headers)
+        if (!http_field_name_ok(k) || !http_field_value_ok(v))
+            fields_ok = false;
     if (!fields_ok)
     {
         ::close(sock);
@@ -1463,16 +1406,12 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         req.append(cl_buf, static_cast<size_t>(cl_res.ptr - cl_buf));
         req.append("\r\n");
     }
-    if (hdrs) {
-        (*hdrs).for_each([&](sol::object k, sol::object v) {
-            if (k.is<std::string>() && v.is<std::string>())
-            {
-                req.append(k.as<std::string>());
-                req.append(": ");
-                req.append(v.as<std::string>());
-                req.append("\r\n");
-            }
-        });
+    for (const auto& [k, v] : o.headers)
+    {
+        req.append(k);
+        req.append(": ");
+        req.append(v);
+        req.append("\r\n");
     }
     req.append("Connection: close\r\n\r\n");
     req.append(body);
@@ -2546,9 +2485,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         return info;
     };
 
-    sk["http"] = [this](sol::table opts) -> sol::table {
-        return socketley_http_call(m_lua, opts);
-    };
+    if (!m_http_client)
+        m_http_client = std::make_unique<lua_http_client>(*this, *owner);
+    m_http_client->install(sk);
 
     // socketley.set_timeout(ms, fn) → timer_id
     //

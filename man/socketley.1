@@ -15470,7 +15470,11 @@ the content blocks as the revision has them; with
 .BR structured ,
 structured content, sent as text too; and with
 .BR "error = true" ,
-a failure the model reads, as is a handler that raises. A resource's
+a failure the model reads, as is a handler that raises. A handler may wait on
+.BR socketley.http ,
+.B socketley.db
+and the other calls that wait, and the runtime answers other calls meanwhile.
+A resource's
 .B read
 answers a string, or a table with
 .B text
@@ -17270,9 +17274,8 @@ self.cache(command)        -- Run one command against the LINKED cache and
 -- Every callback used to run to the end in one go, so a script could answer
 -- only out of what it already held.  A server linked to a cache could not read
 -- that cache at all, and the one call that reaches outside the process --
--- socketley.http -- does it by blocking the event loop for every runtime in the
--- daemon, which is why its own entry says to use it in on_start and nowhere
--- else.
+-- socketley.http -- did it by blocking the event loop for every runtime in the
+-- daemon.  In a handler that waits, it now waits too.
 --
 --     function on_client_message(id, msg)
 --         local v, err = self.cache("get " .. msg)
@@ -17755,11 +17758,20 @@ See
 .BR "MAIL FLAGS" .
 .TP
 .B socketley.http(opts) \(-> table
-Synchronous HTTP/HTTPS client.
-.B WARNING:
-Blocks the event loop thread \(em the wait is bounded, but it is not
-asynchronous: the whole exchange completes before any other runtime in
-the daemon is served again. Use only in
+HTTP/HTTPS client. In a callback that can wait \(em the ones
+.B socketley.db
+may be called from without a function, and an
+.B mcp
+tool's handler \(em the callback stops at the call and the runtime serves
+everything else until the answer comes. Anywhere else
+.RB ( on_start ,
+.BR on_stop ,
+a timer,
+.BR on_http_request ,
+a filter, an
+.B mcp
+resource or prompt) it blocks the event loop thread until the exchange ends;
+use it there only in
 .BR on_start / on_stop
 or low-frequency
 .B on_tick
@@ -17794,9 +17806,10 @@ error   string  Error message on failure
 .I timeout_ms
 is one deadline for the whole exchange \(em connect, TLS handshake,
 request and response are all measured against it \(em not a separate
-timeout per operation. Name resolution is the exception: it runs before
-the deadline is armed and has no bound of its own. A response is refused
-once it exceeds 8 MB rather than buffered without limit.
+timeout per operation. A call that blocks resolves the name before the
+deadline is armed, on a thread of its own and bounded by it; a call that
+waits counts the resolving in. A response is refused once it exceeds 8 MB
+rather than buffered without limit.
 .PP
 A response that declares a
 .B Content-Length
@@ -21837,12 +21850,16 @@ the disk is busy or the resolver is down, which is the case they matter for.
 .RS
 .IP \(bu 2
 .B socketley.http()
-\(em the whole exchange, per call from a script: name resolution, the connect
-and the transfer, bounded only by the callback's remaining budget. Its own entry
-says to use it in
-.B on_start
-and nowhere else, which is the honest way of saying the capability is not usable
-where it is wanted.
+outside a callback that can wait \(em the whole exchange, per call from a script:
+name resolution, the connect and the transfer, bounded by its
+.B timeout_ms
+and the callback's remaining budget. In
+.BR on_message ,
+.BR on_client_message ,
+an
+.B mcp
+tool's handler and the other callbacks that can wait, the call waits on the
+loop instead and blocks nothing.
 .IP \(bu 2
 .BR open (2)
 and

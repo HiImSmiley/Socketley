@@ -5,6 +5,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/lua/lua_context.h"
 #include "../../shared/lua/lua_json.h"
+#include "../../shared/lua/lua_suspend.h"
 #include "../../shared/util/logging.h"
 
 namespace socketley::mcp
@@ -89,6 +90,49 @@ std::string text_block(std::string_view s)
     return "[{\"type\":\"text\",\"text\":" + js::quote(s) + "}]";
 }
 
+// What a tool's handler returned, as its result: a string, or a table of text, content, structured and error.
+bool tool_answer(const sol::object& v, tool_result& out, std::string& why)
+{
+    out.content = "[]";
+    if (v.get_type() == sol::type::string || v.get_type() == sol::type::number)
+    {
+        out.content = text_block(v.as<std::string>());
+        return true;
+    }
+    if (v.get_type() != sol::type::table)
+        return true;
+    const sol::table t = v.as<sol::table>();
+    const sol::object content = t[std::string("content")], text = t[std::string("text")],
+                      structured = t[std::string("structured")];
+    std::string err;
+    if (structured.valid() && structured.get_type() != sol::type::lua_nil && !json_of(structured, out.structured, err))
+    {
+        why = "the tool's structured " + err;
+        return false;
+    }
+    if (content.valid() && content.get_type() == sol::type::table)
+    {
+        if (!json_of(content, out.content, err))
+        {
+            why = "the tool's content " + err;
+            return false;
+        }
+    }
+    else if (text.valid() && text.get_type() != sol::type::lua_nil)
+        out.content = text_block(text.as<std::string>());
+    else if (!out.structured.empty())
+        out.content = text_block(out.structured);
+    else if (!json_of(v, out.structured, err))
+    {
+        why = "the tool's answer " + err;
+        return false;
+    }
+    else
+        out.content = text_block(out.structured);
+    out.is_error = t.get_or("error", false);
+    return true;
+}
+
 // The function the script gave under `kind` and `name`, in the state that now runs it.
 sol::protected_function handler(mcp_instance* rt, const std::string& kind, const std::string& name, std::string& why)
 {
@@ -170,63 +214,35 @@ void register_lua_table(runtime_instance* owner, sol::state& lua, sol::table& se
             return fail("mcp.tool " + t.def.name + " needs a handler function");
         L[handlers_key][tools_key][t.def.name] = *fn;
         const std::string name = t.def.name;
-        t.call = [rt, name](const js::jvalue& args, const caller& who, tool_result& out, std::string& why) {
+        t.call = [rt, name](const js::jvalue& args, const caller& who, tool_done done) {
+            std::string why;
             sol::protected_function f = handler(rt, tools_key, name, why);
             if (!f.valid())
-                return false;
-            sol::state& S = rt->lua()->state();
-            // Kept for the deadline's message, which may be written from the hook where nothing may allocate.
-            const std::string who_name(rt->get_name());
-            sol::protected_function_result r;
             {
-                lua_deadline::scope bound("mcp tool", lua_deadline::default_ms(), who_name.c_str());
-                r = f(lua_of(S, args), caller_table(S, who));
+                done(false, {}, why);
+                return;
             }
-            // A tool that raised has failed, which is the model's to read and the operator's to see.
-            if (lua_diag::raised(r, rt->get_name(), "mcp tool " + name))
-            {
-                out.content = text_block("the tool raised: " + raised_text(r));
-                out.is_error = true;
-                return true;
-            }
-            const sol::object v = r.get<sol::object>(0);
-            out.content = "[]";
-            if (v.get_type() == sol::type::string || v.get_type() == sol::type::number)
-            {
-                out.content = text_block(v.as<std::string>());
-                return true;
-            }
-            if (v.get_type() != sol::type::table)
-                return true;
-            const sol::table t = v.as<sol::table>();
-            const sol::object content = t[std::string("content")], text = t[std::string("text")], structured = t[std::string("structured")];
-            std::string err;
-            if (structured.valid() && structured.get_type() != sol::type::lua_nil && !json_of(structured, out.structured, err))
-            {
-                why = "the tool's structured " + err;
-                return false;
-            }
-            if (content.valid() && content.get_type() == sol::type::table)
-            {
-                if (!json_of(content, out.content, err))
+            lua_context* ctx = rt->lua();
+            sol::state& S = ctx->state();
+            // On a coroutine, so a handler that waits on socketley.http or socketley.db lets the runtime go on serving.
+            auto& sus = ctx->suspender();
+            sus.set_next_result([done](lua_State* th, int n, const char* error) {
+                tool_result out;
+                // A tool that raised has failed, which is the model's to read; the suspender has told the operator.
+                if (error)
                 {
-                    why = "the tool's content " + err;
-                    return false;
+                    out.content = text_block(std::string("the tool raised: ") + error);
+                    out.is_error = true;
+                    done(true, std::move(out), {});
+                    return;
                 }
-            }
-            else if (text.valid() && text.get_type() != sol::type::lua_nil)
-                out.content = text_block(text.as<std::string>());
-            else if (!out.structured.empty())
-                out.content = text_block(out.structured);
-            else if (!json_of(v, out.structured, err))
-            {
-                why = "the tool's answer " + err;
-                return false;
-            }
-            else
-                out.content = text_block(out.structured);
-            out.is_error = t.get_or("error", false);
-            return true;
+                std::string why;
+                const sol::object v = n >= 1 ? sol::stack::get<sol::object>(th, 1) : sol::object(sol::lua_nil);
+                const bool ok = tool_answer(v, out, why);
+                done(ok, std::move(out), std::move(why));
+            });
+            lua_suspender::id_t id = 0;
+            sus.start(f, "mcp tool", ctx->callback_timeout_ms(), id, lua_of(S, args), caller_table(S, who));
         };
         auto& tools = rt->declared().tools;
         std::erase_if(tools, [&](const lua_tool& x) { return x.def.name == name; });

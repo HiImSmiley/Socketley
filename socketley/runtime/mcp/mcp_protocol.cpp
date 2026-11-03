@@ -1,6 +1,7 @@
 #include "mcp_protocol.h"
 
 #include <algorithm>
+#include <optional>
 
 #include "../../shared/json/json_escape.h"
 
@@ -117,7 +118,24 @@ const js::jvalue* object_member(const js::jvalue& v, std::string_view name)
     return m && m->k == js::jvalue::kind::object ? m : nullptr;
 }
 
-reply dispatch(backend& b, const server_info& info, const message& m, const caller& who)
+// A tool's end as the answer to `m`.
+reply tool_reply(const message& m, const server_info& info, bool ok, const tool_result& out, const std::string& why)
+{
+    if (!ok)
+        return error_reply(m, internal_error, why.empty() ? "the tool could not be run" : why);
+    if (out.is_error)
+        ++stats().tool_errors;
+    std::string f = "\"content\":" + out.content;
+    if (!out.structured.empty())
+        f += ",\"structuredContent\":" + out.structured;
+    if (out.is_error)
+        f += ",\"isError\":true";
+    return result_reply(m, info, f);
+}
+
+// The answer, or none when a tool was started and `later` hears its answer.
+std::optional<reply> dispatch(backend& b, const server_info& info, const message& m, const caller& who,
+                              const std::function<void(reply)>& later)
 {
     const std::string_view method = m.method;
     if (method == "initialize")
@@ -170,18 +188,9 @@ reply dispatch(backend& b, const server_info& info, const message& m, const call
                                                                           given->k != js::jvalue::kind::null)
             return error_reply(m, invalid_params, "arguments is an object");
         ++stats().tool_calls;
-        tool_result out;
-        std::string why;
-        if (!b.call_tool(*it, args ? *args : no_args, who, out, why))
-            return error_reply(m, internal_error, why.empty() ? "the tool could not be run" : why);
-        if (out.is_error)
-            ++stats().tool_errors;
-        std::string f = "\"content\":" + out.content;
-        if (!out.structured.empty())
-            f += ",\"structuredContent\":" + out.structured;
-        if (out.is_error)
-            f += ",\"isError\":true";
-        return result_reply(m, info, f);
+        b.call_tool(*it, args ? *args : no_args, who,
+                    [m, info, later](bool ok, tool_result out, std::string why) { later(tool_reply(m, info, ok, out, why)); });
+        return std::nullopt;
     }
     if (method == "resources/list")
     {
@@ -279,7 +288,9 @@ counters& stats()
     return c;
 }
 
-reply handle(backend& b, const server_info& info, const headers& h, std::string_view body, const caller& who)
+static std::optional<reply> handle_or_start(backend& b, const server_info& info, const headers& h,
+                                            std::string_view body, const caller& who,
+                                            const std::function<void(reply)>& later)
 {
     ++stats().requests;
     message m;
@@ -345,7 +356,21 @@ reply handle(backend& b, const server_info& info, const headers& h, std::string_
     // A notification, a cancellation or the end of initialize among them, wants no answer.
     if (!m.has_id)
         return reply{202, {}};
-    return dispatch(b, info, m, who);
+    return dispatch(b, info, m, who, later);
+}
+
+void handle(backend& b, const server_info& info, const headers& h, std::string_view body, const caller& who,
+            std::function<void(reply)> answer)
+{
+    if (std::optional<reply> r = handle_or_start(b, info, h, body, who, answer))
+        answer(std::move(*r));
+}
+
+reply handle(backend& b, const server_info& info, const headers& h, std::string_view body, const caller& who)
+{
+    reply out;
+    handle(b, info, h, body, who, [&](reply r) { out = std::move(r); });
+    return out;
 }
 
 }   // namespace socketley::mcp

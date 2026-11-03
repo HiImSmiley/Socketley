@@ -222,18 +222,26 @@ void mcp_run::collect()
         m_prompts.push_back(p.def);
 }
 
-bool mcp_run::call_tool(const tool_def& t, const json::jvalue& args, const caller& who, tool_result& out,
-                        std::string& why)
+void mcp_run::call_tool(const tool_def& t, const json::jvalue& args, const caller& who, tool_done done)
 {
     if (t.name.starts_with("socketley_") && m_owner.get_tools() == "daemon" &&
         std::none_of(m_owner.declared().tools.begin(), m_owner.declared().tools.end(),
                      [&](const lua_tool& l) { return l.def.name == t.name; }))
-        return daemon_tool(t, args, who, out);
+    {
+        tool_result out;
+        const bool ok = daemon_tool(t, args, who, out);
+        done(ok, std::move(out), {});
+        return;
+    }
     for (const auto& l : m_owner.declared().tools)
         if (l.def.name == t.name)
-            return l.call(args, who, out, why);
-    why = "the tool " + t.name + " is no longer declared";
-    return false;
+        {
+            // A copy, since a handler that waits may outlive this declaration when the script is read again.
+            const auto call = l.call;
+            call(args, who, std::move(done));
+            return;
+        }
+    done(false, {}, "the tool " + t.name + " is no longer declared");
 }
 
 bool mcp_run::read_resource(const resource_def& r, const caller& who, std::string& contents, std::string& why)
@@ -469,8 +477,20 @@ void mcp_run::serve(const std::shared_ptr<socketley::http::server_conn>& c)
             continue;
         }
         collect();
-        const reply rep = handle(*this, m_info, h, body, who);
-        answer(c, rep.status, rep.body, cors);
+        // A tool whose handler waits answers on a later turn, and nothing more is read off the connection meanwhile.
+        auto in_line = std::make_shared<bool>(true);
+        std::weak_ptr<socketley::http::server_conn> weak = c;
+        c->waiting = true;
+        handle(*this, m_info, h, body, who, [this, weak, cors, in_line](reply rep) {
+            auto cc = weak.lock();
+            if (!cc || cc->dead || m_stopped)
+                return;
+            cc->waiting = false;
+            answer(cc, rep.status, rep.body, cors);
+            if (!*in_line)
+                m_http.resume(cc);
+        });
+        *in_line = false;
     }
 }
 

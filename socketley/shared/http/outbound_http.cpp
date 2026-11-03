@@ -435,7 +435,11 @@ void http_peer::advance()
         const int h = tls_context::do_handshake(m_ssl);
         if (h < 0)
         {
-            finish(false, "the TLS handshake failed");
+            // The verify result says why a certificate was refused, which the handshake's own failure does not.
+            std::string why = "the TLS handshake failed";
+            if (const long v = SSL_get_verify_result(m_ssl); v != X509_V_OK)
+                why += std::string(": certificate rejected: ") + X509_verify_cert_error_string(v);
+            finish(false, std::move(why));
             return;
         }
         m_handshaken = h == 1;
@@ -959,12 +963,22 @@ void http_peer::finish(bool answered, std::string why)
         else if (http_whole_decimal(a.header("content-length"), length))
         {
             if (body.size() < length && !m_req.head_only)
+            {
                 a.status = 0;
+                if (why.empty())
+                    why = "the answer stopped " + std::to_string(length - body.size()) +
+                          " bytes short of its Content-Length";
+            }
             a.body = std::string(body.substr(0, length));
         }
         else
             a.body = std::string(body);
     }
+    // Bytes that do not begin like an answer are named by their start, since a host that speaks something else is not
+    // one that closed early.
+    if (a.status == 0 && why.empty() && answered && !m_in.empty() && !m_in.starts_with("HTTP/"))
+        why = "the answer is not an HTTP response (it begins \"" + m_in.substr(0, std::min<size_t>(m_in.size(), 32)) +
+              "\")";
     if (a.status == 0)
         a.failure = !why.empty() ? std::move(why) : answered ? "the host closed before a whole answer" : "no answer";
     auto done = std::move(m_done);

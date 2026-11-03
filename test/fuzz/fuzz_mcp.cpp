@@ -44,11 +44,11 @@ struct echo : mcp::backend
     const std::vector<mcp::tool_def>& tools() const override { return t; }
     const std::vector<mcp::resource_def>& resources() const override { return r; }
     const std::vector<mcp::prompt_def>& prompts() const override { return p; }
-    bool call_tool(const mcp::tool_def&, const js::jvalue& args, const mcp::caller&, mcp::tool_result& out,
-                   std::string&) override
+    void call_tool(const mcp::tool_def&, const js::jvalue& args, const mcp::caller&, mcp::tool_done done) override
     {
+        mcp::tool_result out;
         out.content = "[{\"type\":\"text\",\"text\":" + js::quote(js::written(args)) + "}]";
-        return true;
+        done(true, std::move(out), {});
     }
     bool read_resource(const mcp::resource_def&, const mcp::caller&, std::string& c, std::string&) override
     {

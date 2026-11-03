@@ -68,8 +68,8 @@ still_there() {  # label, grep -E pattern, path under socketley/
     fi
 }
 
-still_there "socketley.http is synchronous" \
-            'socketley_http_call' shared/lua/lua_context.cpp
+still_there "socketley.http blocks outside a callback that can wait" \
+            'lua_http_blocking' shared/lua/lua_context.cpp
 still_there "the static file path opens on the loop" \
             '(^|[^_a-zA-Z0-9>.])open\(resolved' runtime/server/server_instance.cpp
 still_there "the resolver on a client's first dial" \

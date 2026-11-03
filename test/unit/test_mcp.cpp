@@ -48,17 +48,18 @@ struct fake : backend
     const std::vector<tool_def>& tools() const override { return t; }
     const std::vector<resource_def>& resources() const override { return r; }
     const std::vector<prompt_def>& prompts() const override { return p; }
-    bool call_tool(const tool_def& d, const js::jvalue& args, const caller&, tool_result& out, std::string&) override
+    void call_tool(const tool_def& d, const js::jvalue& args, const caller&, tool_done done) override
     {
         last_args = js::written(args);
+        tool_result out;
         if (d.name == "boom")
         {
             out.content = R"([{"type":"text","text":"it failed"}])";
             out.is_error = true;
-            return true;
         }
-        out.content = "[{\"type\":\"text\",\"text\":" + js::quote(js::string_of(args, "text")) + "}]";
-        return true;
+        else
+            out.content = "[{\"type\":\"text\",\"text\":" + js::quote(js::string_of(args, "text")) + "}]";
+        done(true, std::move(out), {});
     }
     bool read_resource(const resource_def&, const caller&, std::string& contents, std::string&) override
     {
