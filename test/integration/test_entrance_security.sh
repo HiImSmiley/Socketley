@@ -115,14 +115,16 @@ expect "and one it does not name gets there" \
     "$(curl -s -m 5 -H 'X-Hop-Secret: s3cr3t' "http://127.0.0.1:$((P+10))/plain/" | field secret)" "s3cr3t"
 
 # ─── an upload longer than --backend-timeout ────────────────────────────────
-"$BIN" create proxy slow -p $((P+12)) --backend "127.0.0.1:$ECHO" --backend-timeout 1 -s >/dev/null 2>&1
+# Gaps of 1.2 s under a timeout of 2, the whole 3.6: a gap past the timeout is a turn the box did not give, which
+# beside 28 other files under the sanitizer took the 0.3 s margin a gap of 0.7 under 1 left.
+"$BIN" create proxy slow -p $((P+12)) --backend "127.0.0.1:$ECHO" --backend-timeout 2 -s >/dev/null 2>&1
 sleep 0.5
 got=$(python3 - "$((P+12))" <<'PY'
 import socket, sys, time
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
 s.sendall(b"POST /slow/ HTTP/1.1\r\nHost: x\r\nContent-Length: 3000\r\n\r\n")
 for _ in range(3):
-    time.sleep(0.7)
+    time.sleep(1.2)
     s.sendall(b"x" * 1000)
 s.settimeout(5)
 data = b""

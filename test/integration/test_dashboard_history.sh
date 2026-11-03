@@ -93,7 +93,7 @@ expect "a page's next ask is sent the buckets after its last and the two before"
     "$(echo "$inc" | j "(d['from'] == $last - 3 * d['step'], 2 <= len(d['msg']) <= 4)")" "(True, True)"
 expect "and one too old for the range the whole of it" "$(hist "runtime=st&range=600&points=60&since=1000" | j "len(d['msg'])")" 60
 expect "a value is said in four figures, as many as a line shows" \
-    "$(echo "$h" | j "max(len(repr(v)) for k in ('rss','in','out','msg','cpu') for v in d[k] if v is not None) <= 10")" True
+    "$(echo "$h" | j "all(float('%.4g' % v) == v for k in ('rss','in','out','msg','cpu') for v in d[k] if v is not None)")" True
 # Sent gzipped to a browser that takes it.
 enc=$(curl -s -m 10 -b "$T/jar" -H 'Accept-Encoding: gzip' -D - -o "$T/gz" "$U/api/history?runtime=&range=900&points=90" | tr -d '\r' | sed -n 's/^Content-Encoding: //Ip')
 expect "what a page asks every two seconds is one answer" \
