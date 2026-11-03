@@ -4375,7 +4375,6 @@ response header and once with
 so that a cache hit stays a refcount bump and still answers with the header the
 client asked for.
 .TP
-.TP
 .BI "\-u " "host:port"
 .TQ
 .BI "\-\-upstream " "host:port"
@@ -19255,8 +19254,7 @@ A complete, working one is
 .IR examples/cluster/docker-compose.yml ,
 and the same shape with assertions on it is
 .IR test/docker/ .
-Three things about it are not optional and were wrong in the example this
-paragraph used to print:
+Three things about it are not optional:
 .RS
 .IP \(bu 3
 .B seccomp.
