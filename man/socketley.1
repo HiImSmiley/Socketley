@@ -19660,7 +19660,34 @@ timeout), a worker that fences itself when its daemon is hung for a server, a
 proxy or a client (a cache does), synchronous replication of a cache, and a
 replica that fails to start on one node being tried on another.
 .SH INSTALLATION
+.SS Release Package
+.nf
+curl \-fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
+.fi
+.PP
+Installs the newest release
+.BR .deb ,
+asking before each dependency it lacks, and stops having changed nothing when the
+package was built for a newer distribution; it also installs a package already at
+hand, answers every question with its default, and removes socketley, as its
+.B \-\-help
+says.
+.SS From Source
+.nf
+git clone https://github.com/HiImSmiley/Socketley
+cd Socketley
+bash scripts/install\-from\-source.sh
+.fi
+.PP
+Checks the kernel, architecture and compiler, installs the build dependencies,
+builds the liburing and the static archives the tree links, builds Release,
+installs the binary, this page and the systemd service, and starts the daemon.
+Its
+.B \-\-help
+names how to see every command without running one, and how to remove what it
+installed.
 .SS Quick Install
+From a tree already built:
 .nf
 sudo bash packaging/install.sh
 sudo systemctl start socketley
