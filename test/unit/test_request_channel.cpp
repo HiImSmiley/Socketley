@@ -239,6 +239,43 @@ TEST_CASE("an origin that goes away takes its parked requests with it")
     loop.shutdown_ring();
 }
 
+TEST_CASE("background work cannot fill the parked table a client's request needs")
+{
+    // A sharded db's shard 0 parked a nudge per sync to each reader, background, in the same table as the writes
+    // the readers forwarded to it; a full table answered those writes no_target, and the client saw a 503.
+    event_loop loop;
+    REQUIRE(loop.init());
+    request_channel ch;
+    ch.attach(loop);
+
+    deferred_sink sink;
+    recording_origin origin;
+    ch.register_sink("remote", &sink);
+
+    for (uint64_t i = 0; i < request_channel::MAX_PARKED; ++i)
+        REQUIRE(ch.post(&origin, i, "remote", "nudge", request_class::background));
+    pump(loop, 64);
+
+    CHECK(ch.parked_count() == request_channel::MAX_PARKED_BACKGROUND);
+    CHECK(origin.replies.size() == request_channel::MAX_PARKED - request_channel::MAX_PARKED_BACKGROUND);
+    for (const auto& r : origin.replies)
+        CHECK(r.st == request_status::overloaded);
+
+    // Both ways a client's request parks: queued here, and handed in from outside as a worker's mesh does.
+    const size_t answered = origin.replies.size();
+    REQUIRE(ch.post(&origin, 1u << 20, "remote", "PUT", request_class::client));
+    pump(loop);
+    CHECK(origin.replies.size() == answered);
+    CHECK(ch.park(&origin, 2u << 20, &sink) != 0);
+    CHECK(ch.parked_count() == request_channel::MAX_PARKED_BACKGROUND + 2);
+
+    // And a background park from outside stops at the same line.
+    CHECK(ch.park(&origin, 3u << 20, &sink, request_class::background) == 0);
+
+    ch.detach();
+    loop.shutdown_ring();
+}
+
 // ─── the fallback, and why a worker needs one ───────────────────────────────
 //
 // The daemon holds every runtime, so a name it does not know does not exist.

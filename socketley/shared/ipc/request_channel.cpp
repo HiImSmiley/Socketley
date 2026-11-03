@@ -207,6 +207,7 @@ bool request_channel::post(request_origin* origin, uint64_t cookie,
     e.cookie  = cookie;
     e.target.assign(target);
     e.payload.assign(payload);
+    e.cls = cls;
     m_bytes += e.payload.size();
     m_queue.push_back(std::move(e));
     m_stat_posted++;
@@ -234,9 +235,11 @@ void request_channel::complete_deferred(uint64_t ticket, request_status st,
 }
 
 uint64_t request_channel::park(request_origin* origin, uint64_t cookie,
-                               const request_sink* sink)
+                               const request_sink* sink, request_class cls)
 {
-    if (!origin || m_parked.size() >= MAX_PARKED)
+    // Background work stops short as in post(), or a flood of it fills the table a waiting client parks in.
+    const size_t limit = (cls == request_class::background) ? MAX_PARKED_BACKGROUND : MAX_PARKED;
+    if (!origin || m_parked.size() >= limit)
         return 0;
     if (!origin_live(origin))
         m_origins.push_back(origin);
@@ -341,7 +344,7 @@ void request_channel::drain()
             // The sink is on the other side of a socket and cannot fill
             // `reply` before returning, so the request parks against a ticket
             // and nothing here waits.
-            const uint64_t ticket = park(e.origin, e.cookie, sink);
+            const uint64_t ticket = park(e.origin, e.cookie, sink, e.cls);
             if (ticket == 0)
             {
                 m_stat_deferred_refused++;

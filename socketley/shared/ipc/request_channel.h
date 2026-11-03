@@ -84,6 +84,9 @@ public:
     static constexpr size_t MAX_PENDING_BYTES      = 16u << 20;
     static constexpr size_t MAX_PENDING_BACKGROUND = (MAX_PENDING * 3) / 4;
     static constexpr size_t MAX_DRAIN_BATCH        = 4096;
+    // The parked table, bounded because a remote that never answers must not grow it, and split as the queue is.
+    static constexpr size_t MAX_PARKED             = 4096;
+    static constexpr size_t MAX_PARKED_BACKGROUND  = (MAX_PARKED * 3) / 4;
 
     ~request_channel() override;
 
@@ -124,13 +127,14 @@ public:
 
     // Park a request that arrived from outside this channel, so its answer
     // comes through complete_deferred() like any other; 0 when the table is
-    // full.
+    // full, which for background work is a quarter short of it.
     //
     // `sink` is remembered rather than passed through: a target that really
     // goes can then be answered at the moment it goes, instead of at the
     // deadline below.
     uint64_t park(request_origin* origin, uint64_t cookie,
-                  const request_sink* sink);
+                  const request_sink* sink,
+                  request_class cls = request_class::client);
 
     // How long a parked request may go unanswered before its origin is told
     // `dropped`.  Longer than any budget a caller sets on top of it, so the
@@ -186,6 +190,7 @@ private:
         uint64_t        cookie{0};
         std::string     target;
         std::string     payload;
+        request_class   cls{request_class::client};
     };
 
     std::deque<entry> m_queue;
@@ -195,13 +200,11 @@ private:
     // change and the fallback is a property of the process, not of the map.
     request_sink* m_default_sink{nullptr};
 
-    // Bounded because a remote that never answers must not grow this, and
-    // swept because bounding it was never enough: a ticket was given up only
+    // Swept because bounding it was never enough: a ticket was given up only
     // when its ORIGIN went, and the origin is the side still waiting.  Measured
     // against a cache worker under SIGSTOP -- which accepts and never answers,
     // the one shape a crash does not produce -- a client's `cache get` was
     // never answered and the connection it was owed on was held open for good.
-    static constexpr size_t MAX_PARKED = 4096;
     struct parked_request
     {
         request_origin*     origin{nullptr};
