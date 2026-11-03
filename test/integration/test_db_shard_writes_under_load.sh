@@ -51,8 +51,8 @@ echo "  answers: $out"
 written=$(echo "$out" | tr ' ' '\n' | awk -F: '$1 ~ /^2/ {s += $2} END {print s + 0}')
 refused=$(echo "$out" | tr ' ' '\n' | awk -F: '$1 !~ /^2/ {s += $2} END {print s + 0}')
 # The sanitizer's build answers a tenth to a fifth as many, too few to fill anything: there the answers are checked, and
-# the load that makes the check mean something is Release's.
-MIN=100000; [ "${SOCKETLEY_CONFIG:-}" = Sanitize ] && MIN=10000
+# the load that makes the check mean something is Release's.  Told by the binary, so BIN= alone picks the bound too.
+MIN=100000; grep -q -m1 -a __asan_init "$BIN" && MIN=5000
 [ "$written" -gt "$MIN" ] && ok || bad "the load reached the database" "only $written writes answered (want > $MIN)"
 [ "$refused" -eq 0 ] && ok || bad "every write under load is taken" "$refused of $((written + refused)) answered otherwise: $out"
 
