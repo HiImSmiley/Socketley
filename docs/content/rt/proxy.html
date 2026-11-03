@@ -1,17 +1,22 @@
-<p>A <b>proxy</b> is a reverse proxy for HTTP or plain TCP. In HTTP mode it routes by name and path to backends that are addresses, unix sockets, other runtimes by name or whole groups, keeps backend connections pooled, checks their health, opens a circuit on a failing one and retries elsewhere. Without a <code>--backend</code> it is the <b>entrance</b>: the one proxy on 80/443 that serves every runtime under the names given with <code>--domain</code>, with certificates from ACME.</p>
+<p class="lead">A <b>proxy</b> forwards HTTP or plain TCP to backends, balances them and steers around failing ones. Without <code>--backend</code> it is the <b>entrance</b>, routing each request by name to the runtime that has it.</p>
 <pre class="code">socketley create proxy gw -p 8080 --backend 127.0.0.1:9000 -s          <i># /gw/... goes to the backend</i>
 socketley create proxy web -p 8081 --backend @web --strategy round-robin \
     --health-check http --health-path /health -s
 socketley create proxy db-tcp -p 5433 --protocol tcp --backend 10.0.0.7:5432 -s
 socketley create proxy php -p 8082 --backend fastcgi://127.0.0.1:9000 --root /var/www/site -s</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>Routing</b>: a request to <code>/&lt;proxy-name&gt;/…</code> is forwarded with the prefix stripped; reached by one of its <code>--domain</code> names it forwards path and Host unchanged. <code>--strategy round-robin|random|lua</code> picks the backend, <code>on_route</code> in Lua decides per request.</li>
-<li><b>Backends</b>: <code>host:port</code>, <code>https://host</code> (verified TLS), <code>unix:/path</code>, a runtime's name, <code>@group</code> (every running member, picked up as they come and go), <code>fastcgi://</code> for PHP-FPM.</li>
-<li><b>Resilience</b>: <a href="#/man/proxy-flags.health-check-flags">health checks</a>, a <a href="#/man/proxy-flags.circuit-breaker-flags">circuit breaker</a>, <a href="#/man/proxy-flags.retry-flags">retries</a>, a <code>--backend-timeout</code>, and <a href="#/man/proxy-flags.what-a-request-that-never-reaches-a-backend-is-answered">a defined answer</a> when no backend is reached; <code>--sidecar</code> turns the set on at once.</li>
-<li><b>Access</b>: <code>--auth bearer:file|basic:file|idp:runtime</code> asks before anything reaches a backend; <code>idp:</code> signs people in through an <a href="#/rt/idp">idp</a> runtime.</li>
-<li><b>TLS</b> on both legs: its own listener, <a href="#/man/proxy-flags.mtls-flags">client certificates</a> with <code>--client-ca</code>, verified <code>https://</code> backends and a client certificate for them; <code>--redirect-https</code>.</li>
-<li><b>Lua</b> filters and rewriting: <code>on_proxy_request</code>/<code>on_proxy_response</code> per chunk and a <a href="#/man/lua-configuration.proxy-filter-chain">filter chain</a>; backends' <a href="#/man/lua-configuration.declared-routes">declared routes</a> answer 405 and OPTIONS without a trip.</li>
-<li><b>The entrance</b> speaks HTTP/2 to a client that offers it over TLS and HTTP/3 over UDP on the same port, routing each stream by its name; every proxy relays WebSocket and other upgrades, pools its backend connections and takes <code>--shards</code> for several cores.</li>
-</ul>
+<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>By default a backend has 2 seconds to start answering, or the request gets a 504. Raise <code>--backend-timeout</code> for slow applications.</div></div>
+
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Routing</b><p><code>/&lt;proxy-name&gt;/…</code> loses its prefix; a request for a <code>--domain</code> name passes unchanged.</p></div>
+<div><b>Any backend</b><p><code>host:port</code>, <code>https://</code>, <code>unix:</code>, a runtime, an <code>@group</code>, <code>fastcgi://</code>.</p></div>
+<div><b>Resilience</b><p><a href="#/man/proxy-flags.health-check-flags">Health checks</a>, a <a href="#/man/proxy-flags.circuit-breaker-flags">circuit breaker</a>, <a href="#/man/proxy-flags.retry-flags">retries</a>; <code>--sidecar</code> turns all on.</p></div>
+<div><b>Sign-in first</b><p><code>--auth bearer:</code>, <code>basic:</code> or <code>idp:</code> before anything reaches a backend.</p></div>
+<div><b>TLS on both legs</b><p>Its own listener, <a href="#/man/proxy-flags.mtls-flags">client certificates</a>, verified <code>https://</code> backends.</p></div>
+<div><b>Lua filters</b><p><code>on_route</code> picks backends; a <a href="#/man/lua-configuration.proxy-filter-chain">filter chain</a> rewrites traffic.</p></div>
+<div><b>Modern HTTP</b><p>The entrance speaks HTTP/2 and HTTP/3; every proxy relays WebSocket.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>A <a href="#/rt/dns">dns</a> runtime makes the entrance and its certificates. <code>--auth idp:</code> signs people in through an <a href="#/rt/idp">idp</a>.</p>

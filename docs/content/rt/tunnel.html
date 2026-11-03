@@ -1,15 +1,18 @@
-<p>A <b>tunnel</b> runtime makes a machine that has no address of its own reachable: one at home behind a router, behind carrier-grade NAT, or on a network that lets only port 443 out. That machine runs an <b>agent</b> that dials out to an <b>edge</b>, a tunnel runtime on a machine the internet reaches, and holds the connection open; the edge serves the agent's services under its own names and carries each visitor through the connection the agent made. Nothing is opened on the router.</p>
+<p class="lead">A <b>tunnel</b> makes a machine with no address of its own reachable, such as one at home behind a router. An <b>agent</b> there dials out to an <b>edge</b> the internet reaches; nothing is opened on the router.</p>
 <pre class="code"><i># on the machine with the address</i>
 socketley create tunnel edge --mode edge -p 9450 --domain edge --idp auth -s
 <i># on the machine at home, signed in as an admin of auth</i>
 socketley tunnel join https://edge.example.com --http home=127.0.0.1:8123 \
     --tcp mc:25565=127.0.0.1:25565</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>HTTP services</b> are named beside the edge (<code>home.example.com</code>), served by the entrance with its certificate, the dns runtime answering the name.</li>
-<li><b>TCP services</b> are a port on the edge; what reaches the agent is what the visitor sent.</li>
-<li><b>Joining</b>: <code>socketley &lt;edge&gt; invite</code> prints a one-time invitation an agent joins with (<code>--join</code>), or an admin of the edge's idp joins directly with <code>socketley tunnel join</code>.</li>
-<li><b>Signed-in access</b>: <code>--forward</code> carries a signed-in person's stream to an address, as ssh's <code>ProxyCommand</code> asks; <code>socketley tunnel connect</code> is that command.</li>
-<li><b>Sharing a port for a while</b>: <code>socketley tunnel share</code> publishes a local port through an edge, optionally public, for a set duration.</li>
-</ul>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>HTTP services</b><p>Named beside the edge, such as <code>home.example.com</code>.</p></div>
+<div><b>TCP services</b><p>A port on the edge, carried unchanged to the agent.</p></div>
+<div><b>Joining</b><p><code>socketley tunnel join</code> as an idp admin, or a one-time <code>invite</code> used with <code>--join</code>.</p></div>
+<div><b>ssh through 443</b><p><code>--forward</code> carries a signed-in person to the named addresses, via <code>tunnel connect</code> or <code>tunnel ssh</code>.</p></div>
+<div><b>Share a port</b><p><code>socketley tunnel share</code> publishes a local port for a while, optionally public.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>An <a href="#/rt/idp">idp</a> signs people in; the entrance <a href="#/rt/proxy">proxy</a> terminates TLS and the <a href="#/rt/dns">dns</a> runtime answers the services' names.</p>

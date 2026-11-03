@@ -64,9 +64,25 @@ const SEC = new Map();      // section id -> section
 const FRAG = new Map();     // section id -> parsed DocumentFragment of its html
 const PAGE = new Map();     // content path -> html
 
-const KEEP = new Set(['DNS', 'IDP', 'DB', 'MQTT', 'TLS', 'SDK', 'C++', 'IPC', 'JSON', 'HTTP', 'RESP', 'S3', 'CLI', 'API', 'CORS', 'IAM', 'SSE', 'UDP', 'TCP', 'MTLS']);
+const KEEP = new Set(['MCP', 'QUIC', 'ACME', 'DNSSEC', 'OIDC', 'JWT', 'SSH', 'SMTP', 'IMAP', 'POP3', 'JMAP', 'MQTT', 'DNS', 'IDP', 'DB', 'MQTT', 'TLS', 'SDK', 'C++', 'IPC', 'JSON', 'HTTP', 'RESP', 'S3', 'CLI', 'API', 'CORS', 'IAM', 'SSE', 'UDP', 'TCP', 'MTLS']);
 // The man page's section titles are capitals; on the page they read as a sentence with their acronyms kept.
-const nice = t => t === t.toUpperCase() ? t.split(' ').map((w, i) => KEEP.has(w) ? w : w === 'LUA' ? 'Lua' : i ? w.toLowerCase() : w[0] + w.slice(1).toLowerCase()).join(' ') : t;
+const acro = w => KEEP.has(w.toUpperCase().replace(/[^A-Z0-9+]/g, '')) || /^[A-Z]+\/\d/.test(w.toUpperCase());
+const nice = t => {
+  const caps = t === t.toUpperCase();
+  return !caps ? t : t.split(' ').map((w, i) => acro(w) ? w : w === 'LUA' ? 'Lua' : i ? w.toLowerCase() : w[0] + w.slice(1).toLowerCase()).join(' ');
+};
+// A help text's `code` as code, and an example's " - item" runs as lines.
+function rich(text) {
+  const f = document.createDocumentFragment();
+  String(text).split(/(`[^`]+`)/).forEach(part => {
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) return f.append(el('code', { text: part.slice(1, -1) }));
+    // a flag named in the text is not broken after its hyphens
+    part.split(/((?<![\w-])--?[a-z][a-z0-9-]*)/).forEach((x, i) => f.append(i % 2 ? el('span', { class: 'nw2', text: x }) : x));
+  });
+  return f;
+}
+// Where a value's placeholder may break: after its commas, bars, brackets and slashes, never inside a word.
+const brk = t => t.replace(/([,|\]\/=:])/g, '$1\u200b');
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmt = (v, unit) => {
   if (v == null) return '–';
@@ -111,7 +127,7 @@ function linkify(root) {
 }
 // A short flag is not broken after its hyphens.
 function nowrapFlags(root) {
-  for (const c of root.querySelectorAll('code')) if (c.textContent.length < 32 && /^-/.test(c.textContent)) c.classList.add('nw');
+  for (const c of root.querySelectorAll('code,b')) if (c.textContent.length < 32 && /^-/.test(c.textContent.trim())) c.classList.add('nw');
 }
 function addCopy(p) {
   if (p.querySelector('.cp')) return;
@@ -152,33 +168,35 @@ function foldSec(s, open) {
 
 // ─── flags ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 const LETTER = { server: 'S', client: 'C', proxy: 'P', cache: 'K', storage: 'T', dns: 'D', sync: 'Y', idp: 'I', db: 'B', mqtt: 'M', mail: 'E', tunnel: 'U', metrics: 'R', mcp: 'X' };
+// One flag a row: the flag with what it takes, then what it is; a click opens its entry in the manual beneath.
 function flagRow(f, rt, opts = {}) {
   const ref = rt ? f.ref[rt] : (Object.values(f.ref).find(Boolean) || '');
-  const extra = el('div', {},
-    el('div', { class: 'lb', text: f.label }),
-    el('div', { class: 'hp', text: f.help }),
-    f.choices.length ? el('div', { class: 'ch' }, f.choices.map(c => el('span', { text: c }))) : null,
-    f.placeholder && !f.choices.length ? el('div', { class: 'eg', text: 'e.g. ' + f.flag + (f.kind === 'switch' ? '' : ' ' + f.placeholder) }) : null);
+  // What it takes, as the manual's entry names it (-p port), else the kind of value.
+  const [sid, eid] = (ref || '').split('/');
+  const term = eid ? (SEC.get(sid)?.entries.find(e => e.id === eid)?.term || '') : '';
+  const arg = term.startsWith(f.flag + ' ') ? term.slice(f.flag.length + 1).split(' / ')[0] : '';
+  const takes = f.kind === 'switch' ? '' : (arg || f.kind);
   const tr = el('tr', { class: 'f', id: 'flag:' + (rt || 'all') + ':' + f.flag, 'data-q': (f.flag + ' ' + f.aliases.join(' ') + ' ' + f.label + ' ' + f.help + ' ' + f.group).toLowerCase() },
-    el('td', { class: 'fl' }, el('code', { text: f.flag }), f.aliases.length ? el('span', { class: 'al', text: f.aliases.join(' ') }) : null),
-    el('td', {}, el('span', { class: 'kind', text: f.kind })),
-    el('td', {}, extra),
-    opts.matrix ? el('td', { class: 'hp2' }, el('div', { class: 'tmx' }, RT.map(([t]) => el('i', { class: f.types.includes(t) ? 'on' : '', title: t, text: LETTER[t] })))) : null);
+    el('td', { class: 'fl' }, el('code', { text: f.flag }), takes && !f.choices.length ? el('span', { class: 'ph2', text: brk(takes) }) : null,
+      f.aliases.length ? el('span', { class: 'al', text: f.aliases.join(', ') }) : null),
+    el('td', { class: 'tx' }, ico('chev', 'chev'), el('span', { class: 'lb', text: f.label }), el('span', { class: 'hp' }, ' — ', rich(f.help)),
+      f.choices.length ? el('div', { class: 'ch' }, f.choices.map(c => el('span', { text: c }))) : null),
+    opts.matrix ? el('td', { class: 'mx' }, el('div', { class: 'tmx' }, RT.map(([t]) => el('i', { class: f.types.includes(t) ? 'on' : '', title: t, text: LETTER[t] })))) : null);
   let x = null;
   tr.onclick = () => {
-    if (x) { x.remove(); x = null; return; }
+    if (x) { x.remove(); x = null; tr.classList.remove('open'); return; }
     const n = ref ? entryNode(ref) : null;
-    x = el('tr', { class: 'x' }, el('td', { colspan: opts.matrix ? 4 : 3 },
+    x = el('tr', { class: 'x' }, el('td', { colspan: opts.matrix ? 3 : 2 },
       n || el('p', { class: 'mut', text: 'No entry of its own in the manual.' }),
-      ref ? el('p', { class: 'src' }, el('a', { href: '#/man/' + ref, text: 'In the manual: ' + nice(SEC.get(ref.split('/')[0])?.title || '') })) : null));
-    tr.after(x);
+      ref ? el('p', { class: 'src' }, el('a', { href: '#/man/' + ref, text: 'In the manual: ' + nice(SEC.get(ref.split('/')[0])?.title || '') + ' →' })) : null));
+    tr.after(x); tr.classList.add('open');
   };
   return tr;
 }
 function flagTable(rt, opts = {}) {
   const rows = REF.flags.filter(f => !f.hidden && (!rt || f.types.includes(rt)));
   const box = el('div', {});
-  const q = el('input', { class: 'inp', placeholder: rt ? 'Filter ' + rows.length + ' flags of ' + rt : 'Filter ' + rows.length + ' flags', spellcheck: 'false' });
+  const q = el('input', { class: 'inp', placeholder: 'Filter flags', 'aria-label': 'Filter flags', spellcheck: 'false' });
   const cnt = el('span', { class: 'n' });
   box.append(el('div', { class: 'fbar' }, q, cnt));
   const groups = [];
@@ -208,44 +226,57 @@ function ratioBar(r, lo, hi) {
   const L = Math.log2;
   const x = v => ((L(v) - L(lo)) / (L(hi) - L(lo)) * 100).toFixed(1) + '%';
   const b = el('div', { class: 'rbar' });
+  const cls = r[1] > 1 ? '' : r[2] < 1 ? ' dn' : ' eq';
   b.innerHTML = '<div class="ax" style="left:' + x(1) + '"></div><div class="w" style="left:' + x(Math.max(lo, r[1])) + ';width:calc(' + x(Math.min(hi, r[2])) + ' - ' + x(Math.max(lo, r[1])) + ')"></div>' +
-    '<div class="m' + (r[0] < 1 ? ' dn' : '') + '" style="left:' + x(Math.min(hi, Math.max(lo, r[0]))) + '"></div>';
+    '<div class="m' + cls + '" style="left:' + x(Math.min(hi, Math.max(lo, r[0]))) + '"></div>';
+  b.title = r[0].toFixed(2) + '×, from ' + r[1].toFixed(2) + ' to ' + r[2].toFixed(2) + ' across passes';
   return b;
 }
+const short = a => a.replace(/ [\d.v-]+$/, '');
 function benchSet(s) {
   const arms = s.arms;
   const rs = s.rows.flatMap(r => (r.r || []).flat()).filter(v => v > 0);
   const lo = Math.min(0.5, ...rs) * 0.9, hi = Math.max(2, ...rs) * 1.1;
-  const head = el('tr', {}, el('th', { text: s.cols?.[0] || 'Test' }), arms.map(a => el('th', { text: a })),
-    arms.slice(1).map((a, k) => el('th', { text: arms.length > 2 ? '× ' + a.split(' ')[0] : 'socketley ÷ ' + a.split(' ')[0] })),
-    el('th', { class: 'bar', text: 'ratio' }));
+  const head = el('tr', {}, el('th', { text: '' }), arms.map(a => el('th', { text: short(a) })),
+    arms.slice(1).map(a => el('th', { text: 'vs ' + short(a) })),
+    el('th', { class: 'bar', title: 'Each pass from worst to best, the dot the median; the line is 1×' }, 'per pass'));
   const body = s.rows.map(r => el('tr', {}, el('td', { text: r.name }),
-    arms.map((a, k) => el('td', { class: k ? '' : 'us' }, fmt(r.v[k], r.unit || s.unit),
+    arms.map((a, k) => el('td', { class: k ? '' : 'us', 'data-l': short(a) }, el('div', { class: 'v', text: fmt(r.v[k], r.unit || s.unit) }),
       r.cpu?.[k] != null ? el('div', { class: 'cpu', text: r.cpu[k].toFixed(2) + ' cores' }) : null)),
     arms.slice(1).map((a, k) => {
       const q = r.r?.[k];
       if (!q) return el('td', { text: '–' });
       const cls = q[1] > 1 ? 'up' : q[2] < 1 ? 'dn' : 'eq';
-      return el('td', { class: 'rt ' + cls }, q[0].toFixed(2) + '×', el('span', { class: 'ci', text: '[' + q[1].toFixed(2) + ', ' + q[2].toFixed(2) + ']' }));
+      return el('td', { class: 'rt ' + cls, 'data-l': 'vs ' + short(arms[k + 1]) }, q[0].toFixed(2) + '×', el('span', { class: 'ci', text: q[1].toFixed(2) + '–' + q[2].toFixed(2) }));
     }),
     el('td', { class: 'bar' }, r.r?.[0] ? ratioBar(r.r[0], lo, hi) : null)));
-  const meta = [s.tool, s.passes ? s.passes + ' interleaved passes' : '', s.pin, s.date, s.commit ? 'socketley ' + s.commit : ''].filter(Boolean);
+  const meta = [arms.slice(1).join(', '), s.passes ? s.passes + ' passes' : '', s.date, s.commit ? 'socketley ' + s.commit : ''].filter(Boolean);
+  const notes = el('details', { class: 'bn' }, el('summary', { text: 'How it was measured' }),
+    el('p', { text: [s.tool, s.pin].filter(Boolean).join('; ') + '.' }));
+  if (s.note) { const p = el('p'); p.innerHTML = s.note; notes.append(p); }
   return el('div', { class: 'bset', id: 'bench:' + s.id },
-    el('h3', {}, el('span', { text: s.title }), s.vs?.length ? el('span', { class: 'vs', text: 'against ' + s.vs.join(', ') }) : null),
+    el('h3', {}, el('span', { text: s.title })),
     el('div', { class: 'meta', text: meta.join(' · ') }),
-    el('div', { class: 'mtw' }, el('table', { class: 'btbl' }, el('thead', {}, head), el('tbody', {}, body))),
-    s.note ? (() => { const p = el('p', { class: 'bnote' }); p.innerHTML = s.note; return p; })() : null);
+    el('div', { class: 'mtw' }, el('table', { class: 'btbl' + (arms.length > 2 ? ' a3' : '') }, el('thead', {}, head), el('tbody', {}, body))),
+    s.caveat ? el('p', { class: 'cav', text: '⚠ ' + s.caveat[0].toUpperCase() + s.caveat.slice(1) + '.' }) : null,
+    notes);
 }
-function benchFor(rt) {
+function benchLegend(page) {
+  return el('div', { class: 'legend' },
+    el('div', { class: 'lx' }, el('b', { text: '×' }), ' is how many times better socketley did: more per second, or less time, memory or CPU. Above 1× it is ahead.'),
+    el('span', {}, el('i', { class: 'dot', style: 'background:var(--ok)' }), 'ahead in every pass'),
+    el('span', {}, el('i', { class: 'dot', style: 'background:var(--mut)' }), 'no clear difference'),
+    el('span', {}, el('i', { class: 'dot', style: 'background:var(--bad)' }), 'behind in every pass'),
+    page ? el('span', {}, el('b', { class: 'warn2', text: '⚠' }), 'read its note before quoting it') : null);
+}
+function benchFor(rt, legend = true) {
   const sets = (BENCH?.sets || []).filter(s => !rt || s.runtime === rt);
   const box = el('div', {});
   if (!sets.length) {
     box.append(el('div', { class: 'bnone', text: NOBENCH[rt] || (RTI[rt]?.[2] ? 'Not measured on the current build yet. The comparison planned is against ' + RTI[rt][2] + '.' : 'No comparison is published for this runtime.') }));
     return box;
   }
-  box.append(el('div', { class: 'legend' },
-    el('span', {}, el('b', { text: 'Ratio' }), ' median of per-pass ratios, [range across passes]'),
-    el('span', { class: 'ok2', text: 'green: every pass ahead' }), el('span', { class: 'mut', text: 'grey: range spans 1.00×' }), el('span', { class: 'bad2', text: 'red: every pass behind' })));
+  if (legend) box.append(benchLegend());
   for (const s of sets) box.append(benchSet(s));
   return box;
 }
@@ -268,131 +299,198 @@ async function place(root) {
   for (const x of root.querySelectorAll('x-glance')) x.replaceWith(glance());
   for (const x of root.querySelectorAll('x-index')) {
     const sid = x.getAttribute('s');
-    const top = (SEC.get(sid)?.entries || []).filter(e => !/^(-|type$|name$|port$|path$)/.test(e.term));
-    x.replaceWith(el('div', { class: 'chips' }, top.map(e => el('a', { href: '#/man/' + sid + '/' + e.id, title: e.summary, onclick: ev => {
+    const top = (SEC.get(sid)?.entries || []).filter(e => x.hasAttribute('all') || !/^(-|type$|name$|port$|path$)/.test(e.term));
+    const seen = new Set();
+    x.replaceWith(el('div', { class: 'chips' }, top.filter(e => { const k = e.term.split(' ')[0].replace(/\(.*$/, '()').replace(/,$/, ''); if (seen.has(k)) return false; seen.add(k); return true; }).map(e => el('a', { href: '#/man/' + sid + '/' + e.id, title: e.summary, onclick: ev => {
       const n = document.getElementById(sid + '/' + e.id);
       if (n) { ev.preventDefault(); n.scrollIntoView({ block: 'start' }); n.classList.add('hl'); }
-    } }, el('span', {}, el('b', { text: e.term.split(/\s+[\[<|]/)[0].slice(0, 40) }))))));
+    } }, el('span', {}, el('b', { text: e.term.split(' ')[0].replace(/\(.*$/, '()').replace(/,$/, '').slice(0, 40) }))))));
   }
   for (const p of root.querySelectorAll('pre.code')) addCopy(p);
   nowrapFlags(root);
 }
 // One row of each runtime's benchmarks, the one its set names as its headline, chosen before the numbers were in.
-function glance() {
+function glance(caption = true) {
   const tiles = el('div', { class: 'tiles' });
   for (const s of BENCH?.sets || []) {
     if (s.headline == null) continue;
     const r = s.rows[s.headline], q = r?.r?.[0];
     if (!q) continue;
-    tiles.append(el('a', { class: 'tile', href: '#/bench/' + s.runtime },
-      el('div', { class: 'k', text: s.runtime + ' · ' + r.name }),
-      el('div', { class: 'v ' + (q[1] > 1 ? 'ok2' : q[2] < 1 ? 'bad2' : 'eq2') }, q[0].toFixed(2) + '×'),
-      el('div', { class: 's', text: '[' + q[1].toFixed(2) + ', ' + q[2].toFixed(2) + '] against ' + s.arms[1] }),
-      s.caveat ? el('div', { class: 's', style: 'color:var(--warn)', text: s.caveat }) : null));
+    tiles.append(el('a', { class: 'tile', href: '#/rt/' + s.runtime + '/benchmarks', title: r.name + (s.caveat ? ' — ' + s.caveat : '') },
+      el('div', { class: 'k' }, s.runtime, s.caveat ? el('span', { class: 'warn', text: '⚠' }) : null),
+      el('div', { class: 'v ' + (q[1] > 1 ? 'ok2' : q[2] < 1 ? 'bad2' : 'eq2') }, q[0].toFixed(1) + '×'),
+      el('div', { class: 's', text: 'vs ' + short(s.arms[1]) })));
   }
-  return tiles.children.length ? tiles : el('p', { class: 'mut', text: 'Benchmarks are being measured.' });
+  if (!tiles.children.length) return el('p', { class: 'mut', text: 'Benchmarks are being measured.' });
+  return caption ? el('div', {}, tiles, el('p', { class: 'src', text: '× is how many times better socketley did than the server named; ⚠ marks a result with a caveat in its notes.' })) : tiles;
 }
 function rtCards() {
   return el('div', { class: 'cards' }, RT.map(([id, d, vs]) => el('a', { class: 'tcard', href: '#/rt/' + id },
-    el('b', {}, el('span', { class: 'hb' }, ico(id)), id), el('p', { text: d }), vs ? el('div', { class: 'ref', text: 'Benchmarked against ' + vs }) : null)));
+    el('b', {}, el('span', { class: 'hb' }, ico(id)), id), el('p', { text: d }), vs ? el('div', { class: 'ref', text: 'vs ' + vs }) : null)));
 }
-function hero(kick, title, sub, chips = []) {
-  return el('div', { class: 'hero' }, el('div', { class: 'kick', text: kick }), el('h1', { text: title }),
-    sub ? el('p', { class: 'mut', style: 'margin:0 0 14px;max-width:760px;font-size:16px', text: sub }) : null,
-    chips.length ? el('div', { class: 'stats' }, chips.map(c => el('span', { class: 'chip' }, el('span', { text: c })))) : null);
-}
-function sec(title, icon, id, ...kids) {
-  return el('section', { class: 'sec', id: id || null }, el('h2', {}, el('span', { class: 'hb' }, ico(icon)), el('span', { text: title })), ...kids);
+// The head of a page: what part it belongs to, its title, one line on what it holds, and a few facts.
+function pageHead(kick, title, lead, chips = [], icon, acts) {
+  return el('header', { class: 'ph' }, el('div', { class: 'kick', text: kick }),
+    el('h1', {}, icon ? el('span', { class: 'hb' }, ico(icon)) : null, title),
+    lead ? el('p', { class: 'lead', text: lead }) : null,
+    chips.length ? el('div', { class: 'stats' }, chips.map(c => el('span', { class: 'chip' }, el('span', { text: c })))) : null,
+    acts || null);
 }
 function prose(h) { const d = el('div', { class: 'prose' }); d.innerHTML = h; return d; }
+const slug = t => t.toLowerCase().replace(/<[^>]+>/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+// The text of a page beside its contents: every h2 and h3 of it, the one in view marked as the page scrolls.
+function article(C, main, opts = {}) {
+  const heads = [...main.querySelectorAll(opts.heads || '.prose>h2,.prose>h3,h2.h2')].filter(h => !h.closest('.ftbl,.bset,details'));
+  const wrap = el('div', { class: 'page' }, main);
+  if (heads.length >= (opts.min || 3)) {
+    const toc = el('nav', { class: 'toc' }, el('div', { class: 't', text: 'On this page' }));
+    for (const h of heads) {
+      if (!h.id) h.id = 'h-' + slug(h.textContent);
+      toc.append(el('a', { href: '#', class: h.tagName === 'H3' ? 'l3' : '', 'data-for': h.id, text: h.textContent.trim(),
+        onclick: e => { e.preventDefault(); h.scrollIntoView({ block: 'start', behavior: 'smooth' }); } }));
+    }
+    wrap.classList.add('wtoc'); wrap.append(toc);
+    spy(heads, toc);
+  }
+  C.append(wrap);
+  return wrap;
+}
+let SPY = null;
+function spy(heads, toc) {
+  const S = $('#scroll');
+  if (SPY) S.removeEventListener('scroll', SPY);
+  SPY = () => {
+    const top = S.getBoundingClientRect().top + 90;
+    let cur = heads[0];
+    for (const h of heads) if (h.getBoundingClientRect().top <= top) cur = h;
+    for (const a of toc.querySelectorAll('a')) a.classList.toggle('on', a.dataset.for === cur.id);
+  };
+  S.addEventListener('scroll', SPY, { passive: true });
+  requestAnimationFrame(SPY);
+}
 
 async function pageHome(C) {
   const nflags = REF.flags.filter(f => !f.hidden).length;
-  C.append(hero('Documentation', 'socketley', 'One Linux daemon and CLI for long-living network runtimes — servers, proxies, a Redis-compatible cache, S3 storage, documents, DNS, sign-in, MQTT, mail, metrics, tunnels and MCP — each its own process on io_uring, scripted in Lua, clustered across machines.',
-    [RT.length + ' runtime types', nflags + ' flags', 'io_uring', 'Lua 5.1 / LuaJIT', 'Linux only']));
-  C.append(prose(await content('home')));
-  await place(C);
+  C.append(pageHead('Documentation', 'socketley', 'One Linux daemon and CLI that runs your servers, proxies, caches, storage, databases, DNS, sign-in, MQTT, mail, metrics, tunnels and MCP — each a runtime made with one command.',
+    [RT.length + ' runtime types', nflags + ' flags', 'io_uring', 'Lua scripting', 'Linux'], null,
+    el('div', { class: 'acts' }, el('a', { class: 'btn pri', href: '#/install' }, el('span', { text: 'Install' })),
+      el('a', { class: 'btn', href: '#/tour' }, el('span', { text: 'Ten-minute tour' })),
+      el('a', { class: 'btn', href: '#/concepts' }, el('span', { text: 'Concepts' })))));
+  const main = el('div', { class: 'main' }, prose(await content('home')));
+  await place(main);
+  article(C, main, { min: 99 });
 }
 async function pageContent(C, name, title, kick, sub, icon) {
-  C.append(hero(kick, title, sub));
-  const p = prose(await content(name));
-  C.append(p);
-  await place(C);
+  C.append(pageHead(kick, title, sub, [], icon));
+  const main = el('div', { class: 'main' }, prose(await content(name)));
+  await place(main);
+  article(C, main);
 }
-async function pageRuntime(C, rt) {
+const TABS = [['overview', 'Overview'], ['flags', 'Flags'], ['benchmarks', 'Benchmarks'], ['more', 'In depth']];
+async function pageRuntime(C, rt, tab) {
   const r = RTI[rt]; if (!r) return notFound(C);
   const flags = REF.flags.filter(f => !f.hidden && f.types.includes(rt));
-  const own = flags.filter(f => f.types.length === 1).length;
-  C.append(hero('Runtime', rt, r[1], [flags.length + ' flags, ' + own + ' its own', r[2] ? 'benchmarked against ' + r[2] : 'no reference']));
-  C.append(el('nav', { class: 'jump' }, ['Overview', 'Flags', 'Benchmarks', 'Manual'].map(t => el('a', { href: '#/rt/' + rt + '/' + t.toLowerCase(), text: t }))));
-  const h = await content('rt/' + rt);
-  C.append(sec('Overview', rt, 'overview', prose(h || '')));
-  C.append(sec('Flags', 'list', 'flags', el('p', { class: 'mut', text: 'Every flag create and edit take for a ' + rt + ', grouped as the dashboard asks for them. Click a row for its whole entry in the manual.' }), el('x-flags', { rt })));
-  C.append(sec('Benchmarks', 'bars', 'benchmarks', el('x-bench', { rt })));
+  const sets = (BENCH?.sets || []).filter(s => s.runtime === rt);
   const top = REF.sections.find(s => s.id === rt + '-flags');
-  C.append(sec('Manual', 'book', 'manual', el('p', { class: 'mut', text: 'The ' + nice(top.title) + ' section of socketley(1), with every subsection.' }), el('x-man', { s: top.id, fold: '', subs: '' })));
-  await place(C);
+  const subs = top ? subsOf(top.id) : [];
+  // A tab is shown only where it has something: no benchmarks tab for a runtime nothing was measured against.
+  const tabs = TABS.filter(([id]) => id === 'overview' || id === 'flags' || (id === 'benchmarks' && sets.length) || (id === 'more' && subs.length));
+  if (tab === 'manual') tab = 'more';
+  if (!tabs.some(t => t[0] === tab)) tab = 'overview';
+  C.append(pageHead('Runtime', rt, tab === 'overview' ? '' : r[1], [], rt));
+  C.append(el('nav', { class: 'tabs' }, tabs.map(([id, t]) => el('a', { href: '#/rt/' + rt + (id === 'overview' ? '' : '/' + id), class: id === tab ? 'on' : '' },
+    t, id === 'flags' ? el('span', { class: 'n', text: flags.length }) : null))));
+  const main = el('div', { class: 'main' });
+  const whole = top ? el('p', { class: 'src' }, el('a', { href: '#/man/' + top.id, text: 'The whole ' + nice(top.title) + ' section of the manual →' })) : null;
+  if (tab === 'overview') {
+    main.append(prose(await content('rt/' + rt) || ''));
+    if (!sets.length && NOBENCH[rt]) main.append(el('p', { class: 'src', text: 'No benchmark: ' + NOBENCH[rt][0].toLowerCase() + NOBENCH[rt].slice(1) }));
+  } else if (tab === 'flags') {
+    main.append(el('p', { class: 'sub', text: 'Every flag a ' + rt + ' takes, grouped as in the dashboard\'s create form. Click one for its full entry in the manual.' }), el('x-flags', { rt }), whole);
+  } else if (tab === 'benchmarks') {
+    main.append(el('p', { class: 'sub' }, 'Against ' + r[2] + ', on one machine, in one run. ', el('a', { href: '#/bench', text: 'How every benchmark is made →' })), el('x-bench', { rt }));
+  } else {
+    main.append(el('p', { class: 'sub', text: 'Topics from the manual\'s ' + nice(top.title) + ' section, beyond the flags.' }));
+    for (const c of subs) main.append(foldSec(c, false));
+    main.append(whole);
+  }
+  await place(main);
+  article(C, main);
 }
 async function pageFlags(C) {
-  C.append(hero('Reference', 'All flags', 'Every flag of every runtime type, from the same table the dashboard builds its forms from. The squares say which types take it; a row opens its entry in the manual.'));
+  C.append(pageHead('Reference', 'All flags', 'Every flag of every runtime type. The letters show which types take it; click a flag for its entry in the manual.'));
   C.append(el('div', { class: 'legend' }, RT.map(([t]) => el('span', {}, el('b', { text: LETTER[t] }), t))));
   C.append(el('x-flags', {}));
   await place(C);
 }
 async function pageMan(C, sid, eid) {
   if (!sid) {
-    C.append(hero('Reference', 'Manual', 'socketley(1), whole: the manual page the code is kept against, here by section. Generated from man/socketley.1 at ' + REF.commit + ' (' + REF.date + ').'));
+    C.append(pageHead('Reference', 'Manual', 'socketley(1), the manual page, by section. Generated from man/socketley.1 on ' + REF.date + '.'));
+    const lists = [['Runtime flags', s => /-flags$/.test(s.id)], ['Everything else', s => !/-flags$/.test(s.id)]];
+    for (const [title, want] of lists) {
     const list = el('div', { class: 'cards' });
-    for (const s of REF.sections.filter(s => s.level === 1)) {
+    C.append(el('h2', { class: 'h2', text: title }), list);
+    for (const s of REF.sections.filter(s => s.level === 1 && want(s))) {
       const subs = subsOf(s.id);
       list.append(el('a', { class: 'tcard', href: '#/man/' + s.id }, el('b', { text: nice(s.title) }),
-        el('p', { text: (s.entries.length ? s.entries.length + ' entries · ' : '') + (subs.length ? subs.length + ' subsections · ' : '') + Math.max(1, Math.round((s.words + subs.reduce((a, c) => a + c.words, 0)) / 220)) + ' min' })));
+        el('p', { text: (s.entries.length ? s.entries.length + ' entries · ' : '') + (subs.length ? subs.length + (subs.length === 1 ? ' topic · ' : ' topics · ') : '') + Math.max(1, Math.round((s.words + subs.reduce((a, c) => a + c.words, 0)) / 220)) + ' min read' })));
     }
-    C.append(list);
+    }
     return;
   }
   const s = SEC.get(sid); if (!s) return notFound(C);
   const parent = s.parent && s.parent !== s.id ? SEC.get(s.parent) : null;
-  C.append(hero(parent ? nice(parent.title) : 'Manual', nice(s.title), ''));
-  C.append(manBody(sid));
-  for (const c of subsOf(sid)) C.append(el('h2', { style: 'margin:30px 0 10px', id: 'sec:' + c.id }, el('a', { href: '#/man/' + c.id, class: 'lnk', text: nice(c.title) })), manBody(c.id));
+  C.append(pageHead(parent ? nice(parent.title) : 'Manual', nice(s.title), ''));
+  const main = el('div', { class: 'main' });
+  if (s.entries.length > 6) main.append(el('x-index', { s: sid, all: '' }));
+  main.append(manBody(sid));
+  for (const c of subsOf(sid)) main.append(el('h2', { class: 'h2', id: 'sec:' + c.id }, nice(c.title)), manBody(c.id));
+  await place(main);
+  article(C, main, { heads: 'h2.h2', min: 2 });
   if (eid) setTimeout(() => {
     const n = document.getElementById(sid + '/' + eid);
     if (n) { n.classList.add('hl'); n.querySelector('details')?.setAttribute('open', ''); n.scrollIntoView({ block: 'start' }); }
   }, 0);
 }
 async function pageBench(C, rt) {
-  C.append(hero('Performance', 'Benchmarks', 'Each runtime against the server people would otherwise run, on one machine, in one run, the arms interleaved. Every figure carries the CPU it cost and the spread across passes.',
-    BENCH?.box ? [BENCH.box.cpu, BENCH.box.vcpus + ' vCPUs', BENCH.box.mem, BENCH.box.os, 'Linux ' + BENCH.box.kernel] : []));
-  C.append(prose(await content('bench')));
+  if (rt) { location.replace('#/rt/' + rt + '/benchmarks'); return; }
+  C.append(pageHead('Performance', 'Benchmarks', 'Each runtime against what people run instead, on one machine, in one run. Every rate carries the CPU it cost.',
+    BENCH?.box ? [BENCH.box.cpu, BENCH.box.vcpus + ' vCPUs', BENCH.box.os] : []));
+  const main = el('div', { class: 'main' });
+  const text = prose(await content('bench'));
+  const intro = text.querySelector('p');
+  if (intro) main.append(el('div', { class: 'prose' }, intro));
+  main.append(el('h2', { class: 'h2', text: 'At a glance' }), glance(false), benchLegend(true));
   const done = [...new Set((BENCH?.sets || []).map(s => s.runtime))];
-  C.append(el('nav', { class: 'jump' }, RT.filter(r => done.includes(r[0])).map(([t]) => el('a', { href: '#/bench/' + t, text: t }))));
-  for (const [t, , vs] of RT) {
+  for (const [t] of RT) {
     if (!done.includes(t)) continue;
-    C.append(sec(t, t, 'b-' + t, benchFor(t)));
+    main.append(el('h2', { class: 'h2', id: 'b-' + t }, el('a', { href: '#/rt/' + t, class: 'hl2', text: t })), benchFor(t, false));
   }
   const left = RT.filter(r => !done.includes(r[0]));
-  if (left.length) C.append(sec('Without a comparison', 'clock', 'b-left', el('ul', { class: 'prose' }, left.map(r => el('li', {}, el('b', { text: r[0] }), ': ' + (NOBENCH[r[0]] || 'not measured on the current build yet.'))))));
-  await place(C);
-  if (rt) setTimeout(() => document.getElementById('b-' + rt)?.scrollIntoView({ block: 'start' }), 0);
+  if (left.length) main.append(el('h2', { class: 'h2', text: 'Without a comparison' }), el('ul', { class: 'prose' }, left.map(r => el('li', {}, el('b', { text: r[0] }), ': ' + (NOBENCH[r[0]] || 'not measured on the current build yet.')))));
+  for (const h of text.querySelectorAll('h2')) h.classList.add('h2');
+  main.append(text);
+  await place(main);
+  article(C, main, { heads: 'h2.h2' });
 }
 const REPO = 'https://github.com/HiImSmiley/Socketley/blob/main/';
 async function pageExamples(C) {
-  C.append(hero('Guide', 'Examples', 'Every script and program in the repository\'s examples/ and sdk/examples/, with what its head comment says it is. Each runs as its first lines describe.', [REF.examples.length + ' files']));
+  C.append(pageHead('Guide', 'Examples', 'Every script and program in the repository\'s examples/ and sdk/examples/, with what it does. Each runs as its first lines say.', [REF.examples.length + ' files']));
   const groups = new Map();
   for (const e of REF.examples) {
     const dir = e.path.split('/').slice(0, -1).join('/');
     if (!groups.has(dir)) groups.set(dir, []);
     groups.get(dir).push(e);
   }
-  const q = el('input', { class: 'inp', placeholder: 'Filter ' + REF.examples.length + ' examples', spellcheck: 'false' });
+  const q = el('input', { class: 'inp', placeholder: 'Filter examples', 'aria-label': 'Filter examples', spellcheck: 'false' });
   C.append(el('div', { class: 'fbar' }, q));
   const blocks = [];
-  for (const [dir, es] of groups) {
+  const order = d => ['examples/basic', 'examples/lua', 'examples/cache', 'examples/advanced'].indexOf(d) + 1 || 9;
+  for (const [dir, es] of [...groups].sort((a, b) => order(a[0]) - order(b[0]) || a[0].localeCompare(b[0]))) {
     const t = el('table', { class: 'ftbl ex' }, el('tbody', {}, es.map(e => el('tr', { 'data-q': (e.path + ' ' + e.title + ' ' + e.summary).toLowerCase() },
-      el('td', { class: 'fl' }, el('a', { href: REPO + e.path, target: '_blank', rel: 'noopener', class: 'lnk' }, el('code', { text: e.path.split('/').pop() }))),
-      el('td', {}, el('div', { class: 'lb', text: e.title || '' }), e.summary ? el('div', { class: 'hp', text: e.summary }) : null)))));
-    const h = el('div', { class: 'fgrp', text: dir });
+      el('td', { class: 'fl' }, el('a', { href: REPO + e.path, target: '_blank', rel: 'noopener', class: 'ln' }, el('code', { text: e.path.split('/').pop() }))),
+      el('td', {}, el('div', { class: 'lb' }, rich(e.title || '')), e.summary ? el('div', { class: 'hp' }, ...e.summary.split(/\s+-\s+(?=[A-Z])/).map((x, i) => i ? el('div', { class: 'li' }, '• ', rich(x)) : rich(x))) : null)))));
+    const h = el('div', { class: 'fgrp', text: dir.replace(/^examples\//, '').replace(/^sdk\/examples$/, 'C++ SDK').replace(/^examples$/, 'Other') });
     blocks.push([h, t]); C.append(h, t);
   }
   q.oninput = () => {
@@ -400,7 +498,7 @@ async function pageExamples(C) {
     for (const [h, t] of blocks) { let n = 0; for (const tr of t.rows) { tr.hidden = !!s && !tr.dataset.q.includes(s); n += !tr.hidden; } h.hidden = t.hidden = !n; }
   };
 }
-function notFound(C) { C.append(el('div', { class: 'empty' }, ico('search', 'big'), el('h3', { text: 'Nothing here' }), el('p', {}, el('a', { href: '#/', class: 'lnk', text: 'Back to the overview' })))); }
+function notFound(C) { C.append(el('div', { class: 'empty' }, ico('search', 'big'), el('h3', { text: 'Nothing here' }), el('p', {}, el('a', { href: '#/', class: 'ln', text: 'Back to the overview' })))); }
 
 const CONTENT = {
   install: ['Install', 'Start', 'From source, the install script or a Debian package; the daemon then runs as a systemd service.'],
@@ -428,7 +526,7 @@ async function route() {
   document.title = (TITLES[key] || (parts[0] === 'man' && nice(SEC.get(parts[1])?.title || '')) || 'Documentation') + ' · socketley';
   try {
     if (!key) await pageHome(C);
-    else if (parts[0] === 'rt') await pageRuntime(C, parts[1]);
+    else if (parts[0] === 'rt') await pageRuntime(C, parts[1], parts[2] === 'flag' ? 'flags' : parts[2]);
     else if (parts[0] === 'flags') await pageFlags(C);
     else if (parts[0] === 'man') await pageMan(C, parts[1], parts.slice(2).join('/'));
     else if (parts[0] === 'bench') await pageBench(C, parts[1]);
@@ -437,13 +535,12 @@ async function route() {
     else notFound(C);
   } catch (e) { C.append(el('p', { class: 'bad2', text: String(e) })); }
   // A sub-path names a place on the page: a section, a flag, a subsection of the manual.
-  const sub = parts[0] === 'rt' ? parts.slice(2).join('/') : '';
   const S = $('#scroll');
-  if (sub.startsWith('flag/')) {
-    const tr = document.getElementById('flag:' + parts[1] + ':' + sub.slice(5));
-    if (tr) { tr.click(); tr.scrollIntoView({ block: 'center' }); tr.classList.add('sel'); }
-  } else if (sub) document.getElementById(sub)?.scrollIntoView({ block: 'start' });
-  else if (parts[0] !== 'man' || !parts[2]) S.scrollTop = 0;
+  if (parts[0] === 'rt' && parts[2] === 'flag') {
+    const tr = document.getElementById('flag:' + parts[1] + ':' + parts.slice(3).join('/'));
+    S.scrollTop = 0;
+    if (tr) { tr.click(); tr.scrollIntoView({ block: 'center' }); }
+  } else if (parts[0] !== 'man' || !parts[2]) S.scrollTop = 0;
 }
 function go(h) { location.hash = '#/' + h; }
 

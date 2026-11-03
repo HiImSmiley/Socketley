@@ -1,33 +1,55 @@
-<p>socketley runs on Linux 5.19 or newer, on x86_64 and aarch64. The installed daemon runs as the systemd service <code>socketley</code>; root and members of the <code>socketley</code> group reach it, and anyone else silently gets a private daemon of their own, so join the group and log in again:</p>
-<pre class="code">sudo usermod -aG socketley $USER</pre>
+<p>socketley runs on Linux 5.19 or newer, on x86_64 and aarch64. Install it one of four ways, join the group, then check it.</p>
 
 <h2>A release package</h2>
 <pre class="code">curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh</pre>
-<p>Downloads the newest release <code>.deb</code> and installs it. It lists what the package needs against what is installed, asks before installing each missing dependency (and offers ffmpeg, which the storage runtime's thumbnails and video streams use), and stops, having changed nothing, when the package was built for a newer distribution than yours. Where socketley is installed already it offers to upgrade or remove it. <code>--deb FILE</code> installs a package you have, <code>--yes</code> takes every default, <code>--uninstall</code> removes it.</p>
+<p>Installs the newest release <code>.deb</code>, asking before each missing dependency (ffmpeg is offered for the storage runtime's thumbnails and video). A package built for a newer distribution than yours changes nothing.</p>
+<table class="kv">
+<tr><th>Option</th><th>Does</th></tr>
+<tr><td><code>--deb FILE</code></td><td>Installs a package you have.</td></tr>
+<tr><td><code>--yes</code></td><td>Takes every default.</td></tr>
+<tr><td><code>--uninstall</code></td><td>Removes socketley.</td></tr>
+</table>
 
 <h2>From source, in one step</h2>
 <pre class="code">git clone https://github.com/HiImSmiley/Socketley
 cd Socketley
 bash scripts/install-from-source.sh</pre>
-<p>Checks the kernel, the architecture and the compiler (GCC 12 or newer); installs the build dependencies; builds the liburing this tree needs, since distributions package older ones; builds Release; installs the binary, the man page, the help script and the systemd service; then starts the daemon and asks it for its runtime list before reporting success. <code>--dry-run</code> prints every command and runs none, <code>--uninstall</code> removes exactly what it installed, <code>--prefix</code> moves the install (only <code>/usr</code> gives a system service).</p>
+<p>Checks the kernel, architecture and compiler (GCC 12 or newer), builds liburing and Release, installs the binary, man page and service, and starts the daemon.</p>
+<table class="kv">
+<tr><th>Option</th><th>Does</th></tr>
+<tr><td><code>--dry-run</code></td><td>Prints every command, runs none.</td></tr>
+<tr><td><code>--uninstall</code></td><td>Removes what it installed.</td></tr>
+<tr><td><code>--prefix</code></td><td>Installs elsewhere; only <code>/usr</code> gives a system service.</td></tr>
+</table>
 
 <h2>From source, by hand</h2>
-<pre class="code">sudo apt install build-essential libssl-dev libluajit-5.1-dev git
-bash scripts/install-liburing.sh          <i># liburing &gt;= 2.7, only if yours is older</i>
-./bin/build-thirdparty.sh                 <i># the static archives the tree links, HTTP/3 included</i>
-./bin/premake5 gmake2
-make -C make config=release_x64 -j$(nproc)
-sudo bash packaging/install.sh            <i># optional: system-wide, with the service</i></pre>
-<p>The binary is <code>bin/Release/socketley</code>. Run from there without installing, it is a development install: <code>./bin/Release/socketley daemon &amp;</code> starts a daemon on <code>/tmp/socketley.sock</code>, and state lives under your home directory; see <a href="#/env">environment &amp; files</a>.</p>
+<ol class="steps">
+<li><p>Dependencies.</p>
+<pre class="code">sudo apt install build-essential libssl-dev libluajit-5.1-dev git</pre></li>
+<li><p>liburing, if yours is older than 2.7.</p>
+<pre class="code">bash scripts/install-liburing.sh          <i># liburing &gt;= 2.7, only if yours is older</i></pre></li>
+<li><p>The third-party archives.</p>
+<pre class="code">./bin/build-thirdparty.sh                 <i># the static archives the tree links, HTTP/3 included</i></pre></li>
+<li><p>Build.</p>
+<pre class="code">./bin/premake5 gmake2
+make -C make config=release_x64 -j$(nproc)</pre></li>
+<li><p>Optionally, install system-wide.</p>
+<pre class="code">sudo bash packaging/install.sh            <i># optional: system-wide, with the service</i></pre></li>
+</ol>
+<p>Without installing, <code>./bin/Release/socketley daemon &amp;</code> starts a development daemon on <code>/tmp/socketley.sock</code> with state under your home directory; see <a href="#/env">environment &amp; files</a>.</p>
 
 <h2>A Debian package of your own</h2>
 <pre class="code">bash packaging/build-deb.sh
 sudo apt install ./socketley_*.deb</pre>
-<p>Build it on the release it is for: its dependencies are read from the binary, so a package built on Ubuntu 24.04 does not install on Debian 12.</p>
+<p>Build it on the release it is for: a package built on Ubuntu 24.04 does not install on Debian 12.</p>
+
+<h2>Join the socketley group</h2>
+<pre class="code">sudo usermod -aG socketley $USER</pre>
+<p>Only root and the <code>socketley</code> group reach the installed daemon; anyone else silently gets a private daemon of their own. Log in again after joining.</p>
 
 <h2>Check it</h2>
 <pre class="code">systemctl status socketley
 socketley ls
 socketley --help          <i># the interactive help</i>
 man socketley</pre>
-<x-man s="installation" subs-only></x-man>
+<p class="src"><a href="#/man/installation">The manual's installation section →</a></p>

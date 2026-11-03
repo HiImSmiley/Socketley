@@ -1,15 +1,15 @@
-<p>Several daemons, on one machine or many, form a cluster by sharing a directory: each writes its state there every two seconds and reads the others', and a daemon whose heartbeat is older than ten seconds is left out. From then on <code>socketley ls</code> on any of them shows every daemon's runtimes, a proxy's <code>@group</code> backend reaches the group's members wherever they run, and scripts are told when daemons and groups change.</p>
+<p>Daemons that share a directory form a cluster. Each writes its state there every two seconds; one silent for ten seconds is left out. Then <code>socketley ls</code> shows every daemon's runtimes, and a proxy's <code>@group</code> backend reaches members wherever they run.</p>
 <pre class="code"><i># on every machine, the same shared directory</i>
 socketley daemon --name node-a --cluster /mnt/cluster
 socketley create server api -p 9000 -g api -s
 <i># anywhere in the cluster</i>
 socketley create proxy gw -p 8080 --backend @api -s
 socketley daemons</pre>
-<div class="callout warn"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/></svg><div>Whoever can write to the cluster directory decides where a proxy's <code>@group</code> traffic goes. Give it the same protection as the daemon's control socket.</div></div>
-<x-man s="cluster-mode" fold open></x-man>
+<div class="callout warn"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/></svg><div>Whoever can write to the cluster directory decides where <code>@group</code> traffic goes. Protect it like the control socket.</div></div>
+<x-man s="cluster-mode" fold></x-man>
 <x-man s="cluster-mode.raft-mode-experimental-opt-in" fold></x-man>
 <x-man s="lua-configuration.cluster-introspection-api" fold></x-man>
 <x-man s="lua-configuration.cluster-event-callbacks" fold></x-man>
 <h2>Service mesh</h2>
-<p>The proxy's resilience features, health checks, circuit breaker, deadlines, retries and mTLS, are what a service mesh gives each call; <code>--sidecar</code> puts a proxy beside one service with all of them on.</p>
+<p>The proxy's health checks, circuit breaker, deadlines, retries and mTLS are what a service mesh gives each call. <code>--sidecar</code> turns on health checks, the circuit breaker, retries and draining in one flag.</p>
 <x-man s="service-mesh" subs-only></x-man>

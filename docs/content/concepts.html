@@ -1,31 +1,46 @@
 <h2>The daemon and the CLI</h2>
-<p>One binary is both. <code>socketley daemon</code> holds the runtimes and listens on a unix socket (<code>/run/socketley/socketley.sock</code> when installed, <code>/tmp/socketley.sock</code> in development); every other invocation is a CLI that sends the daemon one command and prints its answer. Success is silent, errors go to stdout, and the exit status is 0, 1 for bad input or 2 for a fatal error.</p>
+<p>One binary is both. <code>socketley daemon</code> holds the runtimes; every other invocation sends it one command and prints the answer. Exit status: 0, 1 for bad input, 2 for a fatal error.</p>
+<table class="kv">
+<tr><th>Install</th><th>Control socket</th></tr>
+<tr><td>Installed</td><td><code>/run/socketley/socketley.sock</code></td></tr>
+<tr><td>Development</td><td><code>/tmp/socketley.sock</code></td></tr>
+</table>
 
 <h2>A runtime</h2>
-<p>A runtime has a <b>type</b> (one of <a href="#/man/registered-types">the registered types</a>), a <b>name</b> unique on the daemon and a six-character id. It is made with <code>create</code>, which checks every flag and keeps the configuration, and runs from <code>start</code>, which is also when its Lua script is loaded. Its life is <code>created → running → stopped</code>, or <code>failed</code> with the reason in <code>ls</code> and the log.</p>
+<p>A runtime has a <b>type</b> (one of <a href="#/man/registered-types">the registered types</a>) and a <b>name</b> unique on the daemon. <code>create</code> checks the flags and keeps them; <code>start</code> runs it and loads its script. A <code>failed</code> runtime shows the reason in <code>ls</code>.</p>
 <x-man s="runtime-states" fold></x-man>
-<p><b>Every runtime is its own process.</b> The daemon forks a supervised worker per runtime (per shard, with <code>--shards</code>), so a crash or a runaway script takes one runtime down and not the daemon; it is restarted, counted, and a worker stuck in a busy loop is reported. Each worker runs one io_uring event loop on one thread.</p>
+<p><b>Each runtime is its own process</b>, a supervised worker with one io_uring loop on one thread. A crash or runaway script takes down that runtime, not the daemon, and it is restarted.</p>
 
 <h2>State that survives</h2>
-<p>Each runtime's configuration is a JSON file in the state directory. When the daemon starts it restores every runtime and starts the ones that were running when it stopped, so a reboot brings the whole topology back. <code>show</code> prints the JSON, <code>edit</code> changes flags, <code>import</code> replaces the configuration, <code>export</code> writes all of it, and <code>export --full</code> archives state and data together for a backup.</p>
+<p>Each runtime's configuration is a JSON file. When the daemon starts, it brings back every runtime and starts those that were running.</p>
+<table class="kv">
+<tr><th>Command</th><th>Does</th></tr>
+<tr><td><code>show</code> / <code>edit</code></td><td>Print the JSON / change flags.</td></tr>
+<tr><td><code>import</code> / <code>export</code></td><td>Replace / write the configuration.</td></tr>
+<tr><td><code>export --full</code></td><td>Archive state and data, for a backup.</td></tr>
+</table>
 <x-man s="state-persistence" fold></x-man>
 
 <h2>Names, ports and addresses</h2>
-<p>Runtimes reach each other by <b>name</b>: a proxy's <code>--backend api</code>, a server's <code>--cache store</code>, a mail runtime's <code>--storage files/mail</code>. A runtime with <code>--domain</code> names is served by the <b>entrance</b>, the one proxy on 80 and 443, under those names with certificates it obtains itself, and a dns runtime with <code>--publish</code> answers for them. <code>--bind</code> keeps a port to one address, <code>--listen unix:/path</code> trades the port for a unix socket, which is faster and checked by file permissions.</p>
+<ul>
+<li>Runtimes reach each other by <b>name</b>: <code>--backend api</code>, <code>--cache store</code>.</li>
+<li><code>--domain</code> names are served by the <b>entrance</b>, the one proxy on 80 and 443, with certificates it gets itself.</li>
+<li><code>--bind</code> keeps a port to one address; <code>--listen unix:/path</code> uses a unix socket instead.</li>
+</ul>
 <x-man s="common-flags" subs-only></x-man>
 
 <h2>TLS</h2>
-<p>TLS terminates on a server, cache, proxy or mqtt listener with <code>--tls --cert --key</code>, verifies client certificates with <code>--ca</code>, and a client or a proxy's <code>https://</code> backend dials over verified TLS; there is no switch to skip verification. <code>--acme</code> gets and renews Let's Encrypt certificates. See <a href="#/man/limitations.tls">TLS under limitations</a> for what is not supported.</p>
+<p>On a server, cache, proxy or mqtt listener, <code>--tls --cert --key</code> terminates TLS and <code>--ca</code> verifies clients; <code>--acme</code> gets Let's Encrypt certificates. A client or a proxy's <code>https://</code> backend always verifies the server. Not supported: <a href="#/man/limitations.tls">TLS under limitations</a>.</p>
 
 <h2>Several cores</h2>
-<p>A runtime's worker is one thread. <code>--shards N</code> runs N workers that share the port through <code>SO_REUSEPORT</code>; on a server or proxy any shard answers any request, on a cache each key has one owning shard and <code>--cluster</code> lets clients go to it directly. <code>--cpus</code> pins where the I/O runs. Read the <a href="#/man/server-flags.sharding">sharding</a> section before choosing N: the gain depends on the workload, and it is measured there.</p>
+<p><code>--shards N</code> runs N workers sharing the port; <code>--cpus</code> pins them. On a cache each key has one owning shard. Read <a href="#/man/server-flags.sharding">sharding</a> before choosing N: the gain depends on the workload.</p>
 
 <h2>Scripts</h2>
-<p>Most types take <code>--lua file</code>: callbacks the runtime calls on its events and methods it offers back. The script is loaded at <code>start</code>, replaced with <code>reload-lua</code>, and runs under a <a href="#/man/lua-configuration.callback-deadline">deadline</a> so a runaway callback ends instead of stalling the runtime. See <a href="#/lua">Lua scripting</a>.</p>
+<p>Most types take <code>--lua file</code>, loaded at <code>start</code> and replaced with <code>reload-lua</code>. A runaway callback is ended by a <a href="#/man/lua-configuration.callback-deadline">deadline</a>. See <a href="#/lua">Lua scripting</a>.</p>
 
 <h2>More than one machine</h2>
-<p>Daemons that share a directory, typically a volume between containers, discover each other through it: <code>ls</code> shows every daemon's runtimes, <code>@group</code> backends span machines, and scripts are told when daemons join and leave. An opt-in Raft mode replicates the cluster's state. See <a href="#/cluster">Cluster</a>.</p>
+<p>Daemons sharing a directory see each other's runtimes, and <code>@group</code> backends span machines. See <a href="#/cluster">Cluster</a>.</p>
 
 <h2>Watching it</h2>
-<p><code>socketley stats</code> prints a runtime's live counters, <code>daemon stats</code> the daemon's. The daemon serves a <a href="#/man/dashboard">dashboard</a> in the browser and a Prometheus <code>/metrics</code> endpoint, and a <a href="#/rt/metrics">metrics</a> runtime keeps the history, raises alerts and sends them by webhook or mail.</p>
+<p><code>socketley stats</code> and <code>daemon stats</code> print live counters. The daemon serves a <a href="#/man/dashboard">dashboard</a> and a Prometheus <code>/metrics</code>; a <a href="#/rt/metrics">metrics</a> runtime keeps history and sends alerts.</p>
 <x-man s="dashboard" fold></x-man>

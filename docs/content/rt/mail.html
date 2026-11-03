@@ -1,15 +1,23 @@
-<p>A <b>mail</b> runtime is a mail server. It takes the mail of its domains and the mail its users send, keeps each message in a spool synced to disk before it says 250, hands mail for elsewhere to the domain's exchanger or a smarthost, and keeps its users' mailboxes in a <a href="#/rt/storage">storage</a> runtime, read over IMAP, POP3, JMAP or in the browser. A <a href="#/rt/dns">dns</a> runtime gives its domains their records, an <a href="#/rt/idp">idp</a> runtime its users, and every other runtime, the CLI and the daemon's alerts can send through it.</p>
+<p class="lead">A <b>mail</b> runtime is a mail server: it receives mail for your domains, sends your users' mail, and keeps their mailboxes. Other runtimes, the CLI and the daemon's alerts can send through it.</p>
 <pre class="code">socketley create mail m -p 25 --dns ns --no-reply -s            <i># only sends: alerts, notices</i>
 socketley send m --to ops@example.com --subject "Backup done" --text ok
 
 socketley create mail m -p 25 --dns ns --idp auth --storage files/mail \
     --submission 587 --imap 143 --tls -s</pre>
 
-<h3>What it does</h3>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Receiving</b><p>SMTP with SPF, DKIM, DMARC and ARC checks, optional greylisting and blocklists, and Sieve filters per user.</p></div>
+<div><b>Safe spool</b><p>A message is synced to disk before the sender is told 250.</p></div>
+<div><b>Sending</b><p><code>--submission</code> and <code>--submissions</code> ports, DKIM signing, DANE and MTA-STS, or a <code>--relay</code> smarthost.</p></div>
+<div><b>Reading</b><p>IMAP, POP3, JMAP, and webmail on <code>--web</code>.</p></div>
+<div><b>DNS records</b><p>Publishes MX, SPF, DKIM, DMARC, MTA-STS and more through <code>--dns</code>.</p></div>
+<div><b>Operating it</b><p><code>socketley mail m queue</code>, <code>show</code>, <code>flush</code>, <code>trace</code>; <code>on_rcpt</code> and <code>on_message</code> in <a href="#/lua">Lua</a>.</p></div>
+</div>
+
+<h2>Works with</h2>
 <ul>
-<li><b>Receiving</b>: SMTP on 25 with SPF, DKIM, DMARC and ARC checked, <code>--greylist</code>, DNS block lists, <code>--clamav</code> and <code>--rspamd</code> when given, <code>--refuse-attachments</code>, and Sieve filters per user (ManageSieve on <code>--sieve</code>).</li>
-<li><b>Sending</b>: <code>--submission</code> (STARTTLS) and <code>--submissions</code> (TLS) for users, DKIM signing with key rotation (<code>--dkim-selector</code>, <code>--dkim-next</code>), delivery over DANE and MTA-STS, retries until <code>--queue-lifetime</code>, or a <code>--relay</code> smarthost.</li>
-<li><b>Reading</b>: <code>--imap</code>/<code>--imaps</code>, <code>--pop3</code>/<code>--pop3s</code>, <code>--jmap</code>, and webmail on <code>--web</code>; quotas with <code>--default-quota</code>.</li>
-<li><b>The domain's records</b>: through <code>--dns</code> it publishes MX, SPF, DKIM, DMARC (<code>--dmarc-policy</code>, <code>--dmarc-rua</code>), MTA-STS, TLS-RPT and BIMI, and with <code>--reports</code> reads the reports others send back.</li>
-<li><b>Operating it</b>: <code>socketley mail queue|show|flush|drop|trace|usage</code>, suppression lists, and <code>on_rcpt</code>/<code>on_message</code> in Lua.</li>
+<li><a href="#/rt/dns">dns</a> publishes its domains' records.</li>
+<li><a href="#/rt/idp">idp</a> provides its users.</li>
+<li><a href="#/rt/storage">storage</a> holds the mailboxes.</li>
 </ul>

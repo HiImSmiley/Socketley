@@ -1,4 +1,4 @@
-<p>A <b>cache</b> is an in-memory data store that speaks RESP2, the Redis protocol, so <code>redis-cli</code> and every Redis client library work against it unchanged; it also answers a plain text protocol for <code>nc</code> and scripts. Strings, lists, sets, hashes, sorted sets and streams with consumer groups, TTLs, pub/sub, transactions, LRU eviction, persistence to a journal, leader-follower replication and a cluster slot map for sharded deployments.</p>
+<p class="lead">A <b>cache</b> is an in-memory data store that speaks the Redis protocol, so <code>redis-cli</code> and Redis libraries work unchanged. <code>nc</code> works too, in plain text.</p>
 <pre class="code">socketley create cache store -p 6379 -s
 redis-cli -p 6379 SET greeting hello
 redis-cli -p 6379 GET greeting
@@ -7,15 +7,18 @@ socketley create cache sessions -p 6380 --maxmemory 512M --eviction allkeys-lru 
     --persistent /var/lib/socketley/sessions.bin -s
 socketley create cache copy -p 6381 --replicate 10.0.0.5:6380 -s</pre>
 
-<div class="callout warn"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/></svg><div>A cache has no password. It serves this machine only, unless it is created with <code>--public</code> or given mutual TLS with <code>--tls --cert --key --ca</code>.</div></div>
+<div class="callout warn"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/></svg><div>A cache has no password. It serves this machine only, unless created with <code>--public</code> or mutual TLS (<code>--tls --cert --key --ca</code>).</div></div>
 
-<h3>What it does</h3>
-<ul>
-<li><b>Commands</b>: the whole list is <a href="#/man/cache-flags.cache-protocol">the cache protocol</a>, with Redis-compatible spellings over <a href="#/man/cache-flags.resp-protocol-redis-compatibility">RESP</a> and bridges Redis lacks, such as <code>SCAN … VALUEMATCH</code>, <code>SCAN … TYPE</code> and <code>DBSIZE TYPE</code>.</li>
-<li><b>Access</b>: <code>--mode readonly|readwrite|admin</code> for what clients may do; <code>--rate-limit</code> per connection.</li>
-<li><b>Memory</b>: <code>--maxmemory</code> with <code>--eviction noeviction|allkeys-lru|allkeys-random</code>; small hashes, lists and sorted sets packed as Redis packs them.</li>
-<li><b>Durability</b>: <code>--persistent file</code> journals accepted writes every <code>--persistent-interval</code> and reloads them at start.</li>
-<li><b>Replication</b>: <code>--replicate leader</code> makes a read-only follower; see <a href="#/man/cache-flags.replication">replication</a>.</li>
-<li><b>Several cores</b>: <code>--shards N</code> keeps one keyspace over N processes; add <code>--cluster</code> so cluster-aware clients go straight to the owning shard.</li>
-<li><b>Lua</b>: <code>on_miss</code> for read-through, <code>on_write</code>/<code>on_delete</code>/<code>on_expire</code> for write-behind to a <a href="#/man/cache-flags.database-backend">database backend</a>.</li>
-</ul>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Redis data types</b><p>Strings, lists, sets, hashes, sorted sets, streams; see <a href="#/man/cache-flags.cache-protocol">commands</a>.</p></div>
+<div><b>Redis features</b><p>TTLs, pub/sub and transactions over <a href="#/man/cache-flags.resp-protocol-redis-compatibility">RESP</a>.</p></div>
+<div><b>Bounded memory</b><p><code>--maxmemory</code> with an <code>--eviction</code> policy.</p></div>
+<div><b>Persistence</b><p><code>--persistent file</code>; <code>--persistent-interval</code> journals writes.</p></div>
+<div><b>Replication</b><p><code>--replicate</code> makes a read-only <a href="#/man/cache-flags.replication">follower</a>.</p></div>
+<div><b>Several cores</b><p><code>--shards N</code>, one keyspace; <code>--cluster</code> for cluster-aware clients.</p></div>
+<div><b>Database backing</b><p>Lua <code>on_miss</code> reads through, <code>on_write</code> writes behind; see <a href="#/man/cache-flags.database-backend">database backend</a>.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>A <a href="#/rt/server">server</a> with <code>--cache</code> lets its clients and scripts reach it.</p>

@@ -1,17 +1,19 @@
-<p>A <b>storage</b> serves the S3 API over one directory, so unmodified S3 clients (boto3, the AWS CLI, rclone, every SDK) put, get, list and delete objects on this machine's disk. Around that it keeps what an S3 service keeps: users and IAM policies, versioning, object lock, lifecycle, replication, server-side encryption, event notifications, quotas, website hosting, a cluster of nodes, and a web interface with a drive, share links, media playback and git repositories.</p>
+<p class="lead">A <b>storage</b> runtime serves the S3 API over one directory, so boto3, the AWS CLI, rclone and other S3 clients keep objects on this machine's disk. It adds a web drive with share links and media.</p>
 <pre class="code">socketley create storage files -p 9000 --dir /srv/objects \
     --credentials /etc/socketley/storage.creds -s
 aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://photos
 aws --endpoint-url http://127.0.0.1:9000 s3 cp beach.jpg s3://photos/</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>The S3 API</b>: SigV4 (header and presigned), multipart uploads, path and <a href="#/man/storage-flags.virtual-hosted-style-addressing">virtual-hosted</a> addressing, <a href="#/man/storage-flags.supported-s3-operations">the operations listed</a>, <a href="#/man/storage-flags.checksums">checksums</a>, <a href="#/man/storage-flags.s3-select">S3 Select</a>, HTTP/2 and HTTP/3.</li>
-<li><b>Who</b>: <a href="#/man/storage-flags.users">users</a> from a credentials file, <a href="#/man/storage-flags.iam">IAM</a> and <a href="#/man/storage-flags.bucket-policy">bucket policies</a>, <a href="#/man/storage-flags.temporary-credentials">STS</a> and <a href="#/man/storage-flags.federated-identities">federated identities</a>, sign-in to the web interface through an <a href="#/rt/idp">idp</a>.</li>
-<li><b>Keeping data</b>: <a href="#/man/storage-flags.versioning">versioning</a>, <a href="#/man/storage-flags.object-lock">object lock</a>, <a href="#/man/storage-flags.bucket-lifecycle">lifecycle</a> and <a href="#/man/storage-flags.tiers">tiers</a>, <a href="#/man/storage-flags.replication">replication</a> to other S3 endpoints, a <a href="#/man/storage-flags.cluster">cluster</a> with <code>--nodes</code>, <a href="#/man/storage-flags.scrub">scrub</a>, <a href="#/man/storage-flags.compression">compression</a>, <a href="#/man/storage-flags.server-side-encryption">encryption</a>; <code>--fsync always|interval|never</code> says when an answered write is on disk (<a href="#/man/storage-flags.durability">durability</a>).</li>
-<li><b>Around the data</b>: <a href="#/man/storage-flags.event-notifications">webhooks per event</a>, <a href="#/man/storage-flags.website-hosting">bucket websites</a>, <a href="#/man/storage-flags.quotas">quotas</a>, <a href="#/man/storage-flags.server-access-logging">access logs</a>.</li>
-<li><b>The web interface</b>: a drive with folders, previews, share links, music and video streamed in renditions, and <a href="#/man/storage-flags.git-repositories">git repositories</a> over HTTP; see <a href="#/man/storage-flags.drive-links-media-and-the-web-interface">drive, links, media</a>.</li>
-<li><b>How it is stored</b>: one file per object version under <code>--dir</code>, described in <a href="#/man/storage-flags.how-objects-are-stored">how objects are stored</a>; <a href="#/man/storage-flags.performance">performance</a> notes measured against MinIO.</li>
-</ul>
-<h3>Works with</h3>
-<p><a href="#/rt/sync">sync</a> carries directories into it, <a href="#/rt/mail">mail</a> keeps mailboxes in it, <a href="#/rt/metrics">metrics</a> archives old blocks to it, and <code>socketley.storage</code> reaches it from Lua.</p>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>The S3 API</b><p>SigV4, multipart uploads, <a href="#/man/storage-flags.s3-select">S3 Select</a>; see <a href="#/man/storage-flags.supported-s3-operations">operations</a>.</p></div>
+<div><b>Users and policies</b><p><a href="#/man/storage-flags.users">Users</a>, <a href="#/man/storage-flags.iam">IAM</a>, <a href="#/man/storage-flags.bucket-policy">bucket policies</a>, <a href="#/man/storage-flags.temporary-credentials">STS</a>.</p></div>
+<div><b>Keeping versions</b><p><a href="#/man/storage-flags.versioning">Versioning</a>, <a href="#/man/storage-flags.object-lock">object lock</a>, <a href="#/man/storage-flags.bucket-lifecycle">lifecycle</a>, <a href="#/man/storage-flags.tiers">tiers</a>.</p></div>
+<div><b>Copies</b><p><a href="#/man/storage-flags.replication">Replication</a> to other S3 endpoints, or a <a href="#/man/storage-flags.cluster">cluster</a> of nodes.</p></div>
+<div><b>On disk</b><p><a href="#/man/storage-flags.compression">Compression</a>, <a href="#/man/storage-flags.server-side-encryption">encryption</a>, and <code>--fsync</code> for <a href="#/man/storage-flags.durability">durability</a>.</p></div>
+<div><b>Around the data</b><p><a href="#/man/storage-flags.event-notifications">Webhooks</a>, <a href="#/man/storage-flags.website-hosting">bucket websites</a>, <a href="#/man/storage-flags.quotas">quotas</a>.</p></div>
+<div><b>Web interface</b><p>A <a href="#/man/storage-flags.drive-links-media-and-the-web-interface">drive</a>, <a href="#/man/storage-flags.git-repositories">git repositories</a>, sign-in through an <a href="#/rt/idp">idp</a>.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p><a href="#/rt/sync">sync</a> carries directories into it, <a href="#/rt/mail">mail</a> keeps mailboxes in it, <a href="#/rt/metrics">metrics</a> archives to it.</p>

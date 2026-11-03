@@ -1,19 +1,21 @@
-<p>A <b>server</b> listens on one port and speaks whatever arrives on it: line-delimited TCP, UDP datagrams, WebSocket and HTTP are told apart per connection from the first bytes, so a browser, a game client and <code>nc</code> can share a port. Without a script it relays: what one client says reaches the others, as <code>--mode</code> and <code>--send-to</code> decide. With a Lua script it is whatever the script makes of it: an API, a chat room, a game loop, a bridge to a cache.</p>
+<p class="lead">A <b>server</b> listens on one port and talks to whoever connects. Without a script it relays messages between clients; with Lua it becomes an API, a chat room or a game loop.</p>
 <pre class="code">socketley create server chat -p 9000 -s                    <i># every line reaches every other client</i>
 socketley create server echo -p 9001 --send-to sender -s   <i># answers whoever spoke</i>
 socketley create server site -p 8080 --http /srv/site --http-cache -s
 socketley create server api -p 9002 --lua api.lua --cache store -s</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>One port, several protocols.</b> <a href="#/man/server-flags.multi-protocol-auto-detection">Auto-detection</a> classifies each connection as plain TCP, WebSocket, HTTP or RESP by its first message, and <a href="#/man/server-flags.request-framing">request framing</a> decides how a stream is cut into messages.</li>
-<li><b>Static files</b> with <code>--http</code>, from memory with <code>--http-cache</code>, compressed copies with <code>--compress</code>, ETags and range requests. HTML pages get a WebSocket script injected, as the <a href="#/rt/server/flag/--http">flag's entry</a> says.</li>
-<li><b>Lua handlers</b> per message, connection, HTTP request and WebSocket upgrade (<a href="#/lua">Lua scripting</a>), with streaming responses that pace against the client's queue.</li>
-<li><b>Relaying</b>: <code>--mode inout|in|out|master</code> and <code>--send-to sender,others,master</code>; master mode lets one password-holding client broadcast.</li>
-<li><b>Upstreams</b> with <code>-u host:port</code>: the server dials other servers itself and its script hears them through <code>on_upstream</code>.</li>
-<li><b>A cache beside it</b> with <code>--cache name</code>: scripts and clients reach a cache runtime through the server, see <a href="#/man/server-flags.cache-access-via-server">cache access via server</a>.</li>
-<li><b>Several cores</b> with <code>--shards N</code>: N worker processes share the port through <code>SO_REUSEPORT</code>; see <a href="#/man/server-flags.sharding">sharding</a>.</li>
-</ul>
+<div class="callout warn"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/></svg><div><code>--cache</code> also stores every ordinary message in the cache, under keys <code>1</code>, <code>2</code>, <code>3</code>… And <code>--http</code> injects a WebSocket script into every HTML page.</div></div>
 
-<h3>Works with</h3>
-<p>A <a href="#/rt/proxy">proxy</a> in front of it for names, TLS and load balancing; a <a href="#/rt/cache">cache</a> behind it for state; a <a href="#/rt/client">client</a> runtime or another server's <code>-u</code> to chain servers. Its counters reach the <a href="#/rt/metrics">metrics</a> runtime and the dashboard without configuration.</p>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>One port, several protocols</b><p>TCP, WebSocket, HTTP and RESP, <a href="#/man/server-flags.multi-protocol-auto-detection">told apart by their first bytes</a>; <code>--udp</code> for datagrams.</p></div>
+<div><b>Static files</b><p><code>--http</code> serves a directory; <code>--http-cache</code> holds it in memory.</p></div>
+<div><b>Lua handlers</b><p>Per message, connection, HTTP request and WebSocket upgrade; see <a href="#/lua">Lua</a>.</p></div>
+<div><b>Relaying without code</b><p><code>--mode</code> and <code>--send-to</code> decide who hears a message.</p></div>
+<div><b>Upstreams</b><p><code>-u host:port</code> dials other servers; the script hears them in <code>on_upstream</code>.</p></div>
+<div><b>A cache beside it</b><p>With <code>--cache name</code>, clients send <code>cache &lt;command&gt;</code>; see <a href="#/man/server-flags.cache-access-via-server">cache access</a>.</p></div>
+<div><b>Several cores</b><p><code>--shards N</code> runs N processes on one port; see <a href="#/man/server-flags.sharding">sharding</a>.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>A <a href="#/rt/proxy">proxy</a> in front for names and TLS, a <a href="#/rt/cache">cache</a> behind for state, a <a href="#/rt/client">client</a> to chain servers. Its counters reach <a href="#/rt/metrics">metrics</a> without setup.</p>

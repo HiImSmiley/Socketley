@@ -1,25 +1,30 @@
-<p>What to settle before socketley runs something that matters. Each point links to the part of the manual that decides it.</p>
+<p>What to settle before socketley runs something that matters.</p>
 <h2>The service and who may use it</h2>
 <ul>
-<li>Installed, the daemon runs as the systemd unit <code>socketley</code> under its own account and restores every runtime at boot. <code>systemctl status|restart socketley</code>; its log is in the journal.</li>
-<li>Only root and the <code>socketley</code> group reach the control socket. Membership is the right to create, stop and script every runtime, so treat it like sudo for this service. Anyone else gets a private daemon of their own, not an error.</li>
-<li>A runtime may bind a port below 1024 because the packaged unit grants <code>CAP_NET_BIND_SERVICE</code>.</li>
+<li>The installed daemon is the systemd unit <code>socketley</code>; it restores every runtime at boot and logs to the journal.</li>
+<li>The <code>socketley</code> group can create, stop and script every runtime: treat membership like sudo.</li>
+<li>The unit grants <code>CAP_NET_BIND_SERVICE</code>, so runtimes may bind ports below 1024.</li>
 </ul>
 <h2>What is exposed</h2>
 <ul>
-<li>Bind what only the machine needs with <code>--bind 127.0.0.1</code> or put it on a unix socket with <code>--listen unix:</code>; a cache serves this machine only unless created <code>--public</code>.</li>
-<li>Put public HTTP behind the entrance: one proxy on 80/443, names with <code>--domain</code>, certificates by ACME, <code>--auth</code> where people must sign in, an <a href="#/rt/idp">idp</a> for who they are.</li>
-<li>Limit what a client may cost: <code>--max-connections</code>, <code>--rate-limit</code>, <code>--global-rate-limit</code>, <code>--idle-timeout</code>, <code>--read-buffer</code>, <code>--write-buffer</code>.</li>
+<li>Keep local things on <code>--bind 127.0.0.1</code> or <code>--listen unix:</code>. A cache is local unless created <code>--public</code>.</li>
+<li>Put public HTTP behind the entrance: <code>--domain</code> names, ACME certificates, <code>--auth</code> and an <a href="#/rt/idp">idp</a> for sign-in.</li>
+<li>Cap what a client may cost: <code>--max-connections</code>, <code>--rate-limit</code>, <code>--global-rate-limit</code>, <code>--idle-timeout</code>, <code>--read-buffer</code>, <code>--write-buffer</code>.</li>
 </ul>
 <h2>State and backups</h2>
 <ul>
-<li>A state file can hold secrets (passwords, keys, a relay's password): see <a href="#/man/state-persistence.a-state-file-is-a-secret">a state file is a secret</a>.</li>
-<li><code>socketley export --full file</code> archives configuration and data in one file; <code>socketley restore file</code> puts it back. Run it from a timer.</li>
-<li>Know each runtime's durability flag: a cache's <code>--persistent</code>, a storage's <code>--fsync</code>, an mqtt broker's <code>--persistent</code>, a metrics runtime's <code>--durable</code>.</li>
+<li>State files can hold secrets: see <a href="#/man/state-persistence.a-state-file-is-a-secret">a state file is a secret</a>.</li>
+<li>Back up from a timer with <code>socketley export --full file</code>; <code>socketley restore file</code> puts it back.</li>
 </ul>
+<table class="kv">
+<tr><th>Runtime</th><th>Durability flag</th></tr>
+<tr><td>cache, mqtt</td><td><code>--persistent</code></td></tr>
+<tr><td>storage</td><td><code>--fsync</code></td></tr>
+<tr><td>metrics</td><td><code>--durable</code></td></tr>
+</table>
 <h2>Watching it</h2>
 <ul>
-<li>A <a href="#/rt/metrics">metrics</a> runtime keeps the history and raises alerts; the daemon carries them by webhook and mail (<code>daemon.alert_webhook</code>, <code>daemon.alert_mail</code> in the daemon configuration).</li>
+<li>A <a href="#/rt/metrics">metrics</a> runtime raises alerts; the daemon sends them per <code>daemon.alert_webhook</code> and <code>daemon.alert_mail</code>.</li>
 <li>The <a href="#/man/dashboard">dashboard</a> shows every runtime, its log and its figures.</li>
 </ul>
 <h2>Reference</h2>

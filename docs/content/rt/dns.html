@@ -1,16 +1,24 @@
-<p>A <b>dns</b> runtime is an authoritative name server: it answers, over UDP and TCP on one port, for the zones it is given and for nothing else. It asks no other server and caches nothing, so a name outside its zones is answered REFUSED and it can never be an open resolver. Given <code>--publish</code> it also answers for the names runtimes carry with <code>--domain</code>, and it proves wildcard certificates for ACME over DNS-01.</p>
+<p class="lead">A <b>dns</b> runtime is an authoritative name server for the zones you give it, over UDP and TCP on one port. It answers nothing else and is never an open resolver.</p>
 <pre class="code">socketley create dns ns --zone example.com --publish 203.0.113.7 -s   <i># writes a zone file to start from</i>
 dig @127.0.0.1 example.com SOA
 socketley create dns ns2 --zone /etc/socketley/example.com.zone \
     --publish 203.0.113.7 --transfer 203.0.113.53 --notify 203.0.113.53 --dnssec -s</pre>
-<p>A zone given by its name is written with this machine's public address for its name servers; <code>--publish</code> gives it, and only a machine with a public address on an interface may leave it out. <code>create</code> also makes an entrance (<code>--proxy</code>), which asks Let's Encrypt for each zone's certificate as it starts, except for names reserved for examples and tests such as <code>example.com</code>, <code>.test</code> and <code>.internal</code>: a lab whose names are real gives <code>--proxy none</code>. And <code>--rrl</code> answers one client network at most 100 times a second, so a load test from one host gives <code>--rrl 0</code>.</p>
 
-<h3>What it does</h3>
-<ul>
-<li><b>Zone files</b> in RFC 1035 master format: wildcards, CNAMEs followed inside the zone, delegations with glue; an edited file is served within a second.</li>
-<li><b>Transport</b>: EDNS with answers kept to 1232 bytes, truncation and retry over TCP, port 53 unless <code>-p</code> says otherwise, IPv4 and IPv6.</li>
-<li><b>Secondaries</b>: AXFR to the addresses <code>--transfer</code> names, NOTIFY to those <code>--notify</code> names.</li>
-<li><b>DNSSEC</b> with <code>--dnssec</code>: zones signed online, and <code>socketley &lt;name&gt; dnssec</code> prints the DS record for the parent.</li>
-<li><b>Abuse</b>: response rate limiting per network with <code>--rrl</code>.</li>
-<li><b>Runtimes' names</b>: <code>--publish</code> answers the <code>--domain</code> names of this daemon's runtimes; <code>--proxy</code> makes the entrance those names reach, see <a href="#/man/dns-flags.names-runtimes-are-reached-by">names runtimes are reached by</a>.</li>
-</ul>
+<h2>Good to know first</h2>
+<table class="kv">
+<tr><td><code>--publish</code></td><td>Your public address. Needed when no interface has one, as behind NAT.</td></tr>
+<tr><td><code>--proxy none</code></td><td>Skips the entrance <code>create</code> makes, which asks Let's Encrypt for certificates. Use it for a lab with real names.</td></tr>
+<tr><td><code>--rrl 0</code></td><td>Lifts the default of 100 answers a second per client network, for a load test from one host.</td></tr>
+</table>
+
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Zone files</b><p>RFC 1035 format; an edited file is served within a second.</p></div>
+<div><b>UDP and TCP</b><p>On port 53 unless <code>-p</code>; large answers move to TCP.</p></div>
+<div><b>Secondaries</b><p>AXFR to <code>--transfer</code>, NOTIFY to <code>--notify</code>.</p></div>
+<div><b>DNSSEC</b><p><code>--dnssec</code> signs zones; <code>socketley &lt;name&gt; dnssec</code> prints the DS record.</p></div>
+<div><b>Runtimes' names</b><p>Answers for the <code>--domain</code> names of your runtimes (<a href="#/man/dns-flags.names-runtimes-are-reached-by">how</a>).</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>Its entrance is a <a href="#/rt/proxy">proxy</a>. A <a href="#/rt/mail">mail</a> runtime publishes its records through it.</p>

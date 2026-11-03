@@ -1,13 +1,17 @@
-<p>A <b>db</b> keeps JSON documents for applications, a game's characters, a shop's orders, a user's settings, each owned by an account of an <a href="#/rt/idp">idp</a> runtime, which reaches its own documents and nobody else's. An application in the browser or on a phone talks to it directly over HTTP with the user's access token; there is no backend to write in between.</p>
+<p class="lead">A <b>db</b> keeps JSON documents for applications, such as a game's characters or a shop's orders. Each belongs to an <a href="#/rt/idp">idp</a> account, which reaches its own and no one else's.</p>
 <pre class="code">socketley create db data -p 9500 --domain data --idp auth \
     --schema /etc/socketley/db.schema --keys /etc/socketley/db.keys -s
 socketley data query characters '{"where":{"level":{"gte":5}},"limit":10}'</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>Documents</b> at <code>/c/collection/id</code>: GET, PUT, PATCH with <code>set</code>/<code>unset</code>/<code>inc</code>/<code>push</code>/<code>pull</code> on dotted paths, DELETE, and POST to make one; every document carries <code>_id</code>, <code>_v</code> (its version and ETag) and <code>_owner</code>, and <code>If-Match</code> writes only at a version.</li>
-<li><b>Queries</b>: <code>POST /c/collection/_query</code> with <code>eq ne gt gte lt lte in prefix exists</code>, sorting, paging and counting, answered from the indexes <code>--schema</code> declares.</li>
-<li><b>Access per collection</b>: <code>private</code>, <code>owner</code>, <code>shared</code>, <code>public</code> or <code>catalog</code>, set in the schema; server-side keys from <code>--keys</code> for trusted services.</li>
-<li><b>Transactions and a change stream</b>, an in-memory <code>--cache</code>, a size bound with <code>--max-bytes</code>.</li>
-<li><b>Copies</b>: <code>--replicate</code> follows another db read-only; <code>--backup-dir</code>, <code>--backup-every</code> and <code>--backup-keep</code> take scheduled backups, and <code>socketley &lt;db&gt; backup|restore</code> takes one now.</li>
-</ul>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Documents over HTTP</b><p>GET, PUT, PATCH, DELETE at <code>/c/collection/id</code>, each versioned for safe writes.</p></div>
+<div><b>Queries</b><p><code>POST /c/collection/_query</code> filters, sorts and pages on the indexes in <code>--schema</code>.</p></div>
+<div><b>Access per collection</b><p><code>private</code>, <code>owner</code>, <code>shared</code>, <code>public</code> or <code>catalog</code>; services use <code>--keys</code>.</p></div>
+<div><b>Transactions and changes</b><p>Several writes as one, and a live stream of changes.</p></div>
+<div><b>Replicas</b><p><code>--replicate</code> keeps a read-only copy of another db.</p></div>
+<div><b>Backups</b><p>Scheduled with <code>--backup-dir</code>, or now with <code>socketley &lt;db&gt; backup|restore</code>.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>Users sign in through an <a href="#/rt/idp">idp</a>. Pictures and other large files belong in a <a href="#/rt/storage">storage</a>.</p>

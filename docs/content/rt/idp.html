@@ -1,14 +1,17 @@
-<p>An <b>idp</b> is an OpenID Connect provider that keeps its own accounts: a user signs in once, and every application that asks it, every route a <a href="#/rt/proxy">proxy</a> puts behind <code>--auth idp:</code>, a <a href="#/rt/storage">storage</a>'s web interface, the <a href="#/rt/db">db</a>, the <a href="#/rt/mail">mail</a> server and the dashboard know who they are.</p>
+<p class="lead">An <b>idp</b> is an OpenID Connect provider with its own accounts. A user signs in once, and your applications, <a href="#/rt/proxy">proxy</a> routes, <a href="#/rt/storage">storage</a>, <a href="#/rt/db">db</a>, <a href="#/rt/mail">mail</a> and the dashboard know who they are.</p>
 <pre class="code">socketley create idp auth -p 9400 --domain auth.example.com \
     --clients /etc/socketley/idp.clients --cookie-domain example.com -s
 socketley auth user add smiley --password - --groups admins</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>OpenID Connect</b>: the authorization code flow with PKCE, refresh tokens, discovery at <code>/.well-known/openid-configuration</code>, keys at <code>/jwks</code>, <code>/userinfo</code> and <code>/logout</code>.</li>
-<li><b>Accounts</b>: a fixed random id and fields without a schema; the provider reads name, e-mail, groups, password (scrypt) and a few more, and keeps every other field for the applications. Each change is synced to a journal before it is answered.</li>
-<li><b>Sign-in</b>: passwords, a second step, app passwords, and <code>/account</code> where a user changes their own details and signs out everywhere.</li>
-<li><b>Applications</b> are listed in <code>--clients</code>: an id, a secret or <code>-</code> for a public client, and its redirect addresses.</li>
-<li><b>Tokens for other servers</b>: <code>--resources</code> names resource servers, such as an <a href="#/rt/mcp">mcp</a> runtime's <code>https://mcp.example.com/mcp</code>, that an application may ask a token for (RFC 8707). With it set, an MCP client such as Claude Code may also sign in by its client metadata document, after the person allows it on a page that names it, its host and the resource.</li>
-<li><b>SSH</b>: with <code>--ssh-ca hours</code> it signs short-lived SSH certificates for signed-in users (<code>socketley ssh-cert</code>) and host certificates.</li>
-</ul>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>OpenID Connect</b><p>Authorization code flow with PKCE, refresh tokens, discovery at <code>/.well-known/openid-configuration</code>.</p></div>
+<div><b>Accounts</b><p>Fields without a schema; fields it does not use are kept for your applications.</p></div>
+<div><b>Sign-in</b><p>Passwords, a second step and app passwords; users manage themselves at <code>/account</code>.</p></div>
+<div><b>Applications</b><p>Listed in <code>--clients</code> with an id, a secret or <code>-</code>, and redirect addresses.</p></div>
+<div><b>Tokens for other servers</b><p><code>--resources</code> gives tokens for, say, an <a href="#/rt/mcp">mcp</a> runtime, to MCP clients like Claude Code too, once the user allows it.</p></div>
+<div><b>SSH certificates</b><p><code>--ssh-ca hours</code> signs short-lived SSH certificates for signed-in users.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>Put routes behind it with a <a href="#/rt/proxy">proxy</a>'s <code>--auth idp:</code>. A <a href="#/rt/db">db</a>, <a href="#/rt/mail">mail</a> or <a href="#/rt/mqtt">mqtt</a> runtime takes its users with <code>--idp</code>.</p>

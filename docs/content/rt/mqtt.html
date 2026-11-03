@@ -1,15 +1,18 @@
-<p>An <b>mqtt</b> runtime is an MQTT broker for 3.1, 3.1.1 and 5.0 on TCP, TLS and WebSocket: devices, apps and browsers publish to topics and subscribe to them, and a client that goes away keeps its session, its subscriptions and the messages sent while it was gone, until it comes back or the session expires. Rules of its own hand messages to a cache, a db, a storage, a server or another broker, and a storage's events and a script's messages reach its subscribers.</p>
+<p class="lead">An <b>mqtt</b> runtime is an MQTT broker (3.1, 3.1.1 and 5.0) for devices, apps and browsers. A client that disconnects keeps its session and the messages it missed until it returns or the session expires.</p>
 <pre class="code">socketley mqtt passwd /etc/socketley/mqtt.users sensor-17
 socketley create mqtt broker --users /etc/socketley/mqtt.users \
     --acl /etc/socketley/mqtt.acl --ws 8083 --persistent on -s
 mosquitto_sub -h 127.0.0.1 -u sensor-17 -P secret -t 'home/#'</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>The protocol</b>: QoS 0, 1 and 2, retained messages, wills with 5.0's delay, sessions with 3.1.1's clean session and 5.0's expiry, shared subscriptions, topic aliases, message expiry and the 5.0 properties.</li>
-<li><b>Ports</b>: 1883, or 8883 with <code>--tls</code>, and WebSocket on <code>--ws</code>; with <code>--ca</code> a verified client certificate's name is the user.</li>
-<li><b>Who</b>: a password file (<code>--users</code>, written by <code>socketley mqtt passwd</code>), access tokens of an <a href="#/rt/idp">idp</a>, or <code>--anonymous</code>; topic rights per user in <code>--acl</code>.</li>
-<li><b>Keeping</b>: <code>--persistent</code> keeps sessions and retained messages across restarts; <code>--session-queue</code>, <code>--retained-max</code>, <code>--max-sessions</code> and <code>--max-packet</code> bound them.</li>
-<li><b>Rules</b>: <code>--routes</code> hands matching messages to other runtimes; <code>socketley.mqtt.publish</code> publishes from any script.</li>
-<li><b>Operating it</b>: <code>socketley &lt;broker&gt; pub|sub|sessions|kick|retained</code>.</li>
-</ul>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Full protocol</b><p>QoS 0, 1 and 2, retained messages, wills, shared subscriptions and the 5.0 properties.</p></div>
+<div><b>TCP, TLS, WebSocket</b><p>Port 1883, or 8883 with <code>--tls</code>, and WebSocket on <code>--ws</code>.</p></div>
+<div><b>Users</b><p>A password file (<code>--users</code>), client certificates (<code>--ca</code>), <a href="#/rt/idp">idp</a> tokens, or <code>--anonymous</code>.</p></div>
+<div><b>Topic rights</b><p>Per user in <code>--acl</code>.</p></div>
+<div><b>Survives restarts</b><p><code>--persistent</code> keeps sessions and retained messages.</p></div>
+<div><b>Routes</b><p><code>--routes</code> hands matching messages to other runtimes.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>Routes deliver to a <a href="#/rt/cache">cache</a>, <a href="#/rt/db">db</a>, <a href="#/rt/storage">storage</a>, <a href="#/rt/server">server</a> or another broker. A storage's events and <code>socketley.mqtt.publish</code> from any <a href="#/lua">script</a> reach its subscribers.</p>

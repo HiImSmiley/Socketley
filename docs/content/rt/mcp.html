@@ -1,4 +1,4 @@
-<p>An <b>mcp</b> runtime is a Model Context Protocol server. An AI client such as Claude Code, or an agent built on an MCP SDK, connects to it and is offered the tools, resources and prompts its Lua script declares, and with <code>--tools daemon</code> this daemon's runtimes as tools: listed for every key, started and stopped for an admin's.</p>
+<p class="lead">An <b>mcp</b> runtime is a Model Context Protocol server: an AI client such as Claude Code gets the tools, resources and prompts its Lua script declares.</p>
 <pre class="code">printf 'claude %s\nops %s admin\n' "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" &gt; /etc/socketley/mcp.keys
 socketley create mcp shop -p 9600 --keys /etc/socketley/mcp.keys \
     --lua shop.lua --tools daemon --instructions "Ask about the shop's orders." -s
@@ -13,12 +13,13 @@ claude mcp add --transport http shop http://127.0.0.1:9600/mcp \
     -- the handler and the rest: examples/mcp/shop.lua in the repository
 }</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>Transport</b>: Streamable HTTP at <code>/mcp</code>, one JSON-RPC message per POST answered as JSON, stateless. It speaks revision 2026-07-28 with its headers, and answers a client that opens with <code>initialize</code> as 2025-11-25, 2025-06-18 or 2025-03-26 do.</li>
-<li><b>Who may ask</b>: <code>--keys</code> lists names and secrets, an <code>admin</code> key also changes the daemon; <code>--anonymous</code> for a port only this machine reaches; <code>--origins</code> for browser clients.</li>
-<li><b>People, by OAuth</b>: with <code>--idp auth</code> a client that comes without a token is pointed, through <code>/.well-known/oauth-protected-resource/mcp</code>, at the <a href="#/rt/idp">idp</a> runtime, where its person signs in for this server (<code>https://&lt;first --domain&gt;/mcp</code>, a whole name such as <code>mcp.example.com</code>) and allows the client; the idp gives such tokens when its <code>--resources</code> names that address. Members of the idp's <code>admins</code> group are admins here; <code>--idp-audience</code> takes the idp's own clients' tokens as well.</li>
-<li><b>What is offered</b>: tools, resources and prompts from the script, and the daemon's runtimes with <code>--tools daemon</code>; <code>--instructions</code> is the text a client is given about the server.</li>
-<li><b>Scale</b>: every request is answered on its own, so <code>--shards</code> spreads them over processes; TLS comes from the entrance proxy in front of it.</li>
-</ul>
-<p>No benchmark is published for this runtime: there is no established MCP server to measure it against on equal terms.</p>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Your tools in Lua</b><p>Tools, resources and prompts from the script; <code>--instructions</code> says what the server is for.</p></div>
+<div><b>The daemon as tools</b><p><code>--tools daemon</code> lists runtimes for any key; an admin key may start and stop them.</p></div>
+<div><b>Streamable HTTP</b><p>At <code>/mcp</code>, one JSON-RPC message per POST, stateless; revision 2026-07-28, and 2025-11-25, 2025-06-18, 2025-03-26.</p></div>
+<div><b>Who may ask</b><p><code>--keys</code>, OAuth sign-in with <code>--idp</code>, or <code>--anonymous</code> on a local-only port.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>The entrance <a href="#/rt/proxy">proxy</a> terminates TLS in front of it. An <a href="#/rt/idp">idp</a> signs people in; its <code>admins</code> are admins here.</p>

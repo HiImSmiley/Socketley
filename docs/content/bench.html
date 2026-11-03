@@ -1,11 +1,12 @@
+<p>Each table below sets socketley beside reference servers doing the same work on one machine. A row gives a ratio, its range across passes, and the CPU spent. The data, with commit, versions and date of every set, is in <a href="data/bench.json">data/bench.json</a>; the harness is not in the repository.</p>
+
 <h2>How these numbers are made</h2>
 <ul>
-<li><b>One machine, one run, interleaved.</b> Every arm, socketley and each reference, is up at the same time on the same pinned core, each with its own port. A pass runs every arm once, in an order that rotates and reverses from pass to pass, and the first pass is thrown away as a warm-up. A clock change on the host therefore moves every arm alike, and a comparison is never made between two runs.</li>
-<li><b>The ratio is the median of the per-pass ratios</b>, not the ratio of two medians, and the range across passes is printed beside it. Where that range contains 1.00× the row is not a difference, whatever its median says.</li>
-<li><b>CPU beside every rate.</b> Each server's cores are read from <code>/proc</code> around the measured operations; a server at 1.00 core is saturated, so its rate is one core divided by its cost per operation. Client cores are recorded too, and a load generator that reaches a full core is the ceiling being measured, so such a run is not published.</li>
-<li><b>The answer is checked.</b> Every HTTP arm is asked for the same path and its body size compared before a pass is timed; a 404 is fast and is never what is measured.</li>
-<li><b>The box is quiet.</b> A pass begins only when no build, test suite or foreign server runs on the machine, and one that another workload started during is thrown away and run again.</li>
-<li><b>The machine is a virtual one, and that has a direction.</b> It halts an idle vCPU, so every time a server wakes a client that sleeps, the host takes a VM exit, and how many find their client asleep is chance. A server that answers each message with its own write and wakeup (Redis at depth 1, nginx, Mosquitto's fan-out) pays that more often than one that batches, as socketley does: its rates swing between passes, and on hardware without the exit the gap in those rows is smaller. Keeping the vCPUs awake with spinners was tried and refused, because a spinner on a client's core delays that client's own wakeups to the next tick.</li>
-<li><b>Same work for each.</b> References run as a production install would: persistence off where socketley's is off, one worker or thread where socketley has one core, the configuration written in each set's notes.</li>
+<li><b>Interleaved on the same cores.</b> All arms run at once on the same pinned core, in a rotating order; the first pass is a discarded warm-up.</li>
+<li><b>Median of per-pass ratios.</b> The range is shown beside it; a range that contains 1.00× is no difference.</li>
+<li><b>CPU beside every rate.</b> A server at 1.00 core is saturated; a run whose load generator hits a full core is not published.</li>
+<li><b>Checked answers.</b> HTTP body sizes are compared first, so a fast 404 is never measured.</li>
+<li><b>A quiet machine.</b> No build, test or foreign server runs during a pass; a disturbed pass is run again.</li>
+<li><b>Same work.</b> References run as a production install would, as each set's notes say.</li>
+<li><b>The VM penalises wakeups.</b> It halts idle vCPUs, so a server that wakes a client per message (Redis at depth 1, nginx, Mosquitto's fan-out) takes VM exits more often than one that batches, as socketley does. Those rows swing, and the gap is smaller on hardware without the exit. Keeping vCPUs awake with spinners was refused: it delays clients' own wakeups.</li>
 </ul>
-<p>The harness is not part of the repository; the numbers, with the commit, the versions and the date of every set, are in <a href="data/bench.json">data/bench.json</a>.</p>

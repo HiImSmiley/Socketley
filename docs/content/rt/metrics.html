@@ -1,14 +1,17 @@
-<p>A <b>metrics</b> runtime keeps what socketley and the machines around it measure, for years, and answers with PromQL over the Prometheus HTTP API, so Grafana reads it as it reads a Prometheus. This daemon's own series reach it without any configuration; other daemons and any Prometheus endpoint are scraped. Its rules raise the daemon's alerts, it keeps log lines answered with LogQL, and the dashboard draws its history from it.</p>
+<p class="lead">A <b>metrics</b> runtime keeps years of what socketley and nearby machines measure. It answers PromQL over the Prometheus HTTP API, so Grafana reads it as a Prometheus.</p>
 <pre class="code">socketley create metrics metrics -p 9090 --scrape /etc/socketley/targets -s
 socketley metrics query 'rate(socketley_runtime_messages_total[5m])'
 socketley metrics query_range 'up' --start -6h --step 5m</pre>
 
-<h3>What it does</h3>
-<ul>
-<li><b>Collecting</b>: the daemon's own series at each tick, <code>--scrape</code> targets every <code>--every</code>, and remote write with <code>--receive</code>.</li>
-<li><b>Keeping</b>: samples stamped on the tick, one to three bytes each, cut into two-hour blocks merged into days, with five-minute and hourly tiers built beside them (<code>--downsample</code>); <code>--keep</code> bounds the age, <code>--max-series</code> the cardinality, and <code>--durable</code> logs every sample as it arrives so a crash loses none.</li>
-<li><b>Answering</b>: PromQL instant and range queries, series and label lookups over the Prometheus API; a long range reads the coarsest tier that still answers it exactly.</li>
-<li><b>Alerting</b>: <code>--rules</code> in Prometheus's format raise alerts that <code>--notify</code> and the daemon's webhook, mail and event settings carry.</li>
-<li><b>Logs</b>: with <code>--logs</code> it keeps the daemon's log lines for <code>--logs-keep</code> and answers LogQL as Loki does.</li>
-<li><b>Archive</b>: old blocks go to an S3 bucket with <code>--archive</code>, such as a <a href="#/rt/storage">storage</a> runtime's.</li>
-</ul>
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Collects</b><p>This daemon's series with no setup; <code>--scrape</code> targets; remote write with <code>--receive</code>.</p></div>
+<div><b>Stores compactly</b><p>One to three bytes a sample, with coarser tiers (<code>--downsample</code>) for long ranges.</p></div>
+<div><b>Stays bounded</b><p><code>--keep</code> limits age, <code>--max-series</code> cardinality; <code>--durable</code> loses nothing in a crash.</p></div>
+<div><b>Alerts</b><p><code>--rules</code> in Prometheus's format, sent by webhook, mail or events (<code>--notify</code>).</p></div>
+<div><b>Logs</b><p><code>--logs</code> keeps the daemon's log lines and answers LogQL as Loki does.</p></div>
+<div><b>Archives</b><p><code>--archive</code> copies old blocks to an S3 bucket.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>The dashboard draws its history from it. A <a href="#/rt/storage">storage</a> runtime can hold its archive.</p>
