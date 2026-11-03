@@ -12397,9 +12397,31 @@ runtime is an authoritative name server: it answers, over UDP and TCP on one
 port, for the zones in the files it is given, and for nothing else.
 .PP
 .nf
-socketley create dns ns \-\-zone example.com \-s
+socketley create dns ns \-\-zone example.com \-\-publish 203.0.113.7 \-s
 dig @127.0.0.1 example.com SOA
 .fi
+.PP
+A zone given by its name is written with this machine's public address for its
+name servers:
+.B \-\-publish
+gives it, and may be left out only where an interface has one, which behind NAT
+none has.
+.B create
+also makes it an entrance, a proxy of its own (see
+.BR \-\-proxy ),
+which asks Let's Encrypt for a certificate for each zone and its wildcard as
+soon as it starts \(em for every name but those reserved for examples and tests,
+such as
+.BR example.com ,
+.B .test
+and
+.BR .internal ,
+which no public CA issues for. A lab or a test whose names are real gives
+.BR "\-\-proxy none" .
+And it answers one client network at most 100 times a second
+.RB ( \-\-rrl ),
+so a load test from a single host sees most answers dropped unless it gives
+.BR "\-\-rrl 0" .
 .PP
 It asks no other server and caches nothing: a name in none of its zones is
 answered REFUSED, never looked up, so it cannot be used as an open resolver and
@@ -13264,7 +13286,10 @@ durable before it answers, so a read on any shard sees every write answered
 before it began. Transactions, unique indexes, streams, replicas and backups
 hold as they do on one shard, and the number may change across a restart, the
 documents being one log whichever it is. Reads and queries are answered by every
-shard; writes, which wait for one disk, are as many as one shard takes.
+shard; writes, which wait for one disk, are at most as many as one shard takes,
+and cost more cores than on one shard, since each that reaches another shard is
+handed on to shard 0 and its answer back. A database that is mostly written
+is served best by one shard.
 .PP
 .B Changes, as they happen.
 .BI GET " /c/" collection /_feed

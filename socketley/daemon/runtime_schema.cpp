@@ -13,7 +13,7 @@ namespace
 {
 
 // The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc, Idp, dB, Mqtt,
-// mail (E), tunnel (U), metRics.
+// mail (E), tunnel (U), metRics, mcp (X).
 struct row
 {
     std::string_view flag, types, kind, label, help, section, choices = {}, placeholder = {}, aliases = {};
