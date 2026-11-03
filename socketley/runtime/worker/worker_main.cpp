@@ -27,6 +27,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/turn_clock.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/heap_trim.h"
 #include "../../shared/ipc/exit_bound.h"
 #include "../../shared/lua/lua_context.h"
 #include "../../shared/runtime/runtime_config_apply.h"
@@ -441,6 +442,8 @@ public:
                 m_rt->on_loop_turn();
                 // Certificates replaced on disk, and the runtime's own --acme renewals, for every type alike.
                 cert_keeper::tick();
+                // What a burst freed, handed back once it has been idle a while, so the figure shows what is used.
+                heap_trim::tick(now);
                 // Strangers' failed handshakes, as one line a minute rather than one each.
                 tls_context::report_inbound_failures();
             }
