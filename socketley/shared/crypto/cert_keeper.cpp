@@ -31,6 +31,7 @@
 #endif
 
 #include "../util/logging.h"
+#include "../util/settings.h"
 #include "../persist/paths.h"
 #include "tls_context.h"
 #include "../persist/replaced_file.h"
@@ -301,11 +302,47 @@ void unwatch(tls_context* ctx)
     std::erase_if(g_watched, [ctx](const watched& w) { return w.ctx == ctx; });
 }
 
-bool prepare_acme(const std::vector<std::string>& domains, std::string_view email, std::string_view cert_path,
+bool reserved_name(std::string_view name)
+{
+    if (socketley::settings::text("SOCKETLEY_ACME_DIRECTORY"))
+        return false;
+    std::string n;
+    for (const char c : name)
+        n += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    while (n.ends_with('.'))
+        n.pop_back();
+    static constexpr std::string_view reserved[] = {"example", "example.com", "example.net", "example.org", "test",
+                                                    "invalid", "localhost", "local", "internal", "home.arpa", "alt"};
+    return std::any_of(std::begin(reserved), std::end(reserved), [&](std::string_view r) {
+        return n == r || (n.size() > r.size() && n.ends_with(r) && n[n.size() - r.size() - 1] == '.');
+    });
+}
+
+bool prepare_acme(const std::vector<std::string>& in, std::string_view email, std::string_view cert_path,
                   std::string_view key_path, bool on_443, std::string& err, const std::vector<std::string>& dns_zones)
 {
+    // Asked of a public CA, a reserved name only sends a request out of a test or a lab that comes back refused.
+    std::vector<std::string> domains;
+    for (const std::string& d : in)
+        if (!reserved_name(d))
+            domains.push_back(d);
+    if (domains.size() < in.size())
+        LOG_INFO(("acme: " + std::to_string(in.size() - domains.size()) +
+                  " reserved name(s) not asked for, which no public CA issues; a self-signed certificate stands in")
+                     .c_str());
     if (domains.empty())
+    {
+        // A week's stand-in from before is replaced, since nothing is going to issue the one it stood in for.
+        int64_t left = 0;
+        bool self_signed = false;
+        const bool keep = cert_left(std::string(cert_path), left, self_signed) && (!self_signed || left > 30 * 86400);
+        if (!in.empty() && !keep && !write_self_signed(in, 365, cert_path, key_path))
+        {
+            err = "acme: a self-signed certificate could not be written to " + std::string(cert_path);
+            return false;
+        }
         return true;
+    }
     acme_state a;
     a.tls_alpn = on_443;
     a.domains = domains;

@@ -30,11 +30,16 @@ bool read_cert(const std::string& path, cert_facts& out);
 void watch(tls_context* ctx, std::string_view cert_path, std::string_view key_path);
 void unwatch(tls_context* ctx);
 
+// Whether `name` is reserved for examples, tests or local use (RFC 2606, 6761, 6762, 8375, 9476, and .internal), which
+// no public CA issues for; false for every name once SOCKETLEY_ACME_DIRECTORY names a CA of one's own, which may.
+bool reserved_name(std::string_view name);
+
 // This process's runtime's names; a short-lived self-signed certificate stands in until one is issued, so the
 // listener starts and can answer the CA's challenge. False, with the reason, when the files cannot be written.
 // A runtime on 443 proves its names over TLS-ALPN-01 on its own listener, and any other over HTTP-01.
 // A name in one of `dns_zones` (zones a dns runtime of this daemon serves) is proven over DNS-01 instead, as a
-// wildcard always is. Called again with other names, it issues again for them.
+// wildcard always is. Called again with other names, it issues again for them. A reserved name is not asked for and
+// keeps the stand-in.
 bool prepare_acme(const std::vector<std::string>& domains, std::string_view email, std::string_view cert_path,
                   std::string_view key_path, bool on_443, std::string& err,
                   const std::vector<std::string>& dns_zones = {});

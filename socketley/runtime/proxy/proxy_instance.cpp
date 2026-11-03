@@ -5956,9 +5956,11 @@ void proxy_instance::entrance_certify()
     if (!cert_keeper::prepare_acme(names, get_acme_email(), get_cert_path(), get_key_path(), on_443, err,
                                    m_entrance_zones))
         LOG_ERROR(("proxy " + std::string(get_name()) + ": " + err).c_str());
-    else
-        LOG_INFO(("proxy " + std::string(get_name()) + ": a certificate is asked for " + std::to_string(names.size()) +
-                  " names, " + names.front() + " first").c_str());
+    else if (const auto first = std::find_if_not(names.begin(), names.end(), cert_keeper::reserved_name);
+             first != names.end())
+        LOG_INFO(("proxy " + std::string(get_name()) + ": a certificate is asked for " +
+                  std::to_string(names.end() - first - std::count_if(first, names.end(), cert_keeper::reserved_name)) +
+                  " names, " + *first + " first").c_str());
 }
 
 proxy_instance::entrance_route* proxy_instance::entrance_find(std::string_view host)

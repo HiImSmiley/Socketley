@@ -3454,7 +3454,24 @@ for the first name. Until the CA has issued one, a self-signed certificate valid
 for a week stands in, so the listener starts at once; the issued one replaces it
 within seconds, and is renewed when it has less than thirty days left, tried
 again after a minute, then twice as long each time up to six hours, with the
-CA's reason in the log.
+CA's reason in the log. A name reserved for examples, tests or local use
+.RB ( example.com ,
+.BR example.net ,
+.BR example.org ,
+and anything under
+.BR .example ,
+.BR .test ,
+.BR .invalid ,
+.BR .localhost ,
+.BR .local ,
+.BR .internal ,
+.B .home.arpa
+or
+.BR .alt )
+is not asked of Let's Encrypt, which issues for none of them: it keeps a
+self-signed certificate valid for a year, and the log says so. With
+.B SOCKETLEY_ACME_DIRECTORY
+set they are asked for like any other, since a CA of one's own may issue them.
 .B \-\-acme\-email
 is the account's contact, where the CA writes before a certificate expires.
 .IP
