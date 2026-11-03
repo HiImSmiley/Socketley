@@ -1469,9 +1469,7 @@ private:
     socketley::fd_table<proxy_backend_connection*> m_backend_slots{MAX_FDS};
     size_t m_client_count{0};
     size_t m_backend_count{0};
-    // Backends parked on a client, a subset of m_backend_count, capped at
-    // MAX_POOL_PER_BACKEND so idle clients hold no more idle backend sockets
-    // than the pool itself would.
+    // Backends parked on a client, a subset of m_backend_count, capped at MAX_PARKED_BACKENDS.
     size_t m_parked_count{0};
     // Loop turns seen, so a socket parked this turn can be told apart.
     uint64_t m_turn{0};
@@ -1639,8 +1637,11 @@ private:
     // while it streams.
     bool m_splice_enabled{false};
 
-    // Connection pool for backend reuse (avoids connect() per request)
-    static constexpr size_t MAX_POOL_PER_BACKEND = 32;
+    // Connection pool for backend reuse: as many as were busy at once, since the newest is taken first and the rest
+    // age out after POOL_IDLE_TIMEOUT_SEC.
+    static constexpr size_t MAX_POOL_PER_BACKEND = 4096;
+    // The parked are not swept, so idle keep-alive clients hold no more of them than this.
+    static constexpr size_t MAX_PARKED_BACKENDS = 32;
     static constexpr int POOL_IDLE_TIMEOUT_SEC = 60;
     std::vector<std::vector<pooled_backend>> m_backend_pool; // per-backend pool
     // A backend was found to have written on a pooled socket, reported once

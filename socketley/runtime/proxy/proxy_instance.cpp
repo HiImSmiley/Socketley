@@ -8468,7 +8468,7 @@ bool proxy_instance::park_backend(proxy_client_connection* cconn,
     if (!cconn->kept_alive || cconn->client_eof || cconn->ex.client_conn_close ||
         cconn->parked_backend_fd >= 0)
         return false;
-    if (m_parked_count >= MAX_POOL_PER_BACKEND)
+    if (m_parked_count >= MAX_PARKED_BACKENDS)
         return false;
     // Only the read may be in flight, and it must not be on its way back.
     if (bconn->write_pending || bconn->splice_in_pending || bconn->splice_out_pending ||

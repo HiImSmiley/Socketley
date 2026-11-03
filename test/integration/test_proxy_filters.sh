@@ -4,7 +4,7 @@
 # test, so the oracle is the backend's own accept and byte counters -- both,
 # because a pooled socket would carry a rejected request without moving the
 # accept count -- measured over forty rejections rather than one, since
-# MAX_POOL_PER_BACKEND is 32 and a single-request oracle is a proof about an
+# the pool holds only the one socket opened before and a single-request oracle is a proof about an
 # empty pool, with an allowed request in phase 2 as the vacuity guard.
 set -euo pipefail
 
@@ -385,7 +385,7 @@ print("P0 %s %s" % (st, body))
 
 # ── phase 1: THE assertion — rejections cost the backend nothing ───────────
 #
-# Forty of them, not one.  MAX_POOL_PER_BACKEND is 32, so no pool this proxy
+# Forty of them, not one.  The pool holds only what was opened before, so no pool this proxy
 # keeps can supply forty backend sockets; if the chain ran below the connect,
 # the accepts would have to happen and be counted.  One request would not show
 # it — the pooled socket from the readiness probe absorbs the first rejection
