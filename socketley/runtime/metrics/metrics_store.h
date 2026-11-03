@@ -93,6 +93,8 @@ public:
     int64_t tick(int64_t now);
     // Whether background work is in flight, which a later tick() takes in.
     bool busy() const;
+    // How many blocks it holds, for a caller on every tick that stats() would cost a walk of the index.
+    uint64_t block_count() const;
     // Everything in the head written to its files and synced, and no maintenance started before `hold_until`, so a
     // copy of the directory taken now holds every sample and no block is replaced under it.
     void checkpoint(int64_t hold_until);

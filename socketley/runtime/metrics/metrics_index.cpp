@@ -296,6 +296,10 @@ const label_set& series_index::labels(uint32_t id) const
         each_label(id, [&](std::string_view n, std::string_view v) {
             slot->push_back(label{std::string(n), std::string(v)});
         });
+        m_label_cache_bytes += sizeof(label_set) + slot->capacity() * sizeof(label);
+        for (const auto& x : *slot)
+            m_label_cache_bytes += (x.name.capacity() > 15 ? x.name.capacity() : 0) +
+                                   (x.value.capacity() > 15 ? x.value.capacity() : 0);
     }
     return *slot;
 }
@@ -432,18 +436,11 @@ size_t series_index::bytes() const
     size_t b = m_sym_bytes.capacity() + m_sym_off.capacity() * 4 + m_sym_table.bytes() + m_pairs.capacity() * 4 +
                m_ser_off.capacity() * 4 + m_ser_table.bytes() + m_pair_table.bytes() +
                m_postings.capacity() * sizeof(posting) + m_names.capacity() * sizeof(name_entry) +
-               m_name_of_sym.capacity() * 4 + m_label_cache.capacity() * sizeof(void*);
+               m_name_of_sym.capacity() * 4 + m_label_cache.capacity() * sizeof(void*) + m_label_cache_bytes;
     for (const auto& p : m_postings)
         b += p.ids.capacity() * 4;
     for (const auto& n : m_names)
         b += n.postings.capacity() * 4;
-    for (const auto& l : m_label_cache)
-        if (l)
-        {
-            b += sizeof(label_set) + l->capacity() * sizeof(label);
-            for (const auto& x : *l)
-                b += (x.name.capacity() > 15 ? x.name.capacity() : 0) + (x.value.capacity() > 15 ? x.value.capacity() : 0);
-        }
     return b;
 }
 

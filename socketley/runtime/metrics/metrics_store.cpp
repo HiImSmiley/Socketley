@@ -1624,6 +1624,14 @@ int64_t store::tick(int64_t now)
 
 bool store::busy() const { return m->bg.busy(); }
 
+uint64_t store::block_count() const
+{
+    uint64_t n = 0;
+    for (const auto& list : m->blocks)
+        n += list.size();
+    return n;
+}
+
 void store::checkpoint(int64_t hold_until)
 {
     impl& s = *m;

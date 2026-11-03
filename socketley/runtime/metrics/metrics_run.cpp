@@ -284,7 +284,7 @@ void metrics_run::tick()
     }
     if (m_rules && m_rules_due <= now + 2)
         m_rules_due = m_rules->eval(now);
-    if (const uint64_t blocks = m_store.stats().blocks; m_archive.enabled() && blocks != m_blocks_seen)
+    if (const uint64_t blocks = m_store.block_count(); m_archive.enabled() && blocks != m_blocks_seen)
     {
         m_blocks_seen = blocks;
         m_archive.poke();

@@ -435,6 +435,23 @@ TEST_CASE("index: postings survive many series and table growth")
     CHECK(ix.find(L({{"__name__", "m"}, {"i", "4999"}, {"mod", "1"}})) == 4999);
 }
 
+TEST_CASE("index: the label sets a query reads are counted in bytes() once, as each is made")
+{
+    // bytes() is asked on every tick, and walked every cached set until it counted them as they were made.
+    series_index ix;
+    const int n = 1000;
+    for (int i = 0; i < n; ++i)
+        ix.add(L({{"__name__", "m"}, {"path", ("/a/path/longer/than/sixteen/" + std::to_string(i)).c_str()}}));
+    const size_t before = ix.bytes();
+    for (int i = 0; i < n; ++i)
+        REQUIRE(ix.labels(static_cast<uint32_t>(i)).size() == 2);
+    const size_t after = ix.bytes();
+    CHECK(after - before >= size_t(n) * (sizeof(label_set) + 2 * sizeof(label) + 16));
+    for (int i = 0; i < n; ++i)
+        ix.labels(static_cast<uint32_t>(i));
+    CHECK(ix.bytes() == after);
+}
+
 // ── the head ──────────────────────────────────────────────────────────────
 
 TEST_CASE("store: max_series refuses new series and counts them, and labels are normalized")

@@ -133,6 +133,8 @@ private:
     std::vector<uint32_t> m_name_of_sym;
 
     mutable std::vector<std::unique_ptr<label_set>> m_label_cache;
+    // What the label sets in m_label_cache hold, counted as each is made, since bytes() is asked on every tick.
+    mutable size_t m_label_cache_bytes{0};
     mutable std::string m_key;
     mutable std::vector<std::unique_ptr<compiled>> m_regexes;
     mutable size_t m_regex_next{0};
