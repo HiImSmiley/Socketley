@@ -289,6 +289,7 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_storage_parsers) corpus=storageparsers ;;
         fuzz_dns)            corpus=dns ;;
         fuzz_db)             corpus=db ;;
+        fuzz_mcp)            corpus=mcp ;;
         fuzz_metrics_chunk)  corpus=metrics_chunk ;;
         fuzz_metrics_text)   corpus=metrics_text ;;
         fuzz_metrics_query)  corpus=metrics_query ;;

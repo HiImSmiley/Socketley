@@ -459,6 +459,19 @@ constexpr field metrics_fields[] = {
     gauge("local_series", "socketley_metrics_local_series", "This daemon's own series the local feed holds."),
 };
 
+constexpr field mcp_fields[] = {
+    counter("requests", "socketley_mcp_requests_total", "MCP messages an mcp runtime took."),
+    counter("tool_calls", "socketley_mcp_tool_calls_total", "Tools an mcp runtime ran."),
+    counter("tool_errors", "socketley_mcp_tool_errors_total", "Tool runs that said they failed."),
+    counter("errors", "socketley_mcp_errors_total", "Messages answered with a JSON-RPC error."),
+    counter("legacy_requests", "socketley_mcp_legacy_requests_total", "Messages of a revision before 2026-07-28."),
+    counter("refused", "socketley_mcp_refused_total", "Requests refused before a message: a key, an origin or a method."),
+    gauge("tools", "socketley_mcp_tools", "Tools an mcp runtime offers.", merge::first),
+    gauge("resources", "socketley_mcp_resources", "Resources an mcp runtime offers.", merge::first),
+    gauge("prompts", "socketley_mcp_prompts", "Prompts an mcp runtime offers.", merge::first),
+    gauge("keys", "socketley_mcp_keys", "Keys an mcp runtime takes.", merge::first),
+};
+
 constexpr type_entry entries[] = {
     {runtime_storage, storage_fields,
      {"socketley_storage_stat", kind::untyped, "A storage runtime's other stats figures, by name."}, true},
@@ -478,6 +491,7 @@ constexpr type_entry entries[] = {
     {runtime_sync, sync_fields, {"socketley_sync_stat", kind::untyped, "A sync's other stats figures, by name."}},
     {runtime_metrics, metrics_fields,
      {"socketley_metrics_stat", kind::untyped, "A metrics runtime's other stats figures, by name."}},
+    {runtime_mcp, mcp_fields, {"socketley_mcp_stat", kind::untyped, "An mcp runtime's other stats figures, by name."}},
 };
 
 // Each type's keys sorted, for the one lookup a figure costs; built once, on first use, by whichever thread comes.

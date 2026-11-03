@@ -26,6 +26,7 @@
 #include "../runtime/proxy/proxy_auth.h"
 #include "../runtime/db/db_instance.h"
 #include "../runtime/metrics/metrics_instance.h"
+#include "../runtime/mcp/mcp_instance.h"
 #include "../shared/persist/replaced_file.h"
 #include "../runtime/metrics/metrics_query.h"
 #include "../shared/http/url.h"
@@ -1707,6 +1708,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_metrics:
                     result = parse_metrics_flags(static_cast<metrics_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_mcp:
+                    result = parse_mcp_flags(static_cast<mcp_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -5124,8 +5128,10 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
                 case runtime_db:
                 case runtime_mqtt:
                 case runtime_mail:
-                    // A storage, DNS, sync, idp, db, mqtt or mail runtime's
-                    // own settings are applied by `import`, as a cache's are.
+                case runtime_mcp:
+                    // A storage, DNS, sync, idp, db, mqtt, mail or mcp
+                    // runtime's own settings are applied by `import`, as a
+                    // cache's are.
                     result = -1;
                     break;
                 case runtime_tunnel:
@@ -5163,20 +5169,22 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
             // A flag `create` takes for this type and `edit` does not is named as one `import` changes, so the answer
             // does not read as a typo; -s and --test are what create does, not settings.
             const bool own_type = type == runtime_cache || type == runtime_storage || type == runtime_idp ||
-                                  type == runtime_db || type == runtime_mqtt || type == runtime_mail;
+                                  type == runtime_db || type == runtime_mqtt || type == runtime_mail ||
+                                  type == runtime_mcp;
             if (own_type && pa.hashes[i] != fnv1a("-s") && pa.hashes[i] != fnv1a("--test") &&
                 runtime_schema::offered(pa.args[i], type))
             {
                 restore_edit();
                 // idp, db and mqtt read their own settings once, at start.
                 const bool restart = type == runtime_idp || type == runtime_db || type == runtime_mqtt ||
-                                     type == runtime_mail;
+                                     type == runtime_mail || type == runtime_mcp;
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
                           << (type == runtime_cache     ? "  A cache's"
                               : type == runtime_storage ? "  A storage runtime's"
                               : type == runtime_idp     ? "  An idp runtime's"
                               : type == runtime_mqtt    ? "  An mqtt runtime's"
                               : type == runtime_mail    ? "  A mail runtime's"
+                              : type == runtime_mcp     ? "  An mcp runtime's"
                                                         : "  A db runtime's")
                           << " own settings are applied by `import`:\n"
                              "    socketley show " << name
@@ -7536,7 +7544,7 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // only a worker turns.
         if (cfg.type == runtime_sync || cfg.type == runtime_idp || cfg.type == runtime_db ||
             cfg.type == runtime_mqtt || cfg.type == runtime_mail || cfg.type == runtime_tunnel ||
-            cfg.type == runtime_metrics)
+            cfg.type == runtime_metrics || cfg.type == runtime_mcp)
             inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(

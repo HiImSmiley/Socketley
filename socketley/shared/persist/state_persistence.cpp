@@ -15,6 +15,7 @@
 #include "../../runtime/tunnel/tunnel_instance.h"
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/metrics/metrics_instance.h"
+#include "../../runtime/mcp/mcp_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
 #include "../../cli/command_hashing.h"
@@ -753,6 +754,16 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.db_backup_keep = db->get_backup_keep();
             break;
         }
+        case runtime_mcp:
+        {
+            auto* mc = static_cast<const mcp_instance*>(instance);
+            cfg.mcp_keys = std::string(mc->get_keys_path());
+            cfg.mcp_anonymous = mc->get_anonymous();
+            cfg.mcp_origins = std::string(mc->get_origins());
+            cfg.mcp_tools = std::string(mc->get_tools());
+            cfg.mcp_instructions = std::string(mc->get_instructions());
+            break;
+        }
         case runtime_metrics:
         {
             auto* mt = static_cast<const metrics_instance*>(instance);
@@ -1273,6 +1284,16 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_int_field("backup_every", cfg.db_backup_every);
             append_int_field("backup_keep", cfg.db_backup_keep);
             break;
+        case runtime_mcp:
+            if (!cfg.mcp_keys.empty())
+                append_str_field("keys", cfg.mcp_keys);
+            append_bool_field("anonymous", cfg.mcp_anonymous);
+            if (!cfg.mcp_origins.empty())
+                append_str_field("origins", cfg.mcp_origins);
+            append_str_field("tools", cfg.mcp_tools);
+            if (!cfg.mcp_instructions.empty())
+                append_str_field("instructions", cfg.mcp_instructions);
+            break;
         case runtime_metrics:
             if (!cfg.metrics_keys.empty())
                 append_str_field("keys", cfg.metrics_keys);
@@ -1654,6 +1675,15 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.db_backup_dir = json_get_string(json, "backup_dir");
             cfg.db_backup_every = json_get_uint32(json, "backup_every", 86400);
             cfg.db_backup_keep = json_get_uint32(json, "backup_keep", 7);
+            break;
+        case runtime_mcp:
+            cfg.mcp_keys = json_get_string(json, "keys");
+            cfg.mcp_anonymous = json_get_bool(json, "anonymous");
+            cfg.mcp_origins = json_get_string(json, "origins");
+            cfg.mcp_tools = json_get_string(json, "tools");
+            if (cfg.mcp_tools.empty())
+                cfg.mcp_tools = "none";
+            cfg.mcp_instructions = json_get_string(json, "instructions");
             break;
         case runtime_metrics:
             cfg.metrics_keys = json_get_string(json, "keys");

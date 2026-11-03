@@ -238,7 +238,7 @@ cli_commands() {
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
     echo "  Create a new runtime: server, client, proxy, cache, storage, dns, sync, idp, db,"
-    echo "  mqtt, mail, tunnel, metrics, or a type"
+    echo "  mqtt, mail, tunnel, metrics, mcp, or a type"
     echo "  registered by a manifest in the daemon's types directory"
     echo "  (/etc/socketley/types/ or ~/.config/socketley/types/), whose"
     echo "  schema keys become --<key> flags. See REGISTERED TYPES in man."

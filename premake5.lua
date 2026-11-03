@@ -1583,6 +1583,24 @@ project "fuzz_db"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the mcp runtime's reader of a client's message ───
+
+project "fuzz_mcp"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_mcp.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/mcp/mcp_protocol.cpp"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: the metrics runtime's chunk codec, block reader and head log reader ───
 
 project "fuzz_metrics_chunk"
@@ -3348,6 +3366,37 @@ project "test_db"
     files { "test/unit/test_db.cpp", "socketley/runtime/db/db_doc.cpp", "socketley/runtime/db/db_schema.cpp",
             "socketley/runtime/db/db_store.cpp", "socketley/runtime/db/db_log.cpp", "socketley/runtime/db/db_shard.cpp",
             "socketley/shared/crypto/jws.cpp", "socketley/shared/crypto/key_file.cpp", "socketley/shared/util/base64.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+project "test_mcp"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_mcp.cpp", "socketley/runtime/mcp/mcp_protocol.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

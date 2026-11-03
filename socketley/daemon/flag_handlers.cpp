@@ -26,6 +26,7 @@
 #include "../runtime/mqtt/mqtt_instance.h"
 #include "../runtime/mail/mail_instance.h"
 #include "../runtime/metrics/metrics_instance.h"
+#include "../runtime/mcp/mcp_instance.h"
 #include "../shared/http/http_url.h"
 #include "../runtime/metrics/metrics_query.h"
 #include "../runtime/idp/idp_logic.h"
@@ -1988,6 +1989,54 @@ int parse_tunnel_flags(tunnel_instance* tn, const parsed_args& pa, size_t& i, st
         case fnv1a("--idp-audience"):
             return text("--idp-audience", "the clients, a comma between each, whose access tokens are taken",
                         [&](std::string_view v) { tn->set_idp_audience(v); });
+        default:
+            return -1;
+    }
+}
+
+int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+    switch (pa.hashes[i])
+    {
+        // The keys that may ask, `name secret [admin]` a line.
+        case fnv1a("--keys"):
+            if (next.empty() || next.front() != '/')
+            {
+                std::cout << "--keys requires the absolute path of a file with one key a line: name secret [admin]\n";
+                return 1;
+            }
+            mc->set_keys_path(pa.args[++i]);
+            return 0;
+        case fnv1a("--anonymous"):
+            mc->set_anonymous(true);
+            return 0;
+        case fnv1a("--origins"):
+            if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
+            {
+                std::cout << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                return 1;
+            }
+            mc->set_origins(pa.args[++i]);
+            return 0;
+        // The daemon's runtimes as tools: listing and reading them for every key, starting and stopping them for an
+        // admin's.
+        case fnv1a("--tools"):
+            if (next != "none" && next != "daemon")
+            {
+                std::cout << "--tools is none or daemon\n";
+                return 1;
+            }
+            mc->set_tools(pa.args[++i]);
+            return 0;
+        case fnv1a("--instructions"):
+            if (next.empty())
+            {
+                std::cout << "--instructions requires the text a client is told the server is for\n";
+                return 1;
+            }
+            mc->set_instructions(pa.args[++i]);
+            return 0;
         default:
             return -1;
     }

@@ -520,7 +520,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-can be: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, or any registered type \(em see
+can be: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, or any registered type \(em see
 .BR "REGISTERED TYPES" .
 .I name
 is a unique identifier for the runtime.
@@ -2178,7 +2178,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -15226,6 +15226,192 @@ prints what the API answers.
 .B \-\-shards
 is refused: one process holds 100000 series at 10s, and a series is written by
 one process.
+.SH MCP FLAGS
+An
+.B mcp
+runtime is a Model Context Protocol server: an AI client such as Claude Code, or
+an agent built on an MCP SDK, connects to it and is offered the tools, resources
+and prompts its script declares, and, with
+.BR "\-\-tools daemon" ,
+this daemon's runtimes as tools.
+.PP
+.nf
+socketley create mcp shop \-p 9600 \-\-domain mcp \-\-keys /etc/socketley/mcp.keys \e
+    \-\-lua /etc/socketley/shop.lua \-\-tools daemon \-s
+.fi
+.PP
+It speaks Streamable HTTP at
+.B /mcp
+(and
+.BR / ):
+one JSON-RPC message a
+.BR POST ,
+answered as JSON, a notification
+.B 202
+with nothing;
+.B GET
+and
+.B DELETE
+are
+.BR 405 ,
+since there is no stream of its own and no session. It speaks revision
+.B 2026\-07\-28
+as that revision has it, stateless: every request carries
+.B MCP\-Protocol\-Version
+and its version and client capabilities in
+.BR _meta ,
+.B Mcp\-Method
+names the method and
+.B Mcp\-Name
+the tool, prompt or resource, and a mismatch is
+.B 400
+.RB ( \-32020 );
+.B server/discover
+says what it has. A client that opens with
+.B initialize
+is answered as 2025\-11\-25, 2025\-06\-18 or 2025\-03\-26 have it, and its
+requests are taken without the 2026 headers: the MCP SDKs of 2026 speak that
+revision. A version neither era has is
+.B 400
+.RB ( \-32022 ),
+naming the ones it speaks. Every request is answered on its own, so
+.B \-\-shards
+spreads them over processes as a server's are. It listens on plain HTTP and is
+reached through the entrance proxy, which terminates TLS for it.
+.TP
+.BI "\-\-keys " file
+The keys that may ask, a line each:
+.IR "name secret" ,
+and
+.B admin
+after the secret of one that may change the daemon; the secret at least 16
+characters, sent as
+.BR "Authorization: Bearer" .
+A request without a key of the file is
+.B 401
+with
+.BR "WWW\-Authenticate: Bearer" .
+Read again when it changes; one that no longer reads keeps the keys before it
+and says why in the log.
+.TP
+.B \-\-anonymous
+Asked by anyone, with no key: for a port only this machine reaches
+.RB ( "\-\-bind 127.0.0.1" ).
+One of
+.B \-\-keys
+and
+.B \-\-anonymous
+is required.
+.TP
+.BI "\-\-origins " list
+The web origins a browser may call it from, comma-separated, or
+.B *
+for any. A request with any other
+.B Origin
+is
+.BR 403 ,
+as the revision asks of every server; a client that is no browser sends none.
+.TP
+.BR "\-\-tools none" | daemon
+.B daemon
+offers this daemon's runtimes:
+.B socketley_list
+and
+.B socketley_get
+(name, type, state, port, connections, owner) to every key, and
+.B socketley_start
+and
+.B socketley_stop
+to an admin's alone; a key that may not administer is not shown them. A
+server does not stop itself. A tool of the script's own of the same name is
+the script's.
+.TP
+.BI "\-\-instructions " text
+What a client is told the server is for.
+.PP
+The script declares, at its start:
+.RS
+.nf
+mcp.tool{ name = "order_status", description = "An order's state.", read_only = true,
+  input = { type = "object", properties = { id = { type = "string" } }, required = { "id" } },
+  handler = function(args, who) return { structured = { id = args.id, state = "sent" } } end }
+mcp.resource{ uri = "shop://catalog", mime = "text/plain", ttl_ms = 60000,
+  read = function(who) return "..." end }
+mcp.prompt{ name = "summarize", arguments = { { name = "order", required = true } },
+  get = function(args, who) return "Summarize order " .. args.order end }
+.fi
+.RE
+.IP
+A tool's
+.B input
+and
+.B output
+are a JSON Schema, a table or JSON text (an empty object is written as JSON
+text, since a table cannot tell it from an empty array);
+.B read_only
+.RB ( false ),
+.B destructive
+(not read_only),
+.B idempotent
+(read_only) and
+.B open_world
+.RB ( true )
+are its hints, and
+.B admin
+offers it to an admin's key alone. A handler answers a string, as text; a table
+with
+.B text
+or
+.BR content ,
+the content blocks as the revision has them; with
+.BR structured ,
+structured content, sent as text too; and with
+.BR "error = true" ,
+a failure the model reads, as is a handler that raises. A resource's
+.B read
+answers a string, or a table with
+.B text
+or
+.B blob
+(base64) and
+.BR mime ;
+a prompt's
+.B get
+a string, a user's message, or a table with
+.B description
+and
+.B messages
+of
+.B role
+and
+.BR text .
+Each gets
+.BR who ,
+the key's
+.B name
+and whether it is
+.BR admin ,
+and runs on the event loop inside the callback deadline. A declaration that
+does not read answers
+.B nil
+and why, and says so in the log.
+.PP
+.B stats
+shows
+.BR requests ,
+.BR tool_calls ,
+.BR tool_errors ,
+.B errors
+(answered with a JSON-RPC error),
+.B legacy_requests
+(of a revision before 2026),
+.B refused
+(a key, an origin or a method),
+.BR tools ,
+.BR resources ,
+.B prompts
+and
+.BR keys .
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never

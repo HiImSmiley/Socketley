@@ -14,6 +14,7 @@
 #include "../../runtime/tunnel/tunnel_instance.h"
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/metrics/metrics_instance.h"
+#include "../../runtime/mcp/mcp_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
 
@@ -231,6 +232,23 @@ void apply_metrics_config(metrics_instance& mt, const runtime_config& cfg, bool 
         mt.set_notify(cfg.metrics_notify);
     if (asked("receive", true))
         mt.set_receive(cfg.metrics_receive);
+}
+
+void apply_mcp_config(mcp_instance& mc, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("keys", !cfg.mcp_keys.empty()))
+        mc.set_keys_path(cfg.mcp_keys);
+    if (asked("anonymous", cfg.mcp_anonymous))
+        mc.set_anonymous(cfg.mcp_anonymous);
+    if (asked("origins", !cfg.mcp_origins.empty()))
+        mc.set_origins(cfg.mcp_origins);
+    if (asked("tools", cfg.mcp_tools != "none"))
+        mc.set_tools(cfg.mcp_tools);
+    if (asked("instructions", !cfg.mcp_instructions.empty()))
+        mc.set_instructions(cfg.mcp_instructions);
 }
 
 void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence)
@@ -660,6 +678,9 @@ bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by
             break;
         case runtime_metrics:
             apply_metrics_config(static_cast<metrics_instance&>(rt), cfg, by_presence);
+            break;
+        case runtime_mcp:
+            apply_mcp_config(static_cast<mcp_instance&>(rt), cfg, by_presence);
             break;
     }
 

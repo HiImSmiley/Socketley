@@ -25,7 +25,8 @@ enum runtime_type : uint8_t
     runtime_mqtt    = 9,
     runtime_mail    = 10,
     runtime_tunnel  = 11,
-    runtime_metrics = 12
+    runtime_metrics = 12,
+    runtime_mcp     = 13
 };
 
 // The names, once.  Five places had this switch -- lua_context,

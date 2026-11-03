@@ -241,6 +241,13 @@ struct runtime_config
     uint32_t db_backup_every = 86400;
     uint32_t db_backup_keep = 7;
 
+    // Mcp
+    std::string mcp_keys;
+    bool mcp_anonymous = false;
+    std::string mcp_origins;
+    std::string mcp_tools = "none";
+    std::string mcp_instructions;
+
     // Metrics
     std::string metrics_keys;
     std::string metrics_idp;

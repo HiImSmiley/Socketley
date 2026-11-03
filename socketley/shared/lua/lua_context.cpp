@@ -11,6 +11,7 @@
 #include "lua_mqtt_api.h"
 #include "lua_mail_api.h"
 #include "../../runtime/mqtt/mqtt_lua_table.h"
+#include "../../runtime/mcp/mcp_lua_table.h"
 #include "../util/settings.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
@@ -3119,6 +3120,9 @@ void lua_context::register_bindings(runtime_instance* owner)
             break;
         case runtime_mqtt:
             socketley::mqtt::register_lua_table(owner, m_lua, self);
+            break;
+        case runtime_mcp:
+            socketley::mcp::register_lua_table(owner, m_lua, self);
             break;
         case runtime_storage:
         case runtime_dns:

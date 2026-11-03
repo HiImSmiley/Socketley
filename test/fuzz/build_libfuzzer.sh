@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -133,6 +133,7 @@ want fuzz_db && build fuzz_db "$ROOT/test/fuzz/fuzz_db.cpp" "$ROOT/socketley/run
     "$ROOT/socketley/runtime/db/db_schema.cpp" "$ROOT/socketley/runtime/db/db_store.cpp" \
     "$ROOT/socketley/runtime/db/db_log.cpp" "$ROOT/socketley/shared/crypto/jws.cpp" \
     "$ROOT/socketley/shared/crypto/key_file.cpp" "$ROOT/socketley/shared/util/base64.cpp" -lcrypto
+want fuzz_mcp && build fuzz_mcp "$ROOT/test/fuzz/fuzz_mcp.cpp" "$ROOT/socketley/runtime/mcp/mcp_protocol.cpp"
 want fuzz_metrics_chunk && build fuzz_metrics_chunk "$ROOT/test/fuzz/fuzz_metrics_chunk.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_chunk.cpp" "$ROOT/socketley/runtime/metrics/metrics_block.cpp" \
     "$ROOT/socketley/shared/util/crc.cpp"
