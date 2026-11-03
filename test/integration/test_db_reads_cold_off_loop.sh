@@ -40,7 +40,7 @@ daemon_start "$BIN"
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$P/")" != 000 ] && break; sleep 0.1; done
 
 out=$(timeout 300 python3 - "$P" "$DH" <<'PY'
-import glob, json, os, random, socket, sys, threading
+import glob, json, os, random, socket, sys, threading, time
 port, home = int(sys.argv[1]), sys.argv[2]
 N = 3000
 KEY = "Authorization: Bearer dbbackendsecret0123456789\r\n"
@@ -66,10 +66,25 @@ os.sync()
 # Every segment's pages let go of, so the reads below go to the disk.
 # Under the state directory, which is a hidden one that glob would pass over.
 segs = [os.path.join(d, f) for d, _, fs in os.walk(home) for f in fs if f.startswith("seg-") and f.endswith(".log")]
-for p in segs:
-    fd = os.open(p, os.O_RDONLY)
-    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-    os.close(fd)
+def let_go():
+    # Asked until the kernel has let the pages go, which it does not do for one under writeback; a read that would
+    # wait for the disk says so.
+    for _ in range(25):
+        cold = True
+        for p in segs:
+            fd = os.open(p, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            try:
+                os.preadv(fd, [bytearray(4096)], 4096, os.RWF_NOWAIT)
+                cold = False
+            except BlockingIOError:
+                pass
+            os.close(fd)
+        if cold:
+            return True
+        time.sleep(0.2)
+    return False
+evicted = let_go()
 wrong = []
 def read(k):
     s = socket.create_connection(("127.0.0.1", port), timeout=60)
@@ -79,24 +94,23 @@ def read(k):
         if st != 200 or json.loads(body).get("text") != text(i): wrong.append(i)
 ts = [threading.Thread(target=read, args=(k,)) for k in range(8)]
 [t.start() for t in ts]; [t.join() for t in ts]
-for p in segs:
-    fd = os.open(p, os.O_RDONLY)
-    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-    os.close(fd)
+let_go()
 s = socket.create_connection(("127.0.0.1", port), timeout=60)
 st, body = call(s, "POST", "/c/notes/_query", {"where": {"i": {"lt": 400}}, "limit": 1000})
 got = json.loads(body)
 docs = got.get("docs", [])
 seen = sorted(d.get("i") for d in docs if isinstance(d, dict) and d.get("text") == text(d.get("i", -1)))
-print(len(segs), len(wrong), st, len(seen), seen == list(range(400)))
+print(len(segs), len(wrong), st, len(seen), seen == list(range(400)), evicted)
 PY
 )
-read -r segs wrong qst qn qall <<<"$out"
+read -r segs wrong qst qn qall evicted <<<"$out"
 fetched=$("$BIN" stats d 2>/dev/null | awk -F: '$1=="fetched" {print $2}')
 echo "  3000 documents of 2 KB in ${segs:-?} segment(s), read with the page cache let go of: ${wrong:-?} wrong, ${fetched:-none} brought through the ring"
 echo "  a query over them cold: status ${qst:-?}, ${qn:-?} of 400 whole"
 [ "${wrong:-x}" = 0 ] && ok || bad "every document read cold is the one asked for" "$out"
-[ "${fetched:-0}" -gt 0 ] && ok || bad "the cold ones are brought through the ring" "fetched ${fetched:-none}"
+if [ "${evicted:-}" != True ]; then echo "  SKIP [ring]: the kernel would not let the segment's pages go"
+elif [ "${fetched:-0}" -gt 0 ]; then ok
+else bad "the cold ones are brought through the ring" "fetched ${fetched:-none}"; fi
 [ "${qall:-}" = True ] && ok || bad "a query read cold finds every document it matches" "$out"
 
 echo
