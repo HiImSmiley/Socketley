@@ -951,6 +951,13 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         case fnv1a("--compress"):
             srv->set_compress(true);
             return 0;
+        // A page goes out as the file holds it, without the script that opens a WebSocket here.
+        case fnv1a("--no-inject"):
+            srv->set_inject(false);
+            return 0;
+        case fnv1a("--inject"):
+            srv->set_inject(true);
+            return 0;
         // The web origins besides its own whose pages may open a WebSocket here.
         case fnv1a("--origins"):
         {

@@ -1112,7 +1112,7 @@ void server_instance::rebuild_http_cache()
             ct.append(VARY_FIELD);
 
         // Inject WebSocket script into HTML files
-        const bool html = ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm");
+        const bool html = m_http_inject && (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
         if (html)
             content = inject_ws_script(content);
 
@@ -1128,7 +1128,7 @@ void server_instance::rebuild_http_cache()
                 const std::string file = rel_s.substr(0, rel_s.size() - packed.size());
                 const std::string_view type = socketley::http::content_type_of(file);
                 struct statx fx{};
-                if (type.starts_with("text/html") || socketley::http::compressed_type(type) ||
+                if ((m_http_inject && type.starts_with("text/html")) || socketley::http::compressed_type(type) ||
                     ::statx(m_http_root_fd, file.c_str(), 0, STATX_TYPE | STATX_MTIME, &fx) != 0 ||
                     !S_ISREG(fx.stx_mode) || fx.stx_mtime.tv_sec > cst.st_mtim.tv_sec ||
                     (fx.stx_mtime.tv_sec == cst.st_mtim.tv_sec && fx.stx_mtime.tv_nsec > cst.st_mtim.tv_nsec))
@@ -1380,7 +1380,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         std::string coded_key, coded_ct;
         struct statx copy_sx{};
         if (SOCKETLEY_UNLIKELY(m_http_compress) && range_hdr.empty() && m_http_root_fd >= 0 &&
-            !socketley::http::content_type_of(url_path).starts_with("text/html"))
+            (!m_http_inject || !socketley::http::content_type_of(url_path).starts_with("text/html")))
         {
             struct statx file_sx{};
             bool file_known = false;
@@ -1578,7 +1578,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         for (auto& c : ext)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         uint32_t ext_hash = fnv1a(ext);
-        bool is_html = coded_key.empty() && (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
+        // A page under --no-inject is served as any other file, its ranges and zero-copy paths included.
+        bool is_html = m_http_inject && coded_key.empty() && (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
         std::string_view ct = coded_key.empty() ? socketley::http::content_type_of(ext) : std::string_view(coded_ct);
         if (SOCKETLEY_UNLIKELY(m_http_compress))
         {

@@ -68,6 +68,7 @@ constexpr config_key config_keys[] = {
     { "udp",                "--udp",                key_kind::boolean },
     { "http",               "--http",               key_kind::text    },
     { "http_cache",         "--http-cache",         key_kind::boolean },
+    { "no_inject",          "--no-inject",          key_kind::boolean },
     { "master_pw",          "--master-pw",          key_kind::text    },
     // scalar, for a db's cache size as well as a server's cache runtime.
     { "cache",              "--cache",              key_kind::scalar  },

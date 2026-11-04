@@ -112,6 +112,7 @@ struct runtime_config
     // Server HTTP static file serving
     std::string http_dir;
     bool http_cache = false;
+    bool no_inject = false;
 
     // Server WebSocket origins besides its own
     std::string origins;

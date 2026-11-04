@@ -636,6 +636,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.http_dir = srv->get_http_dir().string();
             cfg.http_cache = srv->get_http_cache();
             cfg.compress = srv->get_compress();
+            cfg.no_inject = !srv->get_inject();
             cfg.origins = std::string(srv->get_origins());
             for (const auto& ut : srv->get_upstream_targets())
                 cfg.upstreams.push_back(ut.address);
@@ -1072,6 +1073,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_bool_field("http_cache", true);
             if (cfg.compress)
                 append_bool_field("compress", true);
+            if (cfg.no_inject)
+                append_bool_field("no_inject", true);
             if (!cfg.origins.empty())
                 append_str_field("origins", cfg.origins);
             if (!cfg.upstreams.empty())
@@ -1559,6 +1562,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.http_dir = json_get_string(json, "http_dir");
             cfg.http_cache = json_get_bool(json, "http_cache");
             cfg.compress = json_get_bool(json, "compress");
+            cfg.no_inject = json_get_bool(json, "no_inject");
             cfg.origins = json_get_string(json, "origins");
             cfg.upstreams = json_get_array(json, "upstreams");
             break;

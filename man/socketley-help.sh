@@ -1218,6 +1218,8 @@ flags_options() {
     echo "│ --http-cache     │ Cache files in memory at startup        │"
     echo "│                  │ does NOT pick up edits until reload-lua │"
     echo "│ --compress       │ Send a file's .br/.gz copy beside it    │"
+    echo "│ --no-inject      │ Pages as the file holds them, without   │"
+    echo "│                  │ the WebSocket script (--inject: back)   │"
     echo "│ --origins <list> │ Web pages from other origins that may   │"
     echo "│                  │ open a WebSocket here; * for any        │"
     echo "│ --listen unix:P  │ Listen on an AF_UNIX socket instead of  │"

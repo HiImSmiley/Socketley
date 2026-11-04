@@ -4621,8 +4621,8 @@ Every .html and .htm response is rewritten as it is sent.
 Documents this server did not author, such as uploads, a generated report or a
 third\-party page, are therefore delivered altered: they carry a script that
 opens a WebSocket back to this runtime.
-No flag turns this off.
-If you do not want it, serve those files with something else.
+.B \-\-no\-inject
+turns this off.
 .IP
 Content-Type is detected from the file extension.
 Every file response carries an
@@ -4692,6 +4692,9 @@ A byte offset into the file is therefore not an offset into the response.
 Those responses do not send
 .B Accept-Ranges
 either, so no client is invited to make a seek the server cannot honour.
+With
+.BR \-\-no\-inject ,
+a page is served like any other file, ranges included.
 .IP
 .B "Concurrency of the zero-copy path."
 The server sends a file with
@@ -4881,6 +4884,20 @@ A file edited on disk is therefore
 picked up.
 That is both the reason to use this flag and the reason not to.
 .TP
+.B \-\-no\-inject
+With \-\-http, serve a page as the file holds it, without the script that
+opens a WebSocket here: a site that does not use the global
+.B socketley
+does not open a connection per visitor it never reads. A page is then a file
+like any other, so it is answered for a
+.BR Range ,
+sent zero\-copy, and given its
+.B \-\-compress
+copy. WebSocket upgrades on the port are unchanged; a page that wants one opens
+it itself.
+.B \-\-inject
+puts the script back, which is the default.
+.TP
 .B \-\-compress
 With \-\-http, send a file's precompressed copy, made by the site's build, to
 clients that accept it.
@@ -4901,7 +4918,9 @@ With this flag, every file response also carries
 .BR "Vary: Accept\-Encoding" .
 .IP
 A copy is never sent when it is older than its file, or for a range request.
-Nor is one sent for a page, because the copy lacks the injected script.
+Nor is one sent for a page, because the copy lacks the injected script, unless
+.B \-\-no\-inject
+is set.
 Nor is one sent for an image, a video, a woff font, a zip or a pdf.
 A copy requested by its own name is sent as itself.
 With

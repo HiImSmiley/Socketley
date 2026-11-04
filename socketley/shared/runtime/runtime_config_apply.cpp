@@ -596,6 +596,8 @@ bool apply_server_config(server_instance& srv, const runtime_config& cfg, bool b
         srv.set_http_cache(cfg.http_cache);
     if (asked("compress", cfg.compress))
         srv.set_compress(cfg.compress);
+    if (asked("no_inject", cfg.no_inject))
+        srv.set_inject(!cfg.no_inject);
     if (asked("origins", !cfg.origins.empty()))
         srv.set_origins(cfg.origins);
     if (!cfg.master_pw.empty())

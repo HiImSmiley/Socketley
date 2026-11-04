@@ -824,6 +824,9 @@ public:
     bool get_http_cache() const;
     void set_compress(bool on) { m_http_compress = on; }
     bool get_compress() const { return m_http_compress; }
+    // Whether a page gets the script that opens a WebSocket to this server, true unless --no-inject.
+    void set_inject(bool on) { m_http_inject = on; }
+    bool get_inject() const { return m_http_inject; }
     void rebuild_http_cache();
 
     // False when the address named a port that cannot work, storing nothing in
@@ -1527,6 +1530,7 @@ private:
     void open_http_root();
     bool m_http_cache_enabled{false};
     bool m_http_compress{false};
+    bool m_http_inject{true};
     // The keep-alive response and the close one's header, which goes out ahead of the keep-alive one's body, so a hit
     // stays a refcount bump with the Connection header the client asked for and the body is not kept twice.
     struct cached_file

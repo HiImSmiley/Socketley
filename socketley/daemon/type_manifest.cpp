@@ -77,7 +77,7 @@ constexpr std::string_view reserved_keys[] = {
     "drain", "reconnect", "tls", "cert_path", "key_path", "ca_path", "target",
     "cache_name", "group", "owner", "child_policy", "shards", "shard_index",
     "cpus", "external_runtime", "managed", "exec_path", "pid",
-    "mode", "send_to", "udp", "master_pw", "http_dir", "http_cache",
+    "mode", "send_to", "udp", "master_pw", "http_dir", "http_cache", "no_inject",
     "upstreams", "protocol", "strategy", "backends", "health_check",
     "health_interval", "health_path", "health_threshold", "circuit_threshold", "root", "fastcgi_root", "index", "compress",
     "circuit_timeout", "backend_timeout", "retry_count", "retry_all",
