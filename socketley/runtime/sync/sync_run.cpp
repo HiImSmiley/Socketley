@@ -1673,6 +1673,8 @@ void sync_run::fetch_range(target& t, lane& l)
                                      {{"range", "bytes=" + std::to_string(f.got) + "-" + std::to_string(last)},
                                       // A file the storage changed during the fetch is not put together from two.
                                       {"if-match", "\"" + f.etag + "\""}});
+    // The range is the answer, so the client takes all of it, its head beside it, as the tierer's reads do.
+    rq.max_answer = static_cast<size_t>(last - f.got + 1) + (64 << 10);
     l.peer->exchange(std::move(rq), [this, &t, &l](http_answer a) {
         if (m_stopped || !l.get)
             return;
