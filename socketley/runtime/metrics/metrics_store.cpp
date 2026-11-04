@@ -48,26 +48,54 @@ constexpr char meta_magic[8] = {'S', 'K', 'L', 'M', 'M', 'E', 'T', '1'};
 class page
 {
 public:
-    page()
+    page() { map_anonymous(); }
+    ~page()
+    {
+        if (m_p)
+            ::munmap(m_p, page_bytes);
+    }
+    page(page&& o) noexcept : m_p(o.m_p), m_file(o.m_file) { o.m_p = nullptr; }
+    page& operator=(page&&) = delete;
+    page(const page&) = delete;
+
+    // The page at `off` of `fd`, its blocks reserved first so writing it can never fault for want of space; anonymous
+    // when the file cannot give it.
+    page(int fd, off_t off)
+    {
+        if (fd >= 0 && ::fallocate(fd, 0, off, static_cast<off_t>(page_bytes)) == 0)
+        {
+            void* p = ::mmap(nullptr, page_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off);
+            if (p != MAP_FAILED)
+            {
+                m_p = static_cast<uint8_t*>(p);
+                m_file = true;
+                return;
+            }
+        }
+        map_anonymous();
+    }
+
+    uint8_t* data() const { return m_p; }
+    bool in_file() const { return m_file; }
+
+    // Out of this process's memory and into the file's page cache, from where a read brings it back.
+    void let_go() const
+    {
+        if (m_file)
+            ::madvise(m_p, page_bytes, MADV_DONTNEED);
+    }
+
+private:
+    void map_anonymous()
     {
         void* p = ::mmap(nullptr, page_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED)
             throw std::bad_alloc();
         m_p = static_cast<uint8_t*>(p);
     }
-    ~page()
-    {
-        if (m_p)
-            ::munmap(m_p, page_bytes);
-    }
-    page(page&& o) noexcept : m_p(o.m_p) { o.m_p = nullptr; }
-    page& operator=(page&&) = delete;
-    page(const page&) = delete;
 
-    uint8_t* data() const { return m_p; }
-
-private:
     uint8_t* m_p{nullptr};
+    bool m_file{false};
 };
 
 // An open chunk and its state, a fixed 256 bytes whatever the series appends.
@@ -122,61 +150,105 @@ private:
     uint32_t m_used{0};
 };
 
+// A closed chunk as its window holds it: a header in front of its bytes, in the window's pages.
 struct head_chunk
 {
     int64_t mint;
     int64_t maxt;
-    uint32_t series;
-    uint32_t prev;   // the series' chunk before it in this window, plus one
-    uint32_t at;     // page << 16 | offset
-    uint16_t len;
     uint16_t n;
+    std::span<const uint8_t> bytes;
 };
 
 // The closed chunks of one aligned window (start, start + block_ms], immutable once sealed, which is when a cut may
-// read it off the loop.
+// read it off the loop.  Each chunk is a header and its bytes, the header naming the series' chunk before it, in pages
+// of an unnamed file under the head directory, so a full page leaves the process for the page cache and memory holds
+// no more of a window than the page being filled and where each series' last chunk starts.
 struct head_window
 {
+    // The series' chunk before, as its place plus one; its first and last time from the window's start; length; count.
+    static constexpr size_t header_bytes = 8 + 4 + 4 + 2 + 2;
+
     int64_t start{0};
+    int fd{-1};
     std::vector<page> pages;
     size_t fill{page_bytes};
-    std::vector<head_chunk> chunks;
-    std::vector<uint32_t> last_of;
+    // Where each series' last chunk starts, plus one: page * page_bytes + offset.
+    std::vector<uint64_t> last_of;
+    uint64_t count{0};
     bool sealed{false};
 
-    std::span<const uint8_t> bytes(const head_chunk& c) const
+    head_window() = default;
+    head_window(const head_window&) = delete;
+    head_window& operator=(const head_window&) = delete;
+    ~head_window()
     {
-        return {pages[c.at >> 16].data() + (c.at & 0xFFFF), c.len};
+        if (fd >= 0)
+            ::close(fd);
+    }
+
+    head_chunk chunk(uint64_t at) const
+    {
+        const uint8_t* h = pages[at / page_bytes].data() + at % page_bytes;
+        uint32_t lo = 0, hi = 0;
+        uint16_t len = 0, n = 0;
+        std::memcpy(&lo, h + 8, 4);
+        std::memcpy(&hi, h + 12, 4);
+        std::memcpy(&len, h + 16, 2);
+        std::memcpy(&n, h + 18, 2);
+        return {start + lo, start + hi, n, {h + header_bytes, len}};
     }
 
     void add(uint32_t series, int64_t mint, int64_t maxt, uint16_t n, std::span<const uint8_t> b)
     {
-        if (fill + b.size() > page_bytes)
+        if (fill + header_bytes + b.size() > page_bytes)
         {
-            pages.emplace_back();
+            if (!pages.empty())
+                pages.back().let_go();
+            pages.emplace_back(fd, static_cast<off_t>(pages.size() * page_bytes));
             fill = 0;
         }
-        const auto at = static_cast<uint32_t>(((pages.size() - 1) << 16) | fill);
-        std::memcpy(pages.back().data() + fill, b.data(), b.size());
-        fill += b.size();
         if (last_of.size() <= series)
             last_of.resize(size_t(series) + 1, 0);
-        chunks.push_back(head_chunk{mint, maxt, series, last_of[series], at, static_cast<uint16_t>(b.size()), n});
-        last_of[series] = static_cast<uint32_t>(chunks.size());
+        const uint64_t at = (pages.size() - 1) * page_bytes + fill;
+        const auto lo = static_cast<uint32_t>(mint - start), hi = static_cast<uint32_t>(maxt - start);
+        const auto len = static_cast<uint16_t>(b.size());
+        uint8_t* h = pages.back().data() + fill;
+        std::memcpy(h, &last_of[series], 8);
+        std::memcpy(h + 8, &lo, 4);
+        std::memcpy(h + 12, &hi, 4);
+        std::memcpy(h + 16, &len, 2);
+        std::memcpy(h + 18, &n, 2);
+        std::memcpy(h + header_bytes, b.data(), b.size());
+        fill += header_bytes + b.size();
+        last_of[series] = at + 1;
+        ++count;
     }
 
-    // The chunks of `series` in time order, through `chain`.
-    void chain_of(uint32_t series, std::vector<uint32_t>& chain) const
+    // Where the chunks of `series` ending at or after `mint` start, in time order, through `chain`; the walk back stops
+    // at the first that ends before it, so a read of the last minutes touches only their pages.
+    void chain_of(uint32_t series, std::vector<uint64_t>& chain, int64_t mint = INT64_MIN) const
     {
         chain.clear();
-        for (uint32_t c = series < last_of.size() ? last_of[series] : 0; c != 0; c = chunks[c - 1].prev)
+        for (uint64_t c = series < last_of.size() ? last_of[series] : 0; c != 0;)
+        {
+            const uint8_t* h = pages[(c - 1) / page_bytes].data() + (c - 1) % page_bytes;
+            uint32_t hi = 0;
+            std::memcpy(&hi, h + 12, 4);
+            if (start + hi < mint)
+                break;
             chain.push_back(c - 1);
+            std::memcpy(&c, h, 8);
+        }
         std::reverse(chain.begin(), chain.end());
     }
 
+    // The page being filled, and every page an unnamed file could not hold.
     size_t ram_bytes() const
     {
-        return sizeof(*this) + pages.size() * page_bytes + chunks.capacity() * sizeof(head_chunk) + last_of.capacity() * 4;
+        size_t held = 0;
+        for (size_t i = 0; i < pages.size(); ++i)
+            held += !pages[i].in_file() || i + 1 == pages.size() ? page_bytes : 0;
+        return sizeof(*this) + held + pages.capacity() * sizeof(page) + last_of.capacity() * 8;
     }
 };
 
@@ -405,7 +477,7 @@ std::unique_ptr<job_result> run_cut(cut_input& in)
     std::sort(in.series.begin(), in.series.end(),
               [](const auto& a, const auto& b) { return label_set_less(a.first, b.first); });
     const int64_t lo = in.win->start, hi = lo + block_ms;
-    std::vector<uint32_t> chain;
+    std::vector<uint64_t> chain;
     std::vector<uint8_t> buf;
     std::vector<tier_point> pts;
 
@@ -421,9 +493,9 @@ std::unique_ptr<job_result> run_cut(cut_input& in)
             {
                 tier_folder f(in.tier_step, pts);
                 in.win->chain_of(id, chain);
-                for (uint32_t c : chain)
+                for (const uint64_t c : chain)
                 {
-                    chunk_reader rd(in.win->bytes(in.win->chunks[c]));
+                    chunk_reader rd(in.win->chunk(c).bytes);
                     while (rd.next())
                         f.add(rd.t(), rd.v());
                 }
@@ -447,10 +519,10 @@ std::unique_ptr<job_result> run_cut(cut_input& in)
     {
         rw.add_series(ls, id);
         in.win->chain_of(id, chain);
-        for (uint32_t c : chain)
+        for (const uint64_t c : chain)
         {
-            const head_chunk& hc = in.win->chunks[c];
-            rw.add_chunk(hc.mint, hc.maxt, in.win->bytes(hc));
+            const head_chunk hc = in.win->chunk(c);
+            rw.add_chunk(hc.mint, hc.maxt, hc.bytes);
         }
     }
     std::shared_ptr<block> b;
@@ -604,7 +676,7 @@ struct store::impl
 
     label_set norm;
     std::vector<std::pair<std::string_view, std::string_view>> pairs;
-    std::vector<uint32_t> chain;
+    std::vector<uint64_t> chain;
     std::vector<uint32_t> candidates;
     // What a tier read reuses: the points it hands out, and per tier what is folded past its last block.
     std::vector<tier_point> agg_pts;
@@ -665,6 +737,7 @@ struct store::impl
         }
         auto w = std::make_shared<head_window>();
         w->start = start;
+        w->fd = ::open(head_dir.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
         const auto pos = std::lower_bound(windows.begin(), windows.end(), start,
                                           [](const auto& a, int64_t s) { return a->start < s; });
         return windows.insert(pos, std::move(w))->get();
@@ -1135,12 +1208,12 @@ struct store::impl
                 break;
             if (w->start + block_ms < mint)
                 continue;
-            w->chain_of(id, chain);
-            for (uint32_t c : chain)
+            w->chain_of(id, chain, mint);
+            for (const uint64_t c : chain)
             {
-                const head_chunk& hc = w->chunks[c];
+                const head_chunk hc = w->chunk(c);
                 if (hc.maxt >= mint && hc.mint <= maxt)
-                    take(w->bytes(hc));
+                    take(hc.bytes);
             }
         }
         const series_head& s = heads[id];
@@ -1674,7 +1747,7 @@ store_stats store::stats() const
         st.bytes_on_disk += l.file_bytes;
     st.head_windows = s.windows.size();
     for (const auto& w : s.windows)
-        st.head_chunks += w->chunks.size();
+        st.head_chunks += w->count;
     st.bytes_in_ram = s.ram();
     return st;
 }

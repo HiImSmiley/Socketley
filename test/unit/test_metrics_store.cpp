@@ -1142,6 +1142,46 @@ TEST_CASE("store: select and samples span blocks, the head's windows and the ope
     CHECK(values == std::vector<std::string>{"c", "g", "new", "old"});
 }
 
+TEST_CASE("store: a window's full pages leave the process, and a read of its last minute brings back only those")
+{
+    tmpdir d;
+    store s;
+    std::string why;
+    REQUIRE(s.open(d.path, small_config(), why));
+    constexpr int series = 4000, rounds = 900;
+    std::vector<uint32_t> ids;
+    for (int i = 0; i < series; ++i)
+        ids.push_back(s.get_or_create(L({{"__name__", "g"}, {"i", std::to_string(i).c_str()}})));
+    const long anon0 = status_kb("RssAnon");
+    std::mt19937_64 rng(7);
+    // Values that do not compress, inside one window, so tens of megabytes of chunks close in it.
+    for (int k = 1; k <= rounds; ++k)
+        for (const uint32_t id : ids)
+            REQUIRE(s.append(id, T0 + k * 1000, std::bit_cast<double>(rng() >> 2)));
+    const auto st = s.stats();
+    const long closed_kb = static_cast<long>(st.samples_appended) * 8 / 1024;
+    const long anon_kb = status_kb("RssAnon") - anon0;
+    INFO("closed about " << closed_kb << " KiB, anonymous memory grew " << anon_kb << " KiB, store RAM "
+         << st.bytes_in_ram / 1024 << " KiB, " << st.head_chunks << " closed chunks");
+    REQUIRE(st.head_chunks > static_cast<uint64_t>(series) * 10);
+    CHECK(anon_kb < closed_kb / 8);
+    CHECK(st.bytes_in_ram < static_cast<uint64_t>(closed_kb) * 1024 / 8);
+
+    const long mapped0 = status_kb("RssFile") + status_kb("RssShmem");
+    std::vector<sample> got;
+    for (const uint32_t id : ids)
+    {
+        got.clear();
+        s.samples(id, T0 + (rounds - 60) * 1000, T0 + rounds * 1000, got);
+        REQUIRE(got.size() == 61);
+    }
+    CHECK(status_kb("RssFile") + status_kb("RssShmem") - mapped0 < closed_kb / 3);
+    // Every sample is still there, read back from the pages that left.
+    got.clear();
+    s.samples(ids[17], T0, T0 + rounds * 1000, got);
+    CHECK(got.size() == rounds);
+}
+
 // ── how much it costs ─────────────────────────────────────────────────────
 
 TEST_CASE("perf: append to 100k series, once and then ten rounds")
