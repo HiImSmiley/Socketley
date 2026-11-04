@@ -765,7 +765,7 @@ void flatten(const sol::table& list, const std::string& base, std::vector<runtim
         runtime_type type;
         if (!type_opt || type_opt->empty())
             e.refused = "it has no type (server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, "
-                        "tunnel, or a registered type)\n";
+                        "tunnel, metrics, mcp, web, or a registered type)\n";
         else if (e.type = *type_opt; !parse_runtime_type(e.type.c_str(), type))
             e.refused = "unknown runtime type: " + e.type + "\n";
         else

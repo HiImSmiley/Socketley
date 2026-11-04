@@ -27,6 +27,7 @@
 #include "../runtime/db/db_instance.h"
 #include "../runtime/metrics/metrics_instance.h"
 #include "../runtime/mcp/mcp_instance.h"
+#include "../runtime/web/web_instance.h"
 #include "../shared/persist/replaced_file.h"
 #include "../runtime/metrics/metrics_query.h"
 #include "../shared/http/url.h"
@@ -1712,6 +1713,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                 case runtime_mcp:
                     result = parse_mcp_flags(static_cast<mcp_instance*>(instance), pa, i, name);
                     break;
+                case runtime_web:
+                    result = parse_web_flags(static_cast<web_instance*>(instance), pa, i, name);
+                    break;
                 default:
                     // A registered type's flags come from its manifest schema.
                     result = type_manifest::parse_registered_flag(instance, pa, i);
@@ -1798,6 +1802,15 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         !msg.empty())
     {
         std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
+    // A web runtime runs no script, which config_refusal cannot see before the script is set.
+    if (type == runtime_web && !lua_script.empty())
+    {
+        std::cout << "web: --lua is not run; a web runtime serves files, and a page that talks to a script is a "
+                     "server's --http\n";
         m_manager.remove(name);
         return 1;
     }
@@ -5158,6 +5171,17 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
                     }
                     result = parse_metrics_flags(static_cast<metrics_instance*>(instance), pa, i, name);
                     break;
+                case runtime_web:
+                    // A web runtime reads its own settings when it starts, as a tunnel does.
+                    if (is_running && runtime_schema::offered(pa.args[i], type))
+                    {
+                        restore_edit();
+                        std::cout << pa.args[i] << " changes a web runtime when it starts: socketley edit " << name
+                                  << " " << pa.args[i] << " ... --restart\n";
+                        return 1;
+                    }
+                    result = parse_web_flags(static_cast<web_instance*>(instance), pa, i, name);
+                    break;
                 default:
                     // A registered type's fields reach its worker at the next
                     // start, which is when the config frame is built.
@@ -7546,7 +7570,7 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // only a worker turns.
         if (cfg.type == runtime_sync || cfg.type == runtime_idp || cfg.type == runtime_db ||
             cfg.type == runtime_mqtt || cfg.type == runtime_mail || cfg.type == runtime_tunnel ||
-            cfg.type == runtime_metrics || cfg.type == runtime_mcp)
+            cfg.type == runtime_metrics || cfg.type == runtime_mcp || cfg.type == runtime_web)
             inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(

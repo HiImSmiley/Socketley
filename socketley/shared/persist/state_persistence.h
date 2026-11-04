@@ -252,6 +252,11 @@ struct runtime_config
     std::string mcp_idp;
     std::string mcp_idp_audience;
 
+    // Web
+    std::string web_root;
+    std::string web_index = "index.html";
+    std::string web_fallback;
+
     // Metrics
     std::string metrics_keys;
     std::string metrics_idp;

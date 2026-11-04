@@ -3073,6 +3073,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         case runtime_metrics:
             // No verbs of their own yet.
             break;
+        case runtime_web:
+            // Runs no script: config_refusal turns --lua away.
+            break;
     }
 
     m_lua["self"] = self;

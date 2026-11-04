@@ -125,6 +125,7 @@ bool speaks_http(const runtime_instance& rt)
         case runtime_db:
         case runtime_metrics:
         case runtime_mcp:
+        case runtime_web:
             return true;
         case runtime_proxy:
             return static_cast<const proxy_instance&>(rt).get_protocol() == protocol_http && !is_entrance(rt);

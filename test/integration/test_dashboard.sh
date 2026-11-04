@@ -79,7 +79,8 @@ parsers = {"parse_common_flags": None, "parse_shared_flags": None, "parse_server
            "parse_proxy_gate_flag": "proxy", "parse_proxy_flags": "proxy", "parse_cache_flags": "cache",
            "parse_dns_flags": "dns", "parse_storage_flags": "storage", "parse_sync_flags": "sync",
            "parse_idp_flags": "idp", "parse_db_flags": "db", "parse_mqtt_flags": "mqtt", "parse_mail_flags": "mail",
-           "parse_tunnel_flags": "tunnel", "parse_metrics_flags": "metrics", "parse_mcp_flags": "mcp"}
+           "parse_tunnel_flags": "tunnel", "parse_metrics_flags": "metrics", "parse_mcp_flags": "mcp",
+           "parse_web_flags": "web"}
 out = []
 for fn, ty in parsers.items():
     m = re.search(r"\n(?:static )?int " + fn + r"\(.*?\n\}\n", src, re.S)

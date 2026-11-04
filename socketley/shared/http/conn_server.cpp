@@ -356,6 +356,36 @@ void conn_server::flush(const std::shared_ptr<server_conn>& c)
         close_conn(c);
 }
 
+// A FIN sent from the write's completion loses the race to a client that closes as soon as it has the answer, and its
+// TIME-WAIT then makes every connect() of that client search for a port: server_instance::send_final_and_fin measured
+// 78% of them on the clients at 32 connections a request.
+bool conn_server::finish_now(const std::shared_ptr<server_conn>& c)
+{
+    if (c->dead || c->keep_alive || c->waiting || c->wr_pending || c->cn_pending || c->sent < c->sending.size() ||
+        c->out.empty() || m_hooks.keeps_open(*c))
+        return false;
+    size_t off = 0;
+    while (off < c->out.size())
+    {
+        const ssize_t n = ::send(c->fd, c->out.data() + off, c->out.size() - off, MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE);
+        if (n > 0)
+        {
+            off += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    runtime_instance::stat_add(m_rt.m_stat_bytes_out, off);
+    c->out.erase(0, off);
+    // What the socket did not take goes the usual way, the FIN after it from the write's completion.
+    if (!c->out.empty())
+        return false;
+    close_conn(c);
+    return true;
+}
+
 void conn_server::write_done(const std::shared_ptr<server_conn>& c, int res)
 {
     c->wr_pending = false;

@@ -159,6 +159,8 @@ Object.assign(P, {
   mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
   tunnel: '<path d="M3.5 20v-8a8.5 8.5 0 0 1 17 0v8"/><path d="M8.5 20v-7a3.5 3.5 0 0 1 7 0v7"/><path d="M2.5 20h19"/>',
   metrics: '<path d="M3.5 20.5h17"/><path d="M5 16.5l4.5-5 3.5 3 6-7.5"/><circle cx="19" cy="7" r="1.3"/>',
+  web: '<rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M3 9h18M6.5 6.8h.01M9 6.8h.01"/><path d="M7.5 13h9M7.5 16h5.5"/>',
+  mcp: '<path d="M8 4v4M16 4v4"/><rect x="5.5" y="8" width="13" height="6" rx="2"/><path d="M12 14v6"/>',
   sync: '<path d="M4 11a8 8 0 0 1 13.7-5.6L20 7.5"/><path d="M20 13a8 8 0 0 1-13.7 5.6L4 16.5"/><path d="M20 3.5V7.5h-4M4 20.5v-4h4"/>',
   open: '<path d="M14 3.5h6.5V10"/><path d="M20.5 3.5 11 13"/><path d="M17.5 14v5.2a1.3 1.3 0 0 1-1.3 1.3H4.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H10"/>',
   gauge: '<path d="M12 14l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>', cpu: '<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/>'
@@ -176,7 +178,9 @@ const TYPES = {
   mqtt: ['mqtt', 'MQTT', 'A broker for devices, apps and browsers, whose sessions wait for clients that went away.'],
   mail: ['mail', 'Mail', 'A mail server for its domains and users: SMTP, a spool, DKIM, mailboxes in a storage, IMAP.'],
   tunnel: ['tunnel', 'Tunnel', 'Reaches a machine with no public address: an edge here, or an agent that dials one.'],
-  metrics: ['metrics', 'Metrics', 'Every figure of this daemon and the endpoints it scrapes, kept for years and read by PromQL, as Grafana reads a Prometheus.']
+  metrics: ['metrics', 'Metrics', 'Every figure of this daemon and the endpoints it scrapes, kept for years and read by PromQL, as Grafana reads a Prometheus.'],
+  mcp: ['mcp', 'MCP', 'A Model Context Protocol server: an AI client is offered the tools its script declares.'],
+  web: ['web', 'Web', 'A site of files for browsers: its pages, their caching and compression, a new release seen at once.']
 };
 const ARRAYS = new Set(['backends', 'upstreams']);
 const TUNNEL_AGENT = new Set(['--to', '--join', '--offer']);
@@ -1023,7 +1027,7 @@ function form(type, conf, editing, running) {
     if (!sections.has(f.section)) sections.set(f.section, []);
     sections.get(f.section).push(f);
   }
-  const OPEN = new Set(['Basics', 'Network', TYPES[type] ? TYPES[type][1] : '', 'Server', 'Client', 'Proxy', 'Cache', 'Storage', 'DNS', 'Sync', 'Identity', 'MQTT', 'Metrics']);
+  const OPEN = new Set(['Basics', 'Network', TYPES[type] ? TYPES[type][1] : '', 'Server', 'Client', 'Proxy', 'Cache', 'Storage', 'DNS', 'Sync', 'Identity', 'MQTT', 'Metrics', 'MCP', 'Web']);
   // Basics first, then what only this type has, then what every type has.
   const COMMON = ['Basics', 'Network', 'TLS', 'Limits', 'Output'];
   const order = [...sections.keys()].sort((a, b) => (a === 'Basics' ? -1 : b === 'Basics' ? 1 : COMMON.includes(a) - COMMON.includes(b)));

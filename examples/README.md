@@ -14,6 +14,8 @@ examples/
 ├── storage/            # A storage runtime reached from a script, and its hooks
 ├── mqtt/               # An MQTT broker, and servers that publish through one
 ├── mail/               # A mail server for a domain, its filters and its script
+├── mcp/                # An MCP server an AI client asks, its tools in a script
+├── web/                # A static site, and a deploy that swaps releases with no restart
 ├── lua-config/         # Lua configuration and scripting
 ├── cluster/            # Several daemons discovering each other
 ├── managed/            # Binaries the daemon supervises, via `socketley add`

@@ -12,9 +12,9 @@ namespace socketley::http
 inline std::string_view content_type_of(std::string_view name)
 {
     const size_t dot = name.rfind('.');
-    if (dot == std::string_view::npos || name.find('/', dot) != std::string_view::npos || name.size() - dot > 8)
+    if (dot == std::string_view::npos || name.find('/', dot) != std::string_view::npos || name.size() - dot > 12)
         return "application/octet-stream";
-    char e[8];
+    char e[12];
     const std::string_view ext = name.substr(dot + 1);
     for (size_t i = 0; i < ext.size(); ++i)
         e[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(ext[i])));
@@ -43,6 +43,9 @@ inline std::string_view content_type_of(std::string_view name)
         {"m4a", "audio/mp4"},                        {"aac", "audio/aac"},
         {"flac", "audio/flac"},                      {"ogg", "audio/ogg"},
         {"opus", "audio/ogg"},                       {"wav", "audio/wav"},
+        {"webmanifest", "application/manifest+json"}, {"jsonld", "application/ld+json"},
+        {"rss", "application/rss+xml"},              {"atom", "application/atom+xml"},
+        {"ics", "text/calendar; charset=utf-8"},     {"xhtml", "application/xhtml+xml"},
     };
     for (const auto& [k, v] : types)
         if (k == x)

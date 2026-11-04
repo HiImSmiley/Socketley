@@ -16,6 +16,7 @@
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/metrics/metrics_instance.h"
 #include "../../runtime/mcp/mcp_instance.h"
+#include "../../runtime/web/web_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
 #include "../../cli/command_hashing.h"
@@ -768,6 +769,14 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mcp_idp_audience = std::string(mc->get_idp_audience());
             break;
         }
+        case runtime_web:
+        {
+            auto* wb = static_cast<const web_instance*>(instance);
+            cfg.web_root = std::string(wb->get_root());
+            cfg.web_index = std::string(wb->get_index());
+            cfg.web_fallback = std::string(wb->get_fallback());
+            break;
+        }
         case runtime_metrics:
         {
             auto* mt = static_cast<const metrics_instance*>(instance);
@@ -1306,6 +1315,14 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             if (!cfg.mcp_idp_audience.empty())
                 append_str_field("idp_audience", cfg.mcp_idp_audience);
             break;
+        case runtime_web:
+            if (!cfg.web_root.empty())
+                append_str_field("root", cfg.web_root);
+            if (!cfg.web_index.empty() && cfg.web_index != "index.html")
+                append_str_field("index", cfg.web_index);
+            if (!cfg.web_fallback.empty())
+                append_str_field("fallback", cfg.web_fallback);
+            break;
         case runtime_metrics:
             if (!cfg.metrics_keys.empty())
                 append_str_field("keys", cfg.metrics_keys);
@@ -1700,6 +1717,13 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.mcp_instructions = json_get_string(json, "instructions");
             cfg.mcp_idp = json_get_string(json, "idp");
             cfg.mcp_idp_audience = json_get_string(json, "idp_audience");
+            break;
+        case runtime_web:
+            cfg.web_root = json_get_string(json, "root");
+            cfg.web_index = json_get_string(json, "index");
+            if (cfg.web_index.empty())
+                cfg.web_index = "index.html";
+            cfg.web_fallback = json_get_string(json, "fallback");
             break;
         case runtime_metrics:
             cfg.metrics_keys = json_get_string(json, "keys");

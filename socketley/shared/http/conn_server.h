@@ -96,6 +96,9 @@ public:
 
     // What `out` holds sent, and a connection whose answers are done closed unless it is kept alive.
     void flush(const std::shared_ptr<server_conn>& c);
+    // A connection that is not kept alive, its last answer sent by a direct send() and closed in this turn, so the FIN
+    // leaves before the client's and the TIME-WAIT is this side's; false, and nothing done, unless nothing is in flight.
+    bool finish_now(const std::shared_ptr<server_conn>& c);
     // A connection whose answer waited takes up its requests again.
     void resume(const std::shared_ptr<server_conn>& c);
     void close_conn(const std::shared_ptr<server_conn>& c);

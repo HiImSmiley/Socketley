@@ -238,7 +238,7 @@ cli_commands() {
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
     echo "  Create a new runtime: server, client, proxy, cache, storage, dns, sync, idp, db,"
-    echo "  mqtt, mail, tunnel, metrics, mcp, or a type"
+    echo "  mqtt, mail, tunnel, metrics, mcp, web, or a type"
     echo "  registered by a manifest in the daemon's types directory"
     echo "  (/etc/socketley/types/ or ~/.config/socketley/types/), whose"
     echo "  schema keys become --<key> flags. See REGISTERED TYPES in man."
@@ -1008,6 +1008,20 @@ runtime_types() {
     echo -e "${CYAN}│${NC}        --tools daemon, --origins, --instructions text          ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Example: socketley create mcp shop -p 9600 --domain \\          ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   mcp.example.com --idp auth --lua shop.lua -s                 ${CYAN}│${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}WEB${NC}                                                            ${CYAN}│${NC}"
+    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}│${NC} A site of files for browsers: GET and HEAD, /guide/ is its     ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   index.html, /about is about.html, 404.html for the rest;     ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   304s, ranges, gzip, stamped assets kept a year; inotify      ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   sees a change or a new release at once. No script, no WS.    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Flags: --root dir (required), --index index.html,              ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --fallback index.html (a single-page app's routes)      ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Example: socketley create web docs -p 9500 --bind 127.0.0.1 \\  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   --root /srv/docs --domain docs -s                            ${CYAN}│${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
@@ -3717,7 +3731,7 @@ sdk_cross() {
 plain_help() {
     cat <<'EOF'
 socketley — a daemon for long-living network runtimes (server, client, proxy, cache, storage, dns, sync, idp,
-db, mqtt, mail)
+db, mqtt, mail, tunnel, metrics, mcp, web)
 
 USAGE
   socketley <command> [options]
@@ -3728,7 +3742,8 @@ USAGE
 
 RUNTIMES
   create <type> <name> [flags]   create a server, client, proxy, cache, storage, dns, sync, idp,
-                                 db, mqtt, mail, or a manifest-registered type (man: REGISTERED TYPES)
+                                 db, mqtt, mail, tunnel, metrics, mcp, web, or a manifest-registered
+                                 type (man: REGISTERED TYPES)
   start|stop|restart <name>      lifecycle
   remove <name>                  remove a runtime
   ls | ps [-a] [--json]          list runtimes

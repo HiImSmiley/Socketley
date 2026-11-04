@@ -5,6 +5,7 @@
 #include "../../shared/http/conditional.h"
 #include "../../shared/http/encoding.h"
 #include "../../shared/http/mime.h"
+#include "../../shared/http/site_path.h"
 #include "../../shared/net/file_send.h"
 #include "../../shared/lua/lua_suspend.h"
 #include "../../shared/loop/coarse_clock.h"
@@ -983,27 +984,6 @@ static const std::shared_ptr<const std::string>& http_500_response()
     return resp;
 }
 
-// A path with a segment that starts with a dot -- .env, .git/config,
-// .htpasswd -- which is where a site's secrets sit beside its pages, so none is
-// served; .well-known is the one such directory meant for the public.
-static bool http_hidden_path(std::string_view path)
-{
-    size_t i = 0;
-    while (i < path.size())
-    {
-        while (i < path.size() && path[i] == '/') ++i;
-        const size_t end = path.find('/', i);
-        const std::string_view seg = path.substr(i, end == std::string_view::npos
-                                                        ? std::string_view::npos : end - i);
-        if (!seg.empty() && seg.front() == '.' && seg != ".well-known")
-            return true;
-        if (end == std::string_view::npos)
-            break;
-        i = end;
-    }
-    return false;
-}
-
 void server_instance::rebuild_http_cache()
 {
     m_http_cache.clear();
@@ -1035,7 +1015,7 @@ void server_instance::rebuild_http_cache()
         if (rel.empty())
             continue;
         std::string url_path = "/" + rel.string();
-        if (http_hidden_path(url_path))
+        if (socketley::http::hidden_path(url_path))
             continue;
 
         // A link is followed exactly where disk mode follows it, by asking the
@@ -1306,7 +1286,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
     if (url_path == "/")
         url_path = "/index.html";
 
-    if (url_path.empty() || http_hidden_path(url_path))
+    if (url_path.empty() || socketley::http::hidden_path(url_path))
     {
         queue_http_response(conn, http_404_response(conn->http_keep_alive));
         if (!conn->http_keep_alive)

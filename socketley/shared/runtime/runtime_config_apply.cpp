@@ -15,6 +15,7 @@
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/metrics/metrics_instance.h"
 #include "../../runtime/mcp/mcp_instance.h"
+#include "../../runtime/web/web_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../runtime/mail/mail_instance.h"
 
@@ -255,6 +256,19 @@ void apply_mcp_config(mcp_instance& mc, const runtime_config& cfg, bool by_prese
         mc.set_idp(cfg.mcp_idp);
     if (asked("idp_audience", !cfg.mcp_idp_audience.empty()))
         mc.set_idp_audience(cfg.mcp_idp_audience);
+}
+
+void apply_web_config(web_instance& wb, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("root", !cfg.web_root.empty()))
+        wb.set_root(cfg.web_root);
+    if (asked("index", cfg.web_index != "index.html"))
+        wb.set_index(cfg.web_index.empty() ? std::string("index.html") : cfg.web_index);
+    if (asked("fallback", !cfg.web_fallback.empty()))
+        wb.set_fallback(cfg.web_fallback);
 }
 
 void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence)
@@ -689,6 +703,9 @@ bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by
             break;
         case runtime_mcp:
             apply_mcp_config(static_cast<mcp_instance&>(rt), cfg, by_presence);
+            break;
+        case runtime_web:
+            apply_web_config(static_cast<web_instance&>(rt), cfg, by_presence);
             break;
     }
 

@@ -13,7 +13,7 @@ namespace
 {
 
 // The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc, Idp, dB, Mqtt,
-// mail (E), tunnel (U), metRics, mcp (X).
+// mail (E), tunnel (U), metRics, mcp (X), Web.
 struct row
 {
     std::string_view flag, types, kind, label, help, section, choices = {}, placeholder = {}, aliases = {};
@@ -22,18 +22,18 @@ struct row
 
 constexpr row rows[] = {
     // ── basics ──────────────────────────────────────────────────────────────
-    {"-p", "SCPKTDIBMEURX", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
-    {"-s", "SCPKTDIBMEURX", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
+    {"-p", "SCPKTDIBMEURXW", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
+    {"-s", "SCPKTDIBMEURXW", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
     {"-g", "SCPKTDME", "text", "Group", "Puts it in a group; a proxy with --backend @group reaches every member.", "Basics", {}, "web", "--group"},
     {"--lua", "SCPKTMEX", "path", "Lua script", "A script with the runtime's callbacks, run at start.", "Basics", {}, "/etc/socketley/app.lua"},
-    {"--test", "SCPKTDIBMEURX", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
+    {"--test", "SCPKTDIBMEURXW", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
 
     // ── network ─────────────────────────────────────────────────────────────
-    {"--bind", "SPKTDIBMEURX", "text", "Bind address", "Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it.", "Network", {}, "127.0.0.1"},
+    {"--bind", "SPKTDIBMEURXW", "text", "Bind address", "Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it.", "Network", {}, "127.0.0.1"},
     {"--listen", "SPKT", "text", "Unix socket", "Listen on a unix socket instead of a port.", "Network", {}, "unix:/run/socketley/app.sock"},
-    {"--shards", "SPKTDIBMEX", "int", "Shards", "Worker processes sharing the port: the way one runtime uses more than one core.", "Network", {}, "4"},
-    {"--domain", "SPKTIBEURX", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
-    {"--cpus", "SCPKTDIBMERX", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
+    {"--shards", "SPKTDIBMEXW", "int", "Shards", "Worker processes sharing the port: the way one runtime uses more than one core.", "Network", {}, "4"},
+    {"--domain", "SPKTIBEURXW", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
+    {"--cpus", "SCPKTDIBMERXW", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
 
     // ── TLS ─────────────────────────────────────────────────────────────────
     {"--tls", "SCPKTME", "switch", "TLS", "Encrypt its transport: terminate TLS on its port, or dial over it.", "TLS"},
@@ -44,7 +44,7 @@ constexpr row rows[] = {
     {"--acme-email", "SPKT", "text", "ACME e-mail", "The address the CA writes to about the certificate.", "TLS", {}, "ops@example.com"},
 
     // ── limits ──────────────────────────────────────────────────────────────
-    {"--max-connections", "SPKTIBMEX", "int", "Max connections", "The most clients at once.", "Limits", {}, "10000", "--max-conn"},
+    {"--max-connections", "SPKTIBMEXW", "int", "Max connections", "The most clients at once.", "Limits", {}, "10000", "--max-conn"},
     {"--rate-limit", "SPK", "int", "Rate limit", "Messages a second per connection.", "Limits", {}, "100"},
     {"--global-rate-limit", "SPK", "int", "Global rate limit", "Messages a second over all connections.", "Limits", {}, "10000"},
     {"--congestion", "SPKT", "text", "Congestion control", "The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss.", "Limits", {}, "bbr"},
@@ -55,7 +55,7 @@ constexpr row rows[] = {
     {"--reconnect", "C", "int", "Reconnect", "Reconnect with backoff when the connection drops: the most attempts, 0 for no limit.", "Limits", {}, "0"},
 
     // ── output ──────────────────────────────────────────────────────────────
-    {"--log", "SCPKTDMEURX", "path", "State log", "A file it appends each state change to.", "Output", {}, "/var/log/socketley/app.log"},
+    {"--log", "SCPKTDMEURXW", "path", "State log", "A file it appends each state change to.", "Output", {}, "/var/log/socketley/app.log"},
     {"-w", "SC", "path", "Message file", "A file every received message is written to.", "Output", {}, "/var/log/socketley/msgs"},
     {"-b", "SC", "switch", "Print messages", "Print every received message.", "Output"},
     {"-bp", "SC", "switch", "…with name", "Print them with the runtime's name before each.", "Output"},
@@ -192,6 +192,11 @@ constexpr row rows[] = {
     {"--instructions", "X", "text", "Instructions", "What a client is told the server is for.", "MCP", {}, "Ask about orders."},
     {"--idp", "X", "text", "Identity provider", "The idp runtime whose people sign in, by an access token for https://<first name>/mcp.", "MCP", {}, "auth"},
     {"--idp-audience", "X", "list", "Token clients", "The idp's clients whose own access tokens it takes as well.", "MCP", {}, "socketley"},
+
+    // ── web ─────────────────────────────────────────────────────────────────
+    {"--root", "W", "path", "Document root", "The directory whose files are the site. Required.", "Web", {}, "/var/www/html"},
+    {"--index", "W", "text", "Index page", "The file a directory's address is answered with, index.html unless given.", "Web", {}, "index.html"},
+    {"--fallback", "W", "text", "Fallback page", "The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise.", "Web", {}, "index.html"},
     {"--scrape", "R", "path", "Scrape", "The targets it scrapes, a line each: name url, then every=, timeout= or labels.", "Metrics", {}, "/etc/socketley/metrics.targets"},
     {"--every", "R", "duration", "Every", "How often a sample is taken; a target's every= takes the place of it.", "Metrics", {}, "10s"},
     {"--keep", "R", "duration", "Keep", "How long the raw samples are kept.", "Metrics", {}, "30d"},
@@ -346,6 +351,7 @@ constexpr state_key_row state_keys[] = {
     {"--root", "root"},
     {"--fastcgi-root", "fastcgi_root"},
     {"--index", "index"},
+    {"--fallback", "fallback"},
     {"--compress", "compress"},
     {"--health-threshold", "health_threshold"},
     {"--circuit-threshold", "circuit_threshold"},
@@ -496,6 +502,7 @@ constexpr std::pair<char, runtime_type> letters[] = {
     {'S', runtime_server}, {'C', runtime_client}, {'P', runtime_proxy}, {'K', runtime_cache},  {'T', runtime_storage},
     {'D', runtime_dns},    {'Y', runtime_sync},   {'I', runtime_idp},   {'B', runtime_db},     {'M', runtime_mqtt},
     {'E', runtime_mail},   {'U', runtime_tunnel}, {'R', runtime_metrics}, {'X', runtime_mcp},
+    {'W', runtime_web},
 };
 
 char letter_of(runtime_type type)

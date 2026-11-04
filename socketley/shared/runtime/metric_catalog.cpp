@@ -476,6 +476,27 @@ constexpr field mcp_fields[] = {
     gauge("keys", "socketley_mcp_keys", "Keys an mcp runtime takes.", merge::first),
 };
 
+constexpr field web_fields[] = {
+    counter("requests", "socketley_web_requests_total", "Requests a web runtime answered."),
+    counter("not_modified", "socketley_web_not_modified_total", "Requests answered 304, the browser's copy still the file."),
+    counter("not_found", "socketley_web_not_found_total", "Requests for an address no file answers."),
+    counter("redirects", "socketley_web_redirects_total", "Directories named without their slash, sent to it with one."),
+    counter("refused", "socketley_web_refused_total", "Requests refused: a method other than GET or HEAD, or a malformed one."),
+    counter("unavailable", "socketley_web_unavailable_total", "Requests answered 503 for want of a descriptor or memory."),
+    counter("ranges", "socketley_web_ranges_total", "Requests answered with a range of the file."),
+    counter("from_memory", "socketley_web_memory_answers_total", "Bodies sent from memory with their head."),
+    counter("zero_copy", "socketley_web_zero_copy_answers_total", "Bodies sent from their descriptor with sendfile."),
+    counter("compressed", "socketley_web_compressed_answers_total", "Answers sent as a gzip or br copy."),
+    counter("compress_jobs", "socketley_web_compress_jobs_total", "Text files the helper thread compressed."),
+    counter("reloads", "socketley_web_reloads_total", "New releases swapped in under --root's name."),
+    counter("stalled", "socketley_web_stalled_total", "Connections let go after a minute of not reading what they asked for."),
+    gauge("addresses", "socketley_web_addresses", "Addresses a web runtime remembers what it resolved to."),
+    gauge("kept_bytes", "socketley_web_kept_bytes", "Bytes of files and compressed copies a web runtime keeps in memory."),
+    gauge("kept_files", "socketley_web_kept_files", "Descriptors of large files a web runtime keeps open to send from."),
+    gauge("watching", "socketley_web_watching", "1 while inotify tells a web runtime of changes, 0 when it looks at each file.",
+          merge::first),
+};
+
 constexpr type_entry entries[] = {
     {runtime_storage, storage_fields,
      {"socketley_storage_stat", kind::untyped, "A storage runtime's other stats figures, by name."}, true},
@@ -496,6 +517,7 @@ constexpr type_entry entries[] = {
     {runtime_metrics, metrics_fields,
      {"socketley_metrics_stat", kind::untyped, "A metrics runtime's other stats figures, by name."}},
     {runtime_mcp, mcp_fields, {"socketley_mcp_stat", kind::untyped, "An mcp runtime's other stats figures, by name."}},
+    {runtime_web, web_fields, {"socketley_web_stat", kind::untyped, "A web runtime's other stats figures, by name."}},
 };
 
 // Each type's keys sorted, for the one lookup a figure costs; built once, on first use, by whichever thread comes.

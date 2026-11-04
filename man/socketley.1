@@ -586,7 +586,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, or any registered type (see
+is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web, or any registered type (see
 .BR "REGISTERED TYPES" ).
 .I name
 is a unique identifier for the runtime.
@@ -2614,7 +2614,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -4609,7 +4609,12 @@ A client that sends no
 is not affected, and only browsers send one.
 .TP
 .BI "\-\-http " "directory"
-Serve static files from the given directory over HTTP.
+Serve static files from the given directory over HTTP, for pages that talk to
+this server.
+A site that does not is a
+.B web
+runtime's; see
+.BR "WEB FLAGS" .
 When a browser sends a plain HTTP GET request (one without a WebSocket upgrade
 header), the server answers with the requested file.
 GET / serves index.html.
@@ -18477,6 +18482,223 @@ shows
 .B prompts
 and
 .BR keys .
+.SH WEB FLAGS
+A
+.B web
+runtime serves a site of files to browsers and does nothing else: no script, no
+WebSocket, no raw TCP, no upload. It is what a documentation site, a blog built
+by a static site generator or a single\-page app's build is put behind.
+.PP
+.nf
+socketley create web docs \-p 9500 \-\-bind 127.0.0.1 \-\-root /srv/docs/current \-\-domain docs \-s
+socketley create web www  \-p 9501 \-\-bind 127.0.0.1 \-\-root /var/www/html \-\-domain example.com \-s
+.fi
+.PP
+It speaks plain HTTP/1.1 on its port and is reached through the entrance proxy,
+which terminates TLS and HTTP/2 for its
+.B \-\-domain
+as for every other name; a name with a dot is taken whole, so the second line
+above answers the zone's own name.
+.B \-\-tls
+and
+.B \-\-lua
+are refused.
+.TP
+.BI "\-\-root " directory
+The directory whose files are the site, absolute; required. It may be a
+symbolic link to a release: a deploy that swaps the link to a new directory
+.RB ( "ln \-s r2 next && mv \-T next current" )
+is served from the next request on, with no restart.
+.TP
+.BI "\-\-index " name
+The file a directory's address is answered with,
+.B index.html
+unless given.
+.TP
+.BI "\-\-fallback " page
+The page, under
+.BR \-\-root ,
+an address with no file behind it is given, with
+.BR 200 ,
+as a single\-page app routes its own addresses. Only an address whose last part
+has no dot: a missing
+.B app.js
+stays a
+.BR 404 .
+.PP
+.B "How an address resolves."
+.B /guide/
+is
+.BR guide/index.html ;
+.B /guide
+is answered
+.B 301
+to
+.BR /guide/ ,
+the query kept, so the page's relative links resolve under it;
+.B /about
+is
+.B about.html
+when there is no file
+.BR about ,
+as static site generators write it. A directory with no index lists nothing. An
+address nothing answers is the site's
+.B 404.html
+with status
+.BR 404 ,
+or a short
+.B 404
+without one. Repeated slashes are one, and a path that leaves
+.B \-\-root
+\(em
+.BR .. ,
+its encoding
+.BR %2e%2e ,
+or a symbolic link that points out \(em is a
+.BR 404 ,
+as is any segment that begins with a dot
+.RB ( .env ,
+.BR .git/ ),
+except
+.BR .well\-known .
+.PP
+.B "Methods."
+.B GET
+and
+.BR HEAD ;
+.B OPTIONS
+is
+.B 204
+saying so, and every other method
+.B 405
+with
+.BR "Allow: GET, HEAD, OPTIONS" .
+A WebSocket upgrade is answered with the page.
+.PP
+.B "Caching."
+Every file answer carries
+.BR ETag ,
+.BR Last\-Modified ,
+.B Date
+and
+.BR "X\-Content\-Type\-Options: nosniff" ;
+.B If\-None\-Match
+and
+.B If\-Modified\-Since
+are answered
+.BR 304 ,
+.B If\-Match
+and
+.B If\-Unmodified\-Since
+.BR 412 ,
+and a single
+.B Range
+.BR 206 ,
+under an
+.B If\-Range
+that names this copy, the whole file otherwise.
+A script, a style sheet, a font, an image or wasm whose name a build stamped
+with a content hash
+.RB ( main.3f9a1c2b.js ,
+.BR index\-B_x3\-9Qa.js )
+is sent with
+.BR "Cache\-Control: public, max\-age=31536000, immutable" ,
+since a new build is a new name; everything else, a page above all, with
+.BR no\-cache ,
+which a browser answers with a revalidation that costs a
+.B 304
+and never shows a page older than the files. A hash has digits and letters and
+no run of four lowercase letters, so
+.B holiday\-2024\-beach.jpg
+is a name its owner may replace.
+.PP
+.B "Compression."
+A
+.B .br
+or
+.B .gz
+copy a build left beside a text file, no older than it, goes to a client whose
+.B Accept\-Encoding
+takes it, br first. A text file with no
+.B .gz
+is compressed once, by a helper thread, after its first answer, and the copy is
+kept until the file changes; the request that asked for it is never held for
+it. A range is always of the file itself.
+.PP
+.B "Memory and the disk."
+What an address resolves to is kept, a file up to 32 KiB with its bytes, a
+larger one with an open descriptor it is sent from with
+.BR sendfile (2),
+or, when a window of it is not in the page cache, read through the ring, so the
+event loop never waits on the disk. inotify watches every directory below
+.B \-\-root
+and every one above it, so a change is seen at once, a release swapped in at
+any name on the way
+.RB ( current ,
+or
+.B current
+in
+.BR current/public )
+too, and no request asks the disk whether a file changed. Kept bytes are bounded
+at 256 MiB and kept descriptors at 4096, past which a large file is opened for
+each request. An address with no file shares the one
+.B 404.html
+or fallback answer, so a flood of made\-up addresses keeps nothing. A file that
+cannot be opened for want of a descriptor or memory is a
+.B 503
+with
+.BR "Retry\-After: 1" ,
+never a remembered
+.BR 404 .
+Without inotify, or with no watch left
+.RB ( fs.inotify.max_user_watches ),
+each kept file and its copies are looked at again with a
+.BR stat (2)
+per request, and
+.B \-\-root
+once a second.
+.PP
+.B "Connections."
+Pipelined requests are answered in order; a client that sends them faster than
+it reads the answers has its next requests wait once a megabyte is owed to it,
+and one that stops reading, mid\-file or so, is let go after a minute without
+progress. After a
+.B "Connection: close"
+or a refused request nothing more on the connection is answered. An HTTP/1.0
+client that asks to stay open is told
+.BR "Connection: keep\-alive" .
+.PP
+.B stats
+shows
+.BR requests ,
+.BR not_modified ,
+.BR not_found ,
+.BR redirects ,
+.B refused
+(a method or a malformed request),
+.B unavailable
+(a
+.B 503
+for want of a descriptor or memory, never remembered as a
+.BR 404 ),
+.BR ranges ,
+.B from_memory
+and
+.B zero_copy
+(how bodies went),
+.B compressed
+(answers sent as a copy),
+.BR compress_jobs ,
+.B reloads
+(releases swapped in),
+.B stalled
+(connections let go after a minute of not reading),
+.BR addresses ,
+.BR kept_bytes ,
+.B kept_files
+and
+.B watching
+(1 while inotify works).
 .SH REGISTERED TYPES
 A runtime type beyond the built-in fourteen is delivered as a manifest plus a
 worker binary.

@@ -27,6 +27,7 @@
 #include "../runtime/mail/mail_instance.h"
 #include "../runtime/metrics/metrics_instance.h"
 #include "../runtime/mcp/mcp_instance.h"
+#include "../runtime/web/web_instance.h"
 #include "../shared/http/http_url.h"
 #include "../runtime/metrics/metrics_query.h"
 #include "../runtime/idp/idp_logic.h"
@@ -2086,6 +2087,44 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
                 return 1;
             }
             mc->set_idp_audience(pa.args[++i]);
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+int parse_web_flags(web_instance* wb, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+    switch (pa.hashes[i])
+    {
+        // The directory whose files are the site, as a FastCGI proxy's --root is its scripts'.
+        case fnv1a("--root"):
+            if (next.empty() || next.front() != '/')
+            {
+                std::cout << "--root requires an absolute directory\n";
+                return 1;
+            }
+            wb->set_root(pa.args[++i]);
+            return 0;
+        // The file a directory's address is answered with.
+        case fnv1a("--index"):
+            if (next.empty() || next.find('/') != std::string_view::npos || next.starts_with('.'))
+            {
+                std::cout << "--index requires a file name, as index.html\n";
+                return 1;
+            }
+            wb->set_index(pa.args[++i]);
+            return 0;
+        // The page an address nothing answers is given, as a single-page app routes its own.
+        case fnv1a("--fallback"):
+            if (next.empty() || next.starts_with('.') || next.find("..") != std::string_view::npos ||
+                next.starts_with("-"))
+            {
+                std::cout << "--fallback requires a page under --root, as index.html\n";
+                return 1;
+            }
+            wb->set_fallback(pa.args[++i]);
             return 0;
         default:
             return -1;

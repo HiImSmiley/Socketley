@@ -54,7 +54,7 @@ constexpr builtin_name builtins[] = {
     {runtime_cache, "cache"},     {runtime_storage, "storage"}, {runtime_dns, "dns"},
     {runtime_sync, "sync"},       {runtime_idp, "idp"},       {runtime_db, "db"},
     {runtime_mqtt, "mqtt"},       {runtime_mail, "mail"},     {runtime_tunnel, "tunnel"},
-    {runtime_metrics, "metrics"}, {runtime_mcp, "mcp"},
+    {runtime_metrics, "metrics"}, {runtime_mcp, "mcp"},       {runtime_web, "web"},
 };
 
 // Every built-in is below first_registered, so no registered type is handed a built-in's id.

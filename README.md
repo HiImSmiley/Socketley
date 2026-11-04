@@ -747,7 +747,7 @@ socketley stats myapp
 
 ```
 socketley daemon                          # start the daemon (systemd does this when installed)
-socketley create <type> <name> [flags]    # types: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail
+socketley create <type> <name> [flags]    # types: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web
 socketley add <path> [--name <n>] [-s]    # register and manage an external SDK binary
 socketley attach <type> <name> <port> [--owner <n>] [--pid <pid>]  # register an external process
 socketley start <name|pattern>... [-i]    # start runtime(s), -i for interactive
