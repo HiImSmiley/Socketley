@@ -144,7 +144,7 @@ is a high-performance Linux daemon and CLI that manages network runtimes
 in a Docker-like style: servers, clients, proxies, Redis-compatible caches,
 S3 object storage, authoritative DNS, file sync jobs, an OpenID Connect
 provider, JSON document stores, MQTT brokers, mail servers, tunnels, a
-Prometheus-compatible metrics store and MCP servers.
+Prometheus-compatible metrics store, MCP servers and static web sites.
 It supports clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
 .B "TLS can terminate on a server or cache listener, on both legs of a proxy, and on a client's outgoing connection."
@@ -18707,7 +18707,7 @@ and
 .B watching
 (1 while inotify works).
 .SH REGISTERED TYPES
-A runtime type beyond the built-in fourteen is delivered as a manifest plus a
+A runtime type beyond the built-in fifteen is delivered as a manifest plus a
 worker binary.
 The manifest is a declarative file, never code.
 From it, the daemon learns the type's name, its worker executable and the schema of its configuration keys.
