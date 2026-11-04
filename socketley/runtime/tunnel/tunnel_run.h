@@ -43,8 +43,9 @@ struct leg : http::server_conn
     http::conn_server* srv{nullptr};
     link* l{nullptr};
     uint32_t stream{0};
-    // Stream bytes written to this socket and not yet given back to the far side as credit.
+    // Stream bytes taken from the far side and not yet given back as credit, and how many of them have left.
     size_t unacked{0};
+    size_t left{0};
     // The far side writes no more, this socket wrote its last, and its write half is shut.
     bool far_closed{false};
     bool near_closed{false};
@@ -156,10 +157,13 @@ public:
     void serve(const std::shared_ptr<http::server_conn>& c) override;
     void accepted(const std::shared_ptr<http::server_conn>& c) override;
     bool written(const std::shared_ptr<http::server_conn>& c) override;
+    void wrote(const std::shared_ptr<http::server_conn>& c, size_t n) override;
     bool keeps_open(const http::server_conn&) const override { return true; }
     void closing(const std::shared_ptr<http::server_conn>& c) override;
     bool read_ended(const std::shared_ptr<http::server_conn>& c) override;
     void connected(const std::shared_ptr<http::server_conn>& c, int res) override;
+    // What has left this leg's socket and not yet gone back as credit, given back once it is worth a frame.
+    void give_credit(leg& g, size_t n);
 };
 
 // The edge's front: agents and people asking to upgrade, and once they have, their links.

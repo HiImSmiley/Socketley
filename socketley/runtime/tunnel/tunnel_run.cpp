@@ -306,20 +306,36 @@ void leg_hooks::accepted(const std::shared_ptr<http::server_conn>& c)
         srv.close_conn(g);
 }
 
+// Credit goes back as the bytes leave this socket, not once all of them have: a stream that never lets its socket
+// fall idle gave none back until the sender, out of window, stopped, and ran stop-and-go at a window that, so paced,
+// rarely doubled -- 520 to 1060 MiB/s from one pass to the next where frp held 630.
+void leg_hooks::give_credit(leg& g, size_t n)
+{
+    g.left += n;
+    const size_t back = std::min(g.left, g.unacked);
+    // A frame per 64 KiB at most, and whatever is left once the socket has written everything.
+    if (!g.l || back == 0 || (back < max_payload && g.unsent() != 0))
+        return;
+    // The link's round trip, which tells a window that limits the stream from a reader that does.
+    const auto t = g.l->transport.lock();
+    const uint32_t rtt = t ? socket_tuning::rtt_us(t->fd) : 0;
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    g.l->s.consumed(g.stream, back, g.l->out, static_cast<uint64_t>(now), rtt);
+    g.unacked -= back;
+    g.left -= back;
+    run.flush_link(*g.l);
+}
+
+void leg_hooks::wrote(const std::shared_ptr<http::server_conn>& c, size_t n)
+{
+    give_credit(static_cast<leg&>(*c), n);
+}
+
 bool leg_hooks::written(const std::shared_ptr<http::server_conn>& c)
 {
     const auto g = std::static_pointer_cast<leg>(c);
-    if (g->l && g->unacked)
-    {
-        // The link's round trip, which tells a window that limits the stream from a reader that does.
-        const auto t = g->l->transport.lock();
-        const uint32_t rtt = t ? socket_tuning::rtt_us(t->fd) : 0;
-        const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        g->l->s.consumed(g->stream, g->unacked, g->l->out, static_cast<uint64_t>(now), rtt);
-        g->unacked = 0;
-        run.flush_link(*g->l);
-    }
+    give_credit(*g, 0);
     run.leg_done_writing(g);
     return false;
 }
