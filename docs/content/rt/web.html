@@ -1,0 +1,18 @@
+<p class="lead">A <b>web</b> runtime serves a directory of files to browsers and does nothing else: no script, no WebSocket, no upload. Put a documentation site, a blog from a static site generator or a single-page app's build behind it.</p>
+<pre class="code">socketley create web docs -p 9500 --root /srv/docs/current --domain docs -s
+socketley create web www  -p 9501 --root /var/www/html --domain example.com -s</pre>
+<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>It speaks plain HTTP and binds <code>127.0.0.1</code> unless <code>--bind</code> says otherwise. Visitors reach it through the entrance, which adds TLS and HTTP/2 for its <code>--domain</code> names. <code>--tls</code> and <code>--lua</code> are refused.</div></div>
+
+<h2>What it does</h2>
+<div class="feats">
+<div><b>Clean addresses</b><p><code>/guide/</code> serves <code>guide/index.html</code>, <code>/about</code> serves <code>about.html</code>, and a missing page gets the site's <code>404.html</code>.</p></div>
+<div><b>Single-page apps</b><p><code>--fallback index.html</code> answers addresses with no file, while a missing <code>app.js</code> stays a 404.</p></div>
+<div><b>Releases without a restart</b><p><code>--root</code> may be a symbolic link; swap it to a new build and the next request is served from it.</p></div>
+<div><b>Caching done right</b><p>ETag and Last-Modified on every file; names a build stamped with a hash are cached for a year, pages are revalidated.</p></div>
+<div><b>Compression</b><p>A <code>.br</code> or <code>.gz</code> copy next to a file is sent when the browser takes it; other text files are compressed once and kept.</p></div>
+<div><b>Never waits on the disk</b><p>Small files are kept in memory, large ones sent with <code>sendfile</code>; inotify sees every change at once.</p></div>
+<div><b>Nothing leaks</b><p><code>..</code>, links pointing out of <code>--root</code> and hidden files (<code>.env</code>, <code>.git/</code>) are 404, <code>.well-known</code> excepted.</p></div>
+</div>
+
+<h2>Works with</h2>
+<p>The entrance <a href="#/rt/proxy">proxy</a> of a <a href="#/rt/dns">dns</a> runtime gives it HTTPS under its <code>--domain</code>; see the <a href="#/deploy">public HTTPS recipe</a>. For a site that also needs WebSocket or a Lua handler, use a <a href="#/rt/server">server</a> with <code>--http</code>.</p>

@@ -62,9 +62,9 @@ The server refuses a handshake whose **Origin** is not in the list and is not th
 
 ### `--http directory`
 
-Serve static files from the given directory over HTTP. When a browser sends a plain HTTP GET request (one without a WebSocket upgrade header), the server answers with the requested file. GET / serves index.html. The server injects a WebSocket connection script before </head> in every HTML file (.html, .htm).
+Serve static files from the given directory over HTTP, for pages that talk to this server. A site that does not is a **web** runtime's; see **WEB FLAGS**. When a browser sends a plain HTTP GET request (one without a WebSocket upgrade header), the server answers with the requested file. GET / serves index.html. The server injects a WebSocket connection script before </head> in every HTML file (.html, .htm).
 
-**Note that this modifies the HTML it serves.** Every .html and .htm response is rewritten as it is sent. Documents this server did not author, such as uploads, a generated report or a third-party page, are therefore delivered altered: they carry a script that opens a WebSocket back to this runtime. No flag turns this off. If you do not want it, serve those files with something else.
+**Note that this modifies the HTML it serves.** Every .html and .htm response is rewritten as it is sent. Documents this server did not author, such as uploads, a generated report or a third-party page, are therefore delivered altered: they carry a script that opens a WebSocket back to this runtime. **--no-inject** turns this off.
 
 Content-Type is detected from the file extension. Every file response carries an **ETag** built from the file's inode, modification time and size. A request whose **If-None-Match** names that ETag is answered **304** with no body. The server sends no **Last-Modified**, so a browser asks again on every load instead of trusting a copy it guessed was fresh. A changed or replaced file is therefore always sent anew. WebSocket upgrades still work on the same port. Only GET requests are served; other HTTP methods fall through to raw TCP handling.
 
@@ -78,7 +78,7 @@ Range: bytes=-500       the last 500 bytes
 
 An end past the file is clamped to the last byte. A range that starts at or past the end is answered **416 Range Not Satisfiable** with **Content-Range: bytes */<length>**. This is how a client that was not told the length learns it.
 
-Two kinds of request are deliberately answered with the whole file instead. A multi-range request (**bytes=0-9,20-29**) would need a **multipart/byteranges** body, which the server does not produce. RFC 9110 14.2 permits ignoring the field, and the whole file is more useful than a wrong slice. A range on **.html** or **.htm** is also ignored, because the injected script described above changes the body's length. A byte offset into the file is therefore not an offset into the response. Those responses do not send **Accept-Ranges** either, so no client is invited to make a seek the server cannot honour.
+Two kinds of request are deliberately answered with the whole file instead. A multi-range request (**bytes=0-9,20-29**) would need a **multipart/byteranges** body, which the server does not produce. RFC 9110 14.2 permits ignoring the field, and the whole file is more useful than a wrong slice. A range on **.html** or **.htm** is also ignored, because the injected script described above changes the body's length. A byte offset into the file is therefore not an offset into the response. Those responses do not send **Accept-Ranges** either, so no client is invited to make a seek the server cannot honour. With **--no-inject**, a page is served like any other file, ranges included.
 
 **Concurrency of the zero-copy path.** The server sends a file with **sendfile**(2) from the event loop. The socket is made non-blocking for that call only, so no pipe is held and nothing limits how many files are sent at once. Compared with the io_uring splice it replaced, a 2 MiB file costs 85 us of CPU instead of 158, and 64 slow readers hold no kernel threads instead of 64. When a window of the file is not in the page cache, the server splices that window through a pipe instead, so the event loop never waits on the disk. The rest of this section is about that pipe.
 
@@ -144,11 +144,15 @@ Outside those two cases, a file that is not kept is not read either: it goes fro
 
 With --http, read all files into memory at startup instead of checking the filesystem on each request. This is faster for production; the difference from plain **--http** is one **statx**(2) per request. The cache is rebuilt on **reload-lua** and at no other time. A file edited on disk is therefore **not** picked up. That is both the reason to use this flag and the reason not to.
 
+### `--no-inject`
+
+With --http, serve a page as the file holds it, without the script that opens a WebSocket here: a site that does not use the global **socketley** does not open a connection per visitor it never reads. A page is then a file like any other, so it is answered for a **Range**, sent zero-copy, and given its **--compress** copy. WebSocket upgrades on the port are unchanged; a page that wants one opens it itself. **--inject** puts the script back, which is the default.
+
 ### `--compress`
 
 With --http, send a file's precompressed copy, made by the site's build, to clients that accept it. For example, **app.css.br** or **app.css.gz** is sent for **app.css** to a client whose **Accept-Encoding** accepts that coding. br is preferred over gzip. The response carries **Content-Encoding** and the copy's own ETag. With this flag, every file response also carries **Vary: Accept-Encoding**.
 
-A copy is never sent when it is older than its file, or for a range request. Nor is one sent for a page, because the copy lacks the injected script. Nor is one sent for an image, a video, a woff font, a zip or a pdf. A copy requested by its own name is sent as itself. With **--http-cache**, the copies are loaded at startup along with the files and compared with them at that time. In the same measurement as the proxy's, a page's 3.8 MB of scripts loaded over 10 Mbit and 50 ms in 0.97 s instead of 3.51 s. The server itself never compresses or decompresses anything.
+A copy is never sent when it is older than its file, or for a range request. Nor is one sent for a page, because the copy lacks the injected script, unless **--no-inject** is set. Nor is one sent for an image, a video, a woff font, a zip or a pdf. A copy requested by its own name is sent as itself. With **--http-cache**, the copies are loaded at startup along with the files and compared with them at that time. In the same measurement as the proxy's, a page's 3.8 MB of scripts loaded over 10 Mbit and 50 ms in 0.97 s instead of 3.51 s. The server itself never compresses or decompresses anything.
 
 Each file is held twice: once with a **Connection: keep-alive** response header and once with **Connection: close**. A cache hit therefore stays a reference-count increment and still answers with the header the client asked for.
 

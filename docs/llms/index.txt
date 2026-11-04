@@ -19,6 +19,7 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 ## The runtimes
 
 - [server](rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path (compared with nginx)
+- [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
 - [client](rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
 - [proxy](rt-proxy.txt): HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI (compared with HAProxy, nginx)
 - [cache](rt-cache.txt): In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub (compared with Redis, Valkey)

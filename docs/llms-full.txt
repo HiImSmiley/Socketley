@@ -2,7 +2,7 @@
 
 > One Linux daemon and CLI that runs your servers, proxies, caches, storage, databases, DNS, sign-in, MQTT, mail, metrics, tunnels and MCP: each a runtime made with one command.
 
-socketley is a single Linux binary. `socketley daemon` supervises runtimes; every other invocation is the CLI that talks to the daemon over a unix socket. A runtime is a network service of one of 14 types, made with `socketley create <type> <name> [flags]`, each in its own worker process on an io_uring event loop, scriptable in Lua. The manual page man/socketley.1 is the source of truth; these files are generated from it and from the site's own pages (https://docs.smileygames.online/).
+socketley is a single Linux binary. `socketley daemon` supervises runtimes; every other invocation is the CLI that talks to the daemon over a unix socket. A runtime is a network service of one of 15 types, made with `socketley create <type> <name> [flags]`, each in its own worker process on an io_uring event loop, scriptable in Lua. The manual page man/socketley.1 is the source of truth; these files are generated from it and from the site's own pages (https://docs.smileygames.online/).
 
 Every page below is plain Markdown. llms-full.txt is all of them in one file (large).
 
@@ -30,6 +30,7 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 ## The runtimes
 
 - [server](rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path (compared with nginx)
+- [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
 - [client](rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
 - [proxy](rt-proxy.txt): HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI (compared with HAProxy, nginx)
 - [cache](rt-cache.txt): In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub (compared with Redis, Valkey)
@@ -1140,7 +1141,7 @@ socketley daemon --name new-name   # rename while cluster is active
 
 #### `create type name [flags]`
 
-Create a new runtime instance. *type* is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, or any registered type (see **REGISTERED TYPES**). *name* is a unique identifier for the runtime.
+Create a new runtime instance. *type* is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web, or any registered type (see **REGISTERED TYPES**). *name* is a unique identifier for the runtime.
 
 With **-s** and a **--lua** script, **on_start** runs inside this command. If **on_start** raises an error, the runtime is not taken down. It is created and running, with whatever **on_start** set up before it failed. But the command exits 1 and names the callback and the reason, so a start whose set-up did not run is not reported as a clean one. Fix the script and run **reload-lua** to run it again.
 
@@ -2380,6 +2381,7 @@ Every flag a server runtime takes, by group.
 | `--http` | path | Static files: Serve this directory over HTTP. |
 | `--http-cache` |  | Files in memory: Read the static files into memory at start. |
 | `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. |
+| `--no-inject` |  | Pages as they are: Serve each page exactly as the file holds it, without the WebSocket script. |
 | `--master-pw` | text | Master password: The password that claims master mode. |
 | `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. |
 | `--cache` | text | Cache: A cache runtime its scripts and clients use. |
@@ -2408,6 +2410,84 @@ How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk on 2
 ## In the manual
 
 Every flag in full, and Sharding, Multi-Protocol Auto-Detection, Request Framing, Cache Access via Server: man-server-flags.txt
+
+
+---
+
+# web runtime
+
+Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
+
+A **web** runtime serves a directory of files to browsers and does nothing else: no script, no WebSocket, no upload. Put a documentation site, a blog from a static site generator or a single-page app's build behind it.
+
+```
+socketley create web docs -p 9500 --root /srv/docs/current --domain docs -s
+socketley create web www  -p 9501 --root /var/www/html --domain example.com -s
+```
+
+> It speaks plain HTTP and binds `127.0.0.1` unless `--bind` says otherwise. Visitors reach it through the entrance, which adds TLS and HTTP/2 for its `--domain` names. `--tls` and `--lua` are refused.
+
+## What it does
+
+- **Clean addresses**: `/guide/` serves `guide/index.html`, `/about` serves `about.html`, and a missing page gets the site's `404.html`.
+- **Single-page apps**: `--fallback index.html` answers addresses with no file, while a missing `app.js` stays a 404.
+- **Releases without a restart**: `--root` may be a symbolic link; swap it to a new build and the next request is served from it.
+- **Caching done right**: ETag and Last-Modified on every file; names a build stamped with a hash are cached for a year, pages are revalidated.
+- **Compression**: A `.br` or `.gz` copy next to a file is sent when the browser takes it; other text files are compressed once and kept.
+- **Never waits on the disk**: Small files are kept in memory, large ones sent with `sendfile`; inotify sees every change at once.
+- **Nothing leaks**: `..`, links pointing out of `--root` and hidden files (`.env`, `.git/`) are 404, `.well-known` excepted.
+
+## Works with
+
+The entrance [proxy](rt-proxy.txt) of a [dns](rt-dns.txt) runtime gives it HTTPS under its `--domain`; see the [public HTTPS recipe](deploy.txt). For a site that also needs WebSocket or a Lua handler, use a [server](rt-server.txt) with `--http`.
+
+## Flags
+
+Every flag a web runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**Web**
+
+| flag | value | what it does |
+|---|---|---|
+| `--root` | path | Document root: The directory whose files are the site. Required. |
+| `--index` | text | Index page: The file a directory's address is answered with, index.html unless given. |
+| `--fallback` | text | Fallback page: The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise. |
+
+## Benchmarks
+
+No benchmark. Not measured on the current build yet.
+
+## In the manual
+
+Every flag in full, and the rest: man-web-flags.txt
 
 
 ---
@@ -3904,8 +3984,8 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `-p` | int | Port: The port it listens on (a client: the port of its target). Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
-| `-s` |  | Start now: Start it as soon as it is made. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
+| `-p` | int | Port: The port it listens on (a client: the port of its target). Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp, web. |
+| `-s` |  | Start now: Start it as soon as it is made. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp, web. |
 | `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. Types: server, client, proxy, cache, storage, dns, mqtt, mail. |
 | `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. Types: server, client, proxy, cache, storage, mqtt, mail, mcp. |
 
@@ -3913,11 +3993,11 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp, web. |
 | `--listen` | text | Unix socket: Listen on a unix socket instead of a port. Types: server, proxy, cache, storage. |
-| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, mcp. |
-| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. Types: server, proxy, cache, storage, idp, db, mail, tunnel, metrics, mcp. |
-| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, metrics, mcp. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, mcp, web. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. Types: server, proxy, cache, storage, idp, db, mail, tunnel, metrics, mcp, web. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, metrics, mcp, web. |
 
 **TLS**
 
@@ -3934,7 +4014,7 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. Types: server, proxy, cache, storage, idp, db, mqtt, mail, mcp. |
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. Types: server, proxy, cache, storage, idp, db, mqtt, mail, mcp, web. |
 | `--rate-limit` | int | Rate limit: Messages a second per connection. Types: server, proxy, cache. |
 | `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. Types: server, proxy, cache. |
 | `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. Types: server, proxy, cache, storage. |
@@ -3948,7 +4028,7 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `--log` | path | State log: A file it appends each state change to. Types: server, client, proxy, cache, storage, dns, mqtt, mail, tunnel, metrics, mcp. |
+| `--log` | path | State log: A file it appends each state change to. Types: server, client, proxy, cache, storage, dns, mqtt, mail, tunnel, metrics, mcp, web. |
 | `-w` | path | Message file: A file every received message is written to. Types: server, client. |
 | `-b` |  | Print messages: Print every received message. Types: server, client. |
 | `-bp` |  | …with name: Print them with the runtime's name before each. Types: server, client. |
@@ -3965,6 +4045,7 @@ Every flag of every runtime type, with the types that take it.
 | `--http` | path | Static files: Serve this directory over HTTP. Types: server. |
 | `--http-cache` |  | Files in memory: Read the static files into memory at start. Types: server. |
 | `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. Types: server, proxy. |
+| `--no-inject` |  | Pages as they are: Serve each page exactly as the file holds it, without the WebSocket script. Types: server. |
 | `--master-pw` | text | Master password: The password that claims master mode. Types: server. |
 | `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. Types: server. |
 | `--cache` | text | Cache: A cache runtime its scripts and clients use. Types: server. |
@@ -4176,6 +4257,14 @@ Every flag of every runtime type, with the types that take it.
 | `--instructions` | text | Instructions: What a client is told the server is for. Types: mcp. |
 | `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. Types: mcp. |
 | `--idp-audience` | list | Token clients: The idp's clients whose own access tokens it takes as well. Types: mcp. |
+
+**Web**
+
+| flag | value | what it does |
+|---|---|---|
+| `--root` | path | Document root: The directory whose files are the site. Required. Types: web. |
+| `--index` | text | Index page: The file a directory's address is answered with, index.html unless given. Types: web. |
+| `--fallback` | text | Fallback page: The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise. Types: web. |
 
 **Metrics**
 
@@ -4643,6 +4732,7 @@ Every script and program in the repository's examples/ and sdk/examples/, with w
 - `examples/storage/storage-from-a-script.lua`: A server that keeps its messages in object storage -- socketley create storage media -p 9000 --dir /srv/objects --anonymous -s curl -X PUT localhost:9000/notes socketley create server notes -p 8000 --lua examples/storage/storage-from-a-script.lua -s
 - `examples/storage/storage-hooks.lua`: Policy and an audit trail on a storage runtime -- socketley create storage policy -p 9001 --dir /srv/policy --anonymous -s socketley create storage media -p 9000 --dir /srv/objects --anonymous \ --lua examples/storage/storage-hooks.lua -s curl -X PUT localhost:9001/rules; curl -X PUT localhost:9001/audit curl -X PUT --data-binary x localhost:9001/rules/secret.txt
 - `examples/udp/udp-echo.sh`: UDP Echo Server Example -- Demonstrates fire-and-forget messaging with UDP. Each datagram = one message (no line-parsing).
+- `examples/web/deploy.sh`: A static site behind a web runtime, and a deploy with no restart -- bash examples/web/deploy.sh /srv/site ./public # ./public: a static site generator's output
 - `sdk/examples/advanced/chat_server.cpp`: Socketley SDK — chat server with nicknames, rooms, and commands -- Build: g++ -std=c++23 sdk/examples/advanced/chat_server.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/chat_server
 - `sdk/examples/advanced/heartbeat_server.cpp`: Socketley SDK — server that disconnects idle clients -- Build: g++ -std=c++23 sdk/examples/advanced/heartbeat_server.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/heartbeat_server
 - `sdk/examples/advanced/http_file_server.cpp`: Socketley SDK — static HTTP file server with access logging -- Build: g++ -std=c++23 sdk/examples/advanced/http_file_server.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/http_file_server
@@ -4678,7 +4768,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Commands](man-commands.txt) (70 entries)
 - [Daemon flags](man-daemon-flags.txt) (2 entries)
 - [Common flags](man-common-flags.txt) (25 entries)
-- [Server flags](man-server-flags.txt) (17 entries)
+- [Server flags](man-server-flags.txt) (18 entries)
 - [Client flags](man-client-flags.txt) (4 entries)
 - [Proxy flags](man-proxy-flags.txt) (11 entries)
 - [Cache flags](man-cache-flags.txt) (13 entries)
@@ -4692,6 +4782,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Tunnel flags](man-tunnel-flags.txt) (9 entries)
 - [Metrics flags](man-metrics-flags.txt) (18 entries)
 - [MCP flags](man-mcp-flags.txt) (7 entries)
+- [Web flags](man-web-flags.txt) (3 entries)
 - [Registered types](man-registered-types.txt)
 - [Lua configuration](man-lua-configuration.txt)
 - [Dashboard](man-dashboard.txt) (5 entries)
@@ -4762,7 +4853,7 @@ From the manual page socketley(1).
 
 **socketley** is one program. **socketley daemon** runs the daemon, which creates, starts, stops and supervises runtimes. Most other invocations, such as **socketley create** or **socketley ls**, are the command line: each sends its command to the daemon over a unix socket, and starts the daemon first if none is running. A runtime made with **create** runs in its own worker process, which the daemon restarts if it exits. In that process, one io_uring event loop on one thread serves the runtime. The daemon saves each runtime's configuration as a JSON file and restores every saved runtime when it starts.
 
-**socketley** is a high-performance Linux daemon and CLI that manages network runtimes in a Docker-like style: servers, clients, proxies, Redis-compatible caches, S3 object storage, authoritative DNS, file sync jobs, an OpenID Connect provider, JSON document stores, MQTT brokers, mail servers, tunnels, a Prometheus-compatible metrics store and MCP servers. It supports clustering, WebSocket, Lua scripting, and io_uring async I/O.
+**socketley** is a high-performance Linux daemon and CLI that manages network runtimes in a Docker-like style: servers, clients, proxies, Redis-compatible caches, S3 object storage, authoritative DNS, file sync jobs, an OpenID Connect provider, JSON document stores, MQTT brokers, mail servers, tunnels, a Prometheus-compatible metrics store, MCP servers and static web sites. It supports clustering, WebSocket, Lua scripting, and io_uring async I/O.
 
 **TLS can terminate on a server or cache listener, on both legs of a proxy, and on a client's outgoing connection.** A **server** runtime encrypts its own listening port with **--tls** **--cert** **--key**, and verifies client certificates with **--ca**. A **proxy** does the same on its own port and verifies client certificates with **--client-ca**. The proxy reaches an **https://** backend over TLS: it verifies the backend's certificate chain and name, and presents a client certificate with **--client-cert** **--client-key**. A **client** runtime connects to its target over TLS with **--tls**. It verifies the chain against **--ca** or the system trust store, matches the host from **-t** against the certificate, and presents its own certificate with **--cert** **--key**. Neither check can be switched off. An unverified TLS client protects against someone recording the traffic, but not at all against someone in the path who can intercept it.
 
@@ -4845,7 +4936,7 @@ socketley daemon --name new-name   # rename while cluster is active
 
 ### `create type name [flags]`
 
-Create a new runtime instance. *type* is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, or any registered type (see **REGISTERED TYPES**). *name* is a unique identifier for the runtime.
+Create a new runtime instance. *type* is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web, or any registered type (see **REGISTERED TYPES**). *name* is a unique identifier for the runtime.
 
 With **-s** and a **--lua** script, **on_start** runs inside this command. If **on_start** raises an error, the runtime is not taken down. It is created and running, with whatever **on_start** set up before it failed. But the command exits 1 and names the callback and the reason, so a start whose set-up did not run is not reported as a clean one. Fix the script and run **reload-lua** to run it again.
 
@@ -5462,7 +5553,7 @@ The interactive editor opens a JSON file with the following fields. Fields marke
 |---|---|
 | name | Runtime name **(requires restart)** |
 | id | 6-char hex identifier (read-only, ignored on import) |
-| type | Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp (read-only, ignored on import) |
+| type | Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web (read-only, ignored on import) |
 | was_running | Internal daemon state (ignored on import) |
 
 **Common fields (all types):**
@@ -6199,9 +6290,9 @@ The server refuses a handshake whose **Origin** is not in the list and is not th
 
 ### `--http directory`
 
-Serve static files from the given directory over HTTP. When a browser sends a plain HTTP GET request (one without a WebSocket upgrade header), the server answers with the requested file. GET / serves index.html. The server injects a WebSocket connection script before </head> in every HTML file (.html, .htm).
+Serve static files from the given directory over HTTP, for pages that talk to this server. A site that does not is a **web** runtime's; see **WEB FLAGS**. When a browser sends a plain HTTP GET request (one without a WebSocket upgrade header), the server answers with the requested file. GET / serves index.html. The server injects a WebSocket connection script before </head> in every HTML file (.html, .htm).
 
-**Note that this modifies the HTML it serves.** Every .html and .htm response is rewritten as it is sent. Documents this server did not author, such as uploads, a generated report or a third-party page, are therefore delivered altered: they carry a script that opens a WebSocket back to this runtime. No flag turns this off. If you do not want it, serve those files with something else.
+**Note that this modifies the HTML it serves.** Every .html and .htm response is rewritten as it is sent. Documents this server did not author, such as uploads, a generated report or a third-party page, are therefore delivered altered: they carry a script that opens a WebSocket back to this runtime. **--no-inject** turns this off.
 
 Content-Type is detected from the file extension. Every file response carries an **ETag** built from the file's inode, modification time and size. A request whose **If-None-Match** names that ETag is answered **304** with no body. The server sends no **Last-Modified**, so a browser asks again on every load instead of trusting a copy it guessed was fresh. A changed or replaced file is therefore always sent anew. WebSocket upgrades still work on the same port. Only GET requests are served; other HTTP methods fall through to raw TCP handling.
 
@@ -6215,7 +6306,7 @@ Range: bytes=-500       the last 500 bytes
 
 An end past the file is clamped to the last byte. A range that starts at or past the end is answered **416 Range Not Satisfiable** with **Content-Range: bytes */<length>**. This is how a client that was not told the length learns it.
 
-Two kinds of request are deliberately answered with the whole file instead. A multi-range request (**bytes=0-9,20-29**) would need a **multipart/byteranges** body, which the server does not produce. RFC 9110 14.2 permits ignoring the field, and the whole file is more useful than a wrong slice. A range on **.html** or **.htm** is also ignored, because the injected script described above changes the body's length. A byte offset into the file is therefore not an offset into the response. Those responses do not send **Accept-Ranges** either, so no client is invited to make a seek the server cannot honour.
+Two kinds of request are deliberately answered with the whole file instead. A multi-range request (**bytes=0-9,20-29**) would need a **multipart/byteranges** body, which the server does not produce. RFC 9110 14.2 permits ignoring the field, and the whole file is more useful than a wrong slice. A range on **.html** or **.htm** is also ignored, because the injected script described above changes the body's length. A byte offset into the file is therefore not an offset into the response. Those responses do not send **Accept-Ranges** either, so no client is invited to make a seek the server cannot honour. With **--no-inject**, a page is served like any other file, ranges included.
 
 **Concurrency of the zero-copy path.** The server sends a file with **sendfile**(2) from the event loop. The socket is made non-blocking for that call only, so no pipe is held and nothing limits how many files are sent at once. Compared with the io_uring splice it replaced, a 2 MiB file costs 85 us of CPU instead of 158, and 64 slow readers hold no kernel threads instead of 64. When a window of the file is not in the page cache, the server splices that window through a pipe instead, so the event loop never waits on the disk. The rest of this section is about that pipe.
 
@@ -6281,11 +6372,15 @@ Outside those two cases, a file that is not kept is not read either: it goes fro
 
 With --http, read all files into memory at startup instead of checking the filesystem on each request. This is faster for production; the difference from plain **--http** is one **statx**(2) per request. The cache is rebuilt on **reload-lua** and at no other time. A file edited on disk is therefore **not** picked up. That is both the reason to use this flag and the reason not to.
 
+### `--no-inject`
+
+With --http, serve a page as the file holds it, without the script that opens a WebSocket here: a site that does not use the global **socketley** does not open a connection per visitor it never reads. A page is then a file like any other, so it is answered for a **Range**, sent zero-copy, and given its **--compress** copy. WebSocket upgrades on the port are unchanged; a page that wants one opens it itself. **--inject** puts the script back, which is the default.
+
 ### `--compress`
 
 With --http, send a file's precompressed copy, made by the site's build, to clients that accept it. For example, **app.css.br** or **app.css.gz** is sent for **app.css** to a client whose **Accept-Encoding** accepts that coding. br is preferred over gzip. The response carries **Content-Encoding** and the copy's own ETag. With this flag, every file response also carries **Vary: Accept-Encoding**.
 
-A copy is never sent when it is older than its file, or for a range request. Nor is one sent for a page, because the copy lacks the injected script. Nor is one sent for an image, a video, a woff font, a zip or a pdf. A copy requested by its own name is sent as itself. With **--http-cache**, the copies are loaded at startup along with the files and compared with them at that time. In the same measurement as the proxy's, a page's 3.8 MB of scripts loaded over 10 Mbit and 50 ms in 0.97 s instead of 3.51 s. The server itself never compresses or decompresses anything.
+A copy is never sent when it is older than its file, or for a range request. Nor is one sent for a page, because the copy lacks the injected script, unless **--no-inject** is set. Nor is one sent for an image, a video, a woff font, a zip or a pdf. A copy requested by its own name is sent as itself. With **--http-cache**, the copies are loaded at startup along with the files and compared with them at that time. In the same measurement as the proxy's, a page's 3.8 MB of scripts loaded over 10 Mbit and 50 ms in 0.97 s instead of 3.51 s. The server itself never compresses or decompresses anything.
 
 Each file is held twice: once with a **Connection: keep-alive** response header and once with **Connection: close**. A cache hit therefore stays a reference-count increment and still answers with the header the client asked for.
 
@@ -10786,11 +10881,53 @@ A handler's return value becomes the tool's result:
 
 ---
 
+# Web flags
+
+From the manual page socketley(1).
+
+A **web** runtime serves a site of files to browsers and does nothing else: no script, no WebSocket, no raw TCP, no upload. It is what a documentation site, a blog built by a static site generator or a single-page app's build is put behind.
+
+```
+socketley create web docs -p 9500 --root /srv/docs/current --domain docs -s
+socketley create web www  -p 9501 --root /var/www/html --domain example.com -s
+```
+
+It speaks plain HTTP/1.1 on its port and is reached through the entrance proxy, which terminates TLS and HTTP/2 for its **--domain** as for every other name; a name with a dot is taken whole, so the second line above answers the zone's own name. Unlike the other runtimes it binds **127.0.0.1** unless **--bind** says otherwise, since what it speaks is plain HTTP that only the entrance should reach; **--bind 0.0.0.0** opens it to the network. **--tls** and **--lua** are refused.
+
+### `--root directory`
+
+The directory whose files are the site, absolute; required. It may be a symbolic link to a release: a deploy that swaps the link to a new directory (**ln -s r2 next && mv -T next current**) is served from the next request on, with no restart.
+
+### `--index name`
+
+The file a directory's address is answered with, **index.html** unless given.
+
+### `--fallback page`
+
+The page, under **--root**, an address with no file behind it is given, with **200**, as a single-page app routes its own addresses. Only an address whose last part has no dot: a missing **app.js** stays a **404**.
+
+**How an address resolves.** **/guide/** is **guide/index.html**; **/guide** is answered **301** to **/guide/**, the query kept, so the page's relative links resolve under it; **/about** is **about.html** when there is no file **about**, as static site generators write it. A directory with no index lists nothing. An address nothing answers is the site's **404.html** with status **404**, or a short **404** without one. Repeated slashes are one, and a path that leaves **--root** — **..**, its encoding **%2e%2e**, or a symbolic link that points out — is a **404**, as is any segment that begins with a dot (**.env**, **.git/**), except **.well-known**.
+
+**Methods.** **GET** and **HEAD**; **OPTIONS** is **204** saying so, and every other method **405** with **Allow: GET, HEAD, OPTIONS**. A WebSocket upgrade is answered with the page.
+
+**Caching.** Every file answer carries **ETag**, **Last-Modified**, **Date** and **X-Content-Type-Options: nosniff**; **If-None-Match** and **If-Modified-Since** are answered **304**, **If-Match** and **If-Unmodified-Since** **412**, and a single **Range** **206**, under an **If-Range** that names this copy, the whole file otherwise. A script, a style sheet, a font, an image or wasm whose name a build stamped with a content hash (**main.3f9a1c2b.js**, **index-B_x3-9Qa.js**) is sent with **Cache-Control: public, max-age=31536000, immutable**, since a new build is a new name; everything else, a page above all, with **no-cache**, which a browser answers with a revalidation that costs a **304** and never shows a page older than the files. A hash has digits and letters and no run of four lowercase letters, so **holiday-2024-beach.jpg** is a name its owner may replace.
+
+**Compression.** A **.br** or **.gz** copy a build left beside a text file, no older than it, goes to a client whose **Accept-Encoding** takes it, br first. A text file with no **.gz** is compressed once, by a helper thread, after its first answer, and the copy is kept until the file changes; the request that asked for it is never held for it. A range is always of the file itself.
+
+**Memory and the disk.** What an address resolves to is kept, a file up to 32 KiB with its bytes, a larger one with an open descriptor it is sent from with **sendfile**(2), or, when a window of it is not in the page cache, read through the ring, so the event loop never waits on the disk. inotify watches every directory below **--root** and every one above it, so a change is seen at once, a release swapped in at any name on the way (**current**, or **current** in **current/public**) too, and no request asks the disk whether a file changed. Kept bytes are bounded at 256 MiB and kept descriptors at 4096, past which a large file is opened for each request. An address with no file shares the one **404.html** or fallback answer, so a flood of made-up addresses keeps nothing. A file that cannot be opened for want of a descriptor or memory is a **503** with **Retry-After: 1**, never a remembered **404**. Without inotify, or with no watch left (**fs.inotify.max_user_watches**), each kept file and its copies are looked at again with a **stat**(2) per request, and **--root** once a second.
+
+**Connections.** Pipelined requests are answered in order; a client that sends them faster than it reads the answers has its next requests wait once a megabyte is owed to it, and one that stops reading, mid-file or so, is let go after a minute without progress. After a **Connection: close** or a refused request nothing more on the connection is answered. An HTTP/1.0 client that asks to stay open is told **Connection: keep-alive**.
+
+**stats** shows **requests**, **not_modified**, **not_found**, **redirects**, **refused** (a method or a malformed request), **unavailable** (a **503** for want of a descriptor or memory, never remembered as a **404**), **ranges**, **from_memory** and **zero_copy** (how bodies went), **compressed** (answers sent as a copy), **compress_jobs**, **reloads** (releases swapped in), **stalled** (connections let go after a minute of not reading), **addresses**, **kept_bytes**, **kept_files** and **watching** (1 while inotify works).
+
+
+---
+
 # Registered types
 
 From the manual page socketley(1).
 
-A runtime type beyond the built-in fourteen is delivered as a manifest plus a worker binary. The manifest is a declarative file, never code. From it, the daemon learns the type's name, its worker executable and the schema of its configuration keys. The behaviour lives in the binary, which the daemon forks and execs exactly as it does its own workers. No third-party code ever runs in the daemon's process.
+A runtime type beyond the built-in fifteen is delivered as a manifest plus a worker binary. The manifest is a declarative file, never code. From it, the daemon learns the type's name, its worker executable and the schema of its configuration keys. The behaviour lives in the binary, which the daemon forks and execs exactly as it does its own workers. No third-party code ever runs in the daemon's process.
 
 The daemon reads manifests at startup. A system daemon reads **/etc/socketley/types/*.toml**, and a development daemon reads **~/.config/socketley/types/*.toml**:
 

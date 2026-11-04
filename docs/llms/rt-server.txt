@@ -95,6 +95,7 @@ Every flag a server runtime takes, by group.
 | `--http` | path | Static files: Serve this directory over HTTP. |
 | `--http-cache` |  | Files in memory: Read the static files into memory at start. |
 | `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. |
+| `--no-inject` |  | Pages as they are: Serve each page exactly as the file holds it, without the WebSocket script. |
 | `--master-pw` | text | Master password: The password that claims master mode. |
 | `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. |
 | `--cache` | text | Cache: A cache runtime its scripts and clients use. |

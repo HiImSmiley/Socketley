@@ -6,8 +6,8 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `-p` | int | Port: The port it listens on (a client: the port of its target). Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
-| `-s` |  | Start now: Start it as soon as it is made. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
+| `-p` | int | Port: The port it listens on (a client: the port of its target). Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp, web. |
+| `-s` |  | Start now: Start it as soon as it is made. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp, web. |
 | `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. Types: server, client, proxy, cache, storage, dns, mqtt, mail. |
 | `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. Types: server, client, proxy, cache, storage, mqtt, mail, mcp. |
 
@@ -15,11 +15,11 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp, web. |
 | `--listen` | text | Unix socket: Listen on a unix socket instead of a port. Types: server, proxy, cache, storage. |
-| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, mcp. |
-| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. Types: server, proxy, cache, storage, idp, db, mail, tunnel, metrics, mcp. |
-| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, metrics, mcp. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, mcp, web. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. Types: server, proxy, cache, storage, idp, db, mail, tunnel, metrics, mcp, web. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, metrics, mcp, web. |
 
 **TLS**
 
@@ -36,7 +36,7 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. Types: server, proxy, cache, storage, idp, db, mqtt, mail, mcp. |
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. Types: server, proxy, cache, storage, idp, db, mqtt, mail, mcp, web. |
 | `--rate-limit` | int | Rate limit: Messages a second per connection. Types: server, proxy, cache. |
 | `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. Types: server, proxy, cache. |
 | `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. Types: server, proxy, cache, storage. |
@@ -50,7 +50,7 @@ Every flag of every runtime type, with the types that take it.
 
 | flag | value | what it does |
 |---|---|---|
-| `--log` | path | State log: A file it appends each state change to. Types: server, client, proxy, cache, storage, dns, mqtt, mail, tunnel, metrics, mcp. |
+| `--log` | path | State log: A file it appends each state change to. Types: server, client, proxy, cache, storage, dns, mqtt, mail, tunnel, metrics, mcp, web. |
 | `-w` | path | Message file: A file every received message is written to. Types: server, client. |
 | `-b` |  | Print messages: Print every received message. Types: server, client. |
 | `-bp` |  | …with name: Print them with the runtime's name before each. Types: server, client. |
@@ -67,6 +67,7 @@ Every flag of every runtime type, with the types that take it.
 | `--http` | path | Static files: Serve this directory over HTTP. Types: server. |
 | `--http-cache` |  | Files in memory: Read the static files into memory at start. Types: server. |
 | `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. Types: server, proxy. |
+| `--no-inject` |  | Pages as they are: Serve each page exactly as the file holds it, without the WebSocket script. Types: server. |
 | `--master-pw` | text | Master password: The password that claims master mode. Types: server. |
 | `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. Types: server. |
 | `--cache` | text | Cache: A cache runtime its scripts and clients use. Types: server. |
@@ -278,6 +279,14 @@ Every flag of every runtime type, with the types that take it.
 | `--instructions` | text | Instructions: What a client is told the server is for. Types: mcp. |
 | `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. Types: mcp. |
 | `--idp-audience` | list | Token clients: The idp's clients whose own access tokens it takes as well. Types: mcp. |
+
+**Web**
+
+| flag | value | what it does |
+|---|---|---|
+| `--root` | path | Document root: The directory whose files are the site. Required. Types: web. |
+| `--index` | text | Index page: The file a directory's address is answered with, index.html unless given. Types: web. |
+| `--fallback` | text | Fallback page: The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise. Types: web. |
 
 **Metrics**
 

@@ -1,0 +1,74 @@
+# web runtime
+
+Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
+
+A **web** runtime serves a directory of files to browsers and does nothing else: no script, no WebSocket, no upload. Put a documentation site, a blog from a static site generator or a single-page app's build behind it.
+
+```
+socketley create web docs -p 9500 --root /srv/docs/current --domain docs -s
+socketley create web www  -p 9501 --root /var/www/html --domain example.com -s
+```
+
+> It speaks plain HTTP and binds `127.0.0.1` unless `--bind` says otherwise. Visitors reach it through the entrance, which adds TLS and HTTP/2 for its `--domain` names. `--tls` and `--lua` are refused.
+
+## What it does
+
+- **Clean addresses**: `/guide/` serves `guide/index.html`, `/about` serves `about.html`, and a missing page gets the site's `404.html`.
+- **Single-page apps**: `--fallback index.html` answers addresses with no file, while a missing `app.js` stays a 404.
+- **Releases without a restart**: `--root` may be a symbolic link; swap it to a new build and the next request is served from it.
+- **Caching done right**: ETag and Last-Modified on every file; names a build stamped with a hash are cached for a year, pages are revalidated.
+- **Compression**: A `.br` or `.gz` copy next to a file is sent when the browser takes it; other text files are compressed once and kept.
+- **Never waits on the disk**: Small files are kept in memory, large ones sent with `sendfile`; inotify sees every change at once.
+- **Nothing leaks**: `..`, links pointing out of `--root` and hidden files (`.env`, `.git/`) are 404, `.well-known` excepted.
+
+## Works with
+
+The entrance [proxy](rt-proxy.txt) of a [dns](rt-dns.txt) runtime gives it HTTPS under its `--domain`; see the [public HTTPS recipe](deploy.txt). For a site that also needs WebSocket or a Lua handler, use a [server](rt-server.txt) with `--http`.
+
+## Flags
+
+Every flag a web runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**Web**
+
+| flag | value | what it does |
+|---|---|---|
+| `--root` | path | Document root: The directory whose files are the site. Required. |
+| `--index` | text | Index page: The file a directory's address is answered with, index.html unless given. |
+| `--fallback` | text | Fallback page: The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise. |
+
+## Benchmarks
+
+No benchmark. Not measured on the current build yet.
+
+## In the manual
+
+Every flag in full, and the rest: man-web-flags.txt

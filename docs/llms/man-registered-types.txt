@@ -2,7 +2,7 @@
 
 From the manual page socketley(1).
 
-A runtime type beyond the built-in fourteen is delivered as a manifest plus a worker binary. The manifest is a declarative file, never code. From it, the daemon learns the type's name, its worker executable and the schema of its configuration keys. The behaviour lives in the binary, which the daemon forks and execs exactly as it does its own workers. No third-party code ever runs in the daemon's process.
+A runtime type beyond the built-in fifteen is delivered as a manifest plus a worker binary. The manifest is a declarative file, never code. From it, the daemon learns the type's name, its worker executable and the schema of its configuration keys. The behaviour lives in the binary, which the daemon forks and execs exactly as it does its own workers. No third-party code ever runs in the daemon's process.
 
 The daemon reads manifests at startup. A system daemon reads **/etc/socketley/types/*.toml**, and a development daemon reads **~/.config/socketley/types/*.toml**:
 

@@ -17,6 +17,7 @@ Object.assign(P, {
   tunnel: '<path d="M3 20v-9a9 9 0 0 1 18 0v9"/><path d="M7.5 20v-8a4.5 4.5 0 0 1 9 0v8M2 20h20"/>',
   mcp: '<rect x="4" y="6" width="16" height="12" rx="3"/><path d="M9 11h.01M15 11h.01M9.5 14.5h5M12 6V3.5M8 21h8"/>',
   storage: '<ellipse cx="12" cy="5.5" rx="8" ry="2.8"/><path d="M4 5.5v13c0 1.5 3.6 2.8 8 2.8s8-1.3 8-2.8v-13M4 12c0 1.5 3.6 2.8 8 2.8s8-1.3 8-2.8"/>',
+  web: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01M8 13h8M8 16.5h5"/>',
   term: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
   book: '<path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v17H6.5A2.5 2.5 0 0 0 4 21.5z"/><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>',
   rocket: '<path d="M5 15c-1.5 1.5-2 5-2 5s3.5-.5 5-2M9 15l-3-3c1-4 5-9 12-9 0 7-5 11-9 12z"/><circle cx="15" cy="9" r="1.5"/>',
@@ -29,6 +30,7 @@ Object.assign(P, {
 
 const RT = [
   ['server', 'TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path', 'nginx'],
+  ['web', 'Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in', ''],
   ['client', 'Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting', ''],
   ['proxy', 'HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI', 'HAProxy, nginx'],
   ['cache', 'In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub', 'Redis, Valkey'],
@@ -48,6 +50,7 @@ const RTI = Object.fromEntries(RT.map(r => [r[0], r]));
 const NOBENCH = {
   client: 'A client runtime holds one connection to somebody else\'s server; there is no other program doing that to set beside it.',
   mail: 'Postfix and Dovecot start their master processes as root, which the measuring machine does not give; not measured.',
+  web: 'Not measured on the current build yet.',
   mcp: 'No MCP server is established enough to measure against on equal terms.',
 };
 
@@ -246,7 +249,7 @@ function foldSec(s, open) {
 }
 
 // ─── flags ─────────────────────────────────────────────────────────────────────────────────────────────────────────
-const LETTER = { server: 'S', client: 'C', proxy: 'P', cache: 'K', storage: 'T', dns: 'D', sync: 'Y', idp: 'I', db: 'B', mqtt: 'M', mail: 'E', tunnel: 'U', metrics: 'R', mcp: 'X' };
+const LETTER = { server: 'S', client: 'C', proxy: 'P', cache: 'K', storage: 'T', dns: 'D', sync: 'Y', idp: 'I', db: 'B', mqtt: 'M', mail: 'E', tunnel: 'U', metrics: 'R', mcp: 'X', web: 'W' };
 // One flag a row: the flag with what it takes, then what it is; a click opens its entry in the manual beneath.
 function flagRow(f, rt, opts = {}) {
   const ref = rt ? f.ref[rt] : (Object.values(f.ref).find(Boolean) || '');

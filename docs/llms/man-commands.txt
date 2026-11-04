@@ -68,7 +68,7 @@ socketley daemon --name new-name   # rename while cluster is active
 
 ### `create type name [flags]`
 
-Create a new runtime instance. *type* is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, or any registered type (see **REGISTERED TYPES**). *name* is a unique identifier for the runtime.
+Create a new runtime instance. *type* is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web, or any registered type (see **REGISTERED TYPES**). *name* is a unique identifier for the runtime.
 
 With **-s** and a **--lua** script, **on_start** runs inside this command. If **on_start** raises an error, the runtime is not taken down. It is created and running, with whatever **on_start** set up before it failed. But the command exits 1 and names the callback and the reason, so a start whose set-up did not run is not reported as a clean one. Fix the script and run **reload-lua** to run it again.
 
@@ -685,7 +685,7 @@ The interactive editor opens a JSON file with the following fields. Fields marke
 |---|---|
 | name | Runtime name **(requires restart)** |
 | id | 6-char hex identifier (read-only, ignored on import) |
-| type | Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp (read-only, ignored on import) |
+| type | Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web (read-only, ignored on import) |
 | was_running | Internal daemon state (ignored on import) |
 
 **Common fields (all types):**

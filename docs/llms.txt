@@ -2,7 +2,7 @@
 
 > One Linux daemon and CLI that runs your servers, proxies, caches, storage, databases, DNS, sign-in, MQTT, mail, metrics, tunnels and MCP: each a runtime made with one command.
 
-socketley is a single Linux binary. `socketley daemon` supervises runtimes; every other invocation is the CLI that talks to the daemon over a unix socket. A runtime is a network service of one of 14 types, made with `socketley create <type> <name> [flags]`, each in its own worker process on an io_uring event loop, scriptable in Lua. The manual page man/socketley.1 is the source of truth; these files are generated from it and from the site's own pages (https://docs.smileygames.online/).
+socketley is a single Linux binary. `socketley daemon` supervises runtimes; every other invocation is the CLI that talks to the daemon over a unix socket. A runtime is a network service of one of 15 types, made with `socketley create <type> <name> [flags]`, each in its own worker process on an io_uring event loop, scriptable in Lua. The manual page man/socketley.1 is the source of truth; these files are generated from it and from the site's own pages (https://docs.smileygames.online/).
 
 Every page below is plain Markdown. llms-full.txt is all of them in one file (large).
 
@@ -17,6 +17,7 @@ Every page below is plain Markdown. llms-full.txt is all of them in one file (la
 ## Runtimes
 
 - [server runtime](llms/rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path
+- [web runtime](llms/rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
 - [client runtime](llms/rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
 - [proxy runtime](llms/rt-proxy.txt): HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI
 - [cache runtime](llms/rt-cache.txt): In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub
@@ -70,6 +71,7 @@ Every page below is plain Markdown. llms-full.txt is all of them in one file (la
 - [Manual: Tunnel flags](llms/man-tunnel-flags.txt): The manual page's Tunnel flags section.
 - [Manual: Metrics flags](llms/man-metrics-flags.txt): The manual page's Metrics flags section.
 - [Manual: MCP flags](llms/man-mcp-flags.txt): The manual page's MCP flags section.
+- [Manual: Web flags](llms/man-web-flags.txt): The manual page's Web flags section.
 - [Manual: Registered types](llms/man-registered-types.txt): The manual page's Registered types section.
 - [Manual: Lua configuration](llms/man-lua-configuration.txt): The manual page's Lua configuration section.
 - [Manual: Dashboard](llms/man-dashboard.txt): The manual page's Dashboard section.
