@@ -29,7 +29,7 @@ socketley is one binary. Started as `socketley daemon` it is the **daemon**: a s
 ```
 
 - **A runtime** is one network service of one type (server, proxy, cache, storage, …) with a name that is unique on the daemon.
-- **Every runtime you create runs in its own worker process.** The worker binds the port, serves every byte and runs the runtime's Lua script. The daemon keeps a placeholder with the name, port and state, so `ls` and `stats` can answer. [Out-of-process runtimes →](man-limitations.txt)
+- **Every runtime you create runs in its own worker process**, the entrance proxy included. The worker binds the port, serves every byte and runs the runtime's Lua script. The daemon keeps a placeholder with the name, port and state, so `ls` and `stats` can answer. The one exception: a server, client, proxy, cache, storage or dns runtime that a Lua script makes with `socketley.create` runs inside the daemon. [Out-of-process runtimes →](man-limitations.txt)
 - **Opening the control socket is an administrative right**: whoever can open it can run code as the daemon's user. That is why the installed socket belongs to the `socketley` group. [The IPC socket →](man-files.txt)
 
 ## What `create` does
@@ -97,7 +97,7 @@ A runtime's JSON file holds its flags and whether it was running. It can hold a 
 | A worker crashes | The daemon restarts it and the runtime stays `running`. What the worker held only in memory is lost: a cache keeps only what `--persistent` saved. Other runtimes release the connections routed to or from it. |
 | It crashes more than five times in ten seconds | The runtime is left `failed` instead of being forked again in a loop. Fix the cause, then `socketley start` it again. |
 | A Lua callback never returns | Its deadline ends it. [Callback deadline →](man-lua-configuration.txt) |
-| The daemon is restarted (`systemctl restart`, or a package upgrade, which restarts a running service) | Every worker stops with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running. |
+| The daemon is restarted (`systemctl restart`, or a package upgrade, which restarts a running service) | Every runtime is stopped with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running. |
 | The daemon itself crashes | Its workers end with it: a worker never outlives its daemon. systemd starts the daemon again after five seconds, and it restores the runtimes as above. |
 | The machine reboots | The service starts at boot and restores the runtimes as above. |
 | The power fails | What was only in memory is gone, and so can be the last writes the kernel had not written to disk yet. A cache's journal is not synced to disk; a storage runtime's `--fsync` decides when its writes are. |

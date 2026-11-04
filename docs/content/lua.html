@@ -20,6 +20,17 @@ end)</pre>
 <x-man s="lua-configuration.global-functions" fold></x-man>
 <x-man s="lua-configuration.runtime-management-api" fold></x-man>
 
+<h2>Making runtimes from a script</h2>
+<p>A script can create, start, stop and remove other runtimes. Each call returns <code>true</code>, or <code>false</code> and a sentence saying why, so <code>assert(...)</code> prints the reason.</p>
+<pre class="code">function on_start()
+    assert(socketley.create("server", "child", { port = 9010, lua = "/etc/socketley/child.lua", start = true }))
+end</pre>
+<ul>
+<li>The new runtime is <b>owned</b> by the one whose script made it (<code>ls</code> shows it under OWNED BY). When the owner stops, it is stopped too; <code>on_parent_stop = "remove"</code> removes it instead.</li>
+<li>A server, client, proxy, cache, storage or dns runtime made this way <b>runs inside the daemon</b>, not in a worker of its own; other types get their own worker as usual.</li>
+<li>A runtime that is <code>failed</code> cannot be started from a script; <code>socketley start</code> on the command line can.</li>
+</ul>
+
 <h2>The rest</h2>
 <x-man s="lua-configuration.configuration-file-format" fold></x-man>
 <x-man s="lua-configuration.a-machine-s-setup" fold></x-man>

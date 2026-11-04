@@ -21,7 +21,7 @@
   event loop on one thread</pre>
 <ul>
 <li><b>A runtime</b> is one network service of one type (server, proxy, cache, storage, …) with a name that is unique on the daemon.</li>
-<li><b>Every runtime you create runs in its own worker process.</b> The worker binds the port, serves every byte and runs the runtime's Lua script. The daemon keeps a placeholder with the name, port and state, so <code>ls</code> and <code>stats</code> can answer. <a href="#/man/limitations">Out-of-process runtimes →</a></li>
+<li><b>Every runtime you create runs in its own worker process</b>, the entrance proxy included. The worker binds the port, serves every byte and runs the runtime's Lua script. The daemon keeps a placeholder with the name, port and state, so <code>ls</code> and <code>stats</code> can answer. The one exception: a server, client, proxy, cache, storage or dns runtime that a Lua script makes with <code>socketley.create</code> runs inside the daemon. <a href="#/man/limitations">Out-of-process runtimes →</a></li>
 <li><b>Opening the control socket is an administrative right</b>: whoever can open it can run code as the daemon's user. That is why the installed socket belongs to the <code>socketley</code> group. <a href="#/man/files">The IPC socket →</a></li>
 </ul>
 
@@ -76,7 +76,7 @@
 <tr><td>A worker crashes</td><td>The daemon restarts it and the runtime stays <code>running</code>. What the worker held only in memory is lost: a cache keeps only what <code>--persistent</code> saved. Other runtimes release the connections routed to or from it.</td></tr>
 <tr><td>It crashes more than five times in ten seconds</td><td>The runtime is left <code>failed</code> instead of being forked again in a loop. Fix the cause, then <code>socketley start</code> it again.</td></tr>
 <tr><td>A Lua callback never returns</td><td>Its deadline ends it. <a href="#/man/lua-configuration">Callback deadline →</a></td></tr>
-<tr><td>The daemon is restarted (<code>systemctl restart</code>, or a package upgrade, which restarts a running service)</td><td>Every worker stops with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running.</td></tr>
+<tr><td>The daemon is restarted (<code>systemctl restart</code>, or a package upgrade, which restarts a running service)</td><td>Every runtime is stopped with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running.</td></tr>
 <tr><td>The daemon itself crashes</td><td>Its workers end with it: a worker never outlives its daemon. systemd starts the daemon again after five seconds, and it restores the runtimes as above.</td></tr>
 <tr><td>The machine reboots</td><td>The service starts at boot and restores the runtimes as above.</td></tr>
 <tr><td>The power fails</td><td>What was only in memory is gone, and so can be the last writes the kernel had not written to disk yet. A cache's journal is not synced to disk; a storage runtime's <code>--fsync</code> decides when its writes are.</td></tr>

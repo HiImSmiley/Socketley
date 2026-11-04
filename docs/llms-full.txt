@@ -355,7 +355,7 @@ socketley is one binary. Started as `socketley daemon` it is the **daemon**: a s
 ```
 
 - **A runtime** is one network service of one type (server, proxy, cache, storage, …) with a name that is unique on the daemon.
-- **Every runtime you create runs in its own worker process.** The worker binds the port, serves every byte and runs the runtime's Lua script. The daemon keeps a placeholder with the name, port and state, so `ls` and `stats` can answer. [Out-of-process runtimes →](man-limitations.txt)
+- **Every runtime you create runs in its own worker process**, the entrance proxy included. The worker binds the port, serves every byte and runs the runtime's Lua script. The daemon keeps a placeholder with the name, port and state, so `ls` and `stats` can answer. The one exception: a server, client, proxy, cache, storage or dns runtime that a Lua script makes with `socketley.create` runs inside the daemon. [Out-of-process runtimes →](man-limitations.txt)
 - **Opening the control socket is an administrative right**: whoever can open it can run code as the daemon's user. That is why the installed socket belongs to the `socketley` group. [The IPC socket →](man-files.txt)
 
 ## What `create` does
@@ -423,7 +423,7 @@ A runtime's JSON file holds its flags and whether it was running. It can hold a 
 | A worker crashes | The daemon restarts it and the runtime stays `running`. What the worker held only in memory is lost: a cache keeps only what `--persistent` saved. Other runtimes release the connections routed to or from it. |
 | It crashes more than five times in ten seconds | The runtime is left `failed` instead of being forked again in a loop. Fix the cause, then `socketley start` it again. |
 | A Lua callback never returns | Its deadline ends it. [Callback deadline →](man-lua-configuration.txt) |
-| The daemon is restarted (`systemctl restart`, or a package upgrade, which restarts a running service) | Every worker stops with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running. |
+| The daemon is restarted (`systemctl restart`, or a package upgrade, which restarts a running service) | Every runtime is stopped with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running. |
 | The daemon itself crashes | Its workers end with it: a worker never outlives its daemon. systemd starts the daemon again after five seconds, and it restores the runtimes as above. |
 | The machine reboots | The service starts at boot and restores the runtimes as above. |
 | The power fails | What was only in memory is gone, and so can be the last writes the kernel had not written to disk yet. A cache's journal is not synced to disk; a storage runtime's `--fsync` decides when its writes are. |
@@ -745,6 +745,20 @@ Called when the member count of a group changes (cluster only).
 
 - More in the manual: **Runtime Management API** (man-lua-configuration.txt): Create, start, stop, and remove runtimes from Lua scripts: socketley.create(type, name, config) -- Create runtime socketley.start(name) -- Start runtime socketley.stop(name) -- Stop runtime socketley.
 
+## Making runtimes from a script
+
+A script can create, start, stop and remove other runtimes. Each call returns `true`, or `false` and a sentence saying why, so `assert(...)` prints the reason.
+
+```
+function on_start()
+    assert(socketley.create("server", "child", { port = 9010, lua = "/etc/socketley/child.lua", start = true }))
+end
+```
+
+- The new runtime is **owned** by the one whose script made it (`ls` shows it under OWNED BY). When the owner stops, it is stopped too; `on_parent_stop = "remove"` removes it instead.
+- A server, client, proxy, cache, storage or dns runtime made this way **runs inside the daemon**, not in a worker of its own; other types get their own worker as usual.
+- A runtime that is `failed` cannot be started from a script; `socketley start` on the command line can.
+
 ## The rest
 
 - More in the manual: **Configuration File Format** (man-lua-configuration.txt): -- Optional: configure the daemon itself daemon = { name = "node1", cluster = "/shared/cluster" } runtimes = { { type = "server", name = "api", port = 9000, group = "api", config = "handler.lua", star
@@ -889,8 +903,8 @@ The day-to-day questions once runtimes are running: is it up, where is the log, 
 
 | Command | Shows |
 |---|---|
-| `socketley ls` | Every runtime with its state and port. A `failed` runtime shows why. |
-| `socketley ps` | The same with uptime and connections. `(N restarts)` means the worker died and was replaced N times; `NOT RESPONDING` means it is alive but stuck. |
+| `socketley ls` | Every runtime with its port, connections and status. A running one shows its uptime and notes: `(N restarts)` means its worker died and was replaced N times; `NOT RESPONDING` means it is alive but stuck. A `failed` one shows why. |
+| `socketley ps` | The same, for running runtimes only; `ps -a` shows them all. |
 | `socketley stats name` | Live counters of one runtime: connections, messages, bytes, and its type's own figures. |
 | `socketley daemon stats` | The daemon's own figures. |
 
@@ -917,6 +931,15 @@ journalctl -u socketley --since "10 min ago"
 
 A worker that crashed loses what it held only in memory. A cache keeps what `--persistent` saved; see [How it works](how.txt).
 
+## Slow under load
+
+Look in this order:
+
+1. **A Lua call that waits** in a callback that cannot wait, typically `socketley.http` in `on_http_request`, holds up every client of that runtime. See **What blocks a runtime** below.
+2. **One core is full.** A worker uses one core; `socketley stats name` and the dashboard show its CPU. Near one full core, the runtime is at its limit: `--shards N` spreads it over N workers, though not every workload gains (see [sharding](man-server-flags.txt)).
+3. **A slow backend behind a proxy.** A backend that has not begun its answer within `--backend-timeout` (2 seconds by default) gets the client a 504. After five errors in a row, its circuit breaker opens and requests to it fail at once for a while.
+4. **A limit you set.** `--max-connections`, `--rate-limit` and `--global-rate-limit` refuse or slow clients by design.
+
 ## Restarts and upgrades
 
 - **A package upgrade restarts the service** if it was running, onto the new binary. Restarting the daemon stops every worker, so connections close for the moment it takes; the runtimes then come back as they were.
@@ -927,7 +950,7 @@ Everything else that can happen, and what survives it, is in the table under [Ho
 
 ## `NOT RESPONDING`: a stuck worker
 
-`ps` says this when a worker has said nothing for fifteen seconds while using at least half a core. It is almost always a Lua callback that does not return. Its [deadline](man-lua-configuration.txt) (10 seconds by default) ends the callback; nothing is killed for being slow.
+`ls` and `ps` show this when a worker has said nothing for fifteen seconds while using at least half a core. It is almost always a Lua callback that does not return. Its [deadline](man-lua-configuration.txt) (10 seconds by default) ends the callback; nothing is killed for being slow.
 
 ## What blocks a runtime
 

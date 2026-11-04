@@ -8,8 +8,8 @@ The day-to-day questions once runtimes are running: is it up, where is the log, 
 
 | Command | Shows |
 |---|---|
-| `socketley ls` | Every runtime with its state and port. A `failed` runtime shows why. |
-| `socketley ps` | The same with uptime and connections. `(N restarts)` means the worker died and was replaced N times; `NOT RESPONDING` means it is alive but stuck. |
+| `socketley ls` | Every runtime with its port, connections and status. A running one shows its uptime and notes: `(N restarts)` means its worker died and was replaced N times; `NOT RESPONDING` means it is alive but stuck. A `failed` one shows why. |
+| `socketley ps` | The same, for running runtimes only; `ps -a` shows them all. |
 | `socketley stats name` | Live counters of one runtime: connections, messages, bytes, and its type's own figures. |
 | `socketley daemon stats` | The daemon's own figures. |
 
@@ -36,6 +36,15 @@ journalctl -u socketley --since "10 min ago"
 
 A worker that crashed loses what it held only in memory. A cache keeps what `--persistent` saved; see [How it works](how.txt).
 
+## Slow under load
+
+Look in this order:
+
+1. **A Lua call that waits** in a callback that cannot wait, typically `socketley.http` in `on_http_request`, holds up every client of that runtime. See **What blocks a runtime** below.
+2. **One core is full.** A worker uses one core; `socketley stats name` and the dashboard show its CPU. Near one full core, the runtime is at its limit: `--shards N` spreads it over N workers, though not every workload gains (see [sharding](man-server-flags.txt)).
+3. **A slow backend behind a proxy.** A backend that has not begun its answer within `--backend-timeout` (2 seconds by default) gets the client a 504. After five errors in a row, its circuit breaker opens and requests to it fail at once for a while.
+4. **A limit you set.** `--max-connections`, `--rate-limit` and `--global-rate-limit` refuse or slow clients by design.
+
 ## Restarts and upgrades
 
 - **A package upgrade restarts the service** if it was running, onto the new binary. Restarting the daemon stops every worker, so connections close for the moment it takes; the runtimes then come back as they were.
@@ -46,7 +55,7 @@ Everything else that can happen, and what survives it, is in the table under [Ho
 
 ## `NOT RESPONDING`: a stuck worker
 
-`ps` says this when a worker has said nothing for fifteen seconds while using at least half a core. It is almost always a Lua callback that does not return. Its [deadline](man-lua-configuration.txt) (10 seconds by default) ends the callback; nothing is killed for being slow.
+`ls` and `ps` show this when a worker has said nothing for fifteen seconds while using at least half a core. It is almost always a Lua callback that does not return. Its [deadline](man-lua-configuration.txt) (10 seconds by default) ends the callback; nothing is killed for being slow.
 
 ## What blocks a runtime
 

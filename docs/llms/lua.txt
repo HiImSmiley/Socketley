@@ -299,6 +299,20 @@ Called when the member count of a group changes (cluster only).
 
 - More in the manual: **Runtime Management API** (man-lua-configuration.txt): Create, start, stop, and remove runtimes from Lua scripts: socketley.create(type, name, config) -- Create runtime socketley.start(name) -- Start runtime socketley.stop(name) -- Stop runtime socketley.
 
+## Making runtimes from a script
+
+A script can create, start, stop and remove other runtimes. Each call returns `true`, or `false` and a sentence saying why, so `assert(...)` prints the reason.
+
+```
+function on_start()
+    assert(socketley.create("server", "child", { port = 9010, lua = "/etc/socketley/child.lua", start = true }))
+end
+```
+
+- The new runtime is **owned** by the one whose script made it (`ls` shows it under OWNED BY). When the owner stops, it is stopped too; `on_parent_stop = "remove"` removes it instead.
+- A server, client, proxy, cache, storage or dns runtime made this way **runs inside the daemon**, not in a worker of its own; other types get their own worker as usual.
+- A runtime that is `failed` cannot be started from a script; `socketley start` on the command line can.
+
 ## The rest
 
 - More in the manual: **Configuration File Format** (man-lua-configuration.txt): -- Optional: configure the daemon itself daemon = { name = "node1", cluster = "/shared/cluster" } runtimes = { { type = "server", name = "api", port = 9000, group = "api", config = "handler.lua", star
