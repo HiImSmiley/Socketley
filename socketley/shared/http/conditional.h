@@ -155,7 +155,9 @@ inline bool if_range_holds(std::string_view if_range, std::string_view etag, int
         return true;
     if (if_range.size() == etag.size() + 2 && if_range.front() == '"' && if_range.back() == '"')
         return if_range.substr(1, etag.size()) == etag;
-    return mtime_s >= 0 && if_range.front() != 'W' && if_range.front() != '"' && parse_http_date(if_range) == mtime_s;
+    // A weak ETag is "W/", not a "W": a date on a Wednesday begins with one too.
+    return mtime_s >= 0 && !if_range.starts_with("W/") && if_range.front() != '"' &&
+           parse_http_date(if_range) == mtime_s;
 }
 
 // RFC 9110 13.2.2 in the order it fixes: If-Match, If-Unmodified-Since, If-None-Match, If-Modified-Since.

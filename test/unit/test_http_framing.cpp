@@ -214,6 +214,21 @@ TEST_CASE("an HTTP date is gmtime's, for every second it is asked of")
     CHECK(same == 200000);
 }
 
+TEST_CASE("If-Range holds for the answer's date on every day of the week, and never for a weak tag")
+{
+    // 2026-11-01, a Sunday, and the six days after it.
+    for (int64_t s = 1793491200; s < 1793491200 + 7 * 86400; s += 86400 + 3601)
+    {
+        const std::string date = socketley::http::http_date_of(s);
+        CHECK(socketley::http::if_range_holds(date, "abc", s));
+        CHECK_FALSE(socketley::http::if_range_holds(date, "abc", s + 1));
+        CHECK_FALSE(socketley::http::if_range_holds(date, "abc", -1));
+    }
+    CHECK(socketley::http::if_range_holds("\"abc\"", "abc", -1));
+    CHECK_FALSE(socketley::http::if_range_holds("W/\"abc\"", "abc", 0));
+    CHECK_FALSE(socketley::http::if_range_holds("\"abd\"", "abc", -1));
+}
+
 TEST_CASE("a file's ETag is its inode, time and size in hex, as %llx writes them")
 {
     std::mt19937_64 rng(3);
