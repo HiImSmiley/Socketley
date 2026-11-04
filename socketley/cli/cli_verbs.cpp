@@ -73,7 +73,6 @@ constexpr verb verbs[] = {
     {"metrics", "stats", "metrics", shape::name_verb_rest, {}, "stats"},
     {"server", "send", "send", shape::name_rest, {}, "send <message>"},
     {"client", "send", "send", shape::name_rest, {}, "send <message>"},
-    {"proxy", "send", "send", shape::name_rest, {}, "send <message>"},
 };
 
 // What every runtime answers to, whatever its type, run as the command of the same name.
@@ -85,7 +84,7 @@ constexpr std::string_view cache_verbs[] = {
     "get", "set", "del", "exists", "incr", "decr", "incrby", "decrby", "append", "mget", "mset", "keys", "size",
     "expire", "ttl", "persist", "lpush", "rpush", "lpop", "rpop", "llen", "lrange", "lindex", "sadd", "srem",
     "sismember", "scard", "smembers", "hset", "hget", "hdel", "hlen", "hgetall", "publish", "flush", "load",
-    "memory", "send"};
+    "memory"};
 
 // The type of the runtime `name`, empty when the daemon has none of that name.
 std::string type_of(std::string_view name)
