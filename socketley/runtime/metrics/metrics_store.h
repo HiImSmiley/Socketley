@@ -12,7 +12,7 @@
 // Every public member is called from one thread, the runtime's loop.
 // One background thread cuts, merges and downsamples, reading only what is immutable once handed to it.
 // What it makes is swapped in by tick(), and the loop waits for it nowhere but in stop().
-// A reference from labels() lives as long as the store; the vectors the queries fill are the caller's.
+// A reference from labels() lives until forget_labels(); the vectors the queries fill are the caller's.
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -107,7 +107,14 @@ public:
     // ── series_source ──
     void select(std::span<const matcher> ms, int64_t mint, int64_t maxt, std::vector<uint32_t>& out) override;
     const label_set& labels(uint32_t id) const override;
+    void copy_labels(uint32_t id, label_set& out) const override;
+    // What labels() made given back, which a request or a round of rules calls once nothing holds its references.
+    void forget_labels();
+    // The pages of the head's full pages and of the blocks that reads mapped in, back to the page cache.
+    void let_go_pages();
     void samples(uint32_t id, int64_t mint, int64_t maxt, std::vector<sample>& out) override;
+    // A read keeps its walk of the head in a buffer of its thread, and blocks are read-only once written.
+    bool concurrent_samples() const override { return true; }
     int64_t tier_for(int64_t mint, int64_t resolution) const override;
     void aggregates(uint32_t id, int64_t step, int64_t mint, int64_t maxt, std::vector<agg_point>& out) override;
     void label_names(std::vector<std::string>& out) const override;

@@ -57,6 +57,8 @@ public:
     int64_t maxt() const { return m_maxt; }
     uint64_t file_bytes() const { return m_size; }
     uint32_t count() const { return m_nseries; }
+    // The pages reads brought in back to the page cache, from where the next read brings them again.
+    void let_go() const;
 
     void labels(uint32_t local, label_set& out) const;
 

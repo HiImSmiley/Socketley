@@ -1208,8 +1208,10 @@ struct store::impl
                 break;
             if (w->start + block_ms < mint)
                 continue;
-            w->chain_of(id, chain, mint);
-            for (const uint64_t c : chain)
+            // The thread's own walk, so queries split over threads share nothing they write.
+            thread_local std::vector<uint64_t> walk;
+            w->chain_of(id, walk, mint);
+            for (const uint64_t c : walk)
             {
                 const head_chunk hc = w->chunk(c);
                 if (hc.maxt >= mint && hc.mint <= maxt)
@@ -1765,6 +1767,30 @@ const label_set& store::labels(uint32_t id) const
 {
     static const label_set none;
     return id < m->index.size() ? m->index.labels(id) : none;
+}
+
+void store::copy_labels(uint32_t id, label_set& out) const
+{
+    if (id < m->index.size())
+        m->index.copy_labels(id, out);
+    else
+        out.clear();
+}
+
+void store::forget_labels()
+{
+    m->index.forget_labels();
+}
+
+void store::let_go_pages()
+{
+    // A window's last page is the one being filled.
+    for (const auto& w : m->windows)
+        for (size_t i = 0; i + 1 < w->pages.size(); ++i)
+            w->pages[i].let_go();
+    for (const auto& level : m->blocks)
+        for (const auto& b : level)
+            b->let_go();
 }
 
 void store::samples(uint32_t id, int64_t mint, int64_t maxt, std::vector<sample>& out)

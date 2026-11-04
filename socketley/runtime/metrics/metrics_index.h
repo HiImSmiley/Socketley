@@ -70,8 +70,11 @@ public:
     uint32_t add(const label_set& ls);
     uint32_t size() const { return static_cast<uint32_t>(m_ser_off.size() - 1); }
 
-    // The labels of `id`, made on the first ask and kept, so the reference lives as long as the index.
+    // The labels of `id`, made on the first ask and kept, so the reference lives until forget_labels().
     const label_set& labels(uint32_t id) const;
+    void copy_labels(uint32_t id, label_set& out) const;
+    // The label sets labels() made, given back: a query over every series made one for each of them.
+    void forget_labels();
 
     // Each label of `id` handed to `f(name, value)` in name order, the views valid until the next add().
     template <class F>

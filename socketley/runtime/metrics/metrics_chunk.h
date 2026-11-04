@@ -102,6 +102,22 @@ public:
         return true;
     }
 
+    // The 64 bits from the read position on, left-aligned, of which the first peekable() are the stream's; false where
+    // fewer than eight bytes are left.
+    bool peek(uint64_t& w) const
+    {
+        const size_t byte = m_pos >> 3;
+        if (byte + 8 > m_bytes)
+            return false;
+        std::memcpy(&w, m_p + byte, 8);
+        if constexpr (std::endian::native == std::endian::little)
+            w = std::byteswap(w);
+        w <<= m_pos & 7;
+        return true;
+    }
+    unsigned peekable() const { return 64 - static_cast<unsigned>(m_pos & 7); }
+    void skip(unsigned n) { m_pos += n; }
+
     bool bit(bool& out)
     {
         if (m_pos >= m_bits)

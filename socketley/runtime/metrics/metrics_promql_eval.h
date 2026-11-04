@@ -46,6 +46,8 @@ struct eval_scratch
     std::vector<agg_point> points;
     std::vector<double> row;
     std::vector<double> qbuf;
+    // A counter's resets summed up to each sample, so rate() over a window is one difference, not a walk.
+    std::vector<double> resets;
 };
 
 int  compare_labels(const label_set& a, const label_set& b);
@@ -70,8 +72,9 @@ private:
     void     release(uint64_t n);
     uint64_t held(const value& v) const { return v.vec.size() * m_n; }
     void     tick(uint64_t work);
-    void     select(const expr_node& sel, int64_t mint, int64_t maxt, std::vector<uint32_t>& ids);
-    void     emit_row(value& out, const label_set& labels, bool drop);
+    void     select(const expr_node& sel, int64_t mint, int64_t maxt, std::vector<uint32_t>& ids, bool any_order);
+    void     emit_row(value& out, uint32_t id, bool drop);
+    void     emit_row(value& out, label_set labels, bool drop);
     void     dedupe(std::vector<vseries>& vec);
     void     drop_empty(std::vector<vseries>& vec);
     value    scalar_value(double v) const;
@@ -82,12 +85,19 @@ private:
 
     value vector_selector(const expr_node& e, bool timestamps);
     value range_call(const expr_node& e);
-    double raw_window(fn f, std::span<const sample> w, int64_t t, int64_t te, int64_t range, double arg);
+    void raw_row(fn f, uint32_t id, int64_t t0, int64_t t1, int64_t range, const value& arg, std::vector<sample>& smp,
+                 std::vector<double>& rs, double* row, uint64_t& read, uint64_t& work);
+    // `resets`, where given, is what the window's counter resets add, summed already.
+    double raw_window(fn f, std::span<const sample> w, int64_t t, int64_t te, int64_t range, double arg,
+                      const double* resets = nullptr);
     double tier_window(fn f, std::span<const agg_point> w, int64_t range, int64_t range_eff);
     label_set absent_labels(const expr_node& e);
 
     value call(const expr_node& e);
     value aggregate(const expr_node& e);
+    struct fold;
+    // A row of `id` into the groups of the aggregation above, in place of a row of the vector.
+    void fold_row(fold& fd, uint32_t id, bool drop, const double* v);
     value binary(const expr_node& e);
     value set_op(const expr_node& e, value& l, value& r);
     value vector_op(const expr_node& e, value& l, value& r);
@@ -105,6 +115,10 @@ private:
     uint64_t m_live{0};
     uint64_t m_work{0};
     uint64_t m_next_check{0};
+    // Set by an aggregation no order of its input changes for the selector or range function it evaluates directly,
+    // and taken by it: that one reads its series by id, and a range function folds them into these groups.
+    bool m_any_order{false};
+    fold* m_fold{nullptr};
     std::chrono::steady_clock::time_point m_deadline;
 };
 

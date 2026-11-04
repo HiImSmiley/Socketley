@@ -1,3 +1,8 @@
+#include <sched.h>
+#include <exception>
+#include <system_error>
+#include <thread>
+#include <utility>
 #include "metrics_promql_eval.h"
 
 #include "metrics_regex.h"
@@ -115,6 +120,116 @@ bool listed(const std::vector<std::string>& names, std::string_view n)
 {
     return std::find(names.begin(), names.end(), n) != names.end();
 }
+
+// Whether an aggregation keeps label `l` of a series: what `by` lists or `without` does not, the name never.
+bool grouped(const expr_node& e, const label& l)
+{
+    const bool in_list = listed(e.grouping, l.name);
+    return e.without ? (!in_list && l.name != name_label) : in_list;
+}
+
+// The group of a series with labels `ls` under aggregation `e`, made when new; `skip` names a label left out.
+uint32_t group_of(const expr_node& e, const label_set& ls, std::string_view skip,
+                  std::unordered_map<std::string, uint32_t>& groups, std::vector<label_set>& glabels, std::string& key)
+{
+    key.clear();
+    for (const auto& l : ls)
+        if (l.name != skip && grouped(e, l))
+            key_into(key, l);
+    auto [it, fresh] = groups.try_emplace(key, static_cast<uint32_t>(glabels.size()));
+    if (fresh)
+    {
+        label_set g;
+        for (const auto& l : ls)
+            if (l.name != skip && grouped(e, l))
+                g.push_back(l);
+        glabels.push_back(std::move(g));
+    }
+    return it->second;
+}
+
+// One group's running value at one step under sum, avg, count, min, max, group, stddev, stdvar or quantile.
+struct agg_state
+{
+    double value, mean, c, count;
+    bool incremental;
+
+    void start(agg_op op, double f)
+    {
+        *this = {f, f, 0, 1, false};
+        if (op == agg_op::stddev || op == agg_op::stdvar)
+            value = 0;
+        else if (op == agg_op::group)
+            value = 1;
+    }
+
+    void add(agg_op op, double f)
+    {
+        switch (op)
+        {
+            case agg_op::sum: kahan_inc(f, value, c); break;
+            case agg_op::avg:
+            {
+                count += 1;
+                if (!incremental)
+                {
+                    double nv = value, nc = c;
+                    kahan_inc(f, nv, nc);
+                    if (!std::isinf(nv))
+                    {
+                        value = nv;
+                        c = nc;
+                        break;
+                    }
+                    incremental = true;
+                    mean = value / (count - 1);
+                    c /= count - 1;
+                }
+                if (std::isinf(mean))
+                {
+                    if (std::isinf(f) && (mean > 0) == (f > 0))
+                        break;
+                    if (!std::isinf(f) && !std::isnan(f))
+                        break;
+                }
+                const double cur = mean + c;
+                kahan_inc(f / count - cur / count, mean, c);
+                break;
+            }
+            case agg_op::max:
+                if (value < f || std::isnan(value))
+                    value = f;
+                break;
+            case agg_op::min:
+                if (value > f || std::isnan(value))
+                    value = f;
+                break;
+            case agg_op::count: count += 1; break;
+            case agg_op::stddev: case agg_op::stdvar:
+            {
+                count += 1;
+                const double delta = f - mean;
+                mean += delta / count;
+                value += delta * (f - mean);
+                break;
+            }
+            default: break;
+        }
+    }
+
+    double result(agg_op op) const
+    {
+        switch (op)
+        {
+            case agg_op::sum: return value + c;
+            case agg_op::avg: return incremental ? mean + c : (value + c) / count;
+            case agg_op::count: return count;
+            case agg_op::stdvar: return value / count;
+            case agg_op::stddev: return std::sqrt(value / count);
+            default: return value;
+        }
+    }
+};
 
 bool is_comparison(bin_op o) { return o >= bin_op::eq && o <= bin_op::le; }
 bool is_arithmetic(bin_op o) { return o <= bin_op::atan2; }
@@ -316,13 +431,15 @@ void linear_regression(std::span<const sample> w, int64_t intercept_t, double& s
 
 // Prometheus's extrapolatedRate: the change across the window, stretched to its edges where the samples reach them.
 double extrapolated(std::span<const sample> w, int64_t range_start, int64_t range_end, int64_t range_ms,
-                    bool counter, bool rate)
+                    bool counter, bool rate, const double* resets = nullptr)
 {
     if (w.size() < 2)
         return hole();
     const int64_t first_t = w.front().t, last_t = w.back().t;
     double result = w.back().v - w.front().v;
-    if (counter)
+    if (counter && resets)
+        result += *resets;
+    else if (counter)
     {
         double last = 0;
         for (const auto& s : w)
@@ -611,30 +728,37 @@ void evaluator::tick(uint64_t work)
         throw eval_fail{"timeout", "query timed out in expression evaluation"};
 }
 
-void evaluator::select(const expr_node& sel, int64_t mint, int64_t maxt, std::vector<uint32_t>& ids)
+void evaluator::select(const expr_node& sel, int64_t mint, int64_t maxt, std::vector<uint32_t>& ids, bool any_order)
 {
     ids.clear();
     m_src.select(sel.matchers, mint, maxt, ids);
-    std::sort(ids.begin(), ids.end(),
-              [&](uint32_t a, uint32_t b) { return compare_labels(m_src.labels(a), m_src.labels(b)) < 0; });
+    // By labels where the order is the answer's; by id under an aggregation it cannot change, which sorts numbers
+    // instead of 50,000 label sets for a dashboard's sum by (code).
+    if (any_order)
+        std::sort(ids.begin(), ids.end());
+    else
+        std::sort(ids.begin(), ids.end(),
+                  [&](uint32_t a, uint32_t b) { return compare_labels(m_src.labels(a), m_src.labels(b)) < 0; });
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     tick(ids.size());
 }
 
-void evaluator::emit_row(value& out, const label_set& labels, bool drop)
+void evaluator::emit_row(value& out, uint32_t id, bool drop)
+{
+    if (std::all_of(m_sc.row.begin(), m_sc.row.end(), [](double v) { return is_hole(v); }))
+        return;
+    label_set ls;
+    m_src.copy_labels(id, ls);
+    emit_row(out, std::move(ls), drop);
+}
+
+void evaluator::emit_row(value& out, label_set labels, bool drop)
 {
     const auto& row = m_sc.row;
-    bool any = false;
-    for (double v : row)
-        if (!is_hole(v))
-        {
-            any = true;
-            break;
-        }
-    if (!any)
+    if (std::all_of(row.begin(), row.end(), [](double v) { return is_hole(v); }))
         return;
     charge(m_n);
-    out.vec.push_back({labels, row});
+    out.vec.push_back({std::move(labels), row});
     if (drop)
         drop_name(out.vec.back().labels);
 }
@@ -699,6 +823,7 @@ int64_t evaluator::plan_range(fn f, int64_t range, int64_t t0, int64_t& range_ef
 
 value evaluator::vector_selector(const expr_node& e, bool timestamps)
 {
+    const bool any_order = std::exchange(m_any_order, false);
     value out;
     out.type = V::vector;
     const int64_t t0 = m_start - e.offset_ms, t1 = m_end - e.offset_ms;
@@ -710,7 +835,7 @@ value evaluator::vector_selector(const expr_node& e, bool timestamps)
     if (s)
     {
         ++m_stats.tier_selectors;
-        select(e, t0 - s, t1, ids);
+        select(e, t0 - s, t1, ids, any_order);
         auto& pts = m_sc.points;
         const bool per_step = tier_per_step(s);
         for (uint32_t id : ids)
@@ -748,13 +873,13 @@ value evaluator::vector_selector(const expr_node& e, bool timestamps)
             }
             m_stats.tier_points += work;
             tick(work + m_n);
-            emit_row(out, m_src.labels(id), false);
+            emit_row(out, id, false);
         }
         return out;
     }
     ++m_stats.raw_selectors;
     const int64_t lb = m_lim.lookback_ms;
-    select(e, t0 - lb + 1, t1, ids);
+    select(e, t0 - lb + 1, t1, ids, any_order);
     auto& smp = m_sc.samples;
     // Lookbacks shorter than the step leave gaps, so each is read alone and no sample between them is decoded.
     const bool per_step = m_step > lb;
@@ -796,17 +921,18 @@ value evaluator::vector_selector(const expr_node& e, bool timestamps)
         }
         m_stats.raw_samples += work;
         tick(work + m_n);
-        emit_row(out, m_src.labels(id), timestamps);
+        emit_row(out, id, timestamps);
     }
     return out;
 }
 
-double evaluator::raw_window(fn f, std::span<const sample> w, int64_t t, int64_t te, int64_t range, double arg)
+double evaluator::raw_window(fn f, std::span<const sample> w, int64_t t, int64_t te, int64_t range, double arg,
+                             const double* resets)
 {
     switch (f)
     {
-        case fn::rate: return extrapolated(w, te - range, te, range, true, true);
-        case fn::increase: return extrapolated(w, te - range, te, range, true, false);
+        case fn::rate: return extrapolated(w, te - range, te, range, true, true, resets);
+        case fn::increase: return extrapolated(w, te - range, te, range, true, false, resets);
         case fn::delta: return extrapolated(w, te - range, te, range, false, false);
         case fn::irate: return instant_value(w, true);
         case fn::idelta: return instant_value(w, false);
@@ -961,8 +1087,92 @@ label_set evaluator::absent_labels(const expr_node& e)
     return out;
 }
 
+namespace
+{
+
+// Below this many series a range is read on the loop's thread alone, where starting threads would cost more than they
+// save.
+constexpr size_t parallel_min = 8192;
+
+// The cores this process may run on, at most four: a query is split over them.
+unsigned query_threads()
+{
+    static const unsigned n = [] {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (::sched_getaffinity(0, sizeof set, &set) != 0)
+            return 1u;
+        return std::min(4u, static_cast<unsigned>(CPU_COUNT(&set)));
+    }();
+    return n;
+}
+
+}   // namespace
+
+// One series' row for a range function over raw samples: read once from t0 - range to t1, each step's window found by
+// two cursors.  Reads and writes only what it is handed, and raw_window, so threads may run it side by side.
+void evaluator::raw_row(fn f, uint32_t id, int64_t t0, int64_t t1, int64_t range, const value& arg,
+                        std::vector<sample>& smp, std::vector<double>& rs, double* row, uint64_t& read, uint64_t& work)
+{
+    const int64_t step = m_step > 0 ? m_step : 0;
+    smp.clear();
+    m_src.samples(id, t0 - range + 1, t1, smp);
+    read += smp.size();
+    // A range keeps no staleness marker, which only ends what an instant selector sees.
+    std::erase_if(smp, [](const sample& x) { return is_stale(x.v); });
+    // A counter's resets summed once for the series, as extrapolated() adds them up in each window.
+    const bool counter = f == fn::rate || f == fn::increase;
+    if (counter)
+    {
+        rs.resize(smp.size());
+        double acc = 0;
+        for (size_t i = 0; i < smp.size(); ++i)
+        {
+            if (i > 0 && smp[i].v < smp[i - 1].v)
+                acc += smp[i - 1].v;
+            rs[i] = acc;
+        }
+    }
+    size_t lo = 0, hi = 0;
+    work += smp.size();
+    for (size_t k = 0; k < m_n; ++k)
+    {
+        const int64_t te = t0 + static_cast<int64_t>(k) * step;
+        while (hi < smp.size() && smp[hi].t <= te)
+            ++hi;
+        while (lo < hi && smp[lo].t <= te - range)
+            ++lo;
+        if (lo == hi)
+            continue;
+        const double window_resets = counter ? rs[hi - 1] - rs[lo] : 0;
+        row[k] = raw_window(f, std::span<const sample>(smp).subspan(lo, hi - lo), m_start + static_cast<int64_t>(k) * step,
+                            te, range, arg.s.empty() ? 0 : arg.s[k], counter ? &window_resets : nullptr);
+        work += hi - lo;
+    }
+}
+
+struct evaluator::fold
+{
+    fold(const expr_node& agg, agg_op o) : e(agg), op(o) {}
+
+    const expr_node& e;
+    agg_op op;
+    std::unordered_map<std::string, uint32_t> groups;
+    std::vector<label_set> glabels;
+    // Per group, its state and whether it has one at each step, at [group * steps + step].
+    std::vector<agg_state> st;
+    std::vector<uint8_t> seen;
+    label_set ls;
+    std::string key;
+    // What the rows folded would have held, charged as they would have been.
+    uint64_t held{0};
+    bool used{false};
+};
+
 value evaluator::range_call(const expr_node& e)
 {
+    fold* fd = std::exchange(m_fold, nullptr);
+    const bool any_order = std::exchange(m_any_order, false);
     const fn f = e.func->id;
     const size_t mi = f == fn::quantile_over_time ? 1 : 0;
     const expr_node& ms = unparen(*e.args[mi]);
@@ -976,7 +1186,7 @@ value evaluator::range_call(const expr_node& e)
     int64_t range_eff = range;
     const int64_t s = plan_range(f, range, t0, range_eff);
     std::vector<uint32_t> ids;
-    select(ms, t0 - range + 1, t1, ids);
+    select(ms, t0 - range + 1, t1, ids, any_order);
     auto& row = m_sc.row;
     row.resize(m_n);
     value out;
@@ -985,12 +1195,86 @@ value evaluator::range_call(const expr_node& e)
     if (f == fn::absent_over_time)
         any.assign(m_n, 0);
     const bool drop = f != fn::last_over_time;
+    // Series of one name are told apart by the rest of their labels, so dropping the name leaves nothing to merge.
+    const bool one_name = std::any_of(ms.matchers.begin(), ms.matchers.end(), [](const matcher& m) {
+        return m.name == "__name__" && m.op == match_op::eq;
+    });
+    // Rows that dedupe could refuse are made, so that the aggregation above refuses them as it always has.
+    if (fd && (f == fn::absent_over_time || (drop && !one_name)))
+        fd = nullptr;
+    if (fd)
+        fd->used = true;
+    auto put = [&](uint32_t id, const double* v) {
+        if (fd)
+            fold_row(*fd, id, drop, v);
+        else
+        {
+            std::copy_n(v, m_n, row.begin());
+            emit_row(out, id, drop);
+        }
+    };
     // Windows shorter than the step leave gaps, so each is read alone and no sample between them is decoded.
     const bool per_step = m_step > range;
     if (s)
         ++m_stats.tier_selectors;
     else
         ++m_stats.raw_selectors;
+    // A range over many series reads them on every core the runtime has: decoding is most of what a dashboard's query
+    // costs, the loop waits on the query anyway, and nothing is appended meanwhile.
+    if (!s && !per_step && f != fn::absent_over_time && f != fn::quantile_over_time && ids.size() >= parallel_min &&
+        m_src.concurrent_samples())
+        if (const unsigned threads = query_threads(); threads > 1)
+        {
+            std::vector<double> mat(ids.size() * m_n, hole());
+            charge(mat.size());
+            std::vector<uint64_t> reads(threads), works(threads);
+            std::vector<std::exception_ptr> failed(threads);
+            const auto part = [&](unsigned w) {
+                try
+                {
+                    std::vector<sample> smp;
+                    std::vector<double> rs;
+                    const size_t a = ids.size() * w / threads, b = ids.size() * (w + 1) / threads;
+                    for (size_t i = a; i < b; ++i)
+                        raw_row(f, ids[i], t0, t1, range, arg, smp, rs, mat.data() + i * m_n, reads[w], works[w]);
+                }
+                catch (...)
+                {
+                    failed[w] = std::current_exception();
+                }
+            };
+            std::vector<std::thread> helpers;
+            helpers.reserve(threads - 1);
+            for (unsigned w = 1; w < threads; ++w)
+            {
+                // A thread that cannot be had leaves its part to this one, as the started ones must be joined.
+                try
+                {
+                    helpers.emplace_back(part, w);
+                }
+                catch (const std::system_error&)
+                {
+                    part(w);
+                }
+            }
+            part(0);
+            for (auto& h : helpers)
+                h.join();
+            for (const auto& e : failed)
+                if (e)
+                    std::rethrow_exception(e);
+            uint64_t work = 0;
+            for (unsigned w = 0; w < threads; ++w)
+            {
+                m_stats.raw_samples += reads[w];
+                work += works[w];
+            }
+            tick(work + ids.size() * m_n);
+            for (size_t i = 0; i < ids.size(); ++i)
+                put(ids[i], mat.data() + i * m_n);
+            release(mat.size());
+            ids.clear();
+        }
     for (uint32_t id : ids)
     {
         std::fill(row.begin(), row.end(), hole());
@@ -1052,27 +1336,10 @@ value evaluator::range_call(const expr_node& e)
                 }
             else
             {
-                smp.clear();
-                m_src.samples(id, t0 - range + 1, t1, smp);
-                m_stats.raw_samples += smp.size();
-                std::erase_if(smp, no_stale);
+                uint64_t read = 0;
+                raw_row(f, id, t0, t1, range, arg, smp, m_sc.resets, row.data(), read, work);
+                m_stats.raw_samples += read;
                 charge(smp.size());
-                size_t lo = 0, hi = 0;
-                work = smp.size();
-                for (size_t k = 0; k < m_n; ++k)
-                {
-                    const int64_t te = t0 + static_cast<int64_t>(k) * step;
-                    while (hi < smp.size() && smp[hi].t <= te)
-                        ++hi;
-                    while (lo < hi && smp[lo].t <= te - range)
-                        ++lo;
-                    if (lo == hi)
-                        continue;
-                    row[k] = raw_window(f, std::span<const sample>(smp).subspan(lo, hi - lo),
-                                        m_start + static_cast<int64_t>(k) * step, te, range,
-                                        arg.s.empty() ? 0 : arg.s[k]);
-                    work += hi - lo;
-                }
                 release(smp.size());
             }
             tick(work + m_n);
@@ -1083,7 +1350,10 @@ value evaluator::range_call(const expr_node& e)
                 any[k] = any[k] || !is_hole(row[k]);
             continue;
         }
-        emit_row(out, m_src.labels(id), drop);
+        if (fd)
+            fold_row(*fd, id, drop, row.data());
+        else
+            emit_row(out, id, drop);
     }
     if (f == fn::absent_over_time)
     {
@@ -1092,7 +1362,7 @@ value evaluator::range_call(const expr_node& e)
         emit_row(out, absent_labels(ms), false);
         return out;
     }
-    if (drop)
+    if (drop && !one_name)
         dedupe(out.vec);
     release(held(arg));
     return out;
@@ -1440,15 +1710,75 @@ value evaluator::vector_op(const expr_node& e, value& l, value& r)
     return out;
 }
 
+void evaluator::fold_row(fold& fd, uint32_t id, bool drop, const double* v)
+{
+    if (std::all_of(v, v + m_n, [](double x) { return is_hole(x); }))
+        return;
+    charge(m_n);
+    fd.held += m_n;
+    m_src.copy_labels(id, fd.ls);
+    const uint32_t g = group_of(fd.e, fd.ls, drop ? name_label : std::string_view(), fd.groups, fd.glabels, fd.key);
+    if (fd.st.size() < fd.glabels.size() * m_n)
+    {
+        fd.st.resize(fd.glabels.size() * m_n);
+        fd.seen.resize(fd.glabels.size() * m_n);
+    }
+    agg_state* a = fd.st.data() + size_t(g) * m_n;
+    uint8_t* seen = fd.seen.data() + size_t(g) * m_n;
+    for (size_t k = 0; k < m_n; ++k)
+    {
+        if (is_hole(v[k]))
+            continue;
+        if (!seen[k])
+        {
+            seen[k] = 1;
+            a[k].start(fd.op, v[k]);
+        }
+        else
+            a[k].add(fd.op, v[k]);
+    }
+}
+
 value evaluator::aggregate(const expr_node& e)
 {
     value param;
     if (e.args.size() == 2)
         param = eval(*e.args[0]);
-    value in = eval(*e.args.back());
     const agg_op op = e.agg;
+    // Whether no order of the input series changes the answer: not topk's, bottomk's or limitk's ties, and not
+    // count_values' or quantile's, which keep Prometheus's order where values are equal.
+    const bool any_order = op == agg_op::sum || op == agg_op::avg || op == agg_op::count || op == agg_op::min ||
+                           op == agg_op::max || op == agg_op::group || op == agg_op::stddev || op == agg_op::stdvar;
+    // The selector or range function right below, and only it, takes these: it reads its series by id, and a range
+    // function folds each into its group as it is read, so the rows of 50,000 series are never all held; the sums come
+    // out the same, each group's added in the same order.
+    const expr_node& arg = unparen(*e.args.back());
+    const bool range_arg = arg.k == expr_node::kind::call && is_range_fn(arg.func->id);
+    fold fd(e, op);
+    m_any_order = any_order && (range_arg || arg.k == expr_node::kind::vector_sel);
+    m_fold = any_order && range_arg ? &fd : nullptr;
+    value in = eval(*e.args.back());
+    m_any_order = false;
+    m_fold = nullptr;
     value out;
     out.type = V::vector;
+    if (fd.used)
+    {
+        const size_t ng = fd.glabels.size();
+        charge(ng * m_n);
+        out.vec.reserve(ng);
+        for (size_t g = 0; g < ng; ++g)
+        {
+            out.vec.push_back({std::move(fd.glabels[g]), std::vector<double>(m_n, hole())});
+            for (size_t k = 0; k < m_n; ++k)
+                if (fd.seen[g * m_n + k])
+                    out.vec.back().v[k] = fd.st[g * m_n + k].result(op);
+        }
+        release(fd.held + held(param));
+        std::sort(out.vec.begin(), out.vec.end(),
+                  [](const vseries& a, const vseries& b) { return compare_labels(a.labels, b.labels) < 0; });
+        return out;
+    }
 
     // count_values sets its label before it groups, so the input's own value of that label never counts.
     const std::string& value_label = param.str;
@@ -1461,31 +1791,13 @@ value evaluator::aggregate(const expr_node& e)
             throw eval_fail{"execution", "invalid label name \"" + value_label + "\""};
     }
 
-    // Every series' group, from the labels `by` keeps or `without` leaves, the name always among the latter.
     std::unordered_map<std::string, uint32_t> groups;
     std::vector<uint32_t> gid(in.vec.size());
     std::vector<label_set> glabels;
     std::string key;
+    const std::string_view skip = op == agg_op::count_values ? std::string_view(value_label) : std::string_view();
     for (size_t i = 0; i < in.vec.size(); ++i)
-    {
-        label_set ls;
-        key.clear();
-        for (const auto& l : in.vec[i].labels)
-        {
-            const bool in_list = listed(e.grouping, l.name);
-            if (op == agg_op::count_values && l.name == value_label)
-                continue;
-            if (e.without ? (!in_list && l.name != name_label) : in_list)
-            {
-                ls.push_back(l);
-                key_into(key, l);
-            }
-        }
-        auto [it, fresh] = groups.try_emplace(key, static_cast<uint32_t>(glabels.size()));
-        if (fresh)
-            glabels.push_back(std::move(ls));
-        gid[i] = it->second;
-    }
+        gid[i] = group_of(e, in.vec[i].labels, skip, groups, glabels, key);
     const size_t ng = glabels.size();
 
     if (op == agg_op::topk || op == agg_op::bottomk)
@@ -1601,12 +1913,7 @@ value evaluator::aggregate(const expr_node& e)
     out.vec.reserve(ng);
     for (auto& ls : glabels)
         out.vec.push_back({std::move(ls), std::vector<double>(m_n, hole())});
-    struct state
-    {
-        double value, mean, c, count;
-        bool incremental;
-    };
-    std::vector<state> st(ng);
+    std::vector<agg_state> st(ng);
     std::vector<int64_t> seen(ng, -1);
     std::vector<uint32_t> touched;
     std::vector<std::vector<double>> qv(op == agg_op::quantile ? ng : 0);
@@ -1620,91 +1927,29 @@ value evaluator::aggregate(const expr_node& e)
             if (is_hole(f))
                 continue;
             const uint32_t g = gid[i];
-            state& a = st[g];
+            agg_state& a = st[g];
             if (seen[g] != step)
             {
                 seen[g] = step;
                 touched.push_back(g);
-                a = {f, f, 0, 1, false};
-                if (op == agg_op::stddev || op == agg_op::stdvar)
-                    a.value = 0;
-                else if (op == agg_op::group)
-                    a.value = 1;
-                else if (op == agg_op::quantile)
+                a.start(op, f);
+                if (op == agg_op::quantile)
                     qv[g].assign(1, f);
-                continue;
             }
-            switch (op)
-            {
-                case agg_op::sum: kahan_inc(f, a.value, a.c); break;
-                case agg_op::avg:
-                {
-                    a.count += 1;
-                    if (!a.incremental)
-                    {
-                        double nv = a.value, nc = a.c;
-                        kahan_inc(f, nv, nc);
-                        if (!std::isinf(nv))
-                        {
-                            a.value = nv;
-                            a.c = nc;
-                            break;
-                        }
-                        a.incremental = true;
-                        a.mean = a.value / (a.count - 1);
-                        a.c /= a.count - 1;
-                    }
-                    if (std::isinf(a.mean))
-                    {
-                        if (std::isinf(f) && (a.mean > 0) == (f > 0))
-                            break;
-                        if (!std::isinf(f) && !std::isnan(f))
-                            break;
-                    }
-                    const double cur = a.mean + a.c;
-                    kahan_inc(f / a.count - cur / a.count, a.mean, a.c);
-                    break;
-                }
-                case agg_op::max:
-                    if (a.value < f || std::isnan(a.value))
-                        a.value = f;
-                    break;
-                case agg_op::min:
-                    if (a.value > f || std::isnan(a.value))
-                        a.value = f;
-                    break;
-                case agg_op::count: a.count += 1; break;
-                case agg_op::stddev: case agg_op::stdvar:
-                {
-                    a.count += 1;
-                    const double delta = f - a.mean;
-                    a.mean += delta / a.count;
-                    a.value += delta * (f - a.mean);
-                    break;
-                }
-                case agg_op::quantile: qv[g].push_back(f); break;
-                default: break;
-            }
+            else if (op == agg_op::quantile)
+                qv[g].push_back(f);
+            else
+                a.add(op, f);
         }
         for (uint32_t g : touched)
-        {
-            const state& a = st[g];
-            double v = a.value;
-            switch (op)
-            {
-                case agg_op::sum: v = a.value + a.c; break;
-                case agg_op::avg: v = a.incremental ? a.mean + a.c : (a.value + a.c) / a.count; break;
-                case agg_op::count: v = a.count; break;
-                case agg_op::stdvar: v = a.value / a.count; break;
-                case agg_op::stddev: v = std::sqrt(a.value / a.count); break;
-                case agg_op::quantile: v = quantile_of(param.s[k], qv[g]); break;
-                default: break;
-            }
-            out.vec[g].v[k] = v;
-        }
+            out.vec[g].v[k] = op == agg_op::quantile ? quantile_of(param.s[k], qv[g]) : st[g].result(op);
         tick(in.vec.size());
     }
     release(held(in) + held(param));
+    // Its input came in any order, so its groups are put in the one labels give.
+    if (any_order)
+        std::sort(out.vec.begin(), out.vec.end(),
+                  [](const vseries& a, const vseries& b) { return compare_labels(a.labels, b.labels) < 0; });
     return out;
 }
 
@@ -2047,7 +2292,7 @@ void evaluator::top_matrix(const expr_node& e, std::vector<result_series>& out)
 {
     const int64_t te = m_start - e.offset_ms, range = e.range_ms;
     std::vector<uint32_t> ids;
-    select(e, te - range + 1, te, ids);
+    select(e, te - range + 1, te, ids, false);
     ++m_stats.raw_selectors;
     auto& smp = m_sc.samples;
     for (uint32_t id : ids)
@@ -2060,7 +2305,7 @@ void evaluator::top_matrix(const expr_node& e, std::vector<result_series>& out)
             continue;
         charge(smp.size());
         result_series rs;
-        rs.labels = m_src.labels(id);
+        m_src.copy_labels(id, rs.labels);
         rs.points = smp;
         for (auto& p : rs.points)
             p.v = canon(p.v);

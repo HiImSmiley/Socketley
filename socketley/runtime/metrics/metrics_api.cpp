@@ -169,6 +169,12 @@ void result_text(const query_result& r, std::string& out)
 
 void metrics_run::api(std::string_view path, const api_params& p, api_reply& out, bool text)
 {
+    // The replies hold copies, so what a request had labels() make goes once it is answered.
+    struct forget
+    {
+        store& s;
+        ~forget() { s.forget_labels(); }
+    } done{m_store};
     if (path == "/api/v1/query" || path == "/api/v1/query_range")
         return api_query(p, out, text, path == "/api/v1/query_range");
     if (path == "/api/v1/series")
@@ -319,6 +325,9 @@ void metrics_run::api_query(const api_params& p, api_reply& out, bool text, bool
                                                     "Try decreasing the query resolution (?step=XX)");
         ok = m_engine.eval_range(q, start, end, step, r, err);
     }
+    // A read over much of the store left its pages mapped in this process, a dashboard's 36 MB of 100,000 series.
+    if (const query_stats& st = m_engine.last_stats(); st.raw_samples + st.tier_points >= (1u << 20))
+        m_store.let_go_pages();
     if (!ok)
         return fail(out, text, status_of(err.type), err.type.empty() ? "execution" : err.type, err.message);
     if (text)

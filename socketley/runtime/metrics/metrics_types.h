@@ -78,9 +78,13 @@ public:
     // The ids of the series every matcher accepts that hold a sample in [mint, maxt], ascending.
     virtual void select(std::span<const matcher> ms, int64_t mint, int64_t maxt, std::vector<uint32_t>& out) = 0;
     virtual const label_set& labels(uint32_t id) const = 0;
+    // The labels of `id` into `out`, for a caller that keeps its own copy and so needs none kept for it.
+    virtual void copy_labels(uint32_t id, label_set& out) const { out = labels(id); }
 
     // The raw samples of `id` in [mint, maxt], ascending, appended to `out`.
     virtual void samples(uint32_t id, int64_t mint, int64_t maxt, std::vector<sample>& out) = 0;
+    // Whether samples() may be called from several threads at once, while nothing is appended.
+    virtual bool concurrent_samples() const { return false; }
 
     // The step of the coarsest tier no coarser than `resolution` that still holds data back to `mint`; 0 is raw.
     virtual int64_t tier_for(int64_t mint, int64_t resolution) const = 0;

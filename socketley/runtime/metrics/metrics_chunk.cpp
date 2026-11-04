@@ -185,6 +185,69 @@ chunk_reader::chunk_reader(std::span<const uint8_t> bytes)
     m_r = bit_reader(bytes.data() + chunk_head_bytes, bytes.size() - chunk_head_bytes);
 }
 
+namespace
+{
+
+// A sample's delta of delta read from one peek, false and nothing read where it is the 64-bit kind or the peek fails.
+inline bool fast_dod(bit_reader& r, int64_t& dod)
+{
+    uint64_t w;
+    if (!r.peek(w))
+        return false;
+    if (!(w >> 63))
+    {
+        dod = 0;
+        r.skip(1);
+        return true;
+    }
+    static constexpr unsigned width[4] = {14, 17, 20, 0};
+    const auto ones = static_cast<unsigned>(std::countl_one(w));
+    if (ones > 3)
+        return false;
+    const unsigned n = width[ones - 1];
+    dod = from_field((w << (ones + 1)) >> (64 - n), n);
+    r.skip(ones + 1 + n);
+    return true;
+}
+
+// A sample's XOR read from one peek, false and nothing read where it runs past what the peek holds or is damaged.
+inline bool fast_xor(bit_reader& r, xor_state& x)
+{
+    uint64_t w;
+    if (!r.peek(w))
+        return false;
+    if (!(w >> 63))
+    {
+        r.skip(1);
+        return true;
+    }
+    const unsigned room = r.peekable();
+    if (!((w >> 62) & 1))
+    {
+        if (x.lead == 0xff)
+            return false;
+        const unsigned sig = 64u - x.lead - x.trail;
+        if (2 + sig > room)
+            return false;
+        x.prev ^= ((w << 2) >> (64 - sig)) << x.trail;
+        r.skip(2 + sig);
+        return true;
+    }
+    const auto lead = static_cast<unsigned>((w >> 57) & 31);
+    unsigned sig = static_cast<unsigned>((w >> 51) & 63);
+    if (sig == 0)
+        sig = 64;
+    if (lead + sig > 64 || 13 + sig > room)
+        return false;
+    x.lead = static_cast<uint8_t>(lead);
+    x.trail = static_cast<uint8_t>(64 - lead - sig);
+    x.prev ^= ((w << 13) >> (64 - sig)) << x.trail;
+    r.skip(13 + sig);
+    return true;
+}
+
+}   // namespace
+
 bool chunk_reader::next()
 {
     if (m_failed || m_i >= m_n)
@@ -203,8 +266,9 @@ bool chunk_reader::next()
     }
     else
     {
+        // Each field from one 64-bit peek where it fits, which all but the widest do, and bit by bit otherwise.
         int64_t dod = 0;
-        if (!get_dod(m_r, dod) || !get_xor(m_r, m_x))
+        if (!(fast_dod(m_r, dod) || get_dod(m_r, dod)) || !(fast_xor(m_r, m_x) || get_xor(m_r, m_x)))
         {
             m_failed = true;
             return false;

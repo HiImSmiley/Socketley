@@ -284,6 +284,23 @@ uint32_t series_index::add(const label_set& ls)
     return id;
 }
 
+void series_index::copy_labels(uint32_t id, label_set& out) const
+{
+    // Into the strings `out` already has, so a buffer reused for every series of a query allocates once.
+    out.resize((m_ser_off[id + 1] - m_ser_off[id]) / 2);
+    size_t i = 0;
+    each_label(id, [&](std::string_view n, std::string_view v) {
+        out[i].name.assign(n);
+        out[i++].value.assign(v);
+    });
+}
+
+void series_index::forget_labels()
+{
+    std::vector<std::unique_ptr<label_set>>().swap(m_label_cache);
+    m_label_cache_bytes = 0;
+}
+
 const label_set& series_index::labels(uint32_t id) const
 {
     if (m_label_cache.size() <= id)
@@ -292,10 +309,7 @@ const label_set& series_index::labels(uint32_t id) const
     if (!slot)
     {
         slot = std::make_unique<label_set>();
-        slot->reserve((m_ser_off[id + 1] - m_ser_off[id]) / 2);
-        each_label(id, [&](std::string_view n, std::string_view v) {
-            slot->push_back(label{std::string(n), std::string(v)});
-        });
+        copy_labels(id, *slot);
         m_label_cache_bytes += sizeof(label_set) + slot->capacity() * sizeof(label);
         for (const auto& x : *slot)
             m_label_cache_bytes += (x.name.capacity() > 15 ? x.name.capacity() : 0) +

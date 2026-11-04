@@ -4,6 +4,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include <bit>
 #include <chrono>
 #include <cfloat>
 #include <cmath>
@@ -20,6 +21,7 @@
 #include "runtime/metrics/metrics_block.h"
 #include "runtime/metrics/metrics_chunk.h"
 #include "runtime/metrics/metrics_index.h"
+#include "runtime/metrics/metrics_promql_eval.h"
 #include "runtime/metrics/metrics_query.h"
 #include "runtime/metrics/metrics_store.h"
 
@@ -1216,6 +1218,117 @@ TEST_CASE("perf: append to 100k series, once and then ten rounds")
         std::printf("[perf] append: 100k series x 1 sample %.1f ns each, then 10 rounds %.1f ns each\n", first, rounds);
         CHECK(s.stats().samples_appended == 1'100'000);
     }
+}
+
+TEST_CASE("an aggregation folds a range function's series as they are read, into what it makes of their rows")
+{
+    // Enough series for the read on every core, counters that reset, gauges with gaps, and a NaN.
+    tmpdir d;
+    store s;
+    std::string why;
+    REQUIRE(s.open(d.path, small_config(), why));
+    std::mt19937_64 rng(7);
+    std::vector<uint32_t> ids;
+    for (int j = 0; j < 9000; ++j)
+        ids.push_back(s.get_or_create(L({{"__name__", "x_total"},
+                                         {"code", j % 3 ? "200" : (j % 2 ? "500" : "404")},
+                                         {"path", ("/p" + std::to_string(j)).c_str()}})));
+    const int64_t start = T0 + 3'600'000;
+    std::vector<double> c(ids.size(), 0);
+    for (int k = 0; k < 200; ++k)
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            if ((i + size_t(k) / 40) % 11 == 0)
+                continue;
+            c[i] = rng() % 50 == 0 ? double(rng() % 10) : c[i] + double(rng() % 1000) / 7;
+            REQUIRE(s.append(ids[i], start + k * 1000, i == 5 && k == 100 ? std::nan("") : c[i]));
+        }
+    query_engine eng(s);
+    const int64_t end = start + 199'000;
+    // The rows come sorted by labels and the fold reads by id, which only a sum's or a variance's last bits can tell.
+    auto same = [&](const std::string& folded, const std::string& rows, bool exact) {
+        query_result a, b;
+        query_error err;
+        REQUIRE_MESSAGE(eng.eval_range(folded, end - 120'000, end, 7'000, a, err), err.message);
+        REQUIRE_MESSAGE(eng.eval_range(rows, end - 120'000, end, 7'000, b, err), err.message);
+        REQUIRE_MESSAGE(a.series.size() == b.series.size(), folded);
+        CHECK_MESSAGE(!a.series.empty(), folded);
+        for (size_t i = 0; i < a.series.size(); ++i)
+        {
+            REQUIRE_MESSAGE(compare_labels(a.series[i].labels, b.series[i].labels) == 0, folded);
+            REQUIRE_MESSAGE(a.series[i].points.size() == b.series[i].points.size(), folded);
+            for (size_t k = 0; k < a.series[i].points.size(); ++k)
+            {
+                const double x = a.series[i].points[k].v, y = b.series[i].points[k].v;
+                REQUIRE_MESSAGE(a.series[i].points[k].t == b.series[i].points[k].t, folded);
+                if (exact || std::isnan(x) || std::isnan(y))
+                    REQUIRE_MESSAGE(std::bit_cast<uint64_t>(x) == std::bit_cast<uint64_t>(y),
+                                    folded << " at " << k << ": " << x << " against " << y);
+                else
+                    REQUIRE_MESSAGE(std::abs(x - y) <= 1e-12 * std::max(std::abs(x), std::abs(y)),
+                                    folded << " at " << k << ": " << x << " against " << y);
+            }
+        }
+    };
+    // A row takes its labels from the index and keeps no copy there; only a sort by labels makes them, until forgotten.
+    {
+        const uint64_t ram = s.stats().bytes_in_ram;
+        query_result r;
+        query_error err;
+        REQUIRE(eng.eval_range("sum by (code) (rate(x_total[1m]))", end - 120'000, end, 7'000, r, err));
+        REQUIRE(eng.eval_range("count(x_total)", end - 120'000, end, 7'000, r, err));
+        CHECK(s.stats().bytes_in_ram == ram);
+        REQUIRE(eng.eval_range("x_total", end - 120'000, end, 7'000, r, err));
+        CHECK(s.stats().bytes_in_ram > ram + 9000 * 64);
+        s.forget_labels();
+        CHECK(s.stats().bytes_in_ram == ram);
+    }
+    for (const std::string op : {"sum", "avg", "count", "min", "max", "group", "stddev", "stdvar"})
+        for (const char* f : {"rate", "increase", "avg_over_time", "max_over_time", "last_over_time"})
+            for (const char* by : {"", " by (code)", " without (path)"})
+            {
+                const std::string inner = std::string(f) + "(x_total[1m])";
+                same(op + by + " (" + inner + ")", op + by + " (" + inner + " * 1)",
+                     op == "count" || op == "min" || op == "max" || op == "group");
+            }
+}
+
+TEST_CASE("perf: a dashboard's sum by (code) (rate(x[1m])) over 50,000 counters of six minutes at 1 s")
+{
+    // The docs' range query: 50 targets of 1000 counters each, scraped every second, five minutes at a 15 s step.
+    tmpdir d;
+    store s;
+    std::string why;
+    REQUIRE(s.open(d.path, small_config(), why));
+    constexpr int targets = 50, per = 1000, seconds = 361;
+    std::vector<uint32_t> ids;
+    for (int t = 0; t < targets; ++t)
+        for (int j = 0; j < per; ++j)
+            ids.push_back(s.get_or_create(L({{"__name__", "bench_requests_total"},
+                                             {"code", j % 5 ? "200" : "500"},
+                                             {"instance", "127.0.0.1:38000"},
+                                             {"job", ("t" + std::to_string(t)).c_str()},
+                                             {"path", ("/p" + std::to_string(j)).c_str()}})));
+    const int64_t start = T0 + 3'600'000;
+    for (int k = 0; k < seconds; ++k)
+        for (size_t i = 0; i < ids.size(); ++i)
+            REQUIRE(s.append(ids[i], start + k * 1000, double((start / 1000 + k) * (int64_t(i % per) % 7 + 1) + i % 13)));
+    query_engine eng(s);
+    query_result r;
+    query_error err;
+    const int64_t end = start + (seconds - 1) * 1000;
+    double best = 1e30;
+    for (int i = 0; i < 5; ++i)
+    {
+        const auto t0 = clk::now();
+        REQUIRE_MESSAGE(eng.eval_range("sum by (code) (rate(bench_requests_total[1m]))", end - 300'000, end, 15'000, r, err),
+                        err.message);
+        best = std::min(best, std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+    }
+    REQUIRE(r.series.size() == 2);
+    REQUIRE(r.series[0].points.size() == 21);
+    std::printf("[perf] sum by (code) (rate(x[1m])) 50k series, 5 min at 15 s: %.1f ms (%llu samples read)\n", best,
+                static_cast<unsigned long long>(eng.last_stats().raw_samples));
 }
 
 TEST_CASE("perf: RAM for 2000 series after a day of 10s samples")

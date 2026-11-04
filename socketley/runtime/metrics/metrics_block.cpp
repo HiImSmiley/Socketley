@@ -134,6 +134,12 @@ block::~block()
         ::munmap(const_cast<uint8_t*>(m_map), m_size);
 }
 
+void block::let_go() const
+{
+    if (m_map)
+        ::madvise(const_cast<uint8_t*>(m_map), m_size, MADV_DONTNEED);
+}
+
 std::shared_ptr<block> block::open(const std::string& path, std::string& why)
 {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
