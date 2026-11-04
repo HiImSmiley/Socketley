@@ -137,10 +137,74 @@ function addCopy(p) {
   } }, ico('copy'));
   p.append(b);
 }
-function manBody(id) {
+function manBody(id, full) {
   const d = el('div', { class: 'man' });
   d.append(frag(id).cloneNode(true));
+  if (!full) fold1(d, id);
   return linkify(d);
+}
+// An entry's first sentence, cut at a clause if it runs long: what a row says before it is opened.
+function firstLine(t) {
+  t = t.replace(/\s+/g, ' ').trim();
+  const one = x => (x.match(/^(.+?[.!?])(?=\s+[A-Z(]|$)/) || [, x])[1];
+  let s = one(t);
+  if (s.length < 30 && t.length > s.length) s += ' ' + one(t.slice(s.length).trim());
+  if (s.length > 150) {
+    const c = s.slice(0, 150);
+    const k = Math.max(c.lastIndexOf('; '), c.lastIndexOf(': '), c.lastIndexOf(' — '), c.lastIndexOf(', '));
+    s = (k > 60 ? c.slice(0, k) : c.slice(0, c.lastIndexOf(' '))).replace(/[\s,;:—(]+$/, '') + ' …';
+  }
+  return s;
+}
+// What a row names an entry by: its synopsis up to the first optional part, at most a few words.
+function shortTerm(t) {
+  let s = t.replace(/\s+/g, ' ').split(/ \[| \/ | \| /)[0].replace(/(?<!\.)[.,]$/, '');
+  if (s.length > 42) s = s.slice(0, s.lastIndexOf(' ', 40) > 10 ? s.lastIndexOf(' ', 40) : 40).replace(/[,\s]+$/, '') + ' …';
+  return s;
+}
+function openEnt(n) {
+  if (!n?.classList.contains('c')) return;
+  n.classList.add('open');
+  n.querySelectorAll('details').forEach(d => d.open = true);
+}
+// Each entry of a section becomes one row: name and first sentence; a click opens the whole entry in place.
+// Entries the manual calls test hooks or aids go together at the end, folded.
+function fold1(d, sid) {
+  const meta = new Map((SEC.get(sid)?.entries || []).map(e => [sid + '/' + e.id, e]));
+  const tests = [];
+  for (const n of d.querySelectorAll('.ent')) {
+    const e = meta.get(n.id);
+    if (!e) continue;
+    const st = shortTerm(e.term);
+    const head = el('div', { class: 'er', role: 'button', tabindex: '0', 'aria-expanded': 'false' },
+      el('code', { class: 'tm', text: st }), el('span', { class: 'fs', text: firstLine(e.summary) }), ico('chev', 'chev'));
+    const flip = () => {
+      if (n.classList.contains('open')) n.classList.remove('open'); else openEnt(n);
+      head.setAttribute('aria-expanded', n.classList.contains('open'));
+    };
+    head.onclick = ev => { if (!ev.target.closest('a')) flip(); };
+    head.onkeydown = ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); flip(); } };
+    n.prepend(head);
+    n.classList.add('c');
+    if (st === e.term.replace(/\s+/g, ' ').replace(/(?<!\.)[.,]$/, '')) n.classList.add('same');
+    if (/^A test (hook|aid)\b/.test(e.summary)) tests.push(n);
+  }
+  if (tests.length) {
+    const box = el('details', { class: 'tests' }, el('summary', {}, ico('chev'), el('span', { text: 'For socketley\'s own tests' }), el('span', { class: 'n', text: tests.length + ' entries' })));
+    for (const n of tests) box.append(n);
+    d.append(box);
+  }
+}
+// Opens or closes every entry under root; the button says which it will do next.
+function expandAll(root) {
+  const b = el('button', { class: 'btn sm xa' }, el('span', { text: 'Open all' }));
+  b.onclick = () => {
+    const open = b.textContent === 'Open all';
+    for (const n of root.querySelectorAll('.ent.c')) open ? openEnt(n) : n.classList.remove('open');
+    for (const t of root.querySelectorAll('details.tests')) t.open = open;
+    b.firstChild.textContent = open ? 'Close all' : 'Open all';
+  };
+  return b;
 }
 function entryNode(ref) {
   const [sid] = ref.split('/');
@@ -222,35 +286,24 @@ function flagTable(rt, opts = {}) {
 }
 
 // ─── benchmarks ────────────────────────────────────────────────────────────────────────────────────────────────────
-function ratioBar(r, lo, hi) {
-  const L = Math.log2;
-  const x = v => ((L(v) - L(lo)) / (L(hi) - L(lo)) * 100).toFixed(1) + '%';
-  const b = el('div', { class: 'rbar' });
-  const cls = r[1] > 1 ? '' : r[2] < 1 ? ' dn' : ' eq';
-  b.innerHTML = '<div class="ax" style="left:' + x(1) + '"></div><div class="w" style="left:' + x(Math.max(lo, r[1])) + ';width:calc(' + x(Math.min(hi, r[2])) + ' - ' + x(Math.max(lo, r[1])) + ')"></div>' +
-    '<div class="m' + cls + '" style="left:' + x(Math.min(hi, Math.max(lo, r[0]))) + '"></div>';
-  b.title = r[0].toFixed(2) + '×, from ' + r[1].toFixed(2) + ' to ' + r[2].toFixed(2) + ' across passes';
-  return b;
-}
 const short = a => a.replace(/ [\d.v-]+$/, '');
 function benchSet(s) {
   const arms = s.arms;
-  const rs = s.rows.flatMap(r => (r.r || []).flat()).filter(v => v > 0);
-  const lo = Math.min(0.5, ...rs) * 0.9, hi = Math.max(2, ...rs) * 1.1;
+  // CPU beside every rate, unless every rate of the set cost the same: then it is said once, above the table.
+  const cpus = s.rows.flatMap(r => r.cpu || []).filter(v => v != null);
+  const oneCpu = cpus.length && cpus.every(v => v.toFixed(2) === cpus[0].toFixed(2)) ? cpus[0] : null;
   const head = el('tr', {}, el('th', { text: '' }), arms.map(a => el('th', { text: short(a) })),
-    arms.slice(1).map(a => el('th', { text: 'vs ' + short(a) })),
-    el('th', { class: 'bar', title: 'Each pass from worst to best, the dot the median; the line is 1×' }, 'per pass'));
+    arms.slice(1).map(a => el('th', { text: 'vs ' + short(a) })));
   const body = s.rows.map(r => el('tr', {}, el('td', { text: r.name }),
     arms.map((a, k) => el('td', { class: k ? '' : 'us', 'data-l': short(a) }, el('div', { class: 'v', text: fmt(r.v[k], r.unit || s.unit) }),
-      r.cpu?.[k] != null ? el('div', { class: 'cpu', text: r.cpu[k].toFixed(2) + ' cores' }) : null)),
+      r.cpu?.[k] != null && oneCpu == null ? el('div', { class: 'cpu', text: r.cpu[k].toFixed(2) + ' cores' }) : null)),
     arms.slice(1).map((a, k) => {
       const q = r.r?.[k];
       if (!q) return el('td', { text: '–' });
       const cls = q[1] > 1 ? 'up' : q[2] < 1 ? 'dn' : 'eq';
-      return el('td', { class: 'rt ' + cls, 'data-l': 'vs ' + short(arms[k + 1]) }, q[0].toFixed(2) + '×', el('span', { class: 'ci', text: q[1].toFixed(2) + '–' + q[2].toFixed(2) }));
-    }),
-    el('td', { class: 'bar' }, r.r?.[0] ? ratioBar(r.r[0], lo, hi) : null)));
-  const meta = [arms.slice(1).join(', '), s.passes ? s.passes + ' passes' : '', s.date, s.commit ? 'socketley ' + s.commit : ''].filter(Boolean);
+      return el('td', { class: 'rt ' + cls, 'data-l': 'vs ' + short(arms[k + 1]), title: 'From ' + q[1].toFixed(2) + '× to ' + q[2].toFixed(2) + '× across the passes' }, q[0].toFixed(2) + '×', el('span', { class: 'ci', text: q[1].toFixed(2) + '–' + q[2].toFixed(2) }));
+    })));
+  const meta = [arms.slice(1).join(', '), oneCpu != null ? 'each on ' + (+oneCpu.toFixed(2) === 1 ? 'one core' : oneCpu.toFixed(2) + ' cores') : '', s.passes ? s.passes + ' passes' : '', s.date, s.commit ? 'socketley ' + s.commit : ''].filter(Boolean);
   const notes = el('details', { class: 'bn' }, el('summary', { text: 'How it was measured' }),
     el('p', { text: [s.tool, s.pin].filter(Boolean).join('; ') + '.' }));
   if (s.note) { const p = el('p'); p.innerHTML = s.note; notes.append(p); }
@@ -303,7 +356,7 @@ async function place(root) {
     const seen = new Set();
     x.replaceWith(el('div', { class: 'chips' }, top.filter(e => { const k = e.term.split(' ')[0].replace(/\(.*$/, '()').replace(/,$/, ''); if (seen.has(k)) return false; seen.add(k); return true; }).map(e => el('a', { href: '#/man/' + sid + '/' + e.id, title: e.summary, onclick: ev => {
       const n = document.getElementById(sid + '/' + e.id);
-      if (n) { ev.preventDefault(); n.scrollIntoView({ block: 'start' }); n.classList.add('hl'); }
+      if (n) { ev.preventDefault(); openEnt(n); n.scrollIntoView({ block: 'start' }); n.classList.add('hl'); }
     } }, el('span', {}, el('b', { text: e.term.split(' ')[0].replace(/\(.*$/, '()').replace(/,$/, '').slice(0, 40) }))))));
   }
   for (const p of root.querySelectorAll('pre.code')) addCopy(p);
@@ -442,14 +495,14 @@ async function pageMan(C, sid, eid) {
   const parent = s.parent && s.parent !== s.id ? SEC.get(s.parent) : null;
   C.append(pageHead(parent ? nice(parent.title) : 'Manual', nice(s.title), ''));
   const main = el('div', { class: 'main' });
-  if (s.entries.length > 6) main.append(el('x-index', { s: sid, all: '' }));
   main.append(manBody(sid));
   for (const c of subsOf(sid)) main.append(el('h2', { class: 'h2', id: 'sec:' + c.id }, nice(c.title)), manBody(c.id));
   await place(main);
+  if (main.querySelector('.ent.c')) main.prepend(el('div', { class: 'xbar' }, expandAll(main)));
   article(C, main, { heads: 'h2.h2', min: 2 });
   if (eid) setTimeout(() => {
     const n = document.getElementById(sid + '/' + eid);
-    if (n) { n.classList.add('hl'); n.querySelector('details')?.setAttribute('open', ''); n.scrollIntoView({ block: 'start' }); }
+    if (n) { n.classList.add('hl'); n.closest('details.tests')?.setAttribute('open', ''); openEnt(n); n.scrollIntoView({ block: 'start' }); }
   }, 0);
 }
 async function pageBench(C, rt) {

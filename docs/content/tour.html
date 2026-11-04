@@ -26,13 +26,15 @@ printf 'hi\n' | nc -q1 127.0.0.1 9001</pre></li>
 <pre class="code">socketley create cache store -p 6379 -s
 redis-cli -p 6379 SET visits 0
 redis-cli -p 6379 INCR visits</pre>
-<p>It speaks the Redis protocol, and plain text too: <code>printf 'get visits\n' | nc -q1 127.0.0.1 6379</code>.</p>
+<p>It speaks the Redis protocol, and plain text lines too:</p>
+<pre class="code">printf 'get visits\n' | nc -q1 127.0.0.1 6379</pre>
 
 <h2>4. A proxy</h2>
-<pre class="code">socketley create server web -p 9100 --http ./site -s
+<pre class="code">mkdir -p site &amp;&amp; echo '&lt;h1&gt;hello&lt;/h1&gt;' &gt; site/index.html
+socketley create server web -p 9100 --http ./site -s
 socketley create proxy gw -p 8080 --backend web -s
 curl http://127.0.0.1:8080/gw/index.html</pre>
-<p>The backend is named, not numbered, so the proxy follows it if its port changes. <code>/gw/...</code> reaches it as <code>/...</code>.</p>
+<p>The proxy finds <code>web</code> by its name, so it follows the server if its port changes. It takes its own name off the path: <code>/gw/index.html</code> reaches <code>web</code> as <code>/index.html</code>.</p>
 
 <h2>5. Look at it</h2>
 <pre class="code">socketley ls                 <i># every runtime, its state and port</i>

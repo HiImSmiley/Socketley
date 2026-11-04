@@ -300,3 +300,37 @@ table.mt td:first-child{font-family:var(--mono);font-size:12.5px;color:var(--fg)
 /* Long lines of code wrap rather than run under the edge, where a phone shows no scrollbar. */
 pre.code{white-space:pre-wrap;overflow-wrap:anywhere}
 .ftbl .li{margin-top:2px}
+/* ─── a manual section as rows: an entry's name and first sentence, opened in place ─────────────────────────── */
+.man:has(.ent.c){max-width:940px}
+.man .ent.c{padding:0;border-bottom:1px solid var(--line)}
+.man .ent.c>.et,.man .ent.c>.eb{display:none}
+.man .ent.c.open{padding:0 0 12px;background:rgba(0,0,0,.16)}
+.man .ent.c.open>.eb{display:block;padding:2px 12px 0;max-width:780px}
+.man .ent.c.open:not(.same)>.et{display:flex;padding:4px 12px 0}
+.man .ent.c.open>.eb>details>summary{display:none}
+.man .ent.c.hl{margin-left:0;padding-left:0}
+.man .er{display:grid;grid-template-columns:minmax(0,250px) minmax(0,1fr) 15px;gap:18px;align-items:baseline;padding:11px 12px;cursor:pointer;border-radius:8px;scroll-margin-top:70px}
+.man .er:hover{background:rgba(255,255,255,.035)}
+.man .er:focus-visible{outline:2px solid rgba(var(--glow),.6);outline-offset:-2px}
+.man .er .tm{justify-self:start;font-size:13px;color:var(--a1);background:rgba(var(--glow),.09);border-color:rgba(var(--glow),.22);white-space:normal;overflow-wrap:anywhere;line-height:1.5}
+.man .er .fs{color:var(--mut);font-size:14.5px;line-height:1.55}
+.man .er .chev{width:15px;height:15px;color:var(--dim);align-self:center;transition:transform .15s}
+.man .ent.c.open>.er .fs{color:var(--fg)}
+.man .ent.c.open>.er .chev{transform:rotate(90deg)}
+.man .ent.c.open>.er .fs{visibility:hidden;height:0}
+.man .ent.c.open>.er{grid-template-rows:auto}
+.man details.tests{margin:22px 0 0;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+.man details.tests>summary{display:flex;align-items:center;gap:10px;padding:12px 16px;color:var(--fg);font-size:14.5px;font-weight:650;margin:0}
+.man details.tests>summary::after{content:none}
+.man details.tests>summary .i{width:15px;height:15px;color:var(--dim);transition:transform .15s}
+.man details.tests[open]>summary .i{transform:rotate(90deg)}
+.man details.tests>summary .n{margin-left:auto;font-size:12px;color:var(--dim);font-weight:500}
+.man details.tests>.ent.c{margin:0 6px}
+.xbar{display:flex;justify-content:flex-end;max-width:940px;margin:0 0 6px}
+@media (max-width:640px){
+  .man .er{grid-template-columns:minmax(0,1fr) 15px;gap:4px 10px;padding:10px 6px}
+  .man .er .tm{grid-column:1}
+  .man .er .fs{grid-column:1;grid-row:2}
+  .man .er .chev{grid-column:2;grid-row:1}
+}
+.prose>div:has(.ent.c){max-width:940px!important}
