@@ -174,6 +174,8 @@ public:
     void serve(const std::shared_ptr<http::server_conn>& c) override;
     bool written(const std::shared_ptr<http::server_conn>& c) override;
     bool keeps_open(const http::server_conn& c) const override;
+    // written() hands a link's parked frames on after the last answer, so that answer goes the ring's way.
+    bool fin_at_once(const http::server_conn&) const override { return false; }
     void closing(const std::shared_ptr<http::server_conn>& c) override;
 };
 

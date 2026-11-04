@@ -314,8 +314,7 @@ void conn_server::read_done(const std::shared_ptr<server_conn>& c, int res)
     runtime_instance::stat_add(m_rt.m_stat_bytes_in, static_cast<uint64_t>(res));
     m_hooks.serve(c);
     flush(c);
-    if (!c->dead && !c->waiting)
-        arm_read(c);
+    after_serve(c);
 }
 
 void conn_server::resume(const std::shared_ptr<server_conn>& c)
@@ -324,13 +323,34 @@ void conn_server::resume(const std::shared_ptr<server_conn>& c)
     c->waiting = false;
     m_hooks.serve(c);
     flush(c);
-    if (!c->dead && !c->waiting)
-        arm_read(c);
+    after_serve(c);
+}
+
+void conn_server::after_serve(const std::shared_ptr<server_conn>& c)
+{
+    if (c->dead || c->waiting)
+        return;
+    // A request after one that closes the connection is not answered (RFC 9112 9.6), so none is read.
+    if (!c->keep_alive && !m_hooks.keeps_open(*c))
+    {
+        c->in.clear();
+        return;
+    }
+    // A client that sends requests faster than it reads the answers is not read from until it has caught up; a stream
+    // the runtime keeps open runs its own window.
+    if (c->unsent() > out_max && !m_hooks.keeps_open(*c))
+    {
+        c->held = true;
+        return;
+    }
+    arm_read(c);
 }
 
 void conn_server::flush(const std::shared_ptr<server_conn>& c)
 {
     if (c->dead || c->wr_pending || c->cn_pending)
+        return;
+    if (!c->keep_alive && finish_now(c))
         return;
     if (c->sent >= c->sending.size())
     {
@@ -362,7 +382,7 @@ void conn_server::flush(const std::shared_ptr<server_conn>& c)
 bool conn_server::finish_now(const std::shared_ptr<server_conn>& c)
 {
     if (c->dead || c->keep_alive || c->waiting || c->wr_pending || c->cn_pending || c->sent < c->sending.size() ||
-        c->out.empty() || m_hooks.keeps_open(*c))
+        c->out.empty() || m_hooks.keeps_open(*c) || !m_hooks.fin_at_once(*c))
         return false;
     size_t off = 0;
     while (off < c->out.size())
@@ -404,6 +424,15 @@ void conn_server::write_done(const std::shared_ptr<server_conn>& c, int res)
     runtime_instance::stat_add(m_rt.m_stat_bytes_out, static_cast<uint64_t>(res));
     if (c->unsent() == 0 && m_hooks.written(c))
         return;
+    // Half of what held reading up is gone: the requests it brought meanwhile are answered, and reading goes on.
+    if (c->held && !c->waiting && c->unsent() <= out_max / 2)
+    {
+        c->held = false;
+        m_hooks.serve(c);
+        flush(c);
+        after_serve(c);
+        return;
+    }
     flush(c);
 }
 
@@ -430,8 +459,9 @@ void conn_server::close_conn(const std::shared_ptr<server_conn>& c)
 void conn_server::sweep(int64_t now, int64_t idle_secs)
 {
     std::vector<std::shared_ptr<server_conn>> idle;
+    // Idle with nothing owed, or owed answers the client has not read a byte of for as long.
     for (auto& [id, c] : m_conns)
-        if (now - c->last > idle_secs && !c->waiting && c->unsent() == 0 && !m_hooks.keeps_open(*c))
+        if (now - c->last > idle_secs && !m_hooks.keeps_open(*c) && (c->unsent() > 0 || !c->waiting))
             idle.push_back(c);
     for (auto& c : idle)
         close_conn(c);

@@ -385,7 +385,7 @@ void mcp_run::answer(const std::shared_ptr<socketley::http::server_conn>& c, int
 
 void mcp_run::serve(const std::shared_ptr<socketley::http::server_conn>& c)
 {
-    while (!c->dead && !c->waiting && !c->in.empty())
+    while (socketley::http::conn_server::takes_more(*c))
     {
         socketley::http::request_view v;
         int refusal = 400;

@@ -1015,7 +1015,7 @@ void db_run::reload_files(std::string& why)
 void db_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
 {
     const auto c = std::static_pointer_cast<conn>(sc);
-    while (!c->dead && !c->waiting && !c->in.empty())
+    while (socketley::http::conn_server::takes_more(*c))
     {
         request rq;
         int refusal = 400;

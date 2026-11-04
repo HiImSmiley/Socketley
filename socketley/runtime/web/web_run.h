@@ -88,8 +88,6 @@ struct web_conn : socketley::http::server_conn
     uint64_t file_off{0};
     uint64_t file_left{0};
     int sock_flags{-1};
-    // Answers pile up faster than the client reads them, so its requests wait until they are gone.
-    bool paused{false};
     // The request being answered is a HEAD, or an HTTP/1.0 one.
     bool head{false};
     bool http10{false};

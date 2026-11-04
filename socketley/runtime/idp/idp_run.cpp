@@ -436,7 +436,7 @@ void idp_run::accepted(const std::shared_ptr<conn>&)
 // Requests in order, one at a time: one whose answer waits on the storage holds those behind it.
 void idp_run::serve(const std::shared_ptr<conn>& c)
 {
-    while (!c->dead && !c->waiting && !c->in.empty())
+    while (socketley::http::conn_server::takes_more(*c))
     {
         request rq;
         int refusal = 400;

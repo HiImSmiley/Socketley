@@ -486,7 +486,7 @@ std::shared_ptr<socketley::http::server_conn> metrics_run::make_conn()
 
 void metrics_run::serve(const std::shared_ptr<socketley::http::server_conn>& c)
 {
-    while (!c->dead && !c->in.empty())
+    while (socketley::http::conn_server::takes_more(*c))
     {
         request rq;
         int refusal = 400;

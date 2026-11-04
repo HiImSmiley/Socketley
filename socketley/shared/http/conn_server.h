@@ -31,6 +31,8 @@ struct server_conn
     bool read_eof{false};
     // An answer is made on a later turn, so nothing more is read off this connection meanwhile.
     bool waiting{false};
+    // Nothing is read while more than conn_server::out_max is owed to the client; its going takes reading up again.
+    bool held{false};
     bool keep_alive{true};
     std::string in;
     // What the runtime has answered and is not yet going out; it appends here at any time.
@@ -68,6 +70,9 @@ public:
     // The far side wrote its last; true keeps the connection open for what is still to be written, which the runtime
     // then closes itself.
     virtual bool read_ended(const std::shared_ptr<server_conn>&) { return false; }
+    // Whether a connection that is not kept alive may have its last answer sent by send() and be closed in that turn;
+    // false for one whose written() still has work after its last answer.
+    virtual bool fin_at_once(const server_conn&) const { return true; }
     // A dial() came to `res`: 0 connected and reading, or a negative errno, after which the connection is let go.
     virtual void connected(const std::shared_ptr<server_conn>&, int /*res*/) {}
 };
@@ -75,6 +80,8 @@ public:
 class conn_server
 {
 public:
+    // What may be owed to one client before its next request waits for it to read.
+    static constexpr size_t out_max = 1u << 20;
     conn_server(event_loop& loop, io_handler* owner, runtime_instance& rt, conn_hooks& hooks, size_t max_conns);
 
     // The port on `addr` (network order), every shard's at once when `shared`; -1 with `why` when it cannot be.
@@ -96,9 +103,12 @@ public:
 
     // What `out` holds sent, and a connection whose answers are done closed unless it is kept alive.
     void flush(const std::shared_ptr<server_conn>& c);
-    // A connection that is not kept alive, its last answer sent by a direct send() and closed in this turn, so the FIN
-    // leaves before the client's and the TIME-WAIT is this side's; false, and nothing done, unless nothing is in flight.
-    bool finish_now(const std::shared_ptr<server_conn>& c);
+    // Whether a runtime's serve() takes the next request: not after one that closes the connection, nor while the
+    // client owes reading more than out_max of the answers.
+    static bool takes_more(const server_conn& c)
+    {
+        return !c.dead && !c.waiting && c.keep_alive && !c.in.empty() && c.unsent() <= out_max;
+    }
     // A connection whose answer waited takes up its requests again.
     void resume(const std::shared_ptr<server_conn>& c);
     void close_conn(const std::shared_ptr<server_conn>& c);
@@ -124,6 +134,11 @@ private:
     void read_done(const std::shared_ptr<server_conn>& c, int res);
     void write_done(const std::shared_ptr<server_conn>& c, int res);
     void connect_done(const std::shared_ptr<server_conn>& c, int res);
+    // After serve(): the next read, unless the connection waits, closes, or owes its client too much.
+    void after_serve(const std::shared_ptr<server_conn>& c);
+    // A connection that is not kept alive, its last answer sent by a direct send() and closed in this turn, so the FIN
+    // leaves before the client's and the TIME-WAIT is this side's; false, and nothing done, unless nothing is in flight.
+    bool finish_now(const std::shared_ptr<server_conn>& c);
     // The connection let go of by the ring at last: nothing of it is in flight any more.
     void forget_if_idle(const std::shared_ptr<server_conn>& c);
 

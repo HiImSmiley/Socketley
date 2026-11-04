@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/openat2.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
@@ -42,8 +43,6 @@ constexpr size_t max_head = 16 * 1024;
 // The body a refused method brings is read and dropped, up to this; a larger one closes the connection.
 constexpr size_t max_body = 64 * 1024;
 constexpr size_t max_conns = 65536;
-// Answers owed to one connection past this wait for it to read them before its next request is taken.
-constexpr size_t out_max = 1u << 20;
 // A body this small goes out in the write that carries its head; a larger one is sent from its descriptor.
 constexpr uint64_t inline_max = 32 * 1024;
 // What the bodies kept in memory and the compressed copies may take together.
@@ -209,7 +208,9 @@ bool web_run::start(std::string& why)
                   "; each file is looked at again on each use").c_str());
     if (!m_pool.attach(m_io))
         m_pool.stop();
-    if (!m_http.listen_tcp(m_owner.bind_in_addr(), m_owner.effective_port(), m_owner.get_shards() > 1, why))
+    // Plain HTTP that the entrance terminates TLS for, so without --bind only this machine reaches it.
+    const uint32_t addr = m_owner.get_bind_address().empty() ? htonl(INADDR_LOOPBACK) : m_owner.bind_in_addr();
+    if (!m_http.listen_tcp(addr, m_owner.effective_port(), m_owner.get_shards() > 1, why))
         return false;
     m_http.start_accepting();
     return true;
@@ -265,11 +266,11 @@ void web_run::on_tick()
 {
     const int64_t now = wall::now_sec_coarse();
     m_http.sweep(now, idle_secs);
-    // A connection waiting on a client that stopped reading is not idle to the sweep, so it is let go here.
+    // A body sent from its descriptor is no answer the sweep sees owed, so a client that stopped reading it is let go
+    // here.
     std::vector<std::shared_ptr<socketley::http::server_conn>> stalled;
     m_http.for_each([&](const std::shared_ptr<socketley::http::server_conn>& c) {
-        const auto& w = static_cast<const web_conn&>(*c);
-        if ((w.sending_body || w.paused) && now - c->last > idle_secs)
+        if (static_cast<const web_conn&>(*c).sending_body && now - c->last > idle_secs)
             stalled.push_back(c);
     });
     m_c.stalled += stalled.size();
@@ -849,14 +850,8 @@ void web_run::accepted(const std::shared_ptr<socketley::http::server_conn>&)
 void web_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
 {
     const auto c = std::static_pointer_cast<web_conn>(sc);
-    while (!c->dead && !c->waiting && !c->in.empty())
+    while (socketley::http::conn_server::takes_more(*c))
     {
-        if (c->unsent() > out_max)
-        {
-            c->paused = true;
-            c->waiting = true;
-            break;
-        }
         socketley::http::request_view v;
         int refusal = 400;
         request_fields f;
@@ -898,12 +893,6 @@ void web_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
         runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
         if (!answer_request(c, method, path, query, f) || !c->keep_alive)
             break;
-    }
-    // After a Connection: close, or a refused request, nothing more of the connection is answered.
-    if (!c->keep_alive)
-    {
-        c->in.clear();
-        m_http.finish_now(c);
     }
 }
 
@@ -1180,13 +1169,6 @@ void web_run::pump_later(const std::shared_ptr<web_conn>& c)
 bool web_run::written(const std::shared_ptr<socketley::http::server_conn>& sc)
 {
     const auto c = std::static_pointer_cast<web_conn>(sc);
-    if (c->paused)
-    {
-        // What it owed went, so its next requests are taken.
-        c->paused = false;
-        m_http.resume(c);
-        return true;
-    }
     if (!c->sending_body)
         return false;
     switch (pump(c))
