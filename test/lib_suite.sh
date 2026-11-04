@@ -139,16 +139,33 @@ suite_mem_need() {   # name -> kB to reserve
     echo $(( kb + kb / 5 + 50000 ))
 }
 
+# A reservation is a file of its own under the budget's directory, named by the run that holds it and the job's
+# shell, so a run that was killed -- by a timeout, or by hand -- leaves nothing that the next one waits on for good:
+# a reservation whose run is gone counts for nothing and is cleared. One number in one file, added to and taken
+# from, kept a killed gate's 8.6 GB for ever, and every suite after it waited on memory no one held.
+suite_budget_held() {   # -> kB held by runs that are alive
+    local f run held=0
+    for f in "$SUITE_BUDGET_FILE.d"/*; do
+        [ -f "$f" ] || continue
+        run=${f##*/}; run=${run%%.*}
+        if kill -0 "$run" 2>/dev/null; then held=$((held + $(cat "$f" 2>/dev/null || echo 0)))
+        else rm -f "$f"; fi
+    done
+    echo "$held"
+}
+
 suite_budget_reserve() {   # kB
-    local budget held
+    local budget held ticket
+    mkdir -p "$SUITE_BUDGET_FILE.d"
+    ticket="$SUITE_BUDGET_FILE.d/${SUITE_TAG_RUN##*.}.$BASHPID"
     exec 8>"$SUITE_BUDGET_FILE.lock"
     while :; do
         # What the files' own /tmp holds, when it is tmpfs, is memory no reservation counts.
         budget=$(awk '/^MemTotal:/ { t = $2 } /^Shmem:/ { s = $2 } END { print t - s - 3145728 }' /proc/meminfo)
         flock 8
-        held=$(cat "$SUITE_BUDGET_FILE" 2>/dev/null || echo 0)
+        held=$(suite_budget_held)
         if [ "$held" -le 0 ] || [ $((held + $1)) -le "$budget" ]; then
-            echo $((held + $1)) > "$SUITE_BUDGET_FILE"
+            echo "$1" > "$ticket"
             flock -u 8; exec 8>&-
             return 0
         fi
@@ -158,13 +175,7 @@ suite_budget_reserve() {   # kB
 }
 
 suite_budget_release() {   # kB
-    local held
-    exec 8>"$SUITE_BUDGET_FILE.lock"
-    flock 8
-    held=$(cat "$SUITE_BUDGET_FILE" 2>/dev/null || echo 0)
-    held=$((held - $1)); [ "$held" -lt 0 ] && held=0
-    echo "$held" > "$SUITE_BUDGET_FILE"
-    flock -u 8; exec 8>&-
+    rm -f "$SUITE_BUDGET_FILE.d/${SUITE_TAG_RUN##*.}.$BASHPID"
 }
 
 # Every two seconds, each tagged job's processes summed and its peak kept in `dir`/<tag>.mem.
@@ -207,8 +218,8 @@ suite_job() {   # name command
 suite_run_jobs() {   # list dir parallel
     local list=$1 dir=$2 par=$3
     export SUITE_JOB_DIR="$dir"
-    export -f suite_mem_need suite_budget_reserve suite_budget_release suite_ns_run suite_job
-    export SUITE_MEM_RECORD SUITE_BUDGET_FILE SOCKETLEY_CONFIG NS_ROOT
+    export -f suite_mem_need suite_budget_held suite_budget_reserve suite_budget_release suite_ns_run suite_job
+    export SUITE_MEM_RECORD SUITE_BUDGET_FILE SUITE_TAG_RUN SOCKETLEY_CONFIG NS_ROOT
     awk -F'\t' '{ print $1 }' "$list" | while IFS= read -r name; do
         printf '%s\0' "$name"
     done | xargs -0 -I{} -P"$par" bash -c '

@@ -435,7 +435,7 @@ run_one_parallel() {   # file -> its log, exit code and seconds in RESDIR
     echo $(( $(date +%s) - t0 )) > "$RESDIR/$name.secs"
     suite_budget_release "$need"
 }
-export -f run_file run_one_parallel suite_mem_need suite_budget_reserve suite_budget_release
+export -f run_file run_one_parallel suite_mem_need suite_budget_held suite_budget_reserve suite_budget_release
 export SUITE_MEM_RECORD SUITE_BUDGET_FILE
 export RESDIR
 
