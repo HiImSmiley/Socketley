@@ -18490,15 +18490,22 @@ WebSocket, no raw TCP, no upload. It is what a documentation site, a blog built
 by a static site generator or a single\-page app's build is put behind.
 .PP
 .nf
-socketley create web docs \-p 9500 \-\-bind 127.0.0.1 \-\-root /srv/docs/current \-\-domain docs \-s
-socketley create web www  \-p 9501 \-\-bind 127.0.0.1 \-\-root /var/www/html \-\-domain example.com \-s
+socketley create web docs \-p 9500 \-\-root /srv/docs/current \-\-domain docs \-s
+socketley create web www  \-p 9501 \-\-root /var/www/html \-\-domain example.com \-s
 .fi
 .PP
 It speaks plain HTTP/1.1 on its port and is reached through the entrance proxy,
 which terminates TLS and HTTP/2 for its
 .B \-\-domain
 as for every other name; a name with a dot is taken whole, so the second line
-above answers the zone's own name.
+above answers the zone's own name. Unlike the other runtimes it binds
+.B 127.0.0.1
+unless
+.B \-\-bind
+says otherwise, since what it speaks is plain HTTP that only the entrance should
+reach;
+.B "\-\-bind 0.0.0.0"
+opens it to the network.
 .B \-\-tls
 and
 .B \-\-lua

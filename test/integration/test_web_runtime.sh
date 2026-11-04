@@ -70,6 +70,7 @@ out=$("$BIN" create web scripted -p $((P+5)) --root "$W" --lua "$T/x.lua" -s 2>&
 "$BIN" create web site -p "$P" --root "$R/current" -s >/dev/null 2>&1 || bad "a web runtime is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for _ in $(seq 1 50); do curl -s -o /dev/null "$U/" && break; sleep 0.1; done
 has "ps lists it as web" "$("$BIN" ps 2>&1)" 'site +web'
+has "without --bind it listens on this machine only" "$(ss -ltnH "( sport = :$P )")" "127\\.0\\.0\\.1:$P"
 
 # ─── Addresses ──────────────────────────────────────────────────────────────
 expect "/ is the index" "$(get "$U/")" "$(sha "$W/index.html")"

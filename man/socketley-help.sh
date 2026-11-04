@@ -1020,8 +1020,9 @@ runtime_types() {
     echo -e "${CYAN}│${NC}   sees a change or a new release at once. No script, no WS.    ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Flags: --root dir (required), --index index.html,              ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}        --fallback index.html (a single-page app's routes)      ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} Example: socketley create web docs -p 9500 --bind 127.0.0.1 \\  ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}   --root /srv/docs --domain docs -s                            ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Binds 127.0.0.1 unless --bind: the entrance terminates TLS.    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Example: socketley create web docs -p 9500 --root /srv/docs \\  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   --domain docs -s                                             ${CYAN}│${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
