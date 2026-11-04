@@ -1484,21 +1484,21 @@
     "VictoriaMetrics 1.112"
    ],
    "tool": "50 targets × 2000 series, scraped every 1 s by all three at once",
-   "commit": "9f644c07",
-   "passes": 7,
-   "date": "2026-11-03",
+   "commit": "b1cec63f",
+   "passes": 5,
+   "date": "2026-11-04",
    "rows": [
     {
      "name": "CPU per sample ingested",
      "v": [
-      0.28,
-      0.743,
-      1.025
+      0.312,
+      0.84,
+      1.285
      ],
      "cpu": [
-      0.028,
-      0.074,
-      0.102
+      0.031,
+      0.084,
+      0.128
      ],
      "ccpu": [
       0,
@@ -1507,14 +1507,14 @@
      ],
      "r": [
       [
-       2.692,
-       2.568,
-       2.736
+       2.695,
+       2.626,
+       2.763
       ],
       [
-       3.683,
-       3.58,
-       3.845
+       4.14,
+       4.096,
+       4.333
       ]
      ],
      "unit": "µs",
@@ -1523,40 +1523,8 @@
     {
      "name": "resident memory",
      "v": [
-      277.0,
-      363.0,
-      119.0
-     ],
-     "cpu": [
-      null,
-      null,
-      null
-     ],
-     "ccpu": [
-      0,
-      0,
-      0
-     ],
-     "r": [
-      [
-       1.201,
-       1.044,
-       1.964
-      ],
-      [
-       0.429,
-       0.295,
-       0.788
-      ]
-     ],
-     "unit": "MB",
-     "better": "lower"
-    },
-    {
-     "name": "range query, 5 min of every path",
-     "v": [
-      210.0,
-      669.0,
+      88.117,
+      398.0,
       118.0
      ],
      "cpu": [
@@ -1571,14 +1539,46 @@
      ],
      "r": [
       [
-       3.175,
-       2.983,
-       3.254
+       4.292,
+       3.514,
+       4.964
       ],
       [
-       0.561,
-       0.53,
-       1.211
+       1.32,
+       1.271,
+       1.479
+      ]
+     ],
+     "unit": "MB",
+     "better": "lower"
+    },
+    {
+     "name": "range query, 5 min of every path",
+     "v": [
+      102.0,
+      716.0,
+      153.0
+     ],
+     "cpu": [
+      null,
+      null,
+      null
+     ],
+     "ccpu": [
+      0,
+      0,
+      0
+     ],
+     "r": [
+      [
+       7.181,
+       5.846,
+       8.744
+      ],
+      [
+       1.497,
+       1.158,
+       1.811
       ]
      ],
      "unit": "ms",
@@ -1588,7 +1588,7 @@
    "unit": "µs",
    "better": "lower",
    "pin": "all three at once on the same two cores, the targets on four others; each pass a 60 s window",
-   "note": "50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.",
+   "note": "50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated. This set was measured on a 16-core development machine, not the box above, until the next round there.",
    "headline": 0
   },
   {
