@@ -36,6 +36,11 @@ struct body
 {
     // Content-Type through the last fixed field, each ending in CRLF, without the length.
     std::string fields;
+    // Those of them a 304 repeats: ETag, Cache-Control and Vary.
+    std::string revalidation;
+    // The whole head of a 200 kept alive, and of a 304, made again when the second of their Date field passes.
+    mutable std::string ready, ready_304;
+    mutable int64_t ready_sec{-1}, ready_304_sec{-1};
     std::string etag;
     int64_t mtime_s{0};
     uint64_t size{0};

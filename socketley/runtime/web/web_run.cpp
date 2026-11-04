@@ -117,6 +117,21 @@ bool read_cached(int fd, std::string& out, uint64_t n)
     return true;
 }
 
+// The lines of `fields` a 304 repeats (RFC 9110 15.4.5): what a 200 says of the cache, and nothing of the body.
+std::string revalidation_of(std::string_view fields)
+{
+    std::string keep;
+    for (std::string_view rest = fields; !rest.empty();)
+    {
+        const size_t nl = rest.find("\r\n");
+        const std::string_view line = rest.substr(0, nl + 2);
+        rest.remove_prefix(nl + 2);
+        if (line.starts_with("ETag:") || line.starts_with("Cache-Control:") || line.starts_with("Vary:"))
+            keep.append(line);
+    }
+    return keep;
+}
+
 int64_t mtime_ns_of(const struct stat& st)
 {
     return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
@@ -518,6 +533,7 @@ std::shared_ptr<const body> web_run::make_body(const std::string& rel, int fd, c
     if (coding.empty())
         h.append("Accept-Ranges: bytes\r\n");
     h.append("X-Content-Type-Options: nosniff\r\n");
+    b->revalidation = revalidation_of(h);
 
     if (b->size == 0)
     {
@@ -558,6 +574,7 @@ void web_run::warm(entry& e)
     b->kept = m_kept;
     b->counted_bytes = old.size;
     b->fields = old.fields;
+    b->revalidation = old.revalidation;
     b->etag = old.etag;
     b->mtime_s = old.mtime_s;
     b->size = old.size;
@@ -821,6 +838,7 @@ void web_run::ask_compress(const std::shared_ptr<entry>& e)
             b->fields.append(b->etag).append("\"\r\nLast-Modified: ").append(socketley::http::http_date_of(b->mtime_s));
             b->fields.append("\r\nCache-Control: ").append(cache_control(e->rel, type));
             b->fields.append("\r\nVary: Accept-Encoding\r\nX-Content-Type-Options: nosniff\r\n");
+            b->revalidation = revalidation_of(b->fields);
             if (out->fd >= 0)
             {
                 b->fd = out->fd;
@@ -839,7 +857,8 @@ void web_run::ask_compress(const std::shared_ptr<entry>& e)
 
 std::shared_ptr<socketley::http::server_conn> web_run::make_conn()
 {
-    return std::make_shared<web_conn>();
+    // The read buffer is written before it is read, so it is not cleared for each connection.
+    return std::make_shared_for_overwrite<web_conn>();
 }
 
 void web_run::accepted(const std::shared_ptr<socketley::http::server_conn>&)
@@ -883,15 +902,16 @@ void web_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
             break;
         }
         // The views point into `in`, which the erase below moves.
-        const std::string method(v.method), path(v.path), query(v.query);
-        const size_t line_end = c->in.find("\r\n");
-        c->http10 = std::string_view(c->in).substr(0, line_end).ends_with(" HTTP/1.0");
-        c->in.erase(0, v.head_len + v.body_len);
+        // Answered from views into `in`, which is let go of only after: an answer writes to `out` alone.
+        const size_t used = v.head_len + v.body_len;
+        c->http10 = std::string_view(c->in).substr(0, c->in.find("\r\n")).ends_with(" HTTP/1.0");
         c->keep_alive = !v.close;
-        c->head = method == "HEAD";
+        c->head = v.method == "HEAD";
         ++m_c.requests;
         runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
-        if (!answer_request(c, method, path, query, f) || !c->keep_alive)
+        const bool more = answer_request(c, v.method, v.path, v.query, f);
+        c->in.erase(0, used);
+        if (!more || !c->keep_alive)
             break;
     }
 }
@@ -997,17 +1017,19 @@ bool web_run::answer_file(const std::shared_ptr<web_conn>& c, const entry& e, co
         if (pc == h::precondition::not_modified)
         {
             ++m_c.not_modified;
-            // What a 200 would have said of the cache, and nothing of the body (RFC 9110 15.4.5).
-            std::string keep;
-            for (std::string_view rest = b->fields; !rest.empty();)
+            if (!c->keep_alive || c->http10)
             {
-                const size_t nl = rest.find("\r\n");
-                const std::string_view line = rest.substr(0, nl + 2);
-                rest.remove_prefix(nl + 2);
-                if (line.starts_with("ETag:") || line.starts_with("Cache-Control:") || line.starts_with("Vary:"))
-                    keep.append(line);
+                answer_plain(c, 304, {}, b->revalidation);
+                return true;
             }
-            answer_plain(c, 304, {}, keep);
+            const std::string& date = date_field();
+            if (b->ready_304_sec != m_date_sec)
+            {
+                b->ready_304.assign("HTTP/1.1 304 Not Modified\r\n").append(date);
+                b->ready_304.append("X-Content-Type-Options: nosniff\r\n").append(b->revalidation).append("\r\n");
+                b->ready_304_sec = m_date_sec;
+            }
+            c->out.append(b->ready_304);
             return true;
         }
         if (pc == h::precondition::failed)
@@ -1042,6 +1064,22 @@ bool web_run::answer_file(const std::shared_ptr<web_conn>& c, const entry& e, co
     }
     if (b != e.plain)
         ++m_c.compressed;
+
+    // The common answer, a whole file from memory on a connection kept alive, is its kept head and its bytes.
+    if (status == 200 && b->in_memory && !c->head && c->keep_alive && !c->http10)
+    {
+        const std::string& date = date_field();
+        if (b->ready_sec != m_date_sec)
+        {
+            b->ready.assign("HTTP/1.1 200 OK\r\n").append(date).append(b->fields).append("Content-Length: ");
+            b->ready.append(std::to_string(b->size)).append("\r\n\r\n");
+            b->ready_sec = m_date_sec;
+        }
+        if (b->size)
+            ++m_c.from_memory;
+        c->out.append(b->ready).append(b->bytes);
+        return true;
+    }
 
     std::string head;
     head.reserve(160 + b->fields.size());

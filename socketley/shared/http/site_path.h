@@ -32,6 +32,13 @@ inline bool hidden_path(std::string_view path)
 // nothing under a root: no leading slash, a NUL, or a "." or ".." segment, which a decoded %2e%2e spells as well.
 inline bool site_path(std::string_view raw, std::string& out)
 {
+    // Nothing to decode or merge, and no dot segment: most paths, taken as they are.
+    if (!raw.empty() && raw.front() == '/' && raw.find_first_of(std::string_view("%\0", 2)) == std::string_view::npos &&
+        raw.find("//") == std::string_view::npos && raw.find("/.") == std::string_view::npos)
+    {
+        out.assign(raw);
+        return true;
+    }
     std::string decoded;
     if (raw.empty() || raw.front() != '/' || !percent_decode(raw, decoded, false, bad_escape::keep))
         return false;
