@@ -19606,13 +19606,14 @@ runtime stops it with an error, exactly as if the script had called
 The daemon logs the reason, the callback's usual failure path runs, and the
 runtime goes on serving.
 .PP
-The bound exists because the event loop is a single thread that serves every
-runtime in the daemon. Without it,
+The bound exists because a process serves its runtimes on one event loop, on
+one thread. Without it,
 .B "while true do end"
-in any callback froze every runtime, including traffic, the metrics endpoint and
-the IPC socket. Only
+in any callback would freeze that process for good. In a worker it would stop
+that runtime; in the daemon it would also stop the metrics endpoint and the IPC
+socket. Only
 .B "kill \-9"
-recovered from that.
+would end it.
 .PP
 The budget applies to:
 .RS
@@ -20280,11 +20281,9 @@ self.cache(command)        -- Run one command against the LINKED cache and
                            -- the answer is not coming.
 
 -- ─── A handler that waits ───
--- Every callback used to run to the end in one go, so a script could answer
--- only out of what it already held.  A server linked to a cache could not read
--- that cache at all, and the one call that reaches outside the process --
--- socketley.http -- did it by blocking the event loop for every runtime in the
--- daemon.  In a handler that waits, it now waits too.
+-- In a handler that can wait, a call that reaches outside the runtime
+-- (self.cache, socketley.http) suspends the handler until the answer comes,
+-- and the runtime keeps serving other clients meanwhile.
 --
 --     function on_client_message(id, msg)
 --         local v, err = self.cache("get " .. msg)
@@ -21919,7 +21918,12 @@ The runtime is active and processing I/O.
 The runtime is stopped and can be started again.
 .TP
 .B failed
-Setup failed, and the runtime cannot recover.
+The runtime could not start, or its worker died more than five times in ten
+seconds.
+.B ls
+shows the reason.
+It stays failed until it is started again: fix the cause, then run
+.BR "socketley start" .
 .SH EXAMPLES
 Create a simple server (on an installed system, systemd manages the daemon):
 .PP
@@ -25310,8 +25314,10 @@ A proxy in
 mode is not affected by any of this. It was already a byte relay and never looked
 at a status line.
 .SS What can stop the event loop
-One thread serves every runtime in a process, so a call that waits stops all of
-them. Five places make such calls, and they are listed here.
+A process serves its runtimes on one thread: a worker serves its one runtime,
+and the daemon serves the runtimes that scripts make in it. A call that waits
+therefore stops every runtime of that process. Five places make such calls,
+and they are listed here.
 .PP
 The figures were measured where measuring was possible, on a Lua echo server
 and a static file server under load. Each cost is given as a share of a
@@ -25856,7 +25862,13 @@ Success.
 An error, such as an invalid command, a runtime that was not found, or a rejected TLS flag.
 .TP
 .B 2
-A fatal error.
+A fatal error, or no answer in time: the daemon could not be reached, or a
+runtime's workers stopped answering before it was serving (see
+.B create
+and
+.BR start ).
+The runtime may still come up; check with
+.BR "socketley ls" .
 .SH SEE ALSO
 .BR docker (1),
 .BR nginx (1),
