@@ -325,23 +325,33 @@ function benchSet(s) {
   const notes = el('details', { class: 'bn' }, el('summary', { text: 'How it was measured' }),
     el('p', { text: [s.tool, s.pin].filter(Boolean).join('; ') + '.' }));
   if (s.note) { const p = el('p'); p.innerHTML = s.note; notes.append(p); }
-  // The same rows for a narrow card: one line a server, its ratio beside it.
-  const comp = el('div', { class: 'bcomp' }, s.rows.map(r => el('div', { class: 'br' }, el('div', { class: 'bn2', text: r.name }),
-    el('div', { class: 'bg' }, arms.flatMap((a, k) => {
+  // The same rows for a narrow card: one grid for the whole set, so every column lines up; a line a server.
+  const comp = el('div', { class: 'bcomp' }, s.rows.flatMap((r, i) => [el('div', { class: 'bn2' + (i ? '' : ' first'), text: r.name }),
+    ...arms.flatMap((a, k) => {
       const q = k ? r.r?.[k - 1] : null;
       const cls = q ? (q[1] > 1 ? 'up' : q[2] < 1 ? 'dn' : 'eq') : '';
       return [el('span', { class: 'a' + (k ? '' : ' us'), text: short(a) }),
         el('span', { class: 'v' + (k ? '' : ' us'), text: fmt(r.v[k], r.unit || s.unit) }),
         el('span', { class: 'q ' + cls, text: q ? q[0].toFixed(2) + '×' : '' }),
         el('span', { class: 'ci', text: q ? q[1].toFixed(2) + '–' + q[2].toFixed(2) : '' })];
-    })))));
-  return el('div', { class: 'bset' + (arms.length > 2 ? ' a3' : ''), id: 'bench:' + s.id },
+    })]));
+  const card = el('div', { class: 'bset' + (arms.length > 2 ? ' a3' : ''), id: 'bench:' + s.id },
     el('h3', {}, el('span', { text: s.title })),
     el('div', { class: 'meta', text: meta.join(' · ') }),
     el('div', { class: 'mtw' }, el('table', { class: 'btbl' + (arms.length > 2 ? ' a3' : '') }, el('thead', {}, head), el('tbody', {}, body))), comp,
     s.caveat ? el('p', { class: 'cav', text: '⚠ ' + s.caveat[0].toUpperCase() + s.caveat.slice(1) + '.' }) : null,
     notes);
+  FIT?.observe(card);
+  return card;
 }
+// A card shows the table while the table fits it, and the compact rows once it would have to scroll.
+const FIT = typeof ResizeObserver === 'function' ? new ResizeObserver(es => {
+  for (const { target: b } of es) {
+    const m = b.querySelector('.mtw');
+    b.classList.remove('cmp');
+    if (m.scrollWidth > m.clientWidth + 1) b.classList.add('cmp');
+  }
+}) : null;
 function benchLegend(page) {
   return el('div', { class: 'legend' },
     el('div', { class: 'lx' }, el('b', { text: '×' }), ' is how many times better socketley did: more per second, or less time, memory or CPU. Above 1× it is ahead.'),

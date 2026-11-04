@@ -101,7 +101,7 @@ pre.code:hover .cp,pre.code .cp:focus{opacity:1}
 .tile .s{font-size:12.5px;color:var(--mut);line-height:1.4}
 
 /* ─── tabs of a runtime ─────────────────────────────────────────────────────────────────────────────────────── */
-.tabs{position:sticky;top:0;z-index:20;display:flex;gap:4px;margin:0 0 30px;padding:0;border-bottom:1px solid var(--line);
+.tabs{position:sticky;top:0;z-index:20;display:flex;width:fit-content;max-width:100%;gap:4px;margin:0 0 30px;padding:0 4px;border-radius:10px 10px 0 0;border-bottom:1px solid var(--line);
   background:linear-gradient(180deg,rgba(8,8,14,.92),rgba(8,8,14,.82));backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);overflow-x:auto;scrollbar-width:none}
 .tabs a{flex:none;display:inline-flex;align-items:center;gap:7px;padding:12px 14px 10px;line-height:1.2;color:var(--mut);text-decoration:none;font-weight:600;font-size:14px;border-bottom:2px solid transparent;margin-bottom:-1px}
 .tabs a:hover{color:var(--fg)}
@@ -199,8 +199,8 @@ table.mt td:first-child{font-family:var(--mono);font-size:12.5px;color:var(--fg)
 .btbl{width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;font-variant-numeric:tabular-nums}
 .btbl th{text-align:right;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);padding:6px 10px;border-bottom:1px solid var(--line2);white-space:nowrap;font-weight:650}
 .btbl th:first-child,.btbl td:first-child{text-align:left;padding-left:0}
-.btbl td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap;vertical-align:top}
-.btbl td:first-child{white-space:normal;color:#d5d9e6;min-width:180px}
+.btbl td{padding:8px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap;vertical-align:top}
+.btbl td:first-child{white-space:normal;color:#d5d9e6;min-width:150px}
 .btbl td.us .v{color:var(--fg);font-weight:650}
 .btbl .cpu{color:var(--dim);font-size:11.5px;font-weight:400;margin-top:1px}
 .btbl td.rt{font-weight:700;font-size:14px}
@@ -246,14 +246,15 @@ table.mt td:first-child{font-family:var(--mono);font-size:12.5px;color:var(--fg)
 /* ─── narrow screens ────────────────────────────────────────────────────────────────────────────────────────── */
 @media (max-width:900px){
   #content{padding:0 20px 120px}
-  .tabs{margin:0 -20px 24px;padding:6px 20px 0}
+  .tabs{margin:0 0 24px}
   .ftbl td.mx{display:none}
   #top kbd{display:none}
 }
 @media (max-width:640px){
   .ph{padding:28px 0 16px}
   .ph .lead{font-size:16px}
-  .tabs a{padding:10px 10px 12px;font-size:13.5px}
+  .tabs{gap:0;padding:0 2px}
+  .tabs a{padding:11px 9px 9px;font-size:13.5px}
   .tabs a .n{display:none}
   .prose{font-size:15.5px}
   .ftbl,.ftbl tbody,.ftbl tr.f,.ftbl tr.x,.ftbl.ex tr{display:block}
@@ -330,20 +331,18 @@ pre.code{white-space:pre-wrap;overflow-wrap:anywhere}
 @media (max-width:640px){.prose table.kv3 td:first-child{max-width:none;min-width:0}}
 
 /* A benchmark card too narrow for the table: per row, one line a server, its ratio and range beside it. */
-.bcomp{display:none}
-.bcomp .br{padding:10px 0;border-bottom:1px solid var(--line)}
-.bcomp .br:last-child{border-bottom:0}
-.bcomp .bn2{font-weight:650;color:var(--fg);font-size:13.5px;margin-bottom:5px}
-.bcomp .bg{display:grid;grid-template-columns:minmax(5.5em,max-content) max-content 4.2em max-content;justify-content:start;column-gap:18px;row-gap:3px;align-items:baseline;font-size:13.5px;font-variant-numeric:tabular-nums}
+.bcomp{display:none;grid-template-columns:max-content max-content max-content minmax(0,1fr);column-gap:22px;row-gap:4px;align-items:baseline;font-size:13.5px;font-variant-numeric:tabular-nums}
+.bcomp .bn2{grid-column:1/-1;contain:inline-size;font-weight:650;color:var(--fg);padding-top:12px;margin-top:8px;border-top:1px solid var(--line)}
+.bcomp .bn2.first{border-top:0;margin-top:0;padding-top:4px}
 .bcomp .a{color:var(--mut)}.bcomp .a.us{color:#d5d9e6}
 .bcomp .v{text-align:right;color:#d5d9e6}.bcomp .v.us{color:var(--fg);font-weight:650}
 .bcomp .q{text-align:right;font-weight:700}
 .bcomp .q.up{color:var(--ok)}.bcomp .q.dn{color:var(--bad)}.bcomp .q.eq{color:var(--mut)}
 .bcomp .ci{color:var(--dim);font-size:11.5px}
-@container (max-width:600px){.bset .mtw{display:none}.bset .bcomp{display:block}}
-@container (max-width:860px){.bset.a3 .mtw{display:none}.bset.a3 .bcomp{display:block}}
-@container (max-width:380px){.bcomp .bg{grid-template-columns:minmax(0,1fr) max-content 4.2em;justify-content:stretch;column-gap:12px}.bcomp .ci{display:none}}
+.bset.cmp .mtw{display:none}.bset.cmp .bcomp{display:grid}
+@container (max-width:330px){.bset .bcomp{column-gap:12px;grid-template-columns:minmax(0,1fr) max-content max-content}.bcomp .ci{display:none}}
 /* An opened manual entry ends where its text ends. */
 .man .ent.c.open{padding-bottom:6px}
 .man .ent.c.open>.eb :is(p,ul,pre,div,details):last-child{margin-bottom:0}
 .man .ent.c.open>.er{padding-bottom:4px}
+@media (max-width:400px){.tabs a{padding:11px 7px 9px;font-size:13px}}
