@@ -1601,8 +1601,9 @@ bool proxy_instance::resolve_backend(backend_info& b)
         // -- so this fires only while that address IS that runtime, and the
         // moment it stops being, the address means what it says again.
         const std::vector<std::string>* nodes = published_nodes(b);
+        // One node too goes through configure_node_backends, which records it, so follow_published_nodes sees it go.
         if (nodes && nodes->size() == 1)
-            return configure_unix_backend(b, nodes->front(), "\"" + b.address + "\"");
+            return configure_node_backends(b, *nodes, "\"" + b.address + "\"");
 
         if (inet_pton(AF_INET, b.resolved_host.c_str(), &b.cached_addr.sin_addr) == 1)
         {
@@ -1669,7 +1670,7 @@ bool proxy_instance::resolve_backend(backend_info& b)
     // refused rather than quietly dropped one line further down.
     const std::vector<std::string>* nodes = published_nodes(b);
     if (nodes && nodes->size() == 1)
-        return configure_unix_backend(b, nodes->front(), "\"" + b.address + "\"");
+        return configure_node_backends(b, *nodes, "\"" + b.address + "\"");
 
     b.resolved_host = ep->host;
     b.resolved_port = ep->port;
