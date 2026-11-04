@@ -211,7 +211,7 @@ constexpr row rows[] = {
     {"--archive-credentials", "R", "path", "Archive keys", "A file with the bucket's access_key and secret_key, in the form sync reads.", "Archive", {}, "/etc/socketley/metrics.s3"},
 
     // ── mqtt ────────────────────────────────────────────────────────────────
-    {"--users", "M", "path", "Users", "Password accounts, one user:hash per line, as `socketley mqtt-passwd` writes them.", "MQTT", {}, "/etc/socketley/mqtt.users"},
+    {"--users", "M", "path", "Users", "Password accounts, one user:hash per line, as `socketley mqtt passwd` writes them.", "MQTT", {}, "/etc/socketley/mqtt.users"},
     {"--idp", "M", "text", "Identity provider", "The idp runtime whose access tokens sign clients in, given as the password.", "MQTT", {}, "auth"},
     {"--idp-audience", "M", "list", "Token clients", "The idp's clients whose access tokens it takes; a token of any other is refused.", "MQTT", {}, "spa"},
     {"--acl", "M", "path", "Access rules", "Who may publish and subscribe to what: user, topic and pattern lines, read again when it changes.", "MQTT", {}, "/etc/socketley/mqtt.acl"},
@@ -235,7 +235,7 @@ constexpr row rows[] = {
     {"--idp", "E", "text", "Identity provider", "The idp runtime whose users have mailboxes here and sign in to send.", "Mail", {}, "auth"},
     {"--idp-audience", "E", "list", "Token clients", "The idp's clients whose access tokens it takes; a token of any other is refused.", "Mail", {}, "spa"},
     {"--storage", "E", "text", "Mailboxes", "The storage runtime, and bucket, the mailboxes are kept in.", "Mail", {}, "files/mail"},
-    {"--users", "E", "path", "Users", "Accounts that sign in to send, one user:hash per line, as `socketley mqtt-passwd` writes them.", "Mail", {}, "/etc/socketley/mail.users"},
+    {"--users", "E", "path", "Users", "Accounts that sign in to send, one user:hash per line, as `socketley mqtt passwd` writes them.", "Mail", {}, "/etc/socketley/mail.users"},
     {"--aliases", "E", "path", "Aliases", "Addresses it accepts besides the users', one `address target` per line.", "Mail", {}, "/etc/socketley/mail.aliases"},
     {"--relay", "E", "text", "Smarthost", "Send all mail for elsewhere through this server, smtp[s]://[user:password@]host[:port].", "Mail", {}, "smtps://user:pw@smtp.example.net"},
     {"--submission", "E", "int", "Submission port", "A port users send from with STARTTLS and a password.", "Mail ports", {}, "587"},

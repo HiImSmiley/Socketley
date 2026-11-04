@@ -4,7 +4,7 @@
 .\"
 .TH SOCKETLEY 1 "2026" "socketley" "User Commands"
 .SH NAME
-socketley \- manage network runtimes (servers, clients, proxies, Redis-compatible caches, S3 object storage, DNS) in Docker-like style
+socketley \- run and supervise network runtimes (servers, proxies, caches, S3 storage, DNS, MQTT, mail and more) from one daemon
 .SH SYNOPSIS
 .B socketley
 .I command
@@ -15,7 +15,7 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .RB [ \-\-cpus
 .IR set ]
 .RB [ \-\-fast\-lo
-.RB [ own | all ]]
+.RB [ own | all | trust ]]
 .RB [ \-\-fast\-lo\-limit
 .IR P , G ]
 .br
@@ -125,9 +125,26 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .I dir
 .SH DESCRIPTION
 .B socketley
+is one program.
+.B "socketley daemon"
+runs the daemon, which creates, starts, stops and supervises runtimes.
+Most other invocations, such as
+.BR "socketley create" " or " "socketley ls" ,
+are the command line: each sends its command to the daemon over a unix socket,
+and starts the daemon first if none is running.
+A runtime made with
+.B create
+runs in its own worker process, which the daemon restarts if it exits.
+In that process, one io_uring event loop on one thread serves the runtime.
+The daemon saves each runtime's configuration as a JSON file and restores
+every saved runtime when it starts.
+.PP
+.B socketley
 is a high-performance Linux daemon and CLI that manages network runtimes
-(servers, clients, proxies, Redis-compatible caches, S3 object storage, authoritative DNS, MQTT brokers) in a
-Docker-like style.
+in a Docker-like style: servers, clients, proxies, Redis-compatible caches,
+S3 object storage, authoritative DNS, file sync jobs, an OpenID Connect
+provider, JSON document stores, MQTT brokers, mail servers, tunnels, a
+Prometheus-compatible metrics store and MCP servers.
 It supports clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
 .B "TLS can terminate on a server or cache listener, on both legs of a proxy, and on a client's outgoing connection."
@@ -230,7 +247,8 @@ It is the command-line form of
 when both are given, the flag wins.
 .B daemon
 also accepts
-.B \-\-fast\-lo
+.BR \-\-fast\-lo ,
+.B \-\-fast\-lo\-limit
 (below) and the experimental Raft flags described under
 .BR "CLUSTER MODE" .
 It refuses any other argument.
@@ -239,7 +257,8 @@ These flags cannot be combined with
 .B \-\-name
 or
 .BR \-\-cluster ,
-which address a daemon that is already running.
+which configure a running daemon.
+When none is running, they start one without these flags first.
 A ring's CPU set is fixed when the ring is created, so there would be nothing
 left for them to change.
 .IP
@@ -784,7 +803,7 @@ in this form as well. The types add these verbs:
 .BR ttl ", " persist ", " lpush ", " rpush ", " lpop ", " rpop ", " llen ", "
 .BR lrange ", " lindex ", " sadd ", " srem ", " sismember ", " scard ", "
 .BR smembers ", " hset ", " hget ", " hdel ", " hlen ", " hgetall ", "
-.BR publish ", " flush ", " load ", " memory ", " send
+.BR publish ", " flush ", " load ", " memory
 (each runs the RESP command of the same name, with its arguments after it)
 .TP
 .B db
@@ -811,7 +830,7 @@ in this form as well. The types add these verbs:
 .BR query ", " query_range ", " series ", " targets ", " rules ", " alerts ", "
 .BR logs ", " stats
 .TP
-.BR server ", " client ", " proxy
+.BR server ", " client
 .B send
 .RE
 .IP
@@ -865,9 +884,15 @@ The text comes from
 or stdin.
 An HTML part from a file can go beside the text, and attachments are sent in
 base64.
-Every flag except
-.B \-\-to
+.BR \-\-to ,
+.BR \-\-cc ,
+.BR \-\-bcc ,
+.BR \-\-header ,
+.B \-\-attach
+and
+.B \-\-inline
 can be given as often as needed.
+For any other flag, the last value given is used.
 A name or address may take the form
 .BR "Name <a@b>" .
 Without
@@ -1954,6 +1979,14 @@ runtime of the daemon that serves the name's zone, as
 .B \-\-acme
 describes.
 A wildcard name takes dns-01 by itself.
+.BI "\-\-dns\-zones " zone\fR[\fB,\fIzone\fR...]
+names zones that a
+.B dns
+runtime of the daemon serves.
+A name in one of them is proven over dns-01 whatever
+.B \-\-challenge
+says, and the other names use
+.BR \-\-challenge .
 .IP
 The command writes the chain and a new key to the
 .B \-\-cert
@@ -1963,8 +1996,9 @@ files, the key first.
 By default these are the files that
 .B \-\-acme
 uses for the first name, so a runtime serving them picks them up.
-It needs no daemon to be running, only one of the daemon's runtimes on the
-port the challenge is asked on.
+It does not talk to the daemon.
+It writes each answer to a file that the daemon's runtimes read, so one of
+them must be running on the port the challenge is asked on.
 On success it prints nothing; otherwise it prints the CA's reason and exits
 with status 2.
 A runtime with
@@ -2273,10 +2307,7 @@ Every other flag that
 accepts on a running runtime is stored and takes effect at that runtime's next
 start.
 This is not a policy choice.
-A
-.B \-p
-is a bound socket, and the TLS flags are a context that the open handshakes
-already used.
+The TLS flags are a context that the open handshakes already used.
 A proxy's backends are open connections, and a server's
 .B \-\-http
 directory decides what a request in flight is answered from.
@@ -3003,7 +3034,7 @@ is unchanged, so anything that parses it still sees only running runtimes.
 .BR \-\-name ,
 .BR \-\-type ,
 .BR \-\-port ,
-.BR \-\-uptime ,
+.BR \-\-uptime " (or " \-\-status ),
 .BR \-\-conn ,
 .BR \-\-owner ,
 .BR \-\-created .
@@ -3478,7 +3509,7 @@ the old number.
 .BI "\-\-write\-buffer " "size"
 The most unsent data the runtime queues for one connection before it drops that
 connection. Takes a size with K, M or G. Default 8M. Every runtime has a write
-queue, so this applies to all four types. On a client, the queue that fills is
+queue, so this applies to every type. On a client, the queue that fills is
 the one to a server that has stopped reading.
 .IP
 The queue is per connection, so the bound multiplies with the number of
@@ -6086,16 +6117,16 @@ under
 .B SERVER FLAGS
 for what that means for a script.
 .PP
-.B "One combination is refused on every type."
-.B \-\-shards
-with
-.B "\-\-listen unix:"
-is refused, because
+.B "\-\-shards with \-\-listen unix:"
+gives each shard a node of its own,
+.IR base#N.sock ,
+because
 .B SO_REUSEPORT
-does not work that way on a unix socket.
+cannot share a path: on one path,
 .I N
-processes would unlink each other's socket node, and only the last to bind
-would be reachable.
+processes would unlink each other's node.
+The pair is refused only when the longest of those paths is too long for a
+unix socket address.
 .PP
 .B "What it bought, measured."
 An
@@ -6855,10 +6886,14 @@ The twelve mutating
 calls refuse by returning exactly what they return when there was nothing to
 do:
 .B false
-for nine of them and an empty string for
+for nine of them, an empty string for
 .B self.lpop
 and
-.BR self.rpop .
+.BR self.rpop ,
+and
+.B nil
+for
+.BR self.sadd .
 A script calls
 .B self.cache_mode()
 to tell the two cases apart.
@@ -7113,7 +7148,7 @@ the cache is reached only through its one port, and a proxy in front of it
 depends on that.
 .IP
 .B Each shard binds its own port.
-Shard
+At two or more shards, shard
 .I i
 binds
 .IR port + 1 + i ,
@@ -7128,7 +7163,7 @@ That lets
 .BR "redis\-benchmark \-\-cluster" ,
 redis\-py, go\-redis, lettuce and node\-redis route for themselves.
 .IP
-.B A cache with \-\-cluster therefore needs port+1 .. port+N free, and refuses to start otherwise.
+.B A cache with \-\-cluster and two or more shards therefore needs port+1 .. port+N free, and refuses to start otherwise.
 Whichever shard answers
 .B "CLUSTER SLOTS"
 computes the addresses it sends from a formula.
@@ -7406,7 +7441,7 @@ Get multiple keys. Returns one value per line (nil if missing), then "end".
 Set multiple key-value pairs atomically. Returns "ok".
 .TP
 .BI "type " "key"
-Return type of key: "string", "list", "set", "hash", or "none".
+Return type of key: "string", "list", "set", "hash", "zset", "stream", or "none".
 .TP
 .BI "keys " "pattern"
 List all matching keys (glob patterns, "*" for all). Returns keys then "end".
@@ -8097,7 +8132,7 @@ Messages arrive as
 which carries the pattern as well as the channel.
 A client subscribed to two patterns could not otherwise tell which one matched.
 .IP
-.B Every subscribe verb confirms with a count.
+.B Over RESP, every subscribe verb confirms with a count.
 .BR subscribe ", " unsubscribe ", " psubscribe " and " punsubscribe
 each answer a three\-element reply: the verb, the channel or pattern, and how
 many subscriptions the connection now holds.
@@ -8299,7 +8334,7 @@ Only RESP2 is supported.
 .B hello
 with no argument or with
 .B 2
-answers a map with the server, the version, the protocol, this connection's id,
+answers a flat array of name and value pairs: the server, the version, the protocol, this connection's id,
 whether the cache is clustered, and whether it is a replica.
 .B hello 3
 is refused with
@@ -9744,8 +9779,9 @@ SigV4: \fBx\-amz\-algorithm\fR, \fBx\-amz\-credential\fR, \fBx\-amz\-date\fR and
 \fBx\-amz\-signature\fR, an HMAC\-SHA256 of the policy;
 .IP \(bu 2
 the older form that boto3 still writes by default: \fBAWSAccessKeyId\fR and
-\fBsignature\fR, a base64 HMAC\-SHA1 of the policy. This is the one place a
-signature other than SigV4 is taken, since it covers nothing but the policy.
+\fBsignature\fR, a base64 HMAC\-SHA1 of the policy. This is Signature Version 2,
+which headers and presigned URLs may also use (see
+.BR Authentication ).
 .PP
 The policy is a base64 JSON document with an
 .B expiration
@@ -10042,8 +10078,11 @@ When one of the user's policies denies it
 (on \fB*\fR or \fBarn:aws:s3:::*\fR), ListBuckets is 403.
 Every Owner element is the bucket's owner, with the owner's display name. This
 covers ListBuckets, ListObjects, ListObjectVersions, the uploads and parts
-listings, GetBucketAcl and GetObjectAcl. The reason is that an object of a bucket
-with ACLs disabled belongs to the bucket's owner.
+listings, GetBucketAcl, and GetObjectAcl on a bucket with ACLs disabled. The reason
+is that an object of a bucket with ACLs disabled belongs to the bucket's owner.
+Where ACLs are enabled, GetObjectAcl names the object's own owner, as
+.B "Supported S3 operations"
+describes.
 .PP
 A signed request is decided in this order:
 .IP 1. 4
@@ -11949,7 +11988,8 @@ Instead, the runtime reads it a megabyte at a time, opens it and writes it from
 memory, reading the next megabyte while it sends the current one. An SSE\-S3
 object of up to 60000 bytes is kept opened in memory like any other object.
 .PP
-Not supported: SSE\-KMS and bucket keys, and changing the master key. An object
+Not supported: bucket keys, and changing the master key. A rule's BucketKeyEnabled
+is kept and given back, and changes nothing. An object
 opens only under the key that wrapped its data key.
 .SS Bucket lifecycle
 A bucket's lifecycle configuration is S3's
@@ -12047,7 +12087,8 @@ A document that is not a lifecycle configuration is
 .IP \(bu 2
 A value S3 would not accept is
 .BR InvalidArgument :
-Days of zero, a Date that is not midnight, a repeated ID, 1001 rules, an
+Days of zero outside a transition, a Date that is not midnight, a repeated ID,
+1001 rules, an
 ObjectSizeLessThan of 0, or a NewerNoncurrentVersions of 0 or over 100.
 .IP \(bu 2
 A tag key or value that an object could not have is
@@ -13975,11 +14016,14 @@ Every mode syncs the whole filesystem at a stop, before it writes the clean mark
 .B always
 Each write is synced before it is answered; this is the default.
 A put is answered once its file, its name and its directory are synced.
+A put of up to 1 MiB with no condition waits for one sync instead: its pooled file
+is synced and renamed, and its directory is synced after the answer (see
+.BR "How objects are stored" ).
 A delete is answered once its directory is synced.
 The same holds for versions, tags, uploads and parts, and for the event\-notification
 and replication entries written beside them.
 An answered write survives a crash of the machine.
-Small puts cost about 2 syncs each, which is most of their time.
+A small put spends most of its time waiting for its one sync.
 On one shard of the measuring box this gives about 1,500 4 KiB puts a second, or
 about 700 into a versioned bucket.
 .TP
@@ -15386,7 +15430,10 @@ runtime keeps JSON documents for applications, such as a game's characters, a
 shop's orders and addresses, or a user's settings. Each document is owned by an
 account of an
 .B idp
-runtime, and an account reaches its own documents and no other's. Large things,
+runtime. An account never writes another account's documents, and each
+collection's access in
+.B \-\-schema
+says who reads them. Large things,
 such as a picture or a model, belong in a storage, with their address kept
 here.
 .PP
@@ -15634,7 +15681,8 @@ The idp runtime whose accounts own documents.
 The ids of the idp's clients whose access tokens the runtime takes,
 comma\-separated. A token the provider gave any other application is refused,
 since it belongs to that application and is no key to this runtime. Without the
-flag no access token is taken, while cookies and passwords sign in as before.
+flag no access token is taken, while keys and the sign-in cookie reach it as
+before.
 .TP
 .BI "\-\-origins " list
 The web origins a browser may call the database from, comma\-separated. They
@@ -15775,7 +15823,9 @@ must be given. A client certificate that
 verified lets its client in under the certificate's common name. A password is
 checked against the users file, off the event loop. Otherwise, with
 .BR \-\-idp ,
-the password is taken as an access token of that provider, and the token
+the password is taken as an access token that provider gave a client
+.B \-\-idp\-audience
+names, and the token
 account's name is the user. A user name given with the token must be that
 name. Without credentials, a client is let in only with
 .BR \-\-anonymous .
@@ -16053,17 +16103,21 @@ disconnects one. While a hook decides, that connection's next packets wait.
 The accounts that sign in with a password, one
 .IB user : hash
 per line, as
-.B socketley mqtt\-passwd
+.B socketley mqtt passwd
 writes them. The file is read again within two seconds of a change.
 .TP
 .BI "\-\-idp " runtime
 The idp runtime whose access tokens, given as the password, sign clients in.
+It takes only tokens given to a client that
+.B \-\-idp\-audience
+names.
 .TP
 .BI "\-\-idp\-audience " clients
 The ids of the idp's clients whose access tokens the runtime takes,
 comma\-separated. A token the provider gave any other application is refused,
 since it belongs to that application and is no key to this runtime. Without the
-flag no access token is taken, while cookies and passwords sign in as before.
+flag no access token is taken, while the users file and client certificates
+sign in as before.
 .TP
 .BI "\-\-acl " file
 Who may publish and subscribe to what (see
@@ -16125,7 +16179,7 @@ for more, or for none, is told this value.
 .PP
 A client that leaves more than twice
 .B \-\-write\-buffer
-(default 4M) of what it was sent unread is not read until it has read half of
+(default 8M) of what it was sent unread is not read until it has read half of
 it. So its pings and acks cannot grow what it is owed.
 .PP
 .B stats
@@ -16263,7 +16317,9 @@ with their password over TLS;
 .IP \(bu 2
 with their password in the clear, from this machine only;
 .IP \(bu 2
-with a token from their idp, by XOAUTH2 or OAUTHBEARER on SMTP, IMAP and POP3.
+with a token their idp gave a client that
+.B \-\-idp\-audience
+names, by XOAUTH2 or OAUTHBEARER on SMTP, IMAP and POP3.
 Mail apps that sign in through an identity provider work this way.
 .PP
 If the account has its second sign\-in step turned on, a mail app signs in
@@ -16906,7 +16962,9 @@ move blobs, and
 .B /jmap/eventsource
 reports state changes.
 A user signs in with HTTP Basic and their idp password, over TLS or from
-127.0.0.1, or with an idp bearer token.
+127.0.0.1, or with a bearer token the idp gave a client that
+.B \-\-idp\-audience
+names.
 .PP
 A user's JMAP account holds the same mailboxes IMAP reads.
 A Mailbox id is the folder's MAILBOXID, and an Email id is the message's
@@ -17194,7 +17252,7 @@ The storage runtime, and optionally its bucket, that holds the mailboxes.
 .BI "\-\-users " file
 A file of accounts that sign in to send mail.
 It holds a name and a scrypt hash, one account per line, as
-.B socketley mqtt\-passwd
+.B socketley mqtt passwd
 writes them.
 The runtime reads the file again when it changes.
 .TP
@@ -17233,7 +17291,11 @@ A port where mail clients read the mailboxes, with STARTTLS
 or over TLS from the first byte
 .RB ( \-\-imaps ).
 Both require
-.BR \-\-storage .
+.BR \-\-storage ,
+and
+.B \-\-imaps
+also requires
+.BR \-\-tls .
 .TP
 .BI "\-\-notify\-targets " file
 A file of the targets that are told about each message stored in a mailbox.
@@ -17289,6 +17351,11 @@ and
 .TP
 .BI "\-\-pop3s " port
 A POP3 port that speaks TLS from the first byte.
+Requires
+.BR \-\-tls ,
+.B \-\-idp
+and
+.BR \-\-storage .
 .TP
 .BI "\-\-jmap " port
 A JMAP port for the mailboxes, served over HTTPS with
@@ -18110,8 +18177,9 @@ prints what the API answers.
 .PP
 A metrics runtime does not accept
 .BR \-\-shards :
-one process holds 100000 series at 10s, and each series is written by one
-process.
+each series is written by one process, and one process holds up to
+.B \-\-max\-series
+series (200000 by default).
 .SH MCP FLAGS
 An
 .B mcp
@@ -18384,7 +18452,7 @@ shows
 and
 .BR keys .
 .SH REGISTERED TYPES
-A runtime type beyond the built-in seven is delivered as a manifest plus a
+A runtime type beyond the built-in fourteen is delivered as a manifest plus a
 worker binary.
 The manifest is a declarative file, never code.
 From it, the daemon learns the type's name, its worker executable and the schema of its configuration keys.
@@ -18517,20 +18585,23 @@ The default Lua package path is appended, so standard modules still work.
 .B Standard library:
 .BR base ", " string ", " table ", " math ", " os ", " io " and " package
 are open.
-Six
+Two
 .B os
-functions are removed, because a daemon that serves every runtime from one process
-cannot let one script reach outside its own runtime:
-.BR os.execute ,
-.BR os.remove ,
-.BR os.rename ,
-.BR os.tmpname ,
+functions are removed, because each one damages the process that every runtime
+shares:
 .B os.exit
 and
 .BR os.setlocale .
+.BR os.execute ,
+.BR os.remove ,
+.B os.rename
+and
+.B os.tmpname
+are present (see
+.BR "Handler Privileges" ).
 .PP
 .B os.setlocale
-is not a filesystem or process call, and is removed for a reason of its own.
+is removed for a reason of its own.
 .B setlocale
 is process-wide.
 .B socketley.json_encode
@@ -19566,10 +19637,13 @@ command does not hang the terminal.
 .RE
 .PP
 The budget counts time spent running on the loop, not elapsed clock time. This
-matters for the two callbacks that can wait,
-.B on_message
-and
-.BR on_client_message .
+matters for the callbacks that can wait, such as
+.BR on_message ,
+.B on_client_message
+and an
+.B mcp
+tool's handler (see
+.BR socketley.http ).
 They run on a coroutine. A handler that is waiting in
 .B self.cache
 does not hold the thread and does not use up its budget. Each stretch in which it
@@ -20530,8 +20604,7 @@ Cancels a pending timeout, so the timer does not fire. Calling it with an
 already-expired or invalid ID is safe and does nothing.
 .TP
 .B socketley.clear_interval(timer_id)
-Cancels a repeating interval. The timer stops after the current cycle
-completes. Calling it with an already-expired or invalid ID is safe and does
+Cancels a repeating interval, so the timer does not fire again. Calling it with an already-expired or invalid ID is safe and does
 nothing.
 .IP
 Both functions remove the timer completely rather than just silencing it. The
@@ -20624,19 +20697,23 @@ Messages are delivered only to a
 runtime. Every registration a runtime holds is ended when it stops. A runtime
 that has never been started receives nothing either. Its top level has run, so
 the registration exists, but a runtime that is not running executes no script.
-The same rule cancels the timers. Subscriptions
-.B do
-come back when the runtime is started again, and this is where they differ from
-.B set_interval
-and
-.BR set_timeout .
-A subscription is registered from
-.BR on_start ,
-and
+The same rule cancels the timers. Both come back when the runtime is started
+again in a worker: a
+.B start
+forks a new worker, which runs the top level and
+.B on_start
+again (see
+.BR socketley.set_interval ).
+A server, client, proxy, cache, storage or dns runtime made by
+.B socketley.create
+runs in the daemon instead.
+There a
 .B start
 runs
-.BR on_start .
-A timer is armed at the script's top level, and only a load runs the top level.
+.B on_start
+but not the top level, so a subscription made in
+.B on_start
+comes back and a timer armed at the top level does not.
 .TP
 .B socketley.unsubscribe(subscription_id) \(-> bool
 Ends one subscription. Returns
@@ -20856,7 +20933,7 @@ and
 .B The table is validated, and a refusal leaves nothing behind.
 Each of these returns
 .B false
-with the reason in the log, and creates no runtime:
+and a reason, which also goes to the log, and creates no runtime:
 .IP \(bu 2
 a port outside 0..65535;
 .IP \(bu 2
@@ -21017,11 +21094,10 @@ table provides read-only introspection into the full cluster topology.
 All functions return empty tables when not in cluster mode, so scripts work in
 both standalone and cluster setups without modification.
 .PP
-This also holds in a worker process. The daemon pushes each worker a snapshot
-of the cluster view before the frame that loads its script, and these four
-functions are answered from that snapshot.
+In a worker process the four functions are answered from a snapshot of the
+cluster view, which the daemon pushes before the frame that loads its script.
 .PP
-One exception remains. A daemon that is in no cluster has no view to push. An
+One exception remains, and it is in a worker only. A daemon that is in no cluster has no view to push. An
 empty table is also what a
 .I successful
 call returns for a daemon that is alone in a cluster. So when no view is
@@ -21053,6 +21129,9 @@ group        string   Group tag (empty string if unset)
 state        string   "created", "running", "stopped", or "failed"
 connections  number   Current connection count
 .fi
+.IP
+The type is the name of any runtime type the daemon knows, built in or
+registered, not only these four.
 .TP
 .B socketley.cluster.group(name) \(-> table
 Returns running members of the named group that have a valid port.
@@ -22352,7 +22431,13 @@ Wait for the daemon's own
 line instead.
 .RE
 .PP
-Alternatively, use a Lua config file:
+Alternatively, use a Lua config file.
+.B "socketley \-\-lua"
+does not start a daemon; when none answers yet, it fails and applies nothing.
+The one\-second sleep below is the same race, so a real entrypoint should wait
+for the
+.B "daemon started"
+line here too:
 .PP
 .nf
 \-\- /etc/socketley/setup.lua
@@ -22479,9 +22564,10 @@ suffix (\c
 .BR 4 ,
 .BR 4s ,
 .BR 3500ms ).
-Default: four election timeouts (4 s).
-Values below three election timeouts are refused, because a leader change would
-then look like a node loss.
+Default: four times the shortest election timeout, which is 4 s at the default
+tick.
+Values below three times the shortest election timeout (3 s at the default
+tick) are refused, because a leader change would then look like a node loss.
 Every member of one cluster should use the same value; see
 .B Cluster runtimes
 for what depends on it.
@@ -23080,9 +23166,22 @@ that lived on a multi-user machine under an affected version, either with
 .B "socketley edit"
 or by recreating the runtime.
 .SH ENVIRONMENT
-The daemon reads these variables at startup; all are optional. The first one
-selects which daemon this is. The rest are tuning knobs. Their defaults suit a
-general-purpose deployment and only need changing for an unusual workload.
+All of these variables are optional.
+Each is read by the process that needs it, which for most is a runtime's worker
+process rather than the daemon.
+.B SOCKETLEY_SOCKET
+and
+.B SOCKETLEY_CONFIG
+select which daemon this is and which file it reads.
+.BR EDITOR ", " VISUAL " and " TMPDIR
+are read by the command line, and the
+.B SOCKETLEY_GIT_*
+variables by the command that uses them.
+.B SOCKETLEY_FAST_LO
+is set by the daemon for its workers.
+The entries that begin "A test hook" are for the test suite.
+The rest are tuning knobs. Their defaults suit a general-purpose deployment and
+only need changing for an unusual workload.
 .PP
 You can also set each knob in the
 .B settings
@@ -23092,9 +23191,13 @@ without
 (see
 .BR "Daemon Configuration" ).
 .B socketley settings
-lists every knob with its value and where that value came from. If a number is
-outside a knob's range, or is not a whole number, the daemon logs this once and
-uses the default.
+lists every knob with its value and where that value came from. If a variable
+in the environment holds a number outside the knob's range, or not a whole
+number, the process that reads it logs this once and uses the default. The same
+value in the
+.B settings
+table stops the daemon instead (see
+.BR "Daemon Configuration" ).
 .TP
 .B SOCKETLEY_SOCKET
 Selects which daemon this is, or which daemon the CLI talks to.
@@ -24091,7 +24194,8 @@ under
 .BR "STATE PERSISTENCE" .
 .TP
 .I /etc/socketley/config.lua
-The daemon configuration file (name, cluster, log_level, metrics_port, cpus).
+The daemon configuration file; see
+.BR "Daemon Configuration" .
 .TP
 .I /etc/socketley/types/*.toml
 The manifests of registered types, read at daemon startup; see
@@ -24305,8 +24409,8 @@ and
 .B cluster
 are the two keys that
 .B "socketley \-\-lua"
-can also set on a daemon that is already running. The other three are settled
-before the ring exists, so they are read only from this file. A
+can also set on a daemon that is already running. Every other key is read only
+from this file, when the daemon starts. A
 .B \-\-cpus
 typed on
 .B "socketley daemon"
@@ -24344,7 +24448,8 @@ variables, and
 .B SOCKETLEY_SOCKET
 and
 .BR SOCKETLEY_CONFIG ,
-which choose this file.
+which choose this file; also a variable the daemon sets for its workers, such as
+.BR SOCKETLEY_FAST_LO .
 .PP
 .B socketley settings
 shows the values that were taken.
@@ -24817,7 +24922,7 @@ blocks until SIGINT or SIGTERM.
 For several runtimes in one process, or for asynchronous patterns, use the raw API,
 either through the escape hatches or directly.
 .PP
-.B "TLS: on a server and a proxy only."
+.B "TLS: on a server, a proxy, a client and a cache."
 .B server().tls()
 and
 .B proxy().tls()
@@ -24832,14 +24937,10 @@ This works because
 goes through
 .B runtime_manager::start
 and reaches the same gate as the CLI.
-On a
-.B client
-or
-.B cache
-builder, the same entry points still store their arguments, but nothing reads them.
-There,
-.B start()
-refuses to run rather than listen in cleartext. See
+.B client().tls()
+dials over TLS, and
+.B cache().tls()
+terminates it on the cache's listener, through the same gate. See
 .B TLS
 under
 .BR LIMITATIONS .
@@ -25204,7 +25305,7 @@ mode is not affected by any of this. It was already a byte relay and never looke
 at a status line.
 .SS What can stop the event loop
 One thread serves every runtime in a process, so a call that waits stops all of
-them. Six places make such calls, and they are listed here.
+them. Five places make such calls, and they are listed here.
 .PP
 The figures were measured where measuring was possible, on a Lua echo server
 and a static file server under load. Each cost is given as a share of a
@@ -25375,9 +25476,7 @@ with the same
 .B "error: no such runtime"
 that an in\-process runtime gives; it is not dropped silently.
 .PP
-.B "The cross\-runtime management API is refused inside a worker."
-A worker is a separate process that holds one runtime and no runtime manager.
-So
+.B "The cross\-runtime management API works inside a worker."
 .BR socketley.create ,
 .BR .start ,
 .BR .stop ,
@@ -25386,36 +25485,14 @@ So
 .BR .list ,
 .BR .get ,
 .B .pipe
-and the whole
+and the
 .B socketley.cluster
-table have no inventory to act on. A worker does not offer them, and they do
-not silently return nothing. Each one raises a Lua error that names the call,
-the reason and the way out. Returning a false, a nil or an empty table would
-look exactly like a
-.I successful
-call on a daemon with nothing in it, so neither the script nor the operator
-could tell the two apart.
-.IP
-When the call is made from a callback, whatever ran the callback reports the
-refusal. For example, a filter that raised an error has not said "carry on",
-so the request is answered
-.B 500
-and the message goes to the log. When the call is made at the script's top
-level, the script does not load, and a worker whose script did not load does
-not serve. The worker exits, saying this is a configuration it will never
-accept. The supervisor then leaves the runtime
-.B failed
-instead of forking five more copies of the same refusal.
-.IP
-Everything that does not reach for the runtime map works normally:
-.BR socketley.log ,
-.BR .http ,
-.BR .json_encode / .json_decode ,
-the timers,
-.BR .subscribe ,
-the
-.B self
-table, and the connection and request callbacks.
+table are answered as they are in the daemon; see
+.B Process Isolation
+under
+.BR "PROXY FLAGS" .
+A worker refuses them only when the daemon that forked it could give it no
+control socket, which means an older build.
 .IP
 .B "self.route() crosses the boundary."
 It names another runtime, but it works from a worker.
@@ -25517,11 +25594,10 @@ processes and naming one of them arbitrarily would be wrong. Its counters
 are still one set of figures: the shared region has one line per shard, and the
 sum over them is what the runtime is serving.
 .PP
-Every type can be split, and every type is split unless it asks not to be.
-The limits that remain are described in this section: the cross\-runtime
-management API,
-.BR self.route() ,
-and figures that are pushed rather than read.
+Every type is split, and no flag keeps one in the daemon.
+The management API,
+.B self.route()
+and the figures work in a worker as they do in the daemon.
 .SS TLS
 .B "Every runtime type speaks TLS."
 This covers a server's and a cache's own listener, both legs of a proxy, and a
@@ -25682,8 +25758,8 @@ configuration:
 rejects
 .BR \-\-tls ", " \-\-cert ", " \-\-key " and " \-\-ca
 on a
-.B cache
-runtime, and
+.BR dns ", " sync ", " idp ", " db ", " tunnel ", " metrics " or " mcp
+runtime, which has no handshake, and
 .BR \-\-client\-ca ", " \-\-client\-cert " and " \-\-client\-key
 on anything but a proxy. It exits with status 1 and a message that names the
 flag.
@@ -25748,12 +25824,13 @@ So
 and
 .B proxy().tls(cert, key)
 terminate TLS exactly as a daemon-managed runtime does.
-The same call on a client or cache fails the runtime instead of running in
-cleartext.
+.B client().tls()
+dials over TLS, and
+.B cache().tls(cert, key)
+terminates it, through the same gate.
 .PP
-For encrypted transport on a
-.BR client " or " cache ,
-or on a server's upstream connections, terminate TLS in a front-end proxy
+For encrypted transport on a server's upstream connections, terminate TLS in a
+front-end proxy
 (nginx, HAProxy, stunnel). Have it forward over loopback or another trusted
 network path. A socketley
 .B proxy
