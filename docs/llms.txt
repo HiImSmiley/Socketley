@@ -48,12 +48,27 @@ Every page below is plain Markdown. llms-full.txt is all of them in one file (la
 
 ## Manual sections
 
+- [Manual](llms/man.txt): The manual page socketley(1), one file per section.
 - [Manual: Name](llms/man-name.txt): The manual page's Name section.
 - [Manual: Synopsis](llms/man-synopsis.txt): The manual page's Synopsis section.
 - [Manual: Description](llms/man-description.txt): The manual page's Description section.
 - [Manual: Commands](llms/man-commands.txt): The manual page's Commands section.
 - [Manual: Daemon flags](llms/man-daemon-flags.txt): The manual page's Daemon flags section.
 - [Manual: Common flags](llms/man-common-flags.txt): The manual page's Common flags section.
+- [Manual: Server flags](llms/man-server-flags.txt): The manual page's Server flags section.
+- [Manual: Client flags](llms/man-client-flags.txt): The manual page's Client flags section.
+- [Manual: Proxy flags](llms/man-proxy-flags.txt): The manual page's Proxy flags section.
+- [Manual: Cache flags](llms/man-cache-flags.txt): The manual page's Cache flags section.
+- [Manual: Storage flags](llms/man-storage-flags.txt): The manual page's Storage flags section.
+- [Manual: DNS flags](llms/man-dns-flags.txt): The manual page's DNS flags section.
+- [Manual: Sync flags](llms/man-sync-flags.txt): The manual page's Sync flags section.
+- [Manual: IDP flags](llms/man-idp-flags.txt): The manual page's IDP flags section.
+- [Manual: DB flags](llms/man-db-flags.txt): The manual page's DB flags section.
+- [Manual: MQTT flags](llms/man-mqtt-flags.txt): The manual page's MQTT flags section.
+- [Manual: Mail flags](llms/man-mail-flags.txt): The manual page's Mail flags section.
+- [Manual: Tunnel flags](llms/man-tunnel-flags.txt): The manual page's Tunnel flags section.
+- [Manual: Metrics flags](llms/man-metrics-flags.txt): The manual page's Metrics flags section.
+- [Manual: MCP flags](llms/man-mcp-flags.txt): The manual page's MCP flags section.
 - [Manual: Registered types](llms/man-registered-types.txt): The manual page's Registered types section.
 - [Manual: Lua configuration](llms/man-lua-configuration.txt): The manual page's Lua configuration section.
 - [Manual: Dashboard](llms/man-dashboard.txt): The manual page's Dashboard section.

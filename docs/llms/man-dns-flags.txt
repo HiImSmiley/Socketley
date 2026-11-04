@@ -1,0 +1,92 @@
+# DNS flags
+
+From the manual page socketley(1).
+
+A **dns** runtime is an authoritative name server. It answers queries over UDP and TCP on one port, and only for the zones in the files it is given.
+
+```
+socketley create dns ns --zone example.com --publish 203.0.113.7 -s
+dig @127.0.0.1 example.com SOA
+```
+
+When a zone is given by its name, the runtime writes it with this machine's public address for its name servers. **--publish** gives that address. It may be left out only where a network interface has a public address, and behind NAT none has one. **create** also makes an entrance: a proxy of the runtime's own (see **--proxy**). As soon as the entrance starts, it asks Let's Encrypt for a certificate for each zone and its wildcard. It does so for every name except those reserved for examples and tests, such as **example.com**, **.test** and **.internal**, because no public CA issues certificates for them. For a lab or a test that uses real names, give **--proxy none**. The runtime also answers one client network at most 100 times a second (**--rrl**). A load test from a single host therefore sees most answers dropped unless it gives **--rrl 0**.
+
+The runtime asks no other server and caches nothing. A name that is in none of its zones is answered REFUSED and is never looked up. So the runtime cannot be used as an open resolver, and every answer it gives is its own. Like every other runtime, it runs in a worker process of its own. It may run as **--shards** processes that share the port. It binds IPv4, and also IPv6 when the host has it and no **--bind** address is given. The default port is 53. A port below 1024 needs root or **CAP_NET_BIND_SERVICE**, which the packaged service grants. **-p**, **--bind**, **--cpus**, **--max-connections** (TCP connections; default 256) and the common flags apply as documented under **COMMON FLAGS**. **--listen** and **--tls** are refused.
+
+### `--zone name|file`
+
+A zone to serve, given by its name or as a zone file. Required. Give the flag once for each zone, or give several zones separated by commas.
+
+A name, such as **example.com**, needs no file. The first time, the runtime writes one under *state-dir*/zones/*name*.zone and serves it from then on. The file has an SOA record and names ns1 and ns2 as the zone's name servers. The addresses of **--publish** (or this machine's public addresses) become the addresses of ns1 and ns2, and of the zone's own name, which is the entrance's. You tell the registrar these two names and addresses as the domain's name servers and their glue. The file is yours to edit; the runtime never writes it again while it exists.
+
+A path is made absolute against the caller's directory. If a file called *zone***.zone** does not exist there, it is written in the same way. A zone file uses the master file format of RFC 1035. The zone's apex is the owner of its one SOA record. Every record must lie at or below the apex, and the apex must name its servers with NS records. A CNAME must be the only record of its name. Below a delegation, only the addresses of the delegated servers may appear. **create** and **start** refuse a file that is not such a zone, and name the line that is wrong. **$ORIGIN** and **$TTL** are read. **$INCLUDE** is refused, since it would let a zone file read any file the worker can read. Types A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, CAA and HINFO are written in their usual form. Any other type is written in RFC 3597's form, **TYPE***n* **\#** *length hex*. A TXT string longer than 255 bytes is split into several strings, as a DKIM key needs.
+
+The runtime checks the file once a second, and reads it again when it was edited. The new zone is served once the whole file has been read and checked. If the file no longer parses, the previous zone stays in place and the log gives the reason. A changed zone whose serial did not change is still served. The log then says that its secondaries will not notice the change until the serial is raised.
+
+### `--transfer list`
+
+The addresses and address blocks that may copy a whole zone by AXFR over TCP (RFC 5936). Give them comma-separated: a secondary's address, such as 192.0.2.53, or a block, such as 2001:db8::/48. Everyone else is answered REFUSED, so the names a zone holds are not handed to whoever asks. An IXFR from these addresses over UDP is answered with the SOA alone. This tells the secondary the serial and that it must come over TCP. Over TCP, an IXFR is answered as an AXFR.
+
+### `--notify list`
+
+The secondaries that get a NOTIFY (RFC 1996) when the runtime starts and whenever a zone's serial changes. Give them as *host*[:*port*], comma-separated. The runtime sends the NOTIFY again after 1, 3, 7, 15 and 31 seconds until the secondary answers it. Only the first shard sends them.
+
+### `--publish list`
+
+This machine's public IPv4 and IPv6 addresses, comma-separated, used to answer for the names of the daemon's runtimes. A runtime of the daemon is reached by names given with **--domain**, **--acme**, or a storage runtime's **--domain** and **--website-domain**. Every such name that falls within a zone is answered with these addresses. Without this flag, those names are answered with this machine's public addresses when the runtime has an entrance (below), and not at all with **--proxy none**.
+
+### `--proxy name|none`
+
+The entrance through which the names of runtimes are reached, or **none** for no entrance. An entrance is a proxy without **--backend**. It routes each HTTP request, by the name the request asks for, to the runtime that has that name (see **PROXY FLAGS**).
+
+**create** makes the entrance as this runtime's child. Its name is *dns***-proxy** when the flag is not given. It listens on **--proxy-port** with **--tls** and **--backend-timeout 5m**, because a site may take a while to begin answering, as behind any web server. The entrance asks the CA for its own certificate: each zone with its wildcard, proven over DNS-01 by this runtime's answers. Before that, **acme issue** waits **SOCKETLEY_ACME_DNS_WAIT** seconds and asks the resolver of */etc/resolv.conf* for a TXT record that exists only in this runtime's answers. It then asks every name server the zone is delegated to for that record directly, since a CA may ask any of them. Some zones are not ready in that time: a zone that the world's DNS does not delegate here yet, or a zone with a secondary that has not taken up the record. Each name of such a zone is proven by itself instead, over TLS-ALPN-01 on 443, without the wildcard. The wildcard is asked for again every six hours until the zone is delegated.
+
+An entrance on 443 comes with *dns***-proxy-http** on port 80, which sends every request to HTTPS (**--redirect-https**). Behind the entrance, every response over TLS carries **Strict-Transport-Security: max-age=31536000** unless the answering runtime set its own. Over TLS, the entrance speaks HTTP/2 to a client that offers it by ALPN, and HTTP/1.1 to a client that does not. Each HTTP/2 stream is routed by the name it asks for, like an HTTP/1.1 request. A stream that asks for a name other than the one its connection's handshake gave is answered 421. A client may have eight streams open at once. **SOCKETLEY_PROXY_HTTP2=0** turns HTTP/2 off. Over UDP on the same port, the entrance speaks HTTP/3 (RFC 9114), and every answer over TCP names it in **Alt-Svc: h3**. An HTTP/3 stream is routed by its own **:authority** exactly as an HTTP/2 stream is. A browser that cannot reach the UDP port goes on over TCP. **SOCKETLEY_PROXY_HTTP3=0** opens no UDP socket.
+
+The entrance stops, starts and is removed with this runtime. If this runtime is removed while another dns runtime also names the entrance, the entrance becomes that runtime's instead. A proxy of that name that already exists is used as it is, provided it is an entrance. **none** makes no entrance. With an entrance and no **--publish**, the names are answered with this machine's public addresses. The runtime reads them from the machine's interfaces and checks them again every minute.
+
+```
+socketley create dns ns --zone example.com -s     # and ns-proxy on 443
+socketley create server chat --domain --http /srv/chat -s
+curl https://chat.example.com/
+```
+
+### `--proxy-port port`
+
+The port that the entrance made by **create** listens on. Default: 443.
+
+### `--rrl n`
+
+Response rate limiting: the most answers a second the runtime gives one client network. A client network is an IPv4 /24 or an IPv6 /56. Past the limit, every second answer is replaced by a truncated one (TC set, no records, as large as the query), and the others are dropped. A resolver in that network then retries over TCP, which is not limited, and is served. A victim whose address a flood forges receives nothing larger than what was sent. Default: 100. 0 means no limit. The limit is for the whole runtime: with **--shards**, each shard allows its share of *n*, since the kernel spreads one network's queries over the shards by their source port.
+
+### `--dnssec`
+
+Signs every zone as it is loaded (RFC 4033 to 4035). Each zone gets one key of ECDSA P-256 with SHA-256 (algorithm 13). The key is made at the first start and kept in *state-dir*/dns/*name*.dnssec/ for every shard. The runtime adds the key's DNSKEY at the apex, an NSEC chain through the names, and an RRSIG over every record set the zone holds. The signatures last three weeks and are made again a week before they end. A query with the DO bit is answered with the signatures. A name or type that does not exist is answered with the NSEC records that prove it. A zone transfer carries them too. Give the parent zone the DS record that **socketley dnssec** prints.
+
+## Names runtimes are reached by
+
+Whenever the names of its runtimes change, the daemon writes them into *state-dir*/.dns/names*.* While a CA checks a DNS-01 answer, **acme issue** writes the answer there as **acme-***token***.** A **dns** runtime checks that directory once a second, as it checks its zone files. It adds to each zone the names that fall within it, with the addresses of **--publish** and TTL 300. It adds the DNS-01 answers as TXT records of **_acme-challenge.***name***,** with TTL 10. What the zone file says about a name wins: a name with addresses of its own, or an alias, keeps them, and nothing is added below a delegation.
+
+```
+socketley create dns ns --zone /etc/zones/example.com.zone \
+    --publish 203.0.113.7,2001:db8::7 -s
+socketley create storage files -p 9301 --domain files.example.com ...
+dig files.example.com            # 203.0.113.7
+dig photos.files.example.com     # 203.0.113.7
+```
+
+So that a secondary notices changes, a zone is served with its file's serial plus the seconds from 2023-11-14 to the last change of that directory. The served serial grows with every change of the file's serial and of the published records. It is the same in every shard and after every restart.
+
+## What it answers
+
+A name that is found is answered authoritatively with its records. A CNAME is followed, up to eight steps, while its target is in the same zone. A wildcard (*.label) stands for every name below its parent that does not exist. A name below a delegation gets a referral, without the authoritative flag: the NS records of the cut, plus the addresses of those servers where the zone holds them. An absent name is answered NXDOMAIN. A name without the type asked for is answered NODATA. Both answers carry the zone's SOA, with a TTL of the lesser of its own TTL and its MINIMUM (RFC 2308). The addresses of the hosts that an NS, MX or SRV answer names follow in the additional section, when the zone has them and they fit.
+
+ANY is answered with one HINFO record, as RFC 8482 allows, rather than with every record, so that it amplifies nothing. Classes other than IN, such as CHAOS's version.bind, are answered REFUSED. A query with EDNS (RFC 6891) is answered with EDNS. An answer over UDP stays within the size the query offers and never exceeds 1232 bytes, the size that needs no fragments. An answer to a query without EDNS stays within 512 bytes. An answer that does not fit is sent as the question alone with TC set. The client then asks again over TCP, where it gets the whole answer. A response is never answered. A malformed query is answered FORMERR, and opcodes other than QUERY are answered NOTIMP.
+
+## TCP
+
+A connection may carry several queries one after another, and they are answered in order (RFC 7766). A connection that is quiet for 10 seconds, with nothing left to write, is closed. Only a whole query or a write counts as activity, so a query begun and not finished leaves the connection quiet. A shard holds at most **--max-connections** connections (default 256). One more connection closes the quietest connection that has nothing left to write, to make room. When a peer has not read 64 KiB of answers, its connection's further queries wait unread until it has. A connection whose answers have not moved for 30 seconds is closed.
+
+## Stats
+
+**stats** adds these figures for each shard: **zones**, **records**, **udp_queries**, **tcp_queries**, the answers by rcode (**noerror**, **nxdomain**, **refused**, **formerr**, **notimp**, **other_rcode**), **truncated**, **referrals**, **dropped** (packets that were not queries), **rrl_dropped** and **rrl_slipped**, **send_failed** (answers the socket would not take), **tcp_conns**, **tcp_refused**, **tcp_evicted** (connections closed to make room for a new one), **transfers**, **transfers_refused**, **notify_sent**, **notify_acked**, **notify_given_up**, **zone_reloads** and **zone_reload_failures**.

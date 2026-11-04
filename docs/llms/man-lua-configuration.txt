@@ -491,7 +491,7 @@ Called when the member count of a group changes (cluster only).
 
 Every invocation of a Lua callback has a wall-clock time budget. Default: **10000** milliseconds. When a callback is still running at the end of its budget, the runtime stops it with an error, exactly as if the script had called **error()**. The daemon logs the reason, the callback's usual failure path runs, and the runtime goes on serving.
 
-The bound exists because the event loop is a single thread that serves every runtime in the daemon. Without it, **while true do end** in any callback froze every runtime, including traffic, the metrics endpoint and the IPC socket. Only **kill -9** recovered from that.
+The bound exists because a process serves its runtimes on one event loop, on one thread. Without it, **while true do end** in any callback would freeze that process for good. In a worker it would stop that runtime; in the daemon it would also stop the metrics endpoint and the IPC socket. Only **kill -9** would end it.
 
 The budget applies to:
 
@@ -846,11 +846,9 @@ self.cache(command)        -- Run one command against the LINKED cache and
                            -- the answer is not coming.
 
 -- ─── A handler that waits ───
--- Every callback used to run to the end in one go, so a script could answer
--- only out of what it already held.  A server linked to a cache could not read
--- that cache at all, and the one call that reaches outside the process --
--- socketley.http -- did it by blocking the event loop for every runtime in the
--- daemon.  In a handler that waits, it now waits too.
+-- In a handler that can wait, a call that reaches outside the runtime
+-- (self.cache, socketley.http) suspends the handler until the answer comes,
+-- and the runtime keeps serving other clients meanwhile.
 --
 --     function on_client_message(id, msg)
 --         local v, err = self.cache("get " .. msg)

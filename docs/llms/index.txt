@@ -52,6 +52,7 @@ Each runtime's headline result against the server people run instead; method and
 
 - [Install](install.txt), then the [ten-minute tour](tour.txt).
 - [How it works](how.txt): what happens, and where, from a command to an answer.
+- Recipes: [a public HTTPS site with a Lua handler, and moving to a new machine](deploy.txt).
 - [Concepts](concepts.txt): the daemon, names, ports, TLS, shards and the cluster.
 - Reference: [CLI](cli.txt), [all flags](flags.txt), [Lua](lua.txt), the [manual](man.txt). Press `/` to search.
 - [Benchmarks](bench.txt), with the method written down.

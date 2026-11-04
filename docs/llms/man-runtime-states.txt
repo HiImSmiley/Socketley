@@ -16,4 +16,4 @@ The runtime is stopped and can be started again.
 
 ### `failed`
 
-Setup failed, and the runtime cannot recover.
+The runtime could not start, or its worker died more than five times in ten seconds. **ls** shows the reason. It stays failed until it is started again: fix the cause, then run **socketley start**.

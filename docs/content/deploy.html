@@ -27,6 +27,37 @@
 <li>A <a href="#/rt/metrics">metrics</a> runtime raises alerts; the daemon sends them per <code>daemon.alert_webhook</code> and <code>daemon.alert_mail</code>.</li>
 <li>The <a href="#/man/dashboard">dashboard</a> shows every runtime, its log and its figures.</li>
 </ul>
+<h2>Recipe: a public HTTPS site with a Lua handler</h2>
+<p>The goal: <code>https://shop.example.com</code> answered by a Lua script, with a real certificate, on one machine with the public address 203.0.113.7.</p>
+<ol class="steps">
+<li><p><b>Serve the domain's DNS from this machine.</b> The dns runtime writes a zone whose name servers <code>ns1</code> and <code>ns2</code> point here, and makes the <b>entrance</b>: a proxy on 443 (with a redirect from 80) that gets its own certificates.</p>
+<pre class="code">socketley create dns ns --zone example.com --publish 203.0.113.7 -s</pre></li>
+<li><p><b>Delegate the domain.</b> At your registrar, set <code>ns1.example.com</code> and <code>ns2.example.com</code> as the name servers, both with the glue address 203.0.113.7. The entrance asks Let's Encrypt for the certificates by itself, and asks again until the delegation is visible.</p></li>
+<li><p><b>Write the handler</b>, <code>shop.lua</code>:</p>
+<pre class="code">function on_http_request(req)
+    if req.path == "/" then
+        return { status = 200, headers = { ["Content-Type"] = "text/plain" }, body = "hello\n" }
+    end
+    return { status = 404, body = "not found\n" }
+end</pre></li>
+<li><p><b>Create the site.</b> <code>--domain shop</code> becomes <code>shop.example.com</code> under the zone; <code>--bind 127.0.0.1</code> keeps its own port off the network, since visitors come through the entrance.</p>
+<pre class="code">socketley create server shop -p 9100 --bind 127.0.0.1 --lua shop.lua --domain shop -s
+curl https://shop.example.com/</pre></li>
+</ol>
+<p>A request now goes browser → entrance on 443 (TLS ends here) → the server <code>shop</code> → <code>on_http_request</code>. See <a href="#/how">How it works</a> for the path, and the <a href="#/rt/dns">dns runtime</a> for <code>--publish</code> behind NAT.</p>
+
+<h2>Recipe: moving to a new machine</h2>
+<ol class="steps">
+<li><p><b>On the old machine, archive everything</b>: every runtime, their data (buckets, mailboxes, a cache's file, zones, keys and certificates) and the daemon's configuration.</p>
+<pre class="code">socketley export --full /var/backups/socketley.tar.gz</pre></li>
+<li><p><b>On the new machine</b>, <a href="#/install">install socketley</a>, copy the archive over, and restore it with the daemon stopped. Each runtime comes back running where it ran.</p>
+<pre class="code">systemctl stop socketley
+socketley restore /var/backups/socketley.tar.gz
+systemctl start socketley
+socketley ls</pre></li>
+<li><p><b>Check what it names.</b> The archive leaves out logs, output files, backup directories and what sync runtimes carry, and <code>restore</code> leaves paths under <code>/etc</code>, <code>/usr</code> and the like for you to take out with <code>tar</code>; both commands list these when they finish.</p></li>
+</ol>
+
 <h2>Reference</h2>
 <x-man s="files" subs-only></x-man>
 <x-man s="limitations" subs-only></x-man>

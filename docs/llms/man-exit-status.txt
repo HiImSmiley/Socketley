@@ -12,4 +12,4 @@ An error, such as an invalid command, a runtime that was not found, or a rejecte
 
 ### `2`
 
-A fatal error.
+A fatal error, or no answer in time: the daemon could not be reached, or a runtime's workers stopped answering before it was serving (see **create** and **start**). The runtime may still come up; check with **socketley ls**.

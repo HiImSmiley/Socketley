@@ -1,0 +1,66 @@
+# IDP flags
+
+From the manual page socketley(1).
+
+An **idp** runtime is an OpenID Connect provider that keeps its own accounts. A user signs in once. After that, every application that asks the provider knows who they are, and so do every route a proxy puts behind it, a storage's web interface and the dashboard.
+
+```
+socketley create idp auth -p 9400 --domain auth.example.com \
+    --clients /etc/socketley/idp.clients --cookie-domain example.com -s
+socketley auth user add smiley --password - --groups admins
+```
+
+An account is a fixed random id plus fields with no schema. The provider reads these fields: **username**, **password** (a scrypt hash), **disabled**, **groups** (comma-separated; members of **admins** are admins), **name**, **email**, **picture** and **reset**. It keeps every other field as it is, for the applications. So a field an application adds needs no change here, and an older build keeps the fields it does not know. Data that only one application uses, such as a game's characters or a shop's orders, belongs in that application, under the account's id. Every change is synced to a journal under the state directory before it is answered. Changes are folded into a snapshot that names its format. A build older than that format refuses the snapshot rather than rewriting it. See **idp-user** under **COMMANDS**.
+
+The provider serves:
+
+- the authorization code flow with PKCE, and refresh tokens;
+- discovery at **/.well-known/openid-configuration**;
+- its key at **/jwks**;
+- **/userinfo**, which answers from the account as it is now;
+- **/logout**;
+- **/account**, where a user changes their name, address and password, and signs out everywhere.
+
+Turning a second step on or off, and making an app password, ask for the password again. Where a second step is on, they also ask for a code. These checks count as a sign-in's do, so a session alone can change neither. A second step that is on can be replaced only by turning it off. Signing out everywhere, and setting a new password, end the account's app passwords along with its sessions.
+
+Tokens are signed ES256 with a P-256 key. The key is made at the first start and kept in the state directory, so a restart signs nobody out. A refresh token is read back only by the provider, and is signed HS256 under a secret made from that key. A refresh token is good once. A refresh gives the next token of its sign-in, which is kept with the account. A refresh token used a second time ends that sign-in, including its newest token. Passwords are hashed and checked off the event loop. The runtime uses one thread for each core it may use, up to four, shared out among its shards. Each thread computes up to four sign-ins' scrypt at once with AVX2. The provider serves plain HTTP and is reached through the entrance, which terminates TLS for its names as for every other runtime's. **--tls** is refused.
+
+**Guessing.** Five failed sign-ins from one address within fifteen minutes refuse that address until the failures age out. An IPv6 address is counted by its /64. Sign-ins that are still being checked count with the failures, so many sign-ins sent at once are all refused. Ten failures at one account, from anywhere, make its next try wait half a minute. Each further failure doubles the wait, up to five minutes. A browser that signed in to the account before keeps a count of its own, through a provider cookie that lasts ninety days. So guesses from elsewhere never hold up the account's user. Three wrong codes end a sign-in's second step, and the password is then asked for again. Five wrong codes at an account hold up its codes, as failed passwords do.
+
+A mail runtime checks passwords for some clients that it does not guard itself: a client on its own machine, or one behind a forwarder there. These checks are counted at the account apart from its sign-ins. Ten failures hold up the next check in the same way. At most 64 password checks wait at a shard. A sign-in past them is told to try again in a moment (503).
+
+**On several cores.** With **--shards** *N* the provider is served by *N* worker processes on its one port (**SO_REUSEPORT**). Each shard signs in, gives tokens and answers **/userinfo** with the same key. Shard 0 writes the accounts, as a provider with one shard does. Every other shard reads shard 0's journal from the same files before it answers. So a change made with **idp-user** or on the account page holds at every shard once it is answered. A change made at another shard is sent to shard 0. A code is redeemed at the shard that gave it, which the code names, wherever the exchange arrives. It is good once there. A sign-in is counted at every shard while it is being checked. A failed sign-in is answered only once every shard counts it against its address and its account. So guesses sent at once over the shards share one budget. The number of shards may change across a restart.
+
+A sign-in is a cookie of the provider's. Three kinds of runtime verify it themselves: a proxy with **--auth idp:**, a storage with **--idp**, and the dashboard with **daemon.dashboard_idp**. They verify it against the key the provider publishes beside its state, once for each session until it expires. They also check each account's standing, which the provider publishes there too. So a session ended at the provider ends there at once, and at those runtimes within a second. A session ends when the user signs out at **/logout**, signs out everywhere, or when the account is disabled.
+
+**/logout** ends the session the browser sends, and any copy of its cookie, and keeps the account's other sessions. If another site sent the browser to it, the user is asked first, unless the application names the account by an **id_token_hint** it was given. Past 32 sessions signed out this way within their lifetimes, or for a cookie from an earlier build, a sign-out ends all of the account's sessions and its refresh tokens, as signing out everywhere does.
+
+### `--clients file`
+
+The applications that sign in through the provider, one per line. Each line is *id secret redirect* [*redirect*...]. A secret of **-** marks a public client, which must then send a PKCE challenge. A redirect is an https address, compared whole, or an http address on this machine (localhost, 127.0.0.1). An http address on this machine is taken at any port, since an application on the machine picks its port as it runs.
+
+In place of a redirect, **device** lets the client sign a person in by the device grant, as **socketley login** does. One address, or one IPv6 /48, may hold at most twenty grants waiting at a shard. **ssh** lets the client's access tokens ask for SSH certificates. The file is read again when it changes. If it breaks while the runtime runs, the clients read before stay in use.
+
+### `--ssh-ca hours`
+
+Runs an SSH certificate authority that gives user certificates lasting *hours* (1 to 168). Its Ed25519 key is made at the first start and kept in the state directory. The public key is served at **/ssh/ca.pub**. **/ssh/user-cert** gives a user certificate for the account whose access token is sent. A certificate is given only to a client marked **ssh**, never to a disabled account, and never on a sign-in more than twelve hours old, refreshed tokens included. Such a sign-in is told to sign in again. A user certificate permits a terminal, port forwarding and agent forwarding. It permits neither X11 forwarding nor the user's *~/.ssh/rc*. Every certificate is logged with its serial, the account, its principals and the key's fingerprint. It is kept until it expires so that it can be revoked (see **idp-ssh revoke**). See **ssh-cert** and **idp-ssh**.
+
+### `--issuer url`
+
+The https address the provider is reached at, which every token names. Default: **https://***name* for the first **--domain**.
+
+### `--resources list`
+
+The resource servers an access token may be given for (RFC 8707), as comma-separated https addresses. An example is **https://mcp.example.com/mcp**. An application that sends **resource** with one of them at **/authorize** gets an access token that names that resource as its audience. A runtime that takes tokens for its own clients does not take such a token; an **mcp** runtime with **--idp** does.
+
+With any resource set, an application may also sign in with the https address of its client metadata document as its client id, as MCP clients such as Claude Code do. The document is fetched from public addresses only, and is at most five kilobytes. It is kept as long as its **Cache-Control** says, within a minute and a day. It is taken only for a public client that sends a PKCE challenge, with redirects that are https or on this machine. Such an application is let in only for one of these resources. It is let in only once the signed-in person allows it, every time it asks. The page that asks names the application, its host, the resource and where the person is sent back to. **stats** counts **consents**, **client_fetches** and **client_fetch_failures**.
+
+### `--cookie-domain domain`
+
+The domain whose names share the sign-in cookie. A user signed in here is then signed in for a proxy, a storage or the dashboard on any name below it. Default: the cookie is for the provider's host alone.
+
+### `--shards N`
+
+The number of worker processes that serve the provider, 1 to 64. Shard 0 writes the accounts, and every shard signs in (see **On several cores** above). The number can change only while the runtime is stopped.
+
+An address that failed to sign in five times in fifteen minutes is refused until the oldest of those failures is fifteen minutes old. When the request came through a proxy on this machine, the address counted is the last address that **X-Forwarded-For** names.

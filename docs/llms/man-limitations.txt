@@ -20,7 +20,7 @@ A proxy in **--protocol tcp** mode is not affected by any of this. It was alread
 
 ## What can stop the event loop
 
-One thread serves every runtime in a process, so a call that waits stops all of them. Five places make such calls, and they are listed here.
+A process serves its runtimes on one thread: a worker serves its one runtime, and the daemon serves the runtimes that scripts make in it. A call that waits therefore stops every runtime of that process. Five places make such calls, and they are listed here.
 
 The figures were measured where measuring was possible, on a Lua echo server and a static file server under load. Each cost is given as a share of a worker's CPU on a healthy machine. The figures do not say what the same call costs when the disk is busy or the resolver is down, which is the case where they matter.
 

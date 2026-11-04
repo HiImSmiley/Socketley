@@ -32,318 +32,63 @@ What to settle before socketley runs something that matters.
 - A [metrics](rt-metrics.txt) runtime raises alerts; the daemon sends them per `daemon.alert_webhook` and `daemon.alert_mail`.
 - The [dashboard](man-dashboard.txt) shows every runtime, its log and its figures.
 
+## Recipe: a public HTTPS site with a Lua handler
+
+The goal: `https://shop.example.com` answered by a Lua script, with a real certificate, on one machine with the public address 203.0.113.7.
+
+1. **Serve the domain's DNS from this machine.** The dns runtime writes a zone whose name servers `ns1` and `ns2` point here, and makes the **entrance**: a proxy on 443 (with a redirect from 80) that gets its own certificates.
+
+   ```
+   socketley create dns ns --zone example.com --publish 203.0.113.7 -s
+   ```
+2. **Delegate the domain.** At your registrar, set `ns1.example.com` and `ns2.example.com` as the name servers, both with the glue address 203.0.113.7. The entrance asks Let's Encrypt for the certificates by itself, and asks again until the delegation is visible.
+3. **Write the handler**, `shop.lua`:
+
+   ```
+   function on_http_request(req)
+       if req.path == "/" then
+           return { status = 200, headers = { ["Content-Type"] = "text/plain" }, body = "hello\n" }
+       end
+       return { status = 404, body = "not found\n" }
+   end
+   ```
+4. **Create the site.** `--domain shop` becomes `shop.example.com` under the zone; `--bind 127.0.0.1` keeps its own port off the network, since visitors come through the entrance.
+
+   ```
+   socketley create server shop -p 9100 --bind 127.0.0.1 --lua shop.lua --domain shop -s
+   curl https://shop.example.com/
+   ```
+
+A request now goes browser → entrance on 443 (TLS ends here) → the server `shop` → `on_http_request`. See [How it works](how.txt) for the path, and the [dns runtime](rt-dns.txt) for `--publish` behind NAT.
+
+## Recipe: moving to a new machine
+
+1. **On the old machine, archive everything**: every runtime, their data (buckets, mailboxes, a cache's file, zones, keys and certificates) and the daemon's configuration.
+
+   ```
+   socketley export --full /var/backups/socketley.tar.gz
+   ```
+2. **On the new machine**, [install socketley](install.txt), copy the archive over, and restore it with the daemon stopped. Each runtime comes back running where it ran.
+
+   ```
+   systemctl stop socketley
+   socketley restore /var/backups/socketley.tar.gz
+   systemctl start socketley
+   socketley ls
+   ```
+3. **Check what it names.** The archive leaves out logs, output files, backup directories and what sync runtimes carry, and `restore` leaves paths under `/etc`, `/usr` and the like for you to take out with `tar`; both commands list these when they finish.
+
 ## Reference
 
-### System Mode (installed via package)
-
-##### `/usr/bin/socketley`
-
-The socketley binary.
-
-##### `/usr/lib/systemd/system/socketley.service`
-
-The systemd unit file.
-
-##### `/run/socketley/socketley.sock`
-
-The Unix domain socket for daemon IPC. Mode **0660**, owned by **socketley:socketley**.
-
-##### `/var/lib/socketley/runtimes/`
-
-The per-runtime JSON configuration files. The directory has mode **0750** and the files **0600**, all owned by **socketley:socketley**. The files carry master passwords and private-key paths; see **A State File Is A Secret** under **STATE PERSISTENCE**.
-
-##### `/etc/socketley/config.lua`
-
-The daemon configuration file; see **Daemon Configuration**.
-
-##### `/etc/socketley/types/*.toml`
-
-The manifests of registered types, read at daemon startup; see **REGISTERED TYPES**.
-
-### Development Mode (no system install)
-
-##### `/tmp/socketley.sock`
-
-The Unix domain socket for daemon IPC. Mode **0600**, owned by the user who started the daemon.
-
-##### `~/.local/share/socketley/runtimes/`
-
-The per-runtime JSON configuration files, mode **0600**.
-
-##### `~/.config/socketley/config.lua`
-
-The daemon configuration file. The SOCKETLEY_CONFIG environment variable can name another path.
-
-##### `~/.config/socketley/types/*.toml`
-
-The manifests of registered types, read at daemon startup; see **REGISTERED TYPES**.
-
-### The IPC socket
-
-Every **socketley** command travels over the socket above, and through it a client can reach everything the daemon can do. That includes stopping a runtime, reading **stats**, rewriting a runtime's configuration with **edit**, and running arbitrary code as the user the daemon runs as. The last is possible because a **--lua** handler runs with the daemon's privileges; see **Handler Privileges** under **LUA CONFIGURATION**.
-
-Opening the socket is therefore an administrative right, and the socket's mode reflects that:
-
-```
-/run/socketley/socketley.sock   0660  socketley:socketley
-any other path                  0600  the user who started the daemon
-```
-
-The packaged daemon runs as **socketley**, and the operator does not. The packaged socket is therefore shared with one group, and membership of that group grants the right:
-
-```
-sudo usermod -aG socketley "$USER"     # then log in again
-```
-
-A daemon on any other path keeps its socket to itself. This covers a development daemon and a daemon started with **SOCKETLEY_SOCKET**. The mode is owner-only rather than owner-and-group because a shared primary group is not unusual. Several distributions put every user in **users**, and there the daemon's group is every human on the machine.
-
-**Earlier versions made this socket 0666** (world-writable) on both paths. Any local uid could drive any daemon on the machine, whoever it belonged to. After an upgrade, a user who has been running **socketley** against a system daemon without being in the **socketley** group gets this error:
-
-```
-not permitted to open the daemon socket at /run/socketley/socketley.sock
-```
-
-That user needs to be added to the group. A user who is not added is not locked out of the program. With the system socket unreachable, the CLI falls back to development mode and starts a daemon of the user's own, with that user's privileges and that user's runtimes.
-
-On a machine where two people use development mode at once, the second person gets the same message about */tmp/socketley.sock*. The path has one owner, and the socket is no longer shared. Sharing it was never a supported arrangement; it was a shared daemon that nobody had asked for. Give each person a socket of their own:
-
-```
-export SOCKETLEY_SOCKET="/tmp/socketley-$USER.sock"
-```
-
-This also gives each person a state directory of their own; see **WHERE STATE LIVES**.
-
-### Where state lives
-
-The two directories above are where a daemon's runtimes live when the daemon serves the default socket. That covers every deployed daemon, and every daemon that has never heard of **SOCKETLEY_SOCKET**. This has not changed and will not change.
-
-A daemon on any *other* socket path gets a directory of its own. The directory is a sibling of the default one and is named after the socket path: the leading slash is dropped, and every character outside **A-Za-z0-9._-** becomes an underscore.
-
-```
-SOCKETLEY_SOCKET unset          ~/.local/share/socketley/runtimes
-SOCKETLEY_SOCKET=/tmp/a.sock    ~/.local/share/socketley/runtimes.tmp_a.sock
-SOCKETLEY_SOCKET=/tmp/socketley.sock
-                                ~/.local/share/socketley/runtimes
-```
-
-Setting the variable to the path that would have been used anyway counts as the default, not as a second daemon. A script that spells out the default therefore keeps the default directory. The directory name is readable rather than hashed on purpose: the answer to "which of these is mine" should come out of an **ls**.
-
-At startup the daemon logs the directory it is using (**state directory: ...**), and that line is the authoritative answer. Learn where to find it before you need it.
-
-**Upgrading.** The first time a daemon uses one of these keyed directories, it copies everything from the shared directory it used to read into the new directory, once. An INFO line says how many runtimes were adopted and from where. The originals stay exactly where they are, so an older binary rolled back onto the machine still finds what it has always found. A *.adopted* file in the new directory records what happened, and makes the copy a one-time event. Without that file, an operator who later removed every runtime would find them all back after the next restart.
-
-**...but never out from under a running daemon.** Adoption is skipped entirely while a daemon is serving the default socket path. Those runtimes belong to that daemon, and adopting them would mean binding ports it is already serving. The check is a probe of the default path; anything answering there, daemon or not, is enough to skip adoption.
-
-This is not a rare corner. An operator debugging beside a running daemon gets into this situation with one command. The second bind *succeeds* under **SO_REUSEPORT**, so nothing but the port count would ever have reported the problem.
-
-The daemon logs the skipped adoption at **WARN**, with both directory paths and what to do about it, because from the outside it looks exactly as if the runtimes had vanished. It writes no *.adopted* marker, because "somebody is using these right now" is a fact about this minute, not a decision. So once the daemon on the default path is stopped, restarting this one adopts the runtimes as normal.
-
-**The failure this trades against.** A daemon started with a **SOCKETLEY_SOCKET** that it did not have last time finds no runtimes. On a development machine that is correct: it is a different daemon, and it owns nothing. It cannot happen to a deployed node. A deployed node runs on the default path with the variable unset, and the default path is exempt from the rule for exactly that reason. If it happens anyway, nothing has been destroyed. The other directory is still on disk with everything in it, and starting the daemon with the variable it had before brings it all back.
-
-The alternative, one state directory for every daemon in the namespace, is not the safe direction. Two daemons then bind each other's ports on boot, and each reports the other's runtimes as its own. A **remove** sent to either one deletes a state file the other is still serving, and that cannot be undone.
-
-### Daemon Configuration
-
-The daemon configuration file is a Lua script that sets a **daemon** table:
-
-```
-daemon = {
-    name = "node1",          -- this daemon's name in a cluster
-    cluster = "/shared/dir", -- cluster directory; needs name
-    log_level = "info",      -- debug, info, warn, error
-    metrics_port = 9100,     -- Prometheus metrics HTTP endpoint
-    dashboard_credentials = "/etc/socketley/admin.creds",
-                             -- the dashboard's admins sign in from here
-    dashboard_idp = "auth",  -- or as admins of this idp runtime
-    alert_webhook = "https://discord.com/api/webhooks/...",
-                             -- where alerts are posted
-    alert_mail = "mail://m/ops@example.com",
-                             -- and mailed, by this mail runtime
-    events = "bus",          -- an mqtt runtime the runtimes' states and
-                             -- the alerts are published on
-    cpus = "0-3",            -- where this daemon's I/O runs
-    settings = {             -- any SOCKETLEY_* knob, by its short name
-        storage_hash_threads = 4,
-        lua_timeout_ms = 2000,
-        proxy_splice = true,
-    }
-}
-```
-
-**config** is the older name of the same table and still works. A file that sets both is refused rather than merged. **name** and **cluster** are the two keys that **socketley --lua** can also set on a daemon that is already running. Every other key is read only from this file, when the daemon starts. A **--cpus** typed on **socketley daemon** outranks the file.
-
-**settings** sets any variable under **ENVIRONMENT** that an operator may change, by its name in lower case and without **SOCKETLEY_**. For example, **storage_hash_threads** is **SOCKETLEY_STORAGE_HASH_THREADS**. Write a number as a number, an on-or-off value as **true** or **false**, and anything else as a string. The daemon puts each setting in the environment it starts its workers with, so a runtime reads the file's value just as it would read the variable's.
-
-The file takes precedence. A variable in the daemon's own environment counts only for a setting that the file does not name. The default applies only when neither sets a value. The daemon reports each of these on standard output and does not start:
-
-- a name that is not a setting;
-- a value outside the setting's range;
-- a variable that a command reads from its own environment: the **SOCKETLEY_GIT_*** variables, and **SOCKETLEY_SOCKET** and **SOCKETLEY_CONFIG**, which choose this file; also a variable the daemon sets for its workers, such as **SOCKETLEY_FAST_LO**.
-
-**socketley settings** shows the values that were taken.
-
-When **metrics_port** is set, the daemon starts an HTTP endpoint. It serves a live web dashboard at **GET /**, Prometheus exposition format metrics at **GET /metrics**, and JSON API endpoints at **/api/overview**, **/api/runtimes**, and **/api/runtime/<name>** (see **DASHBOARD**). The metrics include runtimes total/running, connections total/active, messages total, bytes in/out, and per-runtime breakdowns. Among the per-runtime metrics are **socketley_runtime_cpu_seconds_total**, **socketley_runtime_resident_memory_bytes** (resident memory, with a shared page counted once per shard) and **socketley_runtime_memory_bytes** (what the runtime costs the machine, with a shared page counted by the share it holds). The daemon's own metrics are **socketley_daemon_cpu_seconds_total** and **socketley_daemon_memory_bytes**.
-
-Each running runtime also exports the figures of its own **stats**. Each figure becomes a metric in a family named after the runtime's type, with the label **name**. The families are:
-
-- **socketley_server_***
-- **socketley_client_***
-- **socketley_proxy_***, among them **_backends**, **_healthy_backends**, **_backend_responses_total** and **_backend_failures_total**
-- **socketley_cache_***, among them **_keys**, **_get_hits_total** and **_get_misses_total**
-- **socketley_db_***
-- **socketley_dns_***, with **socketley_dns_queries_total** by **transport** and **socketley_dns_responses_total** by **rcode**
-- **socketley_idp_***, among them **_sign_ins_barred_total** (sign-ins refused for too many failures)
-- **socketley_mqtt_*** (messages by **qos**, drops by **reason**)
-- **socketley_sync_***, among them **_failing**
-- the storage, mail and tunnel families under **STORAGE FLAGS** (Metrics). A tunnel edge also adds **socketley_tunnel_agents_joined** (the agents expected to be linked) and **socketley_tunnel_agents_connected** (the agents that are linked).
-
-Counters end in **_total**. A figure that no family names is exported as **socketley_***type***_stat** with its name in the label **stat**.
-
-Beside these are the facts that the daemon's alerts look at. Each is a series that an alert rule can read:
-
-- **socketley_runtime_state** (labels **name**, **type**, **state**): 1 for the state a runtime is in, 0 for the other three.
-- **socketley_runtime_restarts_total**: the times a worker went down and was started again.
-- **socketley_cert_expiry_seconds** (labels **name**, **path**): the seconds until the certificate a runtime serves with ends, below 0 once it has ended. It is read every five minutes.
-- **socketley_disk_free_ratio**, **socketley_disk_free_bytes** and **socketley_disk_size_bytes** (label **path**): the state directory's disk and each storage runtime's disk, each disk once.
-- **socketley_host_memory_available_ratio**, **_available_bytes** and **_total_bytes**.
-- **socketley_runtime_quota_ratio**: how much of its limit a storage with **--max-bytes**, or a cache with **--maxmemory** and no eviction, holds.
-- **socketley_mail_blocklisted**: 1 while a blocklist from a mail runtime's **--dnsbl** names the address the runtime sends from.
-- **socketley_git_mirror_failed** (labels **name**, **repo**, **id**): 1 when the last pull of a storage's git mirror failed, read every minute. The **error** label holds what the failed pull said.
-- **socketley_runtime_failure** (labels **name**, **type**, **reason**): 1 for a runtime that failed, with its last warning or error line as the reason.
-- **socketley_runtime_bytes_received_total** and **_sent_total**, per runtime.
-
-The time work takes is a Prometheus histogram per runtime. The buckets start at 64 microseconds and double up to 16.8 seconds, plus **+Inf**. Each request is measured from the start of the loop turn that read it to the start of the turn that answered it. A request answered in the turn it came in therefore measures 0, and no clock is read for it. The histograms are:
-
-- **socketley_proxy_request_duration_seconds** (from an HTTP request's head to its answer's last byte)
-- **socketley_proxy_backend_connect_duration_seconds** and **socketley_proxy_backend_first_byte_seconds**
-- **socketley_server_http_request_duration_seconds**
-- **socketley_cache_batch_duration_seconds** (from a read's commands to their replies being handed on)
-- **socketley_db_request_duration_seconds**
-- **socketley_idp_sign_in_duration_seconds**
-- **socketley_mail_delivery_duration_seconds**
-- **socketley_storage_request_duration_seconds**
-
-Each histogram has **_bucket** (**le**), **_sum** and **_count**, with the shards' values added together. For example, **histogram_quantile(0.99, rate(socketley_proxy_request_duration_seconds_bucket[5m]))** reads the 99th percentile of the proxy request histogram.
-
-### WebSocket and other protocol upgrades
-
-A proxy in **http** mode relays a connection that has switched protocols. This is what lets a **ws://** client work through it. This section describes what that relay does, and what it deliberately does not do.
-
-Only the two endpoints negotiate the upgrade; nothing between them takes part. The proxy forwards the request's **Upgrade** and **Connection** headers unchanged, instead of stripping them as hop-by-hop headers. It relays the **101** response verbatim and computes no part of it. It does no **Sec-WebSocket-Accept** calculation, does not check that the key matches, and has no opinion about the protocol named. The proxy reacts to the 101, not to the token, so it relays any upgrade that two endpoints agree on in the same way. The exception is **h2c** (and **h2**). The proxy strips that offer, together with its **HTTP2-Settings** field, and answers it as a plain request. HTTP/2 behind a 101 would carry every later request past the checks the proxy makes on each request head.
-
-**Frames are never parsed.** After the 101, the connection carries opaque bytes. The proxy does not know where one frame ends and the next begins. So it does no fragmentation handling, answers no ping or pong on a backend's behalf, negotiates no **permessage-deflate**, and applies no per-message limit. **--max-connections** still counts connections; nothing counts frames. The **on_proxy_request** and **on_proxy_response** callbacks still see these bytes. However, they see whatever one read delivered, not whole frames. A callback that rewrites them corrupts the stream, because a frame carries its own length and a client-to-server frame is masked.
-
-**A tunnelled backend connection is never pooled.** There is no message boundary at which to return it to the pool. So one WebSocket uses one backend TCP connection for its whole life, however long that is. A proxy in front of many long-lived WebSocket clients holds that many backend sockets.
-
-The deadlines behave as follows. **--backend-timeout** limits the wait for the backend's first response byte, and the 101 is that byte. So it applies to the handshake and stops applying the moment the protocol switches. A tunnel is not measured against it, and the proxy never answers **504** because a tunnel is quiet. That is intended: on a tunnel, nothing may arrive for minutes. **--idle-timeout** still applies. On a tunnelled connection it counts bytes in *either* direction, not only what the client sends, so a stream the backend is feeding is not idle. A tunnel that is silent in both directions for longer than the timeout is closed, like any other connection.
-
-The circuit breaker counts a tunnel as one successful response (the 101) and nothing more. A session that ends is a connection closing, and the proxy does not charge it to the backend. In **stats**, the bytes relayed after the 101 are counted in **bytes_in** and **bytes_out**. **total_messages** counts the reads that carried them, not frames or requests. So a proxy carrying WebSocket traffic reports figures that do not match messages in either protocol's sense.
-
-A proxy in **--protocol tcp** mode is not affected by any of this. It was already a byte relay and never looked at a status line.
-
-### What can stop the event loop
-
-One thread serves every runtime in a process, so a call that waits stops all of them. Five places make such calls, and they are listed here.
-
-The figures were measured where measuring was possible, on a Lua echo server and a static file server under load. Each cost is given as a share of a worker's CPU on a healthy machine. The figures do not say what the same call costs when the disk is busy or the resolver is down, which is the case where they matter.
-
-- **socketley.http()** outside a callback that can wait. The whole exchange blocks, once per call from a script: name resolution, the connect and the transfer. It is bounded by the call's **timeout_ms** and by the callback's remaining budget. In **on_message**, **on_client_message**, an **mcp** tool's handler and the other callbacks that can wait, the call instead waits on the loop and blocks nothing.
-- **open**(2) and **fstat**(2) in the static file path, once per request that **--http-cache** does not answer. Measured at about 4.8 per cent of the worker: 1.7 in the kernel's open path and 3.1 in **statx**, which is what glibc turns an **fstat** into.
-- **getaddrinfo**(3) on a client's first dial and in a proxy's setup. Both happen before the runtime serves anything, so a start against a resolver that is not answering takes as long as the resolver does. Other lookups ask the nameservers of */etc/resolv.conf* from the loop itself, after checking */etc/hosts*. These are a client's reconnect, a server's upstream, a cache's **--replicate**, a proxy's later lookups, and every webhook, replication target and tier named by a host. They use UDP on a socket that never waits, and take the answer the next time they look. No call there takes longer than a tenth of a millisecond, even when a nameserver does not answer; that nameserver is passed over for the next one at its timeout. A name these lookups cannot answer, such as one only an NSS module knows or an answer that was cut short, goes to the system's resolver on a thread.
-- The mutation journal's flush, once per **--persistent-interval** while anything is buffered. On a healthy disk this is only a write to the page cache. On a full or slow disk, the write keeps a whole interval's worth of clients waiting.
-- The cache's snapshot and its **fsync**, at teardown rather than periodically. That is why it is listed last among the disk costs rather than first. A stop takes as long as the dump takes.
-
-A runtime's state file is not among them. The runtime writes and syncs it, together with its directory, on a thread of its own whenever its state changes, so no loop waits for that disk.
-
-**A storage runtime blocks twice, and never while it serves.** On start, before its listener exists, it reads the directory and removes temporary files. After any stop that was not clean, it also reads every object's header to reconcile the journals. That start takes as long as the object count requires. The work runs on threads with many reads at once, and all of it has ended before the runtime serves. On stop, the runtime syncs a marker file that records a clean stop. Between the two, every file read and write is an io_uring operation. So a slow disk adds latency to the requests waiting for it; it does not stop the runtime from answering its other connections.
-
-**What is NOT on this list, though it was suspected and measured.** A static file server spends 7.3 per cent of its worker in the kernel clearing pages. That looks like allocation churn, but it is not. The same server took fourteen minor page faults in total while answering half a million requests. So the pages are the kernel's own, for the 1.7 GB a second it puts on the wire. The malloc and free around each file buffer are served from the heap and never reach the kernel.
-
-### Out-of-process runtimes
-
-Every runtime made with **create** or restored at boot, of any type, runs in its own supervised worker process. There is no flag to keep one in the daemon. Only a server, client, proxy, cache, storage or dns runtime that a script makes with **socketley.create** runs in the daemon. This section states plainly what that costs.
-
-**The script runs in the worker and nowhere else.** An out-of-process runtime exists twice. The worker owns the listening socket and serves every byte. A placeholder in the daemon carries the runtime's name, port, group and state, so that **ls**, **stats** and the endpoint table have something to answer with. The script belongs to the worker. The placeholder compiles the script and then discards it without executing a line. Because it compiles the script, **create** still refuses a file that does not parse on the spot, instead of reporting "the worker exited and the runtime is failed".
-
-The script's **routes** declaration still reaches the daemon. The declaration is produced by running the script, and only the worker runs it. The worker encodes the declaration into a **routes** frame on the control socket it already holds. The supervisor decodes the frame onto the placeholder, and the daemon publishes the worker's copy in preference to a local one. Without it, **publish_endpoints** would publish nothing for the runtime. A gateway in front of it would then forward every method instead of refusing undeclared ones at the edge with a 405, and that enforcement would stop existing without notice. A **reload-lua** on such a runtime waits for the new declaration before republishing. So the gateway never enforces the old script's methods against the new script's handler. The declaration belongs to a handler rather than a proxy, which is why it matters now that every type has its own process by default.
-
-**create waits for the worker's verdict.** Compiling the script in the placeholder catches a file that does not parse, and nothing else. The rest of the configuration is judged in the worker, where the script actually runs, the port is actually bound and the TLS pair is actually read. So **create** does not answer as soon as it has forked a process. It waits until that process says whether it can serve what it was given.
-
-Three things end the wait. If the worker reports that it is serving, **create** exits 0. If the worker refuses, or starts but cannot bind, resolve its backend or load its certificates, **create** exits 1 and the daemon's log gives the reason. The runtime is then left **failed**, where **ls** shows it, rather than removed, so there is still something to ask about. If neither answer arrives within two seconds, **create** exits 2 and says so. The runtime stays under supervision, and **ls** reports whatever state it settles on.
-
-The two-second bound is a backstop, not a budget. A worker that has to compile a script, build its ring and bind a listener reports back in about 20 ms. A refusal comes back sooner, because the child stops at the script. Only a worker that has wedged reaches two seconds. **create** never blocks indefinitely on a child.
-
-**A runtime in a worker can still ask another runtime by name.** **--cache** works across the process boundary in both directions. When a process gets a request for a name it does not hold, it sends the request out on the control socket. The daemon holds the whole map and is the only process that can route. It looks the name up, posts the request to whatever answers for it (in the daemon or in another worker), and writes the answer back. Neither the asking runtime nor the client on the other end of the socket can tell which arrangement served it. A request for a name that nothing answers to is refused with the same **error: no such runtime** that an in-process runtime gives; it is not dropped silently.
-
-**The cross-runtime management API works inside a worker.** **socketley.create**, **.start**, **.stop**, **.remove**, **.send**, **.list**, **.get**, **.pipe** and the **socketley.cluster** table are answered as they are in the daemon; see **Process Isolation** under **PROXY FLAGS**. A worker refuses them only when the daemon that forked it could give it no control socket, which means an older build.
-
-**self.route() crosses the boundary.** It names another runtime, but it works from a worker. **route_client**() does not need a file descriptor to travel to the other process. It needs the target's connection tables, which it reaches by **conn_ref** through **shared/ipc/route_relay.h**. The origin keeps the socket and relays the bytes, exactly as it does when both runtimes are in one process.
-
-**unroute()**, **get_route()** and **owner_send()** answer from this runtime's own tables.
-
-**Cross-runtime pub/sub reaches a worker.** A cache's **PUBLISH** is delivered to a worker's **subscribe** callbacks over the worker's control socket. The daemon does not run those callbacks against the placeholder it keeps for the runtime. Delivery is one-way and best-effort, like every other frame on that socket. A publish is an event, not a state. So a frame dropped because the child is not reading is not re-sent. A frame that arrives before the worker has been configured is discarded, not replayed to a subscriber that did not exist when it happened.
-
-**Interactive mode (start -i) is not offered for a proxy, on either path.** Interactive mode is a stream. What is typed reaches a server's clients, a client's server, or a cache's command parser. A proxy relays between a client and a backend and speaks for neither. So typed input has nothing to mean, and offering it would mean inventing a meaning rather than exposing one. The command refuses and exits 1 *without starting anything*.
-
-**A worker's figures are read when they are printed.** For an out-of-process runtime, **connections**, **total_connections**, **total_messages**, **bytes_in** and **bytes_out** are summed from a small shared-memory region at the moment the command prints them. Each worker stores its own line in that region once per turn of its event loop, and the daemon adds the lines up. There is no round trip, and nothing waits on a child that may be wedged. There is also no interval between reading and printing in which a figure could go stale.
-
-So every figure is identical on both paths, which is the property the split exists to have. The **figures:pushed** and **figures_age_ms:***n* lines of earlier releases no longer exist, and nothing replaces them: there is no age left to report.
-
-The part of **stats** that is not a summable counter is still computed inside the worker. Examples are a cache's key count, a proxy's healthy backends and the ring's granted polling mode. They are walks of tables that exist only in the worker. The worker sends this part over the control socket when it changes. For a runtime with no traffic, that is never: an idle worker sends nothing. It wakes only for a TLS listener's check of its certificate files, once every two seconds.
-
-Until the first such report arrives, **stats** prints **worker_report:none** in place of those figures. Ordinarily that window is the first fraction of a second after a start. A runtime that shows it while serving traffic has a worker that is alive but not publishing: it is wedged, or its frames are being lost. That line is the difference between "no data" and "no traffic".
-
-**And which process it is.** **stats** prints **pid:***n* for a runtime that has its own process: an out-of-process proxy's worker, or a managed external runtime's child. Nothing else in the output says that the runtime runs elsewhere. So this line names the process to strace, to read **/proc** for, or to charge a machine's memory to. An in-process runtime prints no such line. Neither does a runtime whose worker has been stopped or reaped. A pid that has been returned to the system is worse than none, because somebody will go and look at that number.
-
-A sharded runtime prints **shards:***n* and **shard_pids:** instead, because there are *n* processes and naming one of them arbitrarily would be wrong. Its counters are still one set of figures: the shared region has one line per shard, and the sum over them is what the runtime is serving.
-
-Every type is split, and no flag keeps one in the daemon. The management API, **self.route()** and the figures work in a worker as they do in the daemon.
-
-### TLS
-
-**Every runtime type speaks TLS.** This covers a server's and a cache's own listener, both legs of a proxy, and a client runtime's dial. A **server** created with **--tls --cert** *file* **--key** *file* accepts connections, handshakes and moves records itself. OpenSSL never touches the socket. Each connection gets a memory BIO pair. The same io_uring submissions that carry every other byte in the daemon carry the ciphertext in and out. The handshake advances one completion at a time, so nothing blocks the event loop. Protocol detection, WebSocket, HTTP and RESP all run on the decrypted stream, so **wss://** and **https://** work on a listener configured this way. **--ca** *file* adds mutual TLS: a client must present a certificate signed by that CA.
-
-A peer that opens a connection and never finishes the handshake is dropped after 30 seconds. This limit is fixed, not configurable, and deliberately separate from **--idle-timeout**. A connection that completed its handshake and then went quiet is legitimate on a daemon built for long-living ones. A peer that has sent nothing the record layer accepted has not become a client at all. Without the limit, it could hold a slot against **--max-connections** for as long as it liked. The clock starts when the handshake does, and later bytes do not move it. So a peer that dribbles inside an unfinished record is dropped on the same schedule as one that sends nothing at all. A **client** runtime applies the same 30 seconds to a target that accepts its connection and then never handshakes. After that, **--reconnect** applies to it like any other lost connection.
-
-A **proxy** runs the same record layer on both of its legs. The same three flags terminate TLS on its listening port, and **--client-ca** *file* makes it demand a certificate from its callers. The backend leg uses TLS when the backend address is **https://**, or when **--ca**, **--client-cert** or **--client-key** is given; those three apply to every backend. **--client-cert** and **--client-key** present a certificate to a backend that asks for one. The proxy always verifies a TLS backend connection: against **--ca** or the system store, with the endpoint's name checked, and with TLS 1.2 as the minimum version. There is no option to turn that off. These connections are pooled and reused together with their sessions, so a handshake is paid once per idle period rather than once per request. A pooled socket is only ever returned to the endpoint it was opened to, which is the name it was verified against.
-
-**--health-check http** works against a TLS backend and probes it over TLS. The probe uses the same record layer as the data path: a memory BIO pair, records carried by ordinary io_uring submissions, and a handshake advanced one completion at a time. It is held to the same standard. The chain is checked against **--ca** or the system store, the certificate against the endpoint's own name, and TLS 1.2 is the minimum. A backend whose certificate does not verify is marked **unhealthy** rather than reported healthy. That is the only answer that agrees with what the data path would do with it. Everything above the record layer is unchanged: the probe fetches the same **--health-path** *path***,** and only a 2xx counts.
-
-A **client** runtime runs the dialling half of the same record layer on its outbound socket. When created with **--tls**, it puts a ClientHello on the wire as soon as it has a socket. It advances the handshake one completion at a time, exactly as the server and the proxy do. The line framing and the Lua callbacks above it see the same plaintext they always did. The client verifies the peer against **--ca** *file* or the system store. The certificate must be valid for the host in **-t**: its DNS SAN must match, or its IP SAN for an address literal. **--cert** *file* and **--key** *file* present a certificate to a peer that asks for one. By design, there is no skip-verify option. When a peer fails either check, the client drops the socket and re-dials on its usual backoff. It never retries in cleartext.
-
-A **cache** terminates TLS on its own listener with the same three flags a server uses, and **--ca** *file* demands a client certificate there in the same way. RESP is auto-detected from the first byte of the decrypted stream. So an existing Redis client speaks the protocol it always did, one layer up, and the line protocol works on the same port.
-
-**A cache still cannot replicate over TLS.** Replication is not a listener, and nothing encrypts it. A follower dials its leader itself, in cleartext. On a leader, a promoted follower is written to by a second writer that goes around the record layer by design. So the combination is refused rather than half-honoured. **--tls** together with **--replicate** is rejected at **create**, by **edit** and **import**, and again at every **start**. A state file that carries both leaves the runtime **failed** rather than letting it come up quietly wrong. A TLS cache that a **REPLICATE** command asks to become a leader answers with an error instead of promoting itself. A cache encrypted for its clients but cleartext for its replicas would be worse than an honestly cleartext one, because only the first looks safe.
-
-Two further combinations are refused for the same reason: **--udp** on a client or a server, because DTLS is not implemented; and, on a server, **--upstream**, because the upstream connection would still be made in cleartext. A proxy in **--protocol tcp** mode terminates TLS on its listener like any other proxy and forwards the decrypted stream to its backend. On any connection with a TLS session, it bypasses the zero-copy splice path, because a splice would move bytes the record layer never saw.
-
-There is one outbound exception, and it is not transport. **socketley.http()** in a Lua callback speaks HTTPS. It verifies the certificate chain and the host name, with TLS 1.2 as the minimum version (see **Global Functions**). It is a client call that a script makes. It encrypts nothing that socketley itself serves or forwards.
-
-Anything that is not implemented fails closed, and so does every incomplete configuration:
-
-- **create** rejects **--tls**, **--cert**, **--key** and **--ca** on a **dns**, **sync**, **idp**, **db**, **tunnel**, **metrics** or **mcp** runtime, which has no handshake, and **--client-ca**, **--client-cert** and **--client-key** on anything but a proxy. It exits with status 1 and a message that names the flag.
-- On a **server**, **client** or **proxy** runtime the same flags are accepted, but only as a complete set. **--tls** without a certificate and key on a **server** or **proxy** is refused, and no runtime is created. So is a certificate or trust store without **--tls** on any of the three. Either would describe a listener that could only serve cleartext, or a dial that would be made in cleartext. On a **client**, **--tls** alone is complete, but half a **--cert**/**--key** pair is refused: it would present nothing while the flags said a certificate was configured. On a proxy, **--client-ca** without **--tls** is refused, and so is half a **--client-cert**/**--client-key** pair, for the same reason.
-- Flag-based **edit** applies the same rule. It restores the previous TLS settings if the edit would leave them incomplete. **edit** accepts a subset of the flags of **create**, so most flags it does not accept come back as **unknown flag**. These flags do not, because changing TLS on a live runtime is exactly what an operator would be attempting.
-- **import** applies the same rule to the JSON document's fields.
-- **start**, **reload** and the daemon's own boot-time restore refuse a runtime whose configuration cannot be honoured. This is how a runtime restored from a state file written by an older release is caught. Nothing is brought up, and the runtime goes to **failed**.
-- A certificate or key that cannot be read, or a key that does not match its certificate, fails the runtime at start. The port is never bound.
-
-To clear the settings from a runtime whose configuration is refused, dump it, delete the TLS fields, and import it back (see **import**).
-
-The embedded C++ SDK reaches the same gate, because its **start()** goes through **runtime_manager::start**. So **server().tls(cert, key)** and **proxy().tls(cert, key)** terminate TLS exactly as a daemon-managed runtime does. **client().tls()** dials over TLS, and **cache().tls(cert, key)** terminates it, through the same gate.
-
-For encrypted transport on a server's upstream connections, terminate TLS in a front-end proxy (nginx, HAProxy, stunnel). Have it forward over loopback or another trusted network path. A socketley **proxy** can play that part.
-
-### Daemon flags
-
-These flags configure the running daemon through IPC commands. If no daemon is running, one is started automatically.
-
-Each socket is served by one daemon. While it runs, the daemon holds a lock on the socket's path with **.lock** appended. A second daemon started meanwhile, by hand or by a command's auto-start, waits for the first one to answer and then exits 0. If the lock holder never answers, the second daemon exits 1 after ten seconds.
-
-##### `--name name | -n name`
-
-Sets this daemon's identity. Cluster mode requires it. The name can be changed at any time. If cluster mode is active, the daemon republishes its cluster file under the new name and removes the old one.
-
-##### `--cluster dir`
-
-Enables cluster mode on the given shared directory. Every 2 seconds, each daemon publishes its runtime state there and scans for peer daemons. Proxy **@group** backends automatically discover runtimes on remote daemons. In Docker Compose, mount a shared volume at this path. The advertised host address is set automatically from **gethostname**(3). Requires **--name** to be set first.
+- More in the manual: **System Mode (installed via package)** (man-files.txt): /usr/bin/socketley # The socketley binary.
+- More in the manual: **Development Mode (no system install)** (man-files.txt): /tmp/socketley.sock # The Unix domain socket for daemon IPC.
+- More in the manual: **The IPC socket** (man-files.txt): Every socketley command travels over the socket above, and through it a client can reach everything the daemon can do.
+- More in the manual: **Where state lives** (man-files.txt): The two directories above are where a daemon's runtimes live when the daemon serves the default socket.
+- More in the manual: **Daemon Configuration** (man-files.txt): The daemon configuration file is a Lua script that sets a daemon table: daemon = { name = "node1", -- this daemon's name in a cluster cluster = "/shared/dir", -- cluster directory; needs name log_leve
+
+- More in the manual: **WebSocket and other protocol upgrades** (man-limitations.txt): A proxy in http mode relays a connection that has switched protocols.
+- More in the manual: **What can stop the event loop** (man-limitations.txt): A process serves its runtimes on one thread: a worker serves its one runtime, and the daemon serves the runtimes that scripts make in it.
+- More in the manual: **Out-of-process runtimes** (man-limitations.txt): Every runtime made with create or restored at boot, of any type, runs in its own supervised worker process.
+- More in the manual: **TLS** (man-limitations.txt): Every runtime type speaks TLS.
+
+- More in the manual: **Daemon flags** (man-daemon-flags.txt): These flags configure the running daemon through IPC commands.

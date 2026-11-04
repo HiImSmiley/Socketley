@@ -1,0 +1,177 @@
+# MQTT flags
+
+From the manual page socketley(1).
+
+An **mqtt** runtime is an MQTT broker for versions 3.1, 3.1.1 and 5.0, over TCP, TLS and WebSocket. Devices, apps and browsers publish to topics and subscribe to them. A client that goes away keeps its session until it comes back or the session expires. The session holds its subscriptions and the messages sent to them while the client was gone. The broker is a runtime like the others. Its own rules pass messages to a cache, a db, a storage, a server or another broker. A storage's events and a script's messages reach its subscribers.
+
+```
+socketley mqtt passwd /etc/socketley/mqtt.users sensor-17
+socketley create mqtt broker --users /etc/socketley/mqtt.users \
+    --acl /etc/socketley/mqtt.acl --ws 8083 --persistent on -s
+socketley create mqtt devices -p 8883 --tls --cert dev.pem --key dev.key \
+    --ca devices-ca.pem --routes /etc/socketley/mqtt.routes -s
+```
+
+The broker listens on 1883, or on 8883 with **--tls**, unless **-p** gives another port. **--max-connections** and **--write-buffer** work as for a server. When a slow client owes more than the write buffer, its QoS 0 messages are dropped and counted, and its QoS 1 and 2 messages wait in its session.
+
+**What it implements.** The broker implements:
+
+- QoS 0, 1 and 2. QoS 2 is delivered exactly once, by its packet identifier.
+- Retained messages, cleared by an empty one.
+- Wills. A will is sent when a connection is lost, or when a 5.0 client disconnects and asks for it. It is not sent when the client disconnects cleanly. A 5.0 will delay is waited out if one is given, and the will is not sent at all when the client comes back within it.
+- Sessions, kept by 3.1.1's clean session 0 and by 5.0's session expiry. A client id has one connection. A second connection takes the session over, and the first is told so. A session belongs to its user, so a CONNECT under another user (or none) is refused as not authorized.
+- Keep alive: a client that is silent for one and a half times its keep alive is disconnected.
+- A CONNECT is required within ten seconds; otherwise the connection is closed.
+- From 5.0: session and message expiry, the receive maximum both ways, topic aliases, the maximum packet size, subscription identifiers, no local, retain as published, and retain handling.
+- From 5.0: shared subscriptions (**$share/***group***/***filter*, each message to one member, in turn), and request and response (the response topic and correlation data are carried).
+- From 5.0: user properties, the content type and the payload format, and reason codes and strings on what it refuses.
+
+The wildcards **+** and **#** do not match a topic that begins with **$**. The broker publishes its own figures, retained, under **$SYS/broker/** every ten seconds: version, uptime, clients, messages and subscriptions. It does not take the 5.0 AUTH exchange: a CONNECT that names an authentication method is refused with 0x8C. It does not bridge to brokers outside the daemon.
+
+**Who may connect.** At least one of **--users**, **--idp**, **--ca** or **--anonymous** must be given. A client certificate that **--ca** verified lets its client in under the certificate's common name. A password is checked against the users file, off the event loop. Otherwise, with **--idp**, the password is taken as an access token that provider gave a client **--idp-audience** names, and the token account's name is the user. A user name given with the token must be that name. Without credentials, a client is let in only with **--anonymous**. A refusal is 0x86 (bad user name or password), or 4 to a 3.1.1 client. A script's **on_auth** has the last word (see **Lua** below).
+
+**What each may do.** **--acl** names rules in Mosquitto's form. The broker reads them again within two seconds of a change:
+
+```
+# before any user line: clients without one
+topic read public/#
+user alice
+topic readwrite home/alice/#
+topic write telemetry/#
+topic deny telemetry/secret/#
+pattern readwrite users/%u/#
+pattern write devices/%c/state
+```
+
+**topic** [**read**|**write**|**readwrite**|**deny**] *filter* applies to the user named last. **pattern** applies to everyone. In a pattern, **%u** stands for the user and **%c** for the client id, each as one level. A deny wins over any grant, and what no rule grants is refused. A refused publish is answered 0x87 to a 5.0 client. To a 3.1.1 client, it is acknowledged and dropped. A subscription is refused only when no rule grants all of it. A message that a deny covers is held back from a subscription that the deny covers in part. Without **--acl**, every client may do everything.
+
+**Sessions across a restart.** With **--persistent**, the broker writes a snapshot every **--persistent-interval** when something changed, off the event loop, and at stop. The snapshot holds the sessions, their queues and messages in flight, the retained messages and the topic rules' queues. A start reads them back. So a stop, a restart of the daemon or a killed worker loses at most one interval. At the start that finds them, a session with no expiry left is ended, and the wills it was owed are sent. Without **--persistent**, the broker keeps nothing across a restart.
+
+**Topic rules.** **--routes** names a file of rules, one per line, each a filter and a target. Every message the filter matches is handed to another runtime of the daemon, besides the broker's own subscribers:
+
+```
+# filter          target
+sensor/+/temp     cache://telemetry/stream/temps-%1
+alarm/#           cache://events/channel/alarms
+device/+/state    db://fleet/devices/%1
+log/#             storage://raw/mqtt/%Y/%m/%d/
+chat/#            server://chat
+share/#           mqtt://other/from-edge/%t
+door/#            https://hooks.example.com/door
+```
+
+- **cache://***runtime***/stream/***key* adds a stream entry with the fields **topic**, **payload**, **qos** and **client**.
+- **cache://***runtime***/channel/***name* publishes the payload on the channel.
+- **db://***runtime***/***collection*[**/***id*] puts a document under *id* when given, and as a new document otherwise. The document is the payload when the payload is a JSON object, and otherwise **{"topic":..,"payload":..,"client":..,"qos":..}**.
+- **storage://***runtime***/***bucket*[**/***prefix*] gathers the messages as JSON lines, **{"at":..,"topic":..,"payload":..,"qos":..,"client":..}**, into one **.ndjson** object a minute (or a megabyte, or at stop) under the prefix.
+- **server://***runtime* sends every client of the server **{"topic":..,"payload":..}** as a line.
+- **mqtt://***runtime***/***topic* publishes on that broker, at the message's QoS and retained as it was. A message that has passed eight such rules on its way is passed on by no more of them, so rules that lead to each other end.
+- **http://** or **https://** URL POSTs **{"topic":..,"payload":..,"qos":..,"retain":..,"client":..}** to the URL, one at a time and in order, on a connection it keeps. The host is resolved on the broker's loop (see What can stop the event loop). A 2xx counts as delivered. A 400 or another refusal is counted as failed and not sent again. No answer, a 408, a 429 or a 5xx is tried again, as for a stopped runtime.
+
+   **%1** to **%9** stand for the levels the filter's **+** matched, **%t** for the whole topic and **%c** for the client that published. A storage prefix also takes **%Y**, **%m**, **%d**, **%H** and **%M**. A line beginning with **#** is a comment, and so is a **#** after a target. The file is read at start. A file that does not read stops the runtime, and the error names the line.
+
+   Each rule has a queue of its own, in order. A target that is stopped or does not answer holds its messages, without holding up the broker or the other rules. The rule tries again after a pause that grows to five seconds. It holds up to 100000 messages; past that, the oldest are dropped and counted. What a rule holds goes into the snapshot, with messages in flight in their place, so a restart sends them again. A target gets each message at least once. **stats** names each rule with what it delivered, what its target refused, what was dropped, what it holds and its last error.
+
+**From the other runtimes.** **socketley mqtt-pub** and a script's **socketley.mqtt.publish** publish as the broker itself. A storage's **mqtt://***runtime***/***topic* notification target publishes the storage's events (see **--notify-targets**). The **mqtt://** rules of another broker publish that broker's messages:
+
+```
+local ok, err = socketley.mqtt.publish("broker", "game/" .. id .. "/move", move, { qos = 1 })
+socketley.mqtt.publish("broker", "chat/lobby", text, { retain = false }, function(ok, err) end)
+```
+
+The call answers true once the broker has the message, or nil and the reason. Inside a callback that can wait, it waits. Anywhere else, the last argument is a function that is called with the answer.
+
+**WebSocket.** **--ws** *port* serves MQTT inside WebSocket on a second port, for browsers. Any path works, and **/mqtt** is the convention. The subprotocol **mqtt** or **mqttv3.1** is chosen when offered. A packet may be carried in any number of frames, and a frame may hold any number of packets. A frame may be no longer than four times **--max-packet**. With **--tls**, it is wss.
+
+**On several cores.** With **--shards** *N* the broker is *N* worker processes sharing its ports (**SO_REUSEPORT**), and its clients see one broker. Each shard tells the others what its clients subscribe to, and hands them the messages their subscribers want. Every shard keeps each retained message. A shared subscription's message goes to one member of the group, across all the shards. A client that connects to a different shard than before takes its session with it. The newest connection of a client id wins.
+
+A shard may not take what another shard hands it as fast as it comes. It then holds back that other shard's publishers, rather than lose their messages: they are not read until it can take more. At QoS 1 and 2 this holds back all of them, and at QoS 0 those whose last message went to it. A shard that has answered nothing for a second holds back only QoS 1 and 2 publishers, whose answer waits. A message for that shard is then dropped at QoS 0, or once 8 MiB wait for it. At any QoS, a message is dropped once what the shard was handed has failed for three seconds. Drops are counted in **shard_dropped**. Each shard keeps a snapshot of its own, *file***.***shard*, and publishes its figures under **$SYS/broker/shard/***n***/**.
+
+**Lua.** A broker's **--lua** script may decide who connects and what passes. Each hook that decides answers **true** to allow, **false** to refuse, or nothing to keep what the broker decided. A hook that fails refuses. A client is a table of **id**, **username**, **peer** and **version**.
+
+```
+function on_auth(c)          -- c.id c.username c.password c.peer
+    if c.username == "robot" then return c.password == "beep" end
+end                          -- c.certificate c.authenticated c.account c.version
+function on_publish(client, msg)              -- msg.topic msg.payload msg.qos msg.retain
+    if msg.topic == "shout" then return { payload = string.upper(msg.payload) } end
+end
+function on_subscribe(client, filter, qos) return filter ~= "secret/#" end
+function on_connect(client) self.publish("presence/" .. client.id, "online", { retain = true }) end
+function on_disconnect(client, why) self.publish("presence/" .. client.id, "offline", { retain = true }) end
+```
+
+**on_auth** is told whether the credentials checked out (**authenticated**) and as whom (**account**). If it lets in a client whose credentials were refused, the user name the client gave becomes its user. **on_publish** may also answer a table: the message as it is to go on, with any of **topic**, **payload**, **qos** and **retain**. A refused publish is answered 0x87. **self.publish(topic, payload [, {qos=, retain=}])** publishes as the broker. **self.retained(topic)** reads a retained payload. **self.sessions()** lists this shard's sessions. **self.kick(client_id [, end])** disconnects one. While a hook decides, that connection's next packets wait.
+
+### `--users file`
+
+The accounts that sign in with a password, one *user***:***hash* per line, as **socketley mqtt passwd** writes them. The file is read again within two seconds of a change.
+
+### `--idp runtime`
+
+The idp runtime whose access tokens, given as the password, sign clients in. It takes only tokens given to a client that **--idp-audience** names.
+
+### `--idp-audience clients`
+
+The ids of the idp's clients whose access tokens the runtime takes, comma-separated. A token the provider gave any other application is refused, since it belongs to that application and is no key to this runtime. Without the flag no access token is taken, while the users file and client certificates sign in as before.
+
+### `--acl file`
+
+Who may publish and subscribe to what (see **What each may do** above).
+
+### `--anonymous`
+
+Lets in clients without credentials, as far as the rules allow.
+
+### `--routes file`
+
+Where messages go besides their subscribers (see **Topic rules** above).
+
+### `--ws port`
+
+A second port, which serves MQTT over WebSocket.
+
+### `--persistent file|on`
+
+The snapshot file that sessions and retained messages are kept in. **on** means *state***/mqtt/***name***.snapshot** under the state directory.
+
+### `--persistent-interval duration`
+
+How often changes are written to the snapshot. Default: 1s.
+
+### `--max-packet size`
+
+The largest packet a client may send, from 64 bytes to 256M. Default: 256K. A larger packet is answered 0x95, and the connection is closed. The limit is told to 5.0 clients. No message larger than a client says it takes is sent to that client.
+
+### `--session-expiry duration`
+
+The longest a session outlives its connection, whatever the client asks. Default: 1d. A 3.1.1 session kept by clean session 0 lasts this long.
+
+### `--session-queue n`
+
+The most messages kept for one session while its client is away or slow. Default: 1000. Past it, the oldest are dropped and counted.
+
+### `--retained-max size`
+
+The most bytes that retained messages may take. Default: 64M. A new retained message past it is not kept, and is counted.
+
+### `--max-sessions n`
+
+The most sessions, connected or not. Default: 100000. A new client past the limit makes the broker look at the owner that holds the most sessions. An owner is a user or, for clients without one, an address (IPv6 by its /64). If that owner holds two or more, the broker ends its session that has been away longest, and counts it as **sessions_evicted**. So one owner filling the table locks nobody else out. Otherwise the new client is refused with 0x97.
+
+### `--keepalive-max seconds`
+
+The longest keep alive the broker grants. Default: 1200. A 5.0 client that asks for more, or for none, is told this value.
+
+A client that leaves more than twice **--write-buffer** (default 8M) of what it was sent unread is not read until it has read half of it. So its pings and acks cannot grow what it is owed.
+
+**stats** reports:
+
+- the sessions, and how many are connected;
+- the subscriptions, the retained messages and their bytes;
+- what is queued and in flight;
+- the messages received and sent at each QoS, and what was dropped and why;
+- the connects and the refusals;
+- the snapshots, and whether a change is in none yet;
+- each topic rule;
+- over shards, what was handed between them.

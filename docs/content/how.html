@@ -73,8 +73,8 @@
 
 <h2>When something stops or fails</h2>
 <table class="kv"><tr><th>Event</th><th>What happens</th></tr>
-<tr><td>A worker crashes</td><td>The daemon restarts it and the runtime stays <code>running</code>. Other runtimes release the connections routed to or from it.</td></tr>
-<tr><td>It crashes more than five times in ten seconds</td><td>The runtime is left <code>failed</code> instead of being forked again in a loop.</td></tr>
+<tr><td>A worker crashes</td><td>The daemon restarts it and the runtime stays <code>running</code>. What the worker held only in memory is lost: a cache keeps only what <code>--persistent</code> saved. Other runtimes release the connections routed to or from it.</td></tr>
+<tr><td>It crashes more than five times in ten seconds</td><td>The runtime is left <code>failed</code> instead of being forked again in a loop. Fix the cause, then <code>socketley start</code> it again.</td></tr>
 <tr><td>A Lua callback never returns</td><td>Its deadline ends it. <a href="#/man/lua-configuration">Callback deadline →</a></td></tr>
 <tr><td>The daemon stops or the machine reboots</td><td>On the next start the daemon restores every saved runtime and starts the ones that were running.</td></tr>
 <tr><td>You run <code>stop</code></td><td>The worker ends; the runtime is kept as <code>stopped</code>. With <code>--drain</code> it first finishes what is in flight.</td></tr></table>

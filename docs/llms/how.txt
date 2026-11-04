@@ -94,8 +94,8 @@ A runtime's JSON file holds its flags and whether it was running. It can hold a 
 
 | Event | What happens |
 |---|---|
-| A worker crashes | The daemon restarts it and the runtime stays `running`. Other runtimes release the connections routed to or from it. |
-| It crashes more than five times in ten seconds | The runtime is left `failed` instead of being forked again in a loop. |
+| A worker crashes | The daemon restarts it and the runtime stays `running`. What the worker held only in memory is lost: a cache keeps only what `--persistent` saved. Other runtimes release the connections routed to or from it. |
+| It crashes more than five times in ten seconds | The runtime is left `failed` instead of being forked again in a loop. Fix the cause, then `socketley start` it again. |
 | A Lua callback never returns | Its deadline ends it. [Callback deadline →](man-lua-configuration.txt) |
 | The daemon stops or the machine reboots | On the next start the daemon restores every saved runtime and starts the ones that were running. |
 | You run `stop` | The worker ends; the runtime is kept as `stopped`. With `--drain` it first finishes what is in flight. |

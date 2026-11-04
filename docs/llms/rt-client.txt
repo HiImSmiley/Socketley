@@ -86,28 +86,6 @@ Every flag a client runtime takes, by group.
 
 No benchmark. A client runtime holds one connection to somebody else's server; there is no other program doing that to set beside it.
 
-## The manual on client
+## In the manual
 
-#### `-t host:port | unix:/path/to.sock`
-
-The server the client connects to. Default: 127.0.0.1:8000.
-
-**unix:***/path/to.sock* dials the socket node that a runtime with **--listen unix:** serves. It is the connect side of the same address and follows the same rules: the path must be absolute and fit within the kernel's *sun_path* limit. It is refused together with **--udp** and with **--tls**, for the reasons given for the listener under **COMMON FLAGS**.
-
-#### `--mode mode`
-
-The direction in which messages flow: **inout** (both ways, the default), **in** (receive only) or **out** (send only).
-
-#### `--udp`
-
-Use UDP instead of TCP. The client creates a connected SOCK_DGRAM socket. Each datagram is one message; there is no line parsing. Not available for cache or proxy.
-
-#### `--reconnect [max-attempts]`
-
-Reconnect automatically, with exponential backoff, when the connection is lost. The backoff starts at 1 second and doubles with each attempt, up to a ceiling of 16 seconds, with up to half a second of jitter. A client whose target is gone therefore dials again after 1, 2, 4, 8, 16, 16, 16 seconds. *max-attempts* limits the number of attempts. 0 means no limit, and is the default when the flag is given without a value. A negative count is refused, because -1 is the stored value for "off". Reconnection is off unless this flag is given.
-
-This is a client flag. It is refused on a server, a proxy or a cache: it re-dials a connection the runtime made, and those three accept connections rather than make them.
-
-"When the connection is lost" includes a peer that never says so. A close sends a FIN or an RST, and the client acts on it at once. But a machine that loses power, a link that partitions, or a firewall that forgets an idle flow sends nothing at all. An idle client that never writes would never find out. Every client socket therefore uses TCP keepalive: 60 seconds idle, then three probes ten seconds apart. A peer that has silently gone is noticed in about 90 seconds, and the backoff above starts from there. No flag changes this. The kernel's own default is two hours, which for this purpose is the same as never.
-
-A client also takes the TLS flags; see **--tls** under **COMMON FLAGS**. **--tls** alone dials the target over TLS and verifies it against the system trust store. **--ca** *file* supplies a trust store instead. **--cert** *file* with **--key** *file* presents a certificate to a peer that asks for one. The host in **-t** is the name the certificate must be valid for. A verification failure closes the socket, and the client re-dials on the backoff above. The client never retries in cleartext, and there is no way to skip the check. **--tls** with **--udp** is refused, because that would need DTLS.
+Every flag in full, and the rest: man-client-flags.txt
