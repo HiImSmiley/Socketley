@@ -423,7 +423,10 @@ A runtime's JSON file holds its flags and whether it was running. It can hold a 
 | A worker crashes | The daemon restarts it and the runtime stays `running`. What the worker held only in memory is lost: a cache keeps only what `--persistent` saved. Other runtimes release the connections routed to or from it. |
 | It crashes more than five times in ten seconds | The runtime is left `failed` instead of being forked again in a loop. Fix the cause, then `socketley start` it again. |
 | A Lua callback never returns | Its deadline ends it. [Callback deadline →](man-lua-configuration.txt) |
-| The daemon stops or the machine reboots | On the next start the daemon restores every saved runtime and starts the ones that were running. |
+| The daemon is restarted (`systemctl restart`, or a package upgrade, which restarts a running service) | Every worker stops with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running. |
+| The daemon itself crashes | Its workers end with it: a worker never outlives its daemon. systemd starts the daemon again after five seconds, and it restores the runtimes as above. |
+| The machine reboots | The service starts at boot and restores the runtimes as above. |
+| The power fails | What was only in memory is gone, and so can be the last writes the kernel had not written to disk yet. A cache's journal is not synced to disk; a storage runtime's `--fsync` decides when its writes are. |
 | You run `stop` | The worker ends; the runtime is kept as `stopped`. With `--drain` it first finishes what is in flight. |
 
 A runtime's state is always one of `created`, `running`, `stopped` or `failed`; `ls` shows it, and a failed runtime shows the reason.
@@ -828,6 +831,14 @@ The goal: `https://shop.example.com` answered by a Lua script, with a real certi
 
 A request now goes browser → entrance on 443 (TLS ends here) → the server `shop` → `on_http_request`. See [How it works](how.txt) for the path, and the [dns runtime](rt-dns.txt) for `--publish` behind NAT.
 
+**If your DNS stays with another provider**, the entrance has no names to route, because it learns them from the dns runtime. Point an A record for `shop.example.com` at this machine instead, and let the server hold port 443 and its certificate itself; it proves the name on that port.
+
+```
+socketley create server shop -p 443 --acme shop.example.com --acme-email you@example.com --lua shop.lua -s
+```
+
+Only one runtime can hold 443 on an address, so for several sites the entrance is the better way.
+
 ## Recipe: moving to a new machine
 
 1. **On the old machine, archive everything**: every runtime, their data (buckets, mailboxes, a cache's file, zones, keys and certificates) and the daemon's configuration.
@@ -905,6 +916,14 @@ journalctl -u socketley --since "10 min ago"
    ```
 
 A worker that crashed loses what it held only in memory. A cache keeps what `--persistent` saved; see [How it works](how.txt).
+
+## Restarts and upgrades
+
+- **A package upgrade restarts the service** if it was running, onto the new binary. Restarting the daemon stops every worker, so connections close for the moment it takes; the runtimes then come back as they were.
+- **A worker never outlives its daemon.** If the daemon crashes, systemd starts it again after five seconds.
+- **One runtime alone**: `socketley restart name`. Other runtimes are not touched.
+
+Everything else that can happen, and what survives it, is in the table under [How it works](how.txt).
 
 ## `NOT RESPONDING`: a stuck worker
 
@@ -2623,14 +2642,14 @@ socketley create cache sessions -p 6380 --maxmemory 512M --eviction allkeys-lru 
 socketley create cache copy -p 6381 --replicate 10.0.0.5:6380 -s
 ```
 
-> Warning: A cache has no password. It serves this machine only, unless created with `--public` or mutual TLS (`--tls --cert --key --ca`).
+> Warning: A cache has no password: whoever reaches it reads and writes everything. So it serves this machine only, unless created with `--public` or mutual TLS (`--tls --cert --key --ca`), where the client certificate is the credential. `--public` opens it to every machine that reaches its address; keep it on a private one with `--bind` and a firewall.
 
 ## What it does
 
 - **Redis data types**: Strings, lists, sets, hashes, sorted sets, streams; see [commands](man-cache-flags.txt).
 - **Redis features**: TTLs, pub/sub and transactions over [RESP](man-cache-flags.txt).
 - **Bounded memory**: `--maxmemory` with an `--eviction` policy.
-- **Persistence**: `--persistent file`; `--persistent-interval` journals writes.
+- **Persistence**: `--persistent file` saves at a clean stop; `--persistent-interval` journals writes, so a crashed worker loses at most that interval (a power cut can lose more).
 - **Replication**: `--replicate` makes a read-only [follower](man-cache-flags.txt).
 - **Several cores**: `--shards N`, one keyspace; `--cluster` for cluster-aware clients.
 - **Database backing**: Lua `on_miss` reads through, `on_write` writes behind; see [database backend](man-cache-flags.txt).

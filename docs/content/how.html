@@ -76,7 +76,10 @@
 <tr><td>A worker crashes</td><td>The daemon restarts it and the runtime stays <code>running</code>. What the worker held only in memory is lost: a cache keeps only what <code>--persistent</code> saved. Other runtimes release the connections routed to or from it.</td></tr>
 <tr><td>It crashes more than five times in ten seconds</td><td>The runtime is left <code>failed</code> instead of being forked again in a loop. Fix the cause, then <code>socketley start</code> it again.</td></tr>
 <tr><td>A Lua callback never returns</td><td>Its deadline ends it. <a href="#/man/lua-configuration">Callback deadline →</a></td></tr>
-<tr><td>The daemon stops or the machine reboots</td><td>On the next start the daemon restores every saved runtime and starts the ones that were running.</td></tr>
+<tr><td>The daemon is restarted (<code>systemctl restart</code>, or a package upgrade, which restarts a running service)</td><td>Every worker stops with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running.</td></tr>
+<tr><td>The daemon itself crashes</td><td>Its workers end with it: a worker never outlives its daemon. systemd starts the daemon again after five seconds, and it restores the runtimes as above.</td></tr>
+<tr><td>The machine reboots</td><td>The service starts at boot and restores the runtimes as above.</td></tr>
+<tr><td>The power fails</td><td>What was only in memory is gone, and so can be the last writes the kernel had not written to disk yet. A cache's journal is not synced to disk; a storage runtime's <code>--fsync</code> decides when its writes are.</td></tr>
 <tr><td>You run <code>stop</code></td><td>The worker ends; the runtime is kept as <code>stopped</code>. With <code>--drain</code> it first finishes what is in flight.</td></tr></table>
 <p>A runtime's state is always one of <code>created</code>, <code>running</code>, <code>stopped</code> or <code>failed</code>; <code>ls</code> shows it, and a failed runtime shows the reason.</p>
 

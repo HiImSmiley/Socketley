@@ -14,14 +14,14 @@ socketley create cache sessions -p 6380 --maxmemory 512M --eviction allkeys-lru 
 socketley create cache copy -p 6381 --replicate 10.0.0.5:6380 -s
 ```
 
-> Warning: A cache has no password. It serves this machine only, unless created with `--public` or mutual TLS (`--tls --cert --key --ca`).
+> Warning: A cache has no password: whoever reaches it reads and writes everything. So it serves this machine only, unless created with `--public` or mutual TLS (`--tls --cert --key --ca`), where the client certificate is the credential. `--public` opens it to every machine that reaches its address; keep it on a private one with `--bind` and a firewall.
 
 ## What it does
 
 - **Redis data types**: Strings, lists, sets, hashes, sorted sets, streams; see [commands](man-cache-flags.txt).
 - **Redis features**: TTLs, pub/sub and transactions over [RESP](man-cache-flags.txt).
 - **Bounded memory**: `--maxmemory` with an `--eviction` policy.
-- **Persistence**: `--persistent file`; `--persistent-interval` journals writes.
+- **Persistence**: `--persistent file` saves at a clean stop; `--persistent-interval` journals writes, so a crashed worker loses at most that interval (a power cut can lose more).
 - **Replication**: `--replicate` makes a read-only [follower](man-cache-flags.txt).
 - **Several cores**: `--shards N`, one keyspace; `--cluster` for cluster-aware clients.
 - **Database backing**: Lua `on_miss` reads through, `on_write` writes behind; see [database backend](man-cache-flags.txt).

@@ -61,6 +61,14 @@ The goal: `https://shop.example.com` answered by a Lua script, with a real certi
 
 A request now goes browser → entrance on 443 (TLS ends here) → the server `shop` → `on_http_request`. See [How it works](how.txt) for the path, and the [dns runtime](rt-dns.txt) for `--publish` behind NAT.
 
+**If your DNS stays with another provider**, the entrance has no names to route, because it learns them from the dns runtime. Point an A record for `shop.example.com` at this machine instead, and let the server hold port 443 and its certificate itself; it proves the name on that port.
+
+```
+socketley create server shop -p 443 --acme shop.example.com --acme-email you@example.com --lua shop.lua -s
+```
+
+Only one runtime can hold 443 on an address, so for several sites the entrance is the better way.
+
 ## Recipe: moving to a new machine
 
 1. **On the old machine, archive everything**: every runtime, their data (buckets, mailboxes, a cache's file, zones, keys and certificates) and the daemon's configuration.

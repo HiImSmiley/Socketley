@@ -46,6 +46,10 @@ curl https://shop.example.com/</pre></li>
 </ol>
 <p>A request now goes browser → entrance on 443 (TLS ends here) → the server <code>shop</code> → <code>on_http_request</code>. See <a href="#/how">How it works</a> for the path, and the <a href="#/rt/dns">dns runtime</a> for <code>--publish</code> behind NAT.</p>
 
+<p><b>If your DNS stays with another provider</b>, the entrance has no names to route, because it learns them from the dns runtime. Point an A record for <code>shop.example.com</code> at this machine instead, and let the server hold port 443 and its certificate itself; it proves the name on that port.</p>
+<pre class="code">socketley create server shop -p 443 --acme shop.example.com --acme-email you@example.com --lua shop.lua -s</pre>
+<p>Only one runtime can hold 443 on an address, so for several sites the entrance is the better way.</p>
+
 <h2>Recipe: moving to a new machine</h2>
 <ol class="steps">
 <li><p><b>On the old machine, archive everything</b>: every runtime, their data (buckets, mailboxes, a cache's file, zones, keys and certificates) and the daemon's configuration.</p>

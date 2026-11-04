@@ -7,14 +7,14 @@ socketley create cache sessions -p 6380 --maxmemory 512M --eviction allkeys-lru 
     --persistent /var/lib/socketley/sessions.bin -s
 socketley create cache copy -p 6381 --replicate 10.0.0.5:6380 -s</pre>
 
-<div class="callout warn"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/></svg><div>A cache has no password. It serves this machine only, unless created with <code>--public</code> or mutual TLS (<code>--tls --cert --key --ca</code>).</div></div>
+<div class="callout warn"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/></svg><div>A cache has no password: whoever reaches it reads and writes everything. So it serves this machine only, unless created with <code>--public</code> or mutual TLS (<code>--tls --cert --key --ca</code>), where the client certificate is the credential. <code>--public</code> opens it to every machine that reaches its address; keep it on a private one with <code>--bind</code> and a firewall.</div></div>
 
 <h2>What it does</h2>
 <div class="feats">
 <div><b>Redis data types</b><p>Strings, lists, sets, hashes, sorted sets, streams; see <a href="#/man/cache-flags.cache-protocol">commands</a>.</p></div>
 <div><b>Redis features</b><p>TTLs, pub/sub and transactions over <a href="#/man/cache-flags.resp-protocol-redis-compatibility">RESP</a>.</p></div>
 <div><b>Bounded memory</b><p><code>--maxmemory</code> with an <code>--eviction</code> policy.</p></div>
-<div><b>Persistence</b><p><code>--persistent file</code>; <code>--persistent-interval</code> journals writes.</p></div>
+<div><b>Persistence</b><p><code>--persistent file</code> saves at a clean stop; <code>--persistent-interval</code> journals writes, so a crashed worker loses at most that interval (a power cut can lose more).</p></div>
 <div><b>Replication</b><p><code>--replicate</code> makes a read-only <a href="#/man/cache-flags.replication">follower</a>.</p></div>
 <div><b>Several cores</b><p><code>--shards N</code>, one keyspace; <code>--cluster</code> for cluster-aware clients.</p></div>
 <div><b>Database backing</b><p>Lua <code>on_miss</code> reads through, <code>on_write</code> writes behind; see <a href="#/man/cache-flags.database-backend">database backend</a>.</p></div>

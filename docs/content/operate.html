@@ -27,6 +27,14 @@ journalctl -u socketley --since "10 min ago"</pre>
 </ol>
 <p>A worker that crashed loses what it held only in memory. A cache keeps what <code>--persistent</code> saved; see <a href="#/how">How it works</a>.</p>
 
+<h2>Restarts and upgrades</h2>
+<ul>
+<li><b>A package upgrade restarts the service</b> if it was running, onto the new binary. Restarting the daemon stops every worker, so connections close for the moment it takes; the runtimes then come back as they were.</li>
+<li><b>A worker never outlives its daemon.</b> If the daemon crashes, systemd starts it again after five seconds.</li>
+<li><b>One runtime alone</b>: <code>socketley restart name</code>. Other runtimes are not touched.</li>
+</ul>
+<p>Everything else that can happen, and what survives it, is in the table under <a href="#/how">How it works</a>.</p>
+
 <h2><code>NOT RESPONDING</code>: a stuck worker</h2>
 <p><code>ps</code> says this when a worker has said nothing for fifteen seconds while using at least half a core. It is almost always a Lua callback that does not return. Its <a href="#/man/lua-configuration.callback-deadline">deadline</a> (10 seconds by default) ends the callback; nothing is killed for being slow.</p>
 
