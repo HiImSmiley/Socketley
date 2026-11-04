@@ -4,6 +4,18 @@ Is it running, where the log is, why a runtime failed, and what blocks it.
 
 The day-to-day questions once runtimes are running: is it up, where is the log, why did it fail, what is slow. For the first setup, see [Deployment](deploy.txt).
 
+## Symptoms
+
+| You see | Usually because | Do |
+|---|---|---|
+| `404` on `/` through a proxy | A proxy with `--backend` forwards only `/<proxy-name>/…`. | Ask for `/name/…`, or reach the runtime by its `--domain` name through the entrance. |
+| `504` from a proxy | The backend did not begin its answer within `--backend-timeout` (2 s). | Find what is slow in the backend, or raise the timeout. |
+| Requests to one backend fail at once | Five errors in a row opened its circuit breaker. | It is tried again after `--circuit-timeout`; fix the backend. |
+| `create` exits 1, runtime `failed` | The worker could not bind, load its certificate, or run its script. | Read `ls` and the log, fix, then `socketley start name`. |
+| `NOT RESPONDING` in `ls` | A Lua callback that does not return. | See below; the deadline ends it. |
+| A cache lost data | Its worker crashed without `--persistent-interval`, or the power failed. | Add `--persistent-interval`; see [what survives what](how.txt). |
+| `not permitted to open the daemon socket` | You are not in the `socketley` group. | `sudo usermod -aG socketley $USER`, then log in again. |
+
 ## Is it running?
 
 | Command | Shows |
@@ -72,11 +84,11 @@ Other runtimes are not affected: each has its own worker. The full list of calls
 
 ## Settings you may actually change
 
-Every setting has a default that suits a normal deployment. These are the ones worth knowing; set them in the `settings` table of `/etc/socketley/config.lua`, or as environment variables of the service. `socketley settings` lists every one with its value and where it came from.
+Every setting has a default that suits a normal deployment. These are the ones worth knowing; set them in the `settings` table of `/etc/socketley/config.lua`, or as environment variables of the service. `socketley settings` lists every one with its value and where it came from. The `settings` table is the simpler place: it needs no change to the service unit.
 
 | Variable | What it changes |
 |---|---|
-| `SOCKETLEY_CPUS` | The CPUs the daemon and its workers may run on. |
+| `SOCKETLEY_CPUS` | The CPUs the daemon may run on; every worker inherits the set. |
 | `SOCKETLEY_LUA_TIMEOUT_MS` | The callback deadline, 10000 ms by default. |
 | `SOCKETLEY_ACME_DIRECTORY` | The ACME CA, for example Let's Encrypt's staging CA while testing. |
 | `SOCKETLEY_PROXY_HTTP2`, `SOCKETLEY_PROXY_HTTP3` | `0` turns HTTP/2 or HTTP/3 off at the entrance. |

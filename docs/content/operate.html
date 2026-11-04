@@ -1,5 +1,17 @@
 <p>The day-to-day questions once runtimes are running: is it up, where is the log, why did it fail, what is slow. For the first setup, see <a href="#/deploy">Deployment</a>.</p>
 
+<h2>Symptoms</h2>
+<table class="kv">
+<tr><th>You see</th><th>Usually because</th><th>Do</th></tr>
+<tr><td><code>404</code> on <code>/</code> through a proxy</td><td>A proxy with <code>--backend</code> forwards only <code>/&lt;proxy-name&gt;/…</code>.</td><td>Ask for <code>/name/…</code>, or reach the runtime by its <code>--domain</code> name through the entrance.</td></tr>
+<tr><td><code>504</code> from a proxy</td><td>The backend did not begin its answer within <code>--backend-timeout</code> (2 s).</td><td>Find what is slow in the backend, or raise the timeout.</td></tr>
+<tr><td>Requests to one backend fail at once</td><td>Five errors in a row opened its circuit breaker.</td><td>It is tried again after <code>--circuit-timeout</code>; fix the backend.</td></tr>
+<tr><td><code>create</code> exits 1, runtime <code>failed</code></td><td>The worker could not bind, load its certificate, or run its script.</td><td>Read <code>ls</code> and the log, fix, then <code>socketley start name</code>.</td></tr>
+<tr><td><code>NOT RESPONDING</code> in <code>ls</code></td><td>A Lua callback that does not return.</td><td>See below; the deadline ends it.</td></tr>
+<tr><td>A cache lost data</td><td>Its worker crashed without <code>--persistent-interval</code>, or the power failed.</td><td>Add <code>--persistent-interval</code>; see <a href="#/how">what survives what</a>.</td></tr>
+<tr><td><code>not permitted to open the daemon socket</code></td><td>You are not in the <code>socketley</code> group.</td><td><code>sudo usermod -aG socketley $USER</code>, then log in again.</td></tr>
+</table>
+
 <h2>Is it running?</h2>
 <table class="kv">
 <tr><th>Command</th><th>Shows</th></tr>
@@ -59,10 +71,10 @@ journalctl -u socketley --since "10 min ago"</pre>
 <p>Other runtimes are not affected: each has its own worker. The full list of calls that can stop a loop is under <a href="#/man/limitations">What can stop the event loop</a>.</p>
 
 <h2>Settings you may actually change</h2>
-<p>Every setting has a default that suits a normal deployment. These are the ones worth knowing; set them in the <code>settings</code> table of <code>/etc/socketley/config.lua</code>, or as environment variables of the service. <code>socketley settings</code> lists every one with its value and where it came from.</p>
+<p>Every setting has a default that suits a normal deployment. These are the ones worth knowing; set them in the <code>settings</code> table of <code>/etc/socketley/config.lua</code>, or as environment variables of the service. <code>socketley settings</code> lists every one with its value and where it came from. The <code>settings</code> table is the simpler place: it needs no change to the service unit.</p>
 <table class="kv">
 <tr><th>Variable</th><th>What it changes</th></tr>
-<tr><td><code>SOCKETLEY_CPUS</code></td><td>The CPUs the daemon and its workers may run on.</td></tr>
+<tr><td><code>SOCKETLEY_CPUS</code></td><td>The CPUs the daemon may run on; every worker inherits the set.</td></tr>
 <tr><td><code>SOCKETLEY_LUA_TIMEOUT_MS</code></td><td>The callback deadline, 10000 ms by default.</td></tr>
 <tr><td><code>SOCKETLEY_ACME_DIRECTORY</code></td><td>The ACME CA, for example Let's Encrypt's staging CA while testing.</td></tr>
 <tr><td><code>SOCKETLEY_PROXY_HTTP2</code>, <code>SOCKETLEY_PROXY_HTTP3</code></td><td><code>0</code> turns HTTP/2 or HTTP/3 off at the entrance.</td></tr>

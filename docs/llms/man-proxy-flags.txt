@@ -74,7 +74,7 @@ The hold ends when the backend closes, when the client resets, or at **--idle-ti
 
 Default port: 8080
 
-HTTP mode: requests to /<proxy-name>/* are forwarded with the prefix stripped.
+HTTP mode: requests to /<proxy-name>/* are forwarded with the prefix stripped. A request for any other path, / included, is answered 404.
 
 In **http** mode, a request carrying an upgrade offer is forwarded with both of the headers that make the offer intact, instead of having them stripped as hop-by-hop. An upgrade offer is an **Upgrade** header together with a **Connection** header that lists the **upgrade** token. If the backend answers **101 Switching Protocols**, the proxy relays that response verbatim. The connection then becomes a bidirectional byte relay until one end closes. This is what makes **ws://** work through a proxy in http mode. See **WebSocket and other protocol upgrades** under **LIMITATIONS** for what the proxy does and does not do with such a connection.
 

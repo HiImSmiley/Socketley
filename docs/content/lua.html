@@ -28,6 +28,7 @@ end</pre>
 <ul>
 <li>The new runtime is <b>owned</b> by the one whose script made it (<code>ls</code> shows it under OWNED BY). When the owner stops, it is stopped too; <code>on_parent_stop = "remove"</code> removes it instead.</li>
 <li>A server, client, proxy, cache, storage or dns runtime made this way <b>runs inside the daemon</b>, not in a worker of its own; other types get their own worker as usual.</li>
+<li>Such runtimes are saved like any other and are back after a daemon restart.</li>
 <li>A runtime that is <code>failed</code> cannot be started from a script; <code>socketley start</code> on the command line can.</li>
 </ul>
 

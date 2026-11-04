@@ -369,8 +369,8 @@ socketley is one binary. Started as `socketley daemon` it is the **daemon**: a s
    | Exit | Meaning |
    |---|---|
    | `0` | The worker is serving. |
-   | `1` | The worker refused, or could not bind, resolve or load its certificate. The reason is in the daemon's log; the runtime is left `failed`, so `ls` still shows it. |
-   | `2` | No answer in time: the daemon could not be reached, or the worker said nothing within two seconds. The runtime stays supervised and may still come up; `ls` shows the state it settles on. |
+   | `1` | The worker refused, or could not bind, resolve or load its certificate. The reason is in the daemon's log; the runtime is left `failed`, so `ls` still shows it. One exception: if only the script's `on_start` raised an error, the runtime is running and the command names the callback. |
+   | `2` | A fatal error, or no answer in time: the daemon could not be reached, or the worker said nothing within two seconds. The runtime stays supervised and may still come up; `ls` shows the state it settles on. |
 
 ## The path of a request
 
@@ -423,7 +423,7 @@ A runtime's JSON file holds its flags and whether it was running. It can hold a 
 | A worker crashes | The daemon restarts it and the runtime stays `running`. What the worker held only in memory is lost: a cache keeps only what `--persistent` saved. Other runtimes release the connections routed to or from it. |
 | It crashes more than five times in ten seconds | The runtime is left `failed` instead of being forked again in a loop. Fix the cause, then `socketley start` it again. |
 | A Lua callback never returns | Its deadline ends it. [Callback deadline →](man-lua-configuration.txt) |
-| The daemon is restarted (`systemctl restart`, or a package upgrade, which restarts a running service) | Every runtime is stopped with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running. |
+| The daemon is restarted (`systemctl restart`, or a package upgrade, which restarts a running service) | Every runtime is stopped cleanly with the daemon, so their connections close; a cache with `--persistent` writes its file. When the daemon is back, it restores every saved runtime and starts the ones that were running. |
 | The daemon itself crashes | Its workers end with it: a worker never outlives its daemon. systemd starts the daemon again after five seconds, and it restores the runtimes as above. |
 | The machine reboots | The service starts at boot and restores the runtimes as above. |
 | The power fails | What was only in memory is gone, and so can be the last writes the kernel had not written to disk yet. A cache's journal is not synced to disk; a storage runtime's `--fsync` decides when its writes are. |
@@ -757,6 +757,7 @@ end
 
 - The new runtime is **owned** by the one whose script made it (`ls` shows it under OWNED BY). When the owner stops, it is stopped too; `on_parent_stop = "remove"` removes it instead.
 - A server, client, proxy, cache, storage or dns runtime made this way **runs inside the daemon**, not in a worker of its own; other types get their own worker as usual.
+- Such runtimes are saved like any other and are back after a daemon restart.
 - A runtime that is `failed` cannot be started from a script; `socketley start` on the command line can.
 
 ## The rest
@@ -899,6 +900,18 @@ Is it running, where the log is, why a runtime failed, and what blocks it.
 
 The day-to-day questions once runtimes are running: is it up, where is the log, why did it fail, what is slow. For the first setup, see [Deployment](deploy.txt).
 
+## Symptoms
+
+| You see | Usually because | Do |
+|---|---|---|
+| `404` on `/` through a proxy | A proxy with `--backend` forwards only `/<proxy-name>/…`. | Ask for `/name/…`, or reach the runtime by its `--domain` name through the entrance. |
+| `504` from a proxy | The backend did not begin its answer within `--backend-timeout` (2 s). | Find what is slow in the backend, or raise the timeout. |
+| Requests to one backend fail at once | Five errors in a row opened its circuit breaker. | It is tried again after `--circuit-timeout`; fix the backend. |
+| `create` exits 1, runtime `failed` | The worker could not bind, load its certificate, or run its script. | Read `ls` and the log, fix, then `socketley start name`. |
+| `NOT RESPONDING` in `ls` | A Lua callback that does not return. | See below; the deadline ends it. |
+| A cache lost data | Its worker crashed without `--persistent-interval`, or the power failed. | Add `--persistent-interval`; see [what survives what](how.txt). |
+| `not permitted to open the daemon socket` | You are not in the `socketley` group. | `sudo usermod -aG socketley $USER`, then log in again. |
+
 ## Is it running?
 
 | Command | Shows |
@@ -967,11 +980,11 @@ Other runtimes are not affected: each has its own worker. The full list of calls
 
 ## Settings you may actually change
 
-Every setting has a default that suits a normal deployment. These are the ones worth knowing; set them in the `settings` table of `/etc/socketley/config.lua`, or as environment variables of the service. `socketley settings` lists every one with its value and where it came from.
+Every setting has a default that suits a normal deployment. These are the ones worth knowing; set them in the `settings` table of `/etc/socketley/config.lua`, or as environment variables of the service. `socketley settings` lists every one with its value and where it came from. The `settings` table is the simpler place: it needs no change to the service unit.
 
 | Variable | What it changes |
 |---|---|
-| `SOCKETLEY_CPUS` | The CPUs the daemon and its workers may run on. |
+| `SOCKETLEY_CPUS` | The CPUs the daemon may run on; every worker inherits the set. |
 | `SOCKETLEY_LUA_TIMEOUT_MS` | The callback deadline, 10000 ms by default. |
 | `SOCKETLEY_ACME_DIRECTORY` | The ACME CA, for example Let's Encrypt's staging CA while testing. |
 | `SOCKETLEY_PROXY_HTTP2`, `SOCKETLEY_PROXY_HTTP3` | `0` turns HTTP/2 or HTTP/3 off at the entrance. |
@@ -2512,7 +2525,7 @@ socketley create proxy php -p 8082 --backend fastcgi://127.0.0.1:9000 --root /va
 
 ## What it does
 
-- **Routing**: A request for `/gw/x` on proxy `gw` reaches the backend as `/x`. A request for one of its `--domain` names passes unchanged.
+- **Routing**: A request for `/gw/x` on proxy `gw` reaches the backend as `/x`; any other path, `/` included, gets 404. Through the entrance, a request for a `--domain` name passes unchanged.
 - **Any backend**: `host:port`, `https://`, `unix:`, a runtime, an `@group`, `fastcgi://`.
 - **Resilience**: [Health checks](man-proxy-flags.txt), a [circuit breaker](man-proxy-flags.txt), [retries](man-proxy-flags.txt); `--sidecar` turns all on.
 - **Sign-in first**: `--auth bearer:`, `basic:` or `idp:` before anything reaches a backend.
@@ -6573,7 +6586,7 @@ The hold ends when the backend closes, when the client resets, or at **--idle-ti
 
 Default port: 8080
 
-HTTP mode: requests to /<proxy-name>/* are forwarded with the prefix stripped.
+HTTP mode: requests to /<proxy-name>/* are forwarded with the prefix stripped. A request for any other path, / included, is answered 404.
 
 In **http** mode, a request carrying an upgrade offer is forwarded with both of the headers that make the offer intact, instead of having them stripped as hop-by-hop. An upgrade offer is an **Upgrade** header together with a **Connection** header that lists the **upgrade** token. If the backend answers **101 Switching Protocols**, the proxy relays that response verbatim. The connection then becomes a bidirectional byte relay until one end closes. This is what makes **ws://** work through a proxy in http mode. See **WebSocket and other protocol upgrades** under **LIMITATIONS** for what the proxy does and does not do with such a connection.
 

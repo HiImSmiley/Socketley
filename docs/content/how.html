@@ -34,8 +34,8 @@
 <li><p><b><code>create</code> waits for the worker's verdict</b> and tells you through its exit status:</p>
 <table class="kv"><tr><th>Exit</th><th>Meaning</th></tr>
 <tr><td><code>0</code></td><td>The worker is serving.</td></tr>
-<tr><td><code>1</code></td><td>The worker refused, or could not bind, resolve or load its certificate. The reason is in the daemon's log; the runtime is left <code>failed</code>, so <code>ls</code> still shows it.</td></tr>
-<tr><td><code>2</code></td><td>No answer in time: the daemon could not be reached, or the worker said nothing within two seconds. The runtime stays supervised and may still come up; <code>ls</code> shows the state it settles on.</td></tr></table></li>
+<tr><td><code>1</code></td><td>The worker refused, or could not bind, resolve or load its certificate. The reason is in the daemon's log; the runtime is left <code>failed</code>, so <code>ls</code> still shows it. One exception: if only the script's <code>on_start</code> raised an error, the runtime is running and the command names the callback.</td></tr>
+<tr><td><code>2</code></td><td>A fatal error, or no answer in time: the daemon could not be reached, or the worker said nothing within two seconds. The runtime stays supervised and may still come up; <code>ls</code> shows the state it settles on.</td></tr></table></li>
 </ol>
 
 <h2>The path of a request</h2>
@@ -76,7 +76,7 @@
 <tr><td>A worker crashes</td><td>The daemon restarts it and the runtime stays <code>running</code>. What the worker held only in memory is lost: a cache keeps only what <code>--persistent</code> saved. Other runtimes release the connections routed to or from it.</td></tr>
 <tr><td>It crashes more than five times in ten seconds</td><td>The runtime is left <code>failed</code> instead of being forked again in a loop. Fix the cause, then <code>socketley start</code> it again.</td></tr>
 <tr><td>A Lua callback never returns</td><td>Its deadline ends it. <a href="#/man/lua-configuration">Callback deadline →</a></td></tr>
-<tr><td>The daemon is restarted (<code>systemctl restart</code>, or a package upgrade, which restarts a running service)</td><td>Every runtime is stopped with the daemon, so their connections close. When the daemon is back, it restores every saved runtime and starts the ones that were running.</td></tr>
+<tr><td>The daemon is restarted (<code>systemctl restart</code>, or a package upgrade, which restarts a running service)</td><td>Every runtime is stopped cleanly with the daemon, so their connections close; a cache with <code>--persistent</code> writes its file. When the daemon is back, it restores every saved runtime and starts the ones that were running.</td></tr>
 <tr><td>The daemon itself crashes</td><td>Its workers end with it: a worker never outlives its daemon. systemd starts the daemon again after five seconds, and it restores the runtimes as above.</td></tr>
 <tr><td>The machine reboots</td><td>The service starts at boot and restores the runtimes as above.</td></tr>
 <tr><td>The power fails</td><td>What was only in memory is gone, and so can be the last writes the kernel had not written to disk yet. A cache's journal is not synced to disk; a storage runtime's <code>--fsync</code> decides when its writes are.</td></tr>

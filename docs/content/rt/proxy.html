@@ -9,7 +9,7 @@ socketley create proxy php -p 8082 --backend fastcgi://127.0.0.1:9000 --root /va
 
 <h2>What it does</h2>
 <div class="feats">
-<div><b>Routing</b><p>A request for <code>/gw/x</code> on proxy <code>gw</code> reaches the backend as <code>/x</code>. A request for one of its <code>--domain</code> names passes unchanged.</p></div>
+<div><b>Routing</b><p>A request for <code>/gw/x</code> on proxy <code>gw</code> reaches the backend as <code>/x</code>; any other path, <code>/</code> included, gets 404. Through the entrance, a request for a <code>--domain</code> name passes unchanged.</p></div>
 <div><b>Any backend</b><p><code>host:port</code>, <code>https://</code>, <code>unix:</code>, a runtime, an <code>@group</code>, <code>fastcgi://</code>.</p></div>
 <div><b>Resilience</b><p><a href="#/man/proxy-flags.health-check-flags">Health checks</a>, a <a href="#/man/proxy-flags.circuit-breaker-flags">circuit breaker</a>, <a href="#/man/proxy-flags.retry-flags">retries</a>; <code>--sidecar</code> turns all on.</p></div>
 <div><b>Sign-in first</b><p><code>--auth bearer:</code>, <code>basic:</code> or <code>idp:</code> before anything reaches a backend.</p></div>

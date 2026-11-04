@@ -311,6 +311,7 @@ end
 
 - The new runtime is **owned** by the one whose script made it (`ls` shows it under OWNED BY). When the owner stops, it is stopped too; `on_parent_stop = "remove"` removes it instead.
 - A server, client, proxy, cache, storage or dns runtime made this way **runs inside the daemon**, not in a worker of its own; other types get their own worker as usual.
+- Such runtimes are saved like any other and are back after a daemon restart.
 - A runtime that is `failed` cannot be started from a script; `socketley start` on the command line can.
 
 ## The rest
