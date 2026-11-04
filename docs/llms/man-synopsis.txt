@@ -1,0 +1,30 @@
+# Synopsis
+
+From the manual page socketley(1).
+
+**socketley** *command* [*options*] 
+ **socketley** **daemon** [**--cpus** *set*] [**--fast-lo** [**own**|**all**|**trust**]] [**--fast-lo-limit** *P*,*G*] 
+ **socketley** **daemon** **--name** *name* [**--cluster** *dir*] 
+ **socketley** **cluster** [*ls*|*ps*|*group*|*show*|*stats*|*watch*] 
+ **socketley** **cluster** {**raft-status**|**placement**|**create**|**scale**|**remove**} *...* 
+ **socketley** **create** *type name* [*flags*] 
+ **socketley** **add** *path* [**--name** *name*] [**-s**] 
+ **socketley** **start** *name*|*pattern*... [**-i**] 
+ **socketley** **stop** *name*|*pattern*... 
+ **socketley** **remove** *name*|*pattern*... 
+ **socketley** **stats** *name*|*pattern*... 
+ **socketley** **reload** *name*|*pattern*... 
+ **socketley** **reload-lua** *name*|*pattern*... 
+ **socketley** **show** *name*|*pattern*... 
+ **socketley** **edit** *name* [*flags*] 
+ **socketley** **edit** *name* [**-r**|**--reload**] 
+ **socketley** **restart** *name*|*pattern*... [*flags*] 
+ **socketley** **ls** [**--json**|**-j**] 
+ **socketley** **ps** [**--json**|**-j**] 
+ **socketley** **owner** *name* 
+ **socketley** **dashboard** 
+ **socketley** **settings** [**-a**|**--all**] [**-j**|**--json**] 
+ **socketley** **help | --help | -h** 
+ **socketley** **version | --version | -v** 
+ **socketley** **--lua** *lua_file* 
+ **socketley** **export** *dir*

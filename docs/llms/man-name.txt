@@ -1,0 +1,5 @@
+# Name
+
+From the manual page socketley(1).
+
+socketley - run and supervise network runtimes (servers, proxies, caches, S3 storage, DNS, MQTT, mail and more) from one daemon

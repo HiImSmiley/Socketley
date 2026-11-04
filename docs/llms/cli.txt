@@ -1,0 +1,997 @@
+# CLI
+
+Every command socketley takes, with its options.
+
+`socketley --help` is the same reference, interactive, in the terminal. A runtime's own verbs are `socketley <name> <verb>`, as in `socketley store get key`.
+
+#### `daemon`
+
+Start the socketley daemon. When socketley is installed system-wide (with the .deb package or install.sh), systemd manages the daemon and starts it automatically, so you do not need to run this command yourself. Use **systemctl start socketley** or **systemctl enable socketley** to control the service.
+
+When running from the build directory (development mode), start the daemon manually: **./bin/Release/socketley daemon &**
+
+The daemon creates its IPC socket at /run/socketley/socketley.sock (system install) or /tmp/socketley.sock (development mode). On startup, it restores the saved runtime configurations. Runtimes that were running when the daemon last stopped are started again automatically.
+
+The daemon ignores **SIGHUP**, so closing the terminal or a stray **kill -HUP** does not stop it.
+
+**daemon** accepts **--cpus** *set***,** the ring setting described under **COMMON FLAGS**. Here it sets the CPUs of the ring this daemon is about to create, rather than stating what a runtime requires of its ring. It is the command-line form of **SOCKETLEY_CPUS**; when both are given, the flag wins. **daemon** also accepts **--fast-lo**, **--fast-lo-limit** (below) and the experimental Raft flags described under **CLUSTER MODE**. It refuses any other argument.
+
+These flags cannot be combined with **--name** or **--cluster**, which configure a running daemon. When none is running, they start one without these flags first. A ring's CPU set is fixed when the ring is created, so there would be nothing left for them to change.
+
+Every runtime runs in its own process and inherits this CPU set, so the set also decides how many runtimes share a core. In a test with fifty idle servers beside one server doing a ping-pong, the median round trip did not change (30.2 against 29.4 microseconds), but the 99th percentile did: 156.5 microseconds on six cores against 51.7 on twelve. Idle runtimes still cost something, because each one wakes on its own stats interval. That cost shows up in the tail latency of whichever runtime is working, and a wider CPU set is the way to reduce it. The daemon itself stayed under one per cent of a core with fifty runtimes. Creating a runtime took the same fourteen milliseconds with five runtimes as with fifty. Neither of these is worth watching.
+
+#### `daemon --fast-lo [own|all|trust]`
+
+Put TCP connections whose two ends are both 127.0.0.1 or ::1 on a kernel shortcut. A BPF **sockops** program adds both sockets to a sockhash when the connection is established. An **sk_msg** program then places every send directly into the peer's receive queue, skipping TCP/IP, the loopback device and its softirq. Off by default.
+
+**all** is the mode used when no mode is given. It accelerates any local client that connects to a port one of this daemon's runtimes listens on, and the connections of the runtimes among themselves. It also accelerates every connection a runtime makes to a listener on 127.0.0.1, whoever owns that listener. Examples are a proxy with **--backend 127.0.0.1:8080** in front of a local application, a client runtime, or a Lua HTTP call to a local service.
+
+**own** accelerates only pairs whose two ends are both this daemon's runtimes, such as a client runtime connected to a server runtime.
+
+**trust** is **all** without the receiver rule described below: it also redirects a send into a foreign receiver. A foreign client of a cache and a proxy's foreign backend are then accelerated in both directions. It is meant for an operator who knows that every local process reading a socket of such a pair reads with **recv**, **read** or **recvmsg**.
+
+**Warning:** a byte redirected into a socket waits in an ingress queue that only **recvmsg** drains. A local process never sees those bytes if it reads with **splice**(2), **sendfile**(2) or **TCP_ZEROCOPY_RECEIVE**, or through a relay built on them (such as Go's **io.Copy** between two TCP connections, or HAProxy with splicing). Under **trust**, the bytes are lost, and neither side gets an error. In a test, a backend reading with **splice** behind a proxy echoed 0 of 500 bytes. Such readers cannot be detected from the outside, which is why **all** never redirects into a foreign socket. Use **all** unless you know every local client and backend. **socketley daemon stats** reports which mode is running.
+
+Under **own** and **all**, a send is redirected only when the socket that will *receive* it belongs to one of this daemon's workers. That is either the socket of a runtime that connects (the socket is marked when it connects), or a socket accepted on a runtime's listener. A send to a foreign receiver goes over ordinary TCP. Each direction of a pair is decided by its own receiver. The reason is that a socket receiving through the kernel's ingress queue can only be read with **recvmsg**. A foreign reader that uses **splice**(2), **sendfile**(2), Go's **io.Copy** between two TCP connections, or HAProxy's splicing would lose the redirected bytes, and such readers cannot be detected from the outside. So the shortcut accelerates only what it can accelerate safely: sends into a runtime always, and sends out to a foreign peer never (unless **trust** is given).
+
+Results for common setups, measured on one machine with alternating passes:
+
+- Runtime to runtime (a client runtime to a server runtime, both ends this daemon's) is accelerated in both directions under every mode. 64 B round trips are 1.3–1.4x faster with one connection and with eight, and 16 KB round trips about 1.2–1.5x. For a client runtime against a cache with one request in flight, off against **all**: 110–116K against 83–85K round trips a second.
+- A foreign client of a cache is accelerated only on the requests it sends; the replies come back over TCP. So a workload of small requests and large replies gains little under **all**. **redis-benchmark** (50 connections, 4 threads, six alternating passes) measured these requests per second, off / **all** / **trust**. **GET** **-P1**: 240–279K / 222–250K / 387–667K. **SET** **-P1**: 222–286K / 197–273K / 462–632K. GET **-P16**: 2.3–4.0M / 2.7–3.4M / 5.3–6.9M. A bulk reader of 64 KiB values: 1377–1488 / 1276–1322 / 2464–3040 MB/s. A request that carries the payload does gain under **all**: a 64 KiB **SET** pipelined 8 deep made 49.9K against 59.1K, 1.18x. Only **trust** gives a foreign client the full gain.
+- For a proxy in front of a foreign local backend, **all** accelerates the two legs that end in the proxy. It leaves the two legs that end in a foreign socket on TCP, so a foreign backend that reads with **splice** keeps every byte. Under **trust**, both kinds of leg are redirected. 64 B round trips through a proxy to a C echo backend, over one connection: 44–48K off, 41–45K under **all**, and 86–88K under **trust**.
+
+The shortcut needs **CAP_BPF** and **CAP_NET_ADMIN** (root, or **setcap cap_bpf,cap_net_admin+ep** on the binary) and cgroup v2 at /sys/fs/cgroup. Without them the daemon logs **fast-lo: unavailable, serving without it** with the reason, and serves on the ordinary path. **own** attaches to the daemon's cgroup; **all** and **trust** attach to the root cgroup. The daemon's own processes are the workers its supervisor forked, and the daemon keeps their pids in a map. Under **all** and **trust**, the program runs for every process on the host, so it accepts only sockets in the daemon's own network namespace. The namespace's netns cookie is built into the program at load time, so a container's identical 127.0.0.1 tuple is left alone. This needs **SO_NETNS_COOKIE** in the kernel. Without it, the shortcut refuses to attach rather than serve across namespaces. The programs and maps are anonymous, and they are detached when the daemon exits.
+
+What it costs:
+
+- The redirected backlog is bounded by **daemon --fast-lo-limit** *per-pair-MiB*,*global-MiB* (default 4,64). A redirected send does not wait for the receiver, so the program counts each pair's sends. Each time the count passes a mark, the program asks a reconciler thread, through a BPF ring buffer, for the size of the peer's real queue. The thread reads it with one exact **sock_diag** lookup and answers within tens of microseconds. If the reader keeps up, the pair's count is reset to the real value, and the pair stays on the shortcut however much data it moves. A pair is tainted to TCP when its peer really holds the per-pair bound, or when its count reaches twice the bound with no answer. TCP then gives the ordinary **EAGAIN** backpressure. Once the sum across all pairs reaches the global budget, a flag taints new sends. Once a second, a sweep recomputes that sum and asks again for any check whose answer was lost. An idle pair costs nothing. Without the bound, a peer that stopped reading took 731 MiB before the kernel's global TCP memory (**tcp_mem**) ran out. With the default bound it stays near 4 MiB per pair.
+- A pair stays tainted for the rest of its life. This keeps bytes in order: **tcp_bpf_recvmsg** drains the redirect queue before the TCP receive queue, so a byte sent over TCP after the taint is still read after the bytes already redirected.
+- The bound is not tight in two cases. First, a pair moving gigabytes a second whose answer is delayed by more than about a millisecond (the reconciler is starved of CPU) reaches the hard ceiling and is tainted. This costs speed, not bytes. Second, pairs that stall together are each checked at least every sixteenth of the global budget. So the sum they reach before the flag is raised is the budget plus a sixteenth per pair. In a test, eight pairs against **4,12** held 13.4 MiB; checking only at the per-pair marks let them hold 23.5.
+- Shortcut bytes skip netfilter, conntrack and the loopback device. nftables rules on **lo**, **tcpdump -i lo** and the byte counters in **ss** do not see them. **socketley daemon stats** and the metrics endpoint report what the shortcut is carrying.
+- The shortcut covers 127.0.0.1 and ::1, including 127.0.0.1 IPv4-mapped on a dual-stack socket. The rest of 127/8 stays on TCP. Runtimes listen, and proxies and client runtimes connect, over IPv4. So a ::1 pair here is a Lua **socketley.http()** call to a local service on ::1, or to a name that resolves to ::1 first. With both ends entered, a ::1 pair gains about as much as a 127.0.0.1 pair (64 B round trips 1.3x against 1.4x, 16 KB 1.2x against 1.3x). A call that opens a connection per request gains nothing, because entering and leaving the sockhash costs about as much as the request saves (-3% at 64 B).
+- A pair enters the shortcut only when both ends are in the map before its first byte. A socket that sent a byte over TCP stays on TCP for its lifetime, so no byte overtakes another. A client sending TCP Fast Open data stays on TCP.
+- A **--protocol tcp** proxy splices, and splice reads a queue that a socket on the shortcut does not fill. So a proxied pair with a 127.0.0.1 leg stays on the copy path.
+- Under **own** and **all**, a send is never redirected into a process that is not this daemon's. Only that process's sends into one of this daemon's workers are redirected, and the workers read with **recvmsg**. So a foreign relay that copies between two TCP connections with Go's **io.Copy** or HAProxy with splicing keeps every byte on the leg it receives, and does not need **own** to be safe. This is the receiver rule above; **trust** gives it up.
+
+```
+sudo socketley daemon --fast-lo &        # all
+sudo socketley daemon --fast-lo own &
+sudo socketley daemon --fast-lo trust &  # only if no local reader splices
+```
+
+#### `daemon --name name [--cluster dir]`
+
+Configure the running daemon for cluster mode. These flags are sent as IPC commands to the daemon that is already running (the daemon is started automatically if it is not running). **--name** sets the daemon's identity in the cluster. **--cluster** enables cluster discovery in the given shared directory (see **CLUSTER MODE**). The name can be changed at any time. If cluster mode is active, the daemon republishes its cluster file under the new name.
+
+```
+socketley daemon --name node1 --cluster /shared/cluster
+socketley daemon --name new-name   # rename while cluster is active
+```
+
+#### `create type name [flags]`
+
+Create a new runtime instance. *type* is one of: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, or any registered type (see **REGISTERED TYPES**). *name* is a unique identifier for the runtime.
+
+With **-s** and a **--lua** script, **on_start** runs inside this command. If **on_start** raises an error, the runtime is not taken down. It is created and running, with whatever **on_start** set up before it failed. But the command exits 1 and names the callback and the reason, so a start whose set-up did not run is not reported as a clean one. Fix the script and run **reload-lua** to run it again.
+
+#### `attach type name port [--owner name] [--pid pid]`
+
+Register an external process as a runtime that appears in **ls**/**ps**. The daemon does NOT bind the port or forward any I/O; the external process manages its own network connections. The runtime appears as running and can be inspected or removed like any other runtime.
+
+#### `type`
+
+Runtime type: server, client, proxy, or cache.
+
+#### `name`
+
+Unique name for this external runtime.
+
+#### `port`
+
+Port number the external process is listening on (informational only).
+
+#### `--owner name`
+
+Optional owner runtime name.
+
+#### `--pid pid`
+
+The pid of the process behind this runtime. The daemon records it so that **socketley stop** *name* sends that process **SIGTERM**. Without a pid the daemon has nothing to stop, and stopping only removes the runtime from the listing. An SDK-embedded process passes its own **getpid()**.
+
+The pid must belong to the user who issues the command. The daemon signals the process on the caller's behalf, and it will not do that for a process the caller could not signal themselves. On the packaged daemon, whose socket is shared with the **socketley** group, doing so would lend out the daemon user's privileges. A daemon running as root has no such restriction, since root can signal any process anyway.
+
+#### `add path [--name name] [-s]`
+
+Register an external binary (built with the C++ SDK) and manage it. The daemon will fork+exec the binary and manage its full lifecycle: it restarts the binary after a crash, launches it again when the daemon boots, and handles the normal start/stop/remove commands.
+
+#### `path`
+
+Path to the executable (must exist and be executable).
+
+#### `--name name, -n name`
+
+Name for the runtime. Default: the binary's file name without its extension.
+
+#### `-s`
+
+Start immediately after adding.
+
+The binary receives the **SOCKETLEY_MANAGED=1** and **SOCKETLEY_NAME=***name* environment variables. When the binary uses **daemon_attach()**, these variables make it re-attach to the existing runtime entry and skip the atexit self-removal.
+
+```
+socketley add /usr/local/bin/myapp -s
+socketley add /usr/local/bin/myapp --name chat
+socketley stop chat
+socketley start chat
+socketley remove chat
+```
+
+#### `start name|pattern... [-i]`
+
+Start one or more runtimes. Accepts multiple names, glob patterns (*, **?**, **[]**), or a mix. With *, starts all runtimes that are not running.
+
+#### `-i`
+
+Interactive mode: start the runtime and open an interactive session. For a server, stdin is broadcast to its clients, and received messages appear on stdout. For a client, stdin is sent to the server, and received messages appear on stdout. For a cache, stdin accepts cache commands, and responses appear on stdout (like redis-cli). **-i** is refused for a proxy: a proxy relays between a client and a backend, and has no stream of its own for typed input to join. The refusal comes before the start, so the runtime is left exactly as it was; see **LIMITATIONS**. Press Ctrl+C to detach (the runtime keeps running). If the runtime is already running, the session attaches without restarting it.
+
+A runtime lives in its own process, and the session connects to that process. Typed input is delivered to the workers that hold the connections. Each worker is also handed the session's descriptor, so what a client sends reaches the terminal without passing through the daemon. Under **--shards** *N* this covers every shard: a typed line reaches the clients of all shards, and any of those clients can be heard back.
+
+A session survives a **restart** of the runtime it is attached to, and re-attaches to the new workers. It does not end when the runtime is **stop**ped: nothing notifies the session, so the operator has to press Ctrl+C.
+
+For a runtime that runs in a worker process, **start** waits for the child to report before it returns. So the port is accepting connections by the time the command exits. A refusal that only the child can judge becomes the command's own exit status, rather than something **ls** shows two seconds later. Exit 1 names the runtime if the worker would not take its configuration, and gives the reason if the script's **on_start** raised an error. The whole command has one budget of two seconds, not one per runtime. The children are forked together and come up concurrently, so a **start** of twenty runtimes waits about as long as a start of one. A child that is still starting after that, such as a storage runtime reading a large store's files after a crash, is waited for by the CLI rather than the daemon, so the daemon stays free. The CLI asks the daemon five times a second whether the runtime is serving yet, for as long as its workers keep using CPU. The CLI exits 2 once the workers have used no CPU for 15 seconds. **create** -s and **restart** wait the same way.
+
+#### `stop name|pattern...`
+
+Stop one or more running runtimes. Accepts multiple names, glob patterns (*, **?**, **[]**), or a mix. With *, stops all running runtimes.
+
+A stopped runtime runs no script. Its **on_stop** callback runs first. Then every **set_timeout** and **set_interval** timer and every **socketley.subscribe** registration the runtime holds is cancelled, so nothing it set up can fire afterwards. None of the three can be set up again until the runtime is started. This stops a script that called **socketley.stop** on itself from immediately setting one up again.
+
+#### `remove name|pattern...`
+
+Remove one or more runtimes from the registry. Cannot be undone. Accepts multiple names, glob patterns, or a mix. Running runtimes are stopped first. With *, stops and removes all runtimes.
+
+#### `runtime verb [args...]`
+
+Run a verb on one runtime: the runtime's name comes first, and the verb is interpreted according to the runtime's type. The global commands above and below are the ones that no single runtime owns. **socketley** *runtime* **help** lists a runtime's verbs. Every runtime accepts **start**, **stop**, **restart**, **remove**, **show**, **stats**, **edit**, **reload**, **reload-lua** and **owner** in this form as well. The types add these verbs:
+
+#### `cache`
+
+**get**, **set**, **del**, **exists**, **incr**, **decr**, **incrby**, **decrby**, **append**, **mget**, **mset**, **keys**, **size**, **expire**, **ttl**, **persist**, **lpush**, **rpush**, **lpop**, **rpop**, **llen**, **lrange**, **lindex**, **sadd**, **srem**, **sismember**, **scard**, **smembers**, **hset**, **hget**, **hdel**, **hlen**, **hgetall**, **publish**, **flush**, **load**, **memory** (each runs the RESP command of the same name, with its arguments after it)
+
+#### `db`
+
+**query**, **backup**, **restore**
+
+#### `mqtt`
+
+**pub**, **sub**, **sessions**, **kick**, **retained**
+
+#### `idp`
+
+**user**, **login**, **logout**, **ssh-cert**, **ssh-ca**
+
+#### `dns`
+
+**dnssec**
+
+#### `tunnel`
+
+**invite**, **set**, **list**, **shares**, **revoke**
+
+#### `mail`
+
+**send**, **queue**, **show**, **flush**, **drop**, **dns**, **trace**, **usage**, **suppressed**, **forgive**, **unsubscribed**, **resubscribe**, **learn**, **export**, **import**, **sieve**
+
+#### `metrics`
+
+**query**, **query_range**, **series**, **targets**, **rules**, **alerts**, **logs**, **stats**
+
+#### `server, client`
+
+**send**
+
+A type's verb takes precedence over a lifecycle verb of the same name. For example, a metrics runtime's **stats** reports its store, while **socketley stats** *name* reports the runtime. A runtime whose name is a global command, such as **stop** or **mail**, is reached through the older forms at the end of this section. For **metrics**, **tunnel** and **mail**, the command named after the type passes its verbs to the runtime of that name. So **socketley metrics query** queries the runtime named **metrics**.
+
+```
+socketley shop query customers '{"where":{"country":"de"}}'
+socketley broker pub --qos 1 sensors/temp 21.5
+socketley auth user add jonas
+socketley edge invite pi --http home=idp:auth
+socketley metrics logs '{level="error"}' --since 1d
+socketley mycache get session:42
+socketley web stop
+```
+
+#### `send name [message]`
+
+Send a message to a running server or client runtime. For a server, the message is broadcast to all connected clients. For a client, the message is sent to the connected server. The command respects the runtime's mode setting, and fails if the mode is receive-only.
+
+#### `mail send --to address [--cc|--bcc address] [--from address] [--reply-to address] [--subject text] [--text text] [--html file] [--attach file[:type]] [--inline image] [--header 'Name: value'] [--raw]`
+
+Write a message and queue it on a mail runtime, which answers with the message's queue id. The text comes from **--text** or stdin. An HTML part from a file can go beside the text, and attachments are sent in base64. **--to**, **--cc**, **--bcc**, **--header**, **--attach** and **--inline** can be given as often as needed. For any other flag, the last value given is used. A name or address may take the form **Name <a@b>**. Without **--from**, a runtime with **--no-reply** sends from no-reply@ at its first domain. **--raw** queues stdin as the whole message, with its own headers. A message larger than 4 MiB is passed to the runtime as a file in its outbox under the state directory, so a message up to **--max-size** is sent whole. A message to a server or a client that begins with - must be given after --. A **:type** after an attachment is used as the attachment's type only if it has the form type/subtype and no file exists under the name that includes it. **--inline** sends an image inside the message. The HTML shows the image as **cid:***name***,** where *name* is the image's file name, so a reader sees it without fetching anything. See **MAIL FLAGS**.
+
+```
+socketley send m --to ops@example.com --subject "Backup done" --text ok
+df -h | socketley send m --to "Ops <ops@example.com>" --subject "Disks" \
+    --attach report.pdf:application/pdf
+```
+
+#### `mail send --template file --to address|idp:idp[/group]|db:db/collection|json:file [--set name=value] [--lua file] [--ad] [--no-check] [--rate-limit n[/m|/h]] [--test] [--test-to address]`
+
+Send each recipient a message of their own, filled in from a template. The template is an HTML file (or **--text** for plain text only) together with the subject, and both can contain placeholders. **{{name}}** is the recipient's value for that name. **{{name|otherwise}}** gives the text to use when the recipient has no value. **{{{name}}}** inserts a value into the HTML unescaped; every other placeholder is escaped.
+
+The values come from **--set**, which applies to every recipient, and from each recipient's source. An address given to **--to** provides its **email**. **idp:***idp* provides the idp's accounts that are not disabled, or only those of a group named after a slash. Each account has its username, name, email and every other field it keeps, except its password. **db:***db***/***collection* provides the collection's documents, each with its fields. The fields of a nested object are named below the object's name (**address.city**). **json:***file* provides a JSON array of objects, or one object per line. Each recipient needs an **email**, and a **name**, if present, is written into the message's To header. With an HTML template, the plain-text part beside it is the HTML's text, with its links written out.
+
+The messages are sent at **--rate-limit** per second, or per minute or per hour when a slash follows (**300/m**). Default: two per second. Sending gradually keeps a new sender's first thousand messages from landing in the spam folder for arriving all at once. The output names each recipient that was skipped or failed, and one line reports how many messages were sent.
+
+A template is Lua. **{{ expr }}** inserts the value of any Lua expression, and **{% code %}** runs the code where it stands. A tag alone on its line removes the whole line from the output:
+
+```
+{% if vip then %}<p>Your code: {{code}}</p>{% end %}
+{% for _, p in ipairs(products) do %}
+<li>{{p.title}}: {{ string.format("%.2f", p.price) }}</li>
+{% end %}
+```
+
+A name with dots refers to a nested field. If a field along the way is missing, the result is no value rather than an error. A list of words is written joined by commas. **html**(s), **url**(s) and **raw**(s) escape a value, percent-encode it, and keep it unescaped, respectively. **include**("file") inserts another template from the same directory, filled in for the same recipient. A template can use the recipient's values, whatever the script defines, the string, table and math libraries, os.date and os.time. It cannot reach any file or process.
+
+**--lua** *file.lua* runs once before the first recipient and can use all of Lua. **on_recipient(***r***)** is called with each recipient's values before their message is written. It can change the values, or leave the recipient out by returning false and a reason. **on_link(***url***,** *r***)** is called with each link in the HTML except the unsubscribe link. Its return value is the link that is written; nil keeps the link unchanged. An error in Lua means a message cannot be written, and is reported with its file and line.
+
+A template is filled strictly. A recipient whose message uses a name with no value and no default is skipped. If this happens to the first recipient, the whole send stops before any message is sent. The send also stops if the runtime refuses the first message, since a template that fails for its first recipient is wrong for all of them. **--no-check** lets a name with no value be empty, and keeps sending after a refused first message. **--test** shows the first recipient's message and how many recipients there are, and sends nothing. **--test-to** sends that message, with its subject marked [test], only to the address it names.
+
+**--ad** marks the messages as advertisements. Each advertisement goes to a single recipient, and never to one who unsubscribed. It carries the recipient's own unsubscribe link, placed where the template says **{{unsubscribe}}**, or below the content if the template does not say. It also carries List-Unsubscribe, naming that link and a mailto: address (RFC 2369), and List-Unsubscribe-Post for a provider's one-click unsubscribe (RFC 8058). List-Id names the list after its sender, such as <news.example.com> (RFC 2919). The link is **https://***webmail***/unsubscribe** when the runtime has **--web** and **--domain**. A GET on the link asks for confirmation and a POST unsubscribes, so a scanner that opens every link unsubscribes no one. The mailto: address is **unsubscribe@***domain* with the token in its subject. A token is the address plus an HMAC of it under the runtime's key, so it is stored nowhere and nobody can forge it. A message that is not an advertisement still goes to an address that unsubscribed.
+
+```
+socketley send m --template autumn.html --inline logo.png --to db:shop/customers \
+    --from news@example.com --subject "Hello {{name|there}}, your code {{code}}" \
+    --ad --rate-limit 5
+socketley send m --template autumn.html --to idp:auth/vip --set code=VIP30 --test
+socketley send m --template order.html --lua shop.lua --to db:shop/orders --test-to me@example.com
+```
+
+If no message is given, **send** reads it from stdin:
+
+```
+echo "hello" | socketley send myserver
+cat data.txt | socketley send myclient
+```
+
+The word **send** can be left out when input is piped in, so **echo "hello" | socketley myserver** is the same command. socketley uses this form only when standard input is not a terminal. That is also the case in every script, pipeline and CI step, so a mistyped command can end up here too. When nothing arrives on standard input, socketley cannot tell a misspelled command from a runtime that was piped zero bytes. It says so and names both readings, with the typo first:
+
+```
+$ socketley gibtsnicht < /dev/null
+unknown command: gibtsnicht
+  If gibtsnicht is a runtime you meant to send to, nothing arrived on standard input:
+    echo 'data' | socketley gibtsnicht
+```
+
+#### `stats name|pattern...`
+
+Display runtime statistics, including total connections, messages processed, bytes in/out, and type-specific counters. Accepts multiple names, glob patterns, or a mix. With *, shows stats for all runtimes.
+
+The **cpus** field describes how the runtime's I/O is running, not what it has done. It is read from the ring itself rather than from the requested setting, because a cpuset can refuse the pinning, and nobody can debug a runtime whose real CPU set cannot be read back. These fields need a note:
+
+#### `cpus`
+
+The CPU set in effect, written in the same form that **--cpus** accepts. **(not applied)** is appended when the pinning was attempted and refused.
+
+#### `dial_attempts`
+
+Client only: the number of connection attempts this client has made. Compare it with **total_connections**, which counts the attempts for which the kernel found a peer. A non-blocking connect answers EINPROGRESS for every target that is not already there, so an attempt only records an intention. The two figures differ exactly when a target is flapping or gone: a client that keeps reconnecting all afternoon shows one climbing and the other standing still. Every other runtime counts **total_connections** when something has actually happened to it: the server and the cache at an **accept**(2), the proxy once **on_auth** has admitted the client.
+
+#### `upstreams`
+
+Server only, and shown only when **-u** was given: the number of configured upstreams that the kernel reports as connected, over the number configured. The left number counts real connections, not attempts, for the same reason as **dial_attempts** does for a client. A flapping upstream makes the two numbers differ, and an unreachable one keeps the left number at zero.
+
+For a runtime that runs in its own process, **cpus** describes that process's ring, not the daemon's.
+
+#### `daemon stop`
+
+Stop the daemon this invocation would talk to, together with every runtime it supervises. The command reaches the daemon over its socket, not by pid. The daemon answers before it exits. The command exits 2 when nothing is serving that socket.
+
+#### `daemon stats`
+
+Print the daemon's own figures as *key***:***value* lines, the same format that **stats** uses for a runtime. Currently these cover the loopback shortcut (**daemon --fast-lo**), whose bytes **tcpdump -i lo** and nftables never see.
+
+**fast_lo** is **off**, **own**, **all**, **trust**, or **unavailable**; when it is unavailable, **fast_lo_reason** says why. The other fields appear when the shortcut is attached. **fast_lo_sockets_shortcut** counts the entered sockets that send through the shortcut, and **fast_lo_sockets_tcp** counts those pinned to TCP for good. Both are as of the last once-a-second sweep; a pair is two sockets, and each direction belongs to its sender. **fast_lo_entered** counts the sockets entered since start.
+
+**fast_lo_tainted_bound**, **_unanswered**, **_budget** and **_peer_off** count taints by reason, in that order: the peer really held the per-pair bound; no answer came before twice the bound; the global budget was reached; the peer was not on the shortcut (it received over TCP before it could enter, or it had closed). **fast_lo_held_bytes** is the unread redirected backlog summed across pairs. The global budget (**fast_lo_budget_bytes**) is compared against it. For a pair below 64 KiB it is an upper bound. **fast_lo_over_budget** is 1 while new sends are being tainted because of the budget.
+
+The metrics endpoint exports the same figures as **socketley_fast_lo_info{mode}**, **socketley_fast_lo_sockets{path}**, **socketley_fast_lo_entered_total**, **socketley_fast_lo_tainted_total{reason}**, **socketley_fast_lo_held_bytes**, **socketley_fast_lo_budget_bytes**, **socketley_fast_lo_pair_limit_bytes** and **socketley_fast_lo_over_budget**. The counting costs one atomic add per entered socket and per taint, never one per send.
+
+```
+socketley daemon stats
+```
+
+#### `idp user add user [--password pw|-] [--name name] [--email addr] [--groups a,b] [--set field=value]... [--reset]` / `idp-user idp passwd user --password pw|- [--reset]` / `idp-user idp set user field=value...` / `idp-user idp disable|enable|logout|remove|show user` / `idp-user idp list|import storage` / `idp-user idp totp user on|off` / `idp-user idp app-password user add label|remove label|list`
+
+Manage the accounts an **idp** runtime keeps. The changes are made in the idp's own process. **add** creates an account under a new fixed id and prints the id. Every token identifies the account by this id, so the account stays the same if its username is changed later. **--password -** reads the password from the first line of stdin, which keeps it off the command line where others can read it. **--reset** makes the user set the password again at the next sign-in.
+
+**set** gives any field a value; an empty value removes the field. A field the provider does not know is kept and passed on unchanged, for the applications that use it. Setting a new **username** ends the account's sessions and tokens, because they carry the old username to every runtime that accepts them. **logout** ends every session and refresh token the account holds; **passwd** does too. **show** prints the fields. It shows the password only as set, never its hash.
+
+**totp on** turns on a second sign-in step (RFC 6238). It prints the key, and the otpauth:// link that loads the key into an authenticator app. From then on, a web sign-in asks for the six digits the app shows, after the password. Each code is accepted only once, at every shard and across a restart, because the last time step used is stored with the account. **off** turns the second step off.
+
+**app-password add** creates a password for one mail app: four groups of four letters, printed once. It signs in over SMTP, IMAP, POP3 and JMAP, and **remove** revokes it on its own, without affecting anything else. With the second step on, mail apps can sign in only with these passwords, since they have no code to give. A user can do all of this on their own account page, **/account**. There, the second step is turned on only after a code proves that the app has the key.
+
+**import** copies a storage runtime's users, each with the password it has there. An account here with the same name is kept as it is. A storage admin is not an admin here, since an admin here is root through an SSH certificate. The output names each such user, so that **set** *user* **groups=admins** can make them one. A refusal makes the command exit 1.
+
+```
+socketley auth user add smiley --password - --groups admins
+socketley auth user set smiley picture=https://storage.example.com/me.png
+socketley auth user import ui
+```
+
+#### `login idp [--client id]` / `logout idp`
+
+Sign a person in to an **idp** runtime, on this machine or another, with the device grant (RFC 8628), or sign them out. **login** prints an address and a code to approve there. It then waits until a browser signed in as that person approves the code. The approval page names the application that is asking and what approving it grants. For a client marked **ssh** under **--ssh-ca**, the page says that the client gets SSH certificates (as root for an admin), and asks for the password again, or for the code if the second step is on. **login** keeps the tokens in *~/.config/socketley/tokens/* (0600). From there, **ssh-cert** and **tunnel** act as that person, and refresh the access token when it expires. The client is **socketley** unless **--client** names another. The provider allows the grant only to a client marked **device** in its **--clients**. **logout** forgets the tokens. A refused or expired code makes the command exit 1.
+
+```
+socketley login auth.example.com
+```
+
+#### `ssh-cert idp [--key file.pub]`
+
+Get an SSH certificate for the person signed in at *idp* with **login**. The certificate is for *~/.ssh/id_ed25519.pub*. If that key does not exist, the command creates *~/.ssh/socketley_ed25519* and uses it instead. The certificate is written beside the key as *-cert.pub*, where ssh finds it. It is valid for the number of hours set by the provider's **--ssh-ca**. Its principals are the username, root for members of the admins group, and *name* for each group named **ssh:***name***.** If the provider refuses, as it does for a token given to a client not marked **ssh**, the command exits 1.
+
+```
+socketley ssh-cert auth.example.com
+ssh root@server.example.com
+```
+
+#### `idp ssh-ca` / `idp-ssh idp host-sign file.pub --names host,... [--days N]` / `idp-ssh idp revoke user|serial` / `idp-ssh idp krl`
+
+Manage the SSH certificate authority of an idp runtime on this daemon. **ssh-ca** prints the authority's public key, for sshd's **TrustedUserCAKeys** and for a client's **@cert-authority** line. **host-sign** certifies a host key for the given names, valid for 365 days unless **--days** says otherwise. It writes the certificate beside the key, for sshd's **HostCertificate**. **revoke** ends a person's current user certificates now rather than at their expiry, or revokes one certificate by the serial the log shows for it. **krl** prints the path of the revocation list the idp keeps, for sshd's **RevokedKeys**.
+
+The idp writes the list when it starts and at every revocation. It also revokes a person's certificates without being asked when that person is signed out everywhere, disabled, reset or removed, or has their groups changed. This is because a certificate made earlier may carry a principal the person no longer has. A server that cannot read the file can fetch the same bytes from **/ssh/krl**.
+
+```
+socketley auth ssh-ca > /etc/ssh/socketley_user_ca.pub
+socketley idp-ssh auth host-sign /etc/ssh/ssh_host_ed25519_key.pub --names server.example.com
+echo "RevokedKeys $(socketley idp-ssh auth krl)" >> /etc/ssh/sshd_config.d/socketley.conf
+socketley idp-ssh auth revoke alice
+```
+
+#### `edge invite|set agent [--http name[=auth],...] [--tcp name:port,...] [--udp name:port,...]` / `tunnel edge list|shares|revoke agent`
+
+Manage the agents a tunnel edge accepts. **invite** prints a one-time invitation for an agent to offer the named services. An HTTP service is served at *name***.***domain***.** A TCP or UDP service is served on its port, on every address of the machine, or only on one address when given as *name***:***address***:***port***.** A TCP and a UDP service may share a port number. An agent that is invited again gets a new invitation.
+
+A UDP service carries each visitor's datagrams to the agent as a separate flow, and carries the answers back. It forgets a flow that has been silent for a minute. It drops a datagram rather than queue it while the agent is away or the agent's link is full. An HTTP service with **=***auth* asks each visitor to pass *auth*, as a proxy's **--auth** does.
+
+**set** changes what an agent offers and keeps its key. **shares** lists the ports people currently share at the edge: who may visit each, whose it is, and until when. **revoke** cuts the agent off.
+
+A TCP service on **127.0.0.1** alone lets the edge's own machine reach a service at home without opening it to anyone else. A proxy's **--backend** or a sync's **--storage** names that port like any other port, and the connection is refused while the agent is away. See **TUNNEL FLAGS**.
+
+```
+socketley edge invite pi --http home=idp:auth,nas --tcp mc:25565 --udp bedrock:19132
+socketley edge set pi --tcp nas:127.0.0.1:9000
+socketley create sync backup --dir /srv/data --storage http://127.0.0.1:9000/backup
+```
+
+#### `tunnel join edge [--name agent] [--http service=host:port,...] [--tcp service:edge-port=host:port,...] [--udp service:edge-port=host:port,...] [--replace] [--idp idp]`
+
+Make this machine an agent of an edge, authorized by an admin of the edge's idp. If no **login** is kept here, the admin signs in with a code approved in a browser. That sign-in is for this join only and is not stored. The edge adds the agent, named after this machine's host name unless **--name** gives another name. The agent runtime of that name is then created and joins at once. Each HTTP service asks its visitors to sign in at the edge's idp, until the edge's owner changes that with **tunnel** edge **set**. If the edge already holds a joined agent of that name, the agent is replaced only with **--replace**, for example when the machine has been set up anew. If a runtime of that name already exists on this machine, the command exits 1 and the edge is not asked. The command prints where each service is.
+
+```
+socketley tunnel join https://edge.example.com --http ollama=127.0.0.1:11434
+```
+
+#### `tunnel connect edge host:port|agent/service [--idp idp]` / `tunnel ssh edge [--agent agent] [--idp idp]`
+
+Connects stdin and stdout to a **--forward** target of a tunnel edge. The stream belongs to the person signed in at *idp* with **login**. Default: the edge's own idp, which the command asks the edge for.
+
+The command trusts an idp that the edge names with a sign-in stored on this machine only when that idp is beside the edge, such as **auth.example.com** for **edge.example.com**. Beside means in the same registrable domain according to the Public Suffix List in */usr/share/publicsuffix*, so two names under **duckdns.org** do not count. Without the list, only the edge's own name counts. Any other idp is trusted only when it is given with **--idp**.
+
+**tunnel ssh** connects to 127.0.0.1:22 on the edge, for use as ssh's **ProxyCommand**. An admin of the edge's idp may instead name an agent's TCP service as *agent***/***service***,** and **--agent** names that agent's **ssh**. This way, ssh reaches a machine at home through port 443 with no port opened for it anywhere. Errors go to stderr, since stdout carries the stream. A target that the edge does not name exits with status 1.
+
+```
+ssh -o ProxyCommand='socketley tunnel ssh edge.example.com' root@server
+ssh -o ProxyCommand='socketley tunnel ssh edge.example.com --agent pi' me@pi
+```
+
+#### `tunnel share edge port|address:port [--public] [--for duration] [--idp idp]`
+
+Shares a port of this machine through a tunnel edge, under a name of six letters and digits that the edge assigns. The name sits beside the edge's own name, as the names of its agents' services do (**k7f3q2.example.com** for **edge.example.com**). The share lasts as long as the command runs. It ends at Ctrl+C, at the end of **--for**, or when the sign-in it was made with ends. **--for** takes a duration from a minute to a day; default: two hours.
+
+Visitors sign in at the edge's idp, unless **--public** lets everyone in. Only admins of the edge's idp can share. Each admin may hold three shares at a time, and an edge holds at most 32. The edge logs who shares what, and **stats** counts the shares as **shares**. The command prints the address on stdout and errors on stderr. When the edge was reached by its address, the command prints the name alone, because there is no domain to put it under.
+
+```
+socketley tunnel share edge.example.com 3000
+socketley tunnel share edge.example.com 127.0.0.1:8080 --public --for 30m
+```
+
+#### `db backup file`
+
+Writes every document of a db runtime into *file*. The runtime writes it off its event loop while it goes on serving. The command waits until the file is written and prints nothing. See **DB FLAGS**.
+
+#### `db restore file`
+
+Replaces a db runtime's documents with those of a backup. The command first reads the whole file, and a file that is not a backup changes nothing. Then it stops the runtime and moves the current documents aside, next to them, as *dir***.before-restore***.* It puts the backup in their place and starts the runtime again if it was running.
+
+#### `db query collection ['query']`
+
+Prints the documents of a collection that a query finds, in the db API's answer format, **{"docs":[...]}**. *query* is the object that **POST /c/***collection***/_query** takes, with its where, sort, limit (up to 1000) and skip. Without a query, the command prints every document, up to the limit. The query runs as the operator, the same as a query from a script.
+
+```
+socketley shop query customers '{"where":{"country":"de"},"limit":50}'
+```
+
+#### `metrics query promql [--at time] | query_range promql [--start] [--end] [--step] | series selector | targets | rules | alerts [--recent] | logs [logql] [--since] [--limit] | stats [--json]`
+
+Asks a metrics runtime what it holds, the way Grafana asks its Prometheus API.
+
+**query** runs a PromQL query at one time, and **query_range** runs it over a range. **series** lists the series a selector names. **targets** lists the targets the runtime scrapes, with their health. **rules** lists its rules. **alerts** lists the alerts pending and firing. With **--recent** it also lists the recent notifications, as the dashboard reads them. **logs** prints the log lines a LogQL query selects, oldest first. It needs the runtime's **--logs**, and by default covers an hour and prints 100 lines. **stats** prints the figures of the runtime's store.
+
+By default the output is one line per series or target; **--json** prints the API's answer instead. See **METRICS FLAGS**.
+
+```
+socketley metrics query 'sum by (name) (rate(socketley_runtime_messages_total[5m]))'
+socketley metrics query_range 'up' --start -6h --step 5m
+```
+
+#### `mqtt pub [--qos 0|1|2] [--retain] topic [payload]`
+
+Publishes a message on an mqtt runtime, as the runtime's own message. **--qos** sets the QoS, and **--retain** makes the message retained. The payload is the words after the topic, or stdin when there are none. Its last newline is dropped, and the rest is carried byte for byte. The command prints nothing once the broker has the message. A topic that contains **+** or **#**, or that starts with **$**, is refused with exit 1.
+
+```
+socketley broker pub --qos 1 --retain firmware/latest 2.4.1
+gzip -c report.json | socketley broker pub reports/daily
+```
+
+#### `mqtt sub filter [--count n]`
+
+Prints every message the broker accepts whose topic matches *filter*, as one JSON line per message as it arrives. Each line is **{"topic":..,"payload":..,"qos":..,"retain":..,"client":..}**; a payload that is not UTF-8 is printed as **{"base64":..}**. The command runs until it is interrupted, or until *n* messages have been printed. It takes no session and changes nothing. A line **{"dropped":n}** means that n messages were not read in time.
+
+#### `mqtt sessions`
+
+Prints the broker's sessions, from every shard, as a JSON array. Each entry has the client id, the user, whether the client is connected, the protocol version and the peer. It also has the client's subscriptions, the messages queued and in flight, the seconds left until the session expires while the client is away, and its shard.
+
+#### `mqtt kick client [--end]`
+
+Disconnects a client without sending its will. A 5.0 client is told that it was an administrative action. The session stays for the client to come back to; with **--end** the session ends too. A client id with no session exits with status 1.
+
+#### `mqtt retained [filter] | --clear topic`
+
+Prints the retained messages whose topics match the filter, as a JSON array. Default filter: **#**, which matches every topic except **$SYS**. With **--clear**, the command instead clears the retained message on *topic*.
+
+#### `mqtt passwd file user [--delete]`
+
+Sets the password of *user* in a users file for **--users**. The command reads the password from stdin, or on a terminal asks for it twice without echo. It stores the password as a scrypt hash. It creates the file with mode 0600 and replaces it whole, keeping every other line. With **--delete**, it removes the user instead. It needs no daemon. A broker, and a mail runtime's **--users**, read the file again within two seconds.
+
+```
+socketley mqtt passwd /etc/socketley/mqtt.users sensor-17
+```
+
+#### `dns dnssec`
+
+Prints the DS record that each zone of a dns runtime with **--dnssec** needs at its parent. The parent is the registrar. The command prints each DS together with the DNSKEY it stands for, one per line. If the runtime has not made the keys yet, the command makes them, so the DS can go to the registrar before the zone is served signed.
+
+Every validating resolver treats a zone whose parent has no DS for it as unsigned. A zone whose parent has a DS for another key gets no answer at all. For that reason, a key is never removed while a DS names it.
+
+```
+socketley ns dnssec
+```
+
+#### `mail [queue [filter] | show id | flush [id] | drop id | dns [--check] | trace address | usage [user] | suppressed | forgive address | unsubscribed | resubscribe address | learn user/folder --as spam|ham | export user [dir] | import user file|dir | sieve user list|get name|put name file|check file|activate name|deactivate|delete name]`
+
+Shows the state of a mail runtime and manages its spool, its users' mailboxes and their Sieve scripts. The runtime's name can be left out when the daemon has only one mail runtime.
+
+Every hour, and when it starts, the runtime checks two things about its host. First, it checks that the PTR record of each address of its host names that host again. This is forward-confirmed reverse DNS. Without it, Gmail and Outlook refuse the runtime's mail or file it as spam. The PTR record is set where the address is rented. Second, it checks whether a blocklist of its **--dnsbl** lists one of those addresses. The runtime reports either problem in its summary and in the log.
+
+Without a verb, the command prints a few lines about the runtime and how it is doing. They cover its domains, users and mailboxes, its ports, the webmail's name, what is waiting, what was delivered, deferred, bounced, received and stored, and its lists.
+
+The spool verbs cover every shard. **queue** lists the messages that are waiting, with each one's id, size, sender, the recipients still waiting, and the tries. With *filter*, it lists only those whose id or sender contains *filter*. **show** prints the envelope of one message, with the last answer each recipient got. **flush** tries every message now, or only the one named. **drop** deletes one message without telling anybody.
+
+**dns** prints the MX, SPF, DKIM, DMARC and SRV records that the runtime's domains need, for a zone kept somewhere other than a dns runtime of this daemon. With **--check**, it asks this machine's resolvers for each record and reports whether it is there, missing, or something else.
+
+**trace** *address* reports what became of the latest mail from or to an address, the newest last. For each message it says whether it was delivered, deferred (with the reason), bounced, or refused (with the answer it got). Each of these is also a line of the log.
+
+**usage** [*user*] shows what each user's mailboxes hold against their quota. Without a user, it shows every user of the runtime's idp.
+
+**suppressed** lists the addresses that bounces reported as dead. The runtime does not mail them again until **forgive** releases one. **unsubscribed** lists the addresses that unsubscribed from its advertisements. An address stays on that list until **resubscribe** takes it back.
+
+**learn** teaches the spam filter one of a user's folders, as spam or as not spam. An example is a user's Junk and INBOX on a new machine, where the filter has learned nothing yet.
+
+**export** writes a user's mailbox out as mbox files, one per folder, as *dir***/***folder***.mbox**. Without *dir*, the files go under */var/tmp/socketley-mail*. The daemon makes the directory for itself alone. It refuses a directory that already holds files, is a link, or lies in a folder that another user may change. Flags are written as Status and X-Status, keywords as X-Keywords, and the internal date goes in each "From " line.
+
+**import** reads an mbox file, or every *.mbox* file under a directory, into a user's folders. Each file goes into the folder its name says, and an empty file becomes an empty folder. It reads what **export** wrote, Thunderbird's mbox files, and a Google Takeout's. In a Takeout, X-Gmail-Labels gives the folder: Inbox, Sent, Drafts, Spam as Junk, Trash, a label of the user's, and Archive for the rest. Its read and starred labels give the flags. Both **export** and **import** wait until they finish and report how many messages they moved. To move a mailbox from another IMAP server, use IMAP itself, with **imapsync**(1) or a mail client.
+
+**sieve** manages a user's Sieve scripts, as ManageSieve does. It lists them with the active one marked, prints one, or stores one from a file (**-** for stdin) once it compiles. It also checks one, makes one active or none active, or deletes one. See **MAIL FLAGS**.
+
+```
+socketley m queue
+socketley m show 65e5113d0e2120000000
+socketley m dns >> /etc/bind/example.com.zone
+socketley m sieve alice put main filter.sieve
+socketley m sieve alice activate main
+socketley m export alice /var/backups/alice
+socketley m import alice ~/Takeout/Mail/All mail Including Spam and Trash.mbox
+```
+
+#### `git-sync --url url --branch name|* --work dir --endpoint host:port [--tls [--ca file]] --bucket library --name folder [--keep days,weeks,months] [--move-from library]`
+
+Runs one sync of a repository that a storage runtime keeps (see **Git repositories** under **STORAGE FLAGS**). The storage runtime starts this command itself, and a run by hand works the same way.
+
+The command fetches into the bare clone under *dir*. When a ref has moved, it writes the branch's files and a bundle into the library at *host*:*port*. It takes the credentials from **SOCKETLEY_GIT_ACCESS_KEY**, **SOCKETLEY_GIT_SECRET** and, for temporary credentials, **SOCKETLEY_GIT_SESSION_TOKEN**. **SOCKETLEY_GIT_TOKEN** is a GitHub token for a private repository; the command sends it only to an https:// URL.
+
+**--ca** names the certificate that the runtime at *host*:*port* must present over **--tls**. The storage runtime passes its own certificate here.
+
+**--move-from** names a library the folder was written to before. Once the tree is complete in the new library, the command copies the backups over from the old one and removes the folder's files there. It removes the old library itself once nothing else is in it. An old library this user may not read is left as it is.
+
+Exit status is 0 when the run ended well, 2 when it did not, and 3 when a run of the same directory is already under way. *dir*/state.json gives the details.
+
+#### `acme issue --domains name[,name...] [--cert file] [--key file] [--email address] [--directory url] [--challenge http-01|tls-alpn-01|dns-01]`
+
+Gets a certificate from an ACME CA by hand, as certbot does. The command creates the account once per CA and keeps it in *state-dir*/.acme/.
+
+By default it proves the names over HTTP-01, through the daemon's runtimes on port 80. With **--challenge tls-alpn-01**, it proves them through the daemon's TLS runtime on port 443. With **--challenge dns-01**, it proves them through a **dns** runtime of the daemon that serves the name's zone, as **--acme** describes. A wildcard name takes dns-01 by itself. **--dns-zones** *zone*[**,***zone*...] names zones that a **dns** runtime of the daemon serves. A name in one of them is proven over dns-01 whatever **--challenge** says, and the other names use **--challenge**.
+
+The command writes the chain and a new key to the **--cert** and **--key** files, the key first. By default these are the files that **--acme** uses for the first name, so a runtime serving them picks them up. It does not talk to the daemon. It writes each answer to a file that the daemon's runtimes read, so one of them must be running on the port the challenge is asked on. On success it prints nothing; otherwise it prints the CA's reason and exits with status 2. A runtime with **--acme** runs this command to renew.
+
+#### `daemons`
+
+Lists every daemon that has registered itself, with its pid, whether it still answers, and the executable serving it. The executable differs per socket once a daemon built on the SDK is running.
+
+An asterisk marks the daemon this invocation would talk to; **SOCKETLEY_SOCKET** selects another. The list is a set of files, one per daemon. A daemon writes its file after it starts serving its socket, and removes the file on a clean exit. The command probes every entry rather than trusting it. So a daemon that was killed outright is reported as **dead** rather than listed as running, and its file is removed once its pid is gone too.
+
+#### `restart name [edit flags] [-i]`
+
+Stops and starts a runtime in one step, and applies any **edit** flags given in between. This is how a setting that cannot change while a runtime runs is changed:
+
+```
+socketley restart api -p 9001
+socketley restart ns-proxy --shards 1
+```
+
+It is one command, not a **stop** followed by a **start**, because the runtime being restarted may carry the command itself. For example, an entrance proxy carries the dashboard the command was sent from. With two commands, the stop arrives and the start never does, and the entrance stays down with its configuration unchanged. The daemon does all of it, so the runtime ends up running whatever happens to the caller's connection. If **edit** refuses a flag, the runtime keeps running unchanged.
+
+The flags are **edit**'s. **edit** reads them, and they are never handed to **start**. **-i** belongs to restart itself, and attaches to the runtime once it is up. A runtime that was stopped is started too, with or without flags: restart is the lifecycle verb, and it means one thing. To store a change WITHOUT starting anything, see **edit --restart** below.
+
+A runtime's new worker is forked only after its previous worker has exited, because that process holds the ports, unix paths and files until then. The **start**, **reload** or **create -s** that brought the runtime up answers after that fork, and the daemon serves everything else meanwhile. The previous worker gets five seconds before it is killed. A cache that is writing its dump gets that dump's own bound instead. So a command can outlast the CLI's five-second wait for an answer while the runtime is still coming up.
+
+#### `reload name|pattern...`
+
+Restarts one or more running runtimes (stop + start). Accepts multiple names, glob patterns, or a mix. Runtimes that are not running are skipped. With *, it restarts all running runtimes.
+
+For a runtime that lives in a worker process, the daemon takes the child down and forks it again. The child then re-reads the script from disk, so a change to the script takes effect. The command waits for the new child, exactly as **create -s** does, and reports on it. It exits 1 and names the runtime if the worker refuses the configuration it was handed. It exits 1 with the reason if the reloaded script's **on_start** raises. On success it prints nothing.
+
+#### `reload-lua name|pattern...`
+
+Hot-reloads the Lua script attached to one or more runtimes. The command destroys the Lua context and re-creates it from the original script path. Accepts multiple names, glob patterns, or a mix. Runtimes without Lua scripts are skipped. With *, it reloads Lua on all runtimes that have scripts loaded.
+
+**on_start** runs again, on the new script. This is the whole difference between reloading a file and reloading a runtime. Everything a script sets up at run time lives in its Lua context: every **socketley.subscribe** registration and every **set_timeout** or **set_interval** timer. Destroying the context destroys all of it. The usual place to create those is **on_start**, so a reload that did not re-run it would leave the runtime serving with no subscriptions and no timers, without a word. So anything **on_start** does must be safe to do twice. **socketley.create** is the case there that costs something, and it refuses a name that already exists rather than creating a duplicate.
+
+**on_stop** does **not** run for the outgoing script. The runtime is not stopping: it keeps its listener, its clients and its state throughout the reload. **on_stop** is where a script says goodbye to exactly those.
+
+An **on_start** that raises is reported like a script that would not load: exit 1, with the reason on the terminal. In that case the new script is in force, with whatever its **on_start** did before it failed. A script that does not *compile* leaves the previous one running instead. The message says which case happened.
+
+A runtime that runs in a worker is asked to reload, rather than reloaded by the daemon: its script lives in that process, and only that process can re-run it. The command waits for the worker to report the declaration that the new script makes. That wait is bounded the same way **create** bounds its own wait. So when the command returns, a gateway in front of that runtime already enforces what the edited script says, even when the edit removed the **routes** table altogether. If the worker does not answer in time, the previous declaration stays in force and the log says so. A script that does not compile leaves the previous one running, as it does in the daemon.
+
+A reload that succeeds prints nothing and exits 0. A script that would not load is named on stdout with the reason: the parse error, or the **filters** or **routes** rule it broke. The command then exits 1. The runtimes that did reload stay reloaded, and the others go on running the script they had. So the message is the only sign that an edit is not live.
+
+#### `show name|pattern...`
+
+Prints a runtime's JSON configuration to stdout. Accepts multiple names, glob patterns, or a mix. With *, it prints all runtimes.
+
+#### `edit name [flags] [--restart]`
+
+Edits a runtime's configuration. With flags (for example -p 9001), it applies the changes directly. Without flags (or with only -r/--reload), it opens the runtime's JSON configuration in **$VISUAL**, **$EDITOR**, or **vim**, and validates and applies the changes after saving.
+
+**--restart** stops the runtime first and starts it again afterwards. A setting refused "while running" needs this. **import** takes **--restart** the same way, before the document:
+
+```
+socketley edit ns-proxy --shards 1 --restart
+socketley show ns-proxy | socketley import ns-proxy --restart
+```
+
+The daemon does the stop, the change and the start as one command, so a caller whose connection the runtime carries cannot be cut off between them; see **restart**. If the runtime refuses a change, it keeps running unchanged. It was still stopped and started around the refusal, because the only way to learn whether a setting needs a restart is to apply it, and a refused edit rolls back whole. A runtime that was already stopped stays stopped.
+
+The flags accepted here are a subset of those that **create** takes. They are the common settings (**-p**, **-b**/**-bp**/**-bt**/**-bpt**, **--log**, **-w**, **--max-connections**, **--rate-limit**, **--global-rate-limit**, **--idle-timeout**, **-g**). They also include the server and client flags, and the proxy mesh flags (**--strategy**, **--health-***, **--circuit-***, **--backend-timeout**, **--retry**, **--retry-all**). A tunnel's own flags are accepted too, such as an agent's **--offer**, which a running tunnel takes only with **--restart**.
+
+Every other flag is refused with **unknown flag** and exit status 1. This includes **--lua**, **--drain**, **--reconnect**, the proxy's **--backend**, **--protocol** and **--sidecar**, and every cache flag. Change those through the editor or **import**, which reach the full field set.
+
+Four flags take effect at once on a *running* runtime of any type: **--max-connections**, **--rate-limit**, **--global-rate-limit** and **--idle-timeout**. They are limits that a runtime reads at the moment it uses them: on each accept, each message, or each idle sweep. So a change affects the next decision and nothing already decided. The daemon sends the edited configuration to every shard.
+
+On a **proxy**, nine more flags take effect at once, for the same reason. They are routing and mesh *policy*: the proxy reads them when it picks a backend, arms a request or counts a failure, and builds nothing from them. They are **--strategy**, **--health-interval**, **--health-path**, **--health-threshold**, **--circuit-threshold**, **--circuit-timeout**, **--backend-timeout**, **--retry** and **--retry-all**. **--health-interval** re-times the sweep that is already armed, so at most one period of the old value passes before the new one applies.
+
+**--health-check** is not among them, and it is the one proxy flag with a different reason. It arms a sweep timer when the runtime starts, so turning it on later has no timer to arm. It is stored and applies at the next start, like everything below.
+
+Every other flag that **edit** accepts on a running runtime is stored and takes effect at that runtime's next start. This is not a policy choice. The TLS flags are a context that the open handshakes already used. A proxy's backends are open connections, and a server's **--http** directory decides what a request in flight is answered from. None of those can change under an existing connection. So **show** reports the new value while the runtime holding the port keeps the old one, until ‘**socketley restart** name**’.** Some flags cannot even be stored while the runtime runs; they say so and change nothing: **-p**, **--listen** and **--shards**.
+
+The TLS flags are an exception only in what they refuse. Editing is the usual way to add encryption to something that already exists. So *every* runtime type accepts **--tls**, **--cert**, **--key** and **--ca** here, and a proxy also accepts **--client-ca**, **--client-cert** and **--client-key**. Certificates are read when a runtime starts, so a running runtime keeps the identity it handshook with until it is restarted.
+
+The settings that decide what a runtime trusts are refused while it runs, instead of stored. A stored value would be shown while the old one went on deciding who gets in. These are **--tls** on a runtime without it, **--ca** naming another file, and on a proxy **--client-ca**, **--client-cert** and **--client-key**, plus the same fields in **import**. **--restart** takes them.
+
+An edit that would leave the set incomplete is refused and changes nothing, so a mistyped flag cannot leave a runtime half-configured. Incomplete means a certificate with no **--tls**, **--tls** with no key pair on a listener, half a client-certificate pair, or **--tls** on a cache that replicates. See **LIMITATIONS**.
+
+#### `edit name -r`
+
+Opens the interactive editor and hot-reloads the runtime's Lua script after the changes are saved. Alias: **--reload**.
+
+#### `export dir`
+
+Writes this daemon's setup as Lua into *dir*.
+
+The output is **config.lua**, with an **include** of one file per runtime under **runtimes/**. A dns runtime's zones go under **zones/** and a handler script under **lua/**. The runtimes are ordered so that each one comes before the runtimes that name it. A runtime that another runtime made, such as a dns runtime's entrance, is left out, because that runtime makes it again. The daemon's own settings are carried over from its configuration file.
+
+Files that the runtimes read but the setup does not hold are named at the top of **config.lua**, so they can be put on the next machine as well. Examples are a credentials file, a token file, and a certificate outside the state directory. The runtimes' data is not in the setup.
+
+Before the command ends, it reads the setup back and plans each runtime from it. If the setup would make a runtime differently, the command names that runtime and exits with status 1. A directory that already holds a **config.lua** is refused. See **A machine's setup** under **LUA CONFIGURATION**.
+
+#### `export --full file [--compress fast|best|none] [--threads n]`
+
+Writes the setup and its data into one tar archive.
+
+The archive is compressed with gzip unless **--compress none** is given. **best** looks harder for what repeats, as **gzip -9** does. Data that does not get smaller, such as photos and attachments, goes in as it is. Compression works one MiB at a time, on as many threads as the CPUs the command may run on, or on *n* threads with **--threads**. The result is one stream that any gzip reads.
+
+The archive holds the state directory: every runtime's file, the mailboxes' index, the idp's accounts and keys, the Sieve scripts, the calendars' journals, the DKIM and DNSSEC keys, and the certificates. It also holds the daemon's configuration directory, and what each runtime keeps elsewhere. That includes a storage runtime's buckets, a cache's file and its journal, a zone, a script, and a file of tokens. The Lua setup that **export** writes goes in beside them.
+
+A db runtime that is running is written by its own backup, which holds its contents at one moment, rather than copied while it writes. A cache gives what its file and its journal hold, which is what a crash would leave. When the cache journals, that is every write except those of the last **--persistent-interval**.
+
+The archive does not hold a log, what a runtime writes as its output, a backups directory, or the files a sync runtime carries, which are the user's own. The command names each of these when it ends. Run it as root or as the daemon's user, while the daemon runs or not. The archive is written with mode 0600, and only once it is complete.
+
+```
+socketley export --full /var/backups/socketley-$(date +%F).tar.gz
+```
+
+#### `restore file [--force]`
+
+Puts what **export --full** wrote back where it was. Each file is owned by the user that owned it, where that user exists on this machine. Each file is written beside its place and then moved there whole.
+
+The daemon must be stopped first. When it is started again, it brings every runtime back from its state as it was, running where it ran. A state directory that already holds runtimes is refused unless **--force** is given. A path outside those the archive's manifest names makes the command refuse the archive.
+
+Some paths are left where they are and named, for **tar** to take out by hand. These are the paths the manifest names under */etc*, */usr*, */root*, */boot*, */run*, */var/spool* and the like, or among a home's hidden files. This machine's state and configuration directories are not among them. No file is restored setuid or setgid. Outside the state and configuration directories, a file that the archive says root owns is owned by the daemon's user.
+
+```
+systemctl stop socketley
+socketley restore /var/backups/socketley-2026-10-25.tar.gz
+systemctl start socketley
+```
+
+#### `import name [--restart] json`
+
+Updates a runtime's configuration from a JSON string. Without the *json* argument, the command reads the document from standard input, so **show** pipes straight into **import**:
+
+```
+socketley show name | socketley import name
+```
+
+The standard-input form has no command-line length limit; the quoted form does. Whitespace outside string literals is stripped before the document is sent, so the pretty-printed output of **show** is accepted as it is. **import** accepts the same fields as the interactive editor (see below). Fields marked **(read-only)** are ignored. Fields marked **(requires restart)** cannot be changed while the runtime is running. Port, protocol, and UDP settings cannot be changed while running.
+
+**A field the document does not mention is left alone.** Only the fields named are applied, so a partial document changes only those fields. To clear a field, write it out, for example **"tls": false** or **"cert_path": ""**. Leaving a field out does not clear it. If it did, a runtime configured for TLS could be handed **{"name":"x"}** and answer in cleartext afterwards, while the command reported success.
+
+**import** is also the fuller of the two ways to reconfigure a runtime. **edit** takes only a subset of the flags: it has no cache-specific ones at all, and no **--backend** or **--lua**. Anything that **edit** refuses with "unknown flag" can still be set: dump the document with **show**, change the field, and import it back.
+
+A JSON document is held to the same rules as the flags. On every runtime type, **tls**, **cert_path**, **key_path** and **ca_path** are accepted as a complete set and refused as an incomplete one. On a **cache**, a document that sets **tls** alongside **replicate_target** is rejected outright and nothing is applied, because replication is not encrypted (see **LIMITATIONS**). **mesh_client_ca**, **mesh_client_cert** and **mesh_client_key** belong to a proxy alone.
+
+Clearing any of these fields must also be written out; as for every field, a document that leaves a field out keeps the runtime's own value. This is how to make a runtime startable again after it was restored from an older state file with certificate paths it can no longer read. Set the paths to empty; do not delete the lines:
+
+```
+socketley show name > cfg.json
+# set the TLS and mesh paths to "" in an editor, do not delete the lines
+socketley import name "$(cat cfg.json)"
+```
+
+A document that leaves out **name** and **type** applies to the runtime the command names, with that runtime's type. So one field can be changed with one key:
+
+```
+socketley import ui '{"domain":"storage"}'
+```
+
+## Editing a runtime as JSON
+
+### Edit: JSON Configuration Fields
+
+The interactive editor opens a JSON file with the following fields. Fields marked **(read-only)** are ignored on import. Fields marked **(requires restart)** cannot be changed while the runtime is running; stop the runtime first.
+
+**Identity fields:**
+
+|  |  |
+|---|---|
+| name | Runtime name **(requires restart)** |
+| id | 6-char hex identifier (read-only, ignored on import) |
+| type | Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp (read-only, ignored on import) |
+| was_running | Internal daemon state (ignored on import) |
+
+**Common fields (all types):**
+
+| Field | Type | Description |
+|---|---|---|
+| port | number | Listener/connection port **(requires restart)** |
+| listen | string | "unix:/abs/path.sock" — an AF_UNIX listener instead of a port **(server/proxy/cache; requires restart)** |
+| log_file | string | State transition log file path |
+| write_file | string | Message write file path |
+| lua_script | string | Lua script path (absolute) |
+| bash_output | bool | Output messages to stdout |
+| bash_prefix | bool | Prefix messages with [name] |
+| bash_timestamp | bool | Prefix messages with [HH:MM:SS] |
+| max_connections | number | Max concurrent connections (0 = unlimited) |
+| rate_limit | number | Messages/sec per connection (0 = unlimited) |
+| global_rate_limit | number | Messages/sec across all connections (0 = unlimited) |
+| idle_timeout | number | Close idle connections after N seconds (0 = disabled) |
+| congestion | string | TCP congestion control of accepted connections (**--congestion**) |
+| drain | bool | Graceful shutdown (flush writes before close) |
+| tls | bool | Terminate TLS on the listener **(server, proxy)**; dial TLS **(client)** |
+| cert_path | string | PEM certificate **(server, proxy; needs tls)**; on a **client**, the certificate it presents |
+| key_path | string | PEM private key **(server, proxy; needs tls)**; on a **client**, the key for cert_path |
+| ca_path | string | Client CA for mutual TLS **(server, needs tls)**; on a **proxy**, the trust store for TLS backends; on a **client**, the trust store for its target |
+| target | string | Client target host:port **(requires restart)** |
+| cache_name | string | Connected cache runtime name |
+| group | string | Group tag for dynamic proxy discovery |
+
+**Server fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| mode | string | "inout", "in", "out", or "master" |
+| udp | bool | Use UDP instead of TCP **(requires restart)** |
+| master_pw | string | Static password for master mode |
+| send_to | string | "sender", "others", "master", comma separated |
+| http_dir | string | Static file root, as **--http** |
+| http_cache | bool | Hold those files in memory, as **--http-cache** |
+| compress | bool | Compressed copies (**--compress**) |
+| origins | string | Other web origins that may open a WebSocket, as **--origins** |
+| upstreams | array | Upstream addresses, as **--upstream** |
+
+**Client fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| mode | string | "inout", "in", or "out" |
+| udp | bool | Use UDP instead of TCP **(requires restart)** |
+| reconnect | number | Auto-reconnect max attempts (-1=off, 0=infinite) |
+
+**Proxy fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| protocol | string | "http" or "tcp" **(requires restart)** |
+| strategy | string | "round-robin", "random", or "lua" |
+| root | string | A FastCGI proxy's directory (**--root**) |
+| fastcgi_root | string | It as the application server sees it |
+| index | string | The index script (default "index.php") |
+| compress | bool | Compressed copies (**--compress**) |
+| backends | array | List of backend addresses ["ip:port", "@group", ...] |
+| health_check | number | 0 disabled, 1 TCP connect, 2 HTTP GET — the number **--health-check** stored |
+| health_interval | number | Health check interval in seconds (default 5) |
+| health_path | string | HTTP health check path (default "/health") |
+| health_threshold | number | Failures to mark unhealthy (default 3) |
+| circuit_threshold | number | Errors to open circuit (default 5) |
+| circuit_timeout | number | Seconds before half-open (default 30) |
+| backend_timeout | number | Seconds for the first response byte (default 2, 0 = off) |
+| retry_count | number | Retry count (0 = disabled) |
+| retry_all | bool | Also retry non-idempotent methods |
+| mesh_client_ca | string | CA for certificates clients present **(needs tls)** |
+| mesh_client_cert | string | Client certificate presented to backends |
+| mesh_client_key | string | Its private key (both or neither) |
+
+These are the names used in the document. They are not always the names of the flags or of the Lua configuration keys that set the same things. The document spells them **retry_count**, **mesh_client_ca**, **mesh_client_cert** and **mesh_client_key**, while the flags are **--retry** and **--client-ca** and the config-file keys are **retry** and **client_ca**. There is no **sidecar** field. Sidecar is a flag and a config key that sets several of the fields above, and nothing writes or reads it in a state document.
+
+**Storage fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| dir | string | Directory holding the buckets, as **--dir** **(requires restart)** |
+| anonymous | bool | Accept requests without credentials, as **--anonymous** **(requires restart)** |
+| idp | string | The idp runtime whose sign-in the web interface takes, as **--idp** **(requires restart)** |
+| max_bytes | number | Quota on the bytes held, as **--max-bytes** (0 = none); takes effect on a serving runtime |
+| sse_key_file | string | The SSE-S3 master key file, as **--sse-key-file** **(requires restart)** |
+| domain | string | The domains of virtual-hosted-style addressing, comma-separated, as **--domain** **(requires restart)** |
+| website_domain | string | The domains buckets' websites are served under, comma-separated, as **--website-domain** **(requires restart)** |
+| notify_targets | string | The event notification webhooks file, as **--notify-targets** **(requires restart)** |
+| replication_targets | string | The replication endpoints file, as **--replication-targets** **(requires restart)** |
+| fsync | string | "always", "interval" or "never", as **--fsync** **(requires restart)** |
+| sync | string | "never", "active" or "per-user", as **--sync**; absent is never **(requires restart)** |
+| fsync_interval | number | Seconds between the filesystem syncs of **--fsync interval**, as **--fsync-interval** **(requires restart)** |
+
+**Db fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| schema | string | The collections file, as **--schema**; read again when it changes |
+| keys | string | The service keys file, as **--keys**; read again when it changes |
+| idp | string | The idp runtime whose accounts own documents, as **--idp** **(requires restart)** |
+| origins | string | The web origins it answers, as **--origins** **(requires restart)** |
+| max_bytes | number | The most bytes the documents hold, as **--max-bytes** (0 = none) **(requires restart)** |
+| cache | number | The memory of documents read, as **--cache** **(requires restart)** |
+| replicate | string | The database this one copies, as **--replicate**; empty for none **(requires restart)** |
+| replicate_key | string | The file of the key it asks with, as **--replicate-key** **(requires restart)** |
+| backup_dir | string | Where scheduled backups go, as **--backup-dir** **(requires restart)** |
+| backup_every | number | Seconds between backups, as **--backup-every** **(requires restart)** |
+| backup_keep | number | Backups kept, as **--backup-keep** **(requires restart)** |
+
+**Cache fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| persistent_path | string | Persistence file path |
+| persistent_interval | number | Journal flush cadence in seconds (0 = no journal) **(requires restart)** |
+| cache_mode | string | "readonly", "readwrite", or "admin" |
+| resp_forced | bool | Force RESP2 protocol **(requires restart)** |
+| replicate_target | string | Leader host:port **(requires restart)** |
+| max_memory | number | Max memory in bytes (0 = unlimited) |
+| eviction | string | "noeviction", "allkeys-lru", "allkeys-random" |
+
+**Example JSON (server):**
+
+```
+{
+    "name": "api",
+    "id": "a1b2c3",
+    "type": "server",
+    "port": 9000,
+    "was_running": true,
+    "lua_script": "/home/user/handler.lua",
+    "max_connections": 100,
+    "rate_limit": 1000,
+    "mode": "inout"
+}
+```
+
+##### `settings [-a|--all] [-j|--json]`
+
+Lists every **SOCKETLEY_*** setting as the daemon and the processes it starts see it. For each setting, it shows the value, where the value came from, and what the setting is for. The value comes from the daemon's environment, from the **settings** table of its configuration file (see **Daemon Configuration**), or from the default.
+
+The plain listing holds the knobs an operator may turn. **--all** adds the test suite's hooks, the variables a command reads from its own environment, and the ones the daemon sets for what it starts. A **FOR** column marks each of these. **--json** prints the same rows as an array of objects with **name**, **env**, **value**, **from**, **for** and **meaning**. Every variable under **ENVIRONMENT** is one row.
+
+##### `dashboard`
+
+Prints the URL of the built-in web dashboard. It requires **daemon.metrics_port** to be set in the daemon configuration file (see **Daemon Configuration**). The dashboard gives a live view of all runtimes, connections, and throughput.
+
+The dashboard listens on loopback. It answers 403 to a request whose Host is not this machine's, so a page whose name was rebound to 127.0.0.1 reads nothing. A request that carries **Via**, which no page can set, comes from a proxy and is served whatever its Host. So a proxy with **--domain** and **--auth** can put the dashboard on the internet. Its pages are never framed, sniffed, cached or named in a Referer. Example output:
+
+```
+Dashboard: http://localhost:9100/
+```
+
+##### `ls [--json | -j | --format json] [--silent | -s] [columns]`
+
+Lists all runtimes, in every state. The output is Docker-style, with the columns ID, NAME, TYPE, PORT, CONN (connections), OWNED BY, STATUS, CREATED, GROUP. With **--json** or **--format json**, it outputs a JSON array of runtime objects. With **--silent** or **-s**, it prints only runtime names (one per line).
+
+For a running runtime, the STATUS column shows its uptime, followed by up to two notes when they apply. **(***N* **restarts)** means the daemon found the worker dead and forked a replacement that many times. The uptime is the replacement's. A runtime that holds state in memory, above all a cache, lost that state at every restart. The JSON form reports the same number in **restarts**.
+
+**NOT RESPONDING** means the worker process is alive but has said nothing for fifteen seconds while using at least half a core. A worker publishes on every completion, so one doing any work at all is heard from within a quarter second. Silence means the worker is either idle, which costs no CPU, or stuck inside a callback, which costs a core. Only the second case is reported, and it is only reported: nothing is killed. A script that deliberately computes for a long time looks the same from outside the process. A worker that is stuck without using CPU (blocked rather than spinning) looks like an idle one and is not reported.
+
+The JSON form has a **listen** field beside **port**. It is empty for an ordinary runtime, and **unix:***/path/to.sock* for a server started with **--listen**. The PORT column shows **-** for such a runtime, since it has no port.
+
+When more than one daemon is running, a line under the table says how many there are and which one answered. The line appears even when the table is empty, because a listing from the wrong daemon looks exactly like an idle machine. It is printed only for the default table. **--json**, **-s** and the column selectors are what scripts read, and they carry nothing extra. **ps** does the same.
+
+**Column selectors** — pass one or more to show only those columns: **--id**, **--name**, **--type**, **--port**, **--status**, **--conn**, **--owner**, **--created**, **--group**.
+
+##### `ps [-a | --all] [--json | -j | --format json] [--silent | -s] [columns]`
+
+Lists only running runtimes, in the same format as **ls**. With **--json**, it outputs a JSON array (with an uptime field). With **--silent** or **-s**, it prints only runtime names (one per line).
+
+A runtime that did not come up is in state **failed**, and **ps** does not list it. So a runtime that failed to start produces no row here, and if nothing else is running, there is no output at all. That is the state to look for when something did not start, so look for it with **ps -a** or **ls**.
+
+**-a**, **--all** 
+ Lists runtimes in every state, not only **running**. The STATUS column then shows the state (**Created**, **Stopped**, **Failed**) instead of an uptime, and **--json** reports it in the **status** field. Bare **ps** is unchanged, so anything that parses it still sees only running runtimes.
+
+**Column selectors:** **--id**, **--name**, **--type**, **--port**, **--uptime** (or **--status**), **--conn**, **--owner**, **--created**.
+
+**--status** and **--uptime** are two names for one column, headed **UPTIME**. It holds the uptime for a running runtime and the state (**Created**, **Stopped**, **Failed**) for anything else. So under **-a**, a row can read **Failed** beneath a header saying **UPTIME**. **ls** heads the same column **STATUS**; **ps** keeps its header because scripts select on it.
+
+##### `owner name`
+
+Shows ownership information for a runtime: its parent's name, its children, and its on_parent_stop policy (stop or remove).
+
+##### `cluster [subcommand]`
+
+Inspects the cluster. It requires a running daemon with cluster mode enabled (via **daemon --name** + **daemon --cluster**). The command reads the cluster directory from the daemon automatically.
+
+##### `ls`
+
+Lists all daemons in the cluster, with their runtime counts and heartbeat status.
+
+##### `ps`
+
+Lists all runtimes across the entire cluster.
+
+##### `group name`
+
+Shows all members of a group across the cluster.
+
+##### `show daemon-name`
+
+Prints a daemon's raw cluster JSON file.
+
+##### `stats`
+
+Shows a cluster summary: daemon counts, runtime totals and group membership.
+
+##### `watch`
+
+Refreshes the cluster view every 2 seconds until Ctrl+C.
+
+##### `ping`
+
+Asks the daemon to identify itself. It prints **socketley-daemon** *version pid dev***:***ino path* for the daemon serving the socket. The last two fields name the executable the daemon is running: its device and inode, and its */proc/self/exe* link. The link carries **(deleted)** once the file the daemon was started from has been replaced. The path comes last because a path may contain spaces. A daemon built before those fields existed answers with the version and pid alone, and is not treated as a different build because of it.
+
+Every command runs this check first, before it sends anything. A **connect**(2) that succeeds only proves that something is listening on the path, not that it is a daemon. A command written to a stranger is a command delivered to a stranger. A path held by something that does not answer this check is refused, and nothing is sent to it.
+
+##### `help | --help | -h`
+
+Prints help; what it prints depends on where the output goes.
+
+On a **terminal**, it opens the interactive browser. The browser is a menu, not a page: you move through it by number, and it takes no topic argument, because everything is behind the menu.
+
+Anywhere else, such as a pipe, a redirect or a CI step, it prints a plain-text summary of the commands and exits **0**. It opens the browser only when both standard input and standard output are terminals. There is no flag, because **socketley --help** is what a person types either way, and only the destination differs. A menu drawn into a pipe is a menu nobody can answer.
+
+It does not require or start a daemon. The browser is *man/socketley-help.sh* under the source tree the binary was built in, and */usr/share/socketley/socketley-help.sh* otherwise. The nearest one wins, so a binary built in a tree prints that tree's help rather than an installed copy from another version. If neither is readable, the command says so and exits 2: the installation is at fault, not the input. This page is the reference and the browser is the tour. They cover the same ground and are kept in step with each other.
+
+##### `version | --version | -v`
+
+Prints the socketley version number and exits. It does not require or start a daemon. Standard output is the version number in every case. Anything about the daemon on the socket goes to standard error, so **$(socketley version)** is unaffected by it.
+
+Two things are reported there. The first is a daemon whose version differs. The second is a daemon still executing a file that has since been replaced at the path it was started from. The version alone cannot show that, because it is one compile-time literal that every build of a release carries. The second case is what ordinarily happens when you rebuild while a daemon holds its runtimes. It is also why a daemon reporting the same version as the binary can reject a new flag that the binary has.
+
+The replaced file is reported only when the daemon and this CLI name the same executable path. Running the CLI from a copy elsewhere on disk reports nothing. A copy is not evidence about anybody's build, and comparing inodes across different paths would report a replaced file on every command.
+
+##### `--lua lua_file`
+
+Loads a Lua orchestration configuration. It can configure the daemon name and cluster mode, and then creates multiple runtimes from a single config file.
+
+##### `Older forms`
+
+These are the command forms from before the runtime name came first. They are kept so that existing scripts go on working.
+
+##### `db-backup db file`
+
+The same as *db* **backup** *file*.
+
+##### `db-restore db file`
+
+The same as *db* **restore** *file*.
+
+##### `db-query db collection`
+
+The same as *db* **query** *collection*.
+
+##### `mqtt-pub mqtt`
+
+The same as *mqtt* **pub**. Likewise, **mqtt-sub**, **mqtt-sessions**, **mqtt-kick** and **mqtt-retained** are its **sub**, **sessions**, **kick** and **retained**, and **mqtt-passwd** is **mqtt passwd**.
+
+##### `mqtt-sub mqtt` / `mqtt-sessions mqtt` / `mqtt-kick mqtt` / `mqtt-retained mqtt` / `mqtt-passwd file`
+
+Older forms of the mqtt verbs, as above.
+
+##### `idp-user idp`
+
+The same as *idp* **user**. Likewise, **idp-ssh** *idp* **ca** is *idp* **ssh-ca**.
+
+##### `idp-ssh idp`
+
+An older form, as above.
+
+##### `dnssec dns`
+
+The same as *dns* **dnssec**.
+
+##### `tunnel edge invite`
+
+This form, with **set**, **list**, **shares** or **revoke**, is the same as *edge* **invite**.
+
+##### `metrics metrics verb`
+
+The same as *metrics* **verb**.
+
+##### `mail [mail] verb`
+
+The same as *mail* **verb**. Without a name, it uses the daemon's only mail runtime.
+
+##### `send mail --to ...`
+
+The same as *mail* **send**.
+
+## Exit status
+
+#### `0`
+
+Success.
+
+#### `1`
+
+An error, such as an invalid command, a runtime that was not found, or a rejected TLS flag.
+
+#### `2`
+
+A fatal error.

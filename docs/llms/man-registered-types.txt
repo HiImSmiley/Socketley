@@ -1,0 +1,27 @@
+# Registered types
+
+From the manual page socketley(1).
+
+A runtime type beyond the built-in fourteen is delivered as a manifest plus a worker binary. The manifest is a declarative file, never code. From it, the daemon learns the type's name, its worker executable and the schema of its configuration keys. The behaviour lives in the binary, which the daemon forks and execs exactly as it does its own workers. No third-party code ever runs in the daemon's process.
+
+The daemon reads manifests at startup. A system daemon reads **/etc/socketley/types/*.toml**, and a development daemon reads **~/.config/socketley/types/*.toml**:
+
+```
+name = "greeter"
+exec = "/usr/local/lib/socketley/greeter-worker"
+manifest_version = 1
+
+[config.greeting]
+kind = "string"        # string | int | bool | enum
+required = true
+
+[config.repeat]
+kind = "int"
+default = "1"
+```
+
+Each **[config.***key***]** section becomes a **--***key* flag on **create** and **edit**. Its value is validated against its kind and stored under an **extra** object in the state file. **show** prints that object, and **import** accepts it. A key that the manifest does not declare is refused by name, exactly as a misspelled built-in flag is. A required key must be given at **create**. A declared default is filled in when the key is omitted. An edit takes effect at the next start, because the worker reads its configuration only once, when it is spawned.
+
+The worker binary is built with the SDK's **<socketley/worker.h>**. It calls **register_type** with a factory for the type, then **run(argc, argv)**. It speaks the same versioned control-socket protocol as the daemon's own workers. It therefore survives daemon upgrades that do not change frame meanings. A worked example is in **sdk/examples/custom-type/**.
+
+A runtime's Lua script cannot create a registered type. If a state file's type has no manifest at the next boot, the daemon leaves the file on disk and does not restore the runtime. The daemon log gives the reason.

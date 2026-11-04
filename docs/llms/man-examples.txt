@@ -1,0 +1,350 @@
+# Examples
+
+From the manual page socketley(1).
+
+Create a simple server (on an installed system, systemd manages the daemon):
+
+```
+socketley create server myserver -p 9000 -s
+```
+
+Create a client that connects to the server:
+
+```
+socketley create client myclient -t 127.0.0.1:9000 -s
+```
+
+Create an HTTP proxy with load balancing:
+
+```
+socketley create proxy gateway -p 8080 \
+    --backend 127.0.0.1:9001,127.0.0.1:9002 \
+    --strategy round-robin -s
+```
+
+Create a server with bash output (messages go to stdout):
+
+```
+socketley create server echo -p 9000 -b -s
+# With timestamp and prefix:
+socketley create server echo -p 9000 -bpt -s
+```
+
+Send a message to a runtime:
+
+```
+socketley send myserver "Hello from CLI"
+socketley send myclient "Message to server"
+```
+
+Create a persistent cache with a memory limit:
+
+```
+socketley create cache store -p 9000 \
+    --persistent /data/cache.bin \
+    --maxmemory 256M --eviction allkeys-lru -s
+```
+
+Create a cache in RESP mode (Redis-compatible):
+
+```
+socketley create cache redis-compat -p 6379 --resp -s
+redis-cli -p 6379 SET mykey myval
+redis-cli -p 6379 GET mykey
+```
+
+Create a server with a connection limit and rate limiting:
+
+```
+socketley create server api -p 9000 \
+    --max-connections 100 --rate-limit 1000 -s
+```
+
+View runtime statistics:
+
+```
+socketley stats myserver
+# Output: name, type, port, connections, total_messages, bytes_in/out, ...
+```
+
+Restart a running runtime:
+
+```
+socketley reload myserver
+# Stops and restarts the runtime
+socketley reload *
+# Restarts all running runtimes
+```
+
+Hot-reload a Lua script:
+
+```
+socketley reload-lua myserver
+# Re-loads the Lua script without stopping the runtime
+socketley reload-lua *
+# Hot-reloads Lua on all runtimes with scripts
+```
+
+Start, stop or remove all runtimes:
+
+```
+socketley start *
+# Starts all non-running runtimes
+socketley stop *
+# Stops all running runtimes
+socketley remove *
+# Stops all and removes everything
+```
+
+Multiple names and glob patterns:
+
+```
+socketley stop myserver myclient
+# Stops both runtimes
+socketley stop my*
+# Stops all runtimes starting with "my"
+socketley stats cache?
+# Shows stats for cache1, cache2, etc.
+socketley start myserver cache*
+# Starts myserver and all cache-prefixed runtimes
+socketley remove api-* test-*
+# Removes all api- and test- prefixed runtimes
+```
+
+Interactive mode (live terminal session):
+
+```
+# Start server and enter interactive session
+socketley create server echo -p 9000
+socketley start echo -i
+# Type messages to broadcast, see received messages
+# Press Ctrl+C to detach (server keeps running)
+
+# Attach to already-running cache
+socketley start mycache -i
+# Type cache commands: set foo bar, get foo, etc.
+```
+
+Edit interactively (opens the JSON configuration in $EDITOR):
+
+```
+socketley edit myserver           # Opens config in editor
+socketley edit myserver -r        # Opens editor, auto-reloads Lua after save
+socketley edit myserver -p 9001   # Flag-based edit (direct)
+```
+
+Cache replication (leader-follower):
+
+```
+socketley create cache leader -p 9000 -s
+socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s
+```
+
+Encrypted server. The listener terminates TLS itself. Everything above it (line protocol, HTTP, WebSocket, RESP) runs on the decrypted stream, so this one runtime serves **https://** and **wss://** on the same port:
+
+```
+socketley create server secure -p 9443 \
+    --tls --cert server.pem --key server-key.pem -s
+curl --cacert server.pem https://localhost:9443/
+```
+
+Mutual TLS, where a client must present a certificate signed by the given CA:
+
+```
+socketley create server mtls -p 9443 \
+    --tls --cert server.pem --key server-key.pem \
+    --ca trusted-clients.pem -s
+```
+
+Renewing a certificate: the files are read at start, so **reload** picks up a new one.
+
+```
+socketley reload secure
+```
+
+An incomplete configuration is refused rather than served in the clear:
+
+```
+socketley create server oops -p 9443 --tls --cert server.pem
+# --tls: a TLS listener needs --key <file> to go with --cert
+# exit status 1
+```
+
+Encrypted client. The client mirrors the listener above: one flag turns TLS on. The client verifies the peer in two ways: the chain against the trust store, and the certificate against the host in **-t**.
+
+```
+# verify against the system trust store
+socketley create client feed -t events.example.com:9443 --tls -s
+
+# verify against a private CA instead
+socketley create client feed -t 10.0.0.7:9443 \
+    --tls --ca internal-ca.pem -s
+
+# and present a certificate of our own, for a peer that demands one
+socketley create client feed -t 10.0.0.7:9443 \
+    --tls --ca internal-ca.pem \
+    --cert client.pem --key client-key.pem -s
+```
+
+If the peer's certificate does not verify, the client closes the socket. It re-dials on its backoff and never falls back to cleartext. There is no skip-verify flag. Encryption without verification protects against somebody recording the wire, but not at all against somebody sitting on it, and from the outside the two look identical.
+
+The same rules apply as on the listener. Half a certificate pair is refused, and a trust store without **--tls** is refused. **reload** installs a renewed client certificate:
+
+```
+socketley create client bad -t host:9443 --tls --cert client.pem
+# --cert: needs --key <file> as well -- a certificate with no key
+# presents nothing
+# exit status 1
+```
+
+Graceful shutdown (drain pending writes):
+
+```
+socketley create server api -p 9000 --drain -s
+socketley stop api   # Flushes write queues before closing
+```
+
+UDP server (fire-and-forget messaging):
+
+```
+socketley create server stats -p 9000 --udp -b -s
+echo "cpu.load 0.42" | socat - UDP:localhost:9000
+```
+
+UDP client:
+
+```
+socketley create client udpcli -t 127.0.0.1:9000 --udp -s
+```
+
+Create a read-only cache (for shared lookups):
+
+```
+socketley create cache lookup -p 9000 --mode readonly -s
+```
+
+Master mode server (one controller, many viewers):
+
+```
+socketley create server broadcast -p 9000 \
+    --mode master --master-pw secret -s
+# Client A: sends "master secret" -> "master: ok"
+# Client A: sends "hello" -> broadcast to all others
+# Client B: sends "hello" -> silently dropped
+```
+
+Master mode with forwarding:
+
+```
+socketley create server ctrl -p 9000 \
+    --mode master --master-pw admin123 --send-to master -s
+# Non-master messages forwarded to master as "[<fd>] msg"
+```
+
+WebSocket server (auto-detected, no flags needed):
+
+```
+socketley create server ws -p 9000 -s
+# Browser: new WebSocket("ws://localhost:9000")
+# Raw TCP clients also work on the same port
+```
+
+Cache access through a server:
+
+```
+socketley create cache db -p 9001 -s
+socketley create server api -p 9000 --cache db -s
+# Client sends: "cache set user:1 alice" -> "ok"
+# Client sends: "cache get user:1" -> "alice"
+# Client sends: "hello" -> broadcast as usual
+```
+
+Dynamic proxy with group-based backend discovery:
+
+```
+socketley create server api1 -p 9001 -g api -s
+socketley create server api2 -p 9002 -g api -s
+socketley create proxy gw -p 8080 --backend @api -s
+# Proxy routes to all running members of group "api"
+
+# Add a new member dynamically (no proxy restart needed)
+socketley create server api3 -p 9003 -g api -s
+
+# Mix group and direct backends
+socketley create proxy gw2 -p 8081 \
+    --backend @api,10.0.0.5:9000 -s
+```
+
+Lua HTTP worker (auto-detected, no flags needed):
+
+```
+socketley create server api -p 9000 --lua handler.lua -s
+# handler.lua:
+# function on_http_request(req)
+#     return {status=200, headers={["Content-Type"]="application/json"},
+#             body='{"hello":"world"}'}
+# end
+# curl http://localhost:9000/api
+```
+
+Sidecar proxy with health checks and circuit breaker:
+
+```
+socketley create proxy sidecar -p 8080 --sidecar \
+    --backend 127.0.0.1:3000 -s
+```
+
+Proxy with HTTP health checks and retries:
+
+```
+socketley create proxy gateway -p 8080 \
+    --backend 10.0.0.1:9000,10.0.0.2:9000 \
+    --health-check http --health-path /ready \
+    --health-interval 10 --health-threshold 5 \
+    --retry 3 --circuit-threshold 10 -s
+```
+
+Proxy with mTLS on both legs. The listener terminates TLS and demands a certificate from its callers. The backend leg dials TLS, verifies the chain and the endpoint's name, and presents a certificate of its own:
+
+```
+socketley create proxy secure -p 8443 \
+    --tls --cert proxy.pem --key proxy-key.pem \
+    --client-ca trusted-clients.pem \
+    --client-cert backend-client.pem --client-key backend-client-key.pem \
+    --ca mesh-ca.pem \
+    --backend https://10.0.0.1:9000 -s
+# Backend connections are pooled with their sessions: a handshake per
+# idle period, not per request.
+# --health-check http probes over TLS and verifies the backend too.
+```
+
+TLS to the backend only. The proxy listens in cleartext on loopback and encrypts the hop that leaves the machine:
+
+```
+socketley create proxy egress -p 8080 \
+    --backend https://api.example.com -s
+# Verified against the system CA store, name checked against the certificate.
+# A private CA goes in --ca; there is no way to skip verification.
+```
+
+Open the live dashboard:
+
+```
+socketley dashboard
+# Dashboard: http://localhost:9100/
+# Open in browser for live runtime view
+```
+
+Query the dashboard API:
+
+```
+curl http://localhost:9100/api/overview
+curl http://localhost:9100/api/runtimes
+curl http://localhost:9100/api/runtime/myserver
+```
+
+Load a complex configuration from a Lua file:
+
+```
+socketley --lua /etc/socketley/setup.lua
+```

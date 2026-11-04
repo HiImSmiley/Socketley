@@ -1,0 +1,440 @@
+# All flags
+
+Every flag of every runtime type, with the types that take it.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
+| `-s` |  | Start now: Start it as soon as it is made. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
+| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. Types: server, client, proxy, cache, storage, dns, mqtt, mail. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. Types: server, client, proxy, cache, storage, mqtt, mail, mcp. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp. |
+| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. Types: server, proxy, cache, storage. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. Types: server, proxy, cache, storage, dns, idp, db, mqtt, mail, mcp. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. Types: server, proxy, cache, storage, idp, db, mail, tunnel, metrics, mcp. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, metrics, mcp. |
+
+**TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. Types: server, client, proxy, cache, storage, mqtt, mail. |
+| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. Types: server, client, proxy, cache, storage, mqtt, mail. |
+| `--key` | path | Key: The PEM key of the certificate. Types: server, client, proxy, cache, storage, mqtt, mail. |
+| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. Types: server, client, proxy, cache, storage, mqtt. |
+| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. Types: server, proxy, cache, storage. |
+| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. Types: server, proxy, cache, storage. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. Types: server, proxy, cache, storage, idp, db, mqtt, mail, mcp. |
+| `--rate-limit` | int | Rate limit: Messages a second per connection. Types: server, proxy, cache. |
+| `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. Types: server, proxy, cache. |
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. Types: server, proxy, cache, storage. |
+| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. Types: server, proxy, cache, storage. |
+| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. Types: server, client, proxy, cache, storage. |
+| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. Types: server, client, proxy, cache, storage, mqtt. |
+| `--drain` |  | Drain on stop: Finish what is in flight before stopping. Types: server, proxy, cache, storage. |
+| `--reconnect` | int | Reconnect: Reconnect with backoff when the connection drops: the most attempts, 0 for no limit. Types: client. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. Types: server, client, proxy, cache, storage, dns, mqtt, mail, tunnel, metrics, mcp. |
+| `-w` | path | Message file: A file every received message is written to. Types: server, client. |
+| `-b` |  | Print messages: Print every received message. Types: server, client. |
+| `-bp` |  | …with name: Print them with the runtime's name before each. Types: server, client. |
+| `-bt` |  | …with time: Print them with the time before each. Types: server, client. |
+| `-bpt` (-btp) |  | …with time and name: Print them with the time and the name before each. Types: server, client. |
+
+**Server**
+
+| flag | value | what it does |
+|---|---|---|
+| `--mode` | one of inout, in, out, master | Mode: Who talks: both ways, in only, out only, or one master broadcasting. Types: server. |
+| `--send-to` | list | Answer to: Who the built-in path answers: sender, others, master. Types: server. |
+| `--udp` |  | UDP: Datagrams instead of a stream. Types: server, client. |
+| `--http` | path | Static files: Serve this directory over HTTP. Types: server. |
+| `--http-cache` |  | Files in memory: Read the static files into memory at start. Types: server. |
+| `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. Types: server, proxy. |
+| `--master-pw` | text | Master password: The password that claims master mode. Types: server. |
+| `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. Types: server. |
+| `--cache` | text | Cache: A cache runtime its scripts and clients use. Types: server. |
+| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it; * for any. Types: server. |
+| `-u` (--upstream) | list | Upstreams: Servers it relays to, host:port each. Types: server. |
+
+**Client**
+
+| flag | value | what it does |
+|---|---|---|
+| `-t` | text | Target: The server it connects to, host:port. Types: client. |
+| `--mode` | one of inout, in, out | Mode: Both ways, receive only or send only. Types: client. |
+
+**Proxy**
+
+| flag | value | what it does |
+|---|---|---|
+| `--backend` | list | Backends: Where requests go: host:port, https://host, unix:/path, a runtime or @group. None makes it the entrance. Types: proxy. |
+| `--protocol` | one of http, tcp | Protocol: HTTP routes by path and name; TCP forwards bytes. Types: proxy. |
+| `--strategy` | one of round-robin, random, lua | Strategy: How a backend is picked. Types: proxy. |
+| `--auth` | text | Auth: Who may pass: bearer:<file of tokens> or basic:<credentials file>. Types: proxy. |
+| `--redirect-https` | text | Redirect to HTTPS: Answer every request with a redirect to HTTPS on this port (443 when empty). Types: proxy. |
+| `--backend-timeout` | duration | Backend timeout: How long a backend may take to begin its answer, 2s unless given; 0 waits for ever. Types: proxy. |
+| `--retry` | int | Retries: Try a failed request this many times on the next backend. Types: proxy. |
+| `--retry-all` |  | Retry POST too: Also retry requests that are not idempotent. Types: proxy. |
+
+**Health**
+
+| flag | value | what it does |
+|---|---|---|
+| `--health-check` | one of tcp, http | Health check: Check the backends by connecting, or by asking a path. Types: proxy. |
+| `--health-interval` | duration | Every: Time between two checks. Types: proxy. |
+| `--health-path` | text | Path: The path an HTTP check asks. Types: proxy. |
+| `--health-threshold` | int | Failures: Failed checks before a backend is out. Types: proxy. |
+| `--circuit-threshold` | int | Circuit after: Errors in a row that take a backend out. Types: proxy. |
+| `--circuit-timeout` | duration | Circuit open for: How long a backend stays out before it is tried again. Types: proxy. |
+| `--sidecar` |  | Sidecar: Health checks, circuit breaker, retries and drain in one. Types: proxy. |
+
+**FastCGI**
+
+| flag | value | what it does |
+|---|---|---|
+| `--root` | path | Document root: The directory of a fastcgi:// backend's scripts: a .php file under it is run, a path with no file goes to the index script. Types: proxy. |
+| `--fastcgi-root` | path | Server's root: The same directory as the application server sees it, when that is another path (a container). Types: proxy. |
+| `--index` | text | Index script: The script that directories and paths with no file go to; index.php unless given. Types: proxy. |
+
+**Proxy TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--client-ca` | path | Client CA: Clients must present a certificate signed by this CA. Types: proxy. |
+| `--client-cert` | path | Backend certificate: The certificate it presents to TLS backends. Types: proxy. |
+| `--client-key` | path | Backend key: That certificate's key. Types: proxy. |
+
+**Cache**
+
+| flag | value | what it does |
+|---|---|---|
+| `--mode` | one of readonly, readwrite, admin | Access: What its clients may do: read, read and write, or everything. Types: cache. |
+| `--persistent` | path | Persist to: The file it is kept in across restarts. Types: cache. |
+| `--persistent-interval` | duration | Journal every: How often accepted writes reach the journal. Types: cache. |
+| `--maxmemory` | size | Max memory: The most memory its data may take. Types: cache. |
+| `--eviction` | one of noeviction, allkeys-lru, allkeys-random | When full: Refuse writes, or evict keys. Types: cache. |
+| `--resp` |  | Redis protocol only: Speak RESP to every client, without detecting it. Types: cache. |
+| `--replicate` | text | Follow: The leader cache it follows, host:port. Types: cache. |
+| `--public` |  | Public: Serve clients on other machines too. Types: cache. |
+| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard. Types: cache. |
+
+**Storage**
+
+| flag | value | what it does |
+|---|---|---|
+| `--dir` | path | Directory: Where the buckets live. Required. Types: storage. |
+| `--credentials` | path | Credentials: A file of access:secret pairs and [users], read again when it changes. Types: storage. |
+| `--access-key` | text | Access key: One access key, when there is no credentials file. Types: storage. |
+| `--secret-key` | text | Secret key: Its secret. Types: storage. |
+| `--anonymous` |  | Anonymous: Let in requests without credentials, as policies allow. Types: storage. |
+| `--website-domain` | list | Website names: Names buckets' websites are reached under. Types: storage. |
+| `--tls-offloaded` | list | TLS proxies: Proxies that end TLS in front of it, whose X-Forwarded-For names the client. Types: storage. |
+| `--max-bytes` | size | Quota: The most bytes it holds. Types: storage. |
+
+**Durability**
+
+| flag | value | what it does |
+|---|---|---|
+| `--fsync` | one of always, interval, never | Sync to disk: When an answered write is on the disk. Types: storage. |
+| `--fsync-interval` | duration | Sync every: How often --fsync interval syncs to disk. Types: storage. |
+| `--scrub` | duration | Scrub every: Read every object back once in this long and check it; never unless given. Types: storage. |
+| `--compress` | duration | Compress after: Compress a version once it has not been written for this long; off unless given. Types: storage. |
+| `--mpu-expire` | duration | Abort uploads after: Abort a multipart upload open this long; never unless given. Types: storage. |
+
+**Storage extras**
+
+| flag | value | what it does |
+|---|---|---|
+| `--sse-key-file` | path | Encryption key: The 32-byte master key of server-side encryption. Types: storage. |
+| `--sync` | one of never, active, per-user | Sync runtimes: Runtimes that pull users' git repositories: none, one for all, or one each. Types: storage. |
+| `--acls` |  | ACLs: Accept ACLs on buckets that have no ownership controls; otherwise the bucket owner owns everything. Types: storage. |
+| `--notify-targets` | path | Webhooks: The webhooks event notifications may go to. Types: storage. |
+| `--replication-targets` | path | Replication targets: The S3 endpoints buckets may replicate to. Types: storage. |
+| `--tiers` | path | Tiers: The S3 endpoints lifecycle may move versions to. Types: storage. |
+| `--federation` | path | Federation: The OIDC provider and LDAP directory STS trusts. Types: storage. |
+| `--nodes` | path | Cluster nodes: Make it a node of a storage cluster. Types: storage. |
+
+**DNS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--zone` | list | Zones: Zone names (a file is written) or zone files. Required. Types: dns. |
+| `--publish` | list | Public addresses: The addresses runtimes' names are answered with. Types: dns. |
+| `--proxy` | text | Entrance: The entrance proxy it creates; none for no entrance. Types: dns. |
+| `--proxy-port` | int | Entrance port: The entrance's port; 443 also makes the redirect on 80. Types: dns. |
+| `--transfer` | list | Transfer to: Addresses that may copy the zones (AXFR): secondaries. Types: dns. |
+| `--notify` | list | Notify: Secondaries told of each change. Types: dns. |
+| `--rrl` | int | Rate limit: Response rate limit: answers a second to one network; 0 turns it off. Types: dns. |
+| `--dnssec` |  | DNSSEC: Signs its zones; the parent takes the DS that socketley <name> dnssec prints. Types: dns. |
+
+**Sync**
+
+| flag | value | what it does |
+|---|---|---|
+| `--dir` | path | Directory: The directory whose files are carried. Required. Types: sync. |
+| `--storage` | list | Storage: Where they go: a runtime and a bucket, or a URL and one. Required. Types: sync. |
+| `--mode` | one of out, in, inout | Direction: Direction: out to the storage, in from it, or inout for both. Types: sync. |
+| `--credentials` | path | Credentials: A file holding access_key and secret_key. Required. Types: sync. |
+| `--prefix` | text | Prefix: The key everything is written under, below the bucket. Types: sync. |
+| `--every` | text | Walk every: How often the whole directory is rescanned; never to sync on changes only. Types: sync. |
+| `--exclude` | list | Exclude: Patterns of paths, relative to the directory, that are not synced. Types: sync. |
+
+**Identity**
+
+| flag | value | what it does |
+|---|---|---|
+| `--clients` | path | Clients: The applications that sign users in through it, one per line: id, secret (or -) and redirect addresses. Types: idp. |
+| `--issuer` | text | Issuer: The https address it is reached at; https://<first name> when not given. Types: idp. |
+
+**Storage**
+
+| flag | value | what it does |
+|---|---|---|
+| `--idp` | text | Identity provider: The idp runtime the web interface signs in with; its users are the users of the same name here. Types: storage. |
+
+**Identity**
+
+| flag | value | what it does |
+|---|---|---|
+| `--cookie-domain` | text | Cookie domain: The domain whose names share one sign-in, for a proxy's --auth idp:. Types: idp. |
+
+**Tunnel**
+
+| flag | value | what it does |
+|---|---|---|
+| `--mode` | one of edge, agent | Mode: An edge agents dial out to, or an agent dialling one. Types: tunnel. |
+| `--to` | text | Edge: The edge an agent dials, its https address. Types: tunnel. |
+| `--join` | text | Invitation: What `socketley tunnel <edge> invite` printed, used once to join. Types: tunnel. |
+| `--offer` | list | Offers: What an agent carries the edge's streams to: service=host:port each. Types: tunnel. |
+| `--forward` | list | Forward: Where an edge forwards a signed-in user's stream, as ssh's ProxyCommand needs. Types: tunnel. |
+| `--idp` | text | Identity provider: The idp runtime whose signed-in people may use --forward. Types: tunnel. |
+| `--idp-audience` | list | Audiences: The clients whose access tokens --forward takes. Types: tunnel. |
+
+**Identity**
+
+| flag | value | what it does |
+|---|---|---|
+| `--resources` | list | Resource servers: Resource servers an access token may be issued for, by their https address. With any set, an application may also sign in by the URL of its metadata document. Types: idp. |
+| `--ssh-ca` | int | SSH certificates: Sign SSH certificates for signed-in users, valid for this many hours; off unless given. Types: idp. |
+
+**Database**
+
+| flag | value | what it does |
+|---|---|---|
+| `--schema` | path | Schema: The collections, a line each: name, access (private, owner, shared, public, catalog) and indexed fields. Types: db. |
+| `--keys` | path | Keys: Service keys a backend sends as Authorization: Bearer, one name and secret per line. Types: db. |
+| `--idp` | text | Identity provider: The idp runtime whose accounts own documents and sign in by its cookie or access tokens. Types: db. |
+| `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. Types: db. |
+| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in; * lets any page call it, without the sign-in. Types: db. |
+| `--max-bytes` | size | Quota: The most bytes the documents hold. Types: db. |
+| `--cache` | size | Cache: Memory for the documents read most recently; the rest are read from disk. Types: db. |
+
+**Replication**
+
+| flag | value | what it does |
+|---|---|---|
+| `--replicate` | text | Copy of: The http or https address of the database this one follows; a copy answers reads. Types: db. |
+| `--replicate-key` | path | Its key: A file holding a key of that database. Types: db. |
+
+**Backups**
+
+| flag | value | what it does |
+|---|---|---|
+| `--backup-dir` | path | Backups: The directory backups are written into. Types: db. |
+| `--backup-every` | duration | Back up every: How often a backup is taken. Types: db. |
+| `--backup-keep` | int | Keep: How many backups are kept. Types: db. |
+
+**Sync**
+
+| flag | value | what it does |
+|---|---|---|
+| `--repositories` | path | Repositories: The file a storage writes for a user's own sync runtime, which pulls their git repositories. Types: sync. |
+
+**MCP**
+
+| flag | value | what it does |
+|---|---|---|
+| `--keys` | path | Keys: The keys that may call it, one per line: name and secret, plus admin for a key that may change the daemon. Types: mcp. |
+| `--anonymous` |  | Anonymous: Anyone may call it without a key; only for a port no other machine can reach. Types: mcp. |
+| `--origins` | list | Origins: The web origins a browser may call it from, or * for any. Types: mcp. |
+| `--tools` | one of none, daemon | Daemon tools: This daemon's runtimes as tools: listed and read by every key, started and stopped by an admin's. Types: mcp. |
+| `--instructions` | text | Instructions: What a client is told the server is for. Types: mcp. |
+| `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. Types: mcp. |
+| `--idp-audience` | list | Token clients: The idp's clients whose own access tokens it takes as well. Types: mcp. |
+
+**Metrics**
+
+| flag | value | what it does |
+|---|---|---|
+| `--scrape` | path | Scrape: The targets it scrapes, a line each: name url, then every=, timeout= or labels. Types: metrics. |
+| `--every` | duration | Every: How often a sample is taken; a target's every= takes the place of it. Types: metrics. |
+| `--keep` | duration | Keep: How long the raw samples are kept. Types: metrics. |
+| `--downsample` | text | Tiers: Coarser tiers kept for longer, as step:keep pairs separated by commas, or none. Types: metrics. |
+| `--max-series` | int | Max series: The most series it keeps; a new one past it is refused and counted. Types: metrics. |
+| `--durable` |  | Durable: Log every sample as it comes, so a crash loses none. Types: metrics. |
+| `--no-local` |  | No local feed: Leave this daemon's own series out. Types: metrics. |
+| `--keys` | path | Keys: Service keys Grafana or a script sends as Bearer or Basic, one name and secret per line. Types: metrics. |
+| `--idp` | text | Identity provider: The idp runtime whose sign-ins and access tokens may read it. Types: metrics. |
+| `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes. Types: metrics. |
+
+**Rules**
+
+| flag | value | what it does |
+|---|---|---|
+| `--rules` | path | Rules: Recording and alerting rules laid over the built-in ones, a rule a line. Types: metrics. |
+| `--notify` | list | Notify: Where the daemon's own alerts go: webhook, mail and events, or none. Types: metrics. |
+
+**Logs**
+
+| flag | value | what it does |
+|---|---|---|
+| `--logs` |  | Logs: Keep every line the daemon and its runtimes log, queried with LogQL as Grafana queries Loki. Types: metrics. |
+| `--logs-keep` | duration | Keep logs: How long the log lines are kept. Types: metrics. |
+
+**Metrics**
+
+| flag | value | what it does |
+|---|---|---|
+| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write. Types: metrics. |
+
+**Archive**
+
+| flag | value | what it does |
+|---|---|---|
+| `--archive` | text | Archive: An S3 bucket every finished block is copied to, so it outlives --keep. Types: metrics. |
+| `--archive-credentials` | path | Archive keys: A file with the bucket's access_key and secret_key, in the form sync reads. Types: metrics. |
+
+**MQTT**
+
+| flag | value | what it does |
+|---|---|---|
+| `--users` | path | Users: Password accounts, one user:hash per line, as `socketley mqtt passwd` writes them. Types: mqtt. |
+| `--idp` | text | Identity provider: The idp runtime whose access tokens sign clients in, given as the password. Types: mqtt. |
+| `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. Types: mqtt. |
+| `--acl` | path | Access rules: Who may publish and subscribe to what: user, topic and pattern lines, read again when it changes. Types: mqtt. |
+| `--anonymous` |  | Anonymous: Let clients in without credentials, as the access rules allow. Types: mqtt. |
+| `--routes` | path | Topic rules: Where messages go besides their subscribers: a cache, a db, a storage, a server or another broker. Types: mqtt. |
+| `--ws` | int | WebSocket port: A port browsers reach the broker on over WebSocket. Types: mqtt. |
+| `--persistent` | path | Persist to: The file sessions and retained messages are kept in across restarts; on puts it in the state directory. Types: mqtt. |
+| `--persistent-interval` | duration | Write every: How often what changed reaches that file. Types: mqtt. |
+
+**MQTT limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-packet` | size | Max packet: The largest packet a client may send; 256K unless given. Types: mqtt. |
+| `--session-expiry` | duration | Session expiry: The longest a session outlives its connection; 1d unless given. Types: mqtt. |
+| `--session-queue` | int | Session queue: Messages kept for one session while its client is away; 1000 unless given. Types: mqtt. |
+| `--retained-max` | size | Retained bytes: The most bytes retained messages take; 64M unless given. Types: mqtt. |
+| `--max-sessions` | int | Max sessions: The most sessions it keeps, connected or not; 100000 unless given. Types: mqtt. |
+| `--keepalive-max` | int | Max keep alive: The longest keep alive a client is granted, in seconds; 1200 unless given. Types: mqtt. |
+
+**Mail**
+
+| flag | value | what it does |
+|---|---|---|
+| `--mail-domain` | list | Mail domains: The domains whose mail it takes; the zones of --dns where none is given. Types: mail. |
+| `--dns` | text | DNS runtime: The dns runtime whose zones are its domains, given their MX, SPF, DKIM and DMARC records. Types: mail. |
+| `--hostname` | text | Host name: The name it greets with and its MX records name; mail.<first domain> unless given. Types: mail. |
+| `--no-reply` |  | No-reply sender: Send as no-reply@<domain> where no sender is said, and take no mail to that address. Types: mail. |
+| `--idp` | text | Identity provider: The idp runtime whose users have mailboxes here and sign in to send. Types: mail. |
+| `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. Types: mail. |
+| `--storage` | text | Mailboxes: The storage runtime, and bucket, the mailboxes are kept in. Types: mail. |
+| `--users` | path | Users: Accounts that sign in to send, one user:hash per line, as `socketley mqtt passwd` writes them. Types: mail. |
+| `--aliases` | path | Aliases: Addresses it accepts besides the users', one `address target` per line. Types: mail. |
+| `--relay` | text | Smarthost: Send all mail for elsewhere through this server, smtp[s]://[user:password@]host[:port]. Types: mail. |
+
+**Mail ports**
+
+| flag | value | what it does |
+|---|---|---|
+| `--submission` | int | Submission port: A port users send from with STARTTLS and a password. Types: mail. |
+| `--submissions` | int | Submission over TLS: A port users send from over TLS from the first byte. Types: mail. |
+| `--imap` | int | IMAP port: A port mail clients read the mailboxes on. Types: mail. |
+| `--imaps` | int | IMAP over TLS: A port mail clients read the mailboxes on over TLS. Types: mail. |
+| `--sieve` | int | ManageSieve port: A port users put their Sieve filters on, over STARTTLS. Types: mail. |
+
+**Mail limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--dnsbl` | text | DNS blocklists: Zones listing addresses whose mail is refused when they connect. Types: mail. |
+
+**Mail ports**
+
+| flag | value | what it does |
+|---|---|---|
+| `--pop3` | int | POP3 port: A port mail clients fetch the INBOX on with POP3. Types: mail. |
+| `--pop3s` | int | POP3 over TLS: A port mail clients fetch the INBOX on over TLS. Types: mail. |
+| `--jmap` | int | JMAP port: A port mail clients and web apps read and send mail on with JMAP. Types: mail. |
+| `--web` | int | Webmail port: A port for webmail and JMAP over plain HTTP on 127.0.0.1, which the entrance reaches by --domain. Types: mail. |
+| `--lmtp` | int | LMTP port: A port a mail server on this machine hands mail for the mailboxes to. Types: mail. |
+| `--mta-sts-port` | int | MTA-STS port: An HTTPS port the MTA-STS policy of its domains is served on. Types: mail. |
+
+**Mail limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--greylist` | duration | Greylist delay: Ask a sender, recipient and network seen for the first time to retry after this long. Types: mail. |
+| `--rspamd` | text | Rspamd: The Rspamd a stranger's mail is scored by, http://host:port. Types: mail. |
+
+**Mail**
+
+| flag | value | what it does |
+|---|---|---|
+| `--recipient-delimiter` | text | Subaddress delimiter: What divides a user from a tag, user+tag; none for no tags. Types: mail. |
+| `--reports` |  | Send reports: Send the DMARC and TLS reports other domains ask for. Types: mail. |
+| `--refuse-attachments` | list | Refused attachments: Attachment extensions refused in mail from elsewhere: default for programs, scripts and macro documents, or none. Types: mail. |
+| `--clamav` | text | ClamAV: The clamd every message from elsewhere is scanned by, host:port or its socket. Types: mail. |
+| `--dmarc-policy` | one of none, quarantine, reject | DMARC policy: What its DMARC record asks of mail that fails its checks; quarantine unless given. Types: mail. |
+| `--bimi` | text | BIMI logo: The https URL of its SVG logo, and after a comma its mark certificate's, for the BIMI record. Types: mail. |
+| `--dmarc-rua` | text | DMARC reports to: Where other servers send DMARC reports of its domains: the rua= it publishes. Types: mail. |
+| `--tls-rpt` | text | TLS reports to: Where other servers send TLS reports of its domains (RFC 8460). Types: mail. |
+| `--mta-sts` | text | MTA-STS mode: Publish an MTA-STS policy of this mode for its domains: enforce or testing. Types: mail. |
+
+**Mail limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--default-quota` | size | Default quota: How much a mailbox may hold when its user has no mail_quota of their own. Types: mail. |
+| `--quota-warn` | int | Quota warning: At what percent of the quota a user is warned, once; 0 for never. Types: mail. |
+
+**Mail**
+
+| flag | value | what it does |
+|---|---|---|
+| `--arc-trust` | text | ARC forwarders: Forwarders whose ARC seal lets mail that fails DMARC through. Types: mail. |
+| `--dkim-next` | text | Next DKIM selector: A DKIM key made and published before it signs, for rotation. Types: mail. |
+| `--notify-targets` | path | Event targets: Who is told of each message stored in a mailbox: webhooks and other runtimes, one `name url` per line. Types: mail. |
+
+**Mail limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-size` | size | Max message: The largest message taken; 25M unless given. Types: mail. |
+| `--max-recipients` | int | Max recipients: The most recipients of one message; 100 unless given. Types: mail. |
+| `--autoexpunge` | duration | Empty Junk and Trash: How long a message stays in Junk or Trash before it is gone; never unless given. Types: mail. |
+| `--queue-lifetime` | duration | Queue lifetime: How long a message is tried before it is bounced; 5d unless given. Types: mail. |
+
+**Mail**
+
+| flag | value | what it does |
+|---|---|---|
+| `--dkim-selector` | text | DKIM selector: The selector its DKIM key is published under; skl unless given. Types: mail. |

@@ -1,0 +1,15 @@
+# Daemon flags
+
+From the manual page socketley(1).
+
+These flags configure the running daemon through IPC commands. If no daemon is running, one is started automatically.
+
+Each socket is served by one daemon. While it runs, the daemon holds a lock on the socket's path with **.lock** appended. A second daemon started meanwhile, by hand or by a command's auto-start, waits for the first one to answer and then exits 0. If the lock holder never answers, the second daemon exits 1 after ten seconds.
+
+### `--name name | -n name`
+
+Sets this daemon's identity. Cluster mode requires it. The name can be changed at any time. If cluster mode is active, the daemon republishes its cluster file under the new name and removes the old one.
+
+### `--cluster dir`
+
+Enables cluster mode on the given shared directory. Every 2 seconds, each daemon publishes its runtime state there and scans for peer daemons. Proxy **@group** backends automatically discover runtimes on remote daemons. In Docker Compose, mount a shared volume at this path. The advertised host address is set automatically from **gethostname**(3). Requires **--name** to be set first.

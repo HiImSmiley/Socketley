@@ -1,0 +1,212 @@
+# db runtime
+
+JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups
+
+A **db** keeps JSON documents for applications, such as a game's characters or a shop's orders. Each document belongs to an [idp](rt-idp.txt) account. Nobody writes another account's documents; who may read them is set per collection.
+
+```
+socketley create db data -p 9500 --domain data --idp auth \
+    --schema /etc/socketley/db.schema --keys /etc/socketley/db.keys -s
+socketley data query characters '{"where":{"level":{"gte":5}},"limit":10}'
+```
+
+## What it does
+
+- **Documents over HTTP**: GET, PUT, PATCH, DELETE at `/c/collection/id`, each versioned for safe writes.
+- **Queries**: `POST /c/collection/_query` filters, sorts and pages on the indexes in `--schema`.
+- **Access per collection**: `private`, `owner`, `shared`, `public` or `catalog`; services use `--keys`.
+- **Transactions and changes**: Several writes as one, and a live stream of changes.
+- **Replicas**: `--replicate` keeps a read-only copy of another db.
+- **Backups**: Scheduled with `--backup-dir`, or now with `socketley <db> backup|restore`.
+
+## Works with
+
+Users sign in through an [idp](rt-idp.txt). Pictures and other large files belong in a [storage](rt-storage.txt).
+
+## Flags
+
+Every flag a db runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+
+**Database**
+
+| flag | value | what it does |
+|---|---|---|
+| `--schema` | path | Schema: The collections, a line each: name, access (private, owner, shared, public, catalog) and indexed fields. |
+| `--keys` | path | Keys: Service keys a backend sends as Authorization: Bearer, one name and secret per line. |
+| `--idp` | text | Identity provider: The idp runtime whose accounts own documents and sign in by its cookie or access tokens. |
+| `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. |
+| `--origins` | list | Web origins: Web origins whose pages may call it with the user's sign-in; * lets any page call it, without the sign-in. |
+| `--max-bytes` | size | Quota: The most bytes the documents hold. |
+| `--cache` | size | Cache: Memory for the documents read most recently; the rest are read from disk. |
+
+**Replication**
+
+| flag | value | what it does |
+|---|---|---|
+| `--replicate` | text | Copy of: The http or https address of the database this one follows; a copy answers reads. |
+| `--replicate-key` | path | Its key: A file holding a key of that database. |
+
+**Backups**
+
+| flag | value | what it does |
+|---|---|---|
+| `--backup-dir` | path | Backups: The directory backups are written into. |
+| `--backup-every` | duration | Back up every: How often a backup is taken. |
+| `--backup-keep` | int | Keep: How many backups are kept. |
+
+## Benchmarks
+
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### JSON documents over HTTP
+
+MongoDB 9.0.4, PocketBase 0.40.5, 7 passes, 2026-11-03, socketley c7d4c42b.
+
+| case | socketley | MongoDB | PocketBase | socketley vs MongoDB | socketley vs PocketBase |
+|---|---|---|---|---|---|
+| read one document by id, 64 clients | 666 K req/s (3.49 cores) | 145 K req/s (3.88 cores) | 34 K req/s (3.86 cores) | 4.56× (4.43–4.73) | 19.65× (19.22–19.95) |
+| replace one document, 64 clients | 112 K req/s (2.92 cores) | 101 K req/s (3.94 cores) | 11 K req/s (2.72 cores) | 1.10× (1.06–1.14) | 9.93× (9.70–10.13) |
+| query on an indexed field, 64 clients | 472 K req/s (3.60 cores) | 80 K req/s (3.90 cores) | 21 K req/s (3.78 cores) | 5.92× (5.36–6.20) | 22.18× (20.91–23.19) |
+| mixed: 90% reads, 10% writes, 64 clients | 312 K req/s (3.64 cores) | 124 K req/s (3.91 cores) | 38 K req/s (3.60 cores) | 2.51× (2.40–2.65) | 8.23× (7.88–8.79) |
+
+How it was measured: loadgen, 8s a run, 100,000 documents, data on tmpfs; all three on the same four cores (socketley as four shards), loadgen on 20 others. 100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db hands every write to shard 0, so its writes are at most what one shard takes, at more cores; reads and queries spread over all four.
+
+## The manual on db
+
+A **db** runtime keeps JSON documents for applications, such as a game's characters, a shop's orders and addresses, or a user's settings. Each document is owned by an account of an **idp** runtime. An account never writes another account's documents, and each collection's access in **--schema** says who reads them. Large things, such as a picture or a model, belong in a storage, with their address kept here.
+
+```
+socketley create db data -p 9500 --domain data --idp auth \
+    --schema /etc/socketley/db.schema --keys /etc/socketley/db.keys -s
+socketley create db copy -p 9500 --replicate https://data.example.com \
+    --replicate-key /etc/socketley/db.replica-key --keys /etc/socketley/db.keys -s
+```
+
+A document lives at **/c/***collection***/***id***.** **GET** reads it, **PUT** replaces it, **PATCH** changes it in place and **DELETE** removes it. A **POST** to **/c/***collection* makes a new document under a new id. The answer holds the document's fields plus **_id**, **_v** (its version: 1 when made, one more with each change, and also its **ETag**) and **_owner** (the account's id). **If-Match: "3"** writes only at that version, and **If-None-Match: *** writes only where no document exists. Otherwise the answer is 412. A patch looks like **{"set":{"a.b":1},"unset":["c"],"inc":{"n":1},"push":{"tags":"x"},"pull":{"tags":"y"}}** and works on dotted paths.
+
+**POST** */c/***collection***/_query* takes a query such as **{"where":{"level":{"gte":5},"name":"x"},"sort":"-level","limit":50,"skip":0}**. The conditions are eq, ne, gt, gte, lt, lte, in, prefix and exists. **count :true** answers the number alone. The answer is **{"docs":[...]}**, plus **next** when there are more. A range compares a field's values of one kind only, in the order an index uses: null, false, true, numbers, strings. A condition or a sort on a field the schema does not index is judged by reading the documents. The query reads at most 8 MiB of them, unless a key asks for more. Past that, it is refused with 400 **needs_index**: index the field. **POST /tx** takes **{"ops":[{"op":"put","c":..,"id":..,"doc":{..}},{"op":"patch",..,"changes":{..},"if":3},{"op":"insert",..},{"op":"delete",..}]}** and makes every change or none. **GET /me** names who is asking.
+
+A request comes from one of three kinds of caller:
+
+- a key, sent as **Authorization: Bearer** *secret*, which reaches everything;
+- an account of the **--idp** runtime, by its sign-in cookie or by an access token the provider gave one of its clients, sent as **Authorization: Bearer**;
+- nobody.
+
+A write made with the cookie must be **application/json** and come from the database's own host or an origin in **--origins**. A form that another site posts cannot meet that. A document over 1 MiB, or nested deeper than 16 levels, is refused.
+
+The documents live on the disk, in segments under the state directory. Each write is one record, appended to the newest segment. A segment is closed at 64 MiB and another is begun. Memory holds where each document lies, its version, its owner and the values its indexes order it by. Memory also holds a cache of the documents last read (**--cache**). The rest are read from the disk, so a database holds far more than memory.
+
+A read may need a document that the page cache does not hold. Such a read is first tried without it, the document is brought in through the ring, and the read is answered then. So a slow disk holds up that read and not every other. Past three tries, the read waits in line. **stats** counts these reads as **fetched**. Some sealed segments have mostly been written again or deleted. They are merged off the event loop into one segment of their living documents, and the old segments are removed. A record torn by a crash ends the newest segment where the last whole record ends. Damage anywhere else refuses the start, so the database must be restored.
+
+No answer is given before what it rests on is on the disk: a write's own record, or the change a read saw. So nothing is read that a crash could take back. One sync runs at a time, off the event loop. It covers every record written while the previous sync ran. So a burst of writes costs a few syncs rather than one each, and reads go on being answered meanwhile. A read behind a write on one connection is answered after the write. A script of this daemon reaches the documents as **socketley.db**. The runtime serves plain HTTP behind the entrance.
+
+**On several cores.** With **--shards** *N* the database is served by *N* worker processes on its one port (**SO_REUSEPORT**). Shard 0 writes the one log, as a database with one shard does. Every other shard reads that log from the same files, as shard 0 puts it on the disk. Those shards answer reads, queries and streams themselves, and send writes to shard 0. A write is answered once it is on shard 0's disk. Before a shard answers, it takes in what shard 0 has made durable. So a read on any shard sees every write that was answered before the read began. Transactions, unique indexes, streams, replicas and backups hold as they do on one shard. The number of shards may change across a restart, since the documents are one log whatever the number.
+
+Every shard answers reads and queries. Writes wait for one disk, so the shards together take at most as many writes as one shard takes. Writes also cost more cores than on one shard, since each write that reaches another shard is handed on to shard 0, and its answer is handed back. A database that is mostly written is served best by one shard.
+
+**Changes, as they happen.** **GET** */c/***collection***/_feed* is a stream of Server-Sent Events, which a browser reads with **EventSource**. Each change is sent once it is on the disk, numbered by the change. A change is an event **put** with **{"collection":..,"id":..,"owner":..,"version":..,"doc":{..}}** or an event **delete** with **{"collection":..,"id":..,"deleted":true}**. The reader sees only what it may read, as with a query: an account sees its own documents of an owner collection. **GET /_feed** streams the changes of every collection, to a key. A stream that broke resumes from the last change it read, with **Last-Event-ID** (or **?since=**). The database keeps about 32 MiB of changes. A stream resuming from an older change is told **reset** and should read again what it shows. A comment every fifteen seconds keeps a quiet stream from looking dead.
+
+**Documents with a time to go.** A collection whose schema line names **ttl:***field* loses a document once that field's number, in seconds since 1970, has passed. From that moment the document is answered as absent. Its deletion is written and streamed within the minute.
+
+**A copy on another machine.** A db runtime with **--replicate** follows another database's **/_replicate** stream, with a key of that database. It takes every document once, then every change. It writes them to its own disk with each change's own number, so after a restart of either side it goes on where it was. When the source no longer keeps the changes the replica missed, the source sends everything again. A replica answers reads, queries and streams of its own. It refuses writes with 403, naming where to make them. Removing **--replicate** (**import --restart**) makes it a database of its own.
+
+**Backups.** **socketley db-backup** *db file* writes every document into one file, off the event loop, while the database serves. **socketley db-restore** *db file* stops the database, keeps its documents aside in *dir***.before-restore***,* and starts it again on the backup's documents. With **--backup-dir**, a backup is taken every **--backup-every**, and the newest **--backup-keep** backups are kept. A sync runtime can carry that directory to a storage.
+
+#### `--schema file`
+
+The collections, one per line: a name, who reaches it, and the fields indexed. **unique:** before a field marks an index whose values no two documents share.
+
+```
+# collection  access   indexes
+characters    owner    level unique:name
+posts         shared   created
+scores        public   score
+products      catalog  unique:sku price
+sessions      owner    ttl:expires_at
+```
+
+The access is one of these: **private** (and any collection the file does not name): only a key reaches it. **owner**: an account reads and writes its own documents, and another account's documents are answered as not there. **shared**: an account reads every document and writes its own. **public**: anybody reads, and an account writes its own. **catalog**: anybody reads, and a key writes. The file is read again when it changes. If the new file does not read, or a unique index is broken by the documents already there, the previous schema stays, and **stats** says why.
+
+#### `--keys file`
+
+Service keys for backends, one per line: *name secret*. The secret must be at least 16 characters. The file is read again when it changes. A key may set a document's **_owner**.
+
+#### `--idp runtime`
+
+The idp runtime whose accounts own documents.
+
+#### `--idp-audience clients`
+
+The ids of the idp's clients whose access tokens the runtime takes, comma-separated. A token the provider gave any other application is refused, since it belongs to that application and is no key to this runtime. Without the flag no access token is taken, while keys and the sign-in cookie reach it as before.
+
+#### `--origins list`
+
+The web origins a browser may call the database from, comma-separated. They are answered with CORS and the browser's sign-in. * allows any page, without the sign-in.
+
+#### `--max-bytes size`
+
+The most the documents may hold. A write past it is refused with 507.
+
+#### `--cache size`
+
+The memory that holds the documents last read. Default: 64M. The rest are read from the disk.
+
+#### `--replicate url`
+
+The http or https address of the database this one copies, as its entrance answers it. An https address is verified against the system's roots.
+
+#### `--replicate-key file`
+
+A file holding the secret of a key of that database.
+
+#### `--backup-dir dir`
+
+The directory scheduled backups are written to, each as *name***-***time***.dbbackup***.*
+
+#### `--backup-every duration`
+
+How often a scheduled backup is taken. Default: 1d.
+
+#### `--backup-keep n`
+
+How many scheduled backups are kept. Default: 7.
+
+#### `--shards N`
+
+The number of worker processes that serve the database, 1 to 64. Shard 0 writes, and every shard reads (see **On several cores** above). The number can change only while the runtime is stopped.
+
+In a script:
+
+```
+local c, err = socketley.db.get("data", "characters", id)
+socketley.db.put("data", "characters", id, { name = "Merlin", level = 3 }, { ["if"] = c._v })
+socketley.db.patch("data", "characters", id, { inc = { level = 1 } })
+local r = socketley.db.query("data", "scores", { sort = "-score", limit = 10 })
+socketley.db.insert("data", "orders", { item = "sword" })
+socketley.db.delete("data", "orders", id)
+socketley.db.tx("data", { { op = "put", c = "a", id = "x", doc = {} }, { op = "delete", c = "b", id = "y" } })
+```
+
+Each function answers the document (or the transaction's results), or nil, an error code and a sentence. Inside a callback that can wait, the call waits. Anywhere else, the last argument is a function that is called with the answer.

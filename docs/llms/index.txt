@@ -1,0 +1,60 @@
+# socketley
+
+One Linux daemon and CLI that runs your servers, proxies, caches, storage, databases, DNS, sign-in, MQTT, mail, metrics, tunnels and MCP: each a runtime made with one command.
+
+```
+curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
+socketley create cache store -p 6379 -s          # a Redis-compatible cache
+socketley create server api -p 9000 --lua api.lua -s
+socketley create proxy edge -p 8080 --backend api -s
+socketley ls
+```
+
+## What it is
+
+socketley is one binary. As `socketley daemon` it runs **runtimes**: network services, each made with one command and each in its own worker process on an io_uring event loop. Anything else you type is the CLI that talks to that daemon, as `docker` talks to `dockerd`.
+
+A runtime has a type, which decides what it speaks, and a name, by which others reach it (`--backend api`). Every type is created, started and removed the same way.
+
+## The runtimes
+
+- [server](rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path (compared with nginx)
+- [client](rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
+- [proxy](rt-proxy.txt): HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI (compared with HAProxy, nginx)
+- [cache](rt-cache.txt): In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub (compared with Redis, Valkey)
+- [storage](rt-storage.txt): S3 object storage over a directory, with versioning, replication, a web drive and git (compared with MinIO)
+- [db](rt-db.txt): JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups (compared with MongoDB, PocketBase)
+- [dns](rt-dns.txt): Authoritative name server for its zones, over UDP and TCP, with DNSSEC and transfers (compared with NSD, Knot)
+- [idp](rt-idp.txt): OpenID Connect provider with its own accounts, second factors, app passwords and SSH certificates (compared with Keycloak)
+- [mail](rt-mail.txt): Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage
+- [mqtt](rt-mqtt.txt): MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules (compared with Mosquitto)
+- [metrics](rt-metrics.txt): Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs (compared with Prometheus, VictoriaMetrics)
+- [sync](rt-sync.txt): One job that carries a directory to a storage, from it, or both ways (compared with rclone)
+- [tunnel](rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials (compared with frp)
+- [mcp](rt-mcp.txt): A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients
+
+## Benchmarks
+
+Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
+
+- cache: 2.2× against Redis (GET)
+- server: 5.3× against nginx (1 KiB file, keep-alive, 256 connections) (caveat: likely higher on this VM than on hardware; see the notes)
+- proxy: 1.2× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
+- dns: 1.3× against NSD (A queries over UDP)
+- mqtt: 21.2× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
+- storage: 12.0× against MinIO (GET 4 KiB, 4 × 16 connections) (caveat: a floor: the load generator ran out before socketley did)
+- db: 2.5× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
+- tunnel: 0.8× against frp (throughput, 512 MiB echoed through the tunnel)
+- metrics: 2.7× against Prometheus (CPU per sample ingested)
+- idp: 19.9× against Keycloak (refresh token, 64 clients) (caveat: a floor: the load generator ran out before socketley did)
+
+## Where to go next
+
+- [Install](install.txt), then the [ten-minute tour](tour.txt).
+- [How it works](how.txt): what happens, and where, from a command to an answer.
+- [Concepts](concepts.txt): the daemon, names, ports, TLS, shards and the cluster.
+- Reference: [CLI](cli.txt), [all flags](flags.txt), [Lua](lua.txt), the [manual](man.txt). Press `/` to search.
+- [Benchmarks](bench.txt), with the method written down.
+- For scripts and AI tools: every page as plain text in [llms.txt](../llms.txt), or all in one file, [llms-full.txt](../llms-full.txt).
+
+> The reference parts of this site are generated from `man/socketley.1`. When this site and `man socketley` disagree, the manual is right.

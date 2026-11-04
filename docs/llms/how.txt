@@ -1,0 +1,113 @@
+# How it works
+
+What happens, and where, from the command you type to the answer a client gets.
+
+Every fact on this page is from the [manual](man.txt), and each section links the part with the details.
+
+## The pieces
+
+socketley is one binary. Started as `socketley daemon` it is the **daemon**: a supervisor that keeps every runtime alive. Started any other way it is the **CLI**: it sends one command to the daemon over a unix socket (`/run/socketley/socketley.sock` when installed, `/tmp/socketley.sock` in development) and prints the answer.
+
+```
+  you
+   │  socketley create cache store -p 6379 -s
+   ▼  one command over the control socket
+  ┌──────────────────────────────────────┐
+  │ daemon                               │
+  │ checks the flags, saves the runtime, │
+  │ forks a worker and watches it        │
+  └─────┬────────────┬────────────┬──────┘
+        ▼            ▼            ▼
+  ┌──────────┐ ┌──────────┐ ┌──────────┐
+  │ worker   │ │ worker   │ │ worker   │
+  │ server   │ │ cache    │ │ proxy    │
+  │ api      │ │ store    │ │ edge     │
+  │ :9000    │ │ :6379    │ │ :8080    │
+  └──────────┘ └──────────┘ └──────────┘
+  each worker: one process, one io_uring
+  event loop on one thread
+```
+
+- **A runtime** is one network service of one type (server, proxy, cache, storage, …) with a name that is unique on the daemon.
+- **Every runtime you create runs in its own worker process.** The worker binds the port, serves every byte and runs the runtime's Lua script. The daemon keeps a placeholder with the name, port and state, so `ls` and `stats` can answer. [Out-of-process runtimes →](man-limitations.txt)
+- **Opening the control socket is an administrative right**: whoever can open it can run code as the daemon's user. That is why the installed socket belongs to the `socketley` group. [The IPC socket →](man-files.txt)
+
+## What `create` does
+
+1. **The CLI sends the command** to the daemon. A relative path in a flag (a script, a directory) is made absolute first, so it means what it meant in your shell.
+2. **The daemon checks it**: the type, the name, every flag and its value. If a `--lua` script does not parse, `create` refuses it on the spot. `--test` stops here and keeps nothing.
+3. **The daemon saves the runtime** as a JSON file in its state directory. From now on the runtime survives restarts of the daemon and reboots.
+4. **With `-s`, the daemon forks a worker.** The worker binds the port, reads the TLS certificate, resolves its backends and runs the script's top level.
+5. `create` waits for the worker's verdict and tells you through its exit status:
+
+   | Exit | Meaning |
+   |---|---|
+   | `0` | The worker is serving. |
+   | `1` | The worker refused, or could not bind, resolve or load its certificate. The reason is in the daemon's log; the runtime is left `failed`, so `ls` still shows it. |
+   | `2` | No answer within two seconds. The runtime stays supervised; `ls` shows the state it settles on. |
+
+## The path of a request
+
+A client connects to the runtime's port. The worker's event loop reads the bytes and answers them, either with a built-in path (a static file, a cache command, a relayed message) or by calling the runtime's Lua handler. The daemon is not on this path at all.
+
+For a public website, the **entrance** sits in front: one proxy on ports 80 and 443 that a [dns runtime](rt-dns.txt) creates with `--proxy`. It gets certificates itself and routes each request by its host name to the runtime that has that name in `--domain`.
+
+```
+  browser: https://shop.example.com/cart
+   │
+   ▼
+  ┌──────────────────────────────────────┐
+  │ entrance proxy, port 443             │
+  │ TLS with an ACME certificate         │
+  │ shop.example.com → runtime "shop"    │
+  └──────────────────┬───────────────────┘
+                     │ a unix socket beside its
+                     │ port, when it has one
+                     ▼
+  ┌──────────────────────────────────────┐
+  │ worker: server "shop", port 9100     │
+  │ on_http_request(req) in Lua,         │
+  │ or the static files of --http        │
+  └──────────────────────────────────────┘
+```
+
+A proxy that names its backend by runtime name (`--backend shop`) follows the runtime if its port changes. On the same machine it reaches a server or an unsharded cache over an AF_UNIX node beside the port, which only the daemon's user can open. [The node beside the port →](man-common-flags.txt)
+
+## Runtimes talking to each other
+
+A script can reach another runtime: `socketley.send`, `self.route`, or a server's `--cache name`. The first such request between two runtimes goes through the daemon. The daemon then hands both workers the two ends of a private socket pair, and later requests go straight across. If that link ever breaks, requests go through the daemon again; only speed is lost.
+
+`socketley stats name` shows `peer_links`, `peer_direct` and `peer_relayed`. [Between runtimes on one machine →](man-common-flags.txt)
+
+## What is stored where
+
+| What | Installed (package) | Development |
+|---|---|---|
+| Control socket | `/run/socketley/socketley.sock` (0660, group `socketley`) | `/tmp/socketley.sock` (0600) |
+| Runtimes, one JSON file each | `/var/lib/socketley/runtimes/` | `~/.local/share/socketley/runtimes/` |
+| Daemon configuration | `/etc/socketley/config.lua` | `~/.config/socketley/config.lua` |
+| Registered types | `/etc/socketley/types/*.toml` | `~/.config/socketley/types/*.toml` |
+
+A runtime's JSON file holds its flags and whether it was running. It can hold a master password and key paths, so it is readable by the daemon's user alone. A daemon on another socket (`SOCKETLEY_SOCKET`) gets a state directory of its own, and logs which one at startup. [Files →](man-files.txt)
+
+## When something stops or fails
+
+| Event | What happens |
+|---|---|
+| A worker crashes | The daemon restarts it and the runtime stays `running`. Other runtimes release the connections routed to or from it. |
+| It crashes more than five times in ten seconds | The runtime is left `failed` instead of being forked again in a loop. |
+| A Lua callback never returns | Its deadline ends it. [Callback deadline →](man-lua-configuration.txt) |
+| The daemon stops or the machine reboots | On the next start the daemon restores every saved runtime and starts the ones that were running. |
+| You run `stop` | The worker ends; the runtime is kept as `stopped`. With `--drain` it first finishes what is in flight. |
+
+A runtime's state is always one of `created`, `running`, `stopped` or `failed`; `ls` shows it, and a failed runtime shows the reason.
+
+## One thread per worker
+
+A worker serves everything on one event loop, on one thread. That is what makes it cheap, and it has one consequence: a call that waits stops that worker's whole loop. The manual lists the few calls that can; `socketley.http` outside a callback that can wait is the one most scripts meet. [What can stop the event loop →](man-limitations.txt)
+
+To use more cores, `--shards N` runs N workers that share the port. A cache gives each key one owning shard. [Concepts: several cores →](concepts.txt)
+
+## More than one machine
+
+Daemons that share a cluster directory see each other's runtimes, and a proxy's `@group` backend reaches members on every machine. An opt-in Raft mode adds elections and replicas. [Cluster →](cluster.txt)

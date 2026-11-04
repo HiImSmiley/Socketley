@@ -1,0 +1,354 @@
+# Common flags
+
+From the manual page socketley(1).
+
+These flags work with all runtime types:
+
+### `-p port`
+
+Sets the listener port of a server, proxy, cache, storage or dns runtime, or the target port of a client. The form **-p** *address***:***port* also sets **--bind**.
+
+### `--bind address`
+
+The IPv4 address that the listener port binds to. Default: every address, which **0.0.0.0** also means. For example, **127.0.0.1** limits a runtime to clients on the same host, such as a reverse proxy there. The address can be changed while the runtime is stopped, with **edit** or with the **bind** field of **import**, and **ls --json** shows it. A value that is not an IPv4 address is refused when it is given. An address the host does not have makes the start fail.
+
+### `-s`
+
+Starts the runtime immediately after creation.
+
+### `--test`
+
+Checks a create command without creating anything (a dry run). The type, the name and every flag are checked, and then nothing is kept. No runtime appears in **ls**, no state file is written, and the name stays free for the **create** that follows.
+
+The port is not bound. A **--lua** script is loaded, which validates it and runs its top level, but **on_start** is not called, because nothing starts. The result says whether **create** accepts this command line.
+
+### `--log file`
+
+Appends one line per state transition to *file*:
+
+```
+2026-09-10 11:48:22 api created
+2026-09-10 11:48:22 api running
+2026-09-10 11:48:31 api stopped
+```
+
+Each line carries the date as well as the time, because this file outlives a day, unlike the daemon's own log. The file is created with mode 0600 and opened for append, so a restart adds to it instead of replacing it.
+
+The first line records the state the runtime was in when the flag was given. That is why **created** appears at all: a runtime is constructed in that state, before any flag is parsed. So when **edit** gives **--log** to a runtime that is already serving, the file starts with a **running** line. That line marks where the record starts, not a transition anyone made.
+
+The recorded state is the one **ls** reports, which is the daemon's. A runtime lives in its own process, and that process keeps its own copy of the same state. Both carry the path, but only the daemon writes, because two writers would double every line. One visible consequence: when an out-of-process runtime's worker refuses its configuration, the file records **created**, **running** and then **failed**. The **running** line appears because the daemon had requested that state and reported it until the worker answered.
+
+The path must be absolute. A relative path would be resolved against the *daemon's* working directory, which is wherever the daemon was started, or **/** under systemd. It is refused so that the file is never written where the operator would not think to look.
+
+A path that cannot be opened or written is reported once, at **ERROR**, and not again.
+
+### `-w file`
+
+Writes every received message to *file*, one per line, in the exact bytes it arrived in. This is the file counterpart of **-b**, and it is written at the same point in the runtime where the message is counted.
+
+The file is created with mode 0600 on the first message, not at start, so a runtime that receives nothing leaves no file behind. It is opened for append, so a restart adds to it instead of truncating it. Under **--shards** *N* the N workers share one path. An append of this size is atomic on a regular file, so the lines interleave without tearing.
+
+Unlike **-b**, this flag does not scrub control characters from the bytes. The scrubbing exists to stop a peer from driving the operator's terminal with an escape sequence, and a file is not a terminal.
+
+The path must be absolute, for the same reason as with **--log**.
+
+**-w** takes effect on a runtime that is already serving, so **edit** *name* **-w other.log** moves the writing without a restart. A path that cannot be opened or written is reported once, at **ERROR**, and not again. Otherwise a runtime under load would log one line per message.
+
+The files written by **-w** and **--log** stay open once written, so a file that is renamed away keeps receiving lines. Rotate them with logrotate's **copytruncate**.
+
+### `--lua script`
+
+Attaches a Lua configuration script with callbacks. If the script does not load, the command is refused with exit 1. The output gives the reason, not only the fact: the parse error, or the **filters** or **routes** rule that the script broke.
+
+### `-b`
+
+Prints received messages to stdout (bash mode).
+
+### `-bp`
+
+Prints messages with the runtime name as a prefix: [name] message
+
+### `-bt`
+
+Prints messages with a timestamp: [HH:MM:SS] message
+
+### `-bpt , -btp`
+
+Prints messages with both timestamp and prefix: [HH:MM:SS] [name] message. Both spellings are accepted and mean the same thing.
+
+### `--max-connections n`
+
+Limits the number of concurrent connections. New connections beyond the limit are closed immediately. 0 means no limit (default). Alias: **--max-conn**.
+
+### `--read-buffer size`
+
+The most data the runtime accumulates from one connection before it refuses more. Takes a size with K, M or G. Default 1M. This is the inbound counterpart of **--write-buffer**, and like it, every runtime has one.
+
+The largest single value inside the buffer is half the buffer's size, which leaves room for the framing around it. So the default gives a cache a 512K limit on any one value.
+
+Raise it for a cache that holds documents rather than fields. For comparison, Redis's own **proto-max-bulk-len** defaults to 512M, a thousand times this default. Lower it for a runtime facing the open internet, where the buffer is memory that a client controls. Values under 64K are raised to 64K rather than refused. A smaller buffer would make the value limit smaller than an ordinary form post or JSON document needs.
+
+The limit is per connection, and nothing bounds the sum but **--max-connections**, which defaults to 0 (no limit). So the memory to plan for is **--read-buffer** × **--max-connections**. At both defaults that product is unbounded: the only ceiling is the worker's descriptor limit, which is over a million on the test machine. Measured on a cache with 200 connections, a connection that has sent nothing costs about 13 KB. A connection holding an unfinished command costs everything it has sent, up to this buffer. An unfinished command is not a malformed one, and nothing refuses it. Only its size is bounded, and only per connection.
+
+A value larger than the limit is answered with **-ERR value is larger than this cache accepts (limit N bytes)** and the connection is closed. Redis does the same for a bulk length it will not accept: the body was never read, so there is no framed position to continue from. The answer is deliberately not **-ERR protocol error**. The command was framed correctly and only its value was too big, and a client library that is told its framing is broken reconnects and sends the same value again. A length that really does not parse still gets the protocol error.
+
+One measured caveat: the runtime writes the refusal and then closes the connection. If the client is still sending at that moment, it receives an RST, and Linux discards the queued reply. A client that overshoots by up to about two megabytes reads the reason; one that sends eight times the limit does not. If a deployment needs the larger values, raise the limit.
+
+The flag can be changed with **edit** on a running runtime, and the change takes effect at once. The bound is compared on every read and the value limit is derived at each parse, so nothing keeps the old number.
+
+### `--write-buffer size`
+
+The most unsent data the runtime queues for one connection before it drops that connection. Takes a size with K, M or G. Default 8M. Every runtime has a write queue, so this applies to every type. On a client, the queue that fills is the one to a server that has stopped reading.
+
+The queue is per connection, so the bound multiplies with the number of connections:
+
+```
+100 streams        800 MB
+1,000 streams        8 GB     (a box with 11 GiB serves about this many)
+10,000 streams      80 GB     not possible
+```
+
+8M suits a few large transfers. For many concurrent streams it is about sixty times too large; nginx serves ten thousand streams with 32-64 KB each. Measured with 400 sends of 64 KB into a peer that is not reading, a runtime at the default accepts 129 of them, and one at **--write-buffer 256K** accepts 5.
+
+The setting also affects throughput, and the right direction depends on the number of streams. The next table is for a 1 MiB chunked response. It gives microseconds per request above a C baseline that puts the same bytes on the wire with one **write**(2) per chunk:
+
+```
+                8 streams    64 streams    RSS
+128K             +75.7        +139.0        45 MB
+256K             +51.6        +128.1        52 MB
+1M               +17.6        +218.1        74 MB
+8M (default)     +27.3        +234.0       106 MB
+```
+
+A deep queue wins with few streams and loses with many. At 64 streams, lowering the default to **256K** gives 28 per cent more throughput for 22 per cent less CPU per request. At 8 streams the same change costs 24 per cent.
+
+The cause is the CPU cache, not the queue itself. The two settings below run the same code on the same bytes with the same number of copies; only this number differs. The table gives CPU per MiB served at 64 streams. Each profile was taken in the same time window as its rate, so every component is divided within one run:
+
+```
+                total   memmove   kernel copy   page clearing
+8M (default)     315      103          87            29
+256K             254       40          43            30
+```
+
+Both copies halve. The runtime does one **memmove** per byte either way, and the kernel's **_copy_from_iter** does one copy per byte either way, so neither does less work. The bytes are simply closer in cache. On the test machine, L2 is 4 MiB per core and L3 is 16 MiB shared. At 64 streams the default queues up to about 69 MB at once, more than either cache holds, while **256K** queues about 8 MB, which fits. A C baseline that does the same one copy per byte, into a buffer it reuses, spends 29 and 21 on those two components. So once the working set is accounted for, little difference remains.
+
+The sweep also measured **64K** and got a figure within 0.6 to 0.9 per cent of **128K**. That is expected: a value under 128K is raised to 128K, so both runs measured the same buffer, and the spread is the harness's own variation.
+
+The pacing watermark that **on_writable** fires on is derived from this value and has no setting of its own. Two separate settings could be set inconsistently, and a watermark above the bound would make a runtime pace only after it had already closed the connection. A script reads the derived value with **self.watermark()**. It is a call rather than a field because the value changes.
+
+While the runtime is keeping up, the watermark is half the bound. When the runtime holds more than 8 MiB in total, the watermark becomes that budget divided by the live connections. It never goes above the configured half or below 64 KB, and it returns to the half once the backlog has been gone for 50 milliseconds. The operator sets the bound, because the bound is memory and decides when a connection is closed. How far a producer may run ahead before it pauses is a CPU cache question: these bytes are written here and then read again by the kernel as it copies them into a socket.
+
+Measured on a 1 MiB chunked response over seven interleaved passes, with byte-identical responses in every arm: 4,480 responses a second at 16 streams against 5,273, and 3,634 at 64 streams against 4,221. At 8 and 128 streams the result was unchanged within the spread. Dividing by the connection count without checking for a backlog cost 19 per cent at 8 streams. There the queues never fill, and the only effect was stopping a producer four times as often.
+
+The watermark does not bound memory. The peak is still the bound times the number of connections that reach it. A bound that shrank under a live connection would close that connection for a backlog it had been allowed to build. Limiting memory for many clients at once is still this flag's job: on the same load, the peak was 60 MB at **--write-buffer 256K** against 146 MB at the default.
+
+Values under 128K are raised to 128K rather than refused. The watermark is half the bound, and the largest single entry these queues build is 64 KB, so a smaller bound would leave a runtime unable to send one message. The flag can be changed with **edit** on a running runtime, and the script sees the change at once, because the bound is read on every send rather than cached.
+
+### `--rate-limit n`
+
+Limits messages per second on each connection, using a token bucket. A server drops excess messages silently. A **cache** answers **error: rate limited**, since its protocol has a way to say so. A **proxy** closes the connection instead, because a request dropped in silence would leave its client waiting for a response that never comes: a hang rather than a refusal. The bucket starts full, so a connection may spend a whole second's allowance at once and then wait for it to refill. 0 means no limit (default).
+
+A **client** does not accept this flag, nor **--max-connections** or **--idle-timeout**. All three act on inbound traffic. A client opens one connection outward and accepts none, so there is nothing for any of them to act on, and accepting them would let **show** report a control that is not in force. They are refused at **create**, **edit** and **import** alike. Import needs its own check because it writes the field without going through the flag parser.
+
+They are refused rather than given a meaning on a client, because each possible meaning is a design decision. An outbound throttle would have to decide what happens to a message that may not go yet: queue it and report success for something that leaves ten seconds later, fail the send, or drop it. An idle timeout would have to decide what happens after the close, since a client reconnects as soon as its connection is dropped.
+
+On a proxy, one token is charged per read completion rather than per HTTP request. That is the same event **--global-rate-limit** is charged on, and the same one **total_messages** counts. So a client that pipelines four requests into one segment pays one token.
+
+### `--global-rate-limit n`
+
+Limits total messages per second across all connections, using a shared token bucket. A server drops excess messages silently; a cache answers them with an error. 0 means no limit (default).
+
+A client refuses it for the same reason as **--rate-limit**: it caps the total across all inbound connections, and a client has one outbound connection.
+
+### `--idle-timeout duration`
+
+Closes connections that have received no data for longer than *duration*. 0 disables it (default). A sweep timer checks for idle connections every 30 seconds. A bare number is seconds; a suffix of **s**, **m**, **h**, **d** or **w** means seconds, minutes, hours, days or weeks (**300** and **5m** both work).
+
+This flag closes connections that are *quiet*, which is not the same as closing connections that are *dead*, and dead connections do not need it. Every accepted TCP connection gets TCP keepalive at 60/10/3: after a minute of silence, three probes ten seconds apart. So a peer that loses power, or vanishes behind a NAT that forgot it, is closed without any timeout being set. A websocket that sends nothing for an hour is quiet but alive, and keepalive leaves it alone; only **--idle-timeout** closes it. A unix listener does not get keepalive, because its peer cannot disappear silently.
+
+### `--congestion name`
+
+The TCP congestion control algorithm for connections that a server, proxy, cache or storage runtime accepts. Give the kernel's name for it, such as **bbr**, **cubic** or **reno**. It is set once on the listener, and each accepted socket inherits it. Default: the host's default (**net.ipv4.tcp_congestion_control**). A loss-based algorithm such as cubic halves its rate at every lost packet. bbr paces to the path's measured bandwidth and holds that rate. One 32 MB download over 100 Mbit with a 50 ms round trip, three interleaved runs:
+
+```
+loss   cubic              bbr
+0%     10.21 MB/s         10.13 MB/s
+1%     0.38-0.49 MB/s    9.76-9.87 MB/s
+2%     0.26-0.27 MB/s    9.59-9.63 MB/s
+```
+
+The kernel decides which algorithms may be chosen. A process without CAP_NET_ADMIN may choose only one that **net.ipv4.tcp_allowed_congestion_control** lists and that is already loaded (**modprobe tcp_bbr**). If the kernel refuses the name, the start fails and the log says why. The runtime never falls back to the default silently.
+
+### `--drain`
+
+Enables graceful shutdown. On stop, the runtime closes its listener but flushes all pending write queues before it closes connections.
+
+A client refuses this flag, because it has no listener and no inbound connections. What a client owes its peer when it stops is a separate question.
+
+### `--cpus set`
+
+The CPUs this runtime's I/O may run on. Accepts **max**, a range such as **0-3**, or a list such as **0,1,2,3**, whose elements may themselves be ranges (**0-1,3**). Default **max**, which applies no pinning at all. It is not a mask of the CPUs that are online now, so a CPU that comes online later is still available to the loop.
+
+A CPU this machine does not have, a descending range, or a set that comes out empty is refused when the runtime is created. Such a value is never silently rounded up to **max**. Otherwise a config written for a sixteen-core machine and deployed on a four-core one would run somewhere other than its author believes, and every later measurement would be measuring something else.
+
+The kernel fixes a ring's CPU set when the ring is created, and a ring belongs to a process, not to a runtime. Every runtime inside one daemon shares that daemon's ring. So this flag states what a runtime requires, and **create** refuses a requirement that the ring does not meet. The refusal names the **socketley daemon** flag or the **SOCKETLEY_CPUS** setting that would satisfy it. The flag cannot be changed with **edit**. **socketley stats** reports the value in force.
+
+The setting is persisted with the runtime, and the same check runs again when a persisted runtime is restored. If the daemon restarts without the setting that satisfied the requirement, the runtime is left **failed**, with the reason in the daemon log. It is not started on a ring that does not meet the requirement. A runtime that asked for nothing records nothing and is never refused for it.
+
+### `--tls` / `--cert file` / `--key file` / `--ca file`
+
+**All runtime types.** Encrypts this runtime's transport with TLS. What that means depends on whether the runtime listens or dials.
+
+On a **server**, **proxy** or **cache**, TLS terminates on the runtime's own listening port. There, **--tls** requires both **--cert** *file* (a PEM certificate, chain allowed) and **--key** *file* (its PEM private key), because a listener needs something to terminate TLS with.
+
+A **cache** terminates TLS exactly as a server does, and everything above the record layer is unchanged. RESP is still auto-detected from the first byte of the *decrypted* stream, so a Redis client speaks the same protocol with TLS switched on, and the line protocol works on the same port. This lets a cache be reached across a network it does not trust.
+
+On a **client**, TLS is dialled rather than terminated, and **--tls** alone is a complete configuration. There is no listening port that needs a certificate, and by default the peer is verified against the system trust store. **--cert** *file* and **--key** *file* are optional there. They set the certificate this client *presents* when the peer asks for one (mutual TLS). Giving only one of the two is refused, because the client would present nothing while the flags said otherwise.
+
+**--ca** *file* means something different on each role, because only some roles verify a peer they dialled. On a **server** or **cache**, it enables mutual TLS: a client must present a certificate signed by that CA, and a client that does not is rejected during the handshake. On a **proxy**, it is the trust store used to verify the certificate a **backend** presents. The proxy's own listener asks for client certificates with **--client-ca** *file* instead. On a **client**, it is the trust store for the peer named by **-t**; without it, the system store is used. See **mTLS Flags** under **PROXY FLAGS**.
+
+A dialled connection, such as a client's target or a proxy's backend, is verified on two counts, and neither check can be turned off. First, the chain must be signed by something in the trust store. Second, the certificate must be valid for the host that was dialled. For a client, that is the name in **-t**, matched against the certificate's DNS SAN, or against its IP SAN for an address literal. The name checked is always the configured one, never one read from the certificate that arrived. The minimum version is TLS 1.2. There is deliberately no skip-verify option. A TLS client that does not verify protects against an eavesdropper but not against someone in the path, while it reports itself as encrypted either way.
+
+A listener speaks TLS 1.2 and 1.3. Over 1.2, it offers only ECDHE key exchange with AEAD ciphers (Mozilla's intermediate list). It resumes sessions from its own cache, not from tickets. A ticket key lives as long as the process, and anyone who learned it could open every session it ever sealed.
+
+Trust stores are read when the runtime starts. A listener's certificate and key are checked again every two seconds. When they are replaced on disk, by **--acme**, certbot or a copy, new handshakes use them from then on, without a restart and without dropping a connection. This happens only once both files load and match. A pair that does not is not used: the log reports it once, and the old pair goes on serving. The whole certificate file is sent, so a CA's intermediates go with the leaf.
+
+The runtime refuses a certificate that cannot be loaded and a key that does not match it. It also refuses any incomplete combination (**--tls** without a key pair on a listener, a key pair or a trust store without **--tls**, or half a client-certificate pair). A refused runtime goes to the **failed** state, and nothing binds the port or dials the target. No path falls back to cleartext. A client whose peer fails verification drops the socket and re-dials on its usual backoff; it never retries in the clear.
+
+These flags are refused on a **client** or a **server** combined with **--udp**, which would need DTLS. They are refused on a server combined with **--upstream**, because the upstream leg would still dial in cleartext. On a **cache**, they are refused together with **--replicate** *host:port***.** Replication is not encrypted, so the pair would stream the whole dataset in the clear from a port that reports itself as encrypted. See **TLS** under **LIMITATIONS**.
+
+### `--acme name[,name...]` / `--acme-email address`
+
+**server, proxy, cache, storage.** Gets a certificate for the given names from an ACME CA, and the runtime itself issues and renews it. The CA is Let's Encrypt unless **SOCKETLEY_ACME_DIRECTORY** names another. **--acme** turns on **--tls**. The certificate and its key are kept in *state-dir*/.acme/*name*/, under the first name.
+
+Until the CA has issued a certificate, a self-signed one valid for a week stands in, so the listener starts at once. The issued certificate replaces it within seconds. It is renewed when it has less than thirty days left. A failed attempt is retried after a minute, then after twice as long each time, up to six hours, with the CA's reason in the log.
+
+Let's Encrypt issues no certificates for names reserved for examples, tests or local use, so the runtime does not request them. These names are **example.com**, **example.net**, **example.org**, and anything under **.example**, **.test**, **.invalid**, **.localhost**, **.local**, **.internal**, **.home.arpa** or **.alt**. For those names it keeps a self-signed certificate valid for a year, and the log says so. With **SOCKETLEY_ACME_DIRECTORY** set, they are requested like any other name, since a CA of one's own may issue them. **--acme-email** is the account's contact address, where the CA writes before a certificate expires.
+
+A runtime on port 443 proves its names over TLS-ALPN-01, on its own listener. The CA's handshake asks for **acme-tls/1** for the name and is shown a challenge certificate for it; no other handshake is shown that certificate. So a proxy on 443 alone is enough.
+
+Any other runtime proves its names over HTTP-01. The CA requests **http://***name***/.well-known/acme-challenge/***token* on port 80. Every socketley **server**, **proxy** and **storage** of the daemon answers that path on any port, for a token the daemon is waiting on. It answers before it routes, serves or runs a script. So one runtime on port 80, such as the proxy that redirects to HTTPS, is all it takes. A request for any other token goes where the path would have gone, so a site's own files there, such as those certbot's webroot writes, are served as before. A name must be a DNS name with a dot; an address is refused.
+
+A wildcard such as *.example.com is proven over DNS-01, the only challenge that can prove one. The answer goes to the daemon's **dns** runtimes as the TXT record of **_acme-challenge.***name* (see **Names runtimes are reached by** under **DNS FLAGS**). The CA is told to look **SOCKETLEY_ACME_DNS_WAIT** seconds later, and the record is removed once it has. This needs a **dns** runtime in the same daemon that is authoritative for the zone. If the zone has secondaries, the wait must also give them time to take the new serial. **SOCKETLEY_ACME_CHALLENGE=dns-01** proves every name over DNS-01, for a host whose port 80 is closed.
+
+```
+socketley create proxy web -p 443 --acme example.com,www.example.com \
+    --acme-email ops@example.com --backend 127.0.0.1:8080 -s
+socketley create proxy plain -p 80 --backend 127.0.0.1:8080 -s
+```
+
+### `--domain [name[,name...]]`
+
+The DNS names the runtime is reached by. With no name, the flag uses the runtime's own name (**create server chat --domain** is reached as **chat**). A **dns** runtime with **--publish** answers for these names with this machine's addresses. A name without a dot is placed under each zone the dns runtime serves (**chat** becomes **chat.example.com** for **example.com**). A name with a dot is used as written, and *.*name* covers every name beneath it. When a runtime is removed, its names go with it. On a **storage** runtime the flag is the storage's own, and it also names the virtual hosts of its buckets (see **STORAGE FLAGS**); those are published through the wildcard beneath the name. The names given to **--acme** are published too.
+
+### `-g name` / `--group name`
+
+Assigns the runtime to a named group. Groups enable dynamic proxy backend discovery: a proxy with **@groupname** as a backend routes to all running members of that group at connection time. New members are discovered automatically, without restarting the proxy.
+
+A member joins its group when it is actually listening, not when it is created. For a runtime that runs in its own process, that is a few milliseconds after **create** returns: the port is bound in that process, and the daemon publishes the member once the worker reports it. Until then the member is absent from the group, rather than present and refusing connections. Routing to an address that does not accept connections yet would trip the proxy's circuit breaker against a member that is merely starting up.
+
+### `--listen unix:/path/to.sock`
+
+Listens on an AF_UNIX socket instead of a TCP port. Every runtime that listens accepts it: server, proxy, cache and storage. A client dials out and listens on nothing, so a client refuses the flag and points to **-t unix:**, the connect side of the same socket. This flag is the other half of **--backend** *unix:***/path/to.sock** under **PROXY FLAGS**. With the two, a proxy and the backend it fronts can talk on one host without a loopback TCP stack between them. A proxy can also serve its own front door on a unix socket.
+
+Measured on a cache serving the same client over both, on Linux 7.2.2: a round trip falls from 10.64 to 6.57 microseconds, and throughput at pipeline depth 1 rises 2.2x to 2.4x. Most of that gain comes from the kernel, not from this daemon: Redis over its own unix socket gains 2.0x on the same machine, so any server on one machine can have it. TCP exists to make an unreliable link reliable, and over loopback there is no link. But sequence numbers, windows, retransmit timers, an skb per direction through IP, and netfilter on every packet all run regardless. On a host running Docker, netfilter alone costs 0.9 microseconds of that round trip. An AF_UNIX socket has none of this.
+
+The saving is per *message*, not per operation, so a pipelining client sees much less of it: at depth 100 it is 0.016 microseconds per operation. That is still 1.25x here, because at that depth the cache's own per-message work is only about 8 microseconds, and the saving is a quarter of it. Redis, whose per-message work is nearer 32 microseconds, gains 1.02x, which is not worth the change.
+
+Without **--shards**, a runtime on a unix socket uses one core. With it, each shard binds a node of its own (see below). Use a unix socket for a local sidecar.
+
+**Every unix stream socket on the data path has a 1 MiB send buffer.** This covers each socket accepted on a **--listen unix:** node or a companion node. It also covers the socket a proxy dials to a **--backend** *unix:* or to a local runtime's node, and the socket a client dials with **-t unix:**. On a unix stream socket, the sender's buffer is the only flow control. An accepted socket inherits nothing from its listener, and the kernel's default is 208 KB. socketley requests 512 KiB, which the kernel doubles. The request is capped at *net.core.wmem_max*, which is 212992 on a stock kernel, so there the buffer is 416 KB. Measured on one connection of pipelined 64 KB GETs:
+
+- A reader that pays for each read (a Python client reading 4 MiB at a time) went from 2.2 to 3.0 GB/s, and the cache spent 41% less CPU per byte.
+- A TCP proxy in front of a local cache, reaching it over its node, gained 10%.
+- A reader that reads cheaply was already at about 10 GB/s, bound by the cache's core, and is unchanged. Small requests are unchanged too.
+
+The buffer is a ceiling, not an allocation. An idle connection holds nothing in it. A connection whose reader has stopped holds at most 1 MiB in the kernel, instead of the default 208 KB.
+
+This flag is mutually exclusive with:
+
+- **-p**.
+- **--udp**. That would be a unix datagram socket, which is a different thing.
+- **--tls**. A unix socket is not on a network; the permissions on the node are what restrict it.
+- **--cluster** on a cache. Cluster members advertise ports computed by a formula, and RESP cannot write a filesystem path as a node address.
+
+Each combination is refused at start, with the reason in the daemon log, so neither flag silently wins.
+
+**--shards is not among them.** A sharded runtime binds one node per shard, *name*#i.sock, which is the rule the daemon's companion nodes already follow. If N processes bound *one* path, each would unlink the others' node, and only the last to bind would stay reachable. N paths give N listeners. See **Sharding** under **SERVER FLAGS** for which node a caller should pick. That choice matters on a cache but not on a server.
+
+The path must be absolute and shorter than 108 bytes, the size of the kernel's *sun_path*. Both rules are checked when the flag is read. The kernel truncates a long path silently, and a truncated path names a different socket, possibly a real one that belongs to something else.
+
+**Under --shards the rule is applied to the longest node, not to the path as typed.** name*#15.sock* is three bytes longer than *name*.sock, so a path that fits can still produce a set of nodes that does not. The shard that did not fit would fail at its bind while the earlier shards were already serving. So the path is refused at configuration instead, and the message names the longest node rather than the path that was typed.
+
+**The socket node is created 0600.** Connecting to a unix socket needs write permission on the node. If that were left to the umask, a daemon running under **umask 0** would publish a listener that anyone on the machine could talk to. There is deliberately no flag to widen it, so a peer running as another user cannot connect. The way around that today is a parent directory that the operator owns and controls.
+
+The node is removed when the runtime stops. A node left behind by a killed daemon or a power loss is taken over on the next start, but only after the runtime connects to it to check that nobody is serving it. A path that something IS serving is refused, so a second runtime cannot take a live socket away from the first.
+
+A server listening this way is reachable as a proxy backend by its path and by its runtime name. It is deliberately NOT offered as an **@***group* member. A group's members are resolved to network addresses per request, and an entry that the group path cannot dial would take a turn of the round-robin and answer 503.
+
+```
+socketley create server app --listen unix:/run/app.sock --http /srv/www -s
+socketley create proxy  gw  -p 8080 --backend app -s
+socketley create cache  kv  --listen unix:/run/kv.sock -s   # redis-cli -s works
+```
+
+## The node beside the port
+
+A **server** or an unsharded **cache** that listens on a TCP port also listens on an AF_UNIX node. The daemon creates the node in a directory named after its own socket, *<socket>*.rt/, and names the node after the runtime. The directory is named after the socket rather than placed beside it, because the default socket is */tmp/socketley.sock*, and every user on the machine shares that directory. Nothing needs to be configured, and nothing about the port changes: a runtime created with **-p 9000** is reached on 9000 from anywhere, as before. The node is an addition, never a replacement, and nothing outside this machine can reach it.
+
+The node exists for one caller: another runtime on this machine. A proxy whose backend is written as a *runtime name* uses it. A proxy whose backend is written as an *address* uses it too, but only while a running runtime publishes exactly that host and port. A name asks for the runtime, and the proxy may choose how to reach it. An address asks for the address, so the substitution holds only while the two are the same thing. If the runtime moves to another port, the address means what it says again.
+
+Measured on Linux 7.2.2, with the same proxy in front of the same server and only the backend leg differing, a request falls from 25.33 to 22.68 microseconds. The whole process tree spends 4.0 microseconds less CPU on each one. This held in 12 of 12 interleaved passes (median of the per-pass differences). The CPU saving is larger than the latency saving, which is what a saving under load looks like. A serial round trip waits on wakeups, and the freed CPU has no use until a second request needs it.
+
+**The node is 0600 in a directory the daemon creates 0700.** Only the user the daemon runs as can reach it. Measured: another local user reaches the port but is refused on the node with **EACCES**, and cannot list the directory or create a node in it either. None of this narrows the port, which is exactly as open as it was. But the leg between two runtimes no longer travels over something every local user could also connect to.
+
+The daemon checks the directory, not only creates it. A **mkdir**(2) that answers **EEXIST** says a directory is there but not who owns it, so the daemon stats it. If it is not a directory the daemon owns with no group or other access, companion nodes are turned off for the whole daemon, and the log says so once. Without that check, another user could create the directory first and hold a live node at a path the daemon was about to publish. The bind refuses to take over a live node, so the path would stay published and be served by that other user.
+
+The node takes away two things, both worth knowing before relying on it:
+
+- **A firewall rule on loopback does not apply.** nftables and iptables see packets, and an AF_UNIX socket produces none. A rule that drops traffic to a runtime's port does not stop another runtime from reaching it over the node.
+- **tcpdump -i lo shows nothing.** At start, the proxy writes one line per backend to the daemon log, naming the path it will use. That line is the only evidence that the node was used.
+
+A runtime gets no node in these cases:
+
+- It is neither a server nor a cache.
+- It has no port. A runtime already on **--listen unix:** has nothing to add.
+- It uses **--udp**.
+- Its listener is TLS. A cleartext node beside an encrypted port would undo what the port was configured to give.
+
+A proxy keeps only its port, and so does a cache with **--shards**. A path is one node, and N processes would unlink each other's; that is why **--listen** gives each shard a node of its own. One rule decides both what the daemon publishes and what a runtime binds. So a type that is not wired to a listener is never advertised as having one, because a path published with nothing behind it is a backend that is simply down. For the same reason, a proxy configured with backend TLS keeps TCP rather than silently dropping the encryption it was asked for.
+
+## Between runtimes on one machine
+
+Requests from one runtime to another include **socketley.send**, **self.route**, and a server's **--cache** *name***.** The daemon carries the first such request between two runtimes, up one control socket and down the other. It then introduces the two processes to each other with a new socket pair, and later requests go straight across.
+
+There is nothing to configure and nothing to see from outside. The pair has no path in the filesystem, so nobody can connect to it or squat on it; only the two processes that were handed the ends can use it. The daemon logs one line naming the pair when it introduces them. **socketley stats** *name* reports **peer_links**, **peer_direct** and **peer_relayed**, which tell a request that went through the daemon from one that went straight across.
+
+Measured with a server posting every cache command to a cache runtime, the two arms differing only in whether they were introduced, a round trip falls from 31.60 to 21.14 microseconds. The process tree spends 10.75 microseconds less CPU per command. This held in 12 of 12 interleaved passes (median of the per-pass differences). A third of the round trip was the daemon.
+
+A request falls back to the daemon whenever the link is not usable, so nothing depends on the link. If a link never forms, or its peer has gone, the only cost is the speed it would have saved. A routed connection is pinned to the path it opened on for its whole life, because a message that changed route mid-stream could arrive ahead of one sent before it.
+
+## Which port a runtime is on
+
+**ls**, **ps**, **stats** and the metrics endpoint report the port a runtime *binds*, which is not always the port it was configured with. A runtime created without **-p** takes its type's default: 8000 for a server, 8080 for a proxy, 9000 for a cache. The **PORT** column, **ps --json** and **stats** show that port, not the configured 0, so an operator can see which port the runtime is actually answering on.
+
+**show** is deliberately not in that list. Its output is the state document, which goes back in through **import**. Writing the default into it would pin a runtime that had been left to take whatever default its type has.
+
+A runtime that binds no port at all reports **0**. That is a client, a **--listen** *unix:* listener, a process registered with **attach**, or a server reachable only through its owner.
+
+## One address, one runtime
+
+A runtime's start is refused when another runtime on this daemon is already serving the address it would bind: a TCP port, a UDP port, or a **--listen** *unix:* path. The refusal names both runtimes and reaches the terminal. During the restore at boot, it names both in the daemon log.
+
+The kernel would not refuse it. Every listener is opened with **SO_REUSEPORT**, because that is the whole mechanism behind **--shards**: N worker processes of *one* runtime bind one port, and the kernel hands each connection to one of them. A second *runtime* claiming the same port looks the same as a second shard, so the bind succeeds and the connections split between the two at random. Measured without this check, with two servers created on one port: both started, both listened, nothing was logged, and twenty messages arrived split nine and eleven.
+
+These are still accepted, because they are not the same address:
+
+- **--udp beside TCP**. UDP and TCP are separate namespaces in the kernel, so a datagram server and a stream server on the same number are two listeners that never meet.
+- **A restart**. It passes through **stopped** and takes back its own port, because the rule reads state, not configuration.
+- **--shards**. Its workers are one runtime.
+- A runtime that binds nothing at all: a client, a process registered with **attach**, or a server reachable only through its owner.
+
+A clustered cache holds more than one address: the configured port, and *base+1*..*base+N* for the shards, which is the formula **CLUSTER SLOTS** publishes. A runtime that took one of those ports would be sent keys it does not hold.
+
+The refused runtime stays in the state it was in, **created** or **stopped**, not **failed**, because nothing was built and nothing broke. To resolve it, stop the runtime named in the refusal, or give one of the two an address of its own.

@@ -1,0 +1,88 @@
+<p>Every fact on this page is from the <a href="#/man">manual</a>, and each section links the part with the details.</p>
+
+<h2>The pieces</h2>
+<p>socketley is one binary. Started as <code>socketley daemon</code> it is the <b>daemon</b>: a supervisor that keeps every runtime alive. Started any other way it is the <b>CLI</b>: it sends one command to the daemon over a unix socket (<code>/run/socketley/socketley.sock</code> when installed, <code>/tmp/socketley.sock</code> in development) and prints the answer.</p>
+<pre class="diagram">  you
+   │  socketley create cache store -p 6379 -s
+   ▼  one command over the control socket
+  ┌──────────────────────────────────────┐
+  │ daemon                               │
+  │ checks the flags, saves the runtime, │
+  │ forks a worker and watches it        │
+  └─────┬────────────┬────────────┬──────┘
+        ▼            ▼            ▼
+  ┌──────────┐ ┌──────────┐ ┌──────────┐
+  │ worker   │ │ worker   │ │ worker   │
+  │ server   │ │ cache    │ │ proxy    │
+  │ api      │ │ store    │ │ edge     │
+  │ :9000    │ │ :6379    │ │ :8080    │
+  └──────────┘ └──────────┘ └──────────┘
+  each worker: one process, one io_uring
+  event loop on one thread</pre>
+<ul>
+<li><b>A runtime</b> is one network service of one type (server, proxy, cache, storage, …) with a name that is unique on the daemon.</li>
+<li><b>Every runtime you create runs in its own worker process.</b> The worker binds the port, serves every byte and runs the runtime's Lua script. The daemon keeps a placeholder with the name, port and state, so <code>ls</code> and <code>stats</code> can answer. <a href="#/man/limitations">Out-of-process runtimes →</a></li>
+<li><b>Opening the control socket is an administrative right</b>: whoever can open it can run code as the daemon's user. That is why the installed socket belongs to the <code>socketley</code> group. <a href="#/man/files">The IPC socket →</a></li>
+</ul>
+
+<h2>What <code>create</code> does</h2>
+<ol class="steps">
+<li><p><b>The CLI sends the command</b> to the daemon. A relative path in a flag (a script, a directory) is made absolute first, so it means what it meant in your shell.</p></li>
+<li><p><b>The daemon checks it</b>: the type, the name, every flag and its value. If a <code>--lua</code> script does not parse, <code>create</code> refuses it on the spot. <code>--test</code> stops here and keeps nothing.</p></li>
+<li><p><b>The daemon saves the runtime</b> as a JSON file in its state directory. From now on the runtime survives restarts of the daemon and reboots.</p></li>
+<li><p><b>With <code>-s</code>, the daemon forks a worker.</b> The worker binds the port, reads the TLS certificate, resolves its backends and runs the script's top level.</p></li>
+<li><p><b><code>create</code> waits for the worker's verdict</b> and tells you through its exit status:</p>
+<table class="kv"><tr><th>Exit</th><th>Meaning</th></tr>
+<tr><td><code>0</code></td><td>The worker is serving.</td></tr>
+<tr><td><code>1</code></td><td>The worker refused, or could not bind, resolve or load its certificate. The reason is in the daemon's log; the runtime is left <code>failed</code>, so <code>ls</code> still shows it.</td></tr>
+<tr><td><code>2</code></td><td>No answer within two seconds. The runtime stays supervised; <code>ls</code> shows the state it settles on.</td></tr></table></li>
+</ol>
+
+<h2>The path of a request</h2>
+<p>A client connects to the runtime's port. The worker's event loop reads the bytes and answers them, either with a built-in path (a static file, a cache command, a relayed message) or by calling the runtime's Lua handler. The daemon is not on this path at all.</p>
+<p>For a public website, the <b>entrance</b> sits in front: one proxy on ports 80 and 443 that a <a href="#/rt/dns">dns runtime</a> creates with <code>--proxy</code>. It gets certificates itself and routes each request by its host name to the runtime that has that name in <code>--domain</code>.</p>
+<pre class="diagram">  browser: https://shop.example.com/cart
+   │
+   ▼
+  ┌──────────────────────────────────────┐
+  │ entrance proxy, port 443             │
+  │ TLS with an ACME certificate         │
+  │ shop.example.com → runtime "shop"    │
+  └──────────────────┬───────────────────┘
+                     │ a unix socket beside its
+                     │ port, when it has one
+                     ▼
+  ┌──────────────────────────────────────┐
+  │ worker: server "shop", port 9100     │
+  │ on_http_request(req) in Lua,         │
+  │ or the static files of --http        │
+  └──────────────────────────────────────┘</pre>
+<p>A proxy that names its backend by runtime name (<code>--backend shop</code>) follows the runtime if its port changes. On the same machine it reaches a server or an unsharded cache over an AF_UNIX node beside the port, which only the daemon's user can open. <a href="#/man/common-flags">The node beside the port →</a></p>
+
+<h2>Runtimes talking to each other</h2>
+<p>A script can reach another runtime: <code>socketley.send</code>, <code>self.route</code>, or a server's <code>--cache name</code>. The first such request between two runtimes goes through the daemon. The daemon then hands both workers the two ends of a private socket pair, and later requests go straight across. If that link ever breaks, requests go through the daemon again; only speed is lost.</p>
+<p><code>socketley stats name</code> shows <code>peer_links</code>, <code>peer_direct</code> and <code>peer_relayed</code>. <a href="#/man/common-flags">Between runtimes on one machine →</a></p>
+
+<h2>What is stored where</h2>
+<table class="kv"><tr><th>What</th><th>Installed (package)</th><th>Development</th></tr>
+<tr><td>Control socket</td><td><code>/run/socketley/socketley.sock</code> (0660, group <code>socketley</code>)</td><td><code>/tmp/socketley.sock</code> (0600)</td></tr>
+<tr><td>Runtimes, one JSON file each</td><td><code>/var/lib/socketley/runtimes/</code></td><td><code>~/.local/share/socketley/runtimes/</code></td></tr>
+<tr><td>Daemon configuration</td><td><code>/etc/socketley/config.lua</code></td><td><code>~/.config/socketley/config.lua</code></td></tr>
+<tr><td>Registered types</td><td><code>/etc/socketley/types/*.toml</code></td><td><code>~/.config/socketley/types/*.toml</code></td></tr></table>
+<p>A runtime's JSON file holds its flags and whether it was running. It can hold a master password and key paths, so it is readable by the daemon's user alone. A daemon on another socket (<code>SOCKETLEY_SOCKET</code>) gets a state directory of its own, and logs which one at startup. <a href="#/man/files">Files →</a></p>
+
+<h2>When something stops or fails</h2>
+<table class="kv"><tr><th>Event</th><th>What happens</th></tr>
+<tr><td>A worker crashes</td><td>The daemon restarts it and the runtime stays <code>running</code>. Other runtimes release the connections routed to or from it.</td></tr>
+<tr><td>It crashes more than five times in ten seconds</td><td>The runtime is left <code>failed</code> instead of being forked again in a loop.</td></tr>
+<tr><td>A Lua callback never returns</td><td>Its deadline ends it. <a href="#/man/lua-configuration">Callback deadline →</a></td></tr>
+<tr><td>The daemon stops or the machine reboots</td><td>On the next start the daemon restores every saved runtime and starts the ones that were running.</td></tr>
+<tr><td>You run <code>stop</code></td><td>The worker ends; the runtime is kept as <code>stopped</code>. With <code>--drain</code> it first finishes what is in flight.</td></tr></table>
+<p>A runtime's state is always one of <code>created</code>, <code>running</code>, <code>stopped</code> or <code>failed</code>; <code>ls</code> shows it, and a failed runtime shows the reason.</p>
+
+<h2>One thread per worker</h2>
+<p>A worker serves everything on one event loop, on one thread. That is what makes it cheap, and it has one consequence: a call that waits stops that worker's whole loop. The manual lists the few calls that can; <code>socketley.http</code> outside a callback that can wait is the one most scripts meet. <a href="#/man/limitations">What can stop the event loop →</a></p>
+<p>To use more cores, <code>--shards N</code> runs N workers that share the port. A cache gives each key one owning shard. <a href="#/concepts">Concepts: several cores →</a></p>
+
+<h2>More than one machine</h2>
+<p>Daemons that share a cluster directory see each other's runtimes, and a proxy's <code>@group</code> backend reaches members on every machine. An opt-in Raft mode adds elections and replicas. <a href="#/cluster">Cluster →</a></p>

@@ -1,0 +1,77 @@
+# Ten-minute tour
+
+Make a server, a cache and a proxy, script one of them, and look at all three.
+
+Ten minutes, three runtimes, on a fresh install. The only file you write is one short script. You also need `nc`, `curl` and, for the cache, `redis-cli`.
+
+## 1. A server
+
+1. Create a server; `-s` starts it.
+
+   ```
+   socketley create server chat -p 9000 -s
+   socketley ls
+   ```
+2. In two terminals, run `nc 127.0.0.1 9000`. What you type in one appears in the other.
+3. Send to both from the CLI: `socketley send chat "hello"`.
+
+## 2. A script
+
+1. Write `echo.lua`.
+
+   ```
+   function on_client_message(id, msg)
+       self.send(id, "you said: " .. msg)
+   end
+   ```
+2. Run a server with it.
+
+   ```
+   socketley create server echo -p 9001 --lua echo.lua -s
+   printf 'hi\n' | nc -q1 127.0.0.1 9001
+   ```
+3. Edit the file, then `socketley reload-lua echo`. Connections stay open.
+
+All callbacks: the [Lua page](lua.txt).
+
+## 3. A cache
+
+```
+socketley create cache store -p 6379 -s
+redis-cli -p 6379 SET visits 0
+redis-cli -p 6379 INCR visits
+```
+
+It speaks the Redis protocol, and plain text lines too:
+
+```
+printf 'get visits\n' | nc -q1 127.0.0.1 6379
+```
+
+## 4. A proxy
+
+```
+mkdir -p site && echo '<h1>hello</h1>' > site/index.html
+socketley create server web -p 9100 --http ./site -s
+socketley create proxy gw -p 8080 --backend web -s
+curl http://127.0.0.1:8080/gw/index.html
+```
+
+The proxy finds `web` by its name, so it follows the server if its port changes. It takes its own name off the path: `/gw/index.html` reaches `web` as `/index.html`.
+
+## 5. Look at it
+
+```
+socketley ls                 # every runtime, its state and port
+socketley stats gw           # live counters
+socketley show echo          # its configuration as JSON
+socketley edit gw --backend-timeout 5s --restart
+socketley stop chat; socketley remove chat
+```
+
+After `sudo systemctl restart socketley`, every running runtime comes back by itself. The [dashboard](man-dashboard.txt) shows it all in a browser.
+
+## Where next
+
+- Each runtime's page: [server](rt-server.txt), [proxy](rt-proxy.txt), [cache](rt-cache.txt), and the ten others.
+- [How it works](how.txt) for what happened behind each command, [concepts](concepts.txt) for what runtimes share, [deployment](deploy.txt) before running it for real.

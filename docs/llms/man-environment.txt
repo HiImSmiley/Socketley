@@ -1,0 +1,501 @@
+# Environment
+
+From the manual page socketley(1).
+
+All of these variables are optional. Each is read by the process that needs it, which for most is a runtime's worker process rather than the daemon. **SOCKETLEY_SOCKET** and **SOCKETLEY_CONFIG** select which daemon this is and which file it reads. **EDITOR**, **VISUAL** and **TMPDIR** are read by the command line, and the **SOCKETLEY_GIT_*** variables by the command that uses them. **SOCKETLEY_FAST_LO** is set by the daemon for its workers. The entries that begin "A test hook" are for the test suite. The rest are tuning knobs. Their defaults suit a general-purpose deployment and only need changing for an unusual workload.
+
+You can also set each knob in the **settings** table of the daemon's configuration file, using its name in lower case and without **SOCKETLEY_** (see **Daemon Configuration**). **socketley settings** lists every knob with its value and where that value came from. If a variable in the environment holds a number outside the knob's range, or not a whole number, the process that reads it logs this once and uses the default. The same value in the **settings** table stops the daemon instead (see **Daemon Configuration**).
+
+### `SOCKETLEY_SOCKET`
+
+Selects which daemon this is, or which daemon the CLI talks to. It overrides the default socket lookup (**/run/socketley/socketley.sock** when installed and privileged, otherwise **/tmp/socketley.sock**).
+
+No workload calls for setting it. A deployed node, whether a container or a host, has a filesystem namespace to itself. One daemon on the default path is then the whole arrangement, and that is what the systemd unit ships. Clustering does not use this variable either. Cluster members publish themselves into a shared directory and reach each other over network addresses, never over socket paths. See **CLUSTER MODE**.
+
+The variable exists to run several daemons inside *one* namespace, which happens only in development and testing. Without it, two checkouts on one workstation, or two test runs at once, end up as the same daemon. Whichever process binds the default path first owns it, and every later one silently talks to that process instead of starting its own. Anything that starts a daemon on the default path claims the identity that the real daemon runs under. The test suite therefore gives every test a socket of its own.
+
+The variable selects the state directory as well as the socket, and it must. Several daemons in one namespace that read one state directory do not behave as separate daemons. Each one restores everything in the directory at startup, including the others' runtimes, onto ports the others are already serving. And each **remove** deletes a state file that another, still running daemon depends on. See **WHERE STATE LIVES**.
+
+### `SOCKETLEY_CPUS=max|0-3|0,1,2,3`
+
+Sets the CPUs that the daemon's I/O thread may run on. Default: **max**, which applies no pinning at all, rather than a mask of the CPUs that happen to be online now.
+
+If the set names a CPU this machine does not have, or comes out empty, the daemon refuses it, logs a warning and runs unpinned. It never rounds the set up to **max**.
+
+**socketley daemon --cpus** *set* sets the same thing on the command line, and wins when both are given. On the command line, an impossible set is refused outright and the daemon does not start. The reason is that a flag typed for this one run is a requirement, not an inherited default.
+
+### `SOCKETLEY_CACHE_BUF_SIZE`
+
+Sets the size in bytes of each buffer in a cache runtime's io_uring provided-buffer ring. Default: **65536**. Larger buffers let one read completion carry more commands. The cost of the ring is its footprint (count times size) competing for the core's cache; see the section on the receive ring for what was measured.
+
+### `SOCKETLEY_CACHE_BUF_COUNT`
+
+Sets the number of buffers in that ring. Default: **64**. Together with the buffer size, it bounds how much concurrent traffic the runtime can absorb before the pool runs dry. When the pool is dry, reads fall back to a slower per-read path. The pool costs count times size of memory per cache runtime.
+
+### `SOCKETLEY_STORAGE_KILL_AFTER_RENAME`
+
+A test hook that kills a sharded storage worker in the middle of a commit. When a commit's key begins with this string, the worker is killed with **SIGKILL** after it renames the body into place and before it writes the journal record. A test can thus put a crash at the one step that leaves a file the journal does not name. Unset by default.
+
+### `SOCKETLEY_STORAGE_KILL_AFTER_EVENT`
+
+A test hook that kills a storage worker after it records an event and before it makes the change. It applies to a change of a key that begins with this string, in a bucket that sends events for that change. The worker is killed with **SIGKILL** once the change's event record is durable and before the change itself is made. A test can then show that the restarted worker sends no event for the change. Unset by default.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_HOLD_CONFIRM`
+
+A test hook that makes a storage worker answer a change but never confirm it. For a key that begins with this string, the worker makes the change and answers it. It never writes the record that says the change was made, and never sends the change's events. This is the state a crash right after the answer would leave. A test can then kill the worker and show that the restarted worker sends the events. Unset by default.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_PART_LIST_MAX`
+
+A test hook that limits how many bytes a multipart object's part lists may take in its header. The limit applies separately to the part sizes, to the part numbers of an encrypted object, and to the parts' checksums. A list that would take more is stored after the object's body instead. Default: **4096**, which takes some five hundred parts of unequal sizes to exceed. A small value lets a test reach a list stored after the body with only a few parts.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_DOC_FAULT`
+
+A test hook that makes a sharded storage runtime drop one phase of a bucket document change. The value is a directory. While a file named *shard***.***phase* (**prepare**, **commit** or **abort**) exists in it, that shard answers the message for that phase as an unreachable sibling would, without acting on it. A test can thus lose a message at each step of the change. Unset by default.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_PROXY_HTTP3`
+
+Set to **0** to stop a **--tls** entrance from opening a UDP socket for HTTP/3. The entrance then offers HTTP/3 to no client and names none in **Alt-Svc**. HTTP/2 over TCP is unaffected.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_PROXY_HTTP2`
+
+Set to **0** to turn HTTP/2 off at an entrance. The entrance then speaks HTTP/1.1 to every client over **--tls**. See the entrance under the dns runtime's **--proxy**.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_HTTP2`
+
+Set to **0** to turn HTTP/2 off for storage runtimes. A storage runtime then speaks HTTP/1.1 to every client. See **HTTP/2** under the storage runtime.
+
+### `SOCKETLEY_STORAGE_HTTP3`
+
+Set to **0** to stop a **--tls** storage runtime from opening a UDP socket for HTTP/3. The runtime then offers HTTP/3 to no client. See **HTTP/3** under the storage runtime.
+
+### `SOCKETLEY_STORAGE_HTTP3_ADVERTISE`
+
+Sets the port that the **Alt-Svc** header names for HTTP/3. Use it when a proxy in front forwards UDP from a port other than the runtime's own. 0 advertises no port. Default: the runtime's port.
+
+### `SOCKETLEY_STORAGE_HTTP3_CC`
+
+Selects the congestion controller that HTTP/3 sends with: **bbr**, **cubic** or **reno**. Default: **bbr**.
+
+### `SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER`
+
+Sets how many QUIC handshakes may be under way before a new client is sent a Retry. A client that is sent a Retry must prove its address first. 0 sends a Retry to every client. Default: 64.
+
+### `SOCKETLEY_STORAGE_SPLICE_MIN`
+
+Sets the body size in bytes from which a storage GET is sent by splice from the file to the socket. Smaller bodies are read into memory and written instead. Default: **65536**; **0** splices every body. Below the default, a read and a write cost less than the pipe a splice needs. This setting changes what **zero_copy_bytes** counts and how much CPU a GET takes, never what a GET returns.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_HOT_BYTES`
+
+Sets how many bytes of small objects a storage shard keeps in memory to answer repeated GETs. An object counts as small up to 60000 bytes. A GET for a kept object is answered without opening its file. A shard keeps objects of any key, whichever shard owns it. Default: **33554432** (32 MiB); **0** keeps nothing. This changes CPU use, GET throughput and the memory a worker holds, never what a GET returns.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_COMPACT_FLOOR`
+
+A test aid that sets the fewest records a bucket's journal must hold before a storage shard compacts it. Compaction rewrites the journal without its superseded records. Default: **4096**. A test lowers it to see compactions without thousands of writes. This changes how often a journal is rewritten, never what it holds.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_HASH_THREADS`
+
+Sets how many helper threads a storage worker uses to compute the digests of large uploads. The digests are the ETag's MD5, any **x-amz-checksum-** the request asked for or the default CRC64NVME, and the SHA-256 that verifies a signed body (a hex payload hash or aws-chunked signatures). The threads keep the worker's loop from being the one core that all upload hashing has to fit in. Default: **3**, or the machine's cores divided by the runtime's shards when that is fewer, but at least one. This way the shards' threads together do not outnumber the cores. **0** hashes on the loop.
+
+The first upload of 256 KiB or more (or of unknown length) starts the threads, and they end with the runtime. Smaller bodies are hashed in line, because the hand-off costs more than their digest. For the same reason, a body that arrives a few segments at a time is handed over 64 KiB at a time. This changes CPU use and the throughput of large puts, never what is stored.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS`
+
+A test aid that sets how many seconds a bucket lifecycle rule counts as one day. The range is 1 to 86400. Only the lifecycle sweep reads it, and the sweep then also runs as often as every second. Unset, a day is a day. Because it changes when objects expire, never set it for a runtime holding data anyone wants (see Bucket lifecycle).
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_SHARE_NOTIFY_ALLOW`
+
+Lists the URL prefixes, comma-separated, that a share link's webhook may begin with. Unset, the allowed prefixes are the webhooks of Discord, Slack and ntfy.sh (see Drive, links, media and the web interface).
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_SHARE_BURN_GRACE_SECS`
+
+A test aid that sets how many seconds a burning share link's files outlive its last allowed download. Default: 600 (see Drive, links, media and the web interface).
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_RESOLV_CONF`
+
+A test aid that names the file from which the resolver on a runtime's loop reads its nameservers, search list and options. The file uses the **resolv.conf**(5) format, so a test can point the resolver at a nameserver of its own. Default: /etc/resolv.conf (see What can stop the event loop). A mail runtime's SPF, DKIM and DMARC lookups also ask these nameservers.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_MX_PORT`
+
+A test aid that sets the port on which a mail runtime hands mail to a domain's exchangers. Default: 25. A test's own server can then act as an exchanger.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_TLS_CA`
+
+A test aid that names the CA file a mail runtime checks an exchanger's certificate against. It applies where DANE or MTA-STS asks for that check. Default: the system's roots. A test's own exchanger can then be trusted.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_STS_CA`
+
+A test aid that names the CA file a mail runtime checks an MTA-STS policy server against. Default: the system's roots.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_STS_CONNECT`
+
+A test aid that sets the *host*:*port* from which every MTA-STS policy is fetched. The name in the policy's URL is still the one checked. A test can thus serve the policies of domains it does not own. Default: each policy's own host.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_DELAY_NOTICE_MS`
+
+A test aid that sets how many milliseconds a mail runtime tries a message before it tells the sender the message is late. This applies only to senders who asked for the notice (NOTIFY=DELAY). Default: four hours.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_SPOOL_MOVE_MS`
+
+A test aid that sets how many milliseconds a sealed spool segment waits before it is used again. Before the segment is reused, the few messages still in it are moved. Default: one minute.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_DEAD_DOMAIN_MS`
+
+A test aid that sets how many milliseconds a mail runtime holds on to a domain that cannot take mail. This covers a domain it found not to exist or to take no mail. After this time, the runtime looks the domain up again. Default: ten minutes.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_PUSH_CONNECT`
+
+A test aid that sets the *host*:*port* to which every JMAP push is posted. The certificate is still checked for the name in the push URL. A test can thus receive the pushes of a URL it does not own. Default: the URL's own host.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_PUSH_CA`
+
+A test aid that names a file of CA certificates for checking a JMAP push URL's certificate. Default: the system's CA certificates.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_IDLE_MS`
+
+A test aid that sets how many milliseconds a connection to a mail runtime may stay quiet before it is closed. The same limit applies to how long a TLS handshake may take. The runtime tells the client before it closes the connection. Defaults: five minutes for SMTP, POP3 and ManageSieve, thirty minutes for IMAP, and thirty seconds for a handshake.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_BAYES_FOLD_MS`
+
+A test aid that sets how many milliseconds new spam filter learning stays in a mail runtime's journal. After this time, the first shard folds it into the filter's file. Default: ten minutes.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_IDP_CLIENT_CA`
+
+A test aid that names a file of CA certificates for checking the client metadata documents an idp fetches. The certificate served with each such document is checked against this file. Default: the system's CA certificates.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_IDP_CLIENT_CONNECT`
+
+A test aid that sets the host:port from which every client metadata document is fetched. The name in the document's address is still the one sent and checked. Default: the host in that address.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_IDP_COMPACT_AFTER`
+
+A test aid that sets how many account changes an idp runtime journals before it folds them into its snapshot. A test can thus see the snapshot written while changes go on. Default: 1000.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_SPOOL_FROZEN_US`
+
+A test aid that names every message of a mail runtime after this fixed microsecond instead of the clock. Writers in two shards then produce the same name, as they would if they wrote in the same microsecond. Default: the clock.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_QUEUE_SCALE`
+
+A test aid that runs a mail runtime's retries and **--queue-lifetime** this many times faster. A test can then see a message tried again and given up within seconds. Default: 1.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_BUSY_HOLD_MS`
+
+A test aid that sets how many milliseconds a mail runtime pauses a domain after one of its exchangers answered 421. During the pause, the runtime opens no new connection to that domain. Each further 421 doubles the pause, up to fifteen minutes, until a message is taken. Default: thirty seconds.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_SPOOL_KEEP_BYTES`
+
+A test aid that sets how many bytes of message bodies a mail spool keeps in memory beside its segments. Default: 64 MiB. A small value lets a test have bodies read back from disk.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_NOTIFY_HOSTS`
+
+A test aid that names a hosts file for a storage runtime's notification webhooks. The file holds one *name address* pair per line. The webhooks' resolver reads it before the system resolver, on every resolve, so a test can point a webhook's host name at another address. Unset, a name is asked of the resolver on the loop and then of the system's resolver (see Event notifications).
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_NOTIFY_QUEUE`
+
+Sets the most undelivered events a storage shard holds. Beyond that, a new event is dropped and counted in **notify_dropped**. Default: 10000. A test lowers it to reach the bound.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_CLUSTER_QUEUE`
+
+Sets the most changes a storage shard queues for another node of its cluster. Beyond that, the shard lets the queued changes go. Once that node answers, the shard sends it everything instead (see Cluster). Default: 100000. A test lowers it to reach the bound with a few writes.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_REPLICATION_HOSTS`
+
+A test aid that names a hosts file for a storage runtime's replication targets. The file holds one *name address* pair per line. The targets' resolver reads it before the system resolver, on every resolve, so a test can name a target by a host name. Unset, a name is asked of the resolver on the loop and then of the system's resolver (see Replication).
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_STOP_HOLD_MS`
+
+A test aid that makes a storage shard's stop wait before it lets go of its directory. The value is in milliseconds, 0 to 3000. The wait starts after the shard's in-flight work has finished, and it is multiplied by the shard's number plus one. A test can thus start a runtime beside shards that are still stopping. Unset, a stop waits only for its own work. It slows every stop and restart, so never use it on a runtime in use.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_START_SPIN_MS`
+
+A test aid that makes a storage shard's start keep the CPU busy before it opens its store. The value is in milliseconds, 0 to 30000. The shard uses CPU the way reading a large store's files does.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_START_SLEEP_MS`
+
+A test aid that makes a storage shard's start wait idle before it opens its store. The value is in milliseconds, 0 to 60000. This imitates a wedged start.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_LOG_FLUSH_MS`
+
+A test aid that sets how long a storage shard holds server access log lines before it delivers them. The value is in milliseconds, 100 to 3600000. Default: one minute.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_RECOVERY_THREADS`
+
+Sets how many threads a storage worker uses to read its object headers when it starts after an unclean stop. The range is 1 to 64. Default: the number of CPUs the worker may run on, at most 16. The threads end before the listener opens. This changes how long such a start takes, never what it finds.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_RECOVERY_DEPTH`
+
+Sets how many opens and header reads each recovery thread keeps in flight on an io_uring of its own. The range is 0 to 256. Both this value and the thread count are lowered to fit within half of what **RLIMIT_NOFILE** leaves. Default: **32**; **0** reads one file at a time without a ring. This changes how long a start from a cold cache takes, never what it finds.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_STORAGE_RECV_BUFS`
+
+Sets how many 16 KiB buffers a storage worker's receive ring holds; the value must be a power of two. Default: **64**; **0** removes the ring, and every connection reads into a buffer of its own. A connection borrows a buffer only for the length of one completion, so an idle keep-alive connection holds none. When a receive finds the ring empty, it uses a buffer of its own for that one read. Such reads are counted as **recv_fallbacks** in **stats**. This changes the memory a worker holds, never what it returns.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_TLS_FAILURE_REPORT_SECS`
+
+Sets how often a runtime serving TLS logs one line counting the inbound handshakes that failed since its last report. Default: every 60 seconds; the range is 1 to 3600. A failed handshake comes from a port scanner far more often than from a client, so each one is counted rather than logged.
+
+### `SOCKETLEY_ACME_DIRECTORY`
+
+Sets the directory URL of the ACME CA that **--acme** and **acme issue** use. Default: Let's Encrypt, **https://acme-v02.api.letsencrypt.org/directory**. Its staging CA is **https://acme-staging-v02.api.letsencrypt.org/directory**. Each CA has an account of its own.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_ACME_CHALLENGE`
+
+Sets the challenge type that **acme issue** and **--acme** use to prove a name when no type is requested. The values are **http-01** (the default), **tls-alpn-01** and **dns-01**. A wildcard name is always proven over DNS-01, whatever this variable says.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_ACME_DNS_WAIT`
+
+Sets the seconds between publishing a DNS-01 answer and telling the CA to look for it. The answer is published where the **dns** runtimes serve it. The wait is the time a secondary of the zone has to take the new serial, and the delegation probe gives the secondary the same time. Default: 10, at most 3600. A secondary that is told by NOTIFY and transfers on it takes seconds. For a secondary that waits for its refresh, set this to the minutes the refresh takes.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_ACME_DNS_PROBE`
+
+Names the resolver that **acme issue** asks whether a zone is delegated to this daemon's **dns** runtimes. The value has the form *host*[:*port*]. **acme issue** asks about a zone of **--dns-zones** before it proves anything there over DNS-01. It then asks each name server of the zone, by its IPv4 addresses, the way a CA would. **off** asks nothing and treats every zone as delegated. Default: the first **nameserver** of */etc/resolv.conf*.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_ACME_CA`
+
+Names a PEM file of root certificates for checking the ACME CA's own HTTPS. Use it for a CA whose certificate no system store holds, such as Pebble. Default: the system's roots.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_GIT_ACCESS_KEY`
+
+Holds the access key that **git-sync** uses to write into a library. A storage runtime that starts git-sync gives it temporary credentials of the user for whom the repository is kept.
+
+### `SOCKETLEY_GIT_SECRET`
+
+Holds the secret of that access key.
+
+### `SOCKETLEY_GIT_SESSION_TOKEN`
+
+Holds the session token of temporary credentials, sent as x-amz-security-token.
+
+### `SOCKETLEY_GIT_TOKEN`
+
+Holds a GitHub token that **git-sync** uses to read a private repository. git-sync gives it to git as an http.extraHeader in git's environment, never on a command line.
+
+### `SOCKETLEY_FFMPEG`
+
+Names the ffmpeg that a storage runtime uses to make thumbnails and streams under **/~media/**. The runtime reads what a film is with the **ffprobe** beside that ffmpeg, or the one on **PATH**. Default: the first **ffmpeg** on **PATH**. With neither, a media request is answered **501**. The runtime reads this variable at its first media request.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MEDIA_HWACCEL`
+
+Selects where a storage runtime encodes its renditions. **off** always uses x264 on the CPU. A render node such as **/dev/dri/renderD129** uses that GPU. The default is **/dev/dri/renderD128**.
+
+At its first medium, a worker runs one second of test picture through the GPU's whole chain (upload, scale, H.264 encode). It tries the full encoder and then the low-power one. The worker uses the GPU for renditions only when one of them works; until it knows, renditions use x264. A rendition keeps the encoder that its first job chose. If a rendition's first GPU job fails before anything is made, that rendition continues with x264. HLG is tone-mapped on the CPU, HDR10 on the GPU. **vaapi-unchecked:***node* skips the test run, for testing that fallback.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MEDIA_CACHE_MB`
+
+Sets the size in MiB beyond which a storage runtime removes the media it made from *dir*/.media/. It removes the least recently requested media first. Default: 10240. The medium made last is kept even when it alone is larger, and no medium is removed while it is being made.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_CACHE_TTL_SWEEP_MS`
+
+Sets the interval in milliseconds between periodic sweeps for expired cache keys. Default: **500**. This never affects correctness: an expired key is not served no matter when the sweep runs, because every read path checks the expiry itself. The interval controls only how quickly keys that are never accessed again release their memory.
+
+### `SOCKETLEY_LUA_TIMEOUT_MS`
+
+Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely, and also turns on LuaJIT's trace compiler. The compiler is worth about 2.4x on a callback that computes, and about 1% on one that does not. See **Callback Deadline**, which prices both halves of that trade.
+
+This is the default for every script that does not declare its own **callback_timeout_ms** global; a script that declares one overrides it. A value that is not a whole number of milliseconds in 0–3600000 is refused with a warning, and the default is used.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_HTTP_REVALIDATE`
+
+Set to **0** to switch off the response cache of plain **--http**. Each request then costs an open, a read and a close again. Any other value, or leaving the variable unset, keeps the cache on. The variable is read when the runtime starts, so a **restart** picks up a change. The server serves the same content either way, because the cache is revalidated on every request. The switch exists for measurement, and for ruling the cache out when diagnosing something else.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_KERNEL_TLS`
+
+Set to **0** to keep every TLS record in this process. Otherwise, some TLS 1.3 connections hand their sending to the kernel's TLS layer. This happens in three cases. A server, storage or proxy connection sends a file or object over 256 KiB. A TCP proxy's backend streams that much to the client. An HTTP/1.1 proxy sends a client an answer body of that known length.
+
+The connection then changes its send key and hands the new key to the kernel's TLS layer. The kernel encrypts what is sent, by sendfile from the page cache or spliced from the backend, at about half the CPU of encrypting a copy in this process. A connection that never sends that much stays as it was, because for small answers encrypting a copy here costs less. HTTP/2 connections are never moved.
+
+This needs the kernel's **tls** module (**modprobe tls**). Without the module, the connection continues in user space under its new key, and the runtime says so once in its log. The variable is read when the runtime starts.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_PROXY_SPLICE`
+
+Makes a **--protocol tcp** proxy splice a pair from its first byte to its last, not only while a side streams. Unset by default; any value other than **0** turns it on. It is read once per process and inherited by worker processes.
+
+Without the variable, each side of a pair decides for itself. A side copies through a buffer until four reads in a row have filled it, which marks a stream. It then moves its bytes with **splice**(2) through a pipe. The splice is called on the event loop, with both sockets non-blocking for the call. It never goes through io_uring, whose splice is an io-wq hand-off per transfer. Four splices in a row that would not have filled the buffer mark messages. The side then goes back to copying and gives its pipe back. Each switch waits until nothing of the other path is in flight or queued, so no byte overtakes another. Measured on one core, over loopback, through the proxy:
+
+```
+                        copy             adaptive         from the first byte
+4 GB stream             3.4-4.2 GB/s     9.3-9.9 GB/s     10.1 GB/s
+  CPU per GB            0.24-0.30 s      0.08-0.11 s      0.08-0.10 s
+64 B messages, 32 conns 6.95 us           6.86 us          10.36 us
+4 KB messages           7.41 us           7.37 us          9.28 us
+```
+
+So the variable is for measuring, not for speed. A TLS listener or TLS backend never splices. Neither does a pair with a 127.0.0.1 leg while the daemon runs with **--fast-lo**. A proxy with an **on_proxy_request** or **on_proxy_response** hook never splices either, because the kernel would move those bytes without the script ever seeing them. Nor does a proxy with a **--rate-limit** or **--global-rate-limit**, which is charged per read.
+
+### `SOCKETLEY_FAST_LO`
+
+Set by a daemon started with **--fast-lo** once the shortcut is attached; it is not a setting. The value is **own**, **all** or **trust**. It tells the daemon's workers to keep a proxied pair with a 127.0.0.1 leg off splice. The daemon clears any inherited value at startup.
+
+### `SOCKETLEY_NAPI_BUSY_POLL_US`
+
+Enables io_uring NAPI busy polling with this timeout in microseconds. Unset by default. It trades CPU for lower receive latency on busy links.
+
+### `SOCKETLEY_HUGEPAGE`
+
+Set to **0** to stop cache workers from asking glibc for transparent huge pages. On by default, and only a cache asks for them. A cache's hot path walks a keyed structure larger than the TLB covers, which is what a huge page is for. A server showed no measured gain for the extra resident memory. glibc reads the tunable at process startup, and a running process cannot ask for itself. The daemon therefore puts it in the worker's environment at exec.
+
+### `SOCKETLEY_RECV_MULTISHOT`
+
+Set to **0** to arm one read at a time instead of a multishot receive. On wherever the kernel supports it. A multishot arm is one submission for a stream of messages instead of one per message. The switch exists so that the two can be measured against each other on one binary.
+
+### `SOCKETLEY_RECV_BUNDLE`
+
+Set to **0** to stop packing several provided buffers into one receive (**IORING_RECVSEND_BUNDLE**). On where the kernel supports it. Support is probed once rather than assumed, and the receive falls back to the plain multishot arm wherever the flag is refused.
+
+Both of these variables read **only** the exact string **0**. **SOCKETLEY_RECV_MULTISHOT=off** leaves multishot on, which is the opposite of what it looks like. The **SOCKETLEY_NO_*** switches below follow the other rule: any value except **0** turns the feature off.
+
+### `SOCKETLEY_NO_SHARD_MESH`
+
+Any value but **0** stops shards from linking to each other directly. The shards then relay through the daemon, and the daemon logs at startup that the mesh is off. This is the measurement control for the mesh: the two paths differ only in the route, not in the build.
+
+### `SOCKETLEY_NO_PEER_LINKS`
+
+Any value but **0** stops runtimes from opening direct links to their peers. It exists for the same reason as **SOCKETLEY_NO_SHARD_MESH** and is read the same way.
+
+### `SOCKETLEY_NO_COMPANION`
+
+Any value but **0** stops a unix-socket listener from being placed beside a port.
+
+### `RES_OPTIONS`
+
+Passes options to glibc's resolver; socketley itself does not read it. If you have not set it, socketley sets it for worker processes to **timeout:1 attempts:2**.
+
+It is set because **getaddrinfo**(3) blocks the thread that calls it. In a worker, that thread is the event loop, with the daemon's control socket armed on the same ring. While a lookup waits, **stop** and **stats** go unanswered. glibc's own default is five seconds, twice. Against a nameserver that drops packets, that measured 10.0 s for one lookup. And a client re-resolves on every reconnect once its cached address stops accepting. One second twice has the same ceiling as two seconds once, and still retries a lost packet.
+
+If you set it yourself, your value is used unchanged, for the daemon and every worker. Raise it if a slow but working nameserver is being given up on. The cost of giving up is one more reconnect round, not a failed runtime.
+
+### `EDITOR , VISUAL`
+
+Name the editor that **socketley edit** opens when given no flags. **VISUAL** is tried first.
+
+### `TMPDIR`
+
+Sets where that editor's temporary file is written. While the editor is open, the file holds the runtime's entire configuration; for a cache, that includes **master_pw**. If */tmp* is shared, point this at a directory of your own. The file is created 0600 and removed when the editor exits.
+
+### `SOCKETLEY_DNS_CACHE_MS`
+
+Sets how long, in milliseconds, **socketley.http()** reuses a resolved address before it asks the resolver again. Default: **60000**. **0** disables reuse and makes every call resolve.
+
+This is a ceiling, not a promise. If a connect to the cached address is refused or times out, the entry is dropped at once. An endpoint that moved is then followed on the next call. So this value only decides how long the cache stays wrong about an endpoint that moved *without* refusing, which is when something else answers on the old address.
+
+The cache exists because **getaddrinfo**(3) blocks the thread that calls it, glibc caches nothing of its own, and in a worker that thread is the event loop. Every other resolver in this daemon is bounded by something. A client and a server re-resolve at most once per second of reconnect backoff, a proxy once per thirty-second sweep, and the rest once at start. Without the cache, **socketley.http()** would resolve on every call. It resolves on a thread of its own and gives up at the call's deadline. A resolver that does not answer therefore costs a call its timeout, rather than costing the loop every retry the resolver makes.
+
+### `SOCKETLEY_RAFT_TICK_MS`
+
+Sets the Raft tick, in milliseconds, of a daemon started with **--raft-listen**. Default: **100**. The election timeout is ten to twenty ticks, and a heartbeat is sent every tick. Every member of one cluster should therefore use the same value.
+
+### `SOCKETLEY_RAFT_COMPACT_EVERY`
+
+Sets how many applied Raft entries go by between snapshots. Default: **1000**. A small value makes a joining node catch up through a snapshot; the test suite sets it for that purpose.
+
+### `SOCKETLEY_CONFIG`
+
+Sets the path to the daemon configuration file.

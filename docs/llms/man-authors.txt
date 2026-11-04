@@ -1,0 +1,5 @@
+# Authors
+
+From the manual page socketley(1).
+
+socketley was created for high-performance network runtime management.

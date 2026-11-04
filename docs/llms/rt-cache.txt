@@ -1,0 +1,1093 @@
+# cache runtime
+
+In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub
+
+A **cache** is an in-memory data store that speaks the Redis protocol, so `redis-cli` and Redis libraries work unchanged. `nc` works too, in plain text.
+
+```
+socketley create cache store -p 6379 -s
+redis-cli -p 6379 SET greeting hello
+redis-cli -p 6379 GET greeting
+
+socketley create cache sessions -p 6380 --maxmemory 512M --eviction allkeys-lru \
+    --persistent /var/lib/socketley/sessions.bin -s
+socketley create cache copy -p 6381 --replicate 10.0.0.5:6380 -s
+```
+
+> Warning: A cache has no password. It serves this machine only, unless created with `--public` or mutual TLS (`--tls --cert --key --ca`).
+
+## What it does
+
+- **Redis data types**: Strings, lists, sets, hashes, sorted sets, streams; see [commands](man-cache-flags.txt).
+- **Redis features**: TTLs, pub/sub and transactions over [RESP](man-cache-flags.txt).
+- **Bounded memory**: `--maxmemory` with an `--eviction` policy.
+- **Persistence**: `--persistent file`; `--persistent-interval` journals writes.
+- **Replication**: `--replicate` makes a read-only [follower](man-cache-flags.txt).
+- **Several cores**: `--shards N`, one keyspace; `--cluster` for cluster-aware clients.
+- **Database backing**: Lua `on_miss` reads through, `on_write` writes behind; see [database backend](man-cache-flags.txt).
+
+## Works with
+
+A [server](rt-server.txt) with `--cache` lets its clients and scripts reach it.
+
+## Flags
+
+Every flag a cache runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
+| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
+| `--key` | path | Key: The PEM key of the certificate. |
+| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
+| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. |
+| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+| `--rate-limit` | int | Rate limit: Messages a second per connection. |
+| `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. |
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
+| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. |
+| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
+| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
+| `--drain` |  | Drain on stop: Finish what is in flight before stopping. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**Cache**
+
+| flag | value | what it does |
+|---|---|---|
+| `--mode` | one of readonly, readwrite, admin | Access: What its clients may do: read, read and write, or everything. |
+| `--persistent` | path | Persist to: The file it is kept in across restarts. |
+| `--persistent-interval` | duration | Journal every: How often accepted writes reach the journal. |
+| `--maxmemory` | size | Max memory: The most memory its data may take. |
+| `--eviction` | one of noeviction, allkeys-lru, allkeys-random | When full: Refuse writes, or evict keys. |
+| `--resp` |  | Redis protocol only: Speak RESP to every client, without detecting it. |
+| `--replicate` | text | Follow: The leader cache it follows, host:port. |
+| `--public` |  | Public: Serve clients on other machines too. |
+| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard. |
+
+## Benchmarks
+
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### Redis protocol, one command per round trip
+
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+
+| case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
+|---|---|---|---|---|---|
+| SET | 232 K /s (1.00 cores) | 203 K /s (1.00 cores) | 208 K /s (1.00 cores) | 1.08× (0.89–2.03) | 1.11× (0.86–2.00) |
+| GET | 235 K /s (1.00 cores) | 206 K /s (1.00 cores) | 149 K /s (1.00 cores) | 1.03× (0.92–1.55) | 1.59× (0.97–2.15) |
+| LPUSH | 230 K /s (1.00 cores) | 220 K /s (1.00 cores) | 240 K /s (1.00 cores) | 1.11× (0.91–2.08) | 0.96× (0.85–2.06) |
+| LPOP | 237 K /s (1.00 cores) | 234 K /s (1.00 cores) | 241 K /s (1.00 cores) | 1.03× (0.92–1.75) | 1.01× (0.94–1.57) |
+| SADD | 237 K /s (1.00 cores) | 188 K /s (1.00 cores) | 180 K /s (1.00 cores) | 1.25× (0.87–2.02) | 1.35× (1.05–2.13) |
+| HSET | 229 K /s (1.00 cores) | 203 K /s (1.00 cores) | 228 K /s (1.00 cores) | 1.10× (0.84–1.69) | 0.99× (0.92–2.07) |
+| ZADD | 234 K /s (1.00 cores) | 174 K /s (1.00 cores) | 209 K /s (1.00 cores) | 1.39× (0.89–1.93) | 1.18× (0.90–2.27) |
+
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
+
+### Redis protocol, 100 commands per message (pipelined)
+
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+
+| case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
+|---|---|---|---|---|---|
+| SET | 11.14 M /s (1.00 cores) | 4.89 M /s (1.00 cores) | 2.85 M /s (1.00 cores) | 2.27× (2.17–2.64) | 3.91× (3.74–4.11) |
+| GET | 11.68 M /s (1.00 cores) | 5.36 M /s (1.00 cores) | 3.96 M /s (1.00 cores) | 2.22× (1.96–2.57) | 3.00× (2.76–3.61) |
+| LPUSH | 9.28 M /s (1.00 cores) | 4.45 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.08× (2.00–2.32) | 3.07× (3.03–3.29) |
+| LPOP | 10.56 M /s (1.00 cores) | 3.68 M /s (1.00 cores) | 2.69 M /s (1.00 cores) | 2.87× (2.66–3.26) | 3.91× (3.72–4.20) |
+| SADD | 11.42 M /s (1.00 cores) | 5.05 M /s (1.00 cores) | 3.47 M /s (1.00 cores) | 2.31× (2.06–2.76) | 3.27× (3.03–3.68) |
+| HSET | 9.96 M /s (1.00 cores) | 4.13 M /s (1.00 cores) | 2.86 M /s (1.00 cores) | 2.37× (2.09–2.86) | 3.48× (3.19–3.84) |
+| ZADD | 9.60 M /s (1.00 cores) | 3.84 M /s (1.00 cores) | 2.73 M /s (1.00 cores) | 2.38× (2.15–2.88) | 3.44× (3.18–3.69) |
+
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. One key, the easy case for every cache.
+
+### Pipelined, keys drawn from 100,000
+
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+
+| case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
+|---|---|---|---|---|---|
+| SET | 9.71 M /s (1.00 cores) | 3.95 M /s (1.00 cores) | 2.77 M /s (1.00 cores) | 2.46× (2.30–3.00) | 3.51× (3.41–3.56) |
+| GET | 10.01 M /s (1.00 cores) | 4.64 M /s (1.00 cores) | 3.84 M /s (1.00 cores) | 2.18× (2.10–2.56) | 2.60× (2.56–2.75) |
+| SADD | 8.97 M /s (1.00 cores) | 4.34 M /s (1.00 cores) | 3.24 M /s (1.00 cores) | 2.04× (1.99–2.50) | 2.77× (2.73–2.83) |
+| HSET | 6.48 M /s (1.00 cores) | 3.54 M /s (1.00 cores) | 2.57 M /s (1.00 cores) | 1.82× (1.73–2.02) | 2.56× (2.41–2.63) |
+| ZADD | 1.56 M /s (1.00 cores) | 1.23 M /s (1.00 cores) | 1.13 M /s (1.00 cores) | 1.26× (1.24–1.28) | 1.38× (1.35–1.40) |
+
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The keyspace no longer fits the caches, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
+
+## The manual on cache
+
+#### `--listen unix:/path/to.sock`
+
+Serves the cache on an AF_UNIX socket instead of the **-p** port. **redis-cli -s** connects to it, and both the plaintext and RESP protocols are detected as on a port. The full description is under **--listen** in **COMMON FLAGS**. It is refused with **--cluster**, because cluster members advertise ports computed from a formula, and RESP has no way to write a filesystem path as a node address.
+
+**It is worth measuring before it is worth arguing about.** On one test machine, one cache and one redis-server were loaded with the same keys and driven with GET by eight client processes:
+
+```
+socketley over TCP      2,969,848/s        redis over TCP    1,411,960/s
+socketley over AF_UNIX  4,517,387/s        redis over AF_UNIX 2,319,573/s
+```
+
+Both programs gain about half again. That gain is the TCP and netfilter path dropping out of the measurement, not anything either program does differently. On a machine with conntrack loaded and nftables rules on the OUTPUT hook, which includes any machine running Docker, that path is not free. A peer on the same machine does not need it.
+
+#### `--listen with --shards binds one node per shard.`
+
+Shard *i* gets *name*#i.sock*:* the shard number is inserted before the suffix, by the same rule the daemon's own companion nodes follow. N processes binding *one* path would unlink each other's node, and only the last would stay reachable. N paths are N listeners.
+
+**The formula is the interface.** On a server, every shard answers every request, so a caller can use any node. On a *cache* the shards are not interchangeable, and choosing the right one pays off. A caller that hashes the key the way **CLUSTER KEYSLOT** does and connects to that shard's node causes no crossing between shards. That is the same saving **--cluster** gives between ports. A caller that picks a node at random still gets correct answers, because the shard crosses to the owner, but it pays the cost of that crossing.
+
+**What that crossing costs, measured.** The setup was one daemon pinned to four cores, and eight **redis-benchmark** processes of twenty-four connections each on the other twelve cores, running GET at depth 1. There were six interleaved passes with the order rotated, the first discarded, and a clock probe at both ends of the run. Client CPU is recorded beside every row, because a client that hits its CPU limit inverts the sign of a comparison before it changes its size. The clients never used more than 5.8 of their twelve cores.
+
+| arrangement | GET/s | x1 | cores | us/op |
+|---|---|---|---|---|
+| 1 shard | 240,671 | 1.00 | 1.00 | 4.16 |
+| 2 shards, one address | 251,959 | 1.05 | 1.91 | 7.60 |
+| 4 shards, one address | 421,093 | 1.75 | 3.95 | 9.38 |
+| 4 shards, slot-routed | 673,017 | 2.80 | 3.65 | 5.43 |
+
+**Behind one address the shards buy far less than the cores they take.** Two shards take 1.91 cores and return 1.05x; four take 3.95 cores and return 1.75x. With two shards, half the keys belong to a sibling; with four, three quarters do. Serving those keys roughly doubles the cost per operation: 4.16 us with one shard, against 7.60 with two and 9.38 with four. With a client that picks the owning shard, the same four shards return 2.80x at 5.43 us, which recovers most of what the crossings were costing.
+
+**How well the crossings batch decides this cost, and the client decides how well they batch.** The mesh queues each crossing and flushes once per loop turn, so requests that arrive together cross together. At the same 192 connections, twelve client processes of sixteen connections give the two-shard arm 0.90x, while eight processes of twenty-four give it 1.05x. In the same two shapes the one-shard arm reads 235,421 and 240,671, unchanged. Measured on a floor of two processes and two rings, one crossing at a time costs 8.13 us, while thirty-two in a batch cost 282 ns each. So a figure for this flag is a figure for one arrival pattern. The figure above is the more favourable of the two shapes tried.
+
+**The ceiling above that is the machine, not this flag.** Four shards routed by key reach 2.80x. Four independent **redis-server** processes on the same four cores, driven the same way, reach 2.88x. socketley is ahead of them in absolute throughput at every count tried: 1.12x at one and 1.09x at four. Neither scales linearly on loopback here. So a cache that must scale needs **--cluster** and a client that routes. The 3.57x quoted for a server under **SERVER FLAGS** does not carry over to a cache.
+
+Against the same cache on TCP with **--cluster**, with both clients routing by key and four shards, AF_UNIX measured at least **1.22x** faster. Two later passes read higher but are not quoted. In them the TCP arm dropped for a reason that was not the port pool (TIME-WAIT peaked at 1,235 of 28,231), and that reason is not understood.
+
+**A remote client gets none of this.** AF_UNIX is local, so the benefit applies only to hops between processes on one machine. The hop that cannot use it today is a proxy in front of a *sharded* cache. A proxy does not read keys, so it would reach the wrong shard (*N*-1)/*N* of the time. Teaching the proxy **cache_shard_of** would solve that, but it is not done.
+
+#### `--persistent file`
+
+The file the cache is stored in. The cache is saved on stop and loaded on start.
+
+The file is written with mode **0600**. The dump holds whatever was cached. Because the cache *loads* it on start, the dump is not just a record of what the cache held: it decides what the cache will hold. Earlier versions wrote it with mode **0644**, readable by every account on the machine. When the cache next loads such a dump, it narrows the file's mode and writes a line to the daemon log.
+
+The file mode is all this flag can control. Replacing a file needs write permission on the *directory*, not on the file. So put *file* in a directory that only this daemon's user can write to, not in a world-writable directory shared with other accounts.
+
+**With --shards each shard writes its own slice, and the set survives a changed shard count.** With one shard, the cache writes *file* itself; with more than one, the shards write *file*.shard0*,* *file*.shard1 and so on. Each file records the shard count it was written under and a fingerprint of the function that decides which shard owns a key. So a cache dumped at four shards and started at eight is redistributed rather than loaded into the wrong slices. Every key survives; this was measured across 1->4, 4->1, 4->8, 8->4 and 4->4.
+
+If the set of files cannot be trusted, the start is refused rather than serving part of the data. The error names a missing slice. Files that disagree about the shard count, such as the dumps of two runs in one place, are refused together. The dump that replaces them removes slices left by a run with more shards.
+
+#### `--persistent-interval duration`
+
+Journals every accepted write next to the dump, and flushes the journal at this interval. An acknowledged write reaches the kernel at most *duration* after it was accepted. So a killed or OOM-killed worker loses at most the last interval of writes, instead of everything since the last stop or FLUSH. Requires **--persistent**; refused without it. Durations are read as everywhere else (**30s**, **5m**, **1h**), and a bare number is seconds.
+
+The journal is *file***.journal** (per shard, *file***.shardN.journal***),* written with mode **0600**. A clean stop and the admin **FLUSH** command write the dump and cut the journal behind it. An unclean stop leaves a tail, which the next start replays on top of the dump before serving. If the crash tore the tail in the middle of a record, the tail is dropped back to the last complete record, and the daemon log gives the number of dropped bytes. TTLs are journaled as absolute deadlines. So a key that had five seconds left when it was written has whatever remains of those five seconds after a replay, possibly nothing.
+
+The flush is a write into the kernel's page cache, and deliberately not an fsync. The guarantee covers a dead process, not a dead machine: a power cut can also lose what the kernel had not yet written back.
+
+A journal with records written under a different shard count, or a different ownership function, refuses the start. The cache does not guess at an order for one key's history across two files. To recover, start under the shard split that wrote the journal and stop cleanly, or delete the **.journal** files to discard the tail.
+
+#### `--mode mode`
+
+Sets the access control mode. **readonly** allows GET and SIZE only; **readwrite** allows GET, SET, DEL and SIZE, and is the default; **admin** allows all commands, including FLUSH and LOAD.
+
+**readonly** also applies to this cache's own Lua script, and there it fails more quietly than on the wire. A client that sends a write is told "**denied: readonly mode**". The twelve mutating **self.*** calls refuse by returning exactly what they return when there was nothing to do: **false** for nine of them, an empty string for **self.lpop** and **self.rpop**, and **nil** for **self.sadd**. A script calls **self.cache_mode()** to tell the two cases apart. The return values are listed with the calls under **LUA API**.
+
+#### `--maxmemory size`
+
+The most memory the cache may use for its data. Takes a size with K, M or G (for example 100M or 1G). When the limit is exceeded, the eviction policy decides what happens. 0 means no limit, which is the default.
+
+The only suffixes are **K**, **M** and **G**. A value the parser cannot read in full is refused, not partly read. So **100MB** is an error rather than a hundred bytes. A value so large that the multiplication would wrap is also an error, rather than 0, which means "unlimited".
+
+#### `--eviction policy`
+
+The eviction policy used when maxmemory is reached. **noeviction** rejects writes and is the default; **allkeys-lru** evicts the least recently used keys; **allkeys-random** evicts random keys.
+
+#### `--resp`
+
+Forces the RESP2 protocol (the Redis wire protocol) on all connections. By default, the cache switches a connection to RESP when its first byte is '*'. With this flag, every connection uses RESP regardless.
+
+#### `--replicate host:port`
+
+Connects to the given leader cache as a follower. The follower receives a full data dump when it connects, and then the leader's write commands as they happen. The follower is read-only.
+
+Values that contain a newline replicate intact. The link carries one command per line, and a cache value can be any bytes. A command that cannot be written as one line is sent length-framed instead. Any other command is sent unchanged. So a leader and a follower of different versions agree on every dataset that older versions replicated correctly. A follower too old to understand a frame stores nothing for that command, rather than storing a truncated value.
+
+Replication is *not* encrypted, in either direction, so it cannot be combined with **--tls**. That pair is refused at **create**, by **edit** and **import**, and again at every **start**. A **--tls** cache also refuses the **replicate** command, so it never becomes a leader either. See **TLS** under **LIMITATIONS**.
+
+**A sharded cache cannot be a replication leader, and says so.** A follower arrives as one connection, and **SO_REUSEPORT** gives it to one shard. That shard would have to be the only writer to the follower's socket, and the other shards have no socket to the follower at all. Promoting the cache anyway would send the follower only one shard's writes and report success. So **replicate** is refused on a cache with more than one shard, and the error names the reason. Fanning the stream out would first need a per-shard sequence and an end-of-dump marker in the follower protocol, and it has neither.
+
+A sharded cache may be a *follower*. Every shard connects to the leader and keeps the part of the stream that its slice owns. So the cache holds the leader's keys once rather than once per shard, at the cost of every shard reading the whole stream.
+
+#### `--tls` / `--cert file` / `--key file` / `--ca file`
+
+Terminates TLS on this cache's listening port, exactly as a server runtime does on its own port. **--tls** requires **--cert** *file* and **--key** *file***;** **--ca** *file* also demands a certificate from every connecting client (mutual TLS). RESP and the line protocol both run on the decrypted stream, so an existing Redis client needs no change beyond speaking TLS. The full description is under **COMMON FLAGS**.
+
+Default port: 9000
+
+#### `--shards N`
+
+Runs the cache as *N* worker processes that share one keyspace. The shard that owns a key is chosen by CRC16 of the key modulo 16384. That is Redis's own hash slot function, hash tags included. Each shard owns a contiguous range of those slots.
+
+The *N* shards share one port through **SO_REUSEPORT**. When a client connects, the kernel gives the connection to whichever shard its four-tuple hashes to. A key that another shard owns is fetched from that shard over the mesh. To any client, the cache is one store.
+
+That crossing costs CPU, and with *N* shards a random key belongs to another shard (*N*-1)/*N* of the time. Measured on this build with 8 client processes × 50 connections, three interleaved passes per arm, medians, in requests per second per *server* core:
+
+```
+four shards, clients on the shared port     63,849   15.66 us/req
+the same runtime with --cluster, clients
+  routed to the per-shard ports             87,401   11.44 us/req
+four independent single-shard caches        87,663   11.40 us/req
+```
+
+Absolute levels cannot be compared between machines or between sessions; what is claimed is the ratio within one interleaved sweep. The same pair measured again hours later on the same binary read 84,828 and 116,894. Every level was a third higher, and the ratio was 1.387 against 1.369.
+
+**--lua under --shards: the script runs in every shard, and each one keeps its own slice.** The keyspace calls of the **self.*** table act only on the keys *this* shard owns. These are **self.set**, **self.get**, **self.del** and seventeen others. For a key the shard does not own, they answer exactly as they answer a refusal: **false** for the mutating calls, an empty string for **self.get** and the two pops, and **nil** for **self.sadd**. They cannot cross to another shard, because the value must be returned on the same turn and the mesh answers on a later one.
+
+For a callback that runs in all *N* processes, such as **on_start** or a timer, this is exactly right: the shards split the work between them and the keyspace is written once. For a callback driven by a connection (**on_miss**, **on_write**, **on_delete**), the key the callback was handed is always owned by this shard, and any *other* key it touches may belong to another shard. A script calls **self.owns(key)** to ask before it acts. It returns true for every key when the cache is one process.
+
+**self.publish** is the one exception that is not refused. The message goes to every shard over the same mesh that the wire's **PUBLISH** uses, because a subscriber is not a key and no shard owns it. Only the returned *count* is this shard's alone: the other shards report back on a later turn, and this call returns on the turn it was made.
+
+#### `--public`
+
+Lets the cache serve peers on other machines. A cache has no password and answers every client with everything it holds. So by default it serves only this machine: a TCP peer whose address is not loopback is answered **-DENIED** and closed before any of its bytes are read. This is Redis's protected mode, for the same reason Redis has it. **--public** lifts this restriction, and so does mutual TLS (**--tls** **--ca**), where the client certificate is the credential. For the same reason, a follower on another host needs its leader to be public. Set the flag at **create**; a running cache takes it through **import**.
+
+#### `--cluster`
+
+Publishes a routable slot map, so a cluster-aware client sends each key straight to the shard that owns it and no crossing happens at all. Off by default.
+
+**Read this before you type it: a cache with --cluster cannot sit behind a proxy used for access control.** With client-side routing, the client connects to every shard *directly*. The cache tells the client where the shards are, using the address that the *asking* connection arrived on. Behind a proxy, the asking connection is the proxy's, so the map names the address at which the *proxy* reaches the cache. Either the client can reach that address too, and the proxy's rules are bypassed by a map the cache handed out. Or it cannot, and the client spends its retry budget on refused connections. Neither outcome produces a log line.
+
+This is not a limitation of this implementation. It is what client-side routing is, and Redis Cluster has exactly the same property. No setting makes a routing client and a proxy enforcement point work together; you have to choose one of the two. Without **--cluster** the cache is reached only through its one port, and a proxy in front of it depends on that.
+
+**Each shard binds its own port.** At two or more shards, shard *i* binds *port*+*1*+*i*, in addition to the shared port. The shared port keeps working exactly as it does without the flag. A client that connects to a per-shard port has chosen that shard on purpose. A key that shard does not own is answered with **-MOVED** *slot host:port* rather than fetched. That lets **redis-cli -c**, **redis-benchmark --cluster**, redis-py, go-redis, lettuce and node-redis route for themselves.
+
+**A cache with --cluster and two or more shards therefore needs port+1 .. port+N free, and refuses to start otherwise.** Whichever shard answers **CLUSTER SLOTS** computes the addresses it sends from a formula. That shard has no way to learn whether its siblings bound their ports. A shard that ran without its port would be advertised anyway, and every client would spend its retries on refused connections. So the start fails instead, and the error names the port and this flag. Without **--cluster**, only the shared port is bound, and two four-shard caches one port apart work as they always did.
+
+**--cluster is legal at any shard count.** At **--shards 1** it publishes a cluster of one node on the base port and binds no extra port. So a client can be written once and deployed at any *N*.
+
+**CLUSTER SLOTS, SHARDS, NODES, INFO, MYID, KEYSLOT and COUNTKEYSINSLOT** are answered on every port and at every shard count, with or without this flag, because a client that asks deserves a straight answer. **CLUSTER INFO** reports **cluster_enabled:1** only when **--cluster** was given; without it the reply is **cluster_enabled:0**, and **CLUSTER SLOTS** publishes a single node that holds every slot on the shared port. That answer is both true and safe. There is no cluster bus, no failover, no slot migration and no **ASK**. The map is a formula, and each slot has one owner for the life of the run.
+
+**On a per-shard port, a command that asks about the keyspace answers for that shard.** **DBSIZE**, **KEYS**, **SCAN**, **FLUSH** and **LOAD** report on or act on the slice that shard holds. That is what a cluster client means when it asks a node, and **redis-cli --cluster call** adds up the results itself. On the shared port these commands still fan out across every shard and merge the results, as they always have. **PUBLISH** fans out on both kinds of port, because a subscriber on another shard is still a subscriber.
+
+A multi-key command on a per-shard port whose keys are all owned by one other shard is answered with **-MOVED**. One whose keys span several shards is answered with **-CROSSSLOT**. That is not pedantry: a redirect would send the client to a shard that would redirect it back.
+
+### Cache Protocol
+
+**A pipelined batch is answered in full or the connection is closed, and either way its cost is bounded.** A connection may owe at most 8 MiB of replies. The replies to a batch are built before the loop returns to the ring, so nothing drains while the batch runs, and the batch must fit inside that bound. Past it, the cache closes the client and logs a line naming the client and how much it was owed.
+
+So the useful pipeline depth is one whose replies fit. Sixteen 256 KiB values make 4 MiB and are answered in full; sixty-four make 16 MiB and the connection is cut. For small values the bound is far away: a 64 byte value at depth 16 is a kilobyte.
+
+Earlier builds did not keep this bound. The batch loop did not stop once the connection was marked closing, and **flush_responses()** returns true for a closing connection, which its callers read as success. So the 1 MiB cap on the reply buffer called a flush that cleared nothing, and the rest of the batch was still parsed and answered into the buffer. Measured with one connection asking for a 256 KiB value and reading none of it:
+
+```
+                        before        after
+    64 pipelined GET    +17 MB        +11 MB
+   512 pipelined GET   +141 MB        +10 MB
+  4,096 pipelined GET  +1,063 MB      +11 MB
+ 16,384 pipelined GET    +941 MB      +11 MB
+```
+
+A GET is about thirty bytes against a 256 KiB answer, so the growth was roughly 8,700 to one, bounded only by how many commands fit in one read. Memory now stays flat.
+
+**A cache serving large values spends most of its time copying them.** This is a property of the design, not a defect to tune around. Profiled at 256 KiB values, 16 clients and one command in flight, sampling the worker process:
+
+```
+              userspace memcpy   kernel copy   page clearing
+  GET               28%             18%            13%
+  SET               42%             28%             —
+```
+
+A GET copies the stored value once, into the reply buffer, and the kernel copies it again into the socket. A SET copies twice: once from the receive ring into the connection's parse buffer, and once from there into the store. Removing the GET copy means sending straight from the store while a send is in flight. That needs the store to promise that a value outlives the send. Every mutating path would have to keep that promise, including LRU eviction and TTL expiry, which a write to an unrelated key can trigger. Removing a SET copy means collecting a bulk body outside the parse buffer, and the replication, sharding and cluster paths would all have to support that. Neither is a local change, and neither is made here.
+
+**Sharding does not solve this, which is worth knowing before reaching for** **--shards**. Measured at 256 KiB values and 32 clients, against one shard:
+
+```
+                                   SET       GET    cpu/op
+  1 shard                       14,903    14,503     66 us
+  4 shards, client not routing  23,175     8,306    151 us
+  4 shards, --cluster, routed   19,920    19,960    158 us
+```
+
+A sharded cache without **--cluster** relays a command that arrived on the wrong shard instead of answering -MOVED. That is what lets an ordinary client work against it at all. But relaying a 256 KiB value passes it through a second process, so GET drops to 0.57 of the single shard. With **--cluster** and a client that routes, four shards give 1.38x on GET and 1.34x on SET. Small messages see 3.2–3.6x at eight shards. Either way, the sharded arm uses about 2.4 times the CPU per operation.
+
+So what an operator can change is the value size itself. In one run with sixteen clients, the CPU cost per operation was 4.4 us at 64 bytes, 4.8 us at 4 KiB, 11.4 us at 64 KiB and 40.8 us at 256 KiB. No setting closes that gap.
+
+**The receive ring is sixty-four buffers of 64 KiB, and its total footprint is what counts.** A provided-buffer ring is used in rotation, so its cost is count times size measured against the core's cache, not the size of one buffer. The ring was 512 buffers of 4 KiB. Raising only the buffer size, to a 32 MiB ring, cost 4.5% at 64 byte values and 24.5% at 256 KiB. Keeping the footprint near the size of the core's cache instead gave the results below. They were measured on one binary with only the two variables differing, in seven interleaved passes, 4 KiB x 512 against 64 KiB x 64:
+
+```
+  SET, 16 deep, 1 KiB values, 50 clients     +22.4%
+  SET, 16 deep, 1 KiB values, 1000 clients   +24.5%
+  SET, 16 deep, 4 KiB values                  +9.8%
+  small values, 64 KiB and 256 KiB values     within 1.5%
+```
+
+The same buffer size in 128 buffers, an 8 MiB ring, lost 12% at 256 KiB values, and 32 buffers ran dry under 1000 pipelining clients. The knob exists to be measured, and it has been.
+
+**A read of a key held as another type answers -WRONGTYPE over RESP.** For example, **get** on a list, **llen** on a string and **hgetall** on a sorted set all answer -WRONGTYPE. Answering as though the key were absent (nil, 0, an empty array) would be worse than an error. The caller would believe it, and fetch from its database something the cache already holds. The type check runs only after a read has missed its own container. So a hit costs nothing, and a store holding one type pays four **empty()** tests. **mget** is the exception, as it is in Redis: it answers nil for each wrong-typed key.
+
+The text protocol keeps its own answers ("nil", "end", 0), because they are its documented contract and a text client is not a Redis client.
+
+Connect via TCP and send commands (newline-terminated, all lowercase).
+
+Nine of the commands listed below are RESP only, and the line protocol answers "failed: unknown command" to them: **client**, **config**, **eval**, **evalsha**, **hello**, **psubscribe**, **punsubscribe**, **script** and **smismember**.
+
+Six of them are protocol and administration commands. The other three share one reason: the line protocol cannot express a list of arguments. Everything after the key is the value, so that a value may contain spaces. So there is no way to write the members of smismember, or the keys and arguments that eval and evalsha take after their script.
+
+**Strings:**
+
+##### `set key value`
+
+Store a key-value pair. Returns "ok", "error: type conflict", or "error: out of memory".
+
+##### `get key`
+
+Retrieve value. Returns value or "nil".
+
+##### `del key`
+
+Delete key (any type). Returns "ok" or "nil".
+
+##### `exists key`
+
+Check if key exists. Returns "1" or "0".
+
+##### `incr key`
+
+Increment integer value by 1. Returns new integer.
+
+##### `decr key`
+
+Decrement integer value by 1. Returns new integer.
+
+##### `incrby key delta`
+
+Increment integer value by delta. Returns new integer.
+
+##### `decrby key delta`
+
+Decrement integer value by delta. Returns new integer.
+
+##### `append key value`
+
+Append to string value. Returns new length.
+
+##### `strlen key`
+
+Return string length. Returns 0 if missing.
+
+##### `getrange key start end` / `substr key start end`
+
+Return the substring between two inclusive offsets. Negative offsets count from the end. An inverted range or a missing key returns an empty string, not an error.
+
+##### `setrange key offset value`
+
+Overwrite the value from *offset* onward and return the new length. A shorter value is padded with zero bytes up to *offset*.
+
+##### `incrbyfloat key delta`
+
+Add a floating-point delta and return the new value. The command is replicated as its *result* rather than as itself. Two builds may round the same addition differently, and a follower would then drift from its leader.
+
+##### `getdel key`
+
+Return the value and remove the key in one step.
+
+##### `getset key newvalue`
+
+Set new value and return old value. Returns old value or "nil".
+
+##### `mget key [key ...]`
+
+Get multiple keys. Returns one value per line (nil if missing), then "end".
+
+##### `mset key value [key value ...]`
+
+Set multiple key-value pairs atomically. Returns "ok".
+
+##### `type key`
+
+Return type of key: "string", "list", "set", "hash", "zset", "stream", or "none".
+
+##### `keys pattern`
+
+List all matching keys (glob patterns, "*" for all). Returns keys then "end".
+
+##### `setnx key value`
+
+Set key only if it does not exist. Returns "1" (set) or "0" (not set).
+
+##### `setex key seconds value`
+
+Set key with expiry. Equivalent to SET + EXPIRE. Returns "ok".
+
+##### `set key value [nx|xx] [ex sec |px ms ] [keepttl] [get]`
+
+Over RESP, **set** takes Redis's options. **nx** writes only if the key is absent, and **xx** only if it exists. **ex** and **px** set a deadline in seconds or milliseconds. The deadline must be positive: zero or less is refused, and NOTHING is written. Otherwise a key stored with a deadline that came out at zero would carry no deadline at all, so it would never expire, while its owner was told the write worked. An argument that is not a number is refused as not a number, rather than as a syntax error about the word after it.
+
+**keepttl** keeps the existing deadline, which a plain **set** clears. A session refresh needs this: the value changes, but the hour it has left does not. Asking for **keepttl** together with **ex** or **px** is a contradiction, so it is refused rather than resolved in either direction.
+
+**get** returns the value that was replaced instead of "ok", or nil when there was none. It returns the value even when **nx** refused the write, which makes it a read and a write in one round trip. A key holding something other than a string answers **-WRONGTYPE** rather than nil, because a caller asking for the old value needs to know that.
+
+##### `psetex key milliseconds value`
+
+Set key with millisecond-precision expiry. Returns "ok".
+
+##### `scan cursor [match pattern] [count n] [valuematch glob] [withvalues]` / `[type t] [field f]... [valuerange min max]`
+
+Iterates over the keys with a cursor. Returns the next cursor (0 when done), then the matching keys, then "end". Start with cursor 0, and repeat with the returned cursor until 0 is returned.
+
+**A numeric range, which a glob cannot express.** *valuerange* takes the same bounds as a zset range: **-inf**, **+inf**, and a leading **(** for an exclusive bound. It keeps the values that fall between the bounds. With *field*, the named field must be in range.
+
+A value that is not a number matches NO range, not even **-inf +inf**. The whole value must be the number: "30kg" is not thirty. A reader that stopped at the digits would answer a question nobody asked.
+
+**More than one condition at once.** *field* may be given up to four times. The rule is one sentence: a *field* applies to the value predicates that follow it, up to the next *field*. So
+
+**scan 0 field city valuematch berlin field age valuerange 25 40**
+
+returns the hashes that satisfy BOTH conditions. It is a conjunction, not a choice, and a hash missing either field does not match. The order of the conditions does not change the answer.
+
+Doing the same with two scans and an intersection in the client costs two walks and the transfer of both result sets. Measured over 50,000 records, where each condition keeps about a quarter and the pair keeps a fifteenth: 96.5 ms and 25,841 keys, against 37.8 ms and 3,335. One scan is also the only way to get an answer that was true at one moment. Two scans are two walks of a keyspace that may have changed between them.
+
+A value predicate given before any *field* tests the key's own value, as it does without *field*. Mixing the two kinds in one scan matches nothing, because no key is both a string and a hash.
+
+**Asking what a FIELD of a hash holds.** *field* walks the hashes and matches *valuematch* against the value of the named field in each hash, not against the key's own value. That is the question a database is asked, for the layout records are usually kept in. A hash WITHOUT the field does not match, not even a predicate that matches everything. That is a different answer from a hash whose field is empty; to match the empty field, use *valuematch ""*. With *withvalues*, the field's value is returned beside the key. Done from outside, this is one **hget** per hash key: measured at 15.8 ms against 1.5 ms over 5,000 hashes, against a client already pipelining and already using *type*.
+
+**Returning the value beside the key.** *withvalues* returns keys and values interleaved, the way **hscan** returns fields and values. So a client that wanted the records does not send a second **mget** for them: the walk had the value in hand when it matched the key. It is limited to strings for the same reason as *valuematch*. Measured as one page used as a query, it saves about a sixth of the operation, because two round trips become one. Over a whole keyspace it saves less, because the bytes move either way and only the second lookup and the extra commands go away. Note that the reply is then sized by VALUES rather than by keys. That is why *count* keeps its small default here, and only a value predicate raises it.
+
+**Restricting to one type.** *type* takes one of **string**, **list**, **set**, **hash** or **zset** in any case, and returns only keys of that type. It costs almost nothing. A key's type is the map it is stored in, and the walk visits the five maps in a fixed order anyway, so a restriction walks one map instead of five. A name that is not a type matches nothing, not everything.
+
+**Keep the options constant across an iteration.** *match*, *count*, *valuematch* and *type* belong to the whole walk, not to one call. The cursor names the map the walk has reached. So a cursor from a restricted walk, handed back without the restriction, resumes partway through the keyspace and never returns the keys before that point. The reverse case is caught: a value or type walk given a cursor from elsewhere restarts its map rather than trusting a bucket index from a different table.
+
+**Filtering on the value.** *valuematch* returns only the keys whose VALUE matches the glob. Without it, a client would fetch the whole keyspace and discard nearly all of it. Only a string key holds a single value, so a list, set, hash or zset never matches, not even when it contains the pattern as a member. With *valuematch* present, *count* limits the keys EXAMINED rather than the keys returned, and defaults to 1000. The predicate is selective, so a page limited by results would walk the whole keyspace in a single call. This is a scan and not an index. It costs about 8 per cent more than a plain scan per key examined, and nothing is maintained on the write path.
+
+**What an iteration guarantees.** A key that is present for the whole iteration is returned at least once, provided the store does not grow enough during it to rehash its table. A key may be returned more than once. A key added or removed during the iteration may or may not appear. So a caller that is counting should count distinct keys, not replies.
+
+The exception needs a precise statement, because Redis does not have it. A rehash moves keys between buckets, and a key moved into a bucket that this iteration has already passed is not returned by it. Redis avoids that with reverse-binary iteration, which needs a power-of-two bucket count. The tables here use prime bucket counts and cannot offer it. The cursor carries the bucket count, so a rehash is at least noticed, and the map being walked restarts. That trades the skip, which is not allowed, for duplicates, which are allowed above.
+
+**count** is a hint, as it is in Redis. Whole buckets are returned, so a reply may carry somewhat more or fewer keys than asked for.
+
+##### `size [type t]`
+
+Return the number of stored keys. Without *type* it counts every type together, which is what **DBSIZE** answers over RESP; with *type*, it counts only that one type.
+
+Both are O(1): the count of a type is the size of the map it is stored in, so this is a lookup and not a walk. Counting the same thing with **scan ... type** walks the whole map and sends back every key name. Measured over 50,000 hashes, that took 50.6 ms against 0.107 ms. The gap widens with the keyspace, because only the scan's cost grows. A name that is not a type counts nothing, not everything.
+
+**Lists (ordered, deque-backed):**
+
+##### `lpush key value`
+
+Insert at front. Returns "ok" or "error: type conflict".
+
+##### `rpush key value`
+
+Insert at back.
+
+##### `lpop key`
+
+Remove and return front element. Returns value or "nil".
+
+##### `rpop key`
+
+Removes and returns the last element of the list.
+
+##### `llen key`
+
+Returns the length of the list.
+
+##### `lindex key index`
+
+Returns the element at *index*. A negative index counts from the end.
+
+##### `lrange key start stop`
+
+Returns a range of elements, one per line, followed by an "end" line. Negative indices are supported.
+
+##### `lset key index value`
+
+Replaces the element at *index*. It answers "nil" when the key does not exist, and refuses an index past the end of the list.
+
+##### `lrem key count value`
+
+Removes up to *count* occurrences of *value* and returns how many it removed. A positive *count* removes from the head, a negative one from the tail, and zero removes every occurrence.
+
+##### `ltrim key start stop`
+
+Keeps only the elements in the inclusive range and removes the rest. A range that selects nothing removes the key, because an empty list is not a key here.
+
+##### `linsert key before|after pivot value`
+
+Inserts *value* before or after the first occurrence of *pivot*. It returns the new length of the list, 0 when the key does not exist, and -1 when *pivot* is not found.
+
+##### `blpop key [key ...] timeout` / `brpop key [key ...] timeout`
+
+These work like **lpop** and **rpop**, but wait when every list is empty. The keys are tried in the order given, and the first key that holds an element answers at once. When none does, the caller waits until something is pushed or *timeout* seconds pass. A timeout of **0** waits forever. The reply names the key as well as the element, because with several keys the caller could not otherwise tell which key the element came from.
+
+**The longest-waiting client is served first.** A worker pool that served its newest waiting member first would starve the member that has been idle longest, and that member is the one most likely to be healthy.
+
+**Everything pipelined behind a blocking pop waits for it.** A blocking pop is the only command here that answers on a later turn than the one it arrived on. The rest of that connection's input therefore stays unparsed until the wait ends; otherwise the second reply would overtake the first.
+
+**Not available on a sharded cache, and refused by name.** Every shard is a separate process. The client would wait in one shard, while the key it waits on can be owned by another. The protocol between shards carries answers to questions; it does not carry a push to a shard that never asked for one. The command is therefore refused, as **replicate** is, rather than blocking on a key this process will never see written.
+
+Replication carries the pop, not the wait. A follower running **blpop** would wait for its own push and would never see the leader's.
+
+##### `rpoplpush source destination` / `lmove source destination left|right left|right`
+
+Moves one element from one end of *source* to one end of *destination* and returns it. **rpoplpush** is the older name for **lmove src dst right left**. The two keys may be the same, which rotates the list.
+
+**Every refusal happens before the element is taken.** This is the move a reliable queue uses: a job leaves the pending list and arrives in the processing list. The pattern exists because a worker can die between those two steps. A wrong-typed destination, a memory limit and a destination on another shard are therefore all checked first, so the element is never missing from both lists.
+
+On a sharded cache, both keys must hash to the same shard. Otherwise the command answers **-CROSSSLOT**, which is Redis's answer, rather than crossing to the other shard. A cross-shard move would be a write in one process that a refusal in another process could not undo.
+
+**Sets (unique unordered members):**
+
+##### `sadd key member`
+
+Adds a member. Returns "ok", "exists", or "error: type conflict".
+
+##### `srem key member`
+
+Removes a member. Returns "ok" or "nil".
+
+##### `sismember key member`
+
+Checks whether a member is in the set. Returns "1" or "0".
+
+##### `scard key`
+
+Returns the number of members in the set (its cardinality).
+
+##### `spop key`
+
+Removes and returns one member. The member is the first one that this process's iteration order reaches. The command is therefore replicated as the **srem** of that member, not as itself: a follower running **spop** would pick a different member.
+
+##### `srandmember key`
+
+Returns the member that **spop** would take, without removing it.
+
+##### `smismember key member [member ...]`
+
+Returns 1 or 0 for each member, in the order the members were given.
+
+##### `smembers key`
+
+Returns all members, one per line, followed by an "end" line.
+
+**Hashes (nested key-value maps):**
+
+##### `hset key field value`
+
+Sets a hash field. Returns "ok", "error: type conflict", or "error: out of memory".
+
+##### `hget key field`
+
+Returns the value of a hash field, or "nil".
+
+##### `hdel key field`
+
+Deletes a hash field. Returns "ok" or "nil".
+
+##### `hlen key`
+
+Returns the number of fields in the hash.
+
+##### `hgetall key`
+
+Returns all fields and values, one "field value\n" line per field, followed by an "end" line.
+
+##### `hkeys key` / `hvals key`
+
+**hkeys** returns only the fields, and **hvals** returns only the values.
+
+##### `hmget key field [field ...]`
+
+Returns one value per field, with "nil" for a field that does not exist.
+
+##### `hmset key field value [field value ...]`
+
+Sets several fields at once.
+
+##### `hexists key field`
+
+Returns 1 if the field exists and 0 if it does not.
+
+##### `hstrlen key field`
+
+Returns the length of a field's value, or 0 when the field does not exist.
+
+##### `hincrby key field delta`
+
+Adds *delta* to a field read as an integer and returns the new value. A missing field is created with the value *delta*.
+
+##### `hsetnx key field value`
+
+Sets the field only if it does not exist. Returns 1 or 0.
+
+##### `hscan key cursor [match pattern] [count n] [valuematch glob]` / `sscan key cursor [match pattern] [count n]` / `zscan key cursor [match pattern] [count n]`
+
+These commands work like **scan**, but walk one key's collection instead of the keyspace. Start with cursor 0 and pass back the returned cursor on each call; a returned cursor of 0 means the walk is done. *valuematch* exists only on **hscan**: it matches what a field holds, while *match* matches the field's name. A set's members and a sorted set's scores are not values in that sense, so **sscan** and **zscan** answer a syntax error for it instead of pretending. One option that meant three different things would be worse than one option fewer. *count* is a hint and defaults to 10, as on Redis. A collection smaller than one bucket-load comes back whole, with cursor 0.
+
+The cursor encodes the collection's bucket count as well as its position. A resumed walk can therefore tell whether the table is still the one it left. A rehash between two calls restarts the walk rather than silently skipping the elements that moved.
+
+**The order of fields is not the order they were set in.** A hash is backed by an unordered map here, so **hgetall**, **hkeys** and **hvals** return the fields in an order this process decides. Redis keeps insertion order for a small hash because it stores a small hash as a listpack. It stops keeping that order once the hash grows into a hashtable. A client that depends on the order therefore depends on Redis's encoding, not on its contract.
+
+**Sorted sets:**
+
+A sorted set holds a score for each member and is read back in score order. The type is exclusive, like the other four: a key that holds a string refuses **zadd**.
+
+##### `zadd key score member`
+
+Adds a member or changes its score. Returns "1" when the member is new, and "0" when it already existed and only its score changed. A score may be fractional. The whole score is parsed, so **1x** is refused rather than read as 1.
+
+##### `zrem key member`
+
+Removes a member. Returns "ok" or "nil". The key is removed when its last member is.
+
+##### `zscore key member`
+
+Returns the member's score, or "nil".
+
+##### `zcard key`
+
+Returns the number of members.
+
+##### `zrank key member`
+
+Returns the member's zero-based rank, counting from the lowest score, or "nil".
+
+##### `zrevrank key member`
+
+Returns the same rank as **zrank**, counted from the highest score.
+
+##### `zrange key start stop [withscores]`
+
+Returns members by rank, with both ends inclusive. Negative indices count from the last member, following the same rules as **lrange**. With **withscores**, each line is "member score". The reply ends with "end".
+
+##### `zrevrange key start stop [withscores]`
+
+Returns the same as **zrange**, walked from the highest score.
+
+##### `zincrby key delta member`
+
+Adds *delta* to a member's score and returns the new score. A missing member is created with the score *delta*.
+
+##### `zrangebyscore key min max [withscores]` / `zrevrangebyscore key max min [withscores]`
+
+Returns the members whose score falls in the range. This is the query a sorted set is kept for. Both ends are inclusive. A leading **(** makes an end exclusive, and **-inf** and **+inf** are the open ends. **zrevrangebyscore** takes its bounds the other way round, as on Redis.
+
+##### `zcount key min max`
+
+Returns how many members fall in the score range, with the same bound syntax.
+
+##### `zpopmin key` / `zpopmax key`
+
+Removes and returns the lowest-scoring member, or the highest, with its score. Each is replicated as the **zrem** of that member, for the reason given under **spop**.
+
+##### `zremrangebyrank key start stop` / `zremrangebyscore key min max`
+
+Removes a range of members by rank or by score, and returns how many it removed. Emptying the set removes the key.
+
+**Streams:**
+
+The stream commands follow Redis 7.0: the same arguments, answers and errors. The line protocol splits words on spaces, so a field or value cannot contain a space there. It answers an array one element per line, followed by "end". An empty stream is still a key, as in Redis.
+
+##### `xadd key [nomkstream] [maxlen|minid [=|~] n [limit n]] *|id field value ...`
+
+Appends an entry to the stream and returns its id. * takes the clock in milliseconds. When the clock has not moved past the last id, it takes the last id instead, with its sequence counted up. *ms-** asks for the next sequence in that millisecond. An id at or below the last one is refused. Replicas and the journal receive the id the entry got, never *. **maxlen ~** removes only whole blocks of up to a hundred entries, as Redis removes whole nodes, so it can leave more entries than asked for.
+
+##### `xlen key`
+
+Returns the number of entries.
+
+##### `xrange key start end [count n]` / `xrevrange key end start [count n]`
+
+Returns entries in id order, or in reverse order, one per line as "id field value ...". **-** and **+** are the ends of the stream. A lone millisecond takes every sequence in it, and a leading **(** makes a bound exclusive.
+
+##### `xdel key id [id ...]`
+
+Removes entries and returns how many of them existed.
+
+##### `xtrim key maxlen|minid [=|~] n [limit n]`
+
+Removes entries from the oldest end and returns how many it removed.
+
+##### `xread [count n] [block ms] streams key [key ...] id [id ...]`
+
+Returns the entries past each given id, one per line as "key id field value ...". **$** means the last id at the time of the read. When there is nothing yet, **block** waits for the next **xadd** to any of the keys; 0 waits forever. A blocking read inside **multi** answers "nil" at once, and a script may not wait at all. On a sharded cache every key must belong to one shard. A blocking read is served only by the shard that owns its streams, through that shard's **--cluster** port.
+
+##### `xgroup create key group id|$ [mkstream] [entriesread n]` / `xgroup setid|destroy|createconsumer|delconsumer key group ...`
+
+Creates, moves or removes a consumer group, or one of its consumers.
+
+##### `xreadgroup group g consumer [count n] [block ms] [noack] streams key ... id ...`
+
+Reads entries for one consumer of a group. **>** delivers the entries the group has not delivered yet, and records them as pending for the consumer unless **noack** is given. Any other id re-reads that consumer's own pending entries.
+
+##### `xack key group id [id ...]`
+
+Removes entries from the pending list and returns how many were on it.
+
+##### `xpending key group [[idle ms] start end count [consumer]]`
+
+Shows the pending list: either a summary, or entries with their consumer, idle time and delivery count.
+
+##### `xclaim key group consumer min-idle id ... [idle ms] [time ms] [retrycount n] [force] [justid] [lastid id]` / `xautoclaim key group consumer min-idle start [count n] [justid]`
+
+Takes over entries that another consumer left pending. **xautoclaim** walks the pending list from *start*, and its answer also includes the ids that **xdel** removed from under the group.
+
+##### `xinfo stream key [full [count n]] | groups key | consumers key group`
+
+Reports what a stream, its groups, or a group's consumers hold.
+
+##### `xsetid key id [entriesadded n] [maxdeletedid id]`
+
+Sets the stream's last id and counters. This is how a replica is told them.
+
+**Pattern subscriptions:**
+
+##### `psubscribe pattern [pattern ...]` / `punsubscribe pattern [pattern ...]`
+
+Subscribes to, or unsubscribes from, every channel that a glob pattern matches. Patterns use *, **?** and character classes, the same matching that **keys** uses. Messages arrive as **pmessage**, which carries the pattern as well as the channel. A client subscribed to two patterns could not otherwise tell which one matched.
+
+**Over RESP, every subscribe verb confirms with a count.** **subscribe**, **unsubscribe**, **psubscribe** and **punsubscribe** each answer a three-element reply: the verb, the channel or pattern, and how many subscriptions the connection now holds. A client library counts down from that number to know that its own batch is complete.
+
+**A pattern costs a sharded cache its publish filter, and only then.** Normally a publish wakes only the shards whose filter says they may hold a subscriber of that channel. A pattern matches channels that do not exist yet, so it has no bit to set in the filter. A shard that holds a pattern subscription is therefore woken by every publish. Nothing changes for a cache that has no pattern subscriber.
+
+**Transactions with a check:**
+
+##### `watch key [key ...]` / `unwatch`
+
+**watch** makes the next **exec** do nothing if a watched key is written between the **watch** and the **exec**. Over RESP the reply is then a nil *array*; its type is how a client tells "did not run" from "ran and returned nothing". Over the text protocol the reply is the word **aborted**. Either way the watch ends, so a retry starts with a fresh watch.
+
+Without a watch, **multi** is only a batch: the commands run together, and nothing checks that the data still looks the way the client read it. With a watch, the compare-and-set loop that a distributed lock or a counter needs becomes possible.
+
+**A write to a different key does not abort.** The watch mark is set in one place, before the switch that runs the command. It is driven by a list of read-only commands, not by a list of writes. A write missing from a list of writes would let a transaction commit silently over a change it never saw. A read missing from the read-only list costs only one retry too many. Commands that can touch any key mark every watcher instead of using the list: **mset**, **del** over several keys, **flush** and **eval**.
+
+**watch** inside **multi** is refused, as on Redis. A watch taken after queueing started could not be checked against the reads that decided what to queue.
+
+**Scripting:**
+
+The cache runs Lua scripts that the client sends, over RESP.
+
+##### `eval script numkeys key... arg...` / `evalsha sha1 numkeys key... arg...`
+
+Runs a Lua script, given as source or by its SHA1. Inside *script*, the declared keys are in **KEYS** and the remaining arguments in **ARGV**, both 1-based. **redis.call** runs a command and raises its answer if that answer is an error. **redis.pcall** returns the error as a table with an **err** field instead. **redis.status_reply**, **redis.error_reply** and **redis.sha1hex** are available. **redis.log** is accepted and writes nothing.
+
+A command that would outlive the script on the caller's connection is refused with **-ERR This Redis command is not allowed from script**, as Redis refuses it. These commands are **eval**, **evalsha**, **script**, **multi**, **exec**, **discard**, **watch**, **unwatch**, the four subscribe commands, **quit**, **reset**, **hello**, **auth** and **client**. A blocking pop answers at once, as its non-blocking twin would.
+
+The return value is converted as Redis converts it:
+
+- A number becomes an integer, truncated towards zero.
+- A string becomes a bulk reply.
+- A table becomes an array *up to its first hole*, which is Lua's own rule for where an array ends.
+- **false** becomes a nil, and **true** becomes the integer 1.
+
+   A table that carries **err** or **ok** becomes an error or a status rather than a list.
+
+   **The interpreter is not the one --lua uses, and that is the point.** **COMMON FLAGS** says that the **--lua** interpreter is not a sandbox: it has **io**, **os**, **package** and the whole of **base** open. That is the right trade for a script the operator wrote, and the wrong one for a script that arrived over the network. The script interpreter is opened the other way round: it has only **base**, **string**, **table** and **math**, with every loader removed by name. Under LuaJIT the library that decides this is **ffi**: **require("ffi")** gives arbitrary memory access, which amounts to a shell on the machine. **require** is therefore not there to reach it with. A client's script also cannot see the operator's globals, because the two states never meet.
+
+   **A script holds the event loop of its shard while it runs.** It therefore runs under the same count hook as a Lua callback. A runaway script is stopped with **a script exceeded the 10000ms deadline** instead of holding every other client on that shard forever. The limit is **callback_timeout_ms** or **SOCKETLEY_LUA_TIMEOUT_MS**, the same as for callbacks.
+
+   **On a sharded cache a script is routed by the keys it declares.** This is the routing itself, not a convention: the shard that owns **KEYS[1]** runs the script. Keys that belong to two shards answer **-CROSSSLOT**, and a script that declares no keys runs on the shard it was sent to. A script that reaches a key it did not declare reaches into whatever store the shard it landed on happens to have.
+
+##### `script load script` / `script exists sha1 [sha1 ...]` / `script flush`
+
+These commands manage the script cache. **eval** loads a script as well as running it. A client can therefore try **evalsha** first and fall back to **eval** on **-NOSCRIPT**, which is the usual pattern.
+
+**The cache is per shard, as it is per node on Redis Cluster.** A sharded cache's shared port hands each connection to whichever shard the kernel picks, so a **script load** reaches only one shard. **eval** makes this self-healing. A client that wants **evalsha** to work on every shard sends **script load** to each per-shard port, as a cluster client does with each master.
+
+**Connection and introspection:**
+
+A client library sends these commands before it sends any of its own. Answering them lets the connection finish being set up. Refusing one by name lets the client fall back instead of failing.
+
+##### `hello [protover]`
+
+Performs the protocol handshake. Only RESP2 is supported. **hello** with no argument or with **2** answers a flat array of name and value pairs: the server, the version, the protocol, this connection's id, whether the cache is clustered, and whether it is a replica. **hello 3** is refused with **-NOPROTO**. That is what Redis before version 6 answers, and every client falls back from it. An unknown-command error, by contrast, is not a protocol negotiation failure, and a client need not handle it as one.
+
+##### `info`
+
+Returns the fields a monitor reads. They are the version, connected clients, memory, commands processed, role, whether clustering is on, and the key count. On a sharded cache the key count is *this shard's* slice, for the same reason that **dbsize** answers that way on a per-shard port.
+
+The replication section differs by role, because half of its fields have no meaning on the other side. **role** answers **master** or **slave**. A follower adds **master_host**, **master_port**, **master_link_status** and **master_sync_in_progress**. A leader adds **connected_slaves**: the number of followers whose connection is live, not the number that ever attached.
+
+**master_link_status** reads **up** once a full sync has finished, not when the socket opens. **master_sync_in_progress** tells apart the two reasons it can read **down**: no leader was reached at all, or a dump is still arriving. A follower whose target was never usable leaves **master_host** empty and **master_port** at zero, which is the honest answer to "where".
+
+##### `config get parameter`
+
+Returns the value of a configuration parameter. **maxmemory** answers with the configured limit. **save** and **appendonly** answer empty, which is accurate here. Any other parameter answers an empty array rather than an invented value.
+
+##### `command`
+
+Answers with an empty array. A client asks **command** for a table of arity and flags. This cache keeps no such table, and saying so is more useful than a table that is wrong.
+
+##### `echo message` / `select index`
+
+**select 0** succeeds, because the cache has a single keyspace. Any other index is refused rather than ignored. A client addressing database 3 therefore learns that it cannot, rather than quietly sharing database 0 with everybody else.
+
+##### `client id|getname|setname|setinfo`
+
+Answers the client subcommands that Redis client libraries send. **setname** and **setinfo** are accepted; redis-py and node-redis send them on connect. **id** answers this connection's descriptor.
+
+##### `auth`
+
+The cache refuses this command by name, because a cache has no password. A silent success would tell a client it had authenticated.
+
+**Transactions:**
+
+A transaction groups commands; it does not roll them back. Between **multi** and **exec**, each command is queued and answered "queued". Nothing has run yet, and a second connection reading the same key still sees the old value. EXEC then runs the queue back to back on the single-threaded event loop, so no other connection's command lands in the middle of it. A command that fails inside **exec** fails alone, and the commands before it stay applied.
+
+##### `multi`
+
+Begins queueing commands. A nested **multi** is refused.
+
+##### `exec`
+
+Runs the queue in order, then answers "end". It is refused without a **multi**.
+
+##### `discard`
+
+Throws the queued commands away.
+
+**TTL / Expiry:**
+
+##### `expire key seconds`
+
+Sets a key's time-to-live in seconds. Returns "ok", or "nil" when the key is not found. A *seconds* value of zero or less deletes the key rather than being an error: the key is removed and the answer is "ok". Redis does the same, and it is what a caller means when its own arithmetic came out at zero.
+
+##### `ttl key`
+
+Returns the remaining seconds, -1 if the key has no TTL, or -2 if it is not found.
+
+##### `persist key`
+
+Removes a key's expiry. Returns "ok" or "nil".
+
+##### `pexpire key milliseconds`
+
+Sets a key's time-to-live in milliseconds. Returns "1" when it is set, or "0" when the key is not found. Zero or less deletes the key, as with **expire**.
+
+##### `pttl key`
+
+Returns the remaining TTL in milliseconds, -1 if the key has no TTL, or -2 if it is not found.
+
+##### `expireat key unix_seconds`
+
+Sets a key's expiry to an absolute Unix timestamp in seconds. Returns "1", or "0" if there is no such key. A timestamp already in the past deletes the key and answers "1".
+
+##### `pexpireat key unix_ms`
+
+Sets a key's expiry to an absolute Unix timestamp in milliseconds. It gives the same answers as **expireat**.
+
+All four commands saturate out-of-range deadlines rather than refusing them. A deadline beyond one end of the clock's range means "never", and one beyond the other end means "already gone". Redis refuses these with an error instead. This is the one place where this family answers differently from Redis on purpose: the number a client sent is honoured as far as the clock goes, rather than rejected.
+
+**Pub/Sub:**
+
+##### `subscribe channel`
+
+Subscribes to a channel. Returns "ok". Messages are delivered as "message <channel> <payload>\n".
+
+##### `unsubscribe channel`
+
+Unsubscribes from a channel. Returns "ok".
+
+##### `publish channel message`
+
+Publishes a message to all subscribers of the channel. Returns the number of subscribers reached.
+
+**Memory Management:**
+
+##### `maxmemory`
+
+Returns the current maxmemory setting in bytes, or "0" for unlimited.
+
+##### `memory`
+
+Returns the current memory usage in bytes.
+
+**Admin (requires --mode admin):**
+
+##### `flush [path]`
+
+Saves the cache to a file. Without *path*, it uses the **--persistent** path.
+
+##### `load [path]`
+
+Loads the cache from a file.
+
+Type enforcement: a key can hold only one data type. A write to a key that holds a different type returns "error: type conflict". Under **--maxmemory**, a write that does not fit is refused with "error: out of memory" (over RESP: "OOM command not allowed when used memory > 'maxmemory'"). The key it would have written is left exactly as it was. This includes a write over a key that already exists: overwriting a value, appending to it or replacing a hash field is checked against the limit like any other write. Multi-line responses (lrange, smembers, hgetall) end with "end\n".
+
+### RESP Protocol (Redis Compatibility)
+
+The cache supports the RESP2 wire protocol, so Redis clients (redis-cli and Redis client libraries) can use it. RESP mode is detected automatically when a connection's first byte is '*', and can be forced with **--resp**.
+
+The supported Redis commands are listed below; command names are case-insensitive. A command not listed here is answered with an error that names it, never silently ignored.
+
+**Strings**
+
+SET (EX, PX, NX, XX, KEEPTTL, GET), GET, GETSET, GETDEL, GETRANGE, SUBSTR, SETRANGE, SETNX, SETEX, PSETEX, MGET, MSET, APPEND, STRLEN, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT
+
+**Keys**
+
+DEL, UNLINK, EXISTS, TOUCH, TYPE, KEYS, SCAN, DBSIZE, RANDOMKEY, RENAME, RENAMENX, COPY, FLUSHALL, FLUSHDB, EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST
+
+RENAME and COPY carry the key's expiry with them, so renaming or copying cannot make an expiring key permanent. RENAME and COPY name two keys. On a sharded cache both keys must belong to one shard, and keys that do not are refused with **-CROSSSLOT**; a key cannot be half-moved. FLUSHALL and FLUSHDB are the same command here, because this cache has one keyspace and no SELECT-able databases to leave behind.
+
+**Lists**
+
+LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LREM, LTRIM, LINSERT, LMOVE, RPOPLPUSH, BLPOP, BRPOP
+
+**Sets**
+
+SADD, SREM, SISMEMBER, SMISMEMBER, SCARD, SMEMBERS, SPOP, SRANDMEMBER, SSCAN, SINTER, SUNION, SDIFF, SINTERSTORE, SUNIONSTORE, SDIFFSTORE, SMOVE
+
+Set algebra reads whole sets and returns one result. On a sharded cache it therefore cannot be split across shards the way MGET or DEL can: an intersection computed separately on two shards is not an intersection. Every key must belong to one shard, and keys that do not are refused with **-CROSSSLOT**. Redis Cluster answers the same, for the same reason. Use a hash tag (**{user}:seen**) to place the keys together.
+
+**Hashes**
+
+HSET, HSETNX, HGET, HMSET, HMGET, HDEL, HLEN, HEXISTS, HKEYS, HVALS, HGETALL, HSTRLEN, HINCRBY, HSCAN
+
+**Sorted sets**
+
+ZADD, ZREM, ZSCORE, ZCARD, ZCOUNT, ZINCRBY, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZPOPMIN, ZPOPMAX, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZSCAN
+
+**Streams**
+
+XADD, XLEN, XRANGE, XREVRANGE, XREAD (BLOCK), XDEL, XTRIM, XSETID, XGROUP (CREATE, SETID, DESTROY, CREATECONSUMER, DELCONSUMER), XREADGROUP (BLOCK, NOACK), XACK, XPENDING, XCLAIM, XAUTOCLAIM, XINFO (STREAM [FULL], GROUPS, CONSUMERS)
+
+Replies and errors match Redis 7.0's; **test_cache_streams_vs_redis.sh** compares them against a redis-server. The radix-tree-nodes field of XINFO STREAM counts no tree, because the entries are stored in blocks indexed by a sorted array. XADD, XGROUP CREATE and CREATECONSUMER are refused with OOM at the memory limit, as Redis refuses its denyoom commands. XREADGROUP and XCLAIM are not refused, which is also Redis's rule. An XREAD naming streams on several shards is answered **-CROSSSLOT**.
+
+**Pub/Sub**
+
+SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH
+
+**Transactions**
+
+MULTI, EXEC, DISCARD, WATCH, UNWATCH
+
+**Scripting**
+
+EVAL, EVALSHA, SCRIPT LOAD, SCRIPT EXISTS, SCRIPT FLUSH
+
+**Connection and server**
+
+PING, ECHO, AUTH, HELLO, SELECT, QUIT, RESET, CLIENT (GETNAME, SETNAME, ID, REPLY, SETINFO), CONFIG GET/SET, COMMAND, INFO, CLUSTER
+
+**Where the answers differ from Redis on purpose**
+
+The RESP array limit is 1024 arguments, not 1024*1024. args[] is a stack array, and a million views would take sixteen megabytes of it. A command over the limit is refused with an error that names the limit, and the connection is closed. The stream is framed, but the arguments were never stored, so the connection cannot continue past a message it did not take.
+
+Lua scripts share one interpreter state, so its globals are sealed. Writing a global raises an error that names the variable. The globals table itself is unnamed, so rawset and table.insert cannot reach it either. Use **local** for everything, including functions: write **local function f() end** rather than **function f() end**. Redis requires this too.
+
+One difference from Redis remains on purpose: reading an undefined global returns nil here, as in ordinary Lua, where Redis raises an error. Blocking the WRITE is what closes the channel between two clients. An error on the read would only catch typos, and it would break a script that tests a global to see whether it is there.
+
+Example with redis-cli:
+
+```
+redis-cli -p 9000 SET mykey myval
+redis-cli -p 9000 GET mykey
+redis-cli -p 9000 EVAL "return redis.call('GET', KEYS[1])" 1 mykey
+redis-cli -p 9000 SUBSCRIBE news
+```
+
+### Database Backend
+
+Cache runtimes support four Lua callbacks for a database-backed cache. Attach a Lua script with **--lua** and implement the callbacks you need with any Lua database library (luasql-mysql, luasql-postgres, lsqlite3, etc.).
+
+| Callback\|Signature\|When called |
+|---|
+| on_miss(key)\|-> value [, ttl_seconds]\|GET returns nil — fetch from DB |
+| on_write(key, value, ttl)\|-> nothing\|T{ |
+| After successful SET/SETEX/SETNX/MSET |
+| T} |
+| on_delete(key)\|-> nothing\|After DEL — delete from DB |
+| on_expire(key)\|-> nothing\|After TTL sweep removes key |
+
+**on_miss** may return two values (a Lua multi-return): the fetched string and an optional TTL in seconds. If the value is nil or empty, the GET returns nil to the client as usual. If a value is returned, the cache stores it and returns it to the client transparently (read-through, or lazy population).
+
+**on_write** is called synchronously on the event loop thread. For write-heavy loads, use the write-behind pattern: buffer writes in Lua inside **on_write**, and flush them to the database in **on_tick** every few seconds. This decouples SET latency from database latency entirely.
+
+Example (SQLite write-behind):
+
+```
+tick_ms = 2000
+local db, pending = nil, {}
+
+function on_start()
+    local sq = require("lsqlite3")
+    db = sq.open("/tmp/cache.db")
+    db:exec("CREATE TABLE IF NOT EXISTS cache_kv (key TEXT PRIMARY KEY, value TEXT)")
+end
+
+function on_miss(key)
+    for row in db:nrows("SELECT value FROM cache_kv WHERE key=" .. db:quote(key)) do
+        return row.value, 300  -- value + 300 s TTL
+    end
+end
+
+function on_write(key, value, ttl)
+    pending[key] = value  -- buffer
+end
+
+function on_tick(dt)
+    for k, v in pairs(pending) do
+        db:exec("INSERT OR REPLACE INTO cache_kv(key,value) VALUES("..db:quote(k)..","..db:quote(v)..")")
+    end
+    pending = {}
+end
+
+function on_delete(key)
+    db:exec("DELETE FROM cache_kv WHERE key="..db:quote(key))
+end
+```
+
+See **examples/cache/db-backend.lua** for a full example with MySQL, Postgres, and SQLite backends.
+
+### Replication
+
+Cache runtimes support leader-follower replication.
+
+A follower connects to the leader and receives a full data dump. After that, the leader forwards ongoing write commands in real time. Followers are read-only.
+
+```
+# Start leader cache
+socketley create cache leader -p 9000 -s
+
+# Start follower
+socketley create cache follower -p 9001 --replicate 127.0.0.1:9000 -s
+
+# Writes on leader are replicated to follower
+echo "set key val" | nc localhost 9000
+echo "get key" | nc localhost 9001    # Returns "val"
+```
+
+Example with netcat:
+
+```
+echo "set user:1 alice" | nc localhost 9000
+echo "get user:1" | nc localhost 9000
+echo "lpush queue task1" | nc localhost 9000
+echo "hset user:1 name alice" | nc localhost 9000
+echo "expire user:1 300" | nc localhost 9000
+echo "subscribe news" | nc localhost 9000
+```

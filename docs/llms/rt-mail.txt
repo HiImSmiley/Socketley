@@ -1,0 +1,658 @@
+# mail runtime
+
+Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage
+
+A **mail** runtime is a mail server: it receives mail for your domains, sends your users' mail, and keeps their mailboxes. Other runtimes, the CLI and the daemon's alerts can send through it.
+
+```
+socketley create mail m -p 25 --dns ns --no-reply -s            # only sends: alerts, notices
+socketley send m --to ops@example.com --subject "Backup done" --text ok
+
+socketley create mail m -p 25 --dns ns --idp auth --storage files/mail \
+    --submission 587 --imap 143 --tls -s
+```
+
+## What it does
+
+- **Receiving**: SMTP with SPF, DKIM, DMARC and ARC checks, optional greylisting and blocklists, and Sieve filters per user.
+- **Safe spool**: A message is synced to disk before the sender is told 250.
+- **Sending**: `--submission` and `--submissions` ports, DKIM signing, DANE and MTA-STS, or a `--relay` smarthost.
+- **Reading**: IMAP, POP3, JMAP, and webmail on `--web`.
+- **DNS records**: Publishes MX, SPF, DKIM, DMARC, MTA-STS and more through `--dns`.
+- **Operating it**: `socketley mail m queue`, `show`, `flush`, `trace`; `on_rcpt` and `on_message` in [Lua](lua.txt).
+
+## Works with
+
+- [dns](rt-dns.txt) publishes its domains' records.
+- [idp](rt-idp.txt) provides its users.
+- [storage](rt-storage.txt) holds the mailboxes.
+
+## Flags
+
+Every flag a mail runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
+| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
+| `--key` | path | Key: The PEM key of the certificate. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**Mail**
+
+| flag | value | what it does |
+|---|---|---|
+| `--mail-domain` | list | Mail domains: The domains whose mail it takes; the zones of --dns where none is given. |
+| `--dns` | text | DNS runtime: The dns runtime whose zones are its domains, given their MX, SPF, DKIM and DMARC records. |
+| `--hostname` | text | Host name: The name it greets with and its MX records name; mail.<first domain> unless given. |
+| `--no-reply` |  | No-reply sender: Send as no-reply@<domain> where no sender is said, and take no mail to that address. |
+| `--idp` | text | Identity provider: The idp runtime whose users have mailboxes here and sign in to send. |
+| `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes; a token of any other is refused. |
+| `--storage` | text | Mailboxes: The storage runtime, and bucket, the mailboxes are kept in. |
+| `--users` | path | Users: Accounts that sign in to send, one user:hash per line, as `socketley mqtt passwd` writes them. |
+| `--aliases` | path | Aliases: Addresses it accepts besides the users', one `address target` per line. |
+| `--relay` | text | Smarthost: Send all mail for elsewhere through this server, smtp[s]://[user:password@]host[:port]. |
+
+**Mail ports**
+
+| flag | value | what it does |
+|---|---|---|
+| `--submission` | int | Submission port: A port users send from with STARTTLS and a password. |
+| `--submissions` | int | Submission over TLS: A port users send from over TLS from the first byte. |
+| `--imap` | int | IMAP port: A port mail clients read the mailboxes on. |
+| `--imaps` | int | IMAP over TLS: A port mail clients read the mailboxes on over TLS. |
+| `--sieve` | int | ManageSieve port: A port users put their Sieve filters on, over STARTTLS. |
+
+**Mail limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--dnsbl` | text | DNS blocklists: Zones listing addresses whose mail is refused when they connect. |
+
+**Mail ports**
+
+| flag | value | what it does |
+|---|---|---|
+| `--pop3` | int | POP3 port: A port mail clients fetch the INBOX on with POP3. |
+| `--pop3s` | int | POP3 over TLS: A port mail clients fetch the INBOX on over TLS. |
+| `--jmap` | int | JMAP port: A port mail clients and web apps read and send mail on with JMAP. |
+| `--web` | int | Webmail port: A port for webmail and JMAP over plain HTTP on 127.0.0.1, which the entrance reaches by --domain. |
+| `--lmtp` | int | LMTP port: A port a mail server on this machine hands mail for the mailboxes to. |
+| `--mta-sts-port` | int | MTA-STS port: An HTTPS port the MTA-STS policy of its domains is served on. |
+
+**Mail limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--greylist` | duration | Greylist delay: Ask a sender, recipient and network seen for the first time to retry after this long. |
+| `--rspamd` | text | Rspamd: The Rspamd a stranger's mail is scored by, http://host:port. |
+
+**Mail**
+
+| flag | value | what it does |
+|---|---|---|
+| `--recipient-delimiter` | text | Subaddress delimiter: What divides a user from a tag, user+tag; none for no tags. |
+| `--reports` |  | Send reports: Send the DMARC and TLS reports other domains ask for. |
+| `--refuse-attachments` | list | Refused attachments: Attachment extensions refused in mail from elsewhere: default for programs, scripts and macro documents, or none. |
+| `--clamav` | text | ClamAV: The clamd every message from elsewhere is scanned by, host:port or its socket. |
+| `--dmarc-policy` | one of none, quarantine, reject | DMARC policy: What its DMARC record asks of mail that fails its checks; quarantine unless given. |
+| `--bimi` | text | BIMI logo: The https URL of its SVG logo, and after a comma its mark certificate's, for the BIMI record. |
+| `--dmarc-rua` | text | DMARC reports to: Where other servers send DMARC reports of its domains: the rua= it publishes. |
+| `--tls-rpt` | text | TLS reports to: Where other servers send TLS reports of its domains (RFC 8460). |
+| `--mta-sts` | text | MTA-STS mode: Publish an MTA-STS policy of this mode for its domains: enforce or testing. |
+
+**Mail limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--default-quota` | size | Default quota: How much a mailbox may hold when its user has no mail_quota of their own. |
+| `--quota-warn` | int | Quota warning: At what percent of the quota a user is warned, once; 0 for never. |
+
+**Mail**
+
+| flag | value | what it does |
+|---|---|---|
+| `--arc-trust` | text | ARC forwarders: Forwarders whose ARC seal lets mail that fails DMARC through. |
+| `--dkim-next` | text | Next DKIM selector: A DKIM key made and published before it signs, for rotation. |
+| `--notify-targets` | path | Event targets: Who is told of each message stored in a mailbox: webhooks and other runtimes, one `name url` per line. |
+
+**Mail limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-size` | size | Max message: The largest message taken; 25M unless given. |
+| `--max-recipients` | int | Max recipients: The most recipients of one message; 100 unless given. |
+| `--autoexpunge` | duration | Empty Junk and Trash: How long a message stays in Junk or Trash before it is gone; never unless given. |
+| `--queue-lifetime` | duration | Queue lifetime: How long a message is tried before it is bounced; 5d unless given. |
+
+**Mail**
+
+| flag | value | what it does |
+|---|---|---|
+| `--dkim-selector` | text | DKIM selector: The selector its DKIM key is published under; skl unless given. |
+
+## Benchmarks
+
+No benchmark. Postfix and Dovecot start their master processes as root, which the measuring machine does not give; not measured.
+
+## The manual on mail
+
+A **mail** runtime is a mail server. It accepts mail for its domains and mail that its users send. It keeps each message in a spool until the message is delivered. It hands mail for other domains to that domain's mail exchanger, or to a smarthost. It keeps its users' mailboxes in a storage runtime, and users read them over IMAP.
+
+The mail runtime works with the other runtimes. A dns runtime publishes the records of its domains, an idp runtime provides its users, and a storage runtime holds its mailboxes. Other runtimes, the CLI and the daemon's alerts send mail through it.
+
+Change its settings with **import**; add --restart to apply all of them at once. A running runtime applies new connection, rate and idle limits immediately, and the other settings at its next start. It reads the **--users** and **--aliases** files again whenever they change. Renaming the runtime with **import** moves its spool, its keys and its mailbox state along with it. A rename is refused while the runtime is running. **show** prints a **--relay** password as ***. Importing that printed output keeps the existing password unchanged.
+
+```
+socketley create mail m -p 25 --dns ns --no-reply -s
+socketley send m --to ops@example.com --subject "Backup done" --text ok
+
+socketley create mail m -p 25 --dns ns --idp auth --storage files/mail \
+    --submission 587 --imap 143 --tls -s
+```
+
+The runtime listens for SMTP on port 25 by default; **-p** sets another port. Port 25 requires that the daemon is allowed to bind it. With **--shards**, only the first shard accepts mail (on SMTP, submission and LMTP), so a single spool commits all of it with one sync. Every shard serves the mailboxes.
+
+These flags open further ports:
+
+- **--submission** opens a port where users send mail, with STARTTLS and a password.
+- **--submissions** opens the same kind of port, but speaking TLS from the first byte.
+- **--imap** and **--imaps** open the same two kinds of port, for reading the mailboxes.
+- **--pop3** and **--pop3s** let clients read INBOX over POP3 (RFC 1939, with STLS, SASL PLAIN, UIDL and TOP).
+- **--lmtp** accepts mail from this machine's own programs into the mailboxes over LMTP (RFC 2033), with one answer for each recipient.
+- **--jmap** serves JMAP (RFC 8620, RFC 8621) for mail clients and web apps, over HTTPS with **--tls**.
+
+When a signed-in user sends a message without a Date or a Message-ID header, the runtime adds the missing header, as Postfix's cleanup does. A message from another server is passed on unchanged. Without **--bind**, each port accepts both IPv6 and IPv4. An IPv4 client is identified, checked and logged by its IPv4 address.
+
+With **--tls** and **--dns**, but no **--cert**, the runtime uses the certificate of the dns runtime's entrance. That certificate holds the names the runtime is reached by, and the entrance renews it. The runtime picks up the renewed certificate as it does any other. If the entrance has not written the certificate yet, the runtime waits for it. This happens when the mail runtime is created before its dns runtime, or on a machine where the entrance has not yet been given its names. Meanwhile, the runtime accepts mail on SMTP without STARTTLS. The ports that take a password or speak TLS from the first byte open within a second of the certificate appearing. A certificate given with **--cert** must exist when the runtime starts; otherwise the runtime does not start.
+
+**Signing in.** A user signs in in one of these ways:
+
+- with their password over TLS;
+- with their password in the clear, from this machine only;
+- with a token their idp gave a client that **--idp-audience** names, by XOAUTH2 or OAUTHBEARER on SMTP, IMAP and POP3. Mail apps that sign in through an identity provider work this way.
+
+If the account has its second sign-in step turned on, a mail app signs in with one of the account's app passwords (see **idp-user**).
+
+Ten failed sign-ins from one address within ten minutes block that address for ten minutes. Twenty failed sign-ins to one account, from three or more addresses, block that account for ten minutes. The account block does not apply to the addresses the account signed in from within the last thirty days. So guesses spread over many addresses do not lock out the user's own devices. Both blocks survive a restart. The log records each sign-in on one line, with the user, the protocol and the address.
+
+**Whose mail it takes.** The runtime's domains are those given by **--mail-domain**, or else the zones of the dns runtime named by **--dns**, which the runtime follows as they change. It accepts mail for an address in its domains when:
+
+- an alias names the address (**--aliases**);
+- the address belongs to a user (**--idp**: the local part is a username, or the address is the account's email);
+- the address is **no-reply@** and the message is a bounce;
+- the script accepts it (**on_rcpt**).
+
+Any other recipient is refused at RCPT with 550. A local part with a tag, *user***+***tag***@**, belongs to the user, and Sieve's subaddress extension reads the tag. **--recipient-delimiter** sets other separator characters, or none. An address that this runtime rewrote under SRS (see below) is accepted as the original sender it stands for. Such an address is accepted for up to 21 days, and only if it was made with the runtime's own key.
+
+Mail for other domains is accepted only from a signed-in user, or from 127.0.0.1 (this machine's own programs). From anyone else it is refused with 554, so the server is not a relay.
+
+**Taking mail.** The runtime speaks ESMTP with PIPELINING, SIZE, 8BITMIME, SMTPUTF8, ENHANCEDSTATUSCODES, STARTTLS, AUTH PLAIN and LOGIN, CHUNKING (BDAT), DSN, LIMITS (RCPTMAX, RFC 9422) and, inside TLS, REQUIRETLS (RFC 8689). Replies come in the order of the commands.
+
+A message larger than **--max-size** is refused. The refusal comes at MAIL when the client's SIZE parameter shows the size, and after the end of the message otherwise. A message ends only at a CRLF, a dot and a CRLF, or with the chunk that BDAT marks as the last. A bare LF or a lone CR inside a message is written as CRLF. So a dot after either cannot end a message, here or on the next server. Anything a client sent after STARTTLS before the handshake is dropped. A recipient given twice counts as one recipient. An EHLO name that contains a control byte or a space is refused.
+
+AUTH is offered over TLS, and in the clear only to 127.0.0.1. The answer to a wrong password comes one second later. Ten wrong passwords from one address within ten minutes lock that address out for ten minutes. During that time even the right password is refused (454, or [UNAVAILABLE] on IMAP).
+
+On the submission ports, the runtime accepts nothing from a client that has not signed in. A signed-in user may send only as their own address, in both MAIL FROM and the From header. Their own address is their username at one of the runtime's domains, the email of their idp account, or the username itself when it is an address. A connection that is idle for five minutes is closed.
+
+**Limits.** One client address may hold at most 50 connections to port 25, and 200 to each other port. These limits do not apply to 127.0.0.1. Without **--max-connections**, the runtime holds at most 8192 connections. A connection past a limit is answered 421 (BYE on IMAP and ManageSieve) and closed.
+
+A client is answered 421 and closed in two cases: it sends more than its largest message plus one mebibyte while a command is pending, or it leaves 32 MiB of replies unread. If it still reads nothing five seconds later, the connection is reset.
+
+**--rate-limit** *n* accepts *n* messages a second from one client address or one signed-in user, and answers the next MAIL with 450. **--global-rate-limit** sets the same kind of limit for the whole runtime.
+
+**What it checks.** With **--dnsbl**, the runtime looks up the address of each connection on port 25 in each list while it greets the client. Connections from 127.0.0.1 are not looked up. If the answer has not arrived by the time of MAIL, MAIL waits for it. A client that a list names (with an address in 127/8) cannot send anything and is answered 554, unless it signs in. An error answer from a list (127.255.255.x) names nobody, and a list that does not answer lets the mail through. Each answer is kept for five minutes.
+
+With **--greylist**, a stranger's first attempt with a given sender and recipient from a given network (a /24, or a /64) is answered 451. The message is accepted when the client tries again after the delay and within a day. From then on, that combination is accepted for 36 days. What one shard learns, every shard knows.
+
+With **--rspamd**, each message from other servers is also scanned by that Rspamd's **/checkv2**, alongside the checks below. Rspamd's actions take effect as follows:
+
+- reject refuses the message with 554;
+- soft reject and greylist answer it with 451;
+- add header and rewrite subject file it in Junk.
+
+The score goes into Authentication-Results as x-spam, which Sieve's spamtest reads. If the scanner does not answer within ten seconds, the mail is let through.
+
+Mail from other servers (on port 25, with no user signed in, and not from 127.0.0.1) is checked before it is accepted:
+
+- SPF (RFC 7208) for the sender's domain, or for the HELO name for a bounce;
+- every DKIM signature, rsa-sha256 and ed25519-sha256, up to ten, those of the From domain's organization first. A signature whose l= leaves part of the body out counts as neutral. An RSA key under 1024 bits is refused;
+- the ARC chain;
+- DMARC (RFC 7489) for the domain of the From header, with labels past ASCII as A-labels. SPF or DKIM must be aligned as the domain's record says, and pct= samples the messages the policy applies to.
+
+A message that fails DMARC under **p=reject** is refused with 550 and not kept. The same happens to a message whose author cannot be determined: one with two From headers, a From header that cannot be read, or authors from two domains. A message that fails under **p=quarantine** goes to the recipient's Junk folder. A passing ARC chain whose last seal is from a domain in **--arc-trust** lifts the policy.
+
+The result of each check is written into the **Authentication-Results** line of the stored message. The runtime removes an Authentication-Results line that a sender added under this host's name, and it also removes the sender's Return-Path.
+
+The lookups run on sixteen threads of their own, never on the event loop. All lookups for one message must finish within twenty seconds; after that they count as a temporary error. Each answer is kept for one minute. When 512 messages are already waiting to be checked, the next one is answered 451.
+
+For DMARC, the organizational domain of a name is its registrable domain under the Public Suffix List of the publicsuffix package (**/usr/share/publicsuffix**). For example, mail.example.co.uk belongs to example.co.uk. The list's rules past ASCII are compared as A-labels. Without the package, each name is its own organizational domain, so relaxed alignment behaves as strict; the log says so once.
+
+**The spool.** A message is synced to disk before the client is answered 250. It is kept under *state***/mail/***name***/spool** until every recipient is done. A message of up to one mebibyte is stored as a record in a segment. A segment is a 32 MiB file that is fully written out before it is used. So one fdatasync commits every message that ended while the previous fdatasync ran. A larger message is stored in a file of its own.
+
+Each record carries its segment's generation and a CRC. So a record that a crash cut short is dropped at the next start, and the log says so. The outcome for each recipient is kept in a log beside the messages. So a restart retries what was waiting and never brings back what was dropped. If only a few deferred messages keep a segment in use, they are moved out after a minute and the segment is used again. A message under one mebibyte is also kept in memory, so its delivery reads nothing back from disk.
+
+**Sending it on.** Recipients at one domain go in one transaction. A connection to a domain carries one message after another while more are waiting for that domain. The runtime opens at most four connections to one domain, and 128 in all. Where the other side offers PIPELINING, MAIL, RCPT and DATA go in one write.
+
+The exchangers are the domain's MX records, looked up by the resolver on the event loop, or the domain itself if it has no MX records. Delivery fails at once to a domain that does not exist or that says it accepts no mail (RFC 7505). With **--relay**, all mail for other domains goes through that smarthost.
+
+The runtime uses TLS wherever the other side offers it. It checks an exchanger's certificate where the exchanger's domain asks for that:
+
+- DANE (RFC 7672): where DNSSEC signed a domain's MX records, the runtime looks up the TLSA records of each exchanger. If there are any, the mail goes over TLS only, and the certificate must be one that the records name (DANE-TA or DANE-EE). A record is trusted only if the resolver set the AD bit and every nameserver that **/etc/resolv.conf** names is on this machine, such as a validating resolver like unbound. Otherwise no record is trusted and nothing is checked.
+- MTA-STS (RFC 8461): where a domain has an **_mta-sts** TXT record, the runtime fetches its policy from **https://mta-sts.***domain***/.well-known/mta-sts.txt** on a separate thread. It fetches the policy again when the record's id changes, and keeps it under the runtime's state for the next start. Under **mode: enforce**, only the exchangers the policy names are tried, over TLS. Each must present a certificate for its name from the system's CAs. Under **testing**, what would have failed is logged and counted, and the mail is sent as usual.
+
+Mail that cannot be sent under these rules waits and is tried again (4.7.5). For other domains the certificate is not checked, since no mail server checks one there. A smarthost's certificate is always checked, and the smarthost password is never sent in the clear.
+
+A recipient refused for now is tried again after 1m, 5m, 15m, 30m, 1h, 2h and 4h, and then every 8h, until **--queue-lifetime** runs out. A recipient refused for good, or out of time, is bounced to the sender as a delivery status report from the null sender. A server that offers CHUNKING receives the message in BDAT chunks, without dot stuffing. A server whose LIMITS say how many recipients a transaction takes receives that many recipients at a time.
+
+After a server answers 421, the runtime opens no new connection to its domain for thirty seconds. Each further 421 doubles that pause, up to fifteen minutes, until the server accepts a message.
+
+REQUIRETLS mail is sent on only to a server that offers REQUIRETLS, over TLS whose certificate DANE or an enforced MTA-STS policy vouched for. A smarthost's certificate always counts as vouched for. Otherwise the message is returned with 550 5.7.10, and the notice carries no more than its header. A Sieve redirect keeps the requirement.
+
+Mail from other servers that the runtime sends on goes out from an SRS address of its first domain (SRS0=hash=time=domain=local@). So SPF at the next hop judges this host, and a bounce still finds its way back.
+
+The delivery reports a sender asked for (RFC 3461) are kept with each recipient. NOTIFY, ORCPT, RET and ENVID are passed on to a server that offers DSN, and that server reports from there. For any other server, this runtime reports itself. It reports a SUCCESS that was asked for as delivered or relayed, and a DELAY once a message has waited four hours. It reports no failure where NOTIFY said NEVER. With RET=FULL the report carries the whole message, up to 4 MiB; otherwise it carries the header.
+
+Mail from one of its domains is signed with DKIM twice, both relaxed: rsa-sha256 under the selector, and ed25519-sha256 (RFC 8463) under *selector***-ed***.* The keys are made at the first start and kept in *state***/mail/***name***.dkim.***selector***.key** for every shard. To rotate a key, first name the new selector with **--dkim-next**, which makes its key pair and publishes it beside the old one. Once DNS has the new key, name the selector with **--dkim-selector**.
+
+Mail from other servers that the runtime sends on, as an alias does, is sealed with ARC (RFC 8617). The seal holds what the runtime's checks found, signed and sealed for its first domain. So the next hop can know what the message was when it arrived here.
+
+**Reports.** With **--reports**, the runtime sends the reports other domains ask for:
+
+- DMARC aggregate reports (RFC 7489), to the rua of each domain whose mail it checked;
+- TLS reports (RFC 8460), to the rua in the **_smtp._tls** record of each domain it sent mail to under DANE or MTA-STS.
+
+It sends them once a day, after midnight UTC, gzip'd. Each shard reports what it saw. **--dmarc-rua** and **--tls-rpt** publish where other domains should send their reports about this runtime's domains.
+
+**Its records.** With **--dns**, the runtime publishes these records for each of its domains, through the dns runtime:
+
+```
+example.com.                 MX   10 mail.example.com.
+example.com.                 TXT  "v=spf1 mx -all"
+skl._domainkey.example.com.  TXT  "v=DKIM1; k=rsa; p=..."
+skl-ed._domainkey.example.com. TXT "v=DKIM1; k=ed25519; p=..."
+_dmarc.example.com.          TXT  "v=DMARC1; p=quarantine; adkim=r; aspf=r"
+_imaps._tcp.example.com.     SRV  0 1 993 mail.example.com.
+_25._tcp.mail.example.com.   TLSA 3 1 1 ...
+```
+
+It also publishes:
+
+- an SRV record (RFC 6186, RFC 8314) for each of **--submission**, **--submissions**, **--imap**, **--imaps**, **--pop3**, **--pop3s**, **--jmap** and **--sieve** that it opens, so a mail client finds them from the address alone;
+- with **--tls**, the TLSA record of its certificate's key, for senders that check DANE where the zone is signed;
+- with **--mta-sts**, an **_mta-sts** record whose id follows the policy;
+- with **--mta-sts-port**, **mta-sts.***domain* as a CNAME of its host, which serves the policy there over TLS;
+- with **--tls-rpt**, an **_smtp._tls** record;
+- with **--dmarc-rua**, a rua in its DMARC record;
+- its host, **mail.***domain* unless **--hostname** names another, with the addresses that the dns runtime's **--publish** gives its names;
+- an SPF record for the host itself, **v=spf1 a -all**, for a receiver that checks the name the runtime greets with (RFC 7208 2.3).
+
+A record that the zone file has at the same name wins. With **--relay**, the SPF record ends in ~all, since mail leaves from the smarthost's addresses. Without a dns runtime, **socketley mail** *m* **dns** prints the lines for a zone kept elsewhere.
+
+**No-reply.** With **--no-reply**, a message that **socketley send** or a script writes without a sender goes out from **no-reply@***domain*. Mail to that address is refused, but a bounce is taken and read. Such a message goes out with one recipient per transaction, from **no-reply+***tag***@***domain*. The tag holds the day and a keyed hash of the recipient's address and that day, which only this runtime can make. A bounce that comes back within seven days under an address's tag suppresses that address. No shard mails a suppressed address again until **socketley mail** *m* **forgive** *address* releases it, or until ninety days pass.
+
+A bounce with no tag, with an older tag, or with another address's tag is read but has no effect. So neither a stranger nor another recipient can stop mail to an address. The runtime trusts its own bounce of such a message, so it learns that an address is dead from the first attempt. A recipient whose Status is 4.x.x, or 5.2.2 (mailbox full), is not a dead address and is not suppressed.
+
+A provider may send a feedback report (ARF, RFC 5965) saying that one of its users called a message spam. Microsoft's JMRP and the other feedback loops send these reports to whichever address of the runtime's domains they were given. If SPF or DKIM shows that the report's sender is who it claims to be, the report unsubscribes that user from the runtime's advertisements, as the user's own click would. The report is still delivered. **socketley mail trace** names it.
+
+**Mailboxes.** With **--idp** and **--storage**, each message of a user is an object in the storage runtime's bucket, made when first needed: *user***/INBOX/***id***.eml**. The bucket is mail unless **--storage** names another. The object holds the message under a Return-Path, a Delivered-To and the Authentication-Results line. A message under one mebibyte is written whole; a larger one is written in pieces of one mebibyte.
+
+Each message stored in a mailbox is announced to the targets of **--notify-targets** as **{"event":"mail.received","mailbox":..,"folder":..,"key":..,"from":..,"subject":..,"size":..}**, under **mail/***user* for a broker. A bucket that encrypts or compresses its objects does the same to mail. Either way, a message is read back one range at a time.
+
+**IMAP.** The runtime serves the mailboxes of **--storage** over IMAP4rev1, and over IMAP4rev2 (RFC 9051) for a client that enables it. It supports LITERAL+, SEARCHRES, SASL-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT, CHILDREN, SPECIAL-USE, ID, ENABLE, CONDSTORE and QRESYNC, and ESEARCH. It also supports LIST-EXTENDED and LIST-STATUS, STATUS=SIZE, QUOTA, SORT (with DISPLAYFROM and DISPLAYTO), THREAD (ORDEREDSUBJECT, REFERENCES), WITHIN (OLDER and YOUNGER), SAVEDATE, PREVIEW and COMPRESS=DEFLATE. Under COMPRESS=DEFLATE, what the server says in one loop turn is compressed as one flushed block. A password is accepted only over STARTTLS or **--imaps** (LOGINDISABLED before that), except from 127.0.0.1.
+
+Every user has the folders INBOX, Sent, Drafts, Junk and Trash. CREATE makes more, including the folders above a name such as Work/2026. A client can set keywords of its own beside the system flags.
+
+The UIDs, flags and keywords of each folder are kept per user in *state***/mail/***name***.imap/***user***,** as a snapshot with a journal beside it. Every shard serves IMAP. A shard records a change by appending a line to the journal under the user's lock, once it has read the journal to its end. So each UID is given only once, whichever shard gives it. Before each command, a shard reads the journal lines it has not yet read. The journal is folded into the snapshot once it passes a quarter of a mebibyte.
+
+A delivery, an APPEND or a COPY writes its journal line as the message is stored. So IDLE reports new mail within a second, and the quota counts the message at once. The bucket remains the authority. It is listed when a folder is selected, and every minute during NOOP and IDLE. A message that has gone from the bucket is expunged. A message that no journal line names gets the next UID once it is a minute old. Every change to a message takes the folder's next mod-sequence. So a client that reconnects can ask what changed and what vanished since it last looked.
+
+SEARCH, SORT and THREAD, like JMAP's text, body and header filters, read a message's header and its text parts, but not its attachments. They read the header both as written and with its encoded words decoded. They read the text parts both as written and with their transfer encoding and charset undone.
+
+Searches use a filter of each message's trigrams. The filter is made when a delivery or an APPEND stores the message. For a delivered message over one mebibyte, it is made the first time a search reads the message instead. The filter is as large as the number of different trigrams the message holds. It is kept in *state***/mail/***name***.imap/***user***.fts** for every shard. The filter rules out the messages that cannot hold the string asked for, so a search reads only the messages that may.
+
+A user's **mail_quota** field in the idp runtime (**socketley idp-user** ... **--set mail_quota=500M**) limits what their mailboxes hold. IMAP reports it as one quota root over every folder. An APPEND or a COPY past the quota is refused with OVERQUOTA. A delivery past it is refused with 552 5.2.2, as Dovecot refuses one. A user with no **mail_quota** gets **--default-quota**.
+
+When a user's mailboxes pass **--quota-warn** percent of their quota (default 90), the user is mailed a warning once. The user is warned again only after the mailboxes fell below that level.
+
+All of a runtime's mailboxes together, across all its domains, are limited by the quota of their bucket (PutBucketQuota on the storage runtime). A delivery past that quota waits, with 452 4.2.2, until room is made. For a separate limit per domain, run one mail runtime per domain, each on a bucket of its own.
+
+IMAP also offers:
+
+- MULTIAPPEND, which stores every message it is given, or none;
+- UTF8=ACCEPT, under which folder names travel as UTF-8 and a message may be a literal8;
+- CREATE-SPECIAL-USE, which accepts a special use only for the folder whose name has it;
+- BINARY, which returns a part with its transfer encoding undone;
+- OBJECTID, whose MAILBOXID a RENAME keeps;
+- METADATA (RFC 5464): entries of the server and of each folder, kept in the index, at most 1000 per user of 64 KiB each;
+- NOTIFY (RFC 5465), which tells a session within a second of changes. It reports new mail, expunges and flags in the folders it watches as STATUS, folders made and removed as LIST, and the selected folder between commands;
+- ACL (RFC 4314), by which a user gives others rights on a folder. The others see the folder under **Other Users/***owner***/** with what those rights allow (l r s w i k x t e a);
+- APPENDLIMIT.
+
+RENAME takes the folders under a name along with it. RENAME INBOX moves its messages and leaves INBOX empty. An IMAP connection that is idle for thirty minutes is closed.
+
+**JMAP.** **/.well-known/jmap** is the JMAP session. The API at **/jmap/api** accepts these methods, with back-references among them:
+
+- Core/echo;
+- Mailbox/get, query, set and changes;
+- Email/get, query, set, import and changes;
+- Thread/get, with every Email of a conversation in any mailbox;
+- Quota/get, query and changes (RFC 9425), with the octets of the user's quota;
+- Identity/get and set;
+- EmailSubmission/set, with its onSuccessUpdateEmail and onSuccessDestroyEmail.
+
+**/jmap/upload** and **/jmap/download** move blobs, and **/jmap/eventsource** reports state changes. A user signs in with HTTP Basic and their idp password, over TLS or from 127.0.0.1, or with a bearer token the idp gave a client that **--idp-audience** names.
+
+A user's JMAP account holds the same mailboxes IMAP reads. A Mailbox id is the folder's MAILBOXID, and an Email id is the message's EMAILID, which a move keeps. A Thread is the conversation named by the Message-ID that a message's References begin with, and collapseThreads folds a query by it. A keyword is an IMAP flag. So a client of either protocol sees at once what a client of the other did.
+
+A state is a digest of the index, and is the same on every shard. A */changes request since any other state is answered cannotCalculateChanges, after which the client reads again. An upload is kept for one day. An EmailSubmission can send only as the user's own address. Email/parse reads a blob, an upload or an attached message, as an Email.
+
+VacationResponse is kept in the user's METADATA. It answers the mail that the user's mailbox accepts, at most once a week per sender. It never answers a list, a bounce, spam or an automatic reply (RFC 3834). It answers whether or not a Sieve script runs.
+
+A user may have at most 50 PushSubscriptions, each lasting a week until it is renewed. A subscription is verified by a code pushed to its URL. After that, it is sent a StateChange whenever the types it asked for change. Pushes go over HTTPS to a public address, encrypted where the subscription gave keys (RFC 8291).
+
+**Calendars and contacts.** The same ports serve CalDAV (RFC 4791) and CardDAV (RFC 6352) for every user. **/.well-known/caldav** and **/.well-known/carddav** lead to **/dav/**. There the user's principal names their calendars under */dav/***user***/calendars/* and their address books under */dav/***user***/contacts/*. The collections **personal** and **default** are there for every user, and more can be made with MKCALENDAR or MKCOL.
+
+A client puts, reads and deletes each event, task or card as a whole, under If-Match and If-None-Match. PROPPATCH stores a collection's name, colour and description. The server answers the multiget and query REPORTs, including a query's component filter, and sync-collection (RFC 6578).
+
+The entries are objects in the **--storage** bucket under *.dav/***user***/*, apart from the mail folders. Each change in a collection is a line in a journal under *state***/mail/***name***.dav/**, and the journal's length is the collection's sync token. Through the entrance, a user signs in as for JMAP. Thunderbird's autoconfig, the Apple profile, and the **_caldavs._tcp** and **_carddavs._tcp** records in the zone point a client there.
+
+**Webmail.** With **--web** and **--domain**, the entrance serves a mail client in the browser under that name. It looks like the storage interface and offers:
+
+- the mailboxes with their unread counts, and a starred view;
+- the conversations a page at a time, each shown as its messages from every mailbox, with quoted text folded away;
+- a search over all of them;
+- reading, writing, replying and forwarding with attachments, with drafts saved while they are written;
+- moving, archiving, flags and deletion, and selecting or emptying a whole folder;
+- a message's headers, and a print view;
+- sending that can be undone within seconds or put off until a set time, as plain text or formatted;
+- a sender chosen from the user's addresses, with the address a message was sent to used for its reply;
+- a name, a signature, and an out-of-office answer between two dates;
+- filters for arriving mail, kept as a Sieve script;
+- new mail shown as it arrives, with notices in the background where the browser allows it.
+
+The webmail speaks German where the browser asks for it, and English otherwise. It signs in through the idp runtime. The idp's session cookie under its **--cookie-domain** signs the user in to every runtime under that domain at once. A page that is not signed in is sent to the idp's **/login**.
+
+A change that only the cookie authorizes must carry the page's **X-Socketley-UI** header, which another site cannot make a browser send. No other origin can read the answer to a request that the cookie signs. A message's HTML is cleaned of anything that runs, submits or reaches out. It is shown in a frame sandboxed without scripts. Its remote images wait until the reader asks for them, either for that message or for its sender from then on. The page's one script may run only by its hash.
+
+On the same port, a JMAP client signs in as on **--jmap**. It may use a password only where the entrance forwarded HTTPS. A client that fails ten times is locked out by the address that the entrance forwards for it.
+
+```
+socketley create mail m -p 25 --dns ns --idp auth --storage files/mail \
+    --imaps 993 --submissions 465 --tls --cert mail.pem --key mail.key \
+    --web 9480 --domain mail -s
+```
+
+**From the other runtimes.** Other parts of socketley send mail through this runtime:
+
+- **socketley send** and a script's **socketley.mail.send** write and queue a message;
+- a storage runtime's **mail://***runtime***/***address* notification target mails the storage's events;
+- **daemon.alert_mail** mails the daemon's alerts.
+
+   ```
+   local id, err = socketley.mail.send("m", { to = "ops@example.com",
+       subject = "order " .. order.id, text = "paid",
+       attachments = { { name = "invoice.pdf", type = "application/pdf", data = pdf } } })
+   ```
+
+**Sieve.** Users file their own mail with Sieve (RFC 5228). The supported extensions are fileinto, reject, ereject, envelope, encoded-character, imap4flags, copy, vacation, vacation-seconds, subaddress, body, relational, comparator-i;ascii-numeric, variables, date, index, mailbox, regex, editheader, duplicate, include, environment, spamtest, spamtestplus, virustest, enotify (mailto) and ihave.
+
+Users upload their scripts over ManageSieve (RFC 5804) on **--sieve**, with STARTTLS and SASL PLAIN using the password IMAP takes. They can also use **socketley mail** ... **sieve**. Each script is compiled as it is uploaded. A user may have at most 32 scripts of 64 KiB each, and 1 MiB in all. The scripts are kept under the runtime's state for every shard. A script is made active only if it compiles together with what it includes.
+
+The active script runs on a thread of its own for each message that reaches the user's mailbox, and reads the whole message. Its actions:
+
+- keep and fileinto file the message, with the imap4flags flags that IMAP shows. fileinto into a folder that does not exist works only with :create; otherwise the message goes into INBOX.
+- discard keeps nothing.
+- reject bounces the message to its sender if that sender signed in, is this machine, or passed SPF; otherwise reject discards it.
+- redirect sends the message on from the user's own address, and never again if it comes back.
+- vacation answers a sender once in its days or seconds, an hour at least, from the null sender, and never answers a bounce or spam.
+- notify mails a mailto URI, marked auto-notified, from the null sender, at most three times per message.
+
+What editheader adds or deletes appears in the message as it is kept and sent on, except for the Received and Auto-Submitted headers. duplicate keeps a message's ID for twelve hours unless :seconds says otherwise, and for a week at most. duplicate and vacation remember at most 10,000 entries per user. include :global reads the scripts uploaded for the user **.global** (**socketley mail** m **sieve .global put** name file ). include :personal reads the user's own. environment provides host, domain, remote-ip, location (MDA), phase (during), name and version. spamtest and virustest are 0 until a scanner says more. If a script fails, the message is kept in INBOX.
+
+imapsieve (RFC 6785): a folder's **/shared/imapsieve/script** entry, set by SETMETADATA, can name one of the user's scripts. That script then runs for each message a client APPENDs, COPYs or MOVEs into the folder, and for each message there whose flags a STORE changes. environment's imap.cause, imap.mailbox, imap.user, imap.email and imap.changedflags say what was done, and imap4flags starts from the message's flags. keep leaves the message with the flags the script left. fileinto files a copy, and redirect sends a copy on. If nothing keeps the message, it leaves the folder once its copies are in. reject is an error, and vacation does nothing. A message that the script's own fileinto puts in another folder runs no script there.
+
+**Lua.** A script of the runtime decides on each recipient and is told about each message:
+
+```
+function on_rcpt(r, default)          -- r.to, r.from, r.peer, r.user
+    if r.to == "orders@example.com" then return true end   -- the script's alone
+    if r.from:match("@spam%.test$") then return false end  -- refused 550
+end                                   -- nil keeps the default
+function on_message(m)                -- m.id, m.from, m.to, m.size, m.subject, m.message, m.peer, m.user
+    socketley.mqtt.publish("bus", "mail/in", m.subject or "", { qos = 1 })
+end
+```
+
+A recipient that **on_rcpt** accepts, and that no mailbox or alias has, belongs to the script. Its message reaches **on_message** and nowhere else. **m.message** holds the whole message if it is under one mebibyte.
+
+#### `--mail-domain domain[,domain...]`
+
+The domains the runtime accepts mail for.
+
+#### `--dns runtime`
+
+The dns runtime whose zones are the runtime's domains. The runtime gives those domains their records through it.
+
+#### `--hostname name`
+
+The name the runtime greets with, which its MX records also name. Default: mail.*first domain*.
+
+#### `--no-reply`
+
+Sends mail that has no sender from no-reply@. That address accepts no mail but bounces, and the runtime learns from those bounces.
+
+#### `--idp runtime`
+
+The idp runtime whose users have mailboxes here and sign in to send and read mail.
+
+#### `--idp-audience clients`
+
+The comma-separated ids of the idp clients whose access tokens the runtime accepts. A token the provider gave any other application is refused, since it belongs to that application and is no key to this runtime. Without this flag no access token is accepted, while cookies and passwords sign in as before.
+
+#### `--storage runtime[/bucket]`
+
+The storage runtime, and optionally its bucket, that holds the mailboxes.
+
+#### `--users file`
+
+A file of accounts that sign in to send mail. It holds a name and a scrypt hash, one account per line, as **socketley mqtt passwd** writes them. The runtime reads the file again when it changes.
+
+#### `--aliases file`
+
+A file of addresses the runtime accepts besides the users' own. Each line is *address target*[,*target*...]. A target is a mailbox (a name) or an address that the mail is sent on to. *@*domain* matches any local part of that domain that has no line of its own. The runtime reads the file again when it changes.
+
+#### `--relay smtp[s]://[user:password@]host[:port]`
+
+A smarthost that all mail for other domains goes through. smtps:// speaks TLS from the first byte (465); smtp:// uses STARTTLS (587).
+
+#### `--submission port`
+
+A port where users send mail, with STARTTLS and a password. Requires **--tls**, and **--users** or **--idp**.
+
+#### `--submissions port`
+
+A port where users send mail over TLS from the first byte. Requires **--tls**.
+
+#### `--imap port` / `--imaps port`
+
+A port where mail clients read the mailboxes, with STARTTLS (**--imap**) or over TLS from the first byte (**--imaps**). Both require **--storage**, and **--imaps** also requires **--tls**.
+
+#### `--notify-targets file`
+
+A file of the targets that are told about each message stored in a mailbox. It has the format of a storage runtime's targets file.
+
+#### `--max-size size`
+
+The largest message the runtime accepts, from 1K to 1G. Default: 25M.
+
+#### `--max-recipients n`
+
+The most recipients one message may have. Default: 100. A RCPT past the limit is answered 452.
+
+#### `--queue-lifetime duration`
+
+How long the runtime tries to deliver a message before it bounces it. Takes 1m to 30d; default 5d.
+
+#### `--autoexpunge duration`
+
+How long a message stays in a user's Junk or Trash before it is expunged. The time counts from when the message was put there. Takes 1h to 3650d; by default messages are never expunged. The first shard sweeps every user it has met, hourly.
+
+#### `--dkim-selector name`
+
+The selector the DKIM key is published and signed under. Default: skl. The Ed25519 key's selector is *name*-ed*.*
+
+#### `--dkim-next name`
+
+A selector whose keys are made and published but not yet used for signing. Use it to rotate a key.
+
+#### `--arc-trust domain[,domain...]`
+
+Forwarders, such as a mailing list's domain, whose ARC seal lets through mail that fails DMARC because they forwarded it. The seal counts only on an ARC chain that passes.
+
+#### `--sieve port`
+
+A ManageSieve (RFC 5804) port, where users manage their Sieve scripts. Requires **--idp** and **--storage**.
+
+#### `--pop3 port`
+
+A POP3 port, with STLS on it. Requires **--idp** and **--storage**.
+
+#### `--pop3s port`
+
+A POP3 port that speaks TLS from the first byte. Requires **--tls**, **--idp** and **--storage**.
+
+#### `--jmap port`
+
+A JMAP port for the mailboxes, served over HTTPS with **--tls**. Requires **--idp** and **--storage**.
+
+#### `--web port`
+
+A port that serves the webmail, and JMAP beside it, in plain HTTP on 127.0.0.1. The entrance in front of it handles TLS (see **Webmail**). Requires **--idp** and **--storage**.
+
+#### `--domain name[,name...]`
+
+The names under which the entrance of a dns runtime with **--proxy** reaches the webmail. A name without a dot, such as **webmail** or **mail**, is placed under each of the dns runtime's zones. Requires **--web**.
+
+Under each of its zones, the webmail also answers at **autoconfig** and **autodiscover**, where mail clients ask how to reach a mailbox. Thunderbird asks at **/mail/config-v1.1.xml** (and **/.well-known/autoconfig/**). Outlook asks at **/autodiscover/autodiscover.xml**, or through the JSON lookup that points at it, with **_autodiscover._tcp** in the zone. Each answer names the runtime's host, the ports it opens with TLS, and the address as the login. An address in a domain the runtime does not keep is answered 404. A user signed in to the webmail finds the same settings under Settings. There is also a profile that sets up an iPhone, an iPad or a Mac at once (**/~mail/mobileconfig**).
+
+#### `--lmtp port`
+
+An LMTP port for this machine's own programs, which delivers into the mailboxes only. A connection from elsewhere is closed.
+
+#### `--mta-sts enforce|testing`
+
+Publishes an MTA-STS policy (RFC 8461) in that mode, naming the runtime's host.
+
+#### `--mta-sts-port port`
+
+Serves the MTA-STS policy over HTTPS on this port, with the certificate of **--tls**. The daemon's ACME also asks for **mta-sts.***domain* in that certificate. Senders fetch the policy on port 443.
+
+#### `--tls-rpt address`
+
+Publishes the address where TLS reports (RFC 8460) about the runtime's domains should go.
+
+#### `--dmarc-rua address`
+
+Publishes the address where DMARC aggregate reports about the runtime's domains should go.
+
+#### `--dmarc-policy none|quarantine|reject`
+
+What the DMARC record asks receivers to do with mail that claims the runtime's domains and fails SPF and DKIM. Default: quarantine. Switch to reject once the reports show that only your own mail passes.
+
+#### `--bimi https://logo.svg[,https://certificate.pem]`
+
+Publishes a BIMI record with its SVG logo, and optionally a mark certificate. Providers that show a logo beside a message, Gmail among them, ask for the certificate. The logo is shown for a domain whose DMARC policy quarantines or rejects.
+
+#### `--reports`
+
+Sends the DMARC and TLS reports that other domains ask for.
+
+#### `--greylist duration`
+
+Greylists strangers (RFC 6647) for this long, such as 5m. 0 disables it.
+
+#### `--refuse-attachments ext[,ext...]|default|none`
+
+Refuses mail from other servers that has an attachment with one of these extensions. The answer is 554 and names the attachment. By default, the list covers programs, scripts, shortcuts, disk images and Office documents with macros (exe, scr, js, vbs, ps1, lnk, iso, docm, xlsm and the rest of Gmail's list).
+
+#### `--clamav host:port|socket`
+
+The clamd that every message from other servers is streamed to (INSTREAM) before the message is accepted. A message in which clamd names a virus is refused with that virus's name. A message clamd does not answer for is accepted and logged, as when Rspamd is silent.
+
+#### `--rspamd url`
+
+The Rspamd that scans mail from other servers, such as http://127.0.0.1:11333.
+
+Without it, or when it did not answer, the runtime's own filter scores the mail. That filter learns from the users. A message moved into Junk is spam. A message moved out of Junk, or filed from INBOX into a folder of the user's own, is not spam. This holds over IMAP, JMAP and the webmail's Report junk and Not junk alike.
+
+The filter's words are those of the subject, the text and the HTML's text, the From domain and the links' hosts. It weighs them as SpamBayes does (Robinson's chi-square of Fisher). A message is learned once, and learned again if it is later marked the other way. Once the filter has learned 20 messages of each kind, every message gets its score as x-spam-bayes. A message that scores 0.9 or more goes into Junk; nothing is refused for its score.
+
+**socketley mail learn** *user***/***folder* **--as spam**|**ham** teaches the filter a whole folder at once. **socketley stats** shows how much it learned (**mail_bayes_spam**, **mail_bayes_ham**) and how much it put in Junk (**mail_bayes_junked**).
+
+#### `--recipient-delimiter chars|none`
+
+The characters that separate a user from a tag in an address. Default: +.
+
+#### `--default-quota size`
+
+The quota of a user whose idp account names none. 0 means no limit.
+
+#### `--quota-warn percent`
+
+How full, in percent, a user's mailboxes get before the user is warned. Default: 90. 0 disables the warning.
+
+#### `--dnsbl zone[,zone...]`
+
+DNS blocklists (RFC 5782) to check, such as zen.spamhaus.org. The runtime looks up a stranger's address in each list as it connects. MAIL from an address that a list names is refused with 554.
+
+**stats** reports:
+
+- the messages received, delivered, deferred, failed and bounced, and the other delivery reports;
+- what is queued, and its bytes;
+- the spool's commits, segments, moves and failures;
+- the recipients and relays refused, and the messages that were too big;
+- what was checked, and what DMARC refused or quarantined;
+- the bounces taken and the addresses suppressed;
+- what was stored in mailboxes;
+- the sign-ins and their failures, and the STARTTLS and TLS failures;
+- the outgoing connections, with their TLS and transactions;
+- the certificates DANE and MTA-STS checked, and the connections refused for want of TLS;
+- the policies fetched, and what testing policies would have failed;
+- what Sieve rejected, sent on and answered on vacation;
+- the MX lookups;
+- what the spam filter refused and filed in Junk;
+- what was greylisted;
+- the reports sent;
+- the IMAP connections and reads.

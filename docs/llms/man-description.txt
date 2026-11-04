@@ -1,0 +1,15 @@
+# Description
+
+From the manual page socketley(1).
+
+**socketley** is one program. **socketley daemon** runs the daemon, which creates, starts, stops and supervises runtimes. Most other invocations, such as **socketley create** or **socketley ls**, are the command line: each sends its command to the daemon over a unix socket, and starts the daemon first if none is running. A runtime made with **create** runs in its own worker process, which the daemon restarts if it exits. In that process, one io_uring event loop on one thread serves the runtime. The daemon saves each runtime's configuration as a JSON file and restores every saved runtime when it starts.
+
+**socketley** is a high-performance Linux daemon and CLI that manages network runtimes in a Docker-like style: servers, clients, proxies, Redis-compatible caches, S3 object storage, authoritative DNS, file sync jobs, an OpenID Connect provider, JSON document stores, MQTT brokers, mail servers, tunnels, a Prometheus-compatible metrics store and MCP servers. It supports clustering, WebSocket, Lua scripting, and io_uring async I/O.
+
+**TLS can terminate on a server or cache listener, on both legs of a proxy, and on a client's outgoing connection.** A **server** runtime encrypts its own listening port with **--tls** **--cert** **--key**, and verifies client certificates with **--ca**. A **proxy** does the same on its own port and verifies client certificates with **--client-ca**. The proxy reaches an **https://** backend over TLS: it verifies the backend's certificate chain and name, and presents a client certificate with **--client-cert** **--client-key**. A **client** runtime connects to its target over TLS with **--tls**. It verifies the chain against **--ca** or the system trust store, matches the host from **-t** against the certificate, and presents its own certificate with **--cert** **--key**. Neither check can be switched off. An unverified TLS client protects against someone recording the traffic, but not at all against someone in the path who can intercept it.
+
+A **cache** terminates TLS on its own listener with the same three flags as a server. RESP runs on the decrypted stream, so a Redis client needs no change. The only combination the cache refuses is **--tls** together with **--replicate**: replication is not encrypted, so the pair would send the whole dataset over the network in cleartext. An **mqtt** broker terminates TLS on its MQTT and WebSocket ports with the same three flags. With **--ca**, it takes the name in a verified client certificate as the client's user.
+
+A runtime whose configuration cannot be honoured (for example, one restored from a state file written by an older release) refuses to start rather than run in cleartext. See **TLS** under **LIMITATIONS**.
+
+The io_uring event loop uses advanced kernel features when they are available: multishot receive (one SQE services many reads) and registered file descriptors (which skip the per-operation **fget**/**fput** overhead). Each feature is probed at startup. On older kernels the loop falls back to standard operations, so no configuration is needed.

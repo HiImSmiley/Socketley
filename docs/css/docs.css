@@ -70,7 +70,8 @@ pre.code:hover .cp,pre.code .cp:focus{opacity:1}
 .prose table.kv{border-collapse:collapse;width:100%;font-size:14px;margin:0 0 20px}
 .prose table.kv th{text-align:left;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);padding:6px 12px 8px 0;border-bottom:1px solid var(--line2)}
 .prose table.kv td{padding:9px 12px 9px 0;border-bottom:1px solid var(--line);vertical-align:top}
-.prose table.kv td:first-child{white-space:nowrap}
+.prose table.kv td:first-child{min-width:7em;max-width:34%}
+.prose table.kv td:first-child code{white-space:nowrap}
 /* Features: a short title and a line under it, two to a row. */
 .feats{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin:0 0 22px;max-width:none}
 .feats>div{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-size:14px;line-height:1.55;color:#c3c8d8}
@@ -334,3 +335,16 @@ pre.code{white-space:pre-wrap;overflow-wrap:anywhere}
   .man .er .chev{grid-column:2;grid-row:1}
 }
 .prose>div:has(.ent.c){max-width:940px!important}
+/* A diagram drawn in text: read as a picture, not copied as a command. */
+.prose>pre.diagram{max-width:940px;font:12.5px/1.45 var(--mono);color:#cfd5ea;background:rgba(255,255,255,.025);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:6px 0 20px;overflow-x:auto;white-space:pre}
+.prose code.pth,.man code.pth{overflow-wrap:normal;word-break:normal}
+@media (max-width:640px){
+  .prose table.kv3,.prose table.kv3 tbody,.prose table.kv3 tr,.prose table.kv3 td{display:block;width:auto}
+  .prose table.kv3 tr:first-child{display:none}
+  .prose table.kv3 tr{border-bottom:1px solid var(--line);padding:10px 0}
+  .prose table.kv3 td{border:0;padding:2px 0}
+  .prose table.kv3 td:first-child{font-weight:650;color:var(--fg)}
+  .prose table.kv3 td:not(:first-child)::before{content:attr(data-l) ": ";color:var(--dim);font-size:12.5px}
+}
+@media (max-width:640px){.prose>pre.diagram{font-size:11px;padding:12px 8px;margin-left:-6px;margin-right:-6px}}
+.prose>pre.diagram{width:fit-content;max-width:100%;padding-right:28px}

@@ -1,0 +1,452 @@
+# proxy runtime
+
+HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI
+
+A **proxy** forwards HTTP or plain TCP to backends, balances them and steers around failing ones. Without `--backend` it is the **entrance**, routing each request by name to the runtime that has it.
+
+```
+socketley create proxy gw -p 8080 --backend 127.0.0.1:9000 -s          # /gw/... goes to the backend
+socketley create proxy web -p 8081 --backend @web --strategy round-robin \
+    --health-check http --health-path /health -s
+socketley create proxy db-tcp -p 5433 --protocol tcp --backend 10.0.0.7:5432 -s
+socketley create proxy php -p 8082 --backend fastcgi://127.0.0.1:9000 --root /var/www/site -s
+```
+
+> By default a backend has 2 seconds to start answering, or the request gets a 504. Raise `--backend-timeout` for slow applications.
+
+## What it does
+
+- **Routing**: A request for `/gw/x` on proxy `gw` reaches the backend as `/x`. A request for one of its `--domain` names passes unchanged.
+- **Any backend**: `host:port`, `https://`, `unix:`, a runtime, an `@group`, `fastcgi://`.
+- **Resilience**: [Health checks](man-proxy-flags.txt), a [circuit breaker](man-proxy-flags.txt), [retries](man-proxy-flags.txt); `--sidecar` turns all on.
+- **Sign-in first**: `--auth bearer:`, `basic:` or `idp:` before anything reaches a backend.
+- **TLS on both legs**: Its own listener, [client certificates](man-proxy-flags.txt), verified `https://` backends.
+- **Lua filters**: `on_route` picks backends; a [filter chain](man-lua-configuration.txt) rewrites traffic.
+- **Modern HTTP**: The entrance speaks HTTP/2 and HTTP/3; every proxy relays WebSocket.
+
+## Works with
+
+A [dns](rt-dns.txt) runtime makes the entrance and its certificates. `--auth idp:` signs people in through an [idp](rt-idp.txt).
+
+## Flags
+
+Every flag a proxy runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
+| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
+| `--key` | path | Key: The PEM key of the certificate. |
+| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
+| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. |
+| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+| `--rate-limit` | int | Rate limit: Messages a second per connection. |
+| `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. |
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
+| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. |
+| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
+| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
+| `--drain` |  | Drain on stop: Finish what is in flight before stopping. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**Server**
+
+| flag | value | what it does |
+|---|---|---|
+| `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. |
+
+**Proxy**
+
+| flag | value | what it does |
+|---|---|---|
+| `--backend` | list | Backends: Where requests go: host:port, https://host, unix:/path, a runtime or @group. None makes it the entrance. |
+| `--protocol` | one of http, tcp | Protocol: HTTP routes by path and name; TCP forwards bytes. |
+| `--strategy` | one of round-robin, random, lua | Strategy: How a backend is picked. |
+| `--auth` | text | Auth: Who may pass: bearer:<file of tokens> or basic:<credentials file>. |
+| `--redirect-https` | text | Redirect to HTTPS: Answer every request with a redirect to HTTPS on this port (443 when empty). |
+| `--backend-timeout` | duration | Backend timeout: How long a backend may take to begin its answer, 2s unless given; 0 waits for ever. |
+| `--retry` | int | Retries: Try a failed request this many times on the next backend. |
+| `--retry-all` |  | Retry POST too: Also retry requests that are not idempotent. |
+
+**Health**
+
+| flag | value | what it does |
+|---|---|---|
+| `--health-check` | one of tcp, http | Health check: Check the backends by connecting, or by asking a path. |
+| `--health-interval` | duration | Every: Time between two checks. |
+| `--health-path` | text | Path: The path an HTTP check asks. |
+| `--health-threshold` | int | Failures: Failed checks before a backend is out. |
+| `--circuit-threshold` | int | Circuit after: Errors in a row that take a backend out. |
+| `--circuit-timeout` | duration | Circuit open for: How long a backend stays out before it is tried again. |
+| `--sidecar` |  | Sidecar: Health checks, circuit breaker, retries and drain in one. |
+
+**FastCGI**
+
+| flag | value | what it does |
+|---|---|---|
+| `--root` | path | Document root: The directory of a fastcgi:// backend's scripts: a .php file under it is run, a path with no file goes to the index script. |
+| `--fastcgi-root` | path | Server's root: The same directory as the application server sees it, when that is another path (a container). |
+| `--index` | text | Index script: The script that directories and paths with no file go to; index.php unless given. |
+
+**Proxy TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--client-ca` | path | Client CA: Clients must present a certificate signed by this CA. |
+| `--client-cert` | path | Backend certificate: The certificate it presents to TLS backends. |
+| `--client-key` | path | Backend key: That certificate's key. |
+
+## Benchmarks
+
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### Reverse proxy, HTTP and TCP
+
+HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-03, socketley 9f644c07.
+
+| case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
+|---|---|---|---|---|---|
+| HTTP, 1 KiB, keep-alive, 32 connections | 56 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.35× (1.31–1.44) | 1.85× (1.81–1.93) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 36 K req/s (1.00 cores) | 32 K req/s (1.00 cores) | 1.25× (1.21–1.28) | 1.43× (1.40–1.47) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.23× (1.17–1.27) | 1.71× (1.70–1.73) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.63× (1.58–1.76) | 2.08× (1.99–2.22) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 95 K req/s (1.00 cores) | 44 K req/s (1.00 cores) | 69 K req/s (1.00 cores) | 2.19× (2.05–2.31) | 1.36× (1.32–1.47) |
+
+How it was measured: wrk 8 threads, 8 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once.
+
+## The manual on proxy
+
+#### `--listen unix:/path/to.sock`
+
+Serve the proxy's front door on an AF_UNIX socket instead of a **-p** port. See **--listen** under **COMMON FLAGS** for the full description. With **--shards**, each shard binds a node of its own, *base#N.sock*, because SO_REUSEPORT cannot share a path.
+
+#### `--backend addr`
+
+Add a backend server for the proxy to forward requests to. The address can be ip:port, **unix:***/path/to.sock***,** a runtime name, or **@***groupname* to target all running members of that group dynamically. The flag is repeatable, or takes comma-separated addresses. Group backends are resolved at connection time, so the proxy picks up new group members automatically, without a restart.
+
+**A hostname is resolved off the request path.** The proxy looks up a backend named by hostname when it starts. If that lookup fails, the proxy tries again on each periodic sweep, on a thread of its own, and never while a request is being served. A request that arrives before the name resolves is refused rather than kept waiting. That is deliberate. The daemon runs all the runtimes it holds on one thread. A resolver that hangs on the request path would stop not only this proxy's clients but every server, cache and client in the same daemon. The cost is that a name which starts resolving is picked up within one sweep instead of immediately.
+
+**IPv4 only.** Every address this daemon resolves is AF_INET: a backend, an upstream, a client target and every listener. A hostname that has only an AAAA record resolves to nothing, and the backend is reported unreachable, with no log line anywhere saying why. This is a property of the whole daemon, not of this flag. It is described here because this is where an operator meets it first. The one address that is not an internet address at all is **unix:***/path/to.sock* below, which needs no resolving.
+
+An address may carry a scheme. **https://***host***:***port* is reached over TLS, and **http://***host***:***port* in cleartext. A bare *host***:***port* follows the backend TLS options described below. After a scheme the port may be omitted; it is then 443 or 80. See **mTLS Flags** for what verifies such a connection.
+
+**unix:***/path/to.sock* reaches a backend over an AF_UNIX socket instead of loopback TCP. A sidecar proxy and the process it fronts are on one host. Loopback TCP makes that pair pay for a whole network stack (sequence numbers, checksums, windows) on a connection that never touches a wire. Measured on a quiet machine with 64-byte round trips through this proxy:
+
+One unpinned connection took 41.4 us over TCP against 37.0 us over AF_UNIX. Eight unpinned connections made 66,620 round trips a second over TCP against 85,217 over AF_UNIX. The gain is 16 to 28%, depending on where the scheduler puts the three processes.
+
+Plan with the throughput figure, for the following reason. What the swap removes is CPU: 17.5 us per round trip across proxy and backend over TCP, against 14.5 us over AF_UNIX. That matches, to the tenth, what a two-process ping-pong predicts for that leg. On one core with a single connection, almost none of it shows up as latency (21.5 us against 20.7 us). A serial round trip there waits on wakeups rather than on work, so the freed CPU has nothing to do. A proxy under load is short of exactly that CPU. That is why the same change is worth under a microsecond in the first measurement and a fifth of the throughput in the second.
+
+The path must be absolute and shorter than 108 bytes, which is what the kernel's *sun_path* holds. Both rules are checked at **create**/**start**, not at traffic time. The kernel truncates a long path silently, and a trimmed path names a different socket, quite possibly a real one belonging to something else. A relative path is refused because it would be resolved against the daemon's working directory, which the operator writing the flag cannot see.
+
+A unix backend is never reached over TLS. **--ca**, **--client-cert** and **--client-key** encrypt every backend connection at once. A proxy given both those flags and a **unix:** backend is therefore refused at start, rather than quietly connecting in the clear. Filesystem permissions on the socket node are what restrict access to it.
+
+If the socket path does not exist, or a process that has exited left a stale socket node behind, the client gets **502**. That is the same answer an unreachable TCP backend gives, for the same reason: the far end failed, not this one.
+
+**fastcgi://unix:***/path/to.sock* or **fastcgi://***host***:***port* names an application server that the proxy speaks FastCGI to instead of HTTP. Examples are php-fpm, or anything else that takes the responder role. Such a proxy needs **--root**, speaks **--protocol http** to its clients, and has no backend of any other kind. **create** refuses a proxy that breaks any of these rules. Deadlines, retries, the circuit breaker and the TLS listener work on it as on any backend.
+
+The proxy does not keep its connection to the application server open between requests. A php-fpm worker serves one connection for as long as that connection lasts. A kept connection would therefore hold that worker away from every other request. With more kept connections than workers, the other requests would wait in the backlog until their deadline.
+
+The proxy sends a request to the first of these that matches. First, the first path segment ending in **.php** that is a regular file beneath **--root**; whatever follows that segment becomes **PATH_INFO**. Second, a directory's **--index**. Third, an existing file that is not a script, which the proxy serves itself. Otherwise, the index script at the top of **--root**, as for a front controller, with the path in **REQUEST_URI**.
+
+The proxy finds a script with **openat2**(2) and **RESOLVE_BENEATH**, so a link that leads out of the root never counts as a script. An absolute link is followed only when its target stays inside the root. Because a script must exist, **/upload.jpg/x.php** is never handed to the interpreter, whatever **cgi.fix_pathinfo** says.
+
+The proxy never serves the following, either as a script or as a file, and answers 404 instead. It refuses a path that walks up the tree, and a hidden segment other than **.well-known**. It also refuses the names a site keeps but does not hand out. Those are a name ending in **~**, a name containing **.php.**, and names with any of these extensions, also when followed by **.gz** or **.br**: **bak**, **old**, **orig**, **save**, **swp**, **swo**, **tmp**, **dist**, **inc**, **sql**, **ini**, **log**, **phtml**, **phar**, **phps** and **php3**–**php8**.
+
+The proxy serves a file with its type, an ETag and Last-Modified. It answers If-None-Match, If-Modified-Since, If-Match and If-Unmodified-Since (RFC 9110 13.2.2), and one range with If-Range. It accepts GET and HEAD only (405 otherwise), under keep-alive. A file up to 16 KiB is kept in memory after its first GET, up to 64 MiB in total. Each request checks the kept file against the disk with one **statx**(2), which notices a file replaced under its name. A larger file is sent with **sendfile**(2) on a plain connection, at most 4 MiB a turn. Where that file is not in the page cache, it is read through the ring instead of waited on. Over TLS, a larger file is read 256 KiB at a time.
+
+The proxy never passes on a **Proxy** header (httpoxy). It also drops any header whose name contains an underscore, because a server would read it as the same variable as its dashed twin. **HTTPS** is on when this proxy terminated TLS, or when an entrance in front of it did and said so over the loopback. When an upload sends **Expect: 100-continue**, the proxy tells it to continue, because an application server never does. Whatever a script writes to STDERR reaches the log, at most twenty lines a minute. An **X-Accel-Redirect** (nginx's internal redirect) is answered 502; a script hands out a file with **readfile()**.
+
+#### `--root directory`
+
+The absolute path of the directory that holds a FastCGI proxy's scripts and files.
+
+#### `--compress`
+
+Send a file's precompressed copy, made by the site's build, to clients that accept it. For example, **app.css.br** or **app.css.gz** is sent for **app.css** to a client whose **Accept-Encoding** accepts that coding. br is preferred over gzip. The response carries **Content-Encoding** and the copy's own ETag, and every file response then carries **Vary: Accept-Encoding**.
+
+A copy older than its file is never sent, since that means a build changed one and not the other. Nor is a copy sent for a range, which refers to the file. Nor is one sent when its file is missing or kept from the public. Nor is one sent for an image, a video, a woff font, a zip or a pdf, whose formats are already compressed. A compressed copy of a name kept from the public is kept from it too, with or without this flag. The proxy itself never compresses or decompresses anything. So it links no compression library, and it decodes nothing a client sends.
+
+#### `--fastcgi-root directory`
+
+The same directory as the application server sees it, when that path differs (for a server in a container). The proxy passes it to the application server in **SCRIPT_FILENAME** and **DOCUMENT_ROOT**.
+
+#### `--index name`
+
+The script that a directory and an unmatched path go to. Default: **index.php**.
+
+#### `--strategy strategy`
+
+The load-balancing strategy: **round-robin** (the default), **random**, or **lua** (custom, via the on_route callback).
+
+#### `--protocol protocol`
+
+The protocol the proxy speaks: **http** (the default, with path-based routing) or **tcp** (raw byte forwarding).
+
+In **tcp** mode, a client may shut its write side with **shutdown**(2). The proxy passes that half-close on to the backend and holds the return direction open until the backend itself closes. A byte relay has no framing, so this is the only way it can tell a backend where a request ended. This is what makes **nc -N**, a one-shot **redis-cli**, and any shell pipeline into the proxy work. Each of those sends, half-closes, and then reads the answer. The proxy issues the half-close only once everything the client sent has reached the backend socket, so the half-close cannot overtake the request it ends.
+
+The hold ends when the backend closes, when the client resets, or at **--idle-timeout** if one is set. A half-closed client is held no longer than one that never half-closed. A TCP relay has no request and no response, so no deadline sweep applies to either.
+
+Default port: 8080
+
+HTTP mode: requests to /<proxy-name>/* are forwarded with the prefix stripped.
+
+In **http** mode, a request carrying an upgrade offer is forwarded with both of the headers that make the offer intact, instead of having them stripped as hop-by-hop. An upgrade offer is an **Upgrade** header together with a **Connection** header that lists the **upgrade** token. If the backend answers **101 Switching Protocols**, the proxy relays that response verbatim. The connection then becomes a bidirectional byte relay until one end closes. This is what makes **ws://** work through a proxy in http mode. See **WebSocket and other protocol upgrades** under **LIMITATIONS** for what the proxy does and does not do with such a connection.
+
+#### `--domain name[,name...]`
+
+On a proxy, the names by which it is reached through the entrance (see **--proxy** under **DNS FLAGS**). When it is reached by one of these names, the proxy serves without a **/***name***/** prefix. The path and the Host go to the backend unchanged, as a site behind it expects. From a hop on this machine (the entrance in front of it), the proxy keeps **X-Forwarded-Proto** and **X-Forwarded-Host** instead of overwriting them. The backend is therefore told the scheme the client used, not the cleartext hop between entrance and proxy.
+
+```
+socketley create proxy hub -p 8089 --bind 127.0.0.1 \
+    --backend 127.0.0.1:8088 --domain hub --backend-timeout 5m -s
+```
+
+#### `--auth bearer:file|basic:file|idp:runtime|none`
+
+Require clients to authenticate before any part of their request reaches a backend. **bearer:** admits **Authorization: Bearer** *token* when the token matches a line of *file*. Blank lines and lines starting with # are ignored. **basic:** admits HTTP Basic with an access key and its secret key from *file*. The file has the format that a storage runtime's **--credentials** reads, and the key must belong to a user who is an admin there. A key outside any **[user]** section belongs to the default owner, who is an admin.
+
+A request without valid credentials is answered **401** with the **WWW-Authenticate** header to answer in. The backend is never sent the **Authorization** field. The proxy reads the file again when it changes, at most once a second. If the file is gone or does not parse, the proxy refuses everybody and says so in the log.
+
+An address that fails five times within fifteen minutes is refused even when it gives the right answer. It gets **429** with **Retry-After** until fifteen minutes after its first failure. An IPv6 address is counted by its /64. Behind the entrance (a hop on this machine), the address is the last one in **X-Forwarded-For**, which is the one the entrance heard from. Each failure is logged with that address.
+
+The proxy checks an admitted connection again every second for as long as its exchange lasts, an upgrade's tunnel included. It closes the connection once the credential that admitted it would no longer do so: a token removed from the file, a sign-in ended or an account disabled. Set at **create**; **edit** changes it on a stopped proxy.
+
+```
+socketley create proxy stats -p 9191 --bind 127.0.0.1 \
+    --backend 127.0.0.1:9190 --domain metrics \
+    --auth basic:/etc/socketley/storage-ui.creds -s
+```
+
+**idp:***runtime* puts a sign-in in front of every route. The proxy accepts the sign-in cookie of the **idp** runtime of that name in this daemon. It verifies the cookie here against the key that runtime publishes beside its state, once per session, and then remembers the session until it expires. A browser without the cookie, meaning a GET or HEAD that accepts HTML, is sent with **302** to sign in and then back to the address it asked for. Any other request without it is answered **401**.
+
+The backend is told the account's fixed id in **X-Forwarded-User**, its username in **X-Forwarded-Preferred-Username** and its email address in **X-Forwarded-Email**. A client's own headers of those names never reach the backend. The proxy removes the provider's own cookies from the **Cookie** field it sends to the backend, and keeps every other cookie. The cookie reaches a proxy on another name only when the provider's **--cookie-domain** covers both names.
+
+```
+socketley create proxy wiki -p 8100 --backend 127.0.0.1:3000 \
+    --domain wiki.example.com --auth idp:auth -s
+```
+
+#### `--redirect-https [port|none]`
+
+Answer every request with a **308** redirect to the same name and path over HTTPS. The redirect goes to *port*. Default: 443, which is then not written into the URL. An ACME HTTP-01 challenge that this daemon holds is still answered first. A **dns** runtime whose entrance is on 443 creates a child proxy on port 80 that uses this flag.
+
+### Sharding
+
+##### `--shards N`
+
+Serve this proxy from *N* worker processes instead of one, sharing the listening socket through **SO_REUSEPORT**. The kernel gives each incoming connection to one of them. *N* is 1 to 64; the default is 1.
+
+A runtime is one process, and therefore one event loop on one core. This flag is the only way to give a single runtime more than that. It is worth using only when a proxy is saturated. Below saturation, a single connection is limited by the cost of a cross-core wakeup, and another process cannot help with that.
+
+A shard is an implementation detail of a runtime, not a runtime of its own:
+
+- **ls** shows one entry.
+- **stats** reports the connection count summed across the shards, and labels each shard's detail text.
+- **stop** and **remove** take all the shards down.
+- The count is persisted, so a restart brings back the number that was asked for.
+
+**It is a declaration, and not every type may make it.** Sharding is correct exactly when nothing is shared between connections, and nothing can detect that. The flags cannot, and the script cannot either: a table at file scope is indistinguishable from one that happens never to be read twice. So the operator declares it, and the flag is offered only where the operator is in a position to judge. How each type handles it:
+
+- A **cache** shards by key ownership. Each shard owns the slice of the keyspace that hashes to it. A command naming a key that another shard owns is forwarded to that shard, executed there, and answered back through the connection that asked. A **SET** on one connection and a later **GET** on another therefore agree, whichever shards they landed on. See **Sharding** under **CACHE FLAGS** for what that costs.
+- A **client** refuses the flag, because it has no listening socket to share.
+- A **server** may shard with or without **--lua**. Each shard loads the script into its own interpreter, so per-shard state stays per shard and is not shared between shards. See **Sharding** under **SERVER FLAGS** for what that means for a script.
+
+**--shards with --listen unix:** gives each shard a node of its own, *base#N.sock*, because **SO_REUSEPORT** cannot share a path: on one path, *N* processes would unlink each other's node. The pair is refused only when the longest of those paths is too long for a unix socket address.
+
+**What it bought, measured.** An **http** proxy in front of four **--http** backends, driven by **wrk**:
+
+| shards | throughput | CPU per shard |
+|---|---|---|
+| 1 | 40,285 req/s | 1.00 cores |
+| 2 | 94,401 req/s | 0.99 cores |
+| 4 | 150,175 req/s | 0.91 cores |
+| 8 | 142,775 req/s | 0.47 cores |
+
+Four shards give 3.73x the throughput of one, close to linear: each shard stays at a full core until the machine runs out of cores. Eight shards on a ten-core box are past that point and gain nothing. The per-shard CPU figure halving is what running out looks like. Do not set more shards than the machine has cores to give them.
+
+**The backend tier saturates first.** That is the first limit anyone will hit, and it is not a property of this flag. The same proxy in front of a *single* backend stops at 2.14x however many shards it is given. The backend is then pinned at exactly 1.00 cores, and the shards are idle, waiting on it. A sharded proxy needs something behind it that is more than one process: several backends, a **--strategy** across a group, or a backend that is itself sharded. Before reading a number as this flag's ceiling, find out what saturated.
+
+**It does nothing for --protocol tcp, for a different reason.** A **tcp** proxy moves bytes with **IORING_OP_SPLICE**, which io_uring preps with **REQ_F_FORCE_ASYNC**. So that data path never runs on the shard's event loop at all; it runs on io-wq kernel threads. It was therefore never limited by the number of processes. At *one* shard, a tcp proxy under 100 connections was measured holding 11 threads, 10 of them **iou-***, and using 1.85 cores. Sharding such a proxy adds processes to a path that is already parallel, and throughput does not change. If you shard a tcp proxy and see no change, this is why. The ceiling that **--shards** exists to lift is the **http** one above, where the runtime really is one event loop on one core.
+
+**The load is balanced per connection, not per request.** **SO_REUSEPORT** picks a shard when it accepts a connection and never changes that choice. One heavy long-lived connection therefore makes one shard hot while the others idle. Over a small number of connections the spread is uneven: eight connections over four shards were measured landing 3/2/2/1. Sharding helps a proxy carrying many comparable connections; it does nothing for a proxy carrying one big one.
+
+The shard count can be changed with **edit** only while the runtime is stopped, for the same reason as **-p**: applying it to a running proxy would mean retiring workers out from under live connections.
+
+### Health Check Flags
+
+##### `--health-check [tcp|http]`
+
+Enables active health checks of the backends. In **tcp** mode, the proxy opens a TCP connection to each backend at the configured interval, and the check succeeds if the port is listening. In **http** mode, the proxy sends an HTTP GET to **--health-path** and treats a 2xx response as healthy. The proxy removes an unhealthy backend from the load balancer pool until it recovers.
+
+##### `--health-interval duration`
+
+The time between health checks. Default: 5 seconds. A bare number is seconds; the suffixes **s**, **m**, **h**, **d** and **w** are accepted (**30** and **5m** both work).
+
+##### `--health-path path`
+
+The path that HTTP health checks request. Default: **/health**. Used only when **--health-check** is set to **http**.
+
+##### `--health-threshold n`
+
+The number of consecutive failed health checks after which a backend is marked unhealthy. Default: 3. One successful check restores the backend.
+
+### Circuit Breaker Flags
+
+##### `--circuit-threshold n`
+
+The number of consecutive backend errors that trips the circuit breaker to the **open** state. A refused connection, a timeout and a 5xx response each count as an error. While the circuit is open, every request to that backend fails at once, without a connection attempt. Default: 5.
+
+##### `--circuit-timeout duration`
+
+How long an open circuit stays open before it changes to **half-open**. In the half-open state, the proxy lets one probe request through. If the probe succeeds, the circuit closes and the backend is fully healthy again; if it fails, the circuit opens again. Default: 30 seconds. A bare number is seconds; the suffixes **s**, **m**, **h**, **d** and **w** are accepted (**30** and **5m** both work).
+
+##### `--backend-timeout duration`
+
+How long a backend may take to send the *first* byte of a response before the proxy gives up on the request. The proxy then retries the request on another backend if **--retry** allows it, and otherwise answers **504 Gateway Timeout**. In both cases the backend is charged with an error, so the circuit breaker above opens and takes the backend out of rotation. While the request body is still arriving, the wait is measured from the latest bytes received. If a client stops sending a body and the backend has already taken all of it so far, the proxy answers **408 Request Timeout** instead, with no retry and no error charged. Default: 2 seconds. 0 disables the deadline, and the proxy waits indefinitely. A bare number is seconds; the suffixes **s**, **m**, **h**, **d** and **w** are accepted (**30** and **5m** both work).
+
+This deadline is the only mechanism that notices a backend which accepts connections and then stops answering. Such a backend passes a TCP health check. A request that never completes counts as neither a success nor a failure, so without a deadline the backend keeps its full share of the rotation. Every request routed to it then waits until the client gives up. The deadline applies in HTTP mode only, because TCP mode has no request and response framing to measure.
+
+Only the wait for the first byte is bounded. Once the backend has begun answering, a slow or streaming response body is never cut short, with one exception: the client has closed its side. Such a client cannot end the response itself, so from then on the backend may go at most this long without sending a byte. After that, the proxy closes both connections, with no error charged. A backend that keeps sending is never cut short.
+
+The 2-second default applies whether or not the flag is given. Some endpoints normally need longer than that to *begin* answering, such as a report computed on demand, a cold cache or a long query. If any endpoint behind this proxy does, raise **--backend-timeout** to cover it, or set it to **0** to disable the deadline. At the default, such an endpoint has its requests cut off at 2 seconds and is charged an error each time. That opens the circuit breaker on a backend that is working correctly.
+
+### Retry Flags
+
+##### `--retry n`
+
+Retries a failed request up to *n* times on the next backend in the pool. Default: 0, which disables retries. Only idempotent HTTP methods (GET, HEAD, PUT, DELETE, OPTIONS) are retried, unless **--retry-all** is set. In TCP mode, every failed connection attempt is retried.
+
+##### `--retry-all`
+
+Also retries non-idempotent methods (POST, PATCH). Use it with caution: the proxy replays the request body to the next backend, which may cause duplicate side effects.
+
+### What a Request That Never Reaches a Backend Is Answered
+
+In **--protocol http** mode, a client that has sent a complete request always gets a status line back. The status tells which side failed. In every case below, the proxy first retries the request if **--retry** allows it. The status is sent when no retry is available or every retry has also failed.
+
+##### `502 Bad Gateway`
+
+The backend failed. It refused the connection, was unreachable, could not be resolved, closed before the first byte of the response arrived, or rejected the TLS handshake. The error is charged to the backend's circuit breaker. A client that retries a 502 immediately asks a backend that has just failed.
+
+##### `503 Service Unavailable`
+
+The proxy itself ran short of a resource before it asked the backend anything. The resource is the local ephemeral port range (**EADDRNOTAVAIL**), descriptors (**EMFILE**, **ENFILE**), or memory or buffers (**ENOMEM**, **ENOBUFS**). A submission that did not reach the io_uring ring also gives 503. Nothing is charged to any circuit breaker: the backend is healthy, and the same request will very likely succeed on the next attempt. The proxy also answers 503 when there is no backend to send to at all: every member of an **@group** is out, or the single backend's breaker is open.
+
+##### `504 Gateway Timeout`
+
+The backend accepted the connection, or never finished accepting it, and sent no first byte within **--backend-timeout**. The error is charged to the breaker.
+
+Two cases deliberately get no status line:
+
+- **--protocol tcp** has no requests or responses. When the backend of such a byte pipe never comes up, the proxy closes the connection and does not invent a status for it.
+- Once the backend has put bytes on the client's connection, a status line can no longer be written. It would land in the middle of a message, and the client would read it as part of the response it is already receiving. The proxy closes such a connection. It charges the backend that produced the unfinished response to its breaker, so the next client is routed elsewhere.
+
+**A script runs when its runtime starts, not when it is created.** **create** compiles the file, so a file that does not parse is refused at once, by the command that asked. The worker process runs the script. Without **-s** there is no worker yet, so nothing has run: not the top level, not **socketley.subscribe**, and no check of a global such as **tick_ms**. These happen at the **start** that forks the worker, and that command reports any refusal.
+
+### Process Isolation
+
+Every runtime made with **create** or restored at boot runs in its own supervised worker process. There is no flag for this and nothing to configure: servers, clients, proxies and caches all run this way. The one exception is a runtime that a script makes with **socketley.create**: a server, client, proxy, cache, storage or dns runtime made that way runs in the daemon.
+
+A configuration file that contains **daemon_process** is refused rather than ignored, whatever its value. The error names the line to delete.
+
+The whole Lua API works in a worker. The thirteen calls that a worker used to refuse are all answered now. They fall into three groups:
+
+##### `Reads of the map`
+
+**socketley.send**, **.list**, **.get** and all four **socketley.cluster** calls. The daemon pushes each worker a replica of the runtime map and a snapshot of the cluster view, and the worker answers these calls from them.
+
+##### `Changes to the map`
+
+**socketley.create**, **.start**, **.stop**, **.remove**. These are not answered from the replica, because a copy of the map gives no permission to change it. The worker sends them to the daemon over a socket of its own and waits for the answer. So **if socketley.create(...) then** branches on what happened, not on whether the request was accepted. Measured over three runs of 20000 calls: 9.95, 10.20 and 10.52 microseconds. A script takes this path deliberately, never once per message.
+
+##### `Moving a connection`
+
+**socketley.pipe** between two runtimes, and **self.route()**. Despite the names, neither hands a descriptor over. The original runtime keeps the socket and relays the bytes, and the target runtime answers as though the connection were its own. Names travel; the connection does not.
+
+One refusal remains, for one case: a worker forked by a daemon that could not give it the control plane these calls need. That is an older build, or a daemon that could not create the socket. The error says so and says to restart the daemon.
+
+A cross-runtime request costs about 50 microseconds more than the same call within one address space, as measured. A server using **--cache** pays this on every command.
+
+A script's **routes** declaration still works. Running the script produces it, and the script runs in the worker. The worker sends the declaration back to the daemon over the control socket it already holds, and the daemon's placeholder publishes it to the proxies in front of the runtime. See **Declared Routes**.
+
+The daemon forks and execs itself, and hands the worker its configuration and its routing table over a control socket. The daemon keeps a placeholder for the worker in the runtime map. The CLI output is unchanged: **ps**, **ls**, **show**, **stats** and the Prometheus endpoint report the same figures as for an in-process runtime. The worker publishes the figures, and the daemon stores them where an in-process runtime would have written them.
+
+The worker binds the port; no descriptor is passed between the processes. If the worker dies, the daemon restarts it and the runtime stays **running**. If it dies more than five times in ten seconds, the runtime is left **failed** instead of being forked again in a loop. In both cases the daemon tells every other runtime to release the connections routed to or from it, because a killed worker runs no teardown of its own.
+
+Lua callbacks run inside the worker, against the worker's own state. A cache's **PUBLISH** reaches the worker's **subscribe** callbacks. The figures the daemon reports were read by the worker when they were printed. See **Out-of-process runtimes** under **LIMITATIONS**.
+
+### mTLS Flags
+
+A proxy has two legs, and each leg has its own half of mutual TLS. The flag names say which leg: **client** always means "a TLS client". The proxy is a TLS client towards its backends, and its own callers are TLS clients towards the proxy.
+
+##### `--client-ca path`
+
+The CA that must have signed the certificate presented *by a client*. This is mutual TLS on the proxy's own listening port, so it requires **--tls** **--cert** **--key**. Without them it is refused: on a cleartext port it would authenticate nobody, while **show** reported mutual TLS.
+
+##### `--client-cert path` / `--client-key path`
+
+The certificate and key this proxy presents *to a backend* that asks for one. Give both or neither. Half a pair loads nothing, so it is refused rather than leaving a leg that presents no certificate although the flag promised one.
+
+Any of **--ca**, **--client-cert** and **--client-key** also switches the backend leg itself to TLS, for every backend. None of the three means anything against a cleartext peer, and honouring them without encrypting would fail open. To encrypt one backend and leave the others alone, use an **https://** backend address instead.
+
+The proxy always **verifies** a TLS backend connection. It checks the chain against **--ca** *file* if one is given, and against the system CA store otherwise. It checks the certificate against the endpoint the request was routed to. A host name must match one of the certificate's DNS names, and partial wildcards are refused; an address literal must match an IP SAN. TLS 1.2 is the minimum version. None of this can be disabled. A backend that presents a private-CA or self-signed certificate needs that CA in **--ca** *file* or in the store OpenSSL reads. If a backend's certificate fails either check, the proxy answers 502 (or retries, where **--retry** is set) and charges the backend's circuit breaker. The request is never sent in the clear as a fallback.
+
+Connections to a TLS backend are pooled and reused, like cleartext ones. Forty requests in a row to one **https://** backend cost one handshake, not forty. The TLS session is pooled together with the descriptor. So a reused connection continues the same record layer in the same stream; it is not a new session over an old socket. A pooled socket is reused only for the endpoint it was opened to. That endpoint is also the name its certificate was verified against and the name sent as SNI. A pooled socket never survives a restart. The trust store and client certificate the leg verifies against are rebuilt when the runtime starts, and the pool is emptied when it stops. Before the proxy reuses a socket, it decrypts and inspects whatever is waiting on it. A session ticket or a key update is consumed, and the connection is kept. Application data is a response nobody asked for, so the proxy drops the connection rather than handing it to the next client.
+
+**--health-check http** works with TLS backends and probes over TLS. It verifies the backend's certificate to the same standard as the data path, and marks a backend it cannot verify as unhealthy rather than healthy.
+
+### Sidecar Mode
+
+##### `--sidecar`
+
+A shorthand that enables a service-mesh-ready configuration with one flag. It is equivalent to:
+
+```
+--health-check tcp --circuit-threshold 5 --circuit-timeout 30 --retry 2 --drain
+```
+
+You can still give individual flags alongside **--sidecar** to override these defaults, for example **--sidecar --health-check http --health-path /ready**.
+
+**--sidecar** does not set **--backend-timeout**, but the two interact. The deadline is 2 seconds by default, and each expiry is charged to the circuit breaker that **--sidecar** turns on. Five slow requests in a row open the circuit for 30 seconds. If the application behind the proxy can take longer than 2 seconds to send its first response byte, add **--backend-timeout** *seconds* alongside **--sidecar**, or add **--backend-timeout 0** to switch the deadline off.
+
+Example:
+
+```
+socketley create proxy myapp --sidecar --backend 127.0.0.1:3000 \
+    -p 8080 --health-check tcp -s
+
+socketley create proxy slowapp --sidecar --backend 127.0.0.1:3000 \
+    -p 8080 --backend-timeout 30 -s
+```

@@ -1,0 +1,159 @@
+# mcp runtime
+
+A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients
+
+An **mcp** runtime is a Model Context Protocol server: an AI client such as Claude Code gets the tools, resources and prompts its Lua script declares.
+
+```
+printf 'claude %s\nops %s admin\n' "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" > /etc/socketley/mcp.keys
+socketley create mcp shop -p 9600 --keys /etc/socketley/mcp.keys \
+    --lua shop.lua --tools daemon --instructions "Ask about the shop's orders." -s
+claude mcp add --transport http shop http://127.0.0.1:9600/mcp \
+    --header "Authorization: Bearer <claude's secret>"
+```
+
+The script declares what is offered:
+
+```
+mcp.tool{
+    name = "order_status",
+    description = "The state of one order: paid, sent or unknown.",
+    read_only = true,
+    input = { type = "object", properties = { id = { type = "string" } }, required = { "id" } },
+    -- the handler and the rest: examples/mcp/shop.lua in the repository
+}
+```
+
+## What it does
+
+- **Your tools in Lua**: Tools, resources and prompts from the script; `--instructions` says what the server is for.
+- **The daemon as tools**: `--tools daemon` lists runtimes for any key; an admin key may start and stop them.
+- **Streamable HTTP**: At `/mcp`, one JSON-RPC message per POST, stateless; revision 2026-07-28, and 2025-11-25, 2025-06-18, 2025-03-26.
+- **Who may ask**: `--keys`, OAuth sign-in with `--idp`, or `--anonymous` on a local-only port.
+
+## Works with
+
+The entrance [proxy](rt-proxy.txt) terminates TLS in front of it. An [idp](rt-idp.txt) signs people in; its `admins` are admins here.
+
+## Flags
+
+Every flag a mcp runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**MCP**
+
+| flag | value | what it does |
+|---|---|---|
+| `--keys` | path | Keys: The keys that may call it, one per line: name and secret, plus admin for a key that may change the daemon. |
+| `--anonymous` |  | Anonymous: Anyone may call it without a key; only for a port no other machine can reach. |
+| `--origins` | list | Origins: The web origins a browser may call it from, or * for any. |
+| `--tools` | one of none, daemon | Daemon tools: This daemon's runtimes as tools: listed and read by every key, started and stopped by an admin's. |
+| `--instructions` | text | Instructions: What a client is told the server is for. |
+| `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. |
+| `--idp-audience` | list | Token clients: The idp's clients whose own access tokens it takes as well. |
+
+## Benchmarks
+
+No benchmark. No MCP server is established enough to measure against on equal terms.
+
+## The manual on mcp
+
+An **mcp** runtime is a Model Context Protocol server. An AI client, such as Claude Code or an agent built on an MCP SDK, connects to it. The runtime offers that client the tools, resources and prompts its script declares. With **--tools daemon**, it also offers this daemon's runtimes as tools.
+
+```
+socketley create mcp shop -p 9600 --domain mcp --keys /etc/socketley/mcp.keys \
+    --lua /etc/socketley/shop.lua --tools daemon -s
+```
+
+The runtime speaks Streamable HTTP at **/mcp** (and at **/**). Each **POST** carries one JSON-RPC message and is answered as JSON. A notification is answered **202** with no body. **GET** and **DELETE** are answered **405**, because the runtime has no stream of its own and no session.
+
+The runtime speaks revision **2026-07-28** as that revision defines it, and is stateless. Every request carries the **MCP-Protocol-Version** header, and carries its version and client capabilities in **_meta**. The **Mcp-Method** header names the method, and **Mcp-Name** names the tool, prompt or resource. A mismatch is answered **400** (**-32020**). The **server/discover** method lists what the server offers.
+
+A client that opens with **initialize** is answered as revisions 2025-11-25, 2025-06-18 and 2025-03-26 specify. Its requests are then accepted without the 2026 headers. This matters because the MCP SDKs of 2026 speak that older revision. A request with a version that neither era defines is answered **400** (**-32022**), and the answer names the versions the runtime speaks.
+
+Each request is answered on its own, so **--shards** spreads requests over processes, as it does for a server. The runtime listens on plain HTTP. Clients reach it through the entrance proxy, which terminates TLS for it.
+
+#### `--keys file`
+
+A file of the keys that clients may call the runtime with, one per line, as *name secret*. Add **admin** after the secret of a key that may change the daemon. A secret is at least 16 characters long, and the client sends it as **Authorization: Bearer**. A request without a key from the file is answered **401** with **WWW-Authenticate: Bearer**. The runtime reads the file again when it changes. If the new file does not read, the runtime keeps the keys it had and logs why.
+
+#### `--anonymous`
+
+Lets anyone call the runtime without a key. Use it only on a port that only this machine reaches (**--bind 127.0.0.1**). One of **--keys**, **--idp** and **--anonymous** is required. **--anonymous** cannot be combined with either of the others.
+
+#### `--origins list`
+
+The web origins from which a browser may call the runtime, comma-separated, or * for any. A request with any other **Origin** is answered **403**, as the revision requires of every server. A client that is not a browser sends no **Origin**.
+
+#### `--idp runtime`
+
+The idp runtime whose users sign in to this runtime, in the way the MCP revisions specify for a client. A request without a token is answered **401** with **WWW-Authenticate: Bearer resource_metadata** naming **/.well-known/oauth-protected-resource/mcp**. That document names the idp, and says that the server is **https://***name***/mcp**, where *name* is the first **--domain**, written as a whole name such as **mcp.example.com**. The client signs in at the idp for that resource. The runtime accepts the client's access token for that audience only. The idp issues such tokens when its **--resources** names this address. A key from **--keys** is accepted as well. An account in the idp's **admins** group is an admin here. An account that is disabled, or signed out everywhere, is refused from its next request on.
+
+#### `--idp-audience clients`
+
+The idp clients, comma-separated, whose own access tokens the runtime also accepts.
+
+#### `--tools none|daemon`
+
+Selects whether the runtime offers this daemon's runtimes as tools. With **daemon**, every key is offered **socketley_list** and **socketley_get** (name, type, state, port, connections, owner). Only an admin's key is offered **socketley_start** and **socketley_stop**; a key that may not administer does not see them. The server does not stop itself. If the script declares its own tool with the same name, the script's tool is used.
+
+#### `--instructions text`
+
+The text that tells a client what the server is for.
+
+The script declares its tools, resources and prompts at its start:
+
+```
+mcp.tool{ name = "order_status", description = "An order's state.", read_only = true,
+  input = { type = "object", properties = { id = { type = "string" } }, required = { "id" } },
+  handler = function(args, who) return { structured = { id = args.id, state = "sent" } } end }
+mcp.resource{ uri = "shop://catalog", mime = "text/plain", ttl_ms = 60000,
+  read = function(who) return "..." end }
+mcp.prompt{ name = "summarize", arguments = { { name = "order", required = true } },
+  get = function(args, who) return "Summarize order " .. args.order end }
+```
+
+A tool's **input** and **output** are each a JSON Schema, given as a table or as JSON text. Write an empty object as JSON text, because a table cannot tell it apart from an empty array. A tool takes four hints: **read_only** (default **false**), **destructive** (default: the opposite of read_only), **idempotent** (default: the same as read_only) and **open_world** (default **true**). A tool with **admin** is offered only to an admin's key.
+
+A handler's return value becomes the tool's result:
+
+- A string is sent as text.
+- A table with **text** or **content** is sent as content blocks, in the revision's format.
+- A table with **structured** is sent as structured content, and as text too.
+- A table with **error = true** is a failure that the model reads. A handler that raises is treated the same way.
+
+   A handler may wait on **socketley.http**, **socketley.db** and the other calls that wait. The runtime answers other calls meanwhile.
+
+   A resource's **read** returns a string, or a table with **text** or **blob** (base64), and **mime**. A prompt's **get** returns a string, which becomes a user's message, or a table with **description** and **messages**. Each message has a **role** and a **text**.
+
+   Each handler, **read** and **get** receives **who**. It holds the key's or the account's **name**, whether it is **admin**, and, for an account, its **sub**, the id that never changes. Each runs on the event loop, within the callback deadline. A declaration that cannot be read returns **nil** and the reason, and the reason is logged.
+
+**stats** shows **requests**, **tool_calls**, **tool_errors**, **errors** (requests answered with a JSON-RPC error), **legacy_requests** (requests in a revision before 2026), **refused** (refused for a key, an origin or a method), **tools**, **resources**, **prompts** and **keys**.

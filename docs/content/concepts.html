@@ -1,46 +1,49 @@
-<h2>The daemon and the CLI</h2>
-<p>One binary is both. <code>socketley daemon</code> holds the runtimes; every other invocation sends it one command and prints the answer. Exit status: 0, 1 for bad input, 2 for a fatal error.</p>
-<table class="kv">
-<tr><th>Install</th><th>Control socket</th></tr>
-<tr><td>Installed</td><td><code>/run/socketley/socketley.sock</code></td></tr>
-<tr><td>Development</td><td><code>/tmp/socketley.sock</code></td></tr>
-</table>
+<p>The rules every runtime follows, whatever its type. For what happens behind a command, step by step, see <a href="#/how">How it works</a>.</p>
 
 <h2>A runtime</h2>
-<p>A runtime has a <b>type</b> (one of <a href="#/man/registered-types">the registered types</a>) and a <b>name</b> unique on the daemon. <code>create</code> checks the flags and keeps them; <code>start</code> runs it and loads its script. A <code>failed</code> runtime shows the reason in <code>ls</code>.</p>
-<x-man s="runtime-states" fold></x-man>
-<p><b>Each runtime is its own process</b>, a supervised worker with one io_uring loop on one thread. A crash or runaway script takes down that runtime, not the daemon, and it is restarted.</p>
+<p>A runtime is one network service. It has a <b>type</b>, which decides what it speaks (a server, a proxy, a cache, …; see <a href="#/man/registered-types">registered types</a>), and a <b>name</b>, unique on its daemon, by which commands and other runtimes refer to it.</p>
+<table class="kv">
+<tr><th>Command</th><th>What it does to a runtime</th></tr>
+<tr><td><code>create type name [flags]</code></td><td>Checks the flags and saves the runtime. With <code>-s</code> it also starts it.</td></tr>
+<tr><td><code>start</code> / <code>stop</code></td><td>Starts its worker process / ends it. The runtime itself is kept.</td></tr>
+<tr><td><code>edit name [flags]</code></td><td>Changes flags. Without flags it opens the runtime's JSON in your editor.</td></tr>
+<tr><td><code>reload-lua name</code></td><td>Loads the changed script without dropping connections.</td></tr>
+<tr><td><code>remove</code></td><td>Stops it and deletes it.</td></tr>
+</table>
+<p>A runtime is always in one of four states: <code>created</code> (saved, never started), <code>running</code>, <code>stopped</code>, or <code>failed</code> (it could not start; <code>ls</code> shows why).</p>
 
 <h2>State that survives</h2>
-<p>Each runtime's configuration is a JSON file. When the daemon starts, it brings back every runtime and starts those that were running.</p>
+<p>Each runtime is saved as a JSON file in the daemon's state directory. When the daemon starts, it brings every runtime back and starts the ones that were running before. Runtimes survive restarts and reboots without any setup.</p>
 <table class="kv">
-<tr><th>Command</th><th>Does</th></tr>
-<tr><td><code>show</code> / <code>edit</code></td><td>Print the JSON / change flags.</td></tr>
-<tr><td><code>import</code> / <code>export</code></td><td>Replace / write the configuration.</td></tr>
-<tr><td><code>export --full</code></td><td>Archive state and data, for a backup.</td></tr>
+<tr><th>Command</th><th>Use it to</th></tr>
+<tr><td><code>show name</code> / <code>import name</code></td><td>Print a runtime's configuration as JSON / replace it from JSON, so <code>show a | import b</code> copies one.</td></tr>
+<tr><td><code>export dir</code></td><td>Write the daemon's whole setup as Lua files into a directory.</td></tr>
+<tr><td><code>export --full file</code></td><td>Archive setup and data together, for a backup; <code>restore</code> puts it back.</td></tr>
 </table>
 <x-man s="state-persistence" fold></x-man>
 
 <h2>Names, ports and addresses</h2>
 <ul>
-<li>Runtimes reach each other by <b>name</b>: <code>--backend api</code>, <code>--cache store</code>.</li>
-<li><code>--domain</code> names are served by the <b>entrance</b>, the one proxy on 80 and 443, with certificates it gets itself.</li>
-<li><code>--bind</code> keeps a port to one address; <code>--listen unix:/path</code> uses a unix socket instead.</li>
+<li><b>Runtimes find each other by name.</b> <code>--backend api</code> or <code>--cache store</code> names a runtime, not a port, so the link holds when its port changes.</li>
+<li><b>Public names go through the entrance.</b> A runtime's <code>--domain</code> names are served by the entrance, the one proxy on ports 80 and 443, which also gets their certificates.</li>
+<li><b>A port can be kept local.</b> <code>--bind 127.0.0.1</code> binds it to one address; <code>--listen unix:/path</code> uses a unix socket instead of a port.</li>
+<li><b>One address, one runtime.</b> Two runtimes on the same port and address are refused, so a typo cannot silently split traffic.</li>
 </ul>
 <x-man s="common-flags" subs-only></x-man>
 
 <h2>TLS</h2>
-<p>On a server, cache, proxy or mqtt listener, <code>--tls --cert --key</code> terminates TLS and <code>--ca</code> verifies clients; <code>--acme</code> gets Let's Encrypt certificates. A client or a proxy's <code>https://</code> backend always verifies the server. Not supported: <a href="#/man/limitations.tls">TLS under limitations</a>.</p>
+<p>A server, cache, proxy or mqtt broker encrypts its own port with <code>--tls --cert file --key file</code>. Add <code>--ca file</code> to require client certificates. <code>--acme name</code> gets a Let's Encrypt certificate and renews it.</p>
+<p>When socketley connects out (a client runtime, a proxy's <code>https://</code> backend), it always verifies the server's certificate; that check cannot be turned off. What is not supported is listed under <a href="#/man/limitations.tls">TLS limitations</a>.</p>
 
 <h2>Several cores</h2>
-<p><code>--shards N</code> runs N workers sharing the port; <code>--cpus</code> pins them. On a cache each key has one owning shard. Read <a href="#/man/server-flags.sharding">sharding</a> before choosing N: the gain depends on the workload.</p>
+<p>A runtime's worker uses one core. <code>--shards N</code> runs N workers that share the port, and <code>--cpus</code> chooses the cores they may run on. On a cache, each key belongs to one shard. More shards do not always mean more speed: read <a href="#/man/server-flags.sharding">sharding</a> before choosing N.</p>
 
 <h2>Scripts</h2>
-<p>Most types take <code>--lua file</code>, loaded at <code>start</code> and replaced with <code>reload-lua</code>. A runaway callback is ended by a <a href="#/man/lua-configuration.callback-deadline">deadline</a>. See <a href="#/lua">Lua scripting</a>.</p>
+<p>Most types take <code>--lua file</code>: a script whose callbacks (<code>on_client_message</code>, <code>on_http_request</code>, …) answer instead of the built-in behaviour. It is loaded when the runtime starts and replaced with <code>reload-lua</code>. A callback that never returns is ended by its <a href="#/man/lua-configuration.callback-deadline">deadline</a>. See <a href="#/lua">Lua scripting</a>.</p>
 
 <h2>More than one machine</h2>
-<p>Daemons sharing a directory see each other's runtimes, and <code>@group</code> backends span machines. See <a href="#/cluster">Cluster</a>.</p>
+<p>Daemons that share a cluster directory see each other's runtimes, and a proxy's <code>@group</code> backend reaches group members on every machine. See <a href="#/cluster">Cluster</a>.</p>
 
 <h2>Watching it</h2>
-<p><code>socketley stats</code> and <code>daemon stats</code> print live counters. The daemon serves a <a href="#/man/dashboard">dashboard</a> and a Prometheus <code>/metrics</code>; a <a href="#/rt/metrics">metrics</a> runtime keeps history and sends alerts.</p>
+<p><code>socketley ls</code> lists runtimes and their states; <code>socketley stats name</code> and <code>socketley daemon stats</code> print live counters. The daemon also serves a web <a href="#/man/dashboard">dashboard</a> and Prometheus <code>/metrics</code>. A <a href="#/rt/metrics">metrics</a> runtime keeps the history and sends alerts.</p>
 <x-man s="dashboard" fold></x-man>

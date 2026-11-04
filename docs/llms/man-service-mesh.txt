@@ -1,0 +1,107 @@
+# Service mesh
+
+From the manual page socketley(1).
+
+The proxy runtime includes service-mesh primitives that can be combined to build sidecar proxies, API gateways, or resilient service-to-service communication layers.
+
+## Health Checks
+
+Active health checks probe backends at a regular interval (**--health-interval**) using either a TCP connect or an HTTP GET (**--health-check**). A backend is marked unhealthy after **--health-threshold** consecutive failures and is excluded from the load balancer pool. A single successful check restores the backend.
+
+## Circuit Breaker
+
+The circuit breaker prevents cascading failures by tracking consecutive errors per backend. It has three states:
+
+#### `closed`
+
+The normal state: requests are forwarded to the backend and errors are counted.
+
+#### `open`
+
+The state the circuit enters when errors reach **--circuit-threshold**. All requests fail immediately, without attempting a connection. After **--circuit-timeout** seconds, the circuit moves to half-open.
+
+#### `half-open`
+
+The circuit lets a single probe request through to the backend. It is one request in total, not one per selection: while that probe is outstanding, the backend is unavailable to every other request. If the probe succeeds, the circuit returns to **closed**. If it fails, the circuit re-opens.
+
+## Response Deadline
+
+A backend that accepts connections and then stops answering fails no check. A TCP health probe connects to it successfully, and a request that never completes counts as neither an error nor a success, so the circuit breaker has nothing to open on. **--backend-timeout** (default 2 seconds) limits the wait for the first byte of a response. When it expires, the proxy records a backend error, which puts such a backend through the breaker like any other failure. The request is retried elsewhere if **--retry** allows it, and answered **504 Gateway Timeout** otherwise.
+
+The deadline covers the handshake as well as the answer. If a backend never completes its connect within the deadline, the client is also answered **504 Gateway Timeout**, instead of being closed without a response. A request routed through an **@group** backend is charged to the member it actually reached. So a group member that stalls is taken out of rotation by the same breaker as a listed backend.
+
+The deadline is on by default and covers only the wait for the first byte, so a large or streaming response body is not affected. An endpoint that legitimately needs more than 2 seconds to start answering must be given a longer **--backend-timeout** or **--backend-timeout 0**; otherwise the proxy treats it as hung. The deadline applies to HTTP mode only, because in TCP mode there is no request boundary to measure from.
+
+## Request Framing
+
+In HTTP mode the proxy is strict about how a request's header block is framed. It refuses anything that it and a backend could read differently. These are the same rules, from the same implementation, that a socketley server applies to a request it receives directly; see **Request Framing** under **SERVER FLAGS**. The proxy forwards bytes to a backend that parses them independently. If the two disagree about where a request ends, the next request on the same connection starts in the wrong place: this is request smuggling. Normalising the request instead would mean guessing how the backend will read it, so the proxy refuses rather than guesses.
+
+A request is answered **400 Bad Request** and its connection is closed, without contacting any backend, when the header block contains any of:
+
+- a bare LF or a bare CR — every line must end with CRLF
+- whitespace between a field name and its colon (**Content-Length : 6**)
+- a continuation (obs-fold) line, i.e. one starting with a space or tab
+- a field line with no colon
+- both **Content-Length** and **Transfer-Encoding**, or more than one **Content-Length** field
+- a **Content-Length** that is not a whole decimal number (**Content-Length: 6x**)
+- a **Transfer-Encoding** whose final coding is not **chunked** (**Transfer-Encoding: gzip**, **Transfer-Encoding: chunked, gzip**, or **chunked** listed twice); such a request has no determinable body length at all
+
+Every request on a connection is framed and checked on its own, including one pipelined behind another. Only the body that a request declares travels with it. Bytes past its **Content-Length** are not body: the proxy holds them back and parses them as the next request instead of forwarding them. Pipelining still works, and a second request sent before the first is answered is still served. But it is answered in turn, after the same checks. A smuggling attempt hidden behind a clean request is refused exactly as if it had been sent first.
+
+A request held this way has the same 10 second deadline as a half-arrived one. The exchange in front of it may never reach an end this proxy can detect, for example when a backend frames its response in a way the proxy cannot read. Then the held request is answered **408 Request Timeout** rather than left waiting. A **chunked** request is the one body this proxy cannot measure, because it never de-chunks. Its body is forwarded as an opaque stream, so a request pipelined behind a chunked one is framed by the backend alone.
+
+Compliant clients send none of these. A request whose header block is still arriving is held until the terminating blank line. It is subject to the 16 KiB header limit (**431 Request Header Fields Too Large**) and a 10 second header deadline (**408 Request Timeout**).
+
+Behind the header limit there is a second, larger limit. It counts everything buffered for an exchange, not just one header block. At most 1 MiB is held for a connection whose request has already been forwarded. That covers the body the client sends past its declared **Content-Length**, and the requests pipelined behind it. Nothing drains this buffer until the response in front of it is finished. So a client that writes faster than the backend answers can reach the limit on a well-formed connection. The client is then answered **413 Request Entity Too Large** and the connection is closed. The one exception is the same as for the gateway statuses. If part of the backend's response is already on that client's wire, no status line is written behind it, because it would land at an offset that is not a message boundary. Instead, the connection is closed with the response left visibly truncated.
+
+The header deadline starts at the first byte of a request and ends when its header block is complete. It is fixed and not configurable. It is deliberately independent of **--idle-timeout**, which defaults to 0 (never) and so cannot be relied on to end a half-sent request. A client that sends a request line and then stops sends no more bytes for the 16 KiB limit to count. Without the deadline, that client could hold its connection, its descriptor and its 64 KB buffer for as long as it liked. The deadline does not measure an idle keep-alive connection between requests, or a slow request body. It measures only the gap between a request's first byte and its terminating blank line.
+
+The proxy applies the same strictness to backend responses, but only to decide whether the backend connection may be reused. Sometimes the length of a response cannot be established with certainty: its header block was split across reads, or was not strictly CRLF-framed, or more bytes arrived than the length it declared. Such a response is forwarded to the client unchanged, and its connection is closed instead of returned to the pool. A backend that answers **Connection: close** is not pooled either, because it has said the socket is going away.
+
+A **Connection: close** sent by the *client* does not do this. It is a hop-by-hop field about the client's own connection to the proxy. So the proxy does not forward it upstream, and it does not end the backend connection. The proxy answers the request, returns the backend socket to the pool, and closes the client connection as asked. The field is a comma-separated list. As on the server, it is parsed token by token and case-insensitively. So **Connection: keep-alive, close** counts as close, while a value that merely begins with those letters, such as **Connection: clientinfo**, does not. A client that opens a connection per request (curl, a health checker, any HTTP library used without a session) therefore costs one accept and no backend connect, the same as a keep-alive client.
+
+Before a connection from the pool is handed to the next request, the proxy checks it. A connection with unread data on it is closed rather than reused. Nothing was asked of an idle pooled socket, so anything waiting on it was sent unbidden by the backend. It is the tail of an answer whose length was mis-declared, or a second answer volunteered behind the first. Reusing the socket would make those bytes the head of the next client's response, so the connection is dropped and a fresh one opened. The proxy logs this once per instance.
+
+Reuse covers an **@group** backend as well as a listed one. A pooled connection is filed under the endpoint it was opened to, never under the group. So it is only ever handed back to a request routed to that same member. When a member leaves the group, its pooled connections are closed at once rather than left to the idle sweep.
+
+Reuse covers a **TLS** backend too. The session is pooled together with the descriptor, so a reused connection continues on the record layer it already had, at the sequence number it had reached. A TLS connection carries more than an address: a negotiated session, a peer identity verified against a name, a client certificate that may have been presented, and a record layer part way through a stream. The endpoint the socket is filed under accounts for three of those. That is because the name was pinned to that endpoint before the handshake, and the certificate was checked against it. The client certificate and the trust store belong to the runtime and are rebuilt on every start, and the pool is emptied on every stop. So a pooled session can never outlive the configuration that verified it.
+
+A pooled TLS socket must not inherit an answer nobody asked for. A cleartext socket with bytes waiting on it is destroyed rather than reused, because a socket in the pool has been asked nothing since its last answer completed. That test cannot be carried across a record layer unchanged. A TLS peer that has said nothing still sends records: a session ticket, a key update, a **close_notify**. So the proxy drains the socket into the session, and puts the question to the record layer instead of to the kernel. Records that produce no application data are the peer's own housekeeping, and the connection is kept. Application data is a response that belongs to a previous exchange, and the connection is dropped. The second case is logged once per runtime.
+
+## Retries
+
+When **--retry** is set, failed requests are automatically retried on the next backend in the load balancer pool. By default only idempotent methods are retried; use **--retry-all** to include POST and PATCH.
+
+## mTLS
+
+Both legs can be encrypted. **--tls --cert --key** terminates TLS on the proxy's own port, and **--client-ca** makes the proxy demand a certificate from its callers. An **https://** backend address, or any of **--ca**, **--client-cert** and **--client-key**, switches the backend leg to TLS. On that leg the proxy verifies the chain and the endpoint's name, and presents a client certificate when one is configured. A full sidecar pair looks like this:
+
+```
+socketley create proxy edge -p 8443 \
+    --tls --cert edge.pem --key edge-key.pem \
+    --client-ca mesh-ca.pem \
+    --backend https://10.0.0.7:8443 \
+    --ca mesh-ca.pem \
+    --client-cert edge.pem --client-key edge-key.pem \
+    --sidecar -s
+```
+
+A TLS backend connection is returned to the connection pool and reused, so a busy sidecar pays for one handshake per idle period rather than per request. The pooled socket keeps its session and goes back only to the endpoint it was opened to. It is dropped rather than reused if the backend has left application data on it. **--health-check http** works against a TLS backend and probes it over TLS, verified to the same standard as the data path. See **LIMITATIONS** for what the probe does and does not establish. See **mTLS Flags** under **PROXY FLAGS** for what is verified and what cannot be switched off.
+
+## Sidecar Deployment
+
+The **--sidecar** flag enables a production-ready set of defaults: TCP health checks, a circuit breaker (threshold 5, timeout 30s), 2 retries, and graceful drain. Deploy it alongside your application:
+
+```
+socketley create proxy myapp --sidecar \
+    --backend 127.0.0.1:3000 -p 8080 -s
+```
+
+The proxy listens on port 8080 and forwards to the local application on port 3000. Unhealthy backends are removed automatically, and the circuit breaker prevents thundering-herd retries during outages.
+
+**--sidecar** does not change **--backend-timeout**. That deadline is 2 seconds by default, and its expiry is charged to the circuit breaker that **--sidecar** enables. If the application can take longer than that to send its first response byte, set a longer timeout explicitly:
+
+```
+socketley create proxy myapp --sidecar --backend-timeout 30 \
+    --backend 127.0.0.1:3000 -p 8080 -s
+```

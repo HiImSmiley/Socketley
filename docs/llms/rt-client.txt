@@ -1,0 +1,113 @@
+# client runtime
+
+Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
+
+A **client** dials a TCP or UDP peer and keeps the connection. What arrives is printed, saved or handled in Lua.
+
+```
+socketley create client feed -t 10.0.0.5:9000 --reconnect 0 -b -s   # print what arrives, reconnect for ever
+socketley send feed "subscribe prices"
+socketley create client probe -t unix:/run/app.sock --lua probe.lua -s
+```
+
+## What it does
+
+- **Any target**: `-t host:port` or `-t unix:/path`; `--udp` for datagrams.
+- **Verified TLS**: `--tls`, checked against `--ca` or the system store; no way to skip it.
+- **Reconnects**: `--reconnect [n]` backs off up to 16 seconds; `0` retries for ever.
+- **Output**: `-b` prints messages (`-bpt` adds name and time); `-w file` saves them.
+- **Lua**: `on_connect`, `on_message`, `on_disconnect`; `on_writable` paces sending.
+
+## Works with
+
+Any [server](rt-server.txt) or TCP service. `socketley send` writes through it from the shell.
+
+## Flags
+
+Every flag a client runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
+| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
+| `--key` | path | Key: The PEM key of the certificate. |
+| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
+| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
+| `--reconnect` | int | Reconnect: Reconnect with backoff when the connection drops: the most attempts, 0 for no limit. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+| `-w` | path | Message file: A file every received message is written to. |
+| `-b` |  | Print messages: Print every received message. |
+| `-bp` |  | …with name: Print them with the runtime's name before each. |
+| `-bt` |  | …with time: Print them with the time before each. |
+| `-bpt` (-btp) |  | …with time and name: Print them with the time and the name before each. |
+
+**Server**
+
+| flag | value | what it does |
+|---|---|---|
+| `--udp` |  | UDP: Datagrams instead of a stream. |
+
+**Client**
+
+| flag | value | what it does |
+|---|---|---|
+| `-t` | text | Target: The server it connects to, host:port. |
+| `--mode` | one of inout, in, out | Mode: Both ways, receive only or send only. |
+
+## Benchmarks
+
+No benchmark. A client runtime holds one connection to somebody else's server; there is no other program doing that to set beside it.
+
+## The manual on client
+
+#### `-t host:port | unix:/path/to.sock`
+
+The server the client connects to. Default: 127.0.0.1:8000.
+
+**unix:***/path/to.sock* dials the socket node that a runtime with **--listen unix:** serves. It is the connect side of the same address and follows the same rules: the path must be absolute and fit within the kernel's *sun_path* limit. It is refused together with **--udp** and with **--tls**, for the reasons given for the listener under **COMMON FLAGS**.
+
+#### `--mode mode`
+
+The direction in which messages flow: **inout** (both ways, the default), **in** (receive only) or **out** (send only).
+
+#### `--udp`
+
+Use UDP instead of TCP. The client creates a connected SOCK_DGRAM socket. Each datagram is one message; there is no line parsing. Not available for cache or proxy.
+
+#### `--reconnect [max-attempts]`
+
+Reconnect automatically, with exponential backoff, when the connection is lost. The backoff starts at 1 second and doubles with each attempt, up to a ceiling of 16 seconds, with up to half a second of jitter. A client whose target is gone therefore dials again after 1, 2, 4, 8, 16, 16, 16 seconds. *max-attempts* limits the number of attempts. 0 means no limit, and is the default when the flag is given without a value. A negative count is refused, because -1 is the stored value for "off". Reconnection is off unless this flag is given.
+
+This is a client flag. It is refused on a server, a proxy or a cache: it re-dials a connection the runtime made, and those three accept connections rather than make them.
+
+"When the connection is lost" includes a peer that never says so. A close sends a FIN or an RST, and the client acts on it at once. But a machine that loses power, a link that partitions, or a firewall that forgets an idle flow sends nothing at all. An idle client that never writes would never find out. Every client socket therefore uses TCP keepalive: 60 seconds idle, then three probes ten seconds apart. A peer that has silently gone is noticed in about 90 seconds, and the backoff above starts from there. No flag changes this. The kernel's own default is two hours, which for this purpose is the same as never.
+
+A client also takes the TLS flags; see **--tls** under **COMMON FLAGS**. **--tls** alone dials the target over TLS and verifies it against the system trust store. **--ca** *file* supplies a trust store instead. **--cert** *file* with **--key** *file* presents a certificate to a peer that asks for one. The host in **-t** is the name the certificate must be valid for. A verification failure closes the socket, and the client re-dials on the backoff above. The client never retries in cleartext, and there is no way to skip the check. **--tls** with **--udp** is refused, because that would need DTLS.

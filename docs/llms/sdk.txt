@@ -1,0 +1,498 @@
+# C++ SDK
+
+Control a daemon, embed the engine, or attach a process of your own to a daemon.
+
+The C++ SDK in `include/linux/socketley/` has three tiers. Examples are in `sdk/examples`, and the test suite builds each one.
+
+Socketley ships a modular C++ SDK in three tiers, in **include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
+
+| Tier | Header | Use Case | Dependencies |
+|---|---|---|---|
+| 1 | socketley/control.h | Control a running daemon | None (POSIX) |
+| 2 | socketley/{server,cache,proxy,client}.h | Embed the full engine | libsocketley_sdk.a |
+| 3 | socketley/attach.h | Register with a daemon | None (Tier 1) |
+
+### Tier 1: Daemon Control (header-only)
+
+**socketley/control.h** gives a program full control over a running daemon. It uses the same Unix socket IPC as the CLI and needs nothing beyond POSIX.
+
+**Result type:**
+
+```
+struct socketley::result {
+    int         exit_code;  // 0=success, 1=bad input, 2=fatal, -1=connect fail
+    std::string data;       // response body
+};
+```
+
+**Runtime management functions** (all in namespace **socketley::ctl**):
+
+```
+command(cmd)               // raw command (glob patterns work)
+command(socket_path, cmd)  // custom socket path
+create(type, name, flags)  // "server", "client", "proxy", "cache"
+start(name)                stop(name)
+remove(name)               send(name, message)
+ls()   ps()   stats(name)  show(name)
+reload(name)               reload_lua(name)
+edit(name, flags)
+```
+
+**Cache string operations** (over direct IPC; no TCP connection is needed):
+
+```
+cache_get(cache, key)           cache_set(cache, key, value)
+cache_del(cache, key)           cache_exists(cache, key)
+cache_incr(cache, key)          cache_decr(cache, key)
+cache_incrby(cache, key, n)     cache_decrby(cache, key, n)
+cache_append(cache, key, val)
+```
+
+**Cache list operations:**
+
+```
+cache_lpush(cache, key, val)    cache_rpush(cache, key, val)
+cache_lpop(cache, key)          cache_rpop(cache, key)
+cache_llen(cache, key)          cache_lrange(cache, key, start, stop)
+cache_lindex(cache, key, idx)
+```
+
+**Cache set operations:**
+
+```
+cache_sadd(cache, key, member)  cache_srem(cache, key, member)
+cache_sismember(cache, key, m)  cache_scard(cache, key)
+cache_smembers(cache, key)
+```
+
+**Cache hash operations:**
+
+```
+cache_hset(cache, key, f, v)    cache_hget(cache, key, field)
+cache_hdel(cache, key, field)   cache_hlen(cache, key)
+cache_hgetall(cache, key)
+```
+
+**Cache TTL:**
+
+```
+cache_expire(cache, key, sec)   cache_ttl(cache, key)
+cache_persist(cache, key)
+```
+
+**Cache pub/sub:**
+
+```
+cache_publish(cache, ch, msg)
+```
+
+**Cache admin:**
+
+```
+cache_size(cache)               cache_memory(cache)
+cache_keys(cache, pattern)
+cache_flush(cache [, path])     cache_load(cache [, path])
+```
+
+To find the daemon's socket, the functions check the **SOCKETLEY_SOCKET** environment variable first, then **/run/socketley/socketley.sock**, then **/tmp/socketley.sock**. Set the variable only to reach a daemon other than the one for this namespace. In practice that means a second daemon on a development machine. A deployed node runs one daemon on the default path.
+
+**Example: lifecycle management**
+
+```
+#include <socketley/control.h>
+#include <cstdio>
+
+int main() {
+    auto r = socketley::ctl::create("server", "myapp", "-p 9000 -s");
+    if (r.exit_code != 0) return 1;
+
+    socketley::ctl::send("myapp", "Hello from C++!");
+    auto stats = socketley::ctl::stats("myapp");
+    printf("%s\n", stats.data.c_str());
+
+    socketley::ctl::stop("myapp");
+    socketley::ctl::remove("myapp");
+}
+// g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
+```
+
+**Example: fleet management with globs**
+
+```
+for (int i = 0; i < 5; ++i) {
+    std::string name  = "api_" + std::to_string(i);
+    std::string flags = "-p " + std::to_string(9000+i) + " -s";
+    socketley::ctl::create("server", name, flags);
+}
+socketley::ctl::command("start api_*");    // start all
+socketley::ctl::command("stats api_*");    // query all
+socketley::ctl::command("stop api_*");     // stop all
+socketley::ctl::command("remove api_*");   // remove all
+```
+
+**Example: cache operations**
+
+```
+socketley::ctl::create("cache", "store", "-p 6379 --mode admin -s");
+socketley::ctl::cache_set("store", "user:1", "alice");
+auto r = socketley::ctl::cache_get("store", "user:1");
+printf("user:1 = %s\n", r.data.c_str());  // "alice"
+socketley::ctl::cache_del("store", "user:1");
+socketley::ctl::cache_flush("store", "/tmp/store.bin");
+```
+
+### Tier 2: Embed Engine (build from source)
+
+Tier 2 embeds the full io_uring event loop and all four runtime types in your own binary. It gives maximum performance, with no IPC overhead. It requires **libsocketley_sdk.a** and the link flags **-luring -lssl -lcrypto [-lluajit]**.
+
+Headers: **socketley/core.h** (event_loop, runtime_manager, enums), **socketley/server.h ,** **socketley/client.h ,** **socketley/proxy.h ,** **socketley/cache.h .**
+
+Define **SOCKETLEY_NO_LUA** to build without LuaJIT, and omit **-lluajit** from the link flags.
+
+**High-Level Wrapper Classes (recommended)**
+
+The **socketley::server**, **socketley::client**, **socketley::proxy**, and **socketley::cache** classes wrap the raw engine API in a fluent, chainable interface. They handle all the boilerplate (event loop, runtime manager, signal handling) internally.
+
+**socketley::server**
+
+```
+server(uint16_t port)
+
+// Config (all return server& for chaining)
+tls(cert, key)         // terminates TLS on this listener
+client_ca(ca)          // mutual TLS on it: clients must present a certificate
+                       // (tls_ca(ca) is the older spelling; it also sets tls)
+max_connections(n)     rate_limit(r)
+global_rate_limit(r)   idle_timeout(s)       lua(path)
+mode(m)                udp()                 http_dir(path)
+http_cache()           upstream(addr)        master_pw(pw)
+drain()                group(g)              tick_interval(ms)
+
+// Callbacks (return server& for chaining)
+on_start(void())                             on_stop(void())
+on_connect(void(int fd))                     on_disconnect(void(int fd))
+on_message(void(int fd, string_view msg))    on_tick(void(double dt_ms))
+
+// Actions
+send(fd, msg)       broadcast(msg)      disconnect(fd)
+peer_ip(fd)         clients()           multicast(fds, msg)
+set_data(fd,k,v)    get_data(fd,k)
+
+// Lifecycle
+start()   stop()
+
+// Escape hatches (raw engine access)
+instance() -> server_instance*
+manager()  -> runtime_manager&
+loop()     -> event_loop&
+```
+
+**socketley::client**
+
+```
+client(string_view host, uint16_t port)
+
+// Config
+tls()              // dial over TLS; the host from the constructor is pinned
+                   // and the chain verified against the system trust store
+tls_ca(ca)         // verify against that CA instead of the system store
+client_cert(c, k)  // the certificate this client presents when the peer asks
+                   // for one - the client half of mutual TLS; needs tls()
+reconnect(max)     mode(m)            udp()
+lua(path)          tick_interval(ms)
+
+// Callbacks
+on_start    on_stop    on_connect    on_disconnect
+on_message(void(string_view msg))   on_tick
+
+// Actions
+send(msg)
+
+// Lifecycle: start()  stop()
+// Escape hatches: instance()  manager()  loop()
+```
+
+**socketley::proxy**
+
+```
+proxy(uint16_t port)
+
+// Config
+backend(addr)      strategy(s)        protocol(p)
+tls(cert, key)     // terminates TLS on this proxy's listener
+client_ca(ca)      // mutual TLS on it: clients must present a certificate
+backend_ca(ca)     // trust store for the backend leg; turns that leg to TLS
+client_cert(c, k)  // the certificate presented to a backend that asks
+max_connections(n) idle_timeout(s)
+lua(path)          group(g)
+
+// Callbacks: on_start  on_stop
+// Lifecycle: start()  stop()
+// Escape hatches: instance()  manager()  loop()
+```
+
+**socketley::cache**
+
+```
+cache(uint16_t port)
+
+// Config
+persistent(path)   max_memory(bytes)   eviction(policy)
+resp()             mode(m)
+tls(cert, key)
+max_connections(n) idle_timeout(s)     replicate(target)
+lua(path)          group(g)
+
+// Callbacks: on_start  on_stop
+// Lifecycle: start()  stop()
+// Escape hatches: instance()  manager()  loop()
+```
+
+**Limitations:** Only one **start()** may run per process, because the signal handler points to one event_loop. **start()** blocks until SIGINT or SIGTERM. For several runtimes in one process, or for asynchronous patterns, use the raw API, either through the escape hatches or directly.
+
+**TLS: on a server, a proxy, a client and a cache.** **server().tls()** and **proxy().tls()** terminate TLS on that runtime's listener. **proxy().backend_ca()**, **proxy().client_ca()** and **proxy().client_cert()** configure the proxy's two legs, exactly as the CLI flags do. This works because **start()** goes through **runtime_manager::start** and reaches the same gate as the CLI. **client().tls()** dials over TLS, and **cache().tls()** terminates it on the cache's listener, through the same gate. See **TLS** under **LIMITATIONS**.
+
+**Example: echo server (3 lines)**
+
+```
+#include <socketley/server.h>
+#include <cstdio>
+
+int main() {
+    socketley::server srv(9000);
+
+    srv.on_connect([](int fd) {
+        printf("client %d connected\n", fd);
+    });
+    srv.on_message([&](int fd, std::string_view msg) {
+        srv.send(fd, "echo: " + std::string(msg));
+    });
+    srv.on_disconnect([](int fd) {
+        printf("client %d disconnected\n", fd);
+    });
+
+    srv.start();
+}
+// g++ -std=c++23 echo.cpp $(sdk/socketley-config --cflags --libs)
+```
+
+**Example: server with Lua scripting**
+
+```
+int main(int argc, char* argv[]) {
+    socketley::server srv(9000);
+    srv.lua(argv[1]);
+    srv.start();
+}
+```
+
+**Example: TCP proxy**
+
+```
+socketley::proxy px(8080);
+px.backend("127.0.0.1:9001")
+  .backend("127.0.0.1:9002")
+  .protocol(protocol_tcp)
+  .strategy(strategy_round_robin);
+px.start();
+```
+
+**Example: Redis-compatible cache**
+
+```
+socketley::cache c(6379);
+c.persistent("/var/data/store.dat")
+ .resp()
+ .max_memory(256 * 1024 * 1024)
+ .eviction(evict_allkeys_lru);
+c.start();
+```
+
+**Example: client with auto-reconnect**
+
+```
+socketley::client cli("127.0.0.1", 9000);
+cli.reconnect(0);  // 0 = infinite
+cli.on_connect([&](int) { cli.send("hello"); });
+cli.on_message([](std::string_view msg) {
+    printf("%.*s\n", (int)msg.size(), msg.data());
+});
+cli.start();
+```
+
+**Raw Engine API (advanced)**
+
+For processes with several runtimes, or for custom control of the event loop, use the raw types directly. The wrapper classes use this API internally.
+
+**Core pattern:** create an event_loop, create a runtime_manager, create the runtimes, configure them, run them, and run the loop.
+
+**C++ callbacks** (an alternative to Lua scripts; they can be set on any runtime):
+
+```
+set_on_start(function<void()>)
+set_on_stop(function<void()>)
+set_on_connect(function<void(int fd)>)
+set_on_disconnect(function<void(int fd)>)
+set_on_client_message(function<void(int fd, string_view)>)
+set_on_message(function<void(string_view)>)
+set_on_tick(function<void(double dt_ms)>)
+```
+
+**Common runtime setters:**
+
+```
+set_port(uint16_t)            set_event_loop(event_loop*)
+set_runtime_manager(mgr*)     set_cache_name(string_view)
+// set_tls / set_cert_path / set_key_path / set_ca_path are honoured
+// on a server runtime and refused on every other type (see LIMITATIONS).
+set_max_connections(uint32_t)
+set_rate_limit(double)        set_idle_timeout(uint32_t)
+set_log_file(string_view)     set_group(string_view)
+set_drain(bool)               load_lua_script(string_view)
+```
+
+**Server-specific:**
+
+```
+set_mode(mode_inout|mode_in|mode_out|mode_master)
+set_udp(bool)          set_http_dir(string_view)
+broadcast(msg)         send_to(fd, msg)
+disconnect(fd)         peer_ip(fd)
+clients()              multicast(fds, msg)
+```
+
+**Cache-specific:**
+
+```
+set_mode(cache_mode_readonly|readwrite|admin)
+set_persistent(path)   set_max_memory(bytes)
+set_resp_forced(bool)  set_replicate_target(host:port)
+```
+
+**Proxy-specific:**
+
+```
+set_protocol(protocol_http|protocol_tcp)
+set_strategy(strategy_round_robin|random|lua)
+add_backend(addr)      clear_backends()
+```
+
+**Example: multi-runtime with raw API (server + cache)**
+
+```
+#include <socketley/server.h>
+#include <socketley/cache.h>
+
+// ... (event_loop + runtime_manager setup as above)
+
+mgr.create(runtime_cache, "store");
+auto* cache = static_cast<cache_instance*>(mgr.get("store"));
+cache->set_port(6379);
+cache->set_mode(cache_mode_admin);
+cache->set_runtime_manager(&mgr);
+cache->set_event_loop(&loop);
+
+mgr.create(runtime_server, "api");
+auto* srv = static_cast<server_instance*>(mgr.get("api"));
+srv->set_port(9000);
+srv->set_cache_name("store");  // clients can "cache set k v"
+srv->set_runtime_manager(&mgr);
+srv->set_event_loop(&loop);
+
+mgr.start("store", loop);
+mgr.start("api", loop);
+loop.run();
+```
+
+### Cross-Platform SDK (Windows / macOS)
+
+These header-only TCP clients connect to Socketley runtimes from non-Linux platforms. One copy lives in **include/portable/socketley/**, and a program reaches it as **<socketley/ws_client.h>** from any of *include/linux*, *include/darwin* or *include/windows*.
+
+**socketley/ws_client.h** is a WebSocket (RFC 6455) and raw TCP client for server runtimes. It embeds its own SHA-1 and Base64, so it needs no OpenSSL. Its modes are **ws_mode::websocket** and **ws_mode::raw_tcp**.
+
+**socketley/cache_client.h** is a text-protocol client for cache runtimes. It supports all cache commands (get, set, del, lpush, sadd, hset, expire, publish, subscribe, etc.). It returns a **cache_result** with the fields *ok*, *value*, *values*, *integer*.
+
+Build with C++17; there are no external dependencies:
+
+```
+# MSVC
+cl /std:c++17 /I include\windows app.cpp
+
+# clang++ (macOS)
+clang++ -std=c++17 -I include/darwin app.cpp -o app
+
+# g++ (Linux)
+g++ -std=c++17 -I include/linux app.cpp -o app
+```
+
+### Tier 3: Daemon Attach (header-only)
+
+**socketley/attach.h** registers your own process as a runtime with a running daemon. After it attaches, your process shows up in **socketley ls**, **socketley stats**, and **socketley ps**. The header is self-contained (it builds on control.h). It deregisters automatically on **exit()**.
+
+**API:**
+
+```
+bool daemon_attach(name, type, port)  // register, auto-detach on exit
+void daemon_detach(name)              // explicit deregister
+void daemon_detach()                  // deregister attach'd name
+```
+
+**Example:**
+
+```
+#include <socketley/attach.h>
+#include <cstdio>
+
+int main() {
+    // Start your own TCP server (any framework)
+    // ...bind, listen on port 8080...
+
+    if (socketley::daemon_attach("myservice", "server", 8080))
+        printf("registered with daemon\n");
+    else
+        printf("daemon not running (standalone mode)\n");
+
+    // Your accept loop here...
+    // atexit() automatically calls daemon_detach()
+}
+// g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
+```
+
+**daemon_attach()** returns false when the process is not allowed to open the daemon's IPC socket. Every **socketley** command needs the same permission; see **THE IPC SOCKET** under **FILES**. A program that runs as a different user from the daemon must be in the **socketley** group to register with it. A false result is not an error to abort on. The example above shows the intended pattern: the program runs standalone and is simply not listed in the daemon's inventory.
+
+### Mixed: Engine + Daemon Attach (Tier 2 + 3)
+
+Embed the full engine for maximum performance, and register with the daemon for fleet monitoring. This combines the strengths of both tiers.
+
+```
+#include <socketley/server.h>
+#include <socketley/attach.h>
+
+socketley::server srv(9000);
+srv.on_message([&](int fd, std::string_view msg) {
+    srv.send(fd, msg);
+});
+
+// Register with daemon so socketley ls/stats can see it
+socketley::daemon_attach("app_srv", "server", 9000);
+
+srv.start();  // daemon sees the runtime
+```
+
+**When to use each tier:**
+
+##### `Tier 1`
+
+Use it for orchestration scripts, deployment tools, monitoring and CI/CD.
+
+##### `Tier 2`
+
+Use it for custom daemons, game servers, IoT gateways and performance-critical services.
+
+##### `Tier 3`
+
+Use it for legacy services, third-party processes, and fleet visibility for external apps.
+
+##### `Mixed`
+
+Use it for an embedded engine with daemon monitoring: maximum performance with fleet management.

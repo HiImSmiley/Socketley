@@ -10,7 +10,7 @@ socketley.set_interval(60000, function()
     self.broadcast(os.date("%H:%M") .. ", " .. n .. " online")
 end)</pre>
 
-<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>Callbacks run on the runtime's one thread; whatever waits does so without blocking it. The exception: <code>socketley.http</code> blocks the loop outside a callback that can wait, such as an <a href="#/rt/mcp">mcp</a> tool's handler. A callback that never ends is stopped by its deadline (<b>Callback Deadline</b> below).</div></div>
+<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>Callbacks run on the runtime's single thread. Inside a callback that can wait, such as <code>on_message</code>, <code>on_client_message</code> or an <a href="#/rt/mcp">mcp</a> tool's handler, <code>socketley.http</code> waits without blocking that thread. Anywhere else it blocks the whole runtime until the answer arrives. A callback that never ends is stopped by its <a href="#/man/lua-configuration.callback-deadline">deadline</a>.</div></div>
 
 <h2>Callbacks</h2>
 <x-man s="lua-configuration.available-callbacks"></x-man>

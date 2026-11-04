@@ -24,6 +24,7 @@ Object.assign(P, {
   nodes: '<circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M11 7.3 6.3 15.7M13 7.3l4.7 8.4M7.5 18h9"/>',
   bars: '<path d="M5 20V11M10.5 20V5M16 20v-6M21.5 20H2.5"/>',
   pkg: '<path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/>',
+  flow: '<rect x="3" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="16" width="7" height="5" rx="1.5"/><path d="M6.5 8v4.5a2 2 0 0 0 2 2h9V16"/><path d="m15 12.5 2.5 2 2.5-2"/>',
 });
 
 const RT = [
@@ -51,7 +52,7 @@ const NOBENCH = {
 };
 
 const NAV = [
-  ['Start', [['', 'Overview', 'home'], ['install', 'Install', 'download'], ['tour', 'Ten-minute tour', 'rocket'], ['concepts', 'Concepts', 'layers']]],
+  ['Start', [['', 'Overview', 'home'], ['install', 'Install', 'download'], ['tour', 'Ten-minute tour', 'rocket'], ['concepts', 'Concepts', 'layers'], ['how', 'How it works', 'flow']]],
   ['Runtimes', RT.map(r => ['rt/' + r[0], r[0], r[0]])],
   ['Guides', [['lua', 'Lua scripting', 'code'], ['deploy', 'Deployment', 'shield'], ['cluster', 'Cluster', 'nodes'], ['sdk', 'C++ SDK', 'pkg'], ['examples', 'Examples', 'folder']]],
   ['Reference', [['cli', 'CLI', 'term'], ['flags', 'All flags', 'list'], ['env', 'Environment & files', 'gear'], ['man', 'Manual', 'book']]],
@@ -128,6 +129,14 @@ function linkify(root) {
 // A short flag is not broken after its hyphens.
 function nowrapFlags(root) {
   for (const c of root.querySelectorAll('code,b')) if (c.textContent.length < 32 && /^-/.test(c.textContent.trim())) c.classList.add('nw');
+  // A long path breaks after a slash, not inside a name; <wbr> marks where, and is not copied with the text.
+  for (const c of root.querySelectorAll('td code, li code, p code')) {
+    if (c.children.length || c.textContent.length < 22 || !c.textContent.includes('/')) continue;
+    const parts = c.textContent.split(/(?<=\/)/);
+    c.textContent = '';
+    parts.forEach((x, i) => { if (i) c.append(document.createElement('wbr')); c.append(x); });
+    c.classList.add('pth');
+  }
 }
 function addCopy(p) {
   if (p.querySelector('.cp')) return;
@@ -361,6 +370,13 @@ async function place(root) {
   }
   for (const p of root.querySelectorAll('pre.code')) addCopy(p);
   nowrapFlags(root);
+  // A table of three or more columns stacks on a phone: each cell on a line of its own, named by its column.
+  for (const t of root.querySelectorAll('table.kv')) {
+    const head = [...(t.querySelector('tr')?.children || [])].map(c => c.textContent.trim());
+    if (head.length < 3) continue;
+    t.classList.add('kv3');
+    for (const tr of [...t.querySelectorAll('tr')].slice(1)) [...tr.children].forEach((c, i) => c.dataset.l = head[i] || '');
+  }
 }
 // One row of each runtime's benchmarks, the one its set names as its headline, chosen before the numbers were in.
 function glance(caption = true) {
@@ -557,6 +573,7 @@ const CONTENT = {
   install: ['Install', 'Start', 'From source, the install script or a Debian package; the daemon then runs as a systemd service.'],
   tour: ['Ten-minute tour', 'Start', 'Make a server, a cache and a proxy, script one of them, and look at all three.'],
   concepts: ['Concepts', 'Start', 'The daemon, its runtimes and the few rules every one of them follows.'],
+  how: ['How it works', 'Start', 'What happens, and where, from the command you type to the answer a client gets.'],
   lua: ['Lua scripting', 'Guide', 'Callbacks per message, connection and request, the runtime methods a script calls, and what a script may not do.'],
   deploy: ['Deployment', 'Guide', 'Running socketley on a machine that matters: the service, permissions, TLS, state, backups and limits.'],
   cluster: ['Cluster', 'Guide', 'Daemons on several machines that see each other\'s runtimes, and the opt-in Raft mode.'],

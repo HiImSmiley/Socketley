@@ -1,0 +1,94 @@
+# Install
+
+From source, the install script or a Debian package; the daemon then runs as a systemd service.
+
+socketley runs on Linux 5.19 or newer, on x86_64 and aarch64. Install it one of four ways, join the group, then check it.
+
+## A release package
+
+```
+curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
+```
+
+Installs the newest release `.deb`, asking before each missing dependency (ffmpeg is offered for the storage runtime's thumbnails and video). If the package was built for a newer distribution than yours, the script stops without changing anything.
+
+| Option | Does |
+|---|---|
+| `--deb FILE` | Installs a package you have. |
+| `--yes` | Takes every default. |
+| `--uninstall` | Removes socketley. |
+
+## From source, in one step
+
+```
+git clone https://github.com/HiImSmiley/Socketley
+cd Socketley
+bash scripts/install-from-source.sh
+```
+
+Checks the kernel, architecture and compiler (GCC 12 or newer), builds liburing and Release, installs the binary, man page and service, and starts the daemon.
+
+| Option | Does |
+|---|---|
+| `--dry-run` | Prints every command, runs none. |
+| `--uninstall` | Removes what it installed. |
+| `--prefix` | Installs elsewhere; only `/usr` gives a system service. |
+
+## From source, by hand
+
+1. Dependencies.
+
+   ```
+   sudo apt install build-essential libssl-dev libluajit-5.1-dev git
+   ```
+2. liburing, if yours is older than 2.7.
+
+   ```
+   bash scripts/install-liburing.sh          # liburing >= 2.7, only if yours is older
+   ```
+3. The third-party archives.
+
+   ```
+   ./bin/build-thirdparty.sh                 # the static archives the tree links, HTTP/3 included
+   ```
+4. Build.
+
+   ```
+   ./bin/premake5 gmake2
+   make -C make config=release_x64 -j$(nproc)
+   ```
+5. Optionally, install system-wide.
+
+   ```
+   sudo bash packaging/install.sh            # optional: system-wide, with the service
+   ```
+
+Without installing, `./bin/Release/socketley daemon &` starts a development daemon on `/tmp/socketley.sock` with state under your home directory; see [environment & files](env.txt).
+
+## A Debian package of your own
+
+```
+bash packaging/build-deb.sh
+sudo apt install ./socketley_*.deb
+```
+
+Build it on the release it is for: a package built on Ubuntu 24.04 does not install on Debian 12.
+
+## Join the socketley group
+
+```
+sudo usermod -aG socketley $USER
+```
+
+Only root and the `socketley` group reach the installed daemon; anyone else silently gets a private daemon of their own. Log in again after joining.
+
+## Check it
+
+```
+systemctl status socketley
+socketley ls
+socketley --help          # the interactive help
+man socketley
+```
+
+[The manual's installation section →](man-installation.txt)

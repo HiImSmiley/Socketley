@@ -1,0 +1,81 @@
+# Dashboard
+
+From the manual page socketley(1).
+
+When **daemon.metrics_port** is set in the daemon configuration file, the metrics endpoint serves the following routes:
+
+### `GET /`
+
+Serves the web dashboard, which has the storage interface's look and takes its stylesheet and helpers from the same binary. The overview shows the daemon's runtimes, connections, messages, bytes in and out, CPU and resident memory, each with a line graph of its last three minutes. The runtime list shows each runtime with its state and the same figures, and can be filtered by type and name. Each runtime also has a page with its configuration and its **stats**.
+
+A signed-in user can start, stop, restart and remove a runtime, and reload its Lua. The user can also edit a runtime, either in a form for its type, filled in with what **show** prints, or as the JSON that **import** takes. To create a runtime, the user picks the type and then fills in a form of every flag that **create** takes for that type, grouped by section. The page shows the command it will send while the form is filled in.
+
+If **daemon.dashboard_idp** names an **idp** runtime, the page offers sign-in through it. An account of the group **admins** that is signed in at that idp is signed in to the dashboard too. Signing out of the dashboard also signs out at the provider.
+
+Otherwise, signing in takes the access key and secret of an admin in the credentials file that **daemon.dashboard_credentials** names. The file has a storage runtime's format, and the dashboard checks the key and secret the same way a proxy's **--auth basic:** does. An address that fails five times in fifteen minutes is refused with 429, even with the right secret. Behind a proxy on this machine, the address counted is the one in X-Forwarded-For.
+
+The session is a cookie sealed with a key that the daemon generates at start. The cookie is HttpOnly and SameSite=Strict, and also Secure behind HTTPS. It is valid for twelve hours. The daemon ends a session when the user signs out, when the user's key is removed from the file, or when that key is given another secret. Each command also carries the page's own header, which a request from another site cannot carry. The command goes over the daemon's control socket, as a CLI command does, and is logged with who sent it. The page sends only **create**, **edit**, **import**, **start**, **stop**, **remove**, **reload**, **reload-lua**, **show**, **stats**, **ls** and **ps**, and never a word that contains a space.
+
+When credentials are configured, every route except the page and the sign-in needs a session. **/metrics** needs a session too, except for a scraper on this machine that connects without a proxy in between. Without credentials, the page shows the figures but changes nothing. The log and a zone's text always need a session, whatever is configured.
+
+The dashboard's history and alerts come from a **metrics** runtime (see **METRICS FLAGS**). The daemon creates one named **metrics** the first time it starts with the dashboard on and a way to sign in to it (**daemon.dashboard_credentials** or **daemon.dashboard_idp**), or with any of **daemon.alert_webhook**, **daemon.alert_mail** and **daemon.events** set. The metrics runtime listens on 127.0.0.1:9090, or on the next free port above it. The daemon creates it only once, so a metrics runtime that was removed stays removed. With no metrics runtime running, the page shows the current figures and no history. With several, the page reads the one named **metrics**, or else any running one that collects this daemon's series.
+
+The graphs cover a chosen range: the last fifteen minutes, hour, six hours, day, week, month or year. The value and time under the pointer are shown. For each runtime and for the daemon, connections and memory are drawn as they are, and messages, bytes and CPU as rates per second. The figures are read from the metrics runtime's store, which keeps them as long as its **--keep** and **--downsample** allow. **GET /api/history?runtime=**name**&range=**seconds**&points=**n returns the history of one runtime, or of all runtimes together when no name is given, as *n* points. A point with no data is null. The answer is an object with **from** (in seconds since 1970), **step** (the seconds per point) and the arrays **conn**, **msg**, **in**, **out**, **cpu** (percent of one CPU) and **rss**. The range is held between a minute and a year, and the number of points between 10 and 1440.
+
+The Alerts view shows the metrics runtime's rules. These are the built-in rules below, unless its **--rules** file changes them. A runtime failed, or was started again three times within the hour. A sync runtime cannot carry what it owes. A certificate that a runtime serves expires within two weeks; the alert is critical within three days, or once the certificate has expired. The disk under a storage runtime or under the state directory, or the host's memory, is at 90% (critical at 95%). A storage runtime is at 90% of its **--max-bytes**, or a cache that refuses writes is at 90% of its **--maxmemory**. A git repository's last pull failed. A mail runtime has a hundred messages waiting (critical at a thousand), or its own address is listed by a blocklist that its **--dnsbl** names. A scraped target does not answer for two minutes. A tunnel edge is missing an agent that joined it, or drops more than 1% of its datagrams. An idp runtime barred more than twenty sign-ins in ten minutes.
+
+A critical alert silences the warning on the same thing. Each alert is logged, listed on the page with the recent notifications, and shown on the overview. When **daemon.alert_webhook** is set to an http or https URL, each alert is also posted to it as JSON. The **content** and **text** fields carry the message; these are the fields Discord, Slack and Telegram's sendMessage read. The **state** (**firing**, **resolved**) and **alert** fields carry the rest. If the hook does not accept a message with a 2xx status, the daemon posts it again after a pause that doubles each time, up to eight seconds. A message the hook has not accepted is kept in **.notify** in the state directory and posted after a restart.
+
+When **daemon.alert_mail** is set to **mail://***runtime***/***address*[,*address*...] that mail runtime mails each alert, as well as or instead of the webhook. The subject is the alert's first line. Mail is held the same way until the mail runtime runs. The metrics runtime keeps its alerts' state in its directory, so a metrics runtime that is started again does not report the same alerts a second time. **GET /api/alerts** lists the alerts, and **POST /api/alerts/test** sent with the page's header posts a test through the hook.
+
+When **daemon.events** names an mqtt runtime, the daemon publishes the state of each runtime on it, at QoS 1 and retained. It publishes on **socketley/runtimes/***name***/state** as JSON with the runtime's **name**, **type**, **state** and **port**. It publishes at every change, and clears the topic when the runtime is removed. The daemon also publishes each alert while it holds, on **socketley/alerts/***id* as the JSON that the **alert** field above carries, and clears it when the alert clears. A subscriber to **socketley/#** receives the current state as soon as it subscribes, and every change after that. The broker may be created after the daemon starts. Until it runs, the messages owed to it wait in **.notify** in the state directory, as the webhook's do.
+
+The Logs view follows the daemon's recent log live, and filters it by runtime, by level and by text. Each runtime's page shows that runtime's own log. A failed runtime shows the last warning or error it wrote, both in the list and on its page, next to how often it was started again. Each worker writes its stderr into its own pipe, which the daemon reads. The daemon passes every line on unchanged to its own stderr, so the journal gets every line. It also keeps the last 10,000 lines in memory, its own and the workers', each tagged with the runtime's name: **GET /api/logs?since=**seq**&max=**n**&runtime=**name**&level=**warn**.**
+
+The Domains view shows three things. The first is every certificate that a runtime serves: its names, its issuer, how long it has left, whether it is self-issued, whether a wildcard is waiting for its zone's delegation, and the last line of a failed issuance. The second is each entrance's routes, each mapping a name to the runtime it goes to. The third is the zones of the dns runtimes, whose records the page can edit. Before an edited zone is written, its text is checked the way the dns runtime reads a zone file. If the serial was left as it was, the dashboard raises it, so secondaries take the change. The view uses **GET /api/edge**, and **GET** and **PUT /api/zone** for a file a dns runtime serves and no other.
+
+The endpoint listens on 127.0.0.1 only. To reach it on a server, open an SSH tunnel with **ssh -L 9100:127.0.0.1:9100** *host*, and then open **http://localhost:9100/**. On an installed system the port is set in **/etc/socketley/config.lua**, as **daemon = { metrics_port = 9100 }**, and is read when the service starts.
+
+### `GET /metrics`
+
+Serves the daemon's metrics in Prometheus exposition format. It is suitable for scraping by Prometheus, Grafana Agent, or similar monitoring stacks.
+
+### `GET /api/overview`
+
+Returns a JSON object with high-level daemon statistics:
+
+```
+{
+    "version": "1.1.0",
+    "uptime_seconds": 86400,
+    "runtimes_total": 5,
+    "runtimes_running": 4,
+    "connections_total": 18230,
+    "connections_active": 142,
+    "messages_total": 9120044,
+    "bytes_in": 12345678,
+    "bytes_out": 9876543,
+    "cpu_seconds": 812.40,
+    "rss_bytes": 163577856,
+    "memory_bytes": 94371840,
+    "processes": 5,
+    "cpus": 4
+}
+```
+
+**cpu_seconds** is the user and system CPU time of the daemon and of every process its runtimes run in, read from **/proc**. The change between two readings, over the time between them, is the CPU used. **rss_bytes** is the sum of their resident memory, which counts a page shared between shards once per shard. **memory_bytes** is what they cost the machine: each shared page is counted by the share of it that each process holds (the kernel's Pss). So the runtimes' figures add up to the memory they hold between them. **processes** is how many processes there are, and **cpus** is the number of CPUs online.
+
+### `GET /api/runtimes`
+
+Returns a JSON array of all runtimes with name, type, port, state, connections and message/byte counters. Each entry also has **cpu_seconds**, **rss_bytes**, **memory_bytes** and **processes** for the runtime's own processes: one per shard, and none while it is stopped.
+
+### `GET /api/runtime/name`
+
+Returns a JSON object for the single runtime named *name*. Returns 404 if the runtime does not exist.
+
+The **dashboard** CLI command prints the dashboard URL:
+
+```
+$ socketley dashboard
+Dashboard: http://localhost:9100/
+```

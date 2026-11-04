@@ -1,0 +1,15 @@
+# Exit status
+
+From the manual page socketley(1).
+
+### `0`
+
+Success.
+
+### `1`
+
+An error, such as an invalid command, a runtime that was not found, or a rejected TLS flag.
+
+### `2`
+
+A fatal error.

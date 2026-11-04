@@ -1,0 +1,194 @@
+# Files
+
+From the manual page socketley(1).
+
+## System Mode (installed via package)
+
+#### `/usr/bin/socketley`
+
+The socketley binary.
+
+#### `/usr/lib/systemd/system/socketley.service`
+
+The systemd unit file.
+
+#### `/run/socketley/socketley.sock`
+
+The Unix domain socket for daemon IPC. Mode **0660**, owned by **socketley:socketley**.
+
+#### `/var/lib/socketley/runtimes/`
+
+The per-runtime JSON configuration files. The directory has mode **0750** and the files **0600**, all owned by **socketley:socketley**. The files carry master passwords and private-key paths; see **A State File Is A Secret** under **STATE PERSISTENCE**.
+
+#### `/etc/socketley/config.lua`
+
+The daemon configuration file; see **Daemon Configuration**.
+
+#### `/etc/socketley/types/*.toml`
+
+The manifests of registered types, read at daemon startup; see **REGISTERED TYPES**.
+
+## Development Mode (no system install)
+
+#### `/tmp/socketley.sock`
+
+The Unix domain socket for daemon IPC. Mode **0600**, owned by the user who started the daemon.
+
+#### `~/.local/share/socketley/runtimes/`
+
+The per-runtime JSON configuration files, mode **0600**.
+
+#### `~/.config/socketley/config.lua`
+
+The daemon configuration file. The SOCKETLEY_CONFIG environment variable can name another path.
+
+#### `~/.config/socketley/types/*.toml`
+
+The manifests of registered types, read at daemon startup; see **REGISTERED TYPES**.
+
+## The IPC socket
+
+Every **socketley** command travels over the socket above, and through it a client can reach everything the daemon can do. That includes stopping a runtime, reading **stats**, rewriting a runtime's configuration with **edit**, and running arbitrary code as the user the daemon runs as. The last is possible because a **--lua** handler runs with the daemon's privileges; see **Handler Privileges** under **LUA CONFIGURATION**.
+
+Opening the socket is therefore an administrative right, and the socket's mode reflects that:
+
+```
+/run/socketley/socketley.sock   0660  socketley:socketley
+any other path                  0600  the user who started the daemon
+```
+
+The packaged daemon runs as **socketley**, and the operator does not. The packaged socket is therefore shared with one group, and membership of that group grants the right:
+
+```
+sudo usermod -aG socketley "$USER"     # then log in again
+```
+
+A daemon on any other path keeps its socket to itself. This covers a development daemon and a daemon started with **SOCKETLEY_SOCKET**. The mode is owner-only rather than owner-and-group because a shared primary group is not unusual. Several distributions put every user in **users**, and there the daemon's group is every human on the machine.
+
+**Earlier versions made this socket 0666** (world-writable) on both paths. Any local uid could drive any daemon on the machine, whoever it belonged to. After an upgrade, a user who has been running **socketley** against a system daemon without being in the **socketley** group gets this error:
+
+```
+not permitted to open the daemon socket at /run/socketley/socketley.sock
+```
+
+That user needs to be added to the group. A user who is not added is not locked out of the program. With the system socket unreachable, the CLI falls back to development mode and starts a daemon of the user's own, with that user's privileges and that user's runtimes.
+
+On a machine where two people use development mode at once, the second person gets the same message about */tmp/socketley.sock*. The path has one owner, and the socket is no longer shared. Sharing it was never a supported arrangement; it was a shared daemon that nobody had asked for. Give each person a socket of their own:
+
+```
+export SOCKETLEY_SOCKET="/tmp/socketley-$USER.sock"
+```
+
+This also gives each person a state directory of their own; see **WHERE STATE LIVES**.
+
+## Where state lives
+
+The two directories above are where a daemon's runtimes live when the daemon serves the default socket. That covers every deployed daemon, and every daemon that has never heard of **SOCKETLEY_SOCKET**. This has not changed and will not change.
+
+A daemon on any *other* socket path gets a directory of its own. The directory is a sibling of the default one and is named after the socket path: the leading slash is dropped, and every character outside **A-Za-z0-9._-** becomes an underscore.
+
+```
+SOCKETLEY_SOCKET unset          ~/.local/share/socketley/runtimes
+SOCKETLEY_SOCKET=/tmp/a.sock    ~/.local/share/socketley/runtimes.tmp_a.sock
+SOCKETLEY_SOCKET=/tmp/socketley.sock
+                                ~/.local/share/socketley/runtimes
+```
+
+Setting the variable to the path that would have been used anyway counts as the default, not as a second daemon. A script that spells out the default therefore keeps the default directory. The directory name is readable rather than hashed on purpose: the answer to "which of these is mine" should come out of an **ls**.
+
+At startup the daemon logs the directory it is using (**state directory: ...**), and that line is the authoritative answer. Learn where to find it before you need it.
+
+**Upgrading.** The first time a daemon uses one of these keyed directories, it copies everything from the shared directory it used to read into the new directory, once. An INFO line says how many runtimes were adopted and from where. The originals stay exactly where they are, so an older binary rolled back onto the machine still finds what it has always found. A *.adopted* file in the new directory records what happened, and makes the copy a one-time event. Without that file, an operator who later removed every runtime would find them all back after the next restart.
+
+**...but never out from under a running daemon.** Adoption is skipped entirely while a daemon is serving the default socket path. Those runtimes belong to that daemon, and adopting them would mean binding ports it is already serving. The check is a probe of the default path; anything answering there, daemon or not, is enough to skip adoption.
+
+This is not a rare corner. An operator debugging beside a running daemon gets into this situation with one command. The second bind *succeeds* under **SO_REUSEPORT**, so nothing but the port count would ever have reported the problem.
+
+The daemon logs the skipped adoption at **WARN**, with both directory paths and what to do about it, because from the outside it looks exactly as if the runtimes had vanished. It writes no *.adopted* marker, because "somebody is using these right now" is a fact about this minute, not a decision. So once the daemon on the default path is stopped, restarting this one adopts the runtimes as normal.
+
+**The failure this trades against.** A daemon started with a **SOCKETLEY_SOCKET** that it did not have last time finds no runtimes. On a development machine that is correct: it is a different daemon, and it owns nothing. It cannot happen to a deployed node. A deployed node runs on the default path with the variable unset, and the default path is exempt from the rule for exactly that reason. If it happens anyway, nothing has been destroyed. The other directory is still on disk with everything in it, and starting the daemon with the variable it had before brings it all back.
+
+The alternative, one state directory for every daemon in the namespace, is not the safe direction. Two daemons then bind each other's ports on boot, and each reports the other's runtimes as its own. A **remove** sent to either one deletes a state file the other is still serving, and that cannot be undone.
+
+## Daemon Configuration
+
+The daemon configuration file is a Lua script that sets a **daemon** table:
+
+```
+daemon = {
+    name = "node1",          -- this daemon's name in a cluster
+    cluster = "/shared/dir", -- cluster directory; needs name
+    log_level = "info",      -- debug, info, warn, error
+    metrics_port = 9100,     -- Prometheus metrics HTTP endpoint
+    dashboard_credentials = "/etc/socketley/admin.creds",
+                             -- the dashboard's admins sign in from here
+    dashboard_idp = "auth",  -- or as admins of this idp runtime
+    alert_webhook = "https://discord.com/api/webhooks/...",
+                             -- where alerts are posted
+    alert_mail = "mail://m/ops@example.com",
+                             -- and mailed, by this mail runtime
+    events = "bus",          -- an mqtt runtime the runtimes' states and
+                             -- the alerts are published on
+    cpus = "0-3",            -- where this daemon's I/O runs
+    settings = {             -- any SOCKETLEY_* knob, by its short name
+        storage_hash_threads = 4,
+        lua_timeout_ms = 2000,
+        proxy_splice = true,
+    }
+}
+```
+
+**config** is the older name of the same table and still works. A file that sets both is refused rather than merged. **name** and **cluster** are the two keys that **socketley --lua** can also set on a daemon that is already running. Every other key is read only from this file, when the daemon starts. A **--cpus** typed on **socketley daemon** outranks the file.
+
+**settings** sets any variable under **ENVIRONMENT** that an operator may change, by its name in lower case and without **SOCKETLEY_**. For example, **storage_hash_threads** is **SOCKETLEY_STORAGE_HASH_THREADS**. Write a number as a number, an on-or-off value as **true** or **false**, and anything else as a string. The daemon puts each setting in the environment it starts its workers with, so a runtime reads the file's value just as it would read the variable's.
+
+The file takes precedence. A variable in the daemon's own environment counts only for a setting that the file does not name. The default applies only when neither sets a value. The daemon reports each of these on standard output and does not start:
+
+- a name that is not a setting;
+- a value outside the setting's range;
+- a variable that a command reads from its own environment: the **SOCKETLEY_GIT_*** variables, and **SOCKETLEY_SOCKET** and **SOCKETLEY_CONFIG**, which choose this file; also a variable the daemon sets for its workers, such as **SOCKETLEY_FAST_LO**.
+
+**socketley settings** shows the values that were taken.
+
+When **metrics_port** is set, the daemon starts an HTTP endpoint. It serves a live web dashboard at **GET /**, Prometheus exposition format metrics at **GET /metrics**, and JSON API endpoints at **/api/overview**, **/api/runtimes**, and **/api/runtime/<name>** (see **DASHBOARD**). The metrics include runtimes total/running, connections total/active, messages total, bytes in/out, and per-runtime breakdowns. Among the per-runtime metrics are **socketley_runtime_cpu_seconds_total**, **socketley_runtime_resident_memory_bytes** (resident memory, with a shared page counted once per shard) and **socketley_runtime_memory_bytes** (what the runtime costs the machine, with a shared page counted by the share it holds). The daemon's own metrics are **socketley_daemon_cpu_seconds_total** and **socketley_daemon_memory_bytes**.
+
+Each running runtime also exports the figures of its own **stats**. Each figure becomes a metric in a family named after the runtime's type, with the label **name**. The families are:
+
+- **socketley_server_***
+- **socketley_client_***
+- **socketley_proxy_***, among them **_backends**, **_healthy_backends**, **_backend_responses_total** and **_backend_failures_total**
+- **socketley_cache_***, among them **_keys**, **_get_hits_total** and **_get_misses_total**
+- **socketley_db_***
+- **socketley_dns_***, with **socketley_dns_queries_total** by **transport** and **socketley_dns_responses_total** by **rcode**
+- **socketley_idp_***, among them **_sign_ins_barred_total** (sign-ins refused for too many failures)
+- **socketley_mqtt_*** (messages by **qos**, drops by **reason**)
+- **socketley_sync_***, among them **_failing**
+- the storage, mail and tunnel families under **STORAGE FLAGS** (Metrics). A tunnel edge also adds **socketley_tunnel_agents_joined** (the agents expected to be linked) and **socketley_tunnel_agents_connected** (the agents that are linked).
+
+Counters end in **_total**. A figure that no family names is exported as **socketley_***type***_stat** with its name in the label **stat**.
+
+Beside these are the facts that the daemon's alerts look at. Each is a series that an alert rule can read:
+
+- **socketley_runtime_state** (labels **name**, **type**, **state**): 1 for the state a runtime is in, 0 for the other three.
+- **socketley_runtime_restarts_total**: the times a worker went down and was started again.
+- **socketley_cert_expiry_seconds** (labels **name**, **path**): the seconds until the certificate a runtime serves with ends, below 0 once it has ended. It is read every five minutes.
+- **socketley_disk_free_ratio**, **socketley_disk_free_bytes** and **socketley_disk_size_bytes** (label **path**): the state directory's disk and each storage runtime's disk, each disk once.
+- **socketley_host_memory_available_ratio**, **_available_bytes** and **_total_bytes**.
+- **socketley_runtime_quota_ratio**: how much of its limit a storage with **--max-bytes**, or a cache with **--maxmemory** and no eviction, holds.
+- **socketley_mail_blocklisted**: 1 while a blocklist from a mail runtime's **--dnsbl** names the address the runtime sends from.
+- **socketley_git_mirror_failed** (labels **name**, **repo**, **id**): 1 when the last pull of a storage's git mirror failed, read every minute. The **error** label holds what the failed pull said.
+- **socketley_runtime_failure** (labels **name**, **type**, **reason**): 1 for a runtime that failed, with its last warning or error line as the reason.
+- **socketley_runtime_bytes_received_total** and **_sent_total**, per runtime.
+
+The time work takes is a Prometheus histogram per runtime. The buckets start at 64 microseconds and double up to 16.8 seconds, plus **+Inf**. Each request is measured from the start of the loop turn that read it to the start of the turn that answered it. A request answered in the turn it came in therefore measures 0, and no clock is read for it. The histograms are:
+
+- **socketley_proxy_request_duration_seconds** (from an HTTP request's head to its answer's last byte)
+- **socketley_proxy_backend_connect_duration_seconds** and **socketley_proxy_backend_first_byte_seconds**
+- **socketley_server_http_request_duration_seconds**
+- **socketley_cache_batch_duration_seconds** (from a read's commands to their replies being handed on)
+- **socketley_db_request_duration_seconds**
+- **socketley_idp_sign_in_duration_seconds**
+- **socketley_mail_delivery_duration_seconds**
+- **socketley_storage_request_duration_seconds**
+
+Each histogram has **_bucket** (**le**), **_sum** and **_count**, with the shards' values added together. For example, **histogram_quantile(0.99, rate(socketley_proxy_request_duration_seconds_bucket[5m]))** reads the 99th percentile of the proxy request histogram.

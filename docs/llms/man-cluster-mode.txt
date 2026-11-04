@@ -1,0 +1,204 @@
+# Cluster mode
+
+From the manual page socketley(1).
+
+**The cluster directory is as privileged as the daemons that read it.** A proxy with an **@***group* backend picks its targets from the files in that directory, so whoever can write there decides where that traffic goes. Treat write access to it exactly as you would treat access to the control socket: it belongs to the daemons and to nobody else. The intended arrangement is a shared volume between containers you control, not a directory that any other workload can write to.
+
+Multi-daemon cluster discovery lets proxies route to runtimes on remote daemons. Each daemon publishes its state to a shared directory (typically a Docker volume) every 2 seconds. Entries whose heartbeat is older than 10s are stale, and are excluded automatically.
+
+**How it works:**
+
+1. Each daemon writes its state to *dir*/*name*.json
+2. Every 2 seconds, each daemon scans the directory for peer files
+3. Proxy **@group** resolution includes both local and remote group members
+4. On graceful shutdown, the daemon deletes its file
+
+**Restarting a node, and name conflicts:**
+
+A name belongs to one node. If two daemons published the same file, every peer would get an endpoint set that belongs to neither of them. Traffic for *api1* would also be split between two machines that each believe they are api1. So a daemon that finds its name held by a live entry is refused **--cluster**, and is told so.
+
+A node that was killed and restarted is a different case. Every restart policy this project documents (a container restart, a redeploy, systemd's **Restart=on-failure**, a crash loop) brings the node back within a second or two. That is well inside the 10s threshold, so the node finds its own entry still fresh, and it reclaims it.
+
+The entry records who wrote it: the advertised host, the daemon's control socket path, the kernel boot id, and the pid. A daemon may take over a fresh entry only when the first three are its own. That is a proof rather than a guess. A unix socket path admits one process at a time, and everything else that reaches a daemon connects to that path instead of binding it. So on one machine, under one hostname, whoever holds the path *is* the daemon, and an entry carrying our own three values was written by a process that is gone. A different machine has a different boot id, and a fresh entry cannot predate a reboot. The pid is published for the operator and never used to decide, because a restarted container has a new pid namespace.
+
+What this cannot tell apart is two containers on *one* host that are given the *same* hostname and both use the default socket path. Their entries are identical, and so is the address every peer would dial for either of them.
+
+A daemon that could not join keeps serving: it is a working server that is not in a cluster. It reports the failure in three places:
+
+- the exit status of the command;
+- an **ERROR** line in its log that names the holder;
+- every **socketley cluster** subcommand, which reports **cluster mode is off** with the reason, instead of the "not in cluster mode" that a daemon never given **--cluster** reports.
+
+Clustering is never accepted and silently not applied.
+
+**Docker Compose example:**
+
+A complete, working example is *examples/cluster/docker-compose.yml*, and *test/docker/* holds the same setup with assertions on it. Three things about it are not optional:
+
+- **seccomp.** Docker's default profile does not permit **io_uring_setup**(2), **io_uring_enter**(2) or **io_uring_register**(2). socketley's whole I/O layer is a ring, so under that profile every node dies at startup with **failed to init event loop**. Run the containers with a profile that allows those three syscalls; during development, use **security_opt: [seccomp:unconfined]**.
+- **entrypoint.** The image's ENTRYPOINT is **socketley**, so a compose **command:** is passed to it as arguments. A node that needs a shell must set **entrypoint: ["/bin/sh", "-c"]**, and give its script as a one-element list. Compose splits a bare string into an argv, and everything past the first **&** is lost.
+- **Readiness.** **daemon --name** and **daemon --cluster** are configuration commands sent to a daemon that is already running. When the socket does not answer, they start a detached daemon automatically. Sleeping for a second before running them is a race. If the race is lost, a second daemon is forked and the container goes down without a message. Wait for the daemon's own **daemon started** line instead.
+
+Alternatively, use a Lua config file. **socketley --lua** does not start a daemon; when none answers yet, it fails and applies nothing. The one-second sleep below is the same race, so a real entrypoint should wait for the **daemon started** line here too:
+
+```
+-- /etc/socketley/setup.lua
+daemon = { name = "api1", cluster = "/cluster" }
+runtimes = {
+    { type = "server", name = "web", port = 9001, group = "api", start = true }
+}
+```
+
+```
+socketley daemon &
+sleep 1 && socketley --lua /etc/socketley/setup.lua
+```
+
+**Inspecting the cluster:**
+
+```
+socketley cluster ls
+socketley cluster ps
+socketley cluster group api
+socketley cluster stats
+socketley cluster watch
+```
+
+**Stale detection:**
+
+| Scenario | Behavior | Recovery |
+|---|---|---|
+| Graceful shutdown | File deleted | Immediate |
+| Container killed | Stale heartbeat | ~10 seconds |
+| Container restart | File overwritten | Immediate |
+
+## Raft mode (experimental, opt-in)
+
+**Experimental.** A daemon started with **--raft-listen** runs one Raft node on its own loop. Nothing else changes: the cluster directory above, and every runtime, proxy and cache that is not declared as a cluster runtime, behave exactly as they do without it. The Raft cluster elects a leader, replicates a log to disk and keeps the membership. The state machine behind the log holds the cluster's runtimes (see **Cluster runtimes** below). A cluster runtime is declared once, and the leader places it on distinct nodes. When a node dies, its runtimes are started on a survivor. A cache is replicated. When the node that holds its primary dies, the leader promotes the follower that holds the most (see **Cluster caches** below).
+
+**Flags** (given on the command line that starts the daemon, like **--cpus**; refused together with **--name** and **--cluster**):
+
+#### `--raft-listen ip:port`
+
+Enables Raft mode and accepts peer connections on this address. The address must be numeric, because a peer's address travels through the replicated log and is dialled without a DNS lookup.
+
+#### `--raft-advertise ip:port`
+
+The address that peers dial, when it differs from the listening address. Required when **--raft-listen** is a wildcard.
+
+#### `--raft-name name`
+
+This node's name in the membership, which its certificate must also carry. The certificate carries it as a DNS subjectAltName or common name. Default: the advertised address. A name belongs to one node. The leader refuses a node that joins under the name of a member. It also refuses a name that reads the same as a member's once **{node}** has made it safe for a command line (see **Cluster runtimes**). The refused node stops, with the reason in its log and in **cluster raft-status**. Two nodes with the same name would give every cluster runtime the same socket path or file.
+
+#### `--raft-init`
+
+Founds a new cluster with a single voter, on first start only.
+
+#### `--raft-join ip:port`
+
+Joins the cluster that the member at this address belongs to, on first start only. The node is added as a learner and receives the log without voting. Once its log has caught up to the leader's commit index, a single-server change promotes it to voter. A member that is not the leader passes the request on.
+
+#### `--raft-cert file --raft-key file --raft-ca file`
+
+Mutual TLS between members, which is required. Every member's certificate is signed by the CA. A connection is closed if its certificate does not name the member it introduces itself as. That name is the one the membership records for its id or, for a newcomer, the name it claims. The join target's id is not known yet, so its certificate is held to the address that was dialled.
+
+#### `--raft-insecure`
+
+Runs Raft in cleartext. It is refused together with the certificate flags. Without this flag and without the certificate flags, the daemon refuses to start.
+
+#### `--raft-down-after duration`
+
+How long the leader waits for a node's lease request before it declares the node down and moves its replicas. Takes seconds, or a value with an **s** or **ms** suffix (**4**, **4s**, **3500ms**). Default: four times the shortest election timeout, which is 4 s at the default tick. Values below three times the shortest election timeout (3 s at the default tick) are refused, because a leader change would then look like a node loss. Every member of one cluster should use the same value; see **Cluster runtimes** for what depends on it.
+
+A daemon whose state directory already holds Raft state ignores **--raft-init** and **--raft-join**, and comes back as the member it was. A daemon with no state and neither flag refuses to start. A daemon that cannot bind the port or read its state exits 2, rather than serve without the cluster it was asked for.
+
+**On disk:** *state-dir*/raft/ holds **node-id** (a random 64-bit id, generated once), **wal-***seq***.log** (CRC32C-checked records: hard state, entries, truncations) and **snap-***index***-***term* files, all with mode 0600. Every write is followed by an fsync linked behind it in io_uring. Nothing a node says to a peer leaves before that fsync reports. Recovery cuts off a torn tail at the first bad record. The log is compacted every 1000 applied entries.
+
+**Timing:** Raft ticks every 100 ms, measured from elapsed monotonic time. The election timeout is 1–2 s, a heartbeat is sent every tick, and pre-vote and check-quorum are used. A leader stopped by SIGTERM hands leadership to its most up-to-date voter (TimeoutNow) before it exits, so the cluster does not wait out an election timeout.
+
+**socketley cluster raft-status** prints this node's id and name, role, term, leader, commit and applied indexes, the log's range, the voters and the learners. It also prints whether a quorum of voters was heard from within an election timeout, and the transport and WAL counters. It exits 0 when there is a leader and a reachable quorum, and 2 when there is not, saying so on its last line. It exits 1 on a daemon that is not in Raft mode.
+
+**Cluster runtimes.** A cluster runtime is declared once, for the whole cluster, and every node applies the same log:
+
+```
+socketley cluster create server api -p 8080 --replicas 2
+socketley cluster create server api --listen unix:/run/api-{node}.sock
+socketley cluster scale api 3
+socketley cluster remove api
+socketley cluster placement
+```
+
+**cluster create** takes *type*, *name* and the flags that **create** takes, plus **--replicas** (default 1). The type is a server, a proxy, a client or a cache (see **Cluster caches**). The flags are stored as a list of arguments, so a value with a space in it stays one argument. They are run as they are on every node that holds a replica, so a file they name must exist on each node. A relative path is made absolute against the caller's directory, as for **create**. Any **{node}** in the flags is replaced by the name of the node running the replica (**--raft-name**, with every character other than letters, digits, **-**, **_** and **.** replaced by **_**). That is what lets several nodes of a test share one host. Two replicas that both ask for **-p 8080** would collide, and **--listen unix:/run/api-{node}.sock** does not. On separate hosts, each node binds its own **-p** and needs no placeholder. The node that takes the command also runs the flags through **create --test**. So a typo is refused there, with exit 1, instead of being found on every node at once. **--test** itself is refused in a spec.
+
+A command may be given to any node; a follower hands it to the leader. Success is silent. When the command returns, it has taken effect on the node that took it. If it has not within five seconds, the CLI says so and exits 2. Exit 1 is a refusal: a duplicate, an unknown name, a replica count outside 1 to 64, a runtime of that name already on this node, or bad flags. Exit 2 means the cluster has no leader that can take the command. On a daemon that is not in Raft mode, every verb says so and exits 1.
+
+**cluster scale** changes the replica count. When the count shrinks, it takes a replica from the most loaded node. A cluster runtime has no edit: remove it and declare it again.
+
+**Placement.** The leader alone decides placement, and writes each assignment to the log, so every node agrees on it. The replicas of one runtime go to distinct nodes. Each replica goes to the node that holds the fewest replicas, and to the lowest node id on a tie. When a node is declared down, its replicas are moved to live nodes. A node that comes back, or a new node that joins, is not given work back. Nothing is rebalanced, so a running replica is never moved for tidiness. If more replicas are asked for than there are live nodes, the cluster runs what fits, and **cluster placement** says how many replicas are unplaced. **cluster placement** prints:
+
+- the runtimes with their replicas, where each is placed and how many are unplaced;
+- each cache's primary and the copies it has (see **Cluster caches**);
+- the nodes with the number of replicas each holds and, on the leader, whether the leader counts each one up and when it last heard from it;
+- this node's replicas with what each is doing: running, waiting for a lease, failed with the reason, or blocked by a local runtime of the same name.
+
+**On each node,** a reconciliation runs at the end of every Raft tick. It compares what the log says the node owns with what the node runs. It creates a replica with **create -s** and stops, starts and removes it with **stop**, **start** and **remove**. This is the same code the CLI uses, and nothing else spawns a replica. The reconciliation never waits for a worker to come up, and runs at most four commands per tick. So a replica whose startup hangs, or fifty replicas arriving at once, cannot stall the Raft loop; a failure shows as the replica's state on a later tick. A replica that fails to start is tried again every three seconds. Its reason is logged once and shown by **cluster placement**. A local runtime with the same name is never touched. A replica is marked **[cluster]** after its state in **ls** and **ps**, **"cluster":true** in **--json**, and **cluster:replica** in **stats**. A replica has no state file, so a node that restarts does not bring back replicas that have moved away. **stop**, **start**, **remove** and **edit** refuse a replica by name, since the next tick would undo them.
+
+**Liveness and the lease.** Every quarter election timeout, a follower asks the leader to count it alive. The leader answers when it holds a quorum. The leader declares a node down when it has not heard a request from it for **--raft-down-after** (the failure timeout). A new leader starts every node's clock at its own election. A node may run its replicas only while it holds a lease. The lease lasts three quarters of the failure timeout, counted from when the request was sent, so a late answer shortens it and a stalled loop cannot extend it. The leader's own lease is its last look at a quorum. The margin between the lease and the failure timeout is a quarter of the failure timeout (1 s by default). That margin is the time a node has to stop its replicas before the leader gives them to another node. A lease that had lapsed is used again only once the node has applied the leader's log up to where it ended when the lease was granted. So a node that comes back does not run a replica that moved while it was away.
+
+**Partitions and duplicates.** A node that cannot reach a quorum stops serving its replicas within its lease. At the defaults this was measured at 2.9–3.8 s after the last answer. The node keeps the replicas defined, so they start again the moment it is granted a lease. The majority moves them after the failure timeout, at least a quarter of that timeout later. So a minority never serves what it cannot confirm it owns, even a minority that holds the old leader, and a healed node runs only what the log still gives it. The same holds for a leader that loses its quorum. It means that a cluster that loses its quorum stops serving every cluster replica, on every node, until it has a quorum again: the cluster chooses one copy or none over two.
+
+A leader change can take longer than the lease, as with a split vote (about one in ten kills of a leader in simulation). It then stops a survivor's replicas until the new leader has granted a lease, a few hundred milliseconds after it is elected. The lease is enforced by the daemon's loop. So a daemon that is hung and not dead (SIGSTOP, a blocked disk) cannot stop the workers of a server, a proxy or a client, which are separate processes. A cache's worker fences itself (see **Cluster caches**). Whatever a replica does on its way down, such as a **--drain** that flushes its connections, spends part of the margin.
+
+**Failover time,** from kill -9 of a node to its replica running on a survivor, was measured at the defaults. It was measured on one host with a real daemon, and in 60 seeds of a simulation of the same logic. It is about 3.9–4.3 s when the node was a follower (the failure timeout and a commit). It is about 5.1–6.0 s when the node was the leader (an election first). In the simulation it reached 8.7 s when a split vote stretched the election.
+
+**Cluster caches.** A cache is a cluster runtime that holds data, so keeping it running is not enough:
+
+```
+socketley cluster create cache db -p 6379 --replicas 3
+socketley cluster create proxy gw -p 7000 --backend @db --replicas 3
+```
+
+The leader places the replicas as for any runtime, and the log names one of them the **primary** of an **epoch**. An epoch is a number that only grows, so two leaders that race to promote agree on which was first. The other replicas are its followers. They follow it with the cache's own replication (**--replicate**: a full dump, then every write), dialling the primary's **-p** on the host that its node advertises to Raft. That is why a cluster cache needs **-p**. It is refused with **--listen**, **--shards**, **--tls**, **--replicate** (the cluster sets it) and without a port. On one host each replica needs its own port, which is what **{node}** is for: with nodes named 1, 2 and 3, **-p 630{node}** gives ports 6301, 6302 and 6303. On separate hosts a follower is a peer on another machine, and a cache serves such a peer only with **--public**. Put it in the spec (the tests here ran on one host and did not try it). A cache with one replica has a primary and nothing to promote. The first primary is the replica on the lowest node id. It is chosen once every replica has said it exists, or after an election timeout. A replica is a process the log can name (its **incarnation**). A restarted replica is another incarnation, holding nothing the old one did.
+
+**Who may write.** A replica takes a client's command only under its worker's last order from its daemon. The daemon sends an order every 100 ms, and each order stands for the lease the daemon held when it sent it. A replica is in one of three roles:
+
+- a **fenced** replica answers every command, reads included, with an error, and refuses **replicate**;
+- a **follower** answers reads and refuses writes;
+- the **primary** takes writes.
+
+A replica starts fenced. It leads only if this node holds a lease AND the log names the very process it runs as the primary. Otherwise it follows whoever the log names, or waits when nobody is named. A fence **keeps the data:** the process stays up. So a node that lost its quorum for a minute and got it back is the primary again, with everything it had. A follower keeps its link and its copy through a period without a lease. When the orders stop for any reason (the node lost its quorum, or the daemon hung or died), the worker fences itself when the last order runs out, without the daemon's help. Measured in nine runs with real daemons, a worker whose daemon was stopped with SIGSTOP refused writes after 2.7–3.1 s. A primary that lost its quorum stopped taking writes after 2.8–3.2 s. The lease is three quarters of the failure timeout, 3 s at the defaults.
+
+**Promotion.** The leader replaces a primary in three cases:
+
+- nobody leads;
+- the primary's node has been declared down (in the same round that takes its replica away);
+- the primary's node is alive, but for the failure timeout it has not named, in a lease request, the process the log calls the primary.
+
+The third case covers a primary whose daemon restarted: it comes back empty and does not lead, and a replica that has the data is promoted after that timeout. For each cache replica a node runs, every lease request carries the replica's incarnation, the epoch of the primary whose stream its copy came from, its offset in that stream, and whether it leads. The offset is a count of records. The primary counts every record it produces, whether or not a follower is connected. The end-of-dump marker carries the count at which the dump was taken. A follower's offset is that number plus the records it has applied since. A copy is empty from the first line of a dump to its last.
+
+The leader promotes the replica whose copy is the most up to date. It compares epochs first (offsets of two primaries are not on one scale), then offsets, then the lowest node id. It writes the chosen replica to the log with the next epoch. The offsets the leader has are up to about half a second old (a stats push and a request interval). But by the time the leader looks, the primary has been gone for the failure timeout, so the followers' last reports are their final positions. A primary that comes back, or a node that is given a replica again, is a new process. It follows the primary of the epoch it finds, and takes a full dump that replaces whatever it held. So nothing it wrote that the cluster did not have survives, and it does not lead a cache whose log names another primary. A cache that is scaled down never loses its primary.
+
+**How long,** from kill -9 of the node that holds the primary to a survivor taking a write, was measured on one host with real daemons at the default timing. It was 3.9–4.1 s when the node was not the Raft leader (the failure timeout and a commit; eleven kills). It was 5.2–5.7 s when the node was the leader (an election first; four kills). In a simulation of the same logic over 60 kills it was 4.1–4.2 s and 5.6–7.2 s; the longer ones were split votes. A follower dials the new primary within about a fifth of a second of being told. A proxy follows through the endpoint group that the primary is published as. The first write through a proxy on a survivor succeeded 20–95 ms after the first write made directly to the new primary (five runs).
+
+**What a failover can lose.** Replication is asynchronous: the primary answers a write and streams it afterwards. So when the primary's node dies, the promoted follower lacks the acknowledged writes it had not received. What survives is always a prefix of the primary's history. Replication is ordered, and the tests read every acknowledged key back to check that no write is lost that a later one outlived. How long the lost tail is depends on how far behind the best follower was. It was measured with a client writing continuously and kill -9 of the primary's node, three kills each:
+
+- one connection writing one key at a time, about a thousand a second (4,500 to 4,900 acknowledged): none missing;
+- 200 writes pipelined at a time, as fast as one connection goes (630,000 to 720,000 acknowledged, some 230,000 a second): none missing;
+- the same, with both followers' workers stopped (SIGSTOP) for the four seconds before the kill, so that neither was receiving: about 1.6 million acknowledged and 876,000 to 922,000 of them missing. That is every write the primary took while no follower had it.
+
+So the window is how far behind the best follower was when the primary died. It is a few writes when the followers keep up (the first two conditions lost none), and everything since a follower stopped reading when they do not. Only what a follower had already received survives. In a separate check, a stopped follower held about 20,000 of 925,000 acknowledged keys after its leader was killed. A primary drops a follower that is 8 MiB behind. After that, the primary keeps acknowledging writes that no follower is receiving, until that follower dials again. A machine that loses power, or a network that is cut, could not be tried without root. There is no synchronous mode: a write that must survive its primary is written to two caches.
+
+**Finding the primary.** **cluster placement** prints, under **CACHE PRIMARIES**, each cache's primary and epoch. For each replica it also prints the epoch and offset of its copy, and how old that news is. The leader hears every node's news; the other nodes hear only their own. A proxy with **--backend** *@name* follows the primary. On every node that holds a lease, the cache's name is published as a group of one, the primary's host and port, and it is republished when the primary moves. The **stats** of a replica carry **cluster_role**, **cluster_epoch**, **cluster_offset** and **cluster_incarnation**.
+
+**Limits.** A cache whose replicas all die at once starts again empty, because the data lived in memory. A **--persistent** file is loaded by a restarted process, but it does not take part in choosing the primary. It is replaced when the replica syncs from the primary that was chosen. A cache with one replica loses its data with its node. A worker that answers its daemon but takes no orders is not replaced.
+
+**Not yet:**
+
+- removing a member;
+- snapshots sent in chunks (a snapshot goes in one frame of at most 16 MiB);
+- a cluster id that keeps two clusters from mixing;
+- editing a cluster runtime in place;
+- moving a replica off a node before the node is stopped for maintenance (a node stopped with SIGTERM keeps its assignments until the failure timeout);
+- a worker of a server, a proxy or a client that fences itself when its daemon is hung (a cache's worker does);
+- synchronous replication of a cache;
+- a replica that fails to start on one node being tried on another.

@@ -1,0 +1,19 @@
+# Runtime states
+
+From the manual page socketley(1).
+
+### `created`
+
+The initial state after a runtime is created.
+
+### `running`
+
+The runtime is active and processing I/O.
+
+### `stopped`
+
+The runtime is stopped and can be started again.
+
+### `failed`
+
+Setup failed, and the runtime cannot recover.

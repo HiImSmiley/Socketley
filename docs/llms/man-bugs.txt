@@ -1,0 +1,5 @@
+# Bugs
+
+From the manual page socketley(1).
+
+Report bugs at: https://github.com/socketley/socketley/issues

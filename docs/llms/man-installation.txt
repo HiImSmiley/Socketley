@@ -1,0 +1,53 @@
+# Installation
+
+From the manual page socketley(1).
+
+## Release Package
+
+```
+curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
+```
+
+The script installs the newest release **.deb**. It asks before it installs each dependency that is missing. If the package was built for a newer distribution than this one, the script stops without changing anything. The script can also install a package you already have, answer every question with its default, and remove socketley; its **--help** describes these options.
+
+## From Source
+
+```
+git clone https://github.com/HiImSmiley/Socketley
+cd Socketley
+bash scripts/install-from-source.sh
+```
+
+The script performs these steps:
+
+- checks the kernel, architecture and compiler;
+- installs the build dependencies;
+- builds liburing and the static archives the tree links against;
+- builds the Release configuration;
+- installs the binary, this manual page and the systemd service;
+- starts the daemon.
+
+Its **--help** explains how to list every command without running any, and how to remove what the script installed.
+
+## Quick Install
+
+To install from a tree that is already built:
+
+```
+sudo bash packaging/install.sh
+sudo systemctl start socketley
+```
+
+## Debian Package
+
+```
+bash packaging/build-deb.sh 1.1.0
+sudo dpkg -i socketley_1.1.0_amd64.deb
+sudo systemctl start socketley
+```
+
+## Uninstall
+
+```
+sudo bash packaging/uninstall.sh
+```

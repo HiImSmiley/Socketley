@@ -1,0 +1,39 @@
+# State persistence
+
+From the manual page socketley(1).
+
+The daemon persists runtime configurations as JSON files. When a runtime is created, its configuration is saved. When the daemon starts, it restores all persisted runtimes. Runtimes that were running when the daemon stopped are started again automatically.
+
+Runtimes therefore survive daemon restarts and system reboots, like Docker containers with the restart-always policy.
+
+State is saved after the create, start, stop, remove and edit commands. The **was_running** field records whether a runtime should be started automatically when the daemon starts.
+
+## A State File Is A Secret
+
+A runtime's state file is not a note about the runtime: it *is* the runtime. The file holds these fields in plaintext:
+
+#### `master_pw`
+
+The password given to **--master-pw**, stored verbatim.
+
+#### `key_path, mesh_client_key`
+
+The paths of the TLS and mTLS private keys that this runtime uses.
+
+#### `lua_script`
+
+The path of the handler script that the daemon loads. The handler runs with the daemon's privileges; see **Handler Privileges** under **LUA CONFIGURATION**.
+
+The daemon restores every runtime from these files when it starts. Whoever can *write* one of these files therefore chooses what the daemon runs at its next start. That is the same power as being able to send the daemon commands.
+
+For this reason the daemon creates the files with mode **0600**, set explicitly at creation rather than inherited from its umask. The packaged state directory has mode **0750** and is owned by **socketley:socketley**. Neither mode is configurable, and there is no supported reason to widen them. An operator reaches this data through the CLI, over a socket with the same group boundary, not by reading the directory.
+
+**Earlier versions wrote these files 0666 & ~umask.** That gave 0644 under systemd's default umask, and 0666 for a daemon started from a shell with **umask 0**. Any local user could read a master password, and in the 0666 case could also rewrite the record. On its first start after an upgrade, the daemon narrows every file it finds in its state directory to 0600 and logs how many it changed:
+
+```
+state: tightened 3 file(s) in /var/lib/socketley/runtimes to 0600 ...
+```
+
+The repair only ever narrows modes, and it is idempotent. It does not touch the directory itself, which belongs to the installer. If this line appears on every start, something outside socketley is putting the old modes back.
+
+**A password that was exposed should be treated as exposed.** The repair closes the hole, but it cannot un-read what was already readable. Rotate any **--master-pw** that lived on a multi-user machine under an affected version, either with **socketley edit** or by recreating the runtime.

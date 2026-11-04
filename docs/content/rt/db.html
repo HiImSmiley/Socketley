@@ -1,4 +1,4 @@
-<p class="lead">A <b>db</b> keeps JSON documents for applications, such as a game's characters or a shop's orders. Each belongs to an <a href="#/rt/idp">idp</a> account, which reaches its own and no one else's.</p>
+<p class="lead">A <b>db</b> keeps JSON documents for applications, such as a game's characters or a shop's orders. Each document belongs to an <a href="#/rt/idp">idp</a> account. Nobody writes another account's documents; who may read them is set per collection.</p>
 <pre class="code">socketley create db data -p 9500 --domain data --idp auth \
     --schema /etc/socketley/db.schema --keys /etc/socketley/db.keys -s
 socketley data query characters '{"where":{"level":{"gte":5}},"limit":10}'</pre>

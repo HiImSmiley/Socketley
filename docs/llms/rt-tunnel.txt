@@ -1,0 +1,159 @@
+# tunnel runtime
+
+Makes a machine without an address of its own reachable through an edge it dials
+
+A **tunnel** makes a machine with no address of its own reachable, such as one at home behind a router. An **agent** there dials out to an **edge** the internet reaches; nothing is opened on the router.
+
+```
+# on the machine with the address
+socketley create tunnel edge --mode edge -p 9450 --domain edge --idp auth -s
+# on the machine at home, signed in as an admin of auth
+socketley tunnel join https://edge.example.com --http home=127.0.0.1:8123 \
+    --tcp mc:25565=127.0.0.1:25565
+```
+
+## What it does
+
+- **HTTP services**: Named beside the edge, such as `home.example.com`.
+- **TCP services**: A port on the edge, carried unchanged to the agent.
+- **Joining**: `socketley tunnel join` as an idp admin, or a one-time `invite` used with `--join`.
+- **ssh through 443**: `--forward` carries a signed-in person to the named addresses, via `tunnel connect` or `tunnel ssh`.
+- **Share a port**: `socketley tunnel share` publishes a local port for a while, optionally public.
+
+## Works with
+
+An [idp](rt-idp.txt) signs people in; the entrance [proxy](rt-proxy.txt) terminates TLS and the [dns](rt-dns.txt) runtime answers the services' names.
+
+## Flags
+
+Every flag a tunnel runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**Tunnel**
+
+| flag | value | what it does |
+|---|---|---|
+| `--mode` | one of edge, agent | Mode: An edge agents dial out to, or an agent dialling one. |
+| `--to` | text | Edge: The edge an agent dials, its https address. |
+| `--join` | text | Invitation: What `socketley tunnel <edge> invite` printed, used once to join. |
+| `--offer` | list | Offers: What an agent carries the edge's streams to: service=host:port each. |
+| `--forward` | list | Forward: Where an edge forwards a signed-in user's stream, as ssh's ProxyCommand needs. |
+| `--idp` | text | Identity provider: The idp runtime whose signed-in people may use --forward. |
+| `--idp-audience` | list | Audiences: The clients whose access tokens --forward takes. |
+
+## Benchmarks
+
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### A TCP service behind an edge
+
+frp 0.71.1, 9 passes, 2026-11-03, socketley c7d4c42b.
+
+| case | socketley | frp | socketley vs frp |
+|---|---|---|---|
+| round trip through the tunnel, 64 B echo | 88.5 µs (0.87 cores) | 168 µs (1.35 cores) | 1.90× (1.88–1.91) |
+| throughput, 512 MiB echoed through the tunnel | 649.0 MiB/s (1.92 cores) | 855.0 MiB/s (1.84 cores) | 0.76× (0.72–0.82) |
+
+How it was measured: tb_client, one connection; agent and edge (frpc and frps) on the same two cores, the echo service on a third. socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in about half frp's time and moves bulk data at three quarters of its rate.
+
+## The manual on tunnel
+
+A **tunnel** runtime makes a machine that has no reachable address of its own reachable. Examples are a machine at home behind a router, one behind carrier-grade NAT, or one on a network that lets only port 443 out.
+
+The machine runs an **agent**. The agent dials out to an **edge**, which is a tunnel runtime on a machine the internet reaches, and holds that one connection open. The edge serves the agent's services under its own names. It carries each visitor through the connection the agent made. Nothing is opened on the router.
+
+```
+# on the machine with the address
+socketley create tunnel edge --mode edge -p 9450 --domain edge --idp auth -s
+# on the machine at home, signed in as an admin of auth
+socketley tunnel join https://edge.example.com --http home=127.0.0.1:8123 --tcp mc:25565=127.0.0.1:25565
+```
+
+An HTTP service gets a name beside the edge's name; here it is **https://home.example.com**. Once the agent has joined, the dns runtime answers that name. The edge serves the service on a socket that the entrance routes the name to, with the entrance's certificate.
+
+A name that a runtime already has stays that runtime's. No other runtime is given a name that a service has. If two edges each have a service with the same name, the edge that comes first by name keeps it. An edge whose name is a whole domain has no name beside it, so its services have no names either. A TCP service is a port on the edge; here it is 25565.
+
+The edge adds nothing to a stream it carries. The agent receives exactly what the visitor sent, and the service answers as if the visitor were on the same machine. There are two exceptions, both for HTTP requests:
+
+- a request arrives without the idp's session and known-device cookies, which sign in wherever the idp is trusted;
+- a request arrives without the **Authorization** header that a service's *auth* took.
+
+A TCP visitor reaches a service at 127.0.0.1 or localhost from 127.0.0.2. So a service that trusts this machine's own programs at 127.0.0.1, as mail lets them relay, treats the visitor as a stranger. A service named at [::1] is reached from ::1.
+
+**Who may visit.** An HTTP service invited as *name***=***auth* lets through only the requests that *auth* admits. *auth* takes the same values as a proxy's **--auth**:
+
+- **idp:***runtime* sends a browser to sign in and back;
+- **bearer:***file* and **basic:***file* ask for a token or a key;
+- several values joined by **+** let in a visitor that any one of them admits. For example, **idp:auth+bearer:/etc/socketley/hub.token** admits a person who is signed in and a program with the token alike.
+
+Every request is checked, not only the first on a connection, since the entrance hands one connection to the edge from visitor to visitor. No part of a refused request reaches the agent. A body is carried as a body and never read as the next request. A connection whose upgrade the service refused ends with that answer. Guarding a TCP service is up to the agent.
+
+Each connection to the edge is a multiplexed link: one TLS connection that carries many streams. Each stream has its own credit, so one slow reader holds back only its own stream. The link is opened by an HTTP upgrade at **/.tunnel**, which passes the entrance like any other request. An agent pings every 15 seconds. A link that is silent for 45 seconds is given up, and the agent dials again. The pause before it dials again doubles each time, up to half a minute.
+
+**Who may connect.** There are two ways to add an agent. An admin of the edge's **--idp** adds one with **socketley tunnel join**. Without an idp, **socketley tunnel** *edge* **invite** on the edge's machine prints an invitation once, for the agent's **--join**. The agent joins with the invitation at its first connection. In its place the agent is given a key of its own, kept in its state directory (0600), and the invitation is spent. The edge keeps only hashes. **revoke** cuts an agent off within a second. **set** changes what an agent offers and keeps its key.
+
+**People.** An edge with **--forward** carries a person signed in at its **--idp** to the targets that **--forward** names, and to nothing else. The person asks for a target with **socketley tunnel connect** or **tunnel ssh**. This is how ssh reaches a server through port 443.
+
+The edge checks the person's sign-in again at every stream and once a second. Signing the account out everywhere, or disabling, resetting or removing it, closes the person's link. Taking the account out of the admins takes away the agents' TCP services at its next stream. An ssh configuration that uses the tunnel:
+
+```
+Host server
+    ProxyCommand socketley tunnel ssh edge.example.com
+```
+
+#### `--mode edge|agent`
+
+Which end of the tunnel this runtime is. Default: edge.
+
+#### `-p port`
+
+An edge's port for agents and people. It listens on 127.0.0.1 unless **--bind** says otherwise, since the entrance in front of it terminates TLS.
+
+#### `--domain name`
+
+An edge's name; its agents' HTTP services are named beside it. For an edge **edge.example.com**, a service is named like **home.example.com**.
+
+#### `--to url`
+
+The edge an agent dials, as **https://***host*[:*port*]. **http://** is allowed only for an edge on the same machine.
+
+#### `--join invitation`
+
+The invitation that **invite** printed. It can be used once.
+
+#### `--offer service=host:port,...`
+
+Where an agent carries the edge's streams, listed by the service names the edge invited it with. A name that the agent does not offer is refused at the agent.
+
+#### `--forward host:port,...`
+
+The targets where an edge may carry a signed-in person's stream.
+
+#### `--idp idp`
+
+The idp runtime whose people may use **--forward**, and whose admins add agents with **tunnel join**.
+
+#### `--idp-audience client,...`
+
+The clients whose access tokens the edge accepts. Default: **socketley**, the client that **socketley login** signs in as.
+
+A tunnel does not accept **--shards**: each agent's link is held by one process.
