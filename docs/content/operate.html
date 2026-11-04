@@ -1,0 +1,63 @@
+<p>The day-to-day questions once runtimes are running: is it up, where is the log, why did it fail, what is slow. For the first setup, see <a href="#/deploy">Deployment</a>.</p>
+
+<h2>Is it running?</h2>
+<table class="kv">
+<tr><th>Command</th><th>Shows</th></tr>
+<tr><td><code>socketley ls</code></td><td>Every runtime with its state and port. A <code>failed</code> runtime shows why.</td></tr>
+<tr><td><code>socketley ps</code></td><td>The same with uptime and connections. <code>(N restarts)</code> means the worker died and was replaced N times; <code>NOT RESPONDING</code> means it is alive but stuck.</td></tr>
+<tr><td><code>socketley stats name</code></td><td>Live counters of one runtime: connections, messages, bytes, and its type's own figures.</td></tr>
+<tr><td><code>socketley daemon stats</code></td><td>The daemon's own figures.</td></tr>
+</table>
+
+<h2>Where the log is</h2>
+<ul>
+<li><b>Installed:</b> <code>journalctl -u socketley</code>. Every worker's output reaches the daemon, which passes each line on to the journal.</li>
+<li><b>Development:</b> the terminal where <code>socketley daemon</code> runs.</li>
+<li><b>In a browser:</b> with <code>daemon.metrics_port</code> set in the configuration file, the <a href="#/man/dashboard">dashboard</a> shows each runtime's own log and a failed runtime's last error.</li>
+</ul>
+<pre class="code">journalctl -u socketley -f                  # follow it
+journalctl -u socketley --since "10 min ago"</pre>
+
+<h2>A runtime failed</h2>
+<ol class="steps">
+<li><p><b>Read the reason</b>: <code>socketley ls</code> shows it beside the runtime, and the log has the full line.</p></li>
+<li><p><b>Know which kind it is.</b> Either the worker could not start (a port in use, an unreadable certificate, a script error), or it died more than five times in ten seconds.</p></li>
+<li><p><b>Fix the cause and start it again.</b> A failed runtime keeps its configuration; nothing has to be created anew.</p>
+<pre class="code">socketley start name</pre></li>
+</ol>
+<p>A worker that crashed loses what it held only in memory. A cache keeps what <code>--persistent</code> saved; see <a href="#/how">How it works</a>.</p>
+
+<h2><code>NOT RESPONDING</code>: a stuck worker</h2>
+<p><code>ps</code> says this when a worker has said nothing for fifteen seconds while using at least half a core. It is almost always a Lua callback that does not return. Its <a href="#/man/lua-configuration.callback-deadline">deadline</a> (10 seconds by default) ends the callback; nothing is killed for being slow.</p>
+
+<h2>What blocks a runtime</h2>
+<p>A worker serves its runtime on one thread. A Lua call that waits for something outside, such as <code>socketley.http</code>, either suspends the callback or blocks the whole runtime, depending on where it is made:</p>
+<table class="kv">
+<tr><th>Called from</th><th>What a waiting call does</th></tr>
+<tr><td><code>on_message</code>, <code>on_client_message</code></td><td>Suspend the callback; the runtime keeps serving everyone else.</td></tr>
+<tr><td>The storage hooks, an mcp tool's handler</td><td>Suspend the callback, as above.</td></tr>
+<tr><td><code>on_http_request</code></td><td><b>Block the whole runtime</b> until the answer arrives or <code>timeout_ms</code> (default 5000) runs out.</td></tr>
+<tr><td><code>on_start</code>, <code>on_stop</code>, timers, filters</td><td>Block the whole runtime, as above. Keep such calls to <code>on_start</code>, <code>on_stop</code> or a rare <code>on_tick</code>.</td></tr>
+</table>
+<p>Other runtimes are not affected: each has its own worker. The full list of calls that can stop a loop is under <a href="#/man/limitations">What can stop the event loop</a>.</p>
+
+<h2>Settings you may actually change</h2>
+<p>Every setting has a default that suits a normal deployment. These are the ones worth knowing; set them in the <code>settings</code> table of <code>/etc/socketley/config.lua</code>, or as environment variables of the service. <code>socketley settings</code> lists every one with its value and where it came from.</p>
+<table class="kv">
+<tr><th>Variable</th><th>What it changes</th></tr>
+<tr><td><code>SOCKETLEY_CPUS</code></td><td>The CPUs the daemon and its workers may run on.</td></tr>
+<tr><td><code>SOCKETLEY_LUA_TIMEOUT_MS</code></td><td>The callback deadline, 10000 ms by default.</td></tr>
+<tr><td><code>SOCKETLEY_ACME_DIRECTORY</code></td><td>The ACME CA, for example Let's Encrypt's staging CA while testing.</td></tr>
+<tr><td><code>SOCKETLEY_PROXY_HTTP2</code>, <code>SOCKETLEY_PROXY_HTTP3</code></td><td><code>0</code> turns HTTP/2 or HTTP/3 off at the entrance.</td></tr>
+</table>
+<p>The rest are tuning knobs for unusual workloads, and the ones the manual calls test hooks exist for socketley's own test suite. All are on <a href="#/env">Environment &amp; files</a>.</p>
+
+<h2>Alerts</h2>
+<p>Set <code>daemon.alert_webhook</code>, <code>daemon.alert_mail</code> or <code>daemon.events</code> in the configuration file, and the daemon creates a <a href="#/rt/metrics">metrics</a> runtime whose built-in rules raise an alert when, among others:</p>
+<ul>
+<li>a runtime failed, or was started again three times within the hour;</li>
+<li>a certificate a runtime serves expires within two weeks;</li>
+<li>a disk under a storage runtime or the state directory, or the host's memory, is at 90%;</li>
+<li>a mail runtime has a hundred messages waiting.</li>
+</ul>
+<p>The full list, and how to change it with <code>--rules</code>, is under <a href="#/man/dashboard">Dashboard</a>.</p>

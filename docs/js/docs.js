@@ -54,7 +54,7 @@ const NOBENCH = {
 const NAV = [
   ['Start', [['', 'Overview', 'home'], ['install', 'Install', 'download'], ['tour', 'Ten-minute tour', 'rocket'], ['concepts', 'Concepts', 'layers'], ['how', 'How it works', 'flow']]],
   ['Runtimes', RT.map(r => ['rt/' + r[0], r[0], r[0]])],
-  ['Guides', [['lua', 'Lua scripting', 'code'], ['deploy', 'Deployment', 'shield'], ['cluster', 'Cluster', 'nodes'], ['sdk', 'C++ SDK', 'pkg'], ['examples', 'Examples', 'folder']]],
+  ['Guides', [['lua', 'Lua scripting', 'code'], ['deploy', 'Deployment', 'shield'], ['operate', 'Operating it', 'eye'], ['cluster', 'Cluster', 'nodes'], ['sdk', 'C++ SDK', 'pkg'], ['examples', 'Examples', 'folder']]],
   ['Reference', [['cli', 'CLI', 'term'], ['flags', 'All flags', 'list'], ['env', 'Environment & files', 'gear'], ['man', 'Manual', 'book']]],
   ['Performance', [['bench', 'Benchmarks', 'bars']]],
 ];
@@ -576,6 +576,7 @@ const CONTENT = {
   how: ['How it works', 'Start', 'What happens, and where, from the command you type to the answer a client gets.'],
   lua: ['Lua scripting', 'Guide', 'Callbacks per message, connection and request, the runtime methods a script calls, and what a script may not do.'],
   deploy: ['Deployment', 'Guide', 'Running socketley on a machine that matters: the service, permissions, TLS, state, backups and limits.'],
+  operate: ['Operating it', 'Guide', 'Is it running, where the log is, why a runtime failed, and what blocks it.'],
   cluster: ['Cluster', 'Guide', 'Daemons on several machines that see each other\'s runtimes, and the opt-in Raft mode.'],
   sdk: ['C++ SDK', 'Guide', 'Control a daemon, embed the engine, or attach a process of your own to a daemon.'],
   cli: ['CLI', 'Reference', 'Every command socketley takes, with its options.'],

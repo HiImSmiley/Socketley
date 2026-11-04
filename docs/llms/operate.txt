@@ -1,0 +1,78 @@
+# Operating it
+
+Is it running, where the log is, why a runtime failed, and what blocks it.
+
+The day-to-day questions once runtimes are running: is it up, where is the log, why did it fail, what is slow. For the first setup, see [Deployment](deploy.txt).
+
+## Is it running?
+
+| Command | Shows |
+|---|---|
+| `socketley ls` | Every runtime with its state and port. A `failed` runtime shows why. |
+| `socketley ps` | The same with uptime and connections. `(N restarts)` means the worker died and was replaced N times; `NOT RESPONDING` means it is alive but stuck. |
+| `socketley stats name` | Live counters of one runtime: connections, messages, bytes, and its type's own figures. |
+| `socketley daemon stats` | The daemon's own figures. |
+
+## Where the log is
+
+- **Installed:** `journalctl -u socketley`. Every worker's output reaches the daemon, which passes each line on to the journal.
+- **Development:** the terminal where `socketley daemon` runs.
+- **In a browser:** with `daemon.metrics_port` set in the configuration file, the [dashboard](man-dashboard.txt) shows each runtime's own log and a failed runtime's last error.
+
+```
+journalctl -u socketley -f                  # follow it
+journalctl -u socketley --since "10 min ago"
+```
+
+## A runtime failed
+
+1. **Read the reason**: `socketley ls` shows it beside the runtime, and the log has the full line.
+2. **Know which kind it is.** Either the worker could not start (a port in use, an unreadable certificate, a script error), or it died more than five times in ten seconds.
+3. **Fix the cause and start it again.** A failed runtime keeps its configuration; nothing has to be created anew.
+
+   ```
+   socketley start name
+   ```
+
+A worker that crashed loses what it held only in memory. A cache keeps what `--persistent` saved; see [How it works](how.txt).
+
+## `NOT RESPONDING`: a stuck worker
+
+`ps` says this when a worker has said nothing for fifteen seconds while using at least half a core. It is almost always a Lua callback that does not return. Its [deadline](man-lua-configuration.txt) (10 seconds by default) ends the callback; nothing is killed for being slow.
+
+## What blocks a runtime
+
+A worker serves its runtime on one thread. A Lua call that waits for something outside, such as `socketley.http`, either suspends the callback or blocks the whole runtime, depending on where it is made:
+
+| Called from | What a waiting call does |
+|---|---|
+| `on_message`, `on_client_message` | Suspend the callback; the runtime keeps serving everyone else. |
+| The storage hooks, an mcp tool's handler | Suspend the callback, as above. |
+| `on_http_request` | **Block the whole runtime** until the answer arrives or `timeout_ms` (default 5000) runs out. |
+| `on_start`, `on_stop`, timers, filters | Block the whole runtime, as above. Keep such calls to `on_start`, `on_stop` or a rare `on_tick`. |
+
+Other runtimes are not affected: each has its own worker. The full list of calls that can stop a loop is under [What can stop the event loop](man-limitations.txt).
+
+## Settings you may actually change
+
+Every setting has a default that suits a normal deployment. These are the ones worth knowing; set them in the `settings` table of `/etc/socketley/config.lua`, or as environment variables of the service. `socketley settings` lists every one with its value and where it came from.
+
+| Variable | What it changes |
+|---|---|
+| `SOCKETLEY_CPUS` | The CPUs the daemon and its workers may run on. |
+| `SOCKETLEY_LUA_TIMEOUT_MS` | The callback deadline, 10000 ms by default. |
+| `SOCKETLEY_ACME_DIRECTORY` | The ACME CA, for example Let's Encrypt's staging CA while testing. |
+| `SOCKETLEY_PROXY_HTTP2`, `SOCKETLEY_PROXY_HTTP3` | `0` turns HTTP/2 or HTTP/3 off at the entrance. |
+
+The rest are tuning knobs for unusual workloads, and the ones the manual calls test hooks exist for socketley's own test suite. All are on [Environment & files](env.txt).
+
+## Alerts
+
+Set `daemon.alert_webhook`, `daemon.alert_mail` or `daemon.events` in the configuration file, and the daemon creates a [metrics](rt-metrics.txt) runtime whose built-in rules raise an alert when, among others:
+
+- a runtime failed, or was started again three times within the hour;
+- a certificate a runtime serves expires within two weeks;
+- a disk under a storage runtime or the state directory, or the host's memory, is at 90%;
+- a mail runtime has a hundred messages waiting.
+
+The full list, and how to change it with `--rules`, is under [Dashboard](man-dashboard.txt).

@@ -35,6 +35,7 @@ Every page below is plain Markdown. llms-full.txt is all of them in one file (la
 
 - [Lua scripting](llms/lua.txt): Callbacks per message, connection and request, the runtime methods a script calls, and what a script may not do.
 - [Deployment](llms/deploy.txt): Running socketley on a machine that matters: the service, permissions, TLS, state, backups and limits.
+- [Operating it](llms/operate.txt): Is it running, where the log is, why a runtime failed, and what blocks it.
 - [Cluster](llms/cluster.txt): Daemons on several machines that see each other's runtimes, and the opt-in Raft mode.
 - [C++ SDK](llms/sdk.txt): Control a daemon, embed the engine, or attach a process of your own to a daemon.
 - [Examples](llms/examples.txt): Every script and program in examples/ and sdk/examples/.

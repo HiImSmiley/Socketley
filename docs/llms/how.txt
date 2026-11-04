@@ -44,7 +44,7 @@ socketley is one binary. Started as `socketley daemon` it is the **daemon**: a s
    |---|---|
    | `0` | The worker is serving. |
    | `1` | The worker refused, or could not bind, resolve or load its certificate. The reason is in the daemon's log; the runtime is left `failed`, so `ls` still shows it. |
-   | `2` | No answer within two seconds. The runtime stays supervised; `ls` shows the state it settles on. |
+   | `2` | No answer in time: the daemon could not be reached, or the worker said nothing within two seconds. The runtime stays supervised and may still come up; `ls` shows the state it settles on. |
 
 ## The path of a request
 

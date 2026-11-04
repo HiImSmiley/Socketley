@@ -35,7 +35,7 @@
 <table class="kv"><tr><th>Exit</th><th>Meaning</th></tr>
 <tr><td><code>0</code></td><td>The worker is serving.</td></tr>
 <tr><td><code>1</code></td><td>The worker refused, or could not bind, resolve or load its certificate. The reason is in the daemon's log; the runtime is left <code>failed</code>, so <code>ls</code> still shows it.</td></tr>
-<tr><td><code>2</code></td><td>No answer within two seconds. The runtime stays supervised; <code>ls</code> shows the state it settles on.</td></tr></table></li>
+<tr><td><code>2</code></td><td>No answer in time: the daemon could not be reached, or the worker said nothing within two seconds. The runtime stays supervised and may still come up; <code>ls</code> shows the state it settles on.</td></tr></table></li>
 </ol>
 
 <h2>The path of a request</h2>

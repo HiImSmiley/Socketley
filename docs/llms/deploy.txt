@@ -77,6 +77,11 @@ A request now goes browser → entrance on 443 (TLS ends here) → the server `s
    socketley ls
    ```
 3. **Check what it names.** The archive leaves out logs, output files, backup directories and what sync runtimes carry, and `restore` leaves paths under `/etc`, `/usr` and the like for you to take out with `tar`; both commands list these when they finish.
+4. **If the new machine has another public address**, three places still name the old one: the glue at your registrar, the dns runtime's `--publish`, and the zone file it wrote (its `ns1`, `ns2` and the zone's own address, under the state directory's `zones/`). Edit the zone file, then give the runtime the new address:
+
+   ```
+   echo '{"publish":"198.51.100.4"}' | socketley import ns --restart
+   ```
 
 ## Reference
 

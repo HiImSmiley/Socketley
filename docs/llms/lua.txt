@@ -17,7 +17,7 @@ socketley.set_interval(60000, function()
 end)
 ```
 
-> Callbacks run on the runtime's single thread. Inside a callback that can wait, such as `on_message`, `on_client_message` or an [mcp](rt-mcp.txt) tool's handler, `socketley.http` waits without blocking that thread. Anywhere else it blocks the whole runtime until the answer arrives. A callback that never ends is stopped by its [deadline](man-lua-configuration.txt).
+> Callbacks run on the runtime's single thread. Inside a callback that can wait, such as `on_message`, `on_client_message` or an [mcp](rt-mcp.txt) tool's handler, `socketley.http` waits without blocking that thread. Anywhere else, `on_http_request` included, it blocks the whole runtime until the answer arrives; see [what blocks a runtime](operate.txt). A callback that never ends is stopped by its [deadline](man-lua-configuration.txt).
 
 ## Callbacks
 

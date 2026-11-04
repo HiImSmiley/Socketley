@@ -15,4 +15,4 @@ socketley tunnel join https://edge.example.com --http home=127.0.0.1:8123 \
 </div>
 
 <h2>Works with</h2>
-<p>An <a href="#/rt/idp">idp</a> signs people in; the entrance <a href="#/rt/proxy">proxy</a> terminates TLS and the <a href="#/rt/dns">dns</a> runtime answers the services' names.</p>
+<p>The edge machine needs what the <a href="#/deploy">public HTTPS recipe</a> sets up: a <a href="#/rt/dns">dns</a> runtime, which answers the services' names, and its entrance <a href="#/rt/proxy">proxy</a>, which terminates TLS. It also needs an <a href="#/rt/idp">idp</a> runtime, here <code>auth</code>: its admins may join agents, and its users sign in for <code>--forward</code>.</p>
