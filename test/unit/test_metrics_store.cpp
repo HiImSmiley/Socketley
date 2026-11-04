@@ -1164,7 +1164,11 @@ TEST_CASE("store: a window's full pages leave the process, and a read of its las
     INFO("closed about " << closed_kb << " KiB, anonymous memory grew " << anon_kb << " KiB, store RAM "
          << st.bytes_in_ram / 1024 << " KiB, " << st.head_chunks << " closed chunks");
     REQUIRE(st.head_chunks > static_cast<uint64_t>(series) * 10);
+    // The sanitizer's own shadow and quarantine grow the process's anonymous memory beside the store's, so the
+    // process is measured only where its allocator is glibc's; the store's own count holds everywhere.
+#if !defined(__SANITIZE_ADDRESS__)
     CHECK(anon_kb < closed_kb / 8);
+#endif
     CHECK(st.bytes_in_ram < static_cast<uint64_t>(closed_kb) * 1024 / 8);
 
     const long mapped0 = status_kb("RssFile") + status_kb("RssShmem");
@@ -1175,7 +1179,11 @@ TEST_CASE("store: a window's full pages leave the process, and a read of its las
         s.samples(id, T0 + (rounds - 60) * 1000, T0 + rounds * 1000, got);
         REQUIRE(got.size() == 61);
     }
+#if !defined(__SANITIZE_ADDRESS__)
     CHECK(status_kb("RssFile") + status_kb("RssShmem") - mapped0 < closed_kb / 3);
+#else
+    (void)mapped0;
+#endif
     // Every sample is still there, read back from the pages that left.
     got.clear();
     s.samples(ids[17], T0, T0 + rounds * 1000, got);
