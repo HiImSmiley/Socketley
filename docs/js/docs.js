@@ -97,10 +97,16 @@ const fmt = (v, unit) => {
 async function getJSON(u) { const r = await fetch(u); if (!r.ok) throw new Error(u + ': ' + r.status); return r.json(); }
 async function content(p) {
   if (PAGE.has(p)) return PAGE.get(p);
-  const r = await fetch('content/' + p + '.html');
-  const h = r.ok ? await r.text() : '';
-  PAGE.set(p, h);
-  return h;
+  // A fetch that fails (as during a deploy) is tried again once and never remembered as an empty page.
+  for (let k = 0; k < 2; k++) {
+    try {
+      const r = await fetch('content/' + p + '.html', { cache: k ? 'reload' : 'default' });
+      if (r.ok) { const h = await r.text(); PAGE.set(p, h); return h; }
+      if (r.status === 404) return '';
+    } catch (e) {}
+    await new Promise(res => setTimeout(res, 400));
+  }
+  throw new Error('This page could not be loaded; reload to try again.');
 }
 
 // ─── the man page ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -316,10 +322,20 @@ function benchSet(s) {
   const notes = el('details', { class: 'bn' }, el('summary', { text: 'How it was measured' }),
     el('p', { text: [s.tool, s.pin].filter(Boolean).join('; ') + '.' }));
   if (s.note) { const p = el('p'); p.innerHTML = s.note; notes.append(p); }
-  return el('div', { class: 'bset', id: 'bench:' + s.id },
+  // The same rows for a narrow card: one line a server, its ratio beside it.
+  const comp = el('div', { class: 'bcomp' }, s.rows.map(r => el('div', { class: 'br' }, el('div', { class: 'bn2', text: r.name }),
+    el('div', { class: 'bg' }, arms.flatMap((a, k) => {
+      const q = k ? r.r?.[k - 1] : null;
+      const cls = q ? (q[1] > 1 ? 'up' : q[2] < 1 ? 'dn' : 'eq') : '';
+      return [el('span', { class: 'a' + (k ? '' : ' us'), text: short(a) }),
+        el('span', { class: 'v' + (k ? '' : ' us'), text: fmt(r.v[k], r.unit || s.unit) }),
+        el('span', { class: 'q ' + cls, text: q ? q[0].toFixed(2) + '×' : '' }),
+        el('span', { class: 'ci', text: q ? q[1].toFixed(2) + '–' + q[2].toFixed(2) : '' })];
+    })))));
+  return el('div', { class: 'bset' + (arms.length > 2 ? ' a3' : ''), id: 'bench:' + s.id },
     el('h3', {}, el('span', { text: s.title })),
     el('div', { class: 'meta', text: meta.join(' · ') }),
-    el('div', { class: 'mtw' }, el('table', { class: 'btbl' + (arms.length > 2 ? ' a3' : '') }, el('thead', {}, head), el('tbody', {}, body))),
+    el('div', { class: 'mtw' }, el('table', { class: 'btbl' + (arms.length > 2 ? ' a3' : '') }, el('thead', {}, head), el('tbody', {}, body))), comp,
     s.caveat ? el('p', { class: 'cav', text: '⚠ ' + s.caveat[0].toUpperCase() + s.caveat.slice(1) + '.' }) : null,
     notes);
 }
@@ -466,7 +482,7 @@ async function pageRuntime(C, rt, tab) {
   const tabs = TABS.filter(([id]) => id === 'overview' || id === 'flags' || (id === 'benchmarks' && sets.length) || (id === 'more' && subs.length));
   if (tab === 'manual') tab = 'more';
   if (!tabs.some(t => t[0] === tab)) tab = 'overview';
-  C.append(pageHead('Runtime', rt, tab === 'overview' ? '' : r[1], [], rt));
+  C.append(pageHead('Runtime', rt, '', [], rt));
   C.append(el('nav', { class: 'tabs' }, tabs.map(([id, t]) => el('a', { href: '#/rt/' + rt + (id === 'overview' ? '' : '/' + id), class: id === tab ? 'on' : '' },
     t, id === 'flags' ? el('span', { class: 'n', text: flags.length }) : null))));
   const main = el('div', { class: 'main' });
