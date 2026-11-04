@@ -286,9 +286,7 @@ void conn_server::arm_read(const std::shared_ptr<server_conn>& c)
     c->rd.buffer = reinterpret_cast<char*>(c.get());
     c->rd.fd = c->fd;
     c->rd.type = op_read;
-    char* const buf = c->big ? c->big.get() : c->rbuf;
-    const uint32_t len = c->big ? c->big_size : static_cast<uint32_t>(sizeof c->rbuf);
-    c->rd_pending = m_loop.submit_read(c->fd, buf, len, &c->rd);
+    c->rd_pending = m_loop.submit_read(c->fd, c->rbuf.data(), c->rbuf.size(), &c->rd);
     if (!c->rd_pending)
         close_conn(c);
 }
@@ -312,14 +310,8 @@ void conn_server::read_done(const std::shared_ptr<server_conn>& c, int res)
         return;
     }
     c->last = wall::now_sec_coarse();
-    const uint32_t len = c->big ? c->big_size : static_cast<uint32_t>(sizeof c->rbuf);
-    c->in.append(c->big ? c->big.get() : c->rbuf, static_cast<size_t>(res));
-    // A read that filled its buffer says more was waiting: the next one takes four times as much.
-    if (static_cast<uint32_t>(res) == len && len < read_max)
-    {
-        c->big_size = std::min<uint32_t>(len * 4, read_max);
-        c->big = std::make_unique_for_overwrite<char[]>(c->big_size);
-    }
+    c->in.append(c->rbuf.data(), static_cast<size_t>(res));
+    c->rbuf.took(static_cast<size_t>(res));
     runtime_instance::stat_add(m_rt.m_stat_bytes_in, static_cast<uint64_t>(res));
     m_hooks.serve(c);
     flush(c);

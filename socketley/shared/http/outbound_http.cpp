@@ -34,7 +34,6 @@ namespace
 
 // The most of an answer that is kept, which is a status, its headers and a small XML document.
 constexpr size_t answer_cap = 1u << 20;
-constexpr uint32_t read_bytes = 16 * 1024;
 // The most plaintext handed to the record layer at once.
 constexpr size_t tls_piece = 1u << 20;
 // A file body over this moves a TLS connection's send key to the kernel and goes by sendfile, as a server's file does.
@@ -777,11 +776,18 @@ void http_peer::send(std::shared_ptr<std::string> bytes, size_t off)
 
 void http_peer::receive()
 {
-    // A buffer per read, held by its completion, so a read the end of an exchange left in the ring writes nowhere shared.
-    std::shared_ptr<char[]> buf(new char[read_bytes]);
+    // A buffer held by the read's completion, so a read the end of an exchange left in the ring writes nowhere shared;
+    // the last one again when nothing holds it, so a stream is not a fresh allocation every read.
+    const uint32_t want = m_read.next();
+    if (!m_rbuf || m_rbuf.use_count() > 1 || m_rbuf_size != want)
+    {
+        m_rbuf = std::shared_ptr<char[]>(new char[want]);
+        m_rbuf_size = want;
+    }
+    std::shared_ptr<char[]> buf = m_rbuf;
     const uint64_t gen = m_gen;
     auto alive = m_alive;
-    if (!m_io.pread(m_fd, buf.get(), read_bytes, file_io::at_stream, [this, alive, gen, buf](int64_t res)
+    if (!m_io.pread(m_fd, buf.get(), want, file_io::at_stream, [this, alive, gen, buf](int64_t res)
         {
             if (!*alive || m_gen != gen)
                 return;
@@ -792,6 +798,7 @@ void http_peer::receive()
                 finish(true);
                 return;
             }
+            m_read.took(static_cast<size_t>(res));
             got(buf.get(), static_cast<size_t>(res));
         }))
         finish(false, "the ring is full");

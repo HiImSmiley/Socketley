@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 
 #include "../loop/event_loop.h"
+#include "../net/read_buffer.h"
 #include "../loop/event_loop_definitions.h"
 
 class runtime_instance;
@@ -42,12 +43,8 @@ struct server_conn
     std::string sending;
     size_t sent{0};
     int64_t last{0};
-    char rbuf[16384];
-    // A connection whose reads fill rbuf reads into this instead, four times larger each time one fills it, up to
-    // conn_server::read_max: one that carries a stream is woken a sixteenth as often, one that asks small things never
-    // holds more than rbuf.
-    std::unique_ptr<char[]> big;
-    uint32_t big_size{0};
+    // 16 KiB a read, growing to 256 KiB for a connection that streams (shared/net/read_buffer.h).
+    socketley::read_buffer<16384> rbuf;
 
     // The bytes answered and not yet gone, in flight or after it.
     size_t unsent() const { return sending.size() - sent + out.size(); }
@@ -89,8 +86,6 @@ class conn_server
 public:
     // What may be owed to one client before its next request waits for it to read.
     static constexpr size_t out_max = 1u << 20;
-    // The most one read takes off a connection.
-    static constexpr uint32_t read_max = 256 * 1024;
     conn_server(event_loop& loop, io_handler* owner, runtime_instance& rt, conn_hooks& hooks, size_t max_conns);
 
     // The port on `addr` (network order), every shard's at once when `shared`; -1 with `why` when it cannot be.

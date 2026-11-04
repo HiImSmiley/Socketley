@@ -23,6 +23,7 @@
 
 #include <sys/types.h>
 
+#include "../../shared/net/read_buffer.h"
 #include "sync_runners.h"
 #include "body_reader.h"
 #include "exif.h"
@@ -450,6 +451,11 @@ struct conn
     // Read into by a recv the ring could not serve, and only then allocated.
     std::unique_ptr<char[]> fbuf;
     bool        rd_fallback{false};
+    // A TLS body's ciphertext, 16 KiB a read and growing while it streams (shared/net/read_buffer.h): the ring's 16 KiB
+    // buffers took one recv, one wakeup and one record per read; the last read's size is told to it at the next arm.
+    socketley::read_buffer<16384> tls_rbuf;
+    uint32_t    tls_last{0};
+    bool        rd_tls{false};
 
     phase       ph{phase::head};
     // Bytes read and not yet consumed: a head being assembled, or the start of
@@ -757,6 +763,8 @@ public:
         uint32_t len{0};
         bool     direct{false};
         bool     hook{false};
+        // A TLS body's ciphertext, read into the connection's own growing buffer.
+        bool     tls{false};
     };
     read_plan plan_read(const conn& c) const;
     // Withdraws the recv that is armed, whose last completion says -ECANCELED.

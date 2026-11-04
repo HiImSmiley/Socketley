@@ -6,6 +6,7 @@
 #include "cli.h"
 
 #include <cctype>
+#include <chrono>
 #include <charconv>
 #include <ctime>
 #include <map>
@@ -27,6 +28,8 @@
 #include <openssl/x509v3.h>
 
 #include "../shared/loop/blocking_write.h"
+#include "../shared/net/read_buffer.h"
+#include "../shared/net/socket_tuning.h"
 #include "../shared/util/duration_parse.h"
 #include "../shared/persist/paths.h"
 #include "../shared/util/ascii.h"
@@ -88,7 +91,8 @@ struct conn
             return n;
         return SSL_get_error(ssl, n) == SSL_ERROR_ZERO_RETURN ? 0 : -1;
     }
-    bool pending() const { return ssl && SSL_pending(ssl) > 0; }
+    // Whether OpenSSL holds bytes poll() cannot see: with read-ahead, records already off the socket.
+    bool pending() const { return ssl && SSL_has_pending(ssl) == 1; }
 };
 
 bool dial(conn& c, const std::string& host, const std::string& port, bool tls, std::string& err)
@@ -125,6 +129,8 @@ bool dial(conn& c, const std::string& host, const std::string& port, bool tls, s
     }
     SSL_CTX_set_verify(c.ctx, SSL_VERIFY_PEER, nullptr);
     c.ssl = SSL_new(c.ctx);
+    // A record in one recv rather than its header and its body in two.
+    SSL_set_read_ahead(c.ssl, 1);
     SSL_set_fd(c.ssl, c.fd);
     SSL_set_tlsext_host_name(c.ssl, host.c_str());
     SSL_set1_host(c.ssl, host.c_str());
@@ -138,11 +144,21 @@ bool dial(conn& c, const std::string& host, const std::string& port, bool tls, s
     return true;
 }
 
+// Credit back for `n` bytes delivered, with the time and the link's round trip that let the window grow, as an edge's
+// and an agent's do; without them it stayed at its first 256 KiB.
+void give_credit(tn::session& s, uint32_t id, size_t n, std::string& out, int link_fd)
+{
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    s.consumed(id, n, out, static_cast<uint64_t>(now), socket_tuning::rtt_us(link_fd));
+}
+
 // What the edge says on the stream, written to stdout, and whether it has finished.
 struct pipe_events : tn::events
 {
     tn::session* s{nullptr};
     std::string* out{nullptr};
+    int link_fd{-1};
     uint32_t stream{0};
     bool far_closed{false};
     bool gone{false};
@@ -159,7 +175,7 @@ struct pipe_events : tn::events
             gone = true;
             return;
         }
-        s->consumed(id, bytes.size(), *out);
+        give_credit(*s, id, bytes.size(), *out, link_fd);
     }
     void on_close(uint32_t id) override { far_closed = far_closed || id == stream; }
     void on_reset(uint32_t id, tn::reset_code code) override
@@ -341,12 +357,14 @@ int connect_main(const std::string& edge, const std::string& target, std::string
     std::string head, leftover;
     if (const int rc = open_link(ea, token, {}, c, head, leftover); rc != 0)
         return rc;
-    char buf[16384];
+    // The edge's side and stdin's, each read in what its traffic asks for (shared/net/read_buffer.h).
+    socketley::read_buffer<16384> rb, lb;
     pipe_events ev;
     tn::session s(true, ev);
     std::string out;
     ev.s = &s;
     ev.out = &out;
+    ev.link_fd = c.fd;
     s.hello({{"person", std::string(socketley::idp::cli_client)}}, out);
     ev.stream = s.open(target, {}, out);
     if (!leftover.empty() && !s.feed(leftover, out))
@@ -373,14 +391,16 @@ int connect_main(const std::string& edge, const std::string& target, std::string
             return 2;
         if (c.pending() || (p[0].revents & (POLLIN | POLLHUP | POLLERR)))
         {
-            const ssize_t n = c.read(buf, sizeof buf);
+            const ssize_t n = c.read(rb.data(), rb.size());
             if (n <= 0)
             {
                 if (!ev.far_closed)
                     std::cerr << "the edge closed the connection\n";
                 return ev.far_closed ? 0 : 2;
             }
-            if (!s.feed(std::string_view(buf, static_cast<size_t>(n)), out))
+            const bool fed = s.feed(std::string_view(rb.data(), static_cast<size_t>(n)), out);
+            rb.took(static_cast<size_t>(n));
+            if (!fed)
             {
                 std::cerr << "the edge broke the protocol: " << s.error() << "\n";
                 return 2;
@@ -388,10 +408,13 @@ int connect_main(const std::string& edge, const std::string& target, std::string
         }
         if (want_stdin && (p[1].revents & (POLLIN | POLLHUP)))
         {
-            const size_t room = std::min<size_t>(sizeof buf, s.credit(ev.stream));
-            const ssize_t n = ::read(0, buf, room);
+            const size_t room = std::min<size_t>(lb.size(), s.credit(ev.stream));
+            const ssize_t n = ::read(0, lb.data(), room);
             if (n > 0)
-                s.send(ev.stream, std::string_view(buf, static_cast<size_t>(n)), out);
+            {
+                s.send(ev.stream, std::string_view(lb.data(), static_cast<size_t>(n)), out);
+                lb.took(static_cast<size_t>(n));
+            }
             else if (n == 0 || (n < 0 && errno != EINTR))
             {
                 stdin_open = false;
@@ -587,7 +610,8 @@ int share_main(const std::string& edge, const std::string& target, bool open, ui
         std::cerr << "the edge broke the protocol: " << s.error() << "\n";
         return 2;
     }
-    char buf[16384];
+    // The edge's side and the ports', each read in what its traffic asks for (shared/net/read_buffer.h).
+    socketley::read_buffer<16384> rb, lb;
     std::vector<pollfd> p;
     std::vector<uint32_t> ids;
     while (!ev.gone)
@@ -615,13 +639,15 @@ int share_main(const std::string& edge, const std::string& target, bool open, ui
             return 2;
         if (c.pending() || (p[0].revents & (POLLIN | POLLHUP | POLLERR)))
         {
-            const ssize_t n = c.read(buf, sizeof buf);
+            const ssize_t n = c.read(rb.data(), rb.size());
             if (n <= 0)
             {
                 std::cerr << "the edge closed the connection\n";
                 return 2;
             }
-            if (!s.feed(std::string_view(buf, static_cast<size_t>(n)), out))
+            const bool fed = s.feed(std::string_view(rb.data(), static_cast<size_t>(n)), out);
+            rb.took(static_cast<size_t>(n));
+            if (!fed)
             {
                 std::cerr << "the edge broke the protocol: " << s.error() << "\n";
                 return 2;
@@ -660,7 +686,7 @@ int share_main(const std::string& edge, const std::string& target, bool open, ui
                 if (n > 0)
                 {
                     g.to_port.erase(0, static_cast<size_t>(n));
-                    s.consumed(id, static_cast<size_t>(n), out);
+                    give_credit(s, id, static_cast<size_t>(n), out, c.fd);
                 }
             }
             if (g.far_closed && g.to_port.empty() && !g.wr_shut)
@@ -670,9 +696,12 @@ int share_main(const std::string& edge, const std::string& target, bool open, ui
             }
             if ((r & (POLLIN | POLLHUP | POLLERR)) && !g.rd_closed && s.credit(id) > 0)
             {
-                const ssize_t n = ::recv(g.fd, buf, std::min<size_t>(sizeof buf, s.credit(id)), 0);
+                const ssize_t n = ::recv(g.fd, lb.data(), std::min<size_t>(lb.size(), s.credit(id)), 0);
                 if (n > 0)
-                    s.send(id, std::string_view(buf, static_cast<size_t>(n)), out);
+                {
+                    s.send(id, std::string_view(lb.data(), static_cast<size_t>(n)), out);
+                    lb.took(static_cast<size_t>(n));
+                }
                 else if (n == 0)
                 {
                     s.close(id, out);

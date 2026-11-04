@@ -1,3 +1,4 @@
+#include "../net/read_buffer.h"
 #include "https_client.h"
 
 #include <arpa/inet.h>
@@ -231,6 +232,10 @@ int client::dial(const std::string& url, std::string& path, std::string& hostpor
     if (tls)
     {
         ssl = SSL_new(m_ctx);
+        // A record in one recv rather than its header and its body in two; every read here blocks, so nothing waits on
+        // a poll() for bytes OpenSSL already holds.
+        if (ssl)
+            SSL_set_read_ahead(ssl, 1);
         if (!ssl || SSL_set_fd(ssl, fd) != 1 || !tls_context::pin_peer_name(ssl, host))
         {
             err = "TLS to " + hostport + " could not be set up to check the name " + host;
@@ -300,8 +305,14 @@ bool client::request(std::string_view method, const std::string& url, std::strin
         err = "sending to " + hostport + " failed";
     std::string raw;
     bool whole = false;
+    // 16 KiB a read, growing while an answer streams (shared/net/read_buffer.h), sized before each read.
+    socketley::read_buffer<16384> rb;
+    size_t last = 0;
     while (ok)
     {
+        if (last)
+            rb.took(last);
+        last = 0;
         const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now());
         if (left.count() <= 0)
         {
@@ -311,11 +322,12 @@ bool client::request(std::string_view method, const std::string& url, std::strin
         }
         timeval tv{static_cast<time_t>(left.count() / 1000000), static_cast<suseconds_t>(left.count() % 1000000)};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        char buf[16384];
-        const int n = ssl ? SSL_read(ssl, buf, sizeof buf) : static_cast<int>(::recv(fd, buf, sizeof buf, 0));
+        const int n = ssl ? SSL_read(ssl, rb.data(), static_cast<int>(rb.size()))
+                          : static_cast<int>(::recv(fd, rb.data(), rb.size(), 0));
         if (n > 0)
         {
-            raw.append(buf, static_cast<size_t>(n));
+            last = static_cast<size_t>(n);
+            raw.append(rb.data(), static_cast<size_t>(n));
             // The head is allowed its own 16 KiB beside the body's bound.
             if (max_bytes && raw.size() > max_bytes + (16u << 10))
             {
@@ -358,10 +370,18 @@ bool client::stream(const std::string& url, const std::vector<std::pair<std::str
     bool head_done = false, chunked = false, closed = false;
     // A chunked body's state, across reads.
     http_chunked_decoder dechunk;
+    socketley::read_buffer<16384> rb;
+    size_t last = 0;
     while (ok)
     {
-        char buf[16384];
-        const int n = ssl ? SSL_read(ssl, buf, sizeof buf) : static_cast<int>(::recv(fd, buf, sizeof buf, 0));
+        if (last)
+            rb.took(last);
+        last = 0;
+        const int n = ssl ? SSL_read(ssl, rb.data(), static_cast<int>(rb.size()))
+                          : static_cast<int>(::recv(fd, rb.data(), rb.size(), 0));
+        if (n > 0)
+            last = static_cast<size_t>(n);
+        char* const buf = rb.data();
         if (n <= 0)
         {
             const bool timed_out = ssl ? (SSL_get_error(ssl, n) == SSL_ERROR_WANT_READ ||

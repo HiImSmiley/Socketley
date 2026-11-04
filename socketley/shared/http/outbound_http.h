@@ -16,6 +16,7 @@
 #include "../loop/file_io.h"
 #include "../loop/hash_pool.h"
 #include "../net/endpoint.h"
+#include "../net/read_buffer.h"
 #include "../crypto/tls_context.h"
 #include "http_url.h"
 
@@ -215,6 +216,10 @@ private:
     // The host closed the connection, which then carries no further exchange.
     bool        m_eof{false};
     std::string m_in;
+    // How much the next read takes, and the buffer it takes it into, reused once no read in flight holds it.
+    socketley::read_size m_read{16 * 1024, 256 * 1024};
+    std::shared_ptr<char[]> m_rbuf;
+    uint32_t m_rbuf_size{0};
     // Where the answer's head ends in m_in once found, so each read does not search it from the start again.
     mutable size_t m_head_end = std::string::npos;
     std::chrono::steady_clock::time_point m_deadline{};

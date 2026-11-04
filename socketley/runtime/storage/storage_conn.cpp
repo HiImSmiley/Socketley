@@ -838,6 +838,11 @@ storage_run::read_plan storage_run::plan_read(const conn& c) const
                 // takes is what the session decrypted.
                 if (c.park_off < c.park.size())
                     p.k = read_plan::kind::none;   // waiting for the put to take what is parked
+                else
+                {
+                    p.k   = read_plan::kind::own;
+                    p.tls = true;
+                }
             }
             else if (!c.hook && !c.req.chunked && c.put && !c.put->failed() && c.put_failed == st::ok &&
                      c.body_left >= direct_min)
@@ -974,6 +979,16 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
     c->pace_due  = false;
     c->rd_direct = plan.direct;
     c->rd_hook   = plan.hook;
+    c->rd_tls    = plan.tls;
+    if (plan.tls)
+    {
+        // Sized by the read before it, now that none is in flight.
+        if (c->tls_last)
+            c->tls_rbuf.took(c->tls_last);
+        c->tls_last = 0;
+        plan.buf = c->tls_rbuf.data();
+        plan.len = c->tls_rbuf.size();
+    }
     c->rd_multi  = false;
     c->rd_cancel = false;
     if (plan.hook)
@@ -1107,6 +1122,12 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
         data = m_loop.get_buf_ptr(ring_group, lend.id);
     else if (lend.own)
         data = lend.own.get();
+    else if (c->rd_tls)
+    {
+        data = c->tls_rbuf.data();
+        c->tls_last = static_cast<uint32_t>(n);
+        c->rd_tls = false;
+    }
 
     if (c->rd_direct || c->rd_hook)
     {
