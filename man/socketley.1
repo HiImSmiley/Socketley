@@ -6407,9 +6407,15 @@ These happen at the
 .B start
 that forks the worker, and that command reports any refusal.
 .SS Process Isolation
-Every runtime runs in its own supervised worker process.
+Every runtime made with
+.B create
+or restored at boot runs in its own supervised worker process.
 There is no flag for this and nothing to configure: servers, clients, proxies
 and caches all run this way.
+The one exception is a runtime that a script makes with
+.BR socketley.create :
+a server, client, proxy, cache, storage or dns runtime made that way runs in the
+daemon.
 .PP
 A configuration file that contains
 .B daemon_process
@@ -25394,8 +25400,14 @@ So the pages are the kernel's own, for the 1.7 GB a second it puts on the
 wire. The malloc and free around each file buffer are served from the heap and
 never reach the kernel.
 .SS Out\-of\-process runtimes
-Every runtime, of any type, runs in its own supervised worker process.
-There is no alternative and no flag to ask for one.
+Every runtime made with
+.B create
+or restored at boot, of any type, runs in its own supervised worker process.
+There is no flag to keep one in the daemon.
+Only a server, client, proxy, cache, storage or dns runtime that a script makes
+with
+.B socketley.create
+runs in the daemon.
 This section states plainly what that costs.
 .PP
 .B "The script runs in the worker and nowhere else."
