@@ -294,9 +294,18 @@ void conn_server::arm_read(const std::shared_ptr<server_conn>& c)
 void conn_server::read_done(const std::shared_ptr<server_conn>& c, int res)
 {
     c->rd_pending = false;
+    const bool trimmed = c->trimming;
+    c->trimming = false;
     if (c->dead)
     {
         forget_if_idle(c);
+        return;
+    }
+    // Withdrawn by trim(): armed again on the first read size, with nothing lost, since nothing was read.
+    if (trimmed && res == -ECANCELED)
+    {
+        c->rbuf.reset();
+        arm_read(c);
         return;
     }
     if (res == 0 && m_hooks.read_ended(c))
@@ -460,8 +469,34 @@ void conn_server::close_conn(const std::shared_ptr<server_conn>& c)
     resume_accept();
 }
 
+void conn_server::trim(int64_t now, int64_t quiet_secs)
+{
+    // What a connection keeps past a burst and before the next: more than this is given back.
+    constexpr size_t keep = 64 * 1024;
+    for (auto& [id, c] : m_conns)
+    {
+        if (c->dead || now - c->last < quiet_secs)
+            continue;
+        if (c->in.empty() && c->in.capacity() > keep)
+            std::string().swap(c->in);
+        if (!c->wr_pending && c->unsent() == 0)
+        {
+            if (c->sending.capacity() > keep)
+            {
+                std::string().swap(c->sending);
+                c->sent = 0;
+            }
+            if (c->out.capacity() > keep)
+                std::string().swap(c->out);
+        }
+        if (c->rd_pending && !c->trimming && c->rbuf.size() > 16384 && m_loop.submit_cancel_request(&c->rd))
+            c->trimming = true;
+    }
+}
+
 void conn_server::sweep(int64_t now, int64_t idle_secs)
 {
+    trim(now);
     std::vector<std::shared_ptr<server_conn>> idle;
     // Idle with nothing owed, or owed answers the client has not read a byte of for as long.
     for (auto& [id, c] : m_conns)

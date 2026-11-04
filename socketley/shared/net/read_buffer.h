@@ -18,6 +18,11 @@ public:
 
     uint32_t next() const { return m_size; }
     uint32_t first() const { return m_first; }
+    void reset()
+    {
+        m_size = m_first;
+        m_small = 0;
+    }
 
     // After a read that took `n` of next(): a full one grows the next, and a long run of small ones goes back to the
     // first size, so a connection that streamed once does not keep its large buffer for the rest of its life.
@@ -52,6 +57,14 @@ class read_buffer
 public:
     char* data() { return m_size.next() == First ? m_small : m_big.get(); }
     uint32_t size() const { return m_size.next(); }
+
+    // Back to the first size and its heap given back, for a connection gone quiet; only with no read in flight.
+    void reset()
+    {
+        m_size.reset();
+        m_big.reset();
+        m_big_size = 0;
+    }
 
     void took(size_t n)
     {

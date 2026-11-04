@@ -34,6 +34,8 @@ struct server_conn
     bool waiting{false};
     // Nothing is read while more than conn_server::out_max is owed to the client; its going takes reading up again.
     bool held{false};
+    // Its read was withdrawn by trim(), to be armed again on the first read size.
+    bool trimming{false};
     bool keep_alive{true};
     std::string in;
     // What the runtime has answered and is not yet going out; it appends here at any time.
@@ -116,8 +118,12 @@ public:
     // A connection whose answer waited takes up its requests again.
     void resume(const std::shared_ptr<server_conn>& c);
     void close_conn(const std::shared_ptr<server_conn>& c);
-    // Those with nothing to do for longer than `idle_secs` closed.
+    // Those with nothing to do for longer than `idle_secs` closed, and the rest trimmed.
     void sweep(int64_t now, int64_t idle_secs);
+    // What a burst left in each connection quiet for `quiet_secs`, given back: the capacity its strings kept, and a
+    // read buffer that grew, whose standing read is withdrawn and armed again on 16 KiB.  Measured on a tunnel: 856
+    // KiB per connection, held for good, after each of 500 connections had carried 4 MiB.
+    void trim(int64_t now, int64_t quiet_secs = 5);
     // The accept again, once one that ran out of descriptors may succeed.
     void resume_accept();
 

@@ -629,6 +629,15 @@ void tunnel_run::tick()
     }
     else if (m_up->srv.empty() && now >= m_next_dial)
         dial_edge();
+    // The legs keep their streams open, so no sweep closes them; what a burst left in a quiet one is given back.
+    for (auto& [name, h] : m_listeners)
+        h->srv.trim(now);
+    if (m_dial)
+        m_dial->srv.trim(now);
+    if (m_local)
+        m_local->srv.trim(now);
+    if (m_up)
+        m_up->srv.trim(now);
     tend_udp(now);
     arm_tick();
 }
