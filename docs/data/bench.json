@@ -1411,29 +1411,29 @@
     "frp 0.71.1"
    ],
    "tool": "tb_client, one connection",
-   "commit": "c7d4c42b",
-   "passes": 9,
-   "date": "2026-11-03",
+   "commit": "1bcbfed4",
+   "passes": 5,
+   "date": "2026-11-04",
    "rows": [
     {
      "name": "round trip through the tunnel, 64 B echo",
      "v": [
-      88.5,
-      168.0
+      35.8,
+      74.3
      ],
      "cpu": [
-      0.868,
-      1.348
+      0.847,
+      1.253
      ],
      "ccpu": [
-      0.169,
-      0.093
+      0.178,
+      0.111
      ],
      "r": [
       [
-       1.898,
-       1.881,
-       1.91
+       2.084,
+       2.05,
+       2.279
       ]
      ],
      "unit": "µs",
@@ -1442,22 +1442,22 @@
     {
      "name": "throughput, 512 MiB echoed through the tunnel",
      "v": [
-      649.0,
-      855.0
+      1688.0,
+      680.0
      ],
      "cpu": [
-      1.917,
-      1.841
+      1.901,
+      1.857
      ],
      "ccpu": [
-      0.622,
-      0.308
+      0.585,
+      0.296
      ],
      "r": [
       [
-       0.758,
-       0.718,
-       0.825
+       2.518,
+       2.439,
+       2.607
       ]
      ],
      "unit": "MiB/s",
@@ -1467,7 +1467,7 @@
    "unit": "MiB/s",
    "better": "higher",
    "pin": "agent and edge (frpc and frps) on the same two cores, the echo service on a third",
-   "note": "socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in about half frp's time and moves bulk data at three quarters of its rate.",
+   "note": "socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in half frp's time and moves bulk data at two and a half times its rate. This set was measured on a 16-core development machine, not the box above, until the next round there.",
    "headline": 1
   },
   {

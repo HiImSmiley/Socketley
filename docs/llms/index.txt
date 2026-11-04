@@ -45,7 +45,7 @@ Each runtime's headline result against the server people run instead; method and
 - mqtt: 21.2× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
 - storage: 12.0× against MinIO (GET 4 KiB, 4 × 16 connections) (caveat: a floor: the load generator ran out before socketley did)
 - db: 2.5× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
-- tunnel: 0.8× against frp (throughput, 512 MiB echoed through the tunnel)
+- tunnel: 2.5× against frp (throughput, 512 MiB echoed through the tunnel)
 - metrics: 2.7× against Prometheus (CPU per sample ingested)
 - idp: 19.9× against Keycloak (refresh token, 64 clients) (caveat: a floor: the load generator ran out before socketley did)
 
