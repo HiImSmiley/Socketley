@@ -220,6 +220,7 @@ public:
         if (!req)
             return;
 
+        ++m_activity;
         if (m_writer.owns_request(req))
         {
             m_writer.on_send_cqe(cqe->res);
@@ -232,6 +233,7 @@ public:
             return;
 
         m_armed = false;
+        const bool trimmed = std::exchange(m_trimming, false);
         if (m_dead)
             return;
 
@@ -260,6 +262,14 @@ public:
             return;
         }
 
+        // Withdrawn by trim(): pump() arms it again on the first read size, with nothing lost, since nothing was read.
+        if (trimmed && res == -ECANCELED)
+        {
+            m_rsize = first_read_bytes;
+            m_rbuf  = std::make_unique<char[]>(m_rsize);
+            return;
+        }
+
         // Nothing arrived and nothing is wrong, since -ECANCELED is this ring
         // going down or close_fd() withdrawing the arm.
         if (res == -EAGAIN || res == -EWOULDBLOCK || res == -EINTR ||
@@ -284,13 +294,42 @@ public:
 
     // A link's unexpected end said once it has stayed unexplained past the grace, since the daemon tells every
     // shard to stop in one turn and a sibling can be gone before this one has read that it is going too.
-    void settle(std::chrono::steady_clock::time_point now)
+    // True when it gave back what a burst grew, which the owner's figures then say.
+    bool settle(std::chrono::steady_clock::time_point now)
     {
         if (!m_held_warning.empty() && now - m_held_at >= peer_exit_grace)
         {
             LOG_WARN(m_held_warning.c_str());
             m_held_warning.clear();
         }
+        if (m_activity != m_activity_seen)
+        {
+            m_activity_seen = m_activity;
+            m_quiet_since   = now;
+            m_trimmed       = false;
+        }
+        else if (!m_trimmed && now - m_quiet_since >= quiet_trim)
+        {
+            const bool grown_before = grown();
+            trim();
+            return grown_before;
+        }
+        return false;
+    }
+
+    // How long the owner's loop may sleep before trim() is due, or -1 when nothing a burst grew is waiting for it.
+    int trim_due_ms(std::chrono::steady_clock::time_point now) const
+    {
+        if (m_trimmed || m_dead || !grown())
+            return -1;
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(m_quiet_since + quiet_trim - now);
+        return left.count() <= 0 ? 0 : static_cast<int>(left.count()) + 1;
+    }
+
+    // What the link's buffers hold, in capacity, which a burst grows and a quiet link gives back.
+    size_t held() const
+    {
+        return m_rsize + m_in.capacity() + m_walk.capacity() + m_part.capacity() + m_writer.capacity();
     }
 
     // ── Once per turn of the owner's loop ───────────────────────────────────
@@ -380,6 +419,30 @@ private:
 
     // One frame of `size` bytes onto the link, in pieces when it is past what a reader takes as one: a sibling's
     // answer of large values is as long as the values, and a single shard writes such an answer to its client whole.
+    // What a burst grew, given back once the link has been quiet for quiet_trim, as a conn_server connection does:
+    // strings past 64 KiB of capacity once nothing is owed, and a grown read buffer by withdrawing its standing read.
+    static constexpr size_t keep = 64 * 1024;
+
+    bool grown() const
+    {
+        return m_rsize > first_read_bytes || m_in.capacity() > keep || m_walk.capacity() > keep ||
+               m_writer.capacity() > 2 * keep;
+    }
+
+    void trim()
+    {
+        m_trimmed = true;
+        if (m_dead || m_taking)
+            return;
+        m_writer.trim(keep);
+        if (m_in.empty() && m_in.capacity() > keep)
+            std::string().swap(m_in);
+        if (m_walk.capacity() > keep)
+            std::string().swap(m_walk);
+        if (m_armed && !m_trimming && m_rsize > first_read_bytes && m_loop && m_loop->submit_cancel_request(&m_req))
+            m_trimming = true;
+    }
+
     template <class Fill>
     bool put(size_t size, Fill&& fill)
     {
@@ -430,29 +493,44 @@ private:
         worker_proto::frame_type type{};
         uint16_t                 ver = 0;
         std::string_view         view;
-        std::string              payload;
         bool                     fatal = false;
-        size_t                   off   = 0;
 
-        while (worker_proto::peek_frame(m_in, off, type, ver, view, fatal))
+        for (;;)
         {
-            // Copied, since handle() may append to m_in and move what view points at.
-            payload.assign(view.data(), view.size());
-            handle(type, payload);
-            if (m_dead)
+            // Walked out of a buffer of its own, so handle() reads each frame in place: a turn of the loop inside it
+            // appends to m_in, which cannot move what the walk is reading.
+            m_walk.clear();
+            m_walk.swap(m_in);
+            size_t off = 0;
+            while (worker_proto::peek_frame(m_walk, off, type, ver, view, fatal))
             {
-                m_taking = false;
-                return;    // handle() gave up on the link; m_in goes with it
+                handle(type, view);
+                if (m_dead)
+                {
+                    m_taking = false;
+                    return;    // handle() gave up on the link; m_in goes with it
+                }
             }
+            m_walk.erase(0, off);
+            // Nothing came in during the walk, so what is left is the start of a frame still on its way.
+            if (m_in.empty())
+            {
+                m_in.swap(m_walk);
+                break;
+            }
+            // What the walk left goes back ahead of what came in during it, and both are walked again.
+            m_walk.append(m_in);
+            m_in.swap(m_walk);
+            if (fatal)
+                break;
         }
-        m_in.erase(0, off);
         m_taking = false;
 
         if (fatal)
             die("a sibling sent a frame this build cannot read");
     }
 
-    void handle(worker_proto::frame_type type, const std::string& payload)
+    void handle(worker_proto::frame_type type, std::string_view payload)
     {
         // Two frame types and no others, where a chan_req's ticket belongs to
         // the sibling and a chan_rep's to this process, so the two spaces
@@ -499,7 +577,7 @@ private:
         }
         if (type == worker_proto::frame_type::mesh_part && !payload.empty())
         {
-            m_part.append(payload, 1, std::string::npos);
+            m_part.append(payload.substr(1));
             if (m_part.size() > BACKLOG)
             {
                 die("a sibling sent more of one frame than a link holds");
@@ -588,10 +666,22 @@ private:
     // many queued, one read already drains many frames.
     //
     // Doubled whenever a read fills it, since one recv a turn would otherwise hold a streaming link to 16 KiB a turn.
+    static constexpr size_t first_read_bytes = 16 * 1024;
     static constexpr size_t max_read_bytes = 256 * 1024;
-    size_t                  m_rsize{16 * 1024};
-    std::unique_ptr<char[]> m_rbuf{std::make_unique<char[]>(16 * 1024)};
+    size_t                  m_rsize{first_read_bytes};
+    std::unique_ptr<char[]> m_rbuf{std::make_unique<char[]>(first_read_bytes)};
     std::string m_in;
+    // The bytes take_frames() is walking, swapped out of m_in so a nested read cannot move them.
+    std::string m_walk;
+
+    // Completions seen, and the turn the count last moved, so settle() can tell a quiet link from a busy one.
+    static constexpr std::chrono::seconds quiet_trim{5};
+    uint64_t    m_activity{0};
+    uint64_t    m_activity_seen{0};
+    std::chrono::steady_clock::time_point m_quiet_since{};
+    bool        m_trimmed{false};
+    // A standing recv withdrawn by trim(), whose -ECANCELED shrinks the buffer instead of meaning the ring is going.
+    bool        m_trimming{false};
 
     std::unordered_set<uint64_t> m_owed;
 };

@@ -364,6 +364,9 @@ public:
                 for_each_link([&](shard_link& link) {
                     if (link.needs_wake())
                         wait_ms = std::min(wait_ms, ctl_fallback_ms);
+                    // A link that a burst grew is woken for when it has been quiet long enough to give that back.
+                    if (const int due = link.trim_due_ms(now); due >= 0)
+                        wait_ms = std::min(wait_ms, due);
                 });
 
                 // The turn did something exactly when the ring delivered
@@ -418,7 +421,8 @@ public:
             // unconditional, since a dying link still owes what it has queued.
             for_each_link([&](shard_link& link) {
                 link.pump();
-                link.settle(now);
+                if (link.settle(now))
+                    stats_dirty = true;
             });
             if (m_link_recv)
                 m_link_recv->pump();
@@ -632,6 +636,10 @@ private:
             s.detail += "mesh_links:"   + std::to_string(m_mesh_sinks.size()) + "\n";
             s.detail += "mesh_direct:"  + std::to_string(direct)  + "\n";
             s.detail += "mesh_relayed:" + std::to_string(relayed) + "\n";
+            size_t held = 0;
+            for (const auto& link : m_mesh_links)
+                held += link->held();
+            s.detail += "mesh_held:"    + std::to_string(held) + "\n";
 
             // The same three for other runtimes, separate lines because a
             // sibling crossing and a cross-runtime one are answered by

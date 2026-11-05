@@ -147,6 +147,25 @@ public:
     bool   dead()    const { return m_dead; }
     void   mark_dead()     { m_dead = true; }
 
+    size_t capacity() const { return m_out.capacity() + m_wire.capacity(); }
+
+    // A drained writer gives back each buffer past `keep`, which a burst grew and an idle one never needs.
+    void trim(size_t keep)
+    {
+        if (m_send_armed || pending() != 0)
+            return;
+        if (m_out.capacity() > keep)
+        {
+            std::string().swap(m_out);
+            m_off = 0;
+        }
+        if (m_wire.capacity() > keep)
+        {
+            std::string().swap(m_wire);
+            m_wire_off = 0;
+        }
+    }
+
 private:
     void ring_flush()
     {
