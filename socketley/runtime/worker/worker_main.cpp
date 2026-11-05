@@ -2013,6 +2013,21 @@ private:
             case worker_proto::route_op::drop:
                 srv->drop_route(ref);
                 break;
+            case worker_proto::route_op::write_many:
+            {
+                std::vector<conn_ref> refs;
+                std::string_view one;
+                if (!worker_proto::decode_route_refs(msg, refs, one))
+                {
+                    LOG_WARN("proxy worker: malformed route frame, dropped");
+                    break;
+                }
+                for (const auto& r : refs)
+                    if (!srv->write_to_ref(r, one))
+                        LOG_DEBUG("proxy worker: a routed message named a "
+                                  "connection this runtime no longer has");
+                break;
+            }
             case worker_proto::route_op::broadcast:
                 // Unconditional, with `--mode in` deliberately not consulted,
                 // because that flag says whether socketley.send reaches this
@@ -2075,6 +2090,43 @@ private:
         if (!m_writer.write(worker_proto::frame(
                 worker_proto::frame_type::route_up, frame))) {}
         forget_route_pin(op, ref);
+    }
+
+    // A broadcast's writes to many connections of one origin, as one frame per path they are pinned to, each carrying
+    // the message once: each connection's write still goes the way the frames before and after it go.
+    void post_many(std::string_view to, std::string_view frm, const conn_ref* refs, size_t n,
+                   std::string_view msg) override
+    {
+        // A mebibyte of refs a frame, far under what a reader takes and a link's backlog holds.
+        constexpr size_t per_frame = (size_t{1} << 20) / conn_ref_wire_size;
+        std::vector<std::pair<shard_link*, std::vector<conn_ref>>> paths;
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (!refs[i].valid())
+                continue;
+            shard_link* link = route_path(to, refs[i]);
+            auto it = std::find_if(paths.begin(), paths.end(), [&](const auto& p) { return p.first == link; });
+            if (it == paths.end())
+                it = paths.insert(paths.end(), {link, {}});
+            it->second.push_back(refs[i]);
+        }
+        for (auto& [link, group] : paths)
+            for (size_t at = 0; at < group.size(); at += per_frame)
+            {
+                const size_t k = std::min(per_frame, group.size() - at);
+                const std::string frame = worker_proto::encode_route_refs(to, frm, group.data() + at, k, msg);
+                if (link && link->send_route(frame))
+                    continue;
+                // The same move post() makes for one: the daemon's leg is slower, so it cannot overtake.
+                for (size_t j = at; j < at + k; ++j)
+                {
+                    uint8_t& pin = m_route_pin[group[j]];
+                    m_pinned_direct -= pin == pin_direct ? 1 : 0;
+                    pin = pin_relay;
+                }
+                if (!m_writer.write(worker_proto::frame(
+                        worker_proto::frame_type::route_up, frame))) {}
+            }
     }
 
     // Every pin for connections a departed runtime minted.  Without it the map

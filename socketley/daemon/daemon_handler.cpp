@@ -7239,6 +7239,15 @@ void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
             case worker_proto::route_op::drop:
                 srv->drop_route(ref);
                 break;
+            case worker_proto::route_op::write_many:
+            {
+                std::vector<conn_ref> refs;
+                std::string_view msg;
+                if (worker_proto::decode_route_refs(payload, refs, msg))
+                    for (const auto& r : refs)
+                        srv->write_to_ref(r, msg);
+                break;
+            }
             case worker_proto::route_op::broadcast:
                 srv->broadcast(payload);
                 break;

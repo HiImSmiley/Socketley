@@ -649,6 +649,10 @@ enum class route_op : uint8_t
     // rather than on the deliver sink because deliver honours `--mode in` and
     // would silently narrow self.owner_broadcast().
     broadcast = 7,
+
+    // The eighth is `write` for many connections of one origin at once, the message carried once beside their refs
+    // (see encode_route_refs), sent where each of them would have gone so none overtakes a write pinned to it.
+    write_many = 8,
 };
 
 // `to` is the runtime the op is performed on and `from` the one that asked,
@@ -682,7 +686,7 @@ inline bool decode_route_frame(std::string_view payload_in, std::string& to,
     // does, or a newer peer's sixth op becomes a `data` delivery of the wrong
     // bytes.
     if (raw < static_cast<uint8_t>(route_op::open) ||
-        raw > static_cast<uint8_t>(route_op::broadcast))
+        raw > static_cast<uint8_t>(route_op::write_many))
         return false;
     op = static_cast<route_op>(raw);
 
@@ -692,6 +696,43 @@ inline bool decode_route_frame(std::string_view payload_in, std::string& to,
         return false;
     reader r2(p, static_cast<size_t>(end - p));
     payload = std::string(r2.str());
+    return r2.ok;
+}
+
+// A write_many frame: the frame encode_route_frame makes with no ref and, as its payload, u32 n, n refs and the
+// message, written in one pass so the message is copied once however many refs there are.
+inline std::string encode_route_refs(std::string_view to, std::string_view from, const conn_ref* refs, size_t n,
+                                     std::string_view msg)
+{
+    const size_t inner = 4 + n * conn_ref_wire_size + 4 + msg.size();
+    std::string out;
+    out.reserve(conn_ref_wire_size + 13 + to.size() + from.size() + inner);
+    put_str(out, to);
+    put_str(out, from);
+    out.push_back(static_cast<char>(route_op::write_many));
+    put_conn_ref(out, conn_ref{});
+    socketley::bytes::append32(out, static_cast<uint32_t>(inner));
+    socketley::bytes::append32(out, static_cast<uint32_t>(n));
+    for (size_t i = 0; i < n; ++i)
+        put_conn_ref(out, refs[i]);
+    put_str(out, msg);
+    return out;
+}
+
+// The payload of a write_many frame read back, its refs into `refs` and its message as a view into `payload`.
+inline bool decode_route_refs(std::string_view payload, std::vector<conn_ref>& refs, std::string_view& msg)
+{
+    reader r(payload.data(), payload.size());
+    const uint32_t n = r.u32();
+    if (!r.ok || n > static_cast<size_t>(r.end - r.p) / conn_ref_wire_size)
+        return false;
+    const char* p = r.p;
+    refs.resize(n);
+    for (auto& ref : refs)
+        if (!take_conn_ref(p, r.end, ref))
+            return false;
+    reader r2(p, static_cast<size_t>(r.end - p));
+    msg = r2.str();
     return r2.ok;
 }
 

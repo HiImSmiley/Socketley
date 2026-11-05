@@ -6140,18 +6140,26 @@ server_instance::fanout_count server_instance::broadcast(std::string_view msg)
 
     // Also reach the connections routed here through the runtime that owns
     // each, so a ref that no longer resolves is dropped there rather than
-    // written to a stranger.
-    for (auto& [handle, fc] : m_forwarded)
+    // written to a stranger -- all of one origin's in one call, which carries
+    // the message once per path rather than once per connection.
+    if (!m_forwarded.empty())
     {
-        (void)handle;
-        // A sibling's client that self.clients() named is reached by that sibling's half of the broadcast, and the
-        // write below found no connection of this shard's for it, once per handle per broadcast.
-        if (fc.origin == get_name())
-            continue;
-        // Same removal as in the read path above, for the same reason: the
-        // state this used to test was this process's copy of somebody else's.
-        route_relay::write(get_runtime_manager(), fc.origin, get_name(),
-                           fc.ref, msg);
+        std::vector<std::pair<std::string_view, std::vector<conn_ref>>> by_origin;
+        for (const auto& [handle, fc] : m_forwarded)
+        {
+            (void)handle;
+            // A sibling's client that self.clients() named is reached by that sibling's half of the broadcast, and
+            // the write found no connection of this shard's for it, once per handle per broadcast.
+            if (fc.origin == get_name())
+                continue;
+            auto it = std::find_if(by_origin.begin(), by_origin.end(),
+                                   [&](const auto& o) { return o.first == fc.origin; });
+            if (it == by_origin.end())
+                it = by_origin.insert(by_origin.end(), {std::string_view(fc.origin), {}});
+            it->second.push_back(fc.ref);
+        }
+        for (const auto& [origin, refs] : by_origin)
+            route_relay::write_many(get_runtime_manager(), origin, get_name(), refs.data(), refs.size(), msg);
     }
 
     // The routed ones are not in the count: their queues belong to the runtime

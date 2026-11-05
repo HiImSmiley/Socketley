@@ -26,6 +26,15 @@ struct sink
                       worker_proto::route_op op, const conn_ref& ref,
                       std::string_view payload) = 0;
 
+    // `write` to each of `n` connections of `to`, the message the same for all; a sink that can carry them in one
+    // frame per path overrides it.
+    virtual void post_many(std::string_view to, std::string_view from, const conn_ref* refs, size_t n,
+                           std::string_view msg)
+    {
+        for (size_t i = 0; i < n; ++i)
+            post(to, from, worker_proto::route_op::write, refs[i], msg);
+    }
+
     // The one that waits; `err` is what the script is shown.
     virtual bool open(std::string_view target, const conn_ref& ref,
                       std::string_view origin, std::string& err) = 0;
@@ -56,6 +65,11 @@ void close(runtime_manager* mgr, std::string_view to, std::string_view from,
 // write_to_ref on the origin; "queued", the same contract queue_send() has.
 bool write(runtime_manager* mgr, std::string_view to, std::string_view from,
            const conn_ref& ref, std::string_view msg);
+
+// write_to_ref on the origin for each of `n` refs, which a broadcast reaching many of one origin's connections sends
+// as one frame per path rather than one per connection.
+void write_many(runtime_manager* mgr, std::string_view to, std::string_view from,
+                const conn_ref* refs, size_t n, std::string_view msg);
 
 // drop_route on the origin.
 void drop(runtime_manager* mgr, std::string_view to, std::string_view from,

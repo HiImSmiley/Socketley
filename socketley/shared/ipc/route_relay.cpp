@@ -102,6 +102,19 @@ bool write(runtime_manager* mgr, std::string_view to, std::string_view from,
     return false;
 }
 
+void write_many(runtime_manager* mgr, std::string_view to, std::string_view from,
+                const conn_ref* refs, size_t n, std::string_view msg)
+{
+    if (auto* srv = local_server(mgr, to))
+    {
+        for (size_t i = 0; i < n; ++i)
+            srv->write_to_ref(refs[i], msg);
+        return;
+    }
+    if (auto* sink = mgr ? mgr->route_sink() : nullptr)
+        sink->post_many(to, from, refs, n, msg);
+}
+
 void drop(runtime_manager* mgr, std::string_view to, std::string_view from,
           const conn_ref& ref)
 {
