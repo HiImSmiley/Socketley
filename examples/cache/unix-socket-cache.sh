@@ -16,7 +16,8 @@
 #     there is no flag to widen it
 #   - --listen cannot be combined with -p or --tls, and on a cache also not
 #     with --cluster (members advertise ports out of a formula, and a path
-#     has no successor) or --shards (SO_REUSEPORT is not a path)
+#     has no successor, so a sharded cache on a path is not in cluster mode)
+#     or --shards (SO_REUSEPORT is not a path)
 #   - the node is removed when the cache stops; a stale one left by a crash
 #     is taken over on the next start, but a path something is live on is
 #     refused rather than stolen

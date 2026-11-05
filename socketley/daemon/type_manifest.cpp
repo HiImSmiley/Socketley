@@ -83,7 +83,7 @@ constexpr std::string_view reserved_keys[] = {
     "circuit_timeout", "backend_timeout", "retry_count", "retry_all",
     "mesh_client_ca", "mesh_client_cert", "mesh_client_key", "auth", "redirect_https", "persistent_path",
     "persistent_interval",
-    "cache_mode", "resp_forced", "cluster", "replicate_target", "cluster_replica", "max_memory",
+    "cache_mode", "resp_forced", "cluster", "no_cluster", "replicate_target", "cluster_replica", "max_memory",
     "eviction", "extra",
     "ca", "cert", "key", "global-rate-limit", "idle-timeout", "log", "lua",
     "max-conn", "max-connections", "rate-limit", "test",

@@ -102,6 +102,8 @@ void apply_cache_config(cache_instance& cache, const runtime_config& cfg, bool b
         cache.set_resp_forced(cfg.resp_forced);
     if (asked("cluster", cfg.cluster))
         cache.set_cluster(cfg.cluster);
+    if (asked("no_cluster", cfg.no_cluster))
+        cache.set_no_cluster(cfg.no_cluster);
     if (asked("replicate_target", !cfg.replicate_target.empty()))
         cache.set_replicate_target(cfg.replicate_target);
     if (asked("cluster_replica", cfg.cluster_replica != 0))

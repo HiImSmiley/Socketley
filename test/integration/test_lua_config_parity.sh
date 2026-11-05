@@ -113,6 +113,7 @@ runtimes = {
   { type = "cache", name = "lp_c2", port = $((P + 4)),
     persistent = "$WORK/store.bin", maxmemory = "256M",
     eviction = "allkeys-lru", resp = true, cluster = true },
+  { type = "cache", name = "lp_c3", port = $((P + 30)), shards = 2, no_cluster = true },
 }
 EOF
 RC=0
@@ -124,6 +125,7 @@ shows "maxmemory understands 256M" lp_c2 '"max_memory": 268435456'
 shows "eviction reaches the runtime" lp_c2 '"eviction": "allkeys-lru"'
 shows "resp reaches the runtime"     lp_c2 '"resp_forced": true'
 shows "cluster reaches the runtime"  lp_c2 '"cluster": true'
+shows "no_cluster reaches the runtime" lp_c3 '"no_cluster": true'
 
 # ─── reconnect is a bool or a count, which is the flag's own shape ──────────
 cat > "$WORK/client.lua" <<EOF

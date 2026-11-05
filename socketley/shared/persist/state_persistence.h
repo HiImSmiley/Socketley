@@ -156,7 +156,9 @@ struct runtime_config
     uint32_t persistent_interval = 0;
     uint8_t cache_mode = 1;  // cache_mode (default readwrite)
     bool resp_forced = false;
+    // --cluster said aloud, and --no-cluster: neither is the default, which is cluster mode above one shard.
     bool cluster = false;
+    bool no_cluster = false;
     std::string replicate_target;
     // The incarnation of a cluster cache replica, zero for a cache that is not one.
     uint64_t cluster_replica = 0;

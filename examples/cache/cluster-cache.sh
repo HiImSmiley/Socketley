@@ -30,11 +30,12 @@
 #   the proxy's rules have been bypassed by a map the cache handed out, or it
 #   cannot, and the client burns its retries on a connection refused.  Neither
 #   logs anything.  That is what client-side routing IS -- Redis Cluster has
-#   the same property -- so a --cluster cache CANNOT SIT BEHIND A PROXY used
-#   for access control, and the operator makes that call, not the cache.
+#   the same property -- so a cache in cluster mode CANNOT SIT BEHIND A PROXY
+#   used for access control, and the operator makes that call, not the cache.
 #
-#   Off by default.  Without it, --shards N is the shared-port cache it always
-#   was: nothing extra bound, no redirects, crossings over the mesh.
+#   On by default at two or more shards on a port; --cluster below says so
+#   aloud.  With --no-cluster, --shards N is the shared-port cache alone:
+#   nothing extra bound, no redirects, crossings over the mesh.
 #
 # WHAT CHANGED
 #   Two things, and neither of them is a client library:
@@ -44,7 +45,7 @@
 #        better -- our FNV-1a mixed better -- but because redis-cli, redis-py,
 #        go-redis, lettuce and node-redis can all compute it WITHOUT ASKING US.
 #
-#     2. With --cluster, shard i binds port+1+i in addition to the shared
+#     2. In cluster mode, shard i binds port+1+i in addition to the shared
 #        port, and a key that arrives on the wrong one is answered
 #        `-MOVED slot host:port`.
 #

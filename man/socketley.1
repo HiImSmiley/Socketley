@@ -4127,6 +4127,8 @@ restrict it.
 .B \-\-cluster
 on a cache. Cluster members advertise ports computed by a formula, and RESP
 cannot write a filesystem path as a node address.
+Cluster mode, which a sharded cache on a port is in by default, is simply off
+on a path; only the flag typed is refused.
 .PP
 Each combination is refused at start, with the reason in the daemon log, so
 neither flag silently wins.
@@ -6709,6 +6711,8 @@ It is refused with
 .BR \-\-cluster ,
 because cluster members advertise ports computed from a formula, and RESP has
 no way to write a filesystem path as a node address.
+For the same reason a sharded cache on a path is not in cluster mode, which it
+would be by default on a port.
 .IP
 .B It is worth measuring before it is worth arguing about.
 On one test machine, one cache and one redis\-server were loaded with the same
@@ -6805,9 +6809,8 @@ processes on the same four cores, driven the same way, reach 2.88x.
 socketley is ahead of them in absolute throughput at every count tried: 1.12x
 at one and 1.09x at four.
 Neither scales linearly on loopback here.
-So a cache that must scale needs
-.B \-\-cluster
-and a client that routes.
+So a cache that must scale needs cluster mode, which is its default, and a
+client that routes.
 The 3.57x quoted for a server under
 .B SERVER FLAGS
 does not carry over to a cache.
@@ -7093,6 +7096,10 @@ When a client connects, the kernel gives the connection to whichever shard its
 four\-tuple hashes to.
 A key that another shard owns is fetched from that shard over the mesh.
 To any client, the cache is one store.
+In cluster mode, which is the default at two or more shards on a port, each
+shard also binds a port of its own and a cluster\-aware client goes straight
+to the owner; see
+.BR \-\-cluster .
 .IP
 That crossing costs CPU, and with
 .I N
@@ -7187,11 +7194,81 @@ a running cache takes it through
 .BR import .
 .TP
 .B \-\-cluster
-Publishes a routable slot map, so a cluster\-aware client sends each key
-straight to the shard that owns it and no crossing happens at all.
-Off by default.
+.TQ
+.B \-\-no\-cluster
+Cluster mode: each shard binds a port of its own and the cache publishes a
+routable slot map, so a cluster\-aware client sends each key straight to the
+shard that owns it and no crossing happens at all.
+.B "On by default for a cache with two or more shards and a TCP port."
+.B \-\-no\-cluster
+turns it off.
+.B \-\-cluster
+is the default said aloud, still accepted so that configurations and scripts
+written when the mode was opt\-in keep working, and it is what turns the mode
+on for a single shard (below).
+With
+.B \-\-listen
+the mode is off, because a unix path has no per\-shard address the map could
+name; a typed
+.B \-\-cluster
+with
+.B \-\-listen
+is refused.
+Set either flag at
+.BR create ;
+a stopped cache takes a change through
+.B import
+(the
+.B cluster
+and
+.B no_cluster
+fields), and a running one refuses it, because clients already hold its map.
 .IP
-.B "Read this before you type it: a cache with \-\-cluster cannot sit behind a proxy used for access control."
+.B "Ordinary clients lose nothing."
+The shared port answers exactly as it does under
+.BR \-\-no\-cluster :
+every key, from any shard, relayed over the mesh when another shard owns it,
+and never a redirect.
+Only a client that connects to a per\-shard port, or reads the map, sees
+cluster mode.
+A cluster\-aware client \(em
+.BR "redis\-cli \-c" ,
+ioredis
+.BR Redis.Cluster ,
+node\-redis
+.BR createCluster ,
+redis\-py
+.BR RedisCluster ,
+go\-redis
+.B NewClusterClient
+\(em reads the map, routes each key by itself and skips the relay.
+Measured at eight shards, such a client cost 0.24 us of cache CPU per operation
+against 0.67 us through the shared port.
+.IP
+.B "It needs N more free and reachable TCP ports."
+A cache on port
+.I P
+with
+.I N
+shards also binds
+.IR P +1 .. P + N ,
+and the map names them by the address the asking client connected to.
+In a container that publishes only
+.IR P ,
+behind NAT that forwards only
+.IR P ,
+or behind a firewall that opens only
+.IR P ,
+a cluster\-aware client is handed ports it cannot reach and spends its retries
+on them; ordinary clients on
+.I P
+are unaffected.
+Publish or open
+.IR P +1 .. P + N
+as well, or give
+.BR \-\-no\-cluster .
+.IP
+.B "Read this before you rely on a proxy: a cache in cluster mode cannot sit behind a proxy used for access control."
 With client\-side routing, the client connects to every shard
 .IR directly .
 The cache tells the client where the shards are, using the address that the
@@ -7211,8 +7288,8 @@ It is what client\-side routing is, and Redis Cluster has exactly the same
 property.
 No setting makes a routing client and a proxy enforcement point work together;
 you have to choose one of the two.
-Without
-.B \-\-cluster
+With
+.B \-\-no\-cluster
 the cache is reached only through its one port, and a proxy in front of it
 depends on that.
 .IP
@@ -7222,7 +7299,8 @@ At two or more shards, shard
 binds
 .IR port + 1 + i ,
 in addition to the shared port.
-The shared port keeps working exactly as it does without the flag.
+The shared port keeps working exactly as it does under
+.BR \-\-no\-cluster .
 A client that connects to a per\-shard port has chosen that shard on purpose.
 A key that shard does not own is answered with
 .BI \-MOVED " slot host:port"
@@ -7232,18 +7310,20 @@ That lets
 .BR "redis\-benchmark \-\-cluster" ,
 redis\-py, go\-redis, lettuce and node\-redis route for themselves.
 .IP
-.B A cache with \-\-cluster and two or more shards therefore needs port+1 .. port+N free, and refuses to start otherwise.
+.B A cache in cluster mode with two or more shards therefore needs port+1 .. port+N free, and refuses to start otherwise.
 Whichever shard answers
 .B "CLUSTER SLOTS"
 computes the addresses it sends from a formula.
 That shard has no way to learn whether its siblings bound their ports.
 A shard that ran without its port would be advertised anyway, and every client
 would spend its retries on refused connections.
-So the start fails instead, and the error names the port and this flag.
-Without
-.BR \-\-cluster ,
-only the shared port is bound, and two four\-shard caches one port apart work
-as they always did.
+So the start fails instead, and the error names the port and
+.BR \-\-no\-cluster .
+With
+.BR \-\-no\-cluster ,
+only the shared port is bound, and two four\-shard caches one port apart work.
+The daemon counts these ports among the cache's addresses, so another runtime
+asked to listen on one is refused at its start, naming the cache.
 .IP
 .B \-\-cluster is legal at any shard count.
 At
@@ -7251,6 +7331,8 @@ At
 it publishes a cluster of one node on the base port and binds no extra port.
 So a client can be written once and deployed at any
 .IR N .
+Without it a single\-shard cache is standalone, because there is nothing to
+route.
 .IP
 .B CLUSTER SLOTS, SHARDS, NODES, INFO, MYID, KEYSLOT and COUNTKEYSINSLOT
 are answered on every port and at every shard count, with or without this
@@ -7258,9 +7340,12 @@ flag, because a client that asks deserves a straight answer.
 .B CLUSTER INFO
 reports
 .B cluster_enabled:1
-only when
-.B \-\-cluster
-was given; without it the reply is
+in cluster mode.
+Under
+.BR \-\-no\-cluster ,
+on a unix path, and at one shard without
+.BR \-\-cluster ,
+the reply is
 .BR cluster_enabled:0 ,
 and
 .B CLUSTER SLOTS
@@ -7364,15 +7449,13 @@ Measured at 256 KiB values and 32 clients, against one shard:
   4 shards, \-\-cluster, routed   19,920    19,960    158 us
 .fi
 .IP
-A sharded cache without
-.B \-\-cluster
-relays a command that arrived on the wrong shard instead of answering \-MOVED.
+On its shared port a sharded cache relays a command that arrived on the wrong
+shard instead of answering \-MOVED.
 That is what lets an ordinary client work against it at all.
 But relaying a 256 KiB value passes it through a second process, so GET drops
 to 0.57 of the single shard.
-With
-.B \-\-cluster
-and a client that routes, four shards give 1.38x on GET and 1.34x on SET.
+With a client that routes to the per\-shard ports, four shards give 1.38x on GET
+and 1.34x on SET.
 Small messages see 3.2\(en3.6x at eight shards.
 Either way, the sharded arm uses about 2.4 times the CPU per operation.
 .IP
@@ -8146,9 +8229,7 @@ A blocking read inside
 answers "nil" at once, and a script may not wait at all.
 On a sharded cache every key must belong to one shard.
 A blocking read is served only by the shard that owns its streams, through
-that shard's
-.B \-\-cluster
-port.
+that shard's own cluster port.
 .TP
 .BI "xgroup " "create key group id|$ [mkstream] [entriesread n]"
 .TQ
@@ -19068,6 +19149,7 @@ eviction                   \-\-eviction
 resp (bool)                \-\-resp
 replicate                  \-\-replicate
 cluster (bool)             \-\-cluster
+no_cluster (bool)          \-\-no\-cluster
 .fi
 .PP
 Every other flag of a type has a key of the same name, without the leading dashes and with each hyphen turned into an underscore:

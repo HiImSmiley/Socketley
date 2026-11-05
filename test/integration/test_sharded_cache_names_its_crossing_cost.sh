@@ -23,11 +23,11 @@
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   exactly 1 on --shards 3         a build that dropped the line entirely, and
-#                                   one that dropped `m_shard_i == 0` and says
+#   --no-cluster                    one that dropped `m_shard_i == 0` and says
 #                                   it once per shard
-#   0 with --cluster                a build that dropped `!m_cluster_forced`,
-#                                   warning about the arrangement that is the
-#                                   remedy
+#   0 with no flag, and with        a build that dropped `!m_cluster_on`,
+#   --cluster                       warning about the arrangement that is the
+#                                   remedy, and one whose default stayed off
 #   0 at --shards 1                 a build that dropped `m_shard_n > 1`
 set -euo pipefail
 
@@ -41,7 +41,8 @@ daemon_isolate shardwarn
 P_ONE=$((SL_PORT_BASE+1940))
 P_REL=$((SL_PORT_BASE+1950))
 P_CLU=$((SL_PORT_BASE+1960))     # braucht base+1..base+3 dazu
-NAMES="sw_one sw_rel sw_clu"
+P_DEF=$((SL_PORT_BASE+1970))     # ebenso, ohne Flag
+NAMES="sw_one sw_rel sw_clu sw_def"
 
 PASS=0; FAIL=0; TOTAL=0
 ok()    { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -65,7 +66,7 @@ said_for() { grep -c "cache \"$1\": .* shards share one address" "$SOCKETLEY_DLO
 state()    { "$BIN" ps -a 2>/dev/null | awk -v n="$1" '$2==n { print $7 }'; }
 
 # ─── 1. Drei Shards hinter einer Adresse ────────────────────────────────────
-create_ok "a cache at three shards, one address" "$BIN" create cache sw_rel -p "$P_REL" --shards 3
+create_ok "a cache at three shards, one address" "$BIN" create cache sw_rel -p "$P_REL" --shards 3 --no-cluster
 "$BIN" start sw_rel >/dev/null 2>&1 || true
 ready_resp 127.0.0.1 "$P_REL" 15 || true
 sleep 0.5
@@ -79,6 +80,14 @@ ready_resp 127.0.0.1 "$P_CLU" 15 || true
 sleep 0.5
 check "it is up"                       "Up" "$(state sw_clu)"
 check "and says nothing: that IS the remedy" "0" "$(said_for sw_clu)"
+
+# ─── 2b. Dieselben drei ohne Flag, im Cluster-Modus als Vorgabe ─────────────
+create_ok "the same three with no flag" "$BIN" create cache sw_def -p "$P_DEF" --shards 3
+"$BIN" start sw_def >/dev/null 2>&1 || true
+ready_resp 127.0.0.1 "$P_DEF" 15 || true
+sleep 0.5
+check "it is up"                       "Up" "$(state sw_def)"
+check "and says nothing: the remedy is the default" "0" "$(said_for sw_def)"
 
 # ─── 3. Ein Shard ───────────────────────────────────────────────────────────
 create_ok "an unsharded cache" "$BIN" create cache sw_one -p "$P_ONE"

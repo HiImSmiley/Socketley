@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A sharded cache is in cluster mode by default.** At two or more shards on
+  a port each shard binds `port+1+i` and the cache publishes its slot map, so
+  a cluster-aware client routes each key to its owner (0.24 us of CPU per
+  operation at eight shards, against 0.67 us through the shared port), while
+  the shared port answers ordinary clients exactly as before. `--no-cluster`
+  turns it off, for a cache behind a proxy used for access control or one
+  whose extra ports cannot be reached; `--cluster` is still accepted. A cache
+  on a unix path stays out of cluster mode, and a busy shard port fails the
+  start naming the port and `--no-cluster`.
+
 - **A runtime others name is not renamed from under them.** A rename by
   `import` or the dashboard left a proxy's backend, a server's cache, and the
   mail runtimes, storages, edges, dbs and brokers signing people in at an idp

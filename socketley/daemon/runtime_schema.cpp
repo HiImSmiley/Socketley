@@ -113,7 +113,8 @@ constexpr row rows[] = {
     {"--resp", "K", "switch", "Redis protocol only", "Speak RESP to every client, without detecting it.", "Cache"},
     {"--replicate", "K", "text", "Follow", "The leader cache it follows, host:port.", "Cache", {}, "10.0.0.5:9000"},
     {"--public", "K", "switch", "Public", "Serve clients on other machines too.", "Cache"},
-    {"--cluster", "K", "switch", "Cluster map", "Publish a slot map so cluster clients go straight to each shard.", "Cache"},
+    {"--cluster", "K", "switch", "Cluster map", "Publish a slot map so cluster clients go straight to each shard (the default above one shard).", "Cache"},
+    {"--no-cluster", "K", "switch", "No cluster map", "Keep the shards on the one port: no per-shard ports, no slot map.", "Cache"},
     {"--cluster-replica", "K", "int", "Cluster replica", "Set by `cluster create`, never by hand.", "Cache", {}, {}, {}, true},
 
     // ── storage ─────────────────────────────────────────────────────────────
@@ -367,6 +368,7 @@ constexpr state_key_row state_keys[] = {
     {"--replicate", "replicate_target"},
     {"--public", "public"},
     {"--cluster", "cluster"},
+    {"--no-cluster", "no_cluster"},
     {"--dir", "dir"},
     {"--credentials", "credentials"},
     {"--access-key", "access_key"},

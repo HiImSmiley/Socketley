@@ -105,6 +105,7 @@ constexpr config_key config_keys[] = {
     { "resp",               "--resp",               key_kind::boolean },
     { "replicate",          "--replicate",          key_kind::text    },
     { "cluster",            "--cluster",            key_kind::boolean },
+    { "no_cluster",         "--no-cluster",         key_kind::boolean },
     { "public",             "--public",             key_kind::boolean },
 
     // ── Storage ─────────────────────────────────────────────────────────────

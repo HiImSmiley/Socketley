@@ -127,7 +127,7 @@ cache may still *be* a follower.
 
 See `sharded-cache.sh`.
 
-### Letting the client pick the shard — `--cluster` (`cluster-cache.sh`)
+### Letting the client pick the shard — cluster mode (`cluster-cache.sh`)
 
 Sharding costs a **crossing**: with N shards a random key is foreign (N-1)/N of
 the time, because all N shards share one port under `SO_REUSEPORT` and the
@@ -149,7 +149,12 @@ Quote the ratio, not the level. The same pair re-measured hours later on the
 same binary gave 84,828 and 116,894 rps/core — every absolute a third higher,
 the ratio 1.387 against 1.369.
 
-**`--cluster` is off by default, and you should read why before turning it on.**
+**Cluster mode is on by default at two or more shards on a port, and
+`--no-cluster` turns it off.** It costs ordinary clients nothing — the shared
+port answers them exactly as before — so the default is the faster arrangement
+for anyone whose client routes. `--cluster` is still accepted as the default
+said aloud. With `--listen` (a unix path) it is off, because a path has no
+per-shard address to publish. Read why you might still want it off:
 
 > A routing client connects to **every shard directly**, and the address this
 > cache advertises is the one the *asking* connection arrived on. Put the cache
@@ -159,13 +164,19 @@ the ratio 1.387 against 1.369.
 > its retry budget on a connection refused. Neither outcome logs anything.
 >
 > This is not fixable here. It is what client-side routing *is*, and Redis
-> Cluster has the same property. **A `--cluster` cache cannot sit behind a proxy
-> used for access control** — choose which of the two you want. Without the flag
-> the cache is reached only through its one port, which is what a proxy in front
-> of it depends on.
+> Cluster has the same property. **A cache in cluster mode cannot sit behind a
+> proxy used for access control** — choose which of the two you want. With
+> `--no-cluster` the cache is reached only through its one port, which is what a
+> proxy in front of it depends on.
+>
+> It also needs `port+1 .. port+N` free **and reachable**: in a container that
+> publishes only the port, behind NAT or a firewall that opens only the port, a
+> cluster-aware client is handed shard addresses it cannot reach. Publish them
+> too, or give `--no-cluster`.
 
-With `--cluster`, the crossing is removed by letting the client route, and the
-client is not ours:
+In cluster mode the crossing is removed by letting the client route, and the
+client is not ours — `redis-cli -c`, ioredis `Redis.Cluster`, node-redis
+`createCluster`, redis-py `RedisCluster`, go-redis `NewClusterClient`:
 
 * a key's owner is **CRC16 mod 16384**, Redis's hash slot function including the
   `{hash tag}` rule, so `redis-cli -c`, `redis-benchmark --cluster`, redis-py,
@@ -177,14 +188,15 @@ client is not ours:
 
 `port+1 .. port+N` therefore have to be free, and a cache that cannot bind one
 of them **refuses to start** rather than being advertised at an address nothing
-answers on — the message names the flag, because that is the thing you can turn
-off. Without `--cluster` nothing but the shared port is bound, so two four-shard
-caches one port apart work as they always did.
+answers on — the message names the port and `--no-cluster`, because that is the
+thing you can turn off. With `--no-cluster` nothing but the shared port is
+bound, so two four-shard caches one port apart work.
 
 `--cluster` is legal at `--shards 1`: one node on the base port, nothing extra
-bound, so a client can be written once and deployed at any N.
+bound, so a client can be written once and deployed at any N. Without it a
+single-shard cache is standalone.
 
-**Without the flag, `--shards N` behaves exactly as it did before this existed**:
+**With `--no-cluster`, `--shards N` is the shared-port cache alone**:
 shared port only, no redirects, `cluster_enabled:0`, and `CLUSTER SLOTS`
 publishing a single node holding every slot on that port — true and safe. The
 `CLUSTER` commands are answered either way; a client that asks deserves a

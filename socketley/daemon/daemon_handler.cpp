@@ -5918,7 +5918,8 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
             // A running cluster has already published its map, so every client
             // holding it would keep sending keys to ports that had stopped
             // answering.
-            if (cfg.has("cluster") && cfg.cluster != cache->get_cluster())
+            if ((cfg.has("cluster") && cfg.cluster != cache->get_cluster()) ||
+                (cfg.has("no_cluster") && cfg.no_cluster != cache->get_no_cluster()))
             {
                 conn->write_buf = "cannot change cluster mode while running\n";
                 return 1;

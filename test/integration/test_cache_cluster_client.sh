@@ -9,11 +9,11 @@
 # answers every key correctly over the mesh; with the same keys driven through
 # the shared port as the control, because zero crossings is also what a broken
 # cache with no traffic reports.
-# ─── AND THAT IT IS OFF UNLESS ASKED FOR ────────────────────────────────────
+# ─── AND THAT --no-cluster TURNS IT OFF ─────────────────────────────────────
 # Client-side routing gives up an enforcement point -- a routing client must
-# reach every shard's port directly -- so it is a decision the operator makes
-# with --cluster, and the last two cases are the shared-port default most
-# likely to rot.
+# reach every shard's port directly -- so an operator who keeps a proxy in
+# front says --no-cluster, and the last cases are that shared-port-only arm,
+# the one most likely to rot now that it is not the default.
 # ─── THE EXTERNAL ORACLE ────────────────────────────────────────────────────
 # Checked against numbers Redis itself publishes, because the entire value of
 # the function is that a stranger computes the same answer.
@@ -32,7 +32,7 @@ daemon_isolate cacheclust
 # collision refuses the start.
 P4=$((SL_PORT_BASE+1470))       # four shards, --cluster  (+1471..1474)
 P1=$((SL_PORT_BASE+1490))       # one shard, the unsharded control
-PD=$((SL_PORT_BASE+1495))       # four shards, NO --cluster: the default
+PD=$((SL_PORT_BASE+1495))       # four shards, --no-cluster
 PSQ=$((PD+1))                   # occupied first, on purpose -- see case 11
 
 PASS=0; FAIL=0; TOTAL=0
@@ -64,13 +64,13 @@ daemon_start "$BIN"
 "$BIN" create cache cl4 -p "$P4" --shards 4 --resp --cluster -s >/dev/null 2>&1 \
     || { echo "  FATAL: a four-shard --cluster cache would not start"; exit 2; }
 "$BIN" create cache cl1 -p "$P1" --resp -s >/dev/null 2>&1
-# The neighbour takes PD+1 first, so a build that bound base+1+i without the
-# flag would find it taken and refuse -- which is the behaviour --cluster is
-# supposed to have and the default is not, and is why these two are created in
-# this order.
+# The neighbour takes PD+1 first, so a build that bound base+1+i under
+# --no-cluster would find it taken and refuse -- which is the behaviour cluster
+# mode is supposed to have and --no-cluster is not, and is why these two are
+# created in this order.
 "$BIN" create cache clsq -p "$PSQ" --resp -s >/dev/null 2>&1
 DEF_START_RC=1
-"$BIN" create cache cldef -p "$PD" --shards 4 --resp -s >/dev/null 2>&1 && DEF_START_RC=0
+"$BIN" create cache cldef -p "$PD" --shards 4 --resp --no-cluster -s >/dev/null 2>&1 && DEF_START_RC=0
 
 ready_resp() {
     local port=$1 i
@@ -322,19 +322,19 @@ else
         "exit $SC_RC after $SC keys; a non-terminating cursor is a hung client"
 fi
 
-# ── 11: WITHOUT --cluster nothing is bound at base+1 ────────────────────────
+# ── 11: UNDER --no-cluster nothing is bound at base+1 ───────────────────────
 #
 # Two independent readings of the same fact, because the cheap one is weak on
 # its own: a port is also closed while a runtime is still forking.
 if [ "$DEF_START_RC" -eq 0 ]; then
-    ok "a four-shard cache without --cluster starts with base+1 already taken"
+    ok "a four-shard cache under --no-cluster starts with base+1 already taken"
 else
-    bad "a four-shard cache without --cluster starts with base+1 already taken" \
-        "it refused, which means it tried to bind base+1+i without being asked" \
-        "to -- so client routing is on for anyone who typed --shards"
+    bad "a four-shard cache under --no-cluster starts with base+1 already taken" \
+        "it refused, which means it tried to bind base+1+i though told not" \
+        "to -- so client routing cannot be turned off"
 fi
 
-ready_resp "$PD" || { echo "  FATAL: the no-flag four-shard cache never answered"; exit 2; }
+ready_resp "$PD" || { echo "  FATAL: the --no-cluster four-shard cache never answered"; exit 2; }
 DEF_BOUND=0
 for i in 2 3 4; do
     redis-cli -p $((PD+i)) -t 2 PING 2>/dev/null | grep -q PONG && DEF_BOUND=$((DEF_BOUND+1))
@@ -342,9 +342,9 @@ done
 # PD+1 is skipped above: clsq is legitimately listening there, and counting it
 # would fail this on the fixture rather than on the build.
 if [ "$DEF_BOUND" -eq 0 ]; then
-    ok "--shards without --cluster binds none of base+2..base+4 either"
+    ok "--shards with --no-cluster binds none of base+2..base+4 either"
 else
-    bad "--shards without --cluster binds none of base+2..base+4" \
+    bad "--shards with --no-cluster binds none of base+2..base+4" \
         "$DEF_BOUND of 3 answered; a cache behind a proxy would be publishing" \
         "addresses that bypass it"
 fi
@@ -365,11 +365,11 @@ done
 sleep 2
 DMESH_AFTER=$("$BIN" stats cldef 2>&1 | awk -F: '/^mesh_direct:/{d+=$2} /^mesh_relayed:/{r+=$2} END{print d+r+0}')
 DCROSS=$((DMESH_AFTER - DMESH_BEFORE))
-echo "        default arm: $DMISS missing, $DREDIR redirected, $DCROSS crossings for 40 reads"
+echo "        --no-cluster arm: $DMISS missing, $DREDIR redirected, $DCROSS crossings for 40 reads"
 if [ "$DMISS" -eq 0 ] && [ "$DREDIR" -eq 0 ] && [ "$DCROSS" -gt 0 ]; then
-    ok "without --cluster a foreign key is fetched over the mesh, never redirected"
+    ok "under --no-cluster a foreign key is fetched over the mesh, never redirected"
 else
-    bad "without --cluster a foreign key is fetched over the mesh" \
+    bad "under --no-cluster a foreign key is fetched over the mesh" \
         "$DMISS of 40 missing, $DREDIR redirected, $DCROSS crossings" \
         "zero crossings here would mean the reads never left one shard, which" \
         "makes the other two numbers meaningless"
@@ -383,9 +383,9 @@ for i in 1 2 3 4; do
     printf '%s\n' "$DSLOTS" | grep -qx "$((PD+i))" && DPORTS=$((DPORTS+1))
 done
 if printf '%s' "$DINFO" | grep -q 'cluster_enabled:0' && [ "$DPORTS" -eq 0 ]; then
-    ok "without --cluster it reports cluster_enabled:0 and advertises no shard ports"
+    ok "under --no-cluster it reports cluster_enabled:0 and advertises no shard ports"
 else
-    bad "without --cluster it reports cluster_enabled:0 and advertises no shard ports" \
+    bad "under --no-cluster it reports cluster_enabled:0 and advertises no shard ports" \
         "cluster_enabled line: $(printf '%s' "$DINFO" | grep cluster_enabled | tr -d '\r')" \
         "$DPORTS of 4 shard ports appear in CLUSTER SLOTS, which nothing is listening on"
 fi

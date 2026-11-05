@@ -283,7 +283,7 @@ struct client_connection
 
 // The port a cache listens on when none was configured.  Named once because
 // setup() and listen_addresses() have to answer with the same number, and the
-// per-shard --cluster ports are counted up from it in both.
+// per-shard cluster ports are counted up from it in both.
 inline constexpr uint16_t cache_default_port = 9000;
 
 enum cache_mode : uint8_t
@@ -504,12 +504,17 @@ public:
     void set_resp_forced(bool enabled);
     bool get_resp_forced() const;
 
-    // --cluster is a flag and not a consequence of --shards, because
-    // client-side routing gives up an enforcement point: behind a proxy the
-    // advertised address either bypasses the proxy's rules or cannot be
-    // reached at all.
+    // Cluster mode is the default above one shard on a port, and --no-cluster
+    // is the way out, because client-side routing gives up an enforcement
+    // point: behind a proxy the advertised address either bypasses the
+    // proxy's rules or cannot be reached at all.
     void set_cluster(bool enabled);
     bool get_cluster() const;
+    void set_no_cluster(bool enabled);
+    bool get_no_cluster() const;
+    // Whether this cache publishes its per-shard map: --cluster, or the
+    // default at more than one shard on a port, unless --no-cluster.
+    bool cluster_mode() const;
 
     // --public: a peer that is not on this machine is served, where by default
     // it is refused, because this cache has no password and answers every
@@ -1191,10 +1196,12 @@ private:
     std::unique_ptr<accept_op> m_cluster_accept;
     bool m_cluster_multishot_active{false};
     uint16_t m_cluster_port{0};
-    // What --cluster asked for and what this run does about it, which differ
-    // for a cluster of a single shard: it publishes a map and binds no extra
-    // port.
+    // What --cluster and --no-cluster asked for, what cluster_mode() made of
+    // them at setup, and what this run binds, which differ for a cluster of a
+    // single shard: it publishes a map and binds no extra port.
     bool m_cluster_forced{false};
+    bool m_no_cluster{false};
+    bool m_cluster_on{false};
     bool m_cluster_ports{false};
     bool m_public{false};
     // Whether a TCP peer on another machine is served, fixed at setup().

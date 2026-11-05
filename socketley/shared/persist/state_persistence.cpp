@@ -686,6 +686,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.cache_mode = static_cast<uint8_t>(cache->get_mode());
             cfg.resp_forced = cache->get_resp_forced();
             cfg.cluster = cache->get_cluster();
+            cfg.no_cluster = cache->get_no_cluster();
             cfg.replicate_target = cache->get_replicate_target();
             cfg.cluster_replica = cache->get_cluster_replica();
             cfg.max_memory = cache->get_max_memory();
@@ -1166,6 +1167,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_bool_field("resp_forced", true);
             if (cfg.cluster)
                 append_bool_field("cluster", true);
+            if (cfg.no_cluster)
+                append_bool_field("no_cluster", true);
             if (!cfg.replicate_target.empty())
                 append_str_field("replicate_target", cfg.replicate_target);
             if (cfg.cluster_replica != 0)
@@ -1619,6 +1622,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.cache_mode = str_to_cache_mode(json_get_string(json, "cache_mode"));
             cfg.resp_forced = json_get_bool(json, "resp_forced");
             cfg.cluster = json_get_bool(json, "cluster");
+            cfg.no_cluster = json_get_bool(json, "no_cluster");
             cfg.replicate_target = json_get_string(json, "replicate_target");
             {
                 const std::string inc = json_get_string(json, "cluster_replica");

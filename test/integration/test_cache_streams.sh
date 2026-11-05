@@ -484,7 +484,7 @@ check('XREADGROUP reaches the owner', [c('XREADGROUP', 'GROUP', 'g', 'w', 'STREA
 blocked = [c('XREAD', 'BLOCK', '10', 'STREAMS', k, '$') for k in ('a', 'c')]
 truth('a blocking read waits at home and is refused away from it',
       sorted(map(str, blocked)) == sorted(['None', 'ERR a blocking read waits on the shard that owns its streams -- '
-                                            'connect to that shard\'s --cluster port to block on them']), blocked)
+                                            'connect to that shard\'s own cluster port to block on them']), blocked)
 PY
 
 # The verbs only a record of the cache's own writes carries -- a group's consumers and pending entries -- are not a
