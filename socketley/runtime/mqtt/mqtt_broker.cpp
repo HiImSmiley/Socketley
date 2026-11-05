@@ -444,7 +444,7 @@ void broker::take_over(session& s, bool clean)
     old->s  = nullptr;
     s.conn    = 0;
     s.gone_ms = m_io.now_ms();
-    mark();
+    mark(s);
     m_hooks.on_disconnect(info, "taken over");
 }
 
@@ -644,7 +644,7 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
     write_connack(out, c->level, ack);
     send_packet(*c, out);
     ++m_stats.connects;
-    mark();
+    mark(*s);
     m_hooks.session_held(s->client_id, s->username, s->stamp);
     m_hooks.on_connected(info_of(*c));
     if (present)
@@ -716,7 +716,7 @@ bool broker::on_publish(connection& c, const frame& f)
         if (p.qos == 2 && (c.level < level_5 || code < 0x80))
         {
             s.incoming_qos2.insert(p.packet_id);
-            mark();
+            mark(s);
         }
     };
     if (p.qos == 2 && s.incoming_qos2.contains(p.packet_id))
@@ -825,7 +825,7 @@ void broker::finish_publish(uint64_t conn, uint64_t generation, uint8_t qos, uin
         if (qos == 2 && c->s && (level < level_5 || code < 0x80))
         {
             c->s->incoming_qos2.insert(id);
-            mark();
+            mark(*c->s);
         }
     }
     if (!c->processing && !c->busy)
@@ -1019,7 +1019,7 @@ void broker::deliver(session& s, const message_ptr& m, uint8_t qos, bool retain_
             ++m_stats.sent[0];
         return;
     }
-    mark();
+    mark(s);
     // Nothing waiting before it and room for it: sent now, without a turn through the queue.
     if (c && s.queue.empty() && s.out.size() < s.receive_max && !s.out.full() &&
         m_io.backlog(c->id) <= m_cfg.write_limit)
@@ -1060,7 +1060,7 @@ void broker::pump(session& s)
     {
         queued q = std::move(s.queue.front());
         s.queue.pop_front();
-        mark();
+        mark(s);
         if (expired(*q.msg))
         {
             ++m_stats.dropped_expired;
@@ -1151,7 +1151,7 @@ void broker::resend(session& s, connection& c)
         if (!denied.empty())
         {
             m_stats.dropped_denied += denied.size();
-            mark();
+            mark(s);
         }
     }
     // Oldest first, which is the order they were sent in.
@@ -1203,7 +1203,7 @@ bool broker::on_ack(connection& c, const frame& f)
             if (f && f->st == inflight::state::await_puback)
             {
                 s.out.erase(a.packet_id);
-                mark();
+                mark(s);
                 pump(s);
             }
             return true;
@@ -1220,12 +1220,12 @@ bool broker::on_ack(connection& c, const frame& f)
             {
                 // The client refused it; the exchange ends here and its identifier is free.
                 s.out.erase(a.packet_id);
-                mark();
+                mark(s);
                 pump(s);
                 return true;
             }
             f->st = inflight::state::await_pubcomp;
-            mark();
+            mark(s);
             send_ack(c, packet_type::pubrel, a.packet_id, reason::success);
             return true;
         }
@@ -1235,7 +1235,7 @@ bool broker::on_ack(connection& c, const frame& f)
             if (f && f->st == inflight::state::await_pubcomp)
             {
                 s.out.erase(a.packet_id);
-                mark();
+                mark(s);
                 pump(s);
             }
             return true;
@@ -1244,7 +1244,7 @@ bool broker::on_ack(connection& c, const frame& f)
         {
             uint8_t code = reason::success;
             if (s.incoming_qos2.erase(a.packet_id))
-                mark();
+                mark(s);
             else
                 code = reason::packet_id_not_found;
             send_ack(c, packet_type::pubcomp, a.packet_id, code);
@@ -1340,7 +1340,7 @@ void broker::subscribe_step(uint64_t conn, uint64_t generation, std::shared_ptr<
             filter_ref(e.filter, true);
         s.subs[e.filter] = o;
         m_subs.add(inner, is_shared ? group : std::string_view{}, s.key, o);
-        mark();
+        mark(s);
         st->codes.push_back(e.qos);
     }
     suback_packet ack;
@@ -1393,7 +1393,7 @@ bool broker::on_unsubscribe(connection& c, const frame& f)
         {
             m_subs.remove(inner, is_shared ? group : std::string_view{}, s.key);
             filter_ref(filter, false);
-            mark();
+            mark(s);
         }
         ack.reasons.push_back(had ? reason::success : reason::no_subscription_existed);
     }
@@ -1423,7 +1423,7 @@ bool broker::on_disconnect(connection& c, const frame& f)
         if (m_cfg.session_expiry_max != never && e > m_cfg.session_expiry_max)
             e = m_cfg.session_expiry_max;
         c.s->expiry = e;
-        mark();
+        mark(*c.s);
     }
     c.no_will = d.reason != reason::disconnect_with_will;
     c.ph = connection::phase::closing;
@@ -1440,7 +1440,7 @@ void broker::fire_will(session& s)
         return;
     message m = std::move(*s.will);
     s.will.reset();
-    mark();
+    mark(s);
     if (!valid_topic(m.topic) || m.topic.front() == '$' || !m_hooks.may_write(s.username, s.client_id, m.topic))
         return;
     ++m_stats.wills_sent;
@@ -1484,7 +1484,7 @@ void broker::detach(connection& c, std::string_view why)
         return;
     s.conn    = 0;
     s.gone_ms = m_io.now_ms();
-    mark();
+    mark(s);
     client_info info;
     info.conn      = c.id;
     info.client_id = s.client_id;
@@ -1523,7 +1523,7 @@ void broker::sweep_sessions(int64_t now)
         if (s->queue.size() != before)
         {
             m_stats.dropped_expired += before - s->queue.size();
-            mark();
+            mark(*s);
         }
         if (lapsed(*s, now))
             gone.push_back(id);

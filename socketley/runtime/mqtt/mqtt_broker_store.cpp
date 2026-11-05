@@ -323,8 +323,17 @@ broker::snapshot_parts broker::snapshot_now() const
     p.sessions.reserve(m_sessions.size());
     for (const auto& [id, s] : m_sessions)
     {
-        p.sessions.push_back(encode_session(*s));
-        p.size += p.sessions.back().size() + 4;
+        // A connected session is written as gone at this moment, so its bytes are made anew each time.
+        if (s->conn || !s->encoded)
+        {
+            auto bytes = std::make_shared<const std::string>(encode_session(*s));
+            if (!s->conn)
+                s->encoded = bytes;
+            p.sessions.push_back(std::move(bytes));
+        }
+        else
+            p.sessions.push_back(s->encoded);
+        p.size += p.sessions.back()->size() + 4;
     }
     return p;
 }
@@ -340,7 +349,7 @@ void broker::write_snapshot(const snapshot_parts& parts, std::string& out)
         put_message(w, *m);
     w.u32(static_cast<uint32_t>(parts.sessions.size()));
     for (const auto& one : parts.sessions)
-        w.bytes(one);
+        w.bytes(*one);
     out = w.take();
 }
 

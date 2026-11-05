@@ -484,7 +484,7 @@ public:
     struct snapshot_parts
     {
         std::vector<message_ptr> retained;
-        std::vector<std::string> sessions;
+        std::vector<std::shared_ptr<const std::string>> sessions;
         size_t size{0};
     };
     snapshot_parts snapshot_now() const;
@@ -554,6 +554,9 @@ private:
         // asked before it was.
         uint64_t    stamp{0};
         bool        asked{true};
+        // Its bytes as last encoded while it had no connection, dropped at each change, so a snapshot encodes again
+        // only what changed.
+        mutable std::shared_ptr<const std::string> encoded;
         // Which message's subscribers it was last gathered for, and where, so overlapping filters fold into one.
         uint64_t    route_stamp{0};
         size_t      route_slot{0};
@@ -670,6 +673,11 @@ private:
     void sweep_sessions(int64_t now);
     void publish_sys(int64_t now);
     void mark() { m_dirty = true; }
+    void mark(session& s)
+    {
+        s.encoded.reset();
+        m_dirty = true;
+    }
 
     std::string encode_session(const session& s) const;
     bool decode_session(std::string_view in, session& s, std::vector<std::pair<std::string, sub_options>>& subs,
