@@ -1514,7 +1514,9 @@ bool proxy_instance::configure_node_backends(backend_info& b,
             return false;
         b.nodes.push_back(std::move(node));
     }
-    b.node_next = 0;
+    // Each shard of this proxy starts at another node, or at light load all of them sent their first requests to
+    // node 0 and kept them there through their pools.
+    b.node_next = get_shard_index();
 
     // One line for the whole set rather than one per node: a sharded backend
     // behind a sharded proxy said the same N facts N times, which was a
@@ -1884,6 +1886,8 @@ bool proxy_instance::setup(event_loop& loop)
 #ifdef SOCKETLEY_TRACE
     trace_register(this);
 #endif
+    // The rotation over the backends starts at another one in each shard, as a sharded backend's nodes do.
+    m_rr_index = get_shard_index();
     // Nothing from the previous run is cleaned up here, because teardown()
     // hands what it cannot free to retire() -- a POLLOUT on a connect socket,
     // a parked splice and a health-check read all outlive a stop.
