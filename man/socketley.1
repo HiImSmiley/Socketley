@@ -4801,6 +4801,10 @@ Ten concurrent 256 MB requests would take about 5 GB.
 limits the multiplication but not the size.
 It holds each file once and shares it, so concurrency stops mattering.
 The cost is that it holds the file permanently from startup.
+With
+.BR \-\-shards ,
+each shard reads the directory and holds its own copy, so the files are held
+once per shard.
 A 64 MB file was measured at 154 MB, which is the file plus the two prebuilt
 responses.
 Otherwise, keep the files a TLS listener serves small, or put a plaintext
