@@ -7270,7 +7270,38 @@ void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
         return;
     }
 
-    if (!it->second[0]->send_route(to, frm, op, ref, payload))
+    // A write or a drop is performed on the runtime that minted the ref, at the shard holding the connection, which
+    // shard 0 is not for a ref another shard minted; a routed connection itself is on shard 0 of its target.
+    auto& shards = it->second;
+    if (op == worker_proto::route_op::write_many && shards.size() > 1)
+    {
+        std::vector<conn_ref> refs;
+        std::string_view msg;
+        if (!worker_proto::decode_route_refs(payload, refs, msg))
+            return;
+        std::vector<std::vector<conn_ref>> by_shard(shards.size());
+        for (const auto& r : refs)
+            if (conn_ref_shard(r) < shards.size())
+                by_shard[conn_ref_shard(r)].push_back(r);
+        for (size_t s = 0; s < shards.size(); ++s)
+        {
+            if (by_shard[s].empty() || !shards[s])
+                continue;
+            std::string part;
+            worker_proto::put_route_refs(part, by_shard[s].data(), by_shard[s].size(), msg);
+            if (!shards[s]->send_route(to, frm, op, ref, part))
+                LOG_WARN("could not reach the worker holding a routed runtime");
+        }
+        return;
+    }
+    const bool at_ref = op == worker_proto::route_op::write || op == worker_proto::route_op::drop;
+    const size_t at = at_ref ? conn_ref_shard(ref) : 0;
+    if (at >= shards.size() || !shards[at])
+    {
+        LOG_DEBUG("a routing frame named a connection on a shard that is gone");
+        return;
+    }
+    if (!shards[at]->send_route(to, frm, op, ref, payload))
         LOG_WARN("could not reach the worker holding a routed runtime");
 }
 

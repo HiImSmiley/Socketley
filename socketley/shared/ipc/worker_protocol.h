@@ -699,8 +699,17 @@ inline bool decode_route_frame(std::string_view payload_in, std::string& to,
     return r2.ok;
 }
 
-// A write_many frame: the frame encode_route_frame makes with no ref and, as its payload, u32 n, n refs and the
-// message, written in one pass so the message is copied once however many refs there are.
+// A write_many frame's payload: u32 n, n refs and the message.
+inline void put_route_refs(std::string& out, const conn_ref* refs, size_t n, std::string_view msg)
+{
+    socketley::bytes::append32(out, static_cast<uint32_t>(n));
+    for (size_t i = 0; i < n; ++i)
+        put_conn_ref(out, refs[i]);
+    put_str(out, msg);
+}
+
+// A write_many frame: the frame encode_route_frame makes with no ref and that payload, written in one pass so the
+// message is copied once however many refs there are.
 inline std::string encode_route_refs(std::string_view to, std::string_view from, const conn_ref* refs, size_t n,
                                      std::string_view msg)
 {
@@ -712,10 +721,7 @@ inline std::string encode_route_refs(std::string_view to, std::string_view from,
     out.push_back(static_cast<char>(route_op::write_many));
     put_conn_ref(out, conn_ref{});
     socketley::bytes::append32(out, static_cast<uint32_t>(inner));
-    socketley::bytes::append32(out, static_cast<uint32_t>(n));
-    for (size_t i = 0; i < n; ++i)
-        put_conn_ref(out, refs[i]);
-    put_str(out, msg);
+    put_route_refs(out, refs, n, msg);
     return out;
 }
 

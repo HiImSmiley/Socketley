@@ -4,7 +4,8 @@
 # gets it once, in the order it was sent, and a broadcast between two writes to
 # one of them arrives between them -- the broadcast is carried once per path to
 # the origin, beside the refs it is for, and each ref's share goes the way its
-# own writes go, whether that is the direct link or the daemon's leg.
+# own writes go, whether that is the direct link or the daemon's leg -- and with
+# a sharded origin, the daemon's leg takes it to the shard holding the client.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -42,7 +43,7 @@ TARGET_LUA="$SOCKETLEY_TMPD/target.lua"
 cat > "$TARGET_LUA" <<'LUAEOF'
 function on_connect(client_id)
     if client_id >= 16777216 then
-        -- The first write to a ref pins its path: the first client's goes up
+        -- The first write to a ref pins its path: the first clients' go up
         -- through the daemon, before the link exists, and the others' over it.
         self.send(client_id, "hi")
         socketley.log("RB_GOT " .. tostring(client_id))
@@ -71,18 +72,26 @@ end
 LUAEOF
 
 create_ok "target created" "$BIN" create server rb_target -p "$TARGET_PORT" --lua "$TARGET_LUA" -s
-create_ok "origin created" "$BIN" create server rb_origin -p "$ORIGIN_PORT" --lua "$ORIGIN_LUA" -s
-sleep 0.5
 
-# The clients, half connected before the peer link exists and half after it, so
-# some refs are pinned to the daemon's leg and some to the link: each one says
+for OSHARDS in 1 4; do
+echo "-- an origin of $OSHARDS shard(s)"
+"$BIN" stop rb_origin >/dev/null 2>&1; "$BIN" remove rb_origin >/dev/null 2>&1
+create_ok "origin created" "$BIN" create server rb_origin -p "$ORIGIN_PORT" --lua "$ORIGIN_LUA" --shards "$OSHARDS" -s
+sleep 0.5
+MARK=$(wc -c < "$SOCKETLEY_DLOG")
+
+# The clients, eight connected before the peer link exists and the rest after
+# it, so some refs are pinned to the daemon's leg, at four shards each shard's
+# first one most of all, and some to the link: each one says
 # `abc <i>` in turn, then the target broadcasts m1..m50, and every client
 # checks what it read.
-OUT=$(python3 - "$ORIGIN_PORT" "$TARGET_PORT" "$CLIENTS" "$SOCKETLEY_DLOG" <<'PY'
+OUT=$(python3 - "$ORIGIN_PORT" "$TARGET_PORT" "$CLIENTS" "$SOCKETLEY_DLOG" "$MARK" <<'PY'
 import socket, sys, time, selectors
-oport, tport, n, dlog = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+oport, tport, n, dlog, mark = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
 def routed():
-    try: return open(dlog, errors='replace').read().count('RB_GOT ')
+    try:
+        with open(dlog, 'rb') as f:
+            f.seek(mark); return f.read().decode(errors='replace').count('RB_GOT ')
     except OSError: return 0
 def wait_routed(k):
     for _ in range(200):
@@ -92,9 +101,9 @@ def wait_routed(k):
 socks = []
 for i in range(n):
     socks.append(socket.create_connection(('127.0.0.1', oport), timeout=5))
-    if i == 0:
-        # The first routed connection's frames go up through the daemon, which then links the two workers.
-        wait_routed(1); time.sleep(1.0)
+    if i == 7:
+        # The first routed connections' frames go up through the daemon, which then links the two workers.
+        wait_routed(8); time.sleep(1.0)
 if not wait_routed(n):
     print('ROUTED', routed()); sys.exit(0)
 bufs = [b''] * n
@@ -146,6 +155,7 @@ if [ "${mall:-0}" -eq "$CLIENTS" ] && [ "${morder:-0}" -eq "$CLIENTS" ]; then
 else
     fail "a run of broadcasts" "${mall:-0} of $CLIENTS clients read all 50, ${morder:-0} in order"
 fi
+done
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]
