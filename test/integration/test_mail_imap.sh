@@ -576,8 +576,8 @@ check "FETCH 1:*, FETCH * and STORE 1:* of an empty folder answer OK" "$r" "OK O
 # left there.
 cat > "$T/first_shard.py" <<'PY'
 import imaplib, re, subprocess
-def first_shard(port, smtp):
-    """A session on the first shard, the one listening for SMTP, not yet signed in."""
+def first_shard(port, smtp, other=False):
+    """A session on the first shard, the one listening for SMTP, or with other on another, not yet signed in."""
     def pid(q):
         m = re.search(r"pid=(\d+)", subprocess.run(["ss", "-tnpH" if "dport" in q else "-ltnpH", q],
                                                   capture_output=True).stdout.decode())
@@ -585,7 +585,7 @@ def first_shard(port, smtp):
     first = pid("sport = :%d" % smtp)
     for _ in range(200):
         M = imaplib.IMAP4("127.0.0.1", port)
-        if pid("sport = :%d and dport = :%d" % (port, M.sock.getsockname()[1])) == first:
+        if (pid("sport = :%d and dport = :%d" % (port, M.sock.getsockname()[1])) == first) != other:
             return M
         M.shutdown()
     raise SystemExit("no session reached the first shard")
@@ -813,6 +813,32 @@ PY
 set -- $r
 check "a delivery, then a fold before the shards that let the user go read it again" "${1:-}${2:-}${3:-}" "00True3"
 check "and it is new to the first session to see it on each shard" "${4:-}" "True"
+# A user is not let go while the storage still owes an answer about it, which would read the user again for nobody:
+# a LIST on a shard other than the first, its session gone while the storage is stopped for longer than a user is
+# kept.  That shard holds alice until the answer comes, and lets her go after it.
+SPID=$(ss -ltnpH "sport = :$PS" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+r=$(timeout 180 python3 - "$IMSH" "$PSH" "$BIN" "$T" "${SPID:-0}" <<'PY'
+import os, signal, subprocess, sys, time
+port, smtp, binary, spid = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[5])
+sys.path.insert(0, sys.argv[4]); from first_shard import first_shard
+def held(wait):
+    time.sleep(wait)
+    out = subprocess.run([binary, "stats", "msh"], capture_output=True, timeout=30).stdout.decode()
+    return "".join(map(str, sorted(int(l.split(":")[1]) for l in out.splitlines() if l.startswith("imap_users_held:"))))
+before = held(3)
+M = first_shard(port, smtp, other=True); M.login("alice", "alicepassword1")
+os.kill(spid, signal.SIGSTOP)
+try:
+    M.send(b"a1 LIST \"\" *\r\n")
+    time.sleep(0.3)
+    M.shutdown()
+    during = held(3.5)
+finally:
+    os.kill(spid, signal.SIGCONT)
+print(before, during, held(4))
+PY
+)
+check "a shard other than the first keeps a user its storage owes an answer about, and lets it go after" "$r" "001 011 001"
 
 # A literal's marker glued to an atom is no literal, so the bytes after it are never taken as one; a length that wraps
 # past the end of what came is refused before sign-in, and the connection answers on.

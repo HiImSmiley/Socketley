@@ -324,6 +324,8 @@ private:
         // When this shard last asked for it and last read its journal, so the turn reads only the journals in use.
         int64_t used_ms{0};
         int64_t caught_ms{0};
+        // Answers owed for it from the storage or a thread, which would read it again were it let go before they came.
+        uint32_t owed{0};
     };
     // What a shard had seen of a folder, by its UIDVALIDITY: the lowest UID still \Recent there, else its UIDNEXT, so a
     // message from there on is new to the shard however it was read again, a fold of the journal between or not.
@@ -336,6 +338,9 @@ private:
     uint64_t m_journal_writes{0};
     uint64_t m_listings{0};
     user_state& user(const std::string& name);
+    // The user read and kept from being let go until the last copy of what this returns is gone, for what answers it
+    // later.
+    std::shared_ptr<void> owe(const std::string& name);
     // Whether nothing here holds the user's folders or waits on its files, so its state may be let go.
     bool unused(const user_state& u) const;
     // The state of a user some shard keeps an index for, or null, nothing made for a name no mail or sign-in made.

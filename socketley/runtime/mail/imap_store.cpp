@@ -179,6 +179,7 @@ void imap_store::know_threads(const std::string& name, std::function<void()> don
         size_t next{0}, open{0}, left{0};
         bool pumping{false}, finished{false};
         std::function<void()> done;
+        std::shared_ptr<void> owed;
     };
     auto j = std::make_shared<job>();
     for (const auto& [n, f] : user(name).folders)
@@ -192,6 +193,7 @@ void imap_store::know_threads(const std::string& name, std::function<void()> don
     }
     j->left = j->todo.size();
     j->done = std::move(done);
+    j->owed = owe(name);
     // What was read is logged in one go, a message another shard gave a conversation meanwhile kept as it is.
     const auto finish = [this, name, j] {
         j->finished = true;
@@ -205,6 +207,7 @@ void imap_store::know_threads(const std::string& name, std::function<void()> don
                             lines += thread_line(t.uid, t.thread, t.folder);
                         }
         });
+        j->owed.reset();
         j->done();
     };
     auto pump = std::make_shared<std::function<void()>>();
@@ -1564,9 +1567,21 @@ bool imap_store::claim_fold(const user_state& u)
     return false;
 }
 
+std::shared_ptr<void> imap_store::owe(const std::string& name)
+{
+    ++user(name).owed;
+    return std::shared_ptr<void>(nullptr, [this, name, alive = m_alive](void*) {
+        if (!*alive)
+            return;
+        if (const auto at = m_users.find(name); at != m_users.end() && at->second.owed)
+            --at->second.owed;
+    });
+}
+
 bool imap_store::unused(const user_state& u) const
 {
-    if (u.locked || u.compacting || u.filters_compacting || u.unsynced || u.reserved || !u.filters_out.empty())
+    if (u.locked || u.compacting || u.filters_compacting || u.unsynced || u.reserved || u.owed ||
+        !u.filters_out.empty())
         return false;
     return std::all_of(u.folders.begin(), u.folders.end(), [](const auto& kv) {
         return kv.second.use_count() == 1 && kv.second->waiting.empty() && !kv.second->syncing;
@@ -1599,7 +1614,7 @@ void imap_store::folders(const std::string& name, std::function<void(std::vector
     rq.prefix = name + "/";
     rq.delimiter = "/";
     boxes->ask(boxes->storage(), rpc::encode(rq),
-               [this, name, done, alive = m_alive](request_status st, std::string_view bytes) {
+               [this, name, done, owed = owe(name), alive = m_alive](request_status st, std::string_view bytes) {
                    if (!*alive)
                        return;
                    user_state& u = user(name);
@@ -1741,7 +1756,7 @@ void imap_store::note_text(const std::string& name, const std::string& key, std:
             const mime::part root = mime::parse(*bytes);
             *filter = text_filter(*bytes, header_block(*bytes), &root);
         },
-        [this, name, key, filter, alive = m_alive] {
+        [this, name, key, filter, owed = owe(name), alive = m_alive] {
             if (*alive)
                 keep_text_filter(name, email_hash(key), std::move(*filter));
         });
