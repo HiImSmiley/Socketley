@@ -332,15 +332,154 @@ std::string imap_store::rights(const std::string& owner, const std::string& fold
     if (!u)
         return {};
     const auto it = u->folders.find(canonical(folder));
-    if (it == u->folders.end())
-        return {};
+    return it == u->folders.end() ? std::string() : granted(it->second->acl, who);
+}
+
+std::string imap_store::granted(const std::map<std::string, std::string>& acl, const std::string& who)
+{
     std::string out;
     for (const char* id : {who.c_str(), "anyone"})
-        if (const auto a = it->second->acl.find(id); a != it->second->acl.end())
+        if (const auto a = acl.find(id); a != acl.end())
             for (const char c : a->second)
                 if (out.find(c) == std::string::npos)
                     out += c;
     return out;
+}
+
+void imap_store::apply_acls(acl_view& v, std::string_view text)
+{
+    // The journal's F, D and L lines as apply() reads them, every other line left alone.
+    while (!text.empty())
+    {
+        const std::string_view line = socketley::take_item(text, '\n');
+        if (line.size() < 3 || line[1] != ' ')
+            continue;
+        std::string_view l = line.substr(2);
+        if (line[0] == 'F')
+        {
+            const size_t sp = l.find(' ');
+            l = sp == std::string_view::npos ? std::string_view{} : l.substr(sp + 1);
+            if (!l.empty())
+                v.folders.try_emplace(std::string(l));
+        }
+        else if (line[0] == 'D')
+            v.folders.erase(std::string(l));
+        else if (line[0] == 'L')
+        {
+            const size_t t1 = l.find('\t'), t2 = t1 == std::string_view::npos ? t1 : l.find('\t', t1 + 1);
+            if (t2 == std::string_view::npos)
+                continue;
+            if (const auto f = v.folders.find(std::string(l.substr(0, t1))); f != v.folders.end())
+            {
+                const std::string who(l.substr(t1 + 1, t2 - t1 - 1)), r(l.substr(t2 + 1));
+                if (r.empty())
+                    f->second.erase(who);
+                else
+                    f->second[who] = r;
+            }
+        }
+    }
+}
+
+const std::map<std::string, std::map<std::string, std::string>>* imap_store::folder_acls(const std::string& owner)
+{
+    const std::string base = path_of(owner);
+    struct stat snap{}, log{};
+    const bool has_snap = ::stat(base.c_str(), &snap) == 0, has_log = ::stat((base + ".log").c_str(), &log) == 0;
+    if (!has_snap && !has_log)
+    {
+        m_acls.erase(owner);
+        return nullptr;
+    }
+    const int64_t mtime = has_snap ? static_cast<int64_t>(snap.st_mtim.tv_sec) * 1000000000 + snap.st_mtim.tv_nsec : 0;
+    const auto [it, fresh] = m_acls.try_emplace(owner);
+    acl_view& v = it->second;
+    // The same snapshot and journal read up to here: only the lines appended since, up to the last whole one, as
+    // catch_up() reads them.
+    const uint64_t snap_ino = has_snap ? snap.st_ino : 0, snap_size = has_snap ? static_cast<uint64_t>(snap.st_size) : 0;
+    if (!fresh && has_log && v.snap_ino == snap_ino && v.snap_size == snap_size && v.snap_mtime == mtime &&
+        v.log_ino == log.st_ino && static_cast<uint64_t>(log.st_size) >= v.log_off)
+    {
+        if (static_cast<uint64_t>(log.st_size) == v.log_off)
+            return &v.folders;
+        const int fd = ::open((base + ".log").c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0)
+        {
+            struct stat now{};
+            if (::fstat(fd, &now) == 0 && now.st_ino == v.log_ino)
+            {
+                std::string more(static_cast<size_t>(std::max(now.st_size, log.st_size)) - v.log_off, '\0');
+                const ssize_t n = ::pread(fd, more.data(), more.size(), static_cast<off_t>(v.log_off));
+                ::close(fd);
+                more.resize(n > 0 ? static_cast<size_t>(n) : 0);
+                if (const size_t whole = more.rfind('\n'); whole != std::string::npos)
+                {
+                    apply_acls(v, std::string_view(more).substr(0, whole + 1));
+                    v.log_off += whole + 1;
+                }
+                return &v.folders;
+            }
+            ::close(fd);
+        }
+    }
+    // Read whole as reload() reads it: under the user's lock, shared, a journal of another snapshot left out.
+    const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock >= 0 && ::flock(lock, LOCK_SH) != 0) {}
+    std::string snap_text, log_text;
+    struct stat ss{}, ls{};
+    const bool snap_read =
+        socketley::read_file(base, snap_text, {.missing_ok = true}, nullptr) && ::stat(base.c_str(), &ss) == 0;
+    const bool log_read = socketley::read_file(base + ".log", log_text, {.missing_ok = true}, nullptr) &&
+                          ::stat((base + ".log").c_str(), &ls) == 0;
+    if (lock >= 0)
+        ::close(lock);
+    v = acl_view{};
+    v.snap_ino = snap_read ? ss.st_ino : 0;
+    v.snap_size = snap_read ? static_cast<uint64_t>(ss.st_size) : 0;
+    v.snap_mtime = snap_read ? static_cast<int64_t>(ss.st_mtim.tv_sec) * 1000000000 + ss.st_mtim.tv_nsec : 0;
+    uint64_t gen = 0;
+    if (snap_text.starts_with("SKLIMAP"))
+    {
+        // F <uidvalidity> <uidnext> <subscribed> [<highestmodseq>] <name>, v1 without the modseq; and L lines.
+        const bool v1 = snap_text.starts_with("SKLIMAP1\n");
+        std::string_view rest = snap_text;
+        const std::string_view head = socketley::take_item(rest, '\n');
+        if (!v1 && head.size() > 9)
+            gen = std::strtoull(std::string(head.substr(9)).c_str(), nullptr, 10);
+        while (!rest.empty())
+        {
+            const std::string_view line = socketley::take_item(rest, '\n');
+            if (line.size() < 2)
+                continue;
+            if (line[0] == 'F')
+            {
+                std::string_view l = line.substr(2);
+                for (int i = 0; i < (v1 ? 3 : 4); ++i)
+                {
+                    const size_t sp = l.find(' ');
+                    l = sp == std::string_view::npos ? std::string_view{} : l.substr(sp + 1);
+                }
+                if (!l.empty())
+                    v.folders[std::string(l)].clear();
+            }
+            else if (line[0] == 'L')
+                apply_acls(v, line);
+        }
+    }
+    if (log_read)
+    {
+        v.log_ino = ls.st_ino;
+        std::string_view rest = log_text;
+        const std::string_view head = socketley::take_item(rest, '\n');
+        const size_t whole = log_text.rfind('\n') == std::string::npos ? 0 : log_text.rfind('\n') + 1;
+        if (head.starts_with("SKLIMAPLOG ") && std::strtoull(std::string(head.substr(11)).c_str(), nullptr, 10) == gen)
+        {
+            const size_t from = head.size() + 1;
+            apply_acls(v, std::string_view(log_text).substr(from, std::max(from, whole) - from));
+        }
+        v.log_off = whole;
+    }
+    return &v.folders;
 }
 
 bool imap_store::set_acl(const std::string& owner, const std::string& folder, const std::string& who,
@@ -467,7 +606,18 @@ std::vector<std::string> imap_store::push_users()
 
 std::vector<std::pair<std::string, std::string>> imap_store::shared_with(const std::string& who)
 {
+    // An owner's ACL is read from its index where this shard holds it, and from its files without one elsewhere.
+    const auto may_list = [&](const std::string& owner, const std::string& folder) {
+        if (const auto u = m_users.find(owner); u != m_users.end() && u->second.loaded)
+            return rights(owner, folder, who).find('l') != std::string::npos;
+        const auto* acls = folder_acls(owner);
+        if (!acls)
+            return false;
+        const auto f = acls->find(canonical(folder));
+        return f != acls->end() && granted(f->second, who).find('l') != std::string::npos;
+    };
     std::vector<std::pair<std::string, std::string>> out;
+    std::unordered_set<std::string> owners;
     for (const auto& key : live_lines(list_path(".shares")))
     {
         // owner \t folder \t grantee.
@@ -475,11 +625,13 @@ std::vector<std::pair<std::string, std::string>> imap_store::shared_with(const s
         if (b == std::string::npos)
             continue;
         const std::string owner = key.substr(0, a), folder = key.substr(a + 1, b - a - 1), grantee = key.substr(b + 1);
-        if ((grantee == who || grantee == "anyone") && owner != who &&
-            rights(owner, folder, who).find('l') != std::string::npos &&
+        owners.insert(owner);
+        if ((grantee == who || grantee == "anyone") && owner != who && may_list(owner, folder) &&
             std::find(out.begin(), out.end(), std::make_pair(owner, folder)) == out.end())
             out.emplace_back(owner, folder);
     }
+    // An owner who shares nothing any more is not kept.
+    std::erase_if(m_acls, [&](const auto& kv) { return !owners.count(kv.first); });
     return out;
 }
 

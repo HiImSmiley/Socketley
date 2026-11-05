@@ -34,6 +34,8 @@
 #   * AUTHENTICATE PLAIN not signing in, with its response at once or after the continuation; DELETE INBOX taken; an
 #     APPEND past the largest message waited for; the command parser answering differently as its input is cut
 #   * BINARY giving a part still encoded, a NUL in a plain literal, or an encoding it cannot undo answered OK
+#   * a LIST that reads each sharing owner's whole index to learn one ACL, or one that answers from the owner's files
+#     other than its index would: a right given or taken, a folder deleted or made again, the journal folded
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -57,6 +59,8 @@ P=$((SL_PORT_BASE+1905))
 IM=$((SL_PORT_BASE+1906))
 PI=$((SL_PORT_BASE+1907))
 PS=$((SL_PORT_BASE+1908))
+P3=$((SL_PORT_BASE+1909))
+IM3=$((SL_PORT_BASE+1910))
 trap daemon_stop EXIT
 
 echo "=== Integration: the IMAP index -- keywords, quota, COPY, folders and searches ==="
@@ -539,6 +543,78 @@ made=$(find "$HOME/.local/share" -path '*/mail/m.imap/nosuchowner*' 2>/dev/null 
 tally < <(run cuts | grep -E '^(ok|bad) ')
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1; ready_tcp 127.0.0.1 "$IM" >/dev/null
 tally < <(run after | grep -E '^(ok|bad) ')
+
+# Two shards, alice on the first and bob, who shares, on the other: alice's LIST reads bob's ACLs from his files, and the
+# first shard never holds his index.
+"$BIN" create mail ms -p "$P3" --mail-domain example.test --idp auth --storage st/mails --imap "$IM3" --shards 2 -s \
+    >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$IM3" || bad "the sharded IMAP port listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+cat > "$T/shared_list.py" <<'PY'
+import imaplib, os, re, subprocess, sys, time
+port, smtp, binary, home = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+def say(name, cond, why=""):
+    print(("ok " if cond else "bad ") + name + ("" if cond else ": " + str(why)[:600]))
+def pid(flags, q):
+    m = re.search(r"pid=(\d+)", subprocess.run(["ss", flags, q], capture_output=True).stdout.decode())
+    return m.group(1) if m else None
+first = pid("-ltnpH", "sport = :%d" % smtp)
+def on(want_first, user, password):
+    for _ in range(200):
+        M = imaplib.IMAP4("127.0.0.1", port)
+        if (pid("-tnpH", "sport = :%d and dport = :%d" % (port, M.sock.getsockname()[1])) == first) == want_first:
+            M.login(user, password)
+            return M
+        M.shutdown()
+    raise SystemExit("bad a session reached the shard it was for")
+def held_first():
+    # Stats come a quarter second late at most.
+    time.sleep(0.6)
+    out = subprocess.run([binary, "stats", "ms"], capture_output=True, timeout=30).stdout.decode()
+    part = out.split("[shard 1]")[0]
+    return [int(l.split(":")[1]) for l in part.splitlines() if l.startswith("imap_users_held:")]
+def shared(A):
+    # An index a shard holds is caught up a second after it was last read, so a change is a second old when asked.
+    time.sleep(1.1)
+    typ, data = A.list('""', '"Other Users/*"')
+    return sorted(re.sub(r'^.*"/" ', "", x.decode()).strip('"') for x in data if x and b"\\Noselect" not in x)
+B = on(False, "bob", "bobpassword12")
+B.create("Crew"); B.setacl("Crew", "alice", "lr")
+B.create("Gone"); B.setacl("Gone", "alice", "lr"); B.delete("Gone")
+A = on(True, "alice", "alicepassword1")
+l = shared(A)
+say("a share is listed on another shard than its owner's, a folder deleted since is not", l == ["Other Users/bob/Crew"], l)
+say("and that shard holds the user who asked, not the owner", held_first() == [1], held_first())
+B.create("Open"); B.setacl("Open", "anyone", "l"); B.create("Gone")
+l = shared(A)
+say("a share to anyone is listed at once, a folder made again under a shared name is not", l == ["Other Users/bob/Crew",
+    "Other Users/bob/Open"], l)
+B.deleteacl("Crew", "alice")
+l = shared(A)
+say("a right taken away is not listed", l == ["Other Users/bob/Open"], l)
+log = next((os.path.join(d, f) for d, _, fs in os.walk(home) for f in fs if f == "bob.log" and d.endswith("ms.imap")), None)
+for k in range(4):
+    B.append("INBOX", None, None, b"Subject: fold %d\r\n\r\nx\r\n" % k)
+B.select("INBOX")
+journal = os.stat(log).st_ino
+folded = False
+for i in range(4000):
+    B.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Seen)")
+    if i % 50 == 0 and os.stat(log).st_ino != journal:
+        folded = True
+        break
+for _ in range(100):
+    if folded or os.stat(log).st_ino != journal:
+        folded = True
+        break
+    B.noop(); time.sleep(0.1)
+B.setacl("Crew", "alice", "lr")
+l = shared(A)
+say("after bob's journal is folded into a snapshot, a share is read from it and from the new journal",
+    folded and l == ["Other Users/bob/Crew", "Other Users/bob/Open"], (folded, l))
+say("and the first shard still holds alice alone", held_first() == [1], held_first())
+A.logout(); B.logout()
+PY
+tally < <(timeout 180 python3 "$T/shared_list.py" "$IM3" "$P3" "$BIN" "$HOME/.local/share" 2>&1 | grep -E '^(ok|bad) ')
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

@@ -397,6 +397,19 @@ private:
 
     mail_run& m_run;
     std::unordered_map<std::string, user_state> m_users;
+    // A sharing owner's folders and their ACLs, read from its snapshot and journal without its index, for LIST.
+    struct acl_view
+    {
+        uint64_t snap_ino{0}, snap_size{0}, log_ino{0}, log_off{0};
+        int64_t snap_mtime{0};
+        std::map<std::string, std::map<std::string, std::string>> folders;
+    };
+    std::unordered_map<std::string, acl_view> m_acls;
+    // The owner's folders as its index would have them, null where it has no index.
+    const std::map<std::string, std::map<std::string, std::string>>* folder_acls(const std::string& owner);
+    static void apply_acls(acl_view& v, std::string_view text);
+    // What `who` may do on a folder whose ACL is `acl`: their own rights and anyone's.
+    static std::string granted(const std::map<std::string, std::string>& acl, const std::string& who);
     int64_t m_expunge_swept_ms{0};
     // Junk and Trash of every user known emptied of what they held longer than --autoexpunge.
     void autoexpunge(int64_t now);
