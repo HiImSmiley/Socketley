@@ -263,11 +263,14 @@ size_t broker::consume(connection& c, std::string_view in)
         c.last_rx_ms = now;
         // A publisher is held while the other shards cannot take more, its bytes waiting in its socket rather than its
         // messages being dropped on the way.
+        // A retained message goes to every shard and is never dropped on the way, so its publisher is held as one at
+        // QoS 1 is.
         const uint8_t qos = static_cast<uint8_t>((f.flags >> 1) & 3);
+        const uint8_t held_as = (f.flags & 1) ? std::max<uint8_t>(qos, 1) : qos;
         if (m_cfg.sharded && f.type == packet_type::publish && c.ph == connection::phase::open &&
-            !m_hooks.publish_room(qos, c.sent_to))
+            !m_hooks.publish_room(held_as, c.sent_to))
         {
-            c.held_qos = qos;
+            c.held_qos = held_as;
             if (!c.held)
             {
                 c.held = true;

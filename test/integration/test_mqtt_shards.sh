@@ -17,6 +17,7 @@
 #   * batches given up and sent again reaching a shard out of order, or taken twice
 #   * a clean start asking every shard, two at once both kept, or one taking another user's fresh session
 #   * the retained messages written by every shard, or a shard started without them
+#   * a flood of retained messages at QoS 0 queued without bound for the other shards
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -487,6 +488,31 @@ if phase == "late":
         far.disconnect()
         pub.disconnect()
     guarded("late", late)
+
+    def retained_flood():
+        def waiting():
+            out = subprocess.run([binary, "stats", "fl"], capture_output=True, timeout=30).stdout.decode()
+            return sum(int(l.partition(":")[2]) for l in out.splitlines() if l.startswith("shard_waiting_bytes:"))
+        # Two hundred MB of retained messages at QoS 0, which every shard is given and none may drop.
+        pub = connected(port, "rf-pub")
+        body = s("rf/x") + b"\x00" + b"r" * 100000
+        blob = (bytes([PUBLISH << 4 | 1]) + varint(len(body)) + body) * 2000
+        sender = threading.Thread(target=lambda: pub.sock.sendall(blob))
+        pub.sock.settimeout(None)
+        sender.start()
+        peak = 0
+        while sender.is_alive():
+            peak = max(peak, waiting())
+            time.sleep(0.1)
+        for _ in range(10):
+            peak = max(peak, waiting())
+            time.sleep(0.1)
+        sender.join()
+        truth("a publisher of retained messages at QoS 0 is held while a shard cannot take more", peak < 32 << 20,
+              "%d bytes waited" % peak)
+        truth("and is still connected", pub.ping())
+        pub.disconnect()
+    guarded("retained_flood", retained_flood)
 
 if phase == "owned":
     def owned():
