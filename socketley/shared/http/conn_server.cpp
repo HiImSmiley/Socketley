@@ -215,8 +215,9 @@ void conn_server::accept_done(struct io_uring_cqe* cqe)
     const int fd = cqe->res;
     if (fd >= 0)
     {
-        const size_t limit = m_rt.get_max_connections() ? m_rt.get_max_connections() : m_max_conns;
-        if (m_stopped || m_conns.size() >= limit)
+        // The flag's limit is the runtime's, the default this process's own.
+        const size_t asked = m_rt.get_max_connections();
+        if (m_stopped || (asked ? m_rt.connections_full(m_conns.size(), asked) : m_conns.size() >= m_max_conns))
             m_loop.close_fd(fd);
         else
         {

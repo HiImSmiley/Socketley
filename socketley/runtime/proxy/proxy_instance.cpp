@@ -3066,7 +3066,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
     if (SOCKETLEY_LIKELY(client_fd >= 0))
     {
         if (SOCKETLEY_UNLIKELY(client_fd >= MAX_FDS ||
-            (m_max_conns_cached > 0 && m_client_count >= m_max_conns_cached)))
+            connections_full(m_client_count, m_max_conns_cached)))
         {
             close_tracked(client_fd);
             goto proxy_resubmit_accept;

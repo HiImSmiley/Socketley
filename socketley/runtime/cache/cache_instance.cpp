@@ -581,6 +581,8 @@ bool cache_instance::setup(event_loop& loop)
     m_shard_i = get_shard_index();
     if (m_shard_i >= m_shard_n)
         m_shard_i = 0;
+    // Again now the shard count is known, whichever of the two the config set first.
+    set_max_memory(m_max_memory);
 
     m_base_port = get_port();
     if (m_base_port == 0)
@@ -1598,7 +1600,7 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
         return false;
     }
 
-    if (m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached)
+    if (connections_full(m_clients.size(), m_max_conns_cached))
     {
         close_tracked(client_fd);
         return false;
@@ -11135,7 +11137,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 case fnv1a("maxmemory"):
                     resp::encode_array_header_into(rb, 2);
                     resp::encode_bulk_into(rb, "maxmemory");
-                    resp::encode_bulk_into(rb, std::to_string(m_store.get_max_memory()));
+                    resp::encode_bulk_into(rb, std::to_string(get_max_memory()));
                     break;
                 // Both are empty here, and empty is the true answer rather
                 // than an absent one.
@@ -12455,14 +12457,17 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
 
 // ─── Maxmemory / Eviction ───
 
+// --maxmemory is the runtime's, and a key lives on one shard, so each shard's store holds its share of it.
 void cache_instance::set_max_memory(size_t bytes)
 {
-    m_store.set_max_memory(bytes);
+    m_max_memory = bytes;
+    const uint32_t n = std::max<uint32_t>(1, get_shards());
+    m_store.set_max_memory(bytes && n > 1 ? std::max<size_t>(1, bytes / n) : bytes);
 }
 
 size_t cache_instance::get_max_memory() const
 {
-    return m_store.get_max_memory();
+    return m_max_memory;
 }
 
 void cache_instance::set_eviction(eviction_policy policy)

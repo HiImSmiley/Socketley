@@ -925,10 +925,12 @@ void dns_run::accept_done(tcp_listener& l, struct io_uring_cqe* cqe)
     const int fd = cqe->res;
     if (fd >= 0)
     {
-        const uint32_t limit = m_owner.get_max_connections() ? m_owner.get_max_connections() : tcp_max_conns;
-        if (!m_stopped && m_conns.size() >= limit)
+        // The flag's limit is the runtime's, the default this process's own.
+        const uint32_t asked = m_owner.get_max_connections();
+        const auto full = [&] { return asked ? m_owner.connections_full(m_conns.size(), asked) : m_conns.size() >= tcp_max_conns; };
+        if (!m_stopped && full())
             evict_quietest();
-        if (m_stopped || m_conns.size() >= limit)
+        if (m_stopped || full())
         {
             ++m_c.tcp_refused;
             m_loop.close_fd(fd);

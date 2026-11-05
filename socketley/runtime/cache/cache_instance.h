@@ -1002,6 +1002,8 @@ private:
     void log_lua_mutation(std::initializer_list<std::string_view> parts);
 
     uint32_t m_shard_n{1};
+    // What --maxmemory asked for, the whole runtime's; the store holds this shard's share.
+    size_t m_max_memory{0};
     uint32_t m_shard_i{0};
 
     // True while this shard is answering a crossing from a sibling rather than

@@ -1127,9 +1127,11 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
         const std::string net = socketley::address_key(ip);
         const bool smtp_port = l.kind == port_kind::smtp || l.kind == port_kind::submission || l.kind == port_kind::lmtp;
         const bool imap_port = l.kind == port_kind::imap || l.kind == port_kind::imaps;
-        const size_t limit = m_owner.get_max_connections() ? m_owner.get_max_connections() : default_max_conns;
+        // The flag's limit is the runtime's, the default this process's own.
+        const size_t asked = m_owner.get_max_connections();
         const uint32_t per_ip = l.kind == port_kind::smtp ? smtp_per_ip : other_per_ip;
-        const bool full = limit && m_conns.size() >= limit;
+        const bool full = asked ? m_owner.connections_full(m_conns.size(), asked)
+                                : default_max_conns && m_conns.size() >= default_max_conns;
         const bool crowded = !loopback(peer) && m_clients[net].conns >= per_ip;
         // LMTP takes mail for the mailboxes with no check of it, so only a server on this machine may speak it.
         const bool stranger = l.kind == port_kind::lmtp && !loopback(peer);

@@ -647,6 +647,22 @@ public:
             m_sibling_sink(msg);
     }
 
+    // Whether a shard holding `mine` connections is at `limit`, which --max-connections sets for the runtime and not
+    // for each of its shards, the siblings counted as they published on their last turn.
+    bool connections_full(size_t mine, size_t limit) const
+    {
+        if (limit == 0)
+            return false;
+        uint64_t all = mine;
+        if (m_shards > 1 && m_shard_stats.mapped())
+        {
+            const uint64_t sum = m_shard_stats.sum_active();
+            const uint64_t own = m_shard_stats.active_at(m_shard_index);
+            all += sum > own ? sum - own : 0;
+        }
+        return all >= limit;
+    }
+
     // How many connections this runtime has counting its sibling shards,
     // publishing our own count first so a script told a client connected sees
     // that client in the answer.

@@ -3454,6 +3454,13 @@ Both spellings are accepted and mean the same thing.
 Limits the number of concurrent connections. New connections beyond the limit
 are closed immediately. 0 means no limit (default). Alias:
 .BR \-\-max\-conn .
+.IP
+With
+.BR \-\-shards ,
+the limit is the runtime's, not each shard's.
+A shard counts its siblings' connections as they published them on their last
+turn, so connections accepted on two shards in the same instant can pass the
+limit by a few.
 .TP
 .BI "\-\-read\-buffer " "size"
 The most data the runtime accumulates from one connection before it refuses
@@ -3669,6 +3676,13 @@ token.
 Limits total messages per second across all connections, using a shared token
 bucket. A server drops excess messages silently; a cache answers them with an
 error. 0 means no limit (default).
+.IP
+With
+.BR \-\-shards ,
+the rate is the runtime's: each shard refills its own bucket with its share,
+the rate divided by the shard count and at least one a second.
+The kernel spreads connections over the shards, so this holds for many
+clients; a single connection lives on one shard and gets that shard's share.
 .IP
 A client refuses it for the same reason as
 .BR \-\-rate\-limit :
@@ -6936,6 +6950,13 @@ The most memory the cache may use for its data.
 Takes a size with K, M or G (for example 100M or 1G).
 When the limit is exceeded, the eviction policy decides what happens.
 0 means no limit, which is the default.
+.IP
+With
+.BR \-\-shards ,
+the limit is the cache's: a key lives on one shard, so each shard holds its
+share, the limit divided by the shard count, and
+.B maxmemory
+answers the sum.
 .IP
 The only suffixes are
 .BR K ", " M " and " G .

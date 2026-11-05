@@ -1114,10 +1114,13 @@ double runtime_instance::get_global_rate_limit() const { return m_global_rate_li
 bool runtime_instance::check_global_rate_limit()
 {
     if (m_global_rate_limit <= 0.0) return true;
+    // The rate is the runtime's, and a sharded one refills each shard's bucket with its share, at least one, as
+    // --rrl does: a share under one would never fill to a whole token.
+    const double rate = m_shards > 1 ? std::max(1.0, m_global_rate_limit / m_shards) : m_global_rate_limit;
     auto now = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(now - m_global_last).count();
     m_global_last = now;
-    m_global_tokens = std::min(m_global_rate_limit, m_global_tokens + elapsed * m_global_rate_limit);
+    m_global_tokens = std::min(rate, m_global_tokens + elapsed * rate);
     if (m_global_tokens < 1.0) return false;
     m_global_tokens -= 1.0;
     return true;

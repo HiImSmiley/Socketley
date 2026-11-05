@@ -389,8 +389,7 @@ void mqtt_run::accept_done(listener& l, struct io_uring_cqe* cqe)
     const int fd = cqe->res;
     if (fd >= 0)
     {
-        const size_t limit = m_owner.get_max_connections();
-        if (m_stopped || (limit && m_conns.size() >= limit))
+        if (m_stopped || m_owner.connections_full(m_conns.size(), m_owner.get_max_connections()))
             m_loop.close_fd(fd);
         else
         {

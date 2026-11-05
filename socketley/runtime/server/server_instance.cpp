@@ -3567,7 +3567,7 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
     }
 
     // Max connections check
-    if (SOCKETLEY_UNLIKELY(m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached))
+    if (SOCKETLEY_UNLIKELY(connections_full(m_clients.size(), m_max_conns_cached)))
     {
         close_tracked(client_fd);
         return false;

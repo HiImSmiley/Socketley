@@ -514,7 +514,7 @@ bool storage_run::adopt_external(int fd)
 
 void storage_run::adopt(int fd)
 {
-    if (m_max_conns > 0 && m_conns.size() >= m_max_conns)
+    if (m_owner.connections_full(m_conns.size(), m_max_conns))
     {
         m_loop.close_fd(fd);
         return;
