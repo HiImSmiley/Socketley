@@ -8420,11 +8420,10 @@ bool cache_instance::lua_persist(std::string_view key)
 void cache_instance::fan_publish_siblings(std::string_view channel,
                                           std::string_view message)
 {
-    // RESP and not the text form, because a message holding a newline or a
-    // space is a message and not two commands.
+    // RESP and not the text form, because a message holding a newline is one message, and built only at the first
+    // sibling the filter keeps.
     std::string_view args[3] = {"publish", channel, message};
     std::string      cmd;
-    rebuild_resp(cmd, args, 3);
 
     const auto&    tbl      = shard_stats_table();
     const bool     filtered = tbl.mapped() && tbl.count() == m_shard_n;
@@ -8449,6 +8448,8 @@ void cache_instance::fan_publish_siblings(std::string_view channel,
         // Gathered for the turn, because a crossing each for a script that
         // publishes in a loop filled the channel and the sibling's parked
         // requests, and three quarters of 2,000 publishes were lost.
+        if (cmd.empty())
+            rebuild_resp(cmd, args, 3);
         std::string& batch = m_lua_pub[sh];
         if (batch.empty())
             batch.assign(shard_batch_resp);
