@@ -104,6 +104,11 @@ print(len(segs), len(wrong), st, len(seen), seen == list(range(400)), evicted)
 PY
 )
 read -r segs wrong qst qn qall evicted <<<"$out"
+# A worker's figures reach the daemon every 250 ms, and the reads and the query take less: read once all are counted.
+for _ in $(seq 1 50); do
+    [ "$("$BIN" stats d 2>/dev/null | awk -F: '$1=="reads" {print $2}')" -ge 3000 ] 2>/dev/null && break
+    sleep 0.1
+done
 fetched=$("$BIN" stats d 2>/dev/null | awk -F: '$1=="fetched" {print $2}')
 echo "  3000 documents of 2 KB in ${segs:-?} segment(s), read with the page cache let go of: ${wrong:-?} wrong, ${fetched:-none} brought through the ring"
 echo "  a query over them cold: status ${qst:-?}, ${qn:-?} of 400 whole"
