@@ -55,7 +55,16 @@ template <uint32_t First, uint32_t Max = 256 * 1024>
 class read_buffer
 {
 public:
-    char* data() { return m_size.next() == First ? m_small : m_big.get(); }
+    // The first size is made at the first read, so a holder that never reads -- a storage connection without TLS
+    // keeps one for its bodies -- costs a pointer and not First bytes.
+    char* data()
+    {
+        if (m_size.next() != First)
+            return m_big.get();
+        if (!m_small)
+            m_small = std::make_unique_for_overwrite<char[]>(First);
+        return m_small.get();
+    }
     uint32_t size() const { return m_size.next(); }
 
     // Back to the first size and its heap given back, for a connection gone quiet; only with no read in flight.
@@ -83,7 +92,7 @@ public:
 
 private:
     read_size m_size{First, Max};
-    char m_small[First];
+    std::unique_ptr<char[]> m_small;
     std::unique_ptr<char[]> m_big;
     uint32_t m_big_size{0};
 };
