@@ -446,14 +446,17 @@ bool mqtt_run::shared_here(std::string_view key)
     if (!sharded() || m_peers.empty())
         return true;
     const uint32_t me = m_owner.get_shard_index();
-    std::vector<uint32_t> candidates{me};
+    std::vector<uint32_t>& candidates = m_candidates;
+    candidates.assign(1, me);
     for (uint32_t j = 0; j < m_peers.size(); ++j)
-        if (j != me && m_peers[j].held.contains(std::string(key)))
+        if (j != me && m_peers[j].held.contains(key))
             candidates.push_back(j);
     if (candidates.size() == 1)
         return true;
-    uint64_t& turn = m_group_turn[std::string(key)];
-    const uint32_t pick = candidates[turn++ % candidates.size()];
+    auto t = m_group_turn.find(key);
+    if (t == m_group_turn.end())
+        t = m_group_turn.emplace(std::string(key), 0).first;
+    const uint32_t pick = candidates[t->second++ % candidates.size()];
     if (pick == me)
         return true;
     m_assign[pick].push_back(std::string(key));

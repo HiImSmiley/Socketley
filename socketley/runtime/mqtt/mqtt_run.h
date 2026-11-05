@@ -318,7 +318,7 @@ private:
     // What the other shards subscribe to, one tree each, and the shared groups among it.
     struct peer
     {
-        std::unordered_map<std::string, size_t> held;
+        std::unordered_map<std::string, size_t, string_hash, string_equal> held;
         // The clients it holds a session of, so a clean start asks only the shards that may have one to end.
         std::unordered_set<std::string> clients;
         bool known{false};
@@ -347,7 +347,9 @@ private:
     std::vector<uint8_t> m_plain;
     // The shards the last message shared was handed to.
     uint64_t m_reached{0};
-    std::unordered_map<std::string, uint64_t> m_group_turn;
+    std::unordered_map<std::string, uint64_t, string_hash, string_equal> m_group_turn;
+    // The shards that could serve a shared group, kept from one message to the next.
+    std::vector<uint32_t> m_candidates;
     // A CONNECT waiting for the other shards to give its session up.
     struct pending_claim
     {
