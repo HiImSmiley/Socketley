@@ -103,7 +103,8 @@ check 'grep -qE "membership at [0-9]+: voters [0-9a-f]+\(a\); learners" "$T/a.lo
       "no committed membership ever held a learner"
 check 'grep -q "promoting .*(b) to voter" "$T/a.log" && grep -q "promoting .*(c) to voter" "$T/a.log"' \
       "a learner was never promoted"
-check 'wait_for 5 "grep -q \"joined the cluster as a voter\" $T/b.log"' "b never said it had joined"
+# Said once, by the second's check, as what b is then: a learner if its promotion is still to come.
+check 'wait_for 5 "grep -qE \"joined the cluster as a (voter|learner)\" $T/b.log"' "b never said it had joined"
 converged() { local x; x=$(field a commit); [ -n "$x" ] && [ "$x" = "$(field b commit)" ] && [ "$x" = "$(field c commit)" ]; }
 check 'wait_for 10 converged' "the three commit indexes did not converge"
 check '[ "$(HOME=$T/a/home SOCKETLEY_SOCKET=$(sock a) "$BIN" cluster raft-status >/dev/null 2>&1; echo $?)" = 0 ]' \
@@ -148,7 +149,8 @@ else
 fi
 L2=$(leader_of "${survivors[@]}" || true)
 check '[ -n "$L2" ] && [ "$(field "$L2" term)" -gt "$old_term" ]' "the new leader's term is not above $old_term"
-check '[ -n "$L2" ] && status "$L2" | grep -q "^quorum: *reachable (2 of 3"' "the survivors do not report a reachable quorum"
+# Heard within one election timeout: a follower whose WAL fsync is still out sends nothing, so it is waited for.
+check '[ -n "$L2" ] && wait_for 10 "saw \"^quorum: *reachable \\(2 of 3\" status $L2"' "the survivors do not report a reachable quorum"
 
 # ─── restart it: same id, log recovered, a follower of the new leader ──────
 case $L in a) port=$PB;; b) port=$((PB+1));; c) port=$((PB+2));; esac
