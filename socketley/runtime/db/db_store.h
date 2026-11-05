@@ -295,7 +295,7 @@ private:
     // One record read into the documents, its changes told to `events` when it is given.
     bool scan(uint32_t seg, uint64_t payload_off, std::string_view payload, std::vector<event>* events = nullptr);
     // A document a merge wrote again, taken at its new place when it is still the version there.
-    void relocate(const event& e, uint32_t seg, uint64_t off);
+    void relocate(const event& e, uint32_t seg, uint64_t off, uint32_t len);
     bool may_read(const principal& who, access a, const doc& d) const;
     bool unique_ok(const coll_state& c, const std::string& id, const doc& d, error& err) const;
     bool expired(const doc& d) const;
@@ -354,9 +354,10 @@ void write_doc(const std::string& id, const doc& d, std::string_view body_json, 
 // The changes of a patch made to `body`; false with `err` when one cannot be.
 bool apply_patch(jvalue& body, const jvalue& changes, error& err);
 
-// A write record's documents, as a feed tells them: what scan() reads and apply() writes.
+// A write record's documents, as a feed tells them: what scan() reads and apply() writes; with json_lens given, each
+// document's JSON is not copied, only its length told.
 bool decode_record(std::string_view payload, std::vector<event>& out, std::vector<uint64_t>* json_offs = nullptr,
-                   uint64_t* seq = nullptr);
+                   uint64_t* seq = nullptr, std::vector<uint32_t>* json_lens = nullptr);
 std::string encode_record(uint64_t seq, const std::vector<event>& evs, std::vector<uint64_t>* json_offs = nullptr);
 
 }   // namespace socketley::db

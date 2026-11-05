@@ -292,7 +292,7 @@ std::string encode_record(uint64_t seq, const std::vector<event>& evs, std::vect
 }
 
 bool decode_record(std::string_view payload, std::vector<event>& out, std::vector<uint64_t>* json_offs,
-                   uint64_t* seq_out)
+                   uint64_t* seq_out, std::vector<uint32_t>* json_lens)
 {
     socketley::bytes::reader r(payload);
     uint8_t kind = 0;
@@ -305,6 +305,8 @@ bool decode_record(std::string_view payload, std::vector<event>& out, std::vecto
     out.clear();
     if (json_offs)
         json_offs->clear();
+    if (json_lens)
+        json_lens->clear();
     for (uint32_t i = 0; i < n; ++i)
     {
         event e;
@@ -317,6 +319,8 @@ bool decode_record(std::string_view payload, std::vector<event>& out, std::vecto
             e.del = true;
             if (json_offs)
                 json_offs->push_back(0);
+            if (json_lens)
+                json_lens->push_back(0);
         }
         else if (t == ent_put)
         {
@@ -328,7 +332,10 @@ bool decode_record(std::string_view payload, std::vector<event>& out, std::vecto
                 return false;
             if (json_offs)
                 json_offs->push_back(before + 4);
-            e.json.assign(json);
+            if (json_lens)
+                json_lens->push_back(static_cast<uint32_t>(json.size()));
+            else
+                e.json.assign(json);
         }
         else
             return false;
@@ -981,7 +988,7 @@ uint64_t record_seq(std::string_view payload)
 
 }   // namespace
 
-void store::relocate(const event& e, uint32_t seg, uint64_t off)
+void store::relocate(const event& e, uint32_t seg, uint64_t off, uint32_t len)
 {
     if (e.del)
         return;
@@ -994,7 +1001,7 @@ void store::relocate(const event& e, uint32_t seg, uint64_t off)
         return;
     live_add(d, -1);
     cache_drop(d);
-    d.at = location{seg, off, static_cast<uint32_t>(e.json.size())};
+    d.at = location{seg, off, len};
     live_add(d, +1);
 }
 
@@ -1110,11 +1117,13 @@ void store::follow_layout()
             continue;
         // A segment a merge wrote, unless its records are past what was read: a log the reading has not reached.
         bool ahead = false;
+        // Where each document now lies is all a merged record says here, so its JSON is not copied out.
+        std::vector<event> evs;
+        std::vector<uint64_t> offs;
+        std::vector<uint32_t> lens;
         m_log.read_records(n, seglog::header_bytes, [&](uint64_t off, std::string_view p) {
-            std::vector<event> evs;
-            std::vector<uint64_t> offs;
             uint64_t q = 0;
-            if (!decode_record(p, evs, &offs, &q))
+            if (!decode_record(p, evs, &offs, &q, &lens))
                 return false;
             if (q > m_seq)
             {
@@ -1122,7 +1131,7 @@ void store::follow_layout()
                 return false;
             }
             for (size_t i = 0; i < evs.size(); ++i)
-                relocate(evs[i], n, off + offs[i]);
+                relocate(evs[i], n, off + offs[i], lens[i]);
             return true;
         });
         if (!ahead)

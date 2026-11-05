@@ -225,6 +225,45 @@ for i in $(seq 1 30); do curl -s -o /dev/null -X PUT -H "Authorization: Bearer s
     -H "Content-Type: application/json" --data "{\"n\":$i}" "http://127.0.0.1:$PD/c/quiet/q$i"; done
 n1=$(stats_of data | awk -F: '/^nudges:/ { n += $2 } END { print n + 0 }')
 expect "thirty writes with no stream open nudge no reading shard" "$((n1 - n0))" 0
+# Documents a merge moved are read where they now lie on every shard, which learns of the move from the segment.
+r=$(timeout 300 python3 - "$PD" "$BIN" <<'PY'
+import http.client, json, subprocess, sys, threading, time
+port, binary = int(sys.argv[1]), sys.argv[2]
+H = {"Authorization": "Bearer shardsecret0123456789", "Content-Type": "application/json"}
+def merges():
+    out = subprocess.run([binary, "stats", "data"], capture_output=True, timeout=30).stdout.decode()
+    return sum(int(l.split(":")[1]) for l in out.splitlines() if l.startswith("merges:"))
+# Fifty documents written once, then enough written over others for the segment they are in to be sealed and merged.
+last = {}
+c = http.client.HTTPConnection("127.0.0.1", port)
+for i in range(50):
+    c.request("PUT", "/c/moved/keep%d" % i, json.dumps({"k": 99, "i": i, "pad": "99-%d-" % i + "x" * 65536}), H)
+    c.getresponse().read()
+    last["keep%d" % i] = (99, i)
+def run(k):
+    c = http.client.HTTPConnection("127.0.0.1", port)
+    for i in range(300):
+        doc = {"k": k, "i": i, "pad": "x" * 65536}
+        c.request("PUT", "/c/junk/j%d_%d" % (k, i % 8), json.dumps(doc), H); c.getresponse().read()
+m0 = merges()
+ts = [threading.Thread(target=run, args=(k,)) for k in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+for _ in range(100):
+    if merges() > m0:
+        break
+    time.sleep(0.2)
+time.sleep(1.5)
+wrong = 0
+for _ in range(4):
+    for key, (k, i) in last.items():
+        c = http.client.HTTPConnection("127.0.0.1", port)
+        c.request("GET", "/c/moved/" + key, None, H); r = c.getresponse(); b = r.read()
+        d = json.loads(b) if r.status == 200 else {}
+        wrong += (d.get("k"), d.get("i"), len(d.get("pad", ""))) != (k, i, len("%d-%d-" % (k, i)) + 65536)
+print(merges() > m0, wrong)
+PY
+)
+expect "after a merge every shard reads each moved document whole" "$r" "True 0"
 
 "$BIN" stop data >/dev/null 2>&1
 "$BIN" edit data --shards 2 >/dev/null 2>&1 && ok || bad "the number of shards is changed while stopped" "$(tail -3 "$SOCKETLEY_DLOG")"
