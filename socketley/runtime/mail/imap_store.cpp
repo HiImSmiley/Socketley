@@ -1378,7 +1378,9 @@ void imap_store::autoexpunge(int64_t now)
 
 void imap_store::tick(int64_t)
 {
-    if (const int64_t now = wall::now_ms_coarse(); now - m_uploads_swept_ms > 3600000)
+    // On the first shard alone, as autoexpunge below, so N shards do not list and delete the same uploads.
+    if (const int64_t now = wall::now_ms_coarse();
+        m_run.owner().get_shard_index() == 0 && now - m_uploads_swept_ms > 3600000)
     {
         m_uploads_swept_ms = now;
         sweep_uploads();
