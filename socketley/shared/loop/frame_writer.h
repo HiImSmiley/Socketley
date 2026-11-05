@@ -89,9 +89,9 @@ public:
         m_dead = true;
     }
 
-    bool write(std::string_view framed)
+    bool write(std::string_view framed, size_t cap = MAX_BACKLOG)
     {
-        if (!admit(framed.size()))
+        if (!admit(framed.size(), cap))
             return false;
         m_out.append(framed);
 
@@ -105,9 +105,9 @@ public:
     // write() for a frame built straight into the queue: `fill` appends
     // exactly `size` bytes, and is not called for a frame the cap refuses.
     template <class Fill>
-    bool write_with(size_t size, Fill&& fill)
+    bool write_with(size_t size, Fill&& fill, size_t cap = MAX_BACKLOG)
     {
-        if (!admit(size))
+        if (!admit(size, cap))
             return false;
         fill(m_out);
         if (!m_loop)
@@ -116,10 +116,10 @@ public:
     }
 
     // A frame with nothing queued ahead of it goes at any size: the cap bounds a backlog, and one frame is none.
-    bool admit(size_t size)
+    bool admit(size_t size, size_t cap = MAX_BACKLOG)
     {
         return pending() == 0 ||
-               m_gate.admit(pending(), size, MAX_BACKLOG, "frame writer: backlog full; the peer is not reading");
+               m_gate.admit(pending(), size, cap, "frame writer: backlog full; the peer is not reading");
     }
 
     void flush()

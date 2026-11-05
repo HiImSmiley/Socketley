@@ -4,12 +4,14 @@
 // table and delegates to the daemon relay whenever no link is usable, so
 // correctness never depends on the mesh and every crossing is counted by
 // route.
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <chrono>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -113,14 +115,17 @@ public:
     // can name the link it belongs on without holding a pointer to it.
     uint64_t serial() const { return m_serial; }
 
+    // A link's queue is held to what the asker's parked tickets bound and not to the writer's cap, which one turn of
+    // large values passes before its flush and which ended the link for good.
+    static constexpr size_t BACKLOG = 256u << 20;
+
     // One answer back to the asker, with a write the link cannot take ending
     // it exactly as an inline answer's would.
     bool send_reply(uint64_t ticket, request_status st, std::string_view reply)
     {
         if (!alive())
             return false;
-        if (!m_writer.write_with(
-                worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
+        if (!put(worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
                     worker_proto::append_chan_reply_frame(
                         out, ticket, static_cast<uint8_t>(st), reply);
                 }))
@@ -139,8 +144,7 @@ public:
         if (!alive())
             return false;
 
-        if (!m_writer.write_with(
-                worker_proto::chan_request_frame_size(target, payload),
+        if (!put(worker_proto::chan_request_frame_size(target, payload),
                 [&](std::string& out) {
                     worker_proto::append_chan_request_frame(out, ticket, target, payload);
                 }))
@@ -172,7 +176,7 @@ public:
             return false;
 
         if (!m_writer.write(worker_proto::frame(
-                worker_proto::frame_type::route_down, payload)))
+                worker_proto::frame_type::route_down, payload), BACKLOG))
         {
             die("the backlog to a peer filled or its socket went");
             return false;
@@ -345,6 +349,41 @@ public:
     size_t owed() const { return m_owed.size(); }
 
 private:
+    static void append_header(std::string& out, worker_proto::frame_type type, size_t len)
+    {
+        socketley::bytes::append32(out, static_cast<uint32_t>(len));
+        worker_proto::put_u16(out, worker_proto::version);
+        worker_proto::put_u16(out, static_cast<uint16_t>(type));
+    }
+
+    // One frame of `size` bytes onto the link, in pieces when it is past what a reader takes as one: a sibling's
+    // answer of large values is as long as the values, and a single shard writes such an answer to its client whole.
+    template <class Fill>
+    bool put(size_t size, Fill&& fill)
+    {
+        static constexpr size_t piece = 4u << 20;
+        if (size - worker_proto::header_size <= worker_proto::max_payload)
+            return m_writer.write_with(size, std::forward<Fill>(fill), BACKLOG);
+        const size_t pieces = (size + piece - 1) / piece;
+        if (!m_writer.admit(size + pieces * (worker_proto::header_size + 1), BACKLOG))
+            return false;
+        std::string whole;
+        whole.reserve(size);
+        fill(whole);
+        for (size_t at = 0; at < whole.size(); at += piece)
+        {
+            const size_t n = std::min(piece, whole.size() - at);
+            const bool last = at + n == whole.size();
+            if (!m_writer.write_with(worker_proto::header_size + 1 + n, [&](std::string& out) {
+                    append_header(out, worker_proto::frame_type::mesh_part, n + 1);
+                    out.push_back(last ? 1 : 0);
+                    out.append(whole, at, n);
+                }, BACKLOG))
+                return false;
+        }
+        return true;
+    }
+
     void arm()
     {
         if (m_dead || !m_loop || m_armed || m_fd < 0 || !m_loop->ring_open())
@@ -436,6 +475,33 @@ private:
                 m_channel->complete_deferred(
                     p.ticket, static_cast<request_status>(p.status), p.payload);
         }
+        if (type == worker_proto::frame_type::mesh_part && !payload.empty())
+        {
+            m_part.append(payload, 1, std::string::npos);
+            if (m_part.size() > BACKLOG)
+            {
+                die("a sibling sent more of one frame than a link holds");
+                return;
+            }
+            if (payload[0] == 0)
+                return;
+            // The whole frame, header and all, which is read as if it had come in one piece.
+            std::string whole = std::move(m_part);
+            m_part.clear();
+            worker_proto::reader r(whole.data(), whole.size());
+            const uint32_t len = r.u32();
+            r.u16();
+            const auto inner = static_cast<worker_proto::frame_type>(r.u16());
+            if (!r.ok || len != whole.size() - worker_proto::header_size ||
+                inner == worker_proto::frame_type::mesh_part)
+            {
+                die("a sibling sent a frame in pieces that do not make one");
+                return;
+            }
+            whole.erase(0, worker_proto::header_size);
+            handle(inner, whole);
+            return;
+        }
         if (type == worker_proto::frame_type::route_down)
         {
             // Applied by the far side with the same function the daemon's leg
@@ -466,6 +532,8 @@ private:
     shard_mesh_server m_server{nullptr};
     void*             m_ctx{nullptr};
     shard_mesh_router m_router{nullptr};
+    // What has come of a frame sent in pieces, until its last.
+    std::string       m_part;
 
     event_loop* m_loop{nullptr};
     io_request  m_req{};

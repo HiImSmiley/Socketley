@@ -88,6 +88,10 @@ enum class frame_type : uint16_t
 
     // payload: see series_feed_writer -- the answer to a series_pull.
     series_feed = 33,
+
+    // shard <-> shard, on a mesh link only: u8 last, then the next piece of
+    // one frame too long for max_payload, read whole once `last` is set.
+    mesh_part = 34,
 };
 
 // reload_err carries the diagnostic verbatim and is sent only when the reload

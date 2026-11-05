@@ -118,6 +118,70 @@ else
         "quietly gives up still reports direct > 0"
 fi
 
+# ── Large values, pipelined, over the mesh ─────────────────────────────────
+#
+# One turn of answers for a sibling passed the writer's 4 MiB cap before its
+# flush and ended the link for good, and an answer past 8 MiB was a frame the
+# sibling could not read: pipelined GETs of 64 KiB values answered "no such
+# runtime", and an MGET of large values never answered.  Both go now, the
+# second in pieces.
+cat > "$SOCKETLEY_TMPD/big.py" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+def cmd(*a):
+    out = b"*%d\r\n" % len(a)
+    for x in a:
+        x = x if isinstance(x, bytes) else str(x).encode()
+        out += b"$%d\r\n%s\r\n" % (len(x), x)
+    return out
+class R:
+    def __init__(s, sock): s.s, s.b = sock, b""
+    def need(s, n):
+        while len(s.b) < n:
+            d = s.s.recv(1 << 20)
+            if not d: raise EOFError
+            s.b += d
+    def line(s):
+        while b"\r\n" not in s.b:
+            d = s.s.recv(1 << 20)
+            if not d: raise EOFError
+            s.b += d
+        l, s.b = s.b.split(b"\r\n", 1)
+        return l
+    def reply(s):
+        l = s.line()
+        if l[:1] == b"$":
+            n = int(l[1:])
+            if n < 0: return None
+            s.need(n + 2); v, s.b = s.b[:n], s.b[n + 2:]
+            return v
+        if l[:1] == b"*":
+            return [s.reply() for _ in range(int(l[1:]))]
+        return l
+s = socket.create_connection(("127.0.0.1", port), timeout=30)
+r = R(s)
+val = lambda i: (b"%06d" % i) * (65536 // 6)
+s.sendall(b"".join(cmd("SET", "big%d" % i, val(i)) for i in range(200)))
+setok = sum(r.reply() == b"+OK" for _ in range(200))
+s.sendall(b"".join(cmd("GET", "big%d" % (i % 200)) for i in range(600)))
+gets = sum(r.reply() == val(i % 200) for i in range(600))
+s.sendall(cmd("MGET", *["big%d" % i for i in range(200)]))
+m = r.reply()
+mget = sum(1 for i, v in enumerate(m or []) if v == val(i))
+print(setok, gets, mget)
+PY
+read -r BIGSET BIGGET BIGMGET < <(timeout 120 python3 "$SOCKETLEY_TMPD/big.py" "$PORT" 2>/dev/null || echo "0 0 0")
+check_big() { [ "$2" = "$3" ] && ok "$1 ($2)" || bad "$1" "$2 of $3"; }
+check_big "two hundred 64 KiB values pipelined in are taken" "$BIGSET" 200
+check_big "six hundred GETs of them pipelined come back whole" "$BIGGET" 600
+check_big "and one MGET of all of them, 13 MB, answers every one" "$BIGMGET" 200
+sleep 1
+ST=$("$BIN" stats meshc 2>&1 || true)
+RELAY2=$(printf '%s\n' "$ST" | awk -F: '/^mesh_relayed:/ {s+=$2} END{print s+0}')
+DOWN=$(grep -cE 'the link to shard .* is down' "$SOCKETLEY_DLOG" 2>/dev/null || true)
+[ "$RELAY2" -eq 0 ] && [ "${DOWN:-0}" -eq 0 ] && ok "no link went down under them (relayed $RELAY2)" \
+    || bad "no link went down under them" "relayed $RELAY2, $DOWN link(s) down"
+
 # ── A clean stop says nothing about the mesh ──────────────────────────────
 #
 # Four shards leaving together means each one watches three siblings' ends
