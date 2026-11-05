@@ -126,9 +126,8 @@ bool mqtt_run::queue_shard(uint32_t to, std::string_view frame, bool droppable)
         ++m_shard_dropped;
         return false;
     }
-    socketley::bytes::writer w;
-    w.bytes(frame);
-    q.pending += w.take();
+    socketley::bytes::append32(q.pending, static_cast<uint32_t>(frame.size()));
+    q.pending.append(frame);
     if (q.waiting() >= batch_bytes)
         send_shard(to);
     return true;
@@ -170,33 +169,36 @@ void mqtt_run::send_shard(uint32_t to)
         // Numbered by its first frame and the oldest one not yet receipted, so the shard takes each frame once and
         // in the order made whatever is sent again.
         std::string batch = frame_of(sverb::batch, me);
+        batch.reserve(batch.size() + 24 + cut);
         socketley::bytes::append64(batch, m_shard_epoch);
         socketley::bytes::append64(batch, q.seq);
-        const auto oldest = q.sent.empty() ? m_shard_batches.end() : m_shard_batches.find(q.sent.front());
-        socketley::bytes::append64(batch, oldest == m_shard_batches.end() ? q.seq : oldest->second.first);
-        const size_t head = batch.size();
+        socketley::bytes::append64(batch, q.sent.empty() ? q.seq : q.sent.front().first);
         batch.append(rest.substr(0, cut));
         const uint64_t cookie = m_shard_cookie_base++;
-        if (!mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), to), batch, request_class::client))
+        if (!mgr->requests().post_owned(this, cookie, shard_target(m_owner.get_name(), to), std::move(batch),
+                                        request_class::client))
             break;
-        q.head += cut;
         if (!q.flying)
             q.heard_ms = now_ms();
         q.flying += cut;
-        m_shard_batches.emplace(cookie, shard_batch{to, std::move(batch), head, q.seq});
-        q.sent.push_back(cookie);
+        m_shard_batches.emplace(cookie, to);
+        q.sent.push_back({cookie, q.head, cut, q.seq});
+        q.head += cut;
         q.seq += count;
     }
-    // The front taken away once half of what is held has gone, not once a batch.
-    if (q.head == q.pending.size())
+    // The front taken away once half of what is held has been receipted, not once a batch.
+    const size_t done = q.sent.empty() ? q.head : q.sent.front().at;
+    if (done == q.pending.size())
     {
         q.pending.clear();
         q.head = 0;
     }
-    else if (q.head > q.pending.size() / 2)
+    else if (done > q.pending.size() / 2)
     {
-        q.pending.erase(0, q.head);
-        q.head = 0;
+        q.pending.erase(0, done);
+        q.head -= done;
+        for (auto& b : q.sent)
+            b.at -= done;
     }
 }
 
@@ -217,39 +219,42 @@ bool mqtt_run::shard_receipt(uint64_t cookie, request_status st, std::string_vie
     const auto it = m_shard_batches.find(cookie);
     if (it == m_shard_batches.end())
         return cookie >= (1ull << 62);
-    const uint32_t to = it->second.to;
+    const uint32_t to = it->second;
     shard_queue& q = m_squeue[to];
     q.heard_ms = now_ms();
-    const auto at = std::find(q.sent.begin(), q.sent.end(), cookie);
-    // A shard that missed a frame before this batch took none of it, and says so.
+    const auto at = std::find_if(q.sent.begin(), q.sent.end(), [&](const shard_batch& b) { return b.cookie == cookie; });
+    if (at == q.sent.end())
+    {
+        m_shard_batches.erase(it);
+        return true;
+    }
+    // A shard that missed a frame before this batch took none of it, and says so; one that took it took every frame
+    // before it, so the batches before it are done too.
     if (st == request_status::ok && reply.empty())
     {
-        q.flying -= std::min(q.flying, it->second.frames.size() - it->second.head);
-        m_shard_batches.erase(it);
-        if (at != q.sent.end())
-            q.sent.erase(at);
+        for (auto i = q.sent.begin(); i != std::next(at); ++i)
+        {
+            q.flying -= std::min(q.flying, i->size);
+            m_shard_batches.erase(i->cookie);
+        }
+        q.sent.erase(q.sent.begin(), std::next(at));
         q.failing_since = 0;
     }
     else
     {
-        // This batch and every one posted after it go again, in the order they went and before what waits, since a
-        // later one may not have been taken either; the shard skips what it already took by its number.
+        // This batch and every one posted after it go again, from where they still are and before what waits, since
+        // a later one may not have been taken either; the shard skips what it already took by its number.
         if (!q.failing_since)
             q.failing_since = now_ms();
         q.retry_at = now_ms() + resend_ms;
-        q.seq = it->second.first;
-        std::string back;
+        q.seq  = at->first;
+        q.head = at->at;
         for (auto i = at; i != q.sent.end(); ++i)
         {
-            const auto b = m_shard_batches.find(*i);
-            if (b == m_shard_batches.end())
-                continue;
-            back.append(std::string_view(b->second.frames).substr(b->second.head));
-            q.flying -= std::min(q.flying, b->second.frames.size() - b->second.head);
-            m_shard_batches.erase(b);
+            q.flying -= std::min(q.flying, i->size);
+            m_shard_batches.erase(i->cookie);
         }
         q.sent.erase(at, q.sent.end());
-        q.pending.insert(q.head, back);
         ++m_shard_resent;
     }
     send_shard(to);
@@ -544,19 +549,21 @@ void mqtt_run::share_retained(const std::string& topic, const message_ptr& now)
     // Stamped, so two shards changing one topic at once settle on the later change.
     const uint64_t stamp = claim_stamp(me);
     m_retained_stamps[topic] = stamp;
-    std::string body;
+    // One frame for every shard, each appending it where it waits.
+    std::string f = frame_of(sverb::retained, me);
+    socketley::bytes::append32(f, static_cast<uint32_t>(topic.size()));
+    f += topic;
+    socketley::bytes::append64(f, stamp);
+    f += static_cast<char>(now != nullptr);
+    if (now)
     {
-        socketley::bytes::writer w;
-        w.bytes(topic);
-        w.u64(stamp);
-        w.flag(now != nullptr);
-        if (now)
-            w.bytes(message_bytes(*now));
-        body = w.take();
+        const std::string body = message_bytes(*now);
+        socketley::bytes::append32(f, static_cast<uint32_t>(body.size()));
+        f += body;
     }
     for (uint32_t j = 0; j < n; ++j)
         if (j != me)
-            queue_shard(j, frame_of(sverb::retained, me) + body, false);
+            queue_shard(j, f, false);
 }
 
 // ── Taking a session over from another shard ────────────────────────────────

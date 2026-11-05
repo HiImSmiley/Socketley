@@ -115,6 +115,10 @@ public:
     bool post(request_origin* origin, uint64_t cookie,
               std::string_view target, std::string_view payload,
               request_class cls = request_class::client);
+    // The same, the payload taken over rather than copied.
+    bool post_owned(request_origin* origin, uint64_t cookie,
+                    std::string_view target, std::string&& payload,
+                    request_class cls = request_class::client);
 
     // Revoke an origin, discarding its queued requests, and call it before the
     // origin is destroyed.
@@ -171,6 +175,10 @@ private:
     // A no-op so the loop comes back; post() calls it BEFORE queueing, because
     // an entry nothing returns for is an answer nobody gets.
     bool kick();
+    // Whether a request of this size and class may be queued now, counting the refusal when not.
+    bool admit(request_origin* origin, std::string_view target, size_t size, request_class cls);
+    void enqueue(request_origin* origin, uint64_t cookie, std::string_view target,
+                 std::string&& payload, request_class cls);
     void drain();
 
     // Come back for parked requests that have waited too long.  Armed only

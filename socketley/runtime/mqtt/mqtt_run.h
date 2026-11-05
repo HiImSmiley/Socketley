@@ -204,7 +204,17 @@ private:
     void share_retained(const std::string& topic, const message_ptr& now);
     void share_interest(uint8_t verb, const std::vector<std::string>& filters);
     bool post_shard(uint32_t to, std::string payload, uint64_t cookie);
-    // What waits here for one shard, and what is posted to it and not yet receipted.
+    // A batch posted to a shard and not yet receipted: where its frames are in the queue, and the number of the
+    // first.
+    struct shard_batch
+    {
+        uint64_t cookie{0};
+        size_t   at{0};
+        size_t   size{0};
+        uint64_t first{0};
+    };
+    // What waits here for one shard from `head` on, and before it what is posted to it and not yet receipted, kept
+    // in place for a resend.
     struct shard_queue
     {
         std::string pending;
@@ -217,17 +227,8 @@ private:
         // The number of the frame at `head`, counted from this shard's start.
         uint64_t    seq{0};
         // The batches posted and not yet receipted, in the order they went.
-        std::deque<uint64_t> sent;
+        std::deque<shard_batch> sent;
         size_t waiting() const { return pending.size() - head; }
-    };
-    struct shard_batch
-    {
-        uint32_t    to{0};
-        // The batch as posted, its frames from `head` on.
-        std::string frames;
-        size_t      head{0};
-        // The number of its first frame.
-        uint64_t    first{0};
     };
     // A word owed only a receipt, kept for the next batch; false when it is dropped instead.
     bool queue_shard(uint32_t to, std::string_view frame, bool droppable);
@@ -333,7 +334,8 @@ private:
     void peer_filter(uint32_t from, const std::string& filter, bool add);
     void forget_peer(uint32_t from);
     std::vector<shard_queue> m_squeue;
-    std::unordered_map<uint64_t, shard_batch> m_shard_batches;
+    // The shard each batch not yet receipted went to, by cookie.
+    std::unordered_map<uint64_t, uint32_t> m_shard_batches;
     // Each retained topic's last change by its stamp, for as long as an older one could still be on its way.
     std::unordered_map<std::string, uint64_t> m_retained_stamps;
     uint64_t m_shard_dropped{0};

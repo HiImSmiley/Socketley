@@ -165,6 +165,24 @@ bool request_channel::post(request_origin* origin, uint64_t cookie,
                            std::string_view target, std::string_view payload,
                            request_class cls)
 {
+    if (!admit(origin, target, payload.size(), cls))
+        return false;
+    enqueue(origin, cookie, target, std::string(payload), cls);
+    return true;
+}
+
+bool request_channel::post_owned(request_origin* origin, uint64_t cookie,
+                                 std::string_view target, std::string&& payload,
+                                 request_class cls)
+{
+    if (!admit(origin, target, payload.size(), cls))
+        return false;
+    enqueue(origin, cookie, target, std::move(payload), cls);
+    return true;
+}
+
+bool request_channel::admit(request_origin* origin, std::string_view target, size_t size, request_class cls)
+{
     if (!m_loop || !origin || target.empty())
     {
         m_stat_refused++;
@@ -179,7 +197,7 @@ bool request_channel::post(request_origin* origin, uint64_t cookie,
     const size_t byte_limit = (cls == request_class::background)
                        ? (MAX_PENDING_BYTES / 4) * 3 : MAX_PENDING_BYTES;
 
-    if (m_queue.size() >= limit || m_bytes + payload.size() > byte_limit)
+    if (m_queue.size() >= limit || m_bytes + size > byte_limit)
     {
         if (cls == request_class::background)
             m_stat_dropped_bg++;
@@ -198,7 +216,12 @@ bool request_channel::post(request_origin* origin, uint64_t cookie,
             m_stat_refused++;
         return false;
     }
+    return true;
+}
 
+void request_channel::enqueue(request_origin* origin, uint64_t cookie, std::string_view target,
+                              std::string&& payload, request_class cls)
+{
     if (!origin_live(origin))
         m_origins.push_back(origin);
 
@@ -206,12 +229,11 @@ bool request_channel::post(request_origin* origin, uint64_t cookie,
     e.origin  = origin;
     e.cookie  = cookie;
     e.target.assign(target);
-    e.payload.assign(payload);
+    e.payload = std::move(payload);
     e.cls = cls;
     m_bytes += e.payload.size();
     m_queue.push_back(std::move(e));
     m_stat_posted++;
-    return true;
 }
 
 void request_channel::complete_deferred(uint64_t ticket, request_status st,
