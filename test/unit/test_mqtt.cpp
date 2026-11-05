@@ -10,6 +10,7 @@
 
 #include <map>
 #include <set>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -986,16 +987,20 @@ TEST_CASE("a session given up by one broker is taken in by another")
     one.b->disconnected(s);
     const uint64_t p = one.connect("p", level_5);
     one.send(p, pub("r", "kept", 1, 1, false, level_5));
-    const std::string bytes = one.b->surrender("roam", false);
-    REQUIRE_FALSE(bytes.empty());
+    // Too large for the room the way back has, the session is kept where it is.
+    CHECK_FALSE(one.b->surrender("roam", false, 8).has_value());
+    CHECK(one.b->session_count() == 2);
+    const std::optional<std::string> bytes = one.b->surrender("roam", false);
+    REQUIRE(bytes.has_value());
+    REQUIRE_FALSE(bytes->empty());
     CHECK(one.b->session_count() == 1);
-    two.b->adopt(bytes);
+    two.b->adopt(*bytes);
     s = two.connect("roam", level_5, false, 3600);
     const auto got = two.packets(s);
     REQUIRE(got.size() == 2);
     CHECK(connack_of(got[0], level_5).session_present);
     CHECK(publish_of(got[1], level_5).payload == "kept");
-    CHECK(one.b->surrender("nobody", false).empty());
+    CHECK(one.b->surrender("nobody", false).value_or("x").empty());
 }
 
 TEST_CASE("a packet larger than the broker takes ends the connection")
