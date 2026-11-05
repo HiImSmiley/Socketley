@@ -808,7 +808,12 @@ private:
             cpu_set_spec spec;
             std::string  err;
             if (parse_cpu_set(cfg.cpus, spec, err))
+            {
                 m_loop.set_cpus(spec);
+                // A shard's set can be one CPU the daemon placed its loop on, which is no place for its helpers.
+                if (cfg.shards > 1)
+                    m_loop.keep_helpers_wide();
+            }
             else
                 LOG_WARN("proxy worker: unusable --cpus in its config, ignored");
         }

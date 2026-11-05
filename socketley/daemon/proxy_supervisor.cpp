@@ -12,6 +12,7 @@
 #include <ctime>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -482,6 +483,26 @@ void proxy_supervisor::answer_map_request(int reply_fd, uint64_t ticket,
     }
 }
 
+// A shard set that fits the daemon's CPUs gives each shard one of them, so two loops are never stacked on a core
+// while another idles, with the sets of several runtimes taking the CPUs after each other.
+static cpu_set_spec shard_cpus(const cpu_set_spec& set, const std::string& name, uint32_t shards, uint32_t index)
+{
+    if (shards <= 1 || set.all || shards > set.count())
+        return set;
+    static std::unordered_map<std::string, uint32_t> bases;
+    static uint32_t next = 0;
+    const auto [it, fresh] = bases.try_emplace(name, next);
+    if (fresh)
+        next += shards;
+    uint64_t left = set.mask;
+    for (uint32_t k = (it->second + index) % set.count(); k > 0; --k)
+        left &= left - 1;
+    cpu_set_spec one;
+    one.all = false;
+    one.mask = left & (~left + 1);
+    return one;
+}
+
 bool proxy_supervisor::spawn(const runtime_config& cfg)
 {
     if (m_exec_path.empty())
@@ -507,7 +528,7 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     if (m_loop)
     {
         if (effective.cpus.empty() && !m_loop->cpus().all)
-            effective.cpus = m_loop->cpus().to_string();
+            effective.cpus = shard_cpus(m_loop->cpus(), cfg.name, cfg.shards, m_shard_index).to_string();
     }
 
     // Keep the config so a restart can replay it without going back to disk,

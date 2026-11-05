@@ -191,11 +191,7 @@ walk_shape recovery_shape()
 {
     walk_shape w;
     // One thread per CPU this process may use, so a pinned runtime stays on its pin.
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    const unsigned cpus = ::sched_getaffinity(0, sizeof set, &set) == 0
-                              ? static_cast<unsigned>(std::clamp(CPU_COUNT(&set), 1, 16))
-                              : 1u;
+    const unsigned cpus = std::clamp(event_loop::helper_cpu_count(), 1u, 16u);
     w.threads = settings::number<unsigned>("SOCKETLEY_STORAGE_RECOVERY_THREADS").value_or(cpus);
     w.depth   = settings::number<unsigned>("SOCKETLEY_STORAGE_RECOVERY_DEPTH").value_or(walk_depth);
 

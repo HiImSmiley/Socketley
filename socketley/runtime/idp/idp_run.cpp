@@ -223,21 +223,18 @@ constexpr std::string_view carried[] = {"client_id", "redirect_uri", "response_t
                                         "code_challenge", "code_challenge_method", "resource", "rd"};
 
 // One scrypt holds 16 MiB and a thread makes up to four at once, so four threads are sixteen at most, shared out
-// among the shards.
-unsigned hash_threads(uint32_t shards)
+// among the shards with shard i taking one of the remainder, where rounding up per shard made six at three shards.
+unsigned hash_threads(uint32_t shards, uint32_t shard)
 {
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    const int n = ::sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : 1;
-    const unsigned all = static_cast<unsigned>(std::clamp(n, 1, 4));
-    return std::max(1u, (all + shards - 1) / shards);
+    const unsigned all = std::clamp(event_loop::helper_cpu_count(), 1u, 4u);
+    return std::max(1u, all / shards + (shard < all % shards ? 1u : 0u));
 }
 
 }   // namespace
 
 idp_run::idp_run(idp_instance& owner, event_loop& loop)
     : m_owner(owner), m_loop(loop), m_io(loop, this), m_http(loop, this, owner, *this, max_conns),
-      m_hash(hash_threads(std::max<uint32_t>(1, owner.get_shards())))
+      m_hash(hash_threads(std::max<uint32_t>(1, owner.get_shards()), owner.get_shard_index()))
 {
 }
 

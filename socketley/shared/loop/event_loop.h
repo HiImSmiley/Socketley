@@ -40,6 +40,10 @@ public:
     // flags at creation, and calling it marks the choice explicit so a flag
     // beats the environment.
     void set_cpus(const cpu_set_spec& cpus);
+    // Threads this process starts later keep the CPUs it was started with, only the I/O thread narrowing to its set.
+    void keep_helpers_wide() { m_helpers_wide = true; }
+    // How many CPUs a helper thread of this process runs on, which the I/O thread's own set no longer says.
+    static unsigned helper_cpu_count();
     // Whether a quiet turn enters the ring again before it sleeps; on unless a runtime says otherwise.
     void set_busy_spin(bool on) { m_spin = on; }
 
@@ -451,6 +455,7 @@ private:
     // "unrestricted" is both a legitimate choice and the state of having made
     // none.
     bool m_cpus_explicit{false};
+    bool m_helpers_wide{false};
     bool m_affinity_applied{false};
     cpu_set_spec m_cpus{};
     unsigned m_ring_setup_flags{0};

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <pthread.h>
 #include <sched.h>
 
 
@@ -910,6 +911,18 @@ void event_loop::set_cpus(const cpu_set_spec& cpus)
     m_cpus_explicit = true;
 }
 
+// How many CPUs keep_helpers_wide() left the helper threads, zero while it has not been asked.
+static int g_helper_cpus = 0;
+
+unsigned event_loop::helper_cpu_count()
+{
+    if (g_helper_cpus > 0)
+        return static_cast<unsigned>(g_helper_cpus);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    return sched_getaffinity(0, sizeof set, &set) == 0 ? static_cast<unsigned>(std::max(1, CPU_COUNT(&set))) : 1u;
+}
+
 // Narrow this thread to the configured set before the ring is built, where
 // "max" makes no call at all rather than pinning to the CPUs that happen to be
 // online now.
@@ -924,6 +937,20 @@ void event_loop::apply_cpu_affinity()
     for (uint32_t c = 0; c < cpu_set_spec::max_cpus; ++c)
         if (m_cpus.mask & (1ull << c))
             CPU_SET(c, &set);
+
+    // The set as it is now becomes every later thread's, pthread_create() taking it from the default attributes.
+    cpu_set_t was;
+    CPU_ZERO(&was);
+    if (m_helpers_wide && sched_getaffinity(0, sizeof was, &was) == 0)
+    {
+        pthread_attr_t attr;
+        if (pthread_getattr_default_np(&attr) == 0)
+        {
+            if (pthread_attr_setaffinity_np(&attr, sizeof was, &was) == 0 && pthread_setattr_default_np(&attr) == 0)
+                g_helper_cpus = CPU_COUNT(&was);
+            pthread_attr_destroy(&attr);
+        }
+    }
 
     if (sched_setaffinity(0, sizeof(set), &set) == 0)
     {
