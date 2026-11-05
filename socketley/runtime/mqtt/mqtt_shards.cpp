@@ -106,12 +106,14 @@ bool mqtt_run::sharded() const
     return m_owner.get_shards() > 1;
 }
 
-void mqtt_run::post_shard(uint32_t to, std::string payload, uint64_t cookie)
+bool mqtt_run::post_shard(uint32_t to, std::string payload, uint64_t cookie)
 {
     auto* mgr = m_owner.get_runtime_manager();
-    if (!mgr || !mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), to), payload,
-                                      request_class::client))
-        ++m_shard_unreached;
+    if (mgr && mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), to), payload,
+                                    request_class::client))
+        return true;
+    ++m_shard_unreached;
+    return false;
 }
 
 bool mqtt_run::queue_shard(uint32_t to, std::string_view frame, bool droppable)
@@ -345,13 +347,22 @@ void mqtt_run::shards_start()
         m_dump_asks[cookie] = {j, false};
         post_shard(j, frame_of(sverb::interest_dump, me), cookie);
     }
-    // A shard that starts with nothing retained asks the next one for what it holds.
+    // A shard that starts with nothing retained asks shard 0, which alone writes them, and shard 0 the next one.
     if (m_broker->retained_count() == 0)
-    {
-        const uint64_t cookie = m_next_cookie++;
-        m_dump_asks[cookie] = {(me + 1) % n, true};
-        post_shard((me + 1) % n, frame_of(sverb::retained_dump, me), cookie);
-    }
+        ask_retained();
+}
+
+void mqtt_run::ask_retained()
+{
+    const uint32_t me = m_owner.get_shard_index();
+    const uint32_t from = me == 0 ? 1 : 0;
+    const uint64_t cookie = m_next_cookie++;
+    m_dump_asks[cookie] = {from, true};
+    m_retained_ask_ms = 0;
+    if (post_shard(from, frame_of(sverb::retained_dump, me), cookie))
+        return;
+    m_dump_asks.erase(cookie);
+    m_retained_ask_ms = now_ms() + resend_ms;
 }
 
 bool mqtt_run::dump_reply(uint64_t cookie, request_status st, std::string_view reply)
@@ -361,6 +372,9 @@ bool mqtt_run::dump_reply(uint64_t cookie, request_status st, std::string_view r
         return false;
     const auto [from, retained] = it->second;
     m_dump_asks.erase(it);
+    // Asked again until answered, since a shard that started first may ask one not yet started.
+    if (st != request_status::ok && retained)
+        m_retained_ask_ms = now_ms() + resend_ms;
     if (st != request_status::ok || from >= m_peers.size())
         return true;
     socketley::bytes::reader r(reply);
@@ -715,6 +729,8 @@ void mqtt_run::settle(const std::string& client_id, uint64_t stamp, const std::s
 
 void mqtt_run::sweep_claims(int64_t now)
 {
+    if (m_retained_ask_ms && now >= m_retained_ask_ms)
+        ask_retained();
     if (!m_retained_stamps.empty())
     {
         const uint64_t us = claim_stamp(0) >> 6;

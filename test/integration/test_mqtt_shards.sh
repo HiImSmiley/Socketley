@@ -16,6 +16,7 @@
 #   * a publisher at QoS 0 held for good by a shard that stopped
 #   * batches given up and sent again reaching a shard out of order, or taken twice
 #   * a clean start asking every shard, two at once both kept, or one taking another user's fresh session
+#   * the retained messages written by every shard, or a shard started without them
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -262,6 +263,7 @@ if phase == "main":
         p = connected(port, "keep-pub")
         for i in range(9):
             p.publish("keep/%d" % i, "for %d" % i, qos=1)
+        p.publish("kept/big", b"b" * 150000, qos=1, retain=True)
         p.disconnect()
         time.sleep(1.6)
     guarded("keep", keep)
@@ -532,6 +534,13 @@ if phase == "after":
             c.disconnect()
         check("every shard's sessions and their queued messages come back after a restart", got,
               [(True, b"for %d" % i) for i in range(9)])
+        cs = [connected(port, "big-%d" % i) for i in range(9)]
+        for c in cs:
+            c.subscribe(("kept/big", 1))
+        check("and the retained messages on every shard", [len(m.payload) if m else None for m in
+              (c.message(3) for c in cs)], [150000] * 9)
+        for c in cs:
+            c.disconnect()
     guarded("after", after)
 PY
 }
@@ -560,6 +569,9 @@ tally < <(run hang "$FP")
 tally < <(run late "$FP")
 "$BIN" remove fl >/dev/null 2>&1
 [ "$snaps" -eq 3 ] && ok || bad "each shard keeps a snapshot of its own" "$(find "$HOME" -name 'sh.snapshot*')"
+# The retained messages are the same on every shard, so one file holds them.
+big=$(find "$HOME" -name 'sh.snapshot.*' -size +100k | wc -l)
+[ "$big" -eq 1 ] && ok || bad "one shard's snapshot holds the retained messages" "$(find "$HOME" -name 'sh.snapshot.*' -printf '%f %s\n')"
 
 # A session is its user's on every shard, the claim of another shard carrying who asks.
 UP=$((P + 2))

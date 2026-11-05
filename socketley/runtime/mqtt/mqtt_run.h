@@ -203,7 +203,7 @@ private:
     void share_message(const message_ptr& m);
     void share_retained(const std::string& topic, const message_ptr& now);
     void share_interest(uint8_t verb, const std::vector<std::string>& filters);
-    void post_shard(uint32_t to, std::string payload, uint64_t cookie);
+    bool post_shard(uint32_t to, std::string payload, uint64_t cookie);
     // What waits here for one shard, and what is posted to it and not yet receipted.
     struct shard_queue
     {
@@ -366,6 +366,9 @@ private:
     std::unordered_map<uint64_t, uint64_t> m_claim_cookies;
     // Questions a starting shard asked, by cookie: of which shard, and whether for its retained messages.
     std::unordered_map<uint64_t, std::pair<uint32_t, bool>> m_dump_asks;
+    // When to ask again for the retained messages a starting shard did not get, 0 when it is not owed.
+    int64_t m_retained_ask_ms{0};
+    void ask_retained();
     uint64_t m_next_claim{1};
     // Cookies of shard requests whose answer is only a receipt.
     uint64_t m_shard_cookie_base{1ull << 62};

@@ -487,7 +487,8 @@ public:
         std::vector<std::shared_ptr<const std::string>> sessions;
         size_t size{0};
     };
-    snapshot_parts snapshot_now() const;
+    // The retained messages are left out where another shard writes the same set.
+    snapshot_parts snapshot_now(bool with_retained = true) const;
     // Those parts as snapshot() gives them, appended to `out`.
     static void write_snapshot(const snapshot_parts& parts, std::string& out);
     // What a snapshot held, taken in at start; false with `why` when the bytes are not one.

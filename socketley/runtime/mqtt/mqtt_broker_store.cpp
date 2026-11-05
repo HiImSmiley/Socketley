@@ -310,16 +310,17 @@ std::string broker::snapshot() const
     return out;
 }
 
-broker::snapshot_parts broker::snapshot_now() const
+broker::snapshot_parts broker::snapshot_now(bool with_retained) const
 {
     snapshot_parts p;
     // The broker's own '$' figures are made again after a start, not read back stale.
-    m_retained.each([&](const std::shared_ptr<const message>& m) {
-        if (m->topic.starts_with('$'))
-            return;
-        p.size += m->topic.size() + m->payload.size() + 64;
-        p.retained.push_back(m);
-    });
+    if (with_retained)
+        m_retained.each([&](const std::shared_ptr<const message>& m) {
+            if (m->topic.starts_with('$'))
+                return;
+            p.size += m->topic.size() + m->payload.size() + 64;
+            p.retained.push_back(m);
+        });
     p.sessions.reserve(m_sessions.size());
     for (const auto& [id, s] : m_sessions)
     {

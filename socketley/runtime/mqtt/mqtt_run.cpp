@@ -1207,7 +1207,9 @@ void mqtt_run::persist(bool now_and_wait)
     }
     m_routes_dirty = false;
     // Taken now, written to bytes where the file is written: the retained messages are shared, not copied, here.
-    auto parts = std::make_shared<broker::snapshot_parts>(m_broker->snapshot_now());
+    // The retained messages are the same on every shard, so shard 0 alone writes them and the others ask it at start.
+    auto parts = std::make_shared<broker::snapshot_parts>(
+        m_broker->snapshot_now(!sharded() || m_owner.get_shard_index() == 0));
     // What is in flight is kept in its place, so a restart sends it again rather than losing it.
     std::vector<std::vector<const route_request*>> flying;
     if (m_routes && !m_route_asks.empty())
