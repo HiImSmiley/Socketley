@@ -1203,6 +1203,23 @@ private:
     void record_backend_error(size_t backend_idx);
     void record_backend_success(size_t backend_idx);
 
+    // Under --shards each of the first shared_verdicts backends is probed by one shard, idx % shards, whose verdict
+    // the others read from the shard table, its failures in a row are counted for the runtime, and a breaker one shard
+    // opens the others open as well.
+    static constexpr size_t shared_verdicts = 64;
+    // Where in the shard table's common words: a tally for each backend, then each shard's open breakers, then the
+    // backends each shard found down.
+    static constexpr uint32_t tally_word(size_t idx) { return static_cast<uint32_t>(idx); }
+    static constexpr uint32_t open_word(uint32_t shard) { return shared_verdicts + shard; }
+    static constexpr uint32_t down_word(uint32_t shard) { return shared_verdicts + max_shards + shard; }
+    bool probes_backend(size_t idx) const;
+    bool backend_healthy(size_t idx) const;
+    void health_record(size_t idx, bool ok);
+    void publish_verdicts();
+    void take_sibling_verdicts();
+    // The runtime's run of failures at backend `idx`, null where it is this shard's alone.
+    std::atomic<uint64_t>* verdict_tally(size_t idx);
+
     // The same three for an endpoint behind an @group backend, which has no
     // index to be charged, so a member that refused every connection kept its
     // full share of the traffic.
@@ -1672,6 +1689,15 @@ private:
     mesh_config m_mesh{};
     std::vector<backend_health> m_backend_health;
     std::vector<circuit_breaker> m_circuit_breakers;
+    // Set by setup() for a sharded proxy with a fixed backend list, which every shard indexes alike; an entrance's
+    // list grows per shard as its table is read, so its indices are not shared.
+    bool m_share_verdicts{false};
+    // The two masks last written for this shard, and the siblings' open breakers already acted on.
+    uint64_t m_published_down{0};
+    uint64_t m_published_open{0};
+    uint64_t m_sibling_open_seen{0};
+    // The shards that held their slot at the last sweep, whose share of the backends they probe themselves.
+    uint64_t m_siblings_live{~uint64_t{0}};
 
     // Breakers for endpoints behind an @group backend, as a map because the
     // set is membership the proxy does not own, with entries appearing only on

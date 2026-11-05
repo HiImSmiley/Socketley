@@ -2269,6 +2269,18 @@ bool proxy_instance::setup(event_loop& loop)
     m_backend_health.resize(m_backends.size());
     m_circuit_breakers.clear();
     m_circuit_breakers.resize(m_backends.size());
+    m_share_verdicts = get_shards() > 1 && !m_entrance && shard_stats_table().writable();
+    m_sibling_open_seen = 0;
+    m_siblings_live = ~uint64_t{0};
+    if (m_share_verdicts)
+    {
+        // Whatever the shard before this one at this index said is not this run's.
+        for (auto* w : {shard_stats_table().common_word(open_word(get_shard_index())),
+                        shard_stats_table().common_word(down_word(get_shard_index()))})
+            if (w)
+                w->store(0, std::memory_order_release);
+        m_published_down = m_published_open = 0;
+    }
     // A previous run's verdicts about group members do not carry over: the
     // membership may be entirely different by now, and an endpoint left open
     // would be refused for circuit_timeout after a restart that fixed it.
@@ -2782,14 +2794,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                         continue;
 
                     // Timed out — count as failure
-                    if (hc->backend_idx < m_backend_health.size())
-                    {
-                        auto& health = m_backend_health[hc->backend_idx];
-                        health.consecutive_failures++;
-                        if (health.consecutive_failures >= m_mesh.health_threshold)
-                            health.healthy = false;
-                        health.last_check = std::chrono::steady_clock::now();
-                    }
+                    health_record(hc->backend_idx, false);
                     // The operation it was waiting on is not cancelled by this
                     // deadline, so the probe is let go rather than handed to
                     // the next sweep, which used to overwrite what the connect
@@ -6125,6 +6130,10 @@ const backend_info* proxy_instance::select_and_resolve_backend(
     if (SOCKETLEY_UNLIKELY(m_backends.empty()))
         return nullptr;
 
+    // At the choice itself, since a request read in the turn that woke this shard would otherwise be sent before it.
+    if (m_share_verdicts)
+        take_sibling_verdicts();
+
     // Cleared up front so every non-group return path leaves it false, including
     // a keep-alive connection that was group-routed on an earlier request.
     conn->ex.backend_from_group = false;
@@ -8973,7 +8982,7 @@ bool proxy_instance::is_backend_available(size_t idx)
     }
 
     // Check health
-    if (idx < m_backend_health.size() && !m_backend_health[idx].healthy)
+    if (!backend_healthy(idx))
         return false;
 
     // Check circuit breaker
@@ -9127,6 +9136,15 @@ void proxy_instance::health_check_sweep()
     if (m_health_checks_pending)
         return;
 
+    // Which siblings are there to probe their share, asked once a sweep rather than at every choice.
+    if (m_share_verdicts)
+    {
+        m_siblings_live = 0;
+        for (uint32_t s = 0; s < get_shards() && s < 64; s++)
+            if (shard_stats_table().live_at(s))
+                m_siblings_live |= uint64_t{1} << s;
+    }
+
     m_health_checks_pending = true;
 
     for (size_t i = 0; i < m_backends.size() && i < m_health_checks.size(); i++)
@@ -9138,7 +9156,7 @@ void proxy_instance::health_check_sweep()
         // the next connect was about to read.
         drop_health_check(i);
 
-        if (b.is_group)
+        if (b.is_group || !probes_backend(i))
             continue;
 
         // Where this backend is, from the same function the request path asks
@@ -9153,14 +9171,7 @@ void proxy_instance::health_check_sweep()
         int fd = socket(addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0)
         {
-            if (i < m_backend_health.size())
-            {
-                auto& health = m_backend_health[i];
-                health.consecutive_failures++;
-                if (health.consecutive_failures >= m_mesh.health_threshold)
-                    health.healthy = false;
-                health.last_check = std::chrono::steady_clock::now();
-            }
+            health_record(i, false);
             continue;
         }
 
@@ -9250,23 +9261,7 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
     // Every path below either arms the next step or finishes the probe, and
     // finishing means letting it go rather than parking it for the next sweep
     // to write over.
-    const auto record = [&](bool ok) {
-        if (idx >= m_backend_health.size())
-            return;
-        auto& health = m_backend_health[idx];
-        if (ok)
-        {
-            health.consecutive_failures = 0;
-            health.healthy = true;
-        }
-        else
-        {
-            health.consecutive_failures++;
-            if (health.consecutive_failures >= m_mesh.health_threshold)
-                health.healthy = false;
-        }
-        health.last_check = std::chrono::steady_clock::now();
-    };
+    const auto record = [&](bool ok) { health_record(idx, ok); };
 
     if (hc->current == async_health_check::connecting)
     {
@@ -10054,7 +10049,14 @@ void proxy_instance::record_backend_error(size_t backend_idx)
     if (SOCKETLEY_UNLIKELY(backend_idx >= m_circuit_breakers.size()))
         return;
 
-    breaker_record_error(m_circuit_breakers[backend_idx], m_mesh.circuit_threshold);
+    auto& cb = m_circuit_breakers[backend_idx];
+    const auto was = cb.current;
+    // A failure in a row at any shard is one of the runtime's, so the tally the threshold is held against is theirs.
+    if (auto* tally = verdict_tally(backend_idx); tally && cb.current == circuit_breaker::closed)
+        cb.error_count = static_cast<int>(std::min<uint64_t>(tally->fetch_add(1, std::memory_order_relaxed), INT32_MAX - 1));
+    breaker_record_error(cb, m_mesh.circuit_threshold);
+    if (cb.current != was)
+        publish_verdicts();
 }
 
 void proxy_instance::record_backend_success(size_t backend_idx)
@@ -10062,7 +10064,118 @@ void proxy_instance::record_backend_success(size_t backend_idx)
     if (SOCKETLEY_UNLIKELY(backend_idx >= m_circuit_breakers.size()))
         return;
 
-    breaker_record_success(m_circuit_breakers[backend_idx]);
+    auto& cb = m_circuit_breakers[backend_idx];
+    const auto was = cb.current;
+    breaker_record_success(cb);
+    // Read before it is written, so a backend that keeps answering costs no store to a line every shard holds.
+    if (auto* tally = verdict_tally(backend_idx); tally && tally->load(std::memory_order_relaxed) != 0)
+        tally->store(0, std::memory_order_relaxed);
+    if (cb.current != was)
+        publish_verdicts();
+}
+
+std::atomic<uint64_t>* proxy_instance::verdict_tally(size_t idx)
+{
+    static_assert(shared_verdicts <= 64 && down_word(max_shards - 1) < shard_stats::common_words,
+                  "a bit for each backend in a word for each shard");
+    if (!m_share_verdicts || idx >= shared_verdicts)
+        return nullptr;
+    return shard_stats_table().common_word(tally_word(idx));
+}
+
+bool proxy_instance::probes_backend(size_t idx) const
+{
+    if (!m_share_verdicts || idx >= shared_verdicts)
+        return true;
+    // A shard that is not there, between a crash and its replacement, has its backends probed by every other one.
+    const auto owner = static_cast<uint32_t>(idx % get_shards());
+    return owner == get_shard_index() || !((m_siblings_live >> owner) & 1u);
+}
+
+bool proxy_instance::backend_healthy(size_t idx) const
+{
+    if (idx >= m_backend_health.size())
+        return true;
+    if (probes_backend(idx))
+        return m_backend_health[idx].healthy;
+    const auto owner = static_cast<uint32_t>(idx % get_shards());
+    return ((shard_stats_table().common_at(down_word(owner)) >> idx) & 1u) == 0;
+}
+
+void proxy_instance::health_record(size_t idx, bool ok)
+{
+    if (idx >= m_backend_health.size())
+        return;
+    auto& health = m_backend_health[idx];
+    const bool was = health.healthy;
+    if (ok)
+    {
+        health.consecutive_failures = 0;
+        health.healthy = true;
+    }
+    else
+    {
+        health.consecutive_failures++;
+        if (health.consecutive_failures >= m_mesh.health_threshold)
+            health.healthy = false;
+    }
+    health.last_check = std::chrono::steady_clock::now();
+    if (health.healthy != was)
+        publish_verdicts();
+}
+
+void proxy_instance::publish_verdicts()
+{
+    if (!m_share_verdicts)
+        return;
+    uint64_t down = 0;
+    uint64_t open = 0;
+    for (size_t i = 0; i < shared_verdicts && i < m_backend_health.size(); i++)
+        if (!m_backend_health[i].healthy)
+            down |= uint64_t{1} << i;
+    for (size_t i = 0; i < shared_verdicts && i < m_circuit_breakers.size(); i++)
+        if (m_circuit_breakers[i].current != circuit_breaker::closed)
+            open |= uint64_t{1} << i;
+    if (down == m_published_down && open == m_published_open)
+        return;
+    auto& table = shard_stats_table();
+    if (down != m_published_down)
+        if (auto* w = table.common_word(down_word(get_shard_index())))
+            w->store(down, std::memory_order_release);
+    if (open != m_published_open)
+        if (auto* w = table.common_word(open_word(get_shard_index())))
+            w->store(open, std::memory_order_release);
+    m_published_down = down;
+    m_published_open = open;
+}
+
+void proxy_instance::take_sibling_verdicts()
+{
+    const uint32_t shards = get_shards();
+    const uint32_t self = get_shard_index();
+    auto& table = shard_stats_table();
+    uint64_t open = 0;
+    for (uint32_t s = 0; s < shards; s++)
+        if (s != self)
+            open |= table.common_at(open_word(s));
+    // Only a breaker that has just opened somewhere is taken, so each shard's own half-open probe still decides when
+    // it closes here.
+    uint64_t rising = open & ~m_sibling_open_seen;
+    m_sibling_open_seen = open;
+    if (SOCKETLEY_LIKELY(rising == 0))
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; rising != 0 && i < m_circuit_breakers.size(); i++, rising >>= 1)
+    {
+        auto& cb = m_circuit_breakers[i];
+        if ((rising & 1u) && cb.current == circuit_breaker::closed)
+        {
+            cb.current = circuit_breaker::open;
+            cb.opened_at = now;
+            cb.probe_in_flight = false;
+        }
+    }
+    publish_verdicts();
 }
 
 void proxy_instance::record_group_error(std::string_view host, uint16_t port)
@@ -10365,8 +10478,8 @@ std::string proxy_instance::stats_lines() const
     if (m_mesh.health_check != mesh_config::health_none)
     {
         size_t healthy = 0;
-        for (const auto& h : m_backend_health)
-            if (h.healthy) healthy++;
+        for (size_t i = 0; i < m_backend_health.size(); i++)
+            if (backend_healthy(i)) healthy++;
         st::put(out, "healthy_backends", healthy);
     }
 

@@ -32,7 +32,7 @@ inline constexpr const char* region_name = "socketley-shards";
 
 inline constexpr size_t   line_size      = 64;
 inline constexpr uint32_t magic_value    = 0x534b4c53u;   // 'SKLS'
-inline constexpr uint32_t format_version = 3u;
+inline constexpr uint32_t format_version = 4u;
 
 // One shard's line, written by it alone, where `generation` counts attachments
 // so a reader can tell an unused slot from a legitimate zero.
@@ -95,6 +95,14 @@ struct figures
     }
 };
 
+// Words every shard of a runtime writes alike, given their meaning by the runtime and apart from the slots, which are
+// written every turn, so a request path may read them: a sharded proxy keeps its verdicts on its backends here.
+inline constexpr uint32_t common_words = 64 + 2 * max_shards;
+struct alignas(line_size) common_area
+{
+    std::atomic<uint64_t> word[common_words];
+};
+
 struct alignas(line_size) header
 {
     std::atomic<uint32_t> magic;
@@ -111,9 +119,10 @@ struct table
     header         h;
     slot           slots[max_shards];
     channel_filter channels[max_shards];
+    common_area    common;
 };
 static_assert(sizeof(table) == line_size * (max_shards + 1)
-                               + sizeof(channel_filter) * max_shards);
+                               + sizeof(channel_filter) * max_shards + sizeof(common_area));
 
 // "is fd 4 open" is the wrong test, because adopt() takes ownership and a guess
 // CLOSES somebody else's descriptor; memfd's name in /proc/self/fd is the test.
@@ -378,6 +387,23 @@ public:
         if (!m_table || i >= m_count || i >= max_shards || k > 1)
             return 0;
         return m_table->slots[i].reserved[k].load(std::memory_order_acquire);
+    }
+
+    // One of the words every shard writes, null where there is no region or no such word.
+    std::atomic<uint64_t>* common_word(uint32_t k)
+    {
+        return (writable() && k < common_words) ? &m_table->common.word[k] : nullptr;
+    }
+    uint64_t common_at(uint32_t k) const
+    {
+        return (m_table && k < common_words) ? m_table->common.word[k].load(std::memory_order_acquire) : 0;
+    }
+
+    // Whether shard `i` holds its slot now, which a dead one stops doing when the daemon clears it.
+    bool live_at(uint32_t i) const
+    {
+        return m_table && i < m_count && i < max_shards &&
+               m_table->slots[i].generation.load(std::memory_order_acquire) != 0;
     }
 
     // This shard's own filter, one bit at a time.
