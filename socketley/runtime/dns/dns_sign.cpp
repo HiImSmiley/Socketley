@@ -87,7 +87,8 @@ bool occluded(const zone& z, std::string_view name)
 
 // The RRSIG of `s` at `owner`, its fields and the signature over them and the set in canonical form (RFC 4034 3.1.8.1).
 bool sign_set(std::string_view owner, const rrset& s, std::string_view origin, const zone_key& key, uint32_t inception,
-              uint32_t expiration, std::string& out)
+              uint32_t expiration, std::string& out, signature_cache* cache,
+              std::unordered_map<std::string, std::string>& next)
 {
     std::string rd;
     put16(rd, s.type);
@@ -111,10 +112,29 @@ bool sign_set(std::string_view owner, const rrset& s, std::string_view origin, c
         put16(data, static_cast<uint16_t>(r.size()));
         data += r;
     }
-    const std::string sig = jws::es256(key.pkey.get(), data);
+    if (!cache)
+    {
+        const std::string sig = jws::es256(key.pkey.get(), data, jws::nonce_kind::derived);
+        if (sig.size() != 64)
+            return false;
+        out = rd + sig;
+        return true;
+    }
+    // The key is part of what is looked up, so a signature is never taken for another key's.
+    std::string digest = jws::sha256(key.dnskey + data);
+    if (const auto it = cache->sigs.find(digest); it != cache->sigs.end())
+    {
+        out = rd + it->second;
+        next.emplace(std::move(digest), it->second);
+        ++cache->kept;
+        return true;
+    }
+    std::string sig = jws::es256(key.pkey.get(), data, jws::nonce_kind::derived);
     if (sig.size() != 64)
         return false;
     out = rd + sig;
+    next.emplace(std::move(digest), std::move(sig));
+    ++cache->made;
     return true;
 }
 
@@ -186,7 +206,7 @@ bool load_or_make_key(const std::string& dir, std::string_view origin, zone_key&
     return true;
 }
 
-bool sign_zone(zone& z, const zone_key& key, int64_t now_s)
+bool sign_zone(zone& z, const zone_key& key, int64_t now_s, signature_cache* cache)
 {
     const int64_t epoch = sign_epoch(now_s);
     const uint32_t inception = static_cast<uint32_t>(epoch * sign_period_s - 3600);
@@ -226,6 +246,7 @@ bool sign_zone(zone& z, const zone_key& key, int64_t now_s)
         nd.sets.push_back({type_sec::NSEC, z.negative_ttl, {std::move(rd)}});
     }
     // Every set signed but a cut's NS, which is the child's to sign.
+    std::unordered_map<std::string, std::string> next;
     for (const auto& name : owners)
     {
         node& nd = z.names[name];
@@ -234,11 +255,14 @@ bool sign_zone(zone& z, const zone_key& key, int64_t now_s)
             if (nd.cut && s.type != type::DS && s.type != type_sec::NSEC)
                 continue;
             std::string sig;
-            if (!sign_set(name, s, z.origin, key, inception, expiration, sig))
+            if (!sign_set(name, s, z.origin, key, inception, expiration, sig, cache, next))
                 return false;
             nd.sigs.push_back({s.type, s.ttl, {std::move(sig)}});
         }
     }
+    // What this signing made or kept is what the next one may take; the rest is of sets gone or changed.
+    if (cache)
+        cache->sigs = std::move(next);
     // The apex's sets grew, so the SOA kept by soa() may have moved.
     z.forget_lookups();
     z.chain = std::move(owners);

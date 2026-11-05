@@ -1,6 +1,7 @@
 #pragma once
 // The pieces of JSON Web Signature this tree signs with: ES256 over P-256, the key kept in a PEM file, and the
 // encodings RFC 7515 and RFC 7638 fix, shared by the ACME client and the identity provider.
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -22,8 +23,16 @@ std::string jwk_of(EVP_PKEY* k);
 // The RFC 7638 thumbprint of that JWK, base64url, which the identity provider uses as the key's kid.
 std::string thumbprint(EVP_PKEY* k);
 
+// How an ES256 signature's nonce is chosen: at random, or derived from the key and the input (RFC 6979), so one
+// input signed twice is one signature.  A build on an OpenSSL before 3.2 derives none and draws at random.
+enum class nonce_kind : uint8_t
+{
+    random,
+    derived,
+};
+
 // ES256 over `input` as JWS writes it: r and s, 32 bytes each, not DER; empty if signing failed.
-std::string es256(EVP_PKEY* k, std::string_view input);
+std::string es256(EVP_PKEY* k, std::string_view input, nonce_kind how = nonce_kind::random);
 
 // Whether `sig`, 64 raw bytes, is the key's ES256 signature over `input`.
 bool es256_verify(EVP_PKEY* k, std::string_view input, std::string_view sig);

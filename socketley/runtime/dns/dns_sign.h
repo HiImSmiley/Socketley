@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 #include "dns_zone.h"
 
@@ -38,8 +39,18 @@ struct zone_key
 // false with why where it can neither be read nor made.
 bool load_or_make_key(const std::string& dir, std::string_view origin, zone_key& out, std::string& why);
 
-// `z` signed with `key` at `now_s`: its DNSKEY, NSEC chain and RRSIGs added; false where a signature failed.
-bool sign_zone(zone& z, const zone_key& key, int64_t now_s);
+// A zone's signatures by what they were made over, so a reload signs only the sets that changed: a signature over
+// the same bytes with the same key is the same signature, as its nonce is derived from them (RFC 6979).
+struct signature_cache
+{
+    std::unordered_map<std::string, std::string> sigs;
+    uint64_t made{0};
+    uint64_t kept{0};
+};
+
+// `z` signed with `key` at `now_s`: its DNSKEY, NSEC chain and RRSIGs added, each taken from `cache` where it holds
+// one over the same bytes, and the cache left holding this signing's; false where a signature failed.
+bool sign_zone(zone& z, const zone_key& key, int64_t now_s, signature_cache* cache = nullptr);
 
 // RFC 4034 Appendix B.
 uint16_t key_tag(std::string_view dnskey_rdata);

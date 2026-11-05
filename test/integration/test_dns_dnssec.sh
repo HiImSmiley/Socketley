@@ -10,6 +10,8 @@
 #   * a denial whose NSEC records do not prove it, for a name, a type or a wildcard
 #   * the DS command on a runtime that signs nothing
 #   * a zone transfer without the signatures
+#   * a reload that signs a set whose bytes did not change, or a changed one with the signature it had
+#   * shards of one runtime answering one set with signatures of their own
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -88,6 +90,37 @@ axfr=$(dig +time=2 +tries=1 -p "$NS" @127.0.0.1 example.test AXFR 2>/dev/null)
 for _ in $(seq 1 50); do dig +short +time=1 +tries=1 -p "$NS" @127.0.0.1 example.test SOA >/dev/null 2>&1 && break; sleep 0.1; done
 [ "$("$BIN" dnssec ns 2>&1)" = "$ds" ] && case "$(v mail.example.test A)" in *"; fully validated"*) true ;; *) false ;; esac \
     && ok "a restart signs with the key the DS is of" || bad "after a restart" "$("$BIN" dnssec ns 2>&1)"
+
+# ── a reload signs only the sets that changed ──
+stat_sum() { "$BIN" stats "$1" 2>/dev/null | awk -F: -v k="$2" '$1 == k { n += $2 } END { print n + 0 }'; }
+reloaded() { # runtime, reloads before: waits for the next one
+    for _ in $(seq 1 60); do [ "$(stat_sum "$1" zone_reloads)" -gt "$2" ] && return 0; sleep 0.1; done; return 1; }
+r0=$(stat_sum ns zone_reloads); m0=$(stat_sum ns signatures_made); k0=$(stat_sum ns signatures_kept)
+printf '; read again, nothing in it changed\n' >> "$T/example.zone"
+reloaded ns "$r0" || bad "a zone file written again is read again" "zone_reloads still $r0"
+m1=$(stat_sum ns signatures_made); k1=$(stat_sum ns signatures_kept)
+[ "$m1" -eq "$m0" ] && [ "$k1" -gt "$k0" ] && ok "a reload of the same records makes no signature ($((k1-k0)) kept)" \
+    || bad "a reload of the same records" "made $m0 -> $m1, kept $k0 -> $k1"
+r1=$(stat_sum ns zone_reloads)
+sed -i 's/2026102501/2026102502/; s/^mail      IN A   192.0.2.25/mail      IN A   192.0.2.26/' "$T/example.zone"
+reloaded ns "$r1" || bad "a changed zone is read again" "zone_reloads still $r1"
+m2=$(stat_sum ns signatures_made); k2=$(stat_sum ns signatures_kept)
+# The SOA and mail's A are new; the chain and every other set are not.
+[ "$((m2-m1))" -eq 2 ] && [ "$((k2-k1))" -gt 5 ] && ok "a change of one record signs it and the SOA alone" \
+    || bad "a change of one record" "made $((m2-m1)), kept $((k2-k1))"
+case "$(v mail.example.test A)" in *"; fully validated"*"192.0.2.26"*) ok "and the new record validates" ;;
+    *) bad "the changed record" "$(v mail.example.test A)" ;; esac
+
+# ── every shard signs a set alike ──
+NS3=$((SL_PORT_BASE+1722))
+cp "$T/example.zone" "$T/sharded.zone"
+"$BIN" create dns ns3 -p "$NS3" --bind 127.0.0.1 --zone "$T/sharded.zone" --dnssec --shards 4 --proxy none -s >/dev/null 2>&1
+for _ in $(seq 1 50); do dig +short +time=1 +tries=1 -p "$NS3" @127.0.0.1 example.test SOA >/dev/null 2>&1 && break; sleep 0.1; done
+# Each dig asks from a port of its own, which the kernel hashes to one of the four.
+sigs=$(for _ in $(seq 1 24); do dig +dnssec +norec +short +time=2 +tries=1 -p "$NS3" @127.0.0.1 mail.example.test A 2>/dev/null | grep '^A 13 '; done | sort -u)
+[ "$(printf '%s\n' "$sigs" | grep -c .)" -eq 1 ] && ok "24 answers from four shards carry one signature" \
+    || bad "the shards' signatures" "$(printf '%s\n' "$sigs" | grep -c .) different: $sigs"
+"$BIN" stop ns3 >/dev/null 2>&1
 
 cat > "$T/plain.zone" <<'EOF'
 $ORIGIN plain.test.

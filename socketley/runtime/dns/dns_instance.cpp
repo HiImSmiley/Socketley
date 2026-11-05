@@ -268,6 +268,9 @@ public:
     void on_cqe(struct io_uring_cqe* cqe) override;
 
     const counters& stats() const { return m_c; }
+    // Signatures made and taken from the cache, counted on the reload's thread and read on the loop's.
+    uint64_t signatures_made() const { return m_sigs_made.load(std::memory_order_relaxed); }
+    uint64_t signatures_kept() const { return m_sigs_kept.load(std::memory_order_relaxed); }
     size_t tcp_count() const { return m_conns.size(); }
     std::shared_ptr<const zone_set> zones() const { return m_zones; }
 
@@ -422,6 +425,9 @@ private:
     // With --dnssec, what signs each zone as it is loaded, and the key of each by its apex.
     zone_signer m_signer;
     std::unordered_map<std::string, zone_key> m_keys;
+    std::unordered_map<std::string, signature_cache> m_sig_cache;
+    std::atomic<uint64_t> m_sigs_made{0};
+    std::atomic<uint64_t> m_sigs_kept{0};
 
     // A reload read, checked and signed off the loop, which answers from the zones before it meanwhile.
     struct reload_job
@@ -463,7 +469,12 @@ bool dns_run::start(std::string& why)
                     return false;
                 it = m_keys.emplace(z.origin, std::move(k)).first;
             }
-            if (sign_zone(z, it->second, socketley::wall::now_sec()))
+            signature_cache& cache = m_sig_cache[z.origin];
+            const uint64_t made = cache.made, kept = cache.kept;
+            const bool ok = sign_zone(z, it->second, socketley::wall::now_sec(), &cache);
+            m_sigs_made.fetch_add(cache.made - made, std::memory_order_relaxed);
+            m_sigs_kept.fetch_add(cache.kept - kept, std::memory_order_relaxed);
+            if (ok)
                 return true;
             err = "its signatures could not be made";
             return false;
@@ -1843,5 +1854,8 @@ std::string dns_instance::stats_lines() const
         << "notify_given_up:" << c.notify_given_up << "\n"
         << "zone_reloads:" << c.reloads << "\n"
         << "zone_reload_failures:" << c.reload_failures << "\n";
+    if (get_dnssec())
+        out << "signatures_made:" << m_run->signatures_made() << "\n"
+            << "signatures_kept:" << m_run->signatures_kept() << "\n";
     return out.str();
 }

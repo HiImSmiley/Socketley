@@ -7,6 +7,7 @@
 
 #include <openssl/bio.h>
 #include <openssl/bn.h>
+#include <openssl/core_names.h>
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/err.h>
@@ -67,7 +68,8 @@ struct sign_context
         EVP_MD_free(sha256);
     }
 };
-thread_local sign_context t_sign;
+// One for each way of choosing the nonce, which is a setting of the context.
+thread_local sign_context t_sign[2];
 
 // r and s of a DER ECDSA signature, each 32 bytes from the left, into `out`; false for anything else.
 bool raw_of_der(const unsigned char* p, size_t n, char* out)
@@ -97,33 +99,48 @@ bool raw_of_der(const unsigned char* p, size_t n, char* out)
 
 }   // namespace
 
-std::string es256(EVP_PKEY* k, std::string_view input)
+std::string es256(EVP_PKEY* k, std::string_view input, nonce_kind how)
 {
     if (!k)
         return {};
-    if (t_sign.key != k)
+    sign_context& t = t_sign[how == nonce_kind::derived ? 1 : 0];
+    if (!t.sha256)
+        t.sha256 = EVP_MD_fetch(nullptr, "SHA256", nullptr);
+    if (!t.sha256)
+        return {};
+    if (t.key != k)
     {
-        EVP_PKEY_CTX_free(t_sign.ctx);
-        t_sign.key = nullptr;
-        t_sign.ctx = EVP_PKEY_CTX_new_from_pkey(nullptr, k, nullptr);
-        if (!t_sign.ctx || EVP_PKEY_sign_init(t_sign.ctx) != 1)
+        EVP_PKEY_CTX_free(t.ctx);
+        t.key = nullptr;
+        t.ctx = EVP_PKEY_CTX_new_from_pkey(nullptr, k, nullptr);
+        bool ready = t.ctx && EVP_PKEY_sign_init(t.ctx) == 1;
+#ifdef OSSL_SIGNATURE_PARAM_NONCE_TYPE
+        // RFC 6979 takes its HMAC from the signature's digest, which the context is told.
+        if (ready && how == nonce_kind::derived)
         {
-            EVP_PKEY_CTX_free(t_sign.ctx);
-            t_sign.ctx = nullptr;
+            unsigned int type = 1;
+            const OSSL_PARAM params[] = {OSSL_PARAM_construct_uint(OSSL_SIGNATURE_PARAM_NONCE_TYPE, &type),
+                                         OSSL_PARAM_construct_end()};
+            ready = EVP_PKEY_CTX_set_signature_md(t.ctx, t.sha256) == 1 && EVP_PKEY_CTX_set_params(t.ctx, params) == 1;
+        }
+#endif
+        if (!ready)
+        {
+            EVP_PKEY_CTX_free(t.ctx);
+            t.ctx = nullptr;
+            ERR_clear_error();
             return {};
         }
-        t_sign.key = k;
+        t.key = k;
     }
-    if (!t_sign.sha256)
-        t_sign.sha256 = EVP_MD_fetch(nullptr, "SHA256", nullptr);
     unsigned char digest[32];
     unsigned int dn = 0;
-    if (!t_sign.sha256 || EVP_Digest(input.data(), input.size(), digest, &dn, t_sign.sha256, nullptr) != 1 || dn != 32)
+    if (EVP_Digest(input.data(), input.size(), digest, &dn, t.sha256, nullptr) != 1 || dn != 32)
         return {};
     unsigned char der[80];
     size_t n = sizeof der;
     std::string raw(64, '\0');
-    if (EVP_PKEY_sign(t_sign.ctx, der, &n, digest, sizeof digest) != 1 || !raw_of_der(der, n, raw.data()))
+    if (EVP_PKEY_sign(t.ctx, der, &n, digest, sizeof digest) != 1 || !raw_of_der(der, n, raw.data()))
     {
         ERR_clear_error();
         return {};

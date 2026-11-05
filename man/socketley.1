@@ -14908,7 +14908,10 @@ ECDSA P\-256 with SHA\-256 (algorithm 13). The key is made at the first start
 and kept in
 .IR state\-dir /dns/ name .dnssec/
 for every shard. The runtime adds the key's DNSKEY at the apex, an NSEC chain
-through the names, and an RRSIG over every record set the zone holds. The
+through the names, and an RRSIG over every record set the zone holds. A
+signature's nonce is derived from the key and what it signs (RFC 6979), so every
+shard serves one set with the same signature, and a reload signs again only the
+sets whose bytes changed (the SOA at least, whose serial moves). The
 signatures last three weeks and are made again a week before they end. A query
 with the DO bit is answered with the signatures. A name or type that does not
 exist is answered with the NSEC records that prove it. A zone transfer carries
@@ -15008,9 +15011,14 @@ and
 .BR notify_sent ,
 .BR notify_acked ,
 .BR notify_given_up ,
-.B zone_reloads
+.BR zone_reloads ,
+.B zone_reload_failures
+and, with
+.BR \-\-dnssec ,
+.B signatures_made
 and
-.BR zone_reload_failures .
+.B signatures_kept
+(taken unchanged from the signing before).
 .SH SYNC FLAGS
 A
 .B sync
