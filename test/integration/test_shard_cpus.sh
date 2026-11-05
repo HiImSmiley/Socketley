@@ -54,8 +54,17 @@ PB=$((SL_PORT_BASE+1411))
 "$BIN" create idp pb -p $PB --issuer "http://127.0.0.1:$PB" --shards 2 -s >/dev/null 2>&1
 "$BIN" create server pc -p $((SL_PORT_BASE+1412)) -s >/dev/null 2>&1
 sleep 1.5
-for _ in 1 2 3 4 5 6 7 8; do
+# Until both idp shards have had a sign-in, since the kernel picks the shard and a pool starts at its first: the
+# threads of every worker other than its loop, counted until there are four or forty sign-ins have gone.
+helper_threads() {
+    local w n=0
+    for w in $(pgrep -P "$SOCKETLEY_DPID" -x socketley); do n=$((n + $(ls "/proc/$w/task" | wc -l) - 1)); done
+    echo "$n"
+}
+for _ in $(seq 1 40); do
     curl -s -o /dev/null -d 'username=nobody&password=not-the-password&rd=/' "http://127.0.0.1:$PB/login"
+    [ "$(helper_threads)" -ge 4 ] && break
+    sleep 0.1
 done
 sleep 0.5
 

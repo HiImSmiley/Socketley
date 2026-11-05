@@ -171,6 +171,8 @@ else
     bad "a busy shard port fails the start, and the error names it and --no-cluster" \
         "exit $RC, said: $(printf '%s' "$OUT" | head -c 160)" "log: ${WHY:-<no line naming $((PB+2))>}"
 fi
+# The shards that did bind are taken down after create has answered, which takes up to a second on a fast machine.
+for _ in $(seq 1 50); do [ "$(answers "$PB")" = no ] && break; sleep 0.1; done
 check "and the shared port of that cache is not left serving" "$(answers "$PB")" "no"
 kill "$HOLDER_PID" 2>/dev/null; wait "$HOLDER_PID" 2>/dev/null; HOLDER_PID=""
 "$BIN" stop cdb >/dev/null 2>&1; "$BIN" remove cdb >/dev/null 2>&1
