@@ -703,6 +703,9 @@ int issue(int argc, char** argv)
     // One issuance per account at a time, so two runtimes renewing at once do not race for the account's key.
     const int lock = ::open((account_path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock >= 0 && ::flock(lock, LOCK_EX) != 0) {}
+    // Asked again once the lock is held, so the shards of one runtime renewing together place one order, not N.
+    if (cert_covers(cert, names))
+        return finish(0);
 
     std::string err;
     https h;
