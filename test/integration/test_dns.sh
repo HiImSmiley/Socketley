@@ -244,6 +244,37 @@ if [ "${full:-999}" -ge 1 ] && [ "${full:-999}" -le 45 ]; then ok "400 queries f
 else bad "--rrl across four shards" "answered ${full:-none}, want at most 45"; fi
 "$BIN" remove wide >/dev/null 2>&1
 
+# A resolver asking from one port loaded one shard of four: the kernel picked the shard by address and port.  It is
+# picked by the query's ID now, which the asker draws at random.
+PS=$((SL_PORT_BASE+1728))
+"$BIN" create dns spread -p "$PS" --zone "$T/one.zone" --shards 4 --rrl 0 --proxy none -s >/dev/null 2>&1
+for _ in $(seq 1 50); do dig @127.0.0.1 -p "$PS" +short +time=1 +tries=1 www.one.test A >/dev/null 2>&1 && break; sleep 0.1; done
+before=$("$BIN" stats spread 2>/dev/null | awk -F: '/^udp_queries:/ {printf "%s ", $2+0}')
+answered=$(python3 - "$PS" <<'EOF'
+import random, socket, struct, sys, time
+p = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 0))
+s.settimeout(2)
+got = 0
+for _ in range(400):
+    s.sendto(struct.pack("!HHHHHH", random.getrandbits(16), 0, 1, 0, 0, 0) + b"\x03www\x03one\x04test\x00"
+             + struct.pack("!HH", 1, 1), ("127.0.0.1", p))
+    try:
+        s.recv(4096); got += 1
+    except socket.timeout:
+        pass
+print(got)
+EOF
+)
+sleep 2
+after=$("$BIN" stats spread 2>/dev/null | awk -F: '/^udp_queries:/ {printf "%s ", $2+0}')
+least=$(python3 -c "import sys; b=[int(x) for x in sys.argv[1].split()]; a=[int(x) for x in sys.argv[2].split()]; print(min(y-x for x,y in zip(b,a)) if len(a)==4 and len(b)==4 else -1)" "$before" "$after")
+expect "400 queries from one port are all answered by four shards" "$answered" "400"
+if [ "${least:--1}" -ge 40 ]; then ok "and every shard takes a share of them (the least took $least)"
+else bad "every shard takes a share of one port's queries" "per shard before '$before', after '$after'"; fi
+"$BIN" remove spread >/dev/null 2>&1
+
 # ── names runtimes are reached by, published ────────────────────────────────
 P2=$((SL_PORT_BASE+1712))
 cp "$T/example.zone" "$T/pub.zone"
