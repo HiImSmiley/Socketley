@@ -437,9 +437,21 @@ void db_run::publish()
         }
     }
     std::erase_if(m_feeds, [](const std::shared_ptr<conn>& c) { return c->dead; });
+    tell_feeds();
 }
 
 void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica)
+{
+    open_feed_at(c, rq, std::move(coll), all, replica);
+    // Shard 0 nudges a reader only once it knows of a stream there, so what it wrote before it knew is read now.
+    if (m_reader)
+    {
+        tell_feeds();
+        catch_up();
+    }
+}
+
+void db_run::open_feed_at(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica)
 {
     // Where the stream starts: after the change it names, or now.
     uint64_t since = m_durable;
@@ -946,7 +958,7 @@ std::string db_run::stats() const
                                (m_reader ? std::string("\nrole:reader") + (m_ready ? "" : " (starting)") +
                                                "\ncaught_up:" + std::to_string(m_c.caught_up) +
                                                "\nreopened:" + std::to_string(m_c.reopened)
-                                         : std::string("\nrole:writer")) +
+                                         : std::string("\nrole:writer\nnudges:") + std::to_string(m_c.nudges)) +
                                "\nsent_to_writer:" + std::to_string(m_c.crossed) +
                                "\ntaken_from_readers:" + std::to_string(m_c.crossings_served)
                          : std::string()) +
@@ -1151,6 +1163,7 @@ void db_run::tick()
         }
     }
     std::erase_if(m_feeds, [](const std::shared_ptr<conn>& c) { return c->dead; });
+    tell_feeds();
     m_http.sweep(now, idle_secs);
     catch_up();
     // A replica is told of the documents that go by the database it copies, which sends their deletions; a shard
@@ -1837,12 +1850,26 @@ void db_run::publish_log()
     const uint64_t layout = m_store.layout() + 1;
     if (m_durable == m_told_durable && layout == m_told_layout)
         return;
+    const bool relaid = layout != m_told_layout;
     m_told_durable = m_durable;
     m_told_layout = layout;
     m_owner.shard_stats_table().publish_words(m_durable, layout);
-    // A word to each reading shard, so its streams hear of the change without waiting for a read or a tick.
+    // A word to each reading shard that holds a stream, so it hears of the change without waiting for a read or a
+    // tick, and to every one when the segments changed, as a starting shard waits for that to open the log; one with
+    // no stream reads a change at its next request.  Ordered against the reader's count and its read.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     for (uint32_t j = 1; j < m_shards; ++j)
-        nudge(j);
+        if (relaid || m_owner.shard_stats_table().word_at(j, 0) != 0)
+            nudge(j);
+}
+
+void db_run::tell_feeds()
+{
+    if (m_shards <= 1 || !m_reader || m_feeds.size() == m_told_feeds)
+        return;
+    m_told_feeds = m_feeds.size();
+    m_owner.shard_stats_table().publish_words(m_told_feeds, 0);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 // The cookie of a nudge, above every crossing's, names the shard it went to.
@@ -1870,6 +1897,7 @@ void db_run::nudge(uint32_t j)
     m_nudge_flying[j] = sent;
     m_nudge_owed[j] = !sent;
     m_nudge_sent[j] = now;
+    m_c.nudges += sent;
 }
 
 void db_run::try_follow()

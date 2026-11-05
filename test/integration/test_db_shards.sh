@@ -217,6 +217,13 @@ w=$(echo "$s" | awk -F: '/^taken_from_readers:/ { n += $2 } END { print n + 0 }'
 [ "$w" -gt 0 ] && ok || bad "the reading shards send their writes to shard 0" "taken_from_readers $w"
 docs=$(echo "$s" | awk -F: '/^documents:/ { print $2 }' | sort -u | wc -l)
 expect "every shard holds every document" "$docs" 1
+# With no stream open on a reading shard, shard 0 tells none of its writes; the reads catch up as they come.
+sleep 1.5
+n0=$(stats_of data | awk -F: '/^nudges:/ { n += $2 } END { print n + 0 }')
+for i in $(seq 1 30); do curl -s -o /dev/null -X PUT -H "Authorization: Bearer shardsecret0123456789" \
+    -H "Content-Type: application/json" --data "{\"n\":$i}" "http://127.0.0.1:$PD/c/quiet/q$i"; done
+n1=$(stats_of data | awk -F: '/^nudges:/ { n += $2 } END { print n + 0 }')
+expect "thirty writes with no stream open nudge no reading shard" "$((n1 - n0))" 0
 
 "$BIN" stop data >/dev/null 2>&1
 "$BIN" edit data --shards 2 >/dev/null 2>&1 && ok || bad "the number of shards is changed while stopped" "$(tail -3 "$SOCKETLEY_DLOG")"

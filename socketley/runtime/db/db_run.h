@@ -162,6 +162,7 @@ private:
     void publish();
     // A stream's changes from `since` on, or a reset and a whole copy when they are no longer kept.
     void open_feed(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica);
+    void open_feed_at(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica);
     void send_event(conn& c, const event& e);
     void pump_dump(const std::shared_ptr<conn>& c);
     // The stream's changes after its place, from the history, until it holds its window; a reset when they are gone.
@@ -190,6 +191,8 @@ private:
     // Shard 0's log on the disk up to its latest change: said to the shards that read it, which take it in before
     // they answer, so a read sees every write answered before it began.
     void publish_log();
+    // How many streams this reading shard holds, said in its slot for shard 0 when it changes.
+    void tell_feeds();
     void nudge(uint32_t shard);
     void catch_up();
     void try_follow();
@@ -225,6 +228,8 @@ private:
     uint64_t m_seen_layout{0};
     std::string m_follow_error;
     uint64_t m_told_durable{0}, m_told_layout{0};
+    // The streams this reading shard told shard 0 it holds, in its own slot's first word.
+    size_t m_told_feeds{0};
     std::unordered_map<uint64_t, crossed> m_crossed;
     uint64_t m_next_cookie{1};
     // One nudge in flight per reading shard, and whether more log came since: each parks a ticket on this shard's
@@ -292,7 +297,7 @@ private:
     {
         uint64_t reads{0}, writes{0}, queries{0}, syncs{0}, refused{0}, conflicts{0}, calls{0}, expired{0}, events{0},
             backups{0}, backup_failures{0}, replicated{0}, resets{0}, crossed{0}, crossings_served{0},
-            caught_up{0}, reopened{0}, fetched{0};
+            caught_up{0}, reopened{0}, fetched{0}, nudges{0};
     } m_c;
     // A request taken to its answer put out, a wait for the disk or for shard 0 included, in loop turns.
     socketley::latency_histogram m_lat;
