@@ -694,6 +694,8 @@ private:
     subscription_tree m_subs;
     retained_tree<const message> m_retained;
     size_t m_retained_bytes{0};
+    // The retained messages that expire, by when, so the sweep reads only those due.
+    std::set<std::pair<int64_t, std::string>> m_retained_due;
 
     broker_stats m_stats;
     int64_t m_started_ms{0};

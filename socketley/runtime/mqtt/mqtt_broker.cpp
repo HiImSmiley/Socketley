@@ -840,10 +840,15 @@ bool broker::store_retained(const message_ptr& m, bool notify)
     const size_t old_size = old ? old->topic.size() + old->payload.size() : 0;
     // A '$' topic holds the broker's own figures, made again each interval and so no change a snapshot keeps.
     const bool kept = !m->topic.starts_with('$');
+    const auto replaced = [&] {
+        if (old && old->expires_ms)
+            m_retained_due.erase({old->expires_ms, old->topic});
+    };
     if (m->payload.empty())
     {
         if (old)
         {
+            replaced();
             m_retained.set(m->topic, nullptr);
             m_retained_bytes -= old_size;
             if (kept)
@@ -859,7 +864,10 @@ bool broker::store_retained(const message_ptr& m, bool notify)
         ++m_stats.retained_refused;
         return false;
     }
+    replaced();
     m_retained.set(m->topic, m);
+    if (m->expires_ms)
+        m_retained_due.emplace(m->expires_ms, m->topic);
     m_retained_bytes = m_retained_bytes - old_size + size;
     if (kept)
         mark();
@@ -1526,18 +1534,17 @@ void broker::sweep_sessions(int64_t now)
             ++m_stats.sessions_expired;
             end_session(*it->second, true);
         }
-    std::vector<std::string> stale;
-    m_retained.each([&](const std::shared_ptr<const message>& m) {
-        if (m->expires_ms && m->expires_ms <= now)
-            stale.push_back(m->topic);
-    });
-    for (const auto& t : stale)
-        if (const auto old = m_retained.get(t))
+    while (!m_retained_due.empty() && m_retained_due.begin()->first <= now)
+    {
+        const std::string topic = m_retained_due.begin()->second;
+        m_retained_due.erase(m_retained_due.begin());
+        if (const auto old = m_retained.get(topic))
         {
-            m_retained.set(t, nullptr);
+            m_retained.set(topic, nullptr);
             m_retained_bytes -= old->topic.size() + old->payload.size();
             mark();
         }
+    }
 }
 
 void broker::tick()

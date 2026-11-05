@@ -9,6 +9,7 @@
 #   * a wildcard that matches $SYS, a retained message that is not replaced or not cleared
 #   * a client that breaks the protocol -- a packet too large, a topic alias out of range -- kept connected
 #   * a 5.0 property dropped on the way: expiry, response topic, correlation data, user properties
+#   * a retained message kept past its expiry, or one set again without an expiry let go at the old one
 #   * mqtt-pub, mqtt-sub, mqtt-sessions, mqtt-kick and mqtt-retained answering wrong or not at all
 set -uo pipefail
 
@@ -240,6 +241,25 @@ if phase == "main":
         m = s3.message()
         check("retain as published keeps the flag on a live message", m.retain if m else None, True)
         for c in (pub, sub, s2, s3):
+            c.disconnect()
+
+        def held():
+            import json
+            out = cli("mqtt-retained", "m", "rx/#")[1]
+            return sorted(r["topic"] for r in json.loads(out or "[]"))
+        pub = connected(port, "ret-exp")
+        pub.publish("rx/gone", "soon", qos=1, retain=True, props={MESSAGE_EXPIRY: 1})
+        pub.publish("rx/again", "soon", qos=1, retain=True, props={MESSAGE_EXPIRY: 1})
+        pub.publish("rx/again", "kept", qos=1, retain=True)
+        pub.publish("rx/stays", "kept", qos=1, retain=True)
+        time.sleep(2.5)
+        check("a retained message is let go once its expiry has passed, and one set again without it is not",
+              held(), ["rx/again", "rx/stays"])
+        s4 = connected(port, "ret-exp-sub")
+        s4.subscribe(("rx/#", 1))
+        check("and a new subscription gets only those", sorted(m.topic for m in s4.messages(3, 1.0)),
+              ["rx/again", "rx/stays"])
+        for c in (pub, s4):
             c.disconnect()
     guarded("retained", retained)
 
