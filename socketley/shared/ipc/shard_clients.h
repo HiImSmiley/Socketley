@@ -158,28 +158,6 @@ public:
     uint32_t index()    const { return m_index; }
     uint32_t count()    const { return m_base ? m_count : 0; }
 
-    // The whole list, copied from m_active_fds rather than a second structure
-    // to keep in step -- a disagreement here is a send to a closed connection.
-    void publish(const std::vector<conn_ref>& refs)
-    {
-        if (!writable()) return;
-        auto* b = block(m_index);
-        auto* e = entries(m_index);
-
-        const uint32_t n = refs.size() > max_clients_per_shard
-                             ? max_clients_per_shard
-                             : static_cast<uint32_t>(refs.size());
-
-        const uint64_t v = begin_write(b);
-        for (uint32_t i = 0; i < n; ++i)
-        {
-            e[i].owner.store(refs[i].owner,  std::memory_order_relaxed);
-            e[i].serial.store(refs[i].serial, std::memory_order_relaxed);
-        }
-        b->count.store(n, std::memory_order_relaxed);
-        end_write(b, v);
-    }
-
     // One entry's worth of stores each, mirroring what server_instance does to
     // m_active_fds -- same order, same swap-remove, so the two stay aligned.
     void push(const conn_ref& r)

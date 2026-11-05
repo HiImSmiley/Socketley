@@ -1420,7 +1420,9 @@ private:
     {
         conn_ref    ref;
         std::string origin;      // runtime name that owns the connection
+        uint64_t    seen{0};     // the last self.clients() that listed it
     };
+    uint64_t m_clients_epoch{0};
     std::unordered_map<int, forwarded_client> m_forwarded;
     // How many of m_forwarded are a sibling shard's clients, minted by handle_for_sibling_ref().
     size_t m_sibling_handles{0};

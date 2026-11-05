@@ -6144,6 +6144,10 @@ server_instance::fanout_count server_instance::broadcast(std::string_view msg)
     for (auto& [handle, fc] : m_forwarded)
     {
         (void)handle;
+        // A sibling's client that self.clients() named is reached by that sibling's half of the broadcast, and the
+        // write below found no connection of this shard's for it, once per handle per broadcast.
+        if (fc.origin == get_name())
+            continue;
         // Same removal as in the read path above, for the same reason: the
         // state this used to test was this process's copy of somebody else's.
         route_relay::write(get_runtime_manager(), fc.origin, get_name(),
@@ -8291,13 +8295,14 @@ std::vector<int> server_instance::clients()
     std::vector<int> out = m_active_fds;
     out.reserve(out.size() + foreign.size());
 
-    std::unordered_set<conn_ref, conn_ref_hash> live;
-    live.reserve(foreign.size() * 2);
-
+    // Each handle listed is marked with this call's number, which the prune below reads instead of a set of them.
+    const uint64_t epoch = ++m_clients_epoch;
     for (const conn_ref& r : foreign)
     {
-        live.insert(r);
-        out.push_back(handle_for_sibling_ref(r));
+        const int h = handle_for_sibling_ref(r);
+        if (const auto it = m_forwarded.find(h); it != m_forwarded.end())
+            it->second.seen = epoch;
+        out.push_back(h);
     }
 
     // Handles for siblings' connections that have gone, pruned here or
@@ -8308,7 +8313,7 @@ std::vector<int> server_instance::clients()
         return out;
     for (auto it = m_forwarded.begin(); it != m_forwarded.end();)
     {
-        if (it->second.origin == get_name() && live.find(it->second.ref) == live.end())
+        if (it->second.seen != epoch && it->second.origin == get_name())
         {
             m_forwarded_by_ref.erase(it->second.ref);
             it = m_forwarded.erase(it);

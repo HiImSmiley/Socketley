@@ -78,6 +78,17 @@ function on_message(msg)
     if msg:find("LIST") then
         self.clients()
     end
+    if msg:find("KEEP") then
+        kept = self.clients()
+    end
+    if msg:find("PROBE") then
+        self.clients()
+        local n = 0
+        for _, h in ipairs(kept or {}) do
+            if self.send(h, "p\n") then n = n + 1 end
+        end
+        self.broadcast("LIVE:" .. tostring(n) .. "\n")
+    end
 end
 LUA
 
@@ -148,6 +159,33 @@ print(next((l.split(":", 1)[1].strip() for l in out.splitlines() if l.startswith
 PY
 COUNTED=$(python3 "$WORK/count.py" "$P_SRV" "$N" "$BIN")
 check "self.clients() leaves the runtime's connection count at its clients" "$COUNTED" "$N"
+
+# A handle for a sibling's client that has gone is dropped by the next self.clients(), or the handles grow for the life
+# of the runtime; one still held answers a send as queued.
+cat > "$WORK/prune.py" <<'PY'
+import socket, sys, time
+port, n = int(sys.argv[1]), int(sys.argv[2])
+socks = [socket.create_connection(('127.0.0.1', port), timeout=5) for _ in range(n)]
+time.sleep(0.8)
+socks[0].sendall(b"KEEP\n")
+time.sleep(0.5)
+for s in socks[1:]:
+    s.close()
+time.sleep(1.0)
+socks[0].sendall(b"PROBE\n")
+socks[0].settimeout(3)
+buf = b""
+try:
+    while b"LIVE:" not in buf or b"\n" not in buf.split(b"LIVE:", 1)[1]:
+        d = socks[0].recv(4096)
+        if not d: break
+        buf += d
+except Exception:
+    pass
+print(buf.split(b"LIVE:", 1)[1].split(b"\n")[0].decode() if b"LIVE:" in buf else "none")
+PY
+LIVE=$(python3 "$WORK/prune.py" "$P_SRV" 20)
+check "a sibling's client that left is gone from the handles at the next self.clients()" "$LIVE" "1"
 
 echo "== the control: the same script on ONE shard =="
 "$BIN" create server fan1 -p $P_SRV1 --lua "$WORK/fan.lua" --shards 1 >/dev/null 2>&1
