@@ -33,7 +33,7 @@ unset SOCKETLEY_CONFIG
 
 # The applications' metadata documents, served over TLS as https://client.test/..., under a CA the idp is told of.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj /CN=ca -keyout "$T/ca.key" \
-    -out "$T/ca.pem" -addext basicConstraints=critical,CA:TRUE >/dev/null 2>&1
+    -out "$T/ca.pem" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign >/dev/null 2>&1
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj /CN=client.test -keyout "$T/c.key" \
     -out "$T/c.csr" >/dev/null 2>&1
 printf 'subjectAltName=DNS:client.test\n' > "$T/c.ext"
