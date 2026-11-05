@@ -4057,6 +4057,7 @@ std::string mail_run::stats() const
         put(out, "imap_connections", imap);
         put(out, "imap_reads", m_imap->gets());
         put(out, "imap_cache_hits", m_imap->cache_hits());
+        put(out, "imap_users_held", m_imap->users_held());
     }
     if (m_mailboxes && m_mailboxes->enabled())
     {

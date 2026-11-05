@@ -12,6 +12,7 @@
 #   * new mail not told by NOOP or IDLE, or told only when the bucket is next listed
 #   * flags and UIDs lost by a restart
 #   * a client on this machine guessing an idp account's password with no count kept of its failures
+#   * a shard holding every user it ever served, or one that let a user go losing what came meanwhile, or its \Recent
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -36,6 +37,9 @@ IM=$((SL_PORT_BASE+1951))
 PI=$((SL_PORT_BASE+1952))
 PS=$((SL_PORT_BASE+1953))
 trap daemon_stop EXIT
+# A shard other than the first lets a user go 1.5 s after nothing there asked for it, so every part below runs through
+# users let go and read again.
+export SOCKETLEY_MAIL_LET_GO_MS=1500
 
 echo "=== Integration: IMAP on a mail runtime's mailboxes ==="
 
@@ -589,6 +593,47 @@ idx=$(find "$HOME/.local/share" -path '*/mail/msh.imap/alice' 2>/dev/null | head
     && [ "$(stat -c %s "$idx.log" 2>/dev/null)" -lt 262144 ] && ok "a journal past a quarter of a mebibyte is folded into its snapshot" \
     || bad "a journal past a quarter of a mebibyte is folded into its snapshot" "$(head -c 20 "$idx" 2>/dev/null) $(stat -c %s "$idx.log" 2>/dev/null)"
 check "and every shard reads the same flags after" "$r" "1 True"
+# A user nothing asked for on a shard other than the first is let go there, and read again whole when asked: what was
+# delivered meanwhile is in its folder and new to the first session to see it on each shard.
+r=$(timeout 180 python3 - "$IMSH" "$PSH" "$BIN" <<'PY'
+import imaplib, re, smtplib, subprocess, sys, time
+port, smtp, binary = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+def held():
+    time.sleep(1.5)
+    out = subprocess.run([binary, "stats", "msh"], capture_output=True, timeout=30).stdout.decode()
+    return sorted(int(l.split(":")[1]) for l in out.splitlines() if l.startswith("imap_users_held:"))
+def shard(M):
+    lport = M.sock.getsockname()[1]
+    out = subprocess.run(["ss", "-tnpH", "sport = :%d and dport = :%d" % (port, lport)], capture_output=True).stdout.decode()
+    m = re.search(r"pid=(\d+)", out)
+    return m.group(1) if m else None
+for _ in range(6):
+    M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); M.select("INBOX"); M.logout()
+time.sleep(3)
+gone = held()
+before = None
+s = smtplib.SMTP("127.0.0.1", smtp); s.ehlo("x")
+s.sendmail("ivy@else.test", ["alice@example.test"], "From: ivy@else.test\r\nSubject: meanwhile\r\n\r\nb\r\n"); s.quit()
+time.sleep(2)
+seen, recent, found = set(), [], []
+for _ in range(12):
+    M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1")
+    who = shard(M)
+    M.select("INBOX")
+    r = int(M.response("RECENT")[1][0] or 0)
+    typ, data = M.search(None, "SUBJECT", "meanwhile")
+    found.append(len(data[0].split()))
+    if who not in seen:
+        seen.add(who)
+        recent.append(r)
+    M.logout()
+print(gone[:2], set(found), len(seen), recent.count(1) == len(seen))
+PY
+)
+set -- $r
+check "a shard other than the first lets go of a user nothing there asked for" "${1:-}${2:-}" "[0,0]"
+check "and what was delivered meanwhile is in its folder on every shard" "${3:-}${4:-}" "{1}3"
+check "and new to the first session to see it on each shard" "${5:-}" "True"
 
 # A literal's marker glued to an atom is no literal, so the bytes after it are never taken as one; a length that wraps
 # past the end of what came is refused before sign-in, and the connection answers on.

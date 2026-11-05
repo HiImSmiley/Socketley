@@ -3237,7 +3237,7 @@ void imap_session::poll()
     m_store.open(m_owner, m_folder->name, [this, alive = m_alive](std::shared_ptr<imap_folder>) {
         if (*alive && (m_idle || m_notify_selected) && !m_running && !m_waiting)
             update_view();
-    }, false, 60000);
+    }, false, 60000, 900);
 }
 
 namespace

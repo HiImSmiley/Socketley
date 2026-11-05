@@ -30,6 +30,7 @@
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/settings.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/util/wall_clock.h"
 
@@ -601,7 +602,7 @@ std::shared_ptr<imap_folder> imap_store::make_folder(user_state& u, const std::s
 imap_store::user_state* imap_store::indexed(const std::string& name)
 {
     if (const auto it = m_users.find(name); it != m_users.end() && it->second.loaded)
-        return &it->second;
+        return &user(name);
     const std::string base = path_of(name);
     struct stat st{};
     if (::stat(base.c_str(), &st) != 0 && ::stat((base + ".log").c_str(), &st) != 0)
@@ -612,11 +613,22 @@ imap_store::user_state* imap_store::indexed(const std::string& name)
 imap_store::user_state& imap_store::user(const std::string& name)
 {
     user_state& u = m_users[name];
+    const int64_t now = wall::now_ms_coarse();
+    u.used_ms = now;
+    // The turn reads only the journals in use, so one asked for again is read here first, never staler than a second.
+    if (u.loaded && now - u.caught_ms > 1000)
+        catch_up(u);
     if (!u.loaded)
     {
         u.loaded = true;
         u.base = path_of(name);
-        reload(u);
+        if (const auto g = m_let_go.find(name); g != m_let_go.end())
+        {
+            reload(u, g->second.ino, g->second.off);
+            m_let_go.erase(g);
+        }
+        else
+            reload(u);
         // The folders every mailbox has, logged by the first shard to want them so every shard has their UIDVALIDITY.
         bool missing = false;
         for (const auto& [f, use] : special())
@@ -877,7 +889,7 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
     sweep();
 }
 
-void imap_store::reload(user_state& u)
+void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
 {
     // Under the user's lock, shared, so a compaction is not caught between its snapshot and its journal.
     const std::string& base = u.base;
@@ -974,8 +986,14 @@ void imap_store::reload(user_state& u)
         const size_t whole = log.rfind('\n') == std::string::npos ? 0 : log.rfind('\n') + 1;
         if (head.starts_with("SKLIMAPLOG ") &&
             std::strtoull(std::string(head.substr(11)).c_str(), nullptr, 10) == u.snapshot_gen)
-            apply(u, std::string_view(log).substr(head.size() + 1, whole > head.size() ? whole - head.size() - 1 : 0),
-                  false);
+        {
+            const size_t from = head.size() + 1;
+            const size_t to = std::max(from, whole);
+            // Past where a shard that let the user go had read the same journal, the lines are new to it.
+            const size_t old = fresh_ino == st.st_ino ? std::clamp<size_t>(fresh, from, to) : to;
+            apply(u, std::string_view(log).substr(from, old - from), false);
+            apply(u, std::string_view(log).substr(old, to - old), true);
+        }
         u.log_off = whole;
     }
     if (lock >= 0)
@@ -1017,6 +1035,7 @@ void imap_store::refresh(const std::string& name)
 
 void imap_store::catch_up(user_state& u)
 {
+    u.caught_ms = wall::now_ms_coarse();
     const std::string log = u.base + ".log";
     struct stat st{};
     if (::stat(log.c_str(), &st) != 0)
@@ -1061,6 +1080,7 @@ void imap_store::catch_up(user_state& u)
 bool imap_store::mutate(const std::string& name, const std::function<void(user_state&, std::string& lines)>& change)
 {
     user_state& u = m_users[name];
+    u.used_ms = wall::now_ms_coarse();
     if (u.base.empty())
         u.base = path_of(name);
     const std::string& base = u.base;
@@ -1360,6 +1380,7 @@ void imap_store::autoexpunge(int64_t now)
     {
         if (!u.loaded)
             continue;
+        catch_up(u);
         for (const char* folder : {"Junk", "Trash"})
         {
             const auto it = u.folders.find(folder);
@@ -1392,12 +1413,35 @@ void imap_store::tick(int64_t)
         m_expunge_swept_ms = now;
         autoexpunge(now);
     }
-    for (auto& [name, u] : m_users)
+    const int64_t now = wall::now_ms_coarse();
+    // A test aid shortens the ten minutes, and the minute with them.
+    static const int64_t let_go_ms = settings::number<int64_t>("SOCKETLEY_MAIL_LET_GO_MS").value_or(600000);
+    const int64_t quiet_ms = std::min<int64_t>(60000, let_go_ms);
+    for (auto it = m_users.begin(); it != m_users.end();)
     {
+        const std::string& name = it->first;
+        user_state& u = it->second;
         write_text_filters(name, u);
-        if (!u.loaded)
+        // A user no session here asked for in a minute is read when it is asked for again, unless its journal is due
+        // to be folded, and one not asked for in ten is let go -- except on the first shard, whose hourly expunge walks
+        // the users it holds.
+        const bool fold_due = u.log_off > (256u << 10) && u.log_off > u.snapshot_bytes;
+        if (!u.loaded || (now - u.used_ms > quiet_ms && !u.unsynced && !u.compacting && !fold_due))
+        {
+            if (u.loaded && now - u.used_ms > let_go_ms && m_run.owner().get_shard_index() != 0 && unused(u))
+            {
+                m_let_go[name] = {u.log_ino, u.log_off};
+                m_filter_bytes -= u.filters_bytes;
+                it = m_users.erase(it);
+            }
+            else
+                ++it;
             continue;
-        catch_up(u);
+        }
+        ++it;
+        // Read once a turn, by a poll of a waiting session or else here.
+        if (now - u.caught_ms >= 900)
+            catch_up(u);
         if (u.unsynced)
         {
             u.unsynced = false;
@@ -1433,6 +1477,15 @@ void imap_store::tick(int64_t)
         oldest->filters_ino = 0;
         oldest->filters_off = 0;
     }
+}
+
+bool imap_store::unused(const user_state& u) const
+{
+    if (u.locked || u.compacting || u.filters_compacting || u.unsynced || u.reserved || !u.filters_out.empty())
+        return false;
+    return std::all_of(u.folders.begin(), u.folders.end(), [](const auto& kv) {
+        return kv.second.use_count() == 1 && kv.second->waiting.empty() && !kv.second->syncing;
+    });
 }
 
 std::vector<std::shared_ptr<imap_folder>> imap_store::known(const std::string& name)
@@ -1760,16 +1813,17 @@ void imap_store::set_subscribed(const std::string& name, const std::string& fold
 }
 
 void imap_store::open(const std::string& name, const std::string& folder,
-                      std::function<void(std::shared_ptr<imap_folder>)> done, bool force, int64_t max_age_ms)
+                      std::function<void(std::shared_ptr<imap_folder>)> done, bool force, int64_t max_age_ms,
+                      int64_t caught_ms)
 {
     user_state& u = user(name);
     const auto it = u.folders.find(canonical(folder));
     if (it == u.folders.end())
     {
         // A folder a delivery or another client made is in the bucket before this session has listed it.
-        folders(name, [this, name, folder, done, force, max_age_ms](std::vector<std::string>) {
+        folders(name, [this, name, folder, done, force, max_age_ms, caught_ms](std::vector<std::string>) {
             if (user(name).folders.count(canonical(folder)))
-                open(name, folder, done, force, max_age_ms);
+                open(name, folder, done, force, max_age_ms, caught_ms);
             else
                 done(nullptr);
         });
@@ -1780,7 +1834,8 @@ void imap_store::open(const std::string& name, const std::string& folder,
     if (!force && now - f->synced_ms < std::max(sync_ms, max_age_ms))
     {
         // What another shard or a delivery logged is read in, even where the bucket is not listed again.
-        catch_up(u);
+        if (now - u.caught_ms >= caught_ms)
+            catch_up(u);
         done(f);
         return;
     }

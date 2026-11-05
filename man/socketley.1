@@ -16937,6 +16937,8 @@ So each UID is given only once, whichever shard gives it.
 Before each command, a shard reads the journal lines it has not yet read.
 The journal is folded into the snapshot once it passes a quarter of a
 mebibyte.
+A shard other than the first lets a user's index go once nothing on it has
+asked for the user for ten minutes, and reads it again when it is next asked.
 .PP
 A delivery, an APPEND or a COPY writes its journal line as the message is
 stored.
@@ -23893,6 +23895,15 @@ Inherited by worker processes, which have no command line of their own.
 A test aid that sets how many milliseconds new spam filter learning stays in a
 mail runtime's journal.
 After this time, the first shard folds it into the filter's file. Default: ten
+minutes.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_LET_GO_MS
+A test aid that sets how many milliseconds a shard of a mail runtime, other than
+the first, keeps a user's index in memory after nothing on that shard asked for
+it.
+The index is read again from its files when it is next asked for. Default: ten
 minutes.
 .IP
 Inherited by worker processes, which have no command line of their own.

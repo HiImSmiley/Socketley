@@ -122,8 +122,9 @@ public:
     void note_text(const std::string& user, const std::string& key, std::shared_ptr<const std::string> bytes);
     // A folder brought up to what the bucket holds, listed again where it was last listed longer than `max_age_ms` ago;
     // null when it does not exist and is not one every mailbox has.
+    // A journal read less than `caught_ms` ago is not read again, for a poll the turn of the clock makes.
     void open(const std::string& user, const std::string& folder, std::function<void(std::shared_ptr<imap_folder>)> done,
-              bool force = false, int64_t max_age_ms = 2000);
+              bool force = false, int64_t max_age_ms = 2000, int64_t caught_ms = 0);
     bool create(const std::string& user, const std::string& folder);
     // A folder's MAILBOXID, empty where there is no such folder.
     std::string mailbox_id(const std::string& user, const std::string& folder);
@@ -232,6 +233,14 @@ public:
     void flush_now();
     uint64_t gets() const { return m_gets; }
     uint64_t cache_hits() const { return m_hits; }
+    // The users whose index this shard holds.
+    size_t users_held() const
+    {
+        size_t n = 0;
+        for (const auto& [name, u] : m_users)
+            n += u.loaded;
+        return n;
+    }
 
 private:
     struct user_state
@@ -274,8 +283,20 @@ private:
         bool filters_compacting{false};
         // The file's size when it was last weighed for compaction.
         uint64_t filters_weighed{0};
+        // When this shard last asked for it and last read its journal, so the turn reads only the journals in use.
+        int64_t used_ms{0};
+        int64_t caught_ms{0};
     };
+    // Where the journal of a user let go by this shard was read to, so what came after is \Recent once it is back.
+    struct let_go
+    {
+        uint64_t ino{0};
+        uint64_t off{0};
+    };
+    std::unordered_map<std::string, let_go> m_let_go;
     user_state& user(const std::string& name);
+    // Whether nothing here holds the user's folders or waits on its files, so its state may be let go.
+    bool unused(const user_state& u) const;
     // The state of a user some shard keeps an index for, or null, nothing made for a name no mail or sign-in made.
     user_state* indexed(const std::string& name);
     // A filter held in memory and counted against what every user's may take together.
@@ -290,8 +311,9 @@ private:
     // A runtime-wide list of keys, each on or off by its last line, folded past a mebibyte.
     void note_line(const std::string& path, const std::string& key, bool on);
     std::vector<std::string> live_lines(const std::string& path);
-    // The snapshot and the whole journal read, everything known before forgotten.
-    void reload(user_state& u);
+    // The snapshot and the whole journal read, everything known before forgotten; the journal's lines past `fresh` of
+    // the inode `fresh_ino` add messages that are \Recent.
+    void reload(user_state& u, uint64_t fresh_ino = 0, uint64_t fresh = 0);
     // The journal's lines from `text`, applied; `fresh` says a message they add is \Recent.
     void apply(user_state& u, std::string_view text, bool fresh);
     // `change` made to `u` under the user's lock, the index read to its end first; it appends the lines it logs.
