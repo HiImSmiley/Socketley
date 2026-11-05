@@ -149,9 +149,16 @@ static constexpr size_t lua_pub_keep_bytes  = 1u << 20;
 
 // `<len>\n<bytes>`, length-prefixed rather than newline-delimited because RESP
 // commands contain newlines and a text value may as well.
+static void append_dec(std::string& out, size_t v)
+{
+    char buf[24];
+    const auto r = std::to_chars(buf, buf + sizeof buf, v);
+    out.append(buf, static_cast<size_t>(r.ptr - buf));
+}
+
 static void shard_frame_append(std::string& out, std::string_view bytes)
 {
-    out.append(std::to_string(bytes.size()));
+    append_dec(out, bytes.size());
     out.push_back('\n');
     out.append(bytes);
 }
@@ -3375,6 +3382,7 @@ void cache_instance::run_local_raw(client_connection* conn, std::string_view raw
 void cache_instance::open_collect(client_connection* conn, bool resp)
 {
     m_collect       = std::make_unique<shard_batch>();
+    m_collect->slots.reserve(m_collect_hint ? m_collect_hint : 8);
     m_collect->fd   = conn->fd;
     m_collect->resp = resp;
     m_collect_fd    = conn->fd;
@@ -4502,6 +4510,7 @@ void cache_instance::route_flush(client_connection* conn)
     auto  batch = std::move(m_collect);
     auto* mgr   = get_runtime_manager();
     m_collect.reset();
+    m_collect_hint = static_cast<uint32_t>(std::min<size_t>(batch->slots.size(), 1024));
     const int collected_for = m_collect_fd;
     m_collect_fd = -1;
 
@@ -4854,12 +4863,12 @@ static void rebuild_resp(std::string& out, std::string_view* args, int argc)
     out.clear();
     out.reserve(16 + static_cast<size_t>(argc) * 24);
     out.push_back('*');
-    out.append(std::to_string(argc));
+    append_dec(out, static_cast<size_t>(argc));
     out.append("\r\n", 2);
     for (int i = 0; i < argc; ++i)
     {
         out.push_back('$');
-        out.append(std::to_string(args[i].size()));
+        append_dec(out, args[i].size());
         out.append("\r\n", 2);
         out.append(args[i]);
         out.append("\r\n", 2);

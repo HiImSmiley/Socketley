@@ -686,12 +686,55 @@ private:
     // their exchange as `<len>\n<bytes>` because replies are not
     // self-delimiting -- with one command's answer assembled in the caller's
     // order rather than the order shards answered.
+    // The first element kept inline, because nearly every slot has one part and
+    // two vectors each were most of what a crossed pipeline allocated.
+    template <class T>
+    struct first_inline
+    {
+        T              first{};
+        std::vector<T> rest;
+        uint32_t       n{0};
+
+        size_t size() const { return n; }
+        bool empty() const { return n == 0; }
+        T&       operator[](size_t i)       { return i == 0 ? first : rest[i - 1]; }
+        const T& operator[](size_t i) const { return i == 0 ? first : rest[i - 1]; }
+        void assign(size_t count, const T& v)
+        {
+            n     = static_cast<uint32_t>(count);
+            first = v;
+            rest.assign(count > 1 ? count - 1 : 0, v);
+        }
+        void push_back(T v)
+        {
+            if (n == 0)
+                first = std::move(v);
+            else
+                rest.push_back(std::move(v));
+            ++n;
+        }
+
+        template <class Q, class E>
+        struct iter
+        {
+            Q*     q;
+            size_t i;
+            E& operator*() const { return (*q)[i]; }
+            iter& operator++() { ++i; return *this; }
+            bool operator!=(const iter& o) const { return i != o.i; }
+        };
+        iter<first_inline, T>             begin()       { return {this, 0}; }
+        iter<first_inline, T>             end()         { return {this, n}; }
+        iter<const first_inline, const T> begin() const { return {this, 0}; }
+        iter<const first_inline, const T> end()   const { return {this, n}; }
+    };
+
     struct reply_slot
     {
-        cache_merge              merge{cache_merge::single};
-        std::vector<std::string> parts;
-        std::vector<uint8_t>     part_filled;
-        uint32_t                 parts_left{0};
+        cache_merge               merge{cache_merge::single};
+        first_inline<std::string> parts;
+        first_inline<uint8_t>     part_filled;
+        uint32_t                  parts_left{0};
     };
 
     struct shard_batch
@@ -894,6 +937,9 @@ private:
     std::unordered_map<uint64_t, posted_group> m_posts;
     // A single-key command bound for a sibling, rebuilt here so a crossing allocates no string of its own.
     std::string m_cross_scratch;
+    // How many slots the last routed batch took, reserved up front for the next one, since a pipeline grown a slot at a
+    // time moved every slot it had held several times over.
+    uint32_t    m_collect_hint{0};
 
     // The batch being collected by the parse running right now, one at a time
     // because one connection is parsed at a time, and null inside
