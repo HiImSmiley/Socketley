@@ -15785,7 +15785,10 @@ The most the documents may hold. A write past it is refused with 507.
 .TP
 .BI "\-\-cache " size
 The memory that holds the documents last read. Default: 64M. The rest are read
-from the disk.
+from the disk. With
+.BR \-\-shards ,
+it is the runtime's: each shard caches its share, the size divided by the shard
+count.
 .TP
 .BI "\-\-replicate " url
 The http or https address of the database this one copies, as its entrance

@@ -175,6 +175,7 @@ public:
     // The most bytes the documents may hold, 0 for no bound; and the most the cache of documents read holds.
     void set_max_bytes(uint64_t b) { m_max_bytes = b; }
     void set_cache_bytes(uint64_t b);
+    uint64_t cache_limit() const { return m_cache_limit; }
 
     // A document's place and figures, null when there is none, it went, or whoever asks may not see it.
     const doc* get(std::string_view coll, std::string_view id) const;

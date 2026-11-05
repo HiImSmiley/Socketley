@@ -120,7 +120,9 @@ bool db_run::start(std::string& why)
     m_shards = std::max<uint32_t>(1, m_owner.get_shards());
     m_shard = m_owner.get_shard_index();
     m_reader = m_shards > 1 && m_shard > 0;
-    m_store.set_cache_bytes(m_owner.get_cache_bytes());
+    // --cache is the runtime's, as --maxmemory is a cache's: each shard caches its share of it, 1 MiB at the least.
+    m_store.set_cache_bytes(m_shards > 1 ? std::max<uint64_t>(1u << 20, m_owner.get_cache_bytes() / m_shards)
+                                         : m_owner.get_cache_bytes());
     // A shard reading shard 0's log opens it once shard 0 has, and sends shard 0 everything until then.
     if (m_reader)
     {
@@ -945,7 +947,8 @@ std::string db_run::stats() const
            "\nbytes:" + std::to_string(m_store.bytes()) + "\nmax_bytes:" + std::to_string(m_owner.get_max_bytes()) +
            "\ndisk_bytes:" + std::to_string(m_store.disk_bytes()) + "\nsegments:" + std::to_string(m_store.segments()) +
            "\nmerges:" + std::to_string(m_store.merges()) + "\ncache_hits:" + std::to_string(m_store.cache_hits()) +
-           "\ncache_misses:" + std::to_string(m_store.cache_misses()) + "\nseq:" + std::to_string(m_store.seq()) +
+           "\ncache_misses:" + std::to_string(m_store.cache_misses()) +
+           "\ncache_limit:" + std::to_string(m_store.cache_limit()) + "\nseq:" + std::to_string(m_store.seq()) +
            "\ndurable:" + std::to_string(m_durable) + "\nkeys:" + std::to_string(m_keys.size()) +
            "\nreads:" + std::to_string(m_c.reads) + "\nfetched:" + std::to_string(m_c.fetched) +
            "\nwrites:" + std::to_string(m_c.writes) +

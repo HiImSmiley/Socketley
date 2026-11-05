@@ -52,6 +52,7 @@ up "$PD" && up "$PR"
 s=$(stats_of data)
 expect "one shard writes" "$(echo "$s" | grep -c '^role:writer')" 1
 expect "and three read its log" "$(echo "$s" | grep -c '^role:reader$')" 3
+expect "the four cache --cache between them" "$(echo "$s" | awk -F: '$1 == "cache_limit" { n += $2 } END { print n + 0 }')" $((64 << 20))
 
 run() {
     python3 - "$1" "$PD" "$PR" "$PC" 2>&1 <<'PY'
