@@ -803,6 +803,8 @@ private:
         std::vector<fill_target> targets;
     };
     std::unordered_map<uint64_t, posted_group> m_posts;
+    // A single-key command bound for a sibling, rebuilt here so a crossing allocates no string of its own.
+    std::string m_cross_scratch;
 
     // The batch being collected by the parse running right now, one at a time
     // because one connection is parsed at a time, and null inside

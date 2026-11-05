@@ -8985,12 +8985,12 @@ void cache_instance::process_resp_command(client_connection* conn,
                     // Rebuilt from the parsed arguments rather than forwarded
                     // as the bytes that arrived, because they are the same
                     // message and a length threaded down from the parse loop
-                    // is a second fact to disagree about.
-                    std::string raw;
-                    rebuild_resp(raw, args, argc);
+                    // is a second fact to disagree about.  Into a kept string, since a foreign key's route_part()
+                    // only appends it and nothing in between can reach here again.
+                    rebuild_resp(m_cross_scratch, args, argc);
                     const uint32_t slot =
                         slot_open(conn, true, cache_merge::single, 1);
-                    route_part(conn, owner, slot, 0, raw, true);
+                    route_part(conn, owner, slot, 0, m_cross_scratch, true);
                     return;
                 }
             }
