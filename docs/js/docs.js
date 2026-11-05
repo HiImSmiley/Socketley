@@ -321,6 +321,22 @@ function benchSet(s) {
       const cls = q[1] > 1 ? 'up' : q[2] < 1 ? 'dn' : 'eq';
       return el('td', { class: 'rt ' + cls, 'data-l': 'vs ' + short(arms[k + 1]), title: 'From ' + q[1].toFixed(2) + '× to ' + q[2].toFixed(2) + '× across the passes' }, q[0].toFixed(2) + '×', el('span', { class: 'ci', text: q[1].toFixed(2) + '–' + q[2].toFixed(2) }));
     })));
+  // With two or more servers to compare against, the same table stacked: one line a server under each row, its
+  // ratio beside it. It is the form a card falls back to when the wide table would not fit.
+  const vsCell = q => {
+    if (!q) return el('td', { text: '–' });
+    const cls = q[1] > 1 ? 'up' : q[2] < 1 ? 'dn' : 'eq';
+    return el('td', { class: 'rt ' + cls, title: 'From ' + q[1].toFixed(2) + '× to ' + q[2].toFixed(2) + '× across the passes' }, q[0].toFixed(2) + '×', el('span', { class: 'ci', text: q[1].toFixed(2) + '–' + q[2].toFixed(2) }));
+  };
+  const valCell = (r, k, cls) => el('td', { class: cls }, el('div', { class: 'v', text: fmt(r.v[k], r.unit || s.unit) }),
+    r.cpu?.[k] != null && oneCpu == null ? el('div', { class: 'cpu', text: r.cpu[k].toFixed(2) + ' cores' }) : null);
+  const n = arms.length - 1;
+  const stk = n > 1 ? el('div', { class: 'mtw s2' }, el('table', { class: 'btbl stk' },
+    el('thead', {}, el('tr', {}, el('th', { text: '' }), el('th', { text: short(arms[0]) }), el('th', { class: 'ag', colspan: '3', text: 'compared with' }))),
+    el('tbody', {}, s.rows.flatMap((r, i) => arms.slice(1).map((a, k) => el('tr', { class: (k < n - 1 ? 'in' : '') + (i === s.rows.length - 1 ? ' end' : '') },
+      k ? null : el('td', { rowspan: String(n), text: r.name }),
+      k ? null : Object.assign(valCell(r, 0, 'us'), { rowSpan: n }),
+      el('td', { class: 'arm', text: short(a) }), valCell(r, k + 1, ''), vsCell(r.r?.[k]))))))) : null;
   const meta = [arms.slice(1).join(', '), oneCpu != null ? 'each on ' + (+oneCpu.toFixed(2) === 1 ? 'one core' : oneCpu.toFixed(2) + ' cores') : '', s.passes ? s.passes + ' passes' : '', s.date, s.commit ? 'socketley ' + s.commit : ''].filter(Boolean);
   const notes = el('details', { class: 'bn' }, el('summary', { text: 'How it was measured' }),
     el('p', { text: [s.tool, s.pin].filter(Boolean).join('; ') + '.' }));
@@ -338,18 +354,21 @@ function benchSet(s) {
   const card = el('div', { class: 'bset' + (arms.length > 2 ? ' a3' : ''), id: 'bench:' + s.id },
     el('h3', {}, el('span', { text: s.title })),
     el('div', { class: 'meta', text: meta.join(' · ') }),
-    el('div', { class: 'mtw' }, el('table', { class: 'btbl' + (arms.length > 2 ? ' a3' : '') }, el('thead', {}, head), el('tbody', {}, body))), comp,
+    el('div', { class: 'mtw s1' }, el('table', { class: 'btbl' + (arms.length > 2 ? ' a3' : '') }, el('thead', {}, head), el('tbody', {}, body))), stk, comp,
     s.caveat ? el('p', { class: 'cav', text: '⚠ ' + s.caveat[0].toUpperCase() + s.caveat.slice(1) + '.' }) : null,
     notes);
   FIT?.observe(card);
   return card;
 }
-// A card shows the table while the table fits it, and the compact rows once it would have to scroll.
+// A card shows the wide table while it fits, else the stacked one while that fits, else the compact rows.
+const over = m => m.scrollWidth > m.clientWidth + 1;
 const FIT = typeof ResizeObserver === 'function' ? new ResizeObserver(es => {
   for (const { target: b } of es) {
-    const m = b.querySelector('.mtw');
-    b.classList.remove('cmp');
-    if (m.scrollWidth > m.clientWidth + 1) b.classList.add('cmp');
+    const w = b.querySelector('.mtw.s1'), t = b.querySelector('.mtw.s2');
+    b.classList.remove('stk', 'cmp');
+    if (!over(w)) continue;
+    if (t) { b.classList.add('stk'); if (!over(t)) continue; }
+    b.classList.add('cmp');
   }
 }) : null;
 function benchLegend(page) {
