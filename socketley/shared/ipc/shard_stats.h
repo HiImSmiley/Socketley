@@ -32,7 +32,7 @@ inline constexpr const char* region_name = "socketley-shards";
 
 inline constexpr size_t   line_size      = 64;
 inline constexpr uint32_t magic_value    = 0x534b4c53u;   // 'SKLS'
-inline constexpr uint32_t format_version = 4u;
+inline constexpr uint32_t format_version = 5u;
 
 // One shard's line, written by it alone, where `generation` counts attachments
 // so a reader can tell an unused slot from a legitimate zero.
@@ -96,8 +96,9 @@ struct figures
 };
 
 // Words every shard of a runtime writes alike, given their meaning by the runtime and apart from the slots, which are
-// written every turn, so a request path may read them: a sharded proxy keeps its verdicts on its backends here.
-inline constexpr uint32_t common_words = 64 + 2 * max_shards;
+// written every turn, so a request path may read them: a sharded proxy keeps its verdicts on its backends here, by
+// index for the first 64 of a fixed list and in a table of 512 entries keyed by endpoint for the rest.
+inline constexpr uint32_t common_words = 64 + 2 * max_shards + 8 + 4 * 512;
 struct alignas(line_size) common_area
 {
     std::atomic<uint64_t> word[common_words];

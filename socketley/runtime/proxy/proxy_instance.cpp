@@ -1881,6 +1881,26 @@ void proxy_instance::listen_addresses(std::vector<std::string>& out) const
     out.push_back("tcp:" + std::to_string(effective_port()));
 }
 
+// FNV-1a and a finalizer, the same in every shard, never zero, which marks an entry no endpoint has taken.
+static uint64_t verdict_hash(std::string_view s, uint64_t tag)
+{
+    uint64_t h = 0xcbf29ce484222325ull ^ tag;
+    for (const unsigned char c : s)
+        h = (h ^ c) * 0x100000001b3ull;
+    h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+    h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+    h ^= h >> 31;
+    return h ? h : 1;
+}
+
+static uint64_t steady_ns(std::chrono::steady_clock::time_point t)
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
+}
+
+// Where each tag's keys come from: an entrance backend's address, a fixed list's index, a node's or member's endpoint.
+enum : uint64_t { key_address = 1, key_index = 2, key_endpoint = 3 };
+
 bool proxy_instance::setup(event_loop& loop)
 {
 #ifdef SOCKETLEY_TRACE
@@ -2269,9 +2289,16 @@ bool proxy_instance::setup(event_loop& loop)
     m_backend_health.resize(m_backends.size());
     m_circuit_breakers.clear();
     m_circuit_breakers.resize(m_backends.size());
-    m_share_verdicts = get_shards() > 1 && !m_entrance && shard_stats_table().writable();
+    m_share_keyed = get_shards() > 1 && shard_stats_table().writable();
+    m_share_verdicts = m_share_keyed && !m_entrance;
     m_sibling_open_seen = 0;
     m_siblings_live = ~uint64_t{0};
+    m_openings_seen = shard_stats_table().common_at(opened_word);
+    m_watching = false;
+    m_backend_keys.clear();
+    for (size_t i = 0; i < m_backends.size(); i++)
+        m_backend_keys.push_back(m_entrance ? verdict_hash(m_backends[i].address, key_address)
+                                            : verdict_hash(std::to_string(i), key_index));
     if (m_share_verdicts)
     {
         // Whatever the shard before this one at this index said is not this run's.
@@ -5897,6 +5924,7 @@ void proxy_instance::entrance_load(std::chrono::milliseconds min_gap)
                 m_backends.push_back(std::move(b));
                 m_backend_health.resize(m_backends.size());
                 m_circuit_breakers.resize(m_backends.size());
+                m_backend_keys.push_back(verdict_hash(addr, key_address));
                 m_backend_pool.resize(m_backends.size());
                 m_health_checks.resize(m_backends.size());
                 it = m_entrance_addr.emplace(addr, idx).first;
@@ -6075,7 +6103,7 @@ const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, siz
         return exclude_path ? nullptr : &b;   // one address, and it just failed
 
     const size_t n = b.nodes.size();
-    const bool gated = m_mesh.circuit_threshold > 0 && !m_group_breakers.empty();
+    const bool gated = m_mesh.circuit_threshold > 0 && (!m_group_breakers.empty() || m_watching);
     // A retry asks for a node OTHER than the one that just failed; the pooled
     // preference below would otherwise hand back the same one.
     const auto barred = [&](const std::string& path) {
@@ -6124,13 +6152,16 @@ const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, siz
 const backend_info* proxy_instance::select_and_resolve_backend(
     proxy_client_connection* conn, const std::string* exclude_host, uint16_t exclude_port)
 {
+    // At the choice itself, since a request read in the turn that woke this shard would otherwise be sent before it.
+    if (m_share_keyed)
+        watch_openings();
+
     if (m_entrance)
         return entrance_select(conn, exclude_host != nullptr);
 
     if (SOCKETLEY_UNLIKELY(m_backends.empty()))
         return nullptr;
 
-    // At the choice itself, since a request read in the turn that woke this shard would otherwise be sent before it.
     if (m_share_verdicts)
         take_sibling_verdicts();
 
@@ -6354,7 +6385,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(
     // Members the breaker has taken out come off the list before anything is
     // selected, because choosing first means either using a broken member or
     // biasing the round-robin by skipping a turn.
-    if (m_mesh.circuit_threshold > 0 && !m_group_breakers.empty())
+    if (m_mesh.circuit_threshold > 0 && (!m_group_breakers.empty() || m_watching))
     {
         pool.erase(std::remove_if(pool.begin(), pool.end(),
                                   [this](const resolved_backend& rb) {
@@ -8972,7 +9003,7 @@ bool proxy_instance::is_backend_available(size_t idx)
         return false;
 
     // A sharded runtime is reachable while any of its nodes is.
-    if (const auto& b = m_backends[idx]; !b.nodes.empty() && !m_group_breakers.empty())
+    if (const auto& b = m_backends[idx]; !b.nodes.empty() && (!m_group_breakers.empty() || m_watching))
     {
         bool any = false;
         for (const auto& node : b.nodes)
@@ -8984,6 +9015,9 @@ bool proxy_instance::is_backend_available(size_t idx)
     // Check health
     if (!backend_healthy(idx))
         return false;
+
+    if (SOCKETLEY_UNLIKELY(m_watching) && keyed_verdict(idx) && idx < m_circuit_breakers.size())
+        take_opening(backend_key(idx), m_circuit_breakers[idx]);
 
     // Check circuit breaker
     if (idx < m_circuit_breakers.size())
@@ -9137,7 +9171,7 @@ void proxy_instance::health_check_sweep()
         return;
 
     // Which siblings are there to probe their share, asked once a sweep rather than at every choice.
-    if (m_share_verdicts)
+    if (m_share_keyed)
     {
         m_siblings_live = 0;
         for (uint32_t s = 0; s < get_shards() && s < 64; s++)
@@ -10052,11 +10086,15 @@ void proxy_instance::record_backend_error(size_t backend_idx)
     auto& cb = m_circuit_breakers[backend_idx];
     const auto was = cb.current;
     // A failure in a row at any shard is one of the runtime's, so the tally the threshold is held against is theirs.
-    if (auto* tally = verdict_tally(backend_idx); tally && cb.current == circuit_breaker::closed)
-        cb.error_count = static_cast<int>(std::min<uint64_t>(tally->fetch_add(1, std::memory_order_relaxed), INT32_MAX - 1));
+    if (cb.current == circuit_breaker::closed)
+        if (auto* tally = verdict_tally(backend_idx, true))
+            cb.error_count = static_cast<int>(std::min<uint64_t>(tally->fetch_add(1, std::memory_order_relaxed), INT32_MAX - 1));
     breaker_record_error(cb, m_mesh.circuit_threshold);
-    if (cb.current != was)
-        publish_verdicts();
+    if (cb.current == was)
+        return;
+    publish_verdicts();
+    if (was == circuit_breaker::closed && keyed_verdict(backend_idx))
+        publish_opening(backend_key(backend_idx), cb);
 }
 
 void proxy_instance::record_backend_success(size_t backend_idx)
@@ -10068,27 +10106,154 @@ void proxy_instance::record_backend_success(size_t backend_idx)
     const auto was = cb.current;
     breaker_record_success(cb);
     // Read before it is written, so a backend that keeps answering costs no store to a line every shard holds.
-    if (auto* tally = verdict_tally(backend_idx); tally && tally->load(std::memory_order_relaxed) != 0)
-        tally->store(0, std::memory_order_relaxed);
+    if (!keyed_verdict(backend_idx) || shard_stats_table().common_at(claimed_word) != 0)
+        if (auto* tally = verdict_tally(backend_idx, false); tally && tally->load(std::memory_order_relaxed) != 0)
+            tally->store(0, std::memory_order_relaxed);
     if (cb.current != was)
         publish_verdicts();
 }
 
-std::atomic<uint64_t>* proxy_instance::verdict_tally(size_t idx)
+std::atomic<uint64_t>* proxy_instance::verdict_tally(size_t idx, bool claim)
 {
-    static_assert(shared_verdicts <= 64 && down_word(max_shards - 1) < shard_stats::common_words,
-                  "a bit for each backend in a word for each shard");
-    if (!m_share_verdicts || idx >= shared_verdicts)
+    static_assert(shared_verdicts <= 64 && down_word(max_shards - 1) < opened_word &&
+                      keyed_base + keyed_entries * keyed_fields == shard_stats::common_words &&
+                      keyed_base * sizeof(uint64_t) % shard_stats::line_size == 0,
+                  "a bit for each backend in a word for each shard, then the keyed entries on lines of their own");
+    if (m_share_verdicts && idx < shared_verdicts)
+        return shard_stats_table().common_word(tally_word(idx));
+    if (!keyed_verdict(idx))
         return nullptr;
-    return shard_stats_table().common_word(tally_word(idx));
+    auto* e = keyed_entry(backend_key(idx), claim);
+    return e ? e + keyed_tally : nullptr;
+}
+
+bool proxy_instance::keyed_verdict(size_t idx) const
+{
+    return m_share_keyed && (!m_share_verdicts || idx >= shared_verdicts);
+}
+
+uint64_t proxy_instance::backend_key(size_t idx) const
+{
+    return idx < m_backend_keys.size() ? m_backend_keys[idx] : 0;
+}
+
+uint32_t proxy_instance::backend_owner(size_t idx) const
+{
+    // A fixed list is indexed alike by every shard; an entrance's list is not, so its address decides.
+    return static_cast<uint32_t>((m_entrance ? backend_key(idx) : idx) % get_shards());
+}
+
+std::atomic<uint64_t>* proxy_instance::keyed_entry(uint64_t key, bool claim)
+{
+    // A run of entries from where the key falls, ended by one never taken, which a takeover below never makes.
+    constexpr uint32_t run = 16;
+    auto& table = shard_stats_table();
+    if (!m_share_keyed || key == 0)
+        return nullptr;
+    const uint64_t now = claim ? steady_ns(std::chrono::steady_clock::now()) : 0;
+    const uint64_t timeout = static_cast<uint64_t>(std::max(m_mesh.circuit_timeout, 1)) * 1'000'000'000ull;
+    std::atomic<uint64_t>* stale = nullptr;
+    uint64_t stale_key = 0;
+    for (uint32_t a = 0; a < run; a++)
+    {
+        auto* e = table.common_word(keyed_base + static_cast<uint32_t>((key + a) % keyed_entries) * keyed_fields);
+        if (!e)
+            return nullptr;
+        uint64_t k = e[keyed_key].load(std::memory_order_acquire);
+        if (k == key)
+            return e;
+        if (k == 0)
+        {
+            if (!claim)
+                return nullptr;
+            if (e[keyed_key].compare_exchange_strong(k, key, std::memory_order_acq_rel) || k == key)
+            {
+                if (auto* c = table.common_word(claimed_word); c && c->load(std::memory_order_relaxed) == 0)
+                    c->store(1, std::memory_order_release);
+                return e;
+            }
+            continue;
+        }
+        const uint64_t opened = e[keyed_opened].load(std::memory_order_relaxed);
+        if (claim && !stale && e[keyed_tally].load(std::memory_order_relaxed) == 0 &&
+            e[keyed_down].load(std::memory_order_relaxed) == 0 && (opened == 0 || (opened <= now && now - opened >= timeout)))
+        {
+            stale = e;
+            stale_key = k;
+        }
+    }
+    // An endpoint no shard has failed at lately gives up its entry; a shard that found it a moment before may add
+    // one error to the new endpoint's tally, which is all that race costs.
+    if (!stale || !stale[keyed_key].compare_exchange_strong(stale_key, key, std::memory_order_acq_rel))
+        return nullptr;
+    stale[keyed_tally].store(0, std::memory_order_relaxed);
+    stale[keyed_opened].store(0, std::memory_order_relaxed);
+    stale[keyed_down].store(0, std::memory_order_release);
+    return stale;
+}
+
+uint64_t proxy_instance::keyed_value(uint64_t key, keyed_field f) const
+{
+    const auto& table = shard_stats_table();
+    if (!m_share_keyed || key == 0)
+        return 0;
+    for (uint32_t a = 0; a < 16; a++)
+    {
+        const uint32_t base = keyed_base + static_cast<uint32_t>((key + a) % keyed_entries) * keyed_fields;
+        const uint64_t k = table.common_at(base + keyed_key);
+        if (k == key)
+            return table.common_at(base + f);
+        if (k == 0)
+            return 0;
+    }
+    return 0;
+}
+
+void proxy_instance::publish_opening(uint64_t key, const circuit_breaker& cb)
+{
+    auto* e = keyed_entry(key, true);
+    if (!e)
+        return;
+    e[keyed_opened].store(steady_ns(cb.opened_at), std::memory_order_release);
+    if (auto* n = shard_stats_table().common_word(opened_word))
+        n->fetch_add(1, std::memory_order_release);
+}
+
+void proxy_instance::take_opening(uint64_t key, circuit_breaker& cb)
+{
+    // Only a closed breaker takes a sibling's opening, so each shard's own half-open probe still decides when it
+    // closes here, and one this shard opened itself, or took already, is not taken twice.
+    if (!m_watching || cb.current != circuit_breaker::closed)
+        return;
+    const uint64_t at = keyed_value(key, keyed_opened);
+    const uint64_t now = steady_ns(std::chrono::steady_clock::now());
+    if (at <= steady_ns(cb.opened_at) || at > now ||
+        now - at >= static_cast<uint64_t>(m_mesh.circuit_timeout) * 1'000'000'000ull)
+        return;
+    cb.current = circuit_breaker::open;
+    cb.opened_at = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(at));
+    cb.probe_in_flight = false;
+}
+
+void proxy_instance::watch_openings()
+{
+    const uint64_t n = shard_stats_table().common_at(opened_word);
+    if (SOCKETLEY_UNLIKELY(n != m_openings_seen))
+    {
+        m_openings_seen = n;
+        m_watching = true;
+        m_watch_until = std::chrono::steady_clock::now() + std::chrono::seconds(m_mesh.circuit_timeout);
+    }
+    else if (SOCKETLEY_UNLIKELY(m_watching) && std::chrono::steady_clock::now() >= m_watch_until)
+        m_watching = false;
 }
 
 bool proxy_instance::probes_backend(size_t idx) const
 {
-    if (!m_share_verdicts || idx >= shared_verdicts)
+    if (!m_share_keyed)
         return true;
     // A shard that is not there, between a crash and its replacement, has its backends probed by every other one.
-    const auto owner = static_cast<uint32_t>(idx % get_shards());
+    const auto owner = backend_owner(idx);
     return owner == get_shard_index() || !((m_siblings_live >> owner) & 1u);
 }
 
@@ -10096,9 +10261,11 @@ bool proxy_instance::backend_healthy(size_t idx) const
 {
     if (idx >= m_backend_health.size())
         return true;
-    if (probes_backend(idx))
+    if (m_mesh.health_check == mesh_config::health_none || probes_backend(idx))
         return m_backend_health[idx].healthy;
-    const auto owner = static_cast<uint32_t>(idx % get_shards());
+    if (keyed_verdict(idx))
+        return keyed_value(backend_key(idx), keyed_down) == 0;
+    const auto owner = backend_owner(idx);
     return ((shard_stats_table().common_at(down_word(owner)) >> idx) & 1u) == 0;
 }
 
@@ -10122,6 +10289,12 @@ void proxy_instance::health_record(size_t idx, bool ok)
     health.last_check = std::chrono::steady_clock::now();
     if (health.healthy != was)
         publish_verdicts();
+    // Written at every answer by the shard that probes it, so one that replaced a crashed shard corrects what that
+    // one left; a shard probing it only while its prober is gone keeps its verdict to itself.
+    if (keyed_verdict(idx) && backend_owner(idx) == get_shard_index())
+        if (auto* e = keyed_entry(backend_key(idx), !health.healthy))
+            if (const uint64_t down = health.healthy ? 0 : 1; e[keyed_down].load(std::memory_order_relaxed) != down)
+                e[keyed_down].store(down, std::memory_order_release);
 }
 
 void proxy_instance::publish_verdicts()
@@ -10189,18 +10362,36 @@ void proxy_instance::record_group_error(std::string_view host, uint16_t port)
     if (it == m_group_breakers.end())
         it = m_group_breakers.emplace(std::string(key), circuit_breaker{}).first;
 
-    breaker_record_error(it->second, m_mesh.circuit_threshold);
+    // Counted for the runtime and opened on every shard, as a backend of a fixed list is, so a dead node of a
+    // sharded backend costs circuit_threshold errors in all rather than at each shard.
+    auto& cb = it->second;
+    const auto was = cb.current;
+    const uint64_t shared = m_share_keyed ? verdict_hash(key, key_endpoint) : 0;
+    if (shared && cb.current == circuit_breaker::closed)
+        if (auto* e = keyed_entry(shared, true))
+            cb.error_count = static_cast<int>(
+                std::min<uint64_t>(e[keyed_tally].fetch_add(1, std::memory_order_relaxed), INT32_MAX - 1));
+    breaker_record_error(cb, m_mesh.circuit_threshold);
+    if (shared && was == circuit_breaker::closed && cb.current == circuit_breaker::open)
+        publish_opening(shared, cb);
 }
 
 void proxy_instance::record_group_success(std::string_view host, uint16_t port)
 {
-    if (m_group_breakers.empty())
+    // The runtime's tally is cleared by any shard's success, once any shard has failed anywhere at all.
+    const bool shared = m_share_keyed && shard_stats_table().common_at(claimed_word) != 0;
+    if (m_group_breakers.empty() && !shared)
         return;
 
     char buf[320];
     const auto key = endpoint_key(buf, sizeof(buf), host, port);
     if (key.empty())
         return;
+
+    if (shared)
+        if (auto* e = keyed_entry(verdict_hash(key, key_endpoint), false);
+            e && e[keyed_tally].load(std::memory_order_relaxed) != 0)
+            e[keyed_tally].store(0, std::memory_order_relaxed);
 
     auto it = m_group_breakers.find(key);
     if (it == m_group_breakers.end())
@@ -10223,6 +10414,15 @@ bool proxy_instance::group_endpoint_available(std::string_view host, uint16_t po
         return true;
 
     auto it = m_group_breakers.find(key);
+    // A breaker another shard has opened since is opened here, with an entry made for it if this shard has none.
+    if (SOCKETLEY_UNLIKELY(m_watching))
+    {
+        circuit_breaker fresh{};
+        auto& cb = it != m_group_breakers.end() ? it->second : fresh;
+        take_opening(verdict_hash(key, key_endpoint), cb);
+        if (it == m_group_breakers.end() && cb.current != circuit_breaker::closed)
+            it = m_group_breakers.emplace(std::string(key), cb).first;
+    }
     if (it == m_group_breakers.end())
         return true;
 

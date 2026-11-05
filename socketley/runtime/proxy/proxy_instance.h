@@ -1217,8 +1217,30 @@ private:
     void health_record(size_t idx, bool ok);
     void publish_verdicts();
     void take_sibling_verdicts();
-    // The runtime's run of failures at backend `idx`, null where it is this shard's alone.
-    std::atomic<uint64_t>* verdict_tally(size_t idx);
+    // The runtime's run of failures at backend `idx`, null where it is this shard's alone, and with `claim` false null
+    // also where no shard has failed there yet.
+    std::atomic<uint64_t>* verdict_tally(size_t idx, bool claim);
+
+    // Every other verdict under --shards -- a node of a sharded backend, a member of an @group, an entrance's backends
+    // and those past the first shared_verdicts -- has an entry in a table in the common words, keyed by a hash of the
+    // endpoint, with the runtime's run of failures, when a shard last opened its breaker, and whether the shard that
+    // probes it found it down.
+    // How many breakers any shard has opened, and whether an entry has ever been taken, alone on their line.
+    static constexpr uint32_t opened_word = shared_verdicts + 2 * max_shards;
+    static constexpr uint32_t claimed_word = opened_word + 1;
+    static constexpr uint32_t keyed_base = opened_word + 8;
+    static constexpr uint32_t keyed_entries = 512;
+    enum keyed_field : uint32_t { keyed_key, keyed_tally, keyed_opened, keyed_down, keyed_fields };
+    // The entry for `key`, taken for it when `claim` and none is, null where the table is not this runtime's or full.
+    std::atomic<uint64_t>* keyed_entry(uint64_t key, bool claim);
+    uint64_t keyed_value(uint64_t key, keyed_field f) const;
+    bool keyed_verdict(size_t idx) const;
+    uint64_t backend_key(size_t idx) const;
+    uint32_t backend_owner(size_t idx) const;
+    // Tell the other shards a breaker has just opened here, and open this one where another shard has since.
+    void publish_opening(uint64_t key, const circuit_breaker& cb);
+    void take_opening(uint64_t key, circuit_breaker& cb);
+    void watch_openings();
 
     // The same three for an endpoint behind an @group backend, which has no
     // index to be charged, so a member that refused every connection kept its
@@ -1698,6 +1720,15 @@ private:
     uint64_t m_sibling_open_seen{0};
     // The shards that held their slot at the last sweep, whose share of the backends they probe themselves.
     uint64_t m_siblings_live{~uint64_t{0}};
+    // Set by setup() for any sharded proxy: the keyed entries, used where the indexed words above are not.
+    bool m_share_keyed{false};
+    // The openings counted when this shard last looked, and until when a closed breaker asks its entry whether a
+    // sibling opened it, set for circuit_timeout after the count moves.
+    uint64_t m_openings_seen{0};
+    std::chrono::steady_clock::time_point m_watch_until{};
+    bool m_watching{false};
+    // Each backend's key in that table, by index, since an entrance's indices differ from shard to shard.
+    std::vector<uint64_t> m_backend_keys;
 
     // Breakers for endpoints behind an @group backend, as a map because the
     // set is membership the proxy does not own, with entries appearing only on

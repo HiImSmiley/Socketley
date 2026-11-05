@@ -6270,9 +6270,7 @@ The proxy removes an unhealthy backend from the load balancer pool until it
 recovers.
 Under
 .BR \-\-shards ,
-each of the first 64 backends of a
-.B \-\-backend
-list is probed by one shard and every shard uses its verdict,
+each backend is probed by one shard and every shard uses its verdict,
 so a backend sees one probe per interval at any shard count;
 a shard that has gone has its share probed by the others until it is back.
 .TP
@@ -6311,6 +6309,9 @@ Under
 .BR \-\-shards ,
 the errors are counted for the whole runtime and a circuit one shard opens is
 open on every shard; each shard sends its own half\-open probe.
+This holds for a node of a sharded backend, a member of a group and a runtime
+an entrance routes a name to as well; past 512 endpoints failing at once, a
+further one is counted by each shard on its own.
 Default: 5.
 .TP
 .BI "\-\-circuit\-timeout " "duration"
