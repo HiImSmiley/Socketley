@@ -2291,7 +2291,8 @@ size_t server_instance::get_connection_count() const
     size_t upstream_connected = 0;
     for (const auto& [_, uc] : m_upstreams)
         if (uc->established) ++upstream_connected;
-    return m_active_fds.size() + m_forwarded.size() + upstream_connected;
+    // A sibling's client named for self.clients() is that sibling's to count.
+    return m_active_fds.size() + m_forwarded.size() - m_sibling_handles + upstream_connected;
 }
 
 // What this server owes right now, over every connection and every upstream.
@@ -2995,6 +2996,7 @@ void server_instance::teardown(event_loop& loop)
     }
     m_forwarded.clear();
     m_forwarded_by_ref.clear();
+    m_sibling_handles = 0;
 
     // And every connection this runtime routed away, which nothing told
     // before, so a target kept an entry per routed connection naming a runtime
@@ -7978,7 +7980,12 @@ void server_instance::release_routed(const conn_ref& ref)
     // script that writes gets a clean false.
     m_forwarded_by_ref.erase(it);
     invoke_on_disconnect(handle);
-    m_forwarded.erase(handle);
+    if (const auto f = m_forwarded.find(handle); f != m_forwarded.end())
+    {
+        if (f->second.origin == get_name())
+            --m_sibling_handles;
+        m_forwarded.erase(f);
+    }
 }
 
 void server_instance::forget_runtime(std::string_view gone)
@@ -8305,6 +8312,7 @@ std::vector<int> server_instance::clients()
         {
             m_forwarded_by_ref.erase(it->second.ref);
             it = m_forwarded.erase(it);
+            --m_sibling_handles;
         }
         else
             ++it;
@@ -8325,6 +8333,7 @@ int server_instance::handle_for_sibling_ref(const conn_ref& r)
     if (h < 0)
         return h;
     m_forwarded[h] = forwarded_client{r, std::string(get_name())};
+    ++m_sibling_handles;
     m_forwarded_by_ref[r] = h;
     return h;
 }

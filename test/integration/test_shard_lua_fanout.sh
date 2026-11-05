@@ -75,6 +75,9 @@ function on_message(msg)
     if msg:find("SHOUT") then
         self.broadcast("ALL:" .. tostring(self.connections()) .. "\n")
     end
+    if msg:find("LIST") then
+        self.clients()
+    end
 end
 LUA
 
@@ -130,6 +133,21 @@ kill -CONT "$SOCKETLEY_DPID"
 echo "  observed with the daemon stopped: $REACHEDM of $N reached, $DELIVEREDM deliveries"
 check "the fan-out reaches every client without the daemon" "$REACHEDM"   "$N"
 check "and each of them exactly once without it"            "$DELIVEREDM" "$N"
+
+# self.clients() names every sibling's client on the shard that asked, and that
+# shard counted them as its own: the runtime's count read N plus what it named.
+cat > "$WORK/count.py" <<'PY'
+import socket, subprocess, sys, time
+port, n, binary = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+socks = [socket.create_connection(('127.0.0.1', port), timeout=5) for _ in range(n)]
+time.sleep(0.8)
+socks[0].sendall(b"LIST\n")
+time.sleep(1.5)
+out = subprocess.run([binary, "stats", "fan4"], capture_output=True, text=True).stdout
+print(next((l.split(":", 1)[1].strip() for l in out.splitlines() if l.startswith("connections:")), "none"))
+PY
+COUNTED=$(python3 "$WORK/count.py" "$P_SRV" "$N" "$BIN")
+check "self.clients() leaves the runtime's connection count at its clients" "$COUNTED" "$N"
 
 echo "== the control: the same script on ONE shard =="
 "$BIN" create server fan1 -p $P_SRV1 --lua "$WORK/fan.lua" --shards 1 >/dev/null 2>&1

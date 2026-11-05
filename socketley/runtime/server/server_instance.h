@@ -1422,6 +1422,8 @@ private:
         std::string origin;      // runtime name that owns the connection
     };
     std::unordered_map<int, forwarded_client> m_forwarded;
+    // How many of m_forwarded are a sibling shard's clients, minted by handle_for_sibling_ref().
+    size_t m_sibling_handles{0};
     std::unordered_map<conn_ref, int, conn_ref_hash> m_forwarded_by_ref;
     int m_next_handle{conn_handle_base};
     int alloc_handle();
