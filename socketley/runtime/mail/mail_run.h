@@ -511,9 +511,10 @@ private:
     uint64_t m_next_cookie{1};
     void imap_sieve_apply(const std::string& user, const std::shared_ptr<imap_folder>& f, uint32_t uid,
                           std::string_view bytes, const sieve::outcome& out, const std::string& own);
-    std::vector<std::string> m_push_users;
+    // This shard's push users, each with when its last verified subscription expires.
+    std::unordered_map<std::string, int64_t> m_push_live;
     std::unordered_map<std::string, std::string> m_push_seen;
-    int64_t m_push_list_mtime{-1};
+    int64_t m_push_list_mtime{-1}, m_push_list_size{-2};
     uint64_t m_pushes_sent{0}, m_pushes_failed{0};
     std::shared_ptr<bool> m_alive;
 

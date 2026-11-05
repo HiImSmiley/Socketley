@@ -20,6 +20,8 @@
 #   * a VacationResponse not answering, answering a sender twice, or answering a list
 #   * a PushSubscription pushed before it is verified, its verification not readable by the keys it gave, a
 #     StateChange not sent when mail comes, or its URL and keys told back
+#   * a push user with no verified subscription read every second by the shard that pushes for it, so that shard
+#     never lets the user go; or one let go and verified later not pushed to
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -46,6 +48,8 @@ PS=$((SL_PORT_BASE+1924))
 NS=$((SL_PORT_BASE+1925))
 SINK=$((SL_PORT_BASE+1926))
 PUSH=$((SL_PORT_BASE+1927))
+P2=$((SL_PORT_BASE+1928))
+JM2=$((SL_PORT_BASE+1929))
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
@@ -84,6 +88,8 @@ srv.serve_forever()
 PY
 PIDS+=($!)
 export SOCKETLEY_MAIL_PUSH_CONNECT="127.0.0.1:$PUSH" SOCKETLEY_MAIL_PUSH_CA="$T/ca.pem"
+# A shard other than the first lets a user go 1.5 s after nothing there asked for it.
+export SOCKETLEY_MAIL_LET_GO_MS=1500
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
 mkdir -p "$T/sink"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" >/dev/null 2>&1 &
@@ -410,6 +416,69 @@ st, _, _ = call("GET", "/.well-known/jmap", source="127.0.0.2")
 say("a password in the clear from another machine is refused", st == 403, st)
 PY
 tally < <(timeout 180 python3 "$T/client.py" "$JM" "$IM" "$T/sink" "$P" "$T/pushes" 2>&1 | grep -E '^(ok|bad) ')
+
+# Two shards, alice's pushes on the second (FNV-1a of her name, odd): with only a subscription not verified she is
+# nothing to push to, so that shard lets her go; verified, she is read again and pushed to.
+"$BIN" create mail mp -p "$P2" --mail-domain example.test --idp auth --storage st/mailp --jmap "$JM2" --shards 2 -s \
+    >/dev/null 2>&1
+for p in "$P2" "$JM2"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"; done
+cat > "$T/sharded_push.py" <<'PY'
+import base64, http.client, json, os, re, smtplib, subprocess, sys, time
+jm, smtp, binary, pushdir = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+AUTH = {"Authorization": "Basic " + base64.b64encode(b"alice:alicepassword1").decode(), "Content-Type": "application/json"}
+def say(name, cond, why=""):
+    print(("ok " if cond else "bad ") + name + ("" if cond else ": " + str(why)[:500]))
+def pid(flags, q):
+    m = re.search(r"pid=(\d+)", subprocess.run(["ss", flags, q], capture_output=True).stdout.decode())
+    return m.group(1) if m else None
+first = pid("-ltnpH", "sport = :%d" % smtp)
+def held():
+    out = subprocess.run([binary, "stats", "mp"], capture_output=True, timeout=30).stdout.decode()
+    return sum(int(l.split(":")[1]) for l in out.splitlines() if l.startswith("imap_users_held:"))
+def second_shard():
+    for _ in range(200):
+        c = http.client.HTTPConnection("127.0.0.1", jm, timeout=20); c.connect()
+        if pid("-tnpH", "sport = :%d and dport = :%d" % (jm, c.sock.getsockname()[1])) not in (None, first):
+            return c
+        c.close()
+    raise SystemExit("bad a session reached the second shard")
+def api(c, *calls):
+    c.request("POST", "/jmap/api", body=json.dumps({"using": ["urn:ietf:params:jmap:core"], "methodCalls": list(calls)}),
+              headers=AUTH)
+    return {cid: args for name, args, cid in json.loads(c.getresponse().read())["methodResponses"]}
+def pushes(n, secs=8):
+    end = time.time() + secs
+    while True:
+        got = sorted(x for x in os.listdir(pushdir) if x.endswith("sharded"))
+        if len(got) >= n or time.time() > end:
+            return [json.loads(open(os.path.join(pushdir, x), "rb").read().partition(b"\n")[2]) for x in got]
+        time.sleep(0.1)
+c = second_shard()
+made = api(c, ["PushSubscription/set", {"create": {"a": {"deviceClientId": "d", "url": "https://push.test/sharded"}}}, "s"])["s"]
+# Stats come a quarter second late at most, and the user is let go 1.5 s after the session asked.
+time.sleep(0.6)
+during = held()
+c.close()
+v = pushes(1)
+say("a subscription is made on the second shard and its verification sent", "a" in made.get("created", {}) and v and
+    v[0].get("@type") == "PushVerification", (made, v))
+for _ in range(80):
+    if held() == 0:
+        break
+    time.sleep(0.1)
+after = held()
+say("the second shard holds alice after her session asked, and lets her go with nothing to push to",
+    during >= 1 and after == 0, (during, after))
+c = second_shard()
+api(c, ["PushSubscription/set", {"update": {made["created"]["a"]["id"]: {"verificationCode": v[0]["verificationCode"]}}}, "u"])
+c.close()
+time.sleep(1.5)
+sm = smtplib.SMTP("127.0.0.1", smtp); sm.ehlo("x")
+sm.sendmail("x@else.test", ["alice@example.test"], "From: x@else.test\r\nSubject: sharded push\r\n\r\nhi\r\n"); sm.quit()
+p = pushes(2)
+say("verified, she is read again by that shard and the new mail pushed", len(p) >= 2 and p[1].get("@type") == "StateChange", p)
+PY
+tally < <(timeout 120 python3 "$T/sharded_push.py" "$JM2" "$P2" "$BIN" "$T/pushes" 2>&1 | grep -E '^(ok|bad) ')
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

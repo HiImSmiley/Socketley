@@ -58,37 +58,81 @@ void mail_run::push_send(const std::string& url, const std::string& p256dh, cons
         });
 }
 
+namespace
+{
+
+// When a subscription stops taking pushes: its expiry if the push service proved it reads the URL, else at once.
+int64_t live_until(const socketley::json::jvalue& sub)
+{
+    const auto* verified = socketley::json::member(sub, "verified");
+    if (!verified || verified->k != socketley::json::jvalue::kind::boolean || !verified->b)
+        return 0;
+    std::tm tm{};
+    const std::string ex(socketley::json::string_of(sub, "expires"));
+    return ::strptime(ex.c_str(), "%Y-%m-%dT%H:%M:%S", &tm) ? static_cast<int64_t>(::timegm(&tm)) * 1000 : 0;
+}
+
+// A user's kept PushSubscriptions, null where there are none.
+const socketley::json::jvalue* subscriptions(imap_store& store, const std::string& user, socketley::json::jvalue& entry)
+{
+    const std::string* kept = store.meta(user, {}, std::string(jmap_session::push_entry));
+    if (!kept || !socketley::json::json_reader(*kept).document(entry))
+        return nullptr;
+    const auto* subs = socketley::json::member(entry, "subs");
+    return subs && subs->k == socketley::json::jvalue::kind::array ? subs : nullptr;
+}
+
+}   // namespace
+
 void mail_run::push_tick()
 {
     if (!m_imap)
         return;
-    // The list is read again only when it changed.
-    struct stat st{};
-    const std::string list = m_imap->list_path(".push-users");
-    const int64_t mtime = ::stat(list.c_str(), &st) == 0 ? static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 +
-                                                              st.st_mtim.tv_nsec
-                                                        : 0;
-    if (mtime != m_push_list_mtime)
-    {
-        m_push_list_mtime = mtime;
-        m_push_users = m_imap->push_users();
-    }
     const size_t shards = std::max<size_t>(1, m_owner.get_shards());
-    const int64_t now = wall::now_ms();
-    for (const auto& user : m_push_users)
-    {
+    const auto mine = [&](const std::string& user) {
         uint64_t h = 1469598103934665603ull;
         for (const unsigned char c : user)
             h = (h ^ c) * 1099511628211ull;
-        if (shards > 1 && h % shards != shard())
+        return shards <= 1 || h % shards == shard();
+    };
+    // The list is read again only when it changed, and every PushSubscription/set writes it, so how long each of this
+    // shard's users has a subscription to push to is read then, and a user with none has its index left alone.
+    struct stat st{};
+    const std::string list = m_imap->list_path(".push-users");
+    const bool there = ::stat(list.c_str(), &st) == 0;
+    const int64_t mtime = there ? static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec : 0;
+    const int64_t size = there ? static_cast<int64_t>(st.st_size) : -1;
+    if (mtime != m_push_list_mtime || size != m_push_list_size)
+    {
+        m_push_list_mtime = mtime;
+        m_push_list_size = size;
+        m_push_live.clear();
+        for (const auto& user : m_imap->push_users())
+        {
+            if (!mine(user))
+                continue;
+            m_imap->refresh(user);
+            socketley::json::jvalue entry;
+            int64_t until = 0;
+            if (const auto* subs = subscriptions(*m_imap, user, entry))
+                for (const auto& sub : subs->items)
+                    until = std::max(until, live_until(sub));
+            m_push_live[user] = until;
+        }
+    }
+    const int64_t now = wall::now_ms();
+    for (const auto& [user, until] : m_push_live)
+    {
+        // A user's next look after a time with nothing to push to begins from the states last set, as a first does.
+        if (until <= now)
+        {
+            m_push_seen.erase(user);
             continue;
+        }
         const std::string es = jmap_session::email_state(*m_imap, user), ms = jmap_session::mailbox_state(*m_imap, user);
-        const std::string* kept = m_imap->meta(user, {}, std::string(jmap_session::push_entry));
         socketley::json::jvalue entry;
-        if (!kept || !socketley::json::json_reader(*kept).document(entry))
-            continue;
-        const auto* subs_v = socketley::json::member(entry, "subs");
-        if (!subs_v || subs_v->k != socketley::json::jvalue::kind::array)
+        const auto* subs_v = subscriptions(*m_imap, user, entry);
+        if (!subs_v)
             continue;
         const auto& subs = *subs_v;
         // A shard's first look begins from the states the subscriptions were last set at, so what came between
@@ -107,12 +151,7 @@ void mail_run::push_tick()
         };
         for (const auto& sub : subs.items)
         {
-            const auto* verified = socketley::json::member(sub, "verified");
-            const std::string_view expires = socketley::json::string_of(sub, "expires");
-            std::tm tm{};
-            const std::string ex(expires);
-            const int64_t until = ::strptime(ex.c_str(), "%Y-%m-%dT%H:%M:%S", &tm) ? static_cast<int64_t>(::timegm(&tm)) * 1000 : 0;
-            if (!verified || verified->k != socketley::json::jvalue::kind::boolean || !verified->b || until <= now)
+            if (live_until(sub) <= now)
                 continue;
             // Only the types the subscription asked for, every one where it named none.
             const auto* types = socketley::json::member(sub, "types");
