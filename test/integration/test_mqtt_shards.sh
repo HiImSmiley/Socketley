@@ -153,6 +153,32 @@ if phase == "main":
         pub.disconnect()
     guarded("roaming", roaming)
 
+    # A session is moved as one answer, here 10 MB of queued messages, past the 8 MiB a frame between processes holds:
+    # it crosses the mesh in pieces, and a link that took it for a corrupt stream lost the session with the link.
+    def heavy():
+        c = connected(port, "heavy", props={SESSION_EXPIRY: 600})
+        c.subscribe(("heavy/#", 1))
+        first = shard_of("heavy")
+        c.disconnect()
+        pub = connected(port, "heavy-pub", timeout=30)
+        body = lambda i: (b"%04d" % i) * 62500
+        for i in range(40):
+            pub.publish("heavy/t", body(i), qos=1)
+        pub.disconnect()
+        c, now = None, first
+        for _ in range(30):
+            c = Client(port, timeout=30)
+            c.connect("heavy", clean=False, props={SESSION_EXPIRY: 600})
+            now = shard_of("heavy")
+            if now != first:
+                break
+            c.close()
+        truth("a session of 10 MB lands on another shard", now != first, (first, now))
+        got = {m.payload[:4] for m in c.messages(40, 30) if m.payload == body(int(m.payload[:4]))}
+        check("and its forty queued messages of 250 KB come with it", len(got), 40)
+        c.disconnect()
+    guarded("heavy", heavy)
+
     def commands():
         held = [connected(port, "k-%d" % i, props={SESSION_EXPIRY: 600}) for i in range(6)]
         for i, c in enumerate(held):
