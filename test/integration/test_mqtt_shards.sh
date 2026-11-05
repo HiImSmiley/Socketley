@@ -183,6 +183,8 @@ if phase == "main":
 
     def clean():
         def asks():
+            # A shard's figures reach the daemon a moment after they change.
+            time.sleep(1.5)
             out = subprocess.run([binary, "stats", "sh"], capture_output=True, timeout=10).stdout.decode()
             got = [int(l.partition(":")[2]) for l in out.splitlines() if l.startswith("session_claim_asks:")]
             return sum(got) if len(got) == 3 else None
