@@ -6,12 +6,14 @@
 // and the daemon carries when it cannot; each is answered, a receipt where nothing more is owed.
 //
 // The words owed only a receipt -- deliveries, retained messages, interest -- wait here for each shard in the order
-// made and go as batches, a bounded number of bytes in flight, so neither the channel's table nor the link's backlog
-// is ever filled; a batch not receipted goes again. A publisher at QoS 1 or 2 is held while a reachable shard cannot
-// take more; a delivery is dropped, and counted, only past a harder bound or to a shard that does not answer, and at
-// QoS 1 or 2 only to one that cannot be reached at all.
+// made and go as batches, a bounded number of bytes in flight, so neither the channel's table nor the link's backlog is
+// ever filled; a batch not receipted goes again with every one after it, and each frame is numbered so the shard takes
+// it once and in order. A publisher at QoS 1 or 2 is held while a reachable shard cannot take more; a delivery is
+// dropped, and counted, only past a harder bound or to a shard that does not answer, and at QoS 1 or 2 only to one that
+// cannot be reached at all.
 #include "mqtt_run.h"
 
+#include <algorithm>
 #include <chrono>
 
 #include "mqtt_command.h"
@@ -151,6 +153,7 @@ void mqtt_run::send_shard(uint32_t to)
         const std::string_view rest = std::string_view(q.pending).substr(q.head);
         socketley::bytes::reader r(rest);
         size_t cut = 0;
+        uint64_t count = 0;
         std::string_view f;
         while (r.view(f, rest.size()))
         {
@@ -158,9 +161,15 @@ void mqtt_run::send_shard(uint32_t to)
             if (cut && end > batch_bytes)
                 break;
             cut = end;
+            ++count;
         }
-        // Kept whole with its head for a retry, which takes the frames after it.
+        // Numbered by its first frame and the oldest one not yet receipted, so the shard takes each frame once and
+        // in the order made whatever is sent again.
         std::string batch = frame_of(sverb::batch, me);
+        socketley::bytes::append64(batch, m_shard_epoch);
+        socketley::bytes::append64(batch, q.seq);
+        const auto oldest = q.sent.empty() ? m_shard_batches.end() : m_shard_batches.find(q.sent.front());
+        socketley::bytes::append64(batch, oldest == m_shard_batches.end() ? q.seq : oldest->second.first);
         const size_t head = batch.size();
         batch.append(rest.substr(0, cut));
         const uint64_t cookie = m_shard_cookie_base++;
@@ -170,7 +179,9 @@ void mqtt_run::send_shard(uint32_t to)
         if (!q.flying)
             q.heard_ms = now_ms();
         q.flying += cut;
-        m_shard_batches.emplace(cookie, shard_batch{to, std::move(batch), head});
+        m_shard_batches.emplace(cookie, shard_batch{to, std::move(batch), head, q.seq});
+        q.sent.push_back(cookie);
+        q.seq += count;
     }
     // The front taken away once half of what is held has gone, not once a batch.
     if (q.head == q.pending.size())
@@ -197,29 +208,47 @@ void mqtt_run::send_shards()
         m_broker->room();
 }
 
-bool mqtt_run::shard_receipt(uint64_t cookie, request_status st)
+bool mqtt_run::shard_receipt(uint64_t cookie, request_status st, std::string_view reply)
 {
     const auto it = m_shard_batches.find(cookie);
     if (it == m_shard_batches.end())
         return cookie >= (1ull << 62);
-    shard_batch b = std::move(it->second);
-    m_shard_batches.erase(it);
-    shard_queue& q = m_squeue[b.to];
-    q.flying -= std::min(q.flying, b.frames.size() - b.head);
+    const uint32_t to = it->second.to;
+    shard_queue& q = m_squeue[to];
     q.heard_ms = now_ms();
-    if (st == request_status::ok)
+    const auto at = std::find(q.sent.begin(), q.sent.end(), cookie);
+    // A shard that missed a frame before this batch took none of it, and says so.
+    if (st == request_status::ok && reply.empty())
+    {
+        q.flying -= std::min(q.flying, it->second.frames.size() - it->second.head);
+        m_shard_batches.erase(it);
+        if (at != q.sent.end())
+            q.sent.erase(at);
         q.failing_since = 0;
+    }
     else
     {
-        // Sent again before what came after it, so the order holds; a frame the shard had already taken is taken
-        // twice, which a delivery may be and an interest change counts for.
+        // This batch and every one posted after it go again, in the order they went and before what waits, since a
+        // later one may not have been taken either; the shard skips what it already took by its number.
         if (!q.failing_since)
             q.failing_since = now_ms();
         q.retry_at = now_ms() + resend_ms;
-        q.pending.insert(q.head, std::string_view(b.frames).substr(b.head));
+        q.seq = it->second.first;
+        std::string back;
+        for (auto i = at; i != q.sent.end(); ++i)
+        {
+            const auto b = m_shard_batches.find(*i);
+            if (b == m_shard_batches.end())
+                continue;
+            back.append(std::string_view(b->second.frames).substr(b->second.head));
+            q.flying -= std::min(q.flying, b->second.frames.size() - b->second.head);
+            m_shard_batches.erase(b);
+        }
+        q.sent.erase(at, q.sent.end());
+        q.pending.insert(q.head, back);
         ++m_shard_resent;
     }
-    send_shard(b.to);
+    send_shard(to);
     if (m_broker)
         m_broker->room();
     return true;
@@ -291,6 +320,7 @@ void mqtt_run::shards_start()
     const uint32_t me = m_owner.get_shard_index();
     m_peers.resize(n);
     m_squeue.assign(n, {});
+    m_shard_epoch = claim_stamp(me);
     m_assign.assign(n, {});
     m_sharing.assign(n, {});
     // What this shard holds, told whole, so a peer that knew an older picture of it replaces that one.
@@ -643,15 +673,36 @@ void mqtt_run::shard_request(uint64_t ticket, std::string_view payload)
     socketley::bytes::reader r(payload);
     uint8_t v = 0;
     uint32_t from = 0;
-    // A batch: its words taken in the order they were made, answered by one receipt.
+    // A batch: its words taken in the order they were made, each once, answered by one receipt.
     if (r.marker(shard_prefix) && r.u8(v) && v == static_cast<uint8_t>(sverb::batch) && r.u32(from))
     {
-        std::string_view frame;
-        while (r.view(frame, payload.size()))
+        uint64_t epoch = 0, first = 0, floor = 0;
+        if (!r.u64(epoch) || !r.u64(first) || !r.u64(floor) || from >= m_peers.size())
         {
-            std::string ignored;
-            shard_frame(frame, ignored);
+            mgr->requests().complete_deferred(ticket, request_status::ok, reply);
+            return;
         }
+        peer& p = m_peers[from];
+        // A shard heard from afresh is taken up only from a batch with nothing before it still unreceipted.
+        if (p.epoch != epoch && first == floor)
+        {
+            p.epoch = epoch;
+            p.next  = first;
+        }
+        if (p.epoch != epoch || first > p.next)
+        {
+            reply = "gap";
+            mgr->requests().complete_deferred(ticket, request_status::ok, reply);
+            return;
+        }
+        std::string_view frame;
+        for (uint64_t n = first; r.view(frame, payload.size()); ++n)
+            if (n >= p.next)
+            {
+                std::string ignored;
+                shard_frame(frame, ignored);
+                p.next = n + 1;
+            }
         mgr->requests().complete_deferred(ticket, request_status::ok, reply);
         return;
     }

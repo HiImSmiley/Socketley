@@ -1531,7 +1531,7 @@ void mqtt_run::on_request_reply(uint64_t cookie, request_status st, std::string_
     }
     if (dump_reply(cookie, st, reply))
         return;
-    if (shard_receipt(cookie, st))
+    if (shard_receipt(cookie, st, reply))
         return;
     const auto it = m_route_asks.find(cookie);
     if (it == m_route_asks.end())

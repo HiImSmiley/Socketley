@@ -14,6 +14,7 @@
 #   * one lost because that shard had stopped answering for a second, though nothing filled its queue
 #   * a flood at QoS 0 dropped between two shards that both keep up, or its publisher cut off while it is held
 #   * a publisher at QoS 0 held for good by a shard that stopped
+#   * batches given up and sent again reaching a shard out of order, or taken twice
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -234,7 +235,7 @@ if phase == "main":
         time.sleep(1.6)
     guarded("keep", keep)
 
-if phase in ("stall", "hang"):
+if phase in ("stall", "hang", "late"):
     import os, re, signal, socket, threading
 
     def owner(c):
@@ -421,6 +422,39 @@ if phase == "hang":
         pub.disconnect()
     guarded("hang", hang)
 
+if phase == "late":
+    def late():
+        pub, far = apart("fz")
+        truth("a subscriber of the late shard lands on another shard than its publisher", far is not None)
+        if far is None:
+            return
+        far.subscribe(("fz/#", 1))
+        time.sleep(0.5)
+        def resent():
+            out = subprocess.run([binary, "stats", "fl"], capture_output=True, timeout=30).stdout.decode()
+            return sum(int(l.partition(":")[2]) for l in out.splitlines() if l.startswith("shard_resent:"))
+
+        # A shard stopped past the channel's 30 s and its 5 s sweep, so every batch posted to it is given up and sent
+        # again, while it still has every one of them to read when it goes on.
+        total = 20
+        before = resent()
+        victim = owner(far)
+        os.kill(victim, signal.SIGSTOP)
+        try:
+            for i in range(total):
+                pub.publish("fz/x", b"%03d" % i, qos=1)
+                time.sleep(0.05)
+            time.sleep(37)
+        finally:
+            os.kill(victim, signal.SIGCONT)
+        truth("the batches for a shard stopped that long are given up and sent again", resent() > before)
+        got = [m.payload for m in far.messages(total * 3, 4)]
+        check("a shard that went on after its batches were given up takes each message once, in order",
+              got, [b"%03d" % i for i in range(total)])
+        far.disconnect()
+        pub.disconnect()
+    guarded("late", late)
+
 if phase == "owned":
     def owned():
         own = connected(port, "sensor-42", version=4, clean=False, username="alice", password="alicepass1")
@@ -477,6 +511,7 @@ tally < <(run stall "$FP")
 dr=$("$BIN" stats fl 2>&1 | awk -F: '$1=="shard_dropped"{s+=$2} END{print s+0}')
 [ "$dr" -eq 0 ] && ok || bad "a shard drops nothing on the way to one that stopped for a while" "dropped $dr"
 tally < <(run hang "$FP")
+tally < <(run late "$FP")
 "$BIN" remove fl >/dev/null 2>&1
 [ "$snaps" -eq 3 ] && ok || bad "each shard keeps a snapshot of its own" "$(find "$HOME" -name 'sh.snapshot*')"
 

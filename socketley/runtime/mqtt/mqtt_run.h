@@ -211,6 +211,10 @@ private:
         int64_t     retry_at{0};
         // When a receipt last came, or the first batch since the last went out.
         int64_t     heard_ms{0};
+        // The number of the frame at `head`, counted from this shard's start.
+        uint64_t    seq{0};
+        // The batches posted and not yet receipted, in the order they went.
+        std::deque<uint64_t> sent;
         size_t waiting() const { return pending.size() - head; }
     };
     struct shard_batch
@@ -219,6 +223,8 @@ private:
         // The batch as posted, its frames from `head` on.
         std::string frames;
         size_t      head{0};
+        // The number of its first frame.
+        uint64_t    first{0};
     };
     // A word owed only a receipt, kept for the next batch; false when it is dropped instead.
     bool queue_shard(uint32_t to, std::string_view frame, bool droppable);
@@ -230,7 +236,7 @@ private:
     // Handed batches and answered none of them for a while, as a shard that is stopped does.
     bool stalled(const shard_queue& q) const;
     // True when the cookie was a batch's, whatever its answer.
-    bool shard_receipt(uint64_t cookie, request_status st);
+    bool shard_receipt(uint64_t cookie, request_status st, std::string_view reply);
     // One word from another shard, alone or out of a batch; `reply` is what a question is answered with.
     void shard_frame(std::string_view payload, std::string& reply);
     // Asks every other shard to give up the session of a client about to connect here, then answers `done`.
@@ -308,6 +314,9 @@ private:
     {
         std::unordered_map<std::string, size_t> held;
         bool known{false};
+        // The start its batches are numbered from, and the number of the next frame owed from it.
+        uint64_t epoch{0};
+        uint64_t next{0};
     };
     std::vector<peer> m_peers;
     // What every other shard subscribes to, in one tree whose sessions are the shards, so a message is matched once
@@ -351,6 +360,8 @@ private:
     uint64_t m_next_claim{1};
     // Cookies of shard requests whose answer is only a receipt.
     uint64_t m_shard_cookie_base{1ull << 62};
+    // What this shard's batches are numbered under, new at each start so a peer counts them again.
+    uint64_t m_shard_epoch{0};
     uint64_t m_shard_forwarded{0};
     uint64_t m_shard_received{0};
     uint64_t m_shard_unreached{0};
