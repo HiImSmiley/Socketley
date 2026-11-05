@@ -593,6 +593,45 @@ idx=$(find "$HOME/.local/share" -path '*/mail/msh.imap/alice' 2>/dev/null | head
     && [ "$(stat -c %s "$idx.log" 2>/dev/null)" -lt 262144 ] && ok "a journal past a quarter of a mebibyte is folded into its snapshot" \
     || bad "a journal past a quarter of a mebibyte is folded into its snapshot" "$(head -c 20 "$idx" 2>/dev/null) $(stat -c %s "$idx.log" 2>/dev/null)"
 check "and every shard reads the same flags after" "$r" "1 True"
+# Folds while sessions on every shard of a runtime of four watch the folder: one shard folds the journal at a time, so
+# none finds another's fold moved in before its own.
+PMF=$((SL_PORT_BASE+1959)); IMF=$((SL_PORT_BASE+1960))
+"$BIN" create mail mf -p "$PMF" --mail-domain example.test --idp auth --storage st/mailf --imap "$IMF" --shards 4 \
+    -s >/dev/null 2>&1
+for _ in $(seq 1 100); do [ "$(ss -ltnpH "sport = :$IMF" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 4 ] && break; sleep 0.1; done
+r=$(timeout 180 python3 - "$IMF" "$BIN" <<'PY'
+import imaplib, subprocess, sys, threading, time
+port, binary = int(sys.argv[1]), sys.argv[2]
+def stat(name):
+    out = subprocess.run([binary, "stats", "mf"], capture_output=True, timeout=30).stdout.decode()
+    return sum(int(l.split(":")[1]) for l in out.splitlines() if l.startswith(name + ":"))
+def conn():
+    M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); return M
+M = conn(); M.create("Folds")
+for i in range(60):
+    M.append("Folds", None, None, b"From: x@else.test\r\nSubject: f%d\r\n\r\nb\r\n" % i)
+M.select("Folds")
+stop = False
+def watch():
+    N = conn(); N.select("Folds")
+    while not stop:
+        N.noop(); time.sleep(0.3)
+    N.logout()
+ts = [threading.Thread(target=watch) for _ in range(8)]
+[t.start() for t in ts]
+for i in range(1500):
+    M.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Seen)")
+time.sleep(4)
+stop = True
+[t.join() for t in ts]
+time.sleep(1.5)
+print(stat("imap_folds"), stat("imap_folds_lost"))
+PY
+)
+set -- $r
+[ "${1:-0}" -ge 1 ] && [ "${2:-x}" = 0 ] && ok "a journal is folded by one shard at a time ($1 folds, none lost to another)" \
+    || bad "a journal is folded by one shard at a time" "folds begun ${1:-}, lost to another shard's ${2:-}"
+"$BIN" remove mf >/dev/null 2>&1
 # A user nothing asked for on a shard other than the first is let go there, and read again whole when asked: what was
 # delivered meanwhile is in its folder and new to the first session to see it on each shard.
 r=$(timeout 180 python3 - "$IMSH" "$PSH" "$BIN" <<'PY'

@@ -233,6 +233,10 @@ public:
     void flush_now();
     uint64_t gets() const { return m_gets; }
     uint64_t cache_hits() const { return m_hits; }
+    // The journal folds this shard began.
+    uint64_t folds() const { return m_folds; }
+    // Those that found another shard's fold had moved in first.
+    uint64_t folds_lost() const { return m_folds_lost; }
     // The users whose index this shard holds.
     size_t users_held() const
     {
@@ -294,6 +298,8 @@ private:
         uint64_t off{0};
     };
     std::unordered_map<std::string, let_go> m_let_go;
+    uint64_t m_folds{0};
+    uint64_t m_folds_lost{0};
     user_state& user(const std::string& name);
     // Whether nothing here holds the user's folders or waits on its files, so its state may be let go.
     bool unused(const user_state& u) const;
@@ -320,6 +326,8 @@ private:
     // False where the lock could not be taken or the lines not written, the change then read back as the disk has it.
     bool mutate(const std::string& name, const std::function<void(user_state&, std::string& lines)>& change);
     void compact(const std::string& name, user_state& u);
+    // Whether this shard may fold the user's journal now: the first to make its claim file folds, the others not.
+    bool claim_fold(const user_state& u);
     // A message put into `f`, given the next UID under the lock and logged.
     // 0 where the folder went meanwhile, or the journal took no line.
     uint32_t add_message(const std::string& name, const std::shared_ptr<imap_folder>& f, const std::string& key,

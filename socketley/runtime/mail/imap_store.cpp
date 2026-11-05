@@ -1147,6 +1147,7 @@ void imap_store::compact(const std::string& name, user_state& u)
 {
     // The journal folded into a new snapshot on a helper thread, given up there if a line came since it was built.
     u.compacting = true;
+    ++m_folds;
     const uint64_t gen = u.snapshot_gen + 1;
     std::string text = "SKLIMAP2 " + std::to_string(gen) + "\n";
     for (const auto& [n, f] : u.folders)
@@ -1217,8 +1218,9 @@ void imap_store::compact(const std::string& name, user_state& u)
             const std::string prev = base + ".prev." + pid;
             ::unlink(prev.c_str());
             const bool had = ::link(base.c_str(), prev.c_str()) == 0;
+            // 2 where a line came since, 3 where another shard's fold moved in first.
             if (::stat((base + ".log").c_str(), &st) == 0 && (st.st_ino != ino || static_cast<uint64_t>(st.st_size) != expect))
-                *done = 2;
+                *done = st.st_ino != ino ? 3 : 2;
             else if (::rename(snap_tmp.c_str(), base.c_str()) == 0)
             {
                 if (::rename(log_tmp.c_str(), (base + ".log").c_str()) == 0)
@@ -1236,7 +1238,8 @@ void imap_store::compact(const std::string& name, user_state& u)
                 ::close(d);
             }
         },
-        [this, name, done, alive = m_alive] {
+        [this, name, done, alive = m_alive, claim = u.base + ".fold"] {
+            ::unlink(claim.c_str());
             if (!*alive)
                 return;
             const auto it = m_users.find(name);
@@ -1256,6 +1259,7 @@ void imap_store::compact(const std::string& name, user_state& u)
                 catch_up(us);
                 us.compact_after = us.log_off + us.log_off / 4;
                 us.compact_quiet = *done == 2 ? us.log_off : UINT64_MAX;
+                m_folds_lost += *done == 3;
             }
         });
 }
@@ -1425,8 +1429,9 @@ void imap_store::tick(int64_t)
         // A user no session here asked for in a minute is read when it is asked for again, unless its journal is due
         // to be folded, and one not asked for in ten is let go -- except on the first shard, whose hourly expunge walks
         // the users it holds.
-        const bool fold_due = u.log_off > (256u << 10) && u.log_off > u.snapshot_bytes;
-        if (!u.loaded || (now - u.used_ms > quiet_ms && !u.unsynced && !u.compacting && !fold_due))
+        // A journal grown past its snapshot and a quarter of a mebibyte is folded into a new one.
+        const auto fold_due = [&] { return u.log_off > (256u << 10) && u.log_off > u.snapshot_bytes; };
+        if (!u.loaded || (now - u.used_ms > quiet_ms && !u.unsynced && !u.compacting && !fold_due()))
         {
             if (u.loaded && now - u.used_ms > let_go_ms && m_run.owner().get_shard_index() != 0 && unused(u))
             {
@@ -1454,13 +1459,19 @@ void imap_store::tick(int64_t)
                 }
             }, [] {});
         }
-        // A journal grown past its snapshot and a quarter of a mebibyte is folded into a new one.
         const bool settled = u.log_off == u.compact_quiet;
         if (u.compact_quiet != UINT64_MAX)
             u.compact_quiet = u.log_off;
-        if (!u.compacting && u.log_off > (256u << 10) && u.log_off > u.snapshot_bytes &&
-            (u.log_off >= u.compact_after || settled))
-            compact(name, u);
+        // Folded by one shard at a time, and read to its end once claimed, so a journal another shard folded just
+        // before is not folded again here.
+        if (!u.compacting && fold_due() && (u.log_off >= u.compact_after || settled) && claim_fold(u))
+        {
+            catch_up(u);
+            if (fold_due())
+                compact(name, u);
+            else
+                ::unlink((u.base + ".fold").c_str());
+        }
     }
     // Past what every user's filters may take together, the least lately searched user's are read again when asked.
     while (m_filter_bytes > filters_most_bytes)
@@ -1477,6 +1488,26 @@ void imap_store::tick(int64_t)
         oldest->filters_ino = 0;
         oldest->filters_off = 0;
     }
+}
+
+bool imap_store::claim_fold(const user_state& u)
+{
+    const std::string claim = u.base + ".fold";
+    for (int tries = 0; tries < 2; ++tries)
+    {
+        const int fd = ::open(claim.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0)
+        {
+            ::close(fd);
+            return true;
+        }
+        // A claim a minute old is one whose shard went before its fold ended.
+        struct stat st{};
+        if (errno != EEXIST || ::stat(claim.c_str(), &st) != 0 || wall::now_ms() - st.st_mtime * 1000ll < 60000)
+            return false;
+        ::unlink(claim.c_str());
+    }
+    return false;
 }
 
 bool imap_store::unused(const user_state& u) const
