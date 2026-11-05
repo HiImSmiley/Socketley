@@ -27,6 +27,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/turn_clock.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/settings.h"
 #include "../../shared/util/heap_trim.h"
 #include "../../shared/ipc/exit_bound.h"
 #include "../../shared/lua/lua_context.h"
@@ -940,6 +941,8 @@ private:
         if (cfg.shards > 1 && cfg.mesh_wired)
         {
             const uint32_t me = m_rt->get_shard_index();
+            // Read once, here: a cache's links carry client descriptors only when the operator asked for it.
+            const bool hand_off = cfg.type == runtime_cache && socketley::settings::flag("SOCKETLEY_CACHE_HANDOFF", false);
             for (uint32_t j = 0; j < cfg.shards; ++j)
             {
                 if (j == me)
@@ -950,6 +953,28 @@ private:
                 m_mesh_links.push_back(std::make_unique<shard_link>(
                     fd, j, &m_manager.requests(), &worker_serve_mesh, this));
                 m_mesh_links.back()->set_noter(&worker_mesh_note);
+                if (hand_off)
+                    m_mesh_links.back()->enable_fd_passing(&worker_mesh_handoff);
+            }
+            if (hand_off && !m_mesh_links.empty())
+            {
+                m_rt->set_handoff_sink([this](uint32_t shard, std::string_view payload, int fd) {
+                    for (auto& link : m_mesh_links)
+                        if (link->peer() == shard)
+                            switch (link->send_with_fd(worker_proto::frame_type::conn_handoff, payload, fd))
+                            {
+                                case shard_link::fd_send::sent: return runtime_instance::handoff_send::sent;
+                                case shard_link::fd_send::busy: return runtime_instance::handoff_send::busy;
+                                case shard_link::fd_send::gone: return runtime_instance::handoff_send::gone;
+                            }
+                    return runtime_instance::handoff_send::gone;
+                });
+                m_rt->set_handoff_probe([this](uint32_t shard) {
+                    for (auto& link : m_mesh_links)
+                        if (link->peer() == shard)
+                            return link->alive();
+                    return false;
+                });
             }
             m_notes_direct = m_mesh_links.size() + 1 == cfg.shards;
             if (!m_mesh_links.empty())
@@ -1249,6 +1274,32 @@ private:
             self->deliver_local(payload);
         else
             self->on_deliver_ref(std::string(payload));
+    }
+
+    // A sibling's client connection arriving, answered on the link it came by whatever the runtime made of it; or
+    // the answer to one this shard gave.
+    static void worker_mesh_handoff(void* ctx, shard_link* from, worker_proto::frame_type type,
+                                    std::string_view payload, int fd)
+    {
+        auto* self = static_cast<worker*>(ctx);
+        worker_proto::reader r(payload.data(), payload.size());
+        const uint64_t id = r.u64();
+        if (type == worker_proto::frame_type::conn_handoff_ack)
+        {
+            const uint8_t taken = r.u8();
+            if (r.ok && self->m_rt)
+                self->m_rt->on_handoff_answer(from->peer(), id, taken != 0);
+            return;
+        }
+        bool taken = false;
+        if (r.ok && self->m_rt)
+            taken = self->m_rt->adopt_handoff(from->peer(), payload, fd);
+        else if (fd >= 0)
+            ::close(fd);
+        std::string ack;
+        socketley::bytes::append64(ack, id);
+        ack.push_back(taken ? 1 : 0);
+        if (!from->send_note(worker_proto::frame_type::conn_handoff_ack, ack)) {}
     }
 
     // Which link a message for sibling `shard`'s clients takes -- UINT32_MAX asks for every sibling at once -- or

@@ -24529,6 +24529,18 @@ the mesh is off. This is the measurement control for the mesh: the two paths
 differ only in the route, not in the build. One answer through the daemon holds
 8 MiB, while a link carries a longer one in pieces.
 .TP
+.B SOCKETLEY_CACHE_HANDOFF
+Any value but
+.B 0
+lets a cache sharded behind one address hand a client connection to the shard
+that owns its keys, over the link between the two shards, instead of relaying
+each of its commands there. A connection is handed once 28 of its last 32
+single\-key commands named one other shard, and only between commands: never
+inside MULTI or WATCH, while subscribed, blocked or replicating, with a reply or
+crossing outstanding, or over TLS or a unix socket. A connection handed on
+waits a second at its new shard before it may move again, twice as long after
+each further move. Off by default; this is a measurement switch.
+.TP
 .B SOCKETLEY_NO_PEER_LINKS
 Any value but
 .B 0

@@ -92,6 +92,11 @@ enum class frame_type : uint16_t
     // shard <-> shard, on a mesh link only: u8 last, then the next piece of
     // one frame too long for max_payload, read whole once `last` is set.
     mesh_part = 34,
+
+    // shard <-> shard, on a mesh link only, with SOCKETLEY_CACHE_HANDOFF: a client connection given to the sibling,
+    // u64 id then what the runtime packed, with the descriptor in the same sendmsg; and the answer, u64 id, u8 taken.
+    conn_handoff     = 35,
+    conn_handoff_ack = 36,
 };
 
 // reload_err carries the diagnostic verbatim and is sent only when the reload

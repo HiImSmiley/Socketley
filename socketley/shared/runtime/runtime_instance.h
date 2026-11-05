@@ -15,6 +15,7 @@
 #include <functional>
 #include <mutex>
 #include <sys/types.h>
+#include <unistd.h>
 
 #ifndef SOCKETLEY_NO_LUA
 #include <sol/sol.hpp>
@@ -608,6 +609,24 @@ public:
     void send_to_ref(const conn_ref& r, std::string_view msg)
     { if (m_ref_sink) m_ref_sink(r, msg); }
 
+    // A client connection given to a sibling shard with its descriptor, set only in a worker whose mesh can carry
+    // one: `gone` means no link, `busy` that the link's writer holds bytes the descriptor may not overtake.
+    enum class handoff_send : uint8_t { sent, busy, gone };
+    using handoff_sink = std::function<handoff_send(uint32_t shard, std::string_view payload, int fd)>;
+    void set_handoff_sink(handoff_sink s) { m_handoff_sink = std::move(s); }
+    // Whether the link to `shard` still stands, which is how a handoff it never answered is told from a slow one.
+    using handoff_probe = std::function<bool(uint32_t shard)>;
+    void set_handoff_probe(handoff_probe p) { m_handoff_probe = std::move(p); }
+    bool can_hand_off() const { return static_cast<bool>(m_handoff_sink); }
+    handoff_send hand_off(uint32_t shard, std::string_view payload, int fd)
+    { return m_handoff_sink ? m_handoff_sink(shard, payload, fd) : handoff_send::gone; }
+    bool handoff_link_alive(uint32_t shard) const { return m_handoff_probe && m_handoff_probe(shard); }
+    // A sibling's connection arriving, which the runtime owns from here, `fd` included; false means refused and closed.
+    virtual bool adopt_handoff(uint32_t /*from*/, std::string_view /*payload*/, int fd)
+    { if (fd >= 0) ::close(fd); return false; }
+    // The sibling's answer to a connection this shard handed it.
+    virtual void on_handoff_answer(uint32_t /*shard*/, uint64_t /*id*/, bool /*taken*/) {}
+
     // Fan-out to this runtime's clients in other processes, which blocks on
     // nothing and is guarded on the shard count so a one-shard worker writes
     // no frame at all.
@@ -1079,6 +1098,10 @@ private:
 
     // See set_ref_sink.  Empty everywhere but in a worker.
     ref_sink m_ref_sink;
+
+    // See set_handoff_sink.  Empty everywhere but in a cache worker started with SOCKETLEY_CACHE_HANDOFF.
+    handoff_sink  m_handoff_sink;
+    handoff_probe m_handoff_probe;
 
     // See set_daemon_sink.
     daemon_sink m_daemon_sink;

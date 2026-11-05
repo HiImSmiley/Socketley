@@ -1,6 +1,10 @@
 #include "../../shared/net/socket_tuning.h"
 #include "../../shared/loop/conn_alloc.h"
 #include "cache_instance.h"
+
+#include <bit>
+#include "../../shared/ipc/worker_protocol.h"
+#include "../../shared/util/byte_codec.h"
 #include "../../shared/net/conn_reachability.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/ipc/exit_bound.h"
@@ -876,6 +880,11 @@ bool cache_instance::setup(event_loop& loop)
     if (m_idle_timeout_cached > 0 || m_tls)
         arm_idle_sweep_if_needed();
 
+    // Only where the worker's mesh carries descriptors, which it does when SOCKETLEY_CACHE_HANDOFF is set.
+    m_handoff_on = m_shard_n > 1 && can_hand_off() && !m_tls;
+    m_ho_waiting.clear();
+    m_ho_sent.clear();
+
     return true;
 }
 
@@ -1584,7 +1593,7 @@ static bool peer_is_local(int fd)
     return false;
 }
 
-bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_unix)
+bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_unix, bool handed)
 {
     // Reject fds beyond our O(1) lookup table — they'd become zombie connections
     if (client_fd >= MAX_FDS)
@@ -1596,7 +1605,9 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
     // Protected mode: the one door every accepted connection comes through,
     // answered in a line both protocols read as an error, before a byte of
     // the peer's is.
-    if ((!from_unix || from_cluster) && !m_admits_remote && !peer_is_local(client_fd))
+    // A connection a sibling hands over was admitted there, and anything said to it here would reach a client the
+    // sibling is still keeping if this shard refuses it.
+    if (!handed && (!from_unix || from_cluster) && !m_admits_remote && !peer_is_local(client_fd))
     {
         static constexpr std::string_view denied =
             "-DENIED this cache serves only this machine: it has no password, "
@@ -1615,8 +1626,8 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
 
     // TCP-level, so a client accepted off a unix listener would spend a
     // syscall per accept on nothing; the cluster listener is TCP by
-    // construction.
-    if (!from_unix || from_cluster)
+    // construction.  A handed socket was tuned where it was accepted, and its options travel with it.
+    if (!handed && (!from_unix || from_cluster))
     {
         int opt = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
@@ -1626,10 +1637,11 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
         // subscriber table -- for ever.
         socket_tuning::keepalive_dead_peer(client_fd);
     }
-    else
+    else if (!handed)
         socketley::unix_sock::tune_stream(client_fd);
 
-    stat_add(m_stat_total_connections, 1);
+    if (!handed)
+        stat_add(m_stat_total_connections, 1);
 
     auto conn = pool_acquire(client_fd);
     SKL_TRACE_SET(conn, opened_ms, ::skl_trace::now_ms());
@@ -1674,6 +1686,7 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
     }
 
     conn->cluster_port = from_cluster;
+    conn->unix_peer    = from_unix && !from_cluster;
 
     auto* ptr = conn.get();
     m_clients[client_fd] = std::move(conn);
@@ -1775,6 +1788,8 @@ void cache_instance::on_loop_turn()
     m_direct_gate.next_turn();
     if (m_companion)
         m_companion->pump();
+    if (SOCKETLEY_UNLIKELY(!m_ho_waiting.empty() || !m_ho_sent.empty()))
+        handoff_turn();
 }
 
 bool cache_instance::submit_client_read(client_connection* conn, int fd)
@@ -2337,6 +2352,13 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         SKL_TRACE_ADD(conn, multishot_ends, 1);
     }
 
+    // A read being withdrawn for a handoff keeps what it brings for the sibling and runs none of it.
+    if (SOCKETLEY_UNLIKELY(conn->ho_state == client_connection::handoff::withdrawing))
+    {
+        handoff_read(conn, fd, cqe, req);
+        return;
+    }
+
     bool is_provided = (req->type == op_read_provided || is_multishot_recv);
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
@@ -2728,6 +2750,12 @@ void cache_instance::after_write(client_connection* conn, int fd)
         }
         else
         {
+            // Everything owed has left, which is the moment a connection can be handed on.
+            if (SOCKETLEY_UNLIKELY(conn->ho_want) && !conn->closing)
+            {
+                try_handoff(conn, fd);
+                return;
+            }
             // The alert this write just carried was the last thing owed; the
             // read is all that is left and no one is going to complete it.
             tls_close_when_read_is_all(conn, fd);
@@ -5582,6 +5610,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             if (!key.empty())
             {
                 const uint32_t owner = cache_shard_of(key, m_shard_n);
+                note_key_owner(conn, owner);
                 if (owner != m_shard_i)
                 {
                     // This client read the slot map and chose this shard, so a
@@ -9021,6 +9050,7 @@ void cache_instance::process_resp_command(client_connection* conn,
             if (argc > ki && !args[ki].empty())
             {
                 const uint32_t owner = cache_shard_of(args[ki], m_shard_n);
+                note_key_owner(conn, owner);
                 if (owner != m_shard_i)
                 {
                     // The per-shard port's answer, because this client chose
@@ -13501,6 +13531,255 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
     }
 }
 
+// ─── Handoff (SOCKETLEY_CACHE_HANDOFF) ───
+
+// A connection whose window chose another shard is handed there once nothing is owed on it and nothing ties it to
+// this process; what ties it for good clears the wish, what only has to finish leaves it for the next quiet moment.
+void cache_instance::try_handoff(client_connection* conn, int fd)
+{
+    if (conn->ho_state != client_connection::handoff::none || !m_handoff_on)
+        return;
+    if (conn->in_multi || conn->in_exec || !conn->watched.empty() || conn->sub_count != 0 || conn->blocked ||
+        conn->is_follower || conn->ssl != nullptr || conn->cluster_port || conn->unix_peer || conn->closing ||
+        conn->peer_gone || conn->quit_after_flush || conn->wr_shutdown || conn->ho_target >= m_shard_n ||
+        conn->ho_target == m_shard_i)
+    {
+        conn->ho_want = false;
+        return;
+    }
+    if (!conn->batches.empty() || conn->crossing_bytes != 0 || conn->write_pending || conn_has_output(conn) ||
+        !conn->response_buf.empty() || conn->read_paused || conn->partial.size() > HO_MAX_BACKLOG)
+        return;
+    if (socketley::turn_clock::now_ns() < conn->ho_not_before_ns)
+        return;
+
+    conn->ho_want  = false;
+    conn->ho_tries = 0;
+    conn->ho_id    = m_ho_next_id++;
+    if (!conn->read_pending)
+    {
+        handoff_send_now(conn, fd);
+        return;
+    }
+    // The standing read goes first, since a byte it took after the descriptor left would be lost to both shards.
+    if (!m_loop || !m_loop->submit_cancel_request(&conn->read_req))
+    {
+        conn->ho_want = true;
+        return;
+    }
+    conn->ho_state = client_connection::handoff::withdrawing;
+}
+
+// One completion of the read being withdrawn: its bytes join what travels, its end sends the connection, and a peer
+// that went meanwhile ends the handoff and is served what it sent before the ordinary end of a read takes over.
+void cache_instance::handoff_read(client_connection* conn, int fd, struct io_uring_cqe* cqe, io_request* req)
+{
+    const bool provided = req->type == op_read_provided || is_multishot_recv_op(req->type);
+    const int  res      = cqe->res;
+    if (res > 0)
+    {
+        stat_add(m_stat_bytes_in, static_cast<uint64_t>(res));
+        if (provided)
+            m_loop->for_each_cqe_buf(BUF_GROUP_ID, cqe, [&](char* p, uint32_t n) { conn->partial.append(p, n); });
+        else
+            conn->partial.append(conn->read_buf.get(), static_cast<size_t>(res));
+    }
+    else if (res != -ECANCELED && res != -ENOBUFS)
+    {
+        conn->ho_state = client_connection::handoff::none;
+        ++m_stat_ho_aborted;
+        serve_buffered(conn, fd);
+        handle_read(cqe, req);
+        return;
+    }
+    else if (provided && (cqe->flags & IORING_CQE_F_BUFFER))
+        m_loop->return_cqe_buf(cqe, req);
+
+    if (conn->read_pending)
+        return;
+    if (conn->partial.size() > HO_MAX_BACKLOG)
+    {
+        handoff_abort(conn, fd);
+        return;
+    }
+    handoff_send_now(conn, fd);
+}
+
+// [u64 id][u8 resp_mode | resp_detected << 1][u8 hops][u64 rate-limit tokens][u32 n][n bytes read and not run].
+void cache_instance::handoff_send_now(client_connection* conn, int fd)
+{
+    std::string payload;
+    payload.reserve(26 + conn->partial.size());
+    socketley::bytes::append64(payload, conn->ho_id);
+    payload.push_back(static_cast<char>((conn->resp_mode ? 1 : 0) | (conn->resp_detected ? 2 : 0)));
+    payload.push_back(static_cast<char>(conn->ho_hops));
+    socketley::bytes::append64(payload, std::bit_cast<uint64_t>(conn->rl_tokens));
+    socketley::bytes::append32(payload, static_cast<uint32_t>(conn->partial.size()));
+    payload.append(conn->partial);
+
+    switch (hand_off(conn->ho_target, payload, fd))
+    {
+        case runtime_instance::handoff_send::sent:
+            conn->ho_state = client_connection::handoff::sent;
+            m_ho_sent.push_back({ fd, conn->ho_id, conn->ho_target });
+            return;
+        case runtime_instance::handoff_send::busy:
+            ++m_stat_ho_busy;
+            if (++conn->ho_tries > HO_MAX_TRIES)
+            {
+                handoff_abort(conn, fd);
+                return;
+            }
+            conn->ho_state = client_connection::handoff::waiting;
+            m_ho_waiting.push_back({ fd, conn->ho_id, conn->ho_target });
+            return;
+        case runtime_instance::handoff_send::gone:
+            handoff_abort(conn, fd);
+            return;
+    }
+}
+
+// The connection stays: what was read for the sibling is served here, the read comes back, and the next attempt
+// waits a second.
+void cache_instance::handoff_abort(client_connection* conn, int fd)
+{
+    conn->ho_state = client_connection::handoff::none;
+    conn->ho_want  = false;
+    conn->ho_not_before_ns = socketley::turn_clock::now_ns() + HO_SECOND_NS;
+    ++m_stat_ho_aborted;
+    serve_buffered(conn, fd);
+    conn = m_conn_idx[fd];
+    if (!conn || conn->closing || conn->read_pending || conn->read_paused)
+        return;
+    if (SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd)))
+    {
+        conn->closing = true;
+        if (!conn->write_pending)
+            close_client(conn, fd, "read-submit-failed");
+    }
+}
+
+// What sits in `partial` run as a read would have run it, without arming one.
+void cache_instance::serve_buffered(client_connection* conn, int fd)
+{
+    if (!conn->partial.empty())
+    {
+        if (!conn->resp_detected)
+        {
+            conn->resp_detected = true;
+            if (conn->partial[0] == '*' || m_resp_forced)
+                conn->resp_mode = true;
+        }
+        pump(conn);
+    }
+    if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
+        conn->closing = true;
+    if (SOCKETLEY_UNLIKELY(conn->quit_after_flush))
+        conn->closing = true;
+    if (conn->closing && !conn->read_pending && !conn->write_pending && conn->batches.empty())
+    {
+        if (conn_has_output(conn) && flush_write_queue(conn) && conn->write_pending)
+            return;
+        close_client(conn, fd, "closing-after-handoff");
+    }
+}
+
+// Retries for links that were busy, and answers that will not come because the link went: the descriptor may have
+// reached the sibling, so this shard's copy is closed rather than served beside it.
+void cache_instance::handoff_turn()
+{
+    if (!m_ho_waiting.empty())
+    {
+        std::vector<ho_ref> waiting;
+        waiting.swap(m_ho_waiting);
+        for (const ho_ref& w : waiting)
+        {
+            auto* c = (w.fd >= 0 && w.fd < MAX_FDS) ? m_conn_idx[w.fd] : nullptr;
+            if (c && c->ho_id == w.id && c->ho_state == client_connection::handoff::waiting)
+                handoff_send_now(c, w.fd);
+        }
+    }
+    for (size_t i = 0; i < m_ho_sent.size();)
+    {
+        const ho_ref w = m_ho_sent[i];
+        auto* c = (w.fd >= 0 && w.fd < MAX_FDS) ? m_conn_idx[w.fd] : nullptr;
+        const bool live = c && c->ho_id == w.id && c->ho_state == client_connection::handoff::sent;
+        if (live && handoff_link_alive(w.shard))
+        {
+            ++i;
+            continue;
+        }
+        m_ho_sent[i] = m_ho_sent.back();
+        m_ho_sent.pop_back();
+        if (live)
+            close_client(c, w.fd, "handoff-unanswered");
+    }
+}
+
+// The sibling's answer: taken, and this shard's copy of the descriptor is closed with nothing said on it; refused,
+// and the connection carries on here.
+void cache_instance::on_handoff_answer(uint32_t /*shard*/, uint64_t id, bool taken)
+{
+    for (size_t i = 0; i < m_ho_sent.size(); ++i)
+    {
+        if (m_ho_sent[i].id != id)
+            continue;
+        const int fd = m_ho_sent[i].fd;
+        m_ho_sent[i] = m_ho_sent.back();
+        m_ho_sent.pop_back();
+        auto* c = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
+        if (!c || c->ho_id != id || c->ho_state != client_connection::handoff::sent)
+            return;
+        if (taken)
+        {
+            ++m_stat_ho_out;
+            close_client(c, fd, "handed-off");
+        }
+        else
+            handoff_abort(c, fd);
+        return;
+    }
+}
+
+// A sibling's connection becoming this shard's own, with what it had read and not run served before anything new.
+bool cache_instance::adopt_handoff(uint32_t /*from*/, std::string_view payload, int fd)
+{
+    worker_proto::reader r(payload.data(), payload.size());
+    r.u64();
+    const uint8_t  flags  = r.u8();
+    const uint8_t  hops   = r.u8();
+    const uint64_t tokens = r.u64();
+    const uint32_t n      = r.u32();
+    if (fd < 0)
+        return false;
+    if (!r.ok || static_cast<size_t>(r.end - r.p) != n || !m_handoff_on || !m_loop || fd >= MAX_FDS ||
+        connections_full(m_clients.size(), m_max_conns_cached))
+    {
+        close_tracked(fd);
+        return false;
+    }
+    if (!adopt_client(fd, false, false, true))
+        return false;
+    auto* conn = m_conn_idx[fd];
+    if (!conn)
+        return false;
+
+    ++m_stat_ho_in;
+    conn->resp_mode     = (flags & 1) != 0;
+    conn->resp_detected = (flags & 2) != 0;
+    if (conn->rl_max > 0)
+        conn->rl_tokens = std::min(conn->rl_max, std::bit_cast<double>(tokens));
+    conn->ho_hops = static_cast<uint8_t>(std::min<int>(hops + 1, 30));
+    conn->ho_not_before_ns = socketley::turn_clock::now_ns() + (HO_SECOND_NS << std::min<int>(conn->ho_hops - 1, 6));
+    conn->partial.assign(r.p, n);
+    if (!conn->partial.empty())
+    {
+        conn->partial_since = std::chrono::steady_clock::now();
+        serve_buffered(conn, fd);
+    }
+    return true;
+}
+
 // ─── Stats ───
 
 // The cache-specific half of `stats`, which is the part a worker still pushes,
@@ -13528,6 +13807,11 @@ std::string cache_instance::stats_lines() const
         // from a leader that accepts and then says nothing.
         << "master_sync_in_progress:" << ((m_master && !m_master->synced) ? 1 : 0) << "\n"
         << "followers:" << m_followers.size() << "\n";
+    if (m_handoff_on)
+        out << "handoff_out:" << m_stat_ho_out << "\n"
+            << "handoff_in:" << m_stat_ho_in << "\n"
+            << "handoff_aborted:" << m_stat_ho_aborted << "\n"
+            << "handoff_busy:" << m_stat_ho_busy << "\n";
     {
         std::string line;
         m_lat_batch.put(line, "batch_latency");

@@ -138,6 +138,8 @@ inline constexpr setting table[] = {
      "applied Raft entries between snapshots"},
     {"SOCKETLEY_NO_SHARD_MESH", kind::flag, audience::tuning, 0, 0, "off",
      "shards relay through the daemon instead of to each other"},
+    {"SOCKETLEY_CACHE_HANDOFF", kind::flag, audience::tuning, 0, 0, "off",
+     "a sharded cache hands a connection to the shard that owns its keys"},
     {"SOCKETLEY_NO_PEER_LINKS", kind::flag, audience::tuning, 0, 0, "off",
      "no direct links between the daemons of a cluster"},
     {"SOCKETLEY_NO_COMPANION", kind::flag, audience::tuning, 0, 0, "off",

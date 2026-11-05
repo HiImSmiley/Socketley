@@ -186,6 +186,25 @@ struct client_connection
     // would overtake the first.
     bool blocked{false};
 
+    // ── SOCKETLEY_CACHE_HANDOFF ─────────────────────────────────────────────
+    // Where this connection is in being given to the shard that owns its keys: its read being withdrawn, waiting
+    // for the link's writer to drain, or sent and waiting for the sibling's answer.
+    enum class handoff : uint8_t { none, withdrawing, waiting, sent };
+    handoff  ho_state{handoff::none};
+    // The last window of single-key commands named ho_target often enough, which the next quiet moment acts on.
+    bool     ho_want{false};
+    // Accepted off a unix socket, which is not handed on.
+    bool     unix_peer{false};
+    uint8_t  ho_hops{0};
+    uint8_t  ho_tries{0};
+    uint8_t  ho_win_n{0};
+    uint8_t  ho_win_hits{0};
+    uint32_t ho_cand{0};
+    uint32_t ho_target{0};
+    uint64_t ho_id{0};
+    // Not handed on before this, which a move and a failed attempt both push out.
+    uint64_t ho_not_before_ns{0};
+
     // Non-null only with --tls, on the server runtime's design deliberately
     // unchanged, and freed only by this struct -- which is what makes freeing
     // it never have to wait on the ring.
@@ -269,6 +288,17 @@ struct client_connection
         watched.clear();
         watch_dirty = false;
         sub_count = 0;
+        ho_state = handoff::none;
+        ho_want = false;
+        unix_peer = false;
+        ho_hops = 0;
+        ho_tries = 0;
+        ho_win_n = 0;
+        ho_win_hits = 0;
+        ho_cand = 0;
+        ho_target = 0;
+        ho_id = 0;
+        ho_not_before_ns = 0;
         // pool_release() already did this, repeated because a struct leaving
         // the pool must not carry the previous connection's session.
         tls_context::free_ssl(ssl);
@@ -559,7 +589,53 @@ private:
     void handle_accept(struct io_uring_cqe* cqe, io_request* req);
     // One accepted descriptor into a connection, from whichever listener
     // handed it over, where false means it was dealt with and is gone.
-    bool adopt_client(int client_fd, bool from_cluster, bool from_unix);
+    bool adopt_client(int client_fd, bool from_cluster, bool from_unix, bool handed = false);
+
+    // ── SOCKETLEY_CACHE_HANDOFF ─────────────────────────────────────────────
+    // A window of this many single-key commands, of which this many naming one other shard hand the connection
+    // there: 28 of 32 is a chance of about 1 in 100,000 per window for random keys over two shards.
+    static constexpr uint8_t  HO_WINDOW = 32;
+    static constexpr uint8_t  HO_NEED   = 28;
+    // What a handoff carries of what was read and not yet run, past which it waits.
+    static constexpr size_t   HO_MAX_BACKLOG = 64 * 1024;
+    // Turns a busy link may hold a handoff before it is given up.
+    static constexpr uint8_t  HO_MAX_TRIES = 64;
+    static constexpr uint64_t HO_SECOND_NS = 1'000'000'000ull;
+    bool m_handoff_on{false};
+    uint64_t m_ho_next_id{1};
+    struct ho_ref { int fd; uint64_t id; uint32_t shard; };
+    std::vector<ho_ref> m_ho_waiting;
+    std::vector<ho_ref> m_ho_sent;
+    uint64_t m_stat_ho_out{0};
+    uint64_t m_stat_ho_in{0};
+    uint64_t m_stat_ho_aborted{0};
+    uint64_t m_stat_ho_busy{0};
+
+    // One single-key command's owner into the connection's window, at the one place each interpreter asks it.
+    void note_key_owner(client_connection* c, uint32_t owner)
+    {
+        if (SOCKETLEY_LIKELY(!m_handoff_on) || c->cluster_port)
+            return;
+        if (c->ho_win_n == 0)
+            c->ho_cand = owner;
+        c->ho_win_hits = static_cast<uint8_t>(c->ho_win_hits + (owner == c->ho_cand));
+        if (++c->ho_win_n < HO_WINDOW)
+            return;
+        c->ho_want   = c->ho_win_hits >= HO_NEED && c->ho_cand != m_shard_i;
+        c->ho_target = c->ho_cand;
+        c->ho_win_n = 0;
+        c->ho_win_hits = 0;
+    }
+    void try_handoff(client_connection* conn, int fd);
+    void handoff_read(client_connection* conn, int fd, struct io_uring_cqe* cqe, io_request* req);
+    void handoff_send_now(client_connection* conn, int fd);
+    void handoff_abort(client_connection* conn, int fd);
+    void handoff_turn();
+    void serve_buffered(client_connection* conn, int fd);
+public:
+    bool adopt_handoff(uint32_t from, std::string_view payload, int fd) override;
+    void on_handoff_answer(uint32_t shard, uint64_t id, bool taken) override;
+private:
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
 

@@ -5,7 +5,10 @@
 // correctness never depends on the mesh and every crossing is counted by
 // route.
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <memory>
 #include <chrono>
 #include <string>
@@ -15,6 +18,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "../loop/event_loop.h"
@@ -45,6 +49,11 @@ using shard_mesh_router = void (*)(void* ctx, std::string_view payload);
 
 // And what it hands a message for this shard's clients to, a deliver or a deliver_ref, which wants no answer.
 using shard_mesh_noter = void (*)(void* ctx, worker_proto::frame_type type, std::string_view payload);
+
+// And what it hands a client connection a sibling gave this shard to, with the descriptor that came with it (-1 when
+// none did, which the callee refuses), or that sibling's answer to one this shard gave, with -1.
+using shard_mesh_handoff = void (*)(void* ctx, shard_link* from, worker_proto::frame_type type,
+                                    std::string_view payload, int fd);
 
 // One link, to one sibling.
 class shard_link : public io_handler
@@ -79,6 +88,7 @@ public:
         // goes now and the slot stays claimed until they have drained.
         if (m_loop)
             m_loop->deregister_owner(this);
+        drop_passed_fds();
         // A link retired before its grace ran out still says it ended unexplained.
         if (!m_held_warning.empty())
             LOG_WARN(m_held_warning.c_str());
@@ -200,6 +210,63 @@ public:
 
     void set_noter(shard_mesh_noter noter) { m_noter = noter; }
 
+    // Reads become recvmsg with room for a descriptor, before attach(), because a plain read of a stream socket
+    // closes any descriptor riding on the bytes it takes.
+    void enable_fd_passing(shard_mesh_handoff cb)
+    {
+        m_pass_fds = true;
+        m_handoff  = cb;
+    }
+
+    enum class fd_send : uint8_t { sent, busy, gone };
+
+    // One frame and one descriptor in a single sendmsg, made only while the writer owes nothing, since the frame
+    // must not land inside one the writer has half sent; what the socket does not take goes to the writer, which
+    // has nothing ahead of it.
+    fd_send send_with_fd(worker_proto::frame_type type, std::string_view payload, int fd)
+    {
+        if (!alive() || fd < 0)
+            return fd_send::gone;
+        if (m_writer.pending() != 0 || m_writer.send_in_flight())
+            return fd_send::busy;
+
+        std::string frame;
+        frame.reserve(worker_proto::header_size + payload.size());
+        append_header(frame, type, payload.size());
+        frame.append(payload);
+
+        struct iovec iov{ frame.data(), frame.size() };
+        alignas(struct cmsghdr) char ctl[CMSG_SPACE(sizeof(int))]{};
+        struct msghdr msg{};
+        msg.msg_iov        = &iov;
+        msg.msg_iovlen     = 1;
+        msg.msg_control    = ctl;
+        msg.msg_controllen = sizeof ctl;
+        struct cmsghdr* c = CMSG_FIRSTHDR(&msg);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type  = SCM_RIGHTS;
+        c->cmsg_len   = CMSG_LEN(sizeof(int));
+        std::memcpy(CMSG_DATA(c), &fd, sizeof(int));
+
+        ssize_t n;
+        do { n = ::sendmsg(m_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT); }
+        while (n < 0 && errno == EINTR);
+        if (n < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return fd_send::busy;
+            die("passing a connection to a sibling failed");
+            return fd_send::gone;
+        }
+        if (static_cast<size_t>(n) < frame.size() &&
+            !m_writer.write(std::string_view(frame).substr(static_cast<size_t>(n)), BACKLOG))
+        {
+            die("the backlog to a sibling filled or its socket went");
+            return fd_send::sent;          // the descriptor left with the first byte, and the far end has it or nothing
+        }
+        return fd_send::sent;
+    }
+
     // One routing frame to the peer, in the encoding the daemon's own leg uses,
     // so the far side reads it with the function it already had.  False means
     // this link is not carrying it and the caller sends it the long way --
@@ -255,6 +322,8 @@ public:
         {
             // A recv and not a readiness notification, so the bytes are
             // already here and no second syscall follows.
+            if (m_pass_fds)
+                take_passed_fds();
             m_in.append(m_rbuf.get(), static_cast<size_t>(res));
             // A read that filled the buffer left more behind it, and a link that streams is read in larger pieces.
             if (static_cast<size_t>(res) == m_rsize && m_rsize < max_read_bytes)
@@ -389,6 +458,7 @@ public:
                 m_channel->complete_deferred(t, request_status::no_target, {});
         const size_t swept = m_owed.size();
         m_owed.clear();
+        drop_passed_fds();
 
         if (m_fd >= 0)
         {
@@ -456,6 +526,38 @@ private:
             m_trimming = true;
     }
 
+    // What one recvmsg brought besides bytes, in arrival order; -1 for a set the kernel cut, so the frames that
+    // follow still meet their own descriptors.
+    void take_passed_fds()
+    {
+        for (struct cmsghdr* c = CMSG_FIRSTHDR(&m_msg); c; c = CMSG_NXTHDR(&m_msg, c))
+        {
+            if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+                continue;
+            const size_t n = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            for (size_t i = 0; i < n; ++i)
+            {
+                int fd = -1;
+                std::memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
+                if (fd >= 0 && ::fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {}
+                m_fds.push_back(fd);
+            }
+        }
+        if (m_msg.msg_flags & MSG_CTRUNC)
+        {
+            LOG_WARN("shard mesh: a connection passed by a sibling arrived without its descriptor");
+            m_fds.push_back(-1);
+        }
+    }
+
+    void drop_passed_fds()
+    {
+        for (const int fd : m_fds)
+            if (fd >= 0)
+                ::close(fd);
+        m_fds.clear();
+    }
+
     template <class Fill>
     bool put(size_t size, Fill&& fill)
     {
@@ -488,6 +590,18 @@ private:
         // The request carries its own owner, and one left empty matches no
         // live registration, so the completion is dropped and every crossing
         // hangs.
+        if (m_pass_fds)
+        {
+            m_iov = { m_rbuf.get(), m_rsize };
+            m_msg = {};
+            m_msg.msg_iov        = &m_iov;
+            m_msg.msg_iovlen     = 1;
+            m_msg.msg_control    = m_ctl;
+            m_msg.msg_controllen = sizeof m_ctl;
+            m_req   = { this, nullptr, m_fd, static_cast<uint32_t>(m_rsize), op_recvmsg };
+            m_armed = m_loop->submit_recvmsg(m_fd, &m_msg, &m_req);
+            return;
+        }
         m_req   = { this, nullptr, m_fd, static_cast<uint32_t>(m_rsize), op_read };
         m_armed = m_loop->submit_read(m_fd, m_rbuf.get(), static_cast<uint32_t>(m_rsize), &m_req);
         // A submission the ring refused is not a dead link, so needs_wake()
@@ -614,6 +728,21 @@ private:
             handle(inner, whole);
             return;
         }
+        if (type == worker_proto::frame_type::conn_handoff || type == worker_proto::frame_type::conn_handoff_ack)
+        {
+            // A descriptor arrives with the first bytes of its frame, so it is queued by the time the frame is whole.
+            int fd = -1;
+            if (type == worker_proto::frame_type::conn_handoff && !m_fds.empty())
+            {
+                fd = m_fds.front();
+                m_fds.pop_front();
+            }
+            if (m_handoff)
+                m_handoff(m_ctx, this, type, payload, fd);
+            else if (fd >= 0)
+                ::close(fd);
+            return;
+        }
         if (type == worker_proto::frame_type::deliver || type == worker_proto::frame_type::deliver_ref)
         {
             if (m_noter)
@@ -651,6 +780,13 @@ private:
     void*             m_ctx{nullptr};
     shard_mesh_router m_router{nullptr};
     shard_mesh_noter  m_noter{nullptr};
+    shard_mesh_handoff m_handoff{nullptr};
+    // Set by enable_fd_passing(): the standing read is a recvmsg into m_msg, and m_fds holds what it brought.
+    bool              m_pass_fds{false};
+    struct iovec      m_iov{};
+    struct msghdr     m_msg{};
+    alignas(struct cmsghdr) char m_ctl[CMSG_SPACE(4 * sizeof(int))]{};
+    std::deque<int>   m_fds;
     // What has come of a frame sent in pieces, until its last.
     std::string       m_part;
 
