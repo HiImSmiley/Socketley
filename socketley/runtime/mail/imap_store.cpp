@@ -891,17 +891,23 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
 
 void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
 {
-    // Under the user's lock, shared, so a compaction is not caught between its snapshot and its journal.
+    // Read under the user's lock, shared, so a compaction is not caught between its snapshot and its journal, and
+    // parsed after it is let go, so no shard's writer waits on the parse.
     const std::string& base = u.base;
     const int lock = u.locked ? -1 : ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock >= 0 && ::flock(lock, LOCK_SH) != 0) {}
+    std::string snap, log;
+    socketley::read_file(base, snap, {.missing_ok = true}, nullptr);
+    struct stat st{};
+    const bool log_read =
+        socketley::read_file(base + ".log", log, {.missing_ok = true}, nullptr) && ::stat((base + ".log").c_str(), &st) == 0;
+    if (lock >= 0)
+        ::close(lock);
     std::map<std::string, std::shared_ptr<imap_folder>> before = std::move(u.folders);
     u.folders.clear();
     u.meta.clear();
     u.meta_bytes = 0;
     u.meta_count = 0;
-    std::string snap, log;
-    socketley::read_file(base, snap, {.missing_ok = true}, nullptr);
     u.snapshot_gen = 0;
     u.snapshot_bytes = snap.size();
     if (snap.starts_with("SKLIMAP"))
@@ -974,10 +980,9 @@ void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
             std::sort(folder->msgs.begin(), folder->msgs.end(),
                       [](const imap_message& a, const imap_message& b) { return a.uid < b.uid; });
     }
-    struct stat st{};
     u.log_ino = 0;
     u.log_off = 0;
-    if (socketley::read_file(base + ".log", log, {.missing_ok = true}, nullptr) && ::stat((base + ".log").c_str(), &st) == 0)
+    if (log_read)
     {
         u.log_ino = st.st_ino;
         // A journal of another snapshot is one a compaction already folded in.
@@ -996,8 +1001,6 @@ void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
         }
         u.log_off = whole;
     }
-    if (lock >= 0)
-        ::close(lock);
     u.used = 0;
     for (const auto& [n, f] : u.folders)
     {
