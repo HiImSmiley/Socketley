@@ -1365,6 +1365,8 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
         return refuse(tag, p);
     const bool writable = p.may('s') || p.may('w') || p.may('t') || p.may('e');
     m_waiting = true;
+    // The bucket is listed again where no shard listed it in two seconds: a listing takes up only what is a minute
+    // old, so one two seconds old finds the same.
     m_store.open(p.owner, p.folder, [this, alive = m_alive, tag, readonly = readonly || !writable, condstore, qr,
                                      p](std::shared_ptr<imap_folder> f) {
         if (!*alive || m_state == state::logout)
@@ -1453,7 +1455,7 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
         }
         finish(tag, "OK", readonly ? "[READ-ONLY] EXAMINE completed" : "[READ-WRITE] SELECT completed");
         resume();
-    }, true);
+    });
 }
 
 std::string imap_session::status_text(const imap_folder& f, const std::vector<std::string>& items, std::string_view as) const

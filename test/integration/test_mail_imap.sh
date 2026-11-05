@@ -619,6 +619,29 @@ print(folded, sorted(flagged))
 PY
 )
 check "a change after a fold reaches every shard" "$r" "True [True]"
+# A listing of the folder in the bucket one shard logged counts for the others: sixteen sessions over the three shards
+# selecting a folder twice a second for six seconds list it about once each two seconds, not once per shard.
+r=$(timeout 180 python3 - "$IMSH" "$BIN" <<'PY'
+import imaplib, subprocess, sys, threading, time
+port, binary = int(sys.argv[1]), sys.argv[2]
+def listings():
+    time.sleep(1.5)
+    out = subprocess.run([binary, "stats", "msh"], capture_output=True, timeout=30).stdout.decode()
+    return sum(int(l.split(":")[1]) for l in out.splitlines() if l.startswith("imap_listings:"))
+ms = [imaplib.IMAP4("127.0.0.1", port) for _ in range(16)]
+for M in ms:
+    M.login("alice", "alicepassword1")
+before = listings()
+def run(M):
+    for _ in range(12):
+        M.select("Shared"); time.sleep(0.5)
+ts = [threading.Thread(target=run, args=(M,)) for M in ms]
+[t.start() for t in ts]; [t.join() for t in ts]
+print(listings() - before)
+PY
+)
+[ "${r:-99}" -ge 1 ] && [ "${r:-99}" -le 6 ] && ok "three shards list a folder selected for six seconds about once each two seconds ($r)" \
+    || bad "three shards list a folder selected for six seconds about once each two seconds" "${r:-none} listings"
 # Folds while sessions on every shard of a runtime of four watch the folder: one shard folds the journal at a time, so
 # none finds another's fold moved in before its own.
 PMF=$((SL_PORT_BASE+1959)); IMF=$((SL_PORT_BASE+1960))

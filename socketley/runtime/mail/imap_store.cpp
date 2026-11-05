@@ -696,6 +696,14 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
                 u.folders[f->name] = std::move(f);
                 break;
             }
+            case 'Y':
+            {
+                // Y <ms> <folder>: a shard listed the folder in the bucket then, and logged what it found before it.
+                const auto w = words(l, 1);
+                if (imap_folder* f = folder(l))
+                    f->synced_ms = std::max<int64_t>(f->synced_ms, static_cast<int64_t>(num(w[0])));
+                break;
+            }
             case 'D':
                 if (const auto it = u.folders.find(std::string(l)); it != u.folders.end())
                 {
@@ -1021,6 +1029,7 @@ void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
             old.vanished_from = f->vanished_from;
             old.acl = std::move(f->acl);
             old.objectid = std::move(f->objectid);
+            old.synced_ms = std::max(old.synced_ms, f->synced_ms);
             for (auto& m : f->msgs)
                 if (const imap_message* was = old.by_uid(m.uid))
                     m.recent = was->recent;
@@ -1882,10 +1891,18 @@ void imap_store::open(const std::string& name, const std::string& folder,
     }
     std::shared_ptr<imap_folder> f = it->second;
     const int64_t now = wall::now_ms_coarse();
-    if (!force && now - f->synced_ms < std::max(sync_ms, max_age_ms))
+    const int64_t window = std::max(sync_ms, max_age_ms);
+    // A listing another shard logged since counts as this shard's own, so N shards list a folder about as often as one.
+    bool caught = false;
+    if (!force && !f->syncing && now - f->synced_ms >= window && m_run.owner().get_shards() > 1)
+    {
+        catch_up(u);
+        caught = true;
+    }
+    if (!force && now - f->synced_ms < window)
     {
         // What another shard or a delivery logged is read in, even where the bucket is not listed again.
-        if (now - u.caught_ms >= caught_ms)
+        if (!caught && now - u.caught_ms >= caught_ms)
             catch_up(u);
         done(f);
         return;
@@ -1894,7 +1911,29 @@ void imap_store::open(const std::string& name, const std::string& folder,
     if (f->syncing)
         return;
     f->syncing = true;
-    catch_up(u);
+    if (m_run.owner().get_shards() > 1)
+    {
+        // The listing is claimed under the user's lock, so of the shards that find the folder due at once one lists
+        // it; it takes up only what is a minute old, so the others are not behind for reading its lines a moment later.
+        bool claimed = false;
+        mutate(name, [&](user_state&, std::string& lines) {
+            if (!force && wall::now_ms_coarse() - f->synced_ms < window)
+                return;
+            lines = "Y " + std::to_string(wall::now_ms_coarse()) + " " + f->name + "\n";
+            claimed = true;
+        });
+        if (!claimed)
+        {
+            f->syncing = false;
+            auto waiting = std::move(f->waiting);
+            f->waiting.clear();
+            for (auto& w : waiting)
+                w(true);
+            return;
+        }
+    }
+    else if (!caught)
+        catch_up(u);
     f->sync_from = f->highestmodseq;
     sync(name, f, {}, {});
 }
@@ -1926,6 +1965,7 @@ void imap_store::sync(const std::string& name, const std::shared_ptr<imap_folder
                            sync(name, f, r.next.empty() ? r.objects.back().key : r.next, std::move(*acc));
                            return;
                        }
+                       ++m_listings;
                        std::set<std::string> there;
                        for (const auto& o : *acc)
                            there.insert(o.first);

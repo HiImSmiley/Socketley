@@ -4061,6 +4061,7 @@ std::string mail_run::stats() const
         put(out, "imap_folds", m_imap->folds());
         put(out, "imap_folds_lost", m_imap->folds_lost());
         put(out, "imap_journal_writes", m_imap->journal_writes());
+        put(out, "imap_listings", m_imap->listings());
     }
     if (m_mailboxes && m_mailboxes->enabled())
     {

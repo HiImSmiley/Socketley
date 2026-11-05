@@ -242,6 +242,8 @@ public:
     uint64_t folds_lost() const { return m_folds_lost; }
     // The appends this shard made to users' journals, one per change however many lines it holds.
     uint64_t journal_writes() const { return m_journal_writes; }
+    // The folder listings in the bucket this shard made.
+    uint64_t listings() const { return m_listings; }
     // The users whose index this shard holds.
     size_t users_held() const
     {
@@ -333,6 +335,7 @@ private:
     uint64_t m_folds{0};
     uint64_t m_folds_lost{0};
     uint64_t m_journal_writes{0};
+    uint64_t m_listings{0};
     user_state& user(const std::string& name);
     // Whether nothing here holds the user's folders or waits on its files, so its state may be let go.
     bool unused(const user_state& u) const;
