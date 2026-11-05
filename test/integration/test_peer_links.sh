@@ -137,7 +137,8 @@ daemon_stop
 # ── 3. A sharded target is wired at shard 0 ────────────────────────────────
 daemon_isolate peerlinksharded
 daemon_start "$BIN"
-"$BIN" create cache  pl_sc -p $((PORT+4)) --shards 4 -s >/dev/null 2>&1
+# Twenty up, because the four shards also bind the four ports above it, where pl_ss and pl_c2 sit.
+"$BIN" create cache  pl_sc -p $((PORT+20)) --shards 4 -s >/dev/null 2>&1
 "$BIN" create server pl_ss -p $((PORT+5)) --cache pl_sc -s >/dev/null 2>&1
 sleep 2
 say "cache set sk sv" $((PORT+5)) >/dev/null

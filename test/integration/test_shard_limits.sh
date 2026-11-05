@@ -27,9 +27,10 @@ check(){ [[ "$2" == "$3" ]] && ok "$1 ($2)" || bad "$1: expected '$3', got '$2'"
 daemon_isolate shardlimits
 daemon_start "$BIN"
 
+# A sharded cache also binds base+1..base+N, its cluster-mode shard ports, so bases sit ten apart.
 P_SRV=$((SL_PORT_BASE+1420))
-P_CACHE=$((SL_PORT_BASE+1421))
-P_RATE=$((SL_PORT_BASE+1422))
+P_CACHE=$((SL_PORT_BASE+1430))
+P_RATE=$((SL_PORT_BASE+1440))
 
 cleanup() {
     for n in lim4 mem4 rate4; do "$BIN" stop $n >/dev/null 2>&1 || true; done

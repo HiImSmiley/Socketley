@@ -59,9 +59,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 daemon_isolate cacheshardmk
 
+# A sharded cache also binds base+1..base+N, its cluster-mode shard ports, so bases sit ten apart.
 P_T4=$((SL_PORT_BASE+1250))
-P_R4=$((SL_PORT_BASE+1251))
-P_T1=$((SL_PORT_BASE+1252))
+P_R4=$((SL_PORT_BASE+1260))
+P_T1=$((SL_PORT_BASE+1270))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }

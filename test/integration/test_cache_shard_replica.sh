@@ -46,8 +46,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
 
 daemon_isolate cacheshardrepl
-L=$((SL_PORT_BASE+1290)); F1=$((SL_PORT_BASE+1291))
-F4=$((SL_PORT_BASE+1292)); L4=$((SL_PORT_BASE+1293)); FX=$((SL_PORT_BASE+1294))
+# A sharded cache also binds base+1..base+N, its cluster-mode shard ports, so bases sit ten apart.
+L=$((SL_PORT_BASE+1290)); F1=$((SL_PORT_BASE+1291)); FX=$((SL_PORT_BASE+1292))
+F4=$((SL_PORT_BASE+1300)); L4=$((SL_PORT_BASE+1310))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }

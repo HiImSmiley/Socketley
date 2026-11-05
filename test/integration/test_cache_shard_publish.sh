@@ -65,10 +65,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 daemon_isolate cacheshardpub
 
+# A sharded cache also binds base+1..base+N, its cluster-mode shard ports, so bases sit ten apart.
 P4=$((SL_PORT_BASE+1260))
-P1=$((SL_PORT_BASE+1261))
-PR=$((SL_PORT_BASE+1262))
-PSRV=$((SL_PORT_BASE+1263))
+P1=$((SL_PORT_BASE+1270))
+PR=$((SL_PORT_BASE+1280))
+PSRV=$((SL_PORT_BASE+1290))
 WORK=$(mktemp -d)
 
 PASS=0; FAIL=0; TOTAL=0

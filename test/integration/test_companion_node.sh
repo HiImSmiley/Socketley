@@ -216,7 +216,8 @@ else bad "stopping the cache removes its node" "$RTDIR/cn_kv.sock is still there
 # --listen is refused for shards, so the shards stay on the port they share
 # -- and the proxy in front of them has to stay on TCP for the same reason
 # 6b exists: a node published for a set that binds none is a backend down.
-"$BIN" create cache  cn_kvs -p $((PORT+10)) --shards 2 -s >/dev/null 2>&1
+# Twenty up, because the two shards also bind the two ports above it, where cn_kvspx and cn_srvs sit.
+"$BIN" create cache  cn_kvs -p $((PORT+20)) --shards 2 -s >/dev/null 2>&1
 "$BIN" create proxy  cn_kvspx -p $((PORT+11)) --backend cn_kvs --protocol tcp -s >/dev/null 2>&1
 # The proxy answering is both shards up, and its backend was resolved and logged before -s returned.
 for _ in 1 2 3 4 5; do

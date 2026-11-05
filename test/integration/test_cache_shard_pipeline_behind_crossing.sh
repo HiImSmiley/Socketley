@@ -44,7 +44,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 daemon_isolate cacheshardpipe
 
 P4=$((SL_PORT_BASE+1275))
-P1=$((SL_PORT_BASE+1276))
+# Five above, clear of base+1..base+4, the shard ports of the four-shard cache.
+P1=$((SL_PORT_BASE+1280))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }

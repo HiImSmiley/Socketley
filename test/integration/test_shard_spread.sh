@@ -98,9 +98,11 @@ printf 'items private level name\n' > "$T/schema"
 : > "$T/clients"
 
 B=$SL_PORT_BASE
-P_SV=$((B+1440)); P_CA=$((B+1441)); P_WE=$((B+1442)); P_AU=$((B+1443)); P_PX=$((B+1444))
+P_SV=$((B+1440)); P_WE=$((B+1442)); P_AU=$((B+1443)); P_PX=$((B+1444))
 P_MQ=$((B+1445)); P_MC=$((B+1446)); P_ST=$((B+1447)); P_DB=$((B+1448))
 P_MLID=$((B+1449)); P_MLST=$((B+1450)); P_ML=$((B+1451)); P_IMAP=$((B+1452))
+# Apart from the rest, because the four cache shards also bind base+1..base+4.
+P_CA=$((B+1460))
 
 echo "== every listening type, four shards =="
 "$BIN" create server  sv -p $P_SV --shards 4 -s >/dev/null 2>&1
