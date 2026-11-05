@@ -3887,8 +3887,13 @@ void mail_run::bayes_read()
 
 void mail_run::bayes_fold()
 {
+    if (m_bayes_saving)
+        return;
     // The journal moved aside, so a shard's next line starts a new one; what it held past what was read, taken.
     const std::string path = mail_bayes_path(m_owner.get_name());
+    // A folding file still there is one a fold before did not get into the table's file, a crash or a failed write.
+    struct stat st{};
+    const bool left = ::stat((path + ".folding").c_str(), &st) == 0;
     if (::rename((path + ".journal").c_str(), (path + ".folding").c_str()) != 0)
         return;
     std::string rest;
@@ -3896,15 +3901,32 @@ void mail_run::bayes_fold()
         m_bayes->apply(std::string_view(rest).substr(m_bayes_off));
     m_bayes_off = 0;
     m_bayes_folded_ms = wall::now_ms_coarse();
-    // Written off the loop from a copy, the folding file kept until the table it went into is on the disk.
-    auto copy = std::make_shared<bayes>(*m_bayes);
-    m_pool.submit(0, [copy, path, name = std::string(m_owner.get_name())] {
-        std::string why;
-        if (copy->save(path, why))
+    // The table's file read and the folding file learned into it on the pool, which a line learned twice leaves as
+    // once, so the loop copies nothing; where an earlier folding file was lost in the rename, the table is written
+    // as it is here.
+    auto bytes = left ? std::make_shared<const std::string>(m_bayes->encode()) : nullptr;
+    m_bayes_saving = true;
+    m_pool.submit(0, [bytes, path, name = std::string(m_owner.get_name())] {
+        std::string why, text;
+        bool ok = true;
+        if (!bytes)
+        {
+            bayes table;
+            ok = table.load(path, why) && socketley::read_file(path + ".folding", text, {.missing_ok = true}, nullptr);
+            if (ok)
+            {
+                table.apply(text);
+                text = table.encode();
+            }
+        }
+        if (ok && bayes::save(path, bytes ? std::string_view(*bytes) : std::string_view(text), why))
             ::unlink((path + ".folding").c_str());
         else
             LOG_ERROR(("mail " + name + ": " + why).c_str());
-    }, [] {});
+    }, [this, alive = m_alive] {
+        if (*alive)
+            m_bayes_saving = false;
+    });
 }
 
 std::string mail_run::learn_command(const std::string& arg, std::function<void(std::string_view)> answer)

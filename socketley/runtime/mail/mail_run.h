@@ -413,6 +413,8 @@ private:
     std::unique_ptr<bayes> m_bayes;
     uint64_t m_bayes_off{0}, m_bayes_junked{0}, m_bayes_learned{0};
     int64_t m_bayes_folded_ms{0};
+    // A fold on its way to the disk, which the next waits for.
+    bool m_bayes_saving{false};
     struct learning
     {
         std::string user, key;

@@ -4,13 +4,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <unordered_set>
 
 #include "mail_compose.h"
 #include "mail_mime.h"
 #include "mail_text.h"
+#include "../../shared/persist/replaced_file.h"
 #include "../../shared/util/ascii.h"
 
 namespace socketley::mail
@@ -297,40 +297,33 @@ size_t bayes::apply(std::string_view text)
     return used;
 }
 
-bool bayes::save(const std::string& path, std::string& why) const
+std::string bayes::encode() const
 {
-    const std::string tmp = path + ".tmp";
+    std::string out;
+    out.reserve(sizeof magic - 1 + 24 + m_tokens.size() * 12 + m_learned.size() * 9);
+    const auto put = [&out](const auto& v) { out.append(reinterpret_cast<const char*>(&v), sizeof v); };
+    out.append(magic, sizeof magic - 1);
+    put(m_spam);
+    put(m_ham);
+    put(static_cast<uint64_t>(m_tokens.size()));
+    for (const auto& [t, c] : m_tokens)
     {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        const auto put = [&f](const auto& v) { f.write(reinterpret_cast<const char*>(&v), sizeof v); };
-        f.write(magic, sizeof magic - 1);
-        put(m_spam);
-        put(m_ham);
-        put(static_cast<uint64_t>(m_tokens.size()));
-        for (const auto& [t, c] : m_tokens)
-        {
-            put(t);
-            put(c.spam);
-            put(c.ham);
-        }
-        put(static_cast<uint64_t>(m_learned.size()));
-        for (const auto& [m, cls] : m_learned)
-        {
-            put(m);
-            put(cls);
-        }
-        f.flush();
-        if (!f)
-        {
-            why = tmp + " could not be written";
-            return false;
-        }
+        put(t);
+        put(c.spam);
+        put(c.ham);
     }
-    std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    if (ec)
-        why = tmp + " could not take the place of " + path + ": " + ec.message();
-    return !ec;
+    put(static_cast<uint64_t>(m_learned.size()));
+    for (const auto& [m, cls] : m_learned)
+    {
+        put(m);
+        put(cls);
+    }
+    return out;
+}
+
+bool bayes::save(const std::string& path, std::string_view bytes, std::string& why)
+{
+    return socketley::replace_file(path, bytes, socketley::durability::data_and_dir, &why);
 }
 
 bool bayes::load(const std::string& path, std::string& why)

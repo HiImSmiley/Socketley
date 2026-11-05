@@ -37,8 +37,11 @@ public:
     uint32_t ham_learned() const { return m_ham; }
     size_t words() const { return m_tokens.size(); }
 
-    // The table as a file, written whole beside and renamed over it; a file missing is a table empty.
-    bool save(const std::string& path, std::string& why) const;
+    // The table as the bytes of its file, and those written whole beside it, synced, and renamed over it; a file
+    // missing is a table empty.
+    std::string encode() const;
+    static bool save(const std::string& path, std::string_view bytes, std::string& why);
+    bool save(const std::string& path, std::string& why) const { return save(path, encode(), why); }
     bool load(const std::string& path, std::string& why);
 
     // A journal line, "s|h <message> <token>...", and the lines of `text` taken, the bytes of whole lines answered.
