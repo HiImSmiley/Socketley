@@ -96,6 +96,19 @@ case "$MOVED" in *MOVED*12182*":$((PD+3))"*) ok "a shard port answers -MOVED for
     *) bad "a shard port answers -MOVED for a key it does not hold" "got '$MOVED' from $((PD+1))" ;; esac
 check "while the shared port still answers the value" "$(redis-cli -p "$PD" GET foo 2>&1)" "v"
 check "and no shared-address warning is logged for it" "$(said_for cdd)" "0"
+# Asked on the shared port, CLUSTER NODES names that port as a node of its own
+# holding no slots and marks it myself: a client that maps myself to the address
+# it dialled, as redis-benchmark and lettuce do, sends every key to a shard port
+# and none through the relay, where the shard that took the connection used to
+# call itself myself and its slots went back to the shared port.
+NODES=$(redis-cli -p "$PD" CLUSTER NODES 2>/dev/null | tr -d '\r')
+check "CLUSTER NODES on the shared port marks that port myself" \
+    "$(echo "$NODES" | awk '/myself/ {split($2, a, "[:@]"); print a[2]}')" "$PD"
+check "and gives it no slots" "$(echo "$NODES" | awk '/myself/ {print NF}')" "8"
+check "while each shard's own port holds its range" \
+    "$(echo "$NODES" | awk '!/myself/ && NF >= 9 {n++} END {print n + 0}')" "3"
+check "and asked on a shard's port, that shard is myself with its slots" \
+    "$(redis-cli -p $((PD+1)) CLUSTER NODES 2>/dev/null | tr -d '\r' | awk '/myself/ {split($2, a, "[:@]"); print a[2], NF}')" "$((PD+1)) 9"
 
 # ─── 2. --no-cluster: one address, one node ─────────────────────────────────
 "$BIN" create cache cdn -p "$PN" --shards 3 --resp --no-cluster -s >/dev/null 2>&1 \

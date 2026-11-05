@@ -7351,6 +7351,17 @@ and
 .B CLUSTER SLOTS
 publishes a single node that holds every slot on the shared port.
 That answer is both true and safe.
+In cluster mode,
+.B CLUSTER NODES
+asked on the shared port lists that port as a node of its own that holds no
+slots and is marked
+.BR myself ,
+beside one node per shard on its own port.
+A client that takes the node marked
+.B myself
+to be the address it dialled, as
+.B redis\-benchmark
+and lettuce do, then sends every key straight to its shard.
 There is no cluster bus, no failover, no slot migration and no
 .BR ASK .
 The map is a formula, and each slot has one owner for the life of the run.

@@ -4103,7 +4103,12 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
     const uint32_t n    = m_cluster_ports ? m_shard_n : 1;
     // And which of them is us, collapsed to node 0 when there is one node, or
     // all four shards would answer CLUSTER NODES with no line marked myself.
-    const uint32_t me   = m_cluster_ports ? m_shard_i : 0;
+    // On the shared port in cluster mode the shard that took the connection is
+    // not the address the client dialled, so that port is a node of its own
+    // holding no slots, and a client mapping `myself` to where it connected
+    // sends no shard's keys back through the relay.
+    const bool     shared = m_cluster_ports && !conn->cluster_port;
+    const uint32_t me     = !m_cluster_ports ? 0 : shared ? n : m_shard_i;
     const std::string host = cluster_host(conn);
     const uint32_t h    = fnv1a_lower(sub);
 
@@ -4214,6 +4219,13 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
         case fnv1a("nodes"):
         {
             std::string out;
+            if (shared)
+            {
+                const uint32_t bus = static_cast<uint32_t>(m_base_port) + 10000u;
+                out += cluster_node_id(n) + ' ' + host + ':' + std::to_string(m_base_port) + '@' +
+                       std::to_string(bus <= 65535u ? bus : 0u) + " myself,master - 0 " +
+                       std::to_string(socketley::wall::now_ms()) + " 1 connected\n";
+            }
             for (uint32_t sh = 0; sh < n; ++sh)
                 out += node_line(sh);
             if (resp) resp::encode_bulk_into(rb, out);
@@ -4233,7 +4245,7 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
             out += "cluster_slots_ok:16384\r\n";
             out += "cluster_slots_pfail:0\r\n";
             out += "cluster_slots_fail:0\r\n";
-            out += "cluster_known_nodes:" + std::to_string(n) + "\r\n";
+            out += "cluster_known_nodes:" + std::to_string(n + (shared ? 1 : 0)) + "\r\n";
             out += "cluster_size:" + std::to_string(n) + "\r\n";
             out += "cluster_current_epoch:1\r\n";
             out += "cluster_my_epoch:1\r\n";
