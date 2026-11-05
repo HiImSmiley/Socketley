@@ -73,6 +73,9 @@ public:
     virtual ~request_origin() = default;
     virtual void on_request_reply(uint64_t cookie, request_status st,
                                   std::string_view reply) = 0;
+
+    // The longest answer the way back can carry, so a sink can decline what it could not take back once given up.
+    virtual size_t reply_room(uint64_t /*cookie*/) const { return SIZE_MAX; }
 };
 
 class request_channel : public io_handler
@@ -128,6 +131,9 @@ public:
     // unknown ticket.
     void complete_deferred(uint64_t ticket, request_status st,
                            std::string_view reply);
+
+    // The longest answer a parked ticket's way back can carry, 0 once it is not parked.
+    size_t reply_room(uint64_t ticket) const;
 
     // Park a request that arrived from outside this channel, so its answer
     // comes through complete_deferred() like any other; 0 when the table is

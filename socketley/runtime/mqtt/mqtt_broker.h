@@ -501,8 +501,9 @@ public:
     // ── Moving sessions between shards ──────────────────────────────────────
 
     // The session of `client_id` given up as bytes for another shard where a connection to it has just arrived, the
-    // one here closed as taken over; empty when there is none, or when `clean` ends it here.
-    std::string surrender(std::string_view client_id, bool clean);
+    // one here closed as taken over; empty when there is none, or when `clean` ends it here, and nothing when its
+    // bytes are more than `room`, the session and its connection then left as they were.
+    std::optional<std::string> surrender(std::string_view client_id, bool clean, size_t room = SIZE_MAX);
     // Whether `client_id` names a session not yet expired that was made under a user other than `username`.
     bool held_by_another(std::string_view client_id, std::string_view username) const;
     // A session another shard gave up, taken in for the connection about to resume it.

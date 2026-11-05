@@ -256,6 +256,14 @@ void request_channel::complete_deferred(uint64_t ticket, request_status st,
         p.origin->on_request_reply(p.cookie, st, reply);
 }
 
+size_t request_channel::reply_room(uint64_t ticket) const
+{
+    const auto it = m_parked.find(ticket);
+    if (it == m_parked.end() || !it->second.origin || !origin_live(it->second.origin))
+        return 0;
+    return it->second.origin->reply_room(it->second.cookie);
+}
+
 uint64_t request_channel::park(request_origin* origin, uint64_t cookie,
                                const request_sink* sink, request_class cls)
 {

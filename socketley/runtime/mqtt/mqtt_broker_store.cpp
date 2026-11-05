@@ -426,17 +426,20 @@ bool broker::restore(std::string_view in, std::string& why)
     return true;
 }
 
-std::string broker::surrender(std::string_view client_id, bool clean)
+std::optional<std::string> broker::surrender(std::string_view client_id, bool clean, size_t room)
 {
     const auto it = m_sessions.find(std::string(client_id));
     if (it == m_sessions.end())
-        return {};
+        return std::string();
     session& s = *it->second;
+    // Measured with the will it then drops, so what is sent is no longer than what was measured.
+    if (!clean && room != SIZE_MAX && encode_session(s).size() > room)
+        return std::nullopt;
     take_over(s, clean);
     if (clean)
     {
         end_session(s, true);
-        return {};
+        return std::string();
     }
     // A delayed will is not sent: the connection that takes the session is the one that came back to it.
     m_wills_due.erase({s.will_due_ms, s.key});

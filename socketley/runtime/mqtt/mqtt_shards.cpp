@@ -642,6 +642,8 @@ void mqtt_run::claim_reply(uint64_t cookie, request_status st, std::string_view 
                 pc.lost = true;
             else if (status == 3)
                 pc.refused = true;
+            else if (status == 4)
+                pc.kept = true;
             else if (status == 1)
             {
                 std::string s;
@@ -675,6 +677,12 @@ void mqtt_run::finish_claim(uint64_t id)
         // A newer connection to the same client on another shard wins; this one is told to come back.
         ++m_claims_lost;
         pc.done({pc.ask.level == level_5 ? reason::session_taken_over : reason::server_unavailable, {}});
+        return;
+    }
+    if (pc.kept)
+    {
+        // The session is too large to move by the way it would come, so it stays with its shard and its connection.
+        pc.done({reason::server_unavailable, {}});
         return;
     }
     if (!pc.session.empty())
@@ -792,17 +800,17 @@ void mqtt_run::shard_request(uint64_t ticket, std::string_view payload)
             if (n >= p.next)
             {
                 std::string ignored;
-                shard_frame(frame, ignored);
+                shard_frame(frame, ignored, 0);
                 p.next = n + 1;
             }
         mgr->requests().complete_deferred(ticket, request_status::ok, reply);
         return;
     }
-    shard_frame(payload, reply);
+    shard_frame(payload, reply, mgr->requests().reply_room(ticket));
     mgr->requests().complete_deferred(ticket, request_status::ok, reply);
 }
 
-void mqtt_run::shard_frame(std::string_view payload, std::string& reply)
+void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t room)
 {
     socketley::bytes::reader r(payload);
     uint8_t v = 0;
@@ -938,13 +946,19 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply)
                 reply = w.take();
                 break;
             }
-            std::string bytes = m_broker->surrender(client, clean);
-            if (bytes.empty())
+            // A session the way back cannot carry stays here with its connection, where one cut short would be lost.
+            std::optional<std::string> bytes = m_broker->surrender(client, clean, room > 5 ? room - 5 : 0);
+            if (!bytes)
+            {
+                w.u8(4);
+                ++m_sessions_kept;
+            }
+            else if (bytes->empty())
                 w.u8(0);
             else
             {
                 w.u8(1);
-                w.bytes(bytes);
+                w.bytes(*bytes);
                 ++m_sessions_moved;
             }
             reply = w.take();
@@ -982,6 +996,7 @@ void mqtt_run::shard_stats(std::string& out) const
     st::put(out, "session_claims_lost", m_claims_lost);
     st::put(out, "session_claims_refused", m_claims_refused);
     st::put(out, "sessions_moved", m_sessions_moved);
+    st::put(out, "sessions_kept", m_sessions_kept);
 }
 
 }   // namespace socketley::mqtt

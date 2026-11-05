@@ -7,6 +7,7 @@
 #   * a message published on one shard missing the subscribers on another, or reaching one twice
 #   * a retained message kept only by the shard it was published on
 #   * a session that does not follow its client to another shard, or two shards both holding it
+#   * one too large for the daemon's frames lost on the way when there is no mesh, rather than kept where it was
 #   * a shared subscription's message delivered once per shard instead of once per group
 #   * mqtt-sessions, mqtt-kick or mqtt-sub seeing one shard only
 #   * a shard's sessions lost across a restart because the shards share one snapshot
@@ -568,6 +569,71 @@ if phase == "after":
         for c in cs:
             c.disconnect()
     guarded("after", after)
+
+# With no mesh a session crosses as one answer through the daemon, whose frames hold 8 MiB.
+if phase == "relayed":
+    def light():
+        c = connected(port, "roamer", props={SESSION_EXPIRY: 600})
+        c.subscribe(("roam/#", 1))
+        first = shard_of("roamer")
+        c.disconnect()
+        pub = connected(port, "roam-pub")
+        got = None
+        for attempt in range(30):
+            pub.publish("roam/t", "m%d" % attempt, qos=1)
+            c = Client(port)
+            present, code, _ = c.connect("roamer", clean=False, props={SESSION_EXPIRY: 600})
+            m = c.message(3)
+            if shard_of("roamer") != first:
+                got = (present, code, m.payload if m else None, attempt)
+                c.disconnect()
+                break
+            c.disconnect()
+        if got is None:
+            truth("with no mesh a client lands on another shard", False, first)
+        else:
+            check("with no mesh a session follows its client to another shard", got[:3], (True, 0, b"m%d" % got[3]))
+        pub.disconnect()
+    guarded("light", light)
+
+    def heavy():
+        c = connected(port, "heavy", props={SESSION_EXPIRY: 600})
+        c.subscribe(("heavy/#", 1))
+        first = shard_of("heavy")
+        c.disconnect()
+        pub = connected(port, "heavy-pub", timeout=30)
+        body = lambda i: (b"%04d" % i) * 62500
+        for i in range(40):
+            pub.publish("heavy/t", body(i), qos=1)
+        pub.disconnect()
+        # A connection landing on another shard is told to come back, and one landing on the session's own is closed
+        # before it reads, which leaves the messages in the session.
+        elsewhere = None
+        for _ in range(30):
+            c = Client(port, timeout=30)
+            present, code, _ = c.connect("heavy", clean=False, props={SESSION_EXPIRY: 600})
+            if code != 0 or shard_of("heavy") != first:
+                elsewhere = (present, code)
+                c.close()
+                break
+            c.close()
+            time.sleep(0.2)
+        check("a session of 10 MB the daemon cannot carry is not moved, and the client is told to come back",
+              elsewhere, (False, 0x88))
+        held = [s["shard"] for s in sessions() if s["client"] == "heavy"]
+        check("the session stays on its own shard", held, [first])
+        whole = None
+        for _ in range(60):
+            c = Client(port, timeout=30)
+            present, code, _ = c.connect("heavy", clean=False, props={SESSION_EXPIRY: 600})
+            if code == 0:
+                whole = (present, shard_of("heavy") == first,
+                         len({m.payload[:4] for m in c.messages(40, 30) if m.payload == body(int(m.payload[:4]))}))
+                c.disconnect()
+                break
+            c.close()
+        check("and its client finds it there with its forty queued messages of 250 KB", whole, (True, True, 40))
+    guarded("heavy", heavy)
 PY
 }
 
@@ -617,6 +683,25 @@ tally < <(run owned "$UP")
 ready_tcp 127.0.0.1 "$P" || bad "the broker listens after a start" "$(tail -5 "$SOCKETLEY_DLOG")"
 sleep 1
 tally < <(run after)
+
+daemon_stop
+
+daemon_isolate mqttshardsoff
+export SOCKETLEY_NO_SHARD_MESH=1
+daemon_start "$BIN"
+"$BIN" create mqtt sh -p "$P" --anonymous --shards 3 -s >/dev/null 2>&1 \
+    && ok || bad "a broker of three shards is made with no mesh" "$(tail -3 "$SOCKETLEY_DLOG")"
+ready_tcp 127.0.0.1 "$P" || bad "it listens" "$(tail -5 "$SOCKETLEY_DLOG")"
+grep -q "shard mesh disabled" "$SOCKETLEY_DLOG" && ok || bad "the daemon says the mesh is off" "$(tail -5 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 50); do
+    [ "$("$BIN" stats sh 2>/dev/null | awk -F: '$1=="shard_peers_known"{s+=$2} END{print s+0}')" -ge 6 ] && break
+    sleep 0.2
+done
+tally < <(run relayed)
+sleep 1.5
+kept=$("$BIN" stats sh 2>&1 | awk -F: '$1=="sessions_kept"{s+=$2} END{print s+0}')
+[ "$kept" -ge 1 ] && ok || bad "stats count the session kept" "sessions_kept $kept"
+unset SOCKETLEY_NO_SHARD_MESH
 
 echo "  Results: $PASS/$((PASS + FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

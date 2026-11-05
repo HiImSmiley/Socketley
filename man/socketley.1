@@ -16216,7 +16216,13 @@ subscribe to, and hands them the messages their subscribers want. Every shard
 keeps each retained message. A shared subscription's message goes to one member
 of the group, across all the shards. A client that connects to a different shard
 than before takes its session with it. The newest connection of a client id
-wins.
+wins. A session moves as one piece. When shards relay through the daemon
+(see
+.BR SOCKETLEY_NO_SHARD_MESH ),
+that piece holds 8 MiB. A larger session stays on its shard, and a connection to
+another shard is refused with Server unavailable until the client lands on the
+session's own shard. Such a refusal is counted in
+.BR sessions_kept .
 .PP
 A shard may not take what another shard hands it as fast as it comes. It then
 holds back that other shard's publishers, rather than lose their messages: they
@@ -24496,7 +24502,8 @@ Any value but
 stops shards from linking to each other directly.
 The shards then relay through the daemon, and the daemon logs at startup that
 the mesh is off. This is the measurement control for the mesh: the two paths
-differ only in the route, not in the build.
+differ only in the route, not in the build. One answer through the daemon holds
+8 MiB, while a link carries a longer one in pieces.
 .TP
 .B SOCKETLEY_NO_PEER_LINKS
 Any value but

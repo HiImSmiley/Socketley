@@ -121,6 +121,19 @@ public:
     // A link's queue is held to what the asker's parked tickets bound and not to the writer's cap, which one turn of
     // large values passes before its flush and which ended the link for good.
     static constexpr size_t BACKLOG = 256u << 20;
+    // A frame past max_payload goes as mesh_part pieces of this size.
+    static constexpr size_t PIECE = 4u << 20;
+
+    // The longest answer of `envelope` bytes besides itself that put() takes now, its pieces' headers counted.
+    size_t reply_room(size_t envelope) const
+    {
+        if (!alive())
+            return 0;
+        const size_t queued = m_writer.pending();
+        const size_t free = queued < BACKLOG ? BACKLOG - queued : 0;
+        const size_t headers = (free / PIECE + 1) * (worker_proto::header_size + 1);
+        return free > headers + envelope ? free - headers - envelope : 0;
+    }
 
     // One answer back to the asker, with a write the link cannot take ending
     // it exactly as an inline answer's would.
@@ -446,18 +459,17 @@ private:
     template <class Fill>
     bool put(size_t size, Fill&& fill)
     {
-        static constexpr size_t piece = 4u << 20;
         if (size - worker_proto::header_size <= worker_proto::max_payload)
             return m_writer.write_with(size, std::forward<Fill>(fill), BACKLOG);
-        const size_t pieces = (size + piece - 1) / piece;
+        const size_t pieces = (size + PIECE - 1) / PIECE;
         if (!m_writer.admit(size + pieces * (worker_proto::header_size + 1), BACKLOG))
             return false;
         std::string whole;
         whole.reserve(size);
         fill(whole);
-        for (size_t at = 0; at < whole.size(); at += piece)
+        for (size_t at = 0; at < whole.size(); at += PIECE)
         {
-            const size_t n = std::min(piece, whole.size() - at);
+            const size_t n = std::min(PIECE, whole.size() - at);
             const bool last = at + n == whole.size();
             if (!m_writer.write_with(worker_proto::header_size + 1 + n, [&](std::string& out) {
                     append_header(out, worker_proto::frame_type::mesh_part, n + 1);

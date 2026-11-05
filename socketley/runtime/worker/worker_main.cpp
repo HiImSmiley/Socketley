@@ -1356,6 +1356,19 @@ private:
             link->send_reply(to.wire_ticket, st, reply);
     }
 
+    // The daemon reads a frame up to max_payload, while a link carries one past it in pieces.
+    size_t reply_room(uint64_t cookie) const override
+    {
+        const auto it = m_deferred.find(cookie);
+        if (it == m_deferred.end())
+            return 0;
+        const size_t envelope = worker_proto::chan_reply_frame_size({});
+        if (it->second.link_serial == 0)
+            return worker_proto::max_payload + worker_proto::header_size - envelope;
+        const shard_link* link = const_cast<worker*>(this)->find_link(it->second.link_serial);
+        return link ? link->reply_room(envelope) : 0;
+    }
+
     shard_link* find_link(uint64_t serial)
     {
         shard_link* found = nullptr;

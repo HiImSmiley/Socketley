@@ -241,8 +241,9 @@ private:
     bool stalled(const shard_queue& q) const;
     // True when the cookie was a batch's, whatever its answer.
     bool shard_receipt(uint64_t cookie, request_status st, std::string_view reply);
-    // One word from another shard, alone or out of a batch; `reply` is what a question is answered with.
-    void shard_frame(std::string_view payload, std::string& reply);
+    // One word from another shard, alone or out of a batch; `reply` is what a question is answered with, in no more
+    // than the `room` the way back carries.
+    void shard_frame(std::string_view payload, std::string& reply, size_t room);
     // Asks every other shard to give up the session of a client about to connect here, then answers `done`.
     void claim(const auth_ask& ask, auth_answer a, std::function<void(auth_answer)> done);
     void claim_reply(uint64_t cookie, request_status st, std::string_view reply);
@@ -363,6 +364,8 @@ private:
         bool        lost{false};
         // Another shard holds the session under another user, so this connection may not have it.
         bool        refused{false};
+        // The shard holding the session could not send it back the way the claim came, so it kept it.
+        bool        kept{false};
         std::string session;
         int64_t     started_ms{0};
     };
@@ -386,6 +389,7 @@ private:
     uint64_t m_claims_lost{0};
     uint64_t m_claims_refused{0};
     uint64_t m_sessions_moved{0};
+    uint64_t m_sessions_kept{0};
 };
 
 }   // namespace socketley::mqtt
