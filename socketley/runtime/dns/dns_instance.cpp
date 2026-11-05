@@ -521,7 +521,8 @@ bool dns_run::start(std::string& why)
         }
         m_notify_to.emplace_back(ss, len);
     }
-    // The shards take one network's queries by their IDs, which an asker draws at random, so each keeps its share.
+    // Each datagram goes to a shard drawn at random, so one network's queries reach every shard alike and each keeps
+    // its share.
     const uint32_t shards = std::max<uint32_t>(m_owner.get_shards(), 1);
     m_rrl_limit = m_owner.get_rrl() == 0 ? 0 : std::max<uint32_t>(1, (m_owner.get_rrl() + shards - 1) / shards);
 
@@ -602,19 +603,20 @@ bool dns_run::open_udp(int family, uint16_t port, uint32_t bind4)
         errno = e;
         return false;
     }
-    // The shard a query goes to is picked by its ID, not by the asker's address and port: a resolver that asks from
-    // one port loaded one shard while the others idled.  Any shard answers any query, and past the shards the group
-    // holds, as while one restarts, the kernel goes back to its hash.
+    // The shard a query goes to is drawn at random for each datagram, not taken from anything in it: the kernel's
+    // hash of address and port sent all of one resolver's port to one shard, and the query's ID all of a client's
+    // that sends one ID, held to that shard's share of --rrl.  Any shard answers any query, and past the shards the
+    // group holds, as while one restarts, the kernel goes back to its hash.
     if (const uint32_t shards = m_owner.get_shards(); shards > 1)
     {
         sock_filter code[] = {
-            BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 0),           // the ID, the first two bytes past the UDP header
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, static_cast<uint32_t>(SKF_AD_OFF + SKF_AD_RANDOM)),
             BPF_STMT(BPF_ALU | BPF_MOD | BPF_K, shards),
             BPF_STMT(BPF_RET | BPF_A, 0),
         };
         sock_fprog prog{static_cast<unsigned short>(sizeof code / sizeof code[0]), code};
         if (::setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, &prog, sizeof prog) < 0)
-            LOG_WARN((std::string("dns: queries are spread over the shards by address, not by ID: ") +
+            LOG_WARN((std::string("dns: queries are spread over the shards by address, not at random: ") +
                       std::strerror(errno)).c_str());
     }
     auto ep = std::make_unique<udp_ep>();

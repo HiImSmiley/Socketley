@@ -14809,8 +14809,9 @@ its zones is answered REFUSED and is never looked up. So the runtime cannot be
 used as an open resolver, and every answer it gives is its own. Like every other
 runtime, it runs in a worker process of its own. It may run as
 .B \-\-shards
-processes that share the port. A UDP query goes to the shard its ID picks, so a
-resolver that asks from one port is still spread over every shard. It binds IPv4, and also IPv6 when the host has it
+processes that share the port. Each UDP query goes to a shard drawn at random,
+so a resolver that asks from one port, or with one ID, is still spread over
+every shard. It binds IPv4, and also IPv6 when the host has it
 and no
 .B \-\-bind
 address is given. The default port is 53. A port below 1024 needs root or
@@ -14992,8 +14993,7 @@ limit. The limit is for the whole runtime: with
 .BR \-\-shards ,
 each shard allows its share of
 .IR n ,
-since one network's queries are spread over the shards by their IDs, which a
-resolver draws at random.
+since each of one network's queries goes to a shard drawn at random.
 .TP
 .B \-\-dnssec
 Signs every zone as it is loaded (RFC 4033 to 4035). Each zone gets one key of

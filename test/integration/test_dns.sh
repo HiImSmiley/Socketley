@@ -242,6 +242,32 @@ EOF
 # 20 a second, or 40 for a burst that straddles a second; each shard keeping 20 of its own answers 80 or more.
 if [ "${full:-999}" -ge 1 ] && [ "${full:-999}" -le 45 ]; then ok "400 queries from 40 ports to four shards at --rrl 20: $full answered"
 else bad "--rrl across four shards" "answered ${full:-none}, want at most 45"; fi
+# And the limit is the runtime's for a client that asks from one port with one ID, not one shard's share: steered by
+# the ID, all of its queries reached one shard, which answered 5 a second (10 across a second's edge).
+sleep 2
+full=$(python3 - "$PW" <<'EOF'
+import socket, struct, sys, time
+p = int(sys.argv[1])
+q = struct.pack("!HHHHHH", 7, 0, 1, 0, 0, 0) + b"\x03www\x03one\x04test\x00" + struct.pack("!HH", 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+s.bind(("127.0.0.1", 0))
+for _ in range(400):
+    s.sendto(q, ("127.0.0.1", p))
+time.sleep(0.5)
+s.setblocking(False)
+full = 0
+try:
+    while True:
+        d = s.recv(4096)
+        if not struct.unpack("!H", d[2:4])[0] & 0x200: full += 1
+except BlockingIOError:
+    pass
+print(full)
+EOF
+)
+if [ "${full:-0}" -ge 12 ] && [ "${full:-0}" -le 45 ]; then ok "400 queries from one port with one ID at --rrl 20: $full answered, the runtime's limit"
+else bad "--rrl for one port and one ID" "answered ${full:-none}, want 12 to 45; one shard's share is 5 to 10"; fi
 "$BIN" remove wide >/dev/null 2>&1
 
 # A resolver asking from one port loaded one shard of four: the kernel picked the shard by address and port.  It is
@@ -250,7 +276,9 @@ PS=$((SL_PORT_BASE+1728))
 "$BIN" create dns spread -p "$PS" --zone "$T/one.zone" --shards 4 --rrl 0 --proxy none -s >/dev/null 2>&1
 for _ in $(seq 1 50); do dig @127.0.0.1 -p "$PS" +short +time=1 +tries=1 www.one.test A >/dev/null 2>&1 && break; sleep 0.1; done
 before=$("$BIN" stats spread 2>/dev/null | awk -F: '/^udp_queries:/ {printf "%s ", $2+0}')
-answered=$(python3 - "$PS" <<'EOF'
+# One port, asked with random IDs and then with one ID throughout, as some clients do.
+for ids in random fixed; do
+answered=$(python3 - "$PS" "$ids" <<'EOF'
 import random, socket, struct, sys, time
 p = int(sys.argv[1])
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -258,7 +286,8 @@ s.bind(("127.0.0.1", 0))
 s.settimeout(2)
 got = 0
 for _ in range(400):
-    s.sendto(struct.pack("!HHHHHH", random.getrandbits(16), 0, 1, 0, 0, 0) + b"\x03www\x03one\x04test\x00"
+    qid = random.getrandbits(16) if sys.argv[2] == "random" else 7
+    s.sendto(struct.pack("!HHHHHH", qid, 0, 1, 0, 0, 0) + b"\x03www\x03one\x04test\x00"
              + struct.pack("!HH", 1, 1), ("127.0.0.1", p))
     try:
         s.recv(4096); got += 1
@@ -270,9 +299,11 @@ EOF
 sleep 2
 after=$("$BIN" stats spread 2>/dev/null | awk -F: '/^udp_queries:/ {printf "%s ", $2+0}')
 least=$(python3 -c "import sys; b=[int(x) for x in sys.argv[1].split()]; a=[int(x) for x in sys.argv[2].split()]; print(min(y-x for x,y in zip(b,a)) if len(a)==4 and len(b)==4 else -1)" "$before" "$after")
-expect "400 queries from one port are all answered by four shards" "$answered" "400"
+expect "400 queries from one port with $ids IDs are all answered by four shards" "$answered" "400"
 if [ "${least:--1}" -ge 40 ]; then ok "and every shard takes a share of them (the least took $least)"
-else bad "every shard takes a share of one port's queries" "per shard before '$before', after '$after'"; fi
+else bad "every shard takes a share of one port's queries with $ids IDs" "per shard before '$before', after '$after'"; fi
+before=$after
+done
 "$BIN" remove spread >/dev/null 2>&1
 
 # ── names runtimes are reached by, published ────────────────────────────────
