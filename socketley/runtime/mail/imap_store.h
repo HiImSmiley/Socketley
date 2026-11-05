@@ -9,6 +9,8 @@
 // gives them, and each shard reads only the lines it has not, one stat a command when there are none.  Each change
 // of a message has the folder's next mod-sequence (RFC 7162).  The journal is folded into the snapshot once it
 // outgrows it.
+#include <unistd.h>
+
 #include <cstdint>
 #include <functional>
 #include <list>
@@ -17,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mail_mime.h"
@@ -249,6 +252,28 @@ public:
     }
 
 private:
+    // A descriptor closed with what holds it.
+    struct kept_fd
+    {
+        int fd{-1};
+        kept_fd() = default;
+        kept_fd(const kept_fd&) = delete;
+        kept_fd& operator=(const kept_fd&) = delete;
+        kept_fd(kept_fd&& o) noexcept : fd(std::exchange(o.fd, -1)) {}
+        kept_fd& operator=(kept_fd&& o) noexcept
+        {
+            reset();
+            fd = std::exchange(o.fd, -1);
+            return *this;
+        }
+        ~kept_fd() { reset(); }
+        void reset(int to = -1)
+        {
+            if (fd >= 0)
+                ::close(fd);
+            fd = to;
+        }
+    };
     struct user_state
     {
         std::map<std::string, std::shared_ptr<imap_folder>> folders;
@@ -273,6 +298,11 @@ private:
         uint64_t compact_quiet{UINT64_MAX};
         // The index's path, worked out once: resolving the state directory costs several syscalls.
         std::string base;
+        // The lock and the journal open for a change, kept while the user is in use, the journal's inode beside it.
+        kept_fd lock_fd;
+        kept_fd log_fd;
+        uint64_t log_fd_ino{0};
+        bool dir_made{false};
         // METADATA entries by folder, "" the server's, and the bytes of their values.
         std::map<std::string, std::map<std::string, std::string>> meta;
         uint64_t meta_bytes{0};

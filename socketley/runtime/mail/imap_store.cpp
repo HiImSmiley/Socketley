@@ -1087,16 +1087,21 @@ bool imap_store::mutate(const std::string& name, const std::function<void(user_s
     if (u.base.empty())
         u.base = path_of(name);
     const std::string& base = u.base;
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(base).parent_path(), ec);
+    if (!u.dir_made)
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(base).parent_path(), ec);
+        u.dir_made = !ec;
+    }
     // Held only for a read of what is new and an append: no shard waits on another's disk.
-    const int lock = u.locked ? -1 : ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (!u.locked && u.lock_fd.fd < 0)
+        u.lock_fd.reset(::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
+    const int lock = u.locked ? -1 : u.lock_fd.fd;
     // A change made without the lock could give a UID another shard gives too: none is made.
     if (!u.locked && (lock < 0 || ::flock(lock, LOCK_EX) != 0))
     {
-        if (lock >= 0)
-            ::close(lock);
         LOG_WARN(("mail: the IMAP index lock of " + name + " could not be taken: " + std::strerror(errno)).c_str());
+        u.lock_fd.reset();
         return false;
     }
     const bool outer = !u.locked;
@@ -1108,10 +1113,18 @@ bool imap_store::mutate(const std::string& name, const std::function<void(user_s
     if (!lines.empty())
     {
         const std::string log = base + ".log";
-        const int fd = ::open(log.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+        // The journal kept open is the one at its path while catch_up saw that inode under the lock; a compaction
+        // that moved a new one in sends it to be opened again.
+        if (u.log_fd.fd < 0 || !u.log_ino || u.log_fd_ino != u.log_ino)
+        {
+            u.log_fd.reset(::open(log.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600));
+            u.log_fd_ino = 0;
+        }
+        const int fd = u.log_fd.fd;
         struct stat st{};
         if (fd >= 0 && ::fstat(fd, &st) == 0)
         {
+            u.log_fd_ino = st.st_ino;
             if (st.st_size == 0)
                 lines = "SKLIMAPLOG " + std::to_string(u.snapshot_gen) + "\n" + lines;
             if (socketley::write_all(fd, lines.data(), lines.size()))
@@ -1134,16 +1147,16 @@ bool imap_store::mutate(const std::string& name, const std::function<void(user_s
         }
         else
             written = false;
-        if (fd >= 0)
-            ::close(fd);
+        if (!written)
+            u.log_fd.reset();
     }
     // A change the journal did not take is undone, memory read back as the disk has it.
     if (!written)
         reload(u);
     if (outer)
         u.locked = false;
-    if (lock >= 0)
-        ::close(lock);
+    if (lock >= 0 && ::flock(lock, LOCK_UN) != 0)
+        u.lock_fd.reset();
     return written;
 }
 
@@ -1437,6 +1450,9 @@ void imap_store::tick(int64_t)
         const auto fold_due = [&] { return u.log_off > (256u << 10) && u.log_off > u.snapshot_bytes; };
         if (!u.loaded || (now - u.used_ms > quiet_ms && !u.unsynced && !u.compacting && !fold_due()))
         {
+            // A user not in use keeps no descriptor.
+            u.lock_fd.reset();
+            u.log_fd.reset();
             if (u.loaded && now - u.used_ms > let_go_ms && m_run.owner().get_shard_index() != 0 && unused(u))
             {
                 m_let_go[name] = {u.log_ino, u.log_off};

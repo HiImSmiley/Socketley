@@ -593,6 +593,32 @@ idx=$(find "$HOME/.local/share" -path '*/mail/msh.imap/alice' 2>/dev/null | head
     && [ "$(stat -c %s "$idx.log" 2>/dev/null)" -lt 262144 ] && ok "a journal past a quarter of a mebibyte is folded into its snapshot" \
     || bad "a journal past a quarter of a mebibyte is folded into its snapshot" "$(head -c 20 "$idx" 2>/dev/null) $(stat -c %s "$idx.log" 2>/dev/null)"
 check "and every shard reads the same flags after" "$r" "1 True"
+# A change after a fold goes into the journal that took its place, not the one the shard had open before it: a session
+# keeps its shard using the user until another fold is done, then changes every message.
+r=$(timeout 180 python3 - "$IMSH" "$idx.log" <<'PY'
+import imaplib, os, sys, time
+port, log = int(sys.argv[1]), sys.argv[2]
+M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); M.select("Shared")
+for i in range(400):
+    M.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Seen)")
+grown = os.stat(log).st_size
+folded = False
+for _ in range(100):
+    M.noop(); time.sleep(0.1)
+    if os.stat(log).st_size < grown:
+        folded = True
+        break
+M.uid("STORE", "1:*", "+FLAGS.SILENT", "(\\Flagged)")
+time.sleep(1.5)
+flagged = set()
+for _ in range(8):
+    N = imaplib.IMAP4("127.0.0.1", port); N.login("alice", "alicepassword1"); N.select("Shared")
+    typ, data = N.uid("FETCH", "1:*", "(FLAGS)")
+    flagged.add(all(b"Flagged" in d for d in data))
+print(folded, sorted(flagged))
+PY
+)
+check "a change after a fold reaches every shard" "$r" "True [True]"
 # Folds while sessions on every shard of a runtime of four watch the folder: one shard folds the journal at a time, so
 # none finds another's fold moved in before its own.
 PMF=$((SL_PORT_BASE+1959)); IMF=$((SL_PORT_BASE+1960))
