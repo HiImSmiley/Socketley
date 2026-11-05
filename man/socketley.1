@@ -18699,7 +18699,12 @@ in
 .BR current/public )
 too, and no request asks the disk whether a file changed. Kept bytes are bounded
 at 256 MiB and kept descriptors at 4096, past which a large file is opened for
-each request. An address with no file shares the one
+each request. Under
+.B \-\-shards
+each shard keeps, compresses and watches for itself, since any of them may be
+asked for any file: the bounds are a shard's, and the watches count once a shard
+against
+.BR fs.inotify.max_user_watches . An address with no file shares the one
 .B 404.html
 or fallback answer, so a flood of made\-up addresses keeps nothing. A file that
 cannot be opened for want of a descriptor or memory is a
