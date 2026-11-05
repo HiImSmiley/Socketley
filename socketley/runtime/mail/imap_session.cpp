@@ -2036,8 +2036,27 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
         bool unknown_cte{false};
         // How far the reads asked for ahead of the one answered reach.
         size_t ahead{0};
+        // Under CONDSTORE the lines of messages this FETCH marks \Seen are held until the marks are written together,
+        // a piece with a uid standing for that message's MODSEQ.
+        struct piece
+        {
+            std::string text;
+            std::shared_ptr<const std::string> bytes;
+            size_t off{0};
+            size_t len{0};
+            uint32_t modseq_of{0};
+        };
+        std::vector<piece> held;
+        size_t held_bytes{0};
+        bool holding{false};
+        // Whether an item read sets \Seen, where the folder's ACL lets it.
+        bool marks{false};
     };
     auto j = std::make_shared<job>();
+    j->marks = m_rights.find('s') != std::string::npos &&
+               std::any_of(items.begin(), items.end(), [](const item& i) {
+                   return !i.peek && (i.binary || i.name.starts_with("BODY[") || i.name == "RFC822" || i.name == "RFC822.TEXT");
+               });
     j->idx = std::move(idx);
     j->items = std::move(items);
     j->needs_body = needs_body;
@@ -2062,6 +2081,37 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             if (told_all && m_folder->highestmodseq == was + n)
                 m_told_modseq = m_folder->highestmodseq;
             j->seen.clear();
+        };
+        const auto say = [this, j](std::string text) {
+            if (!j->holding)
+                return m_hooks.reply(text);
+            j->held_bytes += text.size();
+            j->held.push_back({std::move(text), nullptr, 0, 0, 0});
+        };
+        const auto say_shared = [this, j](const std::shared_ptr<const std::string>& bytes, size_t off, size_t len) {
+            if (!j->holding)
+                return m_hooks.reply_shared(bytes, off, len);
+            j->held_bytes += len;
+            j->held.push_back({{}, bytes, off, len, 0});
+        };
+        // The held lines go once the marks they wait on are written, each MODSEQ the one its message now has.
+        const auto release = [this, j, &flush_seen] {
+            if (!j->holding)
+                return;
+            flush_seen();
+            j->holding = false;
+            for (auto& p : j->held)
+                if (p.modseq_of)
+                {
+                    const imap_message* m = m_folder->by_uid(p.modseq_of);
+                    m_hooks.reply(m ? " MODSEQ (" + std::to_string(m->modseq) + "))\r\n" : std::string(")\r\n"));
+                }
+                else if (p.bytes)
+                    m_hooks.reply_shared(p.bytes, p.off, p.len);
+                else
+                    m_hooks.reply(p.text);
+            j->held.clear();
+            j->held_bytes = 0;
         };
         while (j->at < j->idx.size())
         {
@@ -2099,6 +2149,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 if (j->waiting)
                 {
                     j->looping = false;
+                    release();
                     return;
                 }
             }
@@ -2106,6 +2157,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             if (j->unreadable)
             {
                 j->looping = false;
+                release();
                 flush_seen();
                 finish(tag, "NO", "[UNAVAILABLE] A message could not be read from the storage");
                 resume();
@@ -2118,6 +2170,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 }))
             {
                 j->looping = false;
+                release();
                 return;
             }
             std::shared_ptr<const mime::part> part;
@@ -2133,6 +2186,9 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 first = false;
             };
             bool seen_now = false;
+            // A message this FETCH may mark \Seen under CONDSTORE is held, and so is every one after it until the marks
+            // are written.
+            j->holding = j->holding || (j->marks && m_condstore && !m_readonly && !(m->flags & flag_seen));
             for (const auto& it : j->items)
             {
                 if (it.name == "FLAGS" || it.name == "MODSEQ")
@@ -2212,9 +2268,9 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                     if (got.size() >= shared_from && got.data() >= held.data() &&
                         got.data() + got.size() <= held.data() + held.size())
                     {
-                        m_hooks.reply(out);
+                        say(std::move(out));
                         out.clear();
-                        m_hooks.reply_shared(j->bytes, static_cast<size_t>(got.data() - held.data()), got.size());
+                        say_shared(j->bytes, static_cast<size_t>(got.data() - held.data()), got.size());
                     }
                     else
                         out.append(got);
@@ -2224,31 +2280,11 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             }
             // Reading sets \Seen only where the folder's ACL gives the s right.
             seen_now = seen_now && m_rights.find('s') != std::string::npos;
-            // Without CONDSTORE the \Seen of every message is written at the end, one journal line set for the FETCH; with
-            // it each is written as it goes, as its MODSEQ is told with it.
-            if (seen_now && !m_readonly && !(m->flags & flag_seen) && !m_condstore)
+            // The \Seen of every message is written with the others: without CONDSTORE at the FETCH's end, with it before
+            // the held lines go, so each MODSEQ told is the one written.
+            const bool marks = seen_now && !m_readonly && !(m->flags & flag_seen);
+            if (marks)
                 j->seen.push_back(m->uid);
-            else if (seen_now && !m_readonly && !(m->flags & flag_seen))
-            {
-                // What this session did is not told again, unless another shard's changes came in with it.
-                const uint64_t was = m_folder->highestmodseq;
-                const bool told_all = m_told_modseq == was;
-                const uint32_t uid = m->uid;
-                const size_t n = m_store.set_flags(m_owner, m_folder, {uid},
-                                                   [](uint8_t f) { return static_cast<uint8_t>(f | flag_seen); });
-                if (told_all && m_folder->highestmodseq == was + n)
-                    m_told_modseq = m_folder->highestmodseq;
-                // The change read what other shards logged too, which may have moved the folder's messages.
-                m = m_folder->by_uid(uid);
-                if (!m)
-                {
-                    out += ")\r\n";
-                    m_hooks.reply(out);
-                    j->bytes.reset();
-                    ++j->at;
-                    continue;
-                }
-            }
             const bool flags = std::any_of(j->items.begin(), j->items.end(),
                                            [](const item& it) { return it.name == "FLAGS"; });
             if (flags || seen_now)
@@ -2260,16 +2296,26 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                     shown.flags |= flag_seen;
                 out += "FLAGS " + flags_text(shown, false);
             }
-            if (std::any_of(j->items.begin(), j->items.end(), [](const item& it) { return it.name == "MODSEQ"; }) ||
-                (seen_now && m_condstore))
+            if (marks && m_condstore)
             {
-                next();
-                out += "MODSEQ (" + std::to_string(m->modseq) + ")";
+                say(std::move(out));
+                j->held.push_back({{}, nullptr, 0, 0, m->uid});
             }
-            out += ")\r\n";
-            m_hooks.reply(out);
+            else
+            {
+                if (std::any_of(j->items.begin(), j->items.end(), [](const item& it) { return it.name == "MODSEQ"; }) ||
+                    (seen_now && m_condstore))
+                {
+                    next();
+                    out += "MODSEQ (" + std::to_string(m->modseq) + ")";
+                }
+                out += ")\r\n";
+                say(std::move(out));
+            }
             j->bytes.reset();
             ++j->at;
+            if (j->held_bytes > max_backlog)
+                release();
             if (j->at < j->idx.size() && m_hooks.backlog() > max_backlog)
             {
                 j->waiting = true;
@@ -2288,6 +2334,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             }
         }
         j->looping = false;
+        release();
         flush_seen();
         if (j->unknown_cte)
             finish(tag, "NO", "[UNKNOWN-CTE] A part's Content-Transfer-Encoding is none this decodes");

@@ -1122,6 +1122,7 @@ bool imap_store::mutate(const std::string& name, const std::function<void(user_s
                 u.log_ino = st.st_ino;
                 u.log_off += lines.size();
                 u.unsynced = true;
+                ++m_journal_writes;
             }
             else
             {

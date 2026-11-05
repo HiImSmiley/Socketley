@@ -4060,6 +4060,7 @@ std::string mail_run::stats() const
         put(out, "imap_users_held", m_imap->users_held());
         put(out, "imap_folds", m_imap->folds());
         put(out, "imap_folds_lost", m_imap->folds_lost());
+        put(out, "imap_journal_writes", m_imap->journal_writes());
     }
     if (m_mailboxes && m_mailboxes->enabled())
     {

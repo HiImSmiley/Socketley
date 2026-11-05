@@ -268,6 +268,47 @@ say("and what comes compressed is what comes in the clear", strip(got) == strip(
 say("smaller on the wire", 0 < wire < len(plain), (wire, len(plain)))
 say("a second COMPRESS is refused", b"y NO [COMPRESSIONACTIVE]" in got, got[-300:])
 PY
+# A FETCH that reads six messages under CONDSTORE marks them \Seen in one write to the journal, and tells each the
+# MODSEQ it then has.
+python3 - "$IM" "$BIN" >> "$T/ext.out" 2>&1 <<'PY'
+import re, socket, subprocess, sys, time
+port, binary = int(sys.argv[1]), sys.argv[2]
+def say(name, cond, why=""):
+    print(("ok " if cond else "bad ") + name + ("" if cond else ": " + str(why)[:600]))
+def writes():
+    # The runtime's figures reach the daemon a moment after they change.
+    time.sleep(1.5)
+    out = subprocess.run([binary, "stats", "m"], capture_output=True, timeout=30).stdout.decode()
+    return sum(int(l.split(":")[1]) for l in out.splitlines() if l.startswith("imap_journal_writes:"))
+s = socket.create_connection(("127.0.0.1", port), timeout=10); f = s.makefile("rb"); f.readline(); n = [0]
+def cmd(text, lit=None):
+    n[0] += 1; tag = "r%d" % n[0]
+    s.sendall(("%s %s\r\n" % (tag, text)).encode())
+    if lit is not None:
+        f.readline(); s.sendall(lit + b"\r\n")
+    out = []
+    while True:
+        l = f.readline()
+        if not l: return out + ["<closed>"]
+        l = l.decode(errors="replace").rstrip("\r\n")
+        out.append(l)
+        if l.startswith(tag + " "): return out
+cmd("LOGIN alice alicepassword1"); cmd("CREATE Reads")
+for i in range(6):
+    body = b"From: x@else.test\r\nSubject: r%d\r\n\r\nread me\r\n" % i
+    cmd("APPEND Reads {%d}" % len(body), body)
+cmd("SELECT Reads (CONDSTORE)")
+before = writes()
+r = cmd("FETCH 1:* (BODY[])")
+told = [int(m.group(1)) for m in (re.search(r"MODSEQ \((\d+)\)", x) for x in r) if m]
+seen = len([x for x in r if "FLAGS (\\Seen)" in x])
+after = writes()
+r2 = cmd("FETCH 1:* (MODSEQ)")
+now = [int(m.group(1)) for m in (re.search(r"MODSEQ \((\d+)\)", x) for x in r2) if m]
+say("a FETCH of six under CONDSTORE marks them \\Seen in one journal write", after - before == 1 and seen == 6,
+    (before, after, seen, r))
+say("and tells each the MODSEQ it has after", len(told) == 6 and told == now and len(set(told)) == 6, (told, now))
+PY
 while read -r verdict name; do
     case "$verdict" in ok) ok "$name" ;; bad) bad "${name%%:*}" "${name#*:}" ;; esac
 done < <(grep -E '^(ok|bad) ' "$T/ext.out" || echo "bad the client ran: $(tail -5 "$T/ext.out")")
