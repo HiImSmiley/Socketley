@@ -122,6 +122,15 @@ echo "  observed: $REACHED of $N sockets reached, $DELIVERED deliveries in total
 check "every client of the runtime is reached" "$REACHED"   "$N"
 check "and each of them exactly once"          "$DELIVERED" "$N"
 
+# The sibling half goes over the shards' own links: with the daemon stopped, a
+# half that still went through it would reach this shard's quarter and no more.
+kill -STOP "$SOCKETLEY_DPID"
+read -r REACHEDM DELIVEREDM < <(python3 "$WORK/fan.py" "$P_SRV" "$N")
+kill -CONT "$SOCKETLEY_DPID"
+echo "  observed with the daemon stopped: $REACHEDM of $N reached, $DELIVEREDM deliveries"
+check "the fan-out reaches every client without the daemon" "$REACHEDM"   "$N"
+check "and each of them exactly once without it"            "$DELIVEREDM" "$N"
+
 echo "== the control: the same script on ONE shard =="
 "$BIN" create server fan1 -p $P_SRV1 --lua "$WORK/fan.lua" --shards 1 >/dev/null 2>&1
 "$BIN" start fan1 >/dev/null 2>&1

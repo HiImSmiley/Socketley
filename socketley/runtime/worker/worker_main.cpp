@@ -910,9 +910,12 @@ private:
             m_rt->set_ref_sink(
                 [this](const conn_ref& r, std::string_view message)
                 {
+                    const std::string payload = worker_proto::encode_send_ref(r, message);
+                    if (shard_link* link = note_link(conn_ref_shard(r));
+                        link && link->send_note(worker_proto::frame_type::deliver_ref, payload))
+                        return;
                     if (!m_writer.write(worker_proto::frame(
-                            worker_proto::frame_type::send_ref,
-                            worker_proto::encode_send_ref(r, message)))) {}
+                            worker_proto::frame_type::send_ref, payload))) {}
                 });
         }
 
@@ -933,7 +936,9 @@ private:
                     continue;
                 m_mesh_links.push_back(std::make_unique<shard_link>(
                     fd, j, &m_manager.requests(), &worker_serve_mesh, this));
+                m_mesh_links.back()->set_noter(&worker_mesh_note);
             }
+            m_notes_direct = m_mesh_links.size() + 1 == cfg.shards;
             if (!m_mesh_links.empty())
                 LOG_INFO(("shard mesh: " + std::to_string(m_mesh_links.size())
                           + " direct link(s) to siblings").c_str());
@@ -1001,6 +1006,13 @@ private:
         m_rt->set_sibling_sink(
             [this](std::string_view message)
             {
+                // A sibling whose link has just ended misses this one message, the way its own clients went with it.
+                if (note_link(UINT32_MAX))
+                {
+                    for (auto& link : m_mesh_links)
+                        if (!link->send_note(worker_proto::frame_type::deliver, message)) {}
+                    return;
+                }
                 if (!m_writer.write(worker_proto::frame(
                         worker_proto::frame_type::deliver_to,
                         worker_proto::encode_deliver_to(m_rt->get_name(),
@@ -1214,6 +1226,37 @@ private:
         else if (m_proxy)
             m_proxy->set_endpoints(std::move(tbl)); // only a proxy routes by name
         // else: a runtime that does not route.  Nothing to hand it.
+    }
+
+    // A message for this shard's clients from a sibling, the frame the daemon would otherwise have sent.
+    static void worker_mesh_note(void* ctx, worker_proto::frame_type type, std::string_view payload)
+    {
+        auto* self = static_cast<worker*>(ctx);
+        if (type == worker_proto::frame_type::deliver)
+            self->deliver_local(payload);
+        else
+            self->on_deliver_ref(std::string(payload));
+    }
+
+    // Which link a message for sibling `shard`'s clients takes -- UINT32_MAX asks for every sibling at once -- or
+    // null for the daemon.  Both kinds go one way, so a broadcast cannot overtake a send to one client or be
+    // overtaken by it, and the way only ever changes from the links to the daemon, which cannot overtake them.
+    shard_link* note_link(uint32_t shard)
+    {
+        if (!m_notes_direct)
+            return nullptr;
+        shard_link* found = nullptr;
+        for (auto& link : m_mesh_links)
+        {
+            if (!link->alive())
+            {
+                m_notes_direct = false;
+                return nullptr;
+            }
+            if (link->peer() == shard || shard == UINT32_MAX)
+                found = link.get();
+        }
+        return found;
     }
 
     // A publish delivered through the same entry point an in-process dispatch
@@ -2209,6 +2252,8 @@ private:
     // Before m_remote, which holds a pointer to it.
     control_writer                         m_writer;
     std::vector<std::unique_ptr<shard_link>> m_mesh_links;
+    // Messages for a sibling's clients go over the links while every sibling has one that lives.
+    bool m_notes_direct{false};
     std::vector<std::unique_ptr<mesh_sink>>  m_mesh_sinks;
 
     // ── Links to other runtimes' processes ─────────────────────────────────

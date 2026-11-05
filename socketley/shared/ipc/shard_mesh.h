@@ -43,6 +43,9 @@ using shard_mesh_server = mesh_verdict (*)(void* ctx, shard_link* from,
 // the mesh, and only a link between two runtimes has routes to carry.
 using shard_mesh_router = void (*)(void* ctx, std::string_view payload);
 
+// And what it hands a message for this shard's clients to, a deliver or a deliver_ref, which wants no answer.
+using shard_mesh_noter = void (*)(void* ctx, worker_proto::frame_type type, std::string_view payload);
+
 // One link, to one sibling.
 class shard_link : public io_handler
 {
@@ -164,6 +167,25 @@ public:
         m_owed.insert(ticket);
         return true;
     }
+
+    // A message for the sibling's clients, in the frame the daemon would have sent it, answered by nobody; false
+    // means the caller sends it the long way, which cannot overtake what went this way before it.
+    bool send_note(worker_proto::frame_type type, std::string_view payload)
+    {
+        if (!alive())
+            return false;
+        if (!put(worker_proto::header_size + payload.size(), [&](std::string& out) {
+                    append_header(out, type, payload.size());
+                    out.append(payload);
+                }))
+        {
+            die("the backlog to a sibling filled or its socket went");
+            return false;
+        }
+        return !m_writer.dead();
+    }
+
+    void set_noter(shard_mesh_noter noter) { m_noter = noter; }
 
     // One routing frame to the peer, in the encoding the daemon's own leg uses,
     // so the far side reads it with the function it already had.  False means
@@ -502,6 +524,12 @@ private:
             handle(inner, whole);
             return;
         }
+        if (type == worker_proto::frame_type::deliver || type == worker_proto::frame_type::deliver_ref)
+        {
+            if (m_noter)
+                m_noter(m_ctx, type, payload);
+            return;
+        }
         if (type == worker_proto::frame_type::route_down)
         {
             // Applied by the far side with the same function the daemon's leg
@@ -532,6 +560,7 @@ private:
     shard_mesh_server m_server{nullptr};
     void*             m_ctx{nullptr};
     shard_mesh_router m_router{nullptr};
+    shard_mesh_noter  m_noter{nullptr};
     // What has come of a frame sent in pieces, until its last.
     std::string       m_part;
 
