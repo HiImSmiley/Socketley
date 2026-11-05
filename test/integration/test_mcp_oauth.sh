@@ -40,9 +40,12 @@ printf 'subjectAltName=DNS:client.test\n' > "$T/c.ext"
 openssl x509 -req -in "$T/c.csr" -CA "$T/ca.pem" -CAkey "$T/ca.key" -CAcreateserial -days 2 -extfile "$T/c.ext" \
     -out "$T/c.pem" >/dev/null 2>&1
 python3 - "$PC" "$T" <<'PY' > "$T/docs.log" 2>&1 &
-import http.server, json, ssl, sys
+import http.server, json, ssl, sys, threading, time
 port, d = int(sys.argv[1]), sys.argv[2]
 fetches = {}
+# The documents under /slow/ answered after a second, and how many of them were asked for at once at most.
+slow = {"now": 0, "most": 0, "asked": 0}
+lock = threading.Lock()
 def doc(path, cid=None, **more):
     o = {"client_id": cid or "https://client.test" + path, "client_name": "Test Agent",
          "redirect_uris": ["http://127.0.0.1/callback"], "grant_types": ["authorization_code", "refresh_token"],
@@ -55,6 +58,15 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/count":
             b = json.dumps(fetches).encode()
+        elif self.path == "/slowest":
+            b = json.dumps(slow).encode()
+        elif self.path.startswith("/slow/"):
+            with lock:
+                slow["now"] += 1; slow["most"] = max(slow["most"], slow["now"]); slow["asked"] += 1
+            time.sleep(1)
+            with lock:
+                slow["now"] -= 1
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
         elif self.path in docs:
             fetches[self.path] = fetches.get(self.path, 0) + 1
             b = json.dumps(docs[self.path]).encode()
@@ -346,6 +358,33 @@ case "$stats" in *"consents:"[1-9]*"client_fetches:"[1-9]*"client_fetch_failures
 kill "$SOCKETLEY_DPID" 2>/dev/null; wait "$SOCKETLEY_DPID" 2>/dev/null
 daemon_start "$BIN"
 verdicts < <(flow restart)
+
+# The documents a stranger can have waiting to be fetched are 16 for the runtime, however many shards fetch them: of 48
+# asked for at once at four shards, 16 or so are fetched and the others find no client at once.
+"$BIN" create idp auth4 -p $((PI + 20)) --issuer "http://127.0.0.1:$((PI + 20))" --clients "$T/clients" \
+    --resources "https://mcp.test/mcp" --shards 4 -s >/dev/null 2>&1
+for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((PI + 20))/jwks")" = 200 ] && break; sleep 0.1; done
+python3 - "$((PI + 20))" <<'PY'
+import sys, threading, urllib.parse, urllib.request
+port = sys.argv[1]
+def ask(i):
+    a = dict(client_id="https://client.test/slow/%d.json" % i, redirect_uri="http://127.0.0.1/callback",
+             response_type="code", scope="openid", state="s", code_challenge="x" * 43, code_challenge_method="S256")
+    try:
+        urllib.request.urlopen("http://127.0.0.1:%s/authorize?%s" % (port, urllib.parse.urlencode(a)), timeout=30).read()
+    except Exception:
+        pass
+ts = [threading.Thread(target=ask, args=(i,)) for i in range(48)]
+[t.start() for t in ts]; [t.join() for t in ts]
+PY
+r=$(python3 - "$PC" "$T" <<'PY'
+import json, ssl, sys, urllib.request
+ctx = ssl.create_default_context(cafile=sys.argv[2] + "/ca.pem"); ctx.check_hostname = False
+print(json.loads(urllib.request.urlopen("https://127.0.0.1:%s/slowest" % sys.argv[1], context=ctx, timeout=10).read())["asked"])
+PY
+)
+[ "${r:-99}" -ge 1 ] && [ "${r:-99}" -le 20 ] && ok || bad "a runtime of four shards keeps 16 fetches waiting at most" "${r:-none} of 48 fetched"
+"$BIN" remove auth4 >/dev/null 2>&1
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="

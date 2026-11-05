@@ -730,8 +730,9 @@ bool idp_run::needs_fetch(std::string_view id) const
 void idp_run::fetch_client(const std::shared_ptr<conn>& c, const std::string& id,
                            std::function<void(const std::shared_ptr<conn>&)> then)
 {
-    // A stranger may name any address, so the fetches at once are bounded, and one past the bound finds no client.
-    constexpr size_t max_fetching = 16;
+    // A stranger may name any address, so the fetches at once are bounded, and one past the bound finds no client: 16
+    // for the runtime, shared out over its shards, as each fetches apart.
+    const size_t max_fetching = std::max<size_t>(1, 16 / std::max<uint32_t>(1, m_shards));
     if (!m_fetching.contains(id) && m_fetching.size() >= max_fetching)
     {
         ++m_c.client_fetch_failures;
