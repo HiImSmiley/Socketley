@@ -22,6 +22,10 @@ namespace socketley::idp
 inline constexpr std::string_view session_cookie_name = "skl_idp";
 // The cookie a browser keeps once an account has signed in on it, which only the provider reads.
 inline constexpr std::string_view known_cookie_name = "skl_idp_known";
+// What an unknown user's password is checked against, a hash of the cost of a real one that no password makes: a
+// constant, so no shard derives one on its loop.
+inline constexpr std::string_view no_account_hash =
+    "$scrypt$ln=14,r=8,p=1$UtWLNVX5FXTOzqls4cWkRQ==$NZlBUc0O7vs30nuIN9cFX8vTusUv0k0BmpAwoVusHuc=";
 
 // The client `socketley login` signs in as, and so the one a tunnel edge takes when no --idp-audience is named.
 inline constexpr std::string_view cli_client = "socketley";

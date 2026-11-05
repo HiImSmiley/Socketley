@@ -3,11 +3,13 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include <chrono>
 #include <string>
 #include <vector>
 
 #include <openssl/evp.h>
 
+#include "runtime/idp/idp_logic.h"
 #include "runtime/storage/password_hash.h"
 #include "runtime/storage/scrypt.h"
 
@@ -136,4 +138,13 @@ TEST_CASE("passwords checked many at once match as each would alone")
     }
     CHECK(got == want);
     CHECK(got == std::vector<bool>{true, false, true, true, false, true, false, true, false, true});
+}
+
+TEST_CASE("idp: the hash an unknown user's password is checked against is read as one and costs a real one's hash")
+{
+    // A hash that did not parse would answer at once, and the time would say the user does not exist.
+    const auto began = std::chrono::steady_clock::now();
+    CHECK_FALSE(password_matches(socketley::idp::no_account_hash, "socketley-no-such-user"));
+    CHECK(std::chrono::steady_clock::now() - began > std::chrono::milliseconds(2));
+    CHECK_FALSE(password_matches("$scrypt$ln=14,r=8,p=1$x$y", "z"));
 }

@@ -1549,8 +1549,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
 void idp_run::check_password(const account* who, std::string_view password, std::function<void(bool)> then)
 {
     // An unknown user or one without a password costs a hash all the same, so the time says nothing about who exists.
-    static const std::string dummy = socketley::storage::password_hash("socketley-no-such-user");
-    const std::string hash(who && !who->field("password").empty() ? who->field("password") : std::string_view(dummy));
+    const std::string hash(who && !who->field("password").empty() ? who->field("password") : no_account_hash);
     const bool real = who && !who->field("password").empty();
     check_hash(hash, real, password, std::move(then));
 }
