@@ -50,6 +50,21 @@ workspace "Socketley"
         end
         return { "ssl", "crypto" }
     end
+    -- Archives built from other pins than bin/build-thirdparty.sh names are another library: one from before
+    -- enable-ktls builds a binary that never hands a key to the kernel, and says so nowhere.
+    if http3 then
+        local script = io.readfile("bin/build-thirdparty.sh") or ""
+        local want = {}
+        for _, pin in ipairs({ "OPENSSL_TAG", "OPENSSL_OPTIONS_TAG", "NGHTTP3_TAG", "NGTCP2_TAG" }) do
+            table.insert(want, script:match("\n" .. pin .. "=(%S+)") or "?")
+        end
+        want = table.concat(want, " ")
+        local built = (io.readfile("thirdparty/ngtcp2/.built") or ""):gsub("%s+$", "")
+        if built ~= want then
+            io.stderr:write("premake5: thirdparty/ was built from '" .. built .. "', bin/build-thirdparty.sh pins '"
+                .. want .. "': run bin/build-thirdparty.sh http3\n")
+        end
+    end
     if http3 then
         includedirs { "thirdparty/openssl/include", "thirdparty/ngtcp2/include", "thirdparty/nghttp3/include" }
         libdirs { "thirdparty/openssl/lib", "thirdparty/ngtcp2/lib", "thirdparty/nghttp3/lib" }
