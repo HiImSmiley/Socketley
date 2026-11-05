@@ -733,6 +733,14 @@ private:
     // bucket's last channel and not its first.
     std::vector<uint32_t> m_chan_buckets;
 
+    // DBSIZE, size, memory and maxmemory answered from what every shard published, with no crossing; false when the
+    // table cannot answer, and the command fans out as before.
+    bool answer_from_table(client_connection* conn, uint32_t h, bool bare, bool resp);
+    // This shard's key count and memory, published before anything it answered can leave, so a DBSIZE on a sibling
+    // sees a write whose reply the client already has.
+    void publish_keyspace();
+    uint64_t m_pub_keys{~uint64_t{0}};
+    uint64_t m_pub_memory{~uint64_t{0}};
     void fan_all_shards(client_connection* conn, uint32_t h,
                         std::string_view raw, bool resp);
 
@@ -989,7 +997,7 @@ private:
 
     // The handful of INFO fields a client or a monitor actually reads back,
     // and nothing invented to fill a section out.
-    void build_info_reply(std::string& out) const;
+    void build_info_reply(std::string& out, bool whole) const;
 
     bool mutation_log_wanted() const
     {

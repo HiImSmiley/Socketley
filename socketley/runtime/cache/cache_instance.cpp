@@ -1750,6 +1750,7 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 
 void cache_instance::on_loop_turn()
 {
+    publish_keyspace();
     if (SOCKETLEY_UNLIKELY(!m_lua_pub.empty()))
         flush_lua_publishes();
     // Readers an XADD has woken this turn, served now the commands are done.
@@ -4419,6 +4420,7 @@ void cache_instance::run_deferred(uint64_t ticket, std::string_view payload)
 void cache_instance::complete_ticket(uint64_t ticket, request_status st,
                                      std::string_view reply)
 {
+    publish_keyspace();
     if (auto* mgr = get_runtime_manager())
         mgr->requests().complete_deferred(ticket, st, reply);
 }
@@ -4787,6 +4789,7 @@ bool cache_instance::serve_shard_batch(std::string_view payload, std::string& ou
         run_local_raw(conn, one, resp, produced);
         shard_frame_append(out, produced);
     }
+    publish_keyspace();
 
     conn->response_buf.clear();
     return true;
@@ -5245,6 +5248,49 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
 
 // The same command to every shard, merged, with the local part executed in
 // place, so a four-shard `dbsize` is three crossings that a pipeline shares.
+bool cache_instance::answer_from_table(client_connection* conn, uint32_t h, bool bare, bool resp)
+{
+    const auto& tbl = shard_stats_table();
+    if (!bare || !tbl.mapped() || tbl.count() != m_shard_n)
+        return false;
+    uint64_t v = 0;
+    switch (h)
+    {
+        case fnv1a("dbsize"): case fnv1a("size"):
+            for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+                v += sh == m_shard_i ? m_store.size() : tbl.word_at(sh, 0);
+            break;
+        case fnv1a("memory"):
+            for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+                v += sh == m_shard_i ? m_store.get_memory_used() : tbl.word_at(sh, 1);
+            break;
+        case fnv1a("maxmemory"):
+            v = get_max_memory();
+            break;
+        default:
+            return false;
+    }
+    run_in_reply_order(conn, [&] {
+        if (resp)
+            resp::encode_integer_into(conn->response_buf, v);
+        else
+            append_int_nl(conn->response_buf, static_cast<int64_t>(v));
+    });
+    return true;
+}
+
+void cache_instance::publish_keyspace()
+{
+    if (m_shard_n <= 1)
+        return;
+    const uint64_t keys = m_store.size(), memory = m_store.get_memory_used();
+    if (keys == m_pub_keys && memory == m_pub_memory)
+        return;
+    m_pub_keys   = keys;
+    m_pub_memory = memory;
+    shard_stats_table().publish_words(keys, memory);
+}
+
 void cache_instance::fan_all_shards(client_connection* conn, uint32_t h,
                                     std::string_view raw, bool resp)
 {
@@ -5568,6 +5614,8 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 
         case cache_cmd_class::keyspace:
         {
+            if (answer_from_table(conn, h, parts.args.empty(), false))
+                return;
             if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
@@ -7898,7 +7946,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         case fnv1a("info"):
         {
             std::string info;
-            build_info_reply(info);
+            build_info_reply(info, !conn->cluster_port);
             rb.append(info);
             break;
         }
@@ -7923,6 +7971,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
 // difference is a closed connection rather than a hung one.
 bool cache_instance::flush_responses(client_connection* conn)
 {
+    publish_keyspace();
     if (SOCKETLEY_UNLIKELY(conn->response_buf.empty() || !m_loop || conn->closing))
     {
         if (!conn->response_buf.empty() && (conn->closing || !m_loop))
@@ -9007,6 +9056,8 @@ void cache_instance::process_resp_command(client_connection* conn,
 
         case cache_cmd_class::keyspace:
         {
+            if (answer_from_table(conn, h, argc == 1, true))
+                return;
             if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
@@ -11154,7 +11205,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("info"):
         {
             std::string info;
-            build_info_reply(info);
+            build_info_reply(info, !conn->cluster_port);
             resp::encode_bulk_into(rb, info);
             break;
         }
@@ -12204,18 +12255,30 @@ bool cache_instance::block_pop(client_connection* conn, std::string_view* args,
 
 // ─── INFO ───
 
-void cache_instance::build_info_reply(std::string& out) const
+void cache_instance::build_info_reply(std::string& out, bool whole) const
 {
+    // The runtime's figures on its shared port, from what every shard published, and this shard's on its own port,
+    // where a cluster client is asking one node.
+    const auto& tbl = shard_stats_table();
+    whole = whole && m_shard_n > 1 && tbl.mapped() && tbl.count() == m_shard_n;
+    uint64_t used = m_store.get_memory_used(), keys = m_store.size();
+    if (whole)
+        for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+            if (sh != m_shard_i)
+            {
+                keys += tbl.word_at(sh, 0);
+                used += tbl.word_at(sh, 1);
+            }
     out.reserve(512);
     out += "# Server\r\n";
     out += "redis_version:7.0.0\r\n";        // the dialect spoken, not our own
     out += "socketley_version:" SOCKETLEY_VERSION "\r\n";
     out += "tcp_port:" + std::to_string(get_port()) + "\r\n";
     out += "\r\n# Clients\r\n";
-    out += "connected_clients:" + std::to_string(m_clients.size()) + "\r\n";
+    out += "connected_clients:" + std::to_string(whole ? tbl.sum_active() : m_clients.size()) + "\r\n";
     out += "\r\n# Memory\r\n";
-    out += "used_memory:" + std::to_string(m_store.get_memory_used()) + "\r\n";
-    out += "maxmemory:" + std::to_string(m_store.get_max_memory()) + "\r\n";
+    out += "used_memory:" + std::to_string(used) + "\r\n";
+    out += "maxmemory:" + std::to_string(whole ? get_max_memory() : m_store.get_max_memory()) + "\r\n";
     out += "\r\n# Stats\r\n";
     out += "total_commands_processed:" + std::to_string(m_stat_commands) + "\r\n";
     out += "\r\n# Replication\r\n";
@@ -12257,11 +12320,10 @@ void cache_instance::build_info_reply(std::string& out) const
     out += "\r\n# Cluster\r\n";
     out += std::string("cluster_enabled:") + (m_cluster_forced ? "1" : "0") + "\r\n";
     out += "\r\n# Keyspace\r\n";
-    // This shard's slice, which is what a cluster client means when it asks a
-    // node, and what DBSIZE answers on a per-shard port for the same reason.
-    const uint32_t n = m_store.size();
-    if (n > 0)
-        out += "db0:keys=" + std::to_string(n) + ",expires=0,avg_ttl=0\r\n";
+    // This shard's slice on a per-shard port, which is what a cluster client means when it asks a node, and what
+    // DBSIZE answers there for the same reason.
+    if (keys > 0)
+        out += "db0:keys=" + std::to_string(keys) + ",expires=0,avg_ttl=0\r\n";
 }
 
 // ─── Pub/Sub publish ───

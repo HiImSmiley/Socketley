@@ -593,6 +593,7 @@ public:
     // in a worker whose daemon handed it a region and unmapped everywhere
     // else.
     shard_stats::shard_table& shard_stats_table() { return m_shard_stats; }
+    const shard_stats::shard_table& shard_stats_table() const { return m_shard_stats; }
 
     // And which connections each shard is holding, by name, unmapped for every
     // unsharded runtime and every runtime in the daemon.

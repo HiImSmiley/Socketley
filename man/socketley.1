@@ -7260,7 +7260,12 @@ That is what a cluster client means when it asks a node, and
 .B redis\-cli \-\-cluster call
 adds up the results itself.
 On the shared port these commands still fan out across every shard and merge
-the results, as they always have.
+the results, as they always have, except
+.BR DBSIZE ,
+which adds up the key count each shard publishes and crosses to none.
+A shard publishes its count before any reply it sends, so a
+.B DBSIZE
+already counts a write whose reply the client has.
 .B PUBLISH
 fans out on both kinds of port, because a subscriber on another shard is still
 a subscriber.
@@ -8400,11 +8405,14 @@ and a client need not handle it as one.
 Returns the fields a monitor reads.
 They are the version, connected clients, memory, commands processed, role,
 whether clustering is on, and the key count.
-On a sharded cache the key count is
-.I this shard's
-slice, for the same reason that
+On the shared port of a sharded cache the clients, memory and key count are the
+whole cache's, added up from what each shard publishes, and maxmemory is the
+value it was given.
+On a per-shard port they are
+.I that shard's
+slice and share, for the same reason that
 .B dbsize
-answers that way on a per-shard port.
+answers that way there.
 .IP
 The replication section differs by role, because half of its fields have no
 meaning on the other side.
