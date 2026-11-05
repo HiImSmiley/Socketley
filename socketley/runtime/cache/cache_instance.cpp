@@ -3710,16 +3710,12 @@ bool cache_instance::load_shard_set()
                   "hashes to it").c_str());
 
     for (const auto& f : set)
-    {
-        cache_store incoming;
-        if (!incoming.load(f.path, f.legacy ? 0 : shard_dump_header_size))
+        if (!m_store.load_owned(f.path, f.legacy ? 0 : shard_dump_header_size, m_shard_i, m_shard_n))
         {
             LOG_ERROR(("cache: " + f.path + " could not be read; refusing to start "
                        "on part of a dump").c_str());
             return false;
         }
-        m_store.adopt_owned(incoming, m_shard_i, m_shard_n);
-    }
     return true;
 }
 

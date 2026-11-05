@@ -147,6 +147,46 @@ else
         "sets in one place left behind by the shrink"
 fi
 
+# ── a reshard holds its own slice, not a whole dump ─────────────────────────
+#
+# Every shard reads every dump of the old set and keeps what hashes to it; it loaded each one whole into a store of its
+# own first, so four shards each held the whole 64 MB at once on top of their slice.  Now each keeps only its keys
+# as it reads, and the dump is held only as the page cache of its mapping.
+rm -f "$DUMP" "$DUMP".shard* 2>/dev/null
+if up 1; then
+    python3 - "$PORT" <<'PYW'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=30)
+v = b"x" * 4096
+s.sendall(b"".join(b"*3\r\n$3\r\nSET\r\n$%d\r\nbig%d\r\n$4096\r\n%s\r\n" % (len(b"big%d" % i), i, v) for i in range(16000)))
+got = b""
+while got.count(b"\r\n") < 16000:
+    got += s.recv(1 << 20)
+PYW
+    redis-cli -p "$PORT" SET ttlkey v EX 1000 >/dev/null 2>&1
+    down
+    DSIZE=$(stat -c %s "$DUMP" 2>/dev/null || echo 0)
+    if up 4; then
+        HWM=0
+        for p in $(ss -Hltnp "sport = :$PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+            h=$(awk '/^VmHWM/ {print $2 * 1024}' "/proc/$p/status" 2>/dev/null || echo 0)
+            [ "${h:-0}" -gt "$HWM" ] && HWM=$h
+        done
+        N=$(redis-cli -p "$PORT" DBSIZE 2>/dev/null); T=$(redis-cli -p "$PORT" TTL ttlkey 2>/dev/null)
+        down
+        [ "$N" = 16001 ] && [ "${T:-0}" -gt 900 ] && ok "1 -> 4 of 64 MB keeps every key and a deadline ($N keys, ttl $T)" \
+            || bad "1 -> 4 of 64 MB keeps every key and a deadline" "dbsize '$N', ttl '$T'"
+        [ "$DSIZE" -gt 60000000 ] && [ "$HWM" -lt $((DSIZE * 18 / 10)) ] \
+            && ok "and no shard held more than its slice beside the mapped dump (peak $HWM bytes, dump $DSIZE)" \
+            || bad "and no shard held more than its slice beside the mapped dump" \
+                   "a shard peaked at $HWM bytes over a dump of $DSIZE; each loaded the whole dump into a store of its own"
+    else
+        bad "1 -> 4 of 64 MB" "the 4-shard cache never came up"
+    fi
+else
+    bad "1 -> 4 of 64 MB" "the 1-shard cache never came up"
+fi
+
 # ── the two that must abort ────────────────────────────────────────────────
 serving() { redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG; }
 

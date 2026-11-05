@@ -3167,9 +3167,41 @@ void cache_store::flush_all()
     m_lru_map.clear();
 }
 
-bool cache_store::load_v2(const char* data, size_t size)
+bool cache_store::load_owned(std::string_view path, size_t offset, uint32_t shard_index, uint32_t shard_count)
 {
-    flush_all();
+    const int fd = open(std::string(path).c_str(), O_RDONLY | O_CLOEXEC);
+    struct stat st{};
+    void* map = MAP_FAILED;
+    size_t size = 0;
+    if (fd >= 0 && fstat(fd, &st) == 0 && static_cast<size_t>(st.st_size) >= offset + 4)
+    {
+        size = static_cast<size_t>(st.st_size);
+        map  = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    }
+    if (fd >= 0)
+        close(fd);
+    if (map != MAP_FAILED)
+    {
+        const char* data = static_cast<const char*>(map) + offset;
+        if (std::memcmp(data, MAGIC_V2, 4) == 0)
+        {
+            const bool ok = load_v2(data + 4, size - offset - 4, shard_index, shard_count);
+            munmap(map, size);
+            return ok;
+        }
+        munmap(map, size);
+    }
+    cache_store incoming;
+    if (!incoming.load(path, offset))
+        return false;
+    adopt_owned(incoming, shard_index, shard_count);
+    return true;
+}
+
+bool cache_store::load_v2(const char* data, size_t size, uint32_t owner_index, uint32_t owner_count)
+{
+    if (owner_count == 0)
+        flush_all();
 
     auto now = std::chrono::steady_clock::now();
     const int64_t wall_now_ms = socketley::wall::now_ms();
@@ -3208,14 +3240,18 @@ bool cache_store::load_v2(const char* data, size_t size)
         return true;
     };
 
+    // A key another shard owns is read past and kept nowhere, deadline included.
+    bool keep = true;
+
     // False on a short read, and `expired` set for a deadline already past, so
     // every type is dropped alike rather than restored with no deadline at all.
     auto read_expiry = [&](const std::string& key, bool& expired) -> bool {
         uint8_t has = 0;
         if (!read_u8(has)) return false;
-        if (has == 0) return true;
+        if (has == 0) { expired = !keep; return true; }
         int64_t v = 0;
         if (!read_i64(v)) return false;
+        if (!keep) { expired = true; return true; }
         const int64_t left = expiry_left_ms(has, v, wall_now_ms);
         if (left > 0) m_expiry[key] = now + std::chrono::milliseconds(left);
         else          expired = true;
@@ -3230,6 +3266,7 @@ bool cache_store::load_v2(const char* data, size_t size)
         // A dump cut inside a key's header is as short as one cut inside its value, and loads as nothing.
         std::string key;
         if (!read_string(key)) return false;
+        keep = owner_count == 0 || cache_shard_of(key, owner_count) == owner_index;
 
         bool expired = false;
 

@@ -6858,6 +6858,8 @@ So a cache dumped at four shards and started at eight is redistributed rather
 than loaded into the wrong slices.
 Every key survives; this was measured across 1\->4, 4\->1, 4\->8, 8\->4 and
 4\->4.
+Each shard reads every file of the old set and keeps the keys it now owns as it
+reads them, so a shard holds its own slice and never a whole old dump.
 .IP
 If the set of files cannot be trusted, the start is refused rather than serving
 part of the data.

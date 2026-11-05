@@ -594,6 +594,9 @@ public:
 
     bool save(std::string_view path, std::string_view prefix = {}) const;
     bool load(std::string_view path, size_t offset = 0);
+    // Adds the keys shard `shard_index` of `shard_count` owns out of a dump, read straight off the file so a reshard
+    // never holds a whole dump beside its own slice; what it cannot map is loaded whole and adopted, as before.
+    bool load_owned(std::string_view path, size_t offset, uint32_t shard_index, uint32_t shard_count);
 
     // --- Eviction / Memory ---
     void set_max_memory(size_t bytes);
@@ -670,7 +673,8 @@ private:
     bool has_type_conflict_for_stream(std::string_view key) const;
 
     bool save_v2(std::string_view path, std::string_view prefix) const;
-    bool load_v2(const char* data, size_t size);
+    // `owner_count` 0 replaces everything with the dump; otherwise it adds what shard `owner_index` owns.
+    bool load_v2(const char* data, size_t size, uint32_t owner_index = 0, uint32_t owner_count = 0);
     bool load_v2_stream(std::ifstream& file);  // legacy fallback
     bool load_v1(std::ifstream& file, uint32_t first_key_len);
 
