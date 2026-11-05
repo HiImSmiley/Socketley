@@ -73,6 +73,7 @@ ls.settimeout(0.3)
 sys.stderr.write("origin up\n"); sys.stderr.flush()
 
 BODY = b"LENGTH-FRAMED-BODY"
+said = threading.Lock()
 
 def serve(c):
     try:
@@ -82,6 +83,9 @@ def serve(c):
         parts = line.split(" ")
         method = parts[0] if parts else "GET"
         path = parts[1] if len(parts) > 1 else "/"
+        # When each call reached here: the calls run one after another, so the gap to the next is how long one took.
+        with said:
+            sys.stdout.write("REQ %s %s %.6f\n" % (method, path, time.monotonic())); sys.stdout.flush()
 
         if method == "HEAD":
             # A length with no body behind it, and the socket stays open: the
@@ -177,18 +181,17 @@ function on_start()
 end
 LUAEOF
 
-# Timed from outside: five calls that each waited out a 4s deadline would take
-# twenty seconds, and five that stop at their framing take almost none.  The
-# assertion is on the answers; this is what makes a regression legible.
-T0=$(mono_ns)
 "$BIN" create server clen_caller -p "$CALLER" --lua "$SOCKETLEY_TMPD/probe.lua" >/dev/null 2>&1
 "$BIN" start clen_caller >/dev/null 2>&1
 for i in $(seq 1 250); do
     grep -q "CLEN DONE" "$SOCKETLEY_DLOG" 2>/dev/null && break
     sleep 0.1
 done
-T1=$(mono_ns)
-ELAPSED_MS=$(( (T1 - T0) / 1000000 ))
+# Timed at the origin, from one request to the next, so the runtime's own start -- seconds under a sanitizer on a busy
+# box -- is not in it: a call that waited out its 4 s deadline took 4000 ms or more, one that stopped at its framing
+# almost none.  The assertions are on the answers; this is what makes a regression legible.
+CALL_MS=$(awk '$1=="REQ" {t[n++]=$4} END {for (i = 1; i < n && i <= 5; i++) printf "%d ", (t[i] - t[i-1]) * 1000}' \
+    "$SOCKETLEY_TMPD/origin.out")
 
 line_for() { grep -oE "CLEN $1 .*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1; }
 
@@ -196,7 +199,7 @@ L_LEN=$(line_for LEN); L_CHUNK=$(line_for CHUNK)
 L_NOLEN=$(line_for NOLEN); L_HEAD=$(line_for HEAD)
 L_TWOLEN=$(line_for TWOLEN); L_SHORT=$(line_for SHORT)
 
-echo "  ${ELAPSED_MS} ms for five calls with a 4000 ms deadline each"
+echo "  ${CALL_MS:-nothing}ms for five calls with a 4000 ms deadline each"
 for l in "$L_LEN" "$L_CHUNK" "$L_NOLEN" "$L_HEAD" "$L_TWOLEN" "$L_SHORT"; do echo "    ${l:-<nothing logged>}"; done
 
 if grep -q "CLEN DONE" "$SOCKETLEY_DLOG" 2>/dev/null; then ok
@@ -254,12 +257,12 @@ case "$L_SHORT" in
            "hands the script ten bytes with nothing to distinguish them from forty" ;;
 esac
 
-# One deadline's worth of slack: four calls that stopped at their framing plus
-# one that is meant to wait 1200 ms cannot have spent four deadlines.
-if [ "$ELAPSED_MS" -lt 8000 ]; then ok
+# Five gaps, each under the deadline it would have waited out.
+if [ "$(wc -w <<<"$CALL_MS")" = 5 ] && awk -v c="$CALL_MS" 'BEGIN {n = split(c, m, " "); for (i = 1; i <= n; i++)
+       if (m[i] >= 4000) exit 1}'; then ok
 else bad "the framed calls did not each wait out their deadline" \
-         "${ELAPSED_MS} ms for five calls of 4000 ms and one of 1200 ms" \
-         "at least two of them are waiting for a close that is not coming"; fi
+         "${CALL_MS:-no requests seen} ms for the five calls of 4000 ms (LEN CHUNK NOLEN SHORT HEAD)" \
+         "one at 4000 or more is waiting for a close that is not coming"; fi
 
 echo
 echo "  $PASS/$TOTAL passed"
