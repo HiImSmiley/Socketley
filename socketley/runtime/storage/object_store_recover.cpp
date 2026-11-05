@@ -701,7 +701,8 @@ bool object_store::open(std::string& err, recovery_report* report)
     m_totals.start_files_read = rep.files_read;
     if (report)
         *report = rep;
-    if (m_opts.sync == sync_mode::interval)
+    // One syncfs covers the filesystem every shard writes to, so shard 0 makes the rounds for all of them.
+    if (m_opts.sync == sync_mode::interval && m_opts.shard == 0)
         start_syncer();
     return true;
 }

@@ -14109,6 +14109,9 @@ The per\-write syncs are skipped, and a thread syncs the filesystem periodically
 The thread calls \fBsyncfs\fR every
 .B \-\-fsync\-interval
 (default 1 second).
+Under
+.B \-\-shards
+the thread runs in shard 0 alone, since one call covers the files of every shard.
 A crash of the machine loses at most the writes of the last interval.
 The same box handles about 18,000 puts a second, or about 9,600 into a versioned bucket.
 .TP
@@ -14160,7 +14163,8 @@ and the filesystem syncs of
 in
 .B syncfs_rounds
 and
-.BR syncfs_failed ;
+.B syncfs_failed
+(counted by shard 0);
 a stop after a failed round is not a clean one.
 .
 .SS Sharding

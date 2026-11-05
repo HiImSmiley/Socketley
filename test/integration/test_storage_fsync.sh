@@ -115,6 +115,19 @@ sleep 1
 check "and the next start reads no file" "$(stat_of fn start_files_read)" "0"
 check "and every put is there" "$(reads "$P3" neverb 30)" "30"
 
-for r in fa fi fn; do "$BIN" stop "$r" >/dev/null 2>&1; done
+# ── interval under --shards: one round a second for the filesystem, not one a shard ──
+P4=$((SL_PORT_BASE + 1874))
+"$BIN" create storage fs4 -p "$P4" --dir "$SOCKETLEY_TMPD/fs4" --anonymous --fsync interval --fsync-interval 1s \
+    --shards 4 -s >/dev/null 2>&1
+up "$P4" || bad "the sharded interval runtime serves" "no answer on $P4"
+sleep 3.5
+# Every shard's rounds, read off its own [shard i] section.
+rounds() { "$BIN" stats fs4 2>/dev/null | awk -F: '/^\[shard / { s = $0; gsub(/[^0-9]/, "", s) } $1 == "syncfs_rounds" { printf "s%s=%s ", s, $2 }'; }
+for _ in $(seq 1 50); do r4=$(rounds); [[ "$r4" == *"s0="[2-9]* ]] && break; sleep 0.1; done
+[[ "$r4" == *"s0="[2-9]* ]] && ok || bad "shard 0 syncs the filesystem every second" "$r4"
+others=$(echo "$r4" | tr ' ' '\n' | grep -v '^s0=' | grep -c '=[1-9]')
+check "and no other shard syncs it again ($r4)" "$others" "0"
+
+for r in fa fi fn fs4; do "$BIN" stop "$r" >/dev/null 2>&1; done
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }
