@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# suite: isolated -- its own daemon, socket and port window, so it runs beside the others
+# suite: quiet -- the worst PING of 75 s, which a busy box's scheduler sets as surely as the loop does
 # Integration test: a worker hands the heap a burst freed back to the kernel once it has lain idle a while.
 #
 # What each part would catch:
