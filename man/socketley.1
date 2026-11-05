@@ -15754,6 +15754,13 @@ cores than on one shard, since each write that reaches another shard is handed
 on to shard 0, and its answer is handed back. A database that is mostly written
 is served best by one shard.
 .PP
+Every request a reading shard takes reads the log on first. A shard that holds a
+stream is also told by shard 0 of each change that reaches the disk, so the
+stream hears of it before the next request.
+.B stats
+counts these messages in shard 0's
+.BR nudges .
+.PP
 .B Changes, as they happen.
 .BI GET " /c/" collection /_feed
 is a stream of Server-Sent Events, which a browser reads with
@@ -15881,7 +15888,14 @@ The memory that holds the documents last read. Default: 64M. The rest are read
 from the disk. With
 .BR \-\-shards ,
 it is the runtime's: each shard caches its share, the size divided by the shard
-count.
+count, and at least 1 MiB.
+.B stats
+shows each shard's share as
+.BR cache_limit ,
+and how often a document was found there and not as
+.B cache_hits
+and
+.BR cache_misses .
 .TP
 .BI "\-\-replicate " url
 The http or https address of the database this one copies, as its entrance
@@ -17745,7 +17759,17 @@ what was greylisted;
 .IP \(bu 2
 the reports sent;
 .IP \(bu 2
-the IMAP connections and reads.
+the IMAP connections and reads;
+.IP \(bu 2
+for each shard, the users whose index it holds
+.RB ( imap_users_held ),
+its appends to the users' journals
+.RB ( imap_journal_writes ),
+its listings of a folder in the bucket
+.RB ( imap_listings ),
+and the folds of a journal into its snapshot it began and those that another
+shard's fold came before
+.RB ( imap_folds ", " imap_folds_lost ).
 .SH TUNNEL FLAGS
 A
 .B tunnel
