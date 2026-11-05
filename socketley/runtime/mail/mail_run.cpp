@@ -2958,6 +2958,12 @@ void mail_run::refresh_domains()
 {
     if (m_owner.get_dns().empty() || !m_owner.get_mail_domains().empty())
         return;
+    // Read again only once the file changed, as the address lists are.
+    static const std::string zones = dns_feed::zones_path();
+    const auto stamp = socketley::file_stamp::of(zones);
+    if (m_zones_stamp && *m_zones_stamp == stamp)
+        return;
+    m_zones_stamp = stamp;
     std::vector<std::string> now;
     for (auto& [rt, origin] : dns_feed::read_zones())
         if (rt == m_owner.get_dns())

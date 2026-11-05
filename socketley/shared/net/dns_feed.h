@@ -50,8 +50,9 @@ std::string routes_path(std::string_view entrance);
 bool write_records(std::string_view runtime, std::string_view text);
 // The zones of every dns runtime, "<runtime> <origin>" a line, rewritten only when they change.
 bool write_zones(std::string_view text);
-// Those zones read back, each runtime's origins in the order written.
+// Those zones read back, each runtime's origins in the order written, and the file they are in.
 std::vector<std::pair<std::string, std::string>> read_zones();
+std::string zones_path();
 
 struct snapshot
 {

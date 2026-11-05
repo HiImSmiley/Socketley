@@ -381,6 +381,8 @@ private:
     socketley::watched<alias_table> m_aliases;
     std::string m_hostname;
     std::vector<std::string> m_domains;
+    // The zones file as it was when the domains were last read from it.
+    std::optional<socketley::file_stamp> m_zones_stamp;
     // --arc-trust, split.
     std::vector<std::string> m_arc_trusted;
     std::string m_state_dir;
