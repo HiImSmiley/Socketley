@@ -723,8 +723,13 @@ def shard(M):
     out = subprocess.run(["ss", "-tnpH", "sport = :%d and dport = :%d" % (port, lport)], capture_output=True).stdout.decode()
     m = re.search(r"pid=(\d+)", out)
     return m.group(1) if m else None
-for _ in range(6):
-    M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); M.select("INBOX"); M.logout()
+# Until every shard has served alice once, since a shard that never held her cannot tell what is new to it.
+warm = set()
+for _ in range(60):
+    M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); warm.add(shard(M)); M.select("INBOX")
+    M.logout()
+    if len(warm) == 3:
+        break
 time.sleep(3)
 gone = held()
 before = None
@@ -732,7 +737,9 @@ s = smtplib.SMTP("127.0.0.1", smtp); s.ehlo("x")
 s.sendmail("ivy@else.test", ["alice@example.test"], "From: ivy@else.test\r\nSubject: meanwhile\r\n\r\nb\r\n"); s.quit()
 time.sleep(2)
 seen, recent, found = set(), [], []
-for _ in range(12):
+for _ in range(60):
+    if len(seen) == 3:
+        break
     M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1")
     who = shard(M)
     M.select("INBOX")
@@ -750,6 +757,58 @@ set -- $r
 check "a shard other than the first lets go of a user nothing there asked for" "${1:-}${2:-}" "[0,0]"
 check "and what was delivered meanwhile is in its folder on every shard" "${3:-}${4:-}" "{1}3"
 check "and new to the first session to see it on each shard" "${5:-}" "True"
+# What was delivered while a shard had let the user go stays new to it when a fold put it into the snapshot before the
+# shard reads the user again: a delivery, then changes on the first shard until the journal is another file.  Each
+# shard's first session EXAMINEs the folder, which takes \Recent from nothing, and asks whether that message has it: the
+# bucket the runtime shares with the one above may bring other messages in meanwhile.
+r=$(timeout 300 python3 - "$IMSH" "$PSH" "$BIN" "$idx.log" "$T" <<'PY'
+import imaplib, os, re, smtplib, subprocess, sys, time
+port, smtp, binary, log = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+sys.path.insert(0, sys.argv[5]); from first_shard import first_shard
+def held():
+    out = subprocess.run([binary, "stats", "msh"], capture_output=True, timeout=30).stdout.decode()
+    return sorted(int(l.split(":")[1]) for l in out.splitlines() if l.startswith("imap_users_held:"))
+def shard(M):
+    lport = M.sock.getsockname()[1]
+    out = subprocess.run(["ss", "-tnpH", "sport = :%d and dport = :%d" % (port, lport)], capture_output=True).stdout.decode()
+    m = re.search(r"pid=(\d+)", out)
+    return m.group(1) if m else None
+time.sleep(3)
+gone = held()
+s = smtplib.SMTP("127.0.0.1", smtp); s.ehlo("x")
+s.sendmail("ivy@else.test", ["alice@example.test"], "From: ivy@else.test\r\nSubject: folded\r\n\r\nb\r\n"); s.quit()
+M = first_shard(port, smtp); M.login("alice", "alicepassword1"); M.select("Shared")
+journal = os.stat(log).st_ino
+folded = False
+for i in range(2000):
+    if i % 10 == 0 and os.stat(log).st_ino != journal:
+        folded = True
+        break
+    M.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Seen)")
+for _ in range(200):
+    if folded or os.stat(log).st_ino != journal:
+        folded = True
+        break
+    M.noop(); time.sleep(0.1)
+M.logout()
+seen, recent = set(), []
+for _ in range(60):
+    if len(seen) == 3:
+        break
+    M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1")
+    who = shard(M)
+    M.select("INBOX", readonly=True)
+    if who not in seen:
+        seen.add(who)
+        typ, data = M.search(None, "RECENT", "SUBJECT", "folded")
+        recent.append(len(data[0].split()))
+    M.logout()
+print("".join(map(str, gone[:2])), folded, len(seen), recent.count(1) == len(seen))
+PY
+)
+set -- $r
+check "a delivery, then a fold before the shards that let the user go read it again" "${1:-}${2:-}${3:-}" "00True3"
+check "and it is new to the first session to see it on each shard" "${4:-}" "True"
 
 # A literal's marker glued to an atom is no literal, so the bytes after it are never taken as one; a length that wraps
 # past the end of what came is refused before sign-in, and the connection answers on.

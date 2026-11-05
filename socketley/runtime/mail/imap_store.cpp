@@ -624,7 +624,7 @@ imap_store::user_state& imap_store::user(const std::string& name)
         u.base = path_of(name);
         if (const auto g = m_let_go.find(name); g != m_let_go.end())
         {
-            reload(u, g->second.ino, g->second.off);
+            reload(u, &g->second);
             m_let_go.erase(g);
         }
         else
@@ -897,7 +897,22 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
     sweep();
 }
 
-void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
+imap_store::seen_marks imap_store::marks_of(const std::map<std::string, std::shared_ptr<imap_folder>>& folders)
+{
+    seen_marks out;
+    out.reserve(folders.size());
+    for (const auto& [n, f] : folders)
+    {
+        // By UID ascending, and a session takes \Recent from every message past those it was told of, so what is
+        // still \Recent here is the folder's last messages.
+        const auto it = std::find_if(f->msgs.begin(), f->msgs.end(), [](const imap_message& m) { return m.recent; });
+        out.emplace_back(f->uidvalidity, it == f->msgs.end() ? f->uidnext : it->uid);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+void imap_store::reload(user_state& u, const seen_marks* seen)
 {
     // Read under the user's lock, shared, so a compaction is not caught between its snapshot and its journal, and
     // parsed after it is let go, so no shard's writer waits on the parse.
@@ -1004,11 +1019,7 @@ void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
             std::strtoull(std::string(head.substr(11)).c_str(), nullptr, 10) == u.snapshot_gen)
         {
             const size_t from = head.size() + 1;
-            const size_t to = std::max(from, whole);
-            // Past where a shard that let the user go had read the same journal, the lines are new to it.
-            const size_t old = fresh_ino == st.st_ino ? std::clamp<size_t>(fresh, from, to) : to;
-            apply(u, std::string_view(log).substr(from, old - from), false);
-            apply(u, std::string_view(log).substr(old, to - old), true);
+            apply(u, std::string_view(log).substr(from, std::max(from, whole) - from), false);
         }
         u.log_off = whole;
     }
@@ -1019,11 +1030,25 @@ void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
         for (const auto& m : f->msgs)
             u.used += m.size;
     }
+    // What this shard had not seen is \Recent, by UID rather than by where it had read the journal to, since a fold
+    // may have put what came meanwhile into the snapshot.
+    const seen_marks held = before.empty() ? seen_marks{} : marks_of(before);
+    if (!before.empty())
+        seen = &held;
+    if (seen)
+        for (auto& [n, f] : u.folders)
+        {
+            const auto it = std::lower_bound(seen->begin(), seen->end(), std::make_pair(f->uidvalidity, uint32_t{0}));
+            const uint32_t from = it != seen->end() && it->first == f->uidvalidity ? it->second : 0;
+            for (auto& m : f->msgs)
+                m.recent = m.uid >= from;
+        }
     // The folder objects sessions hold are kept, their contents those just read.
     for (auto& [n, f] : u.folders)
         if (const auto it = before.find(n); it != before.end())
         {
             imap_folder& old = *it->second;
+            const bool same = old.uidvalidity == f->uidvalidity;
             old.uidvalidity = f->uidvalidity;
             old.uidnext = f->uidnext;
             old.subscribed = f->subscribed;
@@ -1034,7 +1059,7 @@ void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
             old.objectid = std::move(f->objectid);
             old.synced_ms = std::max(old.synced_ms, f->synced_ms);
             for (auto& m : f->msgs)
-                if (const imap_message* was = old.by_uid(m.uid))
+                if (const imap_message* was = same ? old.by_uid(m.uid) : nullptr)
                     m.recent = was->recent;
             old.msgs = std::move(f->msgs);
             ++old.version;
@@ -1464,7 +1489,7 @@ void imap_store::tick(int64_t)
             u.log_fd.reset();
             if (u.loaded && now - u.used_ms > let_go_ms && m_run.owner().get_shard_index() != 0 && unused(u))
             {
-                m_let_go[name] = {u.log_ino, u.log_off};
+                m_let_go[name] = marks_of(u.folders);
                 m_filter_bytes -= u.filters_bytes;
                 it = m_users.erase(it);
             }

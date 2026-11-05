@@ -325,13 +325,12 @@ private:
         int64_t used_ms{0};
         int64_t caught_ms{0};
     };
-    // Where the journal of a user let go by this shard was read to, so what came after is \Recent once it is back.
-    struct let_go
-    {
-        uint64_t ino{0};
-        uint64_t off{0};
-    };
-    std::unordered_map<std::string, let_go> m_let_go;
+    // What a shard had seen of a folder, by its UIDVALIDITY: the lowest UID still \Recent there, else its UIDNEXT, so a
+    // message from there on is new to the shard however it was read again, a fold of the journal between or not.
+    using seen_marks = std::vector<std::pair<uint32_t, uint32_t>>;
+    static seen_marks marks_of(const std::map<std::string, std::shared_ptr<imap_folder>>& folders);
+    // Those of each user this shard let go, so what came meanwhile is \Recent once it is back.
+    std::unordered_map<std::string, seen_marks> m_let_go;
     uint64_t m_folds{0};
     uint64_t m_folds_lost{0};
     uint64_t m_journal_writes{0};
@@ -353,9 +352,10 @@ private:
     // A runtime-wide list of keys, each on or off by its last line, folded past a mebibyte.
     void note_line(const std::string& path, const std::string& key, bool on);
     std::vector<std::string> live_lines(const std::string& path);
-    // The snapshot and the whole journal read, everything known before forgotten; the journal's lines past `fresh` of
-    // the inode `fresh_ino` add messages that are \Recent.
-    void reload(user_state& u, uint64_t fresh_ino = 0, uint64_t fresh = 0);
+    // The snapshot and the whole journal read, everything known before forgotten but what this shard had seen: a
+    // message past the marks of the folders it held, or those `seen` gives where it held none, and every message of a
+    // folder it did not know, is \Recent; where it knows nothing at all, none is.
+    void reload(user_state& u, const seen_marks* seen = nullptr);
     // The journal's lines from `text`, applied; `fresh` says a message they add is \Recent.
     void apply(user_state& u, std::string_view text, bool fresh);
     // `change` made to `u` under the user's lock, the index read to its end first; it appends the lines it logs.
