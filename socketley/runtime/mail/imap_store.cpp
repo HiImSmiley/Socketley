@@ -990,6 +990,9 @@ void imap_store::reload(user_state& u, uint64_t fresh_ino, uint64_t fresh)
     }
     u.log_ino = 0;
     u.log_off = 0;
+    // Where a fold that lost to new lines waits to is a length of the journal read before, which may be another file.
+    u.compact_after = 0;
+    u.compact_quiet = UINT64_MAX;
     if (log_read)
     {
         u.log_ino = st.st_ino;
@@ -1276,10 +1279,7 @@ void imap_store::compact(const std::string& name, user_state& u)
             // The new journal is another file, which the next refresh reads from its start; a fold that lost to new
             // lines is tried again once they stop or the journal grew by a quarter, one that failed only on the latter.
             if (*done == 1)
-            {
-                us.compact_quiet = UINT64_MAX;
                 reload(us);
-            }
             else
             {
                 catch_up(us);

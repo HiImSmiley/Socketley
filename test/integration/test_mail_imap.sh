@@ -571,11 +571,30 @@ except Exception as e:
 PY
 )
 check "FETCH 1:*, FETCH * and STORE 1:* of an empty folder answer OK" "$r" "OK OK OK OK"
-# Thousands of changes outgrow the journal, which is folded into a snapshot; every shard reads on from it.
-r=$(timeout 180 python3 - "$IMSH" <<'PY'
+# Thousands of changes outgrow the journal, which is folded into a snapshot; every shard reads on from it.  The changes
+# are made on the first shard, the one that takes mail and never lets a user go, so the next part finds what this fold
+# left there.
+cat > "$T/first_shard.py" <<'PY'
+import imaplib, re, subprocess
+def first_shard(port, smtp):
+    """A session on the first shard, the one listening for SMTP, not yet signed in."""
+    def pid(q):
+        m = re.search(r"pid=(\d+)", subprocess.run(["ss", "-tnpH" if "dport" in q else "-ltnpH", q],
+                                                  capture_output=True).stdout.decode())
+        return m.group(1) if m else None
+    first = pid("sport = :%d" % smtp)
+    for _ in range(200):
+        M = imaplib.IMAP4("127.0.0.1", port)
+        if pid("sport = :%d and dport = :%d" % (port, M.sock.getsockname()[1])) == first:
+            return M
+        M.shutdown()
+    raise SystemExit("no session reached the first shard")
+PY
+r=$(timeout 180 python3 - "$IMSH" "$PSH" "$T" <<'PY'
 import imaplib, sys, time
 port = int(sys.argv[1])
-M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); M.select("Shared")
+sys.path.insert(0, sys.argv[3]); from first_shard import first_shard
+M = first_shard(port, int(sys.argv[2])); M.login("alice", "alicepassword1"); M.select("Shared")
 for i in range(400):
     M.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Seen)")
 M.uid("STORE", "1:*", "+FLAGS.SILENT", "(\\Answered)")
@@ -594,20 +613,29 @@ idx=$(find "$HOME/.local/share" -path '*/mail/msh.imap/alice' 2>/dev/null | head
     || bad "a journal past a quarter of a mebibyte is folded into its snapshot" "$(head -c 20 "$idx" 2>/dev/null) $(stat -c %s "$idx.log" 2>/dev/null)"
 check "and every shard reads the same flags after" "$r" "1 True"
 # A change after a fold goes into the journal that took its place, not the one the shard had open before it: a session
-# keeps its shard using the user until another fold is done, then changes every message.
-r=$(timeout 180 python3 - "$IMSH" "$idx.log" <<'PY'
-import imaplib, os, sys, time
+# keeps its shard using the user until another fold is done, then changes every message.  It is the first shard again,
+# whose last fold moved in after it had lost some to new lines: it folds this journal too, once it is past its bound.
+# The fold is told by the journal being another file, as it may come before the last change is answered.
+r=$(timeout 180 python3 - "$IMSH" "$idx.log" "$PSH" "$T" "$BIN" <<'PY'
+import imaplib, os, subprocess, sys, time
 port, log = int(sys.argv[1]), sys.argv[2]
-M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); M.select("Shared")
+sys.path.insert(0, sys.argv[4]); from first_shard import first_shard
+# The first shard alone holds alice, so no shard that read her afresh since makes this fold in its place.
+for _ in range(100):
+    out = subprocess.run([sys.argv[5], "stats", "msh"], capture_output=True, timeout=30).stdout.decode()
+    if sorted(int(l.split(":")[1]) for l in out.splitlines() if l.startswith("imap_users_held:"))[:2] == [0, 0]:
+        break
+    time.sleep(0.2)
+M = first_shard(port, int(sys.argv[3])); M.login("alice", "alicepassword1"); M.select("Shared")
+journal = os.stat(log).st_ino
 for i in range(400):
     M.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Seen)")
-grown = os.stat(log).st_size
 folded = False
-for _ in range(100):
-    M.noop(); time.sleep(0.1)
-    if os.stat(log).st_size < grown:
+for _ in range(200):
+    if os.stat(log).st_ino != journal:
         folded = True
         break
+    M.noop(); time.sleep(0.1)
 M.uid("STORE", "1:*", "+FLAGS.SILENT", "(\\Flagged)")
 time.sleep(1.5)
 flagged = set()
