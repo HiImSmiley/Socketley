@@ -899,10 +899,10 @@ void broker::room()
     }
 }
 
+// Its retained value is not kept here: the stamped `retained` frame brings that, so a late delivery cannot write
+// over a newer value, nor keep one the publisher's own shard refused.
 void broker::deliver_remote(const message_ptr& m, const std::vector<std::string>& groups)
 {
-    if (m->retain)
-        store_retained(m, false);
     route(m, false, &groups);
 }
 
