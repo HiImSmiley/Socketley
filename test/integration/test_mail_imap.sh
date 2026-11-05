@@ -742,13 +742,17 @@ for _ in range(60):
         break
     M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1")
     who = shard(M)
-    M.select("INBOX")
-    r = int(M.response("RECENT")[1][0] or 0)
-    typ, data = M.search(None, "SUBJECT", "meanwhile")
-    found.append(len(data[0].split()))
+    # The first session on a shard EXAMINEs, which takes \Recent from nothing, to ask whether that message has it, as
+    # the bucket the runtime shares with the one above may bring others in meanwhile; then it SELECTs as a client does.
     if who not in seen:
         seen.add(who)
-        recent.append(r)
+        M.select("INBOX", readonly=True)
+        typ, data = M.search(None, "RECENT", "SUBJECT", "meanwhile")
+        recent.append(len(data[0].split()))
+        M.close()
+    M.select("INBOX")
+    typ, data = M.search(None, "SUBJECT", "meanwhile")
+    found.append(len(data[0].split()))
     M.logout()
 print(gone[:2], set(found), len(seen), recent.count(1) == len(seen))
 PY
