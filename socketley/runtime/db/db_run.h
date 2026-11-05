@@ -193,6 +193,8 @@ private:
     void publish_log();
     // How many streams this reading shard holds, said in its slot for shard 0 when it changes.
     void tell_feeds();
+    // The channel address of shard `shard` of this runtime.
+    const std::string& target_of(uint32_t shard);
     void nudge(uint32_t shard);
     void catch_up();
     void try_follow();
@@ -236,6 +238,7 @@ private:
     // channel until answered, and one per sync filled the table the reading shards' writes are parked in.
     std::vector<uint8_t> m_nudge_flying, m_nudge_owed;
     std::vector<std::chrono::steady_clock::time_point> m_nudge_sent;
+    std::vector<std::string> m_targets;
     // The buffer the last answer's body was built in, kept for the next.
     std::string m_spare;
 

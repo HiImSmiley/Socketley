@@ -1863,6 +1863,15 @@ void db_run::publish_log()
             nudge(j);
 }
 
+const std::string& db_run::target_of(uint32_t shard)
+{
+    // The name does not change while the runtime runs, so each shard's address is made once.
+    if (m_targets.size() < m_shards)
+        for (uint32_t j = static_cast<uint32_t>(m_targets.size()); j < m_shards; ++j)
+            m_targets.push_back(shard_target(m_owner.get_name(), j));
+    return m_targets[shard];
+}
+
 void db_run::tell_feeds()
 {
     if (m_shards <= 1 || !m_reader || m_feeds.size() == m_told_feeds)
@@ -1892,8 +1901,8 @@ void db_run::nudge(uint32_t j)
         return;
     }
     auto* mgr = m_owner.get_runtime_manager();
-    const bool sent = mgr && mgr->requests().post(this, nudge_cookie | j, shard_target(m_owner.get_name(), j),
-                                                  nudge_marker, request_class::background);
+    const bool sent = mgr && mgr->requests().post(this, nudge_cookie | j, target_of(j), nudge_marker,
+                                                  request_class::background);
     m_nudge_flying[j] = sent;
     m_nudge_owed[j] = !sent;
     m_nudge_sent[j] = now;
@@ -1980,7 +1989,8 @@ bool db_run::cross(uint32_t shard, const crossing& what, crossed then)
         return false;
     const uint64_t cookie = m_next_cookie++;
     m_crossed.emplace(cookie, std::move(then));
-    if (!mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), shard), encode_crossing(what)))
+    // The write's body copied once, into the call the channel then keeps.
+    if (!mgr->requests().post_owned(this, cookie, target_of(shard), encode_crossing(what)))
     {
         m_crossed.erase(cookie);
         return false;
