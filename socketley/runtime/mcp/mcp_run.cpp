@@ -154,6 +154,11 @@ void mcp_run::accepted(const std::shared_ptr<socketley::http::server_conn>&)
 
 bool mcp_run::reload_keys(std::string& why)
 {
+    // Looked at once a second, as the idp's sign-ins are, rather than with a stat at every request.
+    const int64_t now = wall::now_sec_coarse();
+    if (now == m_keys_checked)
+        return true;
+    m_keys_checked = now;
     const std::string path(m_owner.get_keys_path());
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0)

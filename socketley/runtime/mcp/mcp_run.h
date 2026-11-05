@@ -81,6 +81,7 @@ private:
     std::string m_metadata_url;
     std::string m_metadata_path;
     int64_t m_keys_mtime{-1};
+    int64_t m_keys_checked{-1};
     std::string m_keys_error;
     std::vector<std::string> m_origins;
     bool m_any_origin{false};

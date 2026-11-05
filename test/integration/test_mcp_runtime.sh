@@ -52,9 +52,9 @@ daemon_start "$BIN"
     --instructions "Ask about the shop." -s >/dev/null 2>&1
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$P/mcp")" != 000 ] && break; sleep 0.1; done
 
-out=$(timeout 120 python3 - "$P" "$BIN" <<'PY'
+out=$(timeout 120 python3 - "$P" "$BIN" "$T/keys" <<'PY'
 import json, subprocess, sys, urllib.request, urllib.error
-port, binp = int(sys.argv[1]), sys.argv[2]
+port, binp, keys_path = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 URL = "http://127.0.0.1:%d/mcp" % port
 OPS, ROOT = "opssecretopssecret01", "rootsecretrootsecret1"
 META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
@@ -155,6 +155,21 @@ st, _, d = post("tools/call", {"name": "add", "arguments": {"a": 1, "b": 1}}, ve
 check("and it calls a tool without the 2026 headers", d["result"]["structuredContent"]["sum"] == 2, d)
 st, _, d = post("tools/list", version="2099-01-01")
 check("a revision neither has is named as unsupported", st == 400 and d["error"]["code"] == -32022, d)
+
+# The keys file is looked at once a second rather than at every request, so an edit is in force within about one.
+original = open(keys_path).read()
+def within(secs, key, want):
+    end = time.time() + secs
+    while True:
+        st, _, _ = post("tools/list", key=key)
+        if st == want or time.time() > end: return st
+        time.sleep(0.1)
+open(keys_path, "w").write(original + "late  latesecretlatesecret1\n")
+check("a key added to the file is taken within two seconds", within(2.5, "latesecretlatesecret1", 200) == 200)
+open(keys_path, "w").write(original.replace("ops   opssecretopssecret01\n", ""))
+check("and one taken out is refused within two seconds", within(2.5, OPS, 401) == 401)
+open(keys_path, "w").write(original)
+check("and put back is taken again", within(2.5, OPS, 200) == 200)
 
 for what, good, got in rows:
     print(("OK " if good else "BAD ") + what + ("" if good else " :: " + got))
