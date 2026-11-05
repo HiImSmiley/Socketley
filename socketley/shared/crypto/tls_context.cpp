@@ -1542,7 +1542,12 @@ const char* tls_context::server_name(const SSL* ssl)
 void tls_context::free_ssl(SSL* ssl)
 {
 #if SOCKETLEY_HAS_TLS
-    if (ssl)
-        SSL_free(ssl);
+    if (!ssl)
+        return;
+    // SSL_free() takes a session out of the server's cache unless a shutdown was sent, and no connection here sends
+    // one, so a returning client never resumed; one that ended on an alert was taken out when the alert went.
+    if (SSL_is_init_finished(ssl))
+        SSL_set_shutdown(ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+    SSL_free(ssl);
 #endif
 }

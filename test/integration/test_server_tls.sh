@@ -371,6 +371,25 @@ assert_eq "$CONNS" "0" "aborted handshakes leave no connections behind"
 assert_ok "$(rc_of ready_tls 127.0.0.1 "$SRV_PORT" "$CERTS/server.pem" localhost 15)" \
     "listener still completes a handshake after the aborts"
 
+# A client that comes back resumes from the listener's session cache.  SSL_free() took every session out of it,
+# since no connection sent a shutdown, so each return was a full handshake.
+RESUMED=$(python3 - "$SRV_PORT" "$CERTS/server.pem" <<'PYEOF' 2>&1 || true
+import socket, ssl, sys
+port, cafile = int(sys.argv[1]), sys.argv[2]
+ctx = ssl.create_default_context(cafile=cafile)
+ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+sess, reused = None, 0
+for i in range(6):
+    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=5),
+                        server_hostname="localhost", session=sess)
+    reused += 1 if s.session_reused else 0
+    sess = s.session
+    s.close()
+print(reused)
+PYEOF
+)
+assert_eq "$RESUMED" "5" "a client that reconnects five times resumes its session each time"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Mutual TLS
 # ─────────────────────────────────────────────────────────────────────────────
