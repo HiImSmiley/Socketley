@@ -28,7 +28,7 @@ bool decode_call(std::string_view in, shard_call& out)
     uint8_t op = 0;
     uint64_t at = 0;
     uint32_t n = 0;
-    if (!r.marker(cross_marker) || !r.u8(op) || op < shard_call::redeem || op > shard_call::let_go || !r.bytes(out.key, 256) || !r.u64(at) ||
+    if (!r.marker(cross_marker) || !r.u8(op) || op < shard_call::redeem || op > shard_call::pending_take || !r.bytes(out.key, 256) || !r.u64(at) ||
         !r.u32(n) || n > account_store::max_fields)
         return false;
     out.op = static_cast<shard_call::op_t>(op);

@@ -109,6 +109,7 @@ private:
                       int status);
     void account_post(const std::shared_ptr<conn>& c, const request& rq);
     void password_post(const std::shared_ptr<conn>& c, const request& rq);
+    void password_form(const std::shared_ptr<conn>& c, const request& rq, params p);
 
     // The device grant (RFC 8628): a client asks for a pair of codes, a person allows the user code on /device, and
     // the client polls the token endpoint with the device code until that person has.
@@ -201,6 +202,11 @@ private:
         int misses{0};
     };
     std::unordered_map<std::string, pending_sign_in> m_pending;
+    std::string pending_token() const;
+    bool take_pending(const std::shared_ptr<conn>& c, const request& rq, params& p, std::string_view field,
+                      void (idp_run::*step)(const std::shared_ptr<conn>&, const request&, params));
+    static std::string encode_pending(const pending_sign_in* e);
+    static bool decode_pending(std::string_view in, bool& found, pending_sign_in& out);
     // A secret an account is enrolling, until a code of it proves the app has it.
     std::unordered_map<std::string, std::pair<std::string, int64_t>> m_enrolling;
     void code_page(const std::shared_ptr<conn>& c, const std::string& pending, std::string_view error, int status);

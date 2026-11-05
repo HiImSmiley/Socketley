@@ -1,4 +1,5 @@
 #include "idp_run.h"
+#include "../../shared/util/byte_codec.h"
 #include "../../shared/loop/turn_clock.h"
 #include "idp_totp.h"
 #include "../../shared/util/qr_code.h"
@@ -1205,8 +1206,97 @@ void idp_run::check_code(const account& a, std::string_view code, std::function<
                    [then = std::move(then)](bool ok, const std::string&) { then(ok); });
 }
 
+// A waiting sign-in is named by the shard that keeps it, as a code is, so its next step can find it from any shard.
+std::string idp_run::pending_token() const
+{
+    const std::string hex = socketley::random_hex(24);
+    return m_shards > 1 && !hex.empty() ? std::to_string(m_shard) + "." + hex : hex;
+}
+
+std::string idp_run::encode_pending(const pending_sign_in* e)
+{
+    socketley::bytes::writer w;
+    w.flag(e);
+    if (e)
+    {
+        w.bytes(e->id);
+        w.flag(e->remember);
+        w.flag(e->reset);
+        w.u32(static_cast<uint32_t>(e->misses));
+        w.u64(static_cast<uint64_t>(e->until_s));
+        w.u32(static_cast<uint32_t>(e->p.size()));
+        for (const auto& [k, v] : e->p)
+        {
+            w.bytes(k);
+            w.bytes(v);
+        }
+    }
+    return w.take();
+}
+
+bool idp_run::decode_pending(std::string_view in, bool& found, pending_sign_in& out)
+{
+    socketley::bytes::reader r(in);
+    if (!r.flag(found))
+        return false;
+    if (!found)
+        return true;
+    uint32_t misses = 0, n = 0;
+    uint64_t until = 0;
+    if (!r.bytes(out.id, 256) || !r.flag(out.remember) || !r.flag(out.reset) || !r.u32(misses) || !r.u64(until) ||
+        !r.u32(n) || n > 64)
+        return false;
+    out.misses = static_cast<int>(misses);
+    out.until_s = static_cast<int64_t>(until);
+    out.p.resize(n);
+    for (auto& [k, v] : out.p)
+        if (!r.bytes(k, 256) || !r.bytes(v, 8192))
+            return false;
+    return true;
+}
+
+// A sign-in another shard keeps is taken from it whole, kept here under a token of this shard's, and the step run
+// with that; true while it is being fetched, false for a token this shard keeps or one nobody can be asked for.
+bool idp_run::take_pending(const std::shared_ptr<conn>& c, const request& rq, params& p, std::string_view field,
+                           void (idp_run::*step)(const std::shared_ptr<conn>&, const request&, params))
+{
+    const std::string token(param(p, field));
+    uint32_t keeper = m_shard;
+    if (!code_shard(token, m_shards, keeper) || keeper == m_shard)
+        return false;
+    std::weak_ptr<conn> weak = c;
+    const bool asked = cross(keeper, shard_call{shard_call::pending_take, token, {}, 0},
+                             [this, weak, rq, p, field = std::string(field), step](bool answered,
+                                                                                  std::string_view reply) mutable
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        cc->waiting = false;
+        bool found = false;
+        pending_sign_in e;
+        // Not found, the step finds nothing under the old token either and says the sign-in took too long.
+        if (answered && decode_pending(reply, found, e) && found && m_pending.size() < 10000)
+        {
+            const std::string here = pending_token();
+            m_pending[here] = std::move(e);
+            for (auto& [k, v] : p)
+                if (k == field)
+                    v = here;
+        }
+        (this->*step)(cc, rq, std::move(p));
+        if (!cc->waiting)
+            m_http.resume(cc);
+    });
+    if (asked)
+        c->waiting = true;
+    return asked;
+}
+
 void idp_run::second_step(const std::shared_ptr<conn>& c, const request& rq, params p)
 {
+    if (take_pending(c, rq, p, "pending", &idp_run::second_step))
+        return;
     const std::string token(param(p, "pending"));
     const std::string ip = client_ip(*c, rq);
     const auto it = m_pending.find(token);
@@ -1302,7 +1392,7 @@ void idp_run::reset_after_sign_in(const std::shared_ptr<conn>& c, const account&
         login_page(c, p, "Too many sign-ins are waiting; try again in a minute.", 429);
         return;
     }
-    const std::string token = socketley::random_hex(24);
+    const std::string token = pending_token();
     m_pending[token] = {a.id, remember, p, now + 600, true};
     reset_page(c, token, {}, 200);
 }
@@ -1432,7 +1522,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             std::erase_if(m_pending, [now](const auto& kv) { return kv.second.until_s < now; });
             if (m_pending.size() < 10000)
             {
-                const std::string token = socketley::random_hex(24);
+                const std::string token = pending_token();
                 m_pending[token] = {a->id, remember, p, now + 300};
                 code_page(cc, token, {}, 200);
             }
@@ -3138,11 +3228,17 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
 
 void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
 {
-    params p = parse_form(rq.body);
+    password_form(c, rq, parse_form(rq.body));
+}
+
+void idp_run::password_form(const std::shared_ptr<conn>& c, const request& rq, params p)
+{
     // Signed in, the account is the session's; at a forced reset it is the one a sign-in that passed every step and
     // found the reset left its token for, and nothing a form names.
     const account* who = session_of(rq);
     const bool from_reset = !who;
+    if (from_reset && take_pending(c, rq, p, "reset_token", &idp_run::password_form))
+        return;
     const std::string token(param(p, "reset_token"));
     params carried_on;
     if (from_reset)
@@ -4127,6 +4223,17 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
     ++m_c.crossings_served;
     switch (call.op)
     {
+        case shard_call::pending_take:
+        {
+            // Taken whole, so one shard at a time keeps it and a second step taken twice finds it once.
+            const auto it = m_pending.find(call.key);
+            const bool live = it != m_pending.end() && it->second.until_s >= wall::now_sec();
+            const std::string reply = encode_pending(live ? &it->second : nullptr);
+            if (it != m_pending.end())
+                m_pending.erase(it);
+            mgr->requests().complete_deferred(ticket, request_status::ok, reply);
+            return;
+        }
         case shard_call::redeem:
         {
             // Good once, whatever the exchange at the asking shard comes to.

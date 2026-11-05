@@ -77,6 +77,7 @@ struct shard_call
         device_peek   = 6,   // the grant the user code `key` names, if it still waits at `at`
         hold          = 7,   // an attempt at `key` begun at `at` at another shard, counted here while it is checked
         let_go        = 8,   // and checked, no longer counted
+        pending_take  = 9,   // the sign-in `key` waiting for its second step, taken from the shard that keeps it
     };
     op_t op{redeem};
     std::string key;

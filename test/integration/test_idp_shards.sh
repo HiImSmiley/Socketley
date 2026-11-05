@@ -204,19 +204,24 @@ elif phase == "replay":
     key = open(tmpd + "/tia.key").read().strip()
     code = totp_now(key)
     taken = 0
+    lost = 0
     for i in range(8):
-        # The password and the code on one connection, as the waiting sign-in is its shard's; each a shard of its own.
-        c = http.client.HTTPConnection("127.0.0.1", int(pi), timeout=10)
+        # The password on one connection and the code on another, as a browser that waited for the code sends it:
+        # the waiting sign-in is its shard's, and the code lands wherever the kernel puts the new connection.
         h = {"X-Forwarded-For": "198.51.100.%d" % (100 + i), "Content-Type": "application/x-www-form-urlencoded"}
+        c = http.client.HTTPConnection("127.0.0.1", int(pi), timeout=10)
         c.request("POST", "/login", urllib.parse.urlencode(dict(rd="/", username="tia", password="tiapassword123")), h)
         r = c.getresponse()
-        pending = (re.search(r'name="pending" value="([0-9a-f]+)"', r.read().decode()) or [None, ""])[1]
+        pending = (re.search(r'name="pending" value="([0-9a-f.]+)"', r.read().decode()) or [None, ""])[1]
+        c.close()
+        c = http.client.HTTPConnection("127.0.0.1", int(pi), timeout=10)
         c.request("POST", "/login", urllib.parse.urlencode(dict(rd="/", pending=pending, code=code)), h)
         r = c.getresponse()
-        r.read()
+        lost += "took too long" in r.read().decode()
         taken += r.status == 302
         c.close()
     check("one code signs in once, whichever shard it is given to", taken, 1)
+    check("and the other shards find the waiting sign-in rather than call it gone", lost, 0)
 
 elif phase == "barred":
     for _ in range(5):
