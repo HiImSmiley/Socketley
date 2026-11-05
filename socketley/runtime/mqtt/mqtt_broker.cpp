@@ -499,6 +499,26 @@ bool broker::held_by_another(std::string_view client_id, std::string_view userna
     return it != m_sessions.end() && !lapsed(*it->second, m_io.now_ms()) && it->second->username != username;
 }
 
+bool broker::session_held_as(std::string_view client_id, uint64_t& stamp, std::string& user, bool& asked) const
+{
+    const auto it = m_sessions.find(std::string(client_id));
+    if (it == m_sessions.end() || lapsed(*it->second, m_io.now_ms()))
+        return false;
+    stamp = it->second->stamp;
+    user  = it->second->username;
+    asked = it->second->asked;
+    return true;
+}
+
+std::vector<std::string> broker::session_ids() const
+{
+    std::vector<std::string> out;
+    out.reserve(m_sessions.size());
+    for (const auto& [id, s] : m_sessions)
+        out.push_back(id);
+    return out;
+}
+
 void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
 {
     connection* c = conn_of(conn);
@@ -571,6 +591,8 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
         m_sessions[p.client_id] = std::move(fresh);
     }
     s->username     = a.username;
+    s->stamp        = a.stamp;
+    s->asked        = a.asked;
     s->level        = c->level;
     s->conn         = c->id;
     s->peer         = c->info.peer;
@@ -623,6 +645,7 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
     send_packet(*c, out);
     ++m_stats.connects;
     mark();
+    m_hooks.session_held(s->client_id, s->username, s->stamp);
     m_hooks.on_connected(info_of(*c));
     if (present)
         resend(*s, *c);
@@ -1440,6 +1463,7 @@ void broker::end_session(session& s, bool publish_will)
     const std::string id = s.client_id;
     m_sessions.erase(id);
     mark();
+    m_hooks.session_ended(id);
 }
 
 void broker::detach(connection& c, std::string_view why)

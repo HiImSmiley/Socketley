@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <openssl/ssl.h>
@@ -92,6 +93,8 @@ public:
     bool heard_elsewhere(std::string_view topic) override;
     void filter_added(const std::string& filter) override;
     void filter_removed(const std::string& filter) override;
+    void session_held(const std::string& client_id, const std::string& user, uint64_t stamp) override;
+    void session_ended(const std::string& client_id) override;
 
     // ── request_origin ──────────────────────────────────────────────────────
     void on_request_reply(uint64_t cookie, request_status st, std::string_view reply) override;
@@ -245,6 +248,8 @@ private:
     // An answer to what a starting shard asked another for; false when the cookie is no such question.
     bool dump_reply(uint64_t cookie, request_status st, std::string_view reply);
     void finish_claim(uint64_t id);
+    // Another shard let a connection in to `client_id`: the one here is ended or refused if it is the one to give way.
+    void settle(const std::string& client_id, uint64_t stamp, const std::string& user);
     void shard_stats(std::string& out) const;
     void sweep_claims(int64_t now);
 
@@ -313,6 +318,8 @@ private:
     struct peer
     {
         std::unordered_map<std::string, size_t> held;
+        // The clients it holds a session of, so a clean start asks only the shards that may have one to end.
+        std::unordered_set<std::string> clients;
         bool known{false};
         // The start its batches are numbered from, and the number of the next frame owed from it.
         uint64_t epoch{0};
@@ -347,6 +354,8 @@ private:
         std::function<void(auth_answer)> done;
         uint64_t    stamp{0};
         size_t      waiting{0};
+        // Some shard was not asked, as for a clean start of a client no shard is known to hold.
+        bool        skipped{false};
         bool        lost{false};
         // Another shard holds the session under another user, so this connection may not have it.
         bool        refused{false};
@@ -366,6 +375,7 @@ private:
     uint64_t m_shard_received{0};
     uint64_t m_shard_unreached{0};
     uint64_t m_claims_made{0};
+    uint64_t m_claim_asks{0};
     uint64_t m_claims_lost{0};
     uint64_t m_claims_refused{0};
     uint64_t m_sessions_moved{0};

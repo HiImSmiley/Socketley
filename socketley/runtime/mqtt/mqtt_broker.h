@@ -291,6 +291,10 @@ struct auth_answer
     uint8_t     code{reason::not_authorized};
     // The name the client is known by from here on: its user name, a certificate's CN or a token's account.
     std::string username;
+    // When the shards let this connection in, so two let in at once on two shards settle on one, and whether every
+    // shard was asked first.
+    uint64_t    stamp{0};
+    bool        asked{true};
 };
 
 struct publish_verdict
@@ -373,6 +377,9 @@ public:
     // send only where someone listens.
     virtual void filter_added(const std::string& /*filter*/) {}
     virtual void filter_removed(const std::string& /*filter*/) {}
+    // A connection was let in to the session of a client here, and a session here ended.
+    virtual void session_held(const std::string& /*client_id*/, const std::string& /*user*/, uint64_t /*stamp*/) {}
+    virtual void session_ended(const std::string& /*client_id*/) {}
 };
 
 struct broker_stats
@@ -499,6 +506,10 @@ public:
     bool held_by_another(std::string_view client_id, std::string_view username) const;
     // A session another shard gave up, taken in for the connection about to resume it.
     void adopt(std::string_view bytes);
+    // Every client with a session here.
+    std::vector<std::string> session_ids() const;
+    // The stamp, user and asking of the session of `client_id` not yet expired, false when there is none.
+    bool session_held_as(std::string_view client_id, uint64_t& stamp, std::string& user, bool& asked) const;
 
 private:
     struct queued
@@ -539,6 +550,10 @@ private:
         uint32_t    max_packet{0};
         bool        problem_info{true};
         std::string peer;
+        // The stamp of the connection last let in to it, 0 for one restored at start, and whether every shard was
+        // asked before it was.
+        uint64_t    stamp{0};
+        bool        asked{true};
         // Which message's subscribers it was last gathered for, and where, so overlapping filters fold into one.
         uint64_t    route_stamp{0};
         size_t      route_slot{0};

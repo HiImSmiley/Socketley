@@ -15,6 +15,7 @@
 #   * a flood at QoS 0 dropped between two shards that both keep up, or its publisher cut off while it is held
 #   * a publisher at QoS 0 held for good by a shard that stopped
 #   * batches given up and sent again reaching a shard out of order, or taken twice
+#   * a clean start asking every shard, two at once both kept, or one taking another user's fresh session
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -179,6 +180,34 @@ if phase == "main":
         check("and its forty queued messages of 250 KB come with it", len(got), 40)
         c.disconnect()
     guarded("heavy", heavy)
+
+    def clean():
+        def asks():
+            out = subprocess.run([binary, "stats", "sh"], capture_output=True, timeout=10).stdout.decode()
+            got = [int(l.partition(":")[2]) for l in out.splitlines() if l.startswith("session_claim_asks:")]
+            return sum(got) if len(got) == 3 else None
+        before = asks()
+        for i in range(30):
+            connected(port, "fresh-%d" % i).disconnect()
+        after = asks()
+        truth("a clean start of a client no shard holds asks no other shard", before is not None and after == before,
+              (before, after))
+        # Two clean starts of one client at once, on whichever shards: one connection keeps it.
+        pairs = []
+        for i in range(10):
+            a, b = Client(port), Client(port)
+            a.connect("pair-%d" % i, expect_ack=False)
+            b.connect("pair-%d" % i, expect_ack=False)
+            pairs.append((a, b))
+        time.sleep(1)
+        alive = [sum(1 for c in pair if not c.closed_within(0.2)) for pair in pairs]
+        check("of two clean starts of one client at once one connection stays", alive, [1] * 10)
+        held = [len([s for s in sessions() if s["client"] == "pair-%d" % i]) for i in range(10)]
+        check("and one session of it", held, [1] * 10)
+        for pair in pairs:
+            for c in pair:
+                c.close()
+    guarded("clean", clean)
 
     def commands():
         held = [connected(port, "k-%d" % i, props={SESSION_EXPIRY: 600}) for i in range(6)]
@@ -473,6 +502,21 @@ if phase == "owned":
         check("its own user still takes it, from whichever shard", back.connect("sensor-42", clean=False,
               username="alice", password="alicepass1")[:2], (True, 0))
         back.disconnect()
+        # Another user's clean start right behind a fresh one, before every shard may have heard of it.
+        kept, taken = [], []
+        for i in range(12):
+            a = connected(port, "race-%d" % i, version=4, username="alice", password="alicepass1")
+            b = Client(port, version=4)
+            try:
+                b.connect("race-%d" % i, username="bob", password="bobpass22")
+            except Closed:
+                pass
+            taken.append(b.closed_within(0.5))
+            kept.append(not a.closed_within(0.1))
+            a.close()
+            b.close()
+        check("another user's clean start does not take a fresh session of a client", taken, [True] * 12)
+        check("and the session's own connection stays", kept, [True] * 12)
     guarded("owned", owned)
 
 if phase == "after":

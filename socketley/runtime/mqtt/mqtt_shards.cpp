@@ -40,6 +40,8 @@ enum class sverb : uint8_t
     retained_dump = 7,
     claim         = 8,
     batch         = 9,
+    client_add    = 10,
+    client_del    = 11,
 };
 
 // A batch is cut at this, far below the 4 MiB a link's backlog holds before it gives up.
@@ -310,6 +312,7 @@ void mqtt_run::forget_peer(uint32_t from)
         m_remote.remove(inner, is_shared ? group : std::string_view{}, from);
     }
     p.held.clear();
+    p.clients.clear();
 }
 
 void mqtt_run::shards_start()
@@ -325,6 +328,7 @@ void mqtt_run::shards_start()
     m_sharing.assign(n, {});
     // What this shard holds, told whole, so a peer that knew an older picture of it replaces that one.
     const std::vector<std::string> mine = m_broker->filters();
+    const std::vector<std::string> clients = m_broker->session_ids();
     for (uint32_t j = 0; j < n; ++j)
     {
         if (j == me)
@@ -333,6 +337,7 @@ void mqtt_run::shards_start()
         {
             socketley::bytes::writer w;
             put_list(w, mine);
+            put_list(w, clients);
             full += w.take();
         }
         queue_shard(j, full, false);
@@ -376,13 +381,14 @@ bool mqtt_run::dump_reply(uint64_t cookie, request_status st, std::string_view r
         }
         return true;
     }
-    std::vector<std::string> list;
-    if (!get_list(r, list))
+    std::vector<std::string> list, clients;
+    if (!get_list(r, list) || !get_list(r, clients))
         return true;
     forget_peer(from);
     m_peers[from].known = true;
     for (const auto& f : list)
         peer_filter(from, f, true);
+    m_peers[from].clients.insert(clients.begin(), clients.end());
     return true;
 }
 
@@ -560,8 +566,15 @@ void mqtt_run::claim(const auth_ask& ask, auth_answer a, std::function<void(auth
     ++m_claims_made;
     for (uint32_t j = 0; j < n; ++j)
     {
+        // A clean start has nothing to take and only a session to end, so it asks only a shard that may hold one;
+        // one let in meanwhile on another shard is settled by the stamps of the two when each hears of the other.
         if (j == me)
             continue;
+        if (ask.clean_start && m_peers[j].known && !m_peers[j].clients.contains(ask.client_id))
+        {
+            pc.skipped = true;
+            continue;
+        }
         std::string f = frame_of(sverb::claim, me);
         socketley::bytes::writer w;
         w.bytes(ask.client_id);
@@ -575,6 +588,7 @@ void mqtt_run::claim(const auth_ask& ask, auth_answer a, std::function<void(auth
         {
             m_claim_cookies[cookie] = id;
             ++pc.waiting;
+            ++m_claim_asks;
         }
         else
             ++m_shard_unreached;
@@ -644,7 +658,59 @@ void mqtt_run::finish_claim(uint64_t id)
         m_broker->adopt(pc.session);
         ++m_sessions_moved;
     }
+    pc.answer.stamp = pc.stamp;
+    pc.answer.asked = !pc.skipped;
     pc.done(std::move(pc.answer));
+}
+
+void mqtt_run::session_held(const std::string& client_id, const std::string& user, uint64_t stamp)
+{
+    if (!sharded() || m_peers.empty())
+        return;
+    const uint32_t me = m_owner.get_shard_index();
+    std::string f = frame_of(sverb::client_add, me);
+    socketley::bytes::append32(f, static_cast<uint32_t>(client_id.size()));
+    f += client_id;
+    socketley::bytes::append64(f, stamp);
+    socketley::bytes::append32(f, static_cast<uint32_t>(user.size()));
+    f += user;
+    for (uint32_t j = 0; j < m_squeue.size(); ++j)
+        if (j != me)
+            queue_shard(j, f, false);
+}
+
+void mqtt_run::session_ended(const std::string& client_id)
+{
+    if (!sharded() || m_peers.empty())
+        return;
+    const uint32_t me = m_owner.get_shard_index();
+    std::string f = frame_of(sverb::client_del, me);
+    socketley::bytes::append32(f, static_cast<uint32_t>(client_id.size()));
+    f += client_id;
+    for (uint32_t j = 0; j < m_squeue.size(); ++j)
+        if (j != me)
+            queue_shard(j, f, false);
+}
+
+void mqtt_run::settle(const std::string& client_id, uint64_t stamp, const std::string& user)
+{
+    // Of two connections let in at once the later keeps the client, unless it came under another user without every
+    // shard asked, in which case the session stays with the user that had it; an older word of a session that has
+    // ended since loses to the one here either way.
+    const auto yields = [&](uint64_t mine, const std::string& mine_user, bool asked) {
+        return mine_user == user ? mine < stamp : mine > stamp && !asked;
+    };
+    for (auto& [id, pc] : m_claims)
+        if (pc.ask.client_id == client_id && yields(pc.stamp, pc.answer.username, !pc.skipped))
+            pc.lost = true;
+    uint64_t mine = 0;
+    std::string mine_user;
+    bool asked = true;
+    if (m_broker->session_held_as(client_id, mine, mine_user, asked) && yields(mine, mine_user, asked))
+    {
+        m_broker->surrender(client_id, true);
+        ++m_claims_lost;
+    }
 }
 
 void mqtt_run::sweep_claims(int64_t now)
@@ -761,10 +827,29 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply)
         {
             forget_peer(from);
             m_peers[from].known = true;
-            std::vector<std::string> list;
+            std::vector<std::string> list, clients;
             if (get_list(r, list))
                 for (const auto& f : list)
                     peer_filter(from, f, true);
+            if (get_list(r, clients))
+                m_peers[from].clients.insert(clients.begin(), clients.end());
+            break;
+        }
+        case sverb::client_add:
+        {
+            std::string client, user;
+            uint64_t stamp = 0;
+            if (!r.bytes(client, 1u << 16) || !r.u64(stamp) || !r.bytes(user, 1u << 16))
+                break;
+            settle(client, stamp, user);
+            m_peers[from].clients.insert(std::move(client));
+            break;
+        }
+        case sverb::client_del:
+        {
+            std::string client;
+            if (r.bytes(client, 1u << 16))
+                m_peers[from].clients.erase(client);
             break;
         }
         case sverb::interest_add:
@@ -781,6 +866,7 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply)
             // Answered with what this shard holds, which the asker takes as a full picture of it.
             socketley::bytes::writer w;
             put_list(w, m_broker->filters());
+            put_list(w, m_broker->session_ids());
             reply = w.take();
             break;
         }
@@ -866,6 +952,7 @@ void mqtt_run::shard_stats(std::string& out) const
     st::put(out, "shard_dropped", m_shard_dropped);
     st::put(out, "shard_resent", m_shard_resent);
     st::put(out, "session_claims", m_claims_made);
+    st::put(out, "session_claim_asks", m_claim_asks);
     st::put(out, "session_claims_lost", m_claims_lost);
     st::put(out, "session_claims_refused", m_claims_refused);
     st::put(out, "sessions_moved", m_sessions_moved);
