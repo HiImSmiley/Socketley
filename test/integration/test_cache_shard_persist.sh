@@ -176,10 +176,14 @@ PYW
         down
         [ "$N" = 16001 ] && [ "${T:-0}" -gt 900 ] && ok "1 -> 4 of 64 MB keeps every key and a deadline ($N keys, ttl $T)" \
             || bad "1 -> 4 of 64 MB keeps every key and a deadline" "dbsize '$N', ttl '$T'"
-        [ "$DSIZE" -gt 60000000 ] && [ "$HWM" -lt $((DSIZE * 18 / 10)) ] \
-            && ok "and no shard held more than its slice beside the mapped dump (peak $HWM bytes, dump $DSIZE)" \
-            || bad "and no shard held more than its slice beside the mapped dump" \
-                   "a shard peaked at $HWM bytes over a dump of $DSIZE; each loaded the whole dump into a store of its own"
+        if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null; then
+            echo "  SKIP [memory]: a peak resident size measures the sanitizer's shadow and quarantine, not the slice"
+        else
+            [ "$DSIZE" -gt 60000000 ] && [ "$HWM" -lt $((DSIZE * 18 / 10)) ] \
+                && ok "and no shard held more than its slice beside the mapped dump (peak $HWM bytes, dump $DSIZE)" \
+                || bad "and no shard held more than its slice beside the mapped dump" \
+                       "a shard peaked at $HWM bytes over a dump of $DSIZE; each loaded the whole dump into a store of its own"
+        fi
     else
         bad "1 -> 4 of 64 MB" "the 4-shard cache never came up"
     fi
