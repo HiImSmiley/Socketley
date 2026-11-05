@@ -283,6 +283,11 @@ case "$out" in *"name: N1099"*) ok ;; *) bad "shard 0 keeps the last change" "$o
 tally < <(run replay)
 
 tally < <(run barred)
+# A refused sign-in tells each other shard its hold, its let-go and its miss in one call each, whatever its keys.
+c0=$(stats_of auth | sum_of crossed)
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Forwarded-For: 198.51.100.230" --data "rd=/&username=bob&password=wrongpassword" "http://127.0.0.1:$PI/login")
+c1=$(stats_of auth | sum_of crossed)
+expect "a refused sign-in at four shards crosses three times to each other shard" "$code $((c1 - c0))" "401 9"
 
 "$BIN" idp-user auth disable alice >/dev/null 2>&1 && ok || bad "disable takes" "rc $?"
 tally < <(run after_logout)

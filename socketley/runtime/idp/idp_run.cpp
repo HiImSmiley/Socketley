@@ -998,10 +998,13 @@ void idp_run::tell_shards(shard_call::op_t op, const std::vector<std::string>& k
 {
     // Not waited for, as the attempt is checked meanwhile and the word need only arrive before the next one does.
     const int64_t now = wall::now_sec();
-    for (uint32_t j = 0; j < m_shards && m_shards > 1; ++j)
-        if (j != m_shard)
-            for (const auto& k : keys)
-                if (!cross(j, shard_call{op, k, {}, now}, [](bool, std::string_view) {})) {}
+    if (m_shards > 1 && !keys.empty())
+    {
+        const shard_call call = keyed_call(op, keys, now);
+        for (uint32_t j = 0; j < m_shards; ++j)
+            if (j != m_shard)
+                if (!cross(j, call, [](bool, std::string_view) {})) {}
+    }
     if (op == shard_call::hold)
         arm_tick();
 }
@@ -1062,14 +1065,17 @@ void idp_run::count_failed(std::vector<std::string> keys, int64_t now, std::func
         if (--*left == 0)
             then();
     };
-    for (uint32_t j = 0; j < m_shards && m_shards > 1; ++j)
-        if (j != m_shard)
-            for (const auto& k : keys)
+    if (m_shards > 1 && !keys.empty())
+    {
+        const shard_call call = keyed_call(shard_call::miss, keys, now);
+        for (uint32_t j = 0; j < m_shards; ++j)
+            if (j != m_shard)
             {
                 ++*left;
-                if (!cross(j, shard_call{shard_call::miss, k, {}, now}, one))
+                if (!cross(j, call, one))
                     --*left;
             }
+    }
     one(true, {});
 }
 
@@ -4269,17 +4275,17 @@ void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
             return;
         }
         case shard_call::miss:
-            m_limits.failed(call.key, call.at);
+            for_each_key(call, [&](const std::string& k) { m_limits.failed(k, call.at); });
             arm_tick();
             mgr->requests().complete_deferred(ticket, request_status::ok, {});
             return;
         case shard_call::hold:
-            m_limits.begun_elsewhere(call.key, call.at);
+            for_each_key(call, [&](const std::string& k) { m_limits.begun_elsewhere(k, call.at); });
             arm_tick();
             mgr->requests().complete_deferred(ticket, request_status::ok, {});
             return;
         case shard_call::let_go:
-            m_limits.ended_elsewhere(call.key);
+            for_each_key(call, [&](const std::string& k) { m_limits.ended_elsewhere(k); });
             mgr->requests().complete_deferred(ticket, request_status::ok, {});
             return;
         case shard_call::device_decide:

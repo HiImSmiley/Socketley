@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "idp_accounts.h"
 
@@ -71,11 +72,11 @@ struct shard_call
     {
         redeem        = 1,   // the code `key`, taken from the shard that gave it
         update        = 2,   // the account `key`'s `fields`, set by shard 0
-        miss          = 3,   // a sign-in from `key` failed at `at`, told to every other shard
+        miss          = 3,   // a sign-in from `key` and each field k failed at `at`, told to every other shard
         device_decide = 4,   // the user code `key` allowed or refused (`fields` allow, sub) at `at`
         device_ask    = 5,   // the device code `key` polled by the client `fields` client_id at `at`
         device_peek   = 6,   // the grant the user code `key` names, if it still waits at `at`
-        hold          = 7,   // an attempt at `key` begun at `at` at another shard, counted here while it is checked
+        hold          = 7,   // an attempt at `key` and each field k begun at `at` at another shard, counted here while checked
         let_go        = 8,   // and checked, no longer counted
         pending_take  = 9,   // the sign-in `key` waiting for its second step, taken from the shard that keeps it
     };
@@ -84,6 +85,23 @@ struct shard_call
     field_list fields;
     int64_t at{0};
 };
+
+// A hold, let_go or miss of every key of one attempt in one call: the first as its key, the others as fields "k".
+inline shard_call keyed_call(shard_call::op_t op, const std::vector<std::string>& keys, int64_t at)
+{
+    shard_call c{op, keys.front(), {}, at};
+    for (size_t i = 1; i < keys.size(); ++i)
+        c.fields.emplace_back("k", keys[i]);
+    return c;
+}
+template <typename F>
+void for_each_key(const shard_call& c, F&& f)
+{
+    f(c.key);
+    for (const auto& [k, v] : c.fields)
+        if (k == "k")
+            f(v);
+}
 
 std::string encode_call(const shard_call& c);
 // False when it is not one.
