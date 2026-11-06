@@ -455,8 +455,13 @@ if phase == "hang":
         finally:
             os.kill(victim, signal.SIGCONT)
         sender.join(30)
-        truth("and what the stopped shard could not take is counted dropped",
-              counted()["shard_dropped"] - before["shard_dropped"] > 0)
+        # A shard's figures reach the daemon at its next report, a quarter second or more after the drop.
+        dropped, deadline = 0, time.time() + 10
+        while dropped <= 0 and time.time() < deadline:
+            dropped = counted()["shard_dropped"] - before["shard_dropped"]
+            if dropped <= 0:
+                time.sleep(0.1)
+        truth("and what the stopped shard could not take is counted dropped", dropped > 0, dropped)
         truth("and the publisher is still connected", pub.ping())
         far.disconnect()
         pub.disconnect()
