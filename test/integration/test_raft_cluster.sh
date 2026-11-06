@@ -105,6 +105,9 @@ check 'grep -q "promoting .*(b) to voter" "$T/a.log" && grep -q "promoting .*(c)
       "a learner was never promoted"
 # Said once, by the second's check, as what b is then: a learner if its promotion is still to come.
 check 'wait_for 5 "grep -qE \"joined the cluster as a (voter|learner)\" $T/b.log"' "b never said it had joined"
+# And a joiner says it was made a voter, as the leader says it made it one.
+check 'wait_for 5 "grep -q \"promoted to voter at [0-9]*, as .*(b)\" $T/b.log && grep -q \"promoted to voter at [0-9]*, as .*(c)\" $T/c.log"' \
+      "a joiner never logged its own promotion to voter"
 converged() { local x; x=$(field a commit); [ -n "$x" ] && [ "$x" = "$(field b commit)" ] && [ "$x" = "$(field c commit)" ]; }
 check 'wait_for 10 converged' "the three commit indexes did not converge"
 check '[ "$(HOME=$T/a/home SOCKETLEY_SOCKET=$(sock a) "$BIN" cluster raft-status >/dev/null 2>&1; echo $?)" = 0 ]' \
@@ -170,6 +173,7 @@ check 'wait_for 20 four' "the fourth node did not become a voter within 20 s"
 check 'grep -q "installed a snapshot at" "$T/d.log"' "the fourth node caught up without a snapshot though the leader compacts every 4 entries"
 check 'grep -q "adding .*(d) as a learner" "$T/$L2.log" && grep -q "promoting .*(d) to voter" "$T/$L2.log"' \
       "d was not added as a learner and then promoted"
+check 'wait_for 5 "grep -q \"promoted to voter at [0-9]*, as .*(d)\" $T/d.log"' "d, which joined through a snapshot, never logged its promotion"
 check 'status d | grep -q "voters:.*(a).*" && status d | grep -q "(b)" && status d | grep -q "(c)"' \
       "d's membership book, which arrives in the snapshot, lacks a member's name"
 
@@ -234,6 +238,17 @@ else
         check '[ "$(voters t9)" = 0 ]' "t9, signed by another CA, believes it is a member"
     fi
 fi
+
+# ─── a joiner restarted says its promotion once, though it applies its log again ──
+# Compaction is put off, so the log the restart applies again holds the membership that promoted it.
+RAFT_COMPACT_EVERY=100000 node_start p1 --raft-listen 127.0.0.1:$((PB+30)) --raft-init --raft-insecure --raft-name p1
+RAFT_COMPACT_EVERY=100000 node_start p2 --raft-listen 127.0.0.1:$((PB+31)) --raft-join 127.0.0.1:$((PB+30)) --raft-insecure --raft-name p2
+check 'wait_for 20 "grep -q \"promoted to voter\" $T/p2.log"' "p2 never logged its promotion to voter"
+kill -9 "$(cat "$T/p2.pid")"; wait "$(cat "$T/p2.pid")" 2>/dev/null || true
+RAFT_COMPACT_EVERY=100000 node_start p2 --raft-listen 127.0.0.1:$((PB+31)) --raft-insecure --raft-name p2
+replayed() { [ "$(sed -n '/entries recovered/h; //!H; ${x;p}' "$T/p2.log" | grep -c "membership at")" -ge 2 ]; }
+check 'wait_for 10 replayed' "the restarted p2 did not apply its memberships again, so the next check measures nothing"
+check '[ "$(grep -c "promoted to voter" "$T/p2.log")" = 1 ]' "p2 logged its promotion again from its own log after a restart"
 
 echo "  SKIP: network partitions (netns/iptables need root; they belong in test/docker)"
 echo ""

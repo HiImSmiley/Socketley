@@ -121,6 +121,8 @@ private:
     void pump();
     void after_persist(bool ok);
     void apply(const socketley::raft::ready& r);
+    // This node's place in a membership applied at `at`: a learner made a voter says so, as the leader that did it does.
+    void note_place(bool voter, bool learner, socketley::raft::index_t at);
     void fail_stop(const std::string& why);
 
     void send(const socketley::raft::message& m);
@@ -184,6 +186,10 @@ private:
 
     socketley::raft::index_t m_applied = 0;
     socketley::raft::index_t m_snap_index = 0;
+    // The last entry the log held at start, which a restart applies again and has said what it says before.
+    socketley::raft::index_t m_recovered_to = 0;
+    // Whether the membership last applied here had this node as a learner.
+    bool m_was_learner = false;
 
     tls_context m_server_tls;
     tls_context m_client_tls;

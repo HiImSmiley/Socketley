@@ -23116,7 +23116,8 @@ Joins the cluster that the member at this address belongs to, on first start
 only.
 The node is added as a learner and receives the log without voting.
 Once its log has caught up to the leader's commit index, a single-server change
-promotes it to voter.
+promotes it to voter. The leader logs the promotion when it proposes it, and the
+node logs it once the change is committed.
 A member that is not the leader passes the request on.
 .TP
 .BI "\-\-raft\-cert " file " \-\-raft\-key " file " \-\-raft\-ca " file

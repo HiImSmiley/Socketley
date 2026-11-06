@@ -512,6 +512,8 @@ bool raft_host::start(event_loop& loop, std::string& err)
     m_brain->restore(std::move(restored));
     m_node = std::make_unique<raft::node>(o, std::move(rec.state));
     m_applied = m_snap_index = first;
+    m_recovered_to = m_node->last_index();
+    m_was_learner  = m_node->is_learner(m_id);
     refresh_book();
 
     if (!m_wal.open(loop, m_cfg.dir, rec, err))
@@ -814,6 +816,7 @@ void raft_host::apply(const raft::ready& r)
         }
         m_applied = r.restore->index;
         info("installed a snapshot at " + std::to_string(r.restore->index) + " from the leader");
+        note_place(m_node->is_voter(m_id), m_node->is_learner(m_id), r.restore->index);
     }
     if (r.snap)
         m_snap_index = r.snap->index;
@@ -829,6 +832,8 @@ void raft_host::apply(const raft::ready& r)
             for (raft::node_id id : m.learners)
                 l += " " + describe(id);
             info("membership at " + std::to_string(e.index) + ": voters" + v + (l.empty() ? "" : "; learners" + l));
+            note_place(std::binary_search(m.voters.begin(), m.voters.end(), m_id),
+                       std::binary_search(m.learners.begin(), m.learners.end(), m_id), e.index);
             continue;
         }
         if (e.type != raft::entry_type::normal)
@@ -1214,6 +1219,13 @@ void raft_host::try_join()
         m_join_link = std::move(l);
     }
     enqueue(m_join_link.get(), wire::encode(wire::join{m_id, m_cfg.name, m_cfg.advertise, true}));
+}
+
+void raft_host::note_place(bool voter, bool learner, raft::index_t at)
+{
+    if (voter && m_was_learner && at > m_recovered_to)
+        info("promoted to voter at " + std::to_string(at) + ", as " + describe(m_id));
+    m_was_learner = learner;
 }
 
 void raft_host::promote_learners()
