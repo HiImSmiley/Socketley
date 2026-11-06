@@ -788,18 +788,18 @@ void proxy_supervisor::flush_control()
 
 bool proxy_supervisor::write_frame(const std::string& framed, size_t cap)
 {
-    if (m_control_fd < 0)
+    if (m_control_fd < 0 || framed.size() > worker_proto::part_limit)
         return false;
 
     // A frame with nothing queued ahead of it goes at any size, as a worker's frame_writer lets one go: the cap
     // bounds a backlog, and a frame of max_payload past it would otherwise never reach the child.
     if (pending_out() != 0 &&
-        !m_out_gate.admit(pending_out(), framed.size(), cap,
+        !m_out_gate.admit(pending_out(), worker_proto::wire_size(framed.size()), cap,
                           "proxy supervisor: control socket backlog full; the child "
                           "is not reading"))
         return false;
 
-    m_out += framed;
+    worker_proto::append_wire(m_out, framed);
     flush_control();
     // A flush that found the child gone closed the socket, and the frame went with it.
     return m_control_fd >= 0;
@@ -1235,6 +1235,20 @@ void proxy_supervisor::ingest()
         m_saw_worker_frame = true;
         m_last_frame_at    = std::chrono::steady_clock::now();
 
+        if (type == worker_proto::frame_type::mesh_part)
+        {
+            std::string whole;
+            const auto step = m_part.take(payload, type, whole);
+            if (step == worker_proto::part_joiner::step::broken)
+            {
+                fatal = true;
+                break;
+            }
+            if (step == worker_proto::part_joiner::step::more)
+                continue;
+            payload.swap(whole);
+        }
+
         switch (type)
         {
             case worker_proto::frame_type::stats:
@@ -1429,6 +1443,7 @@ void proxy_supervisor::ingest()
         LOG_ERROR("proxy supervisor: malformed frame from worker, dropping control socket");
         close_control();
         m_in.clear();
+        m_part.clear();
     }
 }
 
@@ -1567,6 +1582,7 @@ bool proxy_supervisor::check_liveness()
     }
     close_control();
     m_in.clear();
+    m_part.clear();
 
     // The binary and the status, because the usual cause is a worker binary
     // that never became a worker and the bare sentence sent operators looking

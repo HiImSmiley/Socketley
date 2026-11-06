@@ -24687,8 +24687,9 @@ Any value but
 stops shards from linking to each other directly.
 The shards then relay through the daemon, and the daemon logs at startup that
 the mesh is off. This is the measurement control for the mesh: the two paths
-differ only in the route, not in the build. One request or answer through the
-daemon holds 8 MiB, while a link carries a longer one in pieces. Eight such
+differ only in the route, not in the build. A request or answer longer than
+the 8 MiB one frame holds goes in pieces, through the daemon as over a link, up
+to 256 MiB. Eight answers of 8 MiB
 answers may wait at once on each side of the daemon for a shard that has not
 read them yet; past that, an asker is answered at once that the way is
 overloaded. A request the daemon cannot queue for a shard whose backlog is full

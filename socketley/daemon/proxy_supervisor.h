@@ -403,6 +403,7 @@ private:
     std::string       m_runtime_map;      // last map, re-sent to a new child
     std::string       m_cluster_view;     // last cluster view, likewise
     std::string       m_in;               // partial frames from the child
+    worker_proto::part_joiner m_part;     // a frame past max_payload, while its pieces come in
 
     // Frames written but not yet taken by the socket, bounded because the
     // alternative is the daemon growing without limit on behalf of a child

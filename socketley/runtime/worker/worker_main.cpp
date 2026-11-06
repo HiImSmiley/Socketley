@@ -165,16 +165,14 @@ public:
         // The name travels with the request because this process cannot
         // resolve it, and false means the backlog is full, so the channel
         // answers the origin rather than parking a ticket nothing will
-        // complete.  One past what the daemon reads is refused here, as the
-        // daemon would take it for a corrupt stream and drop this worker.
-        if (payload.size() > request_room(target))
-            return false;
-        return m_w->write_with(
+        // complete.  One past max_payload goes in pieces.
+        return worker_proto::write_wire(*m_w,
             worker_proto::chan_request_frame_size(target, payload), [&](std::string& out) {
                 worker_proto::append_chan_request_frame(out, ticket, target, payload);
             }, owed_backlog);
     }
 
+    // What one frame holds, which a runtime that sizes its own crossings keeps to, though a longer request goes in pieces.
     size_t request_room(std::string_view target) const override
     {
         const size_t envelope = worker_proto::chan_request_frame_size(target, {}) - worker_proto::header_size;
@@ -742,7 +740,20 @@ private:
         // Copied, since a handler that turns the loop appends to m_in and moves what view points at.
         while (worker_proto::peek_frame(m_in, off, type, ver, view, fatal))
         {
-            payload.assign(view.data(), view.size());
+            if (type == worker_proto::frame_type::mesh_part)
+            {
+                const auto step = m_part.take(view, type, payload);
+                if (step == worker_proto::part_joiner::step::broken)
+                    fatal = true;
+                if (step != worker_proto::part_joiner::step::whole)
+                {
+                    if (fatal)
+                        break;
+                    continue;
+                }
+            }
+            else
+                payload.assign(view.data(), view.size());
             handle(type, payload);
         }
         m_in.erase(0, off);
@@ -1407,13 +1418,14 @@ private:
 
         if (to.link_serial == 0)
         {
-            // Past what the daemon reads, which it would take for a corrupt stream, the answer is said to be too large.
+            // Past what the daemon joins from pieces, which it would take for a corrupt stream, the answer is said to be
+            // too large.
             std::string too_large;
-            if (worker_proto::chan_reply_frame_size(reply) - worker_proto::header_size > worker_proto::max_payload)
+            if (worker_proto::chan_reply_frame_size(reply) > worker_proto::part_limit)
             {
                 too_large = "error: the answer is " + std::to_string(reply.size()) +
                             " bytes, more than a worker may send (" +
-                            std::to_string(worker_proto::max_payload >> 20) + " MiB)";
+                            std::to_string(worker_proto::part_limit >> 20) + " MiB)";
                 reply = too_large;
             }
             answer_daemon(to.wire_ticket, static_cast<uint8_t>(st), reply);
@@ -1426,7 +1438,8 @@ private:
             link->send_reply(to.wire_ticket, st, reply);
     }
 
-    // The daemon reads a frame up to max_payload, while a link carries one past it in pieces.
+    // One frame to the daemon, which a runtime that sizes its own answers keeps to, though a longer answer goes in
+    // pieces; a link carries what its backlog takes.
     size_t reply_room(uint64_t cookie) const override
     {
         const auto it = m_deferred.find(cookie);
@@ -1812,7 +1825,7 @@ private:
     // the asker is told the way was overloaded, since one told nothing waits out its deadline.
     void answer_daemon(uint64_t ticket, uint8_t st, std::string_view reply)
     {
-        if (m_writer.write_with(
+        if (worker_proto::write_wire(m_writer,
                 worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
                     worker_proto::append_chan_reply_frame(out, ticket, st, reply);
                 }, owed_backlog))
@@ -2420,6 +2433,8 @@ private:
     event_loop                             m_loop;
     // Before m_remote, which holds a pointer to it.
     control_writer                         m_writer;
+    // A frame from the daemon past max_payload, while its pieces come in.
+    worker_proto::part_joiner              m_part;
     std::vector<std::unique_ptr<shard_link>> m_mesh_links;
     // Messages for a sibling's clients go over the links while every sibling has one that lives.
     bool m_notes_direct{false};

@@ -4,6 +4,7 @@
 // every one, so an unknown type is skipped rather than desynchronising the
 // stream, and carrying no descriptors, because ports are values and
 // descriptors are not.
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -266,6 +267,98 @@ inline bool take_frame(std::string& buf, frame_type& type, uint16_t& frame_versi
     buf.erase(0, off);
     return true;
 }
+
+// ── Frames past max_payload ─────────────────────────────────────────────────
+// Such a frame crosses a socket as mesh_part pieces, each u8 last then the next bytes of the whole frame, on a mesh
+// link and on a worker's socket to the daemon alike.
+inline constexpr size_t part_piece = 4u << 20;
+// The most of one frame a reader joins from pieces, and so the longest a writer sends.
+inline constexpr size_t part_limit = 256u << 20;
+
+// The bytes a frame of `size` takes on the wire.
+inline size_t wire_size(size_t size)
+{
+    if (size - header_size <= max_payload)
+        return size;
+    return size + (size + part_piece - 1) / part_piece * (header_size + 1);
+}
+
+// The longest payload besides an `envelope` of its own that `free` bytes on the wire carry, its pieces' headers counted.
+inline size_t wire_room(size_t free, size_t envelope)
+{
+    const size_t cap     = std::min(free, part_limit);
+    const size_t headers = (cap / part_piece + 1) * (header_size + 1);
+    return cap > headers + envelope ? cap - headers - envelope : 0;
+}
+
+// One whole frame onto `out` as it goes on the wire.
+inline void append_wire(std::string& out, std::string_view whole)
+{
+    if (whole.size() - header_size <= max_payload)
+    {
+        out.append(whole);
+        return;
+    }
+    for (size_t at = 0; at < whole.size(); at += part_piece)
+    {
+        const size_t n = std::min(part_piece, whole.size() - at);
+        socketley::bytes::append32(out, static_cast<uint32_t>(n + 1));
+        put_u16(out, version);
+        put_u16(out, static_cast<uint16_t>(frame_type::mesh_part));
+        out.push_back(at + n == whole.size() ? 1 : 0);
+        out.append(whole.substr(at, n));
+    }
+}
+
+// write_with() for a frame of `size` bytes that `fill` appends, in pieces past max_payload; one past part_limit is
+// refused, as its reader would take it for a broken stream.
+template <class Writer, class Fill>
+bool write_wire(Writer& w, size_t size, Fill&& fill, size_t cap)
+{
+    if (size - header_size <= max_payload)
+        return w.write_with(size, std::forward<Fill>(fill), cap);
+    if (size > part_limit)
+        return false;
+    std::string whole;
+    whole.reserve(size);
+    fill(whole);
+    return w.write_with(wire_size(size), [&](std::string& out) { append_wire(out, whole); }, cap);
+}
+
+// The pieces of one frame put back together.
+class part_joiner
+{
+public:
+    enum class step { more, whole, broken };
+
+    // A mesh_part's payload in; once its last piece is in, the joined frame's type and payload out.
+    step take(std::string_view piece, frame_type& type, std::string& payload)
+    {
+        if (piece.empty())
+            return step::broken;
+        m_part.append(piece.substr(1));
+        if (m_part.size() > part_limit)
+            return step::broken;
+        if (piece[0] == 0)
+            return step::more;
+        reader r(m_part.data(), m_part.size());
+        const uint32_t len = r.u32();
+        r.u16();
+        type = static_cast<frame_type>(r.u16());
+        if (!r.ok || len != m_part.size() - header_size || type == frame_type::mesh_part)
+            return step::broken;
+        m_part.erase(0, header_size);
+        payload = std::move(m_part);
+        m_part  = std::string();
+        return step::whole;
+    }
+
+    size_t capacity() const { return m_part.capacity(); }
+    void   clear()          { std::string().swap(m_part); }
+
+private:
+    std::string m_part;
+};
 
 // ── Endpoint table payload ──────────────────────────────────────────────────
 // The table is rebuilt on the far side rather than shared, because a

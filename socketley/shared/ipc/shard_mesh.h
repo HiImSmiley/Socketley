@@ -130,9 +130,7 @@ public:
 
     // A link's queue is held to what the asker's parked tickets bound and not to the writer's cap, which one turn of
     // large values passes before its flush and which ended the link for good.
-    static constexpr size_t BACKLOG = 256u << 20;
-    // A frame past max_payload goes as mesh_part pieces of this size.
-    static constexpr size_t PIECE = 4u << 20;
+    static constexpr size_t BACKLOG = worker_proto::part_limit;
 
     // The longest answer of `envelope` bytes besides itself that put() takes now, its pieces' headers counted.
     size_t reply_room(size_t envelope) const
@@ -140,9 +138,7 @@ public:
         if (!alive())
             return 0;
         const size_t queued = m_writer.pending();
-        const size_t free = queued < BACKLOG ? BACKLOG - queued : 0;
-        const size_t headers = (free / PIECE + 1) * (worker_proto::header_size + 1);
-        return free > headers + envelope ? free - headers - envelope : 0;
+        return worker_proto::wire_room(queued < BACKLOG ? BACKLOG - queued : 0, envelope);
     }
 
     // One answer back to the asker, with a write the link cannot take ending
@@ -600,26 +596,7 @@ private:
     template <class Fill>
     bool put(size_t size, Fill&& fill)
     {
-        if (size - worker_proto::header_size <= worker_proto::max_payload)
-            return m_writer.write_with(size, std::forward<Fill>(fill), BACKLOG);
-        const size_t pieces = (size + PIECE - 1) / PIECE;
-        if (!m_writer.admit(size + pieces * (worker_proto::header_size + 1), BACKLOG))
-            return false;
-        std::string whole;
-        whole.reserve(size);
-        fill(whole);
-        for (size_t at = 0; at < whole.size(); at += PIECE)
-        {
-            const size_t n = std::min(PIECE, whole.size() - at);
-            const bool last = at + n == whole.size();
-            if (!m_writer.write_with(worker_proto::header_size + 1 + n, [&](std::string& out) {
-                    append_header(out, worker_proto::frame_type::mesh_part, n + 1);
-                    out.push_back(last ? 1 : 0);
-                    out.append(whole, at, n);
-                }, BACKLOG))
-                return false;
-        }
-        return true;
+        return worker_proto::write_wire(m_writer, size, std::forward<Fill>(fill), BACKLOG);
     }
 
     void arm()
@@ -741,31 +718,15 @@ private:
                 m_channel->complete_deferred(
                     p.ticket, static_cast<request_status>(p.status), p.payload);
         }
-        if (type == worker_proto::frame_type::mesh_part && !payload.empty())
+        if (type == worker_proto::frame_type::mesh_part)
         {
-            m_part.append(payload.substr(1));
-            if (m_part.size() > BACKLOG)
-            {
-                die("a sibling sent more of one frame than a link holds");
-                return;
-            }
-            if (payload[0] == 0)
-                return;
-            // The whole frame, header and all, which is read as if it had come in one piece.
-            std::string whole = std::move(m_part);
-            m_part.clear();
-            worker_proto::reader r(whole.data(), whole.size());
-            const uint32_t len = r.u32();
-            r.u16();
-            const auto inner = static_cast<worker_proto::frame_type>(r.u16());
-            if (!r.ok || len != whole.size() - worker_proto::header_size ||
-                inner == worker_proto::frame_type::mesh_part)
-            {
+            worker_proto::frame_type inner{};
+            std::string whole;
+            const auto step = m_part.take(payload, inner, whole);
+            if (step == worker_proto::part_joiner::step::broken)
                 die("a sibling sent a frame in pieces that do not make one");
-                return;
-            }
-            whole.erase(0, worker_proto::header_size);
-            handle(inner, whole);
+            else if (step == worker_proto::part_joiner::step::whole)
+                handle(inner, whole);
             return;
         }
         if (type == worker_proto::frame_type::conn_handoff || type == worker_proto::frame_type::conn_handoff_ack)
@@ -828,7 +789,7 @@ private:
     alignas(struct cmsghdr) char m_ctl[CMSG_SPACE(4 * sizeof(int))]{};
     std::deque<int>   m_fds;
     // What has come of a frame sent in pieces, until its last.
-    std::string       m_part;
+    worker_proto::part_joiner m_part;
 
     event_loop* m_loop{nullptr};
     io_request  m_req{};
