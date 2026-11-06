@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string>
@@ -92,14 +93,11 @@ inline uint32_t rtt_us(int fd)
     return getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &n) == 0 ? ti.tcpi_rtt : 0;
 }
 
-// The kernel's tcp_info as far as tcpi_min_rtt, which glibc's copy of the struct stops short of.
-struct tcp_info_min_rtt
-{
-    struct tcp_info base;
-    uint64_t pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
-    uint32_t segs_out, segs_in, notsent_bytes, min_rtt;
-};
-static_assert(offsetof(tcp_info_min_rtt, min_rtt) == 148, "tcpi_min_rtt is at 148 in the kernel's struct tcp_info");
+// Where the kernel's struct tcp_info keeps tcpi_min_rtt and tcpi_rtt, its ABI, which one glibc's copy of the struct
+// stops short of and a newer one reaches past.
+inline constexpr size_t TCPI_MIN_RTT_AT = 148;
+inline constexpr size_t TCPI_RTT_AT     = 68;
+static_assert(offsetof(struct tcp_info, tcpi_rtt) == TCPI_RTT_AT, "tcpi_rtt is at 68 in the kernel's struct tcp_info");
 
 // Which end of a connection asks: the one that dialed it has the round trips of its handshake and first exchanges.
 enum class side : uint8_t { accepted, dialed };
@@ -107,12 +105,15 @@ enum class side : uint8_t { accepted, dialed };
 // The least round trip a connection has seen, falling back to the smoothed one where the kernel keeps no minimum.
 inline uint32_t min_rtt_us(int fd)
 {
-    tcp_info_min_rtt ti{};
-    socklen_t n = sizeof(ti);
-    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &n) < 0)
+    unsigned char ti[256]{};
+    socklen_t     n = sizeof(ti);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, ti, &n) < 0 || n < TCPI_RTT_AT + sizeof(uint32_t))
         return 0;
-    return n >= offsetof(tcp_info_min_rtt, min_rtt) + sizeof(ti.min_rtt) && ti.min_rtt != 0 ? ti.min_rtt
-                                                                                          : ti.base.tcpi_rtt;
+    uint32_t rtt = 0, least = 0;
+    std::memcpy(&rtt, ti + TCPI_RTT_AT, sizeof(rtt));
+    if (n >= TCPI_MIN_RTT_AT + sizeof(uint32_t))
+        std::memcpy(&least, ti + TCPI_MIN_RTT_AT, sizeof(least));
+    return least != 0 ? least : rtt;
 }
 
 // On a path with a round trip, what a connection has framed waits in its own queue, where a frame made later may go
