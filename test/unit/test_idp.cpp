@@ -370,7 +370,13 @@ TEST_CASE("base64url decodes what it encodes and refuses a second spelling")
 #include <filesystem>
 #include <fstream>
 
+#include <map>
+#include <memory>
+#include <set>
+
 #include "runtime/idp/idp_accounts.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/file_io.h"
 
 namespace
 {
@@ -550,6 +556,117 @@ TEST_CASE("a shard that reads the accounts takes each change in, and a new journ
     REQUIRE(r.by_name("frank"));
     CHECK(r.by_name("frank")->field("name") == "Frank F");
     CHECK(r.size() == 1);
+    std::filesystem::remove_all(dir);
+}
+
+namespace
+{
+
+struct ring : io_handler
+{
+    event_loop loop{256};
+    std::unique_ptr<socketley::file_io> io;
+
+    ring()
+    {
+        REQUIRE(loop.init());
+        io = std::make_unique<socketley::file_io>(loop, this);
+    }
+
+    void on_cqe(struct io_uring_cqe* cqe) override
+    {
+        auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+        if (req && socketley::file_io::owns_type(req->type))
+            io->on_cqe(cqe);
+    }
+};
+
+}   // namespace
+
+TEST_CASE("a compaction through the ring writes every account once while accounts are made, changed and removed")
+{
+    const std::string dir = fresh_dir();
+    std::string why;
+    ring e;
+    std::map<std::string, std::string> want;   // username to the name it ends with
+    {
+        account_store w;
+        REQUIRE(w.open(dir, why));
+        w.set_io(e.io.get(), &e.loop);
+        // Past the records a compaction waits for, and many 64 KiB pieces of snapshot.
+        std::vector<field_list> batch;
+        for (int i = 0; i < 3000; ++i)
+            batch.push_back({{"username", "u" + std::to_string(i)}, {"email", "u" + std::to_string(i) + "@x.test"},
+                             {"name", std::string(80, 'n')}});
+        REQUIRE(w.create_many(batch, why) == 3000);
+        bool durable = false;
+        w.when_durable([&](bool ok) { durable = ok; });
+        for (int i = 0; i < 10000 && !w.compacting(); ++i)
+            e.loop.poll_completions(1);
+        REQUIRE(durable);
+        REQUIRE(w.compacting());
+        for (int i = 0; i < 3000; ++i)
+            want["u" + std::to_string(i)] = std::string(80, 'n');
+        // Between its pieces: new accounts, at once enough to grow the table past its buckets, changes and removals.
+        int round = 0;
+        uint64_t records = 0;
+        for (int spins = 0; spins < 100000 && w.compacting(); ++spins)
+        {
+            e.loop.poll_completions(1);
+            if (round >= 40)
+                continue;
+            std::vector<field_list> more;
+            for (int i = 0; i < (round == 2 ? 8000 : 50); ++i)
+            {
+                const std::string u = "r" + std::to_string(round) + "-" + std::to_string(i);
+                more.push_back({{"username", u}, {"email", u + "@x.test"}});
+                want[u] = "";
+            }
+            REQUIRE(w.create_many(more, why) == more.size());
+            const std::string changed = "u" + std::to_string(round * 7);
+            REQUIRE(w.update(w.by_name(changed)->id, {{"name", "N" + std::to_string(round)}}, why));
+            want[changed] = "N" + std::to_string(round);
+            const std::string gone = "u" + std::to_string(2999 - round * 3);
+            REQUIRE(w.remove(w.by_name(gone)->id, why));
+            want.erase(gone);
+            records += more.size() + 2;
+            ++round;
+        }
+        REQUIRE_FALSE(w.compacting());
+        CHECK(round > 2);
+        // Folded into the snapshot rather than given up, which leaves the whole journal behind it.
+        CHECK(w.journal_records() == records);
+        durable = false;
+        w.when_durable([&](bool ok) { durable = ok; });
+        for (int i = 0; i < 10000 && !durable; ++i)
+            e.loop.poll_completions(1);
+        REQUIRE(durable);
+        CHECK(w.size() == want.size());
+    }
+    std::set<std::string> ids;
+    size_t lines = 0;
+    {
+        std::ifstream f(dir + "/accounts.snapshot");
+        std::string line;
+        std::getline(f, line);
+        while (std::getline(f, line))
+        {
+            ++lines;
+            ids.insert(line.substr(0, line.find(',')));
+        }
+    }
+    CHECK(lines >= 3000);
+    CHECK(ids.size() == lines);
+    account_store r;
+    REQUIRE(r.open(dir, why));
+    CHECK(r.size() == want.size());
+    size_t right = 0;
+    for (const auto& [u, name] : want)
+        if (const account* a = r.by_name(u); a && a->field("name") == name)
+            ++right;
+    CHECK(right == want.size());
+    // An address once each, as a snapshot holding an account twice would index it twice.
+    CHECK(r.by_email("u5@x.test").size() == 1);
     std::filesystem::remove_all(dir);
 }
 

@@ -119,6 +119,8 @@ public:
 
     // The journal's records since the last snapshot, for a test that the snapshot cuts them.
     uint64_t journal_records() const { return m_journal_records; }
+    // Whether a compaction through the ring is under way, for a test that commits during one.
+    bool compacting() const { return m_compacting; }
     // Writes the snapshot now and cuts the journal behind it.
     bool compact(std::string& why);
 

@@ -31,6 +31,9 @@ namespace
 constexpr uint8_t op_put    = 1;
 constexpr uint8_t op_remove = 2;
 constexpr std::string_view journal_owner = "socketley-idp-accounts";
+// The accounts' table grows no buckets at this load, which a compaction walking them a bucket at a time holds it to;
+// finite, since the table multiplies its bucket count by it.
+constexpr float held_load_factor = 1e6f;
 // Past this many records the journal is folded into a snapshot, so a start replays a bounded tail.
 uint64_t compact_after()
 {
@@ -401,6 +404,7 @@ void account_store::close()
     m_compacting = false;
     m_tail.clear();
     m_compact_ready.reset();
+    m_accounts.max_load_factor(1.0f);
     if (m_follow_fd >= 0)
         ::close(m_follow_fd);
     m_follow_fd = -1;
@@ -548,14 +552,18 @@ std::string snapshot_header()
 
 void append_snapshot_line(std::string& out, const account& a)
 {
-    out += "{\"id\":" + socketley::json::quote(a.id) + ",\"fields\":{";
+    out += "{\"id\":";
+    socketley::json::quote_into(out, a.id);
+    out += ",\"fields\":{";
     bool first = true;
     for (const auto& [k, v] : a.fields)
     {
         if (!first)
             out += ',';
         first = false;
-        out += socketley::json::quote(k) + ":" + socketley::json::quote(v);
+        socketley::json::quote_into(out, k);
+        out += ':';
+        socketley::json::quote_into(out, v);
     }
     out += "}}\n";
 }
@@ -609,10 +617,11 @@ bool account_store::compact(std::string& why)
 struct account_store::compaction
 {
     uint64_t gen{0};
-    // The ids when it began, written a piece a completion with each account as it is then, which the tail replayed
-    // over it leaves as it is because a record only sets fields or removes an account.
-    std::vector<std::string> ids;
-    size_t next_id{0};
+    // The accounts walked a bucket at a time, a piece a completion, each as it is then, which the tail replayed over
+    // it leaves as it is because a record only sets fields or removes an account; an account keeps its bucket while
+    // the table is held from rehashing, so each is written once and none there when it began is passed over.
+    size_t bucket{0};
+    size_t buckets{0};
     std::string text;
     uint64_t at{0};
     uint64_t written{0};
@@ -628,9 +637,8 @@ void account_store::compact_async()
         return;
     auto job = std::make_shared<compaction>();
     job->gen = m_gen;
-    job->ids.reserve(m_accounts.size());
-    for (const auto& [id, a] : m_accounts)
-        job->ids.push_back(id);
+    m_accounts.max_load_factor(held_load_factor);
+    job->buckets = m_accounts.bucket_count();
     job->text = snapshot_header();
     m_compacting = true;
     m_compact_from = m_committed;
@@ -684,13 +692,19 @@ void account_store::compact_step(const std::shared_ptr<compaction>& job, int ste
         case 1:
         case 2:
             // The next piece once this one is out, so the loop is held for a piece and not for the store.
-            while (job->written == job->text.size() && job->next_id < job->ids.size())
+            while (job->written == job->text.size() && job->bucket < job->buckets)
             {
+                // A table rehashed after all would walk accounts twice or not at all, so the snapshot is not made.
+                if (m_accounts.bucket_count() != job->buckets)
+                {
+                    compact_done(job, false);
+                    return;
+                }
                 job->at += job->written;
                 job->written = 0;
                 job->text.clear();
-                for (; job->next_id < job->ids.size() && job->text.size() < (64u << 10); ++job->next_id)
-                    if (const auto it = m_accounts.find(job->ids[job->next_id]); it != m_accounts.end())
+                for (; job->bucket < job->buckets && job->text.size() < (32u << 10); ++job->bucket)
+                    for (auto it = m_accounts.cbegin(job->bucket); it != m_accounts.cend(job->bucket); ++it)
                         append_snapshot_line(job->text, it->second);
             }
             if (job->written < job->text.size())
@@ -779,6 +793,7 @@ void account_store::compact_step(const std::shared_ptr<compaction>& job, int ste
 
 void account_store::compact_done(const std::shared_ptr<compaction>& job, bool ok)
 {
+    m_accounts.max_load_factor(1.0f);
     if (job->fd >= 0)
         m_loop->close_fd(job->fd);
     if (job->dir >= 0)
