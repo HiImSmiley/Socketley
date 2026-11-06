@@ -7248,6 +7248,30 @@ go\-redis
 Measured at eight shards, such a client cost 0.24 us of cache CPU per operation
 against 0.67 us through the shared port.
 .IP
+.B "Each shard counts what its shared port relays."
+In
+.BR stats ,
+each shard of a sharded cache gives
+.BR shared_port_commands ,
+the commands clients sent it on the shared port, and
+.BR relayed_commands ,
+those of them that named a key another shard owns and were relayed there.
+A command with keys on several shards counts once.
+Random keys over
+.I N
+shards relay
+.RI ( N \-1)/ N
+of them.
+A per\-shard port is not counted.
+When at least half of what reached shard 0 on the shared port was relayed, in two
+windows of two seconds in a row with at least 2,000 commands each, shard 0 logs
+one warning that names the share, the per\-shard ports and
+.BR SOCKETLEY_CACHE_HANDOFF .
+It says so once per start.
+Under
+.B \-\-no\-cluster
+the warning at start says it instead.
+.IP
 .B "It needs N more free and reachable TCP ports."
 A cache on port
 .I P

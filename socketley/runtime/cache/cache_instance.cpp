@@ -1792,6 +1792,8 @@ void cache_instance::on_loop_turn()
         post_turn_crossings();
     if (SOCKETLEY_UNLIKELY(!m_finish_due.empty()))
         finish_due();
+    if (SOCKETLEY_UNLIKELY(m_cluster_ports && m_shard_i == 0 && !m_relay_said))
+        relay_watch();
     publish_keyspace();
     if (SOCKETLEY_UNLIKELY(!m_lua_pub.empty()))
         flush_lua_publishes();
@@ -1812,6 +1814,35 @@ void cache_instance::on_loop_turn()
         m_companion->pump();
     if (SOCKETLEY_UNLIKELY(!m_ho_waiting.empty() || !m_ho_sent.empty()))
         handoff_turn();
+}
+
+// Said once, by shard 0, when two windows in a row under load relayed at least half of what arrived on the shared
+// port, since cluster mode keeps the start quiet and an ordinary client there pays for every relay silently.
+void cache_instance::relay_watch()
+{
+    const uint64_t now = socketley::turn_clock::now_ns();
+    if (m_relay_win_ns == 0 || now - m_relay_win_ns >= RELAY_WINDOW_NS)
+    {
+        const uint64_t cmds    = m_stat_shared_cmds - m_relay_win_cmds;
+        const uint64_t relayed = m_stat_relayed_cmds - m_relay_win_relayed;
+        const bool     started = m_relay_win_ns != 0;
+        m_relay_win_ns       = now;
+        m_relay_win_cmds     = m_stat_shared_cmds;
+        m_relay_win_relayed  = m_stat_relayed_cmds;
+        if (!started)
+            return;
+        m_relay_high = (cmds >= RELAY_WINDOW_MIN && relayed * 2 >= cmds) ? m_relay_high + 1 : 0;
+        if (m_relay_high < RELAY_HIGH_WINDOWS)
+            return;
+        m_relay_said = true;
+        const uint16_t port = m_base_port;
+        LOG_WARN(("cache \"" + std::string(get_name()) + "\": " + std::to_string(relayed * 100 / cmds)
+                  + "% of the commands on its shared port named a key another shard owns and were relayed "
+                  "there, which costs about twice what answering them does.  A cluster-aware client routes each "
+                  "key to its shard's own port (" + std::to_string(port + 1) + ".."
+                  + std::to_string(port + m_shard_n) + "); with SOCKETLEY_CACHE_HANDOFF=1 a connection whose "
+                  "keys keep to one shard is handed to it.  stats shows relayed_commands per shard").c_str());
+    }
 }
 
 bool cache_instance::submit_client_read(client_connection* conn, int fd)
@@ -3440,6 +3471,12 @@ void cache_instance::route_part(client_connection* conn, uint32_t owner,
                 --sl.parts_left;
         }
         return;
+    }
+
+    if (reply_slot& sl = m_collect->slots[slot]; !sl.relayed && conn->fd >= 0 && !conn->cluster_port)
+    {
+        sl.relayed = true;
+        ++m_stat_relayed_cmds;
     }
 
     // By the batch's protocol, which is the one its frame's header names.
@@ -5541,6 +5578,8 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         process_command_local(conn, line);
         return;
     }
+    if (conn->fd >= 0 && !conn->cluster_port)
+        ++m_stat_shared_cmds;
 
     const cache_text_parts parts = cache_split_text(line);
     const uint32_t         h     = fnv1a_lower(parts.cmd);
@@ -9054,6 +9093,8 @@ void cache_instance::process_resp_command(client_connection* conn,
         process_resp_command_local(conn, args, argc);
         return;
     }
+    if (conn->fd >= 0 && !conn->cluster_port)
+        ++m_stat_shared_cmds;
 
     const uint32_t h = fnv1a_lower(args[0]);
 
@@ -13923,6 +13964,9 @@ std::string cache_instance::stats_lines() const
         // from a leader that accepts and then says nothing.
         << "master_sync_in_progress:" << ((m_master && !m_master->synced) ? 1 : 0) << "\n"
         << "followers:" << m_followers.size() << "\n";
+    if (m_shard_n > 1)
+        out << "shared_port_commands:" << m_stat_shared_cmds << "\n"
+            << "relayed_commands:" << m_stat_relayed_cmds << "\n";
     if (m_handoff_on)
         out << "handoff_out:" << m_stat_ho_out << "\n"
             << "handoff_in:" << m_stat_ho_in << "\n"

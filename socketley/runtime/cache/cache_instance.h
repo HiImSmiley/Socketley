@@ -570,6 +570,20 @@ public:
     // Stats
     std::string stats_lines() const override;
     uint64_t m_stat_commands{0};
+    // Above one shard: commands a client sent to the shared port, and those of them that named a key another shard
+    // owns and were relayed there, counted where they arrived.
+    uint64_t m_stat_shared_cmds{0};
+    uint64_t m_stat_relayed_cmds{0};
+    // The once-only line that says so under load, watched by shard 0 over windows of RELAY_WINDOW_NS.
+    static constexpr uint64_t RELAY_WINDOW_NS    = 2'000'000'000ull;
+    static constexpr uint64_t RELAY_WINDOW_MIN   = 2000;
+    static constexpr uint32_t RELAY_HIGH_WINDOWS = 2;
+    bool     m_relay_said{false};
+    uint32_t m_relay_high{0};
+    uint64_t m_relay_win_ns{0};
+    uint64_t m_relay_win_cmds{0};
+    uint64_t m_relay_win_relayed{0};
+    void relay_watch();
     // Commands whose arguments a follower could not have re-split the way this
     // leader meant them -- see the faithfulness check in process_resp_command.
     uint64_t m_repl_unfaithful{0};
@@ -735,6 +749,8 @@ private:
         first_inline<std::string> parts;
         first_inline<uint8_t>     part_filled;
         uint32_t                  parts_left{0};
+        // Counted once in relayed_commands, however many of its parts crossed.
+        bool                      relayed{false};
     };
 
     struct shard_batch
