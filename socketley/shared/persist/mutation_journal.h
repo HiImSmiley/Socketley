@@ -199,13 +199,31 @@ public:
                 ::close(fd);
                 return false;
             }
+            m_size = data.size() - st.dropped_bytes;
         }
 
         m_fd = fd;
         m_head = head;
+        if (st.st_size == 0)
+            m_size = head;
         m_pending.clear();
         m_given_up = false;
         return true;
+    }
+
+    // The records so far moved to `aside`, flushed first, and a fresh journal opened at `path` for what follows, so a
+    // snapshot taken now holds exactly what is aside; false leaves the journal as it was.
+    bool set_aside(const std::string& path, const std::string& aside, std::string_view owner)
+    {
+        if (m_fd < 0 || !flush())
+            return false;
+        if (::rename(path.c_str(), aside.c_str()) != 0)
+            return false;
+        if (open_append(path, owner))
+            return true;
+        if (::rename(aside.c_str(), path.c_str()) != 0) {}
+        if (!open_append(path, owner)) {}
+        return false;
     }
 
     void append(std::string_view record)
@@ -241,6 +259,7 @@ public:
         const bool ok = socketley::write_all(m_fd, m_pending.data(),
                                              m_pending.size(), &written);
         m_pending.erase(0, written);
+        m_size += written;
         return ok;
     }
 
@@ -257,7 +276,10 @@ public:
         m_pending.clear();
         if (m_fd < 0)
             return true;
-        return ::ftruncate(m_fd, static_cast<off_t>(m_head)) == 0;
+        if (::ftruncate(m_fd, static_cast<off_t>(m_head)) != 0)
+            return false;
+        m_size = m_head;
+        return true;
     }
 
     void close()
@@ -265,6 +287,7 @@ public:
         if (m_fd >= 0)
             ::close(m_fd);
         m_fd = -1;
+        m_size = 0;
         m_pending.clear();
     }
 
@@ -273,6 +296,7 @@ public:
     {
         const int fd = m_fd;
         m_fd = -1;
+        m_size = 0;
         m_pending.clear();
         return fd;
     }
@@ -281,6 +305,8 @@ public:
     // The descriptor, for a caller that syncs it off its loop after flush().
     int    fd() const            { return m_fd; }
     size_t pending_bytes() const { return m_pending.size(); }
+    // What the journal holds, on disk and buffered, head included.
+    uint64_t bytes() const       { return m_size + m_pending.size(); }
 
     ~mutation_journal() { close(); }
 
@@ -359,6 +385,7 @@ private:
 
     int         m_fd{-1};
     size_t      m_head{0};
+    uint64_t    m_size{0};
     std::string m_pending;
     // Set when m_pending outgrew max_pending with nothing written; cleared by the next open.
     bool m_given_up{false};

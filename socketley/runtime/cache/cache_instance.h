@@ -1023,6 +1023,32 @@ private:
     void        journal_after_snapshot(bool saved);     // truncate or flush
     void        arm_journal_timer();
 
+    // ── A snapshot off the loop ─────────────────────────────────────────────
+    // A journal past max(SOCKETLEY_CACHE_SNAPSHOT_MB, the last dump) is set aside as `<journal>.<g>` and a forked
+    // child writes the dump from what memory held at that instant, then removes what was set aside; the loop goes
+    // on with a fresh journal and hears of the child's end through its pidfd.
+    struct snapshot_child
+    {
+        pid_t      pid{-1};
+        int        pidfd{-1};
+        io_request req{};
+        bool       armed{false};
+    };
+    std::unique_ptr<snapshot_child> m_snap;
+    // The newest set-aside journal on disk, which the next one is numbered after.
+    uint64_t m_journal_gen{0};
+    // Journal bytes past which a snapshot starts.
+    uint64_t m_snap_at{UINT64_MAX};
+    uint64_t m_snap_floor{64ull << 20};
+    uint64_t m_stat_snapshots{0};
+    uint64_t m_stat_snapshot_failures{0};
+    static std::vector<std::pair<uint64_t, std::string>> journal_asides(const std::string& journal);
+    void     journal_drop_asides(uint64_t upto) const;
+    uint64_t snapshot_threshold() const;
+    void     snapshot_start();
+    void     snapshot_done();
+    void     snapshot_abort();
+
     // A burst must not turn the buffer into the leak the interval avoids, so
     // it reaches the disk early at this size.
     static constexpr size_t journal_flush_bytes = 64 * 1024;

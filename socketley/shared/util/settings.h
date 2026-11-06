@@ -80,6 +80,8 @@ inline constexpr setting table[] = {
      "buffers in a cache's receive ring"},
     {"SOCKETLEY_CACHE_TTL_SWEEP_MS", kind::number, audience::tuning, 1, 86400000, "500",
      "milliseconds between sweeps for expired cache keys"},
+    {"SOCKETLEY_CACHE_SNAPSHOT_MB", kind::number, audience::tuning, 1, 1048576, "64",
+     "MiB a cache shard's journal reaches, or its last dump's size if larger, before the shard snapshots"},
 
     // ─── lua ───
     {"SOCKETLEY_LUA_TIMEOUT_MS", kind::number, audience::tuning, 0, 3600000, "10000",

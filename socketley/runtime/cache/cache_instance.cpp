@@ -47,6 +47,11 @@
 #include <sstream>
 #include <limits>
 #include <sys/stat.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <dirent.h>
+#include <csignal>
 #include <poll.h>
 
 // Each dump says in its own head what split it was written under -- count,
@@ -874,6 +879,8 @@ bool cache_instance::setup(event_loop& loop)
     if (m_journal.is_open())
     {
         m_journal_timer = std::make_unique<timer_op>();
+        m_snap_floor = uint64_t{socketley::settings::number<uint32_t>("SOCKETLEY_CACHE_SNAPSHOT_MB").value_or(64)} << 20;
+        m_snap_at = snapshot_threshold();
         m_journal_timer->ts.tv_sec  = m_persist_interval;
         m_journal_timer->ts.tv_nsec = 0;
         m_journal_timer->req = { this, nullptr, -1, 0, op_timeout };
@@ -902,6 +909,9 @@ void cache_instance::teardown(event_loop& /*loop*/)
     // bound a stopping worker is held to instead of being killed inside it.
     if (!m_persistent_path.empty() && socketley::widen_exit_bound)
         socketley::widen_exit_bound(socketley::dump_exit_bound_sec);
+
+    // A snapshot still being written would land after this dump and over it.
+    snapshot_abort();
 
     // This shard's own slice into its own file, atomically, and never the bare
     // path, because a dump has to say what split it holds.
@@ -1299,6 +1309,13 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
     {
         m_journal_timer_armed = false;
         journal_flush_now();
+        return;
+    }
+
+    if (m_snap && req == &m_snap->req)
+    {
+        m_snap->armed = false;
+        snapshot_done();
         return;
     }
 
@@ -3648,11 +3665,17 @@ bool cache_instance::save_shard_dump() const
             // Its journal goes with it: past this dump either it was empty or
             // its split refused this start, so there is no record to lose.
             if (::unlink((stale + ".journal").c_str()) == 0) {}
+            for (const auto& a : journal_asides(stale + ".journal"))
+                if (::unlink(a.second.c_str()) == 0) {}
         }
         // The bare name's journal is a one-shard run's, superseded the same
         // way once more than one shard writes.
         if (m_shard_n > 1)
+        {
             if (::unlink((m_persistent_path + ".journal").c_str()) == 0) {}
+            for (const auto& a : journal_asides(m_persistent_path + ".journal"))
+                if (::unlink(a.second.c_str()) == 0) {}
+        }
     }
 
     return ok;
@@ -3884,6 +3907,16 @@ bool cache_instance::journal_recover()
         return false;
     };
 
+    // A journal and what a snapshot set aside of it, judged alike.
+    const auto judge_all = [&](const std::string& p, const std::string& expected) {
+        if (!judge(p, expected))
+            return false;
+        for (const auto& a : journal_asides(p))
+            if (!judge(a.second, expected))
+                return false;
+        return true;
+    };
+
     // Every sharded name, where a slice of the current split is a sibling's
     // business and everything else with records belongs to another run.
     for (uint32_t j = 0; j < max_shards; ++j)
@@ -3893,13 +3926,13 @@ bool cache_instance::journal_recover()
         const std::string expected =
             (m_shard_n > 1 && j < m_shard_n)
                 ? encode_shard_dump_header(m_shard_n, j) : std::string{};
-        if (!judge(p, expected))
+        if (!judge_all(p, expected))
             return false;
     }
     // And the bare name, which is this shard's own at one shard and a
     // one-shard run's leftover above that.
-    if (!judge(m_persistent_path + ".journal",
-               m_shard_n <= 1 ? own_head : std::string{}))
+    if (!judge_all(m_persistent_path + ".journal",
+                   m_shard_n <= 1 ? own_head : std::string{}))
         return false;
 
     std::string owner;
@@ -3915,7 +3948,16 @@ bool cache_instance::journal_recover()
         return false;
     }
 
+    // What a snapshot that did not finish set aside comes before the journal written after it, oldest first.
+    const auto asides = journal_asides(own);
+    m_journal_gen = asides.empty() ? 0 : asides.back().first;
+    std::vector<std::string> replay;
+    for (const auto& a : asides)
+        replay.push_back(a.second);
     if (pr == mutation_journal::probe_result::has_records)
+        replay.push_back(own);
+
+    for (const std::string& from : replay)
     {
         // Replay bypasses the mode and the global rate limit, because both
         // guard clients, and a recovery they throttle or refuse is data loss
@@ -3928,7 +3970,7 @@ bool cache_instance::journal_recover()
 
         mutation_journal::replay_stats st;
         const bool ok = mutation_journal::replay(
-            own, [&](std::string_view rec) { apply_replicated(rec); }, st);
+            from, [&](std::string_view rec) { apply_replicated(rec); }, st);
 
         m_journal_replaying = false;
         m_mode = saved_mode;
@@ -3936,15 +3978,15 @@ bool cache_instance::journal_recover()
 
         if (!ok)
         {
-            LOG_ERROR(("cache: the journal at " + own + " could not be read; "
+            LOG_ERROR(("cache: the journal at " + from + " could not be read; "
                        "refusing to start on part of a tail").c_str());
             return false;
         }
 
         LOG_INFO(("cache: replayed " + std::to_string(st.records)
-                  + " journaled write(s) from " + own).c_str());
+                  + " journaled write(s) from " + from).c_str());
         if (st.torn)
-            LOG_WARN(("cache: " + own + " ended mid-record; "
+            LOG_WARN(("cache: " + from + " ended mid-record; "
                       + std::to_string(st.dropped_bytes)
                       + " byte(s) after the last complete record were dropped")
                      .c_str());
@@ -4047,6 +4089,156 @@ void cache_instance::journal_mutation(std::string_view cmd)
         journal_flush_now();
     else
         arm_journal_timer();
+
+    if (SOCKETLEY_UNLIKELY(m_journal.bytes() >= m_snap_at))
+        snapshot_start();
+}
+
+// ─── A SNAPSHOT OFF THE LOOP ────────────────────────────────────────────────
+
+// `<journal>.<g>`, the journals snapshots set aside and did not see through, oldest first.
+std::vector<std::pair<uint64_t, std::string>> cache_instance::journal_asides(const std::string& journal)
+{
+    std::vector<std::pair<uint64_t, std::string>> out;
+    const size_t slash = journal.rfind('/');
+    const std::string dir  = slash == std::string::npos ? std::string(".") : journal.substr(0, slash == 0 ? 1 : slash);
+    const std::string base = (slash == std::string::npos ? journal : journal.substr(slash + 1)) + ".";
+    DIR* d = ::opendir(dir.c_str());
+    if (!d)
+        return out;
+    while (const dirent* e = ::readdir(d))
+    {
+        const std::string_view n(e->d_name);
+        uint64_t g = 0;
+        if (n.size() > base.size() && n.starts_with(base) && parse_int_sv(n.substr(base.size()), g) && g > 0)
+            out.emplace_back(g, (slash == std::string::npos ? std::string() : journal.substr(0, slash + 1))
+                                    + std::string(n));
+    }
+    ::closedir(d);
+    std::ranges::sort(out);
+    return out;
+}
+
+void cache_instance::journal_drop_asides(uint64_t upto) const
+{
+    for (const auto& a : journal_asides(journal_path(m_shard_i)))
+        if (a.first <= upto && ::unlink(a.second.c_str()) != 0)
+            LOG_WARN(("cache: could not remove " + a.second + ", which the dump now holds; the next start will "
+                      "replay it again").c_str());
+}
+
+// A journal longer than the dump it would be replayed onto is cheaper to absorb than to keep.
+uint64_t cache_instance::snapshot_threshold() const
+{
+    struct stat st{};
+    const uint64_t dump = ::stat(shard_dump_path(m_shard_i).c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) : 0;
+    return std::max(m_snap_floor, dump);
+}
+
+// The journal so far set aside, then a child writes the dump from what memory holds at this instant and removes
+// what was set aside, which nothing written after this needs.
+void cache_instance::snapshot_start()
+{
+    m_snap_at = UINT64_MAX;
+    if (m_snap || !m_loop || !m_journal.is_open() || m_persistent_path.empty())
+        return;
+
+    const std::string own   = journal_path(m_shard_i);
+    const uint64_t    gen   = m_journal_gen + 1;
+    const std::string aside = own + "." + std::to_string(gen);
+    const std::string head  = encode_shard_dump_header(m_shard_n, m_shard_i);
+    const std::string dump  = shard_dump_path(m_shard_i);
+    if (!m_journal.set_aside(own, aside, head))
+    {
+        LOG_WARN(("cache: could not set " + own + " aside for a snapshot; it grows until the next stop").c_str());
+        m_snap_at = m_journal.bytes() + m_snap_floor;
+        return;
+    }
+    m_journal_gen = gen;
+    // Named before the fork, so the child allocates as little as it can.
+    std::vector<std::string> drop;
+    for (const auto& a : journal_asides(own))
+        if (a.first <= gen)
+            drop.push_back(a.second);
+
+    const pid_t parent = ::getpid();
+    const pid_t pid    = ::fork();
+    if (pid == 0)
+    {
+        // Dies with the worker, so a restart never races a dump from the run before; holds none of its sockets, so a
+        // connection the worker closes is closed.
+        if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != parent)
+            ::_exit(2);
+        if (::syscall(SYS_close_range, 3u, ~0u, 0u) != 0) {}
+        const bool ok = m_store.save(dump, head);
+        if (ok)
+            for (const std::string& p : drop)
+                if (::unlink(p.c_str()) != 0) {}
+        ::_exit(ok ? 0 : 1);
+    }
+    if (pid < 0)
+    {
+        LOG_WARN(("cache: could not fork a snapshot of slice " + std::to_string(m_shard_i) + ": "
+                  + std::strerror(errno) + "; the journal grows until the next stop").c_str());
+        ++m_stat_snapshot_failures;
+        m_snap_at = m_journal.bytes() + m_snap_floor;
+        return;
+    }
+
+    m_snap = std::make_unique<snapshot_child>();
+    m_snap->pid   = pid;
+    m_snap->pidfd = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+    m_snap->req   = { this, nullptr, m_snap->pidfd, 0, op_poll };
+    m_snap->armed = m_snap->pidfd >= 0 && m_loop->submit_poll_add(m_snap->pidfd, POLLIN, &m_snap->req);
+    if (!m_snap->armed)
+    {
+        // Nothing would say when it ends, so it does not go on.
+        snapshot_abort();
+        ++m_stat_snapshot_failures;
+        m_snap_at = m_journal.bytes() + m_snap_floor;
+    }
+}
+
+// The child's end: a dump written and what it holds removed, or nothing changed and the next try a floor later.
+void cache_instance::snapshot_done()
+{
+    int status = 0;
+    const pid_t r = ::waitpid(m_snap->pid, &status, WNOHANG);
+    if (r == 0)
+    {
+        m_snap->armed = m_loop && m_loop->submit_poll_add(m_snap->pidfd, POLLIN, &m_snap->req);
+        if (m_snap->armed)
+            return;
+        snapshot_abort();
+        return;
+    }
+    close_tracked(m_snap->pidfd);
+    m_snap.reset();
+    if (r > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    {
+        ++m_stat_snapshots;
+        m_snap_at = snapshot_threshold();
+        return;
+    }
+    ++m_stat_snapshot_failures;
+    LOG_WARN(("cache: the snapshot of slice " + std::to_string(m_shard_i) + " beside " + m_persistent_path
+              + " failed; what it set aside stays and is replayed at the next start").c_str());
+    m_snap_at = m_journal.bytes() + m_snap_floor;
+}
+
+// A child still writing is stopped, before a dump of the loop's own or a stop; what it set aside stays for the next.
+void cache_instance::snapshot_abort()
+{
+    if (!m_snap)
+        return;
+    if (::kill(m_snap->pid, SIGKILL) != 0) {}
+    while (::waitpid(m_snap->pid, nullptr, 0) < 0 && errno == EINTR) {}
+    if (m_snap->pidfd >= 0)
+        close_tracked(m_snap->pidfd);
+    io_request* owed[1] = { &m_snap->req };
+    const size_t n = m_snap->armed ? 1 : 0;
+    retire(std::shared_ptr<void>(std::move(m_snap)), owed, n);
+    m_snap.reset();
 }
 
 void cache_instance::journal_flush_now()
@@ -4078,6 +4270,9 @@ void cache_instance::journal_after_snapshot(bool saved)
                   + journal_path(m_shard_i) + " behind its snapshot; the next "
                   "start will replay writes this dump already contains")
                  .c_str());
+    journal_drop_asides(UINT64_MAX);
+    m_journal_gen = 0;
+    m_snap_at = snapshot_threshold();
 }
 
 void cache_instance::arm_journal_timer()
@@ -7399,6 +7594,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             // This shard's own slice into its own file, the same write
             // teardown makes, fanned out to every shard so `all_ok` says so
             // only when every shard managed it.
+            snapshot_abort();
             const bool flushed = save_shard_dump();
             if (flushed)
                 journal_after_snapshot(true);
@@ -7419,6 +7615,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             }
             // The whole set judged as a set, so a gap or a contradiction
             // refuses rather than loading part of it, exactly as at start.
+            snapshot_abort();
             const bool loaded = load_shard_set();
             // The journal's tail describes state the load just replaced, so a
             // fresh snapshot of what is now in memory supersedes it before it
@@ -14015,6 +14212,10 @@ std::string cache_instance::stats_lines() const
     if (m_shard_n > 1)
         out << "shared_port_commands:" << m_stat_shared_cmds << "\n"
             << "relayed_commands:" << m_stat_relayed_cmds << "\n";
+    if (m_journal.is_open())
+        out << "journal_bytes:" << m_journal.bytes() << "\n"
+            << "journal_snapshots:" << m_stat_snapshots << "\n"
+            << "journal_snapshot_failures:" << m_stat_snapshot_failures << "\n";
     if (m_handoff_on)
         out << "handoff_out:" << m_stat_ho_out << "\n"
             << "handoff_in:" << m_stat_ho_in << "\n"

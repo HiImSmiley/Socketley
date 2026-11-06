@@ -6920,6 +6920,26 @@ written with mode
 A clean stop and the admin
 .B FLUSH
 command write the dump and cut the journal behind it.
+A running shard also snapshots on its own once its journal holds 64 MiB, or as
+much as its last dump if that is more
+.RB ( SOCKETLEY_CACHE_SNAPSHOT_MB ),
+so the journal stays bounded under a write load that never stops.
+The dump is written by a forked child from memory as it was when the snapshot
+began, so the shard keeps serving.
+While it runs, the journal up to that moment is set aside as
+.IB file .journal. N
+and new writes go to a fresh
+.IB file .journal ;
+the child removes what was set aside once the dump is in place.
+A snapshot that fails or is cut short leaves the set\-aside file, and the next
+start replays it before the journal.
+.B stats
+gives
+.BR journal_bytes ,
+.B journal_snapshots
+and
+.B journal_snapshot_failures
+per shard.
 An unclean stop leaves a tail, which the next start replays on top of the dump
 before serving.
 If the crash tore the tail in the middle of a record, the tail is dropped back
@@ -24450,6 +24470,16 @@ This never affects correctness: an expired key is not served no matter when the
 sweep runs, because every read path checks the expiry itself. The interval
 controls only how quickly keys that are never accessed again release their
 memory.
+.TP
+.B SOCKETLEY_CACHE_SNAPSHOT_MB
+Sets how many MiB a cache shard's journal
+.RB ( \-\-persistent\-interval )
+may hold before the shard snapshots, unless its last dump is larger, in which
+case that size is the bound.
+Default:
+.BR 64 .
+The snapshot is written by a forked child, so the shard goes on serving; the
+journal is then cut to what came after the snapshot began.
 .TP
 .B SOCKETLEY_LUA_TIMEOUT_MS
 Sets how long, in milliseconds, one Lua callback invocation may hold the
