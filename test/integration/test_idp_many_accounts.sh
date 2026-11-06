@@ -15,6 +15,7 @@
 #   * a snapshot written in pieces while writes go on that a restart reads back as other than the last of them
 #   * an answer over the 4 MiB a worker's writer queues refused whole, even with nothing ahead of it: the list of
 #     100,000 accounts never came, and the command waited out its bound
+#   * a reading shard that reads the accounts whole on its loop after each compaction of shard 0's: 490 ms each
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -146,6 +147,88 @@ echo "  the list: $lines lines, $(wc -c < "$T/list") bytes"
 [ "$lines" = "$N" ] && ok || bad "every account is listed" "$lines lines: $(head -c 120 "$T/list")"
 [ "$(head -1 "$T/list" | cut -f1)" = u1 ] && [ "$(sed -n 2p "$T/list" | cut -f1)" = u10 ] && ok \
     || bad "ordered by username" "$(head -2 "$T/list" | cut -f1 | tr '\n' ' ')"
+
+# Two shards: the reading one reads the accounts whole after each of shard 0's compactions, every thirty writes.
+"$BIN" stop auth >/dev/null 2>&1
+"$BIN" edit auth --shards 2 >/dev/null 2>&1
+"$BIN" start auth >/dev/null 2>&1
+for _ in $(seq 1 600); do
+    [ "$("$BIN" stats auth 2>/dev/null | grep -c "^accounts:$N$")" = 2 ] && break; sleep 0.1
+done
+out=$(timeout 300 python3 - "$PI" "$BIN" "$SOCKETLEY_SOCKET" <<'PY'
+import os, socket, subprocess, sys, threading, time
+port, b, sock = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+# The shard a connection reached, by the process holding its other end, and whether that one writes the journal.
+def ours():
+    for p in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if open("/proc/%s/comm" % p).read().strip() == "socketley" and \
+               ("SOCKETLEY_SOCKET=" + sock).encode() in open("/proc/%s/environ" % p, "rb").read().split(b"\0"):
+                yield p
+        except OSError:
+            pass
+def reads(s):
+    lport, ino = s.getsockname()[1], None
+    for l in open("/proc/net/tcp").readlines()[1:]:
+        f = l.split()
+        if int(f[1].split(":")[1], 16) == port and int(f[2].split(":")[1], 16) == lport:
+            ino = f[9]
+    for p in ours():
+        fds = {}
+        for fd in os.listdir("/proc/%s/fd" % p):
+            try:
+                fds[fd] = os.readlink("/proc/%s/fd/%s" % (p, fd))
+            except OSError:
+                pass
+        if "socket:[%s]" % ino in fds.values():
+            for fd, t in fds.items():
+                if t.endswith("accounts.journal"):
+                    flags = [l for l in open("/proc/%s/fdinfo/%s" % (p, fd)) if l.startswith("flags:")][0]
+                    return int(flags.split()[1], 8) & 3 == 0
+    return False
+def get(s):
+    s.sendall(b"GET /jwks HTTP/1.1\r\nHost: x\r\n\r\n")
+    buf = b""
+    while b"\r\n\r\n" not in buf: buf += s.recv(65536)
+    h, rest = buf.split(b"\r\n\r\n", 1)
+    n = int([l.split(b":")[1] for l in h.split(b"\r\n") if l.lower().startswith(b"content-length")][0])
+    while len(rest) < n: rest += s.recv(65536)
+socks = []
+for _ in range(32):
+    s = socket.create_connection(("127.0.0.1", port), timeout=30)
+    get(s)
+    if reads(s):
+        socks.append(s)
+    if len(socks) == 2:
+        break
+lat, stop = [], [False]
+def probe(s):
+    while not stop[0]:
+        t = time.perf_counter()
+        get(s)
+        lat.append((time.perf_counter() - t) * 1000)
+        time.sleep(0.001)
+th = [threading.Thread(target=probe, args=(s,)) for s in socks]
+for t in th: t.start()
+time.sleep(0.5)
+for i in range(120):
+    subprocess.run([b, "idp-user", "auth", "set", "u6", "name=r%d" % i], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(1)
+stop[0] = True
+for t in th: t.join()
+print("%d %.1f" % (len(socks), max(lat or [9999])))
+PY
+)
+read -r readers worst_reader <<<"$out"
+reopened=$("$BIN" stats auth 2>/dev/null | awk -F: '$1 == "reopened" { n += $2 } END { print n + 0 }')
+echo "  at two shards: the reading shard's worst answer beside 120 writes ${worst_reader:-?} ms, reading the accounts again $reopened time(s)"
+[ "${readers:-0}" -gt 0 ] && [ "$reopened" -ge 2 ] && ok || bad "the reading shard is asked while it reads the accounts again" "$out, reopened $reopened"
+if [ "$sanitized" = 1 ]; then echo "  SKIP [reader stall]: milliseconds measure the sanitizer, not the store"
+else
+    awk -v m="${worst_reader:-9999}" 'BEGIN{exit !(m < 100)}' && ok || bad "a reading shard reads the accounts again off its loop" "$out"
+fi
+r=$("$BIN" idp-user auth show u6 2>&1 | grep '^name:')
+[ "$r" = "name: r119" ] && ok || bad "the last write is the one shard 0 keeps" "${r:-no name}"
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="

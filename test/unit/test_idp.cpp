@@ -553,6 +553,39 @@ TEST_CASE("a shard that reads the accounts takes each change in, and a new journ
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("a reader's store read whole elsewhere is taken in place of the one it held, and goes on following")
+{
+    const std::string dir = fresh_dir();
+    std::string a, b, why;
+    account_store w;
+    REQUIRE(w.open(dir, why));
+    REQUIRE(w.create({{"username", "ivy"}}, a, why));
+    account_store r;
+    REQUIRE(r.follow_open(dir, why));
+    const uint64_t standing = r.standing_changes();
+    REQUIRE(w.compact(why));
+    REQUIRE(w.create({{"username", "jo"}}, b, why));
+    CHECK_FALSE(r.follow(w.journal_id(), w.journal_end()));
+    account_store fresh;
+    REQUIRE(fresh.follow_open(dir, why));
+    // The record written after the read is the tail the store taken in follows on to.
+    REQUIRE(w.update(a, {{"name", "Ivy I"}}, why));
+    r.take_followed(fresh);
+    CHECK(r.standing_changes() > standing);
+    CHECK(r.follow(w.journal_id(), w.journal_end()));
+    REQUIRE(r.by_name("jo"));
+    REQUIRE(r.by_name("ivy"));
+    CHECK(r.by_name("ivy")->field("name") == "Ivy I");
+    CHECK(r.size() == 2);
+    CHECK_FALSE(r.update(a, {{"name", "X"}}, why));
+    // The one handed back holds what was taken out, the account made before the snapshot alone.
+    CHECK(fresh.size() == 1);
+    CHECK_FALSE(fresh.by_name("jo"));
+    fresh.close();
+    CHECK(r.by_name("jo"));
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("a shard that reads accounts nobody has written yet starts empty and reads them once there are some")
 {
     const std::string dir = fresh_dir();
@@ -567,6 +600,25 @@ TEST_CASE("a shard that reads accounts nobody has written yet starts empty and r
     CHECK_FALSE(r.follow(w.journal_id(), w.journal_end()));
     REQUIRE(r.follow_open(dir, why));
     CHECK(r.by_name("hal"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a shard that reads a journal the writer has made but not yet begun starts as if there were none")
+{
+    const std::string dir = fresh_dir();
+    std::string a, why;
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir + "/accounts.journal").close();
+    account_store r;
+    REQUIRE(r.follow_open(dir, why));
+    CHECK(r.size() == 0);
+    account_store w;
+    REQUIRE(w.open(dir, why));
+    REQUIRE(w.create({{"username", "ida"}}, a, why));
+    CHECK_FALSE(r.follow(w.journal_id(), w.journal_end()));
+    REQUIRE(r.follow_open(dir, why));
+    CHECK(r.follow(w.journal_id(), w.journal_end()));
+    CHECK(r.by_name("ida"));
     std::filesystem::remove_all(dir);
 }
 

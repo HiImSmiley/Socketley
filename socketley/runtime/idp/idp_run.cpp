@@ -7,6 +7,7 @@
 #include "../../shared/util/ascii.h"
 
 #include <algorithm>
+#include <thread>
 #include <charconv>
 #include <cstring>
 
@@ -315,8 +316,18 @@ bool idp_run::start(std::string& why)
         why = m_clients_error;
         return false;
     }
-    if (!(m_reader ? m_accounts.follow_open(idp_accounts_dir(m_owner.get_name()), why)
-                   : m_accounts.open(idp_accounts_dir(m_owner.get_name()), why)))
+    if (m_reader)
+    {
+        // Read on a thread, as every later reading is, so that freeing them on the standing thread after the next
+        // compaction puts nothing in the loop's own heap, whose next large allocation would then sort it all out.
+        account_store first;
+        bool read = false;
+        std::thread([&] { read = first.follow_open(idp_accounts_dir(m_owner.get_name()), why); }).join();
+        if (!read)
+            return false;
+        m_accounts.take_followed(first);
+    }
+    else if (!m_accounts.open(idp_accounts_dir(m_owner.get_name()), why))
         return false;
     m_accounts.set_io(&m_io, &m_loop);
     // The accounts' standing beside the key, before any session is signed, so a proxy never verifies one without it.
@@ -330,7 +341,7 @@ bool idp_run::start(std::string& why)
     m_loop.register_owner(this);
     if (!m_hash.attach(m_io))
         m_hash.stop();
-    m_standing_attached = !m_reader && m_standing_pool.attach(m_io);
+    m_standing_attached = m_standing_pool.attach(m_io);
     for (std::string_view rest = m_owner.get_resources(); !rest.empty();)
         if (const std::string r = canonical_resource(socketley::take_item(rest, ',')); !r.empty())
             m_resources.push_back(r);
@@ -361,6 +372,7 @@ void idp_run::stop()
     m_fetch_pool.retire(m_loop);
     m_fetching.clear();
     m_standing_waiters.clear();
+    m_reload_waiters.clear();
     m_accounts.close();
 }
 
@@ -568,8 +580,30 @@ void idp_run::json_error(const std::shared_ptr<conn>& c, int status, std::string
 
 void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
 {
-    // What shard 0 has written by now, so an answer here is as current as one it would give.
+    // What shard 0 has written by now, so an answer here is as current as one it would give: one that reads the
+    // accounts waits while they are read whole, and one that reads none, as the keys, does not.
     catch_up();
+    const std::string_view p = rq.path;
+    if (m_reloading && p != "/jwks" && !p.starts_with("/.well-known/") && p != "/ssh/ca.pub")
+    {
+        std::weak_ptr<conn> weak = c;
+        c->waiting = true;
+        m_reload_waiters.push_back([this, weak, rq]() mutable {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            cc->waiting = false;
+            route(cc, rq);
+            if (!cc->waiting)
+                m_http.resume(cc);
+        });
+        return;
+    }
+    route(c, rq);
+}
+
+void idp_run::route(const std::shared_ptr<conn>& c, request& rq)
+{
     // The clients file, looked at again at most once a second.
     if (const int64_t now = wall::now_sec(); now != m_clients_checked)
     {
@@ -4113,20 +4147,33 @@ void idp_run::publish_accounts(std::function<void()> then)
     m_owner.shard_stats_table().publish_words(end, id);
 }
 
-void idp_run::catch_up()
+void idp_run::catch_up(std::function<void()> then)
 {
     if (!m_reader)
+    {
+        if (then)
+            then();
         return;
+    }
+    if (m_reloading)
+    {
+        if (then)
+            m_reload_waiters.push_back(std::move(then));
+        return;
+    }
     // The length before the journal it is of, since shard 0 says the journal first.
     auto& table = m_owner.shard_stats_table();
     const uint64_t end = table.word_at(0, 0);
     const uint64_t id = table.word_at(0, 1);
     if (m_accounts.follow(id, end))
+    {
+        if (then)
+            then();
         return;
+    }
     // Shard 0 has begun a new journal behind a snapshot, which is read whole.
     ++m_c.reopened;
-    std::string why;
-    if (!m_accounts.follow_open(idp_accounts_dir(m_owner.get_name()), why))
+    const auto failed = [this](const std::string& why)
     {
         // Said once a reason, since it is tried again at the next request.
         if (why != m_follow_error)
@@ -4134,10 +4181,55 @@ void idp_run::catch_up()
                       ": shard 0's accounts could not be read: " + why)
                          .c_str());
         m_follow_error = why;
+    };
+    const std::string dir = idp_accounts_dir(m_owner.get_name());
+    if (!m_standing_attached || !m_standing_pool.enabled())
+    {
+        std::string why;
+        if (!m_accounts.follow_open(dir, why))
+            failed(why);
+        else
+        {
+            m_follow_error.clear();
+            m_accounts.follow(id, end);
+        }
+        if (then)
+            then();
         return;
     }
-    m_follow_error.clear();
-    m_accounts.follow(id, end);
+    // Hundreds of milliseconds of the loop's at 100,000 accounts, so read on the thread into a store of its own while
+    // the loop goes on with what needs no account.
+    m_reloading = true;
+    if (then)
+        m_reload_waiters.push_back(std::move(then));
+    auto fresh = std::make_shared<account_store>();
+    auto why = std::make_shared<std::string>();
+    auto ok = std::make_shared<bool>(false);
+    m_standing_pool.submit(0, [fresh, why, ok, dir] { *ok = fresh->follow_open(dir, *why); },
+        [this, alive = m_alive, fresh, why, ok, failed]
+        {
+            if (!*alive)
+                return;
+            m_reloading = false;
+            auto waiting = std::move(m_reload_waiters);
+            m_reload_waiters.clear();
+            if (!*ok)
+            {
+                // Tried again at the next request, as the old store goes on serving.
+                failed(*why);
+                for (auto& w : waiting)
+                    w();
+                return;
+            }
+            m_follow_error.clear();
+            m_accounts.take_followed(*fresh);
+            // The accounts taken out are freed on the thread too, which at this size is milliseconds more.
+            m_standing_pool.submit(0, [fresh] { fresh->close(); }, [] {});
+            // The records written since it was read, and then whoever waited for them.
+            catch_up();
+            for (auto& w : waiting)
+                catch_up(std::move(w));
+        });
 }
 
 bool idp_run::cross(uint32_t shard, const shard_call& call, std::function<void(bool, std::string_view)> then)
@@ -4221,8 +4313,7 @@ void idp_run::update_account(const std::string& id, field_list fields,
             why = "shard 0, which keeps the accounts, did not answer";
         }
         // Shard 0 said the change before it answered, so it is read here before anything is answered from it.
-        catch_up();
-        then(ok, why);
+        catch_up([then, ok, why] { then(ok, why); });
     };
     if (!cross(0, shard_call{shard_call::update, id, std::move(fields), 0}, answered))
         then(false, "shard 0, which keeps the accounts, cannot be asked");

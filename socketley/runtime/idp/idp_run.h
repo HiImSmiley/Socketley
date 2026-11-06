@@ -86,6 +86,8 @@ private:
     // The request at the front of `in`: 1 taken, 0 not whole yet, -1 malformed.
     int take_request(conn& c, request& rq, int& refusal);
     void handle(const std::shared_ptr<conn>& c, request& rq);
+    // The request answered by what it asks for, once the accounts are as current as handle() wants them.
+    void route(const std::shared_ptr<conn>& c, request& rq);
     void respond(const std::shared_ptr<conn>& c, int status, std::string_view type, std::string_view body,
                  std::string_view extra_headers = {});
     void redirect(const std::shared_ptr<conn>& c, std::string_view location, std::string_view extra_headers = {});
@@ -300,7 +302,8 @@ private:
     // The lines updated and the whole file made from every one of them, by whoever holds the lines: the loop in line,
     // or the write under way, as there is only ever one.
     static std::string standing_doc(standing_lines& lines, standing_update u);
-    void catch_up();
+    // What shard 0 has written by now, read in; `then` runs once it is, which waits out a store being read whole.
+    void catch_up(std::function<void()> then = {});
 
     void answer_command(uint64_t ticket, std::string_view text);
     // The same once every account change made so far is on the disk, and told to the other shards.
@@ -396,13 +399,17 @@ private:
     bool m_reader{false};
     uint64_t m_told_id{0}, m_told_end{0};
     std::string m_follow_error;
+    // A reader's store read whole off the loop after shard 0 began a new journal, and what waits for it to be in.
+    bool m_reloading{false};
+    std::vector<std::function<void()>> m_reload_waiters;
     // The accounts' change count the standing was last written at, each account's line of it by id, the write under
     // way, and who waits for one as of which change count.
     uint64_t m_standing_at{UINT64_MAX};
     std::shared_ptr<standing_lines> m_standing_lines{std::make_shared<standing_lines>()};
     bool m_standing_writing{false};
     std::vector<std::pair<uint64_t, std::function<void()>>> m_standing_waiters;
-    // The thread the standing is written and synced on, apart from the sign-ins' hashing, which it would wait behind.
+    // The thread the standing is written and synced on, or a reader's accounts read whole, apart from the sign-ins'
+    // hashing, which it would wait behind.
     hash_pool m_standing_pool{1};
     bool m_standing_attached{false};
     std::unordered_map<uint64_t, std::function<void(bool, std::string_view)>> m_crossed;

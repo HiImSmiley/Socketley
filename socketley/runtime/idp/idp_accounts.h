@@ -52,6 +52,7 @@ public:
     static constexpr size_t   max_value      = 64 * 1024;
 
     account_store() = default;
+    ~account_store();
     account_store(const account_store&) = delete;
     account_store& operator=(const account_store&) = delete;
 
@@ -72,6 +73,9 @@ public:
     // The records the writer has added up to `end` of the journal `journal` names; false when it has since begun
     // another, which follow_open() then reads whole.
     bool follow(uint64_t journal, uint64_t end);
+    // The accounts `fresh` read whole with follow_open(), on a thread that touched no other store, taken in place of
+    // these; `fresh` is left holding the ones taken out, for that thread to free.
+    void take_followed(account_store& fresh);
     void close();
 
     // The journal written, by its inode, which a compaction changes; and its length, which every change grows.

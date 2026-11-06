@@ -322,9 +322,15 @@ bool account_store::follow_open(const std::string& dir, std::string& why)
     m_follow_fd = ::open(jpath.c_str(), O_RDONLY | O_CLOEXEC);
     if (!read_snapshot(dir + "/accounts.snapshot", why))
         return false;
+    struct stat st{};
+    // A journal the writer has made and not yet begun is one it has written nothing to.
+    if (m_follow_fd >= 0 && ::fstat(m_follow_fd, &st) == 0 && st.st_size == 0)
+    {
+        ::close(m_follow_fd);
+        m_follow_fd = -1;
+    }
     if (m_follow_fd < 0)
         return true;   // the writer has written nothing yet
-    struct stat st{};
     std::string owner;
     if (::fstat(m_follow_fd, &st) != 0 ||
         !mutation_journal::replay_fd(m_follow_fd, owner, [this](std::string_view rec) {
@@ -352,6 +358,30 @@ bool account_store::follow(uint64_t journal, uint64_t end)
                 ++m_journal_records;
         });
     return true;
+}
+
+void account_store::take_followed(account_store& fresh)
+{
+    m_accounts.swap(fresh.m_accounts);
+    m_names.swap(fresh.m_names);
+    m_emails.swap(fresh.m_emails);
+    std::swap(m_follow_fd, fresh.m_follow_fd);
+    std::swap(m_follow_off, fresh.m_follow_off);
+    std::swap(m_journal_id, fresh.m_journal_id);
+    std::swap(m_journal_records, fresh.m_journal_records);
+    m_dir = fresh.m_dir;
+    m_following = true;
+    // Accounts read again are a standing to be made again, as read_snapshot() says of its own store.
+    ++m_changes;
+    ++m_standing_changes;
+    m_standing_all = true;
+    m_standing_dirty.clear();
+}
+
+account_store::~account_store()
+{
+    if (m_follow_fd >= 0)
+        ::close(m_follow_fd);
 }
 
 void account_store::close()
