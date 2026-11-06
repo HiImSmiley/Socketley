@@ -150,8 +150,8 @@ bool claim_current_daemon(int control_fd)
 using control_writer = frame_writer;
 // A request or an answer to the daemon is let past the writer's cap as the daemon lets one past its own.
 constexpr size_t owed_backlog = frame_writer::MAX_BACKLOG + worker_proto::owed_backlog;
-// What requests and answers are admitted under, past which the asker is told the way was full.
-constexpr size_t owed_cap = frame_writer::MAX_BACKLOG + worker_proto::owed_cap;
+// What a request or answer of `size` is admitted under, past which the asker is told the way was full.
+constexpr size_t owed_cap(size_t size) { return frame_writer::MAX_BACKLOG + worker_proto::owed_cap_for(size); }
 static_assert(request_channel::MAX_PENDING_CLIENT_BYTES >= worker_proto::part_limit,
               "a request the daemon leg carries in pieces must fit the channel's queue");
 
@@ -173,9 +173,9 @@ public:
         const size_t size = worker_proto::chan_request_frame_size(target, payload);
         if (!worker_proto::write_wire(*m_w, size, [&](std::string& out) {
                 worker_proto::append_chan_request_frame(out, ticket, target, payload);
-            }, owed_cap))
+            }, owed_cap(size)))
             return false;
-        m_w->note_owed(worker_proto::wire_size(size));
+        m_w->note_owed(worker_proto::wire_size(size), worker_proto::goes_in_pieces(size));
         return true;
     }
 
@@ -1835,9 +1835,9 @@ private:
         const size_t size = worker_proto::chan_reply_frame_size(reply);
         if (worker_proto::write_wire(m_writer, size, [&](std::string& out) {
                     worker_proto::append_chan_reply_frame(out, ticket, st, reply);
-                }, owed_cap))
+                }, owed_cap(size)))
         {
-            m_writer.note_owed(worker_proto::wire_size(size));
+            m_writer.note_owed(worker_proto::wire_size(size), worker_proto::goes_in_pieces(size));
             return;
         }
         const auto overloaded = static_cast<uint8_t>(request_status::overloaded);

@@ -277,6 +277,11 @@ inline constexpr size_t part_limit = 256u << 20;
 // What a writer queues at most of requests and answers: owed_backlog, and beside it one frame as long as part_limit,
 // so a lone long one let in at any size does not shut out every small one behind it.
 inline constexpr size_t owed_cap = owed_backlog + part_limit;
+// The cap one request or answer of `size` is admitted under: owed_backlog, and owed_cap for one long enough to go in
+// pieces, so frames of one frame's size stop at owed_backlog and only a long one uses the room beside it.
+inline constexpr size_t owed_cap_for(size_t size) { return size > max_payload ? owed_cap : owed_backlog; }
+// Whether a frame of `size` goes in pieces, and so is queued under owed_cap beside the owed_backlog of the rest.
+inline constexpr bool goes_in_pieces(size_t size) { return size - header_size > max_payload; }
 
 // The bytes a frame of `size` takes on the wire.
 inline size_t wire_size(size_t size)
@@ -325,7 +330,7 @@ bool write_wire(Writer& w, size_t size, Fill&& fill, size_t cap)
     std::string whole;
     whole.reserve(size);
     fill(whole);
-    return w.write_with(wire_size(size), [&](std::string& out) { append_wire(out, whole); }, cap);
+    return w.write_with(wire_size(size), [&](std::string& out) { append_wire(out, whole); }, cap, true);
 }
 
 // The pieces of one frame put back together.

@@ -251,6 +251,7 @@ void proxy_supervisor::close_control()
         m_out.clear();
         m_out_off = 0;
         m_out_owed.clear();
+        m_out_lone.clear();
     }
 }
 
@@ -548,6 +549,7 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         m_out.clear();
         m_out_off = 0;
         m_out_owed.clear();
+        m_out_lone.clear();
     }
 
     int sv[2] = {-1, -1};
@@ -794,12 +796,15 @@ bool proxy_supervisor::write_frame(const std::string& framed, size_t cap)
         return false;
 
     const bool owed = cap != 0;
+    const bool lone = owed && worker_proto::goes_in_pieces(framed.size());
     size_t queued = pending_out();
     if (!owed)
     {
         queued -= std::min(queued, m_out_owed.pending(m_out_total - pending_out()));
         cap = MAX_CONTROL_BACKLOG;
     }
+    else if (!lone)
+        queued -= std::min(queued, m_out_lone.pending(m_out_total - pending_out()));
     // A frame with nothing queued ahead of it goes at any size, as a worker's frame_writer lets one go: the cap
     // bounds a backlog, and a frame of max_payload past it would otherwise never reach the child.
     const size_t wire = worker_proto::wire_size(framed.size());
@@ -813,6 +818,8 @@ bool proxy_supervisor::write_frame(const std::string& framed, size_t cap)
     m_out_total += wire;
     if (owed)
         m_out_owed.add(m_out_total, wire);
+    if (lone)
+        m_out_lone.add(m_out_total, wire);
     flush_control();
     // A flush that found the child gone closed the socket, and the frame went with it.
     return m_control_fd >= 0;
@@ -1142,10 +1149,10 @@ bool proxy_supervisor::send_direct(uint64_t ticket, std::string_view payload)
     // The worker answers a chan_req by handing the payload to its own runtime,
     // so the target is this supervisor's own name and the frame is the one
     // serve_deferred writes.
-    return write_frame(worker_proto::frame(
-        worker_proto::frame_type::chan_req,
-        worker_proto::encode_chan_request(ticket, m_placeholder->get_name(),
-                                          payload)), OWED_BACKLOG);
+    std::string f = worker_proto::frame(worker_proto::frame_type::chan_req,
+                                        worker_proto::encode_chan_request(ticket, m_placeholder->get_name(), payload));
+    const size_t cap = owed_cap(f.size());
+    return write_frame(std::move(f), cap);
 }
 
 bool proxy_supervisor::await_direct(uint64_t ticket,
@@ -1694,9 +1701,10 @@ bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view target,
     // `target` is this supervisor's own runtime by construction — the channel
     // only reaches here through the name this sink is registered under — but it
     // is sent rather than re-derived, so the two sides read the same field.
-    return write_frame(worker_proto::frame(
-        worker_proto::frame_type::chan_req,
-        worker_proto::encode_chan_request(ticket, target, payload)), OWED_BACKLOG);
+    std::string f = worker_proto::frame(worker_proto::frame_type::chan_req,
+                                        worker_proto::encode_chan_request(ticket, target, payload));
+    const size_t cap = owed_cap(f.size());
+    return write_frame(std::move(f), cap);
 }
 
 request_status proxy_supervisor::refusal(std::string_view, size_t) const
@@ -1780,9 +1788,10 @@ void proxy_supervisor::on_request_reply(uint64_t cookie, request_status st,
 
 void proxy_supervisor::write_answer(uint64_t ticket, uint8_t status, std::string_view reply)
 {
-    if (write_frame(worker_proto::frame(worker_proto::frame_type::chan_rep,
-                                        worker_proto::encode_chan_reply(ticket, status, reply)),
-                    OWED_BACKLOG) ||
+    std::string f   = worker_proto::frame(worker_proto::frame_type::chan_rep,
+                                          worker_proto::encode_chan_reply(ticket, status, reply));
+    const size_t cap = owed_cap(f.size());
+    if (write_frame(std::move(f), cap) ||
         m_control_fd < 0)
         return;
     // An asker told nothing waits out its deadline, so past the room for answers it is told the way was full.

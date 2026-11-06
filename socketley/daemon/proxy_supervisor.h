@@ -411,9 +411,9 @@ private:
     // alternative is the daemon growing without limit on behalf of a child
     // that has stopped reading.
     static constexpr size_t MAX_CONTROL_BACKLOG = 4u << 20;
-    // A request or an answer is let past the cap as far as worker_proto::owed_cap.
-    static constexpr size_t OWED_BACKLOG = MAX_CONTROL_BACKLOG + worker_proto::owed_cap;
-    // An answer for the child: queued within OWED_BACKLOG, else an empty one saying the way was overloaded.
+    // A request or an answer of `size` is let past the cap as far as worker_proto::owed_cap_for says.
+    static constexpr size_t owed_cap(size_t size) { return MAX_CONTROL_BACKLOG + worker_proto::owed_cap_for(size); }
+    // An answer for the child: queued within owed_cap(), else an empty one saying the way was overloaded.
     void   write_answer(uint64_t ticket, uint8_t status, std::string_view reply);
 
     std::string  m_out;
@@ -422,6 +422,8 @@ private:
     // Every byte ever queued in m_out, and of those the ones owed to an asker.
     uint64_t     m_out_total{0};
     owed_bytes   m_out_owed;
+    // Those of them that went in pieces, under a cap of their own beside the rest.
+    owed_bytes   m_out_lone;
 
     event_loop*  m_loop{nullptr};
 
