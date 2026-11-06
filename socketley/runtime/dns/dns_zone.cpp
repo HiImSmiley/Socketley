@@ -947,8 +947,79 @@ bool load_zone(const std::string& path, std::string_view origin_hint, zone& out,
     return true;
 }
 
+namespace
+{
+
+// A published name in wire form, as add_extra() reads it: one without a dot past a leading "*." under the apex.
+bool published_wire(const std::string& n, std::string_view origin, std::string& w)
+{
+    const bool relative = n.find('.', n.starts_with("*.") ? 2 : 0) == std::string::npos;
+    return name_from_text(relative ? n : (n.back() == '.' ? n : n + "."), origin, w) && is_subdomain(w, origin);
+}
+
+bool challenge_wire(const std::string& name, std::string_view origin, std::string& w)
+{
+    const std::string full = "_acme-challenge." + name + (name.back() == '.' ? "" : ".");
+    return name_from_text(full, {}, w) && is_subdomain(w, origin);
+}
+
+// A record line's owner within the zone, which is all of the line extra_within() looks at.
+bool record_within(const std::string& line, std::string_view origin)
+{
+    std::vector<entry> es;
+    std::string why, w;
+    return tokenize(line, es, why) && es.size() == 1 && !es[0].tokens.empty() &&
+           name_from_text(es[0].tokens[0].text, origin, w) && is_subdomain(w, origin);
+}
+
+uint32_t serial_add_of(const zone& z, const extra_records& x)
+{
+    if (x.reached.empty())
+        return x.serial_add;
+    uint32_t add = 0;
+    for (const auto& [name, s] : x.reached)
+        if (name.empty() || is_subdomain(name, z.origin))
+            add = std::max(add, s);
+    return add;
+}
+
+}   // namespace
+
+std::string extra_within(const zone& z, const extra_records& x)
+{
+    std::vector<std::string> parts;
+    std::string w;
+    bool names = false;
+    for (const auto& n : x.names)
+        if (!n.empty() && published_wire(n, z.origin, w))
+        {
+            parts.push_back("n" + w);
+            names = true;
+        }
+    if (names)
+    {
+        for (const auto& a : x.v4)
+            parts.push_back("4" + a);
+        for (const auto& a : x.v6)
+            parts.push_back("6" + a);
+    }
+    for (const auto& [name, value] : x.challenges)
+        if (!name.empty() && challenge_wire(name, z.origin, w))
+            parts.push_back("c" + w + " " + value);
+    for (const auto& line : x.records)
+        if (record_within(line, z.origin))
+            parts.push_back("r" + line);
+    std::sort(parts.begin(), parts.end());
+    std::string out = "s" + std::to_string(serial_add_of(z, x));
+    for (const auto& p : parts)
+        out += '\n' + p;
+    return out;
+}
+
 size_t add_extra(zone& z, const extra_records& x)
 {
+    z.feed = extra_within(z, x);
+    const uint32_t serial_add = serial_add_of(z, x);
     size_t added = 0;
     // The names between a new name and the apex, which exist from now on, empty.
     const auto make_path = [&](const std::string& name)
@@ -980,8 +1051,7 @@ size_t add_extra(zone& z, const extra_records& x)
     {
         std::string w;
         // Relative: no dot past a leading "*." -- "chat", and "*.ui" for the buckets of a storage runtime named "ui".
-        const bool relative = n.find('.', n.starts_with("*.") ? 2 : 0) == std::string::npos;
-        if (!name_from_text(relative ? n : (n.back() == '.' ? n : n + "."), z.origin, w) || !is_subdomain(w, z.origin))
+        if (n.empty() || !published_wire(n, z.origin, w))
             continue;
         put(w, type::A, published_ttl, x.v4);
         put(w, type::AAAA, published_ttl, x.v6);
@@ -990,8 +1060,7 @@ size_t add_extra(zone& z, const extra_records& x)
     for (const auto& [name, value] : x.challenges)
     {
         std::string w;
-        const std::string full = "_acme-challenge." + name + (name.back() == '.' ? "" : ".");
-        if (value.size() > 255 || !name_from_text(full, {}, w) || !is_subdomain(w, z.origin))
+        if (value.size() > 255 || name.empty() || !challenge_wire(name, z.origin, w))
             continue;
         std::string rd(1, static_cast<char>(value.size()));
         rd += value;
@@ -1047,9 +1116,9 @@ size_t add_extra(zone& z, const extra_records& x)
     for (const auto& s : sets)
         put(s.name, s.t, s.ttl, s.rdata);
     z.records += added;
-    z.serial += x.serial_add;
+    z.serial += serial_add;
     // The serial the SOA record itself carries, which is what a secondary compares.
-    if (x.serial_add)
+    if (serial_add)
         if (node* apex = z.names.count(z.origin) ? &z.names[z.origin] : nullptr)
             for (auto& set : apex->sets)
                 if (set.type == type::SOA && !set.rdata.empty())

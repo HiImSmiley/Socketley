@@ -18,8 +18,11 @@
 //
 // Files rather than messages because each side already has what it takes: the daemon writes its state there, and a
 // dns runtime, in a worker process of its own, reads a file when it changes. The directory's own time is when the
-// set last changed, a second later than the change before at least, and a dns runtime adds its seconds to the serial
-// it serves, so a secondary sees every change.
+// set last changed, a second later than the change before at least. Beside it, as .dns-changed, "<second> <name>"
+// lines say the second each name a change reached last changed, "." standing for a name relative to every zone; a
+// dns runtime adds to each zone's serial the latest second of the names within it, so a secondary sees every change
+// to a zone and none to another, and every shard and every restart serves the same serial. Without that file, as
+// a build before it left the directory, every zone takes the directory's own second.
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -63,13 +66,18 @@ struct snapshot
     std::vector<std::pair<std::string, std::string>> challenges;
     // The directory's modification time, nanoseconds; 0 when there is none.
     int64_t stamp_ns{0};
+    // Each name a change reached and the second it last did, from .dns-changed, and that file's own time; 0 and
+    // none when there is no such file.
+    std::vector<std::pair<std::string, int64_t>> reached;
+    int64_t changed_ns{0};
 };
 
 // What the directory holds now; an absent directory is an empty snapshot.
 snapshot read();
 
-// The directory's modification time alone, for asking cheaply whether anything changed.
+// The directory's modification time alone, for asking cheaply whether anything changed; and .dns-changed's.
 int64_t stamp_ns();
+int64_t changed_stamp_ns();
 
 // Whether `name` is one a runtime may be reached by: labels of letters, digits and hyphens, optionally led by "*.",
 // relative (no dot) or absolute; false with the reason.

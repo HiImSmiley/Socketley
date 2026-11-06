@@ -8,6 +8,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <sstream>
 
 #include <dirent.h>
@@ -37,10 +39,90 @@ bool write_atomic(const std::string& path, std::string_view data)
     return socketley::replace_file(path, data, socketley::durability::none, nullptr, 0644);
 }
 
+// A name a change reached, as the file beside the directory keeps it: absolute and lower case, or "." for a name
+// relative to every zone.
+std::string reached_name(std::string_view n, bool relative)
+{
+    if (relative || n.empty() || n == "@")
+        return ".";
+    std::string out(n);
+    for (char& c : out)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    if (out.back() != '.')
+        out += '.';
+    return out;
+}
+
+// A published name is relative when it has no dot past a leading "*.", as dns_zone's add_extra reads it.
+std::string reached_by_published(std::string_view n)
+{
+    return reached_name(n, n.find('.', n.starts_with("*.") ? 2 : 0) == std::string_view::npos);
+}
+
+// A record line's owner, the first word: absolute only where it ends in a dot.
+std::string reached_by_record(std::string_view line)
+{
+    const size_t b = line.find_first_not_of(" \t");
+    if (b == std::string_view::npos)
+        return {};
+    const std::string_view owner = line.substr(b, line.find_first_of(" \t", b) - b);
+    return reached_name(owner, !owner.ends_with('.'));
+}
+
+// The lines of `a` not in `b`, and of `b` not in `a`.
+std::vector<std::string> lines_apart(std::string_view a, std::string_view b)
+{
+    const auto split = [](std::string_view t)
+    {
+        std::vector<std::string> v;
+        std::istringstream in{std::string(t)};
+        for (std::string line; std::getline(in, line);)
+            if (!line.empty())
+                v.push_back(line);
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        return v;
+    };
+    const auto va = split(a), vb = split(b);
+    std::vector<std::string> out;
+    std::set_symmetric_difference(va.begin(), va.end(), vb.begin(), vb.end(), std::back_inserter(out));
+    return out;
+}
+
+std::string changed_path()
+{
+    return dir() + "-changed";
+}
+
+// The second `reached` names last changed, kept beside the directory; made with "." at `before` for every name, the
+// second the whole directory stood at until now.
+void note_reached(const std::vector<std::string>& reached, int64_t before, int64_t at)
+{
+    std::map<std::string, int64_t> last;
+    const std::string text = read_file(changed_path());
+    struct stat st{};
+    if (::stat(changed_path().c_str(), &st) < 0)
+        last["."] = before;
+    std::istringstream in(text);
+    int64_t sec = 0;
+    for (std::string name; in >> sec >> name;)
+        last[name] = std::max(last[name], sec);
+    for (const auto& n : reached)
+        if (!n.empty())
+            last[n] = std::max(last[n], at);
+    std::string out;
+    for (const auto& [name, s] : last)
+        out += std::to_string(s) + " " + name + "\n";
+    if (out != text)
+        write_atomic(changed_path(), out);
+}
+
 // A change to the directory, made under a lock beside it, after which the directory's time is moved past the
-// second it held before, so two changes in one second still raise the serial a dns runtime adds that second to.
+// second it held before, so two changes in one second still raise the serial a dns runtime adds that second to; and
+// that second noted for each name the change reached.
 template <class F>
-bool change(F&& f)
+bool change(const std::vector<std::string>& reached, F&& f)
 {
     std::error_code ec;
     std::filesystem::create_directories(dir(), ec);
@@ -49,10 +131,17 @@ bool change(F&& f)
     const int64_t before = stamp_ns() / 1000000000;
     const bool ok = f();
     struct stat st{};
-    if (before > 0 && ::stat(dir().c_str(), &st) == 0 && st.st_mtim.tv_sec <= before)
+    if (::stat(dir().c_str(), &st) == 0)
     {
-        const timespec times[2] = {{0, UTIME_OMIT}, {static_cast<time_t>(before + 1), 0}};
-        if (::utimensat(AT_FDCWD, dir().c_str(), times, 0) < 0) {}
+        int64_t at = st.st_mtim.tv_sec;
+        if (before > 0 && at <= before)
+        {
+            at = before + 1;
+            const timespec times[2] = {{0, UTIME_OMIT}, {static_cast<time_t>(at), 0}};
+            if (::utimensat(AT_FDCWD, dir().c_str(), times, 0) < 0) {}
+        }
+        // After the directory, so a dns runtime that read the change before its second looks again at this file's.
+        note_reached(reached, before, at);
     }
     if (lock >= 0)
         ::close(lock);
@@ -78,9 +167,13 @@ bool write_names(const std::vector<std::string>& names)
     const std::string path = dir() + "/names";
     struct stat st{};
     // Nothing written when nothing changed, and no file made for nothing.
-    if (::stat(path.c_str(), &st) < 0 ? text.empty() : read_file(path) == text)
+    const std::string was = ::stat(path.c_str(), &st) < 0 ? std::string() : read_file(path);
+    if (::stat(path.c_str(), &st) < 0 ? text.empty() : was == text)
         return true;
-    return change([&] { return write_atomic(path, text); });
+    std::vector<std::string> reached;
+    for (const auto& n : lines_apart(was, text))
+        reached.push_back(reached_by_published(n));
+    return change(reached, [&] { return write_atomic(path, text); });
 }
 
 bool write_challenge(std::string_view name, std::string_view value, std::string_view token, std::string& path)
@@ -93,12 +186,18 @@ bool write_challenge(std::string_view name, std::string_view value, std::string_
         value.find_first_of(" \n") != std::string_view::npos)
         return false;
     path = dir() + "/acme-" + safe.substr(0, 64);
-    return change([&] { return write_atomic(path, std::string(name) + " " + std::string(value) + "\n"); });
+    return change({reached_name("_acme-challenge." + std::string(name), false)},
+                  [&] { return write_atomic(path, std::string(name) + " " + std::string(value) + "\n"); });
 }
 
 void remove_challenge(const std::string& path)
 {
-    change([&] { return ::unlink(path.c_str()) == 0; });
+    std::istringstream in(read_file(path));
+    std::string name;
+    std::vector<std::string> reached;
+    if (in >> name)
+        reached.push_back(reached_name("_acme-challenge." + name, false));
+    change(reached, [&] { return ::unlink(path.c_str()) == 0; });
 }
 
 std::string routes_path(std::string_view entrance)
@@ -112,7 +211,8 @@ bool write_routes(std::string_view entrance, std::string_view table)
     struct stat st{};
     if (::stat(path.c_str(), &st) == 0 && read_file(path) == table)
         return true;
-    return change([&] { return write_atomic(path, table); });
+    // An entrance's table is no record of any zone.
+    return change({}, [&] { return write_atomic(path, table); });
 }
 
 void remove_routes_except(const std::vector<std::string>& entrances)
@@ -131,7 +231,7 @@ void remove_routes_except(const std::vector<std::string>& entrances)
     ::closedir(d);
     if (gone.empty())
         return;
-    change([&] {
+    change({}, [&] {
         for (const auto& g : gone)
             ::unlink((dir() + "/" + g).c_str());
         return true;
@@ -149,11 +249,16 @@ bool write_records(std::string_view runtime, std::string_view text)
     const std::string path = dir() + "/records-" + safe;
     struct stat st{};
     const bool there = ::stat(path.c_str(), &st) == 0;
-    if (text.empty())
-        return !there || change([&] { return ::unlink(path.c_str()) == 0; });
-    if (there && read_file(path) == text)
+    const std::string was = there ? read_file(path) : std::string();
+    if (there && was == text && !text.empty())
         return true;
-    return change([&] { return write_atomic(path, text); });
+    std::vector<std::string> reached;
+    for (const auto& line : lines_apart(was, text))
+        if (std::string r = reached_by_record(line); !r.empty())
+            reached.push_back(std::move(r));
+    if (text.empty())
+        return !there || change(reached, [&] { return ::unlink(path.c_str()) == 0; });
+    return change(reached, [&] { return write_atomic(path, text); });
 }
 
 // Beside the directory and not in it, since the directory's time dates the records and the zones are none of them.
@@ -189,12 +294,29 @@ int64_t stamp_ns()
     return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
 }
 
+int64_t changed_stamp_ns()
+{
+    struct stat st{};
+    if (::stat(changed_path().c_str(), &st) < 0)
+        return 0;
+    return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+}
+
 snapshot read()
 {
     snapshot s;
+    // Both times before what they date, so a change made while this reads is a change still to be read.
     s.stamp_ns = stamp_ns();
+    s.changed_ns = changed_stamp_ns();
     if (!s.stamp_ns)
         return s;
+    if (s.changed_ns)
+    {
+        std::istringstream in(read_file(changed_path()));
+        int64_t sec = 0;
+        for (std::string name; in >> sec >> name;)
+            s.reached.emplace_back(name, sec);
+    }
     {
         std::istringstream in(read_file(dir() + "/names"));
         for (std::string line; std::getline(in, line);)

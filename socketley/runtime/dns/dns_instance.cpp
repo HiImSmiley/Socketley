@@ -139,13 +139,29 @@ std::vector<std::string> split_csv(std::string_view s)
 // What signs a zone as it is loaded where the runtime signs its zones; false with why.
 using zone_signer = std::function<bool(zone&, std::string&)>;
 
-// Every zone of `paths`, read and checked, one apex each, and signed by `sign` where it is given; false with the reason.
+// The zones a reload takes as they are, by their file, since neither the file nor what the feed gives them changed.
+using zone_reuse = std::unordered_map<std::string, std::shared_ptr<const zone>>;
+
+// Every zone of `paths`, read and checked, one apex each, and signed by `sign` where it is given, or taken from
+// `reuse`; false with the reason.
 bool load_all(const std::vector<std::string>& paths, zone_set& out, std::string& why,
-              const extra_records* extra = nullptr, const zone_signer* sign = nullptr)
+              const extra_records* extra = nullptr, const zone_signer* sign = nullptr,
+              const zone_reuse* reuse = nullptr)
 {
     out.zones.clear();
     for (const auto& p : paths)
     {
+        if (const auto it = reuse ? reuse->find(p) : zone_reuse::const_iterator{}; reuse && it != reuse->end())
+        {
+            for (const auto& other : out.zones)
+                if (other->origin == it->second->origin)
+                {
+                    why = p + ": " + to_text(it->second->origin) + " is already served from " + other->path;
+                    return false;
+                }
+            out.zones.push_back(it->second);
+            continue;
+        }
         auto z = std::make_shared<zone>();
         if (!load_zone(p, {}, *z, why))
             return false;
@@ -388,6 +404,7 @@ private:
     // The addresses runtimes' names are given (--publish), and when the feed was last read.
     std::vector<std::string> m_v4, m_v6;
     int64_t m_feed_stamp{-1};
+    int64_t m_feed_changed{-1};
     std::chrono::steady_clock::time_point m_refusal_said{};
     bool m_auto_addresses{false};
     int64_t m_addresses_at{0};
@@ -434,6 +451,7 @@ private:
     {
         std::vector<std::string> paths;
         extra_records extra;
+        zone_reuse reuse;
         std::shared_ptr<const zone_set> prior;
         std::shared_ptr<zone_set> next;
         // The zones of files that are no zone now, kept as they were, and how each file stood when it was read.
@@ -1305,6 +1323,7 @@ extra_records dns_run::feed_extra()
     extra_records x;
     dns_feed::snapshot s = dns_feed::read();
     m_feed_stamp = s.stamp_ns;
+    m_feed_changed = s.changed_ns;
     // Names are published only where there are addresses to give them; DNS-01 answers always.
     if (!m_v4.empty() || !m_v6.empty())
         x.names = std::move(s.names);
@@ -1317,6 +1336,14 @@ extra_records dns_run::feed_extra()
     constexpr int64_t base = 1700000000;
     if (s.stamp_ns > 0)
         x.serial_add = static_cast<uint32_t>(std::max<int64_t>(0, s.stamp_ns / 1000000000 - base));
+    // Each zone the latest second of the names within it, where the feed says them.
+    for (const auto& [name, sec] : s.reached)
+    {
+        std::string w;
+        if (name != "." && !name_from_text(name, {}, w))
+            continue;
+        x.reached.emplace_back(std::move(w), static_cast<uint32_t>(std::max<int64_t>(0, sec - base)));
+    }
     return x;
 }
 
@@ -1325,12 +1352,27 @@ extra_records dns_run::feed_extra()
 void dns_run::read_zones(reload_job& j, const zone_signer* sign)
 {
     j.next = std::make_shared<zone_set>();
-    j.whole = load_all(j.paths, *j.next, j.why, &j.extra, sign);
+    // The zones taken as they were are no reload of them: not logged, counted or told to the secondaries.
+    const auto note_reused = [&j]
+    {
+        for (const auto& z : j.next->zones)
+            if (const auto it = j.reuse.find(z->path); it != j.reuse.end() && it->second == z)
+                j.kept.push_back(z.get());
+    };
+    j.whole = load_all(j.paths, *j.next, j.why, &j.extra, sign, &j.reuse);
     if (j.whole)
+    {
+        note_reused();
         return;
+    }
     j.next->zones.clear();
     for (const auto& p : j.paths)
     {
+        if (const auto it = j.reuse.find(p); it != j.reuse.end())
+        {
+            j.next->zones.push_back(it->second);
+            continue;
+        }
         auto z = std::make_shared<zone>();
         std::string ignored;
         bool sound = load_zone(p, {}, *z, ignored);
@@ -1360,6 +1402,7 @@ void dns_run::read_zones(reload_job& j, const zone_signer* sign)
                     j.broken.emplace_back(p, now);
             }
     }
+    note_reused();
 }
 
 void dns_run::check_zones()
@@ -1367,7 +1410,7 @@ void dns_run::check_zones()
     // A reload under way is looked at again once it has been served.
     if (m_reload)
         return;
-    bool changed = dns_feed::stamp_ns() != m_feed_stamp;
+    bool feed = dns_feed::stamp_ns() != m_feed_stamp || dns_feed::changed_stamp_ns() != m_feed_changed;
     // This machine's addresses, looked at once a minute when they are what is published.
     if (m_auto_addresses && steady_sec() - m_addresses_at >= 60)
     {
@@ -1379,27 +1422,35 @@ void dns_run::check_zones()
             LOG_INFO("dns: this machine's public addresses changed; the names published are given the new ones");
             m_v4 = std::move(v4);
             m_v6 = std::move(v6);
-            changed = true;
+            feed = true;
         }
     }
-    // A signed zone is signed again as a new week begins, its serial raised for the secondaries.
+    // A signed zone is signed again as a new week begins, its serial raised for the secondaries; and a file changed
+    // is read again. A file gone for a moment is no change; it is read again once it is back.
     const int64_t epoch = sign_epoch(socketley::wall::now_sec());
-    for (const auto& z : m_zones->zones)
-        if (z->dnssec && z->sign_epoch != epoch)
-            changed = true;
-    for (const auto& z : m_zones->zones)
+    const auto own_change = [&](const zone& z)
     {
-        // A file gone for a moment is no change; it is read again once it is back.
-        const socketley::file_stamp now = socketley::file_stamp::of(z->path);
-        const auto seen = m_broken.find(z->path);
-        if (now.exists() && now != z->stamp && (seen == m_broken.end() || seen->second != now))
-            changed = true;
-    }
-    if (!changed)
+        const socketley::file_stamp now = socketley::file_stamp::of(z.path);
+        const auto seen = m_broken.find(z.path);
+        return (z.dnssec && z.sign_epoch != epoch) ||
+               (now.exists() && now != z.stamp && (seen == m_broken.end() || seen->second != now));
+    };
+    if (!feed && std::none_of(m_zones->zones.begin(), m_zones->zones.end(),
+                              [&](const auto& z) { return own_change(*z); }))
+        return;
+    // Only the zones whose file, week or share of the feed changed are read and signed again; every other one is
+    // served on as it is, its signatures and serial with it.
+    extra_records extra = feed_extra();
+    zone_reuse reuse;
+    for (const auto& z : m_zones->zones)
+        if (!own_change(*z) && extra_within(*z, extra) == z->feed)
+            reuse.emplace(z->path, z);
+    if (reuse.size() == m_zones->zones.size())
         return;
     auto job = std::make_unique<reload_job>();
     job->paths = m_paths;
-    job->extra = feed_extra();
+    job->extra = std::move(extra);
+    job->reuse = std::move(reuse);
     job->prior = m_zones;
     reload_job* raw = job.get();
     const zone_signer* sign = &m_signer;

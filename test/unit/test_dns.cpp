@@ -782,3 +782,76 @@ TEST_CASE("dns feed: changes in one second each move the directory's time a seco
     REQUIRE(dns_feed::write_records("mail", "a.example.test. 300 IN TXT \"two\"\n"));
     CHECK(dns_feed::stamp_ns() / 1000000000 == third);
 }
+
+TEST_CASE("dns feed: each change notes the names it reached, so a zone's serial moves with its own records alone")
+{
+    const std::filesystem::path home = std::filesystem::temp_directory_path() / ("skl-reach-" + std::to_string(::getpid()));
+    std::filesystem::create_directories(home);
+    struct home_guard
+    {
+        const std::filesystem::path& path;
+        ~home_guard()
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } guard{home};
+    ::setenv("HOME", home.c_str(), 1);
+    const auto second_of = [](std::string_view name)
+    {
+        int64_t s = -1;
+        for (const auto& [n, sec] : dns_feed::read().reached)
+            if (n == name)
+                s = sec;
+        return s;
+    };
+    REQUIRE(dns_feed::write_records("mail", "mx.a.test. 300 IN TXT \"one\"\n"));
+    const int64_t first = dns_feed::stamp_ns() / 1000000000;
+    CHECK(second_of("mx.a.test.") == first);
+    // Made with every name at the second the directory stood at before.
+    CHECK(second_of(".") < first);
+    std::string path;
+    REQUIRE(dns_feed::write_challenge("B.test", "v", "tok", path));
+    const int64_t second = dns_feed::stamp_ns() / 1000000000;
+    CHECK(second_of("_acme-challenge.b.test.") == second);
+    CHECK(second_of("mx.a.test.") == first);
+    // Removed, the name it reached moves on; an entrance's table reaches none.
+    dns_feed::remove_challenge(path);
+    const int64_t third = dns_feed::stamp_ns() / 1000000000;
+    CHECK(second_of("_acme-challenge.b.test.") == third);
+    const int64_t every = second_of(".");
+    REQUIRE(dns_feed::write_routes("gate", "x\n"));
+    CHECK(second_of(".") == every);
+    CHECK(second_of("mx.a.test.") == first);
+    // A name relative to every zone reaches every zone; an absolute one its own.
+    REQUIRE(dns_feed::write_names({"chat", "www.a.test"}));
+    const int64_t fourth = dns_feed::stamp_ns() / 1000000000;
+    CHECK(second_of(".") == fourth);
+    CHECK(second_of("www.a.test.") == fourth);
+    REQUIRE(dns_feed::write_names({"chat"}));
+    CHECK(second_of("www.a.test.") == dns_feed::stamp_ns() / 1000000000);
+    CHECK(second_of(".") == fourth);
+
+    // Each zone adds the latest second within it, and what falls in it is told apart from what falls in another.
+    zone a = load("$ORIGIN a.test.\n@ IN SOA ns hm ( 7 1h 15m 1w 300 )\n  IN NS ns\nns IN A 192.0.2.1\n");
+    zone b = load("$ORIGIN b.test.\n@ IN SOA ns hm ( 7 1h 15m 1w 300 )\n  IN NS ns\nns IN A 192.0.2.1\n");
+    extra_records x;
+    x.serial_add = 9999;
+    std::string wa;
+    REQUIRE(name_from_text("mx.a.test.", {}, wa));
+    x.reached = {{"", 100}, {wa, 300}};
+    x.records = {"mx.a.test. 300 IN TXT \"one\""};
+    const std::string fb = extra_within(b, x);
+    const std::string fa = extra_within(a, x);
+    add_extra(a, x);
+    add_extra(b, x);
+    CHECK(a.serial == 7 + 300);
+    CHECK(b.serial == 7 + 100);
+    CHECK(a.feed == fa);
+    x.records = {"mx.a.test. 300 IN TXT \"two\""};
+    CHECK(extra_within(a, x) != fa);
+    CHECK(extra_within(b, x) == fb);
+    // Without the names a change reached, every zone takes the directory's second, as a feed an older build wrote.
+    x.reached.clear();
+    CHECK(extra_within(b, x) != fb);
+}

@@ -70,6 +70,8 @@ struct zone
     std::vector<std::string> chain;
     int64_t sig_expires_s{0};
     int64_t sign_epoch{0};
+    // extra_within() of what add_extra() gave it.
+    std::string feed;
 
     const node* find(std::string_view wire) const
     {
@@ -152,14 +154,19 @@ struct extra_records
     std::vector<std::pair<std::string, std::string>> challenges;
     // Master-file lines another runtime wrote, owners absolute: "mail.example.com. 300 IN MX 10 mx.example.com."
     std::vector<std::string> records;
-    // What is added to the file's serial, so a secondary sees a change of these.
+    // What is added to the file's serial, so a secondary sees a change of these: `serial_add` for every zone, or where
+    // `reached` holds any, the greatest of those whose name (wire form, empty for every zone) is within the zone.
     uint32_t serial_add{0};
+    std::vector<std::pair<std::string, uint32_t>> reached;
 };
 inline constexpr uint32_t published_ttl = 300;
 inline constexpr uint32_t challenge_ttl = 10;
 
-// `x` added to `z`, where it falls within it; how many records that was.
+// `x` added to `z`, where it falls within it; how many records that was. It notes extra_within() in z.feed.
 size_t add_extra(zone& z, const extra_records& x);
+// What of `x` falls within `z` and what it adds to its serial, as one text, so a zone whose text is the same as when
+// it was loaded is the zone it would be loaded as again.
+std::string extra_within(const zone& z, const extra_records& x);
 
 // Every zone a runtime serves, found for a name by its longest suffix that is an apex.
 struct zone_set

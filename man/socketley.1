@@ -15120,9 +15120,13 @@ dig photos.files.example.com     # 203.0.113.7
 .fi
 .PP
 So that a secondary notices changes, a zone is served with its file's serial
-plus the seconds from 2023\-11\-14 to the last change of that directory. The
-served serial grows with every change of the file's serial and of the published
-records. It is the same in every shard and after every restart.
+plus the seconds from 2023\-11\-14 to the last change of the published records
+that fall in that zone. A name published in one zone, an ACME answer or another
+runtime's records there, reads and signs again that zone alone; every other zone
+is served on as it was, with its serial and its signatures. A name without a dot
+falls in every zone. The served serial grows with every change of the file's
+serial and of the zone's published records. It is the same in every shard and
+after every restart.
 .SS What it answers
 A name that is found is answered authoritatively with its records. A CNAME is
 followed, up to eight steps, while its target is in the same zone. A wildcard
