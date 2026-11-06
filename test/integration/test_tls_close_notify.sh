@@ -10,6 +10,8 @@
 #   * an answer the kernel encrypts whose alert OpenSSL encrypted, or one sent as application data: the client fails
 #     on the record rather than reading an end
 #   * a close_notify after a backend that reset mid-answer, which vouches for an answer cut short as whole
+#   * an IMAP reply still in the COMPRESS deflate buffer when the connection settles, as the idle sweep's BYE is: the
+#     connection closed with neither the BYE nor close_notify
 #   * a session thrown away because the server closed: under --shards 4 a client that lets the server close never
 #     resumes, OpenSSL keeping no session from a connection that ended without close_notify
 set -uo pipefail
@@ -139,6 +141,38 @@ elif mode == "smtp":
     s.sendall(b"QUIT\r\n")
     got, how = drain(s)
     print(how, banner[:3].decode() + "/" + got[:3].decode())
+elif mode in ("imapz-logout", "imapz-idle"):
+    # COMPRESS DEFLATE over TLS, then LOGOUT, or nothing until the idle sweep says BYE.
+    import zlib
+    s = connect()
+    f = s.makefile("rb")
+    f.readline()
+    s.sendall(b"a LOGIN alice alicepassword1\r\n")
+    while not f.readline().startswith(b"a "):
+        pass
+    s.sendall(b"z COMPRESS DEFLATE\r\n")
+    if not f.readline().startswith(b"z OK"):
+        print("no-compress -")
+        sys.exit(0)
+    co, do = zlib.compressobj(wbits=-15), zlib.decompressobj(-15)
+    if mode == "imapz-logout":
+        s.sendall(co.compress(b"b LOGOUT\r\n") + co.flush(zlib.Z_SYNC_FLUSH))
+    s.settimeout(20)
+    wire, how = b"", None
+    try:
+        while True:
+            b = s.recv(65536)
+            if not b:
+                how = "clean"
+                break
+            wire += b
+    except ssl.SSLEOFError:
+        how = "ragged"
+    except (OSError, ssl.SSLError) as e:
+        how = "error(%s)" % e
+    text = do.decompress(wire)
+    lines = [l.split(b" ")[0] + b" " + l.split(b" ")[1] for l in text.split(b"\r\n") if l.count(b" ") >= 1]
+    print(how, "/".join(x.decode() for x in lines) or "-")
 elif mode == "resume":
     # A connection the server closes after each answer, the next one offering the session the last one ended with.
     version = ssl.TLSVersion.TLSv1_3 if sys.argv[3] == "1.3" else ssl.TLSVersion.TLSv1_2
@@ -175,13 +209,18 @@ P_FINBE=$((SL_PORT_BASE + 1414))
 P_TRST=$((SL_PORT_BASE + 1415))
 P_TFIN=$((SL_PORT_BASE + 1416))
 P_HRST=$((SL_PORT_BASE + 1417))
+P_MIDP=$((SL_PORT_BASE + 1418))
+P_MST=$((SL_PORT_BASE + 1419))
+P_MI=$((SL_PORT_BASE + 1420))
+P_MIS=$((SL_PORT_BASE + 1421))
 
 python3 "$T/client.py" backend "$P_RSTBE" rst >/dev/null 2>&1 &
 BE_RST=$!
 python3 "$T/client.py" backend "$P_FINBE" fin >/dev/null 2>&1 &
 BE_FIN=$!
 trap 'kill $BE_RST $BE_FIN 2>/dev/null; daemon_stop' EXIT
-daemon_start "$BIN"
+# The mail runtimes' idle sweep within the test's patience.
+SOCKETLEY_MAIL_IDLE_MS=3000 daemon_start "$BIN"
 "$BIN" create server srv -p "$P_SRV" --http "$T/www" "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create server sh4 -p "$P_SH" --http "$T/www" --shards 4 "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create server be -p "$P_BE" --http "$T/www" -s >/dev/null 2>&1
@@ -197,7 +236,16 @@ daemon_start "$BIN"
 "$BIN" create proxy tfin -p "$P_TFIN" --protocol tcp --backend "127.0.0.1:$P_FINBE" "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create proxy hrst -p "$P_HRST" --protocol http --backend "127.0.0.1:$P_RSTBE" "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create mail ml -p "$P_ML" --mail-domain example.test --submissions "$P_MLS" "${TLS[@]}" -s >/dev/null 2>&1
-for p in "$P_SRV" "$P_SH" "$P_BE" "$P_PX" "$P_PT" "$P_PXS" "$P_CA" "$P_ST" "$P_MQ" "$P_MLS" "$P_FC" "$P_TRST" "$P_TFIN" "$P_HRST"; do
+printf 'spa - http://localhost:5173/cb\n' >"$T/clients"
+"$BIN" create idp mauth -p "$P_MIDP" --clients "$T/clients" --issuer "http://127.0.0.1:$P_MIDP" -s >/dev/null 2>&1
+"$BIN" create storage mst -p "$P_MST" --dir "$T/mst" --anonymous -s >/dev/null 2>&1
+for p in "$P_MIDP/jwks" "$P_MST/"; do
+    for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p")" != 000 ] && break; sleep 0.1; done
+done
+"$BIN" idp-user mauth add alice --password alicepassword1 --email alice@example.test >/dev/null 2>&1
+"$BIN" create mail mi -p "$P_MI" --mail-domain example.test --idp mauth --storage mst/mail --imaps "$P_MIS" "${TLS[@]}" \
+    -s >/dev/null 2>&1
+for p in "$P_SRV" "$P_SH" "$P_BE" "$P_PX" "$P_PT" "$P_PXS" "$P_CA" "$P_ST" "$P_MQ" "$P_MLS" "$P_FC" "$P_TRST" "$P_TFIN" "$P_HRST" "$P_MIS"; do
     ready_tcp 127.0.0.1 "$p" 15 || bad "port $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 done
 # Every shard listening, so the reconnections are spread over all four.
@@ -216,6 +264,10 @@ r=$(client http "$P_ST" /)
 check "storage: an answer with Connection: close ends with close_notify" "${r%% *}" "clean"
 check "mqtt: DISCONNECT ends with close_notify" "$(client mqtt "$P_MQ")" "clean 0 20020000"
 check "mail: QUIT on --submissions ends with close_notify" "$(client smtp "$P_MLS")" "clean 220/221"
+check "mail: IMAP LOGOUT under COMPRESS, its BYE and OK whole, then close_notify" "$(client imapz-logout "$P_MIS")" \
+    "clean * BYE/b OK"
+check "mail: IMAP under COMPRESS left idle, its BYE whole, then close_notify" "$(client imapz-idle "$P_MIS")" \
+    "clean * BYE"
 
 # ─── A backend that fails is not vouched for ───────────────────────────────
 check "proxy (tcp): a backend that closes after an unframed answer ends it with close_notify" \
