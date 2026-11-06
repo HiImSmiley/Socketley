@@ -1099,6 +1099,12 @@ void mqtt_run::on_cqe(struct io_uring_cqe* cqe)
         if (!m_stopped)
             tick();
     }
+    else if (req == &m_ack_req)
+    {
+        m_ack_armed = false;
+        if (!m_stopped)
+            release_acks();
+    }
     else if (req == &m_tcp.req)
         accept_done(m_tcp, cqe);
     else if (req == &m_ws.req)

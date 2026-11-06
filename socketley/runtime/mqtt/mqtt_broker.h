@@ -377,6 +377,12 @@ public:
     // send only where someone listens.
     virtual void filter_added(const std::string& /*filter*/) {}
     virtual void filter_removed(const std::string& /*filter*/) {}
+    // Whether every shard that sends only where someone listens knows these filters are heard here; false when not
+    // yet, and `ready` is called once they do or once the SUBACK waiting on it has waited long enough.
+    virtual bool filters_heard(const std::vector<std::string>& /*filters*/, std::function<void()> /*ready*/)
+    {
+        return true;
+    }
     // A connection was let in to the session of a client here, and a session here ended.
     virtual void session_held(const std::string& /*client_id*/, const std::string& /*user*/, uint64_t /*stamp*/) {}
     virtual void session_ended(const std::string& /*client_id*/) {}
@@ -639,6 +645,8 @@ private:
     bool on_subscribe(connection& c, const frame& f);
     void subscribe_step(uint64_t conn, uint64_t generation, std::shared_ptr<subscribe_state> st, size_t i,
                         bool script_said_yes);
+    // The SUBACK of a walk that is done, and the retained messages after it.
+    void subscribe_ack(uint64_t conn, uint64_t generation, const std::shared_ptr<subscribe_state>& st);
     bool on_unsubscribe(connection& c, const frame& f);
     bool on_disconnect(connection& c, const frame& f);
 

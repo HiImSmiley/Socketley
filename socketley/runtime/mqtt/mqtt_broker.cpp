@@ -1391,6 +1391,24 @@ void broker::subscribe_step(uint64_t conn, uint64_t generation, std::shared_ptr<
         mark(s);
         st->codes.push_back(e.qos);
     }
+    // Answered once the other shards know of each new filter, so what one of them is sent next reaches it here.
+    std::vector<std::string> granted;
+    for (size_t k = 0; k < p.entries.size(); ++k)
+        if (st->codes[k] < 0x80)
+            granted.push_back(p.entries[k].filter);
+    if (!granted.empty() &&
+        !m_hooks.filters_heard(granted, [this, conn, generation, st] { subscribe_ack(conn, generation, st); }))
+        return;
+    subscribe_ack(conn, generation, st);
+}
+
+void broker::subscribe_ack(uint64_t conn, uint64_t generation, const std::shared_ptr<subscribe_state>& st)
+{
+    connection* c = conn_of(conn);
+    if (!c || c->generation != generation || c->ph != connection::phase::open || !c->s)
+        return;
+    session& s = *c->s;
+    const subscribe_packet& p = st->p;
     suback_packet ack;
     ack.packet_id = p.packet_id;
     ack.reasons   = st->codes;

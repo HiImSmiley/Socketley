@@ -93,6 +93,7 @@ public:
     bool heard_elsewhere(std::string_view topic) override;
     void filter_added(const std::string& filter) override;
     void filter_removed(const std::string& filter) override;
+    bool filters_heard(const std::vector<std::string>& filters, std::function<void()> ready) override;
     void session_held(const std::string& client_id, const std::string& user, uint64_t stamp) override;
     void session_ended(const std::string& client_id) override;
 
@@ -226,8 +227,9 @@ private:
         int64_t     retry_at{0};
         // When a receipt last came, or the first batch since the last went out.
         int64_t     heard_ms{0};
-        // The number of the frame at `head`, counted from this shard's start.
+        // The number of the frame at `head`, counted from this shard's start, and of the next one queued.
         uint64_t    seq{0};
+        uint64_t    queued{0};
         // The batches posted and not yet receipted, in the order they went.
         std::deque<shard_batch> sent;
         size_t waiting() const { return pending.size() - head; }
@@ -269,6 +271,13 @@ private:
     void settle(const std::string& client_id, uint64_t stamp, const std::string& user);
     void shard_stats(std::string& out) const;
     void sweep_claims(int64_t now);
+    // Every frame before `upto` that shard has taken, or it cannot be reached.
+    bool shard_took(uint32_t to, uint64_t upto) const;
+    // Whether every shard knows this shard holds the filter; forgotten here once they do.
+    bool heard_everywhere(const std::string& filter);
+    // The SUBACKs whose filters every shard knows now, or that have waited long enough, sent.
+    void release_acks();
+    void arm_ack_timer();
 
     mqtt_instance& m_owner;
     event_loop& m_loop;
@@ -435,6 +444,21 @@ private:
     };
     std::unordered_map<std::string, adopted_session> m_adopted;
     uint64_t m_moved_forwarded{0};
+    // A filter this shard took up, with the frame each shard is to take for it to know, until all of them have.
+    std::unordered_map<std::string, std::vector<uint64_t>, string_hash, string_equal> m_unheard;
+    // A SUBACK held until the other shards know its new filters, or until `until`.
+    struct held_ack
+    {
+        std::vector<std::string> filters;
+        int64_t until{0};
+        std::function<void()> ready;
+    };
+    std::vector<held_ack> m_held_acks;
+    io_request m_ack_req{};
+    __kernel_timespec m_ack_ts{};
+    bool m_ack_armed{false};
+    uint64_t m_acks_held{0};
+    uint64_t m_acks_late{0};
 };
 
 }   // namespace socketley::mqtt

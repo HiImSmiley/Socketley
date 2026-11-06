@@ -64,6 +64,8 @@ constexpr int64_t stall_ms = 1000;
 constexpr int64_t stamp_keep_us = 10'000'000;
 
 constexpr int64_t claim_patience_ms = 3000;
+// How long a SUBACK waits for the other shards to know its new filters, before it goes without.
+constexpr int64_t ack_patience_ms = 1000;
 // How long a shard that gave a session up hands on what still comes for it, far past the moment every other shard
 // heard where the session went.
 constexpr int64_t forward_keep_ms = 10'000;
@@ -155,6 +157,7 @@ bool mqtt_run::queue_shard(uint32_t to, std::string_view frame, bool droppable)
     }
     socketley::bytes::append32(q.pending, static_cast<uint32_t>(frame.size()));
     q.pending.append(frame);
+    ++q.queued;
     if (q.waiting() >= batch_bytes)
         send_shard(to);
     return true;
@@ -274,6 +277,8 @@ bool mqtt_run::shard_receipt(uint64_t cookie, request_status st, std::string_vie
         }
         q.sent.erase(q.sent.begin(), std::next(at));
         q.failing_since = 0;
+        if (!m_held_acks.empty())
+            release_acks();
     }
     else
     {
@@ -372,6 +377,7 @@ void mqtt_run::shards_start()
     m_moved.clear();
     m_unsaid.clear();
     m_adopted.clear();
+    m_unheard.clear();
     // What this shard holds, told whole, so a peer that knew an older picture of it replaces that one.
     const std::vector<std::string> mine = told_filters();
     const std::vector<std::string> clients = m_broker->session_ids();
@@ -487,8 +493,87 @@ void mqtt_run::share_interest(uint8_t v, const std::vector<std::string>& filters
 void mqtt_run::filter_added(const std::string& filter)
 {
     // One whose end was not told yet is still counted by the others.
-    if (sharded() && !m_peers.empty() && !m_unsaid.erase(filter))
-        share_interest(static_cast<uint8_t>(sverb::interest_add), {filter});
+    if (!sharded() || m_peers.empty() || m_unsaid.erase(filter))
+        return;
+    share_interest(static_cast<uint8_t>(sverb::interest_add), {filter});
+    std::vector<uint64_t>& upto = m_unheard[filter];
+    upto.assign(m_squeue.size(), 0);
+    for (uint32_t j = 0; j < m_squeue.size(); ++j)
+        if (j != m_owner.get_shard_index())
+            upto[j] = m_squeue[j].queued;
+}
+
+bool mqtt_run::shard_took(uint32_t to, uint64_t upto) const
+{
+    const shard_queue& q = m_squeue[to];
+    return (q.sent.empty() ? q.seq : q.sent.front().first) >= upto || unreachable(q);
+}
+
+bool mqtt_run::heard_everywhere(const std::string& filter)
+{
+    const auto it = m_unheard.find(filter);
+    if (it == m_unheard.end())
+        return true;
+    for (uint32_t j = 0; j < it->second.size(); ++j)
+        if (!shard_took(j, it->second[j]))
+            return false;
+    m_unheard.erase(it);
+    return true;
+}
+
+bool mqtt_run::filters_heard(const std::vector<std::string>& filters, std::function<void()> ready)
+{
+    bool heard = true;
+    for (const auto& f : filters)
+        heard = heard_everywhere(f) && heard;
+    if (heard)
+        return true;
+    ++m_acks_held;
+    m_held_acks.push_back({filters, now_ms() + ack_patience_ms, std::move(ready)});
+    arm_ack_timer();
+    return false;
+}
+
+void mqtt_run::release_acks()
+{
+    const int64_t now = now_ms();
+    std::vector<std::function<void()>> go;
+    for (size_t i = 0; i < m_held_acks.size();)
+    {
+        held_ack& h = m_held_acks[i];
+        bool all = true;
+        for (const auto& f : h.filters)
+            all = heard_everywhere(f) && all;
+        if (!all && now < h.until)
+        {
+            ++i;
+            continue;
+        }
+        // Past its patience it goes anyway, counted, since a message published elsewhere may not reach it yet.
+        if (!all)
+            ++m_acks_late;
+        go.push_back(std::move(h.ready));
+        m_held_acks.erase(m_held_acks.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    // Answered after the walk, since an answer lets the connection's next SUBSCRIBE be held here.
+    for (auto& g : go)
+        g();
+    arm_ack_timer();
+}
+
+void mqtt_run::arm_ack_timer()
+{
+    if (m_ack_armed || m_stopped || m_held_acks.empty())
+        return;
+    int64_t first = m_held_acks.front().until;
+    for (const auto& h : m_held_acks)
+        first = std::min(first, h.until);
+    const int64_t wait = std::max<int64_t>(first - now_ms(), 1);
+    m_ack_req       = io_request{};
+    m_ack_req.owner = this;
+    m_ack_req.type  = op_timeout;
+    m_ack_ts        = {wait / 1000, (wait % 1000) * 1'000'000};
+    m_ack_armed     = m_loop.submit_timeout(&m_ack_ts, &m_ack_req);
 }
 
 void mqtt_run::filter_removed(const std::string& filter)
@@ -744,6 +829,7 @@ bool mqtt_run::queue_deliver(uint32_t to, uint8_t qos, std::string_view body, co
     socketley::bytes::append64(out, m_shard_epoch);
     socketley::bytes::append64(out, m_msg_seq);
     socketley::bytes::append64(out, taken);
+    ++q.queued;
     if (q.waiting() >= batch_bytes)
         send_shard(to);
     return true;
@@ -990,6 +1076,16 @@ void mqtt_run::sweep_claims(int64_t now)
         if (now >= m_moved[i].until)
             drop_moved(i);
     std::erase_if(m_adopted, [&](const auto& kv) { return now >= kv.second.until; });
+    // A filter let go here is no longer waited on; one still held is, until every shard has it.
+    for (auto it = m_unheard.begin(); it != m_unheard.end();)
+    {
+        const auto next = std::next(it);
+        if (!m_broker->has_filter(it->first))
+            m_unheard.erase(it);
+        else
+            heard_everywhere(it->first);
+        it = next;
+    }
     if (!m_retained_stamps.empty())
     {
         const uint64_t us = claim_stamp(0) >> 6;
@@ -1318,6 +1414,8 @@ void mqtt_run::shard_stats(std::string& out) const
     st::put(out, "sessions_moved", m_sessions_moved);
     st::put(out, "sessions_kept", m_sessions_kept);
     st::put(out, "session_forwards", m_moved_forwarded);
+    st::put(out, "subacks_held", m_acks_held);
+    st::put(out, "subacks_unheard", m_acks_late);
 }
 
 }   // namespace socketley::mqtt

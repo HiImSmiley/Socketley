@@ -16324,6 +16324,13 @@ than before takes its session with it. The newest connection of a client id
 wins. A message still on its way to the shard a session left is handed on to
 the shard it went to, once, for ten seconds after the move; these are counted in
 .BR session_forwards .
+A SUBACK for a filter the other shards do not know yet waits until every shard
+that answers has taken it, so a message published anywhere after the SUBACK
+reaches the subscriber. It waits a second at most, and then goes anyway. The
+SUBACKs that waited are counted in
+.BR subacks_held ,
+and those that went after the second in
+.BR subacks_unheard .
 A session moves as one piece. When shards relay through the daemon
 (see
 .BR SOCKETLEY_NO_SHARD_MESH ),
