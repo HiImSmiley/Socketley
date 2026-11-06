@@ -3870,9 +3870,10 @@ eavesdropper but not against someone in the path, while it reports itself as
 encrypted either way.
 .PP
 A listener speaks TLS 1.2 and 1.3. Over 1.2, it offers only ECDHE key exchange
-with AEAD ciphers (Mozilla's intermediate list). It resumes sessions from its
-own cache, not from tickets. A ticket key lives as long as the process, and
-anyone who learned it could open every session it ever sealed.
+with AEAD ciphers (Mozilla's intermediate list). A returning client resumes its
+session by a ticket on whichever shard it reaches: every shard seals tickets
+with the same key, a new one each hour, which still opens its tickets through
+the next hour and is then wiped. The key is never written to disk.
 .PP
 Trust stores are read when the runtime starts. A listener's certificate and key
 are checked again every two seconds. When they are replaced on disk, by
