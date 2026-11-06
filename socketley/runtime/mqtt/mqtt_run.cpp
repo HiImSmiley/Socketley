@@ -794,16 +794,22 @@ void mqtt_run::raw_out(conn& c, std::string_view bytes)
         return;
     if (c.ssl)
     {
+        // The record layer takes so much before what it made is taken out, which is done after each piece; a piece
+        // it refuses leaves the packet cut short, so the connection ends at once, at the settle after this turn.
         size_t off = 0;
         while (off < bytes.size())
         {
             const int w = tls_context::ssl_write(c.ssl, bytes.data() + off,
                                                  static_cast<int>(std::min<size_t>(bytes.size() - off, 1u << 20)));
+            queue_tls_out(c);
             if (w <= 0)
-                break;
+            {
+                close(c.id);
+                c.closing_ms = now_ms() - close_grace_ms;
+                return;
+            }
             off += static_cast<size_t>(w);
         }
-        queue_tls_out(c);
     }
     else
         queue_owned(c, bytes);

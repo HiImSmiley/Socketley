@@ -8,6 +8,7 @@
 #     made the user
 #   * a cleartext CONNECT answered on a TLS port
 #   * wss refused where ws is served
+#   * a payload over a MiB cut short on its way through the record layer: the subscriber never sees it, nor any after
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -28,6 +29,7 @@ T=$SOCKETLEY_TMPD
 PT=$((SL_PORT_BASE + 1934))
 PS=$((SL_PORT_BASE + 1935))
 PSW=$((SL_PORT_BASE + 1936))
+PB=$((SL_PORT_BASE + 1937))
 trap 'daemon_stop' EXIT
 daemon_start "$BIN"
 
@@ -54,14 +56,17 @@ printf 'alicepass1\n' | "$BIN" mqtt-passwd "$T/users" alice >/dev/null 2>&1
     && ok || bad "a broker taking client certificates is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 "$BIN" create mqtt s -p "$PS" --tls --cert "$T/srv.pem" --key "$T/srv.key" --users "$T/users" --ws "$PSW" -s >/dev/null 2>&1 \
     && ok || bad "a broker over TLS with passwords and secure WebSocket is made" "$(tail -3 "$SOCKETLEY_DLOG")"
-for p in "$PT" "$PS" "$PSW"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -5 "$SOCKETLEY_DLOG")"; done
+"$BIN" create mqtt b -p "$PB" --tls --cert "$T/srv.pem" --key "$T/srv.key" --anonymous --max-packet 8M \
+    -s >/dev/null 2>&1 && ok || bad "a broker over TLS taking large packets is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+for p in "$PT" "$PS" "$PSW" "$PB"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -5 "$SOCKETLEY_DLOG")"; done
 
 run() {
-    PYTHONPATH="$HERE" python3 - "$PT" "$PS" "$PSW" "$BIN" "$T" 2>&1 <<'PY'
+    PYTHONPATH="$HERE" python3 - "$PT" "$PS" "$PSW" "$BIN" "$T" "$PB" 2>&1 <<'PY'
 import os, ssl, subprocess, sys
 from lib_mqtt import *
 pt, ps, psw = (int(x) for x in sys.argv[1:4])
 binary, tmpd = sys.argv[4], sys.argv[5]
+pb = int(sys.argv[6])
 
 def tls_ctx(cert=None, key=None):
     ctx = ssl.create_default_context(cafile=os.path.join(tmpd, "ca.pem"))
@@ -113,8 +118,30 @@ def tls_passwords():
     t.disconnect()
     w.disconnect()
 
+def large_payloads():
+    # Past the MiB the record layer is given at a time, at both QoS, then a small one: each whole and in order.  The
+    # subscriber speaks TLS 1.2, whose records are always encrypted here, as they are where the kernel has no TLS.
+    ctx12 = tls_ctx()
+    ctx12.maximum_version = ssl.TLSVersion.TLSv1_2
+    sub = Client(pb, tls=ctx12, timeout=20)
+    sub.connect("big-sub")
+    sub.subscribe(("big/#", 1))
+    pub = Client(pb, tls=tls_ctx(), timeout=20)
+    pub.connect("big-pub")
+    sizes = [(1536 << 10, 0), (3 << 20, 1), (6 << 20, 0), (100, 1)]
+    want = [bytes([65 + i]) * n for i, (n, _) in enumerate(sizes)]
+    for (n, q), p in zip(sizes, want):
+        pub.publish("big/t", p, qos=q)
+    got = sub.messages(len(sizes), 30)
+    check("payloads of 1.5, 3 and 6 MiB over TLS and a small one after them arrive whole",
+          [len(m.payload) if m.payload == w else "cut at %d" % len(m.payload) for m, w in zip(got, want)],
+          [n for n, _ in sizes])
+    sub.disconnect()
+    pub.disconnect()
+
 guarded("certificates", certificates)
 guarded("tls passwords", tls_passwords)
+guarded("large payloads", large_payloads)
 PY
 }
 tally < <(run)
