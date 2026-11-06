@@ -372,6 +372,8 @@ struct alignas(64) proxy_client_connection
     int fcgi_sock_flags{-1};
     // A wait for room for a record of its own type, which kernel TLS sends with its type and the socket was full for.
     bool tls_wait{false};
+    // Closed with a reset: what it is owed has not moved for --idle-timeout.
+    bool reset_on_close{false};
 
     // Bumped on every reuse from the pool and stamped into io_requests, so
     // late completions from the previous occupant can be recognised and

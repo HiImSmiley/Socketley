@@ -1152,6 +1152,8 @@ flags_options() {
     echo "│ --global-rate-limit│ Messages/sec across all connections   │"
     echo "│ --idle-timeout <s>│ Close idle connections after N seconds │"
     echo "│                  │ or a duration suffix: 5m / 2h / 1d / 1w │"
+    echo "│                  │ (server, proxy: and an answer the client│"
+    echo "│                  │ took nothing of for as long)            │"
     echo "│ --congestion <n> │ TCP congestion control of accepted      │"
     echo "│                  │ connections: bbr holds its rate at 1%   │"
     echo "│                  │ loss, where cubic falls to a twentieth  │"

@@ -2,6 +2,7 @@
 #include "../../shared/net/socket_tuning.h"
 #include "../../shared/loop/conn_alloc.h"
 #include "server_instance.h"
+#include "../../shared/net/orderly_close.h"
 #include "../../shared/http/conditional.h"
 #include "../../shared/http/encoding.h"
 #include "../../shared/http/mime.h"
@@ -343,6 +344,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->drain_on_close = false;
     conn->drained_bytes = 0;
     conn->end_handed = false;
+    conn->reset_on_close = false;
 
     SKL_INV_POOLABLE("server::pool_release", conn->fd,
         conn_ops_pending(conn.get()),
@@ -411,7 +413,13 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
     if (SOCKETLEY_UNLIKELY(conn->splice_sendfile && conn->splice_out_pending) && fd >= 0)
         ::shutdown(fd, SHUT_RDWR);
     // What the client is owed and the kernel still holds goes out before the FIN, and none of it is reset away.
-    if (SOCKETLEY_LIKELY(m_ring_loop != nullptr) && fd >= 0)
+    if (SOCKETLEY_UNLIKELY(conn->reset_on_close) && fd >= 0)
+    {
+        const linger now_reset{1, 0};
+        if (::setsockopt(fd, SOL_SOCKET, SO_LINGER, &now_reset, sizeof now_reset) < 0) {}
+        close_tracked(fd);
+    }
+    else if (SOCKETLEY_LIKELY(m_ring_loop != nullptr) && fd >= 0)
         m_ring_loop->close_fd_orderly(fd, conn->ssl != nullptr && tls_context::close_notify_queued(conn->ssl) &&
                                               tls_context::kernel_sends(conn->ssl));
     else
@@ -3194,6 +3202,22 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                         }
                         else
                             drains_left = true;
+                    }
+                    // What a client is owed and has not taken for the timeout ends it, closing or not: a client
+                    // that stopped reading holds the connection for as long as it likes otherwise.
+                    if (sweep_idle && !cconn->reset_on_close && (cconn->closing || (now - cconn->last_activity) > timeout))
+                    {
+                        const socketley::send_look out = socketley::look_at_send(cfd);
+                        if (socketley::send_stalled(out, timeout))
+                        {
+                            cconn->closing        = true;
+                            cconn->reset_on_close = true;
+                            shutdown(cfd, SHUT_RDWR);
+                            continue;
+                        }
+                        // Quiet, but taking what it is sent.
+                        if (!cconn->closing && out.owed > 0)
+                            continue;
                     }
                     if (cconn->closing)
                         continue;

@@ -2,6 +2,7 @@
 #include "../../shared/net/socket_tuning.h"
 #include "../../shared/loop/conn_alloc.h"
 #include "proxy_instance.h"
+#include "../../shared/net/orderly_close.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/turn_clock.h"
@@ -288,6 +289,7 @@ void proxy_client_connection::reset(int new_fd)
     file.reset();
     fcgi_sock_flags = -1;
     tls_wait = false;
+    reset_on_close = false;
     // client_pool_release() already did this, repeated because a struct
     // leaving the pool must not carry the previous connection's session.
     tls_context::free_ssl(ssl);
@@ -2661,16 +2663,40 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     // leaves the clients after the first idle one for the next
                     // tick.
                     auto timeout = std::chrono::seconds(m_idle_timeout_cached);
-                    std::vector<int> expired;
+                    std::vector<int> expired, stalled;
                     size_t found = 0;
                     for (int cfd = 0; cfd < MAX_FDS && found < m_client_count; cfd++)
                     {
                         auto* cconn = m_client_slots[cfd];
                         if (!cconn) continue;
                         found++;
-                        if (cconn->closing) continue;
-                        if ((now - cconn->last_activity) > timeout)
+                        if (cconn->reset_on_close) continue;
+                        const bool quiet = (now - cconn->last_activity) > timeout;
+                        // What a client is owed and has not taken for the timeout ends it, closing or not: the close of
+                        // one that stopped reading otherwise waits on a write that never completes.
+                        if (cconn->closing || quiet)
+                        {
+                            const socketley::send_look out = socketley::look_at_send(cfd);
+                            if (socketley::send_stalled(out, timeout))
+                            {
+                                stalled.push_back(cfd);
+                                continue;
+                            }
+                            // Quiet, but taking what it is sent.
+                            if (out.owed > 0)
+                                continue;
+                        }
+                        if (!cconn->closing && quiet)
                             expired.push_back(cfd);
+                    }
+                    for (int cfd : stalled)
+                    {
+                        auto* cconn = m_client_slots[cfd];
+                        if (!cconn) continue;
+                        cconn->reset_on_close = true;
+                        // The write it is stuck on comes back failed, and the pair closes behind it.
+                        shutdown(cfd, SHUT_RDWR);
+                        close_pair(cfd, cconn->ex.backend_fd, close_reason::force);
                     }
 
                     // close_pair() and not `closing = true` plus SHUT_RD.  The
@@ -8060,12 +8086,18 @@ void proxy_instance::end_client_read(proxy_client_connection* conn)
         shutdown(conn->fd, SHUT_RD);
 }
 
-// The client's descriptor given back through orderly_close, so the kernel keeps none of its answer back.
+// The client's descriptor given back: reset when what it was owed stopped moving, and otherwise through orderly_close,
+// so the kernel keeps none of its answer back.
 void proxy_instance::close_client_fd(proxy_client_connection* conn, int fd)
 {
     event_loop* lp = m_loop ? m_loop : m_retired_loop;
-    if (lp == nullptr)
+    if (conn->reset_on_close || lp == nullptr)
     {
+        if (conn->reset_on_close)
+        {
+            const linger now_reset{1, 0};
+            if (::setsockopt(fd, SOL_SOCKET, SO_LINGER, &now_reset, sizeof now_reset) < 0) {}
+        }
         close_tracked(fd);
         return;
     }

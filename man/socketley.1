@@ -3693,7 +3693,12 @@ connection.
 Closes connections that have received no data for longer than
 .IR duration .
 0 disables it (default). A sweep timer checks for idle connections every
-30 seconds. A bare number is seconds; a suffix of
+30 seconds.
+On a server or proxy a connection that is still being sent an answer is not
+idle while the answer moves, however slowly the client reads; one whose client
+has taken nothing of it for
+.I duration
+is reset, whether it was to be kept alive or closed after the answer. A bare number is seconds; a suffix of
 .BR s ", " m ", " h ", " d " or " w
 means seconds, minutes, hours, days or weeks
 .RB ( 300 " and " 5m " both work)."

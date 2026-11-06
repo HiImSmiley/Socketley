@@ -125,6 +125,8 @@ struct alignas(64) server_connection
     uint32_t drained_bytes{0};
     // Its end is orderly_close's to send under kernel TLS, its read withdrawn so the close comes.
     bool end_handed{false};
+    // Closed with a reset: what it is owed has not moved for --idle-timeout.
+    bool reset_on_close{false};
     // This runtime closed the connection because the producer outran the
     // socket, not because the peer went away.  Sticky, and read by the refusal
     // a script gets so it can tell "slow down" from "it is gone".
