@@ -148,6 +148,8 @@ bool claim_current_daemon(int control_fd)
 // The worker's writer and the shard mesh's links share one bounded-backlog
 // writer, because two of them is two places to get the EAGAIN case wrong.
 using control_writer = frame_writer;
+// A request or an answer to the daemon is let past the writer's cap as the daemon lets one past its own.
+constexpr size_t owed_backlog = frame_writer::MAX_BACKLOG + worker_proto::owed_backlog;
 
 // Every runtime this process does not hold, as the mirror of
 // proxy_supervisor's sink: the request goes out on the control socket, the
@@ -170,7 +172,7 @@ public:
         return m_w->write_with(
             worker_proto::chan_request_frame_size(target, payload), [&](std::string& out) {
                 worker_proto::append_chan_request_frame(out, ticket, target, payload);
-            });
+            }, owed_backlog);
     }
 
     size_t request_room(std::string_view target) const override
@@ -1405,12 +1407,7 @@ private:
                             std::to_string(worker_proto::max_payload >> 20) + " MiB)";
                 reply = too_large;
             }
-            // Let past the backlog's cap by one frame, as the daemon lets an answer go on to the asker.
-            if (!m_writer.write_with(
-                    worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
-                        worker_proto::append_chan_reply_frame(
-                            out, to.wire_ticket, static_cast<uint8_t>(st), reply);
-                    }, answer_backlog)) {}
+            answer_daemon(to.wire_ticket, static_cast<uint8_t>(st), reply);
             return;
         }
 
@@ -1431,7 +1428,7 @@ private:
         {
             // Within what the writer still lets an answer past, as one past it is refused and its asker told nothing.
             const size_t queued = m_writer.pending();
-            const size_t free = queued == 0 ? SIZE_MAX : queued < answer_backlog ? answer_backlog - queued : 0;
+            const size_t free = queued == 0 ? SIZE_MAX : queued < owed_backlog ? owed_backlog - queued : 0;
             const size_t frame = worker_proto::max_payload + worker_proto::header_size;
             return std::min(frame, free) > envelope ? std::min(frame, free) - envelope : 0;
         }
@@ -1797,10 +1794,23 @@ private:
             }
         }
 
-        if (!m_writer.write_with(
+        answer_daemon(q.ticket, st, reply);
+    }
+
+    // Let past the backlog's cap as far as owed_backlog, as the daemon lets an answer go on to the asker; past that
+    // the asker is told the way was overloaded, since one told nothing waits out its deadline.
+    void answer_daemon(uint64_t ticket, uint8_t st, std::string_view reply)
+    {
+        if (m_writer.write_with(
                 worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
-                    worker_proto::append_chan_reply_frame(out, q.ticket, st, reply);
-                })) {}
+                    worker_proto::append_chan_reply_frame(out, ticket, st, reply);
+                }, owed_backlog))
+            return;
+        const auto overloaded = static_cast<uint8_t>(request_status::overloaded);
+        if (!m_writer.write_with(
+                worker_proto::chan_reply_frame_size({}), [&](std::string& out) {
+                    worker_proto::append_chan_reply_frame(out, ticket, overloaded, {});
+                }, SIZE_MAX)) {}
     }
 
     // The answer to something this worker's runtime asked, whose ticket this
@@ -2454,9 +2464,6 @@ private:
     };
     std::unordered_map<uint64_t, deferred_reply> m_deferred;
     uint64_t                                     m_next_deferred{1};
-    // An answer to the daemon is let past the writer's cap by one frame, since one refused is owed to an asker.
-    static constexpr size_t answer_backlog =
-        frame_writer::MAX_BACKLOG + worker_proto::max_payload + worker_proto::header_size;
     // A replica of the daemon's map and a live channel, declared before the
     // runtime so it outlives it: a runtime revokes its origin as it is
     // destroyed and that call needs a channel that is still there.

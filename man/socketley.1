@@ -16346,7 +16346,7 @@ A session moves as one piece. When shards relay through the daemon
 (see
 .BR SOCKETLEY_NO_SHARD_MESH ),
 that piece holds 8 MiB, less what the shard still has queued to the daemon past
-4 MiB. A larger session stays on its shard, and a connection to
+68 MiB. A larger session stays on its shard, and a connection to
 another shard is refused with Server unavailable until the client lands on the
 session's own shard. Such a refusal is counted in
 .BR sessions_kept .
@@ -24674,7 +24674,10 @@ stops shards from linking to each other directly.
 The shards then relay through the daemon, and the daemon logs at startup that
 the mesh is off. This is the measurement control for the mesh: the two paths
 differ only in the route, not in the build. One request or answer through the
-daemon holds 8 MiB, while a link carries a longer one in pieces.
+daemon holds 8 MiB, while a link carries a longer one in pieces. Eight such
+answers may wait at once on each side of the daemon for a shard that has not
+read them yet; past that, an asker is answered at once that the way is
+overloaded.
 .TP
 .B SOCKETLEY_CACHE_HANDOFF
 .B 0

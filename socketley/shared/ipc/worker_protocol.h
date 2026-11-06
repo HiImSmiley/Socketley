@@ -34,6 +34,10 @@ inline constexpr size_t header_size = 8;
 // above the largest legitimate payload.
 inline constexpr uint32_t max_payload = 8u * 1024u * 1024u;
 
+// What requests and answers may queue past a writer's cap on either side of the daemon, since each is owed to an asker
+// that nobody else answers: eight of the largest at once.
+inline constexpr size_t owed_backlog = 8 * (size_t{max_payload} + header_size);
+
 enum class frame_type : uint16_t
 {
     // worker → daemon

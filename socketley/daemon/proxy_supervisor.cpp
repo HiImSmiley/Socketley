@@ -1667,7 +1667,7 @@ bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view target,
     // is sent rather than re-derived, so the two sides read the same field.
     return write_frame(worker_proto::frame(
         worker_proto::frame_type::chan_req,
-        worker_proto::encode_chan_request(ticket, target, payload)));
+        worker_proto::encode_chan_request(ticket, target, payload)), OWED_BACKLOG);
 }
 
 // ─── the other direction ────────────────────────────────────────────────────
@@ -1695,13 +1695,7 @@ void proxy_supervisor::on_chan_req(std::string_view payload)
     if (!worker_proto::decode_chan_request(payload, q))
         return;
 
-    const auto refuse = [&](request_status st)
-    {
-        if (!write_frame(worker_proto::frame(
-                worker_proto::frame_type::chan_rep,
-                worker_proto::encode_chan_reply(q.ticket,
-                    static_cast<uint8_t>(st), {})), ANSWER_BACKLOG)) {}
-    };
+    const auto refuse = [&](request_status st) { write_answer(q.ticket, static_cast<uint8_t>(st), {}); };
 
     // The one cycle this arrangement can produce, cut here as the second lock
     // on a door the worker's own registration already closes.
@@ -1746,8 +1740,19 @@ void proxy_supervisor::on_chan_req(std::string_view payload)
 void proxy_supervisor::on_request_reply(uint64_t cookie, request_status st,
                                         std::string_view reply)
 {
-    if (!write_frame(worker_proto::frame(
-            worker_proto::frame_type::chan_rep,
-            worker_proto::encode_chan_reply(cookie, static_cast<uint8_t>(st),
-                                            reply)), ANSWER_BACKLOG)) {}
+    write_answer(cookie, static_cast<uint8_t>(st), reply);
+}
+
+void proxy_supervisor::write_answer(uint64_t ticket, uint8_t status, std::string_view reply)
+{
+    if (write_frame(worker_proto::frame(worker_proto::frame_type::chan_rep,
+                                        worker_proto::encode_chan_reply(ticket, status, reply)),
+                    OWED_BACKLOG) ||
+        m_control_fd < 0)
+        return;
+    // An asker told nothing waits out its deadline, so past the room for answers it is told the way was full.
+    if (!write_frame(worker_proto::frame(worker_proto::frame_type::chan_rep,
+                                         worker_proto::encode_chan_reply(
+                                             ticket, static_cast<uint8_t>(request_status::overloaded), {})),
+                     SIZE_MAX)) {}
 }
