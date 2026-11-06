@@ -18,6 +18,8 @@ class frame_writer
 {
 public:
     static constexpr size_t MAX_BACKLOG = 4u << 20;
+    // The cap when none is named: MAX_BACKLOG of frames nobody waits on, counted beside what note_owed() named.
+    static constexpr size_t UNOWED = 0;
 
     // Caps the 32-bit SQE length against an unbounded backlog.
     static constexpr size_t MAX_SEND = 1u << 20;
@@ -89,11 +91,12 @@ public:
         m_dead = true;
     }
 
-    bool write(std::string_view framed, size_t cap = MAX_BACKLOG)
+    bool write(std::string_view framed, size_t cap = UNOWED)
     {
         if (!admit(framed.size(), cap))
             return false;
         m_out.append(framed);
+        m_total += framed.size();
 
         // Queue only: submitting per frame ends the ring's wait for a
         // completion nobody needed, and the loop stops batching.
@@ -105,22 +108,32 @@ public:
     // write() for a frame built straight into the queue: `fill` appends
     // exactly `size` bytes, and is not called for a frame the cap refuses.
     template <class Fill>
-    bool write_with(size_t size, Fill&& fill, size_t cap = MAX_BACKLOG)
+    bool write_with(size_t size, Fill&& fill, size_t cap = UNOWED)
     {
         if (!admit(size, cap))
             return false;
         fill(m_out);
+        m_total += size;
         if (!m_loop)
             blocking_flush();
         return true;
     }
 
     // A frame with nothing queued ahead of it goes at any size: the cap bounds a backlog, and one frame is none.
-    bool admit(size_t size, size_t cap = MAX_BACKLOG)
+    bool admit(size_t size, size_t cap = UNOWED)
     {
-        return pending() == 0 ||
-               m_gate.admit(pending(), size, cap, "frame writer: backlog full; the peer is not reading");
+        size_t queued = pending();
+        if (cap == UNOWED)
+        {
+            queued -= std::min(queued, m_owed.pending(m_total - pending()));
+            cap = MAX_BACKLOG;
+        }
+        return queued == 0 ||
+               m_gate.admit(queued, size, cap, "frame writer: backlog full; the peer is not reading");
     }
+
+    // The frame of `n` bytes just written is owed to an asker, and bounded by the cap it was written under.
+    void note_owed(size_t n) { m_owed.add(m_total, n); }
 
     void flush()
     {
@@ -224,6 +237,9 @@ private:
     size_t       m_off{0};
     backlog_gate m_gate;
     bool         m_dead{false};
+    // Every byte ever queued, of which the first m_total - pending() have gone.
+    uint64_t     m_total{0};
+    owed_bytes   m_owed;
 
     // Null until use_ring(); everything above works without it.
     event_loop* m_loop{nullptr};

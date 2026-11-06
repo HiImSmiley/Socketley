@@ -150,6 +150,10 @@ bool claim_current_daemon(int control_fd)
 using control_writer = frame_writer;
 // A request or an answer to the daemon is let past the writer's cap as the daemon lets one past its own.
 constexpr size_t owed_backlog = frame_writer::MAX_BACKLOG + worker_proto::owed_backlog;
+// What requests and answers are admitted under, past which the asker is told the way was full.
+constexpr size_t owed_cap = frame_writer::MAX_BACKLOG + worker_proto::owed_cap;
+static_assert(request_channel::MAX_PENDING_CLIENT_BYTES >= worker_proto::part_limit,
+              "a request the daemon leg carries in pieces must fit the channel's queue");
 
 // Every runtime this process does not hold, as the mirror of
 // proxy_supervisor's sink: the request goes out on the control socket, the
@@ -166,10 +170,13 @@ public:
         // resolve it, and false means the backlog is full, so the channel
         // answers the origin rather than parking a ticket nothing will
         // complete.  One past max_payload goes in pieces.
-        return worker_proto::write_wire(*m_w,
-            worker_proto::chan_request_frame_size(target, payload), [&](std::string& out) {
+        const size_t size = worker_proto::chan_request_frame_size(target, payload);
+        if (!worker_proto::write_wire(*m_w, size, [&](std::string& out) {
                 worker_proto::append_chan_request_frame(out, ticket, target, payload);
-            }, owed_backlog);
+            }, owed_cap))
+            return false;
+        m_w->note_owed(worker_proto::wire_size(size));
+        return true;
     }
 
     // What one frame holds, which a runtime that sizes its own crossings keeps to, though a longer request goes in pieces.
@@ -179,10 +186,10 @@ public:
         return envelope < worker_proto::max_payload ? worker_proto::max_payload - envelope : 0;
     }
 
-    // A live socket that refused a request the daemon could read refused it for its backlog.
-    request_status refusal(std::string_view target, size_t size) const override
+    // Refused with the daemon still there is the way being full, which is not the target being gone.
+    request_status refusal(std::string_view, size_t) const override
     {
-        return !m_w->dead() && size <= request_room(target) ? request_status::overloaded : request_status::no_target;
+        return m_w->dead() ? request_status::no_target : request_status::overloaded;
     }
 
 private:
@@ -1821,20 +1828,24 @@ private:
         answer_daemon(q.ticket, st, reply);
     }
 
-    // Let past the backlog's cap as far as owed_backlog, as the daemon lets an answer go on to the asker; past that
+    // Let past the backlog's cap as far as owed_cap, as the daemon lets an answer go on to the asker; past that
     // the asker is told the way was overloaded, since one told nothing waits out its deadline.
     void answer_daemon(uint64_t ticket, uint8_t st, std::string_view reply)
     {
-        if (worker_proto::write_wire(m_writer,
-                worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
+        const size_t size = worker_proto::chan_reply_frame_size(reply);
+        if (worker_proto::write_wire(m_writer, size, [&](std::string& out) {
                     worker_proto::append_chan_reply_frame(out, ticket, st, reply);
-                }, owed_backlog))
+                }, owed_cap))
+        {
+            m_writer.note_owed(worker_proto::wire_size(size));
             return;
+        }
         const auto overloaded = static_cast<uint8_t>(request_status::overloaded);
-        if (!m_writer.write_with(
+        if (m_writer.write_with(
                 worker_proto::chan_reply_frame_size({}), [&](std::string& out) {
                     worker_proto::append_chan_reply_frame(out, ticket, overloaded, {});
-                }, SIZE_MAX)) {}
+                }, SIZE_MAX))
+            m_writer.note_owed(worker_proto::chan_reply_frame_size({}));
     }
 
     // The answer to something this worker's runtime asked, whose ticket this

@@ -354,7 +354,9 @@ public:
 
 private:
     void   close_control();
-    bool   write_frame(const std::string& framed, size_t cap = MAX_CONTROL_BACKLOG);
+    // With no cap named, a frame nobody waits on, held to MAX_CONTROL_BACKLOG of those beside what is owed; a cap
+    // named is a request's or an answer's, owed to an asker and counting everything queued.
+    bool   write_frame(const std::string& framed, size_t cap = 0);
 
     // One outstanding direct request, because a command handler blocks until
     // its own answer arrives and cannot start a second.
@@ -409,14 +411,17 @@ private:
     // alternative is the daemon growing without limit on behalf of a child
     // that has stopped reading.
     static constexpr size_t MAX_CONTROL_BACKLOG = 4u << 20;
-    // A request or an answer is let past the cap as far as worker_proto::owed_backlog.
-    static constexpr size_t OWED_BACKLOG = MAX_CONTROL_BACKLOG + worker_proto::owed_backlog;
+    // A request or an answer is let past the cap as far as worker_proto::owed_cap.
+    static constexpr size_t OWED_BACKLOG = MAX_CONTROL_BACKLOG + worker_proto::owed_cap;
     // An answer for the child: queued within OWED_BACKLOG, else an empty one saying the way was overloaded.
     void   write_answer(uint64_t ticket, uint8_t status, std::string_view reply);
 
     std::string  m_out;
     size_t       m_out_off{0};
     backlog_gate m_out_gate;
+    // Every byte ever queued in m_out, and of those the ones owed to an asker.
+    uint64_t     m_out_total{0};
+    owed_bytes   m_out_owed;
 
     event_loop*  m_loop{nullptr};
 

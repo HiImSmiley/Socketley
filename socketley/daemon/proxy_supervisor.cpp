@@ -250,6 +250,7 @@ void proxy_supervisor::close_control()
         // child went away are complete frames still owed.
         m_out.clear();
         m_out_off = 0;
+        m_out_owed.clear();
     }
 }
 
@@ -546,6 +547,7 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
                   "worker's socket; dropping it");
         m_out.clear();
         m_out_off = 0;
+        m_out_owed.clear();
     }
 
     int sv[2] = {-1, -1};
@@ -791,15 +793,26 @@ bool proxy_supervisor::write_frame(const std::string& framed, size_t cap)
     if (m_control_fd < 0 || framed.size() > worker_proto::part_limit)
         return false;
 
+    const bool owed = cap != 0;
+    size_t queued = pending_out();
+    if (!owed)
+    {
+        queued -= std::min(queued, m_out_owed.pending(m_out_total - pending_out()));
+        cap = MAX_CONTROL_BACKLOG;
+    }
     // A frame with nothing queued ahead of it goes at any size, as a worker's frame_writer lets one go: the cap
     // bounds a backlog, and a frame of max_payload past it would otherwise never reach the child.
-    if (pending_out() != 0 &&
-        !m_out_gate.admit(pending_out(), worker_proto::wire_size(framed.size()), cap,
+    const size_t wire = worker_proto::wire_size(framed.size());
+    if (queued != 0 &&
+        !m_out_gate.admit(queued, wire, cap,
                           "proxy supervisor: control socket backlog full; the child "
                           "is not reading"))
         return false;
 
     worker_proto::append_wire(m_out, framed);
+    m_out_total += wire;
+    if (owed)
+        m_out_owed.add(m_out_total, wire);
     flush_control();
     // A flush that found the child gone closed the socket, and the frame went with it.
     return m_control_fd >= 0;
@@ -1132,7 +1145,7 @@ bool proxy_supervisor::send_direct(uint64_t ticket, std::string_view payload)
     return write_frame(worker_proto::frame(
         worker_proto::frame_type::chan_req,
         worker_proto::encode_chan_request(ticket, m_placeholder->get_name(),
-                                          payload)));
+                                          payload)), OWED_BACKLOG);
 }
 
 bool proxy_supervisor::await_direct(uint64_t ticket,

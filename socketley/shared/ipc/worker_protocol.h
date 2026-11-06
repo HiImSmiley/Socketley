@@ -274,6 +274,9 @@ inline bool take_frame(std::string& buf, frame_type& type, uint16_t& frame_versi
 inline constexpr size_t part_piece = 4u << 20;
 // The most of one frame a reader joins from pieces, and so the longest a writer sends.
 inline constexpr size_t part_limit = 256u << 20;
+// What a writer queues at most of requests and answers: owed_backlog, and beside it one frame as long as part_limit,
+// so a lone long one let in at any size does not shut out every small one behind it.
+inline constexpr size_t owed_cap = owed_backlog + part_limit;
 
 // The bytes a frame of `size` takes on the wire.
 inline size_t wire_size(size_t size)

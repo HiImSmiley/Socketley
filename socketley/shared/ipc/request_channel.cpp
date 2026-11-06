@@ -195,9 +195,10 @@ bool request_channel::admit(request_origin* origin, std::string_view target, siz
     const size_t limit = (cls == request_class::background)
                        ? MAX_PENDING_BACKGROUND : MAX_PENDING;
     const size_t byte_limit = (cls == request_class::background)
-                       ? (MAX_PENDING_BYTES / 4) * 3 : MAX_PENDING_BYTES;
+                       ? (MAX_PENDING_BYTES / 4) * 3 : MAX_PENDING_CLIENT_BYTES;
 
-    if (m_queue.size() >= limit || m_bytes + size > byte_limit)
+    if (m_queue.size() >= limit ||
+        (m_bytes + size > byte_limit && (m_bytes != 0 || cls == request_class::background)))
     {
         if (cls == request_class::background)
             m_stat_dropped_bg++;

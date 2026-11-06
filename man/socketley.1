@@ -24689,13 +24689,12 @@ The shards then relay through the daemon, and the daemon logs at startup that
 the mesh is off. This is the measurement control for the mesh: the two paths
 differ only in the route, not in the build. A request or answer longer than
 the 8 MiB one frame holds goes in pieces, through the daemon as over a link, up
-to 256 MiB. Eight answers of 8 MiB
-answers may wait at once on each side of the daemon for a shard that has not
-read them yet; past that, an asker is answered at once that the way is
-overloaded. A request the daemon cannot queue for a shard whose backlog is full
-is answered the same way, as
+to 256 MiB. Requests and answers for a shard that has not read them yet wait on
+each side of the daemon up to 64 MiB, and beside that one of up to 256 MiB;
+past that, an asker is answered at once, as
 .BR "the runtime is overloaded: its request backlog is full" ,
-not as no such runtime.
+not as no such runtime. Everything else the daemon and a shard tell each other
+(configuration, publishes, deliveries) waits up to 4 MiB of its own beside them.
 .TP
 .B SOCKETLEY_CACHE_HANDOFF
 .B 0

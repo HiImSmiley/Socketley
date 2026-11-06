@@ -92,6 +92,8 @@ public:
     // client may pipeline.
     static constexpr size_t MAX_PENDING            = 32768;
     static constexpr size_t MAX_PENDING_BYTES      = 16u << 20;
+    // A client's requests may hold more, as one crosses in pieces up to 256 MiB, and a lone one goes at any size.
+    static constexpr size_t MAX_PENDING_CLIENT_BYTES = 256u << 20;
     static constexpr size_t MAX_PENDING_BACKGROUND = (MAX_PENDING * 3) / 4;
     static constexpr size_t MAX_DRAIN_BATCH        = 4096;
     // The parked table, bounded because a remote that never answers must not grow it, and split as the queue is.
