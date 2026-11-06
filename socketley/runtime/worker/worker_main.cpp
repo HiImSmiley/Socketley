@@ -22,6 +22,7 @@
 #include "../client/client_instance.h"
 #include "../../shared/crypto/cert_keeper.h"
 #include "../../shared/crypto/tls_context.h"
+#include "../../shared/crypto/ticket_keys.h"
 #include "../../shared/ipc/request_channel.h"
 #include "../../shared/net/endpoint_table.h"
 #include "../../shared/loop/event_loop.h"
@@ -460,6 +461,8 @@ public:
                 heap_trim::tick(now);
                 // Strangers' failed handshakes, as one line a minute rather than one each.
                 tls_context::report_inbound_failures();
+                // Session ticket keys past their two periods, wiped although no handshake came to do it.
+                ticket_keys::tick();
             }
 
             // A state the runtime reached on its own, reported as soon as it

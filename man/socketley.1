@@ -24252,6 +24252,13 @@ Default: every 60 seconds; the range is 1 to 3600. A failed handshake comes from
 a port scanner far more often than from a client, so each one is counted
 rather than logged.
 .TP
+.B SOCKETLEY_TLS_TICKET_SECS
+A test aid that sets how many seconds one session ticket key seals new tickets.
+The key still opens its tickets for as long again, and is then wiped. The range
+is 1 to 86400. Default: an hour.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_ACME_DIRECTORY
 Sets the directory URL of the ACME CA that
 .B \-\-acme

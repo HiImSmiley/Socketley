@@ -198,6 +198,8 @@ inline constexpr setting table[] = {
      "milliseconds a mail runtime tries a message before a sender who asked is told it is late"},
     {"SOCKETLEY_MAIL_SPOOL_MOVE_MS", kind::number, audience::test, 0, no_max, "60000",
      "milliseconds a mail spool segment is full before the few messages left in it are moved"},
+    {"SOCKETLEY_TLS_TICKET_SECS", kind::number, audience::test, 1, 86400, "3600",
+     "seconds one TLS session ticket key seals new tickets; it opens them for as long again"},
     {"SOCKETLEY_MAIL_DEAD_DOMAIN_MS", kind::number, audience::test, 0, no_max, "600000",
      "milliseconds a mail runtime holds a domain found not to exist before it looks it up again"},
     {"SOCKETLEY_MAIL_PUSH_CA", kind::text, audience::test, 0, 0, "the system's",

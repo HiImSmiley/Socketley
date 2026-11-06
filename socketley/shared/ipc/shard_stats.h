@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "../runtime/runtime_definitions.h"   // max_shards
+#include "../crypto/ticket_keys.h"
 #include "../../cli/command_hashing.h" // fnv1a, for the channel filter
 
 namespace shard_stats
@@ -32,7 +33,7 @@ inline constexpr const char* region_name = "socketley-shards";
 
 inline constexpr size_t   line_size      = 64;
 inline constexpr uint32_t magic_value    = 0x534b4c53u;   // 'SKLS'
-inline constexpr uint32_t format_version = 5u;
+inline constexpr uint32_t format_version = 6u;
 
 // One shard's line, written by it alone, where `generation` counts attachments
 // so a reader can tell an unused slot from a legitimate zero.
@@ -121,9 +122,12 @@ struct table
     slot           slots[max_shards];
     channel_filter channels[max_shards];
     common_area    common;
+    // The runtime's TLS session ticket keys, which a shard seals and opens with once it has adopted the region.
+    ticket_keys::area tickets;
 };
 static_assert(sizeof(table) == line_size * (max_shards + 1)
-                               + sizeof(channel_filter) * max_shards + sizeof(common_area));
+                               + sizeof(channel_filter) * max_shards + sizeof(common_area)
+                               + sizeof(ticket_keys::area));
 
 // "is fd 4 open" is the wrong test, because adopt() takes ownership and a guess
 // CLOSES somebody else's descriptor; memfd's name in /proc/self/fd is the test.
@@ -290,6 +294,7 @@ public:
         for (auto& w : m_table->channels[index].word)
             w.store(0, std::memory_order_relaxed);
         m_table->slots[index].generation.fetch_add(1, std::memory_order_release);
+        ticket_keys::share(&m_table->tickets);
         return true;
     }
 
@@ -527,6 +532,7 @@ public:
     {
         if (m_table)
         {
+            ticket_keys::unshare(&m_table->tickets);
             ::munmap(m_table, sizeof(table));
             m_table = nullptr;
         }
