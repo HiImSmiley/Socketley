@@ -1407,7 +1407,7 @@ private:
                     worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
                         worker_proto::append_chan_reply_frame(
                             out, to.wire_ticket, static_cast<uint8_t>(st), reply);
-                    }, frame_writer::MAX_BACKLOG + worker_proto::max_payload + worker_proto::header_size)) {}
+                    }, answer_backlog)) {}
             return;
         }
 
@@ -1425,7 +1425,13 @@ private:
             return 0;
         const size_t envelope = worker_proto::chan_reply_frame_size({});
         if (it->second.link_serial == 0)
-            return worker_proto::max_payload + worker_proto::header_size - envelope;
+        {
+            // Within what the writer still lets an answer past, as one past it is refused and its asker told nothing.
+            const size_t queued = m_writer.pending();
+            const size_t free = queued == 0 ? SIZE_MAX : queued < answer_backlog ? answer_backlog - queued : 0;
+            const size_t frame = worker_proto::max_payload + worker_proto::header_size;
+            return std::min(frame, free) > envelope ? std::min(frame, free) - envelope : 0;
+        }
         const shard_link* link = const_cast<worker*>(this)->find_link(it->second.link_serial);
         return link ? link->reply_room(envelope) : 0;
     }
@@ -2445,6 +2451,9 @@ private:
     };
     std::unordered_map<uint64_t, deferred_reply> m_deferred;
     uint64_t                                     m_next_deferred{1};
+    // An answer to the daemon is let past the writer's cap by one frame, since one refused is owed to an asker.
+    static constexpr size_t answer_backlog =
+        frame_writer::MAX_BACKLOG + worker_proto::max_payload + worker_proto::header_size;
     // A replica of the daemon's map and a live channel, declared before the
     // runtime so it outlives it: a runtime revokes its origin as it is
     // destroyed and that call needs a channel that is still there.

@@ -16259,7 +16259,8 @@ than before takes its session with it. The newest connection of a client id
 wins. A session moves as one piece. When shards relay through the daemon
 (see
 .BR SOCKETLEY_NO_SHARD_MESH ),
-that piece holds 8 MiB. A larger session stays on its shard, and a connection to
+that piece holds 8 MiB, less what the shard still has queued to the daemon past
+4 MiB. A larger session stays on its shard, and a connection to
 another shard is refused with Server unavailable until the client lands on the
 session's own shard. Such a refusal is counted in
 .BR sessions_kept .
@@ -16269,7 +16270,10 @@ large
 is; the broker says so in its CONNACK, and a larger packet is refused as one
 past
 .B \-\-max\-packet
-is.
+is. A shard that starts is given the retained messages by shard 0 in as many
+answers as they take, each no longer than the way carries; one longer than the
+daemon carries is not given to it, and is counted in
+.BR shard_dropped .
 .PP
 A shard may not take what another shard hands it as fast as it comes. It then
 holds back that other shard's publishers, rather than lose their messages: they

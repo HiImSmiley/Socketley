@@ -377,6 +377,8 @@ private:
     std::unordered_map<uint64_t, std::pair<uint32_t, bool>> m_dump_asks;
     // When to ask again for the retained messages a starting shard did not get, 0 when it is not owed.
     int64_t m_retained_ask_ms{0};
+    // The last topic of the retained messages a starting shard was given, the next answer starting after it.
+    std::string m_retained_after;
     void ask_retained();
     uint64_t m_next_claim{1};
     // Cookies of shard requests whose answer is only a receipt.

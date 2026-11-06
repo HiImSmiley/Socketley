@@ -21,7 +21,8 @@
 #   * a publisher at QoS 0 held for good by a shard that stopped
 #   * batches given up and sent again reaching a shard out of order, or taken twice
 #   * a clean start asking every shard, two at once both kept, or one taking another user's fresh session
-#   * the retained messages written by every shard, or a shard started without them
+#   * the retained messages written by every shard, or a shard started without them; with no mesh, without those
+#     past what one answer through the daemon holds, or without them when two shards ask at once
 #   * a flood of retained messages at QoS 0 queued without bound for the other shards
 set -uo pipefail
 
@@ -716,6 +717,35 @@ if phase == "large":
         for c in (sub, by, pub2):
             c.disconnect()
     guarded("large", large)
+
+# With no mesh and twelve MB retained, past the 8 MiB one answer through the daemon holds.
+if phase == "many_fill":
+    def many_fill():
+        pub = connected(port, "many-pub", timeout=30)
+        for i in range(48):
+            pub.publish("many/%02d" % i, (b"%02d" % i) * 125000, qos=1, retain=True)
+        pub.disconnect()
+    guarded("many_fill", many_fill)
+
+if phase == "many":
+    def many():
+        held, seen = {}, set()
+        for i in range(40):
+            c = connected(port, "many-%d" % i, timeout=30)
+            k = shard_of("many-%d" % i)
+            if k in seen:
+                c.disconnect()
+                continue
+            seen.add(k)
+            c.subscribe(("many/#", 1))
+            got = {m.topic for m in c.messages(48, 30) if m.payload == m.topic[-2:].encode() * 125000}
+            held[k] = len(got)
+            c.disconnect()
+            if len(seen) == 3:
+                break
+        check("with no mesh every shard started gives every one of 48 retained messages of 250 KB", held,
+              {0: 48, 1: 48, 2: 48})
+    guarded("many", many)
 PY
 }
 
@@ -792,6 +822,27 @@ for _ in $(seq 1 50); do
     sleep 0.2
 done
 tally < <(run large)
+"$BIN" remove sh >/dev/null 2>&1
+"$BIN" create mqtt sh -p "$P" --anonymous --shards 3 --persistent on -s >/dev/null 2>&1 \
+    && ok || bad "a persistent broker of three shards is made with no mesh" "$(tail -3 "$SOCKETLEY_DLOG")"
+ready_tcp 127.0.0.1 "$P" || bad "it listens" "$(tail -5 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 50); do
+    [ "$("$BIN" stats sh 2>/dev/null | awk -F: '$1=="shard_peers_known"{s+=$2} END{print s+0}')" -ge 6 ] && break
+    sleep 0.2
+done
+tally < <(run many_fill)
+# Shard 0 holds them all before it stops, and a started shard is given them in more than one answer.
+for _ in $(seq 1 100); do
+    [ "$("$BIN" stats sh 2>/dev/null | awk -F: '$1=="retained"' | grep -c ':48$')" -eq 3 ] && break
+    sleep 0.2
+done
+"$BIN" stop sh >/dev/null 2>&1 && "$BIN" start sh >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$P" || bad "the broker listens after a start" "$(tail -5 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 100); do
+    [ "$("$BIN" stats sh 2>/dev/null | awk -F: '$1=="retained"' | grep -c ':48$')" -eq 3 ] && break
+    sleep 0.2
+done
+tally < <(run many)
 unset SOCKETLEY_NO_SHARD_MESH
 
 echo "  Results: $PASS/$((PASS + FAIL)) passed ($FAIL failed)"

@@ -63,6 +63,9 @@ constexpr int64_t stamp_keep_us = 10'000'000;
 
 constexpr int64_t claim_patience_ms = 3000;
 
+// What an answer of retained messages keeps free of the way back's room for its count and where the next one starts.
+constexpr size_t dump_margin = 128u << 10;
+
 // What a message for another shard carries besides its packet, the client's id and the shared groups among it, as
 // far as a packet is held to fit; a batch past it is not sent.
 constexpr size_t crossing_margin = 256u << 10;
@@ -391,7 +394,10 @@ void mqtt_run::ask_retained()
     const uint64_t cookie = m_next_cookie++;
     m_dump_asks[cookie] = {from, true};
     m_retained_ask_ms = 0;
-    if (post_shard(from, frame_of(sverb::retained_dump, me), cookie))
+    std::string f = frame_of(sverb::retained_dump, me);
+    socketley::bytes::append32(f, static_cast<uint32_t>(m_retained_after.size()));
+    f += m_retained_after;
+    if (post_shard(from, std::move(f), cookie))
         return;
     m_dump_asks.erase(cookie);
     m_retained_ask_ms = now_ms() + resend_ms;
@@ -412,6 +418,8 @@ bool mqtt_run::dump_reply(uint64_t cookie, request_status st, std::string_view r
     socketley::bytes::reader r(reply);
     if (retained)
     {
+        // An answer that cannot be read is asked for again, from where the last one ended.
+        m_retained_ask_ms = now_ms() + resend_ms;
         uint32_t n = 0;
         if (!r.u32(n))
             return true;
@@ -425,6 +433,17 @@ bool mqtt_run::dump_reply(uint64_t cookie, request_status st, std::string_view r
             if (!m_retained_stamps.contains(m->topic))
                 m_broker->apply_retained(m->topic, m);
         }
+        bool more = false;
+        std::string after;
+        if (!r.flag(more) || (more && !r.bytes(after, 1u << 16)))
+            return true;
+        m_retained_ask_ms = 0;
+        m_retained_after = std::move(after);
+        // An answer the way had no room for any of is asked for again a moment later.
+        if (more && n)
+            ask_retained();
+        else if (more)
+            m_retained_ask_ms = now_ms() + resend_ms;
         return true;
     }
     std::vector<std::string> list, clients;
@@ -933,13 +952,54 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t 
         }
         case sverb::retained_dump:
         {
-            socketley::bytes::writer w;
+            // In the topics' order from after the one asked, as many as the way back carries, and where the next
+            // answer starts when more are left.
+            std::string after;
+            if (!r.bytes(after, 1u << 16))
+                break;
             std::vector<message_ptr> all;
-            m_broker->retained_each("#", [&](const message_ptr& m) { all.push_back(m); });
-            w.u32(static_cast<uint32_t>(all.size()));
-            for (const auto& m : all)
-                w.bytes(message_bytes(*m));
+            m_broker->retained_each("#", [&](const message_ptr& m) {
+                if (m->topic > after)
+                    all.push_back(m);
+            });
+            std::sort(all.begin(), all.end(), [](const message_ptr& a, const message_ptr& b) {
+                return a->topic < b->topic;
+            });
+            // What the way carries at most, past which a message never goes, and what it takes now.
+            auto* mgr = m_owner.get_runtime_manager();
+            const size_t way = mgr ? mgr->requests().request_room(shard_target(m_owner.get_name(), from)) : 0;
+            const size_t most = way > dump_margin ? way - dump_margin : 0;
+            const size_t fits = std::min(room, way) > dump_margin ? std::min(room, way) - dump_margin : 0;
+            std::string items;
+            uint32_t count = 0;
+            size_t i = 0;
+            for (; i < all.size(); ++i)
+            {
+                std::string body = message_bytes(*all[i]);
+                // One the way can never carry is passed over, so the answers after it still come.
+                if (4 + body.size() > most)
+                {
+                    ++m_shard_dropped;
+                    after = all[i]->topic;
+                    continue;
+                }
+                if (items.size() + 4 + body.size() > fits)
+                    break;
+                socketley::bytes::append32(items, static_cast<uint32_t>(body.size()));
+                items += body;
+                ++count;
+                after = all[i]->topic;
+            }
+            socketley::bytes::writer w;
+            w.u32(count);
             reply = w.take();
+            reply += items;
+            reply += static_cast<char>(i < all.size());
+            if (i < all.size())
+            {
+                socketley::bytes::append32(reply, static_cast<uint32_t>(after.size()));
+                reply += after;
+            }
             break;
         }
         case sverb::claim:
