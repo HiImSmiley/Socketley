@@ -32,6 +32,12 @@
 #   no duplication        the summed size equals the leader's, not N times it.
 #                         That is the assertion that fails if the ownership
 #                         filter stops filtering.
+#   one stream, not N     each follower shard names its slice and the leader
+#                         sends it only that, so a four-shard follower costs
+#                         the leader about what a one-shard follower does, in
+#                         the dump and in the live stream, and the four shards
+#                         together read the stream once.  Red when every shard
+#                         reads the whole stream: about four times.
 #   multi-key writes      `mset` names keys in different slices, so as ONE
 #                         command it belongs to no shard.  Before the emitters
 #                         were made to replicate one key at a time, a sharded
@@ -49,6 +55,7 @@ daemon_isolate cacheshardrepl
 # A sharded cache also binds base+1..base+N, its cluster-mode shard ports, so bases sit ten apart.
 L=$((SL_PORT_BASE+1290)); F1=$((SL_PORT_BASE+1291)); FX=$((SL_PORT_BASE+1292))
 F4=$((SL_PORT_BASE+1300)); L4=$((SL_PORT_BASE+1310))
+BL1=$((SL_PORT_BASE+1320)); BF1=$((SL_PORT_BASE+1321)); BL4=$((SL_PORT_BASE+1330)); BF4=$((SL_PORT_BASE+1340))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -56,9 +63,9 @@ bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"
         local l; for l in "${@:3}"; do echo "        $l"; done; }
 
 cleanup() {
-    for n in rl rf1 rf4 rl4 rfx; do "$BIN" stop "$n" >/dev/null 2>&1 || true; done
+    for n in rl rf1 rf4 rl4 rfx bl1 bf1 bl4 bf4; do "$BIN" stop "$n" >/dev/null 2>&1 || true; done
     sleep 0.4
-    for n in rl rf1 rf4 rl4 rfx; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
+    for n in rl rf1 rf4 rl4 rfx bl1 bf1 bl4 bf4; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -150,6 +157,56 @@ else
         "leader $LSZ, unsharded follower $F1SZ, sharded follower $F4SZ" \
         "a sharded follower that stops filtering keeps every key in every shard"
 fi
+
+# ── what a sharded follower costs the leader ───────────────────────────────
+# Two leaders given the same writes, one followed by a one-shard cache and one by a four-shard cache: 400 keys of 200
+# bytes before the follower dials (the dump) and 400 after (the live stream).
+fig(){ "$BIN" stats "$1" 2>/dev/null | awk -F: -v k="$2" '$1==k {s+=$2} END{print s+0}'; }
+load(){ python3 - "$1" "$2" "$3" <<'PY'
+import socket, sys
+port, lo, hi = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+s = socket.create_connection(("127.0.0.1", port), timeout=10)
+s.sendall(b"".join(b"set b:%d %s\n" % (i, b"v" * 200) for i in range(lo, hi)))
+got = b""
+while got.count(b"\n") < hi - lo:
+    got += s.recv(1 << 16)
+PY
+}
+"$BIN" create cache bl1 -p "$BL1" -s >/dev/null 2>&1; "$BIN" create cache bl4 -p "$BL4" -s >/dev/null 2>&1
+ready "$BL1" && ready "$BL4" || bad "the two byte-counting leaders answer" "one never did"
+load "$BL1" 0 400; load "$BL4" 0 400
+"$BIN" create cache bf1 -p "$BF1" --replicate "127.0.0.1:$BL1" -s >/dev/null 2>&1
+"$BIN" create cache bf4 -p "$BF4" --shards 4 --replicate "127.0.0.1:$BL4" -s >/dev/null 2>&1
+for i in $(seq 1 40); do [ "$(fig bl4 followers)" = 4 ] && [ "$(fig bl1 followers)" = 1 ] && break; sleep 0.25; done
+load "$BL1" 400 800; load "$BL4" 400 800
+for i in $(seq 1 40); do [ "$(fig bf4 keys)" -ge 801 ] && [ "$(fig bf1 keys)" -ge 801 ] && break; sleep 0.25; done
+sleep 1.5      # a worker publishes its figures on an interval
+O1=$(fig bl1 bytes_out); O4=$(fig bl4 bytes_out); I1=$(fig bf1 bytes_in); I4=$(fig bf4 bytes_in)
+K4=$(fig bf4 keys); K1=$(fig bf1 keys)
+echo "    leader out: $O1 for one shard, $O4 for four; follower in: $I1 one shard, $I4 four shards; keys $K1 / $K4"
+if [ "$K4" = "$K1" ] && [ "$K1" -ge 801 ]; then
+    ok "the four-shard follower holds every key once ($K4)"
+else
+    bad "the four-shard follower holds every key once" "one shard $K1, four shards $K4"
+fi
+RO=$(awk -v a="$O4" -v b="$O1" 'BEGIN{ if (b > 0) printf "%.2f", a / b; else print "nan" }')
+if awk -v r="$RO" 'BEGIN{ exit !(r > 0.8 && r < 1.5) }'; then
+    ok "the leader sends a four-shard follower what it sends a one-shard one (${RO}x)"
+else
+    bad "the leader sends a four-shard follower what it sends a one-shard one" "${RO}x; every shard getting the whole stream is about 4x"
+fi
+RI=$(awk -v a="$I4" -v b="$I1" 'BEGIN{ if (b > 0) printf "%.2f", a / b; else print "nan" }')
+if awk -v r="$RI" 'BEGIN{ exit !(r > 0.8 && r < 1.5) }'; then
+    ok "the four follower shards together read the stream once (${RI}x)"
+else
+    bad "the four follower shards together read the stream once" "${RI}x of a one-shard follower"
+fi
+BMISS=0
+for i in 0 1 2 3 397 398 399 400 401 402 797 798 799; do
+    [ "$(g "$BF4" "b:$i" | wc -c)" -eq 201 ] || BMISS=$((BMISS+1))
+done
+[ "$BMISS" -eq 0 ] && ok "keys from the dump and the stream read back through the follower's shared port" \
+    || bad "keys from the dump and the stream read back through the follower's shared port" "$BMISS of 13 missing"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

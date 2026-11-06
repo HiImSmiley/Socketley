@@ -2616,6 +2616,15 @@ bool cache_store::exists(std::string_view key) const
 
 void cache_store::dump_commands(std::string& buf) const
 {
+    dump_commands(buf, 0, 1);
+}
+
+void cache_store::dump_commands(std::string& buf, uint32_t shard_i, uint32_t shard_n) const
+{
+    // Every record below names its key first, so the key is the record's owner; a key not ours is skipped whole.
+    const auto theirs = [shard_i, shard_n](std::string_view key) {
+        return shard_n > 1 && cache_shard_of(key, shard_n) != shard_i;
+    };
     // ─── A VALUE MAY CONTAIN THE SEPARATOR ──────────────────────────────────
     // Framed by the same rule as the live replication path, so a value with a
     // newline in it does not end the command -- and a dataset without newlines
@@ -2635,6 +2644,8 @@ void cache_store::dump_commands(std::string& buf) const
     // Strings
     for (const auto& [key, val] : m_data)
     {
+        if (theirs(key))
+            continue;
         cmd.append("set ");
         cmd.append(key);
         cmd.push_back(' ');
@@ -2645,6 +2656,8 @@ void cache_store::dump_commands(std::string& buf) const
     // Lists (emit rpush to preserve order)
     for (const auto& [key, deq] : m_lists)
     {
+        if (theirs(key))
+            continue;
         for (const auto& val : deq)
         {
             cmd.append("rpush ");
@@ -2658,6 +2671,8 @@ void cache_store::dump_commands(std::string& buf) const
     // Sets
     for (const auto& [key, members] : m_sets)
     {
+        if (theirs(key))
+            continue;
         for (const auto& member : members)
         {
             cmd.append("sadd ");
@@ -2671,6 +2686,8 @@ void cache_store::dump_commands(std::string& buf) const
     // Hashes
     for (const auto& [key, fields] : m_hashes)
     {
+        if (theirs(key))
+            continue;
         for (const auto& [field, val] : fields)
         {
             cmd.append("hset ");
@@ -2688,6 +2705,8 @@ void cache_store::dump_commands(std::string& buf) const
     // that came after and only the leader's existing ones went missing.
     for (const auto& [key, z] : m_zsets)
     {
+        if (theirs(key))
+            continue;
         for (const auto& [score, member] : z.order)
         {
             cmd.append("zadd ");
@@ -2716,6 +2735,8 @@ void cache_store::dump_commands(std::string& buf) const
     // rewrite makes it.
     for (const auto& [key, st] : m_streams)
     {
+        if (theirs(key))
+            continue;
         const auto record = [&](std::initializer_list<std::string_view> a) {
             cmd.append("xapply ");
             cmd.append(key);
@@ -2769,6 +2790,8 @@ void cache_store::dump_commands(std::string& buf) const
     auto now = std::chrono::steady_clock::now();
     for (const auto& [key, tp] : m_expiry)
     {
+        if (theirs(key))
+            continue;
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp - now).count();
         if (ms > 0)
         {

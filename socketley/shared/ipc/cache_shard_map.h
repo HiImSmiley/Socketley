@@ -504,6 +504,18 @@ constexpr std::string_view cache_text_key(uint32_t h, std::string_view args)
     return sp == std::string_view::npos ? args : args.substr(0, sp);
 }
 
+// The key that decides which shard of a sharded follower applies a replicated record, read as that shard's
+// interpreter reads it; false for a record every shard applies.  The leader filters by it and the follower checks it.
+constexpr bool cache_record_key(std::string_view line, std::string_view& key)
+{
+    const cache_text_parts parts = cache_split_text(line);
+    const uint32_t         h     = fnv1a_lower(parts.cmd);
+    if (cache_classify_text(h) != cache_cmd_class::single_key)
+        return false;
+    key = cache_text_key(h, parts.args);
+    return !key.empty();
+}
+
 // SCAN walks shard by shard with the shard in the top six bits, so a change of
 // N must refuse an old cursor rather than follow it.
 inline constexpr int      cache_scan_shard_bits  = 6;          // max_shards == 64

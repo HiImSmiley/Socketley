@@ -7062,10 +7062,14 @@ end\-of\-dump marker in the follower protocol, and it has neither.
 .IP
 A sharded cache may be a
 .IR follower .
-Every shard connects to the leader and keeps the part of the stream that its
-slice owns.
-So the cache holds the leader's keys once rather than once per shard, at the
-cost of every shard reading the whole stream.
+Every shard connects to the leader and names its slice
+.RB ( "replicate " "\fIshard shards\fR),"
+and the leader sends it only the writes and the dump of the keys that slice
+owns, with every keyless record to each.
+So the cache holds the leader's keys once rather than once per shard, and the
+leader sends the stream once, not once per shard.
+A leader from before this sends every shard the whole stream, and each shard
+keeps its own part of it.
 .TP
 .B \-\-tls
 .TQ

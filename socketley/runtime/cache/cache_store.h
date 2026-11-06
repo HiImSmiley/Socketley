@@ -632,6 +632,8 @@ public:
     // Serialize all data as text commands into buf, for the initial full sync
     // when a follower connects.
     void dump_commands(std::string& buf) const;
+    // Only the keys shard `shard_i` of `shard_n` owns, for one shard of a sharded follower.
+    void dump_commands(std::string& buf, uint32_t shard_i, uint32_t shard_n) const;
 
     // --- Pub/Sub ---
     // Each says whether the subscription set changed, because the count a

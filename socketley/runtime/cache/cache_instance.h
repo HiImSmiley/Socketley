@@ -1484,6 +1484,9 @@ private:
         io_request write_req{};
         bool write_pending{false};
         bool dead{false};
+        // The slice a shard of a sharded follower asked for; shard_n 1 is the whole stream.
+        uint32_t shard_i{0};
+        uint32_t shard_n{1};
 
         size_t backlog() const { return out.size() - out_off + queued.size(); }
     };
@@ -1575,7 +1578,7 @@ private:
     void refuse_follower_input(client_connection* conn);
 
     void replicate_command(std::string_view cmd);
-    void handle_replicate_request(client_connection* conn);
+    void handle_replicate_request(client_connection* conn, std::string_view shard, std::string_view of);
     bool send_full_dump(follower_conn& f);
     bool connect_to_master();
     void handle_master_connect(struct io_uring_cqe* cqe, io_request* req);

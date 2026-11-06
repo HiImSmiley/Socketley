@@ -3245,10 +3245,8 @@ void cache_instance::serve_one_command(std::string_view line, std::string& out)
     serve_payload(line, out, false);
 }
 
-// Every shard of a sharded follower sees the whole stream and drops what it
-// does not own, which is now a decision rather than the accident that lost
-// every multi-key write -- at the cost of N shards each reading the leader's
-// whole stream.
+// Each shard of a sharded follower applies only the records its slice owns; a leader that knows the slice (`replicate
+// <i> <n>`) sends no others, and one that does not sends the whole stream, which is checked here either way.
 void cache_instance::apply_replicated(std::string_view line)
 {
     std::string discard;
@@ -3264,15 +3262,9 @@ void cache_instance::apply_replicated(std::string_view line)
         return;
     }
 
-    const cache_text_parts parts = cache_split_text(line);
-    const uint32_t         h     = fnv1a_lower(parts.cmd);
-
-    if (cache_classify_text(h) == cache_cmd_class::single_key)
-    {
-        const std::string_view key = cache_text_key(h, parts.args);
-        if (!key.empty() && cache_shard_of(key, m_shard_n) != m_shard_i)
-            return;                      // a sibling owns this one
-    }
+    std::string_view key;
+    if (cache_record_key(line, key) && cache_shard_of(key, m_shard_n) != m_shard_i)
+        return;                          // a sibling owns this one
 
     serve_one_command(line, discard);
 }
@@ -7543,7 +7535,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         }
         case fnv1a("replicate"):
         {
-            handle_replicate_request(conn);
+            const auto [shard, rest] = extract_key(args);
+            const auto [of, _more]   = extract_key(rest);
+            handle_replicate_request(conn, shard, of);
             return;
         }
         // ─── Strings, the range and float spellings ───
@@ -10228,7 +10222,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         // A follower of a --resp cache asks here; what follows is the replication stream, lines and not RESP.
         case fnv1a("replicate"):
         {
-            handle_replicate_request(conn);
+            handle_replicate_request(conn, argc >= 3 ? args[1] : std::string_view{},
+                                     argc >= 3 ? args[2] : std::string_view{});
             return;
         }
         case fnv1a("dbsize"):
@@ -13197,8 +13192,28 @@ void cache_instance::replicate_command(std::string_view cmd)
         line.push_back('\n');
     }
 
+    // A follower shard that named its slice gets the records of its own keys and every keyless one, so a sharded
+    // follower costs one stream and not one per shard; the key is read once, and its owner once per shard count.
+    std::string_view key;
+    int      keyed   = -1;
+    uint32_t owner_n = 0, owner = 0;
     for (auto& f : m_followers)
     {
+        if (f->shard_n > 1)
+        {
+            if (keyed < 0)
+                keyed = cache_record_key(cmd, key) ? 1 : 0;
+            if (keyed)
+            {
+                if (owner_n != f->shard_n)
+                {
+                    owner_n = f->shard_n;
+                    owner   = cache_shard_of(key, owner_n);
+                }
+                if (owner != f->shard_i)
+                    continue;
+            }
+        }
         if (!follower_write(*f, line))
             f->dead = true;
     }
@@ -13208,7 +13223,7 @@ void cache_instance::replicate_command(std::string_view cmd)
     reap_followers();
 }
 
-void cache_instance::handle_replicate_request(client_connection* conn)
+void cache_instance::handle_replicate_request(client_connection* conn, std::string_view shard, std::string_view of)
 {
     // A TLS cache is not a replication leader, which no configuration gate can
     // decide because promotion happens when a client asks -- and follower_conn
@@ -13260,6 +13275,19 @@ void cache_instance::handle_replicate_request(client_connection* conn)
         return;
     }
 
+    // `replicate <i> <n>` is shard i of a follower of n shards, which takes only its slice; plain `replicate`, and
+    // what an older follower sends, takes everything.
+    uint32_t shard_i = 0, shard_n = 1;
+    if (!shard.empty() || !of.empty())
+    {
+        if (!parse_int_sv(shard, shard_i) || !parse_int_sv(of, shard_n) || shard_n < 1 ||
+            shard_n > max_shards || shard_i >= shard_n)
+        {
+            conn->response_buf.append("error: usage: replicate [<shard> <shards>]\n");
+            return;
+        }
+    }
+
     m_repl_role = repl_leader;
     // Ordinary command service on this connection ends here, not when the dump
     // finishes: the refusal in handle_read() has to cover anything the client
@@ -13276,6 +13304,8 @@ void cache_instance::handle_replicate_request(client_connection* conn)
     // follows travel through the same buffer, which is what keeps them ordered.
     auto f = std::make_unique<follower_conn>();
     f->fd = conn->fd;
+    f->shard_i = shard_i;
+    f->shard_n = shard_n;
     follower_conn& fc = *f;
     m_followers.push_back(std::move(f));
 
@@ -13306,7 +13336,7 @@ bool cache_instance::send_full_dump(follower_conn& f)
     // already had -- measured, a list of two came back as four.
     std::string buf = "flushall\n";
     buf.reserve(65536);
-    m_store.dump_commands(buf);
+    m_store.dump_commands(buf, f.shard_i, f.shard_n);
 
     buf.append(repl_sync_done);
     // Where in the primary's stream this dump was taken, which is what tells two followers' copies apart.
@@ -13439,8 +13469,11 @@ void cache_instance::handle_master_connect(struct io_uring_cqe* cqe, io_request*
     // Eleven bytes into the send buffer of a socket that has just connected, so
     // the short write this cannot handle is not one that happens; ended by CRLF
     // so a --resp leader's inline reader takes it as the line reader does.
-    const char* cmd = "replicate\r\n";
-    if (::write(fd, cmd, 11) < 0)
+    // A shard of a sharded follower names its slice, and the leader sends it only that.
+    const std::string cmd = m_shard_n > 1
+        ? "replicate " + std::to_string(m_shard_i) + " " + std::to_string(m_shard_n) + "\r\n"
+        : std::string("replicate\r\n");
+    if (::write(fd, cmd.data(), cmd.size()) < static_cast<ssize_t>(cmd.size()))
     {
         close_tracked(fd);
         LOG_ERROR("cache: the master link connected and would not take `replicate`");
