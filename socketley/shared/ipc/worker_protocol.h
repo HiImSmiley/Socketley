@@ -93,7 +93,7 @@ enum class frame_type : uint16_t
     // one frame too long for max_payload, read whole once `last` is set.
     mesh_part = 34,
 
-    // shard <-> shard, on a mesh link only, with SOCKETLEY_CACHE_HANDOFF: a client connection given to the sibling,
+    // shard <-> shard, on a sharded cache's mesh link only: a client connection given to the sibling,
     // u64 id then what the runtime packed, with the descriptor in the same sendmsg; and the answer, u64 id, u8 taken.
     conn_handoff     = 35,
     conn_handoff_ack = 36,

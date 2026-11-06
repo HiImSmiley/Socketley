@@ -953,8 +953,8 @@ private:
         if (cfg.shards > 1 && cfg.mesh_wired)
         {
             const uint32_t me = m_rt->get_shard_index();
-            // Read once, here: a cache's links carry client descriptors only when the operator asked for it.
-            const bool hand_off = cfg.type == runtime_cache && socketley::settings::flag("SOCKETLEY_CACHE_HANDOFF", false);
+            // Read once, here: a cache's links carry client descriptors unless the operator said 0.
+            const bool hand_off = cfg.type == runtime_cache && socketley::settings::flag("SOCKETLEY_CACHE_HANDOFF", true);
             for (uint32_t j = 0; j < cfg.shards; ++j)
             {
                 if (j == me)

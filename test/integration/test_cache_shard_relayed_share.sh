@@ -145,7 +145,7 @@ check "two hundred commands on a per-shard port leave the shared port's count al
 check "shard 0 said it once" "$(said rs)" "1"
 grep "cache \"rs\": .* of the commands on its shared port" "$SOCKETLEY_DLOG" 2>/dev/null | head -1 | sed 's/^/    /'
 LINE=$(grep "cache \"rs\": .* of the commands on its shared port" "$SOCKETLEY_DLOG" 2>/dev/null | head -1)
-[[ "$LINE" == *"($((P+1))..$((P+4)))"* && "$LINE" == *"SOCKETLEY_CACHE_HANDOFF=1"* ]] \
+[[ "$LINE" == *"($((P+1))..$((P+4)))"* && "$LINE" == *"SOCKETLEY_CACHE_HANDOFF"* ]] \
     && ok "naming the per-shard ports and the handoff switch" || bad "naming the per-shard ports and the handoff switch"
 check "a barely used sharded cache says nothing" "$(said rq)" "0"
 check "one shard has no shared-port figure" "$(sum ro shared_port_commands)" "none 0"

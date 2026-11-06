@@ -888,7 +888,7 @@ bool cache_instance::setup(event_loop& loop)
     if (m_idle_timeout_cached > 0 || m_tls)
         arm_idle_sweep_if_needed();
 
-    // Only where the worker's mesh carries descriptors, which it does when SOCKETLEY_CACHE_HANDOFF is set.
+    // Only where the worker's mesh carries descriptors: a sharded cache's, unless SOCKETLEY_CACHE_HANDOFF=0.
     m_handoff_on = m_shard_n > 1 && can_hand_off() && !m_tls;
     m_ho_waiting.clear();
     m_ho_sent.clear();
@@ -1842,8 +1842,12 @@ void cache_instance::relay_watch()
                   + "% of the commands on its shared port named a key another shard owns and were relayed "
                   "there, which costs about twice what answering them does.  A cluster-aware client routes each "
                   "key to its shard's own port (" + std::to_string(port + 1) + ".."
-                  + std::to_string(port + m_shard_n) + "); with SOCKETLEY_CACHE_HANDOFF=1 a connection whose "
-                  "keys keep to one shard is handed to it.  stats shows relayed_commands per shard").c_str());
+                  + std::to_string(port + m_shard_n) + "); "
+                  + (m_handoff_on ? "SOCKETLEY_CACHE_HANDOFF hands a connection to the shard its keys keep to, and "
+                                    "these connections' keys keep to none"
+                                  : "SOCKETLEY_CACHE_HANDOFF, off here, hands a connection whose keys keep to one "
+                                    "shard to it")
+                  + ".  stats shows relayed_commands per shard").c_str());
     }
 }
 
@@ -13699,7 +13703,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
     }
 }
 
-// ─── Handoff (SOCKETLEY_CACHE_HANDOFF) ───
+// ─── Handoff (on with more than one shard; SOCKETLEY_CACHE_HANDOFF=0 turns it off) ───
 
 // A connection whose window chose another shard is handed there once nothing is owed on it and nothing ties it to
 // this process; what ties it for good clears the wish, what only has to finish leaves it for the next quiet moment.

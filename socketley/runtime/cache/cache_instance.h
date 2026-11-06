@@ -186,7 +186,7 @@ struct client_connection
     // would overtake the first.
     bool blocked{false};
 
-    // ── SOCKETLEY_CACHE_HANDOFF ─────────────────────────────────────────────
+    // ── handoff ─────────────────────────────────────────────────────────────
     // Where this connection is in being given to the shard that owns its keys: its read being withdrawn, waiting
     // for the link's writer to drain, or sent and waiting for the sibling's answer.
     enum class handoff : uint8_t { none, withdrawing, waiting, sent };
@@ -260,6 +260,10 @@ struct client_connection
         // running belongs to the last one.
         partial_since = {};
         partial.clear();
+        // A handed connection's carried bytes are parsed before any read could check these against its partial.
+        read_arrived = 0;
+        text_searched = 0;
+        batch_ns = 0;
         response_buf.clear();
         write_queue.clear();
         for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].clear();
@@ -605,7 +609,7 @@ private:
     // handed it over, where false means it was dealt with and is gone.
     bool adopt_client(int client_fd, bool from_cluster, bool from_unix, bool handed = false);
 
-    // ── SOCKETLEY_CACHE_HANDOFF ─────────────────────────────────────────────
+    // ── handoff, on with more than one shard unless SOCKETLEY_CACHE_HANDOFF=0 ──
     // A window of this many single-key commands, of which this many naming one other shard hand the connection
     // there: 28 of 32 is a chance of about 1 in 100,000 per window for random keys over two shards.
     static constexpr uint8_t  HO_WINDOW = 32;

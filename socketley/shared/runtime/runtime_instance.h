@@ -1099,7 +1099,7 @@ private:
     // See set_ref_sink.  Empty everywhere but in a worker.
     ref_sink m_ref_sink;
 
-    // See set_handoff_sink.  Empty everywhere but in a cache worker started with SOCKETLEY_CACHE_HANDOFF.
+    // See set_handoff_sink.  Empty everywhere but in a sharded cache worker, unless SOCKETLEY_CACHE_HANDOFF=0.
     handoff_sink  m_handoff_sink;
     handoff_probe m_handoff_probe;
 

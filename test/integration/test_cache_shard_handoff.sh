@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # suite: isolated -- its own daemon, socket and port window, so it runs beside the others
-# Integration test: SOCKETLEY_CACHE_HANDOFF hands a connection to the shard that owns its keys, and the connection
-# cannot tell.
+# Integration test: a sharded cache hands a connection to the shard that owns its keys, by default, and the
+# connection cannot tell.
 #
-# A cache sharded behind one address relays every command whose key another shard owns.  With the switch on, a
-# connection whose single-key commands keep naming one other shard is given to that shard -- the descriptor over the
+# A cache sharded behind one address relays every command whose key another shard owns.  Unless
+# SOCKETLEY_CACHE_HANDOFF=0, a connection whose single-key commands keep naming one other shard is given to that shard -- the descriptor over the
 # mesh link, with what was read and not yet run -- and from then on its commands are served at home.
 #
 # What each assertion would catch:
@@ -19,7 +19,7 @@
 #   * one move, not four          a connection alternating between two shards' keys faster than the dwell is moved
 #                                 once and then held, where without the hysteresis it ping-pongs on every window
 #   * random keys, 0 wrong        a connection that never settles is served exactly as it was
-#   * off: unchanged              without the switch nothing is handed: the same split pipeline answers, the MULTI
+#   * off: unchanged              with SOCKETLEY_CACHE_HANDOFF=0 nothing is handed: the same split pipeline answers, the MULTI
 #                                 on a foreign shard is refused as before, and no handoff figure is printed
 set -uo pipefail
 
@@ -200,9 +200,10 @@ start_cache() {
     done
 }
 
-# ─── the switch on ─────────────────────────────────────────────────────────
+# ─── the default: on ───────────────────────────────────────────────────────
 daemon_isolate cachehandoff
-SOCKETLEY_CACHE_HANDOFF=1 daemon_start "$BIN"
+unset SOCKETLEY_CACHE_HANDOFF
+daemon_start "$BIN"
 start_cache
 
 read -r GOOD CROSS < <(client resp)
@@ -228,10 +229,9 @@ check "random keys are answered right" "$(client random)" "0"
 "$BIN" stop ho >/dev/null 2>&1; sleep 0.3; "$BIN" remove ho >/dev/null 2>&1
 daemon_stop
 
-# ─── the switch off ────────────────────────────────────────────────────────
+# ─── SOCKETLEY_CACHE_HANDOFF=0: off ────────────────────────────────────────
 daemon_isolate cachehandoffoff
-unset SOCKETLEY_CACHE_HANDOFF
-daemon_start "$BIN"
+SOCKETLEY_CACHE_HANDOFF=0 daemon_start "$BIN"
 start_cache
 read -r GOOD CROSS < <(client resp)
 check "off: the split pipeline still answers in order" "${GOOD:-?}" "16"
