@@ -8,6 +8,8 @@
 #   * a session lost because the shard holding it answered its claim after the claim's patience: its queued
 #     messages and its subscription missing on the connection that was let in without it; or past what the asker
 #     waits for an answer at all, the session ended when its shard hears of the connection let in
+#   * a session too large for one frame through the daemon ended, rather than carried in pieces, when its shard
+#     answers late
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -131,6 +133,47 @@ if phase in ("late", "stale"):
         # Past what the asker's channel waits for an answer: the session goes over once its shard hears the
         # connection was let in.
         guarded("stale", lambda: late(17, "stale", "sessions_yielded"))
+if phase == "large":
+    def large():
+        # Past the 8 MiB one frame through the daemon holds, so only pieces carry it.
+        body = b"L" * 200000
+        c = connected(port, "big", clean=False, props={SESSION_EXPIRY: 600})
+        c.subscribe(("big/#", 1))
+        old = owner(c)
+        c.disconnect()
+        pub = None
+        for i in range(60):
+            p = connected(port, "big-pub-%d" % i)
+            if owner(p) == old:
+                pub = p
+                break
+            p.disconnect()
+        truth("a publisher lands on the session's shard", pub is not None)
+        if pub is None:
+            return
+        for i in range(50):
+            pub.publish("big/t", body + b"%02d" % i, qos=1)
+        pub.disconnect()
+        os.kill(old, signal.SIGSTOP)
+        try:
+            x = None
+            for _ in range(60):
+                x = Client(port, timeout=15)
+                if owner(x) not in (old, None):
+                    break
+                x.close()
+                x = None
+            present, code, _ = x.connect("big", clean=False, props={SESSION_EXPIRY: 600})
+        finally:
+            os.kill(old, signal.SIGCONT)
+        check("the connection is let in without its large session after the claim's patience", (present, code), (False, 0))
+        got = x.messages(50, 30)
+        check("every queued message of a session past 8 MiB reaches it once its shard answers", len(got), 50)
+        check("whole and in order", [m.payload[-2:] for m in got], [b"%02d" % i for i in range(50)])
+        n = stat("sessions_pieced")
+        truth("stats count a session carried in pieces", n >= 1, n)
+        x.disconnect()
+    guarded("large", large)
 PY
 }
 
@@ -149,6 +192,7 @@ for mode in mesh relayed; do
     if [ "$mode" = relayed ]; then tally < <(run suback_relayed); else tally < <(run suback); fi
     tally < <(run late)
     [ "$mode" = mesh ] && tally < <(run stale)
+    [ "$mode" = relayed ] && tally < <(run large)
     daemon_stop
 done
 unset SOCKETLEY_NO_SHARD_MESH

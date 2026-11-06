@@ -278,8 +278,8 @@ private:
     // A session another shard gave up after the connection it was for was let in here without it, taken in, or handed
     // back to `from` when it cannot be, unless it is itself one handed back.
     void absorb(const std::string& client, std::string_view bytes, uint32_t from, bool back);
-    // The most a frame of one session to shard `to` may hold for it to be carried now.
-    size_t session_room(uint32_t to) const;
+    // A session given up for shard `to`, as one frame or, past what one carries, as pieces of it.
+    void hand_session(uint32_t to, const std::string& client, bool back, std::string_view bytes);
     void shard_stats(std::string& out) const;
     void sweep_claims(int64_t now);
     // Every frame before `upto` that shard has taken, or it cannot be reached.
@@ -361,6 +361,9 @@ private:
         // The start its batches are numbered from, and the number of the next frame owed from it.
         uint64_t epoch{0};
         uint64_t next{0};
+        // The pieces of a session it is handing over, so far.
+        std::string part_client;
+        std::string part;
     };
     std::vector<peer> m_peers;
     // What every other shard subscribes to, in one tree whose sessions are the shards, so a message is matched once
@@ -436,6 +439,7 @@ private:
     uint64_t m_sessions_late_ended{0};
     uint64_t m_sessions_handed_back{0};
     uint64_t m_sessions_yielded{0};
+    uint64_t m_sessions_pieced{0};
     // A session given up to another shard, whose messages still coming here are handed on to it there for as long as
     // one sent here before the other shards heard of the move may come; its filters are told ended only after.
     struct moved_session

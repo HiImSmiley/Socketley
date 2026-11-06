@@ -45,6 +45,7 @@ enum class sverb : uint8_t
     forward       = 12,
     adopted       = 13,
     handover      = 14,
+    handover_part = 15,
 };
 
 // A batch is cut at this, far below the 4 MiB a link's backlog holds before it gives up.
@@ -73,6 +74,12 @@ constexpr int64_t ack_patience_ms = 1000;
 // How long a shard that gave a session up hands on what still comes for it, far past the moment every other shard
 // heard where the session went.
 constexpr int64_t forward_keep_ms = 10'000;
+
+// A session past this goes to another shard in pieces of it, each far inside the 8 MiB one frame through the daemon
+// holds, so no session is too large to move.
+constexpr size_t piece_bytes = 1u << 20;
+// The most one session's pieces may add up to.
+constexpr uint64_t session_most = 1u << 28;
 
 // What an answer of retained messages keeps free of the way back's room for its count and where the next one starts.
 constexpr size_t dump_margin = 128u << 10;
@@ -1070,24 +1077,40 @@ void mqtt_run::absorb(const std::string& client, std::string_view bytes, uint32_
                 ++m_sessions_late_ended;
                 break;
             }
-            std::string f = frame_of(sverb::handover, m_owner.get_shard_index());
-            socketley::bytes::writer w;
-            w.bytes(client);
-            w.flag(true);
-            w.bytes(bytes);
-            f += w.take();
-            if (queue_shard(from, f, false))
-                ++m_sessions_handed_back;
+            hand_session(from, client, true, bytes);
+            ++m_sessions_handed_back;
             break;
         }
     }
 }
 
-size_t mqtt_run::session_room(uint32_t to) const
+void mqtt_run::hand_session(uint32_t to, const std::string& client, bool back, std::string_view bytes)
 {
-    auto* mgr = m_owner.get_runtime_manager();
-    const size_t room = mgr ? mgr->requests().request_room(shard_target(m_owner.get_name(), to)) : 0;
-    return room > crossing_margin ? room - crossing_margin : 0;
+    if (bytes.size() <= piece_bytes)
+    {
+        std::string f = frame_of(sverb::handover, m_owner.get_shard_index());
+        socketley::bytes::writer w;
+        w.bytes(client);
+        w.flag(back);
+        w.bytes(bytes);
+        f += w.take();
+        queue_shard(to, f, false);
+        return;
+    }
+    // Queued at once, so no other frame comes between the pieces.
+    for (size_t at = 0; at < bytes.size(); at += piece_bytes)
+    {
+        std::string f = frame_of(sverb::handover_part, m_owner.get_shard_index());
+        socketley::bytes::writer w;
+        w.bytes(client);
+        w.flag(back);
+        w.u64(bytes.size());
+        w.u64(at);
+        w.bytes(bytes.substr(at, piece_bytes));
+        f += w.take();
+        queue_shard(to, f, false);
+    }
+    ++m_sessions_pieced;
 }
 
 std::optional<std::string> mqtt_run::give_up(const std::string& client, uint32_t to, bool clean, size_t room)
@@ -1156,18 +1179,13 @@ void mqtt_run::settle(const std::string& client_id, uint64_t stamp, const std::s
     if (m_broker->session_held_as(client_id, mine, mine_user, asked) && yields(mine, mine_user, asked))
     {
         // A connection that resumes goes on with the session here, as it would have had its claim been answered.
+        // However large, since it goes in pieces where one frame would not carry it.
         std::optional<std::string> bytes;
         if (!clean && mine_user == user)
-            bytes = give_up(client_id, from, false, session_room(from));
+            bytes = give_up(client_id, from, false, SIZE_MAX);
         if (bytes && !bytes->empty())
         {
-            std::string f = frame_of(sverb::handover, m_owner.get_shard_index());
-            socketley::bytes::writer w;
-            w.bytes(client_id);
-            w.flag(false);
-            w.bytes(*bytes);
-            f += w.take();
-            queue_shard(from, f, false);
+            hand_session(from, client_id, false, *bytes);
             ++m_sessions_yielded;
         }
         else if (!bytes)
@@ -1233,6 +1251,8 @@ void mqtt_run::shard_request(uint64_t ticket, std::string_view payload)
         {
             p.epoch = epoch;
             p.next  = first;
+            p.part.clear();
+            p.part_client.clear();
         }
         if (p.epoch != epoch || first > p.next)
         {
@@ -1295,8 +1315,41 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t 
             std::string client;
             bool back = false;
             std::string_view bytes;
-            if (r.bytes(client, 1u << 16) && r.flag(back) && r.view(bytes, 1u << 28))
+            if (r.bytes(client, 1u << 16) && r.flag(back) && r.view(bytes, session_most))
                 absorb(client, bytes, from, back);
+            break;
+        }
+        case sverb::handover_part:
+        {
+            // The pieces of one session come one after another, in order, so one that does not follow drops them.
+            peer& p = m_peers[from];
+            std::string client;
+            bool back = false;
+            uint64_t total = 0, at = 0;
+            std::string_view piece;
+            if (!r.bytes(client, 1u << 16) || !r.flag(back) || !r.u64(total) || !r.u64(at) ||
+                !r.view(piece, piece_bytes) || total > session_most)
+                break;
+            if (at == 0)
+            {
+                p.part_client = std::move(client);
+                p.part.clear();
+            }
+            else if (client != p.part_client || at != p.part.size())
+            {
+                p.part.clear();
+                p.part_client.clear();
+                break;
+            }
+            p.part.append(piece);
+            if (p.part.size() < total)
+                break;
+            std::string whole = std::move(p.part);
+            const std::string who = std::move(p.part_client);
+            p.part.clear();
+            p.part_client.clear();
+            if (whole.size() == total)
+                absorb(who, whole, from, back);
             break;
         }
         case sverb::adopted:
@@ -1529,6 +1582,7 @@ void mqtt_run::shard_stats(std::string& out) const
     st::put(out, "sessions_late_ended", m_sessions_late_ended);
     st::put(out, "sessions_handed_back", m_sessions_handed_back);
     st::put(out, "sessions_yielded", m_sessions_yielded);
+    st::put(out, "sessions_pieced", m_sessions_pieced);
     st::put(out, "session_forwards", m_moved_forwarded);
     st::put(out, "subacks_held", m_acks_held);
     st::put(out, "subacks_unheard", m_acks_late);

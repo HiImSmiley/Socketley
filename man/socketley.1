@@ -16346,6 +16346,9 @@ are counted in
 .BR sessions_yielded
 and
 .BR sessions_late_ended .
+A session handed over this way that is larger than 1 MiB goes in pieces of
+1 MiB, so none is ended for its size; these are counted in
+.BR sessions_pieced .
 A session moves as one piece. When shards relay through the daemon
 (see
 .BR SOCKETLEY_NO_SHARD_MESH ),
