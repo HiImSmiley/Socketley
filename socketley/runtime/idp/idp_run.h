@@ -288,8 +288,18 @@ private:
     bool publish_standing();
     // The same off the loop, the waiters each run once a write covering their change has ended.
     void write_standing();
-    // The lines of the accounts whose standing changed, made again, and the whole file made from every line.
-    std::string standing_doc();
+    // The lines of the accounts whose standing changed, made again here, since only the loop reads the accounts:
+    // every account's when `all`, and none for an account gone.
+    struct standing_update
+    {
+        bool all{false};
+        std::vector<std::pair<std::string, std::optional<std::string>>> lines;
+    };
+    standing_update standing_changed();
+    using standing_lines = std::unordered_map<std::string, std::string>;
+    // The lines updated and the whole file made from every one of them, by whoever holds the lines: the loop in line,
+    // or the write under way, as there is only ever one.
+    static std::string standing_doc(standing_lines& lines, standing_update u);
     void catch_up();
 
     void answer_command(uint64_t ticket, std::string_view text);
@@ -389,7 +399,7 @@ private:
     // The accounts' change count the standing was last written at, each account's line of it by id, the write under
     // way, and who waits for one as of which change count.
     uint64_t m_standing_at{UINT64_MAX};
-    std::unordered_map<std::string, std::string> m_standing_lines;
+    std::shared_ptr<standing_lines> m_standing_lines{std::make_shared<standing_lines>()};
     bool m_standing_writing{false};
     std::vector<std::pair<uint64_t, std::function<void()>>> m_standing_waiters;
     // The thread the standing is written and synced on, apart from the sign-ins' hashing, which it would wait behind.

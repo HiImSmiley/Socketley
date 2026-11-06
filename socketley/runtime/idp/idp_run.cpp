@@ -3969,7 +3969,7 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
 
 // ─── Shards ─────────────────────────────────────────────────────────────────
 
-std::string idp_run::standing_doc()
+idp_run::standing_update idp_run::standing_changed()
 {
     const auto line_of = [](const account& a)
     {
@@ -3989,27 +3989,38 @@ std::string idp_run::standing_doc()
         append_standing(line, a.id, s);
         return line;
     };
+    standing_update u;
     std::vector<std::string> dirty;
-    if (m_accounts.take_standing_dirty(dirty))
-    {
-        m_standing_lines.clear();
-        m_accounts.each([&](const account& a) { m_standing_lines[a.id] = line_of(a); });
-    }
+    u.all = m_accounts.take_standing_dirty(dirty);
+    if (u.all)
+        m_accounts.each([&](const account& a) { u.lines.emplace_back(a.id, line_of(a)); });
     else
-        for (const std::string& id : dirty)
+        for (std::string& id : dirty)
         {
-            if (const account* a = m_accounts.by_id(id))
-                m_standing_lines[id] = line_of(*a);
-            else
-                m_standing_lines.erase(id);
+            const account* a = m_accounts.by_id(id);
+            u.lines.emplace_back(std::move(id), a ? std::optional<std::string>(line_of(*a)) : std::nullopt);
         }
+    return u;
+}
+
+std::string idp_run::standing_doc(standing_lines& lines, standing_update u)
+{
+    if (u.all)
+        lines.clear();
+    for (auto& [id, line] : u.lines)
+    {
+        if (line)
+            lines[id] = std::move(*line);
+        else
+            lines.erase(id);
+    }
     size_t bytes = standing_format.size();
-    for (const auto& [id, line] : m_standing_lines)
+    for (const auto& [id, line] : lines)
         bytes += line.size();
     std::string doc;
     doc.reserve(bytes);
     doc.append(standing_format);
-    for (const auto& [id, line] : m_standing_lines)
+    for (const auto& [id, line] : lines)
         doc.append(line);
     return doc;
 }
@@ -4023,7 +4034,7 @@ bool idp_run::publish_standing()
     // Synced, since a crash that brought back the file before a sign-out would let its sessions in again.
     std::string why;
     const std::string path = idp_standing_path(m_owner.get_name());
-    if (!replace_file(path, standing_doc(), durability::data_and_dir, &why))
+    if (!replace_file(path, standing_doc(*m_standing_lines, standing_changed()), durability::data_and_dir, &why))
     {
         LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + path + " could not be written: " + why).c_str());
         return false;
@@ -4061,13 +4072,15 @@ void idp_run::write_standing()
         return;
     }
     m_standing_writing = true;
-    auto doc = std::make_shared<std::string>(standing_doc());
+    // A file of every account's line, 10 ms of the loop's at 100,000 accounts, so only the lines that changed are made
+    // here and the file on the thread.
+    auto update = std::make_shared<standing_update>(standing_changed());
     auto why = std::make_shared<std::string>();
     auto ok = std::make_shared<bool>(false);
     m_standing_pool.submit(0,
-        [doc, why, ok, path = idp_standing_path(m_owner.get_name())]
+        [lines = m_standing_lines, update, why, ok, path = idp_standing_path(m_owner.get_name())]
         {
-            *ok = replace_file(path, *doc, durability::data_and_dir, why.get());
+            *ok = replace_file(path, standing_doc(*lines, std::move(*update)), durability::data_and_dir, why.get());
         },
         [this, alive = m_alive, at, why, ok, release]
         {
