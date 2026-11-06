@@ -82,24 +82,6 @@ def shard_of(cid):
             return s["shard"]
     return None
 
-def heard(home, pub):
-    # A subscription taken on shard `home` after a client's own, which every other shard takes in the order made: once
-    # the publisher's shard hands its message there, it knows of the client's too.
-    for i in range(60):
-        cid = "heard-%d-%d" % (home, time.time_ns())
-        r = connected(port, cid)
-        if shard_of(cid) == home:
-            break
-        r.disconnect()
-    else:
-        raise Closed("no connection reached shard %d" % home)
-    r.subscribe((cid, 0))
-    for _ in range(100):
-        pub.publish(cid, b"r")
-        if r.message(0.1):
-            break
-    r.disconnect()
-
 if phase == "main":
     def spread():
         subs = [connected(port, "s-%d" % i) for i in range(12)]
@@ -191,7 +173,6 @@ if phase == "main":
         first = shard_of("heavy")
         c.disconnect()
         pub = connected(port, "heavy-pub", timeout=30)
-        heard(first, pub)
         body = lambda i: (b"%04d" % i) * 62500
         for i in range(40):
             pub.publish("heavy/t", body(i), qos=1)
@@ -679,7 +660,6 @@ if phase == "relayed":
         first = shard_of("middle")
         c.disconnect()
         pub = connected(port, "middle-pub", timeout=30)
-        heard(first, pub)
         body = lambda i: (b"%04d" % i) * 62500
         for i in range(24):
             pub.publish("middle/t", body(i), qos=1)
@@ -710,7 +690,6 @@ if phase == "relayed":
         first = shard_of("heavy")
         c.disconnect()
         pub = connected(port, "heavy-pub", timeout=30)
-        heard(first, pub)
         body = lambda i: (b"%04d" % i) * 62500
         for i in range(40):
             pub.publish("heavy/t", body(i), qos=1)
