@@ -12,7 +12,7 @@
 #   * a close_notify after a backend that reset mid-answer, which vouches for an answer cut short as whole
 #   * a FIN or a close sent while the kernel still holds TLS records it took on a full socket, which throws them away:
 #     a client that did not read for a moment gets the file cut at a record's edge and no close_notify, from the
-#     proxy, the server or storage
+#     proxy, the server, storage or the cache
 #   * an IMAP reply still in the COMPRESS deflate buffer when the connection settles, as the idle sweep's BYE is: the
 #     connection closed with neither the BYE nor close_notify
 #   * a session thrown away because the server closed: under --shards 4 a client that lets the server close never
@@ -165,6 +165,33 @@ elif mode == "stalled":
             bad.append("%s:%s:%d" % (size, how, body))
         s.close()
     print(len(sizes) * 3 - len(bad), " ".join(bad[:4]))
+elif mode in ("resp-set", "resp-stalled"):
+    # The cache's GET of a value of each size and QUIT at once, read as the stalled download above is read.
+    import time
+    sizes = [int(x) for x in sys.argv[3:]]
+    if mode == "resp-set":
+        s = connect()
+        for n in sizes:
+            s.sendall(b"*3\r\n$3\r\nSET\r\n$%d\r\nf%d\r\n$%d\r\n" % (len(b"f%d" % n), n, n) + b"v" * n + b"\r\n")
+            until(s, b"\r\n")
+        print("set", len(sizes))
+        sys.exit(0)
+    bad = []
+    for n in sizes * 3:
+        raw = socket.socket()
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        raw.settimeout(15)
+        raw.connect(("127.0.0.1", port))
+        s = context().wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=False)
+        key = b"f%d" % n
+        s.sendall(b"*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n*1\r\n$4\r\nQUIT\r\n" % (len(key), key))
+        time.sleep(0.7)
+        got, how = drain(s)
+        want = b"$%d\r\n" % n + b"v" * n + b"\r\n+OK\r\n"
+        if how != "clean" or got != want:
+            bad.append("%d:%s:%d" % (n, how, len(got)))
+        s.close()
+    print(len(sizes) * 3 - len(bad), " ".join(bad[:4]))
 elif mode in ("imapz-logout", "imapz-idle"):
     # COMPRESS DEFLATE over TLS, then LOGOUT, or nothing until the idle sweep says BYE.
     import zlib
@@ -251,7 +278,7 @@ SOCKETLEY_MAIL_IDLE_MS=3000 daemon_start "$BIN"
 "$BIN" create proxy px -p "$P_PX" --protocol http --backend "127.0.0.1:$P_BE" "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create proxy pt -p "$P_PT" --protocol tcp --backend "127.0.0.1:$P_BE" "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create proxy px4 -p "$P_PXS" --protocol http --backend "127.0.0.1:$P_BE" --shards 4 "${TLS[@]}" -s >/dev/null 2>&1
-"$BIN" create cache ca -p "$P_CA" "${TLS[@]}" -s >/dev/null 2>&1
+"$BIN" create cache ca -p "$P_CA" --read-buffer 8M "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create storage st -p "$P_ST" --dir "$T/st" --anonymous "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create mqtt mq -p "$P_MQ" --anonymous "${TLS[@]}" -s >/dev/null 2>&1
 "$BIN" create proxy fc -p "$P_FC" --domain fc.test --backend "fastcgi://unix:$T/none.sock" --root "$T/www" \
@@ -337,6 +364,15 @@ if [ -r /proc/net/tls_stat ]; then
     r=$(client stalled "$P_ST" /bkt/f localhost $STALL_SIZES)
     check "storage: 48 objects of 2.2-2.5 MB to clients that paused, each whole and then close_notify" \
         "${r%% *}" "48"
+    # shellcheck disable=SC2086
+    client resp-set "$P_CA" $STALL_SIZES >/dev/null
+    t0=$(tx)
+    # shellcheck disable=SC2086
+    r=$(client resp-stalled "$P_CA" $STALL_SIZES)
+    t1=$(tx)
+    check "cache: 48 values of 2.2-2.5 MB and QUIT to clients that paused, each whole and then close_notify" \
+        "${r%% *}" "48"
+    [ "$t1" -ge $((t0 + 48)) ] && ok || bad "the cache's large answers went through kernel TLS" "TlsTxSw $t0 -> $t1"
 else
     echo "  (no kernel TLS here: the kernel-encrypted close is not checked)"
 fi

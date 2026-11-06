@@ -1101,6 +1101,37 @@ int tls_context::ssl_write(SSL* ssl, const char* buf, int len)
 int tls_context::bio_read_out(SSL* ssl, char* buf, int len)
 {
 #if SOCKETLEY_HAS_TLS
+#if SOCKETLEY_KTLS
+    // On a lent socket the bytes stop at each mark, as take_out's do, and the caller has written what came before
+    // when it asks again: the key goes on the socket then, and a typed record is sent here.
+    if (out_bio* o = out_of(ssl); o && o->fd >= 0 && len > 0)
+    {
+        for (;;)
+        {
+            size_t n = std::min(static_cast<size_t>(len), o->buf.size() - o->off);
+            const uint64_t mark = o->next_mark();
+            if (mark != UINT64_MAX)
+                n = static_cast<size_t>(std::min<uint64_t>(n, mark - o->taken));
+            if (n > 0)
+            {
+                std::memcpy(buf, o->buf.data() + o->off, n);
+                o->off += n;
+                o->taken += n;
+                if (o->off == o->buf.size())
+                {
+                    o->buf.clear();
+                    o->off = 0;
+                }
+                return static_cast<int>(n);
+            }
+            if (o->off == o->buf.size())
+                return 0;
+            const auto step = kernel_step(ssl);
+            if (step != kernel_step_result::progressed)
+                return step == kernel_step_result::failed ? -1 : 0;
+        }
+    }
+#endif
     BIO* wbio = SSL_get_wbio(ssl);
     if (!wbio)
         return -1;

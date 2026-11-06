@@ -25,6 +25,7 @@
 #include "../../shared/ipc/shard_target.h"
 #include "../../shared/util/version.h"
 
+#include <poll.h>
 #include <unistd.h>
 #include <cmath>
 #include <cstring>
@@ -342,6 +343,7 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
     }
     conn->tls_state = tls_conn_none;
     conn->tls_peer_closed = false;
+    conn->tls_kernel = false;
 
     // A struct only goes back into the pool once the ring is finished with it,
     // because the pool hands structs to the very next accepted connection
@@ -409,7 +411,7 @@ void cache_instance::close_client([[maybe_unused]] client_connection* conn, int 
     // socket a shutdown here would end for the sibling too.
     event_loop* lp = m_loop ? m_loop : m_retired_loop;
     if (conn && fd >= 0 && lp && conn->ho_state != client_connection::handoff::sent)
-        lp->close_fd_orderly(fd);
+        lp->close_fd_orderly(fd, conn->tls_kernel);
     else
         close_tracked(fd);
     if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
@@ -842,6 +844,7 @@ bool cache_instance::setup(event_loop& loop)
     if (const auto v = socketley::settings::number<uint32_t>("SOCKETLEY_CACHE_BUF_SIZE"))
         buf_size = *v;
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, buf_count, buf_size);
+    m_kernel_tls = socketley::settings::flag("SOCKETLEY_KERNEL_TLS", true);
     // On always, for the server's reason: nothing here declines a read at a
     // watermark, so there is no second side to trade the throughput against.
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_enabled();
@@ -1369,6 +1372,9 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_writev:
             handle_write(cqe, req);
             break;
+        case op_poll:
+            handle_tls_room(cqe, req);
+            break;
         case op_connect:
             handle_master_connect(cqe, req);
             break;
@@ -1749,6 +1755,8 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
             close_client(ptr, client_fd, "tls-session-alloc-failed");
             return false;
         }
+        if (m_kernel_tls && !tls_context::allow_kernel_tls(ptr->ssl, client_fd))
+            m_kernel_tls = false;
         ptr->tls_state = tls_conn_handshake;
         ptr->handshake_since = std::chrono::steady_clock::now();
     }
@@ -2193,6 +2201,24 @@ bool cache_instance::tls_flush(client_connection* conn)
     // that answers WANT_READ.
     if (conn->tls_state == tls_conn_ready)
     {
+        // The first large answer moves the send key to the kernel, which then encrypts all this connection sends.
+        if (SOCKETLEY_UNLIKELY(!conn->tls_kernel && m_kernel_tls && conn->write_queue.bytes() >= kernel_tls_min))
+        {
+            const auto k = tls_context::start_kernel_tls(conn->ssl);
+            conn->tls_kernel = k == tls_context::kernel_switch::on;
+            if (k == tls_context::kernel_switch::unavailable)
+            {
+                m_kernel_tls = false;
+                LOG_WARN("cache: the kernel has no TLS layer to give (modprobe tls), so answers over TLS are encrypted here");
+            }
+            else if (k == tls_context::kernel_switch::failed)
+            {
+                conn->closing = true;
+                return true;
+            }
+        }
+        if (conn->tls_kernel)
+            return tls_kernel_flush(conn);
         // Room for the records of what is queued, as the proxy reserves it, so the write BIO does not regrow from empty.
         if (!conn->write_queue.empty())
         {
@@ -2265,6 +2291,84 @@ bool cache_instance::tls_flush(client_connection* conn)
         return false;
     }
     return true;
+}
+
+bool cache_instance::tls_kernel_flush(client_connection* conn)
+{
+    // What OpenSSL holds goes first: the records it encrypted before the key change, then any of a type of its own
+    // (an alert, a key update), each sent at its mark with nothing of this connection's in flight.
+    std::string cipher;
+    while (tls_context::take_out(conn->ssl, cipher) == 0 && tls_context::has_pending_out(conn->ssl))
+    {
+        const auto step = tls_context::kernel_step(conn->ssl);
+        if (step == tls_context::kernel_step_result::failed)
+        {
+            conn->closing = true;
+            return true;
+        }
+        if (step == tls_context::kernel_step_result::wait)
+        {
+            // Room for the typed record, waited for as a write is, so every close decision waits for it too.
+            for (uint32_t i = 0; i < conn->write_batch_count; i++)
+                { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
+            conn->write_batch_count = 0;
+            conn->write_req.type = op_poll;
+            conn->write_pending = m_loop->submit_poll_add(conn->fd, POLLOUT, &conn->write_req);
+            return conn->write_pending;
+        }
+        if (step == tls_context::kernel_step_result::idle)
+            break;
+    }
+    if (cipher.empty())
+    {
+        // Plaintext reaches the socket only once the kernel holds the key and nothing of OpenSSL's waits.
+        if (SOCKETLEY_UNLIKELY(!tls_context::kernel_ready(conn->ssl)))
+        {
+            conn->closing = true;
+            return true;
+        }
+        return flush_plain(conn);
+    }
+
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
+    conn->write_batch[0] = std::move(cipher);
+    conn->write_iovs[0].iov_base = conn->write_batch[0].data();
+    conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
+    conn->write_batch_count = 1;
+    conn->write_pending = true;
+    conn->write_req.type = op_write;
+    const auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+    const bool queued = conn->direct_fd
+        ? m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req)
+        : m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+    if (SOCKETLEY_UNLIKELY(!queued))
+    {
+        conn->write_pending = false;
+        conn->write_batch[0].clear();
+        conn->write_batch_count = 0;
+        return false;
+    }
+    return true;
+}
+
+// Room on the socket for a record kernel TLS sends with its type, or the end of the connection.
+void cache_instance::handle_tls_room(struct io_uring_cqe* cqe, io_request* req)
+{
+    const int fd = req->fd;
+    if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd] || &m_conn_idx[fd]->write_req != req)
+        return;
+    auto* conn = m_conn_idx[fd];
+    conn->write_pending = false;
+    conn->write_req.type = op_write;
+    if (cqe->res < 0 || (cqe->res & (POLLERR | POLLHUP)) != 0)
+    {
+        conn->closing = true;
+        if (!conn->read_pending)
+            close_client(conn, fd, "tls-room-wait-failed");
+        return;
+    }
+    after_write(conn, fd);
 }
 
 // One chain, armed by whichever question needs it first and never twice: the
@@ -8426,11 +8530,13 @@ bool cache_instance::flush_responses(client_connection* conn)
         return true;
     }
 
-    // Fast path straight out of response_buf when nothing is queued, never on
-    // a TLS connection, because response_buf is plaintext and this would put
-    // an answer on an encrypted port in the clear.
+    // Fast path straight out of response_buf when nothing is queued, on a TLS
+    // connection only once the kernel encrypts what it is given, because
+    // response_buf is plaintext.
     if (SOCKETLEY_LIKELY(!conn->write_pending && conn->write_queue.empty() &&
-                         conn->ssl == nullptr))
+                         (conn->ssl == nullptr ||
+                          (conn->tls_kernel && tls_context::kernel_ready(conn->ssl) &&
+                           !tls_context::has_pending_out(conn->ssl)))))
     {
         // A lone answer goes by send(), sparing it the ring entry and the
         // completion; see direct_send_gate for when that is a saving.
@@ -8521,7 +8627,11 @@ bool cache_instance::flush_write_queue(client_connection* conn)
     // holds.
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
         return tls_flush(conn);
+    return flush_plain(conn);
+}
 
+bool cache_instance::flush_plain(client_connection* conn)
+{
     if (!m_loop || conn->write_queue.empty())
         return true;
 

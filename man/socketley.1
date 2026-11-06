@@ -7130,6 +7130,10 @@ and
 also demands a certificate from every connecting client (mutual TLS).
 RESP and the line protocol both run on the decrypted stream, so an existing
 Redis client needs no change beyond speaking TLS.
+A TLS 1.3 connection that is owed 2 MiB or more at once hands its send key to
+the kernel's TLS layer, which encrypts that answer and every one after it
+straight from the cache's buffers (see
+.BR SOCKETLEY_KERNEL_TLS ).
 The full description is under
 .BR "COMMON FLAGS" .
 .PP
@@ -24590,17 +24594,22 @@ Set to
 .B 0
 to keep every TLS record in this process.
 Otherwise, some TLS 1.3 connections hand their sending to the kernel's TLS
-layer. This happens in three cases. A server, storage or proxy connection
+layer. This happens in four cases. A server, storage or proxy connection
 sends a file or object over 256 KiB. A TCP proxy's backend streams that much to
 the client. An HTTP/1.1 proxy sends a client an answer body of that known
-length.
+length. A cache connection is owed 2 MiB or more at once.
 .IP
 The connection then changes its send key and hands the new key to the kernel's
 TLS layer. The kernel encrypts what is sent, by sendfile from the page cache or
 spliced from the backend, at about half the CPU of encrypting a copy in this
-process. A connection that never sends that much stays as it was, because for
-small answers encrypting a copy here costs less. HTTP/2 connections are never
-moved.
+process. A cache's answer is in memory and has no sendfile to gain, so the
+kernel only spares it the copies OpenSSL makes: measured over loopback, 2 MiB
+answers cost 0.83 and 8 MiB 0.53 of the CPU, while 1 MiB and smaller cost the
+same or more, which is why a cache waits for 2 MiB. A connection that never
+sends that much stays as it was, because for small answers encrypting a copy
+here costs less. The move is for the rest of the connection: a 1 KiB answer on
+a moved cache connection costs what it did, a 256 KiB one about a tenth more.
+HTTP/2 connections are never moved.
 .IP
 This needs the kernel's
 .B tls

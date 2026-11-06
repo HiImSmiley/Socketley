@@ -215,6 +215,9 @@ struct client_connection
     // The peer's close_notify, remembered rather than acted on, because the
     // read that carries it can carry the last command ahead of it.
     bool tls_peer_closed{false};
+    // The kernel holds this connection's send key, so what is queued goes to the socket as plaintext once OpenSSL's
+    // own records have gone.
+    bool tls_kernel{false};
     // When the handshake began, which the deadline reads instead of
     // last_activity.  last_activity is refreshed on every read -- but only when
     // --idle-timeout is set, so the deadline silently changed meaning with a
@@ -312,6 +315,7 @@ struct client_connection
         ssl = nullptr;
         tls_state = tls_conn_none;
         tls_peer_closed = false;
+        tls_kernel = false;
         rl_tokens = 0.0;
         rl_max = 0.0;
         SKL_TRACE_RESET(*this);
@@ -1231,6 +1235,8 @@ private:
     bool flush_responses(client_connection* conn);
     void after_write(client_connection* conn, int fd);
     bool flush_write_queue(client_connection* conn);
+    // The queue onto the socket as it is: a cleartext connection, or a TLS one whose send key the kernel holds.
+    bool flush_plain(client_connection* conn);
     // Where a published message is written once for its subscribers, one
     // segment per wire format; see socketley::place_in_segment().
     std::shared_ptr<std::string> m_pub_seg_text;
@@ -1246,6 +1252,14 @@ private:
     // byte leaves a TLS connection, where true with nothing submitted is
     // legitimate and common.
     bool tls_flush(client_connection* conn);
+    // Under kernel TLS: OpenSSL's own records to their marks, then the queue as plaintext.
+    bool tls_kernel_flush(client_connection* conn);
+    void handle_tls_room(struct io_uring_cqe* cqe, io_request* req);
+    // A queue this large on a TLS 1.3 connection moves its send key to the kernel, which encrypts what is written
+    // from then on; below it the records encrypted here cost less, an answer from memory having no sendfile to gain.
+    // SOCKETLEY_KERNEL_TLS=0 keeps them all here.
+    static constexpr size_t kernel_tls_min = 2u << 20;
+    bool m_kernel_tls{true};
 
     // Whether this connection still owes the wire anything, which for TLS the
     // queue only half answers, because asking only about it is how a handshake
