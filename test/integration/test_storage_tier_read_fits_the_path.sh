@@ -5,7 +5,8 @@
 #
 # What each part would catch:
 #   * windows of 512 KiB: 50 ms away a read back ran at 20.6 MB/s at best however fast the path, and more of them in
-#     flight on more connections only slowed it, each restarting from a cold congestion window
+#     flight on more connections only slowed it, each restarting from a cold congestion window; counted as the tier's
+#     GETs, since a rate on a busy box is the CPU's
 #   * a window past the 1 MiB an answer is held to: every read back refused
 # A delay on loopback needs a network namespace of its own, which an unprivileged user namespace gives.
 set -uo pipefail
@@ -34,9 +35,6 @@ echo "=== Integration: a read back from a tier fits the path ==="
 ip link set lo up; ip link set dev lo mtu 1500
 command -v tc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || { echo "  SKIP: tc and python3 are required"; exit 0; }
 python3 -c "import boto3" 2>/dev/null || { echo "  SKIP: boto3 is required"; exit 0; }
-# Under the sanitizer every row runs but the ones that time something.
-sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate tierpath
 T=$SOCKETLEY_TMPD
 PS=$((SL_PORT_BASE + 1996)); PT=$((SL_PORT_BASE + 1997))
@@ -53,10 +51,19 @@ for p in "$PT" "$PS"; do
     for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p/")" != 000 ] && break; sleep 0.1; done
 done
 
-out=$(timeout 240 python3 - "$PS" "$PT" "$AK" "$SK" <<'PY'
+out=$(timeout 240 python3 - "$PS" "$PT" "$AK" "$SK" "$BIN" <<'PY'
 import boto3, os, subprocess, sys, time
 from botocore.config import Config
-ps, pt, ak, sk = sys.argv[1:5]
+ps, pt, ak, sk, sl = sys.argv[1:6]
+# The tier's count of GETs, once it has stopped moving: a worker's counters reach the daemon a moment late.
+def gets():
+    last = None
+    for _ in range(50):
+        out = subprocess.run([sl, "stats", "ttier"], capture_output=True, text=True).stdout
+        n = next((int(l.split(":")[1]) for l in out.splitlines() if l.startswith("gets:")), -1)
+        if n == last: return n
+        last = n; time.sleep(0.5)
+    return last
 cl = lambda p: boto3.client("s3", endpoint_url="http://127.0.0.1:%s" % p, region_name="us-east-1", aws_access_key_id=ak,
                             aws_secret_access_key=sk, config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
 s, t = cl(ps), cl(pt)
@@ -78,6 +85,7 @@ for m in ("sport", "dport"):
 # Six reads, the best of which is the path's: one that starts on a cold connection is slower, and says nothing, and a
 # read settles on one of a few plateaus (24, 39, 49, 73 MB/s) by the state its connection is in.
 rates, whole = [], True
+g0 = gets()
 for _ in range(6):
     t0 = time.time()
     try:
@@ -87,16 +95,16 @@ for _ in range(6):
     dt = time.time() - t0
     whole = whole and got == body
     rates.append(len(got) / dt / 1e6)
-print("%s %s %.1f %s" % (moved, whole, max(rates), " ".join("%.1f" % r for r in rates)))
+print("%s %s %d %.1f %s" % (moved, whole, gets() - g0, max(rates), " ".join("%.1f" % r for r in rates)))
 PY
 )
-read -r moved whole best rates <<<"$out"
-echo "  48 MiB read back from a tier 50 ms away, six times: ${rates:-$out} MB/s"
+read -r moved whole asked best rates <<<"$out"
+echo "  48 MiB read back from a tier 50 ms away, six times: ${rates:-$out} MB/s, in ${asked:-?} windows"
 [ "$moved" = True ] && ok || bad "the version moves to the tier" "$out"
 [ "$whole" = True ] && ok || bad "and is read back whole" "$out"
-if [ "$sanitized" = 1 ]; then echo "  SKIP [rate]: a rate measures the sanitizer, not the windows"
-elif awk -v b="${best:-0}" 'BEGIN{exit !(b >= 28)}'; then ok
-else bad "at more than one 512 KiB window a round trip" "the best of six ${best:-none} MB/s"; fi
+# 96 windows a read at 512 KiB; growing to 2 MiB, 26.
+if [ "${asked:-0}" -gt 0 ] && [ "${asked:-0}" -le $((6 * 48)) ]; then ok
+else bad "at more than one 512 KiB window a round trip" "${asked:-no} GETs at the tier for six reads of 48 MiB, best ${best:-none} MB/s"; fi
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
