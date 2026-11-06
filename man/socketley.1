@@ -16359,6 +16359,10 @@ connection waits for them as long as they keep coming, so a client is let in on
 whichever shard it lands on with its session whatever its size; these too are
 counted in
 .BR sessions_pieced .
+When two connections of one client claim its session at once, the newer one
+keeps it: a session the older one was given meanwhile is passed on to the
+newer one's shard, with what was still on its way to it, counted in
+.BR sessions_yielded .
 Relaying through the daemon also holds a packet to 8 MiB less 256 KiB, however
 large
 .B \-\-max\-packet

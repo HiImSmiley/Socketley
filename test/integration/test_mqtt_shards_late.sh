@@ -10,6 +10,8 @@
 #     waits for an answer at all, the session ended when its shard hears of the connection let in
 #   * a session too large for one frame through the daemon ended, rather than carried in pieces, when its shard
 #     answers late
+#   * a session lost when its shard gives it to a claim that has meanwhile lost to a newer connection of the client
+#     on a third shard, rather than passed on to that connection, with the mesh and relayed through the daemon
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -174,6 +176,76 @@ if phase == "large":
         truth("stats count a session carried in pieces", n >= 1, n)
         x.disconnect()
     guarded("large", large)
+if phase == "race":
+    def race():
+        # Two connections of one client on the two shards that do not hold its session, both claiming it while the
+        # shard that holds it is stopped: it gives the session to the older claim, which has lost to the newer.
+        name = "racer"
+        c = connected(port, name, clean=False, props={SESSION_EXPIRY: 600})
+        c.subscribe((name + "/#", 1))
+        held = owner(c)
+        c.disconnect()
+        pub = None
+        for i in range(60):
+            p = connected(port, "%s-pub-%d" % (name, i))
+            if owner(p) == held:
+                pub = p
+                break
+            p.disconnect()
+        truth("a publisher lands on the session's shard", pub is not None)
+        if pub is None:
+            return
+        for i in range(5):
+            pub.publish(name + "/t", b"q%d" % i, qos=1)
+        for _ in range(50):
+            out = subprocess.run([binary, "mqtt-sessions", "sh"], capture_output=True, timeout=10).stdout.decode()
+            if '"queued":5' in out.replace(" ", ""):
+                break
+            time.sleep(0.1)
+        socks = {}
+        for _ in range(100):
+            x = Client(port, timeout=15)
+            o = owner(x)
+            if o not in (held, None) and o not in socks:
+                socks[o] = x
+            else:
+                x.close()
+            if len(socks) == 2:
+                break
+        truth("two connections land on the two shards that do not hold the session", len(socks) == 2, list(socks))
+        if len(socks) != 2:
+            return
+        older, newer = socks.values()
+        # What the parts before counted has reached the daemon by now.
+        time.sleep(1.5)
+        before = stat("sessions_yielded", 0)
+        os.kill(held, signal.SIGSTOP)
+        try:
+            older.connect(name, clean=False, props={SESSION_EXPIRY: 600}, expect_ack=False)
+            time.sleep(0.3)
+            newer.connect(name, clean=False, props={SESSION_EXPIRY: 600}, expect_ack=False)
+            time.sleep(0.3)
+            # Read by the stopped shard after the claims, so it hands these on to the older one, which has passed on.
+            for i in range(3):
+                pub.publish(name + "/t", b"m%d" % i, qos=1, wait=False)
+            time.sleep(0.2)
+        finally:
+            os.kill(held, signal.SIGCONT)
+        a, b = older.expect(CONNACK, 10), newer.expect(CONNACK, 10)
+        check("the newer connection is let in and the older is not",
+              (b.body[1] if b else None, a is not None and a.body[1] == 0), (0, False))
+        got = [m.payload for m in newer.messages(8, 10)]
+        check("every queued message of the session, and those on their way to it, reach the newer connection once, "
+              "in order", (got, newer.quiet(1.0)), ([b"q%d" % i for i in range(5)] + [b"m%d" % i for i in range(3)], True))
+        after = connected(port, name + "-after")
+        after.publish(name + "/t", b"after", qos=1)
+        m = newer.message(5)
+        check("and its subscription goes on", m.payload if m else None, b"after")
+        after.disconnect()
+        n = stat("sessions_yielded", before + 1)
+        truth("stats count the session passed on in sessions_yielded", n > before, (before, n))
+        newer.disconnect(); older.close(); pub.close()
+    guarded("race", race)
 PY
 }
 
@@ -193,6 +265,7 @@ for mode in mesh relayed; do
     tally < <(run late)
     [ "$mode" = mesh ] && tally < <(run stale)
     [ "$mode" = relayed ] && tally < <(run large)
+    tally < <(run race)
     daemon_stop
 done
 unset SOCKETLEY_NO_SHARD_MESH

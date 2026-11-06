@@ -478,6 +478,7 @@ public:
 
     const broker_stats& stats() const { return m_stats; }
     size_t session_count() const { return m_sessions.size(); }
+    bool has_session(std::string_view client_id) const { return m_sessions.contains(std::string(client_id)); }
     size_t connected_count() const;
     size_t subscription_count() const { return m_subs.size(); }
     size_t retained_count() const { return m_retained.size(); }

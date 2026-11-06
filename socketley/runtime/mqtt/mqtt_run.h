@@ -246,6 +246,10 @@ private:
     // the shared groups this shard was chosen for, all of them when null for one accepted here.
     void forward_moved(const message_ptr& m, uint32_t origin, uint64_t epoch, uint64_t seq, uint64_t taken,
                        const std::vector<std::string>* groups);
+    // One message for the session `s` gave up, handed on to the shard it went to for `filters` of it.
+    struct moved_session;
+    void forward_to(const moved_session& s, std::vector<std::string> filters, bool plain, const message_ptr& m,
+                    uint32_t origin, uint64_t epoch, uint64_t seq, uint64_t taken);
     // The filters the other shards are told this shard holds: its own, and those of the sessions it gave up lately.
     std::vector<std::string> told_filters() const;
     // A message the shard a session came from handed on for it, the whole frame.
@@ -280,6 +284,8 @@ private:
     void absorb(const std::string& client, std::string_view bytes, uint32_t from, bool back);
     // The claim still waiting for `from` to answer, or for the session it said it sends, of `client`; 0 when none.
     uint64_t claim_awaiting(const std::string& client, uint32_t from) const;
+    // The session of `client` here handed to the shard whose newer connection beat this one's claim to it.
+    void pass_on(const std::string& client);
     // A session given up for shard `to`, as one frame or, past what one carries, as pieces of it.
     void hand_session(uint32_t to, const std::string& client, bool back, std::string_view bytes);
     void shard_stats(std::string& out) const;
@@ -408,16 +414,32 @@ private:
         bool        coming{false};
         uint32_t    coming_from{0};
         std::string session;
+        uint32_t    session_from{0};
         // When the claim began, or a piece of a session coming for it last came.
         int64_t     started_ms{0};
         // What the shard the session is coming from handed on for it before it is taken in here.
         std::vector<std::string> early;
+        // The shard of the newest connection this claim lost to, and its stamp, 0 when it said only that it is newer.
+        uint32_t    lost_to{0};
+        uint64_t    lost_stamp{0};
+        void lose(uint32_t to, uint64_t stamp)
+        {
+            if (!lost || stamp > lost_stamp)
+            {
+                lost_to    = to;
+                lost_stamp = stamp;
+            }
+            lost = true;
+        }
     };
     std::unordered_map<uint64_t, pending_claim> m_claims;
     // The claim and the shard each claim's question went to, by cookie; and those whose claim was finished without
     // them, for an answer that comes late.
     std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> m_claim_cookies;
     std::unordered_map<uint64_t, std::pair<std::string, uint32_t>> m_late_claims;
+    // A client whose claim here lost to a newer connection: the shard that has it, and until when a session that still
+    // comes here for it is handed there.
+    std::unordered_map<std::string, std::pair<uint32_t, int64_t>> m_pass_on;
     // Questions a starting shard asked, by cookie: of which shard, and whether for its retained messages.
     std::unordered_map<uint64_t, std::pair<uint32_t, bool>> m_dump_asks;
     // When to ask again for the retained messages a starting shard did not get, 0 when it is not owed.
