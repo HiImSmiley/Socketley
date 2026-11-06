@@ -24685,7 +24685,10 @@ differ only in the route, not in the build. One request or answer through the
 daemon holds 8 MiB, while a link carries a longer one in pieces. Eight such
 answers may wait at once on each side of the daemon for a shard that has not
 read them yet; past that, an asker is answered at once that the way is
-overloaded.
+overloaded. A request the daemon cannot queue for a shard whose backlog is full
+is answered the same way, as
+.BR "the runtime is overloaded: its request backlog is full" ,
+not as no such runtime.
 .TP
 .B SOCKETLEY_CACHE_HANDOFF
 .B 0

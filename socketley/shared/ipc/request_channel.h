@@ -24,7 +24,7 @@ enum class request_status : uint8_t
 {
     ok = 0,
     no_target,    // nothing answers to that name — never started, or stopped in between
-    overloaded,   // the channel was full when the request was posted
+    overloaded,   // the channel, or the way to the runtime, was full when the request was posted
     dropped       // the channel gave the request up: it was detached under it
 };
 
@@ -49,12 +49,16 @@ public:
     // say so and the channel parks the request against a ticket.
     virtual bool serves_inline() const { return true; }
 
-    // False means it could not even accept it and the origin is answered
-    // `no_target`, with the name passed because the default sink forwards for
-    // every name.
+    // False means it could not even accept it and the origin is answered as
+    // refusal() says, with the name passed because the default sink forwards
+    // for every name.
     virtual bool serve_deferred(uint64_t /*ticket*/, std::string_view /*target*/,
                                 std::string_view /*payload*/)
     { return false; }
+
+    // Why serve_deferred() just refused a payload of `size` for `target`: `overloaded` when the way is there but full.
+    virtual request_status refusal(std::string_view /*target*/, size_t /*size*/) const
+    { return request_status::no_target; }
 
     // The longest payload a request to `target` may have for this sink to carry it now.
     virtual size_t request_room(std::string_view /*target*/) const { return SIZE_MAX; }

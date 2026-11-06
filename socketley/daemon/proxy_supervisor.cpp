@@ -1655,7 +1655,7 @@ bool proxy_supervisor::check_liveness()
     return true;
 }
 
-// A write that does not queue means the child is gone or wedged, and saying so
+// A write that does not queue means the child is gone or its backlog is full, and saying so
 // keeps a ticket from being parked for something that will never answer.
 bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view target,
                                       std::string_view payload)
@@ -1668,6 +1668,11 @@ bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view target,
     return write_frame(worker_proto::frame(
         worker_proto::frame_type::chan_req,
         worker_proto::encode_chan_request(ticket, target, payload)), OWED_BACKLOG);
+}
+
+request_status proxy_supervisor::refusal(std::string_view, size_t) const
+{
+    return m_channel && m_control_fd >= 0 ? request_status::overloaded : request_status::no_target;
 }
 
 // ─── the other direction ────────────────────────────────────────────────────
@@ -1724,8 +1729,9 @@ void proxy_supervisor::on_chan_req(std::string_view payload)
         !m_channel->post(this, q.ticket, q.target, q.payload, request_class::client))
     {
         // Nothing was taken, so no reply is coming and answering here is the
-        // whole difference between a refusal and a hang.
-        refuse(request_status::no_target);
+        // whole difference between a refusal and a hang; a channel that is
+        // there refused it for being full.
+        refuse(m_channel ? request_status::overloaded : request_status::no_target);
         return;
     }
 

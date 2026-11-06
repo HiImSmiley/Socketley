@@ -5,6 +5,8 @@
 # What each part would catch:
 #   * the second of two large answers refused by the owning shard's writer or by the daemon's writer to the asking
 #     shard, past a backlog of one frame, so its client waits out the 30 s the channel gives an answer
+#   * a request the daemon refuses because the stopped shard's backlog is full, told to its client as
+#     "no such runtime" rather than as the overload it is
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -142,6 +144,48 @@ try:
     check("both answers of 7 MiB arrive whole", [got[0][0], got[1][0]], [True, True])
     slow = max(got[0][1], got[1][1])
     print(("ok " if slow < 10 else "bad ") + "and promptly" + ("" if slow < 10 else ": %.1f s" % slow))
+
+    # Past the 68 MiB the daemon queues for a stopped shard, one APPEND of 448 KiB from each of 200 connections on
+    # the other shard, and the APPENDs past it are refused at once, their clients told why.
+    opened = [socket.create_connection(("127.0.0.1", port)) for _ in range(440)]
+    out = subprocess.run(["ss", "-tnpH", "sport = :%d" % port], capture_output=True, timeout=10).stdout.decode()
+    by_port = {}
+    for line in out.splitlines():
+        f = line.split()
+        m = re.search(r"pid=(\d+)", line)
+        if len(f) >= 5 and m:
+            by_port[int(f[4].rpartition(":")[2])] = int(m.group(1))
+    more = [c for c in opened if by_port.get(c.getsockname()[1]) not in (pids[held], None)][:200]
+    for c in opened:
+        if c not in more:
+            c.close()
+    check("two hundred connections land on the shard that does not hold the key", len(more), 200)
+    answers = []
+    os.kill(pids[held], signal.SIGSTOP)
+    try:
+        chunk = cmd("APPEND", "big%d" % keys[0], b"Z" * (448 << 10))
+        for c in more:
+            c.sendall(chunk)
+        time.sleep(1)
+        for c in more:
+            c.setblocking(False)
+            try:
+                d = c.recv(1 << 16)
+            except BlockingIOError:
+                d = None
+            if d:
+                answers.append(d)
+    finally:
+        os.kill(pids[held], signal.SIGCONT)
+    refused = [a for a in answers if a.startswith(b"-")]
+    print(("ok " if refused else "bad ") + "an APPEND past the stopped shard's backlog is refused at once"
+          + ("" if refused else ": answers %r" % [a[:80] for a in answers]))
+    told = refused[0] if refused else b""
+    print("# told: %r (%d of %d refused)" % (told[:120], len(refused), len(answers)))
+    check("its client is told the worker is overloaded, not that there is no such runtime",
+          (b"overloaded" in told, b"no such runtime" in told, told[:100]), (True, False, told[:100]))
+    for c in more:
+        c.close()
 except Exception as e:
     print("bad the script ran: %s %s" % (type(e).__name__, e))
 PY

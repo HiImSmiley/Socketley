@@ -52,6 +52,8 @@ public:
 
     bool serve_deferred(uint64_t ticket, std::string_view target,
                         std::string_view payload) override;
+    // A child still connected refused a request for its backlog.
+    request_status refusal(std::string_view target, size_t size) const override;
 
     // A reply to something the worker asked, carrying the worker's own ticket
     // back unchanged so this side keeps no table.

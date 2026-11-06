@@ -32,7 +32,7 @@ class shard_link;
 
 // What a served request came to: `deferred` means the answer is written later
 // through shard_link::send_reply() on the link it arrived on.
-enum class mesh_verdict : uint8_t { served, deferred, refused };
+enum class mesh_verdict : uint8_t { served, deferred, refused, overloaded };
 
 // What a link hands a request to once it has arrived from a sibling, supplied
 // by the worker because the link knows nothing about runtimes.
@@ -723,8 +723,9 @@ private:
                 return;
 
             send_reply(q.ticket,
-                       v == mesh_verdict::served ? request_status::ok
-                                                 : request_status::no_target,
+                       v == mesh_verdict::served       ? request_status::ok
+                       : v == mesh_verdict::overloaded ? request_status::overloaded
+                                                       : request_status::no_target,
                        reply);
             return;
         }
@@ -912,6 +913,12 @@ public:
         if (m_link && m_link->alive())
             return SIZE_MAX;
         return m_relay ? m_relay->request_room(target) : 0;
+    }
+
+    // The relay was the last way tried, so its reason is the one that holds.
+    request_status refusal(std::string_view target, size_t size) const override
+    {
+        return m_relay ? m_relay->refusal(target, size) : request_status::no_target;
     }
 
     uint64_t stat_direct()  const { return m_direct; }

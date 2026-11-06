@@ -181,6 +181,12 @@ public:
         return envelope < worker_proto::max_payload ? worker_proto::max_payload - envelope : 0;
     }
 
+    // A live socket that refused a request the daemon could read refused it for its backlog.
+    request_status refusal(std::string_view target, size_t size) const override
+    {
+        return !m_w->dead() && size <= request_room(target) ? request_status::overloaded : request_status::no_target;
+    }
+
 private:
     control_writer* m_w;
 };
@@ -1358,31 +1364,34 @@ private:
             sink->serve_request(payload, reply);
             return mesh_verdict::served;
         }
-        return self->defer_request(sink, ticket, from->serial(), target, payload)
-             ? mesh_verdict::deferred
-             : mesh_verdict::refused;
+        switch (self->defer_request(sink, ticket, from->serial(), target, payload))
+        {
+            case request_status::ok:         return mesh_verdict::deferred;
+            case request_status::overloaded: return mesh_verdict::overloaded;
+            default:                         return mesh_verdict::refused;
+        }
     }
 
     // A request the runtime answers on a later turn, parked on this worker's
     // own channel so the answer comes back through on_request_reply() with a
-    // cookie naming the socket it goes out on.  False means nothing was taken
-    // and the caller answers no_target itself.
-    bool defer_request(request_sink* sink, uint64_t wire_ticket,
-                       uint64_t link_serial, std::string_view target,
-                       std::string_view payload)
+    // cookie naming the socket it goes out on.  Anything but ok means nothing
+    // was taken, and is what the caller answers.
+    request_status defer_request(request_sink* sink, uint64_t wire_ticket,
+                                 uint64_t link_serial, std::string_view target,
+                                 std::string_view payload)
     {
         auto& ch = m_manager.requests();
         const uint64_t cookie = m_next_deferred++;
         // As a client's, since the wire carries no class and background work was already held short where it was posted.
         const uint64_t ticket = ch.park(this, cookie, sink, request_class::client);
         if (ticket == 0)
-            return false;
+            return request_status::overloaded;
         m_deferred.emplace(cookie, deferred_reply{wire_ticket, link_serial});
         if (sink->serve_deferred(ticket, target, payload))
-            return true;
+            return request_status::ok;
         ch.withdraw(ticket);
         m_deferred.erase(cookie);
-        return false;
+        return sink->refusal(target, payload.size());
     }
 
     // The runtime is done with a request that came in from outside, and the
@@ -1783,8 +1792,10 @@ private:
                 // taken.
                 if (!sink->serves_inline())
                 {
-                    if (defer_request(sink, q.ticket, 0, q.target, q.payload))
+                    const request_status took = defer_request(sink, q.ticket, 0, q.target, q.payload);
+                    if (took == request_status::ok)
                         return;
+                    st = static_cast<uint8_t>(took);
                 }
                 else
                 {

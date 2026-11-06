@@ -10,7 +10,7 @@ const char* request_status_text(request_status st)
     {
         case request_status::ok:         return "ok";
         case request_status::no_target:  return "no such runtime";
-        case request_status::overloaded: return "cache request queue full";
+        case request_status::overloaded: return "the runtime is overloaded: its request backlog is full";
         case request_status::dropped:    return "cache request dropped";
     }
     return "unknown";
@@ -397,8 +397,11 @@ void request_channel::drain()
                 // It would not even take it, so nothing is going to complete
                 // this ticket and it must not stay parked.
                 withdraw(ticket);
-                m_stat_no_target++;
-                st = request_status::no_target;
+                st = sink->refusal(e.target, e.payload.size());
+                if (st == request_status::no_target)
+                    m_stat_no_target++;
+                else
+                    m_stat_deferred_refused++;
             }
         }
         else if (sink)
