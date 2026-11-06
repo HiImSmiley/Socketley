@@ -136,6 +136,15 @@ private:
         int64_t closing_ms{0};
         SSL* ssl{nullptr};
         bool handshaken{false};
+        // The kernel holds the send key, and what is sent goes to the socket as plaintext, a payload as a slice of its
+        // message as on a clear connection.  Until the key is on the socket and OpenSSL's records at their marks are
+        // out, it waits in `held`; `kwait` is the write slot waiting for room for a record of a type of its own.
+        bool ktls{false};
+        bool kclean{false};
+        bool kwait{false};
+        // The kernel took no key or no record: the connection ends at the next settle, outside the broker's call.
+        bool kfail{false};
+        std::vector<socketley::write_chunk> held;
         // WebSocket: the upgrade request until it is whole, then frames.
         bool ws{false};
         bool ws_open{false};
@@ -181,6 +190,18 @@ private:
     void urgent_out(conn& c, std::string_view framed);
     // Bytes of the connection's own at the end of what it owes.
     static void queue_owned(conn& c, std::string_view bytes);
+    static void put_owned(conn& c, std::vector<socketley::write_chunk>& to, std::string_view bytes);
+    // Where what the broker sends goes: the queue, or under kernel TLS `held` while OpenSSL's records go first.
+    static std::vector<socketley::write_chunk>& app_out(conn& c) { return c.ktls && !c.kclean ? c.held : c.queue; }
+    // A packet this large on a TLS 1.3 connection moves its send key to the kernel; SOCKETLEY_KERNEL_TLS=0 never.
+    void maybe_kernel_tls(conn& c, size_t bytes);
+    // Under kernel TLS with nothing of the connection's unsent: OpenSSL's records to the next mark, or the mark itself,
+    // and once none is left what was held.  False when it waits for room or ended the connection.
+    bool kernel_marks(conn& c);
+    void kernel_room(conn& c, int res);
+    void kernel_failed(conn& c);
+    static constexpr size_t kernel_tls_min = 256u << 10;
+    bool m_kernel_tls{true};
     // What OpenSSL has encrypted, moved to the end of what the connection owes.
     void queue_tls_out(conn& c);
     std::string m_tls_out;

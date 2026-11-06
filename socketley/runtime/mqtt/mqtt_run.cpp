@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <openssl/x509.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include "mqtt_command.h"
@@ -30,6 +31,7 @@
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/byte_codec.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/settings.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/util/version.h"
 #include "../../shared/util/wall_clock.h"
@@ -171,6 +173,7 @@ bool mqtt_run::start(std::string& why)
     cfg.keepalive_max      = m_owner.get_keepalive_max();
     cfg.write_limit        = m_owner.get_write_buffer() ? m_owner.get_write_buffer() : (4u << 20);
     m_read_hold            = cfg.write_limit * 2 + cfg.max_packet;
+    m_kernel_tls           = socketley::settings::flag("SOCKETLEY_KERNEL_TLS", true);
     cfg.version            = SOCKETLEY_VERSION;
     cfg.sys_interval_s     = 10;
     // A shard of several publishes its own figures under its number, and every shard keeps them all.
@@ -404,7 +407,11 @@ void mqtt_run::accept_done(listener& l, struct io_uring_cqe* cqe)
             c->ws = l.ws;
             c->closing_ms = now_ms();
             if (m_tls)
+            {
                 c->ssl = m_tls->create_ssl_server();
+                if (c->ssl && m_kernel_tls && !tls_context::allow_kernel_tls(c->ssl, fd))
+                    m_kernel_tls = false;
+            }
             conn* raw = c.get();
             m_conns.emplace(raw->id, std::move(c));
             runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
@@ -614,6 +621,7 @@ void mqtt_run::tls_in(conn& c, const char* p, size_t n)
     }
     if (!c.dead && tls_context::has_pending_out(c.ssl))
     {
+        c.kclean = false;
         queue_tls_out(c);
         flush(c);
     }
@@ -792,7 +800,11 @@ void mqtt_run::raw_out(conn& c, std::string_view bytes)
 {
     if (c.dead)
         return;
-    if (c.ssl)
+    if (c.ssl && !c.ktls)
+        maybe_kernel_tls(c, bytes.size());
+    if (c.ktls)
+        put_owned(c, app_out(c), bytes);
+    else if (c.ssl)
     {
         // The record layer takes so much before what it made is taken out, which is done after each piece; a piece
         // it refuses leaves the packet cut short, so the connection ends at once, at the settle after this turn.
@@ -818,17 +830,22 @@ void mqtt_run::raw_out(conn& c, std::string_view bytes)
 
 void mqtt_run::queue_owned(conn& c, std::string_view bytes)
 {
+    put_owned(c, c.queue, bytes);
+}
+
+void mqtt_run::put_owned(conn& c, std::vector<socketley::write_chunk>& to, std::string_view bytes)
+{
     if (bytes.empty())
         return;
     c.owed += bytes.size();
     // A fitted connection's chunks stay a batch long, so a write can stop between them.
-    if (!c.queue.empty() && c.queue.back().owns() && (!c.fitted || c.queue.back().size() < fitted_batch))
-        c.queue.back().append(bytes);
+    if (!to.empty() && to.back().owns() && (!c.fitted || to.back().size() < fitted_batch))
+        to.back().append(bytes);
     else
     {
         std::string b = std::move(c.spare);
         b.assign(bytes);
-        c.queue.emplace_back(std::move(b));
+        to.emplace_back(std::move(b));
     }
 }
 
@@ -839,29 +856,115 @@ void mqtt_run::queue_tls_out(conn& c)
     queue_owned(c, m_tls_out);
 }
 
+void mqtt_run::maybe_kernel_tls(conn& c, size_t bytes)
+{
+    if (!m_kernel_tls || !c.handshaken || bytes < kernel_tls_min)
+        return;
+    const auto k = tls_context::start_kernel_tls(c.ssl);
+    c.ktls = k == tls_context::kernel_switch::on;
+    if (k == tls_context::kernel_switch::unavailable)
+    {
+        m_kernel_tls = false;
+        LOG_WARN("mqtt: the kernel has no TLS layer to give (modprobe tls), so payloads over TLS are encrypted here");
+    }
+    else if (k == tls_context::kernel_switch::failed)
+        kernel_failed(c);
+}
+
+bool mqtt_run::kernel_marks(conn& c)
+{
+    for (;;)
+    {
+        m_tls_out.clear();
+        if (tls_context::take_out(c.ssl, m_tls_out) > 0)
+        {
+            queue_owned(c, m_tls_out);
+            return true;
+        }
+        if (!tls_context::has_pending_out(c.ssl))
+        {
+            // The key goes on the socket here if it is due, with nothing written behind it yet.
+            if (!tls_context::kernel_ready(c.ssl))
+            {
+                kernel_failed(c);
+                return false;
+            }
+            c.kclean = true;
+            std::move(c.held.begin(), c.held.end(), std::back_inserter(c.queue));
+            c.held.clear();
+            return true;
+        }
+        const auto step = tls_context::kernel_step(c.ssl);
+        if (step == tls_context::kernel_step_result::progressed)
+            continue;
+        if (step == tls_context::kernel_step_result::wait)
+        {
+            c.wr         = io_request{};
+            c.wr.owner   = this;
+            c.wr.buffer  = reinterpret_cast<char*>(&c);
+            c.wr.fd      = c.fd;
+            c.wr.type    = op_poll;
+            c.wr_pending = m_loop.submit_poll_add(c.fd, POLLOUT, &c.wr);
+            c.kwait      = c.wr_pending;
+            // The ring had no room; a turn later it may.
+            c.reflush    = !c.wr_pending;
+            return false;
+        }
+        kernel_failed(c);
+        return false;
+    }
+}
+
+void mqtt_run::kernel_failed(conn& c)
+{
+    c.kfail = true;
+    close(c.id);
+}
+
+void mqtt_run::kernel_room(conn& c, int res)
+{
+    c.wr_pending = false;
+    c.kwait = false;
+    if (c.dead)
+    {
+        if (!c.rd_pending)
+            std::erase_if(m_closing, [&](const std::unique_ptr<conn>& x) { return x.get() == &c; });
+        return;
+    }
+    if (res < 0 || (res & (POLLERR | POLLHUP)) != 0)
+    {
+        close_conn(c);
+        return;
+    }
+    flush(c);
+}
+
 void mqtt_run::send_parts(uint64_t id, std::string_view head, const std::shared_ptr<const std::string>& owner,
                           std::string_view body)
 {
     conn* c = find(id);
     if (!c || c->dead)
         return;
-    // TLS encrypts every byte into a record anyway, so a slice saves it nothing.
-    if (c->ssl)
+    if (c->ssl && !c->ktls)
+        maybe_kernel_tls(*c, head.size() + body.size());
+    // TLS encrypted here makes a record of every byte anyway, so a slice saves it nothing; the kernel's takes one.
+    if (c->ssl && !c->ktls)
     {
         broker_io::send_parts(id, head, owner, body);
         return;
     }
+    auto& to = app_out(*c);
     if (c->ws)
     {
         char frame[14];
         const int n = ws_write_header(frame, static_cast<uint8_t>(0x80 | WS_OP_BINARY), head.size() + body.size());
-        queue_owned(*c, std::string_view(frame, static_cast<size_t>(n)));
+        put_owned(*c, to, std::string_view(frame, static_cast<size_t>(n)));
     }
-    queue_owned(*c, head);
+    put_owned(*c, to, head);
     if (!body.empty())
     {
         const auto off = static_cast<uint32_t>(body.data() - owner->data());
-        c->queue.emplace_back(owner, off, static_cast<uint32_t>(body.size()));
+        to.emplace_back(owner, off, static_cast<uint32_t>(body.size()));
         c->owed += body.size();
     }
     flush(*c);
@@ -901,6 +1004,9 @@ void mqtt_run::flush(conn& c)
         c.sending.clear();
         c.sending_at = 0;
         c.sent = 0;
+        // Under kernel TLS what OpenSSL holds at a mark goes once nothing before it is unsent, and then what was held.
+        if (c.queue.empty() && c.urgent.empty() && c.ktls && !c.kclean && !kernel_marks(c))
+            return;
         if (c.queue.empty() && c.urgent.empty())
         {
             if (c.closing)
@@ -1035,7 +1141,7 @@ void mqtt_run::close_conn(conn& c)
     // connection and throws away what the kernel has not delivered of the answer, which orderly_close keeps.
     if (c.fd >= 0)
     {
-        m_loop.close_fd_orderly(c.fd);
+        m_loop.close_fd_orderly(c.fd, c.ktls);
         c.fd = -1;
     }
     if (c.ssl)
@@ -1077,9 +1183,15 @@ void mqtt_run::settle()
             conn* c = find(id);
             if (!c || c->dead)
                 continue;
+            if (c->kfail)
+            {
+                close_conn(*c);
+                continue;
+            }
             // A TLS connection's close_notify goes out once all else has, and its write's end brings it back here.
             if (c->unsent() == 0 && c->ssl && tls_context::close_notify(c->ssl))
             {
+                c->kclean = false;
                 queue_tls_out(*c);
                 flush(*c);
             }
@@ -1120,6 +1232,8 @@ void mqtt_run::on_cqe(struct io_uring_cqe* cqe)
     {
         if (req == &c->rd)
             read_done(*c, cqe);
+        else if (req == &c->wr && c->kwait)
+            kernel_room(*c, cqe->res);
         else if (req == &c->wr)
             write_done(*c, cqe->res);
     }
