@@ -76,10 +76,10 @@ PASS=$((PASS+p)); FAIL=$((FAIL+f)); TOTAL=$((TOTAL+p+f))
 [ "$rc" -ne 0 ] && [ "$f" -eq 0 ] && bad "the compression half ran" "exit $rc: $out"
 
 metrics=$(printf 'GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' | timeout 8 nc 127.0.0.1 "$MPORT" 2>/dev/null)
-n=$(echo "$metrics" | awk '$1 ~ /^socketley_storage_compressed_objects_total/ {print $2; exit}')
+n=$(awk '$1 ~ /^socketley_storage_compressed_objects_total/ {print $2; exit}' <<<"$metrics")
 [ -n "$n" ] && [ "$n" -ge 5 ] 2>/dev/null && ok "/metrics counts the versions compressed" \
     || bad "/metrics counts the versions compressed" "$(echo "$metrics" | grep -c socketley_storage) storage lines, value '$n'"
-echo "$metrics" | grep -q '^socketley_storage_scrub_passes_total' && ok "/metrics has the scrub's counters" \
+grep -q '^socketley_storage_scrub_passes_total' <<<"$metrics" && ok "/metrics has the scrub's counters" \
     || bad "/metrics has the scrub's counters" "$(echo "$metrics" | grep scrub | head -3)"
 
 # A restart reads what was compressed, and the passes go on from where they were rather than over every version.

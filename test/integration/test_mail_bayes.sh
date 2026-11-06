@@ -145,10 +145,10 @@ grep -q "from <someone@else.test> to <nobody@example.test>: refused" "$SOCKETLEY
 # The worker's figures reach the daemon a moment after they change, later under load.
 for _ in $(seq 1 100); do
     metrics=$(curl -s "http://127.0.0.1:$MP/metrics")
-    echo "$metrics" | grep -qE '^socketley_mail_delivered_total\{name="m"\} [1-9]' && echo "$metrics" | grep -q '^socketley_mail_stat{name="m",stat="mail_bayes_spam"} 25' && break
+    grep -qE '^socketley_mail_delivered_total\{name="m"\} [1-9]' <<<"$metrics" && grep -q '^socketley_mail_stat{name="m",stat="mail_bayes_spam"} 25' <<<"$metrics" && break
     sleep 0.1
 done
-echo "$metrics" | grep -qE '^socketley_mail_delivered_total\{name="m"\} [1-9]' && echo "$metrics" | grep -q '^socketley_mail_stat{name="m",stat="mail_bayes_spam"} 25' \
+grep -qE '^socketley_mail_delivered_total\{name="m"\} [1-9]' <<<"$metrics" && grep -q '^socketley_mail_stat{name="m",stat="mail_bayes_spam"} 25' <<<"$metrics" \
     && ok "the daemon's metrics carry the mail runtime's figures" || bad "mail metrics" "$(echo "$metrics" | grep -c socketley_mail)"
 
 case "$("$BIN" mail usage 2>&1)" in *"alice"*"KiB  of no quota"*) ok "mail usage says what each user's mailboxes hold" ;;
