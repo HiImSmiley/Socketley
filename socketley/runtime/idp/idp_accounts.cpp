@@ -522,9 +522,10 @@ void account_store::synced(bool ok)
     {
         auto job = std::move(m_compact_ready);
         compact_step(job, 7);
-        return;
+        // A fresh journal that would not go in has answered every waiter, refused; else this sync's are answered below.
+        ok = !m_broken;
     }
-    if (ok && !m_compacting && m_journal_records >= compact_after())
+    else if (ok && !m_compacting && m_journal_records >= compact_after())
         compact_async();
     std::vector<std::pair<uint64_t, std::function<void(bool)>>> due;
     for (auto it = m_waiting.begin(); it != m_waiting.end();)
