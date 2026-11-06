@@ -41,6 +41,13 @@ constexpr size_t  max_body  = 4u << 20;
 constexpr size_t  max_conns = 4096;
 // What a stream holds unsent before it takes further changes from the history as it drains, not into memory.
 constexpr size_t  feed_window = 256u << 10;
+// The changes kept for a stream that resumes: while one is open on any shard or closed within resume_secs (a replica
+// takes up to a minute to call a silent stream dead, then two seconds to dial again), and else only a few.
+constexpr size_t  history_bytes      = 32u << 20;
+constexpr size_t  idle_history_bytes = 1u << 20;
+constexpr int64_t resume_secs        = 120;
+// The common word the shards of a runtime stamp with the last second one held a stream.
+constexpr uint32_t feed_seen_word = 0;
 // A stream's place when every document of its last change was offered to it.
 constexpr size_t  whole_change = SIZE_MAX;
 
@@ -404,9 +411,41 @@ void db_run::send_event(conn& c, const event& e)
     ++m_c.events;
 }
 
+bool db_run::feeds_near(int64_t now)
+{
+    if (std::any_of(m_feeds.begin(), m_feeds.end(), [](const std::shared_ptr<conn>& c) { return !c->dead; }))
+    {
+        feeds_here(now);
+        return true;
+    }
+    const int64_t seen = std::max<int64_t>(m_feed_seen,
+        static_cast<int64_t>(m_owner.shard_stats_table().common_at(feed_seen_word)));
+    return seen != 0 && now - seen < resume_secs;
+}
+
+void db_run::feeds_here(int64_t now)
+{
+    if (m_feed_seen == now)
+        return;
+    m_feed_seen = now;
+    if (auto* w = m_owner.shard_stats_table().common_word(feed_seen_word))
+        w->store(static_cast<uint64_t>(now), std::memory_order_relaxed);
+}
+
+void db_run::trim_history(size_t cap)
+{
+    while (m_history_bytes > cap && !m_history.empty())
+    {
+        const event& f = m_history.front();
+        m_history_bytes -= f.json.size() + f.coll.size() + f.id.size() + 64;
+        m_history_from = f.seq + 1;
+        m_history.pop_front();
+    }
+}
+
 void db_run::publish()
 {
-    constexpr size_t history_bytes = 32u << 20;
+    const size_t cap = feeds_near(wall::now_sec_coarse()) ? history_bytes : idle_history_bytes;
     while (!m_unpublished.empty() && m_unpublished.front().seq <= m_durable)
     {
         event e = std::move(m_unpublished.front());
@@ -430,13 +469,7 @@ void db_run::publish()
         }
         m_history_bytes += e.json.size() + e.coll.size() + e.id.size() + 64;
         m_history.push_back(std::move(e));
-        while (m_history_bytes > history_bytes && !m_history.empty())
-        {
-            const event& f = m_history.front();
-            m_history_bytes -= f.json.size() + f.coll.size() + f.id.size() + 64;
-            m_history_from = f.seq + 1;
-            m_history.pop_front();
-        }
+        trim_history(cap);
     }
     std::erase_if(m_feeds, [](const std::shared_ptr<conn>& c) { return c->dead; });
     tell_feeds();
@@ -955,6 +988,7 @@ std::string db_run::stats() const
            "\nqueries:" + std::to_string(m_c.queries) + "\nsyncs:" + std::to_string(m_c.syncs) +
            "\nrefused:" + std::to_string(m_c.refused) + "\nconflicts:" + std::to_string(m_c.conflicts) +
            "\nexpired:" + std::to_string(m_c.expired) + "\nfeeds:" + std::to_string(feeds) +
+           "\nhistory_bytes:" + std::to_string(m_history_bytes) +
            "\nevents_sent:" + std::to_string(m_c.events) + "\nbackups:" + std::to_string(m_c.backups) +
            "\nbackup_failures:" + std::to_string(m_c.backup_failures) + "\nscript_calls:" + std::to_string(m_c.calls) +
            (m_shards > 1 ? "\nshard:" + std::to_string(m_shard) + "/" + std::to_string(m_shards) +
@@ -1082,6 +1116,9 @@ bool db_run::keeps_open(const socketley::http::server_conn& c) const
 void db_run::closing(const std::shared_ptr<socketley::http::server_conn>& sc)
 {
     auto& c = static_cast<conn&>(*sc);
+    // A stream that ends may resume, here or at a sibling, from the moment it went.
+    if (c.feed)
+        feeds_here(wall::now_sec_coarse());
     if (!c.dump.empty())
     {
         c.dump.clear();
@@ -1167,6 +1204,10 @@ void db_run::tick()
     }
     std::erase_if(m_feeds, [](const std::shared_ptr<conn>& c) { return c->dead; });
     tell_feeds();
+    // Asked every tick, so a quiet stream still stamps the word its siblings read; once none is near, what was kept for
+    // one goes.
+    if (!feeds_near(now) && m_history_bytes > idle_history_bytes)
+        trim_history(idle_history_bytes);
     m_http.sweep(now, idle_secs);
     catch_up();
     // A replica is told of the documents that go by the database it copies, which sends their deletions; a shard
@@ -1955,8 +1996,11 @@ void db_run::catch_up()
     const uint64_t layout = log_word(1);
     if (layout == m_seen_layout && durable <= m_store.seq())
         return;
+    // The changes are made into events only while a stream may want them; past that the history has a gap and is let
+    // go, so a resume from inside it is told reset.
     std::vector<event> evs;
-    if (!m_store.follow(durable, &evs))
+    const bool tell = feeds_near(wall::now_sec_coarse());
+    if (!m_store.follow(durable, tell ? &evs : nullptr))
     {
         // The log no longer goes on from where this shard stood -- cleared, restored, merged past -- so it is read
         // again whole, and its streams start over as a replica's do after a reset.
@@ -1977,6 +2021,12 @@ void db_run::catch_up()
     for (auto& e : evs)
         m_unpublished.push_back(std::move(e));
     m_durable = m_store.seq();
+    if (!tell)
+    {
+        m_history.clear();
+        m_history_bytes = 0;
+        m_history_from = m_durable + 1;
+    }
     publish();
 }
 

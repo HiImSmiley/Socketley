@@ -15865,10 +15865,18 @@ from the last change it read, with
 .B Last\-Event\-ID
 (or
 .BR ?since= ).
-The database keeps about 32 MiB of changes. A stream resuming from an older
-change is told
+While a stream is open on any shard, and for two minutes after the last one
+closed, the database keeps about 32 MiB of changes on every shard, so a stream
+that resumes may reach any of them.
+With no stream near, shard 0 keeps about 1 MiB and a shard reading its log
+keeps none.
+A stream resuming from an older change is told
 .B reset
-and should read again what it shows. A comment every fifteen seconds keeps a
+and should read again what it shows.
+.B stats
+gives each shard's
+.BR history_bytes .
+A comment every fifteen seconds keeps a
 quiet stream from looking dead.
 .PP
 .B Documents with a time to go.

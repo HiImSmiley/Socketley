@@ -160,6 +160,11 @@ private:
     void hold(waiter w);
     // Changes on the disk told to every stream that may see them, and kept for one that resumes.
     void publish();
+    // Whether a stream is open on any shard of this runtime, or closed within resume_secs, which is when a resume may
+    // come; the history is kept to history_bytes then and to idle_history_bytes otherwise.
+    bool feeds_near(int64_t now);
+    void feeds_here(int64_t now);
+    void trim_history(size_t cap);
     // A stream's changes from `since` on, or a reset and a whole copy when they are no longer kept.
     void open_feed(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica);
     void open_feed_at(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica);
@@ -256,6 +261,8 @@ private:
     std::deque<event> m_history;
     size_t m_history_bytes{0};
     uint64_t m_history_from{1};
+    // When this shard last held a stream, in wall seconds; the runtime's latest is in the shards' common word.
+    int64_t m_feed_seen{0};
 
     // Jobs off the loop, and the eventfd they and the replica's thread wake it through.
     struct job_slot

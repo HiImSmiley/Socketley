@@ -84,6 +84,9 @@ def events(s, want, wait=20.0):
     state[s] = (buf, head)
     return out
 
+# A stream open from the start, as there is wherever streams are used: with none near, a database keeps about 1 MiB
+# of changes and the streams below would be told reset rather than be behind on the history.
+keeper = stuck("/c/pub/_feed")
 n = 0
 for _ in range(40):
     n += 1
@@ -120,7 +123,7 @@ n += 1
 put(n)
 nxt = events(early[0], 1) + events(live[0], 1)
 check("then the next one live", (len(nxt), len(set(nxt)), nxt[0][0] > ids[-1] if nxt else False), (2, 1, True))
-for s in early + live:
+for s in early + live + [keeper]:
     s.close()
 PY
 )

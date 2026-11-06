@@ -917,8 +917,10 @@ bool store::scan(uint32_t seg, uint64_t payload_off, std::string_view payload, s
 {
     std::vector<event> evs;
     std::vector<uint64_t> offs;
+    std::vector<uint32_t> lens;
     uint64_t seq = 0;
-    if (!decode_record(payload, evs, &offs, &seq))
+    // A document's JSON is copied out only for whoever is told of it; the store itself reads it where it lies.
+    if (!decode_record(payload, evs, &offs, &seq, events ? nullptr : &lens))
         return false;
     // Told after the documents are as the record leaves them, as a write tells its own.
     struct tell
@@ -955,15 +957,16 @@ bool store::scan(uint32_t seg, uint64_t payload_off, std::string_view payload, s
         }
         if (const auto t = m_tombs.find(key); t != m_tombs.end() && t->second > e.seq)
             continue;
+        const std::string_view json = events ? std::string_view(e.json) : payload.substr(offs[i], lens[i]);
         doc d;
         d.owner = e.owner;
         d.v = e.v;
         d.seq = e.seq;
-        d.at = location{seg, payload_off + offs[i], static_cast<uint32_t>(e.json.size())};
+        d.at = location{seg, payload_off + offs[i], static_cast<uint32_t>(json.size())};
         if (!c->indexes.empty() || !c->ttl.empty())
         {
             jvalue body;
-            if (!json_reader(e.json).document(body))
+            if (!json_reader(json).document(body))
                 return false;
             derive(*c, body, d);
         }
