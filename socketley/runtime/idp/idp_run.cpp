@@ -339,6 +339,9 @@ bool idp_run::start(std::string& why)
     publish_accounts();
     // Password hashes are made and checked off the loop, which an scrypt would hold for tens of milliseconds.
     m_loop.register_owner(this);
+    m_hash.name("idp-hash");
+    m_standing_pool.name("idp-standing");
+    m_fetch_pool.name("idp-fetch");
     if (!m_hash.attach(m_io))
         m_hash.stop();
     m_standing_attached = m_standing_pool.attach(m_io);

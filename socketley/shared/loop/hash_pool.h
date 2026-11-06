@@ -17,10 +17,13 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include <pthread.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -58,6 +61,9 @@ public:
 
     bool     enabled() const { return !m_lanes.empty() && !m_stopped; }
     unsigned threads() const { return static_cast<unsigned>(m_lanes.size()); }
+
+    // The name its threads show in /proc and top -H, at most 15 characters, set before the first submission.
+    void name(std::string_view n) { m_name.assign(n.substr(0, 15)); }
 
     // Waits for the eventfd on the loop's ring, through `io`, and drains the
     // completions when it fires.  False means the read could not be queued and
@@ -210,7 +216,11 @@ private:
     {
         m_started = true;
         for (lane& l : m_lanes)
+        {
             l.th = std::thread([this, &l] { run(l); });
+            if (!m_name.empty())
+                ::pthread_setname_np(l.th.native_handle(), m_name.c_str());
+        }
     }
 
     void run(lane& l)
@@ -240,6 +250,7 @@ private:
     }
 
     std::vector<lane>       m_lanes;
+    std::string             m_name;
     int                     m_wake{-1};
     bool                    m_started{false};
     bool                    m_stopped{false};

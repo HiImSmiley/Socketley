@@ -58,7 +58,7 @@ sleep 1.5
 # threads of every worker other than its loop, counted until there are four or forty sign-ins have gone.
 helper_threads() {
     local w n=0
-    for w in $(pgrep -P "$SOCKETLEY_DPID" -x socketley); do n=$((n + $(ls "/proc/$w/task" | wc -l) - 1)); done
+    for w in $(pgrep -P "$SOCKETLEY_DPID" -x socketley); do n=$((n + $(cat /proc/$w/task/*/comm 2>/dev/null | grep -cx idp-hash || true))); done
     echo "$n"
 }
 for _ in $(seq 1 40); do
@@ -69,13 +69,14 @@ done
 sleep 0.5
 
 LOOPS=()
-HELPERS_WIDE=0; HELPERS=0; SINGLE=""
+HELPERS_WIDE=0; HELPERS=0; HASHERS=0; SINGLE=""
 for w in $(pgrep -P "$SOCKETLEY_DPID" -x socketley); do
     loop=$(allowed "$w" "$w")
     for t in /proc/$w/task/*; do
         t=${t##*/}
         [ "$t" = "$w" ] && continue
         HELPERS=$((HELPERS+1))
+        [ "$(cat /proc/$w/task/$t/comm 2>/dev/null)" = idp-hash ] && HASHERS=$((HASHERS+1))
         [ "$(allowed "$w" "$t")" = "0-3" ] && HELPERS_WIDE=$((HELPERS_WIDE+1))
     done
     case "$loop" in
@@ -89,7 +90,7 @@ check "and on four different ones" "$(printf '%s\n' "${LOOPS[@]}" | sort -u | tr
 check "the one-shard runtime keeps the whole set" "${SINGLE# }" "0-3"
 [ "$HELPERS" -gt 0 ] || bad "a worker has helper threads to look at"
 check "every helper thread of a worker keeps the whole set" "$HELPERS_WIDE of $HELPERS" "$HELPERS of $HELPERS"
-check "and the idp's two shards start four hashing threads between them" "$HELPERS" "4"
+check "and the idp's two shards start four hashing threads between them" "$HASHERS" "4"
 check "stats names each shard's CPU" "$("$BIN" stats pa 2>&1 | awk -F: '/^cpus:/ {print $2}' | sort | tr '\n' ' ')" \
       "$(printf '%s\n' "${LOOPS[@]}" | sort | head -2 | tr '\n' ' ')"
 
