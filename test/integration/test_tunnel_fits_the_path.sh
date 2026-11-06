@@ -7,7 +7,8 @@
 #   * the link's data unbounded: over a 40 Mbit/s path with 20 ms of round trip, a new stream beside six downloads
 #     was answered after 0.8 to 1.3 s, behind every stream's window and the kernel's buffer
 #   * the bound paid for in rate: the downloads below the path's rate
-#   * the setting made on every link, which on a LAN only caps the rate: there the unsent bytes stay large
+#   * the setting made on every link, which on a LAN only caps the rate: read back from the agent's socket, since how
+#     much stays unsent there is set by whichever of the six readers and the two loops a busy box starves most
 # A delay on loopback needs a network namespace of its own, which an unprivileged user namespace gives.
 set -uo pipefail
 
@@ -107,7 +108,35 @@ print("%d %.0f %.2f" % (peak[0], lat[len(lat) // 2] if lat else 0, rate))
 PY
 }
 
+# The TCP_NOTSENT_LOWAT the agent put on its link, from a copy of the socket (pidfd_getfd, which the test may as root of
+# its own user namespace): 16384 where it fitted the link to the path, 0 where it left the kernel's buffer whole.
+lowat() {
+    python3 - "$PE" <<'PY'
+import ctypes, os, re, socket, subprocess, sys
+out = subprocess.run(["ss", "-tnpH", "state", "established", "( dport = :%s )" % sys.argv[1]], capture_output=True, text=True).stdout
+m = re.search(r"127\.0\.0\.1:(\d+) .*pid=(\d+),fd=(\d+)", out)
+fd = ctypes.CDLL(None).syscall(438, os.pidfd_open(int(m[2])), int(m[3]), 0) if m else -1
+if fd < 0: print("none none"); sys.exit()
+with socket.socket(fileno=fd) as s: print(m[1], s.getsockopt(socket.IPPROTO_TCP, 25))
+PY
+}
+# The agent dialling again, and its new link up.
+redial() {
+    local was=$1 port v
+    "$BIN" stop home >/dev/null 2>&1; "$BIN" start home >/dev/null 2>&1
+    for _ in $(seq 1 100); do read -r port v < <(lowat); [ "$port" != none ] && [ "$port" != "$was" ] && return 0; sleep 0.1; done
+}
+
 read -r lan_unsent _ _ < <(load 4 0)
+# The kernel's round trip when the link is made decides, and a handshake on a starved host can measure a millisecond on
+# loopback, so a link made again settles it: one that fits every link fits all three.
+lan_lowat=() port=none
+for try in 1 2 3; do
+    read -r port v < <(lowat)
+    lan_lowat+=("$v")
+    [ "$v" = 0 ] && break
+    [ "$try" = 3 ] || redial "$port"
+done
 
 # A 20 ms round trip and 40 Mbit/s from the agent to the edge, with a bottleneck queue of 30 ms, and the agent
 # dialling again so its link is made on that path.
@@ -117,22 +146,24 @@ tc qdisc add dev lo root handle 1: prio bands 3 priomap 1 1 1 1 1 1 1 1 1 1 1 1 
 tc qdisc add dev lo parent 1:3 handle 30: netem delay 10ms rate 40mbit limit 100
 tc filter add dev lo parent 1: protocol ip u32 match ip sport "$PE" 0xffff flowid 1:3
 tc filter add dev lo parent 1: protocol ip u32 match ip dport "$PE" 0xffff flowid 1:3
-"$BIN" stop home >/dev/null 2>&1; "$BIN" start home >/dev/null 2>&1
-sleep 1
+redial "$port"
 read -r wan_unsent echo_ms rate < <(load 6 30)
+read -r _ wan_lowat < <(lowat)
 echo "  unsent at most: ${lan_unsent} bytes on loopback, ${wan_unsent} on the path;" \
-     "a new stream beside six downloads answered in ${echo_ms} ms, the downloads at ${rate} MB/s"
+     "a new stream beside six downloads answered in ${echo_ms} ms, the downloads at ${rate} MB/s;" \
+     "the link's TCP_NOTSENT_LOWAT ${lan_lowat[*]} on loopback, ${wan_lowat} on the path"
 if [ "$sanitized" = 1 ]; then echo "  SKIP [timing]: a rate and a latency in milliseconds measure the sanitizer, not the link"
 elif awk -v e="${echo_ms:-99999}" 'BEGIN{exit !(e > 0 && e < 400)}'; then ok
 else bad "a new stream beside bulk ones is answered within a few round trips" "${echo_ms} ms at the median"; fi
 if [ "$sanitized" = 1 ]; then echo "  SKIP [timing]: a rate and a latency in milliseconds measure the sanitizer, not the link"
 elif awk -v r="${rate:-0}" 'BEGIN{exit !(r >= 4.2)}'; then ok
 else bad "and the downloads still fill the path's 4.7 MB/s" "${rate} MB/s"; fi
-if [ "${wan_unsent:-999999999}" -le $((512 << 10)) ]; then ok
-else bad "over a round trip the kernel holds little of the link's data" "$wan_unsent bytes unsent"; fi
-if [ "$sanitized" = 1 ]; then echo "  SKIP [loopback]: how fast the buffer fills measures the sanitizer"
-elif [ "${lan_unsent:-0}" -ge $((256 << 10)) ]; then ok
-else bad "and on loopback the buffer is left whole, which would otherwise cap the rate" "only $lan_unsent bytes unsent"; fi
+if [ "${wan_unsent:-999999999}" -le $((512 << 10)) ] && [ "$wan_lowat" = 16384 ]; then ok
+else bad "over a round trip the kernel holds little of the link's data" \
+    "$wan_unsent bytes unsent, TCP_NOTSENT_LOWAT $wan_lowat"; fi
+if [ "${lan_lowat[-1]}" = 0 ]; then ok
+else bad "and on loopback the buffer is left whole, which would otherwise cap the rate" \
+    "TCP_NOTSENT_LOWAT ${lan_lowat[*]} on three links, $lan_unsent bytes unsent at most"; fi
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
