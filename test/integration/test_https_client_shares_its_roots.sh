@@ -5,7 +5,8 @@
 #
 # What each part would catch:
 #   * a context made per request: every alert, web push and MTA-STS fetch parsed the whole system CA bundle again,
-#     three milliseconds of CPU each before a byte was sent, five times what the request itself costs
+#     three milliseconds of CPU each before a byte was sent, five times what the request itself costs; counted as the
+#     opens of the roots' file, since CPU per request on a busy box is two to three times what it is on a quiet one
 #   * a context kept past a change of its roots: a hook whose certificate a new CA file signs is refused until restart
 set -uo pipefail
 
@@ -22,9 +23,6 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: the https client reads its roots once, and again when they change ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
 command -v openssl >/dev/null 2>&1 || { echo "  SKIP: openssl is required"; exit 0; }
-# Under the sanitizer every row runs but the ones that time something.
-sanitized=0
-nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && sanitized=1
 daemon_isolate httpsroots
 T=$SOCKETLEY_TMPD
 M=$((SL_PORT_BASE + 1937))
@@ -76,17 +74,39 @@ curl -s -X POST -c "$T/jar" -u "$ADMIN" "$U/api/session" >/dev/null
 post() { curl -s -m 20 -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -X POST -o /dev/null -w '%{http_code}' "$U/api/alerts/test"; }
 cpu_ms() { awk -v hz="$(getconf CLK_TCK)" '{print ($14 + $15) * 1000 / hz}' "/proc/$SOCKETLEY_DPID/stat"; }
 
+# How often the roots' file is opened, by inotify, until the file "$T/opens.stop" appears beside it.
+watch_opens() {
+    python3 - "$T/roots.pem" "$T/opens.stop" > "$T/opens" <<'PY' &
+import ctypes, os, select, struct, sys
+libc = ctypes.CDLL(None, use_errno=True)
+fd = libc.inotify_init1(os.O_NONBLOCK)
+libc.inotify_add_watch(fd, sys.argv[1].encode(), 0x20)   # IN_OPEN
+print("watching", flush=True)
+n = 0
+while not os.path.exists(sys.argv[2]):
+    if select.select([fd], [], [], 0.1)[0]:
+        buf = os.read(fd, 65536)
+        while buf:
+            n += 1; buf = buf[16 + struct.unpack_from("I", buf, 12)[0]:]
+print(n, flush=True)
+PY
+    WATCH_PID=$!
+    for _ in $(seq 1 50); do grep -q watching "$T/opens" 2>/dev/null && break; sleep 0.1; done
+}
+
 first=$(post)
+watch_opens
 c0=$(cpu_ms); codes=""
 for _ in $(seq 1 60); do codes="$codes$(post)"; done
 c1=$(cpu_ms)
+touch "$T/opens.stop"; wait "$WATCH_PID"
+opens=$(tail -1 "$T/opens")
 per=$(awk -v a="$c0" -v b="$c1" 'BEGIN{printf "%.1f", (b - a) / 60}')
-echo "  the daemon's CPU per alert posted over https: ${per} ms"
+echo "  the daemon's CPU per alert posted over https: ${per} ms; the roots' file opened ${opens} times for 60"
 if [ "$first" = 204 ] && [ "$codes" = "$(printf '204%.0s' $(seq 1 60))" ]; then ok
 else bad "every alert reaches the hook" "first $first, then $codes"; fi
-if [ "$sanitized" = 1 ]; then echo "  SKIP [cpu]: CPU per request measures the sanitizer, not the roots"
-elif awk -v p="$per" 'BEGIN{exit !(p < 1.5)}'; then ok
-else bad "the roots are read once, not per request" "${per} ms of CPU per alert"; fi
+if [ "$opens" = 0 ]; then ok
+else bad "the roots are read once, not per request" "the roots' file opened ${opens} times for 60 alerts, ${per} ms of CPU each"; fi
 
 # The roots replaced in place by another CA, and the hook presenting that CA's leaf: taken without a restart.
 hook b
