@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "../loop/event_loop.h"
+#include "../util/settings.h"
 
 namespace socketley
 {
@@ -53,6 +54,13 @@ send_look look_at_send(int fd)
     else
         l.tcp = false;
     return l;
+}
+
+std::chrono::seconds write_stall()
+{
+    static const auto secs =
+        std::chrono::seconds(socketley::settings::number<uint64_t>("SOCKETLEY_WRITE_STALL_SECS").value_or(120));
+    return secs;
 }
 
 bool send_stalled(int fd, std::chrono::milliseconds bound)

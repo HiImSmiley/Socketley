@@ -38,6 +38,10 @@ struct send_look
 send_look look_at_send(int fd);
 
 // The peer is owed something and nothing has been sent it for `bound`: it has stopped reading.
+// How long an answer a client takes nothing of holds its connection where no --idle-timeout names a bound: 120 s, as
+// storage's own write stall, or SOCKETLEY_WRITE_STALL_SECS.
+std::chrono::seconds write_stall();
+
 inline bool send_stalled(const send_look& l, std::chrono::milliseconds bound)
 {
     return l.tcp && l.owed > 0 && l.idle_ms >= static_cast<uint64_t>(bound.count());

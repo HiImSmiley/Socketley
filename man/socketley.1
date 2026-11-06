@@ -3698,7 +3698,8 @@ On a server or proxy a connection that is still being sent an answer is not
 idle while the answer moves, however slowly the client reads; one whose client
 has taken nothing of it for
 .I duration
-is reset, whether it was to be kept alive or closed after the answer. A bare number is seconds; a suffix of
+is reset, whether it was to be kept alive or closed after the answer. With no
+timeout set, the same holds after 120 seconds, as for storage. A bare number is seconds; a suffix of
 .BR s ", " m ", " h ", " d " or " w
 means seconds, minutes, hours, days or weeks
 .RB ( 300 " and " 5m " both work)."
@@ -24379,6 +24380,14 @@ rather than logged.
 A test aid that sets how many seconds one session ticket key seals new tickets.
 The key still opens its tickets for as long again, and is then wiped. The range
 is 1 to 86400. Default: an hour.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_WRITE_STALL_SECS
+A test aid that sets how many seconds a server or proxy client with no
+.B \-\-idle\-timeout
+may take nothing of its answer before the connection is reset. The range is 1 to
+86400. Default: 120 seconds.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

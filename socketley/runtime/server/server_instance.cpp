@@ -3178,6 +3178,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 // connection is past it and arming this sweep for the
                 // handshake deadline alone would close the lot.
                 const bool sweep_idle = (m_idle_timeout_cached > 0);
+                const std::chrono::seconds stall_bound = sweep_idle ? timeout : socketley::write_stall();
                 const auto hs = std::chrono::seconds(tls_handshake_deadline_secs);
                 bool heads_left = false;
                 // Counted and reported once for the tick rather than per
@@ -3205,10 +3206,10 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                     }
                     // What a client is owed and has not taken for the timeout ends it, closing or not: a client
                     // that stopped reading holds the connection for as long as it likes otherwise.
-                    if (sweep_idle && !cconn->reset_on_close && (cconn->closing || (now - cconn->last_activity) > timeout))
+                    if (!cconn->reset_on_close && (cconn->closing || (now - cconn->last_activity) > stall_bound))
                     {
                         const socketley::send_look out = socketley::look_at_send(cfd);
-                        if (socketley::send_stalled(out, timeout))
+                        if (socketley::send_stalled(out, stall_bound))
                         {
                             cconn->closing        = true;
                             cconn->reset_on_close = true;
@@ -3293,7 +3294,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 if (sweep_idle && m_udp && !m_udp_peers.empty())
                     forget_idle_udp_peers(now, timeout);
 
-                if (sweep_idle || m_tls || m_headers_outstanding || m_drains_outstanding)
+                if (sweep_idle || m_tls || m_headers_outstanding || m_drains_outstanding || !m_active_fds.empty())
                     m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
             }
 #ifndef SOCKETLEY_NO_LUA
@@ -3648,6 +3649,8 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
     m_conn_idx[client_fd] = ptr;
     ptr->active_idx = static_cast<uint32_t>(m_active_fds.size());
     m_active_fds.push_back(client_fd);
+    // The sweep bounds a client that stops taking its answer, with or without --idle-timeout.
+    arm_idle_sweep();
 
     // And into the shared table at the same position, with the ref minted
     // in pool_acquire() as this connection's name for its whole life.
@@ -8276,7 +8279,8 @@ void server_instance::arm_idle_sweep()
     // configured, the handshake deadline on any TLS listener whether one was or
     // not, a head that has arrived in part, and a refused peer still draining.
     if (!m_loop || m_idle_sweep_armed ||
-        (m_idle_timeout_cached <= 0 && !m_tls && !m_headers_outstanding && !m_drains_outstanding))
+        (m_idle_timeout_cached <= 0 && !m_tls && !m_headers_outstanding && !m_drains_outstanding &&
+         m_active_fds.empty()))
         return;
 
     m_idle_sweep_ts.tv_sec  = 30;

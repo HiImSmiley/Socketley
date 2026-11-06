@@ -2655,14 +2655,15 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                 m_idle_sweep_armed = false;
 
                 auto now = std::chrono::steady_clock::now();
-                if (m_idle_timeout_cached > 0)
                 {
                     // Collected and then closed, because close_pair() frees the
                     // slot and lowers m_client_count, which this walk uses as
                     // its bound -- closing inside it ends the sweep early and
                     // leaves the clients after the first idle one for the next
                     // tick.
-                    auto timeout = std::chrono::seconds(m_idle_timeout_cached);
+                    const bool idle_on = m_idle_timeout_cached > 0;
+                    const std::chrono::seconds timeout =
+                        idle_on ? std::chrono::seconds(m_idle_timeout_cached) : socketley::write_stall();
                     std::vector<int> expired, stalled;
                     size_t found = 0;
                     for (int cfd = 0; cfd < MAX_FDS && found < m_client_count; cfd++)
@@ -2686,7 +2687,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                             if (out.owed > 0)
                                 continue;
                         }
-                        if (!cconn->closing && quiet)
+                        if (idle_on && !cconn->closing && quiet)
                             expired.push_back(cfd);
                     }
                     for (int cfd : stalled)
@@ -2802,7 +2803,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                 // armed timeout holds a removed proxy in the graveyard -- and
                 // an unresolved backend is work, without which the name is
                 // never looked up again.
-                if (m_idle_timeout_cached > 0 || pooled_left || unresolved_left || m_tls)
+                if (m_idle_timeout_cached > 0 || pooled_left || unresolved_left || m_tls || m_client_count > 0)
                     arm_idle_sweep();
             }
             // Backend response deadline sweep: this link has spoken, so it may
@@ -3192,6 +3193,8 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         auto* ptr = conn.get();
         m_client_slots[client_fd] = conn.release();
         m_client_count++;
+        // The sweep bounds a client that stops taking its answer, with or without --idle-timeout.
+        arm_idle_sweep();
         m_conn_idx[client_fd].side = conn_client;
         m_conn_idx[client_fd].client = ptr;
 

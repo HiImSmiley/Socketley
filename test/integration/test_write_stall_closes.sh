@@ -91,11 +91,18 @@ PY
 
 P_SRV=$((SL_PORT_BASE + 1601))
 P_FC=$((SL_PORT_BASE + 1602))
+P_SRV0=$((SL_PORT_BASE + 1603))
+P_FC0=$((SL_PORT_BASE + 1604))
+# The bound with no --idle-timeout, 120 s unless this test aid shortens it.
+export SOCKETLEY_WRITE_STALL_SECS=2
 daemon_start "$BIN"
 "$BIN" create server srv -p "$P_SRV" --http "$T/www" --idle-timeout 2 -s >/dev/null 2>&1
 "$BIN" create proxy fc -p "$P_FC" --domain fc.test --backend "fastcgi://unix:$T/none.sock" --root "$T/www" \
     --idle-timeout 2 -s >/dev/null 2>&1
-for p in "$P_SRV" "$P_FC"; do
+"$BIN" create server srv0 -p "$P_SRV0" --http "$T/www" -s >/dev/null 2>&1
+"$BIN" create proxy fc0 -p "$P_FC0" --domain fc0.test --backend "fastcgi://unix:$T/none.sock" --root "$T/www" \
+    -s >/dev/null 2>&1
+for p in "$P_SRV" "$P_FC" "$P_SRV0" "$P_FC0"; do
     ready_tcp 127.0.0.1 "$p" 15 || bad "port $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 done
 
@@ -106,8 +113,13 @@ r=$(python3 "$T/client.py" 65 \
     "srv-slow,$P_SRV,/big.bin,localhost,slow,close" \
     "fc-close,$P_FC,/big.bin,fc.test,stopped,close" \
     "fc-keep,$P_FC,/big.bin,fc.test,stopped,keep" \
-    "fc-slow,$P_FC,/big.bin,fc.test,slow,close" 2>&1 | tail -1)
-for want in srv-close=reset srv-keep=reset srv-slow=open fc-close=reset fc-keep=reset fc-slow=open; do
+    "fc-slow,$P_FC,/big.bin,fc.test,slow,close" \
+    "srv0-keep,$P_SRV0,/big.bin,localhost,stopped,keep" \
+    "srv0-slow,$P_SRV0,/big.bin,localhost,slow,keep" \
+    "fc0-keep,$P_FC0,/big.bin,fc0.test,stopped,keep" \
+    "fc0-slow,$P_FC0,/big.bin,fc0.test,slow,keep" 2>&1 | tail -1)
+for want in srv-close=reset srv-keep=reset srv-slow=open fc-close=reset fc-keep=reset fc-slow=open \
+            srv0-keep=reset srv0-slow=open fc0-keep=reset fc0-slow=open; do
     name=${want%%=*}
     got=$(tr ' ' '\n' <<<"$r" | grep "^$name=" || true)
     check "$name: ${want#*=} after the timeout" "${got:-$name=none}" "$want"
