@@ -689,7 +689,7 @@ void account_store::compact_step(const std::shared_ptr<compaction>& job, int ste
                 job->at += job->written;
                 job->written = 0;
                 job->text.clear();
-                for (; job->next_id < job->ids.size() && job->text.size() < (256u << 10); ++job->next_id)
+                for (; job->next_id < job->ids.size() && job->text.size() < (64u << 10); ++job->next_id)
                     if (const auto it = m_accounts.find(job->ids[job->next_id]); it != m_accounts.end())
                         append_snapshot_line(job->text, it->second);
             }
