@@ -1224,6 +1224,8 @@ private:
     // handshake failed is the peer's only diagnosis and a multishot recv stays
     // armed until the socket moves.
     void tls_close_when_read_is_all(client_connection* conn, int fd);
+    // A closing TLS connection's close_notify, sent ahead of its FIN once nothing else is owed; true while its write is.
+    bool tls_say_close(client_connection* conn);
     // A closing cleartext connection whose answer has left sends its FIN and
     // keeps reading, so the close waits for the client's EOF.
     void drain_before_close(client_connection* conn, int fd);

@@ -1512,6 +1512,32 @@ bool tls_context::has_pending_out(SSL* ssl)
 #endif
 }
 
+bool tls_context::close_notify(SSL* ssl)
+{
+#if SOCKETLEY_HAS_TLS
+    // A handshake that never finished, or one that failed since, has no orderly end to announce.
+    if (!ssl || !SSL_is_init_finished(ssl) || (SSL_get_shutdown(ssl) & SSL_SENT_SHUTDOWN) != 0)
+        return false;
+    ERR_clear_error();
+    const int r = SSL_shutdown(ssl);
+    ERR_clear_error();
+    return r >= 0 && has_pending_out(ssl);
+#else
+    (void)ssl;
+    return false;
+#endif
+}
+
+void tls_context::withhold_close_notify(SSL* ssl)
+{
+#if SOCKETLEY_HAS_TLS
+    if (ssl)
+        SSL_set_quiet_shutdown(ssl, 1);
+#else
+    (void)ssl;
+#endif
+}
+
 bool tls_context::peer_name_matches(SSL* ssl, std::string_view name)
 {
 #if SOCKETLEY_HAS_TLS
@@ -1546,8 +1572,9 @@ void tls_context::free_ssl(SSL* ssl)
 #if SOCKETLEY_HAS_TLS
     if (!ssl)
         return;
-    // SSL_free() takes a session out of the server's cache unless a shutdown was sent, and no connection here sends
-    // one, so a returning client never resumed; one that ended on an alert was taken out when the alert went.
+    // SSL_free() takes a session out of the server's cache unless close_notify went both ways, which a connection the
+    // peer ended first or never answered has not, so a returning client never resumed; one that ended on an alert was
+    // taken out when the alert went.
     if (SSL_is_init_finished(ssl))
         SSL_set_shutdown(ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
     SSL_free(ssl);

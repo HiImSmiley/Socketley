@@ -3874,6 +3874,10 @@ with AEAD ciphers (Mozilla's intermediate list). A returning client resumes its
 session by a ticket on whichever shard it reaches: every shard seals tickets
 with the same key, a new one each hour, which still opens its tickets through
 the next hour and is then wiped. The key is never written to disk.
+A connection the runtime closes itself ends with a
+.B close_notify
+before its FIN, so the client reads an end rather than a truncation and keeps
+its session for the next connection.
 .PP
 Trust stores are read when the runtime starts. A listener's certificate and key
 are checked again every two seconds. When they are replaced on disk, by

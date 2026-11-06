@@ -129,6 +129,13 @@ public:
     // Check if SSL needs to write (has pending encrypted output)
     static bool has_pending_out(SSL* ssl);
 
+    // This side's close_notify, put behind every record already written, once and without waiting for the peer's:
+    // true when one was queued, for the caller to send through its own write path before its FIN.  Under kernel TLS
+    // it is a record of its own type, which kernel_step sends.
+    static bool close_notify(SSL* ssl);
+    // The connection ends cut short, which a close_notify would vouch for as whole: none is sent from here on.
+    static void withhold_close_notify(SSL* ssl);
+
     // ─── Kernel TLS, on a socket a runtime lends ────────────────────────────
     // start_kernel_tls changes a TLS 1.3 connection's send key and OpenSSL hands the new one to the kernel, which
     // encrypts all that is written to the socket from that point -- sendfile included -- while OpenSSL writes

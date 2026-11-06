@@ -1788,7 +1788,13 @@ void mail_run::settle()
             conn* c = find(id);
             if (!c || c->dead)
                 continue;
-            if (c->owed == 0)
+            // A TLS connection's close_notify goes out once all else has, and its write's end brings it back here.
+            if (c->owed == 0 && c->ssl && c->zplain.empty() && tls_context::close_notify(c->ssl))
+            {
+                queue_tls_out(*c);
+                flush(*c);
+            }
+            else if (c->owed == 0)
                 close_conn(*c);
             else if (now - c->closing_ms >= close_grace_ms)
             {

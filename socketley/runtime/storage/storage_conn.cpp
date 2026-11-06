@@ -1556,7 +1556,12 @@ void storage_run::pump_write(const std::shared_ptr<conn>& c)
             if (!tls_encrypt(c))
                 return;
             if (c->wbuf.empty())
+            {
+                // A close_notify the kernel sent after a wait for room was the last thing the close waited on.
+                if (c->after_write == conn::after_kind::close && !c->poll_pending)
+                    close_conn(c);
                 return;
+            }
         }
         else
         {
@@ -1622,6 +1627,8 @@ void storage_run::write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe
         finish_request(c);
     else if (next == conn::after_kind::pump)
         file_pump(c);
+    else if (next == conn::after_kind::close)
+        close_conn(c);
 }
 
 // ─── HTTP ───────────────────────────────────────────────────────────────────
@@ -1897,6 +1904,14 @@ void storage_run::finish_request(const std::shared_ptr<conn>& c)
     }
     if (c->close_after_write)
     {
+        // A TLS connection's close_notify goes out ahead of its FIN, and the close waits for its write.
+        if (c->ssl && tls_context::close_notify(c->ssl))
+        {
+            c->after_write = conn::after_kind::close;
+            pump_write(c);
+            if (c->dead || c->wr_pending || c->poll_pending)
+                return;
+        }
         close_conn(c);
         return;
     }

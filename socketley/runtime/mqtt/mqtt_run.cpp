@@ -1070,7 +1070,13 @@ void mqtt_run::settle()
             conn* c = find(id);
             if (!c || c->dead)
                 continue;
-            if (c->unsent() == 0 || now - c->closing_ms >= close_grace_ms)
+            // A TLS connection's close_notify goes out once all else has, and its write's end brings it back here.
+            if (c->unsent() == 0 && c->ssl && tls_context::close_notify(c->ssl))
+            {
+                queue_tls_out(*c);
+                flush(*c);
+            }
+            else if (c->unsent() == 0 || now - c->closing_ms >= close_grace_ms)
                 close_conn(*c);
         }
     }

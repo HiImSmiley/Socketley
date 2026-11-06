@@ -473,7 +473,8 @@ struct conn
     // How much of `wq` the record layer has already taken.
     size_t      wq_off{0};
     // What is done once everything queued has been written.
-    enum class after_kind : uint8_t { none, finish, pump };
+    // close: a TLS connection's close_notify has gone, and its FIN follows.
+    enum class after_kind : uint8_t { none, finish, pump, close };
     after_kind  after_write{after_kind::none};
     bool        close_after_write{false};
 

@@ -4376,6 +4376,12 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             }
         }
 
+        // A backend that failed rather than ended leaves its client an answer
+        // cut short, which a close_notify would vouch for as whole.
+        if (cqe->res < 0 && conn->client_fd >= 0 && conn->client_fd < MAX_FDS &&
+            m_conn_idx[conn->client_fd].side == conn_client)
+            tls_context::withhold_close_notify(m_conn_idx[conn->client_fd].client->ssl);
+
         // A TCP backend's clean half-close ends its own direction only, held
         // for whatever the client is still sending.
         if (cqe->res == 0 && hold_backend_half_close(conn))
@@ -8010,15 +8016,19 @@ void proxy_instance::shutdown_client_write(proxy_client_connection* conn)
         h3_child_end(conn);
         return;
     }
-    if (!conn->closing || conn->wr_shutdown || conn->fd < 0 || !conn->read_pending)
+    if (!conn->closing || conn->wr_shutdown || conn->fd < 0)
         return;
 
-    // A TLS connection owes a close_notify record first.
-    if (conn->ssl != nullptr)
-        return;
-
-    if (conn->write_pending || !conn->write_queue.empty() ||
+    if (conn->write_pending || !conn->write_queue.empty() || tls_owes_output(conn) ||
         conn->splice_in_pending || conn->splice_out_pending)
+        return;
+
+    // A TLS connection's FIN goes behind its close_notify, whose write's completion comes back here.
+    if (conn->ssl != nullptr && tls_context::close_notify(conn->ssl) &&
+        (!flush_client_write_queue(conn) || conn->write_pending || tls_owes_output(conn)))
+        return;
+
+    if (!conn->read_pending)
         return;
 
     conn->wr_shutdown = true;
@@ -8205,6 +8215,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
             // socket and the deferral is counting on it.
             if (conn->abort_watch_pending && m_loop)
                 m_loop->submit_poll_remove(&conn->abort_req);
+
+            // A TLS client is told the end before its FIN, behind everything it
+            // is owed, which a client whose read has already ended is not
+            // reached through shutdown_client_write to hear.
+            if (conn->ssl != nullptr && reason == close_reason::normal && !peer_splicing_into_client &&
+                conn->write_queue.empty() && !conn->splice_in_pending && !conn->splice_out_pending)
+                tls_context::close_notify(conn->ssl);
 
             // With peer_splicing_into_client the descriptor the backend is
             // still writing into.

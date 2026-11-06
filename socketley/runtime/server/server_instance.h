@@ -1237,8 +1237,7 @@ private:
     bool arm_conn_read(server_connection* conn);
     static bool drains_on_close(const server_connection* conn)
     {
-        return conn->drain_on_close && conn->ssl == nullptr &&
-               conn->drained_bytes <= DRAIN_LIMIT_BYTES;
+        return conn->drain_on_close && conn->drained_bytes <= DRAIN_LIMIT_BYTES;
     }
     void release_fixed_slot(server_connection* conn);
 

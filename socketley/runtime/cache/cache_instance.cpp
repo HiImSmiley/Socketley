@@ -1439,6 +1439,8 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                     if (sweep_idle && (now - cconn->last_activity) > timeout)
                     {
                         cconn->closing = true;
+                        // Its close_notify first, which the end of the read waits for.
+                        if (tls_say_close(cconn.get())) {}
                         shutdown(cfd, SHUT_RD);
                     }
                 }
@@ -2100,10 +2102,18 @@ void cache_instance::tls_close_when_read_is_all(client_connection* conn, int fd)
         return;
     if (conn->write_pending || !conn->read_pending)
         return;
-    if (fd < 0)
+    if (fd < 0 || tls_say_close(conn))
         return;
 
     shutdown(fd, SHUT_RDWR);
+}
+
+bool cache_instance::tls_say_close(client_connection* conn)
+{
+    if (!conn->closing || conn->ssl == nullptr || conn->write_pending || conn_has_output(conn) ||
+        !tls_context::close_notify(conn->ssl))
+        return false;
+    return tls_flush(conn) && conn->write_pending;
 }
 
 void cache_instance::drain_before_close(client_connection* conn, int fd)
@@ -2658,7 +2668,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (SOCKETLEY_UNLIKELY(!conn->write_pending))
                 close_client(conn, fd, "closing-with-unsendable-output");
         }
-        else
+        else if (!tls_say_close(conn))
         {
             close_client(conn, fd, "closing-nothing-in-flight");
         }
@@ -2799,7 +2809,8 @@ void cache_instance::after_write(client_connection* conn, int fd)
     {
         if (conn->closing && !conn->read_pending)
         {
-            close_client(conn, fd, "closing-after-write");
+            if (!tls_say_close(conn))
+                close_client(conn, fd, "closing-after-write");
         }
         else
         {

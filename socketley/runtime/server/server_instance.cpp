@@ -3224,6 +3224,9 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                     if (sweep_idle && (now - cconn->last_activity) > timeout)
                     {
                         cconn->closing = true;
+                        // Its close_notify first, which the end of the read waits for.
+                        if (cconn->ssl != nullptr)
+                            maybe_shutdown_write(cconn);
                         shutdown(cfd, SHUT_RD);
                     }
                 }
@@ -6575,13 +6578,8 @@ void server_instance::maybe_shutdown_write(server_connection* conn)
     if (SOCKETLEY_LIKELY(!conn->closing) || conn->wr_shutdown || conn->fd < 0)
         return;
 
-    // A TLS connection owes a close_notify record first, and a bare FIN under
-    // it is a truncation attack as far as the peer is concerned.
-    if (conn->ssl != nullptr)
-        return;
-
     // Still something to send, or something in the ring that is sending it.
-    if (conn_has_output(conn) || conn->write_pending)
+    if (conn_has_output(conn) || conn->write_pending || conn->tls_wait_pending)
         return;
     if (conn->splice_pending || conn->splice_in_pending || conn->splice_out_pending)
         return;
@@ -6590,6 +6588,16 @@ void server_instance::maybe_shutdown_write(server_connection* conn)
     // this same flag and so must we, or the FIN goes out before the reply.
     if (conn->cache_pending > 0)
         return;
+
+    // A TLS connection's FIN goes behind its close_notify, which a bare FIN
+    // would leave the peer to read as a truncation, and queued only now so no
+    // file or kernel send can overtake it; its write's completion comes back here.
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr) && tls_context::close_notify(conn->ssl))
+    {
+        tls_flush(conn);
+        if (conn_has_output(conn) || conn->write_pending || conn->tls_wait_pending)
+            return;
+    }
 
     // A read is what drains whatever the peer is still sending after our FIN;
     // without one the caller closes, which is only right when none can be armed.
