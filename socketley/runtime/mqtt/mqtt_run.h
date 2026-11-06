@@ -94,7 +94,7 @@ public:
     void filter_added(const std::string& filter) override;
     void filter_removed(const std::string& filter) override;
     bool filters_heard(const std::vector<std::string>& filters, std::function<void()> ready) override;
-    void session_held(const std::string& client_id, const std::string& user, uint64_t stamp) override;
+    void session_held(const std::string& client_id, const std::string& user, uint64_t stamp, bool clean) override;
     void session_ended(const std::string& client_id) override;
 
     // ── request_origin ──────────────────────────────────────────────────────
@@ -267,8 +267,19 @@ private:
     // An answer to what a starting shard asked another for; false when the cookie is no such question.
     bool dump_reply(uint64_t cookie, request_status st, std::string_view reply);
     void finish_claim(uint64_t id);
-    // Another shard let a connection in to `client_id`: the one here is ended or refused if it is the one to give way.
-    void settle(const std::string& client_id, uint64_t stamp, const std::string& user);
+    // Shard `from` let a connection in to `client_id`: the one here is ended or refused if it is the one to give way,
+    // and a session here that gives way is handed to it unless that connection began clean.
+    void settle(const std::string& client_id, uint64_t stamp, const std::string& user, uint32_t from, bool clean);
+    // The session of `client` given up for shard `to`, what still comes here for it handed on there for a while;
+    // nothing when its bytes pass `room`, as surrender() says.
+    std::optional<std::string> give_up(const std::string& client, uint32_t to, bool clean, size_t room);
+    // A session taken in from another shard: that shard is told what had reached this one by then.
+    void took_in(const std::string& client);
+    // A session another shard gave up after the connection it was for was let in here without it, taken in, or handed
+    // back to `from` when it cannot be, unless it is itself one handed back.
+    void absorb(const std::string& client, std::string_view bytes, uint32_t from, bool back);
+    // The most a frame of one session to shard `to` may hold for it to be carried now.
+    size_t session_room(uint32_t to) const;
     void shard_stats(std::string& out) const;
     void sweep_claims(int64_t now);
     // Every frame before `upto` that shard has taken, or it cannot be reached.
@@ -396,7 +407,10 @@ private:
         std::vector<std::string> early;
     };
     std::unordered_map<uint64_t, pending_claim> m_claims;
-    std::unordered_map<uint64_t, uint64_t> m_claim_cookies;
+    // The claim and the shard each claim's question went to, by cookie; and those whose claim was finished without
+    // them, for an answer that comes late.
+    std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> m_claim_cookies;
+    std::unordered_map<uint64_t, std::pair<std::string, uint32_t>> m_late_claims;
     // Questions a starting shard asked, by cookie: of which shard, and whether for its retained messages.
     std::unordered_map<uint64_t, std::pair<uint32_t, bool>> m_dump_asks;
     // When to ask again for the retained messages a starting shard did not get, 0 when it is not owed.
@@ -418,6 +432,10 @@ private:
     uint64_t m_claims_refused{0};
     uint64_t m_sessions_moved{0};
     uint64_t m_sessions_kept{0};
+    uint64_t m_sessions_late{0};
+    uint64_t m_sessions_late_ended{0};
+    uint64_t m_sessions_handed_back{0};
+    uint64_t m_sessions_yielded{0};
     // A session given up to another shard, whose messages still coming here are handed on to it there for as long as
     // one sent here before the other shards heard of the move may come; its filters are told ended only after.
     struct moved_session

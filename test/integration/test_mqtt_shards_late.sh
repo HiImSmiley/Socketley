@@ -5,6 +5,9 @@
 # What each part would catch:
 #   * a SUBACK sent before the other shards know of its new filter, so a QoS 1 message published on another shard
 #     right after it never reaches the subscriber, with the mesh and with the daemon carrying the shards' words
+#   * a session lost because the shard holding it answered its claim after the claim's patience: its queued
+#     messages and its subscription missing on the connection that was let in without it; or past what the asker
+#     waits for an answer at all, the session ended when its shard hears of the connection let in
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -78,6 +81,56 @@ if phase in ("suback", "suback_relayed"):
         pub.disconnect(); sub.disconnect(); again.disconnect()
     guarded("suback", suback)
 
+if phase in ("late", "stale"):
+    def late(stopped, name, counted):
+        c = connected(port, name, clean=False, props={SESSION_EXPIRY: 600})
+        c.subscribe((name + "/#", 1))
+        old = owner(c)
+        c.disconnect()
+        pub = elsewhere(name + "-pub", old)
+        truth("a publisher lands on another shard than the session", pub is not None)
+        if pub is None:
+            return
+        for i in range(3):
+            pub.publish(name + "/t", b"q%d" % i, qos=1)
+        for _ in range(50):
+            out = subprocess.run([binary, "mqtt-sessions", "sh"], capture_output=True, timeout=10).stdout.decode()
+            if '"queued":3' in out.replace(" ", ""):
+                break
+            time.sleep(0.1)
+        home = owner(pub)
+        # The session's shard stopped past the claim's patience, so the connection is let in without it.
+        os.kill(old, signal.SIGSTOP)
+        try:
+            x = None
+            for _ in range(60):
+                x = Client(port, timeout=15)
+                if owner(x) == home:
+                    break
+                x.close()
+                x = None
+            t = time.time()
+            present, code, _ = x.connect(name, clean=False, props={SESSION_EXPIRY: 600})
+            waited = time.time() - t
+            time.sleep(max(0.0, stopped - (time.time() - t)))
+        finally:
+            os.kill(old, signal.SIGCONT)
+        check("the connection is let in without its session after the claim's patience", (present, code), (False, 0))
+        truth("and only after it", waited >= 2.5, waited)
+        got = sorted(m.payload for m in x.messages(3, 10))
+        check("the session's queued messages reach it once the late answer comes", got, [b"q0", b"q1", b"q2"])
+        pub.publish(name + "/t", b"after", qos=1)
+        m = x.message(5)
+        check("and its subscription goes on", m.payload if m else None, b"after")
+        n = stat(counted)
+        truth("stats count it in " + counted, n >= 1, n)
+        x.disconnect(); pub.disconnect()
+    if phase == "late":
+        guarded("late", lambda: late(0, "roam", "sessions_late"))
+    else:
+        # Past what the asker's channel waits for an answer: the session goes over once its shard hears the
+        # connection was let in.
+        guarded("stale", lambda: late(17, "stale", "sessions_yielded"))
 PY
 }
 
@@ -94,6 +147,8 @@ for mode in mesh relayed; do
         sleep 0.2
     done
     if [ "$mode" = relayed ]; then tally < <(run suback_relayed); else tally < <(run suback); fi
+    tally < <(run late)
+    [ "$mode" = mesh ] && tally < <(run stale)
     daemon_stop
 done
 unset SOCKETLEY_NO_SHARD_MESH

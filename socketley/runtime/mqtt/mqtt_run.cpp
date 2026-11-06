@@ -1538,7 +1538,7 @@ void mqtt_run::post_route(size_t i)
 
 void mqtt_run::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
 {
-    if (m_claim_cookies.contains(cookie))
+    if (m_claim_cookies.contains(cookie) || m_late_claims.contains(cookie))
     {
         claim_reply(cookie, st, reply);
         return;

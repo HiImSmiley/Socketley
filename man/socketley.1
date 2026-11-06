@@ -16331,6 +16331,17 @@ SUBACKs that waited are counted in
 .BR subacks_held ,
 and those that went after the second in
 .BR subacks_unheard .
+A connection whose old session does not come within three seconds is let in
+without it, as a new session. When the session comes later, it is folded into
+the new one: its subscriptions are added, and its queued and unanswered messages
+are sent first, with new packet identifiers. If the new session began with a
+clean start, the old one ends instead. A shard that is asked more than fifteen
+seconds late hands the session over once it hears of the new connection. These
+are counted in
+.BR sessions_late ,
+.BR sessions_yielded
+and
+.BR sessions_late_ended .
 A session moves as one piece. When shards relay through the daemon
 (see
 .BR SOCKETLEY_NO_SHARD_MESH ),

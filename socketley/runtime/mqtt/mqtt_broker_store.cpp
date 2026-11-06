@@ -460,4 +460,57 @@ void broker::adopt(std::string_view in)
     install_session(std::move(s), subs);
 }
 
+broker::late_take broker::take_late(std::string_view in)
+{
+    auto x = std::make_unique<session>();
+    std::vector<std::pair<std::string, sub_options>> subs;
+    std::string why;
+    if (!decode_session(in, *x, subs, why))
+        return late_take::ended;
+    x->will.reset();
+    auto it = m_sessions.find(x->client_id);
+    if (it != m_sessions.end() && lapsed(*it->second, m_io.now_ms()))
+    {
+        ++m_stats.sessions_expired;
+        end_session(*it->second, true);
+        it = m_sessions.find(x->client_id);
+    }
+    if (it == m_sessions.end())
+    {
+        install_session(std::move(x), subs);
+        return late_take::installed;
+    }
+    session& s = *it->second;
+    if (s.username != x->username)
+        return late_take::refused;
+    if (s.began_clean)
+        return late_take::ended;
+    for (const auto& [filter, o] : subs)
+    {
+        if (s.subs.contains(filter))
+            continue;
+        std::string_view group, inner = filter;
+        const bool is_shared = split_shared(filter, group, inner);
+        s.subs[filter] = o;
+        m_subs.add(inner, is_shared ? group : std::string_view{}, s.key, o);
+        filter_ref(filter, true);
+    }
+    // Its unanswered messages and then its queue go ahead of what came here since, being older; the client was told
+    // of no session, so they go with new identifiers and a release it still owed is let go.
+    std::vector<queued> older;
+    x->out.each([&](uint16_t, const inflight& f) {
+        if (f.st != inflight::state::await_pubcomp && f.item.msg)
+            older.push_back(f.item);
+    });
+    for (; !x->queue.empty(); x->queue.pop_front())
+        older.push_back(std::move(x->queue.front()));
+    for (size_t i = older.size(); i-- > 0;)
+        s.queue.push_front(std::move(older[i]));
+    for (; s.queue.size() > m_cfg.session_queue; s.queue.pop_front())
+        ++m_stats.dropped_queue;
+    mark(s);
+    pump(s);
+    return late_take::merged;
+}
+
 }   // namespace socketley::mqtt

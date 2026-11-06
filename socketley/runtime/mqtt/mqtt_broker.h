@@ -384,7 +384,10 @@ public:
         return true;
     }
     // A connection was let in to the session of a client here, and a session here ended.
-    virtual void session_held(const std::string& /*client_id*/, const std::string& /*user*/, uint64_t /*stamp*/) {}
+    virtual void session_held(const std::string& /*client_id*/, const std::string& /*user*/, uint64_t /*stamp*/,
+                              bool /*clean*/)
+    {
+    }
     virtual void session_ended(const std::string& /*client_id*/) {}
 };
 
@@ -519,6 +522,15 @@ public:
     bool held_by_another(std::string_view client_id, std::string_view username) const;
     // A session another shard gave up, taken in for the connection about to resume it.
     void adopt(std::string_view bytes);
+    // What became of a session another shard gave up after the connection it was for was let in without it.
+    enum class late_take : uint8_t
+    {
+        installed,   // no session of the client was here, so it is the client's session now
+        merged,      // folded into the client's session here: its subscriptions, and its messages before that one's
+        ended,       // the session here began with a clean start, which ends any older one
+        refused,     // the session here is another user's
+    };
+    late_take take_late(std::string_view bytes);
     // Every client with a session here.
     std::vector<std::string> session_ids() const;
     // The stamp, user and asking of the session of `client_id` not yet expired, false when there is none.
@@ -567,6 +579,8 @@ private:
         // asked before it was.
         uint64_t    stamp{0};
         bool        asked{true};
+        // Made by a CONNECT with a clean start, so a session older than it, coming late from another shard, is ended.
+        bool        began_clean{false};
         // Its bytes as last encoded while it had no connection, dropped at each change, so a snapshot encodes again
         // only what changed.
         mutable std::shared_ptr<const std::string> encoded;

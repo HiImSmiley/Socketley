@@ -588,6 +588,7 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
         fresh->client_id = p.client_id;
         fresh->username  = a.username;
         fresh->peer      = c->info.peer;
+        fresh->began_clean = p.clean_start;
         own(*fresh);
         s = fresh.get();
         m_by_key[s->key] = s;
@@ -648,7 +649,7 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
     send_packet(*c, out);
     ++m_stats.connects;
     mark(*s);
-    m_hooks.session_held(s->client_id, s->username, s->stamp);
+    m_hooks.session_held(s->client_id, s->username, s->stamp, p.clean_start);
     m_hooks.on_connected(info_of(*c));
     if (present)
         resend(*s, *c);
