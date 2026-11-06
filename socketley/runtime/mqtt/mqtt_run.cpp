@@ -400,7 +400,7 @@ void mqtt_run::accept_done(listener& l, struct io_uring_cqe* cqe)
             if (::getpeername(fd, reinterpret_cast<sockaddr*>(&c->peer), &len) < 0) {}
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-            c->fitted = socket_tuning::fit_to_path(fd);
+            c->fitted = socket_tuning::fit_to_path(fd, socket_tuning::side::accepted);
             c->ws = l.ws;
             c->closing_ms = now_ms();
             if (m_tls)

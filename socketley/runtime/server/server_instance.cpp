@@ -4661,7 +4661,7 @@ reparse:
                     flush_write_queue(conn);
 
                 conn->proto = proto_ws;
-                conn->fitted = socket_tuning::fit_to_path(conn->fd);
+                conn->fitted = socket_tuning::fit_to_path(conn->fd, socket_tuning::side::accepted);
                 invoke_on_websocket(conn->fd);
                 conn->partial.erase(0, hdr_end + 4);
             }

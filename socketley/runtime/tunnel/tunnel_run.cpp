@@ -195,7 +195,9 @@ struct upstream_conn : http::server_conn
 link::link(tunnel_run& r, kind kd, std::string w, const std::shared_ptr<http::server_conn>& t)
     : run(r), k(kd), who(std::move(w)), s(kd == kind::edge, *this), transport(t), last_heard(wall::now_sec())
 {
-    if (t && t->fd >= 0 && socket_tuning::fit_to_path(t->fd))
+    // A link to an edge is one this agent dialed.
+    const auto end = kd == kind::edge ? socket_tuning::side::dialed : socket_tuning::side::accepted;
+    if (t && t->fd >= 0 && socket_tuning::fit_to_path(t->fd, end))
         out_high = 256 * 1024;
 }
 

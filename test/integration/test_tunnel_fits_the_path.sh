@@ -128,14 +128,26 @@ redial() {
 }
 
 read -r lan_unsent _ _ < <(load 4 0)
-# The kernel's round trip when the link is made decides, and a handshake on a starved host can measure a millisecond on
-# loopback, so a link made again settles it: one that fits every link fits all three.
 lan_lowat=() port=none
 for try in 1 2 3; do
     read -r port v < <(lowat)
     lan_lowat+=("$v")
-    [ "$v" = 0 ] && break
     [ "$try" = 3 ] || redial "$port"
+done
+
+# A peer slow to acknowledge, as a starved host is: every segment the edge sends but its SYN-ACK held 10 ms, so the
+# agent's smoothed round trip when the link is made is over a millisecond while the least it has seen is loopback's.
+# That is how a loaded box fitted loopback links (srtt past 1 ms, tcpi_min_rtt 17 us); the dialing side decides on the
+# least.  Byte 33 is the TCP flags behind loopback's 20-byte IP header: ACK set, SYN clear.
+tc qdisc del dev lo root 2>/dev/null
+tc qdisc add dev lo root handle 1: prio bands 3 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+tc qdisc add dev lo parent 1:3 handle 30: netem delay 10ms
+tc filter add dev lo parent 1: protocol ip u32 match ip sport "$PE" 0xffff match u8 0x10 0x12 at 33 flowid 1:3
+slow_lowat=()
+for try in 1 2 3; do
+    redial "$port"
+    read -r port v < <(lowat)
+    slow_lowat+=("$v")
 done
 
 # A 20 ms round trip and 40 Mbit/s from the agent to the edge, with a bottleneck queue of 30 ms, and the agent
@@ -151,7 +163,8 @@ read -r wan_unsent echo_ms rate < <(load 6 30)
 read -r _ wan_lowat < <(lowat)
 echo "  unsent at most: ${lan_unsent} bytes on loopback, ${wan_unsent} on the path;" \
      "a new stream beside six downloads answered in ${echo_ms} ms, the downloads at ${rate} MB/s;" \
-     "the link's TCP_NOTSENT_LOWAT ${lan_lowat[*]} on loopback, ${wan_lowat} on the path"
+     "the link's TCP_NOTSENT_LOWAT ${lan_lowat[*]} on loopback, ${slow_lowat[*]} with slow acknowledgements," \
+     "${wan_lowat} on the path"
 if [ "$sanitized" = 1 ]; then echo "  SKIP [timing]: a rate and a latency in milliseconds measure the sanitizer, not the link"
 elif awk -v e="${echo_ms:-99999}" 'BEGIN{exit !(e > 0 && e < 400)}'; then ok
 else bad "a new stream beside bulk ones is answered within a few round trips" "${echo_ms} ms at the median"; fi
@@ -161,10 +174,11 @@ else bad "and the downloads still fill the path's 4.7 MB/s" "${rate} MB/s"; fi
 if [ "${wan_unsent:-999999999}" -le $((512 << 10)) ] && [ "$wan_lowat" = 16384 ]; then ok
 else bad "over a round trip the kernel holds little of the link's data" \
     "$wan_unsent bytes unsent, TCP_NOTSENT_LOWAT $wan_lowat"; fi
-if [ "${lan_lowat[-1]}" = 0 ]; then ok
+if [ "$(printf '%s\n' "${lan_lowat[@]}" | grep -cx 0)" = 3 ]; then ok
 else bad "and on loopback the buffer is left whole, which would otherwise cap the rate" \
     "TCP_NOTSENT_LOWAT ${lan_lowat[*]} on three links, $lan_unsent bytes unsent at most"; fi
-
+if [ "$(printf '%s\n' "${slow_lowat[@]}" | grep -cx 0)" = 3 ]; then ok
+else bad "and so it is when the edge is slow to acknowledge" "TCP_NOTSENT_LOWAT ${slow_lowat[*]} on three links"; fi
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

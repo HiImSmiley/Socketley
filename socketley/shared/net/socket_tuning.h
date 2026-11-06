@@ -1,6 +1,8 @@
 #pragma once
 // Socket options as this tree tunes them, in one place because every listener owes a peer the same.
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string>
@@ -90,12 +92,37 @@ inline uint32_t rtt_us(int fd)
     return getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &n) == 0 ? ti.tcpi_rtt : 0;
 }
 
+// The kernel's tcp_info as far as tcpi_min_rtt, which glibc's copy of the struct stops short of.
+struct tcp_info_min_rtt
+{
+    struct tcp_info base;
+    uint64_t pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
+    uint32_t segs_out, segs_in, notsent_bytes, min_rtt;
+};
+static_assert(offsetof(tcp_info_min_rtt, min_rtt) == 148, "tcpi_min_rtt is at 148 in the kernel's struct tcp_info");
+
+// Which end of a connection asks: the one that dialed it has the round trips of its handshake and first exchanges.
+enum class side : uint8_t { accepted, dialed };
+
+// The least round trip a connection has seen, falling back to the smoothed one where the kernel keeps no minimum.
+inline uint32_t min_rtt_us(int fd)
+{
+    tcp_info_min_rtt ti{};
+    socklen_t n = sizeof(ti);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &n) < 0)
+        return 0;
+    return n >= offsetof(tcp_info_min_rtt, min_rtt) + sizeof(ti.min_rtt) && ti.min_rtt != 0 ? ti.min_rtt
+                                                                                          : ti.base.tcpi_rtt;
+}
+
 // On a path with a round trip, what a connection has framed waits in its own queue, where a frame made later may go
 // ahead of it, and not in the kernel's buffer behind it; on a LAN that buffer drains as fast as it fills, and holding
 // it short would only cap the rate. True where it was held short, which is when the caller bounds its writes too.
-inline bool fit_to_path(int fd)
+// The side that dialed decides on the least round trip, since a loaded host inflates the smoothed one with its own
+// wait and fitted a loopback link that way.
+inline bool fit_to_path(int fd, side who)
 {
-    if (rtt_us(fd) < 1000)
+    if ((who == side::dialed ? min_rtt_us(fd) : rtt_us(fd)) < 1000)
         return false;
     const int lowat = 16 * 1024;
     if (setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat)) < 0) {}

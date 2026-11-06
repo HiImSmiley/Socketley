@@ -136,7 +136,7 @@ void enqueue(session<S>& s, stream& st)
 template <class S>
 void fit_to_path(session<S>& s, int fd)
 {
-    if (socket_tuning::fit_to_path(fd))
+    if (socket_tuning::fit_to_path(fd, socket_tuning::side::accepted))
         s.out_high = 64 * 1024;
 }
 
