@@ -3722,11 +3722,11 @@ a cache
 .BR QUIT ,
 an MQTT
 .BR DISCONNECT )
-is closed only once its client has acknowledged all of that answer or closed
-its own side. What the client sends meanwhile is read and dropped, since a close
-with bytes unread makes the kernel reset the connection and throw away what it
-has not yet delivered. A client that takes nothing for ten seconds is closed
-then.
+is closed only once its client has closed its own side, or has acknowledged
+all of that answer and sent nothing for a second. What the client sends
+meanwhile is read and dropped, since a close with bytes unread makes the kernel
+reset the connection and throw away what it has not yet delivered. A client
+that takes nothing for ten seconds, or goes on sending for thirty, is reset.
 .TP
 .BI "\-\-congestion " name
 The TCP congestion control algorithm for connections that a server, proxy,

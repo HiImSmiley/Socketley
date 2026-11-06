@@ -72,6 +72,7 @@ void orderly_close::take(int fd, bool kernel_tls)
     auto e = std::make_unique<entry>();
     e->fd         = fd;
     e->kernel_tls = kernel_tls;
+    e->since      = e->heard = std::chrono::steady_clock::now();
     if (advance(*e))
         return;
     // Nothing to wait with, or too many waiting: closed as before, its tail at the kernel's mercy.
@@ -87,15 +88,17 @@ void orderly_close::take(int fd, bool kernel_tls)
 
 bool orderly_close::advance(entry& e)
 {
+    const auto now = std::chrono::steady_clock::now();
     // What the peer sends is read away, so none is left unread for the close to answer with a reset.
-    bool drained = false;
-    for (int i = 0; i < 16; ++i)
+    bool drained = false, eof = false;
+    for (int i = 0; i < 64; ++i)
     {
         static thread_local char sink[16384];
         const ssize_t n = ::recv(e.fd, sink, sizeof(sink), MSG_DONTWAIT);
         if (n > 0)
         {
             e.drained += static_cast<uint64_t>(n);
+            e.heard    = now;
             if (e.drained > drain_limit)
                 break;
             continue;
@@ -110,8 +113,10 @@ bool orderly_close::advance(entry& e)
             return true;
         }
         drained = true;
+        eof     = n == 0;
         break;
     }
+    e.input_left = !drained;
 
     if (!e.write_shut)
     {
@@ -126,17 +131,27 @@ bool orderly_close::advance(entry& e)
         e.write_shut = true;
     }
 
-    int owed = 0;
-    const bool known = ::ioctl(e.fd, SIOCOUTQ, &owed) == 0;
-    bool done = !known || e.drained > drain_limit || (owed <= 0 && (drained || e.drained > settled_limit));
+    // The peer has closed and all it sent is read: nothing more can arrive for the close to answer with a reset.
+    bool done = drained && eof;
+    bool give_up = false;
     if (!done)
     {
         const send_look l = look_at_send(e.fd);
-        // A unix socket's bytes are in its peer's queue already; a TCP peer that closed sends nothing a reset follows.
-        done = !l.tcp || send_stalled(l, stall) || (drained && peer_has_closed(l.state));
+        // A unix socket's bytes are in its peer's queue already, and nothing it sends later resets anything.
+        done = !l.tcp || (drained && peer_has_closed(l.state)) ||
+               // All it was sent is acknowledged, and it has been quiet long enough to be read as done sending.
+               (l.owed == 0 && drained && now - e.heard >= quiet);
+        give_up = !done && (send_stalled(l, stall) || e.drained > drain_limit ||
+                            (l.owed == 0 && now - e.since >= linger_most));
     }
-    if (!done)
+    if (!done && !give_up)
         return false;
+    // Reset, so the peer learns of the end and the kernel keeps no orphan sending what it will not take.
+    if (give_up)
+    {
+        const linger now_reset{1, 0};
+        if (::setsockopt(e.fd, SOL_SOCKET, SO_LINGER, &now_reset, sizeof now_reset) < 0) {}
+    }
     ::close(e.fd);
     e.fd = -1;
     return true;
@@ -167,7 +182,8 @@ void orderly_close::on_cqe(struct io_uring_cqe* cqe)
         drop(e);
         return;
     }
-    e->wait = std::min(e->wait * 2, std::chrono::milliseconds(1000));
+    // A peer still sending is read again soon, so it is not held back; a quiet one is looked at less and less often.
+    e->wait = e->input_left ? std::chrono::milliseconds(10) : std::min(e->wait * 2, std::chrono::milliseconds(1000));
     if (!arm(*e))
     {
         ::close(e->fd);

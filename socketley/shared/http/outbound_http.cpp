@@ -1009,9 +1009,13 @@ void http_peer::close_socket()
         tls_context::free_ssl(m_ssl);
         m_ssl = nullptr;
     }
+    // Only then: the answer is what this side waits for, and the server's own close ends it.
     if (m_fd >= 0)
     {
-        m_loop.close_fd_orderly(m_fd, kernel_tls);
+        if (kernel_tls)
+            m_loop.close_fd_orderly(m_fd, true);
+        else
+            m_loop.close_fd(m_fd);
         m_fd = -1;
     }
 }

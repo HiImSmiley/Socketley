@@ -5,8 +5,8 @@
 // so does input that arrives after shutdown(SHUT_RD) once the FIN is out; under kernel TLS a FIN also throws away the
 // records the kernel took on a full socket and has not handed to TCP.  So a connection ends here: its write side shut
 // (under kernel TLS only once the socket's queue is empty), what its peer still sends read and dropped, and the
-// descriptor closed once nothing it was sent is unacknowledged or the peer has closed as well -- or once its send queue
-// has not moved for `stall`, a peer that stopped reading, or it sent more than `drain_limit`.
+// descriptor closed once the peer has closed as well, or has everything it was sent and has gone quiet -- or reset once
+// its send queue has not moved for `stall`, a peer that stopped reading, or it sent more than `drain_limit`.
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -54,8 +54,10 @@ public:
     // How long a send queue that does not move is waited on, and how much a peer may send meanwhile.
     static constexpr auto     stall       = std::chrono::seconds(10);
     static constexpr uint64_t drain_limit = 64ull << 20;
-    // How much is read away once nothing sent is unacknowledged, past which a reset loses nothing of ours.
-    static constexpr uint64_t settled_limit = 1ull << 20;
+    // A peer that has everything and sent nothing for this long is done sending; one that keeps trickling is reset
+    // after linger_most, which then loses nothing of ours.
+    static constexpr auto     quiet       = std::chrono::seconds(1);
+    static constexpr auto     linger_most = std::chrono::seconds(30);
     // How many ends are held at once; past it one is closed as it comes.
     static constexpr size_t   max_held    = 16384;
 
@@ -83,6 +85,9 @@ private:
         int  fd{-1};
         bool kernel_tls{false};
         bool write_shut{false};
+        // The last look stopped with input still to read.
+        bool input_left{false};
+        std::chrono::steady_clock::time_point since{}, heard{};
         uint64_t drained{0};
         std::chrono::milliseconds wait{10};
         size_t index{0};
