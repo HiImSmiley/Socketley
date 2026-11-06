@@ -234,8 +234,21 @@ private:
     };
     // A word owed only a receipt, kept for the next batch; false when it is dropped instead.
     bool queue_shard(uint32_t to, std::string_view frame, bool droppable);
-    // A message for another shard, dropped where queue_shard() drops a delivery.
-    bool queue_deliver(uint32_t to, uint8_t qos, std::string_view body, const std::vector<std::string>& groups);
+    // Whether a delivery at `qos` would be kept for that shard now.
+    bool deliver_room(uint32_t to, uint8_t qos) const;
+    // A message for another shard, dropped where queue_shard() drops a delivery, numbered and with the shards that
+    // take it.
+    bool queue_deliver(uint32_t to, uint8_t qos, std::string_view body, const std::vector<std::string>& groups,
+                       uint64_t taken);
+    // What a session given up here would have had of a message, handed on to the shard it went to: `groups` are
+    // the shared groups this shard was chosen for, all of them when null for one accepted here.
+    void forward_moved(const message_ptr& m, uint32_t origin, uint64_t epoch, uint64_t seq, uint64_t taken,
+                       const std::vector<std::string>* groups);
+    // The filters the other shards are told this shard holds: its own, and those of the sessions it gave up lately.
+    std::vector<std::string> told_filters() const;
+    // A message the shard a session came from handed on for it, the whole frame.
+    void take_forward(std::string_view frame);
+    void drop_moved(size_t i);
     void send_shard(uint32_t to);
     void send_shards();
     bool unreachable(const shard_queue& q) const;
@@ -370,6 +383,8 @@ private:
         bool        kept{false};
         std::string session;
         int64_t     started_ms{0};
+        // What the shard the session is coming from handed on for it before it is taken in here.
+        std::vector<std::string> early;
     };
     std::unordered_map<uint64_t, pending_claim> m_claims;
     std::unordered_map<uint64_t, uint64_t> m_claim_cookies;
@@ -394,6 +409,32 @@ private:
     uint64_t m_claims_refused{0};
     uint64_t m_sessions_moved{0};
     uint64_t m_sessions_kept{0};
+    // A session given up to another shard, whose messages still coming here are handed on to it there for as long as
+    // one sent here before the other shards heard of the move may come; its filters are told ended only after.
+    struct moved_session
+    {
+        std::string client;
+        uint32_t    to{0};
+        std::map<std::string, sub_options> subs;
+        int64_t     until{0};
+        // What the shard it went to had been handed by each shard when it took it in, once it says.
+        std::vector<std::pair<uint64_t, uint64_t>> marks;
+    };
+    std::vector<moved_session> m_moved;
+    std::unordered_set<std::string> m_unsaid;
+    // Each message accepted here is numbered, under m_shard_epoch.
+    uint64_t m_msg_seq{0};
+    // The newest message each shard delivered here, as its start and number.
+    std::vector<std::pair<uint64_t, uint64_t>> m_seen;
+    // A session taken in here, with m_seen as it was then: a message handed on for it reached it directly if it was
+    // delivered here after.
+    struct adopted_session
+    {
+        std::vector<std::pair<uint64_t, uint64_t>> marks;
+        int64_t until{0};
+    };
+    std::unordered_map<std::string, adopted_session> m_adopted;
+    uint64_t m_moved_forwarded{0};
 };
 
 }   // namespace socketley::mqtt

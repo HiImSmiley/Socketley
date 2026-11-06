@@ -16256,7 +16256,10 @@ subscribe to, and hands them the messages their subscribers want. Every shard
 keeps each retained message. A shared subscription's message goes to one member
 of the group, across all the shards. A client that connects to a different shard
 than before takes its session with it. The newest connection of a client id
-wins. A session moves as one piece. When shards relay through the daemon
+wins. A message still on its way to the shard a session left is handed on to
+the shard it went to, once, for ten seconds after the move; these are counted in
+.BR session_forwards .
+A session moves as one piece. When shards relay through the daemon
 (see
 .BR SOCKETLEY_NO_SHARD_MESH ),
 that piece holds 8 MiB, less what the shard still has queued to the daemon past

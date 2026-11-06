@@ -42,6 +42,8 @@ enum class sverb : uint8_t
     batch         = 9,
     client_add    = 10,
     client_del    = 11,
+    forward       = 12,
+    adopted       = 13,
 };
 
 // A batch is cut at this, far below the 4 MiB a link's backlog holds before it gives up.
@@ -62,6 +64,9 @@ constexpr int64_t stall_ms = 1000;
 constexpr int64_t stamp_keep_us = 10'000'000;
 
 constexpr int64_t claim_patience_ms = 3000;
+// How long a shard that gave a session up hands on what still comes for it, far past the moment every other shard
+// heard where the session went.
+constexpr int64_t forward_keep_ms = 10'000;
 
 // What an answer of retained messages keeps free of the way back's room for its count and where the next one starts.
 constexpr size_t dump_margin = 128u << 10;
@@ -363,8 +368,12 @@ void mqtt_run::shards_start()
     m_shard_epoch = claim_stamp(me);
     m_assign.assign(n, {});
     m_sharing.assign(n, {});
+    m_seen.assign(n, {});
+    m_moved.clear();
+    m_unsaid.clear();
+    m_adopted.clear();
     // What this shard holds, told whole, so a peer that knew an older picture of it replaces that one.
-    const std::vector<std::string> mine = m_broker->filters();
+    const std::vector<std::string> mine = told_filters();
     const std::vector<std::string> clients = m_broker->session_ids();
     for (uint32_t j = 0; j < n; ++j)
     {
@@ -477,14 +486,146 @@ void mqtt_run::share_interest(uint8_t v, const std::vector<std::string>& filters
 
 void mqtt_run::filter_added(const std::string& filter)
 {
-    if (sharded() && !m_peers.empty())
+    // One whose end was not told yet is still counted by the others.
+    if (sharded() && !m_peers.empty() && !m_unsaid.erase(filter))
         share_interest(static_cast<uint8_t>(sverb::interest_add), {filter});
 }
 
 void mqtt_run::filter_removed(const std::string& filter)
 {
-    if (sharded() && !m_peers.empty())
+    if (!sharded() || m_peers.empty())
+        return;
+    // A session given up lately still takes this filter's messages here, to hand them on.
+    if (std::any_of(m_moved.begin(), m_moved.end(), [&](const moved_session& s) { return s.subs.contains(filter); }))
+    {
+        m_unsaid.insert(filter);
+        return;
+    }
+    share_interest(static_cast<uint8_t>(sverb::interest_del), {filter});
+}
+
+std::vector<std::string> mqtt_run::told_filters() const
+{
+    std::vector<std::string> out = m_broker->filters();
+    out.insert(out.end(), m_unsaid.begin(), m_unsaid.end());
+    return out;
+}
+
+void mqtt_run::drop_moved(size_t i)
+{
+    moved_session gone = std::move(m_moved[i]);
+    m_moved.erase(m_moved.begin() + static_cast<std::ptrdiff_t>(i));
+    for (const auto& [filter, o] : gone.subs)
+    {
+        if (!m_unsaid.contains(filter) ||
+            std::any_of(m_moved.begin(), m_moved.end(), [&](const moved_session& s) { return s.subs.contains(filter); }))
+            continue;
+        m_unsaid.erase(filter);
         share_interest(static_cast<uint8_t>(sverb::interest_del), {filter});
+    }
+}
+
+void mqtt_run::forward_moved(const message_ptr& m, uint32_t origin, uint64_t epoch, uint64_t seq, uint64_t taken,
+                             const std::vector<std::string>* groups)
+{
+    const int64_t now = now_ms();
+    const uint32_t me = m_owner.get_shard_index();
+    for (const moved_session& s : m_moved)
+    {
+        if (now >= s.until)
+            continue;
+        std::vector<std::string> filters;
+        bool plain = false;
+        for (const auto& [filter, o] : s.subs)
+        {
+            std::string_view group, inner = filter;
+            const bool shared = split_shared(filter, group, inner);
+            if (!topic_matches(inner, m->topic))
+                continue;
+            // A group's message is the session's only where this shard was chosen for the group and has no member
+            // of it left.
+            if (shared && (m_broker->has_filter(filter) ||
+                           (groups ? std::find(groups->begin(), groups->end(), filter) == groups->end()
+                                   : std::any_of(m_sharing.begin(), m_sharing.end(), [&](const auto& a) {
+                                         return std::find(a.begin(), a.end(), filter) != a.end();
+                                     }))))
+                continue;
+            plain = plain || !shared;
+            filters.push_back(filter);
+        }
+        if (filters.empty())
+            continue;
+        if (!deliver_room(s.to, m->qos))
+        {
+            ++m_shard_dropped;
+            continue;
+        }
+        // Whether the shard it went to was handed this message too, as the one that accepted it or directly.
+        const bool direct = plain && (s.to == origin || (s.to < 64 && (taken >> s.to & 1)));
+        // Handed there after it took the session in, it reached the session there.
+        if (direct && origin < s.marks.size() && std::pair{epoch, seq} > s.marks[origin])
+        {
+            std::erase_if(filters, [](const std::string& f) {
+                std::string_view group, inner = f;
+                return !split_shared(f, group, inner);
+            });
+            if (filters.empty())
+                continue;
+        }
+        std::string f = frame_of(sverb::forward, me);
+        socketley::bytes::writer w;
+        w.bytes(s.client);
+        w.u32(origin);
+        w.u64(epoch);
+        w.u64(seq);
+        w.flag(direct);
+        put_list(w, filters);
+        w.bytes(message_bytes(*m));
+        f += w.take();
+        if (queue_shard(s.to, f, false))
+            ++m_moved_forwarded;
+    }
+}
+
+void mqtt_run::take_forward(std::string_view frame)
+{
+    socketley::bytes::reader r(frame);
+    uint8_t v = 0;
+    uint32_t from = 0, origin = 0;
+    uint64_t epoch = 0, seq = 0;
+    bool direct = false;
+    std::string client;
+    std::vector<std::string> filters;
+    std::string_view body;
+    auto m = std::make_shared<message>();
+    if (!r.marker(shard_prefix) || !r.u8(v) || !r.u32(from) || !r.bytes(client, 1u << 16) || !r.u32(origin) ||
+        !r.u64(epoch) || !r.u64(seq) || !r.flag(direct) || !get_list(r, filters) || !r.view(body, 1u << 28) ||
+        !message_from(body, *m))
+        return;
+    // A session still being claimed here is handed it once it is in.
+    bool held = false;
+    for (auto& [id, pc] : m_claims)
+        if (pc.ask.client_id == client)
+        {
+            pc.early.emplace_back(frame);
+            held = true;
+        }
+    if (held)
+        return;
+    // A copy handed here directly reached the session by its plain subscriptions, unless it came before the session.
+    if (direct)
+    {
+        const auto a = m_adopted.find(client);
+        const bool before = a != m_adopted.end() && origin < a->second.marks.size() &&
+                            std::pair{epoch, seq} <= a->second.marks[origin];
+        if (!before)
+            std::erase_if(filters, [](const std::string& f) {
+                std::string_view group, inner = f;
+                return !split_shared(f, group, inner);
+            });
+    }
+    if (!filters.empty() && !m_broker->deliver_moved(client, m, filters))
+        ++m_shard_dropped;
 }
 
 bool mqtt_run::shared_here(std::string_view key)
@@ -514,6 +655,7 @@ void mqtt_run::share_message(const message_ptr& m)
     m_reached = 0;
     if (!sharded() || m_peers.empty())
         return;
+    const uint64_t seq = ++m_msg_seq;
     const uint32_t n = m_owner.get_shards();
     // The groups decided for another shard while the message was routed here, taken whole and left empty for the next.
     m_sharing.swap(m_assign);
@@ -538,8 +680,13 @@ void mqtt_run::share_message(const message_ptr& m)
                 m_sharing[j].emplace_back(key);
                 any = true;
             });
+    // The shards that take it, which each is told, so a shard a session moved to knows a copy came to it directly.
+    uint64_t taken = 0;
     if (any)
     {
+        for (uint32_t j = 0; j < n && j < 64; ++j)
+            if ((m_plain[j] || !m_sharing[j].empty()) && deliver_room(j, m->qos))
+                taken |= uint64_t{1} << j;
         const std::string body = message_bytes(*m);
         for (uint32_t j = 0; j < n; ++j)
         {
@@ -547,28 +694,38 @@ void mqtt_run::share_message(const message_ptr& m)
                 continue;
             if (j < 64)
                 m_reached |= uint64_t{1} << j;
-            if (queue_deliver(j, m->qos, body, m_sharing[j]))
+            if (queue_deliver(j, m->qos, body, m_sharing[j], taken))
                 ++m_shard_forwarded;
         }
     }
+    if (!m_moved.empty())
+        forward_moved(m, m_owner.get_shard_index(), m_shard_epoch, seq, taken, nullptr);
     for (auto& a : m_sharing)
         a.clear();
 }
 
-bool mqtt_run::queue_deliver(uint32_t to, uint8_t qos, std::string_view body, const std::vector<std::string>& groups)
+bool mqtt_run::deliver_room(uint32_t to, uint8_t qos) const
 {
     if (to >= m_squeue.size() || to == m_owner.get_shard_index())
         return false;
-    shard_queue& q = m_squeue[to];
     // A shard that has gone quiet still has QoS 1 and 2 kept for it, since their publisher was answered and is held
     // at hold_bytes.
-    if (q.waiting() >= drop_bytes || unreachable(q) || (qos == 0 && stalled(q)))
+    const shard_queue& q = m_squeue[to];
+    return q.waiting() < drop_bytes && !unreachable(q) && !(qos == 0 && stalled(q));
+}
+
+bool mqtt_run::queue_deliver(uint32_t to, uint8_t qos, std::string_view body, const std::vector<std::string>& groups,
+                             uint64_t taken)
+{
+    if (!deliver_room(to, qos))
     {
-        ++m_shard_dropped;
+        if (to < m_squeue.size() && to != m_owner.get_shard_index())
+            ++m_shard_dropped;
         return false;
     }
+    shard_queue& q = m_squeue[to];
     // The frame queue_shard() would make, written where it waits rather than built and copied there.
-    size_t size = shard_prefix.size() + 1 + 4 + 4 + body.size() + 4;
+    size_t size = shard_prefix.size() + 1 + 4 + 4 + body.size() + 4 + 24;
     for (const auto& g : groups)
         size += 4 + g.size();
     std::string& out = q.pending;
@@ -584,6 +741,9 @@ bool mqtt_run::queue_deliver(uint32_t to, uint8_t qos, std::string_view body, co
         socketley::bytes::append32(out, static_cast<uint32_t>(g.size()));
         out.append(g);
     }
+    socketley::bytes::append64(out, m_shard_epoch);
+    socketley::bytes::append64(out, m_msg_seq);
+    socketley::bytes::append64(out, taken);
     if (q.waiting() >= batch_bytes)
         send_shard(to);
     return true;
@@ -712,9 +872,15 @@ void mqtt_run::finish_claim(uint64_t id)
     pending_claim pc = std::move(it->second);
     m_claims.erase(it);
     std::erase_if(m_claim_cookies, [&](const auto& kv) { return kv.second == id; });
+    // What was handed on for the session meanwhile goes to it if it is here, whatever became of this connection.
+    const auto early = [&] {
+        for (const auto& f : pc.early)
+            take_forward(f);
+    };
     if (pc.refused)
     {
         ++m_claims_refused;
+        early();
         pc.done({reason::not_authorized, {}});
         return;
     }
@@ -722,20 +888,45 @@ void mqtt_run::finish_claim(uint64_t id)
     {
         // A newer connection to the same client on another shard wins; this one is told to come back.
         ++m_claims_lost;
+        early();
         pc.done({pc.ask.level == level_5 ? reason::session_taken_over : reason::server_unavailable, {}});
         return;
     }
     if (pc.kept)
     {
         // The session is too large to move by the way it would come, so it stays with its shard and its connection.
+        early();
         pc.done({reason::server_unavailable, {}});
         return;
     }
+    // The client is this shard's now, so what it gave up of it before is handed on no longer.
+    for (size_t i = m_moved.size(); i-- > 0;)
+        if (m_moved[i].client == pc.ask.client_id)
+            drop_moved(i);
     if (!pc.session.empty())
     {
         m_broker->adopt(pc.session);
         ++m_sessions_moved;
+        adopted_session& a = m_adopted[pc.ask.client_id];
+        a.marks = m_seen;
+        a.marks[m_owner.get_shard_index()] = {m_shard_epoch, m_msg_seq};
+        a.until = now_ms() + 2 * forward_keep_ms;
+        // Told to the shard it came from, which then hands on only what did not come here after.
+        std::string f = frame_of(sverb::adopted, m_owner.get_shard_index());
+        socketley::bytes::writer w;
+        w.bytes(pc.ask.client_id);
+        w.u32(static_cast<uint32_t>(a.marks.size()));
+        for (const auto& [e, s] : a.marks)
+        {
+            w.u64(e);
+            w.u64(s);
+        }
+        f += w.take();
+        for (uint32_t j = 0; j < m_squeue.size(); ++j)
+            if (j != m_owner.get_shard_index())
+                queue_shard(j, f, false);
     }
+    early();
     pc.answer.stamp = pc.stamp;
     pc.answer.asked = !pc.skipped;
     pc.done(std::move(pc.answer));
@@ -795,6 +986,10 @@ void mqtt_run::sweep_claims(int64_t now)
 {
     if (m_retained_ask_ms && now >= m_retained_ask_ms)
         ask_retained();
+    for (size_t i = m_moved.size(); i-- > 0;)
+        if (now >= m_moved[i].until)
+            drop_moved(i);
+    std::erase_if(m_adopted, [&](const auto& kv) { return now >= kv.second.until; });
     if (!m_retained_stamps.empty())
     {
         const uint64_t us = claim_stamp(0) >> 6;
@@ -871,13 +1066,39 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t 
         {
             std::string_view body;
             std::vector<std::string> groups;
+            uint64_t epoch = 0, seq = 0, taken = 0;
             auto m = std::make_shared<message>();
-            if (r.view(body, 1u << 28) && get_list(r, groups) && message_from(body, *m))
+            if (r.view(body, 1u << 28) && get_list(r, groups) && r.u64(epoch) && r.u64(seq) && r.u64(taken) &&
+                message_from(body, *m))
             {
                 message_ptr held = m;
                 // Not tapped here: a tap is open on every shard, and the shard that accepted it tapped it.
                 m_broker->deliver_remote(held, groups);
+                if (std::pair{epoch, seq} > m_seen[from])
+                    m_seen[from] = {epoch, seq};
+                if (!m_moved.empty())
+                    forward_moved(held, from, epoch, seq, taken, &groups);
             }
+            break;
+        }
+        case sverb::forward:
+        {
+            take_forward(payload);
+            break;
+        }
+        case sverb::adopted:
+        {
+            std::string client;
+            uint32_t n = 0;
+            if (!r.bytes(client, 1u << 16) || !r.u32(n) || n != m_peers.size())
+                break;
+            std::vector<std::pair<uint64_t, uint64_t>> marks(n);
+            for (auto& [e, s] : marks)
+                if (!r.u64(e) || !r.u64(s))
+                    return;
+            for (auto& s : m_moved)
+                if (s.client == client && s.to == from)
+                    s.marks = marks;
             break;
         }
         case sverb::retained:
@@ -945,7 +1166,7 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t 
         {
             // Answered with what this shard holds, which the asker takes as a full picture of it.
             socketley::bytes::writer w;
-            put_list(w, m_broker->filters());
+            put_list(w, told_filters());
             put_list(w, m_broker->session_ids());
             reply = w.take();
             break;
@@ -1033,8 +1254,20 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t 
                 reply = w.take();
                 break;
             }
+            // Kept as given up before it is, so the filters it ends are told ended only once its messages stop coming.
+            std::map<std::string, sub_options> subs;
+            if (!clean)
+                subs = m_broker->session_subs(client);
+            for (size_t i = m_moved.size(); i-- > 0;)
+                if (m_moved[i].client == client)
+                    drop_moved(i);
+            if (!subs.empty())
+                m_moved.push_back({client, from, std::move(subs), now_ms() + forward_keep_ms, {}});
+            m_adopted.erase(client);
             // A session the way back cannot carry stays here with its connection, where one cut short would be lost.
             std::optional<std::string> bytes = m_broker->surrender(client, clean, room > 5 ? room - 5 : 0);
+            if ((!bytes || bytes->empty()) && !m_moved.empty() && m_moved.back().client == client)
+                drop_moved(m_moved.size() - 1);
             if (!bytes)
             {
                 w.u8(4);
@@ -1084,6 +1317,7 @@ void mqtt_run::shard_stats(std::string& out) const
     st::put(out, "session_claims_refused", m_claims_refused);
     st::put(out, "sessions_moved", m_sessions_moved);
     st::put(out, "sessions_kept", m_sessions_kept);
+    st::put(out, "session_forwards", m_moved_forwarded);
 }
 
 }   // namespace socketley::mqtt

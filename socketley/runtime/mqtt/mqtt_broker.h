@@ -432,6 +432,11 @@ public:
     // A message another shard accepted, delivered to the subscribers here, and to the shared groups among `groups`
     // that shard chose this one for.
     void deliver_remote(const message_ptr& m, const std::vector<std::string>& groups);
+    // A message the shard this client's session moved from had for it, delivered to that session alone by those of
+    // its subscriptions among `filters`; false when no session of the client is here.
+    bool deliver_moved(std::string_view client_id, const message_ptr& m, const std::vector<std::string>& filters);
+    // A session's subscriptions, none when there is no session of the client.
+    std::map<std::string, sub_options> session_subs(std::string_view client_id) const;
     // Every filter subscribed to here, shared ones as $share/<group>/<filter>.
     std::vector<std::string> filters() const;
     // A retained message another shard set or cleared.

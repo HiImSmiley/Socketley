@@ -23,6 +23,8 @@
 #   * a clean start asking every shard, two at once both kept, or one taking another user's fresh session
 #   * the retained messages written by every shard, or a shard started without them; with no mesh, without those
 #     past what one answer through the daemon holds, or without them when two shards ask at once
+#   * a message on its way to a session's shard lost because its client took the session to another shard meanwhile,
+#     from the publisher's own shard or from a third one
 #   * a flood of retained messages at QoS 0 queued without bound for the other shards
 set -uo pipefail
 
@@ -275,7 +277,7 @@ if phase == "main":
         time.sleep(1.6)
     guarded("keep", keep)
 
-if phase in ("stall", "hang", "late"):
+if phase in ("stall", "hang", "late", "moving"):
     import os, re, signal, socket, threading
 
     def owner(c):
@@ -525,6 +527,51 @@ if phase == "late":
         pub.disconnect()
     guarded("retained_flood", retained_flood)
 
+if phase == "moving":
+    def moving(third):
+        # The session's shard stopped with 4 MB published for its session on the way to it, past what a shard has in
+        # flight to another, and its client coming back on the publisher's shard or a third one meanwhile.
+        name = "mv%d" % third
+        c = connected(port, name, props={SESSION_EXPIRY: 600})
+        c.subscribe((name + "/#", 1))
+        old = owner(c)
+        c.disconnect()
+        pub = None
+        for i in range(60):
+            p = connected(port, "%s-pub-%d" % (name, i), timeout=30)
+            if owner(p) not in (old, None):
+                pub = p
+                break
+            p.disconnect()
+        home = owner(pub)
+        body = lambda i: (b"%04d" % i) * 62500
+        cl = None
+        os.kill(old, signal.SIGSTOP)
+        try:
+            for i in range(16):
+                pub.publish(name + "/t", body(i), qos=1)
+            for _ in range(60):
+                x = Client(port, timeout=30)
+                o = owner(x)
+                if o not in (old, None) and (o != home) == third:
+                    cl = x
+                    break
+                x.close()
+            cl.connect(name, clean=False, props={SESSION_EXPIRY: 600}, expect_ack=False)
+            time.sleep(0.5)
+        finally:
+            os.kill(old, signal.SIGCONT)
+        ack = cl.expect(CONNACK, 10)
+        msgs = cl.messages(16, 20) + cl.messages(16, 1)
+        got = [m.payload[:4] for m in msgs if m.payload == body(int(m.payload[:4]))]
+        check("a session's 16 messages on their way to its shard follow it to the %s, each once" %
+              ("third shard" if third else "publisher's shard"),
+              (ack.body[:2] if ack else None, sorted(got)), (b"\x01\x00", [b"%04d" % i for i in range(16)]))
+        cl.disconnect()
+        pub.disconnect()
+    guarded("moving", lambda: moving(False))
+    guarded("moving third", lambda: moving(True))
+
 if phase == "owned":
     def owned():
         own = connected(port, "sensor-42", version=4, clean=False, username="alice", password="alicepass1")
@@ -647,6 +694,11 @@ if phase == "relayed":
         for i in range(40):
             pub.publish("heavy/t", body(i), qos=1)
         pub.disconnect()
+        # Every message in the session before it is asked for, or what has come by then is under 8 MiB and moves.
+        for _ in range(100):
+            if [s.get("queued") for s in sessions() if s["client"] == "heavy"] == [40]:
+                break
+            time.sleep(0.1)
         # A connection landing on another shard is told to come back, and one landing on the session's own is closed
         # before it reads, which leaves the messages in the session.
         elsewhere = None
@@ -776,6 +828,7 @@ dr=$("$BIN" stats fl 2>&1 | awk -F: '$1=="shard_dropped"{s+=$2} END{print s+0}')
 [ "$dr" -eq 0 ] && ok || bad "a shard drops nothing on the way to one that stopped for a while" "dropped $dr"
 tally < <(run hang "$FP")
 tally < <(run late "$FP")
+tally < <(run moving "$FP")
 "$BIN" remove fl >/dev/null 2>&1
 [ "$snaps" -eq 3 ] && ok || bad "each shard keeps a snapshot of its own" "$(find "$HOME" -name 'sh.snapshot*')"
 # The retained messages are the same on every shard, so one file holds them.

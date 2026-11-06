@@ -940,6 +940,51 @@ void broker::deliver_remote(const message_ptr& m, const std::vector<std::string>
     route(m, false, &groups);
 }
 
+bool broker::deliver_moved(std::string_view client_id, const message_ptr& m, const std::vector<std::string>& filters)
+{
+    const auto it = m_sessions.find(std::string(client_id));
+    if (it == m_sessions.end())
+        return false;
+    session& s = *it->second;
+    if (m_hooks.reads_checked() && !m_hooks.may_read(s.username, s.client_id, m->topic))
+        return true;
+    // Folded over the plain subscriptions as route() folds them, and once for each shared group.
+    route_target plain{&s, 0, false, {}};
+    bool any = false;
+    for (const auto& f : filters)
+    {
+        const auto sub = s.subs.find(f);
+        if (sub == s.subs.end())
+            continue;
+        const sub_options& o = sub->second;
+        std::string_view group, inner = f;
+        if (split_shared(f, group, inner))
+        {
+            std::vector<uint32_t> ids;
+            if (o.subscription_id)
+                ids.push_back(o.subscription_id);
+            deliver(s, m, std::min(m->qos, o.qos), false, std::move(ids));
+            continue;
+        }
+        if (o.no_local && s.client_id == m->from_client)
+            continue;
+        any = true;
+        plain.qos = std::max(plain.qos, std::min(m->qos, o.qos));
+        plain.retain = plain.retain || (o.retain_as_published && m->retain);
+        if (o.subscription_id)
+            plain.ids.push_back(o.subscription_id);
+    }
+    if (any)
+        deliver(s, m, plain.qos, plain.retain, std::move(plain.ids));
+    return true;
+}
+
+std::map<std::string, sub_options> broker::session_subs(std::string_view client_id) const
+{
+    const auto it = m_sessions.find(std::string(client_id));
+    return it == m_sessions.end() ? std::map<std::string, sub_options>{} : it->second->subs;
+}
+
 void broker::route(const message_ptr& m, bool notify, const std::vector<std::string>* groups)
 {
     // The list is kept from one message to the next; a route begun inside another takes one of its own.
