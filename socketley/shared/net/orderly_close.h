@@ -26,7 +26,7 @@ struct send_look
 {
     // A TCP socket, whose close can reset; a unix socket's cannot, its bytes being in the peer's queue already.
     bool     tcp{false};
-    // Bytes sent and not acknowledged, or not sent yet (SIOCOUTQ).
+    // Nonzero while anything sent is unacknowledged or not sent yet: segments in flight plus bytes unsent.
     uint32_t owed{0};
     // Since the kernel last sent data on it (tcpi_last_data_sent), which a zero window stops and a slow reader does not.
     uint32_t idle_ms{0};

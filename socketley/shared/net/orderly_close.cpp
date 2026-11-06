@@ -19,37 +19,45 @@ namespace socketley
 
 namespace
 {
-// Where the kernel's struct tcp_info keeps tcpi_state and tcpi_last_data_sent, its ABI.
+// Where the kernel's struct tcp_info keeps what is read here, its ABI.
 constexpr size_t TCPI_STATE_AT          = 0;
+constexpr size_t TCPI_UNACKED_AT        = 24;
 constexpr size_t TCPI_LAST_DATA_SENT_AT = 44;
-static_assert(offsetof(struct tcp_info, tcpi_last_data_sent) == TCPI_LAST_DATA_SENT_AT,
-              "tcpi_last_data_sent is at 44 in the kernel's struct tcp_info");
+constexpr size_t TCPI_NOTSENT_BYTES_AT  = 144;
+static_assert(offsetof(struct tcp_info, tcpi_unacked) == TCPI_UNACKED_AT, "tcpi_unacked is at 24");
+static_assert(offsetof(struct tcp_info, tcpi_last_data_sent) == TCPI_LAST_DATA_SENT_AT, "tcpi_last_data_sent is at 44");
+
+uint32_t u32_at(const unsigned char* ti, size_t at)
+{
+    uint32_t v = 0;
+    std::memcpy(&v, ti + at, sizeof(v));
+    return v;
+}
 }
 
 send_look look_at_send(int fd)
 {
     send_look l;
-    unsigned char ti[TCPI_LAST_DATA_SENT_AT + sizeof(uint32_t)]{};
+    unsigned char ti[TCPI_NOTSENT_BYTES_AT + sizeof(uint32_t)]{};
     socklen_t     n = sizeof(ti);
-    if (::getsockopt(fd, IPPROTO_TCP, TCP_INFO, ti, &n) < 0 || n < sizeof(ti))
+    if (::getsockopt(fd, IPPROTO_TCP, TCP_INFO, ti, &n) < 0 || n < TCPI_LAST_DATA_SENT_AT + sizeof(uint32_t))
         return l;
-    int owed = 0;
-    if (::ioctl(fd, SIOCOUTQ, &owed) < 0)
-        return l;
-    l.tcp   = true;
-    l.owed  = owed > 0 ? static_cast<uint32_t>(owed) : 0;
-    l.state = ti[TCPI_STATE_AT];
-    std::memcpy(&l.idle_ms, ti + TCPI_LAST_DATA_SENT_AT, sizeof(l.idle_ms));
+    l.tcp     = true;
+    l.state   = ti[TCPI_STATE_AT];
+    l.idle_ms = u32_at(ti, TCPI_LAST_DATA_SENT_AT);
+    // Segments in flight and bytes not yet sent, in one call; a kernel too old to say the second is asked the queue.
+    if (n >= sizeof(ti))
+        l.owed = u32_at(ti, TCPI_UNACKED_AT) + u32_at(ti, TCPI_NOTSENT_BYTES_AT);
+    else if (int q = 0; ::ioctl(fd, SIOCOUTQ, &q) == 0)
+        l.owed = q > 0 ? static_cast<uint32_t>(q) : 0;
+    else
+        l.tcp = false;
     return l;
 }
 
 bool send_stalled(int fd, std::chrono::milliseconds bound)
 {
-    int owed = 0;
-    // The cheap question first, since a connection with nothing owed is most of those asked.
-    if (fd < 0 || ::ioctl(fd, SIOCOUTQ, &owed) < 0 || owed <= 0)
-        return false;
-    return send_stalled(look_at_send(fd), bound);
+    return fd >= 0 && send_stalled(look_at_send(fd), bound);
 }
 
 bool peer_has_closed(uint8_t s)
@@ -117,6 +125,15 @@ bool orderly_close::advance(entry& e)
         break;
     }
     e.input_left = !drained;
+
+    // The peer has closed and all it sent is read, so nothing can arrive for the close to answer with a reset, and
+    // the close sends the FIN itself; under kernel TLS a close still throws away what the kernel holds.
+    if (drained && eof && !e.kernel_tls)
+    {
+        ::close(e.fd);
+        e.fd = -1;
+        return true;
+    }
 
     if (!e.write_shut)
     {
