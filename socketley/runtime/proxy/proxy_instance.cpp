@@ -8393,6 +8393,10 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                         bslot.backend->client_fd = -1;
                 }
 
+                // Closing from here on, for a caller up the stack still holding it: a hook's close_client() ends the
+                // pair inside the completion that ran the hook, and a read armed after on this struct holds the
+                // number's close open, so its client is never told the end.
+                conn->closing = true;
                 close_client_fd(conn, client_fd);
                 m_conn_idx[client_fd] = {};
                 if (m_client_slots[client_fd])
