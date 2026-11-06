@@ -134,6 +134,15 @@ if command -v redis-cli >/dev/null 2>&1; then
           | timeout 3 nc -q1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' | tr '\n' '|')
     eq "RESP: QUIT is answered and then closes" "$RAW" "+PONG|+OK|"
 
+    # And nothing pipelined after it runs, as in Redis: the PING and SET behind the QUIT in the same write were
+    # answered and applied, the SET's key there for the next client to read.
+    RAW=$(printf '*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nQUIT\r\n*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$8\r\nafterqui\r\n$1\r\n1\r\n' \
+          | timeout 3 nc -q1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' | tr '\n' '|')
+    eq "RESP: what is pipelined behind QUIT is not answered" "$RAW" "+PONG|+OK|"
+    RAW=$(printf '*2\r\n$6\r\nEXISTS\r\n$8\r\nafterqui\r\n*1\r\n$4\r\nQUIT\r\n' \
+          | timeout 3 nc -q1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' | tr '\n' '|')
+    eq "RESP: nor run" "$RAW" ":0|+OK|"
+
     # ── A LONG COMMAND SURVIVES BEING QUEUED ────────────────────────────────
     #
     # EXEC re-parses each queued command, and that re-parse kept a 64-argument

@@ -2347,7 +2347,7 @@ bool cache_instance::parse_text_lines(client_connection* conn)
         // And the same one it makes for a connection already closing, for the
         // same reason: nothing after this point can be delivered, and answering
         // it anyway is memory spent on a socket that is going away.
-        if (SOCKETLEY_UNLIKELY(conn->closing))
+        if (SOCKETLEY_UNLIKELY(conn->closing || conn->quit_after_flush))
             break;
 
         std::string_view line(conn->partial.data() + scan_from, pos - scan_from);
@@ -9086,6 +9086,9 @@ bool cache_instance::process_resp(client_connection* conn)
         // worker peaked at 1,063 MB, for a bound of 8 MiB it had already decided
         // to enforce.
         if (SOCKETLEY_UNLIKELY(conn->closing))
+            break;
+        // Nor does one that asked to QUIT, as Redis stops there: what it pipelined after is neither run nor answered.
+        if (SOCKETLEY_UNLIKELY(conn->quit_after_flush))
             break;
 
         // Anything the lookahead cannot hold -- a long command, an incomplete
