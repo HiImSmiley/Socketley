@@ -4,6 +4,7 @@
 #include "turn_clock.h"
 #include "../util/number_parse.h"
 #include "../util/settings.h"
+#include "../net/orderly_close.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -33,11 +34,17 @@ event_loop::~event_loop()
 {
     shutdown_ring();
 
+    // After the ring, which can then deliver none of its timers.
+    delete m_closer;
+    m_closer = nullptr;
+
     if (m_eventfd >= 0) close(m_eventfd);
 
     free(m_fd_armed);
     free(m_fd_cancels);
     free(m_fd_close_deferred);
+    free(m_fd_orderly);
+    free(m_fd_orderly_ktls);
 }
 
 void event_loop::shutdown_ring()
@@ -109,6 +116,11 @@ void event_loop::shutdown_ring()
             if ((m_fd_close_deferred[fd >> 6] >> (fd & 63)) & 1u)
             {
                 m_fd_close_deferred[fd >> 6] &= ~(1ULL << (fd & 63));
+                if (m_fd_orderly)
+                {
+                    m_fd_orderly[fd >> 6]      &= ~(1ULL << (fd & 63));
+                    m_fd_orderly_ktls[fd >> 6] &= ~(1ULL << (fd & 63));
+                }
                 close(static_cast<int>(fd));
             }
         }
@@ -623,7 +635,49 @@ void event_loop::settle_deferred(uint32_t target)
     m_fd_close_deferred[w] &= ~(1ULL << bit);
     if (m_fd_close_pending > 0)
         --m_fd_close_pending;
-    close(static_cast<int>(target));
+    release_number(static_cast<int>(target));
+}
+
+void event_loop::release_number(int fd)
+{
+    if (m_fd_orderly && fd_tracked(fd))
+    {
+        const uint32_t w = static_cast<uint32_t>(fd) >> 6;
+        const uint64_t b = 1ULL << (static_cast<uint32_t>(fd) & 63);
+        if (m_fd_orderly[w] & b)
+        {
+            const bool ktls = (m_fd_orderly_ktls[w] & b) != 0;
+            m_fd_orderly[w]      &= ~b;
+            m_fd_orderly_ktls[w] &= ~b;
+            if (!m_closer)
+                m_closer = new socketley::orderly_close(*this);
+            m_closer->take(fd, ktls);
+            return;
+        }
+    }
+    close(fd);
+}
+
+void event_loop::close_fd_orderly(int fd, bool kernel_tls)
+{
+    if (fd < 0)
+        return;
+    // Untracked, the number is not held for the ring either, and goes over at once.
+    if (!m_ring_open || !fd_tracked(fd) || !m_fd_armed || !m_fd_orderly)
+    {
+        if (!m_closer)
+            m_closer = new socketley::orderly_close(*this);
+        m_closer->take(fd, kernel_tls);
+        return;
+    }
+    const uint32_t w = static_cast<uint32_t>(fd) >> 6;
+    const uint64_t b = 1ULL << (static_cast<uint32_t>(fd) & 63);
+    m_fd_orderly[w] |= b;
+    if (kernel_tls)
+        m_fd_orderly_ktls[w] |= b;
+    else
+        m_fd_orderly_ktls[w] &= ~b;
+    close_fd(fd);
 }
 
 void event_loop::close_fd(int fd)
@@ -659,7 +713,7 @@ void event_loop::close_fd(int fd)
     {
         // The common case by a wide margin: the caller closes a descriptor it
         // has already seen every completion for.
-        close(fd);
+        release_number(fd);
         return;
     }
 
@@ -886,12 +940,16 @@ bool event_loop::init_fd_tables()
     m_fd_armed          = static_cast<uint16_t*>(calloc(n, sizeof(uint16_t)));
     m_fd_cancels        = static_cast<uint16_t*>(calloc(n, sizeof(uint16_t)));
     m_fd_close_deferred = static_cast<uint64_t*>(calloc(words, sizeof(uint64_t)));
+    m_fd_orderly        = static_cast<uint64_t*>(calloc(words, sizeof(uint64_t)));
+    m_fd_orderly_ktls   = static_cast<uint64_t*>(calloc(words, sizeof(uint64_t)));
 
-    if (!m_fd_armed || !m_fd_cancels || !m_fd_close_deferred)
+    if (!m_fd_armed || !m_fd_cancels || !m_fd_close_deferred || !m_fd_orderly || !m_fd_orderly_ktls)
     {
         free(m_fd_armed);          m_fd_armed = nullptr;
         free(m_fd_cancels);        m_fd_cancels = nullptr;
         free(m_fd_close_deferred); m_fd_close_deferred = nullptr;
+        free(m_fd_orderly);        m_fd_orderly = nullptr;
+        free(m_fd_orderly_ktls);   m_fd_orderly_ktls = nullptr;
         m_fd_table_size = 0;
         return false;
     }

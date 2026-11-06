@@ -456,10 +456,11 @@ void conn_server::close_conn(const std::shared_ptr<server_conn>& c)
         return;
     c->dead = true;
     m_hooks.closing(c);
+    // Not shut down here: with our FIN out and the read side shut, a byte the client still sends resets the
+    // connection and throws away what the kernel has not delivered of the answer, which orderly_close keeps.
     if (c->fd >= 0)
     {
-        ::shutdown(c->fd, SHUT_RDWR);
-        m_loop.close_fd(c->fd);
+        m_loop.close_fd_orderly(c->fd);
         c->fd = -1;
     }
     m_conns.erase(c->id);

@@ -154,6 +154,8 @@ struct client_connection
     // and what the client is still sending is read and discarded until its own
     // EOF, so the close does not reset the answer out of its receive queue.
     bool wr_shutdown{false};
+    // The answer that ends it has left and its read is being withdrawn, the close being orderly_close's.
+    bool read_withdrawn{false};
     size_t drained_bytes{0};
 
     // RESP protocol mode (auto-detected or forced)
@@ -282,6 +284,7 @@ struct client_connection
         read_paused = false;
         peer_gone = false;
         wr_shutdown = false;
+        read_withdrawn = false;
         drained_bytes = 0;
         resp_mode = false;
         resp_detected = false;
@@ -1256,9 +1259,10 @@ private:
     void tls_close_when_read_is_all(client_connection* conn, int fd);
     // A closing TLS connection's close_notify, sent ahead of its FIN once nothing else is owed; true while its write is.
     bool tls_say_close(client_connection* conn);
-    // A closing cleartext connection whose answer has left sends its FIN and
-    // keeps reading, so the close waits for the client's EOF.
+    // A closing cleartext connection whose answer has left has its read withdrawn, and the close that follows is
+    // orderly_close's: its FIN, the client's input read away, and no reset that takes the answer with it.
     void drain_before_close(client_connection* conn, int fd);
+    void withdraw_read_for_close(client_connection* conn, int fd);
     // How much a draining connection may still send before it is closed anyway.
     static constexpr size_t DRAIN_LIMIT_BYTES = 64 * 1024 * 1024;
 

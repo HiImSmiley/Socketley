@@ -11,7 +11,8 @@
 #     on the record rather than reading an end
 #   * a close_notify after a backend that reset mid-answer, which vouches for an answer cut short as whole
 #   * a FIN or a close sent while the kernel still holds TLS records it took on a full socket, which throws them away:
-#     a client that did not read for a moment gets the proxy's file cut at a record's edge and no close_notify
+#     a client that did not read for a moment gets the file cut at a record's edge and no close_notify, from the
+#     proxy, the server or storage
 #   * an IMAP reply still in the COMPRESS deflate buffer when the connection settles, as the idle sweep's BYE is: the
 #     connection closed with neither the BYE nor close_notify
 #   * a session thrown away because the server closed: under --shards 4 a client that lets the server close never
@@ -312,6 +313,7 @@ if [ -r /proc/net/tls_stat ]; then
 
     curl -sk -X PUT "https://127.0.0.1:$P_ST/bkt" >/dev/null
     curl -sk -T "$T/www/big.bin" "https://127.0.0.1:$P_ST/bkt/big.bin" >/dev/null
+    for n in $STALL_SIZES; do curl -sk -T "$T/www/f$n" "https://127.0.0.1:$P_ST/bkt/f$n" >/dev/null; done
     t0=$(tx)
     r=$(client http "$P_ST" /bkt/big.bin)
     t1=$(tx)
@@ -326,6 +328,14 @@ if [ -r /proc/net/tls_stat ]; then
     # shellcheck disable=SC2086
     r=$(client stalled "$P_FC" /f fc.test $STALL_SIZES)
     check "proxy (--root): 48 files of 2.2-2.5 MB to clients that paused, each whole and then close_notify" \
+        "${r%% *}" "48"
+    # shellcheck disable=SC2086
+    r=$(client stalled "$P_SRV" /f localhost $STALL_SIZES)
+    check "server (--http): 48 files of 2.2-2.5 MB to clients that paused, each whole and then close_notify" \
+        "${r%% *}" "48"
+    # shellcheck disable=SC2086
+    r=$(client stalled "$P_ST" /bkt/f localhost $STALL_SIZES)
+    check "storage: 48 objects of 2.2-2.5 MB to clients that paused, each whole and then close_notify" \
         "${r%% *}" "48"
 else
     echo "  (no kernel TLS here: the kernel-encrypted close is not checked)"

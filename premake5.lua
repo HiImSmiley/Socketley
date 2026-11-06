@@ -773,7 +773,7 @@ project "test_request_channel"
 
     files { "test/unit/test_request_channel.cpp",
             "socketley/shared/ipc/request_channel.cpp",
-            "socketley/shared/loop/event_loop.cpp" }
+            "socketley/shared/loop/event_loop.cpp", "socketley/shared/net/orderly_close.cpp" }
 
     links { "uring:static" }
 
@@ -1843,7 +1843,8 @@ project "fuzz_event_loop"
         "test/fuzz/fuzz_event_loop.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/shared/loop/event_loop.cpp"
+        "socketley/shared/loop/event_loop.cpp",
+        "socketley/shared/net/orderly_close.cpp"
     }
 
     fuzz_target_settings()
@@ -3163,7 +3164,7 @@ project "test_idp"
     links { "crypto", "dl", "uring:static" }
 
     files { "test/unit/test_idp.cpp", "socketley/runtime/idp/idp_logic.cpp", "socketley/runtime/idp/idp_accounts.cpp",
-            "socketley/shared/loop/event_loop.cpp", "socketley/shared/loop/file_io.cpp",
+            "socketley/shared/loop/event_loop.cpp", "socketley/shared/net/orderly_close.cpp", "socketley/shared/loop/file_io.cpp",
             "socketley/runtime/idp/idp_shard.cpp", "socketley/runtime/idp/idp_ssh_certs.cpp", "socketley/shared/crypto/jws.cpp",
             "socketley/shared/crypto/key_file.cpp", "socketley/shared/crypto/ssh_cert.cpp", "socketley/shared/crypto/ed25519.cpp",
             "socketley/shared/persist/paths.cpp", "socketley/shared/util/base64.cpp" }

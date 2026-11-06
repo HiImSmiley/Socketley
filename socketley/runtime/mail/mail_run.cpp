@@ -1751,10 +1751,11 @@ void mail_run::close_conn(conn& c)
         m_spool.abort(c.writer);
         c.writer = 0;
     }
+    // Not shut down here: with our FIN out and the read side shut, a byte the client still sends resets the
+    // connection and throws away what the kernel has not delivered of the answer, which orderly_close keeps.
     if (c.fd >= 0)
     {
-        ::shutdown(c.fd, SHUT_RDWR);
-        m_loop.close_fd(c.fd);
+        m_loop.close_fd_orderly(c.fd);
         c.fd = -1;
     }
     if (c.ssl)
@@ -1806,6 +1807,12 @@ void mail_run::settle()
                 // Its client read none of it in the grace: the connection is reset, not left draining for it.
                 const linger now_reset{1, 0};
                 if (c->fd >= 0 && ::setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &now_reset, sizeof now_reset) < 0) {}
+                // Closed here and not by orderly_close, which would wait on the client this gave up on.
+                if (c->fd >= 0)
+                {
+                    m_loop.close_fd(c->fd);
+                    c->fd = -1;
+                }
                 close_conn(*c);
             }
         }

@@ -13,6 +13,8 @@
 #include "event_loop_definitions.h"
 #include "op_timing.h"
 
+namespace socketley { class orderly_close; }
+
 struct buf_ring_pool
 {
     struct io_uring_buf_ring* ring{nullptr};
@@ -141,6 +143,13 @@ public:
     // reported, because close() frees the number and the next accept redirects
     // those operations onto a stranger.
     void close_fd(int fd);
+
+    // The same for a connection whose answer is written: once the ring is done with it the number goes to
+    // orderly_close, which closes it without the kernel throwing away what it still holds of that answer.
+    // `kernel_tls` when the kernel encrypts its records.
+    void close_fd_orderly(int fd, bool kernel_tls = false);
+    // The ends being closed that way, null before the first.
+    const socketley::orderly_close* closer() const { return m_closer; }
 
     // Operations still in the ring that named this descriptor, which is the
     // condition for giving the number away without closing it, and
@@ -417,6 +426,8 @@ private:
     void target_unref(uint32_t target);
     // Perform a close or a slot release that was waiting on the count.
     void settle_deferred(uint32_t target);
+    // The number given back: closed, or handed to orderly_close when close_fd_orderly() asked for it.
+    void release_number(int fd);
 
     bool fd_tracked(int fd) const
     { return fd >= 0 && static_cast<uint32_t>(fd) < m_fd_table_size; }
@@ -485,6 +496,10 @@ private:
     uint16_t* m_fd_armed{nullptr};
     uint16_t* m_fd_cancels{nullptr};
     uint64_t* m_fd_close_deferred{nullptr};
+    // Whether a held number's close goes to orderly_close, and with kernel TLS.
+    uint64_t* m_fd_orderly{nullptr};
+    uint64_t* m_fd_orderly_ktls{nullptr};
+    socketley::orderly_close* m_closer{nullptr};
     uint32_t  m_fd_table_size{0};
     // Descriptors held open only because the ring still names them, reported
     // at shutdown because a number that never drains is otherwise invisible.

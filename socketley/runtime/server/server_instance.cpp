@@ -342,6 +342,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->wr_shutdown = false;
     conn->drain_on_close = false;
     conn->drained_bytes = 0;
+    conn->end_handed = false;
 
     SKL_INV_POOLABLE("server::pool_release", conn->fd,
         conn_ops_pending(conn.get()),
@@ -409,7 +410,12 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
     // close, so the socket is shut first: the poll then answers at once and the struct is not held for a silent peer.
     if (SOCKETLEY_UNLIKELY(conn->splice_sendfile && conn->splice_out_pending) && fd >= 0)
         ::shutdown(fd, SHUT_RDWR);
-    close_tracked(fd);
+    // What the client is owed and the kernel still holds goes out before the FIN, and none of it is reset away.
+    if (SOCKETLEY_LIKELY(m_ring_loop != nullptr) && fd >= 0)
+        m_ring_loop->close_fd_orderly(fd, conn->ssl != nullptr && tls_context::close_notify_queued(conn->ssl) &&
+                                              tls_context::kernel_sends(conn->ssl));
+    else
+        close_tracked(fd);
 
     // The file a response is served out of is this connection's and a retired
     // struct never reaches pool_release(), so it is closed here -- while
@@ -6597,6 +6603,17 @@ void server_instance::maybe_shutdown_write(server_connection* conn)
         tls_flush(conn);
         if (conn_has_output(conn) || conn->write_pending || conn->tls_wait_pending)
             return;
+    }
+
+    // Under kernel TLS a FIN throws away the records the kernel took on a full socket, so the end is orderly_close's,
+    // which sends it once they are out: the read is withdrawn, and its completion closes the connection.
+    if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr) && tls_context::close_notify_queued(conn->ssl) &&
+        tls_context::kernel_sends(conn->ssl))
+    {
+        if (!conn->end_handed && conn->read_pending && m_loop && !m_loop->submit_cancel_request(&conn->read_req))
+            return;
+        conn->end_handed = true;
+        return;
     }
 
     // A read is what drains whatever the peer is still sending after our FIN;

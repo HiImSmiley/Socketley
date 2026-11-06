@@ -405,7 +405,13 @@ void cache_instance::close_client([[maybe_unused]] client_connection* conn, int 
     // number the kernel reissued.
     detach_follower(fd);
     SKL_TRACE_CLOSE(conn, fd, reason);
-    close_tracked(fd);
+    // Through orderly_close, so the close resets none of the answer away -- except a copy a sibling may hold, whose
+    // socket a shutdown here would end for the sibling too.
+    event_loop* lp = m_loop ? m_loop : m_retired_loop;
+    if (conn && fd >= 0 && lp && conn->ho_state != client_connection::handoff::sent)
+        lp->close_fd_orderly(fd);
+    else
+        close_tracked(fd);
     if (fd >= 0 && fd < MAX_FDS) m_conn_idx[fd] = nullptr;
     auto it = m_clients.find(fd);
     if (it != m_clients.end())
@@ -2126,7 +2132,7 @@ void cache_instance::tls_close_when_read_is_all(client_connection* conn, int fd)
     if (fd < 0 || tls_say_close(conn))
         return;
 
-    shutdown(fd, SHUT_RDWR);
+    withdraw_read_for_close(conn, fd);
 }
 
 bool cache_instance::tls_say_close(client_connection* conn)
@@ -2139,12 +2145,25 @@ bool cache_instance::tls_say_close(client_connection* conn)
 
 void cache_instance::drain_before_close(client_connection* conn, int fd)
 {
-    if (!conn->closing || conn->ssl != nullptr || conn->wr_shutdown || fd < 0)
+    if (!conn->closing || conn->ssl != nullptr || fd < 0)
         return;
     if (conn->write_pending || conn_has_output(conn) || !conn->read_pending)
         return;
-    conn->wr_shutdown = true;
-    if (shutdown(fd, SHUT_WR) < 0) {}
+    withdraw_read_for_close(conn, fd);
+}
+
+// Withdrawn rather than ended by shutdown(SHUT_RD): with that and the FIN out, a byte the client still sends makes the
+// kernel reset the connection and throw away what it has not delivered of the answer.
+void cache_instance::withdraw_read_for_close(client_connection* conn, int fd)
+{
+    if (conn->read_withdrawn || !conn->read_pending)
+        return;
+    if (m_loop && m_loop->submit_cancel_request(&conn->read_req))
+    {
+        conn->read_withdrawn = true;
+        return;
+    }
+    shutdown(fd, SHUT_RD);
 }
 
 bool cache_instance::conn_has_output(const client_connection* conn) const
@@ -2529,6 +2548,13 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 close_client(conn, fd, "drain-limit");
             return;
         }
+        // A withdrawn read is not armed again: the close it was withdrawn for is next.
+        if (!conn->read_pending && conn->read_withdrawn)
+        {
+            if (!conn->write_pending)
+                close_client(conn, fd, "closing-read-withdrawn");
+            return;
+        }
         if (!conn->read_pending && m_loop &&
             SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd)))
         {
@@ -2665,7 +2691,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     // Kept reading, for drain_before_close(); a refused read falls through to
     // the close below as it always did.
-    if (conn->closing && conn->ssl == nullptr && !conn->read_pending && !conn->read_paused &&
+    if (conn->closing && conn->ssl == nullptr && !conn->read_pending && !conn->read_paused && !conn->read_withdrawn &&
         m_loop && conn->drained_bytes <= DRAIN_LIMIT_BYTES)
         submit_client_read(conn, fd);
 

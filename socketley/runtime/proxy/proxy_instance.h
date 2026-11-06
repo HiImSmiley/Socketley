@@ -372,11 +372,6 @@ struct alignas(64) proxy_client_connection
     int fcgi_sock_flags{-1};
     // A wait for room for a record of its own type, which kernel TLS sends with its type and the socket was full for.
     bool tls_wait{false};
-    // Its end under kernel TLS held until the socket's queue empties (kernel_end_check), and once let go, not again.
-    bool kernel_end_armed{false};
-    bool kernel_end_done{false};
-    int  kernel_end_outq{-1};
-    std::chrono::steady_clock::time_point kernel_end_moved{};
 
     // Bumped on every reuse from the pool and stamped into io_requests, so
     // late completions from the previous occupant can be recognised and
@@ -953,10 +948,10 @@ private:
     // inherits the assertion instead of having to remember it.
     enum class close_reason { normal, force };
     void shutdown_client_write(proxy_client_connection* conn);
-    bool kernel_tls_end_waits(proxy_client_connection* conn, close_reason reason);
-    void kernel_end_check(int fd, uint32_t gen, std::chrono::milliseconds wait);
-    // How long a held end waits on a socket queue that does not move: its client has stopped reading.
-    static constexpr auto kernel_end_stall = std::chrono::seconds(10);
+    // Its close_notify queued and the kernel encrypting: its FIN is orderly_close's to send.
+    static bool kernel_sends_end(const proxy_client_connection* conn);
+    void end_client_read(proxy_client_connection* conn);
+    void close_client_fd(proxy_client_connection* conn, int fd);
     bool continue_drain(proxy_client_connection* conn, int fd, size_t bytes);
     void close_pair(int client_fd, int backend_fd,
                     close_reason reason = close_reason::normal);

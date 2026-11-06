@@ -3710,6 +3710,18 @@ quiet but alive, and keepalive leaves it alone; only
 .B \-\-idle\-timeout
 closes it. A unix listener does not get keepalive, because its peer cannot
 disappear silently.
+.IP
+A connection a runtime ends after its answer (an HTTP
+.BR "Connection: close" ,
+a cache
+.BR QUIT ,
+an MQTT
+.BR DISCONNECT )
+is closed only once its client has acknowledged all of that answer or closed
+its own side. What the client sends meanwhile is read and dropped, since a close
+with bytes unread makes the kernel reset the connection and throw away what it
+has not yet delivered. A client that takes nothing for ten seconds is closed
+then.
 .TP
 .BI "\-\-congestion " name
 The TCP congestion control algorithm for connections that a server, proxy,
@@ -3878,7 +3890,7 @@ A connection the runtime closes itself ends with a
 .B close_notify
 before its FIN, so the client reads an end rather than a truncation and keeps
 its session for the next connection.
-When the kernel encrypts (a large file over TLS 1.3), a proxy holds that FIN
+When the kernel encrypts (a large file over TLS 1.3), the runtime holds that FIN
 until the socket has passed on everything the kernel took, since a FIN sent
 earlier throws the rest away; a client that stops reading is given ten seconds.
 .PP

@@ -30,7 +30,6 @@
 #include <netdb.h>
 #include <poll.h>
 #include <sys/ioctl.h>
-#include <linux/sockios.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/tcp.h>
@@ -289,9 +288,6 @@ void proxy_client_connection::reset(int new_fd)
     file.reset();
     fcgi_sock_flags = -1;
     tls_wait = false;
-    kernel_end_armed = false;
-    kernel_end_done = false;
-    kernel_end_outq = -1;
     // client_pool_release() already did this, repeated because a struct
     // leaving the pool must not carry the previous connection's session.
     tls_context::free_ssl(ssl);
@@ -8032,67 +8028,48 @@ void proxy_instance::shutdown_client_write(proxy_client_connection* conn)
         (!flush_client_write_queue(conn) || conn->write_pending || tls_owes_output(conn)))
         return;
 
-    if (!conn->read_pending || kernel_tls_end_waits(conn, close_reason::normal))
+    if (!conn->read_pending)
         return;
+
+    // Under kernel TLS a FIN throws away the records the kernel took on a full socket, so the end is orderly_close's,
+    // which sends it once they are out: the read is withdrawn, and its completion closes the pair.
+    if (kernel_sends_end(conn))
+    {
+        end_client_read(conn);
+        return;
+    }
 
     conn->wr_shutdown = true;
     if (shutdown(conn->fd, SHUT_WR) < 0) {}
 }
 
-// The kernel takes records on a full socket and sends them once it has room, and a FIN or a close throws away what it
-// still holds, so a connection whose end it carries waits for its socket's queue to empty or its client to close.
-bool proxy_instance::kernel_tls_end_waits(proxy_client_connection* conn, close_reason reason)
+bool proxy_instance::kernel_sends_end(const proxy_client_connection* conn)
 {
-    if (reason != close_reason::normal || conn->ssl == nullptr || !conn->read_pending || conn->kernel_end_done ||
-        !tls_context::close_notify_queued(conn->ssl) || !tls_context::kernel_sends(conn->ssl) || !m_files)
-        return false;
-    if (!conn->kernel_end_armed)
-    {
-        conn->kernel_end_armed = true;
-        conn->kernel_end_outq  = -1;
-        conn->kernel_end_moved = std::chrono::steady_clock::now();
-        kernel_end_check(conn->fd, conn->generation, std::chrono::milliseconds(10));
-    }
-    return conn->kernel_end_armed;
+    return conn->ssl != nullptr && tls_context::close_notify_queued(conn->ssl) && tls_context::kernel_sends(conn->ssl);
 }
 
-// The held end is let go once the socket's queue is empty, everything the kernel took having reached the client, or
-// once it has not moved for kernel_end_stall; it then ends as any other, through close_pair.
-void proxy_instance::kernel_end_check(int fd, uint32_t gen, std::chrono::milliseconds wait)
+// A read ended by withdrawing it, not by shutdown(SHUT_RD): with that and our FIN out, a byte the client still sends
+// makes the kernel reset the connection and throw away what it has not delivered of the answer.
+void proxy_instance::end_client_read(proxy_client_connection* conn)
 {
-    const bool armed = m_files->io.after(wait, [this, fd, gen, wait](int64_t)
+    if (!conn->read_pending || conn->recv_withdrawing || !m_loop)
+        return;
+    if (m_loop->submit_cancel_request(&conn->read_req))
+        conn->recv_withdrawing = true;
+    else
+        shutdown(conn->fd, SHUT_RD);
+}
+
+// The client's descriptor given back through orderly_close, so the kernel keeps none of its answer back.
+void proxy_instance::close_client_fd(proxy_client_connection* conn, int fd)
+{
+    event_loop* lp = m_loop ? m_loop : m_retired_loop;
+    if (lp == nullptr)
     {
-        if (!m_loop || fd < 0 || fd >= MAX_FDS || m_conn_idx[fd].side != conn_client)
-            return;
-        proxy_client_connection* c = m_conn_idx[fd].client;
-        if (c->generation != gen || c->kernel_end_done)
-            return;
-        // The client closed first, and its read's completion has ended the connection or will.
-        if (!c->read_pending)
-            return;
-        int outq = 0;
-        const bool known = ::ioctl(fd, SIOCOUTQ, &outq) == 0;
-        const auto now = std::chrono::steady_clock::now();
-        if (known && outq != c->kernel_end_outq)
-        {
-            c->kernel_end_outq  = outq;
-            c->kernel_end_moved = now;
-        }
-        if (known && outq > 0 && now - c->kernel_end_moved < kernel_end_stall)
-        {
-            kernel_end_check(fd, gen, std::min(wait * 2, std::chrono::milliseconds(1000)));
-            return;
-        }
-        c->kernel_end_done = true;
-        close_pair(fd, c->ex.backend_fd);
-    });
-    // No timer to be had, so the end is not held.
-    if (!armed && fd >= 0 && fd < MAX_FDS && m_conn_idx[fd].side == conn_client &&
-        m_conn_idx[fd].client->generation == gen)
-    {
-        m_conn_idx[fd].client->kernel_end_armed = false;
-        m_conn_idx[fd].client->kernel_end_done  = true;
+        close_tracked(fd);
+        return;
     }
+    lp->close_fd_orderly(fd, kernel_sends_end(conn));
 }
 
 void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reason)
@@ -8300,10 +8277,10 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     (!conn->write_queue.empty() || tls_owes_output(conn)) &&
                     !flush_client_write_queue(conn))
                     defer_c = false;
-                else if (!kernel_tls_end_waits(conn, reason))
+                else
                 {
                     if (!conn->ex.drain_on_close || reason == close_reason::force)
-                        shutdown(client_fd, SHUT_RD);
+                        end_client_read(conn);
                     if (!peer_splicing_into_client)
                         shutdown_client_write(conn);
                 }
@@ -8381,8 +8358,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                         bslot.backend->client_fd = -1;
                 }
 
-                shutdown(client_fd, SHUT_RDWR);
-                close_tracked(client_fd);
+                close_client_fd(conn, client_fd);
                 m_conn_idx[client_fd] = {};
                 if (m_client_slots[client_fd])
                 {

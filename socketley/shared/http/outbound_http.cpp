@@ -999,6 +999,8 @@ void http_peer::finish(bool answered, std::string why)
 
 void http_peer::close_socket()
 {
+    // A body the kernel encrypted can still be in its hands, which a FIN now would throw away.
+    const bool kernel_tls = m_ssl && tls_context::kernel_sends(m_ssl);
     if (m_ssl)
     {
         // Kept, from a finished handshake only, so the next dial past keep_idle_secs resumes rather than starting over.
@@ -1009,7 +1011,7 @@ void http_peer::close_socket()
     }
     if (m_fd >= 0)
     {
-        m_loop.close_fd(m_fd);
+        m_loop.close_fd_orderly(m_fd, kernel_tls);
         m_fd = -1;
     }
 }
