@@ -7179,6 +7179,15 @@ Only the returned
 .I count
 is this shard's alone: the other shards report back on a later turn, and this
 call returns on the turn it was made.
+.IP
+Every shard, like the one worker of an unsharded cache, is started with its own
+.B GLIBC_TUNABLES
+of
+.BR glibc.malloc.hugetlb=1 ,
+appended to any the operator set (a value the operator gave that tunable is
+kept, and
+.B SOCKETLEY_HUGEPAGE=0
+adds nothing).
 .TP
 .B \-\-public
 Lets the cache serve peers on other machines.
@@ -19742,6 +19751,12 @@ under
 .TP
 .B on_send(msg)
 Called when a message is sent.
+Under
+.BR \-\-shards ,
+it is called on each shard that sends the message to its own clients, so a
+broadcast that reaches the siblings, like a
+.B send
+from the command line, calls it once per shard.
 .TP
 .B on_route(method, path, backend_path)
 Chooses the backend for a request by returning its index (0-based).
