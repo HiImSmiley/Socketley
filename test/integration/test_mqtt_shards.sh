@@ -7,8 +7,9 @@
 #   * a message published on one shard missing the subscribers on another, or reaching one twice
 #   * a retained message kept only by the shard it was published on
 #   * a session that does not follow its client to another shard, or two shards both holding it
-#   * one too large for the daemon's frames lost on the way when there is no mesh, rather than kept where it was;
-#     one of 6 MB, which the daemon's frames hold, lost because the daemon held its answers to 4 MiB
+#   * one too large for the daemon's frames, when there is no mesh, lost on the way or kept on its shard with its
+#     client refused elsewhere, rather than carried in pieces to whichever shard the client lands on; one of 6 MB,
+#     which the daemon's frames hold, lost because the daemon held its answers to 4 MiB
 #   * with no mesh, a message past the daemon's frames taking its publisher's shard down rather than refused as too
 #     large; one past 4 MiB never reaching the other shard; one its shared groups make too large holding every message
 #     after it to that shard
@@ -699,33 +700,26 @@ if phase == "relayed":
             if [s.get("queued") for s in sessions() if s["client"] == "heavy"] == [40]:
                 break
             time.sleep(0.1)
-        # A connection landing on another shard is told to come back, and one landing on the session's own is closed
-        # before it reads, which leaves the messages in the session.
-        elsewhere = None
+        # Every connection is let in wherever it lands; one on the session's own shard is closed before it reads,
+        # which leaves the messages in the session, and the first elsewhere takes it over in pieces.
+        codes, moved = [], None
         for _ in range(30):
             c = Client(port, timeout=30)
             present, code, _ = c.connect("heavy", clean=False, props={SESSION_EXPIRY: 600})
-            if code != 0 or shard_of("heavy") != first:
-                elsewhere = (present, code)
-                c.close()
-                break
-            c.close()
-            time.sleep(0.2)
-        check("a session of 10 MB the daemon cannot carry is not moved, and the client is told to come back",
-              elsewhere, (False, 0x88))
-        held = [s["shard"] for s in sessions() if s["client"] == "heavy"]
-        check("the session stays on its own shard", held, [first])
-        whole = None
-        for _ in range(60):
-            c = Client(port, timeout=30)
-            present, code, _ = c.connect("heavy", clean=False, props={SESSION_EXPIRY: 600})
-            if code == 0:
-                whole = (present, shard_of("heavy") == first,
-                         len({m.payload[:4] for m in c.messages(40, 30) if m.payload == body(int(m.payload[:4]))}))
+            codes.append((present, code))
+            if code == 0 and shard_of("heavy") != first:
+                got = [m.payload for m in c.messages(40, 30)]
+                moved = ([g[:4] for g in got if g == body(int(g[:4]))], c.quiet(1.0))
                 c.disconnect()
                 break
             c.close()
-        check("and its client finds it there with its forty queued messages of 250 KB", whole, (True, True, 40))
+            time.sleep(0.2)
+        check("a session of 10 MB the daemon cannot carry in one answer lets its client in on any shard",
+              set(codes), {(True, 0)})
+        check("and its client gets every one of its forty queued messages of 250 KB once, in order, on another shard",
+              moved, ([b"%04d" % i for i in range(40)], True))
+        held = [s["shard"] for s in sessions() if s["client"] == "heavy"]
+        truth("the session is on the shard its client went to", len(held) == 1 and held[0] != first, (first, held))
     guarded("heavy", heavy)
 
 # With no mesh and --max-packet 16M: a packet is held to what crosses through the daemon, 8 MiB less a margin.
@@ -869,8 +863,8 @@ for _ in $(seq 1 50); do
 done
 tally < <(run relayed)
 sleep 1.5
-kept=$("$BIN" stats sh 2>&1 | awk -F: '$1=="sessions_kept"{s+=$2} END{print s+0}')
-[ "$kept" -ge 1 ] && ok || bad "stats count the session kept" "sessions_kept $kept"
+pieced=$("$BIN" stats sh 2>&1 | awk -F: '$1=="sessions_pieced"{s+=$2} END{print s+0}')
+[ "$pieced" -ge 1 ] && ok || bad "stats count the session carried in pieces" "sessions_pieced $pieced"
 "$BIN" remove sh >/dev/null 2>&1
 "$BIN" create mqtt sh -p "$P" --anonymous --shards 2 --max-packet 16M -s >/dev/null 2>&1 \
     && ok || bad "a broker of two shards taking 16 MiB packets is made with no mesh" "$(tail -3 "$SOCKETLEY_DLOG")"

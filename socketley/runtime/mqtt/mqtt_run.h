@@ -271,13 +271,15 @@ private:
     // and a session here that gives way is handed to it unless that connection began clean.
     void settle(const std::string& client_id, uint64_t stamp, const std::string& user, uint32_t from, bool clean);
     // The session of `client` given up for shard `to`, what still comes here for it handed on there for a while;
-    // nothing when its bytes pass `room`, as surrender() says.
-    std::optional<std::string> give_up(const std::string& client, uint32_t to, bool clean, size_t room);
+    // empty when there is none or `clean` ends it.
+    std::string give_up(const std::string& client, uint32_t to, bool clean);
     // A session taken in from another shard: that shard is told what had reached this one by then.
     void took_in(const std::string& client);
     // A session another shard gave up after the connection it was for was let in here without it, taken in, or handed
     // back to `from` when it cannot be, unless it is itself one handed back.
     void absorb(const std::string& client, std::string_view bytes, uint32_t from, bool back);
+    // The claim still waiting for `from` to answer, or for the session it said it sends, of `client`; 0 when none.
+    uint64_t claim_awaiting(const std::string& client, uint32_t from) const;
     // A session given up for shard `to`, as one frame or, past what one carries, as pieces of it.
     void hand_session(uint32_t to, const std::string& client, bool back, std::string_view bytes);
     void shard_stats(std::string& out) const;
@@ -402,9 +404,11 @@ private:
         bool        lost{false};
         // Another shard holds the session under another user, so this connection may not have it.
         bool        refused{false};
-        // The shard holding the session could not send it back the way the claim came, so it kept it.
-        bool        kept{false};
+        // The shard holding the session sends it in its batches, since the way back would not carry it.
+        bool        coming{false};
+        uint32_t    coming_from{0};
         std::string session;
+        // When the claim began, or a piece of a session coming for it last came.
         int64_t     started_ms{0};
         // What the shard the session is coming from handed on for it before it is taken in here.
         std::vector<std::string> early;
@@ -434,7 +438,6 @@ private:
     uint64_t m_claims_lost{0};
     uint64_t m_claims_refused{0};
     uint64_t m_sessions_moved{0};
-    uint64_t m_sessions_kept{0};
     uint64_t m_sessions_late{0};
     uint64_t m_sessions_late_ended{0};
     uint64_t m_sessions_handed_back{0};

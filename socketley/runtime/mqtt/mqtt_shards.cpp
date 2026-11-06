@@ -942,7 +942,7 @@ void mqtt_run::claim_reply(uint64_t cookie, request_status st, std::string_view 
             absorb(client, bytes, from, false);
         return;
     }
-    const uint64_t id = it->second.first;
+    const auto [id, from] = it->second;
     m_claim_cookies.erase(it);
     const auto c = m_claims.find(id);
     if (c == m_claims.end())
@@ -958,8 +958,11 @@ void mqtt_run::claim_reply(uint64_t cookie, request_status st, std::string_view 
                 pc.lost = true;
             else if (status == 3)
                 pc.refused = true;
-            else if (status == 4)
-                pc.kept = true;
+            else if (status == 4 && pc.session.empty())
+            {
+                pc.coming      = true;
+                pc.coming_from = from;
+            }
             else if (status == 1)
             {
                 std::string s;
@@ -970,8 +973,25 @@ void mqtt_run::claim_reply(uint64_t cookie, request_status st, std::string_view 
     }
     if (pc.waiting)
         --pc.waiting;
-    if (pc.waiting == 0)
+    // A session coming in pieces is waited for as long as they come, a patience at most apart.
+    if (pc.waiting == 0 && !(pc.coming && pc.session.empty()))
         finish_claim(id);
+}
+
+uint64_t mqtt_run::claim_awaiting(const std::string& client, uint32_t from) const
+{
+    for (const auto& [id, pc] : m_claims)
+    {
+        if (pc.ask.client_id != client || !pc.session.empty())
+            continue;
+        if (pc.coming && pc.coming_from == from)
+            return id;
+        // Its pieces may come before the answer that says they do.
+        for (const auto& [cookie, to] : m_claim_cookies)
+            if (to.first == id && to.second == from)
+                return id;
+    }
+    return 0;
 }
 
 void mqtt_run::finish_claim(uint64_t id)
@@ -1007,13 +1027,6 @@ void mqtt_run::finish_claim(uint64_t id)
         ++m_claims_lost;
         early();
         pc.done({pc.ask.level == level_5 ? reason::session_taken_over : reason::server_unavailable, {}});
-        return;
-    }
-    if (pc.kept)
-    {
-        // The session is too large to move by the way it would come, so it stays with its shard and its connection.
-        early();
-        pc.done({reason::server_unavailable, {}});
         return;
     }
     // The client is this shard's now, so what it gave up of it before is handed on no longer.
@@ -1056,6 +1069,16 @@ void mqtt_run::took_in(const std::string& client)
 
 void mqtt_run::absorb(const std::string& client, std::string_view bytes, uint32_t from, bool back)
 {
+    // The session a claim here waits for, sent in the batches since the claim's answer could not carry it.
+    if (const uint64_t id = back ? 0 : claim_awaiting(client, from))
+    {
+        pending_claim& pc = m_claims[id];
+        pc.session = std::string(bytes);
+        pc.coming  = false;
+        if (pc.waiting == 0)
+            finish_claim(id);
+        return;
+    }
     switch (m_broker->take_late(bytes))
     {
         case broker::late_take::installed:
@@ -1113,7 +1136,7 @@ void mqtt_run::hand_session(uint32_t to, const std::string& client, bool back, s
     ++m_sessions_pieced;
 }
 
-std::optional<std::string> mqtt_run::give_up(const std::string& client, uint32_t to, bool clean, size_t room)
+std::string mqtt_run::give_up(const std::string& client, uint32_t to, bool clean)
 {
     // Kept as given up before it is, so the filters it ends are told ended only once its messages stop coming.
     std::map<std::string, sub_options> subs;
@@ -1125,8 +1148,8 @@ std::optional<std::string> mqtt_run::give_up(const std::string& client, uint32_t
     if (!subs.empty())
         m_moved.push_back({client, to, std::move(subs), now_ms() + forward_keep_ms, {}});
     m_adopted.erase(client);
-    std::optional<std::string> bytes = m_broker->surrender(client, clean, room);
-    if ((!bytes || bytes->empty()) && !m_moved.empty() && m_moved.back().client == client)
+    std::string bytes = m_broker->surrender(client, clean).value_or(std::string());
+    if (bytes.empty() && !m_moved.empty() && m_moved.back().client == client)
         drop_moved(m_moved.size() - 1);
     return bytes;
 }
@@ -1180,15 +1203,16 @@ void mqtt_run::settle(const std::string& client_id, uint64_t stamp, const std::s
     {
         // A connection that resumes goes on with the session here, as it would have had its claim been answered.
         // However large, since it goes in pieces where one frame would not carry it.
-        std::optional<std::string> bytes;
         if (!clean && mine_user == user)
-            bytes = give_up(client_id, from, false, SIZE_MAX);
-        if (bytes && !bytes->empty())
         {
-            hand_session(from, client_id, false, *bytes);
-            ++m_sessions_yielded;
+            const std::string bytes = give_up(client_id, from, false);
+            if (!bytes.empty())
+            {
+                hand_session(from, client_id, false, bytes);
+                ++m_sessions_yielded;
+            }
         }
-        else if (!bytes)
+        else
             m_broker->surrender(client_id, true);
         ++m_claims_lost;
     }
@@ -1343,7 +1367,11 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t 
             }
             p.part.append(piece);
             if (p.part.size() < total)
+            {
+                if (const uint64_t id = back ? 0 : claim_awaiting(p.part_client, from))
+                    m_claims[id].started_ms = now_ms();
                 break;
+            }
             std::string whole = std::move(p.part);
             const std::string who = std::move(p.part_client);
             p.part.clear();
@@ -1527,19 +1555,20 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply, size_t 
                 reply = w.take();
                 break;
             }
-            // A session the way back cannot carry stays here with its connection, where one cut short would be lost.
-            std::optional<std::string> bytes = give_up(client, from, clean, room > 5 ? room - 5 : 0);
-            if (!bytes)
-            {
-                w.u8(4);
-                ++m_sessions_kept;
-            }
-            else if (bytes->empty())
+            const std::string bytes = give_up(client, from, clean);
+            if (bytes.empty())
                 w.u8(0);
-            else
+            else if (5 + bytes.size() <= room)
             {
                 w.u8(1);
-                w.bytes(*bytes);
+                w.bytes(bytes);
+                ++m_sessions_moved;
+            }
+            else
+            {
+                // One the way back cannot carry goes in the batches, and the asker waits for it.
+                hand_session(from, client, false, bytes);
+                w.u8(4);
                 ++m_sessions_moved;
             }
             reply = w.take();
@@ -1577,7 +1606,6 @@ void mqtt_run::shard_stats(std::string& out) const
     st::put(out, "session_claims_lost", m_claims_lost);
     st::put(out, "session_claims_refused", m_claims_refused);
     st::put(out, "sessions_moved", m_sessions_moved);
-    st::put(out, "sessions_kept", m_sessions_kept);
     st::put(out, "sessions_late", m_sessions_late);
     st::put(out, "sessions_late_ended", m_sessions_late_ended);
     st::put(out, "sessions_handed_back", m_sessions_handed_back);

@@ -16349,14 +16349,16 @@ and
 A session handed over this way that is larger than 1 MiB goes in pieces of
 1 MiB, so none is ended for its size; these are counted in
 .BR sessions_pieced .
-A session moves as one piece. When shards relay through the daemon
+A session moves as one answer to the claim when the way back carries it. When
+shards relay through the daemon
 (see
 .BR SOCKETLEY_NO_SHARD_MESH ),
-that piece holds 8 MiB, less what the shard still has queued to the daemon past
-68 MiB. A larger session stays on its shard, and a connection to
-another shard is refused with Server unavailable until the client lands on the
-session's own shard. Such a refusal is counted in
-.BR sessions_kept .
+that answer holds 8 MiB, less what the shard still has queued to the daemon past
+68 MiB. A larger session goes in pieces of 1 MiB the same way, and the
+connection waits for them as long as they keep coming, so a client is let in on
+whichever shard it lands on with its session whatever its size; these too are
+counted in
+.BR sessions_pieced .
 Relaying through the daemon also holds a packet to 8 MiB less 256 KiB, however
 large
 .B \-\-max\-packet
