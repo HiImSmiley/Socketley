@@ -1528,6 +1528,16 @@ bool tls_context::close_notify(SSL* ssl)
 #endif
 }
 
+bool tls_context::close_notify_queued(SSL* ssl)
+{
+#if SOCKETLEY_HAS_TLS
+    return ssl && !SSL_get_quiet_shutdown(ssl) && (SSL_get_shutdown(ssl) & SSL_SENT_SHUTDOWN) != 0;
+#else
+    (void)ssl;
+    return false;
+#endif
+}
+
 void tls_context::withhold_close_notify(SSL* ssl)
 {
 #if SOCKETLEY_HAS_TLS

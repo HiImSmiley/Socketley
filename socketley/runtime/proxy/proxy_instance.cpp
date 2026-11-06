@@ -8252,7 +8252,9 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                 // splice counted in: it names this descriptor and its
                 // completion is what makes the number safe to give away, so it
                 // is as good a reason to wait as one of this connection's own.
-                if (defer_c && !client_op_in_flight(conn) && !peer_splicing_into_client)
+                // A close_notify waiting for room under kernel TLS is waited for as a write is.
+                const bool alert_waits = conn->tls_wait && tls_context::close_notify_queued(conn->ssl);
+                if (defer_c && !client_op_in_flight(conn) && !alert_waits && !peer_splicing_into_client)
                     defer_c = false;
             }
             if (!defer_c)
@@ -11525,11 +11527,22 @@ bool proxy_instance::tls_flush(Conn* conn)
                         if (!m_loop || fd < 0 || fd >= MAX_FDS || m_conn_idx[fd].side != conn_client)
                             return;
                         proxy_client_connection* c = m_conn_idx[fd].client;
-                        if (c->generation != gen || c->closing)
+                        if (c->generation != gen)
                             return;
                         c->tls_wait = false;
                         if (res < 0 || (res & (POLLERR | POLLHUP)) != 0 || !flush_client_write_queue(c))
+                        {
                             close_pair(fd, c->ex.backend_fd);
+                            return;
+                        }
+                        // A closing connection waited here to send its close_notify, which its FIN goes behind, and
+                        // with nothing else in flight no other completion comes back to end it.
+                        if (c->closing && !c->tls_wait && !c->write_pending && !tls_owes_output(c))
+                        {
+                            shutdown_client_write(c);
+                            if (!client_op_in_flight(c))
+                                close_pair(fd, c->ex.backend_fd);
+                        }
                     });
                     if (!conn->tls_wait)
                         conn->closing = true;

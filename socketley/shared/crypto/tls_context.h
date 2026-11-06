@@ -135,6 +135,8 @@ public:
     static bool close_notify(SSL* ssl);
     // The connection ends cut short, which a close_notify would vouch for as whole: none is sent from here on.
     static void withhold_close_notify(SSL* ssl);
+    // Whether close_notify() queued this side's alert, sent by now or not.
+    static bool close_notify_queued(SSL* ssl);
 
     // ─── Kernel TLS, on a socket a runtime lends ────────────────────────────
     // start_kernel_tls changes a TLS 1.3 connection's send key and OpenSSL hands the new one to the kernel, which
