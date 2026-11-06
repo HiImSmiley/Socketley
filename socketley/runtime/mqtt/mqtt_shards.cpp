@@ -63,6 +63,10 @@ constexpr int64_t stamp_keep_us = 10'000'000;
 
 constexpr int64_t claim_patience_ms = 3000;
 
+// What a message for another shard carries besides its packet, the client's id and the shared groups among it, as
+// far as a packet is held to fit; a batch past it is not sent.
+constexpr size_t crossing_margin = 256u << 10;
+
 std::string frame_of(sverb v, uint32_t from)
 {
     // Written in place rather than moved out of a writer, which GCC 12 reads as a copy past the string's own buffer.
@@ -104,6 +108,21 @@ uint64_t claim_stamp(uint32_t shard)
 bool mqtt_run::sharded() const
 {
     return m_owner.get_shards() > 1;
+}
+
+uint32_t mqtt_run::crossing_packet(uint32_t asked) const
+{
+    // With no mesh a message crosses through the daemon, whose frames hold 8 MiB, so a packet past that is refused
+    // as one past --max-packet is, rather than sent and lost on the way.
+    auto* mgr = m_owner.get_runtime_manager();
+    if (!sharded() || !mgr)
+        return asked;
+    size_t room = SIZE_MAX;
+    for (uint32_t j = 0; j < m_owner.get_shards(); ++j)
+        if (j != m_owner.get_shard_index())
+            room = std::min(room, mgr->requests().request_room(shard_target(m_owner.get_name(), j)));
+    const size_t fits = room > crossing_margin ? room - crossing_margin : 0;
+    return static_cast<uint32_t>(std::min<size_t>(asked, std::max<size_t>(fits, 64)));
 }
 
 bool mqtt_run::post_shard(uint32_t to, std::string payload, uint64_t cookie)
@@ -168,15 +187,23 @@ void mqtt_run::send_shard(uint32_t to)
         }
         // Numbered by its first frame and the oldest one not yet receipted, so the shard takes each frame once and
         // in the order made whatever is sent again.
+        const std::string target = shard_target(m_owner.get_name(), to);
         std::string batch = frame_of(sverb::batch, me);
         batch.reserve(batch.size() + 24 + cut);
         socketley::bytes::append64(batch, m_shard_epoch);
         socketley::bytes::append64(batch, q.seq);
         socketley::bytes::append64(batch, q.sent.empty() ? q.seq : q.sent.front().first);
-        batch.append(rest.substr(0, cut));
+        // A frame past what the way carries now, which a frame of its own is when it is past a batch, goes as an
+        // empty one, keeping its number: sent, it would be refused there and every frame after it held behind it.
+        if (count == 1 && batch.size() + cut > mgr->requests().request_room(target))
+        {
+            socketley::bytes::append32(batch, 0);
+            ++m_shard_dropped;
+        }
+        else
+            batch.append(rest.substr(0, cut));
         const uint64_t cookie = m_shard_cookie_base++;
-        if (!mgr->requests().post_owned(this, cookie, shard_target(m_owner.get_name(), to), std::move(batch),
-                                        request_class::client))
+        if (!mgr->requests().post_owned(this, cookie, target, std::move(batch), request_class::client))
             break;
         if (!q.flying)
             q.heard_ms = now_ms();

@@ -16263,6 +16263,13 @@ that piece holds 8 MiB. A larger session stays on its shard, and a connection to
 another shard is refused with Server unavailable until the client lands on the
 session's own shard. Such a refusal is counted in
 .BR sessions_kept .
+Relaying through the daemon also holds a packet to 8 MiB less 256 KiB, however
+large
+.B \-\-max\-packet
+is; the broker says so in its CONNACK, and a larger packet is refused as one
+past
+.B \-\-max\-packet
+is.
 .PP
 A shard may not take what another shard hands it as fast as it comes. It then
 holds back that other shard's publishers, rather than lose their messages: they
@@ -16271,7 +16278,8 @@ them, and at QoS 0 those whose last message went to it. A shard that has
 answered nothing for a second holds back only QoS 1 and 2 publishers, whose
 answer waits. A message for that shard is then dropped at QoS 0, or once 8 MiB
 wait for it. At any QoS, a message is dropped once what the shard was handed
-has failed for three seconds. Drops are counted in
+has failed for three seconds. So is a message whose shared groups make it too
+large for the daemon to carry to a shard. Drops are counted in
 .BR shard_dropped .
 Each shard keeps a snapshot of its own,
 .IB file . shard\fR,

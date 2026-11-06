@@ -163,7 +163,7 @@ bool mqtt_run::start(std::string& why)
         m_pool.stop();
 
     broker_config cfg;
-    cfg.max_packet         = m_owner.get_max_packet();
+    cfg.max_packet         = crossing_packet(m_owner.get_max_packet());
     cfg.session_expiry_max = m_owner.get_session_expiry();
     cfg.session_queue      = m_owner.get_session_queue();
     cfg.retained_max_bytes = m_owner.get_retained_max();

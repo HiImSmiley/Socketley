@@ -199,6 +199,8 @@ private:
 
     // ── Shards ──────────────────────────────────────────────────────────────
     bool sharded() const;
+    // The largest packet of `asked` whose message every other shard can be sent the way it goes now.
+    uint32_t crossing_packet(uint32_t asked) const;
     void shards_start();
     void share_message(const message_ptr& m);
     void share_retained(const std::string& topic, const message_ptr& now);

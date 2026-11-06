@@ -9,6 +9,9 @@
 #   * a session that does not follow its client to another shard, or two shards both holding it
 #   * one too large for the daemon's frames lost on the way when there is no mesh, rather than kept where it was;
 #     one of 6 MB, which the daemon's frames hold, lost because the daemon held its answers to 4 MiB
+#   * with no mesh, a message past the daemon's frames taking its publisher's shard down rather than refused as too
+#     large; one past 4 MiB never reaching the other shard; one its shared groups make too large holding every message
+#     after it to that shard
 #   * a shared subscription's message delivered once per shard instead of once per group
 #   * mqtt-sessions, mqtt-kick or mqtt-sub seeing one shard only
 #   * a shard's sessions lost across a restart because the shards share one snapshot
@@ -666,6 +669,53 @@ if phase == "relayed":
             c.close()
         check("and its client finds it there with its forty queued messages of 250 KB", whole, (True, True, 40))
     guarded("heavy", heavy)
+
+# With no mesh and --max-packet 16M: a packet is held to what crosses through the daemon, 8 MiB less a margin.
+if phase == "large":
+    def large():
+        sub = connected(port, "big-sub", timeout=30)
+        sub.subscribe(("big/#", 1), ("small/#", 1))
+        home = shard_of("big-sub")
+        cap = sub.connack[2].get(MAX_PACKET)
+        truth("with no mesh the broker says it takes packets up to what the daemon carries", cap and cap < (8 << 20), cap)
+        def elsewhere(cid):
+            for _ in range(60):
+                c = connected(port, cid, timeout=30)
+                if shard_of(cid) != home:
+                    return c
+                c.disconnect()
+            raise Closed("no connection reached the other shard")
+        pub, by = elsewhere("big-pub"), elsewhere("big-by")
+        pub.publish("big/t", b"x" * (7 << 20), qos=1)
+        m = sub.message(30)
+        check("a message of 7 MiB crosses to the other shard through the daemon", len(m.payload) if m else None, 7 << 20)
+        try:
+            pub.publish("big/t", b"x" * (9 << 20), qos=1, wait=False)
+        except (OSError, Closed):
+            pass
+        refused = pub.closed_within(10)
+        by.publish("small/t", b"after", qos=1)
+        m = sub.message(10)
+        check("one of 9 MiB is refused as too large, and the other clients of its shard are still served",
+              (refused, m.payload if m else None), (True, b"after"))
+        # Five shared groups of long names make a message under the cap too large to cross: it is dropped for that
+        # shard, counted, and what comes after it still goes.
+        groups = ["$share/g%d%s/grp/t" % (i, "x" * 65000) for i in range(5)]
+        sub.subscribe(*[(g, 1) for g in groups])
+        time.sleep(1.5)
+        dropped = lambda: sum(int(l.split(":")[1]) for l in subprocess.run([binary, "stats", "sh"], capture_output=True,
+                              timeout=10).stdout.decode().splitlines() if l.startswith("shard_dropped:"))
+        before = dropped()
+        pub2 = elsewhere("big-pub2")
+        pub2.publish("grp/t", b"y" * (cap - 1024), qos=1)
+        pub2.publish("small/t", b"next", qos=1)
+        got = [len(m.payload) if len(m.payload) > 64 else m.payload for m in sub.messages(1, 15)]
+        time.sleep(0.6)
+        check("one its groups make too large to cross is dropped there, and the next message still goes",
+              (got, dropped() - before), ([b"next"], 1))
+        for c in (sub, by, pub2):
+            c.disconnect()
+    guarded("large", large)
 PY
 }
 
@@ -733,6 +783,15 @@ tally < <(run relayed)
 sleep 1.5
 kept=$("$BIN" stats sh 2>&1 | awk -F: '$1=="sessions_kept"{s+=$2} END{print s+0}')
 [ "$kept" -ge 1 ] && ok || bad "stats count the session kept" "sessions_kept $kept"
+"$BIN" remove sh >/dev/null 2>&1
+"$BIN" create mqtt sh -p "$P" --anonymous --shards 2 --max-packet 16M -s >/dev/null 2>&1 \
+    && ok || bad "a broker of two shards taking 16 MiB packets is made with no mesh" "$(tail -3 "$SOCKETLEY_DLOG")"
+ready_tcp 127.0.0.1 "$P" || bad "it listens" "$(tail -5 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 50); do
+    [ "$("$BIN" stats sh 2>/dev/null | awk -F: '$1=="shard_peers_known"{s+=$2} END{print s+0}')" -ge 2 ] && break
+    sleep 0.2
+done
+tally < <(run large)
 unset SOCKETLEY_NO_SHARD_MESH
 
 echo "  Results: $PASS/$((PASS + FAIL)) passed ($FAIL failed)"
