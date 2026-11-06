@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
+# suite: quiet -- the loop's worst answer in milliseconds, which a busy box's scheduler sets as surely as the store
 # Integration test: an identity provider with a hundred thousand accounts writes one, finds one by its address and
 # lists them all without holding its loop for the size of the store.
 #
