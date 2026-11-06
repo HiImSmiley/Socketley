@@ -191,6 +191,15 @@ private:
         int64_t heard_ms{0};
         SSL* ssl{nullptr};
         bool handshaken{false};
+        // The kernel holds the send key, and what is said goes to the socket as plaintext, a message's body as a slice
+        // of it as on a clear connection.  Until the key is on the socket and OpenSSL's records at their marks are
+        // out, it waits in `held`; `kwait` is the write slot waiting for room for a record of a type of its own.
+        bool ktls{false};
+        bool kclean{false};
+        bool kwait{false};
+        // The kernel took no key or no record: the connection ends at the next settle, outside the session's call.
+        bool kfail{false};
+        std::vector<socketley::write_chunk> held;
         // STARTTLS answered: what comes next is a handshake, after which the session starts over.
         bool upgrading{false};
         std::unique_ptr<smtp_session> smtp;
@@ -312,8 +321,21 @@ private:
     void sts_input(conn& c, std::string_view bytes);
     void out(conn& c, std::string_view bytes);
     void queue_owned(conn& c, std::string_view bytes);
+    void put_owned(conn& c, std::vector<socketley::write_chunk>& to, std::string_view bytes);
     void queue_shared(conn& c, const std::shared_ptr<const std::string>& bytes, size_t off, size_t len);
     void queue_tls_out(conn& c);
+    // Where what a session says goes: the queue, or under kernel TLS `held` while OpenSSL's records go first.
+    static std::vector<socketley::write_chunk>& app_out(conn& c) { return c.ktls && !c.kclean ? c.held : c.queue; }
+    // A reply this large on a TLS 1.3 connection without COMPRESS moves its send key to the kernel; below it the
+    // records encrypted here cost as little or less, as measured.  SOCKETLEY_KERNEL_TLS=0 never.
+    void maybe_kernel_tls(conn& c, size_t bytes);
+    // Under kernel TLS with nothing of the connection's unsent: OpenSSL's records to the next mark, or the mark itself,
+    // and once none is left what was held.  False when it waits for room or ended the connection.
+    bool kernel_marks(conn& c);
+    void kernel_room(conn& c, int res);
+    void kernel_failed(conn& c);
+    static constexpr size_t kernel_tls_min = 4u << 20;
+    bool m_kernel_tls{true};
     void flush(conn& c);
     // Bytes onto the connection as they are, encrypted where it speaks TLS: what out() does once compression is done.
     void send_raw(conn& c, std::string_view bytes);

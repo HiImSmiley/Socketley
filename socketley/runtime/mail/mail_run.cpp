@@ -19,6 +19,7 @@
 #include <sys/file.h>
 #include <sys/statvfs.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <openssl/pem.h>
@@ -822,6 +823,7 @@ bool mail_run::start(std::string& why)
             return false;
         }
     }
+    m_kernel_tls = settings::flag("SOCKETLEY_KERNEL_TLS", true);
     // A certificate the entrance has still to write is waited for, mail taken meanwhile by the listeners that need none.
     if (m_owner.get_tls() && certificate_to_come())
     {
@@ -1175,6 +1177,8 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
                 l.kind == port_kind::sts || (l.kind == port_kind::jmap && m_tls))
             {
                 raw->ssl = m_tls ? m_tls->create_ssl_server() : nullptr;
+                if (raw->ssl && m_kernel_tls && !tls_context::allow_kernel_tls(raw->ssl, raw->fd))
+                    m_kernel_tls = false;
                 if (!raw->ssl)
                 {
                     close_conn(*raw);
@@ -1474,6 +1478,7 @@ void mail_run::tls_in(conn& c, const char* p, size_t n)
     }
     if (!c.dead && tls_context::has_pending_out(c.ssl))
     {
+        c.kclean = false;
         queue_tls_out(c);
         flush(c);
     }
@@ -1571,7 +1576,11 @@ void mail_run::out(conn& c, std::string_view bytes)
 
 void mail_run::send_raw(conn& c, std::string_view bytes)
 {
-    if (c.ssl && c.handshaken && !c.upgrading)
+    if (c.ssl && c.handshaken && !c.upgrading && !c.ktls)
+        maybe_kernel_tls(c, bytes.size());
+    if (c.ktls)
+        put_owned(c, app_out(c), bytes);
+    else if (c.ssl && c.handshaken && !c.upgrading)
     {
         // The record layer takes so much before what it made is taken out, which is done after each piece.
         size_t off = 0;
@@ -1594,17 +1603,22 @@ void mail_run::send_raw(conn& c, std::string_view bytes)
 
 void mail_run::queue_owned(conn& c, std::string_view bytes)
 {
+    put_owned(c, c.queue, bytes);
+}
+
+void mail_run::put_owned(conn& c, std::vector<socketley::write_chunk>& to, std::string_view bytes)
+{
     if (bytes.empty())
         return;
     c.owed += bytes.size();
     // A long reply goes in pieces, so the queue never moves a buffer it has grown to the whole of it.
-    if (!c.queue.empty() && c.queue.back().owns() && c.queue.back().size() + bytes.size() <= chunk_max)
-        c.queue.back().append(bytes);
+    if (!to.empty() && to.back().owns() && to.back().size() + bytes.size() <= chunk_max)
+        to.back().append(bytes);
     else
     {
         std::string b = std::move(c.spare);
         b.assign(bytes);
-        c.queue.emplace_back(std::move(b));
+        to.emplace_back(std::move(b));
     }
 }
 
@@ -1613,7 +1627,89 @@ void mail_run::queue_shared(conn& c, const std::shared_ptr<const std::string>& b
     if (len == 0)
         return;
     c.owed += len;
-    c.queue.emplace_back(bytes, static_cast<uint32_t>(off), static_cast<uint32_t>(len));
+    app_out(c).emplace_back(bytes, static_cast<uint32_t>(off), static_cast<uint32_t>(len));
+}
+
+void mail_run::maybe_kernel_tls(conn& c, size_t bytes)
+{
+    // Not under COMPRESS, whose bytes are made here whatever encrypts them; a connection moved before it keeps the
+    // kernel's key, which carries the compressed bytes as any others.
+    if (!m_kernel_tls || c.zout || bytes < kernel_tls_min)
+        return;
+    const auto k = tls_context::start_kernel_tls(c.ssl);
+    c.ktls = k == tls_context::kernel_switch::on;
+    if (k == tls_context::kernel_switch::unavailable)
+    {
+        m_kernel_tls = false;
+        LOG_WARN("mail: the kernel has no TLS layer to give (modprobe tls), so messages over TLS are encrypted here");
+    }
+    else if (k == tls_context::kernel_switch::failed)
+        kernel_failed(c);
+}
+
+bool mail_run::kernel_marks(conn& c)
+{
+    for (;;)
+    {
+        m_tls_out.clear();
+        if (tls_context::take_out(c.ssl, m_tls_out) > 0)
+        {
+            queue_owned(c, m_tls_out);
+            return true;
+        }
+        if (!tls_context::has_pending_out(c.ssl))
+        {
+            // The key goes on the socket here if it is due, with nothing written behind it yet.
+            if (!tls_context::kernel_ready(c.ssl))
+            {
+                kernel_failed(c);
+                return false;
+            }
+            c.kclean = true;
+            std::move(c.held.begin(), c.held.end(), std::back_inserter(c.queue));
+            c.held.clear();
+            return true;
+        }
+        const auto step = tls_context::kernel_step(c.ssl);
+        if (step == tls_context::kernel_step_result::progressed)
+            continue;
+        if (step == tls_context::kernel_step_result::wait)
+        {
+            c.wr         = io_request{};
+            c.wr.owner   = this;
+            c.wr.buffer  = reinterpret_cast<char*>(&c);
+            c.wr.fd      = c.fd;
+            c.wr.type    = op_poll;
+            c.wr_pending = m_loop.submit_poll_add(c.fd, POLLOUT, &c.wr);
+            c.kwait      = c.wr_pending;
+            c.reflush    = !c.wr_pending;
+            if (c.reflush)
+                retry_io(c);
+            return false;
+        }
+        kernel_failed(c);
+        return false;
+    }
+}
+
+void mail_run::kernel_failed(conn& c)
+{
+    c.kfail = true;
+    close_soon(c);
+}
+
+void mail_run::kernel_room(conn& c, int res)
+{
+    c.wr_pending = false;
+    c.kwait = false;
+    if (c.dead)
+        return;
+    if (res < 0 || (res & (POLLERR | POLLHUP)) != 0)
+    {
+        close_conn(c);
+        return;
+    }
+    flush(c);
 }
 
 void mail_run::queue_tls_out(conn& c)
@@ -1639,6 +1735,9 @@ void mail_run::flush(conn& c)
         c.sending.clear();
         c.sending_at = 0;
         c.sent = 0;
+        // Under kernel TLS what OpenSSL holds at a mark goes once nothing before it is unsent, and then what was held.
+        if (c.queue.empty() && c.ktls && !c.kclean && !kernel_marks(c))
+            return;
         if (c.queue.empty())
         {
             if (c.closing)
@@ -1755,7 +1854,7 @@ void mail_run::close_conn(conn& c)
     // connection and throws away what the kernel has not delivered of the answer, which orderly_close keeps.
     if (c.fd >= 0)
     {
-        m_loop.close_fd_orderly(c.fd);
+        m_loop.close_fd_orderly(c.fd, c.ktls);
         c.fd = -1;
     }
     if (c.ssl)
@@ -1789,6 +1888,11 @@ void mail_run::settle()
             conn* c = find(id);
             if (!c || c->dead)
                 continue;
+            if (c->kfail)
+            {
+                close_conn(*c);
+                continue;
+            }
             // Said under COMPRESS since the last flush, as a BYE from the idle sweep is: it goes out ahead of the end.
             if (!c->zplain.empty())
                 flush(*c);
@@ -1797,6 +1901,7 @@ void mail_run::settle()
             // A TLS connection's close_notify goes out once all else has, and its write's end brings it back here.
             if (c->owed == 0 && c->ssl && tls_context::close_notify(c->ssl))
             {
+                c->kclean = false;
                 queue_tls_out(*c);
                 flush(*c);
             }
@@ -1838,6 +1943,8 @@ void mail_run::conn::start_tls()
         run->close_conn(*this);
         return;
     }
+    if (run->m_kernel_tls && !tls_context::allow_kernel_tls(ssl, fd))
+        run->m_kernel_tls = false;
     handshaken = false;
     upgrading = true;
     closing_ms = wall::now_ms_coarse();
@@ -2597,8 +2704,11 @@ void mail_run::conn::remove(const std::string& user, std::vector<uint32_t> uids,
 
 void mail_run::conn::reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len)
 {
-    // TLS and COMPRESS make a copy anyway, and a slice is at most what 32 bits count.
-    if (dead || zout || (ssl && handshaken && !upgrading) || len > UINT32_MAX || off > UINT32_MAX)
+    // TLS encrypted here and COMPRESS make a copy anyway, and a slice is at most what 32 bits count; the kernel's TLS
+    // takes the slice as a clear connection does.
+    if (ssl && handshaken && !upgrading && !ktls && !dead)
+        run->maybe_kernel_tls(*this, len);
+    if (dead || zout || (ssl && handshaken && !upgrading && !ktls) || len > UINT32_MAX || off > UINT32_MAX)
     {
         reply(std::string_view(*bytes).substr(off, len));
         return;
@@ -2773,6 +2883,8 @@ void mail_run::on_cqe(struct io_uring_cqe* cqe)
     {
         if (req == &c->rd)
             read_done(*c, cqe);
+        else if (req == &c->wr && c->kwait)
+            kernel_room(*c, cqe->res);
         else if (req == &c->wr)
             write_done(*c, cqe->res);
     }

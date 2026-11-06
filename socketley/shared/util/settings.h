@@ -93,7 +93,7 @@ inline constexpr setting table[] = {
     {"SOCKETLEY_HTTP_REVALIDATE", kind::flag, audience::tuning, 0, 0, "on",
      "a server's revalidation of the files it caches"},
     {"SOCKETLEY_KERNEL_TLS", kind::flag, audience::tuning, 0, 0, "on",
-     "a TLS connection's send key handed to the kernel, so a file goes over it by sendfile"},
+     "a TLS connection's send key handed to the kernel for a large file or answer, which it then encrypts"},
     {"SOCKETLEY_PROXY_SPLICE", kind::flag, audience::tuning, 0, 0, "off",
      "splice for a tcp proxy's forwarding"},
     {"SOCKETLEY_PROXY_HTTP2", kind::flag, audience::tuning, 0, 0, "on", "HTTP/2 on a proxy's TLS listener"},

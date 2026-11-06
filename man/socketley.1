@@ -17203,6 +17203,13 @@ It also supports LIST\-EXTENDED and LIST\-STATUS, STATUS=SIZE, QUOTA, SORT
 (OLDER and YOUNGER), SAVEDATE, PREVIEW and COMPRESS=DEFLATE.
 Under COMPRESS=DEFLATE, what the server says in one loop turn is compressed as
 one flushed block.
+Over TLS 1.3 without COMPRESS, the first reply of 4 MiB or more \(em a large
+message's FETCH, a POP3 RETR, a JMAP download \(em hands the connection's send
+key to the kernel's TLS layer, which from then on encrypts a message's body
+straight from the one copy the runtime holds (see
+.BR SOCKETLEY_KERNEL_TLS ).
+Messages are read from the store into memory, so there is no file to send
+from.
 A password is accepted only over STARTTLS or
 .B \-\-imaps
 (LOGINDISABLED before that), except from 127.0.0.1.
@@ -24600,11 +24607,12 @@ Set to
 .B 0
 to keep every TLS record in this process.
 Otherwise, some TLS 1.3 connections hand their sending to the kernel's TLS
-layer. This happens in five cases. A server, storage or proxy connection
+layer. This happens in six cases. A server, storage or proxy connection
 sends a file or object over 256 KiB. A TCP proxy's backend streams that much to
 the client. An HTTP/1.1 proxy sends a client an answer body of that known
 length. A cache connection is owed 2 MiB or more at once. An mqtt client is sent
-a packet of 256 KiB or more.
+a packet of 256 KiB or more. A mail client is sent a reply of 4 MiB or more,
+without COMPRESS.
 .IP
 The connection then changes its send key and hands the new key to the kernel's
 TLS layer. The kernel encrypts what is sent, by sendfile from the page cache or
@@ -24616,7 +24624,9 @@ same or more, which is why a cache waits for 2 MiB. A connection that never
 sends that much stays as it was, because for small answers encrypting a copy
 here costs less. An mqtt payload under kernel TLS is not copied at all, so the
 broker gains from 256 KiB: measured over loopback, a 1 MiB publish to 20 TLS
-subscribers costs 0.56 of the CPU, a 256 KiB one 0.68. The move is for the rest
+subscribers costs 0.56 of the CPU, a 256 KiB one 0.68. A mail FETCH of 8 MiB
+costs 0.61, of 4 MiB 0.79, while at 1 and 2 MiB the move gains nothing it can
+hold to, so mail waits for 4 MiB. The move is for the rest
 of the connection: a 1 KiB answer on
 a moved cache connection costs what it did, a 256 KiB one about a tenth more.
 HTTP/2 connections are never moved.
