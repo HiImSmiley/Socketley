@@ -188,5 +188,24 @@ if [ "$c" = "200" ] && [[ "$b" == *"-v9-"* ]]; then pass
 else fail "a recreated file is served again, with its new content" \
          "code=$c body='$(printf %s "$b" | head -c 60)'"; fi
 
+# ── 11-12. --http-cache, the other promise: built at start, and only then ──
+# The manual said reload-lua rebuilt it, which it never did; a restart does.
+CROOT="$WORK/croot"
+mkdir -p "$CROOT"
+printf 'CCCCCCCCCC-c1-CCCCCCCCCCCCCCCCCCCCCCCCCC' > "$CROOT/held.txt"
+echo 'function on_start() end' > "$WORK/held.lua"
+"$BIN" create server held -p $((P+2)) --http "$CROOT" --http-cache --lua "$WORK/held.lua" -s >/dev/null 2>&1 || true
+cbody(){ curl -s -m 5 "http://127.0.0.1:$((P+2))$1" 2>/dev/null || true; }
+for _ in $(seq 1 50); do [[ "$(cbody /held.txt)" == *"-c1-"* ]] && break; sleep 0.1; done
+printf 'CCCCCCCCCC-c2-CCCCCCCCCCCCCCCCCCCCCCCCCCEXTRA' > "$CROOT/held.txt"
+"$BIN" reload-lua held >/dev/null 2>&1 || true
+b=$(cbody /held.txt)
+if [[ "$b" == *"-c1-"* ]]; then pass
+else fail "--http-cache answers from what it read at start, reload-lua or not" "body='$(printf %s "$b" | head -c 60)'"; fi
+"$BIN" restart held >/dev/null 2>&1 || true
+for _ in $(seq 1 50); do b=$(cbody /held.txt); [[ "$b" == *"-c2-"* ]] && break; sleep 0.1; done
+if [[ "$b" == *"-c2-"* ]]; then pass
+else fail "and a restart reads the edit" "body='$(printf %s "$b" | head -c 60)'"; fi
+
 echo "--- $PASS/$TOTAL passed ---"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -4801,14 +4801,14 @@ Ten concurrent 256 MB requests would take about 5 GB.
 .IP
 .B \-\-http\-cache
 limits the multiplication but not the size.
-It holds each file once and shares it, so concurrency stops mattering.
+A shard holds each file once and shares it among its requests, so concurrency
+stops mattering.
 The cost is that it holds the file permanently from startup.
 With
 .BR \-\-shards ,
 each shard reads the directory and holds its own copy, so the files are held
-once per shard.
-A 64 MB file was measured at 154 MB, which is the file plus the two prebuilt
-responses.
+once per shard: a 64 MB file put 64 MB on each of four shards (81 MB each,
+against 17 MB without the cache), 256 MB in all.
 Otherwise, keep the files a TLS listener serves small, or put a plaintext
 listener behind something else that terminates TLS.
 .IP
@@ -4901,13 +4901,15 @@ This is faster for production; the difference from plain
 is one
 .BR statx (2)
 per request.
-The cache is rebuilt on
-.B reload\-lua
-and at no other time.
+The cache is built when the runtime starts and at no other time, not on
+.BR reload\-lua .
 A file edited on disk is therefore
 .B not
-picked up.
+picked up until a restart.
 That is both the reason to use this flag and the reason not to.
+Each shard builds and holds its own copy, so the memory is the directory's
+size times
+.BR \-\-shards .
 .TP
 .B \-\-no\-inject
 With \-\-http, serve a page as the file holds it, without the script that
