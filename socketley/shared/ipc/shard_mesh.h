@@ -326,10 +326,20 @@ public:
                 take_passed_fds();
             m_in.append(m_rbuf.get(), static_cast<size_t>(res));
             // A read that filled the buffer left more behind it, and a link that streams is read in larger pieces.
-            if (static_cast<size_t>(res) == m_rsize && m_rsize < max_read_bytes)
+            if (static_cast<size_t>(res) == m_rsize)
             {
-                m_rsize *= 2;
-                m_rbuf = std::make_unique<char[]>(m_rsize);
+                m_read_filled = true;
+                if (m_rsize < max_read_bytes)
+                {
+                    m_rsize *= 2;
+                    m_rbuf = std::make_unique<char[]>(m_rsize);
+                }
+            }
+            else if (m_shrink_read && static_cast<size_t>(res) < first_read_bytes)
+            {
+                m_shrink_read = false;
+                m_rsize = first_read_bytes;
+                m_rbuf  = std::make_unique<char[]>(m_rsize);
             }
             take_frames();
             return;                    // re-armed by pump(), at the end of the turn
@@ -384,6 +394,22 @@ public:
             LOG_WARN(m_held_warning.c_str());
             m_held_warning.clear();
         }
+        // A link still busy but past its burst gives back what the burst grew, since a busy link is never quiet and
+        // the heap it held kept every allocation after it scattered.
+        bool gave = false;
+        const bool bursting = m_read_filled || m_writer.pending() > keep || m_in.size() > keep;
+        m_read_filled = false;
+        if (bursting)
+        {
+            m_burst_at    = now;
+            m_shrink_read = false;
+        }
+        else if (now - m_burst_at >= burst_trim && grown() && !m_dead && !m_taking)
+        {
+            const size_t before = held();
+            trim_busy();
+            gave = held() < before;
+        }
         if (m_activity != m_activity_seen)
         {
             m_activity_seen = m_activity;
@@ -394,9 +420,9 @@ public:
         {
             const bool grown_before = grown();
             trim();
-            return grown_before;
+            return grown_before || gave;
         }
-        return false;
+        return gave;
     }
 
     // How long the owner's loop may sleep before trim() is due, or -1 when nothing a burst grew is waiting for it.
@@ -510,6 +536,19 @@ private:
     {
         return m_rsize > first_read_bytes || m_in.capacity() > keep || m_walk.capacity() > keep ||
                m_writer.capacity() > 2 * keep;
+    }
+
+    // What can go while frames still flow: the empty strings now, and the read buffer at the next read too short
+    // to have needed it.
+    void trim_busy()
+    {
+        m_writer.trim(keep);
+        if (m_in.empty() && m_in.capacity() > keep)
+            std::string().swap(m_in);
+        if (m_walk.capacity() > keep)
+            std::string().swap(m_walk);
+        if (m_rsize > first_read_bytes)
+            m_shrink_read = true;
     }
 
     void trim()
@@ -824,6 +863,12 @@ private:
 
     // Completions seen, and the turn the count last moved, so settle() can tell a quiet link from a busy one.
     static constexpr std::chrono::seconds quiet_trim{5};
+    // How long a busy link must go without a burst -- a full read, or more than `keep` queued either way -- before
+    // trim_busy(), and whether a read since the last turn filled the buffer.
+    static constexpr std::chrono::seconds burst_trim{1};
+    std::chrono::steady_clock::time_point m_burst_at{};
+    bool        m_read_filled{false};
+    bool        m_shrink_read{false};
     uint64_t    m_activity{0};
     uint64_t    m_activity_seen{0};
     std::chrono::steady_clock::time_point m_quiet_since{};

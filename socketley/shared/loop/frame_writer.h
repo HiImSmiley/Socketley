@@ -149,17 +149,16 @@ public:
 
     size_t capacity() const { return m_out.capacity() + m_wire.capacity(); }
 
-    // A drained writer gives back each buffer past `keep`, which a burst grew and an idle one never needs.
+    // Each buffer past `keep` that holds nothing owed is given back, which a burst grew and a writer past it never
+    // needs: the queue whenever it is empty, the wire once no send is reading it.
     void trim(size_t keep)
     {
-        if (m_send_armed || pending() != 0)
-            return;
-        if (m_out.capacity() > keep)
+        if (m_off >= m_out.size() && m_out.capacity() > keep)
         {
             std::string().swap(m_out);
             m_off = 0;
         }
-        if (m_wire.capacity() > keep)
+        if (!m_send_armed && m_wire_off >= m_wire.size() && m_wire.capacity() > keep)
         {
             std::string().swap(m_wire);
             m_wire_off = 0;

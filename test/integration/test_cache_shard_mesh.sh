@@ -187,7 +187,48 @@ DOWN=$(grep -cE 'the link to shard .* is down' "$SOCKETLEY_DLOG" 2>/dev/null || 
 # The read buffer doubled to 256 KiB and the writer kept its largest batch, for the life of the set: twelve links of
 # four shards held what one burst grew for good.  Quiet five seconds, a link keeps its 16 KiB read and little else.
 HELD1=$(printf '%s\n' "$ST" | awk -F: '/^mesh_held:/ {s+=$2} END{print s+0}')
-HELD2=$HELD1
+
+# ── and a link still busy gives it back once the burst is over ────────────
+#
+# A link that never goes quiet for five seconds -- an ordinary client's small keys crossing behind the burst -- kept
+# what the burst grew for as long as they kept coming, and the heap it held left the small keys' memory scattered:
+# random small keys measured 4-12% more CPU per operation after the burst than on a fresh daemon.  Under that traffic,
+# a second after the burst the links give back all but what small frames use.
+cat > "$SOCKETLEY_TMPD/busy.py" <<'PY'
+import random, socket, sys, time
+port, secs = int(sys.argv[1]), float(sys.argv[2])
+def cmd(*a):
+    return b"*%d\r\n" % len(a) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x) for x in (y.encode() for y in a))
+socks = [socket.create_connection(("127.0.0.1", port), timeout=10) for _ in range(16)]
+end = time.time() + secs
+while time.time() < end:
+    for s in socks:
+        s.sendall(b"".join(cmd("GET", "small%d" % random.randrange(10000)) for _ in range(16)))
+    for s in socks:
+        b = b""
+        while b.count(b"\r\n") < 16:
+            b += s.recv(1 << 16)
+    time.sleep(0.002)
+PY
+timeout 30 python3 "$SOCKETLEY_TMPD/busy.py" "$PORT" 4.5 >/dev/null 2>&1 &
+BUSYPID=$!
+D0=$(printf '%s\n' "$ST" | awk -F: '/^mesh_direct:/ {s+=$2} END{print s+0}')
+HELDB=$HELD1
+for _ in $(seq 1 14); do
+    sleep 0.25
+    HELDB=$("$BIN" stats meshc 2>/dev/null | awk -F: '/^mesh_held:/ {s+=$2} END{print s+0}')
+    [ "$HELDB" -lt $((4 << 20)) ] && break
+done
+BUSYUP=0; kill -0 "$BUSYPID" 2>/dev/null && BUSYUP=1
+wait "$BUSYPID" 2>/dev/null
+sleep 1.5   # a worker publishes its figures on an interval
+D1=$("$BIN" stats meshc 2>/dev/null | awk -F: '/^mesh_direct:/ {s+=$2} END{print s+0}')
+[ "$BUSYUP" = 1 ] && [ "$D1" -gt "$D0" ] && ok "the small keys kept every link busy past the burst ($((D1 - D0)) crossings)" \
+    || bad "the small keys kept the links busy, or this measures the quiet trim" "client up: $BUSYUP, crossings $D0 -> $D1"
+[ "$HELDB" -lt $((4 << 20)) ] && ok "busy, the links give back what the burst grew ($HELDB bytes over 12 links)" \
+    || bad "busy, the links give back what the burst grew" "$HELDB bytes over 12 links 3.5 s into the small keys"
+
+HELD2=$HELDB
 for _ in $(seq 1 40); do
     sleep 0.5
     HELD2=$("$BIN" stats meshc 2>/dev/null | awk -F: '/^mesh_held:/ {s+=$2} END{print s+0}')
