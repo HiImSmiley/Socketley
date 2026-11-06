@@ -6793,6 +6793,8 @@ With a client that picks the owning shard, the same four shards return 2.80x at
 .B "How well the crossings batch decides this cost, and the client decides how well they batch."
 The mesh queues each crossing and flushes once per loop turn, so requests that
 arrive together cross together.
+Every connection a shard reads in one loop turn shares one crossing to each
+sibling, which goes on its own sooner once it carries 512 commands or 256 KiB.
 At the same 192 connections, twelve client processes of sixteen connections
 give the two\-shard arm 0.90x, while eight processes of twenty\-four give it
 1.05x.

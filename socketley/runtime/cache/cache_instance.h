@@ -764,14 +764,9 @@ private:
         // scratch connection produced ahead of the crossing.
         uint64_t    ticket{0};
         std::string head;
-    };
 
-    // Where one framed reply belongs: which command's answer, and which piece
-    // of it.
-    struct fill_target
-    {
-        uint32_t slot{0};
-        uint32_t part{0};
+        // Its id in m_batches, given when the parse opens it so its pieces can name it in the turn's crossings.
+        uint64_t id{0};
     };
 
     // Crossed for and unanswered, per connection, past which the read is
@@ -791,14 +786,48 @@ private:
     // and stop if a crossing is already in flight for it.
     void pump(client_connection* conn);
 
-    // Post one request per owning shard and put the batch in flight, once at
-    // the end of a parse, which is what makes the grouping worth anything.
+    // Put the batch in flight, its pieces already in the turn's frame to each owning shard, once at the end of a
+    // parse, which is what makes the grouping worth anything.
     void route_flush(client_connection* conn);
 
     // Fill every slot a failed or missing crossing owed, so a batch cannot be
     // left one answer short of ever completing.
-    void batch_fill_error(shard_batch& b, const std::vector<fill_target>& targets,
-                          std::string_view why);
+    void batch_fill_error(shard_batch& b, uint32_t slot, uint32_t part, std::string_view why);
+
+    // One piece of the turn's crossing to a sibling: whose batch, which command, which part of its answer.
+    struct post_target
+    {
+        uint64_t batch{0};
+        uint32_t slot{0};
+        uint32_t part{0};
+    };
+
+    // Every connection parsed in one turn shares one frame per sibling and protocol, posted once at the end of the turn
+    // or sooner past these bounds, because the fixed cost of a crossing on both ends was paid per connection.
+    struct turn_crossing
+    {
+        std::string              payload;
+        std::vector<post_target> targets;
+    };
+    static constexpr size_t TURN_CROSS_TARGETS = 512;
+    static constexpr size_t TURN_CROSS_BYTES   = 256u << 10;
+    std::vector<turn_crossing> m_turn_cross;          // index: shard * 2 + resp
+    bool                       m_turn_cross_any{false};
+    // Where the batch being collected began in each sibling's turn frame, so a batch given up before its flush is taken
+    // back out of the frame whole; SIZE_MAX for a sibling it has not touched.
+    struct cross_mark
+    {
+        size_t bytes{SIZE_MAX};
+        size_t targets{0};
+    };
+    std::vector<cross_mark>    m_route_mark;
+    // Batches a reply has touched, reused between replies.
+    std::vector<uint64_t>      m_reply_touched;
+
+    void post_turn_crossing(uint32_t idx, bool later = false);
+    void post_turn_crossings();
+    // Take the batch being collected back out of the turn's frames, answering what it had sent with `why` when given.
+    void route_unmark(shard_batch* b, std::string_view why);
 
     // Reserve this command's place in the reply order, returning its slot
     // index, with `parts` the number of pieces its answer needs.
@@ -931,10 +960,15 @@ private:
     // -- keyed by the cookie the channel hands back.
     struct posted_group
     {
-        uint64_t                 batch{0};
-        std::vector<fill_target> targets;
+        std::vector<post_target> targets;
     };
     std::unordered_map<uint64_t, posted_group> m_posts;
+    // `later` keeps a batch it completes for finish_due(), for a refusal met inside the parse of that batch's own
+    // connection, where finishing would run that connection's next commands under the parse.
+    void settle_post(const posted_group& grp, request_status st, std::string_view reply, std::string_view why,
+                     bool later = false);
+    std::vector<uint64_t> m_finish_due;
+    void finish_due();
     // A single-key command bound for a sibling, rebuilt here so a crossing allocates no string of its own.
     std::string m_cross_scratch;
     // How many slots the last routed batch took, reserved up front for the next one, since a pipeline grown a slot at a
@@ -947,10 +981,6 @@ private:
     std::unique_ptr<shard_batch> m_collect;
     int                          m_collect_fd{-1};
 
-    // Per-owner accumulation for the parse in progress, sized once at setup
-    // and cleared per flush, so a pipeline costs no allocation per command.
-    std::vector<std::string>              m_route_payload;
-    std::vector<std::vector<fill_target>> m_route_slots;
 
     uint64_t m_next_batch{1};
     uint64_t m_next_cookie{1};

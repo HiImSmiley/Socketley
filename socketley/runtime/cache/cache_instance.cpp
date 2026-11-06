@@ -599,7 +599,9 @@ bool cache_instance::setup(event_loop& loop)
     if (m_base_port == 0)
         m_base_port = cache_default_port;
 
-    m_route_payload.assign(m_shard_n, std::string{});
+    m_turn_cross.assign(static_cast<size_t>(m_shard_n) * 2, turn_crossing{});
+    m_route_mark.assign(m_shard_n, cross_mark{});
+    m_turn_cross_any = false;
     m_store.set_channel_observer(&on_channel_presence, this);
 
     // A replica of a cluster cache starts fenced and follows nobody, before it binds anything, so that no client
@@ -611,7 +613,6 @@ bool cache_instance::setup(event_loop& loop)
         m_repl_role = repl_none;
         apply_role(socketley::cluster::replica_mode::fenced, false);
     }
-    m_route_slots.assign(m_shard_n, std::vector<fill_target>{});
 
     // `--persistent` with more than one shard is no longer refused: each shard
     // writes its own self-describing file, and a set that cannot be trusted
@@ -1203,6 +1204,15 @@ void cache_instance::teardown(event_loop& /*loop*/)
     m_posts.clear();
     m_collect.reset();
     m_collect_fd = -1;
+    for (turn_crossing& tc : m_turn_cross)
+    {
+        tc.payload.clear();
+        tc.targets.clear();
+    }
+    for (cross_mark& mk : m_route_mark)
+        mk = cross_mark{};
+    m_turn_cross_any = false;
+    m_finish_due.clear();
 
     m_ttl_timer_armed = false;
     m_journal_timer_armed = false;
@@ -1777,6 +1787,11 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 
 void cache_instance::on_loop_turn()
 {
+    // First, so what this turn's parses crossed for is on its way before anything else here can run a command.
+    if (m_turn_cross_any)
+        post_turn_crossings();
+    if (SOCKETLEY_UNLIKELY(!m_finish_due.empty()))
+        finish_due();
     publish_keyspace();
     if (SOCKETLEY_UNLIKELY(!m_lua_pub.empty()))
         flush_lua_publishes();
@@ -3383,6 +3398,7 @@ void cache_instance::open_collect(client_connection* conn, bool resp)
 {
     m_collect       = std::make_unique<shard_batch>();
     m_collect->slots.reserve(m_collect_hint ? m_collect_hint : 8);
+    m_collect->id   = m_next_batch++;
     m_collect->fd   = conn->fd;
     m_collect->resp = resp;
     m_collect_fd    = conn->fd;
@@ -3426,11 +3442,18 @@ void cache_instance::route_part(client_connection* conn, uint32_t owner,
         return;
     }
 
-    std::string& pay = m_route_payload[owner];
-    if (pay.empty())
-        pay.append(resp ? shard_batch_resp : shard_batch_text);
-    shard_frame_append(pay, raw);
-    m_route_slots[owner].push_back(fill_target{slot, part});
+    // By the batch's protocol, which is the one its frame's header names.
+    turn_crossing& tc = m_turn_cross[static_cast<size_t>(owner) * 2 + (m_collect->resp ? 1 : 0)];
+    cross_mark&    mk = m_route_mark[owner];
+    if (mk.bytes == SIZE_MAX)
+    {
+        mk.bytes   = tc.payload.size();
+        mk.targets = tc.targets.size();
+    }
+    if (tc.payload.empty())
+        tc.payload.append(m_collect->resp ? shard_batch_resp : shard_batch_text);
+    shard_frame_append(tc.payload, raw);
+    tc.targets.push_back(post_target{m_collect->id, slot, part});
 }
 
 // Put a finished slot's pieces together, where false is answered as an error
@@ -4497,11 +4520,7 @@ void cache_instance::route_flush(client_connection* conn)
     // and the slots go with it.
     if (conn->closing)
     {
-        for (uint32_t sh = 0; sh < m_shard_n; ++sh)
-        {
-            m_route_payload[sh].clear();
-            m_route_slots[sh].clear();
-        }
+        route_unmark(m_collect.get(), {});
         m_collect.reset();
         m_collect_fd = -1;
         return;
@@ -4521,48 +4540,30 @@ void cache_instance::route_flush(client_connection* conn)
     {
         LOG_WARN("cache: a routed batch was collected for another connection; "
                  "dropped rather than answered to the wrong socket");
-        for (uint32_t sh = 0; sh < m_shard_n; ++sh)
-        {
-            m_route_payload[sh].clear();
-            m_route_slots[sh].clear();
-        }
+        route_unmark(batch.get(), {});
         return;
     }
 
-    const uint64_t id    = m_next_batch++;
+    // Nothing to post through is the one refusal known now, filled in on the spot, because the alternative is a batch
+    // permanently one answer short of complete.
+    if (SOCKETLEY_UNLIKELY(!mgr))
+        route_unmark(batch.get(), "the shard that owns this key could not be reached");
+
+    const uint64_t id    = batch->id;
+    const size_t   resp  = batch->resp ? 1 : 0;
     size_t         bytes = 0;
 
-    // Posted first and counted first, with a refused post filled in on the
-    // spot, because the alternative is a batch permanently one answer short of
-    // complete.
+    // Counted per sibling now and posted with the turn's other connections in on_loop_turn(), so the frame a batch
+    // went into is the one whose answer ends its wait.
     for (uint32_t sh = 0; sh < m_shard_n; ++sh)
     {
-        if (m_route_payload[sh].empty())
+        cross_mark& mk = m_route_mark[sh];
+        if (mk.bytes == SIZE_MAX)
             continue;
-
-        bool taken = false;
-        if (mgr)
-        {
-            const uint64_t cookie = m_next_cookie++;
-            m_posts[cookie] = posted_group{id, m_route_slots[sh]};
-            taken = mgr->requests().post(
-                        this, cookie, shard_target(get_name(), sh),
-                        m_route_payload[sh], request_class::client);
-            if (taken)
-            {
-                ++batch->outstanding;
-                bytes += m_route_payload[sh].size();
-            }
-            else
-                m_posts.erase(cookie);
-        }
-
-        if (!taken)
-            batch_fill_error(*batch, m_route_slots[sh],
-                             "the shard that owns this key could not be reached");
-
-        m_route_payload[sh].clear();
-        m_route_slots[sh].clear();
+        const turn_crossing& tc = m_turn_cross[static_cast<size_t>(sh) * 2 + resp];
+        ++batch->outstanding;
+        bytes += tc.payload.size() - mk.bytes;
+        m_turn_cross_any = true;
     }
 
     if (batch->outstanding == 0 && conn->batches.empty())
@@ -4574,6 +4575,8 @@ void cache_instance::route_flush(client_connection* conn)
                 append_error_reply(conn->response_buf, batch->resp,
                                    "this cache's shards answered in a shape "
                                    "this build cannot put back together");
+        for (cross_mark& mk : m_route_mark)
+            mk = cross_mark{};
         return;
     }
 
@@ -4590,26 +4593,88 @@ void cache_instance::route_flush(client_connection* conn)
     conn->batches.push_back(id);
     conn->crossing_bytes += bytes;
     m_batches.emplace(id, std::move(*batch));
+
+    // A frame grown past its bounds goes now rather than at the end of the turn, which bounds what one answer carries.
+    for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+    {
+        cross_mark& mk = m_route_mark[sh];
+        if (mk.bytes == SIZE_MAX)
+            continue;
+        mk = cross_mark{};
+        const uint32_t idx = sh * 2 + static_cast<uint32_t>(resp);
+        const turn_crossing& tc = m_turn_cross[idx];
+        if (tc.targets.size() >= TURN_CROSS_TARGETS || tc.payload.size() >= TURN_CROSS_BYTES)
+            post_turn_crossing(idx, true);
+    }
 }
 
-void cache_instance::batch_fill_error(shard_batch& b,
-                                      const std::vector<fill_target>& targets,
-                                      std::string_view why)
+void cache_instance::route_unmark(shard_batch* b, std::string_view why)
 {
-    for (const fill_target& t : targets)
+    const size_t resp = (b && b->resp) ? 1 : 0;
+    for (uint32_t sh = 0; sh < m_shard_n; ++sh)
     {
-        if (t.slot >= b.slots.size())
+        cross_mark& mk = m_route_mark[sh];
+        if (mk.bytes == SIZE_MAX)
             continue;
-        reply_slot& sl = b.slots[t.slot];
-        if (t.part >= sl.parts.size() || sl.part_filled[t.part])
-            continue;
-
-        sl.parts[t.part].clear();
-        append_error_reply(sl.parts[t.part], b.resp, why);
-        sl.part_filled[t.part] = 1;
-        if (sl.parts_left > 0)
-            --sl.parts_left;
+        turn_crossing& tc = m_turn_cross[static_cast<size_t>(sh) * 2 + resp];
+        if (b && !why.empty())
+            for (size_t i = mk.targets; i < tc.targets.size(); ++i)
+                batch_fill_error(*b, tc.targets[i].slot, tc.targets[i].part, why);
+        tc.targets.resize(std::min(mk.targets, tc.targets.size()));
+        // What is left is only the frame's header when no earlier batch wrote into it.
+        tc.payload.resize(tc.targets.empty() ? 0 : std::min(mk.bytes, tc.payload.size()));
+        mk = cross_mark{};
     }
+}
+
+// One sibling's frame for the turn, with a refusal answered at once for every batch in it, because a batch left
+// waiting on a post that was never taken never completes.
+void cache_instance::post_turn_crossing(uint32_t idx, bool later)
+{
+    turn_crossing& tc = m_turn_cross[idx];
+    if (tc.targets.empty())
+    {
+        tc.payload.clear();
+        return;
+    }
+    const uint32_t sh  = idx / 2;
+    auto*          mgr = get_runtime_manager();
+    const uint64_t cookie = m_next_cookie++;
+    auto [pit, fresh] = m_posts.try_emplace(cookie);
+    (void)fresh;
+    pit->second.targets.assign(tc.targets.begin(), tc.targets.end());
+    const bool taken = mgr && mgr->requests().post(this, cookie, shard_target(get_name(), sh), tc.payload,
+                                                   request_class::client);
+    tc.payload.clear();
+    tc.targets.clear();
+    if (taken)
+        return;
+
+    posted_group grp = std::move(pit->second);
+    m_posts.erase(pit);
+    settle_post(grp, request_status::no_target, {}, "the shard that owns this key could not be reached", later);
+}
+
+void cache_instance::post_turn_crossings()
+{
+    m_turn_cross_any = false;
+    for (uint32_t idx = 0; idx < m_turn_cross.size(); ++idx)
+        if (!m_turn_cross[idx].targets.empty())
+            post_turn_crossing(idx);
+}
+
+void cache_instance::batch_fill_error(shard_batch& b, uint32_t slot, uint32_t part, std::string_view why)
+{
+    if (slot >= b.slots.size())
+        return;
+    reply_slot& sl = b.slots[slot];
+    if (part >= sl.parts.size() || sl.part_filled[part])
+        return;
+    sl.parts[part].clear();
+    append_error_reply(sl.parts[part], b.resp, why);
+    sl.part_filled[part] = 1;
+    if (sl.parts_left > 0)
+        --sl.parts_left;
 }
 
 void cache_instance::batch_drop(client_connection* conn)
@@ -4739,37 +4804,53 @@ void cache_instance::on_request_reply(uint64_t cookie, request_status st,
     if (pit == m_posts.end())
         return;                       // already answered, or withdrawn
 
-    const posted_group grp = std::move(pit->second);
+    posted_group grp = std::move(pit->second);
     m_posts.erase(pit);
+    settle_post(grp, st, reply, request_status_text(st));
+}
 
-    const auto bit = m_batches.find(grp.batch);
-    if (bit == m_batches.end())
-        return;                       // the connection went while this crossed
+// One frame's answers into the batches they belong to, each batch then one sibling nearer complete, finished in the
+// order the frame met them.
+void cache_instance::settle_post(const posted_group& grp, request_status st, std::string_view reply,
+                                 std::string_view why, bool later)
+{
+    std::vector<uint64_t> touched;
+    touched.swap(m_reply_touched);
+    touched.clear();
 
-    shard_batch& b = bit->second;
+    uint64_t     cur_id = 0;
+    shard_batch* cur    = nullptr;
+    auto batch_of = [&](uint64_t id) -> shard_batch* {
+        if (id != cur_id || touched.empty())
+        {
+            cur_id = id;
+            const auto bit = m_batches.find(id);
+            cur = bit == m_batches.end() ? nullptr : &bit->second;
+            // A batch that went while this crossed is skipped, its frames still read past.
+            if (cur)
+                touched.push_back(id);
+        }
+        return cur;
+    };
 
-    if (st != request_status::ok)
+    // One frame per command sent in the order they were sent, with unfilled pieces answered rather than left, because
+    // a piece nobody fills is a client that never hears back.
+    const char* p   = reply.data();
+    const char* end = reply.data() + reply.size();
+    size_t      i   = 0;
+    if (st == request_status::ok)
     {
-        batch_fill_error(b, grp.targets, request_status_text(st));
-    }
-    else
-    {
-        // One frame per command sent in the order they were sent, with
-        // unfilled pieces answered rather than left, because a piece nobody
-        // fills is a client that never hears back.
-        const char* p   = reply.data();
-        const char* end = reply.data() + reply.size();
-        size_t      i   = 0;
         for (; i < grp.targets.size(); ++i)
         {
             std::string_view one;
             if (!shard_frame_take(p, end, one))
                 break;
 
-            const fill_target& t = grp.targets[i];
-            if (t.slot >= b.slots.size())
+            const post_target& t = grp.targets[i];
+            shard_batch* b = batch_of(t.batch);
+            if (!b || t.slot >= b->slots.size())
                 continue;
-            reply_slot& sl = b.slots[t.slot];
+            reply_slot& sl = b->slots[t.slot];
             if (t.part >= sl.parts.size() || sl.part_filled[t.part])
                 continue;
 
@@ -4779,19 +4860,45 @@ void cache_instance::on_request_reply(uint64_t cookie, request_status st,
                 --sl.parts_left;
         }
         if (i < grp.targets.size())
+            why = "the shard that owns this key answered in a framing this build does not read";
+    }
+    for (; i < grp.targets.size(); ++i)
+    {
+        const post_target& t = grp.targets[i];
+        if (shard_batch* b = batch_of(t.batch))
+            batch_fill_error(*b, t.slot, t.part, why);
+    }
+
+    // After every fill, because finishing a batch runs its connection's next commands, and those may close another
+    // connection whose batch this frame also answered.
+    for (const uint64_t id : touched)
+    {
+        const auto bit = m_batches.find(id);
+        if (bit == m_batches.end())
+            continue;
+        shard_batch& b = bit->second;
+        if (b.outstanding > 0)
+            --b.outstanding;
+        if (b.outstanding == 0)
         {
-            const std::vector<fill_target> rest(
-                grp.targets.begin() + static_cast<ptrdiff_t>(i), grp.targets.end());
-            batch_fill_error(b, rest,
-                             "the shard that owns this key answered in a framing "
-                             "this build does not read");
+            if (later)
+                m_finish_due.push_back(id);
+            else
+                batch_finish(id);
         }
     }
 
-    if (b.outstanding > 0)
-        --b.outstanding;
-    if (b.outstanding == 0)
-        batch_finish(grp.batch);
+    if (m_reply_touched.empty())
+        m_reply_touched.swap(touched);
+}
+
+void cache_instance::finish_due()
+{
+    std::vector<uint64_t> due;
+    due.swap(m_finish_due);
+    for (const uint64_t id : due)
+        if (const auto bit = m_batches.find(id); bit != m_batches.end() && bit->second.outstanding == 0)
+            batch_finish(id);
 }
 
 // ─── the answering side ─────────────────────────────────────────────────────
