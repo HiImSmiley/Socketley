@@ -3878,6 +3878,9 @@ A connection the runtime closes itself ends with a
 .B close_notify
 before its FIN, so the client reads an end rather than a truncation and keeps
 its session for the next connection.
+When the kernel encrypts (a large file over TLS 1.3), a proxy holds that FIN
+until the socket has passed on everything the kernel took, since a FIN sent
+earlier throws the rest away; a client that stops reading is given ten seconds.
 .PP
 Trust stores are read when the runtime starts. A listener's certificate and key
 are checked again every two seconds. When they are replaced on disk, by

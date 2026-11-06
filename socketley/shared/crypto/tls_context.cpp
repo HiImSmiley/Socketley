@@ -1479,6 +1479,17 @@ tls_context::kernel_step_result tls_context::kernel_step(SSL* ssl)
 #endif
 }
 
+bool tls_context::kernel_sends(SSL* ssl)
+{
+#if SOCKETLEY_KTLS
+    const out_bio* o = out_of(ssl);
+    return o && !o->broken && (o->kernel || !o->keys.empty());
+#else
+    (void)ssl;
+    return false;
+#endif
+}
+
 bool tls_context::kernel_ready(SSL* ssl)
 {
 #if SOCKETLEY_KTLS

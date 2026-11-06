@@ -152,6 +152,8 @@ public:
     static kernel_step_result kernel_step(SSL* ssl);
     // The kernel encrypts and no application data of OpenSSL's is waiting, so the socket may be written to directly.
     static bool kernel_ready(SSL* ssl);
+    // The kernel holds this connection's send key, or will at a mark already written.
+    static bool kernel_sends(SSL* ssl);
     // Offers HTTP/2 by ALPN to a client that asks for "h2", HTTP/1.1 being what one that does not speaks; off unless a
     // runtime that serves HTTP/2 turns it on. Whether a finished handshake chose it.
     void enable_h2(bool on);

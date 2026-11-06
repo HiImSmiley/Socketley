@@ -10,6 +10,8 @@
 #   * an answer the kernel encrypts whose alert OpenSSL encrypted, or one sent as application data: the client fails
 #     on the record rather than reading an end
 #   * a close_notify after a backend that reset mid-answer, which vouches for an answer cut short as whole
+#   * a FIN or a close sent while the kernel still holds TLS records it took on a full socket, which throws them away:
+#     a client that did not read for a moment gets the proxy's file cut at a record's edge and no close_notify
 #   * an IMAP reply still in the COMPRESS deflate buffer when the connection settles, as the idle sweep's BYE is: the
 #     connection closed with neither the BYE nor close_notify
 #   * a session thrown away because the server closed: under --shards 4 a client that lets the server close never
@@ -40,6 +42,8 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 mkdir -p "$T/www" "$T/st"
 echo hello >"$T/www/a.txt"
 head -c $((4 * 1024 * 1024)) /dev/urandom >"$T/www/big.bin"
+STALL_SIZES=$(seq 2262144 16384 2512000)
+for n in $STALL_SIZES; do head -c "$n" "$T/www/big.bin" >"$T/www/f$n"; done
 TLS=(--tls --cert "$T/c.pem" --key "$T/k.pem")
 
 # Each mode makes one connection, has the runtime end it, and prints how it ended -- "clean" for a close_notify,
@@ -141,6 +145,25 @@ elif mode == "smtp":
     s.sendall(b"QUIT\r\n")
     got, how = drain(s)
     print(how, banner[:3].decode() + "/" + got[:3].decode())
+elif mode == "stalled":
+    # Not read until the file is all sent, behind a small receive buffer, so the kernel holds the end of it.
+    import time
+    path, host, sizes = sys.argv[3], sys.argv[4], sys.argv[5:]
+    bad = []
+    for size in sizes * 3:
+        raw = socket.socket()
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        raw.settimeout(15)
+        raw.connect(("127.0.0.1", port))
+        s = context().wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=False)
+        s.sendall(("GET %s%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (path, size, host)).encode())
+        time.sleep(0.7)
+        got, how = drain(s)
+        body = len(got.partition(b"\r\n\r\n")[2])
+        if how != "clean" or body != int(size):
+            bad.append("%s:%s:%d" % (size, how, body))
+        s.close()
+    print(len(sizes) * 3 - len(bad), " ".join(bad[:4]))
 elif mode in ("imapz-logout", "imapz-idle"):
     # COMPRESS DEFLATE over TLS, then LOGOUT, or nothing until the idle sweep says BYE.
     import zlib
@@ -300,6 +323,10 @@ if [ -r /proc/net/tls_stat ]; then
     t1=$(tx)
     check "proxy (--root): a large file sent by the kernel, then close_notify" "$r" "clean $((4 * 1024 * 1024)) 200"
     [ "$t1" -gt "$t0" ] && ok || bad "the proxy's large file went through kernel TLS" "TlsTxSw $t0 -> $t1"
+    # shellcheck disable=SC2086
+    r=$(client stalled "$P_FC" /f fc.test $STALL_SIZES)
+    check "proxy (--root): 48 files of 2.2-2.5 MB to clients that paused, each whole and then close_notify" \
+        "${r%% *}" "48"
 else
     echo "  (no kernel TLS here: the kernel-encrypted close is not checked)"
 fi
