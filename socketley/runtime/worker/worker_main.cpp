@@ -162,11 +162,20 @@ public:
         // The name travels with the request because this process cannot
         // resolve it, and false means the backlog is full, so the channel
         // answers the origin rather than parking a ticket nothing will
-        // complete.
+        // complete.  One past what the daemon reads is refused here, as the
+        // daemon would take it for a corrupt stream and drop this worker.
+        if (payload.size() > request_room(target))
+            return false;
         return m_w->write_with(
             worker_proto::chan_request_frame_size(target, payload), [&](std::string& out) {
                 worker_proto::append_chan_request_frame(out, ticket, target, payload);
             });
+    }
+
+    size_t request_room(std::string_view target) const override
+    {
+        const size_t envelope = worker_proto::chan_request_frame_size(target, {}) - worker_proto::header_size;
+        return envelope < worker_proto::max_payload ? worker_proto::max_payload - envelope : 0;
     }
 
 private:
@@ -1393,11 +1402,12 @@ private:
                             std::to_string(worker_proto::max_payload >> 20) + " MiB)";
                 reply = too_large;
             }
+            // Let past the backlog's cap by one frame, as the daemon lets an answer go on to the asker.
             if (!m_writer.write_with(
                     worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
                         worker_proto::append_chan_reply_frame(
                             out, to.wire_ticket, static_cast<uint8_t>(st), reply);
-                    })) {}
+                    }, frame_writer::MAX_BACKLOG + worker_proto::max_payload + worker_proto::header_size)) {}
             return;
         }
 

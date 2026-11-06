@@ -786,12 +786,15 @@ void proxy_supervisor::flush_control()
     }
 }
 
-bool proxy_supervisor::write_frame(const std::string& framed)
+bool proxy_supervisor::write_frame(const std::string& framed, size_t cap)
 {
     if (m_control_fd < 0)
         return false;
 
-    if (!m_out_gate.admit(pending_out(), framed.size(), MAX_CONTROL_BACKLOG,
+    // A frame with nothing queued ahead of it goes at any size, as a worker's frame_writer lets one go: the cap
+    // bounds a backlog, and a frame of max_payload past it would otherwise never reach the child.
+    if (pending_out() != 0 &&
+        !m_out_gate.admit(pending_out(), framed.size(), cap,
                           "proxy supervisor: control socket backlog full; the child "
                           "is not reading"))
         return false;
@@ -1697,7 +1700,7 @@ void proxy_supervisor::on_chan_req(std::string_view payload)
         if (!write_frame(worker_proto::frame(
                 worker_proto::frame_type::chan_rep,
                 worker_proto::encode_chan_reply(q.ticket,
-                    static_cast<uint8_t>(st), {})))) {}
+                    static_cast<uint8_t>(st), {})), ANSWER_BACKLOG)) {}
     };
 
     // The one cycle this arrangement can produce, cut here as the second lock
@@ -1746,5 +1749,5 @@ void proxy_supervisor::on_request_reply(uint64_t cookie, request_status st,
     if (!write_frame(worker_proto::frame(
             worker_proto::frame_type::chan_rep,
             worker_proto::encode_chan_reply(cookie, static_cast<uint8_t>(st),
-                                            reply)))) {}
+                                            reply)), ANSWER_BACKLOG)) {}
 }

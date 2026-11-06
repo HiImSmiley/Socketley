@@ -907,6 +907,13 @@ public:
         return false;
     }
 
+    size_t request_room(std::string_view target) const override
+    {
+        if (m_link && m_link->alive())
+            return SIZE_MAX;
+        return m_relay ? m_relay->request_room(target) : 0;
+    }
+
     uint64_t stat_direct()  const { return m_direct; }
     uint64_t stat_relayed() const { return m_relayed; }
 

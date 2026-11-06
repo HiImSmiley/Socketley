@@ -7,7 +7,8 @@
 #   * a message published on one shard missing the subscribers on another, or reaching one twice
 #   * a retained message kept only by the shard it was published on
 #   * a session that does not follow its client to another shard, or two shards both holding it
-#   * one too large for the daemon's frames lost on the way when there is no mesh, rather than kept where it was
+#   * one too large for the daemon's frames lost on the way when there is no mesh, rather than kept where it was;
+#     one of 6 MB, which the daemon's frames hold, lost because the daemon held its answers to 4 MiB
 #   * a shared subscription's message delivered once per shard instead of once per group
 #   * mqtt-sessions, mqtt-kick or mqtt-sub seeing one shard only
 #   * a shard's sessions lost across a restart because the shards share one snapshot
@@ -595,6 +596,37 @@ if phase == "relayed":
             check("with no mesh a session follows its client to another shard", got[:3], (True, 0, b"m%d" % got[3]))
         pub.disconnect()
     guarded("light", light)
+
+    # Past the 4 MiB the daemon's writer holds a backlog to and under its frames' 8 MiB: the session goes, whole.
+    def middle():
+        c = connected(port, "middle", props={SESSION_EXPIRY: 600})
+        c.subscribe(("middle/#", 1))
+        first = shard_of("middle")
+        c.disconnect()
+        pub = connected(port, "middle-pub", timeout=30)
+        body = lambda i: (b"%04d" % i) * 62500
+        for i in range(24):
+            pub.publish("middle/t", body(i), qos=1)
+        pub.disconnect()
+        # Every message in the session before it is asked for, so what moves is the 6 MB.
+        for _ in range(100):
+            if [s.get("queued") for s in sessions() if s["client"] == "middle"] == [24]:
+                break
+            time.sleep(0.1)
+        moved = None
+        for _ in range(30):
+            c = Client(port, timeout=30)
+            present, code, _ = c.connect("middle", clean=False, props={SESSION_EXPIRY: 600})
+            if shard_of("middle") != first:
+                moved = (present, code, len({m.payload[:4] for m in c.messages(24, 30)
+                                             if m.payload == body(int(m.payload[:4]))}))
+                c.disconnect()
+                break
+            c.close()
+            time.sleep(0.2)
+        check("with no mesh a session of 6 MB follows its client to another shard with its 24 messages",
+              moved, (True, 0, 24))
+    guarded("middle", middle)
 
     def heavy():
         c = connected(port, "heavy", props={SESSION_EXPIRY: 600})

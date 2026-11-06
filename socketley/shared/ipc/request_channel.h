@@ -55,6 +55,9 @@ public:
     virtual bool serve_deferred(uint64_t /*ticket*/, std::string_view /*target*/,
                                 std::string_view /*payload*/)
     { return false; }
+
+    // The longest payload a request to `target` may have for this sink to carry it now.
+    virtual size_t request_room(std::string_view /*target*/) const { return SIZE_MAX; }
 };
 
 // A sink whose every answer comes on a later turn, so the inline path is never taken.
@@ -134,6 +137,8 @@ public:
 
     // The longest answer a parked ticket's way back can carry, 0 once it is not parked.
     size_t reply_room(uint64_t ticket) const;
+    // The longest payload a request to `target` can carry the way it would go now.
+    size_t request_room(std::string_view target) const;
 
     // Park a request that arrived from outside this channel, so its answer
     // comes through complete_deferred() like any other; 0 when the table is

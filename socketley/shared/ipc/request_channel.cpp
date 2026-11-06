@@ -264,6 +264,13 @@ size_t request_channel::reply_room(uint64_t ticket) const
     return it->second.origin->reply_room(it->second.cookie);
 }
 
+size_t request_channel::request_room(std::string_view target) const
+{
+    const auto it = m_sinks.find(target);
+    const request_sink* sink = it == m_sinks.end() ? m_default_sink : it->second;
+    return sink ? sink->request_room(target) : SIZE_MAX;
+}
+
 uint64_t request_channel::park(request_origin* origin, uint64_t cookie,
                                const request_sink* sink, request_class cls)
 {

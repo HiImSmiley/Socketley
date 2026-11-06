@@ -352,7 +352,7 @@ public:
 
 private:
     void   close_control();
-    bool   write_frame(const std::string& framed);
+    bool   write_frame(const std::string& framed, size_t cap = MAX_CONTROL_BACKLOG);
 
     // One outstanding direct request, because a command handler blocks until
     // its own answer arrives and cannot start a second.
@@ -406,6 +406,8 @@ private:
     // alternative is the daemon growing without limit on behalf of a child
     // that has stopped reading.
     static constexpr size_t MAX_CONTROL_BACKLOG = 4u << 20;
+    // An answer is let past the cap by one frame, since one refused here is owed to an asker nobody else answers.
+    static constexpr size_t ANSWER_BACKLOG = MAX_CONTROL_BACKLOG + worker_proto::max_payload + worker_proto::header_size;
 
     std::string  m_out;
     size_t       m_out_off{0};
