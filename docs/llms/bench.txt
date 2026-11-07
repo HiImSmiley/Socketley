@@ -150,95 +150,95 @@ How it was measured: wrk 16 threads, 8 s a run; socketley as four shards, HAProx
 
 ## Static site: pages, assets, compression, revalidation
 
-nginx 1.28.3, 9 passes, 2026-11-07, socketley fc762708.
+nginx 1.28.3, 9 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.19× (3.81–4.47) |
-| page 4 KiB, a connection per request, 64 at once | 73 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 2.33× (2.18–2.60) |
-| asset 64 KiB (hashed name), keep-alive, 256 connections | 70 K req/s (1.00 cores) | 42 K req/s (1.00 cores) | 1.67× (1.46–2.23) |
-| file 1 MiB, keep-alive, 64 connections | 25 K req/s (1.00 cores) | 20 K req/s (1.00 cores) | 1.21× (1.11–1.32) |
-| page 4 KiB as gzip, the .gz beside it | 238 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.91× (4.56–5.24) |
-| page 4 KiB as brotli, the .br beside it | 231 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.61× (4.23–5.08) |
-| page 4 KiB as gzip, no .gz on disk | 232 K req/s (1.00 cores) | 26 K req/s (1.00 cores) | 9.19× (8.81–10.08) |
-| revalidation: If-None-Match, 304 | 239 K req/s (1.00 cores) | 64 K req/s (1.00 cores) | 3.76× (2.87–4.10) |
-| missing file: the site's 404.html | 224 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.53× (5.16–5.95) |
-| 10,000 pages of 4 KiB at random | 203 K req/s (1.00 cores) | 53 K req/s (1.00 cores) | 3.86× (3.60–4.05) |
+| page 4 KiB, keep-alive, 256 connections | 232 K req/s (1.00 cores) | 48 K req/s (1.00 cores) | 4.89× (4.56–5.39) |
+| page 4 KiB, a connection per request, 64 at once | 75 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 2.38× (2.32–2.54) |
+| asset 64 KiB (hashed name), keep-alive, 256 connections | 68 K req/s (1.00 cores) | 42 K req/s (1.00 cores) | 1.61× (1.54–1.66) |
+| file 1 MiB, keep-alive, 64 connections | 21 K req/s (1.00 cores) | 20 K req/s (1.00 cores) | 1.04× (0.99–1.06) |
+| page 4 KiB as gzip, the .gz beside it | 272 K req/s (1.00 cores) | 48 K req/s (1.00 cores) | 5.67× (5.10–6.08) |
+| page 4 KiB as brotli, the .br beside it | 276 K req/s (1.00 cores) | 52 K req/s (1.00 cores) | 5.29× (4.53–5.75) |
+| page 4 KiB as gzip, no .gz on disk | 281 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 11.14× (10.48–11.50) |
+| revalidation: If-None-Match, 304 | 279 K req/s (1.00 cores) | 66 K req/s (1.00 cores) | 4.28× (3.81–4.60) |
+| missing file: the site's 404.html | 256 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 6.46× (6.04–7.08) |
+| 10,000 pages of 4 KiB at random | 243 K req/s (1.00 cores) | 54 K req/s (1.00 cores) | 4.51× (4.35–4.89) |
 
 How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row.
 
 ## Authoritative DNS, one zone of 10,000 names
 
-NSD 4.14.0, Knot 3.5.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+NSD 4.14.0, Knot 3.5.3, 9 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | NSD | Knot | socketley vs NSD | socketley vs Knot |
 |---|---|---|---|---|---|
-| A queries over UDP | 506 K q per core·s (1.00 cores) | 369 K q per core·s (0.89 cores) | 306 K q per core·s (0.92 cores) | 1.38× (1.34–1.50) | 1.65× (1.61–1.81) |
-| A queries over TCP, 128 connections | 188 K q per core·s (0.99 cores) | 54 K q per core·s (0.97 cores) | 62 K q per core·s (0.99 cores) | 3.49× (3.28–3.53) | 3.04× (2.87–3.06) |
+| A queries over UDP | 484 K q per core·s (1.00 cores) | 360 K q per core·s (0.90 cores) | 301 K q per core·s (0.92 cores) | 1.34× (1.30–1.43) | 1.61× (1.55–1.69) |
+| A queries over TCP, 128 connections | 195 K q per core·s (0.99 cores) | 54 K q per core·s (0.97 cores) | 63 K q per core·s (0.99 cores) | 3.51× (3.25–3.77) | 3.02× (2.85–3.30) |
 
 How it was measured: dnsperf 8 threads, 32 sockets, 8 s a run, zone of 10000 names; each server one worker on one core, dnsperf on 20 others. Queries answered per second of server CPU (rate ÷ cores), because no server saturates its core at a window of 500 outstanding queries, and with more NSD and Knot drop UDP from their default socket buffers and dnsperf waits out each loss. socketley runs with --rrl 0 --proxy none: its response rate limit, on by default, would throttle one client host, and NSD and Knot have none by default. 90% of queries find a name, 10% are NXDOMAIN.
 
 ## MQTT broker, deliveries per second
 
-Mosquitto 2.0.22, 9 passes, 2026-11-07, socketley 14fae8c3.
+Mosquitto 2.0.22, 9 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | Mosquitto | socketley vs Mosquitto |
 |---|---|---|---|
-| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 6.87 M msg/s (0.97 cores) | 793 K msg/s (0.99 cores) | 8.66× (8.47–8.85) |
-| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.53 M msg/s (1.00 cores) | 568 K msg/s (0.99 cores) | 20.29× (20.10–28.22) |
-| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.49 M msg/s (1.00 cores) | 70 K msg/s (1.00 cores) | 21.27× (20.83–21.53) |
-| round trip, QoS 1 publish to own delivery | 26.7 µs (0.92 cores) | 42.3 µs (0.68 cores) | 1.58× (1.58–1.62) |
+| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 7.44 M msg/s (0.97 cores) | 808 K msg/s (0.99 cores) | 9.21× (9.02–9.29) |
+| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.49 M msg/s (1.00 cores) | 530 K msg/s (0.99 cores) | 21.61× (19.95–33.18) |
+| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.48 M msg/s (1.00 cores) | 69 K msg/s (1.00 cores) | 21.35× (21.11–21.59) |
+| round trip, QoS 1 publish to own delivery | 26.6 µs (0.92 cores) | 42.5 µs (0.68 cores) | 1.61× (1.59–1.76) |
 
 How it was measured: mqbench (MQTT 3.1.1), 6 s a run; each broker on one core, mqbench on 20 others. MQTT 3.1.1, 64-byte payloads; Mosquitto with persistence off and unbounded queues, socketley --anonymous --session-queue 100000. A fan-out delivery costs Mosquitto about 4 µs of CPU, one write each; socketley coalesces the writes to a subscriber, which is the whole of the fan-out difference. The round trip is a QoS 1 publish to the publisher's own subscription.
 
 ## S3 over HTTP, SigV4
 
-MinIO 2025-09-07, 7 passes, 2026-11-07, socketley fc762708.
+MinIO 2025-09-07, 7 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | MinIO | socketley vs MinIO |
 |---|---|---|---|
-| GET 4 KiB, 1 connection | 21 K obj/s (0.61 cores) | 3.9 K obj/s (1.30 cores) | 5.41× (5.34–5.44) |
-| GET 4 KiB, 64 connections | 452 K obj/s (3.79 cores) | 24 K obj/s (3.99 cores) | 18.98× (18.27–19.35) |
-| GET 4 KiB, 128 connections | 564 K obj/s (3.96 cores) | 24 K obj/s (3.99 cores) | 23.54× (23.00–24.28) |
-| GET 4 KiB, 64 connections, from 50,000 objects | 246 K obj/s (3.99 cores) | 24 K obj/s (3.99 cores) | 10.16× (9.98–10.31) |
-| GET 1 MiB, 64 connections | 40 K obj/s (4.00 cores) | 6.0 K obj/s (3.94 cores) | 6.67× (6.48–6.85) |
-| PUT 4 KiB, 64 connections, into an empty store | 77 K obj/s (3.77 cores) | 15 K obj/s (3.98 cores) | 5.05× (4.96–5.19) |
+| GET 4 KiB, 1 connection | 21 K obj/s (0.61 cores) | 3.9 K obj/s (1.30 cores) | 5.39× (5.29–5.42) |
+| GET 4 KiB, 64 connections | 446 K obj/s (3.79 cores) | 25 K obj/s (3.99 cores) | 18.47× (17.66–18.94) |
+| GET 4 KiB, 128 connections | 555 K obj/s (3.96 cores) | 24 K obj/s (3.99 cores) | 22.84× (22.53–23.67) |
+| GET 4 KiB, 64 connections, from 50,000 objects | 247 K obj/s (3.98 cores) | 25 K obj/s (3.99 cores) | 10.13× (9.86–10.37) |
+| GET 1 MiB, 64 connections | 40 K obj/s (4.00 cores) | 6.1 K obj/s (3.93 cores) | 6.59× (6.38–6.69) |
+| PUT 4 KiB, 64 connections, into an empty store | 79 K obj/s (3.78 cores) | 16 K obj/s (3.98 cores) | 5.09× (5.05–5.18) |
 
 How it was measured: s3gen (Go, one process, a request in flight per connection), 8s a run, SigV4 over plain HTTP, PUT bodies aws-chunked and signed; both servers on the same four cores (socketley as four shards), s3gen on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. s3gen signs every request with SigV4 as warp does (PUTs as signed aws-chunked bodies) and checks every answer's status, length and ETag; from 64 connections both servers fill their four cores. The 4 KiB rows read 2,500 objects, which socketley keeps as in-memory copies; the 50,000-object row reads past them, where every GET opens its file as MinIO's always do. The PUT row starts both servers afresh on empty storage for every pass, because MinIO reclaims deleted objects in the background and its puts slow while it does.
 
 ## JSON documents over HTTP
 
-MongoDB 9.0.4, PocketBase 0.40.5, 7 passes, 2026-11-07, socketley 14fae8c3.
+MongoDB 9.0.4, PocketBase 0.40.5, 7 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | MongoDB | PocketBase | socketley vs MongoDB | socketley vs PocketBase |
 |---|---|---|---|---|---|
-| read one document by id, 64 clients | 670 K req/s (3.50 cores) | 152 K req/s (3.88 cores) | 35 K req/s (3.89 cores) | 4.40× (4.30–5.68) | 19.18× (18.70–19.96) |
-| replace one document, 64 clients | 124 K req/s (3.13 cores) | 102 K req/s (3.94 cores) | 12 K req/s (2.74 cores) | 1.23× (1.17–1.35) | 10.62× (9.50–11.11) |
-| query on an indexed field, 64 clients | 485 K req/s (3.60 cores) | 85 K req/s (3.88 cores) | 22 K req/s (3.81 cores) | 5.75× (5.59–5.86) | 21.76× (20.85–22.49) |
-| mixed: 90% reads, 10% writes, 64 clients | 327 K req/s (3.62 cores) | 133 K req/s (3.91 cores) | 38 K req/s (3.57 cores) | 2.46× (2.38–2.54) | 8.63× (8.46–8.82) |
+| read one document by id, 64 clients | 681 K req/s (3.44 cores) | 152 K req/s (3.88 cores) | 35 K req/s (3.86 cores) | 4.52× (4.38–4.82) | 19.41× (18.96–20.64) |
+| replace one document, 64 clients | 124 K req/s (3.12 cores) | 102 K req/s (3.94 cores) | 12 K req/s (2.72 cores) | 1.22× (1.12–1.26) | 10.63× (9.94–11.05) |
+| query on an indexed field, 64 clients | 492 K req/s (3.55 cores) | 84 K req/s (3.90 cores) | 22 K req/s (3.78 cores) | 5.91× (5.61–6.07) | 22.30× (21.75–23.27) |
+| mixed: 90% reads, 10% writes, 64 clients | 327 K req/s (3.65 cores) | 128 K req/s (3.91 cores) | 38 K req/s (3.56 cores) | 2.57× (2.42–2.60) | 8.57× (8.36–8.91) |
 
 How it was measured: loadgen, 8s a run, 100,000 documents, data on tmpfs; all three on the same four cores (socketley as four shards), loadgen on 20 others. 100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db hands every write to shard 0, so its writes are at most what one shard takes, at more cores; reads and queries spread over all four.
 
 ## A TCP service behind an edge
 
-frp 0.71.1, 9 passes, 2026-11-07, socketley 14fae8c3.
+frp 0.71.1, 9 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | frp | socketley vs frp |
 |---|---|---|---|
-| round trip through the tunnel, 64 B echo | 88.8 µs (0.87 cores) | 167 µs (1.34 cores) | 1.88× (1.87–1.89) |
-| throughput, 512 MiB echoed through the tunnel | 2.0 K MiB/s (1.91 cores) | 851.0 MiB/s (1.83 cores) | 2.31× (2.01–2.56) |
+| round trip through the tunnel, 64 B echo | 88.7 µs (0.82 cores) | 166 µs (1.35 cores) | 1.86× (1.85–1.89) |
+| throughput, 512 MiB echoed through the tunnel | 2.0 K MiB/s (1.90 cores) | 867.0 MiB/s (1.82 cores) | 2.32× (2.15–2.51) |
 
 How it was measured: tb_client, one connection; agent and edge (frpc and frps) on the same two cores, the echo service on a third. socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in about half frp's time and moves bulk data at three quarters of its rate.
 
 ## Scraping 100,000 series a second
 
-Prometheus 2.53.5, VictoriaMetrics 1.112, 7 passes, 2026-11-07, socketley 14fae8c3.
+Prometheus 2.53.5, VictoriaMetrics 1.112, 7 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
 |---|---|---|---|---|---|
-| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.75 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.58× (2.56–2.66) | 3.48× (3.40–3.68) |
-| resident memory | 89.8 MB | 398 MB | 121 MB | 4.43× (3.98–5.03) | 1.35× (1.23–1.48) |
-| range query, 5 min of every path | 59.9 ms | 633 ms | 174 ms | 10.51× (9.36–11.45) | 2.93× (1.68–3.61) |
+| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.73 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.59× (2.52–2.62) | 3.56× (3.44–3.63) |
+| resident memory | 97.5 MB | 377 MB | 133 MB | 3.87× (3.75–4.00) | 1.36× (1.35–1.40) |
+| range query, 5 min of every path | 60.3 ms | 643 ms | 131 ms | 10.53× (6.44–11.65) | 2.19× (1.41–2.89) |
 
 How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
 
@@ -255,41 +255,41 @@ How it was measured: the carriers themselves; the storage target is one socketle
 
 ## OpenID Connect provider
 
-Keycloak 26.8.1, 7 passes, 2026-11-07, socketley fc762708.
+Keycloak 26.8.1, 7 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 264.0 req/s (3.98 cores) | 191.0 req/s (3.92 cores) | 1.35× (1.20–1.79) |
-| refresh token, 256 clients | 58 K req/s (2.72 cores) | 2.4 K req/s (3.88 cores) | 24.36× (22.62–25.10) |
-| userinfo, 512 clients | 511 K req/s (3.72 cores) | 22 K req/s (3.85 cores) | 23.86× (22.59–24.86) |
-| JWKS, 256 connections (wrk) | 451 K req/s (3.99 cores) | 29 K req/s (3.93 cores) | 15.55× (15.31–15.76) |
+| sign-in: authorization code with a password, 16 clients | 253.0 req/s (3.98 cores) | 193.0 req/s (3.93 cores) | 1.30× (1.27–1.82) |
+| refresh token, 256 clients | 59 K req/s (2.76 cores) | 2.4 K req/s (3.88 cores) | 23.88× (23.25–25.97) |
+| userinfo, 512 clients | 506 K req/s (3.69 cores) | 22 K req/s (3.87 cores) | 23.50× (22.55–24.95) |
+| JWKS, 256 connections (wrk) | 500 K req/s (3.99 cores) | 30 K req/s (3.92 cores) | 16.90× (16.78–17.22) |
 
 How it was measured: idpgen, 8s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen and wrk on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. Refresh and userinfo come from four idpgen processes and JWKS from wrk, with as many clients as fill socketley's four cores; refresh stays near the same rate from 256 to 512 clients, bound by the durable write of each rotated token family through shard 0. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.
 
 ## Mail: delivery in, IMAP and POP3 out
 
-Postfix 3.10.6 + Dovecot 2.4.2, 7 passes, 2026-11-07, socketley fc762708.
+Postfix 3.10.6 + Dovecot 2.4.2, 7 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | Postfix 3.10.6 + Dovecot | socketley vs Postfix 3.10.6 + Dovecot |
 |---|---|---|---|
-| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 379.0 msg/s (0.10 cores) | 108.0 msg/s (0.26 cores) | 3.44× (2.71–3.66) |
-| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 209.0 msg/s (0.16 cores) | 57.4 msg/s (0.16 cores) | 3.64× (2.89–4.05) |
-| IMAP: LOGIN and LOGOUT, 8 clients | 127.0 sign-ins/s (0.99 cores) | 64.4 sign-ins/s (1.00 cores) | 1.96× (1.95–1.98) |
-| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 490 K msg/s (0.99 cores) | 125 K msg/s (1.00 cores) | 3.91× (3.88–4.03) |
-| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 19 K msg/s (0.99 cores) | 14 K msg/s (0.99 cores) | 1.41× (1.26–1.47) |
-| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 12 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.72× (1.69–1.81) |
+| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 408.0 msg/s (0.11 cores) | 109.0 msg/s (0.26 cores) | 3.72× (3.21–4.00) |
+| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 209.0 msg/s (0.16 cores) | 56.3 msg/s (0.16 cores) | 3.93× (3.21–4.18) |
+| IMAP: LOGIN and LOGOUT, 8 clients | 126.0 sign-ins/s (0.99 cores) | 64.4 sign-ins/s (0.99 cores) | 1.96× (1.95–1.97) |
+| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 487 K msg/s (0.99 cores) | 125 K msg/s (0.99 cores) | 3.88× (3.85–3.92) |
+| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 18 K msg/s (0.99 cores) | 13 K msg/s (0.99 cores) | 1.38× (1.35–1.49) |
+| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 12 K msg/s (0.99 cores) | 7.0 K msg/s (1.00 cores) | 1.77× (1.67–1.80) |
 
 How it was measured: smtp-source (64 processes x 1 connections); mailload.py (8 asyncio processes x 1 connection), 8 s a run; every process of each on the same one core (socketley's daemon, idp, storage and mail; Postfix and Dovecot); smtp-source and mailload on 20 others; data on the VM's ext4 disk. Postfix hands each message over LMTP to Dovecot's Maildir and index; socketley's mail runtime writes it into its storage runtime. Both sync to disk (about 4 ms a sync here) before a message counts, so the SMTP rows are bound by syncs, not cores, and are timed until the last message is in its mailbox. Every sign-in hashes the password: scrypt in socketley, yescrypt in Dovecot. Dovecot 2.4's lmtp_user_concurrency_limit is set to unlimited, 2.3's default, since 10 made Postfix wait out five-minute retries.
 
 ## MCP server over Streamable HTTP
 
-MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 9 passes, 2026-11-07, socketley fc762708.
+MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 9 passes, 2026-11-07, socketley 608e28c6.
 
 | case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
 |---|---|---|---|---|---|
-| initialize + tools/list, a new session each, 64 at once | 69 K req/s (0.97 cores) | 1.2 K req/s (1.00 cores) | 1.7 K req/s (1.00 cores) | 59.16× (58.11–59.90) | 40.67× (39.88–42.23) |
-| tools/call add(a, b), 64 sessions | 135 K req/s (0.99 cores) | 5.3 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 25.64× (24.86–26.09) | 19.05× (18.32–19.32) |
-| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.91 cores) | 5.3 K req/s (1.00 cores) | 6.8 K req/s (1.00 cores) | 10.29× (10.11–10.67) | 8.03× (7.98–8.25) |
-| resources/read, 1 KiB of text, 64 sessions | 151 K req/s (0.96 cores) | 5.4 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.14× (25.58–28.81) | 20.47× (19.89–20.83) |
+| initialize + tools/list, a new session each, 64 at once | 73 K req/s (0.97 cores) | 1.1 K req/s (1.00 cores) | 1.7 K req/s (1.00 cores) | 63.78× (61.13–65.00) | 43.55× (42.81–44.16) |
+| tools/call add(a, b), 64 sessions | 138 K req/s (0.99 cores) | 5.5 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 25.21× (24.71–27.38) | 19.36× (18.98–19.55) |
+| tools/call returning 16 KiB of text, 64 sessions | 55 K req/s (0.91 cores) | 5.3 K req/s (1.00 cores) | 6.9 K req/s (1.00 cores) | 10.34× (10.03–10.69) | 7.95× (7.81–8.11) |
+| resources/read, 1 KiB of text, 64 sessions | 155 K req/s (0.96 cores) | 5.5 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.50× (26.62–30.19) | 20.96× (20.48–21.31) |
 
 How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 6s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
