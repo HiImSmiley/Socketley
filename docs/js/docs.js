@@ -53,10 +53,10 @@ const NOBENCH = {
 
 const NAV = [
   ['Start', [['', 'Overview', 'home'], ['install', 'Install', 'download'], ['tour', 'Ten-minute tour', 'rocket'], ['concepts', 'Concepts', 'layers'], ['how', 'How it works', 'flow']]],
+  ['Performance', [['bench', 'Benchmarks', 'bars']]],
   ['Runtimes', RT.map(r => ['rt/' + r[0], r[0], r[0]])],
   ['Guides', [['lua', 'Lua scripting', 'code'], ['deploy', 'Deployment', 'shield'], ['operate', 'Operating it', 'eye'], ['cluster', 'Cluster', 'nodes'], ['sdk', 'C++ SDK', 'pkg'], ['examples', 'Examples', 'folder']]],
   ['Reference', [['cli', 'CLI', 'term'], ['flags', 'All flags', 'list'], ['env', 'Environment & files', 'gear'], ['man', 'Manual', 'book']]],
-  ['Performance', [['bench', 'Benchmarks', 'bars']]],
 ];
 const TITLES = Object.fromEntries(NAV.flatMap(g => g[1]).map(([h, t]) => [h, t]));
 
