@@ -52,6 +52,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/loop/ring_read.h"
 #include "../../shared/http/http_framing.h"
 #include "../../shared/crypto/tls_context.h"
 
@@ -420,9 +421,8 @@ struct conn
     bool            pulling{false};
     std::chrono::steady_clock::time_point accepted{};
 
-    io_request rd_req{};
+    socketley::ring_read rd;
     io_request wr_req{};
-    bool       rd_pending{false};
     bool       wr_pending{false};
     // A read of the object's file into sbuf the ring has not answered, which the conn must outlive.
     bool       file_rd_pending{false};
@@ -433,10 +433,6 @@ struct conn
     // A recv lands in a buffer the ring lends for the length of the completion, and for a body
     // with nothing to decode straight in the put's staging buffer instead.
     bool        rd_direct{false};
-    // The armed recv is one that keeps delivering until it is cancelled or the peer goes.
-    bool        rd_multi{false};
-    // A cancel for that recv has been submitted, and its last completion is awaited.
-    bool        rd_cancel{false};
     // The last recv took what the socket had and left it empty, so the next one waits for data instead of trying first.
     bool        rd_drained{true};
     // The body is trickling in, judged by what arrived since `rate_since`, and its next recv waits for the pace tick.
@@ -450,7 +446,6 @@ struct conn
     bool        peer_eof{false};
     // Read into by a recv the ring could not serve, and only then allocated.
     std::unique_ptr<char[]> fbuf;
-    bool        rd_fallback{false};
     // A TLS body's ciphertext, 16 KiB a read and growing while it streams (shared/net/read_buffer.h): the ring's 16 KiB
     // buffers took one recv, one wakeup and one record per read; the last read's size is told to it at the next arm.
     socketley::read_buffer<16384> tls_rbuf;
@@ -1712,9 +1707,10 @@ private:
     static constexpr uint64_t kernel_tls_min = 256u << 10;
     bool        m_kernel_tls{true};
     size_t      m_max_conns{0};
-    // Whether a recv can be lent a buffer by the ring, and be armed once to keep delivering.
-    bool        m_ring{false};
-    bool        m_multishot{false};
+    // The buffer group a recv is lent its bytes from, and its geometry: a head is a few hundred bytes, so what one
+    // buffer holds is what a small body can arrive in.
+    static constexpr socketley::ring_group recv_ring{5, 64, 16 * 1024};
+    socketley::ring_reader m_reads{m_loop, recv_ring};
 
     friend class ::storage_instance;
 };

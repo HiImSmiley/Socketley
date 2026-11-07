@@ -64,11 +64,6 @@ constexpr uint64_t pace_tail_bytes     = 64 * 1024;
 // sent it hears the answer instead of a reset; beyond it the connection closes.
 constexpr uint64_t discard_limit       = 64ull << 20;
 constexpr int      body_stall_secs     = 60;
-// The group of the buffer ring a recv is lent its bytes from, and its geometry: a head is a few hundred
-// bytes, so what one buffer holds is what a small body can arrive in.
-constexpr uint16_t ring_group          = 5;
-constexpr uint32_t ring_buf_bytes      = 16 * 1024;
-constexpr uint32_t ring_buf_count      = 64;
 // What a recv brings when the ring has none to lend.
 constexpr uint32_t fallback_bytes      = 16 * 1024;
 // A body this small is taken out of the ring's buffers, and a larger one is read where it will be written.
@@ -163,11 +158,10 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
         m_zero_copy_min = *v;
     m_kernel_tls = settings::flag("SOCKETLEY_KERNEL_TLS", true);
     // A count the tests shrink to make the ring run dry; zero takes it away.
-    uint32_t ring_bufs = ring_buf_count;
+    uint32_t ring_bufs = recv_ring.bufs;
     if (const auto v = settings::number<uint32_t>("SOCKETLEY_STORAGE_RECV_BUFS"); v && (*v & (*v - 1)) == 0)
         ring_bufs = *v;
-    m_ring      = ring_bufs != 0 && m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
-    m_multishot = m_ring && m_loop.recv_multishot_enabled();
+    m_reads.setup(ring_bufs);
 }
 
 storage_run::~storage_run() = default;
@@ -806,13 +800,13 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
     c->on_body     = false;
 
     m_conns.erase(c->id);
-    if (c->rd_pending || c->wr_pending || c->poll_pending || c->file_rd_pending)
+    if (c->rd.pending || c->wr_pending || c->poll_pending || c->file_rd_pending)
         m_closing.push_back(c);
 }
 
 void storage_run::maybe_release(const std::shared_ptr<conn>& c)
 {
-    if (!c->dead || c->rd_pending || c->wr_pending || c->poll_pending || c->file_rd_pending)
+    if (!c->dead || c->rd.pending || c->wr_pending || c->poll_pending || c->file_rd_pending)
         return;
     auto it = std::find(m_closing.begin(), m_closing.end(), c);
     if (it != m_closing.end())
@@ -905,14 +899,13 @@ void storage_run::pace_tick()
 
 void storage_run::cancel_read(const std::shared_ptr<conn>& c)
 {
-    if (c->rd_cancel)
+    if (c->rd.cancel)
         return;
-    if (!m_loop.submit_cancel_request(&c->rd_req))
+    if (!m_reads.withdraw(c->rd))
     {
         close_conn(c);
         return;
     }
-    c->rd_cancel = true;
     ++m_c.recv_cancels;
 }
 
@@ -935,10 +928,10 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
         return;
     // A body that trickles in is left to gather in the socket until the next tick, so a recv and a wakeup are not paid per segment.
     const bool pace = c->ph == phase::body_put && c->trickle && c->body_left > pace_tail_bytes && !m_stopped;
-    if (c->rd_pending)
+    if (c->rd.pending)
     {
         // A recv that keeps delivering is left standing, unless the phase now wants a buffer of its own or a pace.
-        if (c->rd_multi && !c->rd_cancel && (pace || plan_read(*c).k == read_plan::kind::own))
+        if (c->rd.multi && !c->rd.cancel && (pace || plan_read(*c).k == read_plan::kind::own))
             cancel_read(c);
         return;
     }
@@ -949,7 +942,7 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
         c->ph != phase::hook_wait)
     {
         tls_pull(c);
-        if (c->dead || c->rd_pending)
+        if (c->dead || c->rd.pending)
             return;
     }
 
@@ -992,8 +985,6 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
         plan.buf = c->tls_rbuf.data();
         plan.len = c->tls_rbuf.size();
     }
-    c->rd_multi  = false;
-    c->rd_cancel = false;
     if (plan.hook)
     {
         if (!c->hbuf)
@@ -1001,79 +992,45 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
         plan.buf = c->hbuf.get() + c->hfill;
     }
 
-    c->rd_req = io_request{};
-    c->rd_req.owner  = this;
-    c->rd_req.buffer = reinterpret_cast<char*>(c.get());
-    bool queued = false;
-    if (plan.k == read_plan::kind::ring && m_ring && !c->rd_fallback)
-    {
-        // Nothing is held for an idle connection: the kernel picks a buffer when bytes arrive.
-        if (m_multishot && !c->ssl && !pace)
-            queued = c->rd_multi = m_loop.submit_recv_multishot(c->fd, ring_group, &c->rd_req);
-        if (!queued)
-            queued = m_loop.submit_read_provided(c->fd, ring_group, &c->rd_req, c->rd_drained);
-    }
-    else
-    {
-        if (plan.k == read_plan::kind::ring)
+    const bool ring = plan.k == read_plan::kind::ring;
+    // Nothing is held for an idle connection: the kernel picks a buffer when bytes arrive.
+    const socketley::ring_arm how{.ring = ring, .multishot = !c->ssl && !pace, .poll_first = ring && c->rd_drained};
+    const auto own = [&] {
+        // The ring could not lend one, so this receive brings its own.
+        if (ring)
         {
-            // The ring could not lend one, so this receive brings its own.
             c->fbuf = std::make_unique_for_overwrite<char[]>(fallback_bytes);
-            plan.buf = c->fbuf.get();
-            plan.len = fallback_bytes;
+            return std::pair<char*, uint32_t>{c->fbuf.get(), fallback_bytes};
         }
-        c->rd_req.type = op_read;
-        queued = m_loop.submit_read(c->fd, plan.buf, plan.len, &c->rd_req);
-    }
-    c->rd_fallback = false;
-    if (!queued)
-    {
-        c->rd_multi = false;
+        return std::pair<char*, uint32_t>{plan.buf, static_cast<uint32_t>(plan.len)};
+    };
+    if (!m_reads.arm(c->rd, this, c.get(), c->fd, how, own))
         close_conn(c);
-        return;
-    }
-    c->rd_pending = true;
 }
 
 void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe)
 {
-    const bool multi = is_multishot_recv_op(c->rd_req.type);
-    const bool more  = multi && (cqe->flags & IORING_CQE_F_MORE) != 0;
+    using kind = socketley::ring_bytes::kind;
+    const bool multi = is_multishot_recv_op(c->rd.req.type);
+    const bool lent  = c->rd.req.type != op_read;
     // Whatever the ring lent goes back on every way out, and a fallback buffer is freed with it.
-    struct lent
-    {
-        event_loop&              loop;
-        bool                     held;
-        uint16_t                 id;
-        std::unique_ptr<char[]>  own;
-        ~lent()
-        {
-            if (held)
-                loop.return_buf(ring_group, id);
-        }
-    } lend{m_loop, (cqe->flags & IORING_CQE_F_BUFFER) != 0,
-           static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT), std::move(c->fbuf)};
-    if (!more)
-    {
-        c->rd_pending = false;
-        c->rd_multi   = false;
-        c->rd_cancel  = false;
-    }
+    const std::unique_ptr<char[]> fallback = std::move(c->fbuf);
+    const auto got   = m_reads.take(c->rd, cqe);
+    const bool more  = got.more;
     if (c->dead)
     {
         maybe_release(c);
         return;
     }
     const int res = cqe->res;
-    if (res == -ENOBUFS)
+    if (got.what == kind::no_buffer)
     {
-        // The ring had nothing to lend: this receive is taken by a buffer of the connection's own.
+        // The ring had nothing to lend: the next receive is taken by a buffer of the connection's own.
         ++m_c.recv_fallbacks;
-        c->rd_fallback = true;
         arm_read(c);
         return;
     }
-    if (res == -ECANCELED && !more)
+    if (got.what == kind::withdrawn)
     {
         // Asked for, because the phase wanted a buffer of its own or the backlog was full.
         arm_read(c);
@@ -1120,14 +1077,9 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
     if (c->ph == phase::body_put)
         ++m_c.body_recvs;
 
-    const char* data = nullptr;
-    if (lend.held)
-        data = m_loop.get_buf_ptr(ring_group, lend.id);
-    else if (lend.own)
-        data = lend.own.get();
-    else if (c->rd_tls)
+    const char* data = got.data();
+    if (!lent && !fallback && c->rd_tls)
     {
-        data = c->tls_rbuf.data();
         c->tls_last = static_cast<uint32_t>(n);
         c->rd_tls = false;
     }
@@ -1195,7 +1147,7 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
     if (c->dead)
         return;
     // A recv that keeps delivering is stopped when what it brought has piled up faster than it is taken.
-    if (more && !c->rd_cancel &&
+    if (more && !c->rd.cancel &&
         (c->in.size() > backlog_cap || c->park.size() - c->park_off > backlog_cap))
         cancel_read(c);
     else if (!more && multi)
