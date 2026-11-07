@@ -38,6 +38,8 @@ Unset, UDP and TCP both send to **others**. Before this flag existed, a UDP send
 
 Uses UDP instead of TCP. The server binds a single SOCK_DGRAM socket. A peer is registered automatically on its first datagram. Each datagram is one message, with no line parsing. Broadcast sends to all known peers with sendto(). Not available for cache or proxy.
 
+A script's **on_client_message(id, msg)** gets each datagram with the id of the peer that sent it, and **self.send(id, msg)** answers that peer with one datagram, sent as written. The id stays the peer's until the server forgets the peer: after **--idle-timeout** without a datagram from it, or when a full table of 10,000 peers makes room for a new one. A forgotten peer that sends again gets a new id, and **self.send** to the old one answers false with the reason. Return **true** from the handler, or the datagram is also relayed as **--send-to** says.
+
 **An exposed UDP server can reflect traffic.** With no Lua handler, every datagram is relayed to every other peer that has sent one. A peer is learned from a source address, which a sender can forge. Keep such a server on a trusted network, or give it a Lua handler that decides.
 
 Refused with **--mode master**. Master mode claims a connection as the master, and a datagram is not a connection, so the pair is worse than useless. Without the refusal, a datagram beginning with **master** would reach that code with no sender and take the worker down.

@@ -4628,6 +4628,23 @@ registered automatically on its first datagram. Each datagram is one message,
 with no line parsing. Broadcast sends to all known peers with sendto().
 Not available for cache or proxy.
 .IP
+A script's
+.B on_client_message(id, msg)
+gets each datagram with the id of the peer that sent it, and
+.B self.send(id, msg)
+answers that peer with one datagram, sent as written.
+The id stays the peer's until the server forgets the peer: after
+.B \-\-idle\-timeout
+without a datagram from it, or when a full table of 10,000 peers makes room for a new one.
+A forgotten peer that sends again gets a new id, and
+.B self.send
+to the old one answers false with the reason.
+Return
+.B true
+from the handler, or the datagram is also relayed as
+.B \-\-send\-to
+says.
+.IP
 .B "An exposed UDP server can reflect traffic."
 With no Lua handler, every datagram is relayed to every other peer that has
 sent one. A peer is learned from a source address, which a sender can forge.
@@ -19757,6 +19774,8 @@ or of the master's messages, and not what
 .B \-\-send\-to
 names for a non-master.
 Returning anything else, or nothing, leaves those as they are.
+On a UDP server, client_id names the peer that sent the datagram; see
+.BR \-\-udp .
 A handler still waiting on
 .B self.cache
 when the relay runs has not returned yet, so its message is relayed; define

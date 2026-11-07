@@ -3142,11 +3142,14 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // other teaches a script author that the check exists.
     self["send"] = [owner, this](int client_id,
                                  std::string_view msg) -> api_result {
-        if (owner->is_udp())
-            return api_why("a UDP server has no connection to send to; use "
-                           "self.broadcast");
         if (owner->send_to(client_id, msg))
             return api_yes();
+        // A peer is forgotten by --idle-timeout or a full table, and the socket can refuse a datagram.
+        if (owner->is_udp())
+            return api_why("no datagram went to peer " + std::to_string(client_id) + " of "
+                           + q(m_owner_name) + " -- it may have been forgotten (--idle-timeout, "
+                             "or a full peer table), or the socket refused it; its next "
+                             "datagram arrives under a new id");
         // A fifth way, and the only one the script can do something about:
         // this runtime closed the connection because the producer outran the
         // socket.  Named apart from the other four, because "it may have

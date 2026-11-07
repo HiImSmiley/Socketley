@@ -24,7 +24,7 @@ end
 
 ## What it does
 
-- **One port, four protocols**: TCP lines, WebSocket, HTTP and RESP, [told apart by their first bytes](man-server-flags.txt); `--udp` for datagrams, where a script can only broadcast.
+- **One port, four protocols**: TCP lines, WebSocket, HTTP and RESP, [told apart by their first bytes](man-server-flags.txt); `--udp` for datagrams, where `on_client_message` names the peer and `self.send` answers it.
 - **Lua per message**: `on_client_message` answers with `self.send` and returns `true` to keep the relay out; connects, disconnects, requests and upgrades have callbacks too. See [Lua](lua.txt).
 - **Broadcast and rooms**: `self.broadcast` reaches everyone, `self.multicast` a list, `self.join_group` and `self.group_send` a room.
 - **Relaying without code**: `--mode` and `--send-to` decide who hears a message; `--send-to sender` is an echo server.

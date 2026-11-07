@@ -1254,6 +1254,8 @@ private:
     // TCP fan-out answers with.
     fanout_count udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude);
     int find_or_add_peer(const struct sockaddr_in& addr);
+    // A datagram to the peer a script was handed in on_client_message; false once that peer has been forgotten.
+    bool udp_send_to_peer(int peer_id, std::string_view msg);
 
     // The idle sweep's own arm, because setup() has two exits -- the UDP path
     // returns before the TCP path ever reaches the arm, so --idle-timeout was
@@ -1493,6 +1495,8 @@ private:
     {
         struct sockaddr_in                    addr;
         std::chrono::steady_clock::time_point last_seen{};
+        // What a script calls this peer: an index moves under swap-and-pop, so the name is minted once and kept.
+        int                                   id{0};
     };
     int m_udp_fd{-1};
     // Everything one recvmsg names, held apart from the instance and replaced
@@ -1510,6 +1514,10 @@ private:
     std::vector<std::unique_ptr<udp_recv_state>> m_udp_recv_spent;
     std::vector<udp_peer> m_udp_peers;
     std::unordered_map<uint64_t, int> m_udp_peer_idx;  // packed IP+port → index in m_udp_peers
+    std::unordered_map<int, int> m_udp_peer_by_id;     // peer id → index in m_udp_peers
+    int m_udp_next_peer_id{1};
+    // The peer the datagram being dispatched came from, so on_client_message can name it.
+    int m_udp_from_id{0};
     // Where the next eviction's sample of the full table begins.
     size_t m_udp_evict_hand{0};
     // Datagrams the socket refused, counted so the log can be throttled and

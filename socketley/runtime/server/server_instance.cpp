@@ -2840,6 +2840,7 @@ void server_instance::teardown(event_loop& loop)
         }
         m_udp_peers.clear();
         m_udp_peer_idx.clear();
+        m_udp_peer_by_id.clear();
         // This exit dials upstreams like the other one, so it gives them up
         // like the other one.  Without it they stayed in m_upstreams with
         // reads still in the ring and the next start() freed them under the
@@ -5823,9 +5824,11 @@ void server_instance::process_message(server_connection* sender, std::string_vie
         write_received_message(msg);
         notify_interactive(msg);
 
-        // Fire on_client_message callback (sender-aware)
+        // Fire on_client_message callback (sender-aware); a datagram's sender is the peer handle_udp_read named.
         if (sender)
             handled = invoke_on_client_message(sender->fd, msg);
+        else if (m_udp && m_udp_from_id > 0)
+            handled = invoke_on_client_message(m_udp_from_id, msg);
     }
 
     // Cache command interception, asked of the linked cache and answered a
@@ -7505,11 +7508,13 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     // res == 0 as well: a zero-length datagram is a message its sender sent,
     // so it enters and refreshes a peer like any other -- 0 is an end of
     // stream on TCP and a legitimate datagram here.
-    if (find_or_add_peer(m_udp_recv->addr) < 0)
+    const int peer = find_or_add_peer(m_udp_recv->addr);
+    if (peer < 0)
     {
         arm_udp_recv();
         return;
     }
+    m_udp_from_id = m_udp_peers[static_cast<size_t>(peer)].id;
 
     // Extract message — whole datagram = one message
     std::string_view msg(m_udp_recv->buf, static_cast<size_t>(cqe->res));
@@ -7524,6 +7529,7 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
 
     if (!msg.empty())
         process_message(nullptr, msg);
+    m_udp_from_id = 0;
 
     // A datagram is its own read, so this is where its cache batch goes: UDP
     // has no connection and never reaches the label in handle_read.
@@ -7674,8 +7680,11 @@ server_instance::ws_headers_result server_instance::ws_headers(int client_fd) co
 
 bool server_instance::send_to(int client_id, std::string_view msg)
 {
-    if (!m_loop || m_udp)
+    if (!m_loop)
         return false;
+    // A UDP server's ids are its peers, and the datagram goes as the script wrote it, as a broadcast's does.
+    if (m_udp)
+        return udp_send_to_peer(client_id, msg);
 
     // send_to_client() reads which kind of id this is and asks the right
     // runtime, because trying the local table first was unambiguous only while
@@ -8198,6 +8207,7 @@ void server_instance::drop_udp_peer(int idx)
         return;
 
     m_udp_peer_idx.erase(udp_peer_key(m_udp_peers[idx].addr));
+    m_udp_peer_by_id.erase(m_udp_peers[idx].id);
 
     const int last = static_cast<int>(m_udp_peers.size()) - 1;
     if (idx != last)
@@ -8207,6 +8217,7 @@ void server_instance::drop_udp_peer(int idx)
         // somebody else's address.
         m_udp_peers[idx] = m_udp_peers[last];
         m_udp_peer_idx[udp_peer_key(m_udp_peers[idx].addr)] = idx;
+        m_udp_peer_by_id[m_udp_peers[idx].id] = idx;
     }
     m_udp_peers.pop_back();
 }
@@ -8326,10 +8337,27 @@ int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
         drop_udp_peer(static_cast<int>(oldest));
     }
 
+    // Below the routed-handle range, and never one a live peer still holds after the counter wraps.
+    int id = m_udp_next_peer_id;
+    while (m_udp_peer_by_id.contains(id))
+        id = (id + 1 < conn_handle_base) ? id + 1 : 1;
+    m_udp_next_peer_id = (id + 1 < conn_handle_base) ? id + 1 : 1;
+
     int idx = static_cast<int>(m_udp_peers.size());
-    m_udp_peers.push_back({addr, now});
+    m_udp_peers.push_back({addr, now, id});
     m_udp_peer_idx[key] = idx;
+    m_udp_peer_by_id[id] = idx;
     return idx;
+}
+
+bool server_instance::udp_send_to_peer(int peer_id, std::string_view msg)
+{
+    if (m_udp_fd < 0)
+        return false;
+    auto it = m_udp_peer_by_id.find(peer_id);
+    if (it == m_udp_peer_by_id.end())
+        return false;
+    return udp_send_one(msg, m_udp_peers[static_cast<size_t>(it->second)].addr);
 }
 
 // ─── Lua client enumeration ───
