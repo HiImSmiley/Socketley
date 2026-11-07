@@ -6,6 +6,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <linux/openat2.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -14,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include "web_instance.h"
@@ -100,16 +102,30 @@ bool read_whole(int fd, std::string& out, uint64_t n)
 }
 
 // The same from the page cache alone, so the loop never waits on the disk: false when a byte of it is not there.
+// A filesystem whose files are memory already: a read of one cannot wait on a disk.
+bool memory_backed(int fd)
+{
+    struct statfs s{};
+    return ::fstatfs(fd, &s) == 0 && (s.f_type == TMPFS_MAGIC || s.f_type == RAMFS_MAGIC);
+}
+
 bool read_cached(int fd, std::string& out, uint64_t n)
 {
     out.resize(n);
     uint64_t got = 0;
+    int flags = RWF_NOWAIT;
     while (got < n)
     {
         struct iovec v{out.data() + got, n - got};
-        const ssize_t r = ::preadv2(fd, &v, 1, static_cast<off_t>(got), RWF_NOWAIT);
+        const ssize_t r = ::preadv2(fd, &v, 1, static_cast<off_t>(got), flags);
         if (r < 0 && errno == EINTR)
             continue;
+        // tmpfs answers RWF_NOWAIT with EOPNOTSUPP, and its files were never kept in memory for it.
+        if (r < 0 && errno == EOPNOTSUPP && flags != 0 && memory_backed(fd))
+        {
+            flags = 0;
+            continue;
+        }
         if (r <= 0)
             return false;
         got += static_cast<uint64_t>(r);
