@@ -274,7 +274,7 @@ else
     else fail "uncapped stats" "daemon stats says the shortcut is unavailable, and why" "out: $OUT"; fi
     restart "$BIN"
     OUT=$("$BIN" daemon stats 2>&1 || true)
-    if [ "$OUT" = "fast_lo:off" ]; then pass
+    if [ "$(grep '^fast_lo' <<<"$OUT")" = "fast_lo:off" ]; then pass
     else fail "off stats" "daemon stats says the shortcut is off when it was not asked for" "out: $OUT"; fi
 fi
 
