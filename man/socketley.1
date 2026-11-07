@@ -2957,13 +2957,23 @@ The JSON form reports the same number in
 .BR restarts .
 .IP
 .B NOT RESPONDING
-means the worker process is alive but has said nothing for fifteen seconds
+means the worker process is alive but has answered nothing for fifteen seconds
 while using at least half a core.
-A worker publishes on every completion, so one doing any work at all is heard
-from within a quarter second.
+A worker publishes whenever what it has done changes, its own figures or the
+requests of other runtimes it has answered
+.RB ( requests_answered
+in
+.BR stats ),
+so one answering anything is heard from within a quarter second, whether the
+answer was computed on its loop or on a helper thread.
 Silence means the worker is either idle, which costs no CPU, or stuck inside a
 callback, which costs a core.
 Only the second case is reported, and it is only reported: nothing is killed.
+The daemon log says how long it has answered nothing, counted from its last
+answer.
+The report ends when the worker answers again, or when it has spent less than
+half a core for fifteen seconds more without answering, which is a worker idle
+or blocked; a dip of a second ends nothing.
 A script that deliberately computes for a long time looks the same from
 outside the process.
 A worker that is stuck without using CPU (blocked rather than spinning) looks

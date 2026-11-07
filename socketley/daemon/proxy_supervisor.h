@@ -478,6 +478,8 @@ private:
     uint64_t                              m_last_cpu_ticks{0};
     std::chrono::steady_clock::time_point m_last_cpu_at{};
     bool                                  m_wedged{false};
+    // When a reported wedge first spent under the share, zero while it spends at least that.
+    std::chrono::steady_clock::time_point m_cool_since{};
 
     // Why this child's on_start raised, held apart from m_reload_error because
     // the two are cleared on different asks.

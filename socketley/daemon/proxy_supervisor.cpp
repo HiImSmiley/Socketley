@@ -1543,25 +1543,41 @@ void proxy_supervisor::check_wedged()
     const bool silent = m_last_frame_at.time_since_epoch().count() != 0
                      && now - m_last_frame_at > wedge_silence;
 
-    const bool wedged = silent && cores >= wedge_cpu_share;
+    // Once reported, a wedge ends with a frame, or with a whole silent window spent under the share, which is a
+    // worker idle or blocked rather than the spin this reports; a dip of a second ends nothing.
+    bool wedged = silent && (m_wedged || cores >= wedge_cpu_share);
+    if (wedged && m_wedged)
+    {
+        if (cores >= wedge_cpu_share)
+            m_cool_since = {};
+        else if (m_cool_since.time_since_epoch().count() == 0)
+            m_cool_since = now;
+        else if (now - m_cool_since >= wedge_silence)
+            wedged = false;
+    }
     if (wedged == m_wedged)
         return;
 
     // On the edge only, because a stuck worker stays stuck and one line an
     // operator can find beats one a second they cannot.
     m_wedged = wedged;
+    m_cool_since = {};
     if (m_placeholder)
         m_placeholder->set_unresponsive(wedged);
 
+    const long long quiet = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - m_last_frame_at).count());
     char msg[256];
     if (wedged)
         snprintf(msg, sizeof(msg),
                  "worker pid %d has answered nothing for %llds while spending "
                  "%.2f cores; it is running and not serving",
-                 static_cast<int>(m_pid),
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(
-                     now - m_last_frame_at).count()),
-                 cores);
+                 static_cast<int>(m_pid), quiet, cores);
+    else if (silent)
+        snprintf(msg, sizeof(msg),
+                 "worker pid %d has answered nothing for %llds and no longer spends "
+                 "cpu; it is idle or blocked",
+                 static_cast<int>(m_pid), quiet);
     else
         snprintf(msg, sizeof(msg), "worker pid %d is answering again",
                  static_cast<int>(m_pid));
@@ -1684,6 +1700,7 @@ bool proxy_supervisor::check_liveness()
         m_placeholder->set_unresponsive(false);
     }
     m_wedged      = false;
+    m_cool_since  = {};
     m_last_cpu_at = {};
     m_last_frame_at = {};
 

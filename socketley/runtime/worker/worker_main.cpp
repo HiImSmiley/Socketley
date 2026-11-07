@@ -677,6 +677,9 @@ private:
             s.detail += "peer_relayed:" + std::to_string(prelayed) + "\n";
         }
         s.detail += m_manager.requests().bound_stats();
+        // Answers to other runtimes move no figure of the runtime's own, and this line moving is what makes the
+        // daemon hear from a runtime that answers nothing else, as its watchdog counts silence from the last frame.
+        s.detail += "requests_answered:" + std::to_string(m_answered) + "\n";
 
         // Did anything the daemon can see actually move, which now decides
         // whether there is a publish at all rather than how far it backs off.
@@ -1381,6 +1384,7 @@ private:
         if (sink->serves_inline())
         {
             sink->serve_request(payload, reply);
+            ++self->m_answered;
             return mesh_verdict::served;
         }
         switch (self->defer_request(sink, ticket, from->serial(), target, payload))
@@ -1446,7 +1450,8 @@ private:
         // A link that went while the answer was in flight answered its
         // asker's tickets as it died, so there is nobody left to tell.
         if (shard_link* link = find_link(to.link_serial))
-            link->send_reply(to.wire_ticket, st, reply);
+            if (link->send_reply(to.wire_ticket, st, reply))
+                ++m_answered;
     }
 
     // One frame to the daemon, which a runtime that sizes its own answers keeps to, though a longer answer goes in
@@ -1836,6 +1841,7 @@ private:
     // the asker is told the way was overloaded, since one told nothing waits out its deadline.
     void answer_daemon(uint64_t ticket, uint8_t st, std::string_view reply)
     {
+        ++m_answered;
         const size_t size = worker_proto::chan_reply_frame_size(reply);
         if (worker_proto::write_wire(m_writer, size, [&](std::string& out) {
                     worker_proto::append_chan_reply_frame(out, ticket, st, reply);
@@ -2506,6 +2512,8 @@ private:
     };
     std::unordered_map<uint64_t, deferred_reply> m_deferred;
     uint64_t                                     m_next_deferred{1};
+    // Requests of other runtimes this one has answered, over the daemon or a link, inline or from a later turn.
+    uint64_t                                     m_answered{0};
     // A replica of the daemon's map and a live channel, declared before the
     // runtime so it outlives it: a runtime revokes its origin as it is
     // destroyed and that call needs a channel that is still there.
