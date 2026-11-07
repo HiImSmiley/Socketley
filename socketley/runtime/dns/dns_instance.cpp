@@ -316,6 +316,8 @@ private:
         sockaddr_storage peer{};
         io_request rd{}, wr{};
         bool rd_pending{false}, wr_pending{false}, dead{false};
+        // The peer wrote its last, and the connection closes once what it is owed has gone.
+        bool eof_seen{false};
         std::string in;
         std::string out;
         size_t out_off{0};
@@ -1033,6 +1035,12 @@ void dns_run::arm_read(const std::shared_ptr<tcp_conn>& c)
 {
     if (c->dead || c->rd_pending || c->fd < 0)
         return;
+    if (c->eof_seen)
+    {
+        if (c->waiting() == 0 && !c->wr_pending)
+            close_conn(c);
+        return;
+    }
     c->rd = io_request{};
     c->rd.owner = this;
     c->rd.buffer = reinterpret_cast<char*>(c.get());
@@ -1052,7 +1060,14 @@ void dns_run::read_done(const std::shared_ptr<tcp_conn>& c, int res)
             std::erase(m_closing, c);
         return;
     }
-    if (res <= 0)
+    // A peer that half-closed after its queries still reads their answers.
+    if (res == 0)
+    {
+        c->eof_seen = true;
+        arm_read(c);
+        return;
+    }
+    if (res < 0)
     {
         close_conn(c);
         return;
@@ -1077,9 +1092,11 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
             close_conn(c);
             return;
         }
+        const size_t owed = c->waiting();
         tcp_flush(c);
-        // A flush the socket took whole makes room for the queries held back behind it.
-        if (c->dead || c->held() || took == 0)
+        // A flush that made room is followed by the queries held back behind it, whether or not this pass answered
+        // any: one entered while held answers nothing, and the flush after it is what lets the rest be answered.
+        if (c->dead || c->held() || (took == 0 && c->waiting() == owed))
             return;
     }
 }
