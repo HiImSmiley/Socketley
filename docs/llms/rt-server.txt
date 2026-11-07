@@ -2,26 +2,36 @@
 
 TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path
 
-A **server** listens on one port and talks to whoever connects. Without a script it relays messages between clients; with Lua it becomes an API, a chat room or a game loop.
+A **server** is one port for long-lived connections: TCP lines, WebSocket, HTTP and RESP on the same port, or UDP datagrams. Without a script it relays messages between clients; with Lua it answers them, as a chat room, a game server, a line protocol or an API.
 
 ```
 socketley create server chat -p 9000 -s                    # every line reaches every other client
 socketley create server echo -p 9001 --send-to sender -s   # answers whoever spoke
+socketley create server room -p 9003 --lua room.lua -s     # the script decides who hears what
 socketley create server site -p 8080 --http /srv/site --http-cache -s
 socketley create server api -p 9002 --lua api.lua --cache store -s
+```
+
+```
+-- room.lua: whoever sends "join" hears everything said in the room
+function on_message(msg) end   -- defined, so nothing is relayed on its own
+function on_client_message(id, msg)
+  if msg == "join" then self.join_group(id, "room") else self.group_send("room", msg) end
+end
 ```
 
 > Warning: `--cache` also stores every ordinary message in the cache, under keys `1`, `2`, `3`… And `--http` injects a WebSocket script into every HTML page.
 
 ## What it does
 
-- **One port, several protocols**: TCP, WebSocket, HTTP and RESP, [told apart by their first bytes](man-server-flags.txt); `--udp` for datagrams.
-- **Static files**: `--http` serves a directory; `--http-cache` holds it in memory.
-- **Lua handlers**: Per message, connection, HTTP request and WebSocket upgrade; see [Lua](lua.txt).
-- **Relaying without code**: `--mode` and `--send-to` decide who hears a message.
-- **Upstreams**: `-u host:port` dials other servers; the script hears them in `on_upstream`.
-- **A cache beside it**: With `--cache name`, clients send `cache <command>`; see [cache access](man-server-flags.txt).
-- **Several cores**: `--shards N` runs N processes on one port; see [sharding](man-server-flags.txt).
+- **One port, four protocols**: TCP lines, WebSocket, HTTP and RESP, [told apart by their first bytes](man-server-flags.txt); `--udp` for datagrams, where a script can only broadcast.
+- **Lua per message**: `on_client_message` answers with `self.send`; connects, disconnects, requests and upgrades have callbacks too. See [Lua](lua.txt).
+- **Broadcast and rooms**: `self.broadcast` reaches everyone, `self.multicast` a list, `self.join_group` and `self.group_send` a room.
+- **Relaying without code**: `--mode` and `--send-to` decide who hears a message; `--send-to sender` is an echo server.
+- **HTTP on the same port**: `on_http_request` answers requests; `--http` serves a directory, `--http-cache` holds it in memory.
+- **TLS and unix sockets**: `--tls --cert --key` encrypt the port, `--ca` asks for client certificates; `--listen unix:/path` serves a local socket.
+- **Upstreams and a cache**: `-u host:port` dials other servers for `on_upstream`; with `--cache name`, clients send `cache <command>` ([cache access](man-server-flags.txt)).
+- **Several cores**: `--shards N` runs N processes on one port, and a broadcast reaches every shard's clients; see [sharding](man-server-flags.txt).
 
 ## Works with
 
