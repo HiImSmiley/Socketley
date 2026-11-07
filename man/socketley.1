@@ -24781,6 +24781,9 @@ to arm one read at a time instead of a multishot receive.
 On wherever the kernel supports it. A multishot arm is one submission for a
 stream of messages instead of one per message. The switch exists so that the
 two can be measured against each other on one binary.
+A dns runtime's TCP connections read one at a time either way: a client's
+pipelined queries arrive several to a read, and there a multishot receive
+cost more CPU per query than the submissions it saved.
 .TP
 .B SOCKETLEY_RECV_BUNDLE
 Set to

@@ -37,6 +37,7 @@
 #include "../../shared/net/endpoint.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/ring_read.h"
 #include "../../shared/loop/eventfd_wake.h"
 #include "../../shared/net/ip_block.h"
 #include "../../shared/util/base64.h"
@@ -314,10 +315,12 @@ private:
         uint64_t id{0};
         int fd{-1};
         sockaddr_storage peer{};
-        io_request rd{}, wr{};
-        bool rd_pending{false}, wr_pending{false}, dead{false};
+        socketley::ring_read rd;
+        io_request wr{};
+        bool wr_pending{false}, dead{false};
         // The peer wrote its last, and the connection closes once what it is owed has gone.
         bool eof_seen{false};
+        // A query that spans reads; whole ones are answered from where the read put them.
         std::string in;
         std::string out;
         size_t out_off{0};
@@ -331,6 +334,8 @@ private:
         std::string& tail() { return wr_pending ? later : out; }
         size_t waiting() const { return out.size() - out_off + later.size(); }
         bool held() const { return waiting() > tcp_out_high; }
+        // What a read lands in: a standing multishot recv from the ring cost 5% more CPU a query under 128 pipelined
+        // connections than the 0.39 submissions a query it saved.
         char rbuf[tcp_rbuf];
     };
     // A NOTIFY goes from a socket of its own, connected to the secondary, so its answer comes back to this shard:
@@ -368,10 +373,10 @@ private:
     // among those with nothing left to write.
     void evict_quietest();
     void arm_read(const std::shared_ptr<tcp_conn>& c);
-    void read_done(const std::shared_ptr<tcp_conn>& c, int res);
+    void read_done(const std::shared_ptr<tcp_conn>& c, struct io_uring_cqe* cqe);
     // Answers what `in` holds and flushes, over again while the socket takes the answers whole.
     void tcp_serve(const std::shared_ptr<tcp_conn>& c);
-    size_t tcp_answer(const std::shared_ptr<tcp_conn>& c);
+    size_t tcp_answer(const std::shared_ptr<tcp_conn>& c, std::string_view src);
     void tcp_flush(const std::shared_ptr<tcp_conn>& c);
     void write_done(const std::shared_ptr<tcp_conn>& c, int res);
     void close_conn(const std::shared_ptr<tcp_conn>& c);
@@ -398,6 +403,7 @@ private:
 
     dns_instance& m_owner;
     event_loop&   m_loop;
+    socketley::ring_reader m_reads{m_loop};
     counters      m_c;
     bool          m_stopped{false};
 
@@ -1033,7 +1039,7 @@ std::shared_ptr<dns_run::tcp_conn> dns_run::conn_of(io_request* req)
 
 void dns_run::arm_read(const std::shared_ptr<tcp_conn>& c)
 {
-    if (c->dead || c->rd_pending || c->fd < 0)
+    if (c->dead || c->rd.pending || c->fd < 0)
         return;
     if (c->eof_seen)
     {
@@ -1041,40 +1047,48 @@ void dns_run::arm_read(const std::shared_ptr<tcp_conn>& c)
             close_conn(c);
         return;
     }
-    c->rd = io_request{};
-    c->rd.owner = this;
-    c->rd.buffer = reinterpret_cast<char*>(c.get());
-    c->rd.fd = c->fd;
-    c->rd.type = op_read;
-    c->rd_pending = m_loop.submit_read(c->fd, c->rbuf, sizeof c->rbuf, &c->rd);
-    if (!c->rd_pending)
+    if (!m_reads.arm(c->rd, this, c.get(), c->fd, {.ring = false},
+                     [&] { return std::pair<char*, uint32_t>{c->rbuf, static_cast<uint32_t>(sizeof c->rbuf)}; }))
         close_conn(c);
 }
 
-void dns_run::read_done(const std::shared_ptr<tcp_conn>& c, int res)
+void dns_run::read_done(const std::shared_ptr<tcp_conn>& c, struct io_uring_cqe* cqe)
 {
-    c->rd_pending = false;
+    using kind = socketley::ring_bytes::kind;
+    auto got = m_reads.take(c->rd, cqe);
     if (c->dead)
     {
-        if (!c->wr_pending)
+        got.give_back();
+        if (!c->rd.pending && !c->wr_pending)
             std::erase(m_closing, c);
         return;
     }
-    // A peer that half-closed after its queries still reads their answers.
-    if (res == 0)
+    switch (got.what)
     {
-        c->eof_seen = true;
-        arm_read(c);
-        return;
+        case kind::withdrawn:
+        case kind::no_buffer:
+            if (!c->held())
+                arm_read(c);
+            return;
+        case kind::eof:
+            // A peer that half-closed after its queries still reads their answers.
+            c->eof_seen = true;
+            arm_read(c);
+            return;
+        case kind::failed:
+            close_conn(c);
+            return;
+        case kind::data:
+            break;
     }
-    if (res < 0)
-    {
-        close_conn(c);
-        return;
-    }
-    c->in.append(c->rbuf, static_cast<size_t>(res));
-    runtime_instance::stat_add(m_owner.m_stat_bytes_in, static_cast<uint64_t>(res));
-    tcp_serve(c);
+    runtime_instance::stat_add(m_owner.m_stat_bytes_in, got.size());
+    socketley::take_into(c->in, got.view(), [&](std::string_view v) { return tcp_answer(c, v); });
+    got.give_back();
+    // What the answers made room for is answered after them, as tcp_serve() does after each flush.
+    tcp_flush(c);
+    if (!c->dead && !c->held())
+        tcp_serve(c);
+    // A peer that does not read its answers is not read from until it has.
     if (!c->dead && !c->held())
         arm_read(c);
 }
@@ -1083,7 +1097,8 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
 {
     for (;;)
     {
-        const size_t took = tcp_answer(c);
+        const size_t took = tcp_answer(c, c->in);
+        c->in.erase(0, took);
         if (c->dead)
             return;
         // A message can be no longer than 65535 bytes and its length; more than that waiting is no DNS client.
@@ -1102,18 +1117,18 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
 }
 
 // Every whole message the connection has brought, answered in order (RFC 7766 allows pipelining), until what waits
-// to be written is past tcp_out_high; the bytes taken from `in`.
-size_t dns_run::tcp_answer(const std::shared_ptr<tcp_conn>& c)
+// to be written is past tcp_out_high; the bytes taken from `src`.
+size_t dns_run::tcp_answer(const std::shared_ptr<tcp_conn>& c, std::string_view src)
 {
     size_t off = 0;
     static thread_local uint8_t out[max_message + 2];
     const bool xfr_ok = !m_transfer.empty() && ip_block::any_contains(m_transfer, reinterpret_cast<const sockaddr*>(&c->peer));
-    while (!c->held() && c->in.size() - off >= 2)
+    while (!c->held() && src.size() - off >= 2)
     {
-        const size_t len = rd16(reinterpret_cast<const uint8_t*>(c->in.data()) + off);
-        if (c->in.size() - off - 2 < len)
+        const size_t len = rd16(reinterpret_cast<const uint8_t*>(src.data()) + off);
+        if (src.size() - off - 2 < len)
             break;
-        const auto* q = reinterpret_cast<const uint8_t*>(c->in.data()) + off + 2;
+        const auto* q = reinterpret_cast<const uint8_t*>(src.data()) + off + 2;
         off += 2 + len;
         runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
         answer_meta meta;
@@ -1166,7 +1181,6 @@ size_t dns_run::tcp_answer(const std::shared_ptr<tcp_conn>& c)
             return 0;
         }
     }
-    c->in.erase(0, off);
     // Only a whole query counts as activity, so a peer trickling bytes of one it never finishes is still quiet.
     if (off > 0)
         c->last = steady_sec();
@@ -1217,7 +1231,7 @@ void dns_run::write_done(const std::shared_ptr<tcp_conn>& c, int res)
     c->wr_pending = false;
     if (c->dead)
     {
-        if (!c->rd_pending)
+        if (!c->rd.pending)
             std::erase(m_closing, c);
         return;
     }
@@ -1256,7 +1270,7 @@ void dns_run::close_conn(const std::shared_ptr<tcp_conn>& c)
     m_conns.erase(c->id);
     m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
     // Kept while the ring may still write into its buffer.
-    if (c->rd_pending || c->wr_pending)
+    if (c->rd.pending || c->wr_pending)
         m_closing.push_back(c);
 }
 
@@ -1663,9 +1677,14 @@ void dns_run::on_cqe(struct io_uring_cqe* cqe)
         }
     const auto c = conn_of(req);
     if (!c)
+    {
+        // A buffer the ring lent a connection no longer here goes back, or the group loses it for good.
+        if (is_read_op(req->type) && (cqe->flags & IORING_CQE_F_BUFFER))
+            m_loop.return_cqe_buf(cqe, req);
         return;
-    if (req == &c->rd)
-        read_done(c, cqe->res);
+    }
+    if (req == &c->rd.req)
+        read_done(c, cqe);
     else if (req == &c->wr)
         write_done(c, cqe->res);
 }
