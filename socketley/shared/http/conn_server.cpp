@@ -302,8 +302,9 @@ void conn_server::arm_read(const std::shared_ptr<server_conn>& c)
         ended(c);
         return;
     }
-    // A connection that streams reads the larger sizes into its own growing buffer; the first read is a single one.
-    const socketley::ring_arm how{.ring = c->rbuf.size() == ring.bytes, .multishot = c->rd_heard};
+    // A connection that streams reads the larger sizes into its own growing buffer, and one reading singly into its
+    // own as well; the first read is a single one.
+    const socketley::ring_arm how{.ring = c->rbuf.size() == ring.bytes && !c->rd_single, .multishot = c->rd_heard};
     if (!m_reads.arm(c->rd, m_owner, c.get(), c->fd, how,
                      [&] { return std::pair<char*, uint32_t>{c->rbuf.data(), c->rbuf.size()}; }))
         close_conn(c);
@@ -395,6 +396,14 @@ void conn_server::resume(const std::shared_ptr<server_conn>& c)
     m_hooks.serve(c);
     flush(c);
     after_serve(c);
+}
+
+void conn_server::reads_singly(const std::shared_ptr<server_conn>& c)
+{
+    if (c->rd_single)
+        return;
+    c->rd_single = true;
+    m_reads.withdraw(c->rd);
 }
 
 void conn_server::after_serve(const std::shared_ptr<server_conn>& c)

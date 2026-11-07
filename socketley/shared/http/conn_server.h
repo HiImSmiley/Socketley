@@ -40,6 +40,8 @@ struct server_conn
     bool trimming{false};
     // A read has brought bytes; the first is a single recv, so a client that asks once and closes owes no withdrawal.
     bool rd_heard{false};
+    // Its answers are sent by the runtime itself (reads_singly()), so it reads a single read after each, into rbuf.
+    bool rd_single{false};
     // The far side's end, met by the standing recv while no read was wanted, and taken up when one is.
     bool eof_seen{false};
     bool keep_alive{true};
@@ -129,6 +131,9 @@ public:
     }
     // A connection whose answer waited takes up its requests again.
     void resume(const std::shared_ptr<server_conn>& c);
+    // A connection whose answers the runtime sends itself, a file at a time: every ACK of them would wake a standing
+    // recv's poll, which costs more than the single recv armed after each answer that it saves.
+    void reads_singly(const std::shared_ptr<server_conn>& c);
     void close_conn(const std::shared_ptr<server_conn>& c);
     // Those with nothing to do for longer than `idle_secs` closed, and the rest trimmed.
     void sweep(int64_t now, int64_t idle_secs);

@@ -1116,6 +1116,7 @@ bool web_run::answer_file(const std::shared_ptr<web_conn>& c, const entry& e, co
 
     // From the descriptor, after the head; nothing more of the connection is read meanwhile.
     ++m_c.zero_copy;
+    m_http.reads_singly(c);
     c->sending_body = b;
     c->file_off = off;
     c->file_left = n;
