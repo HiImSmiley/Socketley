@@ -301,7 +301,8 @@ function flagTable(rt, opts = {}) {
 }
 
 // ─── benchmarks ────────────────────────────────────────────────────────────────────────────────────────────────────
-const short = a => a.replace(/ [\d.v-]+$/, '');
+// A server's name without its versions or what is in brackets: "Postfix 3.10.6 + Dovecot 2.4.2" is Postfix + Dovecot.
+const short = a => a.replace(/ \([^)]*\)/g, '').replace(/ (v?\d+\.\d[\w.+~-]*|\d{4}-\d\d-\d\d)/g, '').trim();
 function benchSet(s) {
   const arms = s.arms;
   // CPU beside every rate, unless every rate of the set cost the same: then it is said once, above the table.
