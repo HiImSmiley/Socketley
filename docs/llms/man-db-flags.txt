@@ -33,7 +33,9 @@ No answer is given before what it rests on is on the disk: a write's own record,
 
 Every shard answers reads and queries. Writes wait for one disk, so the shards together take at most as many writes as one shard takes. Writes also cost more cores than on one shard, since each write that reaches another shard is handed on to shard 0, and its answer is handed back. A database that is mostly written is served best by one shard.
 
-**Changes, as they happen.** **GET** */c/***collection***/_feed* is a stream of Server-Sent Events, which a browser reads with **EventSource**. Each change is sent once it is on the disk, numbered by the change. A change is an event **put** with **{"collection":..,"id":..,"owner":..,"version":..,"doc":{..}}** or an event **delete** with **{"collection":..,"id":..,"deleted":true}**. The reader sees only what it may read, as with a query: an account sees its own documents of an owner collection. **GET /_feed** streams the changes of every collection, to a key. A stream that broke resumes from the last change it read, with **Last-Event-ID** (or **?since=**). The database keeps about 32 MiB of changes. A stream resuming from an older change is told **reset** and should read again what it shows. A comment every fifteen seconds keeps a quiet stream from looking dead.
+Every request a reading shard takes reads the log on first. A shard that holds a stream is also told by shard 0 of each change that reaches the disk, so the stream hears of it before the next request. **stats** counts these messages in shard 0's **nudges**.
+
+**Changes, as they happen.** **GET** */c/***collection***/_feed* is a stream of Server-Sent Events, which a browser reads with **EventSource**. Each change is sent once it is on the disk, numbered by the change. A change is an event **put** with **{"collection":..,"id":..,"owner":..,"version":..,"doc":{..}}** or an event **delete** with **{"collection":..,"id":..,"deleted":true}**. The reader sees only what it may read, as with a query: an account sees its own documents of an owner collection. **GET /_feed** streams the changes of every collection, to a key. A stream that broke resumes from the last change it read, with **Last-Event-ID** (or **?since=**). While a stream is open on any shard, and for two minutes after the last one closed, the database keeps about 32 MiB of changes on every shard, so a stream that resumes may reach any of them. With no stream near, shard 0 keeps about 1 MiB and a shard reading its log keeps none. A stream resuming from an older change is told **reset** and should read again what it shows. **stats** gives each shard's **history_bytes**. A comment every fifteen seconds keeps a quiet stream from looking dead.
 
 **Documents with a time to go.** A collection whose schema line names **ttl:***field* loses a document once that field's number, in seconds since 1970, has passed. From that moment the document is answered as absent. Its deletion is written and streamed within the minute.
 
@@ -78,7 +80,7 @@ The most the documents may hold. A write past it is refused with 507.
 
 ### `--cache size`
 
-The memory that holds the documents last read. Default: 64M. The rest are read from the disk.
+The memory that holds the documents last read. Default: 64M. The rest are read from the disk. With **--shards**, it is the runtime's: each shard caches its share, the size divided by the shard count, and at least 1 MiB. **stats** shows each shard's share as **cache_limit**, and how often a document was found there and not as **cache_hits** and **cache_misses**.
 
 ### `--replicate url`
 

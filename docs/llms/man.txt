@@ -32,7 +32,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Cluster mode](man-cluster-mode.txt)
 - [Installation](man-installation.txt)
 - [State persistence](man-state-persistence.txt)
-- [Environment](man-environment.txt) (86 entries)
+- [Environment](man-environment.txt) (91 entries)
 - [Files](man-files.txt)
 - [C++ SDK](man-c-sdk.txt)
 - [Limitations](man-limitations.txt)

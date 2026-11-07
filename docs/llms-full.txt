@@ -30,7 +30,7 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 ## The runtimes
 
 - [server](rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path (compared with nginx)
-- [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
+- [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in (compared with nginx)
 - [client](rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
 - [proxy](rt-proxy.txt): HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI (compared with HAProxy, nginx)
 - [cache](rt-cache.txt): In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub (compared with Redis, Valkey)
@@ -38,27 +38,30 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 - [db](rt-db.txt): JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups (compared with MongoDB, PocketBase)
 - [dns](rt-dns.txt): Authoritative name server for its zones, over UDP and TCP, with DNSSEC and transfers (compared with NSD, Knot)
 - [idp](rt-idp.txt): OpenID Connect provider with its own accounts, second factors, app passwords and SSH certificates (compared with Keycloak)
-- [mail](rt-mail.txt): Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage
+- [mail](rt-mail.txt): Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage (compared with Postfix and Dovecot)
 - [mqtt](rt-mqtt.txt): MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules (compared with Mosquitto)
 - [metrics](rt-metrics.txt): Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs (compared with Prometheus, VictoriaMetrics)
 - [sync](rt-sync.txt): One job that carries a directory to a storage, from it, or both ways (compared with rclone)
 - [tunnel](rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials (compared with frp)
-- [mcp](rt-mcp.txt): A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients
+- [mcp](rt-mcp.txt): A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients (compared with the MCP Python and TypeScript SDKs)
 
 ## Benchmarks
 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
 
-- cache: 2.2× against Redis (GET)
-- server: 5.3× against nginx (1 KiB file, keep-alive, 256 connections) (caveat: likely higher on this VM than on hardware; see the notes)
+- cache: 3.6× against Redis (GET)
+- server: 5.6× against nginx (1 KiB file, keep-alive, 256 connections) (caveat: likely higher on this VM than on hardware; see the notes)
 - proxy: 1.2× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
-- dns: 1.3× against NSD (A queries over UDP)
-- mqtt: 21.2× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
-- storage: 12.0× against MinIO (GET 4 KiB, 4 × 16 connections) (caveat: a floor: the load generator ran out before socketley did)
+- web: 4.3× against nginx (page 4 KiB, keep-alive, 256 connections)
+- dns: 1.4× against NSD (A queries over UDP)
+- mqtt: 21.3× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
+- storage: 11.9× against MinIO (GET 4 KiB, 4 × 16 connections) (caveat: a floor: the load generator ran out before socketley did)
 - db: 2.5× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
-- tunnel: 2.5× against frp (throughput, 512 MiB echoed through the tunnel)
-- metrics: 2.7× against Prometheus (CPU per sample ingested)
-- idp: 19.9× against Keycloak (refresh token, 64 clients) (caveat: a floor: the load generator ran out before socketley did)
+- tunnel: 2.3× against frp (throughput, 512 MiB echoed through the tunnel)
+- metrics: 2.6× against Prometheus (CPU per sample ingested)
+- idp: 21.1× against Keycloak (refresh token, 64 clients) (caveat: a floor: the load generator ran out before socketley did)
+- mail: 3.4× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
+- mcp: 25.6× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
 
 ## Where to go next
 
@@ -573,7 +576,7 @@ Decide, in an mqtt runtime, which publishes and subscriptions pass. In that runt
 
 #### `on_send(msg)`
 
-Called when a message is sent.
+Called when a message is sent. Under **--shards**, it is called on each shard that sends the message to its own clients, so a broadcast that reaches the siblings, like a **send** from the command line, calls it once per shard.
 
 #### `on_route(method, path, backend_path)`
 
@@ -1368,6 +1371,8 @@ Print the daemon's own figures as *key***:***value* lines, the same format that 
 
 **fast_lo_tainted_bound**, **_unanswered**, **_budget** and **_peer_off** count taints by reason, in that order: the peer really held the per-pair bound; no answer came before twice the bound; the global budget was reached; the peer was not on the shortcut (it received over TCP before it could enter, or it had closed). **fast_lo_held_bytes** is the unread redirected backlog summed across pairs. The global budget (**fast_lo_budget_bytes**) is compared against it. For a pair below 64 KiB it is an upper bound. **fast_lo_over_budget** is 1 while new sends are being tainted because of the budget.
 
+**requests_overloaded_queue** and the other **requests_overloaded_** lines count the requests the daemon's own request channel answered **overloaded**, by the bound that refused them, as a runtime's **stats** does for its own (see **Between runtimes on one machine**).
+
 The metrics endpoint exports the same figures as **socketley_fast_lo_info{mode}**, **socketley_fast_lo_sockets{path}**, **socketley_fast_lo_entered_total**, **socketley_fast_lo_tainted_total{reason}**, **socketley_fast_lo_held_bytes**, **socketley_fast_lo_budget_bytes**, **socketley_fast_lo_pair_limit_bytes** and **socketley_fast_lo_over_budget**. The counting costs one atomic add per entered socket and per taint, never one per send.
 
 ```
@@ -1981,6 +1986,12 @@ A test aid that sets how many milliseconds new spam filter learning stays in a m
 
 Inherited by worker processes, which have no command line of their own.
 
+#### `SOCKETLEY_MAIL_LET_GO_MS`
+
+A test aid that sets how many milliseconds a shard of a mail runtime, other than the first, keeps a user's index in memory after nothing on that shard asked for it. The index is read again from its files when it is next asked for. Default: ten minutes.
+
+Inherited by worker processes, which have no command line of their own.
+
 #### `SOCKETLEY_IDP_CLIENT_CA`
 
 A test aid that names a file of CA certificates for checking the client metadata documents an idp fetches. The certificate served with each such document is checked against this file. Default: the system's CA certificates.
@@ -2093,6 +2104,18 @@ Inherited by worker processes, which have no command line of their own.
 
 Sets how often a runtime serving TLS logs one line counting the inbound handshakes that failed since its last report. Default: every 60 seconds; the range is 1 to 3600. A failed handshake comes from a port scanner far more often than from a client, so each one is counted rather than logged.
 
+#### `SOCKETLEY_TLS_TICKET_SECS`
+
+A test aid that sets how many seconds one session ticket key seals new tickets. The key still opens its tickets for as long again, and is then wiped. The range is 1 to 86400. Default: an hour.
+
+Inherited by worker processes, which have no command line of their own.
+
+#### `SOCKETLEY_WRITE_STALL_SECS`
+
+A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset. The range is 1 to 86400. Default: 120 seconds.
+
+Inherited by worker processes, which have no command line of their own.
+
 #### `SOCKETLEY_ACME_DIRECTORY`
 
 Sets the directory URL of the ACME CA that **--acme** and **acme issue** use. Default: Let's Encrypt, **https://acme-v02.api.letsencrypt.org/directory**. Its staging CA is **https://acme-staging-v02.api.letsencrypt.org/directory**. Each CA has an account of its own.
@@ -2163,6 +2186,10 @@ Inherited by worker processes, which have no command line of their own.
 
 Sets the interval in milliseconds between periodic sweeps for expired cache keys. Default: **500**. This never affects correctness: an expired key is not served no matter when the sweep runs, because every read path checks the expiry itself. The interval controls only how quickly keys that are never accessed again release their memory.
 
+#### `SOCKETLEY_CACHE_SNAPSHOT_MB`
+
+Sets how many MiB a cache shard's journal (**--persistent-interval**) may hold before the shard snapshots, unless its last dump is larger, in which case that size is the bound. Default: **64**. The snapshot is written by a forked child, so the shard goes on serving; the journal is then cut to what came after the snapshot began.
+
 #### `SOCKETLEY_LUA_TIMEOUT_MS`
 
 Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely, and also turns on LuaJIT's trace compiler. The compiler is worth about 2.4x on a callback that computes, and about 1% on one that does not. See **Callback Deadline**, which prices both halves of that trade.
@@ -2179,9 +2206,9 @@ Inherited by worker processes, which have no command line of their own.
 
 #### `SOCKETLEY_KERNEL_TLS`
 
-Set to **0** to keep every TLS record in this process. Otherwise, some TLS 1.3 connections hand their sending to the kernel's TLS layer. This happens in three cases. A server, storage or proxy connection sends a file or object over 256 KiB. A TCP proxy's backend streams that much to the client. An HTTP/1.1 proxy sends a client an answer body of that known length.
+Set to **0** to keep every TLS record in this process. Otherwise, some TLS 1.3 connections hand their sending to the kernel's TLS layer. This happens in six cases. A server, storage or proxy connection sends a file or object over 256 KiB. A TCP proxy's backend streams that much to the client. An HTTP/1.1 proxy sends a client an answer body of that known length. A cache connection is owed 2 MiB or more at once. An mqtt client is sent a packet of 256 KiB or more. A mail client is sent a reply of 4 MiB or more, without COMPRESS.
 
-The connection then changes its send key and hands the new key to the kernel's TLS layer. The kernel encrypts what is sent, by sendfile from the page cache or spliced from the backend, at about half the CPU of encrypting a copy in this process. A connection that never sends that much stays as it was, because for small answers encrypting a copy here costs less. HTTP/2 connections are never moved.
+The connection then changes its send key and hands the new key to the kernel's TLS layer. The kernel encrypts what is sent, by sendfile from the page cache or spliced from the backend, at about half the CPU of encrypting a copy in this process. A cache's answer is in memory and has no sendfile to gain, so the kernel only spares it the copies OpenSSL makes: measured over loopback, 2 MiB answers cost 0.83 and 8 MiB 0.53 of the CPU, while 1 MiB and smaller cost the same or more, which is why a cache waits for 2 MiB. A connection that never sends that much stays as it was, because for small answers encrypting a copy here costs less. An mqtt payload under kernel TLS is not copied at all, so the broker gains from 256 KiB: measured over loopback, a 1 MiB publish to 20 TLS subscribers costs 0.56 of the CPU, a 256 KiB one 0.68. A mail FETCH of 8 MiB costs 0.61, of 4 MiB 0.79, while at 1 and 2 MiB the move gains nothing it can hold to, so mail waits for 4 MiB. The move is for the rest of the connection: a 1 KiB answer on a moved cache connection costs what it did, a 256 KiB one about a tenth more. HTTP/2 connections are never moved.
 
 This needs the kernel's **tls** module (**modprobe tls**). Without the module, the connection continues in user space under its new key, and the runtime says so once in its log. The variable is read when the runtime starts.
 
@@ -2227,7 +2254,11 @@ Both of these variables read **only** the exact string **0**. **SOCKETLEY_RECV_M
 
 #### `SOCKETLEY_NO_SHARD_MESH`
 
-Any value but **0** stops shards from linking to each other directly. The shards then relay through the daemon, and the daemon logs at startup that the mesh is off. This is the measurement control for the mesh: the two paths differ only in the route, not in the build.
+Any value but **0** stops shards from linking to each other directly. The shards then relay through the daemon, and the daemon logs at startup that the mesh is off. This is the measurement control for the mesh: the two paths differ only in the route, not in the build. A request or answer longer than the 8 MiB one frame holds goes in pieces, through the daemon as over a link, up to 256 MiB. Requests and answers for a shard that has not read them yet wait on each side of the daemon up to 64 MiB, and beside that one of up to 256 MiB; past that, an asker is answered at once, as **the runtime is overloaded: its request backlog is full**, not as no such runtime. Everything else the daemon and a shard tell each other (configuration, publishes, deliveries) waits up to 4 MiB of its own beside them.
+
+#### `SOCKETLEY_CACHE_HANDOFF`
+
+**0** stops a sharded cache from handing a client connection to the shard that owns its keys; it then relays each of that connection's commands there instead. On by default for every cache with two or more shards. A connection is handed once 28 of its last 32 single-key commands named one other shard, over the link between the two shards, and only between commands: never inside MULTI or WATCH, while subscribed, blocked or replicating, with a reply or crossing outstanding, or over TLS, a unix socket or a per-shard port. A connection handed on waits a second at its new shard before it may move again, twice as long after each further move. **stats** shows **handoff_out**, **handoff_in**, **handoff_aborted** and **handoff_busy** per shard while it is on.
 
 #### `SOCKETLEY_NO_PEER_LINKS`
 
@@ -2394,18 +2425,31 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### HTTP: static files and a fixed answer
 
-nginx 1.28.3, 9 passes, 2026-11-03, socketley c7d4c42b.
+nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 281 K req/s (1.00 cores) | 52 K req/s (1.00 cores) | 5.31× (4.95–5.82) |
-| 64 KiB file, keep-alive, 256 connections | 93 K req/s (1.00 cores) | 45 K req/s (1.00 cores) | 2.08× (1.98–2.13) |
-| 1 KiB file, a connection per request, 64 at once | 87 K req/s (1.00 cores) | 33 K req/s (1.00 cores) | 2.64× (2.56–2.86) |
-| fixed answer (Lua handler / nginx return), keep-alive | 225 K req/s (1.00 cores) | 76 K req/s (1.00 cores) | 2.88× (2.82–3.08) |
+| 1 KiB file, keep-alive, 256 connections | 281 K req/s (1.00 cores) | 51 K req/s (1.00 cores) | 5.56× (5.23–5.94) |
+| 64 KiB file, keep-alive, 256 connections | 95 K req/s (1.00 cores) | 45 K req/s (1.00 cores) | 2.09× (1.95–2.22) |
+| 1 KiB file, a connection per request, 64 at once | 82 K req/s (0.99 cores) | 33 K req/s (1.00 cores) | 2.55× (2.33–2.59) |
+| fixed answer (Lua handler / nginx return), keep-alive | 235 K req/s (1.00 cores) | 73 K req/s (1.00 cores) | 3.27× (2.79–3.33) |
 
 Caveat: likely higher on this VM than on hardware; see the notes.
 
 How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row.
+
+### HTTP on four cores
+
+nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | nginx | socketley vs nginx |
+|---|---|---|---|
+| 1 KiB file, keep-alive, 256 connections | 510 K req/s (3.99 cores) | 236 K req/s (4.00 cores) | 2.16× (2.12–2.22) |
+| 64 KiB file, keep-alive, 256 connections | 225 K req/s (4.00 cores) | 168 K req/s (3.99 cores) | 1.34× (1.30–1.40) |
+| 1 KiB file, a connection per request, 64 at once | 160 K req/s (3.94 cores) | 130 K req/s (3.88 cores) | 1.23× (1.22–1.23) |
+| fixed answer (Lua handler / nginx return), keep-alive | 426 K req/s (4.00 cores) | 309 K req/s (3.99 cores) | 1.37× (1.34–1.40) |
+
+How it was measured: wrk 16 threads, 8 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither.
 
 ## In the manual
 
@@ -2483,7 +2527,25 @@ Every flag a web runtime takes, by group.
 
 ## Benchmarks
 
-No benchmark. Not measured on the current build yet.
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### Static site: pages, assets, compression, revalidation
+
+nginx 1.28.3, 9 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | nginx | socketley vs nginx |
+|---|---|---|---|
+| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.26× (3.93–4.73) |
+| asset 64 KiB (hashed name), keep-alive, 256 connections | 75 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 1.82× (1.72–2.00) |
+| file 1 MiB, keep-alive, 64 connections | 26 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.26× (1.17–1.33) |
+| page 4 KiB as gzip, the .gz beside it | 249 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 5.14× (4.41–5.48) |
+| page 4 KiB as brotli, the .br beside it | 229 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 4.66× (4.39–5.10) |
+| page 4 KiB as gzip, no .gz on disk | 249 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 9.74× (9.20–10.51) |
+| revalidation: If-None-Match, 304 | 247 K req/s (1.00 cores) | 60 K req/s (1.00 cores) | 4.07× (3.34–4.58) |
+| missing file: the site's 404.html | 218 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.43× (4.98–5.75) |
+| 10,000 pages of 4 KiB at random | 216 K req/s (1.00 cores) | 54 K req/s (1.00 cores) | 3.98× (3.79–4.33) |
+
+How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches; see the server set.
 
 ## In the manual
 
@@ -2723,17 +2785,31 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Reverse proxy, HTTP and TCP
 
-HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-03, socketley 9f644c07.
+HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 56 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.35× (1.31–1.44) | 1.85× (1.81–1.93) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 36 K req/s (1.00 cores) | 32 K req/s (1.00 cores) | 1.25× (1.21–1.28) | 1.43× (1.40–1.47) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.23× (1.17–1.27) | 1.71× (1.70–1.73) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.63× (1.58–1.76) | 2.08× (1.99–2.22) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 95 K req/s (1.00 cores) | 44 K req/s (1.00 cores) | 69 K req/s (1.00 cores) | 2.19× (2.05–2.31) | 1.36× (1.32–1.47) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 55 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.32× (1.29–1.42) | 1.84× (1.79–1.90) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 37 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 1.24× (1.21–1.25) | 1.45× (1.40–1.47) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.22× (1.19–1.26) | 1.71× (1.66–1.74) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.61× (1.58–1.66) | 2.11× (2.05–2.14) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 100 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 70 K req/s (1.00 cores) | 2.29× (2.15–2.38) | 1.40× (1.34–1.48) |
 
 How it was measured: wrk 8 threads, 8 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once.
+
+### Reverse proxy on four cores
+
+HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
+|---|---|---|---|---|---|
+| HTTP, 1 KiB, keep-alive, 32 connections | 147 K req/s (4.00 cores) | 109 K req/s (4.00 cores) | 102 K req/s (3.72 cores) | 1.33× (1.29–1.37) | 1.43× (1.41–1.47) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 163 K req/s (4.00 cores) | 128 K req/s (4.00 cores) | 117 K req/s (4.00 cores) | 1.27× (1.26–1.30) | 1.40× (1.38–1.44) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 93 K req/s (4.00 cores) | 78 K req/s (4.00 cores) | 56 K req/s (4.00 cores) | 1.18× (1.16–1.21) | 1.65× (1.61–1.66) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 105 K req/s (3.96 cores) | 82 K req/s (3.98 cores) | 36 K req/s (2.02 cores) | 1.27× (1.22–1.30) | 2.88× (2.77–2.91) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 207 K req/s (4.00 cores) | 172 K req/s (4.00 cores) | 182 K req/s (4.00 cores) | 1.20× (1.18–1.22) | 1.14× (1.12–1.16) |
+
+How it was measured: wrk 16 threads, 8 s a run; socketley as four shards, HAProxy with four threads and nginx with four workers, each pinned to one of the same four cores; the nginx backend (eight workers) on eight others, wrk (16 threads) on 14. The same rows as the one-core set, the same wrk for every arm; the backend is not what the proxies run into. As in the server set, each wrk thread holds connections on all four of socketley's shards, so part of every arm's CPU is waking the co-located client across cores.
 
 ## In the manual
 
@@ -2839,7 +2915,8 @@ Every flag a cache runtime takes, by group.
 | `--resp` |  | Redis protocol only: Speak RESP to every client, without detecting it. |
 | `--replicate` | text | Follow: The leader cache it follows, host:port. |
 | `--public` |  | Public: Serve clients on other machines too. |
-| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard. |
+| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard (the default above one shard). |
+| `--no-cluster` |  | No cluster map: Keep the shards on the one port: no per-shard ports, no slot map. |
 
 ## Benchmarks
 
@@ -2847,49 +2924,81 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Redis protocol, one command per round trip
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 232 K /s (1.00 cores) | 203 K /s (1.00 cores) | 208 K /s (1.00 cores) | 1.08× (0.89–2.03) | 1.11× (0.86–2.00) |
-| GET | 235 K /s (1.00 cores) | 206 K /s (1.00 cores) | 149 K /s (1.00 cores) | 1.03× (0.92–1.55) | 1.59× (0.97–2.15) |
-| LPUSH | 230 K /s (1.00 cores) | 220 K /s (1.00 cores) | 240 K /s (1.00 cores) | 1.11× (0.91–2.08) | 0.96× (0.85–2.06) |
-| LPOP | 237 K /s (1.00 cores) | 234 K /s (1.00 cores) | 241 K /s (1.00 cores) | 1.03× (0.92–1.75) | 1.01× (0.94–1.57) |
-| SADD | 237 K /s (1.00 cores) | 188 K /s (1.00 cores) | 180 K /s (1.00 cores) | 1.25× (0.87–2.02) | 1.35× (1.05–2.13) |
-| HSET | 229 K /s (1.00 cores) | 203 K /s (1.00 cores) | 228 K /s (1.00 cores) | 1.10× (0.84–1.69) | 0.99× (0.92–2.07) |
-| ZADD | 234 K /s (1.00 cores) | 174 K /s (1.00 cores) | 209 K /s (1.00 cores) | 1.39× (0.89–1.93) | 1.18× (0.90–2.27) |
+| SET | 239 K /s (1.00 cores) | 224 K /s (1.00 cores) | 176 K /s (1.00 cores) | 1.13× (0.95–1.76) | 1.34× (1.05–1.73) |
+| GET | 246 K /s (1.00 cores) | 206 K /s (1.00 cores) | 206 K /s (1.00 cores) | 1.11× (0.95–2.04) | 1.17× (0.90–1.72) |
+| LPUSH | 240 K /s (1.00 cores) | 226 K /s (1.00 cores) | 227 K /s (1.00 cores) | 1.06× (0.80–1.98) | 1.02× (0.90–1.67) |
+| LPOP | 236 K /s (1.00 cores) | 185 K /s (1.00 cores) | 225 K /s (1.00 cores) | 1.30× (0.85–1.78) | 1.08× (0.95–2.24) |
+| SADD | 239 K /s (1.00 cores) | 180 K /s (1.00 cores) | 203 K /s (1.00 cores) | 1.38× (0.89–1.70) | 1.18× (0.91–2.01) |
+| HSET | 238 K /s (1.00 cores) | 168 K /s (1.00 cores) | 224 K /s (1.00 cores) | 1.39× (0.94–1.94) | 1.03× (0.89–1.94) |
+| ZADD | 176 K /s (1.00 cores) | 155 K /s (1.00 cores) | 141 K /s (1.00 cores) | 1.14× (0.95–1.86) | 1.23× (1.00–1.50) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. SET and GET draw their keys at random from about a million, as a cache's clients spread them. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
 
 ### Redis protocol, 100 commands per message (pipelined)
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 11.14 M /s (1.00 cores) | 4.89 M /s (1.00 cores) | 2.85 M /s (1.00 cores) | 2.27× (2.17–2.64) | 3.91× (3.74–4.11) |
-| GET | 11.68 M /s (1.00 cores) | 5.36 M /s (1.00 cores) | 3.96 M /s (1.00 cores) | 2.22× (1.96–2.57) | 3.00× (2.76–3.61) |
-| LPUSH | 9.28 M /s (1.00 cores) | 4.45 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.08× (2.00–2.32) | 3.07× (3.03–3.29) |
-| LPOP | 10.56 M /s (1.00 cores) | 3.68 M /s (1.00 cores) | 2.69 M /s (1.00 cores) | 2.87× (2.66–3.26) | 3.91× (3.72–4.20) |
-| SADD | 11.42 M /s (1.00 cores) | 5.05 M /s (1.00 cores) | 3.47 M /s (1.00 cores) | 2.31× (2.06–2.76) | 3.27× (3.03–3.68) |
-| HSET | 9.96 M /s (1.00 cores) | 4.13 M /s (1.00 cores) | 2.86 M /s (1.00 cores) | 2.37× (2.09–2.86) | 3.48× (3.19–3.84) |
-| ZADD | 9.60 M /s (1.00 cores) | 3.84 M /s (1.00 cores) | 2.73 M /s (1.00 cores) | 2.38× (2.15–2.88) | 3.44× (3.18–3.69) |
+| SET | 8.29 M /s (1.00 cores) | 2.20 M /s (1.00 cores) | 2.60 M /s (1.00 cores) | 3.77× (3.71–3.85) | 3.18× (3.15–3.26) |
+| GET | 8.59 M /s (1.00 cores) | 2.39 M /s (1.00 cores) | 3.59 M /s (1.00 cores) | 3.59× (3.44–3.66) | 2.40× (2.28–3.02) |
+| SADD | 4.73 M /s (1.00 cores) | 2.60 M /s (1.00 cores) | 2.35 M /s (1.00 cores) | 1.79× (1.74–1.86) | 2.01× (1.89–2.10) |
+| HSET | 3.87 M /s (1.00 cores) | 2.03 M /s (1.00 cores) | 1.96 M /s (1.00 cores) | 1.88× (1.83–1.99) | 1.96× (1.86–2.07) |
+| ZADD | 561 K /s (1.00 cores) | 434 K /s (1.00 cores) | 439 K /s (1.00 cores) | 1.28× (1.19–1.32) | 1.26× (1.18–1.29) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. One key, the easy case for every cache.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. SET and GET draw their keys at random from about a million, more than a core's caches hold, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
 
-### Pipelined, keys drawn from 100,000
+### Pipelined, one key
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 9.71 M /s (1.00 cores) | 3.95 M /s (1.00 cores) | 2.77 M /s (1.00 cores) | 2.46× (2.30–3.00) | 3.51× (3.41–3.56) |
-| GET | 10.01 M /s (1.00 cores) | 4.64 M /s (1.00 cores) | 3.84 M /s (1.00 cores) | 2.18× (2.10–2.56) | 2.60× (2.56–2.75) |
-| SADD | 8.97 M /s (1.00 cores) | 4.34 M /s (1.00 cores) | 3.24 M /s (1.00 cores) | 2.04× (1.99–2.50) | 2.77× (2.73–2.83) |
-| HSET | 6.48 M /s (1.00 cores) | 3.54 M /s (1.00 cores) | 2.57 M /s (1.00 cores) | 1.82× (1.73–2.02) | 2.56× (2.41–2.63) |
-| ZADD | 1.56 M /s (1.00 cores) | 1.23 M /s (1.00 cores) | 1.13 M /s (1.00 cores) | 1.26× (1.24–1.28) | 1.38× (1.35–1.40) |
+| SET | 11.55 M /s (1.00 cores) | 4.73 M /s (1.00 cores) | 2.86 M /s (1.00 cores) | 2.46× (2.26–2.99) | 4.00× (3.84–4.12) |
+| GET | 12.12 M /s (1.00 cores) | 5.68 M /s (1.00 cores) | 3.92 M /s (1.00 cores) | 2.05× (1.90–2.56) | 3.00× (2.61–3.50) |
+| LPUSH | 9.41 M /s (1.00 cores) | 4.28 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.21× (1.98–2.44) | 3.11× (3.05–3.21) |
+| LPOP | 11.00 M /s (1.00 cores) | 3.88 M /s (1.00 cores) | 2.74 M /s (1.00 cores) | 2.83× (2.65–3.37) | 4.03× (3.90–4.19) |
+| SADD | 11.49 M /s (1.00 cores) | 5.26 M /s (1.00 cores) | 3.49 M /s (1.00 cores) | 2.25× (2.02–2.66) | 3.30× (3.15–3.73) |
+| HSET | 9.12 M /s (1.00 cores) | 3.95 M /s (1.00 cores) | 2.70 M /s (1.00 cores) | 2.31× (2.23–2.66) | 3.44× (3.07–3.61) |
+| ZADD | 9.62 M /s (1.00 cores) | 3.85 M /s (1.00 cores) | 2.87 M /s (1.00 cores) | 2.51× (2.35–3.03) | 3.35× (3.28–3.50) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The keyspace no longer fits the caches, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The same commands on one key, which stays in the core's cache: the easy case for every cache, kept to show parsing and executing alone.
+
+### Four cores, a cluster-aware client
+
+Redis Cluster 8.0.5, 4 masters, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | Redis Cluster 8.0.5, 4 masters | socketley vs Redis Cluster 8.0.5, 4 masters |
+|---|---|---|---|
+| SET | 28.09 M /s (3.95 cores) | 12.28 M /s (3.97 cores) | 2.29× (2.29–2.32) |
+| GET | 29.00 M /s (3.97 cores) | 14.00 M /s (3.97 cores) | 2.07× (2.04–2.11) |
+| LPUSH | 28.52 M /s (3.92 cores) | 13.76 M /s (3.97 cores) | 2.07× (2.00–2.15) |
+| LPOP | 30.72 M /s (3.86 cores) | 11.91 M /s (3.96 cores) | 2.58× (2.54–2.68) |
+| SADD | 34.58 M /s (3.92 cores) | 16.98 M /s (3.94 cores) | 2.04× (2.03–2.08) |
+| HSET | 31.54 M /s (3.98 cores) | 13.76 M /s (3.94 cores) | 2.29× (2.25–2.29) |
+| ZADD | 30.96 M /s (3.97 cores) | 11.74 M /s (3.98 cores) | 2.64× (2.60–2.68) |
+
+How it was measured: 5 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards and Redis Cluster as four masters, each shard or master pinned to one of the same four cores; five redis-benchmark --cluster processes on 20 others. SET and GET draw their keys at random from 1,048,576, 64 behind each of the 16,384 slot tags, preloaded so every GET finds its key (the hit rate is counted every pass). Every shard's mesh counters are read around every timed run: no command crossed between shards in any pass, so the client sent each to its owner. redis-benchmark --cluster's threads spin while they wait, so its client cores are no reading of headroom.
+
+### Four cores, a plain client at one address
+
+Valkey 9.0.4, --io-threads 4, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | Valkey 9.0.4, --io-threads | socketley vs Valkey 9.0.4, --io-threads |
+|---|---|---|---|
+| SET | 11.57 M /s (3.92 cores) | 3.48 M /s (3.99 cores) | 3.33× (3.29–3.34) |
+| GET | 12.04 M /s (3.91 cores) | 5.03 M /s (3.99 cores) | 2.39× (2.35–2.42) |
+| LPUSH | 8.36 M /s (1.00 cores) | 4.74 M /s (4.00 cores) | 1.77× (1.68–1.80) |
+| LPOP | 9.84 M /s (1.00 cores) | 3.56 M /s (3.99 cores) | 2.76× (2.75–2.81) |
+| SADD | 10.54 M /s (1.00 cores) | 6.31 M /s (3.99 cores) | 1.67× (1.65–1.70) |
+| HSET | 9.21 M /s (1.00 cores) | 5.06 M /s (3.99 cores) | 1.81× (1.77–1.85) |
+| ZADD | 8.99 M /s (1.00 cores) | 4.77 M /s (4.00 cores) | 1.89× (1.86–1.91) |
+
+How it was measured: 5 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards on one port and Valkey with four I/O threads, on the same four cores; five redis-benchmark processes on 20 others. SET and GET draw their keys at random from 1,048,576, three in four of them owned by another shard than the one a connection landed on: socketley carries those over its shard mesh, many commands a frame. LPUSH to ZADD name one key, which one shard owns, so socketley runs those on one of its four cores (see the cores column) and Valkey on its four I/O threads.
 
 ## In the manual
 
@@ -3024,18 +3133,18 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### S3 over HTTP, SigV4
 
-MinIO 2025-09-07, 7 passes, 2026-11-03, socketley c7d4c42b.
+MinIO 2025-09-07, 7 passes, 2026-11-07, socketley fc762708.
 
 | case | socketley | MinIO | socketley vs MinIO |
 |---|---|---|---|
-| GET 4 KiB, 1 connection | 8.3 K obj/s (0.18 cores) | 2.7 K obj/s (0.84 cores) | 3.12× (3.11–3.14) |
-| GET 4 KiB, 4 × 16 connections | 206 K obj/s (1.94 cores) | 17 K obj/s (3.12 cores) | 12.02× (11.89–12.36) |
-| GET 1 MiB, 4 × 16 connections | 31 K obj/s (2.86 cores) | 5.4 K obj/s (2.84 cores) | 5.69× (5.55–5.86) |
-| PUT 4 KiB, 4 × 16 connections, into an empty store | 56 K obj/s (2.58 cores) | 12 K obj/s (2.65 cores) | 4.48× (4.38–4.64) |
+| GET 4 KiB, 1 connection | 8.2 K obj/s (0.18 cores) | 2.7 K obj/s (0.83 cores) | 3.07× (3.06–3.15) |
+| GET 4 KiB, 4 × 16 connections | 205 K obj/s (1.96 cores) | 17 K obj/s (3.13 cores) | 11.91× (11.72–12.22) |
+| GET 1 MiB, 4 × 16 connections | 31 K obj/s (2.86 cores) | 5.4 K obj/s (2.85 cores) | 5.82× (5.23–5.83) |
+| PUT 4 KiB, 4 × 16 connections, into an empty store | 53 K obj/s (2.81 cores) | 13 K obj/s (2.88 cores) | 4.26× (4.23–4.53) |
 
 Caveat: a floor: the load generator ran out before socketley did.
 
-How it was measured: warp 1.3.1, 8s a run, SigV4 over plain HTTP; six warp processes; both servers on the same four cores (socketley as four shards), six warp processes on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.
+How it was measured: warp 1.3.1, 8s a run, SigV4 over plain HTTP; both servers on the same four cores (socketley as four shards), six warp processes on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.
 
 ## In the manual
 
@@ -3128,14 +3237,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### JSON documents over HTTP
 
-MongoDB 9.0.4, PocketBase 0.40.5, 7 passes, 2026-11-03, socketley c7d4c42b.
+MongoDB 9.0.4, PocketBase 0.40.5, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | MongoDB | PocketBase | socketley vs MongoDB | socketley vs PocketBase |
 |---|---|---|---|---|---|
-| read one document by id, 64 clients | 666 K req/s (3.49 cores) | 145 K req/s (3.88 cores) | 34 K req/s (3.86 cores) | 4.56× (4.43–4.73) | 19.65× (19.22–19.95) |
-| replace one document, 64 clients | 112 K req/s (2.92 cores) | 101 K req/s (3.94 cores) | 11 K req/s (2.72 cores) | 1.10× (1.06–1.14) | 9.93× (9.70–10.13) |
-| query on an indexed field, 64 clients | 472 K req/s (3.60 cores) | 80 K req/s (3.90 cores) | 21 K req/s (3.78 cores) | 5.92× (5.36–6.20) | 22.18× (20.91–23.19) |
-| mixed: 90% reads, 10% writes, 64 clients | 312 K req/s (3.64 cores) | 124 K req/s (3.91 cores) | 38 K req/s (3.60 cores) | 2.51× (2.40–2.65) | 8.23× (7.88–8.79) |
+| read one document by id, 64 clients | 670 K req/s (3.50 cores) | 152 K req/s (3.88 cores) | 35 K req/s (3.89 cores) | 4.40× (4.30–5.68) | 19.18× (18.70–19.96) |
+| replace one document, 64 clients | 124 K req/s (3.13 cores) | 102 K req/s (3.94 cores) | 12 K req/s (2.74 cores) | 1.23× (1.17–1.35) | 10.62× (9.50–11.11) |
+| query on an indexed field, 64 clients | 485 K req/s (3.60 cores) | 85 K req/s (3.88 cores) | 22 K req/s (3.81 cores) | 5.75× (5.59–5.86) | 21.76× (20.85–22.49) |
+| mixed: 90% reads, 10% writes, 64 clients | 327 K req/s (3.62 cores) | 133 K req/s (3.91 cores) | 38 K req/s (3.57 cores) | 2.46× (2.38–2.54) | 8.63× (8.46–8.82) |
 
 How it was measured: loadgen, 8s a run, 100,000 documents, data on tmpfs; all three on the same four cores (socketley as four shards), loadgen on 20 others. 100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db hands every write to shard 0, so its writes are at most what one shard takes, at more cores; reads and queries spread over all four.
 
@@ -3224,12 +3333,12 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Authoritative DNS, one zone of 10,000 names
 
-NSD 4.14.0, Knot 3.5.3, 9 passes, 2026-11-03, socketley c7d4c42b.
+NSD 4.14.0, Knot 3.5.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | NSD | Knot | socketley vs NSD | socketley vs Knot |
 |---|---|---|---|---|---|
-| A queries over UDP | 446 K q per core·s (1.00 cores) | 351 K q per core·s (0.90 cores) | 295 K q per core·s (0.91 cores) | 1.28× (1.24–1.31) | 1.53× (1.49–1.58) |
-| A queries over TCP, 128 connections | 191 K q per core·s (0.99 cores) | 55 K q per core·s (0.94 cores) | 61 K q per core·s (0.99 cores) | 3.53× (3.29–3.64) | 3.10× (2.92–3.34) |
+| A queries over UDP | 506 K q per core·s (1.00 cores) | 369 K q per core·s (0.89 cores) | 306 K q per core·s (0.92 cores) | 1.38× (1.34–1.50) | 1.65× (1.61–1.81) |
+| A queries over TCP, 128 connections | 188 K q per core·s (0.99 cores) | 54 K q per core·s (0.97 cores) | 62 K q per core·s (0.99 cores) | 3.49× (3.28–3.53) | 3.04× (2.87–3.06) |
 
 How it was measured: dnsperf 8 threads, 32 sockets, 8 s a run, zone of 10000 names; each server one worker on one core, dnsperf on 20 others. Queries answered per second of server CPU (rate ÷ cores), because no server saturates its core at a window of 500 outstanding queries, and with more NSD and Knot drop UDP from their default socket buffers and dnsperf waits out each loss. socketley runs with --rrl 0 --proxy none: its response rate limit, on by default, would throttle one client host, and NSD and Knot have none by default. 90% of queries find a name, 10% are NXDOMAIN.
 
@@ -3307,14 +3416,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### OpenID Connect provider
 
-Keycloak 26.8.1, 7 passes, 2026-11-03, socketley 396cc846.
+Keycloak 26.8.1, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 260.0 req/s (3.99 cores) | 188.0 req/s (3.92 cores) | 1.35× (1.32–1.72) |
-| refresh token, 64 clients | 48 K req/s (2.48 cores) | 2.4 K req/s (3.88 cores) | 19.94× (19.13–20.38) |
-| userinfo, 64 clients | 168 K req/s (2.44 cores) | 20 K req/s (3.91 cores) | 8.33× (8.27–8.97) |
-| JWKS, 64 clients | 172 K req/s (2.21 cores) | 28 K req/s (3.90 cores) | 6.05× (5.98–6.43) |
+| sign-in: authorization code with a password, 16 clients | 255.0 req/s (3.99 cores) | 190.0 req/s (3.93 cores) | 1.35× (1.25–1.73) |
+| refresh token, 64 clients | 51 K req/s (2.64 cores) | 2.4 K req/s (3.88 cores) | 21.08× (20.55–22.36) |
+| userinfo, 64 clients | 173 K req/s (2.50 cores) | 19 K req/s (3.86 cores) | 9.01× (8.90–9.09) |
+| JWKS, 64 clients | 176 K req/s (2.24 cores) | 29 K req/s (3.89 cores) | 6.16× (6.07–6.44) |
 
 Caveat: a floor: the load generator ran out before socketley did.
 
@@ -3493,7 +3602,22 @@ Every flag a mail runtime takes, by group.
 
 ## Benchmarks
 
-No benchmark. Postfix and Dovecot start their master processes as root, which the measuring machine does not give; not measured.
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### Mail: delivery in, IMAP and POP3 out
+
+Postfix 3.10.6 + Dovecot 2.4.2, 7 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | Postfix 3.10.6 + Dovecot | socketley vs Postfix 3.10.6 + Dovecot |
+|---|---|---|---|
+| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 379.0 msg/s (0.10 cores) | 108.0 msg/s (0.26 cores) | 3.44× (2.71–3.66) |
+| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 209.0 msg/s (0.16 cores) | 57.4 msg/s (0.16 cores) | 3.64× (2.89–4.05) |
+| IMAP: LOGIN and LOGOUT, 8 clients | 127.0 sign-ins/s (0.99 cores) | 64.4 sign-ins/s (1.00 cores) | 1.96× (1.95–1.98) |
+| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 490 K msg/s (0.99 cores) | 125 K msg/s (1.00 cores) | 3.91× (3.88–4.03) |
+| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 19 K msg/s (0.99 cores) | 14 K msg/s (0.99 cores) | 1.41× (1.26–1.47) |
+| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 12 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.72× (1.69–1.81) |
+
+How it was measured: smtp-source (64 processes x 1 connections); mailload.py (8 asyncio processes x 1 connection), 8 s a run; every process of each on the same one core (socketley's daemon, idp, storage and mail; Postfix and Dovecot); smtp-source and mailload on 20 others; data on the VM's ext4 disk. Postfix hands each message over LMTP to Dovecot's Maildir and index; socketley's mail runtime writes it into its storage runtime. Both sync to disk (about 4 ms a sync here) before a message counts, so the SMTP rows are bound by syncs, not cores, and are timed until the last message is in its mailbox. Every sign-in hashes the password: scrypt in socketley, yescrypt in Dovecot. Dovecot 2.4's lmtp_user_concurrency_limit is set to unlimited, 2.3's default, since 10 made Postfix wait out five-minute retries.
 
 ## In the manual
 
@@ -3602,14 +3726,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### MQTT broker, deliveries per second
 
-Mosquitto 2.0.22, 9 passes, 2026-11-03, socketley c7d4c42b.
+Mosquitto 2.0.22, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Mosquitto | socketley vs Mosquitto |
 |---|---|---|---|
-| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 8.00 M msg/s (0.97 cores) | 793 K msg/s (0.99 cores) | 10.11× (9.96–10.28) |
-| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.98 M msg/s (1.00 cores) | 502 K msg/s (0.99 cores) | 23.02× (20.48–30.99) |
-| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.46 M msg/s (1.00 cores) | 69 K msg/s (1.00 cores) | 21.20× (21.02–21.42) |
-| round trip, QoS 1 publish to own delivery | 26.6 µs (0.91 cores) | 42.7 µs (0.68 cores) | 1.61× (1.60–1.62) |
+| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 6.87 M msg/s (0.97 cores) | 793 K msg/s (0.99 cores) | 8.66× (8.47–8.85) |
+| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.53 M msg/s (1.00 cores) | 568 K msg/s (0.99 cores) | 20.29× (20.10–28.22) |
+| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.49 M msg/s (1.00 cores) | 70 K msg/s (1.00 cores) | 21.27× (20.83–21.53) |
+| round trip, QoS 1 publish to own delivery | 26.7 µs (0.92 cores) | 42.3 µs (0.68 cores) | 1.58× (1.58–1.62) |
 
 How it was measured: mqbench (MQTT 3.1.1), 6 s a run; each broker on one core, mqbench on 20 others. MQTT 3.1.1, 64-byte payloads; Mosquitto with persistence off and unbounded queues, socketley --anonymous --session-queue 100000. A fan-out delivery costs Mosquitto about 4 µs of CPU, one write each; socketley coalesces the writes to a subscriber, which is the whole of the fan-out difference. The round trip is a QoS 1 publish to the publisher's own subscription.
 
@@ -3718,15 +3842,15 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Scraping 100,000 series a second
 
-Prometheus 2.53.5, VictoriaMetrics 1.112, 5 passes, 2026-11-04, socketley b1cec63f.
+Prometheus 2.53.5, VictoriaMetrics 1.112, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
 |---|---|---|---|---|---|
-| CPU per sample ingested | 0.31 µs (0.03 cores) | 0.84 µs (0.08 cores) | 1.28 µs (0.13 cores) | 2.69× (2.63–2.76) | 4.14× (4.10–4.33) |
-| resident memory | 88.1 MB | 398 MB | 118 MB | 4.29× (3.51–4.96) | 1.32× (1.27–1.48) |
-| range query, 5 min of every path | 102 ms | 716 ms | 153 ms | 7.18× (5.85–8.74) | 1.50× (1.16–1.81) |
+| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.75 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.58× (2.56–2.66) | 3.48× (3.40–3.68) |
+| resident memory | 89.8 MB | 398 MB | 121 MB | 4.43× (3.98–5.03) | 1.35× (1.23–1.48) |
+| range query, 5 min of every path | 59.9 ms | 633 ms | 174 ms | 10.51× (9.36–11.45) | 2.93× (1.68–3.61) |
 
-How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated. This set was measured on a 16-core development machine, not the box above, until the next round there.
+How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
 
 ## In the manual
 
@@ -3783,12 +3907,12 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Carrying a directory into a storage
 
-rclone 1.60.1, 7 passes, 2026-11-03, socketley c7d4c42b.
+rclone 1.60.1, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | rclone | socketley vs rclone |
 |---|---|---|---|
-| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 7.1 K files/s (0.17 cores) | 3.5 K files/s (1.48 cores) | 2.01× (1.95–2.08) |
-| 1000 files changed after it | 4.1 K files/s (0.21 cores) | 2.9 K files/s (1.67 cores) | 1.39× (1.35–1.51) |
+| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 7.1 K files/s (0.17 cores) | 3.5 K files/s (1.50 cores) | 2.01× (1.87–2.16) |
+| 1000 files changed after it | 4.1 K files/s (0.25 cores) | 2.9 K files/s (1.67 cores) | 1.42× (1.37–1.50) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the target storage runtime in a daemon of its own on four others. The same socketley storage runtime is the target for both, on tmpfs. rclone is the 1.60 Ubuntu packages (default four transfers); a socketley sync job is one runtime that keeps watching the directory and carries a change when inotify reports it, where rclone walks both sides again. A job's end is read off its figures, which refresh every 250 ms, so each run is made several seconds long.
 
@@ -3867,14 +3991,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### A TCP service behind an edge
 
-frp 0.71.1, 5 passes, 2026-11-04, socketley 1bcbfed4.
+frp 0.71.1, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | frp | socketley vs frp |
 |---|---|---|---|
-| round trip through the tunnel, 64 B echo | 35.8 µs (0.85 cores) | 74.3 µs (1.25 cores) | 2.08× (2.05–2.28) |
-| throughput, 512 MiB echoed through the tunnel | 1.7 K MiB/s (1.90 cores) | 680.0 MiB/s (1.86 cores) | 2.52× (2.44–2.61) |
+| round trip through the tunnel, 64 B echo | 88.8 µs (0.87 cores) | 167 µs (1.34 cores) | 1.88× (1.87–1.89) |
+| throughput, 512 MiB echoed through the tunnel | 2.0 K MiB/s (1.91 cores) | 851.0 MiB/s (1.83 cores) | 2.31× (2.01–2.56) |
 
-How it was measured: tb_client, one connection; agent and edge (frpc and frps) on the same two cores, the echo service on a third. socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in half frp's time and moves bulk data at two and a half times its rate. This set was measured on a 16-core development machine, not the box above, until the next round there.
+How it was measured: tb_client, one connection; agent and edge (frpc and frps) on the same two cores, the echo service on a third. socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in about half frp's time and moves bulk data at three quarters of its rate.
 
 ## In the manual
 
@@ -3967,7 +4091,20 @@ Every flag a mcp runtime takes, by group.
 
 ## Benchmarks
 
-No benchmark. No MCP server is established enough to measure against on equal terms.
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### MCP server over Streamable HTTP
+
+MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 9 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
+|---|---|---|---|---|---|
+| initialize + tools/list, a new session each, 64 at once | 69 K req/s (0.97 cores) | 1.2 K req/s (1.00 cores) | 1.7 K req/s (1.00 cores) | 59.16× (58.11–59.90) | 40.67× (39.88–42.23) |
+| tools/call add(a, b), 64 sessions | 135 K req/s (0.99 cores) | 5.3 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 25.64× (24.86–26.09) | 19.05× (18.32–19.32) |
+| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.91 cores) | 5.3 K req/s (1.00 cores) | 6.8 K req/s (1.00 cores) | 10.29× (10.11–10.67) | 8.03× (7.98–8.25) |
+| resources/read, 1 KiB of text, 64 sessions | 151 K req/s (0.96 cores) | 5.4 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.14× (25.58–28.81) | 20.47× (19.89–20.83) |
+
+How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 6s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
 
 ## In the manual
 
@@ -4112,7 +4249,8 @@ Every flag of every runtime type, with the types that take it.
 | `--resp` |  | Redis protocol only: Speak RESP to every client, without detecting it. Types: cache. |
 | `--replicate` | text | Follow: The leader cache it follows, host:port. Types: cache. |
 | `--public` |  | Public: Serve clients on other machines too. Types: cache. |
-| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard. Types: cache. |
+| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard (the default above one shard). Types: cache. |
+| `--no-cluster` |  | No cluster map: Keep the shards on the one port: no per-shard ports, no slot map. Types: cache. |
 
 **Storage**
 
@@ -4449,179 +4587,284 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ## Redis protocol, one command per round trip
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 232 K /s (1.00 cores) | 203 K /s (1.00 cores) | 208 K /s (1.00 cores) | 1.08× (0.89–2.03) | 1.11× (0.86–2.00) |
-| GET | 235 K /s (1.00 cores) | 206 K /s (1.00 cores) | 149 K /s (1.00 cores) | 1.03× (0.92–1.55) | 1.59× (0.97–2.15) |
-| LPUSH | 230 K /s (1.00 cores) | 220 K /s (1.00 cores) | 240 K /s (1.00 cores) | 1.11× (0.91–2.08) | 0.96× (0.85–2.06) |
-| LPOP | 237 K /s (1.00 cores) | 234 K /s (1.00 cores) | 241 K /s (1.00 cores) | 1.03× (0.92–1.75) | 1.01× (0.94–1.57) |
-| SADD | 237 K /s (1.00 cores) | 188 K /s (1.00 cores) | 180 K /s (1.00 cores) | 1.25× (0.87–2.02) | 1.35× (1.05–2.13) |
-| HSET | 229 K /s (1.00 cores) | 203 K /s (1.00 cores) | 228 K /s (1.00 cores) | 1.10× (0.84–1.69) | 0.99× (0.92–2.07) |
-| ZADD | 234 K /s (1.00 cores) | 174 K /s (1.00 cores) | 209 K /s (1.00 cores) | 1.39× (0.89–1.93) | 1.18× (0.90–2.27) |
+| SET | 239 K /s (1.00 cores) | 224 K /s (1.00 cores) | 176 K /s (1.00 cores) | 1.13× (0.95–1.76) | 1.34× (1.05–1.73) |
+| GET | 246 K /s (1.00 cores) | 206 K /s (1.00 cores) | 206 K /s (1.00 cores) | 1.11× (0.95–2.04) | 1.17× (0.90–1.72) |
+| LPUSH | 240 K /s (1.00 cores) | 226 K /s (1.00 cores) | 227 K /s (1.00 cores) | 1.06× (0.80–1.98) | 1.02× (0.90–1.67) |
+| LPOP | 236 K /s (1.00 cores) | 185 K /s (1.00 cores) | 225 K /s (1.00 cores) | 1.30× (0.85–1.78) | 1.08× (0.95–2.24) |
+| SADD | 239 K /s (1.00 cores) | 180 K /s (1.00 cores) | 203 K /s (1.00 cores) | 1.38× (0.89–1.70) | 1.18× (0.91–2.01) |
+| HSET | 238 K /s (1.00 cores) | 168 K /s (1.00 cores) | 224 K /s (1.00 cores) | 1.39× (0.94–1.94) | 1.03× (0.89–1.94) |
+| ZADD | 176 K /s (1.00 cores) | 155 K /s (1.00 cores) | 141 K /s (1.00 cores) | 1.14× (0.95–1.86) | 1.23× (1.00–1.50) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. SET and GET draw their keys at random from about a million, as a cache's clients spread them. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
 
 ## Redis protocol, 100 commands per message (pipelined)
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 11.14 M /s (1.00 cores) | 4.89 M /s (1.00 cores) | 2.85 M /s (1.00 cores) | 2.27× (2.17–2.64) | 3.91× (3.74–4.11) |
-| GET | 11.68 M /s (1.00 cores) | 5.36 M /s (1.00 cores) | 3.96 M /s (1.00 cores) | 2.22× (1.96–2.57) | 3.00× (2.76–3.61) |
-| LPUSH | 9.28 M /s (1.00 cores) | 4.45 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.08× (2.00–2.32) | 3.07× (3.03–3.29) |
-| LPOP | 10.56 M /s (1.00 cores) | 3.68 M /s (1.00 cores) | 2.69 M /s (1.00 cores) | 2.87× (2.66–3.26) | 3.91× (3.72–4.20) |
-| SADD | 11.42 M /s (1.00 cores) | 5.05 M /s (1.00 cores) | 3.47 M /s (1.00 cores) | 2.31× (2.06–2.76) | 3.27× (3.03–3.68) |
-| HSET | 9.96 M /s (1.00 cores) | 4.13 M /s (1.00 cores) | 2.86 M /s (1.00 cores) | 2.37× (2.09–2.86) | 3.48× (3.19–3.84) |
-| ZADD | 9.60 M /s (1.00 cores) | 3.84 M /s (1.00 cores) | 2.73 M /s (1.00 cores) | 2.38× (2.15–2.88) | 3.44× (3.18–3.69) |
+| SET | 8.29 M /s (1.00 cores) | 2.20 M /s (1.00 cores) | 2.60 M /s (1.00 cores) | 3.77× (3.71–3.85) | 3.18× (3.15–3.26) |
+| GET | 8.59 M /s (1.00 cores) | 2.39 M /s (1.00 cores) | 3.59 M /s (1.00 cores) | 3.59× (3.44–3.66) | 2.40× (2.28–3.02) |
+| SADD | 4.73 M /s (1.00 cores) | 2.60 M /s (1.00 cores) | 2.35 M /s (1.00 cores) | 1.79× (1.74–1.86) | 2.01× (1.89–2.10) |
+| HSET | 3.87 M /s (1.00 cores) | 2.03 M /s (1.00 cores) | 1.96 M /s (1.00 cores) | 1.88× (1.83–1.99) | 1.96× (1.86–2.07) |
+| ZADD | 561 K /s (1.00 cores) | 434 K /s (1.00 cores) | 439 K /s (1.00 cores) | 1.28× (1.19–1.32) | 1.26× (1.18–1.29) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. One key, the easy case for every cache.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. SET and GET draw their keys at random from about a million, more than a core's caches hold, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
 
-## Pipelined, keys drawn from 100,000
+## Pipelined, one key
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 9.71 M /s (1.00 cores) | 3.95 M /s (1.00 cores) | 2.77 M /s (1.00 cores) | 2.46× (2.30–3.00) | 3.51× (3.41–3.56) |
-| GET | 10.01 M /s (1.00 cores) | 4.64 M /s (1.00 cores) | 3.84 M /s (1.00 cores) | 2.18× (2.10–2.56) | 2.60× (2.56–2.75) |
-| SADD | 8.97 M /s (1.00 cores) | 4.34 M /s (1.00 cores) | 3.24 M /s (1.00 cores) | 2.04× (1.99–2.50) | 2.77× (2.73–2.83) |
-| HSET | 6.48 M /s (1.00 cores) | 3.54 M /s (1.00 cores) | 2.57 M /s (1.00 cores) | 1.82× (1.73–2.02) | 2.56× (2.41–2.63) |
-| ZADD | 1.56 M /s (1.00 cores) | 1.23 M /s (1.00 cores) | 1.13 M /s (1.00 cores) | 1.26× (1.24–1.28) | 1.38× (1.35–1.40) |
+| SET | 11.55 M /s (1.00 cores) | 4.73 M /s (1.00 cores) | 2.86 M /s (1.00 cores) | 2.46× (2.26–2.99) | 4.00× (3.84–4.12) |
+| GET | 12.12 M /s (1.00 cores) | 5.68 M /s (1.00 cores) | 3.92 M /s (1.00 cores) | 2.05× (1.90–2.56) | 3.00× (2.61–3.50) |
+| LPUSH | 9.41 M /s (1.00 cores) | 4.28 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.21× (1.98–2.44) | 3.11× (3.05–3.21) |
+| LPOP | 11.00 M /s (1.00 cores) | 3.88 M /s (1.00 cores) | 2.74 M /s (1.00 cores) | 2.83× (2.65–3.37) | 4.03× (3.90–4.19) |
+| SADD | 11.49 M /s (1.00 cores) | 5.26 M /s (1.00 cores) | 3.49 M /s (1.00 cores) | 2.25× (2.02–2.66) | 3.30× (3.15–3.73) |
+| HSET | 9.12 M /s (1.00 cores) | 3.95 M /s (1.00 cores) | 2.70 M /s (1.00 cores) | 2.31× (2.23–2.66) | 3.44× (3.07–3.61) |
+| ZADD | 9.62 M /s (1.00 cores) | 3.85 M /s (1.00 cores) | 2.87 M /s (1.00 cores) | 2.51× (2.35–3.03) | 3.35× (3.28–3.50) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The keyspace no longer fits the caches, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The same commands on one key, which stays in the core's cache: the easy case for every cache, kept to show parsing and executing alone.
+
+## Four cores, a cluster-aware client
+
+Redis Cluster 8.0.5, 4 masters, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | Redis Cluster 8.0.5, 4 masters | socketley vs Redis Cluster 8.0.5, 4 masters |
+|---|---|---|---|
+| SET | 28.09 M /s (3.95 cores) | 12.28 M /s (3.97 cores) | 2.29× (2.29–2.32) |
+| GET | 29.00 M /s (3.97 cores) | 14.00 M /s (3.97 cores) | 2.07× (2.04–2.11) |
+| LPUSH | 28.52 M /s (3.92 cores) | 13.76 M /s (3.97 cores) | 2.07× (2.00–2.15) |
+| LPOP | 30.72 M /s (3.86 cores) | 11.91 M /s (3.96 cores) | 2.58× (2.54–2.68) |
+| SADD | 34.58 M /s (3.92 cores) | 16.98 M /s (3.94 cores) | 2.04× (2.03–2.08) |
+| HSET | 31.54 M /s (3.98 cores) | 13.76 M /s (3.94 cores) | 2.29× (2.25–2.29) |
+| ZADD | 30.96 M /s (3.97 cores) | 11.74 M /s (3.98 cores) | 2.64× (2.60–2.68) |
+
+How it was measured: 5 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards and Redis Cluster as four masters, each shard or master pinned to one of the same four cores; five redis-benchmark --cluster processes on 20 others. SET and GET draw their keys at random from 1,048,576, 64 behind each of the 16,384 slot tags, preloaded so every GET finds its key (the hit rate is counted every pass). Every shard's mesh counters are read around every timed run: no command crossed between shards in any pass, so the client sent each to its owner. redis-benchmark --cluster's threads spin while they wait, so its client cores are no reading of headroom.
+
+## Four cores, a plain client at one address
+
+Valkey 9.0.4, --io-threads 4, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | Valkey 9.0.4, --io-threads | socketley vs Valkey 9.0.4, --io-threads |
+|---|---|---|---|
+| SET | 11.57 M /s (3.92 cores) | 3.48 M /s (3.99 cores) | 3.33× (3.29–3.34) |
+| GET | 12.04 M /s (3.91 cores) | 5.03 M /s (3.99 cores) | 2.39× (2.35–2.42) |
+| LPUSH | 8.36 M /s (1.00 cores) | 4.74 M /s (4.00 cores) | 1.77× (1.68–1.80) |
+| LPOP | 9.84 M /s (1.00 cores) | 3.56 M /s (3.99 cores) | 2.76× (2.75–2.81) |
+| SADD | 10.54 M /s (1.00 cores) | 6.31 M /s (3.99 cores) | 1.67× (1.65–1.70) |
+| HSET | 9.21 M /s (1.00 cores) | 5.06 M /s (3.99 cores) | 1.81× (1.77–1.85) |
+| ZADD | 8.99 M /s (1.00 cores) | 4.77 M /s (4.00 cores) | 1.89× (1.86–1.91) |
+
+How it was measured: 5 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards on one port and Valkey with four I/O threads, on the same four cores; five redis-benchmark processes on 20 others. SET and GET draw their keys at random from 1,048,576, three in four of them owned by another shard than the one a connection landed on: socketley carries those over its shard mesh, many commands a frame. LPUSH to ZADD name one key, which one shard owns, so socketley runs those on one of its four cores (see the cores column) and Valkey on its four I/O threads.
 
 ## HTTP: static files and a fixed answer
 
-nginx 1.28.3, 9 passes, 2026-11-03, socketley c7d4c42b.
+nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 281 K req/s (1.00 cores) | 52 K req/s (1.00 cores) | 5.31× (4.95–5.82) |
-| 64 KiB file, keep-alive, 256 connections | 93 K req/s (1.00 cores) | 45 K req/s (1.00 cores) | 2.08× (1.98–2.13) |
-| 1 KiB file, a connection per request, 64 at once | 87 K req/s (1.00 cores) | 33 K req/s (1.00 cores) | 2.64× (2.56–2.86) |
-| fixed answer (Lua handler / nginx return), keep-alive | 225 K req/s (1.00 cores) | 76 K req/s (1.00 cores) | 2.88× (2.82–3.08) |
+| 1 KiB file, keep-alive, 256 connections | 281 K req/s (1.00 cores) | 51 K req/s (1.00 cores) | 5.56× (5.23–5.94) |
+| 64 KiB file, keep-alive, 256 connections | 95 K req/s (1.00 cores) | 45 K req/s (1.00 cores) | 2.09× (1.95–2.22) |
+| 1 KiB file, a connection per request, 64 at once | 82 K req/s (0.99 cores) | 33 K req/s (1.00 cores) | 2.55× (2.33–2.59) |
+| fixed answer (Lua handler / nginx return), keep-alive | 235 K req/s (1.00 cores) | 73 K req/s (1.00 cores) | 3.27× (2.79–3.33) |
 
 Caveat: likely higher on this VM than on hardware; see the notes.
 
 How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row.
 
+## HTTP on four cores
+
+nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | nginx | socketley vs nginx |
+|---|---|---|---|
+| 1 KiB file, keep-alive, 256 connections | 510 K req/s (3.99 cores) | 236 K req/s (4.00 cores) | 2.16× (2.12–2.22) |
+| 64 KiB file, keep-alive, 256 connections | 225 K req/s (4.00 cores) | 168 K req/s (3.99 cores) | 1.34× (1.30–1.40) |
+| 1 KiB file, a connection per request, 64 at once | 160 K req/s (3.94 cores) | 130 K req/s (3.88 cores) | 1.23× (1.22–1.23) |
+| fixed answer (Lua handler / nginx return), keep-alive | 426 K req/s (4.00 cores) | 309 K req/s (3.99 cores) | 1.37× (1.34–1.40) |
+
+How it was measured: wrk 16 threads, 8 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither.
+
 ## Reverse proxy, HTTP and TCP
 
-HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-03, socketley 9f644c07.
+HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 56 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.35× (1.31–1.44) | 1.85× (1.81–1.93) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 36 K req/s (1.00 cores) | 32 K req/s (1.00 cores) | 1.25× (1.21–1.28) | 1.43× (1.40–1.47) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.23× (1.17–1.27) | 1.71× (1.70–1.73) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.63× (1.58–1.76) | 2.08× (1.99–2.22) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 95 K req/s (1.00 cores) | 44 K req/s (1.00 cores) | 69 K req/s (1.00 cores) | 2.19× (2.05–2.31) | 1.36× (1.32–1.47) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 55 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.32× (1.29–1.42) | 1.84× (1.79–1.90) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 37 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 1.24× (1.21–1.25) | 1.45× (1.40–1.47) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.22× (1.19–1.26) | 1.71× (1.66–1.74) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.61× (1.58–1.66) | 2.11× (2.05–2.14) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 100 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 70 K req/s (1.00 cores) | 2.29× (2.15–2.38) | 1.40× (1.34–1.48) |
 
 How it was measured: wrk 8 threads, 8 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once.
 
+## Reverse proxy on four cores
+
+HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
+|---|---|---|---|---|---|
+| HTTP, 1 KiB, keep-alive, 32 connections | 147 K req/s (4.00 cores) | 109 K req/s (4.00 cores) | 102 K req/s (3.72 cores) | 1.33× (1.29–1.37) | 1.43× (1.41–1.47) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 163 K req/s (4.00 cores) | 128 K req/s (4.00 cores) | 117 K req/s (4.00 cores) | 1.27× (1.26–1.30) | 1.40× (1.38–1.44) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 93 K req/s (4.00 cores) | 78 K req/s (4.00 cores) | 56 K req/s (4.00 cores) | 1.18× (1.16–1.21) | 1.65× (1.61–1.66) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 105 K req/s (3.96 cores) | 82 K req/s (3.98 cores) | 36 K req/s (2.02 cores) | 1.27× (1.22–1.30) | 2.88× (2.77–2.91) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 207 K req/s (4.00 cores) | 172 K req/s (4.00 cores) | 182 K req/s (4.00 cores) | 1.20× (1.18–1.22) | 1.14× (1.12–1.16) |
+
+How it was measured: wrk 16 threads, 8 s a run; socketley as four shards, HAProxy with four threads and nginx with four workers, each pinned to one of the same four cores; the nginx backend (eight workers) on eight others, wrk (16 threads) on 14. The same rows as the one-core set, the same wrk for every arm; the backend is not what the proxies run into. As in the server set, each wrk thread holds connections on all four of socketley's shards, so part of every arm's CPU is waking the co-located client across cores.
+
+## Static site: pages, assets, compression, revalidation
+
+nginx 1.28.3, 9 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | nginx | socketley vs nginx |
+|---|---|---|---|
+| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.26× (3.93–4.73) |
+| asset 64 KiB (hashed name), keep-alive, 256 connections | 75 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 1.82× (1.72–2.00) |
+| file 1 MiB, keep-alive, 64 connections | 26 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.26× (1.17–1.33) |
+| page 4 KiB as gzip, the .gz beside it | 249 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 5.14× (4.41–5.48) |
+| page 4 KiB as brotli, the .br beside it | 229 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 4.66× (4.39–5.10) |
+| page 4 KiB as gzip, no .gz on disk | 249 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 9.74× (9.20–10.51) |
+| revalidation: If-None-Match, 304 | 247 K req/s (1.00 cores) | 60 K req/s (1.00 cores) | 4.07× (3.34–4.58) |
+| missing file: the site's 404.html | 218 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.43× (4.98–5.75) |
+| 10,000 pages of 4 KiB at random | 216 K req/s (1.00 cores) | 54 K req/s (1.00 cores) | 3.98× (3.79–4.33) |
+
+How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches; see the server set.
+
 ## Authoritative DNS, one zone of 10,000 names
 
-NSD 4.14.0, Knot 3.5.3, 9 passes, 2026-11-03, socketley c7d4c42b.
+NSD 4.14.0, Knot 3.5.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | NSD | Knot | socketley vs NSD | socketley vs Knot |
 |---|---|---|---|---|---|
-| A queries over UDP | 446 K q per core·s (1.00 cores) | 351 K q per core·s (0.90 cores) | 295 K q per core·s (0.91 cores) | 1.28× (1.24–1.31) | 1.53× (1.49–1.58) |
-| A queries over TCP, 128 connections | 191 K q per core·s (0.99 cores) | 55 K q per core·s (0.94 cores) | 61 K q per core·s (0.99 cores) | 3.53× (3.29–3.64) | 3.10× (2.92–3.34) |
+| A queries over UDP | 506 K q per core·s (1.00 cores) | 369 K q per core·s (0.89 cores) | 306 K q per core·s (0.92 cores) | 1.38× (1.34–1.50) | 1.65× (1.61–1.81) |
+| A queries over TCP, 128 connections | 188 K q per core·s (0.99 cores) | 54 K q per core·s (0.97 cores) | 62 K q per core·s (0.99 cores) | 3.49× (3.28–3.53) | 3.04× (2.87–3.06) |
 
 How it was measured: dnsperf 8 threads, 32 sockets, 8 s a run, zone of 10000 names; each server one worker on one core, dnsperf on 20 others. Queries answered per second of server CPU (rate ÷ cores), because no server saturates its core at a window of 500 outstanding queries, and with more NSD and Knot drop UDP from their default socket buffers and dnsperf waits out each loss. socketley runs with --rrl 0 --proxy none: its response rate limit, on by default, would throttle one client host, and NSD and Knot have none by default. 90% of queries find a name, 10% are NXDOMAIN.
 
 ## MQTT broker, deliveries per second
 
-Mosquitto 2.0.22, 9 passes, 2026-11-03, socketley c7d4c42b.
+Mosquitto 2.0.22, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Mosquitto | socketley vs Mosquitto |
 |---|---|---|---|
-| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 8.00 M msg/s (0.97 cores) | 793 K msg/s (0.99 cores) | 10.11× (9.96–10.28) |
-| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.98 M msg/s (1.00 cores) | 502 K msg/s (0.99 cores) | 23.02× (20.48–30.99) |
-| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.46 M msg/s (1.00 cores) | 69 K msg/s (1.00 cores) | 21.20× (21.02–21.42) |
-| round trip, QoS 1 publish to own delivery | 26.6 µs (0.91 cores) | 42.7 µs (0.68 cores) | 1.61× (1.60–1.62) |
+| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 6.87 M msg/s (0.97 cores) | 793 K msg/s (0.99 cores) | 8.66× (8.47–8.85) |
+| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.53 M msg/s (1.00 cores) | 568 K msg/s (0.99 cores) | 20.29× (20.10–28.22) |
+| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.49 M msg/s (1.00 cores) | 70 K msg/s (1.00 cores) | 21.27× (20.83–21.53) |
+| round trip, QoS 1 publish to own delivery | 26.7 µs (0.92 cores) | 42.3 µs (0.68 cores) | 1.58× (1.58–1.62) |
 
 How it was measured: mqbench (MQTT 3.1.1), 6 s a run; each broker on one core, mqbench on 20 others. MQTT 3.1.1, 64-byte payloads; Mosquitto with persistence off and unbounded queues, socketley --anonymous --session-queue 100000. A fan-out delivery costs Mosquitto about 4 µs of CPU, one write each; socketley coalesces the writes to a subscriber, which is the whole of the fan-out difference. The round trip is a QoS 1 publish to the publisher's own subscription.
 
 ## S3 over HTTP, SigV4
 
-MinIO 2025-09-07, 7 passes, 2026-11-03, socketley c7d4c42b.
+MinIO 2025-09-07, 7 passes, 2026-11-07, socketley fc762708.
 
 | case | socketley | MinIO | socketley vs MinIO |
 |---|---|---|---|
-| GET 4 KiB, 1 connection | 8.3 K obj/s (0.18 cores) | 2.7 K obj/s (0.84 cores) | 3.12× (3.11–3.14) |
-| GET 4 KiB, 4 × 16 connections | 206 K obj/s (1.94 cores) | 17 K obj/s (3.12 cores) | 12.02× (11.89–12.36) |
-| GET 1 MiB, 4 × 16 connections | 31 K obj/s (2.86 cores) | 5.4 K obj/s (2.84 cores) | 5.69× (5.55–5.86) |
-| PUT 4 KiB, 4 × 16 connections, into an empty store | 56 K obj/s (2.58 cores) | 12 K obj/s (2.65 cores) | 4.48× (4.38–4.64) |
+| GET 4 KiB, 1 connection | 8.2 K obj/s (0.18 cores) | 2.7 K obj/s (0.83 cores) | 3.07× (3.06–3.15) |
+| GET 4 KiB, 4 × 16 connections | 205 K obj/s (1.96 cores) | 17 K obj/s (3.13 cores) | 11.91× (11.72–12.22) |
+| GET 1 MiB, 4 × 16 connections | 31 K obj/s (2.86 cores) | 5.4 K obj/s (2.85 cores) | 5.82× (5.23–5.83) |
+| PUT 4 KiB, 4 × 16 connections, into an empty store | 53 K obj/s (2.81 cores) | 13 K obj/s (2.88 cores) | 4.26× (4.23–4.53) |
 
 Caveat: a floor: the load generator ran out before socketley did.
 
-How it was measured: warp 1.3.1, 8s a run, SigV4 over plain HTTP; six warp processes; both servers on the same four cores (socketley as four shards), six warp processes on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.
+How it was measured: warp 1.3.1, 8s a run, SigV4 over plain HTTP; both servers on the same four cores (socketley as four shards), six warp processes on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.
 
 ## JSON documents over HTTP
 
-MongoDB 9.0.4, PocketBase 0.40.5, 7 passes, 2026-11-03, socketley c7d4c42b.
+MongoDB 9.0.4, PocketBase 0.40.5, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | MongoDB | PocketBase | socketley vs MongoDB | socketley vs PocketBase |
 |---|---|---|---|---|---|
-| read one document by id, 64 clients | 666 K req/s (3.49 cores) | 145 K req/s (3.88 cores) | 34 K req/s (3.86 cores) | 4.56× (4.43–4.73) | 19.65× (19.22–19.95) |
-| replace one document, 64 clients | 112 K req/s (2.92 cores) | 101 K req/s (3.94 cores) | 11 K req/s (2.72 cores) | 1.10× (1.06–1.14) | 9.93× (9.70–10.13) |
-| query on an indexed field, 64 clients | 472 K req/s (3.60 cores) | 80 K req/s (3.90 cores) | 21 K req/s (3.78 cores) | 5.92× (5.36–6.20) | 22.18× (20.91–23.19) |
-| mixed: 90% reads, 10% writes, 64 clients | 312 K req/s (3.64 cores) | 124 K req/s (3.91 cores) | 38 K req/s (3.60 cores) | 2.51× (2.40–2.65) | 8.23× (7.88–8.79) |
+| read one document by id, 64 clients | 670 K req/s (3.50 cores) | 152 K req/s (3.88 cores) | 35 K req/s (3.89 cores) | 4.40× (4.30–5.68) | 19.18× (18.70–19.96) |
+| replace one document, 64 clients | 124 K req/s (3.13 cores) | 102 K req/s (3.94 cores) | 12 K req/s (2.74 cores) | 1.23× (1.17–1.35) | 10.62× (9.50–11.11) |
+| query on an indexed field, 64 clients | 485 K req/s (3.60 cores) | 85 K req/s (3.88 cores) | 22 K req/s (3.81 cores) | 5.75× (5.59–5.86) | 21.76× (20.85–22.49) |
+| mixed: 90% reads, 10% writes, 64 clients | 327 K req/s (3.62 cores) | 133 K req/s (3.91 cores) | 38 K req/s (3.57 cores) | 2.46× (2.38–2.54) | 8.63× (8.46–8.82) |
 
 How it was measured: loadgen, 8s a run, 100,000 documents, data on tmpfs; all three on the same four cores (socketley as four shards), loadgen on 20 others. 100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db hands every write to shard 0, so its writes are at most what one shard takes, at more cores; reads and queries spread over all four.
 
 ## A TCP service behind an edge
 
-frp 0.71.1, 5 passes, 2026-11-04, socketley 1bcbfed4.
+frp 0.71.1, 9 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | frp | socketley vs frp |
 |---|---|---|---|
-| round trip through the tunnel, 64 B echo | 35.8 µs (0.85 cores) | 74.3 µs (1.25 cores) | 2.08× (2.05–2.28) |
-| throughput, 512 MiB echoed through the tunnel | 1.7 K MiB/s (1.90 cores) | 680.0 MiB/s (1.86 cores) | 2.52× (2.44–2.61) |
+| round trip through the tunnel, 64 B echo | 88.8 µs (0.87 cores) | 167 µs (1.34 cores) | 1.88× (1.87–1.89) |
+| throughput, 512 MiB echoed through the tunnel | 2.0 K MiB/s (1.91 cores) | 851.0 MiB/s (1.83 cores) | 2.31× (2.01–2.56) |
 
-How it was measured: tb_client, one connection; agent and edge (frpc and frps) on the same two cores, the echo service on a third. socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in half frp's time and moves bulk data at two and a half times its rate. This set was measured on a 16-core development machine, not the box above, until the next round there.
+How it was measured: tb_client, one connection; agent and edge (frpc and frps) on the same two cores, the echo service on a third. socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in about half frp's time and moves bulk data at three quarters of its rate.
 
 ## Scraping 100,000 series a second
 
-Prometheus 2.53.5, VictoriaMetrics 1.112, 5 passes, 2026-11-04, socketley b1cec63f.
+Prometheus 2.53.5, VictoriaMetrics 1.112, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
 |---|---|---|---|---|---|
-| CPU per sample ingested | 0.31 µs (0.03 cores) | 0.84 µs (0.08 cores) | 1.28 µs (0.13 cores) | 2.69× (2.63–2.76) | 4.14× (4.10–4.33) |
-| resident memory | 88.1 MB | 398 MB | 118 MB | 4.29× (3.51–4.96) | 1.32× (1.27–1.48) |
-| range query, 5 min of every path | 102 ms | 716 ms | 153 ms | 7.18× (5.85–8.74) | 1.50× (1.16–1.81) |
+| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.75 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.58× (2.56–2.66) | 3.48× (3.40–3.68) |
+| resident memory | 89.8 MB | 398 MB | 121 MB | 4.43× (3.98–5.03) | 1.35× (1.23–1.48) |
+| range query, 5 min of every path | 59.9 ms | 633 ms | 174 ms | 10.51× (9.36–11.45) | 2.93× (1.68–3.61) |
 
-How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated. This set was measured on a 16-core development machine, not the box above, until the next round there.
+How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
 
 ## Carrying a directory into a storage
 
-rclone 1.60.1, 7 passes, 2026-11-03, socketley c7d4c42b.
+rclone 1.60.1, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | rclone | socketley vs rclone |
 |---|---|---|---|
-| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 7.1 K files/s (0.17 cores) | 3.5 K files/s (1.48 cores) | 2.01× (1.95–2.08) |
-| 1000 files changed after it | 4.1 K files/s (0.21 cores) | 2.9 K files/s (1.67 cores) | 1.39× (1.35–1.51) |
+| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 7.1 K files/s (0.17 cores) | 3.5 K files/s (1.50 cores) | 2.01× (1.87–2.16) |
+| 1000 files changed after it | 4.1 K files/s (0.25 cores) | 2.9 K files/s (1.67 cores) | 1.42× (1.37–1.50) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the target storage runtime in a daemon of its own on four others. The same socketley storage runtime is the target for both, on tmpfs. rclone is the 1.60 Ubuntu packages (default four transfers); a socketley sync job is one runtime that keeps watching the directory and carries a change when inotify reports it, where rclone walks both sides again. A job's end is read off its figures, which refresh every 250 ms, so each run is made several seconds long.
 
 ## OpenID Connect provider
 
-Keycloak 26.8.1, 7 passes, 2026-11-03, socketley 396cc846.
+Keycloak 26.8.1, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 260.0 req/s (3.99 cores) | 188.0 req/s (3.92 cores) | 1.35× (1.32–1.72) |
-| refresh token, 64 clients | 48 K req/s (2.48 cores) | 2.4 K req/s (3.88 cores) | 19.94× (19.13–20.38) |
-| userinfo, 64 clients | 168 K req/s (2.44 cores) | 20 K req/s (3.91 cores) | 8.33× (8.27–8.97) |
-| JWKS, 64 clients | 172 K req/s (2.21 cores) | 28 K req/s (3.90 cores) | 6.05× (5.98–6.43) |
+| sign-in: authorization code with a password, 16 clients | 255.0 req/s (3.99 cores) | 190.0 req/s (3.93 cores) | 1.35× (1.25–1.73) |
+| refresh token, 64 clients | 51 K req/s (2.64 cores) | 2.4 K req/s (3.88 cores) | 21.08× (20.55–22.36) |
+| userinfo, 64 clients | 173 K req/s (2.50 cores) | 19 K req/s (3.86 cores) | 9.01× (8.90–9.09) |
+| JWKS, 64 clients | 176 K req/s (2.24 cores) | 29 K req/s (3.89 cores) | 6.16× (6.07–6.44) |
 
 Caveat: a floor: the load generator ran out before socketley did.
 
 How it was measured: idpgen, 8s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. On refresh, userinfo and JWKS socketley uses two and a half of its four cores while idpgen takes up to eleven, so those ratios are floors. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.
+
+## Mail: delivery in, IMAP and POP3 out
+
+Postfix 3.10.6 + Dovecot 2.4.2, 7 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | Postfix 3.10.6 + Dovecot | socketley vs Postfix 3.10.6 + Dovecot |
+|---|---|---|---|
+| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 379.0 msg/s (0.10 cores) | 108.0 msg/s (0.26 cores) | 3.44× (2.71–3.66) |
+| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 209.0 msg/s (0.16 cores) | 57.4 msg/s (0.16 cores) | 3.64× (2.89–4.05) |
+| IMAP: LOGIN and LOGOUT, 8 clients | 127.0 sign-ins/s (0.99 cores) | 64.4 sign-ins/s (1.00 cores) | 1.96× (1.95–1.98) |
+| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 490 K msg/s (0.99 cores) | 125 K msg/s (1.00 cores) | 3.91× (3.88–4.03) |
+| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 19 K msg/s (0.99 cores) | 14 K msg/s (0.99 cores) | 1.41× (1.26–1.47) |
+| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 12 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.72× (1.69–1.81) |
+
+How it was measured: smtp-source (64 processes x 1 connections); mailload.py (8 asyncio processes x 1 connection), 8 s a run; every process of each on the same one core (socketley's daemon, idp, storage and mail; Postfix and Dovecot); smtp-source and mailload on 20 others; data on the VM's ext4 disk. Postfix hands each message over LMTP to Dovecot's Maildir and index; socketley's mail runtime writes it into its storage runtime. Both sync to disk (about 4 ms a sync here) before a message counts, so the SMTP rows are bound by syncs, not cores, and are timed until the last message is in its mailbox. Every sign-in hashes the password: scrypt in socketley, yescrypt in Dovecot. Dovecot 2.4's lmtp_user_concurrency_limit is set to unlimited, 2.3's default, since 10 made Postfix wait out five-minute retries.
+
+## MCP server over Streamable HTTP
+
+MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 9 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
+|---|---|---|---|---|---|
+| initialize + tools/list, a new session each, 64 at once | 69 K req/s (0.97 cores) | 1.2 K req/s (1.00 cores) | 1.7 K req/s (1.00 cores) | 59.16× (58.11–59.90) | 40.67× (39.88–42.23) |
+| tools/call add(a, b), 64 sessions | 135 K req/s (0.99 cores) | 5.3 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 25.64× (24.86–26.09) | 19.05× (18.32–19.32) |
+| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.91 cores) | 5.3 K req/s (1.00 cores) | 6.8 K req/s (1.00 cores) | 10.29× (10.11–10.67) | 8.03× (7.98–8.25) |
+| resources/read, 1 KiB of text, 64 sessions | 151 K req/s (0.96 cores) | 5.4 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.14× (25.58–28.81) | 20.47× (19.89–20.83) |
+
+How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 6s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
 
 
 ---
@@ -4792,7 +5035,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Cluster mode](man-cluster-mode.txt)
 - [Installation](man-installation.txt)
 - [State persistence](man-state-persistence.txt)
-- [Environment](man-environment.txt) (86 entries)
+- [Environment](man-environment.txt) (91 entries)
 - [Files](man-files.txt)
 - [C++ SDK](man-c-sdk.txt)
 - [Limitations](man-limitations.txt)
@@ -5162,6 +5405,8 @@ Print the daemon's own figures as *key***:***value* lines, the same format that 
 **fast_lo** is **off**, **own**, **all**, **trust**, or **unavailable**; when it is unavailable, **fast_lo_reason** says why. The other fields appear when the shortcut is attached. **fast_lo_sockets_shortcut** counts the entered sockets that send through the shortcut, and **fast_lo_sockets_tcp** counts those pinned to TCP for good. Both are as of the last once-a-second sweep; a pair is two sockets, and each direction belongs to its sender. **fast_lo_entered** counts the sockets entered since start.
 
 **fast_lo_tainted_bound**, **_unanswered**, **_budget** and **_peer_off** count taints by reason, in that order: the peer really held the per-pair bound; no answer came before twice the bound; the global budget was reached; the peer was not on the shortcut (it received over TCP before it could enter, or it had closed). **fast_lo_held_bytes** is the unread redirected backlog summed across pairs. The global budget (**fast_lo_budget_bytes**) is compared against it. For a pair below 64 KiB it is an upper bound. **fast_lo_over_budget** is 1 while new sends are being tainted because of the budget.
+
+**requests_overloaded_queue** and the other **requests_overloaded_** lines count the requests the daemon's own request channel answered **overloaded**, by the bound that refused them, as a runtime's **stats** does for its own (see **Between runtimes on one machine**).
 
 The metrics endpoint exports the same figures as **socketley_fast_lo_info{mode}**, **socketley_fast_lo_sockets{path}**, **socketley_fast_lo_entered_total**, **socketley_fast_lo_tainted_total{reason}**, **socketley_fast_lo_held_bytes**, **socketley_fast_lo_budget_bytes**, **socketley_fast_lo_pair_limit_bytes** and **socketley_fast_lo_over_budget**. The counting costs one atomic add per entered socket and per taint, never one per send.
 
@@ -5713,7 +5958,7 @@ Lists all runtimes, in every state. The output is Docker-style, with the columns
 
 For a running runtime, the STATUS column shows its uptime, followed by up to two notes when they apply. **(***N* **restarts)** means the daemon found the worker dead and forked a replacement that many times. The uptime is the replacement's. A runtime that holds state in memory, above all a cache, lost that state at every restart. The JSON form reports the same number in **restarts**.
 
-**NOT RESPONDING** means the worker process is alive but has said nothing for fifteen seconds while using at least half a core. A worker publishes on every completion, so one doing any work at all is heard from within a quarter second. Silence means the worker is either idle, which costs no CPU, or stuck inside a callback, which costs a core. Only the second case is reported, and it is only reported: nothing is killed. A script that deliberately computes for a long time looks the same from outside the process. A worker that is stuck without using CPU (blocked rather than spinning) looks like an idle one and is not reported.
+**NOT RESPONDING** means the worker process is alive but has answered nothing for fifteen seconds while using at least half a core. A worker publishes whenever what it has done changes, its own figures or the requests of other runtimes it has answered (**requests_answered** in **stats**), so one answering anything is heard from within a quarter second, whether the answer was computed on its loop or on a helper thread. Silence means the worker is either idle, which costs no CPU, or stuck inside a callback, which costs a core. Only the second case is reported, and it is only reported: nothing is killed. The daemon log says how long it has answered nothing, counted from its last answer. The report ends when the worker answers again, or when it has spent less than half a core for fifteen seconds more without answering, which is a worker idle or blocked; a dip of a second ends nothing. A script that deliberately computes for a long time looks the same from outside the process. A worker that is stuck without using CPU (blocked rather than spinning) looks like an idle one and is not reported.
 
 The JSON form has a **listen** field beside **port**. It is empty for an ordinary runtime, and **unix:***/path/to.sock* for a server started with **--listen**. The PORT column shows **-** for such a runtime, since it has no port.
 
@@ -5950,6 +6195,8 @@ Prints messages with both timestamp and prefix: [HH:MM:SS] [name] message. Both 
 
 Limits the number of concurrent connections. New connections beyond the limit are closed immediately. 0 means no limit (default). Alias: **--max-conn**.
 
+With **--shards**, the limit is the runtime's, not each shard's. A shard counts its siblings' connections as they published them on their last turn, so connections accepted on two shards in the same instant can pass the limit by a few.
+
 ### `--read-buffer size`
 
 The most data the runtime accumulates from one connection before it refuses more. Takes a size with K, M or G. Default 1M. This is the inbound counterpart of **--write-buffer**, and like it, every runtime has one.
@@ -6028,13 +6275,17 @@ On a proxy, one token is charged per read completion rather than per HTTP reques
 
 Limits total messages per second across all connections, using a shared token bucket. A server drops excess messages silently; a cache answers them with an error. 0 means no limit (default).
 
+With **--shards**, the rate is the runtime's: each shard refills its own bucket with its share, the rate divided by the shard count and at least one a second. The kernel spreads connections over the shards, so this holds for many clients; a single connection lives on one shard and gets that shard's share.
+
 A client refuses it for the same reason as **--rate-limit**: it caps the total across all inbound connections, and a client has one outbound connection.
 
 ### `--idle-timeout duration`
 
-Closes connections that have received no data for longer than *duration*. 0 disables it (default). A sweep timer checks for idle connections every 30 seconds. A bare number is seconds; a suffix of **s**, **m**, **h**, **d** or **w** means seconds, minutes, hours, days or weeks (**300** and **5m** both work).
+Closes connections that have received no data for longer than *duration*. 0 disables it (default). A sweep timer checks for idle connections every 30 seconds. On a server or proxy a connection that is still being sent an answer is not idle while the answer moves, however slowly the client reads; one whose client has taken nothing of it for *duration* is reset, whether it was to be kept alive or closed after the answer. With no timeout set, the same holds after 120 seconds, as for storage. A bare number is seconds; a suffix of **s**, **m**, **h**, **d** or **w** means seconds, minutes, hours, days or weeks (**300** and **5m** both work).
 
 This flag closes connections that are *quiet*, which is not the same as closing connections that are *dead*, and dead connections do not need it. Every accepted TCP connection gets TCP keepalive at 60/10/3: after a minute of silence, three probes ten seconds apart. So a peer that loses power, or vanishes behind a NAT that forgot it, is closed without any timeout being set. A websocket that sends nothing for an hour is quiet but alive, and keepalive leaves it alone; only **--idle-timeout** closes it. A unix listener does not get keepalive, because its peer cannot disappear silently.
+
+A connection a runtime ends after its answer (an HTTP **Connection: close**, a cache **QUIT**, an MQTT **DISCONNECT**) is closed only once its client has closed its own side, or has acknowledged all of that answer and sent nothing for a second. What the client sends meanwhile is read and dropped, since a close with bytes unread makes the kernel reset the connection and throw away what it has not yet delivered. A client that takes nothing for ten seconds, or goes on sending for thirty, is reset.
 
 ### `--congestion name`
 
@@ -6079,7 +6330,7 @@ On a **client**, TLS is dialled rather than terminated, and **--tls** alone is a
 
 A dialled connection, such as a client's target or a proxy's backend, is verified on two counts, and neither check can be turned off. First, the chain must be signed by something in the trust store. Second, the certificate must be valid for the host that was dialled. For a client, that is the name in **-t**, matched against the certificate's DNS SAN, or against its IP SAN for an address literal. The name checked is always the configured one, never one read from the certificate that arrived. The minimum version is TLS 1.2. There is deliberately no skip-verify option. A TLS client that does not verify protects against an eavesdropper but not against someone in the path, while it reports itself as encrypted either way.
 
-A listener speaks TLS 1.2 and 1.3. Over 1.2, it offers only ECDHE key exchange with AEAD ciphers (Mozilla's intermediate list). It resumes sessions from its own cache, not from tickets. A ticket key lives as long as the process, and anyone who learned it could open every session it ever sealed.
+A listener speaks TLS 1.2 and 1.3. Over 1.2, it offers only ECDHE key exchange with AEAD ciphers (Mozilla's intermediate list). A returning client resumes its session by a ticket on whichever shard it reaches: every shard seals tickets with the same key, a new one each hour, which still opens its tickets through the next hour and is then wiped. The key is never written to disk. A connection the runtime closes itself ends with a **close_notify** before its FIN, so the client reads an end rather than a truncation and keeps its session for the next connection. When the kernel encrypts (a large file over TLS 1.3), the runtime holds that FIN until the socket has passed on everything the kernel took, since a FIN sent earlier throws the rest away; a client that stops reading is given ten seconds.
 
 Trust stores are read when the runtime starts. A listener's certificate and key are checked again every two seconds. When they are replaced on disk, by **--acme**, certbot or a copy, new handshakes use them from then on, without a restart and without dropping a connection. This happens only once both files load and match. A pair that does not is not used: the log reports it once, and the old pair goes on serving. The whole certificate file is sent, so a CA's intermediates go with the leaf.
 
@@ -6140,7 +6391,7 @@ This flag is mutually exclusive with:
 - **-p**.
 - **--udp**. That would be a unix datagram socket, which is a different thing.
 - **--tls**. A unix socket is not on a network; the permissions on the node are what restrict it.
-- **--cluster** on a cache. Cluster members advertise ports computed by a formula, and RESP cannot write a filesystem path as a node address.
+- **--cluster** on a cache. Cluster members advertise ports computed by a formula, and RESP cannot write a filesystem path as a node address. Cluster mode, which a sharded cache on a port is in by default, is simply off on a path; only the flag typed is refused.
 
 Each combination is refused at start, with the reason in the daemon log, so neither flag silently wins.
 
@@ -6193,6 +6444,8 @@ A proxy keeps only its port, and so does a cache with **--shards**. A path is on
 Requests from one runtime to another include **socketley.send**, **self.route**, and a server's **--cache** *name***.** The daemon carries the first such request between two runtimes, up one control socket and down the other. It then introduces the two processes to each other with a new socket pair, and later requests go straight across.
 
 There is nothing to configure and nothing to see from outside. The pair has no path in the filesystem, so nobody can connect to it or squat on it; only the two processes that were handed the ends can use it. The daemon logs one line naming the pair when it introduces them. **socketley stats** *name* reports **peer_links**, **peer_direct** and **peer_relayed**, which tell a request that went through the daemon from one that went straight across.
+
+A request is answered **overloaded** only by a bound that was full, and each bound is counted in the asking runtime's **stats** (and the daemon's in **socketley daemon stats**): **requests_overloaded_queue** and **_queue_bytes** (the queue of requests not yet sent, 32768 of them), **_parked** (the requests awaiting an answer, 4096, of which background work such as a mail delivery may hold 3072), **_wakeup** (the event loop took no wakeup), **_way** (the socket the request goes out on was full) and **_answer_way** (the socket its answer goes back on was full). **requests_parked_most** is the most that were ever awaiting an answer at once. The first refusal at each bound is also one line in the daemon log, naming it.
 
 Measured with a server posting every cache command to a cache runtime, the two arms differing only in whether they were introduced, a round trip falls from 31.60 to 21.14 microseconds. The process tree spends 10.75 microseconds less CPU per command. This held in 12 of 12 interleaved passes (median of the per-pass differences). A third of the round trip was the daemon.
 
@@ -6345,7 +6598,7 @@ TLS, three concurrent     1,250 MB
 
 The memory is twice the file because the file is read into memory and the response is then assembled around it. The same doubling was recorded for a 400 MiB .html, where it came to 1219 MiB. The memory is held for the whole request, and the client decides how many such requests there are. Ten concurrent 256 MB requests would take about 5 GB.
 
-**--http-cache** limits the multiplication but not the size. It holds each file once and shares it, so concurrency stops mattering. The cost is that it holds the file permanently from startup. A 64 MB file was measured at 154 MB, which is the file plus the two prebuilt responses. Otherwise, keep the files a TLS listener serves small, or put a plaintext listener behind something else that terminates TLS.
+**--http-cache** limits the multiplication but not the size. A shard holds each file once and shares it among its requests, so concurrency stops mattering. The cost is that it holds the file permanently from startup. With **--shards**, each shard reads the directory and holds its own copy, so the files are held once per shard: a 64 MB file put 64 MB on each of four shards (81 MB each, against 17 MB without the cache), 256 MB in all. Otherwise, keep the files a TLS listener serves small, or put a plaintext listener behind something else that terminates TLS.
 
 The fix would be a read path that works in bounded pieces, as the request side does with **on_http_body**, instead of one allocation the size of whatever was requested. That change touches the most intricate function in this path and has not been made.
 
@@ -6370,7 +6623,7 @@ Outside those two cases, a file that is not kept is not read either: it goes fro
 
 ### `--http-cache`
 
-With --http, read all files into memory at startup instead of checking the filesystem on each request. This is faster for production; the difference from plain **--http** is one **statx**(2) per request. The cache is rebuilt on **reload-lua** and at no other time. A file edited on disk is therefore **not** picked up. That is both the reason to use this flag and the reason not to.
+With --http, read all files into memory at startup instead of checking the filesystem on each request. This is faster for production; the difference from plain **--http** is one **statx**(2) per request. The cache is built when the runtime starts and at no other time, not on **reload-lua**. A file edited on disk is therefore **not** picked up until a restart. That is both the reason to use this flag and the reason not to. Each shard builds and holds its own copy, so the memory is the directory's size times **--shards**.
 
 ### `--no-inject`
 
@@ -6769,7 +7022,7 @@ The shard count can be changed with **edit** only while the runtime is stopped, 
 
 #### `--health-check [tcp|http]`
 
-Enables active health checks of the backends. In **tcp** mode, the proxy opens a TCP connection to each backend at the configured interval, and the check succeeds if the port is listening. In **http** mode, the proxy sends an HTTP GET to **--health-path** and treats a 2xx response as healthy. The proxy removes an unhealthy backend from the load balancer pool until it recovers.
+Enables active health checks of the backends. In **tcp** mode, the proxy opens a TCP connection to each backend at the configured interval, and the check succeeds if the port is listening. In **http** mode, the proxy sends an HTTP GET to **--health-path** and treats a 2xx response as healthy. The proxy removes an unhealthy backend from the load balancer pool until it recovers. Under **--shards**, each backend is probed by one shard and every shard uses its verdict, so a backend sees one probe per interval at any shard count; a shard that has gone has its share probed by the others until it is back.
 
 #### `--health-interval duration`
 
@@ -6787,7 +7040,7 @@ The number of consecutive failed health checks after which a backend is marked u
 
 #### `--circuit-threshold n`
 
-The number of consecutive backend errors that trips the circuit breaker to the **open** state. A refused connection, a timeout and a 5xx response each count as an error. While the circuit is open, every request to that backend fails at once, without a connection attempt. Default: 5.
+The number of consecutive backend errors that trips the circuit breaker to the **open** state. A refused connection, a timeout and a 5xx response each count as an error. While the circuit is open, every request to that backend fails at once, without a connection attempt. Under **--shards**, the errors are counted for the whole runtime and a circuit one shard opens is open on every shard; each shard sends its own half-open probe. This holds for a node of a sharded backend, a member of a group and a runtime an entrance routes a name to as well; past 512 endpoints failing at once, a further one is counted by each shard on its own. Default: 5.
 
 #### `--circuit-timeout duration`
 
@@ -6921,7 +7174,7 @@ From the manual page socketley(1).
 
 ### `--listen unix:/path/to.sock`
 
-Serves the cache on an AF_UNIX socket instead of the **-p** port. **redis-cli -s** connects to it, and both the plaintext and RESP protocols are detected as on a port. The full description is under **--listen** in **COMMON FLAGS**. It is refused with **--cluster**, because cluster members advertise ports computed from a formula, and RESP has no way to write a filesystem path as a node address.
+Serves the cache on an AF_UNIX socket instead of the **-p** port. **redis-cli -s** connects to it, and both the plaintext and RESP protocols are detected as on a port. The full description is under **--listen** in **COMMON FLAGS**. It is refused with **--cluster**, because cluster members advertise ports computed from a formula, and RESP has no way to write a filesystem path as a node address. For the same reason a sharded cache on a path is not in cluster mode, which it would be by default on a port.
 
 **It is worth measuring before it is worth arguing about.** On one test machine, one cache and one redis-server were loaded with the same keys and driven with GET by eight client processes:
 
@@ -6949,9 +7202,9 @@ Shard *i* gets *name*#i.sock*:* the shard number is inserted before the suffix, 
 
 **Behind one address the shards buy far less than the cores they take.** Two shards take 1.91 cores and return 1.05x; four take 3.95 cores and return 1.75x. With two shards, half the keys belong to a sibling; with four, three quarters do. Serving those keys roughly doubles the cost per operation: 4.16 us with one shard, against 7.60 with two and 9.38 with four. With a client that picks the owning shard, the same four shards return 2.80x at 5.43 us, which recovers most of what the crossings were costing.
 
-**How well the crossings batch decides this cost, and the client decides how well they batch.** The mesh queues each crossing and flushes once per loop turn, so requests that arrive together cross together. At the same 192 connections, twelve client processes of sixteen connections give the two-shard arm 0.90x, while eight processes of twenty-four give it 1.05x. In the same two shapes the one-shard arm reads 235,421 and 240,671, unchanged. Measured on a floor of two processes and two rings, one crossing at a time costs 8.13 us, while thirty-two in a batch cost 282 ns each. So a figure for this flag is a figure for one arrival pattern. The figure above is the more favourable of the two shapes tried.
+**How well the crossings batch decides this cost, and the client decides how well they batch.** The mesh queues each crossing and flushes once per loop turn, so requests that arrive together cross together. Every connection a shard reads in one loop turn shares one crossing to each sibling, which goes on its own sooner once it carries 512 commands or 256 KiB. At the same 192 connections, twelve client processes of sixteen connections give the two-shard arm 0.90x, while eight processes of twenty-four give it 1.05x. In the same two shapes the one-shard arm reads 235,421 and 240,671, unchanged. Measured on a floor of two processes and two rings, one crossing at a time costs 8.13 us, while thirty-two in a batch cost 282 ns each. So a figure for this flag is a figure for one arrival pattern. The figure above is the more favourable of the two shapes tried.
 
-**The ceiling above that is the machine, not this flag.** Four shards routed by key reach 2.80x. Four independent **redis-server** processes on the same four cores, driven the same way, reach 2.88x. socketley is ahead of them in absolute throughput at every count tried: 1.12x at one and 1.09x at four. Neither scales linearly on loopback here. So a cache that must scale needs **--cluster** and a client that routes. The 3.57x quoted for a server under **SERVER FLAGS** does not carry over to a cache.
+**The ceiling above that is the machine, not this flag.** Four shards routed by key reach 2.80x. Four independent **redis-server** processes on the same four cores, driven the same way, reach 2.88x. socketley is ahead of them in absolute throughput at every count tried: 1.12x at one and 1.09x at four. Neither scales linearly on loopback here. So a cache that must scale needs cluster mode, which is its default, and a client that routes. The 3.57x quoted for a server under **SERVER FLAGS** does not carry over to a cache.
 
 Against the same cache on TCP with **--cluster**, with both clients routing by key and four shards, AF_UNIX measured at least **1.22x** faster. Two later passes read higher but are not quoted. In them the TCP arm dropped for a reason that was not the port pool (TIME-WAIT peaked at 1,235 of 28,231), and that reason is not understood.
 
@@ -6965,7 +7218,7 @@ The file is written with mode **0600**. The dump holds whatever was cached. Beca
 
 The file mode is all this flag can control. Replacing a file needs write permission on the *directory*, not on the file. So put *file* in a directory that only this daemon's user can write to, not in a world-writable directory shared with other accounts.
 
-**With --shards each shard writes its own slice, and the set survives a changed shard count.** With one shard, the cache writes *file* itself; with more than one, the shards write *file*.shard0*,* *file*.shard1 and so on. Each file records the shard count it was written under and a fingerprint of the function that decides which shard owns a key. So a cache dumped at four shards and started at eight is redistributed rather than loaded into the wrong slices. Every key survives; this was measured across 1->4, 4->1, 4->8, 8->4 and 4->4.
+**With --shards each shard writes its own slice, and the set survives a changed shard count.** With one shard, the cache writes *file* itself; with more than one, the shards write *file*.shard0*,* *file*.shard1 and so on. Each file records the shard count it was written under and a fingerprint of the function that decides which shard owns a key. So a cache dumped at four shards and started at eight is redistributed rather than loaded into the wrong slices. Every key survives; this was measured across 1->4, 4->1, 4->8, 8->4 and 4->4. Each shard reads every file of the old set and keeps the keys it now owns as it reads them, so a shard holds its own slice and never a whole old dump.
 
 If the set of files cannot be trusted, the start is refused rather than serving part of the data. The error names a missing slice. Files that disagree about the shard count, such as the dumps of two runs in one place, are refused together. The dump that replaces them removes slices left by a run with more shards.
 
@@ -6973,7 +7226,7 @@ If the set of files cannot be trusted, the start is refused rather than serving 
 
 Journals every accepted write next to the dump, and flushes the journal at this interval. An acknowledged write reaches the kernel at most *duration* after it was accepted. So a killed or OOM-killed worker loses at most the last interval of writes, instead of everything since the last stop or FLUSH. Requires **--persistent**; refused without it. Durations are read as everywhere else (**30s**, **5m**, **1h**), and a bare number is seconds.
 
-The journal is *file***.journal** (per shard, *file***.shardN.journal***),* written with mode **0600**. A clean stop and the admin **FLUSH** command write the dump and cut the journal behind it. An unclean stop leaves a tail, which the next start replays on top of the dump before serving. If the crash tore the tail in the middle of a record, the tail is dropped back to the last complete record, and the daemon log gives the number of dropped bytes. TTLs are journaled as absolute deadlines. So a key that had five seconds left when it was written has whatever remains of those five seconds after a replay, possibly nothing.
+The journal is *file***.journal** (per shard, *file***.shardN.journal***),* written with mode **0600**. A clean stop and the admin **FLUSH** command write the dump and cut the journal behind it. A running shard also snapshots on its own once its journal holds 64 MiB, or as much as its last dump if that is more (**SOCKETLEY_CACHE_SNAPSHOT_MB**), so the journal stays bounded under a write load that never stops. The dump is written by a forked child from memory as it was when the snapshot began, so the shard keeps serving. While it runs, the journal up to that moment is set aside as *file***.journal.***N* and new writes go to a fresh *file***.journal***;* the child removes what was set aside once the dump is in place. A snapshot that fails or is cut short leaves the set-aside file, and the next start replays it before the journal. **stats** gives **journal_bytes**, **journal_snapshots** and **journal_snapshot_failures** per shard. An unclean stop leaves a tail, which the next start replays on top of the dump before serving. If the crash tore the tail in the middle of a record, the tail is dropped back to the last complete record, and the daemon log gives the number of dropped bytes. TTLs are journaled as absolute deadlines. So a key that had five seconds left when it was written has whatever remains of those five seconds after a replay, possibly nothing.
 
 The flush is a write into the kernel's page cache, and deliberately not an fsync. The guarantee covers a dead process, not a dead machine: a power cut can also lose what the kernel had not yet written back.
 
@@ -6988,6 +7241,8 @@ Sets the access control mode. **readonly** allows GET and SIZE only; **readwrite
 ### `--maxmemory size`
 
 The most memory the cache may use for its data. Takes a size with K, M or G (for example 100M or 1G). When the limit is exceeded, the eviction policy decides what happens. 0 means no limit, which is the default.
+
+With **--shards**, the limit is the cache's: a key lives on one shard, so each shard holds its share, the limit divided by the shard count, and **maxmemory** answers the sum.
 
 The only suffixes are **K**, **M** and **G**. A value the parser cannot read in full is refused, not partly read. So **100MB** is an error rather than a hundred bytes. A value so large that the multiplication would wrap is also an error, rather than 0, which means "unlimited".
 
@@ -7009,11 +7264,11 @@ Replication is *not* encrypted, in either direction, so it cannot be combined wi
 
 **A sharded cache cannot be a replication leader, and says so.** A follower arrives as one connection, and **SO_REUSEPORT** gives it to one shard. That shard would have to be the only writer to the follower's socket, and the other shards have no socket to the follower at all. Promoting the cache anyway would send the follower only one shard's writes and report success. So **replicate** is refused on a cache with more than one shard, and the error names the reason. Fanning the stream out would first need a per-shard sequence and an end-of-dump marker in the follower protocol, and it has neither.
 
-A sharded cache may be a *follower*. Every shard connects to the leader and keeps the part of the stream that its slice owns. So the cache holds the leader's keys once rather than once per shard, at the cost of every shard reading the whole stream.
+A sharded cache may be a *follower*. Every shard connects to the leader and names its slice (**replicate** *shard shards*), and the leader sends it only the writes and the dump of the keys that slice owns, with every keyless record to each. So the cache holds the leader's keys once rather than once per shard, and the leader sends the stream once, not once per shard. A leader from before this sends every shard the whole stream, and each shard keeps its own part of it.
 
 ### `--tls` / `--cert file` / `--key file` / `--ca file`
 
-Terminates TLS on this cache's listening port, exactly as a server runtime does on its own port. **--tls** requires **--cert** *file* and **--key** *file***;** **--ca** *file* also demands a certificate from every connecting client (mutual TLS). RESP and the line protocol both run on the decrypted stream, so an existing Redis client needs no change beyond speaking TLS. The full description is under **COMMON FLAGS**.
+Terminates TLS on this cache's listening port, exactly as a server runtime does on its own port. **--tls** requires **--cert** *file* and **--key** *file***;** **--ca** *file* also demands a certificate from every connecting client (mutual TLS). RESP and the line protocol both run on the decrypted stream, so an existing Redis client needs no change beyond speaking TLS. A TLS 1.3 connection that is owed 2 MiB or more at once hands its send key to the kernel's TLS layer, which encrypts that answer and every one after it straight from the cache's buffers (see **SOCKETLEY_KERNEL_TLS**). The full description is under **COMMON FLAGS**.
 
 Default port: 9000
 
@@ -7021,7 +7276,9 @@ Default port: 9000
 
 Runs the cache as *N* worker processes that share one keyspace. The shard that owns a key is chosen by CRC16 of the key modulo 16384. That is Redis's own hash slot function, hash tags included. Each shard owns a contiguous range of those slots.
 
-The *N* shards share one port through **SO_REUSEPORT**. When a client connects, the kernel gives the connection to whichever shard its four-tuple hashes to. A key that another shard owns is fetched from that shard over the mesh. To any client, the cache is one store.
+The *N* shards share one port through **SO_REUSEPORT**. When a client connects, the kernel gives the connection to whichever shard its four-tuple hashes to. A key that another shard owns is fetched from that shard over the mesh. To any client, the cache is one store. In cluster mode, which is the default at two or more shards on a port, each shard also binds a port of its own and a cluster-aware client goes straight to the owner; see **--cluster**.
+
+**A connection whose keys keep to one shard is handed to that shard.** By default, at two or more shards, a connection on the shared port whose last 32 single-key commands named one other shard 28 times is passed to that shard between two commands, with what it had sent and not yet had answered, and from then on its keys are served where they live, with no crossing. The client sees nothing: no redirect, no reconnect, and the same order of replies. Measured at eight shards, a client whose connections each keep to one tag gets 2.23x the throughput it gets with this off, the same as a cluster-aware client on the per-shard ports; random keys cost the same with it on as off, because such a connection never settles on one shard. TLS connections, unix-socket clients and the per-shard ports are never handed; see **SOCKETLEY_CACHE_HANDOFF** for what else keeps a connection where it is and for the switch that turns it off.
 
 That crossing costs CPU, and with *N* shards a random key belongs to another shard (*N*-1)/*N* of the time. Measured on this build with 8 client processes × 50 connections, three interleaved passes per arm, medians, in requests per second per *server* core:
 
@@ -7040,27 +7297,35 @@ For a callback that runs in all *N* processes, such as **on_start** or a timer, 
 
 **self.publish** is the one exception that is not refused. The message goes to every shard over the same mesh that the wire's **PUBLISH** uses, because a subscriber is not a key and no shard owns it. Only the returned *count* is this shard's alone: the other shards report back on a later turn, and this call returns on the turn it was made.
 
+Every shard, like the one worker of an unsharded cache, is started with its own **GLIBC_TUNABLES** of **glibc.malloc.hugetlb=1**, appended to any the operator set (a value the operator gave that tunable is kept, and **SOCKETLEY_HUGEPAGE=0** adds nothing).
+
 ### `--public`
 
 Lets the cache serve peers on other machines. A cache has no password and answers every client with everything it holds. So by default it serves only this machine: a TCP peer whose address is not loopback is answered **-DENIED** and closed before any of its bytes are read. This is Redis's protected mode, for the same reason Redis has it. **--public** lifts this restriction, and so does mutual TLS (**--tls** **--ca**), where the client certificate is the credential. For the same reason, a follower on another host needs its leader to be public. Set the flag at **create**; a running cache takes it through **import**.
 
-### `--cluster`
+### `--cluster` / `--no-cluster`
 
-Publishes a routable slot map, so a cluster-aware client sends each key straight to the shard that owns it and no crossing happens at all. Off by default.
+Cluster mode: each shard binds a port of its own and the cache publishes a routable slot map, so a cluster-aware client sends each key straight to the shard that owns it and no crossing happens at all. **On by default for a cache with two or more shards and a TCP port.** **--no-cluster** turns it off. **--cluster** is the default said aloud, still accepted so that configurations and scripts written when the mode was opt-in keep working, and it is what turns the mode on for a single shard (below). With **--listen** the mode is off, because a unix path has no per-shard address the map could name; a typed **--cluster** with **--listen** is refused. Set either flag at **create**; a stopped cache takes a change through **import** (the **cluster** and **no_cluster** fields), and a running one refuses it, because clients already hold its map.
 
-**Read this before you type it: a cache with --cluster cannot sit behind a proxy used for access control.** With client-side routing, the client connects to every shard *directly*. The cache tells the client where the shards are, using the address that the *asking* connection arrived on. Behind a proxy, the asking connection is the proxy's, so the map names the address at which the *proxy* reaches the cache. Either the client can reach that address too, and the proxy's rules are bypassed by a map the cache handed out. Or it cannot, and the client spends its retry budget on refused connections. Neither outcome produces a log line.
+**Ordinary clients lose nothing.** The shared port answers exactly as it does under **--no-cluster**: every key, from any shard, relayed over the mesh when another shard owns it, and never a redirect. Only a client that connects to a per-shard port, or reads the map, sees cluster mode. A cluster-aware client — **redis-cli -c**, ioredis **Redis.Cluster**, node-redis **createCluster**, redis-py **RedisCluster**, go-redis **NewClusterClient** — reads the map, routes each key by itself and skips the relay. Measured at eight shards, such a client cost 0.24 us of cache CPU per operation against 0.67 us through the shared port.
 
-This is not a limitation of this implementation. It is what client-side routing is, and Redis Cluster has exactly the same property. No setting makes a routing client and a proxy enforcement point work together; you have to choose one of the two. Without **--cluster** the cache is reached only through its one port, and a proxy in front of it depends on that.
+**Each shard counts what its shared port relays.** In **stats**, each shard of a sharded cache gives **shared_port_commands**, the commands clients sent it on the shared port, and **relayed_commands**, those of them that named a key another shard owns and were relayed there. A command with keys on several shards counts once. Random keys over *N* shards relay (*N*-1)/*N* of them. A per-shard port is not counted. When at least half of what reached shard 0 on the shared port was relayed, in two windows of two seconds in a row with at least 2,000 commands each, shard 0 logs one warning that names the share, the per-shard ports and **SOCKETLEY_CACHE_HANDOFF**. It says so once per start. Under **--no-cluster** the warning at start says it instead.
 
-**Each shard binds its own port.** At two or more shards, shard *i* binds *port*+*1*+*i*, in addition to the shared port. The shared port keeps working exactly as it does without the flag. A client that connects to a per-shard port has chosen that shard on purpose. A key that shard does not own is answered with **-MOVED** *slot host:port* rather than fetched. That lets **redis-cli -c**, **redis-benchmark --cluster**, redis-py, go-redis, lettuce and node-redis route for themselves.
+**It needs N more free and reachable TCP ports.** A cache on port *P* with *N* shards also binds *P*+1*..*P*+*N*,* and the map names them by the address the asking client connected to. In a container that publishes only *P*, behind NAT that forwards only *P*, or behind a firewall that opens only *P*, a cluster-aware client is handed ports it cannot reach and spends its retries on them; ordinary clients on *P* are unaffected. Publish or open *P*+1*..*P*+*N as well, or give **--no-cluster**.
 
-**A cache with --cluster and two or more shards therefore needs port+1 .. port+N free, and refuses to start otherwise.** Whichever shard answers **CLUSTER SLOTS** computes the addresses it sends from a formula. That shard has no way to learn whether its siblings bound their ports. A shard that ran without its port would be advertised anyway, and every client would spend its retries on refused connections. So the start fails instead, and the error names the port and this flag. Without **--cluster**, only the shared port is bound, and two four-shard caches one port apart work as they always did.
+**Read this before you rely on a proxy: a cache in cluster mode cannot sit behind a proxy used for access control.** With client-side routing, the client connects to every shard *directly*. The cache tells the client where the shards are, using the address that the *asking* connection arrived on. Behind a proxy, the asking connection is the proxy's, so the map names the address at which the *proxy* reaches the cache. Either the client can reach that address too, and the proxy's rules are bypassed by a map the cache handed out. Or it cannot, and the client spends its retry budget on refused connections. Neither outcome produces a log line.
 
-**--cluster is legal at any shard count.** At **--shards 1** it publishes a cluster of one node on the base port and binds no extra port. So a client can be written once and deployed at any *N*.
+This is not a limitation of this implementation. It is what client-side routing is, and Redis Cluster has exactly the same property. No setting makes a routing client and a proxy enforcement point work together; you have to choose one of the two. With **--no-cluster** the cache is reached only through its one port, and a proxy in front of it depends on that.
 
-**CLUSTER SLOTS, SHARDS, NODES, INFO, MYID, KEYSLOT and COUNTKEYSINSLOT** are answered on every port and at every shard count, with or without this flag, because a client that asks deserves a straight answer. **CLUSTER INFO** reports **cluster_enabled:1** only when **--cluster** was given; without it the reply is **cluster_enabled:0**, and **CLUSTER SLOTS** publishes a single node that holds every slot on the shared port. That answer is both true and safe. There is no cluster bus, no failover, no slot migration and no **ASK**. The map is a formula, and each slot has one owner for the life of the run.
+**Each shard binds its own port.** At two or more shards, shard *i* binds *port*+*1*+*i*, in addition to the shared port. The shared port keeps working exactly as it does under **--no-cluster**. A client that connects to a per-shard port has chosen that shard on purpose. A key that shard does not own is answered with **-MOVED** *slot host:port* rather than fetched. That lets **redis-cli -c**, **redis-benchmark --cluster**, redis-py, go-redis, lettuce and node-redis route for themselves.
 
-**On a per-shard port, a command that asks about the keyspace answers for that shard.** **DBSIZE**, **KEYS**, **SCAN**, **FLUSH** and **LOAD** report on or act on the slice that shard holds. That is what a cluster client means when it asks a node, and **redis-cli --cluster call** adds up the results itself. On the shared port these commands still fan out across every shard and merge the results, as they always have. **PUBLISH** fans out on both kinds of port, because a subscriber on another shard is still a subscriber.
+**A cache in cluster mode with two or more shards therefore needs port+1 .. port+N free, and refuses to start otherwise.** Whichever shard answers **CLUSTER SLOTS** computes the addresses it sends from a formula. That shard has no way to learn whether its siblings bound their ports. A shard that ran without its port would be advertised anyway, and every client would spend its retries on refused connections. So the start fails instead, and the error names the port and **--no-cluster**. With **--no-cluster**, only the shared port is bound, and two four-shard caches one port apart work. The daemon counts these ports among the cache's addresses, so another runtime asked to listen on one is refused at its start, naming the cache.
+
+**--cluster is legal at any shard count.** At **--shards 1** it publishes a cluster of one node on the base port and binds no extra port. So a client can be written once and deployed at any *N*. Without it a single-shard cache is standalone, because there is nothing to route.
+
+**CLUSTER SLOTS, SHARDS, NODES, INFO, MYID, KEYSLOT and COUNTKEYSINSLOT** are answered on every port and at every shard count, with or without this flag, because a client that asks deserves a straight answer. **CLUSTER INFO** reports **cluster_enabled:1** in cluster mode. Under **--no-cluster**, on a unix path, and at one shard without **--cluster**, the reply is **cluster_enabled:0**, and **CLUSTER SLOTS** publishes a single node that holds every slot on the shared port. That answer is both true and safe. In cluster mode, **CLUSTER NODES** asked on the shared port lists that port as a node of its own that holds no slots and is marked **myself**, beside one node per shard on its own port. A client that takes the node marked **myself** to be the address it dialled, as **redis-benchmark** and lettuce do, then sends every key straight to its shard. There is no cluster bus, no failover, no slot migration and no **ASK**. The map is a formula, and each slot has one owner for the life of the run.
+
+**On a per-shard port, a command that asks about the keyspace answers for that shard.** **DBSIZE**, **KEYS**, **SCAN**, **FLUSH** and **LOAD** report on or act on the slice that shard holds. That is what a cluster client means when it asks a node, and **redis-cli --cluster call** adds up the results itself. On the shared port these commands still fan out across every shard and merge the results, as they always have, except **DBSIZE**, which adds up the key count each shard publishes and crosses to none. A shard publishes its count before any reply it sends, so a **DBSIZE** already counts a write whose reply the client has. **PUBLISH** fans out on both kinds of port, because a subscriber on another shard is still a subscriber.
 
 A multi-key command on a per-shard port whose keys are all owned by one other shard is answered with **-MOVED**. One whose keys span several shards is answered with **-CROSSSLOT**. That is not pedantry: a redirect would send the client to a shard that would redirect it back.
 
@@ -7101,7 +7366,7 @@ A GET copies the stored value once, into the reply buffer, and the kernel copies
   4 shards, --cluster, routed   19,920    19,960    158 us
 ```
 
-A sharded cache without **--cluster** relays a command that arrived on the wrong shard instead of answering -MOVED. That is what lets an ordinary client work against it at all. But relaying a 256 KiB value passes it through a second process, so GET drops to 0.57 of the single shard. With **--cluster** and a client that routes, four shards give 1.38x on GET and 1.34x on SET. Small messages see 3.2–3.6x at eight shards. Either way, the sharded arm uses about 2.4 times the CPU per operation.
+On its shared port a sharded cache relays a command that arrived on the wrong shard instead of answering -MOVED. That is what lets an ordinary client work against it at all. But relaying a 256 KiB value passes it through a second process, so GET drops to 0.57 of the single shard. With a client that routes to the per-shard ports, four shards give 1.38x on GET and 1.34x on SET. Small messages see 3.2–3.6x at eight shards. Either way, the sharded arm uses about 2.4 times the CPU per operation.
 
 So what an operator can change is the value size itself. In one run with sixteen clients, the CPU cost per operation was 4.4 us at 64 bytes, 4.8 us at 4 KiB, 11.4 us at 64 KiB and 40.8 us at 256 KiB. No setting closes that gap.
 
@@ -7504,7 +7769,7 @@ Removes entries from the oldest end and returns how many it removed.
 
 #### `xread [count n] [block ms] streams key [key ...] id [id ...]`
 
-Returns the entries past each given id, one per line as "key id field value ...". **$** means the last id at the time of the read. When there is nothing yet, **block** waits for the next **xadd** to any of the keys; 0 waits forever. A blocking read inside **multi** answers "nil" at once, and a script may not wait at all. On a sharded cache every key must belong to one shard. A blocking read is served only by the shard that owns its streams, through that shard's **--cluster** port.
+Returns the entries past each given id, one per line as "key id field value ...". **$** means the last id at the time of the read. When there is nothing yet, **block** waits for the next **xadd** to any of the keys; 0 waits forever. A blocking read inside **multi** answers "nil" at once, and a script may not wait at all. On a sharded cache every key must belong to one shard. A blocking read is served only by the shard that owns its streams, through that shard's own cluster port.
 
 #### `xgroup create key group id|$ [mkstream] [entriesread n]` / `xgroup setid|destroy|createconsumer|delconsumer key group ...`
 
@@ -7597,7 +7862,7 @@ Performs the protocol handshake. Only RESP2 is supported. **hello** with no argu
 
 #### `info`
 
-Returns the fields a monitor reads. They are the version, connected clients, memory, commands processed, role, whether clustering is on, and the key count. On a sharded cache the key count is *this shard's* slice, for the same reason that **dbsize** answers that way on a per-shard port.
+Returns the fields a monitor reads. They are the version, connected clients, memory, commands processed, role, whether clustering is on, and the key count. On the shared port of a sharded cache the clients, memory and key count are the whole cache's, added up from what each shard publishes, and maxmemory is the value it was given. On a per-shard port they are *that shard's* slice and share, for the same reason that **dbsize** answers that way there.
 
 The replication section differs by role, because half of its fields have no meaning on the other side. **role** answers **master** or **slave**. A follower adds **master_host**, **master_port**, **master_link_status** and **master_sync_in_progress**. A leader adds **connected_slaves**: the number of followers whose connection is live, not the number that ever attached.
 
@@ -9398,7 +9663,7 @@ Each write is synced before it is answered; this is the default. A put is answer
 
 #### `interval`
 
-The per-write syncs are skipped, and a thread syncs the filesystem periodically. The thread calls **syncfs** every **--fsync-interval** (default 1 second). A crash of the machine loses at most the writes of the last interval. The same box handles about 18,000 puts a second, or about 9,600 into a versioned bucket.
+The per-write syncs are skipped, and a thread syncs the filesystem periodically. The thread calls **syncfs** every **--fsync-interval** (default 1 second). Under **--shards** the thread runs in shard 0 alone, since one call covers the files of every shard. A crash of the machine loses at most the writes of the last interval. The same box handles about 18,000 puts a second, or about 9,600 into a versioned bucket.
 
 #### `never`
 
@@ -9406,7 +9671,7 @@ The syncs are skipped; only the kernel's own writeback and a stop put the writes
 
 Under **interval** and **never**, what a crash of the machine leaves behind depends on the filesystem. ext4 in its default data=ordered mode leaves an object either as it was or as it was written, never partly written. A start that finds a file whose header does not check out leaves the file unserved. On other filesystems, a file written in the last interval may hold zeros where its data was not yet written. Bucket creation and removal and the configuration documents are synced in every mode. Backups, and anything else that deletes its own copy once a put is answered, should use **always**.
 
-The cost of **always** depends on the disk. A drive with power-loss protection (most enterprise NVMe and SATA SSDs) answers a sync from its protected cache in microseconds, so the mode costs little there. A consumer or virtual disk answers a sync only once the data is on the medium. XFS writes less per sync than ext4. ext4's **fast_commit** feature (**tune2fs -O fast_commit**) shortens a sync after a small change. Concurrent puts already share the filesystem's journal commits, so **always** gains throughput with concurrency. Three alternatives were measured against it: one sync of the whole filesystem shared by every waiting put, files written ahead of time and overwritten, and **O_DSYNC** writes. None did better under a sustained load of small puts. **stats** counts the syncs that ran in **fsyncs**, those a mode skipped in **fsyncs_skipped**, and the filesystem syncs of **interval** in **syncfs_rounds** and **syncfs_failed**; a stop after a failed round is not a clean one.
+The cost of **always** depends on the disk. A drive with power-loss protection (most enterprise NVMe and SATA SSDs) answers a sync from its protected cache in microseconds, so the mode costs little there. A consumer or virtual disk answers a sync only once the data is on the medium. XFS writes less per sync than ext4. ext4's **fast_commit** feature (**tune2fs -O fast_commit**) shortens a sync after a small change. Concurrent puts already share the filesystem's journal commits, so **always** gains throughput with concurrency. Three alternatives were measured against it: one sync of the whole filesystem shared by every waiting put, files written ahead of time and overwritten, and **O_DSYNC** writes. None did better under a sustained load of small puts. **stats** counts the syncs that ran in **fsyncs**, those a mode skipped in **fsyncs_skipped**, and the filesystem syncs of **interval** in **syncfs_rounds** and **syncfs_failed** (counted by shard 0); a stop after a failed round is not a clean one.
 
 ## Sharding
 
@@ -9532,7 +9797,7 @@ dig @127.0.0.1 example.com SOA
 
 When a zone is given by its name, the runtime writes it with this machine's public address for its name servers. **--publish** gives that address. It may be left out only where a network interface has a public address, and behind NAT none has one. **create** also makes an entrance: a proxy of the runtime's own (see **--proxy**). As soon as the entrance starts, it asks Let's Encrypt for a certificate for each zone and its wildcard. It does so for every name except those reserved for examples and tests, such as **example.com**, **.test** and **.internal**, because no public CA issues certificates for them. For a lab or a test that uses real names, give **--proxy none**. The runtime also answers one client network at most 100 times a second (**--rrl**). A load test from a single host therefore sees most answers dropped unless it gives **--rrl 0**.
 
-The runtime asks no other server and caches nothing. A name that is in none of its zones is answered REFUSED and is never looked up. So the runtime cannot be used as an open resolver, and every answer it gives is its own. Like every other runtime, it runs in a worker process of its own. It may run as **--shards** processes that share the port. It binds IPv4, and also IPv6 when the host has it and no **--bind** address is given. The default port is 53. A port below 1024 needs root or **CAP_NET_BIND_SERVICE**, which the packaged service grants. **-p**, **--bind**, **--cpus**, **--max-connections** (TCP connections; default 256) and the common flags apply as documented under **COMMON FLAGS**. **--listen** and **--tls** are refused.
+The runtime asks no other server and caches nothing. A name that is in none of its zones is answered REFUSED and is never looked up. So the runtime cannot be used as an open resolver, and every answer it gives is its own. Like every other runtime, it runs in a worker process of its own. It may run as **--shards** processes that share the port. Each UDP query goes to a shard drawn at random, so a resolver that asks from one port, or with one ID, is still spread over every shard. It binds IPv4, and also IPv6 when the host has it and no **--bind** address is given. The default port is 53. A port below 1024 needs root or **CAP_NET_BIND_SERVICE**, which the packaged service grants. **-p**, **--bind**, **--cpus**, **--max-connections** (TCP connections; default 256) and the common flags apply as documented under **COMMON FLAGS**. **--listen** and **--tls** are refused.
 
 ### `--zone name|file`
 
@@ -9578,11 +9843,11 @@ The port that the entrance made by **create** listens on. Default: 443.
 
 ### `--rrl n`
 
-Response rate limiting: the most answers a second the runtime gives one client network. A client network is an IPv4 /24 or an IPv6 /56. Past the limit, every second answer is replaced by a truncated one (TC set, no records, as large as the query), and the others are dropped. A resolver in that network then retries over TCP, which is not limited, and is served. A victim whose address a flood forges receives nothing larger than what was sent. Default: 100. 0 means no limit. The limit is for the whole runtime: with **--shards**, each shard allows its share of *n*, since the kernel spreads one network's queries over the shards by their source port.
+Response rate limiting: the most answers a second the runtime gives one client network. A client network is an IPv4 /24 or an IPv6 /56. Past the limit, every second answer is replaced by a truncated one (TC set, no records, as large as the query), and the others are dropped. A resolver in that network then retries over TCP, which is not limited, and is served. A victim whose address a flood forges receives nothing larger than what was sent. Default: 100. 0 means no limit. The limit is for the whole runtime: with **--shards**, each shard allows its share of *n*, since each of one network's queries goes to a shard drawn at random.
 
 ### `--dnssec`
 
-Signs every zone as it is loaded (RFC 4033 to 4035). Each zone gets one key of ECDSA P-256 with SHA-256 (algorithm 13). The key is made at the first start and kept in *state-dir*/dns/*name*.dnssec/ for every shard. The runtime adds the key's DNSKEY at the apex, an NSEC chain through the names, and an RRSIG over every record set the zone holds. The signatures last three weeks and are made again a week before they end. A query with the DO bit is answered with the signatures. A name or type that does not exist is answered with the NSEC records that prove it. A zone transfer carries them too. Give the parent zone the DS record that **socketley dnssec** prints.
+Signs every zone as it is loaded (RFC 4033 to 4035). Each zone gets one key of ECDSA P-256 with SHA-256 (algorithm 13). The key is made at the first start and kept in *state-dir*/dns/*name*.dnssec/ for every shard. The runtime adds the key's DNSKEY at the apex, an NSEC chain through the names, and an RRSIG over every record set the zone holds. A signature's nonce is derived from the key and what it signs (RFC 6979), so every shard serves one set with the same signature, and a reload signs again only the sets whose bytes changed (the SOA at least, whose serial moves). The signatures last three weeks and are made again a week before they end. A query with the DO bit is answered with the signatures. A name or type that does not exist is answered with the NSEC records that prove it. A zone transfer carries them too. Give the parent zone the DS record that **socketley dnssec** prints.
 
 ## Names runtimes are reached by
 
@@ -9596,7 +9861,7 @@ dig files.example.com            # 203.0.113.7
 dig photos.files.example.com     # 203.0.113.7
 ```
 
-So that a secondary notices changes, a zone is served with its file's serial plus the seconds from 2023-11-14 to the last change of that directory. The served serial grows with every change of the file's serial and of the published records. It is the same in every shard and after every restart.
+So that a secondary notices changes, a zone is served with its file's serial plus the seconds from 2023-11-14 to the last change of the published records that fall in that zone. A name published in one zone, an ACME answer or another runtime's records there, reads and signs again that zone alone; every other zone is served on as it was, with its serial and its signatures. A name without a dot falls in every zone. The served serial grows with every change of the file's serial and of the zone's published records. It is the same in every shard and after every restart.
 
 ## What it answers
 
@@ -9610,7 +9875,7 @@ A connection may carry several queries one after another, and they are answered 
 
 ## Stats
 
-**stats** adds these figures for each shard: **zones**, **records**, **udp_queries**, **tcp_queries**, the answers by rcode (**noerror**, **nxdomain**, **refused**, **formerr**, **notimp**, **other_rcode**), **truncated**, **referrals**, **dropped** (packets that were not queries), **rrl_dropped** and **rrl_slipped**, **send_failed** (answers the socket would not take), **tcp_conns**, **tcp_refused**, **tcp_evicted** (connections closed to make room for a new one), **transfers**, **transfers_refused**, **notify_sent**, **notify_acked**, **notify_given_up**, **zone_reloads** and **zone_reload_failures**.
+**stats** adds these figures for each shard: **zones**, **records**, **udp_queries**, **tcp_queries**, the answers by rcode (**noerror**, **nxdomain**, **refused**, **formerr**, **notimp**, **other_rcode**), **truncated**, **referrals**, **dropped** (packets that were not queries), **rrl_dropped** and **rrl_slipped**, **send_failed** (answers the socket would not take), **tcp_conns**, **tcp_refused**, **tcp_evicted** (connections closed to make room for a new one), **transfers**, **transfers_refused**, **notify_sent**, **notify_acked**, **notify_given_up**, **zone_reloads**, **zone_reload_failures** and, with **--dnssec**, **signatures_made** and **signatures_kept** (taken unchanged from the signing before).
 
 
 ---
@@ -9798,7 +10063,9 @@ No answer is given before what it rests on is on the disk: a write's own record,
 
 Every shard answers reads and queries. Writes wait for one disk, so the shards together take at most as many writes as one shard takes. Writes also cost more cores than on one shard, since each write that reaches another shard is handed on to shard 0, and its answer is handed back. A database that is mostly written is served best by one shard.
 
-**Changes, as they happen.** **GET** */c/***collection***/_feed* is a stream of Server-Sent Events, which a browser reads with **EventSource**. Each change is sent once it is on the disk, numbered by the change. A change is an event **put** with **{"collection":..,"id":..,"owner":..,"version":..,"doc":{..}}** or an event **delete** with **{"collection":..,"id":..,"deleted":true}**. The reader sees only what it may read, as with a query: an account sees its own documents of an owner collection. **GET /_feed** streams the changes of every collection, to a key. A stream that broke resumes from the last change it read, with **Last-Event-ID** (or **?since=**). The database keeps about 32 MiB of changes. A stream resuming from an older change is told **reset** and should read again what it shows. A comment every fifteen seconds keeps a quiet stream from looking dead.
+Every request a reading shard takes reads the log on first. A shard that holds a stream is also told by shard 0 of each change that reaches the disk, so the stream hears of it before the next request. **stats** counts these messages in shard 0's **nudges**.
+
+**Changes, as they happen.** **GET** */c/***collection***/_feed* is a stream of Server-Sent Events, which a browser reads with **EventSource**. Each change is sent once it is on the disk, numbered by the change. A change is an event **put** with **{"collection":..,"id":..,"owner":..,"version":..,"doc":{..}}** or an event **delete** with **{"collection":..,"id":..,"deleted":true}**. The reader sees only what it may read, as with a query: an account sees its own documents of an owner collection. **GET /_feed** streams the changes of every collection, to a key. A stream that broke resumes from the last change it read, with **Last-Event-ID** (or **?since=**). While a stream is open on any shard, and for two minutes after the last one closed, the database keeps about 32 MiB of changes on every shard, so a stream that resumes may reach any of them. With no stream near, shard 0 keeps about 1 MiB and a shard reading its log keeps none. A stream resuming from an older change is told **reset** and should read again what it shows. **stats** gives each shard's **history_bytes**. A comment every fifteen seconds keeps a quiet stream from looking dead.
 
 **Documents with a time to go.** A collection whose schema line names **ttl:***field* loses a document once that field's number, in seconds since 1970, has passed. From that moment the document is answered as absent. Its deletion is written and streamed within the minute.
 
@@ -9843,7 +10110,7 @@ The most the documents may hold. A write past it is refused with 507.
 
 ### `--cache size`
 
-The memory that holds the documents last read. Default: 64M. The rest are read from the disk.
+The memory that holds the documents last read. Default: 64M. The rest are read from the disk. With **--shards**, it is the runtime's: each shard caches its share, the size divided by the shard count, and at least 1 MiB. **stats** shows each shard's share as **cache_limit**, and how often a document was found there and not as **cache_hits** and **cache_misses**.
 
 ### `--replicate url`
 
@@ -9901,6 +10168,8 @@ socketley create mqtt devices -p 8883 --tls --cert dev.pem --key dev.key \
 ```
 
 The broker listens on 1883, or on 8883 with **--tls**, unless **-p** gives another port. **--max-connections** and **--write-buffer** work as for a server. When a slow client owes more than the write buffer, its QoS 0 messages are dropped and counted, and its QoS 1 and 2 messages wait in its session.
+
+Over TLS 1.3, the first packet of 256 KiB or more that a client is sent hands its connection's send key to the kernel's TLS layer. From then on the kernel encrypts what the client is sent, and a payload goes from the one copy of the message every subscriber sends from, as it does without TLS (see **SOCKETLEY_KERNEL_TLS**).
 
 **What it implements.** The broker implements:
 
@@ -9971,9 +10240,9 @@ The call answers true once the broker has the message, or nil and the reason. In
 
 **WebSocket.** **--ws** *port* serves MQTT inside WebSocket on a second port, for browsers. Any path works, and **/mqtt** is the convention. The subprotocol **mqtt** or **mqttv3.1** is chosen when offered. A packet may be carried in any number of frames, and a frame may hold any number of packets. A frame may be no longer than four times **--max-packet**. With **--tls**, it is wss.
 
-**On several cores.** With **--shards** *N* the broker is *N* worker processes sharing its ports (**SO_REUSEPORT**), and its clients see one broker. Each shard tells the others what its clients subscribe to, and hands them the messages their subscribers want. Every shard keeps each retained message. A shared subscription's message goes to one member of the group, across all the shards. A client that connects to a different shard than before takes its session with it. The newest connection of a client id wins.
+**On several cores.** With **--shards** *N* the broker is *N* worker processes sharing its ports (**SO_REUSEPORT**), and its clients see one broker. Each shard tells the others what its clients subscribe to, and hands them the messages their subscribers want. Every shard keeps each retained message. A shared subscription's message goes to one member of the group, across all the shards. A client that connects to a different shard than before takes its session with it. The newest connection of a client id wins. A message still on its way to the shard a session left is handed on to the shard it went to, once, for ten seconds after the move; these are counted in **session_forwards**. A SUBACK for a filter the other shards do not know yet waits until every shard that answers has taken it, so a message published anywhere after the SUBACK reaches the subscriber. It waits a second at most, and then goes anyway. The SUBACKs that waited are counted in **subacks_held**, and those that went after the second in **subacks_unheard**. A connection whose old session does not come within three seconds is let in without it, as a new session. When the session comes later, it is folded into the new one: its subscriptions are added, and its queued and unanswered messages are sent first, with new packet identifiers. If the new session began with a clean start, the old one ends instead. A shard that is asked more than fifteen seconds late hands the session over once it hears of the new connection. These are counted in **sessions_late**, **sessions_yielded** and **sessions_late_ended**. A session handed over this way that is larger than 1 MiB goes in pieces of 1 MiB, so none is ended for its size; these are counted in **sessions_pieced**. A session moves as one answer to the claim when the way back carries it. When shards relay through the daemon (see **SOCKETLEY_NO_SHARD_MESH**), that answer holds 8 MiB, less what the shard still has queued to the daemon past 68 MiB. A larger session goes in pieces of 1 MiB the same way, and the connection waits for them as long as they keep coming, so a client is let in on whichever shard it lands on with its session whatever its size; these too are counted in **sessions_pieced**. When two connections of one client claim its session at once, the newer one keeps it: a session the older one was given meanwhile is passed on to the newer one's shard, with what was still on its way to it, counted in **sessions_yielded**. Relaying through the daemon also holds a packet to 8 MiB less 256 KiB, however large **--max-packet** is; the broker says so in its CONNACK, and a larger packet is refused as one past **--max-packet** is. A shard that starts is given the retained messages by shard 0 in as many answers as they take, each no longer than the way carries; one longer than the daemon carries is not given to it, and is counted in **shard_dropped**.
 
-A shard may not take what another shard hands it as fast as it comes. It then holds back that other shard's publishers, rather than lose their messages: they are not read until it can take more. At QoS 1 and 2 this holds back all of them, and at QoS 0 those whose last message went to it. A shard that has answered nothing for a second holds back only QoS 1 and 2 publishers, whose answer waits. A message for that shard is then dropped at QoS 0, or once 8 MiB wait for it. At any QoS, a message is dropped once what the shard was handed has failed for three seconds. Drops are counted in **shard_dropped**. Each shard keeps a snapshot of its own, *file***.***shard*, and publishes its figures under **$SYS/broker/shard/***n***/**.
+A shard may not take what another shard hands it as fast as it comes. It then holds back that other shard's publishers, rather than lose their messages: they are not read until it can take more. At QoS 1 and 2 this holds back all of them, and at QoS 0 those whose last message went to it. A shard that has answered nothing for a second holds back only QoS 1 and 2 publishers, whose answer waits. A message for that shard is then dropped at QoS 0, or once 8 MiB wait for it. At any QoS, a message is dropped once what the shard was handed has failed for three seconds. So is a message whose shared groups make it too large for the daemon to carry to a shard. Drops are counted in **shard_dropped**. Each shard keeps a snapshot of its own, *file***.***shard*, and publishes its figures under **$SYS/broker/shard/***n***/**.
 
 **Lua.** A broker's **--lua** script may decide who connects and what passes. Each hook that decides answers **true** to allow, **false** to refuse, or nothing to keep what the broker decided. A hook that fails refuses. A client is a table of **id**, **username**, **peer** and **version**.
 
@@ -10233,11 +10502,11 @@ A provider may send a feedback report (ARF, RFC 5965) saying that one of its use
 
 Each message stored in a mailbox is announced to the targets of **--notify-targets** as **{"event":"mail.received","mailbox":..,"folder":..,"key":..,"from":..,"subject":..,"size":..}**, under **mail/***user* for a broker. A bucket that encrypts or compresses its objects does the same to mail. Either way, a message is read back one range at a time.
 
-**IMAP.** The runtime serves the mailboxes of **--storage** over IMAP4rev1, and over IMAP4rev2 (RFC 9051) for a client that enables it. It supports LITERAL+, SEARCHRES, SASL-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT, CHILDREN, SPECIAL-USE, ID, ENABLE, CONDSTORE and QRESYNC, and ESEARCH. It also supports LIST-EXTENDED and LIST-STATUS, STATUS=SIZE, QUOTA, SORT (with DISPLAYFROM and DISPLAYTO), THREAD (ORDEREDSUBJECT, REFERENCES), WITHIN (OLDER and YOUNGER), SAVEDATE, PREVIEW and COMPRESS=DEFLATE. Under COMPRESS=DEFLATE, what the server says in one loop turn is compressed as one flushed block. A password is accepted only over STARTTLS or **--imaps** (LOGINDISABLED before that), except from 127.0.0.1.
+**IMAP.** The runtime serves the mailboxes of **--storage** over IMAP4rev1, and over IMAP4rev2 (RFC 9051) for a client that enables it. It supports LITERAL+, SEARCHRES, SASL-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT, CHILDREN, SPECIAL-USE, ID, ENABLE, CONDSTORE and QRESYNC, and ESEARCH. It also supports LIST-EXTENDED and LIST-STATUS, STATUS=SIZE, QUOTA, SORT (with DISPLAYFROM and DISPLAYTO), THREAD (ORDEREDSUBJECT, REFERENCES), WITHIN (OLDER and YOUNGER), SAVEDATE, PREVIEW and COMPRESS=DEFLATE. Under COMPRESS=DEFLATE, what the server says in one loop turn is compressed as one flushed block. Over TLS 1.3 without COMPRESS, the first reply of 4 MiB or more — a large message's FETCH, a POP3 RETR, a JMAP download — hands the connection's send key to the kernel's TLS layer, which from then on encrypts a message's body straight from the one copy the runtime holds (see **SOCKETLEY_KERNEL_TLS**). Messages are read from the store into memory, so there is no file to send from. A password is accepted only over STARTTLS or **--imaps** (LOGINDISABLED before that), except from 127.0.0.1.
 
 Every user has the folders INBOX, Sent, Drafts, Junk and Trash. CREATE makes more, including the folders above a name such as Work/2026. A client can set keywords of its own beside the system flags.
 
-The UIDs, flags and keywords of each folder are kept per user in *state***/mail/***name***.imap/***user***,** as a snapshot with a journal beside it. Every shard serves IMAP. A shard records a change by appending a line to the journal under the user's lock, once it has read the journal to its end. So each UID is given only once, whichever shard gives it. Before each command, a shard reads the journal lines it has not yet read. The journal is folded into the snapshot once it passes a quarter of a mebibyte.
+The UIDs, flags and keywords of each folder are kept per user in *state***/mail/***name***.imap/***user***,** as a snapshot with a journal beside it. Every shard serves IMAP. A shard records a change by appending a line to the journal under the user's lock, once it has read the journal to its end. So each UID is given only once, whichever shard gives it. Before each command, a shard reads the journal lines it has not yet read. The journal is folded into the snapshot once it passes a quarter of a mebibyte. A shard other than the first lets a user's index go once nothing on it has asked for the user for ten minutes, and reads it again when it is next asked.
 
 A delivery, an APPEND or a COPY writes its journal line as the message is stored. So IDLE reports new mail within a second, and the quota counts the message at once. The bucket remains the authority. It is listed when a folder is selected, and every minute during NOOP and IDLE. A message that has gone from the bucket is expunged. A message that no journal line names gets the next UID once it is a minute old. Every change to a message takes the folder's next mod-sequence. So a client that reconnects can ask what changed and what vanished since it last looked.
 
@@ -10386,7 +10655,7 @@ The comma-separated ids of the idp clients whose access tokens the runtime accep
 
 ### `--storage runtime[/bucket]`
 
-The storage runtime, and optionally its bucket, that holds the mailboxes.
+The storage runtime, and optionally its bucket, that holds the mailboxes. A burst of mail faster than the store waits for it rather than being deferred: at most 1024 mailbox deliveries, holding at most 128 MiB of their messages, are out at once, and the rest wait in the spool for a place. **stats** says how many are out (**mail_local_out**), waiting (**mail_local_waiting**) and have waited (**mail_local_waited**), and the same for the requests the runtime has out to other runtimes (**mail_asks_out**, **mail_asks_waiting**, **mail_asks_waited**, at most 2048 out); a request the queue to other runtimes has no room for this turn waits for the next. Deliveries to one mailbox while its account is being looked up wait on that one lookup, so a burst asks the idp once per name (**mail_idp_lookups**).
 
 ### `--users file`
 
@@ -10558,7 +10827,8 @@ DNS blocklists (RFC 5782) to check, such as zen.spamhaus.org. The runtime looks 
 - what the spam filter refused and filed in Junk;
 - what was greylisted;
 - the reports sent;
-- the IMAP connections and reads.
+- the IMAP connections and reads;
+- for each shard, the users whose index it holds (**imap_users_held**), its appends to the users' journals (**imap_journal_writes**), its listings of a folder in the bucket (**imap_listings**), and the folds of a journal into its snapshot it began and those that another shard's fold came before (**imap_folds**, **imap_folds_lost**).
 
 
 ---
@@ -10914,7 +11184,7 @@ The page, under **--root**, an address with no file behind it is given, with **2
 
 **Compression.** A **.br** or **.gz** copy a build left beside a text file, no older than it, goes to a client whose **Accept-Encoding** takes it, br first. A text file with no **.gz** is compressed once, by a helper thread, after its first answer, and the copy is kept until the file changes; the request that asked for it is never held for it. A range is always of the file itself.
 
-**Memory and the disk.** What an address resolves to is kept, a file up to 32 KiB with its bytes, a larger one with an open descriptor it is sent from with **sendfile**(2), or, when a window of it is not in the page cache, read through the ring, so the event loop never waits on the disk. inotify watches every directory below **--root** and every one above it, so a change is seen at once, a release swapped in at any name on the way (**current**, or **current** in **current/public**) too, and no request asks the disk whether a file changed. Kept bytes are bounded at 256 MiB and kept descriptors at 4096, past which a large file is opened for each request. An address with no file shares the one **404.html** or fallback answer, so a flood of made-up addresses keeps nothing. A file that cannot be opened for want of a descriptor or memory is a **503** with **Retry-After: 1**, never a remembered **404**. Without inotify, or with no watch left (**fs.inotify.max_user_watches**), each kept file and its copies are looked at again with a **stat**(2) per request, and **--root** once a second.
+**Memory and the disk.** What an address resolves to is kept, a file up to 32 KiB with its bytes, a larger one with an open descriptor it is sent from with **sendfile**(2), or, when a window of it is not in the page cache, read through the ring, so the event loop never waits on the disk. inotify watches every directory below **--root** and every one above it, so a change is seen at once, a release swapped in at any name on the way (**current**, or **current** in **current/public**) too, and no request asks the disk whether a file changed. Kept bytes are bounded at 256 MiB and kept descriptors at 4096, past which a large file is opened for each request. Under **--shards** each shard keeps, compresses and watches for itself, since any of them may be asked for any file: the bounds are a shard's, and the watches count once a shard against **fs.inotify.max_user_watches**.**An**address**with**no**file**shares**the**one **404.html** or fallback answer, so a flood of made-up addresses keeps nothing. A file that cannot be opened for want of a descriptor or memory is a **503** with **Retry-After: 1**, never a remembered **404**. Without inotify, or with no watch left (**fs.inotify.max_user_watches**), each kept file and its copies are looked at again with a **stat**(2) per request, and **--root** once a second.
 
 **Connections.** Pipelined requests are answered in order; a client that sends them faster than it reads the answers has its next requests wait once a megabyte is owed to it, and one that stops reading, mid-file or so, is let go after a minute without progress. After a **Connection: close** or a refused request nothing more on the connection is answered. An HTTP/1.0 client that asks to stay open is told **Connection: keep-alive**.
 
@@ -11076,6 +11346,7 @@ eviction                   --eviction
 resp (bool)                --resp
 replicate                  --replicate
 cluster (bool)             --cluster
+no_cluster (bool)          --no-cluster
 ```
 
 Every other flag of a type has a key of the same name, without the leading dashes and with each hyphen turned into an underscore: **--mail-domain** is **mail_domain**, **--submission** is **submission**, and **--queue-lifetime** is **queue_lifetime**. A list key takes a table, or one string for a list of one. A key that no flag of the type has is refused by name, not silently dropped. A value of the wrong shape is refused the same way. So is a value that contains a tab, because the daemon's command line splits on tabs. A password containing a tab would arrive as two arguments. A space stays inside its value, as it does inside a quoted argument on the command line.
@@ -11278,7 +11549,7 @@ Decide, in an mqtt runtime, which publishes and subscriptions pass. In that runt
 
 #### `on_send(msg)`
 
-Called when a message is sent.
+Called when a message is sent. Under **--shards**, it is called on each shard that sends the message to its own clients, so a broadcast that reaches the siblings, like a **send** from the command line, calls it once per shard.
 
 #### `on_route(method, path, backend_path)`
 
@@ -12973,7 +13244,7 @@ Founds a new cluster with a single voter, on first start only.
 
 #### `--raft-join ip:port`
 
-Joins the cluster that the member at this address belongs to, on first start only. The node is added as a learner and receives the log without voting. Once its log has caught up to the leader's commit index, a single-server change promotes it to voter. A member that is not the leader passes the request on.
+Joins the cluster that the member at this address belongs to, on first start only. The node is added as a learner and receives the log without voting. Once its log has caught up to the leader's commit index, a single-server change promotes it to voter. The leader logs the promotion when it proposes it, and the node logs it once the change is committed. A member that is not the leader passes the request on.
 
 #### `--raft-cert file --raft-key file --raft-ca file`
 
@@ -13393,6 +13664,12 @@ A test aid that sets how many milliseconds new spam filter learning stays in a m
 
 Inherited by worker processes, which have no command line of their own.
 
+### `SOCKETLEY_MAIL_LET_GO_MS`
+
+A test aid that sets how many milliseconds a shard of a mail runtime, other than the first, keeps a user's index in memory after nothing on that shard asked for it. The index is read again from its files when it is next asked for. Default: ten minutes.
+
+Inherited by worker processes, which have no command line of their own.
+
 ### `SOCKETLEY_IDP_CLIENT_CA`
 
 A test aid that names a file of CA certificates for checking the client metadata documents an idp fetches. The certificate served with each such document is checked against this file. Default: the system's CA certificates.
@@ -13505,6 +13782,18 @@ Inherited by worker processes, which have no command line of their own.
 
 Sets how often a runtime serving TLS logs one line counting the inbound handshakes that failed since its last report. Default: every 60 seconds; the range is 1 to 3600. A failed handshake comes from a port scanner far more often than from a client, so each one is counted rather than logged.
 
+### `SOCKETLEY_TLS_TICKET_SECS`
+
+A test aid that sets how many seconds one session ticket key seals new tickets. The key still opens its tickets for as long again, and is then wiped. The range is 1 to 86400. Default: an hour.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_WRITE_STALL_SECS`
+
+A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset. The range is 1 to 86400. Default: 120 seconds.
+
+Inherited by worker processes, which have no command line of their own.
+
 ### `SOCKETLEY_ACME_DIRECTORY`
 
 Sets the directory URL of the ACME CA that **--acme** and **acme issue** use. Default: Let's Encrypt, **https://acme-v02.api.letsencrypt.org/directory**. Its staging CA is **https://acme-staging-v02.api.letsencrypt.org/directory**. Each CA has an account of its own.
@@ -13575,6 +13864,10 @@ Inherited by worker processes, which have no command line of their own.
 
 Sets the interval in milliseconds between periodic sweeps for expired cache keys. Default: **500**. This never affects correctness: an expired key is not served no matter when the sweep runs, because every read path checks the expiry itself. The interval controls only how quickly keys that are never accessed again release their memory.
 
+### `SOCKETLEY_CACHE_SNAPSHOT_MB`
+
+Sets how many MiB a cache shard's journal (**--persistent-interval**) may hold before the shard snapshots, unless its last dump is larger, in which case that size is the bound. Default: **64**. The snapshot is written by a forked child, so the shard goes on serving; the journal is then cut to what came after the snapshot began.
+
 ### `SOCKETLEY_LUA_TIMEOUT_MS`
 
 Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely, and also turns on LuaJIT's trace compiler. The compiler is worth about 2.4x on a callback that computes, and about 1% on one that does not. See **Callback Deadline**, which prices both halves of that trade.
@@ -13591,9 +13884,9 @@ Inherited by worker processes, which have no command line of their own.
 
 ### `SOCKETLEY_KERNEL_TLS`
 
-Set to **0** to keep every TLS record in this process. Otherwise, some TLS 1.3 connections hand their sending to the kernel's TLS layer. This happens in three cases. A server, storage or proxy connection sends a file or object over 256 KiB. A TCP proxy's backend streams that much to the client. An HTTP/1.1 proxy sends a client an answer body of that known length.
+Set to **0** to keep every TLS record in this process. Otherwise, some TLS 1.3 connections hand their sending to the kernel's TLS layer. This happens in six cases. A server, storage or proxy connection sends a file or object over 256 KiB. A TCP proxy's backend streams that much to the client. An HTTP/1.1 proxy sends a client an answer body of that known length. A cache connection is owed 2 MiB or more at once. An mqtt client is sent a packet of 256 KiB or more. A mail client is sent a reply of 4 MiB or more, without COMPRESS.
 
-The connection then changes its send key and hands the new key to the kernel's TLS layer. The kernel encrypts what is sent, by sendfile from the page cache or spliced from the backend, at about half the CPU of encrypting a copy in this process. A connection that never sends that much stays as it was, because for small answers encrypting a copy here costs less. HTTP/2 connections are never moved.
+The connection then changes its send key and hands the new key to the kernel's TLS layer. The kernel encrypts what is sent, by sendfile from the page cache or spliced from the backend, at about half the CPU of encrypting a copy in this process. A cache's answer is in memory and has no sendfile to gain, so the kernel only spares it the copies OpenSSL makes: measured over loopback, 2 MiB answers cost 0.83 and 8 MiB 0.53 of the CPU, while 1 MiB and smaller cost the same or more, which is why a cache waits for 2 MiB. A connection that never sends that much stays as it was, because for small answers encrypting a copy here costs less. An mqtt payload under kernel TLS is not copied at all, so the broker gains from 256 KiB: measured over loopback, a 1 MiB publish to 20 TLS subscribers costs 0.56 of the CPU, a 256 KiB one 0.68. A mail FETCH of 8 MiB costs 0.61, of 4 MiB 0.79, while at 1 and 2 MiB the move gains nothing it can hold to, so mail waits for 4 MiB. The move is for the rest of the connection: a 1 KiB answer on a moved cache connection costs what it did, a 256 KiB one about a tenth more. HTTP/2 connections are never moved.
 
 This needs the kernel's **tls** module (**modprobe tls**). Without the module, the connection continues in user space under its new key, and the runtime says so once in its log. The variable is read when the runtime starts.
 
@@ -13639,7 +13932,11 @@ Both of these variables read **only** the exact string **0**. **SOCKETLEY_RECV_M
 
 ### `SOCKETLEY_NO_SHARD_MESH`
 
-Any value but **0** stops shards from linking to each other directly. The shards then relay through the daemon, and the daemon logs at startup that the mesh is off. This is the measurement control for the mesh: the two paths differ only in the route, not in the build.
+Any value but **0** stops shards from linking to each other directly. The shards then relay through the daemon, and the daemon logs at startup that the mesh is off. This is the measurement control for the mesh: the two paths differ only in the route, not in the build. A request or answer longer than the 8 MiB one frame holds goes in pieces, through the daemon as over a link, up to 256 MiB. Requests and answers for a shard that has not read them yet wait on each side of the daemon up to 64 MiB, and beside that one of up to 256 MiB; past that, an asker is answered at once, as **the runtime is overloaded: its request backlog is full**, not as no such runtime. Everything else the daemon and a shard tell each other (configuration, publishes, deliveries) waits up to 4 MiB of its own beside them.
+
+### `SOCKETLEY_CACHE_HANDOFF`
+
+**0** stops a sharded cache from handing a client connection to the shard that owns its keys; it then relays each of that connection's commands there instead. On by default for every cache with two or more shards. A connection is handed once 28 of its last 32 single-key commands named one other shard, over the link between the two shards, and only between commands: never inside MULTI or WATCH, while subscribed, blocked or replicating, with a reply or crossing outstanding, or over TLS, a unix socket or a per-shard port. A connection handed on waits a second at its new shard before it may move again, twice as long after each further move. **stats** shows **handoff_out**, **handoff_in**, **handoff_aborted** and **handoff_busy** per shard while it is on.
 
 ### `SOCKETLEY_NO_PEER_LINKS`
 

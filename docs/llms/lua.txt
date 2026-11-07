@@ -126,7 +126,7 @@ Decide, in an mqtt runtime, which publishes and subscriptions pass. In that runt
 
 #### `on_send(msg)`
 
-Called when a message is sent.
+Called when a message is sent. Under **--shards**, it is called on each shard that sends the message to its own clients, so a broadcast that reaches the siblings, like a **send** from the command line, calls it once per shard.
 
 #### `on_route(method, path, backend_path)`
 

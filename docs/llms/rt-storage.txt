@@ -124,18 +124,18 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### S3 over HTTP, SigV4
 
-MinIO 2025-09-07, 7 passes, 2026-11-03, socketley c7d4c42b.
+MinIO 2025-09-07, 7 passes, 2026-11-07, socketley fc762708.
 
 | case | socketley | MinIO | socketley vs MinIO |
 |---|---|---|---|
-| GET 4 KiB, 1 connection | 8.3 K obj/s (0.18 cores) | 2.7 K obj/s (0.84 cores) | 3.12× (3.11–3.14) |
-| GET 4 KiB, 4 × 16 connections | 206 K obj/s (1.94 cores) | 17 K obj/s (3.12 cores) | 12.02× (11.89–12.36) |
-| GET 1 MiB, 4 × 16 connections | 31 K obj/s (2.86 cores) | 5.4 K obj/s (2.84 cores) | 5.69× (5.55–5.86) |
-| PUT 4 KiB, 4 × 16 connections, into an empty store | 56 K obj/s (2.58 cores) | 12 K obj/s (2.65 cores) | 4.48× (4.38–4.64) |
+| GET 4 KiB, 1 connection | 8.2 K obj/s (0.18 cores) | 2.7 K obj/s (0.83 cores) | 3.07× (3.06–3.15) |
+| GET 4 KiB, 4 × 16 connections | 205 K obj/s (1.96 cores) | 17 K obj/s (3.13 cores) | 11.91× (11.72–12.22) |
+| GET 1 MiB, 4 × 16 connections | 31 K obj/s (2.86 cores) | 5.4 K obj/s (2.85 cores) | 5.82× (5.23–5.83) |
+| PUT 4 KiB, 4 × 16 connections, into an empty store | 53 K obj/s (2.81 cores) | 13 K obj/s (2.88 cores) | 4.26× (4.23–4.53) |
 
 Caveat: a floor: the load generator ran out before socketley did.
 
-How it was measured: warp 1.3.1, 8s a run, SigV4 over plain HTTP; six warp processes; both servers on the same four cores (socketley as four shards), six warp processes on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.
+How it was measured: warp 1.3.1, 8s a run, SigV4 over plain HTTP; both servers on the same four cores (socketley as four shards), six warp processes on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.
 
 ## In the manual
 

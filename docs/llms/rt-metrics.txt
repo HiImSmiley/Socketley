@@ -96,15 +96,15 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Scraping 100,000 series a second
 
-Prometheus 2.53.5, VictoriaMetrics 1.112, 5 passes, 2026-11-04, socketley b1cec63f.
+Prometheus 2.53.5, VictoriaMetrics 1.112, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
 |---|---|---|---|---|---|
-| CPU per sample ingested | 0.31 µs (0.03 cores) | 0.84 µs (0.08 cores) | 1.28 µs (0.13 cores) | 2.69× (2.63–2.76) | 4.14× (4.10–4.33) |
-| resident memory | 88.1 MB | 398 MB | 118 MB | 4.29× (3.51–4.96) | 1.32× (1.27–1.48) |
-| range query, 5 min of every path | 102 ms | 716 ms | 153 ms | 7.18× (5.85–8.74) | 1.50× (1.16–1.81) |
+| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.75 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.58× (2.56–2.66) | 3.48× (3.40–3.68) |
+| resident memory | 89.8 MB | 398 MB | 121 MB | 4.43× (3.98–5.03) | 1.35× (1.23–1.48) |
+| range query, 5 min of every path | 59.9 ms | 633 ms | 174 ms | 10.51× (9.36–11.45) | 2.93× (1.68–3.61) |
 
-How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated. This set was measured on a 16-core development machine, not the box above, until the next round there.
+How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
 
 ## In the manual
 

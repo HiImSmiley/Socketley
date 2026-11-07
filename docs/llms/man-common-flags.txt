@@ -80,6 +80,8 @@ Prints messages with both timestamp and prefix: [HH:MM:SS] [name] message. Both 
 
 Limits the number of concurrent connections. New connections beyond the limit are closed immediately. 0 means no limit (default). Alias: **--max-conn**.
 
+With **--shards**, the limit is the runtime's, not each shard's. A shard counts its siblings' connections as they published them on their last turn, so connections accepted on two shards in the same instant can pass the limit by a few.
+
 ### `--read-buffer size`
 
 The most data the runtime accumulates from one connection before it refuses more. Takes a size with K, M or G. Default 1M. This is the inbound counterpart of **--write-buffer**, and like it, every runtime has one.
@@ -158,13 +160,17 @@ On a proxy, one token is charged per read completion rather than per HTTP reques
 
 Limits total messages per second across all connections, using a shared token bucket. A server drops excess messages silently; a cache answers them with an error. 0 means no limit (default).
 
+With **--shards**, the rate is the runtime's: each shard refills its own bucket with its share, the rate divided by the shard count and at least one a second. The kernel spreads connections over the shards, so this holds for many clients; a single connection lives on one shard and gets that shard's share.
+
 A client refuses it for the same reason as **--rate-limit**: it caps the total across all inbound connections, and a client has one outbound connection.
 
 ### `--idle-timeout duration`
 
-Closes connections that have received no data for longer than *duration*. 0 disables it (default). A sweep timer checks for idle connections every 30 seconds. A bare number is seconds; a suffix of **s**, **m**, **h**, **d** or **w** means seconds, minutes, hours, days or weeks (**300** and **5m** both work).
+Closes connections that have received no data for longer than *duration*. 0 disables it (default). A sweep timer checks for idle connections every 30 seconds. On a server or proxy a connection that is still being sent an answer is not idle while the answer moves, however slowly the client reads; one whose client has taken nothing of it for *duration* is reset, whether it was to be kept alive or closed after the answer. With no timeout set, the same holds after 120 seconds, as for storage. A bare number is seconds; a suffix of **s**, **m**, **h**, **d** or **w** means seconds, minutes, hours, days or weeks (**300** and **5m** both work).
 
 This flag closes connections that are *quiet*, which is not the same as closing connections that are *dead*, and dead connections do not need it. Every accepted TCP connection gets TCP keepalive at 60/10/3: after a minute of silence, three probes ten seconds apart. So a peer that loses power, or vanishes behind a NAT that forgot it, is closed without any timeout being set. A websocket that sends nothing for an hour is quiet but alive, and keepalive leaves it alone; only **--idle-timeout** closes it. A unix listener does not get keepalive, because its peer cannot disappear silently.
+
+A connection a runtime ends after its answer (an HTTP **Connection: close**, a cache **QUIT**, an MQTT **DISCONNECT**) is closed only once its client has closed its own side, or has acknowledged all of that answer and sent nothing for a second. What the client sends meanwhile is read and dropped, since a close with bytes unread makes the kernel reset the connection and throw away what it has not yet delivered. A client that takes nothing for ten seconds, or goes on sending for thirty, is reset.
 
 ### `--congestion name`
 
@@ -209,7 +215,7 @@ On a **client**, TLS is dialled rather than terminated, and **--tls** alone is a
 
 A dialled connection, such as a client's target or a proxy's backend, is verified on two counts, and neither check can be turned off. First, the chain must be signed by something in the trust store. Second, the certificate must be valid for the host that was dialled. For a client, that is the name in **-t**, matched against the certificate's DNS SAN, or against its IP SAN for an address literal. The name checked is always the configured one, never one read from the certificate that arrived. The minimum version is TLS 1.2. There is deliberately no skip-verify option. A TLS client that does not verify protects against an eavesdropper but not against someone in the path, while it reports itself as encrypted either way.
 
-A listener speaks TLS 1.2 and 1.3. Over 1.2, it offers only ECDHE key exchange with AEAD ciphers (Mozilla's intermediate list). It resumes sessions from its own cache, not from tickets. A ticket key lives as long as the process, and anyone who learned it could open every session it ever sealed.
+A listener speaks TLS 1.2 and 1.3. Over 1.2, it offers only ECDHE key exchange with AEAD ciphers (Mozilla's intermediate list). A returning client resumes its session by a ticket on whichever shard it reaches: every shard seals tickets with the same key, a new one each hour, which still opens its tickets through the next hour and is then wiped. The key is never written to disk. A connection the runtime closes itself ends with a **close_notify** before its FIN, so the client reads an end rather than a truncation and keeps its session for the next connection. When the kernel encrypts (a large file over TLS 1.3), the runtime holds that FIN until the socket has passed on everything the kernel took, since a FIN sent earlier throws the rest away; a client that stops reading is given ten seconds.
 
 Trust stores are read when the runtime starts. A listener's certificate and key are checked again every two seconds. When they are replaced on disk, by **--acme**, certbot or a copy, new handshakes use them from then on, without a restart and without dropping a connection. This happens only once both files load and match. A pair that does not is not used: the log reports it once, and the old pair goes on serving. The whole certificate file is sent, so a CA's intermediates go with the leaf.
 
@@ -270,7 +276,7 @@ This flag is mutually exclusive with:
 - **-p**.
 - **--udp**. That would be a unix datagram socket, which is a different thing.
 - **--tls**. A unix socket is not on a network; the permissions on the node are what restrict it.
-- **--cluster** on a cache. Cluster members advertise ports computed by a formula, and RESP cannot write a filesystem path as a node address.
+- **--cluster** on a cache. Cluster members advertise ports computed by a formula, and RESP cannot write a filesystem path as a node address. Cluster mode, which a sharded cache on a port is in by default, is simply off on a path; only the flag typed is refused.
 
 Each combination is refused at start, with the reason in the daemon log, so neither flag silently wins.
 
@@ -323,6 +329,8 @@ A proxy keeps only its port, and so does a cache with **--shards**. A path is on
 Requests from one runtime to another include **socketley.send**, **self.route**, and a server's **--cache** *name***.** The daemon carries the first such request between two runtimes, up one control socket and down the other. It then introduces the two processes to each other with a new socket pair, and later requests go straight across.
 
 There is nothing to configure and nothing to see from outside. The pair has no path in the filesystem, so nobody can connect to it or squat on it; only the two processes that were handed the ends can use it. The daemon logs one line naming the pair when it introduces them. **socketley stats** *name* reports **peer_links**, **peer_direct** and **peer_relayed**, which tell a request that went through the daemon from one that went straight across.
+
+A request is answered **overloaded** only by a bound that was full, and each bound is counted in the asking runtime's **stats** (and the daemon's in **socketley daemon stats**): **requests_overloaded_queue** and **_queue_bytes** (the queue of requests not yet sent, 32768 of them), **_parked** (the requests awaiting an answer, 4096, of which background work such as a mail delivery may hold 3072), **_wakeup** (the event loop took no wakeup), **_way** (the socket the request goes out on was full) and **_answer_way** (the socket its answer goes back on was full). **requests_parked_most** is the most that were ever awaiting an answer at once. The first refusal at each bound is also one line in the daemon log, naming it.
 
 Measured with a server posting every cache command to a cache runtime, the two arms differing only in whether they were introduced, a round trip falls from 31.60 to 21.14 microseconds. The process tree spends 10.75 microseconds less CPU per command. This held in 12 of 12 interleaved passes (median of the per-pass differences). A third of the round trip was the daemon.
 

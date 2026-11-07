@@ -164,11 +164,11 @@ A provider may send a feedback report (ARF, RFC 5965) saying that one of its use
 
 Each message stored in a mailbox is announced to the targets of **--notify-targets** as **{"event":"mail.received","mailbox":..,"folder":..,"key":..,"from":..,"subject":..,"size":..}**, under **mail/***user* for a broker. A bucket that encrypts or compresses its objects does the same to mail. Either way, a message is read back one range at a time.
 
-**IMAP.** The runtime serves the mailboxes of **--storage** over IMAP4rev1, and over IMAP4rev2 (RFC 9051) for a client that enables it. It supports LITERAL+, SEARCHRES, SASL-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT, CHILDREN, SPECIAL-USE, ID, ENABLE, CONDSTORE and QRESYNC, and ESEARCH. It also supports LIST-EXTENDED and LIST-STATUS, STATUS=SIZE, QUOTA, SORT (with DISPLAYFROM and DISPLAYTO), THREAD (ORDEREDSUBJECT, REFERENCES), WITHIN (OLDER and YOUNGER), SAVEDATE, PREVIEW and COMPRESS=DEFLATE. Under COMPRESS=DEFLATE, what the server says in one loop turn is compressed as one flushed block. A password is accepted only over STARTTLS or **--imaps** (LOGINDISABLED before that), except from 127.0.0.1.
+**IMAP.** The runtime serves the mailboxes of **--storage** over IMAP4rev1, and over IMAP4rev2 (RFC 9051) for a client that enables it. It supports LITERAL+, SEARCHRES, SASL-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT, CHILDREN, SPECIAL-USE, ID, ENABLE, CONDSTORE and QRESYNC, and ESEARCH. It also supports LIST-EXTENDED and LIST-STATUS, STATUS=SIZE, QUOTA, SORT (with DISPLAYFROM and DISPLAYTO), THREAD (ORDEREDSUBJECT, REFERENCES), WITHIN (OLDER and YOUNGER), SAVEDATE, PREVIEW and COMPRESS=DEFLATE. Under COMPRESS=DEFLATE, what the server says in one loop turn is compressed as one flushed block. Over TLS 1.3 without COMPRESS, the first reply of 4 MiB or more — a large message's FETCH, a POP3 RETR, a JMAP download — hands the connection's send key to the kernel's TLS layer, which from then on encrypts a message's body straight from the one copy the runtime holds (see **SOCKETLEY_KERNEL_TLS**). Messages are read from the store into memory, so there is no file to send from. A password is accepted only over STARTTLS or **--imaps** (LOGINDISABLED before that), except from 127.0.0.1.
 
 Every user has the folders INBOX, Sent, Drafts, Junk and Trash. CREATE makes more, including the folders above a name such as Work/2026. A client can set keywords of its own beside the system flags.
 
-The UIDs, flags and keywords of each folder are kept per user in *state***/mail/***name***.imap/***user***,** as a snapshot with a journal beside it. Every shard serves IMAP. A shard records a change by appending a line to the journal under the user's lock, once it has read the journal to its end. So each UID is given only once, whichever shard gives it. Before each command, a shard reads the journal lines it has not yet read. The journal is folded into the snapshot once it passes a quarter of a mebibyte.
+The UIDs, flags and keywords of each folder are kept per user in *state***/mail/***name***.imap/***user***,** as a snapshot with a journal beside it. Every shard serves IMAP. A shard records a change by appending a line to the journal under the user's lock, once it has read the journal to its end. So each UID is given only once, whichever shard gives it. Before each command, a shard reads the journal lines it has not yet read. The journal is folded into the snapshot once it passes a quarter of a mebibyte. A shard other than the first lets a user's index go once nothing on it has asked for the user for ten minutes, and reads it again when it is next asked.
 
 A delivery, an APPEND or a COPY writes its journal line as the message is stored. So IDLE reports new mail within a second, and the quota counts the message at once. The bucket remains the authority. It is listed when a folder is selected, and every minute during NOOP and IDLE. A message that has gone from the bucket is expunged. A message that no journal line names gets the next UID once it is a minute old. Every change to a message takes the folder's next mod-sequence. So a client that reconnects can ask what changed and what vanished since it last looked.
 
@@ -317,7 +317,7 @@ The comma-separated ids of the idp clients whose access tokens the runtime accep
 
 ### `--storage runtime[/bucket]`
 
-The storage runtime, and optionally its bucket, that holds the mailboxes.
+The storage runtime, and optionally its bucket, that holds the mailboxes. A burst of mail faster than the store waits for it rather than being deferred: at most 1024 mailbox deliveries, holding at most 128 MiB of their messages, are out at once, and the rest wait in the spool for a place. **stats** says how many are out (**mail_local_out**), waiting (**mail_local_waiting**) and have waited (**mail_local_waited**), and the same for the requests the runtime has out to other runtimes (**mail_asks_out**, **mail_asks_waiting**, **mail_asks_waited**, at most 2048 out); a request the queue to other runtimes has no room for this turn waits for the next. Deliveries to one mailbox while its account is being looked up wait on that one lookup, so a burst asks the idp once per name (**mail_idp_lookups**).
 
 ### `--users file`
 
@@ -489,4 +489,5 @@ DNS blocklists (RFC 5782) to check, such as zen.spamhaus.org. The runtime looks 
 - what the spam filter refused and filed in Junk;
 - what was greylisted;
 - the reports sent;
-- the IMAP connections and reads.
+- the IMAP connections and reads;
+- for each shard, the users whose index it holds (**imap_users_held**), its appends to the users' journals (**imap_journal_writes**), its listings of a folder in the bucket (**imap_listings**), and the folds of a journal into its snapshot it began and those that another shard's fold came before (**imap_folds**, **imap_folds_lost**).

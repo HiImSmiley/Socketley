@@ -46,12 +46,12 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Carrying a directory into a storage
 
-rclone 1.60.1, 7 passes, 2026-11-03, socketley c7d4c42b.
+rclone 1.60.1, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | rclone | socketley vs rclone |
 |---|---|---|---|
-| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 7.1 K files/s (0.17 cores) | 3.5 K files/s (1.48 cores) | 2.01× (1.95–2.08) |
-| 1000 files changed after it | 4.1 K files/s (0.21 cores) | 2.9 K files/s (1.67 cores) | 1.39× (1.35–1.51) |
+| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 7.1 K files/s (0.17 cores) | 3.5 K files/s (1.50 cores) | 2.01× (1.87–2.16) |
+| 1000 files changed after it | 4.1 K files/s (0.25 cores) | 2.9 K files/s (1.67 cores) | 1.42× (1.37–1.50) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the target storage runtime in a daemon of its own on four others. The same socketley storage runtime is the target for both, on tmpfs. rclone is the 1.60 Ubuntu packages (default four transfers); a socketley sync job is one runtime that keeps watching the directory and carries a change when inotify reports it, where rclone walks both sides again. A job's end is read off its figures, which refresh every 250 ms, so each run is made several seconds long.
 

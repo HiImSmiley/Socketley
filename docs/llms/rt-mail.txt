@@ -164,7 +164,22 @@ Every flag a mail runtime takes, by group.
 
 ## Benchmarks
 
-No benchmark. Postfix and Dovecot start their master processes as root, which the measuring machine does not give; not measured.
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### Mail: delivery in, IMAP and POP3 out
+
+Postfix 3.10.6 + Dovecot 2.4.2, 7 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | Postfix 3.10.6 + Dovecot | socketley vs Postfix 3.10.6 + Dovecot |
+|---|---|---|---|
+| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 379.0 msg/s (0.10 cores) | 108.0 msg/s (0.26 cores) | 3.44× (2.71–3.66) |
+| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 209.0 msg/s (0.16 cores) | 57.4 msg/s (0.16 cores) | 3.64× (2.89–4.05) |
+| IMAP: LOGIN and LOGOUT, 8 clients | 127.0 sign-ins/s (0.99 cores) | 64.4 sign-ins/s (1.00 cores) | 1.96× (1.95–1.98) |
+| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 490 K msg/s (0.99 cores) | 125 K msg/s (1.00 cores) | 3.91× (3.88–4.03) |
+| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 19 K msg/s (0.99 cores) | 14 K msg/s (0.99 cores) | 1.41× (1.26–1.47) |
+| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 12 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.72× (1.69–1.81) |
+
+How it was measured: smtp-source (64 processes x 1 connections); mailload.py (8 asyncio processes x 1 connection), 8 s a run; every process of each on the same one core (socketley's daemon, idp, storage and mail; Postfix and Dovecot); smtp-source and mailload on 20 others; data on the VM's ext4 disk. Postfix hands each message over LMTP to Dovecot's Maildir and index; socketley's mail runtime writes it into its storage runtime. Both sync to disk (about 4 ms a sync here) before a message counts, so the SMTP rows are bound by syncs, not cores, and are timed until the last message is in its mailbox. Every sign-in hashes the password: scrypt in socketley, yescrypt in Dovecot. Dovecot 2.4's lmtp_user_concurrency_limit is set to unlimited, 2.3's default, since 10 made Postfix wait out five-minute retries.
 
 ## In the manual
 

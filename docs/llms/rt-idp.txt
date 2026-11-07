@@ -65,14 +65,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### OpenID Connect provider
 
-Keycloak 26.8.1, 7 passes, 2026-11-03, socketley 396cc846.
+Keycloak 26.8.1, 7 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 260.0 req/s (3.99 cores) | 188.0 req/s (3.92 cores) | 1.35× (1.32–1.72) |
-| refresh token, 64 clients | 48 K req/s (2.48 cores) | 2.4 K req/s (3.88 cores) | 19.94× (19.13–20.38) |
-| userinfo, 64 clients | 168 K req/s (2.44 cores) | 20 K req/s (3.91 cores) | 8.33× (8.27–8.97) |
-| JWKS, 64 clients | 172 K req/s (2.21 cores) | 28 K req/s (3.90 cores) | 6.05× (5.98–6.43) |
+| sign-in: authorization code with a password, 16 clients | 255.0 req/s (3.99 cores) | 190.0 req/s (3.93 cores) | 1.35× (1.25–1.73) |
+| refresh token, 64 clients | 51 K req/s (2.64 cores) | 2.4 K req/s (3.88 cores) | 21.08× (20.55–22.36) |
+| userinfo, 64 clients | 173 K req/s (2.50 cores) | 19 K req/s (3.86 cores) | 9.01× (8.90–9.09) |
+| JWKS, 64 clients | 176 K req/s (2.24 cores) | 29 K req/s (3.89 cores) | 6.16× (6.07–6.44) |
 
 Caveat: a floor: the load generator ran out before socketley did.
 

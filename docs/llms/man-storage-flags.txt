@@ -1531,7 +1531,7 @@ Each write is synced before it is answered; this is the default. A put is answer
 
 #### `interval`
 
-The per-write syncs are skipped, and a thread syncs the filesystem periodically. The thread calls **syncfs** every **--fsync-interval** (default 1 second). A crash of the machine loses at most the writes of the last interval. The same box handles about 18,000 puts a second, or about 9,600 into a versioned bucket.
+The per-write syncs are skipped, and a thread syncs the filesystem periodically. The thread calls **syncfs** every **--fsync-interval** (default 1 second). Under **--shards** the thread runs in shard 0 alone, since one call covers the files of every shard. A crash of the machine loses at most the writes of the last interval. The same box handles about 18,000 puts a second, or about 9,600 into a versioned bucket.
 
 #### `never`
 
@@ -1539,7 +1539,7 @@ The syncs are skipped; only the kernel's own writeback and a stop put the writes
 
 Under **interval** and **never**, what a crash of the machine leaves behind depends on the filesystem. ext4 in its default data=ordered mode leaves an object either as it was or as it was written, never partly written. A start that finds a file whose header does not check out leaves the file unserved. On other filesystems, a file written in the last interval may hold zeros where its data was not yet written. Bucket creation and removal and the configuration documents are synced in every mode. Backups, and anything else that deletes its own copy once a put is answered, should use **always**.
 
-The cost of **always** depends on the disk. A drive with power-loss protection (most enterprise NVMe and SATA SSDs) answers a sync from its protected cache in microseconds, so the mode costs little there. A consumer or virtual disk answers a sync only once the data is on the medium. XFS writes less per sync than ext4. ext4's **fast_commit** feature (**tune2fs -O fast_commit**) shortens a sync after a small change. Concurrent puts already share the filesystem's journal commits, so **always** gains throughput with concurrency. Three alternatives were measured against it: one sync of the whole filesystem shared by every waiting put, files written ahead of time and overwritten, and **O_DSYNC** writes. None did better under a sustained load of small puts. **stats** counts the syncs that ran in **fsyncs**, those a mode skipped in **fsyncs_skipped**, and the filesystem syncs of **interval** in **syncfs_rounds** and **syncfs_failed**; a stop after a failed round is not a clean one.
+The cost of **always** depends on the disk. A drive with power-loss protection (most enterprise NVMe and SATA SSDs) answers a sync from its protected cache in microseconds, so the mode costs little there. A consumer or virtual disk answers a sync only once the data is on the medium. XFS writes less per sync than ext4. ext4's **fast_commit** feature (**tune2fs -O fast_commit**) shortens a sync after a small change. Concurrent puts already share the filesystem's journal commits, so **always** gains throughput with concurrency. Three alternatives were measured against it: one sync of the whole filesystem shared by every waiting put, files written ahead of time and overwritten, and **O_DSYNC** writes. None did better under a sustained load of small puts. **stats** counts the syncs that ran in **fsyncs**, those a mode skipped in **fsyncs_skipped**, and the filesystem syncs of **interval** in **syncfs_rounds** and **syncfs_failed** (counted by shard 0); a stop after a failed round is not a clean one.
 
 ## Sharding
 

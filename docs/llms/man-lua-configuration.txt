@@ -120,6 +120,7 @@ eviction                   --eviction
 resp (bool)                --resp
 replicate                  --replicate
 cluster (bool)             --cluster
+no_cluster (bool)          --no-cluster
 ```
 
 Every other flag of a type has a key of the same name, without the leading dashes and with each hyphen turned into an underscore: **--mail-domain** is **mail_domain**, **--submission** is **submission**, and **--queue-lifetime** is **queue_lifetime**. A list key takes a table, or one string for a list of one. A key that no flag of the type has is refused by name, not silently dropped. A value of the wrong shape is refused the same way. So is a value that contains a tab, because the daemon's command line splits on tabs. A password containing a tab would arrive as two arguments. A space stays inside its value, as it does inside a quoted argument on the command line.
@@ -322,7 +323,7 @@ Decide, in an mqtt runtime, which publishes and subscriptions pass. In that runt
 
 #### `on_send(msg)`
 
-Called when a message is sent.
+Called when a message is sent. Under **--shards**, it is called on each shard that sends the message to its own clients, so a broadcast that reaches the siblings, like a **send** from the command line, calls it once per shard.
 
 #### `on_route(method, path, backend_path)`
 

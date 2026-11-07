@@ -297,6 +297,8 @@ Print the daemon's own figures as *key***:***value* lines, the same format that 
 
 **fast_lo_tainted_bound**, **_unanswered**, **_budget** and **_peer_off** count taints by reason, in that order: the peer really held the per-pair bound; no answer came before twice the bound; the global budget was reached; the peer was not on the shortcut (it received over TCP before it could enter, or it had closed). **fast_lo_held_bytes** is the unread redirected backlog summed across pairs. The global budget (**fast_lo_budget_bytes**) is compared against it. For a pair below 64 KiB it is an upper bound. **fast_lo_over_budget** is 1 while new sends are being tainted because of the budget.
 
+**requests_overloaded_queue** and the other **requests_overloaded_** lines count the requests the daemon's own request channel answered **overloaded**, by the bound that refused them, as a runtime's **stats** does for its own (see **Between runtimes on one machine**).
+
 The metrics endpoint exports the same figures as **socketley_fast_lo_info{mode}**, **socketley_fast_lo_sockets{path}**, **socketley_fast_lo_entered_total**, **socketley_fast_lo_tainted_total{reason}**, **socketley_fast_lo_held_bytes**, **socketley_fast_lo_budget_bytes**, **socketley_fast_lo_pair_limit_bytes** and **socketley_fast_lo_over_budget**. The counting costs one atomic add per entered socket and per taint, never one per send.
 
 ```

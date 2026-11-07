@@ -134,7 +134,8 @@ Every flag of every runtime type, with the types that take it.
 | `--resp` |  | Redis protocol only: Speak RESP to every client, without detecting it. Types: cache. |
 | `--replicate` | text | Follow: The leader cache it follows, host:port. Types: cache. |
 | `--public` |  | Public: Serve clients on other machines too. Types: cache. |
-| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard. Types: cache. |
+| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard (the default above one shard). Types: cache. |
+| `--no-cluster` |  | No cluster map: Keep the shards on the one port: no per-shard ports, no slot map. Types: cache. |
 
 **Storage**
 

@@ -117,7 +117,7 @@ TLS, three concurrent     1,250 MB
 
 The memory is twice the file because the file is read into memory and the response is then assembled around it. The same doubling was recorded for a 400 MiB .html, where it came to 1219 MiB. The memory is held for the whole request, and the client decides how many such requests there are. Ten concurrent 256 MB requests would take about 5 GB.
 
-**--http-cache** limits the multiplication but not the size. It holds each file once and shares it, so concurrency stops mattering. The cost is that it holds the file permanently from startup. A 64 MB file was measured at 154 MB, which is the file plus the two prebuilt responses. Otherwise, keep the files a TLS listener serves small, or put a plaintext listener behind something else that terminates TLS.
+**--http-cache** limits the multiplication but not the size. A shard holds each file once and shares it among its requests, so concurrency stops mattering. The cost is that it holds the file permanently from startup. With **--shards**, each shard reads the directory and holds its own copy, so the files are held once per shard: a 64 MB file put 64 MB on each of four shards (81 MB each, against 17 MB without the cache), 256 MB in all. Otherwise, keep the files a TLS listener serves small, or put a plaintext listener behind something else that terminates TLS.
 
 The fix would be a read path that works in bounded pieces, as the request side does with **on_http_body**, instead of one allocation the size of whatever was requested. That change touches the most intricate function in this path and has not been made.
 
@@ -142,7 +142,7 @@ Outside those two cases, a file that is not kept is not read either: it goes fro
 
 ### `--http-cache`
 
-With --http, read all files into memory at startup instead of checking the filesystem on each request. This is faster for production; the difference from plain **--http** is one **statx**(2) per request. The cache is rebuilt on **reload-lua** and at no other time. A file edited on disk is therefore **not** picked up. That is both the reason to use this flag and the reason not to.
+With --http, read all files into memory at startup instead of checking the filesystem on each request. This is faster for production; the difference from plain **--http** is one **statx**(2) per request. The cache is built when the runtime starts and at no other time, not on **reload-lua**. A file edited on disk is therefore **not** picked up until a restart. That is both the reason to use this flag and the reason not to. Each shard builds and holds its own copy, so the memory is the directory's size times **--shards**.
 
 ### `--no-inject`
 

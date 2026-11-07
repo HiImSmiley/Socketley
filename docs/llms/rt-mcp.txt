@@ -82,7 +82,20 @@ Every flag a mcp runtime takes, by group.
 
 ## Benchmarks
 
-No benchmark. No MCP server is established enough to measure against on equal terms.
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### MCP server over Streamable HTTP
+
+MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 9 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
+|---|---|---|---|---|---|
+| initialize + tools/list, a new session each, 64 at once | 69 K req/s (0.97 cores) | 1.2 K req/s (1.00 cores) | 1.7 K req/s (1.00 cores) | 59.16× (58.11–59.90) | 40.67× (39.88–42.23) |
+| tools/call add(a, b), 64 sessions | 135 K req/s (0.99 cores) | 5.3 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 25.64× (24.86–26.09) | 19.05× (18.32–19.32) |
+| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.91 cores) | 5.3 K req/s (1.00 cores) | 6.8 K req/s (1.00 cores) | 10.29× (10.11–10.67) | 8.03× (7.98–8.25) |
+| resources/read, 1 KiB of text, 64 sessions | 151 K req/s (0.96 cores) | 5.4 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.14× (25.58–28.81) | 20.47× (19.89–20.83) |
+
+How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 6s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
 
 ## In the manual
 

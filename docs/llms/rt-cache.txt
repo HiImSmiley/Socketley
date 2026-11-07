@@ -95,7 +95,8 @@ Every flag a cache runtime takes, by group.
 | `--resp` |  | Redis protocol only: Speak RESP to every client, without detecting it. |
 | `--replicate` | text | Follow: The leader cache it follows, host:port. |
 | `--public` |  | Public: Serve clients on other machines too. |
-| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard. |
+| `--cluster` |  | Cluster map: Publish a slot map so cluster clients go straight to each shard (the default above one shard). |
+| `--no-cluster` |  | No cluster map: Keep the shards on the one port: no per-shard ports, no slot map. |
 
 ## Benchmarks
 
@@ -103,49 +104,81 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Redis protocol, one command per round trip
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 232 K /s (1.00 cores) | 203 K /s (1.00 cores) | 208 K /s (1.00 cores) | 1.08× (0.89–2.03) | 1.11× (0.86–2.00) |
-| GET | 235 K /s (1.00 cores) | 206 K /s (1.00 cores) | 149 K /s (1.00 cores) | 1.03× (0.92–1.55) | 1.59× (0.97–2.15) |
-| LPUSH | 230 K /s (1.00 cores) | 220 K /s (1.00 cores) | 240 K /s (1.00 cores) | 1.11× (0.91–2.08) | 0.96× (0.85–2.06) |
-| LPOP | 237 K /s (1.00 cores) | 234 K /s (1.00 cores) | 241 K /s (1.00 cores) | 1.03× (0.92–1.75) | 1.01× (0.94–1.57) |
-| SADD | 237 K /s (1.00 cores) | 188 K /s (1.00 cores) | 180 K /s (1.00 cores) | 1.25× (0.87–2.02) | 1.35× (1.05–2.13) |
-| HSET | 229 K /s (1.00 cores) | 203 K /s (1.00 cores) | 228 K /s (1.00 cores) | 1.10× (0.84–1.69) | 0.99× (0.92–2.07) |
-| ZADD | 234 K /s (1.00 cores) | 174 K /s (1.00 cores) | 209 K /s (1.00 cores) | 1.39× (0.89–1.93) | 1.18× (0.90–2.27) |
+| SET | 239 K /s (1.00 cores) | 224 K /s (1.00 cores) | 176 K /s (1.00 cores) | 1.13× (0.95–1.76) | 1.34× (1.05–1.73) |
+| GET | 246 K /s (1.00 cores) | 206 K /s (1.00 cores) | 206 K /s (1.00 cores) | 1.11× (0.95–2.04) | 1.17× (0.90–1.72) |
+| LPUSH | 240 K /s (1.00 cores) | 226 K /s (1.00 cores) | 227 K /s (1.00 cores) | 1.06× (0.80–1.98) | 1.02× (0.90–1.67) |
+| LPOP | 236 K /s (1.00 cores) | 185 K /s (1.00 cores) | 225 K /s (1.00 cores) | 1.30× (0.85–1.78) | 1.08× (0.95–2.24) |
+| SADD | 239 K /s (1.00 cores) | 180 K /s (1.00 cores) | 203 K /s (1.00 cores) | 1.38× (0.89–1.70) | 1.18× (0.91–2.01) |
+| HSET | 238 K /s (1.00 cores) | 168 K /s (1.00 cores) | 224 K /s (1.00 cores) | 1.39× (0.94–1.94) | 1.03× (0.89–1.94) |
+| ZADD | 176 K /s (1.00 cores) | 155 K /s (1.00 cores) | 141 K /s (1.00 cores) | 1.14× (0.95–1.86) | 1.23× (1.00–1.50) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. SET and GET draw their keys at random from about a million, as a cache's clients spread them. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
 
 ### Redis protocol, 100 commands per message (pipelined)
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 11.14 M /s (1.00 cores) | 4.89 M /s (1.00 cores) | 2.85 M /s (1.00 cores) | 2.27× (2.17–2.64) | 3.91× (3.74–4.11) |
-| GET | 11.68 M /s (1.00 cores) | 5.36 M /s (1.00 cores) | 3.96 M /s (1.00 cores) | 2.22× (1.96–2.57) | 3.00× (2.76–3.61) |
-| LPUSH | 9.28 M /s (1.00 cores) | 4.45 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.08× (2.00–2.32) | 3.07× (3.03–3.29) |
-| LPOP | 10.56 M /s (1.00 cores) | 3.68 M /s (1.00 cores) | 2.69 M /s (1.00 cores) | 2.87× (2.66–3.26) | 3.91× (3.72–4.20) |
-| SADD | 11.42 M /s (1.00 cores) | 5.05 M /s (1.00 cores) | 3.47 M /s (1.00 cores) | 2.31× (2.06–2.76) | 3.27× (3.03–3.68) |
-| HSET | 9.96 M /s (1.00 cores) | 4.13 M /s (1.00 cores) | 2.86 M /s (1.00 cores) | 2.37× (2.09–2.86) | 3.48× (3.19–3.84) |
-| ZADD | 9.60 M /s (1.00 cores) | 3.84 M /s (1.00 cores) | 2.73 M /s (1.00 cores) | 2.38× (2.15–2.88) | 3.44× (3.18–3.69) |
+| SET | 8.29 M /s (1.00 cores) | 2.20 M /s (1.00 cores) | 2.60 M /s (1.00 cores) | 3.77× (3.71–3.85) | 3.18× (3.15–3.26) |
+| GET | 8.59 M /s (1.00 cores) | 2.39 M /s (1.00 cores) | 3.59 M /s (1.00 cores) | 3.59× (3.44–3.66) | 2.40× (2.28–3.02) |
+| SADD | 4.73 M /s (1.00 cores) | 2.60 M /s (1.00 cores) | 2.35 M /s (1.00 cores) | 1.79× (1.74–1.86) | 2.01× (1.89–2.10) |
+| HSET | 3.87 M /s (1.00 cores) | 2.03 M /s (1.00 cores) | 1.96 M /s (1.00 cores) | 1.88× (1.83–1.99) | 1.96× (1.86–2.07) |
+| ZADD | 561 K /s (1.00 cores) | 434 K /s (1.00 cores) | 439 K /s (1.00 cores) | 1.28× (1.19–1.32) | 1.26× (1.18–1.29) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. One key, the easy case for every cache.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. SET and GET draw their keys at random from about a million, more than a core's caches hold, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
 
-### Pipelined, keys drawn from 100,000
+### Pipelined, one key
 
-Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-03, socketley c7d4c42b.
+Redis 8.0.5, Valkey 9.0.4, 11 passes, 2026-11-07, socketley 14fae8c3.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 9.71 M /s (1.00 cores) | 3.95 M /s (1.00 cores) | 2.77 M /s (1.00 cores) | 2.46× (2.30–3.00) | 3.51× (3.41–3.56) |
-| GET | 10.01 M /s (1.00 cores) | 4.64 M /s (1.00 cores) | 3.84 M /s (1.00 cores) | 2.18× (2.10–2.56) | 2.60× (2.56–2.75) |
-| SADD | 8.97 M /s (1.00 cores) | 4.34 M /s (1.00 cores) | 3.24 M /s (1.00 cores) | 2.04× (1.99–2.50) | 2.77× (2.73–2.83) |
-| HSET | 6.48 M /s (1.00 cores) | 3.54 M /s (1.00 cores) | 2.57 M /s (1.00 cores) | 1.82× (1.73–2.02) | 2.56× (2.41–2.63) |
-| ZADD | 1.56 M /s (1.00 cores) | 1.23 M /s (1.00 cores) | 1.13 M /s (1.00 cores) | 1.26× (1.24–1.28) | 1.38× (1.35–1.40) |
+| SET | 11.55 M /s (1.00 cores) | 4.73 M /s (1.00 cores) | 2.86 M /s (1.00 cores) | 2.46× (2.26–2.99) | 4.00× (3.84–4.12) |
+| GET | 12.12 M /s (1.00 cores) | 5.68 M /s (1.00 cores) | 3.92 M /s (1.00 cores) | 2.05× (1.90–2.56) | 3.00× (2.61–3.50) |
+| LPUSH | 9.41 M /s (1.00 cores) | 4.28 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.21× (1.98–2.44) | 3.11× (3.05–3.21) |
+| LPOP | 11.00 M /s (1.00 cores) | 3.88 M /s (1.00 cores) | 2.74 M /s (1.00 cores) | 2.83× (2.65–3.37) | 4.03× (3.90–4.19) |
+| SADD | 11.49 M /s (1.00 cores) | 5.26 M /s (1.00 cores) | 3.49 M /s (1.00 cores) | 2.25× (2.02–2.66) | 3.30× (3.15–3.73) |
+| HSET | 9.12 M /s (1.00 cores) | 3.95 M /s (1.00 cores) | 2.70 M /s (1.00 cores) | 2.31× (2.23–2.66) | 3.44× (3.07–3.61) |
+| ZADD | 9.62 M /s (1.00 cores) | 3.85 M /s (1.00 cores) | 2.87 M /s (1.00 cores) | 2.51× (2.35–3.03) | 3.35× (3.28–3.50) |
 
-How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The keyspace no longer fits the caches, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
+How it was measured: 6 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The same commands on one key, which stays in the core's cache: the easy case for every cache, kept to show parsing and executing alone.
+
+### Four cores, a cluster-aware client
+
+Redis Cluster 8.0.5, 4 masters, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | Redis Cluster 8.0.5, 4 masters | socketley vs Redis Cluster 8.0.5, 4 masters |
+|---|---|---|---|
+| SET | 28.09 M /s (3.95 cores) | 12.28 M /s (3.97 cores) | 2.29× (2.29–2.32) |
+| GET | 29.00 M /s (3.97 cores) | 14.00 M /s (3.97 cores) | 2.07× (2.04–2.11) |
+| LPUSH | 28.52 M /s (3.92 cores) | 13.76 M /s (3.97 cores) | 2.07× (2.00–2.15) |
+| LPOP | 30.72 M /s (3.86 cores) | 11.91 M /s (3.96 cores) | 2.58× (2.54–2.68) |
+| SADD | 34.58 M /s (3.92 cores) | 16.98 M /s (3.94 cores) | 2.04× (2.03–2.08) |
+| HSET | 31.54 M /s (3.98 cores) | 13.76 M /s (3.94 cores) | 2.29× (2.25–2.29) |
+| ZADD | 30.96 M /s (3.97 cores) | 11.74 M /s (3.98 cores) | 2.64× (2.60–2.68) |
+
+How it was measured: 5 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards and Redis Cluster as four masters, each shard or master pinned to one of the same four cores; five redis-benchmark --cluster processes on 20 others. SET and GET draw their keys at random from 1,048,576, 64 behind each of the 16,384 slot tags, preloaded so every GET finds its key (the hit rate is counted every pass). Every shard's mesh counters are read around every timed run: no command crossed between shards in any pass, so the client sent each to its owner. redis-benchmark --cluster's threads spin while they wait, so its client cores are no reading of headroom.
+
+### Four cores, a plain client at one address
+
+Valkey 9.0.4, --io-threads 4, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | Valkey 9.0.4, --io-threads | socketley vs Valkey 9.0.4, --io-threads |
+|---|---|---|---|
+| SET | 11.57 M /s (3.92 cores) | 3.48 M /s (3.99 cores) | 3.33× (3.29–3.34) |
+| GET | 12.04 M /s (3.91 cores) | 5.03 M /s (3.99 cores) | 2.39× (2.35–2.42) |
+| LPUSH | 8.36 M /s (1.00 cores) | 4.74 M /s (4.00 cores) | 1.77× (1.68–1.80) |
+| LPOP | 9.84 M /s (1.00 cores) | 3.56 M /s (3.99 cores) | 2.76× (2.75–2.81) |
+| SADD | 10.54 M /s (1.00 cores) | 6.31 M /s (3.99 cores) | 1.67× (1.65–1.70) |
+| HSET | 9.21 M /s (1.00 cores) | 5.06 M /s (3.99 cores) | 1.81× (1.77–1.85) |
+| ZADD | 8.99 M /s (1.00 cores) | 4.77 M /s (4.00 cores) | 1.89× (1.86–1.91) |
+
+How it was measured: 5 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards on one port and Valkey with four I/O threads, on the same four cores; five redis-benchmark processes on 20 others. SET and GET draw their keys at random from 1,048,576, three in four of them owned by another shard than the one a connection landed on: socketley carries those over its shard mesh, many commands a frame. LPUSH to ZADD name one key, which one shard owns, so socketley runs those on one of its four cores (see the cores column) and Valkey on its four I/O threads.
 
 ## In the manual
 

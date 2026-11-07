@@ -30,7 +30,7 @@ Object.assign(P, {
 
 const RT = [
   ['server', 'TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path', 'nginx'],
-  ['web', 'Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in', ''],
+  ['web', 'Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in', 'nginx'],
   ['client', 'Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting', ''],
   ['proxy', 'HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI', 'HAProxy, nginx'],
   ['cache', 'In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub', 'Redis, Valkey'],
@@ -38,20 +38,17 @@ const RT = [
   ['db', 'JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups', 'MongoDB, PocketBase'],
   ['dns', 'Authoritative name server for its zones, over UDP and TCP, with DNSSEC and transfers', 'NSD, Knot'],
   ['idp', 'OpenID Connect provider with its own accounts, second factors, app passwords and SSH certificates', 'Keycloak'],
-  ['mail', 'Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage', ''],
+  ['mail', 'Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage', 'Postfix and Dovecot'],
   ['mqtt', 'MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules', 'Mosquitto'],
   ['metrics', 'Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs', 'Prometheus, VictoriaMetrics'],
   ['sync', 'One job that carries a directory to a storage, from it, or both ways', 'rclone'],
   ['tunnel', 'Makes a machine without an address of its own reachable through an edge it dials', 'frp'],
-  ['mcp', 'A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients', ''],
+  ['mcp', 'A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients', 'the MCP Python and TypeScript SDKs'],
 ];
 const RTI = Object.fromEntries(RT.map(r => [r[0], r]));
 // Why a runtime has no comparison on the benchmarks page.
 const NOBENCH = {
   client: 'A client runtime holds one connection to somebody else\'s server; there is no other program doing that to set beside it.',
-  mail: 'Postfix and Dovecot start their master processes as root, which the measuring machine does not give; not measured.',
-  web: 'Not measured on the current build yet.',
-  mcp: 'No MCP server is established enough to measure against on equal terms.',
 };
 
 const NAV = [
