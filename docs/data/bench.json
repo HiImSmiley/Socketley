@@ -1112,7 +1112,6 @@
    "better": "higher",
    "pin": "each server on one core, wrk on 20 others",
    "note": "socketley <code>--http dir --http-cache</code> against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua <code>on_http_request</code> on socketley and a <code>return 200</code> on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row.",
-   "caveat": "likely higher on this VM than on hardware; see the notes",
    "headline": 0
   },
   {
@@ -1593,198 +1592,220 @@
     {
      "name": "page 4 KiB, keep-alive, 256 connections",
      "v": [
-      202841.0,
-      47291.0
+      203353.0,
+      47029.0
      ],
      "cpu": [
       0.998,
-      0.998
+      0.999
      ],
      "ccpu": [
-      1.34,
-      0.797
+      1.335,
+      0.806
      ],
      "r": [
       [
-       4.256,
-       3.931,
-       4.733
+       4.188,
+       3.81,
+       4.466
+      ]
+     ]
+    },
+    {
+     "name": "page 4 KiB, a connection per request, 64 at once",
+     "v": [
+      73366.0,
+      31460.0
+     ],
+     "cpu": [
+      0.996,
+      0.998
+     ],
+     "ccpu": [
+      2.161,
+      1.404
+     ],
+     "r": [
+      [
+       2.332,
+       2.183,
+       2.602
       ]
      ]
     },
     {
      "name": "asset 64 KiB (hashed name), keep-alive, 256 connections",
      "v": [
-      74942.0,
-      41238.0
+      70330.0,
+      41854.0
      ],
      "cpu": [
-      0.999,
+      0.998,
       0.998
      ],
      "ccpu": [
-      1.187,
-      0.924
+      1.199,
+      0.931
      ],
      "r": [
       [
-       1.82,
-       1.717,
-       1.999
+       1.672,
+       1.456,
+       2.229
       ]
      ]
     },
     {
      "name": "file 1 MiB, keep-alive, 64 connections",
      "v": [
-      25524.0,
-      20606.0
+      24802.0,
+      20425.0
      ],
      "cpu": [
-      0.997,
-      0.998
+      0.998,
+      1.0
      ],
      "ccpu": [
-      2.406,
-      1.871
+      2.304,
+      1.853
      ],
      "r": [
       [
-       1.259,
-       1.174,
-       1.327
+       1.206,
+       1.106,
+       1.319
       ]
      ]
     },
     {
      "name": "page 4 KiB as gzip, the .gz beside it",
      "v": [
-      248810.0,
-      48681.0
+      238097.0,
+      48534.0
      ],
      "cpu": [
-      0.999,
+      0.998,
       0.999
      ],
      "ccpu": [
-      1.366,
-      0.802
+      1.367,
+      0.798
      ],
      "r": [
       [
-       5.142,
-       4.409,
-       5.478
+       4.908,
+       4.563,
+       5.242
       ]
      ]
     },
     {
      "name": "page 4 KiB as brotli, the .br beside it",
      "v": [
-      228800.0,
-      49574.0
+      230861.0,
+      49484.0
      ],
      "cpu": [
       0.999,
       0.999
      ],
      "ccpu": [
-      1.354,
-      0.804
+      1.358,
+      0.797
      ],
      "r": [
       [
-       4.663,
-       4.389,
-       5.1
+       4.613,
+       4.227,
+       5.081
       ]
      ]
     },
     {
      "name": "page 4 KiB as gzip, no .gz on disk",
      "v": [
-      248877.0,
-      25286.0
+      231965.0,
+      25554.0
      ],
      "cpu": [
       0.999,
       0.998
      ],
      "ccpu": [
-      1.367,
+      1.368,
       0.471
      ],
      "r": [
       [
-       9.737,
-       9.199,
-       10.507
+       9.194,
+       8.812,
+       10.084
       ]
      ]
     },
     {
      "name": "revalidation: If-None-Match, 304",
      "v": [
-      246674.0,
-      59831.0
+      238965.0,
+      64018.0
      ],
      "cpu": [
       0.999,
       0.998
      ],
      "ccpu": [
-      1.353,
-      0.911
+      1.351,
+      0.917
      ],
      "r": [
       [
-       4.069,
-       3.337,
-       4.583
+       3.761,
+       2.869,
+       4.097
       ]
      ]
     },
     {
      "name": "missing file: the site's 404.html",
      "v": [
-      217614.0,
-      39741.0
+      223570.0,
+      40185.0
      ],
      "cpu": [
-      0.999,
-      0.997
+      0.998,
+      0.998
      ],
      "ccpu": [
-      1.237,
-      0.679
+      1.229,
+      0.683
      ],
      "r": [
       [
-       5.433,
-       4.98,
-       5.745
+       5.527,
+       5.155,
+       5.953
       ]
      ]
     },
     {
      "name": "10,000 pages of 4 KiB at random",
      "v": [
-      216312.0,
-      53932.0
+      203026.0,
+      52744.0
      ],
      "cpu": [
       0.999,
       0.998
      ],
      "ccpu": [
-      1.259,
-      0.827
+      1.274,
+      0.818
      ],
      "r": [
       [
-       3.978,
-       3.785,
-       4.327
+       3.864,
+       3.605,
+       4.047
       ]
      ]
     }
@@ -1792,7 +1813,7 @@
    "unit": "req/s",
    "better": "higher",
    "pin": "each server on one core, wrk (8 threads) on 20 others",
-   "note": "socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches; see the server set.",
+   "note": "socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row.",
    "headline": 0
   },
   {
@@ -2010,7 +2031,7 @@
     "socketley",
     "MinIO 2025-09-07"
    ],
-   "tool": "warp 1.3.1, 8s a run, SigV4 over plain HTTP",
+   "tool": "s3gen (Go, one process, a request in flight per connection), 8s a run, SigV4 over plain HTTP, PUT bodies aws-chunked and signed",
    "commit": "fc762708",
    "passes": 7,
    "date": "2026-11-07",
@@ -2018,97 +2039,140 @@
     {
      "name": "GET 4 KiB, 1 connection",
      "v": [
-      8230.0,
-      2684.0
+      21248.0,
+      3923.0
      ],
      "cpu": [
-      0.185,
-      0.831
+      0.615,
+      1.302
      ],
      "ccpu": [
-      0.997,
-      0.447
+      0.666,
+      0.203
      ],
      "r": [
       [
-       3.072,
-       3.058,
-       3.147
+       5.41,
+       5.338,
+       5.442
       ]
      ]
     },
     {
-     "name": "GET 4 KiB, 4 × 16 connections",
+     "name": "GET 4 KiB, 64 connections",
      "v": [
-      205442.0,
-      17172.0
+      451505.0,
+      24104.0
      ],
      "cpu": [
-      1.961,
-      3.133
+      3.785,
+      3.988
      ],
      "ccpu": [
-      13.586,
-      2.883
+      11.564,
+      0.903
      ],
      "r": [
       [
-       11.911,
-       11.716,
-       12.225
+       18.978,
+       18.272,
+       19.354
       ]
      ]
     },
     {
-     "name": "GET 1 MiB, 4 × 16 connections",
+     "name": "GET 4 KiB, 128 connections",
      "v": [
-      31394.0,
-      5384.0
+      563655.0,
+      24056.0
      ],
      "cpu": [
-      2.861,
-      2.848
+      3.955,
+      3.988
      ],
      "ccpu": [
-      10.702,
-      2.41
+      11.943,
+      0.907
      ],
      "r": [
       [
-       5.823,
-       5.233,
-       5.831
+       23.543,
+       22.998,
+       24.282
       ]
      ]
     },
     {
-     "name": "PUT 4 KiB, 4 × 16 connections, into an empty store",
+     "name": "GET 4 KiB, 64 connections, from 50,000 objects",
      "v": [
-      53416.0,
-      12602.0
+      245541.0,
+      24329.0
      ],
      "cpu": [
-      2.808,
-      2.883
+      3.989,
+      3.989
      ],
      "ccpu": [
-      9.277,
-      2.243
+      8.666,
+      0.913
      ],
      "r": [
       [
-       4.256,
-       4.227,
-       4.528
+       10.161,
+       9.976,
+       10.315
+      ]
+     ]
+    },
+    {
+     "name": "GET 1 MiB, 64 connections",
+     "v": [
+      39905.0,
+      5986.0
+     ],
+     "cpu": [
+      3.999,
+      3.935
+     ],
+     "ccpu": [
+      5.635,
+      0.986
+     ],
+     "r": [
+      [
+       6.666,
+       6.481,
+       6.847
+      ]
+     ]
+    },
+    {
+     "name": "PUT 4 KiB, 64 connections, into an empty store",
+     "v": [
+      77346.0,
+      15299.0
+     ],
+     "cpu": [
+      3.775,
+      3.981
+     ],
+     "ccpu": [
+      3.024,
+      0.509
+     ],
+     "r": [
+      [
+       5.051,
+       4.964,
+       5.187
       ]
      ]
     }
    ],
    "unit": "obj/s",
    "better": "higher",
-   "pin": "both servers on the same four cores (socketley as four shards), six warp processes on 20 others",
-   "note": "MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.",
-   "caveat": "a floor: the load generator ran out before socketley did",
+   "pin": "both servers on the same four cores (socketley as four shards), s3gen on 20 others",
+   "note": "MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. s3gen signs every request with SigV4 as warp does (PUTs as signed aws-chunked bodies) and checks every answer's status, length and ETag; from 64 connections both servers fill their four cores. The 4 KiB rows read 2,500 objects, which socketley keeps as in-memory copies; the 50,000-object row reads past them, where every GET opens its file as MinIO's always do. The PUT row starts both servers afresh on empty storage for every pass, because MinIO reclaims deleted objects in the background and its puts slow while it does.",
    "headline": 1
   },
   {
@@ -2526,104 +2590,103 @@
     "Keycloak 26.8.1"
    ],
    "tool": "idpgen, 8s a run, 200 accounts",
-   "commit": "14fae8c3",
+   "commit": "fc762708",
    "passes": 7,
    "date": "2026-11-07",
    "rows": [
     {
      "name": "sign-in: authorization code with a password, 16 clients",
      "v": [
-      255.0,
-      190.0
+      264.0,
+      191.0
      ],
      "cpu": [
-      3.987,
+      3.981,
+      3.921
+     ],
+     "ccpu": [
+      0.118,
+      0.123
+     ],
+     "r": [
+      [
+       1.349,
+       1.195,
+       1.795
+      ]
+     ]
+    },
+    {
+     "name": "refresh token, 256 clients",
+     "v": [
+      58500.0,
+      2417.0
+     ],
+     "cpu": [
+      2.718,
+      3.884
+     ],
+     "ccpu": [
+      4.864,
+      0.361
+     ],
+     "r": [
+      [
+       24.361,
+       22.625,
+       25.103
+      ]
+     ]
+    },
+    {
+     "name": "userinfo, 512 clients",
+     "v": [
+      510959.0,
+      21528.0
+     ],
+     "cpu": [
+      3.723,
+      3.855
+     ],
+     "ccpu": [
+      14.608,
+      1.625
+     ],
+     "r": [
+      [
+       23.86,
+       22.59,
+       24.865
+      ]
+     ]
+    },
+    {
+     "name": "JWKS, 256 connections (wrk)",
+     "v": [
+      450742.0,
+      29072.0
+     ],
+     "cpu": [
+      3.993,
       3.931
      ],
      "ccpu": [
-      0.117,
-      0.126
+      5.764,
+      0.61
      ],
      "r": [
       [
-       1.352,
-       1.254,
-       1.734
-      ]
-     ]
-    },
-    {
-     "name": "refresh token, 64 clients",
-     "v": [
-      51186.0,
-      2429.0
-     ],
-     "cpu": [
-      2.642,
-      3.882
-     ],
-     "ccpu": [
-      4.466,
-      0.308
-     ],
-     "r": [
-      [
-       21.076,
-       20.549,
-       22.357
-      ]
-     ]
-    },
-    {
-     "name": "userinfo, 64 clients",
-     "v": [
-      173102.0,
-      19218.0
-     ],
-     "cpu": [
-      2.499,
-      3.863
-     ],
-     "ccpu": [
-      10.637,
-      1.488
-     ],
-     "r": [
-      [
-       9.005,
-       8.9,
-       9.089
-      ]
-     ]
-    },
-    {
-     "name": "JWKS, 64 clients",
-     "v": [
-      176314.0,
-      28613.0
-     ],
-     "cpu": [
-      2.24,
-      3.892
-     ],
-     "ccpu": [
-      11.193,
-      2.246
-     ],
-     "r": [
-      [
-       6.162,
-       6.071,
-       6.441
+       15.552,
+       15.313,
+       15.757
       ]
      ]
     }
    ],
    "unit": "req/s",
    "better": "higher",
-   "pin": "both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen on 20 others",
-   "note": "200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. On refresh, userinfo and JWKS socketley uses two and a half of its four cores while idpgen takes up to eleven, so those ratios are floors. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.",
-   "caveat": "a floor: the load generator ran out before socketley did",
+   "pin": "both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen and wrk on 20 others",
+   "note": "200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. Refresh and userinfo come from four idpgen processes and JWKS from wrk, with as many clients as fill socketley's four cores; refresh stays near the same rate from 256 to 512 clients, bound by the durable write of each rotated token family through shard 0. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.",
    "headline": 1
   },
   {

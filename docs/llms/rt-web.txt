@@ -75,17 +75,18 @@ nginx 1.28.3, 9 passes, 2026-11-07, socketley fc762708.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.26× (3.93–4.73) |
-| asset 64 KiB (hashed name), keep-alive, 256 connections | 75 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 1.82× (1.72–2.00) |
-| file 1 MiB, keep-alive, 64 connections | 26 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.26× (1.17–1.33) |
-| page 4 KiB as gzip, the .gz beside it | 249 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 5.14× (4.41–5.48) |
-| page 4 KiB as brotli, the .br beside it | 229 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 4.66× (4.39–5.10) |
-| page 4 KiB as gzip, no .gz on disk | 249 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 9.74× (9.20–10.51) |
-| revalidation: If-None-Match, 304 | 247 K req/s (1.00 cores) | 60 K req/s (1.00 cores) | 4.07× (3.34–4.58) |
-| missing file: the site's 404.html | 218 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.43× (4.98–5.75) |
-| 10,000 pages of 4 KiB at random | 216 K req/s (1.00 cores) | 54 K req/s (1.00 cores) | 3.98× (3.79–4.33) |
+| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.19× (3.81–4.47) |
+| page 4 KiB, a connection per request, 64 at once | 73 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 2.33× (2.18–2.60) |
+| asset 64 KiB (hashed name), keep-alive, 256 connections | 70 K req/s (1.00 cores) | 42 K req/s (1.00 cores) | 1.67× (1.46–2.23) |
+| file 1 MiB, keep-alive, 64 connections | 25 K req/s (1.00 cores) | 20 K req/s (1.00 cores) | 1.21× (1.11–1.32) |
+| page 4 KiB as gzip, the .gz beside it | 238 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.91× (4.56–5.24) |
+| page 4 KiB as brotli, the .br beside it | 231 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.61× (4.23–5.08) |
+| page 4 KiB as gzip, no .gz on disk | 232 K req/s (1.00 cores) | 26 K req/s (1.00 cores) | 9.19× (8.81–10.08) |
+| revalidation: If-None-Match, 304 | 239 K req/s (1.00 cores) | 64 K req/s (1.00 cores) | 3.76× (2.87–4.10) |
+| missing file: the site's 404.html | 224 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.53× (5.16–5.95) |
+| 10,000 pages of 4 KiB at random | 203 K req/s (1.00 cores) | 53 K req/s (1.00 cores) | 3.86× (3.60–4.05) |
 
-How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches; see the server set.
+How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row.
 
 ## In the manual
 

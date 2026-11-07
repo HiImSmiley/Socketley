@@ -65,18 +65,16 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### OpenID Connect provider
 
-Keycloak 26.8.1, 7 passes, 2026-11-07, socketley 14fae8c3.
+Keycloak 26.8.1, 7 passes, 2026-11-07, socketley fc762708.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 255.0 req/s (3.99 cores) | 190.0 req/s (3.93 cores) | 1.35× (1.25–1.73) |
-| refresh token, 64 clients | 51 K req/s (2.64 cores) | 2.4 K req/s (3.88 cores) | 21.08× (20.55–22.36) |
-| userinfo, 64 clients | 173 K req/s (2.50 cores) | 19 K req/s (3.86 cores) | 9.01× (8.90–9.09) |
-| JWKS, 64 clients | 176 K req/s (2.24 cores) | 29 K req/s (3.89 cores) | 6.16× (6.07–6.44) |
+| sign-in: authorization code with a password, 16 clients | 264.0 req/s (3.98 cores) | 191.0 req/s (3.92 cores) | 1.35× (1.20–1.79) |
+| refresh token, 256 clients | 58 K req/s (2.72 cores) | 2.4 K req/s (3.88 cores) | 24.36× (22.62–25.10) |
+| userinfo, 512 clients | 511 K req/s (3.72 cores) | 22 K req/s (3.85 cores) | 23.86× (22.59–24.86) |
+| JWKS, 256 connections (wrk) | 451 K req/s (3.99 cores) | 29 K req/s (3.93 cores) | 15.55× (15.31–15.76) |
 
-Caveat: a floor: the load generator ran out before socketley did.
-
-How it was measured: idpgen, 8s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. On refresh, userinfo and JWKS socketley uses two and a half of its four cores while idpgen takes up to eleven, so those ratios are floors. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.
+How it was measured: idpgen, 8s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen and wrk on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. Refresh and userinfo come from four idpgen processes and JWKS from wrk, with as many clients as fill socketley's four cores; refresh stays near the same rate from 256 to 512 clients, bound by the durable write of each rotated token family through shard 0. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.
 
 ## In the manual
 

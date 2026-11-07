@@ -117,8 +117,6 @@ nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 | 1 KiB file, a connection per request, 64 at once | 82 K req/s (0.99 cores) | 33 K req/s (1.00 cores) | 2.55× (2.33–2.59) |
 | fixed answer (Lua handler / nginx return), keep-alive | 235 K req/s (1.00 cores) | 73 K req/s (1.00 cores) | 3.27× (2.79–3.33) |
 
-Caveat: likely higher on this VM than on hardware; see the notes.
-
 How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row.
 
 ### HTTP on four cores

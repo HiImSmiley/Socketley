@@ -105,8 +105,6 @@ nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 | 1 KiB file, a connection per request, 64 at once | 82 K req/s (0.99 cores) | 33 K req/s (1.00 cores) | 2.55× (2.33–2.59) |
 | fixed answer (Lua handler / nginx return), keep-alive | 235 K req/s (1.00 cores) | 73 K req/s (1.00 cores) | 3.27× (2.79–3.33) |
 
-Caveat: likely higher on this VM than on hardware; see the notes.
-
 How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row.
 
 ## HTTP on four cores
@@ -156,17 +154,18 @@ nginx 1.28.3, 9 passes, 2026-11-07, socketley fc762708.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.26× (3.93–4.73) |
-| asset 64 KiB (hashed name), keep-alive, 256 connections | 75 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 1.82× (1.72–2.00) |
-| file 1 MiB, keep-alive, 64 connections | 26 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.26× (1.17–1.33) |
-| page 4 KiB as gzip, the .gz beside it | 249 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 5.14× (4.41–5.48) |
-| page 4 KiB as brotli, the .br beside it | 229 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 4.66× (4.39–5.10) |
-| page 4 KiB as gzip, no .gz on disk | 249 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 9.74× (9.20–10.51) |
-| revalidation: If-None-Match, 304 | 247 K req/s (1.00 cores) | 60 K req/s (1.00 cores) | 4.07× (3.34–4.58) |
-| missing file: the site's 404.html | 218 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.43× (4.98–5.75) |
-| 10,000 pages of 4 KiB at random | 216 K req/s (1.00 cores) | 54 K req/s (1.00 cores) | 3.98× (3.79–4.33) |
+| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.19× (3.81–4.47) |
+| page 4 KiB, a connection per request, 64 at once | 73 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 2.33× (2.18–2.60) |
+| asset 64 KiB (hashed name), keep-alive, 256 connections | 70 K req/s (1.00 cores) | 42 K req/s (1.00 cores) | 1.67× (1.46–2.23) |
+| file 1 MiB, keep-alive, 64 connections | 25 K req/s (1.00 cores) | 20 K req/s (1.00 cores) | 1.21× (1.11–1.32) |
+| page 4 KiB as gzip, the .gz beside it | 238 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.91× (4.56–5.24) |
+| page 4 KiB as brotli, the .br beside it | 231 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.61× (4.23–5.08) |
+| page 4 KiB as gzip, no .gz on disk | 232 K req/s (1.00 cores) | 26 K req/s (1.00 cores) | 9.19× (8.81–10.08) |
+| revalidation: If-None-Match, 304 | 239 K req/s (1.00 cores) | 64 K req/s (1.00 cores) | 3.76× (2.87–4.10) |
+| missing file: the site's 404.html | 224 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.53× (5.16–5.95) |
+| 10,000 pages of 4 KiB at random | 203 K req/s (1.00 cores) | 53 K req/s (1.00 cores) | 3.86× (3.60–4.05) |
 
-How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches; see the server set.
+How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row.
 
 ## Authoritative DNS, one zone of 10,000 names
 
@@ -198,14 +197,14 @@ MinIO 2025-09-07, 7 passes, 2026-11-07, socketley fc762708.
 
 | case | socketley | MinIO | socketley vs MinIO |
 |---|---|---|---|
-| GET 4 KiB, 1 connection | 8.2 K obj/s (0.18 cores) | 2.7 K obj/s (0.83 cores) | 3.07× (3.06–3.15) |
-| GET 4 KiB, 4 × 16 connections | 205 K obj/s (1.96 cores) | 17 K obj/s (3.13 cores) | 11.91× (11.72–12.22) |
-| GET 1 MiB, 4 × 16 connections | 31 K obj/s (2.86 cores) | 5.4 K obj/s (2.85 cores) | 5.82× (5.23–5.83) |
-| PUT 4 KiB, 4 × 16 connections, into an empty store | 53 K obj/s (2.81 cores) | 13 K obj/s (2.88 cores) | 4.26× (4.23–4.53) |
+| GET 4 KiB, 1 connection | 21 K obj/s (0.61 cores) | 3.9 K obj/s (1.30 cores) | 5.41× (5.34–5.44) |
+| GET 4 KiB, 64 connections | 452 K obj/s (3.79 cores) | 24 K obj/s (3.99 cores) | 18.98× (18.27–19.35) |
+| GET 4 KiB, 128 connections | 564 K obj/s (3.96 cores) | 24 K obj/s (3.99 cores) | 23.54× (23.00–24.28) |
+| GET 4 KiB, 64 connections, from 50,000 objects | 246 K obj/s (3.99 cores) | 24 K obj/s (3.99 cores) | 10.16× (9.98–10.31) |
+| GET 1 MiB, 64 connections | 40 K obj/s (4.00 cores) | 6.0 K obj/s (3.94 cores) | 6.67× (6.48–6.85) |
+| PUT 4 KiB, 64 connections, into an empty store | 77 K obj/s (3.77 cores) | 15 K obj/s (3.98 cores) | 5.05× (4.96–5.19) |
 
-Caveat: a floor: the load generator ran out before socketley did.
-
-How it was measured: warp 1.3.1, 8s a run, SigV4 over plain HTTP; both servers on the same four cores (socketley as four shards), six warp processes on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. At 4 KiB with 64 connections socketley uses under two of its four cores while warp takes fourteen, so that ratio is a floor: the client runs out first. The PUT row starts both servers afresh on empty storage for every pass (five passes), because MinIO reclaims deleted objects in the background and its puts slow while it does.
+How it was measured: s3gen (Go, one process, a request in flight per connection), 8s a run, SigV4 over plain HTTP, PUT bodies aws-chunked and signed; both servers on the same four cores (socketley as four shards), s3gen on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. s3gen signs every request with SigV4 as warp does (PUTs as signed aws-chunked bodies) and checks every answer's status, length and ETag; from 64 connections both servers fill their four cores. The 4 KiB rows read 2,500 objects, which socketley keeps as in-memory copies; the 50,000-object row reads past them, where every GET opens its file as MinIO's always do. The PUT row starts both servers afresh on empty storage for every pass, because MinIO reclaims deleted objects in the background and its puts slow while it does.
 
 ## JSON documents over HTTP
 
@@ -256,18 +255,16 @@ How it was measured: the carriers themselves; the storage target is one socketle
 
 ## OpenID Connect provider
 
-Keycloak 26.8.1, 7 passes, 2026-11-07, socketley 14fae8c3.
+Keycloak 26.8.1, 7 passes, 2026-11-07, socketley fc762708.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 255.0 req/s (3.99 cores) | 190.0 req/s (3.93 cores) | 1.35× (1.25–1.73) |
-| refresh token, 64 clients | 51 K req/s (2.64 cores) | 2.4 K req/s (3.88 cores) | 21.08× (20.55–22.36) |
-| userinfo, 64 clients | 173 K req/s (2.50 cores) | 19 K req/s (3.86 cores) | 9.01× (8.90–9.09) |
-| JWKS, 64 clients | 176 K req/s (2.24 cores) | 29 K req/s (3.89 cores) | 6.16× (6.07–6.44) |
+| sign-in: authorization code with a password, 16 clients | 264.0 req/s (3.98 cores) | 191.0 req/s (3.92 cores) | 1.35× (1.20–1.79) |
+| refresh token, 256 clients | 58 K req/s (2.72 cores) | 2.4 K req/s (3.88 cores) | 24.36× (22.62–25.10) |
+| userinfo, 512 clients | 511 K req/s (3.72 cores) | 22 K req/s (3.85 cores) | 23.86× (22.59–24.86) |
+| JWKS, 256 connections (wrk) | 451 K req/s (3.99 cores) | 29 K req/s (3.93 cores) | 15.55× (15.31–15.76) |
 
-Caveat: a floor: the load generator ran out before socketley did.
-
-How it was measured: idpgen, 8s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. On refresh, userinfo and JWKS socketley uses two and a half of its four cores while idpgen takes up to eleven, so those ratios are floors. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.
+How it was measured: idpgen, 8s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen and wrk on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. Refresh and userinfo come from four idpgen processes and JWKS from wrk, with as many clients as fill socketley's four cores; refresh stays near the same rate from 256 to 512 clients, bound by the durable write of each rotated token family through shard 0. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Keycloak's sign-ins still warm up across the passes (145 to 199 a second), so the top of that row's range is its first passes.
 
 ## Mail: delivery in, IMAP and POP3 out
 

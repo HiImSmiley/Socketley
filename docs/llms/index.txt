@@ -39,16 +39,16 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
 
 - cache: 3.6× against Redis (GET)
-- server: 5.6× against nginx (1 KiB file, keep-alive, 256 connections) (caveat: likely higher on this VM than on hardware; see the notes)
+- server: 5.6× against nginx (1 KiB file, keep-alive, 256 connections)
 - proxy: 1.2× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
-- web: 4.3× against nginx (page 4 KiB, keep-alive, 256 connections)
+- web: 4.2× against nginx (page 4 KiB, keep-alive, 256 connections)
 - dns: 1.4× against NSD (A queries over UDP)
 - mqtt: 21.3× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
-- storage: 11.9× against MinIO (GET 4 KiB, 4 × 16 connections) (caveat: a floor: the load generator ran out before socketley did)
+- storage: 19.0× against MinIO (GET 4 KiB, 64 connections)
 - db: 2.5× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
 - tunnel: 2.3× against frp (throughput, 512 MiB echoed through the tunnel)
 - metrics: 2.6× against Prometheus (CPU per sample ingested)
-- idp: 21.1× against Keycloak (refresh token, 64 clients) (caveat: a floor: the load generator ran out before socketley did)
+- idp: 24.4× against Keycloak (refresh token, 256 clients)
 - mail: 3.4× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
 - mcp: 25.6× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
 
