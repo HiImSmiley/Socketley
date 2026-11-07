@@ -70,6 +70,7 @@ public:
     uint64_t quota_of(const std::string& user) const;
     uint64_t stored() const { return m_stored; }
     uint64_t store_failures() const { return m_store_failures; }
+    uint64_t lookups() const { return m_lookups; }
 
 private:
     struct known
@@ -94,6 +95,9 @@ private:
     bool m_bucket_made{false};
     std::vector<std::function<void(bool)>> m_bucket_waiting;
     std::unordered_map<std::string, known> m_known;
+    // Who waits on a lookup already out for a name, so a burst to one mailbox asks the idp once and not per message.
+    std::unordered_map<std::string, std::vector<std::function<void(account, std::string, std::string)>>> m_finding;
+    uint64_t m_lookups{0};
     std::unordered_map<std::string, uint64_t> m_quota;
     uint64_t m_stored{0};
     uint64_t m_store_failures{0};

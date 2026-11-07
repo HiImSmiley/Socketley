@@ -1068,6 +1068,7 @@ void mail_run::stop()
         }
     if (auto* mgr = m_owner.get_runtime_manager())
         mgr->requests().drop_origin(this);
+    m_asks_waiting.clear();
     if (m_delivery)
         m_delivery->stop();
     if (m_notify)
@@ -3238,14 +3239,43 @@ void mail_run::expect_reply(uint64_t cookie, std::function<void(request_status, 
 void mail_run::ask(const std::string& target, std::string payload,
                    std::function<void(request_status, std::string_view)> cb)
 {
+    // Behind those already waiting, so an answer's own next ask cannot pass them.
+    if (!m_stopped && (m_replies.size() >= asks_most || !m_asks_waiting.empty()))
+    {
+        ++m_asks_waited;
+        m_asks_waiting.push_back({target, std::move(payload), std::move(cb)});
+        return;
+    }
+    post_ask(target, std::move(payload), std::move(cb));
+}
+
+void mail_run::post_ask(const std::string& target, std::string payload,
+                        std::function<void(request_status, std::string_view)> cb)
+{
     auto* mgr = m_owner.get_runtime_manager();
     const uint64_t cookie = next_cookie();
     expect_reply(cookie, cb);
-    if (!mgr || m_stopped || !mgr->requests().post(this, cookie, target, payload, request_class::background))
+    if (!mgr || m_stopped ||
+        !mgr->requests().post_owned(this, cookie, target, std::move(payload), request_class::background))
     {
         m_replies.erase(cookie);
         cb(request_status::no_target, {});
     }
+}
+
+void mail_run::pump_asks()
+{
+    // One loop for every answer, so an ask refused at once cannot nest the next inside itself.
+    if (m_asks_pumping)
+        return;
+    m_asks_pumping = true;
+    while (!m_stopped && m_replies.size() < asks_most && !m_asks_waiting.empty())
+    {
+        waiting_ask a = std::move(m_asks_waiting.front());
+        m_asks_waiting.pop_front();
+        post_ask(a.target, std::move(a.payload), std::move(a.cb));
+    }
+    m_asks_pumping = false;
 }
 
 void mail_run::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
@@ -3256,6 +3286,7 @@ void mail_run::on_request_reply(uint64_t cookie, request_status st, std::string_
     auto cb = std::move(it->second);
     m_replies.erase(it);
     cb(st, reply);
+    pump_asks();
 }
 
 std::string mail_run::queue_text(std::string_view filter) const
@@ -4204,6 +4235,9 @@ std::string mail_run::stats() const
     put(out, "mail_spool_segments", m_spool.segments());
     put(out, "mail_spool_moved", m_spool.moved());
     put(out, "mail_bounces_taken", m_bounces_taken);
+    put(out, "mail_asks_out", m_replies.size());
+    put(out, "mail_asks_waiting", m_asks_waiting.size());
+    put(out, "mail_asks_waited", m_asks_waited);
     put(out, "mail_suppressed", m_suppressed.set.size());
     put(out, "mail_unsubscribed", m_unsubscribed.set.size());
     put(out, "mail_unsubscribes", m_unsubscribes);
@@ -4225,6 +4259,7 @@ std::string mail_run::stats() const
     {
         put(out, "mail_stored", m_mailboxes->stored());
         put(out, "mail_store_failures", m_mailboxes->store_failures());
+        put(out, "mail_idp_lookups", m_mailboxes->lookups());
     }
     put(out, "mail_checked", m_checked);
     put(out, "mail_dmarc_rejected", m_dmarc_rejected);

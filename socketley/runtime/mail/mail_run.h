@@ -530,6 +530,22 @@ private:
     int64_t m_next_files_ms{0};
 
     std::unordered_map<uint64_t, std::function<void(request_status, std::string_view)>> m_replies;
+    // Requests out at once, under the request channel's bound for background work, so the one past it waits here
+    // for an answer to make room rather than being refused there.
+    static constexpr size_t asks_most = 2048;
+    struct waiting_ask
+    {
+        std::string target;
+        std::string payload;
+        std::function<void(request_status, std::string_view)> cb;
+    };
+    std::deque<waiting_ask> m_asks_waiting;
+    uint64_t m_asks_waited{0};
+    bool m_asks_pumping{false};
+    // The next asks waiting, as many as there is room for.
+    void pump_asks();
+    void post_ask(const std::string& target, std::string payload,
+                  std::function<void(request_status, std::string_view)> cb);
     uint64_t m_next_cookie{1};
     void imap_sieve_apply(const std::string& user, const std::shared_ptr<imap_folder>& f, uint32_t uid,
                           std::string_view bytes, const sieve::outcome& out, const std::string& own);

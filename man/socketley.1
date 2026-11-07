@@ -17665,6 +17665,24 @@ in as before.
 .TP
 .BI "\-\-storage " runtime\fR[/\fIbucket\fR]
 The storage runtime, and optionally its bucket, that holds the mailboxes.
+A burst of mail faster than the store waits for it rather than being deferred:
+at most 1024 mailbox deliveries, holding at most 128 MiB of their messages, are
+out at once, and the rest wait in the spool for a place.
+.B stats
+says how many are out
+.RB ( mail_local_out ),
+waiting
+.RB ( mail_local_waiting )
+and have waited
+.RB ( mail_local_waited ),
+and the same for the requests the runtime has out to other runtimes
+.RB ( mail_asks_out ,
+.BR mail_asks_waiting ,
+.BR mail_asks_waited ,
+at most 2048 out).
+Deliveries to one mailbox while its account is being looked up wait on that one
+lookup, so a burst asks the idp once per name
+.RB ( mail_idp_lookups ).
 .TP
 .BI "\-\-users " file
 A file of accounts that sign in to send mail.

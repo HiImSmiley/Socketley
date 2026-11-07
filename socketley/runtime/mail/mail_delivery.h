@@ -6,6 +6,7 @@
 // Recipients of one domain go in one transaction, and the connection to a domain carries one message after another
 // while there are more for it, at most a few at once a domain.  The loop's resolver finds the exchangers; TLS is
 // spoken wherever the other side offers it, and required of a smarthost that is given a password.
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -158,6 +159,11 @@ private:
     };
     void sign_read(const std::shared_ptr<sign_job>& j);
     void deliver_local(const entry_ptr& e, const target& t);
+    // The delivery to a mailbox itself, once one of the local_most places is free for it.
+    void start_local(const entry_ptr& e, const target& t);
+    // A mailbox delivery of `cost` bytes over, its place given to the next one waiting.
+    void local_done(uint64_t cost);
+    struct local_slot;
     // The VacationResponse a user set over JMAP answered, once a week to a sender, for a message their mailbox took.
     void jmap_vacation(const entry_ptr& e, const std::string& user, const std::string& own);
     // A mailbox delivery the user's Sieve script decides: run on the pool, and its actions taken on the loop.
@@ -214,6 +220,21 @@ private:
     uint32_t m_signs_out{0};
     uint32_t m_signs_held{0};
     std::deque<std::shared_ptr<sign_job>> m_signs_waiting;
+    // Mailbox deliveries out at once, each holding a request of the store's and up to a mebibyte of its message, so a
+    // burst waits on the store here rather than filling the requests the runtime may have out and being refused there.
+    static constexpr uint32_t local_most = 1024;
+    static constexpr uint64_t local_bytes_most = 128u << 20;
+    // What a delivery holds of its message at once, which a longer one streams a mebibyte at a time.
+    static uint64_t local_cost(const spool_entry& e) { return std::min<uint64_t>(e.body_len, 1u << 20); }
+    bool local_room(const spool_entry& e) const
+    {
+        return m_local_out == 0 || (m_local_out < local_most && m_local_bytes + local_cost(e) <= local_bytes_most);
+    }
+    uint32_t m_local_out{0};
+    uint64_t m_local_bytes{0};
+    bool m_local_pumping{false};
+    std::deque<std::pair<entry_ptr, target>> m_local_waiting;
+    uint64_t m_local_waited{0};
     // How many of a message's items this try still has out, and how many targets each recipient still waits on.
     std::unordered_map<std::string, uint32_t> m_out;
     std::unordered_map<std::string, std::vector<uint32_t>> m_pending_targets;

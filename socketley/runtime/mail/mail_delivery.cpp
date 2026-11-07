@@ -350,6 +350,8 @@ bool delivery::start(std::string& why)
 void delivery::stop()
 {
     m_stopped = true;
+    // What waits for a place stays in the spool, tried again at the next start.
+    m_local_waiting.clear();
     std::vector<uint64_t> ids;
     for (auto& [id, c] : m_conns)
         ids.push_back(id);
@@ -650,15 +652,69 @@ void delivery::dispatch(const entry_ptr& e)
     });
 }
 
+// A mailbox delivery's place, given back at its answer, or when the last of what could answer it is gone.
+struct delivery::local_slot
+{
+    delivery* d{nullptr};
+    std::shared_ptr<bool> alive;
+    uint64_t cost{0};
+    bool held{true};
+    void release()
+    {
+        if (!held)
+            return;
+        held = false;
+        if (*alive)
+            d->local_done(cost);
+    }
+    ~local_slot() { release(); }
+};
+
 void delivery::deliver_local(const entry_ptr& e, const target& t)
 {
+    if (!local_room(*e) || !m_local_waiting.empty())
+    {
+        ++m_local_waited;
+        m_local_waiting.emplace_back(e, t);
+        return;
+    }
+    start_local(e, t);
+}
+
+void delivery::local_done(uint64_t cost)
+{
+    if (m_local_out > 0)
+        --m_local_out;
+    m_local_bytes -= std::min(m_local_bytes, cost);
+    // One loop for every place freed, so a delivery settled at once cannot nest the next inside itself.
+    if (m_local_pumping)
+        return;
+    m_local_pumping = true;
+    while (!m_stopped && !m_local_waiting.empty() && local_room(*m_local_waiting.front().first))
+    {
+        auto [e, t] = std::move(m_local_waiting.front());
+        m_local_waiting.pop_front();
+        start_local(e, t);
+    }
+    m_local_pumping = false;
+}
+
+void delivery::start_local(const entry_ptr& e, const target& t)
+{
+    ++m_local_out;
+    auto slot = std::make_shared<local_slot>();
+    slot->d = this;
+    slot->alive = m_alive;
+    slot->cost = local_cost(*e);
+    m_local_bytes += slot->cost;
     auto it = std::make_shared<item>();
     it->e = e;
     it->to.push_back(t);
-    const auto settle = [this, it](int code, const std::string& text) {
+    const auto settle = [this, it, slot](int code, const std::string& text) {
         result(*it, 0, code, text, code / 100 == 4, 1);
         if (--m_out[it->e->id] == 0)
             attempt_over(it->e);
+        slot->release();
     };
     mailboxes* boxes = m_run.boxes();
     if (!boxes || !boxes->enabled())
@@ -2064,6 +2120,9 @@ void delivery::stats(std::string& out) const
     put(out, "mail_reports", m_reports);
     put(out, "mail_sieve_rejected", m_sieve_rejected);
     put(out, "mail_over_quota", m_over_quota);
+    put(out, "mail_local_out", m_local_out);
+    put(out, "mail_local_waiting", m_local_waiting.size());
+    put(out, "mail_local_waited", m_local_waited);
     put(out, "mail_sieve_redirected", m_sieve_redirected);
     put(out, "mail_sieve_vacations", m_sieve_vacations);
     put(out, "mail_sieve_notified", m_sieve_notified);

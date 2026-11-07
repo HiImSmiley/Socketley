@@ -118,11 +118,27 @@ void mailboxes::find(const std::string& name, std::function<void(account, std::s
         done(it->second.found ? account::yes : account::no, it->second.user, it->second.email);
         return;
     }
+    auto& waiting = m_finding[key];
+    waiting.push_back(std::move(done));
+    if (waiting.size() > 1)
+        return;
+    ++m_lookups;
     std::string payload(socketley::idp::command_marker);
     payload += "lookup\n" + key;
-    ask(m_idp, std::move(payload), [this, key, done, alive = m_alive](request_status st, std::string_view reply) {
+    ask(m_idp, std::move(payload), [this, key, alive = m_alive](request_status st, std::string_view reply) {
         if (!*alive)
             return;
+        // Taken out before any is told, since one told may look the same name up again.
+        std::vector<std::function<void(account, std::string, std::string)>> told;
+        if (const auto it = m_finding.find(key); it != m_finding.end())
+        {
+            told = std::move(it->second);
+            m_finding.erase(it);
+        }
+        const auto done = [&told](account a, const std::string& user, const std::string& email) {
+            for (auto& d : told)
+                d(a, user, email);
+        };
         known k;
         const int64_t now = wall::now_ms_coarse();
         if (st == request_status::ok && reply.starts_with("ok "))
