@@ -29,21 +29,21 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 
 ## The runtimes
 
-- [server](rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path (compared with nginx)
-- [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in (compared with nginx)
-- [client](rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
-- [proxy](rt-proxy.txt): HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI (compared with HAProxy, nginx)
 - [cache](rt-cache.txt): In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub (compared with Redis, Valkey)
-- [storage](rt-storage.txt): S3 object storage over a directory, with versioning, replication, a web drive and git (compared with MinIO)
+- [client](rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
 - [db](rt-db.txt): JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups (compared with MongoDB, PocketBase)
 - [dns](rt-dns.txt): Authoritative name server for its zones, over UDP and TCP, with DNSSEC and transfers (compared with NSD, Knot)
 - [idp](rt-idp.txt): OpenID Connect provider with its own accounts, second factors, app passwords and SSH certificates (compared with Keycloak)
 - [mail](rt-mail.txt): Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage (compared with Postfix and Dovecot)
-- [mqtt](rt-mqtt.txt): MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules (compared with Mosquitto)
+- [mcp](rt-mcp.txt): A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients (compared with the MCP Python and TypeScript SDKs)
 - [metrics](rt-metrics.txt): Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs (compared with Prometheus, VictoriaMetrics)
+- [mqtt](rt-mqtt.txt): MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules (compared with Mosquitto)
+- [proxy](rt-proxy.txt): HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI (compared with HAProxy, nginx)
+- [server](rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path (compared with nginx)
+- [storage](rt-storage.txt): S3 object storage over a directory, with versioning, replication, a web drive and git (compared with MinIO)
 - [sync](rt-sync.txt): One job that carries a directory to a storage, from it, or both ways (compared with rclone)
 - [tunnel](rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials (compared with frp)
-- [mcp](rt-mcp.txt): A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients (compared with the MCP Python and TypeScript SDKs)
+- [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in (compared with nginx)
 
 ## Benchmarks
 
@@ -2315,508 +2315,6 @@ Sets the path to the daemon configuration file.
 
 ---
 
-# server runtime
-
-TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path
-
-A **server** listens on one port and talks to whoever connects. Without a script it relays messages between clients; with Lua it becomes an API, a chat room or a game loop.
-
-```
-socketley create server chat -p 9000 -s                    # every line reaches every other client
-socketley create server echo -p 9001 --send-to sender -s   # answers whoever spoke
-socketley create server site -p 8080 --http /srv/site --http-cache -s
-socketley create server api -p 9002 --lua api.lua --cache store -s
-```
-
-> Warning: `--cache` also stores every ordinary message in the cache, under keys `1`, `2`, `3`… And `--http` injects a WebSocket script into every HTML page.
-
-## What it does
-
-- **One port, several protocols**: TCP, WebSocket, HTTP and RESP, [told apart by their first bytes](man-server-flags.txt); `--udp` for datagrams.
-- **Static files**: `--http` serves a directory; `--http-cache` holds it in memory.
-- **Lua handlers**: Per message, connection, HTTP request and WebSocket upgrade; see [Lua](lua.txt).
-- **Relaying without code**: `--mode` and `--send-to` decide who hears a message.
-- **Upstreams**: `-u host:port` dials other servers; the script hears them in `on_upstream`.
-- **A cache beside it**: With `--cache name`, clients send `cache <command>`; see [cache access](man-server-flags.txt).
-- **Several cores**: `--shards N` runs N processes on one port; see [sharding](man-server-flags.txt).
-
-## Works with
-
-A [proxy](rt-proxy.txt) in front for names and TLS, a [cache](rt-cache.txt) behind for state, a [client](rt-client.txt) to chain servers. Its counters reach [metrics](rt-metrics.txt) without setup.
-
-## Flags
-
-Every flag a server runtime takes, by group.
-
-**Basics**
-
-| flag | value | what it does |
-|---|---|---|
-| `-p` | int | Port: The port it listens on (a client: the port of its target). |
-| `-s` |  | Start now: Start it as soon as it is made. |
-| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
-| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
-
-**Network**
-
-| flag | value | what it does |
-|---|---|---|
-| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
-| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. |
-| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
-| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
-| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
-
-**TLS**
-
-| flag | value | what it does |
-|---|---|---|
-| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
-| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
-| `--key` | path | Key: The PEM key of the certificate. |
-| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
-| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. |
-| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. |
-
-**Limits**
-
-| flag | value | what it does |
-|---|---|---|
-| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
-| `--rate-limit` | int | Rate limit: Messages a second per connection. |
-| `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. |
-| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
-| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. |
-| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
-| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
-| `--drain` |  | Drain on stop: Finish what is in flight before stopping. |
-
-**Output**
-
-| flag | value | what it does |
-|---|---|---|
-| `--log` | path | State log: A file it appends each state change to. |
-| `-w` | path | Message file: A file every received message is written to. |
-| `-b` |  | Print messages: Print every received message. |
-| `-bp` |  | …with name: Print them with the runtime's name before each. |
-| `-bt` |  | …with time: Print them with the time before each. |
-| `-bpt` (-btp) |  | …with time and name: Print them with the time and the name before each. |
-
-**Server**
-
-| flag | value | what it does |
-|---|---|---|
-| `--mode` | one of inout, in, out, master | Mode: Who talks: both ways, in only, out only, or one master broadcasting. |
-| `--send-to` | list | Answer to: Who the built-in path answers: sender, others, master. |
-| `--udp` |  | UDP: Datagrams instead of a stream. |
-| `--http` | path | Static files: Serve this directory over HTTP. |
-| `--http-cache` |  | Files in memory: Read the static files into memory at start. |
-| `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. |
-| `--no-inject` |  | Pages as they are: Serve each page exactly as the file holds it, without the WebSocket script. |
-| `--master-pw` | text | Master password: The password that claims master mode. |
-| `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. |
-| `--cache` | text | Cache: A cache runtime its scripts and clients use. |
-| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it; * for any. |
-| `-u` (--upstream) | list | Upstreams: Servers it relays to, host:port each. |
-
-## Benchmarks
-
-A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
-
-### HTTP: static files and a fixed answer
-
-nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
-
-| case | socketley | nginx | socketley vs nginx |
-|---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 281 K req/s (1.00 cores) | 51 K req/s (1.00 cores) | 5.56× (5.23–5.94) |
-| 64 KiB file, keep-alive, 256 connections | 95 K req/s (1.00 cores) | 45 K req/s (1.00 cores) | 2.09× (1.95–2.22) |
-| 1 KiB file, a connection per request, 64 at once | 82 K req/s (0.99 cores) | 33 K req/s (1.00 cores) | 2.55× (2.33–2.59) |
-| fixed answer (Lua handler / nginx return), keep-alive | 235 K req/s (1.00 cores) | 73 K req/s (1.00 cores) | 3.27× (2.79–3.33) |
-
-How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row.
-
-### HTTP on four cores
-
-nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
-
-| case | socketley | nginx | socketley vs nginx |
-|---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 510 K req/s (3.99 cores) | 236 K req/s (4.00 cores) | 2.16× (2.12–2.22) |
-| 64 KiB file, keep-alive, 256 connections | 225 K req/s (4.00 cores) | 168 K req/s (3.99 cores) | 1.34× (1.30–1.40) |
-| 1 KiB file, a connection per request, 64 at once | 160 K req/s (3.94 cores) | 130 K req/s (3.88 cores) | 1.23× (1.22–1.23) |
-| fixed answer (Lua handler / nginx return), keep-alive | 426 K req/s (4.00 cores) | 309 K req/s (3.99 cores) | 1.37× (1.34–1.40) |
-
-How it was measured: wrk 16 threads, 8 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither.
-
-## In the manual
-
-Every flag in full, and Sharding, Multi-Protocol Auto-Detection, Request Framing, Cache Access via Server: man-server-flags.txt
-
-
----
-
-# web runtime
-
-Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
-
-A **web** runtime serves a directory of files to browsers and does nothing else: no script, no WebSocket, no upload. Put a documentation site, a blog from a static site generator or a single-page app's build behind it.
-
-```
-socketley create web docs -p 9500 --root /srv/docs/current --domain docs -s
-socketley create web www  -p 9501 --root /var/www/html --domain example.com -s
-```
-
-> It speaks plain HTTP and binds `127.0.0.1` unless `--bind` says otherwise. Visitors reach it through the entrance, which adds TLS and HTTP/2 for its `--domain` names. `--tls` and `--lua` are refused.
-
-## What it does
-
-- **Clean addresses**: `/guide/` serves `guide/index.html`, `/about` serves `about.html`, and a missing page gets the site's `404.html`.
-- **Single-page apps**: `--fallback index.html` answers addresses with no file, while a missing `app.js` stays a 404.
-- **Releases without a restart**: `--root` may be a symbolic link; swap it to a new build and the next request is served from it.
-- **Caching done right**: ETag and Last-Modified on every file; names a build stamped with a hash are cached for a year, pages are revalidated.
-- **Compression**: A `.br` or `.gz` copy next to a file is sent when the browser takes it; other text files are compressed once and kept.
-- **Never waits on the disk**: Small files are kept in memory, large ones sent with `sendfile`; inotify sees every change at once.
-- **Nothing leaks**: `..`, links pointing out of `--root` and hidden files (`.env`, `.git/`) are 404, `.well-known` excepted.
-
-## Works with
-
-The entrance [proxy](rt-proxy.txt) of a [dns](rt-dns.txt) runtime gives it HTTPS under its `--domain`; see the [public HTTPS recipe](deploy.txt). For a site that also needs WebSocket or a Lua handler, use a [server](rt-server.txt) with `--http`.
-
-## Flags
-
-Every flag a web runtime takes, by group.
-
-**Basics**
-
-| flag | value | what it does |
-|---|---|---|
-| `-p` | int | Port: The port it listens on (a client: the port of its target). |
-| `-s` |  | Start now: Start it as soon as it is made. |
-
-**Network**
-
-| flag | value | what it does |
-|---|---|---|
-| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
-| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
-| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
-| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
-
-**Limits**
-
-| flag | value | what it does |
-|---|---|---|
-| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
-
-**Output**
-
-| flag | value | what it does |
-|---|---|---|
-| `--log` | path | State log: A file it appends each state change to. |
-
-**Web**
-
-| flag | value | what it does |
-|---|---|---|
-| `--root` | path | Document root: The directory whose files are the site. Required. |
-| `--index` | text | Index page: The file a directory's address is answered with, index.html unless given. |
-| `--fallback` | text | Fallback page: The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise. |
-
-## Benchmarks
-
-A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
-
-### Static site: pages, assets, compression, revalidation
-
-nginx 1.28.3, 9 passes, 2026-11-07, socketley fc762708.
-
-| case | socketley | nginx | socketley vs nginx |
-|---|---|---|---|
-| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.19× (3.81–4.47) |
-| page 4 KiB, a connection per request, 64 at once | 73 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 2.33× (2.18–2.60) |
-| asset 64 KiB (hashed name), keep-alive, 256 connections | 70 K req/s (1.00 cores) | 42 K req/s (1.00 cores) | 1.67× (1.46–2.23) |
-| file 1 MiB, keep-alive, 64 connections | 25 K req/s (1.00 cores) | 20 K req/s (1.00 cores) | 1.21× (1.11–1.32) |
-| page 4 KiB as gzip, the .gz beside it | 238 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.91× (4.56–5.24) |
-| page 4 KiB as brotli, the .br beside it | 231 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.61× (4.23–5.08) |
-| page 4 KiB as gzip, no .gz on disk | 232 K req/s (1.00 cores) | 26 K req/s (1.00 cores) | 9.19× (8.81–10.08) |
-| revalidation: If-None-Match, 304 | 239 K req/s (1.00 cores) | 64 K req/s (1.00 cores) | 3.76× (2.87–4.10) |
-| missing file: the site's 404.html | 224 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.53× (5.16–5.95) |
-| 10,000 pages of 4 KiB at random | 203 K req/s (1.00 cores) | 53 K req/s (1.00 cores) | 3.86× (3.60–4.05) |
-
-How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row.
-
-## In the manual
-
-Every flag in full, and the rest: man-web-flags.txt
-
-
----
-
-# client runtime
-
-Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
-
-A **client** dials a TCP or UDP peer and keeps the connection. What arrives is printed, saved or handled in Lua.
-
-```
-socketley create client feed -t 10.0.0.5:9000 --reconnect 0 -b -s   # print what arrives, reconnect for ever
-socketley send feed "subscribe prices"
-socketley create client probe -t unix:/run/app.sock --lua probe.lua -s
-```
-
-## What it does
-
-- **Any target**: `-t host:port` or `-t unix:/path`; `--udp` for datagrams.
-- **Verified TLS**: `--tls`, checked against `--ca` or the system store; no way to skip it.
-- **Reconnects**: `--reconnect [n]` backs off up to 16 seconds; `0` retries for ever.
-- **Output**: `-b` prints messages (`-bpt` adds name and time); `-w file` saves them.
-- **Lua**: `on_connect`, `on_message`, `on_disconnect`; `on_writable` paces sending.
-
-## Works with
-
-Any [server](rt-server.txt) or TCP service. `socketley send` writes through it from the shell.
-
-## Flags
-
-Every flag a client runtime takes, by group.
-
-**Basics**
-
-| flag | value | what it does |
-|---|---|---|
-| `-p` | int | Port: The port it listens on (a client: the port of its target). |
-| `-s` |  | Start now: Start it as soon as it is made. |
-| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
-| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
-
-**Network**
-
-| flag | value | what it does |
-|---|---|---|
-| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
-
-**TLS**
-
-| flag | value | what it does |
-|---|---|---|
-| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
-| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
-| `--key` | path | Key: The PEM key of the certificate. |
-| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
-
-**Limits**
-
-| flag | value | what it does |
-|---|---|---|
-| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
-| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
-| `--reconnect` | int | Reconnect: Reconnect with backoff when the connection drops: the most attempts, 0 for no limit. |
-
-**Output**
-
-| flag | value | what it does |
-|---|---|---|
-| `--log` | path | State log: A file it appends each state change to. |
-| `-w` | path | Message file: A file every received message is written to. |
-| `-b` |  | Print messages: Print every received message. |
-| `-bp` |  | …with name: Print them with the runtime's name before each. |
-| `-bt` |  | …with time: Print them with the time before each. |
-| `-bpt` (-btp) |  | …with time and name: Print them with the time and the name before each. |
-
-**Server**
-
-| flag | value | what it does |
-|---|---|---|
-| `--udp` |  | UDP: Datagrams instead of a stream. |
-
-**Client**
-
-| flag | value | what it does |
-|---|---|---|
-| `-t` | text | Target: The server it connects to, host:port. |
-| `--mode` | one of inout, in, out | Mode: Both ways, receive only or send only. |
-
-## Benchmarks
-
-No benchmark. A client runtime holds one connection to somebody else's server; there is no other program doing that to set beside it.
-
-## In the manual
-
-Every flag in full, and the rest: man-client-flags.txt
-
-
----
-
-# proxy runtime
-
-HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI
-
-A **proxy** forwards HTTP or plain TCP to backends, balances them and steers around failing ones. Without `--backend` it is the **entrance**, routing each request by name to the runtime that has it.
-
-```
-socketley create proxy gw -p 8080 --backend 127.0.0.1:9000 -s          # /gw/... goes to the backend
-socketley create proxy web -p 8081 --backend @web --strategy round-robin \
-    --health-check http --health-path /health -s
-socketley create proxy db-tcp -p 5433 --protocol tcp --backend 10.0.0.7:5432 -s
-socketley create proxy php -p 8082 --backend fastcgi://127.0.0.1:9000 --root /var/www/site -s
-```
-
-> By default a backend has 2 seconds to start answering, or the request gets a 504. Raise `--backend-timeout` for slow applications.
-
-## What it does
-
-- **Routing**: A request for `/gw/x` on proxy `gw` reaches the backend as `/x`; any other path, `/` included, gets 404. Through the entrance, a request for a `--domain` name passes unchanged.
-- **Any backend**: `host:port`, `https://`, `unix:`, a runtime, an `@group`, `fastcgi://`.
-- **Resilience**: [Health checks](man-proxy-flags.txt), a [circuit breaker](man-proxy-flags.txt), [retries](man-proxy-flags.txt); `--sidecar` turns all on.
-- **Sign-in first**: `--auth bearer:`, `basic:` or `idp:` before anything reaches a backend.
-- **TLS on both legs**: Its own listener, [client certificates](man-proxy-flags.txt), verified `https://` backends.
-- **Lua filters**: `on_route` picks backends; a [filter chain](man-lua-configuration.txt) rewrites traffic.
-- **Modern HTTP**: The entrance speaks HTTP/2 and HTTP/3; every proxy relays WebSocket.
-
-## Works with
-
-A [dns](rt-dns.txt) runtime makes the entrance and its certificates. `--auth idp:` signs people in through an [idp](rt-idp.txt).
-
-## Flags
-
-Every flag a proxy runtime takes, by group.
-
-**Basics**
-
-| flag | value | what it does |
-|---|---|---|
-| `-p` | int | Port: The port it listens on (a client: the port of its target). |
-| `-s` |  | Start now: Start it as soon as it is made. |
-| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
-| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
-
-**Network**
-
-| flag | value | what it does |
-|---|---|---|
-| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
-| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. |
-| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
-| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
-| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
-
-**TLS**
-
-| flag | value | what it does |
-|---|---|---|
-| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
-| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
-| `--key` | path | Key: The PEM key of the certificate. |
-| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
-| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. |
-| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. |
-
-**Limits**
-
-| flag | value | what it does |
-|---|---|---|
-| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
-| `--rate-limit` | int | Rate limit: Messages a second per connection. |
-| `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. |
-| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
-| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. |
-| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
-| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
-| `--drain` |  | Drain on stop: Finish what is in flight before stopping. |
-
-**Output**
-
-| flag | value | what it does |
-|---|---|---|
-| `--log` | path | State log: A file it appends each state change to. |
-
-**Server**
-
-| flag | value | what it does |
-|---|---|---|
-| `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. |
-
-**Proxy**
-
-| flag | value | what it does |
-|---|---|---|
-| `--backend` | list | Backends: Where requests go: host:port, https://host, unix:/path, a runtime or @group. None makes it the entrance. |
-| `--protocol` | one of http, tcp | Protocol: HTTP routes by path and name; TCP forwards bytes. |
-| `--strategy` | one of round-robin, random, lua | Strategy: How a backend is picked. |
-| `--auth` | text | Auth: Who may pass: bearer:<file of tokens> or basic:<credentials file>. |
-| `--redirect-https` | text | Redirect to HTTPS: Answer every request with a redirect to HTTPS on this port (443 when empty). |
-| `--backend-timeout` | duration | Backend timeout: How long a backend may take to begin its answer, 2s unless given; 0 waits for ever. |
-| `--retry` | int | Retries: Try a failed request this many times on the next backend. |
-| `--retry-all` |  | Retry POST too: Also retry requests that are not idempotent. |
-
-**Health**
-
-| flag | value | what it does |
-|---|---|---|
-| `--health-check` | one of tcp, http | Health check: Check the backends by connecting, or by asking a path. |
-| `--health-interval` | duration | Every: Time between two checks. |
-| `--health-path` | text | Path: The path an HTTP check asks. |
-| `--health-threshold` | int | Failures: Failed checks before a backend is out. |
-| `--circuit-threshold` | int | Circuit after: Errors in a row that take a backend out. |
-| `--circuit-timeout` | duration | Circuit open for: How long a backend stays out before it is tried again. |
-| `--sidecar` |  | Sidecar: Health checks, circuit breaker, retries and drain in one. |
-
-**FastCGI**
-
-| flag | value | what it does |
-|---|---|---|
-| `--root` | path | Document root: The directory of a fastcgi:// backend's scripts: a .php file under it is run, a path with no file goes to the index script. |
-| `--fastcgi-root` | path | Server's root: The same directory as the application server sees it, when that is another path (a container). |
-| `--index` | text | Index script: The script that directories and paths with no file go to; index.php unless given. |
-
-**Proxy TLS**
-
-| flag | value | what it does |
-|---|---|---|
-| `--client-ca` | path | Client CA: Clients must present a certificate signed by this CA. |
-| `--client-cert` | path | Backend certificate: The certificate it presents to TLS backends. |
-| `--client-key` | path | Backend key: That certificate's key. |
-
-## Benchmarks
-
-A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
-
-### Reverse proxy, HTTP and TCP
-
-HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
-
-| case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
-|---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 55 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.32× (1.29–1.42) | 1.84× (1.79–1.90) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 37 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 1.24× (1.21–1.25) | 1.45× (1.40–1.47) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.22× (1.19–1.26) | 1.71× (1.66–1.74) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.61× (1.58–1.66) | 2.11× (2.05–2.14) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 100 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 70 K req/s (1.00 cores) | 2.29× (2.15–2.38) | 1.40× (1.34–1.48) |
-
-How it was measured: wrk 8 threads, 8 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once.
-
-### Reverse proxy on four cores
-
-HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
-
-| case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
-|---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 147 K req/s (4.00 cores) | 109 K req/s (4.00 cores) | 102 K req/s (3.72 cores) | 1.33× (1.29–1.37) | 1.43× (1.41–1.47) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 163 K req/s (4.00 cores) | 128 K req/s (4.00 cores) | 117 K req/s (4.00 cores) | 1.27× (1.26–1.30) | 1.40× (1.38–1.44) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 93 K req/s (4.00 cores) | 78 K req/s (4.00 cores) | 56 K req/s (4.00 cores) | 1.18× (1.16–1.21) | 1.65× (1.61–1.66) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 105 K req/s (3.96 cores) | 82 K req/s (3.98 cores) | 36 K req/s (2.02 cores) | 1.27× (1.22–1.30) | 2.88× (2.77–2.91) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 207 K req/s (4.00 cores) | 172 K req/s (4.00 cores) | 182 K req/s (4.00 cores) | 1.20× (1.18–1.22) | 1.14× (1.12–1.16) |
-
-How it was measured: wrk 16 threads, 8 s a run; socketley as four shards, HAProxy with four threads and nginx with four workers, each pinned to one of the same four cores; the nginx backend (eight workers) on eight others, wrk (16 threads) on 14. The same rows as the one-core set, the same wrk for every arm; the backend is not what the proxies run into. As in the server set, each wrk thread holds connections on all four of socketley's shards, so part of every arm's CPU is waking the co-located client across cores.
-
-## In the manual
-
-Every flag in full, and Sharding, Health Check Flags, Circuit Breaker Flags, Retry Flags, What a Request That Never Reaches a Backend Is Answered, Process Isolation, mTLS Flags, Sidecar Mode: man-proxy-flags.txt
-
-
----
-
 # cache runtime
 
 In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub
@@ -3006,36 +2504,33 @@ Every flag in full, and Cache Protocol, RESP Protocol (Redis Compatibility), Dat
 
 ---
 
-# storage runtime
+# client runtime
 
-S3 object storage over a directory, with versioning, replication, a web drive and git
+Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
 
-A **storage** runtime serves the S3 API over one directory, so boto3, the AWS CLI, rclone and other S3 clients keep objects on this machine's disk. It adds a web drive with share links and media.
+A **client** dials a TCP or UDP peer and keeps the connection. What arrives is printed, saved or handled in Lua.
 
 ```
-socketley create storage files -p 9000 --dir /srv/objects \
-    --credentials /etc/socketley/storage.creds -s
-aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://photos
-aws --endpoint-url http://127.0.0.1:9000 s3 cp beach.jpg s3://photos/
+socketley create client feed -t 10.0.0.5:9000 --reconnect 0 -b -s   # print what arrives, reconnect for ever
+socketley send feed "subscribe prices"
+socketley create client probe -t unix:/run/app.sock --lua probe.lua -s
 ```
 
 ## What it does
 
-- **The S3 API**: SigV4, multipart uploads, [S3 Select](man-storage-flags.txt); see [operations](man-storage-flags.txt).
-- **Users and policies**: [Users](man-storage-flags.txt), [IAM](man-storage-flags.txt), [bucket policies](man-storage-flags.txt), [STS](man-storage-flags.txt).
-- **Keeping versions**: [Versioning](man-storage-flags.txt), [object lock](man-storage-flags.txt), [lifecycle](man-storage-flags.txt), [tiers](man-storage-flags.txt).
-- **Copies**: [Replication](man-storage-flags.txt) to other S3 endpoints, or a [cluster](man-storage-flags.txt) of nodes.
-- **On disk**: [Compression](man-storage-flags.txt), [encryption](man-storage-flags.txt), and `--fsync` for [durability](man-storage-flags.txt).
-- **Around the data**: [Webhooks](man-storage-flags.txt), [bucket websites](man-storage-flags.txt), [quotas](man-storage-flags.txt).
-- **Web interface**: A [drive](man-storage-flags.txt), [git repositories](man-storage-flags.txt), sign-in through an [idp](rt-idp.txt).
+- **Any target**: `-t host:port` or `-t unix:/path`; `--udp` for datagrams.
+- **Verified TLS**: `--tls`, checked against `--ca` or the system store; no way to skip it.
+- **Reconnects**: `--reconnect [n]` backs off up to 16 seconds; `0` retries for ever.
+- **Output**: `-b` prints messages (`-bpt` adds name and time); `-w file` saves them.
+- **Lua**: `on_connect`, `on_message`, `on_disconnect`; `on_writable` paces sending.
 
 ## Works with
 
-[sync](rt-sync.txt) carries directories into it, [mail](rt-mail.txt) keeps mailboxes in it, [metrics](rt-metrics.txt) archives to it.
+Any [server](rt-server.txt) or TCP service. `socketley send` writes through it from the shell.
 
 ## Flags
 
-Every flag a storage runtime takes, by group.
+Every flag a client runtime takes, by group.
 
 **Basics**
 
@@ -3050,10 +2545,6 @@ Every flag a storage runtime takes, by group.
 
 | flag | value | what it does |
 |---|---|---|
-| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
-| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. |
-| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
-| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
 | `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
 
 **TLS**
@@ -3064,90 +2555,46 @@ Every flag a storage runtime takes, by group.
 | `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
 | `--key` | path | Key: The PEM key of the certificate. |
 | `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
-| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. |
-| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. |
 
 **Limits**
 
 | flag | value | what it does |
 |---|---|---|
-| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
-| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
-| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. |
 | `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
 | `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
-| `--drain` |  | Drain on stop: Finish what is in flight before stopping. |
+| `--reconnect` | int | Reconnect: Reconnect with backoff when the connection drops: the most attempts, 0 for no limit. |
 
 **Output**
 
 | flag | value | what it does |
 |---|---|---|
 | `--log` | path | State log: A file it appends each state change to. |
+| `-w` | path | Message file: A file every received message is written to. |
+| `-b` |  | Print messages: Print every received message. |
+| `-bp` |  | …with name: Print them with the runtime's name before each. |
+| `-bt` |  | …with time: Print them with the time before each. |
+| `-bpt` (-btp) |  | …with time and name: Print them with the time and the name before each. |
 
-**Storage**
-
-| flag | value | what it does |
-|---|---|---|
-| `--dir` | path | Directory: Where the buckets live. Required. |
-| `--credentials` | path | Credentials: A file of access:secret pairs and [users], read again when it changes. |
-| `--access-key` | text | Access key: One access key, when there is no credentials file. |
-| `--secret-key` | text | Secret key: Its secret. |
-| `--anonymous` |  | Anonymous: Let in requests without credentials, as policies allow. |
-| `--website-domain` | list | Website names: Names buckets' websites are reached under. |
-| `--tls-offloaded` | list | TLS proxies: Proxies that end TLS in front of it, whose X-Forwarded-For names the client. |
-| `--max-bytes` | size | Quota: The most bytes it holds. |
-
-**Durability**
+**Server**
 
 | flag | value | what it does |
 |---|---|---|
-| `--fsync` | one of always, interval, never | Sync to disk: When an answered write is on the disk. |
-| `--fsync-interval` | duration | Sync every: How often --fsync interval syncs to disk. |
-| `--scrub` | duration | Scrub every: Read every object back once in this long and check it; never unless given. |
-| `--compress` | duration | Compress after: Compress a version once it has not been written for this long; off unless given. |
-| `--mpu-expire` | duration | Abort uploads after: Abort a multipart upload open this long; never unless given. |
+| `--udp` |  | UDP: Datagrams instead of a stream. |
 
-**Storage extras**
+**Client**
 
 | flag | value | what it does |
 |---|---|---|
-| `--sse-key-file` | path | Encryption key: The 32-byte master key of server-side encryption. |
-| `--sync` | one of never, active, per-user | Sync runtimes: Runtimes that pull users' git repositories: none, one for all, or one each. |
-| `--acls` |  | ACLs: Accept ACLs on buckets that have no ownership controls; otherwise the bucket owner owns everything. |
-| `--notify-targets` | path | Webhooks: The webhooks event notifications may go to. |
-| `--replication-targets` | path | Replication targets: The S3 endpoints buckets may replicate to. |
-| `--tiers` | path | Tiers: The S3 endpoints lifecycle may move versions to. |
-| `--federation` | path | Federation: The OIDC provider and LDAP directory STS trusts. |
-| `--nodes` | path | Cluster nodes: Make it a node of a storage cluster. |
-
-**Storage**
-
-| flag | value | what it does |
-|---|---|---|
-| `--idp` | text | Identity provider: The idp runtime the web interface signs in with; its users are the users of the same name here. |
+| `-t` | text | Target: The server it connects to, host:port. |
+| `--mode` | one of inout, in, out | Mode: Both ways, receive only or send only. |
 
 ## Benchmarks
 
-A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
-
-### S3 over HTTP, SigV4
-
-MinIO 2025-09-07, 7 passes, 2026-11-07, socketley fc762708.
-
-| case | socketley | MinIO | socketley vs MinIO |
-|---|---|---|---|
-| GET 4 KiB, 1 connection | 21 K obj/s (0.61 cores) | 3.9 K obj/s (1.30 cores) | 5.41× (5.34–5.44) |
-| GET 4 KiB, 64 connections | 452 K obj/s (3.79 cores) | 24 K obj/s (3.99 cores) | 18.98× (18.27–19.35) |
-| GET 4 KiB, 128 connections | 564 K obj/s (3.96 cores) | 24 K obj/s (3.99 cores) | 23.54× (23.00–24.28) |
-| GET 4 KiB, 64 connections, from 50,000 objects | 246 K obj/s (3.99 cores) | 24 K obj/s (3.99 cores) | 10.16× (9.98–10.31) |
-| GET 1 MiB, 64 connections | 40 K obj/s (4.00 cores) | 6.0 K obj/s (3.94 cores) | 6.67× (6.48–6.85) |
-| PUT 4 KiB, 64 connections, into an empty store | 77 K obj/s (3.77 cores) | 15 K obj/s (3.98 cores) | 5.05× (4.96–5.19) |
-
-How it was measured: s3gen (Go, one process, a request in flight per connection), 8s a run, SigV4 over plain HTTP, PUT bodies aws-chunked and signed; both servers on the same four cores (socketley as four shards), s3gen on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. s3gen signs every request with SigV4 as warp does (PUTs as signed aws-chunked bodies) and checks every answer's status, length and ETag; from 64 connections both servers fill their four cores. The 4 KiB rows read 2,500 objects, which socketley keeps as in-memory copies; the 50,000-object row reads past them, where every GET opens its file as MinIO's always do. The PUT row starts both servers afresh on empty storage for every pass, because MinIO reclaims deleted objects in the background and its puts slow while it does.
+No benchmark. A client runtime holds one connection to somebody else's server; there is no other program doing that to set beside it.
 
 ## In the manual
 
-Every flag in full, and What it shares with the other runtimes, Supported S3 operations, Uploads by form, Virtual-hosted-style addressing, Authentication, Users, Temporary credentials, Federated identities, IAM, CORS, Checksums, Object tags, Multipart uploads, Reading by part number, Versioning, Object lock, Event notifications, Replication, Cluster, Scrub, Compression, S3 Select, Tiers, Server-side encryption, Bucket lifecycle, Bucket policy, Server access logging, Public access block, How objects are stored, Performance, HTTP/2, HTTP/3, Quotas, Website hosting, Drive, links, media and the web interface, Git repositories, Durability, Sharding, Metrics, Lua, socketley.storage: man-storage-flags.txt
+Every flag in full, and the rest: man-client-flags.txt
 
 
 ---
@@ -3623,6 +3070,227 @@ Every flag in full, and the rest: man-mail-flags.txt
 
 ---
 
+# mcp runtime
+
+A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients
+
+An **mcp** runtime is a Model Context Protocol server: an AI client such as Claude Code gets the tools, resources and prompts its Lua script declares.
+
+```
+printf 'claude %s\nops %s admin\n' "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" > /etc/socketley/mcp.keys
+socketley create mcp shop -p 9600 --keys /etc/socketley/mcp.keys \
+    --lua shop.lua --tools daemon --instructions "Ask about the shop's orders." -s
+claude mcp add --transport http shop http://127.0.0.1:9600/mcp \
+    --header "Authorization: Bearer <claude's secret>"
+```
+
+The script declares what is offered:
+
+```
+mcp.tool{
+    name = "order_status",
+    description = "The state of one order: paid, sent or unknown.",
+    read_only = true,
+    input = { type = "object", properties = { id = { type = "string" } }, required = { "id" } },
+    -- the handler and the rest: examples/mcp/shop.lua in the repository
+}
+```
+
+## What it does
+
+- **Your tools in Lua**: Tools, resources and prompts from the script; `--instructions` says what the server is for.
+- **The daemon as tools**: `--tools daemon` lists runtimes for any key; an admin key may start and stop them.
+- **Streamable HTTP**: At `/mcp`, one JSON-RPC message per POST, stateless; revision 2026-07-28, and 2025-11-25, 2025-06-18, 2025-03-26.
+- **Who may ask**: `--keys`, OAuth sign-in with `--idp`, or `--anonymous` on a local-only port.
+
+## Works with
+
+The entrance [proxy](rt-proxy.txt) terminates TLS in front of it. An [idp](rt-idp.txt) signs people in; its `admins` are admins here.
+
+## Flags
+
+Every flag a mcp runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**MCP**
+
+| flag | value | what it does |
+|---|---|---|
+| `--keys` | path | Keys: The keys that may call it, one per line: name and secret, plus admin for a key that may change the daemon. |
+| `--anonymous` |  | Anonymous: Anyone may call it without a key; only for a port no other machine can reach. |
+| `--origins` | list | Origins: The web origins a browser may call it from, or * for any. |
+| `--tools` | one of none, daemon | Daemon tools: This daemon's runtimes as tools: listed and read by every key, started and stopped by an admin's. |
+| `--instructions` | text | Instructions: What a client is told the server is for. |
+| `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. |
+| `--idp-audience` | list | Token clients: The idp's clients whose own access tokens it takes as well. |
+
+## Benchmarks
+
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### MCP server over Streamable HTTP
+
+MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 9 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
+|---|---|---|---|---|---|
+| initialize + tools/list, a new session each, 64 at once | 69 K req/s (0.97 cores) | 1.2 K req/s (1.00 cores) | 1.7 K req/s (1.00 cores) | 59.16× (58.11–59.90) | 40.67× (39.88–42.23) |
+| tools/call add(a, b), 64 sessions | 135 K req/s (0.99 cores) | 5.3 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 25.64× (24.86–26.09) | 19.05× (18.32–19.32) |
+| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.91 cores) | 5.3 K req/s (1.00 cores) | 6.8 K req/s (1.00 cores) | 10.29× (10.11–10.67) | 8.03× (7.98–8.25) |
+| resources/read, 1 KiB of text, 64 sessions | 151 K req/s (0.96 cores) | 5.4 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.14× (25.58–28.81) | 20.47× (19.89–20.83) |
+
+How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 6s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
+
+## In the manual
+
+Every flag in full, and the rest: man-mcp-flags.txt
+
+
+---
+
+# metrics runtime
+
+Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs
+
+A **metrics** runtime keeps years of what socketley and nearby machines measure. It answers PromQL over the Prometheus HTTP API, so Grafana reads it as a Prometheus.
+
+```
+socketley create metrics metrics -p 9090 --scrape /etc/socketley/targets -s
+socketley metrics query 'rate(socketley_runtime_messages_total[5m])'
+socketley metrics query_range 'up' --start -6h --step 5m
+```
+
+## What it does
+
+- **Collects**: This daemon's series with no setup; `--scrape` targets; remote write with `--receive`.
+- **Stores compactly**: One to three bytes a sample, with coarser tiers (`--downsample`) for long ranges.
+- **Stays bounded**: `--keep` limits age, `--max-series` cardinality; `--durable` loses nothing in a crash.
+- **Alerts**: `--rules` in Prometheus's format, sent by webhook, mail or events (`--notify`).
+- **Logs**: `--logs` keeps the daemon's log lines and answers LogQL as Loki does.
+- **Archives**: `--archive` copies old blocks to an S3 bucket.
+
+## Works with
+
+The dashboard draws its history from it. A [storage](rt-storage.txt) runtime can hold its archive.
+
+## Flags
+
+Every flag a metrics runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**Metrics**
+
+| flag | value | what it does |
+|---|---|---|
+| `--scrape` | path | Scrape: The targets it scrapes, a line each: name url, then every=, timeout= or labels. |
+| `--every` | duration | Every: How often a sample is taken; a target's every= takes the place of it. |
+| `--keep` | duration | Keep: How long the raw samples are kept. |
+| `--downsample` | text | Tiers: Coarser tiers kept for longer, as step:keep pairs separated by commas, or none. |
+| `--max-series` | int | Max series: The most series it keeps; a new one past it is refused and counted. |
+| `--durable` |  | Durable: Log every sample as it comes, so a crash loses none. |
+| `--no-local` |  | No local feed: Leave this daemon's own series out. |
+| `--keys` | path | Keys: Service keys Grafana or a script sends as Bearer or Basic, one name and secret per line. |
+| `--idp` | text | Identity provider: The idp runtime whose sign-ins and access tokens may read it. |
+| `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes. |
+
+**Rules**
+
+| flag | value | what it does |
+|---|---|---|
+| `--rules` | path | Rules: Recording and alerting rules laid over the built-in ones, a rule a line. |
+| `--notify` | list | Notify: Where the daemon's own alerts go: webhook, mail and events, or none. |
+
+**Logs**
+
+| flag | value | what it does |
+|---|---|---|
+| `--logs` |  | Logs: Keep every line the daemon and its runtimes log, queried with LogQL as Grafana queries Loki. |
+| `--logs-keep` | duration | Keep logs: How long the log lines are kept. |
+
+**Metrics**
+
+| flag | value | what it does |
+|---|---|---|
+| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write. |
+
+**Archive**
+
+| flag | value | what it does |
+|---|---|---|
+| `--archive` | text | Archive: An S3 bucket every finished block is copied to, so it outlives --keep. |
+| `--archive-credentials` | path | Archive keys: A file with the bucket's access_key and secret_key, in the form sync reads. |
+
+## Benchmarks
+
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### Scraping 100,000 series a second
+
+Prometheus 2.53.5, VictoriaMetrics 1.112, 7 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
+|---|---|---|---|---|---|
+| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.75 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.58× (2.56–2.66) | 3.48× (3.40–3.68) |
+| resident memory | 89.8 MB | 398 MB | 121 MB | 4.43× (3.98–5.03) | 1.35× (1.23–1.48) |
+| range query, 5 min of every path | 59.9 ms | 633 ms | 174 ms | 10.51× (9.36–11.45) | 2.93× (1.68–3.61) |
+
+How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
+
+## In the manual
+
+Every flag in full, and the rest: man-metrics-flags.txt
+
+
+---
+
 # mqtt runtime
 
 MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules
@@ -3741,34 +3409,39 @@ Every flag in full, and the rest: man-mqtt-flags.txt
 
 ---
 
-# metrics runtime
+# proxy runtime
 
-Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs
+HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI
 
-A **metrics** runtime keeps years of what socketley and nearby machines measure. It answers PromQL over the Prometheus HTTP API, so Grafana reads it as a Prometheus.
+A **proxy** forwards HTTP or plain TCP to backends, balances them and steers around failing ones. Without `--backend` it is the **entrance**, routing each request by name to the runtime that has it.
 
 ```
-socketley create metrics metrics -p 9090 --scrape /etc/socketley/targets -s
-socketley metrics query 'rate(socketley_runtime_messages_total[5m])'
-socketley metrics query_range 'up' --start -6h --step 5m
+socketley create proxy gw -p 8080 --backend 127.0.0.1:9000 -s          # /gw/... goes to the backend
+socketley create proxy web -p 8081 --backend @web --strategy round-robin \
+    --health-check http --health-path /health -s
+socketley create proxy db-tcp -p 5433 --protocol tcp --backend 10.0.0.7:5432 -s
+socketley create proxy php -p 8082 --backend fastcgi://127.0.0.1:9000 --root /var/www/site -s
 ```
+
+> By default a backend has 2 seconds to start answering, or the request gets a 504. Raise `--backend-timeout` for slow applications.
 
 ## What it does
 
-- **Collects**: This daemon's series with no setup; `--scrape` targets; remote write with `--receive`.
-- **Stores compactly**: One to three bytes a sample, with coarser tiers (`--downsample`) for long ranges.
-- **Stays bounded**: `--keep` limits age, `--max-series` cardinality; `--durable` loses nothing in a crash.
-- **Alerts**: `--rules` in Prometheus's format, sent by webhook, mail or events (`--notify`).
-- **Logs**: `--logs` keeps the daemon's log lines and answers LogQL as Loki does.
-- **Archives**: `--archive` copies old blocks to an S3 bucket.
+- **Routing**: A request for `/gw/x` on proxy `gw` reaches the backend as `/x`; any other path, `/` included, gets 404. Through the entrance, a request for a `--domain` name passes unchanged.
+- **Any backend**: `host:port`, `https://`, `unix:`, a runtime, an `@group`, `fastcgi://`.
+- **Resilience**: [Health checks](man-proxy-flags.txt), a [circuit breaker](man-proxy-flags.txt), [retries](man-proxy-flags.txt); `--sidecar` turns all on.
+- **Sign-in first**: `--auth bearer:`, `basic:` or `idp:` before anything reaches a backend.
+- **TLS on both legs**: Its own listener, [client certificates](man-proxy-flags.txt), verified `https://` backends.
+- **Lua filters**: `on_route` picks backends; a [filter chain](man-lua-configuration.txt) rewrites traffic.
+- **Modern HTTP**: The entrance speaks HTTP/2 and HTTP/3; every proxy relays WebSocket.
 
 ## Works with
 
-The dashboard draws its history from it. A [storage](rt-storage.txt) runtime can hold its archive.
+A [dns](rt-dns.txt) runtime makes the entrance and its certificates. `--auth idp:` signs people in through an [idp](rt-idp.txt).
 
 ## Flags
 
-Every flag a metrics runtime takes, by group.
+Every flag a proxy runtime takes, by group.
 
 **Basics**
 
@@ -3776,14 +3449,42 @@ Every flag a metrics runtime takes, by group.
 |---|---|---|
 | `-p` | int | Port: The port it listens on (a client: the port of its target). |
 | `-s` |  | Start now: Start it as soon as it is made. |
+| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
 
 **Network**
 
 | flag | value | what it does |
 |---|---|---|
 | `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
 | `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
 | `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
+| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
+| `--key` | path | Key: The PEM key of the certificate. |
+| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
+| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. |
+| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+| `--rate-limit` | int | Rate limit: Messages a second per connection. |
+| `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. |
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
+| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. |
+| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
+| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
+| `--drain` |  | Drain on stop: Finish what is in flight before stopping. |
 
 **Output**
 
@@ -3791,67 +3492,375 @@ Every flag a metrics runtime takes, by group.
 |---|---|---|
 | `--log` | path | State log: A file it appends each state change to. |
 
-**Metrics**
+**Server**
 
 | flag | value | what it does |
 |---|---|---|
-| `--scrape` | path | Scrape: The targets it scrapes, a line each: name url, then every=, timeout= or labels. |
-| `--every` | duration | Every: How often a sample is taken; a target's every= takes the place of it. |
-| `--keep` | duration | Keep: How long the raw samples are kept. |
-| `--downsample` | text | Tiers: Coarser tiers kept for longer, as step:keep pairs separated by commas, or none. |
-| `--max-series` | int | Max series: The most series it keeps; a new one past it is refused and counted. |
-| `--durable` |  | Durable: Log every sample as it comes, so a crash loses none. |
-| `--no-local` |  | No local feed: Leave this daemon's own series out. |
-| `--keys` | path | Keys: Service keys Grafana or a script sends as Bearer or Basic, one name and secret per line. |
-| `--idp` | text | Identity provider: The idp runtime whose sign-ins and access tokens may read it. |
-| `--idp-audience` | list | Token clients: The idp's clients whose access tokens it takes. |
+| `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. |
 
-**Rules**
+**Proxy**
 
 | flag | value | what it does |
 |---|---|---|
-| `--rules` | path | Rules: Recording and alerting rules laid over the built-in ones, a rule a line. |
-| `--notify` | list | Notify: Where the daemon's own alerts go: webhook, mail and events, or none. |
+| `--backend` | list | Backends: Where requests go: host:port, https://host, unix:/path, a runtime or @group. None makes it the entrance. |
+| `--protocol` | one of http, tcp | Protocol: HTTP routes by path and name; TCP forwards bytes. |
+| `--strategy` | one of round-robin, random, lua | Strategy: How a backend is picked. |
+| `--auth` | text | Auth: Who may pass: bearer:<file of tokens> or basic:<credentials file>. |
+| `--redirect-https` | text | Redirect to HTTPS: Answer every request with a redirect to HTTPS on this port (443 when empty). |
+| `--backend-timeout` | duration | Backend timeout: How long a backend may take to begin its answer, 2s unless given; 0 waits for ever. |
+| `--retry` | int | Retries: Try a failed request this many times on the next backend. |
+| `--retry-all` |  | Retry POST too: Also retry requests that are not idempotent. |
 
-**Logs**
-
-| flag | value | what it does |
-|---|---|---|
-| `--logs` |  | Logs: Keep every line the daemon and its runtimes log, queried with LogQL as Grafana queries Loki. |
-| `--logs-keep` | duration | Keep logs: How long the log lines are kept. |
-
-**Metrics**
-
-| flag | value | what it does |
-|---|---|---|
-| `--receive` |  | Take remote_write: Store what a Prometheus or agent sends to /api/v1/write. |
-
-**Archive**
+**Health**
 
 | flag | value | what it does |
 |---|---|---|
-| `--archive` | text | Archive: An S3 bucket every finished block is copied to, so it outlives --keep. |
-| `--archive-credentials` | path | Archive keys: A file with the bucket's access_key and secret_key, in the form sync reads. |
+| `--health-check` | one of tcp, http | Health check: Check the backends by connecting, or by asking a path. |
+| `--health-interval` | duration | Every: Time between two checks. |
+| `--health-path` | text | Path: The path an HTTP check asks. |
+| `--health-threshold` | int | Failures: Failed checks before a backend is out. |
+| `--circuit-threshold` | int | Circuit after: Errors in a row that take a backend out. |
+| `--circuit-timeout` | duration | Circuit open for: How long a backend stays out before it is tried again. |
+| `--sidecar` |  | Sidecar: Health checks, circuit breaker, retries and drain in one. |
+
+**FastCGI**
+
+| flag | value | what it does |
+|---|---|---|
+| `--root` | path | Document root: The directory of a fastcgi:// backend's scripts: a .php file under it is run, a path with no file goes to the index script. |
+| `--fastcgi-root` | path | Server's root: The same directory as the application server sees it, when that is another path (a container). |
+| `--index` | text | Index script: The script that directories and paths with no file go to; index.php unless given. |
+
+**Proxy TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--client-ca` | path | Client CA: Clients must present a certificate signed by this CA. |
+| `--client-cert` | path | Backend certificate: The certificate it presents to TLS backends. |
+| `--client-key` | path | Backend key: That certificate's key. |
 
 ## Benchmarks
 
 A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
 
-### Scraping 100,000 series a second
+### Reverse proxy, HTTP and TCP
 
-Prometheus 2.53.5, VictoriaMetrics 1.112, 7 passes, 2026-11-07, socketley 14fae8c3.
+HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
 
-| case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
+| case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.75 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.58× (2.56–2.66) | 3.48× (3.40–3.68) |
-| resident memory | 89.8 MB | 398 MB | 121 MB | 4.43× (3.98–5.03) | 1.35× (1.23–1.48) |
-| range query, 5 min of every path | 59.9 ms | 633 ms | 174 ms | 10.51× (9.36–11.45) | 2.93× (1.68–3.61) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 55 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.32× (1.29–1.42) | 1.84× (1.79–1.90) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 37 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 1.24× (1.21–1.25) | 1.45× (1.40–1.47) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.22× (1.19–1.26) | 1.71× (1.66–1.74) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.61× (1.58–1.66) | 2.11× (2.05–2.14) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 100 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 70 K req/s (1.00 cores) | 2.29× (2.15–2.38) | 1.40× (1.34–1.48) |
 
-How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
+How it was measured: wrk 8 threads, 8 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once.
+
+### Reverse proxy on four cores
+
+HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
+|---|---|---|---|---|---|
+| HTTP, 1 KiB, keep-alive, 32 connections | 147 K req/s (4.00 cores) | 109 K req/s (4.00 cores) | 102 K req/s (3.72 cores) | 1.33× (1.29–1.37) | 1.43× (1.41–1.47) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 163 K req/s (4.00 cores) | 128 K req/s (4.00 cores) | 117 K req/s (4.00 cores) | 1.27× (1.26–1.30) | 1.40× (1.38–1.44) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 93 K req/s (4.00 cores) | 78 K req/s (4.00 cores) | 56 K req/s (4.00 cores) | 1.18× (1.16–1.21) | 1.65× (1.61–1.66) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 105 K req/s (3.96 cores) | 82 K req/s (3.98 cores) | 36 K req/s (2.02 cores) | 1.27× (1.22–1.30) | 2.88× (2.77–2.91) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 207 K req/s (4.00 cores) | 172 K req/s (4.00 cores) | 182 K req/s (4.00 cores) | 1.20× (1.18–1.22) | 1.14× (1.12–1.16) |
+
+How it was measured: wrk 16 threads, 8 s a run; socketley as four shards, HAProxy with four threads and nginx with four workers, each pinned to one of the same four cores; the nginx backend (eight workers) on eight others, wrk (16 threads) on 14. The same rows as the one-core set, the same wrk for every arm; the backend is not what the proxies run into. As in the server set, each wrk thread holds connections on all four of socketley's shards, so part of every arm's CPU is waking the co-located client across cores.
 
 ## In the manual
 
-Every flag in full, and the rest: man-metrics-flags.txt
+Every flag in full, and Sharding, Health Check Flags, Circuit Breaker Flags, Retry Flags, What a Request That Never Reaches a Backend Is Answered, Process Isolation, mTLS Flags, Sidecar Mode: man-proxy-flags.txt
+
+
+---
+
+# server runtime
+
+TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path
+
+A **server** listens on one port and talks to whoever connects. Without a script it relays messages between clients; with Lua it becomes an API, a chat room or a game loop.
+
+```
+socketley create server chat -p 9000 -s                    # every line reaches every other client
+socketley create server echo -p 9001 --send-to sender -s   # answers whoever spoke
+socketley create server site -p 8080 --http /srv/site --http-cache -s
+socketley create server api -p 9002 --lua api.lua --cache store -s
+```
+
+> Warning: `--cache` also stores every ordinary message in the cache, under keys `1`, `2`, `3`… And `--http` injects a WebSocket script into every HTML page.
+
+## What it does
+
+- **One port, several protocols**: TCP, WebSocket, HTTP and RESP, [told apart by their first bytes](man-server-flags.txt); `--udp` for datagrams.
+- **Static files**: `--http` serves a directory; `--http-cache` holds it in memory.
+- **Lua handlers**: Per message, connection, HTTP request and WebSocket upgrade; see [Lua](lua.txt).
+- **Relaying without code**: `--mode` and `--send-to` decide who hears a message.
+- **Upstreams**: `-u host:port` dials other servers; the script hears them in `on_upstream`.
+- **A cache beside it**: With `--cache name`, clients send `cache <command>`; see [cache access](man-server-flags.txt).
+- **Several cores**: `--shards N` runs N processes on one port; see [sharding](man-server-flags.txt).
+
+## Works with
+
+A [proxy](rt-proxy.txt) in front for names and TLS, a [cache](rt-cache.txt) behind for state, a [client](rt-client.txt) to chain servers. Its counters reach [metrics](rt-metrics.txt) without setup.
+
+## Flags
+
+Every flag a server runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
+| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
+| `--key` | path | Key: The PEM key of the certificate. |
+| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
+| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. |
+| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+| `--rate-limit` | int | Rate limit: Messages a second per connection. |
+| `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. |
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
+| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. |
+| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
+| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
+| `--drain` |  | Drain on stop: Finish what is in flight before stopping. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+| `-w` | path | Message file: A file every received message is written to. |
+| `-b` |  | Print messages: Print every received message. |
+| `-bp` |  | …with name: Print them with the runtime's name before each. |
+| `-bt` |  | …with time: Print them with the time before each. |
+| `-bpt` (-btp) |  | …with time and name: Print them with the time and the name before each. |
+
+**Server**
+
+| flag | value | what it does |
+|---|---|---|
+| `--mode` | one of inout, in, out, master | Mode: Who talks: both ways, in only, out only, or one master broadcasting. |
+| `--send-to` | list | Answer to: Who the built-in path answers: sender, others, master. |
+| `--udp` |  | UDP: Datagrams instead of a stream. |
+| `--http` | path | Static files: Serve this directory over HTTP. |
+| `--http-cache` |  | Files in memory: Read the static files into memory at start. |
+| `--compress` |  | Compressed copies: Serve a file's .br or .gz copy next to it to clients that accept it, unless the copy is older than the file. |
+| `--no-inject` |  | Pages as they are: Serve each page exactly as the file holds it, without the WebSocket script. |
+| `--master-pw` | text | Master password: The password that claims master mode. |
+| `--no-master-pw` |  | No master password: Take the master password away, which ends master mode. |
+| `--cache` | text | Cache: A cache runtime its scripts and clients use. |
+| `--origins` | list | Web origins: Other web origins whose pages may open a WebSocket to it; * for any. |
+| `-u` (--upstream) | list | Upstreams: Servers it relays to, host:port each. |
+
+## Benchmarks
+
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### HTTP: static files and a fixed answer
+
+nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | nginx | socketley vs nginx |
+|---|---|---|---|
+| 1 KiB file, keep-alive, 256 connections | 281 K req/s (1.00 cores) | 51 K req/s (1.00 cores) | 5.56× (5.23–5.94) |
+| 64 KiB file, keep-alive, 256 connections | 95 K req/s (1.00 cores) | 45 K req/s (1.00 cores) | 2.09× (1.95–2.22) |
+| 1 KiB file, a connection per request, 64 at once | 82 K req/s (0.99 cores) | 33 K req/s (1.00 cores) | 2.55× (2.33–2.59) |
+| fixed answer (Lua handler / nginx return), keep-alive | 235 K req/s (1.00 cores) | 73 K req/s (1.00 cores) | 3.27× (2.79–3.33) |
+
+How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row.
+
+### HTTP on four cores
+
+nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+
+| case | socketley | nginx | socketley vs nginx |
+|---|---|---|---|
+| 1 KiB file, keep-alive, 256 connections | 510 K req/s (3.99 cores) | 236 K req/s (4.00 cores) | 2.16× (2.12–2.22) |
+| 64 KiB file, keep-alive, 256 connections | 225 K req/s (4.00 cores) | 168 K req/s (3.99 cores) | 1.34× (1.30–1.40) |
+| 1 KiB file, a connection per request, 64 at once | 160 K req/s (3.94 cores) | 130 K req/s (3.88 cores) | 1.23× (1.22–1.23) |
+| fixed answer (Lua handler / nginx return), keep-alive | 426 K req/s (4.00 cores) | 309 K req/s (3.99 cores) | 1.37× (1.34–1.40) |
+
+How it was measured: wrk 16 threads, 8 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither.
+
+## In the manual
+
+Every flag in full, and Sharding, Multi-Protocol Auto-Detection, Request Framing, Cache Access via Server: man-server-flags.txt
+
+
+---
+
+# storage runtime
+
+S3 object storage over a directory, with versioning, replication, a web drive and git
+
+A **storage** runtime serves the S3 API over one directory, so boto3, the AWS CLI, rclone and other S3 clients keep objects on this machine's disk. It adds a web drive with share links and media.
+
+```
+socketley create storage files -p 9000 --dir /srv/objects \
+    --credentials /etc/socketley/storage.creds -s
+aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://photos
+aws --endpoint-url http://127.0.0.1:9000 s3 cp beach.jpg s3://photos/
+```
+
+## What it does
+
+- **The S3 API**: SigV4, multipart uploads, [S3 Select](man-storage-flags.txt); see [operations](man-storage-flags.txt).
+- **Users and policies**: [Users](man-storage-flags.txt), [IAM](man-storage-flags.txt), [bucket policies](man-storage-flags.txt), [STS](man-storage-flags.txt).
+- **Keeping versions**: [Versioning](man-storage-flags.txt), [object lock](man-storage-flags.txt), [lifecycle](man-storage-flags.txt), [tiers](man-storage-flags.txt).
+- **Copies**: [Replication](man-storage-flags.txt) to other S3 endpoints, or a [cluster](man-storage-flags.txt) of nodes.
+- **On disk**: [Compression](man-storage-flags.txt), [encryption](man-storage-flags.txt), and `--fsync` for [durability](man-storage-flags.txt).
+- **Around the data**: [Webhooks](man-storage-flags.txt), [bucket websites](man-storage-flags.txt), [quotas](man-storage-flags.txt).
+- **Web interface**: A [drive](man-storage-flags.txt), [git repositories](man-storage-flags.txt), sign-in through an [idp](rt-idp.txt).
+
+## Works with
+
+[sync](rt-sync.txt) carries directories into it, [mail](rt-mail.txt) keeps mailboxes in it, [metrics](rt-metrics.txt) archives to it.
+
+## Flags
+
+Every flag a storage runtime takes, by group.
+
+**Basics**
+
+| flag | value | what it does |
+|---|---|---|
+| `-p` | int | Port: The port it listens on (a client: the port of its target). |
+| `-s` |  | Start now: Start it as soon as it is made. |
+| `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
+| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+
+**Network**
+
+| flag | value | what it does |
+|---|---|---|
+| `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
+| `--listen` | text | Unix socket: Listen on a unix socket instead of a port. |
+| `--shards` | int | Shards: Worker processes sharing the port: the way one runtime uses more than one core. |
+| `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
+| `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
+
+**TLS**
+
+| flag | value | what it does |
+|---|---|---|
+| `--tls` |  | TLS: Encrypt its transport: terminate TLS on its port, or dial over it. |
+| `--cert` | path | Certificate: The PEM certificate (chain allowed) a listener presents. |
+| `--key` | path | Key: The PEM key of the certificate. |
+| `--ca` | path | CA: On a listener: require client certificates from this CA (mutual TLS). On a client or proxy: the CA its servers are checked against. |
+| `--acme` | list | ACME names: Names to get a Let's Encrypt certificate for, renewed by itself. |
+| `--acme-email` | text | ACME e-mail: The address the CA writes to about the certificate. |
+
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
+| `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. |
+| `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. |
+| `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. |
+| `--drain` |  | Drain on stop: Finish what is in flight before stopping. |
+
+**Output**
+
+| flag | value | what it does |
+|---|---|---|
+| `--log` | path | State log: A file it appends each state change to. |
+
+**Storage**
+
+| flag | value | what it does |
+|---|---|---|
+| `--dir` | path | Directory: Where the buckets live. Required. |
+| `--credentials` | path | Credentials: A file of access:secret pairs and [users], read again when it changes. |
+| `--access-key` | text | Access key: One access key, when there is no credentials file. |
+| `--secret-key` | text | Secret key: Its secret. |
+| `--anonymous` |  | Anonymous: Let in requests without credentials, as policies allow. |
+| `--website-domain` | list | Website names: Names buckets' websites are reached under. |
+| `--tls-offloaded` | list | TLS proxies: Proxies that end TLS in front of it, whose X-Forwarded-For names the client. |
+| `--max-bytes` | size | Quota: The most bytes it holds. |
+
+**Durability**
+
+| flag | value | what it does |
+|---|---|---|
+| `--fsync` | one of always, interval, never | Sync to disk: When an answered write is on the disk. |
+| `--fsync-interval` | duration | Sync every: How often --fsync interval syncs to disk. |
+| `--scrub` | duration | Scrub every: Read every object back once in this long and check it; never unless given. |
+| `--compress` | duration | Compress after: Compress a version once it has not been written for this long; off unless given. |
+| `--mpu-expire` | duration | Abort uploads after: Abort a multipart upload open this long; never unless given. |
+
+**Storage extras**
+
+| flag | value | what it does |
+|---|---|---|
+| `--sse-key-file` | path | Encryption key: The 32-byte master key of server-side encryption. |
+| `--sync` | one of never, active, per-user | Sync runtimes: Runtimes that pull users' git repositories: none, one for all, or one each. |
+| `--acls` |  | ACLs: Accept ACLs on buckets that have no ownership controls; otherwise the bucket owner owns everything. |
+| `--notify-targets` | path | Webhooks: The webhooks event notifications may go to. |
+| `--replication-targets` | path | Replication targets: The S3 endpoints buckets may replicate to. |
+| `--tiers` | path | Tiers: The S3 endpoints lifecycle may move versions to. |
+| `--federation` | path | Federation: The OIDC provider and LDAP directory STS trusts. |
+| `--nodes` | path | Cluster nodes: Make it a node of a storage cluster. |
+
+**Storage**
+
+| flag | value | what it does |
+|---|---|---|
+| `--idp` | text | Identity provider: The idp runtime the web interface signs in with; its users are the users of the same name here. |
+
+## Benchmarks
+
+A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
+
+### S3 over HTTP, SigV4
+
+MinIO 2025-09-07, 7 passes, 2026-11-07, socketley fc762708.
+
+| case | socketley | MinIO | socketley vs MinIO |
+|---|---|---|---|
+| GET 4 KiB, 1 connection | 21 K obj/s (0.61 cores) | 3.9 K obj/s (1.30 cores) | 5.41× (5.34–5.44) |
+| GET 4 KiB, 64 connections | 452 K obj/s (3.79 cores) | 24 K obj/s (3.99 cores) | 18.98× (18.27–19.35) |
+| GET 4 KiB, 128 connections | 564 K obj/s (3.96 cores) | 24 K obj/s (3.99 cores) | 23.54× (23.00–24.28) |
+| GET 4 KiB, 64 connections, from 50,000 objects | 246 K obj/s (3.99 cores) | 24 K obj/s (3.99 cores) | 10.16× (9.98–10.31) |
+| GET 1 MiB, 64 connections | 40 K obj/s (4.00 cores) | 6.0 K obj/s (3.94 cores) | 6.67× (6.48–6.85) |
+| PUT 4 KiB, 64 connections, into an empty store | 77 K obj/s (3.77 cores) | 15 K obj/s (3.98 cores) | 5.05× (4.96–5.19) |
+
+How it was measured: s3gen (Go, one process, a request in flight per connection), 8s a run, SigV4 over plain HTTP, PUT bodies aws-chunked and signed; both servers on the same four cores (socketley as four shards), s3gen on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. s3gen signs every request with SigV4 as warp does (PUTs as signed aws-chunked bodies) and checks every answer's status, length and ETag; from 64 connections both servers fill their four cores. The 4 KiB rows read 2,500 objects, which socketley keeps as in-memory copies; the 50,000-object row reads past them, where every GET opens its file as MinIO's always do. The PUT row starts both servers afresh on empty storage for every pass, because MinIO reclaims deleted objects in the background and its puts slow while it does.
+
+## In the manual
+
+Every flag in full, and What it shares with the other runtimes, Supported S3 operations, Uploads by form, Virtual-hosted-style addressing, Authentication, Users, Temporary credentials, Federated identities, IAM, CORS, Checksums, Object tags, Multipart uploads, Reading by part number, Versioning, Object lock, Event notifications, Replication, Cluster, Scrub, Compression, S3 Select, Tiers, Server-side encryption, Bucket lifecycle, Bucket policy, Server access logging, Public access block, How objects are stored, Performance, HTTP/2, HTTP/3, Quotas, Website hosting, Drive, links, media and the web interface, Git repositories, Durability, Sharding, Metrics, Lua, socketley.storage: man-storage-flags.txt
 
 
 ---
@@ -4004,46 +4013,36 @@ Every flag in full, and the rest: man-tunnel-flags.txt
 
 ---
 
-# mcp runtime
+# web runtime
 
-A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients
+Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
 
-An **mcp** runtime is a Model Context Protocol server: an AI client such as Claude Code gets the tools, resources and prompts its Lua script declares.
-
-```
-printf 'claude %s\nops %s admin\n' "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" > /etc/socketley/mcp.keys
-socketley create mcp shop -p 9600 --keys /etc/socketley/mcp.keys \
-    --lua shop.lua --tools daemon --instructions "Ask about the shop's orders." -s
-claude mcp add --transport http shop http://127.0.0.1:9600/mcp \
-    --header "Authorization: Bearer <claude's secret>"
-```
-
-The script declares what is offered:
+A **web** runtime serves a directory of files to browsers and does nothing else: no script, no WebSocket, no upload. Put a documentation site, a blog from a static site generator or a single-page app's build behind it.
 
 ```
-mcp.tool{
-    name = "order_status",
-    description = "The state of one order: paid, sent or unknown.",
-    read_only = true,
-    input = { type = "object", properties = { id = { type = "string" } }, required = { "id" } },
-    -- the handler and the rest: examples/mcp/shop.lua in the repository
-}
+socketley create web docs -p 9500 --root /srv/docs/current --domain docs -s
+socketley create web www  -p 9501 --root /var/www/html --domain example.com -s
 ```
+
+> It speaks plain HTTP and binds `127.0.0.1` unless `--bind` says otherwise. Visitors reach it through the entrance, which adds TLS and HTTP/2 for its `--domain` names. `--tls` and `--lua` are refused.
 
 ## What it does
 
-- **Your tools in Lua**: Tools, resources and prompts from the script; `--instructions` says what the server is for.
-- **The daemon as tools**: `--tools daemon` lists runtimes for any key; an admin key may start and stop them.
-- **Streamable HTTP**: At `/mcp`, one JSON-RPC message per POST, stateless; revision 2026-07-28, and 2025-11-25, 2025-06-18, 2025-03-26.
-- **Who may ask**: `--keys`, OAuth sign-in with `--idp`, or `--anonymous` on a local-only port.
+- **Clean addresses**: `/guide/` serves `guide/index.html`, `/about` serves `about.html`, and a missing page gets the site's `404.html`.
+- **Single-page apps**: `--fallback index.html` answers addresses with no file, while a missing `app.js` stays a 404.
+- **Releases without a restart**: `--root` may be a symbolic link; swap it to a new build and the next request is served from it.
+- **Caching done right**: ETag and Last-Modified on every file; names a build stamped with a hash are cached for a year, pages are revalidated.
+- **Compression**: A `.br` or `.gz` copy next to a file is sent when the browser takes it; other text files are compressed once and kept.
+- **Never waits on the disk**: Small files are kept in memory, large ones sent with `sendfile`; inotify sees every change at once.
+- **Nothing leaks**: `..`, links pointing out of `--root` and hidden files (`.env`, `.git/`) are 404, `.well-known` excepted.
 
 ## Works with
 
-The entrance [proxy](rt-proxy.txt) terminates TLS in front of it. An [idp](rt-idp.txt) signs people in; its `admins` are admins here.
+The entrance [proxy](rt-proxy.txt) of a [dns](rt-dns.txt) runtime gives it HTTPS under its `--domain`; see the [public HTTPS recipe](deploy.txt). For a site that also needs WebSocket or a Lua handler, use a [server](rt-server.txt) with `--http`.
 
 ## Flags
 
-Every flag a mcp runtime takes, by group.
+Every flag a web runtime takes, by group.
 
 **Basics**
 
@@ -4051,7 +4050,6 @@ Every flag a mcp runtime takes, by group.
 |---|---|---|
 | `-p` | int | Port: The port it listens on (a client: the port of its target). |
 | `-s` |  | Start now: Start it as soon as it is made. |
-| `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
 
 **Network**
 
@@ -4074,38 +4072,40 @@ Every flag a mcp runtime takes, by group.
 |---|---|---|
 | `--log` | path | State log: A file it appends each state change to. |
 
-**MCP**
+**Web**
 
 | flag | value | what it does |
 |---|---|---|
-| `--keys` | path | Keys: The keys that may call it, one per line: name and secret, plus admin for a key that may change the daemon. |
-| `--anonymous` |  | Anonymous: Anyone may call it without a key; only for a port no other machine can reach. |
-| `--origins` | list | Origins: The web origins a browser may call it from, or * for any. |
-| `--tools` | one of none, daemon | Daemon tools: This daemon's runtimes as tools: listed and read by every key, started and stopped by an admin's. |
-| `--instructions` | text | Instructions: What a client is told the server is for. |
-| `--idp` | text | Identity provider: The idp runtime whose people sign in, by an access token for https://<first name>/mcp. |
-| `--idp-audience` | list | Token clients: The idp's clients whose own access tokens it takes as well. |
+| `--root` | path | Document root: The directory whose files are the site. Required. |
+| `--index` | text | Index page: The file a directory's address is answered with, index.html unless given. |
+| `--fallback` | text | Fallback page: The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise. |
 
 ## Benchmarks
 
 A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
 
-### MCP server over Streamable HTTP
+### Static site: pages, assets, compression, revalidation
 
-MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 9 passes, 2026-11-07, socketley fc762708.
+nginx 1.28.3, 9 passes, 2026-11-07, socketley fc762708.
 
-| case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
-|---|---|---|---|---|---|
-| initialize + tools/list, a new session each, 64 at once | 69 K req/s (0.97 cores) | 1.2 K req/s (1.00 cores) | 1.7 K req/s (1.00 cores) | 59.16× (58.11–59.90) | 40.67× (39.88–42.23) |
-| tools/call add(a, b), 64 sessions | 135 K req/s (0.99 cores) | 5.3 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 25.64× (24.86–26.09) | 19.05× (18.32–19.32) |
-| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.91 cores) | 5.3 K req/s (1.00 cores) | 6.8 K req/s (1.00 cores) | 10.29× (10.11–10.67) | 8.03× (7.98–8.25) |
-| resources/read, 1 KiB of text, 64 sessions | 151 K req/s (0.96 cores) | 5.4 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.14× (25.58–28.81) | 20.47× (19.89–20.83) |
+| case | socketley | nginx | socketley vs nginx |
+|---|---|---|---|
+| page 4 KiB, keep-alive, 256 connections | 203 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.19× (3.81–4.47) |
+| page 4 KiB, a connection per request, 64 at once | 73 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 2.33× (2.18–2.60) |
+| asset 64 KiB (hashed name), keep-alive, 256 connections | 70 K req/s (1.00 cores) | 42 K req/s (1.00 cores) | 1.67× (1.46–2.23) |
+| file 1 MiB, keep-alive, 64 connections | 25 K req/s (1.00 cores) | 20 K req/s (1.00 cores) | 1.21× (1.11–1.32) |
+| page 4 KiB as gzip, the .gz beside it | 238 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.91× (4.56–5.24) |
+| page 4 KiB as brotli, the .br beside it | 231 K req/s (1.00 cores) | 49 K req/s (1.00 cores) | 4.61× (4.23–5.08) |
+| page 4 KiB as gzip, no .gz on disk | 232 K req/s (1.00 cores) | 26 K req/s (1.00 cores) | 9.19× (8.81–10.08) |
+| revalidation: If-None-Match, 304 | 239 K req/s (1.00 cores) | 64 K req/s (1.00 cores) | 3.76× (2.87–4.10) |
+| missing file: the site's 404.html | 224 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 5.53× (5.16–5.95) |
+| 10,000 pages of 4 KiB at random | 203 K req/s (1.00 cores) | 53 K req/s (1.00 cores) | 3.86× (3.60–4.05) |
 
-How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 6s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
+How it was measured: wrk 8 threads, 8 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row.
 
 ## In the manual
 
-Every flag in full, and the rest: man-mcp-flags.txt
+Every flag in full, and the rest: man-web-flags.txt
 
 
 ---

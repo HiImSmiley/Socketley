@@ -29,21 +29,21 @@ Object.assign(P, {
 });
 
 const RT = [
-  ['server', 'TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path', 'nginx'],
-  ['web', 'Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in', 'nginx'],
-  ['client', 'Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting', ''],
-  ['proxy', 'HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI', 'HAProxy, nginx'],
   ['cache', 'In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub', 'Redis, Valkey'],
-  ['storage', 'S3 object storage over a directory, with versioning, replication, a web drive and git', 'MinIO'],
+  ['client', 'Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting', ''],
   ['db', 'JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups', 'MongoDB, PocketBase'],
   ['dns', 'Authoritative name server for its zones, over UDP and TCP, with DNSSEC and transfers', 'NSD, Knot'],
   ['idp', 'OpenID Connect provider with its own accounts, second factors, app passwords and SSH certificates', 'Keycloak'],
   ['mail', 'Mail server: SMTP, submission, IMAP, POP3, JMAP and webmail, mailboxes in a storage', 'Postfix and Dovecot'],
-  ['mqtt', 'MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules', 'Mosquitto'],
+  ['mcp', 'A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients', 'the MCP Python and TypeScript SDKs'],
   ['metrics', 'Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs', 'Prometheus, VictoriaMetrics'],
+  ['mqtt', 'MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules', 'Mosquitto'],
+  ['proxy', 'HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI', 'HAProxy, nginx'],
+  ['server', 'TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path', 'nginx'],
+  ['storage', 'S3 object storage over a directory, with versioning, replication, a web drive and git', 'MinIO'],
   ['sync', 'One job that carries a directory to a storage, from it, or both ways', 'rclone'],
   ['tunnel', 'Makes a machine without an address of its own reachable through an edge it dials', 'frp'],
-  ['mcp', 'A Model Context Protocol server: the tools, resources and prompts its script declares, for AI clients', 'the MCP Python and TypeScript SDKs'],
+  ['web', 'Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in', 'nginx'],
 ];
 const RTI = Object.fromEntries(RT.map(r => [r[0], r]));
 // Why a runtime has no comparison on the benchmarks page.
@@ -427,7 +427,7 @@ async function place(root) {
 // One row of each runtime's benchmarks, the one its set names as its headline, chosen before the numbers were in.
 function glance(caption = true) {
   const tiles = el('div', { class: 'tiles' });
-  for (const s of BENCH?.sets || []) {
+  for (const s of [...(BENCH?.sets || [])].sort((x, y) => x.runtime.localeCompare(y.runtime))) {
     if (s.headline == null) continue;
     const r = s.rows[s.headline], q = r?.r?.[0];
     if (!q) continue;
