@@ -42,6 +42,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/loop/ring_read.h"
 #include "../../shared/loop/write_queue.h"
 #include "../../shared/persist/watched_file.h"
 
@@ -175,9 +176,11 @@ private:
         // The client the entrance in front of the webmail port forwards, whose failed sign-ins count against it.
         std::string forwarded;
         port_kind kind{port_kind::smtp};
-        io_request rd{}, wr{};
-        bool rd_pending{false}, wr_pending{false}, dead{false};
+        socketley::ring_read rd;
+        io_request wr{};
+        bool wr_pending{false}, dead{false};
         bool rearm{false}, reflush{false};
+        // A read buffer of its own, only where the buffer ring cannot lend one.
         std::unique_ptr<char[]> rbuf;
         std::vector<socketley::write_chunk> queue;
         std::vector<socketley::write_chunk> sending;
@@ -518,8 +521,7 @@ private:
     std::vector<std::unique_ptr<conn>> m_closing;
     std::vector<uint64_t> m_close_soon;
     uint64_t m_next_id{1};
-    bool m_ring{false};
-    bool m_multishot{false};
+    socketley::ring_reader m_reads;
     bool m_stopped{false};
     bool m_in_settle{false};
     std::string m_tls_out;

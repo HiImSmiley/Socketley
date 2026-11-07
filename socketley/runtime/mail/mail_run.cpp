@@ -63,9 +63,7 @@ namespace
 {
 
 // The buffer group the runtime's reads take their buffers from, one per runtime type on a loop.
-constexpr uint16_t ring_group = 7;
-constexpr uint32_t ring_bufs = 1024;
-constexpr uint32_t ring_buf_bytes = 4096;
+constexpr socketley::ring_group ring{7, 1024, 4096};
 constexpr int64_t close_grace_ms = 5000;
 // An owned write chunk grows to this and no further.
 constexpr size_t chunk_max = 256u << 10;
@@ -175,7 +173,7 @@ bool loopback(const sockaddr_storage& a)
 mail_run::mail_run(mail_instance& owner, event_loop& loop)
     : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(1 + std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u)),
       // The checks wait on DNS, not on a core, so there are more of them than of cores.
-      m_checks(16), m_spool(loop, m_fio, m_pool),
+      m_checks(16), m_spool(loop, m_fio, m_pool), m_reads(loop, ring),
       m_alive(std::make_shared<bool>(true))
 {
 }
@@ -910,8 +908,7 @@ bool mail_run::start(std::string& why)
             m_bayes_off = m_bayes->apply(text);
         m_bayes_folded_ms = wall::now_ms_coarse();
     }
-    m_ring = m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
-    m_multishot = m_ring && m_loop.recv_multishot_enabled();
+    m_reads.setup();
     // Mail is taken on shard 0 alone, since each shard's spool syncs apart: on one disk four shards took half of what
     // one did.
     const bool takes_mail = m_owner.get_shard_index() == 0;
@@ -1328,28 +1325,15 @@ mail_run::conn* mail_run::find(uint64_t id)
 
 void mail_run::arm_read(conn& c)
 {
-    if (c.dead || c.rd_pending || c.fd < 0)
+    if (c.dead || c.rd.pending || c.fd < 0)
         return;
-    c.rd = io_request{};
-    c.rd.owner = this;
-    c.rd.buffer = reinterpret_cast<char*>(&c);
-    c.rd.fd = c.fd;
     c.rearm = false;
-    // Asked of the loop each time, because a kernel that refuses the flag turns it off after start.
-    if (m_multishot && m_loop.recv_multishot_enabled())
-    {
-        c.rd.type = op_recv_multishot;
-        c.rd.buf_group = static_cast<uint8_t>(ring_group);
-        c.rd_pending = m_loop.submit_recv_multishot(c.fd, ring_group, &c.rd);
-    }
-    else
-    {
+    const auto own = [&] {
         if (!c.rbuf)
-            c.rbuf = std::make_unique<char[]>(ring_buf_bytes);
-        c.rd.type = op_read;
-        c.rd_pending = m_loop.submit_read(c.fd, c.rbuf.get(), ring_buf_bytes, &c.rd);
-    }
-    if (!c.rd_pending)
+            c.rbuf = std::make_unique<char[]>(ring.bytes);
+        return std::pair<char*, uint32_t>{c.rbuf.get(), ring.bytes};
+    };
+    if (!m_reads.arm(c.rd, this, &c, c.fd, {}, own))
     {
         c.rearm = true;
         retry_io(c);
@@ -1363,52 +1347,27 @@ void mail_run::retry_io(conn& c)
 
 void mail_run::read_done(conn& c, struct io_uring_cqe* cqe)
 {
-    const int res = cqe->res;
-    // A provided-buffer read is what the loop re-arms a refused multishot as, and it ends like one without F_MORE.
-    if (c.rd.type == op_recv_multishot || c.rd.type == op_read_provided)
-    {
-        const bool more = cqe->flags & IORING_CQE_F_MORE;
-        if (!more)
-            c.rd_pending = false;
-        if (res > 0)
-        {
-            m_loop.for_each_cqe_buf(ring_group, cqe, [&](const char* p, uint32_t n) {
-                if (!c.dead)
-                    bytes_in(c, p, n);
-            });
-        }
-        else if (cqe->flags & IORING_CQE_F_BUFFER)
-            m_loop.return_cqe_buf(cqe, &c.rd);
-        if (c.dead)
-            return;
-        if (res == -ENOBUFS)
-        {
-            if (!more)
-            {
-                c.rearm = true;
-                retry_io(c);
-            }
-            return;
-        }
-        if (res <= 0)
-        {
-            close_conn(c);
-            return;
-        }
-        if (!more)
-            arm_read(c);
-        return;
-    }
-    c.rd_pending = false;
+    using kind = socketley::ring_bytes::kind;
+    auto got = m_reads.take(c.rd, cqe);
     if (c.dead)
         return;
-    if (res <= 0)
+    switch (got.what)
     {
-        close_conn(c);
-        return;
+        // With no buffer to lend, the next read brings the connection's own.
+        case kind::withdrawn:
+        case kind::no_buffer:
+            arm_read(c);
+            return;
+        case kind::eof:
+        case kind::failed:
+            close_conn(c);
+            return;
+        case kind::data:
+            break;
     }
-    bytes_in(c, c.rbuf.get(), static_cast<size_t>(res));
-    if (!c.dead)
+    bytes_in(c, got.data(), got.size());
+    got.give_back();
+    if (!c.dead && !got.more)
         arm_read(c);
 }
 
@@ -1923,7 +1882,7 @@ void mail_run::settle()
             }
         }
     }
-    std::erase_if(m_closing, [](const std::unique_ptr<conn>& c) { return !c->rd_pending && !c->wr_pending; });
+    std::erase_if(m_closing, [](const std::unique_ptr<conn>& c) { return !c->rd.pending && !c->wr_pending; });
     m_in_settle = false;
 }
 
@@ -2882,7 +2841,7 @@ void mail_run::on_cqe(struct io_uring_cqe* cqe)
         accept_done(m_web_l, cqe);
     else if (conn* c = conn_of(req))
     {
-        if (req == &c->rd)
+        if (req == &c->rd.req)
             read_done(*c, cqe);
         else if (req == &c->wr && c->kwait)
             kernel_room(*c, cqe->res);
