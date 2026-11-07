@@ -206,6 +206,14 @@ public:
     // Count a request answered overloaded at `b`, and say so in the log the first time each bound refuses.
     void note_overloaded(overload_bound b);
     uint64_t stat_overloaded(overload_bound b) const { return m_stat_overloaded[static_cast<size_t>(b)]; }
+    // Every bound's count together, so a caller can tell a refusal at a bound from one for want of a target.
+    uint64_t stat_overloaded_total() const
+    {
+        uint64_t n = 0;
+        for (const uint64_t c : m_stat_overloaded)
+            n += c;
+        return n;
+    }
     // One `requests_overloaded_<bound>:N` line per bound, every bound always listed, and the most ever parked at once.
     std::string bound_stats() const;
 

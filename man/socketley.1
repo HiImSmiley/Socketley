@@ -17689,7 +17689,8 @@ and the same for the requests the runtime has out to other runtimes
 .RB ( mail_asks_out ,
 .BR mail_asks_waiting ,
 .BR mail_asks_waited ,
-at most 2048 out).
+at most 2048 out); a request the queue to other runtimes has no room for this
+turn waits for the next.
 Deliveries to one mailbox while its account is being looked up wait on that one
 lookup, so a burst asks the idp once per name
 .RB ( mail_idp_lookups ).

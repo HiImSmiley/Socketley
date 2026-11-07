@@ -2916,6 +2916,11 @@ void mail_run::on_loop_turn()
                     flush(*c);
             }
     }
+    if (m_asks_retry)
+    {
+        m_asks_retry = false;
+        pump_asks();
+    }
     if (m_delivery)
         m_delivery->on_loop_turn();
     settle();
@@ -3253,14 +3258,29 @@ void mail_run::post_ask(const std::string& target, std::string payload,
                         std::function<void(request_status, std::string_view)> cb)
 {
     auto* mgr = m_owner.get_runtime_manager();
+    if (!mgr || m_stopped)
+    {
+        cb(request_status::no_target, {});
+        return;
+    }
+    request_channel& ch = mgr->requests();
     const uint64_t cookie = next_cookie();
     expect_reply(cookie, cb);
-    if (!mgr || m_stopped ||
-        !mgr->requests().post_owned(this, cookie, target, std::move(payload), request_class::background))
+    const size_t queued = ch.pending();
+    const uint64_t refused = ch.stat_overloaded_total();
+    if (ch.post_owned(this, cookie, target, std::move(payload), request_class::background))
+        return;
+    m_replies.erase(cookie);
+    // The payload is still ours, as a refused post takes nothing.
+    const bool bound = ch.stat_overloaded_total() != refused;
+    if (bound && queued > 0)
     {
-        m_replies.erase(cookie);
-        cb(request_status::no_target, {});
+        // A queue full this turn is drained by the next, so the ask waits for that rather than failing.
+        m_asks_waiting.push_front({target, std::move(payload), std::move(cb)});
+        m_asks_retry = true;
+        return;
     }
+    cb(bound ? request_status::overloaded : request_status::no_target, {});
 }
 
 void mail_run::pump_asks()
@@ -3269,7 +3289,7 @@ void mail_run::pump_asks()
     if (m_asks_pumping)
         return;
     m_asks_pumping = true;
-    while (!m_stopped && m_replies.size() < asks_most && !m_asks_waiting.empty())
+    while (!m_stopped && !m_asks_retry && m_replies.size() < asks_most && !m_asks_waiting.empty())
     {
         waiting_ask a = std::move(m_asks_waiting.front());
         m_asks_waiting.pop_front();

@@ -11,6 +11,8 @@
 #   * a bound on deliveries that never lets the held ones go: all of them must be delivered once the store answers
 #   * a bound that is never reached, which would make the first assertion hold on any build: mail_local_waited
 #   * the bound that refused not being named: `stats` lists every requests_overloaded_<bound> line
+#   * a turn's puts of large messages past the request queue's 12 MiB for background work refused and deferred,
+#     where they can wait for the next turn's room
 #   * a deferral that says the store "does not answer" and not why, or, for a message streamed in pieces, "would not
 #     take it:" with no reason at all
 set -uo pipefail
@@ -54,11 +56,11 @@ done
 ready_tcp 127.0.0.1 "$SMTP" || bad "the mail runtime takes SMTP" "$(tail -5 "$SOCKETLEY_DLOG")"
 
 send() {
-    python3 - "$SMTP" "$USERS" "$1" <<'PY'
+    python3 - "$SMTP" "$USERS" "$1" "${2:-1000}" <<'PY'
 import smtplib, sys, threading
-port, users, msgs = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+port, users, msgs, size = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 rcpts = ["u%d@example.test" % k for k in range(users)]
-body = "From: a@client.test\r\nSubject: burst\r\n\r\n" + "x" * 1000 + "\r\n"
+body = "From: a@client.test\r\nSubject: burst\r\n\r\n" + "x" * size + "\r\n"
 sent = [0]
 def one(n):
     s = smtplib.SMTP("127.0.0.1", port, timeout=30)
@@ -104,6 +106,22 @@ lines=$("$BIN" stats m | grep -c '^requests_overloaded_')
 over=$("$BIN" stats m | grep -E '^requests_overloaded_' | awk -F: '{s+=$2} END {print s+0}')
 [ "$lines" -ge 6 ] && [ "$over" = 0 ] && ok "stats lists every bound that answers overloaded, and none did" \
     || bad "stats names the bounds" "$("$BIN" stats m | grep -E '^requests_')"
+
+# ── Messages of most of a mebibyte: a turn's puts past the queue's bytes wait for the next turn ──
+BIG=8
+HELD=$("$BIN" stats st | grep -oP '^pid:\K[0-9]+' | head -1)
+kill -STOP "$HELD"
+sent=$(send $BIG 900000)
+sleep 1
+kill -CONT "$HELD"; HELD=""
+want=$(( want + BIG * USERS ))
+for _ in $(seq 1 600); do [ "$(stat_of m mail_delivered)" = "$want" ] && break; sleep 0.1; done
+delivered=$(stat_of m mail_delivered); deferred=$(stat_of m mail_deferred)
+echo "  900 KB: delivered ${delivered:-?} of $want, deferred ${deferred:-?}"
+[ "$sent" = "$BIG" ] && [ "${deferred:-1}" = 0 ] && [ "$delivered" = "$want" ] \
+    && ok "a burst of $BIG messages of 900 KB to $USERS mailboxes is delivered whole, none deferred" \
+    || bad "large messages are not deferred for the queue's bytes" \
+           "sent ${sent:-0}, ${delivered:-?} of $want, $(grep -m2 ': deferred (' "$SOCKETLEY_DLOG") $("$BIN" stats m | grep -E '^requests_overloaded_queue')"
 
 # ── A store that is gone: the deferral says why, the streamed one too ──
 "$BIN" stop st >/dev/null 2>&1

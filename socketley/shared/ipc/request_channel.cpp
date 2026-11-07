@@ -63,7 +63,7 @@ std::string overload_bound_text(overload_bound b)
 void request_channel::note_overloaded(overload_bound b)
 {
     if (++m_stat_overloaded[static_cast<size_t>(b)] == 1)
-        LOG_WARN(("request channel: a request was answered overloaded because " + overload_bound_text(b) +
+        LOG_WARN(("request channel: a request was refused as overloaded because " + overload_bound_text(b) +
                   "; counted as requests_overloaded_" + overload_bound_name(b) + " in stats").c_str());
 }
 

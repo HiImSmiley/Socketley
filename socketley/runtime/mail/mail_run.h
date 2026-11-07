@@ -542,6 +542,8 @@ private:
     std::deque<waiting_ask> m_asks_waiting;
     uint64_t m_asks_waited{0};
     bool m_asks_pumping{false};
+    // An ask the channel's queue refused for being full this turn, tried again on the next.
+    bool m_asks_retry{false};
     // The next asks waiting, as many as there is room for.
     void pump_asks();
     void post_ask(const std::string& target, std::string payload,
