@@ -1,6 +1,6 @@
 #pragma once
 // The connections of a runtime that answers on a TCP port, over the ring: the listener and its accepts, every
-// connection's one read and one write in flight, the requests it pipelines answered in order, and a connection
+// connection's one standing read and one write in flight, the requests it pipelines answered in order, and a connection
 // let go only once the ring owes it nothing. The runtime says what a connection holds and answers what was read;
 // db and idp each kept a copy of this, and a fix to one did not reach the other.
 #include <cstddef>
@@ -15,6 +15,7 @@
 #include "../loop/event_loop.h"
 #include "../net/read_buffer.h"
 #include "../loop/event_loop_definitions.h"
+#include "../loop/ring_read.h"
 
 class runtime_instance;
 
@@ -26,8 +27,9 @@ struct server_conn
     uint64_t id{0};
     int fd{-1};
     sockaddr_storage peer{};
-    io_request rd{}, wr{}, cn{};
-    bool rd_pending{false}, wr_pending{false}, cn_pending{false}, dead{false};
+    socketley::ring_read rd;
+    io_request wr{}, cn{};
+    bool wr_pending{false}, cn_pending{false}, dead{false};
     // The far side wrote its last and this one may still write, for a runtime whose read_ended() keeps it open.
     bool read_eof{false};
     // An answer is made on a later turn, so nothing more is read off this connection meanwhile.
@@ -36,6 +38,10 @@ struct server_conn
     bool held{false};
     // Its read was withdrawn by trim(), to be armed again on the first read size.
     bool trimming{false};
+    // A read has brought bytes; the first is a single recv, so a client that asks once and closes owes no withdrawal.
+    bool rd_heard{false};
+    // The far side's end, met by the standing recv while no read was wanted, and taken up when one is.
+    bool eof_seen{false};
     bool keep_alive{true};
     std::string in;
     // What the runtime has answered and is not yet going out; it appends here at any time.
@@ -45,7 +51,8 @@ struct server_conn
     std::string sending;
     size_t sent{0};
     int64_t last{0};
-    // 16 KiB a read, growing to 256 KiB for a connection that streams (shared/net/read_buffer.h).
+    // 16 KiB a read, growing to 256 KiB for a connection that streams (shared/net/read_buffer.h); its bytes are
+    // made only for a read the ring does not lend a buffer.
     socketley::read_buffer<16384> rbuf;
 
     // The bytes answered and not yet gone, in flight or after it.
@@ -88,6 +95,11 @@ class conn_server
 public:
     // What may be owed to one client before its next request waits for it to read.
     static constexpr size_t out_max = 1u << 20;
+    // What a standing recv may bring while its connection takes no requests before it is withdrawn.
+    static constexpr size_t in_max = 64u << 10;
+    // The loop's buffer group for these reads, shared by every conn_server of the process, and its geometry: one
+    // buffer is the first read size, so a recv that fills it is a connection that streams.
+    static constexpr socketley::ring_group ring{0, 256, 16384};
     conn_server(event_loop& loop, io_handler* owner, runtime_instance& rt, conn_hooks& hooks, size_t max_conns);
 
     // The port on `addr` (network order), every shard's at once when `shared`; -1 with `why` when it cannot be.
@@ -140,8 +152,15 @@ private:
     void arm_accept();
     void accept_done(struct io_uring_cqe* cqe);
     std::shared_ptr<server_conn> conn_of(io_request* req);
+    // The buffer ring, set up before the first connection so its pages are not counted against one.
+    void ensure_ring();
     void arm_read(const std::shared_ptr<server_conn>& c);
-    void read_done(const std::shared_ptr<server_conn>& c, int res);
+    // Whether a read would be asked for now: not while an answer waits, the client owes reading, or the last answer
+    // closes the connection.
+    bool wants_read(const server_conn& c) const;
+    // The far side wrote its last.
+    void ended(const std::shared_ptr<server_conn>& c);
+    void read_done(const std::shared_ptr<server_conn>& c, struct io_uring_cqe* cqe);
     void write_done(const std::shared_ptr<server_conn>& c, int res);
     void connect_done(const std::shared_ptr<server_conn>& c, int res);
     // After serve(): the next read, unless the connection waits, closes, or owes its client too much.
@@ -165,6 +184,8 @@ private:
     // The last accept failed for want of descriptors and none is armed.
     bool m_accept_starved{false};
     bool m_stopped{false};
+    socketley::ring_reader m_reads;
+    bool m_ring_asked{false};
     std::unordered_map<uint64_t, std::shared_ptr<server_conn>> m_conns;
     // Let go, and still owed a read or a write by the ring.
     std::vector<std::shared_ptr<server_conn>> m_closing;

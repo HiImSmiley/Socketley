@@ -2078,6 +2078,46 @@ project "test_conn_transfer"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: a connection's read off the ring, decided in one place ───
+
+project "test_ring_read"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        ".",
+        "thirdparty/doctest",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "socketley",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
+
+    files { "test/unit/test_ring_read.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: the one ear a UDP server has, and what re-arms it ───
 
 project "test_udp_recv_ladder"

@@ -17,10 +17,13 @@
 namespace socketley::http
 {
 
+// A recv that fills one of the ring's buffers is the read that grows a connection's own buffer.
+static_assert(conn_server::ring.bytes == 16384, "the ring's buffer is the first read size of server_conn::rbuf");
+
 
 conn_server::conn_server(event_loop& loop, io_handler* owner, runtime_instance& rt, conn_hooks& hooks,
                          size_t max_conns)
-    : m_loop(loop), m_owner(owner), m_rt(rt), m_hooks(hooks), m_max_conns(max_conns)
+    : m_loop(loop), m_owner(owner), m_rt(rt), m_hooks(hooks), m_max_conns(max_conns), m_reads(loop, ring)
 {
 }
 
@@ -109,6 +112,7 @@ std::shared_ptr<server_conn> conn_server::dial(const sockaddr_storage& addr, soc
             return nullptr;
         }
     }
+    ensure_ring();
     auto c = m_hooks.make_conn();
     c->id = m_next_id++;
     c->fd = fd;
@@ -159,13 +163,22 @@ void conn_server::connect_done(const std::shared_ptr<server_conn>& c, int res)
 
 void conn_server::forget_if_idle(const std::shared_ptr<server_conn>& c)
 {
-    if (!c->rd_pending && !c->wr_pending && !c->cn_pending)
+    if (!c->rd.pending && !c->wr_pending && !c->cn_pending)
         std::erase(m_closing, c);
 }
 
 void conn_server::start_accepting()
 {
+    ensure_ring();
     arm_accept();
+}
+
+void conn_server::ensure_ring()
+{
+    if (m_ring_asked)
+        return;
+    m_ring_asked = true;
+    m_reads.setup();
 }
 
 void conn_server::stop()
@@ -264,13 +277,14 @@ bool conn_server::on_cqe(io_request* req, struct io_uring_cqe* cqe)
         accept_done(cqe);
         return true;
     }
-    if (req->type != op_read && req->type != op_write && req->type != op_connect)
+    if (!is_read_op(req->type) && req->type != op_write && req->type != op_connect)
         return false;
+    // Not this server's: an owner with several asks each in turn, and a connection is forgotten only after its last.
     auto c = conn_of(req);
     if (!c)
         return false;
-    if (req == &c->rd)
-        read_done(c, cqe->res);
+    if (req == &c->rd.req)
+        read_done(c, cqe);
     else if (req == &c->wr)
         write_done(c, cqe->res);
     else if (req == &c->cn)
@@ -280,49 +294,95 @@ bool conn_server::on_cqe(io_request* req, struct io_uring_cqe* cqe)
 
 void conn_server::arm_read(const std::shared_ptr<server_conn>& c)
 {
-    if (c->dead || c->rd_pending || c->cn_pending || c->read_eof || c->fd < 0)
+    if (c->dead || c->rd.pending || c->cn_pending || c->read_eof || c->fd < 0)
         return;
-    c->rd = io_request{};
-    c->rd.owner = m_owner;
-    c->rd.buffer = reinterpret_cast<char*>(c.get());
-    c->rd.fd = c->fd;
-    c->rd.type = op_read;
-    c->rd_pending = m_loop.submit_read(c->fd, c->rbuf.data(), c->rbuf.size(), &c->rd);
-    if (!c->rd_pending)
+    if (c->eof_seen)
+    {
+        c->eof_seen = false;
+        ended(c);
+        return;
+    }
+    // A connection that streams reads the larger sizes into its own growing buffer; the first read is a single one.
+    const socketley::ring_arm how{.ring = c->rbuf.size() == ring.bytes, .multishot = c->rd_heard};
+    if (!m_reads.arm(c->rd, m_owner, c.get(), c->fd, how,
+                     [&] { return std::pair<char*, uint32_t>{c->rbuf.data(), c->rbuf.size()}; }))
         close_conn(c);
 }
 
-void conn_server::read_done(const std::shared_ptr<server_conn>& c, int res)
+bool conn_server::wants_read(const server_conn& c) const
 {
-    c->rd_pending = false;
-    const bool trimmed = c->trimming;
-    c->trimming = false;
+    return !c.dead && !c.waiting && !c.held && (c.keep_alive || m_hooks.keeps_open(c));
+}
+
+void conn_server::ended(const std::shared_ptr<server_conn>& c)
+{
+    if (m_hooks.read_ended(c))
+        c->read_eof = true;
+    else
+        close_conn(c);
+}
+
+void conn_server::read_done(const std::shared_ptr<server_conn>& c, struct io_uring_cqe* cqe)
+{
+    using kind = socketley::ring_bytes::kind;
+    auto got = m_reads.take(c->rd, cqe);
+    bool trimmed = false;
+    if (!got.more)
+    {
+        trimmed = c->trimming;
+        c->trimming = false;
+    }
     if (c->dead)
     {
+        got.give_back();
         forget_if_idle(c);
         return;
     }
-    // Withdrawn by trim(): armed again on the first read size, with nothing lost, since nothing was read.
-    if (trimmed && res == -ECANCELED)
+    switch (got.what)
     {
-        c->rbuf.reset();
-        arm_read(c);
-        return;
+        case kind::withdrawn:
+            // Withdrawn by trim(): armed again on the first read size, with nothing lost, since nothing was read.
+            if (trimmed)
+                c->rbuf.reset();
+            [[fallthrough]];
+        case kind::no_buffer:
+            if (wants_read(*c))
+                arm_read(c);
+            return;
+        case kind::eof:
+            // The end met while no read was wanted is taken up when one is, as a single read would have met it then.
+            if (wants_read(*c))
+                ended(c);
+            else
+                c->eof_seen = true;
+            return;
+        case kind::failed:
+            close_conn(c);
+            return;
+        case kind::data:
+            break;
     }
-    if (res == 0 && m_hooks.read_ended(c))
-    {
-        c->read_eof = true;
+    const size_t n = got.size();
+    runtime_instance::stat_add(m_rt.m_stat_bytes_in, n);
+    // What a connection that answers no more requests is sent is read away, not kept.
+    if (!c->keep_alive && !m_hooks.keeps_open(*c))
         return;
-    }
-    if (res <= 0)
-    {
-        close_conn(c);
-        return;
-    }
     c->last = wall::now_sec_coarse();
-    c->in.append(c->rbuf.data(), static_cast<size_t>(res));
-    c->rbuf.took(static_cast<size_t>(res));
-    runtime_instance::stat_add(m_rt.m_stat_bytes_in, static_cast<uint64_t>(res));
+    // Copied, since every runtime's serve() parses `in`.
+    c->in.append(got.data(), n);
+    got.give_back();
+    c->rd_heard = true;
+    c->rbuf.took(n);
+    // A recv that filled the ring's buffer is a stream, which reads the larger sizes into its own buffer.
+    if (got.more && c->rbuf.size() != ring.bytes)
+        m_reads.withdraw(c->rd);
+    if (!wants_read(*c))
+    {
+        // Kept for the request that is taken next, up to a bound, past which the socket holds the rest.
+        if (got.more && c->in.size() > in_max)
+            m_reads.withdraw(c->rd);
+        return;
+    }
     m_hooks.serve(c);
     flush(c);
     after_serve(c);
@@ -345,6 +405,7 @@ void conn_server::after_serve(const std::shared_ptr<server_conn>& c)
     if (!c->keep_alive && !m_hooks.keeps_open(*c))
     {
         c->in.clear();
+        m_reads.withdraw(c->rd);
         return;
     }
     // A client that sends requests faster than it reads the answers is not read from until it has caught up; a stream
@@ -352,6 +413,7 @@ void conn_server::after_serve(const std::shared_ptr<server_conn>& c)
     if (c->unsent() > out_max && !m_hooks.keeps_open(*c))
     {
         c->held = true;
+        m_reads.withdraw(c->rd);
         return;
     }
     arm_read(c);
@@ -465,7 +527,7 @@ void conn_server::close_conn(const std::shared_ptr<server_conn>& c)
     }
     m_conns.erase(c->id);
     m_rt.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
-    if (c->rd_pending || c->wr_pending || c->cn_pending)
+    if (c->rd.pending || c->wr_pending || c->cn_pending)
         m_closing.push_back(c);
     // The descriptor just given back is room for the accept that ran out.
     resume_accept();
@@ -491,7 +553,8 @@ void conn_server::trim(int64_t now, int64_t quiet_secs)
             if (c->out.capacity() > keep)
                 std::string().swap(c->out);
         }
-        if (c->rd_pending && !c->trimming && c->rbuf.size() > 16384 && m_loop.submit_cancel_request(&c->rd))
+        if (c->rd.pending && !c->rd.multi && !c->trimming && c->rbuf.size() > ring.bytes &&
+            m_loop.submit_cancel_request(&c->rd.req))
             c->trimming = true;
     }
 }
