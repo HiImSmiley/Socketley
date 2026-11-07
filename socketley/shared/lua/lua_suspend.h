@@ -244,6 +244,9 @@ public:
     using result_fn = std::function<void(lua_State* results, int count, const char* error)>;
     void set_next_result(result_fn fn) { m_next_result = std::move(fn); }
 
+    // Whether the last start() that finished returned the boolean true first, for a caller that only asks that.
+    bool returned_true() const { return m_returned_true; }
+
     // Every await ends in exactly one settle, including the ones whose answer
     // never came.  A script therefore never has to bound its own wait, which is
     // the whole point: `local v, err = self.cache(...)` always returns.
@@ -508,6 +511,10 @@ private:
         if (SOCKETLEY_UNLIKELY(!m_results.empty()))
             give_result(done.th, rc, rc == 0 ? nullptr : err.c_str());
 
+        // Read here because the stack is cleared below, and asked only as a boolean so no allocation is made for it.
+        m_returned_true = rc == 0 && lua_gettop(done.th) >= 1 && lua_type(done.th, 1) == LUA_TBOOLEAN
+                          && lua_toboolean(done.th, 1);
+
         if (done.id != 0)
             m_live.erase(done.id);
         release(done.th, done.ref, rc == 0);
@@ -547,6 +554,7 @@ private:
     std::string m_owner_name;
 
     std::vector<frame>               m_frames;
+    bool                             m_returned_true{false};
 
     // The registry references of frames forget_all() let go while they ran, released after their resume.
 

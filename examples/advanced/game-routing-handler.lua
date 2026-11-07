@@ -57,7 +57,7 @@ function on_client_message(client_id, msg)
         local info = socketley.get(target)
         if not info then
             self.send(client_id, "unknown mode: " .. mode)
-            return
+            return true
         end
 
         if self.route(client_id, target) then
@@ -65,7 +65,8 @@ function on_client_message(client_id, msg)
         else
             self.send(client_id, "could not join " .. mode)
         end
-        return
+        -- A command answered here, so it is not relayed to the rest of the lobby.
+        return true
     end
 
     if msg == "modes" then
@@ -80,7 +81,7 @@ function on_client_message(client_id, msg)
             end
         end
         self.send(client_id, "available: " .. table.concat(modes, ", "))
-        return
+        return true
     end
 
     -- Unrouted messages are broadcast normally

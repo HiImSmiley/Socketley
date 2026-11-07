@@ -30,7 +30,7 @@ In **--mode master**, the flag decides what happens to a NON-master's message. T
 
 Invalid recipients are refused rather than accepted and ignored. Modes **in** and **out** answer nobody at all, so they refuse the flag. The **master** recipient names a connection that no other mode has, so only master mode accepts it.
 
-In **inout**, and for the master's own messages in **master**, a script's **on_message** takes precedence over every recipient. When it is defined, nothing is sent automatically, and **self.send** or **self.broadcast** decides. A non-master's message in **master** mode never reaches **on_message** at all, only **on_client_message**, which does not suppress anything. So there the recipients apply whether or not a script is loaded.
+In **inout**, and for the master's own messages in **master**, a script's **on_message** takes precedence over every recipient. When it is defined, nothing is sent automatically, and **self.send** or **self.broadcast** decides. The same holds for each message whose **on_client_message** returns **true**, so a script that answers there needs no empty on_message, which would cost a second call per message. A non-master's message in **master** mode never reaches **on_message** at all, only **on_client_message**, which suppresses nothing unless it returns **true**. So there the recipients apply whether or not a script is loaded.
 
 Unset, UDP and TCP both send to **others**. Before this flag existed, a UDP sender also received its own datagram back, while a TCP sender did not. **--send-to sender,others** gives that old UDP behaviour.
 

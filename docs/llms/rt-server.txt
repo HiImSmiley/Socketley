@@ -14,9 +14,9 @@ socketley create server api -p 9002 --lua api.lua --cache store -s
 
 ```
 -- room.lua: whoever sends "join" hears everything said in the room
-function on_message(msg) end   -- defined, so nothing is relayed on its own
 function on_client_message(id, msg)
   if msg == "join" then self.join_group(id, "room") else self.group_send("room", msg) end
+  return true   -- handled, so nothing is relayed on its own
 end
 ```
 
@@ -25,7 +25,7 @@ end
 ## What it does
 
 - **One port, four protocols**: TCP lines, WebSocket, HTTP and RESP, [told apart by their first bytes](man-server-flags.txt); `--udp` for datagrams, where a script can only broadcast.
-- **Lua per message**: `on_client_message` answers with `self.send`; connects, disconnects, requests and upgrades have callbacks too. See [Lua](lua.txt).
+- **Lua per message**: `on_client_message` answers with `self.send` and returns `true` to keep the relay out; connects, disconnects, requests and upgrades have callbacks too. See [Lua](lua.txt).
 - **Broadcast and rooms**: `self.broadcast` reaches everyone, `self.multicast` a list, `self.join_group` and `self.group_send` a room.
 - **Relaying without code**: `--mode` and `--send-to` decide who hears a message; `--send-to sender` is an echo server.
 - **HTTP on the same port**: `on_http_request` answers requests; `--http` serves a directory, `--http-cache` holds it in memory.

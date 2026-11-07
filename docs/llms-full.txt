@@ -483,9 +483,9 @@ Called when the runtime stops.
 
 Called when a message is received (server and client). When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
 
-#### `on_client_message(client_id, msg)`
+#### `on_client_message(client_id, msg) -> true`
 
-Called when a message is received, with the sender's id (server only). It fires alongside on_message, for backward compatibility.
+Called when a message is received, with the sender's id (server only). It fires alongside on_message, and first. Returning **true** says the script has handled the message, so nothing is sent automatically: not the relay of **--mode inout** or of the master's messages, and not what **--send-to** names for a non-master. Returning anything else, or nothing, leaves those as they are. A handler still waiting on **self.cache** when the relay runs has not returned yet, so its message is relayed; define on_message to stop the relay for such a script.
 
 #### `on_http_body(client_id, chunk, remaining)`
 
@@ -3594,9 +3594,9 @@ socketley create server api -p 9002 --lua api.lua --cache store -s
 
 ```
 -- room.lua: whoever sends "join" hears everything said in the room
-function on_message(msg) end   -- defined, so nothing is relayed on its own
 function on_client_message(id, msg)
   if msg == "join" then self.join_group(id, "room") else self.group_send("room", msg) end
+  return true   -- handled, so nothing is relayed on its own
 end
 ```
 
@@ -3605,7 +3605,7 @@ end
 ## What it does
 
 - **One port, four protocols**: TCP lines, WebSocket, HTTP and RESP, [told apart by their first bytes](man-server-flags.txt); `--udp` for datagrams, where a script can only broadcast.
-- **Lua per message**: `on_client_message` answers with `self.send`; connects, disconnects, requests and upgrades have callbacks too. See [Lua](lua.txt).
+- **Lua per message**: `on_client_message` answers with `self.send` and returns `true` to keep the relay out; connects, disconnects, requests and upgrades have callbacks too. See [Lua](lua.txt).
 - **Broadcast and rooms**: `self.broadcast` reaches everyone, `self.multicast` a list, `self.join_group` and `self.group_send` a room.
 - **Relaying without code**: `--mode` and `--send-to` decide who hears a message; `--send-to sender` is an echo server.
 - **HTTP on the same port**: `on_http_request` answers requests; `--http` serves a directory, `--http-cache` holds it in memory.
@@ -6515,7 +6515,7 @@ In **--mode master**, the flag decides what happens to a NON-master's message. T
 
 Invalid recipients are refused rather than accepted and ignored. Modes **in** and **out** answer nobody at all, so they refuse the flag. The **master** recipient names a connection that no other mode has, so only master mode accepts it.
 
-In **inout**, and for the master's own messages in **master**, a script's **on_message** takes precedence over every recipient. When it is defined, nothing is sent automatically, and **self.send** or **self.broadcast** decides. A non-master's message in **master** mode never reaches **on_message** at all, only **on_client_message**, which does not suppress anything. So there the recipients apply whether or not a script is loaded.
+In **inout**, and for the master's own messages in **master**, a script's **on_message** takes precedence over every recipient. When it is defined, nothing is sent automatically, and **self.send** or **self.broadcast** decides. The same holds for each message whose **on_client_message** returns **true**, so a script that answers there needs no empty on_message, which would cost a second call per message. A non-master's message in **master** mode never reaches **on_message** at all, only **on_client_message**, which suppresses nothing unless it returns **true**. So there the recipients apply whether or not a script is loaded.
 
 Unset, UDP and TCP both send to **others**. Before this flag existed, a UDP sender also received its own datagram back, while a TCP sender did not. **--send-to sender,others** gives that old UDP behaviour.
 
@@ -11460,9 +11460,9 @@ Called when the runtime stops.
 
 Called when a message is received (server and client). When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
 
-#### `on_client_message(client_id, msg)`
+#### `on_client_message(client_id, msg) -> true`
 
-Called when a message is received, with the sender's id (server only). It fires alongside on_message, for backward compatibility.
+Called when a message is received, with the sender's id (server only). It fires alongside on_message, and first. Returning **true** says the script has handled the message, so nothing is sent automatically: not the relay of **--mode inout** or of the master's messages, and not what **--send-to** names for a non-master. Returning anything else, or nothing, leaves those as they are. A handler still waiting on **self.cache** when the relay runs has not returned yet, so its message is relayed; define on_message to stop the relay for such a script.
 
 #### `on_http_body(client_id, chunk, remaining)`
 

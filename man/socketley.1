@@ -4600,14 +4600,20 @@ automatically, and
 .B self.send
 or
 .B self.broadcast
-decides. A non\-master's message in
+decides. The same holds for each message whose
+.B on_client_message
+returns
+.BR true ,
+so a script that answers there needs no empty on_message, which would cost a
+second call per message. A non\-master's message in
 .B master
 mode never reaches
 .B on_message
 at all, only
 .BR on_client_message ,
-which does not suppress anything. So there the recipients apply whether or not
-a script is loaded.
+which suppresses nothing unless it returns
+.BR true .
+So there the recipients apply whether or not a script is loaded.
 .IP
 Unset, UDP and TCP both send to
 .BR others .
@@ -19739,9 +19745,22 @@ When a server defines this callback, it takes over message handling: the default
 (in \fBinout\fR and \fBmaster\fR modes) is suppressed.
 Use \fBself.broadcast(msg)\fR to relay messages yourself.
 .TP
-.B on_client_message(client_id, msg)
+.B on_client_message(client_id, msg) \(-> true
 Called when a message is received, with the sender's id (server only).
-It fires alongside on_message, for backward compatibility.
+It fires alongside on_message, and first.
+Returning
+.B true
+says the script has handled the message, so nothing is sent automatically: not
+the relay of
+.B \-\-mode inout
+or of the master's messages, and not what
+.B \-\-send\-to
+names for a non-master.
+Returning anything else, or nothing, leaves those as they are.
+A handler still waiting on
+.B self.cache
+when the relay runs has not returned yet, so its message is relayed; define
+on_message to stop the relay for such a script.
 .TP
 .B on_http_body(client_id, chunk, remaining)
 Called with each piece of a request body and the number of bytes still to come after it.

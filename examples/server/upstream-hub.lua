@@ -22,8 +22,9 @@ function on_upstream(conn_id, data)
 end
 
 function on_client_message(client_id, msg)
-    -- Forward client messages to all upstreams
+    -- Forward client messages to all upstreams, and to them only.
     self.upstream_broadcast(msg)
+    return true
 end
 
 function on_start()

@@ -876,7 +876,8 @@ protected:
     void invoke_on_disconnect(int client_id);
     bool invoke_on_auth(int client_id);
     void invoke_on_send(std::string_view msg);
-    void invoke_on_client_message(int client_id, std::string_view msg);
+    // True when the script's handler ran to the end and returned true, which is it saying the message is handled.
+    bool invoke_on_client_message(int client_id, std::string_view msg);
     // The write queue for this connection has drained back under the
     // backpressure watermark.  Dispatched a loop turn after the completion
     // that emptied it, not on that completion's stack -- see the server's

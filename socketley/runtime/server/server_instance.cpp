@@ -5815,6 +5815,8 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     stat_add(m_stat_total_messages, 1);
     // A master login carries its password: it goes to the login below and to nothing that keeps or shows a message.
     const bool login = m_mode == mode_master && msg.size() > 7 && msg.starts_with("master ");
+    // A handler that returned true has answered, so nothing below sends this message on its own.
+    bool handled = false;
     if (!login)
     {
         print_bash_message(msg);
@@ -5823,7 +5825,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 
         // Fire on_client_message callback (sender-aware)
         if (sender)
-            invoke_on_client_message(sender->fd, msg);
+            handled = invoke_on_client_message(sender->fd, msg);
     }
 
     // Cache command interception, asked of the linked cache and answered a
@@ -5869,7 +5871,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
         {
             invoke_on_message(msg);
 
-            if (lua() && lua()->has_on_message())
+            if (handled || (lua() && lua()->has_on_message()))
                 break;
 
             // Unset keeps what inout has always answered.  There is no master
@@ -6073,7 +6075,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             {
                 invoke_on_message(msg);
 
-                if (!(lua() && lua()->has_on_message()))
+                if (!handled && !(lua() && lua()->has_on_message()))
                 {
                     std::string buf;
                     buf.reserve(msg.size() + 1);
@@ -6088,7 +6090,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             // What a NON-master said is what --send-to decides here.  Unset is
             // the empty set and drops it, which is what this mode did before
             // --master-forward and still does without a flag.
-            if (m_send_to == send_to_unset)
+            if (m_send_to == send_to_unset || handled)
                 break;
 
             const bool master_live = m_master_fd >= 0 && m_master_fd < MAX_FDS &&

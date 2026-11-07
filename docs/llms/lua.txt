@@ -33,9 +33,9 @@ Called when the runtime stops.
 
 Called when a message is received (server and client). When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
 
-#### `on_client_message(client_id, msg)`
+#### `on_client_message(client_id, msg) -> true`
 
-Called when a message is received, with the sender's id (server only). It fires alongside on_message, for backward compatibility.
+Called when a message is received, with the sender's id (server only). It fires alongside on_message, and first. Returning **true** says the script has handled the message, so nothing is sent automatically: not the relay of **--mode inout** or of the master's messages, and not what **--send-to** names for a non-master. Returning anything else, or nothing, leaves those as they are. A handler still waiting on **self.cache** when the relay runs has not returned yet, so its message is relayed; define on_message to stop the relay for such a script.
 
 #### `on_http_body(client_id, chunk, remaining)`
 

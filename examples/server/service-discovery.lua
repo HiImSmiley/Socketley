@@ -56,4 +56,6 @@ end
 
 function on_client_message(client_id, msg)
     self.broadcast("[" .. tostring(client_id) .. "] " .. msg)
+    -- Broadcast here, so true keeps the relay from sending the line a second time.
+    return true
 end

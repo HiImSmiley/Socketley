@@ -6,9 +6,9 @@ socketley create server site -p 8080 --http /srv/site --http-cache -s
 socketley create server api -p 9002 --lua api.lua --cache store -s</pre>
 
 <pre class="code"><i>-- room.lua: whoever sends "join" hears everything said in the room</i>
-function on_message(msg) end   <i>-- defined, so nothing is relayed on its own</i>
 function on_client_message(id, msg)
   if msg == "join" then self.join_group(id, "room") else self.group_send("room", msg) end
+  return true   <i>-- handled, so nothing is relayed on its own</i>
 end</pre>
 
 <div class="callout warn"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/></svg><div><code>--cache</code> also stores every ordinary message in the cache, under keys <code>1</code>, <code>2</code>, <code>3</code>… And <code>--http</code> injects a WebSocket script into every HTML page.</div></div>
@@ -16,7 +16,7 @@ end</pre>
 <h2>What it does</h2>
 <div class="feats">
 <div><b>One port, four protocols</b><p>TCP lines, WebSocket, HTTP and RESP, <a href="#/man/server-flags.multi-protocol-auto-detection">told apart by their first bytes</a>; <code>--udp</code> for datagrams, where a script can only broadcast.</p></div>
-<div><b>Lua per message</b><p><code>on_client_message</code> answers with <code>self.send</code>; connects, disconnects, requests and upgrades have callbacks too. See <a href="#/lua">Lua</a>.</p></div>
+<div><b>Lua per message</b><p><code>on_client_message</code> answers with <code>self.send</code> and returns <code>true</code> to keep the relay out; connects, disconnects, requests and upgrades have callbacks too. See <a href="#/lua">Lua</a>.</p></div>
 <div><b>Broadcast and rooms</b><p><code>self.broadcast</code> reaches everyone, <code>self.multicast</code> a list, <code>self.join_group</code> and <code>self.group_send</code> a room.</p></div>
 <div><b>Relaying without code</b><p><code>--mode</code> and <code>--send-to</code> decide who hears a message; <code>--send-to sender</code> is an echo server.</p></div>
 <div><b>HTTP on the same port</b><p><code>on_http_request</code> answers requests; <code>--http</code> serves a directory, <code>--http-cache</code> holds it in memory.</p></div>

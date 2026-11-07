@@ -1025,16 +1025,21 @@ void runtime_instance::set_event_loop(event_loop* loop) { m_event_loop = loop; }
 runtime_manager* runtime_instance::get_runtime_manager() const { return m_runtime_manager; }
 event_loop* runtime_instance::get_event_loop() const { return m_event_loop; }
 
-void runtime_instance::invoke_on_client_message(int client_id, std::string_view msg)
+bool runtime_instance::invoke_on_client_message(int client_id, std::string_view msg)
 {
-    if (m_cb_on_client_message) { m_cb_on_client_message(client_id, msg); return; }
+    if (m_cb_on_client_message) { m_cb_on_client_message(client_id, msg); return false; }
     if (!m_lua || !m_lua->has_on_client_message())
-        return;
+        return false;
 
 #ifndef SOCKETLEY_NO_LUA
+    // A handler that is still waiting has not answered yet, so what is sent on its own goes ahead as before.
     lua_suspender::id_t id = 0;
-    m_lua->suspender().start(m_lua->raw_on_client_message(), "on_client_message",
-                             m_lua->callback_timeout_ms(), id, client_id, msg);
+    auto& sus = m_lua->suspender();
+    return sus.start(m_lua->raw_on_client_message(), "on_client_message",
+                     m_lua->callback_timeout_ms(), id, client_id, msg) == lua_suspender::outcome::finished
+           && sus.returned_true();
+#else
+    return false;
 #endif
 }
 
