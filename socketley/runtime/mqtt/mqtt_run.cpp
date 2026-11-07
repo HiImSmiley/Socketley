@@ -43,9 +43,7 @@ namespace
 {
 
 // The buffer group the broker's reads take their buffers from, one per runtime type on a loop.
-constexpr uint16_t ring_group = 6;
-constexpr uint32_t ring_bufs = 1024;
-constexpr uint32_t ring_buf_bytes = 4096;
+constexpr socketley::ring_group ring{6, 1024, 4096};
 constexpr int64_t close_grace_ms = 5000;
 constexpr int64_t handshake_ms = 10000;
 constexpr size_t tap_limit = 10000;
@@ -133,7 +131,8 @@ std::string message_line(const message& m)
 }   // namespace
 
 mqtt_run::mqtt_run(mqtt_instance& owner, event_loop& loop)
-    : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(2), m_alive(std::make_shared<bool>(true))
+    : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(2), m_reads(loop, ring),
+      m_alive(std::make_shared<bool>(true))
 {
 }
 
@@ -264,8 +263,7 @@ bool mqtt_run::start(std::string& why)
         why.clear();
     }
 
-    m_ring      = m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
-    m_multishot = m_ring && m_loop.recv_multishot_enabled();
+    m_reads.setup();
 
     if (!open_listener(m_tcp, m_owner.effective_port(), false, why))
         return false;
@@ -473,98 +471,57 @@ const mqtt_run::conn* mqtt_run::find(uint64_t id) const
 
 void mqtt_run::arm_read(conn& c)
 {
-    if (c.dead || c.rd_pending || c.fd < 0 || c.paused || c.write_held)
+    if (c.dead || c.rd.pending || c.fd < 0 || c.paused || c.write_held)
         return;
-    c.rd        = io_request{};
-    c.rd.owner  = this;
-    c.rd.buffer = reinterpret_cast<char*>(&c);
-    c.rd.fd     = c.fd;
-    c.rearm     = false;
-    // Asked of the loop each time, because a kernel that refuses the flag turns it off after start.
-    if (m_multishot && m_loop.recv_multishot_enabled())
-    {
-        c.rd.type      = op_recv_multishot;
-        c.rd.buf_group = static_cast<uint8_t>(ring_group);
-        c.rd_pending   = m_loop.submit_recv_multishot(c.fd, ring_group, &c.rd);
-    }
-    else
-    {
+    c.rearm = false;
+    const auto own = [&] {
         if (!c.rbuf)
-            c.rbuf = std::make_unique<char[]>(ring_buf_bytes);
-        c.rd.type    = op_read;
-        c.rd_pending = m_loop.submit_read(c.fd, c.rbuf.get(), ring_buf_bytes, &c.rd);
-    }
+            c.rbuf = std::make_unique<char[]>(ring.bytes);
+        return std::pair<char*, uint32_t>{c.rbuf.get(), ring.bytes};
+    };
     // The ring had no room: asked again on the next turn.
-    if (!c.rd_pending)
+    if (!m_reads.arm(c.rd, this, &c, c.fd, {}, own))
         c.rearm = true;
 }
 
 void mqtt_run::read_done(conn& c, struct io_uring_cqe* cqe)
 {
-    const int res = cqe->res;
-    // A provided-buffer read is what the loop re-arms a refused multishot as, and it ends like one without F_MORE.
-    if (c.rd.type == op_recv_multishot || c.rd.type == op_read_provided)
-    {
-        const bool more = cqe->flags & IORING_CQE_F_MORE;
-        const bool was_withdrawing = c.withdrawing;
-        if (!more)
-        {
-            c.rd_pending = false;
-            c.withdrawing = false;
-        }
-        if (res > 0)
-        {
-            m_loop.for_each_cqe_buf(ring_group, cqe, [&](const char* p, uint32_t n) {
-                if (!c.dead)
-                    bytes_in(c, p, n);
-            });
-        }
-        else if (cqe->flags & IORING_CQE_F_BUFFER)
-            m_loop.return_cqe_buf(cqe, &c.rd);
-        if (c.dead)
-        {
-            if (!c.rd_pending && !c.wr_pending)
-                std::erase_if(m_closing, [&](const std::unique_ptr<conn>& x) { return x.get() == &c; });
-            return;
-        }
-        if (res == -ENOBUFS)
-        {
-            if (!more)
-                c.rearm = true;
-            return;
-        }
-        // Taken back by withdraw_read(), and armed again here when the connection went on before it came back.
-        if (res == -ECANCELED && !more && was_withdrawing)
-        {
-            arm_read(c);
-            return;
-        }
-        if (res <= 0)
-        {
-            close_conn(c);
-            return;
-        }
-        if (!more)
-            arm_read(c);
-        else if (c.paused || c.write_held)
-            withdraw_read(c);
-        return;
-    }
-    c.rd_pending = false;
+    using kind = socketley::ring_bytes::kind;
+    auto got = m_reads.take(c.rd, cqe);
     if (c.dead)
     {
-        if (!c.wr_pending)
+        got.give_back();
+        if (!c.rd.pending && !c.wr_pending)
             std::erase_if(m_closing, [&](const std::unique_ptr<conn>& x) { return x.get() == &c; });
         return;
     }
-    if (res <= 0)
+    switch (got.what)
     {
-        close_conn(c);
-        return;
+        // Taken back by withdraw_read(): armed again here when the connection may read.
+        case kind::withdrawn:
+            arm_read(c);
+            return;
+        // A flood ran the ring dry: read again from it on the next turn, once its buffers are back, in one submission
+        // where a read into a buffer of its own first would be two.
+        case kind::no_buffer:
+            c.rd.own_next = false;
+            c.rearm = true;
+            return;
+        case kind::eof:
+        case kind::failed:
+            close_conn(c);
+            return;
+        case kind::data:
+            break;
     }
-    bytes_in(c, c.rbuf.get(), static_cast<size_t>(res));
-    if (!c.dead)
+    bytes_in(c, got.data(), got.size());
+    got.give_back();
+    if (c.dead)
+        return;
+    if (!got.more)
         arm_read(c);
+    else if (c.paused || c.write_held)
+        withdraw_read(c);
 }
 
 void mqtt_run::bytes_in(conn& c, const char* p, size_t n)
@@ -927,7 +884,7 @@ void mqtt_run::kernel_room(conn& c, int res)
     c.kwait = false;
     if (c.dead)
     {
-        if (!c.rd_pending)
+        if (!c.rd.pending)
             std::erase_if(m_closing, [&](const std::unique_ptr<conn>& x) { return x.get() == &c; });
         return;
     }
@@ -985,8 +942,7 @@ void mqtt_run::pause_reading(uint64_t id, bool paused)
 void mqtt_run::withdraw_read(conn& c)
 {
     // A single read ends by itself and is not armed again; one the ring would not take back is asked at its next.
-    if (c.rd_pending && c.rd.type == op_recv_multishot && !c.withdrawing)
-        c.withdrawing = m_loop.submit_cancel_request(&c.rd);
+    m_reads.withdraw(c.rd);
 }
 
 size_t mqtt_run::backlog(uint64_t id) const
@@ -1071,7 +1027,7 @@ void mqtt_run::write_done(conn& c, int res)
     c.wr_pending = false;
     if (c.dead)
     {
-        if (!c.rd_pending)
+        if (!c.rd.pending)
             std::erase_if(m_closing, [&](const std::unique_ptr<conn>& x) { return x.get() == &c; });
         return;
     }
@@ -1199,7 +1155,7 @@ void mqtt_run::settle()
                 close_conn(*c);
         }
     }
-    std::erase_if(m_closing, [](const std::unique_ptr<conn>& c) { return !c->rd_pending && !c->wr_pending; });
+    std::erase_if(m_closing, [](const std::unique_ptr<conn>& c) { return !c->rd.pending && !c->wr_pending; });
     m_in_settle = false;
 }
 
@@ -1230,7 +1186,7 @@ void mqtt_run::on_cqe(struct io_uring_cqe* cqe)
         accept_done(m_ws, cqe);
     else if (conn* c = conn_of(req))
     {
-        if (req == &c->rd)
+        if (req == &c->rd.req)
             read_done(*c, cqe);
         else if (req == &c->wr && c->kwait)
             kernel_room(*c, cqe->res);

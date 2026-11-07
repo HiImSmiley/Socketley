@@ -13,6 +13,8 @@
 #include <vector>
 
 #include <openssl/ssl.h>
+
+#include "../../shared/loop/ring_read.h"
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -108,17 +110,17 @@ private:
         uint64_t id{0};
         int fd{-1};
         sockaddr_in peer{};
-        io_request rd{}, wr{};
-        bool rd_pending{false}, wr_pending{false}, dead{false};
+        socketley::ring_read rd;
+        io_request wr{};
+        bool wr_pending{false}, dead{false};
         // The ring had no buffer to give, or no room for a write, so it is asked again on a later turn.
         bool rearm{false};
         bool reflush{false};
-        // The broker holds its next packet, so it is not read until it may go on; a multishot read is being taken back.
+        // The broker holds its next packet, so it is not read until it may go on.
         bool paused{false};
-        bool withdrawing{false};
         // Owed more than m_read_hold: a peer that does not read what it is sent is not read either until it has.
         bool write_held{false};
-        // A read buffer of its own, only where the buffer ring cannot be used.
+        // A read buffer of its own, only where the buffer ring cannot lend one.
         std::unique_ptr<char[]> rbuf;
         // Bytes not yet gone, oldest first: the ones queued since the last write, and the ones the ring is sending
         // now, which stay where they are until it has. A large payload is a slice of the message every subscriber
@@ -336,8 +338,7 @@ private:
     std::vector<std::unique_ptr<conn>> m_closing;
     std::vector<uint64_t> m_close_soon;
     uint64_t m_next_id{1};
-    bool m_ring{false};
-    bool m_multishot{false};
+    socketley::ring_reader m_reads;
     bool m_stopped{false};
     bool m_in_settle{false};
 
