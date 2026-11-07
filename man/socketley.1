@@ -1218,6 +1218,16 @@ For a pair below 64 KiB it is an upper bound.
 .B fast_lo_over_budget
 is 1 while new sends are being tainted because of the budget.
 .IP
+.B requests_overloaded_queue
+and the other
+.B requests_overloaded_
+lines count the requests the daemon's own request channel answered
+.BR overloaded ,
+by the bound that refused them, as a runtime's
+.B stats
+does for its own (see
+.BR "Between runtimes on one machine" ).
+.IP
 The metrics endpoint exports the same figures as
 .BR socketley_fast_lo_info{mode} ,
 .BR socketley_fast_lo_sockets{path} ,
@@ -4331,6 +4341,30 @@ and
 .BR peer_relayed ,
 which tell a request that went through the daemon from one that went straight
 across.
+.PP
+A request is answered
+.B overloaded
+only by a bound that was full, and each bound is counted in the asking
+runtime's
+.B stats
+(and the daemon's in
+.BR "socketley daemon stats" ):
+.B requests_overloaded_queue
+and
+.B _queue_bytes
+(the queue of requests not yet sent, 32768 of them),
+.B _parked
+(the requests awaiting an answer, 4096, of which background work such as a
+mail delivery may hold 3072),
+.B _wakeup
+(the event loop took no wakeup),
+.B _way
+(the socket the request goes out on was full) and
+.B _answer_way
+(the socket its answer goes back on was full).
+.B requests_parked_most
+is the most that were ever awaiting an answer at once.
+The first refusal at each bound is also one line in the daemon log, naming it.
 .PP
 Measured with a server posting every cache command to a cache runtime, the two
 arms differing only in whether they were introduced, a round trip falls from

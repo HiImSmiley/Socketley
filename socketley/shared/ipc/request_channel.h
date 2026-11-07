@@ -37,6 +37,21 @@ enum class request_class : uint8_t
 
 const char* request_status_text(request_status st);
 
+// Which bound answered a request `overloaded`, each counted apart so `stats` names the one that refused.
+enum class overload_bound : uint8_t
+{
+    queue = 0,          // the queue's count of requests
+    queue_bytes,        // the queue's bytes
+    parked,             // the table of requests whose answer comes on a later turn
+    wakeup,             // the ring took no wakeup for the queue
+    way,                // the socket the request goes out on had no room
+    answer_way,         // the socket an answer goes back on had no room
+    count_
+};
+
+// The `stats` key of a bound, without its "requests_overloaded_" prefix.
+const char* overload_bound_name(overload_bound b);
+
 // What answers requests for a runtime name; a payload is what would arrive on
 // the target's own port, and the answer is appended to `out`.
 class request_sink
@@ -188,6 +203,12 @@ public:
     // deadline, a sink that went, or a detach.
     uint64_t stat_parked_dropped() const { return m_stat_parked_dropped; }
 
+    // Count a request answered overloaded at `b`, and say so in the log the first time each bound refuses.
+    void note_overloaded(overload_bound b);
+    uint64_t stat_overloaded(overload_bound b) const { return m_stat_overloaded[static_cast<size_t>(b)]; }
+    // One `requests_overloaded_<bound>:N` line per bound, every bound always listed, and the most ever parked at once.
+    std::string bound_stats() const;
+
 private:
     // A no-op so the loop comes back; post() calls it BEFORE queueing, because
     // an entry nothing returns for is an answer nobody gets.
@@ -268,4 +289,6 @@ private:
     uint64_t m_stat_deferred{0};
     uint64_t m_stat_deferred_refused{0};
     uint64_t m_stat_parked_dropped{0};
+    uint64_t m_stat_overloaded[static_cast<size_t>(overload_bound::count_)]{};
+    size_t   m_parked_most{0};
 };

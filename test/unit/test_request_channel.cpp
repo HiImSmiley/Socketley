@@ -276,6 +276,52 @@ TEST_CASE("background work cannot fill the parked table a client's request needs
     loop.shutdown_ring();
 }
 
+TEST_CASE("every request answered overloaded is counted at the bound that refused it")
+{
+    // A mail runtime's burst was answered overloaded by its own parked table with nothing in stats to say so, and the
+    // operator was left to guess which of five bounds it was.
+    event_loop loop;
+    REQUIRE(loop.init());
+    request_channel ch;
+    ch.attach(loop);
+
+    deferred_sink sink;
+    recording_origin origin;
+    ch.register_sink("remote", &sink);
+
+    const std::string before = ch.bound_stats();
+    CHECK(before.find("requests_overloaded_parked:0\n") != std::string::npos);
+    CHECK(before.find("requests_overloaded_way:0\n") != std::string::npos);
+    CHECK(before.find("requests_parked_most:0\n") != std::string::npos);
+
+    const uint64_t extra = 5;
+    for (uint64_t i = 0; i < request_channel::MAX_PARKED_BACKGROUND + extra; ++i)
+        REQUIRE(ch.post(&origin, i, "remote", "put", request_class::background));
+    pump(loop, 64);
+    CHECK(ch.stat_overloaded(overload_bound::parked) == extra);
+    CHECK(ch.stat_overloaded(overload_bound::way) == 0);
+    CHECK(ch.bound_stats().find("requests_parked_most:" + std::to_string(request_channel::MAX_PARKED_BACKGROUND) +
+                                "\n") != std::string::npos);
+
+    // A sink that would not take it while its way is there is the way being full.
+    struct full_way : deferred_sink
+    {
+        request_status refusal(std::string_view, size_t) const override { return request_status::overloaded; }
+    } full;
+    full.accept = false;
+    ch.register_sink("full", &full);
+    REQUIRE(ch.post(&origin, 1u << 20, "full", "put", request_class::client));
+    pump(loop);
+    CHECK(ch.stat_overloaded(overload_bound::way) == 1);
+
+    const std::string after = ch.bound_stats();
+    CHECK(after.find("requests_overloaded_parked:" + std::to_string(extra) + "\n") != std::string::npos);
+    CHECK(after.find("requests_overloaded_way:1\n") != std::string::npos);
+
+    ch.detach();
+    loop.shutdown_ring();
+}
+
 // ─── the fallback, and why a worker needs one ───────────────────────────────
 //
 // The daemon holds every runtime, so a name it does not know does not exist.

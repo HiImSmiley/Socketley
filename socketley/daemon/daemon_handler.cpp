@@ -9014,6 +9014,7 @@ int daemon_handler::cmd_daemon_stats(ipc_connection* conn)
             << "fast_lo_pair_limit_bytes:" << f.pair_bytes << '\n'
             << "fast_lo_over_budget:" << (f.over_budget ? 1 : 0) << '\n';
     }
+    out << m_manager.requests().bound_stats();
     conn->write_buf = out.str();
     return 0;
 }

@@ -1795,6 +1795,8 @@ void proxy_supervisor::write_answer(uint64_t ticket, uint8_t status, std::string
         m_control_fd < 0)
         return;
     // An asker told nothing waits out its deadline, so past the room for answers it is told the way was full.
+    if (m_channel)
+        m_channel->note_overloaded(overload_bound::answer_way);
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::chan_rep,
                                          worker_proto::encode_chan_reply(
                                              ticket, static_cast<uint8_t>(request_status::overloaded), {})),

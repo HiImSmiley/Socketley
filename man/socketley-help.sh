@@ -203,7 +203,8 @@ cli_commands() {
     echo "  pinned to TCP, sockets entered, taints by reason (bound, unanswered,"
     echo "  budget, peer_off), bytes held and the budget. tcpdump and nftables on"
     echo "  lo never see shortcut bytes; this and socketley_fast_lo_* on the"
-    echo "  metrics endpoint do."
+    echo "  metrics endpoint do. requests_overloaded_<bound> counts the requests"
+    echo "  the daemon answered overloaded, by the bound that was full."
     echo -e "  ${CYAN}socketley daemon stats${NC}"
     echo ""
 

@@ -16,6 +16,66 @@ const char* request_status_text(request_status st)
     return "unknown";
 }
 
+const char* overload_bound_name(overload_bound b)
+{
+    switch (b)
+    {
+        case overload_bound::queue:       return "queue";
+        case overload_bound::queue_bytes: return "queue_bytes";
+        case overload_bound::parked:      return "parked";
+        case overload_bound::wakeup:      return "wakeup";
+        case overload_bound::way:         return "way";
+        case overload_bound::answer_way:  return "answer_way";
+        case overload_bound::count_:      break;
+    }
+    return "unknown";
+}
+
+namespace
+{
+
+// What a bound is, in the words of the one log line it gets.
+std::string overload_bound_text(overload_bound b)
+{
+    switch (b)
+    {
+        case overload_bound::queue:
+            return "the request queue holds " + std::to_string(request_channel::MAX_PENDING) + " requests";
+        case overload_bound::queue_bytes:
+            return "the request queue's bytes are at their bound";
+        case overload_bound::parked:
+            return "the table of requests awaiting an answer is full (" + std::to_string(request_channel::MAX_PARKED) +
+                   ", background work " + std::to_string(request_channel::MAX_PARKED_BACKGROUND) + ")";
+        case overload_bound::wakeup:
+            return "the ring took no wakeup for the queue";
+        case overload_bound::way:
+            return "the socket the request goes out on is full";
+        case overload_bound::answer_way:
+            return "the socket the answer goes back on is full";
+        case overload_bound::count_:
+            break;
+    }
+    return "unknown";
+}
+
+}   // namespace
+
+void request_channel::note_overloaded(overload_bound b)
+{
+    if (++m_stat_overloaded[static_cast<size_t>(b)] == 1)
+        LOG_WARN(("request channel: a request was answered overloaded because " + overload_bound_text(b) +
+                  "; counted as requests_overloaded_" + overload_bound_name(b) + " in stats").c_str());
+}
+
+std::string request_channel::bound_stats() const
+{
+    std::string out;
+    for (size_t i = 0; i < static_cast<size_t>(overload_bound::count_); ++i)
+        out += std::string("requests_overloaded_") + overload_bound_name(static_cast<overload_bound>(i)) + ":" +
+               std::to_string(m_stat_overloaded[i]) + "\n";
+    return out + "requests_parked_most:" + std::to_string(m_parked_most) + "\n";
+}
+
 request_channel::~request_channel()
 {
     // Deliberately does not touch the loop, which has static storage duration
@@ -204,6 +264,7 @@ bool request_channel::admit(request_origin* origin, std::string_view target, siz
             m_stat_dropped_bg++;
         else
             m_stat_refused++;
+        note_overloaded(m_queue.size() >= limit ? overload_bound::queue : overload_bound::queue_bytes);
         return false;
     }
 
@@ -215,6 +276,7 @@ bool request_channel::admit(request_origin* origin, std::string_view target, siz
             m_stat_dropped_bg++;
         else
             m_stat_refused++;
+        note_overloaded(overload_bound::wakeup);
         return false;
     }
     return true;
@@ -277,13 +339,19 @@ uint64_t request_channel::park(request_origin* origin, uint64_t cookie,
 {
     // Background work stops short as in post(), or a flood of it fills the table a waiting client parks in.
     const size_t limit = (cls == request_class::background) ? MAX_PARKED_BACKGROUND : MAX_PARKED;
-    if (!origin || m_parked.size() >= limit)
+    if (!origin)
         return 0;
+    if (m_parked.size() >= limit)
+    {
+        note_overloaded(overload_bound::parked);
+        return 0;
+    }
     if (!origin_live(origin))
         m_origins.push_back(origin);
     const uint64_t ticket = m_next_ticket++;
     m_parked.emplace(ticket, parked_request{origin, cookie, sink,
                                             std::chrono::steady_clock::now()});
+    m_parked_most = std::max(m_parked_most, m_parked.size());
     arm_park_sweep();
     return ticket;
 }
@@ -403,6 +471,8 @@ void request_channel::drain()
                     m_stat_no_target++;
                 else
                     m_stat_deferred_refused++;
+                if (st == request_status::overloaded)
+                    note_overloaded(overload_bound::way);
             }
         }
         else if (sink)
@@ -437,6 +507,7 @@ void request_channel::drain()
             entry e = std::move(m_queue.front());
             m_queue.pop_front();
             m_bytes -= std::min(m_bytes, e.payload.size());
+            note_overloaded(overload_bound::wakeup);
             if (e.origin && origin_live(e.origin))
                 e.origin->on_request_reply(e.cookie, request_status::overloaded, {});
         }

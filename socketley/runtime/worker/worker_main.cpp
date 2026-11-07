@@ -676,6 +676,7 @@ private:
             s.detail += "peer_direct:"  + std::to_string(pdirect)  + "\n";
             s.detail += "peer_relayed:" + std::to_string(prelayed) + "\n";
         }
+        s.detail += m_manager.requests().bound_stats();
 
         // Did anything the daemon can see actually move, which now decides
         // whether there is a publish at all rather than how far it backs off.
@@ -1409,7 +1410,10 @@ private:
             return request_status::ok;
         ch.withdraw(ticket);
         m_deferred.erase(cookie);
-        return sink->refusal(target, payload.size());
+        const request_status st = sink->refusal(target, payload.size());
+        if (st == request_status::overloaded)
+            ch.note_overloaded(overload_bound::way);
+        return st;
     }
 
     // The runtime is done with a request that came in from outside, and the
@@ -1840,6 +1844,7 @@ private:
             m_writer.note_owed(worker_proto::wire_size(size), worker_proto::goes_in_pieces(size));
             return;
         }
+        m_manager.requests().note_overloaded(overload_bound::answer_way);
         const auto overloaded = static_cast<uint8_t>(request_status::overloaded);
         if (m_writer.write_with(
                 worker_proto::chan_reply_frame_size({}), [&](std::string& out) {
