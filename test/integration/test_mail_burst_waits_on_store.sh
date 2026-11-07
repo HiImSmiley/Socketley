@@ -11,6 +11,8 @@
 #   * a bound on deliveries that never lets the held ones go: all of them must be delivered once the store answers
 #   * a bound that is never reached, which would make the first assertion hold on any build: mail_local_waited
 #   * the bound that refused not being named: `stats` lists every requests_overloaded_<bound> line
+#   * a deferral that says the store "does not answer" and not why, or, for a message streamed in pieces, "would not
+#     take it:" with no reason at all
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -102,6 +104,21 @@ lines=$("$BIN" stats m | grep -c '^requests_overloaded_')
 over=$("$BIN" stats m | grep -E '^requests_overloaded_' | awk -F: '{s+=$2} END {print s+0}')
 [ "$lines" -ge 6 ] && [ "$over" = 0 ] && ok "stats lists every bound that answers overloaded, and none did" \
     || bad "stats names the bounds" "$("$BIN" stats m | grep -E '^requests_')"
+
+# ── A store that is gone: the deferral says why, the streamed one too ──
+"$BIN" stop st >/dev/null 2>&1
+python3 - "$SMTP" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), timeout=30)
+for size in (1000, 3 << 20):
+    s.sendmail("a@client.test", ["u0@example.test"], "From: a@client.test\r\nSubject: gone\r\n\r\n" + "y" * size + "\r\n")
+s.quit()
+PY
+for _ in $(seq 1 100); do [ "$(grep -c ': deferred (' "$SOCKETLEY_DLOG")" -ge 2 ] && break; sleep 0.1; done
+why=$(grep ': deferred (' "$SOCKETLEY_DLOG")
+[ "$(echo "$why" | grep -c 'the mailbox store st does not answer: ')" -ge 2 ] \
+    && ok "a delivery to a store that is gone is deferred with the reason, whole or streamed" \
+    || bad "the deferral names why the store gave no answer" "$why"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

@@ -38,6 +38,14 @@ std::string refusal_of(const rpc::reply& r)
     return "451 4.3.0";
 }
 
+// Why a request to the store came to no answer to read, as the 451 the delivery is deferred with.
+std::string unanswered(const std::string& store, request_status st)
+{
+    if (st == request_status::ok)
+        return "451 4.3.0 the mailbox store " + store + " gave an answer that could not be read";
+    return "451 4.3.0 the mailbox store " + store + " does not answer: " + request_status_text(st);
+}
+
 }   // namespace
 
 namespace
@@ -372,7 +380,7 @@ void mailboxes::put_small(const std::shared_ptr<writing>& w)
         rpc::reply r;
         if (st != request_status::ok || !rpc::decode(bytes, rpc::op::put, r))
         {
-            finish(w, 451, "451 4.3.0 the mailbox store " + m_storage + " does not answer");
+            finish(w, 451, unanswered(m_storage, st));
             return;
         }
         if (!r.ok)
@@ -401,7 +409,12 @@ void mailboxes::put_stream(const std::shared_ptr<writing>& w)
         if (!*alive)
             return;
         rpc::reply r;
-        if (st != request_status::ok || !rpc::decode(bytes, rpc::op::put_begin, r) || !r.ok || r.next.empty())
+        if (st != request_status::ok || !rpc::decode(bytes, rpc::op::put_begin, r))
+        {
+            finish(w, 451, unanswered(m_storage, st));
+            return;
+        }
+        if (!r.ok || r.next.empty())
         {
             const std::string why = r.ok ? std::string("451 4.3.0") : refusal_of(r);
             finish(w, std::atoi(why.c_str()), why + " the mailbox store would not take it: " + r.code);
@@ -461,7 +474,7 @@ void mailboxes::put_piece(const std::shared_ptr<writing>& w)
         rpc::reply r;
         if (st != request_status::ok || !rpc::decode(bytes, rpc::op::put_more, r))
         {
-            finish(w, 451, "451 4.3.0 the mailbox store does not answer");
+            finish(w, 451, unanswered(m_storage, st));
             return;
         }
         if (!r.ok)
