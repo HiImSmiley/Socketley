@@ -905,6 +905,8 @@ private:
     const std::vector<std::string>* published_nodes(const backend_info& b) const;
     // Re-resolve every backend whose published nodes changed.
     void follow_published_nodes();
+    // Everything the held table decides, applied on each new table and again in setup().
+    void adopt_endpoints();
     // The backend a selection lands on: the entry, or one of its nodes.
     const backend_info* pick_node(proxy_client_connection* conn, size_t idx,
                                   const std::string* exclude_path = nullptr);

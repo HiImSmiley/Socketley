@@ -631,7 +631,13 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // Straight assignment on the event-loop thread, because a connection
     // already being routed keeps the table it started with.
     m_endpoints = std::move(tbl);
+    adopt_endpoints();
+}
 
+// Everything the table held decides, in setup() as well as on a new table, because the last table before
+// start() may have come while the backends were still unparsed or the resolver had no loop to answer on.
+void proxy_instance::adopt_endpoints()
+{
     // The nodes a name or an address is reached over come out of this
     // snapshot too, so a backend resolved against the last one is re-resolved
     // before anything below judges what still belongs.
@@ -2077,12 +2083,6 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_avail_scratch.reserve(m_backends.size());
 
-    // The backends are known now, because the last publication before start()
-    // may have arrived while m_backends was still empty and a view built from
-    // none enforces nothing.
-    rebuild_route_view();
-    announce_group_nodes();
-
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     // Neither arm is right everywhere, so neither is fixed here; see
     // on_loop_turn() for the rule and MULTISHOT_MIN_CLIENTS for the number.
@@ -2346,6 +2346,8 @@ bool proxy_instance::setup(event_loop& loop)
             LOG_ERROR("proxy: health check timer refused — backend health will not be tracked");
     }
 
+    // Last, once the backends, the pools and the timers a pending lookup re-arms on all exist.
+    adopt_endpoints();
     return true;
 }
 
