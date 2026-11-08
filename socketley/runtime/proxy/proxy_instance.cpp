@@ -2666,13 +2666,20 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     const bool idle_on = m_idle_timeout_cached > 0;
                     const std::chrono::seconds timeout =
                         idle_on ? std::chrono::seconds(m_idle_timeout_cached) : socketley::write_stall();
-                    std::vector<int> expired, stalled;
+                    std::vector<int> expired, stalled, aged;
                     size_t found = 0;
                     for (int cfd = 0; cfd < MAX_FDS && found < m_client_count; cfd++)
                     {
                         auto* cconn = m_client_slots[cfd];
                         if (!cconn) continue;
                         found++;
+                        // A parked backend ages out on the pool's bound, so an idle client holds it no longer than the pool would.
+                        if (cconn->parked_backend_fd >= 0)
+                        {
+                            auto* pb = parked_backend_of(cconn);
+                            if (pb && (now - pb->idle_since) > std::chrono::seconds(POOL_IDLE_TIMEOUT_SEC))
+                                aged.push_back(cfd);
+                        }
                         if (cconn->reset_on_close) continue;
                         const bool quiet = (now - cconn->last_activity) > timeout;
                         // What a client is owed and has not taken for the timeout ends it, closing or not: the close of
@@ -2691,6 +2698,13 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                         }
                         if (idle_on && !cconn->closing && quiet)
                             expired.push_back(cfd);
+                    }
+                    for (int cfd : aged)
+                    {
+                        auto* cconn = m_client_slots[cfd];
+                        if (!cconn) continue;
+                        if (auto* pb = parked_backend_of(cconn))
+                            drop_parked_backend(pb);
                     }
                     for (int cfd : stalled)
                     {

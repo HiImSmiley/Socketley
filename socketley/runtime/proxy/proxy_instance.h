@@ -1687,8 +1687,8 @@ private:
     // Connection pool for backend reuse: as many as were busy at once, since the newest is taken first and the rest
     // age out after POOL_IDLE_TIMEOUT_SEC.
     static constexpr size_t MAX_POOL_PER_BACKEND = 4096;
-    // The parked are not swept, so idle keep-alive clients hold no more of them than this.
-    static constexpr size_t MAX_PARKED_BACKENDS = 32;
+    // The idle sweep ages the parked out like the pool, so the bound is the pool's.
+    static constexpr size_t MAX_PARKED_BACKENDS = MAX_POOL_PER_BACKEND;
     static constexpr int POOL_IDLE_TIMEOUT_SEC = 60;
     std::vector<std::vector<pooled_backend>> m_backend_pool; // per-backend pool
     // A backend was found to have written on a pooled socket, reported once

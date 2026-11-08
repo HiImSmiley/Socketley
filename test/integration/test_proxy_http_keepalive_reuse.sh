@@ -78,6 +78,9 @@
 #        close never seen because the framing they left could not end.  Both
 #        the pool and the park put the second request on that socket, so this
 #        failed on the tree before parking as well
+#   (k)  fewer than every one of 40 idle keep-alive clients holding its
+#        backend parked: a cap below the client count, which sent the rest
+#        through the cancel and the pool on every request
 #   (f)  backend connections left over once every client has gone
 set -uo pipefail
 
@@ -267,6 +270,22 @@ if mode == "seq":
     end = time.time() + 30
     while not os.path.exists(sig) and time.time() < end:
         time.sleep(0.05)
+elif mode == "many":
+    # Every socket asks twice and then idles, all open at once.
+    socks = [s] + [socket.create_connection(("127.0.0.1", port)) for _ in range(int(sys.argv[3]) - 1)]
+    for t in socks:
+        t.settimeout(5)
+    for r in range(2):
+        for k, t in enumerate(socks):
+            t.sendall(req("/ok?many=%d" % k))
+            show("k", t, b"")
+    print("IDLE", flush=True)
+    sig = sys.argv[4]
+    end = time.time() + 30
+    while not os.path.exists(sig) and time.time() < end:
+        time.sleep(0.05)
+    for t in socks[1:]:
+        t.close()
 elif mode == "closeidle":
     s.sendall(req("/ok?warm"))
     buf = show("w", s, buf)
@@ -505,6 +524,22 @@ if [ "$J1" = 200 ] && [ "$J2" = "/ok?after=headlazy" ] && [ "${J_CONNS:-x}" = 0 
 else bad "(j) a pipelined request behind a HEAD's late body gets a clean answer and its close is seen" \
          "HEAD ${J1:-none}, then an answer for '${J2:-none}', connections=${J_CONNS:-absent}" \
          "$(grep '^R j' "$SOCKETLEY_TMPD/j.out" | head -2 | tr '\n' ' ')"; fi
+
+# ─── (k): more idle keep-alive clients than the old cap of 32 ───────────────
+MANY=40
+SIG="$SOCKETLEY_TMPD/close_k"
+python3 "$SOCKETLEY_TMPD/cl.py" many "$PX" "$MANY" "$SIG" >"$SOCKETLEY_TMPD/k.out" 2>&1 &
+CLPID=$!
+for _ in $(seq 1 100); do grep -q '^IDLE' "$SOCKETLEY_TMPD/k.out" 2>/dev/null && break; sleep 0.1; done
+K_OK=$(grep -c '^R k 200 ' "$SOCKETLEY_TMPD/k.out")
+K_PARKED=$(stat_when parked_connections "$MANY")
+touch "$SIG"
+wait "$CLPID" 2>/dev/null; CLPID=""
+echo "  (k) $MANY idle clients: $K_OK/$((MANY * 2)) answered, parked=${K_PARKED:-none}"
+
+if [ "$K_OK" -eq $((MANY * 2)) ] && [ "${K_PARKED:-0}" = "$MANY" ]; then ok
+else bad "(k) every idle keep-alive client keeps its backend parked" \
+         "$K_OK of $((MANY * 2)) answered 200, parked_connections=${K_PARKED:-absent}, want $MANY"; fi
 
 # ─── (f): nothing left once every client has gone ───────────────────────────
 FINAL=$(wait_backends_gone)
