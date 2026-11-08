@@ -118,6 +118,9 @@ using socketley::coarse_now;
 // event loop, which makes nesting across interpreters work out on its own.
 static thread_local unsigned                              t_depth{0};
 static thread_local std::chrono::steady_clock::time_point t_deadline{};
+// Whether t_deadline holds this invocation's deadline yet, set by the first hook, check or remaining_ms() inside it, so
+// a callback that ends before any of them never reads the clock.
+static thread_local bool                                  t_armed{false};
 static thread_local const char*                           t_what{nullptr};
 // Which runtime's script the armed invocation belongs to, set and cleared
 // beside t_what so the pairing cannot be got half right.
@@ -167,7 +170,7 @@ scope::scope(const char* what, uint32_t limit_ms, const char* runtime) noexcept
 
     if (m_outermost)
     {
-        t_deadline = coarse_now() + std::chrono::milliseconds(limit_ms);
+        t_armed    = false;
         t_what     = what;
         t_runtime  = runtime;
         t_limit_ms = limit_ms;
@@ -208,14 +211,26 @@ bool in_callback() noexcept
     return t_frames != 0;
 }
 
+// The armed invocation's deadline, dated from `now` when nothing has asked for it yet in this invocation.
+static std::chrono::steady_clock::time_point deadline_from(std::chrono::steady_clock::time_point now) noexcept
+{
+    if (!t_armed)
+    {
+        t_deadline = now + std::chrono::milliseconds(t_limit_ms);
+        t_armed    = true;
+    }
+    return t_deadline;
+}
+
 long remaining_ms() noexcept
 {
     if (t_depth == 0)
         return -1;
     // The same clock the deadline was armed on, or the two would disagree by
     // however far apart they happen to be.
-    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    t_deadline - coarse_now()).count();
+    const auto now  = coarse_now();
+    auto       left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline_from(now) - now).count();
     if (left < 0)          return 0;
     if (left > INT_MAX)    return INT_MAX;
     return static_cast<long>(left);
@@ -229,7 +244,8 @@ void check(lua_State* L)
 {
     if (t_depth == 0)
         return;
-    if (coarse_now() < t_deadline)
+    const auto now = coarse_now();
+    if (now < deadline_from(now))
         return;
 
     const char*    what = t_what ? t_what : "a callback";

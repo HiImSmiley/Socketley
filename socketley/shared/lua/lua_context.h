@@ -88,9 +88,10 @@ namespace lua_deadline
     // sol::state and a config file is a script like any other.
     void install(lua_State* L, uint32_t limit_ms);
 
-    // Arm the deadline for one callback invocation and mark that this thread
-    // is inside one, with only the outermost scope arming, because a nested
-    // interpreter is the same stretch of time the event loop is held for.
+    // Open the deadline for one callback invocation, dated from the first hook
+    // or check inside it, and mark that this thread is inside one, with only
+    // the outermost scope opening it, because a nested interpreter is the same
+    // stretch of time the event loop is held for.
     class scope
     {
     public:

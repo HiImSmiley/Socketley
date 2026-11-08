@@ -125,7 +125,9 @@ public:
         if (SOCKETLEY_UNLIKELY(static_cast<bool>(mine)))
             m_results[th] = std::move(mine);
 
-        m_frames.push_back(frame{th, ref, what, exec_ms, 0});
+        // Built in place, because a temporary written field by field and then
+        // copied in 16-byte halves stalled on store forwarding.
+        m_frames.emplace_back(th, ref, what, exec_ms, id_t{0});
 
         // The registry by hand rather than fn.push(th).  sol's push compares
         // the target state with the reference's own, and a coroutine is a
@@ -446,17 +448,20 @@ private:
     // from what it answered.
     outcome run(int nargs, id_t& out_id)
     {
-        // By value: the resume can push frames of its own and move the vector.
-        const frame started = m_frames.back();
+        // By value, field by field: the resume can push frames of its own and move the vector, and a whole-frame copy
+        // loads in halves what start() has just stored in fields.
+        lua_State* const  started_th   = m_frames.back().th;
+        const char* const started_what = m_frames.back().what;
+        const uint32_t    started_ms   = m_frames.back().exec_ms;
 
         int rc;
         {
-            lua_deadline::scope guard(started.what, started.exec_ms,
+            lua_deadline::scope guard(started_what, started_ms,
                                       m_owner_name.c_str());
             // Three arguments and not two: sol's 5.1 compatibility layer
             // defines lua_resume with the 5.4 signature and drops the caller.
             ++m_resuming;
-            rc = lua_resume(started.th, nullptr, nargs);
+            rc = lua_resume(started_th, nullptr, nargs);
             --m_resuming;
         }
 
