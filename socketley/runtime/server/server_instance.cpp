@@ -7517,9 +7517,38 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
         return;
     }
 
+    dispatch_datagram(static_cast<size_t>(cqe->res));
+
+    // The datagrams already queued behind this one are read here, one recvmsg each instead of a ring entry and a
+    // turn each, and a socket found empty is not asked again for the next few completions.
+    if (m_udp_drain_skip > 0)
+        --m_udp_drain_skip;
+    else
+    {
+        int got = 0;
+        while (got < udp_drain_max && m_udp_fd >= 0 && get_state() == runtime_running)
+        {
+            m_udp_recv->msg.msg_namelen = sizeof(m_udp_recv->addr);
+            const ssize_t n = ::recvmsg(m_udp_fd, &m_udp_recv->msg, MSG_DONTWAIT);
+            if (n < 0)
+                break;
+            dispatch_datagram(static_cast<size_t>(n));
+            ++got;
+        }
+        if (got == 0)
+            m_udp_drain_skip = udp_drain_backoff;
+    }
+
+    // Resubmit for next datagram
+    arm_udp_recv();
+}
+
+// One datagram sitting in m_udp_recv, whichever read put it there.
+void server_instance::dispatch_datagram(size_t len)
+{
     // Counted before the peer check, because these bytes arrived whatever the
     // table decides about their sender.
-    stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
+    stat_add(m_stat_bytes_in, static_cast<uint64_t>(len));
 
     // Register peer if new; skip processing if peer list is full.  Reached on
     // res == 0 as well: a zero-length datagram is a message its sender sent,
@@ -7527,14 +7556,11 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     // stream on TCP and a legitimate datagram here.
     const int peer = find_or_add_peer(m_udp_recv->addr);
     if (peer < 0)
-    {
-        arm_udp_recv();
         return;
-    }
     m_udp_from_id = m_udp_peers[static_cast<size_t>(peer)].id;
 
     // Extract message — whole datagram = one message
-    std::string_view msg(m_udp_recv->buf, static_cast<size_t>(cqe->res));
+    std::string_view msg(m_udp_recv->buf, len);
 
     // Strip trailing newline if present
     if (!msg.empty() && msg.back() == '\n')
@@ -7552,9 +7578,6 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     // has no connection and never reaches the label in handle_read.
     if (SOCKETLEY_UNLIKELY(!m_cache_store_batch.empty()))
         flush_cache_store();
-
-    // Resubmit for next datagram
-    arm_udp_recv();
 }
 
 // The one door every outbound datagram leaves by, so what the socket did with

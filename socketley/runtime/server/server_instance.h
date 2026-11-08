@@ -1051,6 +1051,7 @@ private:
     // group is shared by every server runtime on this loop.
     void return_provided_buf(struct io_uring_cqe* cqe);
     void arm_udp_recv();
+    void dispatch_datagram(size_t len);
 
 #ifdef SOCKETLEY_INVARIANTS
     // Debug-only: asserts that a connection the runtime still has indexed
@@ -1533,6 +1534,11 @@ private:
     int m_udp_next_peer_id{1};
     // The peer the datagram being dispatched came from, so on_client_message can name it.
     int m_udp_from_id{0};
+    // Datagrams read by recvmsg after a completion before the ring is asked again, and the completions that follow a
+    // socket found empty before it is tried again, so an idle server pays one failed recvmsg per eight datagrams.
+    static constexpr int udp_drain_max = 32;
+    static constexpr int udp_drain_backoff = 8;
+    int m_udp_drain_skip{0};
     // Where the next eviction's sample of the full table begins.
     size_t m_udp_evict_hand{0};
     // Datagrams the socket refused, counted so the log can be throttled and
