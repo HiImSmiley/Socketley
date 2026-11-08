@@ -292,6 +292,10 @@ private:
     __kernel_timespec m_tick_ts{};
     io_request m_tick_req{};
     bool m_tick_armed{false};
+    // The short turn apart from the second's, so one asked for while the second's waits is not dropped behind it.
+    __kernel_timespec m_soon_ts{};
+    io_request m_soon_req{};
+    bool m_soon_armed{false};
 
     // --dir as the filesystem names it, links resolved, which every link's target is held against.
     std::string m_root_real;

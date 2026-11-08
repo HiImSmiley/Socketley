@@ -480,6 +480,8 @@ void sync_run::stop()
     m_watches.clear();
     if (m_tick_armed)
         m_loop.submit_timeout_remove(&m_tick_req);
+    if (m_soon_armed)
+        m_loop.submit_timeout_remove(&m_soon_req);
     // A resolve in progress is waited out here, which the system resolver's own timeout bounds.
     m_resolver.retire(m_loop);
 }
@@ -498,16 +500,34 @@ void sync_run::on_cqe(struct io_uring_cqe* cqe)
         m_tick_armed = false;
         return;
     }
+    if (req == &m_soon_req)
+    {
+        m_soon_armed = false;
+        return;
+    }
     m_io.on_cqe(cqe);
 }
 
 void sync_run::arm_tick(bool soon)
 {
-    if (m_stopped || m_tick_armed)
+    if (m_stopped)
         return;
     // Soon while there is a walk to slice or work queued, else once a second: often enough for a stalled exchange,
     // a retry and --every, and an idle loop otherwise sleeps until something completes.
-    m_tick_ts = soon ? __kernel_timespec{0, 1000000} : __kernel_timespec{1, 0};
+    if (soon)
+    {
+        if (m_soon_armed)
+            return;
+        m_soon_ts = __kernel_timespec{0, 1000000};
+        m_soon_req = io_request{};
+        m_soon_req.owner = this;
+        m_soon_req.type = op_timeout;
+        m_soon_armed = m_loop.submit_timeout(&m_soon_ts, &m_soon_req);
+        return;
+    }
+    if (m_tick_armed)
+        return;
+    m_tick_ts = __kernel_timespec{1, 0};
     m_tick_req = io_request{};
     m_tick_req.owner = this;
     m_tick_req.type = op_timeout;
