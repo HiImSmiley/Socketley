@@ -298,6 +298,8 @@ struct item
         const std::string_view sec = std::string_view(name).substr(br + 1);
         return !binary && (sec.starts_with("HEADER]") || sec.starts_with("HEADER.FIELDS"));
     }
+    // Whether it is the message as it is stored, which asks nothing of its MIME structure.
+    bool whole() const { return !binary && (name == "BODY[]" || name == "RFC822"); }
 };
 
 bool parse_item(std::string_view t, item& it)
@@ -2025,6 +2027,8 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
         std::vector<item> items;
         size_t at{0};
         bool needs_body{false};
+        // Whether an item reads the message's structure, which a whole BODY[] does not.
+        bool needs_part{false};
         bool looping{false};
         bool waiting{false};
         std::shared_ptr<const std::string> bytes;
@@ -2062,6 +2066,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
     j->idx = std::move(idx);
     j->items = std::move(items);
     j->needs_body = needs_body;
+    j->needs_part = std::any_of(j->items.begin(), j->items.end(), [](const item& i) { return i.body() && !i.whole(); });
     j->head_only = head_only;
     m_waiting = true;
     // One message after the other, each answered once its bytes are read, whether they come at once or later.
@@ -2165,7 +2170,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 resume();
                 return;
             }
-            if (j->needs_body && j->bytes && !j->from_head && !j->bytes->empty() &&
+            if (j->needs_part && j->bytes && !j->from_head && !j->bytes->empty() &&
                 m_store.parse_later(m->key, j->bytes, [j, self, alive] {
                     if (*alive && !j->looping)
                         (*self)();
@@ -2176,7 +2181,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 return;
             }
             std::shared_ptr<const mime::part> part;
-            if (j->needs_body && j->bytes && !j->bytes->empty())
+            if (j->needs_part && j->bytes && !j->bytes->empty())
                 part = j->from_head ? std::make_shared<const mime::part>(mime::parse(*j->bytes))
                                     : m_store.structure(m->key, j->bytes);
             // The line is said in pieces, a body the store holds going out as it is held, not copied into it.
@@ -2216,7 +2221,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 }
                 else if (it.name == "RFC822.SIZE")
                     out += std::to_string(j->bytes && !j->from_head && !j->bytes->empty() ? j->bytes->size() : m->size);
-                else if (!part)
+                else if (!part && !(it.whole() && j->bytes && !j->bytes->empty()))
                 {
                     // A message with no part reads as an empty text one, so a strict client parses the answer.
                     if (it.name == "ENVELOPE")
@@ -2261,7 +2266,9 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                         spec = "TEXT";
                     std::string_view got;
                     std::string built;
-                    if (!mime::section_of(*j->bytes, *part, spec, got, built))
+                    if (it.whole())
+                        got = *j->bytes;
+                    else if (!mime::section_of(*j->bytes, *part, spec, got, built))
                         got = {};
                     if (it.partial)
                         got = it.from >= got.size() ? std::string_view() : got.substr(it.from, it.count);
