@@ -1332,12 +1332,31 @@ bool client_instance::lua_send(std::string_view msg)
         return !m_conn->closing;
     }
 
+    // Nothing in flight, so the socket is tried at once, because through the ring the send's own completion cost
+    // every request-answer message a second loop turn; what the socket does not take goes to the ring as before.
+    const bool   has_nl = !msg.empty() && msg.back() == '\n';
+    const size_t total  = msg.size() + (has_nl ? 0 : 1);
+    struct iovec iov[2] = { { const_cast<char*>(msg.data()), msg.size() },
+                            { const_cast<char*>("\n"), 1 } };
+    struct msghdr mh{};
+    mh.msg_iov    = iov;
+    mh.msg_iovlen = has_nl ? 1 : 2;
+    const ssize_t sent = ::sendmsg(m_conn->fd, &mh, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (sent > 0)
+    {
+        note_established();
+        stat_add(m_stat_bytes_out, static_cast<uint64_t>(sent));
+        if (static_cast<size_t>(sent) == total)
+            return true;
+    }
+
     m_conn->write_buf.assign(msg.data(), msg.size());
-    if (m_conn->write_buf.empty() || m_conn->write_buf.back() != '\n')
+    if (!has_nl)
         m_conn->write_buf.push_back('\n');
 
-    m_conn->write_off = 0;
-    arm_write(m_conn->write_buf.data(), static_cast<uint32_t>(m_conn->write_buf.size()));
+    m_conn->write_off = sent > 0 ? static_cast<size_t>(sent) : 0;
+    arm_write(m_conn->write_buf.data() + m_conn->write_off,
+              static_cast<uint32_t>(m_conn->write_buf.size() - m_conn->write_off));
     return true;
 }
 
