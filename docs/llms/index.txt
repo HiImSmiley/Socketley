@@ -39,9 +39,6 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
 
 - cache: 3.9× against Redis (GET)
-- server: 0.9× against socketley, no script (echo, 64 B messages, 256 connections, one in flight each)
-- server: 0.9× against socketley, no script (line echo, 64 B, 256 connections, one in flight each)
-- server: 2.9× against Node 24.22.1 dgram (datagram echo, 64 B, 128 sockets, one in flight each)
 - server: 5.3× against nginx (1 KiB file, keep-alive, 256 connections)
 - proxy: 1.2× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
 - web: 4.5× against nginx (page 4 KiB, keep-alive, 256 connections)
@@ -56,11 +53,6 @@ Each runtime's headline result against the server people run instead; method and
 - mail: 4.6× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
 - mcp: 26.0× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
 - client: 1.1× against Go (request-answer: 1 connection, 64 B each way)
-- client: 0.2× against tcpkali (send: 64 B lines as fast as the connection takes them, TCP)
-- client: 0.9× against Go (send: 64 B lines, TLS 1.3)
-- client: 1.0× against redis-benchmark (pipelined INCR to a socketley cache, depth 32, 1 connection)
-- client: 0.9× against socat (one line from the shell, 1,000 in a row)
-- client: 2.7× against socat (one line from the shell to a TLS service, 1,000 in a row)
 
 ## Where to go next
 

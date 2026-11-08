@@ -425,9 +425,11 @@ async function place(root) {
 }
 // One row of each runtime's benchmarks, the one its set names as its headline, chosen before the numbers were in.
 function glance(caption = true) {
-  const tiles = el('div', { class: 'tiles' });
+  const tiles = el('div', { class: 'tiles' }), shown = new Set();
   for (const s of [...(BENCH?.sets || [])].sort((x, y) => x.runtime.localeCompare(y.runtime))) {
-    if (s.headline == null) continue;
+    // One tile a runtime, and only against another server: socketley against itself is no headline.
+    if (s.headline == null || shown.has(s.runtime) || /^socketley/.test(s.arms[1] || '')) continue;
+    shown.add(s.runtime);
     const r = s.rows[s.headline], q = r?.r?.[0];
     if (!q) continue;
     tiles.append(el('a', { class: 'tile', href: '#/rt/' + s.runtime + '/benchmarks', title: r.name + (s.caveat ? ' — ' + s.caveat : '') },

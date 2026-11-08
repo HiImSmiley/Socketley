@@ -1141,8 +1141,7 @@
    "unit": "msg/s",
    "better": "higher",
    "pin": "each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others",
-   "note": "The same logic in each: an echo, and a room that a receiver enters by sending \"join\", with one sender's messages counted at every receiver. socketley runs it in Lua (join_group/group_send) and, as \"no script\", on its built-in relay; ws loops over the room with send(), uWebSockets.js publishes to a topic. uWebSockets.js builds a published frame once and corks the writes, which is the fan-out difference.",
-   "headline": 0
+   "note": "The same logic in each: an echo, and a room that a receiver enters by sending \"join\", with one sender's messages counted at every receiver. socketley runs it in Lua (join_group/group_send) and, as \"no script\", on its built-in relay; ws loops over the room with send(), uWebSockets.js publishes to a topic. uWebSockets.js builds a published frame once and corks the writes, which is the fan-out difference."
   },
   {
    "id": "server-tcp",
@@ -1244,8 +1243,7 @@
    "unit": "msg/s",
    "better": "higher",
    "pin": "each server on one core, srvgen on 20 others",
-   "note": "Every line is handed to a handler that answers with the line: Lua on socketley, a function on Node's net, a goroutine with bufio in Go. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work.",
-   "headline": 0
+   "note": "Every line is handed to a handler that answers with the line: Lua on socketley, a function on Node's net, a goroutine with bufio in Go. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work."
   },
   {
    "id": "server-udp",
@@ -1347,8 +1345,7 @@
    "unit": "datagrams/s",
    "better": "higher",
    "pin": "each server on one core, srvgen (128 sockets) on 20 others",
-   "note": "Node and Go are given the 1 MiB receive buffer socketley sets; at the kernel's default they lost datagrams at 1 KiB. No arm lost any.",
-   "headline": 0
+   "note": "Node and Go are given the 1 MiB receive buffer socketley sets; at the kernel's default they lost datagrams at 1 KiB. No arm lost any."
   },
   {
    "id": "server-http",
@@ -4461,8 +4458,7 @@
    "unit": "lines/s",
    "better": "higher",
    "pin": "every sender on one core, the Go sink on four others",
-   "note": "Sending as fast as the connection takes it, counted at a sink on other cores. socketley paces with self.pending() and on_writable and sends one line per self.send call; tcpkali repeats its message into large writes; Go makes one buffered write call per line. All are bound by the client's core.",
-   "headline": 0
+   "note": "Sending as fast as the connection takes it, counted at a sink on other cores. socketley paces with self.pending() and on_writable and sends one line per self.send call; tcpkali repeats its message into large writes; Go makes one buffered write call per line. All are bound by the client's core."
   },
   {
    "id": "client-gen2",
@@ -4532,8 +4528,7 @@
    "unit": "lines/s",
    "better": "higher",
    "pin": "every sender on one core, the Go sink on four others",
-   "note": "The same over a unix socket and over TLS 1.3, which tcpkali does not speak. Over TLS socketley's record layer keeps pace with Go's.",
-   "headline": 1
+   "note": "The same over a unix socket and over TLS 1.3, which tcpkali does not speak. Over TLS socketley's record layer keeps pace with Go's."
   },
   {
    "id": "client-resp",
@@ -4603,8 +4598,7 @@
    "unit": "ops/s",
    "better": "higher",
    "pin": "each client on one core, the socketley cache on another",
-   "note": "A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley is four processes on one core.",
-   "headline": 0
+   "note": "A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley is four processes on one core."
   },
   {
    "id": "client-shell",
@@ -4660,8 +4654,7 @@
    "unit": "lines/s",
    "better": "higher",
    "pin": "the shell loop on one core, the Go sink on four others",
-   "note": "One line per command from a shell loop, until the sink has the last one. socketley send writes onto the connection a client runtime holds; socat opens a connection per line (nodelay); bash's /dev/tcp is a builtin with no process to start, bound by the connection set-up alone.",
-   "headline": 0
+   "note": "One line per command from a shell loop, until the sink has the last one. socketley send writes onto the connection a client runtime holds; socat opens a connection per line (nodelay); bash's /dev/tcp is a builtin with no process to start, bound by the connection set-up alone."
   },
   {
    "id": "client-shelltls",
@@ -4707,8 +4700,7 @@
    "unit": "lines/s",
    "better": "higher",
    "pin": "the shell loop on one core, the Go sink on four others",
-   "note": "As above, to a TLS service: socketley's connection is held and verified once, socat makes a verified handshake per line (nodelay; without it every line waited 40 ms).",
-   "headline": 0
+   "note": "As above, to a TLS service: socketley's connection is held and verified once, socat makes a verified handshake per line (nodelay; without it every line waited 40 ms)."
   }
  ]
 }
