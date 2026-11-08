@@ -286,8 +286,8 @@ private:
     // entries made naming `node`.
     void reindex(coll_state& c, const std::string& id, const doc* before, const doc* after, const doc* node);
     // The document `id` replaced by `d`, or removed when `d` is null, with its indexes, expiry, bytes and cache.
-    // `id` made `*d`, which is moved from, or removed when `d` is null.
-    void set_doc(coll_state& c, const std::string& coll, const std::string& id, doc* d);
+    // `id` made `*d`, which is moved from, or removed when `d` is null; `prev`, when given, takes what it was.
+    void set_doc(coll_state& c, const std::string& coll, const std::string& id, doc* d, doc* prev = nullptr);
     // The keys and expiry a body gives a document of `c`.
     void derive(const coll_state& c, const jvalue& body, doc& d) const;
     bool rebuild(coll_state& c, const std::string& name, const collection_def* def, std::string& why);
@@ -326,8 +326,8 @@ private:
     std::set<std::tuple<int64_t, std::string, std::string>> m_expiry;
     // The bytes of living documents each segment holds, against which a merge judges its dead ones.
     std::unordered_map<uint32_t, uint64_t> m_live;
-    // A write's documents before they have a place on the disk, by collection and id.
-    std::unordered_map<std::string, std::string> m_staged;
+    // Where a write's document is written before it is copied out at its own size.
+    std::string m_json;
     // The deletions a start has read, so an older record read after one does not bring its document back.
     std::unordered_map<std::string, uint64_t> m_tombs;
 

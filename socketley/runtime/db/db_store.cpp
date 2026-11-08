@@ -771,7 +771,7 @@ void store::live_add(const doc& d, int64_t sign)
     l = sign > 0 ? l + n : (l > n ? l - n : 0);
 }
 
-void store::set_doc(coll_state& c, const std::string& coll, const std::string& id, doc* d)
+void store::set_doc(coll_state& c, const std::string& coll, const std::string& id, doc* d, doc* prev)
 {
     const auto it = c.docs.find(id);
     doc* now = nullptr;
@@ -789,9 +789,14 @@ void store::set_doc(coll_state& c, const std::string& coll, const std::string& i
         const bool moved = !d || old.at.seg != d->at.seg || old.at.off != d->at.off;
         if (moved)
             cache_drop(old);
+        cached_json* const kept = old.cache;
+        if (prev)
+        {
+            *prev = std::move(old);
+            prev->cache = nullptr;
+        }
         if (d)
         {
-            cached_json* const kept = old.cache;
             old = std::move(*d);
             old.cache = moved ? nullptr : kept;
             now = &old;
@@ -1323,7 +1328,6 @@ void store::close()
     m_colls.clear();
     m_expiry.clear();
     m_live.clear();
-    m_staged.clear();
     clear_cache();
     m_docs = 0;
     m_bytes = 0;
@@ -1856,22 +1860,30 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
     // What each touched document was before, so a change that cannot be made takes back those made before it.
     struct undo
     {
-        coll_state* c;
+        coll_state* c{nullptr};
         std::string coll;
         std::string id;
-        bool had;
+        bool had{false};
+        // Set by the first change made to it, which moves what it was into `before`.
+        bool applied{false};
         doc before;
+        // Its JSON as this write leaves it, for a patch after it and for the record, while `staged`.
+        bool staged{false};
+        std::string json;
     };
     std::vector<undo> undos;
     std::vector<std::string> made_colls;
     const uint64_t bytes_before = m_bytes;
-    std::string results = "[";
+    // The results are written where the caller reads them, and taken back off with the changes on a refusal.
+    const size_t out_from = out.size();
+    out += '[';
     const auto rollback = [&] {
         for (auto it = undos.rbegin(); it != undos.rend(); ++it)
-            set_doc(*it->c, it->coll, it->id, it->had ? &it->before : nullptr);
+            if (it->applied)
+                set_doc(*it->c, it->coll, it->id, it->had ? &it->before : nullptr);
         for (const auto& name : made_colls)
             m_colls.erase(name);
-        m_staged.clear();
+        out.resize(out_from);
     };
     const auto refuse = [&](error e) {
         rollback();
@@ -1926,18 +1938,28 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
             return refuse(fail(404, "not_found", "no such document"));
         if (first && &op == &ops.front())
             *first = first_change{old != nullptr, old ? old->v + 1 : 1};
-        const std::string key = staged_key(op.coll, op.id);
-        if (std::none_of(undos.begin(), undos.end(), [&](const undo& u) { return u.c == c && u.id == op.id; }))
-            undos.push_back({c, op.coll, op.id, it != c->docs.end(), it != c->docs.end() ? it->second : doc{}});
+        size_t ui = 0;
+        while (ui < undos.size() && (undos[ui].c != c || undos[ui].id != op.id))
+            ++ui;
+        if (ui == undos.size())
+        {
+            undo& n = undos.emplace_back();
+            n.c = c;
+            n.coll = op.coll;
+            n.id = op.id;
+            n.had = it != c->docs.end();
+        }
 
         if (op.kind == write_op::del)
         {
-            set_doc(*c, op.coll, op.id, nullptr);
-            m_staged.erase(key);
-            results += results.size() > 1 ? "," : "";
-            results += "{\"_id\":";
-            socketley::json::quote_into(results, op.id);
-            results += ",\"deleted\":true}";
+            undo& u = undos[ui];
+            set_doc(*c, op.coll, op.id, nullptr, u.applied ? nullptr : &u.before);
+            u.applied = true;
+            u.staged = false;
+            out += out.size() > out_from + 1 ? "," : "";
+            out += "{\"_id\":";
+            socketley::json::quote_into(out, op.id);
+            out += ",\"deleted\":true}";
             continue;
         }
         doc nd;
@@ -1945,8 +1967,8 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         {
             nd = *old;
             jvalue body;
-            const auto s = m_staged.find(key);
-            if (s != m_staged.end() ? !json_reader(s->second).document(body) : !body_of(*old, body))
+            const undo& u = undos[ui];
+            if (u.staged ? !json_reader(u.json).document(body) : !body_of(*old, body))
                 return refuse(fail(503, "unreadable", "the document could not be read from the disk"));
             if (!apply_patch(body, op.body, err))
             {
@@ -1992,25 +2014,30 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         if (depth_of(op.body) > socketley::json::json_max_depth)
             return refuse(fail(400, "too_deep", "a document nests at most " +
                                                     std::to_string(socketley::json::json_max_depth) + " deep"));
-        std::string json = json::written(op.body);
-        if (json.size() > max_doc)
+        // Written once into a buffer kept for it and copied out at its size, rather than grown from nothing.
+        m_json.clear();
+        json::write_into(m_json, op.body);
+        if (m_json.size() > max_doc)
             return refuse(fail(413, "too_large", "a document is at most 1 MiB; keep large things in a storage and "
                                                  "their address here"));
-        total += json.size();
+        total += m_json.size();
         if (total > max_write)
             return refuse(fail(413, "too_large", "a write is at most 32 MiB"));
         derive(*c, op.body, nd);
         // No place on the disk yet: the length counts for the bounds, the place comes with the record.
-        nd.at = location{0, 0, static_cast<uint32_t>(json.size())};
+        nd.at = location{0, 0, static_cast<uint32_t>(m_json.size())};
         if (!unique_ok(*c, op.id, nd, err))
         {
             error e = std::move(err);
             return refuse(std::move(e));
         }
-        results += results.size() > 1 ? "," : "";
-        write_doc(op.id, nd, json, results);
-        set_doc(*c, op.coll, op.id, &nd);
-        m_staged[key] = std::move(json);
+        out += out.size() > out_from + 1 ? "," : "";
+        write_doc(op.id, nd, m_json, out);
+        undo& u = undos[ui];
+        set_doc(*c, op.coll, op.id, &nd, u.applied ? nullptr : &u.before);
+        u.applied = true;
+        u.staged = true;
+        u.json.assign(m_json);
     }
     if (m_max_bytes && m_bytes > m_max_bytes && m_bytes > bytes_before)
         return refuse(fail(507, "full", "the database holds its --max-bytes"));
@@ -2018,11 +2045,12 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
     // One record of every touched document as it now is, and each one's place in it.
     std::vector<event> evs;
     evs.reserve(undos.size());
-    for (const auto& u : undos)
+    for (auto& u : undos)
     {
         event e;
         e.seq = seq;
-        e.coll = u.coll;
+        // Nothing is taken back past here, so what the undo held is the event's.
+        e.coll = std::move(u.coll);
         e.id = u.id;
         const auto it = u.c->docs.find(u.id);
         if (it == u.c->docs.end())
@@ -2034,8 +2062,7 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         {
             e.owner = it->second.owner;
             e.v = it->second.v;
-            // Taken rather than copied: the staging is cleared once the record is made.
-            e.json = std::move(m_staged[staged_key(u.coll, u.id)]);
+            e.json = std::move(u.json);
         }
         evs.push_back(std::move(e));
     }
@@ -2054,13 +2081,11 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         live_add(d, +1);
         cache_put(d, evs[i].json);
     }
-    m_staged.clear();
     if (events)
         for (auto& e : evs)
             events->push_back(std::move(e));
     std::string ignored;
     m_log.roll_if_full(ignored);
-    out += results;
     out += ']';
     return true;
 }

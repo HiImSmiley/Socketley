@@ -1768,12 +1768,15 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
         }
     }
 
-    answer a;
-    std::string out;
+    // The store writes its results into the answer itself.
+    answer a = spare_answer();
+    if (is_tx)
+        a.body = "{\"results\":";
     std::vector<event> evs;
     store::first_change first;
-    if (!m_store.write(who, ops, out, err, &evs, &first))
+    if (!m_store.write(who, ops, a.body, err, &evs, &first))
     {
+        m_spare.swap(a.body);
         if (err.status == 409 || err.status == 412)
             ++m_c.conflicts;
         return refused(err);
@@ -1784,12 +1787,12 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
         m_unpublished.push_back(std::move(e));
     if (is_tx)
     {
-        a.body = "{\"results\":" + out + "}";
+        a.body += '}';
         return a;
     }
     // One change: its document, or its deletion, not the list a transaction answers.
-    a.body.swap(m_spare);
-    a.body.assign(out, 1, out.size() - 2);
+    a.body.pop_back();
+    a.body.erase(0, 1);
     if (ops[0].kind != write_op::del)
     {
         a.version = first.version;
@@ -2119,8 +2122,12 @@ void db_run::cross_call(uint64_t ticket, std::string_view payload)
         return;
     }
     ++m_c.crossings_served;
-    const answer a = execute(what.who, what.method, what.path, what.body, what.if_match, what.if_none_match, true);
+    answer a = execute(what.who, what.method, what.path, what.body, what.if_match, what.if_none_match, true);
     std::string reply = encode_crossing_reply(a.status, a.version, a.body);
+    // The answer's buffer serves the next one, as serve() keeps it.
+    m_spare.swap(a.body);
+    if (m_spare.capacity() > (1u << 20))
+        std::string().swap(m_spare);
     if (a.needs > m_durable)
         hold(waiter{a.needs, nullptr, std::move(reply), ticket, true});
     else
