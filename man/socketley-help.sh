@@ -2099,6 +2099,8 @@ lua_config() {
     echo ""
     echo "  socketley.http that blocks lives inside the same budget: its timeout_ms"
     echo "    is clamped to what is left, so it returns ok=false rather than stopped."
+    echo "  The budget is dated from the first instruction hook, so C time before a"
+    echo "    callback runs 10000 VM instructions (os.execute, io) is not counted."
     echo "  Cost: the hooked dispatch path, not the JIT -- LuaJIT compiles traces"
     echo "    with a count hook installed.  Measured, an ordinary callback showed no"
     echo "    change above noise; one doing ~1300 arithmetic ops per message ran at"

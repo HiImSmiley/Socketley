@@ -20612,7 +20612,14 @@ A callback stopped at its deadline has still held the loop for that long. A CLI
 command issued during the stall can hit its own five second receive timeout and
 report the daemon unreachable; the command succeeds on retry. A runaway
 .B on_tick
-is stopped on every tick, not once. Name resolution inside
+is stopped on every tick, not once. Time a callback spends in a C function
+before it has run ten thousand VM instructions, such as an
+.B os.execute
+or an
+.B io
+read at its start, is not counted: the budget is dated from the first
+instruction hook, so such a callback can hold the loop for that time and then
+for its whole budget. Name resolution inside
 .B socketley.http
 executes no VM instructions, so it is not interrupted. Instead, the call gives up
 on it at the call's deadline.
