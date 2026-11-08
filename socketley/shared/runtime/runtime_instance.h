@@ -501,6 +501,11 @@ public:
     void add_interactive_fd(int fd);
     void remove_interactive_fd(int fd);
     void notify_interactive(std::string_view msg) const;
+    // Whether a terminal, a -w file or an interactive attach watches received messages, asked inline before the three calls.
+    bool observes_messages() const
+    {
+        return m_bash_output || !m_write_out.path().empty() || !m_interactive_fds.empty();
+    }
 
     // UDP mode (virtual, implemented by server/client)
     virtual bool is_udp() const { return false; }

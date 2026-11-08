@@ -1201,9 +1201,12 @@ void client_instance::handle_timeout(struct io_uring_cqe* cqe, io_request* req)
 void client_instance::process_message(std::string_view msg)
 {
     stat_add(m_stat_total_messages, 1);
-    print_bash_message(msg);
-    write_received_message(msg);
-    notify_interactive(msg);
+    if (SOCKETLEY_UNLIKELY(observes_messages()))
+    {
+        print_bash_message(msg);
+        write_received_message(msg);
+        notify_interactive(msg);
+    }
 
     switch (m_mode)
     {
