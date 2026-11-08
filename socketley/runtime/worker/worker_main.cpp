@@ -116,6 +116,10 @@ extern "C" void worker_on_term(int)
 {
     g_term_requested = 1;
 
+    // A stop that was asked for unwinds on the alarm below and not on the
+    // daemon's lifetime, which in a graceful shutdown ends while this unwinds.
+    if (::prctl(PR_SET_PDEATHSIG, 0) < 0) {}
+
     // The flag only ends a worker that reaches the top of its loop, so a
     // wedged one keeps its share of the listening socket, and alarm(2) is
     // async-signal-safe with a default action that terminates.
@@ -127,7 +131,7 @@ extern "C" void worker_on_term(int)
 // SO_PEERCRED against getppid() at startup and again before the bind, with
 // PR_SET_PDEATHSIG holding the rule for the rest of the worker's life -- and
 // the signal is SIGKILL because a SIGSTOPped shard runs no handler, made safe
-// by clearing it at the one point this process has decided to exit.
+// by clearing it only for a stop the daemon asked for.
 pid_t control_socket_creator(int fd)
 {
     struct ucred cr{};
@@ -514,9 +518,13 @@ public:
         }
 
         // Every way out of the loop arrives here, which makes this the one
-        // place to give the parent-death kill back, because a check every path
-        // has to remember is one a new path will not.
-        if (::prctl(PR_SET_PDEATHSIG, 0) < 0) {}
+        // place to give the parent-death kill back -- for a stop the daemon
+        // asked for, by a frame or SIGTERM, whose handler gives it back too.
+        // An end of input nobody announced is a dying daemon, which closes this
+        // socket before the kernel sends the signal, so the kill stays armed
+        // through the unwind or a worker that read the EOF first outlives it.
+        if (m_done || g_term_requested)
+            if (::prctl(PR_SET_PDEATHSIG, 0) < 0) {}
 
         // And the one place to say that a sibling going is no longer news,
         // before the drain below -- which is where a sibling's end of input
