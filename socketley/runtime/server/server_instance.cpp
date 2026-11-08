@@ -3748,6 +3748,9 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
 
 void server_instance::on_loop_turn()
 {
+    // First, so a write it starts is counted by the direct-send gate of the turn that queued it.
+    if (!m_fanout_due.empty())
+        flush_fanout_due();
     // A direct send has no completion, so what one would have run runs here,
     // once the turn has settled what the connection wants -- a refusal marks
     // it closing only after its answer is queued.
@@ -3842,6 +3845,10 @@ void server_instance::on_loop_turn()
             invoke_on_writable(fd);
         }
     }
+
+    // Again, for what the callbacks above sent to a room, whose writes no completion would start before the next wake.
+    if (!m_fanout_due.empty())
+        flush_fanout_due();
 }
 
 void server_instance::handle_accept(struct io_uring_cqe* cqe)
@@ -6322,8 +6329,33 @@ bool server_instance::fanout_take(server_connection* conn, std::string_view msg,
         }
         conn->write_queue.push_slice(at.seg, at.off, static_cast<uint32_t>(msg.size()));
     }
-    kick_write(conn);
+    // A closing connection held open for an answer no longer resolves by its serial, so its write starts here as before.
+    if (SOCKETLEY_UNLIKELY(conn->closing))
+        kick_write(conn);
+    // Started at the end of the turn and not here, so a recipient of several messages this turn takes them in one write.
+    else if (!conn->fanout_due && !conn->write_pending && conn != m_answering)
+    {
+        conn->fanout_due = true;
+        m_fanout_due.push_back(conn->ref_serial);
+    }
     return true;
+}
+
+void server_instance::flush_fanout_due()
+{
+    for (const uint64_t serial : m_fanout_due)
+    {
+        const auto it = m_conn_by_serial.find(serial);
+        auto* c = (it != m_conn_by_serial.end() && it->second >= 0 && it->second < MAX_FDS)
+                      ? m_conn_idx[it->second] : nullptr;
+        if (!c || !c->fanout_due)
+            continue;
+        c->fanout_due = false;
+        kick_write(c);
+        // A recipient closed since its message was queued is finished by the chokepoint every completion goes through.
+        finish_unreachable_conn(c->fd);
+    }
+    m_fanout_due.clear();
 }
 
 // ─── Whether the message was taken ──────────────────────────────────────────

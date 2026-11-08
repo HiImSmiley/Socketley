@@ -136,6 +136,8 @@ struct alignas(64) server_connection
     // call.  Edge-triggered: cleared when the call is queued, which is what
     // keeps a draining 8 MiB queue from firing once per completion.
     bool drain_wanted{false};
+    // A fan-out queued to it this turn and its write starts at the turn end, so every message of the turn leaves in one.
+    bool fanout_due{false};
     uint32_t active_idx{0};  // index in m_active_fds for O(1) removal
     uint32_t write_batch_count{0};
 
@@ -395,6 +397,7 @@ struct alignas(64) server_connection
         // A struct that carried a client which had spoken would otherwise hand
         // the next one a permanent exemption from the deadline.
         spoke = false;
+        fanout_due = false;
         // And a struct that carried an HTTP client would hand the next one a
         // permanent exclusion from the relay, silently receiving nothing.
         http_seen = false;
@@ -1406,6 +1409,9 @@ private:
     // recycled fd would hand the call to whoever took the slot -- a serial
     // that no longer resolves is exactly the answer wanted.
     std::vector<uint64_t> m_drain_pending;
+    // Recipients a fan-out queued to this turn, flushed by on_loop_turn() before the ring is entered.
+    std::vector<uint64_t> m_fanout_due;
+    void flush_fanout_due();
     socketley::direct_send_gate m_direct_gate;
     // The upstream leg's own, because a relay alternates between the two fds
     // and one gate shared by both would see a new fd every turn and admit neither.

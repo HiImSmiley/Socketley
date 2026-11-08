@@ -963,7 +963,12 @@ void run_step(world& w, const step& s)
         {
             const int passes = 1 + (s.a & 3);
             for (int i = 0; i < passes; i++)
+            {
                 g_loop->poll_completions(s.b & 1);
+                // A worker ends every turn so, and a fan-out's writes start there.
+                if (w.rt && w.rt->get_state() == runtime_running)
+                    w.rt->on_loop_turn();
+            }
             break;
         }
 
