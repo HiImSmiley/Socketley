@@ -5956,7 +5956,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                     buf.push_back('\n');
                     auto relay_msg = std::make_shared<const std::string>(std::move(buf));
                     if ((to & send_to_sender) && sender)
-                        queue_send(sender, relay_msg, false, nullptr, kind);
+                        queue_send(sender, relay_msg, false, kind);
                     if (to & send_to_others)
                         queue_broadcast(relay_msg, sender ? sender->fd : -1, -1, kind);
                 }
@@ -6133,7 +6133,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 }
                 buf.push_back('\n');
                 auto fwd_msg = std::make_shared<const std::string>(std::move(buf));
-                queue_send(m_conn_idx[m_master_fd], fwd_msg, false, nullptr, kind);
+                queue_send(m_conn_idx[m_master_fd], fwd_msg, false, kind);
             }
 
             if (m_send_to & (send_to_sender | send_to_others))
@@ -6144,7 +6144,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 buf.push_back('\n');
                 auto relay_msg = std::make_shared<const std::string>(std::move(buf));
                 if (m_send_to & send_to_sender)
-                    queue_send(sender, relay_msg, false, nullptr, kind);
+                    queue_send(sender, relay_msg, false, kind);
                 // Two exclusions: the master has already had this message in
                 // its own form above, or was deliberately left out of the set.
                 if (m_send_to & send_to_others)
@@ -6223,10 +6223,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
     if (SOCKETLEY_UNLIKELY(!m_loop))
         return counted;
 
-    uint32_t ws_len = 0;   // the websocket frame, built at the first websocket in the set
-    // Placed at the first recipient that takes each form, once for all of them.
-    std::shared_ptr<const std::string> seg, ws_seg;
-    uint32_t off = 0, ws_off = 0;
+    fanout_placement at;
 
     // Iterate over flat active_fds vector (cache-friendly, no hash overhead)
     for (size_t i = 0; i < m_active_fds.size(); i++)
@@ -6260,65 +6257,74 @@ server_instance::fanout_count server_instance::queue_broadcast(
             continue;
         }
 
-        const size_t queued = conn->write_queue.bytes();
-        if (SOCKETLEY_UNLIKELY(queued >= write_buffer_bytes()))
-        {
-            // Sticky here as at the send door, because otherwise a client this
-            // broadcast dropped answers the script's next self.send() with
-            // "there is no open connection" -- the peer's sentence for the
-            // runtime's decision.  One flag, both entrances.
-            abandon_for_backlog(conn);
-            ++counted.backlogged;
-            continue;
-        }
-
-        // The same watermark as the send door, so a broadcaster is woken by
-        // on_writable too.  A publisher with 3000 subscribers is exactly the
-        // producer that needs it.
-        if (SOCKETLEY_UNLIKELY(queued + msg->size() >= write_watermark_bytes()))
-            conn->drain_wanted = true;
-
-        ++counted.taken;
-
-        if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
-        {
-            if (ws_len == 0)
-            {
-                // Strip trailing newline for WS frame (WS messages are not newline-delimited)
-                std::string_view payload(*msg);
-                if (!payload.empty() && payload.back() == '\n')
-                    payload.remove_suffix(1);
-                // Built once for every websocket in the set, because the
-                // opcode is a fact about the message and not the recipient,
-                // and straight into the segment it is sent from.
-                const auto op = static_cast<uint8_t>(0x80 | ws_data_opcode(kind, payload));
-                const size_t n = ws_header_size(payload.size()) + payload.size();
-                ws_off = socketley::place_in_segment_with(m_bcast_ws_seg, n, [&](std::string& out) {
-                    ws_frame_data_into(out, op, payload);
-                });
-                ws_seg = m_bcast_ws_seg;
-                ws_len = static_cast<uint32_t>(n);
-            }
-            conn->write_queue.push_slice(ws_seg, ws_off, ws_len);
-            kick_write(conn);
-        }
+        if (fanout_take(conn, *msg, kind, at))
+            ++counted.taken;
         else
-        {
-            // One copy for every recipient, and a recipient whose queue still
-            // ends at the previous broadcast takes this one by growing that slice.
-            if (!seg)
-            {
-                off = socketley::place_in_segment(m_bcast_seg, *msg);
-                seg = m_bcast_seg;
-            }
-            conn->write_queue.push_slice(seg, off, static_cast<uint32_t>(msg->size()));
-            kick_write(conn);
-        }
+            ++counted.backlogged;
     }
 
     return counted;
 }
 
+
+// One recipient of a message several connections are sent, for every door that
+// fans out: the relay, a group and a list of ids all reach their members here,
+// so each pays for the frame once and grows the slice it already holds.
+bool server_instance::fanout_take(server_connection* conn, std::string_view msg, ws_kind kind,
+                                  fanout_placement& at)
+{
+    const size_t queued = conn->write_queue.bytes();
+    if (SOCKETLEY_UNLIKELY(queued >= write_buffer_bytes()))
+    {
+        // Sticky here as at the send door, because otherwise a client this
+        // fan-out dropped answers the script's next self.send() with "there is
+        // no open connection" -- the peer's sentence for the runtime's
+        // decision.  One flag, both entrances.
+        abandon_for_backlog(conn);
+        return false;
+    }
+
+    // The same watermark as the send door, so a broadcaster is woken by
+    // on_writable too.  A publisher with 3000 subscribers is exactly the
+    // producer that needs it.
+    if (SOCKETLEY_UNLIKELY(queued + msg.size() >= write_watermark_bytes()))
+        conn->drain_wanted = true;
+
+    if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
+    {
+        if (at.ws_len == 0)
+        {
+            // Strip trailing newline for WS frame (WS messages are not newline-delimited)
+            std::string_view payload(msg);
+            if (!payload.empty() && payload.back() == '\n')
+                payload.remove_suffix(1);
+            // Built once for every websocket in the set, because the opcode is
+            // a fact about the message and not the recipient, and straight
+            // into the segment it is sent from.
+            const auto op = static_cast<uint8_t>(0x80 | ws_data_opcode(kind, payload));
+            const size_t n = ws_header_size(payload.size()) + payload.size();
+            at.ws_off = socketley::place_in_segment_with(m_bcast_ws_seg, n, [&](std::string& out) {
+                ws_frame_data_into(out, op, payload);
+            });
+            at.ws_seg = m_bcast_ws_seg;
+            at.ws_len = static_cast<uint32_t>(n);
+        }
+        conn->write_queue.push_slice(at.ws_seg, at.ws_off, at.ws_len);
+    }
+    else
+    {
+        // One copy for every recipient, and a recipient whose queue still ends
+        // at the previous fan-out takes this one by growing that slice.
+        if (!at.seg)
+        {
+            at.off = socketley::place_in_segment(m_bcast_seg, msg);
+            at.seg = m_bcast_seg;
+        }
+        conn->write_queue.push_slice(at.seg, at.off, static_cast<uint32_t>(msg.size()));
+    }
+    kick_write(conn);
+    return true;
+}
 
 // ─── Whether the message was taken ──────────────────────────────────────────
 // It used to answer nothing, and the comment at its caller said the rest out
@@ -6377,26 +6383,13 @@ bool server_instance::admit_send(server_connection* conn, size_t bytes,
 }
 
 bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
-                              bool even_when_closing,
-                              std::shared_ptr<const std::string>* ws_cache,
-                              ws_kind kind)
+                              bool even_when_closing, ws_kind kind)
 {
     if (!admit_send(conn, msg->size(), even_when_closing))
         return false;
 
     if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
     {
-        // A frame already built for this payload, if the caller is walking a
-        // set: the bytes are the same for every websocket in it.
-        if (ws_cache && *ws_cache)
-        {
-            conn->write_queue.push_shared(*ws_cache,
-                server_connection::WRITE_COALESCE_LIMIT,
-                server_connection::MAX_WRITE_BATCH);
-            kick_write(conn);
-            return true;
-        }
-
         // Strip trailing newline for WS frame
         std::string_view payload(*msg);
         if (!payload.empty() && payload.back() == '\n')
@@ -6406,10 +6399,6 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
         // else is text only when RFC 6455 5.6 lets its bytes be.
         auto frame = ws_frame_data_shared(
             static_cast<uint8_t>(0x80 | ws_data_opcode(kind, payload)), payload);
-        // Kept for the rest of the set, so the next recipient does not pay the
-        // UTF-8 pass, the two allocations and the copy again.
-        if (ws_cache)
-            *ws_cache = frame;
         conn->write_queue.push_shared(frame,
             server_connection::WRITE_COALESCE_LIMIT,
             server_connection::MAX_WRITE_BATCH);
@@ -6519,7 +6508,7 @@ void server_instance::relay_hold_flush(server_connection* conn)
     while (!conn->relay_hold.empty())
     {
         const held_relay held = conn->relay_hold.take_front();
-        queue_send(conn, held.msg, false, nullptr, held.kind);
+        queue_send(conn, held.msg, false, held.kind);
     }
 
     conn->relay_hold_since = {};
@@ -8450,11 +8439,9 @@ size_t server_instance::multicast(const std::vector<int>& fds, std::string_view 
     // The separator, on the same reasoning pipe() gives: every other send path
     // frames its message and this one did not, so two multicasts merged into
     // one unsplittable line.
-    auto shared = std::make_shared<const std::string>(
-        msg.empty() || msg.back() != '\n' ? std::string(msg) + "\n"
-                                          : std::string(msg));
-    // One frame for every websocket in the list; see queue_send's ws_cache.
-    std::shared_ptr<const std::string> ws_msg;
+    const std::string line = msg.empty() || msg.back() != '\n' ? std::string(msg) + "\n"
+                                                                : std::string(msg);
+    fanout_placement at;
     size_t sent = 0;
     for (int fd : fds)
     {
@@ -8462,7 +8449,7 @@ size_t server_instance::multicast(const std::vector<int>& fds, std::string_view 
         auto* conn = m_conn_idx[fd];
         if (!conn || conn->closing) continue;
         // Counted only where it was queued: a recipient dropped for its backlog was not sent it.
-        if (queue_send(conn, shared, false, &ws_msg))
+        if (fanout_take(conn, line, ws_kind::by_payload, at))
             ++sent;
     }
     return sent;
@@ -8561,24 +8548,20 @@ size_t server_instance::group_send(std::string_view group, std::string_view msg)
     auto it = m_groups.find(std::string(group));
     if (it == m_groups.end()) return 0;
 
-    // Build newline-terminated message (single allocation, shared across all recipients)
-    std::string buf;
-    buf.reserve(msg.size() + 1);
-    buf.append(msg);
-    if (buf.empty() || buf.back() != '\n')
-        buf.push_back('\n');
-    auto shared_msg = std::make_shared<const std::string>(std::move(buf));
+    std::string line;
+    line.reserve(msg.size() + 1);
+    line.append(msg);
+    if (line.empty() || line.back() != '\n')
+        line.push_back('\n');
 
-    // One frame for every websocket in the group, built on the first one that
-    // is a websocket and not at all if none is.
-    std::shared_ptr<const std::string> ws_msg;
+    fanout_placement at;
     size_t sent = 0;
     for (int fd : it->second)
     {
         auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
         if (!conn || conn->closing) continue;
-        // The backlog bound is admit_send's, which records why a slow member was let go.
-        if (queue_send(conn, shared_msg, false, &ws_msg))
+        // The backlog bound is the relay's, which records why a slow member was let go.
+        if (fanout_take(conn, line, ws_kind::by_payload, at))
             ++sent;
     }
     return sent;

@@ -1162,23 +1162,24 @@ private:
     std::shared_ptr<std::string> m_bcast_ws_seg;
     fanout_count queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd,
                          int exclude_fd2 = -1, ws_kind kind = ws_kind::by_payload);
+    // Where one fan-out's bytes were placed, at the first recipient that takes each form.
+    struct fanout_placement
+    {
+        std::shared_ptr<const std::string> seg, ws_seg;
+        uint32_t off{0}, ws_off{0}, ws_len{0};
+    };
+    // One recipient of `msg` (newline-terminated): false when its backlog had it let go.
+    bool fanout_take(server_connection* conn, std::string_view msg, ws_kind kind, fanout_placement& at);
     void remove_active_fd(int fd);
     // `even_when_closing` is for an answer that was already promised, which
     // nothing else may set: the socket is still open precisely because that
     // answer is owed.
     // Answers whether the message was taken; see the definition for what a
     // false costs a caller that ignores it.
-    // `ws_cache`, when given, is where the websocket frame for THIS payload is
-    // kept: a server->client frame carries no per-recipient bit, so one set of
-    // recipients needs one frame.  Null means "build it for this connection
-    // alone", which is what a single send is.  group_send() and multicast()
-    // were calling this per recipient and paying a UTF-8 pass, two allocations
-    // and a full payload copy apiece -- O(N) where queue_broadcast() had long
-    // been O(1).
+    // One recipient; a set of them goes through fanout_take(), which builds the
+    // frame once and grows the slice a recipient already holds.
     bool queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
-                    bool even_when_closing = false,
-                    std::shared_ptr<const std::string>* ws_cache = nullptr,
-                    ws_kind kind = ws_kind::by_payload);
+                    bool even_when_closing = false, ws_kind kind = ws_kind::by_payload);
 
     // The same, for a caller that OWNS its bytes and has exactly one recipient
     // -- which is every self.send() and every reply to one client.  A
