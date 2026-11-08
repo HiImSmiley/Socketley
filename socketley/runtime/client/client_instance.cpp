@@ -344,7 +344,7 @@ void client_instance::arm_read(bool poll_first)
 // puts them through push_coalesced, which appends them into one buffer up to
 // WRITE_COALESCE_LIMIT.  Sixteen short lines are therefore one contiguous
 // write, which beats a sixteen-element iovec rather than falling short of it.
-// Above the limit the queue stops merging, and by then each entry is 64 KiB or
+// Above the limit the queue stops merging, and by then each entry is 1 MiB or
 // more, which amortises a submission on its own.
 //
 // Measured, one line answered with a burst of K and the next burst sent only
