@@ -380,6 +380,7 @@ void client_instance::flush_queued_write()
     if (m_conn->closing || m_write_queue.empty())
         return;
 
+    m_direct_gate.admit(m_conn->fd);
     m_conn->write_buf = m_write_queue.take_front();
     // Once there is room again, a later stall is worth reporting afresh.
     if (m_write_queue.bytes() < write_watermark_bytes())
@@ -420,6 +421,7 @@ void client_instance::on_loop_turn()
         // client's on_writable() simply takes none, which Lua allows.
         invoke_on_writable(0);
     }
+    m_direct_gate.next_turn();
 }
 
 // Losing the socket: one teardown, reached from every path that loses it.
@@ -1332,22 +1334,27 @@ bool client_instance::lua_send(std::string_view msg)
         return !m_conn->closing;
     }
 
-    // Nothing in flight, so the socket is tried at once, because through the ring the send's own completion cost
-    // every request-answer message a second loop turn; what the socket does not take goes to the ring as before.
+    // Nothing in flight and the turn's one write, so the socket is tried at once, because through the ring the send's own
+    // completion cost every request-answer message a second loop turn; what the socket does not take goes to the ring.
+    // Not a second line of the turn: a producer sending in a loop paid a syscall a line and never filled its queue.
     const bool   has_nl = !msg.empty() && msg.back() == '\n';
-    const size_t total  = msg.size() + (has_nl ? 0 : 1);
-    struct iovec iov[2] = { { const_cast<char*>(msg.data()), msg.size() },
-                            { const_cast<char*>("\n"), 1 } };
-    struct msghdr mh{};
-    mh.msg_iov    = iov;
-    mh.msg_iovlen = has_nl ? 1 : 2;
-    const ssize_t sent = ::sendmsg(m_conn->fd, &mh, MSG_DONTWAIT | MSG_NOSIGNAL);
-    if (sent > 0)
+    ssize_t sent = -1;
+    if (m_direct_gate.admit(m_conn->fd))
     {
-        note_established();
-        stat_add(m_stat_bytes_out, static_cast<uint64_t>(sent));
-        if (static_cast<size_t>(sent) == total)
-            return true;
+        const size_t total  = msg.size() + (has_nl ? 0 : 1);
+        struct iovec iov[2] = { { const_cast<char*>(msg.data()), msg.size() },
+                                { const_cast<char*>("\n"), 1 } };
+        struct msghdr mh{};
+        mh.msg_iov    = iov;
+        mh.msg_iovlen = has_nl ? 1 : 2;
+        sent = ::sendmsg(m_conn->fd, &mh, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent > 0)
+        {
+            note_established();
+            stat_add(m_stat_bytes_out, static_cast<uint64_t>(sent));
+            if (static_cast<size_t>(sent) == total)
+                return true;
+        }
     }
 
     m_conn->write_buf.assign(msg.data(), msg.size());

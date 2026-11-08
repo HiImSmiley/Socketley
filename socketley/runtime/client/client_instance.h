@@ -12,6 +12,7 @@
 #include "../../shared/loop/write_queue.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/crypto/tls_context.h"
+#include "../../shared/net/direct_send.h"
 
 // Everything the ring can name for one run, with a lifetime of its own because
 // a stop deregisters the owner and the flags saying a request is occupied are
@@ -220,6 +221,9 @@ private:
     // path still holds its own state -- the server's dispatch gives the long
     // form of this reasoning.
     bool m_drain_due{false};
+    // Whether a line may go by sendmsg() and skip the ring: only the turn's one write, so a producer sending in a loop
+    // queues and coalesces instead of paying a syscall per line.
+    socketley::direct_send_gate m_direct_gate;
 
     // Reconnect state, whose request and timespec live in m_conn because they
     // are storage the ring can name.
