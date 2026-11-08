@@ -168,18 +168,18 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Mail: delivery in, IMAP and POP3 out
 
-Postfix 3.10.6 + Dovecot 2.4.2, 7 passes, 2026-11-07, socketley 608e28c6.
+Postfix 3.10.6 + Dovecot 2.4.2, 3 passes, 2026-11-08, socketley bce3e552.
 
 | case | socketley | Postfix 3.10.6 + Dovecot | socketley vs Postfix 3.10.6 + Dovecot |
 |---|---|---|---|
-| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 408.0 msg/s (0.11 cores) | 109.0 msg/s (0.26 cores) | 3.72× (3.21–4.00) |
-| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 209.0 msg/s (0.16 cores) | 56.3 msg/s (0.16 cores) | 3.93× (3.21–4.18) |
-| IMAP: LOGIN and LOGOUT, 8 clients | 126.0 sign-ins/s (0.99 cores) | 64.4 sign-ins/s (0.99 cores) | 1.96× (1.95–1.97) |
-| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 487 K msg/s (0.99 cores) | 125 K msg/s (0.99 cores) | 3.88× (3.85–3.92) |
-| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 18 K msg/s (0.99 cores) | 13 K msg/s (0.99 cores) | 1.38× (1.35–1.49) |
-| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 12 K msg/s (0.99 cores) | 7.0 K msg/s (1.00 cores) | 1.77× (1.67–1.80) |
+| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 639.0 msg/s (0.15 cores) | 138.0 msg/s (0.31 cores) | 4.62× (4.44–4.62) |
+| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 380.0 msg/s (0.26 cores) | 80.0 msg/s (0.22 cores) | 4.75× (4.68–6.12) |
+| IMAP: LOGIN and LOGOUT, 8 clients | 126.0 sign-ins/s (0.99 cores) | 64.7 sign-ins/s (0.99 cores) | 1.95× (1.94–1.97) |
+| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 485 K msg/s (0.99 cores) | 124 K msg/s (0.99 cores) | 3.85× (3.82–3.97) |
+| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 18 K msg/s (0.99 cores) | 13 K msg/s (0.99 cores) | 1.34× (1.32–1.36) |
+| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 12 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.76× (1.74–1.82) |
 
-How it was measured: smtp-source (64 processes x 1 connections); mailload.py (8 asyncio processes x 1 connection), 8 s a run; every process of each on the same one core (socketley's daemon, idp, storage and mail; Postfix and Dovecot); smtp-source and mailload on 20 others; data on the VM's ext4 disk. Postfix hands each message over LMTP to Dovecot's Maildir and index; socketley's mail runtime writes it into its storage runtime. Both sync to disk (about 4 ms a sync here) before a message counts, so the SMTP rows are bound by syncs, not cores, and are timed until the last message is in its mailbox. Every sign-in hashes the password: scrypt in socketley, yescrypt in Dovecot. Dovecot 2.4's lmtp_user_concurrency_limit is set to unlimited, 2.3's default, since 10 made Postfix wait out five-minute retries.
+How it was measured: smtp-source (64 processes x 1 connections); mailload.py (8 asyncio processes x 1 connection), 4 s a run; every process of each on the same one core (socketley's daemon, idp, storage and mail; Postfix and Dovecot); smtp-source and mailload on 20 others; data on the VM's ext4 disk. Postfix hands each message over LMTP to Dovecot's Maildir and index; socketley's mail runtime writes it into its storage runtime. Both sync to disk (about 4 ms a sync here) before a message counts, so the SMTP rows are bound by syncs, not cores, and are timed until the last message is in its mailbox. Every sign-in hashes the password: scrypt in socketley, yescrypt in Dovecot. Dovecot 2.4's lmtp_user_concurrency_limit is set to unlimited, 2.3's default, since 10 made Postfix wait out five-minute retries.
 
 ## In the manual
 

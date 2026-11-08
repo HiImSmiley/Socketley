@@ -44,16 +44,44 @@ Every flag a sync runtime takes, by group.
 
 A ratio (×) is how many times better socketley did: more per second, or less time, memory or CPU; above 1× socketley is ahead. The range in brackets is the lowest and highest ratio across the passes.
 
-### Carrying a directory into a storage
+### Carrying a directory to a storage and back
 
-rclone 1.60.1, 7 passes, 2026-11-07, socketley 14fae8c3.
+rclone v1.75.2, mc 2025-08-13, 3 passes, 2026-11-08, socketley c8301617.
+
+| case | socketley | rclone | mc | socketley vs rclone | socketley vs mc |
+|---|---|---|---|---|---|
+| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 8.9 K files/s (0.22 cores) | 4.1 K files/s (1.69 cores) | 2.8 K files/s (1.18 cores) | 2.08× (2.07–2.20) | 3.16× (3.06–3.17) |
+| 1000 files changed after it | 6.6 K files/s (0.33 cores) | 3.7 K files/s (1.61 cores) | 2.7 K files/s (1.19 cores) | 1.78× (1.77–1.79) | 2.49× (2.46–2.49) |
+| first copy, 20,000 files of 4 KiB | 24 K files/s (0.52 cores) | 7.0 K files/s (1.66 cores) | 4.3 K files/s (1.37 cores) | 3.42× (3.38–3.48) | 5.62× (5.60–5.65) |
+| first copy, 8 files of 256 MiB | 2.9 K MiB/s (0.09 cores) | 616.0 MiB/s (1.47 cores) | 2.0 K MiB/s (1.35 cores) | 4.60× (4.46–4.73) | 1.42× (1.39–1.47) |
+| first copy, a tree 12 directories deep: 8,190 files of 4 KiB in 4,095 directories | 22 K files/s (0.57 cores) | 6.8 K files/s (1.73 cores) | 4.1 K files/s (1.34 cores) | 3.30× (3.24–3.34) | 5.49× (5.42–5.51) |
+| checked again, 1 of 20,000 files deleted since: time | 77.0 ms (0.39 cores) | 225 ms (1.25 cores) | 269 ms (1.25 cores) | 2.93× (2.86–2.96) | 3.52× (3.48–3.54) |
+| checked again, 1 of 20,000 files deleted since: requests sent | 1.0 requests (0.36 cores) | 21.0 requests (1.23 cores) | 22.0 requests (1.26 cores) | 21.00× (21.00–21.00) | 22.00× (22.00–22.00) |
+| 1,000 files deleted | 41 K files/s (1.22 cores) | 12 K files/s (1.44 cores) | 6.9 K files/s (1.28 cores) | 3.51× (3.31–3.60) | 5.84× (5.84–5.86) |
+| a directory of 1,000 files renamed | 7.7 K files/s (0.31 cores) | 3.4 K files/s (1.69 cores) | 2.1 K files/s (1.22 cores) | 2.29× (2.23–2.37) | 3.75× (3.73–3.76) |
+| pulled into an empty directory, 2000 files of 64 KiB and 50 of 1 MiB | 20 K files/s (0.87 cores) | 6.2 K files/s (1.73 cores) | 4.1 K files/s (1.38 cores) | 3.21× (2.94–3.23) | 4.80× (4.74–4.91) |
+
+How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carriers on two cores, the target storage runtime in a daemon of its own on four others. One socketley storage runtime on tmpfs is the target for all three, a fresh bucket a run, every run checked key for key and byte for byte. rclone 1.75.2 runs as its S3 docs advise (--transfers 8 --checkers 16 --fast-list --update --use-server-modtime), mc mirror with --overwrite --remove and eight workers. A socketley job walks once at start and then follows inotify, where the others walk both sides again; it checks a whole tree only when it starts, so the re-check row is a stop and a start, with one file deleted so its end can be seen.
+
+### A change noticed while running
+
+mc 2025-08-13, 3 passes, 2026-11-08, socketley c8301617.
+
+| case | socketley | mc | socketley vs mc |
+|---|---|---|---|
+| a 64 KiB file written, until it is in the storage | 0.91 ms (0.00 cores) | 1.53 ms (0.02 cores) | 1.60× (1.58–1.76) |
+
+How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the storage on four others. Each file is timed from its write until a HEAD of its key answers with its MD5, one write at a time. rclone has no watch mode; mc mirror --watch is the nearest tool.
+
+### Both ways at once
+
+rclone v1.75.2, 3 passes, 2026-11-08, socketley c8301617.
 
 | case | socketley | rclone | socketley vs rclone |
 |---|---|---|---|
-| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 7.1 K files/s (0.17 cores) | 3.5 K files/s (1.50 cores) | 2.01× (1.87–2.16) |
-| 1000 files changed after it | 4.1 K files/s (0.25 cores) | 2.9 K files/s (1.67 cores) | 1.42× (1.37–1.50) |
+| both ways: 500 files changed here and 500 in the storage | 12 K files/s (0.35 cores) | 2.3 K files/s (1.58 cores) | 5.12× (5.12–5.19) |
 
-How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the target storage runtime in a daemon of its own on four others. The same socketley storage runtime is the target for both, on tmpfs. rclone is the 1.60 Ubuntu packages (default four transfers); a socketley sync job is one runtime that keeps watching the directory and carries a change when inotify reports it, where rclone walks both sides again. A job's end is read off its figures, which refresh every 250 ms, so each run is made several seconds long.
+How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the storage on four others. A tree and a bucket in step, then 500 files rewritten here and 500 others replaced in the storage, then one run: socketley --mode inout against rclone bisync. mc mirror carries one way only.
 
 ## In the manual
 

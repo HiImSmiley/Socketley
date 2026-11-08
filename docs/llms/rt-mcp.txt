@@ -86,16 +86,16 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### MCP server over Streamable HTTP
 
-MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 9 passes, 2026-11-07, socketley 608e28c6.
+MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 3 passes, 2026-11-08, socketley bce3e552.
 
 | case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
 |---|---|---|---|---|---|
-| initialize + tools/list, a new session each, 64 at once | 73 K req/s (0.97 cores) | 1.1 K req/s (1.00 cores) | 1.7 K req/s (1.00 cores) | 63.78× (61.13–65.00) | 43.55× (42.81–44.16) |
-| tools/call add(a, b), 64 sessions | 138 K req/s (0.99 cores) | 5.5 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 25.21× (24.71–27.38) | 19.36× (18.98–19.55) |
-| tools/call returning 16 KiB of text, 64 sessions | 55 K req/s (0.91 cores) | 5.3 K req/s (1.00 cores) | 6.9 K req/s (1.00 cores) | 10.34× (10.03–10.69) | 7.95× (7.81–8.11) |
-| resources/read, 1 KiB of text, 64 sessions | 155 K req/s (0.96 cores) | 5.5 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.50× (26.62–30.19) | 20.96× (20.48–21.31) |
+| initialize + tools/list, a new session each, 64 at once | 70 K req/s (0.97 cores) | 1.2 K req/s (1.00 cores) | 1.6 K req/s (0.99 cores) | 62.49× (61.03–63.23) | 43.56× (43.52–45.90) |
+| tools/call add(a, b), 64 sessions | 135 K req/s (0.98 cores) | 5.3 K req/s (1.00 cores) | 7.0 K req/s (1.00 cores) | 25.98× (25.49–27.42) | 19.35× (18.95–19.43) |
+| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.91 cores) | 5.1 K req/s (1.00 cores) | 6.7 K req/s (1.00 cores) | 10.53× (10.30–10.58) | 8.07× (7.96–8.13) |
+| resources/read, 1 KiB of text, 64 sessions | 152 K req/s (0.96 cores) | 5.3 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 28.87× (27.44–29.53) | 20.67× (20.42–20.71) |
 
-How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 6s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
+How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 4s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
 
 ## In the manual
 

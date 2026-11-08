@@ -134,31 +134,31 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Reverse proxy, HTTP and TCP
 
-HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-08, socketley bce3e552.
 
 | case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 55 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.32× (1.29–1.42) | 1.84× (1.79–1.90) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 37 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 1.24× (1.21–1.25) | 1.45× (1.40–1.47) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.22× (1.19–1.26) | 1.71× (1.66–1.74) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.61× (1.58–1.66) | 2.11× (2.05–2.14) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 100 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 70 K req/s (1.00 cores) | 2.29× (2.15–2.38) | 1.40× (1.34–1.48) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 54 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.33× (1.32–1.37) | 1.78× (1.77–1.81) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 45 K req/s (1.00 cores) | 37 K req/s (0.99 cores) | 31 K req/s (1.00 cores) | 1.23× (1.22–1.24) | 1.44× (1.43–1.45) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.20× (1.18–1.25) | 1.75× (1.70–1.75) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 1.59× (1.57–1.63) | 2.00× (1.99–2.04) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 93 K req/s (1.00 cores) | 45 K req/s (1.00 cores) | 67 K req/s (1.00 cores) | 2.08× (1.97–2.16) | 1.42× (1.30–1.44) |
 
-How it was measured: wrk 8 threads, 8 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once.
+How it was measured: wrk 8 threads, 4 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ### Reverse proxy on four cores
 
-HAProxy 3.2.25, nginx 1.28.3, 9 passes, 2026-11-07, socketley 14fae8c3.
+HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-08, socketley bce3e552.
 
 | case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 147 K req/s (4.00 cores) | 109 K req/s (4.00 cores) | 102 K req/s (3.72 cores) | 1.33× (1.29–1.37) | 1.43× (1.41–1.47) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 163 K req/s (4.00 cores) | 128 K req/s (4.00 cores) | 117 K req/s (4.00 cores) | 1.27× (1.26–1.30) | 1.40× (1.38–1.44) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 93 K req/s (4.00 cores) | 78 K req/s (4.00 cores) | 56 K req/s (4.00 cores) | 1.18× (1.16–1.21) | 1.65× (1.61–1.66) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 105 K req/s (3.96 cores) | 82 K req/s (3.98 cores) | 36 K req/s (2.02 cores) | 1.27× (1.22–1.30) | 2.88× (2.77–2.91) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 207 K req/s (4.00 cores) | 172 K req/s (4.00 cores) | 182 K req/s (4.00 cores) | 1.20× (1.18–1.22) | 1.14× (1.12–1.16) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 145 K req/s (4.00 cores) | 108 K req/s (4.00 cores) | 104 K req/s (3.80 cores) | 1.35× (1.24–1.37) | 1.42× (1.27–1.46) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 164 K req/s (3.99 cores) | 125 K req/s (4.00 cores) | 117 K req/s (4.00 cores) | 1.31× (1.28–1.35) | 1.40× (1.39–1.46) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 93 K req/s (3.99 cores) | 78 K req/s (4.00 cores) | 57 K req/s (3.99 cores) | 1.20× (1.19–1.25) | 1.64× (1.63–1.66) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 104 K req/s (3.95 cores) | 85 K req/s (3.98 cores) | 75 K req/s (3.84 cores) | 1.24× (1.21–1.25) | 1.40× (1.40–1.41) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 209 K req/s (4.00 cores) | 172 K req/s (4.00 cores) | 182 K req/s (4.00 cores) | 1.21× (1.21–1.22) | 1.15× (1.14–1.15) |
 
-How it was measured: wrk 16 threads, 8 s a run; socketley as four shards, HAProxy with four threads and nginx with four workers, each pinned to one of the same four cores; the nginx backend (eight workers) on eight others, wrk (16 threads) on 14. The same rows as the one-core set, the same wrk for every arm; the backend is not what the proxies run into. As in the server set, each wrk thread holds connections on all four of socketley's shards, so part of every arm's CPU is waking the co-located client across cores.
+How it was measured: wrk 16 threads, 4 s a run; socketley as four shards, HAProxy with four threads and nginx with four workers, each pinned to one of the same four cores; the nginx backend (eight workers) on eight others, wrk (16 threads) on 14. The same rows as the one-core set, the same wrk for every arm; the backend is not what the proxies run into. As in the server set, each wrk thread holds connections on all four of socketley's shards, so part of every arm's CPU is waking the co-located client across cores. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ## In the manual
 

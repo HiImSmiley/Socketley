@@ -19,7 +19,7 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 ## The runtimes
 
 - [cache](rt-cache.txt): In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub (compared with Redis, Valkey)
-- [client](rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting
+- [client](rt-client.txt): Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting (compared with Go, Node.js, Python asyncio, tcpkali, socat)
 - [db](rt-db.txt): JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups (compared with MongoDB, PocketBase)
 - [dns](rt-dns.txt): Authoritative name server for its zones, over UDP and TCP, with DNSSEC and transfers (compared with NSD, Knot)
 - [idp](rt-idp.txt): OpenID Connect provider with its own accounts, second factors, app passwords and SSH certificates (compared with Keycloak)
@@ -28,9 +28,9 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 - [metrics](rt-metrics.txt): Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs (compared with Prometheus, VictoriaMetrics)
 - [mqtt](rt-mqtt.txt): MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules (compared with Mosquitto)
 - [proxy](rt-proxy.txt): HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI (compared with HAProxy, nginx)
-- [server](rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path (compared with nginx)
+- [server](rt-server.txt): TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path (compared with Node.js (ws, uWebSockets.js), Go, nginx)
 - [storage](rt-storage.txt): S3 object storage over a directory, with versioning, replication, a web drive and git (compared with MinIO)
-- [sync](rt-sync.txt): One job that carries a directory to a storage, from it, or both ways (compared with rclone)
+- [sync](rt-sync.txt): One job that carries a directory to a storage, from it, or both ways (compared with rclone, mc)
 - [tunnel](rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials (compared with frp)
 - [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in (compared with nginx)
 
@@ -38,19 +38,29 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
 
-- cache: 3.6× against Redis (GET)
-- server: 5.6× against nginx (1 KiB file, keep-alive, 256 connections)
+- cache: 3.9× against Redis (GET)
+- server: 0.9× against socketley, no script (echo, 64 B messages, 256 connections, one in flight each)
+- server: 0.9× against socketley, no script (line echo, 64 B, 256 connections, one in flight each)
+- server: 2.9× against Node 24.22.1 dgram (datagram echo, 64 B, 128 sockets, one in flight each)
+- server: 5.3× against nginx (1 KiB file, keep-alive, 256 connections)
 - proxy: 1.2× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
-- web: 4.9× against nginx (page 4 KiB, keep-alive, 256 connections)
-- dns: 1.3× against NSD (A queries over UDP)
-- mqtt: 21.4× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
-- storage: 18.5× against MinIO (GET 4 KiB, 64 connections)
-- db: 2.6× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
+- web: 4.5× against nginx (page 4 KiB, keep-alive, 256 connections)
+- dns: 1.2× against NSD (A queries over UDP)
+- mqtt: 21.0× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
+- storage: 18.4× against MinIO (GET 4 KiB, 64 connections)
+- db: 2.4× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
 - tunnel: 2.3× against frp (throughput, 512 MiB echoed through the tunnel)
 - metrics: 2.6× against Prometheus (CPU per sample ingested)
-- idp: 23.9× against Keycloak (refresh token, 256 clients)
-- mail: 3.7× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
-- mcp: 25.2× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
+- sync: 2.1× against rclone (first copy, 2000 files of 64 KiB and 50 of 1 MiB)
+- idp: 23.5× against Keycloak (refresh token, 256 clients)
+- mail: 4.6× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
+- mcp: 26.0× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
+- client: 1.1× against Go (request-answer: 1 connection, 64 B each way)
+- client: 0.2× against tcpkali (send: 64 B lines as fast as the connection takes them, TCP)
+- client: 0.9× against Go (send: 64 B lines, TLS 1.3)
+- client: 1.0× against redis-benchmark (pipelined INCR to a socketley cache, depth 32, 1 connection)
+- client: 0.9× against socat (one line from the shell, 1,000 in a row)
+- client: 2.7× against socat (one line from the shell to a TLS service, 1,000 in a row)
 
 ## Where to go next
 

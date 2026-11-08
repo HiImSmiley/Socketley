@@ -30,7 +30,7 @@ Object.assign(P, {
 
 const RT = [
   ['cache', 'In-memory store on the Redis protocol: strings, lists, sets, hashes, sorted sets, streams, pub/sub', 'Redis, Valkey'],
-  ['client', 'Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting', ''],
+  ['client', 'Dials a server and holds the connection: TCP, UDP or a unix socket, over TLS, reconnecting', 'Go, Node.js, Python asyncio, tcpkali, socat'],
   ['db', 'JSON documents owned by accounts, over HTTP, with indexes, queries, replicas and backups', 'MongoDB, PocketBase'],
   ['dns', 'Authoritative name server for its zones, over UDP and TCP, with DNSSEC and transfers', 'NSD, Knot'],
   ['idp', 'OpenID Connect provider with its own accounts, second factors, app passwords and SSH certificates', 'Keycloak'],
@@ -39,16 +39,15 @@ const RT = [
   ['metrics', 'Time series for years, answered with PromQL over the Prometheus API, with alert rules and logs', 'Prometheus, VictoriaMetrics'],
   ['mqtt', 'MQTT 3.1, 3.1.1 and 5.0 broker on TCP, TLS and WebSocket, with sessions and rules', 'Mosquitto'],
   ['proxy', 'HTTP and TCP reverse proxy: routes by name and path, health checks, retries, mTLS, FastCGI', 'HAProxy, nginx'],
-  ['server', 'TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path', 'nginx'],
+  ['server', 'TCP, UDP, WebSocket and HTTP on one port, answered by Lua or by a built-in path', 'Node.js (ws, uWebSockets.js), Go, nginx'],
   ['storage', 'S3 object storage over a directory, with versioning, replication, a web drive and git', 'MinIO'],
-  ['sync', 'One job that carries a directory to a storage, from it, or both ways', 'rclone'],
+  ['sync', 'One job that carries a directory to a storage, from it, or both ways', 'rclone, mc'],
   ['tunnel', 'Makes a machine without an address of its own reachable through an edge it dials', 'frp'],
   ['web', 'Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in', 'nginx'],
 ];
 const RTI = Object.fromEntries(RT.map(r => [r[0], r]));
 // Why a runtime has no comparison on the benchmarks page.
 const NOBENCH = {
-  client: 'A client runtime holds one connection to somebody else\'s server; there is no other program doing that to set beside it.',
 };
 
 const NAV = [
