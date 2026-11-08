@@ -1412,6 +1412,8 @@ private:
     std::vector<uint64_t> m_drain_pending;
     // Recipients a fan-out queued to this turn, flushed by on_loop_turn() before the ring is entered.
     std::vector<uint64_t> m_fanout_due;
+    // The list flush_fanout_due() walks, a member so both keep their capacity from turn to turn.
+    std::vector<uint64_t> m_fanout_walk;
     void flush_fanout_due();
     socketley::direct_send_gate m_direct_gate;
     // The upstream leg's own, because a relay alternates between the two fds

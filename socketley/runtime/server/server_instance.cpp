@@ -6343,19 +6343,26 @@ bool server_instance::fanout_take(server_connection* conn, std::string_view msg,
 
 void server_instance::flush_fanout_due()
 {
-    for (const uint64_t serial : m_fanout_due)
+    // Walked from a swapped-out copy until none is left, because a recipient closed here runs on_disconnect, whose
+    // group_send queues more.
+    while (!m_fanout_due.empty())
     {
-        const auto it = m_conn_by_serial.find(serial);
-        auto* c = (it != m_conn_by_serial.end() && it->second >= 0 && it->second < MAX_FDS)
-                      ? m_conn_idx[it->second] : nullptr;
-        if (!c || !c->fanout_due)
-            continue;
-        c->fanout_due = false;
-        kick_write(c);
-        // A recipient closed since its message was queued is finished by the chokepoint every completion goes through.
-        finish_unreachable_conn(c->fd);
+        m_fanout_walk.swap(m_fanout_due);
+        for (const uint64_t serial : m_fanout_walk)
+        {
+            const auto it = m_conn_by_serial.find(serial);
+            auto* c = (it != m_conn_by_serial.end() && it->second >= 0 && it->second < MAX_FDS)
+                          ? m_conn_idx[it->second] : nullptr;
+            if (!c || !c->fanout_due)
+                continue;
+            c->fanout_due = false;
+            kick_write(c);
+            // A recipient closed since its message was queued is finished by the chokepoint every completion
+            // goes through.
+            finish_unreachable_conn(c->fd);
+        }
+        m_fanout_walk.clear();
     }
-    m_fanout_due.clear();
 }
 
 // ─── Whether the message was taken ──────────────────────────────────────────
