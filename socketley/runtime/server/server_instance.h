@@ -1195,6 +1195,14 @@ private:
     void abandon_for_backlog(server_connection* conn);
     bool admit_send(server_connection* conn, size_t bytes, bool even_when_closing);
     void flush_write_queue(server_connection* conn);
+    // The connection whose read is being parsed: what it is answered stays queued until the read is done, so the
+    // answers to one read leave in one send instead of the first alone and the rest after its completion.
+    server_connection* m_answering{nullptr};
+    void kick_write(server_connection* conn)
+    {
+        if (SOCKETLEY_LIKELY(!conn->write_pending) && conn != m_answering)
+            flush_write_queue(conn);
+    }
     void submit_batch(server_connection* conn);
     bool send_direct(server_connection* conn);
     bool send_line_now(server_connection* conn, std::string_view msg, bool add_nl);

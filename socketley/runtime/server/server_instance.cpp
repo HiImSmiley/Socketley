@@ -5384,7 +5384,11 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         goto submit_next_read;
     }
 
+    m_answering = conn;
     parse_partial(conn);
+    m_answering = nullptr;
+    if (!conn->write_queue.empty())
+        kick_write(conn);
 
 submit_next_read:
     // Relay traffic held across classification is released here, because every
@@ -5932,8 +5936,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                         {
                             sender->write_queue.push_coalesced_line(
                                 msg, server_connection::WRITE_COALESCE_LIMIT);
-                            if (SOCKETLEY_LIKELY(!sender->write_pending))
-                                flush_write_queue(sender);
+                            kick_write(sender);
                         }
                     }
                     else
@@ -6297,8 +6300,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
                 ws_len = static_cast<uint32_t>(n);
             }
             conn->write_queue.push_slice(ws_seg, ws_off, ws_len);
-            if (!conn->write_pending)
-                flush_write_queue(conn);
+            kick_write(conn);
         }
         else
         {
@@ -6310,8 +6312,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
                 seg = m_bcast_seg;
             }
             conn->write_queue.push_slice(seg, off, static_cast<uint32_t>(msg->size()));
-            if (!conn->write_pending)
-                flush_write_queue(conn);
+            kick_write(conn);
         }
     }
 
@@ -6392,8 +6393,7 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
             conn->write_queue.push_shared(*ws_cache,
                 server_connection::WRITE_COALESCE_LIMIT,
                 server_connection::MAX_WRITE_BATCH);
-            if (SOCKETLEY_LIKELY(!conn->write_pending))
-                flush_write_queue(conn);
+            kick_write(conn);
             return true;
         }
 
@@ -6421,9 +6421,7 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
             server_connection::MAX_WRITE_BATCH);
     }
 
-    if (SOCKETLEY_LIKELY(!conn->write_pending))
-        flush_write_queue(conn);
-
+    kick_write(conn);
     return true;
 }
 
@@ -6473,9 +6471,7 @@ bool server_instance::queue_send(server_connection* conn, std::string&& msg,
             server_connection::WRITE_COALESCE_LIMIT);
     }
 
-    if (SOCKETLEY_LIKELY(!conn->write_pending))
-        flush_write_queue(conn);
-
+    kick_write(conn);
     return true;
 }
 
@@ -7905,8 +7901,20 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
 
     const bool add_nl = msg.empty() || msg.back() != '\n';
     if (SOCKETLEY_LIKELY(m_loop && conn->ssl == nullptr && conn->write_queue.empty()
-                         && !conn->write_pending && conn->write_batch_count == 0))
+                         && !conn->write_pending && conn->write_batch_count == 0 && conn != m_answering))
         return send_line_now(conn, msg, add_nl);
+
+    // An answer to the read being parsed joins the tail with its newline and leaves with the rest of the read's.
+    if (conn == m_answering && conn->ssl == nullptr)
+    {
+        if (!admit_send(conn, msg.size() + (add_nl ? 1 : 0), conn->cache_pending > 0))
+            return false;
+        if (add_nl)
+            conn->write_queue.push_coalesced_line(msg, server_connection::WRITE_COALESCE_LIMIT);
+        else
+            conn->write_queue.push_coalesced(msg, server_connection::WRITE_COALESCE_LIMIT);
+        return true;
+    }
 
     std::string buf;
     buf.reserve(msg.size() + 1);
@@ -7965,7 +7973,7 @@ bool server_instance::send_ws_message(server_connection* conn, std::string_view 
                     payload.size());
 
     if (SOCKETLEY_LIKELY(conn->ssl == nullptr && conn->write_queue.empty()
-                         && !conn->write_pending && conn->write_batch_count == 0))
+                         && !conn->write_pending && conn->write_batch_count == 0 && conn != m_answering))
     {
         uint32_t count = 0;
         conn->write_iovs[count++] = { hdr, hdr_len };
@@ -7982,8 +7990,7 @@ bool server_instance::send_ws_message(server_connection* conn, std::string_view 
     frame.append(hdr, hdr_len);
     frame.append(payload);
     conn->write_queue.push_coalesced(std::move(frame), server_connection::WRITE_COALESCE_LIMIT);
-    if (SOCKETLEY_LIKELY(!conn->write_pending))
-        flush_write_queue(conn);
+    kick_write(conn);
     return true;
 }
 
