@@ -9,6 +9,7 @@
 
 #include "dns_wire.h"
 #include "dns_zone.h"
+#include "../../shared/util/thread_buffer.h"
 
 namespace socketley::dns
 {
@@ -66,10 +67,12 @@ size_t make_notify(const zone& z, uint16_t id, uint8_t* out, size_t cap);
 // defined, and SRV's target never.
 void write_rr(writer& w, std::string_view owner, uint16_t type, uint32_t ttl, std::string_view rdata);
 
+struct transfer_buffer_site;
+
 template <typename Emit>
 void transfer(const zone& z, const uint8_t* q, size_t question_end, Emit&& emit)
 {
-    static thread_local uint8_t buf[max_message];
+    uint8_t* const buf = thread_buffer<uint8_t, max_message, transfer_buffer_site>();
     const rrset* soa = z.soa();
     if (!soa || soa->rdata.empty())
         return;

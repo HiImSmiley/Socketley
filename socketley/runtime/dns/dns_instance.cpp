@@ -1121,7 +1121,8 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
 size_t dns_run::tcp_answer(const std::shared_ptr<tcp_conn>& c, std::string_view src)
 {
     size_t off = 0;
-    static thread_local uint8_t out[max_message + 2];
+    struct tcp_answer_site;
+    uint8_t* const out = thread_buffer<uint8_t, max_message + 2, tcp_answer_site>();
     const bool xfr_ok = !m_transfer.empty() && ip_block::any_contains(m_transfer, reinterpret_cast<const sockaddr*>(&c->peer));
     while (!c->held() && src.size() - off >= 2)
     {

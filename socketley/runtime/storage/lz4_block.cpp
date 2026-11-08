@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "../../shared/util/thread_buffer.h"
+
 namespace socketley::storage
 {
 
@@ -56,6 +58,8 @@ uint8_t* put_sequence(uint8_t* op, const uint8_t* lit, size_t lit_len, size_t of
     return op;
 }
 
+struct match_table_site;
+
 }   // namespace
 
 size_t lz4_compress(const uint8_t* in, size_t n, uint8_t* out)
@@ -64,8 +68,8 @@ size_t lz4_compress(const uint8_t* in, size_t n, uint8_t* out)
     const uint8_t* anchor = in;
     if (n > match_limit)
     {
-        static thread_local uint32_t table[1u << hash_log];
-        std::memset(table, 0, sizeof table);
+        uint32_t* const table = thread_buffer<uint32_t, (1u << hash_log), match_table_site>();
+        std::memset(table, 0, sizeof(uint32_t) << hash_log);
         const uint8_t* const end   = in + n;
         const uint8_t* const limit = end - match_limit;
         const uint8_t* ip = in + 1;

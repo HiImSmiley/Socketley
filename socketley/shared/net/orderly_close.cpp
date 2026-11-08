@@ -14,6 +14,7 @@
 
 #include "../loop/event_loop.h"
 #include "../util/settings.h"
+#include "../util/thread_buffer.h"
 
 namespace socketley
 {
@@ -109,8 +110,10 @@ bool orderly_close::advance(entry& e)
     bool drained = false, eof = false;
     for (int i = 0; i < 64; ++i)
     {
-        static thread_local char sink[16384];
-        const ssize_t n = ::recv(e.fd, sink, sizeof(sink), MSG_DONTWAIT);
+        struct sink_site;
+        constexpr size_t sink_bytes = 16384;
+        char* const sink = thread_buffer<char, sink_bytes, sink_site>();
+        const ssize_t n = ::recv(e.fd, sink, sink_bytes, MSG_DONTWAIT);
         if (n > 0)
         {
             e.drained += static_cast<uint64_t>(n);
