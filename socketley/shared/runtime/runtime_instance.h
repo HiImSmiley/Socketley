@@ -334,6 +334,7 @@ public:
     // The daemon's answer to a series_pull and each runtime map it pushes, which only a metrics runtime reads.
     virtual void on_series_feed(std::string_view /*payload*/) {}
     virtual void on_runtime_map(std::string_view /*payload*/) {}
+    virtual bool wants_runtime_map() const { return false; }
 
     // A whole frame up the worker's control socket, false when it could not be queued; set only in a worker.
     using daemon_sink = std::function<bool(const std::string& frame)>;

@@ -102,6 +102,10 @@ enum class frame_type : uint16_t
     // u64 id then what the runtime packed, with the descriptor in the same sendmsg; and the answer, u64 id, u8 taken.
     conn_handoff     = 35,
     conn_handoff_ack = 36,
+
+    // daemon -> worker: the rows of the runtime map that changed since the map the worker holds; see
+    // encode_runtime_map_delta.
+    runtime_map_delta = 37,
 };
 
 // reload_err carries the diagnostic verbatim and is sent only when the reload
@@ -921,6 +925,8 @@ struct runtime_wire
     uint64_t    connections{0};
     std::string owner;      // empty when the runtime has no parent
     std::string group;      // empty when the runtime is in no group
+
+    bool operator==(const runtime_wire&) const = default;
 };
 
 inline std::string encode_runtime_map(const std::vector<runtime_wire>& rts)
@@ -940,6 +946,19 @@ inline std::string encode_runtime_map(const std::vector<runtime_wire>& rts)
     return out;
 }
 
+// One row as encode_runtime_map writes it, false once the payload ran out.
+inline bool decode_runtime_row(reader& r, runtime_wire& e)
+{
+    e.name        = std::string(r.str());
+    e.type        = std::string(r.str());
+    e.state       = r.u8();
+    e.port        = r.u16();
+    e.connections = r.u64();
+    e.owner       = std::string(r.str());
+    e.group       = std::string(r.str());
+    return r.ok;
+}
+
 inline bool decode_runtime_map(std::string_view payload, std::vector<runtime_wire>& rts)
 {
     reader r(payload.data(), payload.size());
@@ -954,15 +973,43 @@ inline bool decode_runtime_map(std::string_view payload, std::vector<runtime_wir
     for (uint32_t i = 0; i < n && r.ok; ++i)
     {
         runtime_wire e;
-        e.name        = std::string(r.str());
-        e.type        = std::string(r.str());
-        e.state       = r.u8();
-        e.port        = r.u16();
-        e.connections = r.u64();
-        e.owner       = std::string(r.str());
-        e.group       = std::string(r.str());
-        if (!r.ok) return false;
+        if (!decode_runtime_row(r, e)) return false;
         rts.push_back(std::move(e));
+    }
+    return r.ok;
+}
+
+// The rows that changed, as encode_runtime_map writes them, then u32 n and the names of the runtimes that left.
+inline std::string encode_runtime_map_delta(const std::vector<runtime_wire>& upserts,
+                                            const std::vector<std::string>& removed)
+{
+    std::string out = encode_runtime_map(upserts);
+    socketley::bytes::append32(out, static_cast<uint32_t>(removed.size()));
+    for (const auto& n : removed)
+        put_str(out, n);
+    return out;
+}
+
+inline bool decode_runtime_map_delta(std::string_view payload, std::vector<runtime_wire>& upserts,
+                                     std::vector<std::string>& removed)
+{
+    reader r(payload.data(), payload.size());
+    upserts.clear();
+    removed.clear();
+
+    const uint32_t n = r.u32();
+    for (uint32_t i = 0; i < n && r.ok; ++i)
+    {
+        runtime_wire e;
+        if (decode_runtime_row(r, e))
+            upserts.push_back(std::move(e));
+    }
+    const uint32_t m = r.u32();
+    for (uint32_t i = 0; i < m && r.ok; ++i)
+    {
+        std::string name(r.str());
+        if (r.ok)
+            removed.push_back(std::move(name));
     }
     return r.ok;
 }

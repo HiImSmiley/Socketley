@@ -625,6 +625,8 @@ bool client_instance::setup(event_loop& loop)
 {
     m_loop = &loop;
     m_ring_loop = &loop;
+    // Clients are made one per connection and many share a core, where a spin only takes the core from the others.
+    loop.set_busy_spin(false);
 
     // The three occupied flags survive a stop, because a deregistered owner's
     // completions are dropped and never lower them, so this asks the loop --

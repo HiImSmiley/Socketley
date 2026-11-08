@@ -56,8 +56,13 @@ public:
 
     // Make the map say exactly this, for replica managers only and only
     // outside a script frame, updating entries in place and dropping what the
-    // snapshot omits, with no invalidation and no synchronous refresh.
-    void install_replica(const std::vector<replica_entry>& entries);
+    // snapshot omits, with no invalidation and no synchronous refresh; false
+    // when a script frame refused it.
+    bool install_replica(const std::vector<replica_entry>& entries);
+
+    // Only the rows a push moved, applied and refused exactly as install_replica would.
+    bool apply_replica_delta(const std::vector<replica_entry>& upserts,
+                             const std::vector<std::string>& removed);
 
     // One row of the replica, corrected the instant this worker changed it,
     // because install_replica's push is up to an interval old and a script
@@ -253,6 +258,9 @@ private:
     // See mark_replica(): a plain bool, written once at wiring time and read
     // on the one thread that touches this object in a worker.
     bool m_replica = false;
+
+    // One row of a push written into the replica, with the mutex held and a replaced object handed to `dropped`.
+    void upsert_replica_row(const replica_entry& e, std::vector<std::unique_ptr<runtime_instance>>& dropped);
 
     cluster_discovery* m_cluster = nullptr;
     cluster_primaries  m_cluster_primaries;

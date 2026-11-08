@@ -1,5 +1,6 @@
 #include "worker_main.h"
 
+#include <map>
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -794,6 +795,7 @@ private:
             case worker_proto::frame_type::route_down: on_route_down(payload); break;
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
             case worker_proto::frame_type::runtime_map: on_runtime_map(payload); break;
+            case worker_proto::frame_type::runtime_map_delta: on_runtime_map_delta(payload); break;
             case worker_proto::frame_type::cluster:   on_cluster_view(payload); break;
             case worker_proto::frame_type::cluster_ev: on_cluster_event(payload); break;
             case worker_proto::frame_type::publish:   on_publish(payload);   break;
@@ -1202,6 +1204,56 @@ private:
         send_state();
     }
 
+    // A row of the daemon's map as the manager takes it, false for a kind this build has no type or state for:
+    // the type arrives by name and is interned to a local id, so a registered type this binary cannot build
+    // still shows up under its own name, and a runtime reported as the wrong kind is worse than one not reported.
+    static bool replica_row(const worker_proto::runtime_wire& w, runtime_manager::replica_entry& e)
+    {
+        runtime_type wtype;
+        if (!type_registry::intern(w.type, wtype) ||
+            w.state > static_cast<uint8_t>(runtime_failed))
+        {
+            LOG_WARN("proxy worker: runtime map entry of an unknown kind, skipped");
+            return false;
+        }
+        e.name        = w.name;
+        e.type        = wtype;
+        e.state       = static_cast<runtime_state>(w.state);
+        e.port        = w.port;
+        e.connections = w.connections;
+        e.owner       = w.owner;
+        e.group       = w.group;
+        return true;
+    }
+
+    // The whole of m_map_rows into the manager, remembered as owed when a script frame refused it.
+    void install_map_rows()
+    {
+        std::vector<runtime_manager::replica_entry> entries;
+        entries.reserve(m_map_rows.size());
+        for (const auto& [_, w] : m_map_rows)
+            if (runtime_manager::replica_entry e; replica_row(w, e))
+                entries.push_back(std::move(e));
+        m_replica_behind = !m_manager.install_replica(entries);
+    }
+
+    // The map handed to a runtime that reads it, rebuilt from the rows only when one does.
+    void map_to_runtime(const std::string* payload)
+    {
+        if (!m_rt || !m_rt->wants_runtime_map())
+            return;
+        if (payload)
+        {
+            m_rt->on_runtime_map(*payload);
+            return;
+        }
+        std::vector<worker_proto::runtime_wire> all;
+        all.reserve(m_map_rows.size());
+        for (const auto& [_, w] : m_map_rows)
+            all.push_back(w);
+        m_rt->on_runtime_map(worker_proto::encode_runtime_map(all));
+    }
+
     // The daemon's map decoded into the manager, so every reader works out
     // here exactly as it does in the daemon -- with this worker's own runtime
     // present as a replica, because putting the live object in would deliver
@@ -1215,44 +1267,48 @@ private:
             return;
         }
 
-        std::vector<runtime_manager::replica_entry> entries;
-        entries.reserve(wire.size());
-        for (const auto& w : wire)
-        {
-            // The type arrives by name and is interned to a local id, so a
-            // registered type this binary cannot build still shows up under
-            // its own name -- with a state this build has no name for dropped
-            // rather than cast, because a runtime reported as the wrong kind
-            // is worse than one not reported.
-            runtime_type wtype;
-            if (!type_registry::intern(w.type, wtype) ||
-                w.state > static_cast<uint8_t>(runtime_failed))
-            {
-                LOG_WARN("proxy worker: runtime map entry of an unknown kind, skipped");
-                continue;
-            }
-
-            runtime_manager::replica_entry e;
-            e.name        = w.name;
-            e.type        = wtype;
-            e.state       = static_cast<runtime_state>(w.state);
-            e.port        = w.port;
-            e.connections = w.connections;
-            e.owner       = w.owner;
-            e.group       = w.group;
-            entries.push_back(std::move(e));
-        }
-
-        m_manager.install_replica(entries);
-        if (m_rt)
-            m_rt->on_runtime_map(payload);
+        m_map_rows.clear();
+        for (auto& w : wire)
+            m_map_rows.insert_or_assign(w.name, std::move(w));
+        install_map_rows();
+        map_to_runtime(&payload);
 
         if (logger::g_level <= log_debug)
         {
             std::string msg = "proxy worker: runtime map replica now holds "
-                            + std::to_string(entries.size()) + " runtime(s)";
+                            + std::to_string(m_map_rows.size()) + " runtime(s)";
             LOG_DEBUG(msg.c_str());
         }
+    }
+
+    // The rows that moved since the map this worker holds, which the daemon sends only onto that map.
+    void on_runtime_map_delta(const std::string& payload)
+    {
+        std::vector<worker_proto::runtime_wire> upserts;
+        std::vector<std::string> removed;
+        if (!worker_proto::decode_runtime_map_delta(payload, upserts, removed))
+        {
+            LOG_WARN("proxy worker: malformed runtime map delta, keeping the previous map");
+            return;
+        }
+
+        std::vector<runtime_manager::replica_entry> entries;
+        entries.reserve(upserts.size());
+        for (auto& w : upserts)
+        {
+            if (runtime_manager::replica_entry e; replica_row(w, e))
+                entries.push_back(std::move(e));
+            m_map_rows.insert_or_assign(w.name, std::move(w));
+        }
+        for (const auto& n : removed)
+            m_map_rows.erase(n);
+
+        // A replica a script frame kept from an earlier push is behind by more than these rows.
+        if (m_replica_behind)
+            install_map_rows();
+        else
+            m_replica_behind = !m_manager.apply_replica_delta(entries, removed);
+        map_to_runtime(nullptr);
     }
 
     // The cluster view, installed on lua_context because it is a property of
@@ -2532,6 +2588,10 @@ private:
     runtime_instance*                      m_rt{nullptr};
     proxy_instance*                        m_proxy{nullptr};
     std::shared_ptr<const endpoint_table>  m_pending_endpoints;
+    // The daemon's map as this worker holds it, which a delta is applied to, and whether the manager's
+    // replica still owes a push a script frame refused.
+    std::map<std::string, worker_proto::runtime_wire, std::less<>> m_map_rows;
+    bool                                   m_replica_behind{false};
     std::string                            m_in;
     io_request                             m_ctl_req{};
     bool                                   m_ctl_armed{false};

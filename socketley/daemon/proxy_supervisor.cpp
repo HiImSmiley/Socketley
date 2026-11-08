@@ -711,9 +711,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::cluster,
                                              m_cluster_view))) {}
 
-    if (!m_runtime_map.empty())
-        if (!write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
-                                             m_runtime_map))) {}
+    m_map_gen_held = !m_runtime_map.empty() &&
+        write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map, m_runtime_map))
+        ? m_runtime_map_gen : 0;
 
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::config, m_config_json)))
     {
@@ -725,8 +725,8 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // After the config and not before it, unlike the two above, because only a
     // proxy is handed an endpoint table and the proxy does not exist until the
     // config has been read.
-    if (!m_endpoints.empty())
-        if (!write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints))) {}
+    m_endpoints_held = !m_endpoints.empty() &&
+        write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints));
 
     // Last, and only on the path that keeps the socket: an arm on a descriptor
     // a failed spawn is about to close is the completion-outliving-its-fd case
@@ -914,34 +914,32 @@ std::string proxy_supervisor::take_start_error()
 
 void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
 {
+    // Dropped when this child already holds it, as send_runtime_map() drops a map it has sent.
+    if (m_endpoints_held && encoded_payload == m_endpoints)
+        return;
     m_endpoints = encoded_payload;
-    if (m_control_fd >= 0)
-        if (!write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints))) {}
+    m_endpoints_held = m_control_fd >= 0 &&
+        write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints));
 }
 
-void proxy_supervisor::send_runtime_map(const std::string& encoded_payload)
+void proxy_supervisor::send_runtime_map(const std::string& full, const std::string& delta, uint64_t gen)
 {
-    // Nothing has moved since this child was last told, compared as encoded
-    // payload on purpose, so there is no second idea of what counts as a
-    // change to drift from the first.
-    if (encoded_payload == m_runtime_map)
+    if (gen == m_map_gen_held)
         return;
+    m_runtime_map     = full;
+    m_runtime_map_gen = gen;
 
-    // No child to write to, so this is what the next one is handed, which is
-    // right both for a supervisor that has not forked and for one whose child
-    // is about to be replaced.
+    // No child to write to, so this is what the next one is handed.
     if (m_control_fd < 0)
-    {
-        m_runtime_map = encoded_payload;
         return;
-    }
 
-    // Remembered only once it has been queued, or a payload the child never
-    // received would make every later push of the same map look like a
-    // duplicate.
-    if (write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
-                                        encoded_payload)))
-        m_runtime_map = encoded_payload;
+    // The delta only onto the generation it was taken against, and a frame that was not queued leaves the
+    // child holding nothing this side knows of, so the next push is the whole map.
+    const bool step = m_map_gen_held != 0 && m_map_gen_held + 1 == gen && !delta.empty();
+    const bool sent = step
+        ? write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map_delta, delta))
+        : write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map, full));
+    m_map_gen_held = sent ? gen : 0;
 }
 
 void proxy_supervisor::send_cluster_event(const std::string& encoded_payload)

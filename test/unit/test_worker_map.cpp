@@ -340,3 +340,69 @@ TEST_CASE("a publish frame built in place is the frame built in three steps")
         CHECK(in_place.size() == worker_proto::publish_frame_size(c, ch, m));
     }
 }
+
+TEST_CASE("a delta survives the wire with its rows and its departures")
+{
+    const auto out = worker_proto::encode_runtime_map_delta(
+        { wire("api", "server", 1, 8080, 4, "", "web"), wire("kv", "cache", 0, 6379, 0, "api") }, { "gone", "old" });
+
+    std::vector<worker_proto::runtime_wire> up;
+    std::vector<std::string> removed;
+    REQUIRE(worker_proto::decode_runtime_map_delta(out, up, removed));
+    REQUIRE(up.size() == 2);
+    CHECK(up[0] == wire("api", "server", 1, 8080, 4, "", "web"));
+    CHECK(up[1] == wire("kv", "cache", 0, 6379, 0, "api"));
+    CHECK(removed == std::vector<std::string>{ "gone", "old" });
+
+    // A delta cut short is refused whole, never applied in part.
+    CHECK_FALSE(worker_proto::decode_runtime_map_delta(std::string_view(out).substr(0, out.size() - 2), up, removed));
+}
+
+TEST_CASE("a delta moves only its rows and keeps every other object")
+{
+    runtime_manager mgr;
+    mgr.mark_replica();
+    mgr.install_replica({ entry("api", runtime_server, runtime_running, 8080, 1),
+                          entry("kv", runtime_cache, runtime_running, 6379, 0),
+                          entry("old", runtime_server, runtime_running, 8081, 0) });
+    runtime_instance* api = mgr.get("api");
+    runtime_instance* kv  = mgr.get("kv");
+
+    REQUIRE(mgr.apply_replica_delta({ entry("kv", runtime_cache, runtime_stopped, 6379, 0),
+                                      entry("new", runtime_client, runtime_running, 0, 1) },
+                                    { "old" }));
+
+    CHECK(mgr.get("api") == api);
+    CHECK(api->get_state() == runtime_running);
+    CHECK(api->reported_connection_count() == 1);
+    CHECK(mgr.get("kv") == kv);
+    CHECK(kv->get_state() == runtime_stopped);
+    REQUIRE(mgr.get("new") != nullptr);
+    CHECK(mgr.get("new")->get_type() == runtime_client);
+    CHECK(mgr.get("old") == nullptr);
+    {
+        std::shared_lock lock(mgr.mutex);
+        CHECK(mgr.list().size() == 3);
+    }
+
+    // A departure of a name this replica never had is nothing to do.
+    CHECK(mgr.apply_replica_delta({}, { "never" }));
+}
+
+TEST_CASE("a snapshot of many runtimes keeps them all and drops the one left out")
+{
+    std::vector<runtime_manager::replica_entry> all;
+    for (int i = 0; i < 300; ++i)
+        all.push_back(entry("c" + std::to_string(i), runtime_client, runtime_running, 0, 1));
+    runtime_manager mgr;
+    mgr.mark_replica();
+    REQUIRE(mgr.install_replica(all));
+
+    all.erase(all.begin() + 150);
+    REQUIRE(mgr.install_replica(all));
+    CHECK(mgr.get("c150") == nullptr);
+    CHECK(mgr.get("c149") != nullptr);
+    CHECK(mgr.get("c299") != nullptr);
+    std::shared_lock lock(mgr.mutex);
+    CHECK(mgr.list().size() == 299);
+}

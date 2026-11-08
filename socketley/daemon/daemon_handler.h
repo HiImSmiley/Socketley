@@ -524,11 +524,17 @@ private:
     // so those four calls stay refused.
     void publish_cluster_view_to_workers();
 
-    // The two payloads built without being sent, because a supervisor has to
-    // be handed both before it forks and the config frame is what loads the
-    // child's script.
-    std::string build_runtime_map_payload();
+    // The cluster view built without being sent, because a supervisor has to be handed it and the map before
+    // it forks and the config frame is what loads the child's script.
     std::string build_cluster_view_payload();
+
+    // The map as last published, its generation and both encodings of it, brought up to date from the manager
+    // by refresh_runtime_map(), which bumps the generation only when a row moved.
+    void refresh_runtime_map();
+    std::unordered_map<std::string, worker_proto::runtime_wire> m_map_rows;
+    uint64_t    m_map_gen{0};
+    std::string m_map_full;
+    std::string m_map_delta;
 
     // Whether a cluster view has ever gone out, which is what makes an empty
     // view a withdrawal rather than what every never-clustered daemon sends.

@@ -6869,7 +6869,7 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
 // manager knows what it holds and this class knows where the sockets are --
 // event-loop thread only, because the connection count is a live walk for a
 // local runtime.
-std::string daemon_handler::build_runtime_map_payload()
+void daemon_handler::refresh_runtime_map()
 {
     std::vector<worker_proto::runtime_wire> rts;
     {
@@ -6888,7 +6888,33 @@ std::string daemon_handler::build_runtime_map_payload()
             rts.push_back(std::move(w));
         }
     }
-    return worker_proto::encode_runtime_map(rts);
+
+    // The rows that moved, because a worker that decodes and installs the whole map on every push costs each
+    // create a pass over every runtime in every worker.
+    std::vector<worker_proto::runtime_wire> upserts;
+    std::vector<std::string> removed;
+    std::unordered_set<std::string_view> present;
+    present.reserve(rts.size());
+    for (const auto& w : rts)
+    {
+        present.insert(w.name);
+        const auto it = m_map_rows.find(w.name);
+        if (it == m_map_rows.end() || !(it->second == w))
+            upserts.push_back(w);
+    }
+    for (const auto& [name, _] : m_map_rows)
+        if (!present.count(name))
+            removed.push_back(name);
+    if (m_map_gen != 0 && upserts.empty() && removed.empty())
+        return;
+
+    for (const auto& n : removed)
+        m_map_rows.erase(n);
+    for (const auto& w : upserts)
+        m_map_rows.insert_or_assign(w.name, w);
+    ++m_map_gen;
+    m_map_full  = worker_proto::encode_runtime_map(rts);
+    m_map_delta = worker_proto::encode_runtime_map_delta(upserts, removed);
 }
 
 void daemon_handler::publish_runtime_map_to_workers()
@@ -6898,13 +6924,12 @@ void daemon_handler::publish_runtime_map_to_workers()
     if (m_proxy_workers.empty())
         return;
 
-    // Encoded once for all of them, with each supervisor deciding whether it
-    // is news, so an idle daemon's health tick costs one string compare per
-    // worker.
-    const std::string payload = build_runtime_map_payload();
+    // Built once for all of them, with each supervisor deciding from the generation whether it is news, so an
+    // idle daemon's health tick costs one compare per worker.
+    refresh_runtime_map();
     for (auto& [_, shards] : m_proxy_workers)
         for (auto& sup : shards)
-            sup->send_runtime_map(payload);
+            sup->send_runtime_map(m_map_full, m_map_delta, m_map_gen);
 
     m_last_map_push = std::chrono::steady_clock::now();
 }
@@ -8292,7 +8317,8 @@ void daemon_handler::reconcile_proxy_workers()
         // Handed over before the fork rather than published after it, because
         // these only fill the supervisor's caches and those are what spawn()
         // writes ahead of the config frame that loads the script.
-        sup->send_runtime_map(build_runtime_map_payload());
+        refresh_runtime_map();
+        sup->send_runtime_map(m_map_full, m_map_delta, m_map_gen);
         if (const std::string cv = build_cluster_view_payload(); !cv.empty())
         {
             sup->send_cluster_view(cv);

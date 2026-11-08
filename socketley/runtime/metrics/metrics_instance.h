@@ -140,6 +140,7 @@ public:
 
     void on_series_feed(std::string_view payload) override;
     void on_runtime_map(std::string_view payload) override;
+    bool wants_runtime_map() const override { return true; }
 
 private:
     settings m_c;

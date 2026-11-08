@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_set>
 
 namespace
 {
@@ -178,13 +179,50 @@ void runtime_manager::replica_note(std::string_view op, std::string_view name,
         retire(std::move(dropped));
 }
 
-void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
+void runtime_manager::upsert_replica_row(const replica_entry& e,
+                                         std::vector<std::unique_ptr<runtime_instance>>& dropped)
+{
+    auto it = runtimes.find(e.name);
+
+    // A type change under one name means the daemon replaced the
+    // runtime between two pushes, so the object is rebuilt rather than
+    // re-tagged, get_type() being fixed at construction.
+    if (it != runtimes.end() && it->second->get_type() != e.type)
+    {
+        dropped.push_back(std::move(it->second));
+        runtimes.erase(it);
+        it = runtimes.end();
+    }
+
+    if (it == runtimes.end())
+    {
+        auto inst = std::make_unique<replica_instance>(e.type, e.name);
+        it = runtimes.emplace(e.name, std::move(inst)).first;
+    }
+
+    // Updated in place so a pointer from get() still names this
+    // object, with the state stored straight rather than through
+    // start()/stop(), which are transitions this process is not
+    // making.
+    runtime_instance* inst = it->second.get();
+    inst->set_port(e.port);
+    inst->set_owner(e.owner);
+    inst->set_group(e.group);
+    inst->set_replicated_state(e.state);
+
+    // The same two fields the daemon writes into its placeholder from
+    // a stats frame, with the detail text empty because a replica has
+    // none.
+    inst->set_worker_stats({}, e.connections);
+}
+
+bool runtime_manager::install_replica(const std::vector<replica_entry>& entries)
 {
     // Never under a script frame, because a replica the snapshot has dropped
     // is freed below and a callback may be holding the pointer get() handed
     // it.
     if (script_frame_live())
-        return;
+        return false;
 
     // Freed with the lock released, like every other instance destruction
     // here, and for a replica that is a deallocation and nothing more.
@@ -193,49 +231,17 @@ void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
         std::unique_lock lock(mutex);
 
         for (const auto& e : entries)
-        {
-            auto it = runtimes.find(e.name);
+            upsert_replica_row(e, dropped);
 
-            // A type change under one name means the daemon replaced the
-            // runtime between two pushes, so the object is rebuilt rather than
-            // re-tagged, get_type() being fixed at construction.
-            if (it != runtimes.end() && it->second->get_type() != e.type)
-            {
-                dropped.push_back(std::move(it->second));
-                runtimes.erase(it);
-                it = runtimes.end();
-            }
-
-            if (it == runtimes.end())
-            {
-                auto inst = std::make_unique<replica_instance>(e.type, e.name);
-                it = runtimes.emplace(e.name, std::move(inst)).first;
-            }
-
-            // Updated in place so a pointer from get() still names this
-            // object, with the state stored straight rather than through
-            // start()/stop(), which are transitions this process is not
-            // making.
-            runtime_instance* inst = it->second.get();
-            inst->set_port(e.port);
-            inst->set_owner(e.owner);
-            inst->set_group(e.group);
-            inst->set_replicated_state(e.state);
-
-            // The same two fields the daemon writes into its placeholder from
-            // a stats frame, with the detail text empty because a replica has
-            // none.
-            inst->set_worker_stats({}, e.connections);
-        }
-
-        // Whatever the daemon no longer has, collected first because erasing
-        // from a map while walking it is what this loop must not get wrong.
+        // Whatever the daemon no longer has, found through a set because a scan of the entries per runtime is
+        // quadratic in a map every worker installs.
+        std::unordered_set<std::string_view> kept;
+        kept.reserve(entries.size());
+        for (const auto& e : entries)
+            kept.insert(e.name);
         for (auto it = runtimes.begin(); it != runtimes.end();)
         {
-            const bool still_there =
-                std::any_of(entries.begin(), entries.end(),
-                            [&](const replica_entry& e) { return e.name == it->first; });
-            if (still_there)
+            if (kept.count(it->first))
             {
                 ++it;
                 continue;
@@ -246,6 +252,31 @@ void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
     }
 
     dropped.clear();
+    return true;
+}
+
+bool runtime_manager::apply_replica_delta(const std::vector<replica_entry>& upserts,
+                                          const std::vector<std::string>& removed)
+{
+    // Refused under a script frame for install_replica's reason.
+    if (script_frame_live())
+        return false;
+
+    std::vector<std::unique_ptr<runtime_instance>> dropped;
+    {
+        std::unique_lock lock(mutex);
+        for (const auto& e : upserts)
+            upsert_replica_row(e, dropped);
+        for (const auto& n : removed)
+            if (auto it = runtimes.find(n); it != runtimes.end())
+            {
+                dropped.push_back(std::move(it->second));
+                runtimes.erase(it);
+            }
+    }
+
+    dropped.clear();
+    return true;
 }
 
 // One place that decides what a runtime may be called, in runtime_name.h.

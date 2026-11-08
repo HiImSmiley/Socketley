@@ -249,10 +249,9 @@ public:
     // the daemon publishes only on the few events that move one.
     void send_endpoints(const std::string& encoded_payload);
 
-    // A new copy of the runtime map, sent on the health tick too because it
-    // carries connection counts, deduped against the payload this child
-    // already holds, and kept so a newly forked child does not start empty.
-    void send_runtime_map(const std::string& encoded_payload);
+    // Generation `gen` of the runtime map: only the rows that moved when the child holds gen - 1, the whole map
+    // otherwise, nothing when it holds gen; the whole map is kept so a newly forked child does not start empty.
+    void send_runtime_map(const std::string& full, const std::string& delta, uint64_t gen);
 
     // What the cluster looks like, cached and deduped like the map, except
     // that a heartbeat per remote daemon makes the payload differ on every
@@ -402,7 +401,10 @@ private:
     std::string       m_exec_path;
     std::string       m_config_json;      // kept so a restart can re-send it
     std::string       m_endpoints;        // last table, re-sent to a new child
+    bool              m_endpoints_held{false}; // the running child was handed m_endpoints
     std::string       m_runtime_map;      // last map, re-sent to a new child
+    uint64_t          m_runtime_map_gen{0};  // the generation m_runtime_map is
+    uint64_t          m_map_gen_held{0};     // the generation the running child holds, 0 for none
     std::string       m_cluster_view;     // last cluster view, likewise
     std::string       m_in;               // partial frames from the child
     worker_proto::part_joiner m_part;     // a frame past max_payload, while its pieces come in
