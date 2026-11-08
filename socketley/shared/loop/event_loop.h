@@ -6,6 +6,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
+#include <type_traits>
 #include <liburing.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -582,7 +585,13 @@ private:
         // slot cannot reproduce a token that a request in the ring still holds.
         uint16_t    epoch{0};
     };
-    owner_slot m_owners[MAX_OWNERS]{};
+    // An aggregate with a trivial destructor, so calloc's zeroes are the slots, with the zero every initialiser above names.
+    static_assert(std::is_aggregate_v<owner_slot> && std::is_trivially_destructible_v<owner_slot>);
+    struct owner_table_free { void operator()(owner_slot* p) const noexcept { std::free(p); } };
+    // Calloc'd and not a member array, because a value-initialised member wrote all 172 KB in every process that made
+    // a loop, while calloc's pages stay the kernel's zero page until a slot on them is first used.
+    std::unique_ptr<owner_slot[], owner_table_free> m_owners{
+        static_cast<owner_slot*>(std::calloc(MAX_OWNERS, sizeof(owner_slot)))};
     uint32_t m_owner_hint{0};
     bool m_owner_table_full_logged{false};
 };

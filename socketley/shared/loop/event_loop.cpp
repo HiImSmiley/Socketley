@@ -13,6 +13,7 @@
 #include <sys/resource.h>
 #include <cerrno>
 #include <cstring>
+#include <new>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -23,6 +24,8 @@
 event_loop::event_loop(uint32_t queue_depth)
     : m_running(false), m_queue_depth(queue_depth), m_pending_submissions(0)
 {
+    if (!m_owners)
+        throw std::bad_alloc();
     // Slot 0 is the shared identity for handlers the table had no room for,
     // live from the start because a submission can happen before init().
     m_owners[0].handler = nullptr;
