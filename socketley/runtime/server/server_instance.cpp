@@ -7987,6 +7987,37 @@ bool server_instance::closed_for_backlog(int client_id) const
     return m_conn_idx[client_id]->closed_for_backlog;
 }
 
+// Each condition rules out a step of send_to_client that can run Lua or answer
+// false -- a routed handle, a websocket or TLS write, the direct send whose
+// failure closes the connection, and abandon_for_backlog at the bound -- and
+// with a write in flight the kick that would follow the push does nothing, so
+// what is left is the push the answering branch makes.
+bool server_instance::send_if_queued(int client_id, std::string_view msg)
+{
+    if (!m_loop || m_udp || is_conn_handle(client_id) || client_id < 0 || client_id >= MAX_FDS)
+        return false;
+    server_connection* conn = m_conn_idx[client_id];
+    if (!conn || conn->closing || conn->proto == proto_ws || !raw_targetable(conn) || conn->ssl
+        || !(conn->write_pending || conn == m_answering)
+        || conn->write_queue.bytes() >= write_buffer_bytes())
+        return false;
+    return append_line(conn, msg);
+}
+
+// A line onto the tail with its newline, from the caller's bytes; false only
+// where admit_send refuses.
+bool server_instance::append_line(server_connection* conn, std::string_view msg)
+{
+    const bool add_nl = msg.empty() || msg.back() != '\n';
+    if (!admit_send(conn, msg.size() + (add_nl ? 1 : 0), conn->cache_pending > 0))
+        return false;
+    if (add_nl)
+        conn->write_queue.push_coalesced_line(msg, server_connection::WRITE_COALESCE_LIMIT);
+    else
+        conn->write_queue.push_coalesced(msg, server_connection::WRITE_COALESCE_LIMIT);
+    return true;
+}
+
 // Whether the bytes were taken, which used to be "yes" unconditionally.
 bool server_instance::send_to_client(int client_id, std::string_view msg)
 {
@@ -8038,15 +8069,7 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
 
     // An answer to the read being parsed joins the tail with its newline and leaves with the rest of the read's.
     if (conn == m_answering && conn->ssl == nullptr)
-    {
-        if (!admit_send(conn, msg.size() + (add_nl ? 1 : 0), conn->cache_pending > 0))
-            return false;
-        if (add_nl)
-            conn->write_queue.push_coalesced_line(msg, server_connection::WRITE_COALESCE_LIMIT);
-        else
-            conn->write_queue.push_coalesced(msg, server_connection::WRITE_COALESCE_LIMIT);
-        return true;
-    }
+        return append_line(conn, msg);
 
     std::string buf;
     buf.reserve(msg.size() + 1);

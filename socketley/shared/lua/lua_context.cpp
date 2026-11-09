@@ -3340,9 +3340,26 @@ static double ffi_client_pending(void* inst, int has_id, int id) noexcept
     return static_cast<double>(has_id ? cli->pending_bytes_of(id) : cli->pending_bytes());
 }
 
+static int ffi_server_send(void* inst, int id, const char* p, size_t n) noexcept
+{
+    try { return static_cast<server_instance*>(inst)->send_if_queued(id, std::string_view(p, n)) ? 0 : 1; }
+    catch (...) { return 1; }
+}
+
+static double ffi_server_pending(void* inst, int id) noexcept
+{
+    return static_cast<double>(static_cast<const server_instance*>(inst)->pending_bytes(id));
+}
+
+// One per type, because inst is that type's pointer and not its base's.
 static double ffi_client_watermark(void* inst) noexcept
 {
     return static_cast<double>(static_cast<const client_instance*>(inst)->write_watermark_bytes());
+}
+
+static double ffi_server_watermark(void* inst) noexcept
+{
+    return static_cast<double>(static_cast<const server_instance*>(inst)->write_watermark_bytes());
 }
 
 }
@@ -3355,6 +3372,8 @@ if not pcall(ffi.typeof, "socketley_ffi_watermark_t") then
   ffi.cdef[[
 typedef int (*socketley_ffi_client_send_t)(void*, const char*, size_t, int);
 typedef double (*socketley_ffi_client_pending_t)(void*, int, int);
+typedef int (*socketley_ffi_server_send_t)(void*, int, const char*, size_t);
+typedef double (*socketley_ffi_server_pending_t)(void*, int);
 typedef double (*socketley_ffi_watermark_t)(void*);
 ]]
 end
@@ -3382,6 +3401,25 @@ end, function(id)
   if id == nil then return fpending(inst, 0, 0) end
   if plain(id) then
     local v = fpending(inst, 1, id)
+    if v < 0 then return nil end
+    return v
+  end
+  return pending(id)
+end, watermark
+)lua";
+
+// self.send(id, msg) and self.pending(id).
+static constexpr char k_ffi_server[] = R"lua(
+local fsend = ffi.cast("socketley_ffi_server_send_t", psend)
+local fpending = ffi.cast("socketley_ffi_server_pending_t", ppending)
+return function(id, msg)
+  if type(msg) == "string" and plain(id) and fsend(inst, id, msg, #msg) == 0 then
+    return true
+  end
+  return send(id, msg)
+end, function(id)
+  if plain(id) then
+    local v = fpending(inst, id)
     if v < 0 then return nil end
     return v
   end
@@ -3859,6 +3897,10 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
                       << std::endl;
         }
     }
+
+    defer_ffi_calls({k_ffi_server, sizeof(k_ffi_server) - 1}, owner, static_cast<server_instance*>(owner),
+                    reinterpret_cast<void*>(&ffi_server_send), reinterpret_cast<void*>(&ffi_server_pending),
+                    reinterpret_cast<void*>(&ffi_server_watermark), self);
 }
 
 void lua_context::register_client_table(runtime_instance* owner, sol::table& self)

@@ -691,6 +691,10 @@ public:
 
     long     pending_bytes(int client_id) const;
     bool     closed_for_backlog(int client_id) const;
+    // send_to() when it can only end on a raw connection's queue, behind a
+    // write in flight or the read being answered, and false, having done
+    // nothing, everywhere else.
+    bool     send_if_queued(int client_id, std::string_view msg);
     // The upstream side of the same two questions.  A separate id space, so a
     // separate call: self.pending() resolves a CLIENT id and an upstream is in
     // another map entirely.
@@ -1220,6 +1224,7 @@ private:
     void submit_batch(server_connection* conn);
     bool send_direct(server_connection* conn);
     bool send_line_now(server_connection* conn, std::string_view msg, bool add_nl);
+    bool append_line(server_connection* conn, std::string_view msg);
     bool send_ws_message(server_connection* conn, std::string_view msg);
     void submit_borrowed(server_connection* conn);
     void after_write(server_connection* conn);

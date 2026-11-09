@@ -17,9 +17,9 @@
 #
 # ─── WHAT EACH PART WOULD CATCH ─────────────────────────────────────────────
 #
-#   1. a fast path that loses, reorders or duplicates a line: the peer checks
-#      every sequence number of a paced stream well past the watermark, so the
-#      drain and on_writable are crossed too
+#   1. a fast path that loses, reorders or duplicates a line, on the client and
+#      on the server: the peer checks every sequence number of a paced stream
+#      well past the watermark, so the drain and on_writable are crossed too
 #   2. a fast path that skips on_send: the second client defines it and counts
 #      every call against every send that answered true
 #   3. a wrapper that answers anything but the one value `true`, or a pending
@@ -29,6 +29,8 @@
 #      burst with an id is delivered whole on the connection it names
 #   5. a disconnect in the middle of a burst reported other than once, or a send
 #      after it answered other than "not connected"
+#   6. a fast path that ignores the server's hard bound: the flood against a
+#      reader that reads nothing must still be refused with its sentence
 #   7. the ffi module left reachable: no global, no package.loaded entry, and
 #      require("ffi") still fails, as it did before
 #   8. the wrappers going in over a self.send the script replaced at its top
@@ -43,7 +45,9 @@ daemon_isolate luaffisend
 
 P_ORDER=$((SL_PORT_BASE+1915))
 P_CUT=$((SL_PORT_BASE+1916))
-NAMES="ff_fast ff_slow ff_wrapped ff_ids ff_cut"
+P_PACE=$((SL_PORT_BASE+1917))
+P_FLOOD=$((SL_PORT_BASE+1918))
+NAMES="ff_fast ff_slow ff_wrapped ff_ids ff_cut ff_pace ff_flood"
 T="$SOCKETLEY_TMPD"
 N=300000
 
@@ -102,6 +106,11 @@ if mode == "order":
     threading.Thread(target=accept, daemon=True).start()
     while not os.path.exists(stop): report(); time.sleep(0.2)
     report()
+elif mode == "connect":
+    c = socket.create_connection(("127.0.0.1", port))
+    threading.Thread(target=read_lines, args=(c,), daemon=True).start()
+    while not os.path.exists(stop): report(); time.sleep(0.2)
+    report()
 elif mode == "cut":
     # Reads a little, then resets the connection under a client still pumping.
     s = listener()
@@ -114,6 +123,11 @@ elif mode == "cut":
     c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
     c.close()
     open(out, "w").write("cut after %d\n" % got)
+    while not os.path.exists(stop): time.sleep(0.05)
+elif mode == "stall":
+    # Connects and reads nothing at all.
+    c = socket.socket(); c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    c.connect(("127.0.0.1", port))
     while not os.path.exists(stop): time.sleep(0.05)
 PYEOF
 peer() { python3 "$T/peer.py" "$@" > /dev/null 2>&1 & PEERS="$PEERS $!"; }
@@ -209,6 +223,37 @@ function on_disconnect(fd, id)
 end
 LUAEOF
 
+cat > "$T/pace.lua" <<LUAEOF
+local N, PAD = $N, string.rep("p", 40)
+local i = 0
+local function pump(id)
+  local wm = self.watermark()
+  while i < N do
+    local p = self.pending(id)
+    if not p or p >= wm then return end
+    if self.send(id, "V " .. (i + 1) .. " " .. PAD) ~= true then return end
+    i = i + 1
+  end
+  if i == N then i = i + 1 socketley.log("FT pace done ptype=" .. type(self.pending(id))) end
+end
+function on_connect(id) pump(id) end
+function on_writable(id) pump(id) end
+LUAEOF
+
+cat > "$T/flood.lua" <<'LUAEOF'
+local CHUNK = string.rep("z", 65536)
+function on_connect(id)
+  local sent, refused, why = 0, 0, nil
+  for _ = 1, 300 do
+    local okay, w = self.send(id, CHUNK)
+    if okay then sent = sent + 1 else refused = refused + 1 why = why or w end
+  end
+  local after_ok, after_why = self.send(id, "x")
+  socketley.log("FT flood sent=" .. sent .. " refused=" .. refused .. " why=[" .. tostring(why)
+    .. "] after=" .. tostring(after_ok) .. " none=" .. tostring(self.pending(99999)))
+end
+LUAEOF
+
 echo "=== Integration: self.send through the FFI keeps the binding's answers ==="
 daemon_start "$BIN"
 waitlog() {
@@ -288,8 +333,34 @@ LC=$(grep -o 'FT cut after=.*' "$SOCKETLEY_DLOG" | tail -1) || true
 check "a send after it is refused as not connected" \
     'FT cut after=false why=["ff_cut" is not connected to its server, or was created --mode in and does not send] lost=1' "$LC"
 
+# ─── 6. The server, paced and flooded ───────────────────────────────────────
+create_ok "the pacing server" "$BIN" create server ff_pace -p "$P_PACE" --bind 127.0.0.1 --lua "$T/pace.lua" -s
+create_ok "the flooding server" "$BIN" create server ff_flood -p "$P_FLOOD" --bind 127.0.0.1 --lua "$T/flood.lua" -s
+listening "$P_PACE" || bad "the pacing server listens" "nothing on $P_PACE"
+listening "$P_FLOOD" || bad "the flooding server listens" "nothing on $P_FLOOD"
+peer connect "$P_PACE" "$T/stop" "$T/pace.out"
+peer stall "$P_FLOOD" "$T/stop" "$T/stall.out"
+waitlog "FT pace done" || bad "the server finished its stream" "no 'FT pace done' line"
+waitlog "FT flood " || bad "the flood ran" "no 'FT flood' line"
+check "the server's pending is a number" "FT pace done ptype=number" \
+    "$(grep -o 'FT pace done.*' "$SOCKETLEY_DLOG" | tail -1)"
+LFL=$(grep -o 'FT flood .*' "$SOCKETLEY_DLOG" | tail -1) || true
+SENT=$(g sent " $LFL"); REF=$(g refused " $LFL")
+if [ "${SENT:-0}" -gt 0 ] && [ "${REF:-0}" -gt 0 ] && [ $((SENT + REF)) -eq 300 ]; then ok; else
+    bad "the flood is taken up to the bound and refused past it" "sent=$SENT refused=$REF of 300"; fi
+case "$LFL" in
+    *'was closed because more was queued for it than it could take'*'after=false none=nil') ok ;;
+    *) bad "the refusal past the bound keeps its sentence" "[$LFL]" ;;
+esac
+O=""
+arrived "$T/pace.out" "V=$N" || true
+touch "$T/stop"
+check "the server's stream arrived in order" "none" "$(g bad " $O")"
+check "and whole" "$N" "$(g V " $O")"
+
 echo "  measured: fast=[$LF]"
 echo "            slow=[$LS]"
+echo "            flood=[$LFL]"
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 [ "$FAIL" -eq 0 ]
