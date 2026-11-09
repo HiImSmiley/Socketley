@@ -890,6 +890,18 @@ protected:
     void invoke_on_send(std::string_view msg, int conn_id);
     // True when the script's handler ran to the end and returned true, which is it saying the message is handled.
     bool invoke_on_client_message(int client_id, std::string_view msg);
+
+    // Whether the script takes a read's lines as one string, in on_messages or on_client_messages, which then win
+    // over on_message and on_client_message; a C++ handler set for the per-line one still wins over both.
+    bool wants_on_messages() const;
+    bool wants_on_client_messages() const;
+    // `chunk` is complete lines, each with its '\n'; the second answers as invoke_on_client_message does.
+    void invoke_on_messages(std::string_view chunk);
+    // The client's, with its connection id after the chunk as on_message has it.
+    void invoke_on_messages(std::string_view chunk, int conn_id);
+    bool invoke_on_client_messages(int client_id, std::string_view chunk);
+    // One line handed to the batch callback where a runtime has no read to batch, a datagram or a rate-limited line.
+    std::string_view one_line_chunk(std::string_view line);
     // The write queue for this connection has drained back under the
     // backpressure watermark.  Dispatched a loop turn after the completion
     // that emptied it, not on that completion's stack -- see the server's
@@ -1075,6 +1087,8 @@ private:
     std::function<void(int)>                     m_cb_on_disconnect;
     std::function<void(int, std::string_view)>   m_cb_on_client_message;
     std::function<void(std::string_view)>        m_cb_on_message;
+    // What one_line_chunk() builds into, reused because the callback copies it into Lua before anything can nest.
+    std::string                                  m_line_chunk;
     std::function<void(double)>                  m_cb_on_tick;
     std::function<bool(int)>                     m_cb_on_auth;
     uint32_t                                     m_cb_tick_ms = 0;

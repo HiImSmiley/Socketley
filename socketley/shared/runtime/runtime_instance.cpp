@@ -1077,6 +1077,8 @@ event_loop* runtime_instance::get_event_loop() const { return m_event_loop; }
 bool runtime_instance::invoke_on_client_message(int client_id, std::string_view msg)
 {
     if (m_cb_on_client_message) { m_cb_on_client_message(client_id, msg); return false; }
+    if (SOCKETLEY_UNLIKELY(wants_on_client_messages()))
+        return invoke_on_client_messages(client_id, one_line_chunk(msg));
     if (!m_lua || !m_lua->has_on_client_message())
         return false;
 
@@ -1086,6 +1088,55 @@ bool runtime_instance::invoke_on_client_message(int client_id, std::string_view 
     auto& sus = m_lua->suspender();
     return sus.start<true>(m_lua->raw_on_client_message(), "on_client_message",
                            m_lua->callback_timeout_ms(), id, client_id, msg) == lua_suspender::outcome::finished
+           && sus.returned_true();
+#else
+    return false;
+#endif
+}
+
+bool runtime_instance::wants_on_messages() const
+{
+    return !m_cb_on_message && m_lua && m_lua->has_on_messages();
+}
+
+bool runtime_instance::wants_on_client_messages() const
+{
+    return !m_cb_on_client_message && m_lua && m_lua->has_on_client_messages();
+}
+
+std::string_view runtime_instance::one_line_chunk(std::string_view line)
+{
+    m_line_chunk.assign(line);
+    m_line_chunk.push_back('\n');
+    return m_line_chunk;
+}
+
+void runtime_instance::invoke_on_messages([[maybe_unused]] std::string_view chunk)
+{
+#ifndef SOCKETLEY_NO_LUA
+    // On a coroutine for the reason invoke_on_message gives.
+    lua_suspender::id_t id = 0;
+    m_lua->suspender().start(m_lua->raw_on_messages(), "on_messages", m_lua->callback_timeout_ms(), id, chunk);
+#endif
+}
+
+void runtime_instance::invoke_on_messages([[maybe_unused]] std::string_view chunk, [[maybe_unused]] int conn_id)
+{
+#ifndef SOCKETLEY_NO_LUA
+    lua_suspender::id_t id = 0;
+    m_lua->suspender().start(m_lua->raw_on_messages(), "on_messages", m_lua->callback_timeout_ms(), id, chunk,
+                             conn_id);
+#endif
+}
+
+bool runtime_instance::invoke_on_client_messages([[maybe_unused]] int client_id,
+                                                 [[maybe_unused]] std::string_view chunk)
+{
+#ifndef SOCKETLEY_NO_LUA
+    lua_suspender::id_t id = 0;
+    auto& sus = m_lua->suspender();
+    return sus.start<true>(m_lua->raw_on_client_messages(), "on_client_messages", m_lua->callback_timeout_ms(), id,
+                           client_id, chunk) == lua_suspender::outcome::finished
            && sus.returned_true();
 #else
     return false;

@@ -1210,8 +1210,58 @@ bool client_instance::still_reading(const conn_t* conn, uint32_t slot,
         && conn->fd == fd;
 }
 
+bool client_instance::batches_lines() const
+{
+    return m_mode != client_mode_out && wants_on_messages();
+}
+
+size_t client_instance::deliver_chunk(conn_t* conn, const char* data, size_t len, size_t search_from)
+{
+    const void* nl = search_from < len ? memrchr(data + search_from, '\n', len - search_from) : nullptr;
+    if (!nl)
+        return 0;
+    const size_t end = static_cast<size_t>(static_cast<const char*>(nl) - data) + 1;
+    const std::string_view chunk(data, end);
+
+    // Counted and observed line by line before the script runs, so -w, bash output and interactive see what they
+    // would see with on_message, even when the script stops this runtime.
+    // The lines on_message would have been handed, the blank ones it skips left out, so the count does not depend on
+    // which of the two the script defines.
+    uint64_t lines = 0;
+    const bool observed = observes_messages();
+    socketley::for_each_line(data, end, 0, [&](std::string_view line)
+    {
+        ++lines;
+        if (SOCKETLEY_UNLIKELY(observed))
+        {
+            print_bash_message(line);
+            write_received_message(line);
+            notify_interactive(line);
+        }
+        return true;
+    });
+    stat_add(m_stat_total_messages, lines);
+
+    const uint32_t slot = conn->slot;
+    const uint32_t generation = conn->generation;
+    const int fd = conn->fd;
+    {
+        current_scope cs(*this, conn);
+        invoke_on_messages(chunk, id_of(conn));
+    }
+    if (still_reading(conn, slot, generation, fd))
+        return end;
+    // The same rule deliver_lines() gives for a socket that went under the callback.
+    if (slot < m_slots.size() && m_slots[slot].get() == conn && conn->generation == generation)
+        conn->partial.clear();
+    return socketley::line_framing_stopped;
+}
+
 size_t client_instance::deliver_lines(conn_t* conn, const char* data, size_t len, size_t search_from)
 {
+    if (batches_lines())
+        return deliver_chunk(conn, data, len, search_from);
+
     const uint32_t slot = conn->slot;
     const uint32_t generation = conn->generation;
     const int fd = conn->fd;
@@ -1283,15 +1333,18 @@ void client_instance::read_in_place(conn_t* conn, const char* data, size_t len)
     size_t from = 0;
     if (!partial.empty())
     {
-        const void* nl = std::memchr(data, '\n', len);
+        // Through the last newline for on_messages, so a read is one call however its first line began.
+        const bool batch = batches_lines();
+        const void* nl = batch ? memrchr(data, '\n', len) : std::memchr(data, '\n', len);
         if (!nl)
         {
             partial.append(data, len);
             return;
         }
         from = static_cast<size_t>(static_cast<const char*>(nl) - data) + 1;
+        const size_t scanned = partial.size();
         partial.append(data, from);
-        if (deliver_lines(conn, partial.data(), partial.size(), partial.size() - 1)
+        if (deliver_lines(conn, partial.data(), partial.size(), batch ? scanned : partial.size() - 1)
             == socketley::line_framing_stopped)
             return;
         partial.clear();
@@ -1452,7 +1505,11 @@ void client_instance::process_message(std::string_view msg, int id)
         case client_mode_inout:
         case client_mode_in:
         {
-            invoke_on_message(msg, id);
+            // A datagram has no read to batch, so on_messages takes it as a chunk of one line.
+            if (SOCKETLEY_UNLIKELY(wants_on_messages()))
+                invoke_on_messages(one_line_chunk(msg), id);
+            else
+                invoke_on_message(msg, id);
             break;
         }
         case client_mode_out:

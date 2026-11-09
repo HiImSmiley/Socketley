@@ -1155,6 +1155,15 @@ private:
     // `kind` is what a WebSocket sender's frame said, kept by every relay below.
     void process_message(server_connection* sender, std::string_view msg,
                          ws_kind kind = ws_kind::by_payload);
+    // Whether this connection's complete lines go to on_client_messages as one string per read, which needs every
+    // line to reach the script: no master login, no rate limit dropping some, no route or pipe taking them away.
+    bool batches_lines(const server_connection* conn) const;
+    // The proto_tcp arm for such a connection: the lines observed, the script called once, then each line on through
+    // process_message with the script's answer standing for all of them.
+    void deliver_line_batch(server_connection* conn);
+    // The connection whose batched read process_message is walking, and what on_client_messages answered for it.
+    server_connection* m_batch_conn{nullptr};
+    bool               m_batch_handled{false};
     // Two exclusions, because `others` in master mode means everyone who is
     // neither the sender nor the master, and one of those is the only thing
     // this ever needed before.

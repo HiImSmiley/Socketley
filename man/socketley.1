@@ -5674,6 +5674,7 @@ and keeps it across a reconnect.
 The script's callbacks are handed that id after their usual arguments:
 .BR "on_connect(fd, id)" ,
 .BR "on_message(msg, id)" ,
+.BR "on_messages(chunk, id)" ,
 .BR "on_writable(id)" ,
 .B on_disconnect(fd, id)
 and
@@ -19839,6 +19840,70 @@ A handler still waiting on
 .B self.cache
 when the relay runs has not returned yet, so its message is relayed; define
 on_message to stop the relay for such a script.
+.TP
+.B on_messages(chunk, id)
+.TQ
+.B on_client_messages(client_id, chunk) \(-> true
+The batch forms of on_message (client) and on_client_message (server): every
+complete line of one read in one call, instead of one call per line.
+.B chunk
+is the bytes as they arrived, up to and including the read's last newline, so
+every line in it ends with its \(aq\\n\(aq, a CRLF line keeps its \(aq\\r\(aq
+and an empty line is a bare \(aq\\n\(aq.
+An unfinished last line is kept and arrives at the start of the next call.
+When a script defines both forms, only the batch one is called.
+.IP
+A client calls on_messages for its TCP, unix-socket and TLS reads, with the connection's id after the chunk
+(see
+.BR \-\-connections ).
+A server calls on_client_messages for a TCP line connection;
+returning
+.B true
+answers for every line in the chunk, as on_client_message's
+.B true
+does for one.
+A route or pipe the script sets from on_client_messages carries the next read
+on: the lines of the chunk it was handed are its own and are not sent on as
+well.
+Where there is no read to batch, each message is a chunk of one line with its
+\(aq\\n\(aq added, and a message that itself holds a newline reads as more
+than one line there, so a script for such a runtime is better written with
+on_message: a datagram
+.RB ( \-\-udp ),
+a WebSocket message, a server in
+.B \-\-mode master
+or with
+.B \-\-rate\-limit
+or
+.BR \-\-global\-rate\-limit ,
+which judge each line on its own.
+.BR \-w ,
+bash output and an interactive attach still see each line, exactly as with
+on_message.
+.IP
+A call per read instead of per line pays where the script takes the chunk
+whole: measured on one core, a server echoing 64 connections of 16 pipelined
+64\-byte lines with one
+.B self.send
+per chunk answered 1.6 times as many as with on_client_message.
+A script that walks the chunk line by line in Lua spends about what the calls
+it saves cost: counting 64\-byte lines with string.find as below came to 5 per
+cent fewer than with on_message, and with 4 KiB lines, where copying the chunk
+into Lua is the cost, a third fewer.
+Counting the lines of a chunk:
+.IP
+.nf
+local n = 0
+function on_messages(chunk)
+    local i = 1
+    while true do
+        local j = string.find(chunk, "\\n", i, true)
+        if not j then break end
+        n = n + 1      -- the line is chunk:sub(i, j \- 1)
+        i = j + 1
+    end
+end
+.fi
 .TP
 .B on_http_body(client_id, chunk, remaining)
 Called with each piece of a request body and the number of bytes still to come after it.

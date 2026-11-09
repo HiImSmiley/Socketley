@@ -5192,6 +5192,11 @@ reparse:
     }
 
     // proto_tcp: existing newline-delimited parsing
+    if (SOCKETLEY_UNLIKELY(batches_lines(conn)))
+    {
+        deliver_line_batch(conn);
+        return;
+    }
     {
         size_t scan_from = 0;
         size_t pos;
@@ -5754,6 +5759,77 @@ void server_instance::on_request_reply(uint64_t cookie, request_status st,
         close_conn(conn);
 }
 
+bool server_instance::batches_lines(const server_connection* conn) const
+{
+    return wants_on_client_messages() && m_mode != mode_master && conn->rl_max <= 0
+           && get_global_rate_limit() <= 0.0 && !conn->routed && conn->pipe_peer_fd < 0;
+}
+
+void server_instance::deliver_line_batch(server_connection* conn)
+{
+    const size_t last = conn->partial.rfind('\n');
+    if (last == std::string::npos)
+        return;
+    const size_t end = last + 1;
+
+    // Each line observed before the script runs, as process_message() does before on_client_message.
+    if (SOCKETLEY_UNLIKELY(observes_messages()))
+    {
+        for (size_t from = 0; from < end;)
+        {
+            const size_t nl = conn->partial.find('\n', from);
+            std::string_view line(conn->partial.data() + from, nl - from);
+            from = nl + 1;
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+            if (line.empty())
+                continue;
+            print_bash_message(line);
+            write_received_message(line);
+            notify_interactive(line);
+        }
+    }
+
+    bool handled;
+    {
+#ifndef SOCKETLEY_NO_LUA
+        callback_conn_scope serving(this, conn);
+#endif
+        handled = invoke_on_client_messages(conn->fd, std::string_view(conn->partial.data(), end));
+    }
+
+    // A route or pipe the script set from this chunk takes the next read: it was handed every line here, so they are
+    // its own and none is sent on as well.
+    const bool taken = conn->routed || conn->pipe_peer_fd >= 0;
+
+    // The rest of each line's path, which a script that returned true has answered for, re-reading partial each
+    // time because the script may have closed this connection and cleared it; a route a later line's path sets
+    // carries the lines after it, as on the per-line path.
+    server_connection* const outer_conn   = m_batch_conn;
+    const bool               outer_answer = m_batch_handled;
+    m_batch_conn    = conn;
+    m_batch_handled = handled;
+    size_t scan_from = 0;
+    size_t pos;
+    while (!taken && !conn->closing && scan_from < end
+           && (pos = conn->partial.find('\n', scan_from)) != std::string::npos && pos < end)
+    {
+        std::string_view line(conn->partial.data() + scan_from, pos - scan_from);
+        scan_from = pos + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        if (!line.empty())
+            process_message(conn, line);
+    }
+    m_batch_conn    = outer_conn;
+    m_batch_handled = outer_answer;
+
+    if (end >= conn->partial.size())
+        conn->partial.clear();
+    else
+        conn->partial.erase(0, end);
+}
+
 void server_instance::process_message(server_connection* sender, std::string_view msg,
                                       ws_kind kind)
 {
@@ -5829,7 +5905,12 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     const bool login = m_mode == mode_master && msg.size() > 7 && msg.starts_with("master ");
     // A handler that returned true has answered, so nothing below sends this message on its own.
     bool handled = false;
-    if (!login)
+    if (SOCKETLEY_UNLIKELY(sender != nullptr && sender == m_batch_conn))
+    {
+        // deliver_line_batch() has observed this line and run the script on the read it is part of.
+        handled = m_batch_handled;
+    }
+    else if (!login)
     {
         print_bash_message(msg);
         write_received_message(msg);

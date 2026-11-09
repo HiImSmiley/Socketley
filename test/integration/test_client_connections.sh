@@ -26,6 +26,9 @@
 #     highest ids, says so to the script, and leaves the rest serving
 #   - TLS: four sessions on four sockets, each finishing its rounds, which a
 #     build sharing one SSL or one write buffer between connections fails
+#   - on_messages(chunk, id): the batch callback runs the same rounds on four
+#     connections, so a chunk handed the wrong id, or a send from it that does
+#     not answer on that connection, logs BWRONG or never finishes
 #   - N=1: the id is still passed, 1, and `show` writes no "connections" key,
 #     so a state file of a one-connection client is the one it always was
 #
@@ -54,7 +57,7 @@ ok()  { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); }
 bad() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo "  FAIL [$1]: $2"; }
 check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "got '$2', wanted '$3'"; fi; }
 
-ALL="mc mc1 mcs mcu mcus mct mcts"
+ALL="mc mc1 mcb mcs mcu mcus mct mcts"
 cleanup() {
     for r in $ALL; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.3
@@ -159,6 +162,28 @@ function on_message(msg, id)
 end
 LUAEOF
 
+BAT_LUA="$SOCKETLEY_TMPD/bat.lua"
+cat > "$BAT_LUA" <<'LUAEOF'
+function on_connect(fd, id)
+    self.send("b1 " .. id)
+end
+
+function on_messages(chunk, id)
+    for msg in chunk:gmatch("([^\n]*)\n") do
+        local k, sent_for = msg:match("^echo b(%d+) (%d+)$")
+        if k then
+            if tonumber(sent_for) ~= id then
+                socketley.log("BWRONG id=" .. tostring(id) .. " carried " .. sent_for)
+            elseif tonumber(k) < 5 then
+                self.send("b" .. (tonumber(k) + 1) .. " " .. id)
+            else
+                socketley.log("BAT done id=" .. id .. " ")
+            end
+        end
+    end
+end
+LUAEOF
+
 WFILE="$SOCKETLEY_TMPD/w.txt"
 
 # ── refusals at the flag ─────────────────────────────────────────────────────
@@ -188,6 +213,14 @@ check "on_connect still gets its descriptor first" "$(count_of 'CLI connect id=[
 wait_count 'CLI done id=' $N 10 || true
 check "five rounds finished on every id" "$(ids_matching 'CLI done id=')" "1 2 3 4 5 6 7 8"
 check "no answer arrived on another connection" "$(count_of 'CLI WRONG')" "0"
+# Made and removed here, so the server's counts below see only the clients they are about.
+create_ok "client, four connections, batch callback" "$BIN" create client mcb -t "127.0.0.1:$P" --connections 4 \
+    --lua "$BAT_LUA" -s
+wait_count 'BAT done id=' 4 10 || true
+check "on_messages finished five rounds on every id" "$(ids_matching 'BAT done id=')" "1 2 3 4"
+check "no chunk was handed another connection's id" "$(count_of 'BWRONG')" "0"
+"$BIN" remove mcb >/dev/null 2>&1 || true
+wait_stat mcs connections $((N + 1)) 10 || true
 
 # ── self.send with an id, without one, and the refusal ───────────────────────
 wait_count 'CLI pending sum=' 1 10 || true

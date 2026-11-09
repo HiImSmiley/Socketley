@@ -247,6 +247,9 @@ public:
         CB_ON_SUBSCRIBE          = 1ull << 33,
         // A mail runtime's: a recipient on its way in, which the script may take or refuse.
         CB_ON_RCPT               = 1ull << 34,
+        // Every complete line of one read as one string, in place of on_message and on_client_message.
+        CB_ON_MESSAGES           = 1ull << 35,
+        CB_ON_CLIENT_MESSAGES    = 1ull << 36,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -259,6 +262,9 @@ public:
     bool has_on_route()              const { return m_callback_mask & CB_ON_ROUTE; }
     bool has_on_master_auth()        const { return m_callback_mask & CB_ON_MASTER_AUTH; }
     bool has_on_client_message()     const { return m_callback_mask & CB_ON_CLIENT_MESSAGE; }
+    // The batch forms, which win over the per-line ones when a script defines both.
+    bool has_on_messages()           const { return m_callback_mask & CB_ON_MESSAGES; }
+    bool has_on_client_messages()    const { return m_callback_mask & CB_ON_CLIENT_MESSAGES; }
     // A connection's write queue has come back down under the watermark, so a
     // producer that stopped because self.pending() was high can go on.
     bool has_on_writable()           const { return m_callback_mask & CB_ON_WRITABLE; }
@@ -321,6 +327,8 @@ public:
     // exactly once.
     sol::protected_function& raw_on_message()        { return m_on_message; }
     sol::protected_function& raw_on_client_message() { return m_on_client_message; }
+    sol::protected_function& raw_on_messages()        { return m_on_messages; }
+    sol::protected_function& raw_on_client_messages() { return m_on_client_messages; }
     guarded_protected on_writable()   { return {m_on_writable,   "on_writable",   m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_http_body()  { return {m_on_http_body,  "on_http_body",  m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_upstream_writable() { return {m_on_upstream_writable, "on_upstream_writable", m_deadline_ms, m_owner_name.c_str()}; }
@@ -445,6 +453,8 @@ private:
     // refused it, which is the whole defect this callback was just fixed for.
     sol::protected_function m_on_master_auth;
     sol::protected_function m_on_client_message;
+    sol::protected_function m_on_messages;
+    sol::protected_function m_on_client_messages;
     sol::protected_function m_on_writable;
     sol::protected_function m_on_http_body;
     sol::protected_function m_on_upstream_writable;
@@ -616,6 +626,8 @@ public:
     bool has_on_route()          const { return false; }
     bool has_on_master_auth()    const { return false; }
     bool has_on_client_message() const { return false; }
+    bool has_on_messages()       const { return false; }
+    bool has_on_client_messages() const { return false; }
     bool has_on_writable()       const { return false; }
     bool has_on_http_body()      const { return false; }
     bool has_on_upstream_writable() const { return false; }

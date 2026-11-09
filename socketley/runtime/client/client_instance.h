@@ -212,6 +212,10 @@ private:
     // Every complete line to process_message until a callback loses the
     // socket, which returns socketley::line_framing_stopped.
     size_t deliver_lines(conn_t* conn, const char* data, size_t len, size_t search_from);
+    // Whether a read's lines go to on_messages as one string rather than one by one.
+    bool batches_lines() const;
+    // deliver_lines() for on_messages: everything up to the last newline in one call.
+    size_t deliver_chunk(conn_t* conn, const char* data, size_t len, size_t search_from);
     bool still_reading(const conn_t* conn, uint32_t slot, uint32_t generation, int fd) const;
     // Returns whether the reconnect clock is actually armed, since a caller
     // that ignores it claims a client will dial again when nothing will make

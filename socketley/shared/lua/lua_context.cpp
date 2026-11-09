@@ -642,6 +642,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_route = m_lua["on_route"];
     m_on_master_auth = m_lua["on_master_auth"];
     m_on_client_message = m_lua["on_client_message"];
+    m_on_messages        = m_lua["on_messages"];
+    m_on_client_messages = m_lua["on_client_messages"];
     m_on_writable       = m_lua["on_writable"];
     m_on_http_body      = m_lua["on_http_body"];
     m_on_upstream_writable = m_lua["on_upstream_writable"];
@@ -703,6 +705,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_route.valid())              m_callback_mask |= CB_ON_ROUTE;
     if (m_on_master_auth.valid())        m_callback_mask |= CB_ON_MASTER_AUTH;
     if (m_on_client_message.valid())     m_callback_mask |= CB_ON_CLIENT_MESSAGE;
+    if (m_on_messages.valid())           m_callback_mask |= CB_ON_MESSAGES;
+    if (m_on_client_messages.valid())    m_callback_mask |= CB_ON_CLIENT_MESSAGES;
     if (m_on_writable.valid())           m_callback_mask |= CB_ON_WRITABLE;
     if (m_on_http_body.valid())          m_callback_mask |= CB_ON_HTTP_BODY;
     if (m_on_upstream_writable.valid())  m_callback_mask |= CB_ON_UPSTREAM_WRITABLE;
