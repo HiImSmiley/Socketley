@@ -1,4 +1,5 @@
 #include "event_loop.h"
+#include <atomic>
 #include "../util/logging.h"
 #include "eventfd_wake.h"
 #include "turn_clock.h"
@@ -306,9 +307,48 @@ static bool probe_fixed_file_release()
     return ok;
 }
 
+// What the kernel answered each ring probe, -1 until asked: the same for every loop of this process and every
+// process on this kernel, so each is asked once and a worker starts from the daemon's answers.
+namespace
+{
+enum ring_fact : size_t { fact_multishot_accept, fact_accept_poll_first, fact_recv_poll_first, fact_recv_multishot,
+                          fact_fixed_file_release, fact_recv_bundle, fact_count };
+std::atomic<int8_t> g_ring_facts[fact_count] = {-1, -1, -1, -1, -1, -1};
+
+bool ring_fact_or_probe(ring_fact f, bool (*probe)())
+{
+    int8_t v = g_ring_facts[f].load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        v = probe() ? 1 : 0;
+        g_ring_facts[f].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+} // namespace
+
+std::string event_loop::kernel_facts()
+{
+    std::string out(fact_count, '?');
+    for (size_t f = 0; f < fact_count; ++f)
+        if (const int8_t v = g_ring_facts[f].load(std::memory_order_relaxed); v >= 0)
+            out[f] = v ? '1' : '0';
+    return out;
+}
+
+void event_loop::assume_kernel_facts(std::string_view facts)
+{
+    // A string of another length is another build's, and none of it is taken.
+    if (facts.size() != fact_count)
+        return;
+    for (size_t f = 0; f < fact_count; ++f)
+        if (facts[f] == '0' || facts[f] == '1')
+            g_ring_facts[f].store(facts[f] == '1' ? 1 : 0, std::memory_order_relaxed);
+}
+
 bool event_loop::supports_multishot_accept()
 {
-    return probe_accept_variant(true, false);
+    return ring_fact_or_probe(fact_multishot_accept, [] { return probe_accept_variant(true, false); });
 }
 
 void event_loop::setup_eventfd()
@@ -1101,17 +1141,18 @@ bool event_loop::init()
     m_multishot_supported = supports_multishot_accept();
     // Only worth probing when multishot itself works; the flag lives in the same
     // ioprio field and is meaningless without it.
-    m_accept_poll_first = m_multishot_supported && probe_accept_variant(true, true);
-    m_recv_poll_first = probe_recv_poll_first();
+    m_accept_poll_first = m_multishot_supported &&
+        ring_fact_or_probe(fact_accept_poll_first, [] { return probe_accept_variant(true, true); });
+    m_recv_poll_first = ring_fact_or_probe(fact_recv_poll_first, probe_recv_poll_first);
 
     // IORING_OP_RECV exists from 5.6 and its multishot flag only from 6.0, so the opcode table cannot answer this.
-    m_recv_multishot_supported = probe_recv_multishot();
+    m_recv_multishot_supported = ring_fact_or_probe(fact_recv_multishot, probe_recv_multishot);
 
     // Pre-register a sparse fixed file table with every slot empty,
     // heap-allocated to avoid a 32 KB stack frame, and only on a kernel that
     // closes a removed socket while another one is idle, because every caller
     // keeps its plain descriptor and falls back to it when no slot is handed out.
-    if (probe_fixed_file_release())
+    if (ring_fact_or_probe(fact_fixed_file_release, probe_fixed_file_release))
     {
         int* sparse_fds = static_cast<int*>(malloc(MAX_FIXED_FILES * sizeof(int)));
         if (sparse_fds)
@@ -2119,7 +2160,7 @@ bool event_loop::recv_bundle_enabled() const
     static const bool enabled = [] {
         if (!socketley::settings::flag("SOCKETLEY_RECV_BUNDLE", true))
             return false;
-        return probe_recv_bundle();
+        return ring_fact_or_probe(fact_recv_bundle, probe_recv_bundle);
     }();
     return enabled;
 }

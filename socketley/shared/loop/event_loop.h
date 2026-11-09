@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <liburing.h>
 #include <netinet/in.h>
@@ -374,6 +376,11 @@ public:
 
     // Check if multishot accept is supported
     static bool supports_multishot_accept();
+
+    // What this process's ring probes found, one character each ('1', '0', '?' for not asked), and the same handed
+    // in by a process that already asked them, which a worker is so that it builds no throwaway rings.
+    static std::string kernel_facts();
+    static void assume_kernel_facts(std::string_view facts);
 
     // NAPI busy polling: reduce latency by busy-polling the NIC driver.
     bool enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer = false);

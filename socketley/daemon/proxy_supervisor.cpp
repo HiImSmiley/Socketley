@@ -620,9 +620,10 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // relaying for ever, since the grant that would fix it is suppressed.
     m_granted.clear();
 
-    // Before the fork, because after it only async-signal-safe calls are
-    // legal and this object allocates.
-    const socketley::worker_env child_env(cfg.type == runtime_cache);
+    // Before the fork, because after it only async-signal-safe calls are legal and this object allocates; the ring
+    // probes' answers go with it, so a worker builds no throwaway rings to learn what the daemon already knows.
+    const std::string ring_facts = event_loop::kernel_facts();
+    const socketley::worker_env child_env(cfg.type == runtime_cache, {{"SOCKETLEY_RING_FACTS", ring_facts}});
     // Its stderr through a pipe of its own, so the daemon's recent log knows which runtime wrote each line.
     const int log_fd = log_ring::worker_pipe(cfg.name);
 

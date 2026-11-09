@@ -380,3 +380,30 @@ TEST_CASE("every setup tier builds a ring on this kernel, and init() takes the b
         CHECK(f.loop.ring_setup_flags() == event_loop::RING_SETUP_TIERS[0]);
     }
 }
+
+// Last, because the answers it hands in are the process's for every loop after it, and it puts the real ones back.
+TEST_CASE("the ring probes are asked once, and a process handed the answers asks none of them")
+{
+    {
+        event_loop loop;
+        REQUIRE(loop.init());
+    }
+    const std::string asked = event_loop::kernel_facts();
+    REQUIRE(asked.size() == 6);
+    for (size_t i = 0; i < 5; ++i)
+        CHECK((asked[i] == '0' || asked[i] == '1'));
+
+    // An answer the kernel would not give is what is used, which only an answer that was never probed can be.
+    std::string flipped = asked;
+    flipped[0] = asked[0] == '1' ? '0' : '1';
+    event_loop::assume_kernel_facts(flipped);
+    CHECK(event_loop::supports_multishot_accept() == (flipped[0] == '1'));
+    CHECK(event_loop::kernel_facts() == flipped);
+
+    // Another build's string is not taken at all.
+    event_loop::assume_kernel_facts("1");
+    CHECK(event_loop::kernel_facts() == flipped);
+
+    event_loop::assume_kernel_facts(asked);
+    CHECK(event_loop::supports_multishot_accept() == (asked[0] == '1'));
+}

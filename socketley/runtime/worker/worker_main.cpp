@@ -2698,6 +2698,13 @@ int worker_main(int control_fd)
     // the daemon had just accepted.
     set_worker_process(true);
 
+    // The daemon's answers to the ring probes, so this process asks the kernel none of them again.
+    if (const char* facts = socketley::settings::text("SOCKETLEY_RING_FACTS"))
+    {
+        event_loop::assume_kernel_facts(facts);
+        ::unsetenv("SOCKETLEY_RING_FACTS");
+    }
+
     worker w(control_fd);
     return w.run();
 }

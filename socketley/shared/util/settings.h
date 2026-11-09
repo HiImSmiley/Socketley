@@ -246,6 +246,7 @@ inline constexpr setting table[] = {
     {"SOCKETLEY_MANAGED", kind::flag, audience::internal, 0, 0, "off", "this process was started by a daemon"},
     {"SOCKETLEY_NAME", kind::text, audience::internal, 0, 0, "none", "the runtime this process runs"},
     {"SOCKETLEY_FAST_LO", kind::text, audience::internal, 0, 0, "none", "the loopback shortcut the daemon attached"},
+    {"SOCKETLEY_RING_FACTS", kind::text, audience::internal, 0, 0, "none", "the daemon's answers to the ring probes"},
 };
 
 consteval size_t index_of(std::string_view name)
