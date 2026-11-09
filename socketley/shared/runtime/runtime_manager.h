@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 
 #include <map>
 #include <unordered_map>
@@ -25,6 +26,52 @@ class cluster_discovery;
 // server into every translation unit that only wants the map.
 namespace route_relay { struct sink; }
 struct cluster_event;
+
+// The map's lock, which fills an unfilled replica before its first shared acquisition, because every read of the map
+// takes it shared and a worker whose runtime never reads the map is then never sent it.
+class replica_mutex
+{
+public:
+    void lock() { m_m.lock(); ++t_held; }
+    bool try_lock() { return m_m.try_lock() && (++t_held, true); }
+    void unlock() { --t_held; m_m.unlock(); }
+    void lock_shared() { fill(); m_m.lock_shared(); ++t_held; }
+    bool try_lock_shared() { fill(); return m_m.try_lock_shared() && (++t_held, true); }
+    void unlock_shared() { --t_held; m_m.unlock_shared(); }
+
+    // The lock without the fill, for the manager's own walks that no replica row can answer.
+    std::shared_mutex& raw() { return m_m; }
+
+private:
+    friend class runtime_manager;
+
+    void fill()
+    {
+        if (!m_owed.load(std::memory_order_relaxed) || m_filling) [[likely]]
+            return;
+        // Not with the lock already held by this thread, because the fill installs under the exclusive lock.
+        if (t_held != 0)
+            return;
+        // A second after a fill that failed, so a daemon that is slow to answer costs one wait and not one per read.
+        const auto now = std::chrono::steady_clock::now();
+        if (now < m_retry_at)
+            return;
+        m_filling = true;
+        m_fill();
+        m_filling = false;
+        if (m_owed.load(std::memory_order_relaxed))
+            m_retry_at = now + std::chrono::seconds(1);
+    }
+
+    std::shared_mutex    m_m;
+    std::function<void()> m_fill;
+    // Set once at wiring and cleared by the first install, so the daemon's readers on other threads only ever load a false.
+    std::atomic<bool>    m_owed{false};
+    bool                 m_filling{false};
+    std::chrono::steady_clock::time_point m_retry_at{};
+    // How many holds of the map's lock this thread has, shared or exclusive, through this class.
+    static inline thread_local int t_held = 0;
+};
 
 class runtime_manager
 {
@@ -59,6 +106,15 @@ public:
     // snapshot omits, with no invalidation and no synchronous refresh; false
     // when a script frame refused it.
     bool install_replica(const std::vector<replica_entry>& entries);
+
+    // How a replica is filled the first time anything reads it, armed until an install_replica() fills it.
+    void set_replica_fill(std::function<void()> fill);
+    // An unfilled replica, which drops the rows of a delta because a delta onto nothing is not the map.
+    bool replica_unfilled() const { return mutex.m_owed.load(std::memory_order_relaxed); }
+    // Owed again, for a worker that can no longer tell which map it holds.
+    void replica_owe() { if (mutex.m_fill) mutex.m_owed.store(true, std::memory_order_relaxed); }
+    // Whether an unfilled replica can ask for its map at all, which a worker without a map socket cannot.
+    bool replica_can_fill() const { return static_cast<bool>(mutex.m_fill); }
 
     // Only the rows a push moved, applied and refused exactly as install_replica would.
     bool apply_replica_delta(const std::vector<replica_entry>& upserts,
@@ -206,7 +262,7 @@ public:
     using cluster_primaries = std::map<std::string, std::pair<std::string, uint16_t>>;
     void set_cluster_primaries(cluster_primaries primaries);
 
-    mutable std::shared_mutex mutex;
+    mutable replica_mutex mutex;
 
 private:
     // The names one cascade has already descended into, threaded through

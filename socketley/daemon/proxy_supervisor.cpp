@@ -269,6 +269,13 @@ void proxy_supervisor::close_map()
             ::close(m_map_fd);
         m_map_fd = -1;
         m_map_in.clear();
+
+        // A child that can no longer ask for the map is pushed the whole of it, which is what it asked for.
+        if (!m_map_pushed)
+        {
+            m_map_pushed   = true;
+            m_map_gen_held = 0;
+        }
     }
 }
 
@@ -419,6 +426,13 @@ void proxy_supervisor::poll_map()
         if (!worker_proto::decode_map_request(payload, ticket, op, name, config))
             continue;
 
+        // Answered here and now, because it changes nothing and the answer is what every later push is a delta onto.
+        if (op == worker_proto::map_subscribe_op)
+        {
+            subscribe_map(ticket);
+            continue;
+        }
+
         // The dup the handler owns and closes, taken here while the descriptor
         // is certainly still open rather than on a later turn when this object
         // may be gone.
@@ -441,6 +455,19 @@ void proxy_supervisor::poll_map()
         LOG_ERROR("proxy supervisor: malformed map frame from a worker");
         close_map();
     }
+}
+
+void proxy_supervisor::subscribe_map(uint64_t ticket)
+{
+    if (!m_map_source)
+    {
+        answer_map_request(m_map_fd, ticket, false, "this daemon does not hand out the runtime map");
+        return;
+    }
+    const auto [full, gen] = m_map_source();
+    m_map_pushed   = true;
+    m_map_gen_held = gen;
+    answer_map_request(m_map_fd, ticket, true, *full);
 }
 
 void proxy_supervisor::answer_map_request(int reply_fd, uint64_t ticket,
@@ -711,9 +738,15 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::cluster,
                                              m_cluster_view))) {}
 
-    m_map_gen_held = !m_runtime_map.empty() &&
-        write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map, m_runtime_map))
-        ? m_runtime_map_gen : 0;
+    // Only to a child with no map socket, because one with a socket asks when its runtime first reads the map.
+    m_map_pushed   = m_map_fd < 0;
+    m_map_gen_held = 0;
+    if (m_map_pushed && m_map_source)
+    {
+        const auto [full, gen] = m_map_source();
+        if (write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map, *full)))
+            m_map_gen_held = gen;
+    }
 
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::config, m_config_json)))
     {
@@ -922,15 +955,10 @@ void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
         write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints));
 }
 
-void proxy_supervisor::send_runtime_map(const std::string& full, const std::string& delta, uint64_t gen)
+void proxy_supervisor::send_runtime_map(const std::function<const std::string&()>& full, const std::string& delta,
+                                        uint64_t gen)
 {
-    if (gen == m_map_gen_held)
-        return;
-    m_runtime_map     = full;
-    m_runtime_map_gen = gen;
-
-    // No child to write to, so this is what the next one is handed.
-    if (m_control_fd < 0)
+    if (!m_map_pushed || gen == m_map_gen_held || m_control_fd < 0)
         return;
 
     // The delta only onto the generation it was taken against, and a frame that was not queued leaves the
@@ -938,7 +966,7 @@ void proxy_supervisor::send_runtime_map(const std::string& full, const std::stri
     const bool step = m_map_gen_held != 0 && m_map_gen_held + 1 == gen && !delta.empty();
     const bool sent = step
         ? write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map_delta, delta))
-        : write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map, full));
+        : write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map, full()));
     m_map_gen_held = sent ? gen : 0;
 }
 

@@ -252,6 +252,10 @@ public:
             // socket and `open` starts with a question the map socket alone
             // can answer.
             m_manager.set_route_sink(this);
+
+            // The map asked for at its first read, and only with a map socket, because without one the daemon
+            // pushes it as it always has.
+            m_manager.set_replica_fill([this] { fill_replica(); });
         }
     }
 
@@ -1201,6 +1205,10 @@ private:
             m_pending_endpoints.reset();
         }
 
+        // A runtime that is handed every push reads the map by definition, so it asks for it now.
+        if (m_rt->wants_runtime_map() && m_manager.replica_unfilled())
+            fill_replica();
+
         send_state();
     }
 
@@ -1238,7 +1246,7 @@ private:
     }
 
     // The map handed to a runtime that reads it, rebuilt from the rows only when one does.
-    void map_to_runtime(const std::string* payload)
+    void map_to_runtime(const std::string_view* payload)
     {
         if (!m_rt || !m_rt->wants_runtime_map())
             return;
@@ -1254,24 +1262,45 @@ private:
         m_rt->on_runtime_map(worker_proto::encode_runtime_map(all));
     }
 
+    // The whole map, from the daemon when this worker's runtime first reads it, and blocking, because the read that
+    // asked is waiting for the answer.
+    void fill_replica()
+    {
+        std::string reply;
+        if (!map_request(worker_proto::map_subscribe_op, {}, {}, reply))
+        {
+            // Still owed, so the next read asks again.
+            LOG_WARN(("proxy worker: the runtime map could not be fetched: " + reply).c_str());
+            return;
+        }
+        on_runtime_map(reply);
+    }
+
     // The daemon's map decoded into the manager, so every reader works out
     // here exactly as it does in the daemon -- with this worker's own runtime
     // present as a replica, because putting the live object in would deliver
     // every PUBLISH to it twice.
     void on_runtime_map(const std::string& payload)
     {
+        uint64_t gen = 0;
+        std::string_view body;
         std::vector<worker_proto::runtime_wire> wire;
-        if (!worker_proto::decode_runtime_map(payload, wire))
+        if (!worker_proto::split_generation(payload, gen, body) || !worker_proto::decode_runtime_map(body, wire))
         {
             LOG_WARN("proxy worker: malformed runtime map, keeping the previous one");
             return;
         }
 
+        // A push older than the map this worker asked for, written before the daemon answered the ask.
+        if (gen <= m_map_gen && !m_manager.replica_unfilled())
+            return;
+        m_map_gen = gen;
+
         m_map_rows.clear();
         for (auto& w : wire)
             m_map_rows.insert_or_assign(w.name, std::move(w));
         install_map_rows();
-        map_to_runtime(&payload);
+        map_to_runtime(&body);
 
         if (logger::g_level <= log_debug)
         {
@@ -1284,13 +1313,31 @@ private:
     // The rows that moved since the map this worker holds, which the daemon sends only onto that map.
     void on_runtime_map_delta(const std::string& payload)
     {
+        uint64_t gen = 0;
+        std::string_view body;
         std::vector<worker_proto::runtime_wire> upserts;
         std::vector<std::string> removed;
-        if (!worker_proto::decode_runtime_map_delta(payload, upserts, removed))
+        if (!worker_proto::split_generation(payload, gen, body) ||
+            !worker_proto::decode_runtime_map_delta(body, upserts, removed))
         {
             LOG_WARN("proxy worker: malformed runtime map delta, keeping the previous map");
             return;
         }
+
+        // Nothing to apply it onto, or a delta the map asked for already holds.
+        if (m_manager.replica_unfilled() || gen <= m_map_gen)
+            return;
+
+        // A delta that skips one leaves this worker not knowing its map, so it asks for the whole of it -- when it
+        // can: one without a map socket applies what it is pushed, as every worker did before it could ask.
+        if (gen != m_map_gen + 1 && m_manager.replica_can_fill())
+        {
+            m_manager.replica_owe();
+            if (m_rt && m_rt->wants_runtime_map())
+                fill_replica();
+            return;
+        }
+        m_map_gen = gen;
 
         std::vector<runtime_manager::replica_entry> entries;
         entries.reserve(upserts.size());
@@ -2592,6 +2639,8 @@ private:
     // replica still owes a push a script frame refused.
     std::map<std::string, worker_proto::runtime_wire, std::less<>> m_map_rows;
     bool                                   m_replica_behind{false};
+    // The generation of the map m_map_rows is, 0 before the first.
+    uint64_t                               m_map_gen{0};
     std::string                            m_in;
     io_request                             m_ctl_req{};
     bool                                   m_ctl_armed{false};

@@ -56,7 +56,7 @@ enum class frame_type : uint16_t
     chan_req  = 22,  // payload: see encode_chan_request
     deliver   = 23,  // payload: raw message bytes; see below
     reload    = 24,  // payload: empty; re-run the script, then answer `routes`
-    runtime_map = 25,  // payload: see encode_runtime_map
+    runtime_map = 25,  // payload: see with_generation, then encode_runtime_map
     cluster     = 26,  // payload: see encode_cluster_view
 
     // worker → daemon, again
@@ -104,7 +104,7 @@ enum class frame_type : uint16_t
     conn_handoff_ack = 36,
 
     // daemon -> worker: the rows of the runtime map that changed since the map the worker holds; see
-    // encode_runtime_map_delta.
+    // with_generation, then encode_runtime_map_delta.
     runtime_map_delta = 37,
 };
 
@@ -1013,6 +1013,31 @@ inline bool decode_runtime_map_delta(std::string_view payload, std::vector<runti
     }
     return r.ok;
 }
+
+// The generation a map or a delta brings the replica to, in front of either, so a worker drops a push older
+// than the snapshot it was handed when it asked for the map.
+inline std::string with_generation(uint64_t gen, std::string_view body)
+{
+    std::string out;
+    out.reserve(8 + body.size());
+    socketley::bytes::append64(out, gen);
+    out.append(body);
+    return out;
+}
+
+inline bool split_generation(std::string_view payload, uint64_t& gen, std::string_view& body)
+{
+    reader r(payload.data(), payload.size());
+    gen = r.u64();
+    if (!r.ok)
+        return false;
+    body = payload.substr(8);
+    return true;
+}
+
+// The map op a worker sends on the map socket the first time its runtime reads the map, answered with the whole map
+// as a runtime_map frame carries it, and the daemon pushes the map to no worker that has not asked.
+inline constexpr std::string_view map_subscribe_op = "subscribe";
 
 // The cluster as a worker is allowed to see it: a separate frame because a
 // remote daemon joining moves nothing in the local map, carrying

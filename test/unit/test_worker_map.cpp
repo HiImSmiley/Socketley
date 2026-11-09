@@ -406,3 +406,99 @@ TEST_CASE("a snapshot of many runtimes keeps them all and drops the one left out
     std::shared_lock lock(mgr.mutex);
     CHECK(mgr.list().size() == 299);
 }
+
+TEST_CASE("a replica with a fill is filled at its first read, and once")
+{
+    runtime_manager mgr;
+    mgr.mark_replica();
+    int fills = 0;
+    mgr.set_replica_fill([&] {
+        ++fills;
+        mgr.install_replica({ entry("api", runtime_server, runtime_running, 8080, 0),
+                              entry("kv", runtime_cache, runtime_running, 0, 0) });
+    });
+    CHECK(mgr.replica_unfilled());
+    CHECK(fills == 0);
+
+    // A delta onto nothing is refused by the worker, which asks this before applying one.
+    REQUIRE(mgr.get("api") != nullptr);
+    CHECK(fills == 1);
+    CHECK_FALSE(mgr.replica_unfilled());
+    {
+        std::shared_lock lock(mgr.mutex);
+        CHECK(mgr.list().size() == 2);
+    }
+    CHECK(mgr.get_children("api").empty());
+    CHECK(fills == 1);
+
+    // Owed again, it fills at the next read and not before.
+    mgr.replica_owe();
+    CHECK(mgr.replica_unfilled());
+    CHECK(fills == 1);
+    CHECK(mgr.get("kv") != nullptr);
+    CHECK(fills == 2);
+}
+
+TEST_CASE("a replica is filled by a read that holds the lock, before it is taken")
+{
+    runtime_manager mgr;
+    mgr.mark_replica();
+    int fills = 0;
+    mgr.set_replica_fill([&] {
+        ++fills;
+        mgr.install_replica({ entry("api", runtime_server, runtime_running, 8080, 0) });
+    });
+    std::shared_lock lock(mgr.mutex);
+    CHECK(fills == 1);
+    CHECK(mgr.list().size() == 1);
+}
+
+TEST_CASE("the manager's own walks do not fill a replica")
+{
+    runtime_manager mgr;
+    mgr.mark_replica();
+    int fills = 0;
+    mgr.set_replica_fill([&] { ++fills; });
+    mgr.dispatch_publish("cache", "channel", "message");
+    mgr.publish_endpoints();
+    CHECK(mgr.retired_count() == 0);
+    CHECK(fills == 0);
+    CHECK(mgr.replica_unfilled());
+}
+
+TEST_CASE("a fill that fails leaves the replica owed and the read still answered, and the next read does not ask again at once")
+{
+    runtime_manager mgr;
+    mgr.mark_replica();
+    int fills = 0;
+    mgr.set_replica_fill([&] { ++fills; });
+    CHECK(mgr.get("api") == nullptr);
+    CHECK(mgr.get("api") == nullptr);
+    // A second apart, so a daemon slow to answer costs one wait and not one per read.
+    CHECK(fills == 1);
+    CHECK(mgr.replica_unfilled());
+}
+
+TEST_CASE("a manager with no fill is never owed")
+{
+    runtime_manager mgr;
+    mgr.mark_replica();
+    CHECK_FALSE(mgr.replica_unfilled());
+    mgr.replica_owe();
+    CHECK_FALSE(mgr.replica_unfilled());
+}
+
+TEST_CASE("a push carries its generation in front of the map")
+{
+    const std::string body = worker_proto::encode_runtime_map({ wire("api", "server", 1, 8080, 0, "") });
+    const std::string payload = worker_proto::with_generation(42, body);
+    uint64_t gen = 0;
+    std::string_view rest;
+    REQUIRE(worker_proto::split_generation(payload, gen, rest));
+    CHECK(gen == 42);
+    CHECK(rest == body);
+    std::vector<worker_proto::runtime_wire> out;
+    REQUIRE(worker_proto::decode_runtime_map(rest, out));
+    CHECK(out.size() == 1);
+    CHECK_FALSE(worker_proto::split_generation(std::string_view(payload.data(), 7), gen, rest));
+}

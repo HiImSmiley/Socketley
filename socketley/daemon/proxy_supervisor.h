@@ -145,6 +145,11 @@ public:
                                            std::string config)>;
     void set_map_handler(map_handler h) { m_on_map = std::move(h); }
 
+    // The runtime map as it is now and its generation, which a child is handed when it first reads the map, or at
+    // its spawn when it has no map socket to ask on.
+    using map_source = std::function<std::pair<const std::string*, uint64_t>()>;
+    void set_map_source(map_source s) { m_map_source = std::move(s); }
+
     // ─── Peer links ─────────────────────────────────────────────────────────
     // A crossing this worker made to another runtime, reported so the daemon
     // can introduce the two processes to each other instead of carrying every
@@ -249,9 +254,9 @@ public:
     // the daemon publishes only on the few events that move one.
     void send_endpoints(const std::string& encoded_payload);
 
-    // Generation `gen` of the runtime map: only the rows that moved when the child holds gen - 1, the whole map
-    // otherwise, nothing when it holds gen; the whole map is kept so a newly forked child does not start empty.
-    void send_runtime_map(const std::string& full, const std::string& delta, uint64_t gen);
+    // Generation `gen` of the runtime map, to a child that reads the map: only the rows that moved when it holds
+    // gen - 1, the whole map from `full` otherwise, nothing when it holds gen.
+    void send_runtime_map(const std::function<const std::string&()>& full, const std::string& delta, uint64_t gen);
 
     // What the cluster looks like, cached and deduped like the map, except
     // that a heartbeat per remote daemon makes the payload differ on every
@@ -383,6 +388,8 @@ private:
     void   disarm_map_poll();
     void   poll_map();
     void   close_map();
+    // The child's ask for the map, answered with all of it, after which it is pushed every change.
+    void   subscribe_map(uint64_t ticket);
     void   close_link_chan();
 
     void   apply_stats(const std::string& payload);
@@ -402,9 +409,8 @@ private:
     std::string       m_config_json;      // kept so a restart can re-send it
     std::string       m_endpoints;        // last table, re-sent to a new child
     bool              m_endpoints_held{false}; // the running child was handed m_endpoints
-    std::string       m_runtime_map;      // last map, re-sent to a new child
-    uint64_t          m_runtime_map_gen{0};  // the generation m_runtime_map is
     uint64_t          m_map_gen_held{0};     // the generation the running child holds, 0 for none
+    bool              m_map_pushed{false};   // the running child asked for the map, or has no socket to ask on
     std::string       m_cluster_view;     // last cluster view, likewise
     std::string       m_in;               // partial frames from the child
     worker_proto::part_joiner m_part;     // a frame past max_payload, while its pieces come in
@@ -456,6 +462,7 @@ private:
     route_handler    m_on_route;
     stats_handler   m_on_stats;
     map_handler      m_on_map;
+    map_source       m_map_source;
     peer_handler     m_on_peer;
     series_handler   m_on_series;
     series_handler   m_on_alert;

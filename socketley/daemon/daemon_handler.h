@@ -531,9 +531,12 @@ private:
     // The map as last published, its generation and both encodings of it, brought up to date from the manager
     // by refresh_runtime_map(), which bumps the generation only when a row moved.
     void refresh_runtime_map();
+    // The whole map at m_map_gen, encoded only when a worker is to be sent it, which most pushes are not.
+    const std::string& runtime_map_full();
     std::unordered_map<std::string, worker_proto::runtime_wire> m_map_rows;
     uint64_t    m_map_gen{0};
     std::string m_map_full;
+    uint64_t    m_map_full_gen{0};
     std::string m_map_delta;
 
     // Whether a cluster view has ever gone out, which is what makes an empty

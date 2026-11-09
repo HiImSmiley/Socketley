@@ -6923,8 +6923,21 @@ void daemon_handler::refresh_runtime_map()
     for (const auto& w : upserts)
         m_map_rows.insert_or_assign(w.name, w);
     ++m_map_gen;
-    m_map_full  = worker_proto::encode_runtime_map(rts);
-    m_map_delta = worker_proto::encode_runtime_map_delta(upserts, removed);
+    m_map_delta = worker_proto::with_generation(m_map_gen, worker_proto::encode_runtime_map_delta(upserts, removed));
+}
+
+const std::string& daemon_handler::runtime_map_full()
+{
+    if (m_map_full_gen != m_map_gen)
+    {
+        std::vector<worker_proto::runtime_wire> rts;
+        rts.reserve(m_map_rows.size());
+        for (const auto& [_, w] : m_map_rows)
+            rts.push_back(w);
+        m_map_full     = worker_proto::with_generation(m_map_gen, worker_proto::encode_runtime_map(rts));
+        m_map_full_gen = m_map_gen;
+    }
+    return m_map_full;
 }
 
 void daemon_handler::publish_runtime_map_to_workers()
@@ -6937,9 +6950,10 @@ void daemon_handler::publish_runtime_map_to_workers()
     // Built once for all of them, with each supervisor deciding from the generation whether it is news, so an
     // idle daemon's health tick costs one compare per worker.
     refresh_runtime_map();
+    const std::function<const std::string&()> full = [this]() -> const std::string& { return runtime_map_full(); };
     for (auto& [_, shards] : m_proxy_workers)
         for (auto& sup : shards)
-            sup->send_runtime_map(m_map_full, m_map_delta, m_map_gen);
+            sup->send_runtime_map(full, m_map_delta, m_map_gen);
 
     m_last_map_push = std::chrono::steady_clock::now();
 }
@@ -8324,11 +8338,16 @@ void daemon_handler::reconcile_proxy_workers()
         if (shards.empty())
             inst->set_request_sink_override(sup.get());
 
+        // The map as it is when the child asks for it, which is at its runtime's first read of it.
+        sup->set_map_source([this]
+                            {
+                                refresh_runtime_map();
+                                return std::pair<const std::string*, uint64_t>{&runtime_map_full(), m_map_gen};
+                            });
+
         // Handed over before the fork rather than published after it, because
-        // these only fill the supervisor's caches and those are what spawn()
+        // this only fills the supervisor's cache and that is what spawn()
         // writes ahead of the config frame that loads the script.
-        refresh_runtime_map();
-        sup->send_runtime_map(m_map_full, m_map_delta, m_map_gen);
         if (const std::string cv = build_cluster_view_payload(); !cv.empty())
         {
             sup->send_cluster_view(cv);

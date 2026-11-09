@@ -216,12 +216,18 @@ void runtime_manager::upsert_replica_row(const replica_entry& e,
     inst->set_worker_stats({}, e.connections);
 }
 
+void runtime_manager::set_replica_fill(std::function<void()> fill)
+{
+    mutex.m_fill = std::move(fill);
+    mutex.m_owed.store(static_cast<bool>(mutex.m_fill), std::memory_order_relaxed);
+}
+
 bool runtime_manager::install_replica(const std::vector<replica_entry>& entries)
 {
-    // Never under a script frame, because a replica the snapshot has dropped
-    // is freed below and a callback may be holding the pointer get() handed
-    // it.
-    if (script_frame_live())
+    // An unfilled replica takes its rows even under a script frame, which is where a first read fills it; what that
+    // drops is retired rather than freed, because a callback may hold it.
+    const bool frame = script_frame_live();
+    if (frame && !replica_unfilled())
         return false;
 
     // Freed with the lock released, like every other instance destruction
@@ -232,6 +238,15 @@ bool runtime_manager::install_replica(const std::vector<replica_entry>& entries)
 
         for (const auto& e : entries)
             upsert_replica_row(e, dropped);
+        mutex.m_owed.store(false, std::memory_order_relaxed);
+        if (frame)
+        {
+            // A row whose type changed still drops its instance, retired so it outlives the frame that may hold it.
+            lock.unlock();
+            for (auto& d : dropped)
+                retire(std::move(d));
+            return false;
+        }
 
         // Whatever the daemon no longer has, found through a set because a scan of the entries per runtime is
         // quadratic in a map every worker installs.
@@ -553,7 +568,7 @@ void runtime_manager::publish_offthread_stats()
     // A shared lock and never an exclusive one, because everything that
     // mutates the map runs on this thread and an exclusive lock would make it
     // wait on a reader.
-    std::shared_lock lock(mutex);
+    std::shared_lock lock(mutex.raw());
     for (auto& [name, instance] : runtimes)
         instance->publish_offthread_stats();
 }
@@ -684,7 +699,7 @@ void runtime_manager::free_retired()
 
 size_t runtime_manager::retired_count() const
 {
-    std::shared_lock lock(mutex);
+    std::shared_lock lock(mutex.raw());
     return m_retired.size();
 }
 
@@ -841,7 +856,7 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
     std::vector<std::string> names;
     {
         // No reserve: a worker's table is mostly replicas without a VM, and the common publish collects nothing.
-        std::shared_lock lock(mutex);
+        std::shared_lock lock(mutex.raw());
         for (auto& [n, inst] : runtimes)
         {
             if (inst->get_state() != runtime_running)
@@ -858,7 +873,7 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
         // the middle of this fan-out.
         runtime_instance* inst;
         {
-            std::shared_lock lock(mutex);
+            std::shared_lock lock(mutex.raw());
             auto it = runtimes.find(n);
             if (it == runtimes.end()) continue;
             inst = it->second.get();
@@ -880,7 +895,7 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
     // runtime that is not running executes no script.
     std::vector<std::string> names;
     {
-        std::shared_lock lock(mutex);
+        std::shared_lock lock(mutex.raw());
         names.reserve(runtimes.size());
         for (auto& [n, _] : runtimes)
             names.push_back(n);
@@ -908,7 +923,7 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
         else if (ev.kind == cluster_event::group_change && m_cluster)
         {
             {
-                std::shared_lock lock(mutex);
+                std::shared_lock lock(mutex.raw());
                 for (const auto& [_, rinst] : runtimes)
                     if (rinst->get_group() == ev.group_name &&
                         rinst->get_state() == runtime_running &&
@@ -937,7 +952,7 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
     {
         runtime_instance* inst;
         {
-            std::shared_lock lock(mutex);
+            std::shared_lock lock(mutex.raw());
             auto it = runtimes.find(n);
             if (it == runtimes.end()) continue;
             inst = it->second.get();
@@ -952,7 +967,7 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
             // Re-validate, because a previous event callback may have removed
             // or stopped this runtime, and both end its batch.
             {
-                std::shared_lock lock(mutex);
+                std::shared_lock lock(mutex.raw());
                 auto it = runtimes.find(n);
                 if (it == runtimes.end()) break;
                 if (it->second->get_state() != runtime_running) break;
@@ -982,7 +997,7 @@ void runtime_manager::publish_endpoints()
     std::map<std::string, std::map<std::string, std::shared_ptr<const route_table>>> group_members;
 
     {
-        std::shared_lock lock(mutex);
+        std::shared_lock lock(mutex.raw());
         for (const auto& [name, inst] : runtimes)
         {
             const uint16_t port = inst->get_port();
@@ -1089,7 +1104,7 @@ void runtime_manager::publish_endpoints()
     // Hand the finished table out, immutable from here on, so every runtime
     // holds the same one.
     {
-        std::shared_lock lock(mutex);
+        std::shared_lock lock(mutex.raw());
         for (const auto& [_, inst] : runtimes)
             inst->set_endpoints(tbl);
     }
@@ -1098,7 +1113,7 @@ void runtime_manager::publish_endpoints()
     // to a name -- rebuilt wholesale at the same moments, running only, with a
     // worker's placeholder answering through its supervisor.
     {
-        std::shared_lock lock(mutex);
+        std::shared_lock lock(mutex.raw());
         m_requests.clear_sinks();
         for (const auto& [name, inst] : runtimes)
         {
