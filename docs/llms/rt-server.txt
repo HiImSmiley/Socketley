@@ -122,9 +122,9 @@ socketley, no script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.
 
 | case | socketley | socketley, no script | ws 8.22.0 (Node 24.22.1) | uWebSockets.js 20.71.0 (Node 24.22.1) | socketley vs socketley, no script | socketley vs ws 8.22.0 (Node 24.22.1) | socketley vs uWebSockets.js 20.71.0 (Node 24.22.1) |
 |---|---|---|---|---|---|---|---|
-| echo, 64 B messages, 256 connections, one in flight each | 307 K msg/s (1.00 cores) | 325 K msg/s (1.00 cores) | 148 K msg/s (1.00 cores) | 229 K msg/s (1.00 cores) | 0.94× (0.91–0.95) | 2.08× (2.05–2.12) | 1.33× (1.28–1.35) |
-| room fan-out: 1 sender to 100 receivers, 64 B | 6.02 M msg/s (1.00 cores) | 6.00 M msg/s (1.00 cores) | 302 K msg/s (1.00 cores) | 5.34 M msg/s (1.00 cores) | 1.00× (0.98–1.01) | 19.94× (19.73–20.12) | 1.13× (1.11–1.14) |
-| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.29 M msg/s (1.00 cores) | 6.24 M msg/s (1.00 cores) | 277 K msg/s (1.00 cores) | 5.67 M msg/s (1.00 cores) | 1.01× (1.00–1.02) | 22.75× (21.52–22.93) | 1.12× (1.09–1.12) |
+| echo, 64 B messages, 256 connections, one in flight each | 309 K msg/s (1.00 cores) | 323 K msg/s (1.00 cores) | 145 K msg/s (1.00 cores) | 232 K msg/s (1.00 cores) | 0.94× (0.94–0.97) | 2.11× (2.09–2.15) | 1.33× (1.27–1.34) |
+| room fan-out: 1 sender to 100 receivers, 64 B | 5.91 M msg/s (1.00 cores) | 5.99 M msg/s (1.00 cores) | 300 K msg/s (1.00 cores) | 5.23 M msg/s (1.00 cores) | 0.99× (0.98–0.99) | 19.70× (19.61–21.72) | 1.13× (1.13–1.17) |
+| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.05 M msg/s (1.00 cores) | 6.16 M msg/s (1.00 cores) | 286 K msg/s (1.00 cores) | 5.57 M msg/s (1.00 cores) | 0.99× (0.97–1.00) | 21.17× (20.51–21.58) | 1.09× (1.07–1.10) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others. The same logic in each: an echo, and a room that a receiver enters by sending "join", with one sender's messages counted at every receiver. socketley runs it in Lua (join_group/group_send) and, as "no script", on its built-in relay; ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes.
 
@@ -134,8 +134,8 @@ socketley, no script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-09, soc
 
 | case | socketley | socketley, no script | Node 24.22.1 net | Go 1.24.6 net | socketley vs socketley, no script | socketley vs Node 24.22.1 net | socketley vs Go 1.24.6 net |
 |---|---|---|---|---|---|---|---|
-| line echo, 64 B, 256 connections, one in flight each | 312 K msg/s (1.00 cores) | 327 K msg/s (1.00 cores) | 197 K msg/s (1.00 cores) | 226 K msg/s (1.00 cores) | 0.95× (0.94–0.96) | 1.59× (1.53–1.61) | 1.37× (1.36–1.40) |
-| line echo, 64 B, 64 connections, 16 pipelined each | 3.10 M msg/s (1.00 cores) | 4.57 M msg/s (1.00 cores) | 2.33 M msg/s (1.00 cores) | 3.23 M msg/s (1.00 cores) | 0.68× (0.67–0.68) | 1.33× (1.32–1.34) | 0.96× (0.95–0.97) |
+| line echo, 64 B, 256 connections, one in flight each | 308 K msg/s (1.00 cores) | 322 K msg/s (1.00 cores) | 196 K msg/s (1.00 cores) | 225 K msg/s (1.00 cores) | 0.95× (0.94–0.96) | 1.57× (1.54–1.58) | 1.37× (1.36–1.39) |
+| line echo, 64 B, 64 connections, 16 pipelined each | 3.12 M msg/s (1.00 cores) | 4.54 M msg/s (1.00 cores) | 2.31 M msg/s (1.00 cores) | 3.29 M msg/s (1.00 cores) | 0.68× (0.67–0.69) | 1.35× (1.34–1.35) | 0.95× (0.94–0.95) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen on 20 others. Every line is handed to a handler that answers with the line: Lua on socketley, a function on Node's net, a goroutine with bufio in Go. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work.
 
@@ -145,34 +145,34 @@ Node 24.22.1 dgram, Go 1.24.6 net, socketley, Lua, 3 passes, 2026-11-09, socketl
 
 | case | socketley, no script | Node 24.22.1 dgram | Go 1.24.6 net | socketley, Lua | socketley vs Node 24.22.1 dgram | socketley vs Go 1.24.6 net | socketley vs socketley, Lua |
 |---|---|---|---|---|---|---|---|
-| datagram echo, 64 B, 128 sockets, one in flight each | 513 K datagrams/s (1.00 cores) | 158 K datagrams/s (1.00 cores) | 438 K datagrams/s (1.00 cores) | 451 K datagrams/s (1.00 cores) | 3.24× (3.18–3.31) | 1.17× (1.16–1.17) | 1.14× (1.12–1.14) |
-| datagram echo, 1 KiB, 128 sockets, one in flight each | 494 K datagrams/s (1.00 cores) | 181 K datagrams/s (1.00 cores) | 417 K datagrams/s (1.00 cores) | 403 K datagrams/s (1.00 cores) | 2.71× (2.70–2.78) | 1.19× (1.16–1.21) | 1.22× (1.22–1.24) |
+| datagram echo, 64 B, 128 sockets, one in flight each | 519 K datagrams/s (1.00 cores) | 161 K datagrams/s (1.00 cores) | 433 K datagrams/s (1.00 cores) | 450 K datagrams/s (1.00 cores) | 3.21× (3.14–3.23) | 1.20× (1.19–1.20) | 1.17× (1.13–1.17) |
+| datagram echo, 1 KiB, 128 sockets, one in flight each | 495 K datagrams/s (1.00 cores) | 182 K datagrams/s (1.00 cores) | 409 K datagrams/s (1.00 cores) | 399 K datagrams/s (1.00 cores) | 2.73× (2.65–2.74) | 1.21× (1.21–1.21) | 1.24× (1.23–1.25) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen (128 sockets) on 20 others. Node and Go are given the 1 MiB receive buffer socketley sets; at the kernel's default they lost datagrams at 1 KiB. No arm lost any.
 
 ### HTTP: static files and a fixed answer
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 943691a0.
+nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 277 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 5.55× (5.46–5.68) |
-| 64 KiB file, keep-alive, 256 connections | 94 K req/s (0.99 cores) | 45 K req/s (0.99 cores) | 2.07× (2.06–2.20) |
-| 1 KiB file, a connection per request, 64 at once | 81 K req/s (0.99 cores) | 34 K req/s (1.00 cores) | 2.40× (2.35–2.60) |
-| fixed answer (Lua handler / nginx return), keep-alive | 252 K req/s (1.00 cores) | 72 K req/s (0.99 cores) | 3.48× (3.15–3.62) |
+| 1 KiB file, keep-alive, 256 connections | 285 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 5.65× (5.53–5.71) |
+| 64 KiB file, keep-alive, 256 connections | 97 K req/s (0.99 cores) | 46 K req/s (1.00 cores) | 2.09× (1.96–2.19) |
+| 1 KiB file, a connection per request, 64 at once | 81 K req/s (0.99 cores) | 35 K req/s (1.00 cores) | 2.30× (2.25–2.31) |
+| fixed answer (Lua handler / nginx return), keep-alive | 241 K req/s (0.99 cores) | 68 K req/s (0.99 cores) | 3.43× (3.12–3.54) |
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ### HTTP on four cores
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 943691a0.
+nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 518 K req/s (3.99 cores) | 232 K req/s (3.99 cores) | 2.23× (2.22–2.23) |
-| 64 KiB file, keep-alive, 256 connections | 236 K req/s (3.99 cores) | 169 K req/s (3.99 cores) | 1.40× (1.37–1.41) |
-| 1 KiB file, a connection per request, 64 at once | 160 K req/s (3.94 cores) | 133 K req/s (3.89 cores) | 1.20× (1.19–1.21) |
-| fixed answer (Lua handler / nginx return), keep-alive | 447 K req/s (3.99 cores) | 312 K req/s (3.99 cores) | 1.44× (1.43–1.45) |
+| 1 KiB file, keep-alive, 256 connections | 517 K req/s (3.99 cores) | 233 K req/s (3.99 cores) | 2.22× (2.15–2.28) |
+| 64 KiB file, keep-alive, 256 connections | 233 K req/s (3.99 cores) | 169 K req/s (3.99 cores) | 1.39× (1.36–1.41) |
+| 1 KiB file, a connection per request, 64 at once | 158 K req/s (3.94 cores) | 132 K req/s (3.89 cores) | 1.20× (1.19–1.20) |
+| fixed answer (Lua handler / nginx return), keep-alive | 448 K req/s (3.99 cores) | 307 K req/s (3.99 cores) | 1.46× (1.45–1.48) |
 
 How it was measured: wrk 16 threads, 4 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 

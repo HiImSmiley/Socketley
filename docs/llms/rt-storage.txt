@@ -124,16 +124,16 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### S3 over HTTP, SigV4
 
-MinIO 2025-09-07, 3 passes, 2026-11-08, socketley bce3e552.
+MinIO 2025-09-07, 3 passes, 2026-11-09, socketley 85aa3476.
 
 | case | socketley | MinIO | socketley vs MinIO |
 |---|---|---|---|
-| GET 4 KiB, 1 connection | 21 K obj/s (0.62 cores) | 3.9 K obj/s (1.27 cores) | 5.36× (5.32–5.42) |
-| GET 4 KiB, 64 connections | 447 K obj/s (3.77 cores) | 24 K obj/s (3.99 cores) | 18.39× (18.34–18.45) |
-| GET 4 KiB, 128 connections | 541 K obj/s (3.92 cores) | 24 K obj/s (3.98 cores) | 22.68× (22.29–22.90) |
-| GET 4 KiB, 64 connections, from 50,000 objects | 254 K obj/s (3.96 cores) | 24 K obj/s (3.98 cores) | 10.55× (9.85–10.73) |
-| GET 1 MiB, 64 connections | 39 K obj/s (3.95 cores) | 6.0 K obj/s (3.96 cores) | 6.56× (6.51–6.61) |
-| PUT 4 KiB, 64 connections, into an empty store | 80 K obj/s (3.76 cores) | 15 K obj/s (3.98 cores) | 5.15× (5.12–5.26) |
+| GET 4 KiB, 1 connection | 21 K obj/s (0.63 cores) | 3.9 K obj/s (1.27 cores) | 5.37× (5.33–5.44) |
+| GET 4 KiB, 64 connections | 452 K obj/s (3.78 cores) | 24 K obj/s (3.98 cores) | 18.84× (18.14–19.04) |
+| GET 4 KiB, 128 connections | 553 K obj/s (3.92 cores) | 23 K obj/s (3.98 cores) | 23.47× (21.85–24.16) |
+| GET 4 KiB, 64 connections, from 50,000 objects | 237 K obj/s (3.95 cores) | 24 K obj/s (3.99 cores) | 10.05× (9.72–10.15) |
+| GET 1 MiB, 64 connections | 40 K obj/s (3.94 cores) | 5.9 K obj/s (3.95 cores) | 6.76× (6.73–6.77) |
+| PUT 4 KiB, 64 connections, into an empty store | 79 K obj/s (3.77 cores) | 15 K obj/s (3.98 cores) | 5.17× (5.07–5.24) |
 
 How it was measured: s3gen (Go, one process, a request in flight per connection), 4s a run, SigV4 over plain HTTP, PUT bodies aws-chunked and signed; both servers on the same four cores (socketley as four shards), s3gen on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. s3gen signs every request with SigV4 as warp does (PUTs as signed aws-chunked bodies) and checks every answer's status, length and ETag; from 64 connections both servers fill their four cores. The 4 KiB rows read 2,500 objects, which socketley keeps as in-memory copies; the 50,000-object row reads past them, where every GET opens its file as MinIO's always do. The PUT row starts both servers afresh on empty storage for every pass, because MinIO reclaims deleted objects in the background and its puts slow while it does.
 

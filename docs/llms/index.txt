@@ -38,20 +38,20 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
 
-- cache: 3.9× against Redis (GET)
+- cache: 4.1× against Redis (GET)
 - server: 5.6× against nginx (1 KiB file, keep-alive, 256 connections)
-- proxy: 2.0× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
+- proxy: 1.9× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
 - web: 4.9× against nginx (page 4 KiB, keep-alive, 256 connections)
 - dns: 1.2× against NSD (A queries over UDP)
-- mqtt: 21.0× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
-- storage: 18.4× against MinIO (GET 4 KiB, 64 connections)
-- db: 2.5× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
-- tunnel: 2.3× against frp (throughput, 512 MiB echoed through the tunnel)
+- mqtt: 21.1× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
+- storage: 18.8× against MinIO (GET 4 KiB, 64 connections)
+- db: 2.6× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
+- tunnel: 2.2× against frp (throughput, 512 MiB echoed through the tunnel)
 - metrics: 2.6× against Prometheus (CPU per sample ingested)
 - sync: 2.1× against rclone (first copy, 2000 files of 64 KiB and 50 of 1 MiB)
-- idp: 23.5× against Keycloak (refresh token, 256 clients)
-- mail: 4.3× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
-- mcp: 26.0× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
+- idp: 25.0× against Keycloak (refresh token, 256 clients)
+- mail: 4.1× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
+- mcp: 30.3× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
 - client: 1.1× against Go (request-answer: 1 connection, 64 B each way)
 
 ## Where to go next
