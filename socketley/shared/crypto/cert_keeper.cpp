@@ -321,6 +321,10 @@ bool reserved_name(std::string_view name)
 bool prepare_acme(const std::vector<std::string>& in, std::string_view email, std::string_view cert_path,
                   std::string_view key_path, bool on_443, std::string& err, const std::vector<std::string>& dns_zones)
 {
+    // No names is no certificate to keep, and reading one would initialise OpenSSL in every runtime that has no TLS.
+    if (in.empty())
+        return true;
+
     // Asked of a public CA, a reserved name only sends a request out of a test or a lab that comes back refused.
     std::vector<std::string> domains;
     for (const std::string& d : in)
@@ -336,7 +340,7 @@ bool prepare_acme(const std::vector<std::string>& in, std::string_view email, st
         int64_t left = 0;
         bool self_signed = false;
         const bool keep = cert_left(std::string(cert_path), left, self_signed) && (!self_signed || left > 30 * 86400);
-        if (!in.empty() && !keep && !write_self_signed(in, 365, cert_path, key_path))
+        if (!keep && !write_self_signed(in, 365, cert_path, key_path))
         {
             err = "acme: a self-signed certificate could not be written to " + std::string(cert_path);
             return false;
