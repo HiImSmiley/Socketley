@@ -37,12 +37,25 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "lua_context.h"
 #include "../loop/coarse_clock.h"
+
+// One argument onto a thread about to be resumed.  A string goes through the
+// API function itself, in parentheses so sol's 5.3 compatibility macro does not
+// expand: the macro follows the push with a lua_tolstring nobody reads.
+template <class T>
+inline void lua_suspend_push(lua_State* th, T&& v)
+{
+    if constexpr (std::is_same_v<std::remove_cvref_t<T>, std::string_view>)
+        (lua_pushlstring)(th, v.data(), v.size());
+    else
+        sol::stack::push(th, std::forward<T>(v));
+}
 
 // One runtime's suspended callbacks.  Lives beside the Lua state because a
 // thread belongs to the state that made it, and dies with it.
@@ -97,49 +110,42 @@ public:
     // The whole hot path is here: take a thread off the pool, push a frame,
     // resume.  Nothing is allocated and nothing is hashed unless the handler
     // actually stops.
-    template <class... A>
+    //
+    // `Answer` asks for returned_true() to be read afterwards, three API calls
+    // that only the callers asking it pay for.
+    template <bool Answer = false, class... A>
     outcome start(sol::protected_function& fn, const char* what,
                   uint32_t exec_ms, id_t& out_id, A&&... args)
     {
+        // A result handler, no state or callback, or an empty pool go the general way.
+        if (SOCKETLEY_UNLIKELY(static_cast<bool>(m_next_result) || !m_lua || !fn.valid() || m_pool.empty()))
+            return start_general(Answer, fn, what, exec_ms, out_id, std::forward<A>(args)...);
+
         out_id = 0;
-
-        // Taken before anything can return, so a handler set for this call is
-        // never left over for the next one.
-        result_fn mine = std::move(m_next_result);
-        m_next_result  = nullptr;
-
-        if (!m_lua || !fn.valid())
-        {
-            if (mine)
-                mine(nullptr, 0, "the callback is not defined");
-            return outcome::failed;
-        }
-
-        const auto [th, ref] = acquire();
-        if (SOCKETLEY_UNLIKELY(!th))
-        {
-            if (mine)
-                mine(nullptr, 0, "no coroutine could be made for the callback");
-            return outcome::failed;
-        }
-        if (SOCKETLEY_UNLIKELY(static_cast<bool>(mine)))
-            m_results[th] = std::move(mine);
-
-        // Built in place, because a temporary written field by field and then
-        // copied in 16-byte halves stalled on store forwarding.
+        // Field by field: release() stored them as two words, and one 16-byte load of the pair waited out the store
+        // buffer on every call.
+        lua_State* const th  = m_pool.back().th;
+        const int        ref = m_pool.back().ref;
+        m_pool.pop_back();
         m_frames.emplace_back(th, ref, what, exec_ms, id_t{0});
-
-        // The registry by hand rather than fn.push(th).  sol's push compares
-        // the target state with the reference's own, and a coroutine is a
-        // different lua_State, so it takes the slow arm: push there, then
-        // lua_xmove across.  A thread shares its parent's registry, so one
-        // rawgeti on the thread is the same value with neither step -- measured
-        // at 1.95 per cent of the worker in lua_xmove alone.
-        lua_rawgeti(th, LUA_REGISTRYINDEX, fn.registry_index());
-        (sol::stack::push(th, std::forward<A>(args)), ...);
-
+        // In parentheses for the reason lua_suspend_push gives, here a lua_type.
+        (lua_rawgeti)(th, LUA_REGISTRYINDEX, fn.registry_index());
+        (lua_suspend_push(th, std::forward<A>(args)), ...);
         ++m_stat_started;
-        return run(static_cast<int>(sizeof...(A)), out_id);
+
+        const int rc = resume_top(th, what, exec_ms, static_cast<int>(sizeof...(A)));
+
+        // Ran to the end, waited for nothing and was not let go under the resume: finish() without the calls it
+        // makes for the cases that did not happen.
+        if (SOCKETLEY_LIKELY(rc == 0 && !m_frames.empty() && m_frames.back().id == 0 && m_results.empty()))
+        {
+            m_frames.pop_back();
+            m_returned_true = Answer && lua_gettop(th) >= 1 && lua_type(th, 1) == LUA_TBOOLEAN
+                              && lua_toboolean(th, 1);
+            release(th, ref, true);
+            return outcome::finished;
+        }
+        return finish(rc, out_id, Answer);
     }
 
     // ─── What an awaiting binding needs ─────────────────────────────────────
@@ -246,7 +252,7 @@ public:
     using result_fn = std::function<void(lua_State* results, int count, const char* error)>;
     void set_next_result(result_fn fn) { m_next_result = std::move(fn); }
 
-    // Whether the last start() that finished returned the boolean true first, for a caller that only asks that.
+    // Whether the last start<true>() that finished returned the boolean true first, for a caller that only asks that.
     bool returned_true() const { return m_returned_true; }
 
     // Every await ends in exactly one settle, including the ones whose answer
@@ -337,6 +343,52 @@ public:
     }
 
 private:
+    // start() for the cases its fast path leaves out, which also hands a result handler its thread.
+    template <class... A>
+    outcome start_general(bool answer, sol::protected_function& fn, const char* what,
+                          uint32_t exec_ms, id_t& out_id, A&&... args)
+    {
+        out_id = 0;
+
+        // Taken before anything can return, so a handler set for this call is
+        // never left over for the next one.
+        result_fn mine = std::move(m_next_result);
+        m_next_result  = nullptr;
+
+        if (!m_lua || !fn.valid())
+        {
+            if (mine)
+                mine(nullptr, 0, "the callback is not defined");
+            return outcome::failed;
+        }
+
+        const auto [th, ref] = acquire();
+        if (SOCKETLEY_UNLIKELY(!th))
+        {
+            if (mine)
+                mine(nullptr, 0, "no coroutine could be made for the callback");
+            return outcome::failed;
+        }
+        if (SOCKETLEY_UNLIKELY(static_cast<bool>(mine)))
+            m_results[th] = std::move(mine);
+
+        // Built in place, because a temporary written field by field and then
+        // copied in 16-byte halves stalled on store forwarding.
+        m_frames.emplace_back(th, ref, what, exec_ms, id_t{0});
+
+        // The registry by hand rather than fn.push(th).  sol's push compares
+        // the target state with the reference's own, and a coroutine is a
+        // different lua_State, so it takes the slow arm: push there, then
+        // lua_xmove across.  A thread shares its parent's registry, so one
+        // rawgeti on the thread is the same value with neither step -- measured
+        // at 1.95 per cent of the worker in lua_xmove alone.
+        (lua_rawgeti)(th, LUA_REGISTRYINDEX, fn.registry_index());
+        (lua_suspend_push(th, std::forward<A>(args)), ...);
+
+        ++m_stat_started;
+        return run(static_cast<int>(sizeof...(A)), out_id, answer);
+    }
+
     struct record
     {
         lua_State*  th{nullptr};
@@ -382,13 +434,15 @@ private:
     {
         if (SOCKETLEY_LIKELY(!m_pool.empty()))
         {
-            const pooled p = m_pool.back();
+            // Field by field, for the reason start() gives.
+            lua_State* const th  = m_pool.back().th;
+            const int        ref = m_pool.back().ref;
             m_pool.pop_back();
             // No lua_settop here: release() clears the stack BEFORE pooling,
             // which it has to do anyway so a pooled thread holds nothing alive,
             // and a fresh one from lua_newthread is empty already.  Clearing
             // again on the way out was the same call twice per invocation.
-            return {p.th, p.ref};
+            return {th, ref};
         }
         lua_State* L = m_lua->lua_state();
         lua_State* th = lua_newthread(L);
@@ -436,7 +490,7 @@ private:
 
         m_frames.push_back(frame{r->th, r->ref, r->what, r->exec_ms, id});
         id_t ignored = 0;
-        run(nargs, ignored);
+        run(nargs, ignored, false);
 
         // After the resume, so a handler answering the peer that half-closed
         // still finds the connection its runtime was holding open for it.
@@ -446,25 +500,31 @@ private:
 
     // One resume of whatever frame is on top, and the bookkeeping that follows
     // from what it answered.
-    outcome run(int nargs, id_t& out_id)
+    outcome run(int nargs, id_t& out_id, bool answer)
     {
         // By value, field by field: the resume can push frames of its own and move the vector, and a whole-frame copy
         // loads in halves what start() has just stored in fields.
         lua_State* const  started_th   = m_frames.back().th;
         const char* const started_what = m_frames.back().what;
         const uint32_t    started_ms   = m_frames.back().exec_ms;
+        return finish(resume_top(started_th, started_what, started_ms, nargs), out_id, answer);
+    }
 
-        int rc;
-        {
-            lua_deadline::scope guard(started_what, started_ms,
-                                      m_owner_name.c_str());
-            // Three arguments and not two: sol's 5.1 compatibility layer
-            // defines lua_resume with the 5.4 signature and drops the caller.
-            ++m_resuming;
-            rc = lua_resume(started_th, nullptr, nargs);
-            --m_resuming;
-        }
+    // The resume itself, with the deadline armed around it.
+    int resume_top(lua_State* th, const char* what, uint32_t exec_ms, int nargs)
+    {
+        lua_deadline::scope guard(what, exec_ms, m_owner_name.c_str());
+        // Three arguments and not two: sol's 5.1 compatibility layer
+        // defines lua_resume with the 5.4 signature and drops the caller.
+        ++m_resuming;
+        const int rc = lua_resume(th, nullptr, nargs);
+        --m_resuming;
+        return rc;
+    }
 
+    // What follows from what the resume of the top frame answered.
+    outcome finish(int rc, id_t& out_id, bool answer)
+    {
         // A script that stopped its own runtime ran forget_all() under this
         // resume, which let the frame go with everything else.
         if (SOCKETLEY_UNLIKELY(m_frames.empty()))
@@ -517,8 +577,8 @@ private:
             give_result(done.th, rc, rc == 0 ? nullptr : err.c_str());
 
         // Read here because the stack is cleared below, and asked only as a boolean so no allocation is made for it.
-        m_returned_true = rc == 0 && lua_gettop(done.th) >= 1 && lua_type(done.th, 1) == LUA_TBOOLEAN
-                          && lua_toboolean(done.th, 1);
+        m_returned_true = answer && rc == 0 && lua_gettop(done.th) >= 1
+                          && lua_type(done.th, 1) == LUA_TBOOLEAN && lua_toboolean(done.th, 1);
 
         if (done.id != 0)
             m_live.erase(done.id);

@@ -1084,8 +1084,8 @@ bool runtime_instance::invoke_on_client_message(int client_id, std::string_view 
     // A handler that is still waiting has not answered yet, so what is sent on its own goes ahead as before.
     lua_suspender::id_t id = 0;
     auto& sus = m_lua->suspender();
-    return sus.start(m_lua->raw_on_client_message(), "on_client_message",
-                     m_lua->callback_timeout_ms(), id, client_id, msg) == lua_suspender::outcome::finished
+    return sus.start<true>(m_lua->raw_on_client_message(), "on_client_message",
+                           m_lua->callback_timeout_ms(), id, client_id, msg) == lua_suspender::outcome::finished
            && sus.returned_true();
 #else
     return false;
