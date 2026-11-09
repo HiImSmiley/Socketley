@@ -176,7 +176,10 @@ workspace "Socketley"
         linkoptions {
             "-flto=auto",
             "-Wl,-z,relro,-z,now",
-            "-Wl,--as-needed"
+            "-Wl,--as-needed",
+            -- The C++ runtime linked in, because every CLI call and every worker otherwise loads and relocates it at exec.
+            "-static-libstdc++",
+            "-static-libgcc"
         }
     filter {}
     -- The floor per architecture: x86-64-v2 as above, and armv8-a, which is every 64-bit ARM CPU.
