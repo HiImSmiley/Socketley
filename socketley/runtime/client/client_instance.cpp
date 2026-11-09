@@ -1213,7 +1213,7 @@ bool client_instance::still_reading(const conn_t* conn, uint32_t slot,
 
 bool client_instance::batches_lines() const
 {
-    return m_mode != client_mode_out && wants_on_messages();
+    return m_mode != client_mode_out && (wants_on_read() || wants_on_messages());
 }
 
 size_t client_instance::deliver_chunk(conn_t* conn, const char* data, size_t len, size_t search_from)
@@ -1228,17 +1228,25 @@ size_t client_instance::deliver_chunk(conn_t* conn, const char* data, size_t len
     // on_message, even when the script stops this runtime, and counted in one pass where nothing observes.
     // The lines on_message would have been handed, the blank ones it skips left out, so the count does not depend on
     // which of the two the script defines.
-    uint64_t lines = 0;
+    // For on_read the count comes with an index of the lines, which the view then walks without searching, unless
+    // a view opened further up the stack is still reading the index.
+    const bool view = wants_on_read();
+    const bool indexed = view && !m_viewing;
+    uint64_t lines = indexed ? socketley::index_lines(data, end, m_line_ends) : 0;
     if (SOCKETLEY_UNLIKELY(observes_messages()))
+    {
+        uint64_t seen = 0;
         socketley::for_each_line(data, end, 0, [&](std::string_view line)
         {
-            ++lines;
+            ++seen;
             print_bash_message(line);
             write_received_message(line);
             notify_interactive(line);
             return true;
         });
-    else
+        lines = seen;
+    }
+    else if (!indexed)
         lines = socketley::count_lines(data, end);
     stat_add(m_stat_total_messages, lines);
 
@@ -1247,7 +1255,17 @@ size_t client_instance::deliver_chunk(conn_t* conn, const char* data, size_t len
     const int fd = conn->fd;
     {
         current_scope cs(*this, conn);
-        invoke_on_messages(chunk, id_of(conn));
+        // The view reads the bytes where they lie, which stay put until this returns: a provided buffer goes back
+        // to its group after the read, and partial is only appended to by a read.
+        if (view)
+        {
+            const bool was_viewing = m_viewing;
+            m_viewing = true;
+            invoke_on_read(chunk, indexed ? &m_line_ends : nullptr, id_of(conn));
+            m_viewing = was_viewing;
+        }
+        else
+            invoke_on_messages(chunk, id_of(conn));
     }
     if (still_reading(conn, slot, generation, fd))
         return end;
@@ -1333,7 +1351,7 @@ void client_instance::read_in_place(conn_t* conn, const char* data, size_t len)
     size_t from = 0;
     if (!partial.empty())
     {
-        // Through the last newline for on_messages, so a read is one call however its first line began.
+        // Through the last newline for on_read and on_messages, so a read is one call however its first line began.
         const bool batch = batches_lines();
         const void* nl = batch ? memrchr(data, '\n', len) : std::memchr(data, '\n', len);
         if (!nl)
@@ -1505,8 +1523,10 @@ void client_instance::process_message(std::string_view msg, int id)
         case client_mode_inout:
         case client_mode_in:
         {
-            // A datagram has no read to batch, so on_messages takes it as a chunk of one line.
-            if (SOCKETLEY_UNLIKELY(wants_on_messages()))
+            // A datagram has no read to batch, so on_read and on_messages take it as a chunk of one line.
+            if (SOCKETLEY_UNLIKELY(wants_on_read()))
+                invoke_on_read(one_line_chunk(msg), nullptr, id);
+            else if (SOCKETLEY_UNLIKELY(wants_on_messages()))
                 invoke_on_messages(one_line_chunk(msg), id);
             else
                 invoke_on_message(msg, id);

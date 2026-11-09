@@ -28,6 +28,8 @@
 #include "../loop/event_loop_definitions.h"
 #include "../persist/appending_file.h"
 
+namespace socketley { struct line_ends; }
+
 class event_loop;
 class lua_context;
 class runtime_manager;
@@ -900,6 +902,12 @@ protected:
     // The client's, with its connection id after the chunk as on_message has it.
     void invoke_on_messages(std::string_view chunk, int conn_id);
     bool invoke_on_client_messages(int client_id, std::string_view chunk);
+    // Whether a client's script takes each read as one view in on_read, which wins over both forms above; a C++
+    // handler set for on_message still wins over it.
+    bool wants_on_read() const;
+    // `bytes` is complete lines, each with its '\n', and `ends` where they end when the caller has it; both must
+    // stay where they are until this returns.
+    void invoke_on_read(std::string_view bytes, const socketley::line_ends* ends, int conn_id);
     // One line handed to the batch callback where a runtime has no read to batch, a datagram or a rate-limited line.
     std::string_view one_line_chunk(std::string_view line);
     // The write queue for this connection has drained back under the

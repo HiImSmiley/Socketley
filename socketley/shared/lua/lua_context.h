@@ -173,6 +173,24 @@ namespace lua_diag
     }
 }
 
+namespace socketley { struct line_ends; }
+
+// The bytes of the on_read call that is running, which a view's methods read through the FFI, laid out as the Lua
+// side's socketley_view_state_t declares it.
+struct lua_view_bytes
+{
+    const unsigned char* p;
+    // A double, because a 64-bit integer field reaches Lua as a boxed cdata and not as a number.
+    double               n;
+    // The generation a view must carry to read these bytes, 0 between calls, which no view carries.
+    double               gen;
+    // The offset of every '\n' in the bytes, and how many, or -1 when there is no index and a view searches.
+    const uint32_t*      ends;
+    double               nends;
+    // Where the view's search for the next '\n' expects to find it in `ends`, moved by the view.
+    double               cur;
+};
+
 // Lua context for a runtime - manages state and bindings
 class lua_context
 {
@@ -262,6 +280,8 @@ public:
         // Every complete line of one read as one string, in place of on_message and on_client_message.
         CB_ON_MESSAGES           = 1ull << 35,
         CB_ON_CLIENT_MESSAGES    = 1ull << 36,
+        // A client's read as one view of its bytes, in place of on_messages and on_message.
+        CB_ON_READ               = 1ull << 37,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -277,6 +297,7 @@ public:
     // The batch forms, which win over the per-line ones when a script defines both.
     bool has_on_messages()           const { return m_callback_mask & CB_ON_MESSAGES; }
     bool has_on_client_messages()    const { return m_callback_mask & CB_ON_CLIENT_MESSAGES; }
+    bool has_on_read()               const { return m_callback_mask & CB_ON_READ; }
     // A connection's write queue has come back down under the watermark, so a
     // producer that stopped because self.pending() was high can go on.
     bool has_on_writable()           const { return m_callback_mask & CB_ON_WRITABLE; }
@@ -341,6 +362,10 @@ public:
     sol::protected_function& raw_on_client_message() { return m_on_client_message; }
     sol::protected_function& raw_on_messages()        { return m_on_messages; }
     sol::protected_function& raw_on_client_messages() { return m_on_client_messages; }
+
+    // on_read(view, conn_id) over [p, p + n), the view stale from the moment the call returns or yields, with
+    // `ends` the offset of every '\n' in it when the caller has them, which must stay put until this returns.
+    void call_on_read(const char* p, size_t n, const socketley::line_ends* ends, int conn_id);
     guarded_protected on_writable()   { return {m_on_writable,   "on_writable",   m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_http_body()  { return {m_on_http_body,  "on_http_body",  m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_upstream_writable() { return {m_on_upstream_writable, "on_upstream_writable", m_deadline_ms, m_owner_name.c_str()}; }
@@ -433,6 +458,9 @@ private:
     // open_compiler() has opened the compiler, and never where it stays shut.
     void defer_ffi_calls(std::string_view body, runtime_instance* owner, void* inst, void* psend,
                          void* ppending, void* pwatermark, sol::table& self);
+    // The function call_on_read() runs, which hands the script's on_read a fresh view, or false if it could not
+    // be built.
+    bool install_read_view();
     void register_cache_table(runtime_instance* owner, sol::table& self);
     void register_proxy_table(runtime_instance* owner, sol::table& self);
 
@@ -468,6 +496,15 @@ private:
     sol::protected_function m_on_client_message;
     sol::protected_function m_on_messages;
     sol::protected_function m_on_client_messages;
+    sol::protected_function m_on_read;
+    // What call_on_read() runs: on_read with a view made for the call.
+    sol::protected_function m_on_read_call;
+    lua_view_bytes          m_view{};
+    double                  m_view_gen = 0;
+    // The table the plain view reads its generation from, where the compiler stays shut.
+    int                     m_view_live_ref = LUA_NOREF;
+    // Whether open_compiler() opened the trace compiler, which decides how a view is made.
+    bool                    m_compiler_open = false;
     sol::protected_function m_on_writable;
     sol::protected_function m_on_http_body;
     sol::protected_function m_on_upstream_writable;
@@ -641,6 +678,7 @@ public:
     bool has_on_client_message() const { return false; }
     bool has_on_messages()       const { return false; }
     bool has_on_client_messages() const { return false; }
+    bool has_on_read()           const { return false; }
     bool has_on_writable()       const { return false; }
     bool has_on_http_body()      const { return false; }
     bool has_on_upstream_writable() const { return false; }

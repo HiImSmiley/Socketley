@@ -1099,6 +1099,11 @@ bool runtime_instance::wants_on_messages() const
     return !m_cb_on_message && m_lua && m_lua->has_on_messages();
 }
 
+bool runtime_instance::wants_on_read() const
+{
+    return !m_cb_on_message && m_lua && m_lua->has_on_read();
+}
+
 bool runtime_instance::wants_on_client_messages() const
 {
     return !m_cb_on_client_message && m_lua && m_lua->has_on_client_messages();
@@ -1126,6 +1131,14 @@ void runtime_instance::invoke_on_messages([[maybe_unused]] std::string_view chun
     lua_suspender::id_t id = 0;
     m_lua->suspender().start(m_lua->raw_on_messages(), "on_messages", m_lua->callback_timeout_ms(), id, chunk,
                              conn_id);
+#endif
+}
+
+void runtime_instance::invoke_on_read([[maybe_unused]] std::string_view bytes,
+                                      [[maybe_unused]] const socketley::line_ends* ends, [[maybe_unused]] int conn_id)
+{
+#ifndef SOCKETLEY_NO_LUA
+    m_lua->call_on_read(bytes.data(), bytes.size(), ends, conn_id);
 #endif
 }
 

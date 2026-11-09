@@ -18,8 +18,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -457,4 +460,102 @@ TEST_CASE("cache wrapper store operations work without the network")
     // execute() speaks the same text protocol the port would, newline and all.
     CHECK(c.execute("set exec_k exec_v") == "ok\n");
     CHECK(c.get("exec_k") == "exec_v");
+}
+
+// on_read where the trace compiler stays shut, which is an embedding with a
+// callback deadline: no daemon watches this thread, so the view there is the
+// plain one over a string of the read, and it has to answer exactly what the
+// FFI view and the string functions answer.
+TEST_CASE("a client's on_read view answers as the string functions where the compiler stays shut")
+{
+    constexpr uint16_t port = 25898;
+    const std::string script = "/tmp/sdk_runtime_onread_" + std::to_string(getpid()) + ".lua";
+    {
+        FILE* f = std::fopen(script.c_str(), "w");
+        REQUIRE(f != nullptr);
+        std::fputs(R"lua(
+local function compare(v, s)
+    local n, bad, first = #s, 0, nil
+    local function diff(what, a, b)
+        if a ~= b then bad = bad + 1; first = first or (what .. " view=" .. tostring(a) .. " string=" .. tostring(b)) end
+    end
+    diff("len", v:len(), n)
+    diff("byte()", v:byte(), s:byte())
+    for i = -n - 3, n + 3 do
+        diff("byte(" .. i .. ")", v:byte(i), s:byte(i))
+        diff("sub(" .. i .. ")", v:sub(i), s:sub(i))
+        for j = -n - 3, n + 3 do
+            local want = s:sub(i, j)
+            diff("sub(" .. i .. "," .. j .. ")", v:sub(i, j), want)
+            diff("eq(" .. i .. "," .. j .. ")", v:eq(i, j, want), true)
+            diff("eq+(" .. i .. "," .. j .. ")", v:eq(i, j, want .. "x"), false)
+        end
+    end
+    for _, nd in ipairs({ "\n", "o", "lo", "", "zz", s, s .. "x" }) do
+        for _, init in ipairs({ -n - 3, -1, 0, 1, 2, 2.5, -1.5, n, n + 1, n + 3 }) do
+            local a1, a2 = v:find(nd, init)
+            local b1, b2 = s:find(nd, init, true)
+            diff("find", tostring(a1) .. "," .. tostring(a2), tostring(b1) .. "," .. tostring(b2))
+        end
+    end
+    local got = {}
+    for i, j in v:lines() do got[#got + 1] = v:sub(i, j) end
+    diff("lines", table.concat(got, "|"), "hello world|one|END")
+    return bad .. (first and (" " .. first) or "")
+end
+
+local kept
+function on_read(v)
+    self.send("JIT " .. type(jit))
+    self.send("CMP " .. compare(v, v:sub(1, -1)))
+    self.send("SEAL mt=" .. type(getmetatable(v)) .. " tostring=" .. tostring(v)
+              .. " write=" .. tostring((pcall(function() v.x = 1 end)))
+              .. " notaview=" .. tostring((select(2, pcall(v.len, {})) or ""):match("not on a view") ~= nil))
+    kept = v
+    socketley.set_timeout(20, function()
+        local ok, err = pcall(function() return kept:find("o") end)
+        self.send("STALE " .. tostring(ok) .. " "
+                  .. tostring(tostring(err):find("a view is valid only inside the on_read call", 1, true) ~= nil))
+    end)
+end
+)lua", f);
+        std::fclose(f);
+    }
+
+    socketley::server srv(port);
+    std::mutex mu;
+    std::vector<std::string> heard;
+    srv.mode(mode_in)
+       .on_connect([&](int fd) { srv.send(fd, "hello world\none\r\n\nEND\n"); })
+       .on_message([&](int, std::string_view msg) {
+           std::lock_guard<std::mutex> lk(mu);
+           heard.emplace_back(msg);
+       });
+    std::thread ts([&] { srv.start(); });
+    loop_guard<socketley::server> guard_s{srv, ts};
+    int probe = dial_tcp(port);
+    REQUIRE(probe >= 0);
+    ::close(probe);
+
+    socketley::client cli("127.0.0.1", port);
+    cli.lua(script);
+    std::thread tc([&] { cli.start(); });
+    loop_guard<socketley::client> guard_c{cli, tc};
+
+    const auto count = [&] { std::lock_guard<std::mutex> lk(mu); return heard.size(); };
+    for (int i = 0; i < 200 && count() < 4; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+    cli.stop();
+    tc.join();
+    srv.stop();
+    ts.join();
+    ::unlink(script.c_str());
+
+    std::lock_guard<std::mutex> lk(mu);
+    REQUIRE(heard.size() == 4);
+    CHECK(heard[0] == "JIT nil");
+    CHECK(heard[1] == "CMP 0");
+    CHECK(heard[2] == "SEAL mt=string tostring=view write=false notaview=true");
+    CHECK(heard[3] == "STALE false true");
 }

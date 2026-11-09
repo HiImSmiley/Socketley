@@ -5675,6 +5675,7 @@ The script's callbacks are handed that id after their usual arguments:
 .BR "on_connect(fd, id)" ,
 .BR "on_message(msg, id)" ,
 .BR "on_messages(chunk, id)" ,
+.BR "on_read(view, id)" ,
 .BR "on_writable(id)" ,
 .B on_disconnect(fd, id)
 and
@@ -19902,6 +19903,93 @@ function on_messages(chunk)
         local j = string.find(chunk, "\\n", i, true)
         if not j then break end
         n = n + 1      -- the line is chunk:sub(i, j \- 1)
+        i = j + 1
+    end
+end
+.fi
+.TP
+.B on_read(view, id)
+A client's read without a string made of it: the same bytes on_messages would be handed, every complete line of
+one TCP, unix\-socket or TLS read up to and including its last newline, as one
+.B view
+of the buffer they arrived in, with the connection's id after it (see
+.BR \-\-connections ).
+When a script defines on_read, on_messages and on_message are not called; on_messages wins over on_message
+in the same way.
+Where there is no read to batch, as for a datagram
+.RB ( \-\-udp ),
+the view is one message with its \(aq\\n\(aq added, as on_messages has it.
+.BR \-w ,
+bash output, an interactive attach and
+.B total_messages
+see each line exactly as with on_message.
+.IP
+A view is valid only inside the call it was given to, until on_read returns or waits for an answer, as
+.B self.cache
+does:
+the buffer is the next read's after that, so a method called on a view kept past it raises
+.IR "a view is valid only inside the on_read call it was given to; copy what you keep with view:sub" .
+Indexes count from 1 and are inclusive, negative ones from the end, as for a string, and no method reads outside
+the view.
+.RS
+.TP
+.B view:len()
+The number of bytes.
+.TP
+.B view:byte(i)
+The byte at
+.IR i ,
+as string.byte, and nil outside the view.
+.TP
+.B view:find(s [, init])
+Where
+.I s
+first occurs from
+.IR init ,
+as start and end, as string.find with plain set; nil if it does not.
+Patterns are not supported.
+.TP
+.B view:sub(i [, j])
+Bytes
+.I i
+to
+.I j
+as a new string, as string.sub: the only method that copies, and how a script keeps any of a view.
+.TP
+.B view:eq(i, j, s)
+Whether bytes
+.I i
+to
+.I j
+are the string
+.IR s ,
+which is view:sub(i, j) == s without the copy.
+.TP
+.B view:lines()
+An iterator over the lines, yielding the start and end of each without its \(aq\\n\(aq, or the \(aq\\r\(aq
+before it: the lines on_message would be handed, so an empty line is skipped.
+.RE
+.IP
+A view's methods are LuaJIT FFI reads, which a compiled loop keeps in its trace, so a script that walks a read
+byte by byte or line by line makes no string for a line it does not keep, and v:find(\(dq\\n\(dq, i) steps from
+line to line on the newlines the read was already searched for.
+Where the trace compiler stays shut, in a runtime embedded through the SDK with a callback deadline, the view is a
+string of the read underneath: the same methods and rules, slower than on_messages there.
+Counting lines and answering a line END:
+.IP
+.nf
+local n = 0
+function on_read(v)
+    local i = 1
+    while true do
+        local j = v:find("\\n", i)
+        if not j then break end
+        if v:eq(i, j \- 1, "END") then
+            self.send("done " .. n)
+            n = 0
+        else
+            n = n + 1
+        end
         i = j + 1
     end
 end

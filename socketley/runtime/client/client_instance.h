@@ -10,6 +10,7 @@
 
 #include "../../shared/runtime/runtime_instance.h"
 #include "../../shared/loop/write_queue.h"
+#include "../../shared/loop/line_framing.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/crypto/tls_context.h"
 #include "../../shared/net/direct_send.h"
@@ -216,9 +217,9 @@ private:
     // Every complete line to process_message until a callback loses the
     // socket, which returns socketley::line_framing_stopped.
     size_t deliver_lines(conn_t* conn, const char* data, size_t len, size_t search_from);
-    // Whether a read's lines go to on_messages as one string rather than one by one.
+    // Whether a read's lines go to on_read or on_messages in one call rather than one by one.
     bool batches_lines() const;
-    // deliver_lines() for on_messages: everything up to the last newline in one call.
+    // deliver_lines() for on_read and on_messages: everything up to the last newline in one call.
     size_t deliver_chunk(conn_t* conn, const char* data, size_t len, size_t search_from);
     bool still_reading(const conn_t* conn, uint32_t slot, uint32_t generation, int fd) const;
     // Returns whether the reconnect clock is actually armed, since a caller
@@ -313,6 +314,10 @@ private:
     // struct to drop its completion.
     std::vector<std::unique_ptr<conn_t>> m_slots;
     std::vector<std::unique_ptr<conn_t>> m_conn_spent;
+    // Where each line of the read on_read is looking at ends, kept for its capacity.
+    socketley::line_ends m_line_ends;
+    // True while on_read runs, so a delivery under it leaves m_line_ends alone.
+    bool m_viewing = false;
     // Slots with `connected` up, kept so the count is never a walk.
     size_t m_up{0};
     size_t m_gave_up{0};

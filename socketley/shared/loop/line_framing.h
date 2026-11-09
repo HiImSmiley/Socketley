@@ -2,8 +2,14 @@
 // Newline framing over bytes wherever they lie, so a line can be handed on
 // from the buffer it arrived in rather than from a copy of it.
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <string_view>
+#include <algorithm>
+#include <memory>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 namespace socketley
 {
@@ -115,6 +121,89 @@ inline size_t count_lines(const char* data, size_t len)
         n += data[i] == '\n'
              && !(i == 0 || data[i - 1] == '\n' || (data[i - 1] == '\r' && (i == 1 || data[i - 2] == '\n')));
     return n;
+}
+
+// The offset of the first `c` in [p, p + n), or n, sixteen bytes a step where
+// SSE2 is there, because a memchr call costs more than the search across one
+// short line.
+inline size_t find_byte(const unsigned char* p, size_t n, unsigned char c)
+{
+    size_t i = 0;
+#if defined(__SSE2__)
+    const __m128i want = _mm_set1_epi8(static_cast<char>(c));
+    for (; n - i >= 16; i += 16)
+    {
+        const int hit = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i)), want));
+        if (hit)
+            return i + static_cast<size_t>(__builtin_ctz(static_cast<unsigned>(hit)));
+    }
+#endif
+    for (; i < n; ++i)
+        if (p[i] == c)
+            return i;
+    return n;
+}
+
+// Where each line of some bytes ends, kept between reads for its storage.
+struct line_ends
+{
+    std::unique_ptr<uint32_t[]> at;
+    size_t                      size = 0;
+    size_t                      cap  = 0;
+
+    // Room for `more` past size, so a writer checks once a block and not once an entry.
+    void reserve_more(size_t more)
+    {
+        if (cap - size >= more)
+            return;
+        const size_t grown = std::max(cap * 2, size + more + 1024);
+        std::unique_ptr<uint32_t[]> next(new uint32_t[grown]);
+        if (size)
+            std::memcpy(next.get(), at.get(), size * sizeof(uint32_t));
+        at  = std::move(next);
+        cap = grown;
+    }
+};
+
+// The offset of every '\n' in [data, data + len) into `ends`, and how many of
+// the lines they end for_each_line would deliver, for a reader that walks the
+// lines again without searching for them.
+inline size_t index_lines(const char* data, size_t len, line_ends& ends)
+{
+    ends.size = 0;
+    size_t lines = 0;
+    size_t start = 0;
+    // A line is empty when it ends where it starts, or one past it on a '\r'.
+    const auto add = [&](size_t end) {
+        ends.at[ends.size++] = static_cast<uint32_t>(end);
+        lines += end != start && !(end == start + 1 && data[start] == '\r');
+        start = end + 1;
+    };
+    size_t i = 0;
+#if defined(__SSE2__)
+    const __m128i nl = _mm_set1_epi8('\n');
+    for (; len - i >= 16; i += 16)
+    {
+        unsigned hit = static_cast<unsigned>(
+            _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i)), nl)));
+        if (!hit)
+            continue;
+        ends.reserve_more(16);
+        do
+        {
+            add(i + static_cast<size_t>(__builtin_ctz(hit)));
+            hit &= hit - 1;
+        } while (hit);
+    }
+#endif
+    for (; i < len; ++i)
+    {
+        if (data[i] != '\n')
+            continue;
+        ends.reserve_more(1);
+        add(i);
+    }
+    return lines;
 }
 
 } // namespace socketley

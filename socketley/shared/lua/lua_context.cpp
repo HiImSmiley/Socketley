@@ -5,6 +5,7 @@
 #include "../http/http_framing.h"
 #include "lua_json.h"
 #include "../loop/coarse_clock.h"
+#include "../loop/line_framing.h"
 #include "../loop/turn_clock.h"
 #include "../ipc/deadline_slot.h"
 #include "lua_suspend.h"
@@ -499,6 +500,15 @@ void lua_context::open_compiler()
     lua_State* L  = m_lua.lua_state();
     const int  top = lua_gettop(L);
     luaopen_jit(L);
+    m_compiler_open = true;
+    // luaopen_jit offers jit.util to require, and its tracek hands out the constants of a compiled trace -- among
+    // them the FFI pointers behind self.send and a view, which would read any address.
+    lua_getfield(L, LUA_REGISTRYINDEX, "_PRELOAD");
+    if (lua_istable(L, -1))
+    {
+        lua_pushnil(L);
+        lua_setfield(L, -2, "jit.util");
+    }
     lua_settop(L, top);
     if (ffi_install)
         ffi_install();
@@ -830,6 +840,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_client_message = m_lua["on_client_message"];
     m_on_messages        = m_lua["on_messages"];
     m_on_client_messages = m_lua["on_client_messages"];
+    m_on_read            = m_lua["on_read"];
     m_on_writable       = m_lua["on_writable"];
     m_on_http_body      = m_lua["on_http_body"];
     m_on_upstream_writable = m_lua["on_upstream_writable"];
@@ -917,6 +928,18 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_publish.valid())            m_callback_mask |= CB_ON_PUBLISH;
     if (m_on_subscribe.valid())          m_callback_mask |= CB_ON_SUBSCRIBE;
     if (m_on_rcpt.valid())               m_callback_mask |= CB_ON_RCPT;
+    if (m_on_read.valid())
+    {
+        // Refused here rather than on every read, which would report the same call failing once a read.
+        if (m_on_read.get_type() != sol::type::function)
+        {
+            load_diag("`on_read` must be a function");
+            return false;
+        }
+        if (!install_read_view())
+            return false;
+        m_callback_mask |= CB_ON_READ;
+    }
 
     // The filter chain, where a malformed entry refuses the script rather than
     // being skipped, because a quietly dropped filter is a runtime that admits
@@ -3427,6 +3450,32 @@ end, function(id)
 end, watermark
 )lua";
 
+// The ffi module onto the stack, opened once per state, because luaopen_ffi initialises the state's C type table
+// afresh, and kept in the registry and out of package.loaded, where luaopen_ffi puts it, so require("ffi") still
+// finds nothing.
+static void push_hidden_ffi(lua_State* L)
+{
+    const int top = lua_gettop(L);
+    lua_getfield(L, LUA_REGISTRYINDEX, "socketley.ffi");
+    if (!lua_isnil(L, -1))
+        return;
+    lua_pop(L, 1);
+    // The module is the opener's last value, over whatever else it left.
+    luaopen_ffi(L);
+    if (lua_gettop(L) > top + 1)
+        lua_replace(L, top + 1);
+    lua_settop(L, top + 1);
+    lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+    if (lua_istable(L, -1))
+    {
+        lua_pushnil(L);
+        lua_setfield(L, -2, "ffi");
+    }
+    lua_pop(L, 1);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, LUA_REGISTRYINDEX, "socketley.ffi");
+}
+
 // Puts the wrappers over self's send, pending and watermark, each only where
 // the top level left the binding in place, and leaves the bindings be if
 // anything here fails.
@@ -3442,28 +3491,7 @@ static void install_ffi_calls(lua_State* L, std::string_view body, runtime_insta
         lua_settop(L, top);
     };
 
-    // Once per state, because luaopen_ffi initialises the state's C type table
-    // afresh, and kept in the registry and out of package.loaded, where
-    // luaopen_ffi puts it, so require("ffi") still finds nothing.
-    lua_getfield(L, LUA_REGISTRYINDEX, "socketley.ffi");
-    if (lua_isnil(L, -1))
-    {
-        lua_pop(L, 1);
-        // The module is the opener's last value, over whatever else it left.
-        luaopen_ffi(L);
-        if (lua_gettop(L) > top + 1)
-            lua_replace(L, top + 1);
-        lua_settop(L, top + 1);
-        lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
-        if (lua_istable(L, -1))
-        {
-            lua_pushnil(L);
-            lua_setfield(L, -2, "ffi");
-        }
-        lua_pop(L, 1);
-        lua_pushvalue(L, -1);
-        lua_setfield(L, LUA_REGISTRYINDEX, "socketley.ffi");
-    }
+    push_hidden_ffi(L);
 
     std::string chunk(k_ffi_prelude, sizeof(k_ffi_prelude) - 1);
     chunk.append(body);
@@ -3504,6 +3532,396 @@ void lua_context::defer_ffi_calls(std::string_view body, runtime_instance* owner
         install_ffi_calls(m_lua.lua_state(), body, owner, inst, psend, ppending, pwatermark, self, send,
                           pending, watermark);
     };
+}
+
+// ─── on_read's view of a read buffer ─────────────────────────────────────────
+// A string per line is what a firehose of short lines costs in Lua, so on_read
+// is handed a view of the bytes where they lie: methods in Lua over FFI reads,
+// which a compiled loop keeps in its trace.
+//
+// The view holds no pointer, only the generation of the call it was made for;
+// the pointer and the length are read from this context's lua_view_bytes,
+// through an upvalue no script can reach, and are a null pointer and 0 between
+// calls, so every method is bounded by the call that is running.
+extern "C" {
+
+// The 0-based offset of `s` in p[from, n), or -1.
+static double view_find(const unsigned char* p, size_t n, size_t from, const char* s, size_t m) noexcept
+{
+    if (from > n || m > n - from)
+        return -1;
+    if (m == 0)
+        return static_cast<double>(from);
+    if (m == 1)
+    {
+        const size_t at = from + socketley::find_byte(p + from, n - from, static_cast<unsigned char>(s[0]));
+        return at < n ? static_cast<double>(at) : -1;
+    }
+    const void* at = memmem(p + from, n - from, s, m);
+    return at ? static_cast<double>(static_cast<const unsigned char*>(at) - p) : -1;
+}
+
+static int view_eq(const unsigned char* p, const char* s, size_t m) noexcept
+{
+    return std::memcmp(p, s, m) == 0;
+}
+
+}
+
+static_assert(offsetof(lua_view_bytes, p) == 0 && offsetof(lua_view_bytes, n) == 8
+              && offsetof(lua_view_bytes, gen) == 16 && offsetof(lua_view_bytes, ends) == 24
+              && offsetof(lua_view_bytes, nends) == 32 && offsetof(lua_view_bytes, cur) == 40
+              && sizeof(lua_view_bytes) == 48,
+              "lua_view_bytes is read through socketley_view_state_t");
+
+// Index rules are string.sub's, string.byte's and string.find's with plain set,
+// so a script moves between a string and a view without relearning them; lines()
+// yields what on_message would be handed: '\r' before the '\n' cut, empty lines
+// skipped.
+static constexpr char k_read_view[] = R"lua(
+local ffi, pstate, pfind, peq = ...
+if not pcall(ffi.typeof, "socketley_view_t") then
+  ffi.cdef[[
+typedef struct { const uint8_t* p; double n; double gen; const uint32_t* ends; double nends; double cur; } socketley_view_state_t;
+typedef struct { const double gen; } socketley_view_t;
+typedef double (*socketley_view_find_t)(const uint8_t*, size_t, size_t, const char*, size_t);
+typedef int (*socketley_view_eq_t)(const uint8_t*, const char*, size_t);
+]]
+end
+local st = ffi.cast("socketley_view_state_t*", pstate)
+local ffind = ffi.cast("socketley_view_find_t", pfind)
+local feq = ffi.cast("socketley_view_eq_t", peq)
+local view_t = ffi.typeof("socketley_view_t")
+local new, istype, fstring = ffi.new, ffi.istype, ffi.string
+local type, error, floor, ceil = type, error, math.floor, math.ceil
+local STALE = "a view is valid only inside the on_read call it was given to; copy what you keep with view:sub"
+
+local function bytes(v)
+  if not istype(view_t, v) then error("a view method was called on " .. type(v) .. ", not on a view", 3) end
+  if v.gen ~= st.gen then error(STALE, 3) end
+  return st.n
+end
+
+local function int(x, arg, name)
+  if type(x) ~= "number" then
+    error("bad argument #" .. arg .. " to '" .. name .. "' (number expected, got " .. type(x) .. ")", 3)
+  end
+  -- A NaN passes no bound below and would reach the pointer.
+  if x ~= x then error("bad argument #" .. arg .. " to '" .. name .. "' (number has no integer representation)", 3) end
+  if x >= 0 then return floor(x) end
+  return ceil(x)
+end
+
+local function str(x, arg, name)
+  if type(x) ~= "string" then
+    error("bad argument #" .. arg .. " to '" .. name .. "' (string expected, got " .. type(x) .. ")", 3)
+  end
+  return x
+end
+
+-- string.sub's range, clamped into 1..n, empty when i > j.
+local function range(n, i, j, name)
+  i = int(i, 1, name)
+  if j == nil then j = -1 else j = int(j, 2, name) end
+  if i < 0 then i = n + i + 1 end
+  if j < 0 then j = n + j + 1 end
+  if i < 1 then i = 1 end
+  if j > n then j = n end
+  return i, j
+end
+
+-- The first '\n' at or after 0-based `from` from the index, the cursor making a walk from line to line one
+-- comparison a step.
+local function find_nl(from)
+  local ends, cnt, c = st.ends, st.nends, st.cur
+  if c >= cnt or ends[c] < from or (c > 0 and ends[c - 1] >= from) then
+    local lo, hi = 0, cnt
+    while lo < hi do
+      local mid = floor((lo + hi) / 2)
+      if ends[mid] < from then lo = mid + 1 else hi = mid end
+    end
+    c = lo
+    if c >= cnt then return -1 end
+  end
+  st.cur = c + 1
+  return ends[c]
+end
+
+local view = {}
+
+function view.len(v)
+  return bytes(v)
+end
+
+function view.byte(v, i)
+  local n = bytes(v)
+  if i == nil then i = 1 else i = int(i, 1, "byte") end
+  if i < 0 then i = n + i + 1 end
+  if i < 1 or i > n then return nil end
+  return st.p[i - 1]
+end
+
+function view.sub(v, i, j)
+  local n = bytes(v)
+  i, j = range(n, i, j, "sub")
+  if i > j then return "" end
+  return fstring(st.p + (i - 1), j - i + 1)
+end
+
+function view.eq(v, i, j, s)
+  local n = bytes(v)
+  i, j = range(n, i, j, "eq")
+  s = str(s, 3, "eq")
+  local m = #s
+  if i > j then return m == 0 end
+  if j - i + 1 ~= m then return false end
+  return feq(st.p + (i - 1), s, m) ~= 0
+end
+
+function view.find(v, needle, init)
+  local n = bytes(v)
+  needle = str(needle, 1, "find")
+  local from = 0
+  if init ~= nil then
+    from = int(init, 2, "find")
+    if from < 0 then from = from + n else from = from - 1 end
+    if from < 0 then from = 0 elseif from > n then from = n end
+  end
+  local at
+  if needle == "\n" and st.nends >= 0 then at = find_nl(from) else at = ffind(st.p, n, from, needle, #needle) end
+  if at < 0 then return nil end
+  return at + 1, at + #needle
+end
+
+function view.lines(v)
+  bytes(v)
+  local gen, pos, k = v.gen, 0, 0
+  return function()
+    if gen ~= st.gen then error(STALE, 2) end
+    local p, n, ends, cnt = st.p, st.n, st.ends, st.nends
+    while pos < n do
+      local i, e = pos, n
+      if cnt < 0 then
+        e = ffind(p, n, pos, "\n", 1)
+        if e < 0 then e = n end
+      elseif k < cnt then
+        e = ends[k]
+        k = k + 1
+      end
+      pos = e + 1
+      if e > i and p[e - 1] == 13 then e = e - 1 end
+      if e > i then return i + 1, e end
+    end
+    return nil
+  end
+end
+
+ffi.metatype(view_t, {
+  __index = view,
+  __tostring = function(v) return "view" end,
+})
+
+return function(f)
+  return function(id)
+    return f(new(view_t, st.gen), id)
+  end
+end
+)lua";
+
+// The same view where the compiler stays shut, over a string of the bytes,
+// because an interpreted FFI call costs more than the string: measured at 2.0M
+// lines a second for the FFI view interpreted against 34M for on_messages.
+static constexpr char k_read_view_plain[] = R"lua(
+local live = ...
+local type, error, floor, ceil, setmetatable = type, error, math.floor, math.ceil, setmetatable
+local sbyte, ssub, sfind = string.byte, string.sub, string.find
+local STALE = "a view is valid only inside the on_read call it was given to; copy what you keep with view:sub"
+-- Each view's bytes and generation, out of the view itself so a script cannot change either.
+local views = setmetatable({}, { __mode = "k" })
+
+-- The raise for a view that is not one or is stale, apart from the methods, which inline the test because a call
+-- is what the interpreter spends.
+local function refuse(v)
+  if not views[v] then error("a view method was called on " .. type(v) .. ", not on a view", 3) end
+  error(STALE, 3)
+end
+
+local function int(x, arg, name)
+  if type(x) ~= "number" then
+    error("bad argument #" .. arg .. " to '" .. name .. "' (number expected, got " .. type(x) .. ")", 3)
+  end
+  if x ~= x then error("bad argument #" .. arg .. " to '" .. name .. "' (number has no integer representation)", 3) end
+  if x >= 0 then return floor(x) end
+  return ceil(x)
+end
+
+local function strerr(x, arg, name)
+  error("bad argument #" .. arg .. " to '" .. name .. "' (string expected, got " .. type(x) .. ")", 3)
+end
+
+local view = {}
+
+function view.len(v)
+  local r = views[v]
+  if not r or r[2] ~= live[1] then refuse(v) end
+  return #r[1]
+end
+
+function view.byte(v, i)
+  local r = views[v]
+  if not r or r[2] ~= live[1] then refuse(v) end
+  if i == nil then i = 1 else i = int(i, 1, "byte") end
+  return (sbyte(r[1], i))
+end
+
+function view.sub(v, i, j)
+  local r = views[v]
+  if not r or r[2] ~= live[1] then refuse(v) end
+  i = int(i, 1, "sub")
+  if j == nil then j = -1 else j = int(j, 2, "sub") end
+  return ssub(r[1], i, j)
+end
+
+function view.eq(v, i, j, x)
+  local r = views[v]
+  if not r or r[2] ~= live[1] then refuse(v) end
+  if type(i) ~= "number" or i % 1 ~= 0 then i = int(i, 1, "eq") end
+  if j == nil then j = -1 elseif type(j) ~= "number" or j % 1 ~= 0 then j = int(j, 2, "eq") end
+  if type(x) ~= "string" then strerr(x, 3, "eq") end
+  local n = #r[1]
+  if i < 0 then i = n + i + 1 end
+  if j < 0 then j = n + j + 1 end
+  if i < 1 then i = 1 end
+  if j > n then j = n end
+  if i > j then return #x == 0 end
+  -- The copy only for a range as long as the string, which is the one that can match.
+  return j - i + 1 == #x and ssub(r[1], i, j) == x
+end
+
+function view.find(v, needle, init)
+  local r = views[v]
+  if not r or r[2] ~= live[1] then refuse(v) end
+  if type(needle) ~= "string" then strerr(needle, 1, "find") end
+  if init ~= nil and (type(init) ~= "number" or init % 1 ~= 0) then init = int(init, 2, "find") end
+  return sfind(r[1], needle, init, true)
+end
+
+function view.lines(v)
+  local r = views[v]
+  if not r or r[2] ~= live[1] then refuse(v) end
+  local s, pos = r[1], 1
+  local n = #s
+  return function()
+    if r[2] ~= live[1] then error(STALE, 2) end
+    while pos <= n do
+      local i = pos
+      local e = sfind(s, "\n", pos, true) or n + 1
+      pos = e + 1
+      e = e - 1
+      if e >= i and sbyte(s, e) == 13 then e = e - 1 end
+      if e >= i then return i, e end
+    end
+    return nil
+  end
+end
+
+local mt = {
+  __index = view,
+  __newindex = function() error("a view is read-only", 2) end,
+  __metatable = "view",
+  __tostring = function() return "view" end,
+}
+
+return function(f)
+  return function(chunk, id)
+    local v = setmetatable({}, mt)
+    views[v] = { chunk, live[1] }
+    return f(v, id)
+  end
+end
+)lua";
+
+bool lua_context::install_read_view()
+{
+    lua_State* L = m_lua.lua_state();
+    const int top = lua_gettop(L);
+    const auto give_up = [&](const char* what) {
+        load_diag(std::string("on_read could not ") + what + " its view: " + lua_tostring(L, -1));
+        lua_settop(L, top);
+        return false;
+    };
+
+    // Once per state, because a ctype's metatable cannot be set twice, and kept in the registry where no script
+    // reaches the function that makes views.
+    lua_getfield(L, LUA_REGISTRYINDEX, "socketley.read_view");
+    if (lua_isnil(L, -1))
+    {
+        lua_pop(L, 1);
+        if (m_compiler_open)
+        {
+            if (luaL_loadbuffer(L, k_read_view, sizeof(k_read_view) - 1, "=socketley view") != 0)
+                return give_up("compile");
+            push_hidden_ffi(L);
+            lua_pushlightuserdata(L, &m_view);
+            lua_pushlightuserdata(L, reinterpret_cast<void*>(&view_find));
+            lua_pushlightuserdata(L, reinterpret_cast<void*>(&view_eq));
+            if (lua_pcall(L, 4, 1, 0) != 0)
+                return give_up("set up");
+        }
+        else
+        {
+            if (luaL_loadbuffer(L, k_read_view_plain, sizeof(k_read_view_plain) - 1, "=socketley view") != 0)
+                return give_up("compile");
+            // The generation the plain view reads, which call_on_read() writes.
+            lua_createtable(L, 1, 0);
+            lua_pushnumber(L, 0);
+            lua_rawseti(L, -2, 1);
+            lua_pushvalue(L, -1);
+            m_view_live_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+            if (lua_pcall(L, 1, 1, 0) != 0)
+                return give_up("set up");
+        }
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, "socketley.read_view");
+    }
+    m_on_read.push(L);
+    if (lua_pcall(L, 1, 1, 0) != 0)
+        return give_up("wrap on_read for");
+    m_on_read_call = sol::protected_function(L, -1);
+    lua_settop(L, top);
+    return true;
+}
+
+void lua_context::call_on_read(const char* p, size_t n, const socketley::line_ends* ends, int conn_id)
+{
+    // Put back however the call ends, so a view handed out by it is stale and one of a call this is nested in
+    // reads again.
+    struct restore
+    {
+        lua_view_bytes& view;
+        lua_view_bytes  saved;
+        ~restore() { view = saved; }
+    } const back{m_view, m_view};
+    m_view = {reinterpret_cast<const unsigned char*>(p), static_cast<double>(n), ++m_view_gen,
+              ends ? ends->at.get() : nullptr, ends ? static_cast<double>(ends->size) : -1.0, 0.0};
+    lua_suspender::id_t id = 0;
+    if (m_view_live_ref == LUA_NOREF)
+    {
+        m_suspend->start(m_on_read_call, "on_read", m_deadline_ms, id, conn_id);
+        return;
+    }
+
+    // The plain view is a string of the bytes, its generation written where it reads it, before and after.
+    lua_State* L = m_lua.lua_state();
+    const auto live = [&](double gen) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, m_view_live_ref);
+        lua_pushnumber(L, gen);
+        lua_rawseti(L, -2, 1);
+        lua_pop(L, 1);
+    };
+    live(m_view.gen);
+    m_suspend->start(m_on_read_call, "on_read", m_deadline_ms, id, std::string_view(p, n), conn_id);
+    live(back.saved.gen);
 }
 
 void lua_context::register_server_table(runtime_instance* owner, sol::table& self)
