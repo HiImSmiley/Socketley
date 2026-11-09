@@ -152,6 +152,10 @@ public:
     long pending_bytes() const;
     long pending_bytes_of(int id) const;
 
+    // script_send() when it can only end on the queue behind a write in
+    // flight, and false, having done nothing, everywhere else.
+    bool send_if_queued(std::string_view msg, int id);
+
     // The drain crossing is already detected twice in the write paths; this is
     // where the script is told about it, off those stacks.
     void on_loop_turn() override;
@@ -279,6 +283,10 @@ private:
     conn_t* current_or_only(send_answer& why) const;
     // One message onto one connection, the body every send shares.
     bool write_one(conn_t* conn, std::string_view msg);
+    // One message onto the queue behind a write in flight, raising
+    // drain_wanted at the watermark.
+    void enqueue_line(conn_t* conn, std::string_view msg);
+    void enqueue_datagram(conn_t* conn, std::string_view msg);
 
     // ── TLS record layer ────────────────────────────────────────────────────
     // OpenSSL does no I/O in either of these: tls_feed hands the record layer

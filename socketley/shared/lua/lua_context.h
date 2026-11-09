@@ -429,6 +429,10 @@ private:
                                   runtime_instance* owner);
     void register_server_table(runtime_instance* owner, sol::table& self);
     void register_client_table(runtime_instance* owner, sol::table& self);
+    // Puts self.send, self.pending and self.watermark through the FFI once
+    // open_compiler() has opened the compiler, and never where it stays shut.
+    void defer_ffi_calls(std::string_view body, runtime_instance* owner, void* inst, void* psend,
+                         void* ppending, void* pwatermark, sol::table& self);
     void register_cache_table(runtime_instance* owner, sol::table& self);
     void register_proxy_table(runtime_instance* owner, sol::table& self);
 
@@ -442,6 +446,8 @@ private:
     // After m_lua, because a suspended thread belongs to that state and the
     // suspender's destructor unrefs it.
     std::unique_ptr<lua_suspender> m_suspend;
+    // defer_ffi_calls()' work, holding references into m_lua and so after it.
+    std::function<void()> m_ffi_install;
     sol::protected_function m_on_start;
     sol::protected_function m_on_stop;
     sol::protected_function m_on_message;

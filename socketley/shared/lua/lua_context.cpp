@@ -487,6 +487,10 @@ void check(lua_State* L)
 // where m_deadline_ms is final, since there is no supported way back.
 void lua_context::open_compiler()
 {
+    // Taken whichever way this goes, because an interpreted FFI call costs more
+    // than the sol binding it would stand in front of.
+    const std::function<void()> ffi_install = std::move(m_ffi_install);
+    m_ffi_install = nullptr;
     if (m_deadline_ms != 0 && !lua_deadline::watched())
         return;
 
@@ -496,6 +500,8 @@ void lua_context::open_compiler()
     const int  top = lua_gettop(L);
     luaopen_jit(L);
     lua_settop(L, top);
+    if (ffi_install)
+        ffi_install();
 }
 
 lua_context::lua_context()
@@ -3312,6 +3318,156 @@ static int lua_await_cache(lua_State* L)
     return lua_yield(L, 0);
 }
 
+// ─── self.send, self.pending and self.watermark through LuaJIT's FFI ─────────
+// A compiled loop that calls a sol binding leaves its trace for the interpreter
+// on every call and one that makes an FFI call stays in it, so these three are
+// FFI calls placed in front of the bindings.
+//
+// LuaJIT forbids these to enter the VM, so each does pure bookkeeping or
+// answers 1 having done nothing -- an exception included -- and the wrapper
+// then calls the sol binding, which keeps every refusal's sentence.
+extern "C" {
+
+static int ffi_client_send(void* inst, const char* p, size_t n, int id) noexcept
+{
+    try { return static_cast<client_instance*>(inst)->send_if_queued(std::string_view(p, n), id) ? 0 : 1; }
+    catch (...) { return 1; }
+}
+
+static double ffi_client_pending(void* inst, int has_id, int id) noexcept
+{
+    const auto* cli = static_cast<const client_instance*>(inst);
+    return static_cast<double>(has_id ? cli->pending_bytes_of(id) : cli->pending_bytes());
+}
+
+static double ffi_client_watermark(void* inst) noexcept
+{
+    return static_cast<double>(static_cast<const client_instance*>(inst)->write_watermark_bytes());
+}
+
+}
+
+// An id goes to C only when it is an integer an int holds, which is when sol
+// would read the same number, and anything else takes the sol binding.
+static constexpr char k_ffi_prelude[] = R"lua(
+local ffi, inst, psend, ppending, pwatermark, send, pending = ...
+if not pcall(ffi.typeof, "socketley_ffi_watermark_t") then
+  ffi.cdef[[
+typedef int (*socketley_ffi_client_send_t)(void*, const char*, size_t, int);
+typedef double (*socketley_ffi_client_pending_t)(void*, int, int);
+typedef double (*socketley_ffi_watermark_t)(void*);
+]]
+end
+inst = ffi.cast("void*", inst)
+local fwatermark = ffi.cast("socketley_ffi_watermark_t", pwatermark)
+local type = type
+local function plain(id)
+  return type(id) == "number" and id % 1 == 0 and id >= -2147483648 and id <= 2147483647
+end
+local function watermark()
+  return fwatermark(inst)
+end
+)lua";
+
+// self.send(msg [, id]) and self.pending([id]), where no id is id 0 to C.
+static constexpr char k_ffi_client[] = R"lua(
+local fsend = ffi.cast("socketley_ffi_client_send_t", psend)
+local fpending = ffi.cast("socketley_ffi_client_pending_t", ppending)
+return function(msg, id)
+  if type(msg) == "string" and (id == nil or plain(id)) and fsend(inst, msg, #msg, id or 0) == 0 then
+    return true
+  end
+  return send(msg, id)
+end, function(id)
+  if id == nil then return fpending(inst, 0, 0) end
+  if plain(id) then
+    local v = fpending(inst, 1, id)
+    if v < 0 then return nil end
+    return v
+  end
+  return pending(id)
+end, watermark
+)lua";
+
+// Puts the wrappers over self's send, pending and watermark, each only where
+// the top level left the binding in place, and leaves the bindings be if
+// anything here fails.
+static void install_ffi_calls(lua_State* L, std::string_view body, runtime_instance* owner, void* inst,
+                              void* psend, void* ppending, void* pwatermark, sol::table& self,
+                              const sol::object& send, const sol::object& pending, const sol::object& watermark)
+{
+    const int top = lua_gettop(L);
+    const auto give_up = [&](const char* what) {
+        std::cerr << lua_diag::tag(owner->get_name()) << " could not " << what
+                  << " the FFI send path, so self.send stays a plain binding: "
+                  << lua_tostring(L, -1) << std::endl;
+        lua_settop(L, top);
+    };
+
+    // Once per state, because luaopen_ffi initialises the state's C type table
+    // afresh, and kept in the registry and out of package.loaded, where
+    // luaopen_ffi puts it, so require("ffi") still finds nothing.
+    lua_getfield(L, LUA_REGISTRYINDEX, "socketley.ffi");
+    if (lua_isnil(L, -1))
+    {
+        lua_pop(L, 1);
+        // The module is the opener's last value, over whatever else it left.
+        luaopen_ffi(L);
+        if (lua_gettop(L) > top + 1)
+            lua_replace(L, top + 1);
+        lua_settop(L, top + 1);
+        lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+        if (lua_istable(L, -1))
+        {
+            lua_pushnil(L);
+            lua_setfield(L, -2, "ffi");
+        }
+        lua_pop(L, 1);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, "socketley.ffi");
+    }
+
+    std::string chunk(k_ffi_prelude, sizeof(k_ffi_prelude) - 1);
+    chunk.append(body);
+    if (luaL_loadbuffer(L, chunk.data(), chunk.size(), "=socketley ffi") != 0)
+        return give_up("compile");
+    lua_insert(L, -2);
+    lua_pushlightuserdata(L, inst);
+    lua_pushlightuserdata(L, psend);
+    lua_pushlightuserdata(L, ppending);
+    lua_pushlightuserdata(L, pwatermark);
+    send.push(L);
+    pending.push(L);
+    if (lua_pcall(L, 7, 3, 0) != 0)
+        return give_up("set up");
+    self.push(L);
+    const auto put = [&](const char* key, int wrapper, const sol::object& binding) {
+        lua_getfield(L, -1, key);
+        binding.push(L);
+        const bool untouched = lua_rawequal(L, -1, -2) != 0;
+        lua_pop(L, 2);
+        if (!untouched)
+            return;
+        lua_pushvalue(L, wrapper);
+        lua_setfield(L, -2, key);
+    };
+    put("send", top + 1, send);
+    put("pending", top + 2, pending);
+    put("watermark", top + 3, watermark);
+    lua_settop(L, top);
+}
+
+void lua_context::defer_ffi_calls(std::string_view body, runtime_instance* owner, void* inst, void* psend,
+                                  void* ppending, void* pwatermark, sol::table& self)
+{
+    m_ffi_install = [this, body, owner, inst, psend, ppending, pwatermark, self,
+                     send = sol::object(self["send"]), pending = sol::object(self["pending"]),
+                     watermark = sol::object(self["watermark"])]() mutable {
+        install_ffi_calls(m_lua.lua_state(), body, owner, inst, psend, ppending, pwatermark, self, send,
+                          pending, watermark);
+    };
+}
+
 void lua_context::register_server_table(runtime_instance* owner, sol::table& self)
 {
     // Pushed by hand because sol has no form for a function that yields; the
@@ -3761,6 +3917,9 @@ void lua_context::register_client_table(runtime_instance* owner, sol::table& sel
         return static_cast<size_t>(owner->shard_connection_count());
     };
     self["protocol"] = owner->is_udp() ? "udp" : "tcp";
+    defer_ffi_calls({k_ffi_client, sizeof(k_ffi_client) - 1}, owner, static_cast<client_instance*>(owner),
+                    reinterpret_cast<void*>(&ffi_client_send), reinterpret_cast<void*>(&ffi_client_pending),
+                    reinterpret_cast<void*>(&ffi_client_watermark), self);
 }
 
 void lua_context::register_cache_table(runtime_instance* owner, sol::table& self)

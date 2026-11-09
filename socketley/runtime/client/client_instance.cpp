@@ -6,6 +6,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/crypto/tls_context.h"
 #include "../../shared/loop/line_framing.h"
+#include "../../shared/lua/lua_context.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -1560,6 +1561,57 @@ client_instance::send_answer client_instance::script_send(std::string_view msg, 
     return conn->queue_full && conn->connected ? send_answer::backlogged : send_answer::not_connected;
 }
 
+// Each condition rules out a step of write_one that can run Lua or answer with a
+// sentence -- on_send, the direct send and arm_write whose failure drops the
+// connection, a refusal and the bound's latch -- so what is left is the queue
+// behind a write in flight, where tls_flush returns at once as well.
+bool client_instance::send_if_queued(std::string_view msg, int id)
+{
+    send_answer why = send_answer::no_such_id;
+    conn_t* conn = id != 0 ? slot_of_id(id) : current_or_only(why);
+    if (!conn || !m_loop || !conn->connected || m_mode == client_mode_in || conn->closing
+        || !conn->write_pending || (lua() && lua()->has_on_send())
+        || conn->write_queue.bytes() >= write_buffer_bytes())
+        return false;
+    // The pushes and not write_one, whose checks this has already made.
+    if (m_udp)
+        enqueue_datagram(conn, msg);
+    else
+        enqueue_line(conn, msg);
+    return true;
+}
+
+// The watermark is judged on the size the message leaves behind, not the one it
+// arrived to: a producer pacing on self.pending() stops on this same number, so
+// arming on the size before the push arms one send too late and that send never
+// comes.
+void client_instance::enqueue_line(conn_t* conn, std::string_view msg)
+{
+    if (conn->write_queue.bytes() + msg.size() >= write_watermark_bytes())
+        conn->drain_wanted = true;
+    // The string that was built only to be thrown away: when the tail takes
+    // the bytes, push_coalesced appends them and discards what it was handed,
+    // so a copy per send bought a newline.  The terminator is still only added
+    // when the caller left one off, which push_coalesced_line cannot decide
+    // for itself.
+    if (!msg.empty() && msg.back() == '\n')
+        conn->write_queue.push_coalesced(msg, WRITE_COALESCE_LIMIT);
+    else
+        conn->write_queue.push_coalesced_line(msg, WRITE_COALESCE_LIMIT);
+}
+
+// push and not push_coalesced, which the TCP arm uses: an entry here is a
+// datagram, so merging two of them delivers one message where the script sent
+// two.  Caught by test_udp_client_sends.sh at 2 of 10 -- and the same fact is
+// written in udp_broadcast(), which has no queue at all for exactly this
+// reason.
+void client_instance::enqueue_datagram(conn_t* conn, std::string_view msg)
+{
+    if (conn->write_queue.bytes() + msg.size() >= write_watermark_bytes())
+        conn->drain_wanted = true;
+    conn->write_queue.push(std::string(msg.data(), msg.size()));
+}
+
 // Whether the message was written or queued, which was void, so self.send()
 // reported none of the three ordinary refusals.
 bool client_instance::write_one(conn_t* conn, std::string_view msg)
@@ -1595,16 +1647,7 @@ bool client_instance::write_one(conn_t* conn, std::string_view msg)
                 }
                 return false;
             }
-            // push and not push_coalesced, which the TCP arm below uses: an
-            // entry here is a datagram, so merging two of them delivers one
-            // message where the script sent two.  Caught by
-            // test_udp_client_sends.sh at 2 of 10 -- and the same fact is
-            // written three functions away in udp_broadcast(), which has no
-            // queue at all for exactly this reason.
-            if (conn->write_queue.bytes() + msg.size()
-                >= write_watermark_bytes())
-                conn->drain_wanted = true;
-            conn->write_queue.push(std::string(msg.data(), msg.size()));
+            enqueue_datagram(conn, msg);
             return true;
         }
 
@@ -1644,22 +1687,7 @@ bool client_instance::write_one(conn_t* conn, std::string_view msg)
                 }
                 return false;
             }
-            // Judged on the size the message leaves behind, not the one it
-            // arrived to: a producer pacing on self.pending() stops on this
-            // same number, so arming on the size before the push arms one send
-            // too late and that send never comes.
-            if (conn->write_queue.bytes() + msg.size()
-                >= write_watermark_bytes())
-                conn->drain_wanted = true;
-            // The string that was built only to be thrown away: when the
-            // tail takes the bytes, push_coalesced appends them and discards
-            // what it was handed, so a copy per send bought a newline.  The
-            // terminator is still only added when the caller left one off,
-            // which push_coalesced_line cannot decide for itself.
-            if (!msg.empty() && msg.back() == '\n')
-                conn->write_queue.push_coalesced(msg, WRITE_COALESCE_LIMIT);
-            else
-                conn->write_queue.push_coalesced_line(msg, WRITE_COALESCE_LIMIT);
+            enqueue_line(conn, msg);
         }
         // Nothing else will come back for this message on its own, so the
         // record layer is driven from here or the line sits in the queue.
