@@ -1224,23 +1224,22 @@ size_t client_instance::deliver_chunk(conn_t* conn, const char* data, size_t len
     const size_t end = static_cast<size_t>(static_cast<const char*>(nl) - data) + 1;
     const std::string_view chunk(data, end);
 
-    // Counted and observed line by line before the script runs, so -w, bash output and interactive see what they
-    // would see with on_message, even when the script stops this runtime.
+    // Counted and observed before the script runs, so -w, bash output and interactive see what they would see with
+    // on_message, even when the script stops this runtime, and counted in one pass where nothing observes.
     // The lines on_message would have been handed, the blank ones it skips left out, so the count does not depend on
     // which of the two the script defines.
     uint64_t lines = 0;
-    const bool observed = observes_messages();
-    socketley::for_each_line(data, end, 0, [&](std::string_view line)
-    {
-        ++lines;
-        if (SOCKETLEY_UNLIKELY(observed))
+    if (SOCKETLEY_UNLIKELY(observes_messages()))
+        socketley::for_each_line(data, end, 0, [&](std::string_view line)
         {
+            ++lines;
             print_bash_message(line);
             write_received_message(line);
             notify_interactive(line);
-        }
-        return true;
-    });
+            return true;
+        });
+    else
+        lines = socketley::count_lines(data, end);
     stat_add(m_stat_total_messages, lines);
 
     const uint32_t slot = conn->slot;

@@ -24,6 +24,7 @@
 #     on_message                             never called
 #     -w                                     every line, as on_message's runtime
 #                                              writes them
+#     without -w                             the same count, blank lines left out
 #   server, on_client_messages and on_client_message both defined:
 #     three lines in one read                one call with the sender's id
 #     a line split across reads              joined, as on the client
@@ -43,6 +44,7 @@ daemon_isolate batchlines
 CPORT=$((SL_PORT_BASE+1777))
 SPORT=$((SL_PORT_BASE+1778))
 UPORT=$((SL_PORT_BASE+1779))
+NPORT=$((SL_PORT_BASE+1780))
 STATUS="$SOCKETLEY_TMPD/peer.status"
 WOUT="$SOCKETLEY_TMPD/written.txt"
 
@@ -57,11 +59,12 @@ bad() {
 check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "expected [$2], got [$3]"; fi; }
 
 cleanup() {
-    for r in bl_cli bl_srv bl_udp; do
+    for r in bl_cli bl_count bl_srv bl_udp; do
         "$BIN" stop   "$r" >/dev/null 2>&1 || true
         "$BIN" remove "$r" >/dev/null 2>&1 || true
     done
     [ -n "${PEER_PID:-}" ] && kill "$PEER_PID" 2>/dev/null
+    [ -n "${NPEER_PID:-}" ] && kill "$NPEER_PID" 2>/dev/null
     daemon_stop
 }
 trap cleanup EXIT
@@ -208,6 +211,41 @@ if [ "$(cat "$WOUT" 2>/dev/null)" = "$expect_w" ]; then ok; else
     bad "-w writes every line as the per-line path does" \
         "first lines: $(head -12 "$WOUT" 2>/dev/null | tr '\n' '|')" "lines: $(wc -l < "$WOUT" 2>/dev/null)"
 fi
+
+# ─── Counted without an observer ────────────────────────────────────────────
+# Without -w the count is one pass over the chunk rather than the walk -w takes.
+python3 - "$NPORT" <<'PY' >/dev/null 2>&1 &
+import socket, sys, time
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", int(sys.argv[1])))
+srv.listen(1)
+srv.settimeout(20)
+c = srv.accept()[0]
+time.sleep(0.3)
+c.sendall(b"a\n\n\r\nb\r\n\r\r\n" + b"".join(b"l%d\n" % i for i in range(1000)) + b"\n\n")
+time.sleep(3)
+PY
+NPEER_PID=$!
+for i in $(seq 1 60); do
+    ss -ltnH "sport = :$NPORT" 2>/dev/null | grep -q . && break
+    sleep 0.1
+done
+cat > "$SOCKETLEY_TMPD/count.lua" <<'LUAEOF'
+function on_messages(chunk)
+    if chunk:find("l999\n", 1, true) then socketley.log("CCOUNTED") end
+end
+LUAEOF
+"$BIN" create client bl_count -t "127.0.0.1:$NPORT" --lua "$SOCKETLEY_TMPD/count.lua" >/dev/null 2>&1
+"$BIN" start bl_count >/dev/null 2>&1
+for _ in $(seq 1 50); do calls CCOUNTED | grep -q . && break; sleep 0.1; done
+msgs=""
+for _ in $(seq 1 30); do
+    msgs=$({ "$BIN" stats bl_count 2>/dev/null || true; } | awk -F: '$1 == "total_messages" { print $2; exit }')
+    [ "$msgs" = 1003 ] && break
+    sleep 0.1
+done
+check "total_messages leaves the blank lines out without an observer too" "1003" "$msgs"
 
 # ─── The server ─────────────────────────────────────────────────────────────
 cat > "$SOCKETLEY_TMPD/server.lua" <<'LUAEOF'

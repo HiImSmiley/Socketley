@@ -75,4 +75,46 @@ inline size_t count_newlines(const char* data, size_t len)
     return n;
 }
 
+// How many lines for_each_line would deliver from [data, data + len), a line
+// being empty when its '\n' follows the start or another '\n', with at most a
+// '\r' between, so the count is one pass of vector code instead of a memchr a
+// line.
+inline size_t count_lines(const char* data, size_t len)
+{
+    typedef signed char v16 __attribute__((vector_size(16)));
+    const v16 nl = {'\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n'};
+    const v16 cr = {'\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r', '\r'};
+    // The block before the first is all newlines, since the data starts a line.
+    v16 prev_nl = nl == nl;
+    v16 prev_cr = {};
+    size_t n = 0;
+    size_t i = 0;
+    while (len - i >= 16)
+    {
+        v16 acc = {};
+        for (int step = 0; step < 255 && len - i >= 16; ++step, i += 16)
+        {
+            v16 b;
+            std::memcpy(&b, data + i, 16);
+            const v16 is_nl = b == nl;
+            const v16 is_cr = b == cr;
+            // Each lane's one and two bytes before, from this block and the last.
+            const v16 nl1 = __builtin_shuffle(prev_nl, is_nl, v16{15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30});
+            const v16 cr1 = __builtin_shuffle(prev_cr, is_cr, v16{15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30});
+            const v16 nl2 = __builtin_shuffle(prev_nl, is_nl, v16{14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29});
+            // A lane that ends a line which is not empty is -1, so subtracting counts it, 255 steps being what a
+            // byte lane can count.
+            acc -= is_nl & ~(nl1 | (cr1 & nl2));
+            prev_nl = is_nl;
+            prev_cr = is_cr;
+        }
+        for (int lane = 0; lane < 16; ++lane)
+            n += static_cast<unsigned char>(acc[lane]);
+    }
+    for (; i < len; ++i)
+        n += data[i] == '\n'
+             && !(i == 0 || data[i - 1] == '\n' || (data[i - 1] == '\r' && (i == 1 || data[i - 2] == '\n')));
+    return n;
+}
+
 } // namespace socketley
