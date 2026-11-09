@@ -46,12 +46,24 @@ build_liburing() {
   [ "$v" = "2.15" ] || { echo "   REFUSED: headers report $v, expected 2.15"; return 2; }
 }
 
+# Whether an archive's C half was compiled with optimisation, read off lua_gettop: at -O0 it spills its argument to
+# the stack, and such an archive links, passes every test and costs a Lua callback a quarter of its speed.
+luajit_optimised() {
+  ! objdump -d --no-show-raw-insn "$1" 2>/dev/null \
+      | awk '/<lua_gettop>:/ {f = 1; next} f && /ret/ {exit} f' \
+      | grep -qE 'mov +%rdi,[^,]*\(%r[sb]p\)|str +x0, *\[(sp|x29)'
+}
+
 build_luajit() {
   echo "== luajit"
   local dest="$ROOT/thirdparty/luajit/libluajit.a"
   if [ -f "$dest" ]; then
-    echo "   already present, left alone"
-    return 0
+    if luajit_optimised "$dest"; then
+      echo "   already present, left alone"
+      return 0
+    fi
+    echo "   present but compiled without optimisation, replaced"
+    rm -f "$dest"
   fi
 
   # This used to print "NOT AUTOMATED" and tell the reader to copy the archive
@@ -67,11 +79,12 @@ build_luajit() {
   # can reach it.
   local sys
   sys=$(find /usr/lib /usr/local/lib -name 'libluajit-5.1.a' 2>/dev/null | head -1)
-  if [ -n "$sys" ]; then
+  if [ -n "$sys" ] && luajit_optimised "$sys"; then
     cp "$sys" "$dest"
     echo "   copied from $sys ($(stat -c%s "$dest") bytes)"
     return 0
   fi
+  [ -n "$sys" ] && echo "   $sys is not optimised, so it is not taken"
 
   echo "   no system libluajit-5.1.a found, building from source"
   local tmp; tmp=$(mktemp -d)
@@ -82,6 +95,7 @@ build_luajit() {
     || { echo "   FAILED: LuaJIT build"; return 2; }
   cp "$tmp/src/libluajit.a" "$dest"
   echo "   built from source ($(stat -c%s "$dest") bytes)"
+  luajit_optimised "$dest" || { echo "   REFUSED: the archive built is not optimised"; rm -f "$dest"; return 2; }
 }
 
 build_premake() {
