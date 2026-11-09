@@ -80,6 +80,7 @@ constexpr row rows[] = {
     // ── client ──────────────────────────────────────────────────────────────
     {"-t", "C", "text", "Target", "The server it connects to, host:port.", "Client", {}, "127.0.0.1:9000"},
     {"--mode", "C", "choice", "Mode", "Both ways, receive only or send only.", "Client", "inout,in,out"},
+    {"--connections", "C", "int", "Connections", "How many connections it holds to the target, each with its own id; changing it opens or closes them.", "Client", {}, "64"},
 
     // ── proxy ───────────────────────────────────────────────────────────────
     {"--backend", "P", "list", "Backends", "Where requests go: host:port, https://host, unix:/path, a runtime or @group. None makes it the entrance.", "Proxy", {}, "127.0.0.1:8080, @web"},
@@ -324,6 +325,7 @@ constexpr state_key_row state_keys[] = {
     {"--write-buffer", "write_buffer"},
     {"--drain", "drain"},
     {"--reconnect", "reconnect"},
+    {"--connections", "connections"},
     {"--log", "log_file"},
     {"-w", "write_file"},
     {"-b", "bash_output"},

@@ -882,6 +882,12 @@ protected:
     void invoke_on_disconnect(int client_id);
     bool invoke_on_auth(int client_id);
     void invoke_on_send(std::string_view msg);
+    // The same four with a client's connection id after the arguments they
+    // have always had, so a script for one connection runs unchanged on many.
+    void invoke_on_message(std::string_view msg, int conn_id);
+    void invoke_on_connect(int client_id, int conn_id);
+    void invoke_on_disconnect(int client_id, int conn_id);
+    void invoke_on_send(std::string_view msg, int conn_id);
     // True when the script's handler ran to the end and returned true, which is it saying the message is handled.
     bool invoke_on_client_message(int client_id, std::string_view msg);
     // The write queue for this connection has drained back under the

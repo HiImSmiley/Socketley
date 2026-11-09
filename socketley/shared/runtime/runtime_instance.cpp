@@ -869,6 +869,55 @@ void runtime_instance::invoke_on_disconnect(int client_id)
 #endif
 }
 
+// The C++ callbacks keep their one-connection signatures; only a script is handed the id.
+void runtime_instance::invoke_on_message(std::string_view msg, [[maybe_unused]] int conn_id)
+{
+    if (m_cb_on_message) { m_cb_on_message(msg); return; }
+    if (!m_lua || !m_lua->has_on_message())
+        return;
+
+#ifndef SOCKETLEY_NO_LUA
+    lua_suspender::id_t id = 0;
+    m_lua->suspender().start(m_lua->raw_on_message(), "on_message",
+                             m_lua->callback_timeout_ms(), id, msg, conn_id);
+#endif
+}
+
+void runtime_instance::invoke_on_connect(int client_id, [[maybe_unused]] int conn_id)
+{
+    if (m_cb_on_connect) { m_cb_on_connect(client_id); return; }
+    if (!m_lua || !m_lua->has_on_connect())
+        return;
+
+#ifndef SOCKETLEY_NO_LUA
+    sol::protected_function_result r = m_lua->on_connect()(client_id, conn_id);
+    lua_diag::raised(r, get_name(), "on_connect");
+#endif
+}
+
+void runtime_instance::invoke_on_disconnect(int client_id, [[maybe_unused]] int conn_id)
+{
+    if (m_cb_on_disconnect) { m_cb_on_disconnect(client_id); return; }
+    if (!m_lua || !m_lua->has_on_disconnect())
+        return;
+
+#ifndef SOCKETLEY_NO_LUA
+    sol::protected_function_result r = m_lua->on_disconnect()(client_id, conn_id);
+    lua_diag::raised(r, get_name(), "on_disconnect");
+#endif
+}
+
+void runtime_instance::invoke_on_send([[maybe_unused]] std::string_view msg, [[maybe_unused]] int conn_id)
+{
+    if (!m_lua || !m_lua->has_on_send())
+        return;
+
+#ifndef SOCKETLEY_NO_LUA
+    sol::protected_function_result r = m_lua->on_send()(msg, conn_id);
+    lua_diag::raised(r, get_name(), "on_send");
+#endif
+}
+
 bool runtime_instance::invoke_on_auth(int client_id)
 {
     if (m_cb_on_auth) return m_cb_on_auth(client_id);

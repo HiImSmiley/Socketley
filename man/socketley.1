@@ -873,6 +873,9 @@ socketley web stop
 Send a message to a running server or client runtime.
 For a server, the message is broadcast to all connected clients.
 For a client, the message is sent to the connected server.
+A client holding several connections
+.RB ( \-\-connections )
+sends each message on one of them, the next connected one in turn.
 The command respects the runtime's mode setting, and fails if the mode is
 receive-only.
 .TP
@@ -5650,6 +5653,59 @@ Use UDP instead of TCP.
 The client creates a connected SOCK_DGRAM socket.
 Each datagram is one message; there is no line parsing.
 Not available for cache or proxy.
+.TP
+.BI "\-\-connections " "count"
+How many connections the client holds to its target, all in one process.
+Default: 1.
+The count is from 1 to 65535.
+A count of 0, a count above that, or no count at all is refused.
+.IP
+Every connection dials the same
+.BR \-t .
+Each has its own reconnect backoff, its own TLS session, its own read buffer and its own write queue.
+TLS sessions are resumed from one cache shared by all of them.
+With
+.BR \-\-udp ,
+each connection is a socket of its own.
+.IP
+Each connection has an id from 1 to
+.IR count ,
+and keeps it across a reconnect.
+The script's callbacks are handed that id after their usual arguments:
+.BR "on_connect(fd, id)" ,
+.BR "on_message(msg, id)" ,
+.BR "on_writable(id)" ,
+.B on_disconnect(fd, id)
+and
+.BR "on_send(msg, id)" .
+.B self.send(msg)
+without an id answers on the connection whose callback is running, so a request\-answer script written for one connection runs unchanged on many.
+Outside every callback, such as in a timer, a client with more than one connection refuses a send without an id and says so.
+Name the connection there with
+.BR "self.send(msg, id)" .
+.B self.pending()
+and
+.B on_writable
+pace each connection on its own queue.
+.IP
+.B stats
+adds the connections up: bytes and messages over all of them, and
+.B connections
+is how many are up.
+.B "socketley send"
+puts each message on one connection, the next connected one in turn.
+.BR \-w ,
+.B \-b
+and an interactive session see what every connection receives, with no prefix.
+.IP
+.B edit \-\-connections
+on a running client opens the new ids or closes the highest ones, each closed one with an
+.BR on_disconnect .
+The others stay up.
+.IP
+Every runtime is a process of its own, so many connections to one target are cheaper as one client with
+.B \-\-connections
+than as one client runtime each: one process instead of many, and no context switch between them.
 .TP
 .BI "\-\-reconnect " "[max\-attempts]"
 Reconnect automatically, with exponential backoff, when the connection is lost.
@@ -19758,6 +19814,9 @@ Called when the runtime stops.
 .TP
 .B on_message(msg)
 Called when a message is received (server and client).
+A client passes the connection id as a second argument, 1 unless
+.B \-\-connections
+is given; see there.
 When a server defines this callback, it takes over message handling: the default broadcast
 (in \fBinout\fR and \fBmaster\fR modes) is suppressed.
 Use \fBself.broadcast(msg)\fR to relay messages yourself.
@@ -19889,9 +19948,11 @@ A producer that stopped because
 was high can then carry on.
 The callback is edge\(hytriggered: it fires once per crossing, not once per completed write.
 .IP
-A client runtime has the same callback without the argument,
-.BR on_writable() ,
-because it has one connection, and a number naming it would be a fiction.
+A client runtime passes its connection id,
+.BR on_writable(id) .
+It is 1 unless
+.B \-\-connections
+is given.
 A client's refusal to send also names its real cause.
 A connected
 .B \-\-mode out
@@ -19948,6 +20009,12 @@ Do not compare it against a descriptor or assume anything about its value.
 .TP
 .B on_disconnect(client_id)
 Called when a client disconnects (server and client).
+A client's
+.B on_connect
+and
+.B on_disconnect
+are given the descriptor and then the connection id; see
+.BR \-\-connections .
 .TP
 .B on_rcpt(rcpt, default) \(-> bool
 Decides, in a mail runtime, whether to accept each recipient as the client names it.
@@ -20907,7 +20974,9 @@ self.connections()         -- Current connection count (all four types).
 
 self.protocol  -- server/client: "tcp" or "udp"; proxy: "tcp" or "http"
                -- (not set on a cache)
-self.send(msg)             -- Send message (client)
+self.send(msg [, id])      -- Send message (client).  Without an id, on the
+                           -- connection whose callback is running; with
+                           -- --connections, refused outside every callback
 self.send(client_id, msg)  -- Send to specific client (server)
 self.broadcast(msg)        -- Broadcast to all clients (server).  Answers two
                            -- numbers: how many took it, and how many were
@@ -20926,9 +20995,11 @@ self.watermark()           -- The byte count on_writable fires on the way down
                            -- --write-buffer is editable.  See on_writable.
 on_http_body(id, chunk, n) -- A request body streamed, rather than gathered
                            -- whole (server).  Defining it is the opt-in.
-self.pending()             -- The client's own form, without an id: a client
-                           -- has one connection.  Bytes queued for its server
-                           -- and not yet on the wire.
+self.pending([id])         -- The client's own form.  Bytes queued for its
+                           -- server and not yet on the wire: for that id (nil
+                           -- if it has none), or without one the connection
+                           -- whose callback is running, or all of them
+                           -- outside every callback.
 
 -- ─── Sending faster than the socket ───
 -- A write is queued, not performed, and the queue has a bound.  Reach it and

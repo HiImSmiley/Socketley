@@ -4979,6 +4979,7 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
         std::string master_pw, cache_name, http_dir, origins;
         bool        http_cache{false}, inject{true};
         client_mode cmode{client_mode_inout};
+        uint32_t    connections{1};
         std::string target;
         tunnel_instance::mode tmode{tunnel_instance::mode::edge};
         std::string to, join, offers, forward, idp, idp_audience;
@@ -5030,6 +5031,7 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
         before.cmode  = cli_b->get_mode();
         before.udp    = cli_b->is_udp();
         before.target = std::string(cli_b->get_target());
+        before.connections = cli_b->get_connections();
     }
     else if (type == runtime_tunnel)
     {
@@ -5097,6 +5099,7 @@ int daemon_handler::cmd_edit(ipc_connection* conn,
             cli_r->set_mode(before.cmode);
             cli_r->set_udp(before.udp);
             cli_r->set_target(before.target);
+            cli_r->set_connections(before.connections);
         }
         else if (type == runtime_tunnel)
         {
@@ -6104,6 +6107,13 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
                   "field and import again.\n";
             return 1;
         }
+    }
+
+    if (type == runtime_client && has("connections")
+        && (cfg.connections < 1 || cfg.connections > static_cast<int>(client_instance::max_connections_held)))
+    {
+        conn->write_buf = "invalid connection count\n";
+        return 1;
     }
 
     // And the other direction, for the one field that describes a connection

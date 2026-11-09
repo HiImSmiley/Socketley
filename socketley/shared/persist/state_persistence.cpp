@@ -648,6 +648,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             auto* cli = static_cast<const client_instance*>(instance);
             cfg.mode = static_cast<uint8_t>(cli->get_mode());
             cfg.udp = cli->is_udp();
+            cfg.connections = static_cast<int>(cli->get_connections());
             break;
         }
         case runtime_proxy:
@@ -1104,6 +1105,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_str_field("mode", server_mode_str(cfg.mode));
             if (cfg.udp)
                 append_bool_field("udp", true);
+            if (cfg.connections != 1)
+                append_int_field("connections", cfg.connections);
             break;
         case runtime_proxy:
             append_str_field("protocol", proxy_protocol_str(cfg.protocol));
@@ -1589,6 +1592,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
         case runtime_client:
             cfg.mode = str_to_server_mode(json_get_string(json, "mode"));
             cfg.udp = json_get_bool(json, "udp");
+            cfg.connections = json_get_int(json, "connections", 1);
             break;
         case runtime_proxy:
             cfg.protocol = str_to_proxy_protocol(json_get_string(json, "protocol"));

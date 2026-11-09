@@ -3526,24 +3526,47 @@ void lua_context::register_client_table(runtime_instance* owner, sol::table& sel
     // Same contract as the server's mutators, and the same three silent
     // no-ops behind it: a client that has not connected yet, one whose server
     // has dropped it, and one created --mode in, which does not send at all.
-    self["send"] = [owner, this](
-                                 std::string_view msg) -> api_result {
-        if (owner->lua_send(msg))
-            return api_yes();
-        // A fourth reason, named apart from the three above for the same
-        // cause as on the server: the sentence for a missing connection is
-        // the wrong one for a connection that is merely behind, and only one
-        // of the two is something a script can act on.
-        if (static_cast<client_instance*>(owner)->write_backlogged())
-            return api_why(q(m_owner_name) + " has more queued for its server "
-                           "than it could take -- self.pending() is what to "
-                           "watch before sending the next one");
+    //
+    // The id is optional and trails, so a script for one connection runs
+    // unchanged with --connections: without it the message goes back on the
+    // connection whose callback is running.
+    self["send"] = [owner, this](std::string_view msg, sol::optional<int> id) -> api_result {
+        auto* cli = static_cast<client_instance*>(owner);
+        switch (cli->script_send(msg, id.value_or(0)))
+        {
+            case client_instance::send_answer::sent:
+                return api_yes();
+            // A fourth reason, named apart from the three above for the same
+            // cause as on the server: the sentence for a missing connection is
+            // the wrong one for a connection that is merely behind, and only one
+            // of the two is something a script can act on.
+            case client_instance::send_answer::backlogged:
+                return api_why(q(m_owner_name) + " has more queued for its server "
+                               "than it could take -- self.pending() is what to "
+                               "watch before sending the next one");
+            case client_instance::send_answer::no_current:
+                return api_why(q(m_owner_name) + " holds " + std::to_string(cli->get_connections())
+                               + " connections and this send is outside the callbacks of all of them -- "
+                                 "name one: self.send(msg, id)");
+            case client_instance::send_answer::no_such_id:
+                return api_why(q(m_owner_name) + " has no connection " + std::to_string(id.value_or(0))
+                               + "; its ids are 1 to " + std::to_string(cli->get_connections()));
+            case client_instance::send_answer::not_connected:
+                break;
+        }
         return api_why(q(m_owner_name) + " is not connected to its server, "
                        "or was created --mode in and does not send");
     };
-    // As on the server, minus the id: this runtime has one connection.
-    self["pending"] = [owner]() -> long {
-        return static_cast<client_instance*>(owner)->pending_bytes();
+    // With an id, that connection's bytes and nil for an id it does not have;
+    // without one, the connection whose callback is running, or all of them.
+    self["pending"] = [owner](sol::optional<int> id) -> sol::optional<long> {
+        auto* cli = static_cast<client_instance*>(owner);
+        if (!id)
+            return cli->pending_bytes();
+        const long v = cli->pending_bytes_of(*id);
+        if (v < 0)
+            return sol::nullopt;
+        return v;
     };
     self["watermark"] = [owner]() -> long {
         return static_cast<long>(owner->write_watermark_bytes());

@@ -14,13 +14,13 @@
 // can it tell them apart by descriptor: it closes a socket and dials again in
 // the same breath, and the kernel hands the number straight back — so the new
 // socket is the same address, the same fd and the same owner as the old one.
-// The only thing separating them is m_conn_generation, and everything this
+// The only thing separating them is the connection's generation, and everything this
 // target is looking for is a path that forgets to consult it:
 //
 //   * a read completion for the socket before last, appended to the current
 //     conversation, because the descriptor number was reissued;
 //   * a read armed while the previous one is still in the ring, giving the
-//     kernel two writers into m_conn.read_buf;
+//     kernel two writers into the connection's read_buf;
 //   * the reconnect timer — which hangs off no descriptor, so neither a close
 //     nor a cancel reaches it — left counting down thirty seconds past a stop,
 //     with the ring still owing this owner a completion the whole time and the
@@ -70,7 +70,7 @@
 
 // Reaching inside the class, exactly as fuzz_cache_ops and fuzz_server_ops do
 // and for the same reason: the per-connection half of invariant 2 is about
-// m_conn.read_pending, m_conn.write_pending and m_reconnect_pending, all
+// the first slot's read_pending, write_pending and reconnect_pending, all
 // private, and the alternatives are a friend declaration or a test-only
 // accessor — both of which change socketley/ to suit a test.  Every header
 // client_instance.h needs is included above, so the macro is never in effect
@@ -90,7 +90,7 @@ enum payload_id : uint8_t
 {
     PL_EMPTY = 0,
     PL_LINE,
-    PL_FRAGMENT,      // no newline: accumulates in m_conn.partial
+    PL_FRAGMENT,      // no newline: accumulates in the connection's partial
     PL_TWO_LINES,
     PL_CRLF_ONLY,
     PL_BIG_LINE,      // larger than the 4 KB read buffer, so several reads
@@ -355,20 +355,20 @@ void check_instance(client_instance* rt)
     // directions matter: a descriptor kept past the drop is one nothing will
     // ever close, and a connection with no descriptor is one that will arm on
     // fd -1.
-    RT_CHECK(rt->m_connected || rt->m_conn->fd < 0,
+    RT_CHECK(rt->m_slots.front()->connected || rt->m_slots.front()->fd < 0,
              "the client is not connected but still holds a descriptor — nothing will "
              "close it, and the next dial overwrites the field");
-    RT_CHECK(!rt->m_connected || rt->m_conn->fd >= 0,
+    RT_CHECK(!rt->m_slots.front()->connected || rt->m_slots.front()->fd >= 0,
              "the client believes it is connected with no descriptor to be connected on");
 
     // Every request this runtime owns is stamped with the socket it was armed
     // for.  A pending flag with no generation behind it would mean a completion
     // that cannot be attributed to any socket at all.
-    if (rt->m_conn->read_pending)
-        RT_CHECK(rt->m_conn->read_req.generation != 0,
+    if (rt->m_slots.front()->read_pending)
+        RT_CHECK(rt->m_slots.front()->read_req.generation != 0,
                  "a read is armed on a request that was never stamped with a socket");
-    if (rt->m_conn->write_pending)
-        RT_CHECK(rt->m_conn->write_req.generation != 0,
+    if (rt->m_slots.front()->write_pending)
+        RT_CHECK(rt->m_slots.front()->write_req.generation != 0,
                  "a write is armed on a request that was never stamped with a socket");
 
     if (rt->get_state() != runtime_running)
@@ -388,17 +388,17 @@ void check_instance(client_instance* rt)
     // rather than dispatching them, so nothing lowers the flags until the next
     // setup() does.  That is the state this check would otherwise report on
     // every input, and it is why the check is anchored to `running`.
-    if (rt->m_conn->read_pending || rt->m_conn->write_pending || rt->m_reconnect_pending)
+    if (rt->m_slots.front()->read_pending || rt->m_slots.front()->write_pending || rt->m_slots.front()->reconnect_pending)
     {
         const uint32_t owed = g_loop->owner_inflight(rt);
         if (owed == 0)
         {
             fuzzrt::set_detail("running, with owner_inflight() at zero: read_pending=%d "
                                "write_pending=%d reconnect_pending=%d fd=%d connected=%d",
-                               static_cast<int>(rt->m_conn->read_pending),
-                               static_cast<int>(rt->m_conn->write_pending),
-                               static_cast<int>(rt->m_reconnect_pending),
-                               rt->m_conn->fd, static_cast<int>(rt->m_connected));
+                               static_cast<int>(rt->m_slots.front()->read_pending),
+                               static_cast<int>(rt->m_slots.front()->write_pending),
+                               static_cast<int>(rt->m_slots.front()->reconnect_pending),
+                               rt->m_slots.front()->fd, static_cast<int>(rt->m_slots.front()->connected));
             RT_FINDING("pending-without-inflight", false,
                        "a running client has a request marked occupied although the ring owes "
                        "it nothing — the completion that would free it is never coming, so "
@@ -412,7 +412,7 @@ void check_instance(client_instance* rt)
     // will wake it.  There is no poll loop and no timer here — every step
     // happens inside a completion handler — so a connected client with nothing
     // in the ring is one nobody will ever come back to.
-    if (rt->m_connected && rt->m_conn->fd >= 0 && !rt->m_conn->closing
+    if (rt->m_slots.front()->connected && rt->m_slots.front()->fd >= 0 && !rt->m_slots.front()->closing
         && rt->get_mode() != client_mode_out)
     {
         RT_FINDING("connected-but-unreachable", g_loop->owner_inflight(rt) > 0,
@@ -426,7 +426,7 @@ void check_after_drain(client_instance* rt)
 {
     if (!rt)
         return;
-    RT_FINDING("fd-held-after-drain", rt->m_conn->fd < 0,
+    RT_FINDING("fd-held-after-drain", rt->m_slots.front()->fd < 0,
                "the client still holds a socket after it stopped and drained");
 }
 

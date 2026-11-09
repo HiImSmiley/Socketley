@@ -74,7 +74,7 @@ constexpr std::string_view reserved_keys[] = {
     "write_file", "lua_script", "bash_output", "bash_prefix", "bash_timestamp",
     "max_connections", "rate_limit", "global_rate_limit", "idle_timeout", "congestion",
     "write_buffer", "write-buffer", "read_buffer", "read-buffer",
-    "drain", "reconnect", "tls", "cert_path", "key_path", "ca_path", "target",
+    "drain", "reconnect", "connections", "tls", "cert_path", "key_path", "ca_path", "target",
     "cache_name", "group", "owner", "child_policy", "shards", "shard_index",
     "cpus", "external_runtime", "managed", "exec_path", "pid",
     "mode", "send_to", "udp", "master_pw", "http_dir", "http_cache", "no_inject",

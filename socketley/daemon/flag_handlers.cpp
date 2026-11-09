@@ -1024,6 +1024,24 @@ static int parse_client_shared_flags(client_instance* cli, const parsed_args& pa
             cli->set_mode(mode);
             return 0;
         }
+        // Taken while running too, where the connections are opened or closed to match.
+        case fnv1a("--connections"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--connections requires a count\n";
+                return 1;
+            }
+            uint32_t n = 0;
+            if (!socketley::parse_whole(pa.args[++i], n) || n < 1
+                || n > client_instance::max_connections_held)
+            {
+                std::cout << "invalid connection count\n";
+                return 1;
+            }
+            cli->set_connections(n);
+            return 0;
+        }
         default:
             return -1;
     }

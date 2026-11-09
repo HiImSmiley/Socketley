@@ -50,6 +50,8 @@ struct runtime_config
     size_t   read_buffer  = 0;
     bool drain = false;
     int reconnect = -1;
+    // A client's --connections, held to the one target; 1 is not written.
+    int connections = 1;
     bool tls = false;
     std::string cert_path;
     std::string key_path;

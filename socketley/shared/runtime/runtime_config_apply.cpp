@@ -1,5 +1,7 @@
 #include "runtime_config_apply.h"
 
+#include <algorithm>
+
 #include "../util/logging.h"
 #include "../persist/state_persistence.h"
 #include "runtime_instance.h"
@@ -588,6 +590,10 @@ void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
         prx.set_compress(cfg.compress);
     }
 
+    // A client opens or closes connections to match, which is the one change of shape a live runtime takes.
+    if (rt.get_type() == runtime_client)
+        static_cast<client_instance&>(rt).set_connections(static_cast<uint32_t>(std::max(cfg.connections, 1)));
+
     // A storage quota is read at each put, so it moves under a serving runtime.
     if (rt.get_type() == runtime_storage)
         static_cast<storage_instance&>(rt).set_max_bytes(cfg.storage_max_bytes);
@@ -654,6 +660,8 @@ void apply_client_config(client_instance& cli, const runtime_config& cfg, bool b
     // without a number.
     if (by_presence ? cfg.has("reconnect") : cfg.reconnect >= 0)
         cli.set_reconnect(cfg.reconnect);
+    if (!by_presence || cfg.has("connections"))
+        cli.set_connections(static_cast<uint32_t>(std::max(cfg.connections, 1)));
 }
 
 bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by_presence, std::string* refusal)
