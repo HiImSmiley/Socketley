@@ -82,14 +82,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### JSON documents over HTTP
 
-MongoDB 9.0.4, PocketBase 0.40.5, 3 passes, 2026-11-08, socketley bce3e552.
+MongoDB 9.0.4, PocketBase 0.40.5, 3 passes, 2026-11-09, socketley 7171898a.
 
 | case | socketley | MongoDB | PocketBase | socketley vs MongoDB | socketley vs PocketBase |
 |---|---|---|---|---|---|
-| read one document by id, 64 clients | 704 K req/s (3.49 cores) | 155 K req/s (3.86 cores) | 35 K req/s (3.86 cores) | 4.61× (4.37–12.17) | 20.45× (19.53–20.54) |
-| replace one document, 64 clients | 125 K req/s (3.10 cores) | 106 K req/s (3.94 cores) | 12 K req/s (2.74 cores) | 1.18× (1.17–1.34) | 10.82× (10.72–11.02) |
-| query on an indexed field, 64 clients | 485 K req/s (3.57 cores) | 82 K req/s (3.89 cores) | 22 K req/s (3.78 cores) | 5.94× (5.88–6.01) | 22.44× (22.21–22.80) |
-| mixed: 90% reads, 10% writes, 64 clients | 334 K req/s (3.59 cores) | 135 K req/s (3.90 cores) | 38 K req/s (3.59 cores) | 2.40× (2.28–2.60) | 8.77× (8.70–8.82) |
+| read one document by id, 64 clients | 734 K req/s (3.45 cores) | 146 K req/s (3.88 cores) | 35 K req/s (3.87 cores) | 5.01× (4.95–5.09) | 21.14× (20.69–21.22) |
+| replace one document, 64 clients | 133 K req/s (3.21 cores) | 100 K req/s (3.94 cores) | 12 K req/s (2.74 cores) | 1.31× (1.30–1.41) | 11.33× (11.17–11.89) |
+| query on an indexed field, 64 clients | 494 K req/s (3.57 cores) | 82 K req/s (3.90 cores) | 22 K req/s (3.76 cores) | 6.16× (6.01–6.19) | 22.75× (21.95–22.79) |
+| mixed: 90% reads, 10% writes, 64 clients | 323 K req/s (3.63 cores) | 131 K req/s (3.90 cores) | 37 K req/s (3.50 cores) | 2.52× (2.38–2.54) | 8.73× (8.73–8.75) |
 
 How it was measured: loadgen, 4s a run, 100,000 documents, data on tmpfs; all three on the same four cores (socketley as four shards), loadgen on 20 others. 100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db hands every write to shard 0, so its writes are at most what one shard takes, at more cores; reads and queries spread over all four.
 
