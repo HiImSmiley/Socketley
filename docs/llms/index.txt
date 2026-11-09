@@ -39,7 +39,7 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
 
 - cache: 3.9× against Redis (GET)
-- server: 5.2× against nginx (1 KiB file, keep-alive, 256 connections)
+- server: 5.6× against nginx (1 KiB file, keep-alive, 256 connections)
 - proxy: 2.0× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
 - web: 4.9× against nginx (page 4 KiB, keep-alive, 256 connections)
 - dns: 1.2× against NSD (A queries over UDP)

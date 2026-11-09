@@ -80,6 +80,7 @@ Every flag of every runtime type, with the types that take it.
 |---|---|---|
 | `-t` | text | Target: The server it connects to, host:port. Types: client. |
 | `--mode` | one of inout, in, out | Mode: Both ways, receive only or send only. Types: client. |
+| `--connections` | int | Connections: How many connections it holds to the target, each with its own id; changing it opens or closes them. Types: client. |
 
 **Proxy**
 

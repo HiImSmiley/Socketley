@@ -9,7 +9,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Daemon flags](man-daemon-flags.txt) (2 entries)
 - [Common flags](man-common-flags.txt) (25 entries)
 - [Server flags](man-server-flags.txt) (18 entries)
-- [Client flags](man-client-flags.txt) (4 entries)
+- [Client flags](man-client-flags.txt) (5 entries)
 - [Proxy flags](man-proxy-flags.txt) (11 entries)
 - [Cache flags](man-cache-flags.txt) (13 entries)
 - [Storage flags](man-storage-flags.txt) (22 entries)

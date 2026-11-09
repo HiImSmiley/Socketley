@@ -414,7 +414,7 @@ Sets how many MiB a cache shard's journal (**--persistent-interval**) may hold b
 
 ### `SOCKETLEY_LUA_TIMEOUT_MS`
 
-Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely, and also turns on LuaJIT's trace compiler. The compiler is worth about 2.4x on a callback that computes, and about 1% on one that does not. See **Callback Deadline**, which prices both halves of that trade.
+Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely: nothing is armed or written for a callback. LuaJIT's trace compiler is on either way. The budget is measured from the start of the callback's loop turn and checked every 100 milliseconds, and a compiled callback that cannot be interrupted is ended by replacing its worker. See **Callback Deadline**.
 
 This is the default for every script that does not declare its own **callback_timeout_ms** global; a script that declares one overrides it. A value that is not a whole number of milliseconds in 0–3600000 is refused with a warning, and the default is used.
 

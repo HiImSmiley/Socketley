@@ -50,7 +50,7 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
 
 - cache: 3.9× against Redis (GET)
-- server: 5.2× against nginx (1 KiB file, keep-alive, 256 connections)
+- server: 5.6× against nginx (1 KiB file, keep-alive, 256 connections)
 - proxy: 2.0× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
 - web: 4.9× against nginx (page 4 KiB, keep-alive, 256 connections)
 - dns: 1.2× against NSD (A queries over UDP)
@@ -483,11 +483,32 @@ Called when the runtime stops.
 
 #### `on_message(msg)`
 
-Called when a message is received (server and client). When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
+Called when a message is received (server and client). A client passes the connection id as a second argument, 1 unless **--connections** is given; see there. When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
 
 #### `on_client_message(client_id, msg) -> true`
 
 Called when a message is received, with the sender's id (server only). It fires alongside on_message, and first. Returning **true** says the script has handled the message, so nothing is sent automatically: not the relay of **--mode inout** or of the master's messages, and not what **--send-to** names for a non-master. Returning anything else, or nothing, leaves those as they are. On a UDP server, client_id names the peer that sent the datagram; see **--udp**. A handler still waiting on **self.cache** when the relay runs has not returned yet, so its message is relayed; define on_message to stop the relay for such a script.
+
+#### `on_messages(chunk, id)` / `on_client_messages(client_id, chunk) -> true`
+
+The batch forms of on_message (client) and on_client_message (server): every complete line of one read in one call, instead of one call per line. **chunk** is the bytes as they arrived, up to and including the read's last newline, so every line in it ends with its '\n', a CRLF line keeps its '\r' and an empty line is a bare '\n'. An unfinished last line is kept and arrives at the start of the next call. When a script defines both forms, only the batch one is called.
+
+A client calls on_messages for its TCP, unix-socket and TLS reads, with the connection's id after the chunk (see **--connections**). A server calls on_client_messages for a TCP line connection; returning **true** answers for every line in the chunk, as on_client_message's **true** does for one. A route or pipe the script sets from on_client_messages carries the next read on: the lines of the chunk it was handed are its own and are not sent on as well. Where there is no read to batch, each message is a chunk of one line with its '\n' added, and a message that itself holds a newline reads as more than one line there, so a script for such a runtime is better written with on_message: a datagram (**--udp**), a WebSocket message, a server in **--mode master** or with **--rate-limit** or **--global-rate-limit**, which judge each line on its own. **-w**, bash output and an interactive attach still see each line, exactly as with on_message.
+
+A call per read instead of per line pays where the script takes the chunk whole: measured on one core, a server echoing 64 connections of 16 pipelined 64-byte lines with one **self.send** per chunk answered 1.6 times as many as with on_client_message. A script that walks the chunk line by line in Lua spends about what the calls it saves cost: counting 64-byte lines with string.find as below came to 5 per cent fewer than with on_message, and with 4 KiB lines, where copying the chunk into Lua is the cost, a third fewer. Counting the lines of a chunk:
+
+```
+local n = 0
+function on_messages(chunk)
+    local i = 1
+    while true do
+        local j = string.find(chunk, "\n", i, true)
+        if not j then break end
+        n = n + 1      -- the line is chunk:sub(i, j - 1)
+        i = j + 1
+    end
+end
+```
 
 #### `on_http_body(client_id, chunk, remaining)`
 
@@ -535,7 +556,7 @@ Called when an upstream's write queue has come back under **self.watermark()**. 
 
 Called when this connection's write queue has come back under **self.watermark()**. A producer that stopped because **self.pending(client_id)** was high can then carry on. The callback is edge-triggered: it fires once per crossing, not once per completed write.
 
-A client runtime has the same callback without the argument, **on_writable()**, because it has one connection, and a number naming it would be a fiction. A client's refusal to send also names its real cause. A connected **--mode out** client whose server has stopped reading is refused with a reason that names the backlog. It is not told it "is not connected to its server, or was created --mode in and does not send", three statements that are all false of it. Measured with 400 chunks of 64 KB sent to a peer reading nothing: 129 taken, 271 refused, 8,396,928 bytes queued.
+A client runtime passes its connection id, **on_writable(id)**. It is 1 unless **--connections** is given. A client's refusal to send also names its real cause. A connected **--mode out** client whose server has stopped reading is refused with a reason that names the backlog. It is not told it "is not connected to its server, or was created --mode in and does not send", three statements that are all false of it. Measured with 400 chunks of 64 KB sent to a peer reading nothing: 129 taken, 271 refused, 8,396,928 bytes queued.
 
 This callback is what makes a body larger than the queue limit sendable at all. Without it, a script had only the hard limit, with nothing leading up to it: at 8 MiB the connection is closed. The only safe strategy was to know the limit in advance and never approach it. Measured with a client reading in 256 KB bites with a 5 ms pause, sending 200 chunks of 64 KB (13,107,400 bytes):
 
@@ -566,7 +587,7 @@ Called when a client connects (server and client). It is also called on a sub-se
 
 #### `on_disconnect(client_id)`
 
-Called when a client disconnects (server and client).
+Called when a client disconnects (server and client). A client's **on_connect** and **on_disconnect** are given the descriptor and then the connection id; see **--connections**.
 
 #### `on_rcpt(rcpt, default) -> bool`
 
@@ -1280,7 +1301,7 @@ socketley web stop
 
 #### `send name [message]`
 
-Send a message to a running server or client runtime. For a server, the message is broadcast to all connected clients. For a client, the message is sent to the connected server. The command respects the runtime's mode setting, and fails if the mode is receive-only.
+Send a message to a running server or client runtime. For a server, the message is broadcast to all connected clients. For a client, the message is sent to the connected server. A client holding several connections (**--connections**) sends each message on one of them, the next connected one in turn. The command respects the runtime's mode setting, and fails if the mode is receive-only.
 
 #### `mail send --to address [--cc|--bcc address] [--from address] [--reply-to address] [--subject text] [--text text] [--html file] [--attach file[:type]] [--inline image] [--header 'Name: value'] [--raw]`
 
@@ -2194,7 +2215,7 @@ Sets how many MiB a cache shard's journal (**--persistent-interval**) may hold b
 
 #### `SOCKETLEY_LUA_TIMEOUT_MS`
 
-Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely, and also turns on LuaJIT's trace compiler. The compiler is worth about 2.4x on a callback that computes, and about 1% on one that does not. See **Callback Deadline**, which prices both halves of that trade.
+Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely: nothing is armed or written for a callback. LuaJIT's trace compiler is on either way. The budget is measured from the start of the callback's loop turn and checked every 100 milliseconds, and a compiled callback that cannot be interrupted is ended by replacing its worker. See **Callback Deadline**.
 
 This is the default for every script that does not declare its own **callback_timeout_ms** global; a script that declares one overrides it. A value that is not a whole number of milliseconds in 0–3600000 is refused with a warning, and the default is used.
 
@@ -2589,6 +2610,7 @@ Every flag a client runtime takes, by group.
 |---|---|---|
 | `-t` | text | Target: The server it connects to, host:port. |
 | `--mode` | one of inout, in, out | Mode: Both ways, receive only or send only. |
+| `--connections` | int | Connections: How many connections it holds to the target, each with its own id; changing it opens or closes them. |
 
 ## Benchmarks
 
@@ -2596,79 +2618,79 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### A client in an application: consuming, asking, holding, dialling
 
-Go 1.24.6, Node.js 24.22.1, Python asyncio 3.14.4, 3 passes, 2026-11-09, socketley 7171898a.
+Go 1.24.6, Node.js 24.22.1, Python asyncio 3.14.4, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | Go | Node.js | Python asyncio | socketley vs Go | socketley vs Node.js | socketley vs Python asyncio |
 |---|---|---|---|---|---|---|---|
-| consume: a firehose of 64 B lines, TCP | 24.35 M lines/s (1.00 cores) | 128.62 M lines/s (1.00 cores) | 17.69 M lines/s (1.00 cores) | 18.25 M lines/s (1.00 cores) | 0.19× (0.19–0.20) | 1.38× (1.37–1.40) | 1.33× (1.16–1.58) |
-| consume: a firehose of 64 B lines, unix socket | 24.99 M lines/s (1.00 cores) | 126.32 M lines/s (1.00 cores) | 18.51 M lines/s (1.00 cores) | 20.65 M lines/s (1.00 cores) | 0.20× (0.20–0.20) | 1.35× (1.35–1.37) | 1.21× (1.20–1.24) |
-| consume: a firehose of 4 KiB lines, TCP | 3.19 M lines/s (1.00 cores) | 4.04 M lines/s (1.00 cores) | 1.59 M lines/s (1.00 cores) | 762 K lines/s (1.00 cores) | 0.79× (0.77–0.81) | 2.00× (1.93–2.15) | 4.18× (4.08–6.67) |
-| consume: a firehose of 64 B lines, TLS 1.3 | 21.19 M lines/s (1.00 cores) | 62.49 M lines/s (1.00 cores) | 16.59 M lines/s (1.00 cores) | 14.01 M lines/s (1.00 cores) | 0.34× (0.34–0.34) | 1.30× (1.26–1.31) | 1.54× (1.50–1.55) |
-| request-answer: 1 connection, 64 B each way | 31 K req/s (0.55 cores) | 28 K req/s (0.68 cores) | 28 K req/s (0.71 cores) | 17 K req/s (0.82 cores) | 1.11× (1.11–1.12) | 1.12× (1.11–1.12) | 1.84× (1.81–1.84) |
-| request-answer: 1 connection, 64 B each way, round trip p50 | 30.3 µs (0.55 cores) | 33.0 µs (0.68 cores) | 34.6 µs (0.71 cores) | 57.6 µs (0.82 cores) | 1.09× (1.09–1.10) | 1.14× (1.12–1.14) | 1.90× (1.88–1.92) |
-| request-answer: 1 connection, 64 B each way, round trip p99 | 44.3 µs (0.55 cores) | 51.5 µs (0.68 cores) | 48.9 µs (0.71 cores) | 77.3 µs (0.82 cores) | 1.16× (1.12–1.20) | 1.08× (1.08–1.12) | 1.72× (1.71–1.75) |
-| request-answer: 64 connections held, 64 B each way | 81 K req/s (1.00 cores) | 409 K req/s (1.00 cores) | 254 K req/s (1.00 cores) | 75 K req/s (1.00 cores) | 0.20× (0.20–0.20) | 0.32× (0.31–0.32) | 1.08× (1.02–1.11) |
-| request-answer: 64 connections held, 64 B each way, round trip p50 | 766 µs (1.00 cores) | 148 µs (1.00 cores) | 245 µs (1.00 cores) | 848 µs (1.00 cores) | 0.20× (0.19–0.20) | 0.32× (0.32–0.32) | 1.12× (1.05–1.13) |
-| request-answer: 64 connections held, 64 B each way, round trip p99 | 1630 µs (1.00 cores) | 301 µs (1.00 cores) | 494 µs (1.00 cores) | 1221 µs (1.00 cores) | 0.18× (0.18–0.19) | 0.30× (0.30–0.30) | 0.74× (0.63–0.79) |
-| request-answer over UDP: 1 socket, 64 B datagrams | 34 K req/s (0.54 cores) | 31 K req/s (0.65 cores) | 27 K req/s (0.74 cores) | 22 K req/s (0.80 cores) | 1.08× (1.08–1.09) | 1.23× (1.22–1.25) | 1.52× (1.50–1.56) |
-| request-answer over UDP: 1 socket, 64 B datagrams, round trip p50 | 28.5 µs (0.54 cores) | 31.6 µs (0.65 cores) | 35.1 µs (0.74 cores) | 43.8 µs (0.80 cores) | 1.12× (1.11–1.12) | 1.23× (1.23–1.26) | 1.53× (1.49–1.57) |
-| request-answer over UDP: 1 socket, 64 B datagrams, round trip p99 | 42.2 µs (0.54 cores) | 46.8 µs (0.65 cores) | 49.4 µs (0.74 cores) | 61.7 µs (0.80 cores) | 1.11× (1.10–1.14) | 1.18× (1.16–1.20) | 1.46× (1.42–1.57) |
-| connect: 200 connections dialled and held | 157.0 conn/s (0.95 cores) | 6.5 K conn/s (0.31 cores) | 7.3 K conn/s (0.55 cores) | 10 K conn/s (1.02 cores) | 0.02× (0.02–0.02) | 0.02× (0.02–0.02) | 0.01× (0.01–0.02) |
-| connect: 200 TLS connections, each a full verified handshake | 124.0 conn/s (0.97 cores) | 3.4 K conn/s (1.28 cores) | 2.2 K conn/s (1.91 cores) | 2.9 K conn/s (2.28 cores) | 0.04× (0.04–0.04) | 0.06× (0.04–0.06) | 0.04× (0.04–0.05) |
-| held: 200 idle connections, memory per connection | 2.2 K KiB (0.00 cores) | 23.3 KiB (0.00 cores) | 267.0 KiB (0.00 cores) | 77.0 KiB (0.00 cores) | 0.01× (0.01–0.01) | 0.12× (0.12–0.12) | 0.04× (0.04–0.04) |
+| consume: a firehose of 64 B lines, TCP | 40.49 M lines/s (1.00 cores) | 128.64 M lines/s (1.00 cores) | 18.74 M lines/s (1.00 cores) | 16.01 M lines/s (1.00 cores) | 0.31× (0.30–0.32) | 2.16× (2.07–2.22) | 2.44× (2.43–2.56) |
+| consume: a firehose of 64 B lines, unix socket | 40.66 M lines/s (1.00 cores) | 127.60 M lines/s (1.00 cores) | 18.65 M lines/s (1.00 cores) | 20.89 M lines/s (1.00 cores) | 0.32× (0.32–0.32) | 2.18× (2.15–2.21) | 1.96× (1.94–1.96) |
+| consume: a firehose of 4 KiB lines, TCP | 3.31 M lines/s (1.00 cores) | 4.12 M lines/s (1.00 cores) | 1.59 M lines/s (1.00 cores) | 775 K lines/s (1.00 cores) | 0.81× (0.80–0.83) | 2.08× (2.08–2.09) | 4.30× (4.25–4.58) |
+| consume: a firehose of 64 B lines, TLS 1.3 | 33.20 M lines/s (1.00 cores) | 62.51 M lines/s (1.00 cores) | 16.92 M lines/s (1.00 cores) | 14.35 M lines/s (1.00 cores) | 0.53× (0.53–0.54) | 1.96× (1.93–1.97) | 2.31× (2.30–2.41) |
+| request-answer: 1 connection, 64 B each way | 32 K req/s (0.55 cores) | 28 K req/s (0.68 cores) | 28 K req/s (0.71 cores) | 17 K req/s (0.82 cores) | 1.12× (1.11–1.12) | 1.13× (1.12–1.14) | 1.85× (1.83–1.85) |
+| request-answer: 1 connection, 64 B each way, round trip p50 | 30.3 µs (0.55 cores) | 33.0 µs (0.68 cores) | 34.6 µs (0.71 cores) | 57.6 µs (0.82 cores) | 1.09× (1.04–1.10) | 1.14× (1.12–1.15) | 1.92× (1.90–1.92) |
+| request-answer: 1 connection, 64 B each way, round trip p99 | 43.3 µs (0.55 cores) | 50.9 µs (0.68 cores) | 47.9 µs (0.71 cores) | 76.3 µs (0.82 cores) | 1.18× (1.18–1.18) | 1.11× (1.11–1.13) | 1.76× (1.74–1.76) |
+| request-answer: 64 connections held, 64 B each way | 583 K req/s (1.00 cores) | 402 K req/s (1.00 cores) | 250 K req/s (1.00 cores) | 82 K req/s (1.00 cores) | 1.45× (1.44–1.45) | 2.33× (2.18–2.39) | 7.08× (6.71–7.57) |
+| request-answer: 64 connections held, 64 B each way, round trip p50 | 112 µs (1.00 cores) | 153 µs (1.00 cores) | 247 µs (1.00 cores) | 774 µs (1.00 cores) | 1.36× (1.34–1.38) | 2.20× (2.04–2.24) | 6.90× (6.54–7.20) |
+| request-answer: 64 connections held, 64 B each way, round trip p99 | 163 µs (1.00 cores) | 309 µs (1.00 cores) | 498 µs (1.00 cores) | 1004 µs (1.00 cores) | 1.90× (1.88–1.93) | 3.02× (2.93–3.11) | 6.16× (5.76–7.60) |
+| request-answer over UDP: 1 socket, 64 B datagrams | 34 K req/s (0.53 cores) | 31 K req/s (0.66 cores) | 27 K req/s (0.74 cores) | 23 K req/s (0.78 cores) | 1.09× (1.09–1.10) | 1.23× (1.23–1.25) | 1.50× (1.50–1.50) |
+| request-answer over UDP: 1 socket, 64 B datagrams, round trip p50 | 28.3 µs (0.53 cores) | 30.8 µs (0.66 cores) | 35.1 µs (0.74 cores) | 43.3 µs (0.78 cores) | 1.08× (1.08–1.09) | 1.24× (1.23–1.26) | 1.52× (1.51–1.57) |
+| request-answer over UDP: 1 socket, 64 B datagrams, round trip p99 | 41.2 µs (0.53 cores) | 49.4 µs (0.66 cores) | 48.9 µs (0.74 cores) | 59.6 µs (0.78 cores) | 1.20× (1.17–1.23) | 1.19× (1.17–1.20) | 1.45× (1.41–1.47) |
+| connect: 200 connections dialled and held | 34 K conn/s (1.87 cores) | 7.5 K conn/s (0.39 cores) | 6.9 K conn/s (0.60 cores) | 9.0 K conn/s (0.97 cores) | 4.47× (4.11–5.07) | 5.08× (4.50–5.64) | 3.97× (3.38–4.11) |
+| connect: 200 TLS connections, each a full verified handshake | 6.3 K conn/s (2.24 cores) | 2.9 K conn/s (1.41 cores) | 2.1 K conn/s (1.94 cores) | 2.4 K conn/s (2.30 cores) | 2.18× (1.90–2.58) | 2.99× (2.78–3.05) | 2.58× (2.41–2.69) |
+| held: 200 idle connections, memory per connection | 62.7 KiB (0.00 cores) | 24.6 KiB (0.00 cores) | 271.0 KiB (0.00 cores) | 76.8 KiB (0.00 cores) | 0.39× (0.39–0.40) | 4.32× (4.32–4.41) | 1.22× (1.22–1.25) |
 
-How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every client arm on one core, the Go target (clientgen) on four others. Every client on the same one core, the target (a Go program) on four others with headroom: every row records the target's cores, and none used all four. socketley is one client runtime per connection with its Lua on_message as the handler; the others are one process with the same logic. Every count is taken at the target: a consumer's count must equal the lines sent, every request's size is checked, and a round trip is the interval between one connection's requests as the target sees them. The firehose rows are bound by the client's core, where socketley calls Lua once per line. With 64 connections socketley is 64 processes on one core, so a request costs a context switch, and a connection holds a process's memory. Connecting is creating a runtime each (socketley create ... -s from a shell loop), where the others dial from one process.
+How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every client arm on one core, the Go target (clientgen) on four others. Every client on the same one core, the target (a Go program) on four others with headroom: every row records the target's cores, and none used all four. socketley is one client runtime holding every connection (--connections N) with its Lua on_message as the handler; the others are one process with the same logic. Every count is taken at the target: a consumer's count must equal the lines sent, every request's size is checked, and a round trip is the interval between one connection's requests as the target sees them. The firehose rows are bound by the client's core, where socketley calls Lua once per line. Connecting is that one runtime dialling all of them, as the others dial from one process; the memory row is the runtime's whole process divided by its connections. One runtime per connection instead, each made with socketley create ... -s from a shell loop, is a process each: 386 created and connected a second, 243 with TLS, and 1,546 KiB each held.
 
 ### Generating load: lines as fast as the connection takes them
 
-tcpkali 1.1.1, Go 1.24.6, 3 passes, 2026-11-09, socketley 7171898a.
+tcpkali 1.1.1, Go 1.24.6, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | tcpkali | Go | socketley vs tcpkali | socketley vs Go |
 |---|---|---|---|---|---|
-| send: 64 B lines as fast as the connection takes them, TCP | 23.77 M lines/s (1.00 cores) | 98.66 M lines/s (1.00 cores) | 68.27 M lines/s (1.00 cores) | 0.24× (0.22–0.27) | 0.35× (0.34–0.35) |
-| send: 4 KiB lines, TCP | 2.35 M lines/s (1.00 cores) | 1.56 M lines/s (1.00 cores) | 1.39 M lines/s (1.00 cores) | 1.50× (1.47–1.85) | 1.74× (1.66–2.07) |
+| send: 64 B lines as fast as the connection takes them, TCP | 25.92 M lines/s (1.00 cores) | 101.30 M lines/s (1.00 cores) | 68.96 M lines/s (1.00 cores) | 0.26× (0.23–0.27) | 0.38× (0.37–0.39) |
+| send: 4 KiB lines, TCP | 2.70 M lines/s (1.00 cores) | 1.57 M lines/s (1.00 cores) | 1.48 M lines/s (1.00 cores) | 1.73× (1.66–1.74) | 1.81× (1.81–1.83) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every sender on one core, the Go sink on four others. Sending as fast as the connection takes it, counted at a sink on other cores. socketley paces with self.pending() and on_writable and sends one line per self.send call; tcpkali repeats its message into large writes; Go makes one buffered write call per line. All are bound by the client's core.
 
 ### Generating load over a unix socket and TLS
 
-Go 1.24.6, 3 passes, 2026-11-09, socketley 7171898a.
+Go 1.24.6, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | Go | socketley vs Go |
 |---|---|---|---|
-| send: 64 B lines, unix socket | 24.24 M lines/s (1.00 cores) | 162.00 M lines/s (1.00 cores) | 0.15× (0.14–0.18) |
-| send: 64 B lines, TLS 1.3 | 21.77 M lines/s (1.00 cores) | 33.08 M lines/s (1.00 cores) | 0.67× (0.65–0.69) |
+| send: 64 B lines, unix socket | 27.32 M lines/s (1.00 cores) | 168.04 M lines/s (1.00 cores) | 0.16× (0.16–0.18) |
+| send: 64 B lines, TLS 1.3 | 23.90 M lines/s (1.00 cores) | 17.70 M lines/s (1.00 cores) | 1.34× (0.63–1.36) |
 
-How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every sender on one core, the Go sink on four others. The same over a unix socket and over TLS 1.3, which tcpkali does not speak. Over TLS Go's rate takes one of two levels from pass to pass in every run, about 21 or 33-37 million lines a second, while socketley's stays at 20-22 million; the median falls on whichever level most passes took.
+How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every sender on one core, the Go sink on four others. The same over a unix socket and over TLS 1.3, which tcpkali does not speak. Over TLS Go's rate takes one of two levels from pass to pass in every run, about 18-21 or 33-38 million lines a second, while socketley's stays within a few per cent of its median; the ratio falls on whichever level most of Go's passes took.
 
 ### Driving a Redis-protocol server
 
-redis-benchmark 8.0.5, 3 passes, 2026-11-09, socketley 7171898a.
+redis-benchmark 8.0.5, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | redis-benchmark | socketley vs redis-benchmark |
 |---|---|---|---|
-| pipelined INCR to a socketley cache, depth 32, 1 connection | 904 K /s (0.60 cores) | 919 K /s (0.62 cores) | 0.98× (0.98–0.98) |
-| pipelined INCR to a socketley cache, depth 32, 4 connections | 2.02 M /s (1.00 cores) | 7.28 M /s (0.99 cores) | 0.28× (0.27–0.28) |
+| pipelined INCR to a socketley cache, depth 32, 1 connection | 933 K /s (0.58 cores) | 910 K /s (0.62 cores) | 1.02× (1.02–1.03) |
+| pipelined INCR to a socketley cache, depth 32, 4 connections | 4.72 M /s (0.94 cores) | 6.03 M /s (0.99 cores) | 0.78× (0.76–0.78) |
 
-How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; each client on one core, the socketley cache on another. A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley is four processes on one core.
+How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; each client on one core, the socketley cache on another. A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley's runtime holds four connections, as redis-benchmark's one thread does.
 
 ### A line from a shell script
 
-socat 1.8.1.1, bash /dev/tcp, 3 passes, 2026-11-09, socketley 7171898a.
+socat 1.8.1.1, bash /dev/tcp, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | socat | bash /dev/tcp | socketley vs socat | socketley vs bash /dev/tcp |
 |---|---|---|---|---|---|
-| one line from the shell, 1,000 in a row | 1.0 K lines/s (1.00 cores) | 1.2 K lines/s (1.00 cores) | 26 K lines/s (0.99 cores) | 0.90× (0.89–0.90) | 0.04× (0.04–0.04) |
+| one line from the shell, 1,000 in a row | 1.4 K lines/s (1.00 cores) | 1.2 K lines/s (1.00 cores) | 32 K lines/s (0.98 cores) | 1.20× (1.19–1.20) | 0.04× (0.04–0.05) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; the shell loop on one core, the Go sink on four others. One line per command from a shell loop, until the sink has the last one. socketley send writes onto the connection a client runtime holds; socat opens a connection per line (nodelay); bash's /dev/tcp is a builtin with no process to start, bound by the connection set-up alone.
 
 ### A line from a shell script to a TLS service
 
-socat 1.8.1.1, 3 passes, 2026-11-09, socketley 7171898a.
+socat 1.8.1.1, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | socat | socketley vs socat |
 |---|---|---|---|
-| one line from the shell to a TLS service, 1,000 in a row | 1.0 K lines/s (1.00 cores) | 362.0 lines/s (0.96 cores) | 2.81× (2.81–2.85) |
+| one line from the shell to a TLS service, 1,000 in a row | 1.3 K lines/s (1.00 cores) | 362.0 lines/s (0.96 cores) | 3.71× (3.70–3.74) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; the shell loop on one core, the Go sink on four others. As above, to a TLS service: socketley's connection is held and verified once, socat makes a verified handshake per line (nodelay; without it every line waited 40 ms).
 
@@ -3778,61 +3800,61 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### WebSocket: echo and a chat room's fan-out
 
-socketley, no script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.22.1), 3 passes, 2026-11-09, socketley 7171898a.
+socketley, no script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.22.1), 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | socketley, no script | ws 8.22.0 (Node 24.22.1) | uWebSockets.js 20.71.0 (Node 24.22.1) | socketley vs socketley, no script | socketley vs ws 8.22.0 (Node 24.22.1) | socketley vs uWebSockets.js 20.71.0 (Node 24.22.1) |
 |---|---|---|---|---|---|---|---|
-| echo, 64 B messages, 256 connections, one in flight each | 301 K msg/s (1.00 cores) | 322 K msg/s (1.00 cores) | 151 K msg/s (1.00 cores) | 225 K msg/s (1.00 cores) | 0.94× (0.94–0.95) | 2.00× (1.91–2.10) | 1.34× (1.31–1.35) |
-| room fan-out: 1 sender to 100 receivers, 64 B | 5.95 M msg/s (1.00 cores) | 5.98 M msg/s (0.99 cores) | 298 K msg/s (1.00 cores) | 5.39 M msg/s (1.00 cores) | 1.00× (0.99–1.00) | 19.94× (19.82–20.07) | 1.10× (1.09–1.14) |
-| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.11 M msg/s (1.00 cores) | 6.13 M msg/s (1.00 cores) | 275 K msg/s (1.00 cores) | 5.60 M msg/s (1.00 cores) | 1.01× (0.99–1.02) | 22.27× (21.88–23.47) | 1.09× (1.08–1.12) |
+| echo, 64 B messages, 256 connections, one in flight each | 307 K msg/s (1.00 cores) | 323 K msg/s (1.00 cores) | 148 K msg/s (1.00 cores) | 229 K msg/s (1.00 cores) | 0.95× (0.92–0.95) | 2.05× (2.04–2.07) | 1.34× (1.26–1.36) |
+| room fan-out: 1 sender to 100 receivers, 64 B | 6.00 M msg/s (1.00 cores) | 6.06 M msg/s (1.00 cores) | 303 K msg/s (1.00 cores) | 5.42 M msg/s (1.00 cores) | 0.99× (0.98–1.01) | 19.75× (19.70–19.87) | 1.10× (1.10–1.12) |
+| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.23 M msg/s (1.00 cores) | 6.10 M msg/s (1.00 cores) | 292 K msg/s (1.00 cores) | 5.62 M msg/s (1.00 cores) | 1.02× (1.01–1.02) | 21.33× (20.97–21.48) | 1.09× (1.08–1.11) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others. The same logic in each: an echo, and a room that a receiver enters by sending "join", with one sender's messages counted at every receiver. socketley runs it in Lua (join_group/group_send) and, as "no script", on its built-in relay; ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes.
 
 ### TCP line protocol, answered by a handler
 
-socketley, no script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-09, socketley 7171898a.
+socketley, no script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | socketley, no script | Node 24.22.1 net | Go 1.24.6 net | socketley vs socketley, no script | socketley vs Node 24.22.1 net | socketley vs Go 1.24.6 net |
 |---|---|---|---|---|---|---|---|
-| line echo, 64 B, 256 connections, one in flight each | 303 K msg/s (1.00 cores) | 334 K msg/s (1.00 cores) | 200 K msg/s (1.00 cores) | 225 K msg/s (1.00 cores) | 0.91× (0.89–0.91) | 1.52× (1.50–1.56) | 1.33× (1.33–1.35) |
-| line echo, 64 B, 64 connections, 16 pipelined each | 2.58 M msg/s (1.00 cores) | 4.66 M msg/s (1.00 cores) | 2.33 M msg/s (1.00 cores) | 3.29 M msg/s (1.00 cores) | 0.56× (0.55–0.56) | 1.11× (1.11–1.11) | 0.79× (0.78–0.79) |
+| line echo, 64 B, 256 connections, one in flight each | 304 K msg/s (1.00 cores) | 330 K msg/s (1.00 cores) | 200 K msg/s (1.00 cores) | 226 K msg/s (1.00 cores) | 0.91× (0.91–0.95) | 1.52× (1.50–1.57) | 1.35× (1.33–1.36) |
+| line echo, 64 B, 64 connections, 16 pipelined each | 2.98 M msg/s (1.00 cores) | 4.72 M msg/s (1.00 cores) | 2.33 M msg/s (1.00 cores) | 3.28 M msg/s (1.00 cores) | 0.63× (0.63–0.64) | 1.29× (1.28–1.29) | 0.91× (0.91–0.91) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen on 20 others. Every line is handed to a handler that answers with the line: Lua on socketley, a function on Node's net, a goroutine with bufio in Go. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work.
 
 ### UDP datagrams answered
 
-Node 24.22.1 dgram, Go 1.24.6 net, socketley, Lua, 3 passes, 2026-11-09, socketley 7171898a.
+Node 24.22.1 dgram, Go 1.24.6 net, socketley, Lua, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley, no script | Node 24.22.1 dgram | Go 1.24.6 net | socketley, Lua | socketley vs Node 24.22.1 dgram | socketley vs Go 1.24.6 net | socketley vs socketley, Lua |
 |---|---|---|---|---|---|---|---|
-| datagram echo, 64 B, 128 sockets, one in flight each | 518 K datagrams/s (1.00 cores) | 165 K datagrams/s (1.00 cores) | 434 K datagrams/s (1.00 cores) | 437 K datagrams/s (1.00 cores) | 3.15× (3.06–3.18) | 1.19× (1.17–1.21) | 1.19× (1.18–1.20) |
-| datagram echo, 1 KiB, 128 sockets, one in flight each | 489 K datagrams/s (1.00 cores) | 188 K datagrams/s (1.00 cores) | 419 K datagrams/s (1.00 cores) | 385 K datagrams/s (1.00 cores) | 2.60× (2.58–2.65) | 1.19× (1.15–1.19) | 1.28× (1.26–1.29) |
+| datagram echo, 64 B, 128 sockets, one in flight each | 520 K datagrams/s (1.00 cores) | 164 K datagrams/s (1.00 cores) | 434 K datagrams/s (1.00 cores) | 441 K datagrams/s (1.00 cores) | 3.16× (3.15–3.23) | 1.21× (1.19–1.21) | 1.17× (1.16–1.19) |
+| datagram echo, 1 KiB, 128 sockets, one in flight each | 490 K datagrams/s (1.00 cores) | 186 K datagrams/s (1.00 cores) | 414 K datagrams/s (1.00 cores) | 396 K datagrams/s (1.00 cores) | 2.63× (2.61–2.71) | 1.18× (1.18–1.21) | 1.24× (1.23–1.24) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen (128 sockets) on 20 others. Node and Go are given the 1 MiB receive buffer socketley sets; at the kernel's default they lost datagrams at 1 KiB. No arm lost any.
 
 ### HTTP: static files and a fixed answer
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 7171898a.
+nginx 1.28.3, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 269 K req/s (1.00 cores) | 51 K req/s (0.99 cores) | 5.22× (5.20–5.26) |
-| 64 KiB file, keep-alive, 256 connections | 97 K req/s (1.00 cores) | 46 K req/s (0.99 cores) | 2.12× (2.01–2.12) |
-| 1 KiB file, a connection per request, 64 at once | 76 K req/s (0.99 cores) | 34 K req/s (1.00 cores) | 2.24× (2.19–2.35) |
-| fixed answer (Lua handler / nginx return), keep-alive | 205 K req/s (0.99 cores) | 83 K req/s (1.00 cores) | 2.48× (2.43–2.79) |
+| 1 KiB file, keep-alive, 256 connections | 277 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 5.55× (5.46–5.68) |
+| 64 KiB file, keep-alive, 256 connections | 94 K req/s (0.99 cores) | 45 K req/s (0.99 cores) | 2.07× (2.06–2.20) |
+| 1 KiB file, a connection per request, 64 at once | 81 K req/s (0.99 cores) | 34 K req/s (1.00 cores) | 2.40× (2.35–2.60) |
+| fixed answer (Lua handler / nginx return), keep-alive | 252 K req/s (1.00 cores) | 72 K req/s (0.99 cores) | 3.48× (3.15–3.62) |
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ### HTTP on four cores
 
-nginx 1.28.3, 3 passes, 2026-11-08, socketley bce3e552.
+nginx 1.28.3, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 515 K req/s (3.99 cores) | 231 K req/s (3.99 cores) | 2.22× (2.20–2.28) |
-| 64 KiB file, keep-alive, 256 connections | 240 K req/s (3.99 cores) | 167 K req/s (3.99 cores) | 1.44× (1.43–1.45) |
-| 1 KiB file, a connection per request, 64 at once | 158 K req/s (3.93 cores) | 133 K req/s (3.89 cores) | 1.19× (1.18–1.20) |
-| fixed answer (Lua handler / nginx return), keep-alive | 429 K req/s (3.99 cores) | 311 K req/s (3.99 cores) | 1.38× (1.37–1.41) |
+| 1 KiB file, keep-alive, 256 connections | 518 K req/s (3.99 cores) | 232 K req/s (3.99 cores) | 2.23× (2.22–2.23) |
+| 64 KiB file, keep-alive, 256 connections | 236 K req/s (3.99 cores) | 169 K req/s (3.99 cores) | 1.40× (1.37–1.41) |
+| 1 KiB file, a connection per request, 64 at once | 160 K req/s (3.94 cores) | 133 K req/s (3.89 cores) | 1.20× (1.19–1.21) |
+| fixed answer (Lua handler / nginx return), keep-alive | 447 K req/s (3.99 cores) | 312 K req/s (3.99 cores) | 1.44× (1.43–1.45) |
 
 How it was measured: wrk 16 threads, 4 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
@@ -4344,6 +4366,7 @@ Every flag of every runtime type, with the types that take it.
 |---|---|---|
 | `-t` | text | Target: The server it connects to, host:port. Types: client. |
 | `--mode` | one of inout, in, out | Mode: Both ways, receive only or send only. Types: client. |
+| `--connections` | int | Connections: How many connections it holds to the target, each with its own id; changing it opens or closes them. Types: client. |
 
 **Proxy**
 
@@ -4814,61 +4837,61 @@ How it was measured: 3 redis-benchmark processes × 50 connections, 100 commands
 
 ## WebSocket: echo and a chat room's fan-out
 
-socketley, no script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.22.1), 3 passes, 2026-11-09, socketley 7171898a.
+socketley, no script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.22.1), 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | socketley, no script | ws 8.22.0 (Node 24.22.1) | uWebSockets.js 20.71.0 (Node 24.22.1) | socketley vs socketley, no script | socketley vs ws 8.22.0 (Node 24.22.1) | socketley vs uWebSockets.js 20.71.0 (Node 24.22.1) |
 |---|---|---|---|---|---|---|---|
-| echo, 64 B messages, 256 connections, one in flight each | 301 K msg/s (1.00 cores) | 322 K msg/s (1.00 cores) | 151 K msg/s (1.00 cores) | 225 K msg/s (1.00 cores) | 0.94× (0.94–0.95) | 2.00× (1.91–2.10) | 1.34× (1.31–1.35) |
-| room fan-out: 1 sender to 100 receivers, 64 B | 5.95 M msg/s (1.00 cores) | 5.98 M msg/s (0.99 cores) | 298 K msg/s (1.00 cores) | 5.39 M msg/s (1.00 cores) | 1.00× (0.99–1.00) | 19.94× (19.82–20.07) | 1.10× (1.09–1.14) |
-| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.11 M msg/s (1.00 cores) | 6.13 M msg/s (1.00 cores) | 275 K msg/s (1.00 cores) | 5.60 M msg/s (1.00 cores) | 1.01× (0.99–1.02) | 22.27× (21.88–23.47) | 1.09× (1.08–1.12) |
+| echo, 64 B messages, 256 connections, one in flight each | 307 K msg/s (1.00 cores) | 323 K msg/s (1.00 cores) | 148 K msg/s (1.00 cores) | 229 K msg/s (1.00 cores) | 0.95× (0.92–0.95) | 2.05× (2.04–2.07) | 1.34× (1.26–1.36) |
+| room fan-out: 1 sender to 100 receivers, 64 B | 6.00 M msg/s (1.00 cores) | 6.06 M msg/s (1.00 cores) | 303 K msg/s (1.00 cores) | 5.42 M msg/s (1.00 cores) | 0.99× (0.98–1.01) | 19.75× (19.70–19.87) | 1.10× (1.10–1.12) |
+| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.23 M msg/s (1.00 cores) | 6.10 M msg/s (1.00 cores) | 292 K msg/s (1.00 cores) | 5.62 M msg/s (1.00 cores) | 1.02× (1.01–1.02) | 21.33× (20.97–21.48) | 1.09× (1.08–1.11) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others. The same logic in each: an echo, and a room that a receiver enters by sending "join", with one sender's messages counted at every receiver. socketley runs it in Lua (join_group/group_send) and, as "no script", on its built-in relay; ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes.
 
 ## TCP line protocol, answered by a handler
 
-socketley, no script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-09, socketley 7171898a.
+socketley, no script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | socketley, no script | Node 24.22.1 net | Go 1.24.6 net | socketley vs socketley, no script | socketley vs Node 24.22.1 net | socketley vs Go 1.24.6 net |
 |---|---|---|---|---|---|---|---|
-| line echo, 64 B, 256 connections, one in flight each | 303 K msg/s (1.00 cores) | 334 K msg/s (1.00 cores) | 200 K msg/s (1.00 cores) | 225 K msg/s (1.00 cores) | 0.91× (0.89–0.91) | 1.52× (1.50–1.56) | 1.33× (1.33–1.35) |
-| line echo, 64 B, 64 connections, 16 pipelined each | 2.58 M msg/s (1.00 cores) | 4.66 M msg/s (1.00 cores) | 2.33 M msg/s (1.00 cores) | 3.29 M msg/s (1.00 cores) | 0.56× (0.55–0.56) | 1.11× (1.11–1.11) | 0.79× (0.78–0.79) |
+| line echo, 64 B, 256 connections, one in flight each | 304 K msg/s (1.00 cores) | 330 K msg/s (1.00 cores) | 200 K msg/s (1.00 cores) | 226 K msg/s (1.00 cores) | 0.91× (0.91–0.95) | 1.52× (1.50–1.57) | 1.35× (1.33–1.36) |
+| line echo, 64 B, 64 connections, 16 pipelined each | 2.98 M msg/s (1.00 cores) | 4.72 M msg/s (1.00 cores) | 2.33 M msg/s (1.00 cores) | 3.28 M msg/s (1.00 cores) | 0.63× (0.63–0.64) | 1.29× (1.28–1.29) | 0.91× (0.91–0.91) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen on 20 others. Every line is handed to a handler that answers with the line: Lua on socketley, a function on Node's net, a goroutine with bufio in Go. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work.
 
 ## UDP datagrams answered
 
-Node 24.22.1 dgram, Go 1.24.6 net, socketley, Lua, 3 passes, 2026-11-09, socketley 7171898a.
+Node 24.22.1 dgram, Go 1.24.6 net, socketley, Lua, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley, no script | Node 24.22.1 dgram | Go 1.24.6 net | socketley, Lua | socketley vs Node 24.22.1 dgram | socketley vs Go 1.24.6 net | socketley vs socketley, Lua |
 |---|---|---|---|---|---|---|---|
-| datagram echo, 64 B, 128 sockets, one in flight each | 518 K datagrams/s (1.00 cores) | 165 K datagrams/s (1.00 cores) | 434 K datagrams/s (1.00 cores) | 437 K datagrams/s (1.00 cores) | 3.15× (3.06–3.18) | 1.19× (1.17–1.21) | 1.19× (1.18–1.20) |
-| datagram echo, 1 KiB, 128 sockets, one in flight each | 489 K datagrams/s (1.00 cores) | 188 K datagrams/s (1.00 cores) | 419 K datagrams/s (1.00 cores) | 385 K datagrams/s (1.00 cores) | 2.60× (2.58–2.65) | 1.19× (1.15–1.19) | 1.28× (1.26–1.29) |
+| datagram echo, 64 B, 128 sockets, one in flight each | 520 K datagrams/s (1.00 cores) | 164 K datagrams/s (1.00 cores) | 434 K datagrams/s (1.00 cores) | 441 K datagrams/s (1.00 cores) | 3.16× (3.15–3.23) | 1.21× (1.19–1.21) | 1.17× (1.16–1.19) |
+| datagram echo, 1 KiB, 128 sockets, one in flight each | 490 K datagrams/s (1.00 cores) | 186 K datagrams/s (1.00 cores) | 414 K datagrams/s (1.00 cores) | 396 K datagrams/s (1.00 cores) | 2.63× (2.61–2.71) | 1.18× (1.18–1.21) | 1.24× (1.23–1.24) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen (128 sockets) on 20 others. Node and Go are given the 1 MiB receive buffer socketley sets; at the kernel's default they lost datagrams at 1 KiB. No arm lost any.
 
 ## HTTP: static files and a fixed answer
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 7171898a.
+nginx 1.28.3, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 269 K req/s (1.00 cores) | 51 K req/s (0.99 cores) | 5.22× (5.20–5.26) |
-| 64 KiB file, keep-alive, 256 connections | 97 K req/s (1.00 cores) | 46 K req/s (0.99 cores) | 2.12× (2.01–2.12) |
-| 1 KiB file, a connection per request, 64 at once | 76 K req/s (0.99 cores) | 34 K req/s (1.00 cores) | 2.24× (2.19–2.35) |
-| fixed answer (Lua handler / nginx return), keep-alive | 205 K req/s (0.99 cores) | 83 K req/s (1.00 cores) | 2.48× (2.43–2.79) |
+| 1 KiB file, keep-alive, 256 connections | 277 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 5.55× (5.46–5.68) |
+| 64 KiB file, keep-alive, 256 connections | 94 K req/s (0.99 cores) | 45 K req/s (0.99 cores) | 2.07× (2.06–2.20) |
+| 1 KiB file, a connection per request, 64 at once | 81 K req/s (0.99 cores) | 34 K req/s (1.00 cores) | 2.40× (2.35–2.60) |
+| fixed answer (Lua handler / nginx return), keep-alive | 252 K req/s (1.00 cores) | 72 K req/s (0.99 cores) | 3.48× (3.15–3.62) |
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ## HTTP on four cores
 
-nginx 1.28.3, 3 passes, 2026-11-08, socketley bce3e552.
+nginx 1.28.3, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 515 K req/s (3.99 cores) | 231 K req/s (3.99 cores) | 2.22× (2.20–2.28) |
-| 64 KiB file, keep-alive, 256 connections | 240 K req/s (3.99 cores) | 167 K req/s (3.99 cores) | 1.44× (1.43–1.45) |
-| 1 KiB file, a connection per request, 64 at once | 158 K req/s (3.93 cores) | 133 K req/s (3.89 cores) | 1.19× (1.18–1.20) |
-| fixed answer (Lua handler / nginx return), keep-alive | 429 K req/s (3.99 cores) | 311 K req/s (3.99 cores) | 1.38× (1.37–1.41) |
+| 1 KiB file, keep-alive, 256 connections | 518 K req/s (3.99 cores) | 232 K req/s (3.99 cores) | 2.23× (2.22–2.23) |
+| 64 KiB file, keep-alive, 256 connections | 236 K req/s (3.99 cores) | 169 K req/s (3.99 cores) | 1.40× (1.37–1.41) |
+| 1 KiB file, a connection per request, 64 at once | 160 K req/s (3.94 cores) | 133 K req/s (3.89 cores) | 1.20× (1.19–1.21) |
+| fixed answer (Lua handler / nginx return), keep-alive | 447 K req/s (3.99 cores) | 312 K req/s (3.99 cores) | 1.44× (1.43–1.45) |
 
 How it was measured: wrk 16 threads, 4 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
@@ -5076,79 +5099,79 @@ How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 4s a run
 
 ## A client in an application: consuming, asking, holding, dialling
 
-Go 1.24.6, Node.js 24.22.1, Python asyncio 3.14.4, 3 passes, 2026-11-09, socketley 7171898a.
+Go 1.24.6, Node.js 24.22.1, Python asyncio 3.14.4, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | Go | Node.js | Python asyncio | socketley vs Go | socketley vs Node.js | socketley vs Python asyncio |
 |---|---|---|---|---|---|---|---|
-| consume: a firehose of 64 B lines, TCP | 24.35 M lines/s (1.00 cores) | 128.62 M lines/s (1.00 cores) | 17.69 M lines/s (1.00 cores) | 18.25 M lines/s (1.00 cores) | 0.19× (0.19–0.20) | 1.38× (1.37–1.40) | 1.33× (1.16–1.58) |
-| consume: a firehose of 64 B lines, unix socket | 24.99 M lines/s (1.00 cores) | 126.32 M lines/s (1.00 cores) | 18.51 M lines/s (1.00 cores) | 20.65 M lines/s (1.00 cores) | 0.20× (0.20–0.20) | 1.35× (1.35–1.37) | 1.21× (1.20–1.24) |
-| consume: a firehose of 4 KiB lines, TCP | 3.19 M lines/s (1.00 cores) | 4.04 M lines/s (1.00 cores) | 1.59 M lines/s (1.00 cores) | 762 K lines/s (1.00 cores) | 0.79× (0.77–0.81) | 2.00× (1.93–2.15) | 4.18× (4.08–6.67) |
-| consume: a firehose of 64 B lines, TLS 1.3 | 21.19 M lines/s (1.00 cores) | 62.49 M lines/s (1.00 cores) | 16.59 M lines/s (1.00 cores) | 14.01 M lines/s (1.00 cores) | 0.34× (0.34–0.34) | 1.30× (1.26–1.31) | 1.54× (1.50–1.55) |
-| request-answer: 1 connection, 64 B each way | 31 K req/s (0.55 cores) | 28 K req/s (0.68 cores) | 28 K req/s (0.71 cores) | 17 K req/s (0.82 cores) | 1.11× (1.11–1.12) | 1.12× (1.11–1.12) | 1.84× (1.81–1.84) |
-| request-answer: 1 connection, 64 B each way, round trip p50 | 30.3 µs (0.55 cores) | 33.0 µs (0.68 cores) | 34.6 µs (0.71 cores) | 57.6 µs (0.82 cores) | 1.09× (1.09–1.10) | 1.14× (1.12–1.14) | 1.90× (1.88–1.92) |
-| request-answer: 1 connection, 64 B each way, round trip p99 | 44.3 µs (0.55 cores) | 51.5 µs (0.68 cores) | 48.9 µs (0.71 cores) | 77.3 µs (0.82 cores) | 1.16× (1.12–1.20) | 1.08× (1.08–1.12) | 1.72× (1.71–1.75) |
-| request-answer: 64 connections held, 64 B each way | 81 K req/s (1.00 cores) | 409 K req/s (1.00 cores) | 254 K req/s (1.00 cores) | 75 K req/s (1.00 cores) | 0.20× (0.20–0.20) | 0.32× (0.31–0.32) | 1.08× (1.02–1.11) |
-| request-answer: 64 connections held, 64 B each way, round trip p50 | 766 µs (1.00 cores) | 148 µs (1.00 cores) | 245 µs (1.00 cores) | 848 µs (1.00 cores) | 0.20× (0.19–0.20) | 0.32× (0.32–0.32) | 1.12× (1.05–1.13) |
-| request-answer: 64 connections held, 64 B each way, round trip p99 | 1630 µs (1.00 cores) | 301 µs (1.00 cores) | 494 µs (1.00 cores) | 1221 µs (1.00 cores) | 0.18× (0.18–0.19) | 0.30× (0.30–0.30) | 0.74× (0.63–0.79) |
-| request-answer over UDP: 1 socket, 64 B datagrams | 34 K req/s (0.54 cores) | 31 K req/s (0.65 cores) | 27 K req/s (0.74 cores) | 22 K req/s (0.80 cores) | 1.08× (1.08–1.09) | 1.23× (1.22–1.25) | 1.52× (1.50–1.56) |
-| request-answer over UDP: 1 socket, 64 B datagrams, round trip p50 | 28.5 µs (0.54 cores) | 31.6 µs (0.65 cores) | 35.1 µs (0.74 cores) | 43.8 µs (0.80 cores) | 1.12× (1.11–1.12) | 1.23× (1.23–1.26) | 1.53× (1.49–1.57) |
-| request-answer over UDP: 1 socket, 64 B datagrams, round trip p99 | 42.2 µs (0.54 cores) | 46.8 µs (0.65 cores) | 49.4 µs (0.74 cores) | 61.7 µs (0.80 cores) | 1.11× (1.10–1.14) | 1.18× (1.16–1.20) | 1.46× (1.42–1.57) |
-| connect: 200 connections dialled and held | 157.0 conn/s (0.95 cores) | 6.5 K conn/s (0.31 cores) | 7.3 K conn/s (0.55 cores) | 10 K conn/s (1.02 cores) | 0.02× (0.02–0.02) | 0.02× (0.02–0.02) | 0.01× (0.01–0.02) |
-| connect: 200 TLS connections, each a full verified handshake | 124.0 conn/s (0.97 cores) | 3.4 K conn/s (1.28 cores) | 2.2 K conn/s (1.91 cores) | 2.9 K conn/s (2.28 cores) | 0.04× (0.04–0.04) | 0.06× (0.04–0.06) | 0.04× (0.04–0.05) |
-| held: 200 idle connections, memory per connection | 2.2 K KiB (0.00 cores) | 23.3 KiB (0.00 cores) | 267.0 KiB (0.00 cores) | 77.0 KiB (0.00 cores) | 0.01× (0.01–0.01) | 0.12× (0.12–0.12) | 0.04× (0.04–0.04) |
+| consume: a firehose of 64 B lines, TCP | 40.49 M lines/s (1.00 cores) | 128.64 M lines/s (1.00 cores) | 18.74 M lines/s (1.00 cores) | 16.01 M lines/s (1.00 cores) | 0.31× (0.30–0.32) | 2.16× (2.07–2.22) | 2.44× (2.43–2.56) |
+| consume: a firehose of 64 B lines, unix socket | 40.66 M lines/s (1.00 cores) | 127.60 M lines/s (1.00 cores) | 18.65 M lines/s (1.00 cores) | 20.89 M lines/s (1.00 cores) | 0.32× (0.32–0.32) | 2.18× (2.15–2.21) | 1.96× (1.94–1.96) |
+| consume: a firehose of 4 KiB lines, TCP | 3.31 M lines/s (1.00 cores) | 4.12 M lines/s (1.00 cores) | 1.59 M lines/s (1.00 cores) | 775 K lines/s (1.00 cores) | 0.81× (0.80–0.83) | 2.08× (2.08–2.09) | 4.30× (4.25–4.58) |
+| consume: a firehose of 64 B lines, TLS 1.3 | 33.20 M lines/s (1.00 cores) | 62.51 M lines/s (1.00 cores) | 16.92 M lines/s (1.00 cores) | 14.35 M lines/s (1.00 cores) | 0.53× (0.53–0.54) | 1.96× (1.93–1.97) | 2.31× (2.30–2.41) |
+| request-answer: 1 connection, 64 B each way | 32 K req/s (0.55 cores) | 28 K req/s (0.68 cores) | 28 K req/s (0.71 cores) | 17 K req/s (0.82 cores) | 1.12× (1.11–1.12) | 1.13× (1.12–1.14) | 1.85× (1.83–1.85) |
+| request-answer: 1 connection, 64 B each way, round trip p50 | 30.3 µs (0.55 cores) | 33.0 µs (0.68 cores) | 34.6 µs (0.71 cores) | 57.6 µs (0.82 cores) | 1.09× (1.04–1.10) | 1.14× (1.12–1.15) | 1.92× (1.90–1.92) |
+| request-answer: 1 connection, 64 B each way, round trip p99 | 43.3 µs (0.55 cores) | 50.9 µs (0.68 cores) | 47.9 µs (0.71 cores) | 76.3 µs (0.82 cores) | 1.18× (1.18–1.18) | 1.11× (1.11–1.13) | 1.76× (1.74–1.76) |
+| request-answer: 64 connections held, 64 B each way | 583 K req/s (1.00 cores) | 402 K req/s (1.00 cores) | 250 K req/s (1.00 cores) | 82 K req/s (1.00 cores) | 1.45× (1.44–1.45) | 2.33× (2.18–2.39) | 7.08× (6.71–7.57) |
+| request-answer: 64 connections held, 64 B each way, round trip p50 | 112 µs (1.00 cores) | 153 µs (1.00 cores) | 247 µs (1.00 cores) | 774 µs (1.00 cores) | 1.36× (1.34–1.38) | 2.20× (2.04–2.24) | 6.90× (6.54–7.20) |
+| request-answer: 64 connections held, 64 B each way, round trip p99 | 163 µs (1.00 cores) | 309 µs (1.00 cores) | 498 µs (1.00 cores) | 1004 µs (1.00 cores) | 1.90× (1.88–1.93) | 3.02× (2.93–3.11) | 6.16× (5.76–7.60) |
+| request-answer over UDP: 1 socket, 64 B datagrams | 34 K req/s (0.53 cores) | 31 K req/s (0.66 cores) | 27 K req/s (0.74 cores) | 23 K req/s (0.78 cores) | 1.09× (1.09–1.10) | 1.23× (1.23–1.25) | 1.50× (1.50–1.50) |
+| request-answer over UDP: 1 socket, 64 B datagrams, round trip p50 | 28.3 µs (0.53 cores) | 30.8 µs (0.66 cores) | 35.1 µs (0.74 cores) | 43.3 µs (0.78 cores) | 1.08× (1.08–1.09) | 1.24× (1.23–1.26) | 1.52× (1.51–1.57) |
+| request-answer over UDP: 1 socket, 64 B datagrams, round trip p99 | 41.2 µs (0.53 cores) | 49.4 µs (0.66 cores) | 48.9 µs (0.74 cores) | 59.6 µs (0.78 cores) | 1.20× (1.17–1.23) | 1.19× (1.17–1.20) | 1.45× (1.41–1.47) |
+| connect: 200 connections dialled and held | 34 K conn/s (1.87 cores) | 7.5 K conn/s (0.39 cores) | 6.9 K conn/s (0.60 cores) | 9.0 K conn/s (0.97 cores) | 4.47× (4.11–5.07) | 5.08× (4.50–5.64) | 3.97× (3.38–4.11) |
+| connect: 200 TLS connections, each a full verified handshake | 6.3 K conn/s (2.24 cores) | 2.9 K conn/s (1.41 cores) | 2.1 K conn/s (1.94 cores) | 2.4 K conn/s (2.30 cores) | 2.18× (1.90–2.58) | 2.99× (2.78–3.05) | 2.58× (2.41–2.69) |
+| held: 200 idle connections, memory per connection | 62.7 KiB (0.00 cores) | 24.6 KiB (0.00 cores) | 271.0 KiB (0.00 cores) | 76.8 KiB (0.00 cores) | 0.39× (0.39–0.40) | 4.32× (4.32–4.41) | 1.22× (1.22–1.25) |
 
-How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every client arm on one core, the Go target (clientgen) on four others. Every client on the same one core, the target (a Go program) on four others with headroom: every row records the target's cores, and none used all four. socketley is one client runtime per connection with its Lua on_message as the handler; the others are one process with the same logic. Every count is taken at the target: a consumer's count must equal the lines sent, every request's size is checked, and a round trip is the interval between one connection's requests as the target sees them. The firehose rows are bound by the client's core, where socketley calls Lua once per line. With 64 connections socketley is 64 processes on one core, so a request costs a context switch, and a connection holds a process's memory. Connecting is creating a runtime each (socketley create ... -s from a shell loop), where the others dial from one process.
+How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every client arm on one core, the Go target (clientgen) on four others. Every client on the same one core, the target (a Go program) on four others with headroom: every row records the target's cores, and none used all four. socketley is one client runtime holding every connection (--connections N) with its Lua on_message as the handler; the others are one process with the same logic. Every count is taken at the target: a consumer's count must equal the lines sent, every request's size is checked, and a round trip is the interval between one connection's requests as the target sees them. The firehose rows are bound by the client's core, where socketley calls Lua once per line. Connecting is that one runtime dialling all of them, as the others dial from one process; the memory row is the runtime's whole process divided by its connections. One runtime per connection instead, each made with socketley create ... -s from a shell loop, is a process each: 386 created and connected a second, 243 with TLS, and 1,546 KiB each held.
 
 ## Generating load: lines as fast as the connection takes them
 
-tcpkali 1.1.1, Go 1.24.6, 3 passes, 2026-11-09, socketley 7171898a.
+tcpkali 1.1.1, Go 1.24.6, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | tcpkali | Go | socketley vs tcpkali | socketley vs Go |
 |---|---|---|---|---|---|
-| send: 64 B lines as fast as the connection takes them, TCP | 23.77 M lines/s (1.00 cores) | 98.66 M lines/s (1.00 cores) | 68.27 M lines/s (1.00 cores) | 0.24× (0.22–0.27) | 0.35× (0.34–0.35) |
-| send: 4 KiB lines, TCP | 2.35 M lines/s (1.00 cores) | 1.56 M lines/s (1.00 cores) | 1.39 M lines/s (1.00 cores) | 1.50× (1.47–1.85) | 1.74× (1.66–2.07) |
+| send: 64 B lines as fast as the connection takes them, TCP | 25.92 M lines/s (1.00 cores) | 101.30 M lines/s (1.00 cores) | 68.96 M lines/s (1.00 cores) | 0.26× (0.23–0.27) | 0.38× (0.37–0.39) |
+| send: 4 KiB lines, TCP | 2.70 M lines/s (1.00 cores) | 1.57 M lines/s (1.00 cores) | 1.48 M lines/s (1.00 cores) | 1.73× (1.66–1.74) | 1.81× (1.81–1.83) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every sender on one core, the Go sink on four others. Sending as fast as the connection takes it, counted at a sink on other cores. socketley paces with self.pending() and on_writable and sends one line per self.send call; tcpkali repeats its message into large writes; Go makes one buffered write call per line. All are bound by the client's core.
 
 ## Generating load over a unix socket and TLS
 
-Go 1.24.6, 3 passes, 2026-11-09, socketley 7171898a.
+Go 1.24.6, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | Go | socketley vs Go |
 |---|---|---|---|
-| send: 64 B lines, unix socket | 24.24 M lines/s (1.00 cores) | 162.00 M lines/s (1.00 cores) | 0.15× (0.14–0.18) |
-| send: 64 B lines, TLS 1.3 | 21.77 M lines/s (1.00 cores) | 33.08 M lines/s (1.00 cores) | 0.67× (0.65–0.69) |
+| send: 64 B lines, unix socket | 27.32 M lines/s (1.00 cores) | 168.04 M lines/s (1.00 cores) | 0.16× (0.16–0.18) |
+| send: 64 B lines, TLS 1.3 | 23.90 M lines/s (1.00 cores) | 17.70 M lines/s (1.00 cores) | 1.34× (0.63–1.36) |
 
-How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every sender on one core, the Go sink on four others. The same over a unix socket and over TLS 1.3, which tcpkali does not speak. Over TLS Go's rate takes one of two levels from pass to pass in every run, about 21 or 33-37 million lines a second, while socketley's stays at 20-22 million; the median falls on whichever level most passes took.
+How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every sender on one core, the Go sink on four others. The same over a unix socket and over TLS 1.3, which tcpkali does not speak. Over TLS Go's rate takes one of two levels from pass to pass in every run, about 18-21 or 33-38 million lines a second, while socketley's stays within a few per cent of its median; the ratio falls on whichever level most of Go's passes took.
 
 ## Driving a Redis-protocol server
 
-redis-benchmark 8.0.5, 3 passes, 2026-11-09, socketley 7171898a.
+redis-benchmark 8.0.5, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | redis-benchmark | socketley vs redis-benchmark |
 |---|---|---|---|
-| pipelined INCR to a socketley cache, depth 32, 1 connection | 904 K /s (0.60 cores) | 919 K /s (0.62 cores) | 0.98× (0.98–0.98) |
-| pipelined INCR to a socketley cache, depth 32, 4 connections | 2.02 M /s (1.00 cores) | 7.28 M /s (0.99 cores) | 0.28× (0.27–0.28) |
+| pipelined INCR to a socketley cache, depth 32, 1 connection | 933 K /s (0.58 cores) | 910 K /s (0.62 cores) | 1.02× (1.02–1.03) |
+| pipelined INCR to a socketley cache, depth 32, 4 connections | 4.72 M /s (0.94 cores) | 6.03 M /s (0.99 cores) | 0.78× (0.76–0.78) |
 
-How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; each client on one core, the socketley cache on another. A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley is four processes on one core.
+How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; each client on one core, the socketley cache on another. A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley's runtime holds four connections, as redis-benchmark's one thread does.
 
 ## A line from a shell script
 
-socat 1.8.1.1, bash /dev/tcp, 3 passes, 2026-11-09, socketley 7171898a.
+socat 1.8.1.1, bash /dev/tcp, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | socat | bash /dev/tcp | socketley vs socat | socketley vs bash /dev/tcp |
 |---|---|---|---|---|---|
-| one line from the shell, 1,000 in a row | 1.0 K lines/s (1.00 cores) | 1.2 K lines/s (1.00 cores) | 26 K lines/s (0.99 cores) | 0.90× (0.89–0.90) | 0.04× (0.04–0.04) |
+| one line from the shell, 1,000 in a row | 1.4 K lines/s (1.00 cores) | 1.2 K lines/s (1.00 cores) | 32 K lines/s (0.98 cores) | 1.20× (1.19–1.20) | 0.04× (0.04–0.05) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; the shell loop on one core, the Go sink on four others. One line per command from a shell loop, until the sink has the last one. socketley send writes onto the connection a client runtime holds; socat opens a connection per line (nodelay); bash's /dev/tcp is a builtin with no process to start, bound by the connection set-up alone.
 
 ## A line from a shell script to a TLS service
 
-socat 1.8.1.1, 3 passes, 2026-11-09, socketley 7171898a.
+socat 1.8.1.1, 3 passes, 2026-11-09, socketley 943691a0.
 
 | case | socketley | socat | socketley vs socat |
 |---|---|---|---|
-| one line from the shell to a TLS service, 1,000 in a row | 1.0 K lines/s (1.00 cores) | 362.0 lines/s (0.96 cores) | 2.81× (2.81–2.85) |
+| one line from the shell to a TLS service, 1,000 in a row | 1.3 K lines/s (1.00 cores) | 362.0 lines/s (0.96 cores) | 3.71× (3.70–3.74) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; the shell loop on one core, the Go sink on four others. As above, to a TLS service: socketley's connection is held and verified once, socat makes a verified handshake per line (nodelay; without it every line waited 40 ms).
 
@@ -5298,7 +5321,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Daemon flags](man-daemon-flags.txt) (2 entries)
 - [Common flags](man-common-flags.txt) (25 entries)
 - [Server flags](man-server-flags.txt) (18 entries)
-- [Client flags](man-client-flags.txt) (4 entries)
+- [Client flags](man-client-flags.txt) (5 entries)
 - [Proxy flags](man-proxy-flags.txt) (11 entries)
 - [Cache flags](man-cache-flags.txt) (13 entries)
 - [Storage flags](man-storage-flags.txt) (22 entries)
@@ -5599,7 +5622,7 @@ socketley web stop
 
 ### `send name [message]`
 
-Send a message to a running server or client runtime. For a server, the message is broadcast to all connected clients. For a client, the message is sent to the connected server. The command respects the runtime's mode setting, and fails if the mode is receive-only.
+Send a message to a running server or client runtime. For a server, the message is broadcast to all connected clients. For a client, the message is sent to the connected server. A client holding several connections (**--connections**) sends each message on one of them, the next connected one in turn. The command respects the runtime's mode setting, and fails if the mode is receive-only.
 
 ### `mail send --to address [--cc|--bcc address] [--from address] [--reply-to address] [--subject text] [--text text] [--html file] [--attach file[:type]] [--inline image] [--header 'Name: value'] [--raw]`
 
@@ -7133,6 +7156,20 @@ The direction in which messages flow: **inout** (both ways, the default), **in**
 
 Use UDP instead of TCP. The client creates a connected SOCK_DGRAM socket. Each datagram is one message; there is no line parsing. Not available for cache or proxy.
 
+### `--connections count`
+
+How many connections the client holds to its target, all in one process. Default: 1. The count is from 1 to 65535. A count of 0, a count above that, or no count at all is refused.
+
+Every connection dials the same **-t**. Each has its own reconnect backoff, its own TLS session, its own read buffer and its own write queue. TLS sessions are resumed from one cache shared by all of them. With **--udp**, each connection is a socket of its own.
+
+Each connection has an id from 1 to *count*, and keeps it across a reconnect. The script's callbacks are handed that id after their usual arguments: **on_connect(fd, id)**, **on_message(msg, id)**, **on_messages(chunk, id)**, **on_writable(id)**, **on_disconnect(fd, id)** and **on_send(msg, id)**. **self.send(msg)** without an id answers on the connection whose callback is running, so a request-answer script written for one connection runs unchanged on many. Outside every callback, such as in a timer, a client with more than one connection refuses a send without an id and says so. Name the connection there with **self.send(msg, id)**. **self.pending()** and **on_writable** pace each connection on its own queue.
+
+**stats** adds the connections up: bytes and messages over all of them, and **connections** is how many are up. **socketley send** puts each message on one connection, the next connected one in turn. **-w**, **-b** and an interactive session see what every connection receives, with no prefix.
+
+**edit --connections** on a running client opens the new ids or closes the highest ones, each closed one with an **on_disconnect**. The others stay up.
+
+Every runtime is a process of its own, so many connections to one target are cheaper as one client with **--connections** than as one client runtime each: one process instead of many, and no context switch between them.
+
 ### `--reconnect [max-attempts]`
 
 Reconnect automatically, with exponential backoff, when the connection is lost. The backoff starts at 1 second and doubles with each attempt, up to a ceiling of 16 seconds, with up to half a second of jitter. A client whose target is gone therefore dials again after 1, 2, 4, 8, 16, 16, 16 seconds. *max-attempts* limits the number of attempts. 0 means no limit, and is the default when the flag is given without a value. A negative count is refused, because -1 is the stored value for "off". Reconnection is off unless this flag is given.
@@ -8130,7 +8167,7 @@ The return value is converted as Redis converts it:
 
    **The interpreter is not the one --lua uses, and that is the point.** **COMMON FLAGS** says that the **--lua** interpreter is not a sandbox: it has **io**, **os**, **package** and the whole of **base** open. That is the right trade for a script the operator wrote, and the wrong one for a script that arrived over the network. The script interpreter is opened the other way round: it has only **base**, **string**, **table** and **math**, with every loader removed by name. Under LuaJIT the library that decides this is **ffi**: **require("ffi")** gives arbitrary memory access, which amounts to a shell on the machine. **require** is therefore not there to reach it with. A client's script also cannot see the operator's globals, because the two states never meet.
 
-   **A script holds the event loop of its shard while it runs.** It therefore runs under the same count hook as a Lua callback. A runaway script is stopped with **a script exceeded the 10000ms deadline** instead of holding every other client on that shard forever. The limit is **callback_timeout_ms** or **SOCKETLEY_LUA_TIMEOUT_MS**, the same as for callbacks.
+   **A script holds the event loop of its shard while it runs.** It therefore has the same deadline as a Lua callback, watched the same way. A runaway script is stopped with **a script exceeded the 10000ms deadline** instead of holding every other client on that shard forever. A script is never compiled, unlike a runtime's callbacks, so the stop always reaches it and the shard keeps its worker and its data. The limit is **callback_timeout_ms** or **SOCKETLEY_LUA_TIMEOUT_MS**, the same as for callbacks.
 
    **On a sharded cache a script is routed by the keys it declares.** This is the routing itself, not a convention: the shard that owns **KEYS[1]** runs the script. Keys that belong to two shards answer **-CROSSSLOT**, and a script that declares no keys runs on the shard it was sent to. A script that reaches a key it did not declare reaches into whatever store the shard it landed on happens to have.
 
@@ -11742,11 +11779,32 @@ Called when the runtime stops.
 
 #### `on_message(msg)`
 
-Called when a message is received (server and client). When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
+Called when a message is received (server and client). A client passes the connection id as a second argument, 1 unless **--connections** is given; see there. When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
 
 #### `on_client_message(client_id, msg) -> true`
 
 Called when a message is received, with the sender's id (server only). It fires alongside on_message, and first. Returning **true** says the script has handled the message, so nothing is sent automatically: not the relay of **--mode inout** or of the master's messages, and not what **--send-to** names for a non-master. Returning anything else, or nothing, leaves those as they are. On a UDP server, client_id names the peer that sent the datagram; see **--udp**. A handler still waiting on **self.cache** when the relay runs has not returned yet, so its message is relayed; define on_message to stop the relay for such a script.
+
+#### `on_messages(chunk, id)` / `on_client_messages(client_id, chunk) -> true`
+
+The batch forms of on_message (client) and on_client_message (server): every complete line of one read in one call, instead of one call per line. **chunk** is the bytes as they arrived, up to and including the read's last newline, so every line in it ends with its '\n', a CRLF line keeps its '\r' and an empty line is a bare '\n'. An unfinished last line is kept and arrives at the start of the next call. When a script defines both forms, only the batch one is called.
+
+A client calls on_messages for its TCP, unix-socket and TLS reads, with the connection's id after the chunk (see **--connections**). A server calls on_client_messages for a TCP line connection; returning **true** answers for every line in the chunk, as on_client_message's **true** does for one. A route or pipe the script sets from on_client_messages carries the next read on: the lines of the chunk it was handed are its own and are not sent on as well. Where there is no read to batch, each message is a chunk of one line with its '\n' added, and a message that itself holds a newline reads as more than one line there, so a script for such a runtime is better written with on_message: a datagram (**--udp**), a WebSocket message, a server in **--mode master** or with **--rate-limit** or **--global-rate-limit**, which judge each line on its own. **-w**, bash output and an interactive attach still see each line, exactly as with on_message.
+
+A call per read instead of per line pays where the script takes the chunk whole: measured on one core, a server echoing 64 connections of 16 pipelined 64-byte lines with one **self.send** per chunk answered 1.6 times as many as with on_client_message. A script that walks the chunk line by line in Lua spends about what the calls it saves cost: counting 64-byte lines with string.find as below came to 5 per cent fewer than with on_message, and with 4 KiB lines, where copying the chunk into Lua is the cost, a third fewer. Counting the lines of a chunk:
+
+```
+local n = 0
+function on_messages(chunk)
+    local i = 1
+    while true do
+        local j = string.find(chunk, "\n", i, true)
+        if not j then break end
+        n = n + 1      -- the line is chunk:sub(i, j - 1)
+        i = j + 1
+    end
+end
+```
 
 #### `on_http_body(client_id, chunk, remaining)`
 
@@ -11794,7 +11852,7 @@ Called when an upstream's write queue has come back under **self.watermark()**. 
 
 Called when this connection's write queue has come back under **self.watermark()**. A producer that stopped because **self.pending(client_id)** was high can then carry on. The callback is edge-triggered: it fires once per crossing, not once per completed write.
 
-A client runtime has the same callback without the argument, **on_writable()**, because it has one connection, and a number naming it would be a fiction. A client's refusal to send also names its real cause. A connected **--mode out** client whose server has stopped reading is refused with a reason that names the backlog. It is not told it "is not connected to its server, or was created --mode in and does not send", three statements that are all false of it. Measured with 400 chunks of 64 KB sent to a peer reading nothing: 129 taken, 271 refused, 8,396,928 bytes queued.
+A client runtime passes its connection id, **on_writable(id)**. It is 1 unless **--connections** is given. A client's refusal to send also names its real cause. A connected **--mode out** client whose server has stopped reading is refused with a reason that names the backlog. It is not told it "is not connected to its server, or was created --mode in and does not send", three statements that are all false of it. Measured with 400 chunks of 64 KB sent to a peer reading nothing: 129 taken, 271 refused, 8,396,928 bytes queued.
 
 This callback is what makes a body larger than the queue limit sendable at all. Without it, a script had only the hard limit, with nothing leading up to it: at 8 MiB the connection is closed. The only safe strategy was to know the limit in advance and never approach it. Measured with a client reading in 256 KB bites with a 5 ms pause, sending 200 chunks of 64 KB (13,107,400 bytes):
 
@@ -11825,7 +11883,7 @@ Called when a client connects (server and client). It is also called on a sub-se
 
 #### `on_disconnect(client_id)`
 
-Called when a client disconnects (server and client).
+Called when a client disconnects (server and client). A client's **on_connect** and **on_disconnect** are given the descriptor and then the connection id; see **--connections**.
 
 #### `on_rcpt(rcpt, default) -> bool`
 
@@ -12015,6 +12073,14 @@ The budget applies to:
 - the whole **filters** chain for one request. The chain shares one budget; each filter does not get its own.
 - the script's top level, which runs inside **create**. If the top level never returns, the create is refused with a reason, so the command does not hang the terminal.
 
+**How it is enforced.** Nothing inside the callback times it. A worker writes each invocation into a line of memory it shares with the daemon, three stores with no clock read and no system call. The daemon reads every worker's line every 100 milliseconds. An invocation it finds running on two reads in a row, and past its budget, is sent **SIGURG**. The worker's handler puts an instruction hook on the interpreter, the hook raises the error at the callback's next VM instruction, and it comes off again when the callback ends. The budget is measured from the start of the event-loop turn the callback runs in, so a callback is stopped between its budget and about a tenth of a second after it.
+
+LuaJIT's trace compiler is on for every callback, whatever the budget. A loop the compiler has turned into a trace never goes back to the interpreter, so it never reaches the hook. When a stopped callback is still running after its grace, one second or a quarter of its budget, whichever is longer, the daemon kills its worker, and the runtime's usual restart replaces it. The daemon logs **runtime 'NAME': on_message did not stop at its 500ms deadline; its worker is replaced** and **ls** counts the restart. A replaced worker loses what it held: its connections, and a cache's keyspace unless it is persistent.
+
+The script's top level runs before the compiler is opened. A top level that never returns is therefore always stopped by the hook, and its create refused, rather than answered by replacing a worker that is still starting.
+
+A process the daemon does not watch arms a one-shot timer for each callback instead, with the same signal and the same hook: the daemon running its own configuration file, and a runtime that an SDK program runs inside its own process. That costs two system calls a callback, and there a script with a budget runs with the compiler closed, because nothing outside that process could end a compiled runaway.
+
 The budget counts time spent running on the loop, not elapsed clock time. This matters for the callbacks that can wait, such as **on_message**, **on_client_message** and an **mcp** tool's handler (see **socketley.http**). They run on a coroutine. A handler that is waiting in **self.cache** does not hold the thread and does not use up its budget. Each stretch in which it actually runs gets the budget. How long it may stay suspended is a separate bound of ten seconds, with its own result. See **self.cache** under **Runtime Methods**.
 
 A callback stopped at its deadline is treated as a callback that raised an error. Wherever a raised error already has a defined result, the deadline gives the same result:
@@ -12024,7 +12090,7 @@ A callback stopped at its deadline is treated as a callback that raised an error
 - A **filters** entry refuses the request with a 500.
 - In **on_proxy_request** and **on_proxy_response**, a timeout counts as a refusal, not as "returned nothing". The connection closes. The proxy does not forward the bytes of a request whose hook never finished deciding, as if the hook had let them through.
 
-**socketley.http** runs inside the same budget. Its **timeout_ms** is clamped to the time left in the callback's budget. A callback that spends its budget waiting on a host therefore gets an ordinary **ok = false** result instead of being stopped. A script that needs a long fetch raises its callback budget to fit. Nothing can interrupt a request in the middle of a socket operation: the mechanism is a VM instruction hook, and a blocking call executes no instructions.
+**socketley.http** runs inside the same budget. Its **timeout_ms** is clamped to the time left in the callback's budget. A callback that spends its budget waiting on a host therefore gets an ordinary **ok = false** result instead of being stopped. A script that needs a long fetch raises its callback budget to fit. A stop that arrives during the request does not cut it short: the wait goes on to its clamped end, and the error is raised at the callback's next VM instruction.
 
 **Setting it.** A script sets its own budget with a top-level **callback_timeout_ms** global, next to **tick_ms**:
 
@@ -12035,35 +12101,44 @@ callback_timeout_ms = 0       -- no bound at all for this script
 
 An operator changes the default for every script that does not set its own with **SOCKETLEY_LUA_TIMEOUT_MS** in the daemon's environment; see **ENVIRONMENT**.
 
-**What it costs.** The cost is not the JIT. On this build LuaJIT compiles traces with a count hook installed. The cost of the hook is the hooked dispatch path, which checks on every VM instruction instead of every ten thousandth. Measured at 64 bytes on one connection:
+**What it costs.** A callback with a budget costs its worker three stores into the line on the way in and one on the way out, with no clock read and no system call. Measured with one build, the default budget against **0**, interleaved, seven passes each, in messages a second:
 
-- A callback that only answers a message showed no difference above the run-to-run noise: 42581 and 43130 messages a second with the hook, against 42571 and 42644 without.
-- A callback doing about 1300 arithmetic operations per message ran at 85% of its unhooked rate.
+```
+                               default           0   default/0, per pass
+client firehose, 64 B       39,921,955  40,370,413   0.981 [0.966 .. 1.014]
+client send, 64 B           26,076,696  25,958,758   1.015 [0.994 .. 1.036]
+server Lua echo, pipelined   3,835,606   3,883,802   0.989 [0.979 .. 1.018]
+server, arithmetic+strings     292,037     289,750   1.008 [0.998 .. 1.023]
+```
 
-**What 0 buys.** Setting the bound to **0** installs no hook. It also opens LuaJIT's **jit** library, which is the only thing that turns the trace compiler on. Without it, every Lua callback the daemon runs is interpreted. On the same arithmetic callback, the bounded run served 11722 messages a second and the unbounded run 28085, at 85.2 and 30.3 microseconds of worker CPU per message.
+Every range takes in 1. Against the count hook this replaced, which also kept the compiler closed, the default budget serves 1.08 times as much on the firehose (37,018,042), 1.04 times on the send (25,206,565), the same on the echo (3,857,682), and 1.57 times on the callback that computes (186,155).
 
-A callback that only answers a message gains very little, because there is almost no loop to compile. On the echo fixture the two arms do not differ in throughput: 42850 and 43929 messages a second bounded, against 43577 and 44350 unbounded. That gap is smaller than the spread inside either arm. What does differ is Lua's own share of the worker's CPU: 5.2 and 5.1% bounded, against 3.9 and 4.0% unbounded. That is the compiler doing a little work on two bytecodes. End to end this is about 1%, against 2.4x on a callback that computes.
+The daemon's sweep wakes it ten times a second while any worker runs: an idle daemon with one idle runtime spent 9.4 milliseconds of CPU in 30 seconds, against 2.2 before.
+
+**What the compiler gives.** Before the deadline was watched from outside, a callback with a budget ran interpreted, and setting the budget to **0** was the only way to open the compiler. These measurements compare the two arms, and every callback now runs in the compiled one. On an arithmetic callback the interpreted run served 11722 messages a second and the compiled run 28085, at 85.2 and 30.3 microseconds of worker CPU per message.
+
+A callback that only answers a message gains very little, because there is almost no loop to compile. On the echo fixture the two arms do not differ in throughput: 42850 and 43929 messages a second interpreted, against 43577 and 44350 compiled. That gap is smaller than the spread inside either arm. What does differ is Lua's own share of the worker's CPU: 5.2 and 5.1% interpreted, against 3.9 and 4.0% compiled. That is the compiler doing a little work on two bytecodes. End to end this is about 1%, against 2.4x on a callback that computes.
 
 A streaming producer falls between those two cases. It matters because it is the shape that runs per byte rather than per message. A handler that generates 40,000 CSV rows into **self.send_chunk** gains 25 to 48 per cent, not 2.4x. The profile shows why. With the hook installed, the interpreter takes 92.7 per cent of the worker's core. About 35 per cent of that is spent in **lj_str_new**, **lj_str_resize**, **gc_sweepstr** and the allocator. A compiled trace allocates and interns every string it builds exactly as the interpreter does. The compiler removes the dispatch cost but leaves the string cost in place.
 
 So the way the script builds its strings is the larger lever, and the two effects multiply rather than add. The table shows the same handler using **string.format** instead of a chain of **..** concatenations, at 8 concurrent requests and then at 64:
 
 ```
-                        bounded      unbounded
+                      interpreted     compiled
 .. concatenation        97.8/s      130.6/s   (+34%)
 string.format           93.8/s      160.0/s   (+71%)
 .. at 64 concurrent      68.0/s      100.8/s   (+48%)
 string.format at 64     71.5/s      142.7/s  (+100%)
 ```
 
-Both arms put byte-identical responses on the wire. The unbounded column is the one that changes. In the interpreter, **string.format** gains nothing: it is 4 per cent behind concatenation, inside the spread, because there each row costs one C call either way. **string.format** pays off only when the compiler is on, and then it pays twice. It builds one string per row instead of a chain of intermediate strings, and it uses an integer formatter instead of the double formatter, which alone took 15.6 per cent of the core. Compare the default with concatenation against the compiler with **string.format**. End to end, the second gives 64 per cent more throughput at 8 streams and 110 per cent more at 64, for about half the CPU per request.
+Both arms put byte-identical responses on the wire. The compiled column is the one that changes. In the interpreter, **string.format** gains nothing: it is 4 per cent behind concatenation, inside the spread, because there each row costs one C call either way. **string.format** pays off only when the compiler is on, and then it pays twice. It builds one string per row instead of a chain of intermediate strings, and it uses an integer formatter instead of the double formatter, which alone took 15.6 per cent of the core. Compare the default with concatenation against the compiler with **string.format**. End to end, the second gives 64 per cent more throughput at 8 streams and 110 per cent more at 64, for about half the CPU per request.
 
 A C server that builds the same rows with **snprintf**(3) still serves 2.4x the best of those results. The choice is therefore about how much of a stream's work belongs in Lua at all. No setting closes that gap.
 
 **What decides the size of the gain** is how much of the work happens at the Lua level, not how many bytes pass through. This was measured on a proxy, a second runtime type with a per-byte hook. Both handlers forward the bytes unchanged, so only the work differs:
 
 ```
-                              bounded   unbounded   CPU per request
+                          interpreted    compiled   CPU per request
 one C library call per chunk    120.9      121.9     8223 -> 8155 us
 a Lua loop over every row       417.1     1452.0     2378 ->  669 us
 ```
@@ -12103,11 +12178,13 @@ At a thousand pieces, the best shape serves 14.1 times as many exchanges as the 
 
 The effect on the compiler is the part worth remembering. Opening the compiler gains 14 per cent on the accumulating shape and nothing outside the spread on the accumulating shape that formats. It gains 75 and 104 per cent on the two shapes that join once. This is the rule above seen from the other side. Accumulating moves the work out of Lua and into the allocator, where the compiler cannot reach it. A script that is slow because of its idiom does not become fast because of this setting.
 
-**What 0 gives up.** A compiled trace never calls the instruction hook, so with the compiler on, a runaway callback cannot be interrupted at all. In a measurement, **while true do end** with a 300 millisecond deadline was stopped after 300.2 milliseconds with the compiler off, and never with the compiler on. A hard ceiling inside the hook did not help either, because the hook is never reached from inside a trace. That is why the bound and the compiler are one setting, not two knobs that can disagree.
+**What 0 turns off.** Setting the budget to **0** arms nothing and writes nothing: the worker writes no line, the daemon sends no signal, and no callback of that script is ever stopped or its worker replaced. It no longer changes what is compiled.
 
-A runaway callback affects one runtime, not the whole daemon. In a measurement with a server whose callback never returns, that server's worker process sat at 83% of a core. Meanwhile a second server on the same daemon went on echoing, and the daemon went on answering **ps**. A runaway in the script's top level is always refused, whatever **callback_timeout_ms** says. The top level runs under the default budget, before the script's own setting has been read.
+**What a compiled runaway costs.** A compiled trace never calls the instruction hook. A runaway loop the compiler has made a trace of, such as **while true do n = n + 1 end**, is ended by replacing its worker at the end of its grace, not stopped in place. Measured with a 500 millisecond budget, the replacement was listening 1.71 seconds after the message that started the loop. A loop that raises and catches an error on each turn goes back to the interpreter, and it was stopped in the same worker after 0.52 seconds.
 
-**What it does not bound.** A callback stopped at its deadline has still held the loop for that long. A CLI command issued during the stall can hit its own five second receive timeout and report the daemon unreachable; the command succeeds on retry. A runaway **on_tick** is stopped on every tick, not once. Time a callback spends in a C function before it has run ten thousand VM instructions, such as an **os.execute** or an **io** read at its start, is not counted: the budget is dated from the first instruction hook, so such a callback can hold the loop for that time and then for its whole budget. Name resolution inside **socketley.http** executes no VM instructions, so it is not interrupted. Instead, the call gives up on it at the call's deadline.
+A runaway callback affects one runtime, not the whole daemon. In a measurement with a server whose callback never returns and no budget, that server's worker process sat at 83% of a core. Meanwhile a second server on the same daemon went on echoing, and the daemon went on answering **ps**. A runaway in the script's top level is always refused, whatever **callback_timeout_ms** says. The top level runs under the default budget, before the script's own setting has been read.
+
+**What it does not bound.** A callback stopped at its deadline has still held the loop for that long. A CLI command issued during the stall can hit its own five second receive timeout and report the daemon unreachable; the command succeeds on retry. A runaway **on_tick** is stopped on every tick, not once. The budget is dated from the start of the loop turn, so the callbacks that ran before this one in the same turn count against it too. Time in a C function, such as an **os.execute** or an **io** read, is counted, but the stop is seen only when the callback is back in the VM; one that is still inside the C function at the end of its grace has its worker replaced. Name resolution inside **socketley.http** executes no VM instructions, so it is not interrupted. Instead, the call gives up on it at the call's deadline.
 
 ## Proxy Filter Chain
 
@@ -12257,7 +12334,9 @@ self.connections()         -- Current connection count (all four types).
 
 self.protocol  -- server/client: "tcp" or "udp"; proxy: "tcp" or "http"
                -- (not set on a cache)
-self.send(msg)             -- Send message (client)
+self.send(msg [, id])      -- Send message (client).  Without an id, on the
+                           -- connection whose callback is running; with
+                           -- --connections, refused outside every callback
 self.send(client_id, msg)  -- Send to specific client (server)
 self.broadcast(msg)        -- Broadcast to all clients (server).  Answers two
                            -- numbers: how many took it, and how many were
@@ -12276,9 +12355,11 @@ self.watermark()           -- The byte count on_writable fires on the way down
                            -- --write-buffer is editable.  See on_writable.
 on_http_body(id, chunk, n) -- A request body streamed, rather than gathered
                            -- whole (server).  Defining it is the opt-in.
-self.pending()             -- The client's own form, without an id: a client
-                           -- has one connection.  Bytes queued for its server
-                           -- and not yet on the wire.
+self.pending([id])         -- The client's own form.  Bytes queued for its
+                           -- server and not yet on the wire: for that id (nil
+                           -- if it has none), or without one the connection
+                           -- whose callback is running, or all of them
+                           -- outside every callback.
 
 -- ─── Sending faster than the socket ───
 -- A write is queued, not performed, and the queue has a bound.  Reach it and
@@ -14158,7 +14239,7 @@ Sets how many MiB a cache shard's journal (**--persistent-interval**) may hold b
 
 ### `SOCKETLEY_LUA_TIMEOUT_MS`
 
-Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely, and also turns on LuaJIT's trace compiler. The compiler is worth about 2.4x on a callback that computes, and about 1% on one that does not. See **Callback Deadline**, which prices both halves of that trade.
+Sets how long, in milliseconds, one Lua callback invocation may hold the event-loop thread. Default: **10000**. **0** switches the bound off entirely: nothing is armed or written for a callback. LuaJIT's trace compiler is on either way. The budget is measured from the start of the callback's loop turn and checked every 100 milliseconds, and a compiled callback that cannot be interrupted is ended by replacing its worker. See **Callback Deadline**.
 
 This is the default for every script that does not declare its own **callback_timeout_ms** global; a script that declares one overrides it. A value that is not a whole number of milliseconds in 0–3600000 is refused with a warning, and the default is used.
 

@@ -204,7 +204,7 @@ socketley web stop
 
 #### `send name [message]`
 
-Send a message to a running server or client runtime. For a server, the message is broadcast to all connected clients. For a client, the message is sent to the connected server. The command respects the runtime's mode setting, and fails if the mode is receive-only.
+Send a message to a running server or client runtime. For a server, the message is broadcast to all connected clients. For a client, the message is sent to the connected server. A client holding several connections (**--connections**) sends each message on one of them, the next connected one in turn. The command respects the runtime's mode setting, and fails if the mode is receive-only.
 
 #### `mail send --to address [--cc|--bcc address] [--from address] [--reply-to address] [--subject text] [--text text] [--html file] [--attach file[:type]] [--inline image] [--header 'Name: value'] [--raw]`
 

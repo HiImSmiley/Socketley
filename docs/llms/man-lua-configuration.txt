@@ -228,11 +228,32 @@ Called when the runtime stops.
 
 #### `on_message(msg)`
 
-Called when a message is received (server and client). When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
+Called when a message is received (server and client). A client passes the connection id as a second argument, 1 unless **--connections** is given; see there. When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
 
 #### `on_client_message(client_id, msg) -> true`
 
 Called when a message is received, with the sender's id (server only). It fires alongside on_message, and first. Returning **true** says the script has handled the message, so nothing is sent automatically: not the relay of **--mode inout** or of the master's messages, and not what **--send-to** names for a non-master. Returning anything else, or nothing, leaves those as they are. On a UDP server, client_id names the peer that sent the datagram; see **--udp**. A handler still waiting on **self.cache** when the relay runs has not returned yet, so its message is relayed; define on_message to stop the relay for such a script.
+
+#### `on_messages(chunk, id)` / `on_client_messages(client_id, chunk) -> true`
+
+The batch forms of on_message (client) and on_client_message (server): every complete line of one read in one call, instead of one call per line. **chunk** is the bytes as they arrived, up to and including the read's last newline, so every line in it ends with its '\n', a CRLF line keeps its '\r' and an empty line is a bare '\n'. An unfinished last line is kept and arrives at the start of the next call. When a script defines both forms, only the batch one is called.
+
+A client calls on_messages for its TCP, unix-socket and TLS reads, with the connection's id after the chunk (see **--connections**). A server calls on_client_messages for a TCP line connection; returning **true** answers for every line in the chunk, as on_client_message's **true** does for one. A route or pipe the script sets from on_client_messages carries the next read on: the lines of the chunk it was handed are its own and are not sent on as well. Where there is no read to batch, each message is a chunk of one line with its '\n' added, and a message that itself holds a newline reads as more than one line there, so a script for such a runtime is better written with on_message: a datagram (**--udp**), a WebSocket message, a server in **--mode master** or with **--rate-limit** or **--global-rate-limit**, which judge each line on its own. **-w**, bash output and an interactive attach still see each line, exactly as with on_message.
+
+A call per read instead of per line pays where the script takes the chunk whole: measured on one core, a server echoing 64 connections of 16 pipelined 64-byte lines with one **self.send** per chunk answered 1.6 times as many as with on_client_message. A script that walks the chunk line by line in Lua spends about what the calls it saves cost: counting 64-byte lines with string.find as below came to 5 per cent fewer than with on_message, and with 4 KiB lines, where copying the chunk into Lua is the cost, a third fewer. Counting the lines of a chunk:
+
+```
+local n = 0
+function on_messages(chunk)
+    local i = 1
+    while true do
+        local j = string.find(chunk, "\n", i, true)
+        if not j then break end
+        n = n + 1      -- the line is chunk:sub(i, j - 1)
+        i = j + 1
+    end
+end
+```
 
 #### `on_http_body(client_id, chunk, remaining)`
 
@@ -280,7 +301,7 @@ Called when an upstream's write queue has come back under **self.watermark()**. 
 
 Called when this connection's write queue has come back under **self.watermark()**. A producer that stopped because **self.pending(client_id)** was high can then carry on. The callback is edge-triggered: it fires once per crossing, not once per completed write.
 
-A client runtime has the same callback without the argument, **on_writable()**, because it has one connection, and a number naming it would be a fiction. A client's refusal to send also names its real cause. A connected **--mode out** client whose server has stopped reading is refused with a reason that names the backlog. It is not told it "is not connected to its server, or was created --mode in and does not send", three statements that are all false of it. Measured with 400 chunks of 64 KB sent to a peer reading nothing: 129 taken, 271 refused, 8,396,928 bytes queued.
+A client runtime passes its connection id, **on_writable(id)**. It is 1 unless **--connections** is given. A client's refusal to send also names its real cause. A connected **--mode out** client whose server has stopped reading is refused with a reason that names the backlog. It is not told it "is not connected to its server, or was created --mode in and does not send", three statements that are all false of it. Measured with 400 chunks of 64 KB sent to a peer reading nothing: 129 taken, 271 refused, 8,396,928 bytes queued.
 
 This callback is what makes a body larger than the queue limit sendable at all. Without it, a script had only the hard limit, with nothing leading up to it: at 8 MiB the connection is closed. The only safe strategy was to know the limit in advance and never approach it. Measured with a client reading in 256 KB bites with a 5 ms pause, sending 200 chunks of 64 KB (13,107,400 bytes):
 
@@ -311,7 +332,7 @@ Called when a client connects (server and client). It is also called on a sub-se
 
 #### `on_disconnect(client_id)`
 
-Called when a client disconnects (server and client).
+Called when a client disconnects (server and client). A client's **on_connect** and **on_disconnect** are given the descriptor and then the connection id; see **--connections**.
 
 #### `on_rcpt(rcpt, default) -> bool`
 
@@ -501,6 +522,14 @@ The budget applies to:
 - the whole **filters** chain for one request. The chain shares one budget; each filter does not get its own.
 - the script's top level, which runs inside **create**. If the top level never returns, the create is refused with a reason, so the command does not hang the terminal.
 
+**How it is enforced.** Nothing inside the callback times it. A worker writes each invocation into a line of memory it shares with the daemon, three stores with no clock read and no system call. The daemon reads every worker's line every 100 milliseconds. An invocation it finds running on two reads in a row, and past its budget, is sent **SIGURG**. The worker's handler puts an instruction hook on the interpreter, the hook raises the error at the callback's next VM instruction, and it comes off again when the callback ends. The budget is measured from the start of the event-loop turn the callback runs in, so a callback is stopped between its budget and about a tenth of a second after it.
+
+LuaJIT's trace compiler is on for every callback, whatever the budget. A loop the compiler has turned into a trace never goes back to the interpreter, so it never reaches the hook. When a stopped callback is still running after its grace, one second or a quarter of its budget, whichever is longer, the daemon kills its worker, and the runtime's usual restart replaces it. The daemon logs **runtime 'NAME': on_message did not stop at its 500ms deadline; its worker is replaced** and **ls** counts the restart. A replaced worker loses what it held: its connections, and a cache's keyspace unless it is persistent.
+
+The script's top level runs before the compiler is opened. A top level that never returns is therefore always stopped by the hook, and its create refused, rather than answered by replacing a worker that is still starting.
+
+A process the daemon does not watch arms a one-shot timer for each callback instead, with the same signal and the same hook: the daemon running its own configuration file, and a runtime that an SDK program runs inside its own process. That costs two system calls a callback, and there a script with a budget runs with the compiler closed, because nothing outside that process could end a compiled runaway.
+
 The budget counts time spent running on the loop, not elapsed clock time. This matters for the callbacks that can wait, such as **on_message**, **on_client_message** and an **mcp** tool's handler (see **socketley.http**). They run on a coroutine. A handler that is waiting in **self.cache** does not hold the thread and does not use up its budget. Each stretch in which it actually runs gets the budget. How long it may stay suspended is a separate bound of ten seconds, with its own result. See **self.cache** under **Runtime Methods**.
 
 A callback stopped at its deadline is treated as a callback that raised an error. Wherever a raised error already has a defined result, the deadline gives the same result:
@@ -510,7 +539,7 @@ A callback stopped at its deadline is treated as a callback that raised an error
 - A **filters** entry refuses the request with a 500.
 - In **on_proxy_request** and **on_proxy_response**, a timeout counts as a refusal, not as "returned nothing". The connection closes. The proxy does not forward the bytes of a request whose hook never finished deciding, as if the hook had let them through.
 
-**socketley.http** runs inside the same budget. Its **timeout_ms** is clamped to the time left in the callback's budget. A callback that spends its budget waiting on a host therefore gets an ordinary **ok = false** result instead of being stopped. A script that needs a long fetch raises its callback budget to fit. Nothing can interrupt a request in the middle of a socket operation: the mechanism is a VM instruction hook, and a blocking call executes no instructions.
+**socketley.http** runs inside the same budget. Its **timeout_ms** is clamped to the time left in the callback's budget. A callback that spends its budget waiting on a host therefore gets an ordinary **ok = false** result instead of being stopped. A script that needs a long fetch raises its callback budget to fit. A stop that arrives during the request does not cut it short: the wait goes on to its clamped end, and the error is raised at the callback's next VM instruction.
 
 **Setting it.** A script sets its own budget with a top-level **callback_timeout_ms** global, next to **tick_ms**:
 
@@ -521,35 +550,44 @@ callback_timeout_ms = 0       -- no bound at all for this script
 
 An operator changes the default for every script that does not set its own with **SOCKETLEY_LUA_TIMEOUT_MS** in the daemon's environment; see **ENVIRONMENT**.
 
-**What it costs.** The cost is not the JIT. On this build LuaJIT compiles traces with a count hook installed. The cost of the hook is the hooked dispatch path, which checks on every VM instruction instead of every ten thousandth. Measured at 64 bytes on one connection:
+**What it costs.** A callback with a budget costs its worker three stores into the line on the way in and one on the way out, with no clock read and no system call. Measured with one build, the default budget against **0**, interleaved, seven passes each, in messages a second:
 
-- A callback that only answers a message showed no difference above the run-to-run noise: 42581 and 43130 messages a second with the hook, against 42571 and 42644 without.
-- A callback doing about 1300 arithmetic operations per message ran at 85% of its unhooked rate.
+```
+                               default           0   default/0, per pass
+client firehose, 64 B       39,921,955  40,370,413   0.981 [0.966 .. 1.014]
+client send, 64 B           26,076,696  25,958,758   1.015 [0.994 .. 1.036]
+server Lua echo, pipelined   3,835,606   3,883,802   0.989 [0.979 .. 1.018]
+server, arithmetic+strings     292,037     289,750   1.008 [0.998 .. 1.023]
+```
 
-**What 0 buys.** Setting the bound to **0** installs no hook. It also opens LuaJIT's **jit** library, which is the only thing that turns the trace compiler on. Without it, every Lua callback the daemon runs is interpreted. On the same arithmetic callback, the bounded run served 11722 messages a second and the unbounded run 28085, at 85.2 and 30.3 microseconds of worker CPU per message.
+Every range takes in 1. Against the count hook this replaced, which also kept the compiler closed, the default budget serves 1.08 times as much on the firehose (37,018,042), 1.04 times on the send (25,206,565), the same on the echo (3,857,682), and 1.57 times on the callback that computes (186,155).
 
-A callback that only answers a message gains very little, because there is almost no loop to compile. On the echo fixture the two arms do not differ in throughput: 42850 and 43929 messages a second bounded, against 43577 and 44350 unbounded. That gap is smaller than the spread inside either arm. What does differ is Lua's own share of the worker's CPU: 5.2 and 5.1% bounded, against 3.9 and 4.0% unbounded. That is the compiler doing a little work on two bytecodes. End to end this is about 1%, against 2.4x on a callback that computes.
+The daemon's sweep wakes it ten times a second while any worker runs: an idle daemon with one idle runtime spent 9.4 milliseconds of CPU in 30 seconds, against 2.2 before.
+
+**What the compiler gives.** Before the deadline was watched from outside, a callback with a budget ran interpreted, and setting the budget to **0** was the only way to open the compiler. These measurements compare the two arms, and every callback now runs in the compiled one. On an arithmetic callback the interpreted run served 11722 messages a second and the compiled run 28085, at 85.2 and 30.3 microseconds of worker CPU per message.
+
+A callback that only answers a message gains very little, because there is almost no loop to compile. On the echo fixture the two arms do not differ in throughput: 42850 and 43929 messages a second interpreted, against 43577 and 44350 compiled. That gap is smaller than the spread inside either arm. What does differ is Lua's own share of the worker's CPU: 5.2 and 5.1% interpreted, against 3.9 and 4.0% compiled. That is the compiler doing a little work on two bytecodes. End to end this is about 1%, against 2.4x on a callback that computes.
 
 A streaming producer falls between those two cases. It matters because it is the shape that runs per byte rather than per message. A handler that generates 40,000 CSV rows into **self.send_chunk** gains 25 to 48 per cent, not 2.4x. The profile shows why. With the hook installed, the interpreter takes 92.7 per cent of the worker's core. About 35 per cent of that is spent in **lj_str_new**, **lj_str_resize**, **gc_sweepstr** and the allocator. A compiled trace allocates and interns every string it builds exactly as the interpreter does. The compiler removes the dispatch cost but leaves the string cost in place.
 
 So the way the script builds its strings is the larger lever, and the two effects multiply rather than add. The table shows the same handler using **string.format** instead of a chain of **..** concatenations, at 8 concurrent requests and then at 64:
 
 ```
-                        bounded      unbounded
+                      interpreted     compiled
 .. concatenation        97.8/s      130.6/s   (+34%)
 string.format           93.8/s      160.0/s   (+71%)
 .. at 64 concurrent      68.0/s      100.8/s   (+48%)
 string.format at 64     71.5/s      142.7/s  (+100%)
 ```
 
-Both arms put byte-identical responses on the wire. The unbounded column is the one that changes. In the interpreter, **string.format** gains nothing: it is 4 per cent behind concatenation, inside the spread, because there each row costs one C call either way. **string.format** pays off only when the compiler is on, and then it pays twice. It builds one string per row instead of a chain of intermediate strings, and it uses an integer formatter instead of the double formatter, which alone took 15.6 per cent of the core. Compare the default with concatenation against the compiler with **string.format**. End to end, the second gives 64 per cent more throughput at 8 streams and 110 per cent more at 64, for about half the CPU per request.
+Both arms put byte-identical responses on the wire. The compiled column is the one that changes. In the interpreter, **string.format** gains nothing: it is 4 per cent behind concatenation, inside the spread, because there each row costs one C call either way. **string.format** pays off only when the compiler is on, and then it pays twice. It builds one string per row instead of a chain of intermediate strings, and it uses an integer formatter instead of the double formatter, which alone took 15.6 per cent of the core. Compare the default with concatenation against the compiler with **string.format**. End to end, the second gives 64 per cent more throughput at 8 streams and 110 per cent more at 64, for about half the CPU per request.
 
 A C server that builds the same rows with **snprintf**(3) still serves 2.4x the best of those results. The choice is therefore about how much of a stream's work belongs in Lua at all. No setting closes that gap.
 
 **What decides the size of the gain** is how much of the work happens at the Lua level, not how many bytes pass through. This was measured on a proxy, a second runtime type with a per-byte hook. Both handlers forward the bytes unchanged, so only the work differs:
 
 ```
-                              bounded   unbounded   CPU per request
+                          interpreted    compiled   CPU per request
 one C library call per chunk    120.9      121.9     8223 -> 8155 us
 a Lua loop over every row       417.1     1452.0     2378 ->  669 us
 ```
@@ -589,11 +627,13 @@ At a thousand pieces, the best shape serves 14.1 times as many exchanges as the 
 
 The effect on the compiler is the part worth remembering. Opening the compiler gains 14 per cent on the accumulating shape and nothing outside the spread on the accumulating shape that formats. It gains 75 and 104 per cent on the two shapes that join once. This is the rule above seen from the other side. Accumulating moves the work out of Lua and into the allocator, where the compiler cannot reach it. A script that is slow because of its idiom does not become fast because of this setting.
 
-**What 0 gives up.** A compiled trace never calls the instruction hook, so with the compiler on, a runaway callback cannot be interrupted at all. In a measurement, **while true do end** with a 300 millisecond deadline was stopped after 300.2 milliseconds with the compiler off, and never with the compiler on. A hard ceiling inside the hook did not help either, because the hook is never reached from inside a trace. That is why the bound and the compiler are one setting, not two knobs that can disagree.
+**What 0 turns off.** Setting the budget to **0** arms nothing and writes nothing: the worker writes no line, the daemon sends no signal, and no callback of that script is ever stopped or its worker replaced. It no longer changes what is compiled.
 
-A runaway callback affects one runtime, not the whole daemon. In a measurement with a server whose callback never returns, that server's worker process sat at 83% of a core. Meanwhile a second server on the same daemon went on echoing, and the daemon went on answering **ps**. A runaway in the script's top level is always refused, whatever **callback_timeout_ms** says. The top level runs under the default budget, before the script's own setting has been read.
+**What a compiled runaway costs.** A compiled trace never calls the instruction hook. A runaway loop the compiler has made a trace of, such as **while true do n = n + 1 end**, is ended by replacing its worker at the end of its grace, not stopped in place. Measured with a 500 millisecond budget, the replacement was listening 1.71 seconds after the message that started the loop. A loop that raises and catches an error on each turn goes back to the interpreter, and it was stopped in the same worker after 0.52 seconds.
 
-**What it does not bound.** A callback stopped at its deadline has still held the loop for that long. A CLI command issued during the stall can hit its own five second receive timeout and report the daemon unreachable; the command succeeds on retry. A runaway **on_tick** is stopped on every tick, not once. Time a callback spends in a C function before it has run ten thousand VM instructions, such as an **os.execute** or an **io** read at its start, is not counted: the budget is dated from the first instruction hook, so such a callback can hold the loop for that time and then for its whole budget. Name resolution inside **socketley.http** executes no VM instructions, so it is not interrupted. Instead, the call gives up on it at the call's deadline.
+A runaway callback affects one runtime, not the whole daemon. In a measurement with a server whose callback never returns and no budget, that server's worker process sat at 83% of a core. Meanwhile a second server on the same daemon went on echoing, and the daemon went on answering **ps**. A runaway in the script's top level is always refused, whatever **callback_timeout_ms** says. The top level runs under the default budget, before the script's own setting has been read.
+
+**What it does not bound.** A callback stopped at its deadline has still held the loop for that long. A CLI command issued during the stall can hit its own five second receive timeout and report the daemon unreachable; the command succeeds on retry. A runaway **on_tick** is stopped on every tick, not once. The budget is dated from the start of the loop turn, so the callbacks that ran before this one in the same turn count against it too. Time in a C function, such as an **os.execute** or an **io** read, is counted, but the stop is seen only when the callback is back in the VM; one that is still inside the C function at the end of its grace has its worker replaced. Name resolution inside **socketley.http** executes no VM instructions, so it is not interrupted. Instead, the call gives up on it at the call's deadline.
 
 ## Proxy Filter Chain
 
@@ -743,7 +783,9 @@ self.connections()         -- Current connection count (all four types).
 
 self.protocol  -- server/client: "tcp" or "udp"; proxy: "tcp" or "http"
                -- (not set on a cache)
-self.send(msg)             -- Send message (client)
+self.send(msg [, id])      -- Send message (client).  Without an id, on the
+                           -- connection whose callback is running; with
+                           -- --connections, refused outside every callback
 self.send(client_id, msg)  -- Send to specific client (server)
 self.broadcast(msg)        -- Broadcast to all clients (server).  Answers two
                            -- numbers: how many took it, and how many were
@@ -762,9 +804,11 @@ self.watermark()           -- The byte count on_writable fires on the way down
                            -- --write-buffer is editable.  See on_writable.
 on_http_body(id, chunk, n) -- A request body streamed, rather than gathered
                            -- whole (server).  Defining it is the opt-in.
-self.pending()             -- The client's own form, without an id: a client
-                           -- has one connection.  Bytes queued for its server
-                           -- and not yet on the wire.
+self.pending([id])         -- The client's own form.  Bytes queued for its
+                           -- server and not yet on the wire: for that id (nil
+                           -- if it has none), or without one the connection
+                           -- whose callback is running, or all of them
+                           -- outside every callback.
 
 -- ─── Sending faster than the socket ───
 -- A write is queued, not performed, and the queue has a bound.  Reach it and

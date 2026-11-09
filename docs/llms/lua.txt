@@ -31,11 +31,32 @@ Called when the runtime stops.
 
 #### `on_message(msg)`
 
-Called when a message is received (server and client). When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
+Called when a message is received (server and client). A client passes the connection id as a second argument, 1 unless **--connections** is given; see there. When a server defines this callback, it takes over message handling: the default broadcast (in **inout** and **master** modes) is suppressed. Use **self.broadcast(msg)** to relay messages yourself.
 
 #### `on_client_message(client_id, msg) -> true`
 
 Called when a message is received, with the sender's id (server only). It fires alongside on_message, and first. Returning **true** says the script has handled the message, so nothing is sent automatically: not the relay of **--mode inout** or of the master's messages, and not what **--send-to** names for a non-master. Returning anything else, or nothing, leaves those as they are. On a UDP server, client_id names the peer that sent the datagram; see **--udp**. A handler still waiting on **self.cache** when the relay runs has not returned yet, so its message is relayed; define on_message to stop the relay for such a script.
+
+#### `on_messages(chunk, id)` / `on_client_messages(client_id, chunk) -> true`
+
+The batch forms of on_message (client) and on_client_message (server): every complete line of one read in one call, instead of one call per line. **chunk** is the bytes as they arrived, up to and including the read's last newline, so every line in it ends with its '\n', a CRLF line keeps its '\r' and an empty line is a bare '\n'. An unfinished last line is kept and arrives at the start of the next call. When a script defines both forms, only the batch one is called.
+
+A client calls on_messages for its TCP, unix-socket and TLS reads, with the connection's id after the chunk (see **--connections**). A server calls on_client_messages for a TCP line connection; returning **true** answers for every line in the chunk, as on_client_message's **true** does for one. A route or pipe the script sets from on_client_messages carries the next read on: the lines of the chunk it was handed are its own and are not sent on as well. Where there is no read to batch, each message is a chunk of one line with its '\n' added, and a message that itself holds a newline reads as more than one line there, so a script for such a runtime is better written with on_message: a datagram (**--udp**), a WebSocket message, a server in **--mode master** or with **--rate-limit** or **--global-rate-limit**, which judge each line on its own. **-w**, bash output and an interactive attach still see each line, exactly as with on_message.
+
+A call per read instead of per line pays where the script takes the chunk whole: measured on one core, a server echoing 64 connections of 16 pipelined 64-byte lines with one **self.send** per chunk answered 1.6 times as many as with on_client_message. A script that walks the chunk line by line in Lua spends about what the calls it saves cost: counting 64-byte lines with string.find as below came to 5 per cent fewer than with on_message, and with 4 KiB lines, where copying the chunk into Lua is the cost, a third fewer. Counting the lines of a chunk:
+
+```
+local n = 0
+function on_messages(chunk)
+    local i = 1
+    while true do
+        local j = string.find(chunk, "\n", i, true)
+        if not j then break end
+        n = n + 1      -- the line is chunk:sub(i, j - 1)
+        i = j + 1
+    end
+end
+```
 
 #### `on_http_body(client_id, chunk, remaining)`
 
@@ -83,7 +104,7 @@ Called when an upstream's write queue has come back under **self.watermark()**. 
 
 Called when this connection's write queue has come back under **self.watermark()**. A producer that stopped because **self.pending(client_id)** was high can then carry on. The callback is edge-triggered: it fires once per crossing, not once per completed write.
 
-A client runtime has the same callback without the argument, **on_writable()**, because it has one connection, and a number naming it would be a fiction. A client's refusal to send also names its real cause. A connected **--mode out** client whose server has stopped reading is refused with a reason that names the backlog. It is not told it "is not connected to its server, or was created --mode in and does not send", three statements that are all false of it. Measured with 400 chunks of 64 KB sent to a peer reading nothing: 129 taken, 271 refused, 8,396,928 bytes queued.
+A client runtime passes its connection id, **on_writable(id)**. It is 1 unless **--connections** is given. A client's refusal to send also names its real cause. A connected **--mode out** client whose server has stopped reading is refused with a reason that names the backlog. It is not told it "is not connected to its server, or was created --mode in and does not send", three statements that are all false of it. Measured with 400 chunks of 64 KB sent to a peer reading nothing: 129 taken, 271 refused, 8,396,928 bytes queued.
 
 This callback is what makes a body larger than the queue limit sendable at all. Without it, a script had only the hard limit, with nothing leading up to it: at 8 MiB the connection is closed. The only safe strategy was to know the limit in advance and never approach it. Measured with a client reading in 256 KB bites with a 5 ms pause, sending 200 chunks of 64 KB (13,107,400 bytes):
 
@@ -114,7 +135,7 @@ Called when a client connects (server and client). It is also called on a sub-se
 
 #### `on_disconnect(client_id)`
 
-Called when a client disconnects (server and client).
+Called when a client disconnects (server and client). A client's **on_connect** and **on_disconnect** are given the descriptor and then the connection id; see **--connections**.
 
 #### `on_rcpt(rcpt, default) -> bool`
 
