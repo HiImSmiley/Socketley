@@ -1,47 +1,45 @@
 #!/usr/bin/env bash
-# Integration test: turning the callback deadline off turns LuaJIT's trace
-# compiler on, and nothing else does.
+# Integration test: LuaJIT's trace compiler is on for a runtime's callbacks
+# whatever the deadline says, and off for its top level.
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
 #
 # LuaJIT's trace compiler is initialised by luaopen_jit and by nothing else.
-# lua_context did not call it, so every Lua callback this daemon ran was
-# interpreted -- 5.2-5.5x against the same loop with the compiler on.  It is now
-# opened for exactly the contexts that install no deadline hook, because those
-# are one decision rather than two: a compiled trace does not call an
-# instruction hook back, so with the compiler on a runaway callback cannot be
-# interrupted at all.  At a limit of 0 there is no hook to defeat, so coupling
-# the two gives away nothing that was not already given away.
+# It used to be opened only for a script with no deadline, because the deadline
+# was a standing count hook and a compiled trace never calls a hook back.  The
+# deadline is now watched from outside the worker -- the daemon reads a line
+# the worker writes and signals a callback past its budget -- and a compiled
+# runaway that never reaches the hook the signal puts on has its worker
+# replaced.  Nothing is left for the compiler to defeat, so every worker opens
+# it, under any limit.  This file used to assert the opposite for a bounded
+# script; its premise is what changed.
 #
 # ─── WHY THESE ASSERTIONS AND NOT A TIMING ──────────────────────────────────
 #
-# The obvious test is "the unbounded arm is faster", and it is the wrong one:
-# it needs a hot loop, a warm-up and a threshold, and a threshold separating
-# 30us from 85us on an idle box separates nothing on a loaded one.  This suite
-# has been wrong that way before.
+# The obvious test is "the compiled arm is faster", and it is the wrong one: it
+# needs a hot loop, a warm-up and a threshold.  The compiler's presence is a
+# fact the script can read instead.  luaopen_jit creates the global `jit`;
+# nothing else in this tree does.  So the answer goes on the wire with no clock
+# in it -- and jit.status() is asked as well as the table's existence, because a
+# table with the engine disabled would read as "on" to a test that only checked
+# for the table.
 #
-# The compiler's presence is a fact the script can read instead.  luaopen_jit
-# creates the global `jit`; nothing else in this tree does.  So the answer goes
-# on the wire with no clock in it -- and jit.status() is asked as well as the
-# table's existence, because a table with the engine disabled would read as
-# "on" to a test that only checked for the table.
+# ─── THE CASES, AND WHY EACH IS LOAD-BEARING ────────────────────────────────
 #
-# ─── THE FOUR CASES, AND WHY EACH IS LOAD-BEARING ───────────────────────────
+#   daemon default, script silent   -> jit, engine on.  The half that fails on
+#     the build before the deadline moved out of the worker: every bounded
+#     script there answered `jit=false`.
+#   daemon default, script says 0   -> jit, engine on.
+#   daemon 0, script silent         -> jit, engine on.
+#   daemon 0, script says 10000     -> jit, engine on.  The old ordering case,
+#     a bound raised above an unbounded daemon, which used to close it again.
+#   and the top level of each       -> no jit.  The library is opened once the
+#     top level has run, so a top level that never returns is interpreted and
+#     always stopped by the hook rather than by replacing a worker that is
+#     still starting.
 #
-#   daemon default, script silent   -> no jit.  This is the half that fails if
-#     the coupling is ever widened to "always on", which would quietly remove
-#     the runaway bound from every script in the tree.
-#   daemon default, script says 0   -> jit, engine on.  The script's knob.
-#   daemon 0, script silent         -> jit, engine on.  The operator's knob.
-#   daemon 0, script says 10000     -> NO jit.  This one is about ordering: the
-#     decision has to be taken after the script's top level has run and its
-#     declaration has been read, not when the state is built.  A build that
-#     decided early would open the compiler here and then install a hook that
-#     cannot stop anything -- the worst of the four outcomes, and the only one
-#     no other assertion here would notice.
-#
-# Watched red before it was believed: against bin/Release/socketley as it stood
-# on 2026-08-14, every one of these answered `jit=false`.
+# Watched red before it was believed: against the build before this change,
+# the two bounded cases answered `jit=false status=no-jit`.
 #
 # suite: quiet -- four runtimes, one message each, no timing anywhere.
 
@@ -88,7 +86,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Integration: the deadline being off is what turns LuaJIT's compiler on ==="
+echo "=== Integration: LuaJIT's compiler is on for callbacks under any deadline ==="
 
 # ── The scripts ─────────────────────────────────────────────────────────────
 #
@@ -96,11 +94,12 @@ echo "=== Integration: the deadline being off is what turns LuaJIT's compiler on
 # as well as proof of what it can see.
 
 report_body='
+top_jit = tostring(jit ~= nil)
 function on_message(msg) end
 function on_client_message(id, msg)
     local st = "no-jit"
     if jit ~= nil then st = tostring(jit.status()) end
-    self.send(id, "jit=" .. tostring(jit ~= nil) .. " status=" .. st)
+    self.send(id, "jit=" .. tostring(jit ~= nil) .. " status=" .. st .. " top=" .. top_jit)
 end
 '
 
@@ -124,22 +123,22 @@ ready_tcp 127.0.0.1 "$ZERO_PORT"   8 || echo "  NOTE: jb_zero never accepted a c
 
 OUT=$(say "$SILENT_PORT" ask)
 case "$OUT" in
-    "jit=false status=no-jit") pass ;;
-    *) fail "a bounded script has no jit table at all" \
-            "expected 'jit=false status=no-jit', got: ${OUT:-<nothing>}" \
-            "a bounded script seeing jit means the compiler was opened for a" \
-            "runtime whose deadline can no longer stop a runaway" ;;
+    "jit=true status=true top=false") pass ;;
+    "jit=true status=true top="*) fail "a script that declares nothing: the top level runs before the compiler is opened" \
+            "expected top=false, got: $OUT" \
+            "a top level that is compiled can only be ended by replacing its worker" ;;
+    *) fail "a script that declares nothing: callbacks run with the compiler on" \
+            "expected 'jit=true status=true top=false', got: ${OUT:-<nothing>}" ;;
 esac
 
 OUT=$(say "$ZERO_PORT" ask)
 case "$OUT" in
-    "jit=true status=true") pass ;;
-    "jit=true status="*) fail "callback_timeout_ms = 0 leaves the engine enabled" \
-            "expected status=true, got: $OUT" ;;
-    *) fail "callback_timeout_ms = 0 opens the jit library" \
-            "expected 'jit=true status=true', got: ${OUT:-<nothing>}" \
-            "this is what fails on a build where luaopen_jit is never called:" \
-            "the whole tree answered 'jit=false' before this existed" ;;
+    "jit=true status=true top=false") pass ;;
+    "jit=true status=true top="*) fail "callback_timeout_ms = 0: the top level runs before the compiler is opened" \
+            "expected top=false, got: $OUT" \
+            "a top level that is compiled can only be ended by replacing its worker" ;;
+    *) fail "callback_timeout_ms = 0: callbacks run with the compiler on" \
+            "expected 'jit=true status=true top=false', got: ${OUT:-<nothing>}" ;;
 esac
 
 # ── Arm 2: a daemon the operator unbounded ──────────────────────────────────
@@ -160,19 +159,22 @@ ready_tcp 127.0.0.1 "$RAISE_PORT" 8 || echo "  NOTE: jb_raise never accepted a c
 
 OUT=$(say "$ENVZ_PORT" ask)
 case "$OUT" in
-    "jit=true status=true") pass ;;
-    *) fail "SOCKETLEY_LUA_TIMEOUT_MS=0 reaches a script that declares nothing" \
-            "expected 'jit=true status=true', got: ${OUT:-<nothing>}" ;;
+    "jit=true status=true top=false") pass ;;
+    "jit=true status=true top="*) fail "SOCKETLEY_LUA_TIMEOUT_MS=0: the top level runs before the compiler is opened" \
+            "expected top=false, got: $OUT" \
+            "a top level that is compiled can only be ended by replacing its worker" ;;
+    *) fail "SOCKETLEY_LUA_TIMEOUT_MS=0: callbacks run with the compiler on" \
+            "expected 'jit=true status=true top=false', got: ${OUT:-<nothing>}" ;;
 esac
 
 OUT=$(say "$RAISE_PORT" ask)
 case "$OUT" in
-    "jit=false status=no-jit") pass ;;
-    *) fail "a script that raises the bound above an unbounded daemon gets no compiler" \
-            "expected 'jit=false status=no-jit', got: ${OUT:-<nothing>}" \
-            "the decision has to be taken after the script's declaration is read;" \
-            "taken earlier, this runtime has a compiler AND a hook that cannot" \
-            "stop anything it compiles" ;;
+    "jit=true status=true top=false") pass ;;
+    "jit=true status=true top="*) fail "a bound raised above an unbounded daemon: the top level runs before the compiler is opened" \
+            "expected top=false, got: $OUT" \
+            "a top level that is compiled can only be ended by replacing its worker" ;;
+    *) fail "a bound raised above an unbounded daemon: callbacks run with the compiler on" \
+            "expected 'jit=true status=true top=false', got: ${OUT:-<nothing>}" ;;
 esac
 
 # ── And the daemon that did all of that is still the same process ───────────

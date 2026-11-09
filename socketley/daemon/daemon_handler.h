@@ -349,6 +349,13 @@ private:
     bool m_torn_down{false};
 
     void start_health_timer();
+
+    // The sweep of every worker's Lua deadline line, every scan_ms while any
+    // worker is alive, and stopped while none is, so an empty daemon sleeps.
+    io_request m_deadline_req{};
+    struct __kernel_timespec m_deadline_ts{};
+    bool m_deadline_pending{false};
+    void start_deadline_timer();
     void start_accept();
     void check_managed_health();
 

@@ -281,7 +281,7 @@ void register_lua_table(runtime_instance* owner, sol::state& lua, sol::table& se
             const std::string who_name(rt->get_name());
             sol::protected_function_result res;
             {
-                lua_deadline::scope bound("mcp resource", lua_deadline::default_ms(), who_name.c_str());
+                lua_deadline::scope bound(S.lua_state(), "mcp resource", lua_deadline::default_ms(), who_name.c_str());
                 res = f(caller_table(S, who));
             }
             if (lua_diag::raised(res, rt->get_name(), "mcp resource " + uri))
@@ -355,7 +355,7 @@ void register_lua_table(runtime_instance* owner, sol::state& lua, sol::table& se
             const std::string who_name(rt->get_name());
             sol::protected_function_result res;
             {
-                lua_deadline::scope bound("mcp prompt", lua_deadline::default_ms(), who_name.c_str());
+                lua_deadline::scope bound(S.lua_state(), "mcp prompt", lua_deadline::default_ms(), who_name.c_str());
                 res = f(lua_of(S, args), caller_table(S, who));
             }
             if (lua_diag::raised(res, rt->get_name(), "mcp prompt " + name))

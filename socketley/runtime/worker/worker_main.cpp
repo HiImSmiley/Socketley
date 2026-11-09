@@ -45,6 +45,7 @@
 #include "../../shared/ipc/shard_mesh.h"
 #include "../../shared/ipc/shard_target.h"
 #include "../../shared/ipc/worker_protocol.h"
+#include "../../shared/ipc/deadline_slot.h"
 
 namespace
 {
@@ -76,6 +77,11 @@ constexpr int worker_link_fd = 7;
 // this number, and a worker that probed it armed a recv on its own wakeup and
 // then closed it.
 constexpr int worker_mesh_base = 8;
+
+// The line the daemon watches this worker's Lua callbacks through, past the
+// whole mesh block so no shard count can reach it, agreeing with
+// proxy_supervisor's child_deadline_fd.
+constexpr int worker_deadline_fd = worker_mesh_base + static_cast<int>(max_shards);
 
 constexpr auto stats_interval =
     std::chrono::milliseconds(worker_proto::stats_interval_ms);
@@ -373,7 +379,6 @@ public:
             // Before the ring exists poll_completions() returns at once
             // whatever timeout it is handed, so the wait comes from a poll on
             // the control socket, which is its own notification.
-            bool dispatched = false;
             if (m_loop.ring_open())
             {
                 // The two states the ring cannot end on its own -- no recv
@@ -409,7 +414,12 @@ public:
                 if (m_loop.poll_completions(wait_ms) > 0)
                 {
                     stats_dirty = true;
-                    dispatched = true;
+                }
+                else
+                {
+                    // A turn with nothing dispatched is still the start of
+                    // whatever Lua runs below, which is dated from this stamp.
+                    socketley::turn_clock::stamp();
                 }
 
                 // Dispatched here rather than in on_cqe(), because on_config()
@@ -424,6 +434,8 @@ public:
                 // itself, which costs nothing measurable in a window before
                 // this worker has a runtime, a port or a sibling.
                 wait_for_control(wait_ms, m_writer.pending());
+                // The script's top level runs inside this pump, dated from here.
+                socketley::turn_clock::stamp();
                 if (!pump_control())
                     break;
 
@@ -433,8 +445,8 @@ public:
                 stats_dirty = true;
             }
 
-            // A turn that dispatched has read the clock already, and its stamp is the turn's time.
-            now = dispatched ? socketley::turn_clock::now() : std::chrono::steady_clock::now();
+            // Every turn has read the clock once by now, and its stamp is the turn's time.
+            now = socketley::turn_clock::now();
 
             // Whatever the socket would not take last turn, because a reply
             // sitting here is somebody's answer.
@@ -537,7 +549,9 @@ public:
         for_each_link([](shard_link& link) { link.expect_peer_exit(); });
 
         // Same order the daemon uses: stop the runtime while there is still a
-        // ring for teardown() to cancel into, and only then end the ring.
+        // ring for teardown() to cancel into, and only then end the ring --
+        // with a stamp of its own, since on_stop is dated from it.
+        socketley::turn_clock::stamp();
         if (m_rt && m_rt->get_state() == runtime_running)
             m_rt->stop(m_loop);
 
@@ -2697,6 +2711,15 @@ int worker_main(int control_fd)
     // the --shards placement rule, which would otherwise refuse every shard
     // the daemon had just accepted.
     set_worker_process(true);
+
+    // Before any interpreter exists too, because the compiler is opened only
+    // where the daemon can end a callback a compiled trace keeps from the hook.
+    if ([[maybe_unused]] deadline_slot::slot* line = deadline_slot::adopt(worker_deadline_fd))
+    {
+#ifndef SOCKETLEY_NO_LUA
+        lua_deadline::watch(line);
+#endif
+    }
 
     // The daemon's answers to the ring probes, so this process asks the kernel none of them again.
     if (const char* facts = socketley::settings::text("SOCKETLEY_RING_FACTS"))

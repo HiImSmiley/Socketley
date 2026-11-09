@@ -472,11 +472,10 @@ void cache_script_engine::ensure_state()
     lua_setfield(L, -2, "rep");
     lua_pop(L, 1);
 
-    // The deadline the rest of the tree already uses, on this state too: a
-    // script that loops is stopped by the same count hook a callback is, and
-    // the trace compiler stays off for the same reason -- a compiled trace
-    // calls no hook back.
-    lua_deadline::install(L, lua_deadline::default_ms());
+    // No `jit` here, unlike a runtime's script: a client's runaway script is
+    // then always interpreted and stopped by the deadline's hook, where a
+    // compiled one could only be ended by replacing the worker, and that
+    // would empty the shard's keyspace for one bad EVAL.
 
     // Built ONCE.  These closures read m_call rather than capturing it, so the
     // table survives between evals -- rebuilding it per call cost as much as
@@ -683,7 +682,7 @@ bool cache_script_engine::eval(std::string_view body,
     // once already when the compile moved into a cache -- the scope sat
     // between the lines that were replaced -- and the deadline test caught it
     // by running past its own timeout while the cache stopped answering.
-    lua_deadline::scope deadline("a script", lua_deadline::default_ms(), "cache eval");
+    lua_deadline::scope deadline(L, "a script", lua_deadline::default_ms(), "cache eval");
 
     const int64_t used_before = m_alloc.used;
     bool ran = true;

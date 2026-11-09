@@ -65,10 +65,13 @@ class lua_mqtt_client;
 class lua_mail_client;
 class lua_http_client;
 
-// How long one Lua callback may hold the event-loop thread, enforced by a
-// count hook that fires every N VM instructions and tests wall-clock time --
-// because instructions do not map to time and a callback blocked in
-// socketley.http executes almost none.
+namespace deadline_slot { struct slot; }
+
+// How long one Lua callback may hold the event-loop thread, watched from
+// outside the thread rather than by a hook inside it: a worker publishes the
+// invocation in a line the daemon reads every 100 ms, and only a callback
+// found past its budget gets an instruction hook, put there by a signal --
+// so no hook runs in normal operation and the trace compiler stays on.
 namespace lua_deadline
 {
     // ─── The number ─────────────────────────────────────────────────────────
@@ -77,36 +80,45 @@ namespace lua_deadline
     // for a second request inside one shared budget.
     inline constexpr uint32_t builtin_default_ms = 10000;
 
-    // The process-wide default in milliseconds, 0 meaning no hook at all, set
-    // by the script's `callback_timeout_ms` or by SOCKETLEY_LUA_TIMEOUT_MS --
-    // and not by a CLI flag, which would let somebody who has not read the
-    // script overrule a bound its author set.
+    // The process-wide default in milliseconds, 0 meaning nothing is armed or
+    // written at all, set by the script's `callback_timeout_ms` or by
+    // SOCKETLEY_LUA_TIMEOUT_MS -- and not by a CLI flag, which would let
+    // somebody who has not read the script overrule a bound its author set.
     uint32_t default_ms();
 
-    // Put the count hook on a state or take it off when limit_ms is 0, public
-    // because the daemon reads its own configuration file with a bare
-    // sol::state and a config file is a script like any other.
-    void install(lua_State* L, uint32_t limit_ms);
+    // Hand this thread's callbacks to the daemon's watch through `line`, called
+    // once by a worker before any interpreter exists; a thread that never calls
+    // it watches itself with a timer per invocation instead.
+    void watch(deadline_slot::slot* line) noexcept;
 
-    // Open the deadline for one callback invocation, dated from the first hook
-    // or check inside it, and mark that this thread is inside one, with only
-    // the outermost scope opening it, because a nested interpreter is the same
-    // stretch of time the event loop is held for.
+    // Whether this thread's callbacks are watched by the daemon, which is what
+    // can end one that a compiled trace keeps away from any hook.
+    bool watched() noexcept;
+
+    // Open the deadline for one callback invocation, dated from the start of
+    // the loop turn it runs in, and mark that this thread is inside one, with
+    // only the outermost scope opening it, because a nested interpreter is the
+    // same stretch of time the event loop is held for.
     class scope
     {
     public:
-        // `what` and `runtime` name the callback and its runtime for the
-        // diagnostic and must outlive the scope, because the hook formats them
-        // with fprintf where no destructor may run; `limit_ms` of 0 leaves the
-        // deadline unarmed without stopping the scope counting.
-        scope(const char* what, uint32_t limit_ms, const char* runtime = nullptr) noexcept;
+        // `L` is the state the callback runs on, any thread of it, for the stop
+        // hook to be put on; `what` and `runtime` name the callback and its
+        // runtime for the diagnostic and must outlive the scope, because the
+        // hook formats them with fprintf where no destructor may run;
+        // `limit_ms` of 0 leaves the deadline unarmed without stopping the
+        // scope counting.
+        scope(lua_State* L, const char* what, uint32_t limit_ms, const char* runtime = nullptr) noexcept;
         ~scope() noexcept;
         scope(const scope&)            = delete;
         scope& operator=(const scope&) = delete;
 
     private:
-        bool m_outermost;
-        bool m_first_frame;
+        lua_State* m_L;
+        // The state a nested scope on another interpreter took over from, put back when it ends.
+        lua_State* m_outer_L{nullptr};
+        bool       m_outermost;
+        bool       m_first_frame;
     };
 
     // Milliseconds left in the armed invocation, -1 when nothing is armed,
@@ -131,7 +143,7 @@ class lua_guarded_call
 public:
     lua_guarded_call(F& fn, const char* what, uint32_t limit_ms,
                      const char* runtime = nullptr) noexcept
-        : m_fn(fn), m_scope(what, limit_ms, runtime) {}
+        : m_fn(fn), m_scope(fn.lua_state(), what, limit_ms, runtime) {}
 
     // decltype(auto) rather than auto, because sol's result owns a slice of
     // the Lua stack and C++17 then constructs it straight into the caller's
@@ -400,14 +412,9 @@ public:
     static cluster_view_ptr cluster_view_snapshot();
 
 private:
-    // Put the count hook on this state, or take it off when m_deadline_ms is
-    // 0, called again after the top level has run because that is when
-    // `callback_timeout_ms` becomes readable.
-    void install_deadline_hook();
-
-    // Open LuaJIT's jit library if and only if this context runs without a
-    // deadline hook, once, from the point where m_deadline_ms is final.
-    void enable_jit_if_unbounded();
+    // Open LuaJIT's jit library wherever a runaway compiled trace can still be
+    // ended, once, from the point where m_deadline_ms is final.
+    void open_compiler();
 
     void register_bindings(runtime_instance* owner);
 

@@ -5636,7 +5636,7 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
     // One budget for the whole chain rather than per filter, because a request
     // costs what its chain costs and measuring them one at a time would call
     // ten seconds fine.
-    lua_deadline::scope deadline_guard("a filter in the `filters` chain",
+    lua_deadline::scope deadline_guard(lctx->state().lua_state(), "a filter in the `filters` chain",
                                        lctx->callback_timeout_ms());
 
     for (const auto& filter : lctx->filters())

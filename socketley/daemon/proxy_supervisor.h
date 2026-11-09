@@ -19,6 +19,7 @@
 // rather than something only the .cpp had to know about.
 #include "../shared/runtime/runtime_definitions.h"
 #include "../shared/ipc/worker_protocol.h"
+#include "../shared/ipc/deadline_slot.h"
 
 class runtime_instance;
 struct runtime_config;
@@ -336,6 +337,24 @@ public:
     // from out here, and the operator is the one who knows which it is.
     void check_wedged();
 
+    // ── The Lua callback deadline, watched from out here ────────────────────
+    // Every live worker's line read once, at most every deadline_slot::scan_ms
+    // whoever asks: the daemon's timer, and the waits that hold its loop while
+    // a worker runs its top level or on_start.
+    static void sweep_deadlines();
+
+    // Whether any child is there to watch, which is what keeps the timer
+    // behind sweep_deadlines() armed.
+    static bool any_watched();
+
+    // Whether a child killed at its deadline is still waiting to be reaped,
+    // so its replacement is forked on the next sweep and not the next health tick.
+    static bool any_killed();
+
+    // Who to tell that a child has just been forked, so a timer that stopped
+    // for want of children starts again before the child runs a line of Lua.
+    static void set_spawn_hook(std::function<void()> hook);
+
     // True once for each state or route declaration the child reported: the
     // supervisor decides and the caller persists or republishes.
     bool take_routes_change() { const bool c = m_routes_changed; m_routes_changed = false; return c; }
@@ -510,6 +529,17 @@ private:
     std::vector<int> m_mesh_fds;
     int          m_shard_region_fd{-1};
     int          m_shard_clients_fd{-1};
+
+    // This child's callback as the daemon sees it, judged on every sweep: told
+    // to stop past its limit, and killed for the death policy to replace once
+    // it has had its grace.
+    void check_deadline(uint64_t now_ns);
+
+    // The one line the child writes its running callback into, kept across
+    // restarts and zeroed for each new child.
+    deadline_slot::region m_deadline;
+    deadline_slot::watch  m_deadline_watch;
+    bool                  m_deadline_killed{false};
 
     pid_t        m_pid{0};
     int          m_control_fd{-1};

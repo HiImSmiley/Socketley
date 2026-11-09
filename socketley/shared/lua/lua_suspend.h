@@ -513,7 +513,7 @@ private:
     // The resume itself, with the deadline armed around it.
     int resume_top(lua_State* th, const char* what, uint32_t exec_ms, int nargs)
     {
-        lua_deadline::scope guard(what, exec_ms, m_owner_name.c_str());
+        lua_deadline::scope guard(th, what, exec_ms, m_owner_name.c_str());
         // Three arguments and not two: sol's 5.1 compatibility layer
         // defines lua_resume with the 5.4 signature and drops the caller.
         ++m_resuming;

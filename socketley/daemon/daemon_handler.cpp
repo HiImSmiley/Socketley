@@ -713,6 +713,10 @@ bool daemon_handler::setup()
 
     start_health_timer();
 
+    // A fork restarts the sweep that stopped for want of children, before the child has run a line of Lua.
+    proxy_supervisor::set_spawn_hook([this] { start_deadline_timer(); });
+    start_deadline_timer();
+
     return true;
 }
 
@@ -807,6 +811,10 @@ void daemon_handler::teardown()
         // one completion carrying this request and clearing it would let a
         // later arm hand the kernel a request it is already carrying one for.
     }
+    // The deadline sweep the same way and for the same reasons, with the hook that would re-arm it gone first.
+    proxy_supervisor::set_spawn_hook(nullptr);
+    if (m_deadline_pending && !m_torn_down)
+        if (!m_loop.submit_timeout_remove(&m_deadline_req)) {}
     m_torn_down = true;
 
     // What the alerts' webhook has not taken stays in its outbox for the next start.
@@ -922,6 +930,18 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
                 m_alert_out.on_timer();
                 break;
             }
+            if (req == &m_deadline_req)
+            {
+                m_deadline_pending = false;
+                if (m_torn_down)
+                    break;
+                proxy_supervisor::sweep_deadlines();
+                // The reap and the death policy the health tick would apply, without waiting up to two seconds for it.
+                if (proxy_supervisor::any_killed())
+                    check_managed_health();
+                start_deadline_timer();
+                break;
+            }
             if (req == &m_health_req)
             {
                 m_health_pending = false;
@@ -938,6 +958,7 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
                     start_accept();
 
                 check_managed_health();
+                start_deadline_timer();
                 publish_dns_names(m_manager);
                 // The backstop for a start whose wait ended without an exit watch firing, the reconcile above having forked.
                 finish_deferred_starts(false);
@@ -6814,6 +6835,18 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
         m_persistence->save_runtime(inst);
 
     return 0;
+}
+
+void daemon_handler::start_deadline_timer()
+{
+    // Pending means the kernel already carries this request, and no child means nothing to read.
+    if (m_deadline_pending || m_torn_down || !proxy_supervisor::any_watched())
+        return;
+    m_deadline_req = { this, nullptr, -1, 0, op_timeout };
+    m_deadline_ts  = { 0, static_cast<long long>(deadline_slot::scan_ms) * 1000000LL };
+    // A refused submission is retried by the health tick or the next fork, since the deadline is not the daemon's to lose.
+    if (m_loop.submit_timeout(&m_deadline_ts, &m_deadline_req))
+        m_deadline_pending = true;
 }
 
 void daemon_handler::start_health_timer()

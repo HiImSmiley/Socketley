@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include "../shared/net/fd_placement.h"
 
@@ -62,6 +63,23 @@ constexpr int child_link_fd = 7;
 
 constexpr int child_mesh_base = 8;
 
+// The deadline line, past the whole mesh block so no shard count can reach it.
+constexpr int child_deadline_fd = child_mesh_base + static_cast<int>(max_shards);
+
+// Every supervisor alive, for the sweep that reads all their lines at once,
+// because the waits that block the daemon's loop sit inside one of them.
+std::vector<proxy_supervisor*>& supervisors()
+{
+    static std::vector<proxy_supervisor*> all;
+    return all;
+}
+
+std::function<void()>& spawn_hook()
+{
+    static std::function<void()> hook;
+    return hook;
+}
+
 std::string self_exe()
 {
     char buf[4096];
@@ -80,6 +98,7 @@ proxy_supervisor::proxy_supervisor(runtime_instance* placeholder, std::string ex
 {
     if (m_exec_path.empty())
         m_exec_path = self_exe();
+    supervisors().push_back(this);
 }
 
 proxy_supervisor::~proxy_supervisor()
@@ -102,6 +121,9 @@ proxy_supervisor::~proxy_supervisor()
     // retire() first is what leaves nothing to be found.
     if (m_loop)
         m_loop->deregister_owner(this);
+
+    auto& all = supervisors();
+    all.erase(std::remove(all.begin(), all.end(), this), all.end());
 }
 
 void proxy_supervisor::set_event_loop(event_loop* loop)
@@ -137,6 +159,10 @@ uint32_t proxy_supervisor::retire()
     m_on_send_ref = nullptr;
     m_on_route   = nullptr;
     m_on_stats   = nullptr;
+
+    // The deadline line goes now and not with the object, which waits out its last completions: a retired child is
+    // watched by nobody, and its memfd would outlive the runtime by as long as that wait.
+    m_deadline.close();
 
     if (!m_loop)
         return 0;
@@ -627,6 +653,14 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // Its stderr through a pipe of its own, so the daemon's recent log knows which runtime wrote each line.
     const int log_fd = log_ring::worker_pipe(cfg.name);
 
+    // The line this child's callbacks are watched through, made once and zeroed for every child, and not fatal when
+    // it cannot be made: that child then watches itself and keeps its compiler closed under a limit.
+    if (!m_deadline.mapped() && !m_deadline.create())
+        LOG_WARN((who() + "no deadline line for this worker; a Lua callback with a deadline runs uncompiled there").c_str());
+    m_deadline.reset();
+    m_deadline_watch  = {};
+    m_deadline_killed = false;
+
     const pid_t child = ::fork();
     if (child < 0)
     {
@@ -658,8 +692,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
             ::close(lv[0]);
 
         // Every descriptor on its fixed number at once, so none is placed over another's source.
-        socketley::fd_move moves[5 + max_shards];
+        socketley::fd_move moves[6 + max_shards];
         size_t n_moves = 0;
+        moves[n_moves++] = {m_deadline.fd(), child_deadline_fd};
         moves[n_moves++] = {m_shard_region_fd, child_shard_fd};
         moves[n_moves++] = {m_shard_clients_fd, child_clients_fd};
         moves[n_moves++] = {lv[1], child_link_fd};
@@ -701,6 +736,8 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         ::close(lv[1]);
     m_pid          = child;
     socketley::fast_lo_adopt(child);
+    if (spawn_hook())
+        spawn_hook()();
     m_control_fd   = sv[0];
     m_map_fd       = mv[0];
     m_link_chan_fd = lv[0];
@@ -1107,6 +1144,10 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
         if (m_worker_state_seen && m_worker_state == runtime_running)
             return startup::serving;
 
+        // The daemon's loop is held here while the child runs its top level
+        // and on_start, so the deadline is watched from here meanwhile.
+        sweep_deadlines();
+
         // Reaps, applies the policy, and may mark the placeholder failed or
         // fork a replacement, checked again at the top of the next turn.
         if (check_liveness())
@@ -1205,6 +1246,8 @@ bool proxy_supervisor::await_direct(uint64_t ticket,
             return true;
         }
 
+        sweep_deadlines();
+
         // A child that died owes nothing, and waiting out the deadline for a
         // corpse is the difference between a refusal and a hang.
         if (check_liveness())
@@ -1244,6 +1287,8 @@ bool proxy_supervisor::await_routes(const void* previous,
 
         if (m_placeholder && m_placeholder->worker_routes().get() != previous)
             return true;
+
+        sweep_deadlines();
 
         // A child that has gone will never answer, checked after the drain so
         // a declaration sitting in the socket of an exited child is still
@@ -1520,11 +1565,11 @@ void proxy_supervisor::apply_stats(const std::string& payload)
     m_last_stats.seen   = true;
 }
 
-// Above lua_deadline::builtin_default_ms, deliberately: a runaway callback is
-// already ended by its own deadline, and reporting a wedge the runtime is about
-// to resolve is noise.  What is left over is what no deadline covers -- a
-// callback whose script set `callback_timeout_ms = 0`, and a loop that is not
-// in Lua at all.
+// Above lua_deadline::builtin_default_ms and its grace, 12.5 s, deliberately: a
+// runaway callback is already ended by its own deadline, and reporting a wedge
+// the runtime is about to resolve is noise.  What is left over is what no
+// deadline covers -- a callback whose script set `callback_timeout_ms = 0`, and
+// a loop that is not in Lua at all.
 static constexpr auto wedge_silence = std::chrono::seconds(15);
 
 // Half a core, sustained across the whole silent window.  A worker with nothing
@@ -1609,6 +1654,73 @@ void proxy_supervisor::check_wedged()
         snprintf(msg, sizeof(msg), "worker pid %d is answering again",
                  static_cast<int>(m_pid));
     LOG_WARN((who() + msg).c_str());
+}
+
+void proxy_supervisor::check_deadline(uint64_t now_ns)
+{
+    deadline_slot::slot* line = m_deadline.get();
+    if (m_pid <= 0 || !line || m_deadline_killed)
+        return;
+
+    deadline_slot::reading r;
+    if (!deadline_slot::read(*line, r))
+        return;
+
+    switch (deadline_slot::judge(r, m_deadline_watch, now_ns))
+    {
+        case deadline_slot::verdict::none:
+            return;
+
+        case deadline_slot::verdict::stop:
+            // To the thread that runs the loop, which is the one whose tid is the pid, and again on every sweep
+            // until the callback ends, so a stop that landed between two invocations is not the last word.
+            if (::syscall(SYS_tgkill, m_pid, m_pid, deadline_slot::stop_signal) < 0) {}
+            return;
+
+        case deadline_slot::verdict::replace:
+        {
+            // A trace the compiler made of the loop never reaches the hook, and this is the only way it ends.
+            const std::string msg = who() + deadline_slot::named(*line) + " did not stop at its "
+                                  + std::to_string(r.limit_ms) + "ms deadline; its worker is replaced";
+            LOG_WARN(msg.c_str());
+            ::kill(m_pid, SIGKILL);
+            m_deadline_killed = true;
+            return;
+        }
+    }
+}
+
+void proxy_supervisor::sweep_deadlines()
+{
+    static uint64_t last_ns = 0;
+    const uint64_t now = deadline_slot::monotonic_ns();
+    // A little under the period, so the timer's own sweep is never the one skipped.
+    if (now - last_ns < uint64_t{deadline_slot::scan_ms} * 900000u)
+        return;
+    last_ns = now;
+    for (proxy_supervisor* s : supervisors())
+        s->check_deadline(now);
+}
+
+bool proxy_supervisor::any_watched()
+{
+    for (const proxy_supervisor* s : supervisors())
+        if (s->m_pid > 0 && s->m_deadline.mapped())
+            return true;
+    return false;
+}
+
+bool proxy_supervisor::any_killed()
+{
+    for (const proxy_supervisor* s : supervisors())
+        if (s->m_pid > 0 && s->m_deadline_killed)
+            return true;
+    return false;
+}
+
+void proxy_supervisor::set_spawn_hook(std::function<void()> hook)
+{
+    spawn_hook() = std::move(hook);
 }
 
 std::string proxy_supervisor::who() const

@@ -8672,10 +8672,12 @@ A client's script also cannot see the operator's globals, because the two
 states never meet.
 .IP
 .B A script holds the event loop of its shard while it runs.
-It therefore runs under the same count hook as a Lua callback.
+It therefore has the same deadline as a Lua callback, watched the same way.
 A runaway script is stopped with
 .B "a script exceeded the 10000ms deadline"
 instead of holding every other client on that shard forever.
+A script is never compiled, unlike a runtime's callbacks, so the stop always
+reaches it and the shard keeps its worker and its data.
 The limit is
 .B callback_timeout_ms
 or
@@ -20499,6 +20501,40 @@ If the top level never returns, the create is refused with a reason, so the
 command does not hang the terminal.
 .RE
 .PP
+.B How it is enforced.
+Nothing inside the callback times it. A worker writes each invocation into a
+line of memory it shares with the daemon, three stores with no clock read and
+no system call. The daemon reads every worker's line every 100 milliseconds. An
+invocation it finds running on two reads in a row, and past its budget, is sent
+.BR SIGURG .
+The worker's handler puts an instruction hook on the interpreter, the hook
+raises the error at the callback's next VM instruction, and it comes off again
+when the callback ends. The budget is measured from the start of the event\-loop
+turn the callback runs in, so a callback is stopped between its budget and about
+a tenth of a second after it.
+.PP
+LuaJIT's trace compiler is on for every callback, whatever the budget. A loop
+the compiler has turned into a trace never goes back to the interpreter, so it
+never reaches the hook. When a stopped callback is still running after its
+grace, one second or a quarter of its budget, whichever is longer, the daemon
+kills its worker, and the runtime's usual restart replaces it. The daemon logs
+.B "runtime 'NAME': on_message did not stop at its 500ms deadline; its worker is replaced"
+and
+.B ls
+counts the restart. A replaced worker loses what it held: its connections, and
+a cache's keyspace unless it is persistent.
+.PP
+The script's top level runs before the compiler is opened. A top level that
+never returns is therefore always stopped by the hook, and its create refused,
+rather than answered by replacing a worker that is still starting.
+.PP
+A process the daemon does not watch arms a one\-shot timer for each callback
+instead, with the same signal and the same hook: the daemon running its own
+configuration file, and a runtime that an SDK program runs inside its own
+process. That costs two system calls a callback, and there a script with a
+budget runs with the compiler closed, because nothing outside that process could
+end a compiled runaway.
+.PP
 The budget counts time spent running on the loop, not elapsed clock time. This
 matters for the callbacks that can wait, such as
 .BR on_message ,
@@ -20545,9 +20581,9 @@ is clamped to the time left in the callback's budget. A callback that spends its
 budget waiting on a host therefore gets an ordinary
 .B "ok = false"
 result instead of being stopped. A script that needs a long fetch raises its
-callback budget to fit. Nothing can interrupt a request in the middle of a
-socket operation: the mechanism is a VM instruction hook, and a blocking call
-executes no instructions.
+callback budget to fit. A stop that arrives during the request does not cut it
+short: the wait goes on to its clamped end, and the error is raised at the
+callback's next VM instruction.
 .PP
 .B Setting it.
 A script sets its own budget with a top\-level
@@ -20566,34 +20602,44 @@ in the daemon's environment; see
 .BR ENVIRONMENT .
 .PP
 .B What it costs.
-The cost is not the JIT. On this build LuaJIT compiles traces with a count hook
-installed. The cost of the hook is the hooked dispatch path, which checks on
-every VM instruction instead of every ten thousandth. Measured at 64 bytes on one
-connection:
-.IP \(bu 2
-A callback that only answers a message showed no difference above the
-run\-to\-run noise: 42581 and 43130 messages a second with the hook, against
-42571 and 42644 without.
-.IP \(bu 2
-A callback doing about 1300 arithmetic operations per message ran at 85% of its
-unhooked rate.
+A callback with a budget costs its worker three stores into the line on the
+way in and one on the way out, with no clock read and no system call. Measured
+with one build, the default budget against
+.BR 0 ,
+interleaved, seven passes each, in messages a second:
+.IP
+.nf
+                               default           0   default/0, per pass
+client firehose, 64 B       39,921,955  40,370,413   0.981 [0.966 .. 1.014]
+client send, 64 B           26,076,696  25,958,758   1.015 [0.994 .. 1.036]
+server Lua echo, pipelined   3,835,606   3,883,802   0.989 [0.979 .. 1.018]
+server, arithmetic+strings     292,037     289,750   1.008 [0.998 .. 1.023]
+.fi
+.IP
+Every range takes in 1. Against the count hook this replaced, which also kept
+the compiler closed, the default budget serves 1.08 times as much on the
+firehose (37,018,042), 1.04 times on the send (25,206,565), the same on the echo
+(3,857,682), and 1.57 times on the callback that computes (186,155).
 .PP
-.B What 0 buys.
-Setting the bound to
+The daemon's sweep wakes it ten times a second while any worker runs: an idle
+daemon with one idle runtime spent 9.4 milliseconds of CPU in 30 seconds,
+against 2.2 before.
+.PP
+.B What the compiler gives.
+Before the deadline was watched from outside, a callback with a budget ran
+interpreted, and setting the budget to
 .B 0
-installs no hook. It also opens LuaJIT's
-.B jit
-library, which is the only thing that turns the trace compiler on. Without it,
-every Lua callback the daemon runs is interpreted. On the same arithmetic
-callback, the bounded run served 11722 messages a second and the unbounded run
+was the only way to open the compiler. These measurements compare the two
+arms, and every callback now runs in the compiled one. On an arithmetic
+callback the interpreted run served 11722 messages a second and the compiled run
 28085, at 85.2 and 30.3 microseconds of worker CPU per message.
 .PP
 A callback that only answers a message gains very little, because there is
 almost no loop to compile. On the echo fixture the two arms do not differ in
-throughput: 42850 and 43929 messages a second bounded, against 43577 and 44350
-unbounded. That gap is smaller than the spread inside either arm. What does
-differ is Lua's own share of the worker's CPU: 5.2 and 5.1% bounded, against 3.9
-and 4.0% unbounded. That is the compiler doing a little work on two bytecodes.
+throughput: 42850 and 43929 messages a second interpreted, against 43577 and
+44350 compiled. That gap is smaller than the spread inside either arm. What does
+differ is Lua's own share of the worker's CPU: 5.2 and 5.1% interpreted, against
+3.9 and 4.0% compiled. That is the compiler doing a little work on two bytecodes.
 End to end this is about 1%, against 2.4x on a callback that computes.
 .PP
 A streaming producer falls between those two cases. It matters because it is the
@@ -20618,14 +20664,14 @@ instead of a chain of
 concatenations, at 8 concurrent requests and then at 64:
 .IP
 .nf
-                        bounded      unbounded
+                      interpreted     compiled
 \&.. concatenation        97.8/s      130.6/s   (+34%)
 string.format           93.8/s      160.0/s   (+71%)
 \&.. at 64 concurrent      68.0/s      100.8/s   (+48%)
 string.format at 64     71.5/s      142.7/s  (+100%)
 .fi
 .IP
-Both arms put byte\-identical responses on the wire. The unbounded column is the
+Both arms put byte\-identical responses on the wire. The compiled column is the
 one that changes. In the interpreter,
 .B string.format
 gains nothing: it is 4 per cent behind concatenation, inside the spread, because
@@ -20651,7 +20697,7 @@ through. This was measured on a proxy, a second runtime type with a per\(hybyte
 hook. Both handlers forward the bytes unchanged, so only the work differs:
 .IP
 .nf
-                              bounded   unbounded   CPU per request
+                          interpreted    compiled   CPU per request
 one C library call per chunk    120.9      121.9     8223 -> 8155 us
 a Lua loop over every row       417.1     1452.0     2378 ->  669 us
 .fi
@@ -20720,18 +20766,26 @@ Accumulating moves the work out of Lua and into the allocator, where the
 compiler cannot reach it. A script that is slow because of its idiom does not
 become fast because of this setting.
 .PP
-.B What 0 gives up.
-A compiled trace never calls the instruction hook, so with the compiler on, a
-runaway callback cannot be interrupted at all. In a measurement,
-.B "while true do end"
-with a 300 millisecond deadline was stopped after 300.2 milliseconds with the
-compiler off, and never with the compiler on. A hard ceiling inside the hook did
-not help either, because the hook is never reached from inside a trace. That is
-why the bound and the compiler are one setting, not two knobs that can disagree.
+.B What 0 turns off.
+Setting the budget to
+.B 0
+arms nothing and writes nothing: the worker writes no line, the daemon sends no
+signal, and no callback of that script is ever stopped or its worker replaced.
+It no longer changes what is compiled.
+.PP
+.B What a compiled runaway costs.
+A compiled trace never calls the instruction hook. A runaway loop the compiler
+has made a trace of, such as
+.BR "while true do n = n + 1 end" ,
+is ended by replacing its worker at the end of its grace, not stopped in place.
+Measured with a 500 millisecond budget, the replacement was listening 1.71
+seconds after the message that started the loop. A loop that raises and catches
+an error on each turn goes back to the interpreter, and it was stopped in the
+same worker after 0.52 seconds.
 .PP
 A runaway callback affects one runtime, not the whole daemon. In a measurement
-with a server whose callback never returns, that server's worker process sat at
-83% of a core. Meanwhile a second server on the same daemon went on echoing, and
+with a server whose callback never returns and no budget, that server's worker
+process sat at 83% of a core. Meanwhile a second server on the same daemon went on echoing, and
 the daemon went on answering
 .BR ps .
 A runaway in the script's top level is always refused, whatever
@@ -20744,14 +20798,15 @@ A callback stopped at its deadline has still held the loop for that long. A CLI
 command issued during the stall can hit its own five second receive timeout and
 report the daemon unreachable; the command succeeds on retry. A runaway
 .B on_tick
-is stopped on every tick, not once. Time a callback spends in a C function
-before it has run ten thousand VM instructions, such as an
+is stopped on every tick, not once. The budget is dated from the start of the
+loop turn, so the callbacks that ran before this one in the same turn count
+against it too. Time in a C function, such as an
 .B os.execute
 or an
 .B io
-read at its start, is not counted: the budget is dated from the first
-instruction hook, so such a callback can hold the loop for that time and then
-for its whole budget. Name resolution inside
+read, is counted, but the stop is seen only when the callback is back in the
+VM; one that is still inside the C function at the end of its grace has its
+worker replaced. Name resolution inside
 .B socketley.http
 executes no VM instructions, so it is not interrupted. Instead, the call gives up
 on it at the call's deadline.
@@ -24817,11 +24872,11 @@ event\-loop thread.
 Default:
 .BR 10000 .
 .B 0
-switches the bound off entirely, and also turns on LuaJIT's trace compiler.
-The compiler is worth about 2.4x on a callback that computes, and about 1% on
-one that does not. See
-.BR "Callback Deadline" ,
-which prices both halves of that trade.
+switches the bound off entirely: nothing is armed or written for a callback.
+LuaJIT's trace compiler is on either way. The budget is measured from the start
+of the callback's loop turn and checked every 100 milliseconds, and a compiled
+callback that cannot be interrupted is ended by replacing its worker. See
+.BR "Callback Deadline" .
 .IP
 This is the default for every script that does not declare its own
 .B callback_timeout_ms

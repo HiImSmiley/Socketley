@@ -54,12 +54,13 @@ expect "--all lists them, saying whose they are" \
 expect "the table names its columns" "$("$BIN" settings | head -1 | awk '{ print $1, $2, $3, $4 }')" "SETTING VALUE FROM MEANING"
 expect "a word it does not take is refused" "$("$BIN" settings --everything >/dev/null; echo $?)" 1
 
-# The worker reads the file's lua_timeout_ms from the environment the daemon gave it.
+# The worker reads the file's lua_timeout_ms from the environment the daemon gave it, seen in a loop that keeps
+# going back to the interpreter, so it is stopped in place rather than compiled and its worker replaced.
 cat > "$T/spin.lua" <<'EOF'
 function on_message(msg)
     if msg == "spin" then
         local n = 0
-        while true do n = n + 1 end
+        while true do n = n + 1; pcall(error, n) end
     end
 end
 EOF

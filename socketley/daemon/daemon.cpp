@@ -122,8 +122,7 @@ static daemon_config load_daemon_config(const std::string& config_path)
     // default rather than a `callback_timeout_ms` of the config's own, because
     // this file configures the daemon and not a runtime.
     auto result = [&] {
-        lua_deadline::install(lua.lua_state(), lua_deadline::default_ms());
-        lua_deadline::scope guard("the daemon configuration file",
+        lua_deadline::scope guard(lua.lua_state(), "the daemon configuration file",
                                   lua_deadline::default_ms());
         return lua.safe_script_file(path, sol::script_pass_on_error);
     }();
@@ -415,8 +414,7 @@ static void make_setup_runtimes(const std::string& path, daemon_handler& handler
     std::string why;
     std::vector<lua_setup::runtime_entry> entries;
     {
-        lua_deadline::install(lua.lua_state(), lua_deadline::default_ms());
-        lua_deadline::scope guard("the daemon configuration file", lua_deadline::default_ms());
+        lua_deadline::scope guard(lua.lua_state(), "the daemon configuration file", lua_deadline::default_ms());
         if (auto r = lua.safe_script_file(top, sol::script_pass_on_error); !r.valid())
         {
             const sol::error err = r;

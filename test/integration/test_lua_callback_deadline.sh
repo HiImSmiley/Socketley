@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # suite: quiet -- times a 400ms block against a 1500ms budget.
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
-# A callback that never returns is stopped by a wall-clock deadline enforced
-# through a LUA_MASKCOUNT hook, and the four claims are chosen so a build that
-# answered by killing the whole runtime would fail: the daemon answers for
-# another runtime during the stall, the runaway names itself and its bound in
-# the log, the offending runtime still serves afterwards, and a merely slow
-# callback is untouched -- with the daemon run at SOCKETLEY_LUA_TIMEOUT_MS=1500
-# because the operator's knob is itself a claim under test.
+# A callback that never returns is stopped by a wall-clock deadline, through
+# the instruction hook the daemon's stop signal puts on, and the four claims
+# are chosen so a build that answered by killing the whole runtime would fail:
+# the daemon answers for another runtime during the stall, the runaway names
+# itself and its bound in the log, the offending runtime still serves
+# afterwards, and a merely slow callback is untouched -- with the daemon run at
+# SOCKETLEY_LUA_TIMEOUT_MS=1500 because the operator's knob is itself a claim
+# under test.  Every runaway here raises and catches an error on each turn of
+# its loop, which keeps it out of a compiled trace: a loop the compiler made a
+# trace of never sees the hook and ends in a replaced worker instead, which is
+# test_lua_deadline_watched.sh's.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -69,7 +73,7 @@ ${2}
 function on_message(msg)
     if msg == "spin" then
         local n = 0
-        while true do n = n + 1 end
+        while true do n = n + 1; pcall(error, n) end
     end
     self.broadcast("echo:" .. msg)
 end
@@ -366,7 +370,7 @@ for i in $(seq 1 50); do
     sleep 0.1
 done
 
-printf 'function on_proxy_request(id, data)\n  local n = 0\n  while true do n = n + 1 end\nend\n' \
+printf 'function on_proxy_request(id, data)\n  local n = 0\n  while true do n = n + 1; pcall(error, n) end\nend\n' \
     > "$SOCKETLEY_TMPD/pxspin.lua"
 # The fourth case, deliberately: an observer that returns nothing.
 printf 'function on_proxy_request(id, data)\n  socketley.log("PXWATCH saw " .. #data .. " bytes")\nend\n' \

@@ -138,7 +138,7 @@ void lua_request_client::on_request_reply(uint64_t cookie, request_status st, st
         return;
     }
     lua_State* L = m_ctx.state().lua_state();
-    lua_deadline::scope guard(m_callback_what.c_str(), m_ctx.callback_timeout_ms(), m_ctx.owner_name().c_str());
+    lua_deadline::scope guard(L, m_callback_what.c_str(), m_ctx.callback_timeout_ms(), m_ctx.owner_name().c_str());
     lua_rawgeti(L, LUA_REGISTRYINDEX, p.ref);
     luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
     const int n = push_values(L, p.tag, st, reply);

@@ -5,6 +5,8 @@
 #include "../http/http_framing.h"
 #include "lua_json.h"
 #include "../loop/coarse_clock.h"
+#include "../loop/turn_clock.h"
+#include "../ipc/deadline_slot.h"
 #include "lua_suspend.h"
 #include "lua_storage_api.h"
 #include "lua_db_api.h"
@@ -90,6 +92,9 @@ void lua_diag::report_raise(const sol::protected_function_result& r, std::string
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
+#include <ctime>
+#include <sys/syscall.h>
 #ifndef SOCKETLEY_NO_HTTPS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -101,38 +106,66 @@ void lua_diag::report_raise(const sol::protected_function_result& r, std::string
 // here is the state it is enforced through.
 namespace lua_deadline
 {
-// How many VM instructions between hook calls, which is noise beside the
-// interpreter itself -- the real cost of having a hook at all is the hooked
-// dispatch path and the jit library it forbids, not this number.
+// How many VM instructions pass between two looks at the clock once a callback
+// has been told it may be late, which is noise beside the interpreter itself.
 static constexpr int hook_count = 10000;
 
-// ── Which clock a callback budget is measured on ────────────────────────────
-// The coarse one, because this is read on the hot path: every outermost
-// callback invocation arms a deadline, so a server whose script answers each
-// message reads the clock twice per message.  See shared/loop/coarse_clock.h for
-// the numbers and for when it is the wrong clock.
-using socketley::coarse_now;
+// The coarse clock for every comparison here, because the stamps are a turn's
+// start or a coarse read and a deadline of seconds does not care about a tick.
+static uint64_t coarse_ns() noexcept
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000u + static_cast<uint64_t>(ts.tv_nsec);
+}
 
 // ── The armed invocation ────────────────────────────────────────────────────
 // Thread-local and not per-interpreter, because the deadline protects one
-// event loop, which makes nesting across interpreters work out on its own.
-static thread_local unsigned                              t_depth{0};
-static thread_local std::chrono::steady_clock::time_point t_deadline{};
-// Whether t_deadline holds this invocation's deadline yet, set by the first hook, check or remaining_ms() inside it, so
-// a callback that ends before any of them never reads the clock.
-static thread_local bool                                  t_armed{false};
-static thread_local const char*                           t_what{nullptr};
-// Which runtime's script the armed invocation belongs to, set and cleared
-// beside t_what so the pairing cannot be got half right.
-static thread_local const char*                           t_runtime{nullptr};
-static thread_local uint32_t                              t_limit_ms{0};
+// event loop, which makes nesting across interpreters work out on its own --
+// and constant-initialised, so the stop signal's handler reaching any of them
+// runs no TLS initialiser.
+static thread_local constinit const char* t_what{nullptr};
+// Which runtime's script the armed invocation belongs to, set beside t_what
+// so the pairing cannot be got half right.
+static thread_local constinit const char* t_runtime{nullptr};
 // Whether this invocation has already been reported, because the hook raises
 // every time it fires past the deadline and a script that pcalls its own
 // runaway would otherwise fill the log.
-static thread_local bool                                  t_reported{false};
+static thread_local constinit bool        t_reported{false};
 // How many callback invocations are on this thread's stack, counted whether or
-// not the deadline is armed, which t_depth deliberately does not answer.
-static thread_local unsigned                              t_frames{0};
+// not the deadline is armed, which the line's sequence deliberately does not
+// answer.
+static thread_local constinit unsigned    t_frames{0};
+
+// ── What the stop signal's handler reads and writes ─────────────────────────
+// The daemon's line for this thread, null on a thread that watches itself.
+static thread_local constinit deadline_slot::slot* t_line{nullptr};
+// The line a thread that watches itself writes instead, so the armed
+// invocation's sequence, start and limit are kept in one place either way.
+static thread_local constinit deadline_slot::slot  t_own{};
+// The state the armed invocation runs on, which is where a stop puts its hook,
+// left behind when it ends because the handler asks the line first.
+static thread_local constinit lua_State* t_L{nullptr};
+// Where the stop hook is, null while there is none.
+static thread_local constinit lua_State* t_hooked{nullptr};
+// Whether the hook fires at every instruction, as a stop leaves it, rather than every hook_count.
+static thread_local constinit bool       t_hook_fine{false};
+
+// ── A thread the daemon does not watch ──────────────────────────────────────
+// A one-shot timer per invocation, a syscall either side of every callback,
+// which is acceptable only because no worker's loop thread takes this path:
+// the daemon's configuration file, a CLI or SDK process, the unit tests and
+// the fuzzers.
+struct self_watch
+{
+    timer_t id{};
+    int     state{0};   // 0 not tried, 1 made, -1 refused
+    ~self_watch() { if (state == 1) timer_delete(id); }
+};
+static thread_local self_watch t_self;
+
+// Whatever had the stop signal before, told as well, since it may have been sent for it.
+static struct sigaction s_previous{};
 
 uint32_t default_ms()
 {
@@ -160,96 +193,33 @@ uint32_t default_ms()
     return value;
 }
 
-scope::scope(const char* what, uint32_t limit_ms, const char* runtime) noexcept
-    : m_outermost(t_depth == 0 && limit_ms != 0)
-    , m_first_frame(t_frames == 0)
+static deadline_slot::slot& line() noexcept
 {
-    // Unconditional and reset at the boundary rather than decremented, because
-    // stuck above zero here means nothing is ever freed on the spot again.
-    ++t_frames;
-
-    if (m_outermost)
-    {
-        t_armed    = false;
-        t_what     = what;
-        t_runtime  = runtime;
-        t_limit_ms = limit_ms;
-        t_reported = false;
-    }
-    // Counted even when this scope did not arm, so an inner scope can never
-    // disarm the outer one's deadline, while a scope constructed with the
-    // deadline off neither arms nor counts.
-    if (t_depth != 0 || m_outermost)
-        ++t_depth;
+    return t_line ? *t_line : t_own;
 }
 
-scope::~scope() noexcept
+// Whether an armed invocation is running on this thread, which its line's
+// sequence says by being odd, so no depth has to be kept beside it.
+static bool armed() noexcept
 {
-    // The outermost scope resets rather than decrements, because a leaked
-    // depth would leave the deadline armed and already expired for every
-    // innocent callback after it.
-    if (m_outermost)
-    {
-        t_depth    = 0;
-        t_what     = nullptr;
-        t_runtime  = nullptr;
-        t_limit_ms = 0;
-    }
-    else if (t_depth != 0)
-    {
-        --t_depth;
-    }
-
-    // Same rule and reason on the frame count: the outermost frame knows the
-    // stack is about to be empty and says so outright.
-    if (m_first_frame)      t_frames = 0;
-    else if (t_frames != 0) --t_frames;
+    return (line().seq.load(std::memory_order_relaxed) & 1) != 0;
 }
 
-bool in_callback() noexcept
+static bool past_deadline() noexcept
 {
-    return t_frames != 0;
+    const deadline_slot::slot& s = line();
+    const uint64_t start = s.start_ns.load(std::memory_order_relaxed);
+    const uint64_t now   = coarse_ns();
+    return now > start && now - start >= uint64_t{s.limit_ms.load(std::memory_order_relaxed)} * 1000000u;
 }
 
-// The armed invocation's deadline, dated from `now` when nothing has asked for it yet in this invocation.
-static std::chrono::steady_clock::time_point deadline_from(std::chrono::steady_clock::time_point now) noexcept
-{
-    if (!t_armed)
-    {
-        t_deadline = now + std::chrono::milliseconds(t_limit_ms);
-        t_armed    = true;
-    }
-    return t_deadline;
-}
-
-long remaining_ms() noexcept
-{
-    if (t_depth == 0)
-        return -1;
-    // The same clock the deadline was armed on, or the two would disagree by
-    // however far apart they happen to be.
-    const auto now  = coarse_now();
-    auto       left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline_from(now) - now).count();
-    if (left < 0)          return 0;
-    if (left > INT_MAX)    return INT_MAX;
-    return static_cast<long>(left);
-}
-
-// The hook reports before it raises, and this line stays only for the path
-// with nothing else -- a script that pcalls its own slow work -- with no C++
-// object alive at the raise and the deadline deliberately left expired so a
+// The report before the raise, once per invocation, with no C++ object alive at
+// the raise and the deadline deliberately left expired so a
 // `while true do pcall(spin) end` still ends.
-void check(lua_State* L)
+static void raise(lua_State* L)
 {
-    if (t_depth == 0)
-        return;
-    const auto now = coarse_now();
-    if (now < deadline_from(now))
-        return;
-
     const char*    what = t_what ? t_what : "a callback";
-    const unsigned ms   = t_limit_ms;
+    const unsigned ms   = line().limit_ms.load(std::memory_order_relaxed);
 
     if (!t_reported)
     {
@@ -274,35 +244,250 @@ void check(lua_State* L)
 
 static void hook(lua_State* L, lua_Debug*)
 {
-    check(L);
-}
-
-void install(lua_State* L, uint32_t limit_ms)
-{
-    if (limit_ms == 0)
+    if (armed() && past_deadline())
     {
-        // Off means off, down to not paying for it: with no count hook LuaJIT
-        // compiles again.
-        lua_sethook(L, nullptr, 0, 0);
+        // Every instruction from here on, so a script that pcalls its own runaway is stopped again at its next one.
+        if (!t_hook_fine)
+        {
+            t_hook_fine = true;
+            lua_sethook(L, hook, LUA_MASKCOUNT, 1);
+        }
+        raise(L);
         return;
     }
-    lua_sethook(L, hook, LUA_MASKCOUNT, hook_count);
+    // Told early -- by a stop meant for the invocation before, or by a coarse clock a tick behind the daemon's -- so
+    // it keeps looking, at the cost the old standing hook had.
+    if (t_hook_fine)
+    {
+        t_hook_fine = false;
+        lua_sethook(L, hook, LUA_MASKCOUNT, hook_count);
+    }
+}
+
+// lua_sethook is the one Lua call that is safe here, which is how the standalone
+// interpreter stops a script on Ctrl-C, and it is the whole of what a stop does.
+static void on_stop_signal(int sig, siginfo_t* info, void* uc)
+{
+    const int saved = errno;
+    lua_State* const L = t_L;
+    if ((line().seq.load(std::memory_order_relaxed) & 1) != 0 && L)
+    {
+        if (t_line)
+            deadline_slot::name(*t_line, t_what);
+        t_hooked    = L;
+        t_hook_fine = true;
+        lua_sethook(L, hook, LUA_MASKCOUNT, 1);
+    }
+    if (s_previous.sa_flags & SA_SIGINFO)
+    {
+        if (s_previous.sa_sigaction)
+            s_previous.sa_sigaction(sig, info, uc);
+    }
+    else if (s_previous.sa_handler && s_previous.sa_handler != SIG_DFL && s_previous.sa_handler != SIG_IGN)
+    {
+        s_previous.sa_handler(sig);
+    }
+    errno = saved;
+}
+
+// Once per process, with SA_RESTART so the calls a stop interrupts carry on
+// rather than fail.
+static bool install_handler() noexcept
+{
+    static const bool installed = [] {
+        struct sigaction sa{};
+        sa.sa_sigaction = on_stop_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        return ::sigaction(deadline_slot::stop_signal, &sa, &s_previous) == 0;
+    }();
+    return installed;
+}
+
+void watch(deadline_slot::slot* line) noexcept
+{
+    if (!line || !install_handler())
+        return;
+    t_line = line;
+    // A stamp before the first turn, so nothing is dated from zero.
+    socketley::turn_clock::stamp();
+}
+
+bool watched() noexcept
+{
+    return t_line != nullptr;
+}
+
+// Out of line, like the two below, so the frames they need stay off the path every callback takes.
+[[gnu::noinline, gnu::cold]] static void arm_self_watch(uint32_t limit_ms) noexcept
+{
+    if (t_self.state == 0)
+    {
+        t_self.state = -1;
+        struct sigevent sev{};
+        sev.sigev_notify          = SIGEV_THREAD_ID;
+        sev.sigev_signo           = deadline_slot::stop_signal;
+        sev._sigev_un._tid        = static_cast<pid_t>(::syscall(SYS_gettid));
+        if (install_handler() && timer_create(CLOCK_MONOTONIC, &sev, &t_self.id) == 0)
+            t_self.state = 1;
+    }
+    if (t_self.state != 1)
+        return;
+    struct itimerspec its{};
+    its.it_value.tv_sec  = static_cast<time_t>(limit_ms / 1000);
+    its.it_value.tv_nsec = static_cast<long>(limit_ms % 1000) * 1000000L;
+    if (timer_settime(t_self.id, 0, &its, nullptr) < 0) {}
+}
+
+[[gnu::noinline, gnu::cold]] static void disarm_self_watch() noexcept
+{
+    if (t_self.state != 1)
+        return;
+    const struct itimerspec off{};
+    if (timer_settime(t_self.id, 0, &off, nullptr) < 0) {}
+}
+
+// The armed invocation running on `to` for a while, its stop hook going with it,
+// since a hook on one interpreter is not seen by another.
+[[gnu::noinline, gnu::cold]] static void hand_over(lua_State* to) noexcept
+{
+    lua_State* const from = t_hooked;
+    t_L = to;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if (from && from != to && to)
+    {
+        // With the stop held off, because a handler arming the hook while this takes one off would leave the
+        // interpreter's dispatch half switched.
+        sigset_t stop, was;
+        sigemptyset(&stop);
+        sigaddset(&stop, deadline_slot::stop_signal);
+        pthread_sigmask(SIG_BLOCK, &stop, &was);
+        lua_sethook(from, nullptr, 0, 0);
+        t_hooked    = to;
+        t_hook_fine = true;
+        lua_sethook(to, hook, LUA_MASKCOUNT, 1);
+        pthread_sigmask(SIG_SETMASK, &was, nullptr);
+    }
+}
+
+// The self-watching half of opening an invocation, out of line for the reason arm_self_watch() is.
+[[gnu::noinline, gnu::cold]] static void open_self_watch(uint64_t seq_odd, uint32_t limit_ms) noexcept
+{
+    deadline_slot::enter(t_own, seq_odd, coarse_ns(), limit_ms);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    arm_self_watch(limit_ms);
+}
+
+scope::scope(lua_State* L, const char* what, uint32_t limit_ms, const char* runtime) noexcept
+    : m_L(L)
+    , m_outermost(false)
+    , m_first_frame(t_frames == 0)
+{
+    // Unconditional and reset at the boundary rather than decremented, because
+    // stuck above zero here means nothing is ever freed on the spot again.
+    ++t_frames;
+
+    deadline_slot::slot* const own = t_line;
+    const uint64_t             seq = (own ? *own : t_own).seq.load(std::memory_order_relaxed);
+    if ((seq & 1) == 0)
+    {
+        // Nothing armed, so this scope opens the deadline if it has one, and a
+        // scope with the deadline off neither arms nor stops an inner one arming.
+        if (limit_ms == 0)
+            return;
+        m_outermost = true;
+
+        // Compared before they are stored, since a callback is usually the one
+        // that ran last and a load costs less than a store here.
+        if (t_what != what)       t_what = what;
+        if (t_runtime != runtime) t_runtime = runtime;
+        if (t_L != L)             t_L = L;
+        if (t_reported) [[unlikely]]
+            t_reported = false;
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+        // The turn's stamp and not a clock read, so the daemon's watch costs a
+        // callback three stores and nothing else.
+        if (own) [[likely]]
+            deadline_slot::enter(*own, seq + 1, socketley::turn_clock::now_ns(), limit_ms);
+        else
+            open_self_watch(seq + 1, limit_ms);
+    }
+    else if (L && L != t_L)
+    {
+        // Nested inside an armed invocation, which only the outermost scope
+        // ends, so an inner one can never disarm it.
+        m_outer_L = t_L;
+        hand_over(L);
+    }
+}
+
+scope::~scope() noexcept
+{
+    if (m_outermost)
+    {
+        // Out before anything else, so a stop arriving from here on finds
+        // nothing running and changes nothing.
+        deadline_slot::slot* const own = t_line;
+        deadline_slot::slot&       s   = own ? *own : t_own;
+        deadline_slot::leave(s, s.seq.load(std::memory_order_relaxed) + 1);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+        if (!own) [[unlikely]]
+            disarm_self_watch();
+        // The hook comes off with the invocation, so the compiler runs again.
+        if (lua_State* const h = t_hooked) [[unlikely]]
+        {
+            t_hooked    = nullptr;
+            t_hook_fine = false;
+            lua_sethook(h, nullptr, 0, 0);
+        }
+    }
+    else if (m_outer_L)
+    {
+        hand_over(m_outer_L);
+    }
+
+    // Same rule and reason on the frame count: the outermost frame knows the
+    // stack is about to be empty and says so outright.
+    if (m_first_frame)      t_frames = 0;
+    else if (t_frames != 0) --t_frames;
+}
+
+bool in_callback() noexcept
+{
+    return t_frames != 0;
+}
+
+long remaining_ms() noexcept
+{
+    if (!armed())
+        return -1;
+    const deadline_slot::slot& s = line();
+    const uint64_t start = s.start_ns.load(std::memory_order_relaxed);
+    const uint64_t now   = coarse_ns();
+    const uint64_t spent = now > start ? now - start : 0;
+    const uint64_t limit = uint64_t{s.limit_ms.load(std::memory_order_relaxed)} * 1000000u;
+    if (spent >= limit)
+        return 0;
+    const uint64_t left = (limit - spent) / 1000000u;
+    return left > INT_MAX ? INT_MAX : static_cast<long>(left);
+}
+
+void check(lua_State* L)
+{
+    if (armed() && past_deadline())
+        raise(L);
 }
 
 }  // namespace lua_deadline
 
-void lua_context::install_deadline_hook()
+// The trace compiler, wherever a compiled runaway can still be ended: in a
+// worker, whose daemon replaces it, and in a context with no deadline at all --
+// a thread that watches itself has only the hook, which a trace never calls,
+// so there it stays closed for a bounded script; once only, from the point
+// where m_deadline_ms is final, since there is no supported way back.
+void lua_context::open_compiler()
 {
-    lua_deadline::install(m_lua.lua_state(), m_deadline_ms);
-}
-
-// The trace compiler is opened exactly when no hook is installed, because a
-// compiled trace calls no hook back and the two are one decision -- and once
-// only, from the point where m_deadline_ms is final, since there is no
-// supported way back.
-void lua_context::enable_jit_if_unbounded()
-{
-    if (m_deadline_ms != 0)
+    if (m_deadline_ms != 0 && !lua_deadline::watched())
         return;
 
     // luaopen_jit is a module opener and leaves its table on the stack, so the
@@ -315,10 +500,8 @@ void lua_context::enable_jit_if_unbounded()
 
 lua_context::lua_context()
 {
-    // `jit` is left out deliberately, at a measured 5.2-5.5x on compute-shaped
-    // scripts, because with the compiler on a runaway callback can no longer
-    // be interrupted -- and neither sol::lib::jit nor luaJIT_setmode is a
-    // narrower way in.
+    // `jit` is opened by open_compiler() once the top level has run, so a top
+    // level that never returns is interpreted and always stoppable by the hook.
     m_lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
                          sol::lib::math, sol::lib::os, sol::lib::io,
                          sol::lib::package);
@@ -335,8 +518,6 @@ lua_context::lua_context()
     // JSON into something no parser accepts, and it is removed rather than
     // wrapped because nothing here needs to change how a number is spelled.
     m_lua["os"]["setlocale"] = sol::nil;
-
-    install_deadline_hook();
 }
 
 // ─── lua_timer: heap-allocated one-shot / repeating timer via op_timeout ───
@@ -371,7 +552,7 @@ struct lua_timer : io_handler
         // budget of the context that registered it, with the scope bracketing
         // the call and nothing else.
         {
-            lua_deadline::scope guard("a socketley.set_timeout/set_interval callback",
+            lua_deadline::scope guard(fn.lua_state(), "a socketley.set_timeout/set_interval callback",
                                       ctx ? ctx->callback_timeout_ms() : 0u,
                                       ctx ? ctx->owner_name().c_str() : nullptr);
             // The flag brackets the call and nothing else, so sever_timer()
@@ -596,7 +777,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     // against the process default, since the script's own global is set by
     // this very chunk.
     auto result = [&] {
-        lua_deadline::scope guard("the script's top level", lua_deadline::default_ms(),
+        lua_deadline::scope guard(m_lua.lua_state(), "the script's top level", lua_deadline::default_ms(),
                                   m_owner_name.c_str());
         return m_lua.safe_script_file(std::string(path), sol::script_pass_on_error);
     }();
@@ -624,14 +805,13 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                 return false;
             }
             m_deadline_ms = static_cast<uint32_t>(ms);
-            install_deadline_hook();
         }
     }
 
     // m_deadline_ms is final here in both branches, which is what makes this
     // the place to decide about the compiler, and it is outside the block so a
     // script that declares nothing is decided too.
-    enable_jit_if_unbounded();
+    open_compiler();
 
     m_on_start = m_lua["on_start"];
     m_on_stop = m_lua["on_stop"];
@@ -914,7 +1094,7 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
     // until the last subscriber has run.
     ++m_dispatch_depth;
     {
-        lua_deadline::scope guard("a socketley.subscribe callback", m_deadline_ms,
+        lua_deadline::scope guard(m_lua.lua_state(), "a socketley.subscribe callback", m_deadline_ms,
                                   m_owner_name.c_str());
         for (size_t i = 0; i < n; ++i)
         {
