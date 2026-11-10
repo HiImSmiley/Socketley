@@ -3476,6 +3476,29 @@ or
 .B routes
 rule that the script broke.
 .TP
+.B \-\-lua\-ffi
+Lets the script
+.BR require("ffi") ,
+LuaJIT's foreign function interface: calls into C libraries, C types and raw memory, for a script that parses a
+binary protocol or keeps its own buffers.
+Without it,
+.B require("ffi")
+finds nothing.
+The script runs with the daemon's rights either way, since
+.B io
+and
+.B os
+are open, so the flag adds no rights; it changes what a mistake costs.
+A wrong pointer ends the runtime's process rather than raising a Lua error, and a C call that does not return is not
+stopped by the callback deadline's hook, only by the deadline ending the process.
+The script is given the module when it is loaded: at
+.B create
+or
+.BR start ,
+and for a running runtime by
+.BI "socketley restart " name " \-\-lua\-ffi" .
+The flag is kept with the runtime.
+.TP
 .B \-b
 Prints received messages to stdout (bash mode).
 .TP

@@ -513,6 +513,7 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     if (cfg.write_buffer > 0)        rt.set_write_buffer(cfg.write_buffer);
     if (cfg.read_buffer > 0)         rt.set_read_buffer(cfg.read_buffer);
     if (cfg.drain)                   rt.set_drain(true);
+    if (cfg.lua_ffi)                 rt.set_lua_ffi(true);
     if (cfg.tls)                     rt.set_tls(true);
     if (!cfg.cert_path.empty())      rt.set_cert_path(cfg.cert_path);
     if (!cfg.key_path.empty())       rt.set_key_path(cfg.key_path);

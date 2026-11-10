@@ -49,6 +49,7 @@ struct runtime_config
     size_t   write_buffer = 0;
     size_t   read_buffer  = 0;
     bool drain = false;
+    bool lua_ffi = false;
     int reconnect = -1;
     // A client's --connections, held to the one target; 1 is not written.
     int connections = 1;

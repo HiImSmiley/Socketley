@@ -290,6 +290,9 @@ public:
     // Graceful shutdown
     void set_drain(bool enabled);
     bool get_drain() const;
+    // Whether the script may require("ffi"), which --lua-ffi says.
+    void set_lua_ffi(bool on) { m_lua_ffi = on; }
+    bool get_lua_ffi() const { return m_lua_ffi; }
 
     // Reconnect (client only)
     void set_reconnect(int max_attempts);
@@ -1072,6 +1075,7 @@ private:
 
     // Graceful shutdown
     bool m_drain = false;
+    bool m_lua_ffi = false;
 
     // Reconnect
     int m_reconnect = -1; // -1 = disabled, 0 = infinite, >0 = max attempts

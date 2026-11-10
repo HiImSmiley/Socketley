@@ -6166,6 +6166,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
     if (has("write_buffer"))      instance->set_write_buffer(cfg.write_buffer);
     if (has("read_buffer"))       instance->set_read_buffer(cfg.read_buffer);
     if (has("drain"))             instance->set_drain(cfg.drain);
+    if (has("lua_ffi"))           instance->set_lua_ffi(cfg.lua_ffi);
     if (has("reconnect"))         instance->set_reconnect(cfg.reconnect);
     if (has("tls"))               instance->set_tls(cfg.tls);
     if (has("cert_path"))         instance->set_cert_path(cfg.cert_path);

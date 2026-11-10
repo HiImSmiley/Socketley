@@ -764,6 +764,8 @@ bool lua_context::script_compiles(std::string_view path, std::string& err)
     return false;
 }
 
+static void push_hidden_ffi(lua_State* L);
+
 bool lua_context::load_script(std::string_view path, runtime_instance* owner)
 {
     lua_diag::clear();
@@ -786,6 +788,17 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
             new_path += *current_path;
         }
         m_lua["package"]["path"] = new_path;
+    }
+
+    // A runtime made with --lua-ffi hands its script the ffi module, the one its own FFI calls are made with.
+    if (owner && owner->get_lua_ffi())
+    {
+        lua_State* L = m_lua.lua_state();
+        push_hidden_ffi(L);
+        lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, "ffi");
+        lua_pop(L, 2);
     }
 
     // The top-level chunk is bounded too, because it runs synchronously inside

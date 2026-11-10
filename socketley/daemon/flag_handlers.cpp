@@ -613,6 +613,12 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             lua_script = pa.args[++i];
             return 0;
 
+        // A switch beside --lua, because what it changes is what a mistake in the script costs: a wrong pointer ends
+        // the runtime's worker where a Lua error is raised and caught.
+        case fnv1a("--lua-ffi"):
+            instance->set_lua_ffi(true);
+            return 0;
+
         case fnv1a("--drain"):
             // The fifth of them.  get_drain() is read by the server, the proxy
             // and the cache and by no client code, so a client stored it,
@@ -3043,6 +3049,17 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
 {
     switch (pa.hashes[i])
     {
+        // Taken by the script when it is loaded, so a running runtime has it after a restart and is told so.
+        case fnv1a("--lua-ffi"):
+            if (is_running)
+            {
+                std::cout << "--lua-ffi is given to the script when it starts: socketley restart "
+                          << instance->get_name() << " --lua-ffi\n";
+                return 1;
+            }
+            instance->set_lua_ffi(true);
+            return 0;
+
         // Refused rather than ignored, because a running runtime is bound to
         // the socket node it has and moving it would leave the first node for
         // a teardown that never comes.

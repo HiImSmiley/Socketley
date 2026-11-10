@@ -26,6 +26,7 @@ constexpr row rows[] = {
     {"-s", "SCPKTDIBMEURXW", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
     {"-g", "SCPKTDME", "text", "Group", "Puts it in a group; a proxy with --backend @group reaches every member.", "Basics", {}, "web", "--group"},
     {"--lua", "SCPKTMEX", "path", "Lua script", "A script with the runtime's callbacks, run at start.", "Basics", {}, "/etc/socketley/app.lua"},
+    {"--lua-ffi", "SCPKTMEX", "switch", "Lua FFI", "Let the script require(\"ffi\"): LuaJIT's calls into C and raw memory, where a wrong pointer ends the runtime's process.", "Basics"},
     {"--test", "SCPKTDIBMEURXW", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
 
     // ── network ─────────────────────────────────────────────────────────────
@@ -305,6 +306,7 @@ constexpr state_key_row state_keys[] = {
     {"--receive", "receive"},
     {"-g", "group"},
     {"--lua", "lua_script"},
+    {"--lua-ffi", "lua_ffi"},
     {"--bind", "bind"},
     {"--listen", "listen"},
     {"--shards", "shards"},
