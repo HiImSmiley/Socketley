@@ -83,6 +83,10 @@ cat > "$W/hdr.lua" <<'EOF'
 return { headers = { ["X-Bad"] = "a\r\nInjected: yes", ["Content-Length"] = "1", ["X-Ok"] = "fine" }, body = "hdr" }
 EOF
 echo 'echo("route ", req.method, " ", req.path)' > "$W/app.lua"
+cat > "$W/esc.lua" <<'EOF'
+echo(escape([[a&b<c>d"e'f]]), "|", escape(42), "|", escape("plain"))
+echo("|", url_decode("a+b%41%4a%zz%4"), "|", url_decode("plain"))
+EOF
 cat > "$W/_parts/head.lua" <<'EOF'
 local title = ...
 echo("<h1>", escape(title), "</h1>")
@@ -155,6 +159,8 @@ check "an index.html beside an index.lua answers first" "the static index" "$(ge
 check "an address without .lua runs the page it names" "about /about" "$(get /about)"
 check "a file that is not a page is served" "a static file" "$(get /file.txt)"
 check "a page that is not there is a 404" "404" "$(code /none.lua)"
+check "escape() makes entities of all five characters, and url_decode() leaves a % that is not one as it is" \
+    "a&amp;b&lt;c&gt;d&quot;e&#39;f|42|plain|a bAJ%zz%4|plain" "$(get /esc.lua)"
 check "include runs a file under the root in the page's environment, with its arguments and what it returns" \
     "<h1>A &amp; B</h1> n=5 /withhead.lua" "$(get /withhead.lua)"
 check "and a path out of the root is a 500, never a read" "500" "$(code /badinclude.lua)"

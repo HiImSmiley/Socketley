@@ -24,6 +24,7 @@ namespace
 // one's, with the request (its query, form, files and cookies read the first time they are asked for) and the
 // helpers a page answers with, and what it returns or echoed made into the table on_http_request returns.
 static constexpr char k_frame[] = R"lua(
+local html_escape, c_url_decode = ...
 local setfenv, setmetatable, getmetatable, rawget, rawset, select, tostring, tonumber, type, next, pairs, ipairs =
   setfenv, setmetatable, getmetatable, rawget, rawset, select, tostring, tonumber, type, next, pairs, ipairs
 local concat, gsub, char, byte, format, find, sub, lower, match, gmatch =
@@ -32,15 +33,19 @@ local concat, gsub, char, byte, format, find, sub, lower, match, gmatch =
 local json_encode, json_decode, random_hex = socketley.json_encode, socketley.json_decode, socketley.random_hex
 local G = _G
 
+-- In C for the reason escape is: a form's every name and value goes through it.
 local function url_decode(s)
-  s = gsub(s, "+", " ")
-  return (gsub(s, "%%(%x%x)", function(h) return char(tonumber(h, 16)) end))
+  if type(s) ~= "string" then s = tostring(s) end
+  return c_url_decode(s)
 end
 local function url_encode(s)
   return (gsub(tostring(s), "[^%w%-%._~]", function(c) return format("%%%02X", byte(c)) end))
 end
-local escapes = { ["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;", ['"'] = "&quot;", ["'"] = "&#39;" }
-local function escape(s) return (gsub(tostring(s), "[&<>\"']", escapes)) end
+-- In C: gsub with a table is never compiled, and cost 0.28 us a call, half of a 50-item template's page.
+local function escape(s)
+  if type(s) ~= "string" then s = tostring(s) end
+  return html_escape(s)
+end
 
 -- A name ending in [] gathers a list, as a form's repeated field does.
 local function put(t, k, v)
@@ -137,7 +142,20 @@ end }
 
 -- What render() writes a template's values with: escaped for HTML unless raw() marked one.
 local safe_mt = {}
-local function path_of(v, ...)
+-- A name's parts, which the compiled template passes as strings, so the first missing one ends them; past four the
+-- general walk.
+local function path_of(v, a, b, c, d, ...)
+  if type(v) ~= "table" then return nil end
+  v = v[a]
+  if b == nil then return v end
+  if type(v) ~= "table" then return nil end
+  v = v[b]
+  if c == nil then return v end
+  if type(v) ~= "table" then return nil end
+  v = v[c]
+  if d == nil then return v end
+  if type(v) ~= "table" then return nil end
+  v = v[d]
   for i = 1, select("#", ...) do
     if type(v) ~= "table" then return nil end
     v = v[(select(i, ...))]
@@ -263,8 +281,8 @@ return function(factory, req, load, tload)
         if not dflt then return end
         x = dflt
       end
-      x = tostring(x)
-      b[#b + 1] = raw and x or escape(x)
+      -- A number is never anything to escape.
+      if raw or type(x) == "number" then b[#b + 1] = tostring(x) else b[#b + 1] = escape(x) end
     end
     local tenv = setmetatable(values or {}, { __index = env })
     setfenv(f, tenv)
@@ -572,6 +590,74 @@ int load_thunk(lua_State* L, bool as_template)
     return 1;
 }
 
+// s with & < > " ' as HTML entities, the same string when it holds none of them.
+int html_escape(lua_State* L)
+{
+    size_t n = 0;
+    const char* p = luaL_checklstring(L, 1, &n);
+    size_t i = 0;
+    while (i < n && p[i] != '&' && p[i] != '<' && p[i] != '>' && p[i] != '"' && p[i] != '\'')
+        ++i;
+    if (i == n)
+    {
+        lua_settop(L, 1);
+        return 1;
+    }
+    luaL_Buffer b;
+    luaL_buffinit(L, &b);
+    luaL_addlstring(&b, p, i);
+    for (; i < n; ++i)
+        switch (p[i])
+        {
+            case '&': luaL_addlstring(&b, "&amp;", 5); break;
+            case '<': luaL_addlstring(&b, "&lt;", 4); break;
+            case '>': luaL_addlstring(&b, "&gt;", 4); break;
+            case '"': luaL_addlstring(&b, "&quot;", 6); break;
+            case '\'': luaL_addlstring(&b, "&#39;", 5); break;
+            default: luaL_addchar(&b, p[i]); break;
+        }
+    luaL_pushresult(&b);
+    return 1;
+}
+
+// s with + as a space and each %XX as its byte; a % not followed by two hex digits is left as it is.
+int url_decode(lua_State* L)
+{
+    size_t n = 0;
+    const char* p = luaL_checklstring(L, 1, &n);
+    size_t i = 0;
+    while (i < n && p[i] != '%' && p[i] != '+')
+        ++i;
+    if (i == n)
+    {
+        lua_settop(L, 1);
+        return 1;
+    }
+    const auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    luaL_Buffer b;
+    luaL_buffinit(L, &b);
+    luaL_addlstring(&b, p, i);
+    for (; i < n; ++i)
+    {
+        if (p[i] == '+')
+            luaL_addchar(&b, ' ');
+        else if (p[i] == '%' && i + 2 < n && hex(p[i + 1]) >= 0 && hex(p[i + 2]) >= 0)
+        {
+            luaL_addchar(&b, static_cast<char>(hex(p[i + 1]) * 16 + hex(p[i + 2])));
+            i += 2;
+        }
+        else
+            luaL_addchar(&b, p[i]);
+    }
+    luaL_pushresult(&b);
+    return 1;
+}
+
 int include_thunk(lua_State* L)
 {
     return load_thunk(L, false);
@@ -619,7 +705,8 @@ outcome run(lua_context& ctx, cache& c, int root_fd, const std::string& rel, con
     if (!lua_isfunction(L, -1))
     {
         lua_pop(L, 1);
-        if (luaL_loadbuffer(L, k_frame, sizeof(k_frame) - 1, "=socketley page") != 0 || lua_pcall(L, 0, 1, 0) != 0)
+        if (luaL_loadbuffer(L, k_frame, sizeof(k_frame) - 1, "=socketley page") != 0 ||
+            (lua_pushcfunction(L, &html_escape), lua_pushcfunction(L, &url_decode), lua_pcall(L, 2, 1, 0)) != 0)
             return fail("the page frame: ", lua_tostring(L, -1));
         lua_pushvalue(L, -1);
         lua_setfield(L, LUA_REGISTRYINDEX, "socketley.page_frame");
