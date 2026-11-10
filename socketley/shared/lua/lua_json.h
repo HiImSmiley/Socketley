@@ -61,155 +61,219 @@ inline int array_length(const sol::table& t)
     return (count > 0 && highest == count) ? count : 0;
 }
 
+// The number at `idx` as JSON writes it: an integer without a fraction, the shortest text that decodes to the same
+// double otherwise; false for an infinity or a NaN, which JSON cannot spell.
+inline bool json_encode_number(std::string& out, double d, std::string& err)
+{
+    if (!std::isfinite(d))
+    {
+        char spelled[32];
+        snprintf(spelled, sizeof(spelled), "%.14g", d);
+        err = std::string("the number ") + spelled +
+              " has no JSON spelling: a document can hold neither an infinity nor a NaN";
+        return false;
+    }
+    char buf[32];
+    // The range before the cast, for the reason array_length gives.
+    const auto r = d >= -1e15 && d <= 1e15 && d == static_cast<double>(static_cast<int64_t>(d))
+                       ? std::to_chars(buf, buf + sizeof(buf), static_cast<int64_t>(d))
+                       : std::to_chars(buf, buf + sizeof(buf), d);
+    out.append(buf, static_cast<size_t>(r.ptr - buf));
+    return true;
+}
+
+// The value at stack index `idx` of `L` written as JSON onto `out`, read through the stack rather than through sol
+// objects, each of which is a registry reference made and let go: 21 fields cost 5.5 us that way.
+inline bool json_encode_at(lua_State* L, int idx, std::string& out, int depth, std::vector<const void*>& path,
+                           std::string& err)
+{
+    if (idx < 0 && idx > LUA_REGISTRYINDEX)
+        idx = lua_gettop(L) + idx + 1;
+    switch (lua_type(L, idx))
+    {
+        case LUA_TNIL:
+        case LUA_TNONE:
+            out += "null";
+            return true;
+        case LUA_TBOOLEAN:
+            out += lua_toboolean(L, idx) ? "true" : "false";
+            return true;
+        case LUA_TNUMBER:
+            return json_encode_number(out, lua_tonumber(L, idx), err);
+        case LUA_TSTRING:
+        {
+            size_t n = 0;
+            const char* s = lua_tolstring(L, idx, &n);
+            socketley::json::quote_into(out, std::string_view(s, n));
+            return true;
+        }
+        case LUA_TTABLE:
+            break;
+        default:
+            out += "null";
+            return true;
+    }
+
+    // The cycle first: it is the case a script reaches by accident, and naming it beats reporting a depth limit for a
+    // table that is two levels deep and points at itself.
+    const void* const id = lua_topointer(L, idx);
+    for (const void* ancestor : path)
+        if (ancestor == id)
+        {
+            err = "the table contains itself, so there is no end to encode: a JSON document cannot hold a cycle";
+            return false;
+        }
+    if (depth >= json_max_depth)
+    {
+        err = "the table is nested deeper than " + std::to_string(json_max_depth) + " levels";
+        return false;
+    }
+    if (!lua_checkstack(L, 4))
+    {
+        err = "the Lua stack has no room left to walk the table";
+        return false;
+    }
+    path.push_back(id);
+    // A path that grows on the way in and not back out reports a cycle for the next sibling.
+    struct pop_guard
+    {
+        std::vector<const void*>& p;
+        ~pop_guard() { p.pop_back(); }
+    } guard{path};
+
+    // One walk for both questions: whether the keys are exactly 1..n, and what each is called if they are not. A string
+    // key's text stays the table's own; any other key is written as JSON text and found again by itself.
+    struct field
+    {
+        std::string_view text;
+        std::string own;
+        int type{LUA_TSTRING};
+        double num{0};
+        int ref{LUA_NOREF};
+    };
+    std::vector<field> fields;
+    int count = 0;
+    double highest = 0;
+    bool dense = true;
+    bool ok = true;
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0)
+    {
+        const int kt = lua_type(L, -2);
+        field f;
+        f.type = kt;
+        if (kt == LUA_TSTRING)
+        {
+            size_t n = 0;
+            const char* s = lua_tolstring(L, -2, &n);
+            f.text = std::string_view(s, n);
+            dense = false;
+        }
+        else
+        {
+            if (kt == LUA_TNUMBER)
+            {
+                // Formatted here rather than coerced: lua_tolstring on a number key replaces it in the table
+                // mid-walk, which the Lua manual forbids.
+                f.num = lua_tonumber(L, -2);
+                if (f.num < 1 || f.num > 1e15 || f.num != static_cast<double>(static_cast<int64_t>(f.num)))
+                    dense = false;
+                else if (f.num > highest)
+                    highest = f.num;
+            }
+            else
+                dense = false;
+            // Guarded anyway: a table key would hide a cycle.
+            if (!json_encode_at(L, lua_gettop(L) - 1, f.own, depth + 1, path, err))
+            {
+                ok = false;
+                lua_pop(L, 2);
+                break;
+            }
+            if (kt != LUA_TNUMBER)
+            {
+                lua_pushvalue(L, -2);
+                f.ref = luaL_ref(L, LUA_REGISTRYINDEX);
+            }
+        }
+        ++count;
+        fields.push_back(std::move(f));
+        lua_pop(L, 1);
+    }
+    const auto unref = [&] {
+        for (const field& f : fields)
+            if (f.ref != LUA_NOREF)
+                luaL_unref(L, LUA_REGISTRYINDEX, f.ref);
+    };
+    if (!ok)
+    {
+        unref();
+        return false;
+    }
+
+    // Dense means n keys whose largest is n, so {1,2,4} is sparse and encodes as an object, the only thing JSON can
+    // express; by index, since [1,2] and [2,1] are different documents.
+    if (dense && count > 0 && highest == count)
+    {
+        out += '[';
+        for (int i = 1; i <= count && ok; ++i)
+        {
+            if (i > 1)
+                out += ',';
+            lua_rawgeti(L, idx, i);
+            ok = json_encode_at(L, lua_gettop(L), out, depth + 1, path, err);
+            lua_pop(L, 1);
+        }
+        if (ok)
+            out += ']';
+        return ok;
+    }
+
+    // Sorted, so the output is a function of the value: lua_next's order is not stable even between equal tables. A
+    // key that is not a string is read from its own text each time, as a move of the field moves that text.
+    const auto name = [](const field& f) { return f.type == LUA_TSTRING ? f.text : std::string_view(f.own); };
+    std::sort(fields.begin(), fields.end(), [&](const field& a, const field& b) { return name(a) < name(b); });
+    out += '{';
+    bool first = true;
+    for (const field& f : fields)
+    {
+        if (!first)
+            out += ',';
+        first = false;
+        socketley::json::quote_into(out, name(f));
+        out += ':';
+        if (f.type == LUA_TSTRING)
+            lua_pushlstring(L, f.text.data(), f.text.size());
+        else if (f.type == LUA_TNUMBER)
+            lua_pushnumber(L, f.num);
+        else
+            lua_rawgeti(L, LUA_REGISTRYINDEX, f.ref);
+        lua_rawget(L, idx);
+        ok = json_encode_at(L, lua_gettop(L), out, depth + 1, path, err);
+        lua_pop(L, 1);
+        if (!ok)
+            break;
+    }
+    unref();
+    if (ok)
+        out += '}';
+    return ok;
+}
+
 inline bool json_encode_value(std::string& out, const sol::object& val,
                               int depth, std::vector<const void*>& path,
                               std::string& err)
 {
-    switch (val.get_type())
+    lua_State* L = val.lua_state();
+    if (!L || !val.valid())
     {
-        case sol::type::nil:
-        case sol::type::none:
-            out += "null";
-            break;
-        case sol::type::boolean:
-            out += val.as<bool>() ? "true" : "false";
-            break;
-        case sol::type::number:
-        {
-            const double d = val.as<double>();
-
-            // JSON has no spelling for either, and %.14g writes `inf` or `nan`
-            // -- which the decoder twenty lines below refuses, so the two
-            // halves of one pair disagreed about their own grammar and the
-            // script was handed a string it could not have parsed back.
-            if (!std::isfinite(d))
-            {
-                char spelled[32];
-                snprintf(spelled, sizeof(spelled), "%.14g", d);
-                err = std::string("the number ") + spelled +
-                      " has no JSON spelling: a document can hold neither an "
-                      "infinity nor a NaN";
-                return false;
-            }
-
-            // The range before the cast, for the reason array_length gives.
-            if (d >= -1e15 && d <= 1e15 &&
-                d == static_cast<double>(static_cast<int64_t>(d)))
-            {
-                char buf[24];
-                auto r = std::to_chars(buf, buf + sizeof(buf),
-                                       static_cast<int64_t>(d));
-                out.append(buf, static_cast<size_t>(r.ptr - buf));
-            }
-            else
-            {
-                // The shortest text that decodes to the same double, where %.14g dropped the digits past fourteen.
-                char buf[32];
-                const auto r = std::to_chars(buf, buf + sizeof(buf), d);
-                out.append(buf, static_cast<size_t>(r.ptr - buf));
-            }
-            break;
-        }
-        case sol::type::string:
-            socketley::json::quote_into(out, val.as<std::string>());
-            break;
-        case sol::type::table:
-        {
-            sol::table t = val.as<sol::table>();
-
-            // The cycle first: it is the case a script reaches by accident, and
-            // naming it beats reporting a depth limit for a table that is two
-            // levels deep and points at itself.
-            const void* const id = t.pointer();
-            for (const void* ancestor : path)
-            {
-                if (ancestor == id)
-                {
-                    err = "the table contains itself, so there is no end to "
-                          "encode: a JSON document cannot hold a cycle";
-                    return false;
-                }
-            }
-
-            if (depth >= json_max_depth)
-            {
-                err = "the table is nested deeper than " +
-                      std::to_string(json_max_depth) + " levels";
-                return false;
-            }
-
-            path.push_back(id);
-            // A path that grows on the way in and not back out reports a
-            // cycle for the next sibling.
-            struct pop_guard
-            {
-                std::vector<const void*>& p;
-                ~pop_guard() { p.pop_back(); }
-            } guard{ path };
-
-            if (const int n = array_length(t); n > 0)
-            {
-                // By index: [1,2] and [2,1] are different documents.
-                out += '[';
-                for (int i = 1; i <= n; ++i)
-                {
-                    if (i > 1) out += ',';
-                    if (!json_encode_value(out, sol::object(t[i]), depth + 1, path, err))
-                        return false;
-                }
-                out += ']';
-            }
-            else
-            {
-                // Sorted, so the output is a function of the value: lua_next's
-                // order is not stable even between equal tables.
-                struct field { std::string key; sol::object val; };
-                std::vector<field> fields;
-
-                for (const auto& kv : t)
-                {
-                    std::string key_text;
-
-                    // Formatted here rather than coerced: as<std::string>() on
-                    // a number is lua_tolstring, which REPLACES the key in the
-                    // table mid-traversal, which the Lua manual forbids.
-                    if (kv.first.get_type() == sol::type::string)
-                    {
-                        key_text = kv.first.as<std::string>();
-                    }
-                    else
-                    {
-                        // Guarded anyway: a table key would hide a cycle.
-                        if (!json_encode_value(key_text, kv.first, depth + 1, path, err))
-                            return false;
-                    }
-
-                    fields.push_back({ std::move(key_text), kv.second });
-                }
-
-                std::sort(fields.begin(), fields.end(),
-                          [](const field& a, const field& b) { return a.key < b.key; });
-
-                out += '{';
-                bool first = true;
-                for (const auto& f : fields)
-                {
-                    if (!first) out += ',';
-                    first = false;
-                    socketley::json::quote_into(out, f.key);
-                    out += ':';
-                    if (!json_encode_value(out, f.val, depth + 1, path, err))
-                        return false;
-                }
-                out += '}';
-            }
-            break;
-        }
-        default:
-            out += "null";
-            break;
+        out += "null";
+        return true;
     }
-    return true;
+    val.push(L);
+    const bool ok = json_encode_at(L, lua_gettop(L), out, depth, path, err);
+    lua_pop(L, 1);
+    return ok;
 }
 
 // `st` is set only on failure and never cleared, so one deep in a container
