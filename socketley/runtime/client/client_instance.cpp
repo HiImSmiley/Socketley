@@ -81,10 +81,71 @@ size_t client_instance::get_connection_count() const
 
 size_t client_instance::total_queued_bytes() const
 {
-    size_t sum = 0;
+    size_t sum = m_stage_slot >= 0 ? static_cast<size_t>(m_stage.len) : 0;
     for (const auto& conn : m_slots)
         sum += conn->write_queue.bytes();
     return sum;
+}
+
+client_instance::ffi_stage* client_instance::ffi_stage_area()
+{
+    if (!m_stage_buf)
+    {
+        m_stage_buf = std::make_unique_for_overwrite<unsigned char[]>(STAGE_BYTES);
+        m_stage = { m_stage_buf.get(), 0, 0 };
+    }
+    return &m_stage;
+}
+
+// Only behind a write in flight and on a plain stream with no on_send, the cases send_if_queued queues in; a
+// connection that is not one is sent to C by a cap of 0.
+void client_instance::stage_open(const conn_t* conn)
+{
+    if (!m_stage_buf || !m_loop || m_udp || m_tls || conn->ssl || m_mode == client_mode_in || !conn->connected
+        || conn->closing || !conn->write_pending || (lua() && lua()->has_on_send()))
+        return;
+    const size_t queued = conn->write_queue.bytes();
+    if (queued >= write_buffer_bytes())
+        return;
+    m_stage_slot = static_cast<int>(conn->slot);
+    m_stage_gen = conn->generation;
+    m_stage.len = 0;
+    m_stage.cap = static_cast<double>(std::min(STAGE_BYTES, write_buffer_bytes() - queued));
+}
+
+void client_instance::stage_flush()
+{
+    if (m_stage_slot < 0)
+        return;
+    const size_t n = static_cast<size_t>(m_stage.len);
+    m_stage.len = 0;
+    const size_t slot = static_cast<size_t>(m_stage_slot);
+    conn_t* conn = slot < m_slots.size() ? m_slots[slot].get() : nullptr;
+    // A connection that went or was given up under the callback takes nothing, as its queue was cleared.
+    if (!m_loop || !conn || conn->generation != m_stage_gen || !conn->connected || conn->closing)
+    {
+        m_stage_slot = -1;
+        m_stage.cap = 0;
+        return;
+    }
+    if (n)
+    {
+        // The crossing enqueue_line marks, on the size the bytes leave behind.
+        if (conn->write_queue.bytes() + n >= write_watermark_bytes())
+            conn->drain_wanted = true;
+        conn->write_queue.push_coalesced(std::string_view(reinterpret_cast<const char*>(m_stage.p), n),
+                                         WRITE_COALESCE_LIMIT);
+    }
+    const size_t queued = conn->write_queue.bytes();
+    m_stage.cap = queued < write_buffer_bytes()
+        ? static_cast<double>(std::min(STAGE_BYTES, write_buffer_bytes() - queued)) : 0;
+}
+
+void client_instance::stage_close()
+{
+    stage_flush();
+    m_stage_slot = -1;
+    m_stage.cap = 0;
 }
 
 void client_instance::set_connections(uint32_t n)
@@ -119,6 +180,8 @@ void client_instance::open_slot()
 // The callback runs while the slot is still in m_slots, so a send from it still finds its connection.
 void client_instance::close_slot(conn_t* conn)
 {
+    if (static_cast<int>(conn->slot) == m_stage_slot)
+        stage_close();
     if (conn->fd >= 0)
     {
         {
@@ -510,6 +573,8 @@ void client_instance::arm_write(conn_t* conn, const char* data, uint32_t len)
 
 void client_instance::flush_queued_write(conn_t* conn)
 {
+    if (static_cast<int>(conn->slot) == m_stage_slot)
+        stage_flush();
     if (!m_loop || !conn->connected || conn->write_pending)
         return;
 
@@ -542,14 +607,18 @@ void client_instance::flush_queued_write(conn_t* conn)
 long client_instance::pending_bytes() const
 {
     if (m_cur >= 0 && static_cast<size_t>(m_cur) < m_slots.size())
-        return static_cast<long>(m_slots[static_cast<size_t>(m_cur)]->write_queue.bytes());
+        return static_cast<long>(m_slots[static_cast<size_t>(m_cur)]->write_queue.bytes()
+                                 + (m_cur == m_stage_slot ? static_cast<size_t>(m_stage.len) : 0));
     return static_cast<long>(total_queued_bytes());
 }
 
 long client_instance::pending_bytes_of(int id) const
 {
     const conn_t* conn = slot_of_id(id);
-    return conn ? static_cast<long>(conn->write_queue.bytes()) : -1;
+    if (!conn)
+        return -1;
+    return static_cast<long>(conn->write_queue.bytes()
+                             + (static_cast<int>(conn->slot) == m_stage_slot ? static_cast<size_t>(m_stage.len) : 0));
 }
 
 void client_instance::on_loop_turn()
@@ -591,6 +660,8 @@ void client_instance::on_loop_turn()
 // Losing the socket: one teardown, reached from every path that loses it.
 void client_instance::drop_connection(conn_t* conn)
 {
+    if (static_cast<int>(conn->slot) == m_stage_slot)
+        stage_close();
     if (conn->fd >= 0)
     {
         {
@@ -933,6 +1004,10 @@ bool client_instance::setup(event_loop& loop)
 
 void client_instance::teardown(event_loop& loop)
 {
+    // Staged bytes of a callback that stopped this runtime go with the queues cleared below.
+    m_stage_slot = -1;
+    m_stage.len = 0;
+    m_stage.cap = 0;
     bool withdrew = false;
     for (auto& owned : m_slots)
     {
@@ -1600,6 +1675,8 @@ client_instance::send_answer client_instance::script_send(std::string_view msg, 
 // behind a write in flight, where tls_flush returns at once as well.
 bool client_instance::send_if_queued(std::string_view msg, int id)
 {
+    // Behind what the script staged, which was sent before this.
+    stage_flush();
     send_answer why = send_answer::no_such_id;
     conn_t* conn = id != 0 ? slot_of_id(id) : current_or_only(why);
     if (!conn || !m_loop || !conn->connected || m_mode == client_mode_in || conn->closing
@@ -1611,6 +1688,9 @@ bool client_instance::send_if_queued(std::string_view msg, int id)
         enqueue_datagram(conn, msg);
     else
         enqueue_line(conn, msg);
+    // The running callback's connection now has a write in flight, so the sends after this one can be staged.
+    if (m_stage_slot < 0 && static_cast<int>(conn->slot) == m_cur)
+        stage_open(conn);
     return true;
 }
 
@@ -1649,6 +1729,7 @@ void client_instance::enqueue_datagram(conn_t* conn, std::string_view msg)
 // reported none of the three ordinary refusals.
 bool client_instance::write_one(conn_t* conn, std::string_view msg)
 {
+    stage_flush();
     if (!m_loop || !conn->connected || m_mode == client_mode_in)
         return false;
 

@@ -3390,9 +3390,10 @@ static double ffi_server_watermark(void* inst) noexcept
 // An id goes to C only when it is an integer an int holds, which is when sol
 // would read the same number, and anything else takes the sol binding.
 static constexpr char k_ffi_prelude[] = R"lua(
-local ffi, inst, psend, ppending, pwatermark, send, pending = ...
+local ffi, inst, psend, ppending, pwatermark, send, pending, pstage = ...
 if not pcall(ffi.typeof, "socketley_ffi_watermark_t") then
   ffi.cdef[[
+typedef struct { uint8_t* p; double len; double cap; } socketley_client_stage_t;
 typedef int (*socketley_ffi_client_send_t)(void*, const char*, size_t, int);
 typedef double (*socketley_ffi_client_pending_t)(void*, int, int);
 typedef int (*socketley_ffi_server_send_t)(void*, int, const char*, size_t);
@@ -3411,11 +3412,28 @@ local function watermark()
 end
 )lua";
 
-// self.send(msg [, id]) and self.pending([id]), where no id is id 0 to C.
+// self.send(msg [, id]) and self.pending([id]), where no id is id 0 to C, and a short message for the running
+// callback's connection is copied into the stage while it has room for the message and the newline C would add.
+// Short, because the stage is a second copy: it bought 64 B lines 19-36% and cost 4 KiB ones 7%.
 static constexpr char k_ffi_client[] = R"lua(
 local fsend = ffi.cast("socketley_ffi_client_send_t", psend)
 local fpending = ffi.cast("socketley_ffi_client_pending_t", ppending)
+local st = ffi.cast("socketley_client_stage_t*", pstage)
+local copy, byte = ffi.copy, string.byte
 return function(msg, id)
+  if id == nil and type(msg) == "string" then
+    local n, len = #msg, st.len
+    if n < 128 and len + n < st.cap then
+      copy(st.p + len, msg, n)
+      len = len + n
+      if n == 0 or byte(msg, n) ~= 10 then
+        st.p[len] = 10
+        len = len + 1
+      end
+      st.len = len
+      return true
+    end
+  end
   if type(msg) == "string" and (id == nil or plain(id)) and fsend(inst, msg, #msg, id or 0) == 0 then
     return true
   end
@@ -3480,7 +3498,7 @@ static void push_hidden_ffi(lua_State* L)
 // the top level left the binding in place, and leaves the bindings be if
 // anything here fails.
 static void install_ffi_calls(lua_State* L, std::string_view body, runtime_instance* owner, void* inst,
-                              void* psend, void* ppending, void* pwatermark, sol::table& self,
+                              void* psend, void* ppending, void* pwatermark, void* pstage, sol::table& self,
                               const sol::object& send, const sol::object& pending, const sol::object& watermark)
 {
     const int top = lua_gettop(L);
@@ -3504,7 +3522,8 @@ static void install_ffi_calls(lua_State* L, std::string_view body, runtime_insta
     lua_pushlightuserdata(L, pwatermark);
     send.push(L);
     pending.push(L);
-    if (lua_pcall(L, 7, 3, 0) != 0)
+    lua_pushlightuserdata(L, pstage);
+    if (lua_pcall(L, 8, 3, 0) != 0)
         return give_up("set up");
     self.push(L);
     const auto put = [&](const char* key, int wrapper, const sol::object& binding) {
@@ -3524,12 +3543,12 @@ static void install_ffi_calls(lua_State* L, std::string_view body, runtime_insta
 }
 
 void lua_context::defer_ffi_calls(std::string_view body, runtime_instance* owner, void* inst, void* psend,
-                                  void* ppending, void* pwatermark, sol::table& self)
+                                  void* ppending, void* pwatermark, sol::table& self, void* pstage)
 {
-    m_ffi_install = [this, body, owner, inst, psend, ppending, pwatermark, self,
+    m_ffi_install = [this, body, owner, inst, psend, ppending, pwatermark, pstage, self,
                      send = sol::object(self["send"]), pending = sol::object(self["pending"]),
                      watermark = sol::object(self["watermark"])]() mutable {
-        install_ffi_calls(m_lua.lua_state(), body, owner, inst, psend, ppending, pwatermark, self, send,
+        install_ffi_calls(m_lua.lua_state(), body, owner, inst, psend, ppending, pwatermark, pstage, self, send,
                           pending, watermark);
     };
 }
@@ -4385,7 +4404,8 @@ void lua_context::register_client_table(runtime_instance* owner, sol::table& sel
     self["protocol"] = owner->is_udp() ? "udp" : "tcp";
     defer_ffi_calls({k_ffi_client, sizeof(k_ffi_client) - 1}, owner, static_cast<client_instance*>(owner),
                     reinterpret_cast<void*>(&ffi_client_send), reinterpret_cast<void*>(&ffi_client_pending),
-                    reinterpret_cast<void*>(&ffi_client_watermark), self);
+                    reinterpret_cast<void*>(&ffi_client_watermark), self,
+                    static_cast<client_instance*>(owner)->ffi_stage_area());
 }
 
 void lua_context::register_cache_table(runtime_instance* owner, sol::table& self)

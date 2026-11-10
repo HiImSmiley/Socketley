@@ -457,7 +457,7 @@ private:
     // Puts self.send, self.pending and self.watermark through the FFI once
     // open_compiler() has opened the compiler, and never where it stays shut.
     void defer_ffi_calls(std::string_view body, runtime_instance* owner, void* inst, void* psend,
-                         void* ppending, void* pwatermark, sol::table& self);
+                         void* ppending, void* pwatermark, sol::table& self, void* pstage = nullptr);
     // The function call_on_read() runs, which hands the script's on_read a fresh view, or false if it could not
     // be built.
     bool install_read_view();

@@ -157,6 +157,17 @@ public:
     // flight, and false, having done nothing, everywhere else.
     bool send_if_queued(std::string_view msg, int id);
 
+    // Bytes a script's self.send copies through FFI while a callback for one connection runs, which become that
+    // connection's queue when the callback ends or before anything else reads or writes the queue: a C call a line
+    // was a third of a producer's core.  cap is 0 when there is no such connection, which sends the script to C.
+    struct ffi_stage
+    {
+        unsigned char* p;
+        double len;
+        double cap;
+    };
+    ffi_stage* ffi_stage_area();
+
     // The drain crossing is already detected twice in the write paths; this is
     // where the script is told about it, off those stacks.
     void on_loop_turn() override;
@@ -188,9 +199,15 @@ private:
         int saved;
         current_scope(client_instance& ci, const conn_t* conn) : c(ci), saved(ci.m_cur)
         {
+            ci.stage_close();
             ci.m_cur = static_cast<int>(conn->slot);
+            ci.stage_open(conn);
         }
-        ~current_scope() { c.m_cur = saved; }
+        ~current_scope()
+        {
+            c.stage_close();
+            c.m_cur = saved;
+        }
         current_scope(const current_scope&) = delete;
         current_scope& operator=(const current_scope&) = delete;
     };
@@ -398,6 +415,16 @@ private:
     // A sixteenth of a buffer free before it, where a batch reader's leftover line is put rather than the read copied behind it.
     static constexpr uint32_t BUF_HEADROOM_SHARE = 16;
     bool m_use_provided_bufs{false};
+    // The stage of ffi_stage_area(), open for the connection in m_stage_slot at m_stage_gen, or for none at -1.
+    static constexpr size_t STAGE_BYTES = 65536;
+    std::unique_ptr<unsigned char[]> m_stage_buf;
+    ffi_stage m_stage{};
+    int m_stage_slot{-1};
+    uint32_t m_stage_gen{0};
+    void stage_open(const conn_t* conn);
+    // The staged bytes into their connection's queue, the stage left open with what room the queue leaves.
+    void stage_flush();
+    void stage_close();
 
     // The kernel re-arming the recv instead of this client doing it per
     // message; off wherever the ring or SOCKETLEY_RECV_MULTISHOT says so.
