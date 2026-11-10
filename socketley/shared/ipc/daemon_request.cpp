@@ -79,7 +79,11 @@ int daemon_exchange(int fd, std::string_view command, std::string& data, bool& s
 
     // Read response: first byte = exit code, then data until NUL terminator
     char buf[4096];
-    ssize_t n = read(fd, buf, sizeof(buf));
+    ssize_t n;
+    // A socket with a receive deadline is never restarted after a signal, and a shell's SIGCHLD arrives at any time.
+    do
+        n = read(fd, buf, sizeof(buf));
+    while (n < 0 && errno == EINTR);
 
     if (n < 1)
     {

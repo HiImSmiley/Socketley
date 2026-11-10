@@ -4,6 +4,8 @@
 #include "shared/ipc/daemon_request.h"
 #include "shared/persist/paths.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -14,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -65,26 +68,38 @@ int run_program(const std::vector<std::string>& args)
     maybe_make_export_env();
     std::fflush(stdout);
     std::fflush(stderr);
+    // bash's SIGCHLD handler reaps every child it hears of, so it must not hear of this one before waitpid does.
+    sigset_t chld, old;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &chld, &old);
     const pid_t pid = fork();
     if (pid < 0)
     {
         std::fprintf(stderr, "socketley: could not start %s: %s\n", path, std::strerror(errno));
         std::free(path);
+        sigprocmask(SIG_SETMASK, &old, nullptr);
         return 2;
     }
     if (pid == 0)
     {
-        for (int sig : {SIGINT, SIGQUIT, SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU, SIGCHLD, SIGPIPE})
+        // The stop signals stay as the shell has them: an interactive one ignores them, and would wait on a stopped child.
+        for (int sig : {SIGINT, SIGQUIT, SIGTERM, SIGCHLD, SIGPIPE})
             std::signal(sig, SIG_DFL);
+        sigprocmask(SIG_SETMASK, &old, nullptr);
         execve(path, argv.data(), export_env);
         std::fprintf(stderr, "socketley: could not run %s: %s\n", path, std::strerror(errno));
         _exit(127);
     }
     std::free(path);
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0)
-        if (errno != EINTR)
-            return 2;
+    int waited;
+    while ((waited = waitpid(pid, &status, 0)) < 0 && errno == EINTR)
+    {
+    }
+    sigprocmask(SIG_SETMASK, &old, nullptr);
+    if (waited < 0)
+        return 2;
     if (WIFEXITED(status))
         return WEXITSTATUS(status);
     return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 2;
@@ -98,7 +113,7 @@ bool send_command(const std::vector<std::string>& args, std::string& command)
                                                       "--subject", "--text", "--header", "--html", "--attach",
                                                       "--raw", "--template", "--set", "--inline", "--ad", "--no-check",
                                                       "--test", "--test-to", "--rate-limit", "--lua"};
-    if (args.size() < 3 || args[0] != "send"
+    if (args.size() < 3 || args[0] != "send" || args[1] == "--help" || args[1] == "-h"
         || std::any_of(std::begin(mail_flags), std::end(mail_flags), [&](std::string_view f) { return f == args[2]; }))
         return false;
     size_t from = 2;
@@ -118,14 +133,89 @@ bool send_command(const std::vector<std::string>& args, std::string& command)
     return true;
 }
 
+// The descriptor kept for the shell's commands, and what it was: a script may close it or put a file of its own on it
+// with exec, and a subshell inherits it with the connection its parent reads answers from.
+struct kept_conn
+{
+    int fd{-1};
+    pid_t owner{0};
+    dev_t dev{0};
+    ino_t ino{0};
+    std::string path;
+
+    // Whether `fd` is still this process's connection; when it is not, it is forgotten without a close, which would
+    // close the script's file or the parent's connection.
+    bool still_ours()
+    {
+        if (fd < 0)
+            return false;
+        struct stat st{};
+        if (owner != getpid() || ::fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode) || st.st_dev != dev || st.st_ino != ino)
+        {
+            // A subshell's copy is its own descriptor to close; the parent's connection stays open in the parent.
+            if (owner != getpid() && ::fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode) && st.st_dev == dev && st.st_ino == ino)
+                close(fd);
+            fd = -1;
+            return false;
+        }
+        return true;
+    }
+
+    // `c`, moved above the descriptors a script names with exec, which the checks above still guard.
+    void take(int c, const std::string& p)
+    {
+        const int high = ::fcntl(c, F_DUPFD_CLOEXEC, 100);
+        if (high >= 0)
+        {
+            close(c);
+            c = high;
+        }
+        struct stat st{};
+        ::fstat(c, &st);
+        fd = c;
+        owner = getpid();
+        dev = st.st_dev;
+        ino = st.st_ino;
+        path = p;
+    }
+
+    void drop()
+    {
+        if (fd >= 0)
+            close(fd);
+        fd = -1;
+    }
+};
+
+int send_from_shell(const std::vector<std::string>& args);
+
 } // namespace
 
 extern "C" int socketley_builtin(word_list* list)
 {
-    std::vector<std::string> args;
-    for (; list; list = list->next)
-        args.emplace_back(list->word && list->word->word ? list->word->word : "");
+    // An exception through bash's C would end the shell, and a builtin's failure is a status.
+    try
+    {
+        std::vector<std::string> args;
+        for (; list; list = list->next)
+            args.emplace_back(list->word && list->word->word ? list->word->word : "");
+        return send_from_shell(args);
+    }
+    catch (const std::exception& e)
+    {
+        std::fprintf(stderr, "socketley: %s\n", e.what());
+        return 2;
+    }
+    catch (...)
+    {
+        return 2;
+    }
+}
 
+namespace {
+
+int send_from_shell(const std::vector<std::string>& args)
+{
     std::string command;
     if (!send_command(args, command))
         return run_program(args);
@@ -158,35 +248,32 @@ extern "C" int socketley_builtin(word_list* list)
 
     // One connection for the shell's commands, as the daemon reads a connection's commands in turn, made again when the
     // path changes or the daemon closed it: then nothing of the command went out, and it is sent once more.
-    static int fd = -1;
-    static std::string fd_path;
-    if (fd >= 0 && fd_path != path)
-    {
-        close(fd);
-        fd = -1;
-    }
+    static kept_conn conn;
+    if (conn.still_ours() && conn.path != path)
+        conn.drop();
+    // Checked once above, and a failed exchange below drops it, so a descriptor not -1 here is this process's own.
     std::string data;
     int rc = 0;
     for (int attempt = 0; attempt < 2; ++attempt)
     {
-        const bool fresh = fd < 0;
+        const bool fresh = conn.fd < 0;
         if (fresh)
         {
-            fd = socketley::daemon_connect(path);
-            if (fd < 0)
+            const int c = socketley::daemon_connect(path);
+            // The program starts a daemon that is not running and says why one cannot be reached, so it answers then,
+            // with the path found again.
+            if (c < 0)
             {
-                rc = fd;
-                fd = -1;
-                return socketley::daemon_request_failure(path, rc);
+                resolved = false;
+                return run_program(args);
             }
-            fd_path = path;
+            conn.take(c, path);
         }
         bool sent = false;
-        rc = socketley::daemon_exchange(fd, command, data, sent);
+        rc = socketley::daemon_exchange(conn.fd, command, data, sent);
         if (rc >= 0)
             break;
-        close(fd);
-        fd = -1;
+        conn.drop();
         if (sent || fresh)
             return socketley::daemon_request_failure(path, rc);
     }
@@ -200,7 +287,6 @@ extern "C" int socketley_builtin(word_list* list)
     return rc;
 }
 
-namespace {
 const char* const long_doc[] = {
     "Send a line to a socketley runtime from this shell, without starting a program.",
     "",

@@ -39,6 +39,7 @@ cleanup() {
     for n in $NAMES; do "$BIN" stop "$n"   >/dev/null 2>&1 || true; done
     sleep 0.3
     for n in $NAMES; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
+    daemon_sweep "$SOCKETLEY_TMPD/auto.sock"
     daemon_stop
 }
 trap cleanup EXIT
@@ -92,8 +93,34 @@ check "a runtime that does not exist is refused with the program's code" "runtim
     "$(run 'socketley send nosuch x; echo "|$?"' | tr -d '\n')"
 check "an empty message is refused" "empty message|1" "$(run 'socketley send bb_cli ""; echo "|$?"' | tr -d '\n')"
 check "any other command runs the program" "1" "$(run 'socketley ls' | grep -c 'bb_cli')"
-check "a socket the script exports is the one asked" "2" \
-    "$(run "export SOCKETLEY_SOCKET=$SOCKETLEY_TMPD/none.sock; socketley send bb_cli x >/dev/null 2>&1; echo \$?")"
+# No daemon at the socket the script exports: the program answers, which starts one there, as it does without the builtin.
+AUTO="$SOCKETLEY_TMPD/auto.sock"
+check "a socket the script exports is the one asked, and a daemon is started there" "runtime not found: bb_cli|1" \
+    "$(run "export SOCKETLEY_SOCKET=$AUTO; socketley send bb_cli x; echo \"|\$?\"" | tr -d '\n')"
+daemon_sweep "$AUTO"
+
+# A descriptor the script opens with exec is its own, whatever number the kept connection got.
+: > "$GOT"
+check "a file the script puts on a low descriptor is neither closed nor sent" "runtime not found: nosuch|1|world" \
+    "$(run "socketley send bb_cli e1; exec 3>'$SOCKETLEY_TMPD/log3' 4>'$SOCKETLEY_TMPD/log4'; socketley send bb_cli e2
+            echo world >&3; socketley send nosuch x; echo \"|\$?\"; exec 3>&- 4>&-; cat '$SOCKETLEY_TMPD/log3'" | paste -sd'|' | sed 's/||/|/')"
+for _ in $(seq 1 50); do [ "$(grep -c . "$GOT")" -ge 2 ] && break; sleep 0.1; done
+check "and only the sends reached the peer" "e1|e2" "$(paste -sd'|' "$GOT")"
+
+# Subshells inherit the kept connection; each makes its own rather than reading another's answers.
+# Each subshell asks for a runtime of its own name, so an answer read by the wrong one names another runtime.
+START=$SECONDS
+SUB=$(run 'socketley send bb_cli s0
+    for i in 1 2 3 4 5 6 7 8; do (for k in 1 2 3 4 5; do socketley send "nosuch$i" x 2>&1 | sed "s/^/$i /"; done) & done; wait')
+WRONG=$(printf '%s\n' "$SUB" | awk '{ if ($NF != "nosuch" $1) n++ } END { print n + 0 }')
+check "sends from subshells each get their own answer" "40|0" "$(printf '%s\n' "$SUB" | grep -c 'runtime not found')|$WRONG"
+if [ $((SECONDS - START)) -lt 4 ]; then ok; else bad "and none waits out the 5s deadline" "$((SECONDS - START))s"; fi
+
+# A signal while a send waits for its answer is the shell's, not a failure: SIGCHLD comes at any time.
+check "signals during sends do not fail them" "" \
+    "$(run 'trap : USR1; ( while kill -USR1 $$ 2>/dev/null; do :; done ) & K=$!
+            for i in $(seq 1 300); do socketley send bb_cli "i$i" || { echo "send $i failed: $?"; break; }; done
+            kill $K' 2>&1 | grep -v '^$' || true)"
 
 # The kept connection outlives the daemon it was made to, and the next send makes a new one.
 : > "$GOT"
