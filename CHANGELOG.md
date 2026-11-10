@@ -848,6 +848,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`socketley update`** asks GitHub for the newest release and, when it is newer, installs it: the `.deb` for this
+  machine, checked against the SHA-256 GitHub keeps of it, installed with apt, and the systemd service restarted,
+  which brings every running runtime back, listed once the daemon answers. `--check` and `--list` change nothing,
+  `--to` takes a release older or newer, and `--deb` installs a package already here. `GITHUB_TOKEN` reads a
+  private repository's releases; `install.sh` takes it too, and now checks the SHA-256 of what it downloads.
+
 - **A web runtime runs a site's Lua pages and its PHP.** With `--lua-pages` a
   `.lua` file under `--root` answers its own address, as a `.php` file does
   under PHP: `/about` runs about.lua when no file answers it, a directory its

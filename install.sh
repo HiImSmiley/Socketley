@@ -120,8 +120,11 @@ trap 'rm -rf "$TMP"' EXIT
 if [ -z "$DEB" ]; then
   command -v curl >/dev/null 2>&1 || die "curl is needed to download the release; or pass --deb FILE"
   echo "Looking for the newest release..."
-  curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" -o "$TMP/release.json" \
-    || die "the newest release could not be read from GitHub; download a .deb and pass --deb FILE"
+  # A private repository's releases are read with a token, as socketley update reads them.
+  set -- -H "Accept: application/vnd.github+json"
+  [ -n "${GITHUB_TOKEN:-}" ] && set -- "$@" -H "Authorization: Bearer $GITHUB_TOKEN"
+  curl -fsSL "$@" "https://api.github.com/repos/${REPO}/releases/latest" -o "$TMP/release.json" \
+    || die "the newest release could not be read from GitHub (a private repository needs GITHUB_TOKEN); download a .deb and pass --deb FILE"
   . /etc/os-release
   # Only the packages built for this machine's architecture, since dpkg refuses any other.
   ARCH=$(dpkg --print-architecture)
@@ -130,8 +133,22 @@ if [ -z "$DEB" ]; then
   URL=$(printf '%s\n' "$URLS" | grep -F "${ID:-}${VERSION_ID:-}" | head -1 || true)
   [ -n "$URL" ] || URL=$(printf '%s\n' "$URLS" | head -1)
   [ -n "$URL" ] || die "the newest release has no .deb for $ARCH; build from a clone with scripts/install-from-source.sh"
+  # The SHA-256 GitHub keeps of the asset, which comes before its download URL in the asset's object.
+  # A field a line whichever way GitHub laid the JSON out, as no digest or URL holds a comma.
+  SUM=$(tr ',' '\n' < "$TMP/release.json" | awk -v url="$URL" '/"digest":/ { d = $0; sub(/.*"sha256:/, "", d); sub(/".*/, "", d) }
+    /"browser_download_url":/ && index($0, "\"" url "\"") { print d; exit }')
+  # With a token the asset comes through the API, which a private repository's needs; its URL opens the asset's object.
+  API=$(tr ',' '\n' < "$TMP/release.json" | awk -v url="$URL" '/"url": *"https:\/\/api\.github\.com\/repos\/.*\/releases\/assets\// { a = $0; sub(/.*"url": *"/, "", a); sub(/".*/, "", a) }
+    /"browser_download_url":/ && index($0, "\"" url "\"") { print a; exit }')
+  [ -n "$SUM" ] || die "the release says no SHA-256 of $(basename "$URL"); download it and pass --deb FILE"
   echo "Downloading $(basename "$URL")..."
-  curl -fsSL "$URL" -o "$TMP/socketley.deb"
+  if [ -n "${GITHUB_TOKEN:-}" ] && [ -n "$API" ]; then
+    curl -fsSL -H "Accept: application/octet-stream" -H "Authorization: Bearer $GITHUB_TOKEN" "$API" -o "$TMP/socketley.deb"
+  else
+    curl -fsSL "$URL" -o "$TMP/socketley.deb"
+  fi
+  [ "$(sha256sum "$TMP/socketley.deb" | cut -d' ' -f1)" = "$SUM" ] \
+    || die "$(basename "$URL") is not the file the release published: its SHA-256 differs; nothing was installed"
   DEB="$TMP/socketley.deb"
 fi
 [ -r "$DEB" ] || die "$DEB cannot be read"

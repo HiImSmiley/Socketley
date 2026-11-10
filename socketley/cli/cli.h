@@ -58,6 +58,9 @@ int cli_ssh_cert(int argc, char** argv);
 int cli_idp_ssh(int argc, char** argv);
 // `socketley tunnel connect|ssh` here, `tunnel <edge> ...` to the daemon, in cli_tunnel.cpp.
 int cli_tunnel(int argc, char** argv);
+// `socketley update`: the newest release from GitHub, checked and installed, and the daemon restarted, in
+// cli_update.cpp.
+int cli_update(int argc, char** argv);
 int git_sync_main(int argc, char** argv);
 
 // A path a flag names, made absolute against the caller's directory, because the daemon resolves it against its own.

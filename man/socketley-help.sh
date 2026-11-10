@@ -3838,6 +3838,7 @@ OTHER
   attach <type> <name> <port>    register a process the daemon did not start
   dashboard                      terminal dashboard
   ping                           is the daemon answering
+  update [--check|--list|--to v]  the newest release from GitHub, installed
   settings [-a] [--json]         every SOCKETLEY_* setting and where it came from
   acme issue --domains <names>   a certificate from Let's Encrypt
   git-sync --url <url> ...       mirror a git repository into a storage library

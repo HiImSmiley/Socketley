@@ -117,6 +117,12 @@ socketley \- run and supervise network runtimes (servers, proxies, caches, S3 st
 .B version | \-\-version | \-v
 .br
 .B socketley
+.B update
+.RB [ \-\-check | \-\-list | \-\-to
+.IR version " | " \-\-deb
+.IR file ]
+.br
+.B socketley
 .B \-\-lua
 .I lua_file
 .br
@@ -3220,6 +3226,34 @@ executable path.
 Running the CLI from a copy elsewhere on disk reports nothing.
 A copy is not evidence about anybody's build, and comparing inodes across
 different paths would report a replaced file on every command.
+.RE
+.TP
+.B update \fR[\fB\-\-check\fR | \fB\-\-list\fR | \fB\-\-to \fIversion\fR | \fB\-\-deb \fIfile\fR]
+Without an option, asks GitHub for the newest release, and when it is newer
+than the socketley that runs the command installs it: the
+.B .deb
+for this machine's architecture, preferring one named for its distribution, is
+checked against the SHA\-256 GitHub keeps of it and against the version it says
+it is, installed with apt, which brings any dependency it added, and the
+systemd service restarted, which brings back every runtime that was running;
+the daemon's runtimes are listed once it answers. A daemon systemd does not run
+is said to need a restart. Installing takes root
+.RB ( "sudo socketley update" ),
+and a socketley built from a clone is left to the clone to update.
+.RS
+.PP
+.B \-\-check
+says what is installed and what the newest release is, and changes nothing;
+.B \-\-list
+lists the releases, newest first;
+.B \-\-to
+installs that release, older or newer;
+.B \-\-deb
+installs a package already on this machine, for one that cannot reach GitHub.
+.B GITHUB_TOKEN
+is sent to GitHub's API when it is set, which a private repository's releases
+need
+.RB ( "sudo \-E socketley update" ).
 .RE
 .TP
 .BI "\-\-lua " "lua_file"

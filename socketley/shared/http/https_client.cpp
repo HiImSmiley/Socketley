@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "../net/read_buffer.h"
 #include "https_client.h"
 
@@ -290,8 +291,12 @@ bool client::request(std::string_view method, const std::string& url, std::strin
     const int fd = dial(url, path, hostport, ssl, err, timeout_s);
     if (fd < 0)
         return false;
+    // An Accept of the caller's is the only one: GitHub reads the first, and answered an asset's JSON for its bytes.
+    const bool accepts = std::any_of(headers.begin(), headers.end(), [](const auto& h) {
+        return h.first.size() == 6 && strncasecmp(h.first.c_str(), "accept", 6) == 0;
+    });
     std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: " + hostport + "\r\nUser-Agent: " +
-                      m_agent + "\r\nAccept: */*\r\nConnection: close\r\n";
+                      m_agent + (accepts ? "\r\n" : "\r\nAccept: */*\r\n") + "Connection: close\r\n";
     if (!type.empty())
         req += "Content-Type: " + std::string(type) + "\r\n";
     // A header whose name or value would end the line is left out, not let split the request.

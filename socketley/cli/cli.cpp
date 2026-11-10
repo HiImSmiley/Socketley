@@ -384,6 +384,9 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("git-sync"):
             return git_sync_main(argc, argv);
 
+        case fnv1a("update"):
+            return cli_update(argc, argv);
+
         case fnv1a("daemon"):
         {
             // `stop` before the flag scan, because it is a verb and not a
