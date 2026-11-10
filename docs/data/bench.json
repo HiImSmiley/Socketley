@@ -4751,6 +4751,180 @@
    "better": "higher",
    "pin": "the shell loop on one core, the Go sink on four others",
    "note": "As above, to a TLS service: socketley's connection is held and verified once, socat makes a verified handshake per line (nodelay; without it every line waited 40 ms)."
+  },
+  {
+   "id": "web-pages",
+   "runtime": "web",
+   "title": "Dynamic pages: the same page in Lua and in PHP",
+   "vs": [
+    "nginx + php-fpm",
+    "socketley + php-fpm"
+   ],
+   "arms": [
+    "socketley pages",
+    "nginx + php-fpm",
+    "socketley + php-fpm"
+   ],
+   "tool": "wrk 8 threads, 6 s a run",
+   "commit": "c62f595b",
+   "passes": 5,
+   "date": "2026-11-10",
+   "rows": [
+    {
+     "name": "hello: a tiny page from the query, keep-alive, 64 connections",
+     "v": [
+      100750.0,
+      13469.0,
+      30849.0
+     ],
+     "cpu": [
+      1.0,
+      0.999,
+      0.998
+     ],
+     "ccpu": [
+      0.602,
+      0.26,
+      0.285
+     ],
+     "r": [
+      [
+       7.408,
+       6.611,
+       8.004
+      ],
+      [
+       3.248,
+       2.938,
+       3.454
+      ]
+     ]
+    },
+    {
+     "name": "a template of 50 items, 4 KiB, keep-alive, 64 connections",
+     "v": [
+      26967.0,
+      9151.0,
+      20153.0
+     ],
+     "cpu": [
+      1.0,
+      0.969,
+      1.0
+     ],
+     "ccpu": [
+      0.197,
+      0.238,
+      0.207
+     ],
+     "r": [
+      [
+       2.786,
+       2.482,
+       3.215
+      ],
+      [
+       1.316,
+       1.197,
+       1.429
+      ]
+     ]
+    },
+    {
+     "name": "JSON of 20 fields, keep-alive, 64 connections",
+     "v": [
+      62722.0,
+      12400.0,
+      28289.0
+     ],
+     "cpu": [
+      0.999,
+      0.965,
+      0.996
+     ],
+     "ccpu": [
+      0.373,
+      0.241,
+      0.27
+     ],
+     "r": [
+      [
+       4.72,
+       4.1,
+       5.309
+      ],
+      [
+       2.143,
+       1.935,
+       2.359
+      ]
+     ]
+    },
+    {
+     "name": "a form POST of 10 fields, keep-alive, 64 connections",
+     "v": [
+      64005.0,
+      11822.0,
+      27232.0
+     ],
+     "cpu": [
+      1.0,
+      0.962,
+      0.995
+     ],
+     "ccpu": [
+      0.402,
+      0.237,
+      0.26
+     ],
+     "r": [
+      [
+       5.165,
+       4.573,
+       5.854
+      ],
+      [
+       2.313,
+       2.15,
+       2.566
+      ]
+     ]
+    },
+    {
+     "name": "hello, a connection per request, 32 at once",
+     "v": [
+      29473.0,
+      11831.0,
+      14222.0
+     ],
+     "cpu": [
+      0.998,
+      0.98,
+      0.995
+     ],
+     "ccpu": [
+      1.242,
+      0.581,
+      0.667
+     ],
+     "r": [
+      [
+       2.44,
+       2.233,
+       2.717
+      ],
+      [
+       2.035,
+       1.96,
+       2.121
+      ]
+     ]
+    }
+   ],
+   "unit": "req/s",
+   "better": "higher",
+   "pin": "every process of each arm on the same one core (php-fpm's workers too), wrk (8 threads) on 20 others",
+   "note": "socketley create web --lua-pages runs each page as a .lua file in its own LuaJIT; nginx (one worker) hands the same page as a .php file to php-fpm (pm static, 8 workers, OPcache on as PHP ships it, JIT off) over a unix socket; the third arm is the same php-fpm behind socketley create web --backend fastcgi://. Every page answers the same bytes in each language, checked before each row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before."
   }
  ]
 }
