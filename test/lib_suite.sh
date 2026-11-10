@@ -154,6 +154,38 @@ suite_budget_held() {   # -> kB held by runs that are alive
     echo "$held"
 }
 
+# What the machine held before the suite came, less the suites already reserving, is no job's to spend: a laptop's
+# editor and docker at 3.5 GB went uncounted and sixteen sanitizer files let in beside them paged it for two hours.
+if [ -z "${SUITE_MEM_OTHER:-}" ]; then
+    SUITE_MEM_OTHER=$(awk -v h="$(suite_budget_held)" '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } /^Shmem:/ { s = $2 }
+        END { o = t - a - s - h; print (o > 0 ? o : 0) }' /proc/meminfo)
+    export SUITE_MEM_OTHER
+fi
+
+# A memory.high or memory.max on a cgroup the suite runs in throttles it to paging long before the machine is full:
+# an agent slice's 6.6 GiB held two hours of a sanitizer pass to some fifty files.  So the room the tightest one
+# left at the start caps the budget, less what the binaries' own pages need to stay in it.
+suite_cgroup_room() {   # -> kB the tightest limit above this shell leaves, or nothing when none is set
+    local d f lim used room min=""
+    d=/sys/fs/cgroup$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null)
+    while [ "$d" != /sys/fs/cgroup ] && [ -f "$d/memory.stat" ]; do
+        for f in memory.high memory.max; do
+            lim=$(cat "$d/$f" 2>/dev/null) || continue
+            [ "$lim" = max ] && continue
+            used=$(awk '$1 == "anon" || $1 == "shmem" { s += $2 } END { print s + 0 }' "$d/memory.stat")
+            room=$(( (lim - used) / 1024 ))
+            if [ -z "$min" ] || [ "$room" -lt "$min" ]; then min=$room; fi
+        done
+        d=${d%/*}
+    done
+    echo "$min"
+}
+if [ -z "${SUITE_MEM_CAP+set}" ]; then
+    SUITE_MEM_CAP=$(suite_cgroup_room)
+    [ -n "$SUITE_MEM_CAP" ] && SUITE_MEM_CAP=$(( SUITE_MEM_CAP + $(suite_budget_held) - 1572864 ))
+    export SUITE_MEM_CAP
+fi
+
 suite_budget_reserve() {   # kB
     local budget held ticket
     mkdir -p "$SUITE_BUDGET_FILE.d"
@@ -161,7 +193,8 @@ suite_budget_reserve() {   # kB
     exec 8>"$SUITE_BUDGET_FILE.lock"
     while :; do
         # What the files' own /tmp holds, when it is tmpfs, is memory no reservation counts.
-        budget=$(awk '/^MemTotal:/ { t = $2 } /^Shmem:/ { s = $2 } END { print t - s - 3145728 }' /proc/meminfo)
+        budget=$(awk -v o="$SUITE_MEM_OTHER" -v c="$SUITE_MEM_CAP" '/^MemTotal:/ { t = $2 } /^Shmem:/ { s = $2 }
+            END { b = t - s - o - 3145728; if (c != "" && c + 0 < b) b = c + 0; print b }' /proc/meminfo)
         flock 8
         held=$(suite_budget_held)
         if [ "$held" -le 0 ] || [ $((held + $1)) -le "$budget" ]; then
