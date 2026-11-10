@@ -404,7 +404,11 @@ private:
     // read path is not something the throughput figure would show.
     static constexpr uint16_t BUF_GROUP_ID = 4;
     static constexpr uint32_t BUF_COUNT = 8;
-    static constexpr uint32_t BUF_SIZE = 65536;
+    // A buffer and the free bytes before it are 256 KiB, so eight of them are one 2 MB huge page: 64 KiB buffers cost
+    // the firehose 16% at 64 B lines and 17% at 4 KiB, a read and its completion every 64 KiB.
+    static constexpr uint32_t BUF_STRIDE = 262144;
+    static constexpr uint32_t BUF_HEADROOM = BUF_STRIDE / 16;
+    static constexpr uint32_t BUF_SIZE = BUF_STRIDE - BUF_HEADROOM;
     // With --connections every connection may hold a buffer in the same turn,
     // so the pool is one per connection, the server's size at most, in 1 MB
     // until each buffer is down to a page.
@@ -412,7 +416,8 @@ private:
     static constexpr uint32_t MULTI_BUF_MIN = 4096;
     static constexpr uint32_t MULTI_BUF_POOL = 1024 * 1024;
     static constexpr uint32_t MULTI_BUF_MAX = 4096;
-    // A sixteenth of a buffer free before it, where a batch reader's leftover line is put rather than the read copied behind it.
+    // A sixteenth of a --connections buffer free before it, where a batch reader's leftover line is put rather than the
+    // read copied behind it.
     static constexpr uint32_t BUF_HEADROOM_SHARE = 16;
     bool m_use_provided_bufs{false};
     // The stage of ffi_stage_area(), open for the connection in m_stage_slot at m_stage_gen, or for none at -1.

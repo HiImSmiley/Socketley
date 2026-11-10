@@ -968,7 +968,7 @@ bool client_instance::setup(event_loop& loop)
     }
 
     if (m_connections == 1)
-        m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE, BUF_SIZE / BUF_HEADROOM_SHARE);
+        m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE, BUF_HEADROOM);
     else
     {
         // A power of two, as the ring requires, of at least one buffer a connection, smaller as there are more so
