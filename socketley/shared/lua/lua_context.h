@@ -62,6 +62,8 @@ class lua_suspender;
 class lua_storage_client;
 class lua_db_client;
 class lua_mqtt_client;
+class lua_cache_client;
+class lua_password_client;
 class lua_mail_client;
 class lua_http_client;
 
@@ -549,6 +551,8 @@ private:
     std::unique_ptr<lua_db_client> m_db_client;
     std::unique_ptr<lua_mqtt_client> m_mqtt_client;
     std::unique_ptr<lua_mail_client> m_mail_client;
+    std::unique_ptr<lua_cache_client> m_cache_client;
+    std::unique_ptr<lua_password_client> m_password_client;
     // And socketley.http's exchanges on the loop, for a callback that waits on one.
     std::unique_ptr<lua_http_client> m_http_client;
 

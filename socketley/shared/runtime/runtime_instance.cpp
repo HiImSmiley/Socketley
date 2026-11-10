@@ -722,6 +722,19 @@ void runtime_instance::replace_lua(std::unique_ptr<lua_context> next)
     lua_context_replaced();
 }
 
+bool runtime_instance::ensure_lua_context()
+{
+    if (m_lua)
+        return true;
+    m_lua = std::make_unique<lua_context>();
+    if (!m_lua->load_script({}, this))
+    {
+        m_lua.reset();
+        return false;
+    }
+    return true;
+}
+
 bool runtime_instance::reload_lua_script()
 {
     if (m_lua_script_path.empty())

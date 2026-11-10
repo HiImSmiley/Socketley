@@ -3,7 +3,8 @@
 // --root as they lie, the addresses a static site generator writes, and the caching that lets a new build show at once.
 //
 // It speaks plain HTTP on its port and is reached through the entrance proxy, which terminates TLS and HTTP/2 for it as
-// for every other name. It runs no script and takes no WebSocket: a page that talks to its server is a server's --http.
+// for every other name. It takes no WebSocket: a page that talks to its server is a server's --http. With --lua-pages a
+// .lua file under --root answers its own address, and with --backend fastcgi://... a .php file, run by php-fpm.
 #include <memory>
 #include <string>
 #include <string_view>
@@ -32,6 +33,15 @@ public:
     // The page an address nothing answers is given instead, with 200, as a single-page app routes (--fallback).
     void set_fallback(std::string_view p) { m_fallback = std::string(p); }
     std::string_view get_fallback() const { return m_fallback; }
+    // The FastCGI server a .php file under --root is run by (--backend fastcgi://unix:/path or fastcgi://a.b.c.d:port).
+    void set_backend(std::string_view b) { m_backend = std::string(b); }
+    std::string_view get_backend() const { return m_backend; }
+    // --root as that server sees it, when it is another path (a container), as a FastCGI proxy's --fastcgi-root.
+    void set_fastcgi_root(std::string_view d) { m_fastcgi_root = std::string(d); }
+    std::string_view get_fastcgi_root() const { return m_fastcgi_root; }
+    // A .lua file under --root is run as a page rather than served (--lua-pages).
+    void set_lua_pages(bool on) { m_lua_pages = on; }
+    bool get_lua_pages() const { return m_lua_pages; }
 
     std::string config_refusal() const override;
     void on_cqe(struct io_uring_cqe* cqe) override;
@@ -47,6 +57,9 @@ private:
     std::string m_root;
     std::string m_index{"index.html"};
     std::string m_fallback;
+    bool m_lua_pages{false};
+    std::string m_backend;
+    std::string m_fastcgi_root;
 
     std::unique_ptr<socketley::web::web_run> m_run;
     // Runs stopped but still owed completions by the ring.

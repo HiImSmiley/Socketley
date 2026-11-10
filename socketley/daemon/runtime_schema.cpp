@@ -26,7 +26,7 @@ constexpr row rows[] = {
     {"-s", "SCPKTDIBMEURXW", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
     {"-g", "SCPKTDME", "text", "Group", "Puts it in a group; a proxy with --backend @group reaches every member.", "Basics", {}, "web", "--group"},
     {"--lua", "SCPKTMEX", "path", "Lua script", "A script with the runtime's callbacks, run at start.", "Basics", {}, "/etc/socketley/app.lua"},
-    {"--lua-ffi", "SCPKTMEX", "switch", "Lua FFI", "Let the script require(\"ffi\"): LuaJIT's calls into C and raw memory, where a wrong pointer ends the runtime's process.", "Basics"},
+    {"--lua-ffi", "SCPKTMEXW", "switch", "Lua FFI", "Let the script require(\"ffi\"): LuaJIT's calls into C and raw memory, where a wrong pointer ends the runtime's process.", "Basics"},
     {"--test", "SCPKTDIBMEURXW", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
 
     // ── network ─────────────────────────────────────────────────────────────
@@ -200,6 +200,9 @@ constexpr row rows[] = {
     {"--root", "W", "path", "Document root", "The directory whose files are the site. Required.", "Web", {}, "/var/www/html"},
     {"--index", "W", "text", "Index page", "The file a directory's address is answered with, index.html unless given.", "Web", {}, "index.html"},
     {"--fallback", "W", "text", "Fallback page", "The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise.", "Web", {}, "index.html"},
+    {"--backend", "W", "text", "PHP server", "The FastCGI server a .php file under --root is run by: fastcgi://unix:/path or fastcgi://a.b.c.d:port.", "Web", {}, "fastcgi://unix:/run/php/php-fpm.sock"},
+    {"--fastcgi-root", "W", "path", "Server's root", "--root as the FastCGI server sees it, when that is another path (a container).", "Web", {}, "/var/www/html"},
+    {"--lua-pages", "W", "switch", "Lua pages", "Run a .lua file under --root as a page, which answers its own address, rather than serving it.", "Web"},
     {"--scrape", "R", "path", "Scrape", "The targets it scrapes, a line each: name url, then every=, timeout= or labels.", "Metrics", {}, "/etc/socketley/metrics.targets"},
     {"--every", "R", "duration", "Every", "How often a sample is taken; a target's every= takes the place of it.", "Metrics", {}, "10s"},
     {"--keep", "R", "duration", "Keep", "How long the raw samples are kept.", "Metrics", {}, "30d"},
@@ -357,6 +360,7 @@ constexpr state_key_row state_keys[] = {
     {"--fastcgi-root", "fastcgi_root"},
     {"--index", "index"},
     {"--fallback", "fallback"},
+    {"--lua-pages", "lua_pages"},
     {"--compress", "compress"},
     {"--health-threshold", "health_threshold"},
     {"--circuit-threshold", "circuit_threshold"},

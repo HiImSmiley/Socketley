@@ -500,6 +500,8 @@ public:
 
     // Lua hot-reload
     bool reload_lua_script();
+    // A state with the bindings and no script, for a runtime that runs Lua it was not given a --lua for.
+    bool ensure_lua_context();
     std::string_view get_lua_script_path() const;
     // The one place a running runtime's context is replaced, so what waited in the old one is answered.
     void replace_lua(std::unique_ptr<lua_context> next);

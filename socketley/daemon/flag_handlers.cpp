@@ -2154,6 +2154,28 @@ int parse_web_flags(web_instance* wb, const parsed_args& pa, size_t& i, std::str
             }
             wb->set_fallback(pa.args[++i]);
             return 0;
+        // A .lua file under --root is run rather than sent, which a site of files did not ask for, so it is a switch.
+        case fnv1a("--lua-pages"):
+            wb->set_lua_pages(true);
+            return 0;
+        // The application server a .php file is run by, as a FastCGI proxy's backend names it.
+        case fnv1a("--backend"):
+            if (!next.starts_with("fastcgi://"))
+            {
+                std::cout << "--backend on a web runtime requires a FastCGI server: fastcgi://unix:/path or "
+                             "fastcgi://a.b.c.d:port\n";
+                return 1;
+            }
+            wb->set_backend(pa.args[++i]);
+            return 0;
+        case fnv1a("--fastcgi-root"):
+            if (next.empty() || next.front() != '/')
+            {
+                std::cout << "--fastcgi-root requires an absolute directory\n";
+                return 1;
+            }
+            wb->set_fastcgi_root(pa.args[++i]);
+            return 0;
         default:
             return -1;
     }

@@ -79,7 +79,7 @@ constexpr std::string_view reserved_keys[] = {
     "cpus", "external_runtime", "managed", "exec_path", "pid",
     "mode", "send_to", "udp", "master_pw", "http_dir", "http_cache", "no_inject",
     "upstreams", "protocol", "strategy", "backends", "health_check",
-    "health_interval", "health_path", "health_threshold", "circuit_threshold", "root", "fastcgi_root", "index", "fallback", "compress",
+    "health_interval", "health_path", "health_threshold", "circuit_threshold", "root", "fastcgi_root", "index", "fallback", "lua_pages", "compress",
     "circuit_timeout", "backend_timeout", "retry_count", "retry_all",
     "mesh_client_ca", "mesh_client_cert", "mesh_client_key", "auth", "redirect_https", "persistent_path",
     "persistent_interval",

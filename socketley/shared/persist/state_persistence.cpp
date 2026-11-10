@@ -778,6 +778,10 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.web_root = std::string(wb->get_root());
             cfg.web_index = std::string(wb->get_index());
             cfg.web_fallback = std::string(wb->get_fallback());
+            cfg.web_lua_pages = wb->get_lua_pages();
+            if (!wb->get_backend().empty())
+                cfg.backends.push_back(std::string(wb->get_backend()));
+            cfg.fcgi_remote_root = std::string(wb->get_fastcgi_root());
             break;
         }
         case runtime_metrics:
@@ -1331,6 +1335,16 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("index", cfg.web_index);
             if (!cfg.web_fallback.empty())
                 append_str_field("fallback", cfg.web_fallback);
+            if (cfg.web_lua_pages)
+                append_bool_field("lua_pages", true);
+            if (!cfg.backends.empty())
+            {
+                j += "    \"backends\": [\"";
+                socketley::json::escape_into(j, cfg.backends.front());
+                j += "\"],\n";
+            }
+            if (!cfg.fcgi_remote_root.empty())
+                append_str_field("fastcgi_root", cfg.fcgi_remote_root);
             break;
         case runtime_metrics:
             if (!cfg.metrics_keys.empty())
@@ -1736,6 +1750,9 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             if (cfg.web_index.empty())
                 cfg.web_index = "index.html";
             cfg.web_fallback = json_get_string(json, "fallback");
+            cfg.web_lua_pages = json_get_bool(json, "lua_pages");
+            cfg.backends = json_get_array(json, "backends");
+            cfg.fcgi_remote_root = json_get_string(json, "fastcgi_root");
             break;
         case runtime_metrics:
             cfg.metrics_keys = json_get_string(json, "keys");

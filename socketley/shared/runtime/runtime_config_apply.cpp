@@ -273,6 +273,12 @@ void apply_web_config(web_instance& wb, const runtime_config& cfg, bool by_prese
         wb.set_index(cfg.web_index.empty() ? std::string("index.html") : cfg.web_index);
     if (asked("fallback", !cfg.web_fallback.empty()))
         wb.set_fallback(cfg.web_fallback);
+    if (asked("lua_pages", cfg.web_lua_pages))
+        wb.set_lua_pages(cfg.web_lua_pages);
+    if (asked("backends", !cfg.backends.empty()))
+        wb.set_backend(cfg.backends.empty() ? std::string() : cfg.backends.front());
+    if (asked("fastcgi_root", !cfg.fcgi_remote_root.empty()))
+        wb.set_fastcgi_root(cfg.fcgi_remote_root);
 }
 
 void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence)

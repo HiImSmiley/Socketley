@@ -848,6 +848,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A web runtime runs a site's Lua pages and its PHP.** With `--lua-pages` a
+  `.lua` file under `--root` answers its own address, as a `.php` file does
+  under PHP: `/about` runs about.lua when no file answers it, a directory its
+  index.lua, and a `.lua` `--fallback` routes every address with no file. A
+  page reads the request through `req` (query, form, uploads, cookies,
+  headers), answers through `echo`, `header`, `status`, `redirect`,
+  `set_cookie` and `json`, includes files and fills `.tpl` templates (the mail
+  runtime's, now shared), keeps sessions in a cache runtime, and waits on
+  `socketley.db`, `socketley.http` and the rest while the runtime serves on.
+  With `--backend fastcgi://...` a `.php` file is run by php-fpm, the rest of
+  the site served by the runtime itself. On one core a page in Lua answered
+  2.9x to 7.7x the requests of the same page in PHP behind nginx, and the same
+  php-fpm behind socketley 1.35x to 3.45x those behind nginx.
+- **`--lua-ffi`** lets a runtime's script `require("ffi")`, LuaJIT's calls into
+  C and raw memory, which it is given by name only.
+- **`socketley.cache.command`, `socketley.password_hash` and
+  `socketley.password_verify`** in every script: a command to a cache runtime
+  by its name, and scrypt as the idp keeps a password, made on a thread of the
+  runtime's own while a callback that can wait waits. `socketley.sha256`,
+  `socketley.hmac_sha256` and `socketley.random_hex` give tokens and signed
+  cookies their parts.
+
 - **`socketley send` as a bash builtin.** `enable -f
   /usr/lib/socketley/socketley-bash.so socketley` in a script makes `socketley
   send <name> <message>` a request to the daemon from the shell itself, over
@@ -1810,6 +1832,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `self.route()` reach a runtime in another process. Despite the name neither
   hands a descriptor over — the origin keeps the socket and relays.
 ### Fixed
+
+- **The bash builtin keeps to its own connection.** A script that opened a file
+  on a low descriptor with `exec` had it closed and its output sent to the
+  daemon as a command, subshells read each other's answers, a signal while a
+  send waited (bash's SIGCHLD) read as an unreachable daemon, and a daemon
+  that was not running was not started as the program starts one.
+- **A handler that waits keeps its connection after `reload-lua`.** The new
+  script's awaits let go of nothing they held, so a connection a handler had
+  waited for stayed open until the runtime stopped; a handler's second await
+  held nothing at all; a tool call of an mcp runtime that was waiting when the
+  script was reloaded was never answered; and a reload of a script that did
+  not compile emptied the runtime's tools.
+- **`view:lines()`'s state cannot be written past the view.** An index set in
+  the table the walk keeps read before the buffer.
 
 - **JMAP's preview ended in a space** where the message's text ended in
   white space.

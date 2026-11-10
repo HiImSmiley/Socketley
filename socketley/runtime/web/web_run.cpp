@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <linux/magic.h>
 #include <linux/openat2.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/inotify.h>
@@ -22,12 +23,14 @@
 #include "web_site.h"
 #include "../../shared/http/conditional.h"
 #include "../../shared/http/encoding.h"
+#include "../../shared/http/fastcgi.h"
 #include "../../shared/http/http_framing.h"
 #include "../../shared/http/mime.h"
 #include "../../shared/http/request_head.h"
 #include "../../shared/http/site_path.h"
 #include "../../shared/http/status.h"
 #include "../../shared/http/url.h"
+#include "../../shared/lua/lua_pages.h"
 #include "../../shared/net/file_send.h"
 #include "../../shared/persist/file_stamp.h"
 #include "../../shared/util/deflate.h"
@@ -44,6 +47,12 @@ constexpr int64_t idle_secs = 60;
 constexpr size_t max_head = 16 * 1024;
 // The body a refused method brings is read and dropped, up to this; a larger one closes the connection.
 constexpr size_t max_body = 64 * 1024;
+// What a page or a script may be sent, a form with its uploads, as PHP's post_max_size takes by default.
+constexpr size_t page_max_body = 8 * 1024 * 1024;
+// A page's or a script's answer this small is sent as it is; the gzip header and the work would gain nothing.
+constexpr size_t dynamic_compress_min = 1024;
+// How long a script may take to answer, as php-fpm's request_terminate_timeout is often set.
+constexpr uint32_t script_timeout_ms = 60 * 1000;
 constexpr size_t max_conns = 65536;
 // A body this small goes out in the write that carries its head; a larger one is sent from its descriptor.
 constexpr uint64_t inline_max = 32 * 1024;
@@ -223,6 +232,28 @@ bool web_run::start(std::string& why)
         m_fallback.erase(0, 1);
     if (!open_root(why))
         return false;
+#ifndef SOCKETLEY_NO_LUA
+    m_pages = m_owner.get_lua_pages();
+    if (m_pages)
+    {
+        if (!m_owner.ensure_lua_context())
+        {
+            why = "--lua-pages: the Lua state the pages run in could not be made";
+            return false;
+        }
+        m_page_cache = std::make_unique<socketley::lua_pages::cache>();
+        m_page_cache->root = &m_root_fd;
+    }
+#endif
+    if (const std::string_view b = m_owner.get_backend(); !b.empty())
+    {
+        if (!parse_fcgi_target(b, m_fcgi, why))
+            return false;
+        m_php = true;
+        m_fcgi_root = std::string(m_owner.get_fastcgi_root());
+        while (m_fcgi_root.size() > 1 && m_fcgi_root.back() == '/')
+            m_fcgi_root.pop_back();
+    }
     m_loop.register_owner(this);
 
     // Changes are seen as they happen; without inotify each file is looked at again on each use.
@@ -730,9 +761,8 @@ bool web_run::still_current(const entry& e) const
            (!text_type(socketley::http::content_type_of(e.rel)) || copies_of(e.rel) == e.copies);
 }
 
-std::shared_ptr<entry> web_run::lookup(const std::string& path)
+void web_run::check_root()
 {
-    // Without inotify a release swapped in under --root's name is looked for once a second.
     if (!m_watching)
         if (const int64_t now = wall::now_sec_coarse(); now != m_root_checked)
         {
@@ -740,6 +770,11 @@ std::shared_ptr<entry> web_run::lookup(const std::string& path)
             if (root_swapped())
                 forget_all();
         }
+}
+
+std::shared_ptr<entry> web_run::lookup(const std::string& path)
+{
+    check_root();
     std::shared_ptr<entry> e;
     if (const auto it = m_entries.find(path); it != m_entries.end())
     {
@@ -890,8 +925,16 @@ void web_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
         socketley::http::request_view v;
         int refusal = 400;
         request_fields f;
-        const int r = socketley::http::take_request(c->in, max_head, max_body, v, refusal,
-                                                    [&f](std::string_view line, std::string_view value) {
+        // A page or a script reads every field and a body of its own size; a file needs neither.
+        const bool pages = m_pages || m_php;
+        bool expects = false;
+        const int r = socketley::http::take_request(c->in, max_head, pages ? page_max_body : max_body, v, refusal,
+                                                    [&f, &expects, pages](std::string_view line, std::string_view value) {
+            if (pages)
+            {
+                f.all.emplace_back(line.substr(0, line.find(':')), value);
+                expects = expects || (header_name_equals(line, "expect", 6) && value == "100-continue");
+            }
             if (header_name_equals(line, "if-none-match", 13))
                 f.if_none_match.assign(value);
             else if (header_name_equals(line, "if-modified-since", 17))
@@ -908,7 +951,16 @@ void web_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
                 f.accept_encoding.assign(value);
         });
         if (r == 0)
+        {
+            // A client that waits to be told before it sends its body is told once its head is whole.
+            if (expects && !c->continued)
+            {
+                c->continued = true;
+                c->out.append("HTTP/1.1 100 Continue\r\n\r\n");
+            }
             break;
+        }
+        c->continued = false;
         if (r < 0)
         {
             ++m_c.refused;
@@ -923,8 +975,10 @@ void web_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
         c->http10 = std::string_view(c->in).substr(0, c->in.find("\r\n")).ends_with(" HTTP/1.0");
         c->keep_alive = !v.close;
         c->head = v.method == "HEAD";
+        c->gzip_ok = pages && socketley::http::accepts_coding(f.accept_encoding, "gzip");
         ++m_c.requests;
         runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
+        f.body = std::string_view(c->in).substr(v.head_len, v.body_len);
         const bool more = answer_request(c, v.method, v.path, v.query, f);
         c->in.erase(0, used);
         if (!more || !c->keep_alive)
@@ -957,6 +1011,39 @@ void web_run::answer_plain(const std::shared_ptr<web_conn>& c, int status, std::
 bool web_run::answer_request(const std::shared_ptr<web_conn>& c, std::string_view method, std::string_view raw,
                              std::string_view query, const request_fields& f)
 {
+    // The absolute form a proxy may send names the same path.
+    if (raw.starts_with("http://") || raw.starts_with("https://"))
+    {
+        const size_t slash = raw.find('/', raw.find("://") + 3);
+        raw = slash == std::string_view::npos ? std::string_view("/") : raw.substr(slash);
+    }
+    std::string path;
+    const bool named = socketley::http::site_path(raw, path);
+    std::shared_ptr<entry> e;
+    if (m_pages && named)
+    {
+        // A page takes every method, and with the flag on a .lua file is never sent as it lies, nor a template.
+        if (path.ends_with(".lua"))
+            return answer_page(c, method, path, path, query, f);
+        if (path.ends_with(".tpl"))
+            return answer_page(c, method, path, std::string(), query, f);
+        if (path.back() == '/' && m_index.ends_with(".lua"))
+            return answer_page(c, method, path, path + m_index, query, f);
+        // A file answers first; an address none does is the page it names without its .lua, then a .lua fallback.
+        e = lookup(path);
+        if (e->shared)
+        {
+            const bool has_ext = path.find('.', path.rfind('/')) != std::string::npos;
+            if (path.back() == '/' ? run_page(c, method, path, path + "index.lua", query, f)
+                                   : !has_ext && run_page(c, method, path, path + ".lua", query, f))
+                return true;
+            if (!has_ext && m_fallback.ends_with(".lua") && run_page(c, method, path, "/" + m_fallback, query, f))
+                return true;
+        }
+    }
+    if (m_php && named)
+        if (const int r = answer_php(c, method, raw, path, query, f, e); r >= 0)
+            return r != 0;
     if (method != "GET" && method != "HEAD")
     {
         if (method == "OPTIONS")
@@ -969,20 +1056,14 @@ bool web_run::answer_request(const std::shared_ptr<web_conn>& c, std::string_vie
                      "Allow: GET, HEAD, OPTIONS\r\n");
         return true;
     }
-    // The absolute form a proxy may send names the same path.
-    if (raw.starts_with("http://") || raw.starts_with("https://"))
-    {
-        const size_t slash = raw.find('/', raw.find("://") + 3);
-        raw = slash == std::string_view::npos ? std::string_view("/") : raw.substr(slash);
-    }
-    std::string path;
-    if (!socketley::http::site_path(raw, path))
+    if (!named)
     {
         ++m_c.not_found;
         answer_plain(c, 404, "Not Found\n");
         return true;
     }
-    const std::shared_ptr<entry> e = lookup(path);
+    if (!e)
+        e = lookup(path);
     switch (e->what)
     {
         case entry::kind::redirect:
@@ -1010,6 +1091,269 @@ bool web_run::answer_request(const std::shared_ptr<web_conn>& c, std::string_vie
     if (e->status == 404)
         ++m_c.not_found;
     return answer_file(c, *e, f);
+}
+
+void web_run::write_dynamic(const std::shared_ptr<web_conn>& c, int status_asked,
+                            const std::vector<std::pair<std::string, std::string>>& fields, std::string_view body)
+{
+    const auto named = [](std::string_view k, std::string_view n) {
+        return k.size() == n.size() && std::equal(k.begin(), k.end(), n.begin(), [](char a, char b) {
+            return (a >= 'A' && a <= 'Z' ? a + 32 : a) == b;
+        });
+    };
+    // A final answer: an interim code would leave the client waiting for another.
+    const int status = status_asked >= 200 && status_asked <= 999 ? status_asked : 500;
+    const bool bodyless = status == 204 || status == 304;
+    std::string& o = c->out;
+    o.append("HTTP/1.1 ").append(std::to_string(status)).append(" ").append(socketley::http::status_text(status));
+    o.append("\r\n").append(date_field());
+    bool nosniff = false, coded = false;
+    std::string_view type;
+    for (const auto& [k, v] : fields)
+    {
+        // A header made of what the request said must not end its line, and the framing is this end's to write.
+        if (!http_field_name_ok(k) || !http_field_value_ok(v) || named(k, "content-length") || named(k, "connection") ||
+            named(k, "transfer-encoding") || named(k, "date") || named(k, "keep-alive"))
+            continue;
+        nosniff = nosniff || named(k, "x-content-type-options");
+        coded = coded || named(k, "content-encoding");
+        if (named(k, "content-type"))
+            type = v;
+        o.append(k).append(": ").append(v).append("\r\n");
+    }
+    // Text a script made goes gzipped to a client that takes it, as a file without a copy does; the effort is the
+    // fast one, since it is paid on every answer.
+    std::string gz;
+    if (!bodyless && !coded && body.size() >= dynamic_compress_min && !type.empty() && text_type(type))
+    {
+        o.append("Vary: Accept-Encoding\r\n");
+        if (c->gzip_ok)
+        {
+            gz = socketley::gzip_of(body, socketley::deflater::effort::fast);
+            if (gz.size() < body.size())
+            {
+                o.append("Content-Encoding: gzip\r\n");
+                body = gz;
+            }
+        }
+    }
+    if (!bodyless)
+        o.append("Content-Length: ").append(std::to_string(body.size())).append("\r\n");
+    if (!nosniff)
+        o.append("X-Content-Type-Options: nosniff\r\n");
+    o.append(connection_field(*c)).append("\r\n");
+    if (!c->head && !bodyless)
+        o.append(body);
+}
+
+bool web_run::run_page(const std::shared_ptr<web_conn>& c, std::string_view method, const std::string& path,
+                       const std::string& page, std::string_view query, const request_fields& f)
+{
+#ifndef SOCKETLEY_NO_LUA
+    namespace lp = socketley::lua_pages;
+    check_root();
+    std::string rel;
+    lua_context* lua = m_owner.lua();
+    if (!lua || !lp::page_name(page, rel))
+        return false;
+    lp::request req;
+    req.method = method;
+    req.path = path;
+    req.query = query;
+    req.body = f.body;
+    req.version = c->http10 ? "HTTP/1.0" : "HTTP/1.1";
+    req.headers = f.all;
+    // A page that waits answers on a later turn, and nothing more is read off the connection meanwhile.
+    auto in_line = std::make_shared<bool>(true);
+    std::weak_ptr<web_conn> weak = c;
+    std::weak_ptr<bool> alive = m_alive;
+    c->waiting = true;
+    const lp::outcome o = lp::run(*lua, *m_page_cache, m_root_fd, rel, req, m_owner.get_name(),
+                                  [this, weak, alive, in_line](lp::reply r) {
+        const auto cc = weak.lock();
+        if (alive.expired() || !cc || cc->dead || m_stopped)
+            return;
+        cc->waiting = false;
+        write_dynamic(cc, r.status, r.headers, r.body);
+        if (!*in_line)
+            m_http.resume(cc);
+    });
+    *in_line = false;
+    if (o == lp::outcome::not_a_page)
+    {
+        c->waiting = false;
+        return false;
+    }
+    ++m_c.pages;
+    return true;
+#else
+    (void)c, (void)method, (void)path, (void)page, (void)query, (void)f;
+    return false;
+#endif
+}
+
+bool web_run::answer_page(const std::shared_ptr<web_conn>& c, std::string_view method, const std::string& path,
+                          const std::string& page, std::string_view query, const request_fields& f)
+{
+    if (run_page(c, method, path, page, query, f))
+        return true;
+    // No page is there, or the name is one a request may not run: the site's 404, as for a file that is not there.
+    const std::shared_ptr<entry> e = missing(true);
+    ++m_c.not_found;
+    if (e->what != entry::kind::file)
+    {
+        answer_plain(c, 404, "Not Found\n");
+        return true;
+    }
+    return answer_file(c, *e, f);
+}
+
+bool web_run::regular_file(const std::string& rel)
+{
+    bool is_dir = false;
+    struct stat st{};
+    const int fd = open_beneath(rel, is_dir, st);
+    if (fd < 0)
+        return false;
+    ::close(fd);
+    return !is_dir;
+}
+
+int web_run::answer_php(const std::shared_ptr<web_conn>& c, std::string_view method, std::string_view raw,
+                        const std::string& path, std::string_view query, const request_fields& f,
+                        std::shared_ptr<entry>& e)
+{
+    // A hidden segment is never the interpreter's, as it is never a file's.
+    if (socketley::http::hidden_path(path))
+        return -1;
+    const std::string rel = path.substr(1);
+    // The first segment ending in .php, when it is a script; anything after it is PATH_INFO.
+    for (size_t at = 0;;)
+    {
+        const size_t slash = rel.find('/', at);
+        const std::string upto = rel.substr(0, slash);
+        if (upto.ends_with(".php"))
+        {
+            if (regular_file(upto))
+                return run_script(c, method, raw, path, query, "/" + upto,
+                                  slash == std::string::npos ? std::string() : rel.substr(slash), f);
+            // No script is at it, so it is an address like any other: /upload.jpg/x.php is never the upload.
+            break;
+        }
+        if (slash == std::string::npos)
+            break;
+        at = slash + 1;
+    }
+    // A script's source by another name, an editor's copy or a dump is kept from the public.
+    if (socketley::http::private_file_name(rel))
+    {
+        ++m_c.not_found;
+        answer_plain(c, 404, "Not Found\n");
+        return 1;
+    }
+    if (!e)
+        e = lookup(path);
+    // A file answers first.
+    if (!e->shared)
+        return -1;
+    if (path.back() == '/' && regular_file(rel + "index.php"))
+        return run_script(c, method, raw, path, query, "/" + rel + "index.php", {}, f);
+    // Nothing at the address: index.php answers it, as a front controller does every route it was not given.
+    if (regular_file("index.php"))
+        return run_script(c, method, raw, path, query, "/index.php", {}, f);
+    return -1;
+}
+
+bool web_run::run_script(const std::shared_ptr<web_conn>& c, std::string_view method, std::string_view raw,
+                         const std::string& path, std::string_view query, std::string script, std::string path_info,
+                         const request_fields& f)
+{
+    namespace fcgi = socketley::fastcgi;
+    const auto is = [](std::string_view a, std::string_view b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+            return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
+        });
+    };
+    fcgi::request_info r;
+    r.method = method;
+    std::string target(raw);
+    if (!query.empty())
+        target.append("?").append(query);
+    r.target = target;
+    r.path = path;
+    r.query = query;
+    r.protocol = c->http10 ? "HTTP/1.0" : "HTTP/1.1";
+    const std::string& root = m_fcgi_root.empty() ? m_root : m_fcgi_root;
+    r.script_filename = root + script;
+    r.script_name = std::move(script);
+    r.path_info = std::move(path_info);
+    r.document_root = root;
+    std::string_view host, proto;
+    for (const auto& [n, v] : f.all)
+    {
+        if (is(n, "host"))
+            host = v;
+        else if (is(n, "x-forwarded-proto"))
+            proto = v;
+        if (is(n, "keep-alive") || is(n, "te") || is(n, "transfer-encoding") || is(n, "upgrade") || is(n, "expect") ||
+            is(n, "proxy-connection"))
+            continue;
+        r.headers.emplace_back(n, v);
+    }
+    if (const size_t colon = host.rfind(':'); colon != std::string_view::npos && host.find(']') == std::string_view::npos)
+        host = host.substr(0, colon);
+    r.server_name = host;
+    const std::string port = std::to_string(m_owner.effective_port());
+    r.server_port = port;
+    char addr[INET6_ADDRSTRLEN] = "";
+    uint16_t peer_port = 0;
+    bool loopback = false;
+    if (c->peer.ss_family == AF_INET)
+    {
+        const auto* in = reinterpret_cast<const sockaddr_in*>(&c->peer);
+        ::inet_ntop(AF_INET, &in->sin_addr, addr, sizeof addr);
+        peer_port = ntohs(in->sin_port);
+        loopback = (ntohl(in->sin_addr.s_addr) >> 24) == 127;
+    }
+    else if (c->peer.ss_family == AF_INET6)
+    {
+        const auto* in6 = reinterpret_cast<const sockaddr_in6*>(&c->peer);
+        ::inet_ntop(AF_INET6, &in6->sin6_addr, addr, sizeof addr);
+        peer_port = ntohs(in6->sin6_port);
+        loopback = IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr);
+    }
+    r.remote_addr = addr;
+    const std::string remote_port = std::to_string(peer_port);
+    r.remote_port = remote_port;
+    // TLS the entrance in front of this runtime ended, which it says over the loopback.
+    r.https = loopback && is(proto, "https");
+    r.content_length = f.body.size();
+    r.has_body = !f.body.empty();
+
+    std::string req;
+    fcgi::append_begin(req, false);
+    fcgi::append_params(req, fcgi::cgi_params(r));
+    fcgi::append_stdin(req, f.body);
+    fcgi::append_stdin(req, {});
+
+    ++m_c.scripts;
+    std::weak_ptr<web_conn> weak = c;
+    c->waiting = true;
+    const bool started = fcgi_exchange(m_io, m_fcgi, std::move(req), script_timeout_ms, m_alive,
+                                       [this, weak](fcgi_answer a) {
+        const auto cc = weak.lock();
+        if (!cc || cc->dead || m_stopped)
+            return;
+        cc->waiting = false;
+        write_dynamic(cc, a.status, a.fields, a.body);
+        m_http.resume(cc);
+    });
+    if (!started)
+    {
+        c->waiting = false;
+        answer_plain(c, 502, "Bad Gateway\n");
+    }
+    return true;
 }
 
 bool web_run::answer_file(const std::shared_ptr<web_conn>& c, const entry& e, const request_fields& f)
@@ -1265,6 +1609,8 @@ std::string web_run::stats() const
     line(o, "compress_jobs", m_c.compress_jobs);
     line(o, "reloads", m_c.reloads);
     line(o, "stalled", m_c.stalled);
+    line(o, "pages", m_c.pages);
+    line(o, "scripts", m_c.scripts);
     line(o, "addresses", m_entries.size());
     line(o, "kept_bytes", m_kept->bytes.load(std::memory_order_relaxed));
     line(o, "kept_files", m_kept->fds.load(std::memory_order_relaxed));

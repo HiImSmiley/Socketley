@@ -23,6 +23,7 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/ipc/route_relay.h"
 #include "../../shared/lua/lua_context.h"
+#include "../../shared/lua/lua_pages.h"
 #include "../../shared/http/ws_protocol.h"
 #include "../../shared/util/invariants.h"
 #include "../../shared/util/logging.h"
@@ -1882,19 +1883,6 @@ static std::string build_http_response_full(int status, std::string_view reason,
     return resp;
 }
 
-// A field a script actually set, as against one it never mentioned, since only
-// the first can be of the wrong type.
-static bool lua_field_present(const sol::object& v)
-{
-    return v.valid() && v != sol::nil;
-}
-
-// What the script returned, in Lua's own words, so a diagnostic names the type
-// it got rather than only the type it wanted.
-static const char* lua_value_type_name(lua_context& lc, const sol::object& v)
-{
-    return lua_typename(lc.state().lua_state(), static_cast<int>(v.get_type()));
-}
 
 #endif
 
@@ -2160,95 +2148,13 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         // ask about.
         if (r.return_count() > 0)
         {
-            sol::object result = r;
-            if (result.is<sol::table>())
+            // A table is the response, and a value that is not one falls through to the static file or the 404.
+            socketley::lua_pages::reply out;
+            if (socketley::lua_pages::reply_from_lua(*lua(), get_name(), "on_http_request", sol::object(r), out))
             {
-                sol::table resp_tbl = result.as<sol::table>();
-
-                // Absent and unreadable are different answers: a field the
-                // script never set takes the documented default, one of the
-                // wrong type is a response this end cannot build -- and
-                // get_or() cannot tell them apart, so it substituted the
-                // default for both and said nothing.
-                sol::object status_obj = resp_tbl["status"];
-                sol::object body_obj   = resp_tbl["body"];
-
-                if (SOCKETLEY_UNLIKELY(lua_field_present(status_obj) &&
-                                       status_obj.get_type() != sol::type::number))
-                {
-                    std::cerr << lua_diag::tag(get_name())
-                              << " on_http_request returned a table whose `status` is a "
-                              << lua_value_type_name(*lua(), status_obj)
-                              << "; expected a number — answering 500" << std::endl;
-                    answer_500();
-                    return;
-                }
-
-                if (SOCKETLEY_UNLIKELY(lua_field_present(body_obj) &&
-                                       body_obj.get_type() != sol::type::string))
-                {
-                    std::cerr << lua_diag::tag(get_name())
-                              << " on_http_request returned a table whose `body` is a "
-                              << lua_value_type_name(*lua(), body_obj)
-                              << "; expected a string — answering 500" << std::endl;
-                    answer_500();
-                    return;
-                }
-
-                int status = resp_tbl.get_or("status", 200);
-                // Clamped before the reason is looked up, so "500" is not sent with the text of a code that does not exist.
-                if (status < 100 || status > 999)
-                    status = 500;
-                // Read out of the string body_obj anchors in the registry, so
-                // the response below is the only copy of it.
-                const std::string_view body = lua_field_present(body_obj)
-                    ? body_obj.as<std::string_view>() : std::string_view();
-                std::string_view reason = socketley::http::status_text(status);
-
-                // A header this end cannot read costs the client that header,
-                // while a status or body it cannot read costs the whole
-                // answer, which is why only these are named and skipped.
-                std::vector<std::pair<std::string, std::string>> resp_headers;
-                sol::object headers_obj = resp_tbl["headers"];
-                if (SOCKETLEY_UNLIKELY(lua_field_present(headers_obj) &&
-                                       !headers_obj.is<sol::table>()))
-                {
-                    std::cerr << lua_diag::tag(get_name())
-                              << " on_http_request returned a table whose `headers` is a "
-                              << lua_value_type_name(*lua(), headers_obj)
-                              << "; expected a table — sending none" << std::endl;
-                }
-                else if (headers_obj.is<sol::table>())
-                {
-                    headers_obj.as<sol::table>().for_each([&](sol::object key, sol::object val) {
-                        if (key.is<std::string>() && val.is<std::string>())
-                        {
-                            resp_headers.emplace_back(key.as<std::string>(), val.as<std::string>());
-                            return;
-                        }
-                        std::cerr << lua_diag::tag(get_name())
-                                  << " on_http_request headers: a name and its value must both be"
-                                     " strings, and one pair was a "
-                                  << lua_value_type_name(*lua(), key) << " and a "
-                                  << lua_value_type_name(*lua(), val)
-                                  << " — dropped it" << std::endl;
-                    });
-                }
-
-                answer(build_http_response_full(status, reason, resp_headers, body, keep_alive));
+                answer(build_http_response_full(out.status, socketley::http::status_text(out.status), out.headers,
+                                                out.body, keep_alive));
                 return;
-            }
-
-            // Falling through to the static file or the 404 is what the manual
-            // promises for this, so the client's answer does not change; said
-            // out loud because only nil declines, and a script that returned a
-            // string meant to answer with something this end cannot read.
-            if (SOCKETLEY_UNLIKELY(lua_field_present(result)))
-            {
-                std::cerr << lua_diag::tag(get_name()) << " on_http_request returned a "
-                          << lua_value_type_name(*lua(), result)
-                          << "; expected a table or nil — falling through to the static file or"
-                             " the 404" << std::endl;
             }
         }
     }

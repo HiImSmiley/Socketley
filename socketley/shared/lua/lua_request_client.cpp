@@ -102,8 +102,9 @@ lua_request_client::mode lua_request_client::send(lua_State* L, int tag, std::st
         p.await = m_ctx.suspender().enrol_await(L);
         if (p.await == 0)
             return refuse(waits_name(tag) + " waits for an answer, so without a callback it may only be called from "
-                          "one that can wait (on_message, on_client_message, or a storage runtime's on_request, "
-                          "on_put and on_delete); pass a function as the last argument anywhere else");
+                          "one that can wait (on_message, on_client_message, a storage runtime's on_request, on_put "
+                          "and on_delete, an mcp tool or a web page); pass a function as the last argument anywhere "
+                          "else");
     }
     const uint64_t cookie = m_next++;
     if (!mgr->requests().post(this, cookie, target, std::move(payload), request_class::client))

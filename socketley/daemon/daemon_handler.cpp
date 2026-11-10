@@ -1830,8 +1830,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // A web runtime runs no script, which config_refusal cannot see before the script is set.
     if (type == runtime_web && !lua_script.empty())
     {
-        std::cout << "web: --lua is not run; a web runtime serves files, and a page that talks to a script is a "
-                     "server's --http\n";
+        std::cout << "web: --lua is not run; a .lua file under --root is a page with --lua-pages\n";
         m_manager.remove(name);
         return 1;
     }

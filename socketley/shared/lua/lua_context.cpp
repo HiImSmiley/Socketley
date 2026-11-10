@@ -12,11 +12,17 @@
 #include "lua_storage_api.h"
 #include "lua_db_api.h"
 #include "lua_mqtt_api.h"
+#include "lua_cache_api.h"
+#include "lua_password.h"
 #include "lua_mail_api.h"
 #include "lua_http.h"
 #include "../../runtime/mqtt/mqtt_lua_table.h"
 #include "../../runtime/mcp/mcp_lua_table.h"
 #include "../util/settings.h"
+#include "../util/hex.h"
+#include "../util/random_id.h"
+#include "../crypto/jws.h"
+#include "../crypto/mac.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
 // and the callers that read a load failure back are not conditional on Lua.
@@ -808,6 +814,9 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     auto result = [&] {
         lua_deadline::scope guard(m_lua.lua_state(), "the script's top level", lua_deadline::default_ms(),
                                   m_owner_name.c_str());
+        // No path is a state with the bindings and nothing of a script's, which ensure_lua_context() asks for.
+        if (path.empty())
+            return m_lua.safe_script("", sol::script_pass_on_error, "=socketley");
         return m_lua.safe_script_file(std::string(path), sol::script_pass_on_error);
     }();
     if (!result.valid())
@@ -1236,6 +1245,10 @@ void lua_context::cancel_timers()
         m_mqtt_client->cancel();
     if (m_mail_client)
         m_mail_client->cancel();
+    if (m_cache_client)
+        m_cache_client->cancel();
+    if (m_password_client)
+        m_password_client->cancel();
     if (m_http_client)
         m_http_client->cancel();
 }
@@ -2835,6 +2848,20 @@ void lua_context::register_bindings(runtime_instance* owner)
     // socketley.clear_interval(id) — cancel a repeating interval
     sk["clear_interval"] = cancel_timer_by_id;
 
+    // A digest, a MAC and random bytes, in hex, for a page's tokens, signed cookies and cache keys.
+    sk["sha256"] = [](std::string_view s) { return socketley::hex_encode(socketley::jws::sha256(s)); };
+    sk["hmac_sha256"] = [](std::string_view key, std::string_view msg) {
+        return socketley::hex_encode(socketley::crypto::hmac_sha256(key, msg));
+    };
+    // At most 1 KiB, and nil when the kernel gave no random bytes, which a token must never be made without.
+    sk["random_hex"] = [](sol::optional<int> n, sol::this_state ts) -> sol::object {
+        const int want = n.value_or(16);
+        if (want < 1 || want > 1024)
+            return sol::make_object(ts, sol::lua_nil);
+        std::string out = socketley::random_hex(static_cast<size_t>(want));
+        return out.empty() ? sol::make_object(ts, sol::lua_nil) : sol::make_object(ts, std::move(out));
+    };
+
     // json_encode refuses with false and a reason rather than raising,
     // following this file's return contract, where both refusals used to crash
     // the whole daemon.
@@ -3269,6 +3296,12 @@ void lua_context::register_bindings(runtime_instance* owner)
     if (!m_mail_client)
         m_mail_client = std::make_unique<lua_mail_client>(*this, *owner);
     m_mail_client->install(m_lua, sk);
+    if (!m_cache_client)
+        m_cache_client = std::make_unique<lua_cache_client>(*this, *owner);
+    m_cache_client->install(m_lua, sk);
+    if (!m_password_client)
+        m_password_client = std::make_unique<lua_password_client>(*this, *owner);
+    m_password_client->install(sk);
 
     // Last and over the top of the bindings above, so the two builds differ in
     // one place and the list of what is refused is readable in one place.

@@ -261,6 +261,7 @@ struct runtime_config
     std::string web_root;
     std::string web_index = "index.html";
     std::string web_fallback;
+    bool web_lua_pages = false;
 
     // Metrics
     std::string metrics_keys;
