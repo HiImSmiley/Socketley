@@ -3693,27 +3693,33 @@ function view.find(v, needle, init)
   return at + 1, at + #needle
 end
 
+-- One step of a walk, its state in a table and no loop of its own: a closure whose inner loop ran once a call was
+-- blacklisted by the trace compiler and walked 7.9M lines a second, under on_message's 12.7M.
+local function step(s)
+  if s == nil or s.gen ~= st.gen then error(STALE, 2) end
+  local pos, n = s.pos, st.n
+  if pos >= n then return nil end
+  local p, cnt, e = st.p, st.nends, n
+  if cnt < 0 then
+    e = ffind(p, n, pos, "\n", 1)
+    if e < 0 then e = n end
+  else
+    local k = s.k
+    if k < cnt then
+      e = st.ends[k]
+      s.k = k + 1
+    end
+  end
+  s.pos = e + 1
+  if e > pos and p[e - 1] == 13 then e = e - 1 end
+  if e > pos then return pos + 1, e end
+  -- An empty line is skipped, as on_message is never handed one.
+  return step(s)
+end
+
 function view.lines(v)
   bytes(v)
-  local gen, pos, k = v.gen, 0, 0
-  return function()
-    if gen ~= st.gen then error(STALE, 2) end
-    local p, n, ends, cnt = st.p, st.n, st.ends, st.nends
-    while pos < n do
-      local i, e = pos, n
-      if cnt < 0 then
-        e = ffind(p, n, pos, "\n", 1)
-        if e < 0 then e = n end
-      elseif k < cnt then
-        e = ends[k]
-        k = k + 1
-      end
-      pos = e + 1
-      if e > i and p[e - 1] == 13 then e = e - 1 end
-      if e > i then return i + 1, e end
-    end
-    return nil
-  end
+  return step, {gen = v.gen, pos = 0, k = 0}
 end
 
 ffi.metatype(view_t, {
