@@ -89,80 +89,80 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### A client in an application: consuming, asking, holding, dialling
 
-Go 1.24.6, Node.js 24.22.1, Python asyncio 3.14.4, 3 passes, 2026-11-10, socketley 230bbf04.
+Go 1.24.6, Node.js 24.22.1, Python asyncio 3.14.4, 3 passes, 2026-11-10, socketley 81ffa51e.
 
 | case | socketley | Go | Node.js | Python asyncio | socketley vs Go | socketley vs Node.js | socketley vs Python asyncio |
 |---|---|---|---|---|---|---|---|
-| consume: a firehose of 64 B lines, TCP | 179.58 M lines/s (1.00 cores) | 132.50 M lines/s (1.00 cores) | 18.38 M lines/s (1.00 cores) | 16.00 M lines/s (1.00 cores) | 1.35× (1.35–1.36) | 9.76× (9.66–9.88) | 11.24× (11.04–11.87) |
-| consume: a firehose of 64 B lines, unix socket | 153.77 M lines/s (1.00 cores) | 127.46 M lines/s (0.99 cores) | 18.44 M lines/s (1.00 cores) | 20.86 M lines/s (1.00 cores) | 1.21× (1.20–1.22) | 8.38× (8.29–8.40) | 7.38× (7.37–7.43) |
-| consume: a firehose of 4 KiB lines, TCP | 2.44 M lines/s (1.00 cores) | 2.64 M lines/s (1.00 cores) | 1.49 M lines/s (1.00 cores) | 707 K lines/s (1.00 cores) | 0.92× (0.89–0.97) | 1.68× (1.59–1.71) | 3.62× (3.32–4.20) |
-| consume: a firehose of 64 B lines, TLS 1.3 | 29.85 M lines/s (0.81 cores) | 62.99 M lines/s (1.00 cores) | 16.57 M lines/s (1.00 cores) | 14.12 M lines/s (1.00 cores) | 0.47× (0.47–0.68) | 1.81× (1.80–2.55) | 2.13× (2.11–2.47) |
-| request-answer: 1 connection, 64 B each way | 32 K req/s (0.55 cores) | 28 K req/s (0.67 cores) | 28 K req/s (0.71 cores) | 17 K req/s (0.82 cores) | 1.12× (1.11–1.13) | 1.12× (1.12–1.16) | 1.84× (1.82–1.96) |
-| request-answer: 1 connection, 64 B each way, round trip p50 | 30.3 µs (0.55 cores) | 33.0 µs (0.67 cores) | 34.0 µs (0.71 cores) | 57.6 µs (0.82 cores) | 1.09× (1.07–1.09) | 1.12× (1.12–1.17) | 1.90× (1.90–2.02) |
-| request-answer: 1 connection, 64 B each way, round trip p99 | 44.8 µs (0.55 cores) | 51.5 µs (0.67 cores) | 48.4 µs (0.71 cores) | 80.4 µs (0.82 cores) | 1.15× (1.05–1.23) | 1.09× (1.08–1.12) | 1.79× (1.64–1.93) |
-| request-answer: 64 connections held, 64 B each way | 586 K req/s (1.00 cores) | 409 K req/s (1.00 cores) | 253 K req/s (1.00 cores) | 82 K req/s (1.00 cores) | 1.43× (1.43–1.44) | 2.32× (2.23–2.33) | 7.13× (6.88–7.86) |
-| request-answer: 64 connections held, 64 B each way, round trip p50 | 111 µs (1.00 cores) | 148 µs (1.00 cores) | 245 µs (1.00 cores) | 774 µs (1.00 cores) | 1.34× (1.32–1.35) | 2.20× (2.13–2.20) | 6.97× (6.68–7.41) |
-| request-answer: 64 connections held, 64 B each way, round trip p99 | 161 µs (1.00 cores) | 301 µs (1.00 cores) | 489 µs (1.00 cores) | 995 µs (1.00 cores) | 1.87× (1.83–1.90) | 3.04× (2.92–3.07) | 6.19× (6.14–8.00) |
-| request-answer over UDP: 1 socket, 64 B datagrams | 34 K req/s (0.54 cores) | 31 K req/s (0.65 cores) | 27 K req/s (0.73 cores) | 23 K req/s (0.79 cores) | 1.09× (1.09–1.10) | 1.25× (1.24–1.26) | 1.51× (1.50–1.58) |
-| request-answer over UDP: 1 socket, 64 B datagrams, round trip p50 | 28.3 µs (0.54 cores) | 31.1 µs (0.65 cores) | 35.1 µs (0.73 cores) | 42.2 µs (0.79 cores) | 1.10× (1.07–1.12) | 1.24× (1.23–1.24) | 1.49× (1.48–1.58) |
-| request-answer over UDP: 1 socket, 64 B datagrams, round trip p99 | 41.2 µs (0.54 cores) | 45.8 µs (0.65 cores) | 49.4 µs (0.73 cores) | 59.6 µs (0.79 cores) | 1.11× (1.10–1.15) | 1.20× (1.17–1.20) | 1.44× (1.43–1.56) |
-| connect: 200 connections dialled and held | 37 K conn/s (1.94 cores) | 7.4 K conn/s (0.36 cores) | 6.5 K conn/s (0.57 cores) | 9.3 K conn/s (1.02 cores) | 5.38× (4.13–5.73) | 5.78× (4.93–6.51) | 3.95× (3.61–4.51) |
-| connect: 200 TLS connections, each a full verified handshake | 6.2 K conn/s (2.16 cores) | 2.6 K conn/s (1.24 cores) | 2.2 K conn/s (1.91 cores) | 2.5 K conn/s (2.30 cores) | 2.38× (1.90–2.46) | 2.82× (2.77–2.98) | 2.43× (2.43–2.57) |
-| held: 200 idle connections, memory per connection | 63.1 KiB (0.00 cores) | 23.9 KiB (0.00 cores) | 271.0 KiB (0.00 cores) | 78.4 KiB (0.00 cores) | 0.38× (0.36–0.39) | 4.30× (4.13–4.43) | 1.24× (1.19–1.28) |
-| held: 10,000 idle connections, memory per connection | 2.4 KiB (0.00 cores) | 9.6 KiB (0.00 cores) | 9.7 KiB (0.00 cores) | 9.5 KiB (0.00 cores) | 4.06× (4.05–4.17) | 4.12× (4.12–4.18) | 4.05× (4.03–4.15) |
+| consume: a firehose of 64 B lines, TCP | 175.23 M lines/s (1.00 cores) | 129.67 M lines/s (1.00 cores) | 18.07 M lines/s (1.00 cores) | 15.55 M lines/s (1.00 cores) | 1.35× (1.33–1.36) | 9.70× (9.58–9.80) | 11.22× (11.16–11.45) |
+| consume: a firehose of 64 B lines, unix socket | 151.63 M lines/s (1.00 cores) | 126.08 M lines/s (0.99 cores) | 18.32 M lines/s (1.00 cores) | 20.63 M lines/s (1.00 cores) | 1.21× (1.20–1.21) | 8.28× (8.25–8.57) | 7.39× (7.27–7.52) |
+| consume: a firehose of 4 KiB lines, TCP | 2.31 M lines/s (1.00 cores) | 2.55 M lines/s (1.00 cores) | 1.44 M lines/s (1.00 cores) | 725 K lines/s (1.00 cores) | 0.91× (0.91–0.92) | 1.59× (1.59–1.64) | 3.17× (3.16–3.33) |
+| consume: a firehose of 64 B lines, TLS 1.3 | 62.68 M lines/s (0.99 cores) | 62.01 M lines/s (1.00 cores) | 16.50 M lines/s (1.00 cores) | 13.85 M lines/s (1.00 cores) | 1.00× (0.50–1.01) | 3.80× (1.87–3.85) | 4.53× (2.24–4.56) |
+| request-answer: 1 connection, 64 B each way | 31 K req/s (0.55 cores) | 28 K req/s (0.67 cores) | 28 K req/s (0.71 cores) | 17 K req/s (0.82 cores) | 1.11× (1.11–1.12) | 1.13× (1.12–1.13) | 1.84× (1.83–1.95) |
+| request-answer: 1 connection, 64 B each way, round trip p50 | 30.6 µs (0.55 cores) | 33.5 µs (0.67 cores) | 34.6 µs (0.71 cores) | 58.1 µs (0.82 cores) | 1.09× (1.03–1.10) | 1.13× (1.12–1.14) | 1.92× (1.88–2.00) |
+| request-answer: 1 connection, 64 B each way, round trip p99 | 43.8 µs (0.55 cores) | 52.0 µs (0.67 cores) | 47.9 µs (0.71 cores) | 76.3 µs (0.82 cores) | 1.19× (1.19–1.20) | 1.09× (1.09–1.10) | 1.74× (1.74–1.95) |
+| request-answer: 64 connections held, 64 B each way | 577 K req/s (1.00 cores) | 407 K req/s (1.00 cores) | 247 K req/s (1.00 cores) | 85 K req/s (1.00 cores) | 1.42× (1.41–1.43) | 2.34× (2.22–2.34) | 6.78× (6.72–7.31) |
+| request-answer: 64 connections held, 64 B each way, round trip p50 | 114 µs (1.00 cores) | 148 µs (1.00 cores) | 251 µs (1.00 cores) | 750 µs (1.00 cores) | 1.30× (1.30–1.32) | 2.20× (2.11–2.20) | 6.61× (6.57–7.07) |
+| request-answer: 64 connections held, 64 B each way, round trip p99 | 163 µs (1.00 cores) | 305 µs (1.00 cores) | 498 µs (1.00 cores) | 987 µs (1.00 cores) | 1.85× (1.85–1.87) | 3.02× (2.98–3.06) | 5.99× (5.71–6.21) |
+| request-answer over UDP: 1 socket, 64 B datagrams | 34 K req/s (0.54 cores) | 31 K req/s (0.65 cores) | 27 K req/s (0.73 cores) | 23 K req/s (0.79 cores) | 1.10× (1.10–1.12) | 1.25× (1.25–1.27) | 1.51× (1.49–1.52) |
+| request-answer over UDP: 1 socket, 64 B datagrams, round trip p50 | 28.5 µs (0.54 cores) | 31.9 µs (0.65 cores) | 35.6 µs (0.73 cores) | 42.8 µs (0.79 cores) | 1.12× (1.10–1.13) | 1.25× (1.23–1.25) | 1.50× (1.48–1.50) |
+| request-answer over UDP: 1 socket, 64 B datagrams, round trip p99 | 41.2 µs (0.54 cores) | 47.4 µs (0.65 cores) | 49.9 µs (0.73 cores) | 60.2 µs (0.79 cores) | 1.15× (1.14–1.15) | 1.21× (1.20–1.21) | 1.44× (1.44–1.46) |
+| connect: 200 connections dialled and held | 36 K conn/s (1.96 cores) | 7.1 K conn/s (0.36 cores) | 6.7 K conn/s (0.58 cores) | 9.1 K conn/s (1.02 cores) | 5.15× (4.82–5.43) | 5.25× (5.16–5.73) | 4.06× (3.83–4.11) |
+| connect: 200 TLS connections, each a full verified handshake | 6.2 K conn/s (2.17 cores) | 3.1 K conn/s (1.48 cores) | 2.1 K conn/s (1.97 cores) | 2.5 K conn/s (2.33 cores) | 2.02× (1.93–2.31) | 2.90× (2.77–2.93) | 2.50× (2.36–2.55) |
+| held: 200 idle connections, memory per connection | 63.6 KiB (0.00 cores) | 23.9 KiB (0.00 cores) | 269.0 KiB (0.00 cores) | 78.6 KiB (0.00 cores) | 0.38× (0.36–0.38) | 4.22× (4.01–4.24) | 1.24× (1.17–1.24) |
+| held: 10,000 idle connections, memory per connection | 2.3 KiB (0.00 cores) | 9.6 KiB (0.00 cores) | 9.6 KiB (0.00 cores) | 9.5 KiB (0.00 cores) | 4.14× (4.05–4.16) | 4.13× (4.05–4.18) | 4.12× (4.03–4.13) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every client arm on one core, the Go target (clientgen) on four others. Every client on the same one core, the target (a Go program) on four others with headroom: every row records the target's cores, and none used all four. socketley is one client runtime holding every connection (--connections N) with its Lua on_message as the handler; the others are one process with the same logic. Every count is taken at the target: a consumer's count must equal the lines sent, every request's size is checked, and a round trip is the interval between one connection's requests as the target sees them. The firehose rows are bound by the client's core, and every line differs (each carries its index). socketley's script reads them with on_read, walking a view of the read buffer with view:lines(), which makes no string, as Go's ReadSlice hands out a slice of its buffer; Node and Python make a string or a bytes object per line. Written with on_message instead, a Lua string per line, the 64 B row makes about 12.7 million lines a second, and with on_messages, one string per read, about 52 million. Over TLS the 64 B row is bound by the target, whose one goroutine encrypting the stream uses a whole core while socketley's runtime decrypts at about four fifths of its own; the target's cores beside the row say so. Connecting is that one runtime dialling all of them, as the others dial from one process; the memory row is socketley's daemon and the runtime's process together, by proportional set size, divided by the connections, so at 200 it is mostly the two processes' fixed cost. One runtime per connection instead, each made with socketley create ... -s from a shell loop, is a process each: 386 created and connected a second, 243 with TLS, and 1,546 KiB each held.
 
 ### Generating load: lines as fast as the connection takes them
 
-tcpkali 1.1.1, Go 1.24.6, 3 passes, 2026-11-10, socketley 230bbf04.
+tcpkali 1.1.1, Go 1.24.6, 3 passes, 2026-11-10, socketley 81ffa51e.
 
 | case | socketley | tcpkali | Go | socketley vs tcpkali | socketley vs Go |
 |---|---|---|---|---|---|
-| send: 64 B lines as fast as the connection takes them, TCP | 101.49 M lines/s (1.00 cores) | 103.97 M lines/s (1.00 cores) | 69.98 M lines/s (1.00 cores) | 0.92× (0.90–1.02) | 1.39× (1.37–1.47) |
-| send: 4 KiB lines, TCP | 3.18 M lines/s (1.00 cores) | 1.70 M lines/s (1.00 cores) | 1.47 M lines/s (1.00 cores) | 1.87× (1.72–2.01) | 2.14× (2.09–2.17) |
+| send: 64 B lines as fast as the connection takes them, TCP | 118.78 M lines/s (1.00 cores) | 103.80 M lines/s (1.00 cores) | 68.00 M lines/s (1.00 cores) | 1.12× (1.09–1.14) | 1.68× (1.60–1.77) |
+| send: 4 KiB lines, TCP | 2.45 M lines/s (1.00 cores) | 1.64 M lines/s (1.00 cores) | 1.43 M lines/s (1.00 cores) | 1.50× (1.25–1.58) | 1.69× (1.66–1.79) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every sender on one core, the Go sink on four others. Sending as fast as the connection takes it, counted at a sink on other cores. socketley paces with self.pending() and on_writable and sends one line per self.send call; tcpkali repeats its message into large writes; Go makes one buffered write call per line. All are bound by the client's core.
 
 ### Generating load over a unix socket and TLS
 
-Go 1.24.6, 3 passes, 2026-11-10, socketley 230bbf04.
+Go 1.24.6, 3 passes, 2026-11-10, socketley 81ffa51e.
 
 | case | socketley | Go | socketley vs Go |
 |---|---|---|---|
-| send: 64 B lines, unix socket | 106.19 M lines/s (1.00 cores) | 134.44 M lines/s (1.00 cores) | 0.78× (0.68–0.81) |
-| send: 64 B lines, TLS 1.3 | 47.54 M lines/s (1.00 cores) | 18.69 M lines/s (1.00 cores) | 2.54× (1.27–2.58) |
+| send: 64 B lines, unix socket | 161.63 M lines/s (1.00 cores) | 163.82 M lines/s (1.00 cores) | 0.99× (0.94–1.09) |
+| send: 64 B lines, TLS 1.3 | 45.29 M lines/s (1.00 cores) | 31.66 M lines/s (1.00 cores) | 1.45× (1.18–1.95) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; every sender on one core, the Go sink on four others. The same over a unix socket and over TLS 1.3, which tcpkali does not speak. Over TLS Go's rate takes one of two levels from pass to pass in every run, about 18-21 or 33-38 million lines a second, while socketley's stays within a few per cent of its median; the ratio falls on whichever level most of Go's passes took.
 
 ### Driving a Redis-protocol server
 
-redis-benchmark 8.0.5, 3 passes, 2026-11-10, socketley 230bbf04.
+redis-benchmark 8.0.5, 3 passes, 2026-11-10, socketley 81ffa51e.
 
 | case | socketley | redis-benchmark | socketley vs redis-benchmark |
 |---|---|---|---|
-| pipelined INCR to a socketley cache, depth 32, 1 connection | 965 K /s (0.56 cores) | 905 K /s (0.62 cores) | 1.07× (1.06–1.07) |
-| pipelined INCR to a socketley cache, depth 32, 4 connections | 6.06 M /s (0.84 cores) | 7.57 M /s (0.99 cores) | 0.80× (0.76–0.84) |
+| pipelined INCR to a socketley cache, depth 32, 1 connection | 961 K /s (0.56 cores) | 916 K /s (0.62 cores) | 1.06× (1.04–1.06) |
+| pipelined INCR to a socketley cache, depth 32, 4 connections | 5.89 M /s (0.85 cores) | 7.34 M /s (0.99 cores) | 0.80× (0.79–0.82) |
 
-How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; each client on one core, the socketley cache on another. A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, the replies counted with on_read and view:lines() as redis-benchmark counts them in C, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley's runtime holds four connections, as redis-benchmark's one thread does.
+How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; each client on one core, the socketley cache on another. A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, the replies counted with on_read and view:lines() as redis-benchmark counts them in C, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley's runtime holds four connections, as redis-benchmark's one thread does, and the cache is the bound under socketley's client at a whole core, where redis-benchmark is at its own.
 
 ### A line from a shell script
 
-socat 1.8.1.1, bash /dev/tcp, 3 passes, 2026-11-10, socketley 230bbf04.
+socketley, socat 1.8.1.1, bash /dev/tcp, 3 passes, 2026-11-10, socketley 81ffa51e.
 
-| case | socketley | socat | bash /dev/tcp | socketley vs socat | socketley vs bash /dev/tcp |
-|---|---|---|---|---|---|
-| one line from the shell, 1,000 in a row | 1.4 K lines/s (1.00 cores) | 1.2 K lines/s (1.00 cores) | 30 K lines/s (0.98 cores) | 1.19× (1.17–1.19) | 0.05× (0.04–0.05) |
+| case | socketley, bash builtin | socketley | socat | bash /dev/tcp | socketley vs socketley | socketley vs socat | socketley vs bash /dev/tcp |
+|---|---|---|---|---|---|---|---|
+| one line from the shell, 1,000 in a row | 27 K lines/s (0.99 cores) | 1.4 K lines/s (1.00 cores) | 1.2 K lines/s (1.00 cores) | 33 K lines/s (0.98 cores) | 19.61× (19.18–19.85) | 23.18× (22.84–23.50) | 0.83× (0.76–0.93) |
 
-How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; the shell loop on one core, the Go sink on four others. One line per command from a shell loop, until the sink has the last one. socketley send writes onto the connection a client runtime holds; socat opens a connection per line (nodelay); bash's /dev/tcp is a builtin with no process to start, bound by the connection set-up alone.
+How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; the shell loop on one core, the Go sink on four others. One line per command from a shell loop, until the sink has the last one. socketley send writes onto the connection a client runtime holds, a program started a line; with the bash builtin (enable -f socketley-bash.so socketley) the same command is a request to the daemon from the shell itself over one connection it keeps; socat opens a connection per line (nodelay); bash's /dev/tcp is a builtin with no process to start, bound by the connection set-up alone.
 
 ### A line from a shell script to a TLS service
 
-socat 1.8.1.1, 3 passes, 2026-11-10, socketley 230bbf04.
+socat 1.8.1.1, 3 passes, 2026-11-10, socketley 81ffa51e.
 
 | case | socketley | socat | socketley vs socat |
 |---|---|---|---|
-| one line from the shell to a TLS service, 1,000 in a row | 1.4 K lines/s (1.00 cores) | 365.0 lines/s (0.96 cores) | 3.74× (3.72–3.75) |
+| one line from the shell to a TLS service, 1,000 in a row | 1.3 K lines/s (0.99 cores) | 359.0 lines/s (0.96 cores) | 3.73× (3.71–3.73) |
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; the shell loop on one core, the Go sink on four others. As above, to a TLS service: socketley's connection is held and verified once, socat makes a verified handshake per line (nodelay; without it every line waited 40 ms).
 
