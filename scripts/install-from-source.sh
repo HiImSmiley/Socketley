@@ -308,7 +308,7 @@ step "checking this machine" \
 # ── Linux, and this architecture ────────────────────────────────────────────
 if [ "$(uname -s)" != "Linux" ]; then
     fail "socketley is Linux only: this is $(uname -s)" \
-         "io_uring has no equivalent elsewhere, and CONTRIBUTING.md declines portability patches"
+         "io_uring has no equivalent elsewhere"
 fi
 
 ARCH="$(uname -m)"

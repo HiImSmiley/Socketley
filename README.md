@@ -72,8 +72,6 @@ It's been an amazing journey so far, and I hope others see the same potential in
 ## More
 
 - [CHANGELOG.md](CHANGELOG.md) — what changed, release by release
-- [CONTRIBUTING.md](CONTRIBUTING.md) — building, the test suite and how changes land
-- [SECURITY.md](SECURITY.md) — reporting a vulnerability
 - [examples/](examples/) — ready-to-run setups, from an echo server to a cluster
 
 ## License
