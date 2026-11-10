@@ -104,13 +104,17 @@ def serve(c, n):
         if mode == "404": head = b"Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\n"; body = b"nope"
         elif mode == "redirect": head = b"Location: https://example.test/there\r\n\r\n"; body = b""
         elif mode == "big": head = b"Content-Type: application/octet-stream\r\n\r\n"; body = bytes(range(256)) * 800
+        elif mode.startswith("mib"): head = b"Content-Type: application/octet-stream\r\n\r\n"; body = bytes(range(256)) * (4096 * int(mode[3:]))
+        elif mode == "cut":
+            c.sendall(rec(6, b"Content-Type: text/plain\r\n\r\n" + b"x" * 30000) + rec(6, b"y" * 60000) + rec(6, b"z" * 30000))
+            c.close(); return
         elif mode == "nohead": head = b""; body = b""
         elif mode == "accel": head = b"X-Accel-Redirect: /private/a.zip\r\nContent-Length: 0\r\n\r\n"; body = b""
         else: head = b"Content-Type: application/json\r\nX-Script: yes\r\n\r\n"; body = json.dumps(info).encode()
         whole = head + body
-        for i in range(0, len(whole), 30000): out += rec(6, whole[i:i+30000])
-        out += rec(6) + rec(3, b"\0\0\0\0\0\0\0\0")
-        c.sendall(out)
+        parts = [out] + [rec(6, whole[i:i+30000]) for i in range(0, len(whole), 30000)]
+        parts.append(rec(6) + rec(3, b"\0\0\0\0\0\0\0\0"))
+        c.sendall(b"".join(parts))
         if not keep: c.close(); return
 s = socket.socket(socket.AF_UNIX); s.bind(path); s.listen(16)
 while True:
@@ -177,6 +181,25 @@ expect "a server that answers no CGI head is a 502" "$(curl -s -o /dev/null -w '
 expect "an X-Accel-Redirect is refused rather than answered empty" \
     "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Mode: accel' "$U/hello.php")" 502
 expect "and one that answers garbage" "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Mode: garbage' "$U/hello.php")" 502
+
+# ── an answer too long to hold, sent as it comes ───────────────────────────
+pattern_sha() { python3 -c "import hashlib,sys; print(hashlib.sha256(bytes(range(256)) * (4096 * int(sys.argv[1]))).hexdigest())" "$1"; }
+WPID=$("$BIN" stats site 2>/dev/null | grep -oP '^pid:\K[0-9]+' | head -1)
+curl -s -D "$T/hh" -o "$T/huge.out" -H 'X-Mode: mib100' "$U/hello.php"
+expect "an answer of 100 MiB arrives whole, in chunks" \
+    "$(sha256sum < "$T/huge.out" | cut -c1-64) $(grep -ci '^Transfer-Encoding: chunked' "$T/hh")" "$(pattern_sha 100) 1"
+HWM=$(awk '/^VmHWM/ {print int($2 / 1024)}' /proc/"$WPID"/status 2>/dev/null)
+if [ -n "$HWM" ] && [ "$HWM" -lt 64 ]; then ok; else bad "and the runtime never held it whole" "peak ${HWM:-?} MiB resident"; fi
+curl -s -o "$T/slow.out" --limit-rate 3M -H 'X-Mode: mib8' "$U/hello.php"
+expect "a client that reads slowly gets all of it, the server read as it takes it" \
+    "$(sha256sum < "$T/slow.out" | cut -c1-64)" "$(pattern_sha 8)"
+expect "a HEAD of it has no body" "$(curl -s -I -o /dev/null -w '%{http_code} %{size_download}' -H 'X-Mode: mib100' "$U/hello.php")" "200 0"
+curl -s -0 -D "$T/h10" -o "$T/h10.out" -H 'X-Mode: mib1' "$U/hello.php"
+expect "an HTTP/1.0 client reads it to the close" \
+    "$(sha256sum < "$T/h10.out" | cut -c1-64) $(grep -ci '^Transfer-Encoding' "$T/h10")" "$(pattern_sha 1) 0"
+expect "the connection after a long answer still serves" "$(curl -s -o /dev/null -o /dev/null -w '%{http_code}' -H 'X-Mode: mib1' "$U/hello.php" "$U/style.css")" "200200"
+curl -s -o "$T/cut.out" -H 'X-Mode: cut' "$U/hello.php"; rc=$?
+expect "a server that stops in the middle cuts the answer short, which the client sees" "$rc" 18
 : > "$T/stub.log"
 curl -s -o /dev/null -o /dev/null "$U/hello.php?n=1" "$U/hello.php?n=2"
 expect "each request is a connection of its own, which the server closes" "$(python3 -c '

@@ -53,8 +53,9 @@ namespace
 
 constexpr uint32_t read_chunk = 64 * 1024;
 
-// One exchange, owned by the completions that are owed to it, the last of which closes its socket.
-struct call : std::enable_shared_from_this<call>
+// One exchange, owned by the completions that are owed to it and by the runtime's handle, the last of which closes its
+// socket.
+struct call final : fcgi_stream, std::enable_shared_from_this<call>
 {
     file_io& io;
     int fd{-1};
@@ -64,63 +65,113 @@ struct call : std::enable_shared_from_this<call>
     std::string err;
     std::unique_ptr<char[]> buf{new char[read_chunk]};
     std::weak_ptr<bool> alive;
-    fcgi_done done;
+    fcgi_sink sink;
     bool ended{false};
     bool timed_out{false};
     bool finished{false};
+    // The head went to the runtime and the body goes in pieces; a read waits for resume() while `paused`.
+    bool streaming{false};
+    bool paused{false};
+    bool reading{false};
 
     explicit call(file_io& i) : io(i) {}
-    ~call()
+    ~call() override
     {
         if (fd >= 0)
             ::close(fd);
     }
 
-    // `done` told once: the answer, or a 502 or 504 and the reason in the log.
-    void finish(int status_if_failed, const char* why)
+    bool listening() const { return !finished && !alive.expired(); }
+
+    void resume() override
+    {
+        if (!paused || finished)
+            return;
+        paused = false;
+        if (!reading)
+            read();
+    }
+
+    void cancel() override
     {
         if (finished)
             return;
         finished = true;
+        sink = {};
+        // The read under way comes back, and its completion lets the socket go.
+        ::shutdown(fd, SHUT_RDWR);
+    }
+
+    void failed(int status, const char* why)
+    {
+        if (finished)
+            return;
+        LOG_WARN((std::string("web: the FastCGI server ") + why +
+                  (streaming ? "; the answer under way is cut short" : "; the request is answered " +
+                                                                           std::to_string(status))).c_str());
+        finished = true;
+        if (alive.expired())
+            return;
+        if (streaming)
+        {
+            if (sink.end)
+                sink.end(false);
+            return;
+        }
         fcgi_answer a;
-        if (!why)
-        {
-            fcgi::cgi_head h;
-            size_t len = 0;
-            if (fcgi::parse_cgi_head(answer, len, h) != fcgi::head_result::done)
-                why = "answered with a CGI head that is not one";
-            else if (!h.accel_redirect.empty())
-                why = "named a file by X-Accel-Redirect, which is nginx's";
-            else
-            {
-                a.status = h.status;
-                a.fields = std::move(h.fields);
-                a.body = answer.substr(len);
-            }
-        }
-        if (why)
-        {
-            a = fcgi_answer{};
-            a.status = status_if_failed;
-            a.body = status_if_failed == 504 ? "Gateway Timeout\n" : "Bad Gateway\n";
-            LOG_WARN((std::string("web: the FastCGI server ") + why + "; the request is answered " +
-                      std::to_string(status_if_failed)).c_str());
-        }
-        if (!alive.expired() && done)
-            done(std::move(a));
-        done = nullptr;
+        a.status = status;
+        a.body = status == 504 ? "Gateway Timeout\n" : "Bad Gateway\n";
+        if (sink.head)
+            sink.head(std::move(a), true);
     }
 
     void fail(const char* why)
     {
-        finish(timed_out ? 504 : 502, timed_out ? "did not answer in time" : why);
+        failed(timed_out ? 504 : 502, timed_out ? "did not answer in time" : why);
     }
 
-    // The records read so far, taken off the front of `raw`; false when they are not FastCGI.
+    // The head and what came of the body handed over, whole when the answer ended; false for a head that is not one.
+    bool give_head(bool whole)
+    {
+        fcgi::cgi_head h;
+        size_t len = 0;
+        const fcgi::head_result hr = fcgi::parse_cgi_head(answer, len, h);
+        if (hr == fcgi::head_result::need_more && !whole)
+            return true;
+        if (hr != fcgi::head_result::done)
+        {
+            fail("answered with a CGI head that is not one");
+            return false;
+        }
+        if (!h.accel_redirect.empty())
+        {
+            fail("named a file by X-Accel-Redirect, which is nginx's");
+            return false;
+        }
+        // An answer that is not whole goes when its body outgrows what is held of one.
+        if (!whole && answer.size() - len <= fcgi_whole_max)
+            return true;
+        fcgi_answer a;
+        a.status = h.status;
+        a.fields = std::move(h.fields);
+        a.body = answer.substr(len);
+        answer.clear();
+        answer.shrink_to_fit();
+        streaming = !whole;
+        if (whole)
+            finished = true;
+        if (listening() || whole)
+            if (!alive.expired() && sink.head)
+                sink.head(std::move(a), whole);
+        return true;
+    }
+
+    // The records read so far, taken off the front of `raw`; false when they are not FastCGI or the exchange ended.
     bool take_records()
     {
         size_t at = 0;
-        for (;;)
+        bool ok = true;
+        while (!ended && listening())
         {
             fcgi::record r;
             size_t used = 0;
@@ -128,12 +179,25 @@ struct call : std::enable_shared_from_this<call>
             if (t == fcgi::take::need_more)
                 break;
             if (t == fcgi::take::bad)
-                return false;
+            {
+                ok = false;
+                break;
+            }
             at += used;
             switch (r.type)
             {
                 case fcgi::record_type::stdout_data:
-                    answer.append(r.content);
+                    if (streaming)
+                    {
+                        if (!r.content.empty() && sink.more && !sink.more(r.content))
+                            paused = true;
+                    }
+                    else
+                    {
+                        answer.append(r.content);
+                        if (!give_head(false))
+                            return false;
+                    }
                     break;
                 case fcgi::record_type::stderr_data:
                     err.append(r.content);
@@ -144,11 +208,11 @@ struct call : std::enable_shared_from_this<call>
                 default:
                     break;
             }
-            if (ended)
-                break;
         }
         raw.erase(0, at);
-        return true;
+        if (!ok)
+            fail("answered with records that are not FastCGI");
+        return ok && listening();
     }
 
     void log_stderr()
@@ -161,56 +225,73 @@ struct call : std::enable_shared_from_this<call>
         err.clear();
     }
 
+    void complete()
+    {
+        log_stderr();
+        if (streaming)
+        {
+            finished = true;
+            if (!alive.expired() && sink.end)
+                sink.end(true);
+            return;
+        }
+        give_head(true);
+    }
+
     void read()
     {
         auto self = shared_from_this();
+        reading = true;
         if (!io.pread(fd, buf.get(), read_chunk, file_io::at_stream, [self](int64_t res) { self->got(res); }))
+        {
+            reading = false;
             fail("could not be read from");
+        }
     }
 
     void got(int64_t res)
     {
+        reading = false;
+        if (finished)
+            return;
         if (res < 0)
             return fail("broke the connection");
         if (res == 0)
-        {
-            log_stderr();
-            return ended ? finish(502, nullptr) : fail("closed the connection before its answer was whole");
-        }
+            return ended ? complete() : fail("closed the connection before its answer was whole");
         raw.append(buf.get(), static_cast<size_t>(res));
         if (!take_records())
-            return fail("answered with records that are not FastCGI");
-        if (answer.size() > fcgi_answer_max)
-            return fail("answered with more than the 64 MiB an answer is held to");
+            return;
         if (ended)
-        {
-            log_stderr();
-            return finish(502, nullptr);
-        }
-        read();
+            return complete();
+        if (!paused)
+            read();
     }
 };
 
 }   // namespace
 
-bool fcgi_exchange(file_io& io, const fcgi_target& target, std::string request, uint32_t timeout_ms,
-                   std::weak_ptr<bool> alive, fcgi_done done)
+std::shared_ptr<fcgi_stream> fcgi_exchange(file_io& io, const fcgi_target& target, std::string request,
+                                           uint32_t timeout_ms, std::weak_ptr<bool> alive, fcgi_sink sink)
 {
     const int fd = ::socket(target.unix_socket ? AF_UNIX : AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
-        return false;
+        return nullptr;
     auto c = std::make_shared<call>(io);
     c->fd = fd;
     c->out = std::move(request);
     c->alive = std::move(alive);
-    c->done = std::move(done);
+    c->sink = std::move(sink);
     const auto* addr = target.unix_socket ? reinterpret_cast<const struct sockaddr*>(&target.un)
                                           : reinterpret_cast<const struct sockaddr*>(&target.in);
     const bool started = io.connect(fd, addr, target.len, [c](int64_t res) {
+        if (c->finished)
+            return;
         if (res < 0)
             return c->fail("could not be reached");
         if (!c->io.pwrite(c->fd, c->out.data(), static_cast<uint32_t>(c->out.size()), file_io::at_stream,
                           [c](int64_t w) {
+                              if (c->finished)
+                                  return;
                               if (w < 0)
                                   return c->fail("refused the request");
                               c->out.clear();
@@ -221,19 +302,20 @@ bool fcgi_exchange(file_io& io, const fcgi_target& target, std::string request, 
     });
     if (!started)
     {
-        c->done = nullptr;
-        return false;
+        c->sink = {};
+        return nullptr;
     }
-    // A server that never answers is ended here: the shutdown makes the read under way come back, and that answers.
+    // A server that has not answered with a head by then is ended here: the shutdown makes the read under way come
+    // back, and that answers 504; a body already under way is the client's to take at its own pace.
     std::weak_ptr<call> weak = c;
     io.after(std::chrono::milliseconds(timeout_ms), [weak](int64_t) {
-        if (const auto cc = weak.lock(); cc && !cc->finished)
+        if (const auto cc = weak.lock(); cc && !cc->finished && !cc->streaming)
         {
             cc->timed_out = true;
             ::shutdown(cc->fd, SHUT_RDWR);
         }
     });
-    return true;
+    return c;
 }
 
 }   // namespace socketley::web

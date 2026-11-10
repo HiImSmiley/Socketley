@@ -1,6 +1,7 @@
 #include "web_run.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cerrno>
 #include <cstring>
 
@@ -1339,21 +1340,116 @@ bool web_run::run_script(const std::shared_ptr<web_conn>& c, std::string_view me
     ++m_c.scripts;
     std::weak_ptr<web_conn> weak = c;
     c->waiting = true;
-    const bool started = fcgi_exchange(m_io, m_fcgi, std::move(req), script_timeout_ms, m_alive,
-                                       [this, weak](fcgi_answer a) {
+    fcgi_sink sink;
+    sink.head = [this, weak](fcgi_answer a, bool whole) {
         const auto cc = weak.lock();
         if (!cc || cc->dead || m_stopped)
             return;
+        if (whole)
+        {
+            cc->script.reset();
+            cc->waiting = false;
+            write_dynamic(cc, a.status, a.fields, a.body);
+            m_http.resume(cc);
+            return;
+        }
+        write_stream_head(cc, a.status, a.fields);
+        write_piece(*cc, a.body);
+        m_http.flush(cc);
+    };
+    // The server is read from again once the client has taken most of what it was given.
+    sink.more = [this, weak](std::string_view data) {
+        const auto cc = weak.lock();
+        if (!cc || cc->dead || m_stopped)
+            return false;
+        write_piece(*cc, data);
+        m_http.flush(cc);
+        if (cc->unsent() <= socketley::http::conn_server::out_max)
+            return true;
+        cc->script_paused = true;
+        return false;
+    };
+    sink.end = [this, weak](bool ok) {
+        const auto cc = weak.lock();
+        if (!cc || cc->dead || m_stopped)
+            return;
+        cc->script.reset();
+        cc->script_paused = false;
+        // A body cut short has no last chunk, so the client cannot take it for the whole.
+        if (!ok)
+        {
+            m_http.close_conn(cc);
+            return;
+        }
+        if (cc->chunked && !cc->head)
+            cc->out.append("0\r\n\r\n");
+        cc->chunked = false;
         cc->waiting = false;
-        write_dynamic(cc, a.status, a.fields, a.body);
         m_http.resume(cc);
-    });
-    if (!started)
+    };
+    c->script = fcgi_exchange(m_io, m_fcgi, std::move(req), script_timeout_ms, m_alive, std::move(sink));
+    if (!c->script)
     {
         c->waiting = false;
         answer_plain(c, 502, "Bad Gateway\n");
     }
     return true;
+}
+
+void web_run::write_stream_head(const std::shared_ptr<web_conn>& c, int status_asked,
+                                const std::vector<std::pair<std::string, std::string>>& fields)
+{
+    const auto named = [](std::string_view k, std::string_view n) {
+        return k.size() == n.size() && std::equal(k.begin(), k.end(), n.begin(), [](char a, char b) {
+            return (a >= 'A' && a <= 'Z' ? a + 32 : a) == b;
+        });
+    };
+    const int status = status_asked >= 200 && status_asked <= 999 ? status_asked : 500;
+    std::string& o = c->out;
+    o.append("HTTP/1.1 ").append(std::to_string(status)).append(" ").append(socketley::http::status_text(status));
+    o.append("\r\n").append(date_field());
+    bool nosniff = false;
+    for (const auto& [k, v] : fields)
+    {
+        if (!http_field_name_ok(k) || !http_field_value_ok(v) || named(k, "content-length") || named(k, "connection") ||
+            named(k, "transfer-encoding") || named(k, "date") || named(k, "keep-alive"))
+            continue;
+        nosniff = nosniff || named(k, "x-content-type-options");
+        o.append(k).append(": ").append(v).append("\r\n");
+    }
+    if (!nosniff)
+        o.append("X-Content-Type-Options: nosniff\r\n");
+    // An HTTP/1.0 client reads such a body to the close, as it cannot read chunks.
+    c->chunked = !c->http10;
+    if (c->chunked)
+        o.append("Transfer-Encoding: chunked\r\n");
+    else
+        c->keep_alive = false;
+    o.append(connection_field(*c)).append("\r\n");
+}
+
+void web_run::write_piece(web_conn& c, std::string_view data)
+{
+    if (c.head || data.empty())
+        return;
+    if (c.chunked)
+    {
+        char size[20];
+        const auto r = std::to_chars(size, size + sizeof size, data.size(), 16);
+        c.out.append(size, r.ptr).append("\r\n").append(data).append("\r\n");
+    }
+    else
+        c.out.append(data);
+}
+
+void web_run::wrote(const std::shared_ptr<socketley::http::server_conn>& sc, size_t)
+{
+    auto* c = static_cast<web_conn*>(sc.get());
+    if (c->script_paused && c->script && c->unsent() <= socketley::http::conn_server::out_max / 4)
+    {
+        c->script_paused = false;
+        c->script->resume();
+    }
 }
 
 bool web_run::answer_file(const std::shared_ptr<web_conn>& c, const entry& e, const request_fields& f)
@@ -1587,7 +1683,14 @@ bool web_run::written(const std::shared_ptr<socketley::http::server_conn>& sc)
 
 void web_run::closing(const std::shared_ptr<socketley::http::server_conn>& sc)
 {
-    std::static_pointer_cast<web_conn>(sc)->sending_body.reset();
+    const auto c = std::static_pointer_cast<web_conn>(sc);
+    c->sending_body.reset();
+    // A client gone takes its script's answer with it.
+    if (c->script)
+    {
+        c->script->cancel();
+        c->script.reset();
+    }
 }
 
 std::string web_run::stats() const

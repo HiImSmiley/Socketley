@@ -37,14 +37,34 @@ struct fcgi_answer
     std::string body;
 };
 
-// The scripts' answers bigger than this are a 502, since an answer is held whole to be sent with its length.
-inline constexpr size_t fcgi_answer_max = 64u << 20;
+// An answer whose body ends within this much is handed over whole, to be sent with its length; a longer one in pieces.
+inline constexpr size_t fcgi_whole_max = 64u << 10;
 
-using fcgi_done = std::function<void(fcgi_answer)>;
+// What an exchange tells its runtime as the answer comes, always from the loop and never inside fcgi_exchange().
+struct fcgi_sink
+{
+    // The status, the fields and the body or the first of it; `whole` when that is all of it, always so for a 502 or
+    // a 504.
+    std::function<void(fcgi_answer, bool whole)> head;
+    // More of a body that did not come whole; false asks for no more until fcgi_stream::resume().
+    std::function<bool(std::string_view)> more;
+    // The end of such a body; false when the server failed after its head was handed over.
+    std::function<void(bool ok)> end;
+};
 
-// Sends `request`, already FastCGI records, and calls `done` exactly once, never from inside this call, unless
-// `alive` has expired first; false when nothing could be started, and then `done` is never called.
-bool fcgi_exchange(file_io& io, const fcgi_target& target, std::string request, uint32_t timeout_ms,
-                   std::weak_ptr<bool> alive, fcgi_done done);
+// An exchange under way, which its runtime asks for more of once its client has taken what it was given, or gives up
+// when the client is gone; nothing of the sink is called after cancel().
+class fcgi_stream
+{
+public:
+    virtual ~fcgi_stream() = default;
+    virtual void resume() = 0;
+    virtual void cancel() = 0;
+};
+
+// Sends `request`, already FastCGI records, and tells `sink` the answer, until `alive` expires; null when nothing could
+// be started, and then the sink is never called. `timeout_ms` bounds the wait for the answer's head.
+std::shared_ptr<fcgi_stream> fcgi_exchange(file_io& io, const fcgi_target& target, std::string request,
+                                           uint32_t timeout_ms, std::weak_ptr<bool> alive, fcgi_sink sink);
 
 }   // namespace socketley::web

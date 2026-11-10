@@ -112,6 +112,11 @@ struct web_conn : socketley::http::server_conn
     bool continued{false};
     // And takes a gzipped answer, which a page's or a script's is when it is text.
     bool gzip_ok{false};
+    // A script's answer going in pieces: the exchange asked for more, chunked framing, and whether reading from the
+    // server waits for the client to take what it was given.
+    std::shared_ptr<fcgi_stream> script;
+    bool chunked{false};
+    bool script_paused{false};
 };
 
 class web_run : public io_handler, public socketley::http::conn_hooks
@@ -135,6 +140,7 @@ private:
     void accepted(const std::shared_ptr<socketley::http::server_conn>& c) override;
     void serve(const std::shared_ptr<socketley::http::server_conn>& c) override;
     bool written(const std::shared_ptr<socketley::http::server_conn>& c) override;
+    void wrote(const std::shared_ptr<socketley::http::server_conn>& c, size_t n) override;
     void closing(const std::shared_ptr<socketley::http::server_conn>& c) override;
 
     // One request answered into the connection; false when a body now goes from a descriptor and the rest waits.
@@ -154,6 +160,11 @@ private:
     // HEAD.
     void write_dynamic(const std::shared_ptr<web_conn>& c, int status,
                        const std::vector<std::pair<std::string, std::string>>& fields, std::string_view body);
+    // The head of a script's answer whose body follows in pieces: chunked, or to the close for HTTP/1.0.
+    void write_stream_head(const std::shared_ptr<web_conn>& c, int status,
+                           const std::vector<std::pair<std::string, std::string>>& fields);
+    // One piece of such a body, framed as the head said.
+    static void write_piece(web_conn& c, std::string_view data);
     // The .php script an address names under --backend, run, or the 404 a .php address no script is at gets; -1 when
     // PHP has nothing to say to it and the static answer stands.
     int answer_php(const std::shared_ptr<web_conn>& c, std::string_view method, std::string_view raw,
