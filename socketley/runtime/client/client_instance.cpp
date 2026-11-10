@@ -1943,13 +1943,18 @@ void client_instance::tls_feed(conn_t* conn, const char* data, size_t len)
         // one packet.
     }
 
-    char plain[16384];
+    // Decrypted straight onto the end of partial, which a buffer of its own and an append copied a second time.
+    constexpr size_t record = 16384;
     for (;;)
     {
-        const int n = tls_context::ssl_read(conn->ssl, plain, sizeof(plain));
+        int n = 0;
+        const size_t at = conn->partial.size();
+        conn->partial.resize_and_overwrite(at + record, [&](char* p, size_t) {
+            n = tls_context::ssl_read(conn->ssl, p + at, static_cast<int>(record));
+            return at + (n > 0 ? static_cast<size_t>(n) : 0);
+        });
         if (SOCKETLEY_LIKELY(n > 0))
         {
-            conn->partial.append(plain, static_cast<size_t>(n));
             // The same ceiling the cleartext path applies, checked inside the
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
