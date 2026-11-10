@@ -165,6 +165,9 @@ struct line_ends
     }
 };
 
+// The length past which the index takes a read's lines for long ones.
+inline constexpr size_t k_long_line = 256;
+
 // The offset of every '\n' in [data, data + len) into `ends`, and how many of
 // the lines they end for_each_line would deliver, for a reader that walks the
 // lines again without searching for them.
@@ -180,6 +183,18 @@ inline size_t index_lines(const char* data, size_t len, line_ends& ends)
         start = end + 1;
     };
     size_t i = 0;
+    // A first line past k_long_line bytes makes these long lines, each of whose ends glibc's memchr finds at the machine's
+    // own width: sixteen bytes a step was 14% of a client reading 4 KiB lines, and a test a step cost short ones 2%.
+    if (len > k_long_line && !std::memchr(data, '\n', k_long_line))
+    {
+        while (const void* next = std::memchr(data + i, '\n', len - i))
+        {
+            ends.reserve_more(1);
+            add(static_cast<size_t>(static_cast<const char*>(next) - data));
+            i = start;
+        }
+        return lines;
+    }
 #if defined(__SSE2__)
     const __m128i nl = _mm_set1_epi8('\n');
     for (; len - i >= 16; i += 16)

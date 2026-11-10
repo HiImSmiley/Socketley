@@ -210,7 +210,7 @@ private:
     void process_message(std::string_view msg, int id);
     // One read's plaintext into lines: in place for a provided buffer, through
     // partial for read_buf, and after the record layer for TLS.
-    void read_in_place(conn_t* conn, const char* data, size_t len);
+    void read_in_place(conn_t* conn, char* data, size_t len);
     void read_through_partial(conn_t* conn, const char* data, size_t len);
     void read_tls(conn_t* conn, const char* data, size_t len);
     void deliver_partial(conn_t* conn, size_t scanned);
@@ -395,6 +395,8 @@ private:
     static constexpr uint32_t MULTI_BUF_MIN = 4096;
     static constexpr uint32_t MULTI_BUF_POOL = 1024 * 1024;
     static constexpr uint32_t MULTI_BUF_MAX = 4096;
+    // A sixteenth of a buffer free before it, where a batch reader's leftover line is put rather than the read copied behind it.
+    static constexpr uint32_t BUF_HEADROOM_SHARE = 16;
     bool m_use_provided_bufs{false};
 
     // The kernel re-arming the recv instead of this client doing it per

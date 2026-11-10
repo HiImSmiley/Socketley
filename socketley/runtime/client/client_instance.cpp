@@ -897,7 +897,7 @@ bool client_instance::setup(event_loop& loop)
     }
 
     if (m_connections == 1)
-        m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
+        m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE, BUF_SIZE / BUF_HEADROOM_SHARE);
     else
     {
         // A power of two, as the ring requires, of at least one buffer a connection, smaller as there are more so
@@ -906,7 +906,7 @@ bool client_instance::setup(event_loop& loop)
         while (count < m_connections && count < MULTI_BUF_MAX)
             count <<= 1;
         const uint32_t size = std::clamp<uint32_t>(MULTI_BUF_POOL / count, MULTI_BUF_MIN, MULTI_BUF_SIZE);
-        m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, count, size);
+        m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, count, size, size / BUF_HEADROOM_SHARE);
     }
     // Needs the ring, because a multishot recv selects its buffer from one.
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_enabled();
@@ -1152,7 +1152,7 @@ void client_instance::handle_read(conn_t* conn, struct io_uring_cqe* cqe)
     event_loop* const ring = m_loop;
     const size_t len = static_cast<size_t>(cqe->res);
     const uint16_t buf_id = static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
-    const char* data = is_provided ? ring->get_buf_ptr(BUF_GROUP_ID, buf_id)
+    char* data = is_provided ? ring->get_buf_ptr(BUF_GROUP_ID, buf_id)
                                    : conn->read_buf.get();
     if (data)
     {
@@ -1336,9 +1336,10 @@ void client_instance::deliver_partial(conn_t* conn, size_t scanned)
 
 // Lines straight out of a provided buffer, with partial holding only the
 // unfinished line on either side of it.
-void client_instance::read_in_place(conn_t* conn, const char* data, size_t len)
+void client_instance::read_in_place(conn_t* conn, char* data, size_t len)
 {
     std::string& partial = conn->partial;
+    const uint32_t headroom = m_loop ? m_loop->buf_ring_headroom(BUF_GROUP_ID) : 0;
 
     // Over the bound the copying path refuses it, bytes kept, so every later
     // read on this closing connection is refused too.
@@ -1357,6 +1358,19 @@ void client_instance::read_in_place(conn_t* conn, const char* data, size_t len)
         if (!nl)
         {
             partial.append(data, len);
+            return;
+        }
+        // A batch reader's leftover goes into the free bytes before this buffer, so the read is still one view and
+        // only the leftover is copied: the whole read appended behind it was 7% of a client taking 4 KiB lines.
+        if (batch && partial.size() <= headroom)
+        {
+            const size_t kept = partial.size();
+            char* const front = data - kept;
+            std::memcpy(front, partial.data(), kept);
+            partial.clear();
+            const size_t used = deliver_lines(conn, front, kept + len, kept);
+            if (used != socketley::line_framing_stopped)
+                partial.append(front + used, kept + len - used);
             return;
         }
         from = static_cast<size_t>(static_cast<const char*>(nl) - data) + 1;

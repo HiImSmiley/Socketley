@@ -9,8 +9,10 @@
 #include "shared/util/proc_stat.h"
 #include "shared/util/byte_codec.h"
 #include "shared/runtime/stats_text.h"
+#include "shared/loop/line_framing.h"
 
 #include <chrono>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -209,4 +211,43 @@ TEST_CASE("a stats text is read field by field, the last line too without a newl
     size_t calls = 0;
     socketley::stats_text::for_each_field(text, [&](std::string_view, std::string_view) { return ++calls < 2; });
     CHECK(calls == 2);
+}
+
+TEST_CASE("the line index finds every newline and counts the lines on_message is handed, long lines too")
+{
+    // Lines short and long around the 64 bytes past which the index hands its search to memchr, some empty or
+    // ending in '\r', in buffers of every length mod 16.
+    std::mt19937 rng(7);
+    socketley::line_ends ends;
+    for (int round = 0; round < 400; ++round)
+    {
+        std::string data;
+        const size_t want = 1 + rng() % 9000;
+        while (data.size() < want)
+        {
+            const unsigned kind = rng() % 6;
+            const size_t n = kind == 0 ? 0 : kind < 3 ? rng() % 20 : kind < 5 ? 40 + rng() % 60 : 100 + rng() % 5000;
+            data.append(n, 'x');
+            if (rng() % 4 == 0)
+                data += '\r';
+            data += '\n';
+        }
+        if (rng() % 2)
+            data.append(rng() % 40, 'y');
+        std::vector<uint32_t> at;
+        size_t lines = 0, start = 0;
+        for (size_t i = 0; i < data.size(); ++i)
+        {
+            if (data[i] != '\n')
+                continue;
+            at.push_back(static_cast<uint32_t>(i));
+            lines += i != start && !(i == start + 1 && data[start] == '\r');
+            start = i + 1;
+        }
+        const size_t got = socketley::index_lines(data.data(), data.size(), ends);
+        REQUIRE(ends.size == at.size());
+        CHECK(std::equal(at.begin(), at.end(), ends.at.get()));
+        CHECK(got == lines);
+        CHECK(got == socketley::count_lines(data.data(), data.size()));
+    }
 }

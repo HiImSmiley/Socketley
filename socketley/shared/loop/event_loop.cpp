@@ -1870,7 +1870,7 @@ bool event_loop::submit_write_fixed_buf(int fd, const char* buf, uint32_t len, u
     return true;
 }
 
-bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size)
+bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size, uint32_t headroom)
 {
     if (group_id >= MAX_BUF_GROUPS)
         return false;
@@ -1882,18 +1882,18 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
     if (m_buf_rings[group_id].ring)
     {
         const auto& existing = m_buf_rings[group_id];
-        if (existing.buf_count != buf_count || existing.buf_size != buf_size)
+        if (existing.buf_count != buf_count || existing.buf_size != buf_size || existing.headroom != headroom)
         {
             // Reported rather than refused, because every caller reads false
             // as "no provided buffers on this loop" and drops to the slower
             // path for its whole life.
-            char msg[224];
+            char msg[288];
             snprintf(msg, sizeof(msg),
-                "buffer group %u already exists as %u x %u bytes; this runtime asked for "
-                "%u x %u and will run on the existing pool. Buffer geometry is per runtime "
+                "buffer group %u already exists as %u x %u bytes (%u free before each); this runtime asked for "
+                "%u x %u (%u) and will run on the existing pool. Buffer geometry is per runtime "
                 "type and is set by whichever instance of that type started first",
-                static_cast<unsigned>(group_id), existing.buf_count, existing.buf_size,
-                buf_count, buf_size);
+                static_cast<unsigned>(group_id), existing.buf_count, existing.buf_size, existing.headroom,
+                buf_count, buf_size, headroom);
             LOG_WARN(msg);
         }
         else if (logger::g_level <= log_debug)
@@ -1916,7 +1916,7 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
     if (!br)
         return false;
 
-    size_t total = static_cast<size_t>(buf_count) * buf_size;
+    size_t total = static_cast<size_t>(buf_count) * (static_cast<size_t>(buf_size) + headroom);
     // Align to a 2 MB huge page for TLB coverage on the buffer pool, falling
     // back to 4 K when the allocation is small.
     size_t align = (total >= 2 * 1024 * 1024) ? (2 * 1024 * 1024) : 4096;
@@ -1943,15 +1943,13 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
         (void)touch;
     }
 
-    // Register all buffers
+    m_buf_rings[group_id] = { br, base, buf_count, buf_size, headroom };
     for (uint32_t i = 0; i < buf_count; i++)
     {
-        io_uring_buf_ring_add(br, base + (static_cast<size_t>(i) * buf_size), buf_size, static_cast<uint16_t>(i),
-            io_uring_buf_ring_mask(buf_count), static_cast<int>(i));
+        io_uring_buf_ring_add(br, m_buf_rings[group_id].buf(static_cast<uint16_t>(i)), buf_size,
+            static_cast<uint16_t>(i), io_uring_buf_ring_mask(buf_count), static_cast<int>(i));
     }
     io_uring_buf_ring_advance(br, buf_count);
-
-    m_buf_rings[group_id] = { br, base, buf_count, buf_size };
     return true;
 }
 
@@ -1984,7 +1982,7 @@ char* event_loop::get_buf_ptr(uint16_t group_id, uint16_t buf_id)
     if (__builtin_expect(!pool.ring || buf_id >= pool.buf_count, 0))
         return nullptr;
 
-    return pool.base + (static_cast<size_t>(buf_id) * pool.buf_size);
+    return pool.buf(buf_id);
 }
 
 void event_loop::return_buf(uint16_t group_id, uint16_t buf_id)
@@ -1997,7 +1995,7 @@ void event_loop::return_buf(uint16_t group_id, uint16_t buf_id)
         return;
 
     io_uring_buf_ring_add(pool.ring,
-        pool.base + (static_cast<size_t>(buf_id) * pool.buf_size),
+        pool.buf(buf_id),
         pool.buf_size, buf_id,
         io_uring_buf_ring_mask(pool.buf_count), 0);
     io_uring_buf_ring_advance(pool.ring, 1);
@@ -2014,7 +2012,7 @@ void event_loop::return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, u
     {
         uint16_t bid = buf_ids[i];
         io_uring_buf_ring_add(pool.ring,
-            pool.base + (static_cast<size_t>(bid) * pool.buf_size),
+            pool.buf(bid),
             pool.buf_size, bid,
             io_uring_buf_ring_mask(pool.buf_count), static_cast<int>(i));
     }

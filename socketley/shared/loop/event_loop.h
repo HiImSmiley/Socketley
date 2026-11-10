@@ -26,6 +26,13 @@ struct buf_ring_pool
     char* base{nullptr};
     uint32_t buf_count{0};
     uint32_t buf_size{0};
+    // Bytes kept free in front of every buffer, which the kernel never writes, for a reader to put a leftover before.
+    uint32_t headroom{0};
+
+    char* buf(uint16_t id) const
+    {
+        return base + static_cast<size_t>(id) * (static_cast<size_t>(buf_size) + headroom) + headroom;
+    }
 
     // ── Consumption cursor ──────────────────────────────────────────────────
     // How many ring entries the kernel has consumed, which is the only way to
@@ -220,7 +227,7 @@ public:
     // A buffer group belongs to a runtime type and not an instance, so the
     // first instance to reach here decides the geometry and a later one asking
     // for different dimensions gets the existing pool and a warning.
-    bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);
+    bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size, uint32_t headroom = 0);
     bool submit_read_provided(int fd, uint16_t group_id, io_request* req, bool poll_first = false);
     // Cancel every pending operation on a descriptor in one SQE, counted
     // against that descriptor like any other submission because it too names a
@@ -273,6 +280,10 @@ public:
     uint32_t buf_ring_buf_size(uint16_t group_id) const
     {
         return group_id < MAX_BUF_GROUPS ? m_buf_rings[group_id].buf_size : 0;
+    }
+    uint32_t buf_ring_headroom(uint16_t group_id) const
+    {
+        return group_id < MAX_BUF_GROUPS ? m_buf_rings[group_id].headroom : 0;
     }
 
     // Every buffer of this completion sliced and returned in one place,
