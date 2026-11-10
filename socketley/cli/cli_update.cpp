@@ -496,7 +496,7 @@ int cli_update(int argc, char** argv)
     if (package.empty())
     {
         std::cout << "socketley " << current << " was not installed from a release package; update the clone it was "
-                     "built from: git pull && bash scripts/install-from-source.sh\n";
+                     "built from with bash scripts/update.sh\n";
         return 1;
     }
     if (::geteuid() != 0)

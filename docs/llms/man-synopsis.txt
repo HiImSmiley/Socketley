@@ -26,5 +26,6 @@ From the manual page socketley(1).
  **socketley** **settings** [**-a**|**--all**] [**-j**|**--json**] 
  **socketley** **help | --help | -h** 
  **socketley** **version | --version | -v** 
+ **socketley** **update** [**--check**|**--list**|**--to** *version* | *--deb* *file*] 
  **socketley** **--lua** *lua_file* 
  **socketley** **export** *dir*

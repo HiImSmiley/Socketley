@@ -3239,7 +3239,8 @@ systemd service restarted, which brings back every runtime that was running;
 the daemon's runtimes are listed once it answers. A daemon systemd does not run
 is said to need a restart. Installing takes root
 .RB ( "sudo socketley update" ),
-and a socketley built from a clone is left to the clone to update.
+and a socketley built from a clone is left to the clone's
+.BR scripts/update.sh .
 .RS
 .PP
 .B \-\-check

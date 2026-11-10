@@ -933,6 +933,12 @@ Two things are reported there. The first is a daemon whose version differs. The 
 
 The replaced file is reported only when the daemon and this CLI name the same executable path. Running the CLI from a copy elsewhere on disk reports nothing. A copy is not evidence about anybody's build, and comparing inodes across different paths would report a replaced file on every command.
 
+#### `update [--check | --list | --to version | --deb file]`
+
+Without an option, asks GitHub for the newest release, and when it is newer than the socketley that runs the command installs it: the **.deb** for this machine's architecture, preferring one named for its distribution, is checked against the SHA-256 GitHub keeps of it and against the version it says it is, installed with apt, which brings any dependency it added, and the systemd service restarted, which brings back every runtime that was running; the daemon's runtimes are listed once it answers. A daemon systemd does not run is said to need a restart. Installing takes root (**sudo socketley update**), and a socketley built from a clone is left to the clone's **scripts/update.sh**.
+
+**--check** says what is installed and what the newest release is, and changes nothing; **--list** lists the releases, newest first; **--to** installs that release, older or newer; **--deb** installs a package already on this machine, for one that cannot reach GitHub. **GITHUB_TOKEN** is sent to GitHub's API when it is set, which a private repository's releases need (**sudo -E socketley update**).
+
 #### `--lua lua_file`
 
 Loads a Lua orchestration configuration. It can configure the daemon name and cluster mode, and then creates multiple runtimes from a single config file.

@@ -92,6 +92,20 @@ nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
+### Dynamic pages: the same page in Lua and in PHP
+
+nginx + php-fpm, socketley + php-fpm, 5 passes, 2026-11-10, socketley c62f595b.
+
+| case | socketley pages | nginx + php-fpm | socketley + php-fpm | socketley vs nginx + php-fpm | socketley vs socketley + php-fpm |
+|---|---|---|---|---|---|
+| hello: a tiny page from the query, keep-alive, 64 connections | 101 K req/s (1.00 cores) | 13 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 7.41× (6.61–8.00) | 3.25× (2.94–3.45) |
+| a template of 50 items, 4 KiB, keep-alive, 64 connections | 27 K req/s (1.00 cores) | 9.2 K req/s (0.97 cores) | 20 K req/s (1.00 cores) | 2.79× (2.48–3.21) | 1.32× (1.20–1.43) |
+| JSON of 20 fields, keep-alive, 64 connections | 63 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 28 K req/s (1.00 cores) | 4.72× (4.10–5.31) | 2.14× (1.94–2.36) |
+| a form POST of 10 fields, keep-alive, 64 connections | 64 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 27 K req/s (0.99 cores) | 5.17× (4.57–5.85) | 2.31× (2.15–2.57) |
+| hello, a connection per request, 32 at once | 29 K req/s (1.00 cores) | 12 K req/s (0.98 cores) | 14 K req/s (0.99 cores) | 2.44× (2.23–2.72) | 2.04× (1.96–2.12) |
+
+How it was measured: wrk 8 threads, 6 s a run; every process of each arm on the same one core (php-fpm's workers too), wrk (8 threads) on 20 others. socketley create web --lua-pages runs each page as a .lua file in its own LuaJIT; nginx (one worker) hands the same page as a .php file to php-fpm (pm static, 8 workers, OPcache on as PHP ships it, JIT off) over a unix socket; the third arm is the same php-fpm behind socketley create web --backend fastcgi://. Every page answers the same bytes in each language, checked before each row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
+
 ## In the manual
 
 Every flag in full, and the rest: man-web-flags.txt

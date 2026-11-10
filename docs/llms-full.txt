@@ -2,7 +2,7 @@
 
 > One Linux daemon and CLI that runs your servers, proxies, caches, storage, databases, DNS, sign-in, MQTT, mail, metrics, tunnels and MCP: each a runtime made with one command.
 
-socketley is a single Linux binary. `socketley daemon` supervises runtimes; every other invocation is the CLI that talks to the daemon over a unix socket. A runtime is a network service of one of 15 types, made with `socketley create <type> <name> [flags]`, each in its own worker process on an io_uring event loop, scriptable in Lua. The manual page man/socketley.1 is the source of truth; these files are generated from it and from the site's own pages (https://docs.smileygames.online/).
+socketley is a single Linux binary. `socketley daemon` supervises runtimes; every other invocation is the CLI that talks to the daemon over a unix socket. A runtime is a network service of one of 15 types, made with `socketley create <type> <name> [flags]`, each in its own worker process on an io_uring event loop, scriptable in Lua. The manual page man/socketley.1 is the source of truth; these files are generated from it and from the site's own pages (https://hiimsmiley.github.io/Socketley/).
 
 Every page below is plain Markdown. llms-full.txt is all of them in one file (large).
 
@@ -3867,35 +3867,35 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### WebSocket: echo and a chat room's fan-out
 
-socketley, no script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.22.1), 3 passes, 2026-11-10, socketley 81ffa51e.
+socketley, Lua script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.22.1), 3 passes, 2026-11-10, socketley 81ffa51e.
 
-| case | socketley | socketley, no script | ws 8.22.0 (Node 24.22.1) | uWebSockets.js 20.71.0 (Node 24.22.1) | socketley vs socketley, no script | socketley vs ws 8.22.0 (Node 24.22.1) | socketley vs uWebSockets.js 20.71.0 (Node 24.22.1) |
+| case | socketley | socketley, Lua script | ws 8.22.0 (Node 24.22.1) | uWebSockets.js 20.71.0 (Node 24.22.1) | socketley vs socketley, Lua script | socketley vs ws 8.22.0 (Node 24.22.1) | socketley vs uWebSockets.js 20.71.0 (Node 24.22.1) |
 |---|---|---|---|---|---|---|---|
-| echo, 64 B messages, 256 connections, one in flight each | 303 K msg/s (1.00 cores) | 320 K msg/s (1.00 cores) | 151 K msg/s (1.00 cores) | 232 K msg/s (1.00 cores) | 0.95× (0.94–0.95) | 1.99× (1.97–2.03) | 1.31× (1.27–1.32) |
-| room fan-out: 1 sender to 100 receivers, 64 B | 6.13 M msg/s (1.00 cores) | 6.15 M msg/s (1.00 cores) | 305 K msg/s (1.00 cores) | 5.40 M msg/s (1.00 cores) | 0.99× (0.99–1.00) | 20.00× (19.83–20.35) | 1.13× (1.12–1.14) |
-| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.26 M msg/s (1.00 cores) | 6.25 M msg/s (1.00 cores) | 293 K msg/s (1.00 cores) | 5.73 M msg/s (1.00 cores) | 1.00× (0.99–1.03) | 21.78× (21.32–22.57) | 1.09× (1.09–1.12) |
+| echo, 64 B messages, 256 connections, one in flight each | 320 K msg/s (1.00 cores) | 303 K msg/s (1.00 cores) | 151 K msg/s (1.00 cores) | 232 K msg/s (1.00 cores) | 1.05× (1.05–1.07) | 2.09× (2.08–2.17) | 1.38× (1.34–1.41) |
+| room fan-out: 1 sender to 100 receivers, 64 B | 6.15 M msg/s (1.00 cores) | 6.13 M msg/s (1.00 cores) | 305 K msg/s (1.00 cores) | 5.40 M msg/s (1.00 cores) | 1.01× (1.00–1.01) | 20.27× (20.10–20.44) | 1.14× (1.13–1.15) |
+| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.25 M msg/s (1.00 cores) | 6.26 M msg/s (1.00 cores) | 293 K msg/s (1.00 cores) | 5.73 M msg/s (1.00 cores) | 1.00× (0.97–1.01) | 21.28× (21.19–22.75) | 1.09× (1.09–1.10) |
 
-How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others. The same logic in each: an echo, and a room that a receiver enters by sending "join", with one sender's messages counted at every receiver. socketley runs it in Lua (join_group/group_send) and, as "no script", on its built-in relay; ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes.
+How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others. The same logic in each: an echo, and a room that a receiver enters by sending "join", with one sender's messages counted at every receiver. socketley runs it on its built-in relay, and as "socketley, Lua script" in Lua (join_group/group_send); ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes.
 
 ### TCP line protocol, answered by a handler
 
-socketley, no script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-10, socketley 81ffa51e.
+socketley, Lua script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-10, socketley 81ffa51e.
 
-| case | socketley | socketley, no script | Node 24.22.1 net | Go 1.24.6 net | socketley vs socketley, no script | socketley vs Node 24.22.1 net | socketley vs Go 1.24.6 net |
+| case | socketley | socketley, Lua script | Node 24.22.1 net | Go 1.24.6 net | socketley vs socketley, Lua script | socketley vs Node 24.22.1 net | socketley vs Go 1.24.6 net |
 |---|---|---|---|---|---|---|---|
-| line echo, 64 B, 256 connections, one in flight each | 313 K msg/s (1.00 cores) | 329 K msg/s (1.00 cores) | 199 K msg/s (1.00 cores) | 227 K msg/s (1.00 cores) | 0.95× (0.95–0.95) | 1.57× (1.57–1.60) | 1.38× (1.38–1.39) |
-| line echo, 64 B, 64 connections, 16 pipelined each | 4.48 M msg/s (1.00 cores) | 4.63 M msg/s (1.00 cores) | 2.32 M msg/s (1.00 cores) | 3.24 M msg/s (1.00 cores) | 0.96× (0.95–0.97) | 1.94× (1.91–1.95) | 1.38× (1.37–1.39) |
+| line echo, 64 B, 256 connections, one in flight each | 329 K msg/s (1.00 cores) | 313 K msg/s (1.00 cores) | 199 K msg/s (1.00 cores) | 227 K msg/s (1.00 cores) | 1.05× (1.05–1.05) | 1.65× (1.64–1.68) | 1.46× (1.44–1.46) |
+| line echo, 64 B, 64 connections, 16 pipelined each | 4.63 M msg/s (1.00 cores) | 4.48 M msg/s (1.00 cores) | 2.32 M msg/s (1.00 cores) | 3.24 M msg/s (1.00 cores) | 1.04× (1.03–1.05) | 2.00× (1.99–2.05) | 1.43× (1.42–1.46) |
 
-How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen on 20 others. Every line is answered with itself by a handler: on socketley a Lua on_client_messages, handed a read's lines in one call and answering them with one self.send; on Node's net a function over the read's lines, written with one write a read; in Go a goroutine with bufio. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work, where a script with on_client_message, a call and a string a line, makes about 3.2 million a second.
+How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen on 20 others. Every line is answered with itself by a handler: socketley's built-in echo, and as "socketley, Lua script" a Lua on_client_messages, handed a read's lines in one call and answering them with one self.send; on Node's net a function over the read's lines, written with one write a read; in Go a goroutine with bufio. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work, where a script with on_client_message, a call and a string a line, makes about 3.2 million a second.
 
 ### UDP datagrams answered
 
-Node 24.22.1 dgram, Go 1.24.6 net, socketley, Lua, 3 passes, 2026-11-10, socketley 81ffa51e.
+socketley, Lua script, Node 24.22.1 dgram, Go 1.24.6 net, 3 passes, 2026-11-10, socketley 81ffa51e.
 
-| case | socketley, no script | Node 24.22.1 dgram | Go 1.24.6 net | socketley, Lua | socketley vs Node 24.22.1 dgram | socketley vs Go 1.24.6 net | socketley vs socketley, Lua |
+| case | socketley | socketley, Lua script | Node 24.22.1 dgram | Go 1.24.6 net | socketley vs socketley, Lua script | socketley vs Node 24.22.1 dgram | socketley vs Go 1.24.6 net |
 |---|---|---|---|---|---|---|---|
-| datagram echo, 64 B, 128 sockets, one in flight each | 523 K datagrams/s (1.00 cores) | 162 K datagrams/s (1.00 cores) | 430 K datagrams/s (1.00 cores) | 447 K datagrams/s (1.00 cores) | 3.22× (3.12–3.22) | 1.20× (1.19–1.22) | 1.16× (1.15–1.17) |
-| datagram echo, 1 KiB, 128 sockets, one in flight each | 497 K datagrams/s (1.00 cores) | 191 K datagrams/s (1.00 cores) | 413 K datagrams/s (1.00 cores) | 404 K datagrams/s (1.00 cores) | 2.60× (2.58–2.66) | 1.20× (1.20–1.22) | 1.23× (1.23–1.24) |
+| datagram echo, 64 B, 128 sockets, one in flight each | 523 K datagrams/s (1.00 cores) | 447 K datagrams/s (1.00 cores) | 162 K datagrams/s (1.00 cores) | 430 K datagrams/s (1.00 cores) | 1.16× (1.15–1.17) | 3.22× (3.12–3.22) | 1.20× (1.19–1.22) |
+| datagram echo, 1 KiB, 128 sockets, one in flight each | 497 K datagrams/s (1.00 cores) | 404 K datagrams/s (1.00 cores) | 191 K datagrams/s (1.00 cores) | 413 K datagrams/s (1.00 cores) | 1.23× (1.23–1.24) | 2.60× (2.58–2.66) | 1.20× (1.20–1.22) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen (128 sockets) on 20 others. Node and Go are given the 1 MiB receive buffer socketley sets; at the kernel's default they lost datagrams at 1 KiB. No arm lost any.
 
@@ -4348,6 +4348,20 @@ nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 | 10,000 pages of 4 KiB at random | 237 K req/s (1.00 cores) | 52 K req/s (1.00 cores) | 4.58× (4.57–4.85) |
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
+
+### Dynamic pages: the same page in Lua and in PHP
+
+nginx + php-fpm, socketley + php-fpm, 5 passes, 2026-11-10, socketley c62f595b.
+
+| case | socketley pages | nginx + php-fpm | socketley + php-fpm | socketley vs nginx + php-fpm | socketley vs socketley + php-fpm |
+|---|---|---|---|---|---|
+| hello: a tiny page from the query, keep-alive, 64 connections | 101 K req/s (1.00 cores) | 13 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 7.41× (6.61–8.00) | 3.25× (2.94–3.45) |
+| a template of 50 items, 4 KiB, keep-alive, 64 connections | 27 K req/s (1.00 cores) | 9.2 K req/s (0.97 cores) | 20 K req/s (1.00 cores) | 2.79× (2.48–3.21) | 1.32× (1.20–1.43) |
+| JSON of 20 fields, keep-alive, 64 connections | 63 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 28 K req/s (1.00 cores) | 4.72× (4.10–5.31) | 2.14× (1.94–2.36) |
+| a form POST of 10 fields, keep-alive, 64 connections | 64 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 27 K req/s (0.99 cores) | 5.17× (4.57–5.85) | 2.31× (2.15–2.57) |
+| hello, a connection per request, 32 at once | 29 K req/s (1.00 cores) | 12 K req/s (0.98 cores) | 14 K req/s (0.99 cores) | 2.44× (2.23–2.72) | 2.04× (1.96–2.12) |
+
+How it was measured: wrk 8 threads, 6 s a run; every process of each arm on the same one core (php-fpm's workers too), wrk (8 threads) on 20 others. socketley create web --lua-pages runs each page as a .lua file in its own LuaJIT; nginx (one worker) hands the same page as a .php file to php-fpm (pm static, 8 workers, OPcache on as PHP ships it, JIT off) over a unix socket; the third arm is the same php-fpm behind socketley create web --backend fastcgi://. Every page answers the same bytes in each language, checked before each row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ## In the manual
 
@@ -4913,35 +4927,35 @@ How it was measured: 3 redis-benchmark processes × 50 connections, 100 commands
 
 ## WebSocket: echo and a chat room's fan-out
 
-socketley, no script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.22.1), 3 passes, 2026-11-10, socketley 81ffa51e.
+socketley, Lua script, ws 8.22.0 (Node 24.22.1), uWebSockets.js 20.71.0 (Node 24.22.1), 3 passes, 2026-11-10, socketley 81ffa51e.
 
-| case | socketley | socketley, no script | ws 8.22.0 (Node 24.22.1) | uWebSockets.js 20.71.0 (Node 24.22.1) | socketley vs socketley, no script | socketley vs ws 8.22.0 (Node 24.22.1) | socketley vs uWebSockets.js 20.71.0 (Node 24.22.1) |
+| case | socketley | socketley, Lua script | ws 8.22.0 (Node 24.22.1) | uWebSockets.js 20.71.0 (Node 24.22.1) | socketley vs socketley, Lua script | socketley vs ws 8.22.0 (Node 24.22.1) | socketley vs uWebSockets.js 20.71.0 (Node 24.22.1) |
 |---|---|---|---|---|---|---|---|
-| echo, 64 B messages, 256 connections, one in flight each | 303 K msg/s (1.00 cores) | 320 K msg/s (1.00 cores) | 151 K msg/s (1.00 cores) | 232 K msg/s (1.00 cores) | 0.95× (0.94–0.95) | 1.99× (1.97–2.03) | 1.31× (1.27–1.32) |
-| room fan-out: 1 sender to 100 receivers, 64 B | 6.13 M msg/s (1.00 cores) | 6.15 M msg/s (1.00 cores) | 305 K msg/s (1.00 cores) | 5.40 M msg/s (1.00 cores) | 0.99× (0.99–1.00) | 20.00× (19.83–20.35) | 1.13× (1.12–1.14) |
-| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.26 M msg/s (1.00 cores) | 6.25 M msg/s (1.00 cores) | 293 K msg/s (1.00 cores) | 5.73 M msg/s (1.00 cores) | 1.00× (0.99–1.03) | 21.78× (21.32–22.57) | 1.09× (1.09–1.12) |
+| echo, 64 B messages, 256 connections, one in flight each | 320 K msg/s (1.00 cores) | 303 K msg/s (1.00 cores) | 151 K msg/s (1.00 cores) | 232 K msg/s (1.00 cores) | 1.05× (1.05–1.07) | 2.09× (2.08–2.17) | 1.38× (1.34–1.41) |
+| room fan-out: 1 sender to 100 receivers, 64 B | 6.15 M msg/s (1.00 cores) | 6.13 M msg/s (1.00 cores) | 305 K msg/s (1.00 cores) | 5.40 M msg/s (1.00 cores) | 1.01× (1.00–1.01) | 20.27× (20.10–20.44) | 1.14× (1.13–1.15) |
+| room fan-out: 1 sender to 1,000 receivers, 64 B | 6.25 M msg/s (1.00 cores) | 6.26 M msg/s (1.00 cores) | 293 K msg/s (1.00 cores) | 5.73 M msg/s (1.00 cores) | 1.00× (0.97–1.01) | 21.28× (21.19–22.75) | 1.09× (1.09–1.10) |
 
-How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others. The same logic in each: an echo, and a room that a receiver enters by sending "join", with one sender's messages counted at every receiver. socketley runs it in Lua (join_group/group_send) and, as "no script", on its built-in relay; ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes.
+How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others. The same logic in each: an echo, and a room that a receiver enters by sending "join", with one sender's messages counted at every receiver. socketley runs it on its built-in relay, and as "socketley, Lua script" in Lua (join_group/group_send); ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes.
 
 ## TCP line protocol, answered by a handler
 
-socketley, no script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-10, socketley 81ffa51e.
+socketley, Lua script, Node 24.22.1 net, Go 1.24.6 net, 3 passes, 2026-11-10, socketley 81ffa51e.
 
-| case | socketley | socketley, no script | Node 24.22.1 net | Go 1.24.6 net | socketley vs socketley, no script | socketley vs Node 24.22.1 net | socketley vs Go 1.24.6 net |
+| case | socketley | socketley, Lua script | Node 24.22.1 net | Go 1.24.6 net | socketley vs socketley, Lua script | socketley vs Node 24.22.1 net | socketley vs Go 1.24.6 net |
 |---|---|---|---|---|---|---|---|
-| line echo, 64 B, 256 connections, one in flight each | 313 K msg/s (1.00 cores) | 329 K msg/s (1.00 cores) | 199 K msg/s (1.00 cores) | 227 K msg/s (1.00 cores) | 0.95× (0.95–0.95) | 1.57× (1.57–1.60) | 1.38× (1.38–1.39) |
-| line echo, 64 B, 64 connections, 16 pipelined each | 4.48 M msg/s (1.00 cores) | 4.63 M msg/s (1.00 cores) | 2.32 M msg/s (1.00 cores) | 3.24 M msg/s (1.00 cores) | 0.96× (0.95–0.97) | 1.94× (1.91–1.95) | 1.38× (1.37–1.39) |
+| line echo, 64 B, 256 connections, one in flight each | 329 K msg/s (1.00 cores) | 313 K msg/s (1.00 cores) | 199 K msg/s (1.00 cores) | 227 K msg/s (1.00 cores) | 1.05× (1.05–1.05) | 1.65× (1.64–1.68) | 1.46× (1.44–1.46) |
+| line echo, 64 B, 64 connections, 16 pipelined each | 4.63 M msg/s (1.00 cores) | 4.48 M msg/s (1.00 cores) | 2.32 M msg/s (1.00 cores) | 3.24 M msg/s (1.00 cores) | 1.04× (1.03–1.05) | 2.00× (1.99–2.05) | 1.43× (1.42–1.46) |
 
-How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen on 20 others. Every line is answered with itself by a handler: on socketley a Lua on_client_messages, handed a read's lines in one call and answering them with one self.send; on Node's net a function over the read's lines, written with one write a read; in Go a goroutine with bufio. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work, where a script with on_client_message, a call and a string a line, makes about 3.2 million a second.
+How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen on 20 others. Every line is answered with itself by a handler: socketley's built-in echo, and as "socketley, Lua script" a Lua on_client_messages, handed a read's lines in one call and answering them with one self.send; on Node's net a function over the read's lines, written with one write a read; in Go a goroutine with bufio. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work, where a script with on_client_message, a call and a string a line, makes about 3.2 million a second.
 
 ## UDP datagrams answered
 
-Node 24.22.1 dgram, Go 1.24.6 net, socketley, Lua, 3 passes, 2026-11-10, socketley 81ffa51e.
+socketley, Lua script, Node 24.22.1 dgram, Go 1.24.6 net, 3 passes, 2026-11-10, socketley 81ffa51e.
 
-| case | socketley, no script | Node 24.22.1 dgram | Go 1.24.6 net | socketley, Lua | socketley vs Node 24.22.1 dgram | socketley vs Go 1.24.6 net | socketley vs socketley, Lua |
+| case | socketley | socketley, Lua script | Node 24.22.1 dgram | Go 1.24.6 net | socketley vs socketley, Lua script | socketley vs Node 24.22.1 dgram | socketley vs Go 1.24.6 net |
 |---|---|---|---|---|---|---|---|
-| datagram echo, 64 B, 128 sockets, one in flight each | 523 K datagrams/s (1.00 cores) | 162 K datagrams/s (1.00 cores) | 430 K datagrams/s (1.00 cores) | 447 K datagrams/s (1.00 cores) | 3.22× (3.12–3.22) | 1.20× (1.19–1.22) | 1.16× (1.15–1.17) |
-| datagram echo, 1 KiB, 128 sockets, one in flight each | 497 K datagrams/s (1.00 cores) | 191 K datagrams/s (1.00 cores) | 413 K datagrams/s (1.00 cores) | 404 K datagrams/s (1.00 cores) | 2.60× (2.58–2.66) | 1.20× (1.20–1.22) | 1.23× (1.23–1.24) |
+| datagram echo, 64 B, 128 sockets, one in flight each | 523 K datagrams/s (1.00 cores) | 447 K datagrams/s (1.00 cores) | 162 K datagrams/s (1.00 cores) | 430 K datagrams/s (1.00 cores) | 1.16× (1.15–1.17) | 3.22× (3.12–3.22) | 1.20× (1.19–1.22) |
+| datagram echo, 1 KiB, 128 sockets, one in flight each | 497 K datagrams/s (1.00 cores) | 404 K datagrams/s (1.00 cores) | 191 K datagrams/s (1.00 cores) | 413 K datagrams/s (1.00 cores) | 1.23× (1.23–1.24) | 2.60× (2.58–2.66) | 1.20× (1.20–1.22) |
 
 How it was measured: srvgen (Go), 4 s a run, every answer checked; each server on one core, srvgen (128 sockets) on 20 others. Node and Go are given the 1 MiB receive buffer socketley sets; at the kernel's default they lost datagrams at 1 KiB. No arm lost any.
 
@@ -5252,6 +5266,20 @@ socat 1.8.1.1, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 How it was measured: clientgen target (Go) on 2-5, every client arm on core 8, 3 s windows; the shell loop on one core, the Go sink on four others. As above, to a TLS service: socketley's connection is held and verified once, socat makes a verified handshake per line (nodelay; without it every line waited 40 ms).
 
+## Dynamic pages: the same page in Lua and in PHP
+
+nginx + php-fpm, socketley + php-fpm, 5 passes, 2026-11-10, socketley c62f595b.
+
+| case | socketley pages | nginx + php-fpm | socketley + php-fpm | socketley vs nginx + php-fpm | socketley vs socketley + php-fpm |
+|---|---|---|---|---|---|
+| hello: a tiny page from the query, keep-alive, 64 connections | 101 K req/s (1.00 cores) | 13 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 7.41× (6.61–8.00) | 3.25× (2.94–3.45) |
+| a template of 50 items, 4 KiB, keep-alive, 64 connections | 27 K req/s (1.00 cores) | 9.2 K req/s (0.97 cores) | 20 K req/s (1.00 cores) | 2.79× (2.48–3.21) | 1.32× (1.20–1.43) |
+| JSON of 20 fields, keep-alive, 64 connections | 63 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 28 K req/s (1.00 cores) | 4.72× (4.10–5.31) | 2.14× (1.94–2.36) |
+| a form POST of 10 fields, keep-alive, 64 connections | 64 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 27 K req/s (0.99 cores) | 5.17× (4.57–5.85) | 2.31× (2.15–2.57) |
+| hello, a connection per request, 32 at once | 29 K req/s (1.00 cores) | 12 K req/s (0.98 cores) | 14 K req/s (0.99 cores) | 2.44× (2.23–2.72) | 2.04× (1.96–2.12) |
+
+How it was measured: wrk 8 threads, 6 s a run; every process of each arm on the same one core (php-fpm's workers too), wrk (8 threads) on 20 others. socketley create web --lua-pages runs each page as a .lua file in its own LuaJIT; nginx (one worker) hands the same page as a .php file to php-fpm (pm static, 8 workers, OPcache on as PHP ships it, JIT off) over a unix socket; the third arm is the same php-fpm behind socketley create web --backend fastcgi://. Every page answers the same bytes in each language, checked before each row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
+
 
 ---
 
@@ -5470,6 +5498,7 @@ From the manual page socketley(1).
  **socketley** **settings** [**-a**|**--all**] [**-j**|**--json**] 
  **socketley** **help | --help | -h** 
  **socketley** **version | --version | -v** 
+ **socketley** **update** [**--check**|**--list**|**--to** *version* | *--deb* *file*] 
  **socketley** **--lua** *lua_file* 
  **socketley** **export** *dir*
 
@@ -6429,6 +6458,12 @@ Prints the socketley version number and exits. It does not require or start a da
 Two things are reported there. The first is a daemon whose version differs. The second is a daemon still executing a file that has since been replaced at the path it was started from. The version alone cannot show that, because it is one compile-time literal that every build of a release carries. The second case is what ordinarily happens when you rebuild while a daemon holds its runtimes. It is also why a daemon reporting the same version as the binary can reject a new flag that the binary has.
 
 The replaced file is reported only when the daemon and this CLI name the same executable path. Running the CLI from a copy elsewhere on disk reports nothing. A copy is not evidence about anybody's build, and comparing inodes across different paths would report a replaced file on every command.
+
+#### `update [--check | --list | --to version | --deb file]`
+
+Without an option, asks GitHub for the newest release, and when it is newer than the socketley that runs the command installs it: the **.deb** for this machine's architecture, preferring one named for its distribution, is checked against the SHA-256 GitHub keeps of it and against the version it says it is, installed with apt, which brings any dependency it added, and the systemd service restarted, which brings back every runtime that was running; the daemon's runtimes are listed once it answers. A daemon systemd does not run is said to need a restart. Installing takes root (**sudo socketley update**), and a socketley built from a clone is left to the clone's **scripts/update.sh**.
+
+**--check** says what is installed and what the newest release is, and changes nothing; **--list** lists the releases, newest first; **--to** installs that release, older or newer; **--deb** installs a package already on this machine, for one that cannot reach GitHub. **GITHUB_TOKEN** is sent to GitHub's API when it is set, which a private repository's releases need (**sudo -E socketley update**).
 
 #### `--lua lua_file`
 
@@ -11597,7 +11632,7 @@ A **.lua** file under **--root** is run as a page that answers its address, rath
 
 ### `--backend fastcgi://unix:path | fastcgi://a.b.c.d:port`
 
-The FastCGI server, php-fpm, that a **.php** file under **--root** is run by, as a FastCGI proxy's **--backend** names one. The first segment of an address that ends in **.php** and is a script runs it, and what follows is **PATH_INFO**: **/shop/cart.php/extra** runs shop/cart.php. A file answers first and is served by the runtime itself, with its caching and compression; a directory with no index.html is its index.php, and an address nothing answers is the root's index.php, as a front controller routes every address it was not given. A script takes every method and a body of up to 8 MiB, and its answer is held whole, up to 64 MiB, to be sent with its length; a larger download is a file the site serves, or a FastCGI proxy's to stream. A script gets a connection of its own, which the server closes once it has answered, so a php-fpm worker is free the moment its script is done, and has 60 seconds to answer before the request is answered **504**. A server that cannot be reached, or answers what is not FastCGI, is a **502**, and what a script writes to its error stream goes to the log. A **.php** file's source is never sent, nor a file a site keeps beside its scripts and never means to hand out: **.inc**, **.sql**, **.ini**, **.log**, **.phtml**, **.bak**, an editor's **~** copy, or a **.php.** in a name, such as **wp-config.php.bak**.
+The FastCGI server, php-fpm, that a **.php** file under **--root** is run by, as a FastCGI proxy's **--backend** names one. The first segment of an address that ends in **.php** and is a script runs it, and what follows is **PATH_INFO**: **/shop/cart.php/extra** runs shop/cart.php. A file answers first and is served by the runtime itself, with its caching and compression; a directory with no index.html is its index.php, and an address nothing answers is the root's index.php, as a front controller routes every address it was not given. A script takes every method and a body of up to 8 MiB. An answer that ends within 64 KiB is sent with its length, and gzipped as a page's is; a longer one goes as it comes, chunked (to the close for an HTTP/1.0 client), and the server is read from only as fast as the client takes it. A script gets a connection of its own, which the server closes once it has answered, so a php-fpm worker is free the moment its script is done, and has 60 seconds to begin its answer before the request is answered **504**. A server that cannot be reached, or answers what is not FastCGI, is a **502**, and what a script writes to its error stream goes to the log. A **.php** file's source is never sent, nor a file a site keeps beside its scripts and never means to hand out: **.inc**, **.sql**, **.ini**, **.log**, **.phtml**, **.bak**, an editor's **~** copy, or a **.php.** in a name, such as **wp-config.php.bak**.
 
 ### `--fastcgi-root directory`
 
@@ -12265,7 +12300,7 @@ local name = req.get.name or "world"
 echo("<h1>Hello, ", escape(name), "</h1>")
 ```
 
-A page's environment keeps one request's globals from the next, and from another waiting at the same time; it is no sandbox. A page reaches what any script does through **_G**, a module it **require**s is shared by every request of its runtime, and state that has to outlast a request belongs in a cache or db runtime, since every shard of a **--shards** runtime runs its pages in a state of its own. A page that computes holds the other requests of its shard while it runs, for as long as the callback deadline lets it.
+A page's environment keeps one request's globals from the next, and from another waiting at the same time; it is no sandbox. **include**, **render** and **session** find their request by the coroutine it runs on, so they are called from the page, a file it includes or a module it requires, and not from a coroutine the page makes, where they say so. A page reaches what any script does through **_G**, a module it **require**s is shared by every request of its runtime, and state that has to outlast a request belongs in a cache or db runtime, since every shard of a **--shards** runtime runs its pages in a state of its own. A page that computes holds the other requests of its shard while it runs, for as long as the callback deadline lets it.
 
 A page runs on a coroutine: one that asks **socketley.db**, **socketley.storage**, **socketley.mqtt**, **socketley.mail** or **socketley.http** waits for the answer while the runtime serves its other requests, and its connection reads nothing more until the page has answered. A page whose runtime stops while it waits is not answered.
 
