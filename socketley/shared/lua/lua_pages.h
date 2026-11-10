@@ -28,6 +28,8 @@ struct cache
         off_t   size{};
         int64_t sec{};
         long    nsec{};
+        // The site's generation it was last found current at.
+        uint64_t seen{0};
     };
     const lua_context* ctx{nullptr};
     std::unordered_map<std::string, version, string_hash, std::equal_to<>> compiled;
@@ -36,6 +38,9 @@ struct cache
     // The root include() reads beneath, its owner's own descriptor, so a release swapped in is the one a page that
     // waited reads after it.
     const int* root{nullptr};
+    // What its owner says of the files under the root: a number that changes whenever any of them may have, so a
+    // file found current at it is current still and is not asked of the disk again; 0 when it cannot say.
+    uint64_t site_gen{0};
 };
 
 }   // namespace socketley::lua_pages

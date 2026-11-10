@@ -524,6 +524,8 @@ void web_run::on_watch(int64_t res)
 
 void web_run::forget_all()
 {
+    // Every page is asked of the disk again the next time it runs.
+    ++m_site_gen;
     m_entries.clear();
     m_not_found.reset();
     m_fallback_entry.reset();
@@ -1157,6 +1159,8 @@ bool web_run::run_page(const std::shared_ptr<web_conn>& c, std::string_view meth
     lua_context* lua = m_owner.lua();
     if (!lua || !lp::page_name(page, rel))
         return false;
+    // inotify says when a file under the root changed; without it every page is asked of the disk on every request.
+    m_page_cache->site_gen = m_watching ? m_site_gen : 0;
     lp::request req;
     req.method = method;
     req.path = path;

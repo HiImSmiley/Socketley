@@ -480,6 +480,25 @@ enum class loaded
 loaded load_factory(lua_State* L, cache& c, int root_fd, const std::string& rel, std::string& why,
                     bool as_template = false)
 {
+    const char* const table = as_template ? "socketley.templates" : "socketley.pages";
+    auto& known = as_template ? c.templates : c.compiled;
+    // Found current since the site last changed: the compiled one, with nothing asked of the disk.
+    if (c.site_gen != 0)
+        if (const auto it = known.find(rel); it != known.end() && it->second.seen == c.site_gen)
+        {
+            lua_getfield(L, LUA_REGISTRYINDEX, table);
+            if (lua_istable(L, -1))
+            {
+                lua_getfield(L, -1, rel.c_str());
+                if (lua_isfunction(L, -1))
+                {
+                    lua_remove(L, -2);
+                    return loaded::ok;
+                }
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+        }
     struct open_how how{};
     how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC);
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
@@ -494,8 +513,6 @@ loaded load_factory(lua_State* L, cache& c, int root_fd, const std::string& rel,
         return loaded::missing;
     }
 
-    const char* const table = as_template ? "socketley.templates" : "socketley.pages";
-    auto& known = as_template ? c.templates : c.compiled;
     lua_getfield(L, LUA_REGISTRYINDEX, table);
     if (!lua_istable(L, -1))
     {
@@ -506,12 +523,14 @@ loaded load_factory(lua_State* L, cache& c, int root_fd, const std::string& rel,
     }
     const int pages = lua_gettop(L);
 
-    const cache::version v{st.st_dev, st.st_ino, st.st_size, st.st_mtim.tv_sec, st.st_mtim.tv_nsec};
+    const cache::version v{st.st_dev, st.st_ino, st.st_size, st.st_mtim.tv_sec, st.st_mtim.tv_nsec, c.site_gen};
     const auto it = known.find(rel);
     const bool fresh = it != known.end() && it->second.dev == v.dev && it->second.ino == v.ino &&
                        it->second.size == v.size && it->second.sec == v.sec && it->second.nsec == v.nsec;
     lua_getfield(L, pages, rel.c_str());
-    if (!fresh || !lua_isfunction(L, -1))
+    if (fresh && lua_isfunction(L, -1))
+        it->second.seen = c.site_gen;
+    else
     {
         lua_pop(L, 1);
         // The file as the body of a function the factory returns, on its first line so the page's line numbers

@@ -230,6 +230,8 @@ private:
     // --lua-pages, and the version of each page compiled into the runtime's Lua state.
     bool m_pages{false};
     std::unique_ptr<socketley::lua_pages::cache> m_page_cache;
+    // Moved on by every change inotify reports, which is what lets a page found current skip the disk.
+    uint64_t m_site_gen{1};
     // --backend: the FastCGI server .php files are run by, and --root as it sees it.
     bool m_php{false};
     fcgi_target m_fcgi;

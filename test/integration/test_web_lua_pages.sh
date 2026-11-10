@@ -23,7 +23,7 @@ P=$((SL_PORT_BASE+1976)); P2=$((SL_PORT_BASE+1977)); P3=$((SL_PORT_BASE+1978)); 
 PH=$((SL_PORT_BASE+1980))
 NAMES="pages plainweb router sharded"
 W="$SOCKETLEY_TMPD/www"
-mkdir -p "$W/sub" "$W/both" "$W/_lib" "$W/_next" "$W/_parts"
+mkdir -p "$W/sub" "$W/both" "$W/_lib" "$W/_next" "$W/_parts" "$W/_views"
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -83,6 +83,8 @@ cat > "$W/hdr.lua" <<'EOF'
 return { headers = { ["X-Bad"] = "a\r\nInjected: yes", ["Content-Length"] = "1", ["X-Ok"] = "fine" }, body = "hdr" }
 EOF
 echo 'echo("route ", req.method, " ", req.path)' > "$W/app.lua"
+echo 'one {{ x }}' > "$W/_views/v.tpl"
+echo 'return render("_views/v.tpl", { x = "x" })' > "$W/vt.lua"
 cat > "$W/esc.lua" <<'EOF'
 echo(escape([[a&b<c>d"e'f]]), "|", escape(42), "|", escape("plain"))
 echo("|", url_decode("a+b%41%4a%zz%4"), "|", url_decode("plain"))
@@ -179,6 +181,9 @@ check "v1 before the edit" "v1" "$(get /edit.lua)"
 sleep 1.1   # a second apart, so the mtime differs on a filesystem that keeps whole seconds
 echo 'echo("v2, longer")' > "$W/edit.lua"
 check "an edited page is compiled again" "v2, longer" "$(get /edit.lua)"
+check "a template before its edit" "one x" "$(get /vt.lua)"
+echo 'two {{ x }}' > "$W/_views/v.tpl"
+check "and an edited template, which the page was not asked about again until the site changed" "two x" "$(get /vt.lua)"
 
 check "query, form, cookies and headers are read" "a=1 tags=x,y name=- sid=abc ua=probe/1" \
     "$(get '/form.lua?a=1&tag%5B%5D=x&tag[]=y' -H 'Cookie: sid=abc; other=z' -A probe/1)"
