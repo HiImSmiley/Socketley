@@ -83,6 +83,10 @@ cat > "$W/hdr.lua" <<'EOF'
 return { headers = { ["X-Bad"] = "a\r\nInjected: yes", ["Content-Length"] = "1", ["X-Ok"] = "fine" }, body = "hdr" }
 EOF
 echo 'echo("route ", req.method, " ", req.path)' > "$W/app.lua"
+cat > "$W/inco.lua" <<'EOF'
+local ok, why = coroutine.resume(coroutine.create(function() return render("_views/v.tpl", { x = 1 }) end))
+echo(tostring(ok), " ", tostring(why):match("call it from the page itself") and "said" or tostring(why))
+EOF
 echo 'one {{ x }}' > "$W/_views/v.tpl"
 echo 'return render("_views/v.tpl", { x = "x" })' > "$W/vt.lua"
 cat > "$W/esc.lua" <<'EOF'
@@ -181,6 +185,7 @@ check "v1 before the edit" "v1" "$(get /edit.lua)"
 sleep 1.1   # a second apart, so the mtime differs on a filesystem that keeps whole seconds
 echo 'echo("v2, longer")' > "$W/edit.lua"
 check "an edited page is compiled again" "v2, longer" "$(get /edit.lua)"
+check "render from a coroutine the page made says where to call it from" "false said" "$(get /inco.lua)"
 check "a template before its edit" "one x" "$(get /vt.lua)"
 echo 'two {{ x }}' > "$W/_views/v.tpl"
 check "and an edited template, which the page was not asked about again until the site changed" "two x" "$(get /vt.lua)"

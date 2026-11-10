@@ -20787,7 +20787,14 @@ echo("<h1>Hello, ", escape(name), "</h1>")
 .fi
 .IP
 A page's environment keeps one request's globals from the next, and from
-another waiting at the same time; it is no sandbox. A page reaches what any
+another waiting at the same time; it is no sandbox.
+.BR include ,
+.B render
+and
+.B session
+find their request by the coroutine it runs on, so they are called from the
+page, a file it includes or a module it requires, and not from a coroutine the
+page makes, where they say so. A page reaches what any
 script does through
 .BR _G ,
 a module it

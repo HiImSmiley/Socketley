@@ -163,12 +163,117 @@ local function path_of(v, a, b, c, d, ...)
   return v
 end
 
+-- What a request's own helpers find of it: its state, by the coroutine it runs on, which is its own for as long as it
+-- runs and waits, so the helpers below are made once and not for every request.
+local co_running = coroutine.running
+local states = setmetatable({}, { __mode = "k" })
+local function state(fn)
+  local st = states[co_running()]
+  if not st then error(fn .. ": call it from the page itself, not from a coroutine the page made", 3) end
+  return st
+end
+
+local function raw(s) return setmetatable({ tostring(s) }, safe_mt) end
+
+-- A file under the root run in this request's environment, with what it returns, as a page's head and foot are.
+local function include(name, ...)
+  local st = state("include")
+  local f = st.load(name)
+  setfenv(f, st.env)
+  return f()(...)
+end
+
+-- A template under the root filled with `values`, and the page's helpers beside them, as HTML.
+local function render(name, values)
+  local st = state("render")
+  local f = st.tload(name)
+  local b = {}
+  local function o(s) b[#b + 1] = s end
+  local function v(x, src, dflt, israw)
+    if type(x) == "table" and getmetatable(x) == safe_mt then b[#b + 1] = x[1]; return end
+    if type(x) == "table" then
+      local words = {}
+      for i, e in ipairs(x) do
+        if type(e) ~= "string" and type(e) ~= "number" then
+          error("{{" .. src .. "}} is a list of tables, which {% for %} walks", 2)
+        end
+        words[i] = tostring(e)
+      end
+      if #words == 0 and next(x) ~= nil then error("{{" .. src .. "}} is a table, not a value", 2) end
+      x = concat(words, ", ")
+    end
+    if x == nil or x == false or x == "" then
+      if not dflt then return end
+      x = dflt
+    end
+    -- A number is never anything to escape.
+    if israw or type(x) == "number" then b[#b + 1] = tostring(x) else b[#b + 1] = escape(x) end
+  end
+  local tenv = setmetatable(values or {}, { __index = st.env })
+  setfenv(f, tenv)
+  f()(o, v, path_of, tenv)
+  return concat(b)
+end
+
+-- A session: a table kept in a cache runtime under the id its cookie carries, made anew for an id the cache does not
+-- hold, so a client can never pick its own.
+local ids = setmetatable({}, { __mode = "k" })
+local function ask(c, line)
+  local v, why = socketley.cache.command(c, line)
+  if v == nil then error("session: " .. tostring(why), 3) end
+  return v
+end
+local session = {}
+function session.open(cache, o)
+  local st = state("session.open")
+  o = o or {}
+  o.cache, o.cookie, o.ttl = cache, o.cookie or "sid", o.ttl or 86400
+  local id = st.req.cookies[o.cookie]
+  local data
+  if type(id) == "string" and #id == 32 and match(id, "^%x+$") then
+    local v = ask(cache, "get session:" .. id)
+    if v ~= "nil" then data = json_decode(v) end
+  end
+  if type(data) ~= "table" then data, id = {}, nil end
+  ids[data] = { cache = o.cache, id = id, o = o, env = st.env }
+  return data
+end
+function session.save(s)
+  local k = ids[s]
+  if not k then error("session.save: not a table session.open gave", 2) end
+  k.id = k.id or random_hex(16)
+  if not k.id then error("session.save: no random bytes for an id", 2) end
+  local body, why = json_encode(s)
+  if body == false then error("session.save: " .. tostring(why), 2) end
+  ask(k.cache, "setex session:" .. k.id .. " " .. k.o.ttl .. " " .. body)
+  k.env.set_cookie(k.o.cookie, k.id, { max_age = k.o.ttl, secure = k.o.secure, same_site = k.o.same_site })
+end
+-- A new id for the same data, as a sign-in asks, so an id seen before it is worth nothing after.
+function session.regenerate(s)
+  local k = ids[s]
+  if not k then error("session.regenerate: not a table session.open gave", 2) end
+  if k.id then ask(k.cache, "del session:" .. k.id) end
+  k.id = nil
+  session.save(s)
+end
+function session.destroy(s)
+  local k = ids[s]
+  if not k then error("session.destroy: not a table session.open gave", 2) end
+  if k.id then ask(k.cache, "del session:" .. k.id) end
+  k.env.set_cookie(k.o.cookie, "", { max_age = 0, secure = k.o.secure, same_site = k.o.same_site })
+  for key in pairs(s) do s[key] = nil end
+  k.id = nil
+end
+
+local env_mt = { __index = G }
+
 return function(factory, req, load, tload)
   setmetatable(req, req_mt)
   local out, n = {}, 0
   local res = { status = 200, headers = {} }
-  local env = setmetatable({ req = req, escape = escape, url_encode = url_encode, url_decode = url_decode },
-                           { __index = G })
+  local env = setmetatable({ req = req, escape = escape, url_encode = url_encode, url_decode = url_decode,
+                             include = include, render = render, raw = raw, session = session }, env_mt)
+  states[co_running()] = { req = req, env = env, load = load, tload = tload }
   env.echo = function(...)
     for i = 1, select("#", ...) do
       n = n + 1
@@ -199,95 +304,6 @@ return function(factory, req, load, tload)
     if body == false then error("json: " .. tostring(why), 2) end
     res.headers["Content-Type"] = "application/json"
     return { status = code or res.status, headers = res.headers, body = body }
-  end
-  -- A session: a table kept in a cache runtime under the id its cookie carries, made anew for an id the cache
-  -- does not hold, so a client can never pick its own.
-  local ids = setmetatable({}, { __mode = "k" })
-  local function ask(c, line)
-    local v, why = socketley.cache.command(c, line)
-    if v == nil then error("session: " .. tostring(why), 3) end
-    return v
-  end
-  local function give(s, id, o)
-    ids[s] = { cache = o.cache, id = id, o = o }
-  end
-  env.session = {
-    open = function(cache, o)
-      o = o or {}
-      o.cache, o.cookie, o.ttl = cache, o.cookie or "sid", o.ttl or 86400
-      local id = req.cookies[o.cookie]
-      local data
-      if type(id) == "string" and #id == 32 and match(id, "^%x+$") then
-        local v = ask(cache, "get session:" .. id)
-        if v ~= "nil" then data = json_decode(v) end
-      end
-      if type(data) ~= "table" then data, id = {}, nil end
-      give(data, id, o)
-      return data
-    end,
-    save = function(s)
-      local k = ids[s]
-      if not k then error("session.save: not a table session.open gave", 2) end
-      k.id = k.id or random_hex(16)
-      if not k.id then error("session.save: no random bytes for an id", 2) end
-      local body, why = json_encode(s)
-      if body == false then error("session.save: " .. tostring(why), 2) end
-      ask(k.cache, "setex session:" .. k.id .. " " .. k.o.ttl .. " " .. body)
-      env.set_cookie(k.o.cookie, k.id, { max_age = k.o.ttl, secure = k.o.secure, same_site = k.o.same_site })
-    end,
-    -- A new id for the same data, as a sign-in asks, so an id seen before it is worth nothing after.
-    regenerate = function(s)
-      local k = ids[s]
-      if not k then error("session.regenerate: not a table session.open gave", 2) end
-      if k.id then ask(k.cache, "del session:" .. k.id) end
-      k.id = nil
-      env.session.save(s)
-    end,
-    destroy = function(s)
-      local k = ids[s]
-      if not k then error("session.destroy: not a table session.open gave", 2) end
-      if k.id then ask(k.cache, "del session:" .. k.id) end
-      env.set_cookie(k.o.cookie, "", { max_age = 0, secure = k.o.secure, same_site = k.o.same_site })
-      for key in pairs(s) do s[key] = nil end
-      k.id = nil
-    end,
-  }
-  -- A file under the root run in this request's environment, with what it returns, as a page's head and foot are.
-  env.include = function(name, ...)
-    local f = load(name)
-    setfenv(f, env)
-    return f()(...)
-  end
-  env.raw = function(s) return setmetatable({ tostring(s) }, safe_mt) end
-  -- A template under the root filled with `values`, and the page's helpers beside them, as HTML.
-  env.render = function(name, values)
-    local f = tload(name)
-    local b = {}
-    local function o(s) b[#b + 1] = s end
-    local function v(x, src, dflt, raw)
-      if type(x) == "table" and getmetatable(x) == safe_mt then b[#b + 1] = x[1]; return end
-      if type(x) == "table" then
-        local words = {}
-        for i, e in ipairs(x) do
-          if type(e) ~= "string" and type(e) ~= "number" then
-            error("{{" .. src .. "}} is a list of tables, which {% for %} walks", 2)
-          end
-          words[i] = tostring(e)
-        end
-        if #words == 0 and next(x) ~= nil then error("{{" .. src .. "}} is a table, not a value", 2) end
-        x = concat(words, ", ")
-      end
-      if x == nil or x == false or x == "" then
-        if not dflt then return end
-        x = dflt
-      end
-      -- A number is never anything to escape.
-      if raw or type(x) == "number" then b[#b + 1] = tostring(x) else b[#b + 1] = escape(x) end
-    end
-    local tenv = setmetatable(values or {}, { __index = env })
-    setfenv(f, tenv)
-    f()(o, v, path_of, tenv)
-    return concat(b)
   end
   -- A closure takes the environment its maker has when it is made, so each request's page is a closure of its own
   -- over this request's env, which a second request setting the factory's env does not change.
@@ -740,32 +756,49 @@ outcome run(lua_context& ctx, cache& c, int root_fd, const std::string& rel, con
     sol::protected_function tloader(L, -1);
     lua_settop(L, top);
 
-    sol::table t = ctx.state().create_table(0, 7);
-    t["method"] = req.method;
-    t["path"] = req.path;
-    t["query"] = req.query;
-    t["body"] = req.body;
-    t["client_id"] = req.client_id;
-    t["version"] = req.version;
-    sol::table headers = ctx.state().create_table(0, static_cast<int>(req.headers.size()));
+    // Made through the API rather than sol, whose every field is a push of its key and a lookup of the table.
+    lua_createtable(L, 0, 7);
+    const auto field = [&](const char* k, std::string_view v) {
+        lua_pushlstring(L, v.data(), v.size());
+        lua_setfield(L, -2, k);
+    };
+    field("method", req.method);
+    field("path", req.path);
+    field("query", req.query);
+    field("body", req.body);
+    field("version", req.version);
+    lua_pushinteger(L, req.client_id);
+    lua_setfield(L, -2, "client_id");
+    lua_createtable(L, 0, static_cast<int>(req.headers.size()));
     for (const auto& [k, val] : req.headers)
     {
+        lua_pushlstring(L, k.data(), k.size());
+        lua_pushvalue(L, -1);
+        lua_rawget(L, -3);
         // A field sent twice is one list, as RFC 9110 joins it, and the cookie lines of HTTP/2 are one Cookie.
-        const sol::object prev = headers[k];
-        if (prev.is<std::string_view>())
+        if (lua_type(L, -1) == LUA_TSTRING)
         {
-            std::string joined(prev.as<std::string_view>());
+            size_t pn = 0;
+            const char* prev = lua_tolstring(L, -1, &pn);
+            std::string joined(prev, pn);
             const bool cookie = k.size() == 6 && std::equal(k.begin(), k.end(), "cookie", [](char a, char b) {
                 return (a | 0x20) == b;
             });
             joined.append(cookie ? "; " : ", ");
             joined.append(val);
-            headers[k] = joined;
+            lua_pop(L, 1);
+            lua_pushlstring(L, joined.data(), joined.size());
         }
         else
-            headers[k] = val;
+        {
+            lua_pop(L, 1);
+            lua_pushlstring(L, val.data(), val.size());
+        }
+        lua_rawset(L, -3);
     }
-    t["headers"] = headers;
+    lua_setfield(L, -2, "headers");
+    sol::table t(L, -1);
+    lua_pop(L, 1);
 
     // On a coroutine, so a page that asks socketley.db or socketley.http lets the runtime serve on while it waits; a
     // raise is reported by the suspender with the page's file and line, which its chunk name carries.
