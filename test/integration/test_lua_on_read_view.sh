@@ -236,6 +236,11 @@ local function seal(v)
     put("setgen", (pcall(function() v.gen = 1 end)))
     put("index", (pcall(function() return v[0] end)))
     put("notaview", (select(2, pcall(v.len, {})) or ""):match("not on a view") ~= nil)
+    -- The walk's state is the script's table: an index or a position written into it must not reach the buffer.
+    local f, w = v:lines(); w.k = -1
+    put("walk.k", (pcall(f, w)))
+    f, w = v:lines(); w.pos = -5
+    put("walk.pos", (pcall(f, w)))
     socketley.log("SEAL " .. table.concat(out, " "))
 end
 
@@ -335,7 +340,7 @@ if [ "$bulk_calls" -ge 1 ] && [ "$bulk_calls" -le 50 ]; then ok; else
 fi
 check "END is found with v:eq after 2014 lines counted with v:find" "got done 2014" "$(grep -x 'got done.*' "$STATUS" | head -1)"
 check "the script cannot reach ffi, the pointer or the view's insides" \
-    "SEAL debug=nil ffi=false loaded.ffi=nil jit.util=false mt=string pairs=false rawget=false tostring=view p=raises n=raises gen=number setgen=false index=false notaview=true" \
+    "SEAL debug=nil ffi=false loaded.ffi=nil jit.util=false mt=string pairs=false rawget=false tostring=view p=raises n=raises gen=number setgen=false index=false notaview=true walk.k=false walk.pos=false" \
     "$(calls SEAL | head -1)"
 check "a view kept for a timer raises the documented error from every method" \
     "RSTALE timer len=stale byte=stale sub=stale eq=stale find=stale lines=stale iterator=stale" \

@@ -170,13 +170,8 @@ bool string_field(const sol::table& t, const char* key, std::string& out)
 void register_lua_table(runtime_instance* owner, sol::state& lua, sol::table& self)
 {
     auto* rt = static_cast<mcp_instance*>(owner);
-    // What an earlier reading of the script declared goes with it.
-    {
-        auto& d = rt->declared();
-        const uint64_t gen = d.gen + 1;
-        d = declared{};
-        d.gen = gen;
-    }
+    // What an earlier reading of the script declared goes with it, unless this reading fails.
+    rt->begin_declaring();
     sol::table handlers = lua.create_table();
     handlers[tools_key] = lua.create_table();
     handlers[resources_key] = lua.create_table();
@@ -337,7 +332,7 @@ void register_lua_table(runtime_instance* owner, sol::state& lua, sol::table& se
                 if (!a || !string_field(*a, "name", pa.name) || pa.name.empty())
                     return fail("mcp.prompt " + p.def.name + ": each argument needs a name");
                 string_field(*a, "description", pa.description);
-                pa.required = a->get_or("required", false);
+                pa.required = a->get_or(std::string("required"), false);
                 p.def.args.push_back(std::move(pa));
             }
         sol::optional<sol::protected_function> fn = def[std::string("get")];

@@ -703,17 +703,23 @@ bool runtime_instance::load_lua_script(std::string_view path)
         return true;
     }
 
-    m_lua = std::make_unique<lua_context>();
+    auto next = std::make_unique<lua_context>();
+    const bool loaded = next->load_script(path, this);
+    // On a failure the context goes and the path stays: every reader of m_lua tests it first, and the path is what a
+    // retry needs.
+    replace_lua(loaded ? std::move(next) : nullptr);
+    return loaded;
+}
 
-    if (!m_lua->load_script(path, this))
-    {
-        // The context goes and the path stays: every reader of m_lua tests it
-        // first, and the path is what a retry needs.
-        m_lua.reset();
-        return false;
-    }
-
-    return true;
+void runtime_instance::replace_lua(std::unique_ptr<lua_context> next)
+{
+    // The callbacks waiting in the outgoing context are never resumed, so whoever waits on their answers hears it now.
+#ifndef SOCKETLEY_NO_LUA
+    if (m_lua)
+        m_lua->suspender().fail_results("the script was reloaded");
+#endif
+    m_lua = std::move(next);
+    lua_context_replaced();
 }
 
 bool runtime_instance::reload_lua_script()
@@ -744,9 +750,12 @@ bool runtime_instance::reload_lua_script()
     auto next = std::make_unique<lua_context>();
 
     if (!next->load_script(m_lua_script_path, this))
+    {
+        lua_load_failed();
         return false;
+    }
 
-    m_lua = std::move(next);
+    replace_lua(std::move(next));
 
     bool should_tick = m_lua->has_on_tick();
     if (!m_tick && should_tick)

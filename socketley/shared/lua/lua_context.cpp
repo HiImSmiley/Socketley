@@ -2189,6 +2189,8 @@ void lua_context::register_bindings(runtime_instance* owner)
     // because load_diag is called from everything below.
     m_owner_name = std::string(owner->get_name());
     m_suspend->attach(&m_lua, m_owner_name);
+    // With the context, so a reload's new one lets go of what its awaits hold as the first one did.
+    m_suspend->set_await_ended([owner](uint64_t ctx) { owner->release_answering_connection(ctx); });
 
     // Register socketley.log() and management API
     sol::table sk = m_lua.create_table();
@@ -3730,6 +3732,8 @@ end
 local function step(s)
   if s == nil or s.gen ~= st.gen then error(STALE, 2) end
   local pos, n = s.pos, st.n
+  -- The state is the script's table, so a position or an index it wrote is checked before either reads the buffer.
+  if not (pos >= 0) then error(STALE, 2) end
   if pos >= n then return nil end
   local p, cnt, e = st.p, st.nends, n
   if cnt < 0 then
@@ -3737,6 +3741,7 @@ local function step(s)
     if e < 0 then e = n end
   else
     local k = s.k
+    if not (k >= 0 and k <= cnt) then error(STALE, 2) end
     if k < cnt then
       e = st.ends[k]
       s.k = k + 1

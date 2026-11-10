@@ -252,6 +252,18 @@ public:
     using result_fn = std::function<void(lua_State* results, int count, const char* error)>;
     void set_next_result(result_fn fn) { m_next_result = std::move(fn); }
 
+    // Every waiting callback's handler told `why`, for a script replaced under them whose callbacks will never resume:
+    // each is owed its one call, and none runs script.
+    void fail_results(const char* why)
+    {
+        m_next_result = nullptr;
+        auto results = std::move(m_results);
+        m_results.clear();
+        for (auto& [th, fn] : results)
+            if (fn)
+                fn(nullptr, 0, why);
+    }
+
     // Whether the last start<true>() that finished returned the boolean true first, for a caller that only asks that.
     bool returned_true() const { return m_returned_true; }
 
@@ -492,6 +504,14 @@ private:
         id_t ignored = 0;
         run(nargs, ignored, false);
 
+        // An await made under the resume could not name the connection, which is the runtime's only inside the first
+        // run, so the hold this one ended carries over to it.
+        if (had_await && ended_ctx != 0)
+            if (record* again = find(id); again && again->awaiting && again->ctx == 0)
+            {
+                again->ctx = ended_ctx;
+                return;
+            }
         // After the resume, so a handler answering the peer that half-closed
         // still finds the connection its runtime was holding open for it.
         if (had_await && m_await_ended)
@@ -544,8 +564,12 @@ private:
 
         if (rc == LUA_YIELD)
         {
-            if (SOCKETLEY_UNLIKELY(done.id == 0))
+            // An invocation that waited once and then yielded by itself has a handle and nothing outstanding.
+            const record* waiting = done.id != 0 ? find(done.id) : nullptr;
+            if (SOCKETLEY_UNLIKELY(!waiting || !waiting->awaiting))
             {
+                if (done.id != 0)
+                    m_live.erase(done.id);
                 // The script called coroutine.yield() itself, so nothing is
                 // going to resume it.  Reported and let go rather than pooled:
                 // a suspended thread handed to the next handler answers its

@@ -2471,15 +2471,6 @@ bool server_instance::setup(event_loop& loop)
     m_loop = &loop;
     m_ring_loop = &loop;
 
-#ifndef SOCKETLEY_NO_LUA
-    // What a finished await owes back.  Installed here rather than at the
-    // script's load, because a runtime can be stopped and started again on the
-    // same context and the hold belongs to this run's connections.
-    if (lua())
-        lua()->suspender().set_await_ended(
-            [this](uint64_t ctx) { release_await_hold(ctx); });
-#endif
-
     // Fix this runtime's half of every conn_ref it is about to mint, so every
     // name handed out over one run carries the same owner.
     owner_key();
@@ -2824,6 +2815,10 @@ void server_instance::teardown(event_loop& loop)
         flush_cache_store();
     }
     m_cache_store_batch.clear();
+#ifndef SOCKETLEY_NO_LUA
+    // Their requests were dropped above, so no answer comes for any of them.
+    m_awaits.clear();
+#endif
     // A stopped server holds no file open.
     m_http_open.clear();
 

@@ -501,6 +501,12 @@ public:
     // Lua hot-reload
     bool reload_lua_script();
     std::string_view get_lua_script_path() const;
+    // The one place a running runtime's context is replaced, so what waited in the old one is answered.
+    void replace_lua(std::unique_ptr<lua_context> next);
+    // Told after the context was replaced, for a runtime that keeps state naming the old one's waiting callbacks.
+    virtual void lua_context_replaced() {}
+    // Told when a reload's new context did not load and the running one stays, for state its load already changed.
+    virtual void lua_load_failed() {}
 
     // Interactive mode observer fds
     void add_interactive_fd(int fd);
@@ -820,6 +826,8 @@ public:
     // answer has been used, and says with `ctx` what to let go of afterwards
     // (see lua_suspender::set_await_ended).  Zero, the default, holds nothing.
     virtual void hold_answering_connection(uint64_t& ctx) { ctx = 0; }
+    // What hold_answering_connection() took, let go once the answer it was taken for has been used.
+    virtual void release_answering_connection(uint64_t /*ctx*/) {}
 
     virtual std::string_view lua_cache_mode() const { return {}; }
 

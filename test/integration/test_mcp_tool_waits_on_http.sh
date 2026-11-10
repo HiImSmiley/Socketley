@@ -8,6 +8,8 @@
 #   * a tool that waited answered with nothing, or with another call's answer
 #   * a deadline not kept while the exchange waits on the loop
 #   * a stop with an exchange in flight leaving the runtime unable to start or serve again
+#   * a reload-lua with a tool waiting leaving its call unanswered for ever
+#   * a reload-lua of a script that does not compile taking the running script's tools with it
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -69,9 +71,9 @@ daemon_start "$BIN"
 for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$P/mcp")" != 000 ] && break; sleep 0.1; done
 for _ in $(seq 1 50); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PH/fast")" = 200 ] && break; sleep 0.1; done
 
-out=$(timeout 60 python3 -I - "$P" "$BIN" <<'PY'
+out=$(timeout 60 python3 -I - "$P" "$BIN" "$T/tools.lua" <<'PY'
 import json, subprocess, sys, threading, time, urllib.request
-port, binp = int(sys.argv[1]), sys.argv[2]
+port, binp, script = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 URL = "http://127.0.0.1:%d/mcp" % port
 META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
 def call(name):
@@ -123,6 +125,29 @@ for _ in range(50):
 check("a stop with an exchange in flight leaves the runtime to start and serve again", text == "quick", repr(text))
 text, took = call("two")
 check("and to wait on the loop again", text == "fast-done+again-done", repr(text))
+
+# A reload with a tool waiting: the new script never resumes it, so its call is answered now.
+th = threading.Thread(target=lambda: slow.update(r=call("slow")))
+th.start()
+time.sleep(0.3)
+subprocess.run([binp, "reload-lua", "m"], capture_output=True)
+th.join()
+text, took = slow["r"]
+check("a reload with a tool waiting answers its call", text == "the tool raised: the script was reloaded" and took < 1.4,
+      "%r after %.2fs" % (text, took))
+text, took = call("two")
+check("and the reloaded script's tools wait on the loop", text == "fast-done+again-done", repr(text))
+
+# A script that does not compile leaves the running one, tools and all.
+good = open(script).read()
+with open(script, "w") as f:
+    f.write("mcp.tool{ name = 'broken', handler = function() return 1 end }\nthis is ( not lua\n")
+r = subprocess.run([binp, "reload-lua", "m"], capture_output=True, text=True)
+text, took = call("quick")
+check("a reload that does not compile keeps the running script's tools", text == "quick" and r.returncode != 0,
+      "%r, reload said %r" % (text, r.stdout + r.stderr))
+with open(script, "w") as f:
+    f.write(good)
 PY
 )
 while IFS= read -r line; do
@@ -132,7 +157,7 @@ while IFS= read -r line; do
         *) [ -n "$line" ] && echo "  $line" ;;
     esac
 done <<< "$out"
-[ $((PASS + FAIL)) -ge 6 ] || bad "every check ran" "only $((PASS + FAIL)) did: $out"
+[ $((PASS + FAIL)) -ge 9 ] || bad "every check ran" "only $((PASS + FAIL)) did: $out"
 "$BIN" ls 2>/dev/null | grep -q ' m ' || bad "the daemon lists the runtime still" "$("$BIN" ls 2>&1)"
 
 echo "Results: $PASS passed, $FAIL failed"

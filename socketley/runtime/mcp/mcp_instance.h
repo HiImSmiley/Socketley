@@ -6,6 +6,7 @@
 // other name; a key of --keys says who asks, and one marked admin may call what changes the daemon.
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -77,6 +78,24 @@ public:
 
     // Filled by the script's mcp.tool, mcp.resource and mcp.prompt, and emptied when the script is read again.
     socketley::mcp::declared& declared() { return m_declared; }
+    // The script read again starts from nothing, keeping what the running one declared for a reading that fails.
+    void begin_declaring()
+    {
+        const uint64_t gen = m_declared.gen + 1;
+        m_declared_before = std::move(m_declared);
+        m_declared = {};
+        m_declared.gen = gen;
+    }
+    void lua_load_failed() override
+    {
+        if (!m_declared_before)
+            return;
+        const uint64_t gen = m_declared.gen + 1;
+        m_declared = std::move(*m_declared_before);
+        m_declared_before.reset();
+        m_declared.gen = gen;
+    }
+    void lua_context_replaced() override { m_declared_before.reset(); }
     socketley::mcp::mcp_run* run() const { return m_run.get(); }
 
     std::string config_refusal() const override;
@@ -98,6 +117,7 @@ private:
     std::string m_idp_audience;
     std::string m_instructions;
     socketley::mcp::declared m_declared;
+    std::optional<socketley::mcp::declared> m_declared_before;
 
     std::unique_ptr<socketley::mcp::mcp_run> m_run;
     // Runs stopped but still owed completions by the ring.

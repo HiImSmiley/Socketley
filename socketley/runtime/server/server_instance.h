@@ -895,6 +895,9 @@ public:
     // socketley.storage call, charged the way a cache answer is so the two
     // share one cap and one release.
     void hold_answering_connection(uint64_t& ctx) override;
+    void release_answering_connection(uint64_t ctx) override { release_await_hold(ctx); }
+    // The cache answers still on their way name the old context's callbacks, whose ids the new one hands out again.
+    void lua_context_replaced() override { m_awaits.clear(); }
 #endif
 
 private:
