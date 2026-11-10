@@ -35,7 +35,7 @@
 #include "mail_srs.h"
 #include "mail_verify.h"
 #include "../idp/idp_session.h"
-#include "../storage/password_hash.h"
+#include "../../shared/crypto/password_hash.h"
 #include "../../shared/crypto/mac.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/loop/blocking_write.h"
@@ -1978,7 +1978,7 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
         // scrypt costs tens of milliseconds, which the loop does not spend.
         auto matched = std::make_shared<bool>(false);
         r.m_pool.submit(r.cpu_lane(), [h = *hash, pw = std::move(secret), matched] {
-                            *matched = socketley::storage::password_matches(h, pw);
+                            *matched = socketley::crypto::password_matches(h, pw);
                         },
                         [matched, user, finish] { finish(*matched ? account::yes : account::no, user); });
         return;
@@ -2008,9 +2008,9 @@ void mail_run::conn::authenticate(std::string_view protocol, std::string user, s
     // A name no one has costs what a known one does, so the reply's time does not tell which names exist.
     if (!r.m_owner.get_users().empty())
     {
-        static const std::string dummy = socketley::storage::password_hash("a password no account has");
+        static const std::string dummy = socketley::crypto::password_hash("a password no account has");
         r.m_pool.submit(r.cpu_lane(), [pw = std::move(secret)] {
-                            if (socketley::storage::password_matches(dummy, pw)) {}
+                            if (socketley::crypto::password_matches(dummy, pw)) {}
                         },
                         [finish] { finish(account::no, {}); });
         return;

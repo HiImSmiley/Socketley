@@ -12,7 +12,7 @@
 #include <immintrin.h>
 #endif
 
-namespace socketley::storage::scrypt
+namespace socketley::crypto::scrypt
 {
 
 namespace
@@ -417,4 +417,4 @@ bool derive_many(std::span<const job> jobs, uint64_t N, uint32_t r, uint64_t max
     return true;
 }
 
-}   // namespace socketley::storage::scrypt
+}   // namespace socketley::crypto::scrypt

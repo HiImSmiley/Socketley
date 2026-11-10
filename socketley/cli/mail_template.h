@@ -9,11 +9,6 @@
 namespace socketley::mail
 {
 
-// The Lua of a template: its text as it is, {{ x }} the value of x, {{{ x }}} unescaped, {% code %} run where it
-// stands; false with `why` where a {% is never closed. {{unsubscribe}} is kept for the runtime where `keep_unsubscribe`.
-bool compile_template(std::string_view t, std::string_view name, bool keep_unsubscribe, std::string& code,
-                      std::string& why);
-
 // A campaign's templates and its script, filled in Lua for one recipient at a time.
 class campaign
 {

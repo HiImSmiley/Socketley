@@ -9,7 +9,7 @@
 #include "bucket_policy.h"
 #include "digest.h"
 #include "../../shared/json/json_doc.h"
-#include "password_hash.h"
+#include "../../shared/crypto/password_hash.h"
 #include "s3_names.h"
 #include "s3_users.h"
 #include "../../shared/json/json_escape.h"
@@ -943,10 +943,10 @@ struct api
                 return missing("Password");
             if (pw)
             {
-                const std::string why = password_problem(*pw, n);
+                const std::string why = crypto::password_problem(*pw, n);
                 if (!why.empty())
                     return fail(400, "PasswordPolicyViolation", why);
-                const std::string h = password_hash(*pw);
+                const std::string h = crypto::password_hash(*pw);
                 if (h.empty())
                     return fail(500, "ServiceFailure", "No random bytes for a salt.");
                 std::string secret = u->login_secret.empty() ? random_text("", 40, alnum) : u->login_secret;
@@ -994,12 +994,12 @@ struct api
             auto it = s.users.find(n);
             if (it == s.users.end() || it->second.password.empty())
                 return fail(404, "NoSuchEntity", "Login Profile for User " + n + " cannot be found.");
-            if (!password_matches(it->second.password, text("OldPassword")))
+            if (!crypto::password_matches(it->second.password, text("OldPassword")))
                 return fail(403, "InvalidUserType", "The old password given is not the user's.");
             const std::string pw = text("NewPassword");
-            if (const std::string why = password_problem(pw, n); !why.empty())
+            if (const std::string why = crypto::password_problem(pw, n); !why.empty())
                 return fail(400, "PasswordPolicyViolation", why);
-            const std::string h = password_hash(pw);
+            const std::string h = crypto::password_hash(pw);
             if (h.empty())
                 return fail(500, "ServiceFailure", "No random bytes for a salt.");
             it->second.password = h;
@@ -1125,11 +1125,11 @@ struct api
             if (text("Token").empty() || inv == s.invites.end() || inv->second.hash != h)
                 return fail(404, "NoSuchEntity", "The invitation is not one of this runtime's, or it has ended.");
             const std::string n = text("UserName"), pw = text("Password");
-            if (const std::string why = password_problem(pw, n); !why.empty())
+            if (const std::string why = crypto::password_problem(pw, n); !why.empty())
                 return fail(400, "PasswordPolicyViolation", why);
             const iam_invite i = inv->second;
             // Everything that can refuse is asked before the user is made, so a refusal leaves no half-made one.
-            const std::string hash = password_hash(pw), secret = random_text("", 40, alnum);
+            const std::string hash = crypto::password_hash(pw), secret = random_text("", 40, alnum);
             if (hash.empty() || secret.empty())
                 return fail(500, "ServiceFailure", "No random bytes for a salt.");
             if (const std::string* em = field("Email"); em && !em->empty() && !tag_problem(iam_tag_email, *em).empty())

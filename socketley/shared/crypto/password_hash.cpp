@@ -7,12 +7,11 @@
 #include <cstdlib>
 #include <vector>
 
-#include "checksum.h"
 #include "scrypt.h"
-#include "../../shared/util/base64.h"
-#include "../../shared/crypto/mac.h"
+#include "../util/base64.h"
+#include "mac.h"
 
-namespace socketley::storage
+namespace socketley::crypto
 {
 
 namespace
@@ -127,4 +126,4 @@ std::string password_problem(std::string_view password, std::string_view user)
     return {};
 }
 
-}   // namespace socketley::storage
+}   // namespace socketley::crypto

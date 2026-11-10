@@ -5,7 +5,7 @@
 #include <string>
 #include <string_view>
 
-namespace socketley::storage
+namespace socketley::crypto
 {
 
 // The hash of `password`, empty when no random salt could be drawn.
@@ -25,4 +25,4 @@ void password_matches_many(std::span<password_check> checks);
 // What is wrong with `password` as a new one for `user`, empty when nothing is.
 std::string password_problem(std::string_view password, std::string_view user);
 
-}   // namespace socketley::storage
+}   // namespace socketley::crypto

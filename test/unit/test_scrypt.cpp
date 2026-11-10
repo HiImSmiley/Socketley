@@ -10,10 +10,10 @@
 #include <openssl/evp.h>
 
 #include "runtime/idp/idp_logic.h"
-#include "runtime/storage/password_hash.h"
-#include "runtime/storage/scrypt.h"
+#include "shared/crypto/password_hash.h"
+#include "shared/crypto/scrypt.h"
 
-using namespace socketley::storage;
+using namespace socketley::crypto;
 
 namespace
 {

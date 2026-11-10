@@ -30,8 +30,8 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/ipc/shard_target.h"
 #include "../../shared/storage/storage_rpc.h"
-#include "../storage/password_hash.h"
-#include "../storage/scrypt.h"
+#include "../../shared/crypto/password_hash.h"
+#include "../../shared/crypto/scrypt.h"
 #include "../storage/storage_ui_kit.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
@@ -1648,7 +1648,7 @@ void idp_run::check_hash(std::string hash, bool real, std::string_view password,
 {
     if (!m_hash.enabled())
     {
-        const bool ok = socketley::storage::password_matches(hash, password);
+        const bool ok = socketley::crypto::password_matches(hash, password);
         then(real && ok);
         return;
     }
@@ -1668,16 +1668,16 @@ void idp_run::check_hash(std::string hash, bool real, std::string_view password,
         std::vector<password_checks::check> batch;
         {
             std::lock_guard<std::mutex> g(checks->mu);
-            while (!checks->waiting.empty() && batch.size() < socketley::storage::scrypt::max_batch)
+            while (!checks->waiting.empty() && batch.size() < socketley::crypto::scrypt::max_batch)
             {
                 batch.push_back(std::move(checks->waiting.front()));
                 checks->waiting.pop_front();
             }
         }
-        std::vector<socketley::storage::password_check> asked;
+        std::vector<socketley::crypto::password_check> asked;
         for (const auto& c : batch)
             asked.push_back({c.hash, c.password});
-        socketley::storage::password_matches_many(asked);
+        socketley::crypto::password_matches_many(asked);
         for (size_t i = 0; i < batch.size(); ++i)
             pool->post_done([alive, then = std::move(batch[i].then), ok = batch[i].real && asked[i].matches] {
                 if (*alive)
@@ -1689,7 +1689,7 @@ void idp_run::check_hash(std::string hash, bool real, std::string_view password,
 void idp_run::hash_password(std::string_view password, std::function<void(std::string)> then)
 {
     auto result = std::make_shared<std::string>();
-    auto work = [pw = std::string(password), result] { *result = socketley::storage::password_hash(pw); };
+    auto work = [pw = std::string(password), result] { *result = socketley::crypto::password_hash(pw); };
     m_hash.submit(m_hash.next_lane(), std::move(work), [alive = m_alive, result, then = std::move(then)] {
         if (*alive)
             then(std::move(*result));
@@ -3326,7 +3326,7 @@ void idp_run::password_form(const std::shared_ptr<conn>& c, const request& rq, p
     const std::string current(param(p, "current"));
     const std::string fresh(param(p, "new"));
     const std::string id = who ? who->id : std::string();
-    const std::string problem = socketley::storage::password_problem(fresh, who ? who->username() : "");
+    const std::string problem = socketley::crypto::password_problem(fresh, who ? who->username() : "");
     std::weak_ptr<conn> weak = c;
     c->waiting = true;
     check_password(who, current, [this, weak, rq, token, carried_on, ip, held, acct, id, fresh, problem, from_reset](bool ok)
@@ -3701,7 +3701,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             return;
         }
         if (!password.empty())
-            if (const std::string problem = socketley::storage::password_problem(password, user); !problem.empty())
+            if (const std::string problem = socketley::crypto::password_problem(password, user); !problem.empty())
             {
                 answer_command(ticket, "error: " + problem);
                 return;
@@ -3867,7 +3867,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
                 answer_command(ticket, "error: idp-user passwd takes --password and --reset, not '" + args[i] + "'");
                 return;
             }
-        if (const std::string problem = socketley::storage::password_problem(password, user); !problem.empty())
+        if (const std::string problem = socketley::crypto::password_problem(password, user); !problem.empty())
         {
             answer_command(ticket, "error: " + problem);
             return;

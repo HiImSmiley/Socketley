@@ -1,6 +1,6 @@
 #include "s3_sigv4_auth.h"
 
-#include "password_hash.h"
+#include "../../shared/crypto/password_hash.h"
 
 #include <cerrno>
 #include <charconv>
@@ -1053,16 +1053,16 @@ auth_verdict sigv4_authenticator::authorize_password(std::string_view user, std:
         it = m_logins.find(user);
     }
     // A name without a profile costs what a wrong password does, so a refusal does not say which names are users.
-    static const std::string none = password_hash("socketley: no such user");
+    static const std::string none = crypto::password_hash("socketley: no such user");
     const auto now = std::chrono::steady_clock::now();
     const std::string given = sha256_hex(password);
     bool ok = false;
     if (it == m_logins.end())
-        ok = (password_matches(none, password), false);
+        ok = (crypto::password_matches(none, password), false);
     else if (const auto seen = m_logins_seen.find(user); seen != m_logins_seen.end() && seen->second.until > now &&
              seen->second.hash == it->second.hash && !given.empty() && crypto::secure_equal(seen->second.given, given))
         ok = true;
-    else if ((ok = password_matches(it->second.hash, password)))
+    else if ((ok = crypto::password_matches(it->second.hash, password)))
     {
         if (m_logins_seen.size() > 1024)
             m_logins_seen.clear();

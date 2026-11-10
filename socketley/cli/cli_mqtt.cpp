@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #include "../daemon/ipc_client.h"
-#include "../runtime/storage/password_hash.h"
+#include "../shared/crypto/password_hash.h"
 #include "../shared/ipc/ipc_framing.h"
 #include "../shared/persist/read_file.h"
 #include "../shared/persist/replaced_file.h"
@@ -217,7 +217,7 @@ int cli_mqtt_passwd(int argc, char** argv)
             std::cout << "the passwords differ\n";
             return 1;
         }
-        const std::string hash = socketley::storage::password_hash(pw);
+        const std::string hash = socketley::crypto::password_hash(pw);
         if (hash.empty())
         {
             std::cout << "no random salt could be drawn\n";

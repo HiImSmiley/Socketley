@@ -36,6 +36,7 @@
 #include "../../shared/http/conditional.h"
 #include "../../shared/http/encoding.h"
 #include "../../shared/http/fastcgi.h"
+#include "../../shared/http/site_path.h"
 #include "../../shared/http/mime.h"
 #include "../../shared/http/status.h"
 #include "../../shared/http/url.h"
@@ -175,34 +176,6 @@ void append_chunk(std::string& out, std::string_view data)
     out.append(hex, static_cast<size_t>(n));
     out.append(data);
     out += "\r\n";
-}
-
-// A file a site keeps beside its pages and never means to hand out: a script's source by another name, an editor's or
-// a deploy's leftover copy, a dump or an include -- each a classic way a database password reaches the public.
-bool private_name(std::string_view rel)
-{
-    const size_t slash = rel.rfind('/');
-    const std::string_view name = slash == std::string_view::npos ? rel : rel.substr(slash + 1);
-    if (name.ends_with('~'))
-        return true;
-    std::string lower(name);
-    for (char& c : lower)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (lower.find(".php.") != std::string::npos)
-        return true;
-    std::string_view base = lower;
-    // A compressed copy of a file kept from the public is kept from it too: dump.sql.gz is the dump.
-    for (const std::string_view packed : {std::string_view(".gz"), std::string_view(".br")})
-        if (base.size() > packed.size() && base.ends_with(packed))
-            base.remove_suffix(packed.size());
-    const size_t dot = base.rfind('.');
-    if (dot == std::string::npos)
-        return false;
-    const std::string_view ext = base.substr(dot + 1);
-    static constexpr std::string_view never[] = {"bak", "old", "orig", "save", "swp", "swo", "tmp", "inc", "sql",
-                                                 "ini", "log", "phtml", "phar", "phps", "php3", "php4", "php5",
-                                                 "php7", "php8", "dist"};
-    return std::find(std::begin(never), std::end(never), ext) != std::end(never);
 }
 
 // The largest read of a served file, and so the most of it this proxy holds per connection above the write queue.
@@ -417,7 +390,7 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
     // An existing file that is no script is the site's own, served from here and never handed to the interpreter.
     if (file)
     {
-        if (private_name(rel) || !open_and_serve(rel, {}, {}))
+        if (socketley::http::private_file_name(rel) || !open_and_serve(rel, {}, {}))
             send_error(conn, "404 Not Found", "Not Found\n");
         return false;
     }
@@ -434,7 +407,7 @@ bool proxy_instance::route_fastcgi(proxy_client_connection* conn, std::string_vi
 std::string_view proxy_instance::fcgi_packed(proxy_client_connection* conn, std::string_view rel, std::string& packed,
                                              struct statx& file, struct statx& copy, const struct statx*& file_known) const
 {
-    if (private_name(rel))
+    if (socketley::http::private_file_name(rel))
         return {};
     const size_t end = conn->partial.find("\r\n\r\n");
     if (end == std::string::npos)

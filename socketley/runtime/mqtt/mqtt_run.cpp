@@ -18,7 +18,7 @@
 #include "mqtt_instance.h"
 #include "mqtt_lua.h"
 #include "../idp/idp_session.h"
-#include "../storage/password_hash.h"
+#include "../../shared/crypto/password_hash.h"
 #include "../../shared/crypto/tls_context.h"
 #include "../../shared/http/ws_protocol.h"
 #include "../../shared/ipc/route_relay.h"
@@ -1410,7 +1410,7 @@ void mqtt_run::authenticate(const auth_ask& ask, std::function<void(auth_answer)
             auto matched = std::make_shared<bool>(false);
             m_pool.submit(1,
                           [h = *hash, pw = *ask.password, matched] {
-                              *matched = socketley::storage::password_matches(h, pw);
+                              *matched = socketley::crypto::password_matches(h, pw);
                           },
                           [this, alive = m_alive, matched, user = *ask.username, finish]() mutable {
                               if (!*alive)
