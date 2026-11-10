@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A client script's sends and reads cost less.** `self.send` of a short line
+  copies it into a stage through LuaJIT's FFI with no call into C, a
+  one-connection client reads into 240 KiB buffers rather than 64 KiB, a line
+  left over at the end of a read is put in front of the next one rather than
+  the read copied behind it, and TLS records are decrypted straight onto the
+  line they continue. A client runtime of one connection holds 1.5 MB more for
+  its buffers.
+
 - **A sharded cache is in cluster mode by default.** At two or more shards on
   a port each shard binds `port+1+i` and the cache publishes its slot map, so
   a cluster-aware client routes each key to its owner (0.24 us of CPU per
@@ -839,6 +847,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   taken, and cookies and passwords sign in as before.
 
 ### Added
+
+- **`socketley send` as a bash builtin.** `enable -f
+  /usr/lib/socketley/socketley-bash.so socketley` in a script makes `socketley
+  send <name> <message>` a request to the daemon from the shell itself, over
+  one connection the shell keeps, with the program's answers and exit codes;
+  every other command runs the socketley program as before. A loop sending a
+  line a command goes from about 1,400 lines a second to 27,000, beside bash's
+  own `/dev/tcp` at 28,000.
+- **A client holds many connections.** `--connections N` dials N connections
+  to its target in one runtime; each callback is handed the connection's id
+  after its other arguments, and `self.send(msg, id)` writes to one of them.
+- **`on_messages(chunk, id)` and `on_read(view, id)` for a client.** A script
+  takes every complete line of a read in one call: as one string, or as a view
+  of the read buffer that makes no string at all, whose `len`, `byte`, `sub`,
+  `eq`, `find` and `lines` read the bytes where they arrived. A firehose of
+  64 B lines counted with `view:lines()` runs at about 200 million lines a
+  second, against 12.7 million with `on_message`.
 
 - **A tunnel edge's agents and shares in the dashboard.** An edge's page has
   Agents beside Edit: its agents with their HTTP, TCP and UDP services, which
