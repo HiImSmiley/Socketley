@@ -17,7 +17,7 @@ PKG_DIR="$PROJECT_ROOT/socketley_${VERSION}_${ARCH}"
 # Built here from clean, since make keeps objects across a change of flags and a package must carry the -march it
 # names, not whatever the last build of this tree used.
 make -C "$PROJECT_ROOT/make" config="$CONFIG" clean >/dev/null
-make -C "$PROJECT_ROOT/make" config="$CONFIG" -j"$(nproc)" socketley
+make -C "$PROJECT_ROOT/make" config="$CONFIG" -j"$(nproc)" socketley socketley_bash
 if [ ! -f "$BINARY" ]; then
     echo "error: release binary not found at $BINARY"
     exit 1
@@ -41,6 +41,11 @@ mkdir -p "$PKG_DIR/etc/socketley"
 # Binary
 cp "$BINARY" "$PKG_DIR/usr/bin/socketley"
 chmod 755 "$PKG_DIR/usr/bin/socketley"
+
+# The bash builtin, for `enable -f /usr/lib/socketley/socketley-bash.so socketley`
+mkdir -p "$PKG_DIR/usr/lib/socketley"
+cp "$PROJECT_ROOT/bin/Release/socketley-bash.so" "$PKG_DIR/usr/lib/socketley/socketley-bash.so"
+chmod 644 "$PKG_DIR/usr/lib/socketley/socketley-bash.so"
 
 # Man page
 if [ -f "$PROJECT_ROOT/man/socketley.1" ]; then
@@ -145,7 +150,7 @@ chmod 644 "$COPYRIGHT"
 SHLIBS_DIR=$(mktemp -d)
 mkdir "$SHLIBS_DIR/debian"
 printf 'Source: socketley\n\nPackage: socketley\nArchitecture: any\n' > "$SHLIBS_DIR/debian/control"
-if ! SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "$PKG_DIR/usr/bin/socketley"); then
+if ! SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "$PKG_DIR/usr/bin/socketley" "$PKG_DIR/usr/lib/socketley/socketley-bash.so" 2>/dev/null); then
     rm -rf "$SHLIBS_DIR" "$PKG_DIR"
     echo "error: a library the binary loads belongs to no package; run bin/build-thirdparty.sh and build again"
     exit 1

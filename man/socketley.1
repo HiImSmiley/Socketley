@@ -1105,6 +1105,22 @@ unknown command: gibtsnicht
   If gibtsnicht is a runtime you meant to send to, nothing arrived on standard input:
     echo 'data' | socketley gibtsnicht
 .fi
+.PP
+A script that sends many lines can make
+.B send
+a bash builtin, which asks the daemon from the shell's own process instead of starting socketley for each line:
+.nf
+enable \-f /usr/lib/socketley/socketley\-bash.so socketley
+for i in $(seq 1 1000); do socketley send myclient "line $i"; done
+.fi
+.PP
+With it,
+.B socketley send
+.I name message
+is answered as by the program, with its exit codes, over one connection to the daemon that the shell keeps.
+Every other socketley command, and a
+.B send
+that reads stdin or writes mail, runs the socketley program on PATH.
 .TP
 .BI "stats " "name|pattern" "..."
 Display runtime statistics, including total connections, messages processed,

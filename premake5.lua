@@ -338,6 +338,36 @@ project "socketley"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── socketley-bash.so: `socketley send` as a bash builtin ───
+-- Loaded into bash by `enable -f`, so it carries only the daemon request and the socket's path, and no sanitizer or
+-- coverage runtime, which a bash process does not have: those configurations build it plain.
+project "socketley_bash"
+    kind "SharedLib"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    targetname "socketley-bash"
+    targetprefix ""
+    location("%{wks.location}")
+    pic "On"
+    includedirs { "socketley" }
+    files {
+        "bash/socketley_builtin.cpp",
+        "socketley/shared/ipc/daemon_request.cpp",
+        "socketley/shared/ipc/daemon_client.cpp",
+        "socketley/shared/persist/paths.cpp"
+    }
+    filter "system:linux"
+        defines { "SOCKETLEY_LINUX" }
+    filter "configurations:Release"
+        defines { "NDEBUG", "RELEASE" }
+        optimize "Full"
+    filter "configurations:Sanitize or configurations:TSan or configurations:Coverage"
+        removebuildoptions { "-fsanitize=address,undefined", "-fsanitize=thread", "-fno-sanitize-recover=all",
+                             "--coverage", "-fprofile-update=atomic" }
+        removelinkoptions { "-fsanitize=address,undefined", "-fsanitize=thread", "--coverage" }
+    filter {}
+
 -- ─── SDK: socketley_sdk static library ───
 
 project "socketley_sdk"

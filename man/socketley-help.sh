@@ -300,6 +300,7 @@ cli_commands() {
     echo "  Send message to server (broadcast) or client"
     echo -e "  ${CYAN}socketley send myserver \"Hello everyone\"${NC}"
     echo -e "  ${CYAN}echo \"Hello\" | socketley send myserver${NC}  # stdin"
+    echo -e "  ${CYAN}enable -f /usr/lib/socketley/socketley-bash.so socketley${NC}  # send as a bash builtin"
     echo ""
     echo -e "${BOLD}<runtime> <verb> [args...]   |   <runtime> help${NC}"
     echo "  What belongs to one runtime starts with its name; the verb is read"
