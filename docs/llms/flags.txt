@@ -10,6 +10,7 @@ Every flag of every runtime type, with the types that take it.
 | `-s` |  | Start now: Start it as soon as it is made. Types: server, client, proxy, cache, storage, dns, idp, db, mqtt, mail, tunnel, metrics, mcp, web. |
 | `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. Types: server, client, proxy, cache, storage, dns, mqtt, mail. |
 | `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. Types: server, client, proxy, cache, storage, mqtt, mail, mcp. |
+| `--lua-ffi` |  | Lua FFI: Let the script require("ffi"): LuaJIT's calls into C and raw memory, where a wrong pointer ends the runtime's process. Types: server, client, proxy, cache, storage, mqtt, mail, mcp, web. |
 
 **Network**
 
@@ -289,6 +290,9 @@ Every flag of every runtime type, with the types that take it.
 | `--root` | path | Document root: The directory whose files are the site. Required. Types: web. |
 | `--index` | text | Index page: The file a directory's address is answered with, index.html unless given. Types: web. |
 | `--fallback` | text | Fallback page: The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise. Types: web. |
+| `--backend` | text | PHP server: The FastCGI server a .php file under --root is run by: fastcgi://unix:/path or fastcgi://a.b.c.d:port. Types: web. |
+| `--fastcgi-root` | path | Server's root: --root as the FastCGI server sees it, when that is another path (a container). Types: web. |
+| `--lua-pages` |  | Lua pages: Run a .lua file under --root as a page, which answers its own address, rather than serving it. Types: web. |
 
 **Metrics**
 

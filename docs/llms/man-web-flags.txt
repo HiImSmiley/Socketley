@@ -2,14 +2,14 @@
 
 From the manual page socketley(1).
 
-A **web** runtime serves a site of files to browsers and does nothing else: no script, no WebSocket, no raw TCP, no upload. It is what a documentation site, a blog built by a static site generator or a single-page app's build is put behind.
+A **web** runtime serves a site of files to browsers: no WebSocket, no raw TCP. It is what a documentation site, a blog built by a static site generator or a single-page app's build is put behind, and with **--lua-pages** a site whose **.lua** files answer their own addresses, and with **--backend** a PHP site, whose .php files php-fpm runs.
 
 ```
 socketley create web docs -p 9500 --root /srv/docs/current --domain docs -s
 socketley create web www  -p 9501 --root /var/www/html --domain example.com -s
 ```
 
-It speaks plain HTTP/1.1 on its port and is reached through the entrance proxy, which terminates TLS and HTTP/2 for its **--domain** as for every other name; a name with a dot is taken whole, so the second line above answers the zone's own name. Unlike the other runtimes it binds **127.0.0.1** unless **--bind** says otherwise, since what it speaks is plain HTTP that only the entrance should reach; **--bind 0.0.0.0** opens it to the network. **--tls** and **--lua** are refused.
+It speaks plain HTTP/1.1 on its port and is reached through the entrance proxy, which terminates TLS and HTTP/2 for its **--domain** as for every other name; a name with a dot is taken whole, so the second line above answers the zone's own name. Unlike the other runtimes it binds **127.0.0.1** unless **--bind** says otherwise, since what it speaks is plain HTTP that only the entrance should reach; **--bind 0.0.0.0** opens it to the network. **--tls** and **--lua** are refused; a script of a web runtime is a page.
 
 ### `--root directory`
 
@@ -23,9 +23,21 @@ The file a directory's address is answered with, **index.html** unless given.
 
 The page, under **--root**, an address with no file behind it is given, with **200**, as a single-page app routes its own addresses. Only an address whose last part has no dot: a missing **app.js** stays a **404**.
 
+### `--lua-pages`
+
+A **.lua** file under **--root** is run as a page that answers its address, rather than served: GET /shop/cart.lua runs shop/cart.lua. A file answers first: an address no file answers is the page it names without **.lua** (**/about** runs about.lua, **/shop/** its index.lua), then a **--fallback** that is a **.lua** page, which routes every address with no dot in its last part, as a front controller does. **--index** may name a page as well. A page takes every method and a body of up to 8 MiB, past which the request is answered **413**; a file still takes only GET and HEAD. With the flag on, a **.lua** file and a **.tpl** template are never sent as text, and a page in a directory, or with a name, that begins with **_** is never run by an address, which is where the files a page includes belong; any other file there, such as a build's **_next/**, is served as before. See **Lua Pages** in **LUA CONFIGURATION**.
+
+### `--backend fastcgi://unix:path | fastcgi://a.b.c.d:port`
+
+The FastCGI server, php-fpm, that a **.php** file under **--root** is run by, as a FastCGI proxy's **--backend** names one. The first segment of an address that ends in **.php** and is a script runs it, and what follows is **PATH_INFO**: **/shop/cart.php/extra** runs shop/cart.php. A file answers first and is served by the runtime itself, with its caching and compression; a directory with no index.html is its index.php, and an address nothing answers is the root's index.php, as a front controller routes every address it was not given. A script takes every method and a body of up to 8 MiB, and its answer is held whole, up to 64 MiB, to be sent with its length; a larger download is a file the site serves, or a FastCGI proxy's to stream. A script gets a connection of its own, which the server closes once it has answered, so a php-fpm worker is free the moment its script is done, and has 60 seconds to answer before the request is answered **504**. A server that cannot be reached, or answers what is not FastCGI, is a **502**, and what a script writes to its error stream goes to the log. A **.php** file's source is never sent, nor a file a site keeps beside its scripts and never means to hand out: **.inc**, **.sql**, **.ini**, **.log**, **.phtml**, **.bak**, an editor's **~** copy, or a **.php.** in a name, such as **wp-config.php.bak**.
+
+### `--fastcgi-root directory`
+
+**--root** as the FastCGI server sees it, when that is another path, as in a container.
+
 **How an address resolves.** **/guide/** is **guide/index.html**; **/guide** is answered **301** to **/guide/**, the query kept, so the page's relative links resolve under it; **/about** is **about.html** when there is no file **about**, as static site generators write it. A directory with no index lists nothing. An address nothing answers is the site's **404.html** with status **404**, or a short **404** without one. Repeated slashes are one, and a path that leaves **--root** — **..**, its encoding **%2e%2e**, or a symbolic link that points out — is a **404**, as is any segment that begins with a dot (**.env**, **.git/**), except **.well-known**.
 
-**Methods.** **GET** and **HEAD**; **OPTIONS** is **204** saying so, and every other method **405** with **Allow: GET, HEAD, OPTIONS**. A WebSocket upgrade is answered with the page.
+**Methods.** A page takes every method. A file **GET** and **HEAD**; **OPTIONS** is **204** saying so, and every other method **405** with **Allow: GET, HEAD, OPTIONS**. A WebSocket upgrade is answered with the page.
 
 **Caching.** Every file answer carries **ETag**, **Last-Modified**, **Date** and **X-Content-Type-Options: nosniff**; **If-None-Match** and **If-Modified-Since** are answered **304**, **If-Match** and **If-Unmodified-Since** **412**, and a single **Range** **206**, under an **If-Range** that names this copy, the whole file otherwise. A script, a style sheet, a font, an image or wasm whose name a build stamped with a content hash (**main.3f9a1c2b.js**, **index-B_x3-9Qa.js**) is sent with **Cache-Control: public, max-age=31536000, immutable**, since a new build is a new name; everything else, a page above all, with **no-cache**, which a browser answers with a revalidation that costs a **304** and never shows a page older than the files. A hash has digits and letters and no run of four lowercase letters, so **holiday-2024-beach.jpg** is a name its owner may replace.
 
@@ -35,4 +47,4 @@ The page, under **--root**, an address with no file behind it is given, with **2
 
 **Connections.** Pipelined requests are answered in order; a client that sends them faster than it reads the answers has its next requests wait once a megabyte is owed to it, and one that stops reading, mid-file or so, is let go after a minute without progress. After a **Connection: close** or a refused request nothing more on the connection is answered. An HTTP/1.0 client that asks to stay open is told **Connection: keep-alive**.
 
-**stats** shows **requests**, **not_modified**, **not_found**, **redirects**, **refused** (a method or a malformed request), **unavailable** (a **503** for want of a descriptor or memory, never remembered as a **404**), **ranges**, **from_memory** and **zero_copy** (how bodies went), **compressed** (answers sent as a copy), **compress_jobs**, **reloads** (releases swapped in), **stalled** (connections let go after a minute of not reading), **addresses**, **kept_bytes**, **kept_files** and **watching** (1 while inotify works).
+**stats** shows **requests**, **not_modified**, **not_found**, **redirects**, **refused** (a method or a malformed request), **unavailable** (a **503** for want of a descriptor or memory, never remembered as a **404**), **ranges**, **from_memory** and **zero_copy** (how bodies went), **compressed** (answers sent as a copy), **compress_jobs**, **reloads** (releases swapped in), **stalled** (connections let go after a minute of not reading), **addresses**, **kept_bytes**, **kept_files**, **watching** (1 while inotify works), **pages** (answers a Lua page gave) and **scripts** (requests handed to the FastCGI server).

@@ -264,7 +264,7 @@ Called right after a WebSocket upgrade handshake completes (server only). By the
 
 #### `on_http_request(req) -> table`
 
-Called when the server receives an HTTP request (server only). The server detects HTTP from the first bytes; see **Multi-Protocol Auto-Detection**. The *req* argument is a table with these fields:
+Called when the server receives an HTTP request (server only): the HTTP side of a server of messages, such as a webhook it relays to its clients. A site whose **.lua** files answer their own addresses is a **web** runtime's **--lua-pages**; see **Lua Pages**. The server detects HTTP from the first bytes; see **Multi-Protocol Auto-Detection**. The *req* argument is a table with these fields:
 
 ```
 method      string   HTTP method ("GET", "POST", etc.)

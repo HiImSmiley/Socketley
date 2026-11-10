@@ -35,6 +35,7 @@ Every flag a web runtime takes, by group.
 |---|---|---|
 | `-p` | int | Port: The port it listens on (a client: the port of its target). |
 | `-s` |  | Start now: Start it as soon as it is made. |
+| `--lua-ffi` |  | Lua FFI: Let the script require("ffi"): LuaJIT's calls into C and raw memory, where a wrong pointer ends the runtime's process. |
 
 **Network**
 
@@ -64,6 +65,9 @@ Every flag a web runtime takes, by group.
 | `--root` | path | Document root: The directory whose files are the site. Required. |
 | `--index` | text | Index page: The file a directory's address is answered with, index.html unless given. |
 | `--fallback` | text | Fallback page: The page an address with no file is given, with 200, as a single-page app routes; 404.html, if there, otherwise. |
+| `--backend` | text | PHP server: The FastCGI server a .php file under --root is run by: fastcgi://unix:/path or fastcgi://a.b.c.d:port. |
+| `--fastcgi-root` | path | Server's root: --root as the FastCGI server sees it, when that is another path (a container). |
+| `--lua-pages` |  | Lua pages: Run a .lua file under --root as a page, which answers its own address, rather than serving it. |
 
 ## Benchmarks
 

@@ -46,6 +46,7 @@ Every flag a mcp runtime takes, by group.
 | `-p` | int | Port: The port it listens on (a client: the port of its target). |
 | `-s` |  | Start now: Start it as soon as it is made. |
 | `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+| `--lua-ffi` |  | Lua FFI: Let the script require("ffi"): LuaJIT's calls into C and raw memory, where a wrong pointer ends the runtime's process. |
 
 **Network**
 

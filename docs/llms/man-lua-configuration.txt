@@ -461,7 +461,7 @@ Called right after a WebSocket upgrade handshake completes (server only). By the
 
 #### `on_http_request(req) -> table`
 
-Called when the server receives an HTTP request (server only). The server detects HTTP from the first bytes; see **Multi-Protocol Auto-Detection**. The *req* argument is a table with these fields:
+Called when the server receives an HTTP request (server only): the HTTP side of a server of messages, such as a webhook it relays to its clients. A site whose **.lua** files answer their own addresses is a **web** runtime's **--lua-pages**; see **Lua Pages**. The server detects HTTP from the first bytes; see **Multi-Protocol Auto-Detection**. The *req* argument is a table with these fields:
 
 ```
 method      string   HTTP method ("GET", "POST", etc.)
@@ -558,6 +558,63 @@ Called when a remote daemon becomes stale or disappears (cluster only).
 #### `on_group_change(group, members)`
 
 Called when the member count of a group changes (cluster only).
+
+## Lua Pages
+
+A web runtime with **--lua-pages** runs a **.lua** file under its **--root** as a page, as PHP runs a .php file: a request for the file's address runs it, and what it echoes or returns is the response. A page is compiled once and again only when its file changes, so an edit is answered by the next request, and it runs in an environment of its own each request: a global one request sets is not there for the next. Each shard of a **--shards** runtime runs its pages in a Lua state of its own. A page has the **socketley** functions a script has, and these:
+
+```
+req              the request: method, path, query, body, version, headers,
+                 and, read the first time they are asked for:
+req.get          the query string as a table
+req.post         the form fields of a urlencoded or multipart body
+req.files        a multipart body's files: { filename, type, data, size }
+req.cookies      the Cookie header as a table
+req:header(n)    a request header by name, in any case; a field sent twice
+                 is one value joined with ", ", and Cookie with "; "
+echo(...)        adds to the response body
+header(k, v)     sets a response header; a list of values sends a line each
+status(code)     sets the status, 200 unless set
+redirect(url [, code])   302 unless given, with Location
+set_cookie(name, value [, opts])   opts: path ("/"), max_age, domain,
+                 http_only (true), secure, same_site ("Lax")
+json(value [, code])     a response of value as JSON, for return json(t)
+escape(s)        s with & < > " ' as HTML entities
+url_encode(s), url_decode(s)
+include(path, ...)  runs a .lua file under --root, by its path there, in
+                 this request's environment, with the arguments as ...,
+                 and answers what it returns: a page's head and foot,
+                 kept where no request reaches, under _parts/
+render(path, values)  a template under --root, a .tpl file, filled with
+                 values and the page's own helpers, as HTML: {{ x }} the
+                 value of any Lua expression escaped, {{ x|otherwise }}
+                 with a default, {{{ x }}} or {{ raw(x) }} unescaped, and
+                 {% code %} run where it stands, a tag alone on its line
+                 taking the line with it, as the mail runtime's templates
+session.open(cache [, opts])  the session its cookie names, a table, from the
+                 cache runtime named; empty for none or an id the cache
+                 does not hold. opts: cookie ("sid"), ttl (86400 seconds),
+                 secure, same_site ("Lax")
+session.save(s)  writes it back, under a new id the first time, and sets the
+                 cookie
+session.regenerate(s)  the same table under a new id, the old one deleted, as
+                 a sign-in asks
+session.destroy(s)  deletes it and the cookie
+```
+
+A session is JSON under **session:***id* in the cache, with the cookie's **Max-Age** as its expiry, so every shard of the site, and every web runtime that names the same cache, reads it. Its id is 16 random bytes in hex that the runtime made; one a client sends that the cache does not hold is not taken.
+
+A field named with **[]** at the end, as **tag[]=a&tag[]=b**, is a list in **req.get** and **req.post**. A page that returns a table (**{ status, headers, body }**) answers with it, and the headers **header()** set that the table does not are sent with it; one that returns a string answers with that, and one that returns nothing with what it echoed, as text/html. The length, Date and Connection of the answer are the runtime's, and a header whose name or value would break its line is left out. An answer of text of 1 KiB or more goes gzipped to a client whose **Accept-Encoding** takes it, unless the page set a **Content-Encoding** itself; so does a script's under **--backend**. A HEAD runs the page as it is and sends no body. A page that raises, or does not compile, is answered 500, and the reason goes to the daemon's log with the file and line. The callback deadline bounds a page as it does a callback.
+
+```
+-- /srv/site/hello.lua
+local name = req.get.name or "world"
+echo("<h1>Hello, ", escape(name), "</h1>")
+```
+
+A page's environment keeps one request's globals from the next, and from another waiting at the same time; it is no sandbox. A page reaches what any script does through **_G**, a module it **require**s is shared by every request of its runtime, and state that has to outlast a request belongs in a cache or db runtime, since every shard of a **--shards** runtime runs its pages in a state of its own. A page that computes holds the other requests of its shard while it runs, for as long as the callback deadline lets it.
+
+A page runs on a coroutine: one that asks **socketley.db**, **socketley.storage**, **socketley.mqtt**, **socketley.mail** or **socketley.http** waits for the answer while the runtime serves its other requests, and its connection reads nothing more until the page has answered. A page whose runtime stops while it waits is not answered.
 
 ## Callback Deadline
 
@@ -1156,6 +1213,24 @@ Making **get** return **nil** for an absent key would answer the question, but i
 #### `socketley.log(msg)`
 
 Writes one line to the daemon's log at **INFO** level, prefixed with the name of the runtime that wrote it: **[12:04:31] [INFO] [lua my-server] ...**. The line goes through the daemon's logger, so **log_level** in the configuration file can suppress it like any other message. At the default level, every line is shown. Every Lua diagnostic carries the same **[lua <runtime>]** prefix. The prefix is what separates two scripts that share one stderr. Two runtimes often share one script file, so the file name in an error does not identify the runtime.
+
+#### `socketley.sha256(s) -> hex`
+
+#### `socketley.hmac_sha256(key, msg) -> hex`
+
+#### `socketley.random_hex([n]) -> hex`
+
+The SHA-256 of *s*, its HMAC under *key*, and *n* random bytes from the kernel, 16 unless given and at most 1024, each as lowercase hex, for tokens and signed cookies. **random_hex** returns nil when the kernel gave no random bytes, and for an *n* out of range.
+
+#### `socketley.password_hash(password) -> hash`
+
+#### `socketley.password_verify(hash, password) -> boolean`
+
+A password as the idp and storage runtimes keep one: scrypt, N = 2^14, r = 8, p = 1, with a random salt, written **$scrypt$ln=14,r=8,p=1$**<salt>**$**<hash>**;** and whether *password* is the one *hash* was made from, compared in constant time, false for a *hash* that is not one. One hash holds a core for tens of milliseconds, so inside a callback that can wait, and in a web page, it is made on a thread of the runtime's own while the callback waits; anywhere else it is made on the spot. **password_hash** returns nil and the reason when no random salt could be drawn.
+
+#### `socketley.cache.command(runtime, command [, callback]) -> reply`
+
+One command of a cache runtime's text protocol, as **socketley cache** sends it, answered with what the cache said: **ok** for a **set**, the value or **nil** for a **get**. nil and the reason when the answer is not coming, as for no runtime of that name. Inside a callback that can wait, and in a web page, it waits; anywhere else the last argument is a function that is called with the answer. A server with **--cache** asks the cache it links with **self.cache**.
 
 #### `socketley.set_timeout(ms, fn) -> timer_id`
 

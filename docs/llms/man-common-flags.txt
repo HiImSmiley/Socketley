@@ -60,6 +60,10 @@ The files written by **-w** and **--log** stay open once written, so a file that
 
 Attaches a Lua configuration script with callbacks. If the script does not load, the command is refused with exit 1. The output gives the reason, not only the fact: the parse error, or the **filters** or **routes** rule that the script broke.
 
+### `--lua-ffi`
+
+Lets the script **require("ffi")**, LuaJIT's foreign function interface: calls into C libraries, C types and raw memory, for a script that parses a binary protocol or keeps its own buffers. Without it, **require("ffi")** finds nothing. The script runs with the daemon's rights either way, since **io** and **os** are open, so the flag adds no rights; it changes what a mistake costs. A wrong pointer ends the runtime's process rather than raising a Lua error, and a C call that does not return is not stopped by the callback deadline's hook, only by the deadline ending the process. The script is given the module when it is loaded: at **create** or **start**, and for a running runtime by **socketley restart** *name* **--lua-ffi***.* The flag is kept with the runtime.
+
 ### `-b`
 
 Prints received messages to stdout (bash mode).

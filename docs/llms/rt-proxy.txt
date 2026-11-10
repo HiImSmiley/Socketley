@@ -40,6 +40,7 @@ Every flag a proxy runtime takes, by group.
 | `-s` |  | Start now: Start it as soon as it is made. |
 | `-g` (--group) | text | Group: Puts it in a group; a proxy with --backend @group reaches every member. |
 | `--lua` | path | Lua script: A script with the runtime's callbacks, run at start. |
+| `--lua-ffi` |  | Lua FFI: Let the script require("ffi"): LuaJIT's calls into C and raw memory, where a wrong pointer ends the runtime's process. |
 
 **Network**
 
