@@ -1008,13 +1008,13 @@
    "runtime": "server",
    "title": "WebSocket: echo and a chat room's fan-out",
    "vs": [
-    "socketley, no script",
+    "socketley, Lua script",
     "ws 8.22.0 (Node 24.22.1)",
     "uWebSockets.js 20.71.0 (Node 24.22.1)"
    ],
    "arms": [
     "socketley",
-    "socketley, no script",
+    "socketley, Lua script",
     "ws 8.22.0 (Node 24.22.1)",
     "uWebSockets.js 20.71.0 (Node 24.22.1)"
    ],
@@ -1026,46 +1026,46 @@
     {
      "name": "echo, 64 B messages, 256 connections, one in flight each",
      "v": [
-      303409.0,
       319770.0,
+      303409.0,
       150955.0,
       231855.0
      ],
      "cpu": [
-      1.0,
       0.997,
+      1.0,
       1.0,
       0.997
      ],
      "ccpu": [
-      8.46,
       8.757,
+      8.46,
       3.032,
       6.702
      ],
      "r": [
       [
-       0.949,
-       0.938,
-       0.949
+       1.054,
+       1.054,
+       1.066
       ],
       [
-       1.987,
-       1.971,
-       2.032
+       2.093,
+       2.077,
+       2.165
       ],
       [
-       1.306,
-       1.275,
-       1.323
+       1.377,
+       1.344,
+       1.41
       ]
      ]
     },
     {
      "name": "room fan-out: 1 sender to 100 receivers, 64 B",
      "v": [
-      6126323.0,
       6153033.0,
+      6126323.0,
       305327.0,
       5402745.0
      ],
@@ -1076,64 +1076,64 @@
       0.997
      ],
      "ccpu": [
-      9.822,
       9.82,
+      9.822,
       7.816,
       9.109
      ],
      "r": [
       [
-       0.986,
-       0.986,
-       0.996
+       1.014,
+       1.004,
+       1.014
       ],
       [
-       19.995,
-       19.826,
-       20.349
+       20.271,
+       20.1,
+       20.437
       ],
       [
+       1.139,
        1.134,
-       1.118,
-       1.137
+       1.152
       ]
      ]
     },
     {
      "name": "room fan-out: 1 sender to 1,000 receivers, 64 B",
      "v": [
-      6255986.0,
       6246289.0,
+      6255986.0,
       293497.0,
       5730048.0
      ],
      "cpu": [
-      0.998,
       0.999,
+      0.998,
       1.001,
       1.001
      ],
      "ccpu": [
-      9.366,
       9.294,
+      9.366,
       7.465,
       9.181
      ],
      "r": [
       [
-       1.002,
-       0.992,
-       1.028
+       0.998,
+       0.973,
+       1.008
       ],
       [
-       21.781,
-       21.315,
-       22.574
+       21.282,
+       21.193,
+       22.745
       ],
       [
-       1.09,
        1.088,
-       1.119
+       1.088,
+       1.096
       ]
      ]
     }
@@ -1141,20 +1141,20 @@
    "unit": "msg/s",
    "better": "higher",
    "pin": "each server on one core (ws and uWebSockets.js under Node 24), srvgen on 20 others",
-   "note": "The same logic in each: an echo, and a room that a receiver enters by sending \"join\", with one sender's messages counted at every receiver. socketley runs it in Lua (join_group/group_send) and, as \"no script\", on its built-in relay; ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes."
+   "note": "The same logic in each: an echo, and a room that a receiver enters by sending \"join\", with one sender's messages counted at every receiver. socketley runs it on its built-in relay, and as \"socketley, Lua script\" in Lua (join_group/group_send); ws loops over the room with send(), uWebSockets.js publishes to a topic. Both socketley and uWebSockets.js build a room's frame once; socketley writes each receiver's share of a turn in one send, and uWebSockets.js corks its writes."
   },
   {
    "id": "server-tcp",
    "runtime": "server",
    "title": "TCP line protocol, answered by a handler",
    "vs": [
-    "socketley, no script",
+    "socketley, Lua script",
     "Node 24.22.1 net",
     "Go 1.24.6 net"
    ],
    "arms": [
     "socketley",
-    "socketley, no script",
+    "socketley, Lua script",
     "Node 24.22.1 net",
     "Go 1.24.6 net"
    ],
@@ -1166,8 +1166,8 @@
     {
      "name": "line echo, 64 B, 256 connections, one in flight each",
      "v": [
-      313298.0,
       328513.0,
+      313298.0,
       199449.0,
       226750.0
      ],
@@ -1178,34 +1178,34 @@
       1.0
      ],
      "ccpu": [
-      8.547,
       8.813,
+      8.547,
       4.528,
       6.518
      ],
      "r": [
       [
-       0.955,
-       0.949,
-       0.955
+       1.047,
+       1.047,
+       1.054
       ],
       [
-       1.573,
-       1.57,
-       1.597
+       1.647,
+       1.644,
+       1.682
       ],
       [
-       1.381,
-       1.379,
-       1.39
+       1.455,
+       1.444,
+       1.455
       ]
      ]
     },
     {
      "name": "line echo, 64 B, 64 connections, 16 pipelined each",
      "v": [
-      4482408.0,
       4626572.0,
+      4482408.0,
       2315448.0,
       3236178.0
      ],
@@ -1216,26 +1216,26 @@
       1.0
      ],
      "ccpu": [
-      8.489,
       8.802,
+      8.489,
       3.742,
       6.343
      ],
      "r": [
       [
-       0.961,
-       0.953,
-       0.97
+       1.041,
+       1.031,
+       1.049
       ],
       [
-       1.937,
-       1.914,
-       1.953
+       1.998,
+       1.992,
+       2.049
       ],
       [
-       1.381,
-       1.37,
-       1.393
+       1.426,
+       1.424,
+       1.462
       ]
      ]
     }
@@ -1243,22 +1243,22 @@
    "unit": "msg/s",
    "better": "higher",
    "pin": "each server on one core, srvgen on 20 others",
-   "note": "Every line is answered with itself by a handler: on socketley a Lua on_client_messages, handed a read's lines in one call and answering them with one self.send; on Node's net a function over the read's lines, written with one write a read; in Go a goroutine with bufio. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work, where a script with on_client_message, a call and a string a line, makes about 3.2 million a second."
+   "note": "Every line is answered with itself by a handler: socketley's built-in echo, and as \"socketley, Lua script\" a Lua on_client_messages, handed a read's lines in one call and answering them with one self.send; on Node's net a function over the read's lines, written with one write a read; in Go a goroutine with bufio. With one line in flight the kernel's per-message cost dominates; 16 pipelined lines show each server's own per-line work, where a script with on_client_message, a call and a string a line, makes about 3.2 million a second."
   },
   {
    "id": "server-udp",
    "runtime": "server",
    "title": "UDP datagrams answered",
    "vs": [
+    "socketley, Lua script",
     "Node 24.22.1 dgram",
-    "Go 1.24.6 net",
-    "socketley, Lua"
+    "Go 1.24.6 net"
    ],
    "arms": [
-    "socketley, no script",
+    "socketley",
+    "socketley, Lua script",
     "Node 24.22.1 dgram",
-    "Go 1.24.6 net",
-    "socketley, Lua"
+    "Go 1.24.6 net"
    ],
    "tool": "srvgen (Go), 4 s a run, every answer checked",
    "commit": "81ffa51e",
@@ -1269,23 +1269,28 @@
      "name": "datagram echo, 64 B, 128 sockets, one in flight each",
      "v": [
       522517.0,
+      447374.0,
       162164.0,
-      429514.0,
-      447374.0
+      429514.0
      ],
      "cpu": [
       1.0,
       1.0,
-      0.997,
-      1.0
+      1.0,
+      0.997
      ],
      "ccpu": [
       11.345,
+      10.474,
       3.399,
-      10.28,
-      10.474
+      10.28
      ],
      "r": [
+      [
+       1.163,
+       1.15,
+       1.169
+      ],
       [
        3.224,
        3.123,
@@ -1295,11 +1300,6 @@
        1.202,
        1.189,
        1.221
-      ],
-      [
-       1.163,
-       1.15,
-       1.169
       ]
      ]
     },
@@ -1307,9 +1307,9 @@
      "name": "datagram echo, 1 KiB, 128 sockets, one in flight each",
      "v": [
       497019.0,
+      403590.0,
       190798.0,
-      413159.0,
-      403590.0
+      413159.0
      ],
      "cpu": [
       0.997,
@@ -1319,11 +1319,16 @@
      ],
      "ccpu": [
       11.243,
+      9.914,
       4.073,
-      10.133,
-      9.914
+      10.133
      ],
      "r": [
+      [
+       1.232,
+       1.228,
+       1.24
+      ],
       [
        2.604,
        2.577,
@@ -1333,11 +1338,6 @@
        1.204,
        1.201,
        1.218
-      ],
-      [
-       1.232,
-       1.228,
-       1.24
       ]
      ]
     }
