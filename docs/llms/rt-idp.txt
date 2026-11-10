@@ -65,14 +65,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### OpenID Connect provider
 
-Keycloak 26.8.1, 3 passes, 2026-11-09, socketley 85aa3476.
+Keycloak 26.8.1, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 255.0 req/s (3.99 cores) | 221.0 req/s (3.90 cores) | 1.13× (1.10–1.16) |
-| refresh token, 256 clients | 60 K req/s (2.92 cores) | 2.4 K req/s (3.86 cores) | 24.97× (24.32–27.57) |
-| userinfo, 512 clients | 519 K req/s (3.72 cores) | 20 K req/s (3.83 cores) | 25.87× (23.13–26.95) |
-| JWKS, 256 connections (wrk) | 497 K req/s (3.99 cores) | 28 K req/s (3.89 cores) | 17.94× (16.67–17.97) |
+| sign-in: authorization code with a password, 16 clients | 265.0 req/s (3.95 cores) | 223.0 req/s (3.90 cores) | 1.19× (1.18–1.24) |
+| refresh token, 256 clients | 59 K req/s (2.91 cores) | 2.4 K req/s (3.86 cores) | 24.85× (24.10–25.84) |
+| userinfo, 512 clients | 513 K req/s (3.75 cores) | 21 K req/s (3.83 cores) | 24.87× (24.11–26.34) |
+| JWKS, 256 connections (wrk) | 510 K req/s (3.99 cores) | 29 K req/s (3.91 cores) | 17.30× (15.83–17.73) |
 
 How it was measured: idpgen, 4s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen and wrk on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. Refresh and userinfo come from four idpgen processes and JWKS from wrk, with as many clients as fill socketley's four cores; refresh stays near the same rate from 256 to 512 clients, bound by the durable write of each rotated token family through shard 0. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Both are warmed with sign-ins before the passes until a 5 s run gains under 3% on the best before it: Keycloak's JIT compiles the flow over its first half minute, from about 100 to 190 sign-ins a second.
 

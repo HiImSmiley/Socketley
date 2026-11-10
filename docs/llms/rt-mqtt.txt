@@ -98,14 +98,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### MQTT broker, deliveries per second
 
-Mosquitto 2.0.22, 3 passes, 2026-11-09, socketley 85aa3476.
+Mosquitto 2.0.22, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Mosquitto | socketley vs Mosquitto |
 |---|---|---|---|
-| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 7.10 M msg/s (0.96 cores) | 800 K msg/s (0.99 cores) | 8.87× (8.82–9.10) |
-| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.29 M msg/s (1.00 cores) | 565 K msg/s (0.99 cores) | 19.87× (19.18–24.89) |
-| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.47 M msg/s (1.00 cores) | 70 K msg/s (1.00 cores) | 21.12× (20.89–21.32) |
-| round trip, QoS 1 publish to own delivery | 24.3 µs (0.96 cores) | 42.8 µs (0.68 cores) | 1.76× (1.61–1.76) |
+| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 7.23 M msg/s (0.95 cores) | 799 K msg/s (0.99 cores) | 9.06× (9.03–9.18) |
+| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.80 M msg/s (1.00 cores) | 576 K msg/s (0.99 cores) | 20.50× (20.43–20.68) |
+| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.50 M msg/s (1.00 cores) | 69 K msg/s (1.00 cores) | 21.64× (21.54–21.76) |
+| round trip, QoS 1 publish to own delivery | 26.6 µs (0.91 cores) | 42.7 µs (0.67 cores) | 1.60× (1.59–1.60) |
 
 How it was measured: mqbench (MQTT 3.1.1), 4 s a run; each broker on one core, mqbench on 20 others. MQTT 3.1.1, 64-byte payloads; Mosquitto with persistence off and unbounded queues, socketley --anonymous --session-queue 100000. A QoS 0 fan-out delivery costs Mosquitto about 2 µs of CPU, one write each; socketley coalesces the writes to a subscriber, which is the whole of the fan-out difference. The round trip is a QoS 1 publish to the publisher's own subscription.
 

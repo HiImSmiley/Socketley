@@ -49,20 +49,20 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
 
-- cache: 4.1× against Redis (GET)
-- server: 5.6× against nginx (1 KiB file, keep-alive, 256 connections)
-- proxy: 1.9× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
+- cache: 3.9× against Redis (GET)
+- server: 5.5× against nginx (1 KiB file, keep-alive, 256 connections)
+- proxy: 2.0× against HAProxy (HTTP, 1 KiB, keep-alive, 256 connections)
 - web: 4.9× against nginx (page 4 KiB, keep-alive, 256 connections)
 - dns: 1.2× against NSD (A queries over UDP)
-- mqtt: 21.1× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
-- storage: 18.8× against MinIO (GET 4 KiB, 64 connections)
-- db: 2.6× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
-- tunnel: 2.2× against frp (throughput, 512 MiB echoed through the tunnel)
-- metrics: 2.6× against Prometheus (CPU per sample ingested)
+- mqtt: 21.6× against Mosquitto (fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B)
+- storage: 18.2× against MinIO (GET 4 KiB, 64 connections)
+- db: 2.5× against MongoDB (mixed: 90% reads, 10% writes, 64 clients)
+- tunnel: 2.3× against frp (throughput, 512 MiB echoed through the tunnel)
+- metrics: 2.5× against Prometheus (CPU per sample ingested)
 - sync: 2.1× against rclone (first copy, 2000 files of 64 KiB and 50 of 1 MiB)
-- idp: 25.0× against Keycloak (refresh token, 256 clients)
-- mail: 4.1× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
-- mcp: 30.3× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
+- idp: 24.9× against Keycloak (refresh token, 256 clients)
+- mail: 4.4× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
+- mcp: 29.4× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
 - client: 1.1× against Go (request-answer: 1 connection, 64 B each way)
 
 ## Where to go next
@@ -2503,79 +2503,79 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Redis protocol, one command per round trip
 
-Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-09, socketley 85aa3476.
+Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 283 K /s (1.00 cores) | 177 K /s (1.00 cores) | 185 K /s (1.00 cores) | 1.60× (1.14–1.70) | 1.50× (1.50–1.61) |
-| GET | 287 K /s (1.00 cores) | 210 K /s (1.00 cores) | 192 K /s (1.00 cores) | 1.27× (1.10–1.42) | 1.52× (1.39–1.58) |
-| LPUSH | 281 K /s (1.00 cores) | 199 K /s (1.00 cores) | 216 K /s (1.00 cores) | 1.42× (1.39–1.46) | 1.30× (1.21–1.57) |
-| LPOP | 272 K /s (1.00 cores) | 191 K /s (1.00 cores) | 197 K /s (1.00 cores) | 1.43× (1.16–1.65) | 1.45× (1.37–1.66) |
-| SADD | 284 K /s (1.00 cores) | 187 K /s (1.00 cores) | 180 K /s (1.00 cores) | 1.52× (1.50–1.64) | 1.56× (1.51–1.70) |
-| HSET | 287 K /s (1.00 cores) | 177 K /s (1.00 cores) | 178 K /s (1.00 cores) | 1.61× (1.38–1.74) | 1.61× (1.53–1.74) |
-| ZADD | 196 K /s (1.00 cores) | 162 K /s (1.00 cores) | 157 K /s (1.00 cores) | 1.21× (1.21–1.22) | 1.29× (1.16–1.32) |
+| SET | 289 K /s (1.00 cores) | 165 K /s (1.00 cores) | 172 K /s (1.00 cores) | 1.78× (1.72–1.79) | 1.66× (1.55–1.86) |
+| GET | 283 K /s (1.00 cores) | 167 K /s (1.00 cores) | 174 K /s (1.00 cores) | 1.63× (1.57–1.71) | 1.64× (1.49–1.76) |
+| LPUSH | 272 K /s (1.00 cores) | 191 K /s (1.00 cores) | 169 K /s (1.00 cores) | 1.42× (1.42–1.44) | 1.70× (1.49–1.75) |
+| LPOP | 275 K /s (1.00 cores) | 187 K /s (1.00 cores) | 174 K /s (1.00 cores) | 1.47× (1.43–1.72) | 1.60× (1.48–1.63) |
+| SADD | 274 K /s (1.00 cores) | 178 K /s (1.00 cores) | 180 K /s (1.00 cores) | 1.58× (1.51–1.66) | 1.57× (1.52–1.84) |
+| HSET | 282 K /s (1.00 cores) | 175 K /s (1.00 cores) | 164 K /s (1.00 cores) | 1.61× (1.36–1.72) | 1.73× (1.53–1.75) |
+| ZADD | 196 K /s (1.00 cores) | 164 K /s (1.00 cores) | 163 K /s (1.00 cores) | 1.17× (1.13–1.26) | 1.19× (1.14–1.43) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. SET and GET draw their keys at random from about a million, as a cache's clients spread them. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
 
 ### Redis protocol, 100 commands per message (pipelined)
 
-Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-09, socketley 85aa3476.
+Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 9.68 M /s (0.99 cores) | 2.27 M /s (1.00 cores) | 2.61 M /s (1.00 cores) | 4.27× (4.21–4.32) | 3.70× (3.66–3.72) |
-| GET | 9.94 M /s (0.99 cores) | 2.43 M /s (1.00 cores) | 3.67 M /s (1.00 cores) | 4.07× (4.04–4.10) | 2.71× (2.68–2.72) |
-| SADD | 5.57 M /s (1.00 cores) | 2.81 M /s (1.00 cores) | 2.49 M /s (1.00 cores) | 1.98× (1.97–2.00) | 2.24× (2.22–2.25) |
-| HSET | 4.51 M /s (1.00 cores) | 2.18 M /s (1.00 cores) | 2.07 M /s (1.00 cores) | 2.07× (1.99–2.09) | 2.18× (2.15–2.21) |
-| ZADD | 548 K /s (1.00 cores) | 427 K /s (1.00 cores) | 435 K /s (1.00 cores) | 1.28× (1.26–1.29) | 1.26× (1.26–1.26) |
+| SET | 9.69 M /s (1.00 cores) | 2.31 M /s (1.00 cores) | 2.68 M /s (1.00 cores) | 4.18× (4.17–4.19) | 3.62× (3.60–3.63) |
+| GET | 9.87 M /s (0.99 cores) | 2.52 M /s (1.00 cores) | 3.80 M /s (1.00 cores) | 3.91× (3.90–3.93) | 2.60× (2.57–2.61) |
+| SADD | 5.76 M /s (1.00 cores) | 2.91 M /s (1.00 cores) | 2.55 M /s (1.00 cores) | 2.00× (1.96–2.04) | 2.23× (2.23–2.28) |
+| HSET | 4.64 M /s (1.00 cores) | 2.33 M /s (1.00 cores) | 2.11 M /s (1.00 cores) | 1.99× (1.98–2.00) | 2.18× (2.18–2.21) |
+| ZADD | 610 K /s (1.00 cores) | 473 K /s (1.00 cores) | 481 K /s (1.00 cores) | 1.29× (1.27–1.30) | 1.27× (1.25–1.28) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. SET and GET draw their keys at random from about a million, more than a core's caches hold, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
 
 ### Pipelined, one key
 
-Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-09, socketley 85aa3476.
+Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 14.72 M /s (1.00 cores) | 5.76 M /s (1.00 cores) | 2.89 M /s (1.00 cores) | 2.56× (2.55–2.57) | 5.09× (5.08–5.14) |
-| GET | 15.04 M /s (0.99 cores) | 7.01 M /s (1.00 cores) | 4.18 M /s (1.00 cores) | 2.15× (2.14–2.22) | 3.60× (3.59–3.67) |
-| LPUSH | 11.17 M /s (0.99 cores) | 4.79 M /s (1.00 cores) | 3.09 M /s (1.00 cores) | 2.33× (2.32–2.38) | 3.63× (3.60–3.64) |
-| LPOP | 12.80 M /s (1.00 cores) | 4.13 M /s (1.00 cores) | 2.75 M /s (1.00 cores) | 3.10× (3.08–3.13) | 4.61× (4.60–4.70) |
-| SADD | 13.82 M /s (1.00 cores) | 5.62 M /s (1.00 cores) | 3.72 M /s (1.00 cores) | 2.44× (2.44–2.46) | 3.71× (3.69–3.72) |
-| HSET | 10.87 M /s (1.00 cores) | 4.37 M /s (1.00 cores) | 2.81 M /s (1.00 cores) | 2.50× (2.48–2.51) | 3.86× (3.84–3.92) |
-| ZADD | 11.31 M /s (1.00 cores) | 4.33 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.61× (2.58–2.63) | 3.76× (3.71–3.77) |
+| SET | 14.39 M /s (1.00 cores) | 5.25 M /s (1.00 cores) | 2.94 M /s (1.00 cores) | 2.74× (2.72–2.75) | 4.88× (4.86–4.92) |
+| GET | 14.78 M /s (1.00 cores) | 6.29 M /s (1.00 cores) | 4.31 M /s (1.00 cores) | 2.35× (2.33–2.36) | 3.43× (3.43–3.45) |
+| LPUSH | 11.21 M /s (0.99 cores) | 4.99 M /s (0.99 cores) | 3.16 M /s (1.00 cores) | 2.25× (2.24–2.25) | 3.55× (3.54–3.55) |
+| LPOP | 13.06 M /s (0.99 cores) | 4.27 M /s (1.00 cores) | 2.83 M /s (1.00 cores) | 3.06× (3.06–3.06) | 4.63× (4.61–4.64) |
+| SADD | 13.84 M /s (0.99 cores) | 5.66 M /s (1.00 cores) | 3.74 M /s (1.00 cores) | 2.44× (2.44–2.45) | 3.69× (3.68–3.71) |
+| HSET | 10.43 M /s (1.00 cores) | 4.36 M /s (1.00 cores) | 2.84 M /s (1.00 cores) | 2.39× (2.39–2.40) | 3.68× (3.67–3.68) |
+| ZADD | 11.20 M /s (0.99 cores) | 4.29 M /s (1.00 cores) | 3.06 M /s (1.00 cores) | 2.61× (2.60–2.63) | 3.67× (3.60–3.69) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The same commands on one key, which stays in the core's cache: the easy case for every cache, kept to show parsing and executing alone.
 
 ### Four cores, a cluster-aware client
 
-Redis Cluster 8.0.5, 4 masters, 3 passes, 2026-11-09, socketley 85aa3476.
+Redis Cluster 8.0.5, 4 masters, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Redis Cluster 8.0.5, 4 masters | socketley vs Redis Cluster 8.0.5, 4 masters |
 |---|---|---|---|
-| SET | 26.04 M /s (3.32 cores) | 12.70 M /s (3.95 cores) | 2.05× (2.05–2.05) |
-| GET | 26.05 M /s (3.34 cores) | 13.97 M /s (3.84 cores) | 1.86× (1.86–1.95) |
-| LPUSH | 25.39 M /s (3.32 cores) | 13.97 M /s (3.91 cores) | 1.82× (1.82–2.00) |
-| LPOP | 25.40 M /s (3.05 cores) | 12.15 M /s (3.89 cores) | 2.09× (2.09–2.30) |
-| SADD | 28.51 M /s (3.20 cores) | 17.46 M /s (3.95 cores) | 1.63× (1.56–1.72) |
-| HSET | 28.53 M /s (3.34 cores) | 13.97 M /s (3.90 cores) | 2.04× (2.04–2.04) |
-| ZADD | 28.53 M /s (3.46 cores) | 12.70 M /s (3.83 cores) | 2.25× (2.15–2.25) |
+| SET | 24.96 M /s (3.25 cores) | 12.70 M /s (3.95 cores) | 1.97× (1.89–2.05) |
+| GET | 27.23 M /s (3.35 cores) | 13.97 M /s (3.86 cores) | 1.95× (1.79–2.04) |
+| LPUSH | 27.92 M /s (3.47 cores) | 13.97 M /s (3.91 cores) | 2.00× (2.00–2.00) |
+| LPOP | 25.40 M /s (2.99 cores) | 12.15 M /s (3.92 cores) | 2.09× (2.09–2.09) |
+| SADD | 28.53 M /s (3.17 cores) | 17.46 M /s (3.93 cores) | 1.63× (1.56–1.81) |
+| HSET | 28.53 M /s (3.39 cores) | 13.97 M /s (3.93 cores) | 2.04× (1.95–2.04) |
+| ZADD | 28.52 M /s (3.54 cores) | 12.70 M /s (3.85 cores) | 2.25× (2.25–2.25) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards and Redis Cluster as four masters, each shard or master pinned to one of the same four cores; five redis-benchmark --cluster processes on 20 others. SET and GET draw their keys at random from 1,048,576, 64 behind each of the 16,384 slot tags, preloaded so every GET finds its key (the hit rate is counted every pass). Every shard's mesh counters are read around every timed run: no command crossed between shards in any pass, so the client sent each to its owner. redis-benchmark --cluster's threads spin while they wait, so its client cores are no reading of headroom.
 
 ### Four cores, a plain client at one address
 
-Valkey 9.0.4, --io-threads 4, 3 passes, 2026-11-09, socketley 85aa3476.
+Valkey 9.0.4, --io-threads 4, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Valkey 9.0.4, --io-threads | socketley vs Valkey 9.0.4, --io-threads |
 |---|---|---|---|
-| SET | 12.45 M /s (3.95 cores) | 3.49 M /s (3.99 cores) | 3.58× (3.52–3.60) |
-| GET | 13.01 M /s (3.95 cores) | 4.98 M /s (3.99 cores) | 2.61× (2.49–2.61) |
-| LPUSH | 9.67 M /s (1.00 cores) | 4.69 M /s (3.99 cores) | 2.06× (2.05–2.08) |
-| LPOP | 11.69 M /s (1.00 cores) | 3.57 M /s (3.99 cores) | 3.28× (3.27–3.29) |
-| SADD | 12.12 M /s (1.00 cores) | 6.31 M /s (3.99 cores) | 1.92× (1.92–1.92) |
-| HSET | 10.49 M /s (1.00 cores) | 5.05 M /s (3.99 cores) | 2.08× (2.04–2.09) |
-| ZADD | 9.97 M /s (1.00 cores) | 4.81 M /s (3.99 cores) | 2.07× (2.06–2.08) |
+| SET | 12.55 M /s (3.97 cores) | 3.49 M /s (3.99 cores) | 3.59× (3.54–3.63) |
+| GET | 13.17 M /s (3.97 cores) | 5.05 M /s (3.99 cores) | 2.61× (2.60–2.64) |
+| LPUSH | 9.76 M /s (1.00 cores) | 4.63 M /s (3.99 cores) | 2.11× (2.11–2.12) |
+| LPOP | 11.67 M /s (1.00 cores) | 3.50 M /s (3.99 cores) | 3.35× (3.33–3.40) |
+| SADD | 12.03 M /s (1.00 cores) | 6.17 M /s (3.99 cores) | 1.95× (1.94–1.97) |
+| HSET | 10.35 M /s (1.00 cores) | 4.88 M /s (3.99 cores) | 2.12× (2.11–2.13) |
+| ZADD | 9.92 M /s (1.00 cores) | 4.70 M /s (3.99 cores) | 2.12× (2.09–2.14) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards on one port and Valkey with four I/O threads, on the same four cores; five redis-benchmark processes on 20 others. SET and GET draw their keys at random from 1,048,576, three in four of them owned by another shard than the one a connection landed on: socketley carries those over its shard mesh, many commands a frame. LPUSH to ZADD name one key, which one shard owns, so socketley runs those on one of its four cores (see the cores column) and Valkey on its four I/O threads.
 
@@ -2845,14 +2845,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### JSON documents over HTTP
 
-MongoDB 9.0.4, PocketBase 0.40.5, 3 passes, 2026-11-09, socketley 85aa3476.
+MongoDB 9.0.4, PocketBase 0.40.5, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | MongoDB | PocketBase | socketley vs MongoDB | socketley vs PocketBase |
 |---|---|---|---|---|---|
-| read one document by id, 64 clients | 679 K req/s (3.47 cores) | 148 K req/s (3.88 cores) | 34 K req/s (3.86 cores) | 4.72× (4.34–11.00) | 19.73× (19.36–19.78) |
-| replace one document, 64 clients | 130 K req/s (3.16 cores) | 100 K req/s (3.94 cores) | 12 K req/s (2.73 cores) | 1.32× (1.24–1.32) | 11.22× (10.89–11.35) |
-| query on an indexed field, 64 clients | 495 K req/s (3.55 cores) | 83 K req/s (3.89 cores) | 21 K req/s (3.77 cores) | 5.95× (5.87–6.33) | 23.05× (22.58–23.80) |
-| mixed: 90% reads, 10% writes, 64 clients | 329 K req/s (3.60 cores) | 126 K req/s (3.91 cores) | 38 K req/s (3.59 cores) | 2.58× (2.45–2.67) | 8.75× (8.71–8.76) |
+| read one document by id, 64 clients | 689 K req/s (3.46 cores) | 153 K req/s (3.87 cores) | 36 K req/s (3.86 cores) | 4.42× (4.36–11.45) | 19.23× (18.89–20.06) |
+| replace one document, 64 clients | 133 K req/s (3.11 cores) | 105 K req/s (3.94 cores) | 12 K req/s (2.72 cores) | 1.26× (1.26–1.27) | 11.37× (10.82–11.82) |
+| query on an indexed field, 64 clients | 494 K req/s (3.54 cores) | 82 K req/s (3.89 cores) | 22 K req/s (3.80 cores) | 6.01× (5.71–6.10) | 22.21× (21.74–22.78) |
+| mixed: 90% reads, 10% writes, 64 clients | 339 K req/s (3.62 cores) | 134 K req/s (3.90 cores) | 39 K req/s (3.62 cores) | 2.48× (2.44–2.65) | 8.90× (8.41–9.48) |
 
 How it was measured: loadgen, 4s a run, 100,000 documents, data on tmpfs; all three on the same four cores (socketley as four shards), loadgen on 20 others. 100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db hands every write to shard 0, so its writes are at most what one shard takes, at more cores; reads and queries spread over all four.
 
@@ -2941,12 +2941,12 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Authoritative DNS, one zone of 10,000 names
 
-NSD 4.14.0, Knot 3.5.3, 3 passes, 2026-11-09, socketley 85aa3476.
+NSD 4.14.0, Knot 3.5.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | NSD | Knot | socketley vs NSD | socketley vs Knot |
 |---|---|---|---|---|---|
-| A queries over UDP | 442 K q per core·s (1.00 cores) | 357 K q per core·s (0.87 cores) | 304 K q per core·s (0.87 cores) | 1.23× (1.14–1.24) | 1.45× (1.43–1.51) |
-| A queries over TCP, 128 connections | 192 K q per core·s (0.99 cores) | 57 K q per core·s (0.87 cores) | 62 K q per core·s (0.98 cores) | 3.38× (3.30–3.42) | 3.06× (3.03–3.10) |
+| A queries over UDP | 475 K q per core·s (1.00 cores) | 392 K q per core·s (0.83 cores) | 305 K q per core·s (0.86 cores) | 1.21× (1.17–1.33) | 1.55× (1.50–1.62) |
+| A queries over TCP, 128 connections | 193 K q per core·s (0.99 cores) | 59 K q per core·s (0.87 cores) | 60 K q per core·s (0.98 cores) | 3.29× (3.21–3.36) | 3.22× (2.89–3.23) |
 
 How it was measured: dnsperf 8 threads, 32 sockets, 4 s a run, zone of 10000 names; each server one worker on one core, dnsperf on 20 others. Queries answered per second of server CPU (rate ÷ cores), because NSD and Knot do not fill their cores at a window of 500 outstanding queries, and with more they drop UDP from their default socket buffers and dnsperf waits out each loss. socketley runs with --rrl 0 --proxy none: its response rate limit, on by default, would throttle one client host, and NSD and Knot have none by default. 90% of queries find a name, 10% are NXDOMAIN.
 
@@ -3024,14 +3024,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### OpenID Connect provider
 
-Keycloak 26.8.1, 3 passes, 2026-11-09, socketley 85aa3476.
+Keycloak 26.8.1, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 255.0 req/s (3.99 cores) | 221.0 req/s (3.90 cores) | 1.13× (1.10–1.16) |
-| refresh token, 256 clients | 60 K req/s (2.92 cores) | 2.4 K req/s (3.86 cores) | 24.97× (24.32–27.57) |
-| userinfo, 512 clients | 519 K req/s (3.72 cores) | 20 K req/s (3.83 cores) | 25.87× (23.13–26.95) |
-| JWKS, 256 connections (wrk) | 497 K req/s (3.99 cores) | 28 K req/s (3.89 cores) | 17.94× (16.67–17.97) |
+| sign-in: authorization code with a password, 16 clients | 265.0 req/s (3.95 cores) | 223.0 req/s (3.90 cores) | 1.19× (1.18–1.24) |
+| refresh token, 256 clients | 59 K req/s (2.91 cores) | 2.4 K req/s (3.86 cores) | 24.85× (24.10–25.84) |
+| userinfo, 512 clients | 513 K req/s (3.75 cores) | 21 K req/s (3.83 cores) | 24.87× (24.11–26.34) |
+| JWKS, 256 connections (wrk) | 510 K req/s (3.99 cores) | 29 K req/s (3.91 cores) | 17.30× (15.83–17.73) |
 
 How it was measured: idpgen, 4s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen and wrk on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. Refresh and userinfo come from four idpgen processes and JWKS from wrk, with as many clients as fill socketley's four cores; refresh stays near the same rate from 256 to 512 clients, bound by the durable write of each rotated token family through shard 0. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Both are warmed with sign-ins before the passes until a 5 s run gains under 3% on the best before it: Keycloak's JIT compiles the flow over its first half minute, from about 100 to 190 sign-ins a second.
 
@@ -3212,16 +3212,16 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Mail: delivery in, IMAP and POP3 out
 
-Postfix 3.10.6 + Dovecot 2.4.2, 3 passes, 2026-11-09, socketley 85aa3476.
+Postfix 3.10.6 + Dovecot 2.4.2, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Postfix 3.10.6 + Dovecot | socketley vs Postfix 3.10.6 + Dovecot |
 |---|---|---|---|
-| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 438.0 msg/s (0.11 cores) | 107.0 msg/s (0.25 cores) | 4.09× (3.64–4.24) |
-| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 255.0 msg/s (0.18 cores) | 61.4 msg/s (0.18 cores) | 3.78× (3.71–4.16) |
-| IMAP: LOGIN and LOGOUT, 8 clients | 126.0 sign-ins/s (0.99 cores) | 64.8 sign-ins/s (0.99 cores) | 1.95× (1.92–1.96) |
-| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 480 K msg/s (0.99 cores) | 124 K msg/s (0.99 cores) | 3.88× (3.74–3.93) |
-| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 21 K msg/s (0.99 cores) | 13 K msg/s (0.99 cores) | 1.54× (1.44–1.58) |
-| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 13 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.86× (1.82–1.87) |
+| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 569.0 msg/s (0.14 cores) | 129.0 msg/s (0.30 cores) | 4.43× (3.88–4.43) |
+| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 345.0 msg/s (0.23 cores) | 75.5 msg/s (0.21 cores) | 4.62× (3.98–5.25) |
+| IMAP: LOGIN and LOGOUT, 8 clients | 127.0 sign-ins/s (0.99 cores) | 65.2 sign-ins/s (0.99 cores) | 1.94× (1.94–1.95) |
+| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 484 K msg/s (0.99 cores) | 125 K msg/s (0.99 cores) | 3.88× (3.87–3.94) |
+| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 21 K msg/s (0.99 cores) | 14 K msg/s (0.99 cores) | 1.51× (1.43–1.56) |
+| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 13 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.82× (1.82–1.88) |
 
 How it was measured: smtp-source (64 processes x 1 connections); mailload.py (8 asyncio processes x 1 connection), 4 s a run; every process of each on the same one core (socketley's daemon, idp, storage and mail; Postfix and Dovecot); smtp-source and mailload on 20 others; data on the VM's ext4 disk. Postfix hands each message over LMTP to Dovecot's Maildir and index; socketley's mail runtime writes it into its storage runtime. Both sync to disk (about 4 ms a sync here) before a message counts, so the SMTP rows are bound by syncs, not cores, and are timed until the last message is in its mailbox. Every sign-in hashes the password: scrypt in socketley, yescrypt in Dovecot. Dovecot 2.4's lmtp_user_concurrency_limit is set to unlimited, 2.3's default, since 10 made Postfix wait out five-minute retries.
 
@@ -3320,14 +3320,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### MCP server over Streamable HTTP
 
-MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 3 passes, 2026-11-09, socketley 85aa3476.
+MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
 |---|---|---|---|---|---|
-| initialize + tools/list, a new session each, 64 at once | 72 K req/s (0.97 cores) | 1.1 K req/s (1.00 cores) | 1.6 K req/s (1.00 cores) | 62.95× (62.80–63.51) | 44.65× (44.02–46.69) |
-| tools/call add(a, b), 64 sessions | 150 K req/s (0.98 cores) | 4.9 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 30.26× (30.03–30.50) | 21.07× (20.81–21.36) |
-| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.90 cores) | 5.2 K req/s (1.00 cores) | 6.7 K req/s (1.00 cores) | 10.45× (10.25–10.49) | 8.15× (8.07–8.35) |
-| resources/read, 1 KiB of text, 64 sessions | 160 K req/s (0.95 cores) | 5.3 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 30.05× (29.29–32.46) | 21.75× (20.94–22.01) |
+| initialize + tools/list, a new session each, 64 at once | 72 K req/s (0.97 cores) | 1.1 K req/s (0.99 cores) | 1.6 K req/s (1.00 cores) | 63.16× (62.26–63.26) | 43.78× (43.54–46.59) |
+| tools/call add(a, b), 64 sessions | 152 K req/s (0.98 cores) | 5.1 K req/s (1.00 cores) | 7.0 K req/s (1.00 cores) | 29.44× (27.96–31.10) | 21.55× (21.08–21.81) |
+| tools/call returning 16 KiB of text, 64 sessions | 55 K req/s (0.90 cores) | 5.2 K req/s (1.00 cores) | 6.7 K req/s (1.00 cores) | 10.62× (10.43–10.90) | 8.21× (8.10–8.42) |
+| resources/read, 1 KiB of text, 64 sessions | 161 K req/s (0.95 cores) | 5.4 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 29.83× (28.25–30.20) | 21.75× (21.20–22.16) |
 
 How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 4s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
 
@@ -3436,13 +3436,13 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Scraping 100,000 series a second
 
-Prometheus 2.53.5, VictoriaMetrics 1.112, 3 passes, 2026-11-09, socketley 85aa3476.
+Prometheus 2.53.5, VictoriaMetrics 1.112, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
 |---|---|---|---|---|---|
-| CPU per sample ingested | 0.28 µs (0.03 cores) | 0.72 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.56× (2.55–2.67) | 3.53× (3.50–3.64) |
-| resident memory | 88.8 MB | 396 MB | 137 MB | 4.46× (4.21–4.71) | 1.55× (1.53–1.55) |
-| range query, 5 min of every path | 37.7 ms | 387 ms | 108 ms | 10.38× (4.24–12.43) | 2.88× (1.24–6.91) |
+| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.74 µs (0.07 cores) | 0.99 µs (0.10 cores) | 2.55× (2.53–2.58) | 3.47× (3.35–3.49) |
+| resident memory | 91.0 MB | 387 MB | 127 MB | 4.25× (3.95–4.87) | 1.40× (1.27–1.40) |
+| range query, 5 min of every path | 38.0 ms | 359 ms | 133 ms | 9.84× (4.46–11.87) | 3.51× (1.66–4.45) |
 
 How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
 
@@ -3553,14 +3553,14 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### MQTT broker, deliveries per second
 
-Mosquitto 2.0.22, 3 passes, 2026-11-09, socketley 85aa3476.
+Mosquitto 2.0.22, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Mosquitto | socketley vs Mosquitto |
 |---|---|---|---|
-| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 7.10 M msg/s (0.96 cores) | 800 K msg/s (0.99 cores) | 8.87× (8.82–9.10) |
-| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.29 M msg/s (1.00 cores) | 565 K msg/s (0.99 cores) | 19.87× (19.18–24.89) |
-| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.47 M msg/s (1.00 cores) | 70 K msg/s (1.00 cores) | 21.12× (20.89–21.32) |
-| round trip, QoS 1 publish to own delivery | 24.3 µs (0.96 cores) | 42.8 µs (0.68 cores) | 1.76× (1.61–1.76) |
+| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 7.23 M msg/s (0.95 cores) | 799 K msg/s (0.99 cores) | 9.06× (9.03–9.18) |
+| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.80 M msg/s (1.00 cores) | 576 K msg/s (0.99 cores) | 20.50× (20.43–20.68) |
+| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.50 M msg/s (1.00 cores) | 69 K msg/s (1.00 cores) | 21.64× (21.54–21.76) |
+| round trip, QoS 1 publish to own delivery | 26.6 µs (0.91 cores) | 42.7 µs (0.67 cores) | 1.60× (1.59–1.60) |
 
 How it was measured: mqbench (MQTT 3.1.1), 4 s a run; each broker on one core, mqbench on 20 others. MQTT 3.1.1, 64-byte payloads; Mosquitto with persistence off and unbounded queues, socketley --anonymous --session-queue 100000. A QoS 0 fan-out delivery costs Mosquitto about 2 µs of CPU, one write each; socketley coalesces the writes to a subscriber, which is the whole of the fan-out difference. The round trip is a QoS 1 publish to the publisher's own subscription.
 
@@ -3707,29 +3707,29 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Reverse proxy, HTTP and TCP
 
-HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 56 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.38× (1.32–1.40) | 1.85× (1.79–1.89) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 71 K req/s (0.99 cores) | 37 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 1.95× (1.90–1.95) | 2.27× (2.24–2.28) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 31 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 15 K req/s (1.00 cores) | 1.42× (1.36–1.46) | 1.99× (1.96–2.05) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 1.64× (1.62–1.65) | 2.03× (2.00–2.04) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 93 K req/s (1.00 cores) | 44 K req/s (1.00 cores) | 64 K req/s (1.00 cores) | 2.15× (2.10–2.16) | 1.46× (1.42–1.46) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 52 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 29 K req/s (1.00 cores) | 1.26× (1.24–1.28) | 1.75× (1.74–1.76) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 71 K req/s (1.00 cores) | 36 K req/s (1.00 cores) | 31 K req/s (0.99 cores) | 2.01× (1.85–2.04) | 2.30× (2.19–2.34) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 30 K req/s (0.99 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.37× (1.34–1.39) | 1.89× (1.86–1.91) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 28 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.57× (1.57–1.65) | 2.06× (2.04–2.10) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 95 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 65 K req/s (1.00 cores) | 2.15× (2.15–2.33) | 1.43× (1.36–1.53) |
 
 How it was measured: wrk 8 threads, 4 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ### Reverse proxy on four cores
 
-HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 141 K req/s (3.99 cores) | 107 K req/s (4.00 cores) | 104 K req/s (3.83 cores) | 1.32× (1.24–1.39) | 1.42× (1.28–1.44) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 166 K req/s (4.00 cores) | 126 K req/s (4.00 cores) | 116 K req/s (4.00 cores) | 1.31× (1.28–1.33) | 1.43× (1.42–1.44) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 94 K req/s (3.99 cores) | 77 K req/s (3.99 cores) | 57 K req/s (3.99 cores) | 1.22× (1.21–1.22) | 1.65× (1.64–1.65) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 104 K req/s (3.95 cores) | 84 K req/s (3.98 cores) | 75 K req/s (3.84 cores) | 1.23× (1.23–1.24) | 1.40× (1.38–1.41) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 209 K req/s (4.00 cores) | 173 K req/s (4.00 cores) | 181 K req/s (4.00 cores) | 1.21× (1.20–1.21) | 1.15× (1.15–1.17) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 151 K req/s (3.99 cores) | 109 K req/s (4.00 cores) | 102 K req/s (3.73 cores) | 1.36× (1.35–1.39) | 1.48× (1.41–1.50) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 166 K req/s (3.99 cores) | 128 K req/s (4.00 cores) | 116 K req/s (4.00 cores) | 1.30× (1.29–1.32) | 1.43× (1.41–1.45) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 93 K req/s (3.99 cores) | 75 K req/s (3.99 cores) | 56 K req/s (3.99 cores) | 1.24× (1.22–1.25) | 1.68× (1.65–1.68) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 105 K req/s (3.96 cores) | 82 K req/s (3.98 cores) | 74 K req/s (3.83 cores) | 1.28× (1.25–1.29) | 1.42× (1.42–1.42) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 206 K req/s (3.99 cores) | 171 K req/s (4.00 cores) | 180 K req/s (4.00 cores) | 1.20× (1.18–1.20) | 1.14× (1.13–1.15) |
 
 How it was measured: wrk 16 threads, 4 s a run; socketley as four shards, HAProxy with four threads and nginx with four workers, each pinned to one of the same four cores; the nginx backend (eight workers) on eight others, wrk (16 threads) on 14. The same rows as the one-core set, the same wrk for every arm; the backend is not what the proxies run into. As in the server set, each wrk thread holds connections on all four of socketley's shards, so part of every arm's CPU is waking the co-located client across cores. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
@@ -3894,27 +3894,27 @@ How it was measured: srvgen (Go), 4 s a run, every answer checked; each server o
 
 ### HTTP: static files and a fixed answer
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 285 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 5.65× (5.53–5.71) |
-| 64 KiB file, keep-alive, 256 connections | 97 K req/s (0.99 cores) | 46 K req/s (1.00 cores) | 2.09× (1.96–2.19) |
-| 1 KiB file, a connection per request, 64 at once | 81 K req/s (0.99 cores) | 35 K req/s (1.00 cores) | 2.30× (2.25–2.31) |
-| fixed answer (Lua handler / nginx return), keep-alive | 241 K req/s (0.99 cores) | 68 K req/s (0.99 cores) | 3.43× (3.12–3.54) |
+| 1 KiB file, keep-alive, 256 connections | 271 K req/s (1.00 cores) | 50 K req/s (0.99 cores) | 5.46× (5.42–5.51) |
+| 64 KiB file, keep-alive, 256 connections | 93 K req/s (1.00 cores) | 47 K req/s (0.99 cores) | 2.00× (1.98–2.16) |
+| 1 KiB file, a connection per request, 64 at once | 83 K req/s (0.99 cores) | 35 K req/s (1.00 cores) | 2.36× (2.33–2.48) |
+| fixed answer (Lua handler / nginx return), keep-alive | 246 K req/s (1.00 cores) | 77 K req/s (0.99 cores) | 3.22× (3.08–3.54) |
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ### HTTP on four cores
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 517 K req/s (3.99 cores) | 233 K req/s (3.99 cores) | 2.22× (2.15–2.28) |
-| 64 KiB file, keep-alive, 256 connections | 233 K req/s (3.99 cores) | 169 K req/s (3.99 cores) | 1.39× (1.36–1.41) |
-| 1 KiB file, a connection per request, 64 at once | 158 K req/s (3.94 cores) | 132 K req/s (3.89 cores) | 1.20× (1.19–1.20) |
-| fixed answer (Lua handler / nginx return), keep-alive | 448 K req/s (3.99 cores) | 307 K req/s (3.99 cores) | 1.46× (1.45–1.48) |
+| 1 KiB file, keep-alive, 256 connections | 500 K req/s (3.99 cores) | 230 K req/s (3.99 cores) | 2.17× (2.15–2.25) |
+| 64 KiB file, keep-alive, 256 connections | 229 K req/s (3.98 cores) | 166 K req/s (3.99 cores) | 1.38× (1.36–1.40) |
+| 1 KiB file, a connection per request, 64 at once | 158 K req/s (3.94 cores) | 131 K req/s (3.90 cores) | 1.21× (1.21–1.21) |
+| fixed answer (Lua handler / nginx return), keep-alive | 451 K req/s (3.99 cores) | 297 K req/s (3.98 cores) | 1.52× (1.46–1.54) |
 
 How it was measured: wrk 16 threads, 4 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
@@ -4051,16 +4051,16 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### S3 over HTTP, SigV4
 
-MinIO 2025-09-07, 3 passes, 2026-11-09, socketley 85aa3476.
+MinIO 2025-09-07, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | MinIO | socketley vs MinIO |
 |---|---|---|---|
-| GET 4 KiB, 1 connection | 21 K obj/s (0.63 cores) | 3.9 K obj/s (1.27 cores) | 5.37× (5.33–5.44) |
-| GET 4 KiB, 64 connections | 452 K obj/s (3.78 cores) | 24 K obj/s (3.98 cores) | 18.84× (18.14–19.04) |
-| GET 4 KiB, 128 connections | 553 K obj/s (3.92 cores) | 23 K obj/s (3.98 cores) | 23.47× (21.85–24.16) |
-| GET 4 KiB, 64 connections, from 50,000 objects | 237 K obj/s (3.95 cores) | 24 K obj/s (3.99 cores) | 10.05× (9.72–10.15) |
-| GET 1 MiB, 64 connections | 40 K obj/s (3.94 cores) | 5.9 K obj/s (3.95 cores) | 6.76× (6.73–6.77) |
-| PUT 4 KiB, 64 connections, into an empty store | 79 K obj/s (3.77 cores) | 15 K obj/s (3.98 cores) | 5.17× (5.07–5.24) |
+| GET 4 KiB, 1 connection | 21 K obj/s (0.63 cores) | 3.9 K obj/s (1.28 cores) | 5.29× (5.22–5.31) |
+| GET 4 KiB, 64 connections | 451 K obj/s (3.78 cores) | 25 K obj/s (3.99 cores) | 18.17× (17.98–18.73) |
+| GET 4 KiB, 128 connections | 557 K obj/s (3.92 cores) | 24 K obj/s (3.99 cores) | 23.11× (22.69–23.75) |
+| GET 4 KiB, 64 connections, from 50,000 objects | 251 K obj/s (3.96 cores) | 24 K obj/s (3.99 cores) | 10.42× (10.10–10.51) |
+| GET 1 MiB, 64 connections | 42 K obj/s (3.95 cores) | 6.0 K obj/s (3.96 cores) | 7.05× (6.97–7.12) |
+| PUT 4 KiB, 64 connections, into an empty store | 79 K obj/s (3.75 cores) | 15 K obj/s (3.98 cores) | 5.11× (4.92–5.31) |
 
 How it was measured: s3gen (Go, one process, a request in flight per connection), 4s a run, SigV4 over plain HTTP, PUT bodies aws-chunked and signed; both servers on the same four cores (socketley as four shards), s3gen on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. s3gen signs every request with SigV4 as warp does (PUTs as signed aws-chunked bodies) and checks every answer's status, length and ETag; from 64 connections both servers fill their four cores. The 4 KiB rows read 2,500 objects, which socketley keeps as in-memory copies; the 50,000-object row reads past them, where every GET opens its file as MinIO's always do. The PUT row starts both servers afresh on empty storage for every pass, because MinIO reclaims deleted objects in the background and its puts slow while it does.
 
@@ -4119,40 +4119,40 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Carrying a directory to a storage and back
 
-rclone v1.75.2, mc 2025-08-13, 3 passes, 2026-11-09, socketley 85aa3476.
+rclone v1.75.2, mc 2025-08-13, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | rclone | mc | socketley vs rclone | socketley vs mc |
 |---|---|---|---|---|---|
-| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 8.9 K files/s (0.22 cores) | 4.2 K files/s (1.78 cores) | 2.8 K files/s (1.17 cores) | 2.12× (2.08–2.16) | 3.22× (3.12–3.26) |
-| 1000 files changed after it | 6.5 K files/s (0.39 cores) | 3.6 K files/s (1.57 cores) | 2.6 K files/s (1.20 cores) | 1.81× (1.79–1.91) | 2.48× (2.40–2.49) |
-| first copy, 20,000 files of 4 KiB | 24 K files/s (0.51 cores) | 6.9 K files/s (1.67 cores) | 4.3 K files/s (1.37 cores) | 3.47× (3.40–3.49) | 5.65× (5.65–5.69) |
-| first copy, 8 files of 256 MiB | 2.9 K MiB/s (0.10 cores) | 623.0 MiB/s (1.51 cores) | 2.0 K MiB/s (1.37 cores) | 4.66× (4.64–5.00) | 1.43× (1.41–1.45) |
-| first copy, a tree 12 directories deep: 8,190 files of 4 KiB in 4,095 directories | 22 K files/s (0.55 cores) | 6.7 K files/s (1.68 cores) | 4.1 K files/s (1.35 cores) | 3.32× (3.30–3.43) | 5.43× (5.40–5.50) |
-| checked again, 1 of 20,000 files deleted since: time | 74.6 ms (0.40 cores) | 224 ms (1.21 cores) | 265 ms (1.26 cores) | 2.99× (2.95–3.06) | 3.56× (3.55–3.56) |
-| checked again, 1 of 20,000 files deleted since: requests sent | 1.0 requests (0.37 cores) | 21.0 requests (1.22 cores) | 22.0 requests (1.26 cores) | 21.00× (21.00–21.00) | 22.00× (22.00–22.00) |
-| 1,000 files deleted | 40 K files/s (0.80 cores) | 12 K files/s (1.40 cores) | 6.9 K files/s (1.28 cores) | 3.44× (3.29–3.47) | 5.88× (5.71–5.90) |
-| a directory of 1,000 files renamed | 7.7 K files/s (0.31 cores) | 3.5 K files/s (1.69 cores) | 2.0 K files/s (1.20 cores) | 2.18× (2.16–2.27) | 3.78× (3.69–3.92) |
-| pulled into an empty directory, 2000 files of 64 KiB and 50 of 1 MiB | 20 K files/s (0.89 cores) | 6.9 K files/s (1.84 cores) | 4.1 K files/s (1.38 cores) | 2.91× (2.86–2.91) | 4.89× (4.86–4.91) |
+| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 8.9 K files/s (0.21 cores) | 4.3 K files/s (1.76 cores) | 2.8 K files/s (1.18 cores) | 2.07× (2.06–2.11) | 3.18× (3.15–3.25) |
+| 1000 files changed after it | 6.6 K files/s (0.40 cores) | 3.5 K files/s (1.56 cores) | 2.7 K files/s (1.19 cores) | 1.86× (1.86–1.88) | 2.46× (2.44–2.49) |
+| first copy, 20,000 files of 4 KiB | 24 K files/s (0.52 cores) | 7.1 K files/s (1.66 cores) | 4.3 K files/s (1.37 cores) | 3.43× (3.30–3.44) | 5.72× (5.71–5.76) |
+| first copy, 8 files of 256 MiB | 2.9 K MiB/s (0.08 cores) | 618.0 MiB/s (1.47 cores) | 2.0 K MiB/s (1.36 cores) | 4.68× (4.49–4.81) | 1.43× (1.42–1.43) |
+| first copy, a tree 12 directories deep: 8,190 files of 4 KiB in 4,095 directories | 22 K files/s (0.57 cores) | 6.8 K files/s (1.69 cores) | 4.1 K files/s (1.34 cores) | 3.27× (3.24–3.27) | 5.49× (5.39–5.58) |
+| checked again, 1 of 20,000 files deleted since: time | 73.9 ms (0.27 cores) | 219 ms (1.25 cores) | 270 ms (1.25 cores) | 2.93× (2.92–3.00) | 3.65× (3.57–3.67) |
+| checked again, 1 of 20,000 files deleted since: requests sent | 1.0 requests (0.37 cores) | 21.0 requests (1.23 cores) | 22.0 requests (1.26 cores) | 21.00× (21.00–21.00) | 22.00× (22.00–22.00) |
+| 1,000 files deleted | 41 K files/s (0.82 cores) | 11 K files/s (1.29 cores) | 7.0 K files/s (1.27 cores) | 3.70× (3.55–3.74) | 5.83× (5.76–6.08) |
+| a directory of 1,000 files renamed | 7.7 K files/s (0.31 cores) | 3.4 K files/s (1.66 cores) | 2.0 K files/s (1.22 cores) | 2.27× (2.22–2.35) | 3.68× (3.67–3.82) |
+| pulled into an empty directory, 2000 files of 64 KiB and 50 of 1 MiB | 21 K files/s (0.90 cores) | 6.7 K files/s (1.82 cores) | 4.1 K files/s (1.37 cores) | 3.03× (3.03–3.06) | 5.05× (4.95–5.11) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carriers on two cores, the target storage runtime in a daemon of its own on four others. One socketley storage runtime on tmpfs is the target for all three, a fresh bucket a run, every run checked key for key and byte for byte. rclone 1.75.2 runs as its S3 docs advise (--transfers 8 --checkers 16 --fast-list --update --use-server-modtime), mc mirror with --overwrite --remove and eight workers. A socketley job walks once at start and then follows inotify, where the others walk both sides again; it checks a whole tree only when it starts, so the re-check row is a stop and a start, with one file deleted so its end can be seen.
 
 ### A change noticed while running
 
-mc 2025-08-13, 3 passes, 2026-11-09, socketley 85aa3476.
+mc 2025-08-13, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | mc | socketley vs mc |
 |---|---|---|---|
-| a 64 KiB file written, until it is in the storage | 0.89 ms (0.00 cores) | 1.37 ms (0.03 cores) | 1.67× (1.41–1.75) |
+| a 64 KiB file written, until it is in the storage | 0.87 ms (0.00 cores) | 1.57 ms (0.03 cores) | 1.83× (1.73–2.15) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the storage on four others. Each file is timed from its write until a HEAD of its key answers with its MD5, one write at a time. rclone has no watch mode; mc mirror --watch is the nearest tool.
 
 ### Both ways at once
 
-rclone v1.75.2, 3 passes, 2026-11-09, socketley 85aa3476.
+rclone v1.75.2, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | rclone | socketley vs rclone |
 |---|---|---|---|
-| both ways: 500 files changed here and 500 in the storage | 12 K files/s (0.37 cores) | 2.4 K files/s (1.58 cores) | 5.09× (4.97–5.35) |
+| both ways: 500 files changed here and 500 in the storage | 12 K files/s (0.36 cores) | 2.3 K files/s (1.55 cores) | 5.30× (5.28–5.44) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the storage on four others. A tree and a bucket in step, then 500 files rewritten here and 500 others replaced in the storage, then one run: socketley --mode inout against rclone bisync. mc mirror carries one way only.
 
@@ -4231,12 +4231,12 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### A TCP service behind an edge
 
-frp 0.71.1, 3 passes, 2026-11-09, socketley 85aa3476.
+frp 0.71.1, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | frp | socketley vs frp |
 |---|---|---|---|
-| round trip through the tunnel, 64 B echo | 89.5 µs (0.86 cores) | 168 µs (1.34 cores) | 1.87× (1.87–1.88) |
-| throughput, 512 MiB echoed through the tunnel | 1.9 K MiB/s (1.92 cores) | 832.0 MiB/s (1.79 cores) | 2.25× (2.20–2.48) |
+| round trip through the tunnel, 64 B echo | 90.0 µs (0.83 cores) | 167 µs (1.34 cores) | 1.86× (1.85–1.90) |
+| throughput, 512 MiB echoed through the tunnel | 2.0 K MiB/s (1.91 cores) | 872.0 MiB/s (1.82 cores) | 2.27× (2.25–2.35) |
 
 How it was measured: tb_client, one connection; agent and edge (frpc and frps) on the same two cores, the echo service on a third. socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in about half frp's time and moves bulk data at more than twice its rate.
 
@@ -4320,20 +4320,20 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Static site: pages, assets, compression, revalidation
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| page 4 KiB, keep-alive, 256 connections | 226 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.89× (4.52–4.90) |
-| page 4 KiB, a connection per request, 64 at once | 76 K req/s (0.99 cores) | 32 K req/s (1.00 cores) | 2.37× (2.35–2.41) |
-| asset 64 KiB (hashed name), keep-alive, 256 connections | 69 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 1.62× (1.61–1.90) |
-| file 1 MiB, keep-alive, 64 connections | 26 K req/s (1.00 cores) | 20 K req/s (1.00 cores) | 1.23× (1.22–1.28) |
-| page 4 KiB as gzip, the .gz beside it | 275 K req/s (1.00 cores) | 48 K req/s (1.00 cores) | 5.69× (5.39–5.89) |
-| page 4 KiB as brotli, the .br beside it | 275 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 5.83× (5.70–6.10) |
-| page 4 KiB as gzip, no .gz on disk | 267 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 10.44× (10.13–10.87) |
-| revalidation: If-None-Match, 304 | 268 K req/s (1.00 cores) | 65 K req/s (1.00 cores) | 4.05× (3.83–4.93) |
-| missing file: the site's 404.html | 236 K req/s (1.00 cores) | 40 K req/s (0.99 cores) | 5.94× (5.50–5.99) |
-| 10,000 pages of 4 KiB at random | 231 K req/s (1.00 cores) | 52 K req/s (1.00 cores) | 4.48× (4.22–4.61) |
+| page 4 KiB, keep-alive, 256 connections | 237 K req/s (1.00 cores) | 48 K req/s (1.00 cores) | 4.94× (4.68–4.97) |
+| page 4 KiB, a connection per request, 64 at once | 80 K req/s (1.00 cores) | 32 K req/s (1.00 cores) | 2.50× (2.46–2.74) |
+| asset 64 KiB (hashed name), keep-alive, 256 connections | 81 K req/s (0.99 cores) | 42 K req/s (1.00 cores) | 1.89× (1.73–2.24) |
+| file 1 MiB, keep-alive, 64 connections | 25 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.22× (1.16–1.24) |
+| page 4 KiB as gzip, the .gz beside it | 272 K req/s (1.00 cores) | 48 K req/s (1.00 cores) | 5.66× (5.26–5.99) |
+| page 4 KiB as brotli, the .br beside it | 277 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 5.99× (5.83–6.07) |
+| page 4 KiB as gzip, no .gz on disk | 275 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 10.95× (10.69–11.06) |
+| revalidation: If-None-Match, 304 | 283 K req/s (1.00 cores) | 59 K req/s (1.00 cores) | 4.73× (4.66–4.84) |
+| missing file: the site's 404.html | 248 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 6.14× (6.13–6.25) |
+| 10,000 pages of 4 KiB at random | 237 K req/s (1.00 cores) | 52 K req/s (1.00 cores) | 4.58× (4.57–4.85) |
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
@@ -4819,79 +4819,79 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ## Redis protocol, one command per round trip
 
-Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-09, socketley 85aa3476.
+Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 283 K /s (1.00 cores) | 177 K /s (1.00 cores) | 185 K /s (1.00 cores) | 1.60× (1.14–1.70) | 1.50× (1.50–1.61) |
-| GET | 287 K /s (1.00 cores) | 210 K /s (1.00 cores) | 192 K /s (1.00 cores) | 1.27× (1.10–1.42) | 1.52× (1.39–1.58) |
-| LPUSH | 281 K /s (1.00 cores) | 199 K /s (1.00 cores) | 216 K /s (1.00 cores) | 1.42× (1.39–1.46) | 1.30× (1.21–1.57) |
-| LPOP | 272 K /s (1.00 cores) | 191 K /s (1.00 cores) | 197 K /s (1.00 cores) | 1.43× (1.16–1.65) | 1.45× (1.37–1.66) |
-| SADD | 284 K /s (1.00 cores) | 187 K /s (1.00 cores) | 180 K /s (1.00 cores) | 1.52× (1.50–1.64) | 1.56× (1.51–1.70) |
-| HSET | 287 K /s (1.00 cores) | 177 K /s (1.00 cores) | 178 K /s (1.00 cores) | 1.61× (1.38–1.74) | 1.61× (1.53–1.74) |
-| ZADD | 196 K /s (1.00 cores) | 162 K /s (1.00 cores) | 157 K /s (1.00 cores) | 1.21× (1.21–1.22) | 1.29× (1.16–1.32) |
+| SET | 289 K /s (1.00 cores) | 165 K /s (1.00 cores) | 172 K /s (1.00 cores) | 1.78× (1.72–1.79) | 1.66× (1.55–1.86) |
+| GET | 283 K /s (1.00 cores) | 167 K /s (1.00 cores) | 174 K /s (1.00 cores) | 1.63× (1.57–1.71) | 1.64× (1.49–1.76) |
+| LPUSH | 272 K /s (1.00 cores) | 191 K /s (1.00 cores) | 169 K /s (1.00 cores) | 1.42× (1.42–1.44) | 1.70× (1.49–1.75) |
+| LPOP | 275 K /s (1.00 cores) | 187 K /s (1.00 cores) | 174 K /s (1.00 cores) | 1.47× (1.43–1.72) | 1.60× (1.48–1.63) |
+| SADD | 274 K /s (1.00 cores) | 178 K /s (1.00 cores) | 180 K /s (1.00 cores) | 1.58× (1.51–1.66) | 1.57× (1.52–1.84) |
+| HSET | 282 K /s (1.00 cores) | 175 K /s (1.00 cores) | 164 K /s (1.00 cores) | 1.61× (1.36–1.72) | 1.73× (1.53–1.75) |
+| ZADD | 196 K /s (1.00 cores) | 164 K /s (1.00 cores) | 163 K /s (1.00 cores) | 1.17× (1.13–1.26) | 1.19× (1.14–1.43) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. Each server on one pinned core, every row at a full core: the rate is one core divided by the cost of an operation. SET and GET draw their keys at random from about a million, as a cache's clients spread them. At depth 1 that cost is mostly the kernel's per-message price, which all three pay alike, so the differences are small and the ranges wide; this VM halts idle vCPUs and every wakeup of a client costs the server a VM exit, which moves a server that answers each command with its own write more than one that batches.
 
 ## Redis protocol, 100 commands per message (pipelined)
 
-Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-09, socketley 85aa3476.
+Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 9.68 M /s (0.99 cores) | 2.27 M /s (1.00 cores) | 2.61 M /s (1.00 cores) | 4.27× (4.21–4.32) | 3.70× (3.66–3.72) |
-| GET | 9.94 M /s (0.99 cores) | 2.43 M /s (1.00 cores) | 3.67 M /s (1.00 cores) | 4.07× (4.04–4.10) | 2.71× (2.68–2.72) |
-| SADD | 5.57 M /s (1.00 cores) | 2.81 M /s (1.00 cores) | 2.49 M /s (1.00 cores) | 1.98× (1.97–2.00) | 2.24× (2.22–2.25) |
-| HSET | 4.51 M /s (1.00 cores) | 2.18 M /s (1.00 cores) | 2.07 M /s (1.00 cores) | 2.07× (1.99–2.09) | 2.18× (2.15–2.21) |
-| ZADD | 548 K /s (1.00 cores) | 427 K /s (1.00 cores) | 435 K /s (1.00 cores) | 1.28× (1.26–1.29) | 1.26× (1.26–1.26) |
+| SET | 9.69 M /s (1.00 cores) | 2.31 M /s (1.00 cores) | 2.68 M /s (1.00 cores) | 4.18× (4.17–4.19) | 3.62× (3.60–3.63) |
+| GET | 9.87 M /s (0.99 cores) | 2.52 M /s (1.00 cores) | 3.80 M /s (1.00 cores) | 3.91× (3.90–3.93) | 2.60× (2.57–2.61) |
+| SADD | 5.76 M /s (1.00 cores) | 2.91 M /s (1.00 cores) | 2.55 M /s (1.00 cores) | 2.00× (1.96–2.04) | 2.23× (2.23–2.28) |
+| HSET | 4.64 M /s (1.00 cores) | 2.33 M /s (1.00 cores) | 2.11 M /s (1.00 cores) | 1.99× (1.98–2.00) | 2.18× (2.18–2.21) |
+| ZADD | 610 K /s (1.00 cores) | 473 K /s (1.00 cores) | 481 K /s (1.00 cores) | 1.29× (1.27–1.30) | 1.27× (1.25–1.28) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The per-message price divided by a hundred: what remains is parsing and executing commands, where the servers differ. SET and GET draw their keys at random from about a million, more than a core's caches hold, so each lookup waits on memory; SADD, HSET and ZADD put random members into one big collection each.
 
 ## Pipelined, one key
 
-Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-09, socketley 85aa3476.
+Redis 8.0.5, Valkey 9.0.4, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Redis | Valkey | socketley vs Redis | socketley vs Valkey |
 |---|---|---|---|---|---|
-| SET | 14.72 M /s (1.00 cores) | 5.76 M /s (1.00 cores) | 2.89 M /s (1.00 cores) | 2.56× (2.55–2.57) | 5.09× (5.08–5.14) |
-| GET | 15.04 M /s (0.99 cores) | 7.01 M /s (1.00 cores) | 4.18 M /s (1.00 cores) | 2.15× (2.14–2.22) | 3.60× (3.59–3.67) |
-| LPUSH | 11.17 M /s (0.99 cores) | 4.79 M /s (1.00 cores) | 3.09 M /s (1.00 cores) | 2.33× (2.32–2.38) | 3.63× (3.60–3.64) |
-| LPOP | 12.80 M /s (1.00 cores) | 4.13 M /s (1.00 cores) | 2.75 M /s (1.00 cores) | 3.10× (3.08–3.13) | 4.61× (4.60–4.70) |
-| SADD | 13.82 M /s (1.00 cores) | 5.62 M /s (1.00 cores) | 3.72 M /s (1.00 cores) | 2.44× (2.44–2.46) | 3.71× (3.69–3.72) |
-| HSET | 10.87 M /s (1.00 cores) | 4.37 M /s (1.00 cores) | 2.81 M /s (1.00 cores) | 2.50× (2.48–2.51) | 3.86× (3.84–3.92) |
-| ZADD | 11.31 M /s (1.00 cores) | 4.33 M /s (1.00 cores) | 3.01 M /s (1.00 cores) | 2.61× (2.58–2.63) | 3.76× (3.71–3.77) |
+| SET | 14.39 M /s (1.00 cores) | 5.25 M /s (1.00 cores) | 2.94 M /s (1.00 cores) | 2.74× (2.72–2.75) | 4.88× (4.86–4.92) |
+| GET | 14.78 M /s (1.00 cores) | 6.29 M /s (1.00 cores) | 4.31 M /s (1.00 cores) | 2.35× (2.33–2.36) | 3.43× (3.43–3.45) |
+| LPUSH | 11.21 M /s (0.99 cores) | 4.99 M /s (0.99 cores) | 3.16 M /s (1.00 cores) | 2.25× (2.24–2.25) | 3.55× (3.54–3.55) |
+| LPOP | 13.06 M /s (0.99 cores) | 4.27 M /s (1.00 cores) | 2.83 M /s (1.00 cores) | 3.06× (3.06–3.06) | 4.63× (4.61–4.64) |
+| SADD | 13.84 M /s (0.99 cores) | 5.66 M /s (1.00 cores) | 3.74 M /s (1.00 cores) | 2.44× (2.44–2.45) | 3.69× (3.68–3.71) |
+| HSET | 10.43 M /s (1.00 cores) | 4.36 M /s (1.00 cores) | 2.84 M /s (1.00 cores) | 2.39× (2.39–2.40) | 3.68× (3.67–3.68) |
+| ZADD | 11.20 M /s (0.99 cores) | 4.29 M /s (1.00 cores) | 3.06 M /s (1.00 cores) | 2.61× (2.60–2.63) | 3.67× (3.60–3.69) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections; servers on one core, clients on 20 others. The same commands on one key, which stays in the core's cache: the easy case for every cache, kept to show parsing and executing alone.
 
 ## Four cores, a cluster-aware client
 
-Redis Cluster 8.0.5, 4 masters, 3 passes, 2026-11-09, socketley 85aa3476.
+Redis Cluster 8.0.5, 4 masters, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Redis Cluster 8.0.5, 4 masters | socketley vs Redis Cluster 8.0.5, 4 masters |
 |---|---|---|---|
-| SET | 26.04 M /s (3.32 cores) | 12.70 M /s (3.95 cores) | 2.05× (2.05–2.05) |
-| GET | 26.05 M /s (3.34 cores) | 13.97 M /s (3.84 cores) | 1.86× (1.86–1.95) |
-| LPUSH | 25.39 M /s (3.32 cores) | 13.97 M /s (3.91 cores) | 1.82× (1.82–2.00) |
-| LPOP | 25.40 M /s (3.05 cores) | 12.15 M /s (3.89 cores) | 2.09× (2.09–2.30) |
-| SADD | 28.51 M /s (3.20 cores) | 17.46 M /s (3.95 cores) | 1.63× (1.56–1.72) |
-| HSET | 28.53 M /s (3.34 cores) | 13.97 M /s (3.90 cores) | 2.04× (2.04–2.04) |
-| ZADD | 28.53 M /s (3.46 cores) | 12.70 M /s (3.83 cores) | 2.25× (2.15–2.25) |
+| SET | 24.96 M /s (3.25 cores) | 12.70 M /s (3.95 cores) | 1.97× (1.89–2.05) |
+| GET | 27.23 M /s (3.35 cores) | 13.97 M /s (3.86 cores) | 1.95× (1.79–2.04) |
+| LPUSH | 27.92 M /s (3.47 cores) | 13.97 M /s (3.91 cores) | 2.00× (2.00–2.00) |
+| LPOP | 25.40 M /s (2.99 cores) | 12.15 M /s (3.92 cores) | 2.09× (2.09–2.09) |
+| SADD | 28.53 M /s (3.17 cores) | 17.46 M /s (3.93 cores) | 1.63× (1.56–1.81) |
+| HSET | 28.53 M /s (3.39 cores) | 13.97 M /s (3.93 cores) | 2.04× (1.95–2.04) |
+| ZADD | 28.52 M /s (3.54 cores) | 12.70 M /s (3.85 cores) | 2.25× (2.25–2.25) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards and Redis Cluster as four masters, each shard or master pinned to one of the same four cores; five redis-benchmark --cluster processes on 20 others. SET and GET draw their keys at random from 1,048,576, 64 behind each of the 16,384 slot tags, preloaded so every GET finds its key (the hit rate is counted every pass). Every shard's mesh counters are read around every timed run: no command crossed between shards in any pass, so the client sent each to its owner. redis-benchmark --cluster's threads spin while they wait, so its client cores are no reading of headroom.
 
 ## Four cores, a plain client at one address
 
-Valkey 9.0.4, --io-threads 4, 3 passes, 2026-11-09, socketley 85aa3476.
+Valkey 9.0.4, --io-threads 4, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Valkey 9.0.4, --io-threads | socketley vs Valkey 9.0.4, --io-threads |
 |---|---|---|---|
-| SET | 12.45 M /s (3.95 cores) | 3.49 M /s (3.99 cores) | 3.58× (3.52–3.60) |
-| GET | 13.01 M /s (3.95 cores) | 4.98 M /s (3.99 cores) | 2.61× (2.49–2.61) |
-| LPUSH | 9.67 M /s (1.00 cores) | 4.69 M /s (3.99 cores) | 2.06× (2.05–2.08) |
-| LPOP | 11.69 M /s (1.00 cores) | 3.57 M /s (3.99 cores) | 3.28× (3.27–3.29) |
-| SADD | 12.12 M /s (1.00 cores) | 6.31 M /s (3.99 cores) | 1.92× (1.92–1.92) |
-| HSET | 10.49 M /s (1.00 cores) | 5.05 M /s (3.99 cores) | 2.08× (2.04–2.09) |
-| ZADD | 9.97 M /s (1.00 cores) | 4.81 M /s (3.99 cores) | 2.07× (2.06–2.08) |
+| SET | 12.55 M /s (3.97 cores) | 3.49 M /s (3.99 cores) | 3.59× (3.54–3.63) |
+| GET | 13.17 M /s (3.97 cores) | 5.05 M /s (3.99 cores) | 2.61× (2.60–2.64) |
+| LPUSH | 9.76 M /s (1.00 cores) | 4.63 M /s (3.99 cores) | 2.11× (2.11–2.12) |
+| LPOP | 11.67 M /s (1.00 cores) | 3.50 M /s (3.99 cores) | 3.35× (3.33–3.40) |
+| SADD | 12.03 M /s (1.00 cores) | 6.17 M /s (3.99 cores) | 1.95× (1.94–1.97) |
+| HSET | 10.35 M /s (1.00 cores) | 4.88 M /s (3.99 cores) | 2.12× (2.11–2.13) |
+| ZADD | 9.92 M /s (1.00 cores) | 4.70 M /s (3.99 cores) | 2.12× (2.09–2.14) |
 
 How it was measured: 3 redis-benchmark processes × 50 connections, 100 commands a message; socketley as four shards on one port and Valkey with four I/O threads, on the same four cores; five redis-benchmark processes on 20 others. SET and GET draw their keys at random from 1,048,576, three in four of them owned by another shard than the one a connection landed on: socketley carries those over its shard mesh, many commands a frame. LPUSH to ZADD name one key, which one shard owns, so socketley runs those on one of its four cores (see the cores column) and Valkey on its four I/O threads.
 
@@ -4931,229 +4931,229 @@ How it was measured: srvgen (Go), 4 s a run, every answer checked; each server o
 
 ## HTTP: static files and a fixed answer
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 285 K req/s (1.00 cores) | 50 K req/s (1.00 cores) | 5.65× (5.53–5.71) |
-| 64 KiB file, keep-alive, 256 connections | 97 K req/s (0.99 cores) | 46 K req/s (1.00 cores) | 2.09× (1.96–2.19) |
-| 1 KiB file, a connection per request, 64 at once | 81 K req/s (0.99 cores) | 35 K req/s (1.00 cores) | 2.30× (2.25–2.31) |
-| fixed answer (Lua handler / nginx return), keep-alive | 241 K req/s (0.99 cores) | 68 K req/s (0.99 cores) | 3.43× (3.12–3.54) |
+| 1 KiB file, keep-alive, 256 connections | 271 K req/s (1.00 cores) | 50 K req/s (0.99 cores) | 5.46× (5.42–5.51) |
+| 64 KiB file, keep-alive, 256 connections | 93 K req/s (1.00 cores) | 47 K req/s (0.99 cores) | 2.00× (1.98–2.16) |
+| 1 KiB file, a connection per request, 64 at once | 83 K req/s (0.99 cores) | 35 K req/s (1.00 cores) | 2.36× (2.33–2.48) |
+| fixed answer (Lua handler / nginx return), keep-alive | 246 K req/s (1.00 cores) | 77 K req/s (0.99 cores) | 3.22× (3.08–3.54) |
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk on 20 others. socketley --http dir --http-cache against nginx with one worker, sendfile, open_file_cache and access logs off. Files are .txt: socketley adds a WebSocket script to every .html it serves, by design. The fixed answer is a Lua on_http_request on socketley and a return 200 on nginx, which runs no script at all. Read the 1 KiB keep-alive row with this machine in mind: nginx answers each request with its own write and wakeup, and on this VM waking a halted vCPU costs an exit, which costs a server that does that more than one that batches. A single unpublished pass on another VM (16 cores) read 1.85× for the same row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ## HTTP on four cores
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| 1 KiB file, keep-alive, 256 connections | 517 K req/s (3.99 cores) | 233 K req/s (3.99 cores) | 2.22× (2.15–2.28) |
-| 64 KiB file, keep-alive, 256 connections | 233 K req/s (3.99 cores) | 169 K req/s (3.99 cores) | 1.39× (1.36–1.41) |
-| 1 KiB file, a connection per request, 64 at once | 158 K req/s (3.94 cores) | 132 K req/s (3.89 cores) | 1.20× (1.19–1.20) |
-| fixed answer (Lua handler / nginx return), keep-alive | 448 K req/s (3.99 cores) | 307 K req/s (3.99 cores) | 1.46× (1.45–1.48) |
+| 1 KiB file, keep-alive, 256 connections | 500 K req/s (3.99 cores) | 230 K req/s (3.99 cores) | 2.17× (2.15–2.25) |
+| 64 KiB file, keep-alive, 256 connections | 229 K req/s (3.98 cores) | 166 K req/s (3.99 cores) | 1.38× (1.36–1.40) |
+| 1 KiB file, a connection per request, 64 at once | 158 K req/s (3.94 cores) | 131 K req/s (3.90 cores) | 1.21× (1.21–1.21) |
+| fixed answer (Lua handler / nginx return), keep-alive | 451 K req/s (3.99 cores) | 297 K req/s (3.98 cores) | 1.52× (1.46–1.54) |
 
 How it was measured: wrk 16 threads, 4 s a run; socketley as four shards and nginx with four workers, each pinned to one of the same four cores; wrk (16 threads) on 20 others. The same rows as the one-core set, the same wrk for both. socketley spends about twice the CPU a request here that it does on one core, and most of that is the client, not the shards: wrk's threads each hold connections on all four shards, and waking a thread from another core is an interrupt the server's core pays for on loopback, a VM exit on this VM. With one wrk per quarter of the connections, four shards cost about 15% more a request than four separate one-core servers. A client on another machine costs neither. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ## Reverse proxy, HTTP and TCP
 
-HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 56 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 1.38× (1.32–1.40) | 1.85× (1.79–1.89) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 71 K req/s (0.99 cores) | 37 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 1.95× (1.90–1.95) | 2.27× (2.24–2.28) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 31 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 15 K req/s (1.00 cores) | 1.42× (1.36–1.46) | 1.99× (1.96–2.05) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 27 K req/s (1.00 cores) | 22 K req/s (1.00 cores) | 1.64× (1.62–1.65) | 2.03× (2.00–2.04) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 93 K req/s (1.00 cores) | 44 K req/s (1.00 cores) | 64 K req/s (1.00 cores) | 2.15× (2.10–2.16) | 1.46× (1.42–1.46) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 52 K req/s (1.00 cores) | 41 K req/s (1.00 cores) | 29 K req/s (1.00 cores) | 1.26× (1.24–1.28) | 1.75× (1.74–1.76) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 71 K req/s (1.00 cores) | 36 K req/s (1.00 cores) | 31 K req/s (0.99 cores) | 2.01× (1.85–2.04) | 2.30× (2.19–2.34) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 30 K req/s (0.99 cores) | 22 K req/s (1.00 cores) | 16 K req/s (1.00 cores) | 1.37× (1.34–1.39) | 1.89× (1.86–1.91) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 44 K req/s (1.00 cores) | 28 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.57× (1.57–1.65) | 2.06× (2.04–2.10) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 95 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 65 K req/s (1.00 cores) | 2.15× (2.15–2.33) | 1.43× (1.36–1.53) |
 
 How it was measured: wrk 8 threads, 4 s a run; each proxy on one core, the nginx backend on four, wrk on 20. All three forward /px/… with the prefix stripped to one nginx backend with four workers, each proxy saturating its core. HAProxy runs one thread with http-reuse always; nginx keeps 256 idle backend connections (keepalive 256); socketley keeps as many backend connections as were busy at once. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ## Reverse proxy on four cores
 
-HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+HAProxy 3.2.25, nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | HAProxy | nginx | socketley vs HAProxy | socketley vs nginx |
 |---|---|---|---|---|---|
-| HTTP, 1 KiB, keep-alive, 32 connections | 141 K req/s (3.99 cores) | 107 K req/s (4.00 cores) | 104 K req/s (3.83 cores) | 1.32× (1.24–1.39) | 1.42× (1.28–1.44) |
-| HTTP, 1 KiB, keep-alive, 256 connections | 166 K req/s (4.00 cores) | 126 K req/s (4.00 cores) | 116 K req/s (4.00 cores) | 1.31× (1.28–1.33) | 1.43× (1.42–1.44) |
-| HTTP, 64 KiB, keep-alive, 256 connections | 94 K req/s (3.99 cores) | 77 K req/s (3.99 cores) | 57 K req/s (3.99 cores) | 1.22× (1.21–1.22) | 1.65× (1.64–1.65) |
-| HTTP, 1 KiB, a connection per request, 64 at once | 104 K req/s (3.95 cores) | 84 K req/s (3.98 cores) | 75 K req/s (3.84 cores) | 1.23× (1.23–1.24) | 1.40× (1.38–1.41) |
-| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 209 K req/s (4.00 cores) | 173 K req/s (4.00 cores) | 181 K req/s (4.00 cores) | 1.21× (1.20–1.21) | 1.15× (1.15–1.17) |
+| HTTP, 1 KiB, keep-alive, 32 connections | 151 K req/s (3.99 cores) | 109 K req/s (4.00 cores) | 102 K req/s (3.73 cores) | 1.36× (1.35–1.39) | 1.48× (1.41–1.50) |
+| HTTP, 1 KiB, keep-alive, 256 connections | 166 K req/s (3.99 cores) | 128 K req/s (4.00 cores) | 116 K req/s (4.00 cores) | 1.30× (1.29–1.32) | 1.43× (1.41–1.45) |
+| HTTP, 64 KiB, keep-alive, 256 connections | 93 K req/s (3.99 cores) | 75 K req/s (3.99 cores) | 56 K req/s (3.99 cores) | 1.24× (1.22–1.25) | 1.68× (1.65–1.68) |
+| HTTP, 1 KiB, a connection per request, 64 at once | 105 K req/s (3.96 cores) | 82 K req/s (3.98 cores) | 74 K req/s (3.83 cores) | 1.28× (1.25–1.29) | 1.42× (1.42–1.42) |
+| TCP relay, 1 KiB over HTTP keep-alive, 256 connections | 206 K req/s (3.99 cores) | 171 K req/s (4.00 cores) | 180 K req/s (4.00 cores) | 1.20× (1.18–1.20) | 1.14× (1.13–1.15) |
 
 How it was measured: wrk 16 threads, 4 s a run; socketley as four shards, HAProxy with four threads and nginx with four workers, each pinned to one of the same four cores; the nginx backend (eight workers) on eight others, wrk (16 threads) on 14. The same rows as the one-core set, the same wrk for every arm; the backend is not what the proxies run into. As in the server set, each wrk thread holds connections on all four of socketley's shards, so part of every arm's CPU is waking the co-located client across cores. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ## Static site: pages, assets, compression, revalidation
 
-nginx 1.28.3, 3 passes, 2026-11-09, socketley 85aa3476.
+nginx 1.28.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | nginx | socketley vs nginx |
 |---|---|---|---|
-| page 4 KiB, keep-alive, 256 connections | 226 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 4.89× (4.52–4.90) |
-| page 4 KiB, a connection per request, 64 at once | 76 K req/s (0.99 cores) | 32 K req/s (1.00 cores) | 2.37× (2.35–2.41) |
-| asset 64 KiB (hashed name), keep-alive, 256 connections | 69 K req/s (1.00 cores) | 43 K req/s (1.00 cores) | 1.62× (1.61–1.90) |
-| file 1 MiB, keep-alive, 64 connections | 26 K req/s (1.00 cores) | 20 K req/s (1.00 cores) | 1.23× (1.22–1.28) |
-| page 4 KiB as gzip, the .gz beside it | 275 K req/s (1.00 cores) | 48 K req/s (1.00 cores) | 5.69× (5.39–5.89) |
-| page 4 KiB as brotli, the .br beside it | 275 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 5.83× (5.70–6.10) |
-| page 4 KiB as gzip, no .gz on disk | 267 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 10.44× (10.13–10.87) |
-| revalidation: If-None-Match, 304 | 268 K req/s (1.00 cores) | 65 K req/s (1.00 cores) | 4.05× (3.83–4.93) |
-| missing file: the site's 404.html | 236 K req/s (1.00 cores) | 40 K req/s (0.99 cores) | 5.94× (5.50–5.99) |
-| 10,000 pages of 4 KiB at random | 231 K req/s (1.00 cores) | 52 K req/s (1.00 cores) | 4.48× (4.22–4.61) |
+| page 4 KiB, keep-alive, 256 connections | 237 K req/s (1.00 cores) | 48 K req/s (1.00 cores) | 4.94× (4.68–4.97) |
+| page 4 KiB, a connection per request, 64 at once | 80 K req/s (1.00 cores) | 32 K req/s (1.00 cores) | 2.50× (2.46–2.74) |
+| asset 64 KiB (hashed name), keep-alive, 256 connections | 81 K req/s (0.99 cores) | 42 K req/s (1.00 cores) | 1.89× (1.73–2.24) |
+| file 1 MiB, keep-alive, 64 connections | 25 K req/s (1.00 cores) | 21 K req/s (1.00 cores) | 1.22× (1.16–1.24) |
+| page 4 KiB as gzip, the .gz beside it | 272 K req/s (1.00 cores) | 48 K req/s (1.00 cores) | 5.66× (5.26–5.99) |
+| page 4 KiB as brotli, the .br beside it | 277 K req/s (1.00 cores) | 47 K req/s (1.00 cores) | 5.99× (5.83–6.07) |
+| page 4 KiB as gzip, no .gz on disk | 275 K req/s (1.00 cores) | 25 K req/s (1.00 cores) | 10.95× (10.69–11.06) |
+| revalidation: If-None-Match, 304 | 283 K req/s (1.00 cores) | 59 K req/s (1.00 cores) | 4.73× (4.66–4.84) |
+| missing file: the site's 404.html | 248 K req/s (1.00 cores) | 40 K req/s (1.00 cores) | 6.14× (6.13–6.25) |
+| 10,000 pages of 4 KiB at random | 237 K req/s (1.00 cores) | 52 K req/s (1.00 cores) | 4.58× (4.57–4.85) |
 
 How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk (8 threads) on 20 others. socketley create web --root with its defaults against nginx with one worker, sendfile, open_file_cache, gzip_static and brotli_static, both sending the same headers on plain HTTP (TLS and HTTP/2 are the entrance proxy's). The compressed rows send the same .gz and .br bytes; in the row with no .gz on disk socketley sends a copy it made once and nginx compresses every answer, so that row shows what each does with a site deployed without copies rather than a like-for-like speed. This VM halts idle vCPUs, which costs a server that writes each answer on its own more than one that batches: a single unpublished pass on another VM (16 cores) read 1.72x for the headline row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 
 ## Authoritative DNS, one zone of 10,000 names
 
-NSD 4.14.0, Knot 3.5.3, 3 passes, 2026-11-09, socketley 85aa3476.
+NSD 4.14.0, Knot 3.5.3, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | NSD | Knot | socketley vs NSD | socketley vs Knot |
 |---|---|---|---|---|---|
-| A queries over UDP | 442 K q per core·s (1.00 cores) | 357 K q per core·s (0.87 cores) | 304 K q per core·s (0.87 cores) | 1.23× (1.14–1.24) | 1.45× (1.43–1.51) |
-| A queries over TCP, 128 connections | 192 K q per core·s (0.99 cores) | 57 K q per core·s (0.87 cores) | 62 K q per core·s (0.98 cores) | 3.38× (3.30–3.42) | 3.06× (3.03–3.10) |
+| A queries over UDP | 475 K q per core·s (1.00 cores) | 392 K q per core·s (0.83 cores) | 305 K q per core·s (0.86 cores) | 1.21× (1.17–1.33) | 1.55× (1.50–1.62) |
+| A queries over TCP, 128 connections | 193 K q per core·s (0.99 cores) | 59 K q per core·s (0.87 cores) | 60 K q per core·s (0.98 cores) | 3.29× (3.21–3.36) | 3.22× (2.89–3.23) |
 
 How it was measured: dnsperf 8 threads, 32 sockets, 4 s a run, zone of 10000 names; each server one worker on one core, dnsperf on 20 others. Queries answered per second of server CPU (rate ÷ cores), because NSD and Knot do not fill their cores at a window of 500 outstanding queries, and with more they drop UDP from their default socket buffers and dnsperf waits out each loss. socketley runs with --rrl 0 --proxy none: its response rate limit, on by default, would throttle one client host, and NSD and Knot have none by default. 90% of queries find a name, 10% are NXDOMAIN.
 
 ## MQTT broker, deliveries per second
 
-Mosquitto 2.0.22, 3 passes, 2026-11-09, socketley 85aa3476.
+Mosquitto 2.0.22, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Mosquitto | socketley vs Mosquitto |
 |---|---|---|---|
-| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 7.10 M msg/s (0.96 cores) | 800 K msg/s (0.99 cores) | 8.87× (8.82–9.10) |
-| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.29 M msg/s (1.00 cores) | 565 K msg/s (0.99 cores) | 19.87× (19.18–24.89) |
-| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.47 M msg/s (1.00 cores) | 70 K msg/s (1.00 cores) | 21.12× (20.89–21.32) |
-| round trip, QoS 1 publish to own delivery | 24.3 µs (0.96 cores) | 42.8 µs (0.68 cores) | 1.76× (1.61–1.76) |
+| fan-in: 16 publishers to 1 subscriber, QoS 0, 64 B | 7.23 M msg/s (0.95 cores) | 799 K msg/s (0.99 cores) | 9.06× (9.03–9.18) |
+| fan-out: 1 publisher to 100 subscribers, QoS 0, 64 B | 11.80 M msg/s (1.00 cores) | 576 K msg/s (0.99 cores) | 20.50× (20.43–20.68) |
+| fan-out: 1 publisher to 50 subscribers, QoS 1, 64 B | 1.50 M msg/s (1.00 cores) | 69 K msg/s (1.00 cores) | 21.64× (21.54–21.76) |
+| round trip, QoS 1 publish to own delivery | 26.6 µs (0.91 cores) | 42.7 µs (0.67 cores) | 1.60× (1.59–1.60) |
 
 How it was measured: mqbench (MQTT 3.1.1), 4 s a run; each broker on one core, mqbench on 20 others. MQTT 3.1.1, 64-byte payloads; Mosquitto with persistence off and unbounded queues, socketley --anonymous --session-queue 100000. A QoS 0 fan-out delivery costs Mosquitto about 2 µs of CPU, one write each; socketley coalesces the writes to a subscriber, which is the whole of the fan-out difference. The round trip is a QoS 1 publish to the publisher's own subscription.
 
 ## S3 over HTTP, SigV4
 
-MinIO 2025-09-07, 3 passes, 2026-11-09, socketley 85aa3476.
+MinIO 2025-09-07, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | MinIO | socketley vs MinIO |
 |---|---|---|---|
-| GET 4 KiB, 1 connection | 21 K obj/s (0.63 cores) | 3.9 K obj/s (1.27 cores) | 5.37× (5.33–5.44) |
-| GET 4 KiB, 64 connections | 452 K obj/s (3.78 cores) | 24 K obj/s (3.98 cores) | 18.84× (18.14–19.04) |
-| GET 4 KiB, 128 connections | 553 K obj/s (3.92 cores) | 23 K obj/s (3.98 cores) | 23.47× (21.85–24.16) |
-| GET 4 KiB, 64 connections, from 50,000 objects | 237 K obj/s (3.95 cores) | 24 K obj/s (3.99 cores) | 10.05× (9.72–10.15) |
-| GET 1 MiB, 64 connections | 40 K obj/s (3.94 cores) | 5.9 K obj/s (3.95 cores) | 6.76× (6.73–6.77) |
-| PUT 4 KiB, 64 connections, into an empty store | 79 K obj/s (3.77 cores) | 15 K obj/s (3.98 cores) | 5.17× (5.07–5.24) |
+| GET 4 KiB, 1 connection | 21 K obj/s (0.63 cores) | 3.9 K obj/s (1.28 cores) | 5.29× (5.22–5.31) |
+| GET 4 KiB, 64 connections | 451 K obj/s (3.78 cores) | 25 K obj/s (3.99 cores) | 18.17× (17.98–18.73) |
+| GET 4 KiB, 128 connections | 557 K obj/s (3.92 cores) | 24 K obj/s (3.99 cores) | 23.11× (22.69–23.75) |
+| GET 4 KiB, 64 connections, from 50,000 objects | 251 K obj/s (3.96 cores) | 24 K obj/s (3.99 cores) | 10.42× (10.10–10.51) |
+| GET 1 MiB, 64 connections | 42 K obj/s (3.95 cores) | 6.0 K obj/s (3.96 cores) | 7.05× (6.97–7.12) |
+| PUT 4 KiB, 64 connections, into an empty store | 79 K obj/s (3.75 cores) | 15 K obj/s (3.98 cores) | 5.11× (4.92–5.31) |
 
 How it was measured: s3gen (Go, one process, a request in flight per connection), 4s a run, SigV4 over plain HTTP, PUT bodies aws-chunked and signed; both servers on the same four cores (socketley as four shards), s3gen on 20 others. MinIO single node, single drive; both on tmpfs, so the comparison is the servers' work and not a disk. MinIO is a Go server that limits itself on one core, hence four for both. s3gen signs every request with SigV4 as warp does (PUTs as signed aws-chunked bodies) and checks every answer's status, length and ETag; from 64 connections both servers fill their four cores. The 4 KiB rows read 2,500 objects, which socketley keeps as in-memory copies; the 50,000-object row reads past them, where every GET opens its file as MinIO's always do. The PUT row starts both servers afresh on empty storage for every pass, because MinIO reclaims deleted objects in the background and its puts slow while it does.
 
 ## JSON documents over HTTP
 
-MongoDB 9.0.4, PocketBase 0.40.5, 3 passes, 2026-11-09, socketley 85aa3476.
+MongoDB 9.0.4, PocketBase 0.40.5, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | MongoDB | PocketBase | socketley vs MongoDB | socketley vs PocketBase |
 |---|---|---|---|---|---|
-| read one document by id, 64 clients | 679 K req/s (3.47 cores) | 148 K req/s (3.88 cores) | 34 K req/s (3.86 cores) | 4.72× (4.34–11.00) | 19.73× (19.36–19.78) |
-| replace one document, 64 clients | 130 K req/s (3.16 cores) | 100 K req/s (3.94 cores) | 12 K req/s (2.73 cores) | 1.32× (1.24–1.32) | 11.22× (10.89–11.35) |
-| query on an indexed field, 64 clients | 495 K req/s (3.55 cores) | 83 K req/s (3.89 cores) | 21 K req/s (3.77 cores) | 5.95× (5.87–6.33) | 23.05× (22.58–23.80) |
-| mixed: 90% reads, 10% writes, 64 clients | 329 K req/s (3.60 cores) | 126 K req/s (3.91 cores) | 38 K req/s (3.59 cores) | 2.58× (2.45–2.67) | 8.75× (8.71–8.76) |
+| read one document by id, 64 clients | 689 K req/s (3.46 cores) | 153 K req/s (3.87 cores) | 36 K req/s (3.86 cores) | 4.42× (4.36–11.45) | 19.23× (18.89–20.06) |
+| replace one document, 64 clients | 133 K req/s (3.11 cores) | 105 K req/s (3.94 cores) | 12 K req/s (2.72 cores) | 1.26× (1.26–1.27) | 11.37× (10.82–11.82) |
+| query on an indexed field, 64 clients | 494 K req/s (3.54 cores) | 82 K req/s (3.89 cores) | 22 K req/s (3.80 cores) | 6.01× (5.71–6.10) | 22.21× (21.74–22.78) |
+| mixed: 90% reads, 10% writes, 64 clients | 339 K req/s (3.62 cores) | 134 K req/s (3.90 cores) | 39 K req/s (3.62 cores) | 2.48× (2.44–2.65) | 8.90× (8.41–9.48) |
 
 How it was measured: loadgen, 4s a run, 100,000 documents, data on tmpfs; all three on the same four cores (socketley as four shards), loadgen on 20 others. 100,000 documents, data on tmpfs. MongoDB through its wire protocol with journaled writes, PocketBase over its REST API with request logs off, socketley over its HTTP API with a key. A sharded socketley db hands every write to shard 0, so its writes are at most what one shard takes, at more cores; reads and queries spread over all four.
 
 ## A TCP service behind an edge
 
-frp 0.71.1, 3 passes, 2026-11-09, socketley 85aa3476.
+frp 0.71.1, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | frp | socketley vs frp |
 |---|---|---|---|
-| round trip through the tunnel, 64 B echo | 89.5 µs (0.86 cores) | 168 µs (1.34 cores) | 1.87× (1.87–1.88) |
-| throughput, 512 MiB echoed through the tunnel | 1.9 K MiB/s (1.92 cores) | 832.0 MiB/s (1.79 cores) | 2.25× (2.20–2.48) |
+| round trip through the tunnel, 64 B echo | 90.0 µs (0.83 cores) | 167 µs (1.34 cores) | 1.86× (1.85–1.90) |
+| throughput, 512 MiB echoed through the tunnel | 2.0 K MiB/s (1.91 cores) | 872.0 MiB/s (1.82 cores) | 2.27× (2.25–2.35) |
 
 How it was measured: tb_client, one connection; agent and edge (frpc and frps) on the same two cores, the echo service on a third. socketley agent and edge against frpc and frps, the service an echo server, one connection. socketley answers a round trip in about half frp's time and moves bulk data at more than twice its rate.
 
 ## Scraping 100,000 series a second
 
-Prometheus 2.53.5, VictoriaMetrics 1.112, 3 passes, 2026-11-09, socketley 85aa3476.
+Prometheus 2.53.5, VictoriaMetrics 1.112, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
 |---|---|---|---|---|---|
-| CPU per sample ingested | 0.28 µs (0.03 cores) | 0.72 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.56× (2.55–2.67) | 3.53× (3.50–3.64) |
-| resident memory | 88.8 MB | 396 MB | 137 MB | 4.46× (4.21–4.71) | 1.55× (1.53–1.55) |
-| range query, 5 min of every path | 37.7 ms | 387 ms | 108 ms | 10.38× (4.24–12.43) | 2.88× (1.24–6.91) |
+| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.74 µs (0.07 cores) | 0.99 µs (0.10 cores) | 2.55× (2.53–2.58) | 3.47× (3.35–3.49) |
+| resident memory | 91.0 MB | 387 MB | 127 MB | 4.25× (3.95–4.87) | 1.40× (1.27–1.40) |
+| range query, 5 min of every path | 38.0 ms | 359 ms | 133 ms | 9.84× (4.46–11.87) | 3.51× (1.66–4.45) |
 
 How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
 
 ## Carrying a directory to a storage and back
 
-rclone v1.75.2, mc 2025-08-13, 3 passes, 2026-11-09, socketley 85aa3476.
+rclone v1.75.2, mc 2025-08-13, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | rclone | mc | socketley vs rclone | socketley vs mc |
 |---|---|---|---|---|---|
-| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 8.9 K files/s (0.22 cores) | 4.2 K files/s (1.78 cores) | 2.8 K files/s (1.17 cores) | 2.12× (2.08–2.16) | 3.22× (3.12–3.26) |
-| 1000 files changed after it | 6.5 K files/s (0.39 cores) | 3.6 K files/s (1.57 cores) | 2.6 K files/s (1.20 cores) | 1.81× (1.79–1.91) | 2.48× (2.40–2.49) |
-| first copy, 20,000 files of 4 KiB | 24 K files/s (0.51 cores) | 6.9 K files/s (1.67 cores) | 4.3 K files/s (1.37 cores) | 3.47× (3.40–3.49) | 5.65× (5.65–5.69) |
-| first copy, 8 files of 256 MiB | 2.9 K MiB/s (0.10 cores) | 623.0 MiB/s (1.51 cores) | 2.0 K MiB/s (1.37 cores) | 4.66× (4.64–5.00) | 1.43× (1.41–1.45) |
-| first copy, a tree 12 directories deep: 8,190 files of 4 KiB in 4,095 directories | 22 K files/s (0.55 cores) | 6.7 K files/s (1.68 cores) | 4.1 K files/s (1.35 cores) | 3.32× (3.30–3.43) | 5.43× (5.40–5.50) |
-| checked again, 1 of 20,000 files deleted since: time | 74.6 ms (0.40 cores) | 224 ms (1.21 cores) | 265 ms (1.26 cores) | 2.99× (2.95–3.06) | 3.56× (3.55–3.56) |
-| checked again, 1 of 20,000 files deleted since: requests sent | 1.0 requests (0.37 cores) | 21.0 requests (1.22 cores) | 22.0 requests (1.26 cores) | 21.00× (21.00–21.00) | 22.00× (22.00–22.00) |
-| 1,000 files deleted | 40 K files/s (0.80 cores) | 12 K files/s (1.40 cores) | 6.9 K files/s (1.28 cores) | 3.44× (3.29–3.47) | 5.88× (5.71–5.90) |
-| a directory of 1,000 files renamed | 7.7 K files/s (0.31 cores) | 3.5 K files/s (1.69 cores) | 2.0 K files/s (1.20 cores) | 2.18× (2.16–2.27) | 3.78× (3.69–3.92) |
-| pulled into an empty directory, 2000 files of 64 KiB and 50 of 1 MiB | 20 K files/s (0.89 cores) | 6.9 K files/s (1.84 cores) | 4.1 K files/s (1.38 cores) | 2.91× (2.86–2.91) | 4.89× (4.86–4.91) |
+| first copy, 2000 files of 64 KiB and 50 of 1 MiB | 8.9 K files/s (0.21 cores) | 4.3 K files/s (1.76 cores) | 2.8 K files/s (1.18 cores) | 2.07× (2.06–2.11) | 3.18× (3.15–3.25) |
+| 1000 files changed after it | 6.6 K files/s (0.40 cores) | 3.5 K files/s (1.56 cores) | 2.7 K files/s (1.19 cores) | 1.86× (1.86–1.88) | 2.46× (2.44–2.49) |
+| first copy, 20,000 files of 4 KiB | 24 K files/s (0.52 cores) | 7.1 K files/s (1.66 cores) | 4.3 K files/s (1.37 cores) | 3.43× (3.30–3.44) | 5.72× (5.71–5.76) |
+| first copy, 8 files of 256 MiB | 2.9 K MiB/s (0.08 cores) | 618.0 MiB/s (1.47 cores) | 2.0 K MiB/s (1.36 cores) | 4.68× (4.49–4.81) | 1.43× (1.42–1.43) |
+| first copy, a tree 12 directories deep: 8,190 files of 4 KiB in 4,095 directories | 22 K files/s (0.57 cores) | 6.8 K files/s (1.69 cores) | 4.1 K files/s (1.34 cores) | 3.27× (3.24–3.27) | 5.49× (5.39–5.58) |
+| checked again, 1 of 20,000 files deleted since: time | 73.9 ms (0.27 cores) | 219 ms (1.25 cores) | 270 ms (1.25 cores) | 2.93× (2.92–3.00) | 3.65× (3.57–3.67) |
+| checked again, 1 of 20,000 files deleted since: requests sent | 1.0 requests (0.37 cores) | 21.0 requests (1.23 cores) | 22.0 requests (1.26 cores) | 21.00× (21.00–21.00) | 22.00× (22.00–22.00) |
+| 1,000 files deleted | 41 K files/s (0.82 cores) | 11 K files/s (1.29 cores) | 7.0 K files/s (1.27 cores) | 3.70× (3.55–3.74) | 5.83× (5.76–6.08) |
+| a directory of 1,000 files renamed | 7.7 K files/s (0.31 cores) | 3.4 K files/s (1.66 cores) | 2.0 K files/s (1.22 cores) | 2.27× (2.22–2.35) | 3.68× (3.67–3.82) |
+| pulled into an empty directory, 2000 files of 64 KiB and 50 of 1 MiB | 21 K files/s (0.90 cores) | 6.7 K files/s (1.82 cores) | 4.1 K files/s (1.37 cores) | 3.03× (3.03–3.06) | 5.05× (4.95–5.11) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carriers on two cores, the target storage runtime in a daemon of its own on four others. One socketley storage runtime on tmpfs is the target for all three, a fresh bucket a run, every run checked key for key and byte for byte. rclone 1.75.2 runs as its S3 docs advise (--transfers 8 --checkers 16 --fast-list --update --use-server-modtime), mc mirror with --overwrite --remove and eight workers. A socketley job walks once at start and then follows inotify, where the others walk both sides again; it checks a whole tree only when it starts, so the re-check row is a stop and a start, with one file deleted so its end can be seen.
 
 ## A change noticed while running
 
-mc 2025-08-13, 3 passes, 2026-11-09, socketley 85aa3476.
+mc 2025-08-13, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | mc | socketley vs mc |
 |---|---|---|---|
-| a 64 KiB file written, until it is in the storage | 0.89 ms (0.00 cores) | 1.37 ms (0.03 cores) | 1.67× (1.41–1.75) |
+| a 64 KiB file written, until it is in the storage | 0.87 ms (0.00 cores) | 1.57 ms (0.03 cores) | 1.83× (1.73–2.15) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the storage on four others. Each file is timed from its write until a HEAD of its key answers with its MD5, one write at a time. rclone has no watch mode; mc mirror --watch is the nearest tool.
 
 ## Both ways at once
 
-rclone v1.75.2, 3 passes, 2026-11-09, socketley 85aa3476.
+rclone v1.75.2, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | rclone | socketley vs rclone |
 |---|---|---|---|
-| both ways: 500 files changed here and 500 in the storage | 12 K files/s (0.37 cores) | 2.4 K files/s (1.58 cores) | 5.09× (4.97–5.35) |
+| both ways: 500 files changed here and 500 in the storage | 12 K files/s (0.36 cores) | 2.3 K files/s (1.55 cores) | 5.30× (5.28–5.44) |
 
 How it was measured: the carriers themselves; the storage target is one socketley storage runtime on other cores; the carrier on two cores, the storage on four others. A tree and a bucket in step, then 500 files rewritten here and 500 others replaced in the storage, then one run: socketley --mode inout against rclone bisync. mc mirror carries one way only.
 
 ## OpenID Connect provider
 
-Keycloak 26.8.1, 3 passes, 2026-11-09, socketley 85aa3476.
+Keycloak 26.8.1, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Keycloak | socketley vs Keycloak |
 |---|---|---|---|
-| sign-in: authorization code with a password, 16 clients | 255.0 req/s (3.99 cores) | 221.0 req/s (3.90 cores) | 1.13× (1.10–1.16) |
-| refresh token, 256 clients | 60 K req/s (2.92 cores) | 2.4 K req/s (3.86 cores) | 24.97× (24.32–27.57) |
-| userinfo, 512 clients | 519 K req/s (3.72 cores) | 20 K req/s (3.83 cores) | 25.87× (23.13–26.95) |
-| JWKS, 256 connections (wrk) | 497 K req/s (3.99 cores) | 28 K req/s (3.89 cores) | 17.94× (16.67–17.97) |
+| sign-in: authorization code with a password, 16 clients | 265.0 req/s (3.95 cores) | 223.0 req/s (3.90 cores) | 1.19× (1.18–1.24) |
+| refresh token, 256 clients | 59 K req/s (2.91 cores) | 2.4 K req/s (3.86 cores) | 24.85× (24.10–25.84) |
+| userinfo, 512 clients | 513 K req/s (3.75 cores) | 21 K req/s (3.83 cores) | 24.87× (24.11–26.34) |
+| JWKS, 256 connections (wrk) | 510 K req/s (3.99 cores) | 29 K req/s (3.91 cores) | 17.30× (15.83–17.73) |
 
 How it was measured: idpgen, 4s a run, 200 accounts; both on the same four cores (socketley as four shards; Keycloak with its PostgreSQL), idpgen and wrk on 20 others. 200 accounts. A sign-in is the authorization code flow with PKCE and a password, so it also compares the password hashes each uses by default: scrypt here, PBKDF2 in Keycloak. Keycloak's CPU includes PostgreSQL's. Refresh and userinfo come from four idpgen processes and JWKS from wrk, with as many clients as fill socketley's four cores; refresh stays near the same rate from 256 to 512 clients, bound by the durable write of each rotated token family through shard 0. Sign-ins come four at a time from each of four addresses: socketley refuses a fifth from one address while four are being checked, and four connections alone may land on two of its four shards, which would measure where the kernel put them. Both are warmed with sign-ins before the passes until a 5 s run gains under 3% on the best before it: Keycloak's JIT compiles the flow over its first half minute, from about 100 to 190 sign-ins a second.
 
 ## Mail: delivery in, IMAP and POP3 out
 
-Postfix 3.10.6 + Dovecot 2.4.2, 3 passes, 2026-11-09, socketley 85aa3476.
+Postfix 3.10.6 + Dovecot 2.4.2, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Postfix 3.10.6 + Dovecot | socketley vs Postfix 3.10.6 + Dovecot |
 |---|---|---|---|
-| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 438.0 msg/s (0.11 cores) | 107.0 msg/s (0.25 cores) | 4.09× (3.64–4.24) |
-| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 255.0 msg/s (0.18 cores) | 61.4 msg/s (0.18 cores) | 3.78× (3.71–4.16) |
-| IMAP: LOGIN and LOGOUT, 8 clients | 126.0 sign-ins/s (0.99 cores) | 64.8 sign-ins/s (0.99 cores) | 1.95× (1.92–1.96) |
-| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 480 K msg/s (0.99 cores) | 124 K msg/s (0.99 cores) | 3.88× (3.74–3.93) |
-| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 21 K msg/s (0.99 cores) | 13 K msg/s (0.99 cores) | 1.54× (1.44–1.58) |
-| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 13 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.86× (1.82–1.87) |
+| SMTP in, 4 KiB messages, 64 connections, 10 a connection | 569.0 msg/s (0.14 cores) | 129.0 msg/s (0.30 cores) | 4.43× (3.88–4.43) |
+| SMTP in, 64 KiB messages, 64 connections, 10 a connection | 345.0 msg/s (0.23 cores) | 75.5 msg/s (0.21 cores) | 4.62× (3.98–5.25) |
+| IMAP: LOGIN and LOGOUT, 8 clients | 127.0 sign-ins/s (0.99 cores) | 65.2 sign-ins/s (0.99 cores) | 1.94× (1.94–1.95) |
+| IMAP: LOGIN, SELECT, FETCH every header of 10,000, 8 clients | 484 K msg/s (0.99 cores) | 125 K msg/s (0.99 cores) | 3.88× (3.87–3.94) |
+| IMAP: LOGIN, SELECT, FETCH 1,000 whole 64 KiB messages, 8 clients | 21 K msg/s (0.99 cores) | 14 K msg/s (0.99 cores) | 1.51× (1.43–1.56) |
+| POP3: USER, PASS, RETR 1,000 64 KiB messages one by one, 8 clients | 13 K msg/s (0.99 cores) | 7.0 K msg/s (0.99 cores) | 1.82× (1.82–1.88) |
 
 How it was measured: smtp-source (64 processes x 1 connections); mailload.py (8 asyncio processes x 1 connection), 4 s a run; every process of each on the same one core (socketley's daemon, idp, storage and mail; Postfix and Dovecot); smtp-source and mailload on 20 others; data on the VM's ext4 disk. Postfix hands each message over LMTP to Dovecot's Maildir and index; socketley's mail runtime writes it into its storage runtime. Both sync to disk (about 4 ms a sync here) before a message counts, so the SMTP rows are bound by syncs, not cores, and are timed until the last message is in its mailbox. Every sign-in hashes the password: scrypt in socketley, yescrypt in Dovecot. Dovecot 2.4's lmtp_user_concurrency_limit is set to unlimited, 2.3's default, since 10 made Postfix wait out five-minute retries.
 
 ## MCP server over Streamable HTTP
 
-MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 3 passes, 2026-11-09, socketley 85aa3476.
+MCP Python SDK 2.3.0 (uvicorn 0.54.0), MCP TypeScript SDK 1.32.2 (Node 24.22.1), 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | MCP Python SDK 2.3.0 (uvicorn 0.54.0) | MCP TypeScript SDK 1.32.2 (Node 24.22.1) | socketley vs MCP Python SDK 2.3.0 (uvicorn 0.54.0) | socketley vs MCP TypeScript SDK 1.32.2 (Node 24.22.1) |
 |---|---|---|---|---|---|
-| initialize + tools/list, a new session each, 64 at once | 72 K req/s (0.97 cores) | 1.1 K req/s (1.00 cores) | 1.6 K req/s (1.00 cores) | 62.95× (62.80–63.51) | 44.65× (44.02–46.69) |
-| tools/call add(a, b), 64 sessions | 150 K req/s (0.98 cores) | 4.9 K req/s (1.00 cores) | 7.1 K req/s (1.00 cores) | 30.26× (30.03–30.50) | 21.07× (20.81–21.36) |
-| tools/call returning 16 KiB of text, 64 sessions | 54 K req/s (0.90 cores) | 5.2 K req/s (1.00 cores) | 6.7 K req/s (1.00 cores) | 10.45× (10.25–10.49) | 8.15× (8.07–8.35) |
-| resources/read, 1 KiB of text, 64 sessions | 160 K req/s (0.95 cores) | 5.3 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 30.05× (29.29–32.46) | 21.75× (20.94–22.01) |
+| initialize + tools/list, a new session each, 64 at once | 72 K req/s (0.97 cores) | 1.1 K req/s (0.99 cores) | 1.6 K req/s (1.00 cores) | 63.16× (62.26–63.26) | 43.78× (43.54–46.59) |
+| tools/call add(a, b), 64 sessions | 152 K req/s (0.98 cores) | 5.1 K req/s (1.00 cores) | 7.0 K req/s (1.00 cores) | 29.44× (27.96–31.10) | 21.55× (21.08–21.81) |
+| tools/call returning 16 KiB of text, 64 sessions | 55 K req/s (0.90 cores) | 5.2 K req/s (1.00 cores) | 6.7 K req/s (1.00 cores) | 10.62× (10.43–10.90) | 8.21× (8.10–8.42) |
+| resources/read, 1 KiB of text, 64 sessions | 161 K req/s (0.95 cores) | 5.4 K req/s (1.00 cores) | 7.4 K req/s (1.00 cores) | 29.83× (28.25–30.20) | 21.75× (21.20–22.16) |
 
 How it was measured: mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 4s a run; each server on one core, mcpgen on 20 others. Against the official MCP SDKs' own servers: the Python SDK under uvicorn with one worker, and the TypeScript SDK on Node as its JSON-response example. All three are driven on revision 2025-11-25 with the initialize handshake, every answer checked. socketley is stateless and issues no session id, so its new session is three requests to the SDKs' four.
 

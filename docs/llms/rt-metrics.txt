@@ -96,13 +96,13 @@ A ratio (×) is how many times better socketley did: more per second, or less ti
 
 ### Scraping 100,000 series a second
 
-Prometheus 2.53.5, VictoriaMetrics 1.112, 3 passes, 2026-11-09, socketley 85aa3476.
+Prometheus 2.53.5, VictoriaMetrics 1.112, 3 passes, 2026-11-10, socketley 0174a7a1.
 
 | case | socketley | Prometheus | VictoriaMetrics | socketley vs Prometheus | socketley vs VictoriaMetrics |
 |---|---|---|---|---|---|
-| CPU per sample ingested | 0.28 µs (0.03 cores) | 0.72 µs (0.07 cores) | 1.00 µs (0.10 cores) | 2.56× (2.55–2.67) | 3.53× (3.50–3.64) |
-| resident memory | 88.8 MB | 396 MB | 137 MB | 4.46× (4.21–4.71) | 1.55× (1.53–1.55) |
-| range query, 5 min of every path | 37.7 ms | 387 ms | 108 ms | 10.38× (4.24–12.43) | 2.88× (1.24–6.91) |
+| CPU per sample ingested | 0.29 µs (0.03 cores) | 0.74 µs (0.07 cores) | 0.99 µs (0.10 cores) | 2.55× (2.53–2.58) | 3.47× (3.35–3.49) |
+| resident memory | 91.0 MB | 387 MB | 127 MB | 4.25× (3.95–4.87) | 1.40× (1.27–1.40) |
+| range query, 5 min of every path | 38.0 ms | 359 ms | 133 ms | 9.84× (4.46–11.87) | 3.51× (1.66–4.45) |
 
 How it was measured: 50 targets × 2000 series, scraped every 1 s by all three at once; all three at once on the same two cores, the targets on four others; each pass a 60 s window. 50 targets of 2,000 series whose values change every second, scraped every second by all three at the same time, data on tmpfs. socketley's CPU includes its daemon's process. The range query asks five minutes of every path's request rate by status code at a 15 s step, the order of the three rotated.
 
