@@ -403,4 +403,4 @@ end
 
 - More in the manual: **Cluster Event Callbacks** (man-lua-configuration.txt): These optional callbacks fire when the cluster topology changes.
 
-More script APIs: [storage](man-storage-flags.txt), [socketley.storage](man-storage-flags.txt), [mqtt](rt-mqtt.txt), [mail](rt-mail.txt). Working scripts for every type are in the repository's `examples/`.
+More script APIs: [storage](man-storage-flags.txt), [socketley.storage](man-storage-flags.txt), [mqtt](rt-mqtt.txt), [mail](rt-mail.txt). A [web](rt-web.txt) runtime takes no `--lua`; with `--lua-pages` its `.lua` files are pages, as in [Lua pages](man-lua-configuration.txt). Working scripts for every type are in the repository's `examples/`.

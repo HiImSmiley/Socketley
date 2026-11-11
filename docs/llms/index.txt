@@ -32,7 +32,7 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 - [storage](rt-storage.txt): S3 object storage over a directory, with versioning, replication, a web drive and git (compared with MinIO)
 - [sync](rt-sync.txt): One job that carries a directory to a storage, from it, or both ways (compared with rclone, mc)
 - [tunnel](rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials (compared with frp)
-- [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in (compared with nginx)
+- [web](rt-web.txt): Website of files for browsers, with .lua pages and PHP through php-fpm; caching and compression built in (compared with nginx)
 
 ## Benchmarks
 

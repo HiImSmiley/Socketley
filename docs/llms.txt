@@ -30,7 +30,7 @@ Every page below is plain Markdown. llms-full.txt is all of them in one file (la
 - [storage runtime](llms/rt-storage.txt): S3 object storage over a directory, with versioning, replication, a web drive and git
 - [sync runtime](llms/rt-sync.txt): One job that carries a directory to a storage, from it, or both ways
 - [tunnel runtime](llms/rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials
-- [web runtime](llms/rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
+- [web runtime](llms/rt-web.txt): Website of files for browsers, with .lua pages and PHP through php-fpm; caching and compression built in
 
 ## Guides
 

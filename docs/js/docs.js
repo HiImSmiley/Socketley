@@ -43,7 +43,7 @@ const RT = [
   ['storage', 'S3 object storage over a directory, with versioning, replication, a web drive and git', 'MinIO'],
   ['sync', 'One job that carries a directory to a storage, from it, or both ways', 'rclone, mc'],
   ['tunnel', 'Makes a machine without an address of its own reachable through an edge it dials', 'frp'],
-  ['web', 'Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in', 'nginx'],
+  ['web', 'Website of files for browsers, with .lua pages and PHP through php-fpm; caching and compression built in', 'nginx'],
 ];
 const RTI = Object.fromEntries(RT.map(r => [r[0], r]));
 // Why a runtime has no comparison on the benchmarks page.

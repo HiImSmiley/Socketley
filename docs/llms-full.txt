@@ -43,7 +43,7 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 - [storage](rt-storage.txt): S3 object storage over a directory, with versioning, replication, a web drive and git (compared with MinIO)
 - [sync](rt-sync.txt): One job that carries a directory to a storage, from it, or both ways (compared with rclone, mc)
 - [tunnel](rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials (compared with frp)
-- [web](rt-web.txt): Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in (compared with nginx)
+- [web](rt-web.txt): Website of files for browsers, with .lua pages and PHP through php-fpm; caching and compression built in (compared with nginx)
 
 ## Benchmarks
 
@@ -875,7 +875,7 @@ end
 
 - More in the manual: **Cluster Event Callbacks** (man-lua-configuration.txt): These optional callbacks fire when the cluster topology changes.
 
-More script APIs: [storage](man-storage-flags.txt), [socketley.storage](man-storage-flags.txt), [mqtt](rt-mqtt.txt), [mail](rt-mail.txt). Working scripts for every type are in the repository's `examples/`.
+More script APIs: [storage](man-storage-flags.txt), [socketley.storage](man-storage-flags.txt), [mqtt](rt-mqtt.txt), [mail](rt-mail.txt). A [web](rt-web.txt) runtime takes no `--lua`; with `--lua-pages` its `.lua` files are pages, as in [Lua pages](man-lua-configuration.txt). Working scripts for every type are in the repository's `examples/`.
 
 
 ---
@@ -4440,30 +4440,41 @@ Every flag in full, and the rest: man-tunnel-flags.txt
 
 # web runtime
 
-Static site of files for browsers: a docs site, a blog, a single-page app; caching and compression built in
+Website of files for browsers, with .lua pages and PHP through php-fpm; caching and compression built in
 
-A **web** runtime serves a directory of files to browsers and does nothing else: no script, no WebSocket, no upload. Put a documentation site, a blog from a static site generator or a single-page app's build behind it.
+A **web** runtime serves a site of files to browsers: a documentation site, a blog from a static site generator or a single-page app's build. With `--lua-pages` its `.lua` files answer their own addresses, and with `--backend` php-fpm runs its `.php` files.
 
 ```
 socketley create web docs -p 9500 --root /srv/docs/current --domain docs -s
 socketley create web www  -p 9501 --root /var/www/html --domain example.com -s
 ```
 
-> It speaks plain HTTP and binds `127.0.0.1` unless `--bind` says otherwise. Visitors reach it through the entrance, which adds TLS and HTTP/2 for its `--domain` names. `--tls` and `--lua` are refused.
+> It speaks plain HTTP and binds `127.0.0.1` unless `--bind` says otherwise. Visitors reach it through the entrance, which adds TLS and HTTP/2 for its `--domain` names. No WebSocket, no raw TCP; `--tls` and `--lua` are refused, since a script of a web runtime is a page.
 
 ## What it does
 
 - **Clean addresses**: `/guide/` serves `guide/index.html`, `/about` serves `about.html`, and a missing page gets the site's `404.html`.
 - **Single-page apps**: `--fallback index.html` answers addresses with no file, while a missing `app.js` stays a 404.
+- **Lua pages**: With [`--lua-pages`](rt-web.txt), `/shop/cart.lua` runs `shop/cart.lua`; what it echoes or returns is the answer. See [Lua pages](man-lua-configuration.txt).
+- **PHP**: [`--backend fastcgi://unix:/run/php/php-fpm.sock`](rt-web.txt) runs `.php` files in php-fpm, the answer streamed; the source is never sent.
 - **Releases without a restart**: `--root` may be a symbolic link; swap it to a new build and the next request is served from it.
 - **Caching done right**: ETag and Last-Modified on every file; names a build stamped with a hash are cached for a year, pages are revalidated.
 - **Compression**: A `.br` or `.gz` copy next to a file is sent when the browser takes it; other text files are compressed once and kept.
-- **Never waits on the disk**: Small files are kept in memory, large ones sent with `sendfile`; inotify sees every change at once.
 - **Nothing leaks**: `..`, links pointing out of `--root` and hidden files (`.env`, `.git/`) are 404, `.well-known` excepted.
+
+## A page in Lua
+
+A page has the `socketley` functions a script has, and `req`, `echo`, `header`, `status`, `redirect`, `json`, `render` for `.tpl` templates, and sessions kept in a [cache](rt-cache.txt). It is compiled once and again only when its file changes, so an edit is answered by the next request.
+
+```
+socketley create web site -p 8080 --root /srv/site --lua-pages -s
+```
+
+A program of your own can also take a path of the site, before any file: see [the SDK](sdk.txt).
 
 ## Works with
 
-The entrance [proxy](rt-proxy.txt) of a [dns](rt-dns.txt) runtime gives it HTTPS under its `--domain`; see the [public HTTPS recipe](deploy.txt). For a site that also needs WebSocket or a Lua handler, use a [server](rt-server.txt) with `--http`.
+The entrance [proxy](rt-proxy.txt) of a [dns](rt-dns.txt) runtime gives it HTTPS under its `--domain`; see the [public HTTPS recipe](deploy.txt). For a site that also needs WebSocket, use a [server](rt-server.txt) with `--http`.
 
 ## Flags
 
