@@ -14,6 +14,9 @@ Socketley ships a modular C++ SDK in three tiers, in **sdk/include/linux/socketl
 
 - More in the manual: **Tier 1: Daemon Control (header-only)** (man-c-sdk.txt): socketley/control.h gives a program full control over a running daemon.
 - More in the manual: **Tier 2: Embed Engine (build from source)** (man-c-sdk.txt): Tier 2 embeds the full io_uring event loop and a runtime of any type in your own binary.
-- More in the manual: **Cross-Platform SDK (Windows / macOS)** (man-c-sdk.txt): These header-only TCP clients connect to Socketley runtimes from non-Linux platforms.
+- More in the manual: **The C Interface (any language)** (man-c-sdk.txt): socketley/capi.h is plain C and carries nothing of the engine, so any language that can call C can use it.
+- More in the manual: **Rust** (man-c-sdk.txt): The crate in sdk/rust wraps the C interface; set SOCKETLEY_LIB_DIR to build against a checkout.
+- More in the manual: **Node** (man-c-sdk.txt): The package in sdk/node wraps the C interface.
+- More in the manual: **Cross-Platform SDK (Windows / macOS)** (man-c-sdk.txt): The runtimes are Linux only, with or without the daemon, because the engine is built on io_uring.
 - More in the manual: **Tier 3: Daemon Attach (header-only)** (man-c-sdk.txt): socketley/attach.h registers your own process as a runtime with a running daemon.
 - More in the manual: **Mixed: Engine + Daemon Attach (Tier 2 + 3)** (man-c-sdk.txt): Embed the full engine for maximum performance, and register with the daemon for fleet monitoring.

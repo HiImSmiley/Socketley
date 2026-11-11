@@ -411,7 +411,68 @@ mgr.start("api", loop);
 loop.run();
 ```
 
+## The C Interface (any language)
+
+**socketley/capi.h** is plain C and carries nothing of the engine, so any language that can call C can use it. Install **socketley-dev** for **libsocketley.so** and the header, or build **socketley_shared** and use **sdk/socketley-config --shared --cflags --libs**.
+
+An engine is one thread with one io_uring ring, and the runtimes created on it share them; a program may have several. It takes none of the program's signals, writes nothing to its stdout, and answers with return values. Calls may come from any thread and block until done. A runtime takes a type, a name and the flags **socketley create** takes.
+
+```
+#include <socketley/capi.h>
+
+static void open_thread(void* user, skl_mcp_call* call,
+                        const char* args_json, const char* caller)
+{
+    skl_mcp_reply(call, "opened", 0);   /* now, or later from any thread */
+}
+
+char* err = NULL;
+skl_engine* e = skl_engine_new(&err);
+skl_runtime* site = skl_runtime_create(e, "web", "site",
+                        "-p 8080 --root ./public", &err);
+skl_runtime_start(site, &err);
+
+skl_runtime* tools = skl_runtime_create(e, "mcp", "tools",
+                        "-p 9600 --anonymous", &err);
+skl_mcp_tool(tools, "open_thread", "Opens a thread.", NULL,
+             open_thread, NULL, &err);
+skl_runtime_start(tools, &err);
+```
+
+A callback runs on the engine's thread and must return quickly. Work that takes time goes to a thread of the program's, which calls **skl_mcp_reply** from there.
+
+## Rust
+
+The crate in **sdk/rust** wraps the C interface; set **SOCKETLEY_LIB_DIR** to build against a checkout.
+
+```
+let engine = socketley::Engine::new()?;
+let mut tools = engine.runtime("mcp", "tools", "-p 9600 --anonymous")?;
+tools.tool("open_thread", "Opens a thread.", None, |call| {
+    std::thread::spawn(move || call.reply("opened"));
+})?;
+tools.start()?;
+```
+
+A **ToolCall** may be moved to any thread or task, and one dropped unanswered answers as failed.
+
+## Node
+
+The package in **sdk/node** wraps the C interface. A handler is an ordinary function on Node's thread, which may be async; what it returns is the answer, and a throw is a failure of the tool.
+
+```
+const { Engine } = require("socketley");
+const engine = new Engine();
+const tools = engine.runtime("mcp", "tools", "-p 9600 --anonymous");
+tools.tool("open_thread", { input: { id: "string" } }, async ({ id }) => {
+  return `opened ${id}`;
+});
+tools.start();
+```
+
 ## Cross-Platform SDK (Windows / macOS)
+
+The runtimes are Linux only, with or without the daemon, because the engine is built on io_uring. What follows are clients, which reach a socketley running on Linux over the network.
 
 These header-only TCP clients connect to Socketley runtimes from non-Linux platforms. One copy lives in **sdk/include/portable/socketley/**, and a program reaches it as **<socketley/ws_client.h>** from any of *sdk/include/linux*, *sdk/include/darwin* or *sdk/include/windows*.
 
