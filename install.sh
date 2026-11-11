@@ -241,8 +241,9 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && ! id -nG "$SUDO_USER" 
   fi
 fi
 
-# Versions before 1.1.0 wrote the runtime records, each with its --master-pw in plaintext, readable to every account.
-if [ -n "$OLD" ] && [ "$OLD" != unpackaged ] && dpkg --compare-versions "$OLD" lt 1.1.0~; then
+# The 1.0 releases wrote the runtime records, each with its --master-pw in plaintext, readable to every account; the
+# numbering began again at 0.2.0, so it is the 1.0 series that is asked for and not everything lower than a number.
+if [ -n "$OLD" ] && [ "$OLD" != unpackaged ] && dpkg --compare-versions "$OLD" ge 1.0~ && dpkg --compare-versions "$OLD" lt 1.1.0~; then
   cat <<'STATE'
 
 Upgraded from a version that wrote /var/lib/socketley/runtimes/*.json readable

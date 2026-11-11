@@ -288,7 +288,7 @@ inline result version()
     if (r.exit_code != 0)
         return r;
 
-    // "socketley-daemon 1.1.0 <pid> <dev:inode> <path>" -> "1.1.0"
+    // "socketley-daemon 0.2.0 <pid> <dev:inode> <path>" -> "0.2.0"
     constexpr std::string_view prefix = "socketley-daemon ";
     if (r.data.rfind(prefix, 0) != 0)
         return {2, "unrecognised ping reply: " + r.data};

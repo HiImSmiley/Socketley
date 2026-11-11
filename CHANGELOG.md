@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-11
+
+The version numbers start over here: this is a far larger step than the 1.x
+numbers said, and 1.0 is kept for when the interfaces are settled.
+
 ### Changed
 
 - **Any language can embed a runtime.** `socketley/capi.h` is a plain C interface,
