@@ -485,6 +485,14 @@ cli_commands() {
     echo -e "  ${CYAN}socketley ping${NC}"
     echo ""
 
+    echo -e "${BOLD}update [--check|--list|--to <version>|--deb <file>]${NC}"
+    echo "  Install the newest release from GitHub when it is newer than this"
+    echo "  socketley, checked against the SHA-256 GitHub keeps of it, and"
+    echo "  restart the service, which brings back every runtime that ran."
+    echo "  --check only says what there is; takes root otherwise."
+    echo -e "  ${CYAN}sudo socketley update${NC}"
+    echo ""
+
     echo -e "${BOLD}<idp> user add|passwd|set|disable|enable|logout|remove|show|list|import ...${NC}"
     echo "  The accounts an idp runtime keeps: add makes one under a fixed id"
     echo "  it prints, --password - reads the password from stdin, set gives"
