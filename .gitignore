@@ -105,7 +105,6 @@ test/benchmark/bench_client
 !THIRD_PARTY_NOTICES.md
 !examples/**/README.md
 !man/README.md
-!.github/**/*.md
 
 # IDE and editor
 .vscode/
