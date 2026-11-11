@@ -125,7 +125,7 @@ healthy backend gets circuit-broken:
 
 ```bash
 socketley create proxy slowapi -p 8080 --backend 127.0.0.1:9001 \
-    --backend-timeout 30 -s      # 0 disables the deadline entirely
+    --backend-timeout 30 -s  # 0 disables the deadline entirely
 ```
 
 `--sidecar` does not set this flag, but it does enable the circuit breaker the

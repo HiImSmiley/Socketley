@@ -8,8 +8,8 @@ io_uring event loop, can be scripted in Lua, and comes back after a reboot.
 **[Documentation](https://hiimsmiley.github.io/Socketley/)** — every runtime, flag, Lua function and benchmark.
 
 ```bash
-socketley create server chat -p 9000 -s                 # a TCP/WebSocket server, started
-socketley create cache kv -p 6379 --resp -s             # speaks Redis's protocol
+socketley create server chat -p 9000 -s      # a TCP/WebSocket server, started
+socketley create cache kv -p 6379 --resp -s  # speaks Redis's protocol
 socketley create web site -p 8080 --root /srv/site --lua-pages -s
 socketley ls
 ```
@@ -30,8 +30,8 @@ From a clone, on any distribution with a 5.19+ kernel and GCC 12+:
 ```bash
 git clone https://github.com/HiImSmiley/Socketley
 cd Socketley
-bash scripts/install-from-source.sh     # builds and installs; --dry-run shows each step first
-bash scripts/update.sh                  # later: the newest commit, built and swapped in
+bash scripts/install-from-source.sh  # builds and installs; --dry-run shows each step first
+bash scripts/update.sh               # later: the newest commit, built and swapped in
 ```
 
 The daemon then runs as the systemd service `socketley`. Root and members of the `socketley` group reach it:
@@ -68,7 +68,7 @@ Rust and Node. A program with its own website, API, cache and MCP tools for a mo
 ```js
 const { Engine } = require('socketley');
 
-const engine = new Engine();                      // one thread, one io_uring ring
+const engine = new Engine();  // one thread and one io_uring ring for all of its runtimes
 const kv = engine.runtime('cache', 'kv', '-p 8081').start();
 
 const site = engine.runtime('web', 'site', '-p 8080 --root /srv/site');
@@ -87,8 +87,7 @@ A runtime takes the same flags as `socketley create`, and a C program builds wit
 
 Socketley is about the technology more than about a product. It asks how far a handful of ideas carry when they are
 followed all the way through: one io_uring event loop per process, owned by a single thread, every service a
-runtime of the same binary, and each runtime a worker process of its own on such a loop. The version starts at 0.2.0 because the interfaces still change between releases:
-use it, measure it, learn from it, but do not expect the stability promise of a 1.0.
+runtime of the same binary, and each runtime a worker process of its own on such a loop.
 
 What a research project owes is that its claims hold, so most of the work goes into checking them:
 

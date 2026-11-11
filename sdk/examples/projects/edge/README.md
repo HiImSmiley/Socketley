@@ -34,7 +34,7 @@ g++ -std=c++23 sdk/examples/projects/edge/app.cpp \
 g++ -std=c++23 sdk/examples/projects/edge/gateway.cpp \
     ... same flags ... -o edge-gw
 
-cd sdk/examples/projects/edge   # so ./public and the .pem files resolve
+cd sdk/examples/projects/edge  # so ./public and the .pem files resolve
 ./edge-app &  ./edge-gw &
 curl -k https://127.0.0.1:8443/gw/index.html
 ```

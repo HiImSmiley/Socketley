@@ -35,12 +35,12 @@ g++ -std=c++17 sdk/examples/projects/jobqueue/worker.cpp \
 
 ```bash
 ./jobd &
-echo "submit build-42" | nc -q1 127.0.0.1 9000   # -> queued 1
-echo "submit deploy-7" | nc -q1 127.0.0.1 9000   # -> queued 2
-echo "status"          | nc -q1 127.0.0.1 9000   # -> depth 2  submitted 2
+echo "submit build-42" | nc -q1 127.0.0.1 9000  # -> queued 1
+echo "submit deploy-7" | nc -q1 127.0.0.1 9000  # -> queued 2
+echo "status"          | nc -q1 127.0.0.1 9000  # -> depth 2  submitted 2
 
-./jobworker                                       # drains, prints each job
-echo "get jobs_done"   | nc -q1 127.0.0.1 6380   # -> 2
+./jobworker                                     # drains, prints each job
+echo "get jobs_done"   | nc -q1 127.0.0.1 6380  # -> 2
 ```
 
 The queue port speaks the cache text protocol, so `redis-cli -p 6380` and any

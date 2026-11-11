@@ -6,22 +6,22 @@ This directory contains practical examples demonstrating all features of socketl
 
 ```
 examples/
-├── basic/              # Getting started, minimal setups
-├── server-client/      # Server-client communication patterns
-├── server/             # Server flags, and the Lua handlers you attach to one
-├── proxy/              # HTTP/TCP proxy configurations
-├── cache/              # Caching, persistence, sharding
-├── storage/            # A storage runtime reached from a script, and its hooks
-├── mqtt/               # An MQTT broker, and servers that publish through one
-├── mail/               # A mail server for a domain, its filters and its script
-├── mcp/                # An MCP server an AI client asks, its tools in a script
-├── web/                # A static site, and a deploy that swaps releases with no restart
-├── lua-config/         # Lua configuration and scripting
-├── cluster/            # Several daemons discovering each other
-├── managed/            # Binaries the daemon supervises, via `socketley add`
-├── udp/                # UDP server/client examples
-├── advanced/           # Complex multi-runtime setups
-└── projects/           # Complete systems you can run, not single features
+├── basic/          # Getting started, minimal setups
+├── server-client/  # Server-client communication patterns
+├── server/         # Server flags, and the Lua handlers you attach to one
+├── proxy/          # HTTP/TCP proxy configurations
+├── cache/          # Caching, persistence, sharding
+├── storage/        # A storage runtime reached from a script, and its hooks
+├── mqtt/           # An MQTT broker, and servers that publish through one
+├── mail/           # A mail server for a domain, its filters and its script
+├── mcp/            # An MCP server an AI client asks, its tools in a script
+├── web/            # A static site, and a deploy that swaps releases with no restart
+├── lua-config/     # Lua configuration and scripting
+├── cluster/        # Several daemons discovering each other
+├── managed/        # Binaries the daemon supervises, via `socketley add`
+├── udp/            # UDP server/client examples
+├── advanced/       # Complex multi-runtime setups
+└── projects/       # Complete systems you can run, not single features
 ```
 
 ## Quick Start
@@ -32,9 +32,9 @@ examples/
 
 3. **Clean up** when done:
    ```bash
-   socketley ls                    # See all runtimes
-   socketley stop <name>           # Stop each runtime
-   socketley remove <name>         # Remove each runtime
+   socketley ls             # See all runtimes
+   socketley stop <name>    # Stop each runtime
+   socketley remove <name>  # Remove each runtime
    ```
 
 ## Examples Overview
