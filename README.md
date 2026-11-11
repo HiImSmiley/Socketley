@@ -76,7 +76,7 @@ The runtimes bring their own web applications, served from the same binary, with
 
 ## In your own program
 
-Every runtime also runs inside an application, with no daemon ([reference](https://hiimsmiley.github.io/Socketley/#/man/c-sdk)): the `socketley-dev` package carries `libsocketley.so`,
+Every runtime also runs inside an application, with no daemon ([reference](https://hiimsmiley.github.io/Socketley/#/man/sdk)): the `socketley-dev` package carries `libsocketley.so`,
 the C header `socketley/capi.h` and a pkg-config file, and [sdk/rust](sdk/rust) and [sdk/node](sdk/node) wrap it for
 Rust and Node. A program with its own website, API, cache and MCP tools for a model:
 

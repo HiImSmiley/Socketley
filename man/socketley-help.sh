@@ -83,7 +83,7 @@ main_menu() {
     echo -e "  ${GREEN}7)${NC} Architecture Overview"
     echo -e "  ${GREEN}8)${NC} Troubleshooting"
     echo -e "  ${GREEN}9)${NC} Installation & Packaging"
-    echo -e "  ${GREEN}10)${NC} C++ SDK"
+    echo -e "  ${GREEN}10)${NC} SDK: C, C++, Rust, Node"
     echo ""
     echo -e "  ${RED}q)${NC} Quit"
     echo ""
@@ -3317,13 +3317,14 @@ installation_help() {
     main_menu
 }
 
-# C++ SDK
+# SDK
 sdk_help() {
     show_header
-    echo -e "${BOLD}${YELLOW}=== C++ SDK ===${NC}\n"
+    echo -e "${BOLD}${YELLOW}=== SDK: C, C++, Rust, Node ===${NC}\n"
 
-    echo -e "  Three-tier modular SDK in ${CYAN}sdk/include/linux/socketley/${NC}."
-    echo -e "  Tiers 1 & 3 are header-only (zero deps). Tier 2 needs the static library."
+    echo -e "  Any runtime inside your own program, with or without a daemon."
+    echo -e "  C++ in three tiers in ${CYAN}sdk/include/linux/socketley/${NC}: 1 and 3 header-only, 2 the static library."
+    echo -e "  C, Rust and Node through ${CYAN}libsocketley.so${NC} (package socketley-dev)."
     echo ""
     echo -e "  ${GREEN}1)${NC} Overview & When to Use Each Tier"
     echo -e "  ${GREEN}2)${NC} Tier 1: Daemon Control (control.h)"
@@ -3331,6 +3332,9 @@ sdk_help() {
     echo -e "  ${GREEN}4)${NC} Tier 3: Daemon Attach (attach.h)"
     echo -e "  ${GREEN}5)${NC} Mixed: Engine + Attach (Tier 2 + 3)"
     echo -e "  ${GREEN}6)${NC} Cross-Platform SDK (ws_client.h, cache_client.h)"
+    echo -e "  ${GREEN}7)${NC} The C Interface (capi.h, libsocketley.so)"
+    echo -e "  ${GREEN}8)${NC} Rust"
+    echo -e "  ${GREEN}9)${NC} Node"
     echo ""
     echo -e "  ${RED}b)${NC} Back"
     echo ""
@@ -3342,6 +3346,9 @@ sdk_help() {
         4) sdk_tier3 ;;
         5) sdk_mixed ;;
         6) sdk_cross ;;
+        7) sdk_capi ;;
+        8) sdk_rust ;;
+        9) sdk_node ;;
         b|B) main_menu ;;
         *) sdk_help ;;
     esac
@@ -3781,13 +3788,93 @@ sdk_cross() {
 
     echo -e "${BOLD}Build:${NC}"
     echo -e "  ${CYAN}# MSVC (Windows)"
-    echo -e "  cl /std:c++17 /I include\\windows app.cpp"
+    echo -e "  cl /std:c++17 /I sdk\\include\\windows app.cpp"
     echo ""
     echo -e "  # clang++ (macOS)"
     echo -e "  clang++ -std=c++17 -I sdk/include/darwin app.cpp -o app"
     echo ""
     echo -e "  # g++ (Linux)"
     echo -e "  g++ -std=c++17 -I sdk/include/linux app.cpp -o app${NC}"
+    echo ""
+
+    read -p "Press Enter to continue..." || true
+    sdk_help
+}
+
+sdk_capi() {
+    show_header
+    echo -e "${BOLD}${CYAN}=== The C Interface ===${NC}\n"
+
+    echo -e "  ${CYAN}socketley/capi.h${NC} is plain C, so any language that calls C can use it."
+    echo -e "  Install ${CYAN}socketley-dev${NC} for ${CYAN}libsocketley.so${NC}, the header and a pkg-config file,"
+    echo -e "  or build ${CYAN}socketley_shared${NC} and use ${CYAN}sdk/socketley-config --shared --cflags --libs${NC}."
+    echo ""
+    echo -e "  An engine is one thread with one io_uring ring; the runtimes created on it share them."
+    echo -e "  It takes none of the program's signals and writes nothing to stdout."
+    echo -e "  Calls may come from any thread and block until done."
+    echo -e "  A runtime takes a type, a name and the flags ${CYAN}socketley create${NC} takes."
+    echo ""
+    echo -e "${BOLD}Functions:${NC}"
+    echo -e "  ${CYAN}skl_engine_new / skl_engine_free${NC}          an engine"
+    echo -e "  ${CYAN}skl_runtime_create / start / stop / free${NC}  a runtime; ${CYAN}skl_runtime_stats${NC}"
+    echo -e "  ${CYAN}skl_mcp_tool / skl_mcp_reply${NC}              an MCP tool as a function"
+    echo -e "  ${CYAN}skl_on_connect / disconnect / message${NC}     a server's or client's connections"
+    echo -e "  ${CYAN}skl_send${NC}                                  write to a connection"
+    echo -e "  ${CYAN}skl_web_handler / skl_web_reply${NC}           a web path as a function"
+    echo -e "  ${CYAN}skl_cache_command${NC}                         one cache command"
+    echo ""
+    echo -e "${BOLD}Build:${NC}"
+    echo -e "  ${CYAN}cc app.c \$(pkg-config --cflags --libs socketley) -o app${NC}"
+    echo ""
+    echo -e "  ${CYAN}scripts/premake5 gmake --sdk-runtimes=mcp,cache${NC} builds a library of only those types."
+    echo -e "  More: ${CYAN}man socketley${NC}, section SDK."
+    echo ""
+
+    read -p "Press Enter to continue..." || true
+    sdk_help
+}
+
+sdk_rust() {
+    show_header
+    echo -e "${BOLD}${CYAN}=== Rust ===${NC}\n"
+
+    echo -e "  The crate in ${CYAN}sdk/rust${NC} wraps the C interface."
+    echo -e "  Set ${CYAN}SOCKETLEY_LIB_DIR${NC} to build against a checkout instead of socketley-dev."
+    echo ""
+    echo -e "${CYAN}  let engine = socketley::Engine::new()?;"
+    echo -e "  let mut tools = engine.runtime(\"mcp\", \"tools\", \"-p 9600 --anonymous\")?;"
+    echo -e "  tools.tool(\"open_thread\", \"Opens a thread.\", None, |call| {"
+    echo -e "      std::thread::spawn(move || call.reply(\"opened\"));"
+    echo -e "  })?;"
+    echo -e "  tools.start()?;${NC}"
+    echo ""
+    echo -e "  A ToolCall may move to any thread or task; one dropped unanswered answers as failed."
+    echo -e "  on_connect, on_disconnect, on_message and send are a server's and client's,"
+    echo -e "  handle a web runtime's and command a cache's."
+    echo -e "  Examples: ${CYAN}sdk/rust/examples${NC}"
+    echo ""
+
+    read -p "Press Enter to continue..." || true
+    sdk_help
+}
+
+sdk_node() {
+    show_header
+    echo -e "${BOLD}${CYAN}=== Node ===${NC}\n"
+
+    echo -e "  The package in ${CYAN}sdk/node${NC} wraps the C interface."
+    echo -e "  A handler is an ordinary function on Node's thread and may be async;"
+    echo -e "  what it returns is the answer, and a throw is a failure."
+    echo ""
+    echo -e "${CYAN}  const { Engine } = require(\"socketley\");"
+    echo -e "  const engine = new Engine();"
+    echo -e "  const tools = engine.runtime(\"mcp\", \"tools\", \"-p 9600 --anonymous\");"
+    echo -e "  tools.tool(\"open_thread\", { input: { id: \"string\" } }, async ({ id }) => {"
+    echo -e "    return \`opened \${id}\`;"
+    echo -e "  });"
+    echo -e "  tools.start();${NC}"
+    echo ""
+    echo -e "  Examples: ${CYAN}sdk/node/examples${NC}"
     echo ""
 
     read -p "Press Enter to continue..." || true

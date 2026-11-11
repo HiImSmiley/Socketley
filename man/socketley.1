@@ -26114,8 +26114,9 @@ and
 with the shards' values added together. For example,
 .B histogram_quantile(0.99, rate(socketley_proxy_request_duration_seconds_bucket[5m]))
 reads the 99th percentile of the proxy request histogram.
-.SH C++ SDK
-Socketley ships a modular C++ SDK in three tiers, in
+.SH SDK
+Any runtime runs inside a program of your own, with or without a daemon.
+For C++ the SDK comes in three tiers, in
 .BR sdk/include/linux/socketley/ .
 Tiers 1 and 3 are self-contained, header-only files.
 Copy them anywhere and compile with
@@ -26727,7 +26728,7 @@ Build with C++17; there are no external dependencies:
 .RS
 .nf
 # MSVC
-cl /std:c++17 /I include\\windows app.cpp
+cl /std:c++17 /I sdk\\include\\windows app.cpp
 
 # clang++ (macOS)
 clang++ -std=c++17 -I sdk/include/darwin app.cpp -o app

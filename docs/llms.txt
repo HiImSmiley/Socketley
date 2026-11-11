@@ -83,7 +83,7 @@ Every page below is plain Markdown. llms-full.txt is all of them in one file (la
 - [Manual: State persistence](llms/man-state-persistence.txt): The manual page's State persistence section.
 - [Manual: Environment](llms/man-environment.txt): The manual page's Environment section.
 - [Manual: Files](llms/man-files.txt): The manual page's Files section.
-- [Manual: C++ SDK](llms/man-c-sdk.txt): The manual page's C++ SDK section.
+- [Manual: SDK](llms/man-sdk.txt): The manual page's SDK section.
 - [Manual: Limitations](llms/man-limitations.txt): The manual page's Limitations section.
 - [Manual: Exit status](llms/man-exit-status.txt): The manual page's Exit status section.
 - [Manual: See also](llms/man-see-also.txt): The manual page's See also section.

@@ -1331,15 +1331,6 @@ The engine is built on io_uring, so the runtimes run on Linux, with or without t
 
 ## In the manual
 
-- More in the manual: **Tier 1: Daemon Control (header-only)** (man-c-sdk.txt): socketley/control.h gives a program full control over a running daemon.
-- More in the manual: **Tier 2: Embed Engine (build from source)** (man-c-sdk.txt): Tier 2 embeds the full io_uring event loop and a runtime of any type in your own binary.
-- More in the manual: **The C Interface (any language)** (man-c-sdk.txt): socketley/capi.h is plain C and carries nothing of the engine, so any language that can call C can use it.
-- More in the manual: **Rust** (man-c-sdk.txt): The crate in sdk/rust wraps the C interface; set SOCKETLEY_LIB_DIR to build against a checkout.
-- More in the manual: **Node** (man-c-sdk.txt): The package in sdk/node wraps the C interface.
-- More in the manual: **Cross-Platform SDK (Windows / macOS)** (man-c-sdk.txt): The runtimes are Linux only, with or without the daemon, because the engine is built on io_uring.
-- More in the manual: **Tier 3: Daemon Attach (header-only)** (man-c-sdk.txt): socketley/attach.h registers your own process as a runtime with a running daemon.
-- More in the manual: **Mixed: Engine + Daemon Attach (Tier 2 + 3)** (man-c-sdk.txt): Embed the full engine for maximum performance, and register with the daemon for fleet monitoring.
-
 
 ---
 
@@ -5666,7 +5657,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [State persistence](man-state-persistence.txt)
 - [Environment](man-environment.txt) (91 entries)
 - [Files](man-files.txt)
-- [C++ SDK](man-c-sdk.txt)
+- [SDK](man-sdk.txt)
 - [Limitations](man-limitations.txt)
 - [Exit status](man-exit-status.txt) (3 entries)
 - [See also](man-see-also.txt)
@@ -15029,11 +15020,11 @@ Each histogram has **_bucket** (**le**), **_sum** and **_count**, with the shard
 
 ---
 
-# C++ SDK
+# SDK
 
 From the manual page socketley(1).
 
-Socketley ships a modular C++ SDK in three tiers, in **sdk/include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
+Any runtime runs inside a program of your own, with or without a daemon. For C++ the SDK comes in three tiers, in **sdk/include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
 
 | Tier | Header | Use Case | Dependencies |
 |---|---|---|---|
@@ -15523,7 +15514,7 @@ Build with C++17; there are no external dependencies:
 
 ```
 # MSVC
-cl /std:c++17 /I include\windows app.cpp
+cl /std:c++17 /I sdk\include\windows app.cpp
 
 # clang++ (macOS)
 clang++ -std=c++17 -I sdk/include/darwin app.cpp -o app

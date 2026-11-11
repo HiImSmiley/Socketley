@@ -1,8 +1,8 @@
-# C++ SDK
+# SDK
 
 From the manual page socketley(1).
 
-Socketley ships a modular C++ SDK in three tiers, in **sdk/include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
+Any runtime runs inside a program of your own, with or without a daemon. For C++ the SDK comes in three tiers, in **sdk/include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
 
 | Tier | Header | Use Case | Dependencies |
 |---|---|---|---|
@@ -492,7 +492,7 @@ Build with C++17; there are no external dependencies:
 
 ```
 # MSVC
-cl /std:c++17 /I include\windows app.cpp
+cl /std:c++17 /I sdk\include\windows app.cpp
 
 # clang++ (macOS)
 clang++ -std=c++17 -I sdk/include/darwin app.cpp -o app
