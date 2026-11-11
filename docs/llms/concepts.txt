@@ -44,7 +44,7 @@ Each runtime is saved as a JSON file in the daemon's state directory. When the d
 
 ## TLS
 
-A server, cache, proxy or mqtt broker encrypts its own port with `--tls --cert file --key file`. Add `--ca file` to require client certificates. `--acme name` gets a Let's Encrypt certificate and renews it.
+A server, cache, proxy, storage or mqtt runtime encrypts its own port with `--tls --cert file --key file`, and a mail runtime its mail ports. Add `--ca file` to require client certificates. `--acme name` gets a Let's Encrypt certificate and renews it.
 
 When socketley connects out (a client runtime, a proxy's `https://` backend), it always verifies the server's certificate; that check cannot be turned off. What is not supported is listed under [TLS limitations](man-limitations.txt).
 

@@ -32,7 +32,7 @@
 <x-man s="common-flags" subs-only></x-man>
 
 <h2>TLS</h2>
-<p>A server, cache, proxy or mqtt broker encrypts its own port with <code>--tls --cert file --key file</code>. Add <code>--ca file</code> to require client certificates. <code>--acme name</code> gets a Let's Encrypt certificate and renews it.</p>
+<p>A server, cache, proxy, storage or mqtt runtime encrypts its own port with <code>--tls --cert file --key file</code>, and a mail runtime its mail ports. Add <code>--ca file</code> to require client certificates. <code>--acme name</code> gets a Let's Encrypt certificate and renews it.</p>
 <p>When socketley connects out (a client runtime, a proxy's <code>https://</code> backend), it always verifies the server's certificate; that check cannot be turned off. What is not supported is listed under <a href="#/man/limitations.tls">TLS limitations</a>.</p>
 
 <h2>Several cores</h2>

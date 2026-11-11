@@ -488,7 +488,7 @@ function spy(heads, toc) {
 async function pageHome(C) {
   const nflags = REF.flags.filter(f => !f.hidden).length;
   C.append(pageHead('Documentation', 'socketley', 'One Linux daemon and CLI that runs your servers, proxies, caches, storage, databases, DNS, sign-in, MQTT, mail, metrics, tunnels and MCP — each a runtime made with one command.',
-    [RT.length + ' runtime types', nflags + ' flags', 'io_uring', 'Lua scripting', 'Linux'], null,
+    [...(REF.version ? ['version ' + REF.version] : []), RT.length + ' runtime types', nflags + ' flags', 'io_uring', 'Lua scripting', 'Linux'], null,
     el('div', { class: 'acts' }, el('a', { class: 'btn pri', href: '#/install' }, el('span', { text: 'Install' })),
       el('a', { class: 'btn', href: '#/tour' }, el('span', { text: 'Ten-minute tour' })),
       el('a', { class: 'btn', href: '#/concepts' }, el('span', { text: 'Concepts' })))));
@@ -541,7 +541,7 @@ async function pageFlags(C) {
 }
 async function pageMan(C, sid, eid) {
   if (!sid) {
-    C.append(pageHead('Reference', 'Manual', 'socketley(1), the manual page, by section. Generated from man/socketley.1 on ' + REF.date + '.'));
+    C.append(pageHead('Reference', 'Manual', 'socketley(1), the manual page, by section. Generated from man/socketley.1' + (REF.version ? ' of socketley ' + REF.version : '') + ' on ' + REF.date + '.'));
     const lists = [['Runtime flags', s => /-flags$/.test(s.id)], ['Everything else', s => !/-flags$/.test(s.id)]];
     for (const [title, want] of lists) {
     const list = el('div', { class: 'cards' });

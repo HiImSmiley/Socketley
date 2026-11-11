@@ -34,6 +34,21 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 - [tunnel](rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials (compared with frp)
 - [web](rt-web.txt): Website of files for browsers, with .lua pages and PHP through php-fpm; caching and compression built in (compared with nginx)
 
+## Built in: the pages people use
+
+Some runtimes bring their own web applications, served from the same binary, with nothing else to install.
+
+| Page | Where | What it does |
+|---|---|---|
+| [Dashboard](man-dashboard.txt) | The daemon, with `daemon.metrics_port` set; `socketley dashboard` prints its address | Every runtime live, with its figures; create, edit, start and stop them in forms; a Domains view of certificates, routes and zones. |
+| [Storage interface](man-storage-flags.txt) | A [storage](rt-storage.txt) runtime, at `/~ui/` | A drive over the buckets, with share links, media, git repositories and WebDAV. |
+| [Webmail](man-mail-flags.txt) | A [mail](rt-mail.txt) runtime with `--web` and `--domain` | A mail client in the browser: conversations, search, attachments and drafts. |
+| [Account page](rt-idp.txt) | An [idp](rt-idp.txt) runtime, at `/account` | The sign-in the other pages use, and a page for the password, the second step and app passwords. |
+
+## In your own program
+
+Every runtime also runs inside an application of your own, with no daemon. The `socketley-dev` package carries `libsocketley.so` and the C header `socketley/capi.h`, and `sdk/rust` and `sdk/node` wrap it. An MCP tool, a web path or a cache command can be a function of the program. See [the SDK](sdk.txt).
+
 ## Benchmarks
 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.

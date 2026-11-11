@@ -11,6 +11,19 @@ socketley ls</pre>
 <h2>The runtimes</h2>
 <x-cards></x-cards>
 
+<h2>Built in: the pages people use</h2>
+<p>Some runtimes bring their own web applications, served from the same binary, with nothing else to install.</p>
+<table class="kv">
+<tr><th>Page</th><th>Where</th><th>What it does</th></tr>
+<tr><td><a href="#/man/dashboard">Dashboard</a></td><td>The daemon, with <code>daemon.metrics_port</code> set; <code>socketley dashboard</code> prints its address</td><td>Every runtime live, with its figures; create, edit, start and stop them in forms; a Domains view of certificates, routes and zones.</td></tr>
+<tr><td><a href="#/man/storage-flags.drive-links-media-and-the-web-interface">Storage interface</a></td><td>A <a href="#/rt/storage">storage</a> runtime, at <code>/~ui/</code></td><td>A drive over the buckets, with share links, media, git repositories and WebDAV.</td></tr>
+<tr><td><a href="#/man/mail-flags/web">Webmail</a></td><td>A <a href="#/rt/mail">mail</a> runtime with <code>--web</code> and <code>--domain</code></td><td>A mail client in the browser: conversations, search, attachments and drafts.</td></tr>
+<tr><td><a href="#/rt/idp">Account page</a></td><td>An <a href="#/rt/idp">idp</a> runtime, at <code>/account</code></td><td>The sign-in the other pages use, and a page for the password, the second step and app passwords.</td></tr>
+</table>
+
+<h2>In your own program</h2>
+<p>Every runtime also runs inside an application of your own, with no daemon. The <code>socketley-dev</code> package carries <code>libsocketley.so</code> and the C header <code>socketley/capi.h</code>, and <code>sdk/rust</code> and <code>sdk/node</code> wrap it. An MCP tool, a web path or a cache command can be a function of the program. See <a href="#/sdk">the SDK</a>.</p>
+
 <h2>Benchmarks</h2>
 <p>Each runtime's headline result against the server people run instead; method and every set are on the <a href="#/bench">benchmarks</a> page.</p>
 <x-glance></x-glance>

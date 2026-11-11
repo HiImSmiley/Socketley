@@ -73,5 +73,5 @@ After `sudo systemctl restart socketley`, every running runtime comes back by it
 
 ## Where next
 
-- Each runtime's page: [server](rt-server.txt), [proxy](rt-proxy.txt), [cache](rt-cache.txt), and the ten others.
+- Each runtime's page: [server](rt-server.txt), [proxy](rt-proxy.txt), [cache](rt-cache.txt), and the twelve others.
 - [How it works](how.txt) for what happened behind each command, [concepts](concepts.txt) for what runtimes share, [deployment](deploy.txt) before running it for real.

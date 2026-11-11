@@ -45,6 +45,21 @@ A runtime has a type, which decides what it speaks, and a name, by which others 
 - [tunnel](rt-tunnel.txt): Makes a machine without an address of its own reachable through an edge it dials (compared with frp)
 - [web](rt-web.txt): Website of files for browsers, with .lua pages and PHP through php-fpm; caching and compression built in (compared with nginx)
 
+## Built in: the pages people use
+
+Some runtimes bring their own web applications, served from the same binary, with nothing else to install.
+
+| Page | Where | What it does |
+|---|---|---|
+| [Dashboard](man-dashboard.txt) | The daemon, with `daemon.metrics_port` set; `socketley dashboard` prints its address | Every runtime live, with its figures; create, edit, start and stop them in forms; a Domains view of certificates, routes and zones. |
+| [Storage interface](man-storage-flags.txt) | A [storage](rt-storage.txt) runtime, at `/~ui/` | A drive over the buckets, with share links, media, git repositories and WebDAV. |
+| [Webmail](man-mail-flags.txt) | A [mail](rt-mail.txt) runtime with `--web` and `--domain` | A mail client in the browser: conversations, search, attachments and drafts. |
+| [Account page](rt-idp.txt) | An [idp](rt-idp.txt) runtime, at `/account` | The sign-in the other pages use, and a page for the password, the second step and app passwords. |
+
+## In your own program
+
+Every runtime also runs inside an application of your own, with no daemon. The `socketley-dev` package carries `libsocketley.so` and the C header `socketley/capi.h`, and `sdk/rust` and `sdk/node` wrap it. An MCP tool, a web path or a cache command can be a function of the program. See [the SDK](sdk.txt).
+
 ## Benchmarks
 
 Each runtime's headline result against the server people run instead; method and every set are on the [benchmarks](bench.txt) page.
@@ -273,7 +288,7 @@ After `sudo systemctl restart socketley`, every running runtime comes back by it
 
 ## Where next
 
-- Each runtime's page: [server](rt-server.txt), [proxy](rt-proxy.txt), [cache](rt-cache.txt), and the ten others.
+- Each runtime's page: [server](rt-server.txt), [proxy](rt-proxy.txt), [cache](rt-cache.txt), and the twelve others.
 - [How it works](how.txt) for what happened behind each command, [concepts](concepts.txt) for what runtimes share, [deployment](deploy.txt) before running it for real.
 
 
@@ -325,7 +340,7 @@ Each runtime is saved as a JSON file in the daemon's state directory. When the d
 
 ## TLS
 
-A server, cache, proxy or mqtt broker encrypts its own port with `--tls --cert file --key file`. Add `--ca file` to require client certificates. `--acme name` gets a Let's Encrypt certificate and renews it.
+A server, cache, proxy, storage or mqtt runtime encrypts its own port with `--tls --cert file --key file`, and a mail runtime its mail ports. Add `--ca file` to require client certificates. `--acme name` gets a Let's Encrypt certificate and renews it.
 
 When socketley connects out (a client runtime, a proxy's `https://` backend), it always verifies the server's certificate; that check cannot be turned off. What is not supported is listed under [TLS limitations](man-limitations.txt).
 
