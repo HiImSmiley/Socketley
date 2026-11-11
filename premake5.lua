@@ -1412,6 +1412,27 @@ project "fuzz_fastcgi"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the request head six runtimes share, cookies, site paths, HPACK and DEFLATE ───
+
+project "fuzz_http_codecs"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_http_codecs.cpp",
+        "socketley/shared/http/hpack.cpp",
+        "socketley/shared/util/inflate.cpp",
+        "socketley/shared/util/deflate.cpp",
+        "socketley/shared/util/crc.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: RESP2 command parsing (header-only, no libs) ───
 
 project "fuzz_resp"

@@ -2916,6 +2916,55 @@ def sshcert_seeds():
         "key_bad": b"\x01ssh-ed25519 not-base64",
     }
 
+def httpcodecs_seeds():
+    import zlib
+    def raw(b, level=6):
+        z = zlib.compressobj(level, zlib.DEFLATED, -15)
+        return z.compress(b) + z.flush()
+    text = b"the quick brown fox jumps over the lazy dog " * 40
+    return {
+        # 0: the request head an idp, a db, a web, an mcp, a metrics and a tunnel runtime read.
+        "request_get": b"\0GET /login?rd=%2F HTTP/1.1\r\nHost: auth.example.com\r\nCookie: skl_idp=a.b.c\r\n\r\n",
+        "request_post": b"\0POST /token HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        "request_two": b"\0POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+        "request_chunked": b"\0POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "request_both": b"\0POST /a HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "request_twice": b"\0POST /a HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\nabcde",
+        "request_bare_lf": b"\0GET / HTTP/1.1\nHost: x\n\n",
+        "request_fold": b"\0GET / HTTP/1.1\r\nX: a\r\n b\r\n\r\n",
+        # 1: a cookie's name, a NUL, and the Cookie header it is looked for in and stripped from.
+        "cookie_plain": b"\x01skl_idp\0a=1; skl_idp=tok; b=2",
+        "cookie_twice": b"\x01skl_idp\0skl_idp=one;skl_idp=two; skl_idpx=3; xskl_idp=4",
+        "cookie_spaced": b"\x01skl_idp\0 skl_idp =tok;\tskl_idp=t2 ; =v; skl_idp",
+        # 2: a request's path as a site of files reads it.
+        "path_plain": b"\x02/css/site.css",
+        "path_dots": b"\x02/a/%2e%2e/%2E/b//c/",
+        "path_hidden": b"\x02/.git/config",
+        "path_nul": b"\x02/a%00b",
+        "path_bad_escape": b"\x02/a%zz/%2",
+        # 3: HPACK header blocks: indexed, a literal added to the table, a size update, a Huffman name and value.
+        "hpack_indexed": b"\x03\x82\x86\x84\x41\x0fwww.example.com",
+        "hpack_literal": b"\x03\x40\x0acustom-key\x0dcustom-header\xbe\xbe",
+        "hpack_resize": b"\x03\x20\x3f\xe1\x01\x40\x01a\x01b",
+        "hpack_huffman": b"\x03\x82\x86\x84\x41\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff",
+        "hpack_long_int": b"\x03\x7f\xff\xff\xff\xff\xff\xff\xff\xff\x7f",
+        "hpack_missing_entry": b"\x03\xff\x00",
+        # 4: a Huffman string, and a field encoded and decoded again.
+        "huffman_text": b"\x04\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff",
+        "huffman_eos": b"\x04\xff\xff\xff\xff",
+        "field_pair": b"\x04content-typeapplication/json; charset=utf-8",
+        # 5: DEFLATE, where to cut it in two, then the stream: stored, fixed, dynamic, cut short, and a far distance.
+        "inflate_stored": b"\x05\x40" + raw(b"hello, world", 0),
+        "inflate_fixed": b"\x05\x80" + raw(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1),
+        "inflate_dynamic": b"\x05\x20" + raw(text, 9),
+        "inflate_cut": b"\x05\x10" + raw(text, 9)[:40],
+        "inflate_far": b"\x05\x01\x4b\x04\x00\x02\x82\x00",
+        "inflate_no_code": b"\x05\x00\x05\xe0\x81\x08\x00\x00\x00\x00\x20\xff",
+        # 6: bytes compressed and opened again.
+        "round_text": b"\x06" + text[:600],
+        "round_runs": b"\x07" + b"\0" * 300 + b"\xff" * 300 + bytes(range(256)),
+    }
+
 def main(argv):
     root = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
     total = 0
@@ -2933,7 +2982,8 @@ def main(argv):
                         ("mqtt", mqtt_seeds()),
                         ("mail", mail_seeds()),
                         ("tunnelmux", tunnelmux_seeds()),
-                        ("sshcert", sshcert_seeds())):
+                        ("sshcert", sshcert_seeds()),
+                        ("httpcodecs", httpcodecs_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

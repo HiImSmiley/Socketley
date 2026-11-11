@@ -276,6 +276,7 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_ws_frame)       corpus=ws ;;
         fuzz_http_request)   corpus=http ;;
         fuzz_http_response)  corpus=httpresp ;;
+        fuzz_http_codecs)    corpus=httpcodecs ;;
         fuzz_cache_ops)      corpus=cache ;;
         fuzz_client_ops)     corpus=client ;;
         fuzz_server_ops)     corpus=server ;;
