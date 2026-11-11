@@ -1,13 +1,6 @@
 #include "lua_context.h"
-#include "../crypto/tls_context.h"
-#include <strings.h>
-#include "../net/resolve_cache.h"
-#include "../http/http_framing.h"
+#ifndef SOCKETLEY_NO_LUA
 #include "lua_json.h"
-#include "../loop/coarse_clock.h"
-#include "../loop/line_framing.h"
-#include "../loop/turn_clock.h"
-#include "../ipc/deadline_slot.h"
 #include "lua_suspend.h"
 #include "lua_storage_api.h"
 #include "lua_db_api.h"
@@ -18,6 +11,15 @@
 #include "lua_http.h"
 #include "../../runtime/mqtt/mqtt_lua_table.h"
 #include "../../runtime/mcp/mcp_lua_table.h"
+#endif
+#include "../crypto/tls_context.h"
+#include <strings.h>
+#include "../net/resolve_cache.h"
+#include "../http/http_framing.h"
+#include "../loop/coarse_clock.h"
+#include "../loop/line_framing.h"
+#include "../loop/turn_clock.h"
+#include "../ipc/deadline_slot.h"
 #include "../util/settings.h"
 #include "../util/hex.h"
 #include "../util/random_id.h"

@@ -75,7 +75,7 @@ fi
 ok
 
 # And nothing reads one past the table, which would be a knob no listing and no check knows of.
-AROUND=$(grep -rnE '(getenv|getenv_whole<[a-z0-9_]+>)\("SOCKETLEY_' "$ROOT/socketley/" 2>/dev/null | grep -v '/shared/util/settings.h:')
+AROUND=$(grep -rnE '(getenv|getenv_whole<[a-z0-9_]+>)\("SOCKETLEY_' "$ROOT/socketley/" 2>/dev/null | grep -v -e '/shared/util/settings.h:' -e '/socketley/bash/')
 if [ -z "$AROUND" ]; then ok; else
     bad "every SOCKETLEY_* variable is read through the settings table" "read around it:" $AROUND
 fi

@@ -41,6 +41,7 @@
 *.dwo
 
 # Build output
+bin/
 bin/Debug/
 bin/Dev/
 bin/Release/
