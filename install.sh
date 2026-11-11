@@ -116,7 +116,7 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# The package: the one given, or the newest release's, the one built for this distribution where there is one.
+# The package: the one given, or the newest release's.
 if [ -z "$DEB" ]; then
   command -v curl >/dev/null 2>&1 || die "curl is needed to download the release; or pass --deb FILE"
   echo "Looking for the newest release..."
@@ -125,13 +125,10 @@ if [ -z "$DEB" ]; then
   [ -n "${GITHUB_TOKEN:-}" ] && set -- "$@" -H "Authorization: Bearer $GITHUB_TOKEN"
   curl -fsSL "$@" "https://api.github.com/repos/${REPO}/releases/latest" -o "$TMP/release.json" \
     || die "the newest release could not be read from GitHub (a private repository needs GITHUB_TOKEN); download a .deb and pass --deb FILE"
-  . /etc/os-release
   # Only the packages built for this machine's architecture, since dpkg refuses any other.
   ARCH=$(dpkg --print-architecture)
   URLS=$(sed -n 's/.*"browser_download_url": *"\([^"]*\/socketley_[^"]*_'"$ARCH"'\.deb\)".*/\1/p' "$TMP/release.json")
-  # A rolling distribution names no version, which set -u would otherwise stop at.
-  URL=$(printf '%s\n' "$URLS" | grep -F "${ID:-}${VERSION_ID:-}" | head -1 || true)
-  [ -n "$URL" ] || URL=$(printf '%s\n' "$URLS" | head -1)
+  URL=$(printf '%s\n' "$URLS" | head -1)
   [ -n "$URL" ] || die "the newest release has no .deb for $ARCH; build from a clone with scripts/install-from-source.sh"
   # The SHA-256 GitHub keeps of the asset, which comes before its download URL in the asset's object.
   # A field a line whichever way GitHub laid the JSON out, as no digest or URL holds a comma.

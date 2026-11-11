@@ -243,48 +243,21 @@ std::string architecture()
     return m == "x86_64" ? "amd64" : m == "aarch64" ? "arm64" : std::string(m);
 }
 
-// ID and VERSION_ID of /etc/os-release, run together as a package built for one distribution may be named.
-std::string distribution()
-{
-    std::ifstream f("/etc/os-release");
-    std::string line, id, ver;
-    while (std::getline(f, line))
-    {
-        const auto value = [&](std::string_view key) {
-            std::string v = line.substr(key.size());
-            if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
-                v = v.substr(1, v.size() - 2);
-            return v;
-        };
-        if (line.starts_with("ID="))
-            id = value("ID=");
-        else if (line.starts_with("VERSION_ID="))
-            ver = value("VERSION_ID=");
-    }
-    return id + ver;
-}
-
-// The release's .deb for this machine: one named for its distribution first, as install.sh picks it.
+// The release's .deb for this machine's architecture; one build serves every distribution, as only glibc is linked.
 const js::jvalue* pick_asset(const js::jvalue& release, std::string& why)
 {
     const js::jvalue* assets = js::member(release, "assets");
-    const std::string arch = "_" + architecture() + ".deb", distro = distribution();
-    const js::jvalue* first = nullptr;
+    const std::string arch = "_" + architecture() + ".deb";
     if (assets)
         for (const auto& a : assets->items)
         {
             const std::string_view name = js::string_of(a, "name");
-            if (!name.starts_with("socketley_") || !name.ends_with(arch))
-                continue;
-            if (!distro.empty() && name.find(distro) != std::string_view::npos)
+            if (name.starts_with("socketley_") && name.ends_with(arch))
                 return &a;
-            if (!first)
-                first = &a;
         }
-    if (!first)
-        why = "release " + std::string(js::string_of(release, "tag_name")) + " has no .deb for " + architecture() +
-              "; build from a clone with scripts/install-from-source.sh";
-    return first;
+    why = "release " + std::string(js::string_of(release, "tag_name")) + " has no .deb for " + architecture() +
+          "; build from a clone with scripts/install-from-source.sh";
+    return nullptr;
 }
 
 // The SHA-256 of the file at `path`, in hex; empty when it cannot be read.
