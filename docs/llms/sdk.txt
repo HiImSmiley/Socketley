@@ -13,7 +13,7 @@ Socketley ships a modular C++ SDK in three tiers, in **sdk/include/linux/socketl
 | 3 | socketley/attach.h | Register with a daemon | None (Tier 1) |
 
 - More in the manual: **Tier 1: Daemon Control (header-only)** (man-c-sdk.txt): socketley/control.h gives a program full control over a running daemon.
-- More in the manual: **Tier 2: Embed Engine (build from source)** (man-c-sdk.txt): Tier 2 embeds the full io_uring event loop and all four runtime types in your own binary.
+- More in the manual: **Tier 2: Embed Engine (build from source)** (man-c-sdk.txt): Tier 2 embeds the full io_uring event loop and a runtime of any type in your own binary.
 - More in the manual: **Cross-Platform SDK (Windows / macOS)** (man-c-sdk.txt): These header-only TCP clients connect to Socketley runtimes from non-Linux platforms.
 - More in the manual: **Tier 3: Daemon Attach (header-only)** (man-c-sdk.txt): socketley/attach.h registers your own process as a runtime with a running daemon.
 - More in the manual: **Mixed: Engine + Daemon Attach (Tier 2 + 3)** (man-c-sdk.txt): Embed the full engine for maximum performance, and register with the daemon for fleet monitoring.

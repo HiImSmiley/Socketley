@@ -1137,7 +1137,7 @@ Socketley ships a modular C++ SDK in three tiers, in **sdk/include/linux/socketl
 | 3 | socketley/attach.h | Register with a daemon | None (Tier 1) |
 
 - More in the manual: **Tier 1: Daemon Control (header-only)** (man-c-sdk.txt): socketley/control.h gives a program full control over a running daemon.
-- More in the manual: **Tier 2: Embed Engine (build from source)** (man-c-sdk.txt): Tier 2 embeds the full io_uring event loop and all four runtime types in your own binary.
+- More in the manual: **Tier 2: Embed Engine (build from source)** (man-c-sdk.txt): Tier 2 embeds the full io_uring event loop and a runtime of any type in your own binary.
 - More in the manual: **Cross-Platform SDK (Windows / macOS)** (man-c-sdk.txt): These header-only TCP clients connect to Socketley runtimes from non-Linux platforms.
 - More in the manual: **Tier 3: Daemon Attach (header-only)** (man-c-sdk.txt): socketley/attach.h registers your own process as a runtime with a running daemon.
 - More in the manual: **Mixed: Engine + Daemon Attach (Tier 2 + 3)** (man-c-sdk.txt): Embed the full engine for maximum performance, and register with the daemon for fleet monitoring.
@@ -5395,8 +5395,10 @@ Every script and program in the repository's examples/ and sdk/examples/, with w
 - `sdk/examples/advanced/http_file_server.cpp`: Socketley SDK — static HTTP file server with access logging -- Build: g++ -std=c++23 sdk/examples/advanced/http_file_server.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/http_file_server
 - `sdk/examples/advanced/reconnecting_client.cpp`: Socketley SDK — client with auto-reconnect and periodic heartbeat -- Build: g++ -std=c++23 sdk/examples/advanced/reconnecting_client.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/reconnecting_client
 - `sdk/examples/advanced/tls_server.cpp`: Socketley SDK — production-hardened TLS echo server -- Build: g++ -std=c++23 sdk/examples/advanced/tls_server.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/tls_server
+- `sdk/examples/basic/any_runtime.cpp`: Socketley SDK — any runtime type, by the flags `socketley create` takes -- Build: g++ -std=c++23 sdk/examples/basic/any_runtime.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/any_runtime
 - `sdk/examples/basic/client.cpp`: Socketley SDK — minimal client example -- Build: g++ -std=c++23 sdk/examples/basic/client.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/client
-- `sdk/examples/basic/daemon_control.cpp`: Socketley SDK — daemon control example (header-only, no library needed) -- Build: g++ -std=c++17 sdk/examples/basic/daemon_control.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/daemon_control
+- `sdk/examples/basic/daemon_control.cpp`: Socketley SDK — daemon control example (header-only, no library needed) -- Build: g++ -std=c++17 sdk/examples/basic/daemon_control.cpp \ $(sdk/socketley-config --cflags) -o /tmp/daemon_control
+- `sdk/examples/basic/echo.lua`: What echo_server_lua runs: every message back to the client that sent it.
 - `sdk/examples/basic/echo_server.cpp`: Socketley SDK — echo server example (no daemon required) -- Build: g++ -std=c++23 sdk/examples/basic/echo_server.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/echo_server
 - `sdk/examples/basic/echo_server_lua.cpp`: Socketley SDK — echo server with Lua scripting -- Requires: apt install libluajit-5.1-dev (or build LuaJIT from source)
 - `sdk/examples/basic/redis_cache.cpp`: Socketley SDK — minimal Redis-compatible cache example -- Build: g++ -std=c++23 sdk/examples/basic/redis_cache.cpp \ $(sdk/socketley-config --cflags --libs) -o /tmp/redis_cache
@@ -9877,7 +9879,7 @@ Over HTTP/2 a stream's file is read through the process rather than spliced, as 
 
 ## HTTP/3
 
-With **--tls** a storage runtime also speaks HTTP/3 (RFC 9114) over QUIC (RFC 9000), on the same port number over UDP. This requires a build with HTTP/3, which **stats** shows as **h3:1**. **bin/build-thirdparty.sh http3** builds the static OpenSSL 3.5, ngtcp2 and nghttp3 that HTTP/3 needs, and the install script runs it.
+With **--tls** a storage runtime also speaks HTTP/3 (RFC 9114) over QUIC (RFC 9000), on the same port number over UDP. This requires a build with HTTP/3, which **stats** shows as **h3:1**. **scripts/build-thirdparty.sh http3** builds the static OpenSSL 3.5, ngtcp2 and nghttp3 that HTTP/3 needs, and the install script runs it.
 
 Every answer over TCP carries **Alt-Svc: h3=":PORT"**. A browser then tries QUIC on its next request, and stays on TCP if UDP does not get through. Each request is a stream and runs exactly as over HTTP/1.1 and HTTP/2. A connection survives a client's change of address or network, and a lost packet holds up only its own stream. These are the reasons to use HTTP/3 on mobile and lossy links; on a clean wire, HTTP/2 costs less CPU per byte.
 
@@ -14957,9 +14959,18 @@ socketley::ctl::cache_flush("store", "/tmp/store.bin");
 
 ## Tier 2: Embed Engine (build from source)
 
-Tier 2 embeds the full io_uring event loop and all four runtime types in your own binary. It gives maximum performance, with no IPC overhead. It requires **libsocketley_sdk.a** and the link flags **-luring -lssl -lcrypto [-lluajit]**.
+Tier 2 embeds the full io_uring event loop and a runtime of any type in your own binary. It gives maximum performance, with no IPC overhead. It requires **libsocketley_sdk.a** and the link flags **-luring -lssl -lcrypto [-lluajit]**.
 
-Headers: **socketley/core.h** (event_loop, runtime_manager, enums), **socketley/server.h ,** **socketley/client.h ,** **socketley/proxy.h ,** **socketley/cache.h .**
+Headers: **socketley/core.h** (event_loop, runtime_manager, enums), **socketley/server.h ,** **socketley/client.h ,** **socketley/proxy.h ,** **socketley/cache.h** for C++ hooks, and **socketley/any_runtime.h** for every other type.
+
+**any_runtime** takes a type name, a name and the flags **socketley create** takes for that type, read by the daemon's own parsers:
+
+```
+socketley::any_runtime site("web", "site", "-p 8080 --root /srv/site --lua-pages");
+if (!site.start()) return 1;
+```
+
+**server**, **client**, **proxy** and **cache** accept the same through **flags()**: **srv.flags("--bind 127.0.0.1")**. A refused flag prints why and **start()** then answers false. **--shards** is refused, because shards are forked by the daemon.
 
 Define **SOCKETLEY_NO_LUA** to build without LuaJIT, and omit **-lluajit** from the link flags.
 

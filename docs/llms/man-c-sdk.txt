@@ -141,9 +141,18 @@ socketley::ctl::cache_flush("store", "/tmp/store.bin");
 
 ## Tier 2: Embed Engine (build from source)
 
-Tier 2 embeds the full io_uring event loop and all four runtime types in your own binary. It gives maximum performance, with no IPC overhead. It requires **libsocketley_sdk.a** and the link flags **-luring -lssl -lcrypto [-lluajit]**.
+Tier 2 embeds the full io_uring event loop and a runtime of any type in your own binary. It gives maximum performance, with no IPC overhead. It requires **libsocketley_sdk.a** and the link flags **-luring -lssl -lcrypto [-lluajit]**.
 
-Headers: **socketley/core.h** (event_loop, runtime_manager, enums), **socketley/server.h ,** **socketley/client.h ,** **socketley/proxy.h ,** **socketley/cache.h .**
+Headers: **socketley/core.h** (event_loop, runtime_manager, enums), **socketley/server.h ,** **socketley/client.h ,** **socketley/proxy.h ,** **socketley/cache.h** for C++ hooks, and **socketley/any_runtime.h** for every other type.
+
+**any_runtime** takes a type name, a name and the flags **socketley create** takes for that type, read by the daemon's own parsers:
+
+```
+socketley::any_runtime site("web", "site", "-p 8080 --root /srv/site --lua-pages");
+if (!site.start()) return 1;
+```
+
+**server**, **client**, **proxy** and **cache** accept the same through **flags()**: **srv.flags("--bind 127.0.0.1")**. A refused flag prints why and **start()** then answers false. **--shards** is refused, because shards are forked by the daemon.
 
 Define **SOCKETLEY_NO_LUA** to build without LuaJIT, and omit **-lluajit** from the link flags.
 

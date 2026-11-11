@@ -1295,7 +1295,7 @@ Over HTTP/2 a stream's file is read through the process rather than spliced, as 
 
 ## HTTP/3
 
-With **--tls** a storage runtime also speaks HTTP/3 (RFC 9114) over QUIC (RFC 9000), on the same port number over UDP. This requires a build with HTTP/3, which **stats** shows as **h3:1**. **bin/build-thirdparty.sh http3** builds the static OpenSSL 3.5, ngtcp2 and nghttp3 that HTTP/3 needs, and the install script runs it.
+With **--tls** a storage runtime also speaks HTTP/3 (RFC 9114) over QUIC (RFC 9000), on the same port number over UDP. This requires a build with HTTP/3, which **stats** shows as **h3:1**. **scripts/build-thirdparty.sh http3** builds the static OpenSSL 3.5, ngtcp2 and nghttp3 that HTTP/3 needs, and the install script runs it.
 
 Every answer over TCP carries **Alt-Svc: h3=":PORT"**. A browser then tries QUIC on its next request, and stays on TCP if UDP does not get through. Each request is a stream and runs exactly as over HTTP/1.1 and HTTP/2. A connection survives a client's change of address or network, and a lost packet holds up only its own stream. These are the reasons to use HTTP/3 on mobile and lossy links; on a clean wire, HTTP/2 costs less CPU per byte.
 
