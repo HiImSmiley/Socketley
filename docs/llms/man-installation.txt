@@ -41,8 +41,8 @@ sudo systemctl start socketley
 ## Debian Package
 
 ```
-bash packaging/build-deb.sh 1.1.0
-sudo dpkg -i socketley_1.1.0_amd64.deb
+bash packaging/build-deb.sh 0.2.0
+sudo dpkg -i socketley_0.2.0_amd64.deb
 sudo systemctl start socketley
 ```
 
