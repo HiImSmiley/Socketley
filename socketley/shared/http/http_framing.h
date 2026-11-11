@@ -125,6 +125,28 @@ inline std::string_view http_trim_ows(std::string_view s)
     return s;
 }
 
+// Whether a browser sent a request from a page of another site, as it says itself: by Sec-Fetch-Site, or where it
+// sends none by an Origin that is neither of the hosts the request was asked at; a client that is no browser says neither.
+inline bool http_from_another_site(std::string_view fetch_site, std::string_view origin, std::string_view host,
+                                   std::string_view forwarded_host)
+{
+    fetch_site = http_trim_ows(fetch_site);
+    if (!fetch_site.empty())
+        return !http_token_equals(fetch_site, "same-origin", 11) && !http_token_equals(fetch_site, "none", 4);
+    origin = http_trim_ows(origin);
+    if (origin.empty())
+        return false;
+    const size_t scheme = origin.find("://");
+    if (scheme == std::string_view::npos)
+        return true;
+    const std::string_view asked = origin.substr(scheme + 3);
+    const auto same = [asked](std::string_view h) {
+        h = http_trim_ows(h);
+        return h.size() == asked.size() && http_token_equals(h, asked.data(), asked.size());
+    };
+    return !same(host) && !same(forwarded_host);
+}
+
 // The hop an X-Forwarded-For names last, which the proxy on this machine appended; everything before it is the
 // client's own word.
 inline std::string_view http_last_forwarded_hop(std::string_view xff)

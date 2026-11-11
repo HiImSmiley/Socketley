@@ -120,6 +120,27 @@ if phase == "main":
     check("nor one sent after it", ui("GET", "/~ui/session", cookie=alice + "; skl_ui=Zm9y.1.9999999999999.00")[0], 200)
     check("a WebDAV client's Basic name and password sign in", ui("PROPFIND", "/~dav/", basic=("alice", "alicepassword1"), ui_header=False)[0], 207)
 
+    # A browser keeps Basic credentials as it keeps a cookie, and sends them with a form another site's page posts.
+    def elsewhere(extra, basic=ROOT, body=b'{"Action":"CreateUser","UserName":"mallory","pad":"="}'):
+        h = {"Authorization": "Basic " + base64.b64encode(("%s:%s" % basic).encode()).decode(), "Content-Type": "text/plain"}
+        h.update(extra)
+        req = urllib.request.Request(url + "/~ui/iam", data=body, method="POST", headers=h)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+    check("a form another site posts with the browser's Basic credentials changes nothing",
+          (elsewhere({"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"}),
+           code(lambda: iam.get_user(UserName="mallory"))), (403, "NoSuchEntity"))
+    check("nor one from a sibling name", elsewhere({"Sec-Fetch-Site": "same-site"}), 403)
+    check("nor one of a browser that says only its Origin", elsewhere({"Origin": "https://evil.example"}), 403)
+    check("nor one of a page that hides it", elsewhere({"Origin": "null"}), 403)
+    check("a client that is no browser, saying neither, is taken as before",
+          (elsewhere({}, body=b'{"Action":"CreateUser","UserName":"plainclient"}'), code(lambda: iam.delete_user(UserName="plainclient"))), (200, "ok"))
+    check("and so is the interface's own page, by its Origin",
+          (elsewhere({"Origin": url}, body=b'{"Action":"CreateUser","UserName":"ownpage"}'), code(lambda: iam.delete_user(UserName="ownpage"))), (200, "ok"))
+
     # What a user does to itself without a policy, and what it may not.
     check("a user makes its own key without a policy", act(alice, "CreateAccessKey"), "ok")
     keys = iam.list_access_keys(UserName="alice")["AccessKeyMetadata"]

@@ -201,6 +201,16 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
 {
     const std::string_view h = c->req.header("authorization");
     auth_verdict v;
+    // A browser keeps Basic credentials as it keeps a cookie and sends them with another site's form, so a change such
+    // a page had it send is refused whatever it is signed with.
+    if (const std::string_view m = c->req.method; m != "GET" && m != "HEAD" && m != "OPTIONS" && m != "PROPFIND" &&
+        c->req.header("x-socketley-ui").empty() &&
+        http_from_another_site(c->req.header("sec-fetch-site"), c->req.header("origin"), c->req.header("host"),
+                               c->req.header("x-forwarded-host")))
+    {
+        app_reply(c, 403, "A change another site's page had the browser send is not taken.\n");
+        return false;
+    }
     if (std::string_view cred; http_auth_credentials(h, "basic", cred))
     {
         // An address that keeps guessing is refused even the right secret, so the answer tells it nothing.
