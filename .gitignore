@@ -102,7 +102,6 @@ test/benchmark/bench_client
 *.md
 !README.md
 !CHANGELOG.md
-!CODE_OF_CONDUCT.md
 !THIRD_PARTY_NOTICES.md
 !examples/**/README.md
 !man/README.md

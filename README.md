@@ -59,6 +59,48 @@ The daemon then runs as the systemd service `socketley`. Root and members of the
 
 `socketley --help` and `man socketley` cover the same ground as the documentation, offline.
 
+## In your own program
+
+Every runtime also runs inside an application, with no daemon: the `socketley-dev` package carries `libsocketley.so`,
+the C header `socketley/capi.h` and a pkg-config file, and [sdk/rust](sdk/rust) and [sdk/node](sdk/node) wrap it for
+Rust and Node. A program with its own website, API, cache and MCP tools for a model:
+
+```js
+const { Engine } = require('socketley');
+
+const engine = new Engine();                      // one thread, one io_uring ring
+const kv = engine.runtime('cache', 'kv', '-p 8081').start();
+
+const site = engine.runtime('web', 'site', '-p 8080 --root /srv/site');
+site.handle('/api/count', () => kv.command('incr count'));
+site.start();
+
+const tools = engine.runtime('mcp', 'tools', '-p 9600 --anonymous');
+tools.tool('count', { description: 'How often /api/count was asked.' }, () => kv.command('get count'));
+tools.start();
+```
+
+A runtime takes the same flags as `socketley create`, and a C program builds with
+`cc app.c $(pkg-config --cflags --libs socketley)`.
+
+## A research project
+
+Socketley is about the technology more than about a product. It asks how far a handful of ideas carry when they are
+followed all the way through: one io_uring event loop per process, owned by a single thread, every service a
+runtime of the same binary, and each runtime a worker process of its own on such a loop. The version starts at 0.2.0 because the interfaces still change between releases:
+use it, measure it, learn from it, but do not expect the stability promise of a 1.0.
+
+What a research project owes is that its claims hold, so most of the work goes into checking them:
+
+- **Every change runs the whole suite twice before it lands**: once optimised, and once under AddressSanitizer and
+  UndefinedBehaviorSanitizer, where any report fails the run. Both builds compile with zero warnings.
+- **765 test files per run**: 687 integration tests that start a real daemon and talk to it over real sockets with
+  ordinary clients, 64 unit test programs, and 28 fuzz targets over a corpus of more than a thousand inputs.
+- **Benchmarks against the established tool for each job**, such as Redis for the cache, measured A/B and interleaved
+  on a quiet machine, with the CPU spent beside the latency.
+- **Every release is installed in clean Ubuntu and Debian containers**, where it creates all 15 runtimes, survives a
+  restart with its runtimes intact, and serves apps in C, Rust and Node built against the SDK while they are under load.
+
 ## About Me and the Project
 
 Hi, I'm Smiley. This project was born out of a university module called Networked Systems, where I spent a lot of time working with Docker, proxies, sockets, caches, and the protocols that tie them all together. While reading into virtual threads, I stumbled upon Linux's io_uring interface and was immediately hooked.
