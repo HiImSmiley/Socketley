@@ -59,8 +59,10 @@ FROM ubuntu:24.04 AS builder
 ARG BUILD_JOBS
 ARG LIBURING_TAG
 
+# uuid-dev on aarch64 only, where scripts/premake5, an x86-64 binary, cannot run and premake is built from source.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential libssl-dev cmake libluajit-5.1-dev git ca-certificates \
+        $([ "$(uname -m)" = aarch64 ] && echo uuid-dev) \
     && rm -rf /var/lib/apt/lists/*
 
 # Copied on its own, before the tree, so that editing socketley source does not
@@ -81,11 +83,17 @@ COPY . .
 # scripts/install-liburing.sh already ended that argument for the other archive.
 RUN bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
 
-RUN ./scripts/premake5 gmake2 && cd make && make config=release_x64 -j"$BUILD_JOBS"
+# The premake that runs here and the configuration it made for this machine, release_x64 or release_arm64.
+RUN bash scripts/build-thirdparty.sh premake \
+    && PREMAKE=./scripts/premake5 && { "$PREMAKE" --version >/dev/null 2>&1 || PREMAKE=./thirdparty/premake/premake5; } \
+    && "$PREMAKE" gmake2 && cd make && make config="$(sed -n 's/^  config=debug_/release_/p' Makefile)" -j"$BUILD_JOBS"
 
 # A build that "succeeded" without producing a binary is the failure this image
 # used to pass along to whoever ran the container.
 RUN test -x bin/Release/socketley
+
+# liburing at the path it has in the builder, which names the architecture: /usr/lib/x86_64-linux-gnu or aarch64's.
+RUN mkdir /uring && cp -a --parents /usr/lib/*-linux-gnu/liburing.so.2* /uring/
 
 # ─── Runtime ───────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
@@ -97,12 +105,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # liburing comes from the builder for the same reason it is built there: the
 # package archive has no version this binary can be loaded against.
-COPY --from=builder /usr/lib/x86_64-linux-gnu/liburing.so.2* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /uring/ /
 COPY --from=builder /src/bin/Release/socketley /usr/bin/socketley
 
-# The Release configuration builds with -march=native, so this image is only
-# portable to machines with the CPU features of the one that built it.  Fine for
-# a test cluster and for a local run; not a thing to push to a registry.
+# Release compiles its architecture's floor, x86-64-v2 or armv8-a, so the image runs on any CPU of that architecture.
 RUN socketley version
 
 ENTRYPOINT ["socketley"]
