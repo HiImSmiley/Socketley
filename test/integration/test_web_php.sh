@@ -189,7 +189,10 @@ curl -s -D "$T/hh" -o "$T/huge.out" -H 'X-Mode: mib100' "$U/hello.php"
 expect "an answer of 100 MiB arrives whole, in chunks" \
     "$(sha256sum < "$T/huge.out" | cut -c1-64) $(grep -ci '^Transfer-Encoding: chunked' "$T/hh")" "$(pattern_sha 100) 1"
 HWM=$(awk '/^VmHWM/ {print int($2 / 1024)}' /proc/"$WPID"/status 2>/dev/null)
-if [ -n "$HWM" ] && [ "$HWM" -lt 64 ]; then ok; else bad "and the runtime never held it whole" "peak ${HWM:-?} MiB resident"; fi
+# ASan's quarantine keeps what was freed, so resident memory says nothing here of what was held at once.
+if ! nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null; then
+    if [ -n "$HWM" ] && [ "$HWM" -lt 64 ]; then ok; else bad "and the runtime never held it whole" "peak ${HWM:-?} MiB resident"; fi
+fi
 curl -s -o "$T/slow.out" --limit-rate 3M -H 'X-Mode: mib8' "$U/hello.php"
 expect "a client that reads slowly gets all of it, the server read as it takes it" \
     "$(sha256sum < "$T/slow.out" | cut -c1-64)" "$(pattern_sha 8)"
