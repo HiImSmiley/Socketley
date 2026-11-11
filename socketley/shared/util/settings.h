@@ -126,6 +126,8 @@ inline constexpr setting table[] = {
      "changes a storage shard queues for another node of its cluster"},
     {"SOCKETLEY_SHARE_NOTIFY_ALLOW", kind::text, audience::tuning, 0, 0, "Discord, Slack and ntfy.sh",
      "the URL prefixes a share link's webhook may begin with, comma-separated"},
+    {"SOCKETLEY_REPO_PRIVATE_HOSTS", kind::flag, audience::tuning, 0, 0, "off",
+     "a storage's users keep repositories fetched from this machine and private networks"},
     {"SOCKETLEY_FFMPEG", kind::text, audience::tuning, 0, 0, "the first ffmpeg on PATH",
      "the ffmpeg storage makes thumbnails and streams with"},
     {"SOCKETLEY_MEDIA_HWACCEL", kind::text, audience::tuning, 0, 0, "/dev/dri/renderD128",

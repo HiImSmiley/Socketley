@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 
@@ -19,6 +21,32 @@ inline bool is_loopback(const sockaddr_storage& a)
     {
         const auto& v6 = reinterpret_cast<const sockaddr_in6&>(a).sin6_addr;
         return IN6_IS_ADDR_LOOPBACK(&v6) || (IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127);
+    }
+    return false;
+}
+
+// Whether `sa` is an address anyone may reach: not loopback, private, link-local, shared, unspecified or multicast.
+inline bool is_public_address(const sockaddr* sa)
+{
+    if (sa->sa_family == AF_INET)
+    {
+        const auto a = ntohl(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr);
+        const auto in = [a](uint32_t net, int bits) { return (a >> (32 - bits)) == (net >> (32 - bits)); };
+        return !(in(0x00000000, 8) || in(0x0A000000, 8) || in(0x7F000000, 8) || in(0xA9FE0000, 16) ||
+                 in(0xAC100000, 12) || in(0xC0A80000, 16) || in(0x64400000, 10) || in(0xE0000000, 3));
+    }
+    if (sa->sa_family == AF_INET6)
+    {
+        const auto& a = reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(&a))
+        {
+            sockaddr_in v4{};
+            v4.sin_family = AF_INET;
+            std::memcpy(&v4.sin_addr, a.s6_addr + 12, 4);
+            return is_public_address(reinterpret_cast<const sockaddr*>(&v4));
+        }
+        return !(IN6_IS_ADDR_UNSPECIFIED(&a) || IN6_IS_ADDR_LOOPBACK(&a) || IN6_IS_ADDR_LINKLOCAL(&a) ||
+                 IN6_IS_ADDR_MULTICAST(&a) || (a.s6_addr[0] & 0xFE) == 0xFC);
     }
     return false;
 }

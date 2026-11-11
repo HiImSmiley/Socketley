@@ -1,4 +1,5 @@
 #include "git_mirrors.h"
+#include "../../shared/util/settings.h"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -394,6 +395,10 @@ std::string git_mirrors::start(const repo& r, const identity& id)
     std::filesystem::create_directories(work, ec);
     std::vector<std::string> args = {"socketley", "git-sync", "--url", r.url, "--branch", r.branch, "--work", work,
                                      "--endpoint", m_endpoint, "--bucket", r.bucket, "--name", r.name};
+    // A user names the URL, so it is fetched only where anyone could fetch it, unless this storage's users are let
+    // reach this machine's own and its network's repositories.
+    if (!socketley::settings::flag("SOCKETLEY_REPO_PRIVATE_HOSTS", false))
+        args.push_back("--public-only");
     if (m_tls)
         args.push_back("--tls");
     if (m_tls && !m_cert.empty())

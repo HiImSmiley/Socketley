@@ -73,6 +73,8 @@ git daemon --export-all --base-path="$T/srv" --listen=127.0.0.1 --port="$GP" --r
 GITD=$!
 for _ in $(seq 1 50); do git ls-remote "git://127.0.0.1:$GP/demo.git" >/dev/null 2>&1 && break; sleep 0.1; done
 
+# The upstream here is on this machine, which a storage fetches from for its users only when told it may.
+export SOCKETLEY_REPO_PRIVATE_HOSTS=1
 daemon_start "$BIN"
 # --sync per-user: a runtime of its own for each user, which is what everything below asks of who runs what.
 "$BIN" create storage st -p "$ST" --dir "$T/st" --credentials "$T/creds" --sync per-user -s >/dev/null 2>&1

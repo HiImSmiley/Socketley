@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "http_framing.h"
+#include "../net/peer_address.h"
 #include "../crypto/tls_context.h"
 
 namespace https_client
@@ -118,37 +119,6 @@ bool client::init(std::string& err, const std::string& ca_file, std::string user
     return m_ctx || fail(err, why);
 }
 
-namespace
-{
-
-// Whether `sa` is an address anyone may reach: not loopback, private, link-local, shared, unspecified or multicast.
-bool public_address(const sockaddr* sa)
-{
-    if (sa->sa_family == AF_INET)
-    {
-        const auto a = ntohl(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr);
-        const auto in = [a](uint32_t net, int bits) { return (a >> (32 - bits)) == (net >> (32 - bits)); };
-        return !(in(0x00000000, 8) || in(0x0A000000, 8) || in(0x7F000000, 8) || in(0xA9FE0000, 16) ||
-                 in(0xAC100000, 12) || in(0xC0A80000, 16) || in(0x64400000, 10) || in(0xE0000000, 3));
-    }
-    if (sa->sa_family == AF_INET6)
-    {
-        const auto& a = reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr;
-        if (IN6_IS_ADDR_V4MAPPED(&a))
-        {
-            sockaddr_in v4{};
-            v4.sin_family = AF_INET;
-            std::memcpy(&v4.sin_addr, a.s6_addr + 12, 4);
-            return public_address(reinterpret_cast<const sockaddr*>(&v4));
-        }
-        return !(IN6_IS_ADDR_UNSPECIFIED(&a) || IN6_IS_ADDR_LOOPBACK(&a) || IN6_IS_ADDR_LINKLOCAL(&a) ||
-                 IN6_IS_ADDR_MULTICAST(&a) || (a.s6_addr[0] & 0xFE) == 0xFC);
-    }
-    return false;
-}
-
-}   // namespace
-
 int client::dial(const std::string& url, std::string& path, std::string& hostport, SSL*& ssl, std::string& err,
                  int timeout_s)
 {
@@ -207,7 +177,7 @@ int client::dial(const std::string& url, std::string& path, std::string& hostpor
     bool refused = false;
     for (addrinfo* a = res; a && fd < 0; a = a->ai_next)
     {
-        if (m_public_only && m_connect.empty() && !public_address(a->ai_addr))
+        if (m_public_only && m_connect.empty() && !socketley::is_public_address(a->ai_addr))
         {
             refused = true;
             continue;

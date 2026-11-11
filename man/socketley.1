@@ -1955,7 +1955,7 @@ socketley m import alice ~/Takeout/Mail/All\ mail\ Including\ Spam\ and\ Trash.m
 .fi
 .RE
 .TP
-.B git\-sync \-\-url \fIurl\fR \-\-branch \fIname\fR|\fB*\fR \-\-work \fIdir\fR \-\-endpoint \fIhost\fB:\fIport\fR \fR[\fB\-\-tls\fR [\fB\-\-ca \fIfile\fR]] \fB\-\-bucket \fIlibrary\fR \fB\-\-name \fIfolder\fR [\fB\-\-keep \fIdays\fB,\fIweeks\fB,\fImonths\fR] [\fB\-\-move\-from \fIlibrary\fR]
+.B git\-sync \-\-url \fIurl\fR \-\-branch \fIname\fR|\fB*\fR \-\-work \fIdir\fR \-\-endpoint \fIhost\fB:\fIport\fR \fR[\fB\-\-tls\fR [\fB\-\-ca \fIfile\fR]] \fB\-\-bucket \fIlibrary\fR \fB\-\-name \fIfolder\fR [\fB\-\-keep \fIdays\fB,\fIweeks\fB,\fImonths\fR] [\fB\-\-move\-from \fIlibrary\fR] [\fB\-\-public\-only\fR]
 Runs one sync of a repository that a storage runtime keeps (see
 .B Git repositories
 under
@@ -1990,6 +1990,13 @@ Once the tree is complete in the new library, the command copies the backups
 over from the old one and removes the folder's files there.
 It removes the old library itself once nothing else is in it.
 An old library this user may not read is left as it is.
+.IP
+.B \-\-public\-only
+fetches the repository only when every address of its host is one anyone can
+reach, holds git to the address it looked up, and follows no redirect.
+A storage runtime passes it for a repository one of its users named, unless
+.B SOCKETLEY_REPO_PRIVATE_HOSTS
+is set.
 .IP
 Exit status is 0 when the run ended well, 2 when it did not, and 3 when a run
 of the same directory is already under way.
@@ -14436,6 +14443,12 @@ A runtime on a unix socket has none of these features.
 .IP
 A repository is fetched over https://, http:// or git://, never with credentials in
 its URL.
+Because the runtime fetches it for the user who named it, its host must have
+only addresses anyone can reach: one on this machine or a private network is not
+fetched from, the run fails and says so, and no redirect to another host is
+followed.
+.B SOCKETLEY_REPO_PRIVATE_HOSTS=1
+lets a storage's users keep repositories from such hosts too.
 A private repository is read with the GitHub token the user keeps in the page.
 The token is passed as git's http.extraHeader through git's environment, so it
 appears on no command line.
@@ -24850,6 +24863,14 @@ The range is 1 to 86400. Only the lifecycle sweep reads it, and the sweep then
 also runs as often as every second. Unset, a day is a day. Because it changes
 when objects expire, never set it for a runtime holding data anyone wants (see
 Bucket lifecycle).
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_REPO_PRIVATE_HOSTS
+Set to 1, lets the users of a storage runtime keep git repositories fetched from
+this machine and from private networks.
+Unset, a repository a user names is fetched only from a host whose addresses
+anyone can reach (see Git repositories).
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

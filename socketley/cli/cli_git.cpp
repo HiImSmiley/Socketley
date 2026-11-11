@@ -45,6 +45,7 @@
 #include "../shared/storage/git_names.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/http/url.h"
+#include "../shared/net/peer_address.h"
 #include "../shared/util/base64.h"
 #include "../shared/crypto/tls_context.h"
 #include "../shared/util/settings.h"
@@ -472,8 +473,73 @@ struct options
     // A library the repository was written to before, which what it still holds of it is taken from.
     std::string move_from;
     bool tls{false};
+    // Fetched only from an address anyone may reach, as a storage asks for a repository one of its users named.
+    bool public_only{false};
     int keep_days{14}, keep_weeks{8}, keep_months{12};
 };
+
+// What git is run with so that it fetches `url` from an address anyone may reach and from no other: the options that
+// hold it to the one address looked up here, and the URL to give it. False with `why` when the host has an address
+// on this machine or a private network, so no later answer for the name can send git there.
+bool public_fetch(const std::string& url, std::vector<std::string>& pre, std::string& fetch_url, std::string& why)
+{
+    const size_t scheme_end = url.find("://");
+    const std::string scheme = url.substr(0, scheme_end);
+    const size_t path = url.find('/', scheme_end + 3);
+    std::string host = url.substr(scheme_end + 3, path - scheme_end - 3);
+    std::string port = scheme == "https" ? "443" : scheme == "http" ? "80" : "9418";
+    if (host.starts_with('['))
+    {
+        const size_t close = host.find(']');
+        if (close == std::string::npos)
+        {
+            why = "the URL's host is no address";
+            return false;
+        }
+        if (close + 2 < host.size() && host[close + 1] == ':')
+            port = host.substr(close + 2);
+        host = host.substr(1, close - 1);
+    }
+    else if (const size_t colon = host.rfind(':'); colon != std::string::npos)
+    {
+        port = host.substr(colon + 1);
+        host = host.substr(0, colon);
+    }
+    addrinfo hints{}, *ai = nullptr;
+    hints.ai_socktype = SOCK_STREAM;
+    if (host.empty() || ::getaddrinfo(host.c_str(), port.c_str(), &hints, &ai) != 0 || !ai)
+    {
+        why = host + " is no host that is found";
+        return false;
+    }
+    bool all_public = true;
+    for (const addrinfo* a = ai; a; a = a->ai_next)
+        all_public = all_public && socketley::is_public_address(a->ai_addr);
+    char text[INET6_ADDRSTRLEN] = {};
+    const void* raw = ai->ai_family == AF_INET6
+                          ? static_cast<const void*>(&reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr)
+                          : static_cast<const void*>(&reinterpret_cast<const sockaddr_in*>(ai->ai_addr)->sin_addr);
+    const bool named = ::inet_ntop(ai->ai_family, raw, text, sizeof text) != nullptr;
+    const bool v6 = ai->ai_family == AF_INET6;
+    ::freeaddrinfo(ai);
+    if (!all_public || !named)
+    {
+        why = host + " is on this machine or a private network, which a repository kept for a user is not fetched "
+                     "from (SOCKETLEY_REPO_PRIVATE_HOSTS)";
+        return false;
+    }
+    const std::string addr = v6 ? "[" + std::string(text) + "]" : std::string(text);
+    if (scheme == "git")
+    {
+        // The address itself in the name's place, since git:// has nothing a name is checked against.
+        fetch_url = "git://" + addr + ":" + port + url.substr(path);
+        return true;
+    }
+    // The name kept for TLS and the Host field, the address pinned under it, and no redirect followed elsewhere.
+    pre = {"-c", "http.curloptResolve=" + host + ":" + port + ":" + addr, "-c", "http.followRedirects=false"};
+    fetch_url = url;
+    return true;
+}
 
 class run
 {
@@ -517,7 +583,15 @@ private:
         // The branch asked for, or every branch; tags with either, and what is gone upstream goes here too.
         const std::string spec = m_o.branch == "*" ? "+refs/heads/*:refs/heads/*"
                                                    : "+refs/heads/" + m_o.branch + ":refs/heads/" + m_o.branch;
-        if (!git({"-C", repo, "fetch", "--quiet", "--prune", "--no-auto-gc", "--tags", "--force", m_o.url, spec}))
+        std::vector<std::string> pre;
+        std::string from = m_o.url, why;
+        if (m_o.public_only && !public_fetch(m_o.url, pre, from, why))
+            return fail(why);
+        const auto with = [&pre](std::vector<std::string> args) {
+            args.insert(args.begin(), pre.begin(), pre.end());
+            return args;
+        };
+        if (!git(with({"-C", repo, "fetch", "--quiet", "--prune", "--no-auto-gc", "--tags", "--force", from, spec})))
             return fail("fetching " + m_o.url + (m_o.branch == "*" ? "" : " (branch " + m_o.branch + ")") +
                         " failed; see the log");
         // What the files are taken from: the branch, or with every branch the remote's own default.
@@ -525,7 +599,7 @@ private:
         if (shown == "*")
         {
             std::string out;
-            if (git({"ls-remote", "--symref", m_o.url, "HEAD"}, &out) && out.starts_with("ref: refs/heads/"))
+            if (git(with({"ls-remote", "--symref", from, "HEAD"}), &out) && out.starts_with("ref: refs/heads/"))
                 shown = out.substr(16, out.find_first_of("\t\n", 16) - 16);
         }
         std::string commit;
@@ -958,6 +1032,8 @@ int git_sync_main(int argc, char** argv)
             ok = value(o.name);
         else if (a == "--tls")
             o.tls = true;
+        else if (a == "--public-only")
+            o.public_only = true;
         else if (a == "--ca")
             ok = value(o.ca);
         else if (a == "--move-from")
@@ -989,7 +1065,7 @@ int git_sync_main(int argc, char** argv)
         !git_names::valid_branch(o.branch, why) || !git_names::valid_name(o.name, why))
     {
         std::cout << "usage: socketley git-sync --url URL --branch NAME|* --work DIR --endpoint HOST:PORT [--tls [--ca FILE]] "
-                     "--bucket B --name N [--keep DAYS,WEEKS,MONTHS] [--move-from LIBRARY]"
+                     "--bucket B --name N [--keep DAYS,WEEKS,MONTHS] [--move-from LIBRARY] [--public-only]"
                   << (why.empty() ? "" : "\n" + why) << "\n";
         return 1;
     }
