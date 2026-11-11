@@ -591,7 +591,7 @@ async function pageBench(C, rt) {
 }
 const REPO = 'https://github.com/HiImSmiley/Socketley/blob/main/';
 async function pageExamples(C) {
-  C.append(pageHead('Guide', 'Examples', 'Every script and program in the repository\'s examples/ and sdk/examples/, with what it does. Each runs as its first lines say.', [REF.examples.length + ' files']));
+  C.append(pageHead('Guide', 'Examples', 'Every script and program in the repository\'s examples/, sdk/examples/, sdk/rust/examples/ and sdk/node/examples/, with what it does. Each runs as its first lines say.', [REF.examples.length + ' files']));
   const groups = new Map();
   for (const e of REF.examples) {
     const dir = e.path.split('/').slice(0, -1).join('/');
@@ -601,12 +601,12 @@ async function pageExamples(C) {
   const q = el('input', { class: 'inp', placeholder: 'Filter examples', 'aria-label': 'Filter examples', spellcheck: 'false' });
   C.append(el('div', { class: 'fbar' }, q));
   const blocks = [];
-  const order = d => ['examples/basic', 'examples/lua', 'examples/cache', 'examples/advanced'].indexOf(d) + 1 || 9;
+  const order = d => ['examples/basic', 'examples/lua', 'examples/cache', 'examples/advanced'].indexOf(d) + 1 || (d.startsWith('sdk/') ? 10 : 9);
   for (const [dir, es] of [...groups].sort((a, b) => order(a[0]) - order(b[0]) || a[0].localeCompare(b[0]))) {
     const t = el('table', { class: 'ftbl ex' }, el('tbody', {}, es.map(e => el('tr', { 'data-q': (e.path + ' ' + e.title + ' ' + e.summary).toLowerCase() },
       el('td', { class: 'fl' }, el('a', { href: REPO + e.path, target: '_blank', rel: 'noopener', class: 'ln' }, el('code', { text: e.path.split('/').pop() }))),
       el('td', {}, el('div', { class: 'lb' }, rich(e.title || '')), e.summary ? el('div', { class: 'hp' }, ...e.summary.split(/\s+-\s+(?=[A-Z])/).map((x, i) => i ? el('div', { class: 'li' }, '• ', rich(x)) : rich(x))) : null)))));
-    const h = el('div', { class: 'fgrp', text: dir.replace(/^examples\//, '').replace(/^sdk\/examples$/, 'C++ SDK').replace(/^examples$/, 'Other') });
+    const h = el('div', { class: 'fgrp', text: dir.replace(/^examples\//, '').replace(/^sdk\/examples$/, 'C++ SDK').replace(/^sdk\/rust\/examples$/, 'Rust SDK').replace(/^sdk\/node\/examples$/, 'Node SDK').replace(/^examples$/, 'Other') });
     blocks.push([h, t]); C.append(h, t);
   }
   q.oninput = () => {

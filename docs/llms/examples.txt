@@ -1,6 +1,6 @@
 # Examples
 
-Every script and program in the repository's examples/ and sdk/examples/, with what it does.
+Every script and program in the repository's examples/, sdk/examples/, sdk/rust/examples/ and sdk/node/examples/, with what it does.
 
 - `examples/advanced/blitz-handler.lua`: Sub-server for chess blitz mode -- Similar to rapid-handler but for blitz games
 - `examples/advanced/daemon-config.lua`: Daemon configuration file -- Place at /etc/socketley/config.lua (system) or ~/.config/socketley/config.lua (dev) Or set SOCKETLEY_CONFIG=/path/to/config.lua
@@ -128,3 +128,7 @@ Every script and program in the repository's examples/ and sdk/examples/, with w
 - `sdk/examples/projects/edge/gateway.cpp`: edge — a TLS-terminating gateway in front of a unix-socket application. -- The public face of the pair: TLS on the listener, HTTP awareness for per-request routing, the sidecar mesh defaults (TCP health checks, circuit breaker, retries, drain), and a backend that is a filesystem node rather than a port. Adding a second backend("...") is a one-line scale-out; the strategy then load-balances across them, and health checks eject the dead.
 - `sdk/examples/projects/jobqueue/jobd.cpp`: jobqueue — a working job queue service in one process.
 - `sdk/examples/projects/jobqueue/worker.cpp`: jobqueue — a worker draining the queue jobd serves. -- Deliberately built on the CROSS-PLATFORM header: cache_client.h is the same file on Linux, Windows and macOS, so this worker compiles unchanged on all three and needs nothing from the repo but that one header. A worker fleet on a different OS than the queue is the normal case, not the exotic one.
+- `sdk/rust/examples/echo_server.rs`: A TCP server inside this program: `cargo run --example echo_server -- 9700`, then `nc 127.0.0.1 9700`.
+- `sdk/rust/examples/mcp_tool.rs`: An MCP server inside this program: `cargo run --example mcp_tool -- 9600`, then -- claude mcp add --transport http demo http://127.0.0.1:9600/mcp
+- `sdk/rust/examples/web_app.rs`: A website whose /api is this program: `cargo run --example web_app -- 8080 /srv/site`.
+- `sdk/node/examples/app.js`: A program with its own website, API, cache and MCP tools: `node app.js 8080 ./public`, then -- curl localhost:8080/api/count claude mcp add --transport http app http://127.0.0.1:9600/mcp
