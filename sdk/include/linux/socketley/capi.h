@@ -11,6 +11,8 @@
 #ifndef SOCKETLEY_CAPI_H
 #define SOCKETLEY_CAPI_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -55,6 +57,21 @@ SKL_API int skl_mcp_tool(skl_runtime* runtime, const char* name, const char* des
                          const char* input_schema_json, skl_mcp_tool_fn fn, void* user, char** err);
 /* The tool's answer: text for the model, and is_error non-zero when the tool failed. */
 SKL_API void skl_mcp_reply(skl_mcp_call* call, const char* text, int is_error);
+
+/* A connection of a server runtime, a number never given to another; a client runtime's connections are one stream,
+ * always 1. */
+typedef unsigned long long skl_connection;
+typedef void (*skl_connection_fn)(void* user, skl_connection connection);
+typedef void (*skl_message_fn)(void* user, skl_connection connection, const char* data, size_t length);
+
+/* Callbacks of a runtime of type "server" or "client", set before it starts, one of each.  0, or -1 and the reason. */
+SKL_API int skl_on_connect(skl_runtime* runtime, skl_connection_fn fn, void* user, char** err);
+SKL_API int skl_on_disconnect(skl_runtime* runtime, skl_connection_fn fn, void* user, char** err);
+SKL_API int skl_on_message(skl_runtime* runtime, skl_message_fn fn, void* user, char** err);
+
+/* Sends a line on a connection, from any thread; a connection gone by then is not an error.  -1 once the runtime or the
+ * engine has ended. */
+SKL_API int skl_send(skl_runtime* runtime, skl_connection connection, const char* data, size_t length);
 
 #ifdef __cplusplus
 }

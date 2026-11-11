@@ -29,8 +29,12 @@ cleanup() { [ -n "$HOST" ] && kill -9 "$HOST" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 
 expect "the library shows nothing but the C interface" "$(nm -D --defined-only "$LIB" | awk '{print $3}' | grep -vc '^skl_')" 0
-expect "and all of it" "$(nm -D --defined-only "$LIB" | awk '{print $3}' | grep -c '^skl_')" 11
+expect "and all of it" "$(nm -D --defined-only "$LIB" | awk '{print $3}' | grep -c '^skl_')" 15
 
+say() { python3 -c "
+import socket,sys
+s=socket.create_connection(('127.0.0.1',int(sys.argv[1])),5); s.sendall(sys.argv[2].encode()+b'\\n'); s.settimeout(5)
+print(s.recv(99).decode().strip())" "$@" 2>&1 | tail -1; }
 mcp() { python3 "$HERE/lib_mcp_call.py" "$@" 2>&1 | tail -1; }
 wait_ready() { for _ in $(seq 1 300); do grep -q '^READY' "$T/$1.out" 2>/dev/null && return 0; kill -0 "$HOST" 2>/dev/null || return 1; sleep 0.1; done; return 1; }
 
@@ -42,7 +46,7 @@ P=$SL_PORT_BASE
 # ── Rust ─────────────────────────────────────────────────────────────────────
 # Not `command -v`: rustup installs a cargo that cannot run with HOME moved, as run_all moves it.
 if cargo --version >/dev/null 2>&1; then
-    if SOCKETLEY_LIB_DIR="$BINDIR" CARGO_TARGET_DIR="$T/target" cargo build -q --offline --example mcp_tool \
+    if SOCKETLEY_LIB_DIR="$BINDIR" CARGO_TARGET_DIR="$T/target" cargo build -q --offline --examples \
          --manifest-path "$ROOT/sdk/rust/Cargo.toml" 2>"$T/cargo.err"; then
         ok
         "$T/target/debug/examples/mcp_tool" $((P+1)) > "$T/rust.out" 2>"$T/rust.err" &
@@ -54,6 +58,13 @@ if cargo --version >/dev/null 2>&1; then
         expect "Rust: and from a thread it moved the call to" "$(mcp $((P+1)) call later)" "from a thread False"
         expect "Rust: a failure says so" "$(mcp $((P+1)) call failing)" "it broke True"
         expect "Rust: a call dropped unanswered still gets an answer" "$(mcp $((P+1)) call silent)" "the tool did not answer True"
+        kill -9 "$HOST" 2>/dev/null; wait "$HOST" 2>/dev/null; HOST=""
+        "$T/target/debug/examples/echo_server" $((P+5)) > "$T/rust2.out" 2>"$T/rust2.err" &
+        HOST=$!
+        wait_ready rust2 || bad "the Rust server comes up" "$(tail -3 "$T/rust2.err" | cut -c1-240)"
+        expect "Rust: a server answers on the connection" "$(say $((P+5)) hi)" "echo: hi"
+        sleep 0.3
+        expect "Rust: and was told it opened and went" "$(grep -c -E '^(OPEN|GONE) true' "$T/rust2.out")" 2
         kill -9 "$HOST" 2>/dev/null; wait "$HOST" 2>/dev/null; HOST=""
     else
         bad "the crate builds" "$(head -8 "$T/cargo.err" | cut -c1-240)"
@@ -81,6 +92,11 @@ tools.tool('object', {}, () => ({ ok: true }));
 tools.tool('throws', {}, () => { throw new Error('it broke'); });
 tools.tool('hash', {}, () => crypto.createHash('sha256').update('x').digest('hex').slice(0, 8));
 tools.start();
+const lines = engine.runtime('server', 'lines', '-p $((P+6)) --mode in');
+let opened = 0;
+lines.on('connect', () => { opened++; });
+lines.on('message', (c, d) => { lines.send(c, 'echo: ' + d.toString() + ' seen ' + opened); });
+lines.start();
 try { engine.runtime('web', 'bad', '--no-such-flag'); } catch (e) { console.log('CAUGHT', e.message); }
 process.on('SIGTERM', () => { engine.close(); console.log('CLOSED'); });
 console.log('READY', version);
@@ -96,6 +112,7 @@ JS
         expect "Node: an object is sent as JSON" "$(mcp $((P+3)) call object)" '{"ok":true} False'
         expect "Node: a throw is a failure of the tool" "$(mcp $((P+3)) call throws)" "it broke True"
         expect "Node: its own OpenSSL still works" "$(mcp $((P+3)) call hash)" "2d711642 False"
+        expect "Node: a server's message reaches JavaScript and its answer the connection" "$(say $((P+6)) hi)" "echo: hi seen 1"
         kill -TERM "$HOST"
         for _ in $(seq 1 100); do grep -q '^CLOSED' "$T/node.out" && break; sleep 0.1; done
         for _ in $(seq 1 100); do kill -0 "$HOST" 2>/dev/null || break; sleep 0.1; done

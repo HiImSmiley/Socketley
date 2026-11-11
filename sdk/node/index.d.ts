@@ -14,6 +14,9 @@ export class Runtime {
   start(): this;
   stop(): boolean;
   stats(): string;
+  on(event: 'connect' | 'disconnect', handler: (connection: number) => void): this;
+  on(event: 'message', handler: (connection: number, data: Buffer) => void): this;
+  send(connection: number, data: string | Buffer): boolean;
   /** An MCP tool, on a runtime of type "mcp". */
   tool(name: string, options: ToolOptions, handler: ToolHandler): this;
   close(): void;

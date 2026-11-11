@@ -26622,6 +26622,13 @@ A callback runs on the engine's thread and must return quickly.
 Work that takes time goes to a thread of the program's, which calls
 .B skl_mcp_reply
 from there.
+.PP
+A server or client runtime tells the program of its connections through
+.BR skl_on_connect ", " skl_on_disconnect " and " skl_on_message ,
+and
+.B skl_send
+sends a line on one, from any thread.
+A connection is a number never given to another, so one that has gone cannot be mistaken for a new one.
 .SS Rust
 The crate in
 .B sdk/rust

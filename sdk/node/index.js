@@ -34,6 +34,17 @@ class Runtime {
     return native.runtimeStats(this.handle);
   }
 
+  /** 'connect' and 'disconnect' give (connection), 'message' gives (connection, Buffer). */
+  on(event, handler) {
+    native.on(this.handle, event, handler);
+    return this;
+  }
+
+  /** Sends a line on a connection. */
+  send(connection, data) {
+    return native.send(this.handle, connection, Buffer.from(data));
+  }
+
   tool(name, options, handler) {
     const run = (call, argsJson, caller) => {
       Promise.resolve()

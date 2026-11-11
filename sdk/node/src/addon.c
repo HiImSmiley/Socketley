@@ -210,6 +210,99 @@ static napi_value mcp_reply(napi_env env, napi_callback_info info)
     return NULL;
 }
 
+/* Events of a server or client runtime, carried across as a tool's calls are. */
+struct event
+{
+    skl_connection connection;
+    char* data;
+    size_t length;
+    bool has_data;
+};
+
+static void event_js(napi_env env, napi_value js, void* context, void* data)
+{
+    (void)context;
+    struct event* e = data;
+    if (env)
+    {
+        napi_value undefined, argv[2];
+        napi_get_undefined(env, &undefined);
+        napi_create_double(env, (double)e->connection, &argv[0]);
+        if (e->has_data)
+            napi_create_buffer_copy(env, e->length, e->data ? e->data : "", NULL, &argv[1]);
+        napi_call_function(env, undefined, js, e->has_data ? 2 : 1, argv, NULL);
+    }
+    free(e->data);
+    free(e);
+}
+
+static void push(void* tsfn, skl_connection connection, const char* data, size_t length, bool has_data)
+{
+    struct event* e = calloc(1, sizeof *e);
+    if (!e)
+        return;
+    e->connection = connection;
+    e->length = length;
+    e->has_data = has_data;
+    if (has_data && length && (e->data = malloc(length)))
+        memcpy(e->data, data, length);
+    if (napi_call_threadsafe_function(tsfn, e, napi_tsfn_nonblocking) != napi_ok)
+    {
+        free(e->data);
+        free(e);
+    }
+}
+
+static void on_conn(void* user, skl_connection c) { push(user, c, NULL, 0, false); }
+static void on_msg(void* user, skl_connection c, const char* d, size_t n) { push(user, c, d, n, true); }
+
+static napi_value on(napi_env env, napi_callback_info info)
+{
+    ARGS(3);
+    char* event = text_of(env, argv[1]);
+    napi_value resource;
+    napi_create_string_utf8(env, "socketley.event", NAPI_AUTO_LENGTH, &resource);
+    napi_threadsafe_function fn;
+    if (napi_create_threadsafe_function(env, argv[2], NULL, resource, 0, 1, NULL, NULL, NULL, event_js, &fn) != napi_ok)
+    {
+        free(event);
+        napi_throw_error(env, NULL, "could not make a threadsafe function");
+        return NULL;
+    }
+    napi_unref_threadsafe_function(env, fn);
+    skl_runtime* r = pointer_of(env, argv[0]);
+    char* err = NULL;
+    int rc = -1;
+    if (strcmp(event, "connect") == 0)
+        rc = skl_on_connect(r, on_conn, fn, &err);
+    else if (strcmp(event, "disconnect") == 0)
+        rc = skl_on_disconnect(r, on_conn, fn, &err);
+    else if (strcmp(event, "message") == 0)
+        rc = skl_on_message(r, on_msg, fn, &err);
+    else
+        err = strdup("the events are connect, disconnect and message");
+    free(event);
+    if (rc != 0)
+    {
+        napi_release_threadsafe_function(fn, napi_tsfn_abort);
+        throw_taken(env, err);
+    }
+    return NULL;
+}
+
+static napi_value send_line(napi_env env, napi_callback_info info)
+{
+    ARGS(3);
+    double connection = 0;
+    napi_get_value_double(env, argv[1], &connection);
+    void* data = NULL;
+    size_t length = 0;
+    napi_get_buffer_info(env, argv[2], &data, &length);
+    napi_value v;
+    napi_get_boolean(env, skl_send(pointer_of(env, argv[0]), (skl_connection)connection, data, length) == 0, &v);
+    return v;
+}
+
 static napi_value runtime_free(napi_env env, napi_callback_info info)
 {
     ARGS(1);
@@ -227,7 +320,7 @@ NAPI_MODULE_INIT()
         {"version", version},           {"engineNew", engine_new},       {"engineFree", engine_free},
         {"runtimeCreate", runtime_create}, {"runtimeStart", runtime_start}, {"runtimeStop", runtime_stop},
         {"runtimeStats", runtime_stats},   {"runtimeFree", runtime_free},   {"mcpTool", mcp_tool},
-        {"mcpReply", mcp_reply},
+        {"mcpReply", mcp_reply},           {"on", on},                      {"send", send_line},
     };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; ++i)
     {

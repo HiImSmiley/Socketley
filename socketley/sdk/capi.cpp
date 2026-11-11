@@ -16,7 +16,9 @@
 
 #include "../cli/runtime_type_parser.h"
 #include "../daemon/flag_handlers.h"
+#include "../runtime/client/client_instance.h"
 #include "../runtime/mcp/mcp_instance.h"
+#include "../runtime/server/server_instance.h"
 #include "../shared/json/json_doc.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/loop/event_loop.h"
@@ -353,6 +355,92 @@ int skl_mcp_tool(skl_runtime* runtime, const char* name, const char* description
         return -1;
     }
     return 0;
+}
+
+namespace
+{
+// `set` on the engine's thread, for a runtime that has connections to tell of.
+int on_connected_runtime(skl_runtime* runtime, char** err, const std::function<void(runtime_instance*, bool)>& set)
+{
+    if (!runtime)
+    {
+        set_err(err, "a runtime is required");
+        return -1;
+    }
+    engine_state& s = *runtime->s;
+    std::string why;
+    const bool ran = s.call([&] {
+        runtime_instance* rt = s.manager.get(runtime->name);
+        if (!rt || (rt->get_type() != runtime_server && rt->get_type() != runtime_client))
+            why = "not a runtime of type server or client";
+        else
+            set(rt, rt->get_type() == runtime_server);
+    });
+    if (!ran || !why.empty())
+    {
+        set_err(err, ran ? why : "the engine has ended");
+        return -1;
+    }
+    return 0;
+}
+
+skl_connection connection_of(runtime_instance* rt, bool server, int fd)
+{
+    return server ? static_cast<server_instance*>(rt)->ref_for_fd(fd).serial : 1;
+}
+}
+
+int skl_on_connect(skl_runtime* runtime, skl_connection_fn fn, void* user, char** err)
+{
+    return on_connected_runtime(runtime, err, [&](runtime_instance* rt, bool server) {
+        rt->set_on_connect([rt, server, fn, user](int fd) { fn(user, connection_of(rt, server, fd)); });
+    });
+}
+
+int skl_on_disconnect(skl_runtime* runtime, skl_connection_fn fn, void* user, char** err)
+{
+    return on_connected_runtime(runtime, err, [&](runtime_instance* rt, bool server) {
+        rt->set_on_disconnect([rt, server, fn, user](int fd) { fn(user, connection_of(rt, server, fd)); });
+    });
+}
+
+int skl_on_message(skl_runtime* runtime, skl_message_fn fn, void* user, char** err)
+{
+    return on_connected_runtime(runtime, err, [&](runtime_instance* rt, bool server) {
+        if (server)
+            rt->set_on_client_message([rt, fn, user](int fd, std::string_view m) {
+                fn(user, connection_of(rt, true, fd), m.data(), m.size());
+            });
+        else
+            rt->set_on_message([fn, user](std::string_view m) { fn(user, 1, m.data(), m.size()); });
+    });
+}
+
+int skl_send(skl_runtime* runtime, skl_connection connection, const char* data, size_t length)
+{
+    if (!runtime || (!data && length))
+        return -1;
+    const std::shared_ptr<engine_state> state = runtime->s;
+    auto send = [state, name = runtime->name, connection, body = std::string(data ? data : "", length)] {
+        runtime_instance* rt = state->manager.get(name);
+        if (!rt)
+            return;
+        if (rt->get_type() == runtime_server)
+        {
+            auto* srv = static_cast<server_instance*>(rt);
+            if (srv->write_to_ref(conn_ref{conn_owner_key(srv->get_id()), connection}, body)) {}
+        }
+        else if (rt->get_type() == runtime_client)
+        {
+            if (static_cast<client_instance*>(rt)->lua_send(body)) {}
+        }
+    };
+    if (state->here())
+    {
+        send();
+        return 0;
+    }
+    return state->post(send) ? 0 : -1;
 }
 
 void skl_mcp_reply(skl_mcp_call* call, const char* text, int is_error)

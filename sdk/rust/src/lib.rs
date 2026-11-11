@@ -30,6 +30,8 @@ struct RawCall {
 }
 
 type RawTool = extern "C" fn(*mut c_void, *mut RawCall, *const c_char, *const c_char);
+type RawConnection = extern "C" fn(*mut c_void, u64);
+type RawMessage = extern "C" fn(*mut c_void, u64, *const c_char, usize);
 
 extern "C" {
     fn skl_version() -> *const c_char;
@@ -57,6 +59,10 @@ extern "C" {
         err: *mut *mut c_char,
     ) -> c_int;
     fn skl_mcp_reply(call: *mut RawCall, text: *const c_char, is_error: c_int);
+    fn skl_on_connect(runtime: *mut RawRuntime, f: RawConnection, user: *mut c_void, err: *mut *mut c_char) -> c_int;
+    fn skl_on_disconnect(runtime: *mut RawRuntime, f: RawConnection, user: *mut c_void, err: *mut *mut c_char) -> c_int;
+    fn skl_on_message(runtime: *mut RawRuntime, f: RawMessage, user: *mut c_void, err: *mut *mut c_char) -> c_int;
+    fn skl_send(runtime: *mut RawRuntime, connection: u64, data: *const c_char, length: usize) -> c_int;
 }
 
 /// Why socketley refused: the sentence the CLI would have printed.
@@ -122,7 +128,7 @@ impl Engine {
         if raw.is_null() {
             return Err(unsafe { taken(err) });
         }
-        Ok(Runtime { raw, tools: Vec::new(), _engine: self.handle.clone() })
+        Ok(Runtime { raw, tools: Vec::new(), hooks: Vec::new(), _engine: self.handle.clone() })
     }
 }
 
@@ -133,6 +139,7 @@ pub struct Runtime {
     raw: *mut RawRuntime,
     // Declared so they outlive the C runtime, which Drop frees first and which is what calls them.
     tools: Vec<Box<Box<ToolFn>>>,
+    hooks: Vec<Box<dyn std::any::Any + Send + Sync>>,
     _engine: Arc<EngineHandle>,
 }
 unsafe impl Send for Runtime {}
@@ -161,6 +168,55 @@ impl Runtime {
         let text = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
         unsafe { skl_free(p) };
         text
+    }
+
+    /// A connection came, on a runtime of type `server` or `client`.  Runs on the engine's thread, as do the two below.
+    pub fn on_connect<F: Fn(u64) + Send + Sync + 'static>(&mut self, f: F) -> Result<(), Error> {
+        self.connection_hook(skl_on_connect, f)
+    }
+
+    /// A connection went.
+    pub fn on_disconnect<F: Fn(u64) + Send + Sync + 'static>(&mut self, f: F) -> Result<(), Error> {
+        self.connection_hook(skl_on_disconnect, f)
+    }
+
+    fn connection_hook<F: Fn(u64) + Send + Sync + 'static>(
+        &mut self,
+        set: unsafe extern "C" fn(*mut RawRuntime, RawConnection, *mut c_void, *mut *mut c_char) -> c_int,
+        f: F,
+    ) -> Result<(), Error> {
+        extern "C" fn call<F: Fn(u64)>(user: *mut c_void, connection: u64) {
+            let f = unsafe { &*user.cast::<F>() };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(connection)));
+        }
+        let boxed = Box::new(f);
+        let mut err = ptr::null_mut();
+        if unsafe { set(self.raw, call::<F>, (&*boxed as *const F).cast_mut().cast(), &mut err) } != 0 {
+            return Err(unsafe { taken(err) });
+        }
+        self.hooks.push(boxed);
+        Ok(())
+    }
+
+    /// A message arrived on a connection.
+    pub fn on_message<F: Fn(u64, &[u8]) + Send + Sync + 'static>(&mut self, f: F) -> Result<(), Error> {
+        extern "C" fn call<F: Fn(u64, &[u8])>(user: *mut c_void, connection: u64, data: *const c_char, length: usize) {
+            let f = unsafe { &*user.cast::<F>() };
+            let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(connection, bytes)));
+        }
+        let boxed = Box::new(f);
+        let mut err = ptr::null_mut();
+        if unsafe { skl_on_message(self.raw, call::<F>, (&*boxed as *const F).cast_mut().cast(), &mut err) } != 0 {
+            return Err(unsafe { taken(err) });
+        }
+        self.hooks.push(boxed);
+        Ok(())
+    }
+
+    /// Sends a line on a connection, from any thread.  False once the engine has ended.
+    pub fn send(&self, connection: u64, data: &[u8]) -> bool {
+        unsafe { skl_send(self.raw, connection, data.as_ptr().cast(), data.len()) == 0 }
     }
 
     /// An MCP tool on a runtime of type `mcp`; `input_schema` is a JSON Schema object as text.

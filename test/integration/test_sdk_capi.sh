@@ -82,6 +82,48 @@ static void hold(void* user, skl_mcp_call* call, const char* args, const char* c
     held = call;
 }
 
+/* a server and a client of it, each told of its connections */
+static skl_runtime* server_rt;
+static skl_runtime* client_rt;
+static _Atomic int opened, closed;
+static char client_got[128];
+
+static void on_open(void* user, skl_connection c) { (void)user; if (c) opened++; }
+static void on_gone(void* user, skl_connection c) { (void)user; if (c) closed++; }
+
+struct echo { skl_connection c; char text[200]; };
+static void* echo_thread(void* arg)
+{
+    struct echo* e = arg;
+    skl_send(server_rt, e->c, e->text, strlen(e->text));
+    free(e);
+    return NULL;
+}
+static void on_line(void* user, skl_connection c, const char* data, size_t n)
+{
+    (void)user;
+    struct echo* e = malloc(sizeof *e);
+    e->c = c;
+    if (n == 2 && memcmp(data, "id", 2) == 0)
+        snprintf(e->text, sizeof e->text, "%llu", c);
+    else
+        snprintf(e->text, sizeof e->text, "echo: %.*s", (int)n, data);
+    pthread_t t;
+    pthread_create(&t, NULL, echo_thread, e);
+    pthread_detach(t);
+}
+
+static void client_open(void* user, skl_connection c)
+{
+    (void)user; (void)c;
+    skl_send(client_rt, 1, "from client", 11);
+}
+static void client_line(void* user, skl_connection c, const char* data, size_t n)
+{
+    (void)user; (void)c;
+    snprintf(client_got, sizeof client_got, "%.*s", (int)n, data);
+}
+
 static void say_err(const char* what, char* err)
 {
     printf("ERR %s: %s\n", what, err ? err : "(none)");
@@ -115,6 +157,15 @@ int main(int argc, char** argv)
         skl_mcp_tool(mcp, "hold", "Answers late.", NULL, hold, NULL, &err)) { say_err("tool", err); return 2; }
     if (skl_runtime_start(mcp, &err)) { say_err("mcp start", err); return 2; }
 
+    snprintf(flags, sizeof flags, "-p %s --mode in", argv[5]);
+    server_rt = skl_runtime_create(one, "server", "lines", flags, &err);
+    if (!server_rt || skl_on_connect(server_rt, on_open, NULL, &err) || skl_on_disconnect(server_rt, on_gone, NULL, &err) ||
+        skl_on_message(server_rt, on_line, NULL, &err) || skl_runtime_start(server_rt, &err)) { say_err("server", err); return 2; }
+    snprintf(flags, sizeof flags, "-t 127.0.0.1:%s", argv[5]);
+    client_rt = skl_runtime_create(one, "client", "out", flags, &err);
+    if (!client_rt || skl_on_connect(client_rt, client_open, NULL, &err) || skl_on_message(client_rt, client_line, NULL, &err) ||
+        skl_runtime_start(client_rt, &err)) { say_err("client", err); return 2; }
+
     snprintf(flags, sizeof flags, "-p %s", argv[3]);
     skl_runtime* cache = skl_runtime_create(two, "cache", "store", flags, &err);
     if (!cache || skl_runtime_start(cache, &err)) { say_err("cache", err); return 2; }
@@ -126,6 +177,9 @@ int main(int argc, char** argv)
     say_err("type", err); err = NULL;
     if (skl_runtime_create(one, "web", "site", "", &err)) return 3;
     say_err("name", err); err = NULL;
+    if (skl_on_message(web, on_line, NULL, &err) == 0) return 3;
+    say_err("hook on web", err); err = NULL;
+    if (skl_send(server_rt, 999999, "x", 1) != 0) return 3;
     if (skl_mcp_tool(web, "x", "", NULL, add, NULL, &err) == 0) return 3;
     say_err("tool on web", err); err = NULL;
     snprintf(flags, sizeof flags, "-p %s --root %s", argv[1], argv[4]);
@@ -144,6 +198,12 @@ int main(int argc, char** argv)
     fflush(stdout);
     while (!term)
         usleep(10000);
+
+    usleep(100000);
+    printf("CLIENT GOT %s\n", client_got);
+    printf("SERVER opened %d closed %d\n", (int)opened, (int)closed);
+    skl_runtime_free(client_rt);
+    skl_runtime_free(server_rt);
 
     /* an answer after the runtime is gone, its memory freed, has no one to reach */
     skl_runtime_free(mcp);
@@ -176,7 +236,7 @@ ok
 
 P=$SL_PORT_BASE
 mkdir -p "$T/site"; echo 'echo("embedded page")' > "$T/site/i.lua"
-"$T/host" $((P+1)) $((P+2)) $((P+3)) "$T/site" > "$T/out" 2>"$T/err" &
+"$T/host" $((P+1)) $((P+2)) $((P+3)) "$T/site" $((P+4)) > "$T/out" 2>"$T/err" &
 HOST=$!
 for _ in $(seq 1 300); do grep -q '^READY' "$T/out" 2>/dev/null && break; kill -0 "$HOST" 2>/dev/null || break; sleep 0.1; done
 grep -q '^READY' "$T/out" || bad "the host comes up" "$(tail -3 "$T/out" "$T/err" | cut -c1-240)"
@@ -241,9 +301,26 @@ expect "a tool that failed says so" "$(m FAILING)" "FAILING it broke True"
 expect "eight at once all get theirs" "$(m MANY)" "MANY 8 {'from a thread'}"
 grep -q '^DONE' "$T/mcp.out" || bad "the client ran through" "$(tail -4 "$T/mcp.out" | cut -c1-260)"
 
+expect "a hook is only for a server or client" "$(line 'ERR hook on web')" "ERR hook on web: not a runtime of type server or client"
+expect "a server answers from a thread of the program, on the connection the line came on" \
+    "$(python3 -c "
+import socket
+s=socket.create_connection(('127.0.0.1',$((P+4))),5); s.sendall(b'hello\\n'); s.settimeout(5)
+print(s.recv(99).decode().strip())")" "echo: hello"
+
+# The kernel gives the next connection the descriptor the last one closed, and its number must still be new.
+ask_id() { python3 -c "
+import socket
+s=socket.create_connection(('127.0.0.1',$((P+4))),5); s.sendall(b'id\\n'); s.settimeout(5)
+print(s.recv(99).decode().strip())"; }
+first=$(ask_id); sleep 0.2; second=$(ask_id)
+if [ -n "$first" ] && [ "$first" != "$second" ]; then ok; else bad "a connection after one that closed has a number of its own" "'$first' and '$second'"; fi
+
 kill -TERM "$HOST"
 for _ in $(seq 1 200); do kill -0 "$HOST" 2>/dev/null || break; sleep 0.1; done
 wait "$HOST"; rc=$?; HOST=""
+expect "a client runtime heard the server" "$(line 'CLIENT GOT')" "CLIENT GOT echo: from client"
+expect "the server told of both connections, and of the one that closed" "$(line 'SERVER')" "SERVER opened 4 closed 3"
 expect "the host ends by its own handler, the engines freed, a late answer dropped" "$rc $(grep -c 'HOST HANDLER RAN' "$T/out")" "0 1"
 [ -z "$SANFLAGS" ] || expect "and the sanitizer saw nothing" "$(grep -c -E 'ERROR: (Address|Leak)Sanitizer|runtime error:' "$T/err")" 0
 
