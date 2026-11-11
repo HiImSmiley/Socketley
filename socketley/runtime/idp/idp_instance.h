@@ -67,6 +67,7 @@ public:
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
     void on_loop_turn() override;
+    bool runs_drained() override;
     size_t get_connection_count() const override;
     std::string stats_lines() const override;
 

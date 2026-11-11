@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Any language can embed a runtime.** `socketley/capi.h` is a plain C interface,
+  `libsocketley.so` (package `socketley-dev`) carries it, and `sdk/rust` and
+  `sdk/node` are bindings on top. An engine is a guest in its process: its own
+  thread, none of the program's signals, nothing on stdout. An MCP tool can be a
+  function of the program, answering at once or later from any thread.
+
+- **A runtime removed from a running loop waits for its runs.** Eleven types kept
+  their work in a run the ring could still complete after the instance was freed.
+  The daemon never hit it, as each runtime is its own process.
+
 - **The SDK runs every runtime type.** `socketley::any_runtime` takes a type name
   and the flags `socketley create` takes, read by the daemon's own parsers, and
   `flags()` on the four typed classes reaches every flag they had no setter

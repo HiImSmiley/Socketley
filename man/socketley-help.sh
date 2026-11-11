@@ -3390,6 +3390,7 @@ sdk_overview() {
     echo -e "  ${CYAN}sdk/examples/basic/echo_server.cpp${NC}     — Tier 2 engine"
     echo -e "  ${CYAN}sdk/examples/basic/echo_server_lua.cpp${NC} — Tier 2 with Lua"
     echo -e "  ${CYAN}sdk/examples/basic/any_runtime.cpp${NC}     — Tier 2, any runtime type"
+    echo -e "  ${CYAN}sdk/rust/examples/mcp_tool.rs${NC}          — Rust, through socketley/capi.h"
     echo ""
 
     read -p "Press Enter to continue..." || true

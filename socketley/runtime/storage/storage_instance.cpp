@@ -521,6 +521,11 @@ void storage_instance::teardown(event_loop&)
     m_loop = nullptr;
 }
 
+bool storage_instance::runs_drained()
+{
+    return m_graveyard.drain();
+}
+
 void storage_instance::on_loop_turn()
 {
     m_graveyard.reap();

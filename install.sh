@@ -128,7 +128,7 @@ if [ -z "$DEB" ]; then
   . /etc/os-release
   # Only the packages built for this machine's architecture, since dpkg refuses any other.
   ARCH=$(dpkg --print-architecture)
-  URLS=$(sed -n 's/.*"browser_download_url": *"\([^"]*_'"$ARCH"'\.deb\)".*/\1/p' "$TMP/release.json")
+  URLS=$(sed -n 's/.*"browser_download_url": *"\([^"]*\/socketley_[^"]*_'"$ARCH"'\.deb\)".*/\1/p' "$TMP/release.json")
   # A rolling distribution names no version, which set -u would otherwise stop at.
   URL=$(printf '%s\n' "$URLS" | grep -F "${ID:-}${VERSION_ID:-}" | head -1 || true)
   [ -n "$URL" ] || URL=$(printf '%s\n' "$URLS" | head -1)

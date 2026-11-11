@@ -20,6 +20,13 @@ public:
         m_runs.push_back(std::move(run));
     }
 
+    // True once every retired run has been freed.
+    bool drain()
+    {
+        reap();
+        return m_runs.empty();
+    }
+
     void reap()
     {
         if (!m_runs.empty())

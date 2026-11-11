@@ -19,6 +19,7 @@ file(GLOB_RECURSE SDK_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../socketley/runtime/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../socketley/runtime/**/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../socketley/daemon/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../socketley/sdk/*.cpp"
 )
 
 add_library(socketley_sdk STATIC ${SDK_SOURCES})

@@ -140,3 +140,8 @@ test/benchmark/bench_client
 # scripts/update.sh: which pins of scripts/build-thirdparty.sh the archives here were built from
 thirdparty/.built-versions
 thirdparty/premake/
+
+# What building the Rust binding leaves behind.
+sdk/rust/Cargo.lock
+sdk/rust/target/
+sdk/node/build/

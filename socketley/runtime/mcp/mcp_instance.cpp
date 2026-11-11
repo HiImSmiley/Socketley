@@ -63,6 +63,11 @@ void mcp_instance::teardown(event_loop&)
     m_graveyard.retire(std::move(m_run));
 }
 
+bool mcp_instance::runs_drained()
+{
+    return m_graveyard.drain();
+}
+
 void mcp_instance::on_loop_turn()
 {
     m_graveyard.reap();

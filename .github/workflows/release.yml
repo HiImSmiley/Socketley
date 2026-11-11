@@ -70,4 +70,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "Socketley $VERSION" \
             --generate-notes \
-            "socketley_${VERSION}_amd64.deb"
+            "socketley_${VERSION}_amd64.deb" "socketley-dev_${VERSION}_amd64.deb"

@@ -6,11 +6,27 @@
 #include <charconv>
 #include <limits>
 
+#include <ostream>
+
 #include "../cli/arg_parser.h"
 #include "../cli/command_hashing.h"
 #include "../shared/runtime/runtime_definitions.h"
 #include "../shared/util/size_suffix.h"
 #include "../shared/util/number_parse.h"
+
+// Where a create line's refusals go: stdout, unless this thread has asked for them as text.
+std::ostream& flag_out();
+class flag_out_capture
+{
+public:
+    explicit flag_out_capture(std::ostream& to);
+    ~flag_out_capture();
+    flag_out_capture(const flag_out_capture&) = delete;
+    flag_out_capture& operator=(const flag_out_capture&) = delete;
+
+private:
+    std::ostream* m_before;
+};
 
 // parse_double is the one number not read by parse_whole, because std::stod
 // takes a std::string and from_chars for double is not available everywhere.

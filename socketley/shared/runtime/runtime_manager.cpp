@@ -612,7 +612,7 @@ size_t runtime_manager::reap_retired(const event_loop& loop)
                 LOG_DEBUG(dbg.c_str());
             }
 #endif
-            if (*it && loop.owner_inflight(it->get()) == 0)
+            if (*it && loop.owner_inflight(it->get()) == 0 && (*it)->runs_drained())
             {
                 doomed.push_back(std::move(*it));
                 it = m_retired.erase(it);

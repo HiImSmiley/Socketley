@@ -24,6 +24,8 @@ struct lua_tool
 {
     tool_def def;
     std::function<void(const json::jvalue&, const caller&, tool_done)> call;
+    // Declared by a program, not a script, so a script read again leaves it.
+    bool kept{false};
 };
 struct lua_resource
 {
@@ -85,6 +87,16 @@ public:
         m_declared_before = std::move(m_declared);
         m_declared = {};
         m_declared.gen = gen;
+        for (const auto& t : m_declared_before->tools)
+            if (t.kept)
+                m_declared.tools.push_back(t);
+    }
+    // A tool of this name is replaced.
+    void declare_tool(socketley::mcp::lua_tool t)
+    {
+        std::erase_if(m_declared.tools, [&](const socketley::mcp::lua_tool& x) { return x.def.name == t.def.name; });
+        m_declared.tools.push_back(std::move(t));
+        ++m_declared.gen;
     }
     void lua_load_failed() override
     {
@@ -103,6 +115,7 @@ public:
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
     void on_loop_turn() override;
+    bool runs_drained() override;
     size_t get_connection_count() const override;
     std::string stats_lines() const override;
     void listen_addresses(std::vector<std::string>& out) const override;

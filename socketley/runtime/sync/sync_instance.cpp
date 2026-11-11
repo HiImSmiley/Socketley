@@ -222,6 +222,11 @@ void sync_instance::teardown(event_loop&)
     m_graveyard.retire(std::move(m_run));
 }
 
+bool sync_instance::runs_drained()
+{
+    return m_graveyard.drain() & m_repo_graveyard.drain();
+}
+
 void sync_instance::on_loop_turn()
 {
     m_graveyard.reap();

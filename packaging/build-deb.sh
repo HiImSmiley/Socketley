@@ -17,7 +17,7 @@ PKG_DIR="$PROJECT_ROOT/socketley_${VERSION}_${ARCH}"
 # Built here from clean, since make keeps objects across a change of flags and a package must carry the -march it
 # names, not whatever the last build of this tree used.
 make -C "$PROJECT_ROOT/make" config="$CONFIG" clean >/dev/null
-make -C "$PROJECT_ROOT/make" config="$CONFIG" -j"$(nproc)" socketley socketley_bash
+make -C "$PROJECT_ROOT/make" config="$CONFIG" -j"$(nproc)" socketley socketley_bash socketley_shared
 if [ ! -f "$BINARY" ]; then
     echo "error: release binary not found at $BINARY"
     exit 1
@@ -247,3 +247,35 @@ dpkg-deb --build "$PKG_DIR"
 rm -rf "$PKG_DIR"
 
 echo "built: socketley_${VERSION}_${ARCH}.deb"
+
+# The library and the C header, for programs that carry their runtimes themselves.
+DEV_DIR="socketley-dev_${VERSION}_${ARCH}"
+rm -rf "$DEV_DIR"
+mkdir -p "$DEV_DIR/DEBIAN" "$DEV_DIR/usr/lib/pkgconfig" "$DEV_DIR/usr/include/socketley" "$DEV_DIR/usr/share/doc/socketley-dev"
+install -m 644 "$PROJECT_ROOT/bin/Release/libsocketley.so" "$DEV_DIR/usr/lib/libsocketley.so"
+install -m 644 "$PROJECT_ROOT/sdk/include/linux/socketley/capi.h" "$DEV_DIR/usr/include/socketley/capi.h"
+install -m 644 "$PROJECT_ROOT/LICENSE" "$DEV_DIR/usr/share/doc/socketley-dev/copyright"
+cat > "$DEV_DIR/usr/lib/pkgconfig/socketley.pc" << EOF
+prefix=/usr
+Name: socketley
+Description: Socketley's runtimes inside your own program
+Version: $VERSION
+Cflags: -I\${prefix}/include
+Libs: -L\${prefix}/lib -lsocketley
+EOF
+DEV_SHLIBS=$(mkdir -p "$DEV_DIR/debian" && cd "$DEV_DIR" && touch debian/control && dpkg-shlibdeps -O -e usr/lib/libsocketley.so 2>/dev/null)
+rm -rf "$DEV_DIR/debian"
+cat > "$DEV_DIR/DEBIAN/control" << EOF
+Package: socketley-dev
+Version: $VERSION
+Architecture: $ARCH
+Maintainer: Socketley Developers
+Description: Socketley's runtimes inside your own program
+ libsocketley.so and its C header, on which the C, Rust and Node interfaces rest.
+Depends: $(printf '%s\n' "$DEV_SHLIBS" | sed -n 's/^shlibs:Depends=//p')
+Section: libdevel
+Priority: optional
+EOF
+dpkg-deb --build "$DEV_DIR" >/dev/null
+rm -rf "$DEV_DIR"
+echo "built: socketley-dev_${VERSION}_${ARCH}.deb"

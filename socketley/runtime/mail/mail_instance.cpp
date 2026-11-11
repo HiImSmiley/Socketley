@@ -267,6 +267,11 @@ void mail_instance::teardown(event_loop&)
     m_graveyard.retire(std::move(m_run));
 }
 
+bool mail_instance::runs_drained()
+{
+    return m_graveyard.drain();
+}
+
 void mail_instance::on_loop_turn()
 {
     m_graveyard.reap();

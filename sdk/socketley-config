@@ -25,9 +25,10 @@ CONFIG=${SOCKETLEY_CONFIG:-Release}
 
 usage()
 {
-    echo "usage: socketley-config [--config <name>] [--no-lua] [--cflags] [--libs] [--pc] [--root] [--version]"
+    echo "usage: socketley-config [--config <name>] [--no-lua] [--shared] [--cflags] [--libs] [--pc] [--root] [--version]"
     echo "  --config   build directory under bin/ (default: \$SOCKETLEY_CONFIG or Release)"
     echo "  --no-lua   the library built without LuaJIT"
+    echo "  --shared   libsocketley.so and the C interface alone"
 }
 
 want_cflags=0
@@ -35,6 +36,7 @@ want_libs=0
 want_pc=0
 want_root=0
 no_lua=0
+shared=0
 LIB=socketley_sdk
 
 while [ $# -gt 0 ]; do
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
         --pc)      want_pc=1 ;;
         --root)    want_root=1 ;;
         --no-lua)  no_lua=1; LIB=socketley_sdk_nolua ;;
+        --shared)  shared=1 ;;
         --version) sed -n 's/^#define SOCKETLEY_VERSION "\(.*\)"/\1/p' "$ROOT/socketley/shared/util/version.h"; exit 0 ;;
         --config)  shift; [ $# -gt 0 ] || { echo "--config needs a name"; exit 1; }
                    CONFIG=$1 ;;
@@ -86,6 +89,12 @@ if [ "$no_lua" = 1 ]; then
     LIBS="$LIBS -l$LIB -Wl,-Bstatic -luring -Wl,-Bdynamic $TLSLIBS -pthread"
 else
     LIBS="$LIBS -l$LIB -lluajit -Wl,-Bstatic -luring -Wl,-Bdynamic $TLSLIBS -pthread"
+fi
+
+if [ "$shared" = 1 ]; then
+    [ -f "$LIBDIR/libsocketley.so" ] || { echo "no libsocketley.so in $LIBDIR"; exit 2; }
+    CFLAGS="-I$ROOT/sdk/include/linux"
+    LIBS="-L$LIBDIR -lsocketley -Wl,-rpath,$LIBDIR"
 fi
 
 if [ "$want_pc" = 1 ]; then

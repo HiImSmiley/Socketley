@@ -1,0 +1,11 @@
+[package]
+name = "socketley"
+version = "0.1.0"
+edition = "2021"
+description = "Socketley's runtimes inside a Rust program"
+license = "Apache-2.0"
+links = "socketley"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"

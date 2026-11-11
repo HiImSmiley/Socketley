@@ -312,7 +312,7 @@ project "socketley"
         "socketley/**.cpp"
     }
     -- The bash builtin is a library of its own, loaded by bash.
-    removefiles { "socketley/bash/**" }
+    removefiles { "socketley/bash/**", "socketley/sdk/**" }
 
     filter "system:linux"
         systemversion "latest"
@@ -370,9 +370,40 @@ project "socketley_bash"
         removelinkoptions { "-fsanitize=address,undefined", "-fsanitize=thread", "--coverage" }
     filter {}
 
+-- ─── SDK: libsocketley.so, the C interface alone ──
+-- Everything but skl_* is hidden, so a host with an OpenSSL of its own, as Node has, keeps it and this library keeps its.
+project "socketley_shared"
+    kind "SharedLib"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    targetname "socketley"
+    location("%{wks.location}")
+    pic "On"
+    dependson { "socketley_sdk" }
+    externalincludedirs { "thirdparty/sol2", "thirdparty/luajit" }
+    includedirs { ".", "socketley", "sdk/include/linux" }
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    files { "socketley/sdk/capi.cpp" }
+    links { "socketley_sdk", "luajit_pic", "uring:static" } links(tls_libs())
+    linkoptions { "-Wl,--version-script=../sdk/socketley.map", "-Wl,-Bsymbolic" }
+    filter "system:linux"
+        defines { "SOCKETLEY_LINUX" }
+    filter "configurations:Release"
+        defines { "NDEBUG", "RELEASE" }
+        optimize "Full"
+        buildoptions { "-fno-lto" }
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── SDK: socketley_sdk static library ───
 
 project "socketley_sdk"
+    pic "On"
     kind "StaticLib"
     language "C++"
     cppdialect "C++latest"
@@ -399,7 +430,8 @@ project "socketley_sdk"
         -- The daemon too, because an SDK binary may serve the control socket
         -- itself via <socketley/daemon.h>.
         "socketley/daemon/**.h",
-        "socketley/daemon/**.cpp"
+        "socketley/daemon/**.cpp",
+        "socketley/sdk/**.cpp"
     }
 
     filter "system:linux"
@@ -454,7 +486,8 @@ project "socketley_sdk_nolua"
     files {
         "socketley/shared/**.h", "socketley/shared/**.cpp",
         "socketley/runtime/**.h", "socketley/runtime/**.cpp",
-        "socketley/daemon/**.h", "socketley/daemon/**.cpp"
+        "socketley/daemon/**.h", "socketley/daemon/**.cpp",
+        "socketley/sdk/**.cpp"
     }
 
     filter "system:linux"

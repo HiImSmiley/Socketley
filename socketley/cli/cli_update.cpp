@@ -274,7 +274,7 @@ const js::jvalue* pick_asset(const js::jvalue& release, std::string& why)
         for (const auto& a : assets->items)
         {
             const std::string_view name = js::string_of(a, "name");
-            if (!name.ends_with(arch))
+            if (!name.starts_with("socketley_") || !name.ends_with(arch))
                 continue;
             if (!distro.empty() && name.find(distro) != std::string_view::npos)
                 return &a;

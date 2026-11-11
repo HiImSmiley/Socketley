@@ -54,6 +54,21 @@ luajit_optimised() {
       | grep -qE 'mov +%rdi,[^,]*\(%r[sb]p\)|str +x0, *\[(sp|x29)'
 }
 
+# libsocketley.so links LuaJIT too, which takes an archive built position-independent; the daemon keeps the faster one.
+build_luajit_pic() {
+  echo "== luajit, position-independent"
+  local dest="$ROOT/thirdparty/luajit/libluajit_pic.a"
+  if [ -f "$dest" ]; then echo "   already present, left alone"; return 0; fi
+  local tmp; tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+  git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git "$tmp" >/dev/null 2>&1 \
+    || { echo "   FAILED: could not clone LuaJIT"; return 2; }
+  make -C "$tmp/src" -j"$(nproc)" BUILDMODE=static XCFLAGS=-DLUAJIT_ENABLE_GC64 CFLAGS="-O2 -fomit-frame-pointer -fPIC" libluajit.a \
+       >/dev/null 2>&1 || { echo "   FAILED: LuaJIT build"; return 2; }
+  cp "$tmp/src/libluajit.a" "$dest"
+  echo "   built ($(stat -c%s "$dest") bytes)"
+}
+
 build_luajit() {
   echo "== luajit"
   local dest="$ROOT/thirdparty/luajit/libluajit.a"
@@ -183,9 +198,9 @@ build_http3() {
 
 case "$WHAT" in
   liburing) build_liburing ;;
-  luajit)   build_luajit ;;
+  luajit)   build_luajit && build_luajit_pic ;;
   http3)    build_http3 ;;
   premake)  build_premake ;;
-  all)      build_liburing; build_luajit; build_http3; build_premake ;;
+  all)      build_liburing; build_luajit; build_luajit_pic; build_http3; build_premake ;;
   *) echo "usage: $0 [liburing|luajit|http3|premake|all]"; exit 1 ;;
 esac

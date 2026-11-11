@@ -1,0 +1,11 @@
+{
+  "name": "socketley",
+  "version": "0.1.0",
+  "description": "Socketley's runtimes inside a Node program",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "os": ["linux"],
+  "scripts": { "install": "node-gyp rebuild" },
+  "files": ["index.js", "index.d.ts", "binding.gyp", "src/"]
+}

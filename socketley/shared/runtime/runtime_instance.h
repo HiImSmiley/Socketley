@@ -744,6 +744,8 @@ public:
     // no completion to hang off: a submission the ring refused leaves a
     // listener unarmed, and nothing else would come back to try again.
     virtual void on_loop_turn() {}
+    // False while a run of this runtime, its own owner in the ring, is still owed completions.
+    virtual bool runs_drained() { return true; }
 
     virtual void set_endpoints(std::shared_ptr<const endpoint_table>) {}
 

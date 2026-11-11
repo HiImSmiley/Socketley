@@ -1,6 +1,5 @@
 #include "flag_handlers.h"
 #include "type_manifest.h"
-#include "type_manifest.h"
 #include "../shared/util/duration_parse.h"
 #include "../shared/runtime/runtime_instance.h"
 #include "../shared/net/unix_listener.h"
@@ -46,13 +45,30 @@
 // accepts none, because they were stored and reported by `show` while no code
 // implemented them -- and giving each a meaning on a client is a feature to
 // design rather than a gap to plug.
+static thread_local std::ostream* t_flag_out = nullptr;
+
+std::ostream& flag_out()
+{
+    return t_flag_out ? *t_flag_out : std::cout;
+}
+
+flag_out_capture::flag_out_capture(std::ostream& to) : m_before(t_flag_out)
+{
+    t_flag_out = &to;
+}
+
+flag_out_capture::~flag_out_capture()
+{
+    t_flag_out = m_before;
+}
+
 static bool refuse_inbound_flag_on_client(const runtime_instance* instance,
                                           const char* flag, const char* why)
 {
     if (!instance || instance->get_type() != runtime_client)
         return false;
 
-    std::cout << flag << " does not apply to a client: " << why << "\n";
+    flag_out() << flag << " does not apply to a client: " << why << "\n";
     return true;
 }
 
@@ -67,7 +83,7 @@ static bool refuse_client_flag_elsewhere(const runtime_instance* instance,
     if (!instance || instance->get_type() == runtime_client)
         return false;
 
-    std::cout << flag << " applies to a client: " << why << "\n";
+    flag_out() << flag << " applies to a client: " << why << "\n";
     return true;
 }
 
@@ -82,7 +98,7 @@ static int apply_bind_address(runtime_instance* instance, std::string_view addre
     const std::string text(address);
     if (::inet_pton(AF_INET, text.c_str(), &a) != 1)
     {
-        std::cout << "invalid listen address \"" << text << "\": an IPv4 address such as 127.0.0.1\n";
+        flag_out() << "invalid listen address \"" << text << "\": an IPv4 address such as 127.0.0.1\n";
         return 1;
     }
     // A metrics runtime keeps 0.0.0.0 as given, since its API unset is loopback alone.
@@ -98,7 +114,7 @@ static int parse_port_flag(runtime_instance* instance, std::string_view value)
     uint16_t port;
     if (!socketley::parse_whole(colon == std::string_view::npos ? value : value.substr(colon + 1), port))
     {
-        std::cout << "invalid port number\n";
+        flag_out() << "invalid port number\n";
         return 1;
     }
     if (colon != std::string_view::npos && apply_bind_address(instance, value.substr(0, colon)) != 0)
@@ -155,12 +171,12 @@ static int parse_acme_flag(runtime_instance* instance, const parsed_args& pa, si
     const bool email = pa.hashes[i] == fnv1a("--acme-email");
     if (i + 1 >= pa.count)
     {
-        std::cout << (email ? "--acme-email requires an address\n" : "--acme requires a name, or several separated by commas\n");
+        flag_out() << (email ? "--acme-email requires an address\n" : "--acme requires a name, or several separated by commas\n");
         return 1;
     }
     if (const std::string why = apply_acme(instance, pa.args[++i], email); !why.empty())
     {
-        std::cout << why << "\n";
+        flag_out() << why << "\n";
         return 1;
     }
     return 0;
@@ -175,7 +191,7 @@ static int parse_domain_flag(runtime_instance* instance, const parsed_args& pa, 
     const bool own = i + 1 >= pa.count || pa.args[i + 1].starts_with('-');
     if (!own && pa.args[i + 1].empty())
     {
-        std::cout << "--domain requires a name, or several separated by commas; alone it takes the runtime's\n";
+        flag_out() << "--domain requires a name, or several separated by commas; alone it takes the runtime's\n";
         return 1;
     }
     const std::string_view v = own ? instance->get_name() : pa.args[++i];
@@ -184,7 +200,7 @@ static int parse_domain_flag(runtime_instance* instance, const parsed_args& pa, 
         const size_t comma = std::min(v.find(',', p), v.size());
         if (std::string why; !dns_feed::valid_name(v.substr(p, comma - p), why))
         {
-            std::cout << "--domain: " << why << (own ? " (the runtime's name, taken since no name followed --domain)" : "")
+            flag_out() << "--domain: " << why << (own ? " (the runtime's name, taken since no name followed --domain)" : "")
                       << "\n";
             return 1;
         }
@@ -202,10 +218,10 @@ static bool parse_duration_flag(const char* flag, std::string_view value,
         case duration_parse::ok:
             return true;
         case duration_parse::out_of_range:
-            std::cout << flag << " value out of range\n";
+            flag_out() << flag << " value out of range\n";
             return false;
         default:
-            std::cout << "invalid " << flag << " value\n";
+            flag_out() << "invalid " << flag << " value\n";
             return false;
     }
 }
@@ -218,7 +234,7 @@ static bool take_duration(const parsed_args& pa, size_t& i, uint64_t min, uint64
     const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
     if (v.empty() || parse_duration_seconds(v, max, out) != duration_parse::ok || out < min)
     {
-        std::cout << usage;
+        flag_out() << usage;
         return false;
     }
     ++i;
@@ -230,12 +246,12 @@ static bool take_size(const parsed_args& pa, size_t& i, const char* flag, size_t
 {
     if (i + 1 >= pa.count)
     {
-        std::cout << flag << " requires a size value\n";
+        flag_out() << flag << " requires a size value\n";
         return false;
     }
     if (!parse_size_suffix(pa.args[++i], out))
     {
-        std::cout << "invalid " << flag << " value (use K/M/G suffix)\n";
+        flag_out() << "invalid " << flag << " value (use K/M/G suffix)\n";
         return false;
     }
     return true;
@@ -251,12 +267,12 @@ static bool parse_count_flag(const char* flag, std::string_view value,
     auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), val);
     if (ec == std::errc::result_out_of_range)
     {
-        std::cout << flag << " value out of range\n";
+        flag_out() << flag << " value out of range\n";
         return false;
     }
     if (ec != std::errc{} || ptr != value.data() + value.size() || val < min)
     {
-        std::cout << "invalid " << flag << " value\n";
+        flag_out() << "invalid " << flag << " value\n";
         return false;
     }
     out = val;
@@ -281,14 +297,14 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--shards requires a count\n";
+                flag_out() << "--shards requires a count\n";
                 return 1;
             }
 
             uint32_t n = 0;
             if (!socketley::parse_whole(pa.args[++i], n) || n < 1)
             {
-                std::cout << "invalid shard count\n";
+                flag_out() << "invalid shard count\n";
                 return 1;
             }
 
@@ -298,7 +314,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
             if (const std::string msg = shards_config_refusal(
                     instance->get_type(), n); !msg.empty())
             {
-                std::cout << msg;
+                flag_out() << msg;
                 return 1;
             }
 
@@ -310,7 +326,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "-p requires a port number\n";
+                flag_out() << "-p requires a port number\n";
                 return 1;
             }
             return parse_port_flag(instance, pa.args[++i]);
@@ -320,7 +336,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--bind requires an address\n";
+                flag_out() << "--bind requires an address\n";
                 return 1;
             }
             return apply_bind_address(instance, pa.args[++i]);
@@ -329,7 +345,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--log"):
             if (i + 1 >= pa.count)
             {
-                std::cout << "--log requires a file path\n";
+                flag_out() << "--log requires a file path\n";
                 return 1;
             }
             // Absolute only: a relative path is resolved against the
@@ -337,7 +353,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
             if (const std::string why = socketley::appended_path_refusal(
                     "--log", pa.args[i + 1]); !why.empty())
             {
-                std::cout << why;
+                flag_out() << why;
                 return 1;
             }
             instance->set_log_file(pa.args[++i]);
@@ -346,7 +362,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("-w"):
             if (i + 1 >= pa.count)
             {
-                std::cout << "-w requires a file path\n";
+                flag_out() << "-w requires a file path\n";
                 return 1;
             }
             // Absolute only: a relative path is resolved against the
@@ -354,7 +370,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
             if (const std::string why = socketley::appended_path_refusal(
                     "-w", pa.args[i + 1]); !why.empty())
             {
-                std::cout << why;
+                flag_out() << why;
                 return 1;
             }
             instance->set_write_file(pa.args[++i]);
@@ -386,13 +402,13 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--max-connections requires a value\n";
+                flag_out() << "--max-connections requires a value\n";
                 return 1;
             }
             uint32_t max;
             if (!socketley::parse_whole(pa.args[++i], max))
             {
-                std::cout << "invalid max-connections value\n";
+                flag_out() << "invalid max-connections value\n";
                 return 1;
             }
             if (refuse_inbound_flag_on_client(instance, "--max-connections",
@@ -407,13 +423,13 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--rate-limit requires a value\n";
+                flag_out() << "--rate-limit requires a value\n";
                 return 1;
             }
             double rate;
             if (!parse_double(pa.args[++i], rate) || rate < 0)
             {
-                std::cout << "invalid rate-limit value\n";
+                flag_out() << "invalid rate-limit value\n";
                 return 1;
             }
             if (refuse_inbound_flag_on_client(instance, "--rate-limit",
@@ -428,13 +444,13 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--global-rate-limit requires a value\n";
+                flag_out() << "--global-rate-limit requires a value\n";
                 return 1;
             }
             double rate;
             if (!parse_double(pa.args[++i], rate) || rate < 0)
             {
-                std::cout << "invalid global-rate-limit value\n";
+                flag_out() << "invalid global-rate-limit value\n";
                 return 1;
             }
             // The fourth of them, and the one whose sibling was already
@@ -456,7 +472,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--idle-timeout requires a value\n";
+                flag_out() << "--idle-timeout requires a value\n";
                 return 1;
             }
             uint64_t secs;
@@ -483,13 +499,13 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
                                });
             if (!named)
             {
-                std::cout << "--congestion requires a congestion control's name, such as bbr or cubic\n";
+                flag_out() << "--congestion requires a congestion control's name, such as bbr or cubic\n";
                 return 1;
             }
             const runtime_type t = instance->get_type();
             if (t != runtime_server && t != runtime_proxy && t != runtime_cache && t != runtime_storage)
             {
-                std::cout << "--congestion applies to a server, a proxy, a cache or a storage: their listeners are "
+                flag_out() << "--congestion applies to a server, a proxy, a cache or a storage: their listeners are "
                              "where it is set\n";
                 return 1;
             }
@@ -527,7 +543,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--tls"):
             if (!tls_role_has_handshake(instance->get_type()))
             {
-                std::cout << tls_not_implemented_error("--tls");
+                flag_out() << tls_not_implemented_error("--tls");
                 return 1;
             }
             instance->set_tls(true);
@@ -550,12 +566,12 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
                                                         : "--ca";
             if (!tls_role_has_handshake(instance->get_type()))
             {
-                std::cout << tls_not_implemented_error(flag);
+                flag_out() << tls_not_implemented_error(flag);
                 return 1;
             }
             if (i + 1 >= pa.count)
             {
-                std::cout << flag << " requires a file\n";
+                flag_out() << flag << " requires a file\n";
                 return 1;
             }
             const std::string_view path = pa.args[++i];
@@ -570,7 +586,7 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--group requires a value\n";
+                flag_out() << "--group requires a value\n";
                 return 1;
             }
             instance->set_group(pa.args[++i]);
@@ -609,7 +625,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--lua"):
             if (i + 1 >= pa.count)
             {
-                std::cout << "--lua requires a Lua script path\n";
+                flag_out() << "--lua requires a Lua script path\n";
                 return 1;
             }
             lua_script = pa.args[++i];
@@ -672,7 +688,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                     // is not printed.
                     if (e == std::errc::result_out_of_range)
                     {
-                        std::cout << "--reconnect value out of range: " << sv << "\n"
+                        flag_out() << "--reconnect value out of range: " << sv << "\n"
                                      "  Give it no value or 0 for unlimited attempts, "
                                      "which is what a number that large was asking "
                                      "for.\n";
@@ -680,7 +696,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                     }
                     if (val < 0)
                     {
-                        std::cout << "--reconnect does not take " << sv << "\n"
+                        flag_out() << "--reconnect does not take " << sv << "\n"
                                      "  It is the flag that turns reconnection ON: "
                                      "give it no value or 0 for unlimited attempts, "
                                      "or a positive count to stop after that many.\n"
@@ -705,14 +721,14 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--cpus requires a CPU set: max | 0-3 | 0,1,2,3\n";
+                flag_out() << "--cpus requires a CPU set: max | 0-3 | 0,1,2,3\n";
                 return 1;
             }
             cpu_set_spec cpus;
             std::string err;
             if (!parse_cpu_set(pa.args[++i], cpus, err))
             {
-                std::cout << "invalid --cpus value: " << err << "\n";
+                flag_out() << "invalid --cpus value: " << err << "\n";
                 return 1;
             }
             instance->set_cpus(cpus);
@@ -822,21 +838,21 @@ static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t
     // the refusal says where it is rather than "unknown flag".
     if (rt->get_type() == runtime_client)
     {
-        std::cout << "--listen does not apply to a client: a client dials out"
+        flag_out() << "--listen does not apply to a client: a client dials out"
                      " and has no listener.  The connect side of a unix socket"
                      " is -t unix:/path/to.sock\n";
         return 1;
     }
     if (i + 1 >= pa.count)
     {
-        std::cout << "--listen requires an address (unix:/path/to.sock)\n";
+        flag_out() << "--listen requires an address (unix:/path/to.sock)\n";
         return 1;
     }
     std::string path;
     const std::string why = validate_listen_value(pa.args[++i], path);
     if (!why.empty())
     {
-        std::cout << "--listen: " << why << "\n";
+        flag_out() << "--listen: " << why << "\n";
         return 1;
     }
     rt->set_listen_path(path);
@@ -854,7 +870,7 @@ static int refuse_removed_server_flag(uint32_t which)
 {
     if (which == fnv1a("--master-forward"))
     {
-        std::cout << "--master-forward is now --send-to master: it was one "
+        flag_out() << "--master-forward is now --send-to master: it was one "
                      "recipient carrying its own flag, and the recipients are "
                      "a set\n";
         return 1;
@@ -872,7 +888,7 @@ static int add_upstream_list(server_instance* srv, std::string_view list)
         const std::string_view addr = list.substr(start, semi - start);
         if (!addr.empty() && !srv->add_upstream_target(addr))
         {
-            std::cout << server_instance::upstream_refusal(addr);
+            flag_out() << server_instance::upstream_refusal(addr);
             return 1;
         }
         start = semi + 1;
@@ -889,14 +905,14 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--mode requires a value\n";
+                flag_out() << "--mode requires a value\n";
                 return 1;
             }
             ++i;
             server_mode mode;
             if (!parse_server_mode(pa.hashes[i], mode))
             {
-                std::cout << "unknown mode: " << pa.args[i] << "\n";
+                flag_out() << "unknown mode: " << pa.args[i] << "\n";
                 return 1;
             }
             srv->set_mode(mode);
@@ -906,7 +922,7 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--send-to requires sender, others or master, "
+                flag_out() << "--send-to requires sender, others or master, "
                              "comma separated\n";
                 return 1;
             }
@@ -915,7 +931,7 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
             std::string bad;
             if (!parse_server_send_to(pa.args[i], mask, bad))
             {
-                std::cout << "unknown --send-to: " << (bad.empty() ? pa.args[i] : bad)
+                flag_out() << "unknown --send-to: " << (bad.empty() ? pa.args[i] : bad)
                           << " (sender, others, master; comma separated)\n";
                 return 1;
             }
@@ -926,7 +942,7 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--cache requires a cache name\n";
+                flag_out() << "--cache requires a cache name\n";
                 return 1;
             }
             srv->set_cache_name(pa.args[++i]);
@@ -937,7 +953,7 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--master-pw requires a password\n";
+                flag_out() << "--master-pw requires a password\n";
                 return 1;
             }
             srv->set_master_pw(pa.args[++i]);
@@ -947,7 +963,7 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--http requires a directory path\n";
+                flag_out() << "--http requires a directory path\n";
                 return 1;
             }
             srv->set_http_dir(pa.args[++i]);
@@ -973,7 +989,7 @@ static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa
             const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
             if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
             {
-                std::cout << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                flag_out() << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
                 return 1;
             }
             srv->set_origins(pa.args[++i]);
@@ -1000,7 +1016,7 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "-u requires host:port\n";
+                flag_out() << "-u requires host:port\n";
                 return 1;
             }
             return add_upstream_list(srv, pa.args[++i]);
@@ -1019,14 +1035,14 @@ static int parse_client_shared_flags(client_instance* cli, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--mode requires a value\n";
+                flag_out() << "--mode requires a value\n";
                 return 1;
             }
             ++i;
             client_mode mode;
             if (!parse_client_mode(pa.hashes[i], mode))
             {
-                std::cout << "unknown mode: " << pa.args[i] << "\n";
+                flag_out() << "unknown mode: " << pa.args[i] << "\n";
                 return 1;
             }
             cli->set_mode(mode);
@@ -1037,14 +1053,14 @@ static int parse_client_shared_flags(client_instance* cli, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--connections requires a count\n";
+                flag_out() << "--connections requires a count\n";
                 return 1;
             }
             uint32_t n = 0;
             if (!socketley::parse_whole(pa.args[++i], n) || n < 1
                 || n > client_instance::max_connections_held)
             {
-                std::cout << "invalid connection count\n";
+                flag_out() << "invalid connection count\n";
                 return 1;
             }
             cli->set_connections(n);
@@ -1064,7 +1080,7 @@ int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "-t requires a target address\n";
+                flag_out() << "-t requires a target address\n";
                 return 1;
             }
             // A unix: target is judged now and not at dial time, because this
@@ -1077,13 +1093,13 @@ int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
                         socketley::unix_sock::path_refusal(v.substr(5));
                     !why.empty())
                 {
-                    std::cout << "-t: " << why << "\n";
+                    flag_out() << "-t: " << why << "\n";
                     return 1;
                 }
             }
             else if (std::string why = socketley::dial_addr::refusal(v); !why.empty())
             {
-                std::cout << "-t: " << why << "\n";
+                flag_out() << "-t: " << why << "\n";
                 return 1;
             }
             cli->set_target(pa.args[i]);
@@ -1106,7 +1122,7 @@ static int parse_proxy_gate_flag(proxy_instance* proxy, const parsed_args& pa, s
         {
             if (i + 1 >= pa.count || pa.args[i + 1].starts_with('-'))
             {
-                std::cout << "--auth requires bearer:<file> or basic:<file>\n";
+                flag_out() << "--auth requires bearer:<file> or basic:<file>\n";
                 return 1;
             }
             const std::string_view spec = pa.args[++i];
@@ -1117,7 +1133,7 @@ static int parse_proxy_gate_flag(proxy_instance* proxy, const parsed_args& pa, s
             }
             if (const std::string why = proxy_auth::spec_error(spec); !why.empty())
             {
-                std::cout << why << "\n";
+                flag_out() << why << "\n";
                 return 1;
             }
             proxy->set_auth(spec);
@@ -1138,7 +1154,7 @@ static int parse_proxy_gate_flag(proxy_instance* proxy, const parsed_args& pa, s
                     const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
                     if (ec != std::errc{} || end != v.data() + v.size() || n == 0 || n > 65535)
                     {
-                        std::cout << "--redirect-https takes the port HTTPS is reached on, or none\n";
+                        flag_out() << "--redirect-https takes the port HTTPS is reached on, or none\n";
                         return 1;
                     }
                     port = static_cast<uint16_t>(n);
@@ -1164,7 +1180,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
             const bool remote = pa.hashes[i] == fnv1a("--fastcgi-root");
             if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].front() != '/')
             {
-                std::cout << (remote ? "--fastcgi-root" : "--root") << " requires an absolute directory\n";
+                flag_out() << (remote ? "--fastcgi-root" : "--root") << " requires an absolute directory\n";
                 return 1;
             }
             if (remote)
@@ -1182,7 +1198,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
             const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
             if (v.empty() || v.find('/') != std::string_view::npos || v.starts_with('.'))
             {
-                std::cout << "--index requires a file name, as index.php\n";
+                flag_out() << "--index requires a file name, as index.php\n";
                 return 1;
             }
             proxy->set_index(pa.args[++i]);
@@ -1192,7 +1208,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--strategy requires a value\n";
+                flag_out() << "--strategy requires a value\n";
                 return 1;
             }
             ++i;
@@ -1208,7 +1224,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
                     proxy->set_strategy(strategy_lua);
                     break;
                 default:
-                    std::cout << "unknown strategy: " << pa.args[i] << "\n";
+                    flag_out() << "unknown strategy: " << pa.args[i] << "\n";
                     return 1;
             }
             return 0;
@@ -1217,7 +1233,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--health-check requires tcp or http\n";
+                flag_out() << "--health-check requires tcp or http\n";
                 return 1;
             }
             ++i;
@@ -1230,7 +1246,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
                     proxy->set_health_check(mesh_config::health_http);
                     break;
                 default:
-                    std::cout << "unknown health-check type: " << pa.args[i] << "\n";
+                    flag_out() << "unknown health-check type: " << pa.args[i] << "\n";
                     return 1;
             }
             return 0;
@@ -1239,7 +1255,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--health-interval requires a value\n";
+                flag_out() << "--health-interval requires a value\n";
                 return 1;
             }
             uint64_t secs;
@@ -1248,7 +1264,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
                 return 1;
             if (secs == 0)
             {
-                std::cout << "invalid health-interval value\n";
+                flag_out() << "invalid health-interval value\n";
                 return 1;
             }
             proxy->set_health_interval(static_cast<int>(secs));
@@ -1258,7 +1274,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--health-path requires a value\n";
+                flag_out() << "--health-path requires a value\n";
                 return 1;
             }
             {
@@ -1269,7 +1285,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
                 const std::string_view hp = pa.args[i + 1];
                 if (hp.empty() || hp.front() != '/')
                 {
-                    std::cout << "--health-path must begin with '/'\n";
+                    flag_out() << "--health-path must begin with '/'\n";
                     return 1;
                 }
             }
@@ -1280,7 +1296,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--health-threshold requires a value\n";
+                flag_out() << "--health-threshold requires a value\n";
                 return 1;
             }
             int val;
@@ -1293,7 +1309,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--circuit-threshold requires a value\n";
+                flag_out() << "--circuit-threshold requires a value\n";
                 return 1;
             }
             int val;
@@ -1306,7 +1322,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--circuit-timeout requires a value\n";
+                flag_out() << "--circuit-timeout requires a value\n";
                 return 1;
             }
             uint64_t secs;
@@ -1315,7 +1331,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
                 return 1;
             if (secs == 0)
             {
-                std::cout << "invalid circuit-timeout value\n";
+                flag_out() << "invalid circuit-timeout value\n";
                 return 1;
             }
             proxy->set_circuit_timeout(static_cast<int>(secs));
@@ -1328,7 +1344,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--backend-timeout requires a value\n";
+                flag_out() << "--backend-timeout requires a value\n";
                 return 1;
             }
             uint64_t secs;
@@ -1342,7 +1358,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--retry requires a value\n";
+                flag_out() << "--retry requires a value\n";
                 return 1;
             }
             int val;
@@ -1367,7 +1383,7 @@ static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa
                                                                : "--client-key";
             if (i + 1 >= pa.count)
             {
-                std::cout << flag << " requires a file\n";
+                flag_out() << flag << " requires a file\n";
                 return 1;
             }
             const std::string_view path = pa.args[++i];
@@ -1392,7 +1408,7 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--backend requires a value\n";
+                flag_out() << "--backend requires a value\n";
                 return 1;
             }
             std::string_view backend_str = pa.args[++i];
@@ -1409,7 +1425,7 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--protocol requires a value\n";
+                flag_out() << "--protocol requires a value\n";
                 return 1;
             }
             ++i;
@@ -1422,7 +1438,7 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                     proxy->set_protocol(protocol_tcp);
                     break;
                 default:
-                    std::cout << "unknown protocol: " << pa.args[i] << "\n";
+                    flag_out() << "unknown protocol: " << pa.args[i] << "\n";
                     return 1;
             }
             return 0;
@@ -1449,7 +1465,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--persistent requires a file path\n";
+                flag_out() << "--persistent requires a file path\n";
                 return 1;
             }
             cache->set_persistent(pa.args[++i]);
@@ -1462,7 +1478,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--persistent-interval requires a value\n";
+                flag_out() << "--persistent-interval requires a value\n";
                 return 1;
             }
             uint64_t secs;
@@ -1471,7 +1487,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
                 return 1;
             if (secs == 0)
             {
-                std::cout << "invalid persistent-interval value\n";
+                flag_out() << "invalid persistent-interval value\n";
                 return 1;
             }
             cache->set_persist_interval(static_cast<uint32_t>(secs));
@@ -1481,14 +1497,14 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--mode requires a value\n";
+                flag_out() << "--mode requires a value\n";
                 return 1;
             }
             ++i;
             cache_mode mode;
             if (!parse_cache_mode(pa.hashes[i], mode))
             {
-                std::cout << "unknown mode: " << pa.args[i] << "\n";
+                flag_out() << "unknown mode: " << pa.args[i] << "\n";
                 return 1;
             }
             cache->set_mode(mode);
@@ -1506,7 +1522,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--eviction requires a policy\n";
+                flag_out() << "--eviction requires a policy\n";
                 return 1;
             }
             ++i;
@@ -1522,7 +1538,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
                     cache->set_eviction(evict_allkeys_random);
                     break;
                 default:
-                    std::cout << "unknown eviction policy: " << pa.args[i] << "\n";
+                    flag_out() << "unknown eviction policy: " << pa.args[i] << "\n";
                     return 1;
             }
             return 0;
@@ -1546,7 +1562,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--replicate requires host:port\n";
+                flag_out() << "--replicate requires host:port\n";
                 return 1;
             }
             // An empty value means follows nobody, which set_replicate_target
@@ -1558,7 +1574,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
                 if (std::string why = socketley::dial_addr::refusal(v, true);
                     !why.empty())
                 {
-                    std::cout << "--replicate: " << why << "\n";
+                    flag_out() << "--replicate: " << why << "\n";
                     return 1;
                 }
             }
@@ -1570,7 +1586,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         {
             if (!cache->is_cluster_owned())
             {
-                std::cout << "--cluster-replica is the cluster's to set: `socketley cluster create cache ...` makes replicas\n";
+                flag_out() << "--cluster-replica is the cluster's to set: `socketley cluster create cache ...` makes replicas\n";
                 return 1;
             }
             uint64_t incarnation = 0;
@@ -1578,7 +1594,7 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
             const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), incarnation);
             if (ec != std::errc{} || end != v.data() + v.size() || incarnation == 0)
             {
-                std::cout << "--cluster-replica requires a nonzero number\n";
+                flag_out() << "--cluster-replica requires a nonzero number\n";
                 return 1;
             }
             ++i;
@@ -1600,7 +1616,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
             if (v.empty() || v.find('\0') != std::string_view::npos)
             {
-                std::cout << "--zone requires the path of a zone file, or several separated by commas\n";
+                flag_out() << "--zone requires the path of a zone file, or several separated by commas\n";
                 return 1;
             }
             ++i;
@@ -1614,7 +1630,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             std::string bad;
             if (i + 1 >= pa.count || !socketley::ip_block::parse_list(pa.args[i + 1], blocks, bad))
             {
-                std::cout << "--transfer requires addresses or blocks such as 192.0.2.7 or 2001:db8::/32"
+                flag_out() << "--transfer requires addresses or blocks such as 192.0.2.7 or 2001:db8::/32"
                           << (bad.empty() ? std::string{} : ", not '" + bad + "'") << "\n";
                 return 1;
             }
@@ -1626,7 +1642,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--notify requires addresses, with :port where it is not 53\n";
+                flag_out() << "--notify requires addresses, with :port where it is not 53\n";
                 return 1;
             }
             dns->set_notify(pa.args[++i]);
@@ -1638,7 +1654,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].starts_with('-'))
             {
-                std::cout << "--proxy requires the name of the entrance (a proxy without --backend), or none\n";
+                flag_out() << "--proxy requires the name of the entrance (a proxy without --backend), or none\n";
                 return 1;
             }
             dns->set_proxy(pa.args[++i]);
@@ -1649,7 +1665,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             uint32_t port = 0;
             if (i + 1 >= pa.count || !socketley::parse_whole(pa.args[i + 1], port) || port == 0 || port > 65535)
             {
-                std::cout << "--proxy-port requires the port the entrance listens on, 1 to 65535\n";
+                flag_out() << "--proxy-port requires the port the entrance listens on, 1 to 65535\n";
                 return 1;
             }
             ++i;
@@ -1661,7 +1677,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--publish requires this machine's public addresses, IPv4 and IPv6, comma-separated\n";
+                flag_out() << "--publish requires this machine's public addresses, IPv4 and IPv6, comma-separated\n";
                 return 1;
             }
             dns->set_publish(pa.args[++i]);
@@ -1672,7 +1688,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             uint32_t n = 0;
             if (i + 1 >= pa.count || !socketley::parse_whole(pa.args[i + 1], n) || n > 1000000)
             {
-                std::cout << "--rrl requires responses a second per client network, 0 for no limit\n";
+                flag_out() << "--rrl requires responses a second per client network, 0 for no limit\n";
                 return 1;
             }
             ++i;
@@ -1696,7 +1712,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].front() != '/')
             {
-                std::cout << "--dir requires the absolute path of the directory whose files are carried\n";
+                flag_out() << "--dir requires the absolute path of the directory whose files are carried\n";
                 return 1;
             }
             sy->set_dir(pa.args[++i]);
@@ -1707,7 +1723,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].find('/') == std::string_view::npos)
             {
-                std::cout << "--storage requires a runtime and a bucket (ui/photos), or a URL and one "
+                flag_out() << "--storage requires a runtime and a bucket (ui/photos), or a URL and one "
                              "(https://storage.example/photos)\n";
                 return 1;
             }
@@ -1719,7 +1735,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].front() == '/')
             {
-                std::cout << "--prefix requires a key below the bucket, without a leading slash\n";
+                flag_out() << "--prefix requires a key below the bucket, without a leading slash\n";
                 return 1;
             }
             sy->set_prefix(pa.args[++i]);
@@ -1730,7 +1746,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--credentials requires the path of a file holding access_key and secret_key\n";
+                flag_out() << "--credentials requires the path of a file holding access_key and secret_key\n";
                 return 1;
             }
             sy->set_credentials(pa.args[++i]);
@@ -1741,7 +1757,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
             sync_mode m{};
             if (i + 1 >= pa.count || !parse_sync_runtime_mode(pa.args[i + 1], m))
             {
-                std::cout << "--mode requires out (the directory to the storage), in (the storage to the "
+                flag_out() << "--mode requires out (the directory to the storage), in (the storage to the "
                              "directory) or inout (both)\n";
                 return 1;
             }
@@ -1756,7 +1772,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
             uint64_t secs = 0;
             if (v != "never" && (v.empty() || parse_duration_seconds(v, 365ull * 24 * 3600, secs) != duration_parse::ok))
             {
-                std::cout << "--every requires how often the whole directory is walked, as 30s, 10m, 1h or 1d, "
+                flag_out() << "--every requires how often the whole directory is walked, as 30s, 10m, 1h or 1d, "
                              "or never\n";
                 return 1;
             }
@@ -1769,7 +1785,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--exclude requires patterns such as '*.tmp, .git, node_modules', comma-separated\n";
+                flag_out() << "--exclude requires patterns such as '*.tmp, .git, node_modules', comma-separated\n";
                 return 1;
             }
             sy->set_exclude(pa.args[++i]);
@@ -1779,7 +1795,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--repositories requires the file a storage runtime writes for a user's sync runtime\n";
+                flag_out() << "--repositories requires the file a storage runtime writes for a user's sync runtime\n";
                 return 1;
             }
             sy->set_repositories(pa.args[++i]);
@@ -1799,7 +1815,7 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].front() != '/')
             {
-                std::cout << "--clients requires the absolute path of a file with one client a line: "
+                flag_out() << "--clients requires the absolute path of a file with one client a line: "
                              "id secret redirect...\n";
                 return 1;
             }
@@ -1813,7 +1829,7 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
             if (v.empty() || socketley::idp::url_host(v).empty() || v.find_first_of("?#") != std::string_view::npos ||
                 (!v.starts_with("https://") && !v.starts_with("http://localhost") && !v.starts_with("http://127.0.0.1")))
             {
-                std::cout << "--issuer requires the https address the provider is reached at, "
+                flag_out() << "--issuer requires the https address the provider is reached at, "
                              "such as https://auth.example.com\n";
                 return 1;
             }
@@ -1826,7 +1842,7 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
             const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
             if (v.empty() || v.find_first_of("/:; ,") != std::string_view::npos || v.find('.') == std::string_view::npos)
             {
-                std::cout << "--cookie-domain requires a domain such as example.com, whose names share the sign-in\n";
+                flag_out() << "--cookie-domain requires a domain such as example.com, whose names share the sign-in\n";
                 return 1;
             }
             ip->set_cookie_domain(pa.args[++i]);
@@ -1850,7 +1866,7 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
             }
             if (canonical.empty())
             {
-                std::cout << "--resources requires the https addresses of the servers tokens are given for, "
+                flag_out() << "--resources requires the https addresses of the servers tokens are given for, "
                              "comma-separated, such as https://mcp.example.com/mcp\n";
                 return 1;
             }
@@ -1866,7 +1882,7 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
             const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), h);
             if (v.empty() || ec != std::errc{} || end != v.data() + v.size() || h < 1 || h > 168)
             {
-                std::cout << "--ssh-ca requires the hours a user certificate holds, 1 to 168, such as 8\n";
+                flag_out() << "--ssh-ca requires the hours a user certificate holds, 1 to 168, such as 8\n";
                 return 1;
             }
             ip->set_ssh_ca_hours(h);
@@ -1887,7 +1903,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--schema"):
             if (next.empty() || next.front() != '/')
             {
-                std::cout << "--schema requires the absolute path of a file with one collection a line: "
+                flag_out() << "--schema requires the absolute path of a file with one collection a line: "
                              "name access index...\n";
                 return 1;
             }
@@ -1897,7 +1913,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--keys"):
             if (next.empty() || next.front() != '/')
             {
-                std::cout << "--keys requires the absolute path of a file with one key a line: name secret\n";
+                flag_out() << "--keys requires the absolute path of a file with one key a line: name secret\n";
                 return 1;
             }
             db->set_keys_path(pa.args[++i]);
@@ -1906,7 +1922,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--idp"):
             if (next.empty() || next.find_first_of("/ ") != std::string_view::npos)
             {
-                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                flag_out() << "--idp requires the name of an idp runtime of this daemon\n";
                 return 1;
             }
             db->set_idp(pa.args[++i]);
@@ -1915,7 +1931,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--idp-audience"):
             if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
             {
-                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                flag_out() << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
                 return 1;
             }
             db->set_idp_audience(pa.args[++i]);
@@ -1924,7 +1940,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--origins"):
             if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
             {
-                std::cout << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                flag_out() << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
                 return 1;
             }
             db->set_origins(pa.args[++i]);
@@ -1934,7 +1950,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             size_t bytes = 0;
             if (next.empty() || !parse_size_suffix(pa.args[++i], bytes))
             {
-                std::cout << "--max-bytes requires a size such as 2G\n";
+                flag_out() << "--max-bytes requires a size such as 2G\n";
                 return 1;
             }
             db->set_max_bytes(bytes);
@@ -1946,7 +1962,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             size_t bytes = 0;
             if (next.empty() || !parse_size_suffix(pa.args[++i], bytes))
             {
-                std::cout << "--cache requires a size such as 256M\n";
+                flag_out() << "--cache requires a size such as 256M\n";
                 return 1;
             }
             db->set_cache_bytes(bytes);
@@ -1956,7 +1972,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--replicate"):
             if (!next.starts_with("http://") && !next.starts_with("https://"))
             {
-                std::cout << "--replicate requires the http or https address of the database to copy\n";
+                flag_out() << "--replicate requires the http or https address of the database to copy\n";
                 return 1;
             }
             db->set_replicate(pa.args[++i]);
@@ -1964,7 +1980,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--replicate-key"):
             if (next.empty() || next.front() != '/')
             {
-                std::cout << "--replicate-key requires the absolute path of a file holding a key's secret\n";
+                flag_out() << "--replicate-key requires the absolute path of a file holding a key's secret\n";
                 return 1;
             }
             db->set_replicate_key(pa.args[++i]);
@@ -1973,7 +1989,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--backup-dir"):
             if (next.empty() || next.front() != '/')
             {
-                std::cout << "--backup-dir requires the absolute path of a directory\n";
+                flag_out() << "--backup-dir requires the absolute path of a directory\n";
                 return 1;
             }
             db->set_backup_dir(pa.args[++i]);
@@ -1992,7 +2008,7 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             const auto r = std::from_chars(next.data(), next.data() + next.size(), n);
             if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || n < 1 || n > 10000)
             {
-                std::cout << "--backup-keep requires how many backups are kept, from 1\n";
+                flag_out() << "--backup-keep requires how many backups are kept, from 1\n";
                 return 1;
             }
             ++i;
@@ -2010,7 +2026,7 @@ int parse_tunnel_flags(tunnel_instance* tn, const parsed_args& pa, size_t& i, st
     const auto text = [&](const char* flag, const char* what, auto set) {
         if (next.empty() || next.starts_with("--"))
         {
-            std::cout << flag << " requires " << what << "\n";
+            flag_out() << flag << " requires " << what << "\n";
             return 1;
         }
         set(next);
@@ -2023,7 +2039,7 @@ int parse_tunnel_flags(tunnel_instance* tn, const parsed_args& pa, size_t& i, st
         case fnv1a("--mode"):
             if (next != "edge" && next != "agent")
             {
-                std::cout << "--mode requires edge or agent\n";
+                flag_out() << "--mode requires edge or agent\n";
                 return 1;
             }
             tn->set_mode(next == "edge" ? tunnel_instance::mode::edge : tunnel_instance::mode::agent);
@@ -2032,7 +2048,7 @@ int parse_tunnel_flags(tunnel_instance* tn, const parsed_args& pa, size_t& i, st
         case fnv1a("--to"):
             if (!next.starts_with("https://") && !next.starts_with("http://"))
             {
-                std::cout << "--to requires the edge's address, such as https://t.example.com\n";
+                flag_out() << "--to requires the edge's address, such as https://t.example.com\n";
                 return 1;
             }
             tn->set_to(next);
@@ -2067,7 +2083,7 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--keys"):
             if (next.empty() || next.front() != '/')
             {
-                std::cout << "--keys requires the absolute path of a file with one key a line: name secret [admin]\n";
+                flag_out() << "--keys requires the absolute path of a file with one key a line: name secret [admin]\n";
                 return 1;
             }
             mc->set_keys_path(pa.args[++i]);
@@ -2078,7 +2094,7 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--origins"):
             if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
             {
-                std::cout << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                flag_out() << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
                 return 1;
             }
             mc->set_origins(pa.args[++i]);
@@ -2088,7 +2104,7 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--tools"):
             if (next != "none" && next != "daemon")
             {
-                std::cout << "--tools is none or daemon\n";
+                flag_out() << "--tools is none or daemon\n";
                 return 1;
             }
             mc->set_tools(pa.args[++i]);
@@ -2096,7 +2112,7 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--instructions"):
             if (next.empty())
             {
-                std::cout << "--instructions requires the text a client is told the server is for\n";
+                flag_out() << "--instructions requires the text a client is told the server is for\n";
                 return 1;
             }
             mc->set_instructions(pa.args[++i]);
@@ -2105,7 +2121,7 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--idp"):
             if (next.empty() || next.find_first_of("/ ") != std::string_view::npos)
             {
-                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                flag_out() << "--idp requires the name of an idp runtime of this daemon\n";
                 return 1;
             }
             mc->set_idp(pa.args[++i]);
@@ -2113,7 +2129,7 @@ int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--idp-audience"):
             if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
             {
-                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                flag_out() << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
                 return 1;
             }
             mc->set_idp_audience(pa.args[++i]);
@@ -2132,7 +2148,7 @@ int parse_web_flags(web_instance* wb, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--root"):
             if (next.empty() || next.front() != '/')
             {
-                std::cout << "--root requires an absolute directory\n";
+                flag_out() << "--root requires an absolute directory\n";
                 return 1;
             }
             wb->set_root(pa.args[++i]);
@@ -2141,7 +2157,7 @@ int parse_web_flags(web_instance* wb, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--index"):
             if (next.empty() || next.find('/') != std::string_view::npos || next.starts_with('.'))
             {
-                std::cout << "--index requires a file name, as index.html\n";
+                flag_out() << "--index requires a file name, as index.html\n";
                 return 1;
             }
             wb->set_index(pa.args[++i]);
@@ -2151,7 +2167,7 @@ int parse_web_flags(web_instance* wb, const parsed_args& pa, size_t& i, std::str
             if (next.empty() || next.starts_with('.') || next.find("..") != std::string_view::npos ||
                 next.starts_with("-"))
             {
-                std::cout << "--fallback requires a page under --root, as index.html\n";
+                flag_out() << "--fallback requires a page under --root, as index.html\n";
                 return 1;
             }
             wb->set_fallback(pa.args[++i]);
@@ -2164,7 +2180,7 @@ int parse_web_flags(web_instance* wb, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--backend"):
             if (!next.starts_with("fastcgi://"))
             {
-                std::cout << "--backend on a web runtime requires a FastCGI server: fastcgi://unix:/path or "
+                flag_out() << "--backend on a web runtime requires a FastCGI server: fastcgi://unix:/path or "
                              "fastcgi://a.b.c.d:port\n";
                 return 1;
             }
@@ -2173,7 +2189,7 @@ int parse_web_flags(web_instance* wb, const parsed_args& pa, size_t& i, std::str
         case fnv1a("--fastcgi-root"):
             if (next.empty() || next.front() != '/')
             {
-                std::cout << "--fastcgi-root requires an absolute directory\n";
+                flag_out() << "--fastcgi-root requires an absolute directory\n";
                 return 1;
             }
             wb->set_fastcgi_root(pa.args[++i]);
@@ -2189,7 +2205,7 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
     const auto path = [&](const char* flag, const char* what, auto set) {
         if (next.empty() || next.front() != '/')
         {
-            std::cout << flag << " requires the absolute path of " << what << "\n";
+            flag_out() << flag << " requires the absolute path of " << what << "\n";
             return 1;
         }
         set(next);
@@ -2209,7 +2225,7 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
         if (next.empty() || (!bare && !socketley::metrics::parse_duration(next, ms)) || ms % 1000 != 0 ||
             ms / 1000 < min || ms / 1000 > max)
         {
-            std::cout << usage;
+            flag_out() << usage;
             return 1;
         }
         set(ms / 1000);
@@ -2225,7 +2241,7 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
         case fnv1a("--idp"):
             if (next.empty() || next.find_first_of("/ ") != std::string_view::npos)
             {
-                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                flag_out() << "--idp requires the name of an idp runtime of this daemon\n";
                 return 1;
             }
             mt->set_idp(next);
@@ -2234,7 +2250,7 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
         case fnv1a("--idp-audience"):
             if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
             {
-                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                flag_out() << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
                 return 1;
             }
             mt->set_idp_audience(next);
@@ -2261,7 +2277,7 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
             std::string why;
             if (next.empty() || !socketley::metrics::parse_downsample(next, tiers, why))
             {
-                std::cout << "--downsample requires the tiers as step:keep, a comma between each, such as 5m:1y,1h:5y, "
+                flag_out() << "--downsample requires the tiers as step:keep, a comma between each, such as 5m:1y,1h:5y, "
                              "or none" << (why.empty() ? "" : ": " + why) << "\n";
                 return 1;
             }
@@ -2275,7 +2291,7 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
             const auto r = std::from_chars(next.data(), next.data() + next.size(), n);
             if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || n < 1)
             {
-                std::cout << "--max-series requires how many series the store takes, from 1\n";
+                flag_out() << "--max-series requires how many series the store takes, from 1\n";
                 return 1;
             }
             mt->set_max_series(n);
@@ -2301,7 +2317,7 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
         {
             if (uint8_t m = 0; next.empty() || !socketley::metrics::parse_notify(next, m))
             {
-                std::cout << "--notify requires where alerts go of the daemon's own: webhook, mail and events, a comma "
+                flag_out() << "--notify requires where alerts go of the daemon's own: webhook, mail and events, a comma "
                              "between, or none\n";
                 return 1;
             }
@@ -2318,7 +2334,7 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
             std::string why;
             if (next.empty() || !socketley::parse_http_url(next, t, why) || t.path.size() < 2)
             {
-                std::cout << "--archive requires the S3 bucket blocks are copied to, as http[s]://host/bucket[/prefix]"
+                flag_out() << "--archive requires the S3 bucket blocks are copied to, as http[s]://host/bucket[/prefix]"
                           << (why.empty() ? "" : ": " + why) << "\n";
                 return 1;
             }
@@ -2342,7 +2358,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         const auto r = std::from_chars(next.data(), next.data() + next.size(), p);
         if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || p < 1 || p > 65535)
         {
-            std::cout << usage;
+            flag_out() << usage;
             return 1;
         }
         ++i;
@@ -2352,7 +2368,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
     const auto file = [&](const char* usage, void (mail_instance::*set)(std::string_view)) {
         if (next.empty() || next.front() != '/')
         {
-            std::cout << usage;
+            flag_out() << usage;
             return 1;
         }
         (ml->*set)(pa.args[++i]);
@@ -2362,7 +2378,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         if (next.empty() || next.find(' ') != std::string_view::npos ||
             (!slash_ok && next.find('/') != std::string_view::npos))
         {
-            std::cout << usage;
+            flag_out() << usage;
             return 1;
         }
         (ml->*set)(pa.args[++i]);
@@ -2386,7 +2402,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             if (next.empty() || next.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.-,") != std::string_view::npos ||
                 next.front() == '.' || next.find("..") != std::string_view::npos)
             {
-                std::cout << "--dnsbl requires a blocklist's zone, or a comma list of them, such as zen.spamhaus.org\n";
+                flag_out() << "--dnsbl requires a blocklist's zone, or a comma list of them, such as zen.spamhaus.org\n";
                 return 1;
             }
             ml->set_dnsbl(pa.args[++i]);
@@ -2414,7 +2430,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--rspamd"):
             if (!(next.starts_with("http://") || next.starts_with("https://")) || next.find(' ') != std::string_view::npos)
             {
-                std::cout << "--rspamd requires an http:// or https:// URL, such as http://127.0.0.1:11333\n";
+                flag_out() << "--rspamd requires an http:// or https:// URL, such as http://127.0.0.1:11333\n";
                 return 1;
             }
             ml->set_rspamd(pa.args[++i]);
@@ -2422,7 +2438,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--recipient-delimiter"):
             if (next.empty() || (next != "none" && (next.size() > 4 || next.find_first_of(" @\"") != std::string_view::npos)))
             {
-                std::cout << "--recipient-delimiter requires the characters that divide a user from a tag, such as +, or none\n";
+                flag_out() << "--recipient-delimiter requires the characters that divide a user from a tag, such as +, or none\n";
                 return 1;
             }
             ml->set_recipient_delimiter(next == "none" ? std::string_view{} : next);
@@ -2434,7 +2450,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--refuse-attachments"):
             if (next.empty() || next.find_first_of(" ;\"/") != std::string_view::npos)
             {
-                std::cout << "--refuse-attachments requires the extensions refused, such as exe,js,vbs, default, or none\n";
+                flag_out() << "--refuse-attachments requires the extensions refused, such as exe,js,vbs, default, or none\n";
                 return 1;
             }
             ml->set_refused_attachments(pa.args[++i]);
@@ -2442,7 +2458,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--clamav"):
             if (next.empty() || (next.front() != '/' && next.rfind(':') == std::string_view::npos))
             {
-                std::cout << "--clamav requires clamd's host:port, such as 127.0.0.1:3310, or its socket's path\n";
+                flag_out() << "--clamav requires clamd's host:port, such as 127.0.0.1:3310, or its socket's path\n";
                 return 1;
             }
             ml->set_clamav(pa.args[++i]);
@@ -2450,7 +2466,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--dmarc-policy"):
             if (next != "none" && next != "quarantine" && next != "reject")
             {
-                std::cout << "--dmarc-policy requires none, quarantine or reject\n";
+                flag_out() << "--dmarc-policy requires none, quarantine or reject\n";
                 return 1;
             }
             ml->set_dmarc_policy(pa.args[++i]);
@@ -2463,7 +2479,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             if (!logo.starts_with("https://") || !logo.ends_with(".svg") || (!vmc.empty() && !vmc.starts_with("https://")) ||
                 next.find_first_of(" ;\"") != std::string_view::npos)
             {
-                std::cout << "--bimi requires the https URL of an SVG logo, and a comma and its certificate's where it has "
+                flag_out() << "--bimi requires the https URL of an SVG logo, and a comma and its certificate's where it has "
                              "one, such as https://example.com/logo.svg\n";
                 return 1;
             }
@@ -2473,7 +2489,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--dmarc-rua"):
             if (next.empty() || next.find('@') == std::string_view::npos || next.find_first_of(" ,;\"") != std::string_view::npos)
             {
-                std::cout << "--dmarc-rua requires the address reports are mailed to, such as dmarc@example.com\n";
+                flag_out() << "--dmarc-rua requires the address reports are mailed to, such as dmarc@example.com\n";
                 return 1;
             }
             ml->set_dmarc_rua(pa.args[++i]);
@@ -2481,7 +2497,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--tls-rpt"):
             if (next.empty() || next.find('@') == std::string_view::npos || next.find_first_of(" ,;\"") != std::string_view::npos)
             {
-                std::cout << "--tls-rpt requires the address reports are mailed to, such as tlsrpt@example.com\n";
+                flag_out() << "--tls-rpt requires the address reports are mailed to, such as tlsrpt@example.com\n";
                 return 1;
             }
             ml->set_tls_rpt(pa.args[++i]);
@@ -2489,7 +2505,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--mta-sts"):
             if (next != "enforce" && next != "testing")
             {
-                std::cout << "--mta-sts requires enforce or testing\n";
+                flag_out() << "--mta-sts requires enforce or testing\n";
                 return 1;
             }
             ml->set_mta_sts(pa.args[++i]);
@@ -2499,7 +2515,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             size_t bytes = 0;
             if (next.empty() || !parse_size_suffix(next, bytes))
             {
-                std::cout << "--default-quota requires a size, such as 1G, or 0 for no bound\n";
+                flag_out() << "--default-quota requires a size, such as 1G, or 0 for no bound\n";
                 return 1;
             }
             ++i;
@@ -2512,7 +2528,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             const auto r = std::from_chars(next.data(), next.data() + next.size(), n);
             if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || n > 100)
             {
-                std::cout << "--quota-warn requires a percent from 0 to 100, such as 90\n";
+                flag_out() << "--quota-warn requires a percent from 0 to 100, such as 90\n";
                 return 1;
             }
             ++i;
@@ -2523,7 +2539,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             if (next.empty() || next.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.-,") != std::string_view::npos ||
                 next.front() == '.' || next.find("..") != std::string_view::npos)
             {
-                std::cout << "--arc-trust requires a forwarder's domain, or a comma list of them, such as lists.example.org\n";
+                flag_out() << "--arc-trust requires a forwarder's domain, or a comma list of them, such as lists.example.org\n";
                 return 1;
             }
             ml->set_arc_trust(pa.args[++i]);
@@ -2531,7 +2547,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--dkim-next"):
             if (next.empty() || next.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string_view::npos)
             {
-                std::cout << "--dkim-next requires a name of lower-case letters, digits and hyphens\n";
+                flag_out() << "--dkim-next requires a name of lower-case letters, digits and hyphens\n";
                 return 1;
             }
             ml->set_dkim_next(pa.args[++i]);
@@ -2557,7 +2573,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             }
             if (!good)
             {
-                std::cout << (host ? "--hostname requires the name the runtime greets with, such as mail.example.com"
+                flag_out() << (host ? "--hostname requires the name the runtime greets with, such as mail.example.com"
                                    : "--mail-domain requires a domain, or a comma list of them, such as example.com")
                           << (why.empty() ? "" : ": " + why) << "\n";
                 return 1;
@@ -2578,7 +2594,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--idp-audience"):
             if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
             {
-                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                flag_out() << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
                 return 1;
             }
             ml->set_idp_audience(pa.args[++i]);
@@ -2599,7 +2615,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--relay"):
             if (!next.starts_with("smtp://") && !next.starts_with("smtps://"))
             {
-                std::cout << "--relay requires smtp://[user:password@]host[:port] or smtps://...\n";
+                flag_out() << "--relay requires smtp://[user:password@]host[:port] or smtps://...\n";
                 return 1;
             }
             ml->set_relay(pa.args[++i]);
@@ -2609,7 +2625,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             size_t bytes = 0;
             if (next.empty() || !parse_size_suffix(next, bytes) || bytes < 1024 || bytes > (1ull << 30))
             {
-                std::cout << "--max-size requires a size from 1K to 1G, such as 25M\n";
+                flag_out() << "--max-size requires a size from 1K to 1G, such as 25M\n";
                 return 1;
             }
             ++i;
@@ -2622,7 +2638,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             const auto r = std::from_chars(next.data(), next.data() + next.size(), n);
             if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || n < 1 || n > 100000)
             {
-                std::cout << "--max-recipients requires how many, from 1\n";
+                flag_out() << "--max-recipients requires how many, from 1\n";
                 return 1;
             }
             ++i;
@@ -2651,7 +2667,7 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--dkim-selector"):
             if (next.empty() || next.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string_view::npos)
             {
-                std::cout << "--dkim-selector requires a name of lower-case letters, digits and hyphens\n";
+                flag_out() << "--dkim-selector requires a name of lower-case letters, digits and hyphens\n";
                 return 1;
             }
             ml->set_dkim_selector(pa.args[++i]);
@@ -2669,7 +2685,7 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
         const auto r = std::from_chars(next.data(), next.data() + next.size(), out);
         if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || out < lo || out > hi)
         {
-            std::cout << usage;
+            flag_out() << usage;
             return false;
         }
         ++i;
@@ -2678,7 +2694,7 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
     const auto file = [&](const char* usage, void (mqtt_instance::*set)(std::string_view)) {
         if (next.empty() || next.front() != '/')
         {
-            std::cout << usage;
+            flag_out() << usage;
             return 1;
         }
         (mq->*set)(pa.args[++i]);
@@ -2702,7 +2718,7 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--idp"):
             if (next.empty() || next.find_first_of("/ ") != std::string_view::npos)
             {
-                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                flag_out() << "--idp requires the name of an idp runtime of this daemon\n";
                 return 1;
             }
             mq->set_idp(pa.args[++i]);
@@ -2711,7 +2727,7 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--idp-audience"):
             if (next.empty() || next.find_first_of(" ;/") != std::string_view::npos)
             {
-                std::cout << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
+                flag_out() << "--idp-audience requires the ids of the idp's clients whose tokens are taken, comma-separated\n";
                 return 1;
             }
             mq->set_idp_audience(pa.args[++i]);
@@ -2732,7 +2748,7 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
         case fnv1a("--persistent"):
             if (next != "on" && (next.empty() || next.front() != '/'))
             {
-                std::cout << "--persistent requires the absolute path of a file, or on for one under the state "
+                flag_out() << "--persistent requires the absolute path of a file, or on for one under the state "
                              "directory\n";
                 return 1;
             }
@@ -2751,7 +2767,7 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
             size_t bytes = 0;
             if (next.empty() || !parse_size_suffix(next, bytes) || bytes < 64 || bytes > 268435455)
             {
-                std::cout << "--max-packet requires a size from 64 bytes to 256M, such as 1M\n";
+                flag_out() << "--max-packet requires a size from 64 bytes to 256M, such as 1M\n";
                 return 1;
             }
             ++i;
@@ -2780,7 +2796,7 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
             size_t bytes = 0;
             if (next.empty() || !parse_size_suffix(next, bytes))
             {
-                std::cout << "--retained-max requires a size such as 64M\n";
+                flag_out() << "--retained-max requires a size such as 64M\n";
                 return 1;
             }
             ++i;
@@ -2819,13 +2835,13 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "--dir requires a directory path\n";
+                flag_out() << "--dir requires a directory path\n";
                 return 1;
             }
             const std::string_view dir = pa.args[++i];
             if (dir.empty() || dir.find('\0') != std::string_view::npos)
             {
-                std::cout << "--dir requires a directory path\n";
+                flag_out() << "--dir requires a directory path\n";
                 return 1;
             }
             stg->set_dir(dir);
@@ -2840,7 +2856,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].find_first_of("/ ") != std::string_view::npos)
             {
-                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                flag_out() << "--idp requires the name of an idp runtime of this daemon\n";
                 return 1;
             }
             stg->set_idp(pa.args[++i]);
@@ -2857,7 +2873,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             const bool access = pa.hashes[i] == fnv1a("--access-key");
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << (access ? "--access-key" : "--secret-key") << " requires a value\n";
+                flag_out() << (access ? "--access-key" : "--secret-key") << " requires a value\n";
                 return 1;
             }
             const std::string_view v = pa.args[++i];
@@ -2872,7 +2888,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--credentials requires a file path\n";
+                flag_out() << "--credentials requires a file path\n";
                 return 1;
             }
             stg->set_credentials_file(pa.args[++i]);
@@ -2883,7 +2899,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--sse-key-file requires a file path\n";
+                flag_out() << "--sse-key-file requires a file path\n";
                 return 1;
             }
             stg->set_sse_key_file(pa.args[++i]);
@@ -2899,7 +2915,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             const std::string_view v = own ? stg->get_name() : pa.args[i + 1];
             if (!socketley::storage::parse_domains(v, domains, why))
             {
-                std::cout << (own ? "--domain: the runtime's name is no domain name; give one: " : "") << why << "\n";
+                flag_out() << (own ? "--domain: the runtime's name is no domain name; give one: " : "") << why << "\n";
                 return 1;
             }
             if (!own)
@@ -2913,7 +2929,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             socketley::storage::sync_mode m;
             if (i + 1 >= pa.count || !socketley::storage::parse_sync_mode(pa.args[i + 1], m))
             {
-                std::cout << "--fsync requires always, interval or never\n";
+                flag_out() << "--fsync requires always, interval or never\n";
                 return 1;
             }
             stg->set_fsync(pa.args[++i]);
@@ -2925,7 +2941,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             socketley::storage::sync_runners r;
             if (i + 1 >= pa.count || !socketley::storage::parse_sync_runners(pa.args[i + 1], r))
             {
-                std::cout << "--sync requires never, active or per-user\n";
+                flag_out() << "--sync requires never, active or per-user\n";
                 return 1;
             }
             stg->set_sync(pa.args[++i]);
@@ -2946,7 +2962,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             std::string why;
             if (i + 1 >= pa.count || !socketley::storage::parse_domains(pa.args[i + 1], domains, why))
             {
-                std::cout << (why.empty() ? "--website-domain requires a domain name, or several separated by commas"
+                flag_out() << (why.empty() ? "--website-domain requires a domain name, or several separated by commas"
                                           : "--website-domain: " + why)
                           << "\n";
                 return 1;
@@ -2959,7 +2975,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--notify-targets requires a file path\n";
+                flag_out() << "--notify-targets requires a file path\n";
                 return 1;
             }
             stg->set_notify_targets(pa.args[++i]);
@@ -2970,7 +2986,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--replication-targets requires a file path\n";
+                flag_out() << "--replication-targets requires a file path\n";
                 return 1;
             }
             stg->set_replication_targets(pa.args[++i]);
@@ -2981,7 +2997,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--tiers requires a file path\n";
+                flag_out() << "--tiers requires a file path\n";
                 return 1;
             }
             stg->set_tiers_file(pa.args[++i]);
@@ -2992,7 +3008,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--federation requires a file path\n";
+                flag_out() << "--federation requires a file path\n";
                 return 1;
             }
             stg->set_federation_file(pa.args[++i]);
@@ -3003,7 +3019,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--tls-offloaded requires addresses such as 10.0.0.5 or 10.0.0.0/24\n";
+                flag_out() << "--tls-offloaded requires addresses such as 10.0.0.5 or 10.0.0.0/24\n";
                 return 1;
             }
             stg->set_tls_offloaded(pa.args[++i]);
@@ -3014,7 +3030,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--nodes requires a file path\n";
+                flag_out() << "--nodes requires a file path\n";
                 return 1;
             }
             stg->set_nodes_file(pa.args[++i]);
@@ -3063,7 +3079,7 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
 // A TLS flag a running runtime would store and not handshake with, refused with the way to have it taken.
 static int refuse_running_trust(std::string_view flag)
 {
-    std::cout << "cannot change " << flag << " while running: its handshakes use what it started with; edit it with "
+    flag_out() << "cannot change " << flag << " while running: its handshakes use what it started with; edit it with "
                  "--restart\n";
     return 1;
 }
@@ -3101,7 +3117,7 @@ bool apply_create_flags(runtime_instance* instance, runtime_manager& manager, st
     pa.parse(line);
     if (pa.overflowed)
     {
-        std::cout << "too many flags on one line\n";
+        flag_out() << "too many flags on one line\n";
         return false;
     }
     bool autostart = false;
@@ -3112,25 +3128,25 @@ bool apply_create_flags(runtime_instance* instance, runtime_manager& manager, st
     {
         const int result = parse_create_flag(instance, type, pa, i, autostart, lua_script, &manager, name);
         if (result == -1)
-            std::cout << "unknown flag: " << pa.args[i] << "\n";
+            flag_out() << "unknown flag: " << pa.args[i] << "\n";
         if (result != 0)
             return false;
     }
     if (instance->get_shards() > 1)
     {
-        std::cout << "--shards: shards are forked by the daemon, and an embedded runtime is this one process\n";
+        flag_out() << "--shards: shards are forked by the daemon, and an embedded runtime is this one process\n";
         return false;
     }
     if (lua_script.empty())
         return true;
     if (type == runtime_web)
     {
-        std::cout << "web: --lua is not run; a .lua file under --root is a page with --lua-pages\n";
+        flag_out() << "web: --lua is not run; a .lua file under --root is a page with --lua-pages\n";
         return false;
     }
     if (!instance->load_lua_script(lua_script))
     {
-        std::cout << "could not load Lua script: " << lua_script << "\n";
+        flag_out() << "could not load Lua script: " << lua_script << "\n";
         return false;
     }
     return true;
@@ -3145,7 +3161,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--lua-ffi"):
             if (is_running)
             {
-                std::cout << "--lua-ffi is given to the script when it starts: socketley restart "
+                flag_out() << "--lua-ffi is given to the script when it starts: socketley restart "
                           << instance->get_name() << " --lua-ffi\n";
                 return 1;
             }
@@ -3158,7 +3174,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--listen"):
             if (is_running)
             {
-                std::cout << "cannot change the listen socket while running\n";
+                flag_out() << "cannot change the listen socket while running\n";
                 return 1;
             }
             return parse_listen_flag(instance, pa, i);
@@ -3167,7 +3183,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         // and accepting the edit would store a value the next `stats`
         // contradicts.
         case fnv1a("--cpus"):
-            std::cout << "the ring's CPU set is fixed when the ring is created; "
+            flag_out() << "the ring's CPU set is fixed when the ring is created; "
                          "recreate the runtime to change it\n";
             return 1;
 
@@ -3175,21 +3191,21 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--shards"):
             if (is_running)
             {
-                std::cout << "cannot change the shard count while running\n";
+                flag_out() << "cannot change the shard count while running\n";
                 return 1;
             }
             return parse_shared_flags(instance, pa, i);
         case fnv1a("-p"):
             if (is_running)
             {
-                std::cout << "cannot change port while running\n";
+                flag_out() << "cannot change port while running\n";
                 return 1;
             }
             return parse_shared_flags(instance, pa, i);
         case fnv1a("--bind"):
             if (is_running)
             {
-                std::cout << "cannot change the bind address while running\n";
+                flag_out() << "cannot change the bind address while running\n";
                 return 1;
             }
             return parse_shared_flags(instance, pa, i);
@@ -3225,7 +3241,7 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
         {
             if (is_running)
             {
-                std::cout << "cannot change protocol while running\n";
+                flag_out() << "cannot change protocol while running\n";
                 return 1;
             }
             srv->set_udp(true);
@@ -3245,12 +3261,12 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
         {
             if (is_running)
             {
-                std::cout << "cannot change upstreams while running\n";
+                flag_out() << "cannot change upstreams while running\n";
                 return 1;
             }
             if (i + 1 >= pa.count)
             {
-                std::cout << "-u requires host:port\n";
+                flag_out() << "-u requires host:port\n";
                 return 1;
             }
             // The list is cleared already on edit, so a refusal leaves fewer upstreams and names the one it read.
@@ -3270,12 +3286,12 @@ int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t&
         {
             if (is_running)
             {
-                std::cout << "cannot change target while running\n";
+                flag_out() << "cannot change target while running\n";
                 return 1;
             }
             if (i + 1 >= pa.count)
             {
-                std::cout << "-t requires a target address\n";
+                flag_out() << "-t requires a target address\n";
                 return 1;
             }
             // The same judgment as create's -t, for the same reason.
@@ -3286,13 +3302,13 @@ int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t&
                         socketley::unix_sock::path_refusal(v.substr(5));
                     !why.empty())
                 {
-                    std::cout << "-t: " << why << "\n";
+                    flag_out() << "-t: " << why << "\n";
                     return 1;
                 }
             }
             else if (std::string why = socketley::dial_addr::refusal(v); !why.empty())
             {
-                std::cout << "-t: " << why << "\n";
+                flag_out() << "-t: " << why << "\n";
                 return 1;
             }
             cli->set_target(pa.args[i]);
@@ -3302,7 +3318,7 @@ int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t&
         {
             if (is_running)
             {
-                std::cout << "cannot change protocol while running\n";
+                flag_out() << "cannot change protocol while running\n";
                 return 1;
             }
             cli->set_udp(true);
@@ -3320,7 +3336,7 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
     {
         if (is_running)
         {
-            std::cout << "cannot change " << pa.args[i] << " while running; stop it first\n";
+            flag_out() << "cannot change " << pa.args[i] << " while running; stop it first\n";
             return 1;
         }
         return parse_proxy_gate_flag(proxy, pa, i);
