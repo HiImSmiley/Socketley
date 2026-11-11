@@ -2,6 +2,7 @@
 // The broker on its sockets: listeners for MQTT and for MQTT over WebSocket, TLS in memory buffers, reads from a
 // buffer ring so a connection that says nothing holds no read buffer of its own, and the second tick that drives
 // keep alive, wills, expiry, the files read again and the snapshot.
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -28,6 +29,7 @@
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
 #include "../../shared/loop/write_queue.h"
+#include "../../shared/net/failure_bar.h"
 
 class mqtt_instance;
 class tls_context;
@@ -360,6 +362,8 @@ private:
     uint64_t m_next_tap{1};
 
     uint64_t m_auth_refused{0};
+    // Wrong passwords by address: ten within a quarter of an hour bar it for the rest of it.
+    socketley::failure_bar m_misses{10, std::chrono::minutes(15)};
     uint64_t m_tls_failures{0};
     uint64_t m_ws_refused{0};
     // Twice what deliveries stop at and a packet over, so only replies to a peer's own input can pass it.

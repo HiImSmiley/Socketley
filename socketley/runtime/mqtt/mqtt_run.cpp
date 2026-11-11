@@ -1403,6 +1403,20 @@ void mqtt_run::authenticate(const auth_ask& ask, std::function<void(auth_answer)
     }
     if (ask.password)
     {
+        // An address that keeps guessing is refused the right password too, so an answer tells it nothing; 127.0.0.1,
+        // which the entrance's every client comes from, is not counted.
+        std::string from = ask.peer.substr(0, ask.peer.rfind(':'));
+        if (from == "127.0.0.1")
+            from.clear();
+        if (!from.empty() && m_misses.barred_for(from, std::chrono::steady_clock::now()))
+        {
+            finish(false, reason::bad_user_or_password, {});
+            return;
+        }
+        const auto missed = [this, from] {
+            if (!from.empty())
+                m_misses.missed(from, std::chrono::steady_clock::now());
+        };
         const std::string* hash = ask.username ? m_users.value().hash_of(*ask.username) : nullptr;
         if (hash)
         {
@@ -1412,9 +1426,11 @@ void mqtt_run::authenticate(const auth_ask& ask, std::function<void(auth_answer)
                           [h = *hash, pw = *ask.password, matched] {
                               *matched = socketley::crypto::password_matches(h, pw);
                           },
-                          [this, alive = m_alive, matched, user = *ask.username, finish]() mutable {
+                          [this, alive = m_alive, matched, user = *ask.username, finish, missed]() mutable {
                               if (!*alive)
                                   return;
+                              if (!*matched)
+                                  missed();
                               finish(*matched, *matched ? reason::success : reason::bad_user_or_password,
                                      *matched ? user : std::string());
                           });
@@ -1430,6 +1446,7 @@ void mqtt_run::authenticate(const auth_ask& ask, std::function<void(auth_answer)
                 return;
             }
         }
+        missed();
         finish(false, reason::bad_user_or_password, {});
         return;
     }

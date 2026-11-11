@@ -241,10 +241,12 @@ class WS:
 
 
 class Client:
-    def __init__(self, port, host="127.0.0.1", version=5, tls=None, ws=None, timeout=5.0, server_hostname=None):
+    def __init__(self, port, host="127.0.0.1", version=5, tls=None, ws=None, timeout=5.0, server_hostname=None,
+                 source=None):
         self.version = version
         self.timeout = timeout
-        raw = socket.create_connection((host, port), timeout=timeout)
+        # `source` is the address the broker sees the client come from, for what it counts by address.
+        raw = socket.create_connection((host, port), timeout=timeout, source_address=(source, 0) if source else None)
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         if tls is not None:
             raw = tls.wrap_socket(raw, server_hostname=server_hostname or host)

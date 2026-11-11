@@ -5,6 +5,7 @@
 #
 # What each part would catch:
 #   * a wrong password, an unknown user or a forged token let in, or a right one refused
+#   * a password guessed at without end from one address, or its guesses shutting out another address or the entrance
 #   * mqtt-passwd writing a file the broker does not read, or one others can read
 #   * a users or rules file changed while running and not taken
 #   * a publish the rules refuse delivered anyway, or a subscription widened past what the rules grant
@@ -100,7 +101,7 @@ def guarded(name, fn):
         print("bad %s: %s %s" % (name, type(e).__name__, e))
 
 def code_of(port, version=5, **kw):
-    opts = {k: kw.pop(k) for k in ("tls", "ws") if k in kw}
+    opts = {k: kw.pop(k) for k in ("tls", "ws", "source") if k in kw}
     c = Client(port, version=version, **opts)
     try:
         return c.connect(kw.pop("client_id", ""), **kw)[1]
@@ -314,6 +315,24 @@ if phase == "emptyacl":
             time.sleep(0.2)
         check("an acl file of no rules grants nothing", got, [0x87])
     guarded("emptyacl", emptyacl)
+if phase == "guessing":
+    def guessing():
+        # Ten wrong passwords from one address, and it is told nothing more, the right password included.
+        wrong = [code_of(pa, version=4, client_id="g%d" % n, username="bob", password="guess%d" % n, source="127.0.0.2")
+                 for n in range(10)]
+        check("ten wrong passwords are each answered as a wrong password", wrong, [4] * 10)
+        check("after them the address is refused the right one too",
+              code_of(pa, version=4, client_id="g10", username="bob", password="bobpass22", source="127.0.0.2"), 4)
+        check("a 5.0 client from there as well",
+              code_of(pa, version=5, client_id="g11", username="bob", password="bobpass22", source="127.0.0.2"), 0x86)
+        check("another address signs in with it all the while",
+              code_of(pa, version=4, client_id="g12", username="bob", password="bobpass22", source="127.0.0.3"), 0)
+        check("and so does the entrance's, which every browser comes from",
+              code_of(pa, version=4, client_id="g13", username="bob", password="bobpass22"), 0)
+        many = [code_of(pa, version=4, client_id="h%d" % n, username="bob", password="guess") for n in range(12)]
+        check("whose own wrong passwords bar nobody",
+              (many, code_of(pa, version=4, client_id="h12", username="bob", password="bobpass22")), ([4] * 12, 0))
+    guarded("guessing", guessing)
 PY
 }
 
@@ -324,6 +343,7 @@ sed -i 's|^topic read public/#|topic read granted/now|' "$T/acl"
 tally < <(run reread)
 printf '# every rule taken out\n' > "$T/acl"
 tally < <(run emptyacl)
+tally < <(run guessing)
 
 st=$("$BIN" stats a 2>&1)
 case "$st" in *"auth_refused:"*) ok ;; *) bad "stats count the refused sign-ins" "$st" ;; esac

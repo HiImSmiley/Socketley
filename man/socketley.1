@@ -16693,6 +16693,10 @@ The accounts that sign in with a password, one
 per line, as
 .B socketley mqtt passwd
 writes them. The file is read again within two seconds of a change.
+Ten wrong passwords or tokens from one address within fifteen minutes bar that
+address until the fifteen minutes are over; during that time the right password
+is refused too. 127.0.0.1, which the entrance's clients come from, is not
+counted. Each shard counts for itself.
 .TP
 .BI "\-\-idp " runtime
 The idp runtime whose access tokens, given as the password, sign clients in.
