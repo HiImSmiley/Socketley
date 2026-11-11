@@ -87,6 +87,17 @@ def end_of_input(pid):
         os.close(pidfd)
     return n
 
+# Read off every process's parent in /proc/<pid>/stat, since task/<tid>/children needs CONFIG_PROC_CHILDREN, which Tegra's kernel lacks.
+def children(parent):
+    out = []
+    for e in os.listdir("/proc"):
+        try:
+            if e.isdigit() and int(open("/proc/%s/stat" % e).read().rsplit(")", 1)[1].split()[1]) == parent:
+                out.append(int(e))
+        except (OSError, IndexError, ValueError):
+            pass
+    return out
+
 def arm(load):
     label = "load" if load else "idle"
     name, p = ("slow-load", port + 2) if load else ("slow-idle", port + 3)
@@ -108,8 +119,7 @@ def arm(load):
     if r.returncode != 0:
         print(label, "create failed:", (r.stdout + r.stderr).strip()); d.kill(); d.wait(); return
     time.sleep(0.3)
-    workers = [int(x) for t in os.listdir("/proc/%d/task" % d.pid)
-               for x in open("/proc/%d/task/%s/children" % (d.pid, t)).read().split()]
+    workers = children(d.pid)
     if len(workers) != 1:
         print(label, "workers: %d, not one" % len(workers)); d.kill(); d.wait(); return
     w = workers[0]
