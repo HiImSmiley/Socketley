@@ -5,7 +5,7 @@ Redis-compatible caches, websites with Lua pages and PHP, S3 storage, DNS, sign-
 metrics and MCP servers. Each runtime is one command away, runs in a supervised worker process of its own on an
 io_uring event loop, can be scripted in Lua, and comes back after a reboot.
 
-**[Documentation](https://hiimsmiley.github.io/Socketley/)** — every [runtime](https://hiimsmiley.github.io/Socketley/#/home), [flag](https://hiimsmiley.github.io/Socketley/#/flags), [Lua function](https://hiimsmiley.github.io/Socketley/#/lua) and
+**[Documentation](https://hiimsmiley.github.io/Socketley/)** — every runtime, [flag](https://hiimsmiley.github.io/Socketley/#/flags), [Lua function](https://hiimsmiley.github.io/Socketley/#/lua) and
 [benchmark](https://hiimsmiley.github.io/Socketley/#/bench).
 
 ```bash
