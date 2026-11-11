@@ -11,7 +11,7 @@
 #   distinct CPUs   a server and an idp of two shards each land on four CPUs, not on
 #                   the first two twice -- the second set starts after the first
 #   stats           `stats` says the CPU each shard runs on, not the set
-#   helpers         a worker's other threads keep the daemon's whole set, and the
+#   helpers         a worker's own threads keep the daemon's whole set, and the
 #                   idp counts them for the CPUs it has and not for its loop's one
 #   one shard       a runtime of one shard keeps the set as before
 set -uo pipefail
@@ -55,14 +55,17 @@ PB=$((SL_PORT_BASE+1411))
 "$BIN" create server pc -p $((SL_PORT_BASE+1412)) -s >/dev/null 2>&1
 sleep 1.5
 # Until both idp shards have had a sign-in, since the kernel picks the shard and a pool starts at its first: the
-# threads of every worker other than its loop, counted until there are four or forty sign-ins have gone.
+# threads of every worker other than its loop, counted until there are four or forty sign-ins have gone.  With the
+# right password, because five wrong ones from one address bar it at every shard, and five tries all land on one
+# shard one time in sixteen.
+"$BIN" idp-user pb add hasher --password hasher-password-1 >/dev/null 2>&1 || bad "an account to sign in as is made"
 helper_threads() {
     local w n=0
     for w in $(pgrep -P "$SOCKETLEY_DPID" -x socketley); do n=$((n + $(cat /proc/$w/task/*/comm 2>/dev/null | grep -cx idp-hash || true))); done
     echo "$n"
 }
 for _ in $(seq 1 40); do
-    curl -s -o /dev/null -d 'username=nobody&password=not-the-password&rd=/' "http://127.0.0.1:$PB/login"
+    curl -s -o /dev/null -d 'username=hasher&password=hasher-password-1&rd=/' "http://127.0.0.1:$PB/login"
     [ "$(helper_threads)" -ge 4 ] && break
     sleep 0.1
 done
@@ -75,8 +78,11 @@ for w in $(pgrep -P "$SOCKETLEY_DPID" -x socketley); do
     for t in /proc/$w/task/*; do
         t=${t##*/}
         [ "$t" = "$w" ] && continue
+        comm=$(cat /proc/$w/task/$t/comm 2>/dev/null || true)
+        # io_uring's own workers, which the kernel keeps inside the mask their loop asked for, and no call widens.
+        case "$comm" in iou-*) continue ;; esac
         HELPERS=$((HELPERS+1))
-        [ "$(cat /proc/$w/task/$t/comm 2>/dev/null)" = idp-hash ] && HASHERS=$((HASHERS+1))
+        [ "$comm" = idp-hash ] && HASHERS=$((HASHERS+1))
         [ "$(allowed "$w" "$t")" = "0-3" ] && HELPERS_WIDE=$((HELPERS_WIDE+1))
     done
     case "$loop" in
