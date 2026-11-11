@@ -10,7 +10,8 @@
 # without the piece it covers:
 #   (a) a compiled tight loop ends in a replaced worker that serves again --
 #       red on the old build, which interpreted the loop and stopped it, and
-#       red without the daemon's kill;
+#       red without the daemon's kill; on aarch64 LuaJIT's compiled loop does
+#       reach the hook, so there it is stopped in its own worker at its deadline;
 #   (b) an interpreted runaway that calls C in its loop is stopped by the hook
 #       the signal put on, in the same worker -- red without the signal;
 #   (c) a cache EVAL "while true do end" is stopped and the shard answers in
@@ -138,35 +139,59 @@ fi
 
 T0=$(mono_s)
 ( printf 'spin\n' | timeout 5 nc -q 0 127.0.0.1 "$JIT_PORT" >/dev/null 2>&1 & )
-W1=""
-for _ in $(seq 1 100); do
+if [ "$(uname -m)" = aarch64 ]; then
+    # A hook set from the stop signal is seen by a compiled trace on aarch64, which it never is on x86-64.
+    if wait_log '\[lua dw_jit\] on_message hit its 500ms deadline and was stopped' 5; then pass; else
+        fail "a compiled loop past its deadline is stopped by the hook on aarch64" \
+             "no '[lua dw_jit] on_message hit its 500ms deadline' line in $SOCKETLEY_DLOG"
+    fi
+    T1=$(mono_s)
+    TOOK=$(echo "$T1 - $T0" | bc)
+    echo "  the compiled runaway was stopped after ${TOOK}s"
+    # Not before the 500ms limit, and before limit + grace, past which the daemon would have replaced the worker.
+    if [ "$(echo "$TOOK >= 0.45 && $TOOK < 1.5" | bc)" = "1" ]; then pass; else
+        fail "and after its deadline, before its grace ran out" "stopped after ${TOOK}s"
+    fi
+    OUT=$(say "$JIT_PORT" after)
+    case "$OUT" in
+        *echo:after*) pass ;;
+        *) fail "the stopped runtime serves on" "got: ${OUT:-<nothing>}" ;;
+    esac
     W1=$(worker_on "$JIT_PORT")
-    [ -n "$W1" ] && [ "$W1" != "$W0" ] && break
-    sleep 0.05
-done
-T1=$(mono_s)
-TOOK=$(echo "$T1 - $T0" | bc)
-if [ -n "$W1" ] && [ "$W1" != "$W0" ]; then pass; else
-    fail "a compiled loop past its deadline ends in a new worker" \
-         "dw_jit is still served by pid ${W1:-<none>} (was $W0) after ${TOOK}s"
-fi
-echo "  the compiled runaway's replacement listened after ${TOOK}s"
-# 500ms limit, 1000ms grace, and a second for the scans and the restart.
-if [ "$(echo "$TOOK < 2.5" | bc)" = "1" ]; then pass; else
-    fail "and within limit + grace + 1s" "the replacement was listening after ${TOOK}s"
-fi
-if wait_log "runtime 'dw_jit': on_message did not stop at its 500ms deadline; its worker is replaced"; then pass; else
-    fail "the daemon says which callback it ended and why" \
-         "no 'did not stop at its 500ms deadline' line for dw_jit in $SOCKETLEY_DLOG"
-fi
-OUT=$(say "$JIT_PORT" after)
-case "$OUT" in
-    *echo:after*) pass ;;
-    *) fail "the replaced runtime serves again" "got: ${OUT:-<nothing>}" ;;
-esac
-sleep 2.5   # one health tick, so ls has counted the restart
-if status_of dw_jit | grep -q "(1 restart"; then pass; else
-    fail "ls shows it the way a replaced worker shows" "$(status_of dw_jit)"
+    if [ -n "$W0" ] && [ "$W1" = "$W0" ]; then pass; else
+        fail "in the same worker" "pid ${W1:-<none>}, was $W0"
+    fi
+else
+    W1=""
+    for _ in $(seq 1 100); do
+        W1=$(worker_on "$JIT_PORT")
+        [ -n "$W1" ] && [ "$W1" != "$W0" ] && break
+        sleep 0.05
+    done
+    T1=$(mono_s)
+    TOOK=$(echo "$T1 - $T0" | bc)
+    if [ -n "$W1" ] && [ "$W1" != "$W0" ]; then pass; else
+        fail "a compiled loop past its deadline ends in a new worker" \
+             "dw_jit is still served by pid ${W1:-<none>} (was $W0) after ${TOOK}s"
+    fi
+    echo "  the compiled runaway's replacement listened after ${TOOK}s"
+    # 500ms limit, 1000ms grace, and a second for the scans and the restart.
+    if [ "$(echo "$TOOK < 2.5" | bc)" = "1" ]; then pass; else
+        fail "and within limit + grace + 1s" "the replacement was listening after ${TOOK}s"
+    fi
+    if wait_log "runtime 'dw_jit': on_message did not stop at its 500ms deadline; its worker is replaced"; then pass; else
+        fail "the daemon says which callback it ended and why" \
+             "no 'did not stop at its 500ms deadline' line for dw_jit in $SOCKETLEY_DLOG"
+    fi
+    OUT=$(say "$JIT_PORT" after)
+    case "$OUT" in
+        *echo:after*) pass ;;
+        *) fail "the replaced runtime serves again" "got: ${OUT:-<nothing>}" ;;
+    esac
+    sleep 2.5   # one health tick, so ls has counted the restart
+    if status_of dw_jit | grep -q "(1 restart"; then pass; else
+        fail "ls shows it the way a replaced worker shows" "$(status_of dw_jit)"
+    fi
 fi
 
 # ── (b) an interpreted runaway is stopped in place ──────────────────────────
