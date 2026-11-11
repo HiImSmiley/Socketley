@@ -60,6 +60,20 @@ The daemon then runs as the systemd service `socketley`. Root and members of the
 
 `socketley --help` and `man socketley` cover the same ground as the documentation, offline.
 
+## Built in: the pages people use
+
+The runtimes bring their own web applications, served from the same binary, with nothing else to install:
+
+- **Dashboard** (`socketley dashboard`): every runtime live, with its connections, throughput and logs, history and
+  alerts from a metrics runtime, and a Domains view of every certificate, every entrance route and the DNS zones, whose
+  records it edits.
+- **Storage**: a media library over the S3 buckets, with thumbnails, films grouped by season that play on and remember
+  where they stopped, pictures by month, share links, git repositories, and a WebDAV drive for file managers and phones.
+- **Webmail**: a mail client in the browser for the `mail` runtime, with conversations, search, attachments, drafts,
+  sending that can be undone or scheduled, signatures, an out-of-office answer and Sieve filters.
+- **Sign-in and account** (`idp`): the sign-in every other page uses, and an account page for passwords, the second
+  step and app passwords for mail apps.
+
 ## In your own program
 
 Every runtime also runs inside an application, with no daemon ([reference](https://hiimsmiley.github.io/Socketley/#/man/c-sdk)): the `socketley-dev` package carries `libsocketley.so`,
