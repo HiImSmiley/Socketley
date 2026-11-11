@@ -51,7 +51,7 @@ Each runtime's headline result against the server people run instead; method and
 - sync: 2.1× against rclone (first copy, 2000 files of 64 KiB and 50 of 1 MiB)
 - idp: 24.9× against Keycloak (refresh token, 256 clients)
 - mail: 4.4× against Postfix 3.10.6 + Dovecot (SMTP in, 4 KiB messages, 64 connections, 10 a connection)
-- mcp: 29.4× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
+- mcp: 31.9× against MCP Python SDK 2.3.0 (uvicorn 0.54.0) (tools/call add(a, b), 64 sessions)
 - client: 1.1× against Go (request-answer: 1 connection, 64 B each way)
 
 ## Where to go next

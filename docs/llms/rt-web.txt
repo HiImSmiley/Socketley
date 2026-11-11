@@ -94,15 +94,15 @@ How it was measured: wrk 8 threads, 4 s a run; each server on one core, wrk (8 t
 
 ### Dynamic pages: the same page in Lua and in PHP
 
-nginx + php-fpm, socketley + php-fpm, 5 passes, 2026-11-10, socketley c62f595b.
+nginx + php-fpm, socketley + php-fpm, 5 passes, 2026-11-11, socketley 2b8768a1.
 
 | case | socketley pages | nginx + php-fpm | socketley + php-fpm | socketley vs nginx + php-fpm | socketley vs socketley + php-fpm |
 |---|---|---|---|---|---|
-| hello: a tiny page from the query, keep-alive, 64 connections | 101 K req/s (1.00 cores) | 13 K req/s (1.00 cores) | 31 K req/s (1.00 cores) | 7.41× (6.61–8.00) | 3.25× (2.94–3.45) |
-| a template of 50 items, 4 KiB, keep-alive, 64 connections | 27 K req/s (1.00 cores) | 9.2 K req/s (0.97 cores) | 20 K req/s (1.00 cores) | 2.79× (2.48–3.21) | 1.32× (1.20–1.43) |
-| JSON of 20 fields, keep-alive, 64 connections | 63 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 28 K req/s (1.00 cores) | 4.72× (4.10–5.31) | 2.14× (1.94–2.36) |
-| a form POST of 10 fields, keep-alive, 64 connections | 64 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 27 K req/s (0.99 cores) | 5.17× (4.57–5.85) | 2.31× (2.15–2.57) |
-| hello, a connection per request, 32 at once | 29 K req/s (1.00 cores) | 12 K req/s (0.98 cores) | 14 K req/s (0.99 cores) | 2.44× (2.23–2.72) | 2.04× (1.96–2.12) |
+| hello: a tiny page from the query, keep-alive, 64 connections | 129 K req/s (1.00 cores) | 14 K req/s (1.00 cores) | 30 K req/s (1.00 cores) | 9.53× (8.81–10.13) | 4.25× (4.01–4.52) |
+| a template of 50 items, 4 KiB, keep-alive, 64 connections | 47 K req/s (1.00 cores) | 9.2 K req/s (0.97 cores) | 20 K req/s (1.00 cores) | 4.83× (4.38–5.46) | 2.24× (2.09–2.41) |
+| JSON of 20 fields, keep-alive, 64 connections | 97 K req/s (1.00 cores) | 12 K req/s (0.96 cores) | 28 K req/s (1.00 cores) | 7.62× (6.67–8.19) | 3.44× (3.15–3.56) |
+| a form POST of 10 fields, keep-alive, 64 connections | 102 K req/s (1.00 cores) | 12 K req/s (0.97 cores) | 27 K req/s (1.00 cores) | 8.00× (7.10–9.01) | 3.71× (3.35–4.02) |
+| hello, a connection per request, 32 at once | 41 K req/s (1.00 cores) | 12 K req/s (0.98 cores) | 14 K req/s (0.99 cores) | 3.58× (3.19–3.81) | 2.92× (2.90–3.10) |
 
 How it was measured: wrk 8 threads, 6 s a run; every process of each arm on the same one core (php-fpm's workers too), wrk (8 threads) on 20 others. socketley create web --lua-pages runs each page as a .lua file in its own LuaJIT; nginx (one worker) hands the same page as a .php file to php-fpm (pm static, 8 workers, OPcache on as PHP ships it, JIT off) over a unix socket; the third arm is the same php-fpm behind socketley create web --backend fastcgi://. Every page answers the same bytes in each language, checked before each row. The kernel keeps at most 2,048 connections in TIME-WAIT for every arm (net.ipv4.tcp_max_tw_buckets, 131,072 by default), so a pass with a connection per request does not wait out the closed connections of the one before.
 

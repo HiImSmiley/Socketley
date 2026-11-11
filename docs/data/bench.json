@@ -1,5 +1,5 @@
 {
- "updated": "2026-11-10",
+ "updated": "2026-11-11",
  "box": {
   "cpu": "AMD Ryzen 9 9950X3D (KVM guest)",
   "vcpus": 28,
@@ -3574,127 +3574,127 @@
     "MCP TypeScript SDK 1.32.2 (Node 24.22.1)"
    ],
    "tool": "mcpgen (Streamable HTTP, 2025-11-25), 64 sessions, 4s a run",
-   "commit": "0174a7a1",
+   "commit": "2b8768a1",
    "passes": 3,
-   "date": "2026-11-10",
+   "date": "2026-11-11",
    "rows": [
     {
      "name": "initialize + tools/list, a new session each, 64 at once",
      "v": [
-      71914.0,
-      1149.0,
-      1641.0
+      73703.0,
+      1153.0,
+      1661.0
      ],
      "cpu": [
       0.967,
-      0.995,
-      0.996
+      0.996,
+      0.995
      ],
      "ccpu": [
-      8.196,
-      0.19,
-      0.276
+      8.255,
+      0.191,
+      0.275
      ],
      "r": [
       [
-       63.163,
-       62.261,
-       63.255
+       63.311,
+       63.288,
+       65.035
       ],
       [
-       43.779,
-       43.543,
-       46.586
+       44.118,
+       43.96,
+       47.73
       ]
      ]
     },
     {
      "name": "tools/call add(a, b), 64 sessions",
      "v": [
-      151768.0,
-      5148.0,
-      7043.0
+      159481.0,
+      4995.0,
+      7178.0
      ],
      "cpu": [
-      0.984,
+      0.978,
       1.0,
       0.999
      ],
      "ccpu": [
-      6.959,
-      0.276,
-      0.346
+      7.121,
+      0.259,
+      0.353
      ],
      "r": [
       [
-       29.438,
-       27.956,
-       31.101
+       31.929,
+       31.09,
+       32.221
       ],
       [
-       21.55,
-       21.076,
-       21.813
+       22.22,
+       21.844,
+       22.466
       ]
      ]
     },
     {
      "name": "tools/call returning 16 KiB of text, 64 sessions",
      "v": [
-      54816.0,
-      5198.0,
-      6668.0
+      54772.0,
+      5369.0,
+      6664.0
      ],
      "cpu": [
-      0.901,
-      1.001,
-      1.0
+      0.898,
+      1.0,
+      0.999
      ],
      "ccpu": [
-      11.001,
-      0.924,
-      0.993
+      10.933,
+      0.937,
+      0.972
      ],
      "r": [
       [
-       10.616,
-       10.43,
-       10.904
+       10.194,
+       10.044,
+       10.412
       ],
       [
-       8.209,
-       8.1,
-       8.416
+       8.256,
+       8.189,
+       8.305
       ]
      ]
     },
     {
      "name": "resources/read, 1 KiB of text, 64 sessions",
      "v": [
-      160816.0,
-      5431.0,
-      7375.0
+      165637.0,
+      5481.0,
+      7541.0
      ],
      "cpu": [
-      0.95,
+      0.949,
       1.001,
       0.999
      ],
      "ccpu": [
-      8.213,
-      0.336,
-      0.396
+      8.275,
+      0.335,
+      0.4
      ],
      "r": [
       [
-       29.833,
-       28.246,
-       30.197
+       30.219,
+       27.636,
+       32.14
       ],
       [
-       21.749,
-       21.201,
-       22.164
+       21.965,
+       21.6,
+       22.191
       ]
      ]
     }
@@ -4638,7 +4638,7 @@
    "unit": "ops/s",
    "better": "higher",
    "pin": "each client on one core, the socketley cache on another",
-   "note": "A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, the replies counted with on_read and view:lines() as redis-benchmark counts them in C, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley's runtime holds four connections, as redis-benchmark's one thread does, and the cache is the bound under socketley's client at a whole core, where redis-benchmark is at its own."
+   "note": "A socketley client runtime sending 32 INCR commands as one message and the next 32 on the 32nd reply, the replies counted with on_read and view:lines() as redis-benchmark counts them in C, against redis-benchmark -P 32 with one thread, both to the same socketley cache on its own core, counted by the cache's own counter. At one connection both wait on the round trip; at four, socketley's runtime holds four connections, as redis-benchmark's one thread does, and the cache is the bound under socketley's client at a whole core, where redis-benchmark is at its own. The work per batch is the same with both clients, while on this VM the cache spends more kernel time per command under socketley's, 105 ns against 72; on a second VM the four-connection row reads 1.08 to 1.13x."
   },
   {
    "id": "client-shell",
@@ -4766,157 +4766,157 @@
     "socketley + php-fpm"
    ],
    "tool": "wrk 8 threads, 6 s a run",
-   "commit": "c62f595b",
+   "commit": "2b8768a1",
    "passes": 5,
-   "date": "2026-11-10",
+   "date": "2026-11-11",
    "rows": [
     {
      "name": "hello: a tiny page from the query, keep-alive, 64 connections",
      "v": [
-      100750.0,
-      13469.0,
-      30849.0
+      128741.0,
+      13528.0,
+      30085.0
      ],
      "cpu": [
       1.0,
-      0.999,
-      0.998
+      0.998,
+      0.996
      ],
      "ccpu": [
-      0.602,
-      0.26,
-      0.285
+      0.8,
+      0.264,
+      0.286
      ],
      "r": [
       [
-       7.408,
-       6.611,
-       8.004
+       9.531,
+       8.807,
+       10.127
       ],
       [
-       3.248,
-       2.938,
-       3.454
+       4.245,
+       4.006,
+       4.518
       ]
      ]
     },
     {
      "name": "a template of 50 items, 4 KiB, keep-alive, 64 connections",
      "v": [
-      26967.0,
-      9151.0,
-      20153.0
+      46834.0,
+      9153.0,
+      20398.0
      ],
      "cpu": [
       1.0,
-      0.969,
-      1.0
+      0.967,
+      0.996
      ],
      "ccpu": [
-      0.197,
-      0.238,
-      0.207
+      0.298,
+      0.237,
+      0.211
      ],
      "r": [
       [
-       2.786,
-       2.482,
-       3.215
+       4.833,
+       4.385,
+       5.456
       ],
       [
-       1.316,
-       1.197,
-       1.429
+       2.244,
+       2.086,
+       2.412
       ]
      ]
     },
     {
      "name": "JSON of 20 fields, keep-alive, 64 connections",
      "v": [
-      62722.0,
-      12400.0,
-      28289.0
+      97243.0,
+      12361.0,
+      28267.0
      ],
      "cpu": [
-      0.999,
+      0.998,
       0.965,
-      0.996
+      0.998
      ],
      "ccpu": [
-      0.373,
-      0.241,
-      0.27
+      0.594,
+      0.24,
+      0.266
      ],
      "r": [
       [
-       4.72,
-       4.1,
-       5.309
+       7.621,
+       6.67,
+       8.186
       ],
       [
-       2.143,
-       1.935,
-       2.359
+       3.44,
+       3.152,
+       3.555
       ]
      ]
     },
     {
      "name": "a form POST of 10 fields, keep-alive, 64 connections",
      "v": [
-      64005.0,
-      11822.0,
-      27232.0
+      102308.0,
+      12033.0,
+      27106.0
      ],
      "cpu": [
-      1.0,
-      0.962,
-      0.995
+      0.999,
+      0.967,
+      0.998
      ],
      "ccpu": [
-      0.402,
-      0.237,
-      0.26
+      0.607,
+      0.245,
+      0.255
      ],
      "r": [
       [
-       5.165,
-       4.573,
-       5.854
+       8.001,
+       7.103,
+       9.005
       ],
       [
-       2.313,
-       2.15,
-       2.566
+       3.711,
+       3.352,
+       4.022
       ]
      ]
     },
     {
      "name": "hello, a connection per request, 32 at once",
      "v": [
-      29473.0,
-      11831.0,
-      14222.0
+      40899.0,
+      11821.0,
+      13894.0
      ],
      "cpu": [
       0.998,
-      0.98,
+      0.983,
       0.995
      ],
      "ccpu": [
-      1.242,
-      0.581,
-      0.667
+      1.49,
+      0.583,
+      0.648
      ],
      "r": [
       [
-       2.44,
-       2.233,
-       2.717
+       3.581,
+       3.192,
+       3.81
       ],
       [
-       2.035,
-       1.96,
-       2.121
+       2.919,
+       2.903,
+       3.101
       ]
      ]
     }
