@@ -617,7 +617,7 @@ async function pageExamples(C) {
 function notFound(C) { C.append(el('div', { class: 'empty' }, ico('search', 'big'), el('h3', { text: 'Nothing here' }), el('p', {}, el('a', { href: '#/', class: 'ln', text: 'Back to the overview' })))); }
 
 const CONTENT = {
-  install: ['Install', 'Start', 'From source, the install script or a Debian package; the daemon then runs as a systemd service.'],
+  install: ['Install', 'Start', 'The install script, a Debian package or a build from source; the daemon then runs as a systemd service, and socketley update brings the next release.'],
   tour: ['Ten-minute tour', 'Start', 'Make a server, a cache and a proxy, script one of them, and look at all three.'],
   concepts: ['Concepts', 'Start', 'The daemon, its runtimes and the few rules every one of them follows.'],
   how: ['How it works', 'Start', 'What happens, and where, from the command you type to the answer a client gets.'],

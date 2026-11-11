@@ -9,7 +9,7 @@ Every page below is plain Markdown. llms-full.txt is all of them in one file (la
 ## Start
 
 - [socketley](llms/index.txt): One Linux daemon and CLI that runs your servers, proxies, caches, storage, databases, DNS, sign-in, MQTT, mail, metrics, tunnels and MCP: each a runtime made with one command.
-- [Install](llms/install.txt): From source, the install script or a Debian package; the daemon then runs as a systemd service.
+- [Install](llms/install.txt): The install script, a Debian package or a build from source; the daemon then runs as a systemd service, and socketley update brings the next release.
 - [Ten-minute tour](llms/tour.txt): Make a server, a cache and a proxy, script one of them, and look at all three.
 - [Concepts](llms/concepts.txt): The daemon, its runtimes and the few rules every one of them follows.
 - [How it works](llms/how.txt): What happens, and where, from the command you type to the answer a client gets.

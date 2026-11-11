@@ -1,14 +1,27 @@
-<p>socketley runs on Linux 5.19 or newer, on x86_64 and aarch64. Install it one of four ways, join the group, then check it.</p>
+<p>socketley runs on Linux 5.19 or newer. The release packages are for amd64; from source it builds on x86_64 and aarch64. Install it one of four ways, join the group, then check it.</p>
 
 <h2>A release package</h2>
 <pre class="code">curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh</pre>
-<p>Installs the newest release <code>.deb</code>, asking before each missing dependency (ffmpeg is offered for the storage runtime's thumbnails and video). If the package was built for a newer distribution than yours, the script stops without changing anything.</p>
+<p>Installs the newest release's <code>.deb</code>, asking before each missing dependency (ffmpeg is offered for the storage runtime's thumbnails and video). Where socketley is installed already, it offers to upgrade or remove it. If the package does not fit the machine, the script stops without changing anything.</p>
 <table class="kv">
 <tr><th>Option</th><th>Does</th></tr>
 <tr><td><code>--deb FILE</code></td><td>Installs a package you have.</td></tr>
 <tr><td><code>--yes</code></td><td>Takes every default.</td></tr>
 <tr><td><code>--uninstall</code></td><td>Removes socketley.</td></tr>
 </table>
+<p>A release has two packages, for Debian, Ubuntu and any other distribution with glibc 2.35 or newer: everything but the C library is linked in, so one build serves them all.</p>
+<table class="kv">
+<tr><th>Package</th><th>Holds</th></tr>
+<tr><td><code>socketley_0.2.0_amd64.deb</code></td><td>The binary, the manual, the interactive help and the systemd service. This is what <code>install.sh</code> installs.</td></tr>
+<tr><td><code>socketley-dev_0.2.0_amd64.deb</code></td><td>The <a href="#/sdk">SDK</a>: <code>libsocketley.so</code>, <code>socketley/capi.h</code> and a pkg-config file. Only for programs that run runtimes themselves.</td></tr>
+</table>
+
+<h2>Updating</h2>
+<pre class="code">socketley update --check      <i># what is installed, and the newest release</i>
+sudo socketley update         <i># installs the newest release and restarts the service</i></pre>
+<p>The package is checked against the SHA-256 GitHub keeps of it, installed with apt, and the service restarted, which brings back every runtime that was running. <code>--list</code> lists the releases, <code>--to VERSION</code> installs one, older or newer, and <code>--deb FILE</code> installs a package already on the machine.</p>
+<div class="callout"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg><div>The numbering started over at 0.2.0. Coming from a 1.x release, <code>socketley update</code> takes 1.x for the newer one: install 0.2.0 with <code>install.sh</code> or <code>sudo socketley update --to 0.2.0</code>.</div></div>
+<p>A socketley built from a clone is updated by the clone's <code>bash scripts/update.sh</code>: it pulls, builds, swaps the binary and restarts, and puts the old binary back if the new one does not come up.</p>
 
 <h2>From source, in one step</h2>
 <pre class="code">git clone https://github.com/HiImSmiley/Socketley
@@ -38,10 +51,10 @@ make -C make config=release_x64 -j$(nproc)</pre></li>
 </ol>
 <p>Without installing, <code>./bin/Release/socketley daemon &amp;</code> starts a development daemon on <code>/tmp/socketley.sock</code> with state under your home directory; see <a href="#/env">environment &amp; files</a>.</p>
 
-<h2>A Debian package of your own</h2>
-<pre class="code">bash packaging/build-deb.sh
-sudo apt install ./socketley_*.deb</pre>
-<p>Build it on the release it is for: a package built on Ubuntu 24.04 does not install on Debian 12.</p>
+<h2>Debian packages of your own</h2>
+<pre class="code">bash packaging/build-deb.sh 0.2.0
+sudo dpkg -i socketley_0.2.0_amd64.deb</pre>
+<p>Run it in a tree prepared as above (<code>premake5 gmake2</code>): it builds Release from clean, for this machine's architecture, and writes <code>socketley-dev</code> beside it. A package built on a newer distribution can need a newer glibc than an older one has, so build on the oldest one you install to.</p>
 
 <h2>Join the socketley group</h2>
 <pre class="code">sudo usermod -aG socketley $USER</pre>

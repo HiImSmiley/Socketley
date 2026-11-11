@@ -59,7 +59,7 @@ Look in this order:
 
 ## Restarts and upgrades
 
-- **A package upgrade restarts the service** if it was running, onto the new binary. Restarting the daemon stops every worker, so connections close for the moment it takes; the runtimes then come back as they were.
+- **A package upgrade restarts the service** if it was running, onto the new binary; `sudo socketley update` installs the newest release that way (see [Install](install.txt)). Restarting the daemon stops every worker, so connections close for the moment it takes; the runtimes then come back as they were.
 - **A worker never outlives its daemon.** If the daemon crashes, systemd starts it again after five seconds.
 - **One runtime alone**: `socketley restart name`. Other runtimes are not touched.
 
