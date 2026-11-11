@@ -37,6 +37,12 @@ echo "=== Integration: a second daemon does not adopt a live daemon's runtimes =
 
 # Reported rather than silent, because a check that quietly does not run is the
 # failure mode this suite has been paying down.
+# The default path is the installed daemon's once /usr/bin/socketley exists and its socket is ours to use, as paths.cpp decides.
+if [ -x /usr/bin/socketley ] && [ -r /run/socketley/socketley.sock ] && [ -w /run/socketley/socketley.sock ]; then
+    echo "  SKIP: the default path here is the installed daemon's /run/socketley/socketley.sock,"
+    echo "        and this file will not start a daemon on a path it does not own."
+    exit 0
+fi
 if [ -n "$(daemon_pids "$DEFAULT_SOCK")" ]; then
     echo "  SKIP: something is already serving $DEFAULT_SOCK (pid$(daemon_pids "$DEFAULT_SOCK"))."
     echo "        This file has to start a daemon on the default path -- that is the"
