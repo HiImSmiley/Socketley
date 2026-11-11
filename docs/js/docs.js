@@ -54,7 +54,7 @@ const NAV = [
   ['Start', [['', 'Overview', 'home'], ['install', 'Install', 'download'], ['tour', 'Ten-minute tour', 'rocket'], ['concepts', 'Concepts', 'layers'], ['how', 'How it works', 'flow']]],
   ['Performance', [['bench', 'Benchmarks', 'bars']]],
   ['Runtimes', RT.map(r => ['rt/' + r[0], r[0], r[0]])],
-  ['Guides', [['lua', 'Lua scripting', 'code'], ['deploy', 'Deployment', 'shield'], ['operate', 'Operating it', 'eye'], ['cluster', 'Cluster', 'nodes'], ['sdk', 'C++ SDK', 'pkg'], ['examples', 'Examples', 'folder']]],
+  ['Guides', [['lua', 'Lua scripting', 'code'], ['deploy', 'Deployment', 'shield'], ['operate', 'Operating it', 'eye'], ['cluster', 'Cluster', 'nodes'], ['sdk', 'SDK: C, C++, Rust, Node', 'pkg'], ['examples', 'Examples', 'folder']]],
   ['Reference', [['cli', 'CLI', 'term'], ['flags', 'All flags', 'list'], ['env', 'Environment & files', 'gear'], ['man', 'Manual', 'book']]],
 ];
 const TITLES = Object.fromEntries(NAV.flatMap(g => g[1]).map(([h, t]) => [h, t]));
@@ -625,7 +625,7 @@ const CONTENT = {
   deploy: ['Deployment', 'Guide', 'Running socketley on a machine that matters: the service, permissions, TLS, state, backups and limits.'],
   operate: ['Operating it', 'Guide', 'Is it running, where the log is, why a runtime failed, and what blocks it.'],
   cluster: ['Cluster', 'Guide', 'Daemons on several machines that see each other\'s runtimes, and the opt-in Raft mode.'],
-  sdk: ['C++ SDK', 'Guide', 'Control a daemon, embed the engine, or attach a process of your own to a daemon.'],
+  sdk: ['SDK: C, C++, Rust, Node', 'Guide', 'Any runtime inside your own program, with or without a daemon, from C, C++, Rust or Node; or a daemon controlled from one.'],
   cli: ['CLI', 'Reference', 'Every command socketley takes, with its options.'],
   env: ['Environment & files', 'Reference', 'The variables the daemon and the CLI read, and where everything lives on disk.'],
 };

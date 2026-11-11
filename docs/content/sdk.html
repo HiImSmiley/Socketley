@@ -1,3 +1,138 @@
-<p>The C++ SDK in <code>sdk/include/linux/socketley/</code> has three tiers. Examples are in <code>sdk/examples</code>, and the test suite builds each one.</p>
-<x-man s="c-sdk"></x-man>
+<p>Every runtime type also runs inside a program of your own, from C, Rust, Node or any language that can call C. Its MCP tools, web paths, connections and cache commands can be functions of the program. No daemon is needed. For C++ there are also headers that control a running daemon, or list your own process in it.</p>
+
+<table class="kv">
+<tr><th>You want</th><th>Use</th><th>From</th></tr>
+<tr><td>Any of the 15 runtimes inside your program</td><td><code>socketley/capi.h</code> in <code>libsocketley.so</code>, package <code>socketley-dev</code></td><td>C, Rust, Node, any language that calls C</td></tr>
+<tr><td>The engine in C++, with C++ hooks</td><td>Tier 2: <code>server.h</code>, <code>cache.h</code>, <code>any_runtime.h</code>, … and <code>libsocketley_sdk.a</code></td><td>C++, built from source</td></tr>
+<tr><td>To drive a running daemon</td><td>Tier 1: <code>control.h</code>, header-only</td><td>C++17</td></tr>
+<tr><td>Your own process in <code>socketley ls</code></td><td>Tier 3: <code>attach.h</code>, header-only</td><td>C++17</td></tr>
+</table>
+
+<h2>The library</h2>
+<p>Each release has two packages for amd64: <code>socketley</code> is the daemon, <code>socketley-dev</code> the SDK. The SDK package holds <code>libsocketley.so</code>, the header <code>socketley/capi.h</code> and a pkg-config file. It needs no daemon on the machine.</p>
+<pre class="code">sudo apt install ./socketley-dev_0.2.0_amd64.deb      <i># from the release's assets</i>
+cc app.c $(pkg-config --cflags --libs socketley)</pre>
+<p>From a checkout, build the <code>socketley_shared</code> target in <code>make/</code>; then <code>sdk/socketley-config --shared --cflags --libs</code> gives the flags.</p>
+
+<h3>A smaller library</h3>
+<p><code>libsocketley.so</code> holds all fifteen runtime types. A library of only the ones you use is built from a checkout: an MCP server alone is about 13 MB rather than 32.</p>
+<pre class="code">scripts/premake5 gmake --sdk-runtimes=mcp,web
+cd make &amp;&amp; make clean &amp;&amp; make socketley_shared</pre>
+<p>Asking such a library for another type is refused by name.</p>
+
+<h2>C</h2>
+<p>An <b>engine</b> is one thread with one io_uring ring; the runtimes created on it share them, and a program may have several. A runtime takes a type, a name and the flags <code>socketley create</code> takes. The engine takes none of the program's signals, writes nothing to its stdout, and answers with return values.</p>
+<pre class="code">#include &lt;socketley/capi.h&gt;
+
+static void open_thread(void* user, skl_mcp_call* call,
+                        const char* args_json, const char* caller)
+{
+    skl_mcp_reply(call, "opened", 0);   /* now, or later from any thread */
+}
+
+char* err = NULL;
+skl_engine* e = skl_engine_new(&amp;err);
+skl_runtime* site = skl_runtime_create(e, "web", "site",
+                        "-p 8080 --root /srv/site", &amp;err);
+skl_runtime_start(site, &amp;err);
+
+skl_runtime* tools = skl_runtime_create(e, "mcp", "tools",
+                        "-p 9600 --anonymous", &amp;err);
+skl_mcp_tool(tools, "open_thread", "Opens a thread.", NULL,
+             open_thread, NULL, &amp;err);
+skl_runtime_start(tools, &amp;err);</pre>
+<ul>
+<li><b>Threads.</b> Calls may come from any thread and block until done. A callback runs on the engine's thread and must return quickly; work that takes time goes to a thread of yours, which answers from there.</li>
+<li><b>Errors.</b> A function that takes <code>char** err</code> sets it to the reason when it fails; give that text to <code>skl_free</code>.</li>
+<li><b>Connections.</b> A connection is a number never given to another, so one that has gone cannot be mistaken for a new one. A client runtime's one stream is always <code>1</code>.</li>
+<li><b>The other runtimes</b> (storage, dns, idp, …) are reached over their own protocol on their port, as any client reaches them.</li>
+</ul>
+<table class="kv">
+<tr><th>Functions</th><th>For</th></tr>
+<tr><td><code>skl_engine_new</code>, <code>skl_engine_free</code>, <code>skl_version</code>, <code>skl_free</code></td><td>The engine, and the texts the interface returns.</td></tr>
+<tr><td><code>skl_runtime_create</code>, <code>_start</code>, <code>_stop</code>, <code>_stats</code>, <code>_free</code></td><td>A runtime of any type, with the flags of <code>socketley create</code>.</td></tr>
+<tr><td><code>skl_mcp_tool</code>, <code>skl_mcp_reply</code></td><td>A tool of an <code>mcp</code> runtime as a C function, answered exactly once.</td></tr>
+<tr><td><code>skl_on_connect</code>, <code>skl_on_disconnect</code>, <code>skl_on_message</code>, <code>skl_send</code></td><td>A <code>server</code>'s or <code>client</code>'s connections; <code>skl_send</code> works from any thread.</td></tr>
+<tr><td><code>skl_web_handler</code>, <code>skl_web_reply</code></td><td>A path of a <code>web</code> runtime and all under it, before any file.</td></tr>
+<tr><td><code>skl_cache_command</code></td><td>One command of a <code>cache</code>'s text protocol, in the process.</td></tr>
+</table>
+<p>The header, <code>sdk/include/linux/socketley/capi.h</code>, says what each one takes and returns.</p>
+
+<h2>Rust</h2>
+<p>The crate in <code>sdk/rust</code> wraps the C interface. It links <code>libsocketley.so</code> from the system's library path, or from <code>SOCKETLEY_LIB_DIR</code> for a checkout's build. A <code>ToolCall</code> may be moved to any thread or task; one dropped unanswered answers as failed.</p>
+<p><code>sdk/rust/examples/mcp_tool.rs</code>, run with <code>cargo run --example mcp_tool -- 9600</code>:</p>
+<pre class="code">use std::{env, thread, time::Duration};
+
+fn main() -&gt; Result&lt;(), socketley::Error&gt; {
+    let port = env::args().nth(1).unwrap_or_else(|| "9600".into());
+    let engine = socketley::Engine::new()?;
+    let mut tools = engine.runtime("mcp", "tools", &amp;format!("-p {port} --anonymous"))?;
+
+    // Answers at once, on the engine's thread.
+    tools.tool("echo", "Gives its arguments back.", None, |call| {
+        let text = format!("args {}", call.args());
+        call.reply(&amp;text);
+    })?;
+
+    // Work that takes time goes to a thread of the program's.
+    tools.tool("later", "Answers from another thread.", None, |call| {
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            call.reply("from a thread");
+        });
+    })?;
+
+    tools.tool("failing", "Fails.", None, |call| call.fail("it broke"))?;
+    tools.tool("silent", "Forgets to answer.", None, |_call| {})?;
+
+    tools.start()?;
+    println!("READY {}", socketley::version());
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
+}</pre>
+<p><code>on_connect</code>, <code>on_disconnect</code>, <code>on_message</code> and <code>send</code> are a server's and client's (<code>echo_server.rs</code>), <code>handle</code> a web runtime's and <code>command</code> a cache's (<code>web_app.rs</code>). To build them against a checkout:</p>
+<pre class="code">SOCKETLEY_LIB_DIR=$PWD/bin/Release cargo build --examples --manifest-path sdk/rust/Cargo.toml</pre>
+
+<h2>Node</h2>
+<p>The package in <code>sdk/node</code> wraps the C interface; its install script builds the addon with node-gyp against <code>libsocketley.so</code>, or the one in <code>SOCKETLEY_LIB_DIR</code>. A handler is an ordinary function on Node's thread, and may be async: what it returns is the answer, and a throw is a failure (a 500 from a web handler).</p>
+<p><code>sdk/node/examples/app.js</code>, a program with its own website, API, cache and MCP tools:</p>
+<pre class="code">// A program with its own website, API, cache and MCP tools: `node app.js 8080 ./public`, then
+//   curl localhost:8080/api/count
+//   claude mcp add --transport http app http://127.0.0.1:9600/mcp
+const { Engine } = require('socketley');
+
+const port = Number(process.argv[2] || 8080);
+const root = require('path').resolve(process.argv[3] || '.');
+
+const engine = new Engine();
+const kv = engine.runtime('cache', 'kv', `-p ${port + 1}`).start();
+kv.command('set count 0');
+
+const site = engine.runtime('web', 'site', `-p ${port} --root ${root}`);
+site.handle('/api/count', () =&gt; kv.command('incr count'));
+site.start();
+
+const tools = engine.runtime('mcp', 'tools', '-p 9600 --anonymous');
+tools.tool('count', { description: 'How often /api/count was asked.' }, () =&gt; kv.command('get count'));
+tools.start();
+
+process.on('SIGTERM', () =&gt; engine.close());
+process.on('SIGINT', () =&gt; engine.close());</pre>
+<p><code>on("connect"|"disconnect"|"message")</code> and <code>send</code> are a server's and client's, <code>handle</code> a web runtime's and <code>command</code> a cache's. A refused flag is a thrown error. The types are in <code>sdk/node/index.d.ts</code>.</p>
+
+<h2>C++</h2>
+<p>The C++ headers in <code>sdk/include/linux/socketley/</code> come in three tiers. Their examples are in <code>sdk/examples</code>, and the test suite builds each one.</p>
+<ul>
+<li><b>Tier 1, <code>control.h</code></b>: create, start, stop and query the runtimes of a running daemon, over the same socket the CLI uses. Header-only.</li>
+<li><b>Tier 2, the engine</b>: <code>server.h</code>, <code>client.h</code>, <code>proxy.h</code> and <code>cache.h</code> with C++ hooks, and <code>any_runtime.h</code> for every other type, linked with <code>libsocketley_sdk.a</code>.</li>
+<li><b>Tier 3, <code>attach.h</code></b>: registers your own process with a running daemon, so <code>socketley ls</code>, <code>stats</code> and <code>ps</code> show it. Header-only.</li>
+</ul>
+<pre class="code">socketley::any_runtime site("web", "site", "-p 8080 --root /srv/site --lua-pages");
+if (!site.start()) return 1;</pre>
+
+<h2>The runtimes are Linux only</h2>
+<p>The engine is built on io_uring, so the runtimes run on Linux, with or without the daemon. For Windows and macOS there are header-only clients, <code>ws_client.h</code> and <code>cache_client.h</code>, which reach a socketley on Linux over the network.</p>
+
+<h2>In the manual</h2>
 <x-man s="c-sdk" subs-only></x-man>
