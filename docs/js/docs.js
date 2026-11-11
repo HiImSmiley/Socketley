@@ -632,7 +632,8 @@ const CONTENT = {
 
 // ─── routing ───────────────────────────────────────────────────────────────────────────────────────────────────────
 async function route() {
-  const h = decodeURIComponent(location.hash.replace(/^#\/?/, ''));
+  // The overview is the empty route; #/home and #/index name it as well, as a link written by hand would.
+  const h = decodeURIComponent(location.hash.replace(/^#\/?/, '')).replace(/^(home|index)(\.html)?$/, '');
   const parts = h.split('/');
   const C = $('#content'); C.textContent = '';
   $('#side').classList.remove('open');
