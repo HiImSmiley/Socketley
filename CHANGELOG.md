@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `sdk/node` are bindings on top. An engine is a guest in its process: its own
   thread, none of the program's signals, nothing on stdout. An MCP tool can be a
   function of the program, answering at once or later from any thread, and a
-  server or client runtime tells the program of its connections and messages.
+  server or client runtime tells the program of its connections and messages, a
+  web runtime hands it the paths it asks for, and a cache takes commands in the
+  process. `--sdk-runtimes=mcp,web` builds a library of only those types: an MCP
+  server alone is 13 MB rather than 32.
 
 - **A runtime removed from a running loop waits for its runs.** Eleven types kept
   their work in a run the ring could still complete after the instance was freed.

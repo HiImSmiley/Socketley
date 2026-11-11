@@ -1,6 +1,24 @@
 -- The machine's own architecture, or --arch=x64|arm64 when the makefiles are for another one.
 newoption { trigger = "arch", value = "x64|arm64", description = "The architecture to build for, this machine's by default",
             allowed = { { "x64", "x86-64" }, { "arm64", "64-bit ARM" } } }
+newoption { trigger = "sdk-runtimes", value = "mcp,web,...", description = "The runtime types libsocketley.so keeps; all by default (make clean after changing it)" }
+
+-- What the SDK leaves out: a type the factory cannot make is dead code the linker drops.
+local function sdk_without()
+    local all = { "cache", "server", "client", "proxy", "storage", "dns", "sync", "idp", "db", "mqtt", "mail", "tunnel", "metrics", "mcp", "web" }
+    local out = {}
+    if not _OPTIONS["sdk-runtimes"] then return out end
+    local keep = {}
+    for t in _OPTIONS["sdk-runtimes"]:gmatch("[^,]+") do
+        if not table.contains(all, t) then error("--sdk-runtimes: no runtime type " .. t) end
+        keep[t] = true
+    end
+    for _, t in ipairs(all) do
+        if not keep[t] then table.insert(out, "SOCKETLEY_WITHOUT_" .. t:upper()) end
+    end
+    return out
+end
+
 target_arch = _OPTIONS["arch"] or ((os.outputof("uname -m") or ""):match("aarch64") and "arm64" or "x64")
 
 workspace "Socketley"
@@ -386,7 +404,7 @@ project "socketley_shared"
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     files { "socketley/sdk/capi.cpp" }
     links { "socketley_sdk", "luajit_pic", "uring:static" } links(tls_libs())
-    linkoptions { "-Wl,--version-script=../sdk/socketley.map", "-Wl,-Bsymbolic" }
+    linkoptions { "-Wl,--version-script=../sdk/socketley.map", "-Wl,-Bsymbolic", "-Wl,--gc-sections" }
     filter "system:linux"
         defines { "SOCKETLEY_LINUX" }
     filter "configurations:Release"
@@ -405,6 +423,8 @@ project "socketley_shared"
 project "socketley_sdk"
     pic "On"
     kind "StaticLib"
+    defines(sdk_without())
+    buildoptions { "-ffunction-sections", "-fdata-sections" }
     language "C++"
     cppdialect "C++latest"
     targetdir ("bin/%{cfg.buildcfg}")

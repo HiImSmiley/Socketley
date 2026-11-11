@@ -303,6 +303,122 @@ static napi_value send_line(napi_env env, napi_callback_info info)
     return v;
 }
 
+static napi_value cache_command(napi_env env, napi_callback_info info)
+{
+    ARGS(2);
+    char* line = text_of(env, argv[1]);
+    char* err = NULL;
+    char* reply = skl_cache_command(pointer_of(env, argv[0]), line, &err);
+    free(line);
+    if (!reply)
+    {
+        throw_taken(env, err);
+        return NULL;
+    }
+    napi_value v;
+    napi_create_string_utf8(env, reply, NAPI_AUTO_LENGTH, &v);
+    skl_free(reply);
+    return v;
+}
+
+struct web_call
+{
+    skl_web_request* request;
+    char* method;
+    char* path;
+    char* query;
+    char* headers;
+    char* body;
+    size_t length;
+};
+
+static void web_js(napi_env env, napi_value js, void* context, void* data)
+{
+    (void)context;
+    struct web_call* w = data;
+    if (env)
+    {
+        napi_value undefined, argv[6];
+        napi_get_undefined(env, &undefined);
+        argv[0] = external(env, w->request);
+        napi_create_string_utf8(env, w->method, NAPI_AUTO_LENGTH, &argv[1]);
+        napi_create_string_utf8(env, w->path, NAPI_AUTO_LENGTH, &argv[2]);
+        napi_create_string_utf8(env, w->query, NAPI_AUTO_LENGTH, &argv[3]);
+        napi_create_string_utf8(env, w->headers, NAPI_AUTO_LENGTH, &argv[4]);
+        napi_create_buffer_copy(env, w->length, w->length ? w->body : "", NULL, &argv[5]);
+        napi_call_function(env, undefined, js, 6, argv, NULL);
+    }
+    else
+    {
+        skl_web_reply(w->request, 503, NULL, "", 0);
+    }
+    free(w->method);
+    free(w->path);
+    free(w->query);
+    free(w->headers);
+    free(w->body);
+    free(w);
+}
+
+static void on_web(void* user, skl_web_request* request, const char* method, const char* path, const char* query,
+                   const char* headers, const char* body, size_t length)
+{
+    struct web_call* w = calloc(1, sizeof *w);
+    if (!w)
+    {
+        skl_web_reply(request, 500, NULL, "", 0);
+        return;
+    }
+    w->request = request;
+    w->method = strdup(method);
+    w->path = strdup(path);
+    w->query = strdup(query);
+    w->headers = strdup(headers);
+    w->length = length;
+    if (length && (w->body = malloc(length)))
+        memcpy(w->body, body, length);
+    if (napi_call_threadsafe_function(user, w, napi_tsfn_nonblocking) != napi_ok)
+        web_js(NULL, NULL, NULL, w);
+}
+
+static napi_value web_handler(napi_env env, napi_callback_info info)
+{
+    ARGS(3);
+    napi_value resource;
+    napi_create_string_utf8(env, "socketley.web", NAPI_AUTO_LENGTH, &resource);
+    napi_threadsafe_function fn;
+    if (napi_create_threadsafe_function(env, argv[2], NULL, resource, 0, 1, NULL, NULL, NULL, web_js, &fn) != napi_ok)
+    {
+        napi_throw_error(env, NULL, "could not make a threadsafe function");
+        return NULL;
+    }
+    napi_unref_threadsafe_function(env, fn);
+    char* prefix = text_of(env, argv[1]);
+    char* err = NULL;
+    const int rc = skl_web_handler(pointer_of(env, argv[0]), prefix, on_web, fn, &err);
+    free(prefix);
+    if (rc != 0)
+    {
+        napi_release_threadsafe_function(fn, napi_tsfn_abort);
+        throw_taken(env, err);
+    }
+    return NULL;
+}
+
+static napi_value web_reply(napi_env env, napi_callback_info info)
+{
+    ARGS(4);
+    int32_t status = 200;
+    napi_get_value_int32(env, argv[1], &status);
+    char* headers = text_of(env, argv[2]);
+    void* body = NULL;
+    size_t length = 0;
+    napi_get_buffer_info(env, argv[3], &body, &length);
+    skl_web_reply(pointer_of(env, argv[0]), status, headers, body, length);
+    free(headers);
+    return NULL;
+}
+
 static napi_value runtime_free(napi_env env, napi_callback_info info)
 {
     ARGS(1);
@@ -321,6 +437,7 @@ NAPI_MODULE_INIT()
         {"runtimeCreate", runtime_create}, {"runtimeStart", runtime_start}, {"runtimeStop", runtime_stop},
         {"runtimeStats", runtime_stats},   {"runtimeFree", runtime_free},   {"mcpTool", mcp_tool},
         {"mcpReply", mcp_reply},           {"on", on},                      {"send", send_line},
+        {"cacheCommand", cache_command},   {"webHandler", web_handler},     {"webReply", web_reply},
     };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; ++i)
     {

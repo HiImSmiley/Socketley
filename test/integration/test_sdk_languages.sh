@@ -29,7 +29,7 @@ cleanup() { [ -n "$HOST" ] && kill -9 "$HOST" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 
 expect "the library shows nothing but the C interface" "$(nm -D --defined-only "$LIB" | awk '{print $3}' | grep -vc '^skl_')" 0
-expect "and all of it" "$(nm -D --defined-only "$LIB" | awk '{print $3}' | grep -c '^skl_')" 15
+expect "and all of it" "$(nm -D --defined-only "$LIB" | awk '{print $3}' | grep -c '^skl_')" 18
 
 say() { python3 -c "
 import socket,sys
@@ -66,6 +66,15 @@ if cargo --version >/dev/null 2>&1; then
         sleep 0.3
         expect "Rust: and was told it opened and went" "$(grep -c -E '^(OPEN|GONE) true' "$T/rust2.out")" 2
         kill -9 "$HOST" 2>/dev/null; wait "$HOST" 2>/dev/null; HOST=""
+        mkdir -p "$T/pub"; echo plain > "$T/pub/a.txt"
+        "$T/target/debug/examples/web_app" $((P+7)) "$T/pub" > "$T/rust3.out" 2>"$T/rust3.err" &
+        HOST=$!
+        wait_ready rust3 || bad "the Rust site comes up" "$(tail -3 "$T/rust3.err" | cut -c1-240)"
+        expect "Rust: a handler, with a cache beside it" "$(curl -s -m 5 -d x "http://127.0.0.1:$((P+7))/api/a?b=1")" "POST /api/a b=1 hits 1 body x"
+        expect "Rust: answered from a thread" "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((P+7))/slow")" 202
+        expect "Rust: a request dropped unanswered is a 500" "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((P+7))/forgets")" 500
+        expect "Rust: files still answer beside it" "$(curl -s -m 5 "http://127.0.0.1:$((P+7))/a.txt")" "plain"
+        kill -9 "$HOST" 2>/dev/null; wait "$HOST" 2>/dev/null; HOST=""
     else
         bad "the crate builds" "$(head -8 "$T/cargo.err" | cut -c1-240)"
     fi
@@ -97,10 +106,17 @@ let opened = 0;
 lines.on('connect', () => { opened++; });
 lines.on('message', (c, d) => { lines.send(c, 'echo: ' + d.toString() + ' seen ' + opened); });
 lines.start();
+const kv = engine.runtime('cache', 'kv', '-p $((P+8))').start();
+kv.command('set n 5');
+const site2 = engine.runtime('web', 'site2', '-p $((P+9)) --root $T/site');
+site2.handle('/api', async (q) => { await new Promise((r) => setTimeout(r, 10)); return { status: 201, headers: { 'X-From': 'node' }, body: q.method + ' ' + q.query + ' ' + q.body + ' n=' + kv.command('get n') }; });
+site2.handle('/boom', () => { throw new Error('nope'); });
+site2.start();
 try { engine.runtime('web', 'bad', '--no-such-flag'); } catch (e) { console.log('CAUGHT', e.message); }
 process.on('SIGTERM', () => { engine.close(); console.log('CLOSED'); });
 console.log('READY', version);
 JS
+        node --check "$ROOT/sdk/node/examples/app.js" && ok || bad "Node: the example parses"
         SOCKETLEY_NODE_ADDON="$T/socketley.node" node "$T/host.js" > "$T/node.out" 2>"$T/node.err" &
         HOST=$!
         wait_ready node || bad "the Node program comes up" "$(tail -3 "$T/node.out" "$T/node.err" | cut -c1-240)"
@@ -113,6 +129,8 @@ JS
         expect "Node: a throw is a failure of the tool" "$(mcp $((P+3)) call throws)" "it broke True"
         expect "Node: its own OpenSSL still works" "$(mcp $((P+3)) call hash)" "2d711642 False"
         expect "Node: a server's message reaches JavaScript and its answer the connection" "$(say $((P+6)) hi)" "echo: hi seen 1"
+        expect "Node: an async handler, a cache beside it" "$(curl -s -m 5 -D - -d zz "http://127.0.0.1:$((P+9))/api?q=1" | grep -E '^HTTP|^X-From|n=' | tr -d '\r' | tr '\n' ' ')" "HTTP/1.1 201 Created X-From: node POST q=1 zz n=5 "
+        expect "Node: a throw is a 500" "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((P+9))/boom")" 500
         kill -TERM "$HOST"
         for _ in $(seq 1 100); do grep -q '^CLOSED' "$T/node.out" && break; sleep 0.1; done
         for _ in $(seq 1 100); do kill -0 "$HOST" 2>/dev/null || break; sleep 0.1; done

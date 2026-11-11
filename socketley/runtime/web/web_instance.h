@@ -5,6 +5,7 @@
 // It speaks plain HTTP on its port and is reached through the entrance proxy, which terminates TLS and HTTP/2 for it as
 // for every other name. It takes no WebSocket: a page that talks to its server is a server's --http. With --lua-pages a
 // .lua file under --root answers its own address, and with --backend fastcgi://... a .php file, run by php-fpm.
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -18,9 +19,28 @@ namespace socketley::web
 class web_run;
 }
 
+// A request answered by the program that embeds this runtime; `answer` is called once, now or on a later turn.
+struct web_handler_request
+{
+    std::string method, path, query, headers, body;
+};
+using web_answer = std::function<void(int status, std::vector<std::pair<std::string, std::string>> fields, std::string body)>;
+using web_handler = std::function<void(const web_handler_request&, web_answer)>;
+
 class web_instance : public runtime_instance
 {
 public:
+    // The path and what lies under it go to `h` before any file does.
+    void add_handler(std::string prefix, web_handler h) { m_handlers.emplace_back(std::move(prefix), std::move(h)); }
+    const web_handler* handler_for(std::string_view path) const
+    {
+        for (const auto& [prefix, h] : m_handlers)
+            if (path == prefix || prefix == "/" || (path.starts_with(prefix) && path[prefix.size()] == '/'))
+                return &h;
+        return nullptr;
+    }
+    bool has_handlers() const { return !m_handlers.empty(); }
+
     explicit web_instance(std::string_view name);
     ~web_instance() override;
 
@@ -55,6 +75,7 @@ public:
     uint16_t effective_port() const override;
 
 private:
+    std::vector<std::pair<std::string, web_handler>> m_handlers;
     std::string m_root;
     std::string m_index{"index.html"};
     std::string m_fallback;

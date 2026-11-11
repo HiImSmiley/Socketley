@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <time.h>
 
+#include "web_instance.h"
 #include "../../shared/http/conn_server.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/event_loop_definitions.h"
@@ -158,6 +159,8 @@ private:
                      const std::string& page, std::string_view query, const request_fields& f);
     // A page's or a script's answer, framed by this end: its length, its Date and Connection fields, and no body for a
     // HEAD.
+    bool run_handler(const std::shared_ptr<web_conn>& c, const web_handler& h, std::string_view method,
+                     const std::string& path, std::string_view query, const request_fields& f);
     void write_dynamic(const std::shared_ptr<web_conn>& c, int status,
                        const std::vector<std::pair<std::string, std::string>>& fields, std::string_view body);
     // The head of a script's answer whose body follows in pieces: chunked, or to the close for HTTP/1.0.

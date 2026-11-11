@@ -18,7 +18,9 @@
 #include "../daemon/flag_handlers.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/mcp/mcp_instance.h"
+#include "../runtime/cache/cache_instance.h"
 #include "../runtime/server/server_instance.h"
+#include "../runtime/web/web_instance.h"
 #include "../shared/json/json_doc.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/loop/event_loop.h"
@@ -169,6 +171,12 @@ struct skl_runtime
     std::string name;
 };
 
+struct skl_web_request
+{
+    std::shared_ptr<engine_state> s;
+    web_answer answer;
+};
+
 struct skl_mcp_call
 {
     std::shared_ptr<engine_state> s;
@@ -233,7 +241,7 @@ skl_runtime* skl_runtime_create(skl_engine* engine, const char* type, const char
             case runtime_manager::create_result::ok: break;
             case runtime_manager::create_result::name_taken: why = std::string("name taken: ") + name; return;
             case runtime_manager::create_result::invalid_name: why = std::string("invalid name: ") + name; return;
-            default: why = "could not build a runtime of this type"; return;
+            default: why = std::string("this library has no runtime of type ") + type; return;
         }
         runtime_instance* rt = s.manager.get(name);
         rt->set_runtime_manager(&s.manager);
@@ -441,6 +449,103 @@ int skl_send(skl_runtime* runtime, skl_connection connection, const char* data, 
         return 0;
     }
     return state->post(send) ? 0 : -1;
+}
+
+char* skl_cache_command(skl_runtime* runtime, const char* line, char** err)
+{
+    if (!runtime || !line)
+    {
+        set_err(err, "runtime and line are required");
+        return nullptr;
+    }
+    engine_state& s = *runtime->s;
+    std::string why;
+    char* out = nullptr;
+    const bool ran = s.call([&] {
+        runtime_instance* rt = s.manager.get(runtime->name);
+        if (!rt || rt->get_type() != runtime_cache)
+            why = "not a runtime of type cache";
+        else if (rt->get_state() != runtime_running)
+            why = "the cache is not running";
+        else
+            out = dup_text(static_cast<cache_instance*>(rt)->execute(line));
+    });
+    if (!ran || !why.empty())
+    {
+        set_err(err, ran ? why : "the engine has ended");
+        return nullptr;
+    }
+    return out;
+}
+
+int skl_web_handler(skl_runtime* runtime, const char* prefix, skl_web_fn fn, void* user, char** err)
+{
+    if (!runtime || !prefix || !fn || prefix[0] != '/')
+    {
+        set_err(err, "runtime, a prefix starting with / and fn are required");
+        return -1;
+    }
+    engine_state& s = *runtime->s;
+    std::string why;
+    const bool ran = s.call([&] {
+        runtime_instance* rt = s.manager.get(runtime->name);
+        if (!rt || rt->get_type() != runtime_web)
+        {
+            why = "not a runtime of type web";
+            return;
+        }
+        std::string p(prefix);
+        while (p.size() > 1 && p.back() == '/')
+            p.pop_back();
+        static_cast<web_instance*>(rt)->add_handler(std::move(p), [state = runtime->s, fn, user](const web_handler_request& q, web_answer answer) {
+            auto* request = new skl_web_request{state, std::move(answer)};
+            fn(user, request, q.method.c_str(), q.path.c_str(), q.query.c_str(), q.headers.c_str(), q.body.data(), q.body.size());
+        });
+    });
+    if (!ran || !why.empty())
+    {
+        set_err(err, ran ? why : "the engine has ended");
+        return -1;
+    }
+    return 0;
+}
+
+void skl_web_reply(skl_web_request* request, int status, const char* headers, const char* body, size_t length)
+{
+    if (!request)
+        return;
+    const std::shared_ptr<engine_state> state = request->s;
+    std::vector<std::pair<std::string, std::string>> fields;
+    for (std::string_view left = headers ? headers : ""; !left.empty();)
+    {
+        const size_t end = left.find('\n');
+        std::string_view line = left.substr(0, end);
+        left = end == std::string_view::npos ? std::string_view{} : left.substr(end + 1);
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        const size_t colon = line.find(':');
+        if (colon == std::string_view::npos)
+            continue;
+        std::string_view value = line.substr(colon + 1);
+        while (!value.empty() && value.front() == ' ')
+            value.remove_prefix(1);
+        fields.emplace_back(line.substr(0, colon), value);
+    }
+    auto answer = [request, status, fields = std::move(fields), text = std::string(body ? body : "", body ? length : 0)]() mutable {
+        request->answer(status, std::move(fields), std::move(text));
+        delete request;
+    };
+    if (state->here())
+    {
+        answer();
+    }
+    else
+    {
+        // A std::function wants a copyable callable, and the fields move only once it runs.
+        auto held = std::make_shared<decltype(answer)>(std::move(answer));
+        if (!state->post([held] { (*held)(); }))
+            delete request;
+    }
 }
 
 void skl_mcp_reply(skl_mcp_call* call, const char* text, int is_error)

@@ -1022,6 +1022,9 @@ bool web_run::answer_request(const std::shared_ptr<web_conn>& c, std::string_vie
     }
     std::string path;
     const bool named = socketley::http::site_path(raw, path);
+    if (named && m_owner.has_handlers())
+        if (const web_handler* h = m_owner.handler_for(path))
+            return run_handler(c, *h, method, path, query, f);
     std::shared_ptr<entry> e;
     if (m_pages && named)
     {
@@ -1147,6 +1150,31 @@ void web_run::write_dynamic(const std::shared_ptr<web_conn>& c, int status_asked
     o.append(connection_field(*c)).append("\r\n");
     if (!c->head && !bodyless)
         o.append(body);
+}
+
+bool web_run::run_handler(const std::shared_ptr<web_conn>& c, const web_handler& h, std::string_view method,
+                          const std::string& path, std::string_view query, const request_fields& f)
+{
+    web_handler_request req{std::string(method), path, std::string(query), {}, std::string(f.body)};
+    for (const auto& [k, v] : f.all)
+        req.headers.append(k).append(": ").append(v).append("\n");
+    // As a page that waits: nothing more is read off the connection until it is answered.
+    auto in_line = std::make_shared<bool>(true);
+    std::weak_ptr<web_conn> weak = c;
+    std::weak_ptr<bool> alive = m_alive;
+    c->waiting = true;
+    ++m_c.pages;
+    h(req, [this, weak, alive, in_line](int status, std::vector<std::pair<std::string, std::string>> fields, std::string body) {
+        const auto cc = weak.lock();
+        if (alive.expired() || !cc || cc->dead || m_stopped)
+            return;
+        cc->waiting = false;
+        write_dynamic(cc, status, fields, body);
+        if (!*in_line)
+            m_http.resume(cc);
+    });
+    *in_line = false;
+    return true;
 }
 
 bool web_run::run_page(const std::shared_ptr<web_conn>& c, std::string_view method, const std::string& path,

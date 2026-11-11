@@ -28,10 +28,15 @@ struct RawRuntime {
 struct RawCall {
     _private: [u8; 0],
 }
+#[repr(C)]
+struct RawRequest {
+    _private: [u8; 0],
+}
 
 type RawTool = extern "C" fn(*mut c_void, *mut RawCall, *const c_char, *const c_char);
 type RawConnection = extern "C" fn(*mut c_void, u64);
 type RawMessage = extern "C" fn(*mut c_void, u64, *const c_char, usize);
+type RawWeb = extern "C" fn(*mut c_void, *mut RawRequest, *const c_char, *const c_char, *const c_char, *const c_char, *const c_char, usize);
 
 extern "C" {
     fn skl_version() -> *const c_char;
@@ -63,6 +68,9 @@ extern "C" {
     fn skl_on_disconnect(runtime: *mut RawRuntime, f: RawConnection, user: *mut c_void, err: *mut *mut c_char) -> c_int;
     fn skl_on_message(runtime: *mut RawRuntime, f: RawMessage, user: *mut c_void, err: *mut *mut c_char) -> c_int;
     fn skl_send(runtime: *mut RawRuntime, connection: u64, data: *const c_char, length: usize) -> c_int;
+    fn skl_cache_command(runtime: *mut RawRuntime, line: *const c_char, err: *mut *mut c_char) -> *mut c_char;
+    fn skl_web_handler(runtime: *mut RawRuntime, prefix: *const c_char, f: RawWeb, user: *mut c_void, err: *mut *mut c_char) -> c_int;
+    fn skl_web_reply(request: *mut RawRequest, status: c_int, headers: *const c_char, body: *const c_char, length: usize);
 }
 
 /// Why socketley refused: the sentence the CLI would have printed.
@@ -219,6 +227,56 @@ impl Runtime {
         unsafe { skl_send(self.raw, connection, data.as_ptr().cast(), data.len()) == 0 }
     }
 
+    /// One command of a runtime of type `cache`, in its text protocol.
+    pub fn command(&self, line: &str) -> Result<String, Error> {
+        let l = c(line)?;
+        let mut err = ptr::null_mut();
+        let p = unsafe { skl_cache_command(self.raw, l.as_ptr(), &mut err) };
+        if p.is_null() {
+            return Err(unsafe { taken(err) });
+        }
+        let text = unsafe { CStr::from_ptr(p) }.to_string_lossy().trim_end().to_owned();
+        unsafe { skl_free(p) };
+        Ok(text)
+    }
+
+    /// `prefix` and every path under it, on a runtime of type `web`, go to `f` before any file does.
+    pub fn handle<F>(&mut self, prefix: &str, f: F) -> Result<(), Error>
+    where
+        F: Fn(WebRequest) + Send + Sync + 'static,
+    {
+        extern "C" fn call<F: Fn(WebRequest)>(
+            user: *mut c_void,
+            request: *mut RawRequest,
+            method: *const c_char,
+            path: *const c_char,
+            query: *const c_char,
+            headers: *const c_char,
+            body: *const c_char,
+            length: usize,
+        ) {
+            let text = |p: *const c_char| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+            let req = WebRequest {
+                raw: request,
+                method: text(method),
+                path: text(path),
+                query: text(query),
+                headers: text(headers),
+                body: if length == 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(body.cast::<u8>(), length) }.to_vec() },
+            };
+            let f = unsafe { &*user.cast::<F>() };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(req)));
+        }
+        let p = c(prefix)?;
+        let boxed = Box::new(f);
+        let mut err = ptr::null_mut();
+        if unsafe { skl_web_handler(self.raw, p.as_ptr(), call::<F>, (&*boxed as *const F).cast_mut().cast(), &mut err) } != 0 {
+            return Err(unsafe { taken(err) });
+        }
+        self.hooks.push(boxed);
+        Ok(())
+    }
+
     /// An MCP tool on a runtime of type `mcp`; `input_schema` is a JSON Schema object as text.
     pub fn tool<F>(&mut self, name: &str, description: &str, input_schema: Option<&str>, f: F) -> Result<(), Error>
     where
@@ -307,5 +365,40 @@ impl ToolCall {
 impl Drop for ToolCall {
     fn drop(&mut self) {
         self.answer("the tool did not answer", true);
+    }
+}
+
+/// One HTTP request of a web runtime.  It answers exactly once, or with a 500 when it is dropped unanswered, and may be
+/// moved to another thread.
+pub struct WebRequest {
+    raw: *mut RawRequest,
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    /// One `Name: value` a line.
+    pub headers: String,
+    pub body: Vec<u8>,
+}
+unsafe impl Send for WebRequest {}
+
+impl WebRequest {
+    /// `headers` is one `Name: value` a line, empty for none.
+    pub fn reply(mut self, status: u16, headers: &str, body: &[u8]) {
+        self.answer(status, headers, body);
+    }
+
+    fn answer(&mut self, status: u16, headers: &str, body: &[u8]) {
+        if self.raw.is_null() {
+            return;
+        }
+        let h = CString::new(headers.replace('\0', "")).unwrap_or_default();
+        unsafe { skl_web_reply(self.raw, c_int::from(status), h.as_ptr(), body.as_ptr().cast(), body.len()) };
+        self.raw = ptr::null_mut();
+    }
+}
+
+impl Drop for WebRequest {
+    fn drop(&mut self) {
+        self.answer(500, "Content-Type: text/plain", b"the handler did not answer\n");
     }
 }

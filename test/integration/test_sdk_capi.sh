@@ -124,6 +124,28 @@ static void client_line(void* user, skl_connection c, const char* data, size_t n
     snprintf(client_got, sizeof client_got, "%.*s", (int)n, data);
 }
 
+static void* slow_thread(void* arg)
+{
+    usleep(50000);
+    skl_web_reply(arg, 202, "Content-Type: text/plain\nX-From: thread", "later", 5);
+    return NULL;
+}
+static void api(void* user, skl_web_request* r, const char* method, const char* path, const char* query,
+                const char* headers, const char* body, size_t n)
+{
+    (void)user;
+    if (strcmp(path, "/api/slow") == 0)
+    {
+        pthread_t t;
+        pthread_create(&t, NULL, slow_thread, r);
+        pthread_detach(t);
+        return;
+    }
+    char text[600];
+    int len = snprintf(text, sizeof text, "%s %s %s ua=%d body=%.*s", method, path, query, strstr(headers, "User-Agent:") != NULL, (int)n, n ? body : "");
+    skl_web_reply(r, 200, "Content-Type: text/plain", text, (size_t)len);
+}
+
 static void say_err(const char* what, char* err)
 {
     printf("ERR %s: %s\n", what, err ? err : "(none)");
@@ -146,7 +168,7 @@ int main(int argc, char** argv)
 
     snprintf(flags, sizeof flags, "-p %s --root %s --lua-pages", argv[1], argv[4]);
     skl_runtime* web = skl_runtime_create(one, "web", "site", flags, &err);
-    if (!web || skl_runtime_start(web, &err)) { say_err("web", err); return 2; }
+    if (!web || skl_web_handler(web, "/api", api, NULL, &err) || skl_runtime_start(web, &err)) { say_err("web", err); return 2; }
 
     snprintf(flags, sizeof flags, "-p %s --anonymous", argv[2]);
     skl_runtime* mcp = skl_runtime_create(one, "mcp", "tools", flags, &err);
@@ -169,6 +191,15 @@ int main(int argc, char** argv)
     snprintf(flags, sizeof flags, "-p %s", argv[3]);
     skl_runtime* cache = skl_runtime_create(two, "cache", "store", flags, &err);
     if (!cache || skl_runtime_start(cache, &err)) { say_err("cache", err); return 2; }
+    skl_free(skl_cache_command(cache, "set k embedded", &err));
+    char* got = skl_cache_command(cache, "get k", &err);
+    printf("CACHE %s", got ? got : "none\n");
+    if (got && got[strlen(got) - 1] != '\n') printf("\n");
+    skl_free(got);
+    if (skl_cache_command(web, "get k", &err)) return 3;
+    say_err("command on web", err); err = NULL;
+    if (skl_web_handler(cache, "/x", api, NULL, &err) == 0) return 3;
+    say_err("handler on cache", err); err = NULL;
 
     /* what is refused comes back as text */
     if (skl_runtime_create(one, "web", "bad", "--no-such-flag", &err)) return 3;
@@ -251,6 +282,14 @@ expect "a port in use is a refused start" "$(line REFUSED)" "REFUSED port taken"
 expect "tools are counted" "$(line STATS)" "STATS tools:4"
 expect "nothing but the host wrote to its stdout" "$(grep -c -E '^(unknown|name taken|--)' "$T/out")" 0
 expect "a page of a runtime on the first engine" "$(curl -s -m 5 "http://127.0.0.1:$((P+1))/i.lua")" "embedded page"
+expect "a request under a handler's path is the program's" "$(curl -s -m 5 "http://127.0.0.1:$((P+1))/api/x?y=1")" "GET /api/x y=1 ua=1 body="
+expect "with its body" "$(curl -s -m 5 -d hello "http://127.0.0.1:$((P+1))/api")" "POST /api  ua=1 body=hello"
+expect "and answered from a thread, with its status and headers" \
+    "$(curl -s -m 5 -D - "http://127.0.0.1:$((P+1))/api/slow" | grep -E '^HTTP|^X-From|^later' | tr -d '\r' | tr '\n' ' ')" "HTTP/1.1 202 Accepted X-From: thread later "
+expect "a path that only begins like it is not" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$((P+1))/apix")" 404
+expect "a cache command from the program" "$(line CACHE)" "CACHE embedded"
+expect "a command is only for a cache" "$(line 'ERR command on web')" "ERR command on web: not a runtime of type cache"
+expect "a handler is only for a web runtime" "$(line 'ERR handler on cache')" "ERR handler on cache: not a runtime of type web"
 if command -v redis-cli >/dev/null 2>&1; then :; fi
 expect "the second engine serves beside it" \
     "$(python3 -c "

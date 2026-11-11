@@ -26629,6 +26629,24 @@ and
 .B skl_send
 sends a line on one, from any thread.
 A connection is a number never given to another, so one that has gone cannot be mistaken for a new one.
+.PP
+.B skl_web_handler
+gives a path and all under it to the program, before any file; the handler answers with
+.BR skl_web_reply ,
+now or later from any thread.
+.B skl_cache_command
+runs a command of a cache's text protocol in the process.
+The other runtimes are reached over their own protocol on their port, as any client reaches them.
+.PP
+.B libsocketley.so
+holds all fifteen runtime types.
+A library of only some is built from a checkout, an MCP server alone being about 13 MB rather than 32:
+.BR "scripts/premake5 gmake --sdk-runtimes=mcp,web" ,
+then
+.BR "make clean" " and " "make socketley_shared"
+in
+.BR make/ .
+Asking it for another type is refused by name.
 .SS Rust
 The crate in
 .B sdk/rust
@@ -26648,6 +26666,13 @@ tools.start()?;
 A
 .B ToolCall
 may be moved to any thread or task, and one dropped unanswered answers as failed.
+.BR on_connect ", " on_disconnect ", " on_message " and " send
+are a server's and client's,
+.B handle
+a web runtime's and
+.B command
+a cache's; examples are in
+.BR sdk/rust/examples .
 .SS Node
 The package in
 .B sdk/node
@@ -26663,6 +26688,15 @@ tools.tool("open_thread", { input: { id: "string" } }, async ({ id }) => {
 });
 tools.start();
 .fi
+.PP
+.BR on("connect"|"disconnect"|"message") " and " send
+are a server's and client's,
+.B handle
+a web runtime's, whose handler returns the answer, and
+.B command
+a cache's.
+.B sdk/node/examples/app.js
+is a program with all of them.
 .SS Cross-Platform SDK (Windows / macOS)
 The runtimes are Linux only, with or without the daemon, because the engine is built on io_uring.
 What follows are clients, which reach a socketley running on Linux over the network.

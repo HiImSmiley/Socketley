@@ -73,6 +73,23 @@ SKL_API int skl_on_message(skl_runtime* runtime, skl_message_fn fn, void* user, 
  * engine has ended. */
 SKL_API int skl_send(skl_runtime* runtime, skl_connection connection, const char* data, size_t length);
 
+/* One command of a runtime of type "cache", in its text protocol: skl_cache_command(rt, "get k", &err).  The reply, for
+ * skl_free, or NULL and the reason. */
+SKL_API char* skl_cache_command(skl_runtime* runtime, const char* line, char** err);
+
+typedef struct skl_web_request skl_web_request;
+
+/* A request of a runtime of type "web".  `headers` is one `Name: value` a line.  All of it lasts only for the call, and
+ * the handler answers with skl_web_reply exactly once, in the callback or later from any thread. */
+typedef void (*skl_web_fn)(void* user, skl_web_request* request, const char* method, const char* path, const char* query,
+                           const char* headers, const char* body, size_t body_length);
+
+/* `prefix` and every path under it go to `fn` before any file does.  Set before the runtime starts.  0, or -1 and the
+ * reason. */
+SKL_API int skl_web_handler(skl_runtime* runtime, const char* prefix, skl_web_fn fn, void* user, char** err);
+/* `headers` is one `Name: value` a line, NULL for none. */
+SKL_API void skl_web_reply(skl_web_request* request, int status, const char* headers, const char* body, size_t length);
+
 #ifdef __cplusplus
 }
 #endif
