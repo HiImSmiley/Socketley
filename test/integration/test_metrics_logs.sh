@@ -84,6 +84,29 @@ else bad "every line kept before a restart is there once after it" "$(diff "$T/b
 has "and the restart's own lines after them" "$(tail -n +$((n+1)) "$T/after")" "metrics 'm'"
 has "the files are kept" "$(S metrics m stats)" '^log_files:[1-9]'
 
+# ── who reads the log through an idp ────────────────────────────────────────
+# The log says who signed in from where, so an account that is no admin reads the figures and not the log.
+PI=$((P+5)); PG=$((P+6))
+printf 'spa - http://localhost:5173/cb\n' > "$T/clients"
+S create idp auth -p "$PI" --clients "$T/clients" --issuer "http://127.0.0.1:$PI" -s >/dev/null
+for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PI/jwks")" = 200 ] && break; sleep 0.1; done
+S idp-user auth add bob --password bobpassword12 >/dev/null
+S idp-user auth add root --password rootpassword12 --groups admins >/dev/null
+S create metrics guarded -p "$PG" --every 1s --logs --idp auth -s >/dev/null
+cookie_of() { curl -s -i -X POST -H "Origin: http://127.0.0.1:$PI" -d "username=$1&password=$2" "http://127.0.0.1:$PI/login" | sed -n 's/^[Ss]et-[Cc]ookie: \(skl_idp=[^;]*\).*/\1/p' | head -1; }
+BOB=$(cookie_of bob bobpassword12); ROOT=$(cookie_of root rootpassword12)
+for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: $ROOT" "http://127.0.0.1:$PG/api/v1/labels")" = 200 ] && break; sleep 0.1; done
+G() { curl -s -o "$T/g.out" -w '%{http_code}' -H "Cookie: $1" --data-urlencode 'query={job="socketley"}' "http://127.0.0.1:$PG/$2"; }
+[ -n "$BOB" ] && [ -n "$ROOT" ] && ok || bad "both accounts signed in" "bob '$BOB' root '$ROOT'"
+expect "an account that is no admin reads the figures" "$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: $BOB" "http://127.0.0.1:$PG/api/v1/labels")" 200
+expect "and is refused the log" "$(G "$BOB" loki/api/v1/query_range)" 403
+hasnt "none of whose lines it is given" "$(cat "$T/g.out")" 'signed in'
+expect "nor its labels" "$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: $BOB" "http://127.0.0.1:$PG/loki/api/v1/labels")" 403
+for _ in $(seq 1 50); do G "$ROOT" loki/api/v1/query_range >/dev/null; grep -q 'signed in' "$T/g.out" && break; sleep 0.2; done
+expect "an admin reads it" "$(G "$ROOT" loki/api/v1/query_range)" 200
+has "with the lines it keeps" "$(cat "$T/g.out")" 'signed in'
+expect "and nobody signed in reads nothing" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PG/loki/api/v1/labels")" 401
+
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

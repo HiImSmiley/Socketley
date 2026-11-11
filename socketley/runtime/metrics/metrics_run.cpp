@@ -556,8 +556,9 @@ void metrics_run::respond(socketley::http::server_conn& c, int status, std::stri
     o += body;
 }
 
-bool metrics_run::admitted(const request& rq)
+bool metrics_run::admitted(const request& rq, bool& admin)
 {
+    admin = true;
     if (!m_owner.guarded())
         return true;
     if (const int64_t now = wall::now_sec_coarse(); m_keys.configured() && now != m_keys_checked)
@@ -576,7 +577,9 @@ bool metrics_run::admitted(const request& rq)
             if (socketley::crypto::secure_equal(k.secret, cred))
                 return true;
         socketley::idp::session_verifier::who w;
-        return m_idp.check_bearer(cred, w);
+        const bool taken = m_idp.check_bearer(cred, w);
+        admin = taken && w.admin;
+        return taken;
     }
     // Basic, as Grafana's data source sends it: a key's name and its secret.
     if (http_auth_credentials(rq.authorization, "basic", cred))
@@ -595,7 +598,9 @@ bool metrics_run::admitted(const request& rq)
         return ok;
     }
     socketley::idp::session_verifier::who w;
-    return !rq.cookie.empty() && m_idp.check(rq.cookie, w);
+    const bool taken = !rq.cookie.empty() && m_idp.check(rq.cookie, w);
+    admin = taken && w.admin;
+    return taken;
 }
 
 void metrics_run::handle(const std::shared_ptr<socketley::http::server_conn>& c, request& rq)
@@ -614,11 +619,20 @@ void metrics_run::handle(const std::shared_ptr<socketley::http::server_conn>& c,
                 R"({"status":"error","errorType":"bad_data","error":"the API takes GET and POST"})");
         return;
     }
-    if (!admitted(rq))
+    bool admin = false;
+    if (!admitted(rq, admin))
     {
         ++m_c.unauthorized;
         respond(*c, 401, "application/json",
                 R"({"status":"error","errorType":"unauthorized","error":"a key of --keys, or a sign-in of --idp, is needed"})");
+        return;
+    }
+    // The log says who signed in from where and what each runtime did for whom, which is no figure.
+    if (!admin && rq.path.starts_with("/loki/"))
+    {
+        ++m_c.unauthorized;
+        respond(*c, 403, "application/json",
+                R"({"status":"error","errorType":"forbidden","error":"the log is read with a key of --keys or by an admin of --idp"})");
         return;
     }
     // A checkpoint is the daemon's to ask, for an export, and no client's.

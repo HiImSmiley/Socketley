@@ -18440,6 +18440,11 @@ source sends.
 .BI \-\-idp " idp"
 Admits the sign\-ins of that idp runtime: a browser's session cookie, or an
 access token as Bearer.
+The log that
+.B \-\-logs
+keeps is read only by an account in the idp's
+.B admins
+group, as at the dashboard; a key reads it too.
 .TP
 .BI \-\-idp\-audience " clients"
 The comma\-separated clients, one of which an access token's audience must

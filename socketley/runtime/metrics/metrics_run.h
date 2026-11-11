@@ -96,8 +96,9 @@ private:
     int take_request(socketley::http::server_conn& c, request& rq, int& refusal);
     void handle(const std::shared_ptr<socketley::http::server_conn>& c, request& rq);
     void respond(socketley::http::server_conn& c, int status, std::string_view type, std::string_view body);
-    // Whether the request may read the store: a key's secret by Bearer or Basic, or a sign-in of the idp.
-    bool admitted(const request& rq);
+    // Whether the request may read the store: a key's secret by Bearer or Basic, or a sign-in of the idp, which reads
+    // the log only as an admin (`admin`), as at the dashboard.
+    bool admitted(const request& rq, bool& admin);
 
     // The timer, due at whichever comes first: a sample of this daemon, a target's scrape, or the store's work.
     void arm_tick();
