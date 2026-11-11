@@ -5,7 +5,8 @@ Redis-compatible caches, websites with Lua pages and PHP, S3 storage, DNS, sign-
 metrics and MCP servers. Each runtime is one command away, runs in a supervised worker process of its own on an
 io_uring event loop, can be scripted in Lua, and comes back after a reboot.
 
-**[Documentation](https://hiimsmiley.github.io/Socketley/)** — every runtime, flag, Lua function and benchmark.
+**[Documentation](https://hiimsmiley.github.io/Socketley/)** — every [runtime](https://hiimsmiley.github.io/Socketley/#/home), [flag](https://hiimsmiley.github.io/Socketley/#/flags), [Lua function](https://hiimsmiley.github.io/Socketley/#/lua) and
+[benchmark](https://hiimsmiley.github.io/Socketley/#/bench).
 
 ```bash
 socketley create server chat -p 9000 -s      # a TCP/WebSocket server, started
@@ -41,27 +42,27 @@ The daemon then runs as the systemd service `socketley`. Root and members of the
 
 | Type | What it is |
 |---|---|
-| `server` | TCP, UDP and WebSocket on one port, with `--http` for the page that talks to it |
-| `client` | Outbound connections that reconnect, for consumers, load and bridges |
-| `proxy` | HTTP and TCP reverse proxy, and the entrance that ends TLS and HTTP/2 for every `--domain` |
-| `cache` | In-memory store with Redis's protocol, streams, pub/sub, persistence, replication and sharding |
-| `web` | A site of files, its `.lua` pages with `--lua-pages`, and its `.php` files through php-fpm |
-| `storage` | S3 for unmodified clients, with a web interface for files, links, media and git |
-| `sync` | A directory carried to a storage, out, in or both ways |
-| `idp` | OpenID Connect sign-in for everything else here |
-| `db` | JSON documents with indexed queries, transactions and a change stream |
-| `dns` | Authoritative DNS for zone files and for the runtimes' names |
-| `mqtt` | MQTT 3.1 to 5.0 on TCP, TLS and WebSocket |
-| `mail` | SMTP, IMAP, POP3 and JMAP, with webmail |
-| `tunnel` | A machine with no address of its own reached through an edge |
-| `metrics` | Prometheus-compatible collection and storage |
-| `mcp` | An MCP server whose tools are Lua functions |
+| [`server`](https://hiimsmiley.github.io/Socketley/#/rt/server) | TCP, UDP and WebSocket on one port, with `--http` for the page that talks to it |
+| [`client`](https://hiimsmiley.github.io/Socketley/#/rt/client) | Outbound connections that reconnect, for consumers, load and bridges |
+| [`proxy`](https://hiimsmiley.github.io/Socketley/#/rt/proxy) | HTTP and TCP reverse proxy, and the entrance that ends TLS and HTTP/2 for every `--domain` |
+| [`cache`](https://hiimsmiley.github.io/Socketley/#/rt/cache) | In-memory store with Redis's protocol, streams, pub/sub, persistence, replication and sharding |
+| [`web`](https://hiimsmiley.github.io/Socketley/#/rt/web) | A site of files, its `.lua` pages with `--lua-pages`, and its `.php` files through php-fpm |
+| [`storage`](https://hiimsmiley.github.io/Socketley/#/rt/storage) | S3 for unmodified clients, with a web interface for files, links, media and git |
+| [`sync`](https://hiimsmiley.github.io/Socketley/#/rt/sync) | A directory carried to a storage, out, in or both ways |
+| [`idp`](https://hiimsmiley.github.io/Socketley/#/rt/idp) | OpenID Connect sign-in for everything else here |
+| [`db`](https://hiimsmiley.github.io/Socketley/#/rt/db) | JSON documents with indexed queries, transactions and a change stream |
+| [`dns`](https://hiimsmiley.github.io/Socketley/#/rt/dns) | Authoritative DNS for zone files and for the runtimes' names |
+| [`mqtt`](https://hiimsmiley.github.io/Socketley/#/rt/mqtt) | MQTT 3.1 to 5.0 on TCP, TLS and WebSocket |
+| [`mail`](https://hiimsmiley.github.io/Socketley/#/rt/mail) | SMTP, IMAP, POP3 and JMAP, with webmail |
+| [`tunnel`](https://hiimsmiley.github.io/Socketley/#/rt/tunnel) | A machine with no address of its own reached through an edge |
+| [`metrics`](https://hiimsmiley.github.io/Socketley/#/rt/metrics) | Prometheus-compatible collection and storage |
+| [`mcp`](https://hiimsmiley.github.io/Socketley/#/rt/mcp) | An MCP server whose tools are Lua functions |
 
 `socketley --help` and `man socketley` cover the same ground as the documentation, offline.
 
 ## In your own program
 
-Every runtime also runs inside an application, with no daemon: the `socketley-dev` package carries `libsocketley.so`,
+Every runtime also runs inside an application, with no daemon ([reference](https://hiimsmiley.github.io/Socketley/#/man/c-sdk)): the `socketley-dev` package carries `libsocketley.so`,
 the C header `socketley/capi.h` and a pkg-config file, and [sdk/rust](sdk/rust) and [sdk/node](sdk/node) wrap it for
 Rust and Node. A program with its own website, API, cache and MCP tools for a model:
 
