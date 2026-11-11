@@ -15250,7 +15250,7 @@ static void open_thread(void* user, skl_mcp_call* call,
 char* err = NULL;
 skl_engine* e = skl_engine_new(&err);
 skl_runtime* site = skl_runtime_create(e, "web", "site",
-                        "-p 8080 --root ./public", &err);
+                        "-p 8080 --root /srv/site", &err);
 skl_runtime_start(site, &err);
 
 skl_runtime* tools = skl_runtime_create(e, "mcp", "tools",
