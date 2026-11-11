@@ -24,14 +24,14 @@ jobs:
             netcat-openbsd bc libluajit-5.1-dev
 
       - name: Vendored static archives
-        run: bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+        run: bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
 
       - name: Install liburing
         run: bash scripts/install-liburing.sh
 
       - name: Build release binary
         run: |
-          ./bin/premake5 gmake2
+          ./scripts/premake5 gmake2
           cd make && make config=release_x64 -j$(nproc)
 
       - name: Run tests

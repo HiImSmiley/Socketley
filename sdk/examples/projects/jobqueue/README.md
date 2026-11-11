@@ -20,7 +20,7 @@ client header, so the fleet that drains the queue does not have to run Linux.
 
 ## Build
 
-From the repo root, after `./bin/premake5 gmake2 && cd make && make
+From the repo root, after `./scripts/premake5 gmake2 && cd make && make
 config=release_x64 socketley_sdk`:
 
 ```bash

@@ -25,7 +25,7 @@ Checked into this repository and therefore redistributed with the source.
 | **sol2** | 3.5.0 | MIT | `thirdparty/sol2/LICENSE.txt` | header-only | https://github.com/ThePhD/sol2 |
 | **doctest** | 2.4.12 | MIT | `thirdparty/doctest/LICENSE.txt` | header-only, tests only | https://github.com/doctest/doctest |
 
-Built by `bin/build-thirdparty.sh http3` from pinned upstream tags rather than checked in, and linked statically when
+Built by `scripts/build-thirdparty.sh http3` from pinned upstream tags rather than checked in, and linked statically when
 present; without them the tree builds against the system's OpenSSL and a storage runtime speaks HTTP/1.1 and HTTP/2:
 
 | Component | Version | Licence | Licence text | Linked | Upstream |
@@ -88,4 +88,4 @@ dependencies rather than shipped.
 
 | Component | Version | Licence | Note |
 |---|---|---|---|
-| **premake5** | 5.0.0-beta8 | BSD-3-Clause | `bin/premake5`, generates the makefiles.  Present in no build output. |
+| **premake5** | 5.0.0-beta8 | BSD-3-Clause | `scripts/premake5`, generates the makefiles.  Present in no build output. |

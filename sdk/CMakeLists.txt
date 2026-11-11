@@ -23,7 +23,7 @@ add_library(socketley_sdk STATIC ${SDK_SOURCES})
 
 # ── Include directories ───────────────────────────────────────────────────────
 target_include_directories(socketley_sdk PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/linux"
     "${CMAKE_CURRENT_SOURCE_DIR}/.."                    # repo root (socketley/...)
     "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/sol2"
     "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/luajit"
@@ -69,7 +69,7 @@ install(TARGETS socketley_sdk
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
 
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux/socketley/"
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/linux/socketley/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/socketley"
     FILES_MATCHING PATTERN "*.h"
 )
@@ -83,7 +83,7 @@ if(SOCKETLEY_BUILD_EXAMPLES)
     # Header-only daemon control (no library needed)
     add_executable(daemon_control examples/basic/daemon_control.cpp)
     target_include_directories(daemon_control PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/linux"
     )
 
     # Engine examples (need libsocketley_sdk)
@@ -135,14 +135,14 @@ if(SOCKETLEY_BUILD_EXAMPLES)
     # cross-platform: needs only the client header
     add_executable(jobqueue_worker examples/projects/jobqueue/worker.cpp)
     target_include_directories(jobqueue_worker PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux")
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/linux")
 
     add_executable(chatroom_chatd examples/projects/chatroom/chatd.cpp)
     target_link_libraries(chatroom_chatd PRIVATE socketley_sdk)
 
     add_executable(chatroom_cli examples/projects/chatroom/chat_cli.cpp)
     target_include_directories(chatroom_cli PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux")
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/linux")
     find_package(Threads REQUIRED)
     target_link_libraries(chatroom_cli PRIVATE Threads::Threads)
 

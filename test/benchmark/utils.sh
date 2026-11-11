@@ -590,7 +590,7 @@ print_table_footer() {
 ensure_socketley_bench() {
     if [[ ! -x "$SOCKETLEY_BENCH" ]]; then
         log_info "Building socketley-bench..."
-        (cd "$PROJECT_ROOT" && ./bin/premake5 gmake2 >/dev/null 2>&1 && \
+        (cd "$PROJECT_ROOT" && ./scripts/premake5 gmake2 >/dev/null 2>&1 && \
          cd make && make config=release_x64 socketley_bench -j$(nproc) >/dev/null 2>&1) \
             || { log_error "Failed to build socketley-bench"; return 1; }
     fi

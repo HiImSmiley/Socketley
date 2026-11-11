@@ -69,7 +69,7 @@ for _ in $(seq 1 100); do [ "$(curl -s -m 5 --cacert "$T/cert.pem" -o /dev/null 
 sum() { "$BIN" stats stgh3 2>/dev/null | awk -F: -v k="$1" '$1==k {s+=$2} END {print s+0}'; }
 # A shard's section appears once it has served something, so the TCP answers above have published at least one.
 for _ in $(seq 1 50); do [ "$(sum h3)" -ge 1 ] && break; sleep 0.1; done
-[ "$(sum h3)" -ge 1 ] || skip "this build has no HTTP/3 (bin/build-thirdparty.sh http3, then rebuild)"
+[ "$(sum h3)" -ge 1 ] || skip "this build has no HTTP/3 (scripts/build-thirdparty.sh http3, then rebuild)"
 
 # ── discovery ───────────────────────────────────────────────────────────────
 expect "an answer over TCP names HTTP/3 at the advertised port" \

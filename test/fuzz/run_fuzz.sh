@@ -362,7 +362,7 @@ for target in "${TARGETS[@]}"; do
     # ── GCC replay driver: always, even when libFuzzer ran ──
     if [ ! -x "$BIN_DIR/$target" ]; then
         echo "FAIL $target: $BIN_DIR/$target does not exist"
-        echo "     build it: ./bin/premake5 gmake2 && cd make && make config=$(echo "$CONFIG" | tr 'A-Z' 'a-z')_$PLATFORM $target"
+        echo "     build it: ./scripts/premake5 gmake2 && cd make && make config=$(echo "$CONFIG" | tr 'A-Z' 'a-z')_$PLATFORM $target"
         fail=$((fail + 1))
         continue
     fi

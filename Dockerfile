@@ -79,9 +79,9 @@ COPY . .
 # "same trick as CI" and copy libluajit-5.1.a by hand -- one of nine hand-written
 # copies of the same three commands, and one of the two that had no error check.
 # scripts/install-liburing.sh already ended that argument for the other archive.
-RUN bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+RUN bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
 
-RUN ./bin/premake5 gmake2 && cd make && make config=release_x64 -j"$BUILD_JOBS"
+RUN ./scripts/premake5 gmake2 && cd make && make config=release_x64 -j"$BUILD_JOBS"
 
 # A build that "succeeded" without producing a binary is the failure this image
 # used to pass along to whoever ran the container.

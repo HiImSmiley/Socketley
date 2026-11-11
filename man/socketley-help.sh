@@ -3243,7 +3243,7 @@ installation_help() {
     echo ""
 
     echo -e "${BOLD}System Install:${NC}"
-    echo -e "  ${CYAN}sudo bash packaging/install.sh${NC}"
+    echo -e "  ${CYAN}sudo bash packaging/install-local.sh${NC}"
     echo -e "  ${CYAN}sudo systemctl start socketley${NC}"
     echo ""
     echo -e "  Installs to /usr/bin, creates systemd service, socketley user"
@@ -3322,7 +3322,7 @@ sdk_help() {
     show_header
     echo -e "${BOLD}${YELLOW}=== C++ SDK ===${NC}\n"
 
-    echo -e "  Three-tier modular SDK in ${CYAN}include/linux/socketley/${NC}."
+    echo -e "  Three-tier modular SDK in ${CYAN}sdk/include/linux/socketley/${NC}."
     echo -e "  Tiers 1 & 3 are header-only (zero deps). Tier 2 needs the static library."
     echo ""
     echo -e "  ${GREEN}1)${NC} Overview & When to Use Each Tier"
@@ -3400,7 +3400,7 @@ sdk_tier1() {
     echo -e "${BOLD}${GREEN}=== Tier 1: Daemon Control (control.h) ===${NC}\n"
 
     echo -e "  ${CYAN}#include <socketley/control.h>${NC}"
-    echo -e "  Compile: ${CYAN}g++ -std=c++17 myapp.cpp -Iinclude/linux${NC}"
+    echo -e "  Compile: ${CYAN}g++ -std=c++17 myapp.cpp -Isdk/include/linux${NC}"
     echo -e "  No library needed. Fully self-contained. Copy anywhere."
     echo ""
 
@@ -3662,7 +3662,7 @@ sdk_tier3() {
     echo -e "${BOLD}${YELLOW}=== Tier 3: Daemon Attach (attach.h) ===${NC}\n"
 
     echo -e "  ${CYAN}#include <socketley/attach.h>${NC}"
-    echo -e "  Compile: ${CYAN}g++ -std=c++17 myapp.cpp -Iinclude/linux${NC}"
+    echo -e "  Compile: ${CYAN}g++ -std=c++17 myapp.cpp -Isdk/include/linux${NC}"
     echo -e "  Header-only, zero deps. Builds on control.h."
     echo ""
 
@@ -3758,10 +3758,10 @@ sdk_cross() {
     echo ""
 
     echo -e "${BOLD}Headers:${NC}"
-    echo -e "  ${CYAN}include/portable/socketley/ws_client.h${NC}     — WebSocket + raw TCP"
-    echo -e "  ${CYAN}include/portable/socketley/cache_client.h${NC}  — Cache text protocol"
-    echo -e "  ${CYAN}include/darwin/socketley/ws_client.h${NC}      — (identical copy)"
-    echo -e "  ${CYAN}include/darwin/socketley/cache_client.h${NC}   — (identical copy)"
+    echo -e "  ${CYAN}sdk/include/portable/socketley/ws_client.h${NC}     — WebSocket + raw TCP"
+    echo -e "  ${CYAN}sdk/include/portable/socketley/cache_client.h${NC}  — Cache text protocol"
+    echo -e "  ${CYAN}sdk/include/darwin/socketley/ws_client.h${NC}      — (identical copy)"
+    echo -e "  ${CYAN}sdk/include/darwin/socketley/cache_client.h${NC}   — (identical copy)"
     echo ""
 
     echo -e "${BOLD}ws_client.h:${NC}"
@@ -3782,10 +3782,10 @@ sdk_cross() {
     echo -e "  cl /std:c++17 /I include\\windows app.cpp"
     echo ""
     echo -e "  # clang++ (macOS)"
-    echo -e "  clang++ -std=c++17 -I include/darwin app.cpp -o app"
+    echo -e "  clang++ -std=c++17 -I sdk/include/darwin app.cpp -o app"
     echo ""
     echo -e "  # g++ (Linux)"
-    echo -e "  g++ -std=c++17 -I include/linux app.cpp -o app${NC}"
+    echo -e "  g++ -std=c++17 -I sdk/include/linux app.cpp -o app${NC}"
     echo ""
 
     read -p "Press Enter to continue..." || true

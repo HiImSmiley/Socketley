@@ -1,11 +1,11 @@
-// socketley/runtime/client.h -- a client runtime you can inherit from
+// socketley/runtime/instance.h -- the base every runtime type shares
 //
 // Tier 3: the class you inherit from to give the daemon a runtime type it has
 // never heard of, paired with <socketley/worker.h>.
 //
-//   class kvdb final : public client_instance {
+//   class kvdb final : public runtime_instance {
 //   public:
-//       explicit kvdb(std::string_view n) : client_instance(n) { ... }
+//       explicit kvdb(std::string_view n) : runtime_instance(n) { ... }
 //   };
 //
 // The path below is relative to this header rather than to an include path,
@@ -17,4 +17,4 @@
 #  error "Socketley requires Linux (io_uring)"
 #endif
 
-#include "../../../../socketley/runtime/client/client_instance.h"
+#include "../../../../../socketley/shared/runtime/runtime_instance.h"

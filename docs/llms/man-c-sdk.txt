@@ -2,7 +2,7 @@
 
 From the manual page socketley(1).
 
-Socketley ships a modular C++ SDK in three tiers, in **include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
+Socketley ships a modular C++ SDK in three tiers, in **sdk/include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
 
 | Tier | Header | Use Case | Dependencies |
 |---|---|---|---|
@@ -111,7 +111,7 @@ int main() {
     socketley::ctl::stop("myapp");
     socketley::ctl::remove("myapp");
 }
-// g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
+// g++ -std=c++17 myapp.cpp -Isdk/include/linux -o myapp
 ```
 
 **Example: fleet management with globs**
@@ -404,7 +404,7 @@ loop.run();
 
 ## Cross-Platform SDK (Windows / macOS)
 
-These header-only TCP clients connect to Socketley runtimes from non-Linux platforms. One copy lives in **include/portable/socketley/**, and a program reaches it as **<socketley/ws_client.h>** from any of *include/linux*, *include/darwin* or *include/windows*.
+These header-only TCP clients connect to Socketley runtimes from non-Linux platforms. One copy lives in **sdk/include/portable/socketley/**, and a program reaches it as **<socketley/ws_client.h>** from any of *sdk/include/linux*, *sdk/include/darwin* or *sdk/include/windows*.
 
 **socketley/ws_client.h** is a WebSocket (RFC 6455) and raw TCP client for server runtimes. It embeds its own SHA-1 and Base64, so it needs no OpenSSL. Its modes are **ws_mode::websocket** and **ws_mode::raw_tcp**.
 
@@ -417,10 +417,10 @@ Build with C++17; there are no external dependencies:
 cl /std:c++17 /I include\windows app.cpp
 
 # clang++ (macOS)
-clang++ -std=c++17 -I include/darwin app.cpp -o app
+clang++ -std=c++17 -I sdk/include/darwin app.cpp -o app
 
 # g++ (Linux)
-g++ -std=c++17 -I include/linux app.cpp -o app
+g++ -std=c++17 -I sdk/include/linux app.cpp -o app
 ```
 
 ## Tier 3: Daemon Attach (header-only)
@@ -453,7 +453,7 @@ int main() {
     // Your accept loop here...
     // atexit() automatically calls daemon_detach()
 }
-// g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
+// g++ -std=c++17 myapp.cpp -Isdk/include/linux -o myapp
 ```
 
 **daemon_attach()** returns false when the process is not allowed to open the daemon's IPC socket. Every **socketley** command needs the same permission; see **THE IPC SOCKET** under **FILES**. A program that runs as a different user from the daemon must be in the **socketley** group to register with it. A false result is not an error to abort on. The example above shows the intended pattern: the program runs standalone and is simply not listed in the daemon's inventory.

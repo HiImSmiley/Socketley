@@ -114,7 +114,7 @@ EOF
 BUILT=1
 for f in detach hold; do
     sdk_cxx "$SOCKETLEY_TMPD/$f.cpp" \
-        -I"$ROOT" -I"$ROOT/include/linux" \
+        -I"$ROOT" -I"$ROOT/sdk/include/linux" \
         -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
         -o "$SOCKETLEY_TMPD/$f" 2>>"$SOCKETLEY_TMPD/gxx.err" || BUILT=0
 done

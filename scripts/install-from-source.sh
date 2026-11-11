@@ -16,8 +16,8 @@
 #   build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl
 #                                 Dockerfile builder stage, ci.yml, release.yml
 #   liburing >= 2.7, from source  scripts/install-liburing.sh, which owns the pin
-#   thirdparty/luajit/libluajit.a bin/build-thirdparty.sh luajit, as CI runs it
-#   premake5 gmake2, release_<arch>  CLAUDE.md's build section, release.yml; make/Makefile names the arch
+#   thirdparty/luajit/libluajit.a scripts/build-thirdparty.sh luajit, as CI runs it
+#   premake5 gmake2, release_<arch>  release.yml; make/Makefile names the arch
 #   Linux 5.19                    README.md's Requirements, sdk/CMakeLists.txt:5
 #   x86_64 or aarch64             premake5.lua's target_arch; on aarch64 premake is built, with uuid-dev
 #
@@ -25,7 +25,7 @@
 # ci.yml and are deliberately absent here: they belong to the test suite, the
 # man page render check and libFuzzer, none of which an install runs.
 #
-# `bin/build-thirdparty.sh luajit` and not `all`, which is what the Dockerfile,
+# `scripts/build-thirdparty.sh luajit` and not `all`, which is what the Dockerfile,
 # ci.yml and release.yml all do.  `all` also drops thirdparty/liburing/liburing.a
 # into a directory that is on the link path, so -luring resolves to it and the
 # result is a statically linked liburing -- not what this project ships, and not
@@ -314,7 +314,7 @@ fi
 ARCH="$(uname -m)"
 # Who runs the install, through sudo or not, and is given the daemon's socket.
 ADMIN_USER="${SUDO_USER:-$(id -un)}"
-# bin/premake5 is an x86-64 binary, so on aarch64 premake is built from source, and its bootstrap links libuuid.
+# scripts/premake5 is an x86-64 binary, so on aarch64 premake is built from source, and its bootstrap links libuuid.
 ARCH_DEPS=""
 case "$ARCH" in
     x86_64) ;;
@@ -362,7 +362,7 @@ if [ -r /proc/sys/kernel/io_uring_disabled ]; then
 fi
 
 # ── Are we in a socketley clone at all ──────────────────────────────────────
-for f in premake5.lua bin/premake5 bin/build-thirdparty.sh scripts/install-liburing.sh \
+for f in premake5.lua scripts/premake5 scripts/build-thirdparty.sh scripts/install-liburing.sh \
          man/socketley.1 man/socketley-help.sh packaging/socketley.service; do
     if [ ! -e "$ROOT/$f" ]; then
         fail "$ROOT does not look like a socketley clone: $f is missing" \
@@ -402,7 +402,7 @@ if [ "$SKIP_DEPS" = 0 ] && [ "$IS_DEBIAN" = 0 ]; then
          "as capabilities rather than package names:" \
          "  a C++ compiler: GCC 12 or newer, and make" \
          "  OpenSSL headers and libraries (libssl, libcrypto)" \
-         "  LuaJIT: a static libluajit-5.1.a, or none and bin/build-thirdparty.sh builds one" \
+         "  LuaJIT: a static libluajit-5.1.a, or none and scripts/build-thirdparty.sh builds one" \
          "  git and a CA bundle, for the two source clones the build makes" \
          "" \
          "liburing is not on that list: scripts/install-liburing.sh builds the pinned release" \
@@ -554,17 +554,17 @@ run bash scripts/install-liburing.sh
 # luajit only, and not `all`; the header of this file says why.  The script
 # leaves an existing archive alone, so a second run costs one stat.
 step "building the vendored LuaJIT archive" \
-     "bin/build-thirdparty.sh luajit failed; the first run needs git and a network"
-run bash bin/build-thirdparty.sh luajit
+     "scripts/build-thirdparty.sh luajit failed; the first run needs git and a network"
+run bash scripts/build-thirdparty.sh luajit
 # HTTP/3's libraries, OpenSSL 3.5 with them; a few minutes once, a few stats after.
 step "building OpenSSL 3.5, ngtcp2 and nghttp3 for HTTP/3" \
-     "bin/build-thirdparty.sh http3 failed; it needs perl, cmake, git and a network"
-run bash bin/build-thirdparty.sh http3
+     "scripts/build-thirdparty.sh http3 failed; it needs perl, cmake, git and a network"
+run bash scripts/build-thirdparty.sh http3
 
 # ── Makefiles, then the Release build ───────────────────────────────────────
-step "premake for this machine" "bin/build-thirdparty.sh premake failed; on aarch64 it needs uuid-dev, git and a network"
-run bash bin/build-thirdparty.sh premake
-PREMAKE=./bin/premake5
+step "premake for this machine" "scripts/build-thirdparty.sh premake failed; on aarch64 it needs uuid-dev, git and a network"
+run bash scripts/build-thirdparty.sh premake
+PREMAKE=./scripts/premake5
 "$PREMAKE" --version >/dev/null 2>&1 || PREMAKE=./thirdparty/premake/premake5
 step "generating makefiles" "$PREMAKE gmake2 failed; check that it is executable"
 run "$PREMAKE" gmake2

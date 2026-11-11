@@ -34,7 +34,7 @@ Its **--help** explains how to list every command without running any, and how t
 To install from a tree that is already built:
 
 ```
-sudo bash packaging/install.sh
+sudo bash packaging/install-local.sh
 sudo systemctl start socketley
 ```
 

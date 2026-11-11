@@ -36,7 +36,7 @@ echo ""
 
 # Build
 g++ -std=c++17 -O2 \
-    -I"${SCRIPT_DIR}/../../include/linux" \
+    -I"${SCRIPT_DIR}/../../sdk/include/linux" \
     "${SCRIPT_DIR}/echo-service.cpp" \
     -o /tmp/echo-service
 

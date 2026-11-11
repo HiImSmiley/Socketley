@@ -1,11 +1,11 @@
-// socketley/runtime/cache.h -- a cache runtime you can inherit from
+// socketley/runtime/proxy.h -- a proxy runtime you can inherit from
 //
 // Tier 3: the class you inherit from to give the daemon a runtime type it has
 // never heard of, paired with <socketley/worker.h>.
 //
-//   class kvdb final : public cache_instance {
+//   class kvdb final : public proxy_instance {
 //   public:
-//       explicit kvdb(std::string_view n) : cache_instance(n) { ... }
+//       explicit kvdb(std::string_view n) : proxy_instance(n) { ... }
 //   };
 //
 // The path below is relative to this header rather than to an include path,
@@ -17,4 +17,4 @@
 #  error "Socketley requires Linux (io_uring)"
 #endif
 
-#include "../../../../socketley/runtime/cache/cache_instance.h"
+#include "../../../../../socketley/runtime/proxy/proxy_instance.h"

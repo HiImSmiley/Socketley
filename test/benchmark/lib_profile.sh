@@ -70,16 +70,16 @@ profile_symbol_build() {   # ROOT LOGFILE -> path on stdout
     fi
     (
         cd "$root" || exit 2
-        ./bin/premake5 gmake2 >/dev/null 2>&1 || exit 2
+        ./scripts/premake5 gmake2 >/dev/null 2>&1 || exit 2
         sed -i 's/-m64 -s -flto=auto/-m64 -flto=auto/' make/socketley.make
         rm -f "$root/bin/Release/socketley"
         if ! make -C make config=release_x64 -j"$(nproc)" >"$log" 2>&1; then
-            ./bin/premake5 gmake2 >/dev/null 2>&1
+            ./scripts/premake5 gmake2 >/dev/null 2>&1
             exit 2
         fi
         mkdir -p "$root/bin/Profile"
         cp "$root/bin/Release/socketley" "$bin"
-        ./bin/premake5 gmake2 >/dev/null 2>&1
+        ./scripts/premake5 gmake2 >/dev/null 2>&1
         rm -f "$root/bin/Release/socketley"
         make -C make config=release_x64 -j"$(nproc)" >>"$log" 2>&1 || exit 2
     ) || return 1

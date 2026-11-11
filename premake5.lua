@@ -35,7 +35,7 @@ workspace "Socketley"
     externalincludedirs { "thirdparty/liburing" }
     libdirs { "thirdparty/liburing" }
 
-    -- HTTP/3: OpenSSL 3.5, ngtcp2 and nghttp3 as bin/build-thirdparty.sh http3
+    -- HTTP/3: OpenSSL 3.5, ngtcp2 and nghttp3 as scripts/build-thirdparty.sh http3
     -- leaves them in thirdparty/, put before the system's so every project
     -- compiles and links against the one OpenSSL, statically.  Without them the
     -- tree builds as before against the system's OpenSSL, and a storage runtime
@@ -50,10 +50,10 @@ workspace "Socketley"
         end
         return { "ssl", "crypto" }
     end
-    -- Archives built from other pins than bin/build-thirdparty.sh names are another library: one from before
+    -- Archives built from other pins than scripts/build-thirdparty.sh names are another library: one from before
     -- enable-ktls builds a binary that never hands a key to the kernel, and says so nowhere.
     if http3 then
-        local script = io.readfile("bin/build-thirdparty.sh") or ""
+        local script = io.readfile("scripts/build-thirdparty.sh") or ""
         local want = {}
         for _, pin in ipairs({ "OPENSSL_TAG", "OPENSSL_OPTIONS_TAG", "NGHTTP3_TAG", "NGTCP2_TAG" }) do
             table.insert(want, script:match("\n" .. pin .. "=(%S+)") or "?")
@@ -61,8 +61,8 @@ workspace "Socketley"
         want = table.concat(want, " ")
         local built = (io.readfile("thirdparty/ngtcp2/.built") or ""):gsub("%s+$", "")
         if built ~= want then
-            io.stderr:write("premake5: thirdparty/ was built from '" .. built .. "', bin/build-thirdparty.sh pins '"
-                .. want .. "': run bin/build-thirdparty.sh http3\n")
+            io.stderr:write("premake5: thirdparty/ was built from '" .. built .. "', scripts/build-thirdparty.sh pins '"
+                .. want .. "': run scripts/build-thirdparty.sh http3\n")
         end
     end
     if http3 then
@@ -285,7 +285,7 @@ project "socketley"
     includedirs {
         "socketley",
         -- The SDK's public headers, because worker_api.cpp implements one.
-        "include/linux"
+        "sdk/include/linux"
     }
 
     -- The liburing floor, checked before anything in this project compiles.
@@ -311,6 +311,8 @@ project "socketley"
         "socketley/**.h",
         "socketley/**.cpp"
     }
+    -- The bash builtin is a library of its own, loaded by bash.
+    removefiles { "socketley/bash/**" }
 
     filter "system:linux"
         systemversion "latest"
@@ -352,7 +354,7 @@ project "socketley_bash"
     pic "On"
     includedirs { "socketley" }
     files {
-        "bash/socketley_builtin.cpp",
+        "socketley/bash/socketley_builtin.cpp",
         "socketley/shared/ipc/daemon_request.cpp",
         "socketley/shared/ipc/daemon_client.cpp",
         "socketley/shared/persist/paths.cpp"
@@ -384,7 +386,7 @@ project "socketley_sdk"
     includedirs {
         ".",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -444,7 +446,7 @@ project "socketley_sdk_nolua"
     includedirs {
         ".",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     defines { "SOCKETLEY_NO_LUA" }
@@ -842,7 +844,7 @@ project "test_managed_runtime"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -882,7 +884,7 @@ project "test_write_queue"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -922,7 +924,7 @@ project "test_worker_map"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -991,7 +993,7 @@ project "test_sdk_control"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
-    includedirs { "include/linux" }
+    includedirs { "sdk/include/linux" }
 
     files { "test/unit/test_sdk_control.cpp" }
 
@@ -1195,7 +1197,7 @@ project "test_sdk_engine"
 
     includedirs {
         ".",
-        "include/linux",
+        "sdk/include/linux",
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley"
@@ -1236,7 +1238,7 @@ project "test_sdk_runtime"
 
     includedirs {
         ".",
-        "include/linux",
+        "sdk/include/linux",
         "thirdparty/sol2",
         "thirdparty/luajit",
         "thirdparty/doctest",
@@ -1274,7 +1276,7 @@ project "test_sdk_ws_client"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
-    includedirs { "include/linux" }
+    includedirs { "sdk/include/linux" }
 
     files { "test/unit/test_sdk_ws_client.cpp" }
 
@@ -1758,7 +1760,7 @@ project "fuzz_storage_parsers"
     language "C++"
     cppdialect "C++latest"
 
-    includedirs { ".", "socketley", "test/fuzz", "thirdparty/sol2", "thirdparty/luajit", "include/linux" }
+    includedirs { ".", "socketley", "test/fuzz", "thirdparty/sol2", "thirdparty/luajit", "sdk/include/linux" }
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
@@ -1906,7 +1908,7 @@ project "fuzz_http_request"
         "test/fuzz",
         "thirdparty/sol2",
         "thirdparty/luajit",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -1954,7 +1956,7 @@ project "fuzz_server_ops"
         "test/fuzz",
         "thirdparty/sol2",
         "thirdparty/luajit",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -1980,7 +1982,7 @@ project "fuzz_client_ops"
         "test/fuzz",
         "thirdparty/sol2",
         "thirdparty/luajit",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2026,7 +2028,7 @@ project "fuzz_proxy_ops"
         "test/fuzz",
         "thirdparty/sol2",
         "thirdparty/luajit",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2050,7 +2052,7 @@ project "test_sdk_cache_client"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
-    includedirs { "include/linux" }
+    includedirs { "sdk/include/linux" }
 
     files { "test/unit/test_sdk_cache_client.cpp" }
 
@@ -2086,7 +2088,7 @@ project "test_conn_transfer"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2126,7 +2128,7 @@ project "test_ring_read"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2166,7 +2168,7 @@ project "test_udp_recv_ladder"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2204,7 +2206,7 @@ project "test_loop_kernel_floor"
         ".",
         "thirdparty/doctest",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2445,7 +2447,7 @@ project "test_raft_storage"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2485,7 +2487,7 @@ project "test_object_store"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2523,7 +2525,7 @@ project "test_storage_multipart"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2561,7 +2563,7 @@ project "test_storage_select"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2599,7 +2601,7 @@ project "test_storage_federation"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -2637,7 +2639,7 @@ project "test_storage_compression"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -3012,7 +3014,7 @@ project "test_scrypt"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -3050,7 +3052,7 @@ project "test_https_client"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -3088,7 +3090,7 @@ project "test_storage_shards"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -3126,7 +3128,7 @@ project "test_storage_crash"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -3164,7 +3166,7 @@ project "test_outbox"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -3203,7 +3205,7 @@ project "bench_conn_transfer"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
@@ -3405,7 +3407,7 @@ project "test_mail_more"
         "thirdparty/sol2",
         "thirdparty/luajit",
         "socketley",
-        "include/linux"
+        "sdk/include/linux"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }

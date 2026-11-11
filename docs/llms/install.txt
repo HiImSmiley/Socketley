@@ -49,18 +49,18 @@ Checks the kernel, architecture and compiler (GCC 12 or newer), builds liburing 
 3. The third-party archives.
 
    ```
-   ./bin/build-thirdparty.sh                 # the static archives the tree links, HTTP/3 included
+   ./scripts/build-thirdparty.sh                 # the static archives the tree links, HTTP/3 included
    ```
 4. Build.
 
    ```
-   ./bin/premake5 gmake2
+   ./scripts/premake5 gmake2
    make -C make config=release_x64 -j$(nproc)
    ```
 5. Optionally, install system-wide.
 
    ```
-   sudo bash packaging/install.sh            # optional: system-wide, with the service
+   sudo bash packaging/install-local.sh            # optional: system-wide, with the service
    ```
 
 Without installing, `./bin/Release/socketley daemon &` starts a development daemon on `/tmp/socketley.sock` with state under your home directory; see [environment & files](env.txt).

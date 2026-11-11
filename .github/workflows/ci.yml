@@ -99,7 +99,7 @@ jobs:
           # and a half-installed toolchain should fail here where the error is
           # legible rather than three steps later.
           clang++-18 --version
-          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
 
       - name: Install liburing
         run: bash scripts/install-liburing.sh
@@ -130,7 +130,7 @@ jobs:
           echo "man/socketley.1 renders clean."
 
       - name: Generate Makefiles
-        run: ./bin/premake5 gmake2
+        run: ./scripts/premake5 gmake2
 
       - name: Build (Debug)
         run: cd make && make config=debug_x64 -j"$(nproc)"
@@ -312,7 +312,7 @@ jobs:
             clang++-18 -std=c++23 -Wall -Wextra -m64 -g -O0 -c "$f" \
               -o "/tmp/clangobj/$(echo "$f" | tr '/' '_').o" \
               -DSOCKETLEY_LINUX -DDEBUG \
-              -I. -Isocketley -Iinclude/linux \
+              -I. -Isocketley -Isdk/include/linux \
               -isystem thirdparty/sol2 -isystem thirdparty/luajit \
               >> clang-warnings.log 2>&1 || fail=1
           done

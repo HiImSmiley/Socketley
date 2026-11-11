@@ -131,11 +131,11 @@ test/benchmark/bench_client
 # deliberate decision the old comment asked for and did not enforce.
 .claude/
 
-# Built by bin/build-thirdparty.sh http3, headers and archives alike.
+# Built by scripts/build-thirdparty.sh http3, headers and archives alike.
 /thirdparty/openssl/
 /thirdparty/ngtcp2/
 /thirdparty/nghttp3/
 
-# scripts/update.sh: which pins of bin/build-thirdparty.sh the archives here were built from
+# scripts/update.sh: which pins of scripts/build-thirdparty.sh the archives here were built from
 thirdparty/.built-versions
 thirdparty/premake/

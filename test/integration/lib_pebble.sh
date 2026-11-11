@@ -6,6 +6,6 @@ case "$(uname -m)" in
     aarch64|arm64) PEBBLE_ARCH=arm64 ;;
     *)             PEBBLE_ARCH=amd64 ;;
 esac
-PEBBLE_DIR="${PEBBLE_DIR:-$HOME/socketley-perf/acme}"
+PEBBLE_DIR="${PEBBLE_DIR:-$HOME/.local/share/socketley-test/acme}"
 PEBBLE="$PEBBLE_DIR/pebble-linux-$PEBBLE_ARCH/linux/$PEBBLE_ARCH/pebble"
 CHALL="$PEBBLE_DIR/pebble-challtestsrv-linux-$PEBBLE_ARCH/linux/$PEBBLE_ARCH/pebble-challtestsrv"

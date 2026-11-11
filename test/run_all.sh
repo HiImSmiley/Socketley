@@ -42,8 +42,8 @@ echo "Port window:    $SL_PORT_BASE-$((SL_PORT_BASE + 1999))"
 # What the caller installed under their own home stays found -- python's --user packages, the Pebble the ACME tests
 # default to, the compatibility clients -- since the private HOME below is for socketley's state alone.
 export PYTHONUSERBASE="${PYTHONUSERBASE:-$HOME/.local}"
-export PEBBLE_DIR="${PEBBLE_DIR:-$HOME/socketley-perf/acme}"
-export SOCKETLEY_COMPAT_BIN="${SOCKETLEY_COMPAT_BIN:-$HOME/socketley-perf/compat/bin}"
+export PEBBLE_DIR="${PEBBLE_DIR:-$HOME/.local/share/socketley-test/acme}"
+export SOCKETLEY_COMPAT_BIN="${SOCKETLEY_COMPAT_BIN:-$HOME/.local/share/socketley-test/compat/bin}"
 SUITE_HOME=$(mktemp -d "${TMPDIR:-/tmp}/socketley-suite-home.XXXXXX") || {
     echo "ERROR: could not create a private HOME for this run"; exit 1; }
 export HOME="$SUITE_HOME"

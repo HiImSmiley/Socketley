@@ -18,7 +18,7 @@
 #   1. git fetch; fast-forward the branch, never reset or merge -- a clone with
 #      changes of its own, or one that has diverged, is reported and left alone
 #   2. the vendored LuaJIT, OpenSSL, ngtcp2 and nghttp3 are built only when an
-#      archive is missing or bin/build-thirdparty.sh pins another version
+#      archive is missing or scripts/build-thirdparty.sh pins another version
 #   3. premake5 gmake2, make the socketley target, check the binary runs
 #   4. note which runtimes are running; keep the installed binary as
 #      /var/lib/socketley/socketley.prev; install binary, man page, help, unit
@@ -229,23 +229,23 @@ if [ -z "$JOBS" ]; then
     JOBS=$(( NPROC < BY_MEM ? NPROC : BY_MEM ))
 fi
 
-# A pin changed in bin/build-thirdparty.sh is a different library: built again, as a missing archive is.
-PINS="$(grep -E '^[A-Z0-9_]+_TAG=' bin/build-thirdparty.sh | sha256sum | cut -c1-16)"
+# A pin changed in scripts/build-thirdparty.sh is a different library: built again, as a missing archive is.
+PINS="$(grep -E '^[A-Z0-9_]+_TAG=' scripts/build-thirdparty.sh | sha256sum | cut -c1-16)"
 if [ "$(cat "$TP_STAMP" 2>/dev/null || true)" != "$PINS" ]; then rm -f "$TP_STAMP"; REBUILD_TP=1; else REBUILD_TP=0; fi
 if [ "$REBUILD_TP" = 1 ] || [ ! -f thirdparty/luajit/libluajit.a ]; then
-    step "building the vendored LuaJIT" "bin/build-thirdparty.sh luajit needs git and a network"
-    bash bin/build-thirdparty.sh luajit
+    step "building the vendored LuaJIT" "scripts/build-thirdparty.sh luajit needs git and a network"
+    bash scripts/build-thirdparty.sh luajit
 fi
 if [ "$REBUILD_TP" = 1 ] || [ ! -f thirdparty/openssl/lib/libssl.a ] || [ ! -f thirdparty/ngtcp2/lib/libngtcp2.a ] \
    || [ ! -f thirdparty/ngtcp2/lib/libngtcp2_crypto_ossl.a ] || [ ! -f thirdparty/nghttp3/lib/libnghttp3.a ]; then
     step "building OpenSSL 3.5, ngtcp2 and nghttp3 for HTTP/3 (a few minutes)" \
-         "bin/build-thirdparty.sh http3 needs perl, cmake, git and a network"
-    bash bin/build-thirdparty.sh http3
+         "scripts/build-thirdparty.sh http3 needs perl, cmake, git and a network"
+    bash scripts/build-thirdparty.sh http3
 fi
 echo "$PINS" > "$TP_STAMP"
 
-bash bin/build-thirdparty.sh premake >/dev/null || fail "premake could not be built for this machine" "bash bin/build-thirdparty.sh premake"
-PREMAKE=./bin/premake5
+bash scripts/build-thirdparty.sh premake >/dev/null || fail "premake could not be built for this machine" "bash scripts/build-thirdparty.sh premake"
+PREMAKE=./scripts/premake5
 "$PREMAKE" --version >/dev/null 2>&1 || PREMAKE=./thirdparty/premake/premake5
 step "generating makefiles" "$PREMAKE gmake2 failed"
 "$PREMAKE" gmake2 >/dev/null 2>&1 || "$PREMAKE" gmake2

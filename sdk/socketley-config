@@ -60,14 +60,14 @@ if [ "$want_libs" = 1 ] || [ "$want_pc" = 1 ]; then
     fi
 fi
 
-CFLAGS="-I$ROOT/include/linux"
+CFLAGS="-I$ROOT/sdk/include/linux"
 CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/liburing"
 CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/sol2"
 CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/luajit"
 
 LIBS="-L$LIBDIR -L$ROOT/thirdparty/luajit -L$ROOT/thirdparty/liburing"
 TLSLIBS="-lssl -lcrypto"
-# A tree built with HTTP/3 (bin/build-thirdparty.sh http3) compiled the engine against the static OpenSSL 3.5 in
+# A tree built with HTTP/3 (scripts/build-thirdparty.sh http3) compiled the engine against the static OpenSSL 3.5 in
 # thirdparty/ and calls ngtcp2 and nghttp3: a program links those, and that OpenSSL rather than the system's, whose
 # version the engine's structures do not match.
 if [ -f "$ROOT/thirdparty/ngtcp2/lib/libngtcp2.a" ] && [ -f "$ROOT/thirdparty/openssl/lib/libssl.a" ] &&

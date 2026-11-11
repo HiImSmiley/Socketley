@@ -2,9 +2,9 @@
 
 Control a daemon, embed the engine, or attach a process of your own to a daemon.
 
-The C++ SDK in `include/linux/socketley/` has three tiers. Examples are in `sdk/examples`, and the test suite builds each one.
+The C++ SDK in `sdk/include/linux/socketley/` has three tiers. Examples are in `sdk/examples`, and the test suite builds each one.
 
-Socketley ships a modular C++ SDK in three tiers, in **include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
+Socketley ships a modular C++ SDK in three tiers, in **sdk/include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
 
 | Tier | Header | Use Case | Dependencies |
 |---|---|---|---|

@@ -11,9 +11,9 @@
 # built here, headers and all, into thirdparty/{openssl,ngtcp2,nghttp3}, which
 # git ignores, and need perl and cmake.
 #
-# `premake` builds premake itself into thirdparty/premake/, only where bin/premake5, an x86-64 binary, cannot run.
+# `premake` builds premake itself into thirdparty/premake/, only where scripts/premake5, an x86-64 binary, cannot run.
 #
-#   ./bin/build-thirdparty.sh [liburing|luajit|http3|premake|all]
+#   ./scripts/build-thirdparty.sh [liburing|luajit|http3|premake|all]
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WHAT=${1:-all}
@@ -24,7 +24,7 @@ OPENSSL_TAG=openssl-3.5.9
 OPENSSL_OPTIONS_TAG=enable-ktls
 NGHTTP3_TAG=v1.18.0
 NGTCP2_TAG=v1.25.0
-PREMAKE_REF=v5.0.0-beta8   # bin/premake5's version; not a _TAG, so a change here rebuilds no library in scripts/update.sh
+PREMAKE_REF=v5.0.0-beta8   # scripts/premake5's version; not a _TAG, so a change here rebuilds no library in scripts/update.sh
 
 build_liburing() {
   local tmp; tmp=$(mktemp -d)
@@ -100,8 +100,8 @@ build_luajit() {
 
 build_premake() {
   echo "== premake"
-  if "$ROOT/bin/premake5" --version >/dev/null 2>&1; then
-    echo "   bin/premake5 runs here, nothing to build"
+  if "$ROOT/scripts/premake5" --version >/dev/null 2>&1; then
+    echo "   scripts/premake5 runs here, nothing to build"
     return 0
   fi
   local dest="$ROOT/thirdparty/premake/premake5"

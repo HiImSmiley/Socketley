@@ -24467,7 +24467,7 @@ the script installed.
 .SS Quick Install
 To install from a tree that is already built:
 .nf
-sudo bash packaging/install.sh
+sudo bash packaging/install-local.sh
 sudo systemctl start socketley
 .fi
 .SS Debian Package
@@ -26116,7 +26116,7 @@ with the shards' values added together. For example,
 reads the 99th percentile of the proxy request histogram.
 .SH C++ SDK
 Socketley ships a modular C++ SDK in three tiers, in
-.BR include/linux/socketley/ .
+.BR sdk/include/linux/socketley/ .
 Tiers 1 and 3 are self-contained, header-only files.
 Copy them anywhere and compile with
 .BR "g++ -std=c++17" ;
@@ -26233,7 +26233,7 @@ int main() {
     socketley::ctl::stop("myapp");
     socketley::ctl::remove("myapp");
 }
-// g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
+// g++ -std=c++17 myapp.cpp -Isdk/include/linux -o myapp
 .fi
 .PP
 .B "Example: fleet management with globs"
@@ -26558,11 +26558,11 @@ loop.run();
 .SS Cross-Platform SDK (Windows / macOS)
 These header-only TCP clients connect to Socketley runtimes from non-Linux platforms.
 One copy lives in
-.BR include/portable/socketley/ ,
+.BR sdk/include/portable/socketley/ ,
 and a program reaches it as
 .B <socketley/ws_client.h>
 from any of
-.IR include/linux ", " include/darwin " or " include/windows .
+.IR sdk/include/linux ", " sdk/include/darwin " or " sdk/include/windows .
 .PP
 .B socketley/ws_client.h
 is a WebSocket (RFC 6455) and raw TCP client for server runtimes.
@@ -26585,10 +26585,10 @@ Build with C++17; there are no external dependencies:
 cl /std:c++17 /I include\\windows app.cpp
 
 # clang++ (macOS)
-clang++ -std=c++17 -I include/darwin app.cpp -o app
+clang++ -std=c++17 -I sdk/include/darwin app.cpp -o app
 
 # g++ (Linux)
-g++ -std=c++17 -I include/linux app.cpp -o app
+g++ -std=c++17 -I sdk/include/linux app.cpp -o app
 .fi
 .RE
 .SS Tier 3: Daemon Attach (header-only)
@@ -26627,7 +26627,7 @@ int main() {
     // Your accept loop here...
     // atexit() automatically calls daemon_detach()
 }
-// g++ -std=c++17 myapp.cpp -Iinclude/linux -o myapp
+// g++ -std=c++17 myapp.cpp -Isdk/include/linux -o myapp
 .fi
 .PP
 .B daemon_attach()

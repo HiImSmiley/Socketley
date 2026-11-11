@@ -275,7 +275,7 @@ run_floor_comparison() {
     ensure_socketley_bench || return 1
     if [[ ! -x "$FLOOR_BIN" ]]; then
         log_info "Building floor_server..."
-        (cd "$PROJECT_ROOT" && ./bin/premake5 gmake2 >/dev/null 2>&1 && \
+        (cd "$PROJECT_ROOT" && ./scripts/premake5 gmake2 >/dev/null 2>&1 && \
          cd make && make config=release_x64 floor_server -j"$(nproc)" >/dev/null 2>&1) \
             || { log_error "Failed to build floor_server"; return 1; }
     fi

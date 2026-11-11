@@ -166,7 +166,7 @@ if want fuzz_http_request || want fuzz_server_ops || want fuzz_client_ops || \
 SDK_OBJ="$OUT/sdk-obj"
 mkdir -p "$SDK_OBJ"
 
-SDK_INC=(-I"$ROOT" -I"$ROOT/socketley" -I"$ROOT/include/linux" -I"$ROOT/test/fuzz"
+SDK_INC=(-I"$ROOT" -I"$ROOT/socketley" -I"$ROOT/sdk/include/linux" -I"$ROOT/test/fuzz"
          -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit")
 SDK_DEF=(-DSOCKETLEY_LINUX -DDEBUG -DSOCKETLEY_INVARIANTS)
 
@@ -202,7 +202,7 @@ sdk_object_current() {
 # duplicated here, so a file added to the SDK cannot silently go un-fuzzed.
 SDK_MAKE="$ROOT/make/socketley_sdk.make"
 if [ ! -f "$SDK_MAKE" ]; then
-    echo "  runtime targets: $SDK_MAKE not found — run ./bin/premake5 gmake2 first"
+    echo "  runtime targets: $SDK_MAKE not found — run ./scripts/premake5 gmake2 first"
     rc=2
 else
     mapfile -t SDK_SRCS < <(grep -oE '\.\./[A-Za-z0-9_/.-]+\.cpp' "$SDK_MAKE" | sort -u | sed "s|^\.\./|$ROOT/|")

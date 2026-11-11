@@ -6,7 +6,7 @@
 # Two claims the SDK makes, both of which were false when they were first
 # measured:
 #
-# 1. `include/linux/socketley/daemon.h` documents a four-line main() that serves
+# 1. `sdk/include/linux/socketley/daemon.h` documents a four-line main() that serves
 #    the control socket.  It did serve it -- `ls` and `stats` worked -- but it
 #    could not start a single runtime.  The supervisor forks and execs
 #    self_exe() with `proxy-worker`, and a custom binary that does not dispatch
@@ -90,7 +90,7 @@ case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
 
 build() {   # build <src> <out>
     sdk_cxx "$1" \
-        -I"$ROOT" -I"$ROOT/include/linux" \
+        -I"$ROOT" -I"$ROOT/sdk/include/linux" \
         -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
         -L"$ROOT/thirdparty/liburing" $("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) \
         -o "$2" 2>"$SOCKETLEY_TMPD/gxx.err"

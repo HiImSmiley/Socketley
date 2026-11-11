@@ -76,7 +76,7 @@ if command -v g++ >/dev/null 2>&1 && [ -f "$BINDIR/libsocketley_sdk.a" ]; then
     case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
     if sdk_cxx \
            "$ROOT/sdk/examples/custom-type/greeter_worker.cpp" \
-           -I"$ROOT" -I"$ROOT/include/linux" \
+           -I"$ROOT" -I"$ROOT/sdk/include/linux" \
            -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
            -L"$ROOT/thirdparty/liburing" $("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) \
            -o "$SOCKETLEY_TMPD/greeter-worker" 2>"$SOCKETLEY_TMPD/gxx.err"

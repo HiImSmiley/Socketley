@@ -92,7 +92,7 @@ int main(int argc, char** argv)
 }
 EOF
     if sdk_cxx "$SOCKETLEY_TMPD/mine.cpp" \
-         -I"$ROOT" -I"$ROOT/include/linux" \
+         -I"$ROOT" -I"$ROOT/sdk/include/linux" \
          -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
          -L"$ROOT/thirdparty/liburing" $("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) \
          -o "$SOCKETLEY_TMPD/mine" 2>"$SOCKETLEY_TMPD/gxx.err"; then

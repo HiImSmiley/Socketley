@@ -7,7 +7,7 @@
 // fork+exec on start, auto-restart on crash, re-launch on daemon boot.
 //
 // BUILD:
-//   g++ -std=c++17 -I/path/to/socketley/include/linux echo-service.cpp -o echo-service
+//   g++ -std=c++17 -I/path/to/socketley/sdk/include/linux echo-service.cpp -o echo-service
 //
 // USAGE (standalone, self-attaches):
 //   ./echo-service

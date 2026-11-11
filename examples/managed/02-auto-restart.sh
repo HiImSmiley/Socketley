@@ -39,7 +39,7 @@ echo ""
 # Build and register
 echo "[1/5] Building echo-service..."
 g++ -std=c++17 -O2 \
-    -I"${SCRIPT_DIR}/../../include/linux" \
+    -I"${SCRIPT_DIR}/../../sdk/include/linux" \
     "${SCRIPT_DIR}/echo-service.cpp" \
     -o /tmp/echo-service
 

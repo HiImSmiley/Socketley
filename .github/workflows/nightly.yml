@@ -109,12 +109,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (Sanitize)
         run: |
-          ./bin/premake5 gmake2
+          ./scripts/premake5 gmake2
           cd make && make config=sanitize_x64 -j"$(nproc)"
 
       - name: Verify the build
@@ -199,7 +199,7 @@ jobs:
           # where the error names the cause.
           sudo apt-get install -y $APT_PACKAGES clang-18 libclang-rt-18-dev
           clang++-18 --version
-          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       # Carry-over.  The key rotates per run so each night writes a new entry;
@@ -242,7 +242,7 @@ jobs:
         # and would have exited 1 on that alone.  Nobody saw it because the job
         # has not reached the end of the target list since 2026-07-28.
         run: |
-          ./bin/premake5 gmake2
+          ./scripts/premake5 gmake2
           cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops
           cd ..
           for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops; do
@@ -810,14 +810,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (Debug + invariants, warn-only)
         # The generated makefiles pass $(CPPFLAGS) through, which is how
         # invariants.h documents turning itself on — no build system change.
         run: |
-          ./bin/premake5 gmake2
+          ./scripts/premake5 gmake2
           cd make
           make config=debug_x64 -j"$(nproc)" \
             CPPFLAGS="-DSOCKETLEY_INVARIANTS -DSOCKETLEY_INVARIANTS_WARN_ONLY"
@@ -919,12 +919,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (Release)
         run: |
-          ./bin/premake5 gmake2
+          ./scripts/premake5 gmake2
           cd make && make config=release_x64 -j"$(nproc)"
           cd ..
           test -x bin/Release/socketley || { echo "no bin/Release/socketley"; exit 1; }
@@ -982,12 +982,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (TSan)
         run: |
-          ./bin/premake5 gmake2
+          ./scripts/premake5 gmake2
           cd make && make config=tsan_x64 -j"$(nproc)"
           cd ..
           test -x bin/TSan/socketley || { echo "no bin/TSan/socketley"; exit 1; }
@@ -1034,7 +1034,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
+          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (Release) and fail on any warning
@@ -1042,7 +1042,7 @@ jobs:
         # A warning that only appears under LTO or -D_FORTIFY_SOURCE=2 appears
         # nowhere else in this pipeline.
         run: |
-          ./bin/premake5 gmake2
+          ./scripts/premake5 gmake2
           cd make
           set -o pipefail
           make config=release_x64 -j"$(nproc)" 2>&1 | tee ../release-build.log

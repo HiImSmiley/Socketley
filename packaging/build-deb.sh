@@ -10,7 +10,7 @@ CONFIG="$(sed -n 's/^  config=debug_/release_/p' "$PROJECT_ROOT/make/Makefile")"
 case "$CONFIG" in
     release_x64) ARCH="amd64" ;;
     release_arm64) ARCH="arm64" ;;
-    *) echo "error: run ./bin/premake5 gmake2 first, make/Makefile names no known configuration"; exit 1 ;;
+    *) echo "error: run ./scripts/premake5 gmake2 first, make/Makefile names no known configuration"; exit 1 ;;
 esac
 PKG_DIR="$PROJECT_ROOT/socketley_${VERSION}_${ARCH}"
 
@@ -125,7 +125,7 @@ emit_notice "LuaJIT"   "statically linked into /usr/bin/socketley" \
     thirdparty/luajit/COPYRIGHT
 emit_notice "sol2"     "header-only, compiled into /usr/bin/socketley" \
     thirdparty/sol2/LICENSE.txt
-# The documented build links liburing's archive from bin/build-thirdparty.sh; one against a shared liburing names it in Depends.
+# The documented build links liburing's archive from scripts/build-thirdparty.sh; one against a shared liburing names it in Depends.
 if objdump -p "$BINARY" | grep -q 'NEEDED *liburing\.so'; then
     URING_HOW="dynamically linked (see Depends)"
 else
@@ -133,7 +133,7 @@ else
 fi
 emit_notice "liburing" "$URING_HOW" \
     thirdparty/liburing/LICENSE
-# HTTP/3's libraries, when bin/build-thirdparty.sh http3 built them in: OpenSSL is then linked statically too.
+# HTTP/3's libraries, when scripts/build-thirdparty.sh http3 built them in: OpenSSL is then linked statically too.
 if [ -f thirdparty/ngtcp2/COPYING ]; then
     emit_notice "OpenSSL"  "statically linked into /usr/bin/socketley" thirdparty/openssl/LICENSE.txt
     emit_notice "ngtcp2"   "statically linked into /usr/bin/socketley" thirdparty/ngtcp2/COPYING
@@ -152,7 +152,7 @@ mkdir "$SHLIBS_DIR/debian"
 printf 'Source: socketley\n\nPackage: socketley\nArchitecture: any\n' > "$SHLIBS_DIR/debian/control"
 if ! SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "$PKG_DIR/usr/bin/socketley" "$PKG_DIR/usr/lib/socketley/socketley-bash.so" 2>/dev/null); then
     rm -rf "$SHLIBS_DIR" "$PKG_DIR"
-    echo "error: a library the binary loads belongs to no package; run bin/build-thirdparty.sh and build again"
+    echo "error: a library the binary loads belongs to no package; run scripts/build-thirdparty.sh and build again"
     exit 1
 fi
 rm -rf "$SHLIBS_DIR"

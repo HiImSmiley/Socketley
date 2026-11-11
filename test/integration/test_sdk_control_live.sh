@@ -185,7 +185,7 @@ SANFLAGS=""
 case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
 
 if sdk_cxx "$SOCKETLEY_TMPD/probe.cpp" \
-     -I"$ROOT" -I"$ROOT/include/linux" \
+     -I"$ROOT" -I"$ROOT/sdk/include/linux" \
      -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
      -o "$SOCKETLEY_TMPD/probe" 2>"$SOCKETLEY_TMPD/gxx.err"
 then ok
@@ -285,7 +285,7 @@ fi
 MISSING=""
 while read -r fn; do
     grep -q "^$fn	" "$SOCKETLEY_TMPD/probe.out" || MISSING="$MISSING $fn"
-done < <(grep -oP '^inline result \K[a-z_0-9]+' "$ROOT/include/linux/socketley/control.h" | sort -u)
+done < <(grep -oP '^inline result \K[a-z_0-9]+' "$ROOT/sdk/include/linux/socketley/control.h" | sort -u)
 
 if [ -z "$MISSING" ]; then ok; else
     bad "every function control.h declares is called here" \

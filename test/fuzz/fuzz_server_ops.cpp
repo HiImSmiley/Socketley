@@ -447,7 +447,7 @@ uint16_t next_port()
         // window 21000 came back 139/2 with fuzz targets live and 141/0 on a
         // quiet machine.
         //
-        // So the range is overridable, and test/nightly.sh points the fuzz job
+        // So the range is overridable, and the nightly run points the fuzz job
         // at 31000-32767 -- still below ephemeral, and the one stretch no
         // window reaches.  Unset, this is what it always was.
         base = 20000;

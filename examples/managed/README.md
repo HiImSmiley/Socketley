@@ -49,7 +49,7 @@ Minimal echo server using the C++ SDK (`attach.h`). Works both standalone
 and as a managed binary.
 
 ```bash
-g++ -std=c++17 -I../../include/linux echo-service.cpp -o echo-service
+g++ -std=c++17 -I../../sdk/include/linux echo-service.cpp -o echo-service
 ```
 
 ### 01 - Add and Run

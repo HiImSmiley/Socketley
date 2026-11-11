@@ -29,12 +29,12 @@ bash scripts/install-from-source.sh</pre>
 <li><p>liburing, if yours is older than 2.7.</p>
 <pre class="code">bash scripts/install-liburing.sh          <i># liburing &gt;= 2.7, only if yours is older</i></pre></li>
 <li><p>The third-party archives.</p>
-<pre class="code">./bin/build-thirdparty.sh                 <i># the static archives the tree links, HTTP/3 included</i></pre></li>
+<pre class="code">./scripts/build-thirdparty.sh                 <i># the static archives the tree links, HTTP/3 included</i></pre></li>
 <li><p>Build.</p>
-<pre class="code">./bin/premake5 gmake2
+<pre class="code">./scripts/premake5 gmake2
 make -C make config=release_x64 -j$(nproc)</pre></li>
 <li><p>Optionally, install system-wide.</p>
-<pre class="code">sudo bash packaging/install.sh            <i># optional: system-wide, with the service</i></pre></li>
+<pre class="code">sudo bash packaging/install-local.sh            <i># optional: system-wide, with the service</i></pre></li>
 </ol>
 <p>Without installing, <code>./bin/Release/socketley daemon &amp;</code> starts a development daemon on <code>/tmp/socketley.sock</code> with state under your home directory; see <a href="#/env">environment &amp; files</a>.</p>
 
