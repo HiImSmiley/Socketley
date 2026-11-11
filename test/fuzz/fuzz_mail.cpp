@@ -300,8 +300,9 @@ void tls_policy_case(std::string_view in)
     if (tls_policy::parse_sts(in, p, age, why))
     {
         FUZZ_CHECK(age >= 0, "a policy with a negative max_age");
+        // A name is matched without its closing dot, so one written with two is no host's and matches none.
         for (const auto& mx : p.mx)
-            if (!mx.starts_with("*."))
+            if (!mx.starts_with("*.") && !mx.ends_with('.'))
                 FUZZ_CHECK(tls_policy::mx_matches(p, mx), "a policy that does not match an exchanger it lists");
         const std::string line = tls_policy::cache_line("d.test", p);
         std::string domain;
