@@ -2211,7 +2211,10 @@ bool run_step(world& w, const step& s)
             }
             else
             {
-                CACHE_CHECK(r == -1, "linsert() on a list answered neither a length nor -1");
+                CACHE_CHECK(r == -1 || r == cache_store::linsert_refused,
+                            "linsert() on a list answered neither a length, -1 nor a refusal");
+                CACHE_CHECK((r == -1) == (at == e.list.end()),
+                            "linsert() answered -1 beside a pivot the list holds, or a refusal beside one it does not");
                 if (at != e.list.end())
                     CACHE_FINDING("write-refused", refusal_excusable(),
                                   "an LINSERT was refused that there was room for after eviction");
