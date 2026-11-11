@@ -90,16 +90,23 @@ Socketley is about the technology more than about a product. It asks how far a h
 followed all the way through: one io_uring event loop per process, owned by a single thread, every service a
 runtime of the same binary, and each runtime a worker process of its own on such a loop.
 
-What a research project owes is that its claims hold, so most of the work goes into checking them:
+## How it is tested
 
-- **Every change runs the whole suite twice before it lands**: once optimised, and once under AddressSanitizer and
-  UndefinedBehaviorSanitizer, where any report fails the run. Both builds compile with zero warnings.
-- **765 test files per run**: 687 integration tests that start a real daemon and talk to it over real sockets with
-  ordinary clients, 64 unit test programs, and 28 fuzz targets over a corpus of more than a thousand inputs.
+Most of the work on Socketley is proving it. Nothing that touches the engine lands on `main` before the whole suite has
+passed on that exact tree, in two builds, and that has happened hundreds of times:
+
+- **765 test files and more than 13,000 checks per run.** 687 integration tests start a real daemon and drive it over
+  real sockets with real clients; beside them run 64 unit test programs and 28 fuzz targets over a corpus of more than
+  a thousand inputs.
+- **Every run twice.** Once as the optimised release build, and once under AddressSanitizer and
+  UndefinedBehaviorSanitizer with recovery off, where a single report fails the run. Both builds compile with zero
+  warnings.
+- **A test counts once it has failed.** A new test is put against the defect it is about before it is trusted; a test
+  that passes with the bug still in measures nothing.
 - **Benchmarks against the established tool for each job**, such as Redis for the cache, measured A/B and interleaved
   on a quiet machine, with the CPU spent beside the latency.
-- **Every release is installed in clean Ubuntu and Debian containers**, where it creates all 15 runtimes, survives a
-  restart with its runtimes intact, and serves apps in C, Rust and Node built against the SDK while they are under load.
+- **Every release in clean Ubuntu and Debian containers**, where it creates all 15 runtimes, comes back from a restart
+  with its runtimes intact, and serves apps in C, Rust and Node built against the SDK while they are under load.
 
 ## About Me and the Project
 
