@@ -625,9 +625,11 @@ void idp_run::route(const std::shared_ptr<conn>& c, request& rq)
         return;
     }
     // A form that signs in or changes an account is taken only from this provider's pages, or a browser on another
-    // site could post one and sign its visitor into an account of the site's choosing.
+    // site could post one and sign its visitor into an account of the site's choosing; a name under --cookie-domain is
+    // another's page too, which the session cookie goes to all the same.
     if (post && (p == "/login" || p == "/authorize" || p == "/consent" || p == "/device" || p.starts_with("/account")) &&
-        !form_origin_allowed(rq.origin.empty() ? rq.referer : rq.origin, m_issuer, m_cookie_domain))
+        (rq.fetch_site.empty() ? !form_origin_allowed(rq.origin.empty() ? rq.referer : rq.origin, m_issuer, {})
+                               : rq.fetch_site != "same-origin" && rq.fetch_site != "none"))
     {
         respond(c, 403, "text/plain", "a form posted from another site is not taken here\n");
         return;

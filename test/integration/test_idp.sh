@@ -725,6 +725,25 @@ expect "a sign-out sends a browser to no such address" \
 expect "but to one under the cookie domain" \
     "$(curl -s -o /dev/null -w '%{redirect_url}' "http://127.0.0.1:$P2/logout?post_logout_redirect_uri=https%3A%2F%2Fapp.example.com%2Fx")" \
     "https://app.example.com/x"
+# A name under the cookie domain is given the session cookie and is still another's page: its form signs nobody in
+# and allows no device, as a tunnel's share or a bucket's website there would have a signed-in browser post.
+"$BIN" idp-user auth2 add carol --password carolpassword1 >/dev/null 2>&1
+F2() { curl -s -o /dev/null -w '%{http_code}' -X POST "${@:2}" -d "$1" "http://127.0.0.1:$P2/login"; }
+expect "a sign-in posted from a name under the cookie domain is refused" \
+    "$(F2 'rd=/&username=carol&password=carolpassword1' -H 'Origin: https://share.example.com')" 403
+expect "so is one a browser calls same-site" \
+    "$(F2 'rd=/&username=carol&password=carolpassword1' -H 'Origin: https://share.example.com' -H 'Sec-Fetch-Site: same-site')" 403
+expect "and one whose Referer is a page there" \
+    "$(F2 'rd=/&username=carol&password=carolpassword1' -H 'Referer: https://share.example.com/page')" 403
+expect "the provider's own page still signs in, by its Origin" \
+    "$(F2 'rd=/&username=carol&password=carolpassword1' -H 'Origin: https://auth.example.com')" 302
+expect "and by what the browser says of it, under whichever of its names it was asked" \
+    "$(F2 'rd=/&username=carol&password=carolpassword1' -H 'Origin: https://login.example.com' -H 'Sec-Fetch-Site: same-origin')" 302
+CAROL=$(curl -s -i -X POST -H 'Origin: https://auth.example.com' -d 'rd=/&username=carol&password=carolpassword1' "http://127.0.0.1:$P2/login" | sed -n 's/^[Ss]et-[Cc]ookie: \(skl_idp=[^;]*\).*/\1/p' | head -1)
+expect "a device allowed from a page under the cookie domain is refused before its code is looked at" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Cookie: $CAROL" -H 'Origin: https://share.example.com' -d 'user_code=ABCD-EFGH&action=allow' "http://127.0.0.1:$P2/device")" 403
+expect "where the provider's own page is answered that the code is not known" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Cookie: $CAROL" -H 'Origin: https://auth.example.com' -d 'user_code=ABCD-EFGH&action=allow' "http://127.0.0.1:$P2/device")" 400
 
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
