@@ -183,7 +183,8 @@ build_http3() {
   git clone --depth 1 --branch "$NGTCP2_TAG" --recurse-submodules https://github.com/ngtcp2/ngtcp2.git "$tmp/ngtcp2" >/dev/null 2>&1 \
     || { echo "   FAILED: could not clone ngtcp2"; return 2; }
   rm -rf "$tc"
-  ( cmake -S "$tmp/ngtcp2" -B "$tmp/ngtcp2/b" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$tc" \
+  # CMake from 3.31 asks pkg-config what a static OpenSSL needs, and the system's own answers for the system's build.
+  ( PKG_CONFIG_LIBDIR="$ossl/lib/pkgconfig" cmake -S "$tmp/ngtcp2" -B "$tmp/ngtcp2/b" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$tc" \
         -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_STATIC_LIB=ON -DENABLE_SHARED_LIB=OFF -DENABLE_LIB_ONLY=ON \
         -DENABLE_OPENSSL=ON -DOPENSSL_ROOT_DIR="$ossl" -DOPENSSL_USE_STATIC_LIBS=ON \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null 2>&1 && cmake --build "$tmp/ngtcp2/b" -j"$jobs" >/dev/null && \

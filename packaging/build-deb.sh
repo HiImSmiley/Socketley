@@ -249,7 +249,7 @@ rm -rf "$PKG_DIR"
 echo "built: socketley_${VERSION}_${ARCH}.deb"
 
 # The library and the C header, for programs that carry their runtimes themselves.
-DEV_DIR="socketley-dev_${VERSION}_${ARCH}"
+DEV_DIR="$PROJECT_ROOT/socketley-dev_${VERSION}_${ARCH}"
 rm -rf "$DEV_DIR"
 mkdir -p "$DEV_DIR/DEBIAN" "$DEV_DIR/usr/lib/pkgconfig" "$DEV_DIR/usr/include/socketley" "$DEV_DIR/usr/share/doc/socketley-dev"
 install -m 644 "$PROJECT_ROOT/bin/Release/libsocketley.so" "$DEV_DIR/usr/lib/libsocketley.so"

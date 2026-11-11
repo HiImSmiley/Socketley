@@ -1,9 +1,10 @@
-// A website whose /api is this program: `cargo run --example web_app -- 8080 ./public`.
+// A website whose /api is this program: `cargo run --example web_app -- 8080 /srv/site`.
 use std::{env, thread, time::Duration};
 
 fn main() -> Result<(), socketley::Error> {
     let port = env::args().nth(1).unwrap_or_else(|| "8080".into());
     let root = env::args().nth(2).unwrap_or_else(|| ".".into());
+    let root = std::fs::canonicalize(&root).map_err(|e| socketley::Error(format!("{root}: {e}")))?.display().to_string();
     let engine = socketley::Engine::new()?;
     let kv = engine.runtime("cache", "kv", &format!("-p {}", port.parse::<u32>().unwrap_or(8080) + 1))?;
     kv.start()?;

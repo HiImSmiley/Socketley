@@ -4,7 +4,7 @@
 const { Engine } = require('socketley');
 
 const port = Number(process.argv[2] || 8080);
-const root = process.argv[3] || '.';
+const root = require('path').resolve(process.argv[3] || '.');
 
 const engine = new Engine();
 const kv = engine.runtime('cache', 'kv', `-p ${port + 1}`).start();
