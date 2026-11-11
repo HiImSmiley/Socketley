@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The SDK runs every runtime type.** `socketley::any_runtime` takes a type name
+  and the flags `socketley create` takes, read by the daemon's own parsers, and
+  `flags()` on the four typed classes reaches every flag they had no setter
+  for. `socketley-config` gained `--no-lua` and `--version`. The SDK's CMake
+  build compiles again; its `install` target, which never produced headers that
+  compile, is gone, so the SDK is used from a checkout.
+
+- **The repository's layout.** The SDK's headers are in `sdk/include/`, and
+  `premake5` and `build-thirdparty.sh` in `scripts/`.
+
 - **A client script's sends and reads cost less.** `self.send` of a short line
   copies it into a stage through LuaJIT's FFI with no call into C, a
   one-connection client reads into 240 KiB buffers rather than 64 KiB, a line

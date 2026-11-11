@@ -3386,9 +3386,10 @@ sdk_overview() {
     echo ""
 
     echo -e "${BOLD}Examples:${NC}"
-    echo -e "  ${CYAN}sdk/examples/daemon_control.cpp${NC}        — Tier 1 control"
-    echo -e "  ${CYAN}sdk/examples/standalone_server.cpp${NC}     — Tier 2 engine"
-    echo -e "  ${CYAN}sdk/examples/standalone_server_lua.cpp${NC} — Tier 2 with Lua"
+    echo -e "  ${CYAN}sdk/examples/basic/daemon_control.cpp${NC}  — Tier 1 control"
+    echo -e "  ${CYAN}sdk/examples/basic/echo_server.cpp${NC}     — Tier 2 engine"
+    echo -e "  ${CYAN}sdk/examples/basic/echo_server_lua.cpp${NC} — Tier 2 with Lua"
+    echo -e "  ${CYAN}sdk/examples/basic/any_runtime.cpp${NC}     — Tier 2, any runtime type"
     echo ""
 
     read -p "Press Enter to continue..." || true

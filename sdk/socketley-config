@@ -25,14 +25,17 @@ CONFIG=${SOCKETLEY_CONFIG:-Release}
 
 usage()
 {
-    echo "usage: socketley-config [--config <name>] [--cflags] [--libs] [--pc] [--root]"
+    echo "usage: socketley-config [--config <name>] [--no-lua] [--cflags] [--libs] [--pc] [--root] [--version]"
     echo "  --config   build directory under bin/ (default: \$SOCKETLEY_CONFIG or Release)"
+    echo "  --no-lua   the library built without LuaJIT"
 }
 
 want_cflags=0
 want_libs=0
 want_pc=0
 want_root=0
+no_lua=0
+LIB=socketley_sdk
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -40,6 +43,8 @@ while [ $# -gt 0 ]; do
         --libs)    want_libs=1 ;;
         --pc)      want_pc=1 ;;
         --root)    want_root=1 ;;
+        --no-lua)  no_lua=1; LIB=socketley_sdk_nolua ;;
+        --version) sed -n 's/^#define SOCKETLEY_VERSION "\(.*\)"/\1/p' "$ROOT/socketley/shared/util/version.h"; exit 0 ;;
         --config)  shift; [ $# -gt 0 ] || { echo "--config needs a name"; exit 1; }
                    CONFIG=$1 ;;
         -h|--help) usage; exit 0 ;;
@@ -53,8 +58,8 @@ LIBDIR="$ROOT/bin/$CONFIG"
 # A missing library is the failure this script exists to make legible: without
 # the check the flags print happily and the link fails on socketley symbols.
 if [ "$want_libs" = 1 ] || [ "$want_pc" = 1 ]; then
-    if [ ! -f "$LIBDIR/libsocketley_sdk.a" ]; then
-        echo "no libsocketley_sdk.a in $LIBDIR -- build it with"
+    if [ ! -f "$LIBDIR/lib$LIB.a" ]; then
+        echo "no lib$LIB.a in $LIBDIR -- build it with"
         echo "  make -C make config=$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')_x64"
         exit 2
     fi
@@ -71,17 +76,22 @@ TLSLIBS="-lssl -lcrypto"
 # thirdparty/ and calls ngtcp2 and nghttp3: a program links those, and that OpenSSL rather than the system's, whose
 # version the engine's structures do not match.
 if [ -f "$ROOT/thirdparty/ngtcp2/lib/libngtcp2.a" ] && [ -f "$ROOT/thirdparty/openssl/lib/libssl.a" ] &&
-   { [ ! -f "$LIBDIR/libsocketley_sdk.a" ] || grep -aq ngtcp2_conn_server_new "$LIBDIR/libsocketley_sdk.a"; }; then
+   { [ ! -f "$LIBDIR/lib$LIB.a" ] || grep -aq ngtcp2_conn_server_new "$LIBDIR/lib$LIB.a"; }; then
     CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/openssl/include"
     LIBS="$LIBS -L$ROOT/thirdparty/ngtcp2/lib -L$ROOT/thirdparty/nghttp3/lib -L$ROOT/thirdparty/openssl/lib"
     TLSLIBS="-lngtcp2_crypto_ossl -lngtcp2 -lnghttp3 -lssl -lcrypto -ldl"
 fi
-LIBS="$LIBS -lsocketley_sdk -lluajit -Wl,-Bstatic -luring -Wl,-Bdynamic $TLSLIBS -pthread"
+if [ "$no_lua" = 1 ]; then
+    CFLAGS="$CFLAGS -DSOCKETLEY_NO_LUA"
+    LIBS="$LIBS -l$LIB -Wl,-Bstatic -luring -Wl,-Bdynamic $TLSLIBS -pthread"
+else
+    LIBS="$LIBS -l$LIB -lluajit -Wl,-Bstatic -luring -Wl,-Bdynamic $TLSLIBS -pthread"
+fi
 
 if [ "$want_pc" = 1 ]; then
     cat <<EOF
 Name: socketley
-Description: Long-living network runtimes: server, client, proxy, cache
+Description: Network runtimes, embedded: servers, proxies, caches, websites, storage and the rest
 Version: $("$ROOT/bin/$CONFIG/socketley" --version 2>/dev/null | head -1 || echo 0)
 Cflags: $CFLAGS
 Libs: $LIBS

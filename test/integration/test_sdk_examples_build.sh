@@ -4,10 +4,10 @@
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
-# There are fourteen programs under sdk/examples/ and exactly one of them was
-# ever compiled by this suite -- greeter_worker.cpp, as a side effect of
-# test_registered_type.sh needing a worker binary.  The other thirteen, every
-# one of basic/ and advanced/ among them, were only ever read.
+# Of the programs under sdk/examples/, exactly one was ever compiled by this
+# suite -- greeter_worker.cpp, as a side effect of test_registered_type.sh
+# needing a worker binary.  The others, every one of basic/ and advanced/ among
+# them, were only ever read.
 #
 # They are the SDK's documentation.  A header that changes shape breaks them
 # silently, and the first person to find out is someone following the file that

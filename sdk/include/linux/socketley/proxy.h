@@ -16,7 +16,7 @@ public:
     // routes by path prefix "/<name>/" -- a GET that does not start with it is
     // answered 404 before any backend is consulted, exactly as the daemon's
     // named proxies behave.  So proxy(8443, "gw") serves /gw/..., and the
-    // default name serves /_sdk_proxy/....  protocol_tcp has no prefix.
+    // default name serves /_sdk_proxy/....  protocol_tcp has no prefix, and neither has a proxy given --domain.
     explicit proxy(uint16_t port, std::string_view name = "_sdk_proxy")
         : m_name(name) {
         m_mgr.create(runtime_proxy, m_name);
@@ -41,6 +41,9 @@ public:
     }
 
     // ── Chainable config ────────────────────────────────────────────────
+    // Any flag `socketley create` takes for this type, spelled the same: flags("--bind 127.0.0.1 --compress gzip").
+    // One that is refused prints why, and start() then answers false.
+    proxy& flags(std::string_view line) { if (!apply_create_flags(raw(), m_mgr, line)) m_refused = true; return *this; }
     // `host:port`, `unix:/path/to.sock`, or `@group` — every spelling
     // `--backend` takes.
     proxy& backend(std::string_view addr)  { prx()->add_backend(addr); return *this; }
@@ -183,6 +186,7 @@ public:
     // produced one, is in the log already; the LOG_ERROR here is for the paths
     // that produce none (a TCP bind failure returns false silently).
     bool start() {
+        if (m_refused) return false;
         if (!m_loop.init()) return false;
         const detail::signal_scope signals(&m_loop);
         if (!m_mgr.start(m_name, m_loop) || raw()->get_state() != runtime_running) {
@@ -215,6 +219,7 @@ private:
     runtime_instance* raw() { return m_mgr.get(m_name); }
     proxy_instance*   prx() { return static_cast<proxy_instance*>(raw()); }
 
+    bool            m_refused = false;
     std::string     m_name;
     event_loop      m_loop;
     runtime_manager m_mgr;

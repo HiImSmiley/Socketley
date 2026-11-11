@@ -1682,67 +1682,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 
     for (size_t i = 3; i < pa.count; ++i)
     {
-        int result = parse_common_flags(instance, pa, i, autostart, lua_script);
-        if (result == -1)
-        {
-            switch (type)
-            {
-                case runtime_server:
-                    result = parse_server_flags(
-                        static_cast<server_instance*>(instance), pa, i, &m_manager, name);
-                    break;
-                case runtime_client:
-                    result = parse_client_flags(
-                        static_cast<client_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_proxy:
-                    result = parse_proxy_flags(
-                        static_cast<proxy_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_cache:
-                    result = parse_cache_flags(
-                        static_cast<cache_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_storage:
-                    result = parse_storage_flags(
-                        static_cast<storage_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_dns:
-                    result = parse_dns_flags(static_cast<dns_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_sync:
-                    result = parse_sync_flags(static_cast<sync_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_idp:
-                    result = parse_idp_flags(static_cast<idp_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_db:
-                    result = parse_db_flags(static_cast<db_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_mqtt:
-                    result = parse_mqtt_flags(static_cast<mqtt_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_mail:
-                    result = parse_mail_flags(static_cast<mail_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_tunnel:
-                    result = parse_tunnel_flags(static_cast<tunnel_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_metrics:
-                    result = parse_metrics_flags(static_cast<metrics_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_mcp:
-                    result = parse_mcp_flags(static_cast<mcp_instance*>(instance), pa, i, name);
-                    break;
-                case runtime_web:
-                    result = parse_web_flags(static_cast<web_instance*>(instance), pa, i, name);
-                    break;
-                default:
-                    // A registered type's flags come from its manifest schema.
-                    result = type_manifest::parse_registered_flag(instance, pa, i);
-                    break;
-            }
-        }
+        const int result = parse_create_flag(instance, type, pa, i, autostart, lua_script, &m_manager, name);
 
         if (result == -1)
         {

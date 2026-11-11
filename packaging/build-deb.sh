@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BINARY="$PROJECT_ROOT/bin/Release/socketley"
-VERSION="${1:-1.1.0}"
+VERSION="${1:-$(sed -n 's/^#define SOCKETLEY_VERSION "\(.*\)"/\1/p' "$PROJECT_ROOT/socketley/shared/util/version.h")}"
 # The configuration premake5.lua made, and the Debian name of its architecture.
 CONFIG="$(sed -n 's/^  config=debug_/release_/p' "$PROJECT_ROOT/make/Makefile")"
 case "$CONFIG" in
@@ -164,7 +164,7 @@ Architecture: $ARCH
 Maintainer: Socketley Developers
 Description: Network runtime daemon with Docker-style management
  Socketley is a Linux-only daemon that manages long-living network
- runtimes (server, client, proxy, cache) in a Docker-like style.
+ runtimes (servers, proxies, caches, websites, storage and more) in a Docker-like style.
 Depends: $DEPENDS
 Section: net
 Priority: optional

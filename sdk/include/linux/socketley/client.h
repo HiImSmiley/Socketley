@@ -36,6 +36,9 @@ public:
     }
 
     // ── Chainable config ────────────────────────────────────────────────
+    // Any flag `socketley create` takes for this type, spelled the same: flags("--bind 127.0.0.1 --compress gzip").
+    // One that is refused prints why, and start() then answers false.
+    client& flags(std::string_view line) { if (!apply_create_flags(raw(), m_mgr, line)) m_refused = true; return *this; }
     // Dial over TLS.  Complete on its own for this role: a client has no
     // listener to present a certificate on, the host from the constructor is
     // pinned before the ClientHello, and the chain is verified against the
@@ -119,6 +122,7 @@ public:
     // produced one, is in the log already; the LOG_ERROR here is for the paths
     // that produce none (a TCP bind failure returns false silently).
     bool start() {
+        if (m_refused) return false;
         if (!m_loop.init()) return false;
         const detail::signal_scope signals(&m_loop);
         if (!m_mgr.start(m_name, m_loop) || raw()->get_state() != runtime_running) {
@@ -151,6 +155,7 @@ private:
     runtime_instance* raw() { return m_mgr.get(m_name); }
     client_instance*  cli() { return static_cast<client_instance*>(raw()); }
 
+    bool            m_refused = false;
     std::string     m_name;
     event_loop      m_loop;
     runtime_manager m_mgr;

@@ -57,7 +57,7 @@ of the `ctl::cache_*` Tier-1 functions work against it too.
 - **Restart safety.** `set_persistent` means a killed `jobd` comes back with
   its queue; run the submit lines, Ctrl-C, restart, and `status` still shows
   the depth.
-- **Polling is the contract, and it is named.** The text protocol has no
-  blocking pop, so the worker's sleep interval is the latency floor for a
-  queued job. If that matters, the store's pub/sub (`publish`/`subscribe`) can
+- **Polling is the contract, and it is named.** `blpop` holds only on an
+  unsharded cache, so the worker polls with `lpop`, and its sleep interval is
+  the latency floor for a queued job. If that matters, the store's pub/sub (`publish`/`subscribe`) can
   wake workers instead — see the cross-platform client's `subscribe()`.

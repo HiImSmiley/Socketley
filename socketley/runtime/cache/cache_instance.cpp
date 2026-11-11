@@ -12403,7 +12403,6 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     }
 }
 
-#ifndef SOCKETLEY_NO_LUA
 void cache_instance::repl_unfaithful(std::string_view key)
 {
     ++m_repl_unfaithful;
@@ -12415,6 +12414,8 @@ void cache_instance::repl_unfaithful(std::string_view key)
                    "on a follower; " + std::to_string(m_repl_unfaithful)
                    + " command(s) have now been held back").c_str());
 }
+
+#ifndef SOCKETLEY_NO_LUA
 
 // ─── EVAL's way into the cache ──────────────────────────────────────────────
 //

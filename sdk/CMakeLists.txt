@@ -7,6 +7,8 @@ endif()
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# GNU mode defines `unix` and `linux` as macros, and the engine has variables of those names.
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ── Optional: disable Lua/LuaJIT ─────────────────────────────────────────────
 option(SOCKETLEY_NO_LUA "Build without LuaJIT/sol2 support" OFF)
@@ -25,11 +27,13 @@ add_library(socketley_sdk STATIC ${SDK_SOURCES})
 target_include_directories(socketley_sdk PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/linux"
     "${CMAKE_CURRENT_SOURCE_DIR}/.."                    # repo root (socketley/...)
+    "${CMAKE_CURRENT_SOURCE_DIR}/../socketley"          # the engine includes itself from here
     "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/sol2"
     "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/luajit"
 )
 
 # ── Compile definitions ───────────────────────────────────────────────────────
+target_compile_definitions(socketley_sdk PRIVATE SOCKETLEY_LINUX)
 if(SOCKETLEY_NO_LUA)
     target_compile_definitions(socketley_sdk PUBLIC SOCKETLEY_NO_LUA)
 endif()
@@ -62,18 +66,6 @@ if(NOT SOCKETLEY_NO_LUA)
     endif()
 endif()
 
-# ── Install rules ─────────────────────────────────────────────────────────────
-include(GNUInstallDirs)
-
-install(TARGETS socketley_sdk
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-)
-
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/linux/socketley/"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/socketley"
-    FILES_MATCHING PATTERN "*.h"
-)
-
 # ── Examples ──────────────────────────────────────────────────────────────────
 option(SOCKETLEY_BUILD_EXAMPLES "Build SDK examples" OFF)
 
@@ -98,6 +90,18 @@ if(SOCKETLEY_BUILD_EXAMPLES)
 
     add_executable(redis_cache examples/basic/redis_cache.cpp)
     target_link_libraries(redis_cache PRIVATE socketley_sdk)
+
+    add_executable(store examples/basic/store.cpp)
+    target_link_libraries(store PRIVATE socketley_sdk)
+
+    add_executable(any_runtime examples/basic/any_runtime.cpp)
+    target_link_libraries(any_runtime PRIVATE socketley_sdk)
+
+    add_executable(counter_daemon examples/custom-daemon/counter_daemon.cpp)
+    target_link_libraries(counter_daemon PRIVATE socketley_sdk)
+
+    add_executable(kvdb_worker examples/nosql-runtime/kvdb_worker.cpp)
+    target_link_libraries(kvdb_worker PRIVATE socketley_sdk)
 
     if(NOT SOCKETLEY_NO_LUA)
         add_executable(echo_server_lua examples/basic/echo_server_lua.cpp)

@@ -13451,7 +13451,7 @@ same port number over UDP.
 This requires a build with HTTP/3, which
 .B stats
 shows as \fBh3:1\fR.
-\fBbin/build\-thirdparty.sh http3\fR builds the static OpenSSL 3.5, ngtcp2 and nghttp3
+\fBscripts/build\-thirdparty.sh http3\fR builds the static OpenSSL 3.5, ngtcp2 and nghttp3
 that HTTP/3 needs, and the install script runs it.
 .PP
 Every answer over TCP carries
@@ -24467,7 +24467,7 @@ the script installed.
 .SS Quick Install
 To install from a tree that is already built:
 .nf
-sudo bash packaging/install-local.sh
+sudo bash packaging/install\-local.sh
 sudo systemctl start socketley
 .fi
 .SS Debian Package
@@ -26259,7 +26259,7 @@ socketley::ctl::cache_del("store", "user:1");
 socketley::ctl::cache_flush("store", "/tmp/store.bin");
 .fi
 .SS Tier 2: Embed Engine (build from source)
-Tier 2 embeds the full io_uring event loop and all four runtime types in your own binary.
+Tier 2 embeds the full io_uring event loop and a runtime of any type in your own binary.
 It gives maximum performance, with no IPC overhead.
 It requires
 .B libsocketley_sdk.a
@@ -26272,7 +26272,29 @@ Headers:
 .B socketley/server.h ,
 .B socketley/client.h ,
 .B socketley/proxy.h ,
-.B socketley/cache.h .
+.B socketley/cache.h
+for C++ hooks, and
+.B socketley/any_runtime.h
+for every other type.
+.PP
+.B any_runtime
+takes a type name, a name and the flags
+.B socketley create
+takes for that type, read by the daemon's own parsers:
+.nf
+socketley::any_runtime site("web", "site", "\-p 8080 \-\-root /srv/site \-\-lua\-pages");
+if (!site.start()) return 1;
+.fi
+.PP
+.BR server ", " client ", " proxy " and " cache
+accept the same through
+.BR flags() :
+.BR "srv.flags(""\-\-bind 127.0.0.1"")" .
+A refused flag prints why and
+.B start()
+then answers false.
+.B \-\-shards
+is refused, because shards are forked by the daemon.
 .PP
 Define
 .B SOCKETLEY_NO_LUA

@@ -6,7 +6,7 @@
 //   g++ -std=c++23 sdk/examples/basic/echo_server_lua.cpp \
 //       $(sdk/socketley-config --cflags --libs) -o /tmp/echo_server_lua
 //
-// Run: /tmp/echo_server_lua sdk/examples/server_config.lua
+// Run: /tmp/echo_server_lua sdk/examples/basic/echo.lua
 //
 // Example Lua config (sdk/examples/server_config.lua):
 //
@@ -38,7 +38,7 @@
 
 int main(int argc, char* argv[])
 {
-    const char* lua_script = (argc > 1) ? argv[1] : "sdk/examples/server_config.lua";
+    const char* lua_script = (argc > 1) ? argv[1] : "sdk/examples/basic/echo.lua";
 
     socketley::server srv(9000);
     srv.lua(lua_script);

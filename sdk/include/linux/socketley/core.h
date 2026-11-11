@@ -2,7 +2,7 @@
 //  socketley/core.h — Engine core (Tier 2, requires libsocketley_sdk.a)
 //
 //  Provides the event loop, runtime manager, and shared infrastructure.
-//  Requires building from source: link with -lsocketley_sdk -luring -lssl -lcrypto
+//  Requires building from source: link with -lsocketley_sdk -lluajit -luring -lssl -lcrypto, or `socketley-config --cflags --libs`
 // ═══════════════════════════════════════════════════════════════════
 #pragma once
 
@@ -22,10 +22,17 @@
 #include "runtime/instance.h"
 #include "../../../../socketley/shared/runtime/runtime_manager.h"
 #include "../../../../socketley/shared/runtime/runtime_factory.h"
+#include "../../../../socketley/shared/util/version.h"
 
 #include <csignal>
 
+// The daemon's own flag parsers, in libsocketley_sdk.a, behind flags() and any_runtime.
+bool apply_create_flags(runtime_instance* instance, runtime_manager& manager, std::string_view line);
+
 namespace socketley {
+
+inline constexpr std::string_view version = SOCKETLEY_VERSION;
+
 namespace detail {
 
 inline event_loop*& signal_loop_ptr() {

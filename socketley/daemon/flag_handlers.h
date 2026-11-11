@@ -92,6 +92,13 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
 int parse_mcp_flags(mcp_instance* mc, const parsed_args& pa, size_t& i, std::string_view name);
 int parse_web_flags(web_instance* wb, const parsed_args& pa, size_t& i, std::string_view name);
 
+// One flag of a create line for a runtime of `type`, answered as parse_common_flags answers: -1 for one no parser knows.
+int parse_create_flag(runtime_instance* instance, runtime_type type, const parsed_args& pa, size_t& i, bool& autostart,
+                      std::string& lua_script, runtime_manager* manager, std::string_view name);
+
+// A whole line of create flags for an embedded runtime; false once a refusal is printed, as the CLI prints one.
+bool apply_create_flags(runtime_instance* instance, runtime_manager& manager, std::string_view line);
+
 // A `--listen` value, one function because the flag and an `import` document's
 // "listen" field must judge it the same way, returning an empty string on
 // success with the bare path in `out` and the reason otherwise.

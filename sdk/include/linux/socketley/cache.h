@@ -36,6 +36,9 @@ public:
     }
 
     // ── Chainable config ────────────────────────────────────────────────
+    // Any flag `socketley create` takes for this type, spelled the same: flags("--bind 127.0.0.1 --compress gzip").
+    // One that is refused prints why, and start() then answers false.
+    cache& flags(std::string_view line) { if (!apply_create_flags(raw(), m_mgr, line)) m_refused = true; return *this; }
     cache& persistent(std::string_view path) { cch()->set_persistent(path); return *this; }
     cache& max_memory(size_t bytes)          { cch()->set_max_memory(bytes); return *this; }
     cache& eviction(eviction_policy p)       { cch()->set_eviction(p); return *this; }
@@ -154,6 +157,7 @@ public:
     // produced one, is in the log already; the LOG_ERROR here is for the paths
     // that produce none (a TCP bind failure returns false silently).
     bool start() {
+        if (m_refused) return false;
         if (!m_loop.init()) return false;
         const detail::signal_scope signals(&m_loop);
         if (!m_mgr.start(m_name, m_loop) || raw()->get_state() != runtime_running) {
@@ -186,6 +190,7 @@ private:
     runtime_instance* raw() { return m_mgr.get(m_name); }
     cache_instance*   cch() { return static_cast<cache_instance*>(raw()); }
 
+    bool            m_refused = false;
     std::string     m_name;
     event_loop      m_loop;
     runtime_manager m_mgr;

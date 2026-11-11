@@ -1,4 +1,6 @@
 #include "flag_handlers.h"
+#include "type_manifest.h"
+#include "type_manifest.h"
 #include "../shared/util/duration_parse.h"
 #include "../shared/runtime/runtime_instance.h"
 #include "../shared/net/unix_listener.h"
@@ -3064,6 +3066,74 @@ static int refuse_running_trust(std::string_view flag)
     std::cout << "cannot change " << flag << " while running: its handshakes use what it started with; edit it with "
                  "--restart\n";
     return 1;
+}
+
+int parse_create_flag(runtime_instance* instance, runtime_type type, const parsed_args& pa, size_t& i, bool& autostart,
+                      std::string& lua_script, runtime_manager* manager, std::string_view name)
+{
+    if (const int common = parse_common_flags(instance, pa, i, autostart, lua_script); common != -1)
+        return common;
+    switch (type)
+    {
+        case runtime_server:  return parse_server_flags(static_cast<server_instance*>(instance), pa, i, manager, name);
+        case runtime_client:  return parse_client_flags(static_cast<client_instance*>(instance), pa, i, name);
+        case runtime_proxy:   return parse_proxy_flags(static_cast<proxy_instance*>(instance), pa, i, name);
+        case runtime_cache:   return parse_cache_flags(static_cast<cache_instance*>(instance), pa, i, name);
+        case runtime_storage: return parse_storage_flags(static_cast<storage_instance*>(instance), pa, i, name);
+        case runtime_dns:     return parse_dns_flags(static_cast<dns_instance*>(instance), pa, i, name);
+        case runtime_sync:    return parse_sync_flags(static_cast<sync_instance*>(instance), pa, i, name);
+        case runtime_idp:     return parse_idp_flags(static_cast<idp_instance*>(instance), pa, i, name);
+        case runtime_db:      return parse_db_flags(static_cast<db_instance*>(instance), pa, i, name);
+        case runtime_mqtt:    return parse_mqtt_flags(static_cast<mqtt_instance*>(instance), pa, i, name);
+        case runtime_mail:    return parse_mail_flags(static_cast<mail_instance*>(instance), pa, i, name);
+        case runtime_tunnel:  return parse_tunnel_flags(static_cast<tunnel_instance*>(instance), pa, i, name);
+        case runtime_metrics: return parse_metrics_flags(static_cast<metrics_instance*>(instance), pa, i, name);
+        case runtime_mcp:     return parse_mcp_flags(static_cast<mcp_instance*>(instance), pa, i, name);
+        case runtime_web:     return parse_web_flags(static_cast<web_instance*>(instance), pa, i, name);
+        // A registered type's flags come from its manifest schema.
+        default:              return type_manifest::parse_registered_flag(instance, pa, i);
+    }
+}
+
+bool apply_create_flags(runtime_instance* instance, runtime_manager& manager, std::string_view line)
+{
+    parsed_args pa;
+    pa.parse(line);
+    if (pa.overflowed)
+    {
+        std::cout << "too many flags on one line\n";
+        return false;
+    }
+    bool autostart = false;
+    std::string lua_script;
+    const runtime_type type = instance->get_type();
+    const std::string name(instance->get_name());
+    for (size_t i = 0; i < pa.count; ++i)
+    {
+        const int result = parse_create_flag(instance, type, pa, i, autostart, lua_script, &manager, name);
+        if (result == -1)
+            std::cout << "unknown flag: " << pa.args[i] << "\n";
+        if (result != 0)
+            return false;
+    }
+    if (instance->get_shards() > 1)
+    {
+        std::cout << "--shards: shards are forked by the daemon, and an embedded runtime is this one process\n";
+        return false;
+    }
+    if (lua_script.empty())
+        return true;
+    if (type == runtime_web)
+    {
+        std::cout << "web: --lua is not run; a .lua file under --root is a page with --lua-pages\n";
+        return false;
+    }
+    if (!instance->load_lua_script(lua_script))
+    {
+        std::cout << "could not load Lua script: " << lua_script << "\n";
+        return false;
+    }
+    return true;
 }
 
 int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,

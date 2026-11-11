@@ -22,7 +22,7 @@
 // What it gives you over the std:: container you would otherwise reach for:
 // lookups take a string_view and build no temporary key, get_ptr() hands back
 // the stored string rather than a copy, keys can carry a TTL, a memory budget
-// can refuse a write, an LRU can evict, SCAN walks all four types from one
+// can refuse a write, an LRU can evict, SCAN walks all six types from one
 // packed cursor, and save()/load() plus adopt_owned() are what the cache
 // runtime uses for its dumps and its shard moves.
 //

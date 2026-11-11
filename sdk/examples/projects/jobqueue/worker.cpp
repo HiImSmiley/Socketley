@@ -5,7 +5,7 @@
 // three and needs nothing from the repo but that one header.  A worker fleet
 // on a different OS than the queue is the normal case, not the exotic one.
 //
-// It polls with lpop.  The text protocol has no blocking pop, so an idle
+// It polls with lpop, because blpop holds only on an unsharded cache, so an idle
 // worker sleeps between empty polls — the interval is the latency floor for
 // a queued job, and 200ms is a demo value, not a recommendation.
 //

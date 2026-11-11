@@ -47,6 +47,9 @@ public:
     }
 
     // ── Chainable config ────────────────────────────────────────────────
+    // Any flag `socketley create` takes for this type, spelled the same: flags("--bind 127.0.0.1 --compress gzip").
+    // One that is refused prints why, and start() then answers false.
+    server& flags(std::string_view line) { if (!apply_create_flags(raw(), m_mgr, line)) m_refused = true; return *this; }
     server& tls(std::string_view cert, std::string_view key) {
         auto* i = raw(); i->set_tls(true); i->set_cert_path(cert); i->set_key_path(key); return *this;
     }
@@ -182,6 +185,7 @@ public:
     // produced one, is in the log already; the LOG_ERROR here is for the paths
     // that produce none (a TCP bind failure returns false silently).
     bool start() {
+        if (m_refused) return false;
         if (!m_loop.init()) return false;
         const detail::signal_scope signals(&m_loop);
         if (!m_mgr.start(m_name, m_loop) || raw()->get_state() != runtime_running) {
@@ -214,6 +218,7 @@ private:
     runtime_instance* raw() { return m_mgr.get(m_name); }
     server_instance*  srv() { return static_cast<server_instance*>(raw()); }
 
+    bool            m_refused = false;
     std::string     m_name;
     event_loop      m_loop;
     runtime_manager m_mgr;
