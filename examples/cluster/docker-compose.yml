@@ -70,8 +70,9 @@ x-node: &node
   # I/O layer is a ring.  `unconfined` is the blunt way to say it; a deployment
   # should copy Docker's default profile, add those three syscalls back, and
   # pass the file instead — the ring needs three syscalls, not no sandbox.
+  # `=`, not Docker's older `:`, which nerdctl and podman ignore.
   security_opt:
-    - seccomp:unconfined
+    - seccomp=unconfined
   volumes:
     - cluster:/cluster
 

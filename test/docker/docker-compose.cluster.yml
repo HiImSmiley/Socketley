@@ -47,13 +47,14 @@
 # `unconfined` is the blunt instrument and it is acceptable here because this is
 # a test cluster on a throwaway network.  A deployment should ship a profile
 # derived from Docker's default with those three syscalls added back, and pass
-# it as `seccomp:/path/to/profile.json` — the point being that the ring needs
-# three syscalls, not that it needs no sandbox.
+# it as `seccomp=/path/to/profile.json` — the point being that the ring needs
+# three syscalls, not that it needs no sandbox.  `=` rather than Docker's older
+# `:`, which nerdctl and podman do not read and run the default profile on.
 x-node: &node
   image: socketley-cluster-test:latest
   entrypoint: ["/bin/sh", "/node.sh"]
   security_opt:
-    - seccomp:unconfined
+    - seccomp=unconfined
 
 volumes:
   cluster:
