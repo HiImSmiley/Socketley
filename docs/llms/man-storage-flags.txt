@@ -259,7 +259,7 @@ The loopback shortcut needs no exception for a storage runtime. The runtime read
 | DeleteObjectTagging | DELETE /bucket/key?tagging | 204 whether or not the object had tags. |
 | CreateMultipartUpload | POST /bucket/key?uploads | Content-Type, the stored headers, x-amz-meta-* and x-amz-tagging are kept for the object; x-amz-checksum-algorithm names the checksum every part takes; x-amz-server-side-encryption or the SSE-C headers encrypt every part and the object. |
 | UploadPart | PUT /bucket/key?partNumber=N&uploadId=ID | Streamed like a put, Content-MD5 and the checksums checked; a part sent again replaces the old one. N is 1 to 10000. A part of an SSE-C upload carries the upload's key. |
-| UploadPartCopy | PUT /bucket/key?partNumber=N&uploadId=ID + x-amz-copy-source | The whole source or x-amz-copy-source-range=bytes=first-last, a range past the source's end being 416 InvalidRange; a source of key?versionId=ID reads that version. |
+| UploadPartCopy | PUT /bucket/key?partNumber=N&uploadId=ID + x-amz-copy-source | The whole source or x-amz-copy-source-range=\:bytes=first-last, a range past the source's end being 416 InvalidRange; a source of key?versionId=ID reads that version. |
 | CompleteMultipartUpload | POST /bucket/key?uploadId=ID | InvalidPart, InvalidPartOrder, EntityTooSmall (a part but the last under 5 MiB), NoSuchUpload, MalformedXML; If-Match and If-None-Match as for PutObject. A completion sent again after it succeeded is answered as the first was, for as long as the key holds the object it made. |
 | AbortMultipartUpload | DELETE /bucket/key?uploadId=ID | 204; NoSuchUpload afterwards. |
 | ListParts | GET /bucket/key?uploadId=ID | max-parts, part-number-marker. |
