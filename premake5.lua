@@ -1510,6 +1510,25 @@ project "fuzz_mail"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: an HTTP/2 connection's frames, flow control and answers, as the entrance and the storage read them ───
+
+project "fuzz_h2_session"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_h2_session.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/shared/http/hpack.cpp",
+        "socketley/shared/http/mux_head.cpp"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: the IMAP and JMAP conversations, over a store the target keeps in memory ───
 
 project "fuzz_mail_sessions"

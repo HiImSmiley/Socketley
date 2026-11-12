@@ -3127,6 +3127,76 @@ def mailsessions_seeds():
     seeds["api_deep"] = bytes([3, 0]) + b"{\"methodCalls\":" + b"[" * 200 + b"]" * 200 + b"}"
     return seeds
 
+def h2session_seeds():
+    import struct
+    def fr(t, flags, sid, payload=b""):
+        return struct.pack(">I", len(payload))[1:] + bytes([t, flags]) + struct.pack(">I", sid) + payload
+    DATA, HEADERS, PRIORITY, RST, SETTINGS, PUSH, PING, GOAWAY, WU, CONT = range(10)
+    get = b"\x82\x87\x84\x41\x01x"                       # GET https / , :authority x
+    post = b"\x83\x87\x84\x41\x01x"                      # POST
+    post_cl = post + b"\x5c\x015"                        # content-length: 5
+    lit = lambda n, v: b"\x00" + bytes([len(n)]) + n + bytes([len(v)]) + v
+    def seed(how, cut, body):
+        return bytes([how, cut]) + body
+    answer_len, answer_chunked, answer_interim = 0x02, 0x04, 0x06
+    return {
+        # The preface and SETTINGS given (bit 0), then one request of each shape and what a server answers it.
+        "get": seed(1 | answer_len, 0, fr(HEADERS, 5, 1, get)),
+        "get_chunked_answer": seed(1 | answer_chunked, 0, fr(WU, 0, 0, struct.pack(">I", 1 << 20)) + fr(HEADERS, 5, 1, get)),
+        "get_interim": seed(1 | answer_interim, 1, fr(HEADERS, 5, 1, get) + fr(HEADERS, 5, 3, get)),
+        "get_no_answer_reset": seed(1, 0, fr(HEADERS, 5, 1, get) + fr(RST, 0, 1, struct.pack(">I", 8))),
+        "post_length": seed(1 | answer_len, 0, fr(HEADERS, 4, 1, post_cl) + fr(DATA, 1, 1, b"hello")),
+        "post_length_short": seed(1 | answer_len, 0, fr(HEADERS, 4, 1, post_cl) + fr(DATA, 1, 1, b"hell")),
+        "post_length_long": seed(1 | answer_len, 0, fr(HEADERS, 4, 1, post_cl) + fr(DATA, 0, 1, b"hello!")),
+        "post_chunked": seed(1 | answer_len, 3, fr(HEADERS, 4, 1, post) + fr(DATA, 0, 1, b"abc") + fr(DATA, 0, 1) +
+                             fr(DATA, 1, 1, b"def")),
+        "post_padded": seed(1 | answer_len, 0, fr(HEADERS, 4, 1, post) + fr(DATA, 9, 1, b"\x03abc\0\0\0")),
+        "post_bad_padding": seed(1, 0, fr(HEADERS, 4, 1, post) + fr(DATA, 9, 1, b"\x09abc")),
+        "post_trailers": seed(1 | answer_len, 0, fr(HEADERS, 4, 1, post) + fr(DATA, 0, 1, b"abc") +
+                              fr(HEADERS, 5, 1, lit(b"x-sum", b"1"))),
+        "data_after_end": seed(1 | answer_len, 0, fr(HEADERS, 5, 1, get) + fr(DATA, 0, 1, b"late") * 3),
+        "data_idle_stream": seed(1, 0, fr(DATA, 0, 5, b"x")),
+        "continuation": seed(1 | answer_len, 2, fr(HEADERS, 1, 1, get[:2]) + fr(CONT, 0, 1, get[2:4]) + fr(CONT, 4, 1, get[4:])),
+        "continuation_flood": seed(1, 0, fr(HEADERS, 1, 1, get) + fr(CONT, 0, 1, lit(b"a", b"b")) * 70),
+        "continuation_interleaved": seed(1, 0, fr(HEADERS, 1, 1, get) + fr(PING, 0, 0, b"12345678")),
+        "priority_headers": seed(1 | answer_len, 0, fr(HEADERS, 0x25, 1, b"\0\0\0\x03\x10" + get) +
+                                 fr(HEADERS, 0x25, 3, b"\0\0\0\x03\x10" + get) + fr(PRIORITY, 0, 5, b"\0\0\0\x05\x10") +
+                                 fr(PRIORITY, 0, 7, b"\0\0")),
+        "many_streams": seed(1 | 0x40, 0, b"".join(fr(HEADERS, 4, 2 * i + 1, post) for i in range(12))),
+        "rapid_reset": seed(1 | 0x40, 0, b"".join(fr(HEADERS, 5, 2 * i + 1, get) + fr(RST, 0, 2 * i + 1, b"\0\0\0\x08")
+                                                  for i in range(40))),
+        "host_cannot_make": seed(1 | 0x80 | answer_len, 0, b"".join(fr(HEADERS, 5, 2 * i + 1, get) for i in range(9))),
+        "settings": seed(1 | answer_chunked, 0, fr(SETTINGS, 0, 0, struct.pack(">HIHIHIHI", 4, 100, 5, 20000, 1, 0, 2, 0)) +
+                         fr(HEADERS, 5, 1, get) + fr(SETTINGS, 0, 0, struct.pack(">HI", 4, 0x7fffffff)) +
+                         fr(WU, 0, 1, struct.pack(">I", 0x7fffffff)) + fr(SETTINGS, 1, 0)),
+        "settings_bad": seed(1, 0, fr(SETTINGS, 0, 0, struct.pack(">HI", 5, 1)) ),
+        "settings_window_shrinks": seed(1 | answer_chunked, 0, fr(HEADERS, 5, 1, get) +
+                                        fr(SETTINGS, 0, 0, struct.pack(">HI", 4, 0)) + fr(WU, 0, 0, struct.pack(">I", 70000)) +
+                                        fr(SETTINGS, 0, 0, struct.pack(">HI", 4, 65535))),
+        "window_updates": seed(1 | answer_chunked, 0, fr(HEADERS, 5, 1, get) + fr(WU, 0, 0, b"\0\0\0\0") +
+                               fr(WU, 0, 1, b"\0\0\0\0")),
+        "window_overflow": seed(1, 0, fr(WU, 0, 0, struct.pack(">I", 0x7fffffff)) * 2),
+        "pings": seed(1, 5, fr(PING, 0, 0, b"abcdefgh") * 3 + fr(PING, 1, 0, b"abcdefgh") + fr(PING, 0, 0, b"short")),
+        "goaway_push_unknown": seed(1, 0, fr(0x20, 0, 0, b"??") + fr(GOAWAY, 0, 0, b"\0" * 8) + fr(PUSH, 4, 1, b"\0\0\0\x02")),
+        "frame_too_long": seed(1, 0, b"\x00\x40\x01\x00\x00\x00\x00\x00\x01"),
+        "bad_headers": seed(1 | answer_len, 0, fr(HEADERS, 5, 1, b"\x82\x87\x84" + lit(b"Upper", b"x")) +
+                            fr(HEADERS, 5, 3, b"\x82\x87\x84" + lit(b"connection", b"close")) +
+                            fr(HEADERS, 5, 5, b"\x82\x87\x84" + lit(b"a", b"b\r\nc: d")) +
+                            fr(HEADERS, 5, 7, b"\x82\x87" + lit(b":path", b"/a b")) +
+                            fr(HEADERS, 5, 9, b"\x82\x87\x84\x82") +
+                            fr(HEADERS, 5, 11, b"\x82\x87\x84" + lit(b"content-length", b"1") + lit(b"content-length", b"1")) +
+                            fr(HEADERS, 5, 13, lit(b"a", b"b") + b"\x82\x87\x84") +
+                            fr(HEADERS, 5, 15, b"\x82\x87\x84" + lit(b"cookie", b"a=1") + lit(b"cookie", b"b=2") + lit(b"host", b"y"))),
+        "hpack_broken": seed(1, 0, fr(HEADERS, 5, 1, b"\xff\xff\xff\xff\xff")),
+        "even_and_zero_streams": seed(1, 0, fr(HEADERS, 5, 2, get) ),
+        "headers_stream_zero": seed(1, 0, fr(HEADERS, 5, 0, get)),
+        # No preface given: the bytes are the connection's first.
+        "preface_whole": seed(answer_len, 7, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + fr(SETTINGS, 0, 0) + fr(HEADERS, 5, 1, get)),
+        "preface_wrong": seed(0, 0, b"PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n"),
+        "preface_no_settings": seed(0, 0, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + fr(PING, 0, 0, b"12345678")),
+        "http1": seed(0, 0, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+    }
+
 def main(argv):
     root = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
     total = 0
@@ -3146,7 +3216,8 @@ def main(argv):
                         ("tunnelmux", tunnelmux_seeds()),
                         ("sshcert", sshcert_seeds()),
                         ("httpcodecs", httpcodecs_seeds()),
-                        ("mailsessions", mailsessions_seeds())):
+                        ("mailsessions", mailsessions_seeds()),
+                        ("h2session", h2session_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

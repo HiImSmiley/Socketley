@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp fuzz_http_codecs fuzz_fastcgi fuzz_lua_json fuzz_storage_parsers fuzz_mail_sessions"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp fuzz_http_codecs fuzz_fastcgi fuzz_lua_json fuzz_storage_parsers fuzz_mail_sessions fuzz_h2_session"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -135,6 +135,8 @@ want fuzz_db && build fuzz_db "$ROOT/test/fuzz/fuzz_db.cpp" "$ROOT/socketley/run
     "$ROOT/socketley/shared/crypto/key_file.cpp" "$ROOT/socketley/shared/util/base64.cpp" -lcrypto
 want fuzz_http_codecs && build fuzz_http_codecs "$ROOT/test/fuzz/fuzz_http_codecs.cpp" "$ROOT/socketley/shared/http/hpack.cpp" \
     "$ROOT/socketley/shared/util/inflate.cpp" "$ROOT/socketley/shared/util/deflate.cpp" "$ROOT/socketley/shared/util/crc.cpp"
+want fuzz_h2_session && build fuzz_h2_session "$ROOT/test/fuzz/fuzz_h2_session.cpp" -std=c++23 \
+    "$ROOT/socketley/shared/http/hpack.cpp" "$ROOT/socketley/shared/http/mux_head.cpp"
 want fuzz_fastcgi && build fuzz_fastcgi "$ROOT/test/fuzz/fuzz_fastcgi.cpp" "$ROOT/socketley/shared/http/fastcgi.cpp"
 want fuzz_lua_json && build fuzz_lua_json "$ROOT/test/fuzz/fuzz_lua_json.cpp" -std=c++23 \
     -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" -L"$ROOT/thirdparty/luajit" -lluajit -ldl
