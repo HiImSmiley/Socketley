@@ -6,6 +6,7 @@
 #   * an unfinished WebSocket frame held up to 16 MiB however small --max-packet is, before any CONNECT
 #   * a WebSocket client that sends pings and reads no pongs read on regardless, its queue growing without end
 #   * retained messages whose properties --retained-max does not count, so the store grows past it without end
+#   * messages kept for one owner's away sessions bounded only in count, so many sessions hold memory without end
 #   * a topic or filter of thousands of levels taken, whose walk through the topic trees ends the worker
 set -uo pipefail
 
@@ -29,7 +30,7 @@ PW=$((SL_PORT_BASE + 1729))
 trap 'daemon_stop' EXIT
 daemon_start "$BIN"
 
-"$BIN" create mqtt lm -p "$P" --anonymous --ws "$PW" --max-packet 64K --write-buffer 1M --retained-max 256K -s >/dev/null 2>&1 \
+"$BIN" create mqtt lm -p "$P" --anonymous --ws "$PW" --max-packet 64K --write-buffer 1M --retained-max 256K --queue-max 1M -s >/dev/null 2>&1 \
     && ok || bad "an anonymous broker with WebSocket is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for p in "$P" "$PW"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -5 "$SOCKETLEY_DLOG")"; done
 
@@ -150,6 +151,30 @@ def retained_props():
           c.publish("keep/again", b"x", qos=1, retain=True, props={0x26: [("k", "v" * 60000)]}) < 0x80, True)
     c.disconnect()
 
+def held_for_owner():
+    # Four sessions of one address, away, each subscribed to its own topic; twenty 60000-byte messages for each.
+    for i in range(4):
+        c = Client(port, version=4); c.connect("away%d" % i, clean=False); c.subscribe(("away/%d" % i, 1)); c.close()
+    p = Client(port); p.connect("away-pub")
+    for i in range(4):
+        for _ in range(20):
+            p.publish("away/%d" % i, b"z" * 60000, qos=1)
+    p.disconnect()
+    # The worker reports its figures every so often, so they are waited for.
+    end = time.time() + 10
+    while stat_sum(binary, "lm", "dropped_queue") == 0 and time.time() < end:
+        time.sleep(0.3)
+    held = stat_sum(binary, "lm", "queued")
+    truth("what one owner's away sessions hold is bounded by --queue-max (%d of 80 kept)" % held, 0 < held <= 17)
+    # What was kept is sent: the first session took the room, and the others found none.
+    c = Client(port, version=4)
+    c.connect("away0", clean=False)
+    truth("and a session taken up again is sent what it kept", len(c.messages(1, 3)) == 1)
+    c.close()
+
+if phase == "held":
+    guarded("held for owner", held_for_owner)
+
 if phase == "props":
     guarded("retained properties", retained_props)
 
@@ -164,6 +189,7 @@ PY
 tally < <(run ws)
 tally < <(run deep)
 tally < <(run props)
+tally < <(run held)
 
 echo "  Results: $PASS/$((PASS + FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

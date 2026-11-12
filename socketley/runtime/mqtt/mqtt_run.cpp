@@ -168,6 +168,7 @@ bool mqtt_run::start(std::string& why)
     cfg.session_expiry_max = m_owner.get_session_expiry();
     cfg.session_queue      = m_owner.get_session_queue();
     cfg.retained_max_bytes = m_owner.get_retained_max();
+    cfg.queue_max_bytes    = m_owner.get_queue_max();
     cfg.max_sessions       = m_owner.get_max_sessions();
     cfg.keepalive_max      = m_owner.get_keepalive_max();
     cfg.write_limit        = m_owner.get_write_buffer() ? m_owner.get_write_buffer() : (4u << 20);

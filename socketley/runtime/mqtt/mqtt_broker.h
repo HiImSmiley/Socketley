@@ -49,6 +49,8 @@ using message_ptr = std::shared_ptr<const message>;
 
 // A message as bytes, for the snapshot and for the shard it is handed to.
 std::string message_bytes(const message& m);
+// What a message takes of --retained-max and --queue-max.
+size_t message_size(const message& m);
 bool message_from(std::string_view in, message& m);
 
 struct broker_config
@@ -58,6 +60,8 @@ struct broker_config
     uint32_t session_expiry_max{86400};
     size_t   session_queue{1000};
     size_t   retained_max_bytes{64u << 20};
+    // The most bytes the QoS 1 and 2 messages held for one owner's sessions take, queued or unanswered.
+    size_t   queue_max_bytes{64u << 20};
     size_t   max_sessions{100000};
     // The longest keep alive accepted, in seconds; a client asking more, or none, is held to it. 0 for no limit.
     uint16_t keepalive_max{1200};
@@ -484,6 +488,11 @@ public:
     size_t retained_count() const { return m_retained.size(); }
     size_t retained_bytes() const { return m_retained_bytes; }
     size_t queued_count() const;
+    // The bytes held for sessions as counted on the way, and as a walk of every session finds them.
+    size_t held_bytes() const;
+    size_t held_bytes_walked() const;
+    // The most held for any one owner.
+    size_t held_bytes_most() const;
     size_t inflight_count() const;
     // Whether any subscription here matches, for a peer that sends only where someone listens.
     bool listens(std::string_view topic) const { return m_subs.any_match(topic); }
@@ -564,6 +573,8 @@ private:
         std::map<std::string, sub_options> subs;
         fifo<queued> queue;
         id_window<inflight> out;
+        // What queue and out hold, counted against owner in m_held.
+        size_t      held{0};
         std::set<uint16_t> incoming_qos2;
         uint64_t    next_seq{1};
         uint32_t    expiry{0};
@@ -713,6 +724,11 @@ private:
     bool decode_session(std::string_view in, session& s, std::vector<std::pair<std::string, sub_options>>& subs,
                         std::string& why);
     void install_session(std::unique_ptr<session> s, const std::vector<std::pair<std::string, sub_options>>& subs);
+    // A message given to a session, or let go by it, in its owner's count.
+    void charge(session& s, size_t n);
+    void release(session& s, const message_ptr& m);
+    // The session's count made again from what it holds, after it was filled other than message by message.
+    void recount(session& s);
 
     broker_config m_cfg;
     broker_io& m_io;
@@ -725,6 +741,9 @@ private:
     std::unordered_map<std::string, std::unique_ptr<session>> m_sessions;
     // How many sessions each owner holds, so one filling the table is the one that gives way.
     std::unordered_map<std::string, size_t> m_owned;
+    // The bytes of the messages each owner's sessions hold, bounded by queue_max_bytes.
+    std::unordered_map<std::string, size_t> m_held_by;
+    size_t m_held_total{0};
     std::unordered_map<uint64_t, session*> m_by_key;
     uint64_t m_next_key{1};
     uint64_t m_next_generation{1};

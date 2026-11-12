@@ -294,6 +294,7 @@ struct runtime_config
     uint32_t mqtt_session_expiry = 86400;
     uint32_t mqtt_session_queue = 1000;
     uint64_t mqtt_retained_max = 64ull << 20;
+    uint64_t mqtt_queue_max = 64ull << 20;
     uint32_t mqtt_max_sessions = 100000;
     uint16_t mqtt_keepalive_max = 1200;
 

@@ -237,6 +237,7 @@ constexpr row rows[] = {
     {"--session-expiry", "M", "duration", "Session expiry", "The longest a session outlives its connection; 1d unless given.", "MQTT limits", {}, "1d"},
     {"--session-queue", "M", "int", "Session queue", "Messages kept for one session while its client is away; 1000 unless given.", "MQTT limits", {}, "1000"},
     {"--retained-max", "M", "size", "Retained bytes", "The most bytes retained messages take; 64M unless given.", "MQTT limits", {}, "64M"},
+    {"--queue-max", "M", "size", "Queued bytes", "The most bytes the messages kept for one owner's sessions take; 64M unless given.", "MQTT limits", {}, "64M"},
     {"--max-sessions", "M", "int", "Max sessions", "The most sessions it keeps, connected or not; 100000 unless given.", "MQTT limits", {}, "100000"},
     {"--keepalive-max", "M", "int", "Max keep alive", "The longest keep alive a client is granted, in seconds; 1200 unless given.", "MQTT limits", {}, "1200"},
 
@@ -436,6 +437,7 @@ constexpr state_key_row state_keys[] = {
     {"--session-expiry", "session_expiry"},
     {"--session-queue", "session_queue"},
     {"--retained-max", "retained_max"},
+    {"--queue-max", "queue_max"},
     {"--max-sessions", "max_sessions"},
     {"--keepalive-max", "keepalive_max"},
     {"--mail-domain", "mail_domain"},

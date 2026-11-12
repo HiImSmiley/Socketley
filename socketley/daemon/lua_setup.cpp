@@ -182,6 +182,7 @@ constexpr config_key config_keys[] = {
     { "session_expiry",     "--session-expiry",     key_kind::scalar  },
     { "session_queue",      "--session-queue",      key_kind::integer },
     { "retained_max",       "--retained-max",       key_kind::scalar  },
+    { "queue_max",          "--queue-max",          key_kind::scalar  },
     { "max_sessions",       "--max-sessions",       key_kind::integer },
     { "keepalive_max",      "--keepalive-max",      key_kind::integer },
 };

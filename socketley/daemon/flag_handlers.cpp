@@ -2803,6 +2803,18 @@ int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::s
             mq->set_retained_max(bytes);
             return 0;
         }
+        case fnv1a("--queue-max"):
+        {
+            size_t bytes = 0;
+            if (next.empty() || !parse_size_suffix(next, bytes) || bytes == 0)
+            {
+                flag_out() << "--queue-max requires a size such as 64M\n";
+                return 1;
+            }
+            ++i;
+            mq->set_queue_max(bytes);
+            return 0;
+        }
         case fnv1a("--max-sessions"):
         {
             uint64_t n = 0;

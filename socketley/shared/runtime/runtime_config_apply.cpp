@@ -434,6 +434,8 @@ void apply_mqtt_config(mqtt_instance& mq, const runtime_config& cfg, bool by_pre
         mq.set_session_queue(cfg.mqtt_session_queue);
     if (asked("retained_max", cfg.mqtt_retained_max != defaults.mqtt_retained_max))
         mq.set_retained_max(cfg.mqtt_retained_max);
+    if (asked("queue_max", cfg.mqtt_queue_max != defaults.mqtt_queue_max))
+        mq.set_queue_max(cfg.mqtt_queue_max);
     if (asked("max_sessions", cfg.mqtt_max_sessions != defaults.mqtt_max_sessions))
         mq.set_max_sessions(cfg.mqtt_max_sessions);
     if (asked("keepalive_max", cfg.mqtt_keepalive_max != defaults.mqtt_keepalive_max))

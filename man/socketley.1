@@ -16775,6 +16775,13 @@ The most bytes that retained messages may take, their topics, payloads and
 properties together. Default: 64M. A new retained message past it is not kept,
 and is counted.
 .TP
+.BI "\-\-queue\-max " size
+The most bytes that the QoS 1 and 2 messages held for one owner's sessions may
+take, queued while a client is away or slow or sent and not yet acknowledged.
+An owner is a user, or for clients with none their address. Default: 64M. Past
+it, the oldest waiting for the session a message is for are dropped, and when
+that is not enough the message is not kept for it; each is counted.
+.TP
 .BI "\-\-max\-sessions " n
 The most sessions, connected or not. Default: 100000. A new client past the
 limit makes the broker look at the owner that holds the most sessions. An owner

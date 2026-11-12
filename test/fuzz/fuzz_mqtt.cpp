@@ -223,6 +223,7 @@ void broker_program(std::string_view in)
     broker_config cfg;
     cfg.session_queue      = 8;
     cfg.retained_max_bytes = 4096;
+    cfg.queue_max_bytes    = 8192;
     cfg.max_sessions       = 6;
     cfg.max_packet         = 1u << 16;
     cfg.sys_interval_s     = 0;
@@ -312,6 +313,8 @@ void broker_program(std::string_view in)
         });
         FUZZ_CHECK(counted == b.retained_bytes(), "the retained byte count is not what is held");
         FUZZ_CHECK(b.retained_bytes() <= cfg.retained_max_bytes, "the retained store grew past its limit");
+        FUZZ_CHECK(b.held_bytes() == b.held_bytes_walked(), "the bytes held for sessions are not what they hold");
+        FUZZ_CHECK(b.held_bytes_most() <= cfg.queue_max_bytes, "one owner's sessions hold more than --queue-max");
         FUZZ_CHECK(b.session_count() <= cfg.max_sessions, "more sessions than the limit");
     }
     for (const auto& [id, bytes] : t.out)

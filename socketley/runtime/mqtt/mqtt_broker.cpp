@@ -110,6 +110,70 @@ size_t broker::queued_count() const
     return n;
 }
 
+size_t broker::held_bytes() const
+{
+    return m_held_total;
+}
+
+size_t broker::held_bytes_walked() const
+{
+    size_t n = 0;
+    for (const auto& [k, s] : m_sessions)
+    {
+        for (const queued& q : s->queue)
+            n += message_size(*q.msg);
+        s->out.each([&](uint16_t, const inflight& f) {
+            if (f.item.msg)
+                n += message_size(*f.item.msg);
+        });
+    }
+    return n;
+}
+
+size_t broker::held_bytes_most() const
+{
+    size_t most = 0;
+    for (const auto& [owner, n] : m_held_by)
+        most = std::max(most, n);
+    return most;
+}
+
+void broker::charge(session& s, size_t n)
+{
+    s.held += n;
+    m_held_by[s.owner] += n;
+    m_held_total += n;
+}
+
+void broker::release(session& s, const message_ptr& m)
+{
+    if (!m)
+        return;
+    const size_t n = std::min(message_size(*m), s.held);
+    s.held -= n;
+    m_held_total -= n;
+    if (const auto it = m_held_by.find(s.owner); it != m_held_by.end() && (it->second -= n) == 0)
+        m_held_by.erase(it);
+}
+
+void broker::recount(session& s)
+{
+    size_t n = 0;
+    for (const queued& q : s.queue)
+        n += message_size(*q.msg);
+    s.out.each([&](uint16_t, const inflight& f) {
+        if (f.item.msg)
+            n += message_size(*f.item.msg);
+    });
+    const size_t was = s.held;
+    m_held_total -= was;
+    if (const auto it = m_held_by.find(s.owner); it != m_held_by.end() && (it->second -= was) == 0)
+        m_held_by.erase(it);
+    s.held = 0;
+    if (n)
+        charge(s, n);
+}
+
 size_t broker::inflight_count() const
 {
     size_t n = 0;
@@ -838,8 +902,8 @@ void broker::finish_publish(uint64_t conn, uint64_t generation, uint8_t qos, uin
 
 // ── Routing ─────────────────────────────────────────────────────────────────
 
-// What a retained message holds of the store's bound: every field a publisher chose, its properties with them.
-static size_t retained_size(const message& m)
+// What a message holds of a store's bound: every field a publisher chose, its properties with them.
+size_t message_size(const message& m)
 {
     size_t n = m.topic.size() + m.payload.size() + m.from_client.size();
     for (const auto* o : {&m.content_type, &m.response_topic, &m.correlation_data})
@@ -853,7 +917,7 @@ static size_t retained_size(const message& m)
 bool broker::store_retained(const message_ptr& m, bool notify)
 {
     const auto old = m_retained.get(m->topic);
-    const size_t old_size = old ? retained_size(*old) : 0;
+    const size_t old_size = old ? message_size(*old) : 0;
     // A '$' topic holds the broker's own figures, made again each interval and so no change a snapshot keeps.
     const bool kept = !m->topic.starts_with('$');
     const auto replaced = [&] {
@@ -874,7 +938,7 @@ bool broker::store_retained(const message_ptr& m, bool notify)
         }
         return true;
     }
-    const size_t size = retained_size(*m);
+    const size_t size = message_size(*m);
     if (m_retained_bytes - old_size + size > m_cfg.retained_max_bytes)
     {
         ++m_stats.retained_refused;
@@ -1081,6 +1145,25 @@ void broker::deliver(session& s, const message_ptr& m, uint8_t qos, bool retain_
         return;
     }
     mark(s);
+    // What one owner's sessions hold is bounded in bytes, as the queue of each is in messages: the oldest waiting
+    // go first, and a message that does not fit even then is not kept.
+    const size_t size = message_size(*m);
+    const auto held = [&] {
+        const auto it = m_held_by.find(s.owner);
+        return it == m_held_by.end() ? size_t{0} : it->second;
+    };
+    while (held() + size > m_cfg.queue_max_bytes && !s.queue.empty())
+    {
+        release(s, s.queue.front().msg);
+        s.queue.pop_front();
+        ++m_stats.dropped_queue;
+    }
+    if (held() + size > m_cfg.queue_max_bytes)
+    {
+        ++m_stats.dropped_queue;
+        return;
+    }
+    charge(s, size);
     // Nothing waiting before it and room for it: sent now, without a turn through the queue.
     if (c && s.queue.empty() && s.out.size() < s.receive_max && !s.out.full() &&
         m_io.backlog(c->id) <= m_cfg.write_limit)
@@ -1090,6 +1173,7 @@ void broker::deliver(session& s, const message_ptr& m, uint8_t qos, bool retain_
     }
     if (s.queue.size() >= m_cfg.session_queue)
     {
+        release(s, s.queue.front().msg);
         s.queue.pop_front();
         ++m_stats.dropped_queue;
     }
@@ -1102,7 +1186,10 @@ void broker::send_queued(session& s, connection& c, queued q)
 {
     const uint16_t id = s.out.next_id();
     if (!write_publish_to(s, c, id, q, false))
+    {
+        release(s, q.msg);
         return;
+    }
     ++m_stats.sent[q.qos];
     inflight f;
     f.seq  = s.next_seq++;
@@ -1124,12 +1211,14 @@ void broker::pump(session& s)
         mark(s);
         if (expired(*q.msg))
         {
+            release(s, q.msg);
             ++m_stats.dropped_expired;
             continue;
         }
         // Asked again as it leaves, since the rules may have changed while it waited.
         if (checked && !m_hooks.may_read(s.username, s.client_id, q.msg->topic))
         {
+            release(s, q.msg);
             ++m_stats.dropped_denied;
             continue;
         }
@@ -1208,7 +1297,11 @@ void broker::resend(session& s, connection& c)
                 denied.push_back(id);
         });
         for (const uint16_t id : denied)
+        {
+            if (const inflight* f = s.out.find(id))
+                release(s, f->item.msg);
             s.out.erase(id);
+        }
         if (!denied.empty())
         {
             m_stats.dropped_denied += denied.size();
@@ -1263,6 +1356,7 @@ bool broker::on_ack(connection& c, const frame& f)
             const inflight* f = s.out.find(a.packet_id);
             if (f && f->st == inflight::state::await_puback)
             {
+                release(s, f->item.msg);
                 s.out.erase(a.packet_id);
                 mark(s);
                 pump(s);
@@ -1280,6 +1374,7 @@ bool broker::on_ack(connection& c, const frame& f)
             if (a.reason >= 0x80)
             {
                 // The client refused it; the exchange ends here and its identifier is free.
+                release(s, f->item.msg);
                 s.out.erase(a.packet_id);
                 mark(s);
                 pump(s);
@@ -1295,6 +1390,7 @@ bool broker::on_ack(connection& c, const frame& f)
             const inflight* f = s.out.find(a.packet_id);
             if (f && f->st == inflight::state::await_pubcomp)
             {
+                release(s, f->item.msg);
                 s.out.erase(a.packet_id);
                 mark(s);
                 pump(s);
@@ -1568,6 +1664,10 @@ void broker::end_session(session& s, bool publish_will)
             c->s = nullptr;
     if (const auto o = m_owned.find(s.owner); o != m_owned.end() && --o->second == 0)
         m_owned.erase(o);
+    m_held_total -= s.held;
+    if (const auto h = m_held_by.find(s.owner); h != m_held_by.end() && (h->second -= s.held) == 0)
+        m_held_by.erase(h);
+    s.held = 0;
     m_by_key.erase(s.key);
     const std::string id = s.client_id;
     m_sessions.erase(id);
@@ -1624,6 +1724,7 @@ void broker::sweep_sessions(int64_t now)
         if (s->queue.size() != before)
         {
             m_stats.dropped_expired += before - s->queue.size();
+            recount(*s);
             mark(*s);
         }
         if (lapsed(*s, now))
@@ -1642,7 +1743,7 @@ void broker::sweep_sessions(int64_t now)
         if (const auto old = m_retained.get(topic))
         {
             m_retained.set(topic, nullptr);
-            m_retained_bytes -= retained_size(*old);
+            m_retained_bytes -= message_size(*old);
             mark();
         }
     }

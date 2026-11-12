@@ -820,6 +820,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mqtt_session_expiry = mq->get_session_expiry();
             cfg.mqtt_session_queue = mq->get_session_queue();
             cfg.mqtt_retained_max = mq->get_retained_max();
+            cfg.mqtt_queue_max = mq->get_queue_max();
             cfg.mqtt_max_sessions = mq->get_max_sessions();
             cfg.mqtt_keepalive_max = mq->get_keepalive_max();
             cfg.persistent_path = std::string(mq->get_persistent());
@@ -1392,6 +1393,7 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_int_field("session_expiry", cfg.mqtt_session_expiry);
             append_int_field("session_queue", cfg.mqtt_session_queue);
             append_int_field("retained_max", cfg.mqtt_retained_max);
+            append_int_field("queue_max", cfg.mqtt_queue_max);
             append_int_field("max_sessions", cfg.mqtt_max_sessions);
             append_int_field("keepalive_max", cfg.mqtt_keepalive_max);
             if (!cfg.persistent_path.empty())
@@ -1787,6 +1789,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.mqtt_session_expiry = json_get_uint32(json, "session_expiry", 86400);
             cfg.mqtt_session_queue = json_get_uint32(json, "session_queue", 1000);
             cfg.mqtt_retained_max = json_get_size(json, "retained_max", 64ull << 20);
+            cfg.mqtt_queue_max = json_get_size(json, "queue_max", 64ull << 20);
             cfg.mqtt_max_sessions = json_get_uint32(json, "max_sessions", 100000);
             cfg.mqtt_keepalive_max = static_cast<uint16_t>(json_get_uint32(json, "keepalive_max", 1200));
             cfg.persistent_path = json_get_string(json, "persistent_path");

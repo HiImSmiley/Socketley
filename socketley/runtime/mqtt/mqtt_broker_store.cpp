@@ -292,6 +292,7 @@ void broker::install_session(std::unique_ptr<session> s, const std::vector<std::
     }
     own(*s);
     session* raw = s.get();
+    recount(*raw);
     m_by_key[raw->key] = raw;
     m_sessions[raw->client_id] = std::move(s);
     if (raw->will)
@@ -509,6 +510,7 @@ broker::late_take broker::take_late(std::string_view in)
         s.queue.push_front(std::move(older[i]));
     for (; s.queue.size() > m_cfg.session_queue; s.queue.pop_front())
         ++m_stats.dropped_queue;
+    recount(s);
     mark(s);
     pump(s);
     return late_take::merged;

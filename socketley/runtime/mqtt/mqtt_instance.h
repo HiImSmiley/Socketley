@@ -52,6 +52,8 @@ public:
     uint32_t get_session_queue() const { return m_session_queue; }
     void set_retained_max(uint64_t bytes) { m_retained_max = bytes; }
     uint64_t get_retained_max() const { return m_retained_max; }
+    void set_queue_max(uint64_t bytes) { m_queue_max = bytes; }
+    uint64_t get_queue_max() const { return m_queue_max; }
     void set_max_sessions(uint32_t n) { m_max_sessions = n; }
     uint32_t get_max_sessions() const { return m_max_sessions; }
     void set_keepalive_max(uint16_t s) { m_keepalive_max = s; }
@@ -93,6 +95,7 @@ private:
     uint32_t    m_session_expiry{86400};
     uint32_t    m_session_queue{1000};
     uint64_t    m_retained_max{64u << 20};
+    uint64_t    m_queue_max{64u << 20};
     uint32_t    m_max_sessions{100000};
     uint16_t    m_keepalive_max{1200};
     std::string m_persistent;
