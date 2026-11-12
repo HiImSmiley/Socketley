@@ -2777,7 +2777,7 @@ circuit_threshold	number	Errors to open circuit (default 5)
 circuit_timeout	number	Seconds before half-open (default 30)
 backend_timeout	number	T{
 .ad l
-Seconds for the first response byte (default 2, 0 = off)
+Seconds for the first response byte, in TCP mode for the connect (default 2, 0 = off)
 T}
 retry_count	number	Retry count (0 = disabled)
 retry_all	bool	Also retry non-idempotent methods
@@ -6589,8 +6589,17 @@ Such a backend passes a TCP health check.
 A request that never completes counts as neither a success nor a failure, so
 without a deadline the backend keeps its full share of the rotation.
 Every request routed to it then waits until the client gives up.
-The deadline applies in HTTP mode only, because TCP mode has no request and
-response framing to measure.
+In TCP mode, which has no request and response framing to measure, the same
+deadline bounds the connect to the backend instead.
+A connect that has not completed within it is a failed connection attempt: the
+backend is charged an error, and the next backend is tried as
+.B \-\-retry
+allows.
+So an address that has gone silent, such as a container's old one after it
+restarted, holds a client this long rather than for the kernel's two minutes of
+SYN retries.
+.B "\-\-backend\-timeout 0"
+leaves the connect unbounded there too.
 .IP
 Only the wait for the first byte is bounded.
 Once the backend has begun answering, a slow or streaming response body is
@@ -23080,8 +23089,11 @@ be given a longer
 or
 .BR "\-\-backend\-timeout 0" ;
 otherwise the proxy treats it as hung.
-The deadline applies to HTTP mode only, because in TCP mode there is no request
-boundary to measure from.
+In TCP mode, where there is no request boundary to measure from, it bounds the
+connect to the backend instead, and a connect it ends is a failed attempt that
+is charged to the member and retried on the next one as
+.B \-\-retry
+allows.
 .SS Request Framing
 In HTTP mode the proxy is strict about how a request's header block is framed.
 It refuses anything that it and a backend could read differently.

@@ -285,6 +285,7 @@ void proxy_client_connection::reset(int new_fd)
     // once a descriptor moves between structs.
     generation = next_io_generation();
     connect_reattempted = false;
+    connect_timed_out = false;
     fd = new_fd;
     file.reset();
     fcgi_sock_flags = -1;
@@ -7306,6 +7307,11 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             conn->abort_watch_pending = true;
     }
 
+    // TCP mode's one bound on a backend that answers nothing is its connect, under the --backend-timeout that bounds
+    // HTTP's first byte, so an address gone silent costs an attempt rather than the kernel's SYN retries.
+    if (m_protocol == protocol_tcp)
+        arm_response_deadline(conn);
+
     return true;  // connect_pending = true — caller must check
 }
 
@@ -9695,6 +9701,11 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     int bfd = conn->connect_fd;
     conn->connect_fd = -1;
 
+    // The connect has answered, which is all TCP mode's deadline waits for.
+    const bool timed_out = std::exchange(conn->connect_timed_out, false);
+    if (m_protocol == protocol_tcp)
+        clear_response_deadline(conn);
+
     // The abort watch covered exactly this handshake and is withdrawn rather
     // than left armed, because a struct that still owes a completion is
     // retired instead of pooled.
@@ -9703,7 +9714,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
 
     // A poll completion only reports readiness, so SO_ERROR is folded into one
     // value and the failure path stays shared.
-    int res = cqe->res;
+    int res = timed_out ? -ETIMEDOUT : cqe->res;
     bool fd_ours = (bfd >= 0);
     if (res >= 0 && req->type == op_poll)
     {
@@ -9767,7 +9778,8 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
             if (!try_retry(conn))
                 answer_gateway_failure(conn, ours);
         }
-        else
+        // In TCP mode every failed connection attempt is retried, as --retry allows, on the next backend.
+        else if (ours || !try_retry(conn))
         {
             close_pair(client_fd, -1);
         }
@@ -10125,6 +10137,19 @@ void proxy_instance::response_deadline_sweep()
         if (now < conn->ex.response_deadline)
         {
             still_waiting = true;
+            continue;
+        }
+
+        // A TCP-mode connect past its deadline is withdrawn here and failed in handle_connect, which charges the
+        // backend and makes the next attempt -- the one place a connect ends either way.
+        if (m_protocol == protocol_tcp && conn->connect_pending)
+        {
+            conn->ex.awaiting_response = false;
+            if (!conn->connect_timed_out && m_loop)
+            {
+                conn->connect_timed_out = true;
+                m_loop->submit_poll_remove(&conn->connect_req);
+            }
             continue;
         }
 
@@ -10709,7 +10734,8 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     if (conn->closing)
         return false;
 
-    if (!retry_safe_method(conn->ex.method, m_mesh.retry_all))
+    // TCP mode has no method, and its every failed connection attempt is retried.
+    if (m_protocol == protocol_http && !retry_safe_method(conn->ex.method, m_mesh.retry_all))
         return false;
 
     conn->ex.retries_remaining--;
@@ -10778,8 +10804,12 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     {
         const std::string failed_host = conn->ex.backend_host;
         const uint16_t    failed_port = conn->ex.backend_port;
+        // A selection hands out a fresh --retry budget, which inside a retry made a group whose members all fail
+        // retry for ever; this one keeps what is left.
+        const int left = conn->ex.retries_remaining;
         const backend_info* target =
             select_and_resolve_backend(conn, &failed_host, failed_port);
+        conn->ex.retries_remaining = left;
         if (!target || !connect_to_backend(conn, target))
             return false;
         if (conn->connect_pending)

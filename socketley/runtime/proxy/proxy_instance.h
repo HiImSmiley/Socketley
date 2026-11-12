@@ -385,6 +385,8 @@ struct alignas(64) proxy_client_connection
     // no longer valid, which is an internal inconsistency rather than a
     // refusal, bounded so a persistent problem surfaces.
     bool connect_reattempted{false};
+    // TCP mode's --backend-timeout ran out on the connect, which the sweep withdrew and handle_connect fails.
+    bool connect_timed_out{false};
     // The client has shut its write side and is still reading, set on the EOF
     // completion and nowhere else, on both the copy and the splice path.
     bool client_eof{false};
