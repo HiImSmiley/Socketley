@@ -4597,3 +4597,55 @@ TEST_CASE("glob_match answers a pattern built to backtrack in linear time")
     store.keys("*" + run, out);
     CHECK(out.size() == 1);
 }
+
+// A store past the flush's floor is freed by a thread of its own, so the calling thread -- a worker's loop -- spends a
+// fraction of what freeing it there costs, and the store is empty and serves on at once.
+TEST_CASE("cache_store flush_all of a large store leaves the freeing to another thread")
+{
+    const std::string v(200, 'v');
+    auto fill = [&](cache_store& s)
+    {
+        for (int i = 0; i < 200000; ++i)
+            s.set("key:" + std::to_string(i), v);
+        for (int i = 0; i < 2000; ++i)
+        {
+            s.rpush("list", v);
+            s.sadd("set", std::to_string(i));
+            s.hset("hash", std::to_string(i), v);
+        }
+    };
+    std::chrono::nanoseconds freed_here{};
+    {
+        auto twin = std::make_unique<cache_store>();
+        fill(*twin);
+        const auto t0 = thread_cpu_now();
+        twin.reset();
+        freed_here = thread_cpu_now() - t0;
+    }
+    cache_store store;
+    fill(store);
+    const auto t0 = thread_cpu_now();
+    store.flush_all();
+    const auto flushed = thread_cpu_now() - t0;
+    MESSAGE("freeing 200,000 keys here: " << freed_here.count() / 1000 << " us, flush_all: " << flushed.count() / 1000
+            << " us of this thread's CPU");
+    CHECK(flushed * 10 < freed_here);
+
+    CHECK(store.size() == 0);
+    std::string out;
+    CHECK_FALSE(store.get("key:7", out));
+    CHECK(store.llen("list") == 0);
+    CHECK(store.scard("set") == 0);
+    CHECK(store.hlen("hash") == 0);
+    CHECK(store.set("key:7", "again"));
+    CHECK(store.get("key:7", out));
+    CHECK(out == "again");
+
+    // Below the floor the flush frees in place, and empties the store the same.
+    cache_store small;
+    small.set("a", "1");
+    small.rpush("l", "x");
+    small.flush_all();
+    CHECK(small.size() == 0);
+    CHECK(small.llen("l") == 0);
+}

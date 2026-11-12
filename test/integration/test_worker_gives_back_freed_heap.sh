@@ -6,6 +6,8 @@
 #   * freed memory kept by glibc below the top of its arenas: a cache that held 200,000 keys and dropped them all
 #     stayed at 76 MB for good, and the dashboard's memory line with it
 #   * a trim that holds the loop: a client of the worker asking all along waits for it
+#   * a FLUSHALL that frees 200,000 keys on the loop (100-165 ms on a Cortex-A78), or leaves their small chunks for the
+#     next large request to coalesce there (46-58 ms): its own answer, or the PINGs after it, wait for that
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -43,7 +45,8 @@ for base in range(0, 200000, 1000):
     got = 0
     while got < 1000: got += s.recv(65536).count(b"+OK")
 print("filled", flush=True)
-s.sendall(b"*1\r\n$8\r\nFLUSHALL\r\n"); s.recv(64)
+t = time.perf_counter(); s.sendall(b"*1\r\n$8\r\nFLUSHALL\r\n"); s.recv(64)
+print("flush %.2f" % ((time.perf_counter() - t) * 1000), flush=True)
 worst, end = 0.0, time.time() + 75
 while time.time() < end:
     t = time.perf_counter(); s.sendall(b"*1\r\n$4\r\nPING\r\n"); s.recv(64)
@@ -57,9 +60,12 @@ full=$(rss)
 wait "$reader"
 worst=$(tail -1 "$SOCKETLEY_TMPD/out")
 after=$(rss)
+flush=$(sed -n 's/^flush //p' "$SOCKETLEY_TMPD/out")
 echo "  200,000 keys held at ${full} MB, all dropped and 75 s idle ${after} MB, the worst PING meanwhile ${worst} ms"
+echo "  FLUSHALL answered in ${flush} ms"
+awk -v f="${flush:-99}" 'BEGIN{exit !(f < 20)}' && ok || bad "a FLUSHALL of 200,000 keys does not hold the loop" "${flush} ms"
 [ "${after:-999}" -lt $(( ${full:-0} - 20 )) ] && ok || bad "the heap a burst freed is given back" "${full} MB then ${after} MB"
-awk -v w="${worst:-99}" 'BEGIN{exit !(w < 20)}' && ok || bad "and giving it back does not hold the loop" "${worst} ms"
+awk -v w="${worst:-99}" 'BEGIN{exit !(w < 20)}' && ok || bad "and nothing after the flush, the heap given back included, holds the loop" "${worst} ms"
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -14,6 +14,12 @@
 #include <cstdio>
 #include <algorithm>
 #include <iterator>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <system_error>
+#include <thread>
 #include "../../shared/util/glob_match.h"
 #include "../../shared/util/wall_clock.h"
 #include <fcntl.h>
@@ -3168,12 +3174,112 @@ bool cache_store::load(std::string_view path, size_t offset)
     return load_v1(file, first_key_len);
 }
 
+namespace
+{
+
+// Keys and members past which a flush frees on a thread of its own: 200,000 keys freed here held the loop 100-165 ms.
+constexpr size_t retire_floor = 4096;
+
+struct garbage
+{
+    virtual ~garbage() = default;
+};
+
+// The one thread a process frees flushed stores on, started at the first and drained and joined at exit, so no store
+// is left half freed for the leak checker or the next owner of the heap.
+class reaper
+{
+public:
+    // False when no thread can be had, and `g` is the caller's to free.
+    bool take(std::unique_ptr<garbage>& g)
+    {
+        std::lock_guard<std::mutex> l(m_mu);
+        if (!m_th.joinable())
+        {
+            try
+            {
+                m_th = std::thread([this] { run(); });
+            }
+            catch (const std::system_error&)
+            {
+                return false;
+            }
+        }
+        m_q.push_back(std::move(g));
+        m_cv.notify_one();
+        return true;
+    }
+
+    ~reaper()
+    {
+        {
+            std::lock_guard<std::mutex> l(m_mu);
+            m_quit = true;
+        }
+        m_cv.notify_one();
+        if (m_th.joinable())
+            m_th.join();
+    }
+
+private:
+    void run()
+    {
+        std::unique_lock<std::mutex> l(m_mu);
+        for (;;)
+        {
+            m_cv.wait(l, [this] { return m_quit || !m_q.empty(); });
+            if (m_q.empty())
+                return;
+            std::unique_ptr<garbage> g = std::move(m_q.front());
+            m_q.pop_front();
+            l.unlock();
+            g.reset();
+            l.lock();
+        }
+    }
+
+    std::mutex                           m_mu;
+    std::condition_variable              m_cv;
+    std::deque<std::unique_ptr<garbage>> m_q;
+    bool                                 m_quit{false};
+    std::thread                          m_th;
+};
+
+reaper& the_reaper()
+{
+    static reaper r;
+    return r;
+}
+
+}   // namespace
+
 // Everything, including the counters.  Extracted from load_v2, which had the
 // only copy: a second hand-written clear is a second chance to leave
 // m_list_elems standing while the lists it counts are gone, and the memory
 // figure would then never come back to zero.
 void cache_store::flush_all()
 {
+    const size_t held = m_data.size() + m_lists.size() + m_sets.size() + m_hashes.size() + m_zsets.size() +
+                        m_streams.size() + m_list_elems + m_set_elems + m_hash_fields + m_zset_members;
+    if (held >= retire_floor)
+    {
+        // Moved out whole, so the clears below find empty tables and bump their epochs as before.
+        struct retired : garbage
+        {
+            retired(cache_store& s)
+                : data(std::move(s.m_data)), lists(std::move(s.m_lists)), sets(std::move(s.m_sets)),
+                  hashes(std::move(s.m_hashes)), zsets(std::move(s.m_zsets)), streams(std::move(s.m_streams)),
+                  expiry(std::move(s.m_expiry)), lru_order(std::move(s.m_lru_order)), lru_map(std::move(s.m_lru_map))
+            {
+            }
+            string_map data; list_map lists; set_map sets; hash_map hashes; zset_map zsets; stream_map streams;
+            expiry_map expiry; std::list<std::string> lru_order; decltype(m_lru_map) lru_map;
+        };
+        std::unique_ptr<garbage> r = std::make_unique<retired>(*this);
+        // With no thread to be had it is freed here, as every flush was.
+        if (!the_reaper().take(r))
+            r.reset();
+    }
     m_data.clear();
     m_lists.clear();
     m_sets.clear();

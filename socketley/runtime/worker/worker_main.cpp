@@ -2698,6 +2698,12 @@ int worker_main(int control_fd)
     if (!claim_current_daemon(control_fd))
         return 2;
 
+#if defined(__GLIBC__)
+    // No fastbins: their chunks are coalesced only by the next large request, which after a mass free walks all of
+    // them on the loop -- 46-58 ms after FLUSHALL of 200,000 keys on a Cortex-A78.
+    mallopt(M_MXFAST, 0);
+#endif
+
     // Before the first line this process might log, because a worker reads no
     // configuration file and every LOG_DEBUG out here would otherwise be
     // unreachable.
