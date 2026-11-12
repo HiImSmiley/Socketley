@@ -286,7 +286,11 @@ void srs_case(std::string_view in)
         FUZZ_CHECK(socketley::ascii::iequals(back, sender) || (foreign && back.empty()),
                    "an SRS address that does not read back as its sender");
         FUZZ_CHECK(srs::reverse(fwd, "fwd.test", "k2", 20003).empty(), "an SRS address read with another key");
-        FUZZ_CHECK(srs::reverse(fwd, "fwd.test", "k1", 20030).empty(), "an SRS address read past its 21 days");
+        // Past the 21 days of the stamp this forwarder gave; another forwarder's address carries that one's stamp,
+        // which may be of any day, so it reads back on the days near that one and as nothing else than its sender.
+        const std::string late = srs::reverse(fwd, "fwd.test", "k1", 20030);
+        FUZZ_CHECK(late.empty() || (foreign && socketley::ascii::iequals(late, sender)),
+                   "an SRS address read past its 21 days");
     }
     (void)srs::reverse(rest, "fwd.test", "k1", 20000);
 }
