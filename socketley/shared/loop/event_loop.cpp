@@ -1067,6 +1067,26 @@ void event_loop::apply_cpu_affinity()
     LOG_WARN(msg);
 }
 
+namespace
+{
+// Why the kernel built no ring, as a refusal that names nothing leaves the operator to guess; a ring's pages are
+// charged to its user's RLIMIT_MEMLOCK, which every process of that user shares, so ENOMEM is that limit spent.
+void log_ring_refused(int err)
+{
+    char msg[384];
+    struct rlimit rl{};
+    if (err == ENOMEM && ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+        snprintf(msg, sizeof(msg),
+                 "event loop: the kernel refused an io_uring (%s): its pages count against this user's locked "
+                 "memory, RLIMIT_MEMLOCK is %llu KiB and this user's other rings hold it; raise it "
+                 "(LimitMEMLOCK=infinity in a systemd unit, ulimit -l in a shell)",
+                 strerror(err), static_cast<unsigned long long>(rl.rlim_cur / 1024));
+    else
+        snprintf(msg, sizeof(msg), "event loop: the kernel refused an io_uring (%s)", strerror(err));
+    LOG_ERROR(msg);
+}
+} // namespace
+
 bool event_loop::init()
 {
     // Before the ring, so no submission is counted against a table that does
@@ -1106,15 +1126,21 @@ bool event_loop::init()
     apply_cpu_affinity();
 
     // The first setup this kernel accepts, best first, so a kernel missing one flag loses that flag and not the rest.
-    const int tier = pick_ring_setup([this](unsigned flags) {
+    int refused = 0;
+    const int tier = pick_ring_setup([this, &refused](unsigned flags) {
         struct io_uring_params p{};
         p.flags = flags;
         if (flags & IORING_SETUP_CQSIZE)
             p.cq_entries = m_queue_depth * 4;
-        return io_uring_queue_init_params(m_queue_depth, &m_ring, &p) == 0;
+        const int rc = io_uring_queue_init_params(m_queue_depth, &m_ring, &p);
+        refused = -rc;
+        return rc == 0;
     });
     if (tier < 0)
+    {
+        log_ring_refused(refused);
         return false;
+    }
     m_ring_setup_flags = RING_SETUP_TIERS[tier];
 
     // The ring exists from here on, and only from here: everything below and

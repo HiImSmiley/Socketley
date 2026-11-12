@@ -10,6 +10,8 @@ Restart=on-failure
 RestartSec=5
 # Every connection is a descriptor, and systemd's default soft limit of 1024 would cap a runtime near a thousand.
 LimitNOFILE=1048576
+# Every runtime's io_uring is charged to this user's locked memory, and systemd's default 8 MiB stops near thirty.
+LimitMEMLOCK=infinity
 
 # Directories
 RuntimeDirectory=socketley
