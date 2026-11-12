@@ -70,39 +70,20 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Debug build, tests, short fuzz
+  man-page:
+    name: Man page renders
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 5
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          # No liburing-dev here.  ubuntu-24.04 packages liburing 2.5 and this
-          # tree has not compiled against 2.5 since 5593ee1 (2026-07-28); this
-          # job installed it anyway and was red on every run from that day until
-          # 2026-08-01.  scripts/install-liburing.sh below is the dependency.
-          sudo apt-get install -y build-essential libssl-dev cmake \
-            netcat-openbsd bc libluajit-5.1-dev \
-            clang-18 libclang-rt-18-dev groff-base
-          # clang is for libFuzzer only — see the note at the top of this file.
-          # Not tolerant of failure: REQUIRE_LIBFUZZER=1 below depends on it,
-          # and a half-installed toolchain should fail here where the error is
-          # legible rather than three steps later.
-          clang++-18 --version
-          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
-
-      - name: Install liburing
-        run: bash scripts/install-liburing.sh
+      - uses: actions/checkout@v7
 
       - name: Man page renders
         # A roff source can be malformed and still install.  In running text
@@ -129,6 +110,27 @@ jobs:
           fi
           echo "man/socketley.1 renders clean."
 
+  # The suite in four parts on four runners, each building the tree itself: the
+  # whole of it is 673 files, about 140 minutes one after another on the
+  # developer machine, and a runner has four cores.  Building on each is the
+  # same wall time as building once and handing the tree over.
+  suite:
+    name: Debug build and suite, part ${{ matrix.shard }} of 4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # No liburing-dev: ubuntu-24.04 packages liburing 2.5 and this tree has not
+      # compiled against 2.5 since 5593ee1 (2026-07-28).
+      - uses: ./.github/actions/build-deps
+      - uses: ./.github/actions/suite-tools
+
       - name: Generate Makefiles
         run: ./scripts/premake5 gmake2
 
@@ -151,28 +153,55 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
           ls -la bin/Debug/
 
-      - name: Unit tests
-        run: |
-          set -e
-          # Every test binary the build produced, not a list of five.  The
-          # build produces eleven; test_conn_transfer, test_managed_runtime and
-          # the four SDK tests were compiled here and by nightly.yml and run by
-          # neither.  A name list goes stale silently when a test is added.
-          n=0
-          for t in bin/Debug/test_*; do
-            [ -f "$t" ] && [ -x "$t" ] || continue
-            n=$((n + 1))
-            echo "--- $(basename "$t") ---"
-            "$t"
-          done
-          [ "$n" -gt 0 ] || { echo "no unit test binaries in bin/Debug"; exit 1; }
-          echo "$n unit test binaries ran."
-
-      - name: Integration suite
+      - name: Unit tests, fuzz corpora and integration suite
+        # run_all.sh runs every unit binary and replays every fuzz corpus before
+        # the integration files, so this part's share of all three is here.
         env:
           SOCKETLEY_CONFIG: Debug
+          SUITE_SHARD: ${{ matrix.shard }}/4
+          # Two files whose bound is the developer machine's speed, which a Debug
+          # build on four shared cores does not reach; both run in the desktop
+          # suite and in release.yml's Release suite.  Measured on the runner,
+          # against Debug on four desktop cores:
+          #   test_db_shard_writes_under_load  71,911 and 98,072 writes in 6 s
+          #     against 277,575..290,091: under its 100,000, the load that can
+          #     fill the table the defect filled, so the file proves nothing here
+          #   test_worker_gives_back_freed_heap  worst PING 20.58 ms over 75 s
+          #     against 0.28..0.80 ms: a shared VM's own pauses, not the trim
+          SUITE_SKIP: test_db_shard_writes_under_load.sh test_worker_gives_back_freed_heap.sh
         run: bash test/ci/assert_suite.sh suite-debug.log
-        timeout-minutes: 12
+        timeout-minutes: 50
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-suite-${{ matrix.shard }}
+          path: suite-debug.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  fuzz:
+    name: Short fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # clang is for libFuzzer only -- see the note at the top of this file.
+      - uses: ./.github/actions/build-deps
+        with:
+          packages: clang-18 libclang-rt-18-dev
+
+      - name: clang is there
+        # Not tolerant of failure: REQUIRE_LIBFUZZER=1 below depends on it, and a
+        # half-installed toolchain should fail here where the error is legible
+        # rather than three steps later.
+        run: clang++-18 --version
+
+      - name: Generate Makefiles
+        run: ./scripts/premake5 gmake2
 
       - name: Build fuzz targets (GCC replay floor, ASan+UBSan)
         # The two header-only targets, fuzz_cache_ops (which adds exactly one
@@ -250,12 +279,10 @@ jobs:
 
       - name: Upload failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ci-failure-artifacts
-          path: |
-            suite-debug.log
-            bin/fuzz-artifacts/
+          name: ci-fuzz-artifacts
+          path: bin/fuzz-artifacts/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -285,20 +312,17 @@ jobs:
     continue-on-error: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          # See the note in the job above: liburing-dev is 2.5 on this runner and
-          # 2.5 does not compile this tree.  This is the job whose failure reads
-          # as six "not declared in this scope" and one incomplete type, with
-          # nothing anywhere naming a package version — so it is the job that
-          # most needed the dependency to be honest.
-          sudo apt-get install -y clang-18 build-essential libssl-dev cmake libluajit-5.1-dev
-          clang++-18 --version
+      - name: clang is there
+        # The image carries clang-18 and OpenSSL's headers, and LuaJIT's and
+        # sol2's come from thirdparty/, so nothing is asked of apt.
+        run: clang++-18 --version
 
       - name: Install liburing
+        # liburing-dev is 2.5 on this runner and 2.5 does not compile this tree.
+        # This is the job whose failure reads as six "not declared in this
+        # scope" and one incomplete type, with nothing naming a package version.
         run: bash scripts/install-liburing.sh
 
       - name: Compile every source with clang
@@ -335,7 +359,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: clang-warnings
