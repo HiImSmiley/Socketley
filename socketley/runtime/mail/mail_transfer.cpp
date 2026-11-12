@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "imap_store.h"
+#include "mail_compose.h"
 #include "mail_mbox.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/wall_clock.h"
@@ -550,7 +551,8 @@ struct importer : std::enable_shared_from_this<importer>
         auto self = shared_from_this();
         const std::string folder = m.folder;
         const int64_t date = m.date_ms ? m.date_ms : socketley::wall::now_ms();
-        store.append(user, folder, std::move(m.bytes), m.flags, std::move(m.keywords), date,
+        // Lines that end in CRLF and nothing else, as APPEND and an import by JMAP store them.
+        store.append(user, folder, crlf_lines(m.bytes), m.flags, std::move(m.keywords), date,
                      [self, folder](imap_store::refusal why, uint32_t, uint32_t) {
                          if (!*self->alive)
                              return;

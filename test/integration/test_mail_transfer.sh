@@ -11,6 +11,7 @@
 #   * an import that loses a message's bytes, its folder, its flags or its keywords
 #   * a Takeout's labels not making the folders, or its read and starred not the flags
 #   * a file that is no mbox taken for one
+#   * a lone CR of an imported message kept, which the sending side puts no dot before
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -127,6 +128,11 @@ open(sys.argv[1], "w", newline="").write(m("Inbox,Opened", "read one") + m("Spam
 PY
 out=$("$BIN" mail m import carol "$T/takeout.mbox" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && [ "$out" = "imported 3 messages into carol's mailbox" ] && ok "a Takeout's mbox is imported" || bad "the Takeout" "rc $rc: $out"
+# A lone CR inside a line: stored as it stood, it went out again with a dot after it that no dot was put before,
+# and a server that ends lines at a CR read the message's end there.
+printf 'From 1234@xxx Mon Oct 19 10:00:00 +0000 2026\nX-Gmail-Labels: Inbox\nSubject: lone cr\n\nbefore\r.\rafter\n\n' > "$T/cr.mbox"
+out=$("$BIN" mail m import carol "$T/cr.mbox" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "an mbox with a lone CR in a line is imported" || bad "the lone CR's import" "rc $rc: $out"
 printf 'just text\n' > "$T/notes.mbox"
 out=$("$BIN" mail m import carol "$T/notes.mbox" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && case "$out" in *"is no mbox"*) true ;; *) false ;; esac && ok "a file that is no mbox is refused" \
@@ -170,6 +176,8 @@ say("the labels made the folders", '"Clients"' in r and '"Junk"' in r, r)
 r = k.cmd("SELECT INBOX"); r = k.cmd("FETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT X-GMAIL-LABELS)])")
 say("a read one in the inbox, read, its labels' header taken out", "Subject: read one" in r and "\\Seen" in r and
     "X-Gmail-Labels" not in r, r)
+k.cmd("SELECT INBOX"); r = k.cmd("FETCH 1:* (BODY.PEEK[TEXT])")
+say("an imported message's lines end in CRLF and nowhere else", "before\r\n.\r\nafter" in r and not re.search(r"\r(?!\n)", r), repr(r))
 k.cmd("SELECT Junk"); r = k.cmd("FETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
 say("spam in Junk, unread", "Subject: spam one" in r and "\\Seen" not in r, r)
 k.cmd("SELECT Clients"); r = k.cmd("FETCH 1:* (FLAGS INTERNALDATE)")

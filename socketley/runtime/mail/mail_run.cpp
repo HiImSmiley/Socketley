@@ -2781,7 +2781,9 @@ void mail_run::queue_message(const std::string& from, const std::vector<std::str
     e->at_ms = wall::now_ms_coarse();
     e->bounce = bounce;
     const uint64_t w = m_spool.begin(e, {});
-    m_spool.append(w, body);
+    // The spool holds lines that end in CRLF and no lone CR or LF, as what SMTP takes in does: the one that sends it
+    // on puts a dot before a line's dot, and a server that ends lines elsewhere would read an end where there is none.
+    m_spool.append(w, crlf_lines(body));
     m_spool.finish(w, [this, alive = m_alive, e, done, hold_until_ms](bool ok) {
         if (!*alive)
             return;
