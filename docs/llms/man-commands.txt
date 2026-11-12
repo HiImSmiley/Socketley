@@ -766,7 +766,7 @@ The interactive editor opens a JSON file with the following fields. Fields marke
 | health_threshold | number | Failures to mark unhealthy (default 3) |
 | circuit_threshold | number | Errors to open circuit (default 5) |
 | circuit_timeout | number | Seconds before half-open (default 30) |
-| backend_timeout | number | Seconds for the first response byte (default 2, 0 = off) |
+| backend_timeout | number | Seconds for the first response byte, in TCP mode for the connect (default 2, 0 = off) |
 | retry_count | number | Retry count (0 = disabled) |
 | retry_all | bool | Also retry non-idempotent methods |
 | mesh_client_ca | string | CA for certificates clients present **(needs tls)** |

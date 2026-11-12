@@ -30,7 +30,7 @@ A backend that accepts connections and then stops answering fails no check. A TC
 
 The deadline covers the handshake as well as the answer. If a backend never completes its connect within the deadline, the client is also answered **504 Gateway Timeout**, instead of being closed without a response. A request routed through an **@group** backend is charged to the member it actually reached. So a group member that stalls is taken out of rotation by the same breaker as a listed backend.
 
-The deadline is on by default and covers only the wait for the first byte, so a large or streaming response body is not affected. An endpoint that legitimately needs more than 2 seconds to start answering must be given a longer **--backend-timeout** or **--backend-timeout 0**; otherwise the proxy treats it as hung. The deadline applies to HTTP mode only, because in TCP mode there is no request boundary to measure from.
+The deadline is on by default and covers only the wait for the first byte, so a large or streaming response body is not affected. An endpoint that legitimately needs more than 2 seconds to start answering must be given a longer **--backend-timeout** or **--backend-timeout 0**; otherwise the proxy treats it as hung. In TCP mode, where there is no request boundary to measure from, it bounds the connect to the backend instead, and a connect it ends is a failed attempt that is charged to the member and retried on the next one as **--retry** allows.
 
 ## Request Framing
 

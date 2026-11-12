@@ -6514,7 +6514,7 @@ The interactive editor opens a JSON file with the following fields. Fields marke
 | health_threshold | number | Failures to mark unhealthy (default 3) |
 | circuit_threshold | number | Errors to open circuit (default 5) |
 | circuit_timeout | number | Seconds before half-open (default 30) |
-| backend_timeout | number | Seconds for the first response byte (default 2, 0 = off) |
+| backend_timeout | number | Seconds for the first response byte, in TCP mode for the connect (default 2, 0 = off) |
 | retry_count | number | Retry count (0 = disabled) |
 | retry_all | bool | Also retry non-idempotent methods |
 | mesh_client_ca | string | CA for certificates clients present **(needs tls)** |
@@ -7724,7 +7724,7 @@ How long an open circuit stays open before it changes to **half-open**. In the h
 
 How long a backend may take to send the *first* byte of a response before the proxy gives up on the request. The proxy then retries the request on another backend if **--retry** allows it, and otherwise answers **504 Gateway Timeout**. In both cases the backend is charged with an error, so the circuit breaker above opens and takes the backend out of rotation. While the request body is still arriving, the wait is measured from the latest bytes received. If a client stops sending a body and the backend has already taken all of it so far, the proxy answers **408 Request Timeout** instead, with no retry and no error charged. Default: 2 seconds. 0 disables the deadline, and the proxy waits indefinitely. A bare number is seconds; the suffixes **s**, **m**, **h**, **d** and **w** are accepted (**30** and **5m** both work).
 
-This deadline is the only mechanism that notices a backend which accepts connections and then stops answering. Such a backend passes a TCP health check. A request that never completes counts as neither a success nor a failure, so without a deadline the backend keeps its full share of the rotation. Every request routed to it then waits until the client gives up. The deadline applies in HTTP mode only, because TCP mode has no request and response framing to measure.
+This deadline is the only mechanism that notices a backend which accepts connections and then stops answering. Such a backend passes a TCP health check. A request that never completes counts as neither a success nor a failure, so without a deadline the backend keeps its full share of the rotation. Every request routed to it then waits until the client gives up. In TCP mode, which has no request and response framing to measure, the same deadline bounds the connect to the backend instead. A connect that has not completed within it is a failed connection attempt: the backend is charged an error, and the next backend is tried as **--retry** allows. So an address that has gone silent, such as a container's old one after it restarted, holds a client this long rather than for the kernel's two minutes of SYN retries. **--backend-timeout 0** leaves the connect unbounded there too.
 
 Only the wait for the first byte is bounded. Once the backend has begun answering, a slow or streaming response body is never cut short, with one exception: the client has closed its side. Such a client cannot end the response itself, so from then on the backend may go at most this long without sending a byte. After that, the proxy closes both connections, with no error charged. A backend that keeps sending is never cut short.
 
@@ -10116,7 +10116,7 @@ The limits are:
 
 The runtime paces what it sends with BBR. BBR follows the path's measured rate and round trip rather than backing off at each lost packet. Over a 50 ms path that loses one packet in a hundred, as Wi-Fi and mobile links do, a download ran ten to twenty times faster than with CUBIC. On a clean path it was as fast. **SOCKETLEY_STORAGE_HTTP3_CC=cubic** (or **reno**) chooses another congestion control. AES-128-GCM is offered first, because every packet is sealed on its own and AES-128-GCM costs a quarter less than AES-256.
 
-While more than **SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER** handshakes are under way (default 64; 0 means always), a new client is sent a Retry. The client must prove its address before the runtime keeps any state for it (RFC 9000 8.1.2), so datagrams with forged sources cannot fill the table. QUIC uses the same TLS setup as TCP: a certificate renewed on disk is picked up the same way, and **--ca** asks for a client certificate here too.
+While more than **SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER** handshakes are under way (default 64; 0 means always), a new client is sent a Retry. The client must prove its address before the runtime keeps any state for it (RFC 9000 8.1.2), so datagrams with forged sources cannot fill the table. Each shard holds at most 4096 QUIC connections, 256 of them from any one client address; a new connection past either is not answered. QUIC uses the same TLS setup as TCP: a certificate renewed on disk is picked up the same way, and **--ca** asks for a client certificate here too.
 
 A reverse proxy forwards only TCP, and it passes the Alt-Svc header on unchanged, still naming the runtime's port. To use HTTP/3 behind such a proxy:
 
@@ -13550,7 +13550,7 @@ A backend that accepts connections and then stops answering fails no check. A TC
 
 The deadline covers the handshake as well as the answer. If a backend never completes its connect within the deadline, the client is also answered **504 Gateway Timeout**, instead of being closed without a response. A request routed through an **@group** backend is charged to the member it actually reached. So a group member that stalls is taken out of rotation by the same breaker as a listed backend.
 
-The deadline is on by default and covers only the wait for the first byte, so a large or streaming response body is not affected. An endpoint that legitimately needs more than 2 seconds to start answering must be given a longer **--backend-timeout** or **--backend-timeout 0**; otherwise the proxy treats it as hung. The deadline applies to HTTP mode only, because in TCP mode there is no request boundary to measure from.
+The deadline is on by default and covers only the wait for the first byte, so a large or streaming response body is not affected. An endpoint that legitimately needs more than 2 seconds to start answering must be given a longer **--backend-timeout** or **--backend-timeout 0**; otherwise the proxy treats it as hung. In TCP mode, where there is no request boundary to measure from, it bounds the connect to the backend instead, and a connect it ends is a failed attempt that is charged to the member and retried on the next one as **--retry** allows.
 
 ## Request Framing
 
