@@ -24935,6 +24935,18 @@ Default: 25. A test's own server can then act as an exchanger.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_MAIL_LOCAL_EXCHANGERS
+A test aid that lets a mail runtime hand mail to an exchanger whose address is
+this machine's own (127.0.0.0/8, ::1 or the unspecified address).
+Default: off. Without it such an exchanger is refused with
+.BR "554 5.4.6" ,
+since mail that arrives from this machine is taken as its own and may relay.
+A smarthost named by
+.B \-\-relay
+is not held to this.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_MAIL_TLS_CA
 A test aid that names the CA file a mail runtime checks an exchanger's
 certificate against.

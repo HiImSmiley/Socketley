@@ -48,7 +48,7 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test 
     plain.test=MX:10:mx.plain.test mx.plain.test=127.0.0.3 >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_DELAY_NOTICE_MS=0
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_LOCAL_EXCHANGERS=1 SOCKETLEY_MAIL_DELAY_NOTICE_MS=0
 mkdir -p "$T/rich" "$T/plain"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/rich" --chunking --dsn >/dev/null 2>&1 &
 PIDS+=($!)

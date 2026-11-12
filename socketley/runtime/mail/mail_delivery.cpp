@@ -1,3 +1,4 @@
+#include "../../shared/net/peer_address.h"
 #include "mail_delivery.h"
 #include "../../shared/loop/turn_clock.h"
 
@@ -136,6 +137,20 @@ void stuff(std::string_view in, std::string& out, bool& bol)
     }
 }
 
+// Whether a connection to `a` ends on this machine: 127/8, ::1, or the unspecified address the kernel takes for it.
+bool this_machine(const sockaddr_storage& a)
+{
+    if (socketley::is_loopback(a))
+        return true;
+    if (a.ss_family == AF_INET)
+        return reinterpret_cast<const sockaddr_in&>(a).sin_addr.s_addr == 0;
+    if (a.ss_family != AF_INET6)
+        return false;
+    const auto& v6 = reinterpret_cast<const sockaddr_in6&>(a).sin6_addr;
+    static constexpr uint8_t mapped_any[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0};
+    return IN6_IS_ADDR_UNSPECIFIED(&v6) || std::memcmp(v6.s6_addr, mapped_any, 16) == 0;
+}
+
 }   // namespace
 
 struct delivery::out_conn
@@ -231,6 +246,7 @@ bool delivery::start(std::string& why)
     mail_instance& o = m_run.owner();
     m_selector = std::string(o.get_dkim_selector());
     m_mx_port = settings::number<uint16_t>("SOCKETLEY_MAIL_MX_PORT").value_or(25);
+    m_local_exchangers = settings::flag("SOCKETLEY_MAIL_LOCAL_EXCHANGERS", false);
     m_tls = std::make_unique<tls_context>();
     const char* ca = settings::text("SOCKETLEY_MAIL_TLS_CA");
     if (!m_tls->init_client(ca ? std::string_view(ca) : std::string_view{}))
@@ -2276,6 +2292,13 @@ void delivery::conn_connect(out_conn& c)
         {
             ++c.host_at;
             c.resolved = false;
+            continue;
+        }
+        // A domain's exchanger on this machine would be handed the mail as this machine's own, which may relay.
+        if (!m_relay && !m_local_exchangers && this_machine(c.addrs[c.addr_at].addr))
+        {
+            c.last_error = "554 5.4.6 the exchanger " + c.host + " of " + r.key + " is this machine";
+            ++c.addr_at;
             continue;
         }
         break;

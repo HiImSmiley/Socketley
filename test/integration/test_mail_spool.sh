@@ -52,7 +52,7 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test 
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 # A segment emptied but for a deferred message is moved out of at once; a body past 64 KiB is read back from it.
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_SPOOL_MOVE_MS=0 \
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_LOCAL_EXCHANGERS=1 SOCKETLEY_MAIL_SPOOL_MOVE_MS=0 \
     SOCKETLEY_MAIL_SPOOL_KEEP_BYTES=65536
 mkdir -p "$T/sink"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" --reply later@remote.test 451 >/dev/null 2>&1 &

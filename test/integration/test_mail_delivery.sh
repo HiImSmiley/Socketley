@@ -65,7 +65,7 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test 
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 # The resolver keeps no answer, so a domain looked up again is asked again.
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_DEAD_DOMAIN_MS=1000 \
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_LOCAL_EXCHANGERS=1 SOCKETLEY_MAIL_DEAD_DOMAIN_MS=1000 \
     SOCKETLEY_DNS_CACHE_MS=0
 mkdir -p "$T/sink" "$T/sink5" "$T/relay" "$T/relay2" "$T/relay3"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" --mail held@remote.test 451 --reply b@remote.test '451!' \

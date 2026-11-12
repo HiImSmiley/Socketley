@@ -144,7 +144,7 @@ PIDS+=($!)
 for a in 4 5 6 7; do ready_tcp 127.0.0.$a "$SINK" || bad "the exchangers listen" "127.0.0.$a"; done
 ready_tcp 127.0.0.1 "$WEB" || bad "the policies' server listens" "-"
 
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_TLS_CA="$T/ca.pem" \
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_LOCAL_EXCHANGERS=1 SOCKETLEY_MAIL_TLS_CA="$T/ca.pem" \
     SOCKETLEY_MAIL_STS_CA="$T/ca.pem" SOCKETLEY_MAIL_STS_CONNECT="127.0.0.1:$WEB"
 daemon_start "$BIN"
 "$BIN" create mail t -p "$P" --mail-domain example.test -s >/dev/null 2>&1

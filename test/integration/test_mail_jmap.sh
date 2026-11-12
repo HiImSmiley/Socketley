@@ -90,7 +90,7 @@ PIDS+=($!)
 export SOCKETLEY_MAIL_PUSH_CONNECT="127.0.0.1:$PUSH" SOCKETLEY_MAIL_PUSH_CA="$T/ca.pem"
 # A shard other than the first lets a user go 1.5 s after nothing there asked for it.
 export SOCKETLEY_MAIL_LET_GO_MS=1500
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_LOCAL_EXCHANGERS=1
 mkdir -p "$T/sink"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" >/dev/null 2>&1 &
 PIDS+=($!)

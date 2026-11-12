@@ -192,6 +192,8 @@ inline constexpr setting table[] = {
      "the resolv.conf the resolver on the loop reads its nameservers from"},
     {"SOCKETLEY_MAIL_MX_PORT", kind::number, audience::test, 1, 65535, "25",
      "the port a mail runtime delivers to a domain's mail exchangers on"},
+    {"SOCKETLEY_MAIL_LOCAL_EXCHANGERS", kind::flag, audience::test, 0, 0, "off",
+     "a mail runtime delivers to an exchanger whose address is this machine's"},
     {"SOCKETLEY_MAIL_TLS_CA", kind::text, audience::test, 0, 0, "the system's roots",
      "the CA file a mail runtime checks exchangers' certificates against"},
     {"SOCKETLEY_MAIL_STS_CA", kind::text, audience::test, 0, 0, "the system's roots",

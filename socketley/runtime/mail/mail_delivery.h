@@ -262,6 +262,8 @@ private:
     uint16_t m_relay_port{25};
     std::string m_relay_user, m_relay_pass;
     uint16_t m_mx_port{25};
+    // A test has its exchangers on 127.0.0.1, where anyone else would find this runtime itself.
+    bool m_local_exchangers{false};
     // MTA-STS policies by domain, kept across a restart so a policy gone from DNS still counts until it expires.
     std::unordered_map<std::string, tls_policy::sts> m_sts;
     std::string m_sts_path;
