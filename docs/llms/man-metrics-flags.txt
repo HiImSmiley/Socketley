@@ -19,11 +19,11 @@ The port of the API. Default: 9090. It listens on 127.0.0.1 unless **--bind** na
 
 ### `--keys file`
 
-A file of service keys, one name and secret per line, in the format a **db** runtime reads. The runtime reads the file again when it changes. A request carries a key as **Authorization: Bearer** *secret*, or as Basic auth with the name and the secret, which is what Grafana's data source sends.
+A file of service keys, one name and secret per line, in the format a **db** runtime reads. The runtime reads the file again when it changes. A request carries a key as **Authorization: Bearer** *secret*, or as Basic auth with the name and the secret, which is what Grafana's data source sends. Ten wrong keys from one address within fifteen minutes bar that address until the fifteen minutes are over; during that time a request with a key from it is answered **429** with **Retry-After**, the right key included. Behind the entrance the address is the client's; 127.0.0.1 itself is not counted, and each shard counts for itself.
 
 ### `--idp idp`
 
-Admits the sign-ins of that idp runtime: a browser's session cookie, or an access token as Bearer.
+Admits the sign-ins of that idp runtime: a browser's session cookie, or an access token as Bearer. The log that **--logs** keeps is read only by an account in the idp's **admins** group, as at the dashboard; a key reads it too.
 
 ### `--idp-audience clients`
 

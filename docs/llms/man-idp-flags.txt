@@ -57,7 +57,7 @@ With any resource set, an application may also sign in with the https address of
 
 ### `--cookie-domain domain`
 
-The domain whose names share the sign-in cookie. A user signed in here is then signed in for a proxy, a storage or the dashboard on any name below it. Default: the cookie is for the provider's host alone.
+The domain whose names share the sign-in cookie. A user signed in here is then signed in for a proxy, a storage or the dashboard on any name below it. Default: the cookie is for the provider's host alone. A browser sends that cookie to every name below the domain, and whoever holds it is the user. So a proxy hands it only to a backend that is a runtime of this daemon, which checks it itself. From what it sends to any other backend, an application named by address, the proxy removes the provider's cookies and keeps every other one, with **--auth idp:** or without it.
 
 ### `--shards N`
 

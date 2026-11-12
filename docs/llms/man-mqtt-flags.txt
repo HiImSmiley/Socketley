@@ -107,7 +107,7 @@ function on_disconnect(client, why) self.publish("presence/" .. client.id, "offl
 
 ### `--users file`
 
-The accounts that sign in with a password, one *user***:***hash* per line, as **socketley mqtt passwd** writes them. The file is read again within two seconds of a change.
+The accounts that sign in with a password, one *user***:***hash* per line, as **socketley mqtt passwd** writes them. The file is read again within two seconds of a change. Ten wrong passwords or tokens from one address within fifteen minutes bar that address until the fifteen minutes are over; during that time the right password is refused too. 127.0.0.1, which the entrance's clients come from, is not counted. Each shard counts for itself.
 
 ### `--idp runtime`
 

@@ -1854,7 +1854,7 @@ socketley m export alice /var/backups/alice
 socketley m import alice ~/Takeout/Mail/All mail Including Spam and Trash.mbox
 ```
 
-#### `git-sync --url url --branch name|* --work dir --endpoint host:port [--tls [--ca file]] --bucket library --name folder [--keep days,weeks,months] [--move-from library]`
+#### `git-sync --url url --branch name|* --work dir --endpoint host:port [--tls [--ca file]] --bucket library --name folder [--keep days,weeks,months] [--move-from library] [--public-only]`
 
 Runs one sync of a repository that a storage runtime keeps (see **Git repositories** under **STORAGE FLAGS**). The storage runtime starts this command itself, and a run by hand works the same way.
 
@@ -1863,6 +1863,8 @@ The command fetches into the bare clone under *dir*. When a ref has moved, it wr
 **--ca** names the certificate that the runtime at *host*:*port* must present over **--tls**. The storage runtime passes its own certificate here.
 
 **--move-from** names a library the folder was written to before. Once the tree is complete in the new library, the command copies the backups over from the old one and removes the folder's files there. It removes the old library itself once nothing else is in it. An old library this user may not read is left as it is.
+
+**--public-only** fetches the repository only when every address of its host is one anyone can reach, holds git to the address it looked up, and follows no redirect. A storage runtime passes it for a repository one of its users named, unless **SOCKETLEY_REPO_PRIVATE_HOSTS** is set.
 
 Exit status is 0 when the run ended well, 2 when it did not, and 3 when a run of the same directory is already under way. *dir*/state.json gives the details.
 
@@ -2173,6 +2175,12 @@ A test aid that sets how many seconds a bucket lifecycle rule counts as one day.
 
 Inherited by worker processes, which have no command line of their own.
 
+#### `SOCKETLEY_REPO_PRIVATE_HOSTS`
+
+Set to 1, lets the users of a storage runtime keep git repositories fetched from this machine and from private networks. Unset, a repository a user names is fetched only from a host whose addresses anyone can reach (see Git repositories).
+
+Inherited by worker processes, which have no command line of their own.
+
 #### `SOCKETLEY_SHARE_NOTIFY_ALLOW`
 
 Lists the URL prefixes, comma-separated, that a share link's webhook may begin with. Unset, the allowed prefixes are the webhooks of Discord, Slack and ntfy.sh (see Drive, links, media and the web interface).
@@ -2194,6 +2202,12 @@ Inherited by worker processes, which have no command line of their own.
 #### `SOCKETLEY_MAIL_MX_PORT`
 
 A test aid that sets the port on which a mail runtime hands mail to a domain's exchangers. Default: 25. A test's own server can then act as an exchanger.
+
+Inherited by worker processes, which have no command line of their own.
+
+#### `SOCKETLEY_MAIL_LOCAL_EXCHANGERS`
+
+A test aid that lets a mail runtime hand mail to an exchanger whose address is this machine's own (127.0.0.0/8, ::1 or the unspecified address). Default: off. Without it such an exchanger is refused with **554 5.4.6**, since mail that arrives from this machine is taken as its own and may relay. A smarthost named by **--relay** is not held to this.
 
 Inherited by worker processes, which have no command line of their own.
 
@@ -5655,7 +5669,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Cluster mode](man-cluster-mode.txt)
 - [Installation](man-installation.txt)
 - [State persistence](man-state-persistence.txt)
-- [Environment](man-environment.txt) (91 entries)
+- [Environment](man-environment.txt) (93 entries)
 - [Files](man-files.txt)
 - [SDK](man-sdk.txt)
 - [Limitations](man-limitations.txt)
@@ -6248,7 +6262,7 @@ socketley m export alice /var/backups/alice
 socketley m import alice ~/Takeout/Mail/All mail Including Spam and Trash.mbox
 ```
 
-### `git-sync --url url --branch name|* --work dir --endpoint host:port [--tls [--ca file]] --bucket library --name folder [--keep days,weeks,months] [--move-from library]`
+### `git-sync --url url --branch name|* --work dir --endpoint host:port [--tls [--ca file]] --bucket library --name folder [--keep days,weeks,months] [--move-from library] [--public-only]`
 
 Runs one sync of a repository that a storage runtime keeps (see **Git repositories** under **STORAGE FLAGS**). The storage runtime starts this command itself, and a run by hand works the same way.
 
@@ -6257,6 +6271,8 @@ The command fetches into the bare clone under *dir*. When a ref has moved, it wr
 **--ca** names the certificate that the runtime at *host*:*port* must present over **--tls**. The storage runtime passes its own certificate here.
 
 **--move-from** names a library the folder was written to before. Once the tree is complete in the new library, the command copies the backups over from the old one and removes the folder's files there. It removes the old library itself once nothing else is in it. An old library this user may not read is left as it is.
+
+**--public-only** fetches the repository only when every address of its host is one anyone can reach, holds git to the address it looked up, and follows no redirect. A storage runtime passes it for a repository one of its users named, unless **SOCKETLEY_REPO_PRIVATE_HOSTS** is set.
 
 Exit status is 0 when the run ended well, 2 when it did not, and 3 when a run of the same directory is already under way. *dir*/state.json gives the details.
 
@@ -10303,7 +10319,7 @@ A sync runtime runs **socketley git-sync** for that user's repositories alone, o
 
 A failed scheduled run is retried an hour later. A run the user asks for is the file *dir*/.ui/git/*id*/asked, and the user's sync runtime starts it within a second. Each repository's bare clone, the state of its last run and its log are under *dir*/.ui/git/*id*/. The list of repositories is *dir*/.ui/git.json*.* Git must be installed. A runtime on a unix socket has none of these features.
 
-A repository is fetched over https://, http:// or git://, never with credentials in its URL. A private repository is read with the GitHub token the user keeps in the page. The token is passed as git's http.extraHeader through git's environment, so it appears on no command line. It is stored in *dir*/.ui/git-tokens/, sealed with AES-256-GCM under a key that only the user's own secret derives. It is never shown again.
+A repository is fetched over https://, http:// or git://, never with credentials in its URL. Because the runtime fetches it for the user who named it, its host must have only addresses anyone can reach: one on this machine or a private network is not fetched from, the run fails and says so, and no redirect to another host is followed. **SOCKETLEY_REPO_PRIVATE_HOSTS=1** lets a storage's users keep repositories from such hosts too. A private repository is read with the GitHub token the user keeps in the page. The token is passed as git's http.extraHeader through git's environment, so it appears on no command line. It is stored in *dir*/.ui/git-tokens/, sealed with AES-256-GCM under a key that only the user's own secret derives. It is never shown again.
 
 **GET /~ui/git** lists the repositories the user keeps (for an admin, all of them). Each entry has the state its last run ended in, and the answer says whether the user has a token. **POST /~ui/git** takes one of these bodies. **{"action":"add", url , branch , bucket , name , private , every }** adds a repository and starts its first run. The defaults are branch **main**, the user's own library **git-***user***,** every **never**, and the name taken from the URL's last part. **{"action":"every","id","every"}** sets the schedule: **never**, **day**, **week** or **month**. **{"action":"sync","id"}** starts a run. **{"action":"remove","id"}** removes a repository; its files and bundles stay. **{"action":"token","token"}** sets the user's token, and an empty token removes it. A user can add a repository only into a library the user may write.
 
@@ -10673,7 +10689,7 @@ With any resource set, an application may also sign in with the https address of
 
 ### `--cookie-domain domain`
 
-The domain whose names share the sign-in cookie. A user signed in here is then signed in for a proxy, a storage or the dashboard on any name below it. Default: the cookie is for the provider's host alone.
+The domain whose names share the sign-in cookie. A user signed in here is then signed in for a proxy, a storage or the dashboard on any name below it. Default: the cookie is for the provider's host alone. A browser sends that cookie to every name below the domain, and whoever holds it is the user. So a proxy hands it only to a backend that is a runtime of this daemon, which checks it itself. From what it sends to any other backend, an application named by address, the proxy removes the provider's cookies and keeps every other one, with **--auth idp:** or without it.
 
 ### `--shards N`
 
@@ -10746,7 +10762,7 @@ The access is one of these: **private** (and any collection the file does not na
 
 ### `--keys file`
 
-Service keys for backends, one per line: *name secret*. The secret must be at least 16 characters. The file is read again when it changes. A key may set a document's **_owner**.
+Service keys for backends, one per line: *name secret*. The secret must be at least 16 characters. The file is read again when it changes. A key may set a document's **_owner**. Ten wrong keys from one address within fifteen minutes bar that address until the fifteen minutes are over; during that time a request with a key from it is answered **429** with **Retry-After**, the right key included. Behind the entrance the address is the client's; 127.0.0.1 itself is not counted, and each shard counts for itself.
 
 ### `--idp runtime`
 
@@ -10918,7 +10934,7 @@ function on_disconnect(client, why) self.publish("presence/" .. client.id, "offl
 
 ### `--users file`
 
-The accounts that sign in with a password, one *user***:***hash* per line, as **socketley mqtt passwd** writes them. The file is read again within two seconds of a change.
+The accounts that sign in with a password, one *user***:***hash* per line, as **socketley mqtt passwd** writes them. The file is read again within two seconds of a change. Ten wrong passwords or tokens from one address within fifteen minutes bar that address until the fifteen minutes are over; during that time the right password is refused too. 127.0.0.1, which the entrance's clients come from, is not counted. Each shard counts for itself.
 
 ### `--idp runtime`
 
@@ -11598,11 +11614,11 @@ The port of the API. Default: 9090. It listens on 127.0.0.1 unless **--bind** na
 
 ### `--keys file`
 
-A file of service keys, one name and secret per line, in the format a **db** runtime reads. The runtime reads the file again when it changes. A request carries a key as **Authorization: Bearer** *secret*, or as Basic auth with the name and the secret, which is what Grafana's data source sends.
+A file of service keys, one name and secret per line, in the format a **db** runtime reads. The runtime reads the file again when it changes. A request carries a key as **Authorization: Bearer** *secret*, or as Basic auth with the name and the secret, which is what Grafana's data source sends. Ten wrong keys from one address within fifteen minutes bar that address until the fifteen minutes are over; during that time a request with a key from it is answered **429** with **Retry-After**, the right key included. Behind the entrance the address is the client's; 127.0.0.1 itself is not counted, and each shard counts for itself.
 
 ### `--idp idp`
 
-Admits the sign-ins of that idp runtime: a browser's session cookie, or an access token as Bearer.
+Admits the sign-ins of that idp runtime: a browser's session cookie, or an access token as Bearer. The log that **--logs** keeps is read only by an account in the idp's **admins** group, as at the dashboard; a key reads it too.
 
 ### `--idp-audience clients`
 
@@ -11749,7 +11765,7 @@ Each request is answered on its own, so **--shards** spreads requests over proce
 
 ### `--keys file`
 
-A file of the keys that clients may call the runtime with, one per line, as *name secret*. Add **admin** after the secret of a key that may change the daemon. A secret is at least 16 characters long, and the client sends it as **Authorization: Bearer**. A request without a key from the file is answered **401** with **WWW-Authenticate: Bearer**. The runtime reads the file again when it changes. If the new file does not read, the runtime keeps the keys it had and logs why.
+A file of the keys that clients may call the runtime with, one per line, as *name secret*. Add **admin** after the secret of a key that may change the daemon. A secret is at least 16 characters long, and the client sends it as **Authorization: Bearer**. A request without a key from the file is answered **401** with **WWW-Authenticate: Bearer**. The runtime reads the file again when it changes. If the new file does not read, the runtime keeps the keys it had and logs why. Ten wrong keys from one address within fifteen minutes bar that address until the fifteen minutes are over; during that time a request with a key from it is answered **429** with **Retry-After**, the right key included. Behind the entrance the address is the client's; 127.0.0.1 itself is not counted, and each shard counts for itself.
 
 ### `--anonymous`
 
@@ -14417,6 +14433,12 @@ A test aid that sets how many seconds a bucket lifecycle rule counts as one day.
 
 Inherited by worker processes, which have no command line of their own.
 
+### `SOCKETLEY_REPO_PRIVATE_HOSTS`
+
+Set to 1, lets the users of a storage runtime keep git repositories fetched from this machine and from private networks. Unset, a repository a user names is fetched only from a host whose addresses anyone can reach (see Git repositories).
+
+Inherited by worker processes, which have no command line of their own.
+
 ### `SOCKETLEY_SHARE_NOTIFY_ALLOW`
 
 Lists the URL prefixes, comma-separated, that a share link's webhook may begin with. Unset, the allowed prefixes are the webhooks of Discord, Slack and ntfy.sh (see Drive, links, media and the web interface).
@@ -14438,6 +14460,12 @@ Inherited by worker processes, which have no command line of their own.
 ### `SOCKETLEY_MAIL_MX_PORT`
 
 A test aid that sets the port on which a mail runtime hands mail to a domain's exchangers. Default: 25. A test's own server can then act as an exchanger.
+
+Inherited by worker processes, which have no command line of their own.
+
+### `SOCKETLEY_MAIL_LOCAL_EXCHANGERS`
+
+A test aid that lets a mail runtime hand mail to an exchanger whose address is this machine's own (127.0.0.0/8, ::1 or the unspecified address). Default: off. Without it such an exchanger is refused with **554 5.4.6**, since mail that arrives from this machine is taken as its own and may relay. A smarthost named by **--relay** is not held to this.
 
 Inherited by worker processes, which have no command line of their own.
 

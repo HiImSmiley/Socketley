@@ -60,7 +60,7 @@ The access is one of these: **private** (and any collection the file does not na
 
 ### `--keys file`
 
-Service keys for backends, one per line: *name secret*. The secret must be at least 16 characters. The file is read again when it changes. A key may set a document's **_owner**.
+Service keys for backends, one per line: *name secret*. The secret must be at least 16 characters. The file is read again when it changes. A key may set a document's **_owner**. Ten wrong keys from one address within fifteen minutes bar that address until the fifteen minutes are over; during that time a request with a key from it is answered **429** with **Retry-After**, the right key included. Behind the entrance the address is the client's; 127.0.0.1 itself is not counted, and each shard counts for itself.
 
 ### `--idp runtime`
 

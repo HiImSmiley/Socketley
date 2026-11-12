@@ -19,7 +19,7 @@ Each request is answered on its own, so **--shards** spreads requests over proce
 
 ### `--keys file`
 
-A file of the keys that clients may call the runtime with, one per line, as *name secret*. Add **admin** after the secret of a key that may change the daemon. A secret is at least 16 characters long, and the client sends it as **Authorization: Bearer**. A request without a key from the file is answered **401** with **WWW-Authenticate: Bearer**. The runtime reads the file again when it changes. If the new file does not read, the runtime keeps the keys it had and logs why.
+A file of the keys that clients may call the runtime with, one per line, as *name secret*. Add **admin** after the secret of a key that may change the daemon. A secret is at least 16 characters long, and the client sends it as **Authorization: Bearer**. A request without a key from the file is answered **401** with **WWW-Authenticate: Bearer**. The runtime reads the file again when it changes. If the new file does not read, the runtime keeps the keys it had and logs why. Ten wrong keys from one address within fifteen minutes bar that address until the fifteen minutes are over; during that time a request with a key from it is answered **429** with **Retry-After**, the right key included. Behind the entrance the address is the client's; 127.0.0.1 itself is not counted, and each shard counts for itself.
 
 ### `--anonymous`
 

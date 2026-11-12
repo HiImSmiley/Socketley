@@ -516,7 +516,7 @@ socketley m export alice /var/backups/alice
 socketley m import alice ~/Takeout/Mail/All mail Including Spam and Trash.mbox
 ```
 
-### `git-sync --url url --branch name|* --work dir --endpoint host:port [--tls [--ca file]] --bucket library --name folder [--keep days,weeks,months] [--move-from library]`
+### `git-sync --url url --branch name|* --work dir --endpoint host:port [--tls [--ca file]] --bucket library --name folder [--keep days,weeks,months] [--move-from library] [--public-only]`
 
 Runs one sync of a repository that a storage runtime keeps (see **Git repositories** under **STORAGE FLAGS**). The storage runtime starts this command itself, and a run by hand works the same way.
 
@@ -525,6 +525,8 @@ The command fetches into the bare clone under *dir*. When a ref has moved, it wr
 **--ca** names the certificate that the runtime at *host*:*port* must present over **--tls**. The storage runtime passes its own certificate here.
 
 **--move-from** names a library the folder was written to before. Once the tree is complete in the new library, the command copies the backups over from the old one and removes the folder's files there. It removes the old library itself once nothing else is in it. An old library this user may not read is left as it is.
+
+**--public-only** fetches the repository only when every address of its host is one anyone can reach, holds git to the address it looked up, and follows no redirect. A storage runtime passes it for a repository one of its users named, unless **SOCKETLEY_REPO_PRIVATE_HOSTS** is set.
 
 Exit status is 0 when the run ended well, 2 when it did not, and 3 when a run of the same directory is already under way. *dir*/state.json gives the details.
 
