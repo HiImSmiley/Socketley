@@ -293,6 +293,17 @@ TEST_CASE("cache_store TTL")
         CHECK(store.expire_then_pttl("gone") == -2);
         CHECK_FALSE(store.exists("gone"));
     }
+
+    // A key whose deadline passed and that nothing has reaped yet still has one: none of its answers may read as
+    // "no expiry" (-1) or "no key" (-2), however long ago the deadline was.
+    SUBCASE("a deadline passed but not yet reaped reads as expiring now")
+    {
+        store.set("late", "v");
+        REQUIRE(store.set_expiry_ms("late", 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+        CHECK(store.get_ttl("late") == 0);
+        CHECK(store.get_pttl("late") == 0);
+    }
 }
 
 TEST_CASE("cache_store eviction")

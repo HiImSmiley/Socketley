@@ -1203,8 +1203,9 @@ int64_t cache_store::get_ttl(std::string_view key) const
     // 1` answered 0 immediately and `EX 10` read as 9 after one millisecond.
     // Redis computes (ms + 500) / 1000, and a client treating TTL == 0 as
     // "expiring now" acted a whole second early against the old answer.
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        it->second - std::chrono::steady_clock::now()).count();
+    // A deadline passed and not yet reaped is expiring now: below zero the answer would read as no expiry or no key.
+    const auto ms = std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(
+        it->second - std::chrono::steady_clock::now()).count());
     return (ms + 500) / 1000;
 }
 
@@ -1332,9 +1333,9 @@ int64_t cache_store::get_pttl(std::string_view key) const
     if (it == m_expiry.end())
         return -1;
 
-    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-        it->second - std::chrono::steady_clock::now());
-    return remaining.count();
+    // As get_ttl(): never below zero, where -1 and -2 mean something else.
+    return std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(
+        it->second - std::chrono::steady_clock::now()).count());
 }
 
 // TTL asked check_expiry() and then get_ttl(), which probed the expiry map
