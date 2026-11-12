@@ -1,0 +1,79 @@
+# The clients, servers and libraries the integration suite drives, as a
+# developer machine has them.  Without them a file says SKIP and passes, or
+# fails on a command that is not there: on the first run here, 25 files skipped
+# and 11 failed on redis-cli alone.
+#
+# Paths are absolute, because test/run_all.sh runs each file with HOME moved
+# into a namespace of its own, where ~/.local and rustup's ~/.rustup are gone.
+
+name: Suite tools
+description: what the integration suite drives besides socketley
+
+runs:
+  using: composite
+  steps:
+    - name: Locked memory as the packaged unit has it
+      # Every io_uring is charged to its user's RLIMIT_MEMLOCK, shared by all of
+      # that user's processes, and the runner's 8 MiB holds about thirty rings:
+      # the 31st worker of a run failed to start.  packaging/socketley.service
+      # sets LimitMEMLOCK=infinity, and so does this, on the process every later
+      # step of the job is started from.
+      shell: bash
+      run: |
+        p=$$
+        while [ "$p" -gt 1 ] && [ "$(cat "/proc/$p/comm")" != Runner.Worker ]; do p=$(ps -o ppid= -p "$p" | tr -d ' '); done
+        [ "$p" -gt 1 ] || { echo "no Runner.Worker above this step"; exit 1; }
+        sudo prlimit --pid "$p" --memlock=unlimited:unlimited
+
+    - name: The limit reaches the steps
+      shell: bash
+      run: '[ "$(ulimit -l)" = unlimited ] || { echo "locked memory is still $(ulimit -l) KiB"; exit 1; }'
+
+    - name: apt
+      shell: bash
+      run: |
+        need=""
+        for p in redis-tools redis-server ffmpeg mosquitto-clients rclone strace python3-venv; do
+          dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' || need="$need $p"
+        done
+        if [ -n "$need" ]; then
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $need
+        fi
+        # The package starts a redis of its own on 6379; the tests start theirs.
+        sudo systemctl disable --now redis-server >/dev/null 2>&1 || true
+
+    - name: Python's h2 and aioquic
+      # A venv first on PATH, beside the system's packages, as the runner's python is externally managed.
+      shell: bash
+      run: |
+        python3 -m venv --system-site-packages "$RUNNER_TEMP/suite-py"
+        "$RUNNER_TEMP/suite-py/bin/pip" install --quiet h2==4.3.0 aioquic==1.7.0
+        echo "$RUNNER_TEMP/suite-py/bin" >> "$GITHUB_PATH"
+
+    - name: Pebble, the ACME test CA
+      shell: bash
+      run: |
+        case "$(uname -m)" in aarch64|arm64) arch=arm64 ;; *) arch=amd64 ;; esac
+        dir="$RUNNER_TEMP/acme" ver=v2.10.1
+        mkdir -p "$dir"
+        for b in pebble pebble-challtestsrv; do
+          curl -fsSL --retry 5 "https://github.com/letsencrypt/pebble/releases/download/$ver/$b-linux-$arch.tar.gz" | tar -xz -C "$dir"
+          # The release's tarballs carry the binaries as 0644.
+          chmod +x "$dir/$b-linux-$arch/linux/$arch/$b"
+        done
+        raw="https://raw.githubusercontent.com/letsencrypt/pebble/$ver/test/certs"
+        curl -fsSL --retry 5 "$raw/pebble.minica.pem" -o "$dir/pebble.minica.pem"
+        curl -fsSL --retry 5 "$raw/localhost/cert.pem" -o "$dir/localhost-cert.pem"
+        curl -fsSL --retry 5 "$raw/localhost/key.pem" -o "$dir/localhost-key.pem"
+        "$dir/pebble-linux-$arch/linux/$arch/pebble" -version
+        echo "PEBBLE_DIR=$dir" >> "$GITHUB_ENV"
+
+    - name: cargo with HOME moved
+      shell: bash
+      run: |
+        if [ -d "$HOME/.rustup" ]; then
+          echo "RUSTUP_HOME=$HOME/.rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+        fi
