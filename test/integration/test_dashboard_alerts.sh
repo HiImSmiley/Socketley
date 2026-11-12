@@ -81,7 +81,7 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal listed-host.test=127.0.0.2 2.0.0.
     far.test=MX:10:mx.far.test mx.far.test=127.0.0.9 >/dev/null 2>&1 &
 DNS_PID=$!
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf"
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_LOCAL_EXCHANGERS=1
 daemon_start "$BIN"
 U="http://127.0.0.1:$M"
 for _ in $(seq 1 50); do curl -s -o /dev/null "$U/" && break; sleep 0.1; done
