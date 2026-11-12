@@ -18,6 +18,7 @@
 #   * a join that replaces an agent already joined without being asked to
 #   * a person's link kept open, and its streams opened, after the idp took the sign-in back
 set -uo pipefail
+USER=${USER:-$(id -un)}   # unset under a service, cron or a container's exec
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(readlink -f "$BIN")

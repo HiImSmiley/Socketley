@@ -13,6 +13,7 @@
 #   * a host certificate a client checking @cert-authority would not take
 #   * a certificate given without a line in the log saying for whom and for which key
 set -uo pipefail
+USER=${USER:-$(id -un)}   # unset under a service, cron or a container's exec
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(readlink -f "$BIN")

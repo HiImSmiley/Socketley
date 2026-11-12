@@ -21,6 +21,7 @@
 #   storage      behind a proxy --tls-offloaded names, failed sign-ins count
 #                against the address in X-Forwarded-For, not the proxy's
 set -uo pipefail
+USER=${USER:-$(id -un)}   # unset under a service, cron or a container's exec
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
