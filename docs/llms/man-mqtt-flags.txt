@@ -20,6 +20,7 @@ Over TLS 1.3, the first packet of 256 KiB or more that a client is sent hands it
 
 - QoS 0, 1 and 2. QoS 2 is delivered exactly once, by its packet identifier.
 - Retained messages, cleared by an empty one.
+- Topics and filters of at most 256 levels. A SUBSCRIBE to a deeper filter is refused for it (0x8F), and a PUBLISH to a deeper topic ends the connection.
 - Wills. A will is sent when a connection is lost, or when a 5.0 client disconnects and asks for it. It is not sent when the client disconnects cleanly. A 5.0 will delay is waited out if one is given, and the will is not sent at all when the client comes back within it.
 - Sessions, kept by 3.1.1's clean session 0 and by 5.0's session expiry. A client id has one connection. A second connection takes the session over, and the first is told so. A session belongs to its user, so a CONNECT under another user (or none) is refused as not authorized.
 - Keep alive: a client that is silent for one and a half times its keep alive is disconnected.
@@ -103,7 +104,7 @@ function on_connect(client) self.publish("presence/" .. client.id, "online", { r
 function on_disconnect(client, why) self.publish("presence/" .. client.id, "offline", { retain = true }) end
 ```
 
-**on_auth** is told whether the credentials checked out (**authenticated**) and as whom (**account**). If it lets in a client whose credentials were refused, the user name the client gave becomes its user. **on_publish** may also answer a table: the message as it is to go on, with any of **topic**, **payload**, **qos** and **retain**. A refused publish is answered 0x87. **self.publish(topic, payload [, {qos=, retain=}])** publishes as the broker. **self.retained(topic)** reads a retained payload. **self.sessions()** lists this shard's sessions. **self.kick(client_id [, end])** disconnects one. While a hook decides, that connection's next packets wait.
+**on_auth** is told whether the credentials checked out (**authenticated**) and as whom (**account**). If it lets in a client whose credentials were refused, the user name the client gave becomes its user. **on_publish** may also answer a table: the message as it is to go on, with any of **topic**, **payload**, **qos** and **retain**. A refused publish is answered 0x87. A will is asked as any publish is, when it is to be sent; one refused is not sent. **self.publish(topic, payload [, {qos=, retain=}])** publishes as the broker. **self.retained(topic)** reads a retained payload. **self.sessions()** lists this shard's sessions. **self.kick(client_id [, end])** disconnects one. While a hook decides, that connection's next packets wait.
 
 ### `--users file`
 
@@ -155,7 +156,11 @@ The most messages kept for one session while its client is away or slow. Default
 
 ### `--retained-max size`
 
-The most bytes that retained messages may take. Default: 64M. A new retained message past it is not kept, and is counted.
+The most bytes that retained messages may take, their topics, payloads and properties together. Default: 64M. A new retained message past it is not kept, and is counted.
+
+### `--queue-max size`
+
+The most bytes that the QoS 1 and 2 messages held for one owner's sessions may take, queued while a client is away or slow or sent and not yet acknowledged. An owner is a user, or for clients with none their address. Default: 64M. Past it, the oldest waiting for the session a message is for are dropped, and when that is not enough the message is not kept for it; each is counted.
 
 ### `--max-sessions n`
 

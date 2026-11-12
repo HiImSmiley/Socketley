@@ -17,7 +17,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Sync flags](man-sync-flags.txt) (11 entries)
 - [IDP flags](man-idp-flags.txt) (6 entries)
 - [DB flags](man-db-flags.txt) (13 entries)
-- [MQTT flags](man-mqtt-flags.txt) (15 entries)
+- [MQTT flags](man-mqtt-flags.txt) (16 entries)
 - [Mail flags](man-mail-flags.txt) (43 entries)
 - [Tunnel flags](man-tunnel-flags.txt) (9 entries)
 - [Metrics flags](man-metrics-flags.txt) (18 entries)

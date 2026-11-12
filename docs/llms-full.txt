@@ -2397,7 +2397,7 @@ Inherited by worker processes, which have no command line of their own.
 
 #### `SOCKETLEY_WRITE_STALL_SECS`
 
-A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset. The range is 1 to 86400. Default: 120 seconds.
+A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset, and how many a storage's client may before its connection or stream is let go. The range is 1 to 86400. Default: 120 seconds.
 
 Inherited by worker processes, which have no command line of their own.
 
@@ -3752,6 +3752,7 @@ Every flag a mqtt runtime takes, by group.
 | `--session-expiry` | duration | Session expiry: The longest a session outlives its connection; 1d unless given. |
 | `--session-queue` | int | Session queue: Messages kept for one session while its client is away; 1000 unless given. |
 | `--retained-max` | size | Retained bytes: The most bytes retained messages take; 64M unless given. |
+| `--queue-max` | size | Queued bytes: The most bytes the messages kept for one owner's sessions take; 64M unless given. |
 | `--max-sessions` | int | Max sessions: The most sessions it keeps, connected or not; 100000 unless given. |
 | `--keepalive-max` | int | Max keep alive: The longest keep alive a client is granted, in seconds; 1200 unless given. |
 
@@ -4944,6 +4945,7 @@ Every flag of every runtime type, with the types that take it.
 | `--session-expiry` | duration | Session expiry: The longest a session outlives its connection; 1d unless given. Types: mqtt. |
 | `--session-queue` | int | Session queue: Messages kept for one session while its client is away; 1000 unless given. Types: mqtt. |
 | `--retained-max` | size | Retained bytes: The most bytes retained messages take; 64M unless given. Types: mqtt. |
+| `--queue-max` | size | Queued bytes: The most bytes the messages kept for one owner's sessions take; 64M unless given. Types: mqtt. |
 | `--max-sessions` | int | Max sessions: The most sessions it keeps, connected or not; 100000 unless given. Types: mqtt. |
 | `--keepalive-max` | int | Max keep alive: The longest keep alive a client is granted, in seconds; 1200 unless given. Types: mqtt. |
 
@@ -5654,7 +5656,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Sync flags](man-sync-flags.txt) (11 entries)
 - [IDP flags](man-idp-flags.txt) (6 entries)
 - [DB flags](man-db-flags.txt) (13 entries)
-- [MQTT flags](man-mqtt-flags.txt) (15 entries)
+- [MQTT flags](man-mqtt-flags.txt) (16 entries)
 - [Mail flags](man-mail-flags.txt) (43 entries)
 - [Tunnel flags](man-tunnel-flags.txt) (9 entries)
 - [Metrics flags](man-metrics-flags.txt) (18 entries)
@@ -9295,7 +9297,7 @@ ldap user   *      reader
 
 **AssumeRoleWithWebIdentity** takes a JWT signed with RS256, RS384, RS512, PS256, ES256 or ES384 by a key of the JWK Set file. The keys may be RSA of 2048 bits and up, or EC P-256 and P-384. The runtime reads the JWK Set file again whenever it changes, and keeps the old keys while a new file does not parse. In the token, **iss** must be the issuer, **aud** must name a client, and **exp**, **nbf** and **iat** must hold within a minute. Otherwise the answer is **400 InvalidIdentityToken**, or **ExpiredTokenException** once the token has run out. A **role** line for the RoleArn names the user the session signs as. Without such a line, the token's claim (by default **policy**) must name exactly one user.
 
-**AssumeRoleWithLDAPIdentity** binds **LDAPUsername** with **LDAPPassword**, using the DN that the **dn** template makes (the name is escaped as a DN value). The connection is ldap:// or ldaps://, checked against **ca=** or the system's CAs. The bind runs on a thread of its own and must finish within five seconds. The answer is **503 ServiceUnavailable** when the directory does not answer, and **403 AccessDenied** when the directory refuses the bind. The user's own **ldap user** line, or else the * line, names the user the session signs as; **=** means the same name. An empty password is refused before anything is sent.
+**AssumeRoleWithLDAPIdentity** binds **LDAPUsername** with **LDAPPassword**, using the DN that the **dn** template makes (the name is escaped as a DN value). The connection is ldap:// or ldaps://, checked against **ca=** or the system's CAs. The bind runs on a thread of its own and must finish within five seconds. The answer is **503 ServiceUnavailable** when the directory does not answer, and **403 AccessDenied** when the directory refuses the bind. The user's own **ldap user** line, or else the * line, names the user the session signs as; **=** means the same name. An empty password is refused before anything is sent. Ten refused passwords from one address within 15 minutes bar it until those 15 minutes end, answered **429 Throttling**; the address counted is the one a **--tls-offloaded** proxy forwards, or for a request from exactly 127.0.0.1, ::1 or a unix socket (the entrance) the last X-Forwarded-For hop; this machine's own requests are not counted.
 
 Both kinds of session belong to the mapped user. They are signed under that user's first key and have the user's rights, narrowed by a **Policy** as for AssumeRole. A RoleArn that names a role the IAM API made is assumed when the role's trust policy names the mapped user, as for AssumeRole. A mapping to a user that does not exist, or that has no key, is **403 AccessDenied**. The runtime reads the file at every start. **create** and **start** refuse the file when a line does not parse.
 
@@ -10847,6 +10849,7 @@ Over TLS 1.3, the first packet of 256 KiB or more that a client is sent hands it
 
 - QoS 0, 1 and 2. QoS 2 is delivered exactly once, by its packet identifier.
 - Retained messages, cleared by an empty one.
+- Topics and filters of at most 256 levels. A SUBSCRIBE to a deeper filter is refused for it (0x8F), and a PUBLISH to a deeper topic ends the connection.
 - Wills. A will is sent when a connection is lost, or when a 5.0 client disconnects and asks for it. It is not sent when the client disconnects cleanly. A 5.0 will delay is waited out if one is given, and the will is not sent at all when the client comes back within it.
 - Sessions, kept by 3.1.1's clean session 0 and by 5.0's session expiry. A client id has one connection. A second connection takes the session over, and the first is told so. A session belongs to its user, so a CONNECT under another user (or none) is refused as not authorized.
 - Keep alive: a client that is silent for one and a half times its keep alive is disconnected.
@@ -10930,7 +10933,7 @@ function on_connect(client) self.publish("presence/" .. client.id, "online", { r
 function on_disconnect(client, why) self.publish("presence/" .. client.id, "offline", { retain = true }) end
 ```
 
-**on_auth** is told whether the credentials checked out (**authenticated**) and as whom (**account**). If it lets in a client whose credentials were refused, the user name the client gave becomes its user. **on_publish** may also answer a table: the message as it is to go on, with any of **topic**, **payload**, **qos** and **retain**. A refused publish is answered 0x87. **self.publish(topic, payload [, {qos=, retain=}])** publishes as the broker. **self.retained(topic)** reads a retained payload. **self.sessions()** lists this shard's sessions. **self.kick(client_id [, end])** disconnects one. While a hook decides, that connection's next packets wait.
+**on_auth** is told whether the credentials checked out (**authenticated**) and as whom (**account**). If it lets in a client whose credentials were refused, the user name the client gave becomes its user. **on_publish** may also answer a table: the message as it is to go on, with any of **topic**, **payload**, **qos** and **retain**. A refused publish is answered 0x87. A will is asked as any publish is, when it is to be sent; one refused is not sent. **self.publish(topic, payload [, {qos=, retain=}])** publishes as the broker. **self.retained(topic)** reads a retained payload. **self.sessions()** lists this shard's sessions. **self.kick(client_id [, end])** disconnects one. While a hook decides, that connection's next packets wait.
 
 ### `--users file`
 
@@ -10982,7 +10985,11 @@ The most messages kept for one session while its client is away or slow. Default
 
 ### `--retained-max size`
 
-The most bytes that retained messages may take. Default: 64M. A new retained message past it is not kept, and is counted.
+The most bytes that retained messages may take, their topics, payloads and properties together. Default: 64M. A new retained message past it is not kept, and is counted.
+
+### `--queue-max size`
+
+The most bytes that the QoS 1 and 2 messages held for one owner's sessions may take, queued while a client is away or slow or sent and not yet acknowledged. An owner is a user, or for clients with none their address. Default: 64M. Past it, the oldest waiting for the session a message is for are dropped, and when that is not enough the message is not kept for it; each is counted.
 
 ### `--max-sessions n`
 
@@ -11134,10 +11141,10 @@ Mail from other servers that the runtime sends on, as an alias does, is sealed w
 
 **Reports.** With **--reports**, the runtime sends the reports other domains ask for:
 
-- DMARC aggregate reports (RFC 7489), to the rua of each domain whose mail it checked;
+- DMARC aggregate reports (RFC 7489), to the rua of each domain whose mail it checked: to addresses of the domain's own organizational domain, and to another domain's only where it publishes *domain*._report._dmarc.*other* (RFC 7489 7.1);
 - TLS reports (RFC 8460), to the rua in the **_smtp._tls** record of each domain it sent mail to under DANE or MTA-STS.
 
-It sends them once a day, after midnight UTC, gzip'd. Each shard reports what it saw. **--dmarc-rua** and **--tls-rpt** publish where other domains should send their reports about this runtime's domains.
+It sends them once a day, after midnight UTC, gzip'd, each to five addresses at the most. Each shard reports what it saw. **--dmarc-rua** and **--tls-rpt** publish where other domains should send their reports about this runtime's domains.
 
 **Its records.** With **--dns**, the runtime publishes these records for each of its domains, through the dns runtime:
 
@@ -14655,7 +14662,7 @@ Inherited by worker processes, which have no command line of their own.
 
 ### `SOCKETLEY_WRITE_STALL_SECS`
 
-A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset. The range is 1 to 86400. Default: 120 seconds.
+A test aid that sets how many seconds a server or proxy client with no **--idle-timeout** may take nothing of its answer before the connection is reset, and how many a storage's client may before its connection or stream is let go. The range is 1 to 86400. Default: 120 seconds.
 
 Inherited by worker processes, which have no command line of their own.
 

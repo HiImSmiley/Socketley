@@ -124,10 +124,10 @@ Mail from other servers that the runtime sends on, as an alias does, is sealed w
 
 **Reports.** With **--reports**, the runtime sends the reports other domains ask for:
 
-- DMARC aggregate reports (RFC 7489), to the rua of each domain whose mail it checked;
+- DMARC aggregate reports (RFC 7489), to the rua of each domain whose mail it checked: to addresses of the domain's own organizational domain, and to another domain's only where it publishes *domain*._report._dmarc.*other* (RFC 7489 7.1);
 - TLS reports (RFC 8460), to the rua in the **_smtp._tls** record of each domain it sent mail to under DANE or MTA-STS.
 
-It sends them once a day, after midnight UTC, gzip'd. Each shard reports what it saw. **--dmarc-rua** and **--tls-rpt** publish where other domains should send their reports about this runtime's domains.
+It sends them once a day, after midnight UTC, gzip'd, each to five addresses at the most. Each shard reports what it saw. **--dmarc-rua** and **--tls-rpt** publish where other domains should send their reports about this runtime's domains.
 
 **Its records.** With **--dns**, the runtime publishes these records for each of its domains, through the dns runtime:
 
