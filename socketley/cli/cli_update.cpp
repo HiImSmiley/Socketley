@@ -167,6 +167,12 @@ struct github
     {
         for (int hop = 0; hop < 5; ++hop)
         {
+            // The release's SHA-256 is only as good as the channel it came over, so no hop leaves TLS.
+            if (!url.starts_with("https://"))
+            {
+                err = "a redirect led off https, to " + url;
+                return 0;
+            }
             std::vector<std::pair<std::string, std::string>> h = {{"Accept", std::string(accept)},
                                                                   {"X-GitHub-Api-Version", "2022-11-28"}};
             // Only to GitHub's own API: a redirect leads to a signed address that a token must not reach.
@@ -252,7 +258,8 @@ const js::jvalue* pick_asset(const js::jvalue& release, std::string& why)
         for (const auto& a : assets->items)
         {
             const std::string_view name = js::string_of(a, "name");
-            if (name.starts_with("socketley_") && name.ends_with(arch))
+            // The name becomes a file root writes, so it is a file's name and no path.
+            if (name.starts_with("socketley_") && name.ends_with(arch) && name.find('/') == std::string_view::npos)
                 return &a;
         }
     why = "release " + std::string(js::string_of(release, "tag_name")) + " has no .deb for " + architecture() +
