@@ -1633,7 +1633,8 @@ bool answer_end(stream& st)
     return true;
 }
 
-// The host has let go of its object: the stream is ended toward the client and forgotten.
+// The host has let go of its object: the stream is ended toward the client, and forgotten once nothing of its answer
+// can be asked for again.
 void gone(stream& st)
 {
     if (st.gone || !st.owner)
@@ -1641,13 +1642,22 @@ void gone(stream& st)
     conn& hc = *st.owner;
     drop_rx(st);
     st.gone = true;
-    // Ended before its answer did: the client is told the request was cancelled.  An end already asked for is not
-    // a cancel, and resetting then would take the answer with it.
-    if (!st.ended && !st.end_pending && hc.q && !hc.dead)
+    // The host's object is gone, so the stream_gone() QUIC's own end of the stream brings resolves to nothing.
+    st.user = 0;
+    // Bytes nghttp3 was given are read where they lie until the peer acknowledges them, a lost packet's again.
+    const bool lent = st.tx_given > st.tx_acked;
+    // Ended before its answer did: the client is told the request was cancelled.  An answer whose end was asked for
+    // and whose every byte the peer has is no cancel; one the host gives up with bytes still to go is, since nothing
+    // hands the rest on and the peer would read an answer cut short as a whole one.
+    const bool whole = (st.ended || st.end_pending) && st.tx_acked >= st.tx_total;
+    if (!whole && hc.q && !hc.dead)
         ngtcp2_conn_shutdown_stream(hc.q, 0, st.sid, NGHTTP3_H3_REQUEST_CANCELLED);
     // The reset, or the window its unread body gave back, goes out.
     if (hc.ep)
         hc.ep->dirty_raw(hc);
+    // While they are lent the stream keeps them: QUIC closing the stream, or the connection going, lets it go.
+    if (lent)
+        return;
     if (hc.h)
         nghttp3_conn_set_stream_user_data(hc.h, st.sid, nullptr);
     const int64_t sid = st.sid;

@@ -74,7 +74,12 @@ constexpr size_t   tls_plain_bytes     = 16 * 1024;
 // What one turn of the encryptor puts in front of the kernel.
 constexpr size_t   tls_write_slice     = 64 * 1024;
 constexpr size_t   tls_write_cap       = 512 * 1024;
-constexpr int      write_stall_secs    = 120;
+// Seconds a client may take nothing of its answer; a test sets less than the 120 with SOCKETLEY_WRITE_STALL_SECS.
+long write_stall()
+{
+    static const long secs = static_cast<long>(socketley::settings::number<uint64_t>("SOCKETLEY_WRITE_STALL_SECS").value_or(120));
+    return secs;
+}
 
 }   // namespace
 
@@ -597,7 +602,7 @@ void storage_run::sweep()
                 kill = quiet > body_stall_secs;
                 break;
             case phase::respond:
-                kill = quiet > write_stall_secs;
+                kill = quiet > write_stall();
                 break;
             case phase::hook_wait:
                 kill = quiet > body_stall_secs;

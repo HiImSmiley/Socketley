@@ -6,6 +6,8 @@ usage:
                                                        this process, puts FILE and reads it back; prints "same" or
                                                        what differed, then the relay's rebind count
   lib_storage_http3_edge.py halfopen PORT N            N handshakes begun from N ports and never finished
+  lib_storage_http3_edge.py stalled PORT CAFILE PATH SECS  a GET whose answer the client holds back for SECS by its window,
+                                                       then lets through; prints reset, whole, differs or closed
   lib_storage_http3_edge.py peer PORT CAFILE [CERT KEY]  one GET; prints the server certificate's serial and subject
                                                        and the status, or "refused" when the handshake fails
 """
@@ -176,6 +178,74 @@ async def peer(port, ca, cert=None, key=None):
     c.close()
 
 
+async def stalled(port, ca, path, wait):
+    """A GET whose answer the client lets only the first bytes of through, by a window it does not open again, for
+    `wait` seconds while it keeps the connection alive; meanwhile other objects are put and read, so memory the
+    server let go of is used again. Then the window is opened. Prints what became of the answer: "reset" when the
+    server gave the stream up, "whole" when every byte came and is the object's, "differs at N" when bytes came that
+    are not the object's, "closed" when the connection ended instead."""
+    want = None
+    async def other(i):
+        q = await open_client(port, config(ca))
+        try:
+            if i == 0:
+                return (await q.request("GET", path))[1]
+            body = bytes([0x41 + i % 20]) * (150000 + 4096 * i)
+            await q.request("PUT", "/stall/churn%d" % i, body)
+            await q.request("GET", "/stall/churn%d" % i)
+        finally:
+            q.close()
+            q._tr.close()
+    want = await other(0)
+    cfg = config(ca)
+    cfg.max_stream_data = 2048
+    p = await open_client(port, cfg)
+    quic = p._quic
+    # The window is not opened while the answer is held: aioquic does that by itself as bytes arrive.
+    limits, quic._write_stream_limits = quic._write_stream_limits, lambda *a, **k: None
+    sid = quic.get_next_available_stream_id()
+    st = {"status": None, "body": [], "done": asyncio.Event()}
+    p.waiting[sid] = st
+    reset = []
+    seen = p.quic_event_received
+    def watch(ev):
+        if type(ev).__name__ == "StreamReset" and ev.stream_id == sid:
+            reset.append(ev.error_code)
+            st["done"].set()
+        seen(ev)
+    p.quic_event_received = watch
+    p.h3.send_headers(sid, [(b":method", b"GET"), (b":scheme", b"https"), (b":authority", b"localhost"),
+                            (b":path", path.encode())], end_stream=True)
+    p.transmit()
+    for i in range(int(wait)):
+        await asyncio.sleep(1)
+        quic.send_ping(i)
+        p.transmit()
+        if i >= 5 and i % 2 == 1:
+            await other(i)
+    for i in range(1, 6):
+        await other(40 + i)
+    quic._write_stream_limits = limits
+    for _ in range(40):
+        if st["done"].is_set() or p.closed:
+            break
+        quic.send_ping(999)
+        p.transmit()
+        await asyncio.sleep(0.25)
+    got = b"".join(st["body"])
+    if reset:
+        print("reset")
+    elif p.closed and not st["done"].is_set():
+        print("closed")
+    elif got == want:
+        print("whole")
+    else:
+        at = next((i for i in range(min(len(got), len(want))) if got[i] != want[i]), min(len(got), len(want)))
+        print("differs at %d of %d (%d came)" % (at, len(want), len(got)))
+    p.close()
+    p._tr.close()
+
+
 cmd = sys.argv[1]
 if cmd == "migrate":
     asyncio.run(migrate(int(sys.argv[2]), sys.argv[3], sys.argv[4]))
@@ -183,3 +253,5 @@ elif cmd == "halfopen":
     halfopen(int(sys.argv[2]), int(sys.argv[3]))
 elif cmd == "peer":
     asyncio.run(peer(int(sys.argv[2]), sys.argv[3], *sys.argv[4:6]))
+elif cmd == "stalled":
+    asyncio.run(stalled(int(sys.argv[2]), sys.argv[3], sys.argv[4], float(sys.argv[5])))
