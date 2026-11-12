@@ -381,6 +381,9 @@ PAR_LIST=$(mktemp); SERIAL_LIST=$(mktemp); QUIET_LIST=$(mktemp); RESDIR=$(mktemp
 for script in "$SCRIPT_DIR"/integration/test_*.sh; do
     [ -f "$script" ] || continue
     suite_in_shard "$(basename "$script")" || continue
+    # SUITE_SKIP names files a machine cannot measure, which its caller gives the reason for; listed with the skips.
+    case " ${SUITE_SKIP:-} " in *" $(basename "$script") "*)
+        PASS=$((PASS+1)); SKIPPED="$SKIPPED$(basename "$script"): SKIP: named in SUITE_SKIP"$'\n'; continue ;; esac
     # A quiet file that needs the host's own network disturbs every other one, so it runs alone after them.
     if [ -n "$NS_ROOT" ] && grep -q '^# suite: quiet' "$script" && grep -q '^# suite: host' "$script"; then
         echo "$script" >> "$SERIAL_LIST"
