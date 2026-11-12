@@ -2460,6 +2460,10 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
 namespace
 {
 
+// The most words a search's criteria take: every message is matched against all of them, so a command of a hundred
+// thousand cost a minute of the worker for 2000 messages, and no client writes more than a few dozen.
+constexpr size_t max_search_words = 2048;
+
 bool parse_one(const std::vector<std::string>& t, size_t& i, crit& out, int depth = 0)
 {
     // A criterion nested deeper than a client writes one is refused, not followed down the stack.
@@ -2742,6 +2746,8 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
         m_saved.clear();
     if (i < t.size() && iequal(t[i], "CHARSET"))
         i += 2;
+    if (t.size() - std::min(i, t.size()) > max_search_words)
+        return finish(tag, "NO", "[LIMIT] Too many search criteria");
     crit all;
     all.key = "AND";
     while (i < t.size())
@@ -2993,6 +2999,8 @@ void imap_session::cmd_order(const std::string& tag, const std::vector<token>& a
     std::vector<std::string> t;
     for (; i < a.size(); ++i)
         t.push_back(a[i].k == token::open ? "(" : a[i].k == token::close ? ")" : a[i].text);
+    if (t.size() > max_search_words)
+        return finish(tag, "NO", "[LIMIT] Too many search criteria");
     crit all;
     all.key = "AND";
     for (size_t k = 0; k < t.size();)

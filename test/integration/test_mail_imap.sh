@@ -12,6 +12,7 @@
 #   * new mail not told by NOOP or IDLE, or told only when the bucket is next listed
 #   * flags and UIDs lost by a restart
 #   * a client on this machine guessing an idp account's password with no count kept of its failures
+#   * a search of thousands of criteria taken, each message matched against every one
 #   * a tag no client may send said back, so that the answer is no status line
 #   * a shard holding every user it ever served, or one that let a user go losing what came meanwhile, or its \Recent
 set -uo pipefail
@@ -856,6 +857,24 @@ except Exception as e:
 PY
 )
 check "a literal's marker glued to an atom is no literal, a huge one is refused, and the next command answered" "$r" "a BAD c NO  b OK "
+
+# A search's criteria are bounded, since every message is matched against all of them: 5000 (lines joined by empty
+# literals, each the last SUBJECT's argument) are refused with [LIMIT], and a search of two is answered.
+r=$(timeout 120 python3 - "$IM" <<'PY'
+import imaplib, ssl, sys
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1]), timeout=60); M.starttls(ssl_context=ctx); M.login("alice", "alicepassword1")
+M.select("INBOX")
+lines = [b"SUBJECT a " * 999 + b"SUBJECT " for _ in range(4)] + [b"SUBJECT a " * 999 + b"SUBJECT a"]
+M.send(b"w1 SEARCH " + b"{0+}\r\n".join(lines) + b"\r\n")
+while True:
+    l = M.readline()
+    if not l or l.startswith(b"w1 "):
+        break
+print(l.split(b" ")[1].decode(), l.split(b" ")[2].decode(), M.search(None, "SUBJECT", "a", "NOT", "DELETED")[0])
+PY
+)
+check "a search of 5000 criteria is refused as past the limit, and one of two answered" "$r" "NO [LIMIT] OK"
 
 # A tag no client may send is refused, not said back: one with a NUL came back with a blank in it, which made the
 # answer no status line, and what the command name said ({99999999}) then read as a literal's marker.
