@@ -474,7 +474,9 @@ private:
     static constexpr uint32_t credit_after_turn(uint32_t last_batch, uint32_t credit)
     { return last_batch > 1 ? BUSY_CREDIT : credit > 0 ? credit - 1 : 0; }
     bool     m_warned_ownerless{false};
-    int m_eventfd{-1};
+    // Atomic with m_stop_pending, as request_stop() comes from any thread and may come before init() made it.
+    std::atomic<int> m_eventfd{-1};
+    std::atomic<bool> m_stop_pending{false};
     io_request m_signal_req{};
     uint64_t m_signal_buf{};
     bool m_multishot_supported{false};

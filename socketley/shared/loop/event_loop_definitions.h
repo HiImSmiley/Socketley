@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -196,13 +197,15 @@ private:
 };
 
 // One counter for the whole process, since two live structs must never hold
-// the same value, with zero reserved for never stamped.
+// the same value, with zero reserved for never stamped; atomic, because an SDK
+// program runs a loop per runtime on threads of its own.
 inline uint32_t next_io_generation()
 {
-    static uint32_t seq = 0;
-    if (SOCKETLEY_UNLIKELY(++seq == 0))
-        seq = 1;
-    return seq;
+    static std::atomic<uint32_t> seq{0};
+    uint32_t g = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (SOCKETLEY_UNLIKELY(g == 0))
+        g = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    return g;
 }
 
 // io_request::buf_group for a submission that selected no provided buffer,

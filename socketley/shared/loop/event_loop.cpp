@@ -42,7 +42,7 @@ event_loop::~event_loop()
     delete m_closer;
     m_closer = nullptr;
 
-    if (m_eventfd >= 0) close(m_eventfd);
+    if (const int fd = m_eventfd.load(std::memory_order_relaxed); fd >= 0) close(fd);
 
     free(m_fd_armed);
     free(m_fd_cancels);
@@ -353,19 +353,24 @@ bool event_loop::supports_multishot_accept()
 
 void event_loop::setup_eventfd()
 {
-    m_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (m_eventfd < 0)
+    const int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0)
         return;
 
-    m_signal_req = { nullptr, reinterpret_cast<char*>(&m_signal_buf), m_eventfd, sizeof(m_signal_buf), op_read };
+    m_signal_req = { nullptr, reinterpret_cast<char*>(&m_signal_buf), fd, sizeof(m_signal_buf), op_read };
 
     struct io_uring_sqe* sqe = io_uring_get_sqe(&m_ring);
     if (sqe)
     {
-        io_uring_prep_read(sqe, m_eventfd, &m_signal_buf, sizeof(m_signal_buf), 0);
+        io_uring_prep_read(sqe, fd, &m_signal_buf, sizeof(m_signal_buf), 0);
         io_uring_sqe_set_data(sqe, &m_signal_req);
         io_uring_submit(&m_ring);
     }
+
+    // Published, then a stop that came before it is carried out: one side of the pair sees the other's store.
+    m_eventfd.store(fd, std::memory_order_seq_cst);
+    if (m_stop_pending.load(std::memory_order_seq_cst))
+        socketley::eventfd_bump(fd);
 }
 
 // Centralised SQE acquisition, with everything but the branch-predicted fast
@@ -1522,6 +1527,9 @@ void event_loop::run()
         }
     }
 
+    // A stop is spent by the run it ended, so starting again is not ended by it.
+    m_stop_pending.store(false, std::memory_order_seq_cst);
+
     // The ring is deliberately left standing, because stopping the runtimes
     // that are still up submits into it, and shutdown_ring() ends it at the
     // point the caller knows no more submissions are coming.
@@ -1531,13 +1539,16 @@ void event_loop::request_stop()
 {
     m_running.store(false, std::memory_order_release);
 
-    if (m_eventfd >= 0)
-        socketley::eventfd_bump(m_eventfd);
+    // Before init() made the eventfd there is nothing to wake, so the request waits for setup_eventfd() to see it.
+    m_stop_pending.store(true, std::memory_order_seq_cst);
+    const int fd = m_eventfd.load(std::memory_order_seq_cst);
+    if (fd >= 0)
+        socketley::eventfd_bump(fd);
 }
 
 int event_loop::get_signal_write_fd() const
 {
-    return m_eventfd;
+    return m_eventfd.load(std::memory_order_acquire);
 }
 
 struct io_uring* event_loop::get_ring()
