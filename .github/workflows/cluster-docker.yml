@@ -91,7 +91,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Show the docker that will run this
         run: |
@@ -119,7 +119,10 @@ jobs:
         run: docker run --rm socketley-cluster-test:latest version
 
       - name: Cluster test
-        run: bash test/docker/test_cluster_docker.sh
+        # The same BUILD_JOBS as the build above, since it is a build argument: the
+        # script's own build is then that image from the cache, where with its
+        # default of 1 it was a second, one-job LTO build that ran out the step.
+        run: BUILD_JOBS="$(nproc)" bash test/docker/test_cluster_docker.sh
         timeout-minutes: 15
 
       - name: Container logs on failure
@@ -149,7 +152,7 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: The compose file parses and its context resolves
         run: |
@@ -178,9 +181,10 @@ jobs:
         # A one-element list keeps the script whole.  This check exists because
         # that is exactly what happened while this example was being repaired.
         run: |
-          # From apt, not pip: the runner's python is an externally managed
-          # environment and a bare `pip install` fails on it.
-          sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
+          # From apt when the image lacks it, not pip: the runner's python is an
+          # externally managed environment and a bare `pip install` fails on it.
+          python3 -c 'import yaml' 2>/dev/null \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml; }
           python3 - <<'PY'
           import subprocess, sys, yaml
           doc = yaml.safe_load(open("/tmp/resolved.yml"))
