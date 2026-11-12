@@ -1265,6 +1265,8 @@ private:
     // reading backend_idx unconditionally made a healthy backend carry a group
     // member's failures.
     void note_backend_failure(proxy_client_connection* conn);
+    void recheck_group_host(const std::string& host);
+    void forget_member_connections(const std::string& host);
     void note_backend_success(proxy_client_connection* conn);
 
     bool try_retry(proxy_client_connection* conn);
@@ -1760,6 +1762,8 @@ private:
     // port applied at selection, pruned to the size of the membership rather
     // than of its history.
     std::unordered_map<std::string, in_addr> m_group_addr;
+    // Members whose address failed, looked up again past the resolver's cache while the old one stays in use.
+    std::unordered_set<std::string> m_group_recheck;
     // Nodes already announced in the log, so a republish does not repeat them.
     std::unordered_set<std::string> m_group_nodes_said;
     // Some member did not resolve, so the idle sweep has a reason to run and

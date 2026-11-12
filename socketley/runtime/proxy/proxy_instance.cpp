@@ -870,12 +870,14 @@ void proxy_instance::resolve_group_hosts(bool retry_failed)
     {
         m_group_addr.clear();
         m_group_failed.clear();
+        m_group_recheck.clear();
         m_group_unresolved = false;
         return;
     }
 
     std::unordered_map<std::string, in_addr> kept;
     std::unordered_set<std::string> named;
+    std::vector<std::string> moved;
     bool unresolved = false;
 
     for (const auto& b : m_backends)
@@ -902,8 +904,11 @@ void proxy_instance::resolve_group_hosts(bool retry_failed)
 
             // Carried over rather than looked up again, because a membership
             // change is one member joining or leaving and re-resolving the
-            // whole group would scale with the cluster.
-            if (const auto prev = m_group_addr.find(ep.host); prev != m_group_addr.end())
+            // whole group would scale with the cluster -- unless dialling it
+            // failed, when the name may have moved.
+            const auto prev = m_group_addr.find(ep.host);
+            const bool recheck = m_group_recheck.contains(ep.host);
+            if (prev != m_group_addr.end() && !recheck)
             {
                 kept.emplace(ep.host, prev->second);
                 continue;
@@ -915,17 +920,34 @@ void proxy_instance::resolve_group_hosts(bool retry_failed)
                 continue;
             }
 
+            // A member that joined -- or came back after it was dropped -- is asked about once past the resolver's
+            // cache, which may still hold the address of its last incarnation.
+            if (prev == m_group_addr.end() && !recheck && !m_group_failed.count(ep.host) &&
+                m_group_recheck.insert(ep.host).second)
+                m_resolver.forget(ep.host);
+
             std::vector<socketley::async_resolver::address> found;
             const auto st = m_resolver.lookup(ep.host, AF_INET, found);
             if (st == socketley::async_resolver::state::pending)
             {
+                // A recheck keeps dialling the old address until the new answer is in.
+                if (prev != m_group_addr.end())
+                    kept.emplace(ep.host, prev->second);
                 unresolved = true;
                 arm_resolve_poll();
                 continue;
             }
+            m_group_recheck.erase(ep.host);
             if (st == socketley::async_resolver::state::ready && !found.empty() &&
                 found.front().len == sizeof(struct sockaddr_in))
-                kept.emplace(ep.host, reinterpret_cast<const struct sockaddr_in*>(&found.front().addr)->sin_addr);
+            {
+                const in_addr at = reinterpret_cast<const struct sockaddr_in*>(&found.front().addr)->sin_addr;
+                if (prev != m_group_addr.end() && prev->second.s_addr != at.s_addr)
+                    moved.push_back(ep.host);
+                kept.emplace(ep.host, at);
+            }
+            else if (prev != m_group_addr.end())
+                kept.emplace(ep.host, prev->second);
 
             if (kept.find(ep.host) == kept.end())
             {
@@ -938,7 +960,10 @@ void proxy_instance::resolve_group_hosts(bool retry_failed)
     }
 
     m_group_addr.swap(kept);
+    for (const auto& host : moved)
+        forget_member_connections(host);
     std::erase_if(m_group_failed, [&](const std::string& h) { return !named.contains(h); });
+    std::erase_if(m_group_recheck, [&](const std::string& h) { return !named.contains(h); });
     m_group_unresolved = unresolved;
 
     // A name that did not resolve is work for the sweep, the same way an
@@ -10615,9 +10640,47 @@ void proxy_instance::note_backend_failure(proxy_client_connection* conn)
 {
     ++m_backend_failures;
     if (conn->ex.backend_from_group)
+    {
         record_group_error(conn->ex.backend_host, conn->ex.backend_port);
+        recheck_group_host(conn->ex.backend_host);
+    }
     else
         record_backend_error(conn->ex.backend_idx);
+}
+
+// What the pool and the breakers hold of a member whose name now has another address: sockets to the old one and
+// errors counted against it, both of which only delay the new one.
+void proxy_instance::forget_member_connections(const std::string& host)
+{
+    for (auto& pool : m_backend_pool)
+        pool.erase(std::remove_if(pool.begin(), pool.end(),
+                                  [&](pooled_backend& pb) {
+                                      if (pb.host != host)
+                                          return false;
+                                      discard_pooled(pb, true);
+                                      return true;
+                                  }),
+                   pool.end());
+    std::erase_if(m_group_breakers, [&](const auto& kv) {
+        const std::string_view key(kv.first);
+        return key.size() > host.size() && key.starts_with(host) && key[host.size()] == ':';
+    });
+}
+
+// A member that restarted under its name on another address -- a container given a new one -- is dialled at the old
+// address for as long as it stays in the group, since its address is carried over and the resolver keeps an answer
+// for thirty seconds; so a failure has the name looked up again, past that cache, on the next sweep.
+void proxy_instance::recheck_group_host(const std::string& host)
+{
+    in_addr literal{};
+    if (host.empty() || inet_pton(AF_INET, host.c_str(), &literal) == 1 || !m_group_addr.contains(host))
+        return;
+    if (m_group_recheck.insert(host).second)
+        m_resolver.forget(host);
+    // On the resolve poll rather than the thirty-second sweep, which stays behind it as the fallback.
+    m_group_unresolved = true;
+    arm_resolve_poll();
+    arm_idle_sweep();
 }
 
 void proxy_instance::note_backend_success(proxy_client_connection* conn)
