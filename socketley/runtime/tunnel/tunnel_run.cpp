@@ -97,7 +97,7 @@ std::string client_of(const sockaddr_storage& peer, std::string_view head)
 {
     int fields = 0;
     const std::string_view xff = http_last_forwarded_hop(http_request_field(head, "x-forwarded-for", fields));
-    return is_loopback(peer) && fields == 1 && !xff.empty() ? std::string(xff) : peer_text(peer);
+    return is_entrance_hop(peer) && fields == 1 && !xff.empty() ? std::string(xff) : peer_text(peer);
 }
 
 // `host:port` with a literal address or localhost, as --forward and --offer name their targets.

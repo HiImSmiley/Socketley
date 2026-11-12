@@ -57,6 +57,25 @@ inline bool is_loopback(std::string_view ip)
     return ip.empty() || ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.");
 }
 
+// Whether a peer is the entrance or another of this machine's own programs, whose X-Forwarded-* fields are taken:
+// 127.0.0.1 or ::1 and not all of 127/8, since a tunnel hands its TCP visitors to a service here from 127.0.0.2.
+inline bool is_entrance_hop(const sockaddr_storage& a)
+{
+    if (a.ss_family == AF_INET)
+        return ntohl(reinterpret_cast<const sockaddr_in&>(a).sin_addr.s_addr) == INADDR_LOOPBACK;
+    if (a.ss_family != AF_INET6)
+        return false;
+    const auto& v6 = reinterpret_cast<const sockaddr_in6&>(a).sin6_addr;
+    static constexpr uint8_t mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1};
+    return IN6_IS_ADDR_LOOPBACK(&v6) || std::memcmp(v6.s6_addr, mapped, 16) == 0;
+}
+
+// The same for an address as text, where none at all is a unix socket's peer.
+inline bool is_entrance_hop(std::string_view ip)
+{
+    return ip.empty() || ip == "127.0.0.1" || ip == "::1" || ip == "::ffff:127.0.0.1";
+}
+
 // Whether a URL's host[:port] names this machine, the only place plain http may carry a credential to.
 inline bool authority_is_this_machine(std::string_view authority)
 {

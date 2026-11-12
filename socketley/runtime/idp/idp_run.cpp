@@ -998,7 +998,7 @@ std::string idp_run::clear_cookie() const
 std::string idp_run::client_ip(const conn& c, const request& rq) const
 {
     // Behind the entrance, a hop on this machine, the client is the last one it names.
-    if (is_loopback(c.peer))
+    if (is_entrance_hop(c.peer))
         if (const std::string_view f = http_last_forwarded_hop(rq.forwarded_for); !f.empty())
             return std::string(f);
     return peer_text(c.peer);

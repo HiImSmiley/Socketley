@@ -278,7 +278,7 @@ proxy_auth::request_verdict proxy_auth::decide(std::string_view head, std::strin
     const std::string_view authorization = http_request_field(head, "authorization", fields);
     // Behind the entrance, a hop on this machine, the client is who it says it heard from last.
     std::string client(peer);
-    if (socketley::is_loopback(client))
+    if (socketley::is_entrance_hop(client))
     {
         int xff_fields = 0;
         const std::string_view xff = http_last_forwarded_hop(http_request_field(head, "x-forwarded-for", xff_fields));
@@ -340,7 +340,7 @@ proxy_auth::request_verdict proxy_auth::decide(std::string_view head, std::strin
     {
         // The scheme the browser used: this hop's own, or what the entrance in front of it says it was.
         std::string_view scheme = tls ? "https" : "http";
-        if (socketley::is_loopback(client) || socketley::is_loopback(peer))
+        if (socketley::is_entrance_hop(peer))
             if (const std::string_view p = http_trim_ows(http_request_field(head, "x-forwarded-proto", proto_fields));
                 proto_fields == 1 && (p == "https" || p == "http"))
                 scheme = p;

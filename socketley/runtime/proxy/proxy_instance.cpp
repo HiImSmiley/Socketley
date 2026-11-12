@@ -5132,7 +5132,7 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     const bool backend_checks_idp =
         m_entrance || conn->ex.backend_from_group ||
         (conn->ex.backend_idx < m_backends.size() && m_backends[conn->ex.backend_idx].of_this_daemon);
-    const bool forwarded_trusted = m_prefix.empty() && !m_entrance && socketley::is_loopback(conn->peer_addr);
+    const bool forwarded_trusted = m_prefix.empty() && !m_entrance && socketley::is_entrance_hop(conn->peer_addr);
     bool kept_proto = false, kept_host = false;
     std::string prior_forwarded_for;
     std::string_view client_host;

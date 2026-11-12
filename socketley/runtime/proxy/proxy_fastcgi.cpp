@@ -844,7 +844,7 @@ bool proxy_instance::fastcgi_encode(proxy_client_connection* conn, fcgi_leg& leg
         r.remote_addr = conn->peer_addr;
         // TLS this proxy ended, or that an entrance in front of it ended and said so over the loopback.
         r.https = conn->tls() != nullptr ||
-                  (socketley::is_loopback(conn->peer_addr) && iequal(field_of(h, "x-forwarded-proto"), "https"));
+                  (socketley::is_entrance_hop(conn->peer_addr) && iequal(field_of(h, "x-forwarded-proto"), "https"));
         for (const auto& [n, v] : h.fields)
             if (!hop_field(n))
                 r.headers.emplace_back(n, v);

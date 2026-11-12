@@ -24,6 +24,8 @@
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
 #   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted,
 #     with --auth idp: or without it; or keeping it from a runtime of this daemon, which signs in by it
+#   * a peer on 127.0.0.2, as a tunnel's TCP visitor is, taken for the entrance and let name the address its
+#     failed sign-ins count against
 #   * a storage refusing the sign-in for a stale or tossed interface cookie sent beside it
 #   * a return address a browser reads as another host's, by a backslash in its host
 #   * a sign-in or an account's change posted from another site's page
@@ -745,6 +747,16 @@ expect "a device allowed from a page under the cookie domain is refused before i
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Cookie: $CAROL" -H 'Origin: https://share.example.com' -d 'user_code=ABCD-EFGH&action=allow' "http://127.0.0.1:$P2/device")" 403
 expect "where the provider's own page is answered that the code is not known" \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Cookie: $CAROL" -H 'Origin: https://auth.example.com' -d 'user_code=ABCD-EFGH&action=allow' "http://127.0.0.1:$P2/device")" 400
+
+# Only the entrance, on 127.0.0.1, names the client a request came from. A tunnel hands its TCP visitors to a service
+# on this machine from 127.0.0.2, and one of them that wrote its own X-Forwarded-For had each guess counted against
+# another address, so it was never barred.
+G2() { curl -s -o /dev/null -w '%{http_code}' --interface 127.0.0.2 -X POST -H 'Origin: https://auth.example.com' \
+           -H "X-Forwarded-For: 198.51.100.$1" -d 'rd=/&username=carol&password=wrongpassword1' "http://127.0.0.1:$P2/login"; }
+for i in 1 2 3 4 5; do G2 "$i" >/dev/null; done
+expect "a peer that is not the entrance is counted by its own address, whatever X-Forwarded-For it writes" "$(G2 6)" 429
+expect "and the entrance's next client is not barred for it" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Origin: https://auth.example.com' -H 'X-Forwarded-For: 198.51.100.77' -d 'rd=/&username=carol&password=carolpassword1' "http://127.0.0.1:$P2/login")" 302
 
 # Under a cookie domain a browser sends the session cookie to every name, so a proxy with no --auth of its own hands
 # it to no application: that could replay it as the visitor. A runtime of this daemon checks it itself and is sent it.
