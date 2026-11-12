@@ -161,11 +161,12 @@ echo "node $NODE_NAME ready"
 # peers age it out over ten seconds instead of seeing it deleted.  Both rows of
 # the stale-detection table in the man page then look like the second one.
 #
-# So wait, and then keep waiting until the daemon is actually gone.
+# So wait, and then keep waiting until the daemon is actually gone -- with the
+# status taken by `||`, since under `set -e` the 143 of a wait the trap cut short
+# ended this script on the spot, which is exactly the exit described above.
 RC=0
 while :; do
-    wait "$DPID" 2>/dev/null
-    RC=$?
+    RC=0; wait "$DPID" 2>/dev/null || RC=$?
     kill -0 "$DPID" 2>/dev/null || break
     sleep 0.1
 done
