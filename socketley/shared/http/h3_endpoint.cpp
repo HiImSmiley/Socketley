@@ -63,6 +63,9 @@ constexpr uint64_t conn_window_max = 64u << 20;
 constexpr uint64_t max_streams     = 128;
 constexpr size_t   max_head        = 32 * 1024;
 constexpr size_t   max_conns       = 4096;
+// The most of them one client address holds, so that one address cannot take the table whole: sixteen at least
+// always find room.
+constexpr size_t   max_per_address = max_conns / 16;
 constexpr size_t   pull_slice      = 64 * 1024;
 constexpr size_t   rx_buf          = 64 * 1024;
 // Packets written at once and sent in one sendmsg by UDP GSO: as many of ngtcp2's largest (its default
@@ -118,6 +121,8 @@ struct conn : std::enable_shared_from_this<conn>
     // The peer as text, for a host that logs it; its address itself stays in `remote`, which the host reads
     // through peer_of() -- parsing it into a runtime's own type is that runtime's business.
     std::string    peer;
+    // The client address it is counted under, as it opened.
+    uint32_t       addr{0};
 
     ~conn()
     {
@@ -161,6 +166,8 @@ struct endpoint
     std::vector<uint8_t> txbuf = std::vector<uint8_t>(gso_burst * max_udp_payload);
     std::unordered_map<std::string, std::shared_ptr<conn>> by_cid;
     std::vector<std::shared_ptr<conn>> conns;
+    // The connections each client address holds, kept where conns is.
+    std::unordered_map<uint32_t, size_t> per_address;
     // One timeout for every connection's earliest expiry; two timespecs, so one waiting to be submitted is never
     // written over by the next.
     io_request  tm{};
@@ -606,6 +613,9 @@ void endpoint::packet(const sockaddr_storage& local, socklen_t local_len, const 
         ngtcp2_pkt_hd hd{};
         if (ngtcp2_accept(&hd, data, len) != 0 || conns.size() >= max_conns)
             return;
+        const uint32_t from = reinterpret_cast<const sockaddr_in*>(&remote)->sin_addr.s_addr;
+        if (const auto it = per_address.find(from); it != per_address.end() && it->second >= max_per_address)
+            return;
         // A client that has not proven its address is sent a Retry while many handshakes are under way; one that
         // comes back with the token is let in as the client the first Initial named.
         ngtcp2_cid odcid{};
@@ -893,6 +903,8 @@ std::shared_ptr<conn> endpoint::new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_c
         by_cid[k] = hc;
     }
     conns.push_back(hc);
+    hc->addr = reinterpret_cast<const sockaddr_in*>(&remote)->sin_addr.s_addr;
+    ++per_address[hc->addr];
     h->count(event::conn_opened);
     return hc;
 }
@@ -1284,6 +1296,10 @@ void endpoint::drop(const std::shared_ptr<conn>& hc)
     for (const std::string& k : hc->cids)
         if (auto it = by_cid.find(k); it != by_cid.end() && it->second == hc)
             by_cid.erase(it);
+    // Once, however many times the connection is dropped.
+    if (std::find(conns.begin(), conns.end(), hc) != conns.end())
+        if (const auto it = per_address.find(hc->addr); it != per_address.end() && --it->second == 0)
+            per_address.erase(it);
     std::erase(conns, hc);
 }
 

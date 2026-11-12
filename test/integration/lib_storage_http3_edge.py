@@ -10,6 +10,9 @@ usage:
                                                        then lets through; prints reset, whole, differs or closed
   lib_storage_http3_edge.py peer PORT CAFILE [CERT KEY]  one GET; prints the server certificate's serial and subject
                                                        and the status, or "refused" when the handshake fails
+  lib_storage_http3_edge.py crowd PORT CAFILE N        N connections from 127.0.0.1 held open, then one more from it
+                                                       and one from 127.0.0.2; prints how many were kept and whether
+                                                       each of the two was "served" or "refused"
 """
 import asyncio
 import hashlib
@@ -77,14 +80,18 @@ def config(ca, cert=None, key=None):
     return cfg
 
 
-async def open_client(port, cfg, via=None):
+async def open_client(port, cfg, via=None, src="127.0.0.1", wait=10):
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", 0))
+    sock.bind((src, 0))
     tr, p = await loop.create_datagram_endpoint(lambda: Client(QuicConnection(configuration=cfg)), sock=sock)
     p.connect(("127.0.0.1", via or port))
-    await asyncio.wait_for(p.wait_connected(), 10)
     p._tr = tr
+    try:
+        await asyncio.wait_for(p.wait_connected(), wait)
+    except BaseException:
+        tr.close()
+        raise
     return p
 
 
@@ -246,6 +253,31 @@ async def stalled(port, ca, path, wait):
     p._tr.close()
 
 
+async def crowd(port, ca, n):
+    held = []
+    for i in range(0, n, 16):
+        batch = await asyncio.gather(*(open_client(port, config(ca)) for _ in range(min(16, n - i))),
+                                     return_exceptions=True)
+        held += [c for c in batch if not isinstance(c, BaseException)]
+
+    async def one(src):
+        try:
+            c = await open_client(port, config(ca), src=src, wait=4)
+        except BaseException:
+            return "refused"
+        st, _ = await c.request("GET", "/")
+        c.close()
+        c._tr.close()
+        return "served" if st else "refused"
+
+    more = await one("127.0.0.1")
+    other = await one("127.0.0.2")
+    print("kept %d, then %s, other %s" % (len(held), more, other))
+    for c in held:
+        c.close()
+        c._tr.close()
+
+
 cmd = sys.argv[1]
 if cmd == "migrate":
     asyncio.run(migrate(int(sys.argv[2]), sys.argv[3], sys.argv[4]))
@@ -253,5 +285,7 @@ elif cmd == "halfopen":
     halfopen(int(sys.argv[2]), int(sys.argv[3]))
 elif cmd == "peer":
     asyncio.run(peer(int(sys.argv[2]), sys.argv[3], *sys.argv[4:6]))
+elif cmd == "crowd":
+    asyncio.run(crowd(int(sys.argv[2]), sys.argv[3], int(sys.argv[4])))
 elif cmd == "stalled":
     asyncio.run(stalled(int(sys.argv[2]), sys.argv[3], sys.argv[4], float(sys.argv[5])))

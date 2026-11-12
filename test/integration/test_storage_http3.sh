@@ -34,6 +34,7 @@ daemon_isolate stgh3
 P1=$((SL_PORT_BASE+1874))
 P2=$((SL_PORT_BASE+1875))
 P3=$((SL_PORT_BASE+1876))
+P4=$((SL_PORT_BASE+1877))
 T="$SOCKETLEY_TMPD"
 
 PASS=0; FAIL=0; TOTAL=0
@@ -143,6 +144,16 @@ for _ in $(seq 1 30); do
 done
 if [ -n "$old" ] && [ "$old" != "$want" ] && [ "$got" = "$want" ]; then ok "a renewed certificate is what QUIC shows next"
 else bad "a renewed certificate over QUIC" "before $old, after $got, want $want"; fi
+
+# ── what one address may hold ───────────────────────────────────────────────
+# One shard, so one table: 256 connections from one address are its share, the 257th from it is refused, and another
+# address is still let in.
+"$BIN" create storage stgh3c -p "$P4" --dir "$T/crowd" --anonymous --tls --cert "$T/cert.pem" --key "$T/key.pem" \
+    --shards 1 -s >/dev/null 2>&1 || bad "create" "the one-shard runtime was not created"
+for _ in $(seq 1 100); do [ "$(curl -s -m 5 --cacert "$T/cert.pem" -o /dev/null -w '%{http_code}' "https://localhost:$P4/")" = 200 ] && break; sleep 0.1; done
+expect "one address holds 256 connections, not the table: the next is refused and another address served" \
+    "$(timeout 120 python3 "$HERE/lib_storage_http3_edge.py" crowd "$P4" "$T/cert.pem" 256 2>&1 | tail -1)" \
+    "kept 256, then refused, other served"
 
 expect "the runtime still serves HTTP/1.1 and HTTP/2 after all that" \
     "$(curl -s -m 10 --cacert "$T/cert.pem" --http1.1 -o /dev/null -w '%{http_code}' "$U/hthree/s.txt") $(curl -s -m 10 --cacert "$T/cert.pem" --http2 -o /dev/null -w '%{http_code}' "$U/hthree/s.txt")" "200 200"
