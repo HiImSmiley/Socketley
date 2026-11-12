@@ -105,9 +105,9 @@ inline size_t count_lines(const char* data, size_t len)
             const v16 is_nl = b == nl;
             const v16 is_cr = b == cr;
             // Each lane's one and two bytes before, from this block and the last.
-            const v16 nl1 = __builtin_shuffle(prev_nl, is_nl, v16{15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30});
-            const v16 cr1 = __builtin_shuffle(prev_cr, is_cr, v16{15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30});
-            const v16 nl2 = __builtin_shuffle(prev_nl, is_nl, v16{14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29});
+            const v16 nl1 = __builtin_shufflevector(prev_nl, is_nl, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30);
+            const v16 cr1 = __builtin_shufflevector(prev_cr, is_cr, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30);
+            const v16 nl2 = __builtin_shufflevector(prev_nl, is_nl, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29);
             // A lane that ends a line which is not empty is -1, so subtracting counts it, 255 steps being what a
             // byte lane can count.
             acc -= is_nl & ~(nl1 | (cr1 & nl2));
