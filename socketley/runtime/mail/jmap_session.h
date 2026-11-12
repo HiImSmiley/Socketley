@@ -31,6 +31,8 @@ struct jmap_config
     bool login_in_clear{false};
     // The largest upload, and the largest message an Email/set or an import makes.
     uint64_t max_size{25ull << 20};
+    // The most recipients of one message, --max-recipients, as SMTP submission holds a client to it.
+    uint32_t max_rcpt{100};
     // The port the entrance reaches on 127.0.0.1: the webmail page at /, the idp's session cookie, and the client and
     // scheme the entrance forwards.
     bool web{false};

@@ -11,6 +11,7 @@
 #   * Email/get without the header, preview, body values or attachments a client shows
 #   * a keyword JMAP sets not a flag IMAP reads, a move changing an Email's id, a destroy leaving it
 #   * an upload not imported, an attachment part not downloaded whole
+#   * EmailSubmission/set sending one message to more recipients than --max-recipients lets SMTP send it to
 #   * Email/set create and EmailSubmission/set not sending the draft, or not filing it in Sent after
 #   * */changes on the current state not empty, on an old one not cannotCalculateChanges
 #   * an EventSource not told of new mail
@@ -238,6 +239,17 @@ r = api(["Email/set", {"accountId": acct, "create": {"f": {
             "envelope": {"mailFrom": {"email": "alice@example.test"}, "rcptTo": [{"email": "bob@remote.test"}]}}}}, "fs"])
 nc = r["fs"][0][1].get("notCreated", {}).get("s", {})
 say("EmailSubmission/set refuses a draft whose From header is another's", nc.get("type") == "forbiddenFrom", r)
+# One message goes to as many recipients as --max-recipients lets SMTP submission send it to, 100 here, and no more.
+r = api(["Email/set", {"accountId": acct, "create": {"w": {
+            "mailboxIds": {boxes["drafts"]["id"]: True}, "keywords": {"$draft": True},
+            "from": [{"email": "alice@example.test"}], "to": [{"email": "bob@remote.test"}],
+            "subject": "to the many", "textBody": [{"partId": "t", "type": "text/plain"}],
+            "bodyValues": {"t": {"value": "to all of you"}}}}}, "w"],
+        ["EmailSubmission/set", {"accountId": acct, "create": {"s": {"identityId": "i0", "emailId": "#w",
+            "envelope": {"mailFrom": {"email": "alice@example.test"},
+                         "rcptTo": [{"email": "r%d@remote.test" % i} for i in range(101)]}}}}, "ws"])
+nc = r["ws"][0][1].get("notCreated", {}).get("s", {})
+say("EmailSubmission/set refuses one message to more recipients than --max-recipients", nc.get("type") == "tooManyRecipients", r)
 # Destroy, changes
 r = api(["Email/set", {"accountId": acct, "destroy": [up and got and got[0]["id"] or "x"]}, "x"])
 say("Email/set destroy takes an Email away", len(r["x"][0][1].get("destroyed", [])) == 1, r)

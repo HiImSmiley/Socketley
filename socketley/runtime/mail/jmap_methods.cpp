@@ -2459,6 +2459,14 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
                     j->not_created += q(cid) + ":" + set_error("noRecipients");
                     return (*self)();
                 }
+                // As many as SMTP submission takes for one message, and no more (RFC 8621 7.5).
+                if (rcpts.size() > m_cfg.max_rcpt)
+                {
+                    comma(j->not_created);
+                    j->not_created += q(cid) + ":" + set_error("tooManyRecipients", "the most recipients of one message are " +
+                                                                                    std::to_string(m_cfg.max_rcpt));
+                    return (*self)();
+                }
                 // The Bcc header does not go with the message (RFC 8621 7.5).
                 std::string message;
                 for (const auto& [n, v] : split_headers(head))

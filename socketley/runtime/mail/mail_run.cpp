@@ -1260,6 +1260,7 @@ void mail_run::begin_session(conn& c)
         cfg.login_in_clear = loopback(c.peer) && !cfg.web;
         cfg.trust_forwarded = cfg.web && loopback(c.peer);
         cfg.max_size = m_owner.get_max_size();
+        cfg.max_rcpt = m_owner.get_max_recipients();
         c.jmap = std::make_unique<jmap_session>(cfg, c, *m_imap);
     }
     else if (c.kind == port_kind::imap || c.kind == port_kind::imaps)
