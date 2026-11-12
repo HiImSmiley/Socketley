@@ -79,15 +79,6 @@ concurrency:
   group: nightly
   cancel-in-progress: false
 
-env:
-  # liburing is deliberately absent from this list.  ubuntu-24.04 packages 2.5,
-  # this tree has needed >= 2.7 since 5593ee1 (2026-07-28), and every job below
-  # installed 2.5 and then failed to build — the Nightly was red from that day
-  # until 2026-08-01.  Each job runs scripts/install-liburing.sh instead, which
-  # is also what the Dockerfile, CI and the release job use.
-  APT_PACKAGES: >-
-    build-essential libssl-dev cmake netcat-openbsd bc libluajit-5.1-dev
-
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # ASan + UBSan over the whole suite.  This is the job that would have caught
@@ -97,20 +88,23 @@ jobs:
   # rather than printing and continuing.
   # ───────────────────────────────────────────────────────────────────────────
   sanitizers:
-    name: ASan + UBSan suite
+    name: ASan + UBSan suite, part ${{ matrix.shard }} of 6
     if: >-
       ${{ github.event_name != 'workflow_dispatch'
           || inputs.only == 'all'
           || inputs.only == 'sanitizers' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
-          bash scripts/install-liburing.sh
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-deps
+        with:
+          room: 'true'
+      - uses: ./.github/actions/suite-tools
 
       - name: Build (Sanitize)
         run: |
@@ -146,16 +140,17 @@ jobs:
 
       - name: Integration suite (sanitized)
         env:
+          SUITE_SHARD: ${{ matrix.shard }}/6
           SOCKETLEY_CONFIG: Sanitize
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:log_path=stderr:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: bash test/ci/assert_suite.sh suite-sanitize.log
-        timeout-minutes: 40
+        timeout-minutes: 60
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: nightly-sanitize-log
+          name: nightly-sanitize-log-${{ matrix.shard }}
           path: suite-sanitize.log
           if-no-files-found: warn
           retention-days: 30
@@ -182,31 +177,30 @@ jobs:
           || inputs.only == 'all'
           || inputs.only == 'fuzz' }}
     runs-on: ubuntu-24.04
-    # The fuzz step alone is allowed 200 minutes (see BUDGET below); the two
-    # builds ahead of it take about eight.  A job ceiling under the sum of its
-    # steps is not a safety net, it is a second timeout that fires first and
-    # reports something other than what happened.
-    timeout-minutes: 220
+    # The fuzz step alone is allowed 200 minutes (see BUDGET below), and its 30
+    # targets take 150 of them four at a time; the two builds ahead of it took
+    # 9 and 33 minutes on a runner, every target of both drivers.  A job ceiling
+    # under the sum of its steps is not a safety net, it is a second timeout
+    # that fires first and reports something other than what happened.
+    timeout-minutes: 270
     steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          # clang is required in this job: libFuzzer is the primary fuzzing
-          # path and REQUIRE_LIBFUZZER=1 below will fail without it.  It remains
-          # a testing toolchain — socketley itself is built by GCC, here and
-          # everywhere else.  No `||` fallback: a missing clang must fail here,
-          # where the error names the cause.
-          sudo apt-get install -y $APT_PACKAGES clang-18 libclang-rt-18-dev
-          clang++-18 --version
-          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
-          bash scripts/install-liburing.sh
+      - uses: actions/checkout@v7
+      # clang is required in this job: libFuzzer is the primary fuzzing path and
+      # REQUIRE_LIBFUZZER=1 below will fail without it.  It remains a testing
+      # toolchain — socketley itself is built by GCC, here and everywhere else.
+      - uses: ./.github/actions/build-deps
+        with:
+          packages: clang-18 libclang-rt-18-dev
+
+      - name: clang is there
+        # No `||` fallback: a missing clang must fail here, where the error names the cause.
+        run: clang++-18 --version
 
       # Carry-over.  The key rotates per run so each night writes a new entry;
       # restore-keys falls back to the most recent one, which is what makes the
       # corpus grow instead of resetting.
       - name: Restore fuzz corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: bin/fuzz-corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -232,20 +226,23 @@ jobs:
           find bin/fuzz-corpus -type f 2>/dev/null | wc -l | xargs echo "carried-over working corpus:"
 
       - name: Build fuzz targets (GCC, ASan+UBSan)
-        # All nine.  This list is the one run_fuzz.sh defaults to and it has to
-        # stay that way: the script runs each target twice, libFuzzer then the
-        # GCC replay driver, and a target whose replay binary is missing is a
-        # failure, not a skip.  fuzz_event_loop was added to run_fuzz.sh in
+        # Every fuzz target premake5.lua defines, which holds every one
+        # run_fuzz.sh defaults to, and it has to: the script runs each target
+        # twice, libFuzzer then the GCC replay driver, and a target whose
+        # replay binary is missing is a failure, not a skip.  fuzz_event_loop was added to run_fuzz.sh in
         # 683e981 and never added here, so every run of this job since has ended
         # with
         #     FAIL fuzz_event_loop: bin/Sanitize/fuzz_event_loop does not exist
         # and would have exited 1 on that alone.  Nobody saw it because the job
-        # has not reached the end of the target list since 2026-07-28.
+        # has not reached the end of the target list since 2026-07-28.  The same
+        # happened again to the fourteen targets added after it, so the list is
+        # now premake5.lua's, the authority run_all.sh reads it from too.
         run: |
           ./scripts/premake5 gmake2
-          cd make && make config=sanitize_x64 -j"$(nproc)" fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops
+          FUZZ_ALL=$(sed -n 's/^project "\(fuzz_[A-Za-z0-9_]*\)".*/\1/p' premake5.lua)
+          cd make && make config=sanitize_x64 -j"$(nproc)" $FUZZ_ALL
           cd ..
-          for b in fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops; do
+          for b in $FUZZ_ALL; do
             test -x "bin/Sanitize/$b" || { echo "$b was not built"; exit 1; }
           done
 
@@ -265,8 +262,10 @@ jobs:
         # reason it is nightly.
         #
         # BUDGET.  run_fuzz.sh spends the per-target budget twice — libFuzzer
-        # then the replay driver — so the worst case is 2 x targets x seconds:
-        # 2 x 9 x 600 = 180 minutes.  That is a ceiling, not a forecast.  The
+        # then the replay driver — and runs as many targets at once as cores and
+        # memory allow, four on a runner, so the worst case is
+        # 2 x targets x seconds / 4: 2 x 30 x 600 / 4 = 150 minutes (it was
+        # 2 x 9 x 600 = 180 one at a time).  That is a ceiling, not a forecast.  The
         # libFuzzer half always spends its whole -max_total_time; the replay half
         # stops at whichever of FUZZ_ITERS (20000) and FUZZ_SECONDS comes first,
         # and on the parser targets it is the iterations, by a wide margin.
@@ -758,19 +757,19 @@ jobs:
           REQUIRE_LIBFUZZER: "1"
           FUZZ_PROXY_SKIP: ""
         run: bash test/fuzz/run_fuzz.sh "${{ github.event.inputs.fuzz_seconds || 600 }}" Sanitize
-        # 180 minutes is what 2 x 9 x 600 costs; the rest is margin.  See BUDGET
+        # 150 minutes is what 2 x 30 x 600 / 4 costs; the rest is margin.  See BUDGET
         # in the step above before changing this — and change fuzz_seconds, not
         # this number, if the job has to get cheaper.
         timeout-minutes: 200
 
       - name: Save fuzz corpus
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: bin/fuzz-corpus
           key: fuzz-corpus-${{ github.run_id }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: nightly-fuzz-reproducers
@@ -798,20 +797,21 @@ jobs:
   # job; without it the job is decoration.
   # ───────────────────────────────────────────────────────────────────────────
   invariants:
-    name: Invariants (warn-only) under load
+    name: Invariants (warn-only) under load, part ${{ matrix.shard }} of 4
     if: >-
       ${{ github.event_name != 'workflow_dispatch'
           || inputs.only == 'all'
           || inputs.only == 'invariants' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
-          bash scripts/install-liburing.sh
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-deps
+      - uses: ./.github/actions/suite-tools
 
       - name: Build (Debug + invariants, warn-only)
         # The generated makefiles pass $(CPPFLAGS) through, which is how
@@ -842,15 +842,20 @@ jobs:
 
       - name: Integration suite (invariants warn-only)
         env:
+          SUITE_SHARD: ${{ matrix.shard }}/4
+          # Debug on four shared cores, as in ci.yml's suite, where the reasons are.
+          SUITE_SKIP: test_db_shard_writes_under_load.sh test_worker_gives_back_freed_heap.sh
           SOCKETLEY_CONFIG: Debug
         run: bash test/ci/assert_suite.sh suite-invariants.log
-        timeout-minutes: 15
+        timeout-minutes: 45
 
       - name: Load harnesses (invariants warn-only)
         # The lifecycle harnesses only — the three measure_* ones exist to
         # produce comparable timings and there is nothing to compare an
         # invariants build against.  These three are the ones that churn
-        # connections and runtimes, which is what the invariants watch.
+        # connections and runtimes, which is what the invariants watch.  Once,
+        # on the first part, as they are not the suite's to divide.
+        if: matrix.shard == 1
         env:
           SOCKETLEY_CONFIG: Debug
           LOAD_SETTLE_SECS: "20"
@@ -883,10 +888,10 @@ jobs:
           fi
           echo "No invariant violations."
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: nightly-invariants-logs
+          name: nightly-invariants-logs-${{ matrix.shard }}
           path: |
             suite-invariants.log
             load-invariants.log
@@ -915,12 +920,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
-          bash scripts/install-liburing.sh
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-deps
 
       - name: Build (Release)
         run: |
@@ -946,7 +947,7 @@ jobs:
           bash test/load/run_all.sh 2>&1 | tee load-release.log
         timeout-minutes: 100
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: nightly-load-log
@@ -970,20 +971,23 @@ jobs:
   # and not noise to be suppressed.
   # ───────────────────────────────────────────────────────────────────────────
   tsan:
-    name: TSan (expected quiet)
+    name: TSan (expected quiet), part ${{ matrix.shard }} of 6
     if: >-
       ${{ github.event_name != 'workflow_dispatch'
           || inputs.only == 'all'
           || inputs.only == 'tsan' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
-          bash scripts/install-liburing.sh
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-deps
+        with:
+          room: 'true'
+      - uses: ./.github/actions/suite-tools
 
       - name: Build (TSan)
         run: |
@@ -1002,15 +1006,16 @@ jobs:
 
       - name: Integration suite (TSan)
         env:
+          SUITE_SHARD: ${{ matrix.shard }}/6
           SOCKETLEY_CONFIG: TSan
           TSAN_OPTIONS: halt_on_error=0:second_deadlock_stack=1:log_path=stderr
         run: bash test/ci/assert_suite.sh suite-tsan.log
-        timeout-minutes: 30
+        timeout-minutes: 60
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: nightly-tsan-log
+          name: nightly-tsan-log-${{ matrix.shard }}
           path: suite-tsan.log
           if-no-files-found: warn
           retention-days: 30
@@ -1030,12 +1035,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
-          bash scripts/install-liburing.sh
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-deps
 
       - name: Build (Release) and fail on any warning
         # The project's build contract is zero warnings under -Wall -Wextra.
@@ -1070,7 +1071,7 @@ jobs:
           [ "$n" -gt 0 ] || { echo "no unit test binaries in bin/Release"; exit 1; }
           echo "$n unit test binaries ran."
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: nightly-release-build-log
