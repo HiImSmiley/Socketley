@@ -1,0 +1,102 @@
+# What every build in these workflows needs before premake: the compilers and
+# tools, liburing from source (the runner's 2.5 does not compile this tree),
+# and the vendored static archives of scripts/build-thirdparty.sh.
+#
+# The archives are cached, keyed on the script that pins their versions and on
+# the system and compiler that built them, since OpenSSL alone is minutes of
+# every job and the script leaves a library alone whose stamp matches its pins.
+
+name: Build dependencies
+description: tools, liburing and the vendored archives
+
+inputs:
+  packages:
+    description: apt packages a job needs beyond the build's own
+    required: false
+    default: ''
+  room:
+    description: free the disk the image's unused toolchains hold, for a sanitizer build
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Room for a sanitizer build
+      # A Sanitize build of every target outgrew 17 GB on the desktop before it
+      # finished, and a runner's root disk has little more free; three of six
+      # ASan parts lost their runner mid-build.  None of these is used here.
+      if: inputs.room == 'true'
+      shell: bash
+      run: |
+        df -h / | tail -1
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+        df -h / | tail -1
+
+    - name: What the image lacks
+      # The runner image carries the compilers, cmake, OpenSSL's headers, nc and
+      # bc already, so apt runs only for what is missing.  LuaJIT is not asked
+      # of apt at all: build-thirdparty.sh builds it from source when the system
+      # has none.
+      shell: bash
+      run: |
+        need=""
+        for c in gcc g++ make perl git; do command -v "$c" >/dev/null || need="$need build-essential git"; done
+        command -v cmake >/dev/null || need="$need cmake"
+        for p in libssl-dev netcat-openbsd bc ${{ inputs.packages }}; do
+          dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' || need="$need $p"
+        done
+        if [ -n "$need" ]; then
+          echo "installing:$need"
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y $need
+        else
+          echo "the image has everything"
+        fi
+
+    - name: User namespaces for the suite
+      # test/run_all.sh runs each file in user, network and mount namespaces of
+      # its own, as it does on a developer machine; Ubuntu's AppArmor default
+      # denies them to an unprivileged user, and the suite then falls back to
+      # sharing the host's ports through port windows.
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    - name: What the archives were compiled by
+      id: toolchain
+      shell: bash
+      run: echo "id=$(. /etc/os-release && echo "$ID$VERSION_ID")-gcc$(gcc -dumpfullversion)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the vendored archives
+      id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          thirdparty/luajit/libluajit.a
+          thirdparty/luajit/libluajit_pic.a
+          thirdparty/openssl
+          thirdparty/ngtcp2
+          thirdparty/nghttp3
+        key: thirdparty-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('scripts/build-thirdparty.sh') }}
+
+    - name: Vendored archives
+      shell: bash
+      run: bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
+
+    # Saved here rather than at the end of the job, which a red job never reaches.
+    - name: Save the vendored archives
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: |
+          thirdparty/luajit/libluajit.a
+          thirdparty/luajit/libluajit_pic.a
+          thirdparty/openssl
+          thirdparty/ngtcp2
+          thirdparty/nghttp3
+        key: thirdparty-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('scripts/build-thirdparty.sh') }}
+
+    - name: liburing
+      shell: bash
+      run: bash scripts/install-liburing.sh
