@@ -761,6 +761,9 @@ struct backend_sock
     size_t   rx_bytes{0};
     size_t   blind_horizon{0};
     uint32_t blind_pending{0};
+    // Answers this end gave while the proxy held a request for this socket that the kernel had not been handed.
+    // Each took that request's place, so the request is not owed one when it is read.  See bsock_request_coming().
+    uint32_t answered_ahead{0};
 
     std::string carry;
 
@@ -1818,6 +1821,7 @@ void bsock_close(backend_sock& b)
     b.rx_bytes = 0;
     b.blind_horizon = 0;
     b.blind_pending = 0;
+    b.answered_ahead = 0;
     b.carry.clear();
 }
 
@@ -1927,6 +1931,7 @@ int backend_accept(world& w, int idx)
     b.rx_bytes = 0;
     b.blind_horizon = 0;
     b.blind_pending = 0;
+    b.answered_ahead = 0;
     b.carry.clear();
 
     // The backend leg.  This end is the server: it presents the certificate the
@@ -2041,11 +2046,23 @@ void bsock_note_request(backend_sock& b, uint32_t id, size_t abs_off)
         return;
     }
 
+    // Answered ahead: the proxy had given this socket the request before the answer went out, and the kernel had
+    // not been handed it.  The answer took its place by position, as for the blind one above, and for the same
+    // reason it is asked before resp_pending.
+    if (b.answered_ahead > 0)
+    {
+        b.answered_ahead--;
+        return;
+    }
+
     if (b.resp_pending)
     {
         fuzzrt::set_detail("a request marked %u arrived on the backend socket at port %u "
-                           "while the previous response on it was still unfinished",
-                           id, static_cast<unsigned>(b.peer_port));
+                           "while the previous response on it was still unfinished "
+                           "(read before it %zu bytes, written %zu, last whole message ended at %zu, last id answered %u, "
+                           "%s the pool at the last step's end)",
+                           id, static_cast<unsigned>(b.peer_port), abs_off, b.tx_bytes, b.complete_at, b.last_id,
+                           b.in_pool ? "in" : "not in");
         RT_FINDING("request-on-unfinished-socket", false,
                    "a backend socket carrying the unfinished tail of one response was "
                    "handed to another request — whatever is still on the wire becomes the "
@@ -2149,6 +2166,50 @@ void bsock_recv(world& w, int idx)
     (void)w;
 }
 
+// Whether the proxy has given this socket a request this end cannot see yet: queued on the backend connection, held
+// as TLS records, or a write in the ring the kernel has not been handed.
+//
+// What the proxy promises about a backend that speaks unasked is two things.  Bytes on a socket when it is taken off
+// the shelf destroy it, which is the acquire probe.  And once a socket has been given a request, the next answer on
+// it is that request's, by position, which is all HTTP/1.1 offers a proxy: an answer that arrives after the request
+// was queued and before the ring was entered is indistinguishable from the fastest honest one, because the read and
+// the write reach the kernel in one submission.  FIONREAD at this end says the socket is quiet through that whole
+// stretch, and it is not: the socket is spoken for.
+//
+// Measured on corpus/proxy/found-answer-before-request (seed 7331, the 2026-11-12 round): an encrypted backend leg,
+// so the request goes through the record layer and a write in the ring instead of one send(); client 0's second
+// request was taken off its socket and queued for the pooled backend in one poll, this end volunteered an answer
+// before the next, the proxy paired the two, and the answer this end then gave "for" that request went to the
+// socket's next borrower.  The second answer was this harness's, not the backend's: it had been given already.
+//
+// And on corpus/proxy/found-volunteered-tail, the same round: the answer volunteered was a headers-only one, 39 bytes
+// behind the last whole message, and the request it was given for reached this end two polls later, where B read
+// it as a socket handed over mid-response.  Nothing was handed over: the proxy took the socket at a boundary.
+bool bsock_request_coming(const world& w, const backend_sock& b)
+{
+    auto* rt = w.rt.get();
+    if (!rt)
+        return false;
+    for (int i = 0; i < NCLIENTS; i++)
+    {
+        const int fd = w.cli[i].proxy_fd;
+        if (fd < 0 || fd >= proxy_instance::MAX_FDS || !rt->m_client_slots[fd])
+            continue;
+        const int bfd = rt->m_client_slots[fd]->ex.backend_fd;
+        if (bfd < 0 || bfd >= proxy_instance::MAX_FDS || rt->m_conn_idx[bfd].side != conn_backend)
+            continue;
+        struct sockaddr_in me{};
+        socklen_t melen = sizeof(me);
+        if (::getsockname(bfd, reinterpret_cast<struct sockaddr*>(&me), &melen) != 0 ||
+            ntohs(me.sin_port) != b.peer_port)
+            continue;
+        const auto* bc = rt->m_conn_idx[bfd].backend;
+        return bc->write_pending || !bc->write_queue.empty() ||
+               (bc->ssl != nullptr && tls_context::has_pending_out(bc->ssl));
+    }
+    return false;
+}
+
 void bsock_respond(world& w, int idx, int shape)
 {
     backend_sock& b = w.bs[idx];
@@ -2165,6 +2226,9 @@ void bsock_respond(world& w, int idx, int shape)
     // "the queue was empty when this answer was decided" are different facts
     // and only the second one makes an answer blind.
     const bool nothing_owed = (b.owed_n == 0);
+
+    // An answer that takes the place of a request the proxy has queued for this socket: see bsock_request_coming().
+    const bool ahead = nothing_owed && unread == 0 && bsock_request_coming(w, b);
 
     uint32_t id = 0;
     if (b.owed_n > 0)
@@ -2191,7 +2255,9 @@ void bsock_respond(world& w, int idx, int shape)
         // positional pairing is all HTTP/1.1 gives it.  An older id on such an
         // answer is a mismatch this harness invented and then reported the
         // proxy for.  It goes out unmarked.
-        if (unread == 0)
+        //
+        // Nor is it quiet with a request queued at the proxy's end, for the same reason one step earlier.
+        if (unread == 0 && !ahead)
             id = b.last_id;
     }
 
@@ -2234,6 +2300,8 @@ void bsock_respond(world& w, int idx, int shape)
     b.resp_pending = !complete || static_cast<size_t>(n) != buf.size();
     if (b.resp_pending)
         w.answer_left_unfinished = true;
+    if (ahead)
+        b.answered_ahead++;
 
     // Where the wire now runs to, and where the last boundary on it is.  A
     // boundary only counts if the write actually reached it: a short write that
