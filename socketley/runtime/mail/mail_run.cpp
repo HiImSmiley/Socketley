@@ -248,6 +248,12 @@ void mail_run::send_reports()
         auto r = system_check_resolver();
         for (auto& m : *list)
         {
+            // A DMARC record names its report addresses anywhere, so another domain's take one only by saying so.
+            if (!m.policy_domain.empty())
+            {
+                m.to = dmarc_destinations(m.policy_domain, m.to, *r);
+                continue;
+            }
             if (!m.to.empty())
                 continue;
             std::string domain;
@@ -276,7 +282,8 @@ void mail_run::send_reports()
                     rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
                     while (!uri.empty() && uri.front() == ' ')
                         uri.remove_prefix(1);
-                    if (uri.size() > 7 && socketley::ascii::iequals(uri.substr(0, 7), "mailto:"))
+                    if (uri.size() > 7 && socketley::ascii::iequals(uri.substr(0, 7), "mailto:") &&
+                        m.to.size() < max_report_destinations)
                         m.to.emplace_back(uri.substr(7));
                 }
             }

@@ -17282,13 +17282,17 @@ With
 the runtime sends the reports other domains ask for:
 .IP \(bu 2
 DMARC aggregate reports (RFC 7489), to the rua of each domain whose mail it
-checked;
+checked: to addresses of the domain's own organizational domain, and to another
+domain's only where it publishes
+.IR domain ._report._dmarc. other
+(RFC 7489 7.1);
 .IP \(bu 2
 TLS reports (RFC 8460), to the rua in the
 .B _smtp._tls
 record of each domain it sent mail to under DANE or MTA\-STS.
 .PP
-It sends them once a day, after midnight UTC, gzip'd.
+It sends them once a day, after midnight UTC, gzip'd, each to five addresses at
+the most.
 Each shard reports what it saw.
 .B \-\-dmarc\-rua
 and

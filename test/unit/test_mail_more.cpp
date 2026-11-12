@@ -4,6 +4,7 @@
 #include <ctime>
 #include <random>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "runtime/mail/mail_mime.h"
 #include "runtime/mail/imap_store.h"
 #include "runtime/mail/mail_reports.h"
+#include "runtime/mail/mail_verify.h"
 #include "runtime/mail/mail_rspamd.h"
 #include "runtime/mail/mail_srs.h"
 #include "runtime/mail/mail_text.h"
@@ -752,4 +754,29 @@ TEST_CASE("xml: elements know their namespace through prefixes and defaults, att
     std::string back;
     CHECK(socketley::xml::unescape(socketley::xml::escape("a<b>&\"c'\x01"), back));
     CHECK(back == "a<b>&\"c'");
+}
+
+TEST_CASE("reports: a DMARC report goes to another domain's address only where that domain says it takes them")
+{
+    struct table : socketley::mail::check_resolver
+    {
+        std::map<std::string, std::vector<std::string>> txts;
+        bool txt(const std::string& name, std::vector<std::string>& out, bool& nx) override
+        {
+            const auto it = txts.find(name);
+            nx = it == txts.end();
+            if (!nx)
+                out = it->second;
+            return true;
+        }
+        bool addrs(const std::string&, std::vector<std::string>&, bool& nx) override { return nx = true; }
+        bool mx(const std::string&, std::vector<std::string>&, bool& nx) override { return nx = true; }
+    } r;
+    r.txts["origin.test._report._dmarc.vendor.test"] = {"v=DMARC1"};
+    const std::vector<std::string> asked = {"dmarc@origin.test", "ops@mail.origin.test", "x@vendor.test",
+                                            "victim@else.test", "a@sub.origin.test", "b@origin.test", "c@origin.test"};
+    // Its own domain's, a domain that published the record, and none other; five at the most.
+    CHECK(socketley::mail::dmarc_destinations("Origin.test", asked, r) ==
+          std::vector<std::string>{"dmarc@origin.test", "ops@mail.origin.test", "x@vendor.test", "a@sub.origin.test",
+                                   "b@origin.test"});
 }

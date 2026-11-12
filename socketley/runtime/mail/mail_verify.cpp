@@ -688,6 +688,40 @@ std::string organizational_domain(std::string_view domain)
     return socketley::public_suffix::registrable(domain);
 }
 
+std::vector<std::string> dmarc_destinations(const std::string& policy_domain, const std::vector<std::string>& to,
+                                            check_resolver& r)
+{
+    const auto lowered = [](std::string_view v) {
+        std::string l(v);
+        socketley::ascii::lower_in_place(l);
+        return l;
+    };
+    std::vector<std::string> out;
+    const std::string policy = lowered(policy_domain);
+    const std::string own = organizational_domain(policy);
+    for (const auto& address : to)
+    {
+        if (out.size() >= max_report_destinations)
+            break;
+        const size_t at = address.rfind('@');
+        if (at == std::string::npos || at + 1 >= address.size())
+            continue;
+        const std::string dest = lowered(std::string_view(address).substr(at + 1));
+        bool ok = !own.empty() && organizational_domain(dest) == own;
+        if (!ok)
+        {
+            std::vector<std::string> txts;
+            bool nx = false;
+            if (r.txt(policy + "._report._dmarc." + dest, txts, nx))
+                for (const auto& t : txts)
+                    ok = ok || lowered(t).starts_with("v=dmarc1");
+        }
+        if (ok)
+            out.push_back(address);
+    }
+    return out;
+}
+
 std::string spf_check(const std::string& ip, const std::string& domain, const std::string& sender, check_resolver& r,
                       const std::string& helo)
 {

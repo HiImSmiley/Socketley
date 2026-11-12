@@ -201,6 +201,7 @@ std::vector<report_mail> reports::due(int64_t now_s, const std::string& organiza
         }
         if (r.to.empty())
             continue;
+        r.policy_domain = domain;
         r.subject = "Report Domain: " + domain + " Submitter: " + organization + " Report-ID: <" + id + ">";
         r.filename = organization + "!" + domain + "!" + std::to_string(begin) + "!" + std::to_string(end) + ".xml.gz";
         r.content_type = "application/gzip";

@@ -90,4 +90,12 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
 // The domain DMARC's relaxed alignment compares, its registrable domain by the Public Suffix List.
 std::string organizational_domain(std::string_view domain);
 
+// The most addresses one report goes to.
+inline constexpr size_t max_report_destinations = 5;
+// Which of a DMARC record's rua addresses for `policy_domain` a report may go to: those of its own organizational
+// domain, and another domain's only where that domain publishes <policy_domain>._report._dmarc.<it> (RFC 7489 7.1);
+// the first max_report_destinations of them.
+std::vector<std::string> dmarc_destinations(const std::string& policy_domain, const std::vector<std::string>& to,
+                                            check_resolver& r);
+
 }   // namespace socketley::mail

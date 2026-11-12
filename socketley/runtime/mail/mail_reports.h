@@ -16,6 +16,8 @@ struct report_mail
 {
     // The mailto: addresses it goes to, its subject, extra headers, and its one attachment.
     std::vector<std::string> to;
+    // A DMARC report's: the domain whose record named `to`, which decides which of them it may go to.
+    std::string policy_domain;
     std::string subject;
     std::vector<std::pair<std::string, std::string>> headers;
     std::string filename, content_type, data;
