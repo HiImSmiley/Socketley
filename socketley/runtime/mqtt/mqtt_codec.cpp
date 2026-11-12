@@ -1,5 +1,7 @@
 #include "mqtt_codec.h"
 
+#include <algorithm>
+
 namespace socketley::mqtt
 {
 
@@ -88,9 +90,14 @@ bool valid_utf8(std::string_view s)
     return true;
 }
 
+bool levels_ok(std::string_view t)
+{
+    return static_cast<size_t>(std::count(t.begin(), t.end(), '/')) < max_topic_levels;
+}
+
 bool valid_topic(std::string_view t)
 {
-    if (t.empty() || t.size() > 65535)
+    if (t.empty() || t.size() > 65535 || !levels_ok(t))
         return false;
     for (const char c : t)
         if (c == '+' || c == '#')
@@ -104,7 +111,7 @@ namespace
 // A filter without the $share/<group>/ prefix: '#' only as the whole last level, '+' only as a whole level.
 bool valid_plain_filter(std::string_view f)
 {
-    if (f.empty() || f.size() > 65535)
+    if (f.empty() || f.size() > 65535 || !levels_ok(f))
         return false;
     size_t start = 0;
     while (true)
@@ -530,6 +537,8 @@ bool read_publish(const frame& f, uint8_t level, publish_packet& out, refusal& e
         return fail(err, reason::malformed, "the PUBLISH's topic is no UTF-8 string");
     if (out.topic.find_first_of("+#") != std::string::npos)
         return fail(err, reason::topic_name_invalid, "a PUBLISH to a wildcard");
+    if (!levels_ok(out.topic))
+        return fail(err, reason::topic_name_invalid, "a PUBLISH to a topic of more levels than the broker takes");
     if (out.topic.empty() && level < level_5)
         return fail(err, reason::topic_name_invalid, "a PUBLISH without a topic");
     if (out.qos > 0)

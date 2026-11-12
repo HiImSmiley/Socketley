@@ -16327,6 +16327,9 @@ QoS 0, 1 and 2. QoS 2 is delivered exactly once, by its packet identifier.
 .IP \(bu 2
 Retained messages, cleared by an empty one.
 .IP \(bu 2
+Topics and filters of at most 256 levels. A SUBSCRIBE to a deeper filter is
+refused for it (0x8F), and a PUBLISH to a deeper topic ends the connection.
+.IP \(bu 2
 Wills. A will is sent when a connection is lost, or when a 5.0 client
 disconnects and asks for it. It is not sent when the client disconnects
 cleanly. A 5.0 will delay is waited out if one is given, and the will is not

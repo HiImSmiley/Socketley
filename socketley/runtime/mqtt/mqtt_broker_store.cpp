@@ -373,13 +373,14 @@ bool broker::restore(std::string_view in, std::string& why)
     for (uint32_t i = 0; i < n; ++i)
     {
         auto m = std::make_shared<message>();
-        if (!get_message(r, *m) || !valid_topic(m->topic))
+        if (!get_message(r, *m) || m->topic.empty())
         {
             why = "a retained message is cut off";
             return false;
         }
-        // A snapshot written before the '$' figures were left out still holds the last process's.
-        if (!m->topic.starts_with('$'))
+        // A snapshot written before the '$' figures were left out still holds the last process's, and one written
+        // before the level bound may hold a topic past it, which no client could clear or be sent.
+        if (!m->topic.starts_with('$') && valid_topic(m->topic))
             retained.push_back(std::move(m));
     }
     if (!r.u32(n) || n > cap_count)

@@ -269,7 +269,11 @@ void put_prop_pair(std::string& out, uint8_t id, std::string_view k, std::string
 
 // Well-formed UTF-8 without U+0000, which every string of the protocol must be.
 bool valid_utf8(std::string_view s);
-// A topic a PUBLISH may name: no wildcard, not empty.
+// The most levels a topic or filter has; the trees that hold them are walked a level a call.
+inline constexpr size_t max_topic_levels = 256;
+// Whether `t` has at most max_topic_levels levels.
+bool levels_ok(std::string_view t);
+// A topic a PUBLISH may name: no wildcard, not empty, not past max_topic_levels.
 bool valid_topic(std::string_view t);
 // A filter a SUBSCRIBE may name, a shared one ($share/<group>/<filter>) included.
 bool valid_filter(std::string_view f);

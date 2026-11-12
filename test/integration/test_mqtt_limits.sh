@@ -5,6 +5,7 @@
 # What each part would catch:
 #   * an unfinished WebSocket frame held up to 16 MiB however small --max-packet is, before any CONNECT
 #   * a WebSocket client that sends pings and reads no pongs read on regardless, its queue growing without end
+#   * a topic or filter of thousands of levels taken, whose walk through the topic trees ends the worker
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -110,12 +111,40 @@ def ws_ping_flood():
     truth("and once it reads its pongs it is read again, its PINGREQ answered", got)
     raw.close()
 
+def deep_topics():
+    # Another client, connected throughout: a worker that ends takes it with it.
+    bystander = Client(port)
+    check("a bystander is let in", bystander.connect("deep-bystander")[1], 0)
+    c = Client(port)
+    check("a client is let in", c.connect("deep")[1], 0)
+    check("a filter of 256 levels is taken", c.subscribe(("/" * 255, 0)), [0])
+    check("one of 257 is refused as no filter", c.subscribe(("/" * 256, 0)), [0x8F])
+    check("one of 60000 is refused as no filter", c.subscribe(("/" * 59999, 0)), [0x8F])
+    c.publish("/" * 255, b"x", qos=1)
+    truth("a topic of 256 levels is published and delivered", any(m.payload == b"x" for m in c.messages(1, 3)))
+    try:
+        c.publish("/" * 59999, b"y", qos=1, retain=True)
+    except Closed:
+        pass
+    truth("a PUBLISH to a topic of 60000 levels ends that client's connection", c.closed_within(3))
+    try:
+        served = bystander.ping()
+    except (Closed, OSError):
+        served = False
+    truth("and the bystander is still served", served)
+    if served:
+        bystander.disconnect()
+
+if phase == "deep":
+    guarded("deep topics", deep_topics)
+
 if phase == "ws":
     guarded("ws frame cap", ws_frame_cap)
     guarded("ws ping flood", ws_ping_flood)
 PY
 }
 tally < <(run ws)
+tally < <(run deep)
 
 echo "  Results: $PASS/$((PASS + FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
