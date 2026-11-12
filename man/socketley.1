@@ -10000,7 +10000,7 @@ Streamed like a put, Content\-MD5 and the checksums checked; a part sent again r
 T}
 UploadPartCopy	PUT /bucket/key?partNumber=N&uploadId=ID + x\-amz\-copy\-source	T{
 .ad l
-The whole source or x\-amz\-copy\-source\-range=bytes=first\-last, a range past the source's end being 416 InvalidRange; a source of key?versionId=ID reads that version.
+The whole source or x\-amz\-copy\-source\-range=\:bytes=first\-last, a range past the source's end being 416 InvalidRange; a source of key?versionId=ID reads that version.
 T}
 CompleteMultipartUpload	POST /bucket/key?uploadId=ID	T{
 .ad l
@@ -15998,7 +15998,9 @@ and works on dotted paths.
 .PP
 .BI POST " /c/" collection /_query
 takes a query such as
-.BR {"where":{"level":{"gte":5},"name":"x"},"sort":"\-level","limit":50,"skip":0} .
+.na
+.BR {"where":{"level":{"gte":5},\:"name":"x"},\:"sort":"\-level",\:"limit":50,\:"skip":0} .
+.ad
 The conditions are eq, ne, gt, gte, lt, lte, in, prefix and exists.
 .B "count":true
 answers the number alone. The answer is
@@ -16014,7 +16016,9 @@ refused with 400
 index the field.
 .B POST /tx
 takes
-.B {"ops":[{"op":"put","c":..,"id":..,"doc":{..}},{"op":"patch",..,"changes":{..},"if":3},{"op":"insert",..},{"op":"delete",..}]}
+.na
+.B {"ops":[{"op":"put","c":..,"id":..,"doc":{..}},\:{"op":"patch",..,"changes":{..},"if":3},\:{"op":"insert",..},\:{"op":"delete",..}]}
+.ad
 and makes every change or none.
 .B GET /me
 names who is asking.
