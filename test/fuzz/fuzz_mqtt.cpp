@@ -301,7 +301,15 @@ void broker_program(std::string_view in)
                         g += 4;
             }
         size_t counted = 0;
-        b.retained_each("#", [&](const message_ptr& m) { counted += m->topic.size() + m->payload.size(); });
+        // Every field a publisher chose counts toward the bound, its properties with them.
+        b.retained_each("#", [&](const message_ptr& m) {
+            counted += m->topic.size() + m->payload.size() + m->from_client.size();
+            for (const auto* o : {&m->content_type, &m->response_topic, &m->correlation_data})
+                if (*o)
+                    counted += (*o)->size();
+            for (const auto& [k, v] : m->user)
+                counted += k.size() + v.size();
+        });
         FUZZ_CHECK(counted == b.retained_bytes(), "the retained byte count is not what is held");
         FUZZ_CHECK(b.retained_bytes() <= cfg.retained_max_bytes, "the retained store grew past its limit");
         FUZZ_CHECK(b.session_count() <= cfg.max_sessions, "more sessions than the limit");

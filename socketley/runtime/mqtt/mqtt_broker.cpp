@@ -838,10 +838,22 @@ void broker::finish_publish(uint64_t conn, uint64_t generation, uint8_t qos, uin
 
 // ── Routing ─────────────────────────────────────────────────────────────────
 
+// What a retained message holds of the store's bound: every field a publisher chose, its properties with them.
+static size_t retained_size(const message& m)
+{
+    size_t n = m.topic.size() + m.payload.size() + m.from_client.size();
+    for (const auto* o : {&m.content_type, &m.response_topic, &m.correlation_data})
+        if (*o)
+            n += (*o)->size();
+    for (const auto& [k, v] : m.user)
+        n += k.size() + v.size();
+    return n;
+}
+
 bool broker::store_retained(const message_ptr& m, bool notify)
 {
     const auto old = m_retained.get(m->topic);
-    const size_t old_size = old ? old->topic.size() + old->payload.size() : 0;
+    const size_t old_size = old ? retained_size(*old) : 0;
     // A '$' topic holds the broker's own figures, made again each interval and so no change a snapshot keeps.
     const bool kept = !m->topic.starts_with('$');
     const auto replaced = [&] {
@@ -862,7 +874,7 @@ bool broker::store_retained(const message_ptr& m, bool notify)
         }
         return true;
     }
-    const size_t size = m->topic.size() + m->payload.size();
+    const size_t size = retained_size(*m);
     if (m_retained_bytes - old_size + size > m_cfg.retained_max_bytes)
     {
         ++m_stats.retained_refused;
@@ -1630,7 +1642,7 @@ void broker::sweep_sessions(int64_t now)
         if (const auto old = m_retained.get(topic))
         {
             m_retained.set(topic, nullptr);
-            m_retained_bytes -= old->topic.size() + old->payload.size();
+            m_retained_bytes -= retained_size(*old);
             mark();
         }
     }

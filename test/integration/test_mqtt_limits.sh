@@ -5,6 +5,7 @@
 # What each part would catch:
 #   * an unfinished WebSocket frame held up to 16 MiB however small --max-packet is, before any CONNECT
 #   * a WebSocket client that sends pings and reads no pongs read on regardless, its queue growing without end
+#   * retained messages whose properties --retained-max does not count, so the store grows past it without end
 #   * a topic or filter of thousands of levels taken, whose walk through the topic trees ends the worker
 set -uo pipefail
 
@@ -28,7 +29,7 @@ PW=$((SL_PORT_BASE + 1729))
 trap 'daemon_stop' EXIT
 daemon_start "$BIN"
 
-"$BIN" create mqtt lm -p "$P" --anonymous --ws "$PW" --max-packet 64K --write-buffer 1M -s >/dev/null 2>&1 \
+"$BIN" create mqtt lm -p "$P" --anonymous --ws "$PW" --max-packet 64K --write-buffer 1M --retained-max 256K -s >/dev/null 2>&1 \
     && ok || bad "an anonymous broker with WebSocket is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for p in "$P" "$PW"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -5 "$SOCKETLEY_DLOG")"; done
 
@@ -135,6 +136,23 @@ def deep_topics():
     if served:
         bystander.disconnect()
 
+def retained_props():
+    c = Client(port)
+    check("a client is let in to retain", c.connect("props")[1], 0)
+    # Each a one-byte payload with 60000 bytes of user property: the bound of 256K holds four, not a fifth.
+    codes = [c.publish("keep/%d" % i, b"x", qos=1, retain=True, props={0x26: [("k", "v" * 60000)]}) for i in range(6)]
+    check("retained messages are held to --retained-max with their properties counted",
+          [x < 0x80 for x in codes], [True] * 4 + [False] * 2)
+    check("and the refusal is the quota's", codes[5], 0x97)
+    for i in range(6):
+        c.publish("keep/%d" % i, b"", qos=1, retain=True)
+    check("once cleared, the room is there again",
+          c.publish("keep/again", b"x", qos=1, retain=True, props={0x26: [("k", "v" * 60000)]}) < 0x80, True)
+    c.disconnect()
+
+if phase == "props":
+    guarded("retained properties", retained_props)
+
 if phase == "deep":
     guarded("deep topics", deep_topics)
 
@@ -145,6 +163,7 @@ PY
 }
 tally < <(run ws)
 tally < <(run deep)
+tally < <(run props)
 
 echo "  Results: $PASS/$((PASS + FAIL)) passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

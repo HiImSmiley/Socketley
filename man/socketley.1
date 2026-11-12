@@ -16771,8 +16771,9 @@ The most messages kept for one session while its client is away or slow.
 Default: 1000. Past it, the oldest are dropped and counted.
 .TP
 .BI "\-\-retained\-max " size
-The most bytes that retained messages may take. Default: 64M. A new retained
-message past it is not kept, and is counted.
+The most bytes that retained messages may take, their topics, payloads and
+properties together. Default: 64M. A new retained message past it is not kept,
+and is counted.
 .TP
 .BI "\-\-max\-sessions " n
 The most sessions, connected or not. Default: 100000. A new client past the
