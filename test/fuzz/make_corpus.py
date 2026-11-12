@@ -2415,6 +2415,8 @@ KEPT_BUDGET = {
     "raftmsg": 8,      # 0 kept
     "s3sigv4": 8,      # 0 kept
     "bucketpolicy": 8, # 0 kept
+    "mail": 24,        # 18 kept: a seed each for the cases the generator writes none for (ARC, SRS, MTA-STS, mbox,
+                       # POP3, ManageSieve, the DAV and JMAP readers, sorting), made by hand beside their cases
 }
 
 
