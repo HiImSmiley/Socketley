@@ -67,8 +67,9 @@ fi
 echo "libfuzzer build: using $($CLANG --version | head -1)"
 mkdir -p "$OUT"
 
+# The dialect premake5.lua builds every project with, C++latest, which GCC and clang both read as c++23.
 FLAGS=(
-    -std=c++20 -g -O1
+    -std=c++23 -g -O1
     -fsanitize=fuzzer,address,undefined
     -fno-sanitize-recover=all
     -fno-omit-frame-pointer
@@ -162,11 +163,12 @@ want fuzz_cache_ops && build fuzz_cache_ops \
 want fuzz_http_response && build fuzz_http_response "$ROOT/test/fuzz/fuzz_http_response.cpp"
 want fuzz_proxy_tunnel && build fuzz_proxy_tunnel "$ROOT/test/fuzz/fuzz_proxy_tunnel.cpp"
 
-# fuzz_event_loop is two translation units and one system library, and it never
-# opens a ring, so -luring is a link-time dependency only and the binary runs
-# anywhere.
+# fuzz_event_loop is premake's three translation units and one system library,
+# and it never opens a ring, so -luring is a link-time dependency only and the
+# binary runs anywhere.
 want fuzz_event_loop && build fuzz_event_loop \
-    "$ROOT/test/fuzz/fuzz_event_loop.cpp" "$ROOT/socketley/shared/loop/event_loop.cpp" -luring
+    "$ROOT/test/fuzz/fuzz_event_loop.cpp" "$ROOT/socketley/shared/loop/event_loop.cpp" \
+    "$ROOT/socketley/shared/net/orderly_close.cpp" -luring
 
 # ─── the targets that link the runtime ──────────────────────────────────────
 # The five runtime-linking targets cannot use premake's GCC archive, because
@@ -252,10 +254,7 @@ else
         if [ "$sdk_fail" -ne 0 ]; then
             rc=2
         else
-            # -std=c++23 comes after FLAGS' -std=c++20 and therefore wins: the
-            # runtime headers these targets pull in need it, the header-only
-            # ones do not.
-            RT_LINK=(-std=c++23 "${SDK_INC[@]}" "${SDK_DEF[@]}"
+            RT_LINK=("${SDK_INC[@]}" "${SDK_DEF[@]}"
                      -L"$ROOT/thirdparty/luajit" -lluajit -luring -lssl -lcrypto -ldl -lpthread)
 
             want fuzz_http_request && build fuzz_http_request \
