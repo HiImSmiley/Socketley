@@ -16197,6 +16197,14 @@ Service keys for backends, one per line:
 The secret must be at least 16 characters. The file is read again when it
 changes. A key may set a document's
 .BR _owner .
+Ten wrong keys from one address within fifteen minutes bar that address until
+the fifteen minutes are over; during that time a request with a key from it is
+answered
+.B 429
+with
+.BR Retry\-After ,
+the right key included. Behind the entrance the address is the client's;
+127.0.0.1 itself is not counted, and each shard counts for itself.
 .TP
 .BI "\-\-idp " runtime
 The idp runtime whose accounts own documents.
@@ -18453,6 +18461,14 @@ A request carries a key as
 .IR secret ,
 or as Basic auth with the name and the secret, which is what Grafana's data
 source sends.
+Ten wrong keys from one address within fifteen minutes bar that address until
+the fifteen minutes are over; during that time a request with a key from it is
+answered
+.B 429
+with
+.BR Retry\-After ,
+the right key included. Behind the entrance the address is the client's;
+127.0.0.1 itself is not counted, and each shard counts for itself.
 .TP
 .BI \-\-idp " idp"
 Admits the sign\-ins of that idp runtime: a browser's session cookie, or an
@@ -18896,6 +18912,14 @@ with
 .BR "WWW\-Authenticate: Bearer" .
 The runtime reads the file again when it changes.
 If the new file does not read, the runtime keeps the keys it had and logs why.
+Ten wrong keys from one address within fifteen minutes bar that address until
+the fifteen minutes are over; during that time a request with a key from it is
+answered
+.B 429
+with
+.BR Retry\-After ,
+the right key included. Behind the entrance the address is the client's;
+127.0.0.1 itself is not counted, and each shard counts for itself.
 .TP
 .B \-\-anonymous
 Lets anyone call the runtime without a key.

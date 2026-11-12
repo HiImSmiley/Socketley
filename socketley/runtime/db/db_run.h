@@ -23,6 +23,7 @@
 
 #include "db_schema.h"
 #include "../../shared/http/conn_server.h"
+#include "../../shared/http/key_bar.h"
 #include "db_shard.h"
 #include "db_store.h"
 #include "../idp/idp_session.h"
@@ -120,6 +121,7 @@ private:
         std::string last_event_id;
         std::string origin;
         std::string host;
+        std::string forwarded_for;
     };
 
     // What waits for the disk: a connection's answer, or a channel call's.
@@ -216,6 +218,7 @@ private:
     store m_store;
     socketley::idp::session_verifier m_idp;
     std::vector<service_key> m_keys;
+    socketley::http::key_bar m_wrong_keys;
     std::vector<std::string> m_origins;
     std::optional<socketley::file_stamp> m_schema_stamp;
     std::optional<socketley::file_stamp> m_keys_stamp;

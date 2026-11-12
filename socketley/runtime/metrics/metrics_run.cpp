@@ -523,6 +523,8 @@ int metrics_run::take_request(socketley::http::server_conn& c, request& rq, int&
         }
         else if (header_name_equals(f, "content-type", 12))
             rq.content_type.assign(value);
+        else if (header_name_equals(f, "x-forwarded-for", 15))
+            rq.forwarded_for.assign(value);
     });
     if (r <= 0)
         return r;
@@ -535,7 +537,8 @@ int metrics_run::take_request(socketley::http::server_conn& c, request& rq, int&
     return 1;
 }
 
-void metrics_run::respond(socketley::http::server_conn& c, int status, std::string_view type, std::string_view body)
+void metrics_run::respond(socketley::http::server_conn& c, int status, std::string_view type, std::string_view body,
+                          std::string_view extra)
 {
     char num[24];
     std::string& o = c.out;
@@ -550,6 +553,7 @@ void metrics_run::respond(socketley::http::server_conn& c, int status, std::stri
     o += "\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
     if (status == 401)
         o += "WWW-Authenticate: Basic realm=\"metrics\"\r\n";
+    o += extra;
     if (!c.keep_alive)
         o += "Connection: close\r\n";
     o += "\r\n";
@@ -620,8 +624,21 @@ void metrics_run::handle(const std::shared_ptr<socketley::http::server_conn>& c,
         return;
     }
     bool admin = false;
+    // A wrong key is a guess at one of --keys, so it is counted where there is a key to guess; a cookie is no key.
+    const std::string from = !m_keys.configured() || rq.authorization.empty()
+                                 ? std::string()
+                                 : socketley::http::key_bar::client(c->peer, rq.forwarded_for);
+    if (const int64_t left = m_wrong_keys.barred_for(from))
+    {
+        ++m_c.unauthorized;
+        respond(*c, 429, "application/json",
+                R"({"status":"error","errorType":"unavailable","error":"too many wrong keys from this address"})",
+                "Retry-After: " + std::to_string(left) + "\r\n");
+        return;
+    }
     if (!admitted(rq, admin))
     {
+        m_wrong_keys.missed(from);
         ++m_c.unauthorized;
         respond(*c, 401, "application/json",
                 R"({"status":"error","errorType":"unauthorized","error":"a key of --keys, or a sign-in of --idp, is needed"})");

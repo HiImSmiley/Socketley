@@ -1254,6 +1254,8 @@ int db_run::take_request(conn& c, request& rq, int& refusal)
             rq.origin.assign(value);
         else if (header_name_equals(f, "host", 4))
             rq.host.assign(value);
+        else if (header_name_equals(f, "x-forwarded-for", 15))
+            rq.forwarded_for.assign(value);
     });
     if (r <= 0)
         return r;
@@ -1383,8 +1385,19 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
     principal who;
     bool by_cookie = false;
     std::string why;
+    // A wrong key is a guess at one of --keys, so it is counted where there is a key to guess; a cookie is no key.
+    const std::string from = m_keys.empty() || rq.authorization.empty()
+                                 ? std::string()
+                                 : socketley::http::key_bar::client(c->peer, rq.forwarded_for);
+    if (const int64_t left = m_wrong_keys.barred_for(from))
+    {
+        respond(c, 429, error_body("slow_down", "too many wrong keys from this address"),
+                allow + "Retry-After: " + std::to_string(left) + "\r\n");
+        return;
+    }
     if (!who_of(rq, who, by_cookie, why))
     {
+        m_wrong_keys.missed(from);
         respond(c, 401, error_body("bad_credentials", why), allow + "WWW-Authenticate: Bearer\r\n");
         return;
     }

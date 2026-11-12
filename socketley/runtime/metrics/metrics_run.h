@@ -25,6 +25,7 @@
 #include "../db/db_schema.h"
 #include "../idp/idp_session.h"
 #include "../../shared/http/conn_server.h"
+#include "../../shared/http/key_bar.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/loop/file_io.h"
@@ -88,6 +89,7 @@ private:
         std::string authorization;
         std::string cookie;
         std::string content_type;
+        std::string forwarded_for;
     };
 
     std::shared_ptr<socketley::http::server_conn> make_conn() override;
@@ -95,7 +97,8 @@ private:
 
     int take_request(socketley::http::server_conn& c, request& rq, int& refusal);
     void handle(const std::shared_ptr<socketley::http::server_conn>& c, request& rq);
-    void respond(socketley::http::server_conn& c, int status, std::string_view type, std::string_view body);
+    void respond(socketley::http::server_conn& c, int status, std::string_view type, std::string_view body,
+                 std::string_view extra = {});
     // Whether the request may read the store: a key's secret by Bearer or Basic, or a sign-in of the idp, which reads
     // the log only as an admin (`admin`), as at the dashboard.
     bool admitted(const request& rq, bool& admin);
@@ -166,6 +169,7 @@ private:
     socketley::idp::session_verifier m_idp;
     socketley::watched<std::vector<socketley::db::service_key>> m_keys;
     int64_t m_keys_checked{0};
+    socketley::http::key_bar m_wrong_keys;
 
     int64_t m_every_ms{10'000};
     int64_t m_local_next{0};

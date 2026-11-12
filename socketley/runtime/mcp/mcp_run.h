@@ -11,6 +11,7 @@
 
 #include "mcp_protocol.h"
 #include "../../shared/http/conn_server.h"
+#include "../../shared/http/key_bar.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../idp/idp_session.h"
@@ -75,6 +76,7 @@ private:
     std::vector<prompt_def> m_prompts;
     size_t m_declared_seen{SIZE_MAX};
     std::unordered_map<std::string, key> m_keys;
+    socketley::http::key_bar m_wrong_keys;
     // The address its tokens name, and what verifies the idp's sign-ins against it.
     std::string m_resource;
     socketley::idp::session_verifier m_idp;

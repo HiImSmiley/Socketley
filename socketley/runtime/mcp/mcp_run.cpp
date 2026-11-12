@@ -11,6 +11,7 @@
 
 #include "mcp_instance.h"
 #include "../../shared/http/http_framing.h"
+#include "../../shared/crypto/mac.h"
 #include "../../shared/http/status.h"
 #include "../../shared/http/request_head.h"
 #include "../../shared/json/json_escape.h"
@@ -341,9 +342,14 @@ bool mcp_run::authenticate(std::string_view a, caller& who)
             LOG_WARN(("mcp " + std::string(m_owner.get_name()) + ": " + why + "; the keys read before stay").c_str());
             m_keys_error = why;
         }
-        if (const auto it = m_keys.find(std::string(token)); it != m_keys.end())
+        // Every key is compared, each in constant time, so how long a wrong one takes says nothing about the right.
+        const key* held = nullptr;
+        for (const auto& [secret, k] : m_keys)
+            if (socketley::crypto::secure_equal(secret, token))
+                held = &k;
+        if (held)
         {
-            who = caller{it->second.name, it->second.admin, {}};
+            who = caller{held->name, held->admin, {}};
             return true;
         }
     }
@@ -395,7 +401,7 @@ void mcp_run::serve(const std::shared_ptr<socketley::http::server_conn>& c)
         socketley::http::request_view v;
         int refusal = 400;
         headers h;
-        std::string authorization, origin;
+        std::string authorization, origin, forwarded_for;
         const int r = socketley::http::take_request(c->in, max_head, max_body, v, refusal,
                                                     [&](std::string_view f, std::string_view value) {
             if (header_name_equals(f, "mcp-protocol-version", 20))
@@ -408,6 +414,8 @@ void mcp_run::serve(const std::shared_ptr<socketley::http::server_conn>& c)
                 authorization.assign(value);
             else if (header_name_equals(f, "origin", 6))
                 origin.assign(value);
+            else if (header_name_equals(f, "x-forwarded-for", 15))
+                forwarded_for.assign(value);
         });
         if (r == 0)
             break;
@@ -470,8 +478,19 @@ void mcp_run::serve(const std::shared_ptr<socketley::http::server_conn>& c)
             continue;
         }
         caller who;
+        // A wrong key is a guess at one of --keys, so it is counted where there is a key to guess.
+        const std::string from = m_owner.get_keys_path().empty() || authorization.empty()
+                                     ? std::string()
+                                     : socketley::http::key_bar::client(c->peer, forwarded_for);
+        if (const int64_t left = m_wrong_keys.barred_for(from))
+        {
+            answer(c, 429, R"({"error":"too many wrong keys from this address"})",
+                   cors + "Retry-After: " + std::to_string(left) + "\r\n");
+            continue;
+        }
         if ((!m_owner.get_keys_path().empty() || m_idp.enabled()) && !authenticate(authorization, who))
         {
+            m_wrong_keys.missed(from);
             // A client that can sign in is told where, and which scopes to ask for (RFC 9728 5.1).
             const std::string challenge =
                 m_idp.enabled()
