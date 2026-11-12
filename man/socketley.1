@@ -10737,6 +10737,12 @@ line, or else the
 line, names the user the session signs as;
 .B =
 means the same name. An empty password is refused before anything is sent.
+Ten refused passwords from one address within 15 minutes bar it until those 15
+minutes end, answered
+.BR "429 Throttling" ;
+the address counted is the one a \fB\-\-tls\-offloaded\fR proxy forwards, or for a
+request from exactly 127.0.0.1, ::1 or a unix socket (the entrance) the last
+X\-Forwarded\-For hop; this machine's own requests are not counted.
 .PP
 Both kinds of session belong to the mapped user. They are signed under that
 user's first key and have the user's rights, narrowed by a

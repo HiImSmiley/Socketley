@@ -24,6 +24,7 @@
 #include <sys/types.h>
 
 #include "../../shared/net/read_buffer.h"
+#include "../../shared/net/failure_bar.h"
 #include "sync_runners.h"
 #include "body_reader.h"
 #include "exif.h"
@@ -1466,6 +1467,8 @@ private:
     // The thread an LDAP bind waits on, apart from the digests', since a bind may take seconds.
     hash_pool         m_ldap_pool{1};
     bool              m_ldap_attached{false};
+    // Passwords the directory refused, by client address, on the bar every other sign-in keeps.
+    socketley::failure_bar m_ldap_misses{10, std::chrono::minutes(15)};
     // The name the cluster file gives this node, empty for a runtime that is no node of one, and the id of its data.
     std::string       m_cluster_self;
     std::string       m_cluster_id;

@@ -67,9 +67,9 @@ def token(key=rsa_key, alg="RS256", kid="r1", **over):
     return jwt.encode(claims, key, algorithm=alg, headers={"kid": kid})
 
 
-def form(fields):
+def form(fields, headers=None):
     req = urllib.request.Request(URL + "/", data=urllib.parse.urlencode(fields).encode(), method="POST",
-                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+                                 headers={"Content-Type": "application/x-www-form-urlencoded", **(headers or {})})
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, r.read().decode()
@@ -232,5 +232,15 @@ check("a name with a DN's separator in it is escaped, not obeyed",
       "uid=eve\\,ou\\=Admins,ou=People,dc=test" in seen and st == 403, (seen[-1:], st, body))
 st, body = ldap("alice", "")
 check("an empty password is refused before the directory is asked", st == 400, (st, body))
+# Refused passwords are counted per address: ten from one bar it, the right one included, and others are not barred.
+away = {"X-Forwarded-For": "203.0.113.9"}
+codes = [form({"Action": "AssumeRoleWithLDAPIdentity", "Version": "2011-06-15", "LDAPUsername": "alice",
+               "LDAPPassword": "guess%d" % i}, away)[0] for i in range(10)]
+st, body = form({"Action": "AssumeRoleWithLDAPIdentity", "Version": "2011-06-15", "LDAPUsername": "alice",
+                 "LDAPPassword": "secret"}, away)
+check("ten refused passwords from one address bar it, the right one too", codes == [403] * 10 and st == 429,
+      (codes, st, body))
+st, body = ldap("alice", "secret")
+check("and another address still signs in", st == 200, (st, body))
 print("  federation: PASS=%d FAIL=%d" % (passed, failed))
 sys.exit(failed)

@@ -1,7 +1,12 @@
 // STS over the S3 endpoint: GetSessionToken and AssumeRole, which give a user temporary credentials that sign for it,
 // and AssumeRoleWithWebIdentity and AssumeRoleWithLDAPIdentity, which give them to an identity an outside provider
 // vouches for.
+#include <cstring>
+
+#include <sys/socket.h>
+
 #include "storage_run.h"
+#include "../../shared/http/key_bar.h"
 
 #include <algorithm>
 #include <chrono>
@@ -292,6 +297,25 @@ void storage_run::op_sts_federated(const std::shared_ptr<conn>& c,
         sts_fail(c, 400, "ValidationError", "AssumeRoleWithLDAPIdentity needs an LDAPUsername and an LDAPPassword.");
         return;
     }
+    // The address a refusal is counted under, as key_bar counts wrong keys: the client a --tls-offloaded proxy
+    // names, or behind the entrance on this machine the hop it wrote last; this machine itself is never counted.
+    const client_ip& ip = client_address(*c);
+    std::string who;
+    if (c->ip_forwarded)
+        who.assign(reinterpret_cast<const char*>(ip.addr), ip.family == 4 ? 4 : 8);
+    else
+    {
+        sockaddr_storage peer{};
+        socklen_t len = sizeof peer;
+        if (::getpeername(c->sock(), reinterpret_cast<sockaddr*>(&peer), &len) == 0)
+            who = http::key_bar::client(peer, c->req.header("x-forwarded-for"));
+    }
+    if (const int64_t wait = who.empty() ? 0 : m_ldap_misses.barred_for(who, failure_bar::clock::now()); wait > 0)
+    {
+        sts_fail(c, 429, "Throttling", "Too many refused passwords from this address; try again in " +
+                                           std::to_string(wait) + " seconds.");
+        return;
+    }
     if (!m_ldap_attached)
         m_ldap_attached = m_ldap_pool.attach(m_io);
     if (!m_ldap_attached || !m_ldap_pool.enabled())
@@ -313,7 +337,7 @@ void storage_run::op_sts_federated(const std::shared_ptr<conn>& c,
     b->password = *password;
     std::weak_ptr<conn> weak = c;
     m_ldap_pool.submit(0, [b] { b->ok = ldap_simple_bind(b->cfg, b->user, b->password, b->res, b->why); },
-        [this, b, weak, action = std::string(action), duration, policy, known]
+        [this, b, weak, action = std::string(action), duration, policy, known, who]
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -325,6 +349,8 @@ void storage_run::op_sts_federated(const std::shared_ptr<conn>& c,
         }
         if (!b->res.bound())
         {
+            if (!who.empty())
+                m_ldap_misses.missed(who, failure_bar::clock::now());
             sts_fail(cc, 403, "AccessDenied", "The directory refused the credentials.");
             return;
         }
