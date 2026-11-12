@@ -1,73 +1,217 @@
+# A release is one .deb pair per architecture, socketley_<ver>_<arch>.deb and
+# socketley-dev_<ver>_<arch>.deb, and install.sh and `socketley update` take
+# the first socketley_*_<arch>.deb of it.
+#
+# Only glibc is linked dynamically -- libstdc++, libgcc, liburing, LuaJIT and
+# OpenSSL are all static -- so a package built against the oldest glibc served
+# runs on every newer distribution.  That is Ubuntu 22.04's 2.35, so the build
+# runs in an ubuntu:22.04 container, and the packages it makes are then tested
+# on the runner's own Ubuntu 24.04: the suite against the very binaries that
+# were packaged, and the package installed and started by its own postinst.
+#
+# A tag publishes.  A dispatch builds and tests both architectures and keeps
+# the packages as an artifact, which is how this file is run before a tag.
+
 name: Release
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 jobs:
-  release:
+  build:
+    name: Packages, ${{ matrix.arch }}, built on Ubuntu 22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, config: release_x64,   runner: ubuntu-24.04 }
+          - { arch: arm64, config: release_arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    timeout-minutes: 60
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Toolchain
+        # git before the checkout, so it is a clone and not a tarball.  22.04's
+        # own g++ is 11 and the build needs 12 for C++23.
+        run: |
+          echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries
+          apt-get update
+          apt-get install -y build-essential g++-12 gcc-12 git ca-certificates cmake perl \
+            libssl-dev libluajit-5.1-dev python3 dpkg-dev uuid-dev pkg-config file
+          update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100 --slave /usr/bin/gcc gcc /usr/bin/gcc-12
+          g++ --version | head -1
+          ldd --version | head -1
+
+      - uses: actions/checkout@v7
+
+      - name: liburing, the vendored archives and premake
+        # All into thirdparty/, which the SDK's socketley-config links from, so the
+        # tree handed to the test job below is whole.  scripts/premake5 is an
+        # x86-64 binary; on ARM the script builds premake from source.
+        run: |
+          bash scripts/build-thirdparty.sh liburing
+          bash scripts/build-thirdparty.sh luajit
+          bash scripts/build-thirdparty.sh http3
+          bash scripts/build-thirdparty.sh premake
+          if ./scripts/premake5 --version >/dev/null 2>&1; then
+            ./scripts/premake5 gmake2
+          else
+            thirdparty/premake/premake5 gmake2
+          fi
+
+      - name: Packages
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            HEADER=$(sed -n 's/^#define SOCKETLEY_VERSION "\(.*\)"/\1/p' socketley/shared/util/version.h)
+            [ "$VERSION" = "$HEADER" ] || { echo "tag $GITHUB_REF_NAME, but version.h says $HEADER"; exit 1; }
+          else
+            VERSION=$(sed -n 's/^#define SOCKETLEY_VERSION "\(.*\)"/\1/p' socketley/shared/util/version.h)
+          fi
+          bash packaging/build-deb.sh "$VERSION"
+          mkdir -p dist
+          mv "socketley_${VERSION}_${{ matrix.arch }}.deb" "socketley-dev_${VERSION}_${{ matrix.arch }}.deb" dist/
+
+      - name: Nothing but glibc 2.35 is loaded
+        # What the release policy rests on, read off the packaged files rather than assumed.
+        run: |
+          set -e
+          mkdir -p /tmp/pkg
+          for d in dist/*.deb; do dpkg-deb -x "$d" /tmp/pkg; done
+          bad=0
+          for f in /tmp/pkg/usr/bin/socketley /tmp/pkg/usr/lib/socketley/socketley-bash.so /tmp/pkg/usr/lib/libsocketley.so; do
+            needed=$(objdump -p "$f" | awk '$1 == "NEEDED" { print $2 }' | tr '\n' ' ')
+            newest=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+            echo "$(basename "$f"): needs $needed; newest symbol $newest"
+            for lib in $needed; do
+              case "$lib" in libc.so.6|libm.so.6|ld-linux-*.so.*) ;; *) echo "  $lib is not glibc"; bad=1 ;; esac
+            done
+            [ "$(printf '%s\n' "$newest" GLIBC_2.35 | sort -V | tail -1)" = GLIBC_2.35 ] || { echo "  needs a glibc newer than 2.35"; bad=1; }
+          done
+          for d in dist/*.deb; do echo "$(basename "$d"): Depends: $(dpkg-deb -f "$d" Depends)"; done
+          exit $bad
+
+      - name: Everything the suite runs
+        # After build-deb.sh, which cleans and builds only the three packaged
+        # targets, so the suite tests binaries from this same compile.
+        run: make -C make config=${{ matrix.config }} -j"$(nproc)"
+
+      - name: Keep the packages and the build
+        # A tarball, since an artifact does not keep the executable bit, and with
+        # thirdparty/, whose archives the suite's SDK files link.
+        run: tar -cf build.tar bin/Release thirdparty
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.arch }}
+          path: build.tar
+          if-no-files-found: error
+          retention-days: 3
+
+  # The suite in four parts per architecture, as in ci.yml: 673 files are about
+  # 140 minutes one after another, and a runner has four cores.
+  test:
+    name: Packages, ${{ matrix.arch }}, tested on Ubuntu 24.04, part ${{ matrix.shard }} of 4
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        shard: [1, 2, 3, 4]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: What the suite needs
+        # The image has the compilers, nc and bc; apt only for what it lacks.  And
+        # the user namespaces run_all.sh gives each file, which Ubuntu's AppArmor
+        # default denies an unprivileged user -- see .github/actions/build-deps.
+        run: |
+          need=""
+          for p in g++ make netcat-openbsd bc; do
+            dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' || need="$need $p"
+          done
+          if [ -n "$need" ]; then sudo apt-get update && sudo apt-get install -y $need; fi
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - uses: ./.github/actions/suite-tools
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-${{ matrix.arch }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist
+
+      - name: Unpack the build
+        run: tar -xf build.tar && rm build.tar && ls bin/Release | wc -l
+
+      - name: Unit tests, fuzz corpora and integration suite
+        # Through assert_suite.sh, since run_all.sh exits 0 when it ran
+        # nothing at all and a release must not ship on that.
+        env:
+          SOCKETLEY_CONFIG: Release
+          SUITE_SHARD: ${{ matrix.shard }}/4
+        run: bash test/ci/assert_suite.sh suite-release.log
+        timeout-minutes: 60
+
+      - name: The package installs, starts and goes
+        # Once per architecture, on the first part.
+        if: matrix.shard == 1
+        run: |
+          set -e
+          # dpkg rather than apt: the packages depend on libc6 alone, which is here.
+          sudo dpkg -i dist/socketley_*_${{ matrix.arch }}.deb dist/socketley-dev_*_${{ matrix.arch }}.deb
+          socketley version
+          systemctl is-active socketley.service
+          pkg-config --modversion socketley
+          sudo dpkg --purge socketley socketley-dev
+          ! systemctl is-active socketley.service
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: suite-release-${{ matrix.arch }}-${{ matrix.shard }}
+          path: suite-release.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Publish
+    needs: test
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          # Not liburing-dev: ubuntu-24.04 has 2.5 and this tree needs >= 2.7.
-          # A tagged release built against 2.5 does not exist — the build stops
-          # at event_loop.cpp — so every tag pushed since 2026-07-28 failed here.
-          sudo apt-get install -y build-essential libssl-dev cmake \
-            netcat-openbsd bc libluajit-5.1-dev
-
-      - name: Vendored static archives
-        run: bash scripts/build-thirdparty.sh luajit && bash scripts/build-thirdparty.sh http3
-
-      - name: Install liburing
-        run: bash scripts/install-liburing.sh
-
-      - name: Build release binary
-        run: |
-          ./scripts/premake5 gmake2
-          cd make && make config=release_x64 -j$(nproc)
-
-      - name: Run tests
-        run: |
-          ./bin/Release/test_command_hashing
-          ./bin/Release/test_cache_store
-          ./bin/Release/test_resp_parser
-          ./bin/Release/test_name_resolver
-          ./bin/Release/test_ws_parser
-          bash test/ci/assert_suite.sh suite-release.log
-        # 5 was right when it was written: the release job passed for v1.0.6
-        # through v1.0.9 in about 3m50s each.  The suite has grown since -- its
-        # own header says 141 sections and there are 162 now, ~32 minutes on a
-        # 16-core box -- so the step this guards would be killed mid-suite, and
-        # every tag pushed would fail here.  Nothing caught it because no tag has
-        # been pushed since v1.0.9 in March.
-        #
-        # 45 rather than a guess: nightly.yml gives run_all.sh 35 on this same
-        # runner and has been living with it.
-        #
-        # And assert_suite.sh rather than run_all.sh directly, for the reason
-        # that wrapper exists: run_all.sh exits 0 when it ran nothing at all, so
-        # a missing binary or a daemon that never came up would have shipped a
-        # release with a green check mark.  ci.yml has gone through the wrapper
-        # for exactly this since it was written; the release job never did.
-        timeout-minutes: 45
-
-      - name: Build .deb package
-        run: bash packaging/build-deb.sh "${GITHUB_REF_NAME#v}"
-
-      - name: Create GitHub release
+      - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" \
-            --title "Socketley $VERSION" \
-            --generate-notes \
-            "socketley_${VERSION}_amd64.deb" "socketley-dev_${VERSION}_amd64.deb"
+          ls -la dist
+          [ "$(ls dist/*.deb | wc -l)" -eq 4 ] || { echo "expected two packages per architecture"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Socketley ${GITHUB_REF_NAME#v}" --generate-notes dist/*.deb
