@@ -176,6 +176,12 @@ void humanize_duration(double v, std::string& out)
     {
         const char* sign = v < 0 ? "-" : "";
         const double a = std::fabs(v);
+        // Past what int64_t holds the cast below is undefined, and such a span is said in seconds.
+        if (a >= 9.2e18)
+        {
+            out += sign;
+            return g4(a, "s", out);
+        }
         const auto d = static_cast<int64_t>(a);
         const int64_t s = d % 60, m = d / 60 % 60, h = d / 3600 % 24, days = d / 86400;
         char buf[96];
