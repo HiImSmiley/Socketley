@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp fuzz_http_codecs"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_mcp fuzz_http_codecs fuzz_fastcgi fuzz_lua_json fuzz_storage_parsers fuzz_mail_sessions"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -135,6 +135,16 @@ want fuzz_db && build fuzz_db "$ROOT/test/fuzz/fuzz_db.cpp" "$ROOT/socketley/run
     "$ROOT/socketley/shared/crypto/key_file.cpp" "$ROOT/socketley/shared/util/base64.cpp" -lcrypto
 want fuzz_http_codecs && build fuzz_http_codecs "$ROOT/test/fuzz/fuzz_http_codecs.cpp" "$ROOT/socketley/shared/http/hpack.cpp" \
     "$ROOT/socketley/shared/util/inflate.cpp" "$ROOT/socketley/shared/util/deflate.cpp" "$ROOT/socketley/shared/util/crc.cpp"
+want fuzz_fastcgi && build fuzz_fastcgi "$ROOT/test/fuzz/fuzz_fastcgi.cpp" "$ROOT/socketley/shared/http/fastcgi.cpp"
+want fuzz_lua_json && build fuzz_lua_json "$ROOT/test/fuzz/fuzz_lua_json.cpp" -std=c++23 \
+    -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" -L"$ROOT/thirdparty/luajit" -lluajit -ldl
+want fuzz_mail_sessions && build fuzz_mail_sessions "$ROOT/test/fuzz/fuzz_mail_sessions.cpp" -std=c++23 \
+    "$ROOT/socketley/runtime/mail/imap_session.cpp" "$ROOT/socketley/runtime/mail/jmap_session.cpp" \
+    "$ROOT/socketley/runtime/mail/jmap_methods.cpp" "$ROOT/socketley/runtime/mail/imap_order.cpp" \
+    "$ROOT/socketley/runtime/mail/imap_utf7.cpp" "$ROOT/socketley/runtime/mail/mail_compose.cpp" \
+    "$ROOT/socketley/runtime/mail/mail_mime.cpp" "$ROOT/socketley/runtime/mail/mail_text.cpp" \
+    "$ROOT/socketley/runtime/mail/smtp_session.cpp" "$ROOT/socketley/runtime/mail/mail_setup.cpp" \
+    "$ROOT/socketley/shared/util/base64.cpp" -lssl -lcrypto
 want fuzz_mcp && build fuzz_mcp "$ROOT/test/fuzz/fuzz_mcp.cpp" "$ROOT/socketley/runtime/mcp/mcp_protocol.cpp"
 want fuzz_metrics_chunk && build fuzz_metrics_chunk "$ROOT/test/fuzz/fuzz_metrics_chunk.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_chunk.cpp" "$ROOT/socketley/runtime/metrics/metrics_block.cpp" \
@@ -157,14 +167,14 @@ want fuzz_event_loop && build fuzz_event_loop \
     "$ROOT/test/fuzz/fuzz_event_loop.cpp" "$ROOT/socketley/shared/loop/event_loop.cpp" -luring
 
 # ─── the targets that link the runtime ──────────────────────────────────────
-# The four runtime-linking targets cannot use premake's GCC archive, because
+# The five runtime-linking targets cannot use premake's GCC archive, because
 # one process cannot host both GCC's and clang's sanitizer runtimes, so the SDK
 # sources are compiled here with clang and cached -- with SOCKETLEY_INVARIANTS
 # defined for these objects and nowhere else, since the pool-safety and
 # reachability checks compile to nothing without it and are half of what these
 # targets exist to assert.
 if want fuzz_http_request || want fuzz_server_ops || want fuzz_client_ops || \
-   want fuzz_proxy_ops; then
+   want fuzz_proxy_ops || want fuzz_storage_parsers; then
 SDK_OBJ="$OUT/sdk-obj"
 mkdir -p "$SDK_OBJ"
 
@@ -254,6 +264,8 @@ else
                 "$ROOT/test/fuzz/fuzz_client_ops.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
             want fuzz_proxy_ops && build fuzz_proxy_ops \
                 "$ROOT/test/fuzz/fuzz_proxy_ops.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
+            want fuzz_storage_parsers && build fuzz_storage_parsers \
+                "$ROOT/test/fuzz/fuzz_storage_parsers.cpp" "${sdk_objs[@]}" "${RT_LINK[@]}"
         fi
     fi
 fi

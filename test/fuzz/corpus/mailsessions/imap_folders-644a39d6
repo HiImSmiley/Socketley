@@ -1,0 +1,13 @@
+c CREATE "a/b"
+d RENAME a/b c
+e SUBSCRIBE c
+f UNSUBSCRIBE c
+g DELETE c
+h DELETE INBOX
+i RENAME INBOX Old
+j CREATE {3}
+x
+
+k EXAMINE Trash
+l UNSELECT
+m SELECT Nowhere

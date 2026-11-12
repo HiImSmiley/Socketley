@@ -1510,6 +1510,35 @@ project "fuzz_mail"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the IMAP and JMAP conversations, over a store the target keeps in memory ───
+
+project "fuzz_mail_sessions"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_mail_sessions.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/mail/imap_session.cpp",
+        "socketley/runtime/mail/jmap_session.cpp",
+        "socketley/runtime/mail/jmap_methods.cpp",
+        "socketley/runtime/mail/imap_order.cpp",
+        "socketley/runtime/mail/imap_utf7.cpp",
+        "socketley/runtime/mail/mail_compose.cpp",
+        "socketley/runtime/mail/mail_mime.cpp",
+        "socketley/runtime/mail/mail_text.cpp",
+        "socketley/runtime/mail/smtp_session.cpp",
+        "socketley/runtime/mail/mail_setup.cpp",
+        "socketley/shared/util/base64.cpp"
+    }
+    links(tls_libs())
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: the JSON pair behind socketley.json_decode / json_encode ─────────
 --
 -- The one binding written to be pointed at data from the network, and the one

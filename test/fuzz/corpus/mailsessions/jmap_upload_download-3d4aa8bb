@@ -1,0 +1,8 @@
+POST /jmap/upload/dQ/ HTTP/1.1
+Authorization: Basic dTpw
+Content-Type: text/plain
+Content-Length: 5
+
+helloGET /jmap/download/dQ/U1-5/a%22b%0d%0a.txt?type=text/html HTTP/1.1
+Authorization: Basic dTpw
+

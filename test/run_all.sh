@@ -298,6 +298,7 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_metrics_remote) corpus=metrics_remote ;;
         fuzz_mqtt)           corpus=mqtt ;;
         fuzz_mail)           corpus=mail ;;
+        fuzz_mail_sessions)  corpus=mailsessions ;;
         fuzz_tunnel_mux)     corpus=tunnelmux ;;
         fuzz_ssh_cert)       corpus=sshcert ;;
         *)

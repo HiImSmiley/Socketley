@@ -2965,6 +2965,166 @@ def httpcodecs_seeds():
         "round_runs": b"\x07" + b"\0" * 300 + b"\xff" * 300 + bytes(range(256)),
     }
 
+def mailsessions_seeds():
+    import json
+    # Byte 0 says which conversation, byte 1 whether the store answers a step late; see fuzz_mail_sessions.cpp.
+    def imap(lines, signed_in=True, late=False):
+        return bytes([1 if signed_in else 0, 1 if late else 0]) + b"".join(l + b"\r\n" for l in lines)
+    def api(calls, late=False, using=("urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail",
+                                       "urn:ietf:params:jmap:submission", "urn:ietf:params:jmap:vacationresponse",
+                                       "urn:ietf:params:jmap:quota")):
+        return bytes([3, 1 if late else 0]) + json.dumps({"using": list(using), "methodCalls": calls}).encode()
+    def http(text, late=False):
+        return bytes([2, 1 if late else 0]) + text
+    A = "dQ"   # the account of user u
+    basic = b"Authorization: Basic dTpw\r\n"
+    msg = b"Subject: x\r\nFrom: a@example.test\r\n\r\nbody text\r\n"
+    seeds = {
+        # ── IMAP before the sign-in: the command reader, literals and both continuations.
+        "imap_login": imap([b"a CAPABILITY", b"b LOGIN u p", b"c SELECT INBOX", b"d FETCH 1:* (FLAGS UID RFC822.SIZE)",
+                            b"e LOGOUT"], False),
+        "imap_login_literal": imap([b"a LOGIN {1}", b"u {1}", b"p", b"b NOOP"], False),
+        "imap_login_literal_plus": imap([b"a LOGIN {1+}", b"u {1+}", b"p", b"b ID (\"name\" \"x\")"], False, True),
+        "imap_authenticate": imap([b"a AUTHENTICATE PLAIN", b"AHUAcA==", b"b AUTHENTICATE LOGIN", b"dQ==", b"cA==",
+                                   b"c AUTHENTICATE PLAIN AHUAcA==", b"d AUTHENTICATE XOAUTH2", b"*"], False),
+        "imap_literal_too_big": imap([b"a LOGIN {99999999}", b"b LOGIN {99999999+}"], False),
+        "imap_pieces": bytes([0, 1]) + b"a LOG\xffIN u\xff p\r\nb SEL\xffECT INBOX\r\n\xffc FETCH 1 BODY[]\r\n",
+        "imap_bad_lines": imap([b"", b"a", b"a \"unclosed", b"a X {3}", b"abc", b"a X {abc}", b"a X [unclosed", b"* x",
+                                b"a ENABLE CONDSTORE", b"a STARTTLS", b"a COMPRESS DEFLATE"], False),
+        # ── IMAP signed in, INBOX selected.
+        "imap_fetch_parts": imap([b"c FETCH 1:3 (BODY[] BODY[1] BODY[2.MIME] BODY[HEADER.FIELDS (FROM SUBJECT)] "
+                                  b"BODY[HEADER.FIELDS.NOT (TO)] BODY[TEXT]<0.5> BINARY[2] BINARY.SIZE[1] BINARY.PEEK[1]<2.3>)",
+                                  b"d FETCH 2 (ENVELOPE BODYSTRUCTURE BODY INTERNALDATE RFC822 RFC822.HEADER RFC822.TEXT)",
+                                  b"e FETCH 3 FULL", b"f FETCH * FAST", b"g FETCH 1 (EMAILID THREADID MODSEQ SAVEDATE PREVIEW)"]),
+        "imap_fetch_uid_changed": imap([b"c ENABLE QRESYNC", b"d UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1 VANISHED)",
+                                        b"e UID FETCH 4:* FLAGS", b"f FETCH 9 FLAGS", b"g FETCH 1:0 FLAGS",
+                                        b"h UID FETCH 4294967295:1,2,* UID"], late=True),
+        "imap_store": imap([b"c STORE 1:* +FLAGS (\\Seen $kw)", b"d UID STORE 1 -FLAGS.SILENT (\\Deleted)",
+                            b"e STORE 2 (UNCHANGEDSINCE 1) FLAGS (\\Answered \\Draft kw2)", b"f STORE 1 FLAGS ()",
+                            b"g STORE 3 +FLAGS ({3})"]),
+        "imap_search": imap([b"c SEARCH RETURN (MIN MAX COUNT ALL SAVE) OR FROM ann NOT SUBJECT hello SINCE 1-Jan-2024 "
+                             b"LARGER 10 HEADER X-Odd \"\" UID 1:* MODSEQ 1", b"d SEARCH CHARSET UTF-8 TEXT {3}", b"foo",
+                             b"e UID SEARCH $", b"f SEARCH (OR (SEEN) (UNSEEN DELETED)) BEFORE 1-Jan-2030 SENTON 1-Jan-2024 "
+                             b"KEYWORD kw UNKEYWORD kw BODY body BCC x CC x TO u SMALLER 99999 YOUNGER 1 OLDER 1",
+                             b"g SEARCH RETURN (PARTIAL 1:2) ALL", b"h SEARCH CHARSET KOI8-R ALL", b"i SEARCH FUZZY FROM a"]),
+        "imap_sort_thread": imap([b"c SORT (REVERSE DATE SUBJECT) UTF-8 ALL", b"d THREAD REFERENCES UTF-8 ALL",
+                                  b"e UID THREAD ORDEREDSUBJECT UTF-8 SEEN", b"f UID SORT (ARRIVAL FROM TO CC SIZE "
+                                  b"DISPLAYFROM DISPLAYTO) US-ASCII UNDELETED", b"g SORT RETURN (COUNT) (DATE) UTF-8 ALL"],
+                                 late=True),
+        "imap_copy_move_expunge": imap([b"c COPY 1:2 Trash", b"d UID MOVE 1 \"Lists/dev\"", b"e EXPUNGE",
+                                        b"f UID EXPUNGE 1:3", b"g COPY 1 INBOX", b"h MOVE 1:* Nowhere", b"i CLOSE",
+                                        b"j EXPUNGE"]),
+        "imap_append": imap([b"c APPEND INBOX (\\Seen kw) \"01-Jan-2024 10:00:00 +0000\" {%d}" % len(msg), msg,
+                             b"d APPEND Drafts {%d+}" % len(msg), msg, b"e APPEND INBOX ~{3}", b"a\x00b",
+                             b"f APPEND Nowhere {2}", b"xx", b"g APPEND INBOX {70000}"]),
+        "imap_list": imap([b"c LIST \"\" *", b"d LIST (SUBSCRIBED SPECIAL-USE) \"\" (\"%\" \"Lists/*\") RETURN (CHILDREN "
+                           b"STATUS (MESSAGES UNSEEN SIZE))", b"e LSUB \"\" %", b"f LIST \"\" \"\"",
+                           b"g STATUS INBOX (MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN HIGHESTMODSEQ SIZE MAILBOXID DELETED)",
+                           b"h LIST \"Other Users/\" *", b"i NAMESPACE", b"j LIST \"\" \"&AOQ-*\""]),
+        "imap_folders": imap([b"c CREATE \"a/b\"", b"d RENAME a/b c", b"e SUBSCRIBE c", b"f UNSUBSCRIBE c", b"g DELETE c",
+                              b"h DELETE INBOX", b"i RENAME INBOX Old", b"j CREATE {3}", b"x\r\n", b"k EXAMINE Trash",
+                              b"l UNSELECT", b"m SELECT Nowhere"], late=True),
+        "imap_idle": imap([b"c IDLE", b"x", b"DONE", b"d IDLE", b"DONE", b"e NOOP", b"f CHECK"]),
+        "imap_acl": imap([b"c GETACL INBOX", b"d SETACL INBOX v lrs", b"e MYRIGHTS INBOX", b"f LISTRIGHTS INBOX v",
+                          b"g DELETEACL INBOX v", b"h SELECT \"Other Users/v/INBOX\"", b"i STORE 1 +FLAGS (\\Seen)",
+                          b"j SETACL INBOX anyone +lr", b"k SETACL INBOX v -r", b"l GETACL \"Other Users/v/INBOX\""]),
+        "imap_metadata": imap([b"c SETMETADATA INBOX (/private/comment \"x\" /shared/vendor/a {2}", b"hi)",
+                               b"d GETMETADATA (DEPTH infinity MAXSIZE 100) INBOX (/private /shared)",
+                               b"e GETMETADATA \"\" /private/comment", b"f SETMETADATA INBOX (/private/comment NIL)",
+                               b"g SETMETADATA INBOX (/bad \"x\")"]),
+        "imap_notify": imap([b"c NOTIFY SET (selected (MessageNew MessageExpunge FlagChange)) (personal (MailboxName "
+                             b"SubscriptionChange MessageNew MessageExpunge)) (subtree (Lists) (MessageNew))",
+                             b"d APPEND Trash {2}", b"xx", b"e NOOP", b"f NOTIFY NONE", b"g NOTIFY SET STATUS (inboxes (MessageNew))"]),
+        "imap_qresync": imap([b"c ENABLE QRESYNC CONDSTORE UTF8=ACCEPT IMAP4rev2", b"d SELECT INBOX (QRESYNC (1001 1 1:3 (1:3 1:3)))",
+                              b"e SELECT INBOX (CONDSTORE)", b"f GETQUOTAROOT INBOX", b"g GETQUOTA \"\"", b"h SETQUOTA \"\" (STORAGE 1)"]),
+        # ── JMAP: whole requests as they come.
+        "jmap_session": http(b"GET /.well-known/jmap HTTP/1.1\r\nHost: x\r\n" + basic + b"\r\n"
+                             b"GET /jmap/session HTTP/1.1\r\nAuthorization: Bearer tok\r\n\r\n"),
+        "jmap_unsigned": http(b"GET /jmap/session HTTP/1.1\r\n\r\nPOST /jmap/api HTTP/1.1\r\nAuthorization: Basic eDp5\r\n"
+                              b"Content-Length: 2\r\n\r\n{}"),
+        "jmap_upload_download": http(b"POST /jmap/upload/" + A.encode() + b"/ HTTP/1.1\r\n" + basic +
+                                     b"Content-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+                                     b"GET /jmap/download/" + A.encode() + b"/U1-5/a%22b%0d%0a.txt?type=text/html HTTP/1.1\r\n" +
+                                     basic + b"\r\n", True),
+        "jmap_eventsource": http(b"GET /jmap/eventsource?types=*&closeafter=no&ping=1 HTTP/1.1\r\n" + basic + b"\r\n"),
+        "jmap_page": http(b"GET / HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\nOPTIONS /jmap/api HTTP/1.1\r\nOrigin: https://a\r\n\r\n"
+                          b"GET /unsubscribe?t=x HTTP/1.0\r\n\r\n"),
+        "jmap_bad_framing": http(b"POST /jmap/api HTTP/1.1\r\nContent-Length: x\r\n\r\n"),
+        "jmap_chunked": http(b"POST /jmap/api HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+        "jmap_pieces": bytes([2, 1]) + b"POST /jmap/api HTTP/1.1\r\n" + basic + b"Content-Length: 61\r\n\r\n{\"using\":[]"
+                       b",\"methodCalls\xff\":[[\"Core/echo\",{\"a\":1},\"c0\"]]}\xffGET /jmap/session HTTP/1.1\r\n\r\n",
+        # ── JMAP: the body of one API request, each method with what it takes.
+        "api_echo_unknown": api([["Core/echo", {"a": [1, None, {"b": "c"}]}, "c0"], ["No/such", {}, "c1"]]),
+        "api_mailbox": api([["Mailbox/get", {"accountId": A, "ids": None}, "c0"],
+                            ["Mailbox/query", {"accountId": A, "filter": {"role": "inbox"}, "sort": [{"property": "name"}]}, "c1"],
+                            ["Mailbox/set", {"accountId": A, "create": {"k1": {"name": "New", "parentId": None}},
+                                             "update": {"#k1": {"name": "Newer", "isSubscribed": False}},
+                                             "destroy": ["#k1"], "onDestroyRemoveEmails": True}, "c2"],
+                            ["Mailbox/changes", {"accountId": A, "sinceState": "0"}, "c3"]]),
+        "api_email_query_get": api([["Email/query", {"accountId": A, "filter": {"operator": "AND", "conditions": [
+                                        {"inMailbox": "F000003e9"}, {"operator": "NOT", "conditions": [{"text": "zzz"}]},
+                                        {"from": "ann", "hasKeyword": "$seen", "after": "2020-01-01T00:00:00Z", "minSize": 1}]},
+                                     "sort": [{"property": "receivedAt", "isAscending": False}, {"property": "subject"}],
+                                     "position": 0, "limit": 10, "calculateTotal": True, "collapseThreads": True}, "c0"],
+                                    ["Email/get", {"accountId": A, "#ids": {"resultOf": "c0", "name": "Email/query", "path": "/ids"},
+                                                   "properties": ["id", "blobId", "threadId", "mailboxIds", "keywords", "from", "to",
+                                                                  "subject", "receivedAt", "preview", "bodyStructure", "textBody",
+                                                                  "htmlBody", "attachments", "bodyValues", "headers",
+                                                                  "header:Subject:asText", "header:From:asAddresses:all"],
+                                                   "fetchAllBodyValues": True, "maxBodyValueBytes": 16,
+                                                   "bodyProperties": ["partId", "blobId", "size", "type", "charset", "name"]}, "c1"],
+                                    ["Thread/get", {"accountId": A, "#ids": {"resultOf": "c1", "name": "Email/get",
+                                                                            "path": "/list/*/threadId"}}, "c2"],
+                                    ["SearchSnippet/get", {"accountId": A, "filter": {"text": "line"},
+                                                           "#emailIds": {"resultOf": "c0", "name": "Email/query", "path": "/ids"}}, "c3"]],
+                                   late=True),
+        "api_email_set": api([["Email/set", {"accountId": A, "create": {"d1": {
+                                  "mailboxIds": {"F000003eb": True}, "keywords": {"$draft": True},
+                                  "from": [{"name": "U", "email": "u@example.test"}], "to": [{"email": "x@example.test"}],
+                                  "subject": "a\r\nb", "bodyStructure": {"type": "multipart/mixed", "subParts": [
+                                      {"type": "text/plain", "partId": "t"}, {"type": "text/html", "partId": "h"}]},
+                                  "bodyValues": {"t": {"value": "plain\n.\nbody"}, "h": {"value": "<b>x</b>"}},
+                                  "header:X-A": " v"}}}, "c0"],
+                              ["Email/set", {"accountId": A, "update": {"#d1": {"keywords/$seen": True, "mailboxIds/F000003ec": True,
+                                                                               "mailboxIds/F000003eb": None}}}, "c1"],
+                              ["EmailSubmission/set", {"accountId": A, "create": {"s1": {"emailId": "#d1", "identityId": "u",
+                                  "envelope": {"mailFrom": {"email": "u@example.test", "parameters": {"HOLDFOR": "60"}},
+                                               "rcptTo": [{"email": "x@example.test"}, {"email": "bad\r\naddr"}]}}},
+                                  "onSuccessUpdateEmail": {"#s1": {"keywords/$draft": None}},
+                                  "onSuccessDestroyEmail": ["#s1"]}, "c2"],
+                              ["Email/set", {"accountId": A, "destroy": ["#d1", "Mnope", ""]}, "c3"],
+                              ["EmailSubmission/get", {"accountId": A, "ids": []}, "c4"],
+                              ["EmailSubmission/query", {"accountId": A}, "c5"]]),
+        "api_import_parse": api([["Email/import", {"accountId": A, "emails": {"i1": {"blobId": "U1-5", "mailboxIds": {
+                                     "F000003e9": True}, "keywords": {"k": True}, "receivedAt": "2024-01-01T00:00:00Z"}}}, "c0"],
+                                 ["Email/parse", {"accountId": A, "blobIds": ["U1-5", "M0000000000000000", "x"],
+                                                  "properties": ["subject", "textBody", "bodyValues"],
+                                                  "fetchTextBodyValues": True}, "c1"],
+                                 ["Email/changes", {"accountId": A, "sinceState": "x", "maxChanges": 1}, "c2"],
+                                 ["Email/queryChanges", {"accountId": A, "sinceQueryState": "x"}, "c3"]]),
+        "api_identity_vacation": api([["Identity/get", {"accountId": A}, "c0"],
+                                      ["Identity/set", {"accountId": A, "update": {"u": {"name": "N", "replyTo": [
+                                          {"email": "r@example.test"}], "bcc": None, "textSignature": "s", "htmlSignature": "<i>s</i>"}}}, "c1"],
+                                      ["VacationResponse/get", {"accountId": A}, "c2"],
+                                      ["VacationResponse/set", {"accountId": A, "update": {"singleton": {
+                                          "isEnabled": True, "fromDate": "2024-01-01T00:00:00Z", "toDate": None,
+                                          "subject": "away", "textBody": "gone", "htmlBody": None}}}, "c3"],
+                                      ["Quota/get", {"accountId": A, "ids": None}, "c4"], ["Quota/query", {"accountId": A}, "c5"],
+                                      ["Identity/changes", {"accountId": A, "sinceState": "0"}, "c6"]], late=True),
+        "api_push": api([["PushSubscription/set", {"create": {"p1": {"deviceClientId": "d", "url": "https://push.example.test/x",
+                              "keys": {"p256dh": "BA", "auth": "AA"}, "types": ["Email", "Mailbox"], "expires": "2030-01-01T00:00:00Z"}},
+                              "update": {"#p1": {"verificationCode": "x", "types": None}}, "destroy": ["nope"]}, "c0"],
+                         ["PushSubscription/get", {"ids": None}, "c1"]]),
+        "api_refs_bad": api([["Email/get", {"accountId": A, "#ids": {"resultOf": "zz", "name": "Email/query", "path": "/ids"}}, "c0"],
+                             ["Email/get", {"accountId": "other", "ids": ["M1"]}, "c1"],
+                             ["Email/get", {"accountId": A, "ids": "not a list", "properties": [1, None]}, "c2"],
+                             ["Mailbox/get", {"accountId": A, "#ids": {"resultOf": "c0", "name": "Email/get", "path": "/list/*/x/*/y"}}, "c3"],
+                             "not a call", ["Email/query"], ["Email/query", [], 3]]),
+    }
+    seeds["api_not_json"] = bytes([3, 0]) + b"{\"using\":[\"urn:ietf:params:jmap:core\"],\"methodCalls\":[[\"Core/echo\",{},\"c0\"]"
+    seeds["api_deep"] = bytes([3, 0]) + b"{\"methodCalls\":" + b"[" * 200 + b"]" * 200 + b"}"
+    return seeds
+
 def main(argv):
     root = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
     total = 0
@@ -2983,7 +3143,8 @@ def main(argv):
                         ("mail", mail_seeds()),
                         ("tunnelmux", tunnelmux_seeds()),
                         ("sshcert", sshcert_seeds()),
-                        ("httpcodecs", httpcodecs_seeds())):
+                        ("httpcodecs", httpcodecs_seeds()),
+                        ("mailsessions", mailsessions_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

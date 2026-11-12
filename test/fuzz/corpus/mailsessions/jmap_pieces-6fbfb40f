@@ -1,0 +1,6 @@
+POST /jmap/api HTTP/1.1
+Authorization: Basic dTpw
+Content-Length: 61
+
+{"using":[],"methodCallsÿ":[["Core/echo",{"a":1},"c0"]]}ÿGET /jmap/session HTTP/1.1
+
