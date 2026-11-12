@@ -372,7 +372,12 @@ void jmap_session::finished()
 std::string jmap_session::base_url(const request& rq) const
 {
     std::string host = rq.header("host");
-    if (host.empty() || host.find_first_of(" /\\\"<>") != std::string::npos)
+    // A name or an address, with a port or not, and nothing a URL, a header or JSON would read as anything else.
+    const bool plain = !host.empty() && host.size() <= 255 && std::all_of(host.begin(), host.end(), [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+               c == '_' || c == ':' || c == '[' || c == ']';
+    });
+    if (!plain)
         host = m_cfg.hostname;
     return std::string(m_cfg.tls_active || m_https ? "https://" : "http://") + host;
 }
