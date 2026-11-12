@@ -642,6 +642,7 @@ void proxy_instance::adopt_endpoints()
     // snapshot too, so a backend resolved against the last one is re-resolved
     // before anything below judges what still belongs.
     follow_published_nodes();
+    mark_runtime_backends();
 
     // What the new snapshot says this proxy's backends will answer, rebuilt
     // here and in setup(), which are the only two moments it can change.
@@ -757,6 +758,26 @@ void proxy_instance::follow_published_nodes()
         fresh.tls     = m_backend_tls_all;
         if (resolve_backend(fresh))
             b = std::move(fresh);
+    }
+}
+
+void proxy_instance::mark_runtime_backends()
+{
+    for (auto& b : m_backends)
+    {
+        const std::string_view addr(b.address);
+        std::string_view host;
+        uint16_t port = 0;
+        if (b.is_group)
+            b.of_this_daemon = true;
+        else if (!m_endpoints || b.fastcgi)
+            b.of_this_daemon = false;
+        else if (addr.starts_with("unix:"))
+            b.of_this_daemon = m_endpoints->serves(0, addr.substr(5));
+        else if (split_address(addr, host, port, nullptr))
+            b.of_this_daemon = socketley::authority_is_this_machine(host) && m_endpoints->serves(port);
+        else
+            b.of_this_daemon = m_endpoints->find_name(addr) != nullptr;
     }
 }
 
@@ -2034,6 +2055,7 @@ bool proxy_instance::setup(event_loop& loop)
         any_backend_tls = any_backend_tls || b.tls;
     }
     m_backends_resolved = true;
+    mark_runtime_backends();
 
     // config_refusal() has made sure these are all the backends and that --root names where the scripts are.
     const size_t fcgi_count = static_cast<size_t>(
@@ -5105,6 +5127,11 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
 
     bool host_written = false;
     bool client_keep_alive = false;
+    // An idp's cookie signs in at every runtime under its --cookie-domain, so only a runtime of this daemon, which
+    // checks it against the provider's key itself, is sent it: an application behind a proxy could replay it.
+    const bool backend_checks_idp =
+        m_entrance || conn->ex.backend_from_group ||
+        (conn->ex.backend_idx < m_backends.size() && m_backends[conn->ex.backend_idx].of_this_daemon);
     const bool forwarded_trusted = m_prefix.empty() && !m_entrance && socketley::is_loopback(conn->peer_addr);
     bool kept_proto = false, kept_host = false;
     std::string prior_forwarded_for;
@@ -5257,7 +5284,7 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         }
 
         // The provider's own cookies --auth took were this proxy's to see, as the backend is told who in X-Forwarded-User.
-        if (!skip && m_auth.idp() && header_name_equals(hdr_line, "cookie", 6))
+        if (!skip && (m_auth.idp() || !backend_checks_idp) && header_name_equals(hdr_line, "cookie", 6))
         {
             const std::string kept = socketley::http::without_cookies(
                 hdr_line.substr(7), {socketley::idp::session_cookie_name, socketley::idp::known_cookie_name});

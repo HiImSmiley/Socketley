@@ -3,6 +3,7 @@
 // and group to endpoint that the daemon republishes on the few events that
 // change it, immutable and shared so no reader takes a lock or reaches into
 // another runtime's objects.
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -95,6 +96,20 @@ public:
             if (ep.port == port && ep.host == host && !ep.unix_paths.empty())
                 return &ep.unix_paths;
         return nullptr;
+    }
+
+    // Whether a runtime of this daemon answers on `port` of this machine, or on the unix socket at `path`.
+    bool serves(uint16_t port, std::string_view path = {}) const
+    {
+        for (const auto& [_, ep] : m_by_name)
+        {
+            if (port != 0 && ep.port == port)
+                return true;
+            if (!path.empty() && ((ep.port == 0 && ep.host == path) ||
+                                  std::find(ep.unix_paths.begin(), ep.unix_paths.end(), path) != ep.unix_paths.end()))
+                return true;
+        }
+        return false;
     }
 
     const std::vector<runtime_endpoint>* find_group(std::string_view group) const

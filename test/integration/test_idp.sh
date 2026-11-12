@@ -22,7 +22,8 @@
 #   * an app password removed while another is being made coming back with it
 #   * a storage's users not coming over with the passwords they have there, or its admins coming over as admins
 #   * a proxy, a storage or the dashboard not taking the sign-in, or a client naming itself someone else
-#   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted
+#   * a proxy handing its backend the provider's session cookie, which signs in wherever the provider is trusted,
+#     with --auth idp: or without it; or keeping it from a runtime of this daemon, which signs in by it
 #   * a storage refusing the sign-in for a stale or tossed interface cookie sent beside it
 #   * a return address a browser reads as another host's, by a backslash in its host
 #   * a sign-in or an account's change posted from another site's page
@@ -745,11 +746,37 @@ expect "a device allowed from a page under the cookie domain is refused before i
 expect "where the provider's own page is answered that the code is not known" \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Cookie: $CAROL" -H 'Origin: https://auth.example.com' -d 'user_code=ABCD-EFGH&action=allow' "http://127.0.0.1:$P2/device")" 400
 
+# Under a cookie domain a browser sends the session cookie to every name, so a proxy with no --auth of its own hands
+# it to no application: that could replay it as the visitor. A runtime of this daemon checks it itself and is sent it.
+PX=$((SL_PORT_BASE + 1966))
+"$BIN" create proxy app -p "$PX" --backend "127.0.0.1:$PB" -s >/dev/null 2>&1 || bad "a proxy to an application is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+"$BIN" create proxy files -p $((PX + 1)) --backend "127.0.0.1:$PS" -s >/dev/null 2>&1 || bad "a proxy to a storage by address is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+"$BIN" create proxy files2 -p $((PX + 2)) --backend ui -s >/dev/null 2>&1 || bad "a proxy to a storage by name is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+for p in "$PX" $((PX + 1)) $((PX + 2)); do
+    for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p/")" != 000 ] && break; sleep 0.1; done
+done
+expect "a proxy without --auth hands an application its own cookies and not the provider's" \
+    "$(curl -s -H "Cookie: $CAROL; theme=dark; skl_idp_known=k" "http://127.0.0.1:$PX/app/who" | cut -d'|' -f3)" "theme=dark"
+expect "and no Cookie field at all when the provider's were the only ones" \
+    "$(curl -s -H "Cookie: $CAROL" "http://127.0.0.1:$PX/app/who" | cut -d'|' -f3)" "-"
+# zed is an account of the provider and no user of the storage: 403 says the cookie arrived and was checked.
+"$BIN" idp-user auth add zed --password zedpassword123 >/dev/null 2>&1
+CAROL1=$(curl -s -i -X POST -H "Origin: http://127.0.0.1:$PI" -H 'X-Forwarded-For: 198.51.100.200' -d 'rd=/&username=zed&password=zedpassword123' "http://127.0.0.1:$PI/login" | sed -n 's/^[Ss]et-[Cc]ookie: \(skl_idp=[^;]*\).*/\1/p' | head -1)
+[ -n "$CAROL1" ] && ok || bad "an account of the first provider signs in" "no cookie"
+expect "a storage reached directly knows the account by its cookie" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Socketley-UI: 1' -H "Cookie: $CAROL1" "http://127.0.0.1:$PS/~ui/session")" 403
+expect "and so does one behind a proxy that names its address" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Socketley-UI: 1' -H "Cookie: $CAROL1" "http://127.0.0.1:$((PX + 1))/files/~ui/session")" 403
+expect "or names the runtime" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Socketley-UI: 1' -H "Cookie: $CAROL1" "http://127.0.0.1:$((PX + 2))/files2/~ui/session")" 403
+expect "where without the cookie nobody is signed in" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Socketley-UI: 1' "http://127.0.0.1:$((PX + 1))/files/~ui/session")" 401
+
 SHOWJ=$("$BIN" show auth 2>/dev/null)
 case "$SHOWJ" in *'"issuer": "http://127.0.0.1:'*) ok ;; *) bad "show names the issuer" "$SHOWJ" ;; esac
-# The worker started again reports at its first tick, and until then `stats` says it has not.
-for _ in $(seq 1 50); do STATS=$("$BIN" stats auth 2>/dev/null); case "$STATS" in *worker_report:none*) sleep 0.1 ;; *) break ;; esac; done
-case "$STATS" in *"accounts:14"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
+# The worker reports at its ticks, so the account made above is in what `stats` says within a few of them.
+for _ in $(seq 1 80); do STATS=$("$BIN" stats auth 2>/dev/null); case "$STATS" in *"accounts:15"*) break ;; *) sleep 0.1 ;; esac; done
+case "$STATS" in *"accounts:15"*) ok ;; *) bad "stats counts the accounts" "$STATS" ;; esac
 
 # At a terminal, --password - asks twice and shows neither, as a password prompt does: typed only once each is asked.
 out=$(python3 - "$BIN" <<'PY'

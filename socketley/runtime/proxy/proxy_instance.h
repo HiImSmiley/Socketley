@@ -80,6 +80,8 @@ struct backend_info
     // request from node_next; empty for a backend with one address.
     std::vector<backend_info> nodes;
     size_t node_next = 0;
+    // A runtime of this daemon, which checks an idp's cookie itself; any other backend is not sent one.
+    bool of_this_daemon = false;
 };
 
 struct resolved_backend
@@ -905,6 +907,8 @@ private:
     const std::vector<std::string>* published_nodes(const backend_info& b) const;
     // Re-resolve every backend whose published nodes changed.
     void follow_published_nodes();
+    // Says of every backend whether the held table has it as a runtime of this daemon.
+    void mark_runtime_backends();
     // Everything the held table decides, applied on each new table and again in setup().
     void adopt_endpoints();
     // The backend a selection lands on: the entry, or one of its nodes.
