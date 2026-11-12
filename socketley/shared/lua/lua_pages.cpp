@@ -67,12 +67,27 @@ local function parse_form(s, t)
   end
   return t
 end
+-- s without the blanks at its ends, in one pass from each: a pattern with two open ends tries every split between them.
+local function trim(s)
+  local i = find(s, "%S")
+  if not i then return "" end
+  local j = #s
+  while true do
+    local c = byte(s, j)
+    if c ~= 32 and (c < 9 or c > 13) then break end
+    j = j - 1
+  end
+  return sub(s, i, j)
+end
 local function parse_cookies(s)
   local t = {}
   if s then
     for part in gmatch(s, "[^;]+") do
-      local k, v = match(part, "^%s*([^=]-)%s*=%s*(.-)%s*$")
-      if k and k ~= "" and t[k] == nil then t[k] = v end
+      local eq = find(part, "=", 1, true)
+      if eq then
+        local k = trim(sub(part, 1, eq - 1))
+        if k ~= "" and t[k] == nil then t[k] = trim(sub(part, eq + 1)) end
+      end
     end
   end
   return t

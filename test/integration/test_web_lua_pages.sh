@@ -192,6 +192,12 @@ check "and an edited template, which the page was not asked about again until th
 
 check "query, form, cookies and headers are read" "a=1 tags=x,y name=- sid=abc ua=probe/1" \
     "$(get '/form.lua?a=1&tag%5B%5D=x&tag[]=y' -H 'Cookie: sid=abc; other=z' -A probe/1)"
+check "a cookie's name and value lose the blanks around them, and a part with no = is none" "a=- tags=- name=- sid=a b ua=curl" \
+    "$(get /form.lua -H 'Cookie: junk;  sid  =  a b  ; sid=second' -A curl)"
+# A cookie part of blanks and no = took a pattern with two open ends n^3 steps inside one C call, which no deadline
+# ends: 3000 of them were seconds of the worker, and the 12000 a request head holds were most of an hour.
+check "a Cookie field of blanks is read in no time" "a=- tags=- name=- sid=abc ua=curl 0" \
+    "$(get /form.lua -H "Cookie: x=1;$(printf '%12000s' '');sid=abc" -A curl --max-time 5; echo " $?")"
 check "a posted field is escaped by escape()" "a=- tags=- name=&lt;b&gt;bob&lt;/b&gt; sid=- ua=curl" \
     "$(get /form.lua --data-urlencode 'name=<b>bob</b>' -A curl)"
 printf 'file body' > "$SOCKETLEY_TMPD/up.txt"
