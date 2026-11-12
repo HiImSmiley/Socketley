@@ -1,6 +1,24 @@
 # What run_all.sh and run_group.sh both decide about a test file -- only ever
 # sourced.
 
+# SUITE_SHARD=k/n runs the k-th of n disjoint parts of the suite, so n machines
+# share one run; a test belongs to the part its name hashes to, which
+# test/ci/assert_suite.sh computes the same way for what each part owes.
+suite_in_shard() {   # name -> 0 when SUITE_SHARD is unset or the name is this shard's
+    [ -n "${SUITE_SHARD:-}" ] || return 0
+    local k=${SUITE_SHARD%/*} n=${SUITE_SHARD#*/}
+    [ $(( $(printf '%s' "$1" | cksum | cut -d' ' -f1) % n + 1 )) -eq "$k" ]
+}
+
+suite_shard_ok() {   # -> 0 when SUITE_SHARD is unset or a valid k/n
+    [ -n "${SUITE_SHARD:-}" ] || return 0
+    local k=${SUITE_SHARD%%/*} n=${SUITE_SHARD#*/}
+    case "$SUITE_SHARD" in */*) ;; *) return 1 ;; esac
+    case "$k" in ''|*[!0-9]*) return 1 ;; esac
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$n" -ge 1 ] && [ "$k" -ge 1 ] && [ "$k" -le "$n" ]
+}
+
 # A file that measures time or CPU, or that shares the suite's daemon, runs
 # alone: the first measures nothing under load, the second has no daemon of
 # its own to run beside anybody.  A file that isolates without daemon_isolate

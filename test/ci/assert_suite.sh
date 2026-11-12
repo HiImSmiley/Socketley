@@ -48,9 +48,16 @@ LOG="${1:-$ROOT/suite.log}"
 # to start when a defined target is missing from the build directory, which is
 # the earlier and better place for it; this stays as the check on what actually
 # RAN, which is a different question and the one a wrapper can answer.
-unit_count=$(sed -n 's/^project "\(test_[A-Za-z0-9_]*\)".*/\1/p' "$ROOT/premake5.lua" | wc -l)
-fuzz_count=$(sed -n 's/^project "\(fuzz_[A-Za-z0-9_]*\)".*/\1/p' "$ROOT/premake5.lua" | wc -l)
-integration_count=$(find "$ROOT/test/integration" -maxdepth 1 -name 'test_*.sh' -type f | wc -l)
+# What SUITE_SHARD's part owes, dealt by run_all.sh's own rule; in a subshell, as
+# lib_suite.sh exports what run_all.sh must measure for itself.
+in_shard() {
+    bash -c '. "$1/test/lib_suite.sh"; suite_shard_ok || exit 2
+             n=0; while IFS= read -r x; do suite_in_shard "$x" && n=$((n + 1)); done; echo "$n"' _ "$ROOT"
+}
+in_shard </dev/null >/dev/null || { echo "ERROR: SUITE_SHARD=$SUITE_SHARD is not k/n with 1 <= k <= n"; exit 2; }
+unit_count=$(sed -n 's/^project "\(test_[A-Za-z0-9_]*\)".*/\1/p' "$ROOT/premake5.lua" | in_shard)
+fuzz_count=$(sed -n 's/^project "\(fuzz_[A-Za-z0-9_]*\)".*/\1/p' "$ROOT/premake5.lua" | in_shard)
+integration_count=$(find "$ROOT/test/integration" -maxdepth 1 -name 'test_*.sh' -type f -printf '%f\n' | in_shard)
 expected=$((unit_count + fuzz_count + integration_count))
 
 if [ "$integration_count" -eq 0 ]; then
@@ -64,7 +71,7 @@ if [ "$unit_count" -eq 0 ] || [ "$fuzz_count" -eq 0 ]; then
     exit 2
 fi
 
-echo "expecting $unit_count unit + $fuzz_count fuzz + $integration_count integration = $expected"
+echo "expecting $unit_count unit + $fuzz_count fuzz + $integration_count integration = $expected${SUITE_SHARD:+ (shard $SUITE_SHARD)}"
 
 bash "$ROOT/test/run_all.sh" 2>&1 | tee "$LOG"
 suite_rc=${PIPESTATUS[0]}

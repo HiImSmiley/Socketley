@@ -134,6 +134,8 @@ run_test() {
 # The jobs suite_run_jobs ran, their output in the list's order, each red one run again alone: green alone is
 # counted as passed and named at the end, since a race that load exposes is still a race.
 . "$SCRIPT_DIR/lib_suite.sh"
+suite_shard_ok || { echo "ERROR: SUITE_SHARD=$SUITE_SHARD is not k/n with 1 <= k <= n"; exit 1; }
+[ -n "${SUITE_SHARD:-}" ] && echo "Shard:          ${SUITE_SHARD%/*} of ${SUITE_SHARD#*/}"
 # The peaks this run's jobs reach, sampled throughout and kept for the next run's reservations.
 MEMDIR=$(mktemp -d)
 suite_mem_sampler "$MEMDIR" & SAMPLER_PID=$!
@@ -218,6 +220,7 @@ unit_found=0
 UNIT_JOBS=$(mktemp); UNIT_DIR=$(mktemp -d)
 for t in "$BIN_DIR"/test_*; do
     [ -f "$t" ] && [ -x "$t" ] || continue
+    suite_in_shard "$(basename "$t")" || continue
     unit_found=$((unit_found + 1))
     case " $UNIT_TARGETS " in
         *" $(basename "$t") "*) ;;
@@ -270,6 +273,7 @@ FUZZ_JOBS=$(mktemp); FUZZ_DIR=$(mktemp -d)
 for f in "$BIN_DIR"/fuzz_*; do
     [ -f "$f" ] && [ -x "$f" ] || continue
     fname=$(basename "$f")
+    suite_in_shard "$fname" || continue
     case "$fname" in
         fuzz_resp)           corpus=resp ;;
         fuzz_fastcgi)        corpus=fastcgi ;;
@@ -376,6 +380,7 @@ PAR_LIST=$(mktemp); SERIAL_LIST=$(mktemp); QUIET_LIST=$(mktemp); RESDIR=$(mktemp
 # by side, and a quiet one runs on cores of its own beside them; without, as before.
 for script in "$SCRIPT_DIR"/integration/test_*.sh; do
     [ -f "$script" ] || continue
+    suite_in_shard "$(basename "$script")" || continue
     # A quiet file that needs the host's own network disturbs every other one, so it runs alone after them.
     if [ -n "$NS_ROOT" ] && grep -q '^# suite: quiet' "$script" && grep -q '^# suite: host' "$script"; then
         echo "$script" >> "$SERIAL_LIST"
