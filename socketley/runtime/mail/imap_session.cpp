@@ -399,12 +399,21 @@ void imap_session::untagged(std::string_view line)
     m_hooks.reply(out);
 }
 
+// RFC 3501's tag: ASTRING-CHARs but '+', which are printable ASCII without the atom specials.
+static bool valid_tag(std::string_view tag)
+{
+    if (tag.empty())
+        return false;
+    for (const char c : tag)
+        if (c <= ' ' || c > '~' || std::string_view("(){%*\"\\+").find(c) != std::string_view::npos)
+            return false;
+    return true;
+}
+
 void imap_session::finish(const std::string& tag, std::string_view status, std::string_view text)
 {
-    std::string out;
-    // A line's end in what a client gave and is said back would start a response of its own.
-    for (const char c : tag)
-        out += c == '\r' || c == '\n' || c == '\0' ? ' ' : c;
+    // A tag no client may send is not said back, since a blank in it makes the line no status response.
+    std::string out = tag == "*" || valid_tag(tag) ? tag : "*";
     out += ' ';
     out.append(status);
     out += ' ';
@@ -768,6 +777,11 @@ void imap_session::run()
             continue;
         }
         const std::string tag = t[0].text;
+        if (!valid_tag(tag))
+        {
+            finish("*", "BAD", "The tag is not one a client may send");
+            continue;
+        }
         t.erase(t.begin());
         command(tag, std::move(t));
     }

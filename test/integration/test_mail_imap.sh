@@ -12,6 +12,7 @@
 #   * new mail not told by NOOP or IDLE, or told only when the bucket is next listed
 #   * flags and UIDs lost by a restart
 #   * a client on this machine guessing an idp account's password with no count kept of its failures
+#   * a tag no client may send said back, so that the answer is no status line
 #   * a shard holding every user it ever served, or one that let a user go losing what came meanwhile, or its \Recent
 set -uo pipefail
 
@@ -855,6 +856,20 @@ except Exception as e:
 PY
 )
 check "a literal's marker glued to an atom is no literal, a huge one is refused, and the next command answered" "$r" "a BAD c NO  b OK "
+
+# A tag no client may send is refused, not said back: one with a NUL came back with a blank in it, which made the
+# answer no status line, and what the command name said ({99999999}) then read as a literal's marker.
+r=$(timeout 60 python3 - "$IM" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3); f = s.makefile("rb"); f.readline()
+s.sendall(b"c\0\0a FOO{99999999}\r\nb\xd5 NOOP\r\nd NOOP\r\n")
+try:
+    print(" ".join(f.readline().split(b" ")[0].decode(errors="replace") for _ in range(3)))
+except Exception as e:
+    print("no answer", repr(e))
+PY
+)
+check "a command whose tag holds a NUL or an 8-bit byte is answered untagged, and the next one by its tag" "$r" "* * d"
 
 # LIST matches every folder against every pattern on the loop, so a long reference or many patterns are refused at
 # once, as is a command of more than a million words; an ordinary LIST of two patterns still answers both.
