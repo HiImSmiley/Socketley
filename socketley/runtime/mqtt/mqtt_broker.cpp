@@ -1510,11 +1510,33 @@ void broker::fire_will(session& s)
     mark(s);
     if (!valid_topic(m.topic) || m.topic.front() == '$' || !m_hooks.may_write(s.username, s.client_id, m.topic))
         return;
-    ++m_stats.wills_sent;
-    auto p = std::make_shared<const message>(std::move(m));
-    if (p->retain)
-        store_retained(p, true);
-    route(p, true);
+    const message_ptr p = std::make_shared<const message>(std::move(m));
+    const auto send = [this](const message_ptr& out) {
+        ++m_stats.wills_sent;
+        if (out->retain)
+            store_retained(out, true);
+        route(out, true);
+    };
+    if (!m_hooks.hooks_publish())
+        return send(p);
+    // A will is a publish of its client's, so the script that decides which publishes pass decides this one too:
+    // without it a client said by its will what on_publish refuses it to say.
+    client_info who;
+    who.conn      = s.conn;
+    who.client_id = s.client_id;
+    who.username  = s.username;
+    who.peer      = s.peer;
+    who.level     = s.level;
+    m_hooks.on_publish(who, p, [this, p, send](publish_verdict v) {
+        if (!v.allow)
+        {
+            ++m_stats.denied_publish;
+            return;
+        }
+        // A script may rename, never send to a wildcard or to '$'.
+        const bool renamed = v.replace && valid_topic(v.replace->topic) && v.replace->topic.front() != '$';
+        send(renamed ? v.replace : p);
+    });
 }
 
 void broker::end_session(session& s, bool publish_will)

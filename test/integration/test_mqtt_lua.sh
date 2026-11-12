@@ -5,6 +5,7 @@
 #
 # What each part would catch:
 #   * a hook's true, false, nil or table not doing what it says, or a silent on_auth refusing --anonymous clients
+#   * a will published without on_publish being asked, so that a client says by its will what the script refuses
 #   * a script that let a client in under a name the credentials did not check, given that name's rights anyway
 #   * on_connect or on_disconnect not run, or run for a client that was refused
 #   * a self.* call that answers wrong, or a kick that leaves the client connected
@@ -105,6 +106,16 @@ def hooks():
     c.publish("shout", "quiet words", qos=1)
     m = [x for x in ev.messages(5, 2) if x.topic == "shout/out"]
     check("a table replaces the message", (m[0].topic, m[0].payload) if m else None, ("shout/out", b"QUIET WORDS"))
+    # A will is its client's publish, said when the connection is lost: the script decides it as any other.
+    w = Client(ph)
+    w.connect("will-blocked", will=("blocked", "from a will", 1, False))
+    w.close()
+    truth("on_publish's false refuses a will too", all(m.topic != "blocked" for m in ev.messages(5, 1.0)))
+    w = Client(ph)
+    w.connect("will-shout", will=("shout", "last words", 1, False))
+    w.close()
+    m = [x for x in ev.messages(5, 2) if x.topic == "shout/out"]
+    check("and its table replaces one", (m[0].topic, m[0].payload) if m else None, ("shout/out", b"LAST WORDS"))
     check("on_subscribe's false refuses the subscription", c.subscribe(("forbidden/#", 1)), [0x80])
     check("and nil grants it", c.subscribe(("allowed/#", 1)), [1])
     c.publish("keep/me", "kept value", qos=1, retain=True)

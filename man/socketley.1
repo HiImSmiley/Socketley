@@ -16693,6 +16693,7 @@ may also answer a table: the message as it is to go on, with any of
 and
 .BR retain .
 A refused publish is answered 0x87.
+A will is asked as any publish is, when it is to be sent; one refused is not sent.
 .B self.publish(topic, payload [, {qos=, retain=}])
 publishes as the broker.
 .B self.retained(topic)
