@@ -155,11 +155,15 @@ if phase == "main":
     check("and the other one is refused at the proxy", eventually(lambda: gate(bobs[0]), 401), 401)
 
     # Changed on the account page, at whichever shard; every shard answers with the change at once.
-    for n in range(8):
+    # Many times over, since shard 0 answering before it told the others where its journal ends was a race of
+    # microseconds: the reader asked next said the old name once in seven runs of the eight changes this was.
+    saved, stale = 0, 0
+    for n in range(120):
         st, body, _ = req("POST", "/account", dict(name="Alice %d" % n, email="a@example.com"), cookie=cookie)
-        check("the account page saves at every shard", (st, "Saved." in body), (200, True))
-        check("a change on the account page is what every shard says next",
-              [userinfo(tokens[i]["access_token"]) for i in range(8)], ["Alice %d" % n] * 8)
+        saved += st == 200 and "Saved." in body
+        stale += sum(userinfo(tokens[i % len(tokens)]["access_token"]) != "Alice %d" % n for i in range(n % 8, n % 8 + 4))
+    check("the account page saves at every shard", saved, 120)
+    check("a change on the account page is what every shard says next", stale, 0)
     # A refresh token refreshes once, whichever shard it reaches, and one used again ends its sign-in at every shard.
     st, body, _ = req("POST", "/token", dict(grant_type="refresh_token", refresh_token=tokens[2]["refresh_token"]), BASIC)
     newest = json.loads(body).get("refresh_token", "") if st == 200 else ""

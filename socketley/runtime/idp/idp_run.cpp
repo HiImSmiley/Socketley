@@ -4139,17 +4139,21 @@ void idp_run::write_standing()
 
 void idp_run::publish_accounts(std::function<void()> then)
 {
+    // The other shards are told where the journal ends before anyone is answered, since write_standing() answers at
+    // once when no account's standing changed, and a reader asked next read the account as it was before.
+    if (m_shards > 1 && !m_reader)
+    {
+        const uint64_t id = m_accounts.journal_id(), end = m_accounts.journal_end();
+        if (id != m_told_id || end != m_told_end)
+        {
+            m_told_id = id;
+            m_told_end = end;
+            m_owner.shard_stats_table().publish_words(end, id);
+        }
+    }
     if (then)
         m_standing_waiters.emplace_back(m_accounts.standing_changes(), std::move(then));
     write_standing();
-    if (m_shards <= 1 || m_reader)
-        return;
-    const uint64_t id = m_accounts.journal_id(), end = m_accounts.journal_end();
-    if (id == m_told_id && end == m_told_end)
-        return;
-    m_told_id = id;
-    m_told_end = end;
-    m_owner.shard_stats_table().publish_words(end, id);
 }
 
 void idp_run::catch_up(std::function<void()> then)
