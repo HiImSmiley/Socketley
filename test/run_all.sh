@@ -154,7 +154,7 @@ report_jobs() {   # list dir
         note_skips "$name" "$2/$name.log"
         if [ "$(cat "$2/$name.rc" 2>/dev/null)" = 0 ]; then PASS=$((PASS+1)); echo ""; continue; fi
         echo "  -- red beside others; run again alone:"
-        if suite_job "$name" "$cmd" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
+        if suite_job "$name" "$cmd" 2>&1 </dev/null; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
         else FAIL=$((FAIL+1)); FAILED="$FAILED$name"$'\n'; fi
         echo ""
     done < "$1"
@@ -463,13 +463,15 @@ if [ "$PAR" -gt 1 ]; then
     fi
     # A file red beside others and green alone is load, not this tree -- but it
     # is named at the end, because a race that load exposes is still a race.
+    # Every file run inside a loop that reads its list from stdin gets /dev/null, since one that reads stdin (ssh
+    # does) ate the rest of the list: nineteen files went unreported and uncounted behind test_tunnel_forward.
     while IFS= read -r script; do
         name=$(basename "$script")
         cat "$RESDIR/$name.log" 2>/dev/null
         note_skips "$name" "$RESDIR/$name.log"
         if [ "$(cat "$RESDIR/$name.rc" 2>/dev/null)" = 0 ]; then PASS=$((PASS+1)); echo ""; continue; fi
         echo "  -- red beside $PAR others; run again alone:"
-        if run_file "$script" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
+        if run_file "$script" 2>&1 </dev/null; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
         else FAIL=$((FAIL+1)); FAILED="$FAILED$name"$'\n'; fi
         echo ""
     done < <(sort "$PAR_LIST" "$QUIET_LIST")
@@ -489,7 +491,7 @@ fi
 while IFS= read -r script; do
     name=$(basename "$script" .sh)
     t0=$(date +%s)
-    run_test "$name" bash "$script"
+    run_test "$name" bash "$script" </dev/null
     echo $(( $(date +%s) - t0 )) > "$RESDIR/$name.sh.secs"
     check_leaked_daemons "$name"
 done < <(sort "$SERIAL_LIST")
