@@ -170,7 +170,7 @@ Every flag of every runtime type, with the types that take it.
 | `--sync` | one of never, active, per-user | Sync runtimes: Runtimes that pull users' git repositories: none, one for all, or one each. Types: storage. |
 | `--acls` |  | ACLs: Accept ACLs on buckets that have no ownership controls; otherwise the bucket owner owns everything. Types: storage. |
 | `--notify-targets` | path | Webhooks: The webhooks event notifications may go to. Types: storage. |
-| `--replication-targets` | path | Replication targets: The S3 endpoints buckets may replicate to. Types: storage. |
+| `--replication-targets` | path | Replication targets: The S3 endpoints buckets may replicate to; only an admin may name one. Types: storage. |
 | `--tiers` | path | Tiers: The S3 endpoints lifecycle may move versions to. Types: storage. |
 | `--federation` | path | Federation: The OIDC provider and LDAP directory STS trusts. Types: storage. |
 | `--nodes` | path | Cluster nodes: Make it a node of a storage cluster. Types: storage. |

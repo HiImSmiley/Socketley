@@ -105,7 +105,7 @@ Names the file of S3 endpoints that a bucket's replication may write to. Each li
 backup   https://s3.backup.internal   eu-west-1  AKIAREPLICATOR000001  wJal.../replicator
 ```
 
-A configuration's **Role** names a target by its last path segment, as **arn:aws:iam::***account***:role/***name*. Every copy to that endpoint is signed with the line's key and secret, for the line's region. **create** and **start** refuse the file if a line does not parse, and it is read at every start. **show** and the state file keep its path, and its secrets are never logged. Without this flag every replication configuration is refused. See **Replication**.
+A configuration's **Role** names a target by its last path segment, as **arn:aws:iam::***account***:role/***name*. Every copy to that endpoint is signed with the line's key and secret, for the line's region, so naming a line spends that key's authority: only an admin (**admin = true** in **--credentials**, or the IAM API's admins group) may put a configuration, and no bucket policy grants it to anyone else. A runtime that holds no users, **--anonymous** alone, takes it from anyone. Configurations stored before this rule are kept as they are. **create** and **start** refuse the file if a line does not parse, and it is read at every start. **show** and the state file keep its path, and its secrets are never logged. Without this flag every replication configuration is refused. See **Replication**.
 
 ### `--acls`
 
@@ -767,7 +767,7 @@ A bucket's **ReplicationConfiguration** (PutBucketReplication, GetBucketReplicat
 - a **Destination** with the **Bucket** as **arn:aws:s3:::***bucket*, and optionally an **Account**, a **StorageClass** (sent as the replica's **x-amz-storage-class**) and an **AccessControlTranslation** to Destination;
 - **DeleteMarkerReplication**.
 
-The last path segment of the Role names a target of **--replication-targets**. Every rule of the configuration writes with that target's endpoint and credentials:
+The last path segment of the Role names a target of **--replication-targets**, and only an admin may name one: PutBucketReplication from any other user is AccessDenied, whatever a bucket policy allows. GetBucketReplication and DeleteBucketReplication are the bucket's as before. Every rule of the configuration writes with that target's endpoint and credentials:
 
 ```
 <ReplicationConfiguration>
