@@ -47,6 +47,7 @@ E = os.environ
 ADMIN = (E.get("ADMIN_AK", ""), E.get("ADMIN_SK", ""))
 REPL = (E.get("REPL_AK", ""), E.get("REPL_SK", ""))
 READ = (E.get("READ_AK", ""), E.get("READ_SK", ""))
+PLAIN = (E.get("PLAIN_AK", ""), E.get("PLAIN_SK", ""))
 NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 ROLE = "arn:aws:iam::123456789012:role/"
 SB = "rsrc-b"
@@ -686,6 +687,27 @@ def mode_loop(sp, dp):
           stat("rdst", "replication_completed") - before == 3, rstats("rdst"))
 
 
+# ── who may name a target ──────────────────────────────────────────────────
+def mode_admin(dp):
+    """The destination holds users and its own --replication-targets, whose one line, back, is named here."""
+    admin, plain, reader = client(dp, ADMIN), client(dp, PLAIN), client(dp, READ)
+    conf = config("back", rule("all", 1, "rsrc-b"))
+    versioned(plain, "plain-own")
+    check("a user that is no admin is refused naming a target for its own bucket",
+          call(plain.put_bucket_replication, Bucket="plain-own", ReplicationConfiguration=conf) == "AccessDenied")
+    versioned(admin, "admin-granted")
+    admin.put_bucket_policy(Bucket="admin-granted", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": ["reader"]}, "Action": ["s3:PutReplicationConfiguration"],
+         "Resource": "arn:aws:s3:::admin-granted"}]}))
+    check("nor may a bucket policy grant it",
+          call(reader.put_bucket_replication, Bucket="admin-granted", ReplicationConfiguration=conf) == "AccessDenied")
+    check("an admin's configuration is taken",
+          isinstance(call(admin.put_bucket_replication, Bucket="plain-own", ReplicationConfiguration=conf), dict))
+    check("and its owner still reads it back",
+          isinstance(call(plain.get_bucket_replication, Bucket="plain-own"), dict))
+    check("and deletes it", isinstance(call(plain.delete_bucket_replication, Bucket="plain-own"), dict))
+
+
 if __name__ == "__main__":
     a = sys.argv[2:]
     if MODE == "main":
@@ -700,4 +722,6 @@ if __name__ == "__main__":
         mode_shards(int(a[0]), a[1:])
     elif MODE == "loop":
         mode_loop(int(a[0]), int(a[1]))
+    elif MODE == "admin":
+        mode_admin(int(a[0]))
     sys.exit(min(failed, 100))

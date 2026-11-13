@@ -9561,7 +9561,11 @@ A configuration's
 names a target by its last path segment, as
 .BI arn:aws:iam:: account :role/ name\fR.
 Every copy to that endpoint is signed with the line's key and secret, for the
-line's region.
+line's region, so naming a line spends that key's authority: only an admin
+(\fBadmin = true\fR in \fB\-\-credentials\fR, or the IAM API's admins group) may
+put a configuration, and no bucket policy grants it to anyone else.
+A runtime that holds no users, \fB\-\-anonymous\fR alone, takes it from anyone.
+Configurations stored before this rule are kept as they are.
 .B create
 and
 .B start
@@ -11748,7 +11752,10 @@ to Destination;
 .BR DeleteMarkerReplication .
 .PP
 The last path segment of the Role names a target of
-.BR \-\-replication\-targets .
+.BR \-\-replication\-targets ,
+and only an admin may name one: PutBucketReplication from any other user is
+AccessDenied, whatever a bucket policy allows. GetBucketReplication and
+DeleteBucketReplication are the bucket's as before.
 Every rule of the configuration writes with that target's endpoint and
 credentials:
 .RS

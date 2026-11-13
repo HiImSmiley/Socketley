@@ -20,6 +20,16 @@ bool replica_request(const s3_request& r)
 void storage_run::op_put_replication(const std::shared_ptr<conn>& c)
 {
     const s3_request& q = c->req;
+    // The Role names a --replication-targets line whose key signs every copy, so naming one is the operator's to do,
+    // as AWS holds it to iam:PassRole: an admin, or anyone where the runtime holds no users; no bucket policy grants it.
+    if (c->user ? !c->user->admin : m_auth->holds_users())
+    {
+        s3_error e = make_error("AccessDenied");
+        e.message  = "Only an admin may set a bucket's replication, since its Role names a replication target whose "
+                     "key signs every copy.";
+        send_error(c, e);
+        return;
+    }
     if (!m_store.has_bucket(q.bucket))
     {
         send_error_st(c, st::no_such_bucket);

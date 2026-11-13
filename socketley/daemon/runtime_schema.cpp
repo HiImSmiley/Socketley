@@ -137,7 +137,7 @@ constexpr row rows[] = {
     {"--sync", "T", "choice", "Sync runtimes", "Runtimes that pull users' git repositories: none, one for all, or one each.", "Storage extras", "never,active,per-user"},
     {"--acls", "T", "switch", "ACLs", "Accept ACLs on buckets that have no ownership controls; otherwise the bucket owner owns everything.", "Storage extras"},
     {"--notify-targets", "T", "path", "Webhooks", "The webhooks event notifications may go to.", "Storage extras"},
-    {"--replication-targets", "T", "path", "Replication targets", "The S3 endpoints buckets may replicate to.", "Storage extras"},
+    {"--replication-targets", "T", "path", "Replication targets", "The S3 endpoints buckets may replicate to; only an admin may name one.", "Storage extras"},
     {"--tiers", "T", "path", "Tiers", "The S3 endpoints lifecycle may move versions to.", "Storage extras"},
     {"--federation", "T", "path", "Federation", "The OIDC provider and LDAP directory STS trusts.", "Storage extras"},
     {"--nodes", "T", "path", "Cluster nodes", "Make it a node of a storage cluster.", "Storage extras"},

@@ -21,6 +21,8 @@
 #               FAILED for a destination user that may not replicate and for a
 #               destination bucket that is not there; replication_pending,
 #               _completed, _failed, _retries and _bytes in stats
+#   admin       naming a --replication-targets line is an admin's: a user that owns its bucket, and one a bucket
+#               policy grants s3:PutReplicationConfiguration, are refused AccessDenied; an admin's put is taken
 #   policy      a destination user allowed s3:ReplicateObject,
 #               s3:ReplicateDelete and s3:ReplicateTags only: its copies land, its own writes and
 #               reads are refused; a user that may only read cannot write a
@@ -61,6 +63,8 @@ export REPL_AK="AKIAREPLICATOR000001"
 export REPL_SK="repl/user/secret/1"
 export READ_AK="AKIAREPLREADER000001"
 export READ_SK="repl/reader/secret/1"
+export PLAIN_AK="AKIAREPLPLAIN0000001"
+export PLAIN_SK="repl/plain/secret/1"
 # A test aid read by the resolver thread before the system resolver, so a target can be named by a host.
 export SOCKETLEY_STORAGE_REPLICATION_HOSTS="$SOCKETLEY_TMPD/hosts"
 echo "replica.test 127.0.0.1" > "$SOCKETLEY_STORAGE_REPLICATION_HOSTS"
@@ -125,6 +129,9 @@ $REPL_AK:$REPL_SK
 [reader]
 policy = {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::*/*"}]}
 $READ_AK:$READ_SK
+
+[plain]
+$PLAIN_AK:$PLAIN_SK
 EOF
 TARGETS="$SOCKETLEY_TMPD/targets"
 cat > "$TARGETS" <<EOF
@@ -176,6 +183,7 @@ run_lib "the policy half ran" policy "$PD"
 run_lib "the down half ran" down "$PS" "$PD"
 run_lib "the crash half ran" crash "$PS" "$PD" "$PSLOW" "$DATA"
 run_lib "the loop half ran" loop "$PS" "$PD"
+run_lib "the admin half ran" admin "$PD"
 
 # ── two shards ──────────────────────────────────────────────────────────────
 SOCK="$SOCKETLEY_TMPD/rshard.sock"
