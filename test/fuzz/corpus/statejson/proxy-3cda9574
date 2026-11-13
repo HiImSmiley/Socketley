@@ -1,0 +1,1 @@
+{"name": "p", "type": "proxy", "port": 8080, "backends": ["127.0.0.1:1", "@grp", "unix:/x"], "strategy": "round-robin", "retry_count": 2, "health_path": "/h", "compress": true}

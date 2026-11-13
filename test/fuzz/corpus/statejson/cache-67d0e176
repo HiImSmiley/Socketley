@@ -1,0 +1,1 @@
+{"name": "c", "type": "cache", "port": 6379, "max_memory": 1048576, "eviction": "allkeys-lru", "resp_forced": true, "replicate_target": "127.0.0.1:6380"}

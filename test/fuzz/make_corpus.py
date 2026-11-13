@@ -3127,6 +3127,111 @@ def mailsessions_seeds():
     seeds["api_deep"] = bytes([3, 0]) + b"{\"methodCalls\":" + b"[" * 200 + b"]" * 200 + b"}"
     return seeds
 
+def statejson_seeds():
+    # A type byte (0x80 and up: none assumed), then a document as a state file or an import holds it.
+    def doc(t, obj):
+        return bytes([t]) + json.dumps(obj).encode()
+    return {
+        "server": doc(0, {"name": "s", "id": "1a2b", "type": "server", "port": 9000, "was_running": True,
+                          "log_file": "/var/log/s.log", "lua_script": "/etc/s.lua", "mode": "inout",
+                          "http_dir": "/srv", "origins": "a.test,b.test", "extra": {"k": "v", "q": "a\"b"}}),
+        "proxy": doc(2, {"name": "p", "type": "proxy", "port": 8080, "backends": ["127.0.0.1:1", "@grp", "unix:/x"],
+                         "strategy": "round-robin", "retry_count": 2, "health_path": "/h", "compress": True}),
+        "cache": doc(3, {"name": "c", "type": "cache", "port": 6379, "max_memory": 1048576, "eviction": "allkeys-lru",
+                         "resp_forced": True, "replicate_target": "127.0.0.1:6380"}),
+        "storage": doc(4, {"name": "st", "type": "storage", "port": 9100, "dir": "/data", "replication_targets": "/t",
+                           "max_bytes": 18446744073709551615, "fsync": "interval", "fsync_interval": 1.5}),
+        "mqtt": doc(9, {"name": "m", "type": "mqtt", "port": 1883, "session_queue": 1000, "retained_max": 67108864,
+                        "queue_max": 67108864, "max_sessions": 4294967296, "keepalive_max": 70000}),
+        "mail_no_type": doc(10, {"name": "ml", "port": 25, "mail_domain": "example.test", "imap": 143}),
+        "unix_listen": doc(0x80, {"name": "u", "type": "web", "listen": "unix:/run/x.sock", "bind": "::1"}),
+        "escapes": bytes([0]) + b'{"name":"e\u0001\u00ff\ud83d\ude00","log_file":"a\\b\/c\n","id":"\u12"}',
+        "numbers": bytes([0]) + b'{"name":"n","port":-1,"retry_count":80abc,"max_memory":-5,"fsync_interval":NaN,'
+                                b'"keepalive_max":1e400,"session_queue":0x10}',
+        "keys_in_values": bytes([0]) + b'{"name":"\"port\":1","note":"\"name\": \"x\"","port":7}',
+        "nested": bytes([0]) + b'{"name":"d","extra":{"a":{"b":["c",{"d":"}"]}},"port":1},"backends":["]",",","\""]}',
+        "duplicate_keys": bytes([0]) + b'{"name":"a","name":"b","port":1,"port":2}',
+        "truncated": bytes([0]) + b'{"name":"t","backends":["a","b',
+        "not_an_object": bytes([0]) + b'["name","x"]',
+        "empty": bytes([0x80]) + b"{}",
+        "whitespace": bytes([1]) + b' \t\n{ "name" :\r\n "w" , "port" : 5 } ',
+        "deep": bytes([0]) + b'{"extra":' + b"[" * 3000 + b"]" * 3000 + b'}',
+        "long_string": bytes([0]) + b'{"name":"' + b"x" * 20000 + b'"}',
+    }
+
+def wsreassembly_seeds():
+    # A read-size byte, a --read-buffer byte (64, 128 or 192 KiB), then per frame a kind and a length (0xF0 and up: two bytes more).
+    TEXT, BIN, FIRST_T, FIRST_B, MID, LAST, PING, PONG, CLOSE, UNMASKED, RESOP, RESBIT, BADTEXT = range(13)
+    def seed(chunk, cap, *frames):
+        out = bytes([chunk, cap])
+        for f in frames:
+            out += bytes(f)
+        return out
+    return {
+        "one_text": seed(0, 0, (TEXT, 5)),
+        "fragments": seed(0, 0, (FIRST_T, 3), (MID, 4), (LAST, 2), (BIN, 9)),
+        "control_between": seed(3, 0, (FIRST_B, 3), (PING, 4), (MID, 2), (PONG, 0), (LAST, 3)),
+        "byte_at_a_time": seed(0xff, 5, (FIRST_T, 10), (PING, 125), (LAST, 10), (TEXT, 1)),
+        "empty_fragments": seed(0, 0, (FIRST_T, 0), (MID, 0), (LAST, 0), (TEXT, 0), (BIN, 1)),
+        "close_mid_message": seed(0, 0, (FIRST_T, 3), (CLOSE, 2), (LAST, 3)),
+        "close_empty": seed(0, 0, (TEXT, 2), (CLOSE, 0)),
+        "continuation_alone": seed(0, 0, (TEXT, 2), (MID, 2)),
+        "message_inside_message": seed(0, 0, (FIRST_B, 2), (TEXT, 2)),
+        "unmasked": seed(0, 0, (TEXT, 3), (UNMASKED, 3)),
+        "reserved_opcode": seed(0, 0, (RESOP, 1)),
+        "reserved_bit": seed(0, 0, (BIN, 1), (RESBIT, 1)),
+        "bad_text_whole": seed(0, 0, (BADTEXT, 4)),
+        "bad_text_fragmented": seed(0, 0, (FIRST_T, 2), (BADTEXT, 2)),
+        "big_one_read": seed(0x40, 3, (BIN, 0xF4, 200)),
+        "big_over_cap": seed(0xff, 0, (FIRST_B, 0xFF, 255), *[(MID, 0xFF, 255)] * 11, (LAST, 4)),
+        "big_under_cap": seed(0xff, 2, (FIRST_B, 0xFF, 255), *[(MID, 0xFF, 255)] * 11, (LAST, 4), (TEXT, 3)),
+        "many_small": seed(7, 1, *[(TEXT, i % 30) for i in range(120)]),
+        "pings_only": seed(1, 0, *[(PING, 125)] * 40),
+    }
+
+def respdispatch_seeds():
+    # A read-size byte, then per command a name byte (an index into the table), an argument count and per argument a
+    # pick byte (0xE0 and up: a run of the input's bytes, its length first), and a byte whose low bit upper-cases it.
+    # The name bytes stand for different commands as the table grows, which a generator's input is free to do.
+    import random
+    rnd = random.Random(4242)
+    out = {}
+    for i in range(24):
+        b = bytearray([rnd.randrange(256)])
+        for _ in range(rnd.randrange(1, 12)):
+            b.append(rnd.randrange(256))
+            argc = rnd.randrange(7)
+            b.append(argc)
+            for _ in range(argc):
+                if rnd.random() < 0.15:
+                    b += bytes([0xE0 + rnd.randrange(32), rnd.randrange(40)])
+                    b += bytes(rnd.randrange(256) for _ in range(rnd.randrange(12)))
+                else:
+                    b.append(rnd.randrange(0xE0))
+            b.append(rnd.randrange(2))
+        out["program_%02d" % i] = bytes(b)
+    # Every name in turn with two plain arguments, so each command is reached once from the corpus alone.
+    for start in range(0, 256, 32):
+        b = bytearray([0])
+        for n in range(start, start + 32):
+            b += bytes([n, 2, n % 0xE0, (n * 7) % 0xE0, 0])
+        out["every_name_%03d" % start] = bytes(b)
+    return out
+
+def sievebudget_seeds():
+    # A program for the script and message generator in fuzz_sieve_budget.cpp: the message's chunk, how often the
+    # subject and body repeat it and how many Received headers it has, then the statements.
+    import random
+    rnd = random.Random(1007)
+    out = {}
+    for i in range(20):
+        out["program_%02d" % i] = bytes(rnd.randrange(256) for _ in range(rnd.randrange(40, 600)))
+    # Long subject of stars, a body of a megabyte, many :matches.
+    out["stars_long_message"] = bytes([20, 4, 4, 4, 4, 4, 255, 63, 255, 255]) + bytes([32]) + bytes([2, 0, 0, 3, 24] * 40)
+    out["variables_doubling"] = bytes([2, 0, 0, 1, 1, 1, 1, 1]) + bytes([32]) + bytes([1, 0, 1, 1, 1, 2, 1, 0] * 30)
+    out["includes"] = bytes([2, 0, 0, 1, 1, 1, 1, 1, 8]) + bytes([6, 6, 6, 6, 6, 6, 6, 6] * 8)
+    return out
+
 def h2session_seeds():
     import struct
     def fr(t, flags, sid, payload=b""):
@@ -3217,7 +3322,11 @@ def main(argv):
                         ("sshcert", sshcert_seeds()),
                         ("httpcodecs", httpcodecs_seeds()),
                         ("mailsessions", mailsessions_seeds()),
-                        ("h2session", h2session_seeds())):
+                        ("h2session", h2session_seeds()),
+                        ("statejson", statejson_seeds()),
+                        ("wsreassembly", wsreassembly_seeds()),
+                        ("respdispatch", respdispatch_seeds()),
+                        ("sievebudget", sievebudget_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

@@ -191,9 +191,13 @@ declare -A CORPUS=(
     [fuzz_storage_parsers]=storageparsers
     [fuzz_mail_sessions]=mailsessions
     [fuzz_h2_session]=h2session
+    [fuzz_state_json]=statejson
+    [fuzz_ws_reassembly]=wsreassembly
+    [fuzz_resp_dispatch]=respdispatch
+    [fuzz_sieve_budget]=sievebudget
 )
 
-read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_http_codecs fuzz_db fuzz_fastcgi fuzz_lua_json fuzz_mcp fuzz_storage_parsers fuzz_mail_sessions fuzz_h2_session}"
+read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_metrics_text fuzz_metrics_query fuzz_metrics_rules fuzz_metrics_remote fuzz_mqtt fuzz_mail fuzz_proxy_tunnel fuzz_tunnel_mux fuzz_ssh_cert fuzz_metrics_chunk fuzz_http_codecs fuzz_db fuzz_fastcgi fuzz_lua_json fuzz_mcp fuzz_storage_parsers fuzz_mail_sessions fuzz_h2_session fuzz_state_json fuzz_ws_reassembly fuzz_resp_dispatch fuzz_sieve_budget}"
 
 # The pinned configurations the proxy seed corpus is replayed over, on top of
 # the default run.  ';' separated because the values themselves are comma

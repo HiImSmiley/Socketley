@@ -1,0 +1,1 @@
+{"name": "st", "type": "storage", "port": 9100, "dir": "/data", "replication_targets": "/t", "max_bytes": 18446744073709551615, "fsync": "interval", "fsync_interval": 1.5}

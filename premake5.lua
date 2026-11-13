@@ -1529,6 +1529,29 @@ project "fuzz_h2_session"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the Sieve interpreter's step budget, over scripts and messages made to cost ───
+
+project "fuzz_sieve_budget"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_sieve_budget.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/mail/mail_sieve.cpp",
+        "socketley/runtime/mail/mail_compose.cpp",
+        "socketley/runtime/mail/mail_mime.cpp",
+        "socketley/runtime/mail/smtp_session.cpp",
+        "socketley/shared/util/base64.cpp"
+    }
+    links(tls_libs())
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: the IMAP and JMAP conversations, over a store the target keeps in memory ───
 
 project "fuzz_mail_sessions"
@@ -2066,6 +2089,87 @@ project "fuzz_http_request"
 -- clang build in test/fuzz/build_libfuzzer.sh compiles its own copy of the SDK
 -- and does define it, so the in-tree pool-safety and reachability assertions are
 -- live there.  The harness's own equivalents run in both.
+
+-- ─── Fuzz: the state file's JSON reader, a document read, written and read again ───
+
+project "fuzz_state_json"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs {
+        ".",
+        "socketley",
+        "test/fuzz",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "sdk/include/linux"
+    }
+
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
+
+    files {
+        "test/fuzz/fuzz_state_json.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
+-- ─── Fuzz: a server's WebSocket reassembly, driven on a connection with no socket ───
+
+project "fuzz_ws_reassembly"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs {
+        ".",
+        "socketley",
+        "test/fuzz",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "sdk/include/linux"
+    }
+
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
+
+    files {
+        "test/fuzz/fuzz_ws_reassembly.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
+
+-- ─── Fuzz: the cache's RESP command dispatch, every command of the table it answers COMMAND from ───
+
+project "fuzz_resp_dispatch"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs {
+        ".",
+        "socketley",
+        "test/fuzz",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "sdk/include/linux"
+    }
+
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
+
+    files {
+        "test/fuzz/fuzz_resp_dispatch.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h"
+    }
+
+    fuzz_target_settings()
 
 project "fuzz_server_ops"
     kind "ConsoleApp"
