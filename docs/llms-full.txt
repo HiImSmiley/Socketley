@@ -2471,6 +2471,10 @@ Inherited by worker processes, which have no command line of their own.
 
 Sets the interval in milliseconds between periodic sweeps for expired cache keys. Default: **500**. This never affects correctness: an expired key is not served no matter when the sweep runs, because every read path checks the expiry itself. The interval controls only how quickly keys that are never accessed again release their memory.
 
+#### `SOCKETLEY_CACHE_DUMP_STALL_MS`
+
+How long in milliseconds a full dump on its way to a follower may move nothing before it is given up. Default: **60000**. A cache sends at most two copies of its dataset to followers at once, a shard of a sharded follower counting as its share of one, and tells a third **replicate** that it is busy; the follower dials again. A dump nobody reads is given up when a follower asks once it has stood this long, so a client that sends **replicate** and never reads does not keep followers out.
+
 #### `SOCKETLEY_CACHE_SNAPSHOT_MB`
 
 Sets how many MiB a cache shard's journal (**--persistent-interval**) may hold before the shard snapshots, unless its last dump is larger, in which case that size is the bound. Default: **64**. The snapshot is written by a forked child, so the shard goes on serving; the journal is then cut to what came after the snapshot began.
@@ -3604,6 +3608,7 @@ Every flag a metrics runtime takes, by group.
 | `--keep` | duration | Keep: How long the raw samples are kept. |
 | `--downsample` | text | Tiers: Coarser tiers kept for longer, as step:keep pairs separated by commas, or none. |
 | `--max-series` | int | Max series: The most series it keeps; a new one past it is refused and counted. |
+| `--query-timeout` | duration | Query timeout: How long one query may hold the runtime's loop before it is ended. |
 | `--durable` |  | Durable: Log every sample as it comes, so a crash loses none. |
 | `--no-local` |  | No local feed: Leave this daemon's own series out. |
 | `--keys` | path | Keys: Service keys Grafana or a script sends as Bearer or Basic, one name and secret per line. |
@@ -4890,6 +4895,7 @@ Every flag of every runtime type, with the types that take it.
 | `--keep` | duration | Keep: How long the raw samples are kept. Types: metrics. |
 | `--downsample` | text | Tiers: Coarser tiers kept for longer, as step:keep pairs separated by commas, or none. Types: metrics. |
 | `--max-series` | int | Max series: The most series it keeps; a new one past it is refused and counted. Types: metrics. |
+| `--query-timeout` | duration | Query timeout: How long one query may hold the runtime's loop before it is ended. Types: metrics. |
 | `--durable` |  | Durable: Log every sample as it comes, so a crash loses none. Types: metrics. |
 | `--no-local` |  | No local feed: Leave this daemon's own series out. Types: metrics. |
 | `--keys` | path | Keys: Service keys Grafana or a script sends as Bearer or Basic, one name and secret per line. Types: metrics. |
@@ -5659,7 +5665,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [MQTT flags](man-mqtt-flags.txt) (16 entries)
 - [Mail flags](man-mail-flags.txt) (43 entries)
 - [Tunnel flags](man-tunnel-flags.txt) (9 entries)
-- [Metrics flags](man-metrics-flags.txt) (18 entries)
+- [Metrics flags](man-metrics-flags.txt) (19 entries)
 - [MCP flags](man-mcp-flags.txt) (7 entries)
 - [Web flags](man-web-flags.txt) (6 entries)
 - [Registered types](man-registered-types.txt)
@@ -5671,7 +5677,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [Cluster mode](man-cluster-mode.txt)
 - [Installation](man-installation.txt)
 - [State persistence](man-state-persistence.txt)
-- [Environment](man-environment.txt) (93 entries)
+- [Environment](man-environment.txt) (94 entries)
 - [Files](man-files.txt)
 - [SDK](man-sdk.txt) (3 entries)
 - [Limitations](man-limitations.txt)
@@ -11140,7 +11146,7 @@ Over TLS 1.3, the first packet of 256 KiB or more that a client is sent hands it
 - QoS 0, 1 and 2. QoS 2 is delivered exactly once, by its packet identifier.
 - Retained messages, cleared by an empty one.
 - Topics and filters of at most 256 levels. A SUBSCRIBE to a deeper filter is refused for it (0x8F), and a PUBLISH to a deeper topic ends the connection.
-- A session holds at most 10,000 filters of at most 1 MiB together. A SUBSCRIBE past that is refused for the filters that do not fit (0x97, quota exceeded, or 0x80 to 3.1.1). Retained messages are sent once for each filter a SUBSCRIBE names, and at QoS 0 none past the subscriber's write limit, which they would be dropped by.
+- A session holds at most 10,000 filters of at most 1 MiB together. A SUBSCRIBE past that is refused for the filters that do not fit (0x97, quota exceeded, or 0x80 to 3.1.1). Retained messages are sent once for each filter a SUBSCRIBE names, and at QoS 0 none past the subscriber's write limit, which they would be dropped by. The filters of one SUBSCRIBE walk the retained messages at most four times over together; the filters after that are granted and sent no retained messages, counted as **retained_cut**.
 - Wills. A will is sent when a connection is lost, or when a 5.0 client disconnects and asks for it. It is not sent when the client disconnects cleanly. A 5.0 will delay is waited out if one is given, and the will is not sent at all when the client comes back within it.
 - Sessions, kept by 3.1.1's clean session 0 and by 5.0's session expiry. A client id has one connection. A second connection takes the session over, and the first is told so. A session belongs to its user, so a CONNECT under another user (or none) is refused as not authorized.
 - Keep alive: a client that is silent for one and a half times its keep alive is disconnected.
@@ -11959,6 +11965,10 @@ The coarser tiers, each a step and how long it is kept. Default: 5m:1y,1h:5y; **
 ### `--max-series n`
 
 The most series the runtime holds at once. Default: 200000. A new series past the limit is refused and counted in **socketley_metrics_series_refused_total**. So one target that sends a label per request cannot take the machine's memory.
+
+### `--query-timeout duration`
+
+How long one query of the API may run, from 1s to 2m. Default: 5s. A query runs on the runtime's loop, which also scrapes, takes remote_write and evaluates the rules, so a longer one would hold all of those for as long. One that runs out is answered 503 with **errorType** timeout**,** as Prometheus answers one past its query timeout; that includes the regexes of its selectors over the label values, and **/api/v1/series** and **/api/v1/labels**. Rules have 5 seconds each, whatever this says.
 
 ### `--durable`
 
@@ -15032,6 +15042,10 @@ Inherited by worker processes, which have no command line of their own.
 ### `SOCKETLEY_CACHE_TTL_SWEEP_MS`
 
 Sets the interval in milliseconds between periodic sweeps for expired cache keys. Default: **500**. This never affects correctness: an expired key is not served no matter when the sweep runs, because every read path checks the expiry itself. The interval controls only how quickly keys that are never accessed again release their memory.
+
+### `SOCKETLEY_CACHE_DUMP_STALL_MS`
+
+How long in milliseconds a full dump on its way to a follower may move nothing before it is given up. Default: **60000**. A cache sends at most two copies of its dataset to followers at once, a shard of a sharded follower counting as its share of one, and tells a third **replicate** that it is busy; the follower dials again. A dump nobody reads is given up when a follower asks once it has stood this long, so a client that sends **replicate** and never reads does not keep followers out.
 
 ### `SOCKETLEY_CACHE_SNAPSHOT_MB`
 

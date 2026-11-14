@@ -57,6 +57,7 @@ Every flag a metrics runtime takes, by group.
 | `--keep` | duration | Keep: How long the raw samples are kept. |
 | `--downsample` | text | Tiers: Coarser tiers kept for longer, as step:keep pairs separated by commas, or none. |
 | `--max-series` | int | Max series: The most series it keeps; a new one past it is refused and counted. |
+| `--query-timeout` | duration | Query timeout: How long one query may hold the runtime's loop before it is ended. |
 | `--durable` |  | Durable: Log every sample as it comes, so a crash loses none. |
 | `--no-local` |  | No local feed: Leave this daemon's own series out. |
 | `--keys` | path | Keys: Service keys Grafana or a script sends as Bearer or Basic, one name and secret per line. |

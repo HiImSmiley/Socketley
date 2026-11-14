@@ -63,6 +63,10 @@ The coarser tiers, each a step and how long it is kept. Default: 5m:1y,1h:5y; **
 
 The most series the runtime holds at once. Default: 200000. A new series past the limit is refused and counted in **socketley_metrics_series_refused_total**. So one target that sends a label per request cannot take the machine's memory.
 
+### `--query-timeout duration`
+
+How long one query of the API may run, from 1s to 2m. Default: 5s. A query runs on the runtime's loop, which also scrapes, takes remote_write and evaluates the rules, so a longer one would hold all of those for as long. One that runs out is answered 503 with **errorType** timeout**,** as Prometheus answers one past its query timeout; that includes the regexes of its selectors over the label values, and **/api/v1/series** and **/api/v1/labels**. Rules have 5 seconds each, whatever this says.
+
 ### `--durable`
 
 Logs every sample as it arrives, so a crash loses none. Without it, a crash loses what the open chunks hold, and a stop loses nothing.

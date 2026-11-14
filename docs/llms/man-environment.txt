@@ -420,6 +420,10 @@ Inherited by worker processes, which have no command line of their own.
 
 Sets the interval in milliseconds between periodic sweeps for expired cache keys. Default: **500**. This never affects correctness: an expired key is not served no matter when the sweep runs, because every read path checks the expiry itself. The interval controls only how quickly keys that are never accessed again release their memory.
 
+### `SOCKETLEY_CACHE_DUMP_STALL_MS`
+
+How long in milliseconds a full dump on its way to a follower may move nothing before it is given up. Default: **60000**. A cache sends at most two copies of its dataset to followers at once, a shard of a sharded follower counting as its share of one, and tells a third **replicate** that it is busy; the follower dials again. A dump nobody reads is given up when a follower asks once it has stood this long, so a client that sends **replicate** and never reads does not keep followers out.
+
 ### `SOCKETLEY_CACHE_SNAPSHOT_MB`
 
 Sets how many MiB a cache shard's journal (**--persistent-interval**) may hold before the shard snapshots, unless its last dump is larger, in which case that size is the bound. Default: **64**. The snapshot is written by a forked child, so the shard goes on serving; the journal is then cut to what came after the snapshot began.
