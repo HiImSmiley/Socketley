@@ -4778,8 +4778,9 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     }
 
     // The client leg's rule on this one: a stream turns it over to splice, which starts once the client has taken
-    // what is queued for it.
-    if (m_protocol == protocol_tcp && !m_splice_enabled && !multishot_more && !conn->splice_active &&
+    // what is queued for it -- and on an HTTP proxy, a tunnel's backend leg is that stream.
+    if ((m_protocol == protocol_tcp || (m_protocol == protocol_http && conn->http_frame.switched_protocols)) &&
+        !m_splice_enabled && !multishot_more && !conn->splice_active &&
         !conn->closing && conn->client_fd >= 0 && conn->client_fd < MAX_FDS &&
         m_conn_idx[conn->client_fd].side == conn_client)
     {
@@ -7356,7 +7357,11 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 bool proxy_instance::splice_eligible(proxy_client_connection* conn, const proxy_backend_connection* bconn,
                                      bool client_side)
 {
-    if (m_protocol != protocol_tcp || bconn->ssl != nullptr || conn->h2_parent != nullptr ||
+    // An HTTP proxy's pair is a byte stream once a 101 has made it a tunnel, and splices as a TCP proxy's does.
+    const bool stream = m_protocol == protocol_tcp ||
+                        (m_protocol == protocol_http && conn_tunnelled(conn) && !m_cb_on_proxy_request &&
+                         !m_cb_on_proxy_response);
+    if (!stream || bconn->ssl != nullptr || conn->h2_parent != nullptr ||
         conn->h3s != nullptr || m_fastcgi || conn->rl_max > 0 || get_global_rate_limit() > 0.0 ||
         on_fast_lo(conn->fd, bconn->fd))
         return false;
