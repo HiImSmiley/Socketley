@@ -470,6 +470,9 @@ struct alignas(64) proxy_backend_connection
     uint8_t drained_reads{0};
     // Sends refused for memory in a row, which sets how long the next one waits.
     uint8_t send_retries{0};
+    // take_body_behind_head's tries left before it stops looking on this socket, and the answers since it stopped.
+    uint8_t body_tries{4};
+    uint8_t body_rest{0};
     // As on the client side: this side's reads go by splice, and what turns them over and back.
     bool splice_active{false};
     bool splice_in_pending{false};
@@ -1148,6 +1151,11 @@ private:
     bool forward_to_client(proxy_backend_connection* conn, std::string_view data,
                            int lent_buf = -1, bool last = false);
     bool send_final_and_fin(proxy_client_connection* cconn, std::string_view data);
+    // The rest of an answer whose first read is in hand, read off the socket when it is already there, so both leave
+    // in one send and wake the client once; empty when none was there.
+    std::string_view take_body_behind_head(proxy_backend_connection* conn, int fd, size_t head_len, bool more_waiting);
+    // forward_to_client for that first read and the rest take_body_behind_head read, as one send.
+    void forward_head_and_body(proxy_backend_connection* conn, std::string_view head, std::string_view body);
 
     // Mark both sides of a pair whose response an on_proxy_response hook
     // refused, because handle_backend_read is gated on the backend's flag and

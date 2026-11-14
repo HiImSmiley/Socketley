@@ -17,6 +17,7 @@
 #include "../../shared/http/status.h"
 #include "../../shared/net/peer_address.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/thread_buffer.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/http/cookie.h"
 #include "../idp/idp_logic.h"
@@ -393,6 +394,8 @@ void proxy_backend_connection::reset(int new_fd)
     idle_since = {};
     drained_reads = 0;
     send_retries = 0;
+    body_tries = 4;
+    body_rest = 0;
     pool_abandoned = false;
     pool_backend_idx = 0;
     pool_host.clear();
@@ -4677,6 +4680,20 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         }
     }
 
+    std::string_view body_behind;
+    if (m_protocol == protocol_http && first_bytes && forward_len == data_len && !is_multishot_recv &&
+        !conn->read_pending && !conn->splice_active && conn->ssl == nullptr && conn->fcgi == nullptr)
+    {
+        body_behind = take_body_behind_head(conn, fd, data_len, !drained);
+        if (!body_behind.empty())
+        {
+            http_response_scan_chunk(conn->http_frame, body_behind);
+            const size_t excess = conn->http_frame.excess_in_chunk;
+            if (SOCKETLEY_UNLIKELY(excess > 0 && excess <= body_behind.size()))
+                body_behind.remove_suffix(excess);
+        }
+    }
+
     // A client that asked to close is told close, where a pooled backend says
     // keep-alive, and an entrance speaking TLS tells browsers to come back over
     // it alone (HSTS) -- when the whole final head came in this first read,
@@ -4715,10 +4732,14 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     if (response_ends && conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
         if (const auto& ce = m_conn_idx[conn->client_fd]; ce.side == conn_client)
             m_lat_request.observe(ce.client->ex.began_ns, socketley::turn_clock::now_ns());
-    const bool lent = closing_head.empty()
-        ? forward_to_client(conn, {data_ptr, forward_len},
-                            lendable_buf(is_provided, buf_id, forward_len), response_ends)
-        : forward_to_client(conn, closing_head, -1, response_ends);
+    bool lent = false;
+    if (!body_behind.empty())
+        forward_head_and_body(conn, {data_ptr, forward_len}, body_behind);
+    else
+        lent = closing_head.empty()
+            ? forward_to_client(conn, {data_ptr, forward_len},
+                                lendable_buf(is_provided, buf_id, forward_len), response_ends)
+            : forward_to_client(conn, closing_head, -1, response_ends);
 
     // The response framing decides both whether the socket may be pooled and
     // how much of this chunk the client may see, which were one question all
@@ -11493,6 +11514,106 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     if (!cconn->write_pending && !flush_client_write_queue(cconn))
         cconn->closing = true;
     return lent;
+}
+
+// ─── THE FIRST READ OF AN ANSWER AND ITS REST IN ONE SEND ────────────────────
+// An answer that does not fit the first read went to the client in two sends and woke it twice: a 64 KiB file is a
+// full ring buffer and then the last 252 bytes, and a backend that writes its head before its body sends the head
+// alone.  So the rest of a body of known length is read off the socket while the first read is in hand -- never past
+// the answer's end -- when the kernel said more was waiting, or the head came alone and the body may be right behind
+// it, which a socket that had nothing there four times running is asked once in 64 answers after.
+std::string_view proxy_instance::take_body_behind_head(proxy_backend_connection* conn, int fd, size_t head_len,
+                                                       bool more_waiting)
+{
+    static constexpr size_t head_alone_max = 16 * 1024;
+    const http_response_framing& f = conn->http_frame;
+    if ((!more_waiting && head_len > head_alone_max) || !f.headers_parsed || !f.has_content_length || f.chunked ||
+        f.transfer_encoding || f.no_body || f.body_remaining == 0 || f.interim_blocks != 0 || f.switched_protocols ||
+        conn->client_fd < 0 || conn->client_fd >= MAX_FDS)
+        return {};
+    const proxy_conn_entry& ce = m_conn_idx[conn->client_fd];
+    if (ce.side != conn_client)
+        return {};
+    const proxy_client_connection* c = ce.client;
+    // The client must be one forward_head_and_body can write to as forward_to_client would: plain, ours, staying
+    // open, its head passed on unchanged and no hook between.
+    if (c->ex.backend_fd != fd || c->closing || c->ssl != nullptr || c->h2_parent != nullptr || c->h3s != nullptr ||
+        c->ex.client_conn_close || c->client_eof || (m_entrance && get_tls()) || !m_alt_svc.empty() ||
+        m_cb_on_proxy_response)
+        return {};
+#ifndef SOCKETLEY_NO_LUA
+    if (auto* lctx = lua(); lctx && lctx->has_on_proxy_response())
+        return {};
+#endif
+    if (!more_waiting && conn->body_tries == 0)
+    {
+        if (++conn->body_rest < 64)
+            return {};
+        conn->body_rest = 0;
+        conn->body_tries = 1;
+    }
+    struct body_site;
+    char* const buf = socketley::thread_buffer<char, PROXY_READ_BUF_SIZE, body_site>();
+    const ssize_t n = ::recv(fd, buf, std::min<size_t>(f.body_remaining, PROXY_READ_BUF_SIZE), MSG_DONTWAIT);
+    if (n > 0)
+    {
+        if (!more_waiting)
+            conn->body_tries = 4;
+#ifdef SOCKETLEY_INVARIANTS
+        inv_check_progress(fd, static_cast<int>(n), op_read, "proxy::take_body_behind_head");
+#endif
+        return {buf, static_cast<size_t>(n)};
+    }
+    // A failure is reported once and the read armed next sees only the end, so the breaker hears it here.
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+        note_backend_failure(ce.client);
+    else if (n < 0 && !more_waiting && conn->body_tries > 0)
+        --conn->body_tries;
+    return {};
+}
+
+void proxy_instance::forward_head_and_body(proxy_backend_connection* conn, std::string_view head,
+                                           std::string_view body)
+{
+    auto* cconn = m_conn_idx[conn->client_fd].client;
+    if (SOCKETLEY_UNLIKELY(cconn->write_queue.bytes() >= write_buffer_bytes()))
+    {
+        cconn->closing = true;
+        return;
+    }
+    stat_add(m_stat_bytes_out, head.size() + body.size());
+    size_t sent = 0;
+    if (!cconn->write_pending && cconn->write_queue.empty() && !cconn->splice_active && cconn->fd >= 0)
+    {
+        struct iovec iov[2] = { { const_cast<char*>(head.data()), head.size() },
+                                { const_cast<char*>(body.data()), body.size() } };
+        struct msghdr mh{};
+        mh.msg_iov    = iov;
+        mh.msg_iovlen = 2;
+        const ssize_t n = ::sendmsg(cconn->fd, &mh, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0)
+        {
+            sent = static_cast<size_t>(n);
+#ifdef SOCKETLEY_INVARIANTS
+            inv_check_progress(cconn->fd, static_cast<int>(n), op_write, "proxy::forward_head_and_body");
+#endif
+        }
+    }
+    if (sent == head.size() + body.size())
+        return;
+    // The body is in a scratch buffer the next answer reuses, so what the socket did not take is copied.
+    std::string rest;
+    rest.reserve(head.size() + body.size() - sent);
+    if (sent < head.size())
+    {
+        rest.append(head.substr(sent));
+        rest.append(body);
+    }
+    else
+        rest.append(body.substr(sent - head.size()));
+    cconn->write_queue.emplace(std::move(rest));
+    if (!cconn->write_pending && !flush_client_write_queue(cconn))
+        cconn->closing = true;
 }
 
 void proxy_instance::send_error(proxy_client_connection* conn, std::string_view status, std::string_view body,
