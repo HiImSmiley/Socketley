@@ -16300,10 +16300,11 @@ replicas and backups hold as they do on one shard. The number of shards may
 change across a restart, since the documents are one log whatever the number.
 .PP
 Every shard answers reads and queries. Writes wait for one disk, so the shards
-together take at most as many writes as one shard takes. Writes also cost more
-cores than on one shard, since each write that reaches another shard is handed
-on to shard 0, and its answer is handed back. A database that is mostly written
-is served best by one shard.
+together take about as many writes as one shard takes. Writes also cost more
+cores than on one shard, about two and a half times as many at four shards,
+since each write that reaches another shard is handed on to shard 0, and its
+answer is handed back. A database that is mostly written is served best by one
+shard.
 .PP
 Every request a reading shard takes reads the log on first. A shard that holds a
 stream is also told by shard 0 of each change that reaches the disk, so the
