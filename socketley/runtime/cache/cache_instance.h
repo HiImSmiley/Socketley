@@ -1233,6 +1233,11 @@ private:
     // Both report whether the submission reached the ring; see the definitions
     // for why a caller must not ignore that.
     bool flush_responses(client_connection* conn);
+    // A value at least this long is sent from the store with the replies ahead of it rather than copied behind them.
+    static constexpr size_t SEND_FROM_STORE_MIN = 64u * 1024u;
+    // Sends what the connection's reply buffer holds and then `value` as a bulk string, false when it may not and the
+    // caller encodes it as usual; what the socket does not take is left in the reply buffer, in order.
+    bool send_value_now(client_connection* conn, std::string_view value);
     void after_write(client_connection* conn, int fd);
     bool flush_write_queue(client_connection* conn);
     // The queue onto the socket as it is: a cleartext connection, or a TLS one whose send key the kernel holds.

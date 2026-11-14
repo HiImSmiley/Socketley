@@ -8619,6 +8619,72 @@ bool cache_instance::flush_responses(client_connection* conn)
     return true;
 }
 
+// The value goes out now, from the store, because a command later in the same read may change it; only the part the
+// socket does not take is copied, and only where nothing is queued, collected or encrypted ahead of it.
+bool cache_instance::send_value_now(client_connection* conn, std::string_view value)
+{
+    if (conn->fd < 0 || conn->ssl != nullptr || conn->closing || conn->in_exec || conn->in_multi || m_collect ||
+        !conn->batches.empty() || conn->write_pending || !conn->write_queue.empty() || !m_loop)
+        return false;
+#ifndef SOCKETLEY_NO_LUA
+    if (m_script_depth > 0)
+        return false;
+#endif
+    std::string& rb = conn->response_buf;
+    char head[32];
+    head[0] = '$';
+    const auto [end, ec] = std::to_chars(head + 1, head + sizeof(head) - 2, value.size());
+    char* he = end;
+    *he++ = '\r';
+    *he++ = '\n';
+    static constexpr char crlf[2] = {'\r', '\n'};
+    iovec iov[4] = {{rb.data(), rb.size()},
+                    {head, static_cast<size_t>(he - head)},
+                    {const_cast<char*>(value.data()), value.size()},
+                    {const_cast<char*>(crlf), sizeof(crlf)}};
+    msghdr m{};
+    m.msg_iov    = rb.empty() ? iov + 1 : iov;
+    m.msg_iovlen = rb.empty() ? 3 : 4;
+    ssize_t n = ::sendmsg(conn->fd, &m, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n < 0)
+    {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            return false;
+        n = 0;
+    }
+    size_t sent = static_cast<size_t>(n);
+    if (sent > 0)
+    {
+        SKL_TRACE_ADD(conn, writes, 1);
+        SKL_TRACE_ADD(conn, bytes_written, sent);
+        stat_add(m_stat_bytes_out, sent);
+    }
+    if (sent < rb.size())
+    {
+        rb.erase(0, sent);
+        sent = 0;
+    }
+    else
+    {
+        sent -= rb.size();
+        rb.clear();
+    }
+    for (size_t i = 1; i < 4; ++i)
+    {
+        if (sent >= iov[i].iov_len)
+        {
+            sent -= iov[i].iov_len;
+            continue;
+        }
+        rb.append(static_cast<const char*>(iov[i].iov_base) + sent, iov[i].iov_len - sent);
+        sent = 0;
+    }
+    // Every reply so far is out, which is what a batch's latency measures.
+    if (rb.empty())
+        m_lat_batch.observe(std::exchange(conn->batch_ns, 0), socketley::turn_clock::now_ns());
+    return true;
+}
+
 // Same contract as flush_responses above: false means nothing reached the ring
 // and no completion is owed, so the caller has to stop treating the connection
 // as one that is still going to be written to.
@@ -10286,6 +10352,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (SOCKETLEY_LIKELY(val != nullptr))
             {
                 m_stat_get_hits++;
+                if (SOCKETLEY_UNLIKELY(val->size() >= SEND_FROM_STORE_MIN) && send_value_now(conn, *val))
+                    break;
                 resp::encode_bulk_into(rb, *val);
             }
             else
