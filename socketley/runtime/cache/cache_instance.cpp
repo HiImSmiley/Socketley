@@ -13404,6 +13404,7 @@ void cache_instance::handle_follower_write(struct io_uring_cqe* cqe, follower_co
 
     // A short write is normal; only the acknowledged prefix may be dropped.
     size_t written = std::min(static_cast<size_t>(cqe->res), f.in_flight);
+    f.progress = std::chrono::steady_clock::now();
     f.out_off += written;
     f.sync_left -= std::min(f.sync_left, written);
     f.in_flight = 0;
@@ -13618,6 +13619,37 @@ void cache_instance::handle_replicate_request(client_connection* conn, std::stri
             shard_n > max_shards || shard_i >= shard_n)
         {
             conn->response_buf.append("error: usage: replicate [<shard> <shards>]\n");
+            return;
+        }
+    }
+
+    // A dump is the dataset, or a shard's slice of it, held here until the follower has taken it, and any client may
+    // ask for one: at most two datasets' worth are on their way at once, and a follower told so dials again.
+    const auto sending = [&] {
+        double n = 1.0 / shard_n;
+        for (const auto& f : m_followers)
+            if (!f->dead && f->sync_left > 0)
+                n += 1.0 / f->shard_n;
+        return n;
+    };
+    if (sending() > max_dumps_sending + 1e-9)
+    {
+        // A dump its follower has taken nothing of for a while is given up, its socket shut so the write in flight
+        // returns, or a client that never reads would keep every follower out.
+        const auto now = std::chrono::steady_clock::now();
+        const auto stall = std::chrono::milliseconds(
+            socketley::settings::number<long>("SOCKETLEY_CACHE_DUMP_STALL_MS").value_or(60'000));
+        for (auto& f : m_followers)
+            if (!f->dead && f->sync_left > 0 && now - f->progress > stall)
+            {
+                f->dead = true;
+                if (f->fd >= 0)
+                    ::shutdown(f->fd, SHUT_RDWR);
+            }
+        if (sending() > max_dumps_sending + 1e-9)
+        {
+            conn->response_buf.append("error: busy: two copies of the dataset are already on their way to followers, "
+                                      "dial again shortly\n");
             return;
         }
     }
@@ -13987,9 +14019,9 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
             continue;
         }
 
-        // A source that is not a primary answers `replicate` with an error and nothing else, so this link is for a
-        // replica that is not, or not yet, the one to follow.
-        if (m_role && !link.synced && line.starts_with("error:"))
+        // A source that is not a primary, or that is busy sending dumps, answers `replicate` with an error and nothing
+        // else, so this link is for a source to dial again.
+        if (!link.synced && line.starts_with("error:"))
         {
             link_refused = true;
             break;

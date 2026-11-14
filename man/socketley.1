@@ -25678,6 +25678,20 @@ Default:
 .B 0
 switches the bound off entirely: nothing is armed or written for a callback.
 LuaJIT's trace compiler is on either way. The budget is measured from the start
+.B SOCKETLEY_CACHE_DUMP_STALL_MS
+How long in milliseconds a full dump on its way to a follower may move nothing
+before it is given up.
+Default:
+.BR 60000 .
+A cache sends at most two copies of its dataset to followers at once, a shard
+of a sharded follower counting as its share of one, and tells a third
+.B replicate
+that it is busy; the follower dials again.
+A dump nobody reads is given up when a follower asks once it has stood this
+long, so a client that sends
+.B replicate
+and never reads does not keep followers out.
+.TP
 of the callback's loop turn and checked every 100 milliseconds, and a compiled
 callback that cannot be interrupted is ended by replacing its worker. See
 .BR "Callback Deadline" .

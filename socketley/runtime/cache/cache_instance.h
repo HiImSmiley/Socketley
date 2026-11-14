@@ -1531,6 +1531,8 @@ private:
         // The slice a shard of a sharded follower asked for; shard_n 1 is the whole stream.
         uint32_t shard_i{0};
         uint32_t shard_n{1};
+        // When the kernel last took bytes of it, which says whether a dump on its way is moving.
+        std::chrono::steady_clock::time_point progress{std::chrono::steady_clock::now()};
 
         size_t backlog() const { return out.size() - out_off + queued.size(); }
     };
@@ -1538,6 +1540,8 @@ private:
     // dump, past which it is dropped, because an explicit disconnect is
     // recoverable and a corrupted command stream is not.
     static constexpr size_t MAX_FOLLOWER_PENDING = 8 * 1024 * 1024;
+    // Full dumps being sent at once, in datasets: a shard of a follower of n shards takes 1/n of one.
+    static constexpr double max_dumps_sending = 2.0;
 
     // unique_ptr because the kernel holds a pointer to each write_req for the
     // lifetime of its operation; vector growth would move the elements.
