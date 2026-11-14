@@ -478,6 +478,17 @@ check "nor is the owner shared its own" "$(acc "$A" ann read)" 400
 check "none takes it away" "$(acc "$A" ben none) $(code -u "$B" "$U/~dav/docs/a/one.txt") $(names "$B" "")" "204 403 "
 check "and leaves the rest of the policy as it was" "$(s3 "$U/docs?policy" | python3 -c 'import json,sys; print([x["Sid"] for x in json.load(sys.stdin)["Statement"]])')" "['mine']"
 s3 -o /dev/null -X DELETE "$U/docs?policy"; s3 -o /dev/null -X DELETE "$U/docs/secret/x.txt"
+# A folder is listed as S3 lists it under its prefix, so a policy's s3:prefix condition reads the folder's.
+s3 -o /dev/null -X PUT "$U/homes"
+printf h | s3 -o /dev/null -X PUT -T - "$U/homes/ben/h.txt"
+printf o | s3 -o /dev/null -X PUT -T - "$U/homes/ann/o.txt"
+s3 -o /dev/null -X PUT "$U/homes?policy" -d '{"Version":"2012-10-17","Statement":[{"Sid":"home","Effect":"Allow","Principal":{"AWS":"arn:aws:iam:::user/ben"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::homes","Condition":{"StringLike":{"s3:prefix":"ben/*"}}}]}'
+check "S3 lets ben list his home by the policy's s3:prefix" "$(code --aws-sigv4 "aws:amz:us-east-1:s3" -u "$B" "$U/homes?list-type=2&prefix=ben/")" 200
+check "and so does DAV" "$(curl -s -u "$B" "$U/~dav/homes/ben/?list" | python3 -c 'import json,sys; print([f[0] for f in json.load(sys.stdin)["f"]])')" "['h.txt']"
+check "and its PROPFIND" "$(names "$B" homes/ben/)" "ben h.txt"
+check "but not another's home" "$(code -u "$B" "$U/~dav/homes/ann/?list")" 403
+check "nor the bucket's top" "$(code -u "$B" -X PROPFIND -H 'Depth: 1' "$U/~dav/homes/")" 403
+
 
 # A library deleted with its contents loses each file only as a policy lets that file be deleted.
 check "MKCOL makes a library to delete" "$(code -u "$A" -X MKCOL "$U/~dav/purged/")" 201

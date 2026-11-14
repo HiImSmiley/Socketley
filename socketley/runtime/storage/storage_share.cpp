@@ -985,7 +985,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
         return;
     }
     // A link gives what its maker may do, and nothing more.
-    if (!app_allowed(c, "GET", s.bucket, s.folder ? std::string_view{} : std::string_view(s.key)) ||
+    if (!(s.folder ? app_lists(c, s.bucket, s.key, false) : app_allowed(c, "GET", s.bucket, s.key)) ||
         (s.upload && !app_allowed(c, "PUT", s.bucket, s.key)) ||
         (s.burn && !app_allowed(c, "DELETE", s.bucket, s.key)))
     {

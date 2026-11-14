@@ -1507,7 +1507,7 @@ void storage_run::ui_taken(const std::shared_ptr<conn>& c)
         app_reply(c, 400, "Name a bucket, and a folder ending in '/'.\n");
         return;
     }
-    if (!app_allowed(c, "GET", bucket, {}))
+    if (!app_lists(c, bucket, prefix, true))
     {
         app_reply(c, 403, "Access denied.\n");
         return;

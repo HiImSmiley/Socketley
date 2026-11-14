@@ -300,6 +300,26 @@ bool storage_run::lists_bucket(const std::shared_ptr<conn>& c, const bucket_info
 bool storage_run::app_allowed(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
                               std::string_view key, std::string_view query)
 {
+    std::vector<std::pair<std::string, std::string>> q;
+    if (!query.empty())
+        q.emplace_back(std::string(query), std::string{});
+    return app_judged(c, method, bucket, key, std::move(q));
+}
+
+bool storage_run::app_lists(const std::shared_ptr<conn>& c, std::string_view bucket, std::string_view prefix,
+                            bool delimited)
+{
+    std::vector<std::pair<std::string, std::string>> q;
+    if (!prefix.empty())
+        q.emplace_back("prefix", std::string(prefix));
+    if (delimited)
+        q.emplace_back("delimiter", "/");
+    return app_judged(c, "GET", bucket, {}, std::move(q));
+}
+
+bool storage_run::app_judged(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
+                             std::string_view key, std::vector<std::pair<std::string, std::string>> query)
+{
     // Nothing to judge leaves the verdict at its allowed default, decided before any copy.
     if (!needs_judging(c->anonymous ? nullptr : c->user.get()))
         return true;
@@ -311,9 +331,7 @@ bool storage_run::app_allowed(const std::shared_ptr<conn>& c, std::string_view m
     r.method = method;
     r.bucket.assign(bucket);
     r.key.assign(key);
-    r.query.clear();
-    if (!query.empty())
-        r.query.emplace_back(std::string(query), std::string{});
+    r.query = std::move(query);
     auth_verdict v;
     v.anonymous = c->anonymous;
     v.user      = c->user;
@@ -458,7 +476,7 @@ void storage_run::op_dav(const std::shared_ptr<conn>& c)
     {
         if (!key.empty() && key.back() != '/')
             key += '/';
-        if (!app_allowed(c, "GET", bucket, {}))
+        if (!app_lists(c, bucket, key, false))
         {
             app_reply(c, 403, "Access denied.\n");
             return;
@@ -846,7 +864,7 @@ void storage_run::dav_list(const std::shared_ptr<conn>& c, std::string bucket, s
         app_reply(c, 404, "No such bucket.\n");
         return;
     }
-    if (!app_allowed(c, "GET", bucket, {}))
+    if (!app_lists(c, bucket, prefix, true))
     {
         app_reply(c, 403, "Access denied.\n");
         return;
@@ -946,7 +964,7 @@ void storage_run::dav_propfind(const std::shared_ptr<conn>& c, const std::string
         app_reply(c, 404, "No such bucket.\n");
         return;
     }
-    if (!app_allowed(c, "GET", bucket, {}))
+    if (!app_lists(c, bucket, key.empty() || key.back() == '/' ? key : key + "/", true))
     {
         app_reply(c, 403, "Access denied.\n");
         return;
@@ -1041,13 +1059,13 @@ void storage_run::dav_collection(const std::shared_ptr<conn>& c, const std::stri
         app_reply(c, 200, page("/", links), "text/html; charset=utf-8");
         return;
     }
-    if (!app_allowed(c, "GET", bucket, {}))
+    list_query q;
+    q.prefix    = key.empty() || key.back() == '/' ? key : key + "/";
+    if (!app_lists(c, bucket, q.prefix, true))
     {
         app_reply(c, 403, "Access denied.\n");
         return;
     }
-    list_query q;
-    q.prefix    = key.empty() || key.back() == '/' ? key : key + "/";
     q.delimiter = "/";
     const std::string prefix = q.prefix;
     app_list(bucket, std::move(q), [this, weak, bucket, prefix, page](st s, list_page p)
@@ -1074,7 +1092,7 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
                            std::string dst_bucket, std::string dst_prefix, bool keep_source)
 {
     const bool removing = dst_bucket.empty();
-    if (!app_allowed(c, "GET", bucket, {}) || (!keep_source && !app_allowed(c, "DELETE", bucket, prefix)) ||
+    if (!app_lists(c, bucket, prefix, false) || (!keep_source && !app_allowed(c, "DELETE", bucket, prefix)) ||
         (!removing && !app_allowed(c, "PUT", dst_bucket, dst_prefix)))
     {
         app_reply(c, 403, "Access denied.\n");

@@ -1036,6 +1036,10 @@ public:
     // Whether the request's user may do `method` to `bucket`/`key` as S3 would judge it.
     bool app_allowed(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
                      std::string_view key, std::string_view query = {});
+    // Whether the user may list `bucket` under `prefix`, judged with the prefix and delimiter as S3 would see them.
+    bool app_lists(const std::shared_ptr<conn>& c, std::string_view bucket, std::string_view prefix, bool delimited);
+    bool app_judged(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket, std::string_view key,
+                    std::vector<std::pair<std::string, std::string>> query);
     // Whether the user lists bucket `b` among its own: one it owns, one a policy lets it list, every one for an admin.
     bool lists_bucket(const std::shared_ptr<conn>& c, const bucket_info& b);
     // Every page of a listing as one, up to the bound an application lists to.
