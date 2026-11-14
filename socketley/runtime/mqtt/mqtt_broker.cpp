@@ -915,10 +915,18 @@ size_t message_size(const message& m)
     return n;
 }
 
+// What a retained message is counted against --retained-max: its bytes, and at least 256, since keeping one takes
+// about 430 bytes beside them (the message, its tree node, its control block); one-byte payloads counted their bytes
+// alone, and the 64 MiB default held 8 million of them in more than 3 GB.
+size_t retained_size(const message& m)
+{
+    return std::max<size_t>(message_size(m), 256);
+}
+
 bool broker::store_retained(const message_ptr& m, bool notify)
 {
     const auto old = m_retained.get(m->topic);
-    const size_t old_size = old ? message_size(*old) : 0;
+    const size_t old_size = old ? retained_size(*old) : 0;
     // A '$' topic holds the broker's own figures, made again each interval and so no change a snapshot keeps.
     const bool kept = !m->topic.starts_with('$');
     const auto replaced = [&] {
@@ -939,7 +947,7 @@ bool broker::store_retained(const message_ptr& m, bool notify)
         }
         return true;
     }
-    const size_t size = message_size(*m);
+    const size_t size = retained_size(*m);
     if (m_retained_bytes - old_size + size > m_cfg.retained_max_bytes)
     {
         ++m_stats.retained_refused;
@@ -1763,7 +1771,7 @@ void broker::sweep_sessions(int64_t now)
         if (const auto old = m_retained.get(topic))
         {
             m_retained.set(topic, nullptr);
-            m_retained_bytes -= message_size(*old);
+            m_retained_bytes -= retained_size(*old);
             mark();
         }
     }
