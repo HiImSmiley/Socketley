@@ -109,7 +109,7 @@ ask() {
 # ─── Documented and not excepted: the line protocol has to take it ──────────
 MISSING=""
 for cmd in $DOCUMENTED; do
-    printf '%s\n' "$EXCEPTED" | grep -qx "$cmd" && continue
+    grep -qx "$cmd" <<<"$EXCEPTED" && continue
     [ "$(ask "$cmd")" = "failed: unknown command" ] && MISSING="$MISSING $cmd"
 done
 if [ -z "$MISSING" ]; then pass

@@ -110,18 +110,18 @@ grep -q 'whole 0 of 0' "$W/set.out" || echo "  note: setting the values said: $(
 
 # Small and middling answers alone: the connection stays in user space.
 out=$(python3 -I "$W/client.py" "$P" tiny small mid tiny+small+mid kernel? 2>&1)
-if echo "$out" | grep -q 'whole 6 of 6' && echo "$out" | grep -q 'kernel 0'; then ok
+if grep -q 'whole 6 of 6' <<<"$out" && grep -q 'kernel 0' <<<"$out"; then ok
 else bad "a connection given small answers only stays in user space" "$(echo "$out" | tr '\n' ' ')"; fi
 
 # One connection: a large answer moves it, and every answer after it, alone or several in one write, is whole.
 out=$(python3 -I "$W/client.py" "$P" tiny big kernel? tiny small huge mid tiny+big+small huge+huge mid+tiny 2>&1)
-if echo "$out" | grep -q 'whole 13 of 13' && echo "$out" | grep -q 'kernel 1'; then ok
+if grep -q 'whole 13 of 13' <<<"$out" && grep -q 'kernel 1' <<<"$out"; then ok
 else bad "a large answer moves its connection, and the answers after it come back whole" "$(echo "$out" | tr '\n' ' ')"; fi
 
 # A moved connection the cache closes behind a reader that stalled on a 4 KiB receive buffer: the answer whole, then
 # close_notify.
 out=$(python3 -I "$W/client.py" "$P" big quit-slow 2>&1)
-if echo "$out" | grep -q 'whole 2 of 2' && echo "$out" | grep -q 'closed clean'; then ok
+if grep -q 'whole 2 of 2' <<<"$out" && grep -q 'closed clean' <<<"$out"; then ok
 else bad "a moved connection closed by QUIT ends its answer, then close_notify, then its FIN" "$(echo "$out" | tr '\n' ' ')"; fi
 
 # Eight moved connections at once.
@@ -154,7 +154,7 @@ start_cache
 python3 -I "$W/client.py" "$P" set >/dev/null 2>&1
 t0=$(kstat)
 out=$(python3 -I "$W/client.py" "$P" big huge kernel? tiny 2>&1)
-if echo "$out" | grep -q 'whole 3 of 3' && echo "$out" | grep -q 'kernel 0'; then ok
+if grep -q 'whole 3 of 3' <<<"$out" && grep -q 'kernel 0' <<<"$out"; then ok
 else bad "SOCKETLEY_KERNEL_TLS=0 keeps the send key in user space" "$(echo "$out" | tr '\n' ' '), TlsTxSw $t0 -> $(kstat)"; fi
 
 echo

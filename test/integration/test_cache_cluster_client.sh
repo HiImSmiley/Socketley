@@ -132,7 +132,7 @@ MAP=$(redis-cli -p "$P4" CLUSTER SLOTS 2>/dev/null)
 TOKENS=$(printf '%s\n' "$MAP" | sed 's/^ *//; s/ *$//' | grep -v '^$')
 PORTS_IN_MAP=0
 for i in 1 2 3 4; do
-    printf '%s\n' "$TOKENS" | grep -qx "$((P4+i))" && PORTS_IN_MAP=$((PORTS_IN_MAP+1))
+    grep -qx "$((P4+i))" <<<"$TOKENS" && PORTS_IN_MAP=$((PORTS_IN_MAP+1))
 done
 HAS_ZERO=$(printf '%s\n' "$TOKENS" | grep -cx 0 || true)
 HAS_LAST=$(printf '%s\n' "$TOKENS" | grep -cx 16383 || true)
@@ -154,13 +154,13 @@ fi
 # ── 4: CLUSTER INFO tells a client whether to bother ────────────────────────
 INFO4=$(redis-cli -p "$P4" CLUSTER INFO 2>/dev/null)
 INFO1=$(redis-cli -p "$P1" CLUSTER INFO 2>/dev/null)
-if printf '%s' "$INFO4" | grep -q 'cluster_enabled:1' \
-   && printf '%s' "$INFO4" | grep -q 'cluster_state:ok'; then
+if grep -q 'cluster_enabled:1' <<<"$INFO4" \
+   && grep -q 'cluster_state:ok' <<<"$INFO4"; then
     ok "a sharded cache reports cluster_enabled:1 and cluster_state:ok"
 else
     bad "a sharded cache reports cluster_enabled:1" "$(printf '%s' "$INFO4" | tr '\n' '|' | head -c 200)"
 fi
-if printf '%s' "$INFO1" | grep -q 'cluster_enabled:0'; then
+if grep -q 'cluster_enabled:0' <<<"$INFO1"; then
     ok "an unsharded cache reports cluster_enabled:0 rather than a map of one"
 else
     bad "an unsharded cache reports cluster_enabled:0" \
@@ -300,7 +300,7 @@ else
 fi
 # And the same command on the shared port is still served across the mesh.
 MK_SHARED=$(redis-cli -p "$P4" MGET foo ck1 ck2 2>&1)
-if printf '%s' "$MK_SHARED" | grep -q 'clusterval'; then
+if grep -q 'clusterval' <<<"$MK_SHARED"; then
     ok "the shared port still answers the same multi-key command over the mesh"
 else
     bad "the shared port still answers the same multi-key command" \
@@ -380,9 +380,9 @@ DINFO=$(redis-cli -p "$PD" CLUSTER INFO 2>/dev/null)
 DSLOTS=$(redis-cli -p "$PD" CLUSTER SLOTS 2>/dev/null | sed 's/^ *//' | grep -v '^$')
 DPORTS=0
 for i in 1 2 3 4; do
-    printf '%s\n' "$DSLOTS" | grep -qx "$((PD+i))" && DPORTS=$((DPORTS+1))
+    grep -qx "$((PD+i))" <<<"$DSLOTS" && DPORTS=$((DPORTS+1))
 done
-if printf '%s' "$DINFO" | grep -q 'cluster_enabled:0' && [ "$DPORTS" -eq 0 ]; then
+if grep -q 'cluster_enabled:0' <<<"$DINFO" && [ "$DPORTS" -eq 0 ]; then
     ok "under --no-cluster it reports cluster_enabled:0 and advertises no shard ports"
 else
     bad "under --no-cluster it reports cluster_enabled:0 and advertises no shard ports" \

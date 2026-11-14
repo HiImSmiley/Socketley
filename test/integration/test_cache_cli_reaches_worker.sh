@@ -140,7 +140,7 @@ eq "the flushed dump comes back with the worker's keys" "$(port 'get c')" "onlyp
 # `socketley stpo cw` answered "runtime not found: stpo" and sent the reader
 # looking for a runtime nobody meant.
 RC=0; OUT=$("$BIN" stpo cw 2>&1) || RC=$?
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "unknown command: stpo"; then ok; else
+if [ "$RC" -eq 1 ] && grep -q "unknown command: stpo" <<<"$OUT"; then ok; else
     bad "a mistyped command names itself" "exit $RC, said '$(printf '%s' "$OUT" | head -1)'"
 fi
 if printf '%s' "$OUT" | grep -q "is a runtime"; then ok; else
