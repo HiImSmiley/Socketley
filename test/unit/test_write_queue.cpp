@@ -3,8 +3,23 @@
 
 #include "../../socketley/shared/loop/write_queue.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <memory>
+#include <new>
 #include <string>
+
+// Every allocation this binary makes, counted, so a queue that allocates before anything is pushed is seen to.
+static std::atomic<size_t> g_allocs{0};
+void* operator new(size_t n)
+{
+    g_allocs.fetch_add(1, std::memory_order_relaxed);
+    if (void* p = std::malloc(n ? n : 1))
+        return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
 
 // The write queue's coalescing decision, which had no test of its own.
 //
@@ -415,4 +430,36 @@ TEST_CASE("bytes that do not live in their entry are sent from where they were")
         [&](uint32_t i) -> const char* { return owned[i] ? batch[i].data() : nullptr; });
     REQUIRE(left == 1);
     CHECK(sent_by(iovs, left) == "nt-bytes");
+}
+
+// A std::deque allocates its map and a 512-byte block when it is constructed, which every connection of every
+// runtime paid for a queue most of them never use: 0.62 KiB of the 2.31 a client held per idle connection.
+TEST_CASE("a queue allocates nothing until something is pushed")
+{
+    const size_t before = g_allocs.load();
+    {
+        queue_t q;
+        socketley::byte_counted_queue<std::string> lines;
+        CHECK(q.empty());
+        CHECK(q.size() == 0);
+        CHECK(q.bytes() == 0);
+        q.pop();
+        q.clear();
+        lines.clear();
+        CHECK(g_allocs.load() == before);
+
+        lines.push_coalesced_line("hi", LIMIT);
+        CHECK(g_allocs.load() > before);
+        CHECK(lines.size() == 1);
+        CHECK(lines.take_front() == "hi\n");
+        CHECK(lines.empty());
+        CHECK(lines.bytes() == 0);
+
+        // Kept once made, so a queue that empties and fills again allocates no new storage for itself.
+        lines.clear();
+        const size_t kept = g_allocs.load();
+        lines.push(std::string(1, 'x'));
+        CHECK(g_allocs.load() == kept);
+        CHECK(lines.front() == "x");
+    }
 }

@@ -243,20 +243,20 @@ template <typename T>
 class byte_counted_queue
 {
 public:
-    bool   empty() const noexcept { return m_queue.empty(); }
-    size_t size()  const noexcept { return m_queue.size(); }
+    bool   empty() const noexcept { return !m_queue || m_queue->empty(); }
+    size_t size()  const noexcept { return m_queue ? m_queue->size() : 0; }
     size_t bytes() const noexcept { return m_bytes; }
 
     // Read-only, because moving out of it leaves pop() subtracting an emptied
     // string; use take_front().
-    const T& front() const { return m_queue.front(); }
-    const T& back()  const { return m_queue.back(); }
+    const T& front() const { return m_queue->front(); }
+    const T& back()  const { return m_queue->back(); }
 
     // Grow the tail entry in place, only the tail, since entries ahead of it
     // may already have been handed to the kernel.
     void append_back(std::string_view extra)
     {
-        m_queue.back().append(extra);
+        m_queue->back().append(extra);
         m_bytes += extra.size();
     }
 
@@ -289,9 +289,9 @@ public:
     // and no copy at all.
     void push_slice(const std::shared_ptr<const std::string>& seg, uint32_t off, uint32_t len)
     {
-        if (!m_queue.empty() && m_queue.back().continues_at(seg.get(), off))
+        if (!empty() && m_queue->back().continues_at(seg.get(), off))
         {
-            m_queue.back().grow_slice(len);
+            m_queue->back().grow_slice(len);
             m_bytes += len;
             return;
         }
@@ -317,7 +317,7 @@ public:
     {
         if (!value)
             return;
-        if (m_queue.size() < batch)
+        if (size() < batch)
         {
             push(T(value));
             return;
@@ -388,20 +388,20 @@ public:
     void push(const T& value)
     {
         m_bytes += write_queue_size_of(value);
-        m_queue.push_back(value);
+        entries().push_back(value);
     }
 
     void push(T&& value)
     {
         m_bytes += write_queue_size_of(value);
-        m_queue.push_back(std::move(value));
+        entries().push_back(std::move(value));
     }
 
     template <typename... Args>
     void emplace(Args&&... args)
     {
-        m_queue.emplace_back(std::forward<Args>(args)...);
-        m_bytes += write_queue_size_of(m_queue.back());
+        entries().emplace_back(std::forward<Args>(args)...);
+        m_bytes += write_queue_size_of(m_queue->back());
     }
 
     // An entry ahead of every other, for a queue whose writer takes out what it sends, so nothing at the front is
@@ -409,31 +409,32 @@ public:
     void push_front(T value)
     {
         m_bytes += write_queue_size_of(value);
-        m_queue.push_front(std::move(value));
+        entries().push_front(std::move(value));
     }
 
     void pop()
     {
-        if (m_queue.empty())
+        if (empty())
             return;
-        charge_back(write_queue_size_of(m_queue.front()));
-        m_queue.pop_front();
+        charge_back(write_queue_size_of(m_queue->front()));
+        m_queue->pop_front();
     }
 
     // Hand the front entry to the caller and drop it, accounting for its size
     // before the move empties it.
     T take_front()
     {
-        const size_t n = write_queue_size_of(m_queue.front());
-        T value = std::move(m_queue.front());
-        m_queue.pop_front();
+        const size_t n = write_queue_size_of(m_queue->front());
+        T value = std::move(m_queue->front());
+        m_queue->pop_front();
         charge_back(n);
         return value;
     }
 
     void clear()
     {
-        m_queue.clear();
+        if (m_queue)
+            m_queue->clear();
         m_bytes = 0;
     }
 
@@ -451,9 +452,9 @@ private:
 
     bool fits_in_tail(size_t n, size_t limit) const
     {
-        if (m_queue.empty() || !write_queue_can_grow(m_queue.back()))
+        if (empty() || !write_queue_can_grow(m_queue->back()))
             return false;
-        const T& tail = m_queue.back();
+        const T& tail = m_queue->back();
         return tail.size() + n <= limit &&
                (n <= write_queue_room_of(tail) || tail.size() < write_queue_regrow_max);
     }
@@ -463,8 +464,17 @@ private:
         m_bytes = (m_bytes >= n) ? m_bytes - n : 0;
     }
 
-    std::deque<T> m_queue;
-    size_t        m_bytes{0};
+    // Made on the first push, because a std::deque allocates its map and a 512-byte block when constructed, and
+    // that was half of what an idle connection cost; kept once made, so a queue going empty and back allocates nothing.
+    std::deque<T>& entries()
+    {
+        if (!m_queue)
+            m_queue = std::make_unique<std::deque<T>>();
+        return *m_queue;
+    }
+
+    std::unique_ptr<std::deque<T>> m_queue;
+    size_t                         m_bytes{0};
 };
 
 // After a short write of `written` bytes, less than the batch holds: drops the entries sent whole and the front of the
