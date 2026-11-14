@@ -797,6 +797,14 @@ void jmap_session::next_call(const std::shared_ptr<call_state>& cs)
             said("error", "{\"type\":\"invalidResultReference\"}", id);
             return next_call(cs);
         }
+        // Each reference is a copy, so many of them would make a small request a large one.
+        cs->referenced += json::written(got).size();
+        if (cs->referenced > max_request)
+        {
+            said("error", "{\"type\":\"requestTooLarge\",\"description\":\"the references copy more than a request may hold\"}",
+                 id);
+            return next_call(cs);
+        }
         const std::string plain = k.substr(1);
         if (json::member(args, plain))
         {

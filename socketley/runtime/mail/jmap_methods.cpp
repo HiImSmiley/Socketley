@@ -421,6 +421,16 @@ std::vector<std::string> strings_of(const jvalue* v)
     return out;
 }
 
+// The ids a /get asks for, each once (RFC 8620 5.1); false past maxObjectsInGet.
+bool get_ids(const jvalue* v, std::vector<std::string>& out)
+{
+    std::unordered_set<std::string, string_hash, string_equal> seen;
+    for (auto& id : strings_of(v))
+        if (seen.insert(id).second)
+            out.push_back(std::move(id));
+    return out.size() <= 1000;
+}
+
 // The first mailbox of a mailboxIds object set true.
 std::string first_true(const jvalue* v)
 {
@@ -749,13 +759,16 @@ void jmap_session::mailbox_get(const jvalue& args, std::function<void(answer)> d
     std::string not_found = "[";
     if (ids && ids->k == jvalue::kind::array)
     {
-        for (const auto& i : ids->items)
+        std::vector<std::string> wanted;
+        if (!get_ids(ids, wanted))
+            return done({{"error", set_error("requestTooLarge")}});
+        for (const auto& i : wanted)
         {
-            const auto it = std::find_if(folders.begin(), folders.end(), [&](const auto& f) { return f->id() == i.s; });
+            const auto it = std::find_if(folders.begin(), folders.end(), [&](const auto& f) { return f->id() == i; });
             if (it != folders.end())
                 chosen.push_back(*it);
             else
-                not_found += (not_found.size() > 1 ? "," : "") + q(i.s);
+                not_found += (not_found.size() > 1 ? "," : "") + q(i);
         }
     }
     else
@@ -1075,13 +1088,14 @@ void jmap_session::email_get(const jvalue& args, std::function<void(answer)> don
     j->args = args;
     const jvalue* ids = json::member(j->args, "ids");
     if (ids && ids->k == jvalue::kind::array)
-        j->ids = strings_of(ids);
+    {
+        if (!get_ids(ids, j->ids))
+            return done({{"error", set_error("requestTooLarge")}});
+    }
     else
         for (const auto& entry : m_ids)
             if (j->ids.size() < 1000)
                 j->ids.push_back(entry.first);
-    if (j->ids.size() > 1000)
-        return done({{"error", set_error("requestTooLarge")}});
     const jvalue* props = json::member(j->args, "properties");
     j->props = props && props->k == jvalue::kind::array ? strings_of(props) : defaults;
     if (!props_ok(j->props))
@@ -1408,8 +1422,11 @@ void jmap_session::thread_get(const jvalue& args, std::function<void(answer)> do
     for (const auto& f : m_store.known(m_user))
         for (const auto& m : f->msgs)
             threads[thread_id(m)].emplace_back(m.date_ms, imap_store::email_id(m.key));
+    std::vector<std::string> wanted;
+    if (!get_ids(json::member(args, "ids"), wanted))
+        return done({{"error", set_error("requestTooLarge")}});
     std::string list = "[", missing = "[";
-    for (const auto& id : strings_of(json::member(args, "ids")))
+    for (const auto& id : wanted)
     {
         auto it = threads.find(id);
         if (it == threads.end())
@@ -1970,8 +1987,7 @@ void jmap_session::email_parse(const jvalue& args, std::function<void(answer)> d
         std::string parsed = "{", not_parsable = "[", not_found = "[";
     };
     auto j = std::make_shared<job>();
-    j->blobs = strings_of(json::member(args, "blobIds"));
-    if (j->blobs.size() > 1000)
+    if (!get_ids(json::member(args, "blobIds"), j->blobs))
         return done({{"error", set_error("requestTooLarge")}});
     const jvalue* props = json::member(args, "properties");
     j->view.props = props && props->k == jvalue::kind::array

@@ -250,6 +250,25 @@ r = api(["Email/set", {"accountId": acct, "create": {"w": {
                          "rcptTo": [{"email": "r%d@remote.test" % i} for i in range(101)]}}}}, "ws"])
 nc = r["ws"][0][1].get("notCreated", {}).get("s", {})
 say("EmailSubmission/set refuses one message to more recipients than --max-recipients", nc.get("type") == "tooManyRecipients", r)
+# A /get answers an id given twice once (RFC 8620 5.1), and takes no more than maxObjectsInGet.
+r = api(["Email/get", {"accountId": acct, "ids": [one["id"]] * 3, "properties": ["subject"]}, "g"],
+        ["Mailbox/get", {"accountId": acct, "ids": [inbox["id"]] * 3, "properties": ["name"]}, "m"],
+        ["Thread/get", {"accountId": acct, "ids": ["T%015d" % i for i in range(1001)]}, "t"])
+say("Email/get and Mailbox/get answer an id given three times once", len(r["g"][0][1].get("list", [])) == 1 and
+    len(r["m"][0][1].get("list", [])) == 1, r)
+say("Thread/get takes at most 1000 ids", r["t"][0][0] == "error" and r["t"][0][1].get("type") == "requestTooLarge", str(r["t"])[:200])
+# References copy what an earlier call said; their copies together are no larger than a request may be.
+calls = [["Core/echo", {"x": "A" * 100000}, "e0"]]
+for i in (1, 2):
+    calls.append(["Core/echo", {"#k%d" % k: {"resultOf": "e%d" % (i - 1), "name": "Core/echo", "path": ""} for k in range(12)}, "e%d" % i])
+r = api(*calls)
+say("references that copy more than a request may hold are refused", r.get("e2", [[None, {}]])[0][0] == "error" and
+    r["e2"][0][1].get("type") == "requestTooLarge" and len(r["e1"][0][1]) == 12, str(r)[:300])
+# A Message-ID the client gives is one id on one line.
+r = api(["Email/set", {"accountId": acct, "create": {"i": {"mailboxIds": {boxes["drafts"]["id"]: True},
+            "messageId": ["x@y>\r\nX-Injected: yes"], "subject": "id", "textBody": [{"partId": "t", "type": "text/plain"}],
+            "bodyValues": {"t": {"value": "b"}}}}}, "i"])
+say("Email/set refuses a messageId that is not one id", "i" in r["i"][0][1].get("notCreated", {}), r)
 # Destroy, changes
 r = api(["Email/set", {"accountId": acct, "destroy": [up and got and got[0]["id"] or "x"]}, "x"])
 say("Email/set destroy takes an Email away", len(r["x"][0][1].get("destroyed", [])) == 1, r)

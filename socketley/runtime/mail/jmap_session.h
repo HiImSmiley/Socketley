@@ -175,6 +175,8 @@ private:
         std::unordered_map<std::string, std::string, string_hash, string_equal> created;
         // The request's own createdIds, given back with what it made added.
         bool echo_created{false};
+        // The bytes result references have copied into its calls, held to what one request may be.
+        size_t referenced{0};
     };
     void next_call(const std::shared_ptr<call_state>& cs);
     void method(const std::string& name, const json::jvalue& args, const std::shared_ptr<call_state>& cs,
