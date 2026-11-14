@@ -38,6 +38,13 @@ struct post_form
     uint64_t    range_max{0};
     // The fields as the request's headers name them, owned here for the views the request keeps.
     std::deque<std::string> held;
+    // A scan that stopped for more of the body: where the next field starts, its head once read (where it ends, its
+    // name, filename and type), and how far the search for what it still waits on looked, so the next call goes on
+    // from there rather than reading every field again from the first.
+    size_t      scan_pos{0};
+    size_t      scan_head{0};
+    std::string scan_name, scan_filename, scan_type;
+    size_t      scan_seen{0};
 
     const std::string* field(std::string_view lower_name) const;
 };
@@ -45,7 +52,8 @@ struct post_form
 enum class form_scan : uint8_t { more, ok, bad };
 
 // Reads the fields of a multipart/form-data body up to the first byte of its file, from `in`, the body so far,
-// which is all of it when `whole`.  `more` asks for more of the body; `bad` comes with S3's refusal.
+// which is all of it when `whole`.  `more` asks for more of the body, and a call with `in` longer goes on where this
+// one stopped; `bad` comes with S3's refusal.
 form_scan scan_post_form(std::string_view content_type, std::string_view in, bool whole, post_form& out,
                          s3_error& err);
 

@@ -605,8 +605,12 @@ void storage_run::sweep()
             case phase::body_small:
             case phase::body_put:
             case phase::body_discard:
-            case phase::form_head:
                 kill = quiet > body_stall_secs;
+                break;
+            case phase::form_head:
+                // A form's fields come before its file and are bounded as a head is, in time as well as in size.
+                kill = std::chrono::duration_cast<std::chrono::seconds>(now - c->request_began).count() >
+                       http_header_deadline_secs;
                 break;
             case phase::respond:
                 kill = quiet > write_stall();

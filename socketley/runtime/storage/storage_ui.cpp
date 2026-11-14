@@ -1298,17 +1298,27 @@ void storage_run::ui_search(const std::shared_ptr<conn>& c)
             if (s == st::ok)
             {
                 h->more = h->more || p.truncated;
+                std::string_view prev;
                 for (const list_entry& e : p.objects)
                 {
                     if (h->found >= limit)
                         break;
-                    // Each folder on the way to the key, once, where its own name holds the text.
-                    size_t from = 0;
-                    for (size_t slash = e.key.find('/'); slash != std::string::npos; slash = e.key.find('/', from))
+                    // Each folder on the way to the key, once, where its own name holds the text. The keys come in
+                    // order, so the folders this one shares with the last were judged with it, and only those past their
+                    // common part are read: every folder of every key, built before it was tested, cost a key of 500
+                    // folders 250 KB of copies.
+                    const std::string_view key = e.key;
+                    size_t common = 0;
+                    while (common < key.size() && common < prev.size() && key[common] == prev[common])
+                        ++common;
+                    prev = key;
+                    const size_t shared = key.substr(0, common).rfind('/');
+                    size_t from = shared == std::string_view::npos ? 0 : shared + 1;
+                    for (size_t slash = e.key.find('/', from); slash != std::string::npos; slash = e.key.find('/', from))
                     {
                         const std::string_view name = std::string_view(e.key).substr(from, slash - from);
-                        const std::string folder = bucket + "/" + e.key.substr(0, slash + 1);
-                        if (fold(name).find(h->q) != std::string::npos && h->seen.insert(folder).second && h->found < limit)
+                        if (h->found < limit && fold(name).find(h->q) != std::string::npos &&
+                            h->seen.insert(bucket + "/" + e.key.substr(0, slash + 1)).second)
                         {
                             h->folders += h->folders.empty() ? "{\"bucket\":" : ",{\"bucket\":";
                             socketley::json::quote_into(h->folders, bucket);

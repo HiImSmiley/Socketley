@@ -8,6 +8,8 @@
 #include <ctime>
 #include <optional>
 #include <unordered_set>
+#include <algorithm>
+#include <unordered_map>
 
 #include "body_reader.h"
 #include "checksum.h"
@@ -219,19 +221,34 @@ std::string entry_name(std::string_view rel)
 
 // `name` made one no entry before it has, by " (2)", " (3)" and on before its last segment's extension, since an
 // unzipper writes a second entry of one name over the first.
-std::string unique_name(std::string name, std::unordered_set<std::string>& taken,
-                        const std::unordered_set<std::string>& dirs)
+// Whether `name` is a folder another entry's name lies under: the sorted names hold one starting with "name/".
+bool is_dir_of(const std::vector<std::string_view>& sorted, std::string_view name)
 {
-    if (!dirs.contains(name) && taken.insert(name).second)
+    std::string under(name);
+    under += '/';
+    const auto it = std::lower_bound(sorted.begin(), sorted.end(), std::string_view(under));
+    return it != sorted.end() && it->starts_with(under);
+}
+
+// Each name's next number goes on from where its last one stopped: the n-th of one name tried every number below n,
+// which for 20,000 keys of one name was 2e8 names built.
+std::string unique_name(std::string name, std::unordered_set<std::string>& taken,
+                        const std::vector<std::string_view>& sorted, std::unordered_map<std::string, int>& next_of)
+{
+    if (!is_dir_of(sorted, name) && taken.insert(name).second)
         return name;
     const size_t slash = name.rfind('/');
     const size_t dot = name.rfind('.');
     const size_t cut = dot != std::string::npos && (slash == std::string::npos || dot > slash + 1) ? dot : name.size();
-    for (int n = 2;; ++n)
+    int& n = next_of.try_emplace(name, 2).first->second;
+    for (;; ++n)
     {
         std::string next = name.substr(0, cut) + " (" + std::to_string(n) + ")" + name.substr(cut);
-        if (!dirs.contains(next) && taken.insert(next).second)
+        if (!is_dir_of(sorted, next) && taken.insert(next).second)
+        {
+            ++n;
             return next;
+        }
     }
 }
 
@@ -265,17 +282,36 @@ void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, 
         job->bucket = bucket;
         uint64_t at = 0;
         size_t skipped = 0;
-        std::unordered_set<std::string> taken, dirs;
+        std::unordered_set<std::string> taken;
+        std::unordered_map<std::string, int> next_of;
         std::vector<std::pair<list_entry*, std::string>> picked;
+        // Reserved, so the names the sorted views below point into never move.
+        picked.reserve(p.objects.size());
+        const std::unordered_set<std::string_view> named(only.begin(), only.end());
+        // The lengths asked for, so only a folder above a name that is one of them is hashed and looked up.
+        std::vector<bool> asked_len;
+        for (const std::string& o : only)
+        {
+            if (asked_len.size() <= o.size())
+                asked_len.resize(o.size() + 1);
+            asked_len[o.size()] = true;
+        }
         for (list_entry& e : p.objects)
         {
             std::string name = e.key.substr(prefix.size());
             // A folder's marker is no file, and a selection takes only what it named and what is under those.
             if (name.empty() || name.back() == '/')
                 continue;
-            if (!only.empty() && std::none_of(only.begin(), only.end(), [&name](const std::string& o)
-                                              { return name == o || (name.starts_with(o) && name[o.size()] == '/'); }))
-                continue;
+            // The name or a folder above it among those asked for, looked up rather than compared with each.
+            if (!only.empty())
+            {
+                bool asked = named.contains(name);
+                for (size_t sl = name.find('/'); !asked && sl != std::string::npos && sl < asked_len.size();
+                     sl = name.find('/', sl + 1))
+                    asked = asked_len[sl] && named.contains(std::string_view(name).substr(0, sl));
+                if (!asked)
+                    continue;
+            }
             // What only its client's key opens cannot be read here, and what the user may not read is not given.
             if (sse_mode_of(e.meta) == sse_mode::c ||
                 !(as ? link_allows(c, *as, "GET", bucket, e.key) : app_allowed(c, "GET", bucket, e.key)))
@@ -288,17 +324,21 @@ void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, 
             std::string safe = entry_name(name);
             if (safe.empty())
                 continue;
-            // A file named as a folder of another entry would keep that folder from unpacking.
-            for (size_t sl = safe.find('/'); sl != std::string::npos; sl = safe.find('/', sl + 1))
-                dirs.insert(safe.substr(0, sl));
             picked.emplace_back(&e, std::move(safe));
         }
+        // A file named as a folder of another entry would keep that folder from unpacking; the names sorted answer
+        // which are, where a set of every folder above every name copied each name's prefixes, its length squared.
+        std::vector<std::string_view> sorted;
+        sorted.reserve(picked.size());
+        for (const auto& pk : picked)
+            sorted.push_back(pk.second);
+        std::sort(sorted.begin(), sorted.end());
         for (auto& [ep, safe] : picked)
         {
             list_entry& e = *ep;
             zip_job::entry z;
             z.key      = std::move(e.key);
-            z.name     = unique_name(std::move(safe), taken, dirs);
+            z.name     = unique_name(std::move(safe), taken, sorted, next_of);
             z.size     = e.meta.size;
             z.mtime_ms = e.meta.mtime_ms;
             z.offset   = at;

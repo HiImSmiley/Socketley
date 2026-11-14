@@ -1,11 +1,14 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
+#include "thread_cpu.h"
+#include <chrono>
 
 #include "runtime/storage/body_reader.h"
 #include "runtime/storage/checksum.h"
 #include "runtime/storage/multipart.h"
 #include "runtime/storage/object_format.h"
 #include "runtime/storage/object_store.h"
+#include "runtime/storage/post_policy.h"
 #include "runtime/storage/s3_multipart_xml.h"
 #include "runtime/storage/s3_sigv4_auth.h"
 #include "shared/loop/event_loop.h"
@@ -60,6 +63,45 @@ std::string pattern(size_t n, unsigned seed = 1)
 }   // namespace
 
 // ─── Checksums ──────────────────────────────────────────────────────────────
+
+TEST_CASE("a POST form's fields are read once however the body arrives, and as they were read whole")
+{
+    std::string body;
+    // As many fields as 20 KiB holds, each read again for every byte under the old scan.
+    for (int i = 0; i < 370; ++i)
+        body += "--B\r\nContent-Disposition: form-data; name=\"f" + std::to_string(i) + "\"\r\n\r\n\r\n";
+    body += "--B\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nk\r\n";
+    body += "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\n";
+    const std::string tail = "hello\r\n--B--\r\n";
+    const std::string all = body + tail;
+    const std::string_view type = "multipart/form-data; boundary=B";
+    s3_error err;
+    post_form whole;
+    REQUIRE(scan_post_form(type, all, true, whole, err) == form_scan::ok);
+    // A byte at a time read every field again for each byte: 20 KiB of fields, a parse of them all per byte.
+    post_form trickled;
+    form_scan last = form_scan::more;
+    const auto t0 = thread_cpu_now();
+    for (size_t n = 1; n <= all.size() && last == form_scan::more; ++n)
+        last = scan_post_form(type, std::string_view(all).substr(0, n), n == all.size(), trickled, err);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    REQUIRE(last == form_scan::ok);
+    CHECK(trickled.fields == whole.fields);
+    CHECK(trickled.fields.size() == 371);
+    CHECK(trickled.file_at == whole.file_at);
+    CHECK(trickled.file_at == body.size());
+    CHECK(trickled.filename == "a.txt");
+    CHECK(trickled.file_type == "text/plain");
+    // Cut inside a field's head, and inside its value, and a field given twice read as its first.
+    post_form twice;
+    const std::string dup = "--B\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\n1\r\n--B\r\nContent-Disposition: "
+                            "form-data; name=\"X\"\r\n\r\n2\r\n--B\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\n";
+    for (size_t n : {10ul, 50ul, 60ul, dup.size()})
+        last = scan_post_form(type, std::string_view(dup).substr(0, n), false, twice, err);
+    REQUIRE(last == form_scan::ok);
+    REQUIRE(twice.fields.size() == 1);
+    CHECK(twice.fields[0].second == "1");
+}
 
 TEST_CASE("the checksums match their published check values")
 {

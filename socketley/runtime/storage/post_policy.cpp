@@ -129,9 +129,12 @@ form_scan scan_post_form(std::string_view content_type, std::string_view in, boo
         return form_scan::bad;
     }
     out.boundary = *boundary;
-    out.fields.clear();
     const std::string dash = "--" + out.boundary;
     const std::string delim = "\r\n" + dash;
+    // Where a search for `what` from `from` begins, given that the last call looked as far as scan_seen.
+    const auto resume = [&](size_t from, size_t what) {
+        return std::max(from, out.scan_seen > what ? out.scan_seen - what : size_t{0});
+    };
 
     auto more = [&]() -> form_scan
     {
@@ -145,17 +148,23 @@ form_scan scan_post_form(std::string_view content_type, std::string_view in, boo
             err = refusal("MalformedPOSTRequest");
             return form_scan::bad;
         }
+        out.scan_seen = in.size();
         return form_scan::more;
     };
 
     // The first boundary opens the body, or follows a preamble that is dropped.
-    size_t pos = 0;
-    if (in.substr(0, dash.size()) == dash)
-        pos = dash.size();
-    else if (const size_t d = in.find(delim); d != std::string_view::npos)
-        pos = d + delim.size();
-    else
-        return more();
+    size_t pos = out.scan_pos;
+    if (pos == 0)
+    {
+        if (in.substr(0, dash.size()) == dash)
+            pos = dash.size();
+        else if (const size_t d = in.find(delim, resume(0, delim.size())); d != std::string_view::npos)
+            pos = d + delim.size();
+        else
+            return more();
+        out.scan_pos  = pos;
+        out.scan_seen = 0;
+    }
     for (;;)
     {
         if (in.size() < pos + 2)
@@ -170,61 +179,71 @@ form_scan scan_post_form(std::string_view content_type, std::string_view in, boo
             err = refusal("MalformedPOSTRequest");
             return form_scan::bad;
         }
-        pos += 2;
-        const size_t head_end = in.find("\r\n\r\n", pos);
-        if (head_end == std::string_view::npos)
-            return more();
-        std::string name, filename, part_type;
-        bool has_name = false;
-        std::string_view heads = in.substr(pos, head_end - pos);
-        while (!heads.empty())
+        if (out.scan_head == 0)
         {
-            const size_t eol = heads.find("\r\n");
-            const std::string_view line = heads.substr(0, eol);
-            heads = eol == std::string_view::npos ? std::string_view{} : heads.substr(eol + 2);
-            const size_t colon = line.find(':');
-            if (colon == std::string_view::npos)
-                continue;
-            const std::string hname = lowered(trimmed(line.substr(0, colon)));
-            const std::string_view hvalue = trimmed(line.substr(colon + 1));
-            if (hname == "content-disposition")
+            const size_t head_end = in.find("\r\n\r\n", resume(pos + 2, 4));
+            if (head_end == std::string_view::npos)
+                return more();
+            std::string name, filename, part_type;
+            bool has_name = false;
+            std::string_view heads = in.substr(pos + 2, head_end - pos - 2);
+            while (!heads.empty())
             {
-                if (const auto n = header_param(hvalue, "name"))
+                const size_t eol = heads.find("\r\n");
+                const std::string_view line = heads.substr(0, eol);
+                heads = eol == std::string_view::npos ? std::string_view{} : heads.substr(eol + 2);
+                const size_t colon = line.find(':');
+                if (colon == std::string_view::npos)
+                    continue;
+                const std::string hname = lowered(trimmed(line.substr(0, colon)));
+                const std::string_view hvalue = trimmed(line.substr(colon + 1));
+                if (hname == "content-disposition")
                 {
-                    name     = lowered(*n);
-                    has_name = true;
+                    if (const auto n = header_param(hvalue, "name"))
+                    {
+                        name     = lowered(*n);
+                        has_name = true;
+                    }
+                    if (const auto f = header_param(hvalue, "filename"))
+                        filename = *f;
                 }
-                if (const auto f = header_param(hvalue, "filename"))
-                    filename = *f;
+                else if (hname == "content-type")
+                    part_type = std::string(hvalue);
             }
-            else if (hname == "content-type")
-                part_type = std::string(hvalue);
+            if (!has_name)
+            {
+                err = refusal("MalformedPOSTRequest");
+                return form_scan::bad;
+            }
+            out.scan_head     = head_end;
+            out.scan_name     = std::move(name);
+            out.scan_filename = std::move(filename);
+            out.scan_type     = std::move(part_type);
+            out.scan_seen     = 0;
         }
-        if (!has_name)
-        {
-            err = refusal("MalformedPOSTRequest");
-            return form_scan::bad;
-        }
-        const size_t content = head_end + 4;
-        if (name == "file")
+        const size_t content = out.scan_head + 4;
+        if (out.scan_name == "file")
         {
             if (content > post_max_fields_bytes)
             {
                 err = refusal("MaxPostPreDataLengthExceeded");
                 return form_scan::bad;
             }
-            out.filename  = std::move(filename);
-            out.file_type = std::move(part_type);
+            out.filename  = std::move(out.scan_filename);
+            out.file_type = std::move(out.scan_type);
             out.file_at   = content;
             return form_scan::ok;
         }
-        const size_t end = in.find(delim, content);
+        const size_t end = in.find(delim, resume(content, delim.size()));
         if (end == std::string_view::npos)
             return more();
         // A field given twice is read as its first, which is the one a condition was written against.
-        if (!out.field(name))
-            out.fields.emplace_back(std::move(name), std::string(in.substr(content, end - content)));
+        if (!out.field(out.scan_name))
+            out.fields.emplace_back(std::move(out.scan_name), std::string(in.substr(content, end - content)));
         pos = end + delim.size();
+        out.scan_pos  = pos;
+        out.scan_head = 0;
+        out.scan_seen = 0;
     }
 }
 

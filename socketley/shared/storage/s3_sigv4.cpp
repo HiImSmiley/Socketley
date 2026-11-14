@@ -10,6 +10,7 @@
 #include <openssl/hmac.h>
 
 #include <algorithm>
+#include <map>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -311,15 +312,19 @@ bool query_param(std::string_view raw_query, std::string_view name, std::string&
 }
 
 // A signed header missing from the request, or an empty name, makes the list unusable.
+// So is one not in the order SigV4 writes it, sorted and each name once: a list repeating one name 500 times had every
+// request header read and appended 500 times, twice, before a signature nobody could have made was turned away.
 bool append_canonical_headers(std::string& out, std::span<const header_field> headers, std::string_view signed_list)
 {
     std::string_view rest = signed_list;
+    std::string_view last;
     while (true)
     {
         size_t semi = rest.find(';');
         std::string_view name = rest.substr(0, semi);
-        if (name.empty())
+        if (name.empty() || (!last.empty() && name <= last))
             return false;
+        last = name;
         bool found = false;
         out.append(name);
         out.push_back(':');
@@ -1000,7 +1005,8 @@ std::string v2_string_to_sign(const request_view& req, const verify_options& opt
     std::string s;
     append(s, {req.method, "\n", value("content-md5"), "\n", value("content-type"), "\n", date, "\n"});
     // Every x-amz-* header by its lowercase name, the values of one name joined by commas.
-    std::vector<std::pair<std::string, std::string>> amz;
+    // Grouped by a map, where a search of the list for each header cost 2,900 distinct names their count squared.
+    std::map<std::string, std::string> amz;
     for (const header_field& h : req.headers)
     {
         if (h.name.size() < 6)
@@ -1010,13 +1016,10 @@ std::string v2_string_to_sign(const request_view& req, const verify_options& opt
             ch = ascii::lower(ch);
         if (!name.starts_with("x-amz-"))
             continue;
-        const auto it = std::ranges::find_if(amz, [&](const auto& e) { return e.first == name; });
-        if (it == amz.end())
-            amz.emplace_back(std::move(name), std::string(trim(h.value)));
-        else
+        const auto [it, fresh] = amz.try_emplace(std::move(name), std::string(trim(h.value)));
+        if (!fresh)
             append(it->second, {",", trim(h.value)});
     }
-    std::ranges::sort(amz);
     for (const auto& [n, v] : amz)
         append(s, {n, ":", v, "\n"});
     const size_t resource = s.size();

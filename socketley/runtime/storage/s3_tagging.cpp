@@ -1,5 +1,6 @@
 #include "s3_tagging.h"
 
+#include <unordered_set>
 #include <cstdint>
 
 #include "s3_names.h"
@@ -174,6 +175,7 @@ bool parse_tagging_header(std::string_view header, tag_set& out, s3_error& err)
     const s3_error bad = tag_error("InvalidArgument",
         "The header 'x-amz-tagging' shall be encoded as UTF-8 then URLEncoded URL query parameters without tag name "
         "duplicates.");
+    std::unordered_set<std::string> names;
     while (!header.empty())
     {
         const std::string_view one = take_item(header, '&');
@@ -187,12 +189,13 @@ bool parse_tagging_header(std::string_view header, tag_set& out, s3_error& err)
             err = bad;
             return false;
         }
-        for (const auto& t : out)
-            if (t.first == k)
-            {
-                err = bad;
-                return false;
-            }
+        // A set answers whether a name came before: 8,000 names searched for in the list cost 3e7 comparisons ahead
+        // of check_tags() refusing more than ten.
+        if (!names.insert(k).second)
+        {
+            err = bad;
+            return false;
+        }
         out.emplace_back(std::move(k), std::move(v));
     }
     return check_tags(out, err);
