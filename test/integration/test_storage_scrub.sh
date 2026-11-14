@@ -75,7 +75,7 @@ out=$("$BIN" create storage scx -p "$P1" --dir "$T/x" --credentials "$T/creds" -
     --scrub 2s -s >/dev/null 2>&1 || { echo "  FAIL [create]: the runtime was not created"; exit 1; }
 wait_up "$P1" || bad "the runtime comes up" "no answer on $P1"
 shown=$("$BIN" show sc1 2>&1)
-echo "$shown" | grep -q '"scrub": 2' && ok "show names the scrub's period" || bad "show names the scrub's period" "$shown"
+grep -q '"scrub": 2' <<<"$shown" && ok "show names the scrub's period" || bad "show names the scrub's period" "$shown"
 run_lib "the alone half ran" alone "sc1:$P1" "$T/one"
 told=$(grep -c "does not hold the bytes its header names; restore it from a copy" "$SOCKETLEY_DLOG")
 [ "$told" = 4 ] && ok "each corrupt copy is logged once, saying what to do, however many passes find it" \

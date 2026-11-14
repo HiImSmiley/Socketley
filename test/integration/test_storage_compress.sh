@@ -66,7 +66,7 @@ out=$("$BIN" create storage czx -p "$P" --dir "$T/x" --credentials "$T/creds" --
     >/dev/null 2>&1 || { echo "  FAIL [create]: the runtime was not created"; exit 1; }
 wait_up "$P" || bad "the runtime comes up" "no answer on $P"
 shown=$("$BIN" show cz 2>&1)
-echo "$shown" | grep -q '"compress": 1' && ok "show names the age" || bad "show names the age" "$shown"
+grep -q '"compress": 1' <<<"$shown" && ok "show names the age" || bad "show names the age" "$shown"
 
 out=$(python3 "$HERE/lib_storage_compress.py" cz "$P" "$T/data" 2>&1); rc=$?
 echo "$out" | grep -E '^  (PASS|FAIL)'

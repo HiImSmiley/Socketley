@@ -170,7 +170,7 @@ if ! "$BIN" create storage rdst -p "$PD" --dir "$SOCKETLEY_TMPD/dst" --credentia
 fi
 wait_up "$PS" && wait_up "$PD" || bad "both runtimes come up" "no answer on $PS or $PD"
 shown=$("$BIN" show rsrc 2>&1)
-if echo "$shown" | grep -q "\"replication_targets\": \"$TARGETS\"" && ! echo "$shown" | grep -q "$REPL_SK"; then
+if grep -q "\"replication_targets\": \"$TARGETS\"" <<<"$shown" && ! grep -q "$REPL_SK" <<<"$shown"; then
     ok "show names the targets file and no secret in it"
 else
     bad "show names the targets file and no secret in it" "$shown"

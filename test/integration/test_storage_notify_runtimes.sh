@@ -132,7 +132,7 @@ PY
 }
 for _ in $(seq 1 50); do xr | grep -q '"key":"k1.feed"' && break; sleep 0.1; done
 out=$(xr)
-echo "$out" | grep -q ' event {"Records"' && echo "$out" | grep -q '"key":"k1.feed"' \
+grep -q ' event {"Records"' <<<"$out" && grep -q '"key":"k1.feed"' <<<"$out" \
     && ok "the cache's stream holds the event as an entry of one field, event" \
     || bad "the cache's stream holds the event as an entry of one field, event" "$out"
 for _ in $(seq 1 50); do [ "$(stat_of notify_sent)" -ge 3 ] && break; sleep 0.1; done

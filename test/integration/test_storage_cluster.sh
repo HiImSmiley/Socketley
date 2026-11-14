@@ -100,7 +100,7 @@ out=$("$BIN" create storage clx -p "$PX" --dir "$T/x" --credentials "$T/creds" -
     -s >/dev/null 2>&1 || { echo "  FAIL [create]: the nodes were not created"; exit 1; }
 wait_up "$PA" && wait_up "$PB" && wait_up "$PC" || bad "the nodes come up" "no answer on $PA, $PB or $PC"
 shown=$("$BIN" show cla 2>&1)
-if echo "$shown" | grep -q "\"nodes\": \"$T/cla.cluster\"" && ! echo "$shown" | grep -q "$NODE_SK"; then
+if grep -q "\"nodes\": \"$T/cla.cluster\"" <<<"$shown" && ! grep -q "$NODE_SK" <<<"$shown"; then
     ok "show names the nodes file and not its key"
 else
     bad "show names the nodes file and not its key" "$shown"
