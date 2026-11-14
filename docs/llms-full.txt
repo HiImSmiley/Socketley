@@ -11279,6 +11279,8 @@ socketley create mail m -p 25 --dns ns --idp auth --storage files/mail \
 
 **Sieve.** Users file their own mail with Sieve (RFC 5228). The supported extensions are fileinto, reject, ereject, envelope, encoded-character, imap4flags, copy, vacation, vacation-seconds, subaddress, body, relational, comparator-i;ascii-numeric, variables, date, index, mailbox, regex, editheader, duplicate, include, environment, spamtest, spamtestplus, virustest, enotify (mailto) and ihave.
 
+A regex test takes a POSIX extended regular expression without back-references and finds its leftmost match in time linear in the value, whatever the expression. A **^** or **$** is the start or end of the value, never of a line inside it. Forms POSIX does not have, such as **\d**, lazy repetition and Perl's groups, are refused when the script is uploaded.
+
 Users upload their scripts over ManageSieve (RFC 5804) on **--sieve**, with STARTTLS and SASL PLAIN using the password IMAP takes. They can also use **socketley mail** ... **sieve**. Each script is compiled as it is uploaded. A user may have at most 32 scripts of 64 KiB each, and 1 MiB in all. The scripts are kept under the runtime's state for every shard. A script is made active only if it compiles together with what it includes.
 
 The active script runs on a thread of its own for each message that reaches the user's mailbox, and reads the whole message. Its actions:
