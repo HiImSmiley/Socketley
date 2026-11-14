@@ -13,17 +13,25 @@ namespace socketley::http
 // Calls `visit` with the value of every cookie named `name` in a Cookie header, in order, until it answers true, and
 // says whether one did; a browser sends one cookie of a name per domain and path it was set for, so a caller that
 // verifies takes the first that verifies rather than the first there is.
+// At most max_cookies_of_a_name are visited: a browser sends a handful, and a caller that verifies spends a signature
+// check on each, so 85 forged session cookies in one head cost 4-6 ms of the loop before it was refused.
+inline constexpr int max_cookies_of_a_name = 8;
+
 template <class F>
 bool for_each_cookie(std::string_view header, std::string_view name, F&& visit)
 {
-    while (!header.empty())
+    int left = max_cookies_of_a_name;
+    while (!header.empty() && left > 0)
     {
         std::string_view part = take_item(header, ';');
         while (!part.empty() && (part.front() == ' ' || part.front() == '\t'))
             part.remove_prefix(1);
-        if (part.size() > name.size() && part.starts_with(name) && part[name.size()] == '=' &&
-            visit(part.substr(name.size() + 1)))
-            return true;
+        if (part.size() > name.size() && part.starts_with(name) && part[name.size()] == '=')
+        {
+            if (visit(part.substr(name.size() + 1)))
+                return true;
+            --left;
+        }
     }
     return false;
 }
