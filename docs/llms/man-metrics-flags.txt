@@ -98,7 +98,7 @@ Also keeps every line the daemon and its runtimes write, and answers queries for
 
 The lines are collected with the series at each tick, into one file per day in **logs/** of the runtime's directory. Grafana's Loki data source reads the runtime as it reads a Loki. Each line is labelled **job="socketley"**, **instance** (the daemon), **level** (**debug**, **info**, **warn**, **error**) and **name**. **name** is the runtime the line is about: the one that wrote it, or the one that a daemon line names. A start never collects a line twice. **socketley_log_lines_total** counts the lines by **name** and **level**, for a rule such as **increase(socketley_log_lines_total{level="error"}[5m]) > 0**.
 
-The supported LogQL is a selector with **=**, **!=**, **=~**, **!~**, and the line filters **|= "text"**, **!= "text"**, **|~ "regex"** and **!~ "regex"**, which match anywhere in the line. Over these, it supports **count_over_time**, **rate**, **bytes_over_time** and **bytes_rate**, with **sum**, **count**, **min**, **max**, **avg** by or without labels. A query without a selector is PromQL.
+The supported LogQL is a selector with **=**, **!=**, **=~**, **!~**, and the line filters **|= "text"**, **!= "text"**, **|~ "regex"** and **!~ "regex"**, which match anywhere in the line: at most 16 filters in a query of at most 64 KiB, whose regexes may cost about two seconds of the loop (bytes read times their programs) before it fails with 422. Over these, it supports **count_over_time**, **rate**, **bytes_over_time** and **bytes_rate**, with **sum**, **count**, **min**, **max**, **avg** by or without labels. A query without a selector is PromQL.
 
 ### `--logs-keep duration`
 
@@ -128,6 +128,8 @@ A Grafana data source of type Prometheus is pointed at **https://***domain* or *
 - the aggregations, with **by** and **without**;
 - **rate**, **irate**, **increase**, **delta**, **deriv**, **predict_linear** and the **_over_time** functions;
 - **histogram_quantile**, **label_replace**, **label_join**, **absent**, and the time and maths functions.
+
+A query nests at most 200 levels, each operator of a chain such as **a + b + c** counting as one; a label that **label_replace** or **label_join** makes is at most 64 KiB. **/api/v1/series** and **/api/v1/labels** take at most 256 **match[]**.
 
 Not supported: subqueries, **@**, and native histograms.
 

@@ -189,7 +189,7 @@ IMAP also offers:
 - CREATE-SPECIAL-USE, which accepts a special use only for the folder whose name has it;
 - BINARY, which returns a part with its transfer encoding undone;
 - OBJECTID, whose MAILBOXID a RENAME keeps;
-- METADATA (RFC 5464): entries of the server and of each folder, kept in the index, at most 1000 per user of 64 KiB each;
+- METADATA (RFC 5464): entries of the server and of each folder, kept in the index, at most 1000 per user of 64 KiB each, and at most 256 named in one GETMETADATA;
 - NOTIFY (RFC 5465), which tells a session within a second of changes. It reports new mail, expunges and flags in the folders it watches as STATUS, folders made and removed as LIST, and the selected folder between commands;
 - ACL (RFC 4314), by which a user gives others rights on a folder. The others see the folder under **Other Users/***owner***/** with what those rights allow (l r s w i k x t e a);
 - APPENDLIMIT.
@@ -205,6 +205,8 @@ RENAME takes the folders under a name along with it. RENAME INBOX moves its mess
 - Quota/get, query and changes (RFC 9425), with the octets of the user's quota;
 - Identity/get and set;
 - EmailSubmission/set, with its onSuccessUpdateEmail and onSuccessDestroyEmail.
+
+Email/get and Email/parse take at most 256 properties, each once, and an Email/query filter at most 256 conditions; an IMAP FETCH names at most 256 items.
 
 **/jmap/upload** and **/jmap/download** move blobs, and **/jmap/eventsource** reports state changes. A user signs in with HTTP Basic and their idp password, over TLS or from 127.0.0.1, or with a bearer token the idp gave a client that **--idp-audience** names.
 
