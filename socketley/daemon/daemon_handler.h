@@ -624,6 +624,9 @@ private:
     std::vector<pending_map_request> m_map_queue;
     io_request                       m_map_defer_req{};
     bool                             m_map_defer_armed{false};
+    // A command that creates, starts, stops or reconfigures ran code nothing runs again until the next one, so its
+    // reply going out releases the program's image (image_trim.h).
+    bool                             m_image_trim_due{false};
 
     // Above zero while this daemon is blocked waiting on a worker, during
     // which map requests are served where they arrive -- safe because

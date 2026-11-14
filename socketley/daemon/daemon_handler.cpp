@@ -115,6 +115,7 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include "../shared/json/json_escape.h"
 #include "../shared/util/number_parse.h"
 #include "../shared/util/transparent_string.h"
+#include "../shared/util/image_trim.h"
 
 // Two seconds is the backstop for a worker that has wedged, not a budget the
 // normal path spends -- a child reports in 17-22 ms -- and it is one budget
@@ -1163,6 +1164,12 @@ void daemon_handler::handle_write(struct io_uring_cqe* cqe, const io_request* re
                   "reply went out; closing it");
         close_client(it);
     }
+
+    if (m_image_trim_due)
+    {
+        m_image_trim_due = false;
+        image_trim::release();
+    }
 }
 
 // Take a client connection down, reached from every path where the daemon can
@@ -1525,6 +1532,16 @@ int daemon_handler::process_parsed(ipc_connection* conn, const parsed_args& pa)
     }
 
     const int rc = dispatch_command(conn, pa);
+    switch (pa.hashes[0])
+    {
+        case fnv1a("create"): case fnv1a("start"): case fnv1a("stop"): case fnv1a("remove"): case fnv1a("edit"):
+        case fnv1a("import"): case fnv1a("restart"): case fnv1a("reload"): case fnv1a("cluster-create"):
+        case fnv1a("cluster-remove"): case fnv1a("cluster-scale"):
+            m_image_trim_due = true;
+            break;
+        default:
+            break;
+    }
 
     // The names in the list that named nothing -- see resolve_names.  Written
     // through cout so the reply guard puts it after whatever the handler

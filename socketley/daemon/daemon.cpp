@@ -48,6 +48,7 @@
 #include "lua_setup.h"
 #include "../shared/util/transparent_string.h"
 #endif
+#include "../shared/util/image_trim.h"
 
 static int g_signal_write_fd = -1;
 
@@ -1032,6 +1033,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     const std::filesystem::path daemon_entry = register_daemon(paths);
 
     LOG_INFO("daemon started");
+
+    // Start-up -- parsing, the restore, the workers forked -- ran code that serving does not run again.
+    image_trim::release();
 
     loop.run();
 

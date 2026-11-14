@@ -31,6 +31,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/util/settings.h"
 #include "../../shared/util/heap_trim.h"
+#include "../../shared/util/image_trim.h"
 #include "../../shared/ipc/exit_bound.h"
 #include "../../shared/lua/lua_context.h"
 #include "../../shared/runtime/runtime_config_apply.h"
@@ -2517,6 +2518,9 @@ private:
         // The first figures ahead of the state that ends the daemon's wait, so a `stats` after `start` reads this worker.
         if (!push_stats()) {}
         send_state();
+
+        // Configuring, the script's loading and the start ran code that serving does not run again.
+        image_trim::release();
     }
 
     void on_stop()
