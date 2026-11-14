@@ -525,6 +525,9 @@ public:
     void zrangebyscore(std::string_view key, double min, double max,
                        bool min_incl, bool max_incl, bool reverse,
                        std::vector<std::pair<std::string_view, double>>& out) const;
+    // The same with LIMIT `off` `cnt` (cnt negative for all), found by rank, so a page of a large range costs the page.
+    void   zrangebyscore(std::string_view key, double min, double max, bool min_incl, bool max_incl, bool reverse,
+                         std::vector<std::pair<std::string_view, double>>& out, int64_t off, int64_t cnt) const;
     size_t zcount(std::string_view key, double min, double max,
                   bool min_incl, bool max_incl) const;
     // The lowest-scoring member, or the highest, removed and handed back.

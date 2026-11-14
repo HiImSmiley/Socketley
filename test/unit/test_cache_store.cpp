@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 #include "doctest.h"
 #include "thread_cpu.h"
@@ -212,6 +213,45 @@ TEST_CASE("cache_store leaving channels, LREM, SDIFF and SCAN cost what they tou
         found += page.size();
     } while (cur != 0);
     CHECK(found == 11111);
+}
+
+TEST_CASE("cache_store ZCOUNT, a page of ZRANGEBYSCORE and ZREMRANGEBYRANK cost log n and the page")
+{
+    cache_store store;
+    for (int i = 0; i < 1000000; ++i)
+        store.zadd("z", i % 1000, "m" + std::to_string(i));
+    const auto t0 = thread_cpu_now();
+    size_t total = 0;
+    std::vector<std::pair<std::string_view, double>> page;
+    for (int i = 0; i < 1000; ++i)
+    {
+        total += store.zcount("z", -INFINITY, INFINITY, true, true);
+        page.clear();
+        store.zrangebyscore("z", -INFINITY, INFINITY, true, true, false, page, 999000, 3);
+        CHECK(page.size() == 3);
+    }
+    // A million members walked for each was 1e9 steps.
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(total == 1000u * 1000000u);
+    CHECK(store.zcount("z", 10, 12, true, true) == 3000);
+    CHECK(store.zcount("z", 10, 12, false, false) == 1000);
+    CHECK(store.zcount("z", 12, 10, true, true) == 0);
+    // The same pages the whole range trimmed gives, forward and reversed, past the end and with no count.
+    for (const bool rev : {false, true})
+        for (const auto& [off, cnt] : std::vector<std::pair<int64_t, int64_t>>{{0, 5}, {998, 5}, {2995, 10}, {3000, 1}, {7, -1}})
+        {
+            std::vector<std::pair<std::string_view, double>> whole, paged;
+            store.zrangebyscore("z", 10, 12, true, true, rev, whole);
+            store.zrangebyscore("z", 10, 12, true, true, rev, paged, off, cnt);
+            std::vector<std::pair<std::string_view, double>> want;
+            for (size_t i = static_cast<size_t>(off); i < whole.size() && (cnt < 0 || want.size() < static_cast<size_t>(cnt)); ++i)
+                want.push_back(whole[i]);
+            CHECK(paged == want);
+        }
+    CHECK(store.zremrangebyrank("z", 999990, -1) == 10);
+    CHECK(store.zcard("z") == 999990);
+    CHECK(store.zremrangebyrank("z", 0, 1) == 2);
+    CHECK(store.zcount("z", 0, 0, true, true) == 998);
 }
 
 TEST_CASE("cache_store type conflicts")

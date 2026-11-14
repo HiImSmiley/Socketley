@@ -2386,6 +2386,32 @@ void cache_store::zrangebyscore(std::string_view key, double min, double max,
         std::reverse(out.begin(), out.end());
 }
 
+void cache_store::zrangebyscore(std::string_view key, double min, double max, bool min_incl, bool max_incl,
+                                bool reverse, std::vector<std::pair<std::string_view, double>>& out, int64_t off,
+                                int64_t cnt) const
+{
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end() || off < 0)
+        return;
+    const auto& ord = it->second.order;
+    const auto rank_of = [&](zskiplist::const_iterator e) {
+        return e == ord.end() ? ord.size() : ord.rank(e->first, e->second);
+    };
+    const size_t from = rank_of(score_lower(ord, min, min_incl));
+    const size_t to   = rank_of(score_lower(ord, max, !max_incl));
+    if (to <= from || static_cast<uint64_t>(off) >= to - from)
+        return;
+    const size_t have = to - from - static_cast<size_t>(off);
+    const size_t n = cnt < 0 ? have : std::min(have, static_cast<size_t>(cnt));
+    // Forward from `off` past the first; reversed, the last `off` are skipped and the page read from its low end.
+    const size_t first = reverse ? to - static_cast<size_t>(off) - n : from + static_cast<size_t>(off);
+    auto e = ord.at(first);
+    for (size_t i = 0; i < n && e != ord.end(); ++i, ++e)
+        out.emplace_back(std::string_view(e->second), e->first);
+    if (reverse)
+        std::reverse(out.begin(), out.end());
+}
+
 size_t cache_store::zcount(std::string_view key, double min, double max,
                            bool min_incl, bool max_incl) const
 {
@@ -2393,14 +2419,14 @@ size_t cache_store::zcount(std::string_view key, double min, double max,
     if (it == m_zsets.end())
         return 0;
     const auto& ord = it->second.order;
-    size_t n = 0;
-    for (auto e = score_lower(ord, min, min_incl); e != ord.end(); ++e)
-    {
-        if (e->first > max || (!max_incl && e->first == max))
-            break;
-        ++n;
-    }
-    return n;
+    // The ranks of the range's first member and of the first past it, as Redis's O(log n), where walking the range
+    // cost a million steps for ZCOUNT z -inf +inf.
+    const auto rank_of = [&](zskiplist::const_iterator e) {
+        return e == ord.end() ? ord.size() : ord.rank(e->first, e->second);
+    };
+    const size_t from = rank_of(score_lower(ord, min, min_incl));
+    const size_t to   = rank_of(score_lower(ord, max, !max_incl));
+    return to > from ? to - from : 0;
 }
 
 bool cache_store::zpop(std::string_view key, bool highest, std::string& member, double& score)
@@ -2428,14 +2454,12 @@ size_t cache_store::zremrangebyrank(std::string_view key, int64_t start, int64_t
     if (!resolve_range(static_cast<int64_t>(it->second.order.size()), s, e))
         return 0;
 
+    // From the start's index, found by the spans, rather than walked to from the first member.
     std::vector<std::string> doomed;
-    int64_t i = 0;
-    for (const auto& m : it->second.order)
-    {
-        if (i > e) break;
-        if (i >= s) doomed.emplace_back(m.second);
-        ++i;
-    }
+    const auto& ord = it->second.order;
+    auto m = ord.at(static_cast<size_t>(s));
+    for (int64_t i = s; i <= e && m != ord.end(); ++i, ++m)
+        doomed.emplace_back(m->second);
     for (const auto& m : doomed)
         zrem(key, m);
     return doomed.size();

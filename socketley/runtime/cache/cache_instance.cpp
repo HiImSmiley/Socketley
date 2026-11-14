@@ -3052,21 +3052,6 @@ static void encode_refusal(std::string& rb, std::string_view held, std::string_v
 // verb, the channel or pattern, and how many this connection now holds.  A
 // client counts down from that number to know when its own batch is done, and
 // +OK -- which is what this used to send -- gives it nothing to count.
-// LIMIT offset count over a range already in order, a negative count meaning
-// the rest of it, as Redis reads it.
-static void apply_zlimit(std::vector<std::pair<std::string_view, double>>& v,
-                         int64_t off, int64_t cnt)
-{
-    if (off < 0 || static_cast<uint64_t>(off) >= v.size())
-    {
-        v.clear();
-        return;
-    }
-    v.erase(v.begin(), v.begin() + off);
-    if (cnt >= 0 && static_cast<uint64_t>(cnt) < v.size())
-        v.resize(static_cast<size_t>(cnt));
-}
-
 static void sub_confirm(std::string& rb, std::string_view verb,
                         std::string_view name, uint32_t count)
 {
@@ -3163,24 +3148,38 @@ void cache_instance::resp_srandmember_count(std::string_view* args, int argc, st
         resp::encode_array_header_into(rb, 0);
         return;
     }
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    const auto draw = [] { return rng(); };
+    // Drawn from the table, as Redis does, where every member was copied out for a count of one: a few members of a
+    // million cost a million views each time.
+    if (count < 0 || static_cast<uint64_t>(count) * 3 < set->size())
+    {
+        const uint64_t n = count < 0 ? (count == INT64_MIN ? uint64_t{1} << 62 : static_cast<uint64_t>(-count))
+                                     : static_cast<uint64_t>(count);
+        if (n > (1u << 20))
+        { resp::encode_error_into(rb, "value is out of range"); return; }
+        resp::encode_array_header_into(rb, static_cast<int>(n));
+        if (count < 0)
+        {
+            for (uint64_t i = 0; i < n; ++i) resp::encode_bulk_into(rb, *set->at_random(draw));
+            return;
+        }
+        std::unordered_set<std::string_view> picked;
+        picked.reserve(n * 2);
+        while (picked.size() < n)
+            if (const std::string_view v = *set->at_random(draw); picked.insert(v).second)
+                resp::encode_bulk_into(rb, v);
+        return;
+    }
     std::vector<std::string_view> all;
     all.reserve(set->size());
     for (const auto& m : *set) all.emplace_back(m);
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    if (count > 0)
-    {
-        const size_t n = std::min(all.size(), static_cast<size_t>(count));
-        for (size_t i = 0; i < n; ++i)
-            std::swap(all[i], all[i + rng() % (all.size() - i)]);
-        resp::encode_array_header_into(rb, static_cast<int>(n));
-        for (size_t i = 0; i < n; ++i) resp::encode_bulk_into(rb, all[i]);
-        return;
-    }
-    const uint64_t n = count == INT64_MIN ? uint64_t{1} << 62 : static_cast<uint64_t>(-count);
-    if (n > (1u << 20))
-    { resp::encode_error_into(rb, "value is out of range"); return; }
+    // A third of the set or more: a shuffle's prefix, which draws would take long to fill without repeats.
+    const size_t n = std::min(all.size(), static_cast<size_t>(count));
+    for (size_t i = 0; i < n; ++i)
+        std::swap(all[i], all[i + rng() % (all.size() - i)]);
     resp::encode_array_header_into(rb, static_cast<int>(n));
-    for (uint64_t i = 0; i < n; ++i) resp::encode_bulk_into(rb, all[rng() % all.size()]);
+    for (size_t i = 0; i < n; ++i) resp::encode_bulk_into(rb, all[i]);
 }
 
 // Both UNSUBSCRIBE verbs, where naming nothing means everything held -- the
@@ -10916,8 +10915,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 if (!parse_score_bound(zrev ? args[3] : args[2], lo, lo_in)
                  || !parse_score_bound(zrev ? args[2] : args[3], hi, hi_in))
                 { resp::encode_error_code_into(rb, "ERR min or max is not a float"); break; }
-                m_store.zrangebyscore(args[1], lo, hi, lo_in, hi_in, zrev, zitems);
-                apply_zlimit(zitems, off, cnt);
+                m_store.zrangebyscore(args[1], lo, hi, lo_in, hi_in, zrev, zitems, off, cnt);
             }
             else
             {
@@ -12310,8 +12308,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             std::vector<std::pair<std::string_view, double>> out;
             m_store.check_expiry(args[1]);
-            m_store.zrangebyscore(args[1], lo, hi, lo_in, hi_in, rev, out);
-            apply_zlimit(out, off, cnt);
+            m_store.zrangebyscore(args[1], lo, hi, lo_in, hi_in, rev, out, off, cnt);
             resp::encode_array_header_into(rb,
                 static_cast<int>(out.size()) * (withscores ? 2 : 1));
             for (const auto& [m, sc] : out)
