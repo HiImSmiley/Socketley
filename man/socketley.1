@@ -18047,6 +18047,9 @@ three times per message.
 .PP
 What editheader adds or deletes appears in the message as it is kept and sent
 on, except for the Received and Auto\-Submitted headers.
+A redirect after the script changed the From is sent only when every author
+in this runtime's domains is the user's own address, as submission requires;
+otherwise the message is kept in INBOX.
 duplicate keeps a message's ID for twelve hours unless :seconds says
 otherwise, and for a week at most.
 duplicate and vacation remember at most 10,000 entries per user.
@@ -18068,7 +18071,9 @@ environment's imap.cause, imap.mailbox, imap.user, imap.email and
 imap.changedflags say what was done, and imap4flags starts from the message's
 flags.
 keep leaves the message with the flags the script left.
-fileinto files a copy, and redirect sends a copy on.
+fileinto files a copy, and redirect sends a copy on, only when every author
+the message names in this runtime's domains is the user's own address;
+otherwise the message is kept in the folder.
 If nothing keeps the message, it leaves the folder once its copies are in.
 reject is an error, and vacation does nothing.
 A message that the script's own fileinto puts in another folder runs no script
