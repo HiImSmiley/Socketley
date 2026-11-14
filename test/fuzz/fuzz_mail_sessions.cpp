@@ -649,6 +649,22 @@ void imap_store::put_upload(const std::string& name, std::string data, std::func
     });
 }
 
+void imap_store::uploads_held(const std::string& name, std::function<void(bool, uint64_t, size_t)> done, std::string,
+                              uint64_t, size_t)
+{
+    answer([name, done = std::move(done)] {
+        const std::string prefix = ".jmap-uploads/" + name + "/";
+        uint64_t bytes = 0;
+        size_t count = 0;
+        for (auto it = g_objects.lower_bound(prefix); it != g_objects.end() && it->first.starts_with(prefix); ++it)
+        {
+            bytes += it->second->size();
+            ++count;
+        }
+        done(true, bytes, count);
+    });
+}
+
 void imap_store::get_upload(const std::string& name, const std::string& id,
                             std::function<void(std::shared_ptr<const std::string>)> done)
 {
