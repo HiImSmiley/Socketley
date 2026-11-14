@@ -442,6 +442,11 @@ say("new mail is pushed as a StateChange to the verified one", len(p1) >= 2 and 
     "Email" in p1[1].get("changed", {}).get(acct, {}), p1)
 p2 = pushes("two", 2, 2)
 say("and only its verification to the one not verified", len(p2) == 1 and p2[0].get("@type") == "PushVerification", p2)
+# Uploads kept count with the mail against the account's quota, 1M here.
+st1, _, _ = call("POST", "/jmap/upload/%s/" % acct, os.urandom(400 * 1024), {"Content-Type": "application/octet-stream"})
+st2, _, data = call("POST", "/jmap/upload/%s/" % acct, os.urandom(700 * 1024), {"Content-Type": "application/octet-stream"})
+say("an upload within the quota is kept, one past it with the uploads kept is refused", st1 == 201 and st2 == 413 and
+    b"quota" in data, (st1, st2, data[:200]))
 # The clear from elsewhere
 st, _, _ = call("GET", "/.well-known/jmap", source="127.0.0.2")
 say("a password in the clear from another machine is refused", st == 403, st)

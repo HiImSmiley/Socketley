@@ -1546,6 +1546,47 @@ void imap_store::get_upload(const std::string& user, const std::string& id,
     body(upload_key(user, id), size, std::move(done), false);
 }
 
+void imap_store::uploads_held(const std::string& user, std::function<void(bool, uint64_t, size_t)> done,
+                              std::string after, uint64_t bytes, size_t count)
+{
+    mailboxes* boxes = m_run.boxes();
+    if (!boxes || !boxes->enabled())
+        return done(false, 0, 0);
+    rpc::request rq;
+    rq.kind = rpc::op::list;
+    rq.bucket = boxes->bucket();
+    rq.prefix = upload_key(user, {});
+    rq.start_after = std::move(after);
+    boxes->ask(boxes->storage(), rpc::encode(rq),
+               [this, user, done = std::move(done), bytes, count, alive = m_alive](request_status st,
+                                                                                  std::string_view b) mutable {
+                   if (!*alive)
+                       return;
+                   rpc::reply r;
+                   if (st != request_status::ok || !rpc::decode(b, rpc::op::list, r))
+                       return done(false, 0, 0);
+                   // A bucket no mail has made yet holds no uploads either.
+                   if (!r.ok)
+                       return r.code == "NoSuchBucket" ? done(true, bytes, count) : done(false, 0, 0);
+                   // What the hourly sweep has yet to take is past its day, and no longer the user's.
+                   const int64_t now = wall::now_ms();
+                   for (const auto& o : r.objects)
+                   {
+                       const size_t at = o.key.rfind("/U");
+                       const int64_t made = at == std::string::npos
+                                                ? 0
+                                                : static_cast<int64_t>(std::strtoull(o.key.c_str() + at + 2, nullptr, 16));
+                       if (now - made > 86400000)
+                           continue;
+                       bytes += o.size;
+                       ++count;
+                   }
+                   if (r.truncated && !r.objects.empty() && count <= max_uploads)
+                       return uploads_held(user, std::move(done), r.objects.back().key, bytes, count);
+                   done(true, bytes, count);
+               });
+}
+
 void imap_store::sweep_uploads(std::string after)
 {
     mailboxes* boxes = m_run.boxes();

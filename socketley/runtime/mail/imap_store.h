@@ -230,6 +230,10 @@ public:
     // A JMAP upload (RFC 8620 6.1): kept under .jmap-uploads/ of the bucket, apart from every user's folders, for a
     // day, its id naming its size so it is read back in one; the id answered, empty where it could not be written.
     void put_upload(const std::string& user, std::string data, std::function<void(std::string id)> done);
+    // The bytes and number of a user's uploads not yet swept, counted up to past max_uploads; false when unread.
+    static constexpr size_t max_uploads = 1000;
+    void uploads_held(const std::string& user, std::function<void(bool ok, uint64_t bytes, size_t count)> done,
+                      std::string after = {}, uint64_t bytes = 0, size_t count = 0);
     void get_upload(const std::string& user, const std::string& id, std::function<void(std::shared_ptr<const std::string>)> done);
 
     void tick(int64_t now);

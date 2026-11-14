@@ -148,6 +148,9 @@ private:
     std::string session_json(const request& rq) const;
     void api(const request& rq);
     void upload(const request& rq, const std::string& account);
+    void uploads_counted(const std::string& account, const std::string& type, std::string body, bool ok, uint64_t held,
+                         size_t count);
+    void store_upload(const std::string& account, const std::string& type, std::string body);
     void download(const std::string& account, const std::string& blob, const std::string& type,
                   const std::string& name);
     void eventsource(const request& rq);

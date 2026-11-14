@@ -944,8 +944,42 @@ void jmap_session::upload(const request& rq, const std::string& account)
     std::string type = rq.header("content-type");
     if (type.empty() || type.find_first_of("\r\n\"") != std::string::npos)
         type = "application/octet-stream";
-    const size_t size = rq.body.size();
-    m_store.put_upload(m_user, rq.body, [this, account, type, size, alive = m_alive](std::string id) {
+    // What a user keeps as uploads is held to the quota beside its mail, as storage taken is either way.
+    m_store.freshen(m_user, [this, account, type, body = rq.body, alive = m_alive]() mutable {
+        if (!*alive)
+            return;
+        m_store.uploads_held(m_user, [this, account, type, body = std::move(body), alive](bool ok, uint64_t held,
+                                                                                          size_t count) mutable {
+            if (!*alive)
+                return;
+            uploads_counted(account, type, std::move(body), ok, held, count);
+        });
+    });
+}
+
+void jmap_session::uploads_counted(const std::string& account, const std::string& type, std::string body, bool ok,
+                                   uint64_t held, size_t count)
+{
+    if (!ok)
+    {
+        fail(503, "about:blank", "the uploads kept cannot be counted now");
+        return finished();
+    }
+    const uint64_t quota = m_store.quota(m_user);
+    if (count >= imap_store::max_uploads || (quota && m_store.usage(m_user) + held + body.size() > quota))
+    {
+        fail(413, "urn:ietf:params:jmap:error:limit",
+             count >= imap_store::max_uploads ? "the most uploads kept at once are 1000, each for a day"
+                                              : "the upload with the mail and uploads kept is past the account's quota");
+        return finished();
+    }
+    store_upload(account, type, std::move(body));
+}
+
+void jmap_session::store_upload(const std::string& account, const std::string& type, std::string body)
+{
+    const size_t size = body.size();
+    m_store.put_upload(m_user, std::move(body), [this, account, type, size, alive = m_alive](std::string id) {
         if (!*alive)
             return;
         if (id.empty())
