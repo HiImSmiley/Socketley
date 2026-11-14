@@ -87,9 +87,9 @@ except socket.timeout:
 print("burst", len(got))
 PY
 )
-echo "$out" | grep -qx "one echo from a" && ok || bad "a datagram is carried to the service at home and its answer back" "$out"
-echo "$out" | grep -qx "two echo from b echo a again" && ok || bad "each visitor gets its own answers" "$out"
-echo "$out" | grep -qx "big True" && ok || bad "a datagram of eight thousand bytes is carried whole" "$out"
+grep -qx "one echo from a" <<<"$out" && ok || bad "a datagram is carried to the service at home and its answer back" "$out"
+grep -qx "two echo from b echo a again" <<<"$out" && ok || bad "each visitor gets its own answers" "$out"
+grep -qx "big True" <<<"$out" && ok || bad "a datagram of eight thousand bytes is carried whole" "$out"
 n=$(echo "$out" | sed -n 's/^burst //p')
 [ "${n:-0}" -ge 190 ] && ok || bad "two hundred at once come back, on loopback all but a few" "$n of 200"
 [ "$(python3 -c "

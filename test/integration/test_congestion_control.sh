@@ -22,7 +22,7 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 expect() { if [ "$2" = "$3" ]; then ok; else bad "$1" "got '$2', want '$3'"; fi; }
-has() { if printf '%s' "$2" | grep -qE -- "$3"; then ok; else bad "$1" "no /$3/ in: $(printf '%s' "$2" | head -c 400)"; fi; }
+has() { if grep -qE -- "$3" <<<"$2"; then ok; else bad "$1" "no /$3/ in: $(printf '%s' "$2" | head -c 400)"; fi; }
 
 echo "=== Integration: --congestion is the congestion control of every accepted connection ==="
 command -v ss >/dev/null 2>&1 || { echo "  SKIP: ss is required"; exit 0; }

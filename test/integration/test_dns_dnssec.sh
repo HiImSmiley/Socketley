@@ -83,7 +83,7 @@ signed=$(dig +dnssec +norec +time=2 +tries=1 -p "$NS" @127.0.0.1 mail.example.te
 case "$plain" in *RRSIG*) bad "no signature to a query without DO" "$plain" ;; *)
     case "$signed" in *"flags: do;"*RRSIG*) ok "a signature goes to a query with DO alone, and DO goes back" ;; *) bad "DO" "$signed" ;; esac ;; esac
 axfr=$(dig +time=2 +tries=1 -p "$NS" @127.0.0.1 example.test AXFR 2>/dev/null)
-[ "$(printf '%s\n' "$axfr" | grep -c 'IN	RRSIG')" -gt 5 ] && printf '%s' "$axfr" | grep -q 'IN	NSEC' \
+[ "$(printf '%s\n' "$axfr" | grep -c 'IN	RRSIG')" -gt 5 ] && grep -q 'IN	NSEC' <<<"$axfr" \
     && ok "a zone transfer carries the signatures and the chain" || bad "AXFR" "$(printf '%s\n' "$axfr" | head -20)"
 
 "$BIN" stop ns >/dev/null 2>&1; "$BIN" start ns >/dev/null 2>&1

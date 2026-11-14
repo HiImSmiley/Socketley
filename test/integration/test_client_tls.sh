@@ -336,7 +336,7 @@ if [ $? -ne 0 ]; then ok; else bad "--ca without --tls is refused" "it was accep
 CREATE_RC=$?
 sleep 0.5
 LISTED=$("$BIN" ps -a 2>/dev/null; "$BIN" ls 2>/dev/null)
-if [ $CREATE_RC -ne 0 ] && ! printf '%s\n' "$LISTED" | grep -q "tudp"; then ok; else
+if [ $CREATE_RC -ne 0 ] && ! grep -q "tudp" <<<"$LISTED"; then ok; else
     bad "--tls on a UDP client is refused where it is started" \
         "a UDP client came up under a TLS configuration and is sending datagrams in the clear"
 fi
