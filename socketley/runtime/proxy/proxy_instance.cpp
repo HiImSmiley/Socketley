@@ -3204,6 +3204,8 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         // flood is nearly every connection, so one getsockopt saves seven
         // socket options, a 64 KB struct, a backend socket and a handshake
         // spent on a peer that cannot receive a byte.
+        // On a TCP listener the getpeername below refuses the same sockets, a reset one being unconnected.
+        if (!m_bound_listen_path.empty())
         {
             int sock_err = 0;
             socklen_t err_len = sizeof(sock_err);
