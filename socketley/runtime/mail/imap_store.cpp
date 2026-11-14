@@ -550,13 +550,7 @@ void imap_store::note_line(const std::string& path, const std::string& key, bool
         for (const auto& [k, is_on] : live)
             if (is_on)
                 folded += k + "\t+\n";
-        const std::string tmp = path + ".new." + std::to_string(::getpid());
-        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        const bool ok = fd >= 0 && socketley::write_all(fd, folded.data(), folded.size());
-        if (fd >= 0)
-            ::close(fd);
-        if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
-            ::unlink(tmp.c_str());
+        if (!socketley::replace_file(path, folded, socketley::durability::none)) {}
         ::close(lock);
         return;
     }

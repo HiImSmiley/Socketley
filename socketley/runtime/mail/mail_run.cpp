@@ -3763,13 +3763,7 @@ void mail_run::save_auth()
     }
     auto body = std::make_shared<std::string>(std::move(text));
     m_pool.submit(0, [body, path = m_state_dir + "/auth"] {
-        const std::string tmp = path + ".tmp";
-        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        const bool ok = fd >= 0 && socketley::write_all(fd, body->data(), body->size());
-        if (fd >= 0)
-            ::close(fd);
-        if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
-            ::unlink(tmp.c_str());
+        if (!socketley::replace_file(path, *body, socketley::durability::none)) {}
     }, [] {});
 }
 

@@ -13,6 +13,7 @@
 #include "../../shared/crypto/mac.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::mail
 {
@@ -163,13 +164,7 @@ void greylist::fold(int64_t now_ms)
         const entry& e = m_entries[h];
         text += std::to_string(e.first_ms) + " " + std::to_string(e.passed_ms) + " " + h + "\n";
     }
-    const std::string tmp = m_path + ".tmp." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    const bool ok = fd >= 0 && socketley::write_all(fd, text.data(), text.size());
-    if (fd >= 0)
-        ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), m_path.c_str()) != 0)
-        ::unlink(tmp.c_str());
+    if (!socketley::replace_file(m_path, text, socketley::durability::none)) {}
     // Read again from the new file at the next check.
     m_ino = m_read = m_lines = 0;
     m_entries.clear();

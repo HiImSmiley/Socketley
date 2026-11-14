@@ -15,6 +15,7 @@
 #include "../shared/ipc/ipc_framing.h"
 #include "../shared/http/url.h"
 #include "../shared/persist/read_file.h"
+#include "../shared/persist/replaced_file.h"
 
 namespace fs = std::filesystem;
 
@@ -54,13 +55,8 @@ std::string cert_path_of(const std::string& pub)
 
 bool write_text(const std::string& path, const std::string& text)
 {
-    const std::string tmp = path + ".new";
-    {
-        std::ofstream f(tmp, std::ios::trunc);
-        if (!(f << text))
-            return false;
-    }
-    return std::rename(tmp.c_str(), path.c_str()) == 0;
+    // 0644 as ssh-keygen leaves a certificate, which the umask then narrows no further.
+    return socketley::replace_file(path, text, socketley::durability::data, nullptr, 0644);
 }
 
 // A new Ed25519 key at `path` made by ssh-keygen, which writes the private key in the form ssh reads.

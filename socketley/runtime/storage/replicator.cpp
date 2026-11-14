@@ -19,6 +19,7 @@
 #include "../../shared/util/hex.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::storage
 {
@@ -94,13 +95,7 @@ std::string unhex(std::string_view h)
 // Writes `text` beside `path` and renames it over, unsynced, for a note a crash may take back to an older one.
 bool replace_note(const std::string& path, const std::string& text)
 {
-    const std::string tmp = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return false;
-    const bool whole = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
-    ::close(fd);
-    return whole && ::rename(tmp.c_str(), path.c_str()) == 0;
+    return socketley::replace_file(path, text, socketley::durability::none);
 }
 
 // What a change sent to another node is, for the log.

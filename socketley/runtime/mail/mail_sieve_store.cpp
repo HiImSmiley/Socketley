@@ -15,6 +15,7 @@
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::mail
 {
@@ -37,19 +38,14 @@ void sync_dir(const std::string& dir)
 // with the directory where `durable`, as a script is and a memory need not be.
 bool write_whole(const std::string& path, std::string_view text, bool durable = true)
 {
-    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    const bool ok = fd >= 0 && socketley::write_all(fd, text.data(), text.size()) && (!durable || ::fsync(fd) == 0);
-    if (fd >= 0)
-        ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
+    // A failed directory sync is not a failed write: the script is in place, as it was before replace_file.
+    if (socketley::replace_file(path, text, durable ? socketley::durability::data : socketley::durability::none))
     {
-        ::unlink(tmp.c_str());
-        return false;
+        if (durable)
+            sync_dir(std::filesystem::path(path).parent_path().string());
+        return true;
     }
-    if (durable)
-        sync_dir(std::filesystem::path(path).parent_path().string());
-    return true;
+    return false;
 }
 
 // A user's directory locked against every other shard for as long as this lives.

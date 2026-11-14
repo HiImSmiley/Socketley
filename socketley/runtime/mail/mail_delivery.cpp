@@ -41,6 +41,7 @@
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/settings.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::mail
 {
@@ -1591,13 +1592,7 @@ void delivery::sts_save()
         if (p.expires_s > wall::now_ms() / 1000)
             text += tls_policy::cache_line(domain, p);
     // A cache: written whole and moved into place, and a crash loses at most the last fetch.
-    const std::string tmp = m_sts_path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    const bool ok = fd >= 0 && socketley::write_all(fd, text.data(), text.size());
-    if (fd >= 0)
-        ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), m_sts_path.c_str()) != 0)
-        ::unlink(tmp.c_str());
+    if (!socketley::replace_file(m_sts_path, text, socketley::durability::none)) {}
 }
 
 void delivery::poll_lookups(const std::string* key, uint64_t conn)

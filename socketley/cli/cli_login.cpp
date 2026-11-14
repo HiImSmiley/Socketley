@@ -19,6 +19,7 @@
 #include "../shared/persist/read_file.h"
 #include "../shared/util/ascii.h"
 #include "../runtime/idp/idp_logic.h"
+#include "../shared/persist/replaced_file.h"
 
 namespace fs = std::filesystem;
 using socketley::json::json_reader;
@@ -78,14 +79,8 @@ bool write_kept(const kept& k, std::string& err)
                              socketley::json::quote(k.refresh_token) + ",\"expires\":" + std::to_string(k.expires) +
                              "}\n";
     // Written beside and renamed over, so a reader never sees half of it.
-    const std::string tmp = p.string() + ".new." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    const bool ok = fd >= 0 && socketley::write_all(fd, text.data(), text.size()) && ::fsync(fd) == 0;
-    if (fd >= 0)
-        ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), p.c_str()) != 0)
+    if (!socketley::replace_file(p.string(), text, socketley::durability::data))
     {
-        ::unlink(tmp.c_str());
         err = "the tokens could not be kept in " + p.string();
         return false;
     }
