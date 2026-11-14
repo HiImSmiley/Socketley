@@ -16548,6 +16548,12 @@ Retained messages, cleared by an empty one.
 Topics and filters of at most 256 levels. A SUBSCRIBE to a deeper filter is
 refused for it (0x8F), and a PUBLISH to a deeper topic ends the connection.
 .IP \(bu 2
+A session holds at most 10,000 filters of at most 1 MiB together. A SUBSCRIBE
+past that is refused for the filters that do not fit (0x97, quota exceeded, or
+0x80 to 3.1.1). Retained messages are sent once for each filter a SUBSCRIBE
+names, and at QoS 0 none past the subscriber's write limit, which they would be
+dropped by.
+.IP \(bu 2
 Wills. A will is sent when a connection is lost, or when a 5.0 client
 disconnects and asks for it. It is not sent when the client disconnects
 cleanly. A 5.0 will delay is waited out if one is given, and the will is not
@@ -17767,7 +17773,8 @@ BINARY, which returns a part with its transfer encoding undone;
 OBJECTID, whose MAILBOXID a RENAME keeps;
 .IP \(bu 2
 METADATA (RFC 5464): entries of the server and of each folder, kept in the
-index, at most 1000 per user of 64 KiB each;
+index, at most 1000 per user of 64 KiB each, and at most 256 named in one
+GETMETADATA;
 .IP \(bu 2
 NOTIFY (RFC 5465), which tells a session within a second of changes.
 It reports new mail, expunges and flags in the folders it watches as STATUS,
@@ -17804,6 +17811,9 @@ Quota/get, query and changes (RFC 9425), with the octets of the user's quota;
 Identity/get and set;
 .IP \(bu 2
 EmailSubmission/set, with its onSuccessUpdateEmail and onSuccessDestroyEmail.
+.PP
+Email/get and Email/parse take at most 256 properties, each once, and an
+Email/query filter at most 256 conditions; an IMAP FETCH names at most 256 items.
 .PP
 .B /jmap/upload
 and
@@ -18923,7 +18933,9 @@ and the line filters
 .B |~ \(dqregex\(dq
 and
 .BR "!~ \(dqregex\(dq" ,
-which match anywhere in the line.
+which match anywhere in the line: at most 16 filters in a query of at most
+64 KiB, whose regexes may cost about two seconds of the loop (bytes read times
+their programs) before it fails with 422.
 Over these, it supports
 .BR count_over_time ,
 .BR rate ,
@@ -19050,6 +19062,19 @@ functions;
 .BR label_join ,
 .BR absent ,
 and the time and maths functions.
+.PP
+A query nests at most 200 levels, each operator of a chain such as
+.B a + b + c
+counting as one; a label that
+.B label_replace
+or
+.B label_join
+makes is at most 64 KiB.
+.B /api/v1/series
+and
+.B /api/v1/labels
+take at most 256
+.BR match[] .
 .PP
 Not supported: subqueries,
 .BR @ ,
