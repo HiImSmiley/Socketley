@@ -1454,7 +1454,10 @@ uint32_t event_loop::poll_completions(int timeout_ms)
         // spends answers for the phase instead of the instant.
         m_busy_credit = m_spin ? credit_after_turn(m_last_batch, m_busy_credit) : 0;
 
-        for (uint32_t s = m_busy_credit ? SPIN_BUDGET - spun : 0; s > 0; --s)
+        const uint64_t stream_until = m_stream_spin && m_busy_credit
+                                          ? socketley::turn_clock::read_ns() + STREAM_SPIN_NS : 0;
+        for (uint32_t s = m_busy_credit ? SPIN_BUDGET - spun : 0;
+             s > 0 || (stream_until && socketley::turn_clock::read_ns() < stream_until); s -= (s > 0))
         {
             // Entering the ring is what runs the task work that posts
             // completions under DEFER_TASKRUN, so this is a syscall and

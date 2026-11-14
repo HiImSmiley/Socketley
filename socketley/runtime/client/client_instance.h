@@ -434,4 +434,6 @@ private:
     // The kernel re-arming the recv instead of this client doing it per
     // message; off wherever the ring or SOCKETLEY_RECV_MULTISHOT says so.
     bool m_recv_multishot{false};
+    // A read of at least a full TLS record is a stream, and the loop spins before sleeping while reads are that size.
+    static constexpr size_t STREAM_SPIN_BYTES = 16384;
 };

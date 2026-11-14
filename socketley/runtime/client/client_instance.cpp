@@ -868,7 +868,8 @@ bool client_instance::setup(event_loop& loop)
 {
     m_loop = &loop;
     m_ring_loop = &loop;
-    // Clients are made one per connection and many share a core, where a spin only takes the core from the others.
+    // Off until reads are stream-sized: clients are made one per connection and many share a core, where a spin
+    // only takes the core from the others.
     loop.set_busy_spin(false);
 
     // The occupied flags survive a stop, because a deregistered owner's
@@ -1226,6 +1227,12 @@ void client_instance::handle_read(conn_t* conn, struct io_uring_cqe* cqe)
     // while the buffer this read holds is still owed to the group.
     event_loop* const ring = m_loop;
     const size_t len = static_cast<size_t>(cqe->res);
+    // A stream this client drains faster than it arrives would otherwise sleep after every read and be woken for
+    // every write, which on loopback the sender pays for.
+    if (len >= STREAM_SPIN_BYTES)
+        ring->spin_for_stream();
+    else
+        ring->set_busy_spin(false);
     const uint16_t buf_id = static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
     char* data = is_provided ? ring->get_buf_ptr(BUF_GROUP_ID, buf_id)
                                    : conn->read_buf.get();

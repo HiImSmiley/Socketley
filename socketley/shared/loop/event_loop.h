@@ -59,7 +59,10 @@ public:
     // How many CPUs a helper thread of this process runs on, which the I/O thread's own set no longer says.
     static unsigned helper_cpu_count();
     // Whether a quiet turn enters the ring again before it sleeps; on unless a runtime says otherwise.
-    void set_busy_spin(bool on) { m_spin = on; }
+    void set_busy_spin(bool on) { m_spin = on; m_stream_spin = false; }
+    // Spinning on, with the credit a batch would have earned and for STREAM_SPIN_NS at least, for an owner that knows
+    // its traffic is a stream.
+    void spin_for_stream() { m_spin = true; m_stream_spin = true; m_busy_credit = BUSY_CREDIT; }
 
     bool init();
 
@@ -468,6 +471,10 @@ private:
     static constexpr uint32_t BUSY_CREDIT = 64;
     uint32_t m_busy_credit{0};
     bool     m_spin{true};
+    // A stream's spin lasts a time and not a count of entries, because the gap it must cover is the sender's next
+    // write, and one that was woken for every write writes slower than 32 entries last.
+    static constexpr uint64_t STREAM_SPIN_NS = 50000;
+    bool     m_stream_spin{false};
     // The credit after a turn that found nothing: a batch refills it and a
     // quiet turn spends one, written once so a turn can read what the
     // settlement will say before it makes the entry the answer depends on.
