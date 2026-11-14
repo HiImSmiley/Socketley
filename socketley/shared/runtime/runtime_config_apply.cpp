@@ -227,6 +227,8 @@ void apply_metrics_config(metrics_instance& mt, const runtime_config& cfg, bool 
         mt.set_downsample(cfg.metrics_downsample);
     if (asked("max_series", true))
         mt.set_max_series(cfg.metrics_max_series);
+    if (asked("query_timeout", true))
+        mt.set_query_timeout(cfg.metrics_query_timeout);
     if (asked("durable", true))
         mt.set_durable(cfg.metrics_durable);
     if (asked("logs", true))

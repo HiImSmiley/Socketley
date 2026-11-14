@@ -75,6 +75,9 @@ public:
     // The most series the head holds before a new one is refused (--max-series).
     void set_max_series(uint32_t n) { m_c.max_series = n; }
     uint32_t get_max_series() const { return m_c.max_series; }
+    // Seconds a query of the API may hold the loop before it is ended with 503 (--query-timeout).
+    void set_query_timeout(uint32_t s) { m_c.query_timeout = s; }
+    uint32_t get_query_timeout() const { return m_c.query_timeout; }
     // Every sample logged as it comes, so a crash loses none (--durable).
     void set_durable(bool on) { m_c.durable = on; }
     bool get_durable() const { return m_c.durable; }
@@ -112,6 +115,7 @@ public:
         uint64_t keep{30ull * 86400};
         std::string downsample{"5m:1y,1h:5y"};
         uint32_t max_series{200'000};
+        uint32_t query_timeout{5};
         bool durable{false};
         std::string rules;
         std::string notify;

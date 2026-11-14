@@ -2,6 +2,7 @@
 // What the metrics runtime's store, its query language and its rules agree on: a series is a sorted set of labels,
 // its samples are milliseconds and doubles, and a coarser tier holds one aggregate per step.
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -70,6 +71,38 @@ struct matcher
 };
 
 // What the query engine reads; the store implements it, and a test can with a vector.
+// What a query may still spend: its work is held to its deadline, looked at every 2^16 units, and the regexes it runs
+// over label values to 2^32 instruction-bytes, since one match is not stopped once it runs.
+struct work_meter
+{
+    std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::time_point::max()};
+    uint64_t work{0};
+    uint64_t next_check{0};
+    uint64_t regex_work{0};
+    bool     regex_over{false};
+    static constexpr uint64_t regex_cap = uint64_t{1} << 32;
+
+    // False once the deadline has passed.
+    bool tick(uint64_t n)
+    {
+        work += n;
+        if (work < next_check)
+            return true;
+        next_check = work + (1u << 16);
+        return std::chrono::steady_clock::now() < deadline;
+    }
+    // False, before it runs, for a regex over `bytes` of a program of `program` instructions past the cap or the
+    // deadline.
+    bool regex(size_t bytes, size_t program)
+    {
+        const uint64_t n = (uint64_t{bytes} + 1) * program;
+        regex_work += n;
+        if (regex_work > regex_cap)
+            return !(regex_over = true);
+        return tick(n);
+    }
+};
+
 class series_source
 {
 public:
@@ -77,6 +110,14 @@ public:
 
     // The ids of the series every matcher accepts that hold a sample in [mint, maxt], ascending.
     virtual void select(std::span<const matcher> ms, int64_t mint, int64_t maxt, std::vector<uint32_t>& out) = 0;
+    // The same, held to `meter` as the matchers' regexes run over the label values; false, and `out` empty, once it
+    // is spent.
+    virtual bool select_within(std::span<const matcher> ms, int64_t mint, int64_t maxt, std::vector<uint32_t>& out,
+                               work_meter& meter)
+    {
+        select(ms, mint, maxt, out);
+        return meter.tick(out.size());
+    }
     virtual const label_set& labels(uint32_t id) const = 0;
     // The labels of `id` into `out`, for a caller that keeps its own copy and so needs none kept for it.
     virtual void copy_labels(uint32_t id, label_set& out) const { out = labels(id); }

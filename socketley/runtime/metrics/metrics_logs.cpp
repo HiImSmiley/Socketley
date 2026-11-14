@@ -325,6 +325,9 @@ bool grouping(lexer& lx, logql& q)
             return false;
         q.grouping.push_back(id);
     }
+    // In order and each once, as a stream's labels are looked up in it by halving.
+    std::sort(q.grouping.begin(), q.grouping.end());
+    q.grouping.erase(std::unique(q.grouping.begin(), q.grouping.end()), q.grouping.end());
     return true;
 }
 
@@ -494,7 +497,7 @@ void metric_eval(const log_store& s, const logql& q, std::string_view instance, 
         label_set g;
         for (const auto& l : st.labels)
         {
-            const bool named = std::find(q.grouping.begin(), q.grouping.end(), l.name) != q.grouping.end();
+            const bool named = std::binary_search(q.grouping.begin(), q.grouping.end(), l.name);
             if (q.agg.empty() || named != q.without)
                 g.push_back(l);
         }

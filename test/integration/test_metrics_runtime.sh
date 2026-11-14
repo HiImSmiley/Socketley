@@ -192,6 +192,15 @@ sleep 2.5
 has "past --max-series new series are refused and counted" \
     "$(curl -s "http://127.0.0.1:$((B+13))/metrics")" 'socketley_metrics_series_refused_total\{name="mm"\} [1-9]'
 
+# ── query-timeout ───────────────────────────────────────────────────────────
+# A query holds the loop that scrapes and takes remote_write, for 120 s before; 5 s now unless asked, at most 2 min.
+has "--query-timeout is at most 2m" "$(S create metrics mqt -p $((B+19)) --query-timeout 3m 2>&1)" '--query-timeout requires'
+has "and at least 1s" "$(S create metrics mqt -p $((B+19)) --query-timeout 0s 2>&1)" '--query-timeout requires'
+S create metrics mqt -p $((B+19)) --query-timeout 2s -s >/dev/null 2>&1
+has "--query-timeout is kept" "$(S show mqt 2>&1)" '"query_timeout": 2,'
+has "and a runtime without it has 5 s" "$(S show mm 2>&1)" '"query_timeout": 5,'
+has "a running one takes it at a start" "$(S edit mqt --query-timeout 9s 2>&1)" '--restart'
+
 # ── a restart keeps what was stored ─────────────────────────────────────────
 BEFORE=$(F /api/v1/query 'count(count by (__name__)({__name__=~".+"}))' | grep -oE '"[0-9]+"\]' | tr -dc 0-9)
 S stop ma >/dev/null; S start ma >/dev/null

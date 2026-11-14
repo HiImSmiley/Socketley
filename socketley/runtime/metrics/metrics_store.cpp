@@ -1756,11 +1756,20 @@ store_stats store::stats() const
 
 void store::select(std::span<const matcher> ms, int64_t mint, int64_t maxt, std::vector<uint32_t>& out)
 {
+    work_meter unbounded;
+    select_within(ms, mint, maxt, out, unbounded);
+}
+
+bool store::select_within(std::span<const matcher> ms, int64_t mint, int64_t maxt, std::vector<uint32_t>& out,
+                          work_meter& meter)
+{
     out.clear();
-    m->index.match(ms, m->candidates);
+    if (!m->index.match(ms, m->candidates, &meter))
+        return false;
     for (uint32_t id : m->candidates)
         if (m->has_data(id, mint, maxt))
             out.push_back(id);
+    return meter.tick(m->candidates.size());
 }
 
 const label_set& store::labels(uint32_t id) const

@@ -326,9 +326,10 @@ const series_index::name_entry* series_index::name_of(std::string_view name) con
     return &m_names[m_name_of_sym[s] - 1];
 }
 
-void series_index::match(std::span<const matcher> ms, std::vector<uint32_t>& out) const
+bool series_index::match(std::span<const matcher> ms, std::vector<uint32_t>& out, work_meter* meter) const
 {
     out.clear();
+    bool spent = false;
     const uint32_t universe = size();
     std::vector<std::vector<uint32_t>> pos, neg;
     std::vector<const std::vector<uint32_t>*> lists;
@@ -377,8 +378,17 @@ void series_index::match(std::span<const matcher> ms, std::vector<uint32_t>& out
         }
         else
             for (uint32_t p : ne->postings)
-                if (accepts(symbol(m_postings[p].value)) != takes_empty)
+            {
+                const std::string_view v = symbol(m_postings[p].value);
+                // Charged before it runs, since a regex over a long value is not stopped inside.
+                if (meter && !literal && c->k == compiled::kind::general && !meter->regex(v.size(), c->re.program_size()))
+                {
+                    spent = true;
+                    return false;
+                }
+                if (accepts(v) != takes_empty)
                     lists.push_back(&m_postings[p].ids);
+            }
         if (!takes_empty)
         {
             if (lists.empty())
@@ -396,7 +406,7 @@ void series_index::match(std::span<const matcher> ms, std::vector<uint32_t>& out
 
     for (const matcher& m : ms)
         if (!eval(m))
-            return;
+            return !spent;
 
     std::vector<uint32_t> cur, tmp;
     if (pos.empty())
@@ -424,6 +434,7 @@ void series_index::match(std::span<const matcher> ms, std::vector<uint32_t>& out
         cur.swap(tmp);
     }
     out = std::move(cur);
+    return true;
 }
 
 void series_index::label_names(std::vector<std::string>& out) const

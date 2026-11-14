@@ -106,6 +106,8 @@ public:
 
     // ── series_source ──
     void select(std::span<const matcher> ms, int64_t mint, int64_t maxt, std::vector<uint32_t>& out) override;
+    bool select_within(std::span<const matcher> ms, int64_t mint, int64_t maxt, std::vector<uint32_t>& out,
+                       work_meter& meter) override;
     const label_set& labels(uint32_t id) const override;
     void copy_labels(uint32_t id, label_set& out) const override;
     // What labels() made given back, which a request or a round of rules calls once nothing holds its references.

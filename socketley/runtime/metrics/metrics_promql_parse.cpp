@@ -2,6 +2,7 @@
 #include "shared/util/regex.h"
 #include "metrics_text.h"
 
+#include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -602,6 +603,7 @@ private:
                 n->on = ident("on");
                 advance();
                 label_list(n->match_labels);
+                sort_names(n->match_labels);
                 matching = true;
                 if (ident("group_left") || ident("group_right"))
                 {
@@ -645,9 +647,8 @@ private:
             fail("vector matching only allowed between instant vectors", n.pos);
         if (n.on)
             for (const auto& i : n.include)
-                for (const auto& m : n.match_labels)
-                    if (i == m)
-                        fail("label \"" + i + "\" must not occur in ON and GROUP clause at once", n.pos);
+                if (std::binary_search(n.match_labels.begin(), n.match_labels.end(), i))
+                    fail("label \"" + i + "\" must not occur in ON and GROUP clause at once", n.pos);
     }
 
     std::unique_ptr<expr_node> unary()
@@ -821,6 +822,14 @@ private:
         return n;
     }
 
+    // A by, without or on list in order and each name once, which a series' labels are looked up in by halving: a
+    // 64 KiB query names 5,000 of them, and each label of each series was compared with all.
+    static void sort_names(std::vector<std::string>& names)
+    {
+        std::sort(names.begin(), names.end());
+        names.erase(std::unique(names.begin(), names.end()), names.end());
+    }
+
     void label_list(std::vector<std::string>& out)
     {
         expect(tk::lparen, "grouping opts");
@@ -947,6 +956,7 @@ private:
                 n->without = ident("without");
                 advance();
                 label_list(n->grouping);
+                sort_names(n->grouping);
                 grouped = true;
             }
         };

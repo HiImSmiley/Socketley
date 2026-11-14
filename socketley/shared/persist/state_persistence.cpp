@@ -798,6 +798,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.metrics_keep = mt->get_keep();
             cfg.metrics_downsample = std::string(mt->get_downsample());
             cfg.metrics_max_series = mt->get_max_series();
+            cfg.metrics_query_timeout = mt->get_query_timeout();
             cfg.metrics_durable = mt->get_durable();
             cfg.metrics_logs = mt->get_logs();
             cfg.metrics_logs_keep = mt->get_logs_keep();
@@ -1365,6 +1366,7 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_int_field("keep", cfg.metrics_keep);
             append_str_field("downsample", cfg.metrics_downsample);
             append_int_field("max_series", cfg.metrics_max_series);
+            append_int_field("query_timeout", cfg.metrics_query_timeout);
             append_bool_field("durable", cfg.metrics_durable);
             append_bool_field("logs", cfg.metrics_logs);
             append_int_field("logs_keep", cfg.metrics_logs_keep);
@@ -1770,6 +1772,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             if (!json_has_key(json, "downsample"))
                 cfg.metrics_downsample = "5m:1y,1h:5y";
             cfg.metrics_max_series = json_get_uint32(json, "max_series", 200000);
+            cfg.metrics_query_timeout = json_get_uint32(json, "query_timeout", 5);
             cfg.metrics_durable = json_get_bool(json, "durable");
             cfg.metrics_logs = json_get_bool(json, "logs");
             cfg.metrics_logs_keep = json_get_size(json, "logs_keep", 14ull * 86400);

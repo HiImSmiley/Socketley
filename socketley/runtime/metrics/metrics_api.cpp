@@ -503,6 +503,9 @@ bool metrics_run::matched(const api_params& p, int64_t mint, int64_t maxt, std::
         return false;
     }
     std::vector<uint32_t> one, merged;
+    // Held to the time a query has, its selectors' regexes over the label values with it.
+    work_meter meter;
+    meter.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(m_engine.limits().timeout_ms);
     for (const std::string_view sel : sels)
     {
         std::unique_ptr<expr_node> e;
@@ -519,7 +522,15 @@ bool metrics_run::matched(const api_params& p, int64_t mint, int64_t maxt, std::
             return false;
         }
         one.clear();
-        m_store.select(e->matchers, mint, maxt, one);
+        if (!m_store.select_within(e->matchers, mint, maxt, one, meter))
+        {
+            if (meter.regex_over)
+                fail(out, false, 422, "execution", "the selectors' regexes would cost more than 2^32 "
+                                                   "instruction-bytes over the label values");
+            else
+                fail(out, false, 503, "timeout", "query timed out in series selection");
+            return false;
+        }
         // Merged as it comes, so the ids held are the distinct ones and not every selector's copy of them.
         std::sort(one.begin(), one.end());
         one.erase(std::unique(one.begin(), one.end()), one.end());

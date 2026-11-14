@@ -2298,6 +2298,9 @@ int parse_metrics_flags(metrics_instance* mt, const parsed_args& pa, size_t& i, 
             ++i;
             return 0;
         }
+        case fnv1a("--query-timeout"):
+            return duration("--query-timeout requires how long a query may run, from 1s to 2m, as 5s\n", 1, 120,
+                            [&](int64_t s) { mt->set_query_timeout(static_cast<uint32_t>(s)); });
         case fnv1a("--durable"):
             mt->set_durable(true);
             return 0;

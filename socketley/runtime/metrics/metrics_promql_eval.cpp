@@ -9,6 +9,7 @@
 #include "metrics_text.h"
 
 #include <algorithm>
+#include <set>
 #include <charconv>
 #include <cmath>
 #include <limits>
@@ -121,9 +122,10 @@ void key_into(std::string& key, const label& l)
     key += '\xff';
 }
 
+// `names` as the parser leaves a by, without or on list: in order, each name once.
 bool listed(const std::vector<std::string>& names, std::string_view n)
 {
-    return std::find(names.begin(), names.end(), n) != names.end();
+    return std::binary_search(names.begin(), names.end(), n, std::less<>{});
 }
 
 // Whether an aggregation keeps label `l` of a series: what `by` lists or `without` does not, the name never.
@@ -711,7 +713,7 @@ evaluator::evaluator(series_source& src, const query_limits& lim, query_stats& s
     : m_src(src), m_lim(lim), m_stats(stats), m_sc(sc), m_start(start), m_end(end), m_step(step)
 {
     m_n = step > 0 ? static_cast<size_t>((end - start) / step) + 1 : 1;
-    m_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(lim.timeout_ms);
+    m_meter.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(lim.timeout_ms);
 }
 
 void evaluator::charge(uint64_t n)
@@ -725,18 +727,18 @@ void evaluator::release(uint64_t n) { m_live -= std::min(n, m_live); }
 
 void evaluator::tick(uint64_t work)
 {
-    m_work += work;
-    if (m_work < m_next_check)
-        return;
-    m_next_check = m_work + (1u << 16);
-    if (std::chrono::steady_clock::now() >= m_deadline)
+    if (!m_meter.tick(work))
         throw eval_fail{"timeout", "query timed out in expression evaluation"};
 }
 
 void evaluator::select(const expr_node& sel, int64_t mint, int64_t maxt, std::vector<uint32_t>& ids, bool any_order)
 {
     ids.clear();
-    m_src.select(sel.matchers, mint, maxt, ids);
+    if (!m_src.select_within(sel.matchers, mint, maxt, ids, m_meter))
+        throw m_meter.regex_over
+            ? eval_fail{"execution", "the selector's regexes would cost more than 2^32 instruction-bytes over the "
+                                     "label values"}
+            : eval_fail{"timeout", "query timed out in series selection"};
     // By labels where the order is the answer's; by id under an aggregation it cannot change, which sorts numbers
     // instead of 50,000 label sets for a dashboard's sum by (code).
     if (any_order)
@@ -1076,16 +1078,13 @@ label_set evaluator::absent_labels(const expr_node& e)
     if (sel->k != expr_node::kind::vector_sel && sel->k != expr_node::kind::matrix_sel)
         return {};
     label_set out;
-    std::vector<std::string> seen;
+    std::set<std::string_view> seen;
     for (const auto& m : sel->matchers)
     {
         if (m.name == name_label)
             continue;
-        if (m.op == match_op::eq && !listed(seen, m.name))
-        {
+        if (m.op == match_op::eq && seen.insert(m.name).second)
             set_label(out, m.name, m.value);
-            seen.push_back(m.name);
-        }
         else
             set_label(out, m.name, {});
     }

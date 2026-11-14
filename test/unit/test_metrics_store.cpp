@@ -1293,6 +1293,58 @@ TEST_CASE("an aggregation folds a range function's series as they are read, into
             }
 }
 
+TEST_CASE("a selector's regexes over the label values are held to the query's time, and its by list is halved")
+{
+    tmpdir d;
+    store s;
+    std::string why;
+    REQUIRE(s.open(d.path, small_config(), why));
+    const std::string pad(1000, 'a');
+    for (int i = 0; i < 600; ++i)
+    {
+        const std::string v = pad + std::to_string(i);
+        const uint32_t id = s.get_or_create(L({{"__name__", "r"}, {"v", v.c_str()}}));
+        REQUIRE(s.append(id, T0 + 1000, 1));
+    }
+    query_engine eng(s);
+    eng.limits().timeout_ms = 200;
+    // Each value keeps a thousand of the regex's threads alive to its end: the index ran all 600, 1.6 s, and the
+    // query was answered past its deadline.
+    query_result r;
+    query_error err;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(eng.eval_instant(R"(r{v=~"(a?){500}a{500}b"})", T0 + 2000, r, err));
+    const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    MESSAGE("a selector's regex over 600 values of 1 KB: " << took << " s, " << err.type << ": " << err.message);
+    CHECK(err.type == "timeout");
+    CHECK(took < 1.0);
+    // A cheap one is answered as before.
+    REQUIRE(eng.eval_instant(R"(count(r{v=~"a+1.*"}))", T0 + 2000, r, err));
+    CHECK(r.series.at(0).points.at(0).v == 111);
+
+    // 9,000 names in by, without and on, each label of each of 30,000 series compared with every one: 1.2 s before.
+    for (int i = 0; i < 30000; ++i)
+    {
+        const std::string a = std::to_string(i % 7), b = std::to_string(i);
+        const uint32_t id = s.get_or_create(L({{"__name__", "g"}, {"a", a.c_str()}, {"b", b.c_str()}, {"c", "x"}}));
+        REQUIRE(s.append(id, T0 + 1000, 1));
+    }
+    eng.limits().timeout_ms = 120'000;
+    std::string names;
+    for (int i = 0; i < 9000; ++i)
+        names += "n" + std::to_string(i) + ",";
+    const auto t1 = std::chrono::steady_clock::now();
+    REQUIRE_MESSAGE(eng.eval_instant("sum by (" + names + "a, a) (g)", T0 + 2000, r, err), err.message);
+    CHECK(r.series.size() == 7);
+    REQUIRE_MESSAGE(eng.eval_instant("count without (" + names + "b, c) (g)", T0 + 2000, r, err), err.message);
+    CHECK(r.series.size() == 7);
+    REQUIRE_MESSAGE(eng.eval_instant("count(g * on (" + names + "a, b) g)", T0 + 2000, r, err), err.message);
+    CHECK(r.series.at(0).points.at(0).v == 30000);
+    const double grouped = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    MESSAGE("by, without and on of 9,002 names over 30,000 series: " << grouped << " s");
+    CHECK(grouped < 0.5);
+}
+
 TEST_CASE("perf: a dashboard's sum by (code) (rate(x[1m])) over 50,000 counters of six minutes at 1 s")
 {
     // The docs' range query: 50 targets of 1000 counters each, scraped every second, five minutes at a 15 s step.

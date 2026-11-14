@@ -113,13 +113,11 @@ private:
     int64_t m_start, m_end, m_step;
     size_t  m_n{1};
     uint64_t m_live{0};
-    uint64_t m_work{0};
-    uint64_t m_next_check{0};
     // Set by an aggregation no order of its input changes for the selector or range function it evaluates directly,
     // and taken by it: that one reads its series by id, and a range function folds them into these groups.
     bool m_any_order{false};
     fold* m_fold{nullptr};
-    std::chrono::steady_clock::time_point m_deadline;
+    work_meter m_meter;
 };
 
 }   // namespace socketley::metrics

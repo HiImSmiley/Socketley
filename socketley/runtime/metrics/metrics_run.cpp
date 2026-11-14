@@ -98,6 +98,7 @@ metrics_run::~metrics_run()
 bool metrics_run::start(std::string& why)
 {
     m_every_ms = static_cast<int64_t>(m_owner.get_every()) * 1000;
+    m_engine.limits().timeout_ms = static_cast<int64_t>(m_owner.get_query_timeout()) * 1000;
     store_config cfg;
     cfg.keep_raw = static_cast<int64_t>(m_owner.get_keep()) * 1000;
     std::vector<std::pair<int64_t, int64_t>> tiers;

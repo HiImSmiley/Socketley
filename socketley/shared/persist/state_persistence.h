@@ -275,6 +275,7 @@ struct runtime_config
     uint64_t metrics_keep = 30ull * 86400;
     std::string metrics_downsample = "5m:1y,1h:5y";
     uint32_t metrics_max_series = 200000;
+    uint32_t metrics_query_timeout = 5;
     bool metrics_durable = false;
     bool metrics_logs = false;
     uint64_t metrics_logs_keep = 14ull * 86400;

@@ -85,7 +85,8 @@ public:
     }
 
     // The ids every matcher accepts, ascending; an empty value matches a missing label.
-    void match(std::span<const matcher> ms, std::vector<uint32_t>& out) const;
+    // False, `out` empty, once `meter` is spent by the regexes run over the label values.
+    bool match(std::span<const matcher> ms, std::vector<uint32_t>& out, work_meter* meter = nullptr) const;
 
     void label_names(std::vector<std::string>& out) const;
     void label_values(std::string_view name, std::vector<std::string>& out) const;
