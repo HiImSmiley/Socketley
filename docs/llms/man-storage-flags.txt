@@ -1238,7 +1238,7 @@ The expression supports:
 - **CAST**, **LOWER**, **UPPER**, **TRIM**, **CHAR_LENGTH**, **SUBSTRING**, **COALESCE** and **NULLIF**;
 - the aggregates **COUNT**, **SUM**, **AVG**, **MIN** and **MAX**.
 
-A record over 1 MiB fails with **OverMaxRecordSize**. GZIP, BZIP2 and Parquet input fail with **501 NotImplemented**. The object is read the way a GET reads it, whether it is sealed, compressed or at a tier. The request needs everything a GetObject of the object needs, SSE-C headers included. **stats** counts **selects** and **select_scanned** (the bytes their scans read).
+A record over 1 MiB fails with **OverMaxRecordSize**. A query may spend 100 ms of CPU and 250 ns more for each byte of the object it reads, and a JSON record as much again for its own bytes; past that it fails with **ExpressionTooLong**. A select evaluates for at most about 2 ms before the runtime serves its other connections and comes back to it. **LIKE** and **TRIM** cost time linear in their value, and **IN** over a list of string literals is one lookup per record. A **LIKE** pattern whose run between two **%** holds 63 characters or more with a **_** among them may fail with **LikeInvalidInputs** where matching it would take more than 64 steps for each byte of the value and the pattern. GZIP, BZIP2 and Parquet input fail with **501 NotImplemented**. The object is read the way a GET reads it, whether it is sealed, compressed or at a tier. The request needs everything a GetObject of the object needs, SSE-C headers included. **stats** counts **selects** and **select_scanned** (the bytes their scans read).
 
 ## Tiers
 
