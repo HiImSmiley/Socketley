@@ -18,9 +18,9 @@ A document lives at **/c/***collection***/***id***.** **GET** reads it, **PUT** 
  push :{"tags":"x"},"pull":{"tags":"y"}}
 ```
 
-and works on dotted paths.
+and works on dotted paths, at most 256 of them in one patch.
 
-**POST** */c/***collection***/_query* takes a query such as **{"where":{"level":{"gte":5},\:"name":"x"},\:"sort":"-level",\:"limit":50,\:"skip":0}**. The conditions are eq, ne, gt, gte, lt, lte, in, prefix and exists. **count :true** answers the number alone. The answer is **{"docs":[...]}**, plus **next** when there are more. A range compares a field's values of one kind only, in the order an index uses: null, false, true, numbers, strings. A condition or a sort on a field the schema does not index is judged by reading the documents. The query reads at most 8 MiB of them, unless a key asks for more. Past that, it is refused with 400 **needs_index**: index the field. **POST /tx** takes **{"ops":[{"op":"put","c":..,"id":..,"doc":{..}},\:{"op":"patch",..,"changes":{..},"if":3},\:{"op":"insert",..},\:{"op":"delete",..}]}** and makes every change or none. **GET /me** names who is asking.
+**POST** */c/***collection***/_query* takes a query such as **{"where":{"level":{"gte":5},\:"name":"x"},\:"sort":"-level",\:"limit":50,\:"skip":0}**. The conditions are eq, ne, gt, gte, lt, lte, in, prefix and exists, at most 64 in a query. An **in** list may be as long as the body allows: a document's value is looked up in it, not compared with each item, and at most 64 of its items may be arrays or objects. **count :true** answers the number alone. The answer is **{"docs":[...]}**, plus **next** when there are more. A range compares a field's values of one kind only, in the order an index uses: null, false, true, numbers, strings. A condition or a sort on a field the schema does not index is judged by reading the documents. The query reads at most 8 MiB of them, unless a key asks for more. Past that, it is refused with 400 **needs_index**: index the field. **POST /tx** takes **{"ops":[{"op":"put","c":..,"id":..,"doc":{..}},\:{"op":"patch",..,"changes":{..},"if":3},\:{"op":"insert",..},\:{"op":"delete",..}]}** and makes every change or none. **GET /me** names who is asking.
 
 A request comes from one of three kinds of caller:
 
