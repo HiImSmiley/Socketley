@@ -2653,12 +2653,18 @@ cannot be changed while the runtime is running; stop the runtime first.
 .TS
 l lw(56).
 name	Runtime name \fB(requires restart)\fR
-id	6-char hex identifier (read-only, ignored on import)
+id	T{
+.ad l
+6-char hex identifier (read-only, ignored on import)
+T}
 type	T{
 .ad l
 Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, tunnel, metrics, mcp, web (read-only, ignored on import)
 T}
-was_running	Internal daemon state (ignored on import)
+was_running	T{
+.ad l
+Internal daemon state (ignored on import)
+T}
 .TE
 .PP
 .B Common fields (all types):
@@ -2680,7 +2686,10 @@ lua_script	string	Lua script path (absolute)
 bash_output	bool	Output messages to stdout
 bash_prefix	bool	Prefix messages with [name]
 bash_timestamp	bool	Prefix messages with [HH:MM:SS]
-max_connections	number	Max concurrent connections (0 = unlimited)
+max_connections	number	T{
+.ad l
+Max concurrent connections (0 = unlimited)
+T}
 rate_limit	number	T{
 .ad l
 Messages/sec per connection (0 = unlimited)
@@ -2717,7 +2726,10 @@ ca_path	string	T{
 .ad l
 Client CA for mutual TLS \fB(server, needs tls)\fR; on a \fBproxy\fR, the trust store for TLS backends; on a \fBclient\fR, the trust store for its target
 T}
-target	string	Client target host:port \fB(requires restart)\fR
+target	string	T{
+.ad l
+Client target host:port \fB(requires restart)\fR
+T}
 cache_name	string	Connected cache runtime name
 group	string	Group tag for dynamic proxy discovery
 .TE
@@ -2728,14 +2740,29 @@ l l l.
 Field	Type	Description
 _
 mode	string	"inout", "in", "out", or "master"
-udp	bool	Use UDP instead of TCP \fB(requires restart)\fR
+udp	bool	T{
+.ad l
+Use UDP instead of TCP \fB(requires restart)\fR
+T}
 master_pw	string	Static password for master mode
-send_to	string	"sender", "others", "master", comma separated
+send_to	string	T{
+.ad l
+"sender", "others", "master", comma separated
+T}
 http_dir	string	Static file root, as \fB\-\-http\fR
-http_cache	bool	Hold those files in memory, as \fB\-\-http\-cache\fR
+http_cache	bool	T{
+.ad l
+Hold those files in memory, as \fB\-\-http\-cache\fR
+T}
 compress	bool	Compressed copies (\fB\-\-compress\fR)
-origins	string	Other web origins that may open a WebSocket, as \fB\-\-origins\fR
-upstreams	array	Upstream addresses, as \fB\-\-upstream\fR
+origins	string	T{
+.ad l
+Other web origins that may open a WebSocket, as \fB\-\-origins\fR
+T}
+upstreams	array	T{
+.ad l
+Upstream addresses, as \fB\-\-upstream\fR
+T}
 .TE
 .PP
 .B Client fields:
@@ -2744,8 +2771,14 @@ l l l.
 Field	Type	Description
 _
 mode	string	"inout", "in", or "out"
-udp	bool	Use UDP instead of TCP \fB(requires restart)\fR
-reconnect	number	Auto-reconnect max attempts (-1=off, 0=infinite)
+udp	bool	T{
+.ad l
+Use UDP instead of TCP \fB(requires restart)\fR
+T}
+reconnect	number	T{
+.ad l
+Auto-reconnect max attempts (-1=off, 0=infinite)
+T}
 .TE
 .PP
 .B Proxy fields:
@@ -2755,7 +2788,10 @@ Field	Type	Description
 _
 protocol	string	"http" or "tcp" \fB(requires restart)\fR
 strategy	string	"round-robin", "random", or "lua"
-root	string	A FastCGI proxy's directory (\fB\-\-root\fR)
+root	string	T{
+.ad l
+A FastCGI proxy's directory (\fB\-\-root\fR)
+T}
 fastcgi_root	string	It as the application server sees it
 index	string	The index script (default "index.php")
 compress	bool	Compressed copies (\fB\-\-compress\fR)
@@ -2771,7 +2807,10 @@ health_interval	number	T{
 .ad l
 Health check interval in seconds (default 5)
 T}
-health_path	string	HTTP health check path (default "/health")
+health_path	string	T{
+.ad l
+HTTP health check path (default "/health")
+T}
 health_threshold	number	Failures to mark unhealthy (default 3)
 circuit_threshold	number	Errors to open circuit (default 5)
 circuit_timeout	number	Seconds before half-open (default 30)
@@ -2824,8 +2863,14 @@ dir	string	T{
 .ad l
 Directory holding the buckets, as \fB\-\-dir\fR \fB(requires restart)\fR
 T}
-anonymous	bool	Accept requests without credentials, as \fB\-\-anonymous\fR \fB(requires restart)\fR
-idp	string	The idp runtime whose sign-in the web interface takes, as \fB\-\-idp\fR \fB(requires restart)\fR
+anonymous	bool	T{
+.ad l
+Accept requests without credentials, as \fB\-\-anonymous\fR \fB(requires restart)\fR
+T}
+idp	string	T{
+.ad l
+The idp runtime whose sign-in the web interface takes, as \fB\-\-idp\fR \fB(requires restart)\fR
+T}
 max_bytes	number	T{
 .ad l
 Quota on the bytes held, as \fB\-\-max\-bytes\fR (0 = none); takes effect on a serving runtime
@@ -2868,17 +2913,50 @@ T}
 l l lw(42).
 Field	Type	Description
 _
-schema	string	The collections file, as \fB\-\-schema\fR; read again when it changes
-keys	string	The service keys file, as \fB\-\-keys\fR; read again when it changes
-idp	string	The idp runtime whose accounts own documents, as \fB\-\-idp\fR \fB(requires restart)\fR
-origins	string	The web origins it answers, as \fB\-\-origins\fR \fB(requires restart)\fR
-max_bytes	number	The most bytes the documents hold, as \fB\-\-max\-bytes\fR (0 = none) \fB(requires restart)\fR
-cache	number	The memory of documents read, as \fB\-\-cache\fR \fB(requires restart)\fR
-replicate	string	The database this one copies, as \fB\-\-replicate\fR; empty for none \fB(requires restart)\fR
-replicate_key	string	The file of the key it asks with, as \fB\-\-replicate\-key\fR \fB(requires restart)\fR
-backup_dir	string	Where scheduled backups go, as \fB\-\-backup\-dir\fR \fB(requires restart)\fR
-backup_every	number	Seconds between backups, as \fB\-\-backup\-every\fR \fB(requires restart)\fR
-backup_keep	number	Backups kept, as \fB\-\-backup\-keep\fR \fB(requires restart)\fR
+schema	string	T{
+.ad l
+The collections file, as \fB\-\-schema\fR; read again when it changes
+T}
+keys	string	T{
+.ad l
+The service keys file, as \fB\-\-keys\fR; read again when it changes
+T}
+idp	string	T{
+.ad l
+The idp runtime whose accounts own documents, as \fB\-\-idp\fR \fB(requires restart)\fR
+T}
+origins	string	T{
+.ad l
+The web origins it answers, as \fB\-\-origins\fR \fB(requires restart)\fR
+T}
+max_bytes	number	T{
+.ad l
+The most bytes the documents hold, as \fB\-\-max\-bytes\fR (0 = none) \fB(requires restart)\fR
+T}
+cache	number	T{
+.ad l
+The memory of documents read, as \fB\-\-cache\fR \fB(requires restart)\fR
+T}
+replicate	string	T{
+.ad l
+The database this one copies, as \fB\-\-replicate\fR; empty for none \fB(requires restart)\fR
+T}
+replicate_key	string	T{
+.ad l
+The file of the key it asks with, as \fB\-\-replicate\-key\fR \fB(requires restart)\fR
+T}
+backup_dir	string	T{
+.ad l
+Where scheduled backups go, as \fB\-\-backup\-dir\fR \fB(requires restart)\fR
+T}
+backup_every	number	T{
+.ad l
+Seconds between backups, as \fB\-\-backup\-every\fR \fB(requires restart)\fR
+T}
+backup_keep	number	T{
+.ad l
+Backups kept, as \fB\-\-backup\-keep\fR \fB(requires restart)\fR
+T}
 .TE
 .PP
 .B Cache fields:
@@ -2887,10 +2965,19 @@ l l lw(42).
 Field	Type	Description
 _
 persistent_path	string	Persistence file path
-persistent_interval	number	Journal flush cadence in seconds (0 = no journal) \fB(requires restart)\fR
+persistent_interval	number	T{
+.ad l
+Journal flush cadence in seconds (0 = no journal) \fB(requires restart)\fR
+T}
 cache_mode	string	"readonly", "readwrite", or "admin"
-resp_forced	bool	Force RESP2 protocol \fB(requires restart)\fR
-replicate_target	string	Leader host:port \fB(requires restart)\fR
+resp_forced	bool	T{
+.ad l
+Force RESP2 protocol \fB(requires restart)\fR
+T}
+replicate_target	string	T{
+.ad l
+Leader host:port \fB(requires restart)\fR
+T}
 max_memory	number	Max memory in bytes (0 = unlimited)
 eviction	string	T{
 .ad l
@@ -9190,16 +9277,25 @@ and implement the callbacks you need with any Lua database library
 .PP
 .TS
 tab(|);
-l l lw(30).
+l l lx.
 Callback|Signature|When called
 _
-on_miss(key)|\(-> value [, ttl_seconds]|GET returns nil \(em fetch from DB
+on_miss(key)|\(-> value [, ttl_seconds]|T{
+.ad l
+GET returns nil \(em fetch from DB
+T}
 on_write(key, value, ttl)|\(-> nothing|T{
 .ad l
 After successful SET/SETEX/SETNX/MSET
 T}
-on_delete(key)|\(-> nothing|After DEL \(em delete from DB
-on_expire(key)|\(-> nothing|After TTL sweep removes key
+on_delete(key)|\(-> nothing|T{
+.ad l
+After DEL \(em delete from DB
+T}
+on_expire(key)|\(-> nothing|T{
+.ad l
+After TTL sweep removes key
+T}
 .TE
 .PP
 \fBon_miss\fR may return two values (a Lua multi-return): the fetched string
@@ -9855,291 +9951,356 @@ The runtime reads every request body with a receive call, and it splices only
 from a file to a socket, never from a socket. Clients on the shortcut, directly
 or through a proxy, therefore put and get objects byte for byte.
 .SS Supported S3 operations
-.TS
-l l lw(40).
-Operation	Request	Notes
-_
-ListBuckets	GET /	T{
-.ad l
+.TP
+.B ListBuckets
+\fIGET /\fR
+.br
 The buckets the caller owns, or every bucket for an admin (see \fBUsers\fR), sorted by name, with creation dates; max\-buckets (1 to 10000), continuation\-token and prefix page it as S3 does.
-T}
-CreateBucket	PUT /bucket	T{
-.ad l
+.TP
+.B CreateBucket
+\fIPUT /bucket\fR
+.br
 BucketAlreadyOwnedByYou (409) if the caller owns it, BucketAlreadyExists (409) if another user does; InvalidBucketName (400) for a name S3 would refuse. x\-amz\-bucket\-object\-lock\-enabled: true makes it versioned and locked for good; see \fBObject lock\fR below.
-T}
-DeleteBucket	DELETE /bucket	T{
-.ad l
+.TP
+.B DeleteBucket
+\fIDELETE /bucket\fR
+.br
 BucketNotEmpty (409) while it holds objects, noncurrent versions or delete markers; open multipart uploads are aborted with it.
-T}
-HeadBucket	HEAD /bucket	T{
-.ad l
+.TP
+.B HeadBucket
+\fIHEAD /bucket\fR
+.br
 200, or 404 with no body.
-T}
-GetBucketLocation	GET /bucket?location	T{
-.ad l
+.TP
+.B GetBucketLocation
+\fIGET /bucket?location\fR
+.br
 An empty LocationConstraint.
-T}
-PutBucketVersioning	PUT /bucket?versioning	T{
-.ad l
+.TP
+.B PutBucketVersioning
+\fIPUT /bucket?versioning\fR
+.br
 Status Enabled or Suspended; MfaDelete Enabled, or an x\-amz\-mfa header, is 501 NotImplemented. See \fBVersioning\fR below.
-T}
-GetBucketVersioning	GET /bucket?versioning	T{
-.ad l
+.TP
+.B GetBucketVersioning
+\fIGET /bucket?versioning\fR
+.br
 An empty VersioningConfiguration for a bucket never versioned.
-T}
-PutObjectLockConfiguration	PUT /bucket?object\-lock	T{
-.ad l
+.TP
+.B PutObjectLockConfiguration
+\fIPUT /bucket?object\-lock\fR
+.br
 ObjectLockEnabled Enabled and an optional default retention; only while versioning is Enabled; Content\-MD5 or a checksum required. See \fBObject lock\fR below.
-T}
-GetObjectLockConfiguration	GET /bucket?object\-lock	T{
-.ad l
+.TP
+.B GetObjectLockConfiguration
+\fIGET /bucket?object\-lock\fR
+.br
 ObjectLockConfigurationNotFoundError (404) for a bucket without object lock.
-T}
-PutObjectRetention	PUT /bucket/key?retention	T{
-.ad l
+.TP
+.B PutObjectRetention
+\fIPUT /bucket/key?retention\fR
+.br
 Mode and RetainUntilDate, or an empty Retention to remove one; versionId; x\-amz\-bypass\-governance\-retention; Content\-MD5 or a checksum required.
-T}
-GetObjectRetention	GET /bucket/key?retention	T{
-.ad l
+.TP
+.B GetObjectRetention
+\fIGET /bucket/key?retention\fR
+.br
 NoSuchObjectLockConfiguration (404) for a version without one.
-T}
-PutObjectLegalHold	PUT /bucket/key?legal\-hold	T{
-.ad l
+.TP
+.B PutObjectLegalHold
+\fIPUT /bucket/key?legal\-hold\fR
+.br
 Status ON or OFF; versionId; Content\-MD5 or a checksum required.
-T}
-GetObjectLegalHold	GET /bucket/key?legal\-hold	T{
-.ad l
+.TP
+.B GetObjectLegalHold
+\fIGET /bucket/key?legal\-hold\fR
+.br
 NoSuchObjectLockConfiguration (404) for a version whose hold was never set.
-T}
-PutBucketEncryption	PUT /bucket?encryption	T{
-.ad l
+.TP
+.B PutBucketEncryption
+\fIPUT /bucket?encryption\fR
+.br
 A ServerSideEncryptionConfiguration whose one rule is AES256, or aws:kms with an optional KMSMasterKeyID; aws:kms:dsse is 501 NotImplemented, and so is any rule on a runtime without \fB\-\-sse\-key\-file\fR. See \fBServer\-side encryption\fR below.
-T}
-GetBucketEncryption	GET /bucket?encryption	T{
-.ad l
+.TP
+.B GetBucketEncryption
+\fIGET /bucket?encryption\fR
+.br
 The rule; ServerSideEncryptionConfigurationNotFoundError (404) for a bucket without one.
-T}
-DeleteBucketEncryption	DELETE /bucket?encryption	T{
-.ad l
+.TP
+.B DeleteBucketEncryption
+\fIDELETE /bucket?encryption\fR
+.br
 204; the objects keep the encryption they were written with.
-T}
-ListObjectVersions	GET /bucket?versions	T{
-.ad l
+.TP
+.B ListObjectVersions
+\fIGET /bucket?versions\fR
+.br
 prefix, delimiter, key\-marker, version\-id\-marker, max\-keys (at most 1000), encoding\-type=url; Version and DeleteMarker entries by key, each key's newest first.
-T}
-PutBucketCors	PUT /bucket?cors	T{
-.ad l
+.TP
+.B PutBucketCors
+\fIPUT /bucket?cors\fR
+.br
 A CORSConfiguration of at most 100 rules and 64 KiB, replacing the one before; Content\-MD5 checked. See \fBCORS\fR below.
-T}
-GetBucketCors	GET /bucket?cors	T{
-.ad l
+.TP
+.B GetBucketCors
+\fIGET /bucket?cors\fR
+.br
 The rules as they are kept; NoSuchCORSConfiguration (404) when there are none.
-T}
-DeleteBucketCors	DELETE /bucket?cors	T{
-.ad l
+.TP
+.B DeleteBucketCors
+\fIDELETE /bucket?cors\fR
+.br
 204 whether or not there were rules.
-T}
-(preflight)	OPTIONS /bucket[/key]	T{
-.ad l
+.TP
+.B (preflight)
+\fIOPTIONS /bucket[/key]\fR
+.br
 Answered from the bucket's CORS rules, with no signature.
-T}
-ListObjectsV2	GET /bucket?list\-type=2	T{
-.ad l
+.TP
+.B ListObjectsV2
+\fIGET /bucket?list\-type=2\fR
+.br
 prefix, delimiter, continuation\-token, max\-keys (at most 1000), start\-after, encoding\-type=url, fetch\-owner; CommonPrefixes count against max\-keys.
-T}
-ListObjects (V1)	GET /bucket	T{
-.ad l
+.TP
+.B "ListObjects (V1)"
+\fIGET /bucket\fR
+.br
 marker and NextMarker.
-T}
-PutObject	PUT /bucket/key	T{
-.ad l
+.TP
+.B PutObject
+\fIPUT /bucket/key\fR
+.br
 Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding, Content\-Language, Expires and x\-amz\-meta\-* stored and returned; x\-amz\-tagging sets the object's tags; Expect: 100\-continue and chunked request bodies accepted; If\-Match (an ETag or *) writes only over that object, NoSuchKey (404) when the key holds none, and If\-None\-Match (* or an ETag) only when the key holds no such object, decided when the object is committed so two racing writers cannot both win; PreconditionFailed (412) otherwise; x\-amz\-server\-side\-encryption: AES256 or the SSE\-C headers encrypt it.
-T}
-GetObject	GET /bucket/key	T{
-.ad l
+.TP
+.B GetObject
+\fIGET /bucket/key\fR
+.br
 Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides on a signed request (InvalidRequest, 400, on an anonymous one); every answer outside a website endpoint carries X\-Content\-Type\-Options: nosniff and, but for a PDF, Content\-Security\-Policy: default\-src 'none'; sandbox, and is sent as Content\-Disposition: attachment unless its type is an image, audio, video, font, text/plain, text/csv, PDF, JSON, ZIP or octet\-stream, so nothing it holds runs on the web interface's origin; x\-amz\-tagging\-count when the object has tags (on HEAD too); ?versionId= reads that version, and x\-amz\-version\-id names it; an object stored under a client's key needs the SSE\-C headers, on HEAD too.
-T}
-HeadObject	HEAD /bucket/key	T{
-.ad l
+.TP
+.B HeadObject
+\fIHEAD /bucket/key\fR
+.br
 The headers of a GET, from memory, or from the object's header when another shard owns the key; ?versionId= as for GET.
-T}
-SelectObjectContent	POST /bucket/key?select&select\-type=2	T{
-.ad l
+.TP
+.B SelectObjectContent
+\fIPOST /bucket/key?select&select\-type=2\fR
+.br
 A SQL expression over a CSV or JSON object, answered as an event stream. See \fBS3 Select\fR below.
-T}
-GetObjectAttributes	GET /bucket/key?attributes	T{
-.ad l
+.TP
+.B GetObjectAttributes
+\fIGET /bucket/key?attributes\fR
+.br
 x\-amz\-object\-attributes of ETag, Checksum, ObjectParts, StorageClass and ObjectSize; the parts of a multipart object paged by x\-amz\-max\-parts and x\-amz\-part\-number\-marker, with their numbers, sizes and, when the upload had a checksum algorithm, each part's own checksum; ?versionId= and the SSE\-C headers as for HeadObject.
-T}
-GetObject, HeadObject by part	GET|HEAD /bucket/key?partNumber=N	T{
-.ad l
+.TP
+.B "GetObject, HeadObject by part"
+\fIGET|HEAD /bucket/key?partNumber=N\fR
+.br
 Part N of a multipart object as a 206 with its Content\-Range and x\-amz\-mp\-parts\-count; see \fBReading by part number\fR below.
-T}
-DeleteObject	DELETE /bucket/key	T{
-.ad l
+.TP
+.B DeleteObject
+\fIDELETE /bucket/key\fR
+.br
 204 whether or not the key existed; in a versioned bucket a delete marker, and with ?versionId= that version removed for good. If\-Match (an ETag list or *), x\-amz\-if\-match\-last\-modified\-time and x\-amz\-if\-match\-size are asked of that version, or of the latest the marker would cover (a delete marker included, which only * passes): PreconditionFailed (412) when it does not match, and 204 with nothing removed when there is none, decided by the shard that owns the key as the delete is.
-T}
-PostObject	POST /bucket (multipart/form-data)	T{
-.ad l
+.TP
+.B PostObject
+\fIPOST /bucket (multipart/form-data)\fR
+.br
 A browser's upload by HTML form; see \fBUploads by form\fR below.
-T}
-DeleteObjects	POST /bucket?delete	T{
-.ad l
+.TP
+.B DeleteObjects
+\fIPOST /bucket?delete\fR
+.br
 Up to 1000 keys, each with or without a VersionId and with the conditions DeleteObject takes as an ETag, a LastModifiedTime (an HTTP date or ISO 8601) and a Size, a key whose condition does not match answered PreconditionFailed among the errors; Quiet, Content\-MD5 checked.
-T}
-CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
-.ad l
+.TP
+.B CopyObject
+\fIPUT /bucket/key + x\-amz\-copy\-source\fR
+.br
 Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE, from an older version or naming an encryption or a checksum algorithm; a source of key?versionId=ID copies that version. The copy is a single\-part object whose ETag is the md5 of its bytes, encrypted as its own request or its bucket asks whatever its source's was; x\-amz\-copy\-source\-server\-side\-encryption\-customer\-* open an SSE\-C source. Its checksum is FULL_OBJECT, of its own bytes, in the algorithm x\-amz\-checksum\-algorithm names or else its source's (see \fBChecksums\fR below).
-T}
-PutObjectTagging	PUT /bucket/key?tagging	T{
-.ad l
+.TP
+.B PutObjectTagging
+\fIPUT /bucket/key?tagging\fR
+.br
 A Tagging document replacing the object's tags; Content\-MD5 checked. See \fBObject tags\fR below. The tagging operations take ?versionId= too.
-T}
-GetObjectTagging	GET /bucket/key?tagging	T{
-.ad l
+.TP
+.B GetObjectTagging
+\fIGET /bucket/key?tagging\fR
+.br
 The tags in the order they were set; an empty TagSet for none.
-T}
-DeleteObjectTagging	DELETE /bucket/key?tagging	T{
-.ad l
+.TP
+.B DeleteObjectTagging
+\fIDELETE /bucket/key?tagging\fR
+.br
 204 whether or not the object had tags.
-T}
-CreateMultipartUpload	POST /bucket/key?uploads	T{
-.ad l
+.TP
+.B CreateMultipartUpload
+\fIPOST /bucket/key?uploads\fR
+.br
 Content\-Type, the stored headers, x\-amz\-meta\-* and x\-amz\-tagging are kept for the object; x\-amz\-checksum\-algorithm names the checksum every part takes; x\-amz\-server\-side\-encryption or the SSE\-C headers encrypt every part and the object.
-T}
-UploadPart	PUT /bucket/key?partNumber=N&uploadId=ID	T{
-.ad l
+.TP
+.B UploadPart
+\fIPUT /bucket/key?partNumber=N&uploadId=ID\fR
+.br
 Streamed like a put, Content\-MD5 and the checksums checked; a part sent again replaces the old one. N is 1 to 10000. A part of an SSE\-C upload carries the upload's key.
-T}
-UploadPartCopy	PUT /bucket/key?partNumber=N&uploadId=ID + x\-amz\-copy\-source	T{
-.ad l
+.TP
+.B UploadPartCopy
+\fIPUT /bucket/key?partNumber=N&uploadId=ID + x\-amz\-copy\-source\fR
+.br
 The whole source or x\-amz\-copy\-source\-range=\:bytes=first\-last, a range past the source's end being 416 InvalidRange; a source of key?versionId=ID reads that version.
-T}
-CompleteMultipartUpload	POST /bucket/key?uploadId=ID	T{
-.ad l
+.TP
+.B CompleteMultipartUpload
+\fIPOST /bucket/key?uploadId=ID\fR
+.br
 InvalidPart, InvalidPartOrder, EntityTooSmall (a part but the last under 5 MiB), NoSuchUpload, MalformedXML; If\-Match and If\-None\-Match as for PutObject. A completion sent again after it succeeded is answered as the first was, for as long as the key holds the object it made.
-T}
-AbortMultipartUpload	DELETE /bucket/key?uploadId=ID	T{
-.ad l
+.TP
+.B AbortMultipartUpload
+\fIDELETE /bucket/key?uploadId=ID\fR
+.br
 204; NoSuchUpload afterwards.
-T}
-ListParts	GET /bucket/key?uploadId=ID	T{
-.ad l
+.TP
+.B ListParts
+\fIGET /bucket/key?uploadId=ID\fR
+.br
 max\-parts, part\-number\-marker.
-T}
-ListMultipartUploads	GET /bucket?uploads	T{
-.ad l
+.TP
+.B ListMultipartUploads
+\fIGET /bucket?uploads\fR
+.br
 prefix, delimiter, key\-marker, upload\-id\-marker, max\-uploads, encoding\-type=url.
-T}
-PutBucketLifecycleConfiguration	PUT /bucket?lifecycle	T{
-.ad l
+.TP
+.B PutBucketLifecycleConfiguration
+\fIPUT /bucket?lifecycle\fR
+.br
 Replaces the bucket's rules; see Bucket lifecycle. Content\-MD5 checked.
-T}
-GetBucketLifecycleConfiguration	GET /bucket?lifecycle	T{
-.ad l
+.TP
+.B GetBucketLifecycleConfiguration
+\fIGET /bucket?lifecycle\fR
+.br
 NoSuchLifecycleConfiguration (404) for a bucket without rules.
-T}
-DeleteBucketLifecycle	DELETE /bucket?lifecycle	T{
-.ad l
+.TP
+.B DeleteBucketLifecycle
+\fIDELETE /bucket?lifecycle\fR
+.br
 204 whether or not the bucket had rules.
-T}
-PutBucketPolicy	PUT /bucket?policy	T{
-.ad l
+.TP
+.B PutBucketPolicy
+\fIPUT /bucket?policy\fR
+.br
 A JSON policy of at most 20 KiB, replacing the one before; 204; MalformedPolicy (400) for one this runtime cannot honour exactly. See \fBBucket policy\fR below.
-T}
-GetBucketPolicy	GET /bucket?policy	T{
-.ad l
+.TP
+.B GetBucketPolicy
+\fIGET /bucket?policy\fR
+.br
 The document as it was given; NoSuchBucketPolicy (404) when there is none.
-T}
-DeleteBucketPolicy	DELETE /bucket?policy	T{
-.ad l
+.TP
+.B DeleteBucketPolicy
+\fIDELETE /bucket?policy\fR
+.br
 204 whether or not there was one.
-T}
-GetBucketPolicyStatus	GET /bucket?policyStatus	T{
-.ad l
+.TP
+.B GetBucketPolicyStatus
+\fIGET /bucket?policyStatus\fR
+.br
 IsPublic: whether an Allow lets everyone in from any address; NoSuchBucketPolicy (404) when there is none.
-T}
-PutBucketLogging	PUT /bucket?logging	T{
-.ad l
+.TP
+.B PutBucketLogging
+\fIPUT /bucket?logging\fR
+.br
 A BucketLoggingStatus naming a TargetBucket of the same owner, a TargetPrefix and SimplePrefix or PartitionedPrefix keys; an empty one turns logging off; TargetGrants is AccessControlListNotSupported (400). See \fBServer access logging\fR below.
-T}
-GetBucketLogging	GET /bucket?logging	T{
-.ad l
+.TP
+.B GetBucketLogging
+\fIGET /bucket?logging\fR
+.br
 The status as it is kept, an empty one for a bucket that is not logged.
-T}
-PutPublicAccessBlock	PUT /bucket?publicAccessBlock	T{
-.ad l
+.TP
+.B PutPublicAccessBlock
+\fIPUT /bucket?publicAccessBlock\fR
+.br
 A PublicAccessBlockConfiguration, every setting false when left out. See \fBPublic access block\fR below.
-T}
-GetPublicAccessBlock	GET /bucket?publicAccessBlock	T{
-.ad l
+.TP
+.B GetPublicAccessBlock
+\fIGET /bucket?publicAccessBlock\fR
+.br
 The four settings; NoSuchPublicAccessBlockConfiguration (404) when there is none.
-T}
-DeletePublicAccessBlock	DELETE /bucket?publicAccessBlock	T{
-.ad l
+.TP
+.B DeletePublicAccessBlock
+\fIDELETE /bucket?publicAccessBlock\fR
+.br
 204 whether or not there was one; answers to s3:PutBucketPublicAccessBlock, as on S3.
-T}
-PutBucketNotificationConfiguration	PUT /bucket?notification	T{
-.ad l
+.TP
+.B PutBucketNotificationConfiguration
+\fIPUT /bucket?notification\fR
+.br
 A NotificationConfiguration whose destinations are webhooks of \fB\-\-notify\-targets\fR, replacing the one before; an empty one removes it. See \fBEvent notifications\fR below.
-T}
-GetBucketNotificationConfiguration	GET /bucket?notification	T{
-.ad l
+.TP
+.B GetBucketNotificationConfiguration
+\fIGET /bucket?notification\fR
+.br
 The configuration as it is kept, an Id given to a rule that had none; an empty one for a bucket without.
-T}
-PutBucketReplication	PUT /bucket?replication	T{
-.ad l
+.TP
+.B PutBucketReplication
+\fIPUT /bucket?replication\fR
+.br
 A ReplicationConfiguration whose Role names a target of \fB\-\-replication\-targets\fR, on a bucket whose versioning is Enabled, replacing the one before. See \fBReplication\fR below.
-T}
-GetBucketReplication	GET /bucket?replication	T{
-.ad l
+.TP
+.B GetBucketReplication
+\fIGET /bucket?replication\fR
+.br
 The configuration as it is kept, an ID given to a rule that had none; ReplicationConfigurationNotFoundError (404) when there is none.
-T}
-DeleteBucketReplication	DELETE /bucket?replication	T{
-.ad l
+.TP
+.B DeleteBucketReplication
+\fIDELETE /bucket?replication\fR
+.br
 204 whether or not there was one; versions already queued are still copied.
-T}
-PutBucketQuota	PUT /bucket?quota	T{
-.ad l
+.TP
+.B PutBucketQuota
+\fIPUT /bucket?quota\fR
+.br
 socketley's own: a BucketQuota of MaxBytes and MaxObjects, admins only. See \fBQuotas\fR below.
-T}
-GetBucketQuota	GET /bucket?quota	T{
-.ad l
+.TP
+.B GetBucketQuota
+\fIGET /bucket?quota\fR
+.br
 The quota as it is kept; NoSuchBucketQuota (404) when there is none. Admins only.
-T}
-DeleteBucketQuota	DELETE /bucket?quota	T{
-.ad l
+.TP
+.B DeleteBucketQuota
+\fIDELETE /bucket?quota\fR
+.br
 204 whether or not there was one. Admins only.
-T}
-PutBucketWebsite	PUT /bucket?website	T{
-.ad l
+.TP
+.B PutBucketWebsite
+\fIPUT /bucket?website\fR
+.br
 A WebsiteConfiguration: an IndexDocument, an ErrorDocument and up to 50 RoutingRules, or a RedirectAllRequestsTo alone. See \fBWebsite hosting\fR below.
-T}
-GetBucketWebsite	GET /bucket?website	T{
-.ad l
+.TP
+.B GetBucketWebsite
+\fIGET /bucket?website\fR
+.br
 The configuration as it is kept; NoSuchWebsiteConfiguration (404) when there is none.
-T}
-DeleteBucketWebsite	DELETE /bucket?website	T{
-.ad l
+.TP
+.B DeleteBucketWebsite
+\fIDELETE /bucket?website\fR
+.br
 204 whether or not there was one.
-T}
-GetSessionToken	POST / Action=GetSessionToken	T{
-.ad l
+.TP
+.B GetSessionToken
+\fIPOST / Action=GetSessionToken\fR
+.br
 STS's: temporary credentials for the signing user, DurationSeconds 900 to 129600 (43200). See \fBTemporary credentials\fR below.
-T}
-AssumeRole	POST / Action=AssumeRole	T{
-.ad l
+.TP
+.B AssumeRole
+\fIPOST / Action=AssumeRole\fR
+.br
 STS's: the same, DurationSeconds 900 to 43200 (3600), the RoleArn of a role the IAM API made, and a Policy that bounds the session.
-T}
-AssumeRoleWithWebIdentity	POST / Action=AssumeRoleWithWebIdentity	T{
-.ad l
+.TP
+.B AssumeRoleWithWebIdentity
+\fIPOST / Action=AssumeRoleWithWebIdentity\fR
+.br
 STS's, unsigned: temporary credentials for an OIDC provider's token, as \fB\-\-federation\fR maps it. See \fBFederated identities\fR below.
-T}
-AssumeRoleWithLDAPIdentity	POST / Action=AssumeRoleWithLDAPIdentity	T{
-.ad l
+.TP
+.B AssumeRoleWithLDAPIdentity
+\fIPOST / Action=AssumeRoleWithLDAPIdentity\fR
+.br
 Unsigned: temporary credentials for a user the LDAP directory binds, as \fB\-\-federation\fR maps it.
-T}
-.TE
 .PP
 A bucket's ownership controls decide whether the bucket takes ACLs. They are
 managed with PutBucketOwnershipControls, GetBucketOwnershipControls and
@@ -16011,7 +16172,10 @@ writes only at that version, and
 .B "If-None-Match: *"
 writes only where no document exists. Otherwise the answer is 412. A patch
 looks like
-.B {"set":{"a.b":1},"unset":["c"],"inc":{"n":1},"push":{"tags":"x"},"pull":{"tags":"y"}}
+.nf
+.B {"set":{"a.b":1},"unset":["c"],"inc":{"n":1},
+.B \ "push":{"tags":"x"},"pull":{"tags":"y"}}
+.fi
 and works on dotted paths.
 .PP
 .BI POST " /c/" collection /_query
@@ -21625,7 +21789,7 @@ self.pending([id])         -- The client's own form.  Bytes queued for its
                            -- whose callback is running, or all of them
                            -- outside every callback.
 
--- ─── Sending faster than the socket ───
+-- --- Sending faster than the socket ---
 -- A write is queued, not performed, and the queue has a bound.  Reach it and
 -- the runtime closes the connection -- which used to be the only way a script
 -- found out: the message that filled the queue was dropped and answered true,
@@ -21659,7 +21823,7 @@ self.pending([id])         -- The client's own form.  Bytes queued for its
 -- Measured with a client that connects and never reads, against 400 chunks of
 -- 64 KB: 129 taken, 271 refused, and the queue standing at its bound.
 
--- ─── A response written rather than returned ───
+-- --- A response written rather than returned ---
 -- on_http_request has to RETURN its body, so a generated answer had to fit in
 -- memory.  A FILE of any size was already served by the splice path and a Range
 -- of it by the 206 path; a generated one of any size was not expressible at all
@@ -21706,7 +21870,7 @@ self.cache(command)        -- Run one command against the LINKED cache and
                            -- keeps serving meanwhile.  nil plus a reason when
                            -- the answer is not coming.
 
--- ─── A handler that waits ───
+-- --- A handler that waits ---
 -- In a handler that can wait, a call that reaches outside the runtime
 -- (self.cache, socketley.http) suspends the handler until the answer comes,
 -- and the runtime keeps serving other clients meanwhile.
@@ -21762,7 +21926,7 @@ self.upstream_pending(conn_id)   -- Bytes queued for that upstream and not yet o
                                  -- runtime's upstreams
 self.upstreams()                 -- Table of connected upstream conn_ids
 
--- ─── The same bound, pointed outwards ───
+-- --- The same bound, pointed outwards ---
 -- An upstream's write queue fills exactly as a client's does, and these used to
 -- report none of it.  upstream_send() tested only whether the upstream was
 -- connected; a queue that reached the bound sets `closing` and leaves
@@ -26255,14 +26419,15 @@ Copy them anywhere and compile with
 .BR "g++ -std=c++17" ;
 no library is needed. Tier 2 must be built from source.
 .PP
-.TS
-l l l l .
-Tier	Header	Use Case	Dependencies
-_
-1	socketley/control.h	Control a running daemon	None (POSIX)
-2	socketley/{server,cache,proxy,client}.h	Embed the full engine	libsocketley_sdk.a
-3	socketley/attach.h	Register with a daemon	None (Tier 1)
-.TE
+.TP
+.B "Tier 1: socketley/control.h"
+Control a running daemon. Needs nothing beyond POSIX.
+.TP
+.B "Tier 2: socketley/{server,cache,proxy,client}.h"
+Embed the full engine. Links libsocketley_sdk.a.
+.TP
+.B "Tier 3: socketley/attach.h"
+Register with a daemon. Needs nothing beyond Tier 1.
 .SS Tier 1: Daemon Control (header-only)
 .B socketley/control.h
 gives a program full control over a running daemon.
