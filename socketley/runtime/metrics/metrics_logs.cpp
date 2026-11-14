@@ -385,6 +385,9 @@ bool log_expr(lexer& lx, logql& q, std::string& why)
                 return why = "parse error : invalid regex " + f.text + ": " + w, false;
         }
         q.filters.push_back(std::move(f));
+        // Every filter reads every line, and a regex compiled for each holds its own program and scratch.
+        if (q.filters.size() > logql_max_filters)
+            return why = "parse error : more than " + std::to_string(logql_max_filters) + " line filters", false;
     }
     return true;
 }
@@ -545,6 +548,11 @@ void metric_eval(const log_store& s, const logql& q, std::string_view instance, 
 bool parse_logql(std::string_view q, logql& out, bool& is_log, std::string& why)
 {
     out = {};
+    if (q.size() > logql_max_length)
+    {
+        why = "the query is longer than " + std::to_string(logql_max_length) + " bytes";
+        return false;
+    }
     lexer lx{q};
     lx.ws();
     is_log = true;
@@ -581,6 +589,8 @@ void log_labels(const log_view& l, std::string_view instance, label_set& out)
 
 bool logql_matches(const logql& q, const label_set& labels, std::string_view text)
 {
+    if (q.over)
+        return false;
     for (size_t i = 0; i < q.selector.size(); ++i)
     {
         const matcher& m = q.selector[i];
@@ -594,6 +604,15 @@ bool logql_matches(const logql& q, const label_set& labels, std::string_view tex
     }
     for (const auto& f : q.filters)
     {
+        if (f.re)
+        {
+            q.work += (text.size() + 1) * f.re->program_size();
+            if (q.work > logql_max_work)
+            {
+                q.over = true;
+                return false;
+            }
+        }
         const bool ok = f.k == logql::filter::kind::contains       ? text.find(f.text) != std::string_view::npos
                         : f.k == logql::filter::kind::not_contains ? text.find(f.text) == std::string_view::npos
                         : f.k == logql::filter::kind::re           ? f.re->matches(text)

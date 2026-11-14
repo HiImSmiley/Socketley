@@ -18,6 +18,10 @@
 namespace socketley::metrics
 {
 
+// The longest label value label_replace() and label_join() make, the bound a query's own text has.
+constexpr size_t max_made_label = 64 * 1024;
+
+
 namespace
 {
 
@@ -2131,12 +2135,36 @@ value evaluator::label_replace(const expr_node& e)
         valid = valid && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9'));
     if (!valid)
         throw eval_fail{"execution", "invalid destination label name in label_replace(): " + dst};
+    // The groups the replacement names, so the match tracks those and not every group: (.?) 4,990 times tracked all
+    // 9,982 slots, 1.6 GB and 1e8 copies a byte, for a replacement that named none.
+    int most = 0;
+    for (size_t i = 0; i + 1 < repl.size(); ++i)
+    {
+        if (repl[i] != '$')
+            continue;
+        size_t j = i + 1 + (repl[i + 1] == '{');
+        const size_t from = j;
+        while (j < repl.size() && ((repl[j] >= 'a' && repl[j] <= 'z') || (repl[j] >= 'A' && repl[j] <= 'Z') ||
+                                   (repl[j] >= '0' && repl[j] <= '9') || repl[j] == '_'))
+            ++j;
+        const std::string_view name(repl.data() + from, j - from);
+        if (name.empty())
+            continue;
+        int g = 0;
+        if (name.find_first_not_of("0123456789") == std::string_view::npos)
+            g = name.size() > 9 ? -1 : std::stoi(std::string(name));
+        else
+            g = re.group_named(name);
+        if (g >= 0 && g < re.group_count())
+            most = std::max(most, g + 1);
+    }
     std::vector<int> groups;
     std::string res;
     for (auto& s : v.vec)
     {
         const std::string_view sv = label_value(s.labels, src);
-        if (!re.matches(sv, groups))
+        tick(1 + sv.size());
+        if (!re.matches(sv, groups, most))
             continue;
         // Go's Regexp.Expand: $n, ${n}, $name and ${name}, the longest run of word characters taken as the name.
         res.clear();
@@ -2180,10 +2208,13 @@ value evaluator::label_replace(const expr_node& e)
             if (name.size() > 1 && name[0] == '0')
                 num = -1;
             const int g = num >= 0 ? num : re.group_named(name);
-            if (g >= 0 && g < re.group_count() && groups[2 * static_cast<size_t>(g)] >= 0)
+            if (g >= 0 && g < most && groups[2 * static_cast<size_t>(g)] >= 0)
                 res.append(sv.substr(static_cast<size_t>(groups[2 * static_cast<size_t>(g)]),
                                      static_cast<size_t>(groups[2 * static_cast<size_t>(g) + 1] -
                                                          groups[2 * static_cast<size_t>(g)])));
+            if (res.size() > max_made_label)
+                throw eval_fail{"execution", "label_replace(): the new value is longer than " +
+                                                 std::to_string(max_made_label) + " bytes"};
         }
         set_label(s.labels, dst, res);
     }
@@ -2217,7 +2248,12 @@ value evaluator::label_join(const expr_node& e)
             if (i > 3)
                 res += sep;
             res += label_value(s.labels, e.args[i]->str);
+            // A separator of 32 KB repeated 8,000 times made a value of 266 MB for every series.
+            if (res.size() > max_made_label)
+                throw eval_fail{"execution", "label_join(): the joined value is longer than " +
+                                                 std::to_string(max_made_label) + " bytes"};
         }
+        tick(1 + res.size());
         set_label(s.labels, dst, res);
     }
     dedupe(v.vec);

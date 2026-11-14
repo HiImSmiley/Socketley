@@ -99,7 +99,18 @@ struct logql
     std::string agg;
     bool without{false};
     std::vector<std::string> grouping;
+
+    // What the regexes have cost, bytes times their programs, and whether the query spent what it may: a match is
+    // false once it has, and the answer says so instead of what it found.
+    mutable uint64_t work{0};
+    mutable bool     over{false};
 };
+
+// What a LogQL query's regexes may cost, in VM instructions times bytes: about two seconds of the loop.
+inline constexpr uint64_t logql_max_work = uint64_t{1} << 32;
+// The longest LogQL query and the most line filters it may hold.
+inline constexpr size_t logql_max_length  = 64 * 1024;
+inline constexpr size_t logql_max_filters = 16;
 
 // False with `why` (Loki's message style) when `q` is not in the subset; `is_log` false when it has no selector.
 bool parse_logql(std::string_view q, logql& out, bool& is_log, std::string& why);

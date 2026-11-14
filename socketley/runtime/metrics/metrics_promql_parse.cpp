@@ -570,12 +570,19 @@ private:
         if (++m_depth > 200)
             fail("query nests too deeply");
         auto lhs = unary();
+        // Each operator of a chain is a level of the tree it makes, so it counts as nesting does: "1+1+...+1" of
+        // 32,767 operands passed the bound one level at a time and made a tree whose evaluation and whose
+        // destruction recurse 32,767 deep.
+        int chained = 0;
         while (true)
         {
             bin_op op;
             const int p = precedence(op);
             if (!p || p < min_prec)
                 break;
+            if (++m_depth > 200)
+                fail("query nests too deeply");
+            ++chained;
             const uint32_t op_pos = m_t.pos;
             advance();
             auto n = std::make_unique<expr_node>();
@@ -611,7 +618,7 @@ private:
             n->args.push_back(std::move(rhs));
             lhs = std::move(n);
         }
-        --m_depth;
+        m_depth -= 1 + chained;
         return lhs;
     }
 

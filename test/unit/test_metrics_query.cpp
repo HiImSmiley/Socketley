@@ -3,6 +3,8 @@
 // against brute force over the raw samples.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
+#include "thread_cpu.h"
+#include <chrono>
 
 #include <chrono>
 #include <cmath>
@@ -89,6 +91,36 @@ struct db
 bool contains(const std::string& s, std::string_view part) { return s.find(part) != std::string::npos; }
 
 }   // namespace
+
+TEST_CASE("a query cannot make its evaluation nest deeper, or its labels larger, than its text bounds")
+{
+    db d;
+    d.src.add({{"__name__", "x"}, {"a", "1"}}, pts({{10, 1}}));
+    // A chain of operators is a level of the tree each, as nesting is: 32,767 of them recursed as deep.
+    std::string chain = "1";
+    for (int i = 0; i < 300; ++i)
+        chain += "+1";
+    CHECK(contains(d.fails(chain), "nests too deeply"));
+    std::string fine = "1";
+    for (int i = 0; i < 150; ++i)
+        fine += "+1";
+    CHECK(d.one(fine, 100) == 151);
+    // label_replace tracks only the groups its replacement names: (.?) 4,990 times tracked every one, 1.6 GB.
+    std::string groups;
+    for (int i = 0; i < 4990; ++i)
+        groups += "(.?)";
+    d.src.add({{"__name__", "w"}, {"a", std::string(20, '1')}}, pts({{10, 1}}));
+    const auto t0 = thread_cpu_now();
+    CHECK(d.at("label_replace(w, \"b\", \"$1\", \"a\", \"" + groups + "\")", 100).size() == 1);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(d.at("label_replace(x, \"b\", \"<$1$2>\", \"a\", \"(1)(.*)\")", 100).begin()->first ==
+          "{__name__=\"x\",a=\"1\",b=\"<1>\"}");
+    // label_join's value is bounded as a query's text is.
+    std::string join = "label_join(x, \"b\", \"" + std::string(30000, 's') + "\"";
+    for (int i = 0; i < 4; ++i)
+        join += ", \"a\"";
+    CHECK(contains(d.fails(join + ")"), "label_join(): the joined value is longer than"));
+}
 
 TEST_CASE("an instant selector looks back five minutes, left-open, and a staleness marker ends its series")
 {

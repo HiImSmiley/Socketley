@@ -3,6 +3,7 @@
 #include "metrics_run.h"
 
 #include <algorithm>
+#include <iterator>
 #include <charconv>
 #include <cmath>
 
@@ -23,6 +24,8 @@ namespace
 
 // The version Grafana is told, a Prometheus whose API this one answers.
 constexpr std::string_view prometheus_version = "2.53.0";
+// The most match[] parameters /series and /labels take.
+constexpr size_t max_match_params = 256;
 // What a time left out stands for in /series and /labels: everything the store holds.
 constexpr int64_t min_time = INT64_MIN / 4;
 constexpr int64_t max_time = INT64_MAX / 4;
@@ -440,6 +443,9 @@ void metrics_run::api_logs(std::string_view path, const api_params& p, api_reply
             return fail(out, text, 400, "bad_data", "invalid time: " + std::string(v));
         logql_instant(m_logs, lq, inst, t, limit, d);
     }
+    if (lq.over)
+        return fail(out, text, 422, "execution", "the query's regexes cost more than a query may spend: narrow its time "
+                                                 "range or its line filters");
     if (!text)
         return success(out, d);
     // For the CLI, a line a log line, oldest first, as the daemon wrote it.
@@ -490,7 +496,13 @@ bool metrics_run::matched(const api_params& p, int64_t mint, int64_t maxt, std::
     std::vector<std::string_view> sels;
     p.all("match[]", sels);
     any = !sels.empty();
-    std::vector<uint32_t> one;
+    // Each selector walks the index, and 45,000 of them in one body held the loop for minutes.
+    if (sels.size() > max_match_params)
+    {
+        fail(out, false, 400, "bad_data", "at most " + std::to_string(max_match_params) + " match[] parameters");
+        return false;
+    }
+    std::vector<uint32_t> one, merged;
     for (const std::string_view sel : sels)
     {
         std::unique_ptr<expr_node> e;
@@ -508,10 +520,13 @@ bool metrics_run::matched(const api_params& p, int64_t mint, int64_t maxt, std::
         }
         one.clear();
         m_store.select(e->matchers, mint, maxt, one);
-        ids.insert(ids.end(), one.begin(), one.end());
+        // Merged as it comes, so the ids held are the distinct ones and not every selector's copy of them.
+        std::sort(one.begin(), one.end());
+        one.erase(std::unique(one.begin(), one.end()), one.end());
+        merged.clear();
+        std::set_union(ids.begin(), ids.end(), one.begin(), one.end(), std::back_inserter(merged));
+        ids.swap(merged);
     }
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     return true;
 }
 

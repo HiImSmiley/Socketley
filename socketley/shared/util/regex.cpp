@@ -1054,8 +1054,12 @@ bool regex::matches(std::string_view s, std::vector<int>& groups, int most) cons
     {
         if (!fast(s))
             return false;
-        groups[0] = 0;
-        groups[1] = static_cast<int>(s.size());
+        // Group 0 only where the caller asked for any group: `most` 0 leaves `groups` empty.
+        if (groups.size() >= 2)
+        {
+            groups[0] = 0;
+            groups[1] = static_cast<int>(s.size());
+        }
         return true;
     }
     return run(s, groups.data(), static_cast<int>(groups.size()));
