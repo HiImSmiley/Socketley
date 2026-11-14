@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <ctime>
+#include <utility>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -11,6 +12,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "../net/socket_tuning.h"
 #include "../runtime/runtime_instance.h"
 #include "../util/wall_clock.h"
 
@@ -47,6 +49,14 @@ bool conn_server::listen_tcp(uint32_t addr, uint16_t port, bool shared, std::str
     if (::bind(m_listen_fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0 || ::listen(m_listen_fd, 1024) < 0)
     {
         why = "port " + std::to_string(port) + " could not be bound: " + std::strerror(errno);
+        ::close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+    // --congestion, which every accepted socket inherits from the listener.
+    if (!m_rt.apply_congestion(m_listen_fd))
+    {
+        why = "--congestion " + m_rt.get_congestion() + " was refused";
         ::close(m_listen_fd);
         m_listen_fd = -1;
         return false;
@@ -122,6 +132,10 @@ std::shared_ptr<server_conn> conn_server::dial(const sockaddr_storage& addr, soc
     {
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        // A dialled connection sends as much as an accepted one, so --congestion is its too; a refusal is said once,
+        // here when no listener said it at the start.
+        if (socket_tuning::congestion(fd, m_rt.get_congestion()) != 0 && m_listen_fd < 0 &&
+            !std::exchange(m_congestion_said, true) && !m_rt.apply_congestion(fd)) {}
     }
     c->cn = io_request{};
     c->cn.owner = m_owner;

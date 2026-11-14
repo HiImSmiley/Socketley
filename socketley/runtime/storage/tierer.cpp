@@ -190,6 +190,7 @@ void tierer::pump(tier& t)
         {
             t.peers.push_back(std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.t.http, m_hosts_file,
                                                           "storage: the tier " + t.t.name));
+            t.peers.back()->set_congestion(m_congestion);
             free = t.peers.back().get();
         }
         if (!free)

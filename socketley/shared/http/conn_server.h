@@ -183,6 +183,8 @@ private:
     size_t m_max_conns;
 
     int m_listen_fd{-1};
+    // A dial's refusal of --congestion was said, which a runtime with no listener says once.
+    bool m_congestion_said{false};
     std::string m_unix_path;
     io_request m_accept_req{};
     bool m_accept_pending{false};

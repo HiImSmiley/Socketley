@@ -312,6 +312,13 @@ bool mqtt_run::open_listener(listener& l, uint16_t port, bool ws, std::string& w
         l.fd = -1;
         return false;
     }
+    if (!m_owner.apply_congestion(l.fd))
+    {
+        why = "--congestion " + m_owner.get_congestion() + " was refused";
+        ::close(l.fd);
+        l.fd = -1;
+        return false;
+    }
     return true;
 }
 

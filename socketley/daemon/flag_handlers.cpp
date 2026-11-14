@@ -503,10 +503,13 @@ static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
             const runtime_type t = instance->get_type();
-            if (t != runtime_server && t != runtime_proxy && t != runtime_cache && t != runtime_storage)
+            // The runtimes whose listeners or own connections it is set on, which are the ones that send.
+            if (t != runtime_server && t != runtime_proxy && t != runtime_cache && t != runtime_storage &&
+                t != runtime_tunnel && t != runtime_mqtt && t != runtime_mail && t != runtime_db && t != runtime_idp &&
+                t != runtime_web && t != runtime_metrics && t != runtime_mcp)
             {
-                flag_out() << "--congestion applies to a server, a proxy, a cache or a storage: their listeners are "
-                             "where it is set\n";
+                flag_out() << "--congestion applies to a runtime that accepts TCP connections and sends on them: a "
+                             "client, dns or sync runtime takes none\n";
                 return 1;
             }
             instance->set_congestion(std::string(v));

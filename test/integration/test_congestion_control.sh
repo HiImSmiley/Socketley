@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
-# Integration test: --congestion sets the TCP congestion control of every connection a runtime accepts.
+# Integration test: --congestion sets the TCP congestion control of every connection a runtime accepts, and of those
+# it makes itself where it sends on them.
 #
 # What each part would catch:
-#   * the option set nowhere, or on a socket its connections do not inherit it from, for each of the four listeners
+#   * the option set nowhere, or on a socket its connections do not inherit it from, for a server, a proxy, a cache, a
+#     storage, an mqtt broker, a mail runtime, and the runtimes on the shared connection server (db, tunnel)
+#   * a tunnel agent's own connection to its edge, which carries what visitors download, left on the default
 #   * a name that is no name, or the flag on a runtime whose listener never reads it, taken without a word
 #   * a name the kernel refuses started anyway on the kernel's default, with nobody told
 #   * the choice lost when the runtime is written to its state
@@ -65,8 +68,27 @@ expect "a name that is no name is refused" "$rc" "1"
 has "and says what it wants" "$out" 'congestion control'
 out=$("$BIN" create client cl -p "$P" --congestion reno 2>&1); rc=$?
 expect "a client is refused it" "$rc" "1"
-out=$("$BIN" create mqtt mq -p $((P+6)) --congestion reno 2>&1); rc=$?
-expect "and a runtime whose listener never reads it" "$rc" "1"
+out=$("$BIN" create dns dz -p $((P+6)) --congestion reno 2>&1); rc=$?
+expect "and a runtime that sends nothing on TCP it would choose for" "$rc" "1"
+has "saying which do" "$out" 'accepts TCP connections and sends'
+"$BIN" create mqtt mqc -p $((P+8)) --anonymous --congestion reno -s >/dev/null 2>&1; up $((P+8))
+expect "an mqtt broker's connections run its --congestion" "$(cc_of $((P+8)))" "reno"
+printf 'backend congestsecret0123456789\n' > "$T/keys"
+"$BIN" create db dbc -p $((P+9)) --keys "$T/keys" --congestion reno -s >/dev/null 2>&1; up $((P+9))
+expect "a db's connections, on the shared connection server, run its --congestion" "$(cc_of $((P+9)))" "reno"
+"$BIN" create mail mlc -p $((P+10)) --mail-domain example.test --congestion reno -s >/dev/null 2>&1; up $((P+10))
+expect "a mail runtime's connections run its --congestion" "$(cc_of $((P+10)))" "reno"
+"$BIN" create tunnel edc --mode edge -p $((P+11)) --congestion reno -s >/dev/null 2>&1; up $((P+11))
+expect "a tunnel edge's connections run its --congestion" "$(cc_of $((P+11)))" "reno"
+INV=$("$BIN" tunnel edc invite pi --http web 2>&1)
+"$BIN" create tunnel agc --mode agent --to "http://127.0.0.1:$((P+11))" --join "$INV" --offer web=127.0.0.1:$P \
+    --congestion reno -s >/dev/null 2>&1
+agent_cc=none
+for _ in $(seq 1 50); do
+    agent_cc=$(ss -tinH state established "( dport = :$((P+11)) )" 2>/dev/null | tr ' \t' '\n\n' | grep -xE 'reno|cubic|bbr' | head -1)
+    [ -n "$agent_cc" ] && break; sleep 0.1
+done
+expect "a tunnel agent's own connection to its edge runs its --congestion" "${agent_cc:-none}" "reno"
 
 "$BIN" create server nosuch -p $((P+7)) --http "$T/www" --congestion nosuchcc -s >/dev/null 2>&1
 for _ in $(seq 1 50); do grep -q 'congestion nosuchcc was refused' "$SOCKETLEY_DLOG" 2>/dev/null && break; sleep 0.1; done

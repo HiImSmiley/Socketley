@@ -113,6 +113,8 @@ public:
     http_peer& operator=(const http_peer&) = delete;
 
     const http_target& target() const { return m_target; }
+    // The congestion control its connections send with, the host's default when empty.
+    void set_congestion(std::string name) { m_congestion = std::move(name); }
     bool busy() const { return m_busy; }
     // Asks for a named host's addresses now, so the first exchange does not wait for them.
     void prime();
@@ -168,6 +170,7 @@ private:
     http_target m_target;
     std::string m_hosts_file;
     std::string m_what;
+    std::string m_congestion;
     std::unique_ptr<tls_context> m_tls;
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
 

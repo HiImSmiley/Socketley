@@ -1,3 +1,4 @@
+#include "../net/socket_tuning.h"
 #include "outbound_http.h"
 #include "../util/settings.h"
 #include "../net/file_send.h"
@@ -389,6 +390,8 @@ void http_peer::connect()
     // A request's last segment goes at once, not after the host's delayed acknowledgement of the one before.
     const int one = 1;
     if (::setsockopt(m_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {}
+    // Best effort: the runtime's listener has already said whether the kernel takes the name.
+    if (socket_tuning::congestion(m_fd, m_congestion) != 0) {}
     ++m_connects;
     m_connected_at = std::chrono::steady_clock::now();
     const uint64_t gen = m_gen;

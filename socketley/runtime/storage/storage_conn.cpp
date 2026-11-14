@@ -130,6 +130,8 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     if (const char* e = settings::text("SOCKETLEY_STORAGE_NOTIFY_HOSTS"))
         m_notify.set_hosts_file(e);
     m_idp.configure(owner.get_idp());
+    m_repl.set_congestion(owner.get_congestion());
+    m_tier.set_congestion(owner.get_congestion());
     // Uploads are each on the shard that owns their key; a bucket is dropped only
     // when no shard is at work on one, and the idle ones are aborted with it, as in S3.
     m_node.set_multipart(&m_mpu);

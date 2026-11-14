@@ -271,8 +271,11 @@ void replicator::add_lanes(std::vector<replication_target> targets, bool nodes)
 
 std::unique_ptr<http_peer> replicator::new_peer(const replication_target& t)
 {
-    return std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.http, m_hosts_file,
-                                       (t.node ? "storage: the cluster node " : "storage: the replication target ") + t.name);
+    auto p = std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.http, m_hosts_file,
+                                         (t.node ? "storage: the cluster node " : "storage: the replication target ") +
+                                             t.name);
+    p->set_congestion(m_congestion);
+    return p;
 }
 
 size_t replicator::free_slot(lane& l)

@@ -48,7 +48,7 @@ constexpr row rows[] = {
     {"--max-connections", "SPKTIBMEXW", "int", "Max connections", "The most clients at once.", "Limits", {}, "10000", "--max-conn"},
     {"--rate-limit", "SPK", "int", "Rate limit", "Messages a second per connection.", "Limits", {}, "100"},
     {"--global-rate-limit", "SPK", "int", "Global rate limit", "Messages a second over all connections.", "Limits", {}, "10000"},
-    {"--congestion", "SPKT", "text", "Congestion control", "The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss.", "Limits", {}, "bbr"},
+    {"--congestion", "SPKTIBMEURXW", "text", "Congestion control", "The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss.", "Limits", {}, "bbr"},
     {"--idle-timeout", "SPKT", "duration", "Idle timeout", "Close a connection that has received nothing for this long; off unless given.", "Limits", {}, "5m"},
     {"--read-buffer", "SCPKT", "size", "Read buffer", "How much data may pile up from one connection before it is refused; 1M unless given.", "Limits", {}, "1M"},
     {"--write-buffer", "SCPKTM", "size", "Write buffer", "How much unsent data may queue up for one connection before it is dropped; 8M unless given.", "Limits", {}, "8M"},

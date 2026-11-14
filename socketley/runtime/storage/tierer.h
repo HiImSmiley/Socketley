@@ -54,6 +54,8 @@ public:
     static constexpr uint64_t max_move = 5ull << 30;
 
     tierer(event_loop& loop, file_io& io, object_store& store, hash_pool& hashes);
+    // --congestion of the runtime, for the connections it makes to its targets.
+    void set_congestion(std::string name) { m_congestion = std::move(name); }
     ~tierer();
 
     tierer(const tierer&)            = delete;
@@ -128,6 +130,7 @@ private:
     std::chrono::steady_clock::time_point m_next_sweep{};
     bool          m_stopped{false};
     std::string   m_hosts_file;
+    std::string   m_congestion;
     hash_pool     m_resolver{1};
     bool          m_resolver_attached{false};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};

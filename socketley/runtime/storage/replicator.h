@@ -112,6 +112,8 @@ public:
     // `owner` is the handler the timer's completion is delivered to, which hands it to on_timer().
     replicator(event_loop& loop, file_io& io, io_handler* owner, object_store& store, hash_pool& hashes,
                key_opener keys);
+    // --congestion of the runtime, for the connections it makes to its targets.
+    void set_congestion(std::string name) { m_congestion = std::move(name); }
     ~replicator();
 
     replicator(const replicator&)            = delete;
@@ -401,6 +403,7 @@ private:
     hash_pool     m_resolver{1};
     bool          m_resolver_attached{false};
     std::string   m_hosts_file;
+    std::string   m_congestion;
 
     io_request    m_timer_req{};
     struct __kernel_timespec m_timer_ts{};
