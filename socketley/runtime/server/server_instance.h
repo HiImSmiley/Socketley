@@ -214,6 +214,8 @@ struct alignas(64) server_connection
     size_t file_size{0};
     std::string file_content_type;
     bool file_is_html{false};
+    // The page is answered as its gzip, made from what is served, script and all.
+    bool file_gzip{false};
     // Set only when this read is a candidate for the revalidating cache, so
     // handle_file_read knows which key to store under; empty means do not
     // store.
@@ -1672,7 +1674,7 @@ private:
     // it is called from two places.
     void note_http_reval_full();
     void http_reval_store(const std::string& url_path, const struct stat& st,
-                          std::shared_ptr<const std::string> ka);
+                          std::shared_ptr<const std::string> ka, std::string_view etag = {});
 
     // Splice pipe for zero-copy file serving (shared across connections, one at a time)
     // How many connections hold a splice pipe right now.  A cap and not a

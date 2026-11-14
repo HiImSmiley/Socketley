@@ -5239,9 +5239,14 @@ With this flag, every file response also carries
 .BR "Vary: Accept\-Encoding" .
 .IP
 A copy is never sent when it is older than its file, or for a range request.
-Nor is one sent for a page, because the copy lacks the injected script, unless
-.B \-\-no\-inject
-is set.
+A page that takes the injected script has no copy that could hold it, so its
+gzip is made by the server from the page as served, script and all, and sent
+to a client that accepts gzip, under an ETag of its own; it is made once per
+version of the file and kept in the content cache, or with
+.B \-\-http\-cache
+at startup. With
+.BR \-\-no\-inject ,
+a page's copy beside it is sent as any other file's.
 Nor is one sent for an image, a video, a woff font, a zip or a pdf.
 A copy requested by its own name is sent as itself.
 With

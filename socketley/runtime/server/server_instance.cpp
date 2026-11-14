@@ -25,6 +25,7 @@
 #include "../../shared/lua/lua_context.h"
 #include "../../shared/lua/lua_pages.h"
 #include "../../shared/http/ws_protocol.h"
+#include "../../shared/util/deflate.h"
 #include "../../shared/util/invariants.h"
 #include "../../shared/util/logging.h"
 #include "../../cli/command_hashing.h"
@@ -339,6 +340,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->file_size = 0;
     conn->file_content_type.clear();
     conn->file_is_html = false;
+    conn->file_gzip = false;
     conn->file_read_pending = false;
     conn->http_keep_alive = false;
     conn->wr_shutdown = false;
@@ -1147,6 +1149,20 @@ void server_instance::rebuild_http_cache()
 
         // Accept-Ranges as the disk path says it, since a range is served from the file; not on a page, whose
         // injected script moves every offset.
+        // An injected page has no copy beside it, so --compress keeps its gzip, made here from the page as served.
+        if (html && m_http_compress)
+        {
+            std::string typed(socketley::http::content_type_of(ext));
+            typed.append("\r\nContent-Encoding: gzip").append(VARY_FIELD);
+            std::string key = url_path;
+            key.push_back('\0');
+            key.append("gzip");
+            const std::string tag = etag + "-gz";
+            cached_file& g = m_http_cache[key];
+            g.response = std::make_shared<const std::string>(build_http_response(typed, socketley::gzip_of(content), true, tag));
+            g.close_head = close_head_of(*g.response, g.body_at);
+            g.etag = tag;
+        }
         const size_t whole = std::string_view::npos;
         cached_file& e = m_http_cache[url_path];
         e.response = std::make_shared<const std::string>(html ? build_http_response(ct, content, true, etag)
@@ -1192,7 +1208,7 @@ void server_instance::note_http_reval_full()
 }
 
 void server_instance::http_reval_store(const std::string& url_path, const struct stat& st,
-                                       std::shared_ptr<const std::string> ka)
+                                       std::shared_ptr<const std::string> ka, std::string_view etag)
 {
     uint32_t body_at = 0;
     auto cl = ka ? close_head_of(*ka, body_at) : nullptr;
@@ -1212,7 +1228,8 @@ void server_instance::http_reval_store(const std::string& url_path, const struct
     e.size       = static_cast<uint64_t>(st.st_size);
     e.mtime_sec  = st.st_mtim.tv_sec;
     e.mtime_nsec = static_cast<uint32_t>(st.st_mtim.tv_nsec);
-    e.etag       = socketley::http::etag_of(socketley::file_stamp::of(st));
+    // A representation of the file other than its bytes, its gzip, says so in the tag it was answered with.
+    e.etag       = etag.empty() ? socketley::http::etag_of(socketley::file_stamp::of(st)) : std::string(etag);
     e.bytes      = cost;
     e.response   = std::move(ka);
     e.close_head = std::move(cl);
@@ -1396,6 +1413,21 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
                 url_path = coded_key;
             }
         }
+        // An injected page has no copy beside it either: its gzip is made from the page as served, under the page's own
+        // name, a NUL and the coding, and kept as a copy would be.
+        bool gzip_page = false;
+        if (SOCKETLEY_UNLIKELY(m_http_compress) && coded_key.empty() && range_hdr.empty() && m_http_root_fd >= 0 &&
+            m_http_inject && url_path.size() > 1 && socketley::http::content_type_of(url_path).starts_with("text/html") &&
+            socketley::http::accepts_coding(accept_encoding, "gzip") &&
+            ::statx(m_http_root_fd, std::string(url_path.substr(1)).c_str(), 0,
+                    STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE, &copy_sx) == 0)
+        {
+            gzip_page = true;
+            coded_ct.append(socketley::http::content_type_of(url_path)).append("\r\nContent-Encoding: gzip");
+            coded_key.append(url_path).push_back('\0');
+            coded_key.append("gzip");
+            url_path = coded_key;
+        }
         const std::string_view rel_view = url_path.substr(1);
         const char* rel_path = rel_view.empty() ? "." : rel_view.data();
 
@@ -1561,6 +1593,9 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             conn->file_etag.assign(held_etag);
         else
             conn->file_etag = socketley::http::etag_of(socketley::file_stamp::of(st));
+        // The gzip is a representation of its own, and a cache keeps the two apart by their tags.
+        if (gzip_page)
+            conn->file_etag.append("-gz");
         if (not_modified(conn->file_etag))
         {
             drop_file();
@@ -1584,7 +1619,8 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         uint32_t ext_hash = fnv1a(ext);
         // A page under --no-inject is served as any other file, its ranges and zero-copy paths included.
-        bool is_html = m_http_inject && coded_key.empty() && (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
+        bool is_html = gzip_page ||
+                       (m_http_inject && coded_key.empty() && (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm")));
         std::string_view ct = coded_key.empty() ? socketley::http::content_type_of(ext) : std::string_view(coded_ct);
         if (SOCKETLEY_UNLIKELY(m_http_compress))
         {
@@ -1624,8 +1660,9 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         if (fsize == 0)
         {
             drop_file();
+            const std::string page = is_html ? inject_ws_script({}) : std::string();
             queue_http_response(conn, std::make_shared<const std::string>(build_http_response(
-                ct, is_html ? inject_ws_script({}) : std::string(), conn->http_keep_alive, conn->file_etag)));
+                ct, gzip_page ? socketley::gzip_of(page) : page, conn->http_keep_alive, conn->file_etag)));
             if (!conn->http_keep_alive)
                 conn->closing = true;
             else
@@ -1810,6 +1847,7 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         conn->range_first = send_first;
         conn->range_total = fsize;
         conn->file_is_html = is_html;
+        conn->file_gzip = gzip_page;
         conn->file_read_pending = true;
         // Non-empty only when the completion may keep the bytes, with the
         // identity fstat() reported on this very descriptor rather than
@@ -7210,8 +7248,23 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     // for the same bytes on the splice path.  One copy of the file remains --
     // the response is a contiguous string and the bytes have to reach it --
     // and getting below that needs the body streamed rather than assembled.
-    const size_t inject_at = conn->file_is_html
+    size_t inject_at = conn->file_is_html
         ? ws_inject_offset(file_content) : std::string_view::npos;
+    // A page answered as its gzip is the page as served, script and all, compressed here; the hardest effort only for
+    // a page small enough that doing it again on a full cache costs little.
+    std::string packed;
+    if (conn->file_gzip)
+    {
+        std::string page;
+        page.reserve(file_content.size() + WS_INJECT_SCRIPT.size());
+        page.append(file_content.substr(0, inject_at));
+        if (inject_at != std::string_view::npos)
+            page.append(WS_INJECT_SCRIPT).append(file_content.substr(inject_at));
+        packed = socketley::gzip_of(page, page.size() <= (1u << 20) ? socketley::deflater::effort::best
+                                                                     : socketley::deflater::effort::fast);
+        file_content = packed;
+        inject_at = std::string_view::npos;
+    }
     const size_t body_len = file_content.size() +
         (inject_at == std::string_view::npos ? 0 : WS_INJECT_SCRIPT.size());
 
@@ -7241,7 +7294,8 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     {
         auto ka = std::make_shared<const std::string>(build_http_response_at(
             conn->file_content_type, file_content, inject_at, true, conn->file_etag));
-        http_reval_store(conn->file_url_path, conn->file_st, ka);
+        http_reval_store(conn->file_url_path, conn->file_st, ka,
+                         conn->file_gzip ? std::string_view(conn->file_etag) : std::string_view{});
         uint32_t body_at = 0;
         const auto cl = conn->http_keep_alive ? nullptr : close_head_of(*ka, body_at);
         queue_cached_response(conn, ka, cl, body_at);
