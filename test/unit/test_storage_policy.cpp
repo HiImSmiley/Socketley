@@ -7,6 +7,8 @@
 
 #include <string>
 #include <string_view>
+#include <chrono>
+#include <random>
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -540,4 +542,71 @@ TEST_CASE("allows_iam is an Allow of an IAM action on some IAM resource")
     CHECK_FALSE(identity(R"({"Statement":{"Effect":"Allow","Action":"*","Resource":"arn:aws:s3:::*"}})").allows_iam());
     CHECK_FALSE(identity(R"({"Statement":{"Effect":"Deny","Action":"iam:*","Resource":"*"}})").allows_iam());
     CHECK_FALSE(identity(R"({"Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}})").allows_iam());
+}
+
+namespace
+{
+
+// The one-backtrack walk iam_wild_match was, as the reference its answers are held to.
+bool wild_reference(std::string_view pat, std::string_view str, bool fold)
+{
+    constexpr size_t none = static_cast<size_t>(-1);
+    const auto low = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
+    size_t pi = 0, si = 0, star = none, star_si = 0;
+    while (si < str.size())
+    {
+        if (pi < pat.size() && pat[pi] == '*')
+        {
+            star = pi++;
+            star_si = si;
+            continue;
+        }
+        if (pi < pat.size() && (pat[pi] == '?' || (fold ? low(pat[pi]) == low(str[si]) : pat[pi] == str[si])))
+        {
+            ++pi;
+            ++si;
+            continue;
+        }
+        if (star == none)
+            return false;
+        pi = star + 1;
+        si = ++star_si;
+    }
+    while (pi < pat.size() && pat[pi] == '*')
+        ++pi;
+    return pi == pat.size();
+}
+
+}   // namespace
+
+TEST_CASE("IAM's wildcard answers as the backtracking walk does, and a long pattern over a long subject reads it once")
+{
+    std::mt19937 rng(20261114);
+    const std::string_view pat_bytes = "ab?*aAB", str_bytes = "abAB";
+    for (int n = 0; n < 300000; ++n)
+    {
+        std::string pat, str;
+        // Long enough sometimes for the walk over positions, which past 2^16 steps answers in place of the other.
+        const size_t pl = rng() % (n % 50 == 0 ? 300 : 12), sl = rng() % (n % 50 == 0 ? 400 : 14);
+        for (size_t i = 0; i < pl; ++i)
+            pat.push_back(pat_bytes[rng() % pat_bytes.size()]);
+        for (size_t i = 0; i < sl; ++i)
+            str.push_back(str_bytes[rng() % str_bytes.size()]);
+        const bool fold = rng() % 2;
+        REQUIRE_MESSAGE(socketley::iam_wild_match(pat, str, fold) == wild_reference(pat, str, fold),
+                        "pattern \"" << pat << "\" subject \"" << str << "\" fold " << fold);
+        REQUIRE_MESSAGE(socketley::detail::iam_wild_states(pat, str, fold) == wild_reference(pat, str, fold),
+                        "pattern \"" << pat << "\" subject \"" << str << "\" fold " << fold);
+    }
+    // A policy of 20 KB is one pattern a run of 19,000 a's long, and a header value 60,000 a's: the walk tried the
+    // run at each place, 1.1e9 steps.
+    const std::string pat = "*" + std::string(19000, 'a') + "b*";
+    const std::string str(60000, 'a');
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(socketley::iam_wild_match(pat, str));
+    CHECK(socketley::iam_wild_match(pat, str + "b"));
+    CHECK(socketley::iam_wild_match("*?a?*", str));
+    const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    MESSAGE("a 19,000-byte run against 60,000 bytes: " << took << " s");
+    CHECK(took < 0.3);
 }

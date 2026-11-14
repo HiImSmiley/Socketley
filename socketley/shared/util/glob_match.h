@@ -27,9 +27,12 @@
 // a pattern of a thousand stars against a long channel is a legal thing for a
 // client to send and must not be a thousand stack frames.
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <string_view>
+#include <vector>
 
 namespace socketley
 {
@@ -139,10 +142,97 @@ inline bool glob_match(std::string_view pat, std::string_view str) noexcept
 }
 
 
+namespace detail
+{
+
+// IAM's wildcard as a set of positions in the pattern read over the subject once, 64 positions a word: what the
+// pattern can have matched so far moves on by a byte its next position takes, and stays at a '*'.
+inline bool iam_wild_states(std::string_view pat, std::string_view str, bool fold)
+{
+    const auto low = [](unsigned char c) { return c >= 'A' && c <= 'Z' ? static_cast<unsigned char>(c - 'A' + 'a') : c; };
+    const auto high = [](unsigned char c) { return c >= 'a' && c <= 'z' ? static_cast<unsigned char>(c - 'a' + 'A') : c; };
+    // Position j is the first j bytes or '?'s of the pattern taken; a '*' after them leaves j where it is.
+    size_t m = 0;
+    for (const char c : pat)
+        m += c != '*';
+    // Each position takes a byte of the subject.
+    if (m > str.size())
+        return false;
+    const size_t words = m / 64 + 1;
+    // A row a byte of the pattern, which the positions holding it take, and the '?'s in every row; row 0 for a byte
+    // the pattern does not hold.
+    uint16_t row_of[256] = {};
+    size_t rows = 1;
+    for (const char ch : pat)
+    {
+        const auto c = static_cast<unsigned char>(ch);
+        if (ch == '*' || ch == '?' || row_of[fold ? low(c) : c])
+            continue;
+        row_of[fold ? low(c) : c] = static_cast<uint16_t>(rows++);
+    }
+    if (fold)
+        for (unsigned c = 'a'; c <= 'z'; ++c)
+            row_of[high(static_cast<unsigned char>(c))] = row_of[c];
+    std::vector<uint64_t> take(rows * words, 0), stay(words, 0), d(words, 0), next(words, 0);
+    const auto set = [](uint64_t* v, size_t bit) { v[bit / 64] |= uint64_t{1} << (bit % 64); };
+    size_t j = 0;
+    for (const char ch : pat)
+    {
+        if (ch == '*')
+        {
+            set(stay.data(), j);
+            continue;
+        }
+        ++j;
+        if (ch == '?')
+        {
+            for (size_t r = 0; r < rows; ++r)
+                set(take.data() + r * words, j);
+            continue;
+        }
+        const auto c = static_cast<unsigned char>(ch);
+        set(take.data() + row_of[fold ? low(c) : c] * words, j);
+    }
+    set(d.data(), 0);
+    // The lowest position held never falls, and the highest rises by one a byte at most.
+    size_t lo = 0, hi = 0;
+    for (const char ch : str)
+    {
+        const uint64_t* t = take.data() + row_of[static_cast<unsigned char>(ch)] * words;
+        const size_t top = std::min(hi + 1, words - 1);
+        bool any = false;
+        size_t first = top + 1, last = 0;
+        for (size_t w = lo; w <= top; ++w)
+        {
+            const uint64_t carry = w > lo ? d[w - 1] >> 63 : 0;
+            next[w] = (((d[w] << 1) | carry) & t[w]) | (d[w] & stay[w]);
+            if (next[w])
+            {
+                any = true;
+                first = std::min(first, w);
+                last = w;
+            }
+        }
+        if (!any)
+            return false;
+        for (size_t w = lo; w <= top; ++w)
+            d[w] = next[w];
+        lo = first;
+        hi = last;
+    }
+    return (d[m / 64] >> (m % 64)) & 1;
+}
+
+}   // namespace detail
+
 // IAM's wildcard (StringLike, ARNs): '*' is any run of characters, '?' is one, nothing else is special, and `fold`
 // compares letters without case. A '*' in the pattern is a wildcard even where the text holds one too.
-inline bool iam_wild_match(std::string_view pat, std::string_view str, bool fold = false) noexcept
+inline bool iam_wild_match(std::string_view pat, std::string_view str, bool fold = false)
 {
+    // The walk below backtracks to its last star, pattern times subject at worst: a 20 KB policy's run of a's against
+    // a 60 KB header value was 1.1e9 steps, for every request the bucket's policy is asked about.
+    if (pat.size() * str.size() > (size_t{1} << 16))
+        return detail::iam_wild_states(pat, str, fold);
     constexpr size_t none = static_cast<size_t>(-1);
     const auto low = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
     size_t pi = 0, si = 0, star = none, star_si = 0;
