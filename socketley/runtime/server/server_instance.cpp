@@ -4288,6 +4288,17 @@ static bool resp2_starts(char c0, char c1)
            (c0 == '+' && ((c1 >= 'A' && c1 <= 'Z') || (c1 >= 'a' && c1 <= 'z')));
 }
 
+// Where the head in `partial` ends, searched from where the last unfinished search stopped, less the three bytes a
+// split terminator could have begun with: rescanned whole on each byte of a trickled head, it cost the square.
+size_t server_instance::head_end(server_connection* conn)
+{
+    const size_t resume = std::min<size_t>(conn->head_scanned, conn->partial.size());
+    const size_t at = conn->partial.find("\r\n\r\n", resume > 3 ? resume - 3 : 0);
+    conn->head_scanned = at == std::string::npos ? static_cast<uint32_t>(std::min<size_t>(conn->partial.size(), UINT32_MAX))
+                                                 : 0;
+    return at;
+}
+
 void server_instance::parse_partial(server_connection* conn)
 {
 reparse:
@@ -4377,7 +4388,7 @@ reparse:
 
     if (conn->proto == proto_ws_upgrading)
     {
-        auto hdr_end = conn->partial.find("\r\n\r\n");
+        auto hdr_end = head_end(conn);
         if (hdr_end == std::string::npos)
         {
             // Reject oversized upgrade requests (belt-and-suspenders for F1 partial limit)
@@ -4812,8 +4823,16 @@ reparse:
                                conn->stream_pending))
             return;
 
+        // A request whose head was judged and whose body is still coming needs nothing from a read but its length.
+        if (conn->body_wait != 0)
+        {
+            if (conn->partial.size() < conn->body_wait)
+                return;
+            conn->body_wait = 0;
+        }
+
         // Wait for complete headers
-        auto hdr_end = conn->partial.find("\r\n\r\n");
+        auto hdr_end = head_end(conn);
         if (hdr_end == std::string::npos)
         {
             if (conn->partial.size() > 16384)
@@ -4822,6 +4841,12 @@ reparse:
                 return;
             }
             arm_header_deadline(conn);
+            return;
+        }
+        // A head that arrived whole is held to the bound an unfinished one is, as the proxy holds it.
+        if (SOCKETLEY_UNLIKELY(hdr_end > 16384))
+        {
+            refuse_http_request(conn, http_431_response());
             return;
         }
 
@@ -4939,7 +4964,10 @@ reparse:
 
         size_t total_expected = hdr_end + 4 + content_length;
         if (!stream_body && conn->partial.size() < total_expected)
+        {
+            conn->body_wait = total_expected;
             return;  // Need more body data
+        }
 
         hreq.headers.swap(conn->http_hdr_scratch);
 

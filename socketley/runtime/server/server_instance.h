@@ -165,6 +165,10 @@ struct alignas(64) server_connection
     // gives: renewing it hands the bound back to the client.
     bool awaiting_headers{false};
     std::chrono::steady_clock::time_point header_deadline{};
+    // How much of an unfinished head has been searched for its end, so a head sent a byte at a time is read once.
+    uint32_t head_scanned{0};
+    // The bytes a request whose head was judged waits for, so its body's reads do not judge the head again.
+    size_t body_wait{0};
 
     io_request read_req;
     io_request write_req;
@@ -486,6 +490,8 @@ struct alignas(64) server_connection
         // mid-head for something its predecessor did.
         awaiting_headers = false;
         header_deadline = {};
+        head_scanned = 0;
+        body_wait = 0;
         partial.clear();
         meta.clear();
         groups.clear();
@@ -1020,6 +1026,7 @@ private:
     // from handle_read and from the three completion arms that finish an async
     // HTTP response.
     void parse_partial(server_connection* conn);
+    size_t head_end(server_connection* conn);
     void handle_splice_in(struct io_uring_cqe* cqe, server_connection* conn);
     void handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn);
     // The next burst of a file sent by sendfile, from a write's completion or a wait for room on the socket.
