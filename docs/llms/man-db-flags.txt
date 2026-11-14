@@ -11,7 +11,14 @@ socketley create db copy -p 9500 --replicate https://data.example.com \
     --replicate-key /etc/socketley/db.replica-key --keys /etc/socketley/db.keys -s
 ```
 
-A document lives at **/c/***collection***/***id***.** **GET** reads it, **PUT** replaces it, **PATCH** changes it in place and **DELETE** removes it. A **POST** to **/c/***collection* makes a new document under a new id. The answer holds the document's fields plus **_id**, **_v** (its version: 1 when made, one more with each change, and also its **ETag**) and **_owner** (the account's id). **If-Match: "3"** writes only at that version, and **If-None-Match: *** writes only where no document exists. Otherwise the answer is 412. A patch looks like **{"set":{"a.b":1},"unset":["c"],"inc":{"n":1},"push":{"tags":"x"},"pull":{"tags":"y"}}** and works on dotted paths.
+A document lives at **/c/***collection***/***id***.** **GET** reads it, **PUT** replaces it, **PATCH** changes it in place and **DELETE** removes it. A **POST** to **/c/***collection* makes a new document under a new id. The answer holds the document's fields plus **_id**, **_v** (its version: 1 when made, one more with each change, and also its **ETag**) and **_owner** (the account's id). **If-Match: "3"** writes only at that version, and **If-None-Match: *** writes only where no document exists. Otherwise the answer is 412. A patch looks like
+
+```
+{"set":{"a.b":1},"unset":["c"],"inc":{"n":1},
+ push :{"tags":"x"},"pull":{"tags":"y"}}
+```
+
+and works on dotted paths.
 
 **POST** */c/***collection***/_query* takes a query such as **{"where":{"level":{"gte":5},\:"name":"x"},\:"sort":"-level",\:"limit":50,\:"skip":0}**. The conditions are eq, ne, gt, gte, lt, lte, in, prefix and exists. **count :true** answers the number alone. The answer is **{"docs":[...]}**, plus **next** when there are more. A range compares a field's values of one kind only, in the order an index uses: null, false, true, numbers, strings. A condition or a sort on a field the schema does not index is judged by reading the documents. The query reads at most 8 MiB of them, unless a key asks for more. Past that, it is refused with 400 **needs_index**: index the field. **POST /tx** takes **{"ops":[{"op":"put","c":..,"id":..,"doc":{..}},\:{"op":"patch",..,"changes":{..},"if":3},\:{"op":"insert",..},\:{"op":"delete",..}]}** and makes every change or none. **GET /me** names who is asking.
 

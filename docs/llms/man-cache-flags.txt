@@ -881,12 +881,18 @@ Cache runtimes support four Lua callbacks for a database-backed cache. Attach a 
 
 | Callback\|Signature\|When called |
 |---|
-| on_miss(key)\|-> value [, ttl_seconds]\|GET returns nil — fetch from DB |
+| on_miss(key)\|-> value [, ttl_seconds]\|T{ |
+| GET returns nil — fetch from DB |
+| T} |
 | on_write(key, value, ttl)\|-> nothing\|T{ |
 | After successful SET/SETEX/SETNX/MSET |
 | T} |
-| on_delete(key)\|-> nothing\|After DEL — delete from DB |
-| on_expire(key)\|-> nothing\|After TTL sweep removes key |
+| on_delete(key)\|-> nothing\|T{ |
+| After DEL — delete from DB |
+| T} |
+| on_expire(key)\|-> nothing\|T{ |
+| After TTL sweep removes key |
+| T} |
 
 **on_miss** may return two values (a Lua multi-return): the fetched string and an optional TTL in seconds. If the value is nil or empty, the GET returns nil to the client as usual. If a value is returned, the cache stores it and returns it to the client transparently (read-through, or lazy population).
 

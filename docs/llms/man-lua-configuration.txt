@@ -917,7 +917,7 @@ self.pending([id])         -- The client's own form.  Bytes queued for its
                            -- whose callback is running, or all of them
                            -- outside every callback.
 
--- ─── Sending faster than the socket ───
+-- --- Sending faster than the socket ---
 -- A write is queued, not performed, and the queue has a bound.  Reach it and
 -- the runtime closes the connection -- which used to be the only way a script
 -- found out: the message that filled the queue was dropped and answered true,
@@ -951,7 +951,7 @@ self.pending([id])         -- The client's own form.  Bytes queued for its
 -- Measured with a client that connects and never reads, against 400 chunks of
 -- 64 KB: 129 taken, 271 refused, and the queue standing at its bound.
 
--- ─── A response written rather than returned ───
+-- --- A response written rather than returned ---
 -- on_http_request has to RETURN its body, so a generated answer had to fit in
 -- memory.  A FILE of any size was already served by the splice path and a Range
 -- of it by the 206 path; a generated one of any size was not expressible at all
@@ -997,7 +997,7 @@ self.cache(command)        -- Run one command against the LINKED cache and
                            -- keeps serving meanwhile.  nil plus a reason when
                            -- the answer is not coming.
 
--- ─── A handler that waits ───
+-- --- A handler that waits ---
 -- In a handler that can wait, a call that reaches outside the runtime
 -- (self.cache, socketley.http) suspends the handler until the answer comes,
 -- and the runtime keeps serving other clients meanwhile.
@@ -1053,7 +1053,7 @@ self.upstream_pending(conn_id)   -- Bytes queued for that upstream and not yet o
                                  -- runtime's upstreams
 self.upstreams()                 -- Table of connected upstream conn_ids
 
--- ─── The same bound, pointed outwards ───
+-- --- The same bound, pointed outwards ---
 -- An upstream's write queue fills exactly as a client's does, and these used to
 -- report none of it.  upstream_send() tested only whether the upstream was
 -- connected; a queue that reached the bound sets `closing` and leaves

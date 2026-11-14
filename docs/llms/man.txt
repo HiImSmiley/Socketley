@@ -34,7 +34,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [State persistence](man-state-persistence.txt)
 - [Environment](man-environment.txt) (93 entries)
 - [Files](man-files.txt)
-- [SDK](man-sdk.txt)
+- [SDK](man-sdk.txt) (3 entries)
 - [Limitations](man-limitations.txt)
 - [Exit status](man-exit-status.txt) (3 entries)
 - [See also](man-see-also.txt)

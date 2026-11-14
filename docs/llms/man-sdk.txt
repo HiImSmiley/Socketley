@@ -4,11 +4,17 @@ From the manual page socketley(1).
 
 Any runtime runs inside a program of your own, with or without a daemon. For C++ the SDK comes in three tiers, in **sdk/include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
 
-| Tier | Header | Use Case | Dependencies |
-|---|---|---|---|
-| 1 | socketley/control.h | Control a running daemon | None (POSIX) |
-| 2 | socketley/{server,cache,proxy,client}.h | Embed the full engine | libsocketley_sdk.a |
-| 3 | socketley/attach.h | Register with a daemon | None (Tier 1) |
+### `Tier 1: socketley/control.h`
+
+Control a running daemon. Needs nothing beyond POSIX.
+
+### `Tier 2: socketley/{server,cache,proxy,client}.h`
+
+Embed the full engine. Links libsocketley_sdk.a.
+
+### `Tier 3: socketley/attach.h`
+
+Register with a daemon. Needs nothing beyond Tier 1.
 
 ## Tier 1: Daemon Control (header-only)
 

@@ -5673,7 +5673,7 @@ The manual page socketley(1), the source of truth for everything here, one file 
 - [State persistence](man-state-persistence.txt)
 - [Environment](man-environment.txt) (93 entries)
 - [Files](man-files.txt)
-- [SDK](man-sdk.txt)
+- [SDK](man-sdk.txt) (3 entries)
 - [Limitations](man-limitations.txt)
 - [Exit status](man-exit-status.txt) (3 entries)
 - [See also](man-see-also.txt)
@@ -8725,12 +8725,18 @@ Cache runtimes support four Lua callbacks for a database-backed cache. Attach a 
 
 | Callback\|Signature\|When called |
 |---|
-| on_miss(key)\|-> value [, ttl_seconds]\|GET returns nil — fetch from DB |
+| on_miss(key)\|-> value [, ttl_seconds]\|T{ |
+| GET returns nil — fetch from DB |
+| T} |
 | on_write(key, value, ttl)\|-> nothing\|T{ |
 | After successful SET/SETEX/SETNX/MSET |
 | T} |
-| on_delete(key)\|-> nothing\|After DEL — delete from DB |
-| on_expire(key)\|-> nothing\|After TTL sweep removes key |
+| on_delete(key)\|-> nothing\|T{ |
+| After DEL — delete from DB |
+| T} |
+| on_expire(key)\|-> nothing\|T{ |
+| After TTL sweep removes key |
+| T} |
 
 **on_miss** may return two values (a Lua multi-return): the fetched string and an optional TTL in seconds. If the value is nil or empty, the GET returns nil to the client as usual. If a value is returned, the cache stores it and returns it to the client transparently (read-through, or lazy population).
 
@@ -9025,78 +9031,355 @@ The loopback shortcut needs no exception for a storage runtime. The runtime read
 
 ## Supported S3 operations
 
-| Operation | Request | Notes |
-|---|---|---|
-| ListBuckets | GET / | The buckets the caller owns, or every bucket for an admin (see **Users**), sorted by name, with creation dates; max-buckets (1 to 10000), continuation-token and prefix page it as S3 does. |
-| CreateBucket | PUT /bucket | BucketAlreadyOwnedByYou (409) if the caller owns it, BucketAlreadyExists (409) if another user does; InvalidBucketName (400) for a name S3 would refuse. x-amz-bucket-object-lock-enabled: true makes it versioned and locked for good; see **Object lock** below. |
-| DeleteBucket | DELETE /bucket | BucketNotEmpty (409) while it holds objects, noncurrent versions or delete markers; open multipart uploads are aborted with it. |
-| HeadBucket | HEAD /bucket | 200, or 404 with no body. |
-| GetBucketLocation | GET /bucket?location | An empty LocationConstraint. |
-| PutBucketVersioning | PUT /bucket?versioning | Status Enabled or Suspended; MfaDelete Enabled, or an x-amz-mfa header, is 501 NotImplemented. See **Versioning** below. |
-| GetBucketVersioning | GET /bucket?versioning | An empty VersioningConfiguration for a bucket never versioned. |
-| PutObjectLockConfiguration | PUT /bucket?object-lock | ObjectLockEnabled Enabled and an optional default retention; only while versioning is Enabled; Content-MD5 or a checksum required. See **Object lock** below. |
-| GetObjectLockConfiguration | GET /bucket?object-lock | ObjectLockConfigurationNotFoundError (404) for a bucket without object lock. |
-| PutObjectRetention | PUT /bucket/key?retention | Mode and RetainUntilDate, or an empty Retention to remove one; versionId; x-amz-bypass-governance-retention; Content-MD5 or a checksum required. |
-| GetObjectRetention | GET /bucket/key?retention | NoSuchObjectLockConfiguration (404) for a version without one. |
-| PutObjectLegalHold | PUT /bucket/key?legal-hold | Status ON or OFF; versionId; Content-MD5 or a checksum required. |
-| GetObjectLegalHold | GET /bucket/key?legal-hold | NoSuchObjectLockConfiguration (404) for a version whose hold was never set. |
-| PutBucketEncryption | PUT /bucket?encryption | A ServerSideEncryptionConfiguration whose one rule is AES256, or aws:kms with an optional KMSMasterKeyID; aws:kms:dsse is 501 NotImplemented, and so is any rule on a runtime without **--sse-key-file**. See **Server-side encryption** below. |
-| GetBucketEncryption | GET /bucket?encryption | The rule; ServerSideEncryptionConfigurationNotFoundError (404) for a bucket without one. |
-| DeleteBucketEncryption | DELETE /bucket?encryption | 204; the objects keep the encryption they were written with. |
-| ListObjectVersions | GET /bucket?versions | prefix, delimiter, key-marker, version-id-marker, max-keys (at most 1000), encoding-type=url; Version and DeleteMarker entries by key, each key's newest first. |
-| PutBucketCors | PUT /bucket?cors | A CORSConfiguration of at most 100 rules and 64 KiB, replacing the one before; Content-MD5 checked. See **CORS** below. |
-| GetBucketCors | GET /bucket?cors | The rules as they are kept; NoSuchCORSConfiguration (404) when there are none. |
-| DeleteBucketCors | DELETE /bucket?cors | 204 whether or not there were rules. |
-| (preflight) | OPTIONS /bucket[/key] | Answered from the bucket's CORS rules, with no signature. |
-| ListObjectsV2 | GET /bucket?list-type=2 | prefix, delimiter, continuation-token, max-keys (at most 1000), start-after, encoding-type=url, fetch-owner; CommonPrefixes count against max-keys. |
-| ListObjects (V1) | GET /bucket | marker and NextMarker. |
-| PutObject | PUT /bucket/key | Streamed; Content-MD5 checked; Content-Type, Cache-Control, Content-Disposition, Content-Encoding, Content-Language, Expires and x-amz-meta-* stored and returned; x-amz-tagging sets the object's tags; Expect: 100-continue and chunked request bodies accepted; If-Match (an ETag or *) writes only over that object, NoSuchKey (404) when the key holds none, and If-None-Match (* or an ETag) only when the key holds no such object, decided when the object is committed so two racing writers cannot both win; PreconditionFailed (412) otherwise; x-amz-server-side-encryption: AES256 or the SSE-C headers encrypt it. |
-| GetObject | GET /bucket/key | Range (one range), If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since, response-* header overrides on a signed request (InvalidRequest, 400, on an anonymous one); every answer outside a website endpoint carries X-Content-Type-Options: nosniff and, but for a PDF, Content-Security-Policy: default-src 'none'; sandbox, and is sent as Content-Disposition: attachment unless its type is an image, audio, video, font, text/plain, text/csv, PDF, JSON, ZIP or octet-stream, so nothing it holds runs on the web interface's origin; x-amz-tagging-count when the object has tags (on HEAD too); ?versionId= reads that version, and x-amz-version-id names it; an object stored under a client's key needs the SSE-C headers, on HEAD too. |
-| HeadObject | HEAD /bucket/key | The headers of a GET, from memory, or from the object's header when another shard owns the key; ?versionId= as for GET. |
-| SelectObjectContent | POST /bucket/key?select&select-type=2 | A SQL expression over a CSV or JSON object, answered as an event stream. See **S3 Select** below. |
-| GetObjectAttributes | GET /bucket/key?attributes | x-amz-object-attributes of ETag, Checksum, ObjectParts, StorageClass and ObjectSize; the parts of a multipart object paged by x-amz-max-parts and x-amz-part-number-marker, with their numbers, sizes and, when the upload had a checksum algorithm, each part's own checksum; ?versionId= and the SSE-C headers as for HeadObject. |
-| GetObject, HeadObject by part | GET\|HEAD /bucket/key?partNumber=N | Part N of a multipart object as a 206 with its Content-Range and x-amz-mp-parts-count; see **Reading by part number** below. |
-| DeleteObject | DELETE /bucket/key | 204 whether or not the key existed; in a versioned bucket a delete marker, and with ?versionId= that version removed for good. If-Match (an ETag list or *), x-amz-if-match-last-modified-time and x-amz-if-match-size are asked of that version, or of the latest the marker would cover (a delete marker included, which only * passes): PreconditionFailed (412) when it does not match, and 204 with nothing removed when there is none, decided by the shard that owns the key as the delete is. |
-| PostObject | POST /bucket (multipart/form-data) | A browser's upload by HTML form; see **Uploads by form** below. |
-| DeleteObjects | POST /bucket?delete | Up to 1000 keys, each with or without a VersionId and with the conditions DeleteObject takes as an ETag, a LastModifiedTime (an HTTP date or ISO 8601) and a Size, a key whose condition does not match answered PreconditionFailed among the errors; Quiet, Content-MD5 checked. |
-| CopyObject | PUT /bucket/key + x-amz-copy-source | Within or across buckets; x-amz-metadata-directive COPY or REPLACE; x-amz-tagging-directive COPY (the default, the source's tags) or REPLACE (those x-amz-tagging names, or none); x-amz-copy-source-if-match and -if-none-match; onto itself only with REPLACE, from an older version or naming an encryption or a checksum algorithm; a source of key?versionId=ID copies that version. The copy is a single-part object whose ETag is the md5 of its bytes, encrypted as its own request or its bucket asks whatever its source's was; x-amz-copy-source-server-side-encryption-customer-* open an SSE-C source. Its checksum is FULL_OBJECT, of its own bytes, in the algorithm x-amz-checksum-algorithm names or else its source's (see **Checksums** below). |
-| PutObjectTagging | PUT /bucket/key?tagging | A Tagging document replacing the object's tags; Content-MD5 checked. See **Object tags** below. The tagging operations take ?versionId= too. |
-| GetObjectTagging | GET /bucket/key?tagging | The tags in the order they were set; an empty TagSet for none. |
-| DeleteObjectTagging | DELETE /bucket/key?tagging | 204 whether or not the object had tags. |
-| CreateMultipartUpload | POST /bucket/key?uploads | Content-Type, the stored headers, x-amz-meta-* and x-amz-tagging are kept for the object; x-amz-checksum-algorithm names the checksum every part takes; x-amz-server-side-encryption or the SSE-C headers encrypt every part and the object. |
-| UploadPart | PUT /bucket/key?partNumber=N&uploadId=ID | Streamed like a put, Content-MD5 and the checksums checked; a part sent again replaces the old one. N is 1 to 10000. A part of an SSE-C upload carries the upload's key. |
-| UploadPartCopy | PUT /bucket/key?partNumber=N&uploadId=ID + x-amz-copy-source | The whole source or x-amz-copy-source-range=\:bytes=first-last, a range past the source's end being 416 InvalidRange; a source of key?versionId=ID reads that version. |
-| CompleteMultipartUpload | POST /bucket/key?uploadId=ID | InvalidPart, InvalidPartOrder, EntityTooSmall (a part but the last under 5 MiB), NoSuchUpload, MalformedXML; If-Match and If-None-Match as for PutObject. A completion sent again after it succeeded is answered as the first was, for as long as the key holds the object it made. |
-| AbortMultipartUpload | DELETE /bucket/key?uploadId=ID | 204; NoSuchUpload afterwards. |
-| ListParts | GET /bucket/key?uploadId=ID | max-parts, part-number-marker. |
-| ListMultipartUploads | GET /bucket?uploads | prefix, delimiter, key-marker, upload-id-marker, max-uploads, encoding-type=url. |
-| PutBucketLifecycleConfiguration | PUT /bucket?lifecycle | Replaces the bucket's rules; see Bucket lifecycle. Content-MD5 checked. |
-| GetBucketLifecycleConfiguration | GET /bucket?lifecycle | NoSuchLifecycleConfiguration (404) for a bucket without rules. |
-| DeleteBucketLifecycle | DELETE /bucket?lifecycle | 204 whether or not the bucket had rules. |
-| PutBucketPolicy | PUT /bucket?policy | A JSON policy of at most 20 KiB, replacing the one before; 204; MalformedPolicy (400) for one this runtime cannot honour exactly. See **Bucket policy** below. |
-| GetBucketPolicy | GET /bucket?policy | The document as it was given; NoSuchBucketPolicy (404) when there is none. |
-| DeleteBucketPolicy | DELETE /bucket?policy | 204 whether or not there was one. |
-| GetBucketPolicyStatus | GET /bucket?policyStatus | IsPublic: whether an Allow lets everyone in from any address; NoSuchBucketPolicy (404) when there is none. |
-| PutBucketLogging | PUT /bucket?logging | A BucketLoggingStatus naming a TargetBucket of the same owner, a TargetPrefix and SimplePrefix or PartitionedPrefix keys; an empty one turns logging off; TargetGrants is AccessControlListNotSupported (400). See **Server access logging** below. |
-| GetBucketLogging | GET /bucket?logging | The status as it is kept, an empty one for a bucket that is not logged. |
-| PutPublicAccessBlock | PUT /bucket?publicAccessBlock | A PublicAccessBlockConfiguration, every setting false when left out. See **Public access block** below. |
-| GetPublicAccessBlock | GET /bucket?publicAccessBlock | The four settings; NoSuchPublicAccessBlockConfiguration (404) when there is none. |
-| DeletePublicAccessBlock | DELETE /bucket?publicAccessBlock | 204 whether or not there was one; answers to s3:PutBucketPublicAccessBlock, as on S3. |
-| PutBucketNotificationConfiguration | PUT /bucket?notification | A NotificationConfiguration whose destinations are webhooks of **--notify-targets**, replacing the one before; an empty one removes it. See **Event notifications** below. |
-| GetBucketNotificationConfiguration | GET /bucket?notification | The configuration as it is kept, an Id given to a rule that had none; an empty one for a bucket without. |
-| PutBucketReplication | PUT /bucket?replication | A ReplicationConfiguration whose Role names a target of **--replication-targets**, on a bucket whose versioning is Enabled, replacing the one before. See **Replication** below. |
-| GetBucketReplication | GET /bucket?replication | The configuration as it is kept, an ID given to a rule that had none; ReplicationConfigurationNotFoundError (404) when there is none. |
-| DeleteBucketReplication | DELETE /bucket?replication | 204 whether or not there was one; versions already queued are still copied. |
-| PutBucketQuota | PUT /bucket?quota | socketley's own: a BucketQuota of MaxBytes and MaxObjects, admins only. See **Quotas** below. |
-| GetBucketQuota | GET /bucket?quota | The quota as it is kept; NoSuchBucketQuota (404) when there is none. Admins only. |
-| DeleteBucketQuota | DELETE /bucket?quota | 204 whether or not there was one. Admins only. |
-| PutBucketWebsite | PUT /bucket?website | A WebsiteConfiguration: an IndexDocument, an ErrorDocument and up to 50 RoutingRules, or a RedirectAllRequestsTo alone. See **Website hosting** below. |
-| GetBucketWebsite | GET /bucket?website | The configuration as it is kept; NoSuchWebsiteConfiguration (404) when there is none. |
-| DeleteBucketWebsite | DELETE /bucket?website | 204 whether or not there was one. |
-| GetSessionToken | POST / Action=GetSessionToken | STS's: temporary credentials for the signing user, DurationSeconds 900 to 129600 (43200). See **Temporary credentials** below. |
-| AssumeRole | POST / Action=AssumeRole | STS's: the same, DurationSeconds 900 to 43200 (3600), the RoleArn of a role the IAM API made, and a Policy that bounds the session. |
-| AssumeRoleWithWebIdentity | POST / Action=AssumeRoleWithWebIdentity | STS's, unsigned: temporary credentials for an OIDC provider's token, as **--federation** maps it. See **Federated identities** below. |
-| AssumeRoleWithLDAPIdentity | POST / Action=AssumeRoleWithLDAPIdentity | Unsigned: temporary credentials for a user the LDAP directory binds, as **--federation** maps it. |
+#### `ListBuckets`
+
+*GET /* 
+ The buckets the caller owns, or every bucket for an admin (see **Users**), sorted by name, with creation dates; max-buckets (1 to 10000), continuation-token and prefix page it as S3 does.
+
+#### `CreateBucket`
+
+*PUT /bucket* 
+ BucketAlreadyOwnedByYou (409) if the caller owns it, BucketAlreadyExists (409) if another user does; InvalidBucketName (400) for a name S3 would refuse. x-amz-bucket-object-lock-enabled: true makes it versioned and locked for good; see **Object lock** below.
+
+#### `DeleteBucket`
+
+*DELETE /bucket* 
+ BucketNotEmpty (409) while it holds objects, noncurrent versions or delete markers; open multipart uploads are aborted with it.
+
+#### `HeadBucket`
+
+*HEAD /bucket* 
+ 200, or 404 with no body.
+
+#### `GetBucketLocation`
+
+*GET /bucket?location* 
+ An empty LocationConstraint.
+
+#### `PutBucketVersioning`
+
+*PUT /bucket?versioning* 
+ Status Enabled or Suspended; MfaDelete Enabled, or an x-amz-mfa header, is 501 NotImplemented. See **Versioning** below.
+
+#### `GetBucketVersioning`
+
+*GET /bucket?versioning* 
+ An empty VersioningConfiguration for a bucket never versioned.
+
+#### `PutObjectLockConfiguration`
+
+*PUT /bucket?object-lock* 
+ ObjectLockEnabled Enabled and an optional default retention; only while versioning is Enabled; Content-MD5 or a checksum required. See **Object lock** below.
+
+#### `GetObjectLockConfiguration`
+
+*GET /bucket?object-lock* 
+ ObjectLockConfigurationNotFoundError (404) for a bucket without object lock.
+
+#### `PutObjectRetention`
+
+*PUT /bucket/key?retention* 
+ Mode and RetainUntilDate, or an empty Retention to remove one; versionId; x-amz-bypass-governance-retention; Content-MD5 or a checksum required.
+
+#### `GetObjectRetention`
+
+*GET /bucket/key?retention* 
+ NoSuchObjectLockConfiguration (404) for a version without one.
+
+#### `PutObjectLegalHold`
+
+*PUT /bucket/key?legal-hold* 
+ Status ON or OFF; versionId; Content-MD5 or a checksum required.
+
+#### `GetObjectLegalHold`
+
+*GET /bucket/key?legal-hold* 
+ NoSuchObjectLockConfiguration (404) for a version whose hold was never set.
+
+#### `PutBucketEncryption`
+
+*PUT /bucket?encryption* 
+ A ServerSideEncryptionConfiguration whose one rule is AES256, or aws:kms with an optional KMSMasterKeyID; aws:kms:dsse is 501 NotImplemented, and so is any rule on a runtime without **--sse-key-file**. See **Server-side encryption** below.
+
+#### `GetBucketEncryption`
+
+*GET /bucket?encryption* 
+ The rule; ServerSideEncryptionConfigurationNotFoundError (404) for a bucket without one.
+
+#### `DeleteBucketEncryption`
+
+*DELETE /bucket?encryption* 
+ 204; the objects keep the encryption they were written with.
+
+#### `ListObjectVersions`
+
+*GET /bucket?versions* 
+ prefix, delimiter, key-marker, version-id-marker, max-keys (at most 1000), encoding-type=url; Version and DeleteMarker entries by key, each key's newest first.
+
+#### `PutBucketCors`
+
+*PUT /bucket?cors* 
+ A CORSConfiguration of at most 100 rules and 64 KiB, replacing the one before; Content-MD5 checked. See **CORS** below.
+
+#### `GetBucketCors`
+
+*GET /bucket?cors* 
+ The rules as they are kept; NoSuchCORSConfiguration (404) when there are none.
+
+#### `DeleteBucketCors`
+
+*DELETE /bucket?cors* 
+ 204 whether or not there were rules.
+
+#### `(preflight)`
+
+*OPTIONS /bucket[/key]* 
+ Answered from the bucket's CORS rules, with no signature.
+
+#### `ListObjectsV2`
+
+*GET /bucket?list-type=2* 
+ prefix, delimiter, continuation-token, max-keys (at most 1000), start-after, encoding-type=url, fetch-owner; CommonPrefixes count against max-keys.
+
+#### `ListObjects (V1)`
+
+*GET /bucket* 
+ marker and NextMarker.
+
+#### `PutObject`
+
+*PUT /bucket/key* 
+ Streamed; Content-MD5 checked; Content-Type, Cache-Control, Content-Disposition, Content-Encoding, Content-Language, Expires and x-amz-meta-* stored and returned; x-amz-tagging sets the object's tags; Expect: 100-continue and chunked request bodies accepted; If-Match (an ETag or *) writes only over that object, NoSuchKey (404) when the key holds none, and If-None-Match (* or an ETag) only when the key holds no such object, decided when the object is committed so two racing writers cannot both win; PreconditionFailed (412) otherwise; x-amz-server-side-encryption: AES256 or the SSE-C headers encrypt it.
+
+#### `GetObject`
+
+*GET /bucket/key* 
+ Range (one range), If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since, response-* header overrides on a signed request (InvalidRequest, 400, on an anonymous one); every answer outside a website endpoint carries X-Content-Type-Options: nosniff and, but for a PDF, Content-Security-Policy: default-src 'none'; sandbox, and is sent as Content-Disposition: attachment unless its type is an image, audio, video, font, text/plain, text/csv, PDF, JSON, ZIP or octet-stream, so nothing it holds runs on the web interface's origin; x-amz-tagging-count when the object has tags (on HEAD too); ?versionId= reads that version, and x-amz-version-id names it; an object stored under a client's key needs the SSE-C headers, on HEAD too.
+
+#### `HeadObject`
+
+*HEAD /bucket/key* 
+ The headers of a GET, from memory, or from the object's header when another shard owns the key; ?versionId= as for GET.
+
+#### `SelectObjectContent`
+
+*POST /bucket/key?select&select-type=2* 
+ A SQL expression over a CSV or JSON object, answered as an event stream. See **S3 Select** below.
+
+#### `GetObjectAttributes`
+
+*GET /bucket/key?attributes* 
+ x-amz-object-attributes of ETag, Checksum, ObjectParts, StorageClass and ObjectSize; the parts of a multipart object paged by x-amz-max-parts and x-amz-part-number-marker, with their numbers, sizes and, when the upload had a checksum algorithm, each part's own checksum; ?versionId= and the SSE-C headers as for HeadObject.
+
+#### `GetObject, HeadObject by part`
+
+*GET|HEAD /bucket/key?partNumber=N* 
+ Part N of a multipart object as a 206 with its Content-Range and x-amz-mp-parts-count; see **Reading by part number** below.
+
+#### `DeleteObject`
+
+*DELETE /bucket/key* 
+ 204 whether or not the key existed; in a versioned bucket a delete marker, and with ?versionId= that version removed for good. If-Match (an ETag list or *), x-amz-if-match-last-modified-time and x-amz-if-match-size are asked of that version, or of the latest the marker would cover (a delete marker included, which only * passes): PreconditionFailed (412) when it does not match, and 204 with nothing removed when there is none, decided by the shard that owns the key as the delete is.
+
+#### `PostObject`
+
+*POST /bucket (multipart/form-data)* 
+ A browser's upload by HTML form; see **Uploads by form** below.
+
+#### `DeleteObjects`
+
+*POST /bucket?delete* 
+ Up to 1000 keys, each with or without a VersionId and with the conditions DeleteObject takes as an ETag, a LastModifiedTime (an HTTP date or ISO 8601) and a Size, a key whose condition does not match answered PreconditionFailed among the errors; Quiet, Content-MD5 checked.
+
+#### `CopyObject`
+
+*PUT /bucket/key + x-amz-copy-source* 
+ Within or across buckets; x-amz-metadata-directive COPY or REPLACE; x-amz-tagging-directive COPY (the default, the source's tags) or REPLACE (those x-amz-tagging names, or none); x-amz-copy-source-if-match and -if-none-match; onto itself only with REPLACE, from an older version or naming an encryption or a checksum algorithm; a source of key?versionId=ID copies that version. The copy is a single-part object whose ETag is the md5 of its bytes, encrypted as its own request or its bucket asks whatever its source's was; x-amz-copy-source-server-side-encryption-customer-* open an SSE-C source. Its checksum is FULL_OBJECT, of its own bytes, in the algorithm x-amz-checksum-algorithm names or else its source's (see **Checksums** below).
+
+#### `PutObjectTagging`
+
+*PUT /bucket/key?tagging* 
+ A Tagging document replacing the object's tags; Content-MD5 checked. See **Object tags** below. The tagging operations take ?versionId= too.
+
+#### `GetObjectTagging`
+
+*GET /bucket/key?tagging* 
+ The tags in the order they were set; an empty TagSet for none.
+
+#### `DeleteObjectTagging`
+
+*DELETE /bucket/key?tagging* 
+ 204 whether or not the object had tags.
+
+#### `CreateMultipartUpload`
+
+*POST /bucket/key?uploads* 
+ Content-Type, the stored headers, x-amz-meta-* and x-amz-tagging are kept for the object; x-amz-checksum-algorithm names the checksum every part takes; x-amz-server-side-encryption or the SSE-C headers encrypt every part and the object.
+
+#### `UploadPart`
+
+*PUT /bucket/key?partNumber=N&uploadId=ID* 
+ Streamed like a put, Content-MD5 and the checksums checked; a part sent again replaces the old one. N is 1 to 10000. A part of an SSE-C upload carries the upload's key.
+
+#### `UploadPartCopy`
+
+*PUT /bucket/key?partNumber=N&uploadId=ID + x-amz-copy-source* 
+ The whole source or x-amz-copy-source-range=\:bytes=first-last, a range past the source's end being 416 InvalidRange; a source of key?versionId=ID reads that version.
+
+#### `CompleteMultipartUpload`
+
+*POST /bucket/key?uploadId=ID* 
+ InvalidPart, InvalidPartOrder, EntityTooSmall (a part but the last under 5 MiB), NoSuchUpload, MalformedXML; If-Match and If-None-Match as for PutObject. A completion sent again after it succeeded is answered as the first was, for as long as the key holds the object it made.
+
+#### `AbortMultipartUpload`
+
+*DELETE /bucket/key?uploadId=ID* 
+ 204; NoSuchUpload afterwards.
+
+#### `ListParts`
+
+*GET /bucket/key?uploadId=ID* 
+ max-parts, part-number-marker.
+
+#### `ListMultipartUploads`
+
+*GET /bucket?uploads* 
+ prefix, delimiter, key-marker, upload-id-marker, max-uploads, encoding-type=url.
+
+#### `PutBucketLifecycleConfiguration`
+
+*PUT /bucket?lifecycle* 
+ Replaces the bucket's rules; see Bucket lifecycle. Content-MD5 checked.
+
+#### `GetBucketLifecycleConfiguration`
+
+*GET /bucket?lifecycle* 
+ NoSuchLifecycleConfiguration (404) for a bucket without rules.
+
+#### `DeleteBucketLifecycle`
+
+*DELETE /bucket?lifecycle* 
+ 204 whether or not the bucket had rules.
+
+#### `PutBucketPolicy`
+
+*PUT /bucket?policy* 
+ A JSON policy of at most 20 KiB, replacing the one before; 204; MalformedPolicy (400) for one this runtime cannot honour exactly. See **Bucket policy** below.
+
+#### `GetBucketPolicy`
+
+*GET /bucket?policy* 
+ The document as it was given; NoSuchBucketPolicy (404) when there is none.
+
+#### `DeleteBucketPolicy`
+
+*DELETE /bucket?policy* 
+ 204 whether or not there was one.
+
+#### `GetBucketPolicyStatus`
+
+*GET /bucket?policyStatus* 
+ IsPublic: whether an Allow lets everyone in from any address; NoSuchBucketPolicy (404) when there is none.
+
+#### `PutBucketLogging`
+
+*PUT /bucket?logging* 
+ A BucketLoggingStatus naming a TargetBucket of the same owner, a TargetPrefix and SimplePrefix or PartitionedPrefix keys; an empty one turns logging off; TargetGrants is AccessControlListNotSupported (400). See **Server access logging** below.
+
+#### `GetBucketLogging`
+
+*GET /bucket?logging* 
+ The status as it is kept, an empty one for a bucket that is not logged.
+
+#### `PutPublicAccessBlock`
+
+*PUT /bucket?publicAccessBlock* 
+ A PublicAccessBlockConfiguration, every setting false when left out. See **Public access block** below.
+
+#### `GetPublicAccessBlock`
+
+*GET /bucket?publicAccessBlock* 
+ The four settings; NoSuchPublicAccessBlockConfiguration (404) when there is none.
+
+#### `DeletePublicAccessBlock`
+
+*DELETE /bucket?publicAccessBlock* 
+ 204 whether or not there was one; answers to s3:PutBucketPublicAccessBlock, as on S3.
+
+#### `PutBucketNotificationConfiguration`
+
+*PUT /bucket?notification* 
+ A NotificationConfiguration whose destinations are webhooks of **--notify-targets**, replacing the one before; an empty one removes it. See **Event notifications** below.
+
+#### `GetBucketNotificationConfiguration`
+
+*GET /bucket?notification* 
+ The configuration as it is kept, an Id given to a rule that had none; an empty one for a bucket without.
+
+#### `PutBucketReplication`
+
+*PUT /bucket?replication* 
+ A ReplicationConfiguration whose Role names a target of **--replication-targets**, on a bucket whose versioning is Enabled, replacing the one before. See **Replication** below.
+
+#### `GetBucketReplication`
+
+*GET /bucket?replication* 
+ The configuration as it is kept, an ID given to a rule that had none; ReplicationConfigurationNotFoundError (404) when there is none.
+
+#### `DeleteBucketReplication`
+
+*DELETE /bucket?replication* 
+ 204 whether or not there was one; versions already queued are still copied.
+
+#### `PutBucketQuota`
+
+*PUT /bucket?quota* 
+ socketley's own: a BucketQuota of MaxBytes and MaxObjects, admins only. See **Quotas** below.
+
+#### `GetBucketQuota`
+
+*GET /bucket?quota* 
+ The quota as it is kept; NoSuchBucketQuota (404) when there is none. Admins only.
+
+#### `DeleteBucketQuota`
+
+*DELETE /bucket?quota* 
+ 204 whether or not there was one. Admins only.
+
+#### `PutBucketWebsite`
+
+*PUT /bucket?website* 
+ A WebsiteConfiguration: an IndexDocument, an ErrorDocument and up to 50 RoutingRules, or a RedirectAllRequestsTo alone. See **Website hosting** below.
+
+#### `GetBucketWebsite`
+
+*GET /bucket?website* 
+ The configuration as it is kept; NoSuchWebsiteConfiguration (404) when there is none.
+
+#### `DeleteBucketWebsite`
+
+*DELETE /bucket?website* 
+ 204 whether or not there was one.
+
+#### `GetSessionToken`
+
+*POST / Action=GetSessionToken* 
+ STS's: temporary credentials for the signing user, DurationSeconds 900 to 129600 (43200). See **Temporary credentials** below.
+
+#### `AssumeRole`
+
+*POST / Action=AssumeRole* 
+ STS's: the same, DurationSeconds 900 to 43200 (3600), the RoleArn of a role the IAM API made, and a Policy that bounds the session.
+
+#### `AssumeRoleWithWebIdentity`
+
+*POST / Action=AssumeRoleWithWebIdentity* 
+ STS's, unsigned: temporary credentials for an OIDC provider's token, as **--federation** maps it. See **Federated identities** below.
+
+#### `AssumeRoleWithLDAPIdentity`
+
+*POST / Action=AssumeRoleWithLDAPIdentity* 
+ Unsigned: temporary credentials for a user the LDAP directory binds, as **--federation** maps it.
 
 A bucket's ownership controls decide whether the bucket takes ACLs. They are managed with PutBucketOwnershipControls, GetBucketOwnershipControls and DeleteBucketOwnershipControls, or with **x-amz-object-ownership** on CreateBucket. BucketOwnerEnforced is every bucket's default, as S3 makes it now, and it disables ACLs. Every bucket and object then has one grant, FULL_CONTROL to the bucket's owner, and GetBucketAcl and GetObjectAcl answer that grant. A write may ask only for that ACL: **bucket-owner-full-control**, or **x-amz-acl: private** from the bucket's owner, which rclone and s3fs send by default. Any other canned ACL or grant is **400 AccessControlListNotSupported** (**InvalidBucketAclWithObjectOwnership** on CreateBucket), and nothing is stored.
 
@@ -10715,7 +10998,14 @@ socketley create db copy -p 9500 --replicate https://data.example.com \
     --replicate-key /etc/socketley/db.replica-key --keys /etc/socketley/db.keys -s
 ```
 
-A document lives at **/c/***collection***/***id***.** **GET** reads it, **PUT** replaces it, **PATCH** changes it in place and **DELETE** removes it. A **POST** to **/c/***collection* makes a new document under a new id. The answer holds the document's fields plus **_id**, **_v** (its version: 1 when made, one more with each change, and also its **ETag**) and **_owner** (the account's id). **If-Match: "3"** writes only at that version, and **If-None-Match: *** writes only where no document exists. Otherwise the answer is 412. A patch looks like **{"set":{"a.b":1},"unset":["c"],"inc":{"n":1},"push":{"tags":"x"},"pull":{"tags":"y"}}** and works on dotted paths.
+A document lives at **/c/***collection***/***id***.** **GET** reads it, **PUT** replaces it, **PATCH** changes it in place and **DELETE** removes it. A **POST** to **/c/***collection* makes a new document under a new id. The answer holds the document's fields plus **_id**, **_v** (its version: 1 when made, one more with each change, and also its **ETag**) and **_owner** (the account's id). **If-Match: "3"** writes only at that version, and **If-None-Match: *** writes only where no document exists. Otherwise the answer is 412. A patch looks like
+
+```
+{"set":{"a.b":1},"unset":["c"],"inc":{"n":1},
+ push :{"tags":"x"},"pull":{"tags":"y"}}
+```
+
+and works on dotted paths.
 
 **POST** */c/***collection***/_query* takes a query such as **{"where":{"level":{"gte":5},\:"name":"x"},\:"sort":"-level",\:"limit":50,\:"skip":0}**. The conditions are eq, ne, gt, gte, lt, lte, in, prefix and exists. **count :true** answers the number alone. The answer is **{"docs":[...]}**, plus **next** when there are more. A range compares a field's values of one kind only, in the order an index uses: null, false, true, numbers, strings. A condition or a sort on a field the schema does not index is judged by reading the documents. The query reads at most 8 MiB of them, unless a key asks for more. Past that, it is refused with 400 **needs_index**: index the field. **POST /tx** takes **{"ops":[{"op":"put","c":..,"id":..,"doc":{..}},\:{"op":"patch",..,"changes":{..},"if":3},\:{"op":"insert",..},\:{"op":"delete",..}]}** and makes every change or none. **GET /me** names who is asking.
 
@@ -12836,7 +13126,7 @@ self.pending([id])         -- The client's own form.  Bytes queued for its
                            -- whose callback is running, or all of them
                            -- outside every callback.
 
--- ─── Sending faster than the socket ───
+-- --- Sending faster than the socket ---
 -- A write is queued, not performed, and the queue has a bound.  Reach it and
 -- the runtime closes the connection -- which used to be the only way a script
 -- found out: the message that filled the queue was dropped and answered true,
@@ -12870,7 +13160,7 @@ self.pending([id])         -- The client's own form.  Bytes queued for its
 -- Measured with a client that connects and never reads, against 400 chunks of
 -- 64 KB: 129 taken, 271 refused, and the queue standing at its bound.
 
--- ─── A response written rather than returned ───
+-- --- A response written rather than returned ---
 -- on_http_request has to RETURN its body, so a generated answer had to fit in
 -- memory.  A FILE of any size was already served by the splice path and a Range
 -- of it by the 206 path; a generated one of any size was not expressible at all
@@ -12916,7 +13206,7 @@ self.cache(command)        -- Run one command against the LINKED cache and
                            -- keeps serving meanwhile.  nil plus a reason when
                            -- the answer is not coming.
 
--- ─── A handler that waits ───
+-- --- A handler that waits ---
 -- In a handler that can wait, a call that reaches outside the runtime
 -- (self.cache, socketley.http) suspends the handler until the answer comes,
 -- and the runtime keeps serving other clients meanwhile.
@@ -12972,7 +13262,7 @@ self.upstream_pending(conn_id)   -- Bytes queued for that upstream and not yet o
                                  -- runtime's upstreams
 self.upstreams()                 -- Table of connected upstream conn_ids
 
--- ─── The same bound, pointed outwards ───
+-- --- The same bound, pointed outwards ---
 -- An upstream's write queue fills exactly as a client's does, and these used to
 -- report none of it.  upstream_send() tested only whether the upstream was
 -- connected; a queue that reached the bound sets `closing` and leaves
@@ -15063,11 +15353,17 @@ From the manual page socketley(1).
 
 Any runtime runs inside a program of your own, with or without a daemon. For C++ the SDK comes in three tiers, in **sdk/include/linux/socketley/**. Tiers 1 and 3 are self-contained, header-only files. Copy them anywhere and compile with **g++ -std=c++17**; no library is needed. Tier 2 must be built from source.
 
-| Tier | Header | Use Case | Dependencies |
-|---|---|---|---|
-| 1 | socketley/control.h | Control a running daemon | None (POSIX) |
-| 2 | socketley/{server,cache,proxy,client}.h | Embed the full engine | libsocketley_sdk.a |
-| 3 | socketley/attach.h | Register with a daemon | None (Tier 1) |
+### `Tier 1: socketley/control.h`
+
+Control a running daemon. Needs nothing beyond POSIX.
+
+### `Tier 2: socketley/{server,cache,proxy,client}.h`
+
+Embed the full engine. Links libsocketley_sdk.a.
+
+### `Tier 3: socketley/attach.h`
+
+Register with a daemon. Needs nothing beyond Tier 1.
 
 ## Tier 1: Daemon Control (header-only)
 
