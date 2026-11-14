@@ -124,18 +124,21 @@ std::vector<std::string> arf_complainants(std::string_view msg)
             a = a.substr(lt + 1, a.find('>', lt) == std::string::npos ? std::string::npos : a.find('>', lt) - lt - 1);
         while (!a.empty() && (a.back() == ' ' || a.back() == '\r'))
             a.pop_back();
-        while (!a.empty() && a.front() == ' ')
-            a.erase(0, 1);
+        a.erase(0, std::min(a.size(), a.find_first_not_of(' ')));
         socketley::ascii::lower_in_place(a);
         if (a.find('@') != std::string::npos && a.find_first_of(" ,;") == std::string::npos && out.size() < 10 &&
             std::find(out.begin(), out.end(), a) == out.end())
             out.push_back(a);
     };
     const std::string_view body = msg.substr(std::min(msg.size(), header_block(msg).size()));
-    for (size_t at = 0; (at = body.find("Original-Rcpt-To:", at)) != std::string_view::npos; at += 17)
+    // One a line, and none past the tenth: a line of a million copies is one line read once.
+    for (size_t at = 0; out.size() < 10 && (at = body.find("Original-Rcpt-To:", at)) != std::string_view::npos;)
     {
         const size_t end = body.find('\n', at);
         add(body.substr(at + 17, end == std::string_view::npos ? std::string_view::npos : end - at - 17));
+        if (end == std::string_view::npos)
+            break;
+        at = end;
     }
     if (!out.empty())
         return out;
@@ -734,8 +737,7 @@ void mail_run::bounce_taken(std::string_view message, std::string_view to, bool 
             dead_at_status = SIZE_MAX;
             const size_t semi = value.find(';');
             recipient = std::string(semi == std::string_view::npos ? value : value.substr(semi + 1));
-            while (!recipient.empty() && recipient.front() == ' ')
-                recipient.erase(0, 1);
+            recipient.erase(0, std::min(recipient.size(), recipient.find_first_not_of(' ')));
             socketley::ascii::lower_in_place(recipient);
         }
         else if (socketley::ascii::iequals(name, "Action") && !recipient.empty())

@@ -1,6 +1,7 @@
 #include "mail_mime.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cctype>
 #include <cerrno>
 #include <unordered_map>
@@ -10,6 +11,7 @@
 #include "mail_compose.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail::mime
 {
@@ -92,11 +94,13 @@ void joined_2231(std::vector<std::pair<std::string, std::string>>& params)
         bool encoded;
     };
     std::vector<std::pair<std::string, std::vector<segment>>> groups;
+    // Each name's group by a lookup, as a header may hold a hundred thousand parameters.
+    std::unordered_map<std::string, size_t, string_hash, string_equal> group_of;
     std::vector<std::pair<std::string, std::string>> out;
     const auto group = [&](const std::string& base) -> std::vector<segment>& {
-        for (auto& g : groups)
-            if (g.first == base)
-                return g.second;
+        if (const auto it = group_of.find(base); it != group_of.end())
+            return groups[it->second].second;
+        group_of.emplace(base, groups.size());
         out.emplace_back(base, std::string());
         return groups.emplace_back(base, std::vector<segment>{}).second;
     };
@@ -124,8 +128,11 @@ void joined_2231(std::vector<std::pair<std::string, std::string>>& params)
         group(base).push_back({index, std::move(value), encoded});
     }
     static constexpr char hex[] = "0123456789ABCDEF";
-    for (auto& [base, segs] : groups)
+    std::vector<std::string> joined(groups.size());
+    std::vector<bool> joined_encoded(groups.size());
+    for (size_t gi = 0; gi < groups.size(); ++gi)
     {
+        auto& segs = groups[gi].second;
         std::stable_sort(segs.begin(), segs.end(), [](const segment& a, const segment& b) { return a.index < b.index; });
         const bool encoded = std::any_of(segs.begin(), segs.end(), [](const segment& s) { return s.encoded; });
         std::string value;
@@ -152,17 +159,34 @@ void joined_2231(std::vector<std::pair<std::string, std::string>>& params)
                 }
             }
         }
-        // A plain value under the same name gives way to the continued one, as RFC 2231 3 has it.
-        std::erase_if(out, [&](const auto& p) { return p.first == base && !p.second.empty(); });
-        for (auto& p : out)
-            if (p.first == base && p.second.empty())
-            {
-                p.first = encoded ? base + "*" : base;
-                p.second = std::move(value);
-                break;
-            }
+        joined[gi] = std::move(value);
+        joined_encoded[gi] = encoded;
     }
-    params = std::move(out);
+    // A plain value under a continued name gives way to it, as RFC 2231 3 has it, and the first empty entry of the name
+    // takes the joined value: one pass over the parameters rather than one for each name.
+    std::vector<bool> filled(groups.size());
+    std::vector<std::pair<std::string, std::string>> kept;
+    kept.reserve(out.size());
+    for (auto& p : out)
+    {
+        const auto it = group_of.find(p.first);
+        if (it == group_of.end())
+        {
+            kept.push_back(std::move(p));
+            continue;
+        }
+        const size_t gi = it->second;
+        if (!p.second.empty())
+            continue;
+        if (!filled[gi])
+        {
+            filled[gi] = true;
+            p.first = joined_encoded[gi] ? p.first + "*" : p.first;
+            p.second = std::move(joined[gi]);
+        }
+        kept.push_back(std::move(p));
+    }
+    params = std::move(kept);
 }
 
 // "value; name=value; name="quoted"": the value, and the parameters with their names in lower case.
@@ -291,7 +315,8 @@ void parse_into(part& p, std::string_view msg, size_t off, size_t len, int depth
     for (const auto& [k, v] : p.params)
         if (k == "boundary")
             boundary = v;
-    if (boundary.empty())
+    // RFC 2046 5.1.1 allows 1 to 70 characters, and a longer one only made the search below cost more.
+    if (boundary.empty() || boundary.size() > 70)
         return;
     const std::string dash = "--" + boundary;
     // Each delimiter is at a line's start; a part runs from the line after one to the CRLF before the next.
@@ -300,9 +325,12 @@ void parse_into(part& p, std::string_view msg, size_t off, size_t len, int depth
     bool closed = false;
     while (at <= body.size() && !closed)
     {
-        const size_t hit = body.find(dash, at);
-        if (hit == std::string_view::npos)
+        // memmem's two-way search is linear, where string_view::find tries every place the first byte matches.
+        const void* found = at < body.size() ? ::memmem(body.data() + at, body.size() - at, dash.data(), dash.size())
+                                             : nullptr;
+        if (!found)
             break;
+        const size_t hit = static_cast<size_t>(static_cast<const char*>(found) - body.data());
         const bool line_start = hit == 0 || (hit >= 2 && body.substr(hit - 2, 2) == "\r\n");
         const size_t after = hit + dash.size();
         if (!line_start)
@@ -1187,12 +1215,25 @@ std::string preview(std::string_view message, const part& text, size_t bytes)
     {
         std::string flat;
         bool tag = false;
+        // The next '>' is found once and kept until passed, so a run of '<' with none after it is read once.
+        size_t gt = 0;
+        bool gt_known = false;
         // Read only until it is longer than the preview, which what follows cannot change.
         for (size_t i = 0; i < s.size() && flat.size() <= bytes; ++i)
         {
             const char c = s[i];
-            if (cut && tags && c == '<' && quote_tag(sv.substr(i + 1, sv.find('>', i) - i - 1)))
-                break;
+            if (cut && tags && c == '<')
+            {
+                if (!gt_known || (gt != std::string_view::npos && gt < i))
+                {
+                    gt = sv.find('>', i);
+                    gt_known = true;
+                }
+                // What marks a quote is a tag's name or class, within its first KiB.
+                const size_t len = (gt == std::string_view::npos ? sv.size() : gt) - i - 1;
+                if (quote_tag(sv.substr(i + 1, std::min<size_t>(len, 1024))))
+                    break;
+            }
             if (cut && !tags && (i == 0 || s[i - 1] == '\n') && quote_line(sv.substr(i, sv.find('\n', i) - i)))
                 break;
             if (tags && (c == '<' || c == '>'))

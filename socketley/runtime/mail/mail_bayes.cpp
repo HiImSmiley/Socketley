@@ -110,10 +110,12 @@ std::string html_text(std::string_view h)
             for (const std::string_view skip : {std::string_view("style"), std::string_view("script")})
                 if (tag.starts_with(skip))
                 {
-                    std::string rest(h.substr(close));
-                    socketley::ascii::lower_in_place(rest);
-                    const size_t end = rest.find("</" + std::string(skip));
-                    next = end == std::string::npos ? h.size() : close + end;
+                    // Its closing tag, in any case, found where it lies rather than in a lowered copy of the rest.
+                    size_t end = h.find("</", close);
+                    while (end != std::string_view::npos &&
+                           !socketley::ascii::iequals(h.substr(end + 2, skip.size()), skip))
+                        end = h.find("</", end + 2);
+                    next = end == std::string_view::npos ? h.size() : end;
                 }
             out += ' ';
             i = next;
