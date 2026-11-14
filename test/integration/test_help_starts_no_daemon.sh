@@ -69,7 +69,7 @@ for v in $VERBS; do
 
         # And it must actually be that verb's usage, not the general help: the
         # cheapest way to pass the two assertions above is to print nothing.
-        if printf '%s' "$out" | head -1 | grep -q "^usage: $v "; then ok; else
+        if grep -q "^usage: $v " <<<"${out%%$'\n'*}"; then ok; else
             bad "$v $flag prints its own usage" "got '${out:-<silence>}'"
         fi
     done

@@ -94,7 +94,7 @@ else
         "it returned after ${QSECS}s, which is neither the deadline nor close to it"
 fi
 
-if [ "$QRC" -ne 0 ] && printf '%s' "$QOUT" | grep -q "has not answered"; then
+if [ "$QRC" -ne 0 ] && grep -q "has not answered" <<<"$QOUT"; then
     ok "and it is named as busy, not as unreachable (rc $QRC)"
 else
     bad "the CLI says which of the two failures it hit" \
@@ -108,7 +108,7 @@ fi
 # The other direction, which is what stops this from being a rename: nothing is
 # listening at all, and that must still read as absent.
 GOUT=$(SOCKETLEY_SOCKET="$SOCKETLEY_TMPD/nothing.sock" "$BIN" daemon stop 2>&1); GRC=$?
-if [ "$GRC" -ne 0 ] && ! printf '%s' "$GOUT" | grep -q "has not answered"; then
+if [ "$GRC" -ne 0 ] && ! grep -q "has not answered" <<<"$GOUT"; then
     ok "a socket nothing holds still reads as absent (rc $GRC)"
 else
     bad "the two failures stay apart" \

@@ -133,7 +133,7 @@ done
 # Its cpu gone for four seconds, which is no answer.
 kill -STOP "$SPUN" 2>/dev/null; sleep 4; kill -CONT "$SPUN" 2>/dev/null; sleep 4
 lines=$(grep -E "runtime 'spin'.*(answered nothing|answering again)" "$SOCKETLEY_DLOG")
-if echo "$lines" | grep -q 'answering again'; then
+if grep -q 'answering again' <<<"$lines"; then
     bad "a stuck runtime whose cpu dipped is not said to be answering" "$lines"
 elif [ "$(echo "$lines" | grep -c 'answered nothing')" -ne 1 ]; then
     bad "a stuck runtime is reported once, not again with a figure that only grows" "$lines"

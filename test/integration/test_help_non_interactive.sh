@@ -59,7 +59,7 @@ fi
 # The escape check is the one that catches a rebuild of the old behaviour even
 # if something else fixed the status: the interactive path opens with an ANSI
 # clear before it prints anything at all.
-if printf '%s' "$OUT" | grep -q $'\033'; then
+if grep -q $'\033' <<<"$OUT"; then
     fail "the output carries no terminal escapes" \
          "found an ESC byte in output meant for a pipe" \
          "first line: $(printf '%s' "$OUT" | head -1 | cat -v | cut -c1-60)"
@@ -67,7 +67,7 @@ else
     pass
 fi
 
-if printf '%s' "$OUT" | grep -qiE '^\s*q\)\s*Quit|What would you like to learn'; then
+if grep -qiE '^\s*q\)\s*Quit|What would you like to learn' <<<"$OUT"; then
     fail "no interactive menu in a pipe" \
          "the menu was printed to something that cannot answer it"
 else
@@ -79,7 +79,7 @@ fi
 # Without these, a build whose --help printed nothing at all would pass every
 # assertion above: no escapes, no menu, exit 0.
 for want in USAGE create daemon "man socketley"; do
-    if printf '%s' "$OUT" | grep -qF "$want"; then
+    if grep -qF "$want" <<<"$OUT"; then
         pass
     else
         fail "the help names \`$want\`" "not found in $(printf '%s' "$OUT" | wc -l) lines of output"
@@ -91,7 +91,7 @@ done
 # Both files are generated from the same tree, so any command this binary
 # dispatches must appear in the help it prints.  `restart` is the discriminator
 # on this machine: the installed copy predates it.
-if printf '%s' "$OUT" | grep -qF "restart"; then
+if grep -qF "restart" <<<"$OUT"; then
     pass
 else
     fail "the help came from this binary's own tree" \
@@ -111,7 +111,7 @@ fi
 # missing there is nothing to measure and the check says so instead of failing.
 if command -v script >/dev/null 2>&1 && infocmp xterm >/dev/null 2>&1; then
     TTY_OUT=$(TERM=xterm timeout 20 script -qec "$BIN --help" /dev/null </dev/null 2>&1 || true)
-    if printf '%s' "$TTY_OUT" | grep -qiE 'What would you like to learn|Interactive Help'; then
+    if grep -qiE 'What would you like to learn|Interactive Help' <<<"$TTY_OUT"; then
         pass
     else
         fail "a real terminal still gets the interactive help" \
@@ -140,7 +140,7 @@ if command -v script >/dev/null 2>&1 && infocmp xterm >/dev/null 2>&1; then
     BAD_OUT=$(TERM=xterm timeout 20 script -qec \
         "TERM=socketley-no-such-term $BIN --help; echo RC=\$?" /dev/null </dev/null 2>&1 || true)
 
-    if printf '%s' "$BAD_OUT" | grep -qiE 'What would you like to learn|Interactive Help'; then
+    if grep -qiE 'What would you like to learn|Interactive Help' <<<"$BAD_OUT"; then
         pass
     else
         fail "an unknown TERM still gets the help" \
@@ -167,7 +167,7 @@ fi
 if [ -S /tmp/socketley.sock ] && [ ! -e /tmp/socketley.sock.pre ]; then
     : # a pre-existing daemon socket is not this test's business
 fi
-if printf '%s' "$OUT" | grep -qiE 'failed to start daemon|daemon not running'; then
+if grep -qiE 'failed to start daemon|daemon not running' <<<"$OUT"; then
     fail "--help needs no daemon" "the help output mentions the daemon failing to start"
 else
     pass

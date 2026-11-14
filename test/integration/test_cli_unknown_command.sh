@@ -60,7 +60,7 @@ else
     fail "an unknown command exits 1" "got exit $RC"
 fi
 
-if printf '%s' "$OUT" | grep -qF "unknown command: gibtsnicht"; then
+if grep -qF "unknown command: gibtsnicht" <<<"$OUT"; then
     pass
 else
     fail "the message names the word it did not understand" \
@@ -96,7 +96,7 @@ fi
 "$BIN" start cliunk_srv >/dev/null 2>&1 || true
 RC3=0
 OUT3=$(echo "ping" | "$BIN" cliunk_srv 2>&1) || RC3=$?
-if [ "$RC3" -eq 0 ] && ! printf '%s' "$OUT3" | grep -qiE "unknown command|runtime not found"; then
+if [ "$RC3" -eq 0 ] && ! grep -qiE "unknown command|runtime not found" <<<"$OUT3"; then
     pass
 else
     fail "a piped message to a live runtime is sent" \

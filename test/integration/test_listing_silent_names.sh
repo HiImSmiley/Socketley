@@ -85,7 +85,7 @@ fi
 PS_S=$("$BIN" ps -s 2>&1 || true)
 
 # One field per line is the whole claim: "only runtime names (one per line)".
-WIDE=$(printf '%s\n' "$PS_S" | awk 'NF != 1 { print; exit }')
+WIDE=$(awk 'NF != 1 { print; exit }' <<<"$PS_S")
 if [ -z "$WIDE" ]; then
     ok
 else
@@ -101,7 +101,7 @@ fi
 
 # Paired with the two above: -s has always suppressed the header, and must go on
 # doing so.  Green on the build this was written against.
-if ! printf '%s\n' "$PS_S" | grep -q "OWNED BY"; then
+if ! grep -q "OWNED BY" <<<"$PS_S"; then
     ok
 else
     bad "ps -s prints no header" "the header is still there" "$PS_S"
@@ -111,7 +111,7 @@ fi
 
 LS_S=$("$BIN" ls -s 2>&1 || true)
 
-WIDE=$(printf '%s\n' "$LS_S" | awk 'NF != 1 { print; exit }')
+WIDE=$(awk 'NF != 1 { print; exit }' <<<"$LS_S")
 if [ -z "$WIDE" ]; then
     ok
 else
@@ -145,7 +145,7 @@ fi
 PS_COLS=$("$BIN" ps -s --id --name 2>&1 || true)
 if printf '%s\n' "$PS_COLS" | awk -F'\t' 'NF != 2 { bad=1 } END { exit bad }' \
    && printf '%s\n' "$PS_COLS" | grep -q "sn_up" \
-   && ! printf '%s\n' "$PS_COLS" | grep -q "NAME"; then
+   && ! grep -q "NAME" <<<"$PS_COLS"; then
     ok
 else
     bad "ps -s --id --name is still two fields and no header" \
@@ -155,7 +155,7 @@ fi
 # The default table, header and all.  Twenty-odd files in this directory awk a
 # column out of this.
 PS_PLAIN=$("$BIN" ps 2>&1 || true)
-if printf '%s\n' "$PS_PLAIN" | grep -q "OWNED BY" \
+if grep -q "OWNED BY" <<<"$PS_PLAIN" \
    && printf '%s\n' "$PS_PLAIN" | awk '$2 == "sn_up" && /Up / { found=1 } END { exit !found }'; then
     ok
 else
