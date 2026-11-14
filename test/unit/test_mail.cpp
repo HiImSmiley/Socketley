@@ -1321,6 +1321,51 @@ TEST_CASE("SORT and THREAD: a display name with a comma, and a reply chain fifty
     CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
 }
 
+TEST_CASE("THREAD REFERENCES: a parent of many children lets each go at once, and one subject's thread is found by place")
+{
+    namespace io = socketley::mail::imap_order;
+    const auto make = [](uint32_t n, const std::string& head) {
+        io::entry e;
+        e.number = n;
+        e.seq = n - 1;
+        io::read(e, head + "\r\n");
+        return e;
+    };
+    // 100,000 placeholders under one parent, then each the message it stood for, under another: each move searched
+    // the parent's 100,000 children, 5e9 comparisons.
+    constexpr uint32_t k = 100000;
+    std::vector<io::entry> v;
+    v.reserve(2 * k);
+    for (uint32_t i = 1; i <= k; ++i)
+        v.push_back(make(i, "Subject: p\r\nMessage-ID: <m" + std::to_string(i) + "@t>\r\nReferences: <p@t> <c" +
+                                std::to_string(i) + "@t>\r\n"));
+    for (uint32_t i = 1; i <= k; ++i)
+        v.push_back(make(k + i, "Subject: q\r\nMessage-ID: <c" + std::to_string(i) + "@t>\r\nReferences: <q@t>\r\n"));
+    auto t0 = thread_cpu_now();
+    const std::string t = io::references(v);
+    const double moved = std::chrono::duration<double>(thread_cpu_now() - t0).count();
+    MESSAGE("THREAD of 100,000 children moved off one parent: " << moved << " s of CPU");
+    CHECK(moved < 0.75);
+    CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
+    // The parent q holds every c, each its m: none is left under p, which is then no thread of its own.
+    CHECK(t.find("(" + std::to_string(k + 1) + " " + "1)") != std::string::npos);
+    CHECK(t.find(" " + std::to_string(k + 1) + " ") == std::string::npos);
+
+    // 100,000 subjects of two messages each: each pair's thread replaced its first in a list searched whole.
+    std::vector<io::entry> w;
+    w.reserve(200000);
+    for (uint32_t i = 1; i <= 100000; ++i)
+        for (uint32_t j = 0; j < 2; ++j)
+            w.push_back(make(2 * i - 1 + j, "Subject: s" + std::to_string(i) + "\r\nMessage-ID: <s" + std::to_string(i) +
+                                                "-" + std::to_string(j) + "@t>\r\n"));
+    t0 = thread_cpu_now();
+    const std::string u = io::references(w);
+    const double gathered = std::chrono::duration<double>(thread_cpu_now() - t0).count();
+    MESSAGE("THREAD of 100,000 subjects of two: " << gathered << " s of CPU");
+    CHECK(gathered < 0.75);
+    CHECK(u.starts_with("((1)(2))((3)(4))"));
+}
+
 TEST_CASE("SORT and THREAD: a References header of a million ids keeps its last hundred and no room for the rest")
 {
     namespace io = socketley::mail::imap_order;

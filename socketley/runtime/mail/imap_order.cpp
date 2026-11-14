@@ -360,6 +360,8 @@ struct node
     std::vector<node*> kids;
     // For the subject grouping: whether the message's subject was a reply's.
     bool reply{false};
+    // Marks a child already kept while settle() reads a node's children.
+    bool kept{false};
 };
 
 // A thread is printed and sorted by recursion this deep at most: what lies deeper starts a thread of its own.
@@ -375,13 +377,30 @@ bool ancestor(const node* a, const node* of)
     return false;
 }
 
+// Its parent forgets it by settle(): a parent of 50,000 children searched them for each one moved, 50,000^2 / 2.
 void unlink(node* n)
 {
-    if (!n->parent)
-        return;
-    auto& k = n->parent->kids;
-    k.erase(std::remove(k.begin(), k.end(), n), k.end());
     n->parent = nullptr;
+}
+
+// Each node's children as the links left them: those moved elsewhere since gone, each once, where it was last put.
+void settle(const std::vector<std::unique_ptr<node>>& all)
+{
+    std::vector<node*> out;
+    for (const auto& n : all)
+    {
+        auto& k = n->kids;
+        out.clear();
+        for (auto it = k.rbegin(); it != k.rend(); ++it)
+            if ((*it)->parent == n.get() && !(*it)->kept)
+            {
+                (*it)->kept = true;
+                out.push_back(*it);
+            }
+        for (node* x : out)
+            x->kept = false;
+        k.assign(out.rbegin(), out.rend());
+    }
 }
 
 // `child` under `parent`, unless it would close a loop.
@@ -519,6 +538,7 @@ std::string references(std::vector<entry> v)
         if (prev)
             link(prev, me);
     }
+    settle(all);
     // Nodes deeper than the recursion below goes are made roots, found without recursing.
     std::vector<node*> too_deep;
     {
@@ -541,13 +561,14 @@ std::string references(std::vector<entry> v)
     }
     for (node* n : too_deep)
         unlink(n);
+    settle(all);
     std::vector<node*> roots;
     for (const auto& n : all)
         if (!n->parent)
             roots.push_back(n.get());
     prune(roots, nullptr);
-    // Threads of one base subject are gathered under one root.
-    std::map<std::string, node*> by_subject;
+    // Threads of one base subject are gathered under one root, each kept by its place in `kept`.
+    std::map<std::string, std::pair<node*, size_t>> by_subject;
     const auto subject_of = [](const node* n) {
         const node* m = n->msg ? n : n->kids.empty() ? nullptr : n->kids.front();
         return m && m->msg ? m->msg->subject : std::string();
@@ -564,11 +585,12 @@ std::string references(std::vector<entry> v)
         const auto it = by_subject.find(s);
         if (it == by_subject.end())
         {
-            by_subject[s] = r;
+            by_subject[s] = {r, kept.size()};
             kept.push_back(r);
             continue;
         }
-        node* t = it->second;
+        node* t = it->second.first;
+        const size_t at = it->second.second;
         if (!t->msg && !r->msg)
         {
             for (node* k : r->kids)
@@ -581,8 +603,8 @@ std::string references(std::vector<entry> v)
         else if (!r->msg || (t->reply && !r->reply))
         {
             link(r, t);
-            std::replace(kept.begin(), kept.end(), t, r);
-            it->second = r;
+            kept.at(at) = r;
+            it->second.first = r;
         }
         else
         {
@@ -590,8 +612,8 @@ std::string references(std::vector<entry> v)
             node* d = all.back().get();
             link(d, t);
             link(d, r);
-            std::replace(kept.begin(), kept.end(), t, d);
-            it->second = d;
+            kept.at(at) = d;
+            it->second.first = d;
         }
     }
     sort_kids(kept);
