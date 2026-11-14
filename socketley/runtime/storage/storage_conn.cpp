@@ -384,6 +384,13 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
             pace_tick();
         return;
     }
+    if (req == &m_select_timer.req)
+    {
+        m_select_timer.armed = false;
+        if (!m_stopped)
+            select_resume();
+        return;
+    }
     if (req == &m_accept_backoff.req)
     {
         m_accept_backoff.armed = false;
@@ -698,6 +705,9 @@ void storage_run::stop()
     if (m_pace_timer.armed)
         m_loop.submit_timeout_remove(&m_pace_timer.req);
     m_paced.clear();
+    if (m_select_timer.armed)
+        m_loop.submit_timeout_remove(&m_select_timer.req);
+    m_select_waiting.clear();
     media_stop();
 
     std::vector<std::shared_ptr<conn>> all;

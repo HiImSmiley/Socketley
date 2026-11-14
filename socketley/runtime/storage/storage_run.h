@@ -1351,6 +1351,8 @@ public:
     // SelectObjectContent: a SQL expression run over a CSV or JSON object, answered as an event stream.
     void op_select(const std::shared_ptr<conn>& c);
     void select_pump(const std::shared_ptr<conn>& c);
+    void select_feed(const std::shared_ptr<conn>& c);
+    void select_resume();
     // Feeds [first, first + len) of a source object's plaintext into `op`, opening it with the key `customer`
     // or the master gives, and runs `done` with the put's result; a failure on the way is answered here.
     struct copy_feed;
@@ -1563,6 +1565,9 @@ private:
     // One timer for every trickling body, and the connections waiting for it.
     timer       m_pace_timer;
     std::vector<uint64_t> m_paced;
+    // One zero timer for every select whose turn ran out, and the connections waiting for it.
+    timer       m_select_timer;
+    std::vector<uint64_t> m_select_waiting;
 
     struct media_job
     {

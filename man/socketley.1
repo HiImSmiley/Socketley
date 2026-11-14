@@ -12419,6 +12419,27 @@ and
 .PP
 A record over 1 MiB fails with
 .BR OverMaxRecordSize .
+A query may spend 100 ms of CPU and 250 ns more for each byte of the object
+it reads, and a JSON record as much again for its own bytes; past that it fails with
+.BR ExpressionTooLong .
+A select evaluates for at most about 2 ms before the runtime serves its other
+connections and comes back to it.
+.B LIKE
+and
+.B TRIM
+cost time linear in their value, and
+.B IN
+over a list of string literals is one lookup per record.
+A
+.B LIKE
+pattern whose run between two
+.B %
+holds 63 characters or more with a
+.B _
+among them may fail with
+.B LikeInvalidInputs
+where matching it would take more than 64 steps for each byte of the value and
+the pattern.
 GZIP, BZIP2 and Parquet input fail with
 .BR "501 NotImplemented" .
 The object is read the way a GET reads it, whether it is sealed, compressed or at

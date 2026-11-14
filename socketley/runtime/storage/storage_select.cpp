@@ -3,6 +3,7 @@
 #include "storage_run.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 #include "s3_select.h"
@@ -19,10 +20,15 @@ struct select_job
     // The reader gave its last window, and the stream's last chunk is written.
     bool read_all{false};
     bool ended{false};
+    // What of the reader's window the query has not taken yet, valid until the reader is asked for the next.
+    std::string_view pending;
 };
 
 namespace
 {
+
+// How long a select evaluates before the loop serves the other connections.
+constexpr auto select_turn = std::chrono::milliseconds(2);
 
 // One HTTP chunk holding `data`.
 std::string http_chunk(std::string_view data)
@@ -143,6 +149,11 @@ void storage_run::select_pump(const std::shared_ptr<conn>& c)
         file_done(c);
         return;
     }
+    if (!j.pending.empty() && !j.engine.done())
+    {
+        select_feed(c);
+        return;
+    }
     // The query needs nothing more: what it still holds, its Stats or its error, and the stream's end go in one write.
     if (j.read_all || j.engine.done())
     {
@@ -186,18 +197,59 @@ void storage_run::select_pump(const std::shared_ptr<conn>& c)
             return;
         }
         if (piece.empty())
-            sj.read_all = true;
-        else
-            sj.engine.feed(piece);
-        const std::string out = sj.engine.take_output();
-        if (out.empty())
         {
+            sj.read_all = true;
             select_pump(cc);
             return;
         }
-        cc->after_write = conn::after_kind::pump;
-        queue_write(cc, http_chunk(select_records_event(out)));
+        sj.pending = piece;
+        select_feed(cc);
     });
+}
+
+void storage_run::select_feed(const std::shared_ptr<conn>& c)
+{
+    select_job& j = *c->sel;
+    const size_t took = j.engine.feed_until(j.pending, std::chrono::steady_clock::now() + select_turn);
+    j.pending.remove_prefix(std::min(took, j.pending.size()));
+    if (j.engine.done())
+        j.pending = {};
+    if (const std::string out = j.engine.take_output(); !out.empty())
+    {
+        c->after_write = conn::after_kind::pump;
+        queue_write(c, http_chunk(select_records_event(out)));
+        return;
+    }
+    if (j.pending.empty())
+    {
+        select_pump(c);
+        return;
+    }
+    // The turn is up with the window not taken: the rest waits for the loop to come round.
+    m_select_waiting.push_back(c->id);
+    if (m_select_timer.armed)
+        return;
+    m_select_timer.ts  = {};
+    m_select_timer.req = io_request{};
+    m_select_timer.req.owner = this;
+    m_select_timer.req.type  = op_timeout;
+    m_select_timer.armed = m_loop.submit_timeout(&m_select_timer.ts, &m_select_timer.req);
+    if (!m_select_timer.armed)
+    {
+        m_select_waiting.pop_back();
+        j.engine.feed(j.pending);
+        j.pending = {};
+        select_pump(c);
+    }
+}
+
+void storage_run::select_resume()
+{
+    std::vector<uint64_t> due;
+    due.swap(m_select_waiting);
+    for (const uint64_t id : due)
+        if (auto c = find(id); c && !c->dead && c->sel)
+            select_pump(c);
 }
 
 }   // namespace socketley::storage

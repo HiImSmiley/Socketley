@@ -3,6 +3,7 @@
 // and the event stream the answer travels in.
 //
 // Pure code with no I/O, so a unit test reaches it without a ring.
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -17,6 +18,9 @@ namespace socketley::storage
 inline constexpr size_t select_max_record = size_t{1} << 20;
 // The longest SQL expression a request may carry, past which it fails with ExpressionTooLong.
 inline constexpr size_t select_max_expression = size_t{256} << 10;
+// What a query may spend evaluating, and a JSON record of it: this, and select_time_per_byte for each byte fed.
+inline constexpr std::chrono::milliseconds select_time_base{100};
+inline constexpr std::chrono::nanoseconds  select_time_per_byte{250};
 
 enum class select_format : uint8_t { csv, json };
 enum class select_header : uint8_t { none, use, ignore };
@@ -85,6 +89,9 @@ public:
 
     // The next bytes of the object; ignored once done().
     void feed(std::string_view bytes);
+    // As feed(), but stopping after the record that ends past `deadline`, so the caller can let others run first:
+    // the bytes taken, the rest to be fed again.
+    size_t feed_until(std::string_view bytes, std::chrono::steady_clock::time_point deadline);
     // The object has ended: the last record without a delimiter is read and an aggregate's one record is written.
     bool finish();
 

@@ -12,9 +12,12 @@
 //
 // Properties checked, beyond "did it crash":
 //   * any bytes compressed open back to themselves, and a block opens to no more than the room it is given;
-//   * a select fed its object whole gives the records it gives fed a byte at a time;
+//   * a select fed its object whole gives the records it gives fed a byte at a time, and the records it gives
+//     paused at every look at the clock and fed the rest again;
 //   * an ACL that parses encodes and decodes back to itself, and grants nothing a grantee it does not name;
 //   * a photo's facts are a time or a place on the globe, and a HEIF's boxes end however large they say they are.
+
+#include <chrono>
 
 #include "fuzz_common.h"
 #include "runtime/storage/compression.h"
@@ -82,8 +85,9 @@ void select(std::string_view in)
     if (!parse_select_request(in.substr(0, nul), req, err))
         return;
     const std::string_view object = in.substr(nul + 1);
-    select_engine whole, piecewise;
-    if (!whole.init(req, err, object.size()) || !piecewise.init(req, err, object.size()))
+    select_engine whole, piecewise, paused;
+    if (!whole.init(req, err, object.size()) || !piecewise.init(req, err, object.size()) ||
+        !paused.init(req, err, object.size()))
         return;
     whole.feed(object);
     whole.finish();
@@ -98,6 +102,19 @@ void select(std::string_view in)
     b += piecewise.take_output();
     if (!whole.failed() && !piecewise.failed())
         FUZZ_CHECK(a == b, "a select fed in pieces gave other records than fed whole");
+    std::string c;
+    for (std::string_view rest = object; !rest.empty() && !paused.done();)
+    {
+        const size_t took = paused.feed_until(rest, std::chrono::steady_clock::time_point{});
+        FUZZ_CHECK(took <= rest.size(), "a paused select took more bytes than it was given");
+        FUZZ_CHECK(took > 0 || paused.done(), "a paused select took nothing and is not done");
+        rest.remove_prefix(took);
+        c += paused.take_output();
+    }
+    paused.finish();
+    c += paused.take_output();
+    if (!whole.failed() && !paused.failed())
+        FUZZ_CHECK(a == c, "a select paused and fed the rest again gave other records than fed whole");
 }
 
 void acl(std::string_view in)

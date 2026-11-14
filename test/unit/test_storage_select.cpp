@@ -2,8 +2,10 @@
 #include "doctest.h"
 
 #include "runtime/storage/s3_select.h"
+#include "thread_cpu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -514,6 +516,128 @@ TEST_CASE("WHERE compares numbers as numbers and strings as strings, with LIKE, 
     CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE _2", csv_none, "abc,a%\nabc,b%\n") == "abc\n");
     CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '_'", csv_none, "\xC3\xA9\nab\n") == "\xC3\xA9\n");
     CHECK(run_failure("SELECT _1 FROM S3Object WHERE _1", csv_none, "abc\n") == "InvalidDataType");
+}
+
+TEST_CASE("LIKE costs time linear in the value, and a pattern built to cost more fails the query")
+{
+    const std::string value = std::string(512 << 10, 'a') + "\n";
+    const std::string run10k(10000, 'a');
+    std::string blanks;
+    for (int i = 0; i < 5000; ++i)
+        blanks += "_a";
+    const auto cpu_of = [](auto&& f)
+    {
+        const auto t0 = thread_cpu_now();
+        f();
+        return std::chrono::duration<double>(thread_cpu_now() - t0).count();
+    };
+    // A long literal after a % is searched for, not tried at every byte: 10,000 bytes against 512 KiB took 3 s.
+    CHECK(cpu_of([&] { CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + run10k + "b'", csv_none, value) == ""); }) <
+          1.0);
+    CHECK(cpu_of([&] { CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + run10k + "'", csv_none, value) == value); }) <
+          1.0);
+    CHECK(cpu_of([&] { CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + run10k + "%'", csv_none, value) == value); }) <
+          1.0);
+    // Runs of _ have nothing to search for, so their tries are counted and a pattern that spends the count fails.
+    CHECK(cpu_of([&] { CHECK(run_failure("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + blanks + "b'", csv_none, value) ==
+                             "LikeInvalidInputs"); }) < 1.0);
+    // A run shorter than 63 never spends it, however many there are.
+    std::string many;
+    for (int i = 0; i < 2000; ++i)
+        many += "%a_";
+    CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '" + many + "%'", csv_none, value) == value);
+    CHECK(run("SELECT _1 FROM S3Object WHERE _1 LIKE '%" + std::string(62, '_') + "b%'", csv_none, value) == "");
+}
+
+TEST_CASE("TRIM costs time linear in the value and the set, whichever of them is long")
+{
+    // A value of 20 KB trimmed by a set of 256 KiB whose match is its last character took 14 s, 64 KiB here half a minute.
+    const std::string value = std::string(64 << 10, 'a') + "x\n";
+    const std::string set   = std::string(200 << 10, 'b') + "a";
+    const auto t0 = thread_cpu_now();
+    CHECK(run("SELECT TRIM(LEADING '" + set + "' FROM _1) FROM S3Object", csv_none, value) == "x\n");
+    CHECK(run("SELECT TRIM(BOTH _2 FROM _1) FROM S3Object", csv_none, "\xC3\xA9xa\xC3\xA9," + set + "\xC3\xA9\n") == "x\n");
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    // A set ending in a cut character holds both it and the whole one, and the value loses the one it starts with.
+    CHECK(run("SELECT TRIM(LEADING '\xC3\xA9' || '\xC3' FROM _1) FROM S3Object", csv_none, "\xC3\xA9z\n") == "z\n");
+    CHECK(run("SELECT TRIM(LEADING '\xC3\xA9' || '\xC3' FROM _1) FROM S3Object", csv_none, "\xC3z\n") == "z\n");
+}
+
+TEST_CASE("IN over text literals is a lookup, and a query that costs more than its bytes allow fails")
+{
+    std::string rows;
+    for (int i = 0; i < (1 << 17); ++i)
+        rows += i % 1000 == 0 ? "hit\n" : "a\n";
+    std::string text = "SELECT _1 FROM S3Object WHERE _1 IN ('b'";
+    std::string nums = "SELECT _1 FROM S3Object WHERE _1 IN (1";
+    for (int i = 0; i < 40000; ++i)
+    {
+        text += ",'b'";
+        nums += ",1";
+    }
+    // 40,000 text literals against 128 Ki records took 32 s walked one by one.
+    const auto t0 = thread_cpu_now();
+    const std::string hits = run(text + ",'hit')", csv_none, rows);
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 1.0);
+    CHECK(std::count(hits.begin(), hits.end(), '\n') == 132);
+    CHECK(run("SELECT _1 FROM S3Object WHERE _1 NOT IN ('a', 'hit')", csv_none, rows) == "");
+    CHECK(run("SELECT _1 FROM S3Object WHERE _1 IN ('x', 2)", csv_none, "2\nx\ny\n") == "2\nx\n");
+    // A value that is missing compares as unknown, so neither IN nor NOT IN keeps its record.
+    const std::string w = "{\"v\":1}\n{\"v\":2,\"w\":\"a\"}\n{\"v\":3,\"w\":\"b\"}\n";
+    CHECK(run("SELECT s.v FROM S3Object s WHERE s.w IN ('a')", json_lines, w, "<JSON/>") == "{\"v\":2}\n");
+    CHECK(run("SELECT s.v FROM S3Object s WHERE s.w NOT IN ('a')", json_lines, w, "<JSON/>") == "{\"v\":3}\n");
+
+    // Numbers are compared one by one, so this list costs what it did; the query stops at its share of time.
+    const auto t1 = thread_cpu_now();
+    CHECK(run_failure(nums + ")", csv_none, rows) == "ExpressionTooLong");
+    const double took = std::chrono::duration<double>(thread_cpu_now() - t1).count();
+    CHECK(took < std::chrono::duration<double>(select_time_base).count() * 3);
+    // A literal of 200 KB made again for every record of two bytes.
+    CHECK(run_failure("SELECT _1 FROM S3Object WHERE _1 || '" + std::string(200000, 'x') + "' = 'q'", csv_none, rows) ==
+          "ExpressionTooLong");
+}
+
+TEST_CASE("feed_until stops after the record that passes the deadline, and the rest fed again gives the same output")
+{
+    std::string csv, lines, doc;
+    for (int i = 0; i < 5000; ++i)
+    {
+        csv += std::to_string(i) + ",x" + std::to_string(i % 7) + "\n";
+        lines += "{\"n\":" + std::to_string(i) + ",\"s\":\"x" + std::to_string(i % 7) + "\"}\n";
+        doc += "{\"n\":" + std::to_string(i) + ",\"a\":[" + std::to_string(i % 3) + "]} ";
+    }
+    const auto paused = [](const select_request& req, std::string_view data)
+    {
+        select_engine e;
+        s3_error err;
+        REQUIRE(e.init(req, err));
+        std::string out;
+        size_t stops = 0;
+        while (!data.empty() && !e.done())
+        {
+            // A deadline already past: every look at the clock is a pause.
+            const size_t took = e.feed_until(data, std::chrono::steady_clock::time_point{});
+            REQUIRE(took <= data.size());
+            stops += took < data.size();
+            data.remove_prefix(took);
+            out += e.take_output();
+        }
+        e.finish();
+        out += e.take_output();
+        CHECK(stops > 10);
+        return out;
+    };
+    const auto whole = [](const select_request& req, std::string_view data) { return run_pieces(req, data, data.size()).out; };
+    const select_request a = req_of("SELECT _1 FROM S3Object WHERE _2 LIKE 'x_'", csv_none);
+    const select_request b = req_of("SELECT s.n FROM S3Object s WHERE s.s = 'x3'", json_lines);
+    const select_request c = req_of("SELECT s.n FROM S3Object[*].a[*] s", json_doc);
+    const select_request d = req_of("SELECT COUNT(*) FROM S3Object WHERE _2 IN ('x1', 'x2')", csv_none);
+    CHECK(paused(a, csv) == whole(a, csv));
+    CHECK(paused(b, lines) == whole(b, lines));
+    CHECK(paused(c, doc) == whole(c, doc));
+    CHECK(paused(d, csv) == whole(d, csv));
+    CHECK_FALSE(whole(a, csv).empty());
+    CHECK_FALSE(whole(c, doc).empty());
 }
 
 TEST_CASE("expressions: arithmetic, CAST, string functions, COALESCE and NULLIF")

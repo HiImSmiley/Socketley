@@ -1,12 +1,16 @@
 #include "s3_select.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <unordered_set>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -115,6 +119,14 @@ bool is_digit(char c)
 }
 
 // The bytes of the UTF-8 character at `i`, one for a byte that does not begin one, never past the end.
+// The CPU time this thread has spent.
+std::chrono::nanoseconds thread_cpu()
+{
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec);
+}
+
 size_t char_step(std::string_view s, size_t i)
 {
     const unsigned char lead = static_cast<unsigned char>(s[i]);
@@ -464,6 +476,57 @@ struct like_item
     char      c{0};
 };
 
+// A TRIM set's characters by byte length, sorted, each kept at its first place in the set, so stripping a character
+// costs a lookup and not a walk of the set.
+struct trim_set
+{
+    std::string                          chars;
+    std::array<std::vector<uint32_t>, 5> by_len;
+
+    void build(std::string_view set)
+    {
+        chars.assign(set);
+        for (auto& v : by_len)
+            v.clear();
+        for (size_t i = 0; i < chars.size(); i += char_step(chars, i))
+            by_len[char_step(chars, i)].push_back(static_cast<uint32_t>(i));
+        for (size_t len = 1; len < by_len.size(); ++len)
+        {
+            auto& v = by_len[len];
+            const auto piece = [&](uint32_t at) { return std::string_view(chars).substr(at, len); };
+            std::stable_sort(v.begin(), v.end(), [&](uint32_t a, uint32_t b) { return piece(a) < piece(b); });
+            v.erase(std::unique(v.begin(), v.end(), [&](uint32_t a, uint32_t b) { return piece(a) == piece(b); }),
+                    v.end());
+        }
+    }
+
+    // The bytes the set character `s` starts (or ends) with takes, the one first in the set when two do; 0 for none.
+    size_t take(std::string_view s, bool front) const
+    {
+        size_t take = 0;
+        uint32_t first = std::numeric_limits<uint32_t>::max();
+        for (size_t len = 1; len <= 4 && len <= s.size(); ++len)
+        {
+            const std::string_view want = front ? s.substr(0, len) : s.substr(s.size() - len);
+            const auto& v = by_len[len];
+            const auto it = std::lower_bound(v.begin(), v.end(), want, [&](uint32_t at, std::string_view w)
+                                             { return std::string_view(chars).substr(at, len) < w; });
+            if (it != v.end() && std::string_view(chars).substr(*it, len) == want && *it < first)
+            {
+                first = *it;
+                take  = len;
+            }
+        }
+        return take;
+    }
+};
+
+struct text_hash
+{
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
+};
+
 struct node
 {
     op       o{op::lit};
@@ -481,6 +544,12 @@ struct node
     // A LIKE whose pattern and escape are literals, compiled once.
     bool                   pattern_ready{false};
     std::vector<like_item> pattern;
+    // An IN whose list is string literals alone, looked up rather than walked.
+    bool                   in_ready{false};
+    std::unordered_set<std::string, text_hash, std::equal_to<>> in_set;
+    // A TRIM whose set is a string literal, read once.
+    bool                   trim_ready{false};
+    trim_set               trims;
 };
 
 struct select_item
@@ -531,47 +600,113 @@ bool like_compile(std::string_view pat, const std::string_view* esc, std::vector
     return true;
 }
 
-// Matched with one backtrack point per %, so a pattern costs at most its length times the subject's.
-bool like_match(std::string_view s, const std::vector<like_item>& p)
+enum class like_result : uint8_t { no, yes, costly };
+
+// Each run between %s goes to its leftmost start on the walk `_` takes, found by memmem when it opens with bytes, and
+// the tries left are paid from `budget`, which only a run of 63 items or more with a `_` in it can spend.
+like_result like_match(std::string_view s, const std::vector<like_item>& p, uint64_t& budget)
 {
     constexpr size_t none = std::numeric_limits<size_t>::max();
-    size_t si = 0;
-    size_t pi = 0;
-    size_t star_p = none;
-    size_t star_s = 0;
-    while (si < s.size())
+    // Items [a, b) matched from `at`: where they end, or none.
+    const auto here = [&](size_t a, size_t b, size_t at) -> size_t
     {
-        if (pi < p.size())
+        for (size_t i = a; i < b; ++i)
         {
-            const like_item& it = p[pi];
-            if (it.k == like_kind::one)
-            {
-                si += char_step(s, si);
-                ++pi;
-                continue;
-            }
-            if (it.k == like_kind::byte && it.c == s[si])
-            {
-                ++si;
-                ++pi;
-                continue;
-            }
-            if (it.k == like_kind::many)
-            {
-                star_p = pi++;
-                star_s = si;
-                continue;
-            }
+            if (at >= s.size())
+                return none;
+            if (p[i].k == like_kind::one)
+                at += char_step(s, at);
+            else if (p[i].c == s[at])
+                ++at;
+            else
+                return none;
         }
-        if (star_p == none)
-            return false;
-        pi = star_p + 1;
-        star_s += char_step(s, star_s);
-        si = star_s;
+        return at;
+    };
+    const auto run_end = [&](size_t from)
+    {
+        while (from < p.size() && p[from].k != like_kind::many)
+            ++from;
+        return from;
+    };
+
+    size_t b  = run_end(0);
+    size_t at = here(0, b, 0);
+    if (at == none)
+        return like_result::no;
+    if (b == p.size())
+        return at == s.size() ? like_result::yes : like_result::no;
+    for (;;)
+    {
+        size_t a = b;
+        while (a < p.size() && p[a].k == like_kind::many)
+            ++a;
+        if (a == p.size())
+            return like_result::yes;
+        b = run_end(a);
+        // Each item takes a byte at least, so a run longer than what is left of the value matches nowhere.
+        if (s.size() - at < b - a)
+            return like_result::no;
+        const bool last = b == p.size();
+        size_t lit = a;
+        while (lit < b && p[lit].k == like_kind::byte)
+            ++lit;
+        std::string head;
+        for (size_t i = a; i < lit; ++i)
+            head += p[i].c;
+        // A last run of bytes alone can only be the subject's tail.
+        if (last && lit == b)
+        {
+            if (s.size() - at < head.size())
+                return like_result::no;
+            const size_t q = s.size() - head.size();
+            while (at < q)
+            {
+                if (budget-- == 0)
+                    return like_result::costly;
+                at += char_step(s, at);
+            }
+            return at == q && s.substr(q) == head ? like_result::yes : like_result::no;
+        }
+        size_t found = none;
+        while (at <= s.size())
+        {
+            if (!head.empty())
+            {
+                const void* hit = at < s.size() ? ::memmem(s.data() + at, s.size() - at, head.data(), head.size())
+                                                : nullptr;
+                if (!hit)
+                    return like_result::no;
+                const size_t q = static_cast<size_t>(static_cast<const char*>(hit) - s.data());
+                // memmem may land inside a character the walk steps over; the next start on the walk is past it.
+                while (at < q)
+                {
+                    if (budget-- == 0)
+                        return like_result::costly;
+                    at += char_step(s, at);
+                }
+                if (at != q)
+                    continue;
+            }
+            if (budget < b - a + 1)
+                return like_result::costly;
+            budget -= b - a + 1;
+            const size_t end = here(a, b, at);
+            if (end != none && (!last || end == s.size()))
+            {
+                found = end;
+                break;
+            }
+            if (at == s.size())
+                break;
+            at += char_step(s, at);
+        }
+        if (found == none)
+            return like_result::no;
+        if (last)
+            return like_result::yes;
+        at = found;
     }
-    while (pi < p.size() && p[pi].k == like_kind::many)
-        ++pi;
-    return pi == p.size();
 }
 
 // ─── Lexer ──────────────────────────────────────────────────────────────────
@@ -1546,6 +1681,25 @@ private:
             }
             n.pattern_ready = true;
         }
+        for (node& n : m_p.nodes)
+        {
+            if (n.o == op::in)
+            {
+                const bool strings = std::all_of(n.args.begin() + 1, n.args.end(), [&](uint32_t a)
+                                                 { return m_p.nodes[a].o == op::lit && m_p.nodes[a].lit.k == vk::string; });
+                if (!strings)
+                    continue;
+                for (size_t k = 1; k < n.args.size(); ++k)
+                    n.in_set.insert(m_p.nodes[n.args[k]].lit.s);
+                n.in_ready = true;
+            }
+            else if (n.o == op::trim && n.args.size() > 1 && m_p.nodes[n.args[1]].o == op::lit &&
+                     m_p.nodes[n.args[1]].lit.k == vk::string)
+            {
+                n.trims.build(m_p.nodes[n.args[1]].lit.s);
+                n.trim_ready = true;
+            }
+        }
         return true;
     }
 
@@ -1955,6 +2109,20 @@ struct select_engine::impl
     uint64_t       rec_start{0};
     uint64_t       returned{0};
     uint64_t       emitted{0};
+    // A record ending past pause_at stops the feed, which feed() never asks for.
+    std::chrono::steady_clock::time_point pause_at{std::chrono::steady_clock::time_point::max()};
+    bool                                  paused{false};
+    // The thread's CPU time spent feeding, which the bytes fed bound, so a busy machine does not count against a query.
+    std::chrono::nanoseconds              spent{0};
+    std::chrono::nanoseconds              feed_start{0};
+    // Evaluation work counted as it is done, so the clock is read after enough of it or of records, not per record.
+    uint64_t                              units{0};
+    uint64_t                              units_at_look{0};
+    uint32_t                              since{0};
+    // A JSON record's rows, all evaluated before a pause can come, and when they started.
+    bool                                  record_open{false};
+    std::chrono::nanoseconds              record_cpu{0};
+    uint64_t                              record_bytes{0};
     std::vector<agg_state> accs;
     std::vector<value>     vals;
 
@@ -2125,13 +2293,16 @@ struct select_engine::impl
 
     // ── CSV ──
 
-    void csv_feed(std::string_view in)
+    size_t csv_feed(std::string_view in)
     {
         const std::string_view rd = req.csv_in.record_delimiter;
-        for (const char c : in)
+        for (size_t i = 0; i < in.size(); ++i)
         {
             if (done)
-                return;
+                return in.size();
+            if (paused)
+                return i;
+            const char c = in[i];
             ++pos;
             if (skipping)
             {
@@ -2145,6 +2316,7 @@ struct select_engine::impl
             }
             csv_byte(c, rd);
         }
+        return in.size();
     }
 
     bool csv_delimits() const
@@ -2319,7 +2491,7 @@ struct select_engine::impl
 
     // ── JSON ──
 
-    void json_lines_feed(std::string_view in)
+    size_t json_lines_feed(std::string_view in)
     {
         size_t i = 0;
         while (i < in.size() && !done)
@@ -2330,7 +2502,7 @@ struct select_engine::impl
                 if (nl == std::string_view::npos)
                 {
                     pos += in.size() - i;
-                    return;
+                    return in.size();
                 }
                 pos += nl + 1 - i;
                 i         = nl + 1;
@@ -2345,13 +2517,13 @@ struct select_engine::impl
             {
                 pos += span.size();
                 fault("OverMaxRecordSize");
-                return;
+                return in.size();
             }
             if (nl == std::string_view::npos)
             {
                 rec.append(span);
                 pos += span.size();
-                return;
+                return in.size();
             }
             pos += span.size() + 1;
             i = nl + 1;
@@ -2365,10 +2537,13 @@ struct select_engine::impl
             }
             rec_start = pos;
             check_end();
+            if (paused)
+                return i;
         }
+        return in.size();
     }
 
-    void json_document_feed(std::string_view in)
+    size_t json_document_feed(std::string_view in)
     {
         constexpr size_t none = std::string_view::npos;
         size_t from = jstarted ? 0 : none;
@@ -2383,7 +2558,7 @@ struct select_engine::impl
                 {
                     pos += i + 1;
                     fault("JSONParsingError", "A JSON document must hold objects or arrays.");
-                    return;
+                    return in.size();
                 }
                 jstarted = true;
                 jdepth   = 1;
@@ -2415,7 +2590,7 @@ struct select_engine::impl
                 {
                     pos += i + 1;
                     fault("OverMaxRecordSize");
-                    return;
+                    return in.size();
                 }
                 if (rec.empty())
                     json_record(span);
@@ -2428,7 +2603,12 @@ struct select_engine::impl
                 if (done)
                 {
                     pos += i + 1;
-                    return;
+                    return in.size();
+                }
+                if (paused)
+                {
+                    pos += i + 1;
+                    return i + 1;
                 }
             }
         }
@@ -2439,10 +2619,11 @@ struct select_engine::impl
             if (rec.size() + span.size() > select_max_record)
             {
                 fault("OverMaxRecordSize");
-                return;
+                return in.size();
             }
             rec.append(span);
         }
+        return in.size();
     }
 
     void json_record(std::string_view text)
@@ -2455,7 +2636,12 @@ struct select_engine::impl
             fault("JSONParsingError");
             return;
         }
+        // Its rows are evaluated with no pause between them, so the record has a share of time of its own.
+        record_cpu   = thread_cpu();
+        record_bytes = text.size();
+        record_open  = true;
         json_rows(doc, 0);
+        record_open = false;
     }
 
     void json_rows(const jnode& n, size_t step)
@@ -2487,6 +2673,12 @@ struct select_engine::impl
 
     void run_row(const row& r)
     {
+        row_body(r);
+        meter();
+    }
+
+    void row_body(const row& r)
+    {
         if (prog.has_where)
         {
             const value w = eval(prog.where, r);
@@ -2501,6 +2693,24 @@ struct select_engine::impl
         emit(r);
         if (prog.limit >= 0 && ++emitted >= static_cast<uint64_t>(prog.limit))
             done = true;
+    }
+
+    // After a record: the query's time against what its bytes allow, and whether the caller asked for a pause.
+    void meter()
+    {
+        if (++since < 64 && units - units_at_look < 4096)
+            return;
+        since         = 0;
+        units_at_look = units;
+        const auto cpu = thread_cpu();
+        const auto allows = [](uint64_t bytes) { return select_time_base + select_time_per_byte * static_cast<int64_t>(bytes); };
+        if (spent + (cpu - feed_start) > allows(pos) || (record_open && cpu - record_cpu > allows(record_bytes)))
+        {
+            fault("ExpressionTooLong", "The query costs more time per byte of the object than a select may take.");
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= pause_at)
+            paused = true;
     }
 
     void csv_out_field(std::string_view s)
@@ -2944,29 +3154,20 @@ struct select_engine::impl
     value trim(const node& n, const row& r)
     {
         const value t = eval(n.args[0], r);
-        const value c = n.args.size() > 1 ? eval(n.args[1], r) : v_str(" ");
+        const value c = n.args.size() > 1 && !n.trim_ready ? eval(n.args[1], r) : v_str(" ");
         if (failed || absent(t) || absent(c))
             return v_null();
         if (!want_string(t) || !want_string(c))
             return v_null();
         std::string_view s = t.s;
-        const std::string_view set = c.s;
+        trim_set built;
+        if (!n.trim_ready)
+            built.build(c.s);
+        const trim_set& set = n.trim_ready ? n.trims : built;
         auto strip = [&](bool front)
         {
-            for (bool hit = true; hit && !s.empty();)
-            {
-                hit = false;
-                for (size_t i = 0; i < set.size(); i += char_step(set, i))
-                {
-                    const std::string_view ch = set.substr(i, char_step(set, i));
-                    if (front ? s.starts_with(ch) : s.ends_with(ch))
-                    {
-                        front ? s.remove_prefix(ch.size()) : s.remove_suffix(ch.size());
-                        hit = true;
-                        break;
-                    }
-                }
-            }
+            for (size_t k = 0; !s.empty() && (k = set.take(s, front)) != 0;)
+                front ? s.remove_prefix(k) : s.remove_suffix(k);
         };
         const trim_side side = static_cast<trim_side>(n.sub);
         if (side != trim_side::trailing)
@@ -3012,8 +3213,9 @@ struct select_engine::impl
     value like(const node& n, const row& r)
     {
         const value s = eval(n.args[0], r);
-        const value p = eval(n.args[1], r);
-        const value e = n.args.size() > 2 ? eval(n.args[2], r) : value{};
+        // A compiled pattern's literals are not evaluated again, which would copy them for every record.
+        const value p = n.pattern_ready ? v_str({}) : eval(n.args[1], r);
+        const value e = n.args.size() > 2 && !n.pattern_ready ? eval(n.args[2], r) : v_str({});
         if (failed || absent(s) || absent(p) || (n.args.size() > 2 && absent(e)))
             return v_null();
         if (s.k != vk::string || p.k != vk::string || (n.args.size() > 2 && e.k != vk::string))
@@ -3033,10 +3235,28 @@ struct select_engine::impl
             }
             pat = &built;
         }
-        return v_bool(like_match(s.s, *pat) != n.negate);
+        // Linear in the value however the pattern is built, so a crafted one cannot hold the loop on one record.
+        const uint64_t allowed = 64 * (s.s.size() + pat->size()) + 4096;
+        uint64_t budget = allowed;
+        const like_result m = like_match(s.s, *pat, budget);
+        units += (allowed - budget) >> 4;
+        if (m == like_result::costly)
+        {
+            fault("LikeInvalidInputs", "The LIKE pattern costs more to match than its value allows.");
+            return v_null();
+        }
+        return v_bool((m == like_result::yes) != n.negate);
     }
 
+    // A node is a unit of work, and a string it makes one more for each 64 bytes, since making it copied them.
     value eval(uint32_t id, const row& r)
+    {
+        value v = eval_node(id, r);
+        units += 1 + (v.k == vk::string ? v.s.size() >> 6 : 0);
+        return v;
+    }
+
+    value eval_node(uint32_t id, const row& r)
     {
         const node& n = prog.nodes[id];
         switch (n.o)
@@ -3123,6 +3343,9 @@ struct select_engine::impl
             case op::in:
             {
                 const value x = eval(n.args[0], r);
+                // Text against a list of text literals is a lookup, the same answer as comparing it with each.
+                if (n.in_ready && !failed && (x.k == vk::string || (absent(x) && n.args.size() > 1)))
+                    return x.k == vk::string ? v_bool(n.in_set.contains(std::string_view(x.s)) != n.negate) : v_null();
                 int t = 0;
                 for (size_t k = 1; k < n.args.size() && t != 1; ++k)
                 {
@@ -3194,15 +3417,28 @@ uint64_t select_engine::first_offset() const
 
 void select_engine::feed(std::string_view bytes)
 {
+    feed_until(bytes, std::chrono::steady_clock::time_point::max());
+}
+
+size_t select_engine::feed_until(std::string_view bytes, std::chrono::steady_clock::time_point deadline)
+{
     impl& m = *m_impl;
     if (!m.ready || m.done || m.finished || bytes.empty())
-        return;
+        return bytes.size();
+    m.pause_at   = deadline;
+    m.paused     = false;
+    m.feed_start = thread_cpu();
+    size_t took  = 0;
     if (m.req.input == select_format::csv)
-        m.csv_feed(bytes);
+        took = m.csv_feed(bytes);
     else if (m.req.json_type == select_json_type::lines)
-        m.json_lines_feed(bytes);
+        took = m.json_lines_feed(bytes);
     else
-        m.json_document_feed(bytes);
+        took = m.json_document_feed(bytes);
+    m.spent += thread_cpu() - m.feed_start;
+    m.pause_at = std::chrono::steady_clock::time_point::max();
+    m.paused   = false;
+    return took;
 }
 
 bool select_engine::finish()
@@ -3213,6 +3449,8 @@ bool select_engine::finish()
     if (m.finished)
         return !m.failed;
     m.finished = true;
+    // The last record is evaluated here, and only that time counts, not the wait since the last feed.
+    m.feed_start = thread_cpu();
     if (!m.done && !m.skipping)
     {
         if (m.req.input == select_format::csv)
