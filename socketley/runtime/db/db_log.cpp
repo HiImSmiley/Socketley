@@ -696,16 +696,19 @@ uint64_t seglog::read_records(uint32_t seg, uint64_t off,
     if (fd < 0 || ::fstat(fd, &st) != 0)
         return off;
     const uint64_t size = static_cast<uint64_t>(st.st_size);
-    // A window at a time, as a scan reads, so a long tail is not one read a record.
+    // A window at a time, as a scan reads, so a long tail is not one read a record; the first is small and each
+    // after it twice the last, since the active segment's zeroed room past its records counts in its size.
     std::string buf;
     uint64_t base = off;
+    uint64_t window = 16u << 10;
     while (off + record_head <= size)
     {
         if (off + record_head > base + buf.size())
         {
             buf.erase(0, static_cast<size_t>(std::min<uint64_t>(off - base, buf.size())));
             base = off;
-            const size_t want = static_cast<size_t>(std::min<uint64_t>(size - base, 1u << 20));
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(size - base, window));
+            window = std::min<uint64_t>(window * 2, 1u << 20);
             const size_t had = buf.size();
             if (want > had)
             {
