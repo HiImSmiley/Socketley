@@ -44,6 +44,7 @@
 #include "../persist/file_stamp.h"
 #include "../util/spare_buffers.h"
 #include "../util/logging.h"
+#include "../loop/coarse_clock.h"
 #include "../util/number_parse.h"
 #include "../util/settings.h"
 
@@ -53,10 +54,23 @@ namespace
 
 // Every connection's write side: the records SSL writes, kept in one string that take_out hands over whole, where a
 // memory BIO copied them in, zeroed its growth and copied them out again in pieces.
+// A server's first bytes go in records one segment long, so a client decrypts what the first round trip brings rather
+// than waiting a second one for the end of a 16 KiB record; full records follow once the window has grown.
+constexpr int    ramp_record = 1369;
+constexpr int    full_record = 16384;
+constexpr size_t ramp_bytes  = 64 * 1024;
+// A connection quiet this long has had its congestion window shrunk again by the kernel, and ramps again.
+constexpr auto   ramp_idle   = std::chrono::seconds(1);
+
 struct out_bio
 {
     std::string buf;
     size_t      off = 0;
+    // Plaintext still to go in small records on a server connection, 0 once its records are full again; and when its
+    // last write was.
+    size_t      ramp_left = 0;
+    bool        ramps = false;
+    std::chrono::steady_clock::time_point last_write{};
 #if SOCKETLEY_KTLS
     // A socket lent for kernel TLS, and the stream counted in bytes ever written and ever taken, so marks outlive take_out.
     int      fd = -1;
@@ -881,7 +895,16 @@ SSL* tls_context::create_ssl_server() const
 {
 #if SOCKETLEY_HAS_TLS
     SSL* ssl = create_ssl();
-    if (ssl) SSL_set_accept_state(ssl);
+    if (ssl)
+    {
+        SSL_set_accept_state(ssl);
+        if (out_bio* o = out_of(ssl))
+        {
+            o->ramps = true;
+            o->ramp_left = ramp_bytes;
+            SSL_set_max_send_fragment(ssl, ramp_record);
+        }
+    }
     return ssl;
 #else
     return nullptr;
@@ -1068,6 +1091,31 @@ int tls_context::ssl_read(SSL* ssl, char* buf, int len)
 #endif
 }
 
+#if SOCKETLEY_HAS_TLS
+namespace
+{
+
+// One SSL_write: the bytes written, 0 for a retry of the same buffer, -1 for a failure.
+int write_once(SSL* ssl, const char* buf, int len)
+{
+    ERR_clear_error();
+    const int ret = SSL_write(ssl, buf, len);
+    if (ret > 0)
+        return ret;
+    const int err = SSL_get_error(ssl, ret);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+        return 0;
+    const ssl_failure f = take_ssl_failure(err);
+    if (SSL_is_server(ssl))
+        LOG_DEBUG(("tls: write failed: " + f.detail).c_str());
+    else
+        LOG_WARN(("tls: write failed: " + f.detail).c_str());
+    return -1;
+}
+
+}   // namespace
+#endif
+
 int tls_context::ssl_write(SSL* ssl, const char* buf, int len)
 {
 #if SOCKETLEY_HAS_TLS
@@ -1078,21 +1126,34 @@ int tls_context::ssl_write(SSL* ssl, const char* buf, int len)
     if (wbio && BIO_ctrl_pending(wbio) >= max_bio_buffered)
         return 0;
 
-    ERR_clear_error();
-    int ret = SSL_write(ssl, buf, len);
-    if (ret > 0)
-        return ret;
+    out_bio* o = out_of(ssl);
+    if (!o || !o->ramps)
+        return write_once(ssl, buf, len);
+    const auto now = socketley::coarse_now();
+    if (o->ramp_left == 0 && now - o->last_write >= ramp_idle)
+    {
+        o->ramp_left = ramp_bytes;
+        SSL_set_max_send_fragment(ssl, ramp_record);
+    }
+    o->last_write = now;
+    if (o->ramp_left == 0)
+        return write_once(ssl, buf, len);
 
-    int err = SSL_get_error(ssl, ret);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-        return 0;
-
-    const ssl_failure f = take_ssl_failure(err);
-    if (SSL_is_server(ssl))
-        LOG_DEBUG(("tls: write failed: " + f.detail).c_str());
-    else
-        LOG_WARN(("tls: write failed: " + f.detail).c_str());
-    return -1;
+    // What is left of the ramp goes in small records and the rest of this write in full ones, written whole either
+    // way, since the record layer writes into a buffer that refuses nothing and callers take a write as all or none.
+    const int small = static_cast<int>(std::min<size_t>(o->ramp_left, static_cast<size_t>(len)));
+    const int a = write_once(ssl, buf, small);
+    if (a <= 0)
+        return a;
+    o->ramp_left -= static_cast<size_t>(a);
+    if (o->ramp_left > 0)
+        return a;
+    // Lowering the fragment lowered the split one with it, which raising it again does not.
+    if (SSL_set_max_send_fragment(ssl, full_record) == 1 && SSL_set_split_send_fragment(ssl, full_record) != 1) {}
+    if (a == len)
+        return a;
+    const int rest = write_once(ssl, buf + a, len - a);
+    return rest > 0 ? a + rest : -1;
 #else
     return -1;
 #endif
@@ -1419,6 +1480,13 @@ tls_context::kernel_switch tls_context::start_kernel_tls(SSL* ssl)
         return kernel_switch::on;
     if (o->refused || SSL_version(ssl) != TLS1_3_VERSION || !SSL_is_init_finished(ssl))
         return kernel_switch::no;
+    // OpenSSL gives the kernel a key only for full records, so a connection moving there ends its ramp now.
+    if (o->ramps)
+    {
+        o->ramps = false;
+        o->ramp_left = 0;
+        if (SSL_set_max_send_fragment(ssl, full_record) == 1 && SSL_set_split_send_fragment(ssl, full_record) != 1) {}
+    }
     // A new send key, which OpenSSL now hands to the kernel: TLS 1.3 changes keys at any record, so a connection
     // pays for kernel TLS from the first answer it is worth it for, and one that never asks for one never does.
     SSL_set_options(ssl, SSL_OP_ENABLE_KTLS);
