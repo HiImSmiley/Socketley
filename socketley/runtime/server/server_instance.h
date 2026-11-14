@@ -165,7 +165,8 @@ struct alignas(64) server_connection
     // gives: renewing it hands the bound back to the client.
     bool awaiting_headers{false};
     std::chrono::steady_clock::time_point header_deadline{};
-    // How much of an unfinished head has been searched for its end, so a head sent a byte at a time is read once.
+    // How much of an unfinished HTTP head, or of a line protocol's unfinished line, has been searched for its end, so
+    // one sent a byte at a time is read once.
     uint32_t head_scanned{0};
     // The bytes a request whose head was judged waits for, so its body's reads do not judge the head again.
     size_t body_wait{0};

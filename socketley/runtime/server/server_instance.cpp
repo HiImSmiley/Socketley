@@ -5127,10 +5127,14 @@ reparse:
         return;
     }
     {
+        // The first newline is looked for past what the last read already searched: a line of a mebibyte with none,
+        // sent a byte at a time, was searched from its start on every read.
         size_t scan_from = 0;
         size_t pos;
-        while ((pos = conn->partial.find('\n', scan_from)) != std::string::npos)
+        size_t look = std::min<size_t>(conn->head_scanned, conn->partial.size());
+        while ((pos = conn->partial.find('\n', std::max(scan_from, look))) != std::string::npos)
         {
+            look = 0;
             std::string_view line(conn->partial.data() + scan_from, pos - scan_from);
 
             if (!line.empty() && line.back() == '\r')
@@ -5155,6 +5159,8 @@ reparse:
             else
                 conn->partial.erase(0, scan_from);
         }
+        // What is left holds no newline, unless closing cut the walk short.
+        conn->head_scanned = conn->closing ? 0 : static_cast<uint32_t>(std::min<size_t>(conn->partial.size(), UINT32_MAX));
     }
 
 }
@@ -5696,9 +5702,14 @@ bool server_instance::batches_lines(const server_connection* conn) const
 
 void server_instance::deliver_line_batch(server_connection* conn)
 {
-    const size_t last = conn->partial.rfind('\n');
-    if (last == std::string::npos)
+    // Nothing to deliver until a newline comes, looked for only in what came since the last look.
+    const size_t fresh = std::min<size_t>(conn->head_scanned, conn->partial.size());
+    if (conn->partial.find('\n', fresh) == std::string::npos)
+    {
+        conn->head_scanned = static_cast<uint32_t>(std::min<size_t>(conn->partial.size(), UINT32_MAX));
         return;
+    }
+    const size_t last = conn->partial.rfind('\n');
     const size_t end = last + 1;
 
     // Each line observed before the script runs, as process_message() does before on_client_message.
@@ -5757,6 +5768,7 @@ void server_instance::deliver_line_batch(server_connection* conn)
         conn->partial.clear();
     else
         conn->partial.erase(0, end);
+    conn->head_scanned = static_cast<uint32_t>(std::min<size_t>(conn->partial.size(), UINT32_MAX));
 }
 
 void server_instance::process_message(server_connection* sender, std::string_view msg,
