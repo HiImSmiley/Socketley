@@ -382,7 +382,7 @@ TEST_CASE("index: matchers follow Prometheus, an empty value matching a missing 
     CHECK(q({{"nolabel", match_op::ne, "x"}}) == V{a, b, c, d});
     CHECK(q({{"job", match_op::eq, "nothere"}}).empty());
 
-    // Fully anchored, the literal and alternation fast paths, .* and .+, and the rest through metrics_regex.
+    // Fully anchored, the literal and alternation fast paths, .* and .+, and the rest through shared/util/regex.
     CHECK(q({{"job", match_op::re, "web"}}) == V{b});
     CHECK(q({{"job", match_op::re, "we"}}).empty());
     CHECK(q({{"job", match_op::re, "web.*"}}) == V{b, c});

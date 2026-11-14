@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "runtime/metrics/metrics_regex.h"
+#include "shared/util/regex.h"
 #include "runtime/metrics/metrics_types.h"
 
 namespace socketley::metrics::testing

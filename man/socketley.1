@@ -17792,6 +17792,17 @@ body, relational, comparator\-i;ascii\-numeric, variables, date, index,
 mailbox, regex, editheader, duplicate, include, environment, spamtest,
 spamtestplus, virustest, enotify (mailto) and ihave.
 .PP
+A regex test takes a POSIX extended regular expression without back-references
+and finds its leftmost match in time linear in the value, whatever the expression.
+A
+.B ^
+or
+.B $
+is the start or end of the value, never of a line inside it.
+Forms POSIX does not have, such as
+.BR \ed ,
+lazy repetition and Perl's groups, are refused when the script is uploaded.
+.PP
 Users upload their scripts over ManageSieve (RFC 5804) on
 .BR \-\-sieve ,
 with STARTTLS and SASL PLAIN using the password IMAP takes.

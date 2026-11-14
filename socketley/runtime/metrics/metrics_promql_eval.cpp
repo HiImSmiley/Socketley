@@ -5,7 +5,7 @@
 #include <utility>
 #include "metrics_promql_eval.h"
 
-#include "metrics_regex.h"
+#include "shared/util/regex.h"
 #include "metrics_text.h"
 
 #include <algorithm>

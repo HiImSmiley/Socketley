@@ -116,7 +116,7 @@ private:
     uint64_t key_hash(const label_set& ls) const;
     const name_entry* name_of(std::string_view name) const;
     uint32_t posting_of(uint32_t name, uint32_t value) const;
-    // A matcher's regex in RE2 syntax, matched in linear time by metrics_regex, compiled once for a few dozen patterns.
+    // A matcher's regex in RE2 syntax, matched in linear time by shared/util/regex, compiled once for a few dozen patterns.
     const compiled& compiled_for(std::string_view pattern) const;
 
     // Symbols: their bytes back to back, the start of each, and the table that finds one by its bytes.

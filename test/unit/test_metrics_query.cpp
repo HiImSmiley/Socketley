@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "runtime/metrics/metrics_query.h"
-#include "runtime/metrics/metrics_regex.h"
+#include "shared/util/regex.h"
 #include "metrics_fake_source.h"
 
 using namespace socketley::metrics;
@@ -714,7 +714,7 @@ TEST_CASE("the JSON data part is Prometheus's, floats and timestamps formatted a
 
 TEST_CASE("the regex engine reads RE2 syntax and matches whole strings")
 {
-    regex r;
+    socketley::regex r;
     std::string why;
     auto m = [&](std::string_view p, std::string_view s) {
         REQUIRE_MESSAGE(r.compile(p, why), p << ": " << why);

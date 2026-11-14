@@ -6,13 +6,12 @@
 #include <functional>
 #include <unordered_map>
 
-#include <regex.h>
-
 #include "mail_compose.h"
 #include "mail_mime.h"
 #include "smtp_session.h"
 #include "../../shared/http/url.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/regex.h"
 
 namespace socketley::mail::sieve
 {
@@ -39,6 +38,7 @@ constexpr uint64_t duplicate_max_s = 7 * 86400;
 // What one step buys: bytes scanned or decoded, and turns of the wildcard matcher.
 constexpr uint64_t bytes_per_step = 512;
 constexpr uint64_t glob_per_step = 256;
+constexpr uint64_t regex_per_step = 512;
 
 // ─── capabilities ──────────────────────────────────────────────────────────
 
@@ -202,6 +202,20 @@ bool valid_identifier(std::string_view s)
     return std::all_of(s.begin(), s.end(), [](char c) { return is_alpha(c) || is_digit(c) || c == '_'; });
 }
 
+// Whether `s` names a match variable, ${ and digits and }, which is the only way a script reads what a match took.
+bool names_match_variable(std::string_view s)
+{
+    for (size_t at = s.find("${"); at != std::string_view::npos; at = s.find("${", at + 2))
+    {
+        size_t j = at + 2;
+        while (j < s.size() && is_digit(s[j]))
+            ++j;
+        if (j > at + 2 && j < s.size() && s[j] == '}')
+            return true;
+    }
+    return false;
+}
+
 std::string fnv_hex(std::string_view s)
 {
     uint64_t h = 1469598103934665603ull;
@@ -219,27 +233,9 @@ std::string at_line(int line, std::string_view why)
     return "line " + std::to_string(line) + ": " + std::string(why);
 }
 
-// A POSIX extended regular expression, freed with it.
-struct posix_regex
-{
-    regex_t r{};
-    bool ok{false};
-    posix_regex(const std::string& pat, bool fold)
-    {
-        ok = ::regcomp(&r, pat.c_str(), REG_EXTENDED | (fold ? REG_ICASE : 0)) == 0;
-    }
-    ~posix_regex()
-    {
-        if (ok)
-            ::regfree(&r);
-    }
-    posix_regex(const posix_regex&)            = delete;
-    posix_regex& operator=(const posix_regex&) = delete;
-};
-
-// Whether `pat` is an extended expression this takes: one that compiles, with no back-reference, which glibc would
-// take as its own extension and match in time exponential in the string.
-bool regex_ok(std::string_view pat, bool fold, std::string& why)
+// Whether `pat` is an extended expression this takes, compiled into `out`: one with no back-reference, which no
+// matcher runs in time linear in the string.
+bool regex_ok(std::string_view pat, bool fold, std::string& why, socketley::regex& out)
 {
     if (pat.size() > 1024)
     {
@@ -261,7 +257,8 @@ bool regex_ok(std::string_view pat, bool fold, std::string& why)
             }
             ++i;
         }
-    if (!posix_regex(std::string(pat), fold).ok)
+    std::string err;
+    if (!out.compile(pat, err, socketley::regex::syntax::posix_extended, /*search=*/true, fold))
     {
         why = "does not compile";
         return false;
@@ -724,6 +721,8 @@ struct parser
     size_t i{0};
     uint32_t caps{0};
     bool past_require{false};
+    // Some string names ${0} to ${9}, so a match has to say what its groups took.
+    bool match_refs{false};
 
     const token& peek() const { return t[i]; }
 
@@ -741,10 +740,12 @@ struct parser
         return fail(line, std::string(what) + " needs require \"" + std::string(ext) + "\"");
     }
 
-    str mk(std::string s) const
+    str mk(std::string s)
     {
         str out;
         out.vars = (caps & c_variables) && s.find("${") != std::string::npos;
+        if (out.vars && !match_refs)
+            match_refs = names_match_variable(s);
         out.s = std::move(s);
         return out;
     }
@@ -1010,7 +1011,8 @@ struct parser
             if (k.vars)
                 continue;
             std::string why;
-            if (!regex_ok(k.s, m.c != cmp::octet, why))
+            socketley::regex re;
+            if (!regex_ok(k.s, m.c != cmp::octet, why, re))
                 return fail(line, "the regular expression \"" + k.s + "\" " + why);
         }
         return true;
@@ -2297,6 +2299,7 @@ struct script::program
 {
     std::vector<cmd_node> top;
     uint32_t caps{0};
+    bool match_refs{false};
     // The root's alone: every script it includes, at the index an include names, and how each was asked for.
     std::vector<std::unique_ptr<program>> subs;
     std::vector<std::pair<bool, std::string>> included;
@@ -2339,7 +2342,7 @@ struct runner
     size_t added{0};
     std::deque<std::string> owned;
     std::vector<std::pair<std::string, uint32_t>> seen_ids;
-    std::unordered_map<std::string, std::unique_ptr<posix_regex>> regexes;
+    std::unordered_map<std::string, std::unique_ptr<socketley::regex>> regexes;
 
     bool headers_read{false};
     std::vector<std::pair<std::string_view, std::string_view>> headers;
@@ -2657,41 +2660,42 @@ struct runner
             case mtype::count: return false;
             case mtype::regex:
             {
-                if (!step(line, 1 + value.size() * (1 + key.size() / 16) / bytes_per_step))
-                    return false;
                 const bool fold = mt.c != cmp::octet;
                 const std::string id = std::string(fold ? "i" : "o") + std::string(key);
                 auto it = regexes.find(id);
                 if (it == regexes.end())
                 {
                     std::string why;
-                    if (!regex_ok(key, fold, why))
+                    auto re = std::make_unique<socketley::regex>();
+                    if (!regex_ok(key, fold, why, *re))
                         return fail(line, "the regular expression \"" + std::string(key) + "\" " + why);
                     if (regexes.size() >= 64)
                         regexes.clear();
-                    it = regexes.emplace(id, std::make_unique<posix_regex>(std::string(key), fold)).first;
+                    it = regexes.emplace(id, std::move(re)).first;
                 }
-                std::array<regmatch_t, max_match_vars> mm{};
-                mm[0].rm_so = 0;
-                mm[0].rm_eo = static_cast<regoff_t>(value.size());
-                // The value is matched as the bytes it is, a NUL in it no end of it.
-                if (::regexec(&it->second->r, value.data(), mm.size(), mm.data(), REG_STARTEND) != 0)
+                // Charged before it runs, at what the match can cost at most: each byte walks the program once, and
+                // each thread on it carries the groups a script that names ${0} to ${9} is told.
+                const bool groups = (cur->caps & c_variables) && cur->match_refs;
+                const uint64_t per_byte = it->second->program_size() * (groups ? 1 + max_match_vars : 1);
+                if (!step(line, 1 + value.size() * per_byte / regex_per_step))
                     return false;
-                if (cur->caps & c_variables)
+                if (!groups)
+                    return it->second->matches(value);
+                std::vector<int> g;
+                if (!it->second->matches(value, g, static_cast<int>(max_match_vars)))
+                    return false;
+                mv_count = 0;
+                for (size_t k = 0; k * 2 + 1 < g.size(); ++k)
                 {
-                    mv_count = 0;
-                    for (size_t k = 0; k < mm.size(); ++k)
+                    if (g[k * 2] < 0)
                     {
-                        if (mm[k].rm_so < 0)
-                        {
-                            mv[k].clear();
-                            continue;
-                        }
-                        mv[k] = std::string(value.substr(static_cast<size_t>(mm[k].rm_so),
-                                                         static_cast<size_t>(mm[k].rm_eo - mm[k].rm_so)));
-                        clip(mv[k], max_var_len);
-                        mv_count = k + 1;
+                        mv[k].clear();
+                        continue;
                     }
+                    mv[k] = std::string(value.substr(static_cast<size_t>(g[k * 2]),
+                                                     static_cast<size_t>(g[k * 2 + 1] - g[k * 2])));
+                    clip(mv[k], max_var_len);
+                    mv_count = k + 1;
                 }
                 return true;
             }
@@ -3758,6 +3762,7 @@ bool parse_into(script::program& out, std::string_view text, std::string& err)
     if (!ps.check_conflicts(out.top))
         return false;
     out.caps = ps.caps;
+    out.match_refs = ps.match_refs;
     return true;
 }
 

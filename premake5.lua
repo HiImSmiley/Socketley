@@ -1495,7 +1495,7 @@ project "fuzz_mail"
         "socketley/runtime/mail/mail_dkim.cpp",
         "socketley/runtime/mail/mail_mime.cpp",
         "socketley/runtime/mail/mail_aliases.cpp",
-        "socketley/runtime/mail/mail_sieve.cpp",
+        "socketley/runtime/mail/mail_sieve.cpp", "socketley/shared/util/regex.cpp",
         "socketley/runtime/mail/mail_sieve_store.cpp",
         "socketley/runtime/mail/managesieve_session.cpp",
         "socketley/runtime/mail/imap_order.cpp",
@@ -1542,7 +1542,7 @@ project "fuzz_sieve_budget"
         "test/fuzz/fuzz_sieve_budget.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/runtime/mail/mail_sieve.cpp",
+        "socketley/runtime/mail/mail_sieve.cpp", "socketley/shared/util/regex.cpp",
         "socketley/runtime/mail/mail_compose.cpp",
         "socketley/runtime/mail/mail_mime.cpp",
         "socketley/runtime/mail/smtp_session.cpp",
@@ -1848,7 +1848,7 @@ project "fuzz_metrics_query"
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
         "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
-        "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
+        "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/shared/util/regex.cpp",
         "socketley/runtime/metrics/metrics_text.cpp"
     }
 
@@ -1869,7 +1869,7 @@ project "fuzz_metrics_rules"
         "test/fuzz/fuzz_common.h",
         "socketley/runtime/metrics/metrics_rules.cpp",
         "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
-        "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
+        "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/shared/util/regex.cpp",
         "socketley/runtime/metrics/metrics_text.cpp"
     }
 
@@ -3675,6 +3675,7 @@ project "test_mail"
             "socketley/runtime/mail/mail_verify.cpp", "socketley/runtime/mail/mail_arc.cpp",
             "socketley/runtime/dns/dns_wire.cpp", "socketley/runtime/mail/mail_mime.cpp",
             "test/unit/test_mail_sieve.cpp", "socketley/runtime/mail/mail_sieve.cpp",
+            "socketley/shared/util/regex.cpp",
             "socketley/shared/util/base64.cpp", "socketley/runtime/mail/mail_tls_policy.cpp",
             "socketley/shared/net/public_suffix.cpp", "socketley/shared/net/idna.cpp",
             "socketley/runtime/mail/mail_sieve_store.cpp",
@@ -3779,7 +3780,7 @@ project "test_metrics_store"
 
     files { "test/unit/test_metrics_store.cpp", "socketley/runtime/metrics/metrics_chunk.cpp",
             "socketley/runtime/metrics/metrics_index.cpp", "socketley/runtime/metrics/metrics_block.cpp",
-            "socketley/runtime/metrics/metrics_store.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
+            "socketley/runtime/metrics/metrics_store.cpp", "socketley/shared/util/regex.cpp",
             "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
             "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_text.cpp",
             "socketley/shared/util/crc.cpp" }
@@ -3850,7 +3851,7 @@ project "test_metrics_query"
 
     files { "test/unit/test_metrics_query.cpp",
             "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
-            "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
+            "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/shared/util/regex.cpp",
             "socketley/runtime/metrics/metrics_text.cpp" }
 
     filter "configurations:Debug"
@@ -3887,7 +3888,7 @@ project "test_metrics_rules"
 
     files { "test/unit/test_metrics_rules.cpp", "socketley/runtime/metrics/metrics_rules.cpp",
             "socketley/runtime/metrics/metrics_query.cpp", "socketley/runtime/metrics/metrics_promql_parse.cpp",
-            "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/runtime/metrics/metrics_regex.cpp",
+            "socketley/runtime/metrics/metrics_promql_eval.cpp", "socketley/shared/util/regex.cpp",
             "socketley/runtime/metrics/metrics_text.cpp", "socketley/runtime/metrics/metrics_store.cpp",
             "socketley/runtime/metrics/metrics_chunk.cpp", "socketley/runtime/metrics/metrics_index.cpp",
             "socketley/runtime/metrics/metrics_block.cpp", "socketley/shared/util/crc.cpp" }

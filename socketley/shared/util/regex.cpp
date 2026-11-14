@@ -1,9 +1,9 @@
-#include "metrics_regex.h"
+#include "regex.h"
 
 #include <algorithm>
 #include <cstddef>
 
-namespace socketley::metrics
+namespace socketley
 {
 
 namespace
@@ -163,9 +163,10 @@ class rparser
 {
 public:
     rparser(std::string_view p, std::vector<rnode>& nodes, std::vector<ranges>& classes,
-            std::vector<std::string>& names)
-        : m_p(p), m_nodes(nodes), m_classes(classes), m_names(names)
+            std::vector<std::string>& names, bool posix, bool fold)
+        : m_p(p), m_nodes(nodes), m_classes(classes), m_names(names), m_posix(posix)
     {
+        m_flags.i = fold;
     }
 
     bool parse(uint32_t& root, std::string& why)
@@ -297,7 +298,7 @@ private:
             if (!repeatable)
                 return fail("missing argument to repetition operator");
             bool greedy = true;
-            if (!eof() && peek() == '?')
+            if (!m_posix && !eof() && peek() == '?')
             {
                 greedy = false;
                 ++m_pos;
@@ -389,7 +390,7 @@ private:
         std::string name;
         bool capture = true;
         const reflags saved = m_flags;
-        if (!eof() && peek() == '?')
+        if (!m_posix && !eof() && peek() == '?')
         {
             const std::string_view rest = m_p.substr(m_pos);
             if (rest.starts_with("?P<") || rest.starts_with("?<"))
@@ -552,6 +553,8 @@ private:
         if (eof())
             return fail("trailing backslash at end of expression");
         const char c = peek();
+        if (m_posix)
+            return posix_escape(c);
         switch (c)
         {
             case 'A': ++m_pos; return assertion(at_bot);
@@ -589,8 +592,63 @@ private:
         return literal(r);
     }
 
+    // POSIX gives a backslash only before a special character, which it makes literal, and glibc adds \w, \s, \b
+    // and their negations, read the same here; any other letter or digit, and glibc's other anchors, are refused
+    // rather than read as something else.
+    uint32_t posix_escape(char c)
+    {
+        if (c == 'b' || c == 'B')
+        {
+            ++m_pos;
+            return assertion(c == 'b' ? at_word : at_nonword);
+        }
+        ranges rs;
+        if (c != 'd' && c != 'D' && perl_class(c, rs))
+        {
+            ++m_pos;
+            return klass(std::move(rs));
+        }
+        if ((c >= '0' && c <= '9') || is_letter(static_cast<unsigned char>(c)))
+            return fail("invalid escape sequence");
+        if (c == '<' || c == '>' || c == '`' || c == '\'')
+            return fail("invalid escape sequence");
+        size_t w = 0;
+        const uint32_t r = decode(m_p, m_pos, w);
+        m_pos += w;
+        return literal(r);
+    }
+
+    // `[.c.]` or `[=c=]` of one character at m_pos, which POSIX lets a bracket name a character by, read into `r`.
+    bool collating(uint32_t& r)
+    {
+        const std::string_view rest = m_p.substr(m_pos);
+        if (rest.size() < 5 || rest[0] != '[' || (rest[1] != '.' && rest[1] != '='))
+            return false;
+        size_t w = 0;
+        const uint32_t c = decode(rest, 2, w);
+        if (rest.size() < 4 + w || rest[2 + w] != rest[1] || rest[3 + w] != ']')
+            return false;
+        r = c;
+        m_pos += 4 + w;
+        return true;
+    }
+
     bool class_rune(uint32_t& r)
     {
+        if (m_posix)
+        {
+            if (collating(r))
+                return true;
+            if (m_p.substr(m_pos).starts_with("[.") || m_p.substr(m_pos).starts_with("[="))
+            {
+                fail("invalid character class range");
+                return false;
+            }
+            size_t w = 0;
+            r = decode(m_p, m_pos, w);
+            m_pos += w;
+            return true;
+        }
         if (peek() == '\\')
         {
             ++m_pos;
@@ -665,7 +723,7 @@ private:
                     continue;
                 }
             }
-            if (c == '\\' && m_pos + 1 < m_p.size() && perl_class(m_p[m_pos + 1], rs))
+            if (!m_posix && c == '\\' && m_pos + 1 < m_p.size() && perl_class(m_p[m_pos + 1], rs))
             {
                 m_pos += 2;
                 continue;
@@ -701,6 +759,8 @@ private:
     std::vector<rnode>& m_nodes;
     std::vector<ranges>& m_classes;
     std::vector<std::string>& m_names;
+    // POSIX's extended syntax: no Perl groups, no lazy repetition, and a backslash inside brackets is itself.
+    bool m_posix{false};
     reflags m_flags;
     std::string m_err;
 };
@@ -713,9 +773,22 @@ public:
     {
     }
 
-    bool compile(uint32_t root)
+    bool compile(uint32_t root, bool search)
     {
+        // A search is a whole match behind a lazy `.*`, whose every turn is a later start and so a lower priority.
+        uint32_t lead = 0;
+        if (search)
+        {
+            lead = emit(op_split);
+            emit(op_any);
+            emit(op_jmp, lead);
+        }
         emit(op_save, 0);
+        if (search)
+        {
+            m_prog[lead].x = here() - 1;
+            m_prog[lead].y = lead + 1;
+        }
         node(root, 0);
         emit(op_save, 1);
         emit(op_match);
@@ -855,25 +928,36 @@ bool is_any_star(const std::vector<rnode>& nodes, uint32_t i, int min)
 
 }   // namespace
 
-bool regex::compile(std::string_view pattern, std::string& why)
+bool regex::compile(std::string_view pattern, std::string& why, syntax dialect, bool search, bool fold)
 {
     *this = regex{};
     std::vector<rnode> nodes;
     m_names.push_back({});
     uint32_t root = 0;
-    rparser p(pattern, nodes, m_classes, m_names);
+    rparser p(pattern, nodes, m_classes, m_names, dialect == syntax::posix_extended, fold);
     if (!p.parse(root, why))
         return false;
     m_groups = static_cast<int>(m_names.size());
+    m_search = search;
     rcompiler c(nodes, m_classes, m_prog);
-    if (!c.compile(root))
+    if (!c.compile(root, search))
     {
         why = "error parsing regexp: expression too large: `" + std::string(pattern) + "`";
         return false;
     }
 
+    // A search for one literal is a substring's.
+    if (search)
+    {
+        std::string lit;
+        if (literal_of(nodes, root, lit))
+        {
+            m_shape = shape::contains;
+            m_lit = std::move(lit);
+        }
+    }
     // The shapes Grafana's variables produce answer without the machine: a literal, `.*`, `.+`, a prefix or a set.
-    if (m_groups == 1)
+    else if (m_groups == 1)
     {
         const rnode& r = nodes[root];
         std::string lit;
@@ -961,12 +1045,12 @@ bool regex::matches(std::string_view s) const
     return run(s, nullptr, 0);
 }
 
-bool regex::matches(std::string_view s, std::vector<int>& groups) const
+bool regex::matches(std::string_view s, std::vector<int>& groups, int most) const
 {
-    groups.assign(static_cast<size_t>(m_groups) * 2, -1);
+    groups.assign(static_cast<size_t>(most < 0 ? m_groups : std::min(m_groups, most)) * 2, -1);
     if (m_prog.empty())
         return false;
-    if (m_shape != shape::program)
+    if (m_shape != shape::program && !m_search)
     {
         if (!fast(s))
             return false;
@@ -1057,6 +1141,8 @@ bool regex::run(std::string_view s, int* out, int ncap) const
 
     follow(clist, 0, 0);
     size_t pos = 0;
+    // A search's match so far, which only a thread of higher priority -- an earlier start -- may still replace.
+    bool found = false;
     while (true)
     {
         if (pos == s.size())
@@ -1068,10 +1154,10 @@ bool regex::run(std::string_view s, int* out, int ncap) const
                         std::copy_n(clist->caps.begin() + static_cast<std::ptrdiff_t>(i * nc), nc, out);
                     return true;
                 }
-            return false;
+            return found;
         }
         if (clist->n == 0)
-            return false;
+            return found;
         size_t w = 0;
         const uint32_t r = decode(s, pos, w);
         nlist->n = 0;
@@ -1079,6 +1165,15 @@ bool regex::run(std::string_view s, int* out, int ncap) const
         {
             const uint32_t pc = clist->dense[i];
             const inst& in = m_prog[pc];
+            // A search ends where a match does, and every thread behind it in the list has a lower priority.
+            if (m_search && in.op == op_match)
+            {
+                found = true;
+                if (!nc)
+                    return true;
+                std::copy_n(clist->caps.begin() + static_cast<std::ptrdiff_t>(i * nc), nc, out);
+                break;
+            }
             bool ok = false;
             switch (in.op)
             {
@@ -1099,4 +1194,4 @@ bool regex::run(std::string_view s, int* out, int ncap) const
     }
 }
 
-}   // namespace socketley::metrics
+}   // namespace socketley

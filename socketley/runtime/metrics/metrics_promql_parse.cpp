@@ -1,5 +1,5 @@
 #include "metrics_promql.h"
-#include "metrics_regex.h"
+#include "shared/util/regex.h"
 #include "metrics_text.h"
 
 #include <cctype>

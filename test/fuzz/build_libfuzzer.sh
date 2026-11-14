@@ -111,12 +111,12 @@ want fuzz_metrics_text && build fuzz_metrics_text "$ROOT/test/fuzz/fuzz_metrics_
     "$ROOT/socketley/runtime/metrics/metrics_text.cpp"
 want fuzz_metrics_query && build fuzz_metrics_query "$ROOT/test/fuzz/fuzz_metrics_query.cpp" -I"$ROOT/test/unit" \
     "$ROOT/socketley/runtime/metrics/metrics_query.cpp" "$ROOT/socketley/runtime/metrics/metrics_promql_parse.cpp" \
-    "$ROOT/socketley/runtime/metrics/metrics_promql_eval.cpp" "$ROOT/socketley/runtime/metrics/metrics_regex.cpp" \
+    "$ROOT/socketley/runtime/metrics/metrics_promql_eval.cpp" "$ROOT/socketley/shared/util/regex.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_text.cpp"
 want fuzz_metrics_rules && build fuzz_metrics_rules "$ROOT/test/fuzz/fuzz_metrics_rules.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_rules.cpp" "$ROOT/socketley/runtime/metrics/metrics_query.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_promql_parse.cpp" "$ROOT/socketley/runtime/metrics/metrics_promql_eval.cpp" \
-    "$ROOT/socketley/runtime/metrics/metrics_regex.cpp" "$ROOT/socketley/runtime/metrics/metrics_text.cpp"
+    "$ROOT/socketley/shared/util/regex.cpp" "$ROOT/socketley/runtime/metrics/metrics_text.cpp"
 want fuzz_metrics_remote && build fuzz_metrics_remote "$ROOT/test/fuzz/fuzz_metrics_remote.cpp" \
     "$ROOT/socketley/runtime/metrics/metrics_remote.cpp"
 want fuzz_mqtt && build fuzz_mqtt "$ROOT/test/fuzz/fuzz_mqtt.cpp" "$ROOT/socketley/runtime/mqtt/mqtt_codec.cpp" \
@@ -126,6 +126,7 @@ want fuzz_mail && build fuzz_mail "$ROOT/test/fuzz/fuzz_mail.cpp" "$ROOT/socketl
     "$ROOT/socketley/runtime/mail/mail_compose.cpp" "$ROOT/socketley/runtime/mail/mail_dkim.cpp" \
     "$ROOT/socketley/runtime/mail/mail_mime.cpp" "$ROOT/socketley/runtime/mail/mail_aliases.cpp" \
     "$ROOT/socketley/runtime/mail/mail_sieve.cpp" "$ROOT/socketley/runtime/mail/mail_sieve_store.cpp" \
+    "$ROOT/socketley/shared/util/regex.cpp" \
     "$ROOT/socketley/runtime/mail/managesieve_session.cpp" "$ROOT/socketley/runtime/mail/imap_order.cpp" \
     "$ROOT/socketley/runtime/mail/pop3_session.cpp" "$ROOT/socketley/runtime/mail/mail_mbox.cpp" \
     "$ROOT/socketley/runtime/mail/mail_arc.cpp" "$ROOT/socketley/runtime/mail/mail_srs.cpp" \
@@ -140,6 +141,7 @@ want fuzz_h2_session && build fuzz_h2_session "$ROOT/test/fuzz/fuzz_h2_session.c
     "$ROOT/socketley/shared/http/hpack.cpp" "$ROOT/socketley/shared/http/mux_head.cpp"
 want fuzz_sieve_budget && build fuzz_sieve_budget "$ROOT/test/fuzz/fuzz_sieve_budget.cpp" -std=c++23 \
     "$ROOT/socketley/runtime/mail/mail_sieve.cpp" "$ROOT/socketley/runtime/mail/mail_compose.cpp" \
+    "$ROOT/socketley/shared/util/regex.cpp" \
     "$ROOT/socketley/runtime/mail/mail_mime.cpp" "$ROOT/socketley/runtime/mail/smtp_session.cpp" \
     "$ROOT/socketley/shared/util/base64.cpp" -lssl -lcrypto
 want fuzz_fastcgi && build fuzz_fastcgi "$ROOT/test/fuzz/fuzz_fastcgi.cpp" "$ROOT/socketley/shared/http/fastcgi.cpp"

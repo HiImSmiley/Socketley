@@ -709,6 +709,59 @@ if header :regex :comparator "i;octet" "subject" "^hello" { fileinto "x"; })") =
     CHECK(set_value("require \"regex\"; set :quoteregex \"b\" \"a.b*(c)\";") == "a\\.b\\*\\(c\\)");
 }
 
+TEST_CASE("sieve: regex reads POSIX's extended syntax and searches for the leftmost match")
+{
+    const auto subject = [](std::string_view s) { return "Subject: " + std::string(s) + "\n\nbody\n"; };
+    const auto filed = [&](std::string_view re, std::string_view subj, std::string_view into = "x") {
+        return summary_of("require [\"regex\", \"variables\", \"fileinto\"];\nif header :regex \"subject\" \"" +
+                              std::string(re) + "\" { fileinto \"" + std::string(into) + "\"; }",
+                          subject(subj));
+    };
+    CHECK(filed("([[:digit:]]+)", "Order 4711 shipped", "${1}") == "fileinto:4711");
+    CHECK(filed("b(o+)", "foo boo", "${0}-${1}") == "fileinto:boo-oo");
+    CHECK(filed("^(re|fwd): ", "RE: lunch") == "fileinto:x");
+    CHECK(filed("^lunch", "RE: lunch") == "keep");
+    CHECK(filed("a{2,3}b", "xaab") == "fileinto:x");
+    // Inside brackets a backslash is itself, as POSIX has it, so this takes a backslash as well as a dot.
+    CHECK(filed("x[\\\\.]y", "x\\y") == "fileinto:x");
+    // A Perl class is no extended expression, and refused rather than read as the letter glibc made of it.
+    CHECK(compile_error(R"(require "regex"; if header :regex "subject" "\\d" { keep; })").find("does not compile") !=
+          std::string::npos);
+    CHECK(compile_error(R"(require "regex"; if header :regex "subject" "a*?" { keep; })").find("does not compile") !=
+          std::string::npos);
+    // A ^ past the start of the expression is the start of the value still, not a line's, which glibc read it as.
+    CHECK(summary_of(R"(require ["regex", "body", "fileinto"];
+if body :raw :regex "x..^y" { fileinto "x"; })",
+                     "Subject: s\n\nx\ny\n") == "keep");
+}
+
+TEST_CASE("sieve: a regex costs time linear in the value, whatever the expression")
+{
+    // A search restarted at every byte of a 64 KiB subject took seconds on `a.*c`, and glibc's automaton grew for
+    // minutes on the second; both are a few milliseconds of one pass now.
+    std::string a_s(65536, 'a');
+    std::string ab;
+    for (size_t i = 0; i < 65536; ++i)
+        ab += "ab"[(i * 7919) % 3 == 0];
+    std::string grows = "(a|b)*a";
+    for (int i = 0; i < 20; ++i)
+        grows += "(a|b)";
+    grows += "c";
+    for (const auto& [re, subj] : {std::pair{std::string("a.*c"), a_s}, std::pair{grows, ab},
+                                   std::pair{std::string("(a+)(a+)(a+)c"), a_s}})
+    {
+        const auto start = thread_cpu_now();
+        const outcome o = run("require [\"regex\", \"variables\", \"fileinto\"];\nif header :regex \"subject\" \"" + re +
+                                  "\" { fileinto \"${1}\"; }",
+                              "Subject: " + subj + "\n\nbody\n");
+        const auto took = thread_cpu_now() - start;
+        INFO(re);
+        CHECK(o.error.empty());
+        CHECK(summary(o) == "keep");
+        CHECK(took < std::chrono::seconds(1));
+    }
+}
+
 TEST_CASE("sieve: index picks one occurrence of a header, counted from either end")
 {
     constexpr std::string_view two = "Received: from a.example\nReceived: from b.example\nSubject: x\n\nbody\n";

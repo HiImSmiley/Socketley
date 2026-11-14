@@ -5,7 +5,7 @@
 #include <numeric>
 
 #include "../../shared/util/keyed_hash.h"
-#include "metrics_regex.h"
+#include "shared/util/regex.h"
 
 namespace socketley::metrics
 {
@@ -145,7 +145,7 @@ struct series_index::compiled
     std::string pattern;
     kind k{kind::invalid};
     std::vector<std::string> lits;
-    metrics::regex re;
+    socketley::regex re;
 
     explicit compiled(std::string_view p) : pattern(p)
     {

@@ -18,7 +18,7 @@
 #include <string_view>
 #include <vector>
 
-#include "metrics_regex.h"
+#include "shared/util/regex.h"
 #include "metrics_types.h"
 
 namespace socketley::metrics
