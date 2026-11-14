@@ -2,6 +2,7 @@
 #include "../../shared/net/address_key.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include "../../shared/util/random_id.h"
 
@@ -1321,8 +1322,13 @@ void broker::send_retained(session& s, const std::string& filter, const sub_opti
 {
     std::vector<message_ptr> found;
     m_retained.match(filter, [&](const std::shared_ptr<const message>& m) { found.push_back(m); });
+    connection* c = s.conn ? conn_of(s.conn) : nullptr;
     for (const auto& m : found)
     {
+        // At QoS 0 a subscriber that is not reading past its write limit has the rest dropped by deliver(), so they
+        // are not walked; a higher QoS queues them, the oldest giving way, as before.
+        if (c && std::min(m->qos, o.qos) == 0 && m_io.backlog(c->id) > m_cfg.write_limit)
+            continue;
         if (expired(*m) || !m_hooks.may_read(s.username, s.client_id, m->topic))
             continue;
         std::vector<uint32_t> ids;
@@ -1493,8 +1499,19 @@ void broker::subscribe_step(uint64_t conn, uint64_t generation, std::shared_ptr<
         o.retain_handling     = e.retain_handling;
         o.subscription_id     = sub_id;
         st->fresh[i] = !s.subs.contains(e.filter);
+        // A session's filters are bounded in number and bytes: every one is kept, sent to every shard and written
+        // into every snapshot, and repeated SUBSCRIBEs of new 64 KiB filters grew the worker without end.
+        if (st->fresh[i] && (s.subs.size() >= max_session_filters ||
+                             s.filter_bytes + e.filter.size() > max_session_filter_bytes))
+        {
+            st->codes.push_back(level_code(c->level, reason::quota_exceeded, 0x80));
+            continue;
+        }
         if (st->fresh[i])
+        {
             filter_ref(e.filter, true);
+            s.filter_bytes += e.filter.size();
+        }
         s.subs[e.filter] = o;
         m_subs.add(inner, is_shared ? group : std::string_view{}, s.key, o);
         mark(s);
@@ -1524,14 +1541,16 @@ void broker::subscribe_ack(uint64_t conn, uint64_t generation, const std::shared
     std::string out;
     write_suback(out, c->level, ack);
     send_packet(*c, out);
-    // Retained messages after the SUBACK, for every granted plain filter whose Retain Handling asks for them.
+    // Retained messages after the SUBACK, for every granted plain filter whose Retain Handling asks for them, each
+    // filter once however often the packet names it: 60,000 copies of `#` walked every retained message 60,000 times.
+    std::unordered_set<std::string_view> served;
     for (size_t k = 0; k < p.entries.size(); ++k)
     {
         const subscription& e = p.entries[k];
         if (ack.reasons[k] >= 0x80 || e.retain_handling == 2 || (e.retain_handling == 1 && !st->fresh[k]))
             continue;
         std::string_view group, inner = e.filter;
-        if (split_shared(e.filter, group, inner))
+        if (split_shared(e.filter, group, inner) || !served.insert(e.filter).second)
             continue;
         if (const auto it = s.subs.find(e.filter); it != s.subs.end())
             send_retained(s, std::string(inner), it->second);
@@ -1566,6 +1585,7 @@ bool broker::on_unsubscribe(connection& c, const frame& f)
         const bool had = s.subs.erase(filter) > 0;
         if (had)
         {
+            s.filter_bytes -= std::min(s.filter_bytes, filter.size());
             m_subs.remove(inner, is_shared ? group : std::string_view{}, s.key);
             filter_ref(filter, false);
             mark(s);

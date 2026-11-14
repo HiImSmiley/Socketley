@@ -26,6 +26,10 @@
 namespace socketley::mqtt
 {
 
+// What one session may hold of filters, in number and in bytes.
+inline constexpr size_t max_session_filters      = 10000;
+inline constexpr size_t max_session_filter_bytes = 1u << 20;
+
 // A message as it is routed: what a PUBLISH carried and the properties that travel with it.
 struct message
 {
@@ -571,6 +575,8 @@ private:
         uint8_t     level{level_311};
         uint64_t    conn{0};
         std::map<std::string, sub_options> subs;
+        // The bytes of its filters, which with their number bounds what one session holds of the broker's memory.
+        size_t filter_bytes{0};
         fifo<queued> queue;
         id_window<inflight> out;
         // What queue and out hold, counted against owner in m_held.

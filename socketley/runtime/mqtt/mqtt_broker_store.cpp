@@ -494,6 +494,7 @@ broker::late_take broker::take_late(std::string_view in)
         std::string_view group, inner = filter;
         const bool is_shared = split_shared(filter, group, inner);
         s.subs[filter] = o;
+        s.filter_bytes += filter.size();
         m_subs.add(inner, is_shared ? group : std::string_view{}, s.key, o);
         filter_ref(filter, true);
     }

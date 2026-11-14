@@ -197,7 +197,8 @@ public:
 private:
     struct node
     {
-        std::unordered_map<std::string, std::unique_ptr<node>> children;
+        // Keyed by the hash every client-named table takes, since a client names the topics.
+        std::unordered_map<std::string, std::unique_ptr<node>, string_hash, string_equal> children;
         std::shared_ptr<V> value;
     };
 

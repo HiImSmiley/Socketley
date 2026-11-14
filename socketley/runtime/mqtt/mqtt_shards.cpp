@@ -14,6 +14,7 @@
 #include "mqtt_run.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <chrono>
 
 #include "mqtt_command.h"
@@ -787,6 +788,11 @@ void mqtt_run::share_message(const message_ptr& m)
     // The groups decided for another shard while the message was routed here, taken whole and left empty for the next.
     m_sharing.swap(m_assign);
     bool any = std::any_of(m_sharing.begin(), m_sharing.end(), [](const auto& a) { return !a.empty(); });
+    // The groups already taken, looked up rather than searched for in every shard's list: G groups cost G^2/2 string
+    // comparisons a publish when they were searched.
+    std::unordered_set<std::string, string_hash, string_equal> taken_groups;
+    for (const auto& a : m_sharing)
+        taken_groups.insert(a.begin(), a.end());
     m_plain.assign(n, 0);
     if (m_remote.size())
         m_remote.match(
@@ -800,9 +806,7 @@ void mqtt_run::share_message(const message_ptr& m)
             },
             [&](std::string_view key, uint64_t j, const sub_options&) {
                 // A group with members here was decided by shared_here(), and one decided while routing stays so.
-                if (j >= n || (m_broker && m_broker->has_filter(key)) ||
-                    std::any_of(m_sharing.begin(), m_sharing.end(),
-                                [&](const auto& a) { return std::find(a.begin(), a.end(), key) != a.end(); }))
+                if (j >= n || (m_broker && m_broker->has_filter(key)) || !taken_groups.emplace(key).second)
                     return;
                 m_sharing[j].emplace_back(key);
                 any = true;
