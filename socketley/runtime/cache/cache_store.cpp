@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
+#include <type_traits>
 #include <iterator>
 #include <condition_variable>
 #include <deque>
@@ -665,8 +666,8 @@ bool cache_store::srem(std::string_view key, std::string_view member)
     const size_t shape = shape_cost(it->second);
     track_sub(stored_string(*mit));
     it->second.erase(mit);
-    --m_set_elems;
     it->second.shrink_if_sparse();
+    --m_set_elems;
     reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())
@@ -1124,8 +1125,8 @@ bool cache_store::hdel(std::string_view key, std::string_view field)
     const size_t shape = shape_cost(it->second);
     track_sub(stored_string(field.size()) + stored_string(old.size()));
     it->second.erase(field);
-    --m_hash_fields;
     it->second.shrink_if_sparse();
+    --m_hash_fields;
     reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())
@@ -2192,8 +2193,8 @@ bool cache_store::spop(std::string_view key, std::string& out)
     const size_t shape = shape_cost(it->second);
     track_sub(stored_string(*mit));
     it->second.erase(mit);
-    --m_set_elems;
     it->second.shrink_if_sparse();
+    --m_set_elems;
     reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())
@@ -2579,6 +2580,104 @@ void cache_store::keys(std::string_view pattern, std::vector<std::string_view>& 
 
 // ─── General ───
 
+namespace
+{
+
+// Keys and members past which a flush frees on a thread of its own: 200,000 keys freed here held the loop 100-165 ms.
+constexpr size_t retire_floor = 4096;
+
+struct garbage
+{
+    virtual ~garbage() = default;
+};
+
+// The one thread a process frees flushed stores on, started at the first and drained and joined at exit, so no store
+// is left half freed for the leak checker or the next owner of the heap.
+class reaper
+{
+public:
+    // False when no thread can be had, and `g` is the caller's to free.
+    bool take(std::unique_ptr<garbage>& g)
+    {
+        std::lock_guard<std::mutex> l(m_mu);
+        if (!m_th.joinable())
+        {
+            try
+            {
+                m_th = std::thread([this] { run(); });
+            }
+            catch (const std::system_error&)
+            {
+                return false;
+            }
+        }
+        m_q.push_back(std::move(g));
+        m_cv.notify_one();
+        return true;
+    }
+
+    ~reaper()
+    {
+        {
+            std::lock_guard<std::mutex> l(m_mu);
+            m_quit = true;
+        }
+        m_cv.notify_one();
+        if (m_th.joinable())
+            m_th.join();
+    }
+
+private:
+    void run()
+    {
+        std::unique_lock<std::mutex> l(m_mu);
+        for (;;)
+        {
+            m_cv.wait(l, [this] { return m_quit || !m_q.empty(); });
+            if (m_q.empty())
+                return;
+            std::unique_ptr<garbage> g = std::move(m_q.front());
+            m_q.pop_front();
+            l.unlock();
+            g.reset();
+            l.lock();
+        }
+    }
+
+    std::mutex                           m_mu;
+    std::condition_variable              m_cv;
+    std::deque<std::unique_ptr<garbage>> m_q;
+    bool                                 m_quit{false};
+    std::thread                          m_th;
+};
+
+reaper& the_reaper()
+{
+    static reaper r;
+    return r;
+}
+
+// A value of retire_floor elements or more freed on the reaper's thread, as a flush's are: DEL of a set of a million
+// members freed them on the loop.
+template <class T>
+void retire(T& v)
+{
+    static_assert(std::is_nothrow_move_constructible_v<T>, "a value moved to the reaper must not be copied instead");
+    if (v.size() < retire_floor)
+        return;
+    struct held : garbage
+    {
+        T v;
+        explicit held(T&& x) : v(std::move(x)) {}
+    };
+    std::unique_ptr<garbage> g = std::make_unique<held>(std::move(v));
+    if (!the_reaper().take(g))
+        g.reset();
+}
+
+}   // namespace
+
+
 // The one place that knows every container a key can live in, and the one
 // place that keeps the element counters straight while removing it.
 //
@@ -2599,6 +2698,7 @@ bool cache_store::drop_value(std::string_view key)
     {
         track_sub(entry_cost(it->first, it->second));
         m_list_elems -= it->second.size();
+        retire(it->second);
         m_lists.erase(it);
         return true;
     }
@@ -2606,6 +2706,7 @@ bool cache_store::drop_value(std::string_view key)
     {
         track_sub(entry_cost(it->first, it->second));
         m_set_elems -= it->second.size();
+        retire(it->second);
         m_sets.erase(it);
         return true;
     }
@@ -2613,6 +2714,7 @@ bool cache_store::drop_value(std::string_view key)
     {
         track_sub(entry_cost(it->first, it->second));
         m_hash_fields -= it->second.size();
+        retire(it->second);
         m_hashes.erase(it);
         return true;
     }
@@ -2620,6 +2722,7 @@ bool cache_store::drop_value(std::string_view key)
     {
         track_sub(entry_cost(it->first, it->second));
         m_zset_members -= it->second.size();
+        retire(it->second);
         m_zsets.erase(it);
         return true;
     }
@@ -3229,84 +3332,6 @@ bool cache_store::load(std::string_view path, size_t offset)
     return load_v1(file, first_key_len);
 }
 
-namespace
-{
-
-// Keys and members past which a flush frees on a thread of its own: 200,000 keys freed here held the loop 100-165 ms.
-constexpr size_t retire_floor = 4096;
-
-struct garbage
-{
-    virtual ~garbage() = default;
-};
-
-// The one thread a process frees flushed stores on, started at the first and drained and joined at exit, so no store
-// is left half freed for the leak checker or the next owner of the heap.
-class reaper
-{
-public:
-    // False when no thread can be had, and `g` is the caller's to free.
-    bool take(std::unique_ptr<garbage>& g)
-    {
-        std::lock_guard<std::mutex> l(m_mu);
-        if (!m_th.joinable())
-        {
-            try
-            {
-                m_th = std::thread([this] { run(); });
-            }
-            catch (const std::system_error&)
-            {
-                return false;
-            }
-        }
-        m_q.push_back(std::move(g));
-        m_cv.notify_one();
-        return true;
-    }
-
-    ~reaper()
-    {
-        {
-            std::lock_guard<std::mutex> l(m_mu);
-            m_quit = true;
-        }
-        m_cv.notify_one();
-        if (m_th.joinable())
-            m_th.join();
-    }
-
-private:
-    void run()
-    {
-        std::unique_lock<std::mutex> l(m_mu);
-        for (;;)
-        {
-            m_cv.wait(l, [this] { return m_quit || !m_q.empty(); });
-            if (m_q.empty())
-                return;
-            std::unique_ptr<garbage> g = std::move(m_q.front());
-            m_q.pop_front();
-            l.unlock();
-            g.reset();
-            l.lock();
-        }
-    }
-
-    std::mutex                           m_mu;
-    std::condition_variable              m_cv;
-    std::deque<std::unique_ptr<garbage>> m_q;
-    bool                                 m_quit{false};
-    std::thread                          m_th;
-};
-
-reaper& the_reaper()
-{
-    static reaper r;
-    return r;
-}
-
-}   // namespace
 
 // Everything, including the counters.  Extracted from load_v2, which had the
 // only copy: a second hand-written clear is a second chance to leave
