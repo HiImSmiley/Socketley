@@ -206,9 +206,9 @@ RENAME takes the folders under a name along with it. RENAME INBOX moves its mess
 - Identity/get and set;
 - EmailSubmission/set, with its onSuccessUpdateEmail and onSuccessDestroyEmail.
 
-Email/get and Email/parse take at most 256 properties, each once, and an Email/query filter at most 256 conditions; an IMAP FETCH names at most 256 items.
+Email/get and Email/parse take at most 256 properties, each once, and an Email/query filter at most 256 conditions; an IMAP FETCH names at most 256 items. A /get takes at most 1000 ids and answers each once, however often it is given. What the back-references of one request copy is at most its maxSizeRequest, 10 MiB; a call past that is answered requestTooLarge.
 
-**/jmap/upload** and **/jmap/download** move blobs, and **/jmap/eventsource** reports state changes. A user signs in with HTTP Basic and their idp password, over TLS or from 127.0.0.1, or with a bearer token the idp gave a client that **--idp-audience** names.
+**/jmap/upload** and **/jmap/download** move blobs, and **/jmap/eventsource** reports state changes. An upload is kept for a day; what a user keeps counts with their mail against their quota, and at most 1000 are kept at once, so one past either is answered 413. A user signs in with HTTP Basic and their idp password, over TLS or from 127.0.0.1, or with a bearer token the idp gave a client that **--idp-audience** names.
 
 A user's JMAP account holds the same mailboxes IMAP reads. A Mailbox id is the folder's MAILBOXID, and an Email id is the message's EMAILID, which a move keeps. A Thread is the conversation named by the Message-ID that a message's References begin with, and collapseThreads folds a query by it. A keyword is an IMAP flag. So a client of either protocol sees at once what a client of the other did.
 

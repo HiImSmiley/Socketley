@@ -17819,6 +17819,9 @@ EmailSubmission/set, with its onSuccessUpdateEmail and onSuccessDestroyEmail.
 .PP
 Email/get and Email/parse take at most 256 properties, each once, and an
 Email/query filter at most 256 conditions; an IMAP FETCH names at most 256 items.
+A /get takes at most 1000 ids and answers each once, however often it is given.
+What the back\-references of one request copy is at most its maxSizeRequest,
+10 MiB; a call past that is answered requestTooLarge.
 .PP
 .B /jmap/upload
 and
@@ -17826,6 +17829,8 @@ and
 move blobs, and
 .B /jmap/eventsource
 reports state changes.
+An upload is kept for a day; what a user keeps counts with their mail against
+their quota, and at most 1000 are kept at once, so one past either is answered 413.
 A user signs in with HTTP Basic and their idp password, over TLS or from
 127.0.0.1, or with a bearer token the idp gave a client that
 .B \-\-idp\-audience
