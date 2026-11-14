@@ -365,6 +365,8 @@ void decoder::insert(header h)
 
 decoder::result decoder::decode(std::string_view b, std::vector<header>& out, size_t max_list)
 {
+    constexpr size_t max_inserts = 512;
+    size_t inserted = 0;
     size_t at = 0, listed = 0;
     bool over = false, fields = false;
     // A list past its limit is still decoded to its end, so the table stays in step, but nothing more of it is kept:
@@ -405,18 +407,30 @@ decoder::result decoder::decode(std::string_view b, std::vector<header>& out, si
             if (!read_int(b, at, indexing ? 6 : 4, idx))
                 return result::error;
             header h;
+            const header* named = nullptr;
             if (idx)
             {
-                const header* named = nullptr;
                 if (!entry(idx, named))
                     return result::error;
-                h.name = named->name;
             }
             else if (!read_string(b, at, h.name))
                 return result::error;
             if (!read_string(b, at, h.value))
                 return result::error;
+            // A name from the table is copied only where the field is kept or inserted: past the list's limit a
+            // literal that is neither costs its count.
+            if (named && !indexing && over)
+            {
+                listed += named->name.size() + h.value.size() + entry_overhead;
+                continue;
+            }
+            if (named)
+                h.name = named->name;
             add(h);
+            // Each insertion copies its name, which may be a 4 KiB one already in the table, so a block of two-byte
+            // literals inserting it again cost a 4 KiB copy for every two bytes; a real encoder inserts dozens.
+            if (indexing && ++inserted > max_inserts)
+                return result::error;
             if (indexing)
                 insert(std::move(h));
         }

@@ -3,6 +3,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include <chrono>
 #include <random>
 #include <string>
 #include <vector>
@@ -62,6 +63,42 @@ TEST_CASE("RFC 7541 Appendix C decodes as the RFC says, the table carried from b
     for (const auto& b : rfc7541_cases[2].blocks)
         decode(r, unhex(b.hex), got);
     CHECK(r.table_size() == 215);
+}
+
+TEST_CASE("a block of two-byte literals naming a large table entry costs its bytes, not a copy each")
+{
+    decoder d;
+    // A literal with incremental indexing of a new 4,064-byte name, empty value: the table's entry 62.
+    std::string first = "\x40";
+    first += static_cast<char>(0x7f);
+    first += "\xe1\x1e";   // 127 + 3,937 = 4,064, the name's length as an HPACK integer
+    first += std::string(4064, 'x');
+    first += '\0';
+    std::vector<header> got;
+    REQUIRE(decode(d, first, got) == decoder::result::ok);
+    REQUIRE(got.size() == 1);
+    // 0x7e 0x00: insert entry 62's name again with an empty value, which copied 4 KiB for every two bytes.
+    std::string flood;
+    for (int i = 0; i < 40000; ++i)
+        flood += std::string("\x7e\x00", 2);
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(decode(d, flood, got, 64 * 1024) == decoder::result::error);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(200));
+    // The same without indexing (0x0f 0x2f), past the list's limit: counted, not copied.
+    decoder e;
+    REQUIRE(decode(e, first, got) == decoder::result::ok);
+    std::string plain;
+    for (int i = 0; i < 26000; ++i)
+        plain += std::string("\x0f\x2f\x00", 3);
+    const auto t1 = std::chrono::steady_clock::now();
+    CHECK(decode(e, plain, got, 64 * 1024) == decoder::result::too_large);
+    CHECK(std::chrono::steady_clock::now() - t1 < std::chrono::milliseconds(200));
+    // A block inserting a few hundred, as a client might, still decodes.
+    decoder f;
+    std::string some;
+    for (int i = 0; i < 300; ++i)
+        some += "\x40\x01" + std::string(1, static_cast<char>('a' + i % 26)) + "\x01v";
+    CHECK(decode(f, some, got) == decoder::result::ok);
 }
 
 TEST_CASE("what the encoder writes reads back, indexed where the static table has it")

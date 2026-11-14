@@ -48,6 +48,9 @@ struct outcome
 template <class S>
 outcome settings_in(session<S>& s, std::string_view pl)
 {
+    // The frame's last INITIAL_WINDOW_SIZE moves the streams once: a frame of 2,730 of them walked every stream 2,730
+    // times, whether the value changed or not.
+    int64_t init_win = -1;
     for (size_t i = 0; i + 6 <= pl.size(); i += 6)
     {
         const uint16_t id = static_cast<uint16_t>(static_cast<uint8_t>(pl[i]) << 8 | static_cast<uint8_t>(pl[i + 1]));
@@ -58,24 +61,28 @@ outcome settings_in(session<S>& s, std::string_view pl)
         {
             if (v > max_window)
                 return outcome::conn(FLOW_CONTROL_ERROR);
-            // Every open stream's window moves by the difference, and may go below zero.
-            const int64_t delta = static_cast<int64_t>(v) - s.peer_init_win;
-            s.peer_init_win = v;
-            for (auto& [sid, h] : s.streams)
-            {
-                stream& st = state_of(h);
-                st.send_win += delta;
-                if (st.send_win > max_window)
-                    return outcome::conn(FLOW_CONTROL_ERROR);
-                if (delta > 0 && st.tx_left())
-                    enqueue(s, st);
-            }
+            init_win = v;
         }
         else if (id == MAX_FRAME_SIZE)
         {
             if (v < default_frame || v > 16777215)
                 return outcome::conn(PROTOCOL_ERROR);
             s.peer_max_frame = std::min<uint32_t>(v, 64 * 1024);
+        }
+    }
+    // Every open stream's window moves by the difference, and may go below zero.
+    if (init_win >= 0 && init_win != static_cast<int64_t>(s.peer_init_win))
+    {
+        const int64_t delta = init_win - static_cast<int64_t>(s.peer_init_win);
+        s.peer_init_win = static_cast<uint32_t>(init_win);
+        for (auto& [sid, h] : s.streams)
+        {
+            stream& st = state_of(h);
+            st.send_win += delta;
+            if (st.send_win > max_window)
+                return outcome::conn(FLOW_CONTROL_ERROR);
+            if (delta > 0 && st.tx_left())
+                enqueue(s, st);
         }
     }
     s.got_settings = true;
