@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -256,6 +257,117 @@ out_bio* out_of(const SSL* ssl)
 {
     BIO* wbio = ssl ? SSL_get_wbio(ssl) : nullptr;
     return wbio && BIO_method_type(wbio) == out_type() ? static_cast<out_bio*>(BIO_get_data(wbio)) : nullptr;
+}
+
+// The read side of an SSL whose ciphertext is lent for the length of a feed rather than copied in: the record layer
+// reads it where it lies, and only what it leaves is kept, behind which the next lend is read.
+struct in_bio
+{
+    std::string held;
+    size_t held_off = 0;
+    const char* lent = nullptr;
+    size_t lent_len = 0;
+    size_t lent_off = 0;
+
+    size_t pending() const { return held.size() - held_off + lent_len - lent_off; }
+};
+
+int in_read(BIO* b, char* data, size_t len, size_t* read)
+{
+    BIO_clear_retry_flags(b);
+    auto* in = static_cast<in_bio*>(BIO_get_data(b));
+    size_t n = std::min(len, in->held.size() - in->held_off);
+    if (n > 0)
+    {
+        std::memcpy(data, in->held.data() + in->held_off, n);
+        in->held_off += n;
+        if (in->held_off == in->held.size())
+        {
+            in->held.clear();
+            in->held_off = 0;
+        }
+    }
+    const size_t k = std::min(len - n, in->lent_len - in->lent_off);
+    if (k > 0)
+    {
+        std::memcpy(data + n, in->lent + in->lent_off, k);
+        in->lent_off += k;
+        n += k;
+    }
+    *read = n;
+    if (n == 0)
+    {
+        // Empty is "ask again", as a memory BIO with an EOF return of -1 says it.
+        BIO_set_retry_read(b);
+        return 0;
+    }
+    return 1;
+}
+
+// bio_write_in's copy, refused while bytes are lent, since it would be read ahead of the lent ones before it.
+int in_write(BIO* b, const char* data, size_t len, size_t* written)
+{
+    BIO_clear_retry_flags(b);
+    auto* in = static_cast<in_bio*>(BIO_get_data(b));
+    if (in->lent)
+        return 0;
+    in->held.append(data, len);
+    *written = len;
+    return 1;
+}
+
+long in_ctrl(BIO* b, int cmd, long, void*)
+{
+    switch (cmd)
+    {
+        case BIO_CTRL_PENDING: return static_cast<long>(static_cast<in_bio*>(BIO_get_data(b))->pending());
+        case BIO_CTRL_FLUSH:   return 1;
+        default:               return 0;
+    }
+}
+
+int in_create(BIO* b)
+{
+    auto* in = new (std::nothrow) in_bio;
+    BIO_set_data(b, in);
+    BIO_set_init(b, in != nullptr);
+    return in != nullptr;
+}
+
+int in_destroy(BIO* b)
+{
+    delete static_cast<in_bio*>(BIO_get_data(b));
+    BIO_set_data(b, nullptr);
+    return 1;
+}
+
+int in_type()
+{
+    static const int type = BIO_get_new_index() | BIO_TYPE_SOURCE_SINK;
+    return type;
+}
+
+const BIO_METHOD* in_method()
+{
+    static BIO_METHOD* const m = []
+    {
+        BIO_METHOD* x = BIO_meth_new(in_type(), "socketley lent records");
+        if (x && (!BIO_meth_set_write_ex(x, in_write) || !BIO_meth_set_read_ex(x, in_read) ||
+                  !BIO_meth_set_ctrl(x, in_ctrl) || !BIO_meth_set_create(x, in_create) ||
+                  !BIO_meth_set_destroy(x, in_destroy)))
+        {
+            BIO_meth_free(x);
+            x = nullptr;
+        }
+        return x;
+    }();
+    return m;
+}
+
+in_bio* in_of(const SSL* ssl)
+{
+    BIO* rbio = ssl ? SSL_get_rbio(ssl) : nullptr;
+    return rbio && BIO_method_type(rbio) == in_type() ? static_cast<in_bio*>(BIO_get_data(rbio)) : nullptr;
 }
 
 }   // namespace
@@ -1237,6 +1349,84 @@ int tls_context::bio_write_in(SSL* ssl, const char* buf, int len)
     return -1;
 #else
     return -1;
+#endif
+}
+
+bool tls_context::read_lent(SSL* ssl)
+{
+#if SOCKETLEY_HAS_TLS
+    if (!ssl || in_of(ssl))
+        return ssl != nullptr;
+    // Only before the first byte is read, because the memory BIO it replaces would take what it holds with it.
+    BIO* old = SSL_get_rbio(ssl);
+    if (old && BIO_ctrl_pending(old) > 0)
+        return false;
+    const BIO_METHOD* m = in_method();
+    BIO* rbio = m ? BIO_new(m) : nullptr;
+    if (!rbio)
+        return false;
+    SSL_set0_rbio(ssl, rbio);
+    return true;
+#else
+    (void)ssl;
+    return false;
+#endif
+}
+
+bool tls_context::lend_in(SSL* ssl, const char* data, size_t len)
+{
+#if SOCKETLEY_HAS_TLS
+    in_bio* in = in_of(ssl);
+    if (!in)
+    {
+        for (size_t off = 0; off < len;)
+        {
+            const int n = bio_write_in(ssl, data + off, static_cast<int>(std::min<size_t>(len - off, INT_MAX)));
+            if (n <= 0)
+                return false;
+            off += static_cast<size_t>(n);
+        }
+        return true;
+    }
+    in->lent = data;
+    in->lent_len = len;
+    in->lent_off = 0;
+    return true;
+#else
+    (void)ssl; (void)data; (void)len;
+    return false;
+#endif
+}
+
+bool tls_context::lend_end(SSL* ssl)
+{
+#if SOCKETLEY_HAS_TLS
+    in_bio* in = in_of(ssl);
+    if (!in || !in->lent)
+        return true;
+    const size_t left = in->lent_len - in->lent_off;
+    if (left > 0)
+    {
+        if (in->held_off > 0)
+        {
+            in->held.erase(0, in->held_off);
+            in->held_off = 0;
+        }
+        in->held.append(in->lent + in->lent_off, left);
+    }
+    in->lent = nullptr;
+    in->lent_len = in->lent_off = 0;
+    // The bound bio_write_in puts on the memory BIO, for the same reason: a record never finished is held for ever.
+    if (in->held.size() > static_cast<size_t>(max_bio_buffered))
+    {
+        LOG_WARN(("tls: inbound buffer limit exceeded (" + std::to_string(in->held.size()) + " > " +
+                  std::to_string(max_bio_buffered) + " bytes unconsumed) -- dropping connection").c_str());
+        return false;
+    }
+    return true;
+#else
+    (void)ssl;
+    return true;
 #endif
 }
 

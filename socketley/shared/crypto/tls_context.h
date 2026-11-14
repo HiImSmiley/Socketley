@@ -126,6 +126,16 @@ public:
     // exceeding max_bio_buffered, where the caller must close rather than retry.
     static int bio_write_in(SSL* ssl, const char* buf, int len);
 
+    // The SSL reads its records from bytes lent for one feed rather than from copies taken into a memory BIO, for a
+    // runtime whose read buffer stays put until the feed is over; false leaves it copying, which lend_in still serves.
+    static bool read_lent(SSL* ssl);
+    // [data, data + len) readable by the record layer until lend_end, behind whatever an earlier feed left; false when
+    // a copying SSL refused the bytes, which is fatal as bio_write_in's refusal is.
+    static bool lend_in(SSL* ssl, const char* data, size_t len);
+    // What the record layer did not take is copied and kept, so the buffer can go; false when that is over
+    // max_bio_buffered, where the caller must close.
+    static bool lend_end(SSL* ssl);
+
     // Check if SSL needs to write (has pending encrypted output)
     static bool has_pending_out(SSL* ssl);
 

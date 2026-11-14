@@ -1875,6 +1875,9 @@ bool client_instance::start_tls(conn_t* conn)
     conn->ssl = m_tls->create_ssl_client(m_tls_peer_name);
     if (SOCKETLEY_UNLIKELY(!conn->ssl))
         return false;
+    // A read's buffer stays put until tls_feed is done with it, so the record layer reads it in place; one that
+    // cannot keeps copying.
+    tls_context::read_lent(conn->ssl);
     conn->tls_state = tls_conn_handshake;
     conn->tls_peer_closed = false;
 
@@ -1920,20 +1923,23 @@ void client_instance::arm_handshake_deadline(conn_t* conn)
 // blocking the event loop.
 void client_instance::tls_feed(conn_t* conn, const char* data, size_t len)
 {
-    // Inbound ciphertext into the read BIO, whose refusal is fatal by contract
-    // because there is nowhere to hold what was not taken.
-    size_t off = 0;
-    while (off < len)
+    // Inbound ciphertext lent to the record layer where it lies, and what it leaves kept when this returns, because
+    // the buffer goes back to the ring after it; a refusal at either end is fatal, as there is nowhere else to hold it.
+    if (SOCKETLEY_UNLIKELY(!tls_context::lend_in(conn->ssl, data, len)))
     {
-        const int n = tls_context::bio_write_in(conn->ssl, data + off,
-                                                static_cast<int>(len - off));
-        if (SOCKETLEY_UNLIKELY(n <= 0))
-        {
-            conn->closing = true;
-            return;
-        }
-        off += static_cast<size_t>(n);
+        conn->closing = true;
+        return;
     }
+    struct lend_scope
+    {
+        conn_t* conn;
+        SSL* ssl;
+        ~lend_scope()
+        {
+            if (SOCKETLEY_UNLIKELY(!tls_context::lend_end(ssl)))
+                conn->closing = true;
+        }
+    } lent{conn, conn->ssl};
 
     if (conn->tls_state == tls_conn_handshake)
     {
