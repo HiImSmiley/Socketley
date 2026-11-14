@@ -123,6 +123,10 @@ struct alignas(64) server_connection
     bool drain_on_close{false};
     // What a closing connection read and threw away while its FIN was out.
     uint32_t drained_bytes{0};
+    // The read left armed behind our FIN for an HTTP client's own, given once and ended by drain_sweep().
+    bool fin_drain{false};
+    // The drain's read ended at the peer's own FIN, so nothing is left unread for a close to answer with a reset.
+    bool eof_read{false};
     // Its end is orderly_close's to send under kernel TLS, its read withdrawn so the close comes.
     bool end_handed{false};
     // Closed with a reset: what it is owed has not moved for --idle-timeout.
@@ -1389,6 +1393,14 @@ private:
     // completion, so a server with no listeners never puts it in the ring.
     io_request m_relay_deadline_req{};
     struct __kernel_timespec m_relay_deadline_ts{};
+
+    // A drain's deadline, looked at each second while one is outstanding: the idle sweep ticks at 30 seconds, and a
+    // closing client that keeps its end open would hold its connection that long.
+    io_request m_drain_sweep_req{};
+    struct __kernel_timespec m_drain_sweep_ts{};
+    bool m_drain_sweep_armed{false};
+    void drain_sweep_arm();
+    void drain_sweep();
 
     // The bound on a callback that stopped on an await.  Its own timer and not
     // the idle sweep's: that one ticks at 30 seconds, and a handler given ten

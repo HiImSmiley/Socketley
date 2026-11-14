@@ -346,6 +346,8 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->wr_shutdown = false;
     conn->drain_on_close = false;
     conn->drained_bytes = 0;
+    conn->fin_drain = false;
+    conn->eof_read = false;
     conn->end_handed = false;
     conn->reset_on_close = false;
 
@@ -422,6 +424,9 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
         if (::setsockopt(fd, SOL_SOCKET, SO_LINGER, &now_reset, sizeof now_reset) < 0) {}
         close_tracked(fd);
     }
+    // Everything the peer sent is read and its FIN with it, which is the end orderly_close would wait and look for.
+    else if (conn->eof_read && conn->ssl == nullptr && m_ring_loop != nullptr && fd >= 0)
+        m_ring_loop->close_fd(fd);
     else if (SOCKETLEY_LIKELY(m_ring_loop != nullptr) && fd >= 0)
         m_ring_loop->close_fd_orderly(fd, conn->ssl != nullptr && tls_context::close_notify_queued(conn->ssl) &&
                                               tls_context::kernel_sends(conn->ssl));
@@ -2438,6 +2443,7 @@ bool server_instance::setup(event_loop& loop)
         m_accept_armed         = false;
         m_idle_sweep_armed     = false;
         m_relay_deadline_armed = false;
+        m_drain_sweep_armed    = false;
         m_accept_backoff_armed = false;
         m_await_sweep_armed    = false;
         m_udp_recv_armed       = false;
@@ -3010,6 +3016,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         return_provided_buf(cqe);
         if (req == &m_idle_sweep_req)          m_idle_sweep_armed = false;
         else if (req == &m_relay_deadline_req) m_relay_deadline_armed = false;
+        else if (req == &m_drain_sweep_req)    m_drain_sweep_armed = false;
         else if (req == &m_accept_backoff_req) m_accept_backoff_armed = false;
         else if (req == &m_udp_recv->req)       m_udp_recv_armed = false;
         else if (req == m_accept_req.get()) m_accept_armed = false;
@@ -3143,8 +3150,9 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                     if (!cconn)
                         continue;
                     // A refused peer that is still sending after the bound
-                    // is cut off, which ends the read the drain was holding.
-                    if (cconn->closing && cconn->drain_on_close)
+                    // is cut off, which ends the read the drain was holding;
+                    // a FIN drain is drain_sweep()'s.
+                    if (cconn->closing && cconn->drain_on_close && !cconn->fin_drain)
                     {
                         if (now > cconn->header_deadline)
                         {
@@ -3282,6 +3290,11 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 m_relay_deadline_armed = false;
                 relay_deadline_sweep();
             }
+            else if (req == &m_drain_sweep_req)
+            {
+                m_drain_sweep_armed = false;
+                drain_sweep();
+            }
             // Accept backoff expired — resubmit accept
             else if (req == &m_accept_backoff_req)
             {
@@ -3342,6 +3355,18 @@ void server_instance::finish_unreachable_conn(int fd)
     auto* conn = m_conn_idx[fd];
     if (SOCKETLEY_LIKELY(conn == nullptr || !conn->closing))
         return;
+
+    // An HTTP client whose answer ended the connection closes once it has it, and the read still armed takes that
+    // FIN: finished here instead, every connection paid a cancel, a second shutdown, a TCP_INFO and a timed wait in
+    // orderly_close.  Bounded by drain_sweep() and the drain's byte limit.
+    if (conn->proto == proto_http && conn->wr_shutdown && conn->read_pending && conn->ssl == nullptr &&
+        !conn->drain_on_close && !conn->fin_drain && !conn->reset_on_close && m_loop)
+    {
+        conn->fin_drain       = true;
+        conn->drain_on_close  = true;
+        conn->header_deadline = std::chrono::steady_clock::now() + socketley::orderly_close::quiet;
+        drain_sweep_arm();
+    }
 
     using socketley::reach::verdict;
 
@@ -5233,6 +5258,10 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
+        // Only a drain's read ends at zero by the peer's FIN alone: the sweeps clear drain_on_close before they end it.
+        if (cqe->res == 0 && conn->drain_on_close)
+            conn->eof_read = true;
+
         // Return provided buffer if kernel allocated one before error
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
         {
@@ -6621,6 +6650,38 @@ void server_instance::relay_hold_flush(server_connection* conn)
     }
 
     conn->relay_hold_since = {};
+}
+
+void server_instance::drain_sweep_arm()
+{
+    // Not if it is already counting, because a second submission on this request would leave the first in the ring
+    // with nothing able to name it.
+    if (m_drain_sweep_armed || SOCKETLEY_UNLIKELY(!m_loop))
+        return;
+    m_drain_sweep_ts.tv_sec  = std::chrono::duration_cast<std::chrono::seconds>(socketley::orderly_close::quiet).count();
+    m_drain_sweep_ts.tv_nsec = 0;
+    m_drain_sweep_req = { this, nullptr, -1, 0, op_timeout };
+    m_drain_sweep_armed = m_loop->submit_timeout(&m_drain_sweep_ts, &m_drain_sweep_req);
+}
+
+// A client still open at its FIN drain's deadline has the read withdrawn, and its end is then orderly_close's as before
+// the drain: a shutdown(SHUT_RD) would answer its next byte with a reset and lose what of the answer it has not read.
+void server_instance::drain_sweep()
+{
+    const auto now = std::chrono::steady_clock::now();
+    bool left = false;
+    for (int cfd : m_active_fds)
+    {
+        auto* cconn = m_conn_idx[cfd];
+        if (!cconn || !cconn->closing || !cconn->drain_on_close || !cconn->fin_drain)
+            continue;
+        if (now > cconn->header_deadline && m_loop->submit_cancel_request(&cconn->read_req))
+            cconn->drain_on_close = false;
+        else
+            left = true;
+    }
+    if (left)
+        drain_sweep_arm();
 }
 
 void server_instance::relay_deadline_arm(uint32_t after_ms)
@@ -8420,6 +8481,8 @@ void server_instance::withdraw_timers(event_loop& loop)
     // fuse.
     if (m_relay_deadline_armed)
         timers_withdrawn &= loop.submit_timeout_remove(&m_relay_deadline_req);
+    if (m_drain_sweep_armed)
+        timers_withdrawn &= loop.submit_timeout_remove(&m_drain_sweep_req);
     if (m_accept_backoff_armed)
         timers_withdrawn &= loop.submit_timeout_remove(&m_accept_backoff_req);
     loop.flush();
