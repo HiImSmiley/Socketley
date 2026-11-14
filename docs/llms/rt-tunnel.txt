@@ -42,6 +42,12 @@ Every flag a tunnel runtime takes, by group.
 | `--bind` | text | Bind address: Bind the port to this address only, such as 127.0.0.1 when only a proxy on this machine should reach it. |
 | `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
 
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
+
 **Output**
 
 | flag | value | what it does |

@@ -40,7 +40,7 @@ Every flag of every runtime type, with the types that take it.
 | `--max-connections` (--max-conn) | int | Max connections: The most clients at once. Types: server, proxy, cache, storage, idp, db, mqtt, mail, mcp, web. |
 | `--rate-limit` | int | Rate limit: Messages a second per connection. Types: server, proxy, cache. |
 | `--global-rate-limit` | int | Global rate limit: Messages a second over all connections. Types: server, proxy, cache. |
-| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. Types: server, proxy, cache, storage. |
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. Types: server, proxy, cache, storage, idp, db, mqtt, mail, tunnel, metrics, mcp, web. |
 | `--idle-timeout` | duration | Idle timeout: Close a connection that has received nothing for this long; off unless given. Types: server, proxy, cache, storage. |
 | `--read-buffer` | size | Read buffer: How much data may pile up from one connection before it is refused; 1M unless given. Types: server, client, proxy, cache, storage. |
 | `--write-buffer` | size | Write buffer: How much unsent data may queue up for one connection before it is dropped; 8M unless given. Types: server, client, proxy, cache, storage, mqtt. |

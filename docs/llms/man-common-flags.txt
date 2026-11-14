@@ -178,7 +178,7 @@ A connection a runtime ends after its answer (an HTTP **Connection: close**, a c
 
 ### `--congestion name`
 
-The TCP congestion control algorithm for connections that a server, proxy, cache or storage runtime accepts. Give the kernel's name for it, such as **bbr**, **cubic** or **reno**. It is set once on the listener, and each accepted socket inherits it. Default: the host's default (**net.ipv4.tcp_congestion_control**). A loss-based algorithm such as cubic halves its rate at every lost packet. bbr paces to the path's measured bandwidth and holds that rate. One 32 MB download over 100 Mbit with a 50 ms round trip, three interleaved runs:
+The TCP congestion control algorithm for the connections a runtime sends on: those a server, proxy, cache, storage, mqtt, mail, db, idp, tunnel, metrics, mcp or web runtime accepts, and those it makes itself to send — a tunnel agent's link to its edge, which carries what visitors download, and a storage's links to its replication targets, cluster nodes and tiers. A client, dns or sync runtime refuses it. Give the kernel's name for it, such as **bbr**, **cubic** or **reno**. It is set once on the listener, and each accepted socket inherits it; a connection the runtime makes takes it when it is made. Default: the host's default (**net.ipv4.tcp_congestion_control**). A loss-based algorithm such as cubic halves its rate at every lost packet. bbr paces to the path's measured bandwidth and holds that rate. One 32 MB download over 100 Mbit with a 50 ms round trip, three interleaved runs:
 
 ```
 loss   cubic              bbr
@@ -187,7 +187,7 @@ loss   cubic              bbr
 2%     0.26-0.27 MB/s    9.59-9.63 MB/s
 ```
 
-The kernel decides which algorithms may be chosen. A process without CAP_NET_ADMIN may choose only one that **net.ipv4.tcp_allowed_congestion_control** lists and that is already loaded (**modprobe tcp_bbr**). If the kernel refuses the name, the start fails and the log says why. The runtime never falls back to the default silently.
+The kernel decides which algorithms may be chosen. A process without CAP_NET_ADMIN may choose only one that **net.ipv4.tcp_allowed_congestion_control** lists and that is already loaded (**modprobe tcp_bbr**). If the kernel refuses the name, the start fails and the log says why. The runtime never falls back to the default silently. A tunnel agent, which has no listener, says a refusal once in the log and keeps its link on the default.
 
 ### `--drain`
 

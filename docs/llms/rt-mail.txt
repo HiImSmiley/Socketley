@@ -63,6 +63,7 @@ Every flag a mail runtime takes, by group.
 | flag | value | what it does |
 |---|---|---|
 | `--max-connections` (--max-conn) | int | Max connections: The most clients at once. |
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
 
 **Output**
 

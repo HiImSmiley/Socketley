@@ -42,6 +42,12 @@ Every flag a metrics runtime takes, by group.
 | `--domain` | list | Names: The names it is reached by through the entrance; empty for its own name. |
 | `--cpus` | text | CPUs: The CPUs its I/O may run on, as 0-3,6. |
 
+**Limits**
+
+| flag | value | what it does |
+|---|---|---|
+| `--congestion` | text | Congestion control: The kernel's congestion control for its connections, such as bbr, which keeps its rate up under packet loss. |
+
 **Output**
 
 | flag | value | what it does |

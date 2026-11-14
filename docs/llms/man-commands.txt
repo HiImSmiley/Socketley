@@ -717,7 +717,7 @@ The interactive editor opens a JSON file with the following fields. Fields marke
 | rate_limit | number | Messages/sec per connection (0 = unlimited) |
 | global_rate_limit | number | Messages/sec across all connections (0 = unlimited) |
 | idle_timeout | number | Close idle connections after N seconds (0 = disabled) |
-| congestion | string | TCP congestion control of accepted connections (**--congestion**) |
+| congestion | string | TCP congestion control of the runtime's TCP connections (**--congestion**) |
 | drain | bool | Graceful shutdown (flush writes before close) |
 | tls | bool | Terminate TLS on the listener **(server, proxy)**; dial TLS **(client)** |
 | cert_path | string | PEM certificate **(server, proxy; needs tls)**; on a **client**, the certificate it presents |
