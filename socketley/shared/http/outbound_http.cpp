@@ -339,6 +339,10 @@ void http_peer::exchange(http_request req, std::function<void(http_answer)> done
     m_eof          = false;
     m_in.clear();
     m_head_end = std::string::npos;
+    m_head_scanned = 0;
+    m_chunks = http_chunked_decoder{};
+    m_chunks_at = 0;
+    m_chunks_end = false;
     m_deadline = now + std::chrono::seconds(stall_secs);
     if (m_stopped || (m_target.tls && !m_tls))
     {
@@ -853,7 +857,10 @@ void http_peer::got(const char* p, size_t n)
 bool http_peer::answer_complete(bool framed) const
 {
     if (m_head_end == std::string::npos)
-        m_head_end = m_in.find("\r\n\r\n");
+    {
+        m_head_end = m_in.find("\r\n\r\n", m_head_scanned > 3 ? m_head_scanned - 3 : 0);
+        m_head_scanned = m_in.size();
+    }
     const size_t end = m_head_end;
     if (end == std::string::npos)
         return false;
@@ -866,16 +873,16 @@ bool http_peer::answer_complete(bool framed) const
         return true;
     if (http_list_has_token(head_value(head, "transfer-encoding"), "chunked", 7))
     {
-        // A chunked body ends with an empty line, so a buffer that does not is not decoded again just to learn so.
-        if (!m_in.ends_with("\r\n\r\n"))
-            return false;
-        http_chunked_decoder d;
-        std::string_view in = body, out;
+        // Decoded as it comes, from where the last read stopped.
+        if (m_chunks_end)
+            return true;
+        std::string_view in = body.substr(std::min(m_chunks_at, body.size())), out;
         for (;;)
         {
-            const chunk_step s = http_chunked_next(d, in, out);
+            const chunk_step s = http_chunked_next(m_chunks, in, out);
+            m_chunks_at = body.size() - in.size();
             if (s == chunk_step::done || s == chunk_step::bad)
-                return true;
+                return m_chunks_end = true;
             if (s == chunk_step::need_more)
                 return false;
         }
@@ -993,6 +1000,10 @@ void http_peer::finish(bool answered, std::string why)
     m_req  = http_request{};
     m_in.clear();
     m_head_end = std::string::npos;
+    m_head_scanned = 0;
+    m_chunks = http_chunked_decoder{};
+    m_chunks_at = 0;
+    m_chunks_end = false;
     if (done && !m_stopped)
         done(std::move(a));
 }

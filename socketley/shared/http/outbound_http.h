@@ -14,6 +14,7 @@
 
 #include "../loop/event_loop.h"
 #include "../loop/file_io.h"
+#include "http_framing.h"
 #include "../loop/hash_pool.h"
 #include "../net/endpoint.h"
 #include "../net/read_buffer.h"
@@ -220,8 +221,14 @@ private:
     socketley::read_size m_read{16 * 1024, 256 * 1024};
     std::shared_ptr<char[]> m_rbuf;
     uint32_t m_rbuf_size{0};
-    // Where the answer's head ends in m_in once found, so each read does not search it from the start again.
+    // Where the answer's head ends in m_in once found, so each read does not search it from the start again, and how
+    // far the search for it got; a chunked body's decoder and how far into the body it has read, so each byte of the
+    // body is decoded once rather than the whole of it again for every read that ends in an empty line.
     mutable size_t m_head_end = std::string::npos;
+    mutable size_t m_head_scanned = 0;
+    mutable http_chunked_decoder m_chunks{};
+    mutable size_t m_chunks_at = 0;
+    mutable bool m_chunks_end = false;
     std::chrono::steady_clock::time_point m_deadline{};
     // When the connection was made, and since when, kept from the last exchange, it has had nothing on it.
     std::chrono::steady_clock::time_point m_connected_at{};
