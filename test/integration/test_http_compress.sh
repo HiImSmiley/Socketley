@@ -21,8 +21,8 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 expect() { if [ "$2" = "$3" ]; then ok; else bad "$1" "got '$2', want '$3'"; fi; }
-has() { if printf '%s' "$2" | grep -qiE -- "$3"; then ok; else bad "$1" "no /$3/ in: $(printf '%s' "$2" | head -c 400)"; fi; }
-hasnt() { if printf '%s' "$2" | grep -qiE -- "$3"; then bad "$1" "/$3/ in: $(printf '%s' "$2" | head -c 400)"; else ok; fi; }
+has() { if grep -qiE -- "$3" <<<"$2"; then ok; else bad "$1" "no /$3/ in: $(printf '%s' "$2" | head -c 400)"; fi; }
+hasnt() { if grep -qiE -- "$3" <<<"$2"; then bad "$1" "/$3/ in: $(printf '%s' "$2" | head -c 400)"; else ok; fi; }
 
 echo "=== Integration: --compress on --http sends a file's compressed copy to a client that takes it ==="
 daemon_isolate httpgz
