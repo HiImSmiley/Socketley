@@ -45,6 +45,7 @@
 #include "../../shared/loop/ring_read.h"
 #include "../../shared/loop/write_queue.h"
 #include "../../shared/persist/watched_file.h"
+#include "../../shared/util/transparent_string.h"
 
 class mail_instance;
 class tls_context;
@@ -362,7 +363,7 @@ private:
     {
         std::string path;
         int64_t keep_s{0};
-        std::unordered_set<std::string> set;
+        std::unordered_set<std::string, string_hash, string_equal> set;
         std::optional<socketley::file_stamp> stamp;
     };
     address_list m_suppressed, m_unsubscribed;
@@ -482,7 +483,7 @@ private:
     // Reports made and their TLS ones' rua looked up, and mail of them sent.
     void send_reports();
     // What a user is told once their mailbox passes --quota-warn, kept for the run.
-    std::unordered_set<std::string> m_quota_warned;
+    std::unordered_set<std::string, string_hash, string_equal> m_quota_warned;
     std::unique_ptr<imap_store> m_imap;
     std::unique_ptr<dav_store> m_dav;
     std::unordered_map<uint64_t, std::unique_ptr<conn>> m_conns;
@@ -496,7 +497,7 @@ private:
         double tokens{0};
         int64_t tokens_ms{0};
     };
-    std::unordered_map<std::string, client> m_clients;
+    std::unordered_map<std::string, client, string_hash, string_equal> m_clients;
     // Failed sign-ins by account, from how many addresses, and the addresses it signed in from, for a spray of
     // guesses no one address's count sees; kept across a restart with the addresses refused.
     struct account_guard
@@ -504,10 +505,10 @@ private:
         uint32_t failures{0};
         int64_t first_failure_ms{0};
         int64_t locked_until_ms{0};
-        std::unordered_set<std::string> from;
-        std::unordered_map<std::string, int64_t> known;
+        std::unordered_set<std::string, string_hash, string_equal> from;
+        std::unordered_map<std::string, int64_t, string_hash, string_equal> known;
     };
-    std::unordered_map<std::string, account_guard> m_accounts;
+    std::unordered_map<std::string, account_guard, string_hash, string_equal> m_accounts;
     bool m_auth_dirty{false};
     bool account_refused(const std::string& acct, const std::string& ip, int64_t now) const;
     void account_signed_in(const std::string& acct, const std::string& name, const std::string& ip);
@@ -554,8 +555,8 @@ private:
     void imap_sieve_apply(const std::string& user, const std::shared_ptr<imap_folder>& f, uint32_t uid,
                           std::string_view bytes, const sieve::outcome& out, const std::string& own);
     // This shard's push users, each with when its last verified subscription expires.
-    std::unordered_map<std::string, int64_t> m_push_live;
-    std::unordered_map<std::string, std::string> m_push_seen;
+    std::unordered_map<std::string, int64_t, string_hash, string_equal> m_push_live;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> m_push_seen;
     int64_t m_push_list_mtime{-1}, m_push_list_size{-2};
     uint64_t m_pushes_sent{0}, m_pushes_failed{0};
     std::shared_ptr<bool> m_alive;

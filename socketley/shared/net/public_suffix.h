@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include "../util/transparent_string.h"
 
 namespace socketley::public_suffix
 {
@@ -22,7 +23,7 @@ public:
     bool same_owner(std::string_view a, std::string_view b) const;
 
 private:
-    std::unordered_set<std::string> m_rules, m_wild, m_except;
+    std::unordered_set<std::string, string_hash, string_equal> m_rules, m_wild, m_except;
 };
 
 // The system's list, read the first time it is asked for; empty where the file is not there.

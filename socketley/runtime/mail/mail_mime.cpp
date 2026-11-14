@@ -796,7 +796,7 @@ bool iconv_utf8(std::string_view charset, std::string_view in, std::string& out)
     // A descriptor a charset a thread, kept for the thread's life: opening one reads a module, and few are ever asked.
     struct held
     {
-        std::unordered_map<std::string, iconv_t> open;
+        std::unordered_map<std::string, iconv_t, string_hash, string_equal> open;
         ~held()
         {
             for (auto& [n, cd] : open)

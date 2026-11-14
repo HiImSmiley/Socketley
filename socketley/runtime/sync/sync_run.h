@@ -26,6 +26,7 @@
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
 #include "../../shared/http/outbound_http.h"
+#include "../../shared/util/transparent_string.h"
 
 class sync_instance;
 
@@ -245,7 +246,7 @@ private:
     bool m_listing{false};
     std::chrono::steady_clock::time_point m_last_pull{};
     std::string m_list_token;
-    std::unordered_map<std::string, remote_obj> m_remote;
+    std::unordered_map<std::string, remote_obj, string_hash, string_equal> m_remote;
     std::deque<fetch> m_fetches;
     // The key an object is written under: --prefix and the path below --dir.
     std::string key_of(const std::string& rel) const;
@@ -279,7 +280,7 @@ private:
     std::unique_ptr<char[]> m_watch_buf;
     std::unordered_map<int, std::string> m_watches;
     // Paths inotify named, looked at once the walk in progress, if any, is over.
-    std::unordered_set<std::string> m_changed;
+    std::unordered_set<std::string, string_hash, string_equal> m_changed;
     // A directory came or went, or the kernel dropped events: only a walk can say what changed.
     bool m_rewalk{false};
     // The last failure written to the log, so one that repeats each walk is said once.

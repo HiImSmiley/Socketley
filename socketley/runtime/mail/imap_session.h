@@ -16,6 +16,7 @@
 
 #include "mail_account.h"
 #include "imap_store.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -199,7 +200,7 @@ private:
         bool subscribed{false};
         uint8_t events{0};
     };
-    std::unordered_map<std::string, notify_seen> m_notify_seen;
+    std::unordered_map<std::string, notify_seen, string_hash, string_equal> m_notify_seen;
     uint64_t m_told_modseq{0};
     // Input: what is not yet a whole command, the command being gathered with its literals, and how much of a literal
     // is still to come.

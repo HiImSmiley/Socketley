@@ -154,7 +154,7 @@ private:
     };
     // The failures of `key` still in the window, its entry made when it has none.
     entry& fresh(const std::string& key, int64_t now);
-    std::unordered_map<std::string, entry> m_keys;
+    std::unordered_map<std::string, entry, string_hash, string_equal> m_keys;
 };
 
 // A signed token's claims, read back: strings, numbers as their text, and booleans as "true" or "false".

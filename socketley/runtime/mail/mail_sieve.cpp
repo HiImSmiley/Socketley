@@ -12,6 +12,7 @@
 #include "../../shared/http/url.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/regex.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail::sieve
 {
@@ -2342,7 +2343,7 @@ struct runner
     size_t added{0};
     std::deque<std::string> owned;
     std::vector<std::pair<std::string, uint32_t>> seen_ids;
-    std::unordered_map<std::string, std::unique_ptr<socketley::regex>> regexes;
+    std::unordered_map<std::string, std::unique_ptr<socketley::regex>, string_hash, string_equal> regexes;
 
     bool headers_read{false};
     std::vector<std::pair<std::string_view, std::string_view>> headers;
@@ -2354,7 +2355,7 @@ struct runner
     std::vector<std::string> texts;
     // The parts body :content took, by the types it named.
     std::vector<std::pair<std::string, std::vector<std::string>>> contents;
-    std::unordered_map<std::string, glob_pat> globs;
+    std::unordered_map<std::string, glob_pat, string_hash, string_equal> globs;
     std::vector<std::pair<size_t, size_t>> caps;
 
     bool fail(int line, std::string_view why)

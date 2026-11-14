@@ -17,6 +17,7 @@
 #include "../../shared/util/byte_codec.h"
 #include "../../shared/util/crc.h"
 #include "metrics_chunk.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::metrics
 {
@@ -386,7 +387,7 @@ struct block_writer::impl
     bool failed{false};
     int err{0};
 
-    std::unordered_map<std::string, uint32_t> syms;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> syms;
     std::vector<const std::string*> sym_list;
 
     bool pending{false};

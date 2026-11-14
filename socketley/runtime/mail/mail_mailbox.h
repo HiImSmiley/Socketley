@@ -13,6 +13,7 @@
 #include "mail_account.h"
 #include "mail_spool.h"
 #include "../../shared/ipc/request_channel.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -94,11 +95,11 @@ private:
     std::string m_idp;
     bool m_bucket_made{false};
     std::vector<std::function<void(bool)>> m_bucket_waiting;
-    std::unordered_map<std::string, known> m_known;
+    std::unordered_map<std::string, known, string_hash, string_equal> m_known;
     // Who waits on a lookup already out for a name, so a burst to one mailbox asks the idp once and not per message.
-    std::unordered_map<std::string, std::vector<std::function<void(account, std::string, std::string)>>> m_finding;
+    std::unordered_map<std::string, std::vector<std::function<void(account, std::string, std::string)>>, string_hash, string_equal> m_finding;
     uint64_t m_lookups{0};
-    std::unordered_map<std::string, uint64_t> m_quota;
+    std::unordered_map<std::string, uint64_t, string_hash, string_equal> m_quota;
     uint64_t m_stored{0};
     uint64_t m_store_failures{0};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};

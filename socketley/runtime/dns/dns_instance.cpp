@@ -45,6 +45,7 @@
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::dns
 {
@@ -141,7 +142,7 @@ std::vector<std::string> split_csv(std::string_view s)
 using zone_signer = std::function<bool(zone&, std::string&)>;
 
 // The zones a reload takes as they are, by their file, since neither the file nor what the feed gives them changed.
-using zone_reuse = std::unordered_map<std::string, std::shared_ptr<const zone>>;
+using zone_reuse = std::unordered_map<std::string, std::shared_ptr<const zone>, string_hash, string_equal>;
 
 // Every zone of `paths`, read and checked, one apex each, and signed by `sign` where it is given, or taken from
 // `reuse`; false with the reason.
@@ -449,8 +450,8 @@ private:
     int64_t m_last_sweep{0};
     // With --dnssec, what signs each zone as it is loaded, and the key of each by its apex.
     zone_signer m_signer;
-    std::unordered_map<std::string, zone_key> m_keys;
-    std::unordered_map<std::string, signature_cache> m_sig_cache;
+    std::unordered_map<std::string, zone_key, string_hash, string_equal> m_keys;
+    std::unordered_map<std::string, signature_cache, string_hash, string_equal> m_sig_cache;
     std::atomic<uint64_t> m_sigs_made{0};
     std::atomic<uint64_t> m_sigs_kept{0};
 
@@ -473,7 +474,7 @@ private:
     static void read_zones(reload_job& j, const zone_signer* sign);
     std::unique_ptr<reload_job> m_reload;
     // A file that is no zone, as it stood when read, so it is not read again until it changes.
-    std::unordered_map<std::string, socketley::file_stamp> m_broken;
+    std::unordered_map<std::string, socketley::file_stamp, string_hash, string_equal> m_broken;
     // The zone sets a reload replaced, let go of off the loop.
     std::thread m_retire;
     int m_wake_fd{-1};

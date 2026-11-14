@@ -46,6 +46,7 @@ namespace
 {
 
 #include "storage_ui_page.inc"
+#include "../../shared/util/transparent_string.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -1766,7 +1767,7 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
     const bool admin = c->user->admin;
     const int64_t now = wall::now_ms();
     // Each user's key count from one pass over the keys, not one pass per user.
-    std::unordered_map<std::string, size_t> keys_of;
+    std::unordered_map<std::string, size_t, string_hash, string_equal> keys_of;
     if (admin)
         for (const auto& [id, k] : st.keys)
             ++keys_of[k.user];

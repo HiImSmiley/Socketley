@@ -37,6 +37,7 @@
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
 #include "../../shared/util/text_list.h"
+#include "../../shared/util/transparent_string.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -2820,7 +2821,7 @@ void storage_run::tend_sync_runners()
     // Which runtimes --sync wants, by name, each with the user its file is for -- or empty for active's one runtime,
     // whose file carries every user.  never wants none, and the removal at the end takes away whatever an earlier
     // setting made, so changing the setting needs nothing beyond a restart.
-    std::unordered_map<std::string, std::string> want;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> want;
     if (m_sync_runners == sync_runners::per_user)
         for (const auto& id : people)
             want.emplace(sync_runner_name(id), id);
@@ -2968,7 +2969,7 @@ void storage_run::tend_sync_runners()
     }
     // And every credentials file no wanted runtime reads goes too: they hold live session tokens, and a runtime
     // found again after a restart does not say whose file it had.
-    std::unordered_set<std::string> keep;
+    std::unordered_set<std::string, string_hash, string_equal> keep;
     for (const auto& [name, user] : want)
         keep.insert(user.empty() ? sync_runner_file_all() : sync_runner_file(user));
     if (DIR* d = ::opendir(dir.c_str()))

@@ -52,6 +52,7 @@ namespace lua_tick
 
 #include "../http/route_table.h"
 #include "../cluster/cluster_view.h"
+#include "../util/transparent_string.h"
 
 class runtime_instance;
 
@@ -605,7 +606,7 @@ private:
     };
 
     // Cross-runtime pub/sub: key = cache_name + '\0' + channel
-    std::unordered_map<std::string, std::vector<subscription>> m_subscriptions;
+    std::unordered_map<std::string, std::vector<subscription>, string_hash, string_equal> m_subscriptions;
 
     // id to key, so unsubscribe() is one lookup rather than a walk, and a
     // stale id names nothing because ids are never reused.

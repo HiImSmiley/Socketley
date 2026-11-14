@@ -22,6 +22,7 @@
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/net/async_resolver.h"
 #include "../../shared/net/tunnel_mux.h"
+#include "../../shared/util/transparent_string.h"
 
 class tunnel_instance;
 class proxy_auth;
@@ -311,9 +312,9 @@ private:
     std::vector<std::unique_ptr<leg_hooks>> m_retired;
     std::vector<agent> m_agents;
     int64_t m_agents_mtime{-1};
-    std::unordered_map<std::string, std::weak_ptr<link>> m_agent_links;
+    std::unordered_map<std::string, std::weak_ptr<link>, string_hash, string_equal> m_agent_links;
     // Per agent and address refused: when it was last said, and how often since; cleared past 256, as a stranger names any.
-    std::unordered_map<std::string, std::pair<int64_t, uint64_t>> m_refused;
+    std::unordered_map<std::string, std::pair<int64_t, uint64_t>, string_hash, string_equal> m_refused;
     // People's shares by name: whose they are, until when, and the link carrying them once it is up.
     struct share_entry
     {
@@ -340,7 +341,7 @@ private:
         std::string agent;
         service svc;
         std::unique_ptr<udp_port> port;
-        std::unordered_map<std::string, uint32_t> by_peer;
+        std::unordered_map<std::string, uint32_t, string_hash, string_equal> by_peer;
         std::unordered_map<uint32_t, udp_flow> flows;
     };
     std::map<std::string, udp_service> m_udp;
@@ -358,7 +359,7 @@ private:
     // The agent's connection to the edge and its dialler of offers.
     std::unique_ptr<upstream_hooks> m_up;
     std::unique_ptr<leg_hooks> m_local;
-    std::unordered_map<std::string, std::string> m_offers;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> m_offers;
     std::string m_scheme, m_host, m_path_host;
     uint16_t m_port{0};
     tls_context m_tls;

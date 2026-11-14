@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -42,7 +43,7 @@ private:
     std::string m_path;
     int64_t m_delay_ms;
     std::mutex m_mu;
-    std::unordered_map<std::string, entry> m_entries;
+    std::unordered_map<std::string, entry, string_hash, string_equal> m_entries;
     uint64_t m_ino{0}, m_read{0}, m_lines{0};
 };
 

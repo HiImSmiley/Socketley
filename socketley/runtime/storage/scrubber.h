@@ -19,6 +19,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::storage
 {
@@ -104,7 +105,7 @@ private:
     bool          m_stopped{false};
     int64_t       m_saved_ms{0};
     // The corrupt copies already told, by bucket, key, version and time, so a pass after tells only new ones.
-    std::unordered_set<std::string> m_told;
+    std::unordered_set<std::string, string_hash, string_equal> m_told;
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
 };
 

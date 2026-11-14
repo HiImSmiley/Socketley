@@ -15,6 +15,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../idp/idp_session.h"
+#include "../../shared/util/transparent_string.h"
 
 class mcp_instance;
 
@@ -75,7 +76,7 @@ private:
     std::vector<resource_def> m_resources;
     std::vector<prompt_def> m_prompts;
     size_t m_declared_seen{SIZE_MAX};
-    std::unordered_map<std::string, key> m_keys;
+    std::unordered_map<std::string, key, string_hash, string_equal> m_keys;
     socketley::http::key_bar m_wrong_keys;
     // The address its tokens name, and what verifies the idp's sign-ins against it.
     std::string m_resource;

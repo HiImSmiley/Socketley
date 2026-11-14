@@ -16,6 +16,7 @@
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -3569,7 +3570,7 @@ void imap_session::notify_changes(bool all)
         return ev;
     };
     const auto folders = m_store.known(m_user);
-    std::unordered_map<std::string, notify_seen> now;
+    std::unordered_map<std::string, notify_seen, string_hash, string_equal> now;
     for (const auto& f : folders)
     {
         if (f == m_folder)

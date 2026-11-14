@@ -56,6 +56,7 @@
 #include "../../shared/loop/ring_read.h"
 #include "../../shared/http/http_framing.h"
 #include "../../shared/crypto/tls_context.h"
+#include "../../shared/util/transparent_string.h"
 
 // ngtcp2's packet header, named by an HTTP/3 member without its header.
 struct ngtcp2_pkt_hd;
@@ -1080,7 +1081,7 @@ public:
         int64_t ms{0};
         std::chrono::steady_clock::time_point at{};
     };
-    std::unordered_map<std::string, session_floor> m_floors;
+    std::unordered_map<std::string, session_floor, string_hash, string_equal> m_floors;
     int64_t sessions_since(const std::string& who);
     void ui_progress(const std::shared_ptr<conn>& c);
     void ui_progress_body(const std::shared_ptr<conn>& c);
@@ -1100,7 +1101,7 @@ public:
     // When and where the photos directly in a folder were taken, as their EXIF says, /~ui/taken; what was read is kept
     // by bucket, key and ETag, a shard's own.
     void ui_taken(const std::shared_ptr<conn>& c);
-    std::unordered_map<std::string, photo_facts> m_taken;
+    std::unordered_map<std::string, photo_facts, string_hash, string_equal> m_taken;
     void ui_usage_body(const std::shared_ptr<conn>& c);
     // A library's size summed from its listing, kept a minute: the bytes, the objects, and whether it was too large
     // to list whole.
@@ -1110,7 +1111,7 @@ public:
         bool     partial{false};
         std::chrono::steady_clock::time_point at{};
     };
-    std::unordered_map<std::string, usage_count> m_usage;
+    std::unordered_map<std::string, usage_count, string_hash, string_equal> m_usage;
     void ui_access_body(const std::shared_ptr<conn>& c);
     void ui_library_body(const std::shared_ptr<conn>& c);
     // GET lists the git repositories the user keeps here (an admin: all), each with how its last run ended, whether
@@ -1408,7 +1409,7 @@ public:
     sync_runners m_sync_runners{sync_runners::never};
     int64_t m_runners_at{0};
     std::string m_git_endpoint;
-    std::unordered_map<std::string, std::string> m_runners;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> m_runners;
     // Moves the pass on by a bounded step: deletes up to the in-flight cap, and a bounded walk to find more.
     void lifecycle_pump();
     // A bucket's rules changed, so a pass runs soon.
@@ -1503,7 +1504,7 @@ private:
     std::chrono::steady_clock::time_point m_last_reap{};
     // How many links that burn the last look found, the ones this shard is removing for, and the next look.
     size_t            m_burns{0};
-    std::unordered_set<std::string> m_burning;
+    std::unordered_set<std::string, string_hash, string_equal> m_burning;
     std::chrono::steady_clock::time_point m_burn_next{};
     // Whether every link has been looked over once for one with no marks, as an older build made them.
     bool              m_links_marked{false};
@@ -1605,9 +1606,9 @@ private:
     void media_watch_exit(pid_t pid);
     bool media_exit_done(io_request* req);
     // What this shard knows of the cache without asking the disk again: probes, renditions whole, uses written.
-    std::unordered_map<std::string, std::shared_ptr<const media_probe>> m_media_probes;
-    std::unordered_set<std::string> m_media_done;
-    std::unordered_map<std::string, int64_t> m_media_touched;
+    std::unordered_map<std::string, std::shared_ptr<const media_probe>, string_hash, string_equal> m_media_probes;
+    std::unordered_set<std::string, string_hash, string_equal> m_media_done;
+    std::unordered_map<std::string, int64_t, string_hash, string_equal> m_media_touched;
     // An unencrypted object's open file, which ffmpeg reads as its own fd 3 rather than over the listener.
     struct media_src
     {
@@ -1615,7 +1616,7 @@ private:
         uint64_t off{0}, len{0};
         int64_t  used_ms{0};
     };
-    std::unordered_map<std::string, media_src> m_media_srcs;
+    std::unordered_map<std::string, media_src, string_hash, string_equal> m_media_srcs;
     int64_t     m_media_evicted_ms{0};
     bool        m_media_dir_ready{false};
     // ffmpeg's path, looked up at the first media request; empty when there is none.
@@ -1703,7 +1704,7 @@ private:
         uint64_t    ticket{0};
         int64_t     touched_ms{0};
     };
-    std::unordered_map<std::string, std::shared_ptr<rpc_stream>> m_rpc_streams;
+    std::unordered_map<std::string, std::shared_ptr<rpc_stream>, string_hash, string_equal> m_rpc_streams;
     void pump_stream(const std::string& id);
     void end_stream(const std::string& id, st s, const put_result* pr);
     void sweep_streams();

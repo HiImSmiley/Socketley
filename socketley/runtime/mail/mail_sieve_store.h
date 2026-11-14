@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "mail_sieve.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -95,7 +96,7 @@ private:
     // `read` bytes, the inode it was read from, and the lines the file holds past what is live.
     struct memory
     {
-        std::unordered_map<std::string, int64_t> until;
+        std::unordered_map<std::string, int64_t, string_hash, string_equal> until;
         uint64_t ino{0}, read{0}, lines{0};
     };
     // Whether `key` is live in `kind`, after the lines other shards appended are read in; false with `ok` cleared
@@ -105,9 +106,9 @@ private:
     memory& memory_of(const std::string& user, const char* kind);
 
     std::mutex m_mu;
-    std::unordered_map<std::string, compiled> m_cache;
-    std::unordered_map<std::string, compiled> m_named;
-    std::unordered_map<std::string, memory> m_memory;
+    std::unordered_map<std::string, compiled, string_hash, string_equal> m_cache;
+    std::unordered_map<std::string, compiled, string_hash, string_equal> m_named;
+    std::unordered_map<std::string, memory, string_hash, string_equal> m_memory;
 };
 
 }   // namespace socketley::mail

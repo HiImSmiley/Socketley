@@ -122,7 +122,7 @@ private:
         std::unique_ptr<node> plus;
         std::unique_ptr<node> hash;
         std::vector<member> plain;
-        std::unordered_map<std::string, group_set> groups;
+        std::unordered_map<std::string, group_set, string_hash, string_equal> groups;
         bool empty() const { return children.empty() && !plus && !hash && plain.empty() && groups.empty(); }
     };
 

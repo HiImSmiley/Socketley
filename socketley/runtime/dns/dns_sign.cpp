@@ -8,6 +8,7 @@
 
 #include "dns_wire.h"
 #include "../../shared/crypto/jws.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::dns
 {
@@ -88,7 +89,7 @@ bool occluded(const zone& z, std::string_view name)
 // The RRSIG of `s` at `owner`, its fields and the signature over them and the set in canonical form (RFC 4034 3.1.8.1).
 bool sign_set(std::string_view owner, const rrset& s, std::string_view origin, const zone_key& key, uint32_t inception,
               uint32_t expiration, std::string& out, signature_cache* cache,
-              std::unordered_map<std::string, std::string>& next)
+              std::unordered_map<std::string, std::string, string_hash, string_equal>& next)
 {
     std::string rd;
     put16(rd, s.type);
@@ -246,7 +247,7 @@ bool sign_zone(zone& z, const zone_key& key, int64_t now_s, signature_cache* cac
         nd.sets.push_back({type_sec::NSEC, z.negative_ttl, {std::move(rd)}});
     }
     // Every set signed but a cut's NS, which is the child's to sign.
-    std::unordered_map<std::string, std::string> next;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> next;
     for (const auto& name : owners)
     {
         node& nd = z.names[name];

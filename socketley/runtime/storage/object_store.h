@@ -58,6 +58,7 @@
 #include "../../shared/loop/file_io.h"
 #include "../../shared/ipc/cache_shard_map.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::storage
 {
@@ -1071,7 +1072,7 @@ private:
         uint64_t    bytes{0};
         journal     j;
         // Keys with a commit in flight, and what waits behind each.
-        std::unordered_map<std::string, std::vector<std::function<void()>>> lanes;
+        std::unordered_map<std::string, std::vector<std::function<void()>>, string_hash, string_equal> lanes;
         uint32_t    active_puts{0};
         uint32_t    active_ops{0};
         bool        closing{false};
@@ -1188,7 +1189,7 @@ private:
     // The rest of a pooled commit once its rename is done: the answer, then the syncs.
     void commit_pooled(bucket& b, const commit_ptr& c, int leaf);
     // `versioned` keeps the version a pool file replaces, as a versioned commit would have.
-    uint64_t roll_forward_pooled(bucket& b, std::unordered_set<std::string>& keep, bool versioned);
+    uint64_t roll_forward_pooled(bucket& b, std::unordered_set<std::string, string_hash, string_equal>& keep, bool versioned);
     void compact_step(std::shared_ptr<bool> alive, const std::string& name);
     void compact_finish(const std::string& name, bool ok);
 
@@ -1280,7 +1281,7 @@ private:
     int           m_lock_fd{-1};
     std::map<std::string, std::unique_ptr<bucket>, std::less<>> m_buckets;
     // The buckets being made, each with the creates that came while it was.
-    std::unordered_map<std::string, std::vector<std::function<void(st)>>> m_creating;
+    std::unordered_map<std::string, std::vector<std::function<void(st)>>, string_hash, string_equal> m_creating;
     shard_peers* m_peers{nullptr};
     hash_pool*   m_hash{nullptr};
     std::function<bool(std::string_view)> m_drop_guard;
@@ -1294,7 +1295,7 @@ private:
     bool         m_mirror{false};
     // The removals note_removed() keeps, by bucket NUL key NUL id, each with when it was noted, and in that order; the
     // file they are noted in, and how many were noted there since it was last written whole.
-    std::unordered_map<std::string, std::pair<int64_t, int64_t>> m_removed;
+    std::unordered_map<std::string, std::pair<int64_t, int64_t>, string_hash, string_equal> m_removed;
     std::deque<std::pair<int64_t, std::string>> m_removed_order;
     int          m_removed_fd{-1};
     uint64_t     m_removed_appends{0};
@@ -1321,7 +1322,7 @@ private:
     std::string m_kill_after_event;
     std::string m_hold_confirm;
     // What a start's roll forward found at a key's path before it and moved there, null for nothing, by bucket NUL key.
-    std::unordered_map<std::string, std::vector<std::shared_ptr<const object_meta>>> m_rolled_over;
+    std::unordered_map<std::string, std::vector<std::shared_ptr<const object_meta>>, string_hash, string_equal> m_rolled_over;
 
     struct hot_entry
     {
@@ -1354,7 +1355,7 @@ private:
         uint64_t    data_off{0};
         object_meta meta;
     };
-    std::unordered_map<std::string, kept_file> m_kept;
+    std::unordered_map<std::string, kept_file, string_hash, string_equal> m_kept;
     // A bound on the descriptors this holds, as the server's and the FastCGI proxy's.
     static constexpr size_t kept_max = 256;
     void kept_drop(std::string_view bucket, std::string_view key);

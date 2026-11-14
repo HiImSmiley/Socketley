@@ -1103,7 +1103,7 @@ private:
     // `retry_failed` on the sweep tick only: a name that did not resolve is not asked again on every membership
     // change, where each ask would hold the loop for the resolver's whole timeout.
     void resolve_group_hosts(bool retry_failed = true);
-    std::unordered_set<std::string> m_group_failed;
+    std::unordered_set<std::string, string_hash, string_equal> m_group_failed;
     // The one place a member's nodes are chosen over its port, appended to
     // `out` because a sharded member is N dial targets.
     void member_dial(const runtime_endpoint& ep, std::vector<resolved_backend>& out) const;
@@ -1407,7 +1407,7 @@ private:
     // "*.ui.example.com" kept as ".ui.example.com", longest first, so the most
     // specific wildcard answers.
     std::vector<std::pair<std::string, entrance_route>> m_entrance_wild;
-    std::unordered_map<std::string, uint32_t> m_entrance_addr;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> m_entrance_addr;
     std::optional<socketley::file_stamp> m_entrance_stamp;
     std::chrono::steady_clock::time_point m_entrance_checked{};
     // What this entrance writes into Via and looks for there, so a request
@@ -1763,11 +1763,11 @@ private:
     // Addresses for group members advertised by name, keyed by host with the
     // port applied at selection, pruned to the size of the membership rather
     // than of its history.
-    std::unordered_map<std::string, in_addr> m_group_addr;
+    std::unordered_map<std::string, in_addr, string_hash, string_equal> m_group_addr;
     // Members whose address failed, looked up again past the resolver's cache while the old one stays in use.
-    std::unordered_set<std::string> m_group_recheck;
+    std::unordered_set<std::string, string_hash, string_equal> m_group_recheck;
     // Nodes already announced in the log, so a republish does not repeat them.
-    std::unordered_set<std::string> m_group_nodes_said;
+    std::unordered_set<std::string, string_hash, string_equal> m_group_nodes_said;
     // Some member did not resolve, so the idle sweep has a reason to run and
     // to keep running.
     bool m_group_unresolved = false;

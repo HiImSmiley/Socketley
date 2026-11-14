@@ -14,6 +14,7 @@
 #include <limits>
 #include <numbers>
 #include <unordered_map>
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::metrics
 {
@@ -134,7 +135,7 @@ bool grouped(const expr_node& e, const label& l)
 
 // The group of a series with labels `ls` under aggregation `e`, made when new; `skip` names a label left out.
 uint32_t group_of(const expr_node& e, const label_set& ls, std::string_view skip,
-                  std::unordered_map<std::string, uint32_t>& groups, std::vector<label_set>& glabels, std::string& key)
+                  std::unordered_map<std::string, uint32_t, string_hash, string_equal>& groups, std::vector<label_set>& glabels, std::string& key)
 {
     key.clear();
     for (const auto& l : ls)
@@ -1161,7 +1162,7 @@ struct evaluator::fold
 
     const expr_node& e;
     agg_op op;
-    std::unordered_map<std::string, uint32_t> groups;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> groups;
     std::vector<label_set> glabels;
     // Per group, its state and whether it has one at each step, at [group * steps + step].
     std::vector<agg_state> st;
@@ -1541,7 +1542,7 @@ std::string evaluator::signature(const label_set& ls, bool on, const std::vector
 
 value evaluator::set_op(const expr_node& e, value& l, value& r)
 {
-    std::unordered_map<std::string, uint32_t> sigs;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> sigs;
     auto sig_of = [&](const label_set& ls) {
         return sigs.try_emplace(signature(ls, e.on, e.match_labels), static_cast<uint32_t>(sigs.size()))
             .first->second;
@@ -1597,7 +1598,7 @@ value evaluator::vector_op(const expr_node& e, value& l, value& r)
     // The many side, and the one side each of its series is matched against; for one-to-one simply left and right.
     std::vector<vseries>& many = swap ? r.vec : l.vec;
     std::vector<vseries>& one = swap ? l.vec : r.vec;
-    std::unordered_map<std::string, uint32_t> sigs;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> sigs;
     auto sig_of = [&](const label_set& ls) {
         return sigs.try_emplace(signature(ls, e.on, e.match_labels), static_cast<uint32_t>(sigs.size()))
             .first->second;
@@ -1614,7 +1615,7 @@ value evaluator::vector_op(const expr_node& e, value& l, value& r)
     value out;
     out.type = V::vector;
     std::unordered_map<uint64_t, uint32_t> pairs;
-    std::unordered_map<std::string, uint32_t> by_labels;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> by_labels;
     std::vector<int64_t> written_at;
     std::vector<uint32_t> written_sig;
     std::string key;
@@ -1795,7 +1796,7 @@ value evaluator::aggregate(const expr_node& e)
             throw eval_fail{"execution", "invalid label name \"" + value_label + "\""};
     }
 
-    std::unordered_map<std::string, uint32_t> groups;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> groups;
     std::vector<uint32_t> gid(in.vec.size());
     std::vector<label_set> glabels;
     std::string key;
@@ -1877,7 +1878,7 @@ value evaluator::aggregate(const expr_node& e)
     if (op == agg_op::count_values)
     {
         const std::string& lname = value_label;
-        std::unordered_map<std::string, uint32_t> outs;
+        std::unordered_map<std::string, uint32_t, string_hash, string_equal> outs;
         std::string text;
         for (size_t k = 0; k < m_n; ++k)
         {
@@ -2265,7 +2266,7 @@ value evaluator::histogram_quantile(const expr_node& e)
 {
     value q = eval(*e.args[0]);
     value in = eval(*e.args[1]);
-    std::unordered_map<std::string, uint32_t> groups;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> groups;
     std::vector<int64_t> gid(in.vec.size(), -1);
     std::vector<double> les(in.vec.size(), 0);
     std::vector<label_set> glabels;

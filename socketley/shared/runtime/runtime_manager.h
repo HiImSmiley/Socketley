@@ -13,6 +13,7 @@
 #include <atomic>
 
 #include "runtime_instance.h"
+#include "../util/transparent_string.h"
 // runtime_string_hash / runtime_string_equal live here now, with the table
 // whose lookups they exist for.
 #include "../net/endpoint_table.h"
@@ -268,7 +269,7 @@ private:
     // The names one cascade has already descended into, threaded through
     // rather than a member, so two cascades share no state and the public
     // entry points stay re-entrant.
-    using cascade_seen = std::unordered_set<std::string>;
+    using cascade_seen = std::unordered_set<std::string, string_hash, string_equal>;
 
     // The recursive halves of stop()/stop_children()/remove_children(), which
     // the public spellings call with an empty set.

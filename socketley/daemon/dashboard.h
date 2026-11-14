@@ -17,6 +17,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include "../shared/util/transparent_string.h"
 
 class proxy_auth;
 class runtime_instance;
@@ -28,7 +29,7 @@ namespace dashboard
 struct request
 {
     std::string method, path, query, body, peer;
-    std::unordered_map<std::string, std::string> headers;   // names lower case
+    std::unordered_map<std::string, std::string, string_hash, string_equal> headers;   // names lower case
     std::string_view header(std::string_view name) const;
     // Who sent it: the peer, or behind a proxy on this machine the address that proxy put last in X-Forwarded-For.
     std::string client() const;
@@ -98,7 +99,7 @@ private:
         int64_t expires{0};
     };
     mutable std::mutex m_sessions_mutex;
-    mutable std::unordered_map<std::string, open_session> m_sessions;
+    mutable std::unordered_map<std::string, open_session, string_hash, string_equal> m_sessions;
     runtime_manager& m_manager;
 };
 

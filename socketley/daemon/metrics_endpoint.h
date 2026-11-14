@@ -13,6 +13,7 @@
 
 #include "../shared/runtime/metric_catalog.h"
 #include "dashboard.h"
+#include "../shared/util/transparent_string.h"
 
 class runtime_manager;
 
@@ -40,7 +41,7 @@ public:
     struct fact_cache
     {
         // Each certificate's end in seconds since the epoch, INT64_MIN when it cannot be read, and when it was read.
-        std::unordered_map<std::string, std::pair<int64_t, int64_t>> certs;
+        std::unordered_map<std::string, std::pair<int64_t, int64_t>, string_hash, string_equal> certs;
         // Each storage directory's mirrors: the runtime, the repository's name and id, and whether its last pull failed.
         struct mirror
         {

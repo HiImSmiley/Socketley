@@ -9,6 +9,7 @@
 #include "mail_mime.h"
 #include "smtp_session.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail::imap_order
 {
@@ -485,7 +486,7 @@ void prune(std::vector<node*>& level, node* parent)
 std::string references(std::vector<entry> v)
 {
     std::vector<std::unique_ptr<node>> all;
-    std::unordered_map<std::string, node*> by_id;
+    std::unordered_map<std::string, node*, string_hash, string_equal> by_id;
     const auto get = [&](const std::string& id) {
         node*& n = by_id[id];
         if (!n)

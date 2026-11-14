@@ -10,6 +10,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -17,7 +18,7 @@ namespace socketley::mail
 struct alias_table
 {
     // The targets of an address, in lower case; for a catch-all the key is "*@domain".
-    std::unordered_map<std::string, std::vector<std::string>> map;
+    std::unordered_map<std::string, std::vector<std::string>, string_hash, string_equal> map;
 
     bool parse(std::string_view text, std::string& why);
     // The targets of `addr`, then of its domain's catch-all; null when neither is there.

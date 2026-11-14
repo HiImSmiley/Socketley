@@ -55,6 +55,7 @@
 #include "../../shared/util/text_list.h"
 #include "../../shared/util/settings.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -599,9 +600,9 @@ namespace
 {
 
 // An address list as its file holds it: an address and when it went in, a line each.
-std::unordered_map<std::string, int64_t> parse_list(std::string_view text, int64_t now_s)
+std::unordered_map<std::string, int64_t, string_hash, string_equal> parse_list(std::string_view text, int64_t now_s)
 {
-    std::unordered_map<std::string, int64_t> out;
+    std::unordered_map<std::string, int64_t, string_hash, string_equal> out;
     while (!text.empty())
     {
         const std::string_view line = socketley::take_item(text, '\n');
@@ -629,7 +630,7 @@ void mail_run::load_list(address_list& l)
     std::string text;
     if (!socketley::read_file(l.path, text, {.missing_ok = true}, nullptr))
         return;
-    std::unordered_set<std::string> got;
+    std::unordered_set<std::string, string_hash, string_equal> got;
     for (auto& [a, at] : parse_list(text, wall::now_ms() / 1000))
         got.insert(a);
     l.set = std::move(got);
@@ -642,7 +643,7 @@ void mail_run::edit_list(address_list& l, std::vector<std::string> add, std::vec
     for (const auto& a : remove)
         l.set.erase(a);
     // Read, merged and written under a lock of the file, so two shards' changes are both kept; never on the loop.
-    auto result = std::make_shared<std::unordered_set<std::string>>();
+    auto result = std::make_shared<std::unordered_set<std::string, string_hash, string_equal>>();
     auto why = std::make_shared<std::string>();
     auto stamp = std::make_shared<socketley::file_stamp>();
     const std::string path = l.path;
@@ -654,7 +655,7 @@ void mail_run::edit_list(address_list& l, std::vector<std::string> add, std::vec
                       const int64_t now_s = socketley::wall::now_ms() / 1000;
                       auto all = socketley::read_file(path, text, {.missing_ok = true}, nullptr)
                                      ? parse_list(text, now_s)
-                                     : std::unordered_map<std::string, int64_t>{};
+                                     : std::unordered_map<std::string, int64_t, string_hash, string_equal>{};
                       if (keep_s)
                           std::erase_if(all, [now_s, keep_s](const auto& kv) { return now_s - kv.second > keep_s; });
                       for (const auto& a : add)

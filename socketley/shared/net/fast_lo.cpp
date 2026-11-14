@@ -31,6 +31,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "../util/transparent_string.h"
 
 namespace socketley {
 
@@ -915,7 +916,7 @@ public:
     }
 
     // Every pair at once, from a sweep; a sweep that failed raises the flag.
-    void replace(std::unordered_map<std::string, uint64_t>&& held, uint64_t sum, bool failed)
+    void replace(std::unordered_map<std::string, uint64_t, string_hash, string_equal>&& held, uint64_t sum, bool failed)
     {
         std::lock_guard<std::mutex> g(m_mu);
         m_held = std::move(held);
@@ -937,7 +938,7 @@ private:
 
     const recon_args m_a;
     std::mutex m_mu;
-    std::unordered_map<std::string, uint64_t> m_held;
+    std::unordered_map<std::string, uint64_t, string_hash, string_equal> m_held;
     uint64_t m_sum{0};
     uint64_t m_over{UINT64_MAX};   // unknown, so the first publish always writes
 };
@@ -1000,7 +1001,7 @@ static void sweep_loop(const recon_args& a, ledger& book)
     pfd.events = POLLIN;
     while (::poll(&pfd, 1, SWEEP_MS) == 0)
     {
-        std::unordered_map<std::string, uint64_t> held;
+        std::unordered_map<std::string, uint64_t, string_hash, string_equal> held;
         uint64_t sum = 0, on = 0, tcp = 0;
         bool failed = nl < 0;
         uint8_t in_batch[SKL_KEY], out_batch[SKL_KEY];

@@ -28,6 +28,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::storage
 {
@@ -244,7 +245,7 @@ private:
         bool again{false};
         std::vector<std::shared_ptr<job>> active;
         // The keys of the copies in flight, by bucket NUL key, and whether one of them is a bucket's change.
-        std::unordered_set<std::string> busy;
+        std::unordered_set<std::string, string_hash, string_equal> busy;
         bool        barrier{false};
         uint32_t    failures{0};
         std::chrono::steady_clock::time_point next_try{};
@@ -361,9 +362,9 @@ private:
     uint64_t      m_pending{0};
     uint64_t      m_node_pending{0};
     // Destinations still to take each version, by bucket, key and version id, so its status is written once.
-    std::unordered_map<std::string, uint32_t> m_open;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> m_open;
     // The versions a destination refused while others were still to copy them.
-    std::unordered_set<std::string> m_refused;
+    std::unordered_set<std::string, string_hash, string_equal> m_refused;
     // The copies of each change staged and not yet settled, by ticket.
     struct staged_copies
     {

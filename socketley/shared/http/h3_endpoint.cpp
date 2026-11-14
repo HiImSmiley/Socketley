@@ -38,6 +38,7 @@
 #include "../crypto/tls_context.h"
 #include "../util/number_parse.h"
 #include "../util/settings.h"
+#include "../util/transparent_string.h"
 
 #ifndef UDP_SEGMENT
 #define UDP_SEGMENT 103
@@ -164,7 +165,7 @@ struct endpoint
     alignas(cmsghdr) char cbuf[256]{};
     std::vector<uint8_t> rbuf = std::vector<uint8_t>(rx_buf);
     std::vector<uint8_t> txbuf = std::vector<uint8_t>(gso_burst * max_udp_payload);
-    std::unordered_map<std::string, std::shared_ptr<conn>> by_cid;
+    std::unordered_map<std::string, std::shared_ptr<conn>, string_hash, string_equal> by_cid;
     std::vector<std::shared_ptr<conn>> conns;
     // The connections each client address holds, kept where conns is.
     std::unordered_map<uint32_t, size_t> per_address;

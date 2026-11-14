@@ -17,6 +17,7 @@
 #include "imap_store.h"
 #include "mail_account.h"
 #include "../../shared/json/json_doc.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -171,7 +172,7 @@ private:
         };
         std::vector<said> answers;
         // What the request created, by its creation id.
-        std::unordered_map<std::string, std::string> created;
+        std::unordered_map<std::string, std::string, string_hash, string_equal> created;
         // The request's own createdIds, given back with what it made added.
         bool echo_created{false};
     };
@@ -239,7 +240,7 @@ private:
     int64_t m_last_sent_ms{0};
     bool m_close_after_state{false};
     // Emails by id, built once a request from the index.
-    std::unordered_map<std::string, std::pair<std::shared_ptr<imap_folder>, uint32_t>> m_ids;
+    std::unordered_map<std::string, std::pair<std::shared_ptr<imap_folder>, uint32_t>, string_hash, string_equal> m_ids;
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
 };
 

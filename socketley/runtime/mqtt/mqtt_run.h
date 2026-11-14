@@ -30,6 +30,7 @@
 #include "../../shared/loop/hash_pool.h"
 #include "../../shared/loop/write_queue.h"
 #include "../../shared/net/failure_bar.h"
+#include "../../shared/util/transparent_string.h"
 
 class mqtt_instance;
 class tls_context;
@@ -390,7 +391,7 @@ private:
     {
         std::unordered_map<std::string, size_t, string_hash, string_equal> held;
         // The clients it holds a session of, so a clean start asks only the shards that may have one to end.
-        std::unordered_set<std::string> clients;
+        std::unordered_set<std::string, string_hash, string_equal> clients;
         bool known{false};
         // The start its batches are numbered from, and the number of the next frame owed from it.
         uint64_t epoch{0};
@@ -410,7 +411,7 @@ private:
     // The shard each batch not yet receipted went to, by cookie.
     std::unordered_map<uint64_t, uint32_t> m_shard_batches;
     // Each retained topic's last change by its stamp, for as long as an older one could still be on its way.
-    std::unordered_map<std::string, uint64_t> m_retained_stamps;
+    std::unordered_map<std::string, uint64_t, string_hash, string_equal> m_retained_stamps;
     uint64_t m_shard_dropped{0};
     uint64_t m_shard_resent{0};
     // The shared groups this message's delivery chose another shard for, filled while it is routed here.
@@ -465,7 +466,7 @@ private:
     std::unordered_map<uint64_t, std::pair<std::string, uint32_t>> m_late_claims;
     // A client whose claim here lost to a newer connection: the shard that has it, and until when a session that still
     // comes here for it is handed there.
-    std::unordered_map<std::string, std::pair<uint32_t, int64_t>> m_pass_on;
+    std::unordered_map<std::string, std::pair<uint32_t, int64_t>, string_hash, string_equal> m_pass_on;
     // Questions a starting shard asked, by cookie: of which shard, and whether for its retained messages.
     std::unordered_map<uint64_t, std::pair<uint32_t, bool>> m_dump_asks;
     // When to ask again for the retained messages a starting shard did not get, 0 when it is not owed.
@@ -503,7 +504,7 @@ private:
         std::vector<std::pair<uint64_t, uint64_t>> marks;
     };
     std::vector<moved_session> m_moved;
-    std::unordered_set<std::string> m_unsaid;
+    std::unordered_set<std::string, string_hash, string_equal> m_unsaid;
     // Each message accepted here is numbered, under m_shard_epoch.
     uint64_t m_msg_seq{0};
     // The newest message each shard delivered here, as its start and number.
@@ -515,7 +516,7 @@ private:
         std::vector<std::pair<uint64_t, uint64_t>> marks;
         int64_t until{0};
     };
-    std::unordered_map<std::string, adopted_session> m_adopted;
+    std::unordered_map<std::string, adopted_session, string_hash, string_equal> m_adopted;
     uint64_t m_moved_forwarded{0};
     // A filter this shard took up, with the frame each shard is to take for it to know, until all of them have.
     std::unordered_map<std::string, std::vector<uint64_t>, string_hash, string_equal> m_unheard;

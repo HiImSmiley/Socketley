@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "../../shared/loop/file_io.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -52,8 +53,8 @@ private:
         std::string zone;
         int64_t until_ms{0};
     };
-    std::unordered_map<std::string, kept> m_kept;
-    std::unordered_map<std::string, asking> m_asking;
+    std::unordered_map<std::string, kept, string_hash, string_equal> m_kept;
+    std::unordered_map<std::string, asking, string_hash, string_equal> m_asking;
     bool m_polling{false};
     // How long the next poll waits: 2 ms after an answer, doubling to 64 while none comes.
     uint32_t m_poll_ms{2};

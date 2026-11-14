@@ -336,7 +336,7 @@ private:
     // Where a write's document is written before it is copied out at its own size.
     std::string m_json;
     // The deletions a start has read, so an older record read after one does not bring its document back.
-    std::unordered_map<std::string, uint64_t> m_tombs;
+    std::unordered_map<std::string, uint64_t, string_hash, string_equal> m_tombs;
 
     std::vector<cached_json*> m_blocks;
     size_t m_hand{0};

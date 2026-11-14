@@ -37,6 +37,7 @@
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
 #include "../../shared/util/thread_stop.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace fs = std::filesystem;
 
@@ -111,7 +112,7 @@ bool tmp_owner(const std::string& name, uint32_t& shard)
 
 // Removes this shard's own tmp/ files, and for shard 0 those of no shard of the split, never a sibling's upload in flight.
 uint64_t clean_tmp(const std::string& path, uint32_t shard, uint32_t nshards,
-                   const std::unordered_set<std::string>& keep)
+                   const std::unordered_set<std::string, string_hash, string_equal>& keep)
 {
     uint64_t n = 0;
     std::error_code ec;
@@ -866,7 +867,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         return false;
     }
 
-    std::unordered_set<std::string> keep;
+    std::unordered_set<std::string, string_hash, string_equal> keep;
     const bool versioned_dir = b->vstate != versioning::off || has_versions;
     const uint64_t rolled = roll_forward_pooled(*b, keep, versioned_dir);
     rep.rolled_forward += rolled;
@@ -984,11 +985,11 @@ bool pooled_body_whole(const object_meta& m, std::string_view body)
 // A put answered at its rename leaves, until its directories are synced, the
 // whole object in pool/, which the shard owning its key moves into place; any
 // shard's file is looked at, since the split may have changed.
-uint64_t object_store::roll_forward_pooled(bucket& b, std::unordered_set<std::string>& keep, bool versioned)
+uint64_t object_store::roll_forward_pooled(bucket& b, std::unordered_set<std::string, string_hash, string_equal>& keep, bool versioned)
 {
     const std::string base = m_opts.dir + "/" + b.name;
     uint64_t rolled = 0;
-    std::unordered_set<std::string> leaves;
+    std::unordered_set<std::string, string_hash, string_equal> leaves;
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(base + "/pool", ec))
     {

@@ -27,6 +27,7 @@
 #include "../../shared/loop/hash_pool.h"
 #include "../../shared/ipc/request_channel.h"
 #include "../../shared/persist/file_stamp.h"
+#include "../../shared/util/transparent_string.h"
 
 class idp_instance;
 
@@ -134,7 +135,7 @@ private:
     void device_token(const std::shared_ptr<conn>& c, const client& cl, std::string device_code);
     void device_answered(const std::shared_ptr<conn>& c, const client& cl, device_poll what, const device_entry& e);
     // A grant of this shard's let go of, with its user code and its count at the address that asked; the next one after.
-    using device_map = std::unordered_map<std::string, device_entry>;
+    using device_map = std::unordered_map<std::string, device_entry, string_hash, string_equal>;
     device_map::iterator forget_device(device_map::iterator it);
     // This shard's own grants: a user code decided, and a device code polled.
     bool decide_device(const std::string& user_code, bool allow, const std::string& sub, int64_t at);
@@ -203,14 +204,14 @@ private:
         // Wrong codes given for it, three of which end it.
         int misses{0};
     };
-    std::unordered_map<std::string, pending_sign_in> m_pending;
+    std::unordered_map<std::string, pending_sign_in, string_hash, string_equal> m_pending;
     std::string pending_token() const;
     bool take_pending(const std::shared_ptr<conn>& c, const request& rq, params& p, std::string_view field,
                       void (idp_run::*step)(const std::shared_ptr<conn>&, const request&, params));
     static std::string encode_pending(const pending_sign_in* e);
     static bool decode_pending(std::string_view in, bool& found, pending_sign_in& out);
     // A secret an account is enrolling, until a code of it proves the app has it.
-    std::unordered_map<std::string, std::pair<std::string, int64_t>> m_enrolling;
+    std::unordered_map<std::string, std::pair<std::string, int64_t>, string_hash, string_equal> m_enrolling;
     void code_page(const std::shared_ptr<conn>& c, const std::string& pending, std::string_view error, int status);
     void second_step(const std::shared_ptr<conn>& c, const request& rq, params p);
     void security_post(const std::shared_ptr<conn>& c, const request& rq);
@@ -298,7 +299,7 @@ private:
         std::vector<std::pair<std::string, std::optional<std::string>>> lines;
     };
     standing_update standing_changed();
-    using standing_lines = std::unordered_map<std::string, std::string>;
+    using standing_lines = std::unordered_map<std::string, std::string, string_hash, string_equal>;
     // The lines updated and the whole file made from every one of them, by whoever holds the lines: the loop in line,
     // or the write under way, as there is only ever one.
     static std::string standing_doc(standing_lines& lines, standing_update u);
@@ -365,11 +366,11 @@ private:
         client cl;
         int64_t fresh_until{0};
     };
-    std::unordered_map<std::string, fetched_client> m_fetched;
+    std::unordered_map<std::string, fetched_client, string_hash, string_equal> m_fetched;
     // The requests waiting on a document being fetched, by its address.
-    std::unordered_map<std::string, std::vector<std::function<void()>>> m_fetching;
+    std::unordered_map<std::string, std::vector<std::function<void()>>, string_hash, string_equal> m_fetching;
     // Addresses whose document was refused, each said once in the log.
-    std::unordered_set<std::string> m_fetch_said;
+    std::unordered_set<std::string, string_hash, string_equal> m_fetch_said;
     // The threads documents are fetched on, apart from the sign-ins' hashing, which a slow host would hold up.
     hash_pool m_fetch_pool{2};
     bool m_fetch_attached{false};
@@ -377,16 +378,16 @@ private:
     std::optional<socketley::file_stamp> m_clients_stamp;
     int64_t m_clients_checked{0};
 
-    std::unordered_map<std::string, code_entry> m_codes;
+    std::unordered_map<std::string, code_entry, string_hash, string_equal> m_codes;
     // Device grants by device code, and each one's device code by its user code in normal form.
     device_map m_devices;
-    std::unordered_map<std::string, std::string> m_user_codes;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> m_user_codes;
     // The grants waiting by the address or IPv6 site that asked for them, so one cannot take every one there is.
-    std::unordered_map<std::string, uint32_t> m_devices_from;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> m_devices_from;
     // Failures by address and by account, and the attempts at each being checked.
     attempt_limits m_limits;
     // Mail's password checks for an account waiting for one of its own in flight to end, the oldest first.
-    std::unordered_map<std::string, std::deque<std::function<void()>>> m_mail_waiting;
+    std::unordered_map<std::string, std::deque<std::function<void()>>, string_hash, string_equal> m_mail_waiting;
     void wake_mail(const std::string& acct);
     // Password checks given to the hashing threads and not answered yet.
     uint32_t m_hashing{0};

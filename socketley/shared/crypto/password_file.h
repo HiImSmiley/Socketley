@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include "../util/transparent_string.h"
 
 namespace socketley
 {
@@ -17,7 +18,7 @@ public:
     size_t size() const { return m_hashes.size(); }
 
 private:
-    std::unordered_map<std::string, std::string> m_hashes;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> m_hashes;
 };
 
 }   // namespace socketley

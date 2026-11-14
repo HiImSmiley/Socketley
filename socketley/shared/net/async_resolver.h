@@ -24,6 +24,7 @@
 
 #include "dns_client.h"
 #include "endpoint.h"
+#include "../util/transparent_string.h"
 
 namespace socketley
 {
@@ -147,7 +148,7 @@ private:
                      ? m_entries.erase(it) : std::next(it);
     }
 
-    std::unordered_map<std::string, std::shared_ptr<entry>> m_entries;
+    std::unordered_map<std::string, std::shared_ptr<entry>, string_hash, string_equal> m_entries;
 };
 
 }  // namespace socketley

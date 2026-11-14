@@ -20,6 +20,7 @@
 #include "../shared/loop/file_io.h"
 #include "../shared/loop/hash_pool.h"
 #include "../cli/arg_parser.h"
+#include "../shared/util/transparent_string.h"
 
 class event_loop;
 class runtime_manager;
@@ -298,7 +299,7 @@ private:
     socketley::hash_pool m_alert_box{1};
     // Each runtime's state as last published on daemon.events, by name; empty and unused when none is set.
     bool m_events{false};
-    std::unordered_map<std::string, std::string> m_event_states;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> m_event_states;
     void publish_runtime_events();
 
     int m_listen_fd;
@@ -365,17 +366,17 @@ private:
     // names all 30 sites --shards affects instead of leaving a second
     // container for a new path to forget.
     using worker_shards = std::vector<std::unique_ptr<proxy_supervisor>>;
-    std::unordered_map<std::string, worker_shards> m_proxy_workers;
+    std::unordered_map<std::string, worker_shards, string_hash, string_equal> m_proxy_workers;
 
     // One shared counter region per sharded runtime, held by the daemon
     // because it has to outlive any one shard: a replacement must map the
     // region its siblings already have.
-    std::unordered_map<std::string, shard_stats::shard_table> m_shard_regions;
+    std::unordered_map<std::string, shard_stats::shard_table, string_hash, string_equal> m_shard_regions;
 
     // And which connections each shard is holding, a second region because the
     // counters are touched every loop turn and the list only when a connection
     // arrives or leaves.
-    std::unordered_map<std::string, shard_clients::client_table> m_shard_client_regions;
+    std::unordered_map<std::string, shard_clients::client_table, string_hash, string_equal> m_shard_client_regions;
 
     // What every shard of one runtime last reported, added up and written into
     // its placeholder, because a shard is not a runtime and the last frame to
@@ -395,7 +396,7 @@ private:
         unsigned                              count{0};
         std::chrono::steady_clock::time_point last{};
     };
-    std::unordered_map<std::string, managed_restart> m_managed_restarts;
+    std::unordered_map<std::string, managed_restart, string_hash, string_equal> m_managed_restarts;
 
     // Wait for a just-started out-of-process runtime to say whether it can
     // serve its configuration, on one deadline shared across a multi-runtime
@@ -472,7 +473,7 @@ private:
     void forget_settled_snapshots();
 
     // Runtimes wanted running whose fork the last reconcile held back for a predecessor.
-    std::unordered_set<std::string> m_spawn_waiting;
+    std::unordered_set<std::string, string_hash, string_equal> m_spawn_waiting;
 
     // A command's answer that waits for the workers of `names` to be forked, finished with `abandoned` false
     // once none is held back and with true when the daemon goes down first.
@@ -540,7 +541,7 @@ private:
     void refresh_runtime_map();
     // The whole map at m_map_gen, encoded only when a worker is to be sent it, which most pushes are not.
     const std::string& runtime_map_full();
-    std::unordered_map<std::string, worker_proto::runtime_wire> m_map_rows;
+    std::unordered_map<std::string, worker_proto::runtime_wire, string_hash, string_equal> m_map_rows;
     uint64_t    m_map_gen{0};
     std::string m_map_full;
     uint64_t    m_map_full_gen{0};

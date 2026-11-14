@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "../../shared/persist/file_stamp.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::storage
 {
@@ -114,13 +115,13 @@ private:
     std::string m_user;
     int64_t m_next_look{0};
     // The state.json of each repository as last seen, so a run that ended is told once.
-    std::unordered_map<std::string, socketley::file_stamp> m_seen;
+    std::unordered_map<std::string, socketley::file_stamp, string_hash, string_equal> m_seen;
     bool m_seen_once{false};
     figures m_done;
     std::vector<repo> m_cache;
     std::optional<socketley::file_stamp> m_cache_stamp;
     // The runs this process started, by repository.
-    std::unordered_map<std::string, pid_t> m_children;
+    std::unordered_map<std::string, pid_t, string_hash, string_equal> m_children;
 };
 
 }   // namespace socketley::storage

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "endpoint.h"
+#include "../util/transparent_string.h"
 
 namespace socketley
 {
@@ -110,10 +111,10 @@ private:
     void settle(job& j);
 
     config                                      m_cfg;
-    std::unordered_map<std::string, std::vector<endpoint>> m_hosts;
+    std::unordered_map<std::string, std::vector<endpoint>, string_hash, string_equal> m_hosts;
     clock::time_point                           m_checked{};
     int64_t                                     m_conf_mtime{-1}, m_hosts_mtime{-1};
-    std::unordered_map<std::string, job>        m_jobs;
+    std::unordered_map<std::string, job, string_hash, string_equal>        m_jobs;
     clock::time_point                           m_swept{};
     counters                                    m_c;
 };

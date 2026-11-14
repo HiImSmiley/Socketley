@@ -17,6 +17,7 @@
 #include "tierer.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::storage
 {
@@ -232,8 +233,8 @@ bool is_dir_of(const std::vector<std::string_view>& sorted, std::string_view nam
 
 // Each name's next number goes on from where its last one stopped: the n-th of one name tried every number below n,
 // which for 20,000 keys of one name was 2e8 names built.
-std::string unique_name(std::string name, std::unordered_set<std::string>& taken,
-                        const std::vector<std::string_view>& sorted, std::unordered_map<std::string, int>& next_of)
+std::string unique_name(std::string name, std::unordered_set<std::string, string_hash, string_equal>& taken,
+                        const std::vector<std::string_view>& sorted, std::unordered_map<std::string, int, string_hash, string_equal>& next_of)
 {
     if (!is_dir_of(sorted, name) && taken.insert(name).second)
         return name;
@@ -282,8 +283,8 @@ void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, 
         job->bucket = bucket;
         uint64_t at = 0;
         size_t skipped = 0;
-        std::unordered_set<std::string> taken;
-        std::unordered_map<std::string, int> next_of;
+        std::unordered_set<std::string, string_hash, string_equal> taken;
+        std::unordered_map<std::string, int, string_hash, string_equal> next_of;
         std::vector<std::pair<list_entry*, std::string>> picked;
         // Reserved, so the names the sorted views below point into never move.
         picked.reserve(p.objects.size());

@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "dns_zone.h"
+#include "../../shared/util/transparent_string.h"
 
 typedef struct evp_pkey_st EVP_PKEY;
 
@@ -43,7 +44,7 @@ bool load_or_make_key(const std::string& dir, std::string_view origin, zone_key&
 // the same bytes with the same key is the same signature, as its nonce is derived from them (RFC 6979).
 struct signature_cache
 {
-    std::unordered_map<std::string, std::string> sigs;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> sigs;
     uint64_t made{0};
     uint64_t kept{0};
 };

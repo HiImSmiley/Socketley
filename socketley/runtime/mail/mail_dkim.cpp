@@ -17,6 +17,7 @@
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail::dkim
 {
@@ -409,7 +410,7 @@ bool header_data(const std::vector<std::pair<std::string_view, std::string_view>
                  bool relaxed, size_t skip, std::string& data, bool& from_signed)
 {
     // Each name's places from the bottom, so a name of h= costs one step however many headers there are.
-    std::unordered_map<std::string, std::vector<size_t>> places;
+    std::unordered_map<std::string, std::vector<size_t>, string_hash, string_equal> places;
     for (size_t i = 0; i < headers.size(); ++i)
         if (i != skip)
             places[lower(trim(headers[i].first))].push_back(i);

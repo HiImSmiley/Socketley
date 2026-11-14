@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "../../shared/persist/mutation_journal.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley
 {
@@ -144,9 +145,9 @@ private:
     void compact_done(const std::shared_ptr<compaction>& job, bool ok);
 
     std::string m_dir;
-    std::unordered_map<std::string, account> m_accounts;
+    std::unordered_map<std::string, account, string_hash, string_equal> m_accounts;
     // Usernames lower-cased, to the id they name; and e-mail addresses lower-cased, to the ids holding them.
-    std::unordered_map<std::string, std::string> m_names;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> m_names;
     std::unordered_multimap<std::string, std::string> m_emails;
     mutation_journal m_journal;
     uint64_t m_journal_records{0};

@@ -33,6 +33,7 @@
 #include "../../shared/util/settings.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -617,7 +618,7 @@ std::vector<std::pair<std::string, std::string>> imap_store::shared_with(const s
         return f != acls->end() && granted(f->second, who).find('l') != std::string::npos;
     };
     std::vector<std::pair<std::string, std::string>> out;
-    std::unordered_set<std::string> owners;
+    std::unordered_set<std::string, string_hash, string_equal> owners;
     for (const auto& key : live_lines(list_path(".shares")))
     {
         // owner \t folder \t grantee.

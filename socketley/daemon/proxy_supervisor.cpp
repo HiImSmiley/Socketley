@@ -31,6 +31,7 @@
 #include "../shared/ipc/shard_target.h"
 #include "../shared/ipc/worker_protocol.h"
 #include "../shared/util/proc_stat.h"
+#include "../shared/util/transparent_string.h"
 
 namespace
 {
@@ -544,7 +545,7 @@ static cpu_set_spec shard_cpus(const cpu_set_spec& set, const std::string& name,
 {
     if (shards <= 1 || set.all || shards > set.count())
         return set;
-    static std::unordered_map<std::string, uint32_t> bases;
+    static std::unordered_map<std::string, uint32_t, string_hash, string_equal> bases;
     static uint32_t next = 0;
     const auto [it, fresh] = bases.try_emplace(name, next);
     if (fresh)

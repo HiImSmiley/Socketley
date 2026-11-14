@@ -16,6 +16,7 @@
 #include <ctime>
 #include <unistd.h>
 #include <dirent.h>
+#include "../shared/util/transparent_string.h"
 
 namespace {
 
@@ -266,7 +267,7 @@ static int cluster_stats(const std::string& dir, const std::string& local_name,
 
     int healthy = 0, stale = 0;
     int total_runtimes = 0, running_runtimes = 0;
-    std::unordered_map<std::string, int> groups;
+    std::unordered_map<std::string, int, string_hash, string_equal> groups;
 
     for (const auto& d : daemons)
     {

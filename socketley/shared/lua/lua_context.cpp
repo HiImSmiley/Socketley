@@ -108,6 +108,7 @@ void lua_diag::report_raise(const sol::protected_function_result& r, std::string
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
+#include "../util/transparent_string.h"
 #endif
 
 // ─── The callback deadline ──────────────────────────────────────────────────
@@ -3246,7 +3247,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         int daemon_count = 1;  // include local
         int rt_total = 0;
         int rt_running = 0;
-        std::unordered_map<std::string, int> groups;
+        std::unordered_map<std::string, int, string_hash, string_equal> groups;
 
         // Local runtimes
         {

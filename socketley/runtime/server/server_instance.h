@@ -344,7 +344,7 @@ struct alignas(64) server_connection
     int pipe_peer_fd{-1};
 
     // Per-connection metadata (freed automatically on disconnect)
-    std::unordered_map<std::string, std::string> meta;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> meta;
 
     // Multicast group memberships (cleaned up on disconnect)
     std::vector<std::string> groups;
@@ -1696,7 +1696,7 @@ private:
     static constexpr uint32_t MAX_CONCURRENT_SPLICE = 256;
 
     // Multicast groups: group_name → list of fds in that group
-    std::unordered_map<std::string, std::vector<int>> m_groups;
+    std::unordered_map<std::string, std::vector<int>, string_hash, string_equal> m_groups;
     void remove_from_all_groups(int fd);
 
     // Upstream connections

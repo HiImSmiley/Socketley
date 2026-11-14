@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "../util/transparent_string.h"
 
 namespace socketley
 {
@@ -82,7 +83,7 @@ private:
     uint32_t                                 m_tries;
     clock::duration                          m_window;
     size_t                                   m_cap;
-    std::unordered_map<std::string, misses> m_misses;
+    std::unordered_map<std::string, misses, string_hash, string_equal> m_misses;
 };
 
 } // namespace socketley

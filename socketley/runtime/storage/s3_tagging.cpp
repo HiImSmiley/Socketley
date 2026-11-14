@@ -7,6 +7,7 @@
 #include "s3_xml.h"
 #include "s3_xml_tree.h"
 #include "../../shared/util/text_list.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::storage
 {
@@ -175,7 +176,7 @@ bool parse_tagging_header(std::string_view header, tag_set& out, s3_error& err)
     const s3_error bad = tag_error("InvalidArgument",
         "The header 'x-amz-tagging' shall be encoded as UTF-8 then URLEncoded URL query parameters without tag name "
         "duplicates.");
-    std::unordered_set<std::string> names;
+    std::unordered_set<std::string, string_hash, string_equal> names;
     while (!header.empty())
     {
         const std::string_view one = take_item(header, '&');

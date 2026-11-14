@@ -22,6 +22,7 @@
 
 #include "mqtt_codec.h"
 #include "mqtt_topics.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mqtt
 {
@@ -744,11 +745,11 @@ private:
     // The connection conn_of() last answered with, which only disconnected() takes out of the table.
     connection* m_last_conn{nullptr};
     std::vector<uint64_t> m_held;
-    std::unordered_map<std::string, std::unique_ptr<session>> m_sessions;
+    std::unordered_map<std::string, std::unique_ptr<session>, string_hash, string_equal> m_sessions;
     // How many sessions each owner holds, so one filling the table is the one that gives way.
-    std::unordered_map<std::string, size_t> m_owned;
+    std::unordered_map<std::string, size_t, string_hash, string_equal> m_owned;
     // The bytes of the messages each owner's sessions hold, bounded by queue_max_bytes.
-    std::unordered_map<std::string, size_t> m_held_by;
+    std::unordered_map<std::string, size_t, string_hash, string_equal> m_held_by;
     size_t m_held_total{0};
     std::unordered_map<uint64_t, session*> m_by_key;
     uint64_t m_next_key{1};
@@ -768,7 +769,7 @@ private:
     // Sessions with a will waiting for its delay.
     std::set<std::pair<int64_t, uint64_t>> m_wills_due;
     // How many sessions subscribe to each filter.
-    std::unordered_map<std::string, size_t> m_filter_refs;
+    std::unordered_map<std::string, size_t, string_hash, string_equal> m_filter_refs;
 };
 
 }   // namespace socketley::mqtt

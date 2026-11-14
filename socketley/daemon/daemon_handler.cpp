@@ -114,6 +114,7 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include "../shared/util/logging.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/util/number_parse.h"
+#include "../shared/util/transparent_string.h"
 
 // Two seconds is the backstop for a worker that has wedged, not a budget the
 // normal path spends -- a child reports in 17-22 ms -- and it is one budget
@@ -1011,7 +1012,7 @@ static std::vector<std::string> naming_settings(const runtime_config& cfg, std::
 static std::vector<std::string> zone_origins(const runtime_instance& rt)
 {
     struct cached { std::optional<socketley::file_stamp> stamp; std::string origin; };
-    static std::unordered_map<std::string, cached> cache;
+    static std::unordered_map<std::string, cached, string_hash, string_equal> cache;
     std::vector<std::string> out;
     for (const auto& path : static_cast<const dns_instance&>(rt).zone_paths())
     {
@@ -1057,7 +1058,7 @@ static void publish_dns_names(runtime_manager& manager)
                 tables.emplace_back(std::string(r->get_name()), runtime_names::entrance_table(*r, all, zone_origins));
         // Each dns runtime's zones, which a mail runtime naming it with --dns takes as its domains, and whose
         // host name, mail.<zone> unless it says another, is then given the dns runtime's addresses.
-        std::unordered_map<std::string, std::vector<std::string>> origins;
+        std::unordered_map<std::string, std::vector<std::string>, string_hash, string_equal> origins;
         for (const runtime_instance* r : all)
             if (r->get_type() == runtime_dns)
                 for (const auto& o : zone_origins(*r))
@@ -6954,7 +6955,7 @@ void daemon_handler::refresh_publish_interest()
     // back out to N-1 workers that decoded it for nothing.
     bool                            daemon_side = false;
     size_t                          scripted_procs = 0;
-    std::unordered_set<std::string> scripted;
+    std::unordered_set<std::string, string_hash, string_equal> scripted;
     {
         std::shared_lock lock(m_manager.mutex);
         for (const auto& [n, inst] : m_manager.list())
@@ -9838,7 +9839,7 @@ void daemon_handler::publish_runtime_events()
 {
     if (!m_events)
         return;
-    std::unordered_map<std::string, std::string> now;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> now;
     {
         std::shared_lock lock(m_manager.mutex);
         now.reserve(m_manager.list().size());

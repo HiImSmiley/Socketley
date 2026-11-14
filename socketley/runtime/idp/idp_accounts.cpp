@@ -21,6 +21,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/text_list.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::idp
 {
@@ -981,7 +982,7 @@ bool account_store::create(const field_list& fields, std::string& id, std::strin
 size_t account_store::create_many(const std::vector<field_list>& accounts, std::string& why)
 {
     std::vector<std::string> records;
-    std::unordered_set<std::string> names;
+    std::unordered_set<std::string, string_hash, string_equal> names;
     for (const auto& fields : accounts)
     {
         std::string one;

@@ -12,6 +12,7 @@
 
 #include "../loop/event_loop_definitions.h"
 #include <linux/time_types.h>
+#include "../util/transparent_string.h"
 
 class event_loop;
 class runtime_manager;
@@ -157,15 +158,15 @@ private:
 
     // Cached remote daemons (protected by mutex)
     mutable std::mutex m_remote_mutex;
-    std::unordered_map<std::string, remote_daemon> m_remote_daemons;
+    std::unordered_map<std::string, remote_daemon, string_hash, string_equal> m_remote_daemons;
 
     // mtime cache: filename → last seen mtime (skip re-reading unchanged files)
-    std::unordered_map<std::string, time_t> m_mtime_cache;
+    std::unordered_map<std::string, time_t, string_hash, string_equal> m_mtime_cache;
 
     // Change detection for event callbacks
     event_callback_t m_event_callback;
-    std::unordered_set<std::string> m_previous_daemon_names;
-    std::unordered_map<std::string, int> m_previous_group_counts;
+    std::unordered_set<std::string, string_hash, string_equal> m_previous_daemon_names;
+    std::unordered_map<std::string, int, string_hash, string_equal> m_previous_group_counts;
 
     static constexpr int PUBLISH_INTERVAL_SEC = 2;
     static constexpr int STALE_THRESHOLD_SEC = 10;

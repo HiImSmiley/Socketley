@@ -20,6 +20,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -232,10 +233,10 @@ private:
     uint64_t    m_log_base{0};
     bool        m_log_compacting{false};
     // Messages gone whose records stay in a segment until it is used again, so a restart does not bring them back.
-    std::unordered_map<std::string, uint32_t> m_gone_in_seg;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> m_gone_in_seg;
     std::map<std::string, entry_ptr> m_entries;
     std::unordered_map<uint64_t, std::unique_ptr<writer>> m_writers;
-    std::unordered_map<std::string, reader> m_readers;
+    std::unordered_map<std::string, reader, string_hash, string_equal> m_readers;
     uint64_t m_next_writer{1};
     uint64_t m_bytes{0};
     uint64_t m_kept{0};

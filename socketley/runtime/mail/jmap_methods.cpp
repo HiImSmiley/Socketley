@@ -19,6 +19,7 @@
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -47,7 +48,7 @@ std::string q(std::string_view s)
 }
 
 // An id as given, with a "#" creation reference swapped for the id it made, empty where none made it.
-std::string resolved(const std::unordered_map<std::string, std::string>& created, std::string id)
+std::string resolved(const std::unordered_map<std::string, std::string, string_hash, string_equal>& created, std::string id)
 {
     if (id.empty() || id.front() != '#')
         return id;
@@ -739,7 +740,7 @@ std::string set_error(std::string_view type, std::string_view description = {})
 void jmap_session::mailbox_get(const jvalue& args, std::function<void(answer)> done)
 {
     const auto folders = m_store.known(m_user);
-    std::unordered_map<std::string, std::shared_ptr<imap_folder>> by_name;
+    std::unordered_map<std::string, std::shared_ptr<imap_folder>, string_hash, string_equal> by_name;
     for (const auto& f : folders)
         by_name[f->name] = f;
     const jvalue* ids = json::member(args, "ids");
@@ -800,7 +801,7 @@ void jmap_session::mailbox_get(const jvalue& args, std::function<void(answer)> d
 void jmap_session::mailbox_query(const jvalue& args, std::function<void(answer)> done)
 {
     auto folders = m_store.known(m_user);
-    std::unordered_map<std::string, std::string> id_of;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> id_of;
     for (const auto& f : folders)
         id_of[f->name] = f->id();
     if (const jvalue* filter = json::member(args, "filter"); filter && filter->k == jvalue::kind::object)
@@ -1360,7 +1361,7 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
         const bool collapsing = collapse && collapse->k == jvalue::kind::boolean && collapse->b;
         if (collapsing)
         {
-            std::unordered_set<std::string> seen;
+            std::unordered_set<std::string, string_hash, string_equal> seen;
             hits.erase(std::remove_if(hits.begin(), hits.end(), [&](const cand* c) { return !seen.insert(thread_id(c->m)).second; }),
                        hits.end());
         }
@@ -1403,7 +1404,7 @@ void jmap_session::thread_get(const jvalue& args, std::function<void(answer)> do
     if (!m_threads_ready)
         return with_threads([this, args, done] { thread_get(args, done); });
     // A Thread is every Email of the conversation, in any mailbox, oldest first (RFC 8621 3).
-    std::unordered_map<std::string, std::vector<std::pair<int64_t, std::string>>> threads;
+    std::unordered_map<std::string, std::vector<std::pair<int64_t, std::string>>, string_hash, string_equal> threads;
     for (const auto& f : m_store.known(m_user))
         for (const auto& m : f->msgs)
             threads[thread_id(m)].emplace_back(m.date_ms, imap_store::email_id(m.key));
@@ -1419,7 +1420,7 @@ void jmap_session::thread_get(const jvalue& args, std::function<void(answer)> do
         auto& emails = it->second;
         std::sort(emails.begin(), emails.end());
         std::string ids;
-        std::unordered_set<std::string> seen;
+        std::unordered_set<std::string, string_hash, string_equal> seen;
         for (const auto& [at, email] : emails)
             if (seen.insert(email).second)
             {
@@ -2371,7 +2372,7 @@ void jmap_session::submission_set(const jvalue& args, const std::shared_ptr<call
         size_t at{0};
         std::string created = "{", not_created = "{";
         // The submissions sent, by creation id, and the Emails they sent, for onSuccess*.
-        std::unordered_map<std::string, std::string> sent_email;
+        std::unordered_map<std::string, std::string, string_hash, string_equal> sent_email;
     };
     auto j = std::make_shared<job>();
     j->args = args;

@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include "../util/transparent_string.h"
 
 namespace fs = std::filesystem;
 
@@ -322,7 +323,7 @@ void cluster_discovery::scan()
     time_t now = std::time(nullptr);
 
     // Track which daemons we see in this scan (for removing stale entries)
-    std::unordered_set<std::string> seen;
+    std::unordered_set<std::string, string_hash, string_equal> seen;
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr)
@@ -414,8 +415,8 @@ void cluster_discovery::scan()
         return;
 
     // Build current daemon name set and group counts under lock
-    std::unordered_set<std::string> current_names;
-    std::unordered_map<std::string, int> current_groups;
+    std::unordered_set<std::string, string_hash, string_equal> current_names;
+    std::unordered_map<std::string, int, string_hash, string_equal> current_groups;
     {
         std::lock_guard lock(m_remote_mutex);
         for (const auto& [name, daemon] : m_remote_daemons)

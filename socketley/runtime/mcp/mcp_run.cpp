@@ -20,6 +20,7 @@
 #include "../../shared/util/text_list.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/version.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mcp
 {
@@ -176,7 +177,7 @@ bool mcp_run::reload_keys(std::string& why)
         why = "the keys file " + path + " cannot be read";
         return false;
     }
-    std::unordered_map<std::string, key> keys;
+    std::unordered_map<std::string, key, string_hash, string_equal> keys;
     std::string line;
     size_t n = 0;
     while (std::getline(f, line))

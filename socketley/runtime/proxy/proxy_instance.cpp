@@ -41,6 +41,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <cstdio>
+#include "../../shared/util/transparent_string.h"
 #endif
 
 // Defined below, next to the read handlers they belong to; handle_accept needs
@@ -789,7 +790,7 @@ void proxy_instance::announce_group_nodes()
     if (!m_endpoints)
         return;
 
-    std::unordered_set<std::string> present;
+    std::unordered_set<std::string, string_hash, string_equal> present;
     for (const auto& b : m_backends)
     {
         if (!b.is_group)
@@ -876,8 +877,8 @@ void proxy_instance::resolve_group_hosts(bool retry_failed)
         return;
     }
 
-    std::unordered_map<std::string, in_addr> kept;
-    std::unordered_set<std::string> named;
+    std::unordered_map<std::string, in_addr, string_hash, string_equal> kept;
+    std::unordered_set<std::string, string_hash, string_equal> named;
     std::vector<std::string> moved;
     bool unresolved = false;
 

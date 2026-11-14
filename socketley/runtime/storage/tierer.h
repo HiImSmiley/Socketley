@@ -26,6 +26,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::storage
 {
@@ -120,7 +121,7 @@ private:
     int64_t       m_day_ms{86400000};
     // Moves waiting and in flight, by bucket, key and version, so each is made once.
     std::deque<std::shared_ptr<job>> m_queue;
-    std::unordered_set<std::string> m_moving;
+    std::unordered_set<std::string, string_hash, string_equal> m_moving;
     size_t        m_active{0};
     // The sweep of the tiers' listings: the tier being walked and where its listing is, and when the next begins.
     std::unique_ptr<sweep> m_sweep;

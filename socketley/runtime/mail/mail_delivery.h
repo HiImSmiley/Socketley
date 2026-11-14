@@ -28,6 +28,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/runtime/latency_histogram.h"
 #include "../../shared/loop/file_io.h"
+#include "../../shared/util/transparent_string.h"
 
 class tls_context;
 
@@ -207,13 +208,13 @@ private:
     event_loop& m_loop;
     file_io m_io;
     std::unique_ptr<tls_context> m_tls;
-    std::unordered_map<std::string, route> m_routes;
+    std::unordered_map<std::string, route, string_hash, string_equal> m_routes;
     std::unordered_map<uint64_t, std::unique_ptr<out_conn>> m_conns;
     uint64_t m_next_conn{1};
     std::multimap<int64_t, std::string> m_due;
-    std::unordered_map<std::string, std::multimap<int64_t, std::string>::iterator> m_due_at;
+    std::unordered_map<std::string, std::multimap<int64_t, std::string>::iterator, string_hash, string_equal> m_due_at;
     // Routes that wait for a connection the global limit holds back, and those whose lookup is out.
-    std::unordered_map<std::string, bool> m_starved;
+    std::unordered_map<std::string, bool, string_hash, string_equal> m_starved;
     // The routes a 421 holds back, pumped again by the tick once their pause is over.
     std::set<std::string> m_held;
     // Messages read whole to be signed, at most a few at once, and those that wait for a turn.
@@ -236,13 +237,13 @@ private:
     std::deque<std::pair<entry_ptr, target>> m_local_waiting;
     uint64_t m_local_waited{0};
     // How many of a message's items this try still has out, and how many targets each recipient still waits on.
-    std::unordered_map<std::string, uint32_t> m_out;
-    std::unordered_map<std::string, std::vector<uint32_t>> m_pending_targets;
+    std::unordered_map<std::string, uint32_t, string_hash, string_equal> m_out;
+    std::unordered_map<std::string, std::vector<uint32_t>, string_hash, string_equal> m_pending_targets;
     // How many targets each recipient has, where an alias made it more than one.
-    std::unordered_map<std::string, std::vector<uint32_t>> m_target_count;
+    std::unordered_map<std::string, std::vector<uint32_t>, string_hash, string_equal> m_target_count;
     // DKIM signatures by message id, made once and put ahead of each copy sent.
-    std::unordered_map<std::string, std::string> m_signed;
-    std::unordered_map<std::string, std::vector<std::function<void(bool)>>> m_signing;
+    std::unordered_map<std::string, std::string, string_hash, string_equal> m_signed;
+    std::unordered_map<std::string, std::vector<std::function<void(bool)>>, string_hash, string_equal> m_signing;
     // The RSA key and the Ed25519 one beside it (RFC 8463 recommends both), and the pair --dkim-next makes and
     // publishes ahead of signing with them.
     dkim::key_ptr m_key, m_ed_key, m_next_key, m_next_ed_key;
@@ -253,7 +254,7 @@ private:
         bool dane{false};
         std::vector<tls_policy::tlsa> tlsa;
     };
-    std::unordered_map<std::string, tlsa_kept> m_tlsa_kept;
+    std::unordered_map<std::string, tlsa_kept, string_hash, string_equal> m_tlsa_kept;
     std::string m_selector, m_next_selector;
     // --relay, parsed.
     bool m_relay{false};
@@ -265,7 +266,7 @@ private:
     // A test has its exchangers on 127.0.0.1, where anyone else would find this runtime itself.
     bool m_local_exchangers{false};
     // MTA-STS policies by domain, kept across a restart so a policy gone from DNS still counts until it expires.
-    std::unordered_map<std::string, tls_policy::sts> m_sts;
+    std::unordered_map<std::string, tls_policy::sts, string_hash, string_equal> m_sts;
     std::string m_sts_path;
     bool m_dane{false};
     bool m_stopped{false};

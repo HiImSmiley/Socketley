@@ -20,6 +20,7 @@
 #include "../shared/runtime/runtime_definitions.h"
 #include "../shared/ipc/worker_protocol.h"
 #include "../shared/ipc/deadline_slot.h"
+#include "../shared/util/transparent_string.h"
 
 class runtime_instance;
 struct runtime_config;
@@ -549,7 +550,7 @@ private:
     // it, so a worker relaying a burst before its link arrives is introduced
     // once rather than once per request.
     int          m_link_chan_fd{-1};
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_granted;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point, string_hash, string_equal> m_granted;
     unsigned     m_restarts{0};
     std::chrono::steady_clock::time_point m_last_restart{};
 };

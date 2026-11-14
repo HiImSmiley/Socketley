@@ -46,6 +46,7 @@
 #ifndef SOCKETLEY_NO_LUA
 #include <sol/sol.hpp>
 #include "lua_setup.h"
+#include "../shared/util/transparent_string.h"
 #endif
 
 static int g_signal_write_fd = -1;
@@ -457,7 +458,7 @@ static void restore_runtimes(state_persistence& persistence,
     // The runtimes pass 1 refused, carried to pass 2 because the two are
     // separate loops over the same list and a state file cannot say "and this
     // one did not come up".
-    std::unordered_set<std::string> scriptless;
+    std::unordered_set<std::string, string_hash, string_equal> scriptless;
 
     // Pass 1: Create all runtimes and apply configs
     for (const auto& cfg : configs)

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "mail_mime.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -86,7 +87,7 @@ struct imap_folder
     // listing taken before they went still holds and does not bring back.
     uint64_t    sync_from{0};
     // When a listing first lacked each message the index holds, as a store may list a write it acknowledged late.
-    std::unordered_map<std::string, int64_t> missing_since;
+    std::unordered_map<std::string, int64_t, string_hash, string_equal> missing_since;
     std::vector<std::pair<uint64_t, std::string>> gone_keys;
     std::vector<std::function<void(bool)>> waiting;
     bool        subscribed{true};
@@ -332,7 +333,7 @@ private:
     using seen_marks = std::vector<std::pair<uint32_t, uint32_t>>;
     static seen_marks marks_of(const std::map<std::string, std::shared_ptr<imap_folder>>& folders);
     // Those of each user this shard let go, so what came meanwhile is \Recent once it is back.
-    std::unordered_map<std::string, seen_marks> m_let_go;
+    std::unordered_map<std::string, seen_marks, string_hash, string_equal> m_let_go;
     uint64_t m_folds{0};
     uint64_t m_folds_lost{0};
     uint64_t m_journal_writes{0};
@@ -396,7 +397,7 @@ private:
     std::shared_ptr<imap_folder> make_folder(user_state& u, const std::string& name);
 
     mail_run& m_run;
-    std::unordered_map<std::string, user_state> m_users;
+    std::unordered_map<std::string, user_state, string_hash, string_equal> m_users;
     // A sharing owner's folders and their ACLs, read from its snapshot and journal without its index, for LIST.
     struct acl_view
     {
@@ -404,7 +405,7 @@ private:
         int64_t snap_mtime{0};
         std::map<std::string, std::map<std::string, std::string>> folders;
     };
-    std::unordered_map<std::string, acl_view> m_acls;
+    std::unordered_map<std::string, acl_view, string_hash, string_equal> m_acls;
     // The owner's folders as its index would have them, null where it has no index.
     const std::map<std::string, std::map<std::string, std::string>>* folder_acls(const std::string& owner);
     static void apply_acls(acl_view& v, std::string_view text);
@@ -424,17 +425,17 @@ private:
     };
     // Counts `c` again after its bytes or structure changed.
     void recount(cached& c);
-    std::unordered_map<std::string, cached> m_cache;
+    std::unordered_map<std::string, cached, string_hash, string_equal> m_cache;
     std::list<std::string> m_lru;
     size_t m_cached{0};
     // A key's entry made or read now, ahead of the others in leaving.
     cached& touch(const std::string& key);
     void evict();
     // Header blocks read on their own, a few mebibytes of them.
-    std::unordered_map<std::string, std::shared_ptr<const std::string>> m_heads;
+    std::unordered_map<std::string, std::shared_ptr<const std::string>, string_hash, string_equal> m_heads;
     size_t m_heads_bytes{0};
-    std::unordered_map<std::string, std::vector<std::function<void(std::shared_ptr<const std::string>)>>> m_reading;
-    std::unordered_map<std::string, std::vector<std::function<void(std::shared_ptr<const std::string>)>>> m_head_reading;
+    std::unordered_map<std::string, std::vector<std::function<void(std::shared_ptr<const std::string>)>>, string_hash, string_equal> m_reading;
+    std::unordered_map<std::string, std::vector<std::function<void(std::shared_ptr<const std::string>)>>, string_hash, string_equal> m_head_reading;
     uint64_t m_gets{0};
     uint64_t m_hits{0};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};

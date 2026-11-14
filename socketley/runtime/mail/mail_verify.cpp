@@ -24,6 +24,7 @@
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/settings.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mail
 {
@@ -511,7 +512,7 @@ struct thread_resolver
         std::vector<std::string> out;
         int64_t until_ms{0};
     };
-    std::unordered_map<std::string, cached> answers;
+    std::unordered_map<std::string, cached, string_hash, string_equal> answers;
     thread_resolver();
     ~thread_resolver()
     {
