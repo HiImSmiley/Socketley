@@ -172,20 +172,42 @@ public:
     size_t remove_matching(std::string_view v, size_t limit, bool from_back)
     {
         size_t removed = 0;
+        if (limit == 0)
+            return 0;
         if (!is_packed())
         {
             auto& s = seg_ref();
+            // The window the `limit` matches lie in, from the end asked for, then one pass that swaps every survivor
+            // forward and drops the tail: erasing each match shifted the rest, (n^2)/2 swaps for n equal elements.
+            size_t lo = 0, hi = s.size();
             if (!from_back)
             {
-                for (size_t i = 0; i < s.size() && removed < limit; )
-                    if (s[i] == v) { s.erase(s.begin() + static_cast<std::ptrdiff_t>(i)); ++removed; }
-                    else ++i;
+                size_t seen = 0;
+                for (size_t i = 0; i < s.size() && seen < limit; ++i)
+                    if (s[i] == v && ++seen == limit)
+                        hi = i + 1;
             }
             else
             {
-                for (size_t i = s.size(); i > 0 && removed < limit; )
-                    if (s[--i] == v) { s.erase(s.begin() + static_cast<std::ptrdiff_t>(i)); ++removed; }
+                size_t seen = 0;
+                for (size_t i = s.size(); i > 0 && seen < limit;)
+                    if (s[--i] == v && ++seen == limit)
+                        lo = i;
             }
+            size_t w = 0;
+            for (size_t i = 0; i < s.size(); ++i)
+            {
+                if (i >= lo && i < hi && s[i] == v)
+                {
+                    ++removed;
+                    continue;
+                }
+                if (w != i)
+                    s[w].swap(s[i]);
+                ++w;
+            }
+            while (s.size() > w)
+                s.pop_back();
             return removed;
         }
         // By offset: an erase moves only the bytes behind it, which a forward walk has not reached and a backward one has passed.

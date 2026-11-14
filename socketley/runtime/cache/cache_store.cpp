@@ -760,14 +760,23 @@ int cache_store::sdiff(const std::string_view* keys, size_t n,
         if (holds_other_type(keys[i], 't')) return -1;
     const set_inner* first = set_ptr(keys[0]);
     if (!first) return 0;
+    // The other sets looked up once, absent and repeated ones dropped: looked up again for every member, a thousand
+    // absent names of a kilobyte cost every member a megabyte of hashing.
+    std::vector<const set_inner*> others;
+    std::unordered_set<const set_inner*> named;
+    for (size_t i = 1; i < n; ++i)
+    {
+        const set_inner* sp = set_ptr(keys[i]);
+        if (sp == first)
+            return 0;
+        if (sp && named.insert(sp).second)
+            others.push_back(sp);
+    }
     for (const auto& m : *first)
     {
         bool elsewhere = false;
-        for (size_t i = 1; i < n && !elsewhere; ++i)
-        {
-            const set_inner* sp = set_ptr(keys[i]);
-            if (sp && sp->find(m) != sp->end()) elsewhere = true;
-        }
+        for (size_t i = 0; i < others.size() && !elsewhere; ++i)
+            if (others[i]->find(m) != others[i]->end()) elsewhere = true;
         if (!elsewhere) out.emplace_back(m);
     }
     return 0;
@@ -1604,10 +1613,14 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
         const auto e = m_expiry.find(k);
         return e == m_expiry.end() || now < e->second;
     };
+    // A page also ends after ten times COUNT keys looked at, as Redis's does: a MATCH no key meets walked the whole
+    // keyspace in one call.
+    const size_t examine_cap = count > SIZE_MAX / 10 ? SIZE_MAX : count * 10;
+    size_t examined = 0;
     auto walk = [&](const auto& map, uint8_t idx, size_t first_bucket) -> uint64_t {
         return walk_buckets(map, idx, first_bucket,
-            [&](const auto& e) { if (match(e.first) && live(e.first)) out.push_back(e.first); },
-            [&](size_t) { return out.size() >= count; });
+            [&](const auto& e) { ++examined; if (match(e.first) && live(e.first)) out.push_back(e.first); },
+            [&](size_t) { return out.size() >= count || examined >= examine_cap; });
     };
 
     // The five in a fixed order, so a cursor names the same map on every call --
@@ -2241,7 +2254,10 @@ static uint64_t scan_one_collection(const Map& map, uint64_t cursor,
 
         // Whole buckets only: half of one would need an element index the
         // cursor has no room for.
-        if ((bound_by_examined ? examined : emitted) >= count && b + 1 < nbuckets)
+        // Ten times COUNT looked at ends a page too, as in Redis, so a MATCH nothing meets is not one call over all.
+        const size_t examine_cap = count > SIZE_MAX / 10 ? SIZE_MAX : count * 10;
+        if ((bound_by_examined ? examined >= count : (emitted >= count || examined >= examine_cap)) &&
+            b + 1 < nbuckets)
             return ((static_cast<uint64_t>(shape) & 0xFFFFFFu) << 32)
                  | (static_cast<uint64_t>(b + 1) & 0xFFFFFFFFu);
     }
@@ -3952,6 +3968,8 @@ bool cache_store::subscribe(int fd, std::string_view channel)
 {
     const auto [it, fresh] = m_channels.try_emplace(std::string(channel));
     const bool added = it->second.insert(fd).second;
+    if (added)
+        m_fd_channels[fd].emplace(channel);
     if (fresh && m_chan_observer)
         m_chan_observer(m_chan_observer_ctx, it->first, true);
     return added;
@@ -3963,6 +3981,8 @@ bool cache_store::unsubscribe(int fd, std::string_view channel)
     if (it == m_channels.end())
         return false;
     const bool removed = it->second.erase(fd) > 0;
+    if (removed)
+        forget(m_fd_channels, fd, channel);
     if (it->second.empty())
     {
         if (m_chan_observer)
@@ -3977,7 +3997,10 @@ bool cache_store::unsubscribe(int fd, std::string_view channel)
 // hash lookup and pay nothing for a feature they are not using.
 bool cache_store::psubscribe(int fd, std::string_view pattern)
 {
-    return m_patterns[std::string(pattern)].insert(fd).second;
+    const bool added = m_patterns[std::string(pattern)].insert(fd).second;
+    if (added)
+        m_fd_patterns[fd].emplace(pattern);
+    return added;
 }
 
 bool cache_store::punsubscribe(int fd, std::string_view pattern)
@@ -3985,42 +4008,64 @@ bool cache_store::punsubscribe(int fd, std::string_view pattern)
     auto it = m_patterns.find(pattern);
     if (it == m_patterns.end()) return false;
     const bool removed = it->second.erase(fd) > 0;
+    if (removed)
+        forget(m_fd_patterns, fd, pattern);
     if (it->second.empty()) m_patterns.erase(it);
     return removed;
+}
+
+void cache_store::forget(std::unordered_map<int, name_set>& by_fd, int fd, std::string_view name)
+{
+    const auto it = by_fd.find(fd);
+    if (it == by_fd.end())
+        return;
+    if (const auto n = it->second.find(name); n != it->second.end())
+        it->second.erase(n);
+    if (it->second.empty())
+        by_fd.erase(it);
 }
 
 std::vector<std::string> cache_store::subscriptions_of(int fd, bool patterns) const
 {
     std::vector<std::string> out;
-    for (const auto& [name, fds] : patterns ? m_patterns : m_channels)
-        if (fds.count(fd))
-            out.push_back(name);
+    const auto& by_fd = patterns ? m_fd_patterns : m_fd_channels;
+    if (const auto it = by_fd.find(fd); it != by_fd.end())
+        out.assign(it->second.begin(), it->second.end());
     return out;
 }
 
 void cache_store::punsubscribe_all(int fd)
 {
-    for (auto it = m_patterns.begin(); it != m_patterns.end(); )
-    {
-        it->second.erase(fd);
-        if (it->second.empty()) it = m_patterns.erase(it); else ++it;
-    }
+    const auto mine = m_fd_patterns.find(fd);
+    if (mine == m_fd_patterns.end())
+        return;
+    for (const std::string& name : mine->second)
+        if (auto it = m_patterns.find(name); it != m_patterns.end())
+        {
+            it->second.erase(fd);
+            if (it->second.empty())
+                m_patterns.erase(it);
+        }
+    m_fd_patterns.erase(mine);
 }
 
 void cache_store::unsubscribe_all(int fd)
 {
-    for (auto it = m_channels.begin(); it != m_channels.end(); )
-    {
-        it->second.erase(fd);
-        if (it->second.empty())
+    const auto mine = m_fd_channels.find(fd);
+    if (mine == m_fd_channels.end())
+        return;
+    for (const std::string& name : mine->second)
+        if (auto it = m_channels.find(name); it != m_channels.end())
         {
-            if (m_chan_observer)
-                m_chan_observer(m_chan_observer_ctx, it->first, false);
-            it = m_channels.erase(it);
+            it->second.erase(fd);
+            if (it->second.empty())
+            {
+                if (m_chan_observer)
+                    m_chan_observer(m_chan_observer_ctx, it->first, false);
+                m_channels.erase(it);
+            }
         }
-        else
-            ++it;
-    }
+    m_fd_channels.erase(mine);
 }
 
 const std::unordered_set<int>* cache_store::get_subscribers(std::string_view channel) const

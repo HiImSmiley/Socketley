@@ -652,6 +652,9 @@ public:
     // What `fd` holds in one of the two maps, for an UNSUBSCRIBE that names
     // nothing and so means all of them.
     std::vector<std::string> subscriptions_of(int fd, bool patterns) const;
+    // `name` out of `fd`'s own set in `by_fd`, the set gone once empty.
+    void forget(std::unordered_map<int, std::unordered_set<std::string, string_hash, string_equal>>& by_fd, int fd,
+                std::string_view name);
     bool has_patterns() const { return !m_patterns.empty(); }
     const channel_map& patterns() const { return m_patterns; }
 
@@ -979,6 +982,11 @@ private:
     // Pub/Sub
     channel_map m_channels;
     channel_map m_patterns;
+    // Each connection's own channels and patterns, so leaving them all costs what it holds, as in Redis, rather than a
+    // walk of every channel on the server for every RESET and every close.
+    using name_set = std::unordered_set<std::string, string_hash, string_equal>;
+    std::unordered_map<int, name_set> m_fd_channels;
+    std::unordered_map<int, name_set> m_fd_patterns;
     channel_observer m_chan_observer{nullptr};
     void*            m_chan_observer_ctx{nullptr};
 };

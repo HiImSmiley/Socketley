@@ -127,6 +127,93 @@ TEST_CASE("cache_store keys made to share one hash cost what other keys do")
     CHECK(store.scard("s") == keys.size());
 }
 
+TEST_CASE("cache_store leaving channels, LREM, SDIFF and SCAN cost what they touch, not the whole store")
+{
+    cache_store store;
+    const auto cpu = [](auto&& f)
+    {
+        const auto t0 = thread_cpu_now();
+        f();
+        return std::chrono::duration<double>(thread_cpu_now() - t0).count();
+    };
+    // One connection holds 200,000 channels; another leaving its one walked all of them, every RESET and close.
+    for (int i = 0; i < 200000; ++i)
+        store.subscribe(7, "c" + std::to_string(i));
+    store.subscribe(8, "c1");
+    store.psubscribe(8, "p*");
+    CHECK(cpu([&] {
+        for (int i = 0; i < 5000; ++i)
+        {
+            store.unsubscribe_all(9);
+            store.punsubscribe_all(9);
+        }
+    }) < 1.0);
+    CHECK(store.subscriptions_of(8, false) == std::vector<std::string>{"c1"});
+    CHECK(store.subscriptions_of(8, true) == std::vector<std::string>{"p*"});
+    store.unsubscribe_all(8);
+    store.punsubscribe_all(8);
+    CHECK(store.subscriptions_of(8, false).empty());
+    CHECK(store.get_subscribers("c1") != nullptr);
+    CHECK(store.channel_count() == 200000);
+    CHECK_FALSE(store.has_patterns());
+
+    // LREM erased a match at a time, each shifting the rest: (n^2)/2 swaps for n equal elements.
+    for (int i = 0; i < 200000; ++i)
+        store.rpush("l", i % 3 ? "x" : "y");
+    CHECK(cpu([&] { CHECK(store.lrem("l", 0, "x") == 133333); }) < 1.0);
+    CHECK(store.llen("l") == 66667);
+    for (const char* v : {"a", "b", "a", "c", "a", "b"})
+        store.rpush("m", v);
+    CHECK(store.lrem("m", 2, "a") == 2);
+    CHECK(store.lrem("m", -1, "b") == 1);
+    std::vector<std::string> left;
+    for (std::string v; store.lpop("m", v);)
+        left.push_back(v);
+    CHECK(left == std::vector<std::string>{"b", "c", "a"});
+    // The same on a list past the packed form: the first two from the front, the last one from the back.
+    for (int i = 0; i < 3000; ++i)
+        store.rpush("n", i % 3 ? "b" : "a" + std::to_string(i % 2));
+    CHECK(store.lrem("n", 2, "a0") == 2);
+    CHECK(store.lrem("n", -1, "a1") == 1);
+    std::vector<std::string> n;
+    for (std::string v; store.lpop("n", v);)
+        n.push_back(v);
+    REQUIRE(n.size() == 2997);
+    CHECK(n[0] == "b");
+    CHECK(n[2] == "a1");
+    CHECK(std::count(n.begin(), n.end(), "a0") == 498);
+    CHECK(n.back() == "b");
+    CHECK(n[n.size() - 5] == "a0");
+
+    // SDIFF looked every other key up again for each member.
+    for (int i = 0; i < 20000; ++i)
+        store.sadd("d", "m" + std::to_string(i));
+    store.sadd("e", "m1");
+    std::vector<std::string> names{"d", "e", "d2"};
+    for (int i = 0; i < 2000; ++i)
+        names.push_back(std::string(2000, 'k') + std::to_string(i));
+    std::vector<std::string_view> keys(names.begin(), names.end());
+    std::vector<std::string> diff;
+    CHECK(cpu([&] { store.sdiff(keys.data(), keys.size(), diff); }) < 1.0);
+    CHECK(diff.size() == 19999);
+
+    // A SCAN page ends after ten times COUNT keys looked at, so a MATCH nothing meets is not one call over all.
+    for (int i = 0; i < 100000; ++i)
+        store.set("s" + std::to_string(i), "v");
+    std::vector<std::string_view> page;
+    CHECK(store.scan(0, "nothing*", 10, page) != 0);
+    CHECK(page.empty());
+    size_t found = 0;
+    uint64_t cur = 0;
+    do
+    {
+        page.clear();
+        cur = store.scan(cur, "s1*", 1000, page);
+        found += page.size();
+    } while (cur != 0);
+    CHECK(found == 11111);
+}
+
 TEST_CASE("cache_store type conflicts")
 {
     cache_store store;
