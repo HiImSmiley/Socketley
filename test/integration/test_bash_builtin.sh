@@ -117,9 +117,10 @@ check "sends from subshells each get their own answer" "40|0" "$(printf '%s\n' "
 if [ $((SECONDS - START)) -lt 4 ]; then ok; else bad "and none waits out the 5s deadline" "$((SECONDS - START))s"; fi
 
 # A signal while a send waits for its answer is the shell's, not a failure: SIGCHLD comes at any time.
+# No $(...) under the storm: bash 5.2 aborts its own parse when a trap runs while it expands one, builtin or not.
 check "signals during sends do not fail them" "" \
     "$(run 'trap : USR1; ( while kill -USR1 $$ 2>/dev/null; do :; done ) & K=$!
-            for i in $(seq 1 300); do socketley send bb_cli "i$i" || { echo "send $i failed: $?"; break; }; done
+            for ((i = 1; i <= 300; i++)); do socketley send bb_cli "i$i" || { echo "send $i failed: $?"; break; }; done
             kill $K' 2>&1 | grep -v '^$' || true)"
 
 # The kept connection outlives the daemon it was made to, and the next send makes a new one.
