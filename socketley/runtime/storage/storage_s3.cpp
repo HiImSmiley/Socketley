@@ -1197,12 +1197,18 @@ bool storage_run::object_meta_from_headers(const std::shared_ptr<conn>& c, objec
         "x-amz-website-redirect-location",
     };
     size_t user = 0;
+    // Each kept header once, its first, and no user name empty: 3,000 `expires:` lines or `x-amz-meta-:` with no value
+    // counted nothing against the 2 KiB and kept 200 KB of index for every empty object, read again by every listing.
+    bool kept_seen[std::size(kept)] = {};
     for (const auto& [name, value] : q.headers)
     {
         bool take = false;
-        for (std::string_view k : kept)
-            if (name == k)
-                take = true;
+        for (size_t i = 0; i < std::size(kept); ++i)
+            if (name == kept[i])
+            {
+                take = !kept_seen[i];
+                kept_seen[i] = true;
+            }
         if (name == "content-encoding" && http_list_has_token(value, "aws-chunked", 11))
         {
             // The framing is not part of the object, and any other coding is.
@@ -1222,6 +1228,12 @@ bool storage_run::object_meta_from_headers(const std::shared_ptr<conn>& c, objec
         }
         if (name.starts_with("x-amz-meta-"))
         {
+            if (name.size() == 11)
+            {
+                err = make_error("InvalidArgument");
+                err.message = "A user metadata header names nothing after x-amz-meta-.";
+                return false;
+            }
             take = true;
             user += name.size() - 11 + value.size();
         }
