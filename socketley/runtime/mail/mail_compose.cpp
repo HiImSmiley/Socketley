@@ -368,6 +368,14 @@ bool compose_message(const compose& c, const address& from, std::string_view fro
         h += "Reply-To: " + mailbox_text(a, name) + "\r\n";
     }
     h += "Subject: " + encode_header_value("Subject", c.subject) + "\r\n";
+    // A msg-id is printable and holds no angle bracket (RFC 5322 3.6.4), so it cannot end its line or another id.
+    if (msgid.empty() || std::any_of(msgid.begin(), msgid.end(), [](char ch) {
+            return static_cast<unsigned char>(ch) <= ' ' || static_cast<unsigned char>(ch) >= 0x7f || ch == '<' || ch == '>';
+        }))
+    {
+        why = "the Message-ID " + std::string(msgid) + " is not one";
+        return false;
+    }
     h += "Message-ID: <" + std::string(msgid) + ">\r\n";
     h += "MIME-Version: 1.0\r\n";
     for (const auto& x : c.headers)
