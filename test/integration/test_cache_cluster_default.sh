@@ -72,7 +72,9 @@ enabled() { redis-cli "$@" CLUSTER INFO 2>/dev/null | tr -d '\r' | sed -n 's/^cl
 named_ports() {
     local base=$1 slots n=0 i; shift
     slots=$(redis-cli "$@" CLUSTER SLOTS 2>/dev/null | sed 's/^ *//; s/ *$//')
-    for i in 1 2 3; do printf '%s\n' "$slots" | grep -qx "$((base+i))" && n=$((n+1)); done
+    # Matched in the shell: printf writes a line at a time, so under pipefail a grep -q that stops at an early
+    # match left it a SIGPIPE and counted a named port as missing.
+    for i in 1 2 3; do [[ $'\n'$slots$'\n' == *$'\n'"$((base+i))"$'\n'* ]] && n=$((n+1)); done
     echo "$n"
 }
 listeners_on() { ss -ltnH "sport = :$1" 2>/dev/null | grep -c . || true; }
@@ -165,7 +167,7 @@ for _ in $(seq 1 50); do ss -ltnH "sport = :$((PB+2))" | grep -q . && break; sle
 OUT=$("$BIN" create cache cdb -p "$PB" --shards 3 --resp -s 2>&1); RC=$?
 sleep 0.5
 WHY=$(grep "could not bind its own port $((PB+2))" "$SOCKETLEY_DLOG" | head -1)
-if [ "$RC" -ne 0 ] && printf '%s' "$WHY" | grep -q -- '--no-cluster'; then
+if [ "$RC" -ne 0 ] && [[ $WHY == *--no-cluster* ]]; then
     ok "a busy shard port fails the start, and the error names it and --no-cluster"
 else
     bad "a busy shard port fails the start, and the error names it and --no-cluster" \
@@ -180,7 +182,7 @@ kill "$HOLDER_PID" 2>/dev/null; wait "$HOLDER_PID" 2>/dev/null; HOLDER_PID=""
 # The daemon's own table holds the shard ports too, so another runtime cannot take one.
 "$BIN" create server cdx -p $((PD+2)) >/dev/null 2>&1
 OUT=$("$BIN" start cdx 2>&1); RC=$?
-if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'cdd'; then
+if [ "$RC" -ne 0 ] && [[ $OUT == *cdd* ]]; then
     ok "a runtime on a default cluster cache's shard port is refused, naming the cache"
 else
     bad "a runtime on a default cluster cache's shard port is refused, naming the cache" \
@@ -205,7 +207,7 @@ check "and --cluster is still on" "$(enabled -p "$PE")" "1"
 # ─── 8. And it is changed by an import, at a stop, not under a running cache ─
 "$BIN" show cdd | sed 's/^{/{"no_cluster": true,/' > "$D/cdd.json"
 OUT=$("$BIN" import cdd < "$D/cdd.json" 2>&1); RC=$?
-if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'cannot change cluster mode while running'; then
+if [ "$RC" -ne 0 ] && [[ $OUT == *"cannot change cluster mode while running"* ]]; then
     ok "a running cache refuses an import that turns cluster mode off"
 else
     bad "a running cache refuses an import that turns cluster mode off" "exit $RC, said: $OUT"
