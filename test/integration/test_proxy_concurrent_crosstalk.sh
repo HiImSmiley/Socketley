@@ -78,42 +78,70 @@ trap cleanup EXIT
 
 echo "=== Integration: no crossed delivery through the proxy under load ==="
 
-# A threaded TCP echo backend that has to be trivially correct about returning
-# bytes on the connection they arrived on, since that is the invariant under
-# test.
+# A TCP echo backend that has to be trivially correct about returning bytes on
+# the connection they arrived on, since that is the invariant under test, and
+# quick to accept, since a proxy connect left unanswered for --backend-timeout
+# closes a healthy client.
 python3 - "$BE_PORT" >"$TMPDIR_T/backend.log" 2>&1 <<'PYEOF' &
-import socket, sys, threading
+import selectors, socket, sys
 
 port = int(sys.argv[1])
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", port))
-srv.listen(256)
+srv.listen(4096)
+srv.setblocking(False)
+sel = selectors.DefaultSelector()
+sel.register(srv, selectors.EVENT_READ)
+owed = {}    # socket -> bytes read and not yet echoed
+ended = set()
 
 
-def handle(c):
-    c.settimeout(20)
-    try:
-        while True:
-            data = c.recv(65536)
-            if not data:
-                return
-            c.sendall(data)
-    except OSError:
-        pass
-    finally:
+def drop(c):
+    sel.unregister(c)
+    owed.pop(c, None)
+    ended.discard(c)
+    c.close()
+
+
+def flush(c):
+    if owed[c]:
         try:
-            c.close()
-        except OSError:
+            owed[c] = owed[c][c.send(owed[c]):]
+        except BlockingIOError:
             pass
+    want = (0 if c in ended else selectors.EVENT_READ) | (selectors.EVENT_WRITE if owed[c] else 0)
+    if not want:
+        drop(c)
+    elif want != sel.get_key(c).events:
+        sel.modify(c, want)
 
 
 while True:
-    try:
-        conn, _ = srv.accept()
-    except OSError:
-        break
-    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    for key, ev in sel.select():
+        c = key.fileobj
+        if c is srv:
+            while True:
+                try:
+                    n, _ = srv.accept()
+                except OSError:
+                    break
+                n.setblocking(False)
+                owed[n] = b""
+                sel.register(n, selectors.EVENT_READ)
+            continue
+        try:
+            if ev & selectors.EVENT_READ and c not in ended:
+                data = c.recv(65536)
+                if data:
+                    owed[c] += data
+                else:
+                    ended.add(c)
+            flush(c)
+        except BlockingIOError:
+            pass
+        except OSError:
+            drop(c)
 PYEOF
 BEPID=$!
 
