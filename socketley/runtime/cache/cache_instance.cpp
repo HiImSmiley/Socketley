@@ -1285,6 +1285,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             return;    // nothing to expire: stay off until mark_ttl_keys()
         bool more = false;
         auto expired_keys = m_store.sweep_some_expired(more);
+        m_store.settle_tables();
         m_has_ttl_keys = m_store.has_expiry_keys();
         m_stat_keys_expired += expired_keys.size();
 #ifndef SOCKETLEY_NO_LUA
@@ -5904,6 +5905,8 @@ void cache_instance::channel_presence(std::string_view channel, bool present)
 // about.
 void cache_instance::process_command(client_connection* conn, std::string_view line)
 {
+    // Before a command rather than after, since one may run inside another (EVAL, EXEC) but none starts holding one.
+    m_store.settle_tables();
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
     {
         process_command_local(conn, line);
@@ -9700,6 +9703,7 @@ static bool refused_in_script(uint32_t h)
 
 void cache_instance::process_resp_command_local(client_connection* conn, std::string_view* args, int argc)
 {
+    m_store.settle_tables();
     if (SOCKETLEY_UNLIKELY(argc == 0))
         return;
 

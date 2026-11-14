@@ -165,8 +165,6 @@ public:
         unsigned char* p;
         double len;
         double cap;
-        // The staged connection's queued bytes while the stage is open, so self.pending() is answered in Lua.
-        double base;
     };
     ffi_stage* ffi_stage_area();
 
@@ -432,12 +430,6 @@ private:
     // The staged bytes into their connection's queue, the stage left open with what room the queue leaves.
     void stage_flush();
     void stage_close();
-    // The stage's copy of what its connection has queued, kept by every push and take onto that queue.
-    void note_queued(const conn_t* conn)
-    {
-        if (static_cast<int>(conn->slot) == m_stage_slot)
-            m_stage.base = static_cast<double>(conn->write_queue.bytes());
-    }
 
     // The kernel re-arming the recv instead of this client doing it per
     // message; off wherever the ring or SOCKETLEY_RECV_MULTISHOT says so.

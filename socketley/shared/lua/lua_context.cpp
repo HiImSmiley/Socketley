@@ -3444,7 +3444,7 @@ static constexpr char k_ffi_prelude[] = R"lua(
 local ffi, inst, psend, ppending, pwatermark, send, pending, pstage = ...
 if not pcall(ffi.typeof, "socketley_ffi_watermark_t") then
   ffi.cdef[[
-typedef struct { uint8_t* p; double len; double cap; double base; } socketley_client_stage_t;
+typedef struct { uint8_t* p; double len; double cap; } socketley_client_stage_t;
 typedef int (*socketley_ffi_client_send_t)(void*, const char*, size_t, int);
 typedef double (*socketley_ffi_client_pending_t)(void*, int, int);
 typedef int (*socketley_ffi_server_send_t)(void*, int, const char*, size_t);
@@ -3490,11 +3490,7 @@ return function(msg, id)
   end
   return send(msg, id)
 end, function(id)
-  if id == nil then
-    -- An open stage is the running callback's connection, and nothing but a flush changes its queue meanwhile.
-    if st.cap > 0 then return st.base + st.len end
-    return fpending(inst, 0, 0)
-  end
+  if id == nil then return fpending(inst, 0, 0) end
   if plain(id) then
     local v = fpending(inst, 1, id)
     if v < 0 then return nil end

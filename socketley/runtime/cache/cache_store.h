@@ -289,6 +289,8 @@ public:
     // The same from where the last call stopped until a millisecond or 10,000 keys are spent; `more` says the table's
     // end was not reached, and the next call goes on from there.
     std::vector<std::string> sweep_some_expired(bool& more);
+    // The keyspace's tables rebuilt for what they hold once mostly empty, between commands, where no iterator is held.
+    void settle_tables();
     bool has_expiry_keys() const { return !m_expiry.empty(); }
 
     // --- Millisecond-precision TTL ---

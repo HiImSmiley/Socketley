@@ -92,7 +92,7 @@ client_instance::ffi_stage* client_instance::ffi_stage_area()
     if (!m_stage_buf)
     {
         m_stage_buf = std::make_unique_for_overwrite<unsigned char[]>(STAGE_BYTES);
-        m_stage = { m_stage_buf.get(), 0, 0, 0 };
+        m_stage = { m_stage_buf.get(), 0, 0 };
     }
     return &m_stage;
 }
@@ -111,7 +111,6 @@ void client_instance::stage_open(const conn_t* conn)
     m_stage_gen = conn->generation;
     m_stage.len = 0;
     m_stage.cap = static_cast<double>(std::min(STAGE_BYTES, write_buffer_bytes() - queued));
-    m_stage.base = static_cast<double>(queued);
 }
 
 void client_instance::stage_flush()
@@ -138,7 +137,6 @@ void client_instance::stage_flush()
                                          WRITE_COALESCE_LIMIT);
     }
     const size_t queued = conn->write_queue.bytes();
-    m_stage.base = static_cast<double>(queued);
     m_stage.cap = queued < write_buffer_bytes()
         ? static_cast<double>(std::min(STAGE_BYTES, write_buffer_bytes() - queued)) : 0;
 }
@@ -594,7 +592,6 @@ void client_instance::flush_queued_write(conn_t* conn)
 
     m_direct_gate.admit(conn->fd);
     conn->write_buf = conn->write_queue.take_front();
-    note_queued(conn);
     // Once there is room again, a later stall is worth reporting afresh.
     if (conn->write_queue.bytes() < write_watermark_bytes())
     {
@@ -1721,7 +1718,6 @@ void client_instance::enqueue_line(conn_t* conn, std::string_view msg)
         conn->write_queue.push_coalesced(msg, WRITE_COALESCE_LIMIT);
     else
         conn->write_queue.push_coalesced_line(msg, WRITE_COALESCE_LIMIT);
-    note_queued(conn);
 }
 
 // push and not push_coalesced, which the TCP arm uses: an entry here is a
@@ -1734,7 +1730,6 @@ void client_instance::enqueue_datagram(conn_t* conn, std::string_view msg)
     if (conn->write_queue.bytes() + msg.size() >= write_watermark_bytes())
         conn->drain_wanted = true;
     conn->write_queue.push(std::string(msg.data(), msg.size()));
-    note_queued(conn);
 }
 
 // Whether the message was written or queued, which was void, so self.send()

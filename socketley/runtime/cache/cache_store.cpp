@@ -666,6 +666,7 @@ bool cache_store::srem(std::string_view key, std::string_view member)
     track_sub(stored_string(*mit));
     it->second.erase(mit);
     --m_set_elems;
+    it->second.shrink_if_sparse();
     reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())
@@ -1124,6 +1125,7 @@ bool cache_store::hdel(std::string_view key, std::string_view field)
     track_sub(stored_string(field.size()) + stored_string(old.size()));
     it->second.erase(field);
     --m_hash_fields;
+    it->second.shrink_if_sparse();
     reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())
@@ -1260,6 +1262,17 @@ std::vector<std::string> cache_store::sweep_expired()
 }
 
 std::vector<std::string> cache_store::sweep_some_expired(bool& more)
+void cache_store::settle_tables()
+{
+    m_data.shrink_if_sparse();
+    m_lists.shrink_if_sparse();
+    m_sets.shrink_if_sparse();
+    m_hashes.shrink_if_sparse();
+    m_zsets.shrink_if_sparse();
+    m_streams.shrink_if_sparse();
+    m_expiry.shrink_if_sparse();
+}
+
 {
     // At most a millisecond of the loop, or this many keys, a sweep: one over every key with a deadline held the loop
     // 26 ms at a million of them and 86 at five million, twice a second.  A read finds a key expired either way.
@@ -2180,6 +2193,7 @@ bool cache_store::spop(std::string_view key, std::string& out)
     track_sub(stored_string(*mit));
     it->second.erase(mit);
     --m_set_elems;
+    it->second.shrink_if_sparse();
     reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())

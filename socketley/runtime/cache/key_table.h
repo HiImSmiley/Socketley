@@ -400,6 +400,17 @@ public:
     // Back to no table at all, so a FLUSHALL returns the slots as well.
     void clear() { release(); ++m_epoch; }
 
+    // Rebuilt for what it holds once seven eighths of its slots stand empty, so a walk, a random draw and the memory
+    // follow what is held now and not the most it ever held. Entries keep their addresses; iterators do not, so this
+    // is called where none is held, never from erase().
+    bool shrink_if_sparse()
+    {
+        if (m_cap <= 64 || m_size * 8 >= m_cap)
+            return false;
+        rebuild(capacity_for(m_size));
+        return true;
+    }
+
 private:
     static constexpr size_t NPOS = ~size_t{0};
     // Small, because a hash or set held as a value is often a handful of
@@ -600,4 +611,5 @@ public:
     iterator erase(const_iterator pos) { return const_iterator(m_t.erase(pos.m_it)); }
     void   clear() { m_t.clear(); }
     void   reserve(size_t n) { m_t.reserve(n); }
+    bool   shrink_if_sparse() { return m_t.shrink_if_sparse(); }
 };

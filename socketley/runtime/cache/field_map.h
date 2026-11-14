@@ -196,6 +196,8 @@ public:
     }
 
     void clear() { m_pack.release(); m_count = 0; m_table.reset(); ++m_epoch; }
+    // The table's slots back to what its fields need, as key_table::shrink_if_sparse(); where no iterator is held.
+    bool shrink_if_sparse() { return m_table && m_table->shrink_if_sparse(); }
 
     // ─── Walking it ───
 
