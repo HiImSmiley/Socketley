@@ -823,6 +823,7 @@ void store::set_doc(coll_state& c, const std::string& coll, const std::string& i
         }
         else
         {
+            c.by_id.erase(id);
             c.docs.erase(it);
             --m_docs;
         }
@@ -830,6 +831,7 @@ void store::set_doc(coll_state& c, const std::string& coll, const std::string& i
     else if (d)
     {
         now = &c.docs.emplace(id, std::move(*d)).first->second;
+        c.by_id.insert(id);
         now->cache = nullptr;
         ++m_docs;
         reindex(c, id, nullptr, now, now);
@@ -1788,9 +1790,19 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
         walk_run(walk->entries.begin(), walk->entries.end());
     else if (!planned)
     {
-        ids.reserve(c->docs.size());
-        for (const auto& [id, d] : c->docs)
-            ids.emplace_back(&id, &d);
+        // Every document: in the order of its id where that is the answer's, so a page stops once it has its
+        // documents, and in the table's order where a sort puts the hits in theirs after.
+        in_order = q.sort.empty();
+        if (in_order)
+        {
+            for (const std::string& id : c->by_id)
+                if (const auto d = c->docs.find(id); d != c->docs.end() && !consider(&d->first, &d->second))
+                    break;
+        }
+        else
+            for (const auto& [id, d] : c->docs)
+                if (!consider(&id, &d))
+                    break;
     }
     if (!in_order)
     {
@@ -1827,16 +1839,28 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
         out += "{\"count\":" + std::to_string(hits.size()) + "}";
         return true;
     }
+    const size_t stop = q.skip > SIZE_MAX - q.limit ? SIZE_MAX : q.skip + q.limit;
     if (!in_order && !q.sort.empty())
-        std::stable_sort(hits.begin(), hits.end(), [&](const hit& x, const hit& y) {
+    {
+        const auto before = [&](const hit& x, const hit& y) {
             if (x.sort == y.sort)
                 return q.desc ? *y.id < *x.id : *x.id < *y.id;
             return q.desc ? y.sort < x.sort : x.sort < y.sort;
-        });
+        };
+        // Only the page is put in order, the hits before it and after it each only parted from it.
+        const size_t want = std::min(hits.size(), stop);
+        const size_t from = std::min(q.skip, want);
+        if (want < hits.size())
+            std::nth_element(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(want), hits.end(), before);
+        if (from > 0)
+            std::nth_element(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(from),
+                             hits.begin() + static_cast<std::ptrdiff_t>(want), before);
+        std::sort(hits.begin() + static_cast<std::ptrdiff_t>(from), hits.begin() + static_cast<std::ptrdiff_t>(want),
+                  before);
+    }
     else if (!in_order && q.desc)
         std::reverse(hits.begin(), hits.end());
     out += "{\"docs\":[";
-    const size_t stop = q.skip > SIZE_MAX - q.limit ? SIZE_MAX : q.skip + q.limit;
     const size_t end = std::min(hits.size(), stop);
     for (size_t i = q.skip; i < end; ++i)
     {

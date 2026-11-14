@@ -651,6 +651,52 @@ TEST_CASE("an in costs a lookup a document, and a query's conditions and a patch
     CHECK(patch(st, key, "pub", "d1", R"({"set":{"a":1},"unset":["n"]})") == 0);
 }
 
+TEST_CASE("a page no index answers walks the ids in their order and stops, and a sort puts only the page in order")
+{
+    tmpdir t;
+    store st;
+    std::string why;
+    REQUIRE(st.open(t.path, schema{}, why));
+    REQUIRE(st.set_schema(make_schema("pub public score\n"), why));
+    constexpr int n = 100000;
+    char id[16];
+    for (int i = 0; i < n; i += 100)
+    {
+        std::vector<write_op> ops(100);
+        for (int j = 0; j < 100; ++j)
+        {
+            std::snprintf(id, sizeof id, "d%06d", n - 1 - (i + j));
+            ops[j].kind = write_op::put;
+            ops[j].coll = "pub";
+            ops[j].id = id;
+            ops[j].body = parse("{\"score\":" + std::to_string((i + j) % 97) + "}");
+        }
+        std::string out;
+        error err;
+        REQUIRE(st.write(key, ops, out, err));
+    }
+    // Each page sorted every id of the collection first: 21 pages of 100,000 documents took 0.54 s of CPU.
+    const auto t0 = thread_cpu_now();
+    for (int k = 0; k < 20; ++k)
+        CHECK(ids_of(find(st, nobody, "pub", R"({"limit":3})")) == "d000000 d000001 d000002 next=3");
+    CHECK(ids_of(find(st, nobody, "pub", R"({"where":{"_v":{"gte":0}},"limit":2,"skip":5})")) ==
+          "d000005 d000006 next=7");
+    const double took = std::chrono::duration<double>(thread_cpu_now() - t0).count();
+    MESSAGE("21 pages of 100,000 documents no index answers: " << took << " s of CPU");
+    CHECK(took < 0.05);
+    // A sort no index answers puts only the page in order, the same page a whole sort gives.
+    const auto t1 = thread_cpu_now();
+    for (int k = 0; k < 5; ++k)
+        CHECK(ids_of(find(st, nobody, "pub", R"({"sort":"-_id","limit":2})")) == "d099999 d099998 next=2");
+    MESSAGE("5 sorted pages of 100,000 documents: "
+            << std::chrono::duration<double>(thread_cpu_now() - t1).count() << " s of CPU");
+    CHECK(ids_of(find(st, nobody, "pub", R"({"sort":"-_id","limit":3,"skip":10})")) ==
+          "d099989 d099988 d099987 next=13");
+    CHECK(ids_of(find(st, nobody, "pub", R"({"sort":"_owner","limit":2,"skip":99999})")) == "d099999 ");
+    CHECK(del(st, key, "pub", "d000000") == 0);
+    CHECK(ids_of(find(st, nobody, "pub", R"({"limit":2})")) == "d000001 d000002 next=2");
+}
+
 TEST_CASE("queries: an index answers what a scan answers, over random documents and conditions")
 {
     tmpdir t1, t2;

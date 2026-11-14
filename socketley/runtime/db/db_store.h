@@ -280,6 +280,8 @@ private:
         std::vector<index_state> indexes;
         // Every document by its owner, so an account's own are found without a scan.
         std::map<std::pair<std::string, std::string>, const doc*> by_owner;
+        // Every id in order, so a query no index answers walks the documents in its answer's order and stops.
+        std::set<std::string, std::less<>> by_id;
         std::string ttl;
         // The last write that changed the collection, which a query's answer rests on.
         uint64_t last_seq{0};
