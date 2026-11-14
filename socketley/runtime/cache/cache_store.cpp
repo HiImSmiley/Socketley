@@ -1261,7 +1261,6 @@ std::vector<std::string> cache_store::sweep_expired()
     return all;
 }
 
-std::vector<std::string> cache_store::sweep_some_expired(bool& more)
 void cache_store::settle_tables()
 {
     m_data.shrink_if_sparse();
@@ -1273,6 +1272,7 @@ void cache_store::settle_tables()
     m_expiry.shrink_if_sparse();
 }
 
+std::vector<std::string> cache_store::sweep_some_expired(bool& more)
 {
     // At most a millisecond of the loop, or this many keys, a sweep: one over every key with a deadline held the loop
     // 26 ms at a million of them and 86 at five million, twice a second.  A read finds a key expired either way.
