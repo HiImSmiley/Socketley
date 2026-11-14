@@ -582,7 +582,8 @@ public:
 private:
     bool handshake(const federation_ldap& cfg, std::string& why)
     {
-        m_ctx = tls_context::make_client_ctx(cfg.ca_file, why);
+        // One context per CA file for every bind, read again when that file changes, as the https client keeps it.
+        m_ctx = tls_context::shared_client_ctx(cfg.ca_file, why);
         if (!m_ctx)
             return false;
         m_ssl = SSL_new(m_ctx);
