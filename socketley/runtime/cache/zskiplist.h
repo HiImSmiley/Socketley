@@ -562,8 +562,8 @@ public:
 
     // A member moved from `old` to `score`.  Like zslUpdateScore, a score that
     // does not pass a neighbour is written in place, which spares the second
-    // walk; one that does gets a new node, which measured cheaper than moving
-    // the old one.
+    // walk; one that does moves its node, so a move allocates nothing and
+    // cannot lose the member to a refused allocation.
     bool rescore(double old, std::string_view member, double score)
     {
         if (!big())
@@ -615,19 +615,10 @@ public:
             if (at[i] == x)              { at[i] = update[i]; rank[i] = rank_old[i]; }
             else if (rank[i] > rank_x)   --rank[i];
         }
-        // The name is held here because the node holding it goes first.
-        char held[256];
-        std::string spill;
-        std::string_view name = m;
-        if (m.size() <= sizeof(held)) { std::memcpy(held, m.data(), m.size()); name = { held, m.size() }; }
-        else                          { spill.assign(m); name = spill; }
+        // The node keeps its level and name, so its index slot still names it.
         link_out(x, update);
-        ix_erase(m);
-        destroy(x);
-        grow_index();
-        node* n = make_node(random_level(), score, name);
-        link_at(n, at, rank);
-        ix_insert(n);
+        x->score = score;
+        link_at(x, at, rank);
         return true;
     }
 

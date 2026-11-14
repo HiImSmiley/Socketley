@@ -17,6 +17,19 @@
 #include <unistd.h>
 #include <fstream>
 #include <iterator>
+#include <new>
+
+// Set to refuse every operator new in this binary, so a test can say a step allocated nothing.
+static bool g_refuse_new = false;
+void* operator new(size_t n)
+{
+    if (!g_refuse_new)
+        if (void* p = std::malloc(n ? n : 1))
+            return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
 
 TEST_CASE("cache_store string operations")
 {
@@ -2497,6 +2510,31 @@ TEST_CASE("zskiplist orders scores a float cannot tell apart")
                 }
         }
     }
+}
+
+TEST_CASE("zskiplist moves a member without allocating, so a refused allocation cannot lose it")
+{
+    zskiplist z;
+    for (int i = 0; i < 2000; ++i)
+        z.emplace(i, "member-" + std::to_string(i));
+    REQUIRE(z.big());
+    // Each one past the other end, so every move passes its neighbours.
+    for (int i = 0; i < 2000; i += 7)
+    {
+        const std::string m = "member-" + std::to_string(i);
+        const double to = 5000.0 - i;
+        g_refuse_new = true;
+        bool moved = false;
+        try { moved = z.rescore(i, m, to); }
+        catch (const std::bad_alloc&) {}
+        g_refuse_new = false;
+        REQUIRE(moved);
+        double got = -1.0;
+        REQUIRE(z.score_of(m, got));
+        CHECK(got == to);
+        CHECK(z.rank(to, m) == 2000 - 1 - static_cast<size_t>(i / 7));
+    }
+    CHECK(z.size() == 2000);
 }
 
 TEST_CASE("field_map agrees with a map, packed and after it moves to the table")
