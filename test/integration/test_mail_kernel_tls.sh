@@ -143,17 +143,17 @@ start_mail
 py append >/dev/null
 
 out=$(py select 1 2 1,2 kernel?)
-if echo "$out" | grep -q 'whole 4 of 4' && echo "$out" | grep -q 'kernel 0'; then ok
+if grep -q 'whole 4 of 4' <<<"$out" && grep -q 'kernel 0' <<<"$out"; then ok
 else bad "a connection given small messages only stays in user space" "$(echo "$out" | tr '\n' ' ' | cut -c1-300)"; fi
 
 out=$(py select 1 3 kernel? 1 4 2 1,2,3,4 1 logout)
-if echo "$out" | grep -q 'whole 10 of 10' && echo "$out" | grep -q 'kernel 1'; then ok
+if grep -q 'whole 10 of 10' <<<"$out" && grep -q 'kernel 1' <<<"$out"; then ok
 else bad "a large message moves its connection, and every reply after it comes whole" "$(echo "$out" | tr '\n' ' ' | cut -c1-300)"; fi
-echo "$out" | grep -q 'logout clean' && ok \
+grep -q 'logout clean' <<<"$out" && ok \
     || bad "a LOGOUT on a moved connection ends with its OK and close_notify" "$(echo "$out" | grep logout)"
 
 out=$(py select compress 3 1 4 kernel?)
-if echo "$out" | grep -q 'whole 3 of 3' && echo "$out" | grep -q 'kernel 0'; then ok
+if grep -q 'whole 3 of 3' <<<"$out" && grep -q 'kernel 0' <<<"$out"; then ok
 else bad "under COMPRESS a large message comes whole and the connection is not moved" "$(echo "$out" | tr '\n' ' ' | cut -c1-300)"; fi
 
 # Key updates after the switch, the client's own and one it asks for.  Not -ign_eof, which turns s_client's command
@@ -178,7 +178,7 @@ daemon_isolate mailktls-off
 SOCKETLEY_KERNEL_TLS=0 start_mail
 py append >/dev/null
 out=$(py select 3 kernel? 1 4)
-if echo "$out" | grep -q 'whole 3 of 3' && echo "$out" | grep -q 'kernel 0'; then ok
+if grep -q 'whole 3 of 3' <<<"$out" && grep -q 'kernel 0' <<<"$out"; then ok
 else bad "SOCKETLEY_KERNEL_TLS=0 keeps the send key in user space" "$(echo "$out" | tr '\n' ' ' | cut -c1-300)"; fi
 
 echo

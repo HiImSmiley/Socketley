@@ -126,9 +126,9 @@ wait_keys alice/INBOX 1 && ok "and it is in the user's inbox in the storage" || 
 k=$(keys alice/INBOX | head -1)
 body=$(obj "$k")
 case "$body" in *"first mail"*) ok "whole" ;; *) bad "whole" "${body:0:200}" ;; esac
-printf '%s' "$body" | grep -q '^Return-Path: <carol@else.test>' && printf '%s' "$body" | grep -q '^Delivered-To: alice@example.test' \
+grep -q '^Return-Path: <carol@else.test>' <<<"$body" && grep -q '^Delivered-To: alice@example.test' <<<"$body" \
     && ok "under the lines that say whence and to whom" || bad "under the lines that say whence and to whom" "$(printf '%s' "$body" | head -4)"
-printf '%s' "$body" | grep -q '^Authentication-Results: mail.example.test; spf=pass smtp.mailfrom=else.test; dkim=none; dmarc=none' \
+grep -q '^Authentication-Results: mail.example.test; spf=pass smtp.mailfrom=else.test; dkim=none; dmarc=none' <<<"$body" \
     && ok "with what SPF, DKIM and DMARC said" || bad "with what SPF, DKIM and DMARC said" "$(printf '%s' "$body" | grep Authentication-Results)"
 check "and none forged under this host's name" "$(printf '%s' "$body" | grep -c 'forged')" "0"
 for _ in $(seq 1 50); do grep -q 'hello alice' "$T/hook.log" 2>/dev/null && break; sleep 0.1; done
