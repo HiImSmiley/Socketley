@@ -2776,7 +2776,16 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
     }
     if (all.kids.empty())
         return finish(tag, "BAD", "SEARCH needs search criteria");
-    // Sets resolved now, against this session's numbering.
+    // BODY and TEXT decode every text part of every message, each for itself, so 682 of them cost a 25 MB message
+    // 55 s of the loop; a client sends a few.
+    std::function<size_t(const crit&)> texts = [&](const crit& c) {
+        size_t n = c.key == "BODY" || c.key == "TEXT";
+        for (const auto& k : c.kids)
+            n += texts(k);
+        return n;
+    };
+    if (texts(all) > 16)
+        return finish(tag, "NO", "[LIMIT] At most 16 BODY and TEXT criteria");
     std::function<bool(crit&)> resolve = [&](crit& c) {
         if (c.key == "SET" || c.key == "UID")
             if (!parse_set(c.arg, c.key == "UID", c.set))

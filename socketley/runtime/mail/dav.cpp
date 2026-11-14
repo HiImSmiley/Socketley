@@ -1,6 +1,7 @@
 #include "dav.h"
 
 #include <algorithm>
+#include <set>
 #include <ctime>
 #include <optional>
 #include <utility>
@@ -558,8 +559,13 @@ struct op : std::enable_shared_from_this<op>
         const xml::node* p = parent ? parent->child("prop", ns_dav) : nullptr;
         if (!p)
             return false;
+        // Each property once and at most 64: each is rendered for every entry, and calendar-data 100 times over a
+        // thousand hrefs made 100 GB of answer.
         for (const auto& k : p->kids)
         {
+            if (out.size() >= 64 ||
+                std::any_of(out.begin(), out.end(), [&](const prop_name& n) { return n.ns == k.ns && n.name == k.name; }))
+                continue;
             out.push_back({k.ns, k.name});
             data = data || (k.name == "calendar-data" && k.ns == ns_cal) || (k.name == "address-data" && k.ns == ns_card);
         }
@@ -812,6 +818,8 @@ struct op : std::enable_shared_from_this<op>
     {
         auto ts = std::make_shared<std::vector<target>>();
         auto gone = std::make_shared<std::vector<std::string>>();
+        // Each href once, as one answered twice is the same answer twice.
+        std::set<std::string> named;
         for (const auto& k : doc.kids)
         {
             if (k.name != "href" || k.ns != ns_dav || ts->size() >= 1000)
@@ -820,6 +828,8 @@ struct op : std::enable_shared_from_this<op>
             // A client may give the whole URL rather than its path.
             if (const size_t scheme = path.find("://"); scheme != std::string::npos)
                 path = path.substr(std::min(path.size(), path.find('/', scheme + 3)));
+            if (!named.insert(path).second)
+                continue;
             target t;
             int refusal = 0;
             if (parse(path, t, refusal) && t.lv == level::entry && t.kind == here.kind)
