@@ -1791,9 +1791,20 @@ void imap_session::cmd_metadata(const std::string& tag, const std::vector<token>
             entries.push_back(lower_entry(a[i].text));
     else
         entries.push_back(lower_entry(a[i].text));
+    // Each entry once and at most 256 of them, every value written once: /shared with DEPTH infinity 8,000 times
+    // wrote all of a user's metadata 8,000 times into one answer.
+    {
+        std::set<std::string> once;
+        std::erase_if(entries, [&](const std::string& e) { return !once.insert(e).second; });
+    }
+    if (entries.size() > 256)
+        return finish(tag, "BAD", "A GETMETADATA names at most 256 entries");
+    std::set<std::string> written;
     std::string out;
     uint64_t longest = 0;
     const auto add = [&](const std::string& entry, const std::string* value) {
+        if (!written.insert(entry).second)
+            return;
         if (value && value->size() > maxsize)
         {
             longest = std::max<uint64_t>(longest, value->size());
@@ -1969,6 +1980,9 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
         return true;
     };
     size_t after = from + 2;
+    // Each item is made for every message, and 4,300 of them decoding a 20 MB part each held the loop for minutes;
+    // a client asks for a dozen.
+    constexpr size_t max_fetch_items = 256;
     if (a[from + 1].k == token::open)
     {
         size_t i = from + 2;
@@ -1976,6 +1990,8 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
         {
             if (!add(a[i].text))
                 return finish(tag, "BAD", "Unknown FETCH item " + a[i].text);
+            if (items.size() > max_fetch_items)
+                return finish(tag, "BAD", "A FETCH names at most " + std::to_string(max_fetch_items) + " items");
             // PREVIEW's (LAZY) lets the server leave out what is slow to make, and none of it is here (RFC 8970 3).
             if (items.back().name == "PREVIEW" && i + 1 < a.size() && a[i + 1].k == token::open)
                 while (i + 1 < a.size() && a[i].k != token::close)

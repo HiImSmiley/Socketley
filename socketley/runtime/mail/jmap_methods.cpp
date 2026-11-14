@@ -591,6 +591,15 @@ struct email_view
     size_t max_value{0};
 };
 
+// The properties asked for, each once and at most 256: every one is made again for each email, and "preview" or
+// "bodyValues" 100,000 times decoded a part 100,000 times into one answer.
+bool props_ok(std::vector<std::string>& props)
+{
+    std::set<std::string> once;
+    std::erase_if(props, [&](const std::string& p) { return !once.insert(p).second; });
+    return props.size() <= 256;
+}
+
 std::string email_object(const email_view& view, const std::string& id, const imap_message* m, const std::string& mailbox,
                          const std::string* bytes)
 {
@@ -1074,6 +1083,8 @@ void jmap_session::email_get(const jvalue& args, std::function<void(answer)> don
         return done({{"error", set_error("requestTooLarge")}});
     const jvalue* props = json::member(j->args, "properties");
     j->props = props && props->k == jvalue::kind::array ? strings_of(props) : defaults;
+    if (!props_ok(j->props))
+        return done({{"error", set_error("requestTooLarge")}});
     if (std::find(j->props.begin(), j->props.end(), "id") == j->props.end())
         j->props.insert(j->props.begin(), "id");
     j->body_props = json::member(j->args, "bodyProperties");
@@ -1177,6 +1188,22 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
     auto j = std::make_shared<job>();
     j->args = args;
     const jvalue* filter = json::member(j->args, "filter");
+    // Every condition is judged for every Email of the account, and 700,000 of them held the loop for minutes; a
+    // client's filter holds a few.
+    {
+        size_t conditions = 0;
+        std::function<void(const jvalue&, int)> count = [&](const jvalue& f, int depth) {
+            ++conditions;
+            if (const jvalue* conds = json::member(f, "conditions"); conds && conds->k == jvalue::kind::array && depth < 16)
+                for (const auto& c : conds->items)
+                    if (conditions <= 256)
+                        count(c, depth + 1);
+        };
+        if (filter)
+            count(*filter, 0);
+        if (conditions > 256)
+            return done({{"error", set_error("unsupportedFilter", "a filter holds at most 256 conditions")}});
+    }
     bool bad_date = false;
     // What a filter needs of each Email beyond the index: its header, or all of it.
     std::function<void(const jvalue&)> needs = [&](const jvalue& f) {
@@ -1951,6 +1978,8 @@ void jmap_session::email_parse(const jvalue& args, std::function<void(answer)> d
                         : std::vector<std::string>{"messageId", "inReplyTo", "references", "sender", "from", "to", "cc",
                                                    "bcc", "replyTo", "subject", "sentAt", "hasAttachment", "preview",
                                                    "bodyValues", "textBody", "htmlBody", "attachments"};
+    if (!props_ok(j->view.props))
+        return done({{"error", set_error("requestTooLarge")}});
     // What a parsed blob's view reads is the whole of it, which is all it has.
     j->view.whole = true;
     const auto flag = [&](std::string_view k) {
