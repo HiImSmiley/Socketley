@@ -67,6 +67,66 @@ TEST_CASE("cache_store string operations")
     }
 }
 
+namespace
+{
+
+// Keys that all share one libstdc++ std::hash: each 16-byte pair mixes to blocks X, Y or to X and Y with the top bit
+// flipped, which leaves Murmur64A's state the same whatever came before, so n pairs give 2^n keys of one hash.
+std::vector<std::string> one_hash_keys(int pairs)
+{
+    const uint64_t mul = 0xc6a4a7935bd1e995ull;
+    uint64_t inv = mul;
+    for (int i = 0; i < 6; ++i)
+        inv *= 2 - mul * inv;
+    const auto unmix = [&](uint64_t t)
+    {
+        const uint64_t u = t * inv;
+        return (u ^ (u >> 47)) * inv;
+    };
+    std::vector<std::string> keys(1);
+    for (int p = 0; p < pairs; ++p)
+    {
+        const uint64_t x = 0x1234567890abcdefull * (p + 1), y = 0x0fedcba987654321ull * (p + 3);
+        const uint64_t w[4] = {unmix(x), unmix(y), unmix(x ^ (1ull << 63)), unmix(y ^ (1ull << 63))};
+        const std::string a(reinterpret_cast<const char*>(w), 16), b(reinterpret_cast<const char*>(w + 2), 16);
+        std::vector<std::string> next;
+        for (const auto& k : keys)
+        {
+            next.push_back(k + a);
+            next.push_back(k + b);
+        }
+        keys.swap(next);
+    }
+    return keys;
+}
+
+}   // namespace
+
+TEST_CASE("cache_store keys made to share one hash cost what other keys do")
+{
+    const std::vector<std::string> keys = one_hash_keys(15);
+    REQUIRE(keys.size() == 32768);
+    REQUIRE(std::hash<std::string_view>{}(keys[0]) == std::hash<std::string_view>{}(keys[32767]));
+    cache_store store;
+    const auto t0 = thread_cpu_now();
+    for (const auto& k : keys)
+    {
+        store.set(k, "v");
+        store.sadd("s", k);
+        store.zadd("z", 1, k);
+        store.hset("h", k, "v");
+    }
+    size_t found = 0;
+    double score = 0;
+    for (const auto& k : keys)
+        found += store.get_ptr(k) != nullptr && store.sismember("s", k) && store.zscore("z", k, score) &&
+                 store.hget("h", k).has_value();
+    // 32,768 keys of one hash were a list in each table: about 5e8 comparisons of 240-byte names apiece.
+    CHECK(std::chrono::duration<double>(thread_cpu_now() - t0).count() < 2.0);
+    CHECK(found == keys.size());
+    CHECK(store.scard("s") == keys.size());
+}
+
 TEST_CASE("cache_store type conflicts")
 {
     cache_store store;

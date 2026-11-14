@@ -20,6 +20,7 @@
 #include "../../shared/json/json_doc.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/nh_hash.h"
 
 namespace socketley::storage
 {
@@ -524,7 +525,7 @@ struct trim_set
 struct text_hash
 {
     using is_transparent = void;
-    size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
+    size_t operator()(std::string_view s) const noexcept { return socketley::nh_hash(s); }
 };
 
 struct node

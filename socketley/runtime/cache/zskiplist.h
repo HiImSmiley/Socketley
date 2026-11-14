@@ -24,6 +24,7 @@
 // for Redis's reason.  Insert, erase, rank and index are all O(log n), and the
 // ordered walk the rest of the store does is unchanged: follow level 0.
 
+#include "../../shared/util/nh_hash.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -172,7 +173,7 @@ private:
     static constexpr uint64_t IX_TOMB  = 1;
     static constexpr uint64_t IX_ADDR  = (uint64_t{1} << 48) - 1;
 
-    static uint64_t mhash(std::string_view m) { return std::hash<std::string_view>{}(m); }
+    static uint64_t mhash(std::string_view m) { return socketley::nh_hash(m); }
     static node* ix_node(uint64_t w) { return reinterpret_cast<node*>(w & IX_ADDR); }
     member_index* ix() const { return static_cast<member_index*>(m_big.aux); }
 

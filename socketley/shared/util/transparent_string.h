@@ -18,25 +18,21 @@
 #include <string>
 #include <string_view>
 
+#include "nh_hash.h"
+
 struct string_hash
 {
     using is_transparent = void;
 
-    // Left as libstdc++'s Murmur64A.  A hand-rolled wyhash-shaped replacement
-    // was written and measured: equal distribution (chi2/df 1.035 against
-    // 1.000 over 300k keys of three shapes, no full-hash collisions, same
-    // deepest bucket) and SLOWER, 0.975 of the median over six interleaved
-    // passes with only two of them in its favour.  The 2.62 per cent
-    // _Hash_bytes costs at depth 100 is not recovered by mixing it by hand.
-
+    // Keyed, because a client chooses most of the strings these tables hold; see nh_hash.h.
     size_t operator()(std::string_view sv) const noexcept
     {
-        return std::hash<std::string_view>{}(sv);
+        return socketley::nh_hash(sv);
     }
 
     size_t operator()(const std::string& s) const noexcept
     {
-        return std::hash<std::string_view>{}(s);
+        return socketley::nh_hash(s);
     }
 };
 

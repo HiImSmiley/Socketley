@@ -10,6 +10,7 @@
 // Blocks are cut where Redis cuts its nodes, because MAXLEN ~ removes whole
 // ones and a different cut would trim a different count.
 
+#include "../../shared/util/nh_hash.h"
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -273,11 +274,11 @@ public:
     private:
         static constexpr uint8_t empty = 0, tomb = 1, full = 2;
 
+        // Keyed, since a client picks the ids and a fixed mix can be solved for any number sharing one slot.
         static uint64_t hash(stream_id id)
         {
-            uint64_t h = id.ms * 0x9E3779B97F4A7C15ull ^ (id.seq + 0x632BE59BD9B4E019ull);
-            h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
-            return h;
+            const uint64_t words[2] = {id.ms, id.seq};
+            return socketley::nh_hash(std::string_view(reinterpret_cast<const char*>(words), sizeof words));
         }
 
         void rebuild(size_t cap)
