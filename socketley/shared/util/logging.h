@@ -84,15 +84,14 @@ struct logger
 
         static std::mutex mtx;
         std::lock_guard<std::mutex> lock(mtx);
-        std::fprintf(stderr, "[%02d:%02d:%02d] [%s] %s%s\n",
-            tm.tm_hour, tm.tm_min, tm.tm_sec, tag, g_prefix.c_str(), msg);
+        char head[32];
+        const int n = std::snprintf(head, sizeof head, "[%02d:%02d:%02d] [%s] ", tm.tm_hour, tm.tm_min, tm.tm_sec, tag);
+        std::string line = std::string(head, n > 0 ? static_cast<size_t>(n) : 0) + g_prefix + msg + '\n';
+        // One write for the whole line, because every worker shares this stderr and an unbuffered fprintf reaches
+        // the kernel 128 bytes at a time, so a long line was cut by another process's line.
+        std::fwrite(line.data(), 1, line.size(), stderr);
         if (g_tap)
-        {
-            char head[32];
-            const int n = std::snprintf(head, sizeof head, "[%02d:%02d:%02d] [%s] ", tm.tm_hour, tm.tm_min, tm.tm_sec, tag);
-            const std::string line = std::string(head, n > 0 ? static_cast<size_t>(n) : 0) + g_prefix + msg;
-            g_tap(line.data(), line.size());
-        }
+            g_tap(line.data(), line.size() - 1);
     }
 };
 

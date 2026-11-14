@@ -10,17 +10,71 @@
 #include "shared/util/byte_codec.h"
 #include "shared/runtime/stats_text.h"
 #include "shared/loop/line_framing.h"
+#include "shared/util/logging.h"
 
 #include <chrono>
 #include <random>
 #include <string>
 #include <vector>
 
+#include <cstdio>
 #include <cstdlib>
 
+#include <sys/wait.h>
 #include <unistd.h>
 
 // The small helpers in shared/util that every runtime leans on.
+
+TEST_CASE("a log line longer than stdio's staging buffer stays whole when processes share stderr")
+{
+    char path[] = "/tmp/socketley-test-util-log-XXXXXX";
+    const int fd = ::mkstemp(path);
+    REQUIRE(fd >= 0);
+    ::unlink(path);
+    constexpr int writers = 4, lines = 400;
+    const std::string body(300, 'x');
+    for (int w = 0; w < writers; ++w)
+    {
+        const pid_t pid = ::fork();
+        REQUIRE(pid >= 0);
+        if (pid == 0)
+        {
+            ::dup2(fd, STDERR_FILENO);
+            logger::g_prefix = "writer " + std::to_string(w) + ": ";
+            for (int i = 0; i < lines; ++i)
+                LOG_INFO(body.c_str());
+            ::_exit(0);
+        }
+    }
+    for (int w = 0; w < writers; ++w)
+    {
+        int status = 0;
+        CHECK(::wait(&status) > 0);
+    }
+    std::string all;
+    char buf[65536];
+    for (ssize_t n; (n = ::pread(fd, buf, sizeof buf, static_cast<off_t>(all.size()))) > 0;)
+        all.append(buf, static_cast<size_t>(n));
+    ::close(fd);
+    // Every line is a header, one writer's prefix and the whole body, and there is one per call.
+    const std::string tail = ": " + body;
+    int whole = 0, cut = 0;
+    for (size_t pos = 0; pos < all.size();)
+    {
+        size_t nl = all.find('\n', pos);
+        if (nl == std::string::npos)
+            nl = all.size();
+        const std::string_view line(all.data() + pos, nl - pos);
+        pos = nl + 1;
+        const auto at = line.find("] writer ");
+        if (at != std::string_view::npos && line.size() == at + 10 + tail.size() && line.ends_with(tail))
+            ++whole;
+        else
+            ++cut;
+    }
+    CHECK(cut == 0);
+    CHECK(whole == writers * lines);
+}
 
 TEST_CASE("ASCII case folds A to Z and nothing else")
 {
